@@ -3,6 +3,10 @@ name: Release
 on:
   push:
     branches: [main]
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
 
 permissions:
   contents: write
@@ -47,7 +51,6 @@ jobs:
 
           if git rev-parse "v${cargo_version}" >/dev/null 2>&1; then
             # Tag exists — auto-bump patch
-            # Find highest existing patch for this major.minor
             major=$(echo "$cargo_version" | cut -d. -f1)
             minor=$(echo "$cargo_version" | cut -d. -f2)
             highest_patch=$(git tag --list "v${major}.${minor}.*" | sed "s/v${major}\.${minor}\.//" | sort -n | tail -1)
