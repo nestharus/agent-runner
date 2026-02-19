@@ -34,31 +34,38 @@ jobs:
     needs: [lint, test]
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.extract.outputs.version }}
-      tag: ${{ steps.extract.outputs.tag }}
-      exists: ${{ steps.check.outputs.exists }}
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Extract version from Cargo.toml
-        id: extract
+      - name: Resolve version
+        id: resolve
         run: |
-          version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          cargo_version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+
+          if git rev-parse "v${cargo_version}" >/dev/null 2>&1; then
+            # Tag exists — auto-bump patch
+            # Find highest existing patch for this major.minor
+            major=$(echo "$cargo_version" | cut -d. -f1)
+            minor=$(echo "$cargo_version" | cut -d. -f2)
+            highest_patch=$(git tag --list "v${major}.${minor}.*" | sed "s/v${major}\.${minor}\.//" | sort -n | tail -1)
+            if [ -z "$highest_patch" ]; then
+              highest_patch=0
+            fi
+            next_patch=$((highest_patch + 1))
+            version="${major}.${minor}.${next_patch}"
+          else
+            version="$cargo_version"
+          fi
+
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=v$version" >> "$GITHUB_OUTPUT"
-      - name: Check if tag exists
-        id: check
-        run: |
-          if git rev-parse "v${{ steps.extract.outputs.version }}" >/dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
+          echo "Releasing v$version"
 
   build:
     needs: version
-    if: needs.version.outputs.exists == 'false'
     strategy:
       matrix:
         include:
