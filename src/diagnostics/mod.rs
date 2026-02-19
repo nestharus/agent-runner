@@ -101,13 +101,23 @@ fn parse_diagnosis(output: &str, stderr: &str, exit_code: i32) -> Result<Diagnos
 fn heuristic_diagnosis(stderr: &str, _exit_code: i32) -> Diagnosis {
     let lower = stderr.to_lowercase();
 
-    let category = if lower.contains("429") || lower.contains("rate limit") || lower.contains("too many requests") {
+    let category = if lower.contains("429")
+        || lower.contains("rate limit")
+        || lower.contains("too many requests")
+    {
         ErrorCategory::RateLimit
-    } else if lower.contains("quota") || lower.contains("billing") || lower.contains("usage limit") {
+    } else if lower.contains("quota") || lower.contains("billing") || lower.contains("usage limit")
+    {
         ErrorCategory::QuotaExhausted
-    } else if lower.contains("unauthorized") || lower.contains("auth") || lower.contains("token expired") {
+    } else if lower.contains("unauthorized")
+        || lower.contains("auth")
+        || lower.contains("token expired")
+    {
         ErrorCategory::AuthExpired
-    } else if lower.contains("not found") || lower.contains("unknown flag") || lower.contains("unrecognized") {
+    } else if lower.contains("not found")
+        || lower.contains("unknown flag")
+        || lower.contains("unrecognized")
+    {
         ErrorCategory::CliVersionMismatch
     } else if lower.contains("connection") || lower.contains("timeout") || lower.contains("dns") {
         ErrorCategory::NetworkError

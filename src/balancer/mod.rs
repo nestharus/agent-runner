@@ -80,8 +80,14 @@ mod tests {
             name: "test".to_string(),
             prompt_mode: PromptMode::Arg,
             providers: vec![
-                ProviderConfig { command: "a".to_string(), args: vec![] },
-                ProviderConfig { command: "b".to_string(), args: vec![] },
+                ProviderConfig {
+                    command: "a".to_string(),
+                    args: vec![],
+                },
+                ProviderConfig {
+                    command: "b".to_string(),
+                    args: vec![],
+                },
             ],
         }
     }
@@ -92,7 +98,10 @@ mod tests {
         let model = ModelConfig {
             name: "single".to_string(),
             prompt_mode: PromptMode::Arg,
-            providers: vec![ProviderConfig { command: "x".to_string(), args: vec![] }],
+            providers: vec![ProviderConfig {
+                command: "x".to_string(),
+                args: vec![],
+            }],
         };
         assert_eq!(select_provider(&model, &db), 0);
     }
@@ -107,7 +116,8 @@ mod tests {
         assert_eq!(first, 0);
 
         // Record invocation for provider 0
-        db.record_invocation("test", 0, true, 0, None, None).unwrap();
+        db.record_invocation("test", 0, true, 0, None, None)
+            .unwrap();
 
         // Now should pick provider 1 (fewer invocations)
         let second = select_provider(&model, &db);
@@ -121,7 +131,8 @@ mod tests {
 
         // Provider 0 has 3 recent errors
         for _ in 0..3 {
-            db.record_invocation("test", 0, false, 1, None, None).unwrap();
+            db.record_invocation("test", 0, false, 1, None, None)
+                .unwrap();
         }
 
         // Should avoid provider 0

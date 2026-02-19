@@ -92,8 +92,8 @@ pub fn load_models(models_dir: &Path) -> Result<HashMap<String, ModelConfig>, St
         return Ok(models);
     }
 
-    let entries = fs::read_dir(models_dir)
-        .map_err(|e| format!("Failed to read models directory: {e}"))?;
+    let entries =
+        fs::read_dir(models_dir).map_err(|e| format!("Failed to read models directory: {e}"))?;
 
     for entry in entries {
         let entry = entry.map_err(|e| format!("Failed to read directory entry: {e}"))?;
@@ -109,8 +109,8 @@ pub fn load_models(models_dir: &Path) -> Result<HashMap<String, ModelConfig>, St
             .ok_or_else(|| format!("Invalid filename: {}", path.display()))?
             .to_string();
 
-        let content =
-            fs::read_to_string(&path).map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+        let content = fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
 
         let config = ModelConfig::from_toml(&name, &content)?;
         models.insert(name, config);

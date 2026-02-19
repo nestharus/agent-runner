@@ -10,6 +10,17 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy -- -D warnings
+
   test:
     runs-on: ubuntu-latest
     steps:
@@ -19,7 +30,7 @@ jobs:
       - run: cargo test
 
   build:
-    needs: test
+    needs: [lint, test]
     strategy:
       matrix:
         include:

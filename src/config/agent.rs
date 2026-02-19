@@ -64,8 +64,8 @@ pub fn load_agents(agents_dir: &Path) -> Result<HashMap<String, AgentConfig>, St
         return Ok(agents);
     }
 
-    let entries = fs::read_dir(agents_dir)
-        .map_err(|e| format!("Failed to read agents directory: {e}"))?;
+    let entries =
+        fs::read_dir(agents_dir).map_err(|e| format!("Failed to read agents directory: {e}"))?;
 
     for entry in entries {
         let entry = entry.map_err(|e| format!("Failed to read directory entry: {e}"))?;

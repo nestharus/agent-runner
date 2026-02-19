@@ -1,4 +1,4 @@
-use crate::config::{ModelConfig, ProviderConfig, PromptMode};
+use crate::config::{ModelConfig, PromptMode, ProviderConfig};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -19,10 +19,12 @@ pub fn execute(
     prompt: &str,
     working_dir: Option<&Path>,
 ) -> Result<ExecutionResult, String> {
-    let provider = model
-        .providers
-        .get(provider_index)
-        .ok_or_else(|| format!("Provider index {} out of range for model {}", provider_index, model.name))?;
+    let provider = model.providers.get(provider_index).ok_or_else(|| {
+        format!(
+            "Provider index {} out of range for model {}",
+            provider_index, model.name
+        )
+    })?;
 
     let (result, temp_file) = execute_provider(provider, model.prompt_mode, prompt, working_dir)?;
     // Clean up temp file if one was created
@@ -98,12 +100,13 @@ fn execute_provider(
         .map_err(|e| format!("Failed to spawn '{}': {e}", provider.command))?;
 
     if prompt_mode == PromptMode::Stdin
-        && let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(prompt.as_bytes())
-                .map_err(|e| format!("Failed to write to stdin: {e}"))?;
-            // stdin is dropped here, closing the pipe
-        }
+        && let Some(mut stdin) = child.stdin.take()
+    {
+        stdin
+            .write_all(prompt.as_bytes())
+            .map_err(|e| format!("Failed to write to stdin: {e}"))?;
+        // stdin is dropped here, closing the pipe
+    }
 
     let output = child
         .wait_with_output()

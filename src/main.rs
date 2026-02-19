@@ -14,7 +14,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 #[derive(Parser)]
-#[command(name = "oulipoly-agent-runner", about = "LLM agent runner with load balancing")]
+#[command(
+    name = "oulipoly-agent-runner",
+    about = "LLM agent runner with load balancing"
+)]
 struct Cli {
     /// Agent name (from agents directory)
     agent: Option<String>,
@@ -61,14 +64,15 @@ fn load_app_config() -> AppConfig {
     let config_path = config_dir.join("config.toml");
 
     if let Ok(content) = std::fs::read_to_string(&config_path)
-        && let Ok(table) = content.parse::<toml::Table>() {
-            return AppConfig {
-                diagnostics_model: table
-                    .get("diagnostics_model")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-            };
-        }
+        && let Ok(table) = content.parse::<toml::Table>()
+    {
+        return AppConfig {
+            diagnostics_model: table
+                .get("diagnostics_model")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+        };
+    }
 
     AppConfig {
         diagnostics_model: None,
@@ -77,10 +81,9 @@ fn load_app_config() -> AppConfig {
 
 fn collect_positional_prompt(cli: &Cli, include_agent: bool) -> Option<String> {
     let mut parts = Vec::new();
-    if include_agent
-        && let Some(ref a) = cli.agent {
-            parts.push(a.as_str());
-        }
+    if include_agent && let Some(ref a) = cli.agent {
+        parts.push(a.as_str());
+    }
     for arg in &cli.prompt_args {
         parts.push(arg.as_str());
     }
@@ -154,9 +157,12 @@ fn run(cli: Cli) -> Result<i32, String> {
     // Agent-based execution
     let agent = resolve_agent(&cli)?;
 
-    let model = models
-        .get(&agent.model)
-        .ok_or_else(|| format!("Unknown model '{}' referenced by agent '{}'", agent.model, agent.name))?;
+    let model = models.get(&agent.model).ok_or_else(|| {
+        format!(
+            "Unknown model '{}' referenced by agent '{}'",
+            agent.model, agent.name
+        )
+    })?;
 
     let raw_prompt = resolve_prompt(&cli, false)?;
     let full_prompt = if agent.instructions.is_empty() {
@@ -176,14 +182,11 @@ fn resolve_agent(cli: &Cli) -> Result<AgentConfig, String> {
 
     // Named agent from agents directory
     if let Some(ref name) = cli.agent {
-        let agents_dir = cli
-            .agents_dir
-            .clone()
-            .unwrap_or_else(|| {
-                dirs::config_dir()
-                    .map(|d| d.join("oulipoly-agent-runner").join("agents"))
-                    .unwrap_or_else(|| PathBuf::from("agents"))
-            });
+        let agents_dir = cli.agents_dir.clone().unwrap_or_else(|| {
+            dirs::config_dir()
+                .map(|d| d.join("oulipoly-agent-runner").join("agents"))
+                .unwrap_or_else(|| PathBuf::from("agents"))
+        });
         let agents = load_agents(&agents_dir)?;
         return agents
             .get(name)
@@ -252,7 +255,11 @@ fn run_diagnostics(
 
     match diagnostics::diagnose_error(stderr, exit_code, diag_model, models, working_dir) {
         Ok(diagnosis) => {
-            eprintln!("[diagnostics] {}: {}", diagnosis.category.as_str(), diagnosis.summary);
+            eprintln!(
+                "[diagnostics] {}: {}",
+                diagnosis.category.as_str(),
+                diagnosis.summary
+            );
             Some(diagnosis.category.as_str().to_string())
         }
         Err(e) => {

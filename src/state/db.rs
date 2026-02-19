@@ -36,8 +36,7 @@ impl StateDb {
                 .map_err(|e| format!("Failed to create state directory: {e}"))?;
         }
 
-        let conn = Connection::open(path)
-            .map_err(|e| format!("Failed to open state DB: {e}"))?;
+        let conn = Connection::open(path).map_err(|e| format!("Failed to open state DB: {e}"))?;
 
         conn.execute_batch("PRAGMA journal_mode=WAL;")
             .map_err(|e| format!("Failed to set WAL mode: {e}"))?;
@@ -66,15 +65,16 @@ impl StateDb {
 
             CREATE INDEX IF NOT EXISTS idx_invocations_model
                 ON invocations (model_name, provider_index, created_at);
-            "
-        ).map_err(|e| format!("Failed to initialize schema: {e}"))?;
+            ",
+        )
+        .map_err(|e| format!("Failed to initialize schema: {e}"))?;
 
         Ok(StateDb { conn })
     }
 
     pub fn open_default() -> Result<Self, String> {
-        let data_dir = dirs::data_dir()
-            .ok_or_else(|| "Could not determine data directory".to_string())?;
+        let data_dir =
+            dirs::data_dir().ok_or_else(|| "Could not determine data directory".to_string())?;
         let db_path = data_dir.join("oulipoly-agent-runner").join("state.db");
         Self::open(&db_path)
     }
@@ -106,7 +106,11 @@ impl StateDb {
 
         // Record error details if failed
         if !success {
-            let snippet = stderr_snippet.unwrap_or("").chars().take(500).collect::<String>();
+            let snippet = stderr_snippet
+                .unwrap_or("")
+                .chars()
+                .take(500)
+                .collect::<String>();
             self.conn
                 .execute(
                     "UPDATE providers SET last_error = ?1, last_error_at = ?2
@@ -135,7 +139,11 @@ impl StateDb {
         Ok(())
     }
 
-    pub fn get_provider(&self, model_name: &str, provider_index: usize) -> Result<Option<ProviderRecord>, String> {
+    pub fn get_provider(
+        &self,
+        model_name: &str,
+        provider_index: usize,
+    ) -> Result<Option<ProviderRecord>, String> {
         let mut stmt = self
             .conn
             .prepare(
@@ -144,22 +152,23 @@ impl StateDb {
             )
             .map_err(|e| format!("Failed to prepare query: {e}"))?;
 
-        let result = stmt
-            .query_row(params![model_name, provider_index as i64], |row| {
-                Ok(ProviderRecord {
-                    model_name: model_name.to_string(),
-                    provider_index,
-                    invocation_count: row.get::<_, i64>(0)? as u64,
-                    error_count: row.get::<_, i64>(1)? as u64,
-                    last_error: row.get(2)?,
-                    last_error_at: row.get::<_, Option<String>>(3)?
-                        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                        .map(|dt| dt.with_timezone(&Utc)),
-                    last_invoked_at: row.get::<_, Option<String>>(4)?
-                        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                        .map(|dt| dt.with_timezone(&Utc)),
-                })
-            });
+        let result = stmt.query_row(params![model_name, provider_index as i64], |row| {
+            Ok(ProviderRecord {
+                model_name: model_name.to_string(),
+                provider_index,
+                invocation_count: row.get::<_, i64>(0)? as u64,
+                error_count: row.get::<_, i64>(1)? as u64,
+                last_error: row.get(2)?,
+                last_error_at: row
+                    .get::<_, Option<String>>(3)?
+                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                    .map(|dt| dt.with_timezone(&Utc)),
+                last_invoked_at: row
+                    .get::<_, Option<String>>(4)?
+                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                    .map(|dt| dt.with_timezone(&Utc)),
+            })
+        });
 
         match result {
             Ok(record) => Ok(Some(record)),
@@ -207,8 +216,17 @@ mod tests {
     #[test]
     fn record_and_query() {
         let db = test_db();
-        db.record_invocation("test-model", 0, true, 0, None, None).unwrap();
-        db.record_invocation("test-model", 0, false, 1, Some("rate_limit"), Some("429 Too Many Requests")).unwrap();
+        db.record_invocation("test-model", 0, true, 0, None, None)
+            .unwrap();
+        db.record_invocation(
+            "test-model",
+            0,
+            false,
+            1,
+            Some("rate_limit"),
+            Some("429 Too Many Requests"),
+        )
+        .unwrap();
 
         let provider = db.get_provider("test-model", 0).unwrap().unwrap();
         assert_eq!(provider.invocation_count, 2);
