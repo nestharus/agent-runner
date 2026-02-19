@@ -2,8 +2,7 @@ name: Release
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches: [main]
 
 permissions:
   contents: write
@@ -12,7 +11,54 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test
+
+  version:
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.extract.outputs.version }}
+      tag: ${{ steps.extract.outputs.tag }}
+      exists: ${{ steps.check.outputs.exists }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Extract version from Cargo.toml
+        id: extract
+        run: |
+          version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+      - name: Check if tag exists
+        id: check
+        run: |
+          if git rev-parse "v${{ steps.extract.outputs.version }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
+    needs: version
+    if: needs.version.outputs.exists == 'false'
     strategy:
       matrix:
         include:
@@ -51,14 +97,20 @@ jobs:
           path: ${{ matrix.archive }}
 
   release:
-    needs: build
+    needs: [version, build]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
+      - name: Create tag
+        run: |
+          git tag ${{ needs.version.outputs.tag }}
+          git push origin ${{ needs.version.outputs.tag }}
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.version.outputs.tag }}
           generate_release_notes: true
           files: |
             oulipoly-agent-runner-linux-x86_64.tar.gz
