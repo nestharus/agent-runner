@@ -6,9 +6,9 @@ edition = "2024"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
-serde_yaml = "0.9"
-rusqlite = { version = "0.32", features = ["bundled"] }
+toml = "1"
+serde_yml = "0.0.12"
+rusqlite = { version = "0.38", features = ["bundled"] }
 dirs = "6"
 tempfile = "3"
 uuid = { version = "1", features = ["v4"] }

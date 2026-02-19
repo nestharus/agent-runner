@@ -97,14 +97,13 @@ fn execute_provider(
         .spawn()
         .map_err(|e| format!("Failed to spawn '{}': {e}", provider.command))?;
 
-    if prompt_mode == PromptMode::Stdin {
-        if let Some(mut stdin) = child.stdin.take() {
+    if prompt_mode == PromptMode::Stdin
+        && let Some(mut stdin) = child.stdin.take() {
             stdin
                 .write_all(prompt.as_bytes())
                 .map_err(|e| format!("Failed to write to stdin: {e}"))?;
             // stdin is dropped here, closing the pipe
         }
-    }
 
     let output = child
         .wait_with_output()

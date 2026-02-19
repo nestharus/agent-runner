@@ -117,7 +117,7 @@ fn heuristic_diagnosis(stderr: &str, _exit_code: i32) -> Diagnosis {
 
     Diagnosis {
         category,
-        summary: format!("Heuristic classification based on stderr content"),
+        summary: "Heuristic classification based on stderr content".to_string(),
     }
 }
 

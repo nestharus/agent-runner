@@ -33,7 +33,7 @@ pub fn parse_agent_file(name: &str, content: &str) -> Result<AgentConfig, String
     let yaml_str = &caps[1];
     let instructions = caps[2].to_string();
 
-    let raw: RawFrontmatter = serde_yaml::from_str(yaml_str)
+    let raw: RawFrontmatter = serde_yml::from_str(yaml_str)
         .map_err(|e| format!("Agent {name}: YAML parse error: {e}"))?;
 
     Ok(AgentConfig {

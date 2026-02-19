@@ -60,8 +60,8 @@ fn load_app_config() -> AppConfig {
 
     let config_path = config_dir.join("config.toml");
 
-    if let Ok(content) = std::fs::read_to_string(&config_path) {
-        if let Ok(table) = content.parse::<toml::Table>() {
+    if let Ok(content) = std::fs::read_to_string(&config_path)
+        && let Ok(table) = content.parse::<toml::Table>() {
             return AppConfig {
                 diagnostics_model: table
                     .get("diagnostics_model")
@@ -69,7 +69,6 @@ fn load_app_config() -> AppConfig {
                     .map(String::from),
             };
         }
-    }
 
     AppConfig {
         diagnostics_model: None,
@@ -78,11 +77,10 @@ fn load_app_config() -> AppConfig {
 
 fn collect_positional_prompt(cli: &Cli, include_agent: bool) -> Option<String> {
     let mut parts = Vec::new();
-    if include_agent {
-        if let Some(ref a) = cli.agent {
+    if include_agent
+        && let Some(ref a) = cli.agent {
             parts.push(a.as_str());
         }
-    }
     for arg in &cli.prompt_args {
         parts.push(arg.as_str());
     }
