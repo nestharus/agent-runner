@@ -1,0 +1,39 @@
+{
+	"name": "agent-runner",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"dev": "vite",
+		"build": "vite build",
+		"preview": "vite preview",
+		"check": "biome check .",
+		"check:fix": "biome check --fix .",
+		"test": "vitest run",
+		"test:e2e": "playwright test",
+		"tauri": "tauri"
+	},
+	"dependencies": {
+		"@ark-ui/solid": "^5.31.0",
+		"@fortawesome/free-brands-svg-icons": "^7.2.0",
+		"@fortawesome/sharp-regular-svg-icons": "^7.2.0",
+		"@fortawesome/sharp-solid-svg-icons": "^7.2.0",
+		"@tanstack/solid-query": "^5.90.23",
+		"solid-js": "^1.9.11",
+		"tailwind-merge": "^3.5.0",
+		"tailwind-variants": "^3.2.2"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^2.4.2",
+		"@playwright/test": "^1.58.2",
+		"@solidjs/testing-library": "^0.8.10",
+		"@tailwindcss/vite": "^4.2.0",
+		"@tauri-apps/api": "^2.10.1",
+		"@tauri-apps/cli": "^2.10.0",
+		"jsdom": "^28.1.0",
+		"tailwindcss": "^4.2.0",
+		"typescript": "^5.9.3",
+		"vite": "^7.3.1",
+		"vite-plugin-solid": "^2.11.10",
+		"vitest": "^4.0.18"
+	}
+}

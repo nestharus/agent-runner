@@ -1,1 +1,39 @@
-/target
+# Rust
+/src-tauri/target/
+
+# Frontend
+node_modules/
+dist/
+.vite/
+
+# Bun
+bun.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets & auth
+.env
+.env.*
+.npmrc
+*.key
+*.pem
+*.secret
+credentials.json
+
+# CLI config directories
+.claude/
+.codex/
+.gemini/
+.opencode/
+
+# SQLite databases
+*.db
+*.db-wal
+*.db-shm

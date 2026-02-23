@@ -1,0 +1,79 @@
+@import "tailwindcss";
+
+@theme {
+	--color-bg: #121212;
+	--color-surface: #1e1e1e;
+	--color-surface-alt: #2a2a2a;
+	--color-border: #333333;
+	--color-border-focus: #4fc3f7;
+	--color-text: #e0e0e0;
+	--color-text-dim: #888888;
+	--color-text-faint: #555555;
+	--color-accent: #4fc3f7;
+	--color-accent-hover: #29b6f6;
+	--color-error: #ef5350;
+	--color-success: #66bb6a;
+	--color-warning: #ffab40;
+	--color-brand-blue: #4fc3f7;
+	--color-brand-purple: #b388ff;
+	--color-brand-yellow: #ffd54f;
+	--color-brand-orange: #ff8a65;
+}
+
+body {
+	background-color: var(--color-bg);
+	color: var(--color-text);
+	font-family: "Inter", system-ui, -apple-system, sans-serif;
+}
+
+@keyframes slide-in-right {
+	from {
+		transform: translateX(100%);
+	}
+	to {
+		transform: translateX(0);
+	}
+}
+
+.animate-slide-in {
+	animation: slide-in-right 0.2s ease-out;
+}
+
+/* === Ollie Design System Animations === */
+
+/* Portrait head bob */
+@keyframes ollie-bob {
+	0%, 100% { transform: translateY(0) rotate(0deg); }
+	50% { transform: translateY(-4px) rotate(3deg); }
+}
+
+/* Portrait eye blink */
+@keyframes ollie-blink {
+	0%, 46%, 50%, 100% { opacity: 1; transform: scaleY(1); }
+	48% { opacity: 0; transform: scaleY(0.1); }
+}
+
+/* Inline spinner diamond */
+@keyframes ollie-spin {
+	0% { transform: rotate(0deg) scale(0.8); fill: #4fc3f7; }
+	33% { fill: #b388ff; }
+	50% { transform: rotate(180deg) scale(1.1); fill: #ffd54f; }
+	66% { fill: #ff8a65; }
+	100% { transform: rotate(360deg) scale(0.8); fill: #4fc3f7; }
+}
+
+/* Dashboard row entrance animation */
+@keyframes fade-up {
+	from {
+		opacity: 0;
+		transform: translateY(8px);
+	}
+	to {
+		opacity: 1;
+		transform: translateY(0);
+	}
+}
+
+.animate-fade-up {
+	animation: fade-up 0.3s ease-out both;
+}

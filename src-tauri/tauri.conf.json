@@ -1,0 +1,23 @@
+{
+  "productName": "Agent Runner",
+  "version": "0.1.0",
+  "identifier": "com.oulipoly.agent-runner",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "bun run dev",
+    "beforeBuildCommand": "bun run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Agent Runner",
+        "width": 900,
+        "height": 700
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'"
+    }
+  }
+}

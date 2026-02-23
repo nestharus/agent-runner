@@ -1,127 +1,113 @@
-# oulipoly-agent-runner
+# Agent Runner
 
-CLI agent runner with load balancing across LLM providers. Routes prompts to CLI tools like `claude`, `codex`, `opencode`, etc. with automatic failover, error diagnostics, and persistent state tracking.
+Desktop app for managing LLM provider pools with an AI-driven setup agent. Routes prompts to CLI tools like `claude`, `codex`, `opencode`, etc. with automatic load balancing, error diagnostics, and persistent state tracking.
+
+Built with [Tauri v2](https://v2.tauri.app/) + [SolidJS](https://www.solidjs.com/) + TypeScript.
 
 ## Install
 
+Grab a binary from [Releases](https://github.com/nestharus/agent-runner/releases), or build from source (see below).
+
+## Prerequisites
+
+- [Rust](https://rustup.rs/) (stable)
+- [Bun](https://bun.sh/) (v1.2+)
+- Platform system libraries (Linux only):
+  ```bash
+  sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
+  ```
+
+## Development
+
 ```bash
-cargo install --path .
+# Install frontend dependencies
+bun install
+
+# Start dev mode (Vite HMR + Rust hot-reload)
+bunx tauri dev
 ```
 
-Or grab a binary from [Releases](https://github.com/nestharus/agent-runner/releases).
+This opens the app window with the Vite dev server at `localhost:5173` and hot-reloads both frontend and Rust changes.
 
-## Quick Start
+## Building
 
 ```bash
-# Run a prompt against a model
-oulipoly-agent-runner --model claude-haiku "Explain monads in one sentence"
-
-# Run an agent (model + system instructions)
-oulipoly-agent-runner my-agent "Fix the login bug"
-
-# Pipe prompt from stdin
-cat spec.md | oulipoly-agent-runner --model codex-high
-
-# Read prompt from file
-oulipoly-agent-runner --model glm --file prompt.md
+# Build the release binary + platform installers
+bunx tauri build
 ```
 
-## Configuration
+Output locations:
+- **Linux**: `src-tauri/target/release/bundle/deb/` and `appimage/`
+- **macOS**: `src-tauri/target/release/bundle/dmg/` and `macos/`
+- **Windows**: `src-tauri/target/release/bundle/msi/` and `nsis/`
 
-All config lives in `~/.config/oulipoly-agent-runner/`:
+The raw binary is at `src-tauri/target/release/oulipoly-agent-runner` (or `.exe` on Windows).
 
-```
-~/.config/oulipoly-agent-runner/
-  config.toml          # Global settings
-  models/              # Model configs (one .toml per model)
-  agents/              # Agent configs (one .md per agent)
-```
+### Manual install (Linux/macOS)
 
-### Adding a Model
-
-Create a `.toml` file in `~/.config/oulipoly-agent-runner/models/`. The filename becomes the model name.
-
-**Single provider:**
-
-```toml
-# ~/.config/oulipoly-agent-runner/models/claude-haiku.toml
-command = "claude"
-args = ["-p", "--model", "haiku"]
-prompt_mode = "stdin"
+```bash
+bunx tauri build
+cp src-tauri/target/release/oulipoly-agent-runner ~/.local/bin/
 ```
 
-**Multiple providers (load balanced):**
+## Testing
 
-```toml
-# ~/.config/oulipoly-agent-runner/models/codex-high.toml
-prompt_mode = "arg"
+```bash
+# Frontend unit tests (Vitest)
+bun run test
 
-[[providers]]
-command = "codex"
-args = ["exec", "-m", "gpt-5.3-codex"]
+# Lint + format check (Biome)
+bun run check
 
-[[providers]]
-command = "codex2"
-args = ["exec", "-m", "gpt-5.3-codex"]
+# TypeScript type check
+bunx tsc --noEmit
+
+# Rust tests
+cd src-tauri && cargo test
+
+# Rust lint
+cd src-tauri && cargo clippy -- -D warnings
+cd src-tauri && cargo fmt --check
 ```
 
-With multiple providers, the runner automatically alternates between them and avoids providers with recent errors.
-
-#### Fields
-
-| Field | Required | Default | Description |
-|-------|----------|---------|-------------|
-| `command` | Yes (single) | - | CLI command to execute |
-| `args` | No | `[]` | Arguments passed to the command |
-| `prompt_mode` | No | `"stdin"` | `"stdin"` pipes prompt to stdin, `"arg"` appends as final argument |
-| `[[providers]]` | Yes (multi) | - | List of provider configs (each has `command` and `args`) |
-
-Use `prompt_mode = "stdin"` for CLIs that read from stdin (e.g., `claude -p`).
-Use `prompt_mode = "arg"` for CLIs that take the prompt as an argument (e.g., `codex exec`).
-
-### Adding an Agent
-
-Create a `.md` file in `~/.config/oulipoly-agent-runner/agents/`. The filename becomes the agent name.
-
-```markdown
----
-description: 'Code review assistant'
-model: claude-haiku
-output_format: ''
----
-
-You are a senior code reviewer. Review the following code for:
-- Security vulnerabilities
-- Performance issues
-- Readability concerns
-
-Be concise and actionable.
-```
-
-#### Frontmatter Fields
-
-| Field | Required | Description |
-|-------|----------|-------------|
-| `description` | No | Human-readable description of the agent |
-| `model` | Yes | Model name (must match a `.toml` in models/) |
-| `output_format` | No | Reserved for future use |
-
-Everything after the `---` closing delimiter is the agent's system instructions, prepended to every prompt.
-
-### Global Config
-
-```toml
-# ~/.config/oulipoly-agent-runner/config.toml
-
-# Model to use for analyzing errors when a provider fails
-diagnostics_model = "claude-haiku"
-```
-
-When a provider returns a non-zero exit code, the runner pipes stderr to the diagnostics model to classify the error (rate limit, auth expired, quota exhausted, etc.). This influences future load balancing decisions.
-
-## CLI Reference
+## Project Structure
 
 ```
+index.html                    Vite entry point
+src/                          Frontend (SolidJS + TypeScript)
+  index.tsx                   Mount point
+  App.tsx                     Root component with TanStack Router
+  lib/
+    tauri.ts                  Typed invoke/Channel wrappers
+    types.ts                  TypeScript types (mirrors Rust)
+    styles.ts                 Tailwind Variants recipes
+  views/
+    PoolsView.tsx             Model pool management
+    SetupView.tsx             AI-driven setup flow
+  components/
+    FormRenderer.tsx           Dynamic forms from agent actions
+    WizardStepper.tsx          Multi-step wizard (Ark UI Steps)
+    OAuthFlow.tsx              OAuth login instructions
+    ApiKeyEntry.tsx            API key input
+    CliSelector.tsx            CLI checkbox selection
+    ConfirmDialog.tsx          Confirmation prompts
+    ResultDisplay.tsx          Detection/test result summaries
+    NavBar.tsx                 Navigation tabs
+src-tauri/                    Rust backend (Tauri v2)
+  src/
+    main.rs                   Tauri entry point
+    lib.rs                    App builder + command registration
+    ...                       Detection, memory, sync modules
+  Cargo.toml
+  tauri.conf.json
+e2e/                          Playwright QA tests + screenshots
+```
+
+## CLI Usage
+
+When launched with no arguments, the app opens the desktop GUI. When given arguments, it runs in headless CLI mode.
+
+```bash
 oulipoly-agent-runner [OPTIONS] [AGENT] [PROMPT...]
 
 Arguments:
@@ -143,8 +129,11 @@ Options:
 ### Examples
 
 ```bash
+# Launch desktop GUI
+oulipoly-agent-runner
+
 # Direct model execution
-oulipoly-agent-runner --model glm "List 3 sorting algorithms"
+oulipoly-agent-runner --model claude-haiku "Explain monads in one sentence"
 
 # Named agent
 oulipoly-agent-runner code-reviewer "Review this function"
@@ -152,11 +141,14 @@ oulipoly-agent-runner code-reviewer "Review this function"
 # Agent file from any path
 oulipoly-agent-runner --agent-file ./my-agent.md --model claude-haiku "Do the thing"
 
+# Pipe prompt from stdin
+cat spec.md | oulipoly-agent-runner --model codex-high
+
+# Read prompt from file
+oulipoly-agent-runner --model glm --file prompt.md
+
 # Set working directory for the subprocess
 oulipoly-agent-runner --model codex-high -p /path/to/repo "Fix the tests"
-
-# Use custom model directory
-oulipoly-agent-runner --models-dir ./my-models --model local "Hello"
 ```
 
 ## Load Balancing
@@ -175,21 +167,75 @@ When a provider fails, the runner can automatically diagnose the error:
 
 1. Pipes stderr to the configured `diagnostics_model`
 2. Classifies into: `rate_limit`, `quota_exhausted`, `auth_expired`, `cli_version_mismatch`, `network_error`, or `unknown`
-3. Stores the classification in SQLite
-4. Future load balancing uses this to avoid broken providers
+3. Stores the classification in SQLite for future load balancing decisions
 
 Falls back to heuristic keyword matching if the diagnostics model itself fails.
 
-## Building
+## Configuration
 
-```bash
-cargo build --release
+All user config lives in `~/.config/oulipoly-agent-runner/`:
+
+```
+~/.config/oulipoly-agent-runner/
+  config.toml          Global settings
+  models/              Model configs (one .toml per model)
+  agents/              Agent configs (one .md per agent)
 ```
 
-The binary is at `target/release/oulipoly-agent-runner`.
+### Adding a Model
 
-## Testing
+Create a `.toml` file in the models directory. The filename becomes the model name.
 
-```bash
-cargo test
+**Single provider:**
+```toml
+command = "claude"
+args = ["-p", "--model", "haiku"]
+prompt_mode = "stdin"
 ```
+
+**Multiple providers (load balanced):**
+```toml
+prompt_mode = "arg"
+
+[[providers]]
+command = "codex"
+args = ["exec", "-m", "gpt-5.3-codex"]
+
+[[providers]]
+command = "codex2"
+args = ["exec", "-m", "gpt-5.3-codex"]
+```
+
+### Adding an Agent
+
+Create a `.md` file in the agents directory:
+
+```markdown
+---
+description: 'Code review assistant'
+model: claude-haiku
+output_format: ''
+---
+
+You are a senior code reviewer. Be concise and actionable.
+```
+
+## Tech Stack
+
+| Layer | Technology |
+|-------|-----------|
+| Framework | Tauri v2 |
+| Frontend | SolidJS 1.9 + TypeScript |
+| Build | Vite 7 |
+| Styling | Tailwind CSS 4 + Tailwind Variants |
+| Components | Ark UI (headless) |
+| Routing | TanStack Solid Router |
+| Async state | TanStack Solid Query |
+| Linting | Biome |
+| Testing | Vitest + Playwright |
+| Package manager | Bun |
+| Backend | Rust (Tokio + SQLite) |
+
+## License
+
+MIT
