@@ -115,6 +115,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
       - name: Configure FontAwesome registry
+        shell: bash
         run: |
           echo '@fortawesome:registry=https://npm.fontawesome.com/' >> .npmrc
           echo '//npm.fontawesome.com/:_authToken=${{ secrets.FONTAWESOME_NPM_TOKEN }}' >> .npmrc
