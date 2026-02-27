@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub struct CliPaths {
     pub skills_dir: Option<PathBuf>,
@@ -172,52 +172,49 @@ pub fn discover_extensions(clis: &[super::detection::CliInfo]) -> Vec<Extension>
         let paths = resolve_cli_paths(&cli.name);
 
         // Discover skills
-        if let Some(ref skills_dir) = paths.skills_dir {
-            if skills_dir.is_dir() {
-                if let Ok(entries) = std::fs::read_dir(skills_dir) {
-                    for entry in entries.flatten() {
-                        if entry.path().is_dir() {
-                            let name = entry.file_name().to_string_lossy().to_string();
-                            // Check if already tracked
-                            if let Some(existing) =
-                                extensions.iter_mut().find(|e: &&mut Extension| {
-                                    e.name == name && e.ext_type == ExtensionType::Skill
-                                })
-                            {
-                                existing.installed_in.push(cli.name.clone());
-                            } else {
-                                extensions.push(Extension {
-                                    name,
-                                    ext_type: ExtensionType::Skill,
-                                    source_cli: cli.name.clone(),
-                                    installed_in: vec![cli.name.clone()],
-                                });
-                            }
-                        }
+        if let Some(ref skills_dir) = paths.skills_dir
+            && skills_dir.is_dir()
+            && let Ok(entries) = std::fs::read_dir(skills_dir)
+        {
+            for entry in entries.flatten() {
+                if entry.path().is_dir() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    // Check if already tracked
+                    if let Some(existing) = extensions.iter_mut().find(|e: &&mut Extension| {
+                        e.name == name && e.ext_type == ExtensionType::Skill
+                    }) {
+                        existing.installed_in.push(cli.name.clone());
+                    } else {
+                        extensions.push(Extension {
+                            name,
+                            ext_type: ExtensionType::Skill,
+                            source_cli: cli.name.clone(),
+                            installed_in: vec![cli.name.clone()],
+                        });
                     }
                 }
             }
         }
 
         // Discover MCPs from config
-        if let Some(ref mcp_config) = paths.mcp_config {
-            if mcp_config.exists() {
-                if let Ok(content) = std::fs::read_to_string(mcp_config) {
-                    let mcp_names = extract_mcp_names(&content, mcp_config);
-                    for name in mcp_names {
-                        if let Some(existing) = extensions.iter_mut().find(|e: &&mut Extension| {
-                            e.name == name && e.ext_type == ExtensionType::Mcp
-                        }) {
-                            existing.installed_in.push(cli.name.clone());
-                        } else {
-                            extensions.push(Extension {
-                                name,
-                                ext_type: ExtensionType::Mcp,
-                                source_cli: cli.name.clone(),
-                                installed_in: vec![cli.name.clone()],
-                            });
-                        }
-                    }
+        if let Some(ref mcp_config) = paths.mcp_config
+            && mcp_config.exists()
+            && let Ok(content) = std::fs::read_to_string(mcp_config)
+        {
+            let mcp_names = extract_mcp_names(&content, mcp_config);
+            for name in mcp_names {
+                if let Some(existing) = extensions
+                    .iter_mut()
+                    .find(|e: &&mut Extension| e.name == name && e.ext_type == ExtensionType::Mcp)
+                {
+                    existing.installed_in.push(cli.name.clone());
+                } else {
+                    extensions.push(Extension {
+                        name,
+                        ext_type: ExtensionType::Mcp,
+                        source_cli: cli.name.clone(),
+                        installed_in: vec![cli.name.clone()],
+                    });
                 }
             }
         }
@@ -226,22 +223,22 @@ pub fn discover_extensions(clis: &[super::detection::CliInfo]) -> Vec<Extension>
     extensions
 }
 
-fn extract_mcp_names(content: &str, path: &PathBuf) -> Vec<String> {
+fn extract_mcp_names(content: &str, path: &Path) -> Vec<String> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     match ext {
         "json" => {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(content) {
-                if let Some(servers) = val.get("mcpServers").and_then(|s| s.as_object()) {
-                    return servers.keys().cloned().collect();
-                }
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(content)
+                && let Some(servers) = val.get("mcpServers").and_then(|s| s.as_object())
+            {
+                return servers.keys().cloned().collect();
             }
             vec![]
         }
         "toml" => {
-            if let Ok(table) = content.parse::<toml::Table>() {
-                if let Some(mcp) = table.get("mcp").and_then(|m| m.as_table()) {
-                    return mcp.keys().cloned().collect();
-                }
+            if let Ok(table) = content.parse::<toml::Table>()
+                && let Some(mcp) = table.get("mcp").and_then(|m| m.as_table())
+            {
+                return mcp.keys().cloned().collect();
             }
             vec![]
         }

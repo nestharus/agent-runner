@@ -171,10 +171,10 @@ fn parse_model_names(cli_name: &str, output: &str) -> Vec<String> {
         }
 
         // Try to extract a model-like identifier from the line
-        if let Some(model_name) = extract_model_name(cli_name, trimmed) {
-            if is_valid_model_name(&model_name) {
-                models.push(model_name);
-            }
+        if let Some(model_name) = extract_model_name(cli_name, trimmed)
+            && is_valid_model_name(&model_name)
+        {
+            models.push(model_name);
         }
     }
 
@@ -190,7 +190,7 @@ fn extract_model_name(cli_name: &str, line: &str) -> Option<String> {
 
     // Strip leading bullet points, numbers, asterisks
     let cleaned = first_token
-        .trim_start_matches(|c: char| c == '*' || c == '>' || c == '|')
+        .trim_start_matches(['*', '>', '|'])
         .trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == ')')
         .trim();
 

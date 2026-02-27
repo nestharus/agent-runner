@@ -434,9 +434,9 @@ fn execute_allowlisted(command: &str, args: &[String]) -> Result<(String, String
 
 fn validate_and_write(path: &str, content: &str) -> Result<String, String> {
     // Expand ~ to home directory
-    let expanded = if path.starts_with("~/") {
+    let expanded = if let Some(stripped) = path.strip_prefix("~/") {
         let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
-        home.join(&path[2..])
+        home.join(stripped)
     } else {
         std::path::PathBuf::from(path)
     };

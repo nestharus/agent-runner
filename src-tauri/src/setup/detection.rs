@@ -446,26 +446,15 @@ fn enumerate_codex_profiles() -> Vec<CliProfile> {
     // 2. Named profiles from config.toml
     if let Some(home) = dirs::home_dir() {
         let config_path = home.join(".codex").join("config.toml");
-        if let Ok(content) = std::fs::read_to_string(&config_path) {
-            if let Ok(table) = content.parse::<toml::Table>() {
-                for key in table.keys() {
-                    if key.starts_with("profile.") || key == "profile" {
-                        // top-level `[profile.X]` sections appear as dotted keys
-                        // in some TOML parsers; handle both styles.
-                        let name = key.strip_prefix("profile.").unwrap_or(key);
-                        if !name.is_empty() {
-                            profiles.push(CliProfile {
-                                id: format!("profile:{name}"),
-                                auth_method: "config_profile".to_string(),
-                                active: false,
-                                details: None,
-                            });
-                        }
-                    }
-                }
-                // Also check for `[profiles]` table with sub-tables
-                if let Some(toml::Value::Table(pt)) = table.get("profiles") {
-                    for name in pt.keys() {
+        if let Ok(content) = std::fs::read_to_string(&config_path)
+            && let Ok(table) = content.parse::<toml::Table>()
+        {
+            for key in table.keys() {
+                if key.starts_with("profile.") || key == "profile" {
+                    // top-level `[profile.X]` sections appear as dotted keys
+                    // in some TOML parsers; handle both styles.
+                    let name = key.strip_prefix("profile.").unwrap_or(key);
+                    if !name.is_empty() {
                         profiles.push(CliProfile {
                             id: format!("profile:{name}"),
                             auth_method: "config_profile".to_string(),
@@ -473,6 +462,17 @@ fn enumerate_codex_profiles() -> Vec<CliProfile> {
                             details: None,
                         });
                     }
+                }
+            }
+            // Also check for `[profiles]` table with sub-tables
+            if let Some(toml::Value::Table(pt)) = table.get("profiles") {
+                for name in pt.keys() {
+                    profiles.push(CliProfile {
+                        id: format!("profile:{name}"),
+                        auth_method: "config_profile".to_string(),
+                        active: false,
+                        details: None,
+                    });
                 }
             }
         }
@@ -488,16 +488,16 @@ fn read_codex_email() -> Option<String> {
     let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
     // The id_token is a JWT; the email is in the payload.  For robustness
     // we look at the `tokens` object and try to find the email embedded.
-    if let Some(tokens) = parsed.get("tokens") {
-        if let Some(id_token) = tokens.get("id_token").and_then(|t| t.as_str()) {
-            // JWT has 3 dot-separated parts; payload is the second.
-            let parts: Vec<&str> = id_token.splitn(3, '.').collect();
-            if parts.len() >= 2 {
-                // base64url decode the payload
-                use base64_decode::decode_jwt_payload;
-                if let Some(email) = decode_jwt_payload(parts[1]) {
-                    return Some(email);
-                }
+    if let Some(tokens) = parsed.get("tokens")
+        && let Some(id_token) = tokens.get("id_token").and_then(|t| t.as_str())
+    {
+        // JWT has 3 dot-separated parts; payload is the second.
+        let parts: Vec<&str> = id_token.splitn(3, '.').collect();
+        if parts.len() >= 2 {
+            // base64url decode the payload
+            use base64_decode::decode_jwt_payload;
+            if let Some(email) = decode_jwt_payload(parts[1]) {
+                return Some(email);
             }
         }
     }
@@ -536,15 +536,15 @@ fn enumerate_gemini_profiles() -> Vec<CliProfile> {
 
     let mut profiles = Vec::new();
 
-    if let Some(active) = parsed.get("active").and_then(|v| v.as_str()) {
-        if !active.is_empty() {
-            profiles.push(CliProfile {
-                id: active.to_string(),
-                auth_method: "google_oauth".to_string(),
-                active: true,
-                details: None,
-            });
-        }
+    if let Some(active) = parsed.get("active").and_then(|v| v.as_str())
+        && !active.is_empty()
+    {
+        profiles.push(CliProfile {
+            id: active.to_string(),
+            auth_method: "google_oauth".to_string(),
+            active: true,
+            details: None,
+        });
     }
 
     if let Some(old) = parsed.get("old").and_then(|v| v.as_array()) {
@@ -701,24 +701,24 @@ fn scan_wrappers() -> Vec<WrapperInfo> {
 
     if let Some(home) = dirs::home_dir() {
         let bin_dir = home.join(".local").join("bin");
-        if bin_dir.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(&bin_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_file() {
-                        if let Some(target) = identify_wrapper(&path) {
-                            let name = path
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("")
-                                .to_string();
-                            wrappers.push(WrapperInfo {
-                                name,
-                                path: path.clone(),
-                                target_cli: Some(target),
-                            });
-                        }
-                    }
+        if bin_dir.is_dir()
+            && let Ok(entries) = std::fs::read_dir(&bin_dir)
+        {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file()
+                    && let Some(target) = identify_wrapper(&path)
+                {
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_string();
+                    wrappers.push(WrapperInfo {
+                        name,
+                        path: path.clone(),
+                        target_cli: Some(target),
+                    });
                 }
             }
         }
