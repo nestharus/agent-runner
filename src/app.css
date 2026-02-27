@@ -43,23 +43,50 @@ body {
 
 /* Portrait head bob */
 @keyframes ollie-bob {
-	0%, 100% { transform: translateY(0) rotate(0deg); }
-	50% { transform: translateY(-4px) rotate(3deg); }
+	0%,
+	100% {
+		transform: translateY(0) rotate(0deg);
+	}
+	50% {
+		transform: translateY(-4px) rotate(3deg);
+	}
 }
 
 /* Portrait eye blink */
 @keyframes ollie-blink {
-	0%, 46%, 50%, 100% { opacity: 1; transform: scaleY(1); }
-	48% { opacity: 0; transform: scaleY(0.1); }
+	0%,
+	46%,
+	50%,
+	100% {
+		opacity: 1;
+		transform: scaleY(1);
+	}
+	48% {
+		opacity: 0;
+		transform: scaleY(0.1);
+	}
 }
 
 /* Inline spinner diamond */
 @keyframes ollie-spin {
-	0% { transform: rotate(0deg) scale(0.8); fill: #4fc3f7; }
-	33% { fill: #b388ff; }
-	50% { transform: rotate(180deg) scale(1.1); fill: #ffd54f; }
-	66% { fill: #ff8a65; }
-	100% { transform: rotate(360deg) scale(0.8); fill: #4fc3f7; }
+	0% {
+		transform: rotate(0deg) scale(0.8);
+		fill: #4fc3f7;
+	}
+	33% {
+		fill: #b388ff;
+	}
+	50% {
+		transform: rotate(180deg) scale(1.1);
+		fill: #ffd54f;
+	}
+	66% {
+		fill: #ff8a65;
+	}
+	100% {
+		transform: rotate(360deg) scale(0.8);
+		fill: #4fc3f7;
+	}
 }
 
 /* Dashboard row entrance animation */

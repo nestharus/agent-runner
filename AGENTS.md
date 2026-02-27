@@ -92,6 +92,40 @@ Models use `group~facet` format (e.g., `claude~high`, `codex~low`). The
 `~` separator triggers grouping in the UI via `src/lib/grouping.ts`.
 Standalone models without `~` render as single entries.
 
+### Model Command Syntax
+
+The `command` field in model TOML configs supports multi-token strings.
+The **last token** is extracted as the provider name for pool grouping
+and display. Earlier tokens are treated as a command prefix (e.g., for
+setting or unsetting environment variables).
+
+**Simple command** — provider is the command itself:
+```toml
+command = "claude"
+# Provider name: "claude"
+```
+
+**Prefixed command** — provider is the last token:
+```toml
+command = "env -u CLAUDECODE claude"
+# Provider name: "claude"
+```
+
+**Double-quoted tokens** — use `"..."` when a token contains spaces.
+Quotes are stripped during shell splitting. This works on Linux, macOS,
+and Windows:
+```toml
+command = 'env -u CLAUDECODE "my provider"'
+# Provider name: "my provider"
+```
+
+The full command string (including prefix) is passed to the OS for
+execution. Only the extracted provider name is used for pool grouping
+(`derive_pools` in `lib.rs`) and display (`PoolCard.tsx`).
+
+Parsing is handled by `shell_split()` and `provider_name()` in
+`src-tauri/src/executor/mod.rs`.
+
 ## Design Workflow
 
 ### External Design Directory

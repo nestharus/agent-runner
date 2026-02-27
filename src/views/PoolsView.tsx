@@ -462,7 +462,11 @@ export default function PoolsView(props: PoolsViewProps) {
 										handleAddModelPanel(pool.commands, pool.model_names)
 									}
 									onAddModelToGroup={(group) =>
-										handleAddModelToGroup(pool.commands, pool.model_names, group)
+										handleAddModelToGroup(
+											pool.commands,
+											pool.model_names,
+											group,
+										)
 									}
 									onEditModel={(name) =>
 										handleEditModelPanel(pool.commands, pool.model_names, name)

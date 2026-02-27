@@ -15,9 +15,7 @@ interface OAuthFlowProps {
 export default function OAuthFlow(props: OAuthFlowProps) {
 	return (
 		<div class={card()}>
-			<h3 class="mb-3 text-text">
-				Authentication Required: {props.provider}
-			</h3>
+			<h3 class="mb-3 text-text">Authentication Required: {props.provider}</h3>
 			<div class="mb-4 text-[13px] leading-relaxed text-text-dim">
 				{renderInstructions(props.instructions)}
 			</div>

@@ -41,12 +41,15 @@ export default function OllieSvg(props: OllieSvgProps) {
 				viewBox="0 0 100 100"
 				width={size()}
 				height={size()}
+				role="img"
+				aria-label="Ollie mascot"
 				class={props.class}
 				style={{
 					filter: "url(#boil)",
 					animation: "ollie-bob 3s ease-in-out infinite",
 				}}
 			>
+				<title>Ollie mascot</title>
 				<g class="portrait-head" transform="translate(0, 5)">
 					<polygon points="15,20 85,30 75,60 5,50" fill="#ff8a65" />
 					<polygon points="5,50 75,60 45,95 -5,80" fill="#4fc3f7" />
