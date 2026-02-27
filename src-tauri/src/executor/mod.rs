@@ -122,10 +122,39 @@ fn execute_provider(
 }
 
 fn shell_split(s: &str) -> Vec<String> {
-    // Simple whitespace split (handles the common case).
-    // The Python version uses shlex.split which handles quotes,
-    // but model commands are typically single words.
-    s.split_whitespace().map(String::from).collect()
+    // Basic shell-like splitting that handles double-quoted tokens.
+    // e.g. `env -u CLAUDECODE "my cmd"` → ["env", "-u", "CLAUDECODE", "my cmd"]
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+
+    for ch in s.chars() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            c if c.is_whitespace() && !in_quotes => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            c => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+/// Extract the provider name from a command string.
+///
+/// The provider is the last shell-split token (quote-aware) so commands like
+/// `env -u CLAUDECODE claude` display as "claude" and commands like
+/// `env -u FOO "my provider"` display as "my provider".
+pub fn provider_name(command: &str) -> String {
+    shell_split(command)
+        .last()
+        .cloned()
+        .unwrap_or_else(|| command.to_string())
 }
 
 #[cfg(test)]
@@ -140,6 +169,34 @@ mod tests {
     #[test]
     fn shell_split_single() {
         assert_eq!(shell_split("codex"), vec!["codex"]);
+    }
+
+    #[test]
+    fn shell_split_quoted_token() {
+        assert_eq!(
+            shell_split(r#"env -u FOO "my cmd""#),
+            vec!["env", "-u", "FOO", "my cmd"]
+        );
+    }
+
+    #[test]
+    fn provider_name_simple() {
+        assert_eq!(provider_name("claude"), "claude");
+    }
+
+    #[test]
+    fn provider_name_with_prefix() {
+        assert_eq!(provider_name("env -u CLAUDECODE claude"), "claude");
+    }
+
+    #[test]
+    fn provider_name_quoted() {
+        assert_eq!(provider_name(r#"env -u FOO "claude""#), "claude");
+    }
+
+    #[test]
+    fn provider_name_with_spaces() {
+        assert_eq!(provider_name(r#"env -u FOO "my provider""#), "my provider");
     }
 
     #[cfg(unix)]

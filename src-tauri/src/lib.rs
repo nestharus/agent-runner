@@ -45,7 +45,11 @@ fn derive_pools(models: &HashMap<String, config::ModelConfig>) -> Vec<PoolSummar
     let mut groups: HashMap<Vec<String>, Vec<String>> = HashMap::new();
 
     for model in models.values() {
-        let mut cmds: Vec<String> = model.providers.iter().map(|p| p.command.clone()).collect();
+        // Group by extracted provider names (last token, quotes stripped)
+        // so `env -u CLAUDECODE claude` groups as "claude".
+        let mut cmds: Vec<String> = model.providers.iter()
+            .map(|p| executor::provider_name(&p.command))
+            .collect();
         cmds.sort();
         cmds.dedup();
         groups.entry(cmds).or_default().push(model.name.clone());
@@ -297,9 +301,11 @@ fn update_pool(
 
     let mut models = state.models.lock().map_err(|e| e.to_string())?;
 
-    // Find models matching the original command set
+    // Find models matching the original command set (using provider names)
     let matching_names: Vec<String> = models.values().filter(|m| {
-        let mut cmds: Vec<String> = m.providers.iter().map(|p| p.command.clone()).collect();
+        let mut cmds: Vec<String> = m.providers.iter()
+            .map(|p| executor::provider_name(&p.command))
+            .collect();
         cmds.sort();
         cmds.dedup();
         cmds == orig_sorted
@@ -309,15 +315,15 @@ fn update_pool(
         return Err("No models found with the specified command set".to_string());
     }
 
-    // Compute added and removed commands
+    // Compute added and removed provider names
     let removed: Vec<&String> = orig_sorted.iter().filter(|c| !new_sorted.contains(c)).collect();
     let added: Vec<&String> = new_sorted.iter().filter(|c| !orig_sorted.contains(c)).collect();
 
     for name in &matching_names {
         let model = models.get_mut(name).unwrap();
 
-        // Remove providers whose command is in the removed set
-        model.providers.retain(|p| !removed.contains(&&p.command));
+        // Remove providers whose extracted provider name is in the removed set
+        model.providers.retain(|p| !removed.contains(&&executor::provider_name(&p.command)));
 
         // Add providers with empty args for new commands
         for cmd in &added {
@@ -643,6 +649,27 @@ mod tests {
         let pools = derive_pools(&models);
         // Both should be in the same pool since deduped command set is ["claude"]
         assert_eq!(pools.len(), 1);
+        assert_eq!(pools[0].model_count, 2);
+    }
+
+    #[test]
+    fn derive_pools_extracts_provider_from_prefixed_command() {
+        let mut models = HashMap::new();
+        // Command with env prefix should group by the last token ("claude")
+        models.insert("a".into(), ModelConfig {
+            name: "a".to_string(),
+            prompt_mode: PromptMode::Stdin,
+            providers: vec![ProviderConfig {
+                command: "env -u CLAUDECODE claude".to_string(),
+                args: vec![],
+            }],
+        });
+        // Plain command should also group as "claude"
+        models.insert("b".into(), make_model("b", &["claude"]));
+
+        let pools = derive_pools(&models);
+        assert_eq!(pools.len(), 1);
+        assert_eq!(pools[0].commands, vec!["claude".to_string()]);
         assert_eq!(pools[0].model_count, 2);
     }
 }
