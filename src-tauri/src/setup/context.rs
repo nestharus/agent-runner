@@ -74,11 +74,18 @@ const RULES: &str = r#"## Rules
 8. When setup is complete, emit a "complete" action"#;
 
 pub fn build_agent_context(report: &DetectionReport, memory: &MemoryGraph) -> AgentContext {
-    let detection_json = serde_json::to_string_pretty(report)
-        .unwrap_or_else(|_| "{}".to_string());
+    let detection_json = serde_json::to_string_pretty(report).unwrap_or_else(|_| "{}".to_string());
 
     let memory_snapshot = memory
-        .subgraph_for_context(&["cli", "model", "provider", "wrapper", "skill", "mcp", "preference"])
+        .subgraph_for_context(&[
+            "cli",
+            "model",
+            "provider",
+            "wrapper",
+            "skill",
+            "mcp",
+            "preference",
+        ])
         .ok();
     let memory_json = memory_snapshot
         .map(|s| serde_json::to_string_pretty(&s).unwrap_or_else(|_| "{}".to_string()))
@@ -92,7 +99,7 @@ pub fn build_agent_context(report: &DetectionReport, memory: &MemoryGraph) -> Ag
 
 pub fn build_system_prompt(context: &AgentContext) -> String {
     format!(
-r#"You are a setup agent for the Oulipoly Agent Runner desktop application. Your role is to detect, install, configure, and troubleshoot CLI tools that the application uses to route LLM prompts.
+        r#"You are a setup agent for the Oulipoly Agent Runner desktop application. Your role is to detect, install, configure, and troubleshoot CLI tools that the application uses to route LLM prompts.
 
 ## Your Capabilities
 
@@ -129,7 +136,7 @@ If CLIs are detected but not authenticated, guide the user through authenticatio
 
 pub fn build_cli_setup_prompt(cli_name: &str, context: &AgentContext) -> String {
     format!(
-r#"You are a setup agent for the Oulipoly Agent Runner desktop application. The user wants to add the `{cli_name}` CLI. Help them install it, authenticate, create a model configuration, and test it.
+        r#"You are a setup agent for the Oulipoly Agent Runner desktop application. The user wants to add the `{cli_name}` CLI. Help them install it, authenticate, create a model configuration, and test it.
 
 ## Your Capabilities
 

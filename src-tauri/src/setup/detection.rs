@@ -85,8 +85,8 @@ impl VersionTracker {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("Failed to create directory for version DB: {e}"))?;
         }
-        let conn = Connection::open(db_path)
-            .map_err(|e| format!("Failed to open version DB: {e}"))?;
+        let conn =
+            Connection::open(db_path).map_err(|e| format!("Failed to open version DB: {e}"))?;
 
         conn.execute_batch("PRAGMA journal_mode=WAL;")
             .map_err(|e| format!("Failed to set WAL mode: {e}"))?;
@@ -154,10 +154,7 @@ impl VersionTracker {
         let now = chrono::Utc::now().to_rfc3339();
         let prev = self.get_current(cli_name)?;
 
-        let changed = prev
-            .as_ref()
-            .map(|r| r.version != version)
-            .unwrap_or(false);
+        let changed = prev.as_ref().map(|r| r.version != version).unwrap_or(false);
 
         self.conn
             .execute(
@@ -280,11 +277,7 @@ fn detect_cli(name: &str, config_dirs: &[&str], tracker: Option<&VersionTracker>
         _ => (false, None),
     };
 
-    let version = if installed {
-        get_version(name)
-    } else {
-        None
-    };
+    let version = if installed { get_version(name) } else { None };
 
     let home = dirs::home_dir().unwrap_or_default();
     let config_dir = config_dirs
@@ -292,11 +285,7 @@ fn detect_cli(name: &str, config_dirs: &[&str], tracker: Option<&VersionTracker>
         .map(|d| home.join(d))
         .find(|p| p.exists());
 
-    let authenticated = if installed {
-        check_auth(name)
-    } else {
-        false
-    };
+    let authenticated = if installed { check_auth(name) } else { false };
 
     let profiles = if installed {
         enumerate_profiles(name)
@@ -309,9 +298,7 @@ fn detect_cli(name: &str, config_dirs: &[&str], tracker: Option<&VersionTracker>
         (Some(ver), Some(t)) => {
             let prev = t.get_current(name).ok().flatten();
             let prev_ver = prev.map(|r| r.version);
-            let changed = t
-                .record(name, ver, path.as_deref())
-                .unwrap_or(false);
+            let changed = t.record(name, ver, path.as_deref()).unwrap_or(false);
             (Some(changed), prev_ver)
         }
         _ => (None, None),
@@ -331,10 +318,7 @@ fn detect_cli(name: &str, config_dirs: &[&str], tracker: Option<&VersionTracker>
 }
 
 fn get_version(cli: &str) -> Option<String> {
-    let output = Command::new(cli)
-        .arg("--version")
-        .output()
-        .ok()?;
+    let output = Command::new(cli).arg("--version").output().ok()?;
     if output.status.success() {
         Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
@@ -389,10 +373,7 @@ fn enumerate_profiles(cli: &str) -> Vec<CliProfile> {
 /// Claude: `claude auth status` returns JSON with email, authMethod,
 /// subscriptionType, etc.
 fn enumerate_claude_profiles() -> Vec<CliProfile> {
-    let output = match Command::new("claude")
-        .args(["auth", "status"])
-        .output()
-    {
+    let output = match Command::new("claude").args(["auth", "status"]).output() {
         Ok(o) if o.status.success() => o,
         _ => return vec![],
     };
@@ -403,7 +384,10 @@ fn enumerate_claude_profiles() -> Vec<CliProfile> {
         Err(_) => return vec![],
     };
 
-    let logged_in = parsed.get("loggedIn").and_then(|v| v.as_bool()).unwrap_or(false);
+    let logged_in = parsed
+        .get("loggedIn")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     if !logged_in {
         return vec![];
     }
@@ -442,9 +426,7 @@ fn enumerate_codex_profiles() -> Vec<CliProfile> {
     let mut profiles = Vec::new();
 
     // 1. Active login
-    let output = Command::new("codex")
-        .args(["login", "status"])
-        .output();
+    let output = Command::new("codex").args(["login", "status"]).output();
 
     if let Ok(o) = output {
         let text = String::from_utf8_lossy(&o.stdout).trim().to_string();
@@ -817,15 +799,21 @@ mod tests {
         let tracker = VersionTracker::open(Path::new(":memory:")).unwrap();
 
         // First record — no change (no prior version)
-        let changed = tracker.record("claude", "2.1.49", Some("/usr/bin/claude")).unwrap();
+        let changed = tracker
+            .record("claude", "2.1.49", Some("/usr/bin/claude"))
+            .unwrap();
         assert!(!changed);
 
         // Same version — no change
-        let changed = tracker.record("claude", "2.1.49", Some("/usr/bin/claude")).unwrap();
+        let changed = tracker
+            .record("claude", "2.1.49", Some("/usr/bin/claude"))
+            .unwrap();
         assert!(!changed);
 
         // Different version — change detected
-        let changed = tracker.record("claude", "2.2.0", Some("/usr/bin/claude")).unwrap();
+        let changed = tracker
+            .record("claude", "2.2.0", Some("/usr/bin/claude"))
+            .unwrap();
         assert!(changed);
 
         // Current should be 2.2.0

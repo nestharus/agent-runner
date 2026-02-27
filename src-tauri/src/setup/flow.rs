@@ -1,6 +1,4 @@
-use super::actions::{
-    AgentAction, ResultContent, SetupEvent, UserResponse,
-};
+use super::actions::{AgentAction, ResultContent, SetupEvent, UserResponse};
 use super::agent::SetupAgent;
 use super::context;
 use super::detection;
@@ -13,14 +11,10 @@ use tokio::sync::mpsc;
 const MAX_AGENT_TURNS: i32 = 25;
 
 const ALLOWED_COMMANDS: &[&str] = &[
-    "which", "type", "claude", "codex", "opencode", "gemini",
-    "npm", "npx", "curl", "bash",
+    "which", "type", "claude", "codex", "opencode", "gemini", "npm", "npx", "curl", "bash",
 ];
 
-const ALLOWED_WRITE_PREFIXES: &[&str] = &[
-    ".config/oulipoly-agent-runner/",
-    ".local/bin/",
-];
+const ALLOWED_WRITE_PREFIXES: &[&str] = &[".config/oulipoly-agent-runner/", ".local/bin/"];
 
 pub struct SetupFlow {
     channel: Channel<SetupEvent>,
@@ -65,7 +59,10 @@ impl SetupFlow {
         let system_prompt = context::build_system_prompt(&agent_context);
 
         // 3. Check if Claude CLI is available for agent-driven flow
-        let claude_available = report.clis.iter().any(|c| c.name == "claude" && c.installed);
+        let claude_available = report
+            .clis
+            .iter()
+            .any(|c| c.name == "claude" && c.installed);
 
         if !claude_available {
             // Phase A: Static bootstrap — no agent available
@@ -85,12 +82,20 @@ impl SetupFlow {
                     });
                     // Re-detect
                     let new_report = detection::detect_all();
-                    if !new_report.clis.iter().any(|c| c.name == "claude" && c.installed) {
+                    if !new_report
+                        .clis
+                        .iter()
+                        .any(|c| c.name == "claude" && c.installed)
+                    {
                         let _ = self.channel.send(SetupEvent::Error {
-                            message: "Claude CLI still not detected. Please install it and try again.".into(),
+                            message:
+                                "Claude CLI still not detected. Please install it and try again."
+                                    .into(),
                             recoverable: false,
                         });
-                        let _ = self.memory.end_session(&self.session_id, "failed_bootstrap");
+                        let _ = self
+                            .memory
+                            .end_session(&self.session_id, "failed_bootstrap");
                         return;
                     }
                 }
@@ -107,7 +112,8 @@ impl SetupFlow {
         }
 
         // Phase B: Agent-driven flow
-        self.run_agent_loop(system_prompt, "Analyze the system state and begin setup.").await;
+        self.run_agent_loop(system_prompt, "Analyze the system state and begin setup.")
+            .await;
     }
 
     pub async fn run_for_cli(mut self, cli_name: &str) {
@@ -127,10 +133,8 @@ impl SetupFlow {
         let agent_context = context::build_agent_context(&report, &self.memory);
         let system_prompt = context::build_cli_setup_prompt(cli_name, &agent_context);
 
-        self.run_agent_loop(
-            system_prompt,
-            &format!("Help set up the {} CLI.", cli_name),
-        ).await;
+        self.run_agent_loop(system_prompt, &format!("Help set up the {} CLI.", cli_name))
+            .await;
     }
 
     async fn run_agent_loop(&mut self, system_prompt: String, initial_message: &str) {
@@ -143,10 +147,14 @@ impl SetupFlow {
 
             if turn_number > MAX_AGENT_TURNS {
                 let _ = self.channel.send(SetupEvent::Error {
-                    message: "Setup agent exceeded maximum turns. Please retry or configure manually.".into(),
+                    message:
+                        "Setup agent exceeded maximum turns. Please retry or configure manually."
+                            .into(),
                     recoverable: false,
                 });
-                let _ = self.memory.end_session(&self.session_id, "max_turns_exceeded");
+                let _ = self
+                    .memory
+                    .end_session(&self.session_id, "max_turns_exceeded");
                 break;
             }
 
@@ -194,7 +202,11 @@ impl SetupFlow {
                         });
                     }
 
-                    AgentAction::RunCommand { command, args, description } => {
+                    AgentAction::RunCommand {
+                        command,
+                        args,
+                        description,
+                    } => {
                         let _ = self.channel.send(SetupEvent::Status {
                             message: description.clone(),
                         });
@@ -211,8 +223,11 @@ impl SetupFlow {
                                 });
                                 feedback_parts.push(format!(
                                     "Command `{} {}` completed (exit {}).\nstdout: {}\nstderr: {}",
-                                    command, args.join(" "), exit_code,
-                                    truncate(&stdout, 500), truncate(&stderr, 200)
+                                    command,
+                                    args.join(" "),
+                                    exit_code,
+                                    truncate(&stdout, 500),
+                                    truncate(&stderr, 200)
                                 ));
                             }
                             Err(e) => {
@@ -225,7 +240,11 @@ impl SetupFlow {
                         }
                     }
 
-                    AgentAction::WriteConfig { path, content, description } => {
+                    AgentAction::WriteConfig {
+                        path,
+                        content,
+                        description,
+                    } => {
                         let _ = self.channel.send(SetupEvent::Status {
                             message: description.clone(),
                         });
@@ -250,7 +269,11 @@ impl SetupFlow {
                         }
                     }
 
-                    AgentAction::TestIntegration { model_name, command, args } => {
+                    AgentAction::TestIntegration {
+                        model_name,
+                        command,
+                        args,
+                    } => {
                         let _ = self.channel.send(SetupEvent::Status {
                             message: format!("Testing {model_name}..."),
                         });
@@ -258,7 +281,11 @@ impl SetupFlow {
                         match execute_allowlisted(command, args) {
                             Ok((stdout, stderr, exit_code)) => {
                                 let success = exit_code == 0;
-                                let output = if success { stdout.clone() } else { stderr.clone() };
+                                let output = if success {
+                                    stdout.clone()
+                                } else {
+                                    stderr.clone()
+                                };
                                 let _ = self.channel.send(SetupEvent::ShowResult {
                                     content: ResultContent::TestResult {
                                         model: model_name.clone(),
@@ -306,13 +333,18 @@ impl SetupFlow {
                         }
                     }
 
-                    AgentAction::SyncSkill { source_cli, target_cli, skill_name } => {
+                    AgentAction::SyncSkill {
+                        source_cli,
+                        target_cli,
+                        skill_name,
+                    } => {
                         let _ = self.channel.send(SetupEvent::Status {
                             message: format!("Syncing skill '{skill_name}' to {target_cli}..."),
                         });
                         match sync::copy_skill(source_cli, target_cli, skill_name) {
                             Ok(()) => {
-                                feedback_parts.push(format!("Skill '{skill_name}' synced to {target_cli}"));
+                                feedback_parts
+                                    .push(format!("Skill '{skill_name}' synced to {target_cli}"));
                             }
                             Err(e) => {
                                 feedback_parts.push(format!("Failed to sync skill: {e}"));
@@ -320,13 +352,19 @@ impl SetupFlow {
                         }
                     }
 
-                    AgentAction::SyncMcp { source_cli: _, target_cli, mcp_name, config } => {
+                    AgentAction::SyncMcp {
+                        source_cli: _,
+                        target_cli,
+                        mcp_name,
+                        config,
+                    } => {
                         let _ = self.channel.send(SetupEvent::Status {
                             message: format!("Syncing MCP '{mcp_name}' to {target_cli}..."),
                         });
                         match sync::install_mcp(target_cli, mcp_name, config) {
                             Ok(()) => {
-                                feedback_parts.push(format!("MCP '{mcp_name}' installed in {target_cli}"));
+                                feedback_parts
+                                    .push(format!("MCP '{mcp_name}' installed in {target_cli}"));
                             }
                             Err(e) => {
                                 feedback_parts.push(format!("Failed to sync MCP: {e}"));
@@ -334,7 +372,12 @@ impl SetupFlow {
                         }
                     }
 
-                    AgentAction::UpdateMemory { node_type, label, data, edges } => {
+                    AgentAction::UpdateMemory {
+                        node_type,
+                        label,
+                        data,
+                        edges,
+                    } => {
                         let node_id = format!("{node_type}:{label}");
                         let _ = self.memory.upsert_node(&node_id, node_type, label, data);
                         for edge in edges {
@@ -363,7 +406,10 @@ impl SetupFlow {
             next_message = if feedback_parts.is_empty() {
                 "Continue with the next step.".to_string()
             } else {
-                format!("Results from previous actions:\n\n{}", feedback_parts.join("\n\n"))
+                format!(
+                    "Results from previous actions:\n\n{}",
+                    feedback_parts.join("\n\n")
+                )
             };
         }
     }
@@ -405,7 +451,9 @@ fn validate_and_write(path: &str, content: &str) -> Result<String, String> {
     });
 
     if !allowed {
-        return Err(format!("Write path '{resolved}' is not in allowed directories"));
+        return Err(format!(
+            "Write path '{resolved}' is not in allowed directories"
+        ));
     }
 
     // Create parent directories
@@ -414,8 +462,7 @@ fn validate_and_write(path: &str, content: &str) -> Result<String, String> {
             .map_err(|e| format!("Failed to create directories: {e}"))?;
     }
 
-    std::fs::write(&expanded, content)
-        .map_err(|e| format!("Failed to write file: {e}"))?;
+    std::fs::write(&expanded, content).map_err(|e| format!("Failed to write file: {e}"))?;
 
     Ok(resolved)
 }
@@ -427,20 +474,24 @@ fn get_install_instructions() -> String {
             1. Run: curl -fsSL https://claude.ai/install.sh | bash\n\
             2. After installation, run: claude login\n\
             3. Complete the OAuth flow in your browser\n\
-            4. Click 'I've logged in' when done".to_string(),
+            4. Click 'I've logged in' when done"
+            .to_string(),
         "macos" => "To install Claude CLI:\n\n\
             1. Run: brew install claude\n\
                OR: curl -fsSL https://claude.ai/install.sh | bash\n\
             2. After installation, run: claude login\n\
             3. Complete the OAuth flow in your browser\n\
-            4. Click 'I've logged in' when done".to_string(),
+            4. Click 'I've logged in' when done"
+            .to_string(),
         "windows" => "To install Claude CLI:\n\n\
             1. Run in PowerShell: irm https://claude.ai/install.ps1 | iex\n\
             2. After installation, run: claude login\n\
             3. Complete the OAuth flow in your browser\n\
-            4. Click 'I've logged in' when done".to_string(),
+            4. Click 'I've logged in' when done"
+            .to_string(),
         _ => "Please visit https://claude.ai/download to install the Claude CLI \
-            for your platform.\n\nAfter installation, run: claude login".to_string(),
+            for your platform.\n\nAfter installation, run: claude login"
+            .to_string(),
     }
 }
 

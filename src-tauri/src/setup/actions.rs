@@ -5,21 +5,51 @@ use std::collections::HashMap;
 #[derive(Clone, Serialize)]
 #[serde(tag = "event", content = "data", rename_all = "snake_case")]
 pub enum SetupEvent {
-    Status { message: String },
-    Progress { message: String, percent: Option<f64>, detail: Option<String> },
-    NeedInput { action: Action },
-    ShowResult { content: ResultContent },
-    Complete { summary: String, items_configured: Vec<String> },
-    Error { message: String, recoverable: bool },
+    Status {
+        message: String,
+    },
+    Progress {
+        message: String,
+        percent: Option<f64>,
+        detail: Option<String>,
+    },
+    NeedInput {
+        action: Action,
+    },
+    ShowResult {
+        content: ResultContent,
+    },
+    Complete {
+        summary: String,
+        items_configured: Vec<String>,
+    },
+    Error {
+        message: String,
+        recoverable: bool,
+    },
 }
 
 #[derive(Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResultContent {
-    CommandOutput { command: String, stdout: String, stderr: String, exit_code: i32 },
-    DetectionSummary { clis: Vec<CliSummaryItem> },
-    ConfigWritten { path: String, description: String },
-    TestResult { model: String, success: bool, output: String },
+    CommandOutput {
+        command: String,
+        stdout: String,
+        stderr: String,
+        exit_code: i32,
+    },
+    DetectionSummary {
+        clis: Vec<CliSummaryItem>,
+    },
+    ConfigWritten {
+        path: String,
+        description: String,
+    },
+    TestResult {
+        model: String,
+        success: bool,
+        output: String,
+    },
 }
 
 #[derive(Clone, Serialize)]
@@ -117,13 +147,33 @@ pub struct CliOption {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum UserResponse {
-    FormSubmit { form_id: String, values: HashMap<String, String> },
-    WizardStep { wizard_id: String, step: usize, values: HashMap<String, String> },
-    Confirm { confirm_id: String, confirmed: bool },
-    OauthComplete { provider: String, success: bool },
-    ApiKey { provider: String, key: String },
-    CliSelection { selected: Vec<String> },
-    Skip { reason: Option<String> },
+    FormSubmit {
+        form_id: String,
+        values: HashMap<String, String>,
+    },
+    WizardStep {
+        wizard_id: String,
+        step: usize,
+        values: HashMap<String, String>,
+    },
+    Confirm {
+        confirm_id: String,
+        confirmed: bool,
+    },
+    OauthComplete {
+        provider: String,
+        success: bool,
+    },
+    ApiKey {
+        provider: String,
+        key: String,
+    },
+    CliSelection {
+        selected: Vec<String>,
+    },
+    Skip {
+        reason: Option<String>,
+    },
     Cancel,
 }
 
@@ -138,15 +188,48 @@ pub struct AgentTurnResult {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentAction {
-    Status { message: String },
-    RunCommand { command: String, args: Vec<String>, description: String },
-    WriteConfig { path: String, content: String, description: String },
-    TestIntegration { model_name: String, command: String, args: Vec<String> },
-    AskUser { action: Action },
-    SyncSkill { source_cli: String, target_cli: String, skill_name: String },
-    SyncMcp { source_cli: String, target_cli: String, mcp_name: String, config: String },
-    UpdateMemory { node_type: String, label: String, data: String, edges: Vec<MemoryEdgeSpec> },
-    Complete { summary: String, items: Vec<String> },
+    Status {
+        message: String,
+    },
+    RunCommand {
+        command: String,
+        args: Vec<String>,
+        description: String,
+    },
+    WriteConfig {
+        path: String,
+        content: String,
+        description: String,
+    },
+    TestIntegration {
+        model_name: String,
+        command: String,
+        args: Vec<String>,
+    },
+    AskUser {
+        action: Action,
+    },
+    SyncSkill {
+        source_cli: String,
+        target_cli: String,
+        skill_name: String,
+    },
+    SyncMcp {
+        source_cli: String,
+        target_cli: String,
+        mcp_name: String,
+        config: String,
+    },
+    UpdateMemory {
+        node_type: String,
+        label: String,
+        data: String,
+        edges: Vec<MemoryEdgeSpec>,
+    },
+    Complete {
+        summary: String,
+        items: Vec<String>,
+    },
 }
 
 #[derive(Deserialize)]

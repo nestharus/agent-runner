@@ -60,7 +60,10 @@ pub fn copy_skill(source_cli: &str, target_cli: &str, skill_name: &str) -> Resul
         .join(skill_name);
 
     if !source.exists() {
-        return Err(format!("Skill '{}' not found in {}", skill_name, source_cli));
+        return Err(format!(
+            "Skill '{}' not found in {}",
+            skill_name, source_cli
+        ));
     }
 
     copy_dir_recursive(&source, &target)
@@ -77,7 +80,10 @@ pub fn install_mcp(target_cli: &str, mcp_name: &str, config_json: &str) -> Resul
             .map_err(|e| format!("Failed to create config directory: {e}"))?;
     }
 
-    let ext = config_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let ext = config_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
 
     match ext {
         "json" => install_mcp_json(&config_path, mcp_name, config_json),
@@ -86,7 +92,11 @@ pub fn install_mcp(target_cli: &str, mcp_name: &str, config_json: &str) -> Resul
     }
 }
 
-fn install_mcp_json(config_path: &PathBuf, mcp_name: &str, config_json: &str) -> Result<(), String> {
+fn install_mcp_json(
+    config_path: &PathBuf,
+    mcp_name: &str,
+    config_json: &str,
+) -> Result<(), String> {
     let existing = if config_path.exists() {
         let content = std::fs::read_to_string(config_path)
             .map_err(|e| format!("Failed to read config: {e}"))?;
@@ -101,7 +111,9 @@ fn install_mcp_json(config_path: &PathBuf, mcp_name: &str, config_json: &str) ->
         .map_err(|e| format!("Failed to parse MCP config: {e}"))?;
 
     if let Some(obj) = config.as_object_mut() {
-        let mcps = obj.entry("mcpServers").or_insert_with(|| serde_json::json!({}));
+        let mcps = obj
+            .entry("mcpServers")
+            .or_insert_with(|| serde_json::json!({}));
         if let Some(mcps_obj) = mcps.as_object_mut() {
             mcps_obj.insert(mcp_name.to_string(), mcp_value);
         }
@@ -109,24 +121,30 @@ fn install_mcp_json(config_path: &PathBuf, mcp_name: &str, config_json: &str) ->
 
     let output = serde_json::to_string_pretty(&config)
         .map_err(|e| format!("Failed to serialize config: {e}"))?;
-    std::fs::write(config_path, output)
-        .map_err(|e| format!("Failed to write config: {e}"))?;
+    std::fs::write(config_path, output).map_err(|e| format!("Failed to write config: {e}"))?;
 
     Ok(())
 }
 
-fn install_mcp_toml(config_path: &PathBuf, mcp_name: &str, config_json: &str) -> Result<(), String> {
+fn install_mcp_toml(
+    config_path: &PathBuf,
+    mcp_name: &str,
+    config_json: &str,
+) -> Result<(), String> {
     let existing = if config_path.exists() {
         let content = std::fs::read_to_string(config_path)
             .map_err(|e| format!("Failed to read config: {e}"))?;
-        content.parse::<toml::Table>()
+        content
+            .parse::<toml::Table>()
             .map_err(|e| format!("Failed to parse TOML: {e}"))?
     } else {
         toml::Table::new()
     };
 
     let mut config = existing;
-    let mcp_table = config.entry("mcp").or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let mcp_table = config
+        .entry("mcp")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
 
     if let Some(mcp_obj) = mcp_table.as_table_mut() {
         // Store the config JSON as a string value under the MCP name
@@ -136,10 +154,9 @@ fn install_mcp_toml(config_path: &PathBuf, mcp_name: &str, config_json: &str) ->
         );
     }
 
-    let output = toml::to_string_pretty(&config)
-        .map_err(|e| format!("Failed to serialize TOML: {e}"))?;
-    std::fs::write(config_path, output)
-        .map_err(|e| format!("Failed to write config: {e}"))?;
+    let output =
+        toml::to_string_pretty(&config).map_err(|e| format!("Failed to serialize TOML: {e}"))?;
+    std::fs::write(config_path, output).map_err(|e| format!("Failed to write config: {e}"))?;
 
     Ok(())
 }
@@ -162,9 +179,11 @@ pub fn discover_extensions(clis: &[super::detection::CliInfo]) -> Vec<Extension>
                         if entry.path().is_dir() {
                             let name = entry.file_name().to_string_lossy().to_string();
                             // Check if already tracked
-                            if let Some(existing) = extensions.iter_mut().find(|e: &&mut Extension| {
-                                e.name == name && e.ext_type == ExtensionType::Skill
-                            }) {
+                            if let Some(existing) =
+                                extensions.iter_mut().find(|e: &&mut Extension| {
+                                    e.name == name && e.ext_type == ExtensionType::Skill
+                                })
+                            {
                                 existing.installed_in.push(cli.name.clone());
                             } else {
                                 extensions.push(Extension {

@@ -43,9 +43,7 @@ const STRATEGIES: &[CliDiscoveryStrategy] = &[
 pub fn discover_models(cli_name: &str) -> Result<DiscoveryResult, String> {
     let cli_version = get_cli_version(cli_name)?;
 
-    let strategy = STRATEGIES
-        .iter()
-        .find(|s| s.name == cli_name);
+    let strategy = STRATEGIES.iter().find(|s| s.name == cli_name);
 
     let commands: &[&[&str]] = match strategy {
         Some(s) => s.commands,
@@ -229,9 +227,29 @@ fn is_valid_model_name(name: &str) -> bool {
     // Must not be a common non-model word
     let lower = name.to_lowercase();
     let stop_words = [
-        "name", "id", "type", "model", "models", "list", "help", "version",
-        "the", "and", "for", "with", "from", "this", "that", "description",
-        "status", "created", "updated", "default", "none", "true", "false",
+        "name",
+        "id",
+        "type",
+        "model",
+        "models",
+        "list",
+        "help",
+        "version",
+        "the",
+        "and",
+        "for",
+        "with",
+        "from",
+        "this",
+        "that",
+        "description",
+        "status",
+        "created",
+        "updated",
+        "default",
+        "none",
+        "true",
+        "false",
     ];
     if stop_words.contains(&lower.as_str()) {
         return false;
@@ -239,12 +257,7 @@ fn is_valid_model_name(name: &str) -> bool {
 
     // Should only contain valid model-name characters
     name.chars().all(|c| {
-        c.is_ascii_alphanumeric()
-            || c == '-'
-            || c == '_'
-            || c == '.'
-            || c == ':'
-            || c == '/'
+        c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == ':' || c == '/'
     })
 }
 
@@ -257,50 +270,44 @@ fn build_default_parameters(
     let mut params = Vec::new();
 
     let common_params = match cli_name {
-        "claude" => vec![
-            ModelParameter {
-                name: "max_tokens".to_string(),
-                display_name: "Max Tokens".to_string(),
-                param_type: ParamType::Number {
-                    min: Some(1.0),
-                    max: Some(200000.0),
-                },
-                description: "Maximum number of tokens to generate".to_string(),
-                cli_mapping: CliMapping {
-                    flag: "--max-tokens".to_string(),
-                    value_template: "{value}".to_string(),
-                },
+        "claude" => vec![ModelParameter {
+            name: "max_tokens".to_string(),
+            display_name: "Max Tokens".to_string(),
+            param_type: ParamType::Number {
+                min: Some(1.0),
+                max: Some(200000.0),
             },
-        ],
-        "codex" => vec![
-            ModelParameter {
-                name: "model".to_string(),
-                display_name: "Model".to_string(),
-                param_type: ParamType::Enum {
-                    options: model_names.to_vec(),
-                },
-                description: "Model to use for generation".to_string(),
-                cli_mapping: CliMapping {
-                    flag: "-m".to_string(),
-                    value_template: "{value}".to_string(),
-                },
+            description: "Maximum number of tokens to generate".to_string(),
+            cli_mapping: CliMapping {
+                flag: "--max-tokens".to_string(),
+                value_template: "{value}".to_string(),
             },
-        ],
-        "gemini" => vec![
-            ModelParameter {
-                name: "temperature".to_string(),
-                display_name: "Temperature".to_string(),
-                param_type: ParamType::Number {
-                    min: Some(0.0),
-                    max: Some(2.0),
-                },
-                description: "Controls randomness of output".to_string(),
-                cli_mapping: CliMapping {
-                    flag: "--temperature".to_string(),
-                    value_template: "{value}".to_string(),
-                },
+        }],
+        "codex" => vec![ModelParameter {
+            name: "model".to_string(),
+            display_name: "Model".to_string(),
+            param_type: ParamType::Enum {
+                options: model_names.to_vec(),
             },
-        ],
+            description: "Model to use for generation".to_string(),
+            cli_mapping: CliMapping {
+                flag: "-m".to_string(),
+                value_template: "{value}".to_string(),
+            },
+        }],
+        "gemini" => vec![ModelParameter {
+            name: "temperature".to_string(),
+            display_name: "Temperature".to_string(),
+            param_type: ParamType::Number {
+                min: Some(0.0),
+                max: Some(2.0),
+            },
+            description: "Controls randomness of output".to_string(),
+            cli_mapping: CliMapping {
+                flag: "--temperature".to_string(),
+                value_template: "{value}".to_string(),
+            },
+        }],
         _ => vec![],
     };
 

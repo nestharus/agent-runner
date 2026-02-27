@@ -41,10 +41,7 @@ pub enum ParamType {
     /// A free-form string parameter.
     String,
     /// A numeric parameter with optional bounds.
-    Number {
-        min: Option<f64>,
-        max: Option<f64>,
-    },
+    Number { min: Option<f64>, max: Option<f64> },
     /// A boolean flag parameter.
     Boolean,
 }
@@ -1070,9 +1067,7 @@ mod tests {
         db.upsert_model_parameter("claude-opus-4", "claude", &model_param)
             .unwrap();
 
-        let params = db
-            .list_model_parameters("claude-opus-4", "claude")
-            .unwrap();
+        let params = db.list_model_parameters("claude-opus-4", "claude").unwrap();
         assert_eq!(params.len(), 2);
         // Ordered by name
         assert_eq!(params[0].name, "model");

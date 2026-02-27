@@ -19,9 +19,12 @@ impl SetupAgent {
     pub fn send_turn(&mut self, message: &str, schema: &str) -> Result<AgentTurnResult, String> {
         let mut cmd = Command::new("claude");
         cmd.arg("-p")
-            .arg("--output-format").arg("json")
-            .arg("--model").arg("claude-sonnet-4-6")
-            .arg("--allowedTools").arg("Read,Bash,Glob,Grep")
+            .arg("--output-format")
+            .arg("json")
+            .arg("--model")
+            .arg("claude-sonnet-4-6")
+            .arg("--allowedTools")
+            .arg("Read,Bash,Glob,Grep")
             .arg("--no-session-persistence");
 
         // Add JSON schema constraint
@@ -42,7 +45,8 @@ impl SetupAgent {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
-        let mut child = cmd.spawn()
+        let mut child = cmd
+            .spawn()
             .map_err(|e| format!("Failed to spawn claude CLI: {e}"))?;
 
         let timeout = Duration::from_secs(120);
@@ -51,7 +55,8 @@ impl SetupAgent {
         let output = loop {
             match child.try_wait() {
                 Ok(Some(_status)) => {
-                    break child.wait_with_output()
+                    break child
+                        .wait_with_output()
                         .map_err(|e| format!("Failed to read claude CLI output: {e}"))?;
                 }
                 Ok(None) => {
@@ -81,9 +86,12 @@ impl SetupAgent {
 
         // Parse the JSON response
         // Claude --output-format json wraps the result; we need to extract the structured content
-        let result: AgentTurnResult = serde_json::from_str(&stdout)
-            .map_err(|e| format!("Failed to parse agent response: {e}\nRaw output: {}",
-                stdout.chars().take(200).collect::<String>()))?;
+        let result: AgentTurnResult = serde_json::from_str(&stdout).map_err(|e| {
+            format!(
+                "Failed to parse agent response: {e}\nRaw output: {}",
+                stdout.chars().take(200).collect::<String>()
+            )
+        })?;
 
         // Try to extract session_id from stderr or response metadata
         // Claude CLI outputs session info to stderr

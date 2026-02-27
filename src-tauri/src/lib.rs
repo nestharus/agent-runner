@@ -7,6 +7,7 @@ pub mod setup;
 pub mod state;
 
 use config::{ModelConfig, PromptMode};
+use serde::{Deserialize, Serialize};
 use setup::actions::{SetupEvent, UserResponse};
 #[allow(unused_imports)]
 use state::StateDb;
@@ -15,7 +16,6 @@ use state::{DiscoveredModel, ModelParameter};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
 use tokio::sync::mpsc;
 
@@ -47,7 +47,9 @@ fn derive_pools(models: &HashMap<String, config::ModelConfig>) -> Vec<PoolSummar
     for model in models.values() {
         // Group by extracted provider names (last token, quotes stripped)
         // so `env -u CLAUDECODE claude` groups as "claude".
-        let mut cmds: Vec<String> = model.providers.iter()
+        let mut cmds: Vec<String> = model
+            .providers
+            .iter()
             .map(|p| executor::provider_name(&p.command))
             .collect();
         cmds.sort();
@@ -55,14 +57,17 @@ fn derive_pools(models: &HashMap<String, config::ModelConfig>) -> Vec<PoolSummar
         groups.entry(cmds).or_default().push(model.name.clone());
     }
 
-    let mut pools: Vec<PoolSummary> = groups.into_iter().map(|(commands, mut model_names)| {
-        model_names.sort();
-        PoolSummary {
-            model_count: model_names.len(),
-            commands,
-            model_names,
-        }
-    }).collect();
+    let mut pools: Vec<PoolSummary> = groups
+        .into_iter()
+        .map(|(commands, mut model_names)| {
+            model_names.sort();
+            PoolSummary {
+                model_count: model_names.len(),
+                commands,
+                model_names,
+            }
+        })
+        .collect();
 
     pools.sort_by(|a, b| a.commands.cmp(&b.commands));
     pools
@@ -81,9 +86,7 @@ fn check_setup_needed(state: tauri::State<AppState>) -> Result<bool, String> {
         return Ok(true);
     }
     // Check if claude CLI is available
-    let output = std::process::Command::new("which")
-        .arg("claude")
-        .output();
+    let output = std::process::Command::new("which").arg("claude").output();
     match output {
         Ok(o) if o.status.success() => Ok(false),
         _ => Ok(true),
@@ -104,7 +107,9 @@ async fn start_setup(
     }
 
     let sid = session_id.clone();
-    let db_path = state.models_dir.parent()
+    let db_path = state
+        .models_dir
+        .parent()
         .unwrap_or(&state.models_dir)
         .join("state.db");
 
@@ -120,12 +125,7 @@ async fn start_setup(
             }
         };
 
-        let flow = setup::flow::SetupFlow::new(
-            on_event,
-            rx,
-            memory,
-            sid,
-        );
+        let flow = setup::flow::SetupFlow::new(on_event, rx, memory, sid);
         flow.run().await;
     });
 
@@ -133,13 +133,11 @@ async fn start_setup(
 }
 
 #[tauri::command]
-fn setup_respond(
-    state: tauri::State<AppState>,
-    response: UserResponse,
-) -> Result<(), String> {
+fn setup_respond(state: tauri::State<AppState>, response: UserResponse) -> Result<(), String> {
     let guard = state.setup_input_tx.lock().map_err(|e| e.to_string())?;
     if let Some(ref tx) = *guard {
-        tx.blocking_send(response).map_err(|e| format!("Failed to send response: {e}"))
+        tx.blocking_send(response)
+            .map_err(|e| format!("Failed to send response: {e}"))
     } else {
         Err("No active setup session".to_string())
     }
@@ -167,7 +165,9 @@ async fn start_cli_setup(
     }
 
     let sid = session_id.clone();
-    let db_path = state.models_dir.parent()
+    let db_path = state
+        .models_dir
+        .parent()
         .unwrap_or(&state.models_dir)
         .join("state.db");
     let cli = cli_name.clone();
@@ -184,12 +184,7 @@ async fn start_cli_setup(
             }
         };
 
-        let flow = setup::flow::SetupFlow::new(
-            on_event,
-            rx,
-            memory,
-            sid,
-        );
+        let flow = setup::flow::SetupFlow::new(on_event, rx, memory, sid);
         flow.run_for_cli(&cli).await;
     });
 
@@ -210,8 +205,12 @@ fn detect_clis() -> Result<setup::detection::DetectionReport, String> {
 }
 
 #[tauri::command]
-fn get_memory_graph(state: tauri::State<AppState>) -> Result<setup::memory::MemorySnapshot, String> {
-    let db_path = state.models_dir.parent()
+fn get_memory_graph(
+    state: tauri::State<AppState>,
+) -> Result<setup::memory::MemorySnapshot, String> {
+    let db_path = state
+        .models_dir
+        .parent()
         .unwrap_or(&state.models_dir)
         .join("state.db");
     let graph = setup::memory::MemoryGraph::open(&db_path)?;
@@ -221,11 +220,14 @@ fn get_memory_graph(state: tauri::State<AppState>) -> Result<setup::memory::Memo
 #[tauri::command]
 fn list_models(state: tauri::State<AppState>) -> Result<Vec<ModelSummary>, String> {
     let models = state.models.lock().map_err(|e| e.to_string())?;
-    let mut summaries: Vec<ModelSummary> = models.values().map(|m| ModelSummary {
-        name: m.name.clone(),
-        prompt_mode: m.prompt_mode,
-        provider_count: m.providers.len(),
-    }).collect();
+    let mut summaries: Vec<ModelSummary> = models
+        .values()
+        .map(|m| ModelSummary {
+            name: m.name.clone(),
+            prompt_mode: m.prompt_mode,
+            provider_count: m.providers.len(),
+        })
+        .collect();
     summaries.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(summaries)
 }
@@ -233,7 +235,10 @@ fn list_models(state: tauri::State<AppState>) -> Result<Vec<ModelSummary>, Strin
 #[tauri::command]
 fn get_model(state: tauri::State<AppState>, name: String) -> Result<ModelConfig, String> {
     let models = state.models.lock().map_err(|e| e.to_string())?;
-    models.get(&name).cloned().ok_or_else(|| format!("Model '{}' not found", name))
+    models
+        .get(&name)
+        .cloned()
+        .ok_or_else(|| format!("Model '{}' not found", name))
 }
 
 #[tauri::command]
@@ -255,8 +260,7 @@ fn save_model(state: tauri::State<AppState>, model: ModelConfig) -> Result<(), S
 
     std::fs::create_dir_all(&state.models_dir)
         .map_err(|e| format!("Failed to create models directory: {e}"))?;
-    std::fs::write(&path, &toml_content)
-        .map_err(|e| format!("Failed to write model file: {e}"))?;
+    std::fs::write(&path, &toml_content).map_err(|e| format!("Failed to write model file: {e}"))?;
 
     let mut models = state.models.lock().map_err(|e| e.to_string())?;
     models.insert(model.name.clone(), model);
@@ -267,8 +271,7 @@ fn save_model(state: tauri::State<AppState>, model: ModelConfig) -> Result<(), S
 fn delete_model(state: tauri::State<AppState>, name: String) -> Result<(), String> {
     let path = state.models_dir.join(format!("{}.toml", name));
     if path.exists() {
-        std::fs::remove_file(&path)
-            .map_err(|e| format!("Failed to delete model file: {e}"))?;
+        std::fs::remove_file(&path).map_err(|e| format!("Failed to delete model file: {e}"))?;
     }
     let mut models = state.models.lock().map_err(|e| e.to_string())?;
     models.remove(&name);
@@ -302,28 +305,42 @@ fn update_pool(
     let mut models = state.models.lock().map_err(|e| e.to_string())?;
 
     // Find models matching the original command set (using provider names)
-    let matching_names: Vec<String> = models.values().filter(|m| {
-        let mut cmds: Vec<String> = m.providers.iter()
-            .map(|p| executor::provider_name(&p.command))
-            .collect();
-        cmds.sort();
-        cmds.dedup();
-        cmds == orig_sorted
-    }).map(|m| m.name.clone()).collect();
+    let matching_names: Vec<String> = models
+        .values()
+        .filter(|m| {
+            let mut cmds: Vec<String> = m
+                .providers
+                .iter()
+                .map(|p| executor::provider_name(&p.command))
+                .collect();
+            cmds.sort();
+            cmds.dedup();
+            cmds == orig_sorted
+        })
+        .map(|m| m.name.clone())
+        .collect();
 
     if matching_names.is_empty() {
         return Err("No models found with the specified command set".to_string());
     }
 
     // Compute added and removed provider names
-    let removed: Vec<&String> = orig_sorted.iter().filter(|c| !new_sorted.contains(c)).collect();
-    let added: Vec<&String> = new_sorted.iter().filter(|c| !orig_sorted.contains(c)).collect();
+    let removed: Vec<&String> = orig_sorted
+        .iter()
+        .filter(|c| !new_sorted.contains(c))
+        .collect();
+    let added: Vec<&String> = new_sorted
+        .iter()
+        .filter(|c| !orig_sorted.contains(c))
+        .collect();
 
     for name in &matching_names {
         let model = models.get_mut(name).unwrap();
 
         // Remove providers whose extracted provider name is in the removed set
-        model.providers.retain(|p| !removed.contains(&&executor::provider_name(&p.command)));
+        model
+            .providers
+            .retain(|p| !removed.contains(&&executor::provider_name(&p.command)));
 
         // Add providers with empty args for new commands
         for cmd in &added {
@@ -348,14 +365,21 @@ fn update_pool(
 }
 
 #[tauri::command]
-async fn test_model(state: tauri::State<'_, AppState>, name: String) -> Result<TestModelResult, String> {
+async fn test_model(
+    state: tauri::State<'_, AppState>,
+    name: String,
+) -> Result<TestModelResult, String> {
     let model = {
         let models = state.models.lock().map_err(|e| e.to_string())?;
-        models.get(&name).cloned()
+        models
+            .get(&name)
+            .cloned()
             .ok_or_else(|| format!("Model '{}' not found", name))?
     };
 
-    let db_path = state.models_dir.parent()
+    let db_path = state
+        .models_dir
+        .parent()
         .unwrap_or(&state.models_dir)
         .join("state.db");
 
@@ -363,7 +387,9 @@ async fn test_model(state: tauri::State<'_, AppState>, name: String) -> Result<T
         let db = state::StateDb::open(&db_path).map_err(|e| e.to_string())?;
         let provider_index = balancer::select_provider(&model, &db);
         executor::execute(&model, provider_index, "Say hello in one sentence.", None)
-    }).await.map_err(|e| e.to_string())??;
+    })
+    .await
+    .map_err(|e| e.to_string())??;
 
     Ok(TestModelResult {
         success: result.exit_code == 0,
@@ -599,16 +625,19 @@ pub fn run_tauri() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use config::{ModelConfig, ProviderConfig, PromptMode};
+    use config::{ModelConfig, PromptMode, ProviderConfig};
 
     fn make_model(name: &str, commands: &[&str]) -> ModelConfig {
         ModelConfig {
             name: name.to_string(),
             prompt_mode: PromptMode::Stdin,
-            providers: commands.iter().map(|c| ProviderConfig {
-                command: c.to_string(),
-                args: vec![],
-            }).collect(),
+            providers: commands
+                .iter()
+                .map(|c| ProviderConfig {
+                    command: c.to_string(),
+                    args: vec![],
+                })
+                .collect(),
         }
     }
 
@@ -622,12 +651,18 @@ mod tests {
         let pools = derive_pools(&models);
         assert_eq!(pools.len(), 2);
 
-        let pool_claude = pools.iter().find(|p| p.commands.contains(&"claude".to_string())).unwrap();
+        let pool_claude = pools
+            .iter()
+            .find(|p| p.commands.contains(&"claude".to_string()))
+            .unwrap();
         assert_eq!(pool_claude.model_count, 2);
         assert!(pool_claude.model_names.contains(&"a".to_string()));
         assert!(pool_claude.model_names.contains(&"b".to_string()));
 
-        let pool_gemini = pools.iter().find(|p| p.commands.contains(&"gemini".to_string())).unwrap();
+        let pool_gemini = pools
+            .iter()
+            .find(|p| p.commands.contains(&"gemini".to_string()))
+            .unwrap();
         assert_eq!(pool_gemini.model_count, 1);
         assert_eq!(pool_gemini.model_names, vec!["c".to_string()]);
     }
@@ -636,14 +671,23 @@ mod tests {
     fn derive_pools_deduplicates_commands() {
         let mut models = HashMap::new();
         // Model with duplicate commands should deduplicate
-        models.insert("x".into(), ModelConfig {
-            name: "x".to_string(),
-            prompt_mode: PromptMode::Stdin,
-            providers: vec![
-                ProviderConfig { command: "claude".to_string(), args: vec![] },
-                ProviderConfig { command: "claude".to_string(), args: vec!["-p".to_string()] },
-            ],
-        });
+        models.insert(
+            "x".into(),
+            ModelConfig {
+                name: "x".to_string(),
+                prompt_mode: PromptMode::Stdin,
+                providers: vec![
+                    ProviderConfig {
+                        command: "claude".to_string(),
+                        args: vec![],
+                    },
+                    ProviderConfig {
+                        command: "claude".to_string(),
+                        args: vec!["-p".to_string()],
+                    },
+                ],
+            },
+        );
         models.insert("y".into(), make_model("y", &["claude"]));
 
         let pools = derive_pools(&models);
@@ -656,14 +700,17 @@ mod tests {
     fn derive_pools_extracts_provider_from_prefixed_command() {
         let mut models = HashMap::new();
         // Command with env prefix should group by the last token ("claude")
-        models.insert("a".into(), ModelConfig {
-            name: "a".to_string(),
-            prompt_mode: PromptMode::Stdin,
-            providers: vec![ProviderConfig {
-                command: "env -u CLAUDECODE claude".to_string(),
-                args: vec![],
-            }],
-        });
+        models.insert(
+            "a".into(),
+            ModelConfig {
+                name: "a".to_string(),
+                prompt_mode: PromptMode::Stdin,
+                providers: vec![ProviderConfig {
+                    command: "env -u CLAUDECODE claude".to_string(),
+                    args: vec![],
+                }],
+            },
+        );
         // Plain command should also group as "claude"
         models.insert("b".into(), make_model("b", &["claude"]));
 

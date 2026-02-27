@@ -1,5 +1,7 @@
 use agent_runner_lib::balancer;
-use agent_runner_lib::config::{AgentConfig, ModelConfig, load_agent_file, load_agents, load_models};
+use agent_runner_lib::config::{
+    AgentConfig, ModelConfig, load_agent_file, load_agents, load_models,
+};
 use agent_runner_lib::diagnostics;
 use agent_runner_lib::executor;
 use agent_runner_lib::state::StateDb;
