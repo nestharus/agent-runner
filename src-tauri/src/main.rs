@@ -8,7 +8,7 @@ use agent_runner_lib::state::StateDb;
 
 use clap::Parser;
 use std::collections::HashMap;
-use std::io::{IsTerminal, Read};
+use std::io::{IsTerminal, Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -48,6 +48,10 @@ struct Cli {
     /// Agents directory
     #[arg(long)]
     agents_dir: Option<PathBuf>,
+
+    /// Pass model inputs as key=value pairs (repeatable)
+    #[arg(short = 'i', long = "input", value_name = "KEY=VALUE")]
+    inputs: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -78,6 +82,20 @@ fn load_app_config() -> AppConfig {
     }
 }
 
+/// Parse --input key=value flags into a map (repeated keys become arrays).
+fn parse_inputs(raw: &[String]) -> Result<HashMap<String, Vec<String>>, String> {
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    for entry in raw {
+        let (key, value) = entry
+            .split_once('=')
+            .ok_or_else(|| format!("Invalid input format '{}': expected KEY=VALUE", entry))?;
+        map.entry(key.to_string())
+            .or_default()
+            .push(value.to_string());
+    }
+    Ok(map)
+}
+
 fn collect_positional_prompt(cli: &Cli, include_agent: bool) -> Option<String> {
     let mut parts = Vec::new();
     if include_agent && let Some(ref a) = cli.agent {
@@ -94,7 +112,6 @@ fn collect_positional_prompt(cli: &Cli, include_agent: bool) -> Option<String> {
 }
 
 fn resolve_prompt(cli: &Cli, include_agent_as_prompt: bool) -> Result<String, String> {
-    // Priority: --file > positional args > stdin
     if let Some(ref path) = cli.file {
         return std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read prompt file: {e}"));
@@ -104,7 +121,6 @@ fn resolve_prompt(cli: &Cli, include_agent_as_prompt: bool) -> Result<String, St
         return Ok(text);
     }
 
-    // Try stdin (non-blocking check)
     if std::io::stdin().is_terminal() {
         return Err("No prompt provided. Pass as argument, --file, or pipe to stdin.".to_string());
     }
@@ -133,6 +149,7 @@ fn resolve_models_dir(cli: &Cli) -> PathBuf {
 fn run(cli: Cli) -> Result<i32, String> {
     let models_dir = resolve_models_dir(&cli);
     let models = load_models(&models_dir)?;
+    let extra_inputs = parse_inputs(&cli.inputs)?;
 
     let working_dir = cli.project.clone();
 
@@ -150,7 +167,13 @@ fn run(cli: Cli) -> Result<i32, String> {
             resolve_prompt(&cli, true)?
         };
 
-        return run_with_balancing(model, &prompt, &models, working_dir.as_deref());
+        return run_with_balancing(
+            model,
+            &prompt,
+            &models,
+            working_dir.as_deref(),
+            &extra_inputs,
+        );
     }
 
     // Agent-based execution
@@ -170,16 +193,20 @@ fn run(cli: Cli) -> Result<i32, String> {
         format!("{}\n\n{}", agent.instructions, raw_prompt)
     };
 
-    run_with_balancing(model, &full_prompt, &models, working_dir.as_deref())
+    run_with_balancing(
+        model,
+        &full_prompt,
+        &models,
+        working_dir.as_deref(),
+        &extra_inputs,
+    )
 }
 
 fn resolve_agent(cli: &Cli) -> Result<AgentConfig, String> {
-    // --agent-file takes priority
     if let Some(ref path) = cli.agent_file {
         return load_agent_file(path);
     }
 
-    // Named agent from agents directory
     if let Some(ref name) = cli.agent {
         let agents_dir = cli.agents_dir.clone().unwrap_or_else(|| {
             dirs::config_dir()
@@ -201,6 +228,7 @@ fn run_with_balancing(
     prompt: &str,
     all_models: &HashMap<String, ModelConfig>,
     working_dir: Option<&Path>,
+    extra_inputs: &HashMap<String, Vec<String>>,
 ) -> Result<i32, String> {
     let state = StateDb::open_default().unwrap_or_else(|e| {
         eprintln!("Warning: Could not open state DB ({e}), running without state tracking.");
@@ -208,11 +236,11 @@ fn run_with_balancing(
     });
 
     let provider_index = balancer::select_provider(model, &state);
-    let result = executor::execute(model, provider_index, prompt, working_dir)?;
+    let result =
+        executor::execute_with_inputs(model, provider_index, prompt, working_dir, extra_inputs)?;
 
     let success = result.exit_code == 0;
 
-    // Run diagnostics on failure
     let error_category = if !success {
         run_diagnostics(&result.stderr, result.exit_code, all_models, working_dir)
     } else {
@@ -231,7 +259,7 @@ fn run_with_balancing(
         .unwrap_or_else(|e| eprintln!("Warning: Failed to record invocation: {e}"));
 
     if success {
-        print!("{}", result.stdout);
+        let _ = std::io::stdout().write_all(&result.stdout);
     } else {
         eprintln!("{}", result.stderr);
         if let Some(ref cat) = error_category {
@@ -269,8 +297,6 @@ fn run_diagnostics(
 }
 
 fn main() -> ExitCode {
-    // No arguments → launch Tauri UI
-    // Arguments provided → headless CLI mode
     if std::env::args().len() <= 1 {
         agent_runner_lib::run_tauri();
         return ExitCode::SUCCESS;

@@ -125,7 +125,7 @@ export default function ModelPanel(props: ModelPanelProps) {
 			providers.push({ command: form.command, args });
 		}
 
-		return { name, prompt_mode: "stdin", providers };
+		return { name, prompt_mode: "stdin", providers, inputs: [] };
 	}
 
 	async function handleSaveAndTest() {

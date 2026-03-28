@@ -216,6 +216,7 @@ const KNOWN_CLIS: &[(&str, &[&str])] = &[
     ("codex", &[".codex"]),
     ("opencode", &[".opencode"]),
     ("gemini", &[".gemini"]),
+    ("forge", &["forge"]),
 ];
 
 // ---------------------------------------------------------------------------
@@ -352,6 +353,10 @@ fn check_auth(cli: &str) -> bool {
             let data_dir = dirs::data_dir().unwrap_or_default();
             data_dir.join("opencode").join("auth.json").exists()
         }
+        "forge" => {
+            // Forge stores credentials in ~/forge/.credentials.json
+            home.join("forge").join(".credentials.json").exists()
+        }
         _ => false,
     }
 }
@@ -366,6 +371,7 @@ fn enumerate_profiles(cli: &str) -> Vec<CliProfile> {
         "codex" => enumerate_codex_profiles(),
         "gemini" => enumerate_gemini_profiles(),
         "opencode" => enumerate_opencode_profiles(),
+        "forge" => enumerate_forge_profiles(),
         _ => vec![],
     }
 }
@@ -597,6 +603,41 @@ fn enumerate_opencode_profiles() -> Vec<CliProfile> {
                 id: provider_name.clone(),
                 auth_method: auth_type,
                 active: true, // all stored credentials are considered active
+                details: None,
+            });
+        }
+    }
+
+    profiles
+}
+
+/// Forge: reads `~/forge/.credentials.json` which has provider entries
+/// keyed by provider ID (e.g. `{ "openai": { ... }, "minimax": { ... } }`).
+fn enumerate_forge_profiles() -> Vec<CliProfile> {
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => return vec![],
+    };
+
+    let creds_path = home.join("forge").join(".credentials.json");
+    let content = match std::fs::read_to_string(&creds_path) {
+        Ok(c) => c,
+        Err(_) => return vec![],
+    };
+
+    let parsed: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+
+    let mut profiles = Vec::new();
+
+    if let Some(obj) = parsed.as_object() {
+        for (provider_name, _provider_data) in obj {
+            profiles.push(CliProfile {
+                id: provider_name.clone(),
+                auth_method: "api_key".to_string(),
+                active: true,
                 details: None,
             });
         }

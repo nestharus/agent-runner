@@ -6,7 +6,7 @@ pub mod executor;
 pub mod setup;
 pub mod state;
 
-use config::{ModelConfig, PromptMode};
+use config::ModelConfig;
 use serde::{Deserialize, Serialize};
 use setup::actions::{SetupEvent, UserResponse};
 #[allow(unused_imports)]
@@ -30,7 +30,7 @@ pub struct TestModelResult {
 #[derive(Serialize)]
 pub struct ModelSummary {
     pub name: String,
-    pub prompt_mode: PromptMode,
+    pub prompt_mode: config::PromptMode,
     pub provider_count: usize,
 }
 
@@ -45,8 +45,6 @@ fn derive_pools(models: &HashMap<String, config::ModelConfig>) -> Vec<PoolSummar
     let mut groups: HashMap<Vec<String>, Vec<String>> = HashMap::new();
 
     for model in models.values() {
-        // Group by extracted provider names (last token, quotes stripped)
-        // so `env -u CLAUDECODE claude` groups as "claude".
         let mut cmds: Vec<String> = model
             .providers
             .iter()
@@ -393,7 +391,7 @@ async fn test_model(
 
     Ok(TestModelResult {
         success: result.exit_code == 0,
-        stdout: result.stdout,
+        stdout: String::from_utf8_lossy(&result.stdout).into_owned(),
         stderr: result.stderr,
         exit_code: result.exit_code,
     })
@@ -638,6 +636,7 @@ mod tests {
                     args: vec![],
                 })
                 .collect(),
+            inputs: vec![],
         }
     }
 
@@ -686,6 +685,7 @@ mod tests {
                         args: vec!["-p".to_string()],
                     },
                 ],
+                inputs: vec![],
             },
         );
         models.insert("y".into(), make_model("y", &["claude"]));
@@ -709,6 +709,7 @@ mod tests {
                     command: "env -u CLAUDECODE claude".to_string(),
                     args: vec![],
                 }],
+                inputs: vec![],
             },
         );
         // Plain command should also group as "claude"

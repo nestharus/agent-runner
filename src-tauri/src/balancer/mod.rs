@@ -89,6 +89,7 @@ mod tests {
                     args: vec![],
                 },
             ],
+            inputs: vec![],
         }
     }
 
@@ -102,6 +103,7 @@ mod tests {
                 command: "x".to_string(),
                 args: vec![],
             }],
+            inputs: vec![],
         };
         assert_eq!(select_provider(&model, &db), 0);
     }

@@ -120,10 +120,29 @@ export interface ProviderConfig {
 
 export type PromptMode = "stdin" | "arg";
 
+export type InputType =
+	| { kind: "string" }
+	| { kind: "integer"; min?: number; max?: number }
+	| { kind: "number"; min?: number; max?: number }
+	| { kind: "boolean" }
+	| { kind: "enum"; options: string[] }
+	| { kind: "array"; item_type: string; min_items?: number; max_items?: number };
+
+export interface InputDef {
+	name: string;
+	input_type: InputType;
+	required: boolean;
+	default_input: boolean;
+	default?: unknown;
+	description?: string;
+	flag?: string;
+}
+
 export interface ModelConfig {
 	name: string;
 	prompt_mode: PromptMode;
 	providers: ProviderConfig[];
+	inputs: InputDef[];
 }
 
 export interface ModelSummary {

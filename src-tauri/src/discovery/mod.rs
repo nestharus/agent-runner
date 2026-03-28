@@ -34,6 +34,10 @@ const STRATEGIES: &[CliDiscoveryStrategy] = &[
         name: "opencode",
         commands: &[&["models"], &["--help"]],
     },
+    CliDiscoveryStrategy {
+        name: "forge",
+        commands: &[&["list", "model", "--porcelain"], &["--help"]],
+    },
 ];
 
 /// Run model discovery for a specific CLI tool.
@@ -292,6 +296,18 @@ fn build_default_parameters(
             description: "Model to use for generation".to_string(),
             cli_mapping: CliMapping {
                 flag: "-m".to_string(),
+                value_template: "{value}".to_string(),
+            },
+        }],
+        "forge" => vec![ModelParameter {
+            name: "model".to_string(),
+            display_name: "Model".to_string(),
+            param_type: ParamType::Enum {
+                options: model_names.to_vec(),
+            },
+            description: "Model to use for generation".to_string(),
+            cli_mapping: CliMapping {
+                flag: "--model".to_string(),
                 value_template: "{value}".to_string(),
             },
         }],

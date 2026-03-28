@@ -71,7 +71,8 @@ pub fn diagnose_error(
         return Ok(heuristic_diagnosis(stderr, exit_code));
     }
 
-    parse_diagnosis(&result.stdout, stderr, exit_code)
+    let stdout_str = String::from_utf8_lossy(&result.stdout);
+    parse_diagnosis(&stdout_str, stderr, exit_code)
 }
 
 fn parse_diagnosis(output: &str, stderr: &str, exit_code: i32) -> Result<Diagnosis, String> {

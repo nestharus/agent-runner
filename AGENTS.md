@@ -92,6 +92,29 @@ Models use `group~facet` format (e.g., `claude~high`, `codex~low`). The
 `~` separator triggers grouping in the UI via `src/lib/grouping.ts`.
 Standalone models without `~` render as single entries.
 
+### Input Schema System
+
+Models can declare typed input parameters via `[[inputs]]` in their TOML
+configs. The runner validates user-supplied `-i key=value` flags against
+the schema and maps them to CLI flags on the wrapped command.
+
+**How inputs flow:**
+1. The `default_input = true` input receives the positional prompt (args, `--file`, or stdin)
+2. Named inputs (`-i key=value`) are validated against the schema
+3. Each input's `flag` field determines the CLI flag passed to the command (e.g., `flag = "--size"`)
+4. Inputs without a `flag` field default to `--{name}`
+5. Repeated `-i` with the same key collects into an array
+6. Inputs with `default` values are passed automatically when not overridden
+7. Unknown inputs pass through as `--key value`
+
+**Input types:** `string`, `integer` (with min/max), `number` (with min/max),
+`boolean`, `enum` (with options list), `array` (with item_type, min/max items).
+
+**Multimodal models** (image/video generation) use wrapper scripts as their
+`command`. The scripts handle HTTP APIs, polling, downloading — the runner
+just validates inputs and passes flags through. Stdout is raw `Vec<u8>` so
+binary data (images, videos) can flow through without corruption.
+
 ### Model Command Syntax
 
 The `command` field in model TOML configs supports multi-token strings.
@@ -124,7 +147,7 @@ execution. Only the extracted provider name is used for pool grouping
 (`derive_pools` in `lib.rs`) and display (`PoolCard.tsx`).
 
 Parsing is handled by `shell_split()` and `provider_name()` in
-`src-tauri/src/executor/mod.rs`.
+`src-tauri/src/executor/cli.rs`.
 
 ## Design Workflow
 
@@ -247,15 +270,19 @@ bunx playwright test e2e/screenshots.spec.ts  # Generate screenshot catalog
 
 ```
 src-tauri/src/
-├── main.rs              # Entry point
+├── main.rs              # Entry point + CLI arg parsing (-m, -i, -f, -p)
 ├── lib.rs               # Tauri command handlers (IPC bridge)
 ├── config/              # Model + agent config (TOML files)
+│   ├── model.rs         # ModelConfig, InputDef, InputType, TOML parsing
+│   └── agent.rs         # AgentConfig
 ├── state/               # SQLite state DB (invocations, health, accounts)
 ├── setup/               # CLI detection, setup wizard agent, memory
 ├── discovery/           # Model discovery pipeline
 ├── balancer/            # Load balancing across providers
 ├── executor/            # CLI execution engine
-└── diagnostics/         # Health checks, error reporting
+│   ├── mod.rs           # ExecutionResult, dispatch (execute / execute_with_inputs)
+│   └── cli.rs           # Flag resolution, input validation, subprocess execution
+└── diagnostics/         # Error classification (LLM + heuristic fallback)
 ```
 
 ## E2E Test Infrastructure

@@ -119,6 +119,7 @@ Options:
   -a, --agent-file <AGENT_FILE>  Path to an agent .md file (any location)
   -f, --file <FILE>              Read prompt from file
   -p, --project <PROJECT>        Working directory for subprocess
+  -i, --input <KEY=VALUE>        Pass model inputs as key=value (repeatable)
       --models-dir <MODELS_DIR>  Override models directory
       --agents-dir <AGENTS_DIR>  Override agents directory
   -h, --help                     Print help
@@ -149,6 +150,15 @@ oulipoly-agent-runner --model glm --file prompt.md
 
 # Set working directory for the subprocess
 oulipoly-agent-runner --model codex-high -p /path/to/repo "Fix the tests"
+
+# Pass inputs to image/video models
+oulipoly-agent-runner -m seedance-t2v-fast -i duration=5 -i resolution=480p "A whale swimming"
+
+# Image-to-video with source image
+oulipoly-agent-runner -m seedance-i2v-fast -i image=./photo.jpg "Slow camera orbit"
+
+# Multiple values for array inputs (e.g. image editing with reference images)
+oulipoly-agent-runner -m seedream-edit -i images=ref1.png -i images=ref2.png "Make it warmer"
 ```
 
 ## Load Balancing
@@ -186,14 +196,21 @@ All user config lives in `~/.config/oulipoly-agent-runner/`:
 
 Create a `.toml` file in the models directory. The filename becomes the model name.
 
-**Single provider:**
+**Text model (single provider):**
 ```toml
 command = "claude"
 args = ["-p", "--model", "haiku"]
 prompt_mode = "stdin"
+
+[[inputs]]
+name = "prompt"
+type = "string"
+required = true
+default_input = true
+description = "The text prompt"
 ```
 
-**Multiple providers (load balanced):**
+**Text model (multiple providers, load balanced):**
 ```toml
 prompt_mode = "arg"
 
@@ -204,7 +221,93 @@ args = ["exec", "-m", "gpt-5.3-codex"]
 [[providers]]
 command = "codex2"
 args = ["exec", "-m", "gpt-5.3-codex"]
+
+[[inputs]]
+name = "prompt"
+type = "string"
+required = true
+default_input = true
+description = "The text prompt"
 ```
+
+**Image/video model with typed inputs:**
+```toml
+command = "atlas-i2v-fast"
+prompt_mode = "arg"
+
+[[inputs]]
+name = "prompt"
+type = "string"
+default_input = true
+description = "Motion/style description"
+
+[[inputs]]
+name = "image"
+type = "string"
+flag = "--image"
+required = true
+description = "Source image path (jpg/png/svg)"
+
+[[inputs]]
+name = "duration"
+type = "integer"
+flag = "--duration"
+min = 4.0
+max = 12.0
+default = 8
+description = "Video length in seconds"
+
+[[inputs]]
+name = "resolution"
+type = "enum"
+flag = "--resolution"
+options = ["480p", "720p", "1080p"]
+default = "720p"
+description = "Output video resolution"
+
+[[inputs]]
+name = "aspect_ratio"
+type = "enum"
+flag = "--aspect-ratio"
+options = ["16:9", "9:16", "1:1", "4:3", "3:4", "21:9"]
+default = "16:9"
+description = "Output aspect ratio"
+
+[[inputs]]
+name = "images"
+type = "array"
+flag = "--image"
+item_type = "string"
+min_items = 1
+max_items = 14
+description = "Reference images (for edit models)"
+```
+
+### Input Schema
+
+Each `[[inputs]]` entry declares a parameter the model accepts. The runner validates inputs
+and passes them as CLI flags to the underlying command.
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | yes | Input identifier |
+| `type` | yes | `string`, `integer`, `number`, `boolean`, `enum`, `array` |
+| `flag` | no | CLI flag to pass to the command (e.g. `"--size"`) |
+| `required` | no | Fail if not provided and no default |
+| `default_input` | no | This is the unnamed positional input (the "prompt") |
+| `default` | no | Default value when not provided by user |
+| `description` | no | Human/AI-readable description |
+| `options` | enum only | List of valid values |
+| `min` / `max` | integer/number | Value range bounds |
+| `item_type` | array only | Type of array elements |
+| `min_items` / `max_items` | array only | Array length bounds |
+
+**How inputs flow:**
+- The `default_input` receives the positional prompt (args, `--file`, or stdin)
+- Named inputs (`-i key=value`) are validated against the schema, then passed as `--flag value` to the command
+- Repeated `-i` with the same key collects into an array (e.g. `-i images=a.png -i images=b.png`)
+- Inputs with defaults are passed automatically when not overridden
+- Unknown inputs pass through as `--key value`
 
 ### Adding an Agent
 
