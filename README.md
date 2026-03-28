@@ -151,14 +151,21 @@ oulipoly-agent-runner --model glm --file prompt.md
 # Set working directory for the subprocess
 oulipoly-agent-runner --model codex-high -p /path/to/repo "Fix the tests"
 
-# Pass inputs to image/video models
-oulipoly-agent-runner -m seedance-t2v-fast -i duration=5 -i resolution=480p "A whale swimming"
+# Generate an image (raw bytes on stdout, pipe to file)
+oulipoly-agent-runner -m seedream-t2i "A sunset over mountains" > sunset.jpeg
+
+# Generate a video
+oulipoly-agent-runner -m seedance-t2v-low -i duration=5 -i resolution=480p "A whale swimming" > whale.mp4
 
 # Image-to-video with source image
-oulipoly-agent-runner -m seedance-i2v-fast -i image=./photo.jpg "Slow camera orbit"
+oulipoly-agent-runner -m seedance-i2v-fast -i image=./photo.jpg "Slow camera orbit" > orbit.mp4
 
-# Multiple values for array inputs (e.g. image editing with reference images)
-oulipoly-agent-runner -m seedream-edit -i images=ref1.png -i images=ref2.png "Make it warmer"
+# Image editing with reference images
+oulipoly-agent-runner -m seedream-i2i -i image=input.png "Make it warmer" > edited.jpeg
+
+# Chain: generate an image then animate it
+oulipoly-agent-runner -m seedream-t2i "A cat painting" > cat.jpeg
+oulipoly-agent-runner -m seedance-i2v-low -i image=cat.jpeg "The cat blinks slowly" > cat.mp4
 ```
 
 ## Load Balancing
@@ -308,6 +315,8 @@ and passes them as CLI flags to the underlying command.
 - Repeated `-i` with the same key collects into an array (e.g. `-i images=a.png -i images=b.png`)
 - Inputs with defaults are passed automatically when not overridden
 - Unknown inputs pass through as `--key value`
+
+**Stdout is raw bytes** — commands can output binary data (images, videos) and it passes through unmodified. Pipe to a file to save: `agents -m seedream-t2i "A cat" > cat.jpeg`
 
 ### Adding an Agent
 
