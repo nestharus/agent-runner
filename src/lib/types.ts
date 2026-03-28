@@ -126,7 +126,12 @@ export type InputType =
 	| { kind: "number"; min?: number; max?: number }
 	| { kind: "boolean" }
 	| { kind: "enum"; options: string[] }
-	| { kind: "array"; item_type: string; min_items?: number; max_items?: number };
+	| {
+			kind: "array";
+			item_type: string;
+			min_items?: number;
+			max_items?: number;
+	  };
 
 export interface InputDef {
 	name: string;

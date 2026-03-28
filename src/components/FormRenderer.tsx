@@ -45,7 +45,7 @@ export default function FormRenderer(props: FormRendererProps) {
 		for (const f of props.form.fields) {
 			if (!f.required) continue;
 			const el = formRef.querySelector<HTMLInputElement>(`[name="${f.name}"]`);
-			if (!el || !el.value.trim()) {
+			if (!el?.value.trim()) {
 				errs[f.name] = true;
 				valid = false;
 			}
