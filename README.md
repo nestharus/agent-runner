@@ -170,13 +170,41 @@ oulipoly-agent-runner -m seedance-i2v-low -i image=cat.jpeg "The cat blinks slow
 
 ## Load Balancing
 
-Models with multiple `[[providers]]` are automatically load balanced:
+Models with multiple `[[providers]]` are automatically load balanced. The runner picks a provider per invocation using, in order of preference:
 
-- **Round-robin**: Picks the provider with the fewest total invocations
-- **Error avoidance**: Providers with 3+ errors in the last 30 minutes are deprioritized
-- **Persistent state**: All invocation history is stored in SQLite at `~/.local/share/oulipoly-agent-runner/state.db`
+1. **Quota-aware scoring** (when every provider has a cached quota reading): picks the provider with the lowest *projected* usage, where projection = `used_percent + calls_since_refresh × avg_percent_per_call`. The `avg_percent_per_call` is learned globally across refreshes, so fresh accounts with no learned delta fall back to raw `used_percent` ordering.
+2. **Invocation-count round-robin** (fallback when any provider lacks a quota reading): picks the provider with the fewest lifetime invocations.
+3. **Error avoidance** (always applied): providers with 3+ errors in the last 30 minutes are deprioritized regardless of score.
 
-No daemon or background process — state is shared via filesystem-level SQLite WAL locking, so multiple CLI invocations coordinate safely.
+Quota readings are refreshed lazily — each CLI invocation checks if any participating provider's cached reading is older than 12 hours and, if so, runs that provider's `quota_script` (see [`providers.toml`](#providerstoml) below) synchronously before picking. Refreshes are deduplicated across concurrent callers by an in-process lock.
+
+Provider state is keyed by the provider's `name` field (the CLI account — e.g. `claude`, `claude2`) and is shared across every model routed through that account. This means two models pointing at the same provider share quota and error history.
+
+**Persistent state**: all invocation history and quota snapshots live in SQLite at `~/.local/share/oulipoly-agent-runner/state.db`. No daemon or background process — state is shared via filesystem-level SQLite WAL locking, so multiple CLI invocations coordinate safely.
+
+### `providers.toml`
+
+To enable quota-aware balancing, create `~/.config/oulipoly-agent-runner/providers.toml` with one entry per provider account. Each entry declares a `quota_script` — a shell command that prints JSON `{"used_percent": <0..100>, "resets_at": "..."}` on stdout:
+
+```toml
+[claude]
+quota_script = "anthropic-usage ~/.claude/.credentials.json"
+
+[claude2]
+quota_script = "anthropic-usage ~/.claude2/.credentials.json"
+```
+
+The `used_percent` field is on a 0..100 scale (matching what provider APIs typically return). `resets_at` is optional (RFC 3339 timestamp). Scripts have a 30-second timeout and run via `sh -c`, so `~` expansion and pipelines work.
+
+Providers without a `quota_script` entry cause that model to fall back to invocation-count scoring.
+
+### Diagnostic tool
+
+```bash
+cd src-tauri && cargo run --release --example quota_check
+```
+
+Loads the installed models + `providers.toml`, refreshes any stale quotas, then prints — for every multi-provider model — what `select_provider` would pick and the score breakdown.
 
 ## Diagnostics
 
@@ -195,6 +223,7 @@ All user config lives in `~/.config/oulipoly-agent-runner/`:
 ```
 ~/.config/oulipoly-agent-runner/
   config.toml          Global settings
+  providers.toml       Per-provider quota scripts (optional, for quota-aware balancing)
   models/              Model configs (one .toml per model)
   agents/              Agent configs (one .md per agent)
 ```
@@ -228,6 +257,10 @@ args = ["exec", "-m", "gpt-5.3-codex"]
 [[providers]]
 command = "codex2"
 args = ["exec", "-m", "gpt-5.3-codex"]
+
+# Optional: set `name = "..."` on a provider to pin the identity used for
+# quota/error tracking. If omitted, the name is auto-derived from the command
+# (e.g. `env -u CLAUDECODE claude2` → `claude2`).
 
 [[inputs]]
 name = "prompt"

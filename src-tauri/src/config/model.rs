@@ -5,8 +5,70 @@ use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
+    /// Stable identifier for this provider (the CLI account / binary).
+    /// Used as the key for per-account state like quota tracking.
+    /// If omitted in TOML, derived from command+args via `derive_provider_name`.
+    pub name: String,
     pub command: String,
     pub args: Vec<String>,
+}
+
+impl ProviderConfig {
+    /// Build a ProviderConfig, auto-deriving `name` from command+args.
+    pub fn new(command: impl Into<String>, args: Vec<String>) -> Self {
+        let command = command.into();
+        let name = derive_provider_name(&command, &args);
+        Self { name, command, args }
+    }
+}
+
+/// Derive a provider name from a command + args vector.
+///
+/// The heuristic picks the first token that looks like an executable name —
+/// skipping flags, `env` and its flag arguments (e.g. the VAR in `-u VAR`),
+/// and env-var assignments of the form `FOO=bar`. Returns the command string
+/// itself as a last-resort fallback.
+pub fn derive_provider_name(command: &str, args: &[String]) -> String {
+    let mut all: Vec<&str> = Vec::with_capacity(1 + args.len());
+    all.push(command);
+    for a in args {
+        all.push(a.as_str());
+    }
+
+    let mut i = 0;
+    while i < all.len() {
+        let t = all[i];
+        // Skip env wrapper itself.
+        if t == "env" || t.ends_with("/env") {
+            i += 1;
+            continue;
+        }
+        // Skip flags (and consume their value arg for env-style single-char flags).
+        if let Some(rest) = t.strip_prefix("--") {
+            if rest.is_empty() {
+                i += 1;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix('-') {
+            // env's `-u VAR` / `-e VAR` take a value argument (the var name).
+            if matches!(rest, "u" | "e" | "S") {
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        // Skip env var assignments (FOO=bar).
+        if t.contains('=') && t.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+            i += 1;
+            continue;
+        }
+        return t.to_string();
+    }
+    command.to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +154,8 @@ struct RawModelToml {
 
 #[derive(Deserialize)]
 struct RawProvider {
+    #[serde(default)]
+    name: Option<String>,
     command: String,
     args: Option<Vec<String>>,
 }
@@ -210,8 +274,15 @@ impl ModelConfig {
             out.push_str(&format!("prompt_mode = \"{}\"\n", mode_str));
             for p in &self.providers {
                 let args_toml: Vec<String> = p.args.iter().map(|a| format!("\"{}\"", a)).collect();
+                out.push_str("\n[[providers]]\n");
+                // Only emit an explicit name line when the stored name differs
+                // from what would be auto-derived — keeps round-trips stable
+                // while preserving any user-set disambiguation.
+                if p.name != derive_provider_name(&p.command, &p.args) {
+                    out.push_str(&format!("name = \"{}\"\n", p.name));
+                }
                 out.push_str(&format!(
-                    "\n[[providers]]\ncommand = \"{}\"\nargs = [{}]\n",
+                    "command = \"{}\"\nargs = [{}]\n",
                     p.command,
                     args_toml.join(", ")
                 ));
@@ -300,16 +371,22 @@ impl ModelConfig {
         let providers = if let Some(providers) = raw.providers {
             providers
                 .into_iter()
-                .map(|p| ProviderConfig {
-                    command: p.command,
-                    args: p.args.unwrap_or_default(),
+                .map(|p| {
+                    let args = p.args.unwrap_or_default();
+                    let name = p
+                        .name
+                        .unwrap_or_else(|| derive_provider_name(&p.command, &args));
+                    ProviderConfig {
+                        name,
+                        command: p.command,
+                        args,
+                    }
                 })
                 .collect()
         } else if let Some(command) = raw.command {
-            vec![ProviderConfig {
-                command,
-                args: raw.args.unwrap_or_default(),
-            }]
+            let args = raw.args.unwrap_or_default();
+            let name = derive_provider_name(&command, &args);
+            vec![ProviderConfig { name, command, args }]
         } else {
             return Err(format!(
                 "Model {name}: must have either 'command' or '[[providers]]'"
@@ -387,6 +464,38 @@ pub fn load_models(models_dir: &Path) -> Result<HashMap<String, ModelConfig>, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn derive_provider_name_simple() {
+        assert_eq!(derive_provider_name("claude", &[]), "claude");
+    }
+
+    #[test]
+    fn derive_provider_name_env_wrapper() {
+        let args = vec!["-u".to_string(), "CLAUDECODE".to_string(), "claude2".to_string(),
+                        "-p".to_string(), "--model".to_string(), "opus".to_string()];
+        assert_eq!(derive_provider_name("env", &args), "claude2");
+    }
+
+    #[test]
+    fn derive_provider_name_env_assignment() {
+        let args = vec!["FOO=bar".to_string(), "claude3".to_string()];
+        assert_eq!(derive_provider_name("env", &args), "claude3");
+    }
+
+    #[test]
+    fn provider_config_auto_derives_name() {
+        let p = ProviderConfig::new(
+            "env",
+            vec![
+                "-u".to_string(),
+                "CLAUDECODE".to_string(),
+                "claude2".to_string(),
+                "-p".to_string(),
+            ],
+        );
+        assert_eq!(p.name, "claude2");
+    }
 
     #[test]
     fn parse_single_provider() {

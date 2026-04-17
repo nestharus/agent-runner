@@ -19,6 +19,23 @@ pub struct ProviderRecord {
     pub last_invoked_at: Option<DateTime<Utc>>,
 }
 
+/// Per-provider (account) quota snapshot. Keyed on provider name (e.g.
+/// `claude`, `claude2`), which spans every model routed through that account.
+#[derive(Debug, Clone)]
+pub struct QuotaRecord {
+    pub provider_name: String,
+    /// Usage as a 0..1 ratio. 0.12 = 12% of the weekly window consumed.
+    pub used_percent: f64,
+    pub resets_at: Option<DateTime<Utc>>,
+    /// Calls recorded against this provider since the last refresh.
+    pub calls_since_refresh: u64,
+    pub refreshed_at: Option<DateTime<Utc>>,
+    /// Δused_percent observed at the most recent refresh (vs. the refresh before).
+    pub last_delta_percent: Option<f64>,
+    /// Δcalls_since_refresh observed at the most recent refresh.
+    pub last_delta_calls: Option<u64>,
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct InvocationRecord {
@@ -191,6 +208,16 @@ impl StateDb {
 
             CREATE INDEX IF NOT EXISTS idx_invocations_model
                 ON invocations (model_name, provider_index, created_at);
+
+            CREATE TABLE IF NOT EXISTS provider_quotas (
+                provider_name TEXT PRIMARY KEY,
+                used_percent REAL NOT NULL DEFAULT 0,
+                resets_at TEXT,
+                calls_since_refresh INTEGER NOT NULL DEFAULT 0,
+                refreshed_at TEXT,
+                last_delta_percent REAL,
+                last_delta_calls INTEGER
+            );
 
             CREATE TABLE IF NOT EXISTS memory_nodes (
                 id TEXT PRIMARY KEY,
@@ -400,6 +427,158 @@ impl StateDb {
             .map_err(|e| format!("Failed to count recent errors: {e}"))?;
 
         Ok(count as u64)
+    }
+
+    // --- Provider quota operations ---
+
+    /// Fetch a quota snapshot by provider name. Returns None if the provider
+    /// has never been refreshed.
+    pub fn get_quota(&self, provider_name: &str) -> Result<Option<QuotaRecord>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT used_percent, resets_at, calls_since_refresh, refreshed_at,
+                        last_delta_percent, last_delta_calls
+                 FROM provider_quotas WHERE provider_name = ?1",
+            )
+            .map_err(|e| format!("Failed to prepare quota query: {e}"))?;
+
+        let result = stmt.query_row(params![provider_name], |row| {
+            Ok(QuotaRecord {
+                provider_name: provider_name.to_string(),
+                used_percent: row.get(0)?,
+                resets_at: row
+                    .get::<_, Option<String>>(1)?
+                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                    .map(|dt| dt.with_timezone(&Utc)),
+                calls_since_refresh: row.get::<_, i64>(2)? as u64,
+                refreshed_at: row
+                    .get::<_, Option<String>>(3)?
+                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                    .map(|dt| dt.with_timezone(&Utc)),
+                last_delta_percent: row.get(4)?,
+                last_delta_calls: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
+            })
+        });
+
+        match result {
+            Ok(record) => Ok(Some(record)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(format!("Failed to query quota: {e}")),
+        }
+    }
+
+    /// Record a freshly fetched quota reading. Computes the delta from the
+    /// prior refresh for use in `avg_percent_per_call` calibration, then
+    /// resets `calls_since_refresh` to 0.
+    pub fn upsert_quota_refresh(
+        &self,
+        provider_name: &str,
+        used_percent: f64,
+        resets_at: Option<&str>,
+    ) -> Result<(), String> {
+        let now = Utc::now().to_rfc3339();
+
+        let prior = self.get_quota(provider_name)?;
+        let (delta_percent, delta_calls) = match &prior {
+            Some(p) => {
+                let dp = used_percent - p.used_percent;
+                // Only treat as a positive-learning delta when both are positive —
+                // resets (percent goes down) or zero-call intervals give us no signal.
+                if dp > 0.0 && p.calls_since_refresh > 0 {
+                    (Some(dp), Some(p.calls_since_refresh))
+                } else {
+                    (p.last_delta_percent, p.last_delta_calls)
+                }
+            }
+            None => (None, None),
+        };
+
+        self.conn
+            .execute(
+                "INSERT INTO provider_quotas
+                    (provider_name, used_percent, resets_at, calls_since_refresh,
+                     refreshed_at, last_delta_percent, last_delta_calls)
+                 VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6)
+                 ON CONFLICT (provider_name) DO UPDATE SET
+                    used_percent = ?2,
+                    resets_at = ?3,
+                    calls_since_refresh = 0,
+                    refreshed_at = ?4,
+                    last_delta_percent = ?5,
+                    last_delta_calls = ?6",
+                params![
+                    provider_name,
+                    used_percent,
+                    resets_at,
+                    &now,
+                    delta_percent,
+                    delta_calls.map(|v| v as i64),
+                ],
+            )
+            .map_err(|e| format!("Failed to upsert quota: {e}"))?;
+        Ok(())
+    }
+
+    /// Bump `calls_since_refresh` for a provider. Creates the row with 1 call
+    /// and zeroed quota if the provider isn't tracked yet.
+    pub fn increment_calls_since_refresh(&self, provider_name: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO provider_quotas (provider_name, calls_since_refresh)
+                 VALUES (?1, 1)
+                 ON CONFLICT (provider_name) DO UPDATE SET
+                    calls_since_refresh = calls_since_refresh + 1",
+                params![provider_name],
+            )
+            .map_err(|e| format!("Failed to increment calls_since_refresh: {e}"))?;
+        Ok(())
+    }
+
+    /// Fetch quotas for a set of provider names in one query.
+    pub fn get_quotas(&self, names: &[String]) -> Result<Vec<QuotaRecord>, String> {
+        if names.is_empty() {
+            return Ok(vec![]);
+        }
+        let placeholders = vec!["?"; names.len()].join(",");
+        let sql = format!(
+            "SELECT provider_name, used_percent, resets_at, calls_since_refresh,
+                    refreshed_at, last_delta_percent, last_delta_calls
+             FROM provider_quotas WHERE provider_name IN ({placeholders})"
+        );
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| format!("Failed to prepare quota batch query: {e}"))?;
+
+        let name_refs: Vec<&dyn rusqlite::ToSql> =
+            names.iter().map(|n| n as &dyn rusqlite::ToSql).collect();
+
+        let rows = stmt
+            .query_map(name_refs.as_slice(), |row| {
+                Ok(QuotaRecord {
+                    provider_name: row.get(0)?,
+                    used_percent: row.get(1)?,
+                    resets_at: row
+                        .get::<_, Option<String>>(2)?
+                        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                        .map(|dt| dt.with_timezone(&Utc)),
+                    calls_since_refresh: row.get::<_, i64>(3)? as u64,
+                    refreshed_at: row
+                        .get::<_, Option<String>>(4)?
+                        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                        .map(|dt| dt.with_timezone(&Utc)),
+                    last_delta_percent: row.get(5)?,
+                    last_delta_calls: row.get::<_, Option<i64>>(6)?.map(|v| v as u64),
+                })
+            })
+            .map_err(|e| format!("Failed to run quota batch query: {e}"))?;
+
+        let mut out = Vec::with_capacity(names.len());
+        for r in rows {
+            out.push(r.map_err(|e| format!("Failed to parse quota row: {e}"))?);
+        }
+        Ok(out)
     }
 
     // --- CLI Provider operations ---

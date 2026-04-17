@@ -3,6 +3,7 @@ pub mod config;
 pub mod diagnostics;
 pub mod discovery;
 pub mod executor;
+pub mod quota;
 pub mod setup;
 pub mod state;
 
@@ -75,6 +76,8 @@ pub struct AppState {
     pub models: Mutex<HashMap<String, config::ModelConfig>>,
     pub models_dir: PathBuf,
     pub setup_input_tx: Mutex<Option<mpsc::Sender<UserResponse>>>,
+    /// Tracks quota-refresh calls in flight so duplicate callers collapse.
+    pub quota_in_flight: quota::InFlight,
 }
 
 #[tauri::command]
@@ -282,6 +285,103 @@ fn list_pools(state: tauri::State<AppState>) -> Result<Vec<PoolSummary>, String>
     Ok(derive_pools(&models))
 }
 
+#[derive(Serialize)]
+pub struct QuotaRefreshEntry {
+    pub provider_name: String,
+    pub status: String,
+    pub used_percent: Option<f64>,
+    pub resets_at: Option<String>,
+    pub message: Option<String>,
+}
+
+/// Refresh quotas for every distinct provider that participates in at least
+/// one multi-provider model. Single-provider models are skipped since there's
+/// no load-balancing decision to inform.
+#[tauri::command]
+async fn refresh_quotas(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<QuotaRefreshEntry>, String> {
+    // Collect the set of provider names that can actually benefit from a
+    // quota refresh — i.e. names that appear in any model with >1 provider.
+    let candidates: Vec<String> = {
+        let models = state.models.lock().map_err(|e| e.to_string())?;
+        let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for m in models.values() {
+            if m.providers.len() > 1 {
+                for p in &m.providers {
+                    set.insert(p.name.clone());
+                }
+            }
+        }
+        set.into_iter().collect()
+    };
+
+    let providers_path = state
+        .models_dir
+        .parent()
+        .unwrap_or(&state.models_dir)
+        .join("providers.toml");
+    let providers_cfg = config::ProvidersConfig::load(&providers_path).unwrap_or_default();
+
+    let db_path = state
+        .models_dir
+        .parent()
+        .unwrap_or(&state.models_dir)
+        .join("state.db");
+
+    let db = state::StateDb::open(&db_path)
+        .map_err(|e| format!("Failed to open state DB: {e}"))?;
+    let in_flight = &state.quota_in_flight;
+    let mut results = Vec::with_capacity(candidates.len());
+
+    for provider_name in candidates {
+        if !quota::is_stale(&db, &provider_name) {
+            results.push(QuotaRefreshEntry {
+                provider_name,
+                status: "fresh".into(),
+                used_percent: None,
+                resets_at: None,
+                message: None,
+            });
+            continue;
+        }
+
+        let outcome = quota::refresh_provider(&provider_name, &providers_cfg, in_flight, &db);
+        results.push(match outcome {
+            quota::RefreshOutcome::Updated { used_percent, resets_at } => QuotaRefreshEntry {
+                provider_name,
+                status: "updated".into(),
+                used_percent: Some(used_percent),
+                resets_at,
+                message: None,
+            },
+            quota::RefreshOutcome::NoScript => QuotaRefreshEntry {
+                provider_name,
+                status: "no_script".into(),
+                used_percent: None,
+                resets_at: None,
+                message: None,
+            },
+            quota::RefreshOutcome::AlreadyInFlight => QuotaRefreshEntry {
+                provider_name,
+                status: "in_flight".into(),
+                used_percent: None,
+                resets_at: None,
+                message: None,
+            },
+            quota::RefreshOutcome::Failed(msg) => QuotaRefreshEntry {
+                provider_name,
+                status: "failed".into(),
+                used_percent: None,
+                resets_at: None,
+                message: Some(msg),
+            },
+        });
+    }
+
+    Ok(results)
+}
+
 #[tauri::command]
 fn update_pool(
     state: tauri::State<AppState>,
@@ -342,10 +442,9 @@ fn update_pool(
 
         // Add providers with empty args for new commands
         for cmd in &added {
-            model.providers.push(config::ProviderConfig {
-                command: (*cmd).clone(),
-                args: vec![],
-            });
+            model
+                .providers
+                .push(config::ProviderConfig::new((*cmd).clone(), vec![]));
         }
 
         if model.providers.is_empty() {
@@ -383,7 +482,7 @@ async fn test_model(
 
     let result = tauri::async_runtime::spawn_blocking(move || {
         let db = state::StateDb::open(&db_path).map_err(|e| e.to_string())?;
-        let provider_index = balancer::select_provider(&model, &db);
+        let provider_index = balancer::select_provider(&model, &db, None);
         executor::execute(&model, provider_index, "Say hello in one sentence.", None)
     })
     .await
@@ -589,6 +688,7 @@ pub fn run_tauri() {
             models: Mutex::new(models),
             models_dir: models_dir.clone(),
             setup_input_tx: Mutex::new(None),
+            quota_in_flight: quota::InFlight::new(),
         })
         .invoke_handler(tauri::generate_handler![
             check_setup_needed,
@@ -604,6 +704,7 @@ pub fn run_tauri() {
             save_model,
             delete_model,
             list_pools,
+            refresh_quotas,
             update_pool,
             test_model,
             list_cli_providers,
@@ -631,10 +732,7 @@ mod tests {
             prompt_mode: PromptMode::Stdin,
             providers: commands
                 .iter()
-                .map(|c| ProviderConfig {
-                    command: c.to_string(),
-                    args: vec![],
-                })
+                .map(|c| ProviderConfig::new(c.to_string(), vec![]))
                 .collect(),
             inputs: vec![],
         }
@@ -676,14 +774,8 @@ mod tests {
                 name: "x".to_string(),
                 prompt_mode: PromptMode::Stdin,
                 providers: vec![
-                    ProviderConfig {
-                        command: "claude".to_string(),
-                        args: vec![],
-                    },
-                    ProviderConfig {
-                        command: "claude".to_string(),
-                        args: vec!["-p".to_string()],
-                    },
+                    ProviderConfig::new("claude", vec![]),
+                    ProviderConfig::new("claude", vec!["-p".to_string()]),
                 ],
                 inputs: vec![],
             },
@@ -705,10 +797,7 @@ mod tests {
             ModelConfig {
                 name: "a".to_string(),
                 prompt_mode: PromptMode::Stdin,
-                providers: vec![ProviderConfig {
-                    command: "env -u CLAUDECODE claude".to_string(),
-                    args: vec![],
-                }],
+                providers: vec![ProviderConfig::new("env -u CLAUDECODE claude", vec![])],
                 inputs: vec![],
             },
         );

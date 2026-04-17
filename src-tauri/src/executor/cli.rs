@@ -367,10 +367,7 @@ mod tests {
         let model = ModelConfig {
             name: "test".to_string(),
             prompt_mode: PromptMode::Stdin,
-            providers: vec![ProviderConfig {
-                command: "test".to_string(),
-                args: vec![],
-            }],
+            providers: vec![ProviderConfig::new("test", vec![])],
             inputs: vec![
                 InputDef {
                     name: "prompt".to_string(),
@@ -405,10 +402,7 @@ mod tests {
         let model = ModelConfig {
             name: "test".to_string(),
             prompt_mode: PromptMode::Stdin,
-            providers: vec![ProviderConfig {
-                command: "test".to_string(),
-                args: vec![],
-            }],
+            providers: vec![ProviderConfig::new("test", vec![])],
             inputs: vec![InputDef {
                 name: "format".to_string(),
                 input_type: InputType::Enum {
@@ -430,10 +424,7 @@ mod tests {
         let model = ModelConfig {
             name: "test".to_string(),
             prompt_mode: PromptMode::Stdin,
-            providers: vec![ProviderConfig {
-                command: "test".to_string(),
-                args: vec![],
-            }],
+            providers: vec![ProviderConfig::new("test", vec![])],
             inputs: vec![InputDef {
                 name: "size".to_string(),
                 input_type: InputType::Enum {
@@ -457,10 +448,7 @@ mod tests {
         let model = ModelConfig {
             name: "test".to_string(),
             prompt_mode: PromptMode::Stdin,
-            providers: vec![ProviderConfig {
-                command: "test".to_string(),
-                args: vec![],
-            }],
+            providers: vec![ProviderConfig::new("test", vec![])],
             inputs: vec![InputDef {
                 name: "image".to_string(),
                 input_type: InputType::String,
@@ -480,10 +468,7 @@ mod tests {
         let model = ModelConfig {
             name: "test".to_string(),
             prompt_mode: PromptMode::Stdin,
-            providers: vec![ProviderConfig {
-                command: "test".to_string(),
-                args: vec![],
-            }],
+            providers: vec![ProviderConfig::new("test", vec![])],
             inputs: vec![],
         };
         let mut inputs = HashMap::new();
@@ -498,10 +483,7 @@ mod tests {
         let model = ModelConfig {
             name: "test".to_string(),
             prompt_mode: PromptMode::Arg,
-            providers: vec![ProviderConfig {
-                command: "echo".to_string(),
-                args: vec![],
-            }],
+            providers: vec![ProviderConfig::new("echo", vec![])],
             inputs: vec![],
         };
         let result = execute(&model, 0, "hello world", None, &HashMap::new()).unwrap();
@@ -518,10 +500,7 @@ mod tests {
         let model = ModelConfig {
             name: "test".to_string(),
             prompt_mode: PromptMode::Stdin,
-            providers: vec![ProviderConfig {
-                command: "cat".to_string(),
-                args: vec![],
-            }],
+            providers: vec![ProviderConfig::new("cat", vec![])],
             inputs: vec![],
         };
         let result = execute(&model, 0, "piped input", None, &HashMap::new()).unwrap();
@@ -535,10 +514,7 @@ mod tests {
         let model = ModelConfig {
             name: "test".to_string(),
             prompt_mode: PromptMode::Stdin,
-            providers: vec![ProviderConfig {
-                command: "echo".to_string(),
-                args: vec![],
-            }],
+            providers: vec![ProviderConfig::new("echo", vec![])],
             inputs: vec![InputDef {
                 name: "greeting".to_string(),
                 input_type: InputType::String,

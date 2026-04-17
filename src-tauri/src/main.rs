@@ -235,7 +235,19 @@ fn run_with_balancing(
         StateDb::open(std::path::Path::new(":memory:")).unwrap()
     });
 
-    let provider_index = balancer::select_provider(model, &state);
+    // Load providers.toml from the same config dir as models; quota refresh
+    // only runs when actual load-balancing is possible (n > 1 providers).
+    let providers_path = dirs::config_dir()
+        .map(|d| d.join("oulipoly-agent-runner").join("providers.toml"))
+        .unwrap_or_else(|| std::path::PathBuf::from("providers.toml"));
+    let providers_cfg = agent_runner_lib::config::ProvidersConfig::load(&providers_path)
+        .unwrap_or_default();
+    let in_flight = agent_runner_lib::quota::InFlight::new();
+    let ctx = balancer::BalanceContext {
+        providers_cfg: &providers_cfg,
+        in_flight: &in_flight,
+    };
+    let provider_index = balancer::select_provider(model, &state, Some(&ctx));
     let result =
         executor::execute_with_inputs(model, provider_index, prompt, working_dir, extra_inputs)?;
 
@@ -257,6 +269,13 @@ fn run_with_balancing(
             if success { None } else { Some(&result.stderr) },
         )
         .unwrap_or_else(|e| eprintln!("Warning: Failed to record invocation: {e}"));
+
+    // Bump calls_since_refresh for this provider (account). Errors here are
+    // non-fatal — missing a tick just slightly skews the next projection.
+    let provider_name = &model.providers[provider_index].name;
+    state
+        .increment_calls_since_refresh(provider_name)
+        .unwrap_or_else(|e| eprintln!("Warning: Failed to bump quota tick: {e}"));
 
     if success {
         let _ = std::io::stdout().write_all(&result.stdout);
