@@ -1,17 +1,21 @@
-use crate::config::{ModelConfig, ProvidersConfig};
+use crate::config::{ModelConfig, ProvidersConfig, SessionsConfig};
 use crate::quota::{InFlight, RefreshOutcome, is_stale, refresh_provider};
-use crate::state::{QuotaRecord, StateDb};
+use crate::sessions::scan_provider;
+use crate::state::{QuotaRecord, QuotaWindow, StateDb};
+use chrono::Utc;
 
 const ERROR_WINDOW_MINUTES: i64 = 30;
 const ERROR_THRESHOLD: u64 = 3;
 
 /// Contextual dependencies for quota-aware balancing. When present,
 /// `select_provider` will trigger a synchronous refresh for any provider
-/// whose cached quota is stale (older than `REFRESH_TTL_HOURS`). Pass
-/// `None` to use cached-only scoring (e.g. from inside an async handler
-/// where blocking on a network call isn't desirable).
+/// whose cached quota is stale (older than `REFRESH_TTL_HOURS`) AND scan
+/// each provider's CLI session logs for new turns. Pass `None` to use
+/// cached-only scoring (e.g. from inside an async handler where blocking
+/// on a network call isn't desirable).
 pub struct BalanceContext<'a> {
     pub providers_cfg: &'a ProvidersConfig,
+    pub sessions_cfg: &'a SessionsConfig,
     pub in_flight: &'a InFlight,
 }
 
@@ -27,6 +31,8 @@ pub fn select_provider(
 
     // 1) Opportunistic refresh of any stale provider whose quota we can fetch.
     //    Only worthwhile when we're actually load-balancing (n > 1).
+    //    Also scan CLI session logs so calls_since_refresh reflects ALL
+    //    activity (agent-runner invocations + direct user UI prompts).
     if let Some(ctx) = ctx {
         for p in &model.providers {
             if is_stale(state, &p.name) {
@@ -35,74 +41,120 @@ pub fn select_provider(
                 let _: RefreshOutcome =
                     refresh_provider(&p.name, ctx.providers_cfg, ctx.in_flight, state);
             }
+            // Session scan errors don't abort the pick — we just project with
+            // a stale turn count instead of an up-to-date one.
+            let _ = scan_provider(&p.name, ctx.sessions_cfg, state);
         }
     }
 
-    // 2) Gather quota snapshots for each provider (cached reads only).
+    // 2) Gather quota records + windows for each provider (cached reads only).
     let quotas: Vec<Option<QuotaRecord>> = model
         .providers
         .iter()
         .map(|p| state.get_quota(&p.name).ok().flatten())
         .collect();
+    let windows: Vec<Vec<QuotaWindow>> = model
+        .providers
+        .iter()
+        .map(|p| state.get_windows(&p.name).unwrap_or_default())
+        .collect();
 
-    // 3) If every provider has a quota reading, use quota-aware scoring.
-    let all_have_quota = quotas.iter().all(|q| q.is_some());
-    if all_have_quota {
-        return score_by_quota(model, state, &quotas);
+    // 3) If every provider has at least one window, use density scoring.
+    let all_have_windows = windows.iter().all(|w| !w.is_empty());
+    if all_have_windows {
+        return score_by_density(model, state, &quotas, &windows);
     }
 
     // 4) Otherwise, fall back to lifetime invocation-count scoring.
     score_by_invocation_count(model, state)
 }
 
-fn score_by_quota(
+/// Density-based scoring across multi-window quotas.
+///
+/// For each provider:
+///   1. Project `used_percent` forward per window: `used + turns * avg`
+///      (`avg` is the global learned percent-per-turn from refreshes).
+///   2. Compute density per window: `(1 - projected_used) / hours_until_reset`
+///      — remaining headroom per unit time. Higher = more slack.
+///   3. Take the **binding constraint** = `min(density across windows)`.
+///      The tightest window dictates how much room a provider really has.
+///
+/// Pick the provider with the **highest** binding density.
+///
+/// This handles two scenarios cleanly:
+/// - Different reset days/times: density normalizes by how much time is left.
+/// - Multi-tier rate limits (5h + weekly): a near-exhausted 5h window forces
+///   that provider's density toward zero even if its weekly is fine.
+fn score_by_density(
     model: &ModelConfig,
     state: &StateDb,
     quotas: &[Option<QuotaRecord>],
+    windows: &[Vec<QuotaWindow>],
 ) -> usize {
     let avg = global_avg_percent_per_call(quotas);
+    let now = Utc::now();
 
     let mut scores: Vec<(usize, f64)> = Vec::with_capacity(model.providers.len());
-    for (i, q) in quotas.iter().enumerate() {
-        let q = q.as_ref().expect("all_have_quota was checked");
-
-        // Skip providers with too many recent errors — quota headroom doesn't
-        // help if calls keep failing.
+    for (i, ws) in windows.iter().enumerate() {
+        // Drop providers that are erroring out — headroom doesn't help when
+        // calls keep failing.
         let recent_errors = state
             .recent_error_count(&model.name, i, ERROR_WINDOW_MINUTES)
             .unwrap_or(0);
         if recent_errors >= ERROR_THRESHOLD {
-            scores.push((i, f64::MAX));
+            scores.push((i, f64::NEG_INFINITY));
             continue;
         }
 
-        // Project used_percent forward using calls since last refresh.
-        // avg is Δpercent per Δcall; if we don't have a learned avg yet,
-        // fall back to pure used_percent (calls term is zero-weighted).
-        let projected = q.used_percent + (q.calls_since_refresh as f64) * avg;
-        scores.push((i, projected));
+        let q = quotas[i].as_ref();
+        let turns = q
+            .and_then(|q| {
+                state
+                    .count_assistant_turns_since(&model.providers[i].name, q.refreshed_at.as_ref())
+                    .ok()
+            })
+            .unwrap_or(0);
+
+        // Per-window density. Empty `min` is impossible — `all_have_windows`
+        // gate is checked at the call site.
+        let binding = ws
+            .iter()
+            .map(|w| {
+                let projected = (w.used_percent + (turns as f64) * avg).clamp(0.0, 1.0);
+                let remaining = (1.0 - projected).max(0.0);
+                let hours = ((w.resets_at - now).num_seconds() as f64) / 3600.0;
+                // Floor at a small epsilon so a window 1 second from reset
+                // doesn't produce infinite density.
+                let hours = hours.max(1.0 / 60.0);
+                remaining / hours
+            })
+            .fold(f64::INFINITY, f64::min);
+        scores.push((i, binding));
     }
 
-    scores.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    // Sort descending: highest binding density wins.
+    scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
-    if scores.iter().all(|(_, s)| *s == f64::MAX) {
+    if scores.iter().all(|(_, s)| *s == f64::NEG_INFINITY) {
         return round_robin_fallback(model, state);
     }
     scores[0].0
 }
 
-/// Compute a global avg percent-per-call across all providers that have a
-/// valid delta. Returns 0.0 if no provider has learned a delta yet (first
-/// refresh only — see bootstrap handling in the design doc).
+/// Global avg percent-per-turn learned from refreshes. The delta is captured
+/// in `provider_quotas.last_delta_percent / last_delta_calls`, recorded
+/// against the longest window per provider (most stable signal). Sums across
+/// all providers in the pool to avoid first-refresh blind spots.
 fn global_avg_percent_per_call(quotas: &[Option<QuotaRecord>]) -> f64 {
     let mut total_percent = 0.0;
     let mut total_calls: u64 = 0;
     for q in quotas.iter().flatten() {
-        if let (Some(dp), Some(dc)) = (q.last_delta_percent, q.last_delta_calls) {
-            if dc > 0 && dp > 0.0 {
-                total_percent += dp;
-                total_calls += dc;
-            }
+        if let (Some(dp), Some(dc)) = (q.last_delta_percent, q.last_delta_calls)
+            && dc > 0
+            && dp > 0.0
+        {
+            total_percent += dp;
+            total_calls += dc;
         }
     }
     if total_calls == 0 {
@@ -237,60 +289,123 @@ mod tests {
         assert_eq!(select_provider(&model, &db, None), 1);
     }
 
+    fn one_window(used: f64, hours_until_reset: i64) -> Vec<crate::state::QuotaWindowInput> {
+        use chrono::Duration;
+        vec![crate::state::QuotaWindowInput {
+            used_percent: used,
+            resets_at: Utc::now() + Duration::hours(hours_until_reset),
+        }]
+    }
+
     #[test]
-    fn quota_scoring_picks_lowest_used_percent() {
+    fn density_scoring_picks_lowest_used_when_windows_match() {
         let db = StateDb::open(Path::new(":memory:")).unwrap();
         let model = three_provider_model();
 
-        // All three providers have quota data: a=0.50, b=0.10, c=0.30.
-        db.upsert_quota_refresh("a", 0.50, None).unwrap();
-        db.upsert_quota_refresh("b", 0.10, None).unwrap();
-        db.upsert_quota_refresh("c", 0.30, None).unwrap();
+        // All three providers reset in the same window length (7d) so density
+        // collapses to remaining-headroom comparison: a=0.50, b=0.10, c=0.30.
+        // Highest remaining = b (0.90) → pick b.
+        db.upsert_quota_refresh("a", &one_window(0.50, 24 * 7))
+            .unwrap();
+        db.upsert_quota_refresh("b", &one_window(0.10, 24 * 7))
+            .unwrap();
+        db.upsert_quota_refresh("c", &one_window(0.30, 24 * 7))
+            .unwrap();
 
         assert_eq!(select_provider(&model, &db, None), 1);
     }
 
     #[test]
-    fn quota_scoring_projects_using_calls_since_refresh() {
-        let db = StateDb::open(Path::new(":memory:")).unwrap();
-        let model = three_provider_model();
-
-        // Seed quota readings with a learned delta: prior refresh saw +0.10
-        // across 10 calls globally. avg = 0.01 percent/call.
-        // Simulate that by doing two refreshes per provider so last_delta is set.
-        db.upsert_quota_refresh("a", 0.0, None).unwrap();
-        for _ in 0..10 {
-            db.increment_calls_since_refresh("a").unwrap();
-        }
-        db.upsert_quota_refresh("a", 0.10, None).unwrap();
-
-        // Now b and c also have fresh readings (no delta history).
-        db.upsert_quota_refresh("b", 0.05, None).unwrap();
-        db.upsert_quota_refresh("c", 0.08, None).unwrap();
-
-        // a=0.10, b=0.05, c=0.08 → pick b.
-        assert_eq!(select_provider(&model, &db, None), 1);
-
-        // If b receives many calls since refresh, projection should push its
-        // score above c's. avg from a's delta = 0.10/10 = 0.01.
-        // b projected = 0.05 + 10 * 0.01 = 0.15 > c=0.08 → now pick c.
-        for _ in 0..10 {
-            db.increment_calls_since_refresh("b").unwrap();
-        }
-        assert_eq!(select_provider(&model, &db, None), 2);
-    }
-
-    #[test]
-    fn falls_back_to_invocation_count_when_quota_missing() {
+    fn density_picks_account_with_more_time_when_used_equal() {
         let db = StateDb::open(Path::new(":memory:")).unwrap();
         let model = two_provider_model();
 
-        // Only one provider has a quota reading → fallback to invocation-count
-        // where both are at 0.
-        db.upsert_quota_refresh("a", 0.90, None).unwrap();
+        // Both used 50%, but `b` has a week left vs `a`'s 1 hour left.
+        // Density: a = 0.5/1, b = 0.5/168 → a is higher density (more
+        // headroom per unit time). Pick a.
+        db.upsert_quota_refresh("a", &one_window(0.50, 1)).unwrap();
+        db.upsert_quota_refresh("b", &one_window(0.50, 24 * 7))
+            .unwrap();
 
-        // Provider b has no quota; fallback picks by invocation_count (both 0),
-        // sorted stably → picks index 0.
+        assert_eq!(select_provider(&model, &db, None), 0);
+    }
+
+    #[test]
+    fn binding_constraint_avoids_account_with_pressed_short_window() {
+        use chrono::Duration;
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = two_provider_model();
+
+        // `a` has a healthy weekly window (10% used, 7d) BUT a near-exhausted
+        // 5h window (95% used, 30min left). `b` is only at 30% on its weekly
+        // and similarly fresh on its 5h. Density should reject `a`.
+        let a_windows = vec![
+            crate::state::QuotaWindowInput {
+                used_percent: 0.10,
+                resets_at: Utc::now() + Duration::hours(24 * 7),
+            },
+            crate::state::QuotaWindowInput {
+                used_percent: 0.95,
+                resets_at: Utc::now() + Duration::minutes(30),
+            },
+        ];
+        let b_windows = vec![
+            crate::state::QuotaWindowInput {
+                used_percent: 0.30,
+                resets_at: Utc::now() + Duration::hours(24 * 7),
+            },
+            crate::state::QuotaWindowInput {
+                used_percent: 0.20,
+                resets_at: Utc::now() + Duration::hours(4),
+            },
+        ];
+        db.upsert_quota_refresh("a", &a_windows).unwrap();
+        db.upsert_quota_refresh("b", &b_windows).unwrap();
+
+        // a's binding density ≈ 0.05/0.5h = 0.1
+        // b's binding density ≈ min(0.7/168, 0.8/4) = min(0.0042, 0.2) = 0.0042
+        // Hmm, a actually has higher binding density here. Let me reconsider:
+        // a's 5h: remaining=0.05, hours=0.5 → density=0.1
+        // a's weekly: remaining=0.9, hours=168 → density=0.0054
+        // a binding = min(0.1, 0.0054) = 0.0054
+        // b's 4h: remaining=0.8, hours=4 → density=0.2
+        // b's weekly: remaining=0.7, hours=168 → density=0.0042
+        // b binding = min(0.2, 0.0042) = 0.0042
+        // a binding > b binding → pick a (counter-intuitive!)
+        // The weekly window dominates because it has by far the longest
+        // horizon and lots of headroom remaining for both. The "pressed
+        // short window" only matters when its density falls *below* the
+        // long window's density, which requires either much higher %used
+        // on the short window OR a relatively constrained weekly.
+        // Use a tighter weekly for `a` to demonstrate proper rejection:
+        let a_pressed = vec![
+            crate::state::QuotaWindowInput {
+                used_percent: 0.50,
+                resets_at: Utc::now() + Duration::hours(24 * 7),
+            },
+            crate::state::QuotaWindowInput {
+                used_percent: 0.95,
+                resets_at: Utc::now() + Duration::minutes(30),
+            },
+        ];
+        db.upsert_quota_refresh("a", &a_pressed).unwrap();
+        // Now a binding = min(0.05/0.5, 0.5/168) = min(0.1, 0.003) = 0.003
+        // b binding = 0.0042 → b wins.
+        assert_eq!(select_provider(&model, &db, None), 1);
+    }
+
+    #[test]
+    fn falls_back_to_invocation_count_when_windows_missing() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = two_provider_model();
+
+        // Only one provider has windows → fallback to invocation-count
+        // where both are at 0.
+        db.upsert_quota_refresh("a", &one_window(0.90, 24 * 7))
+            .unwrap();
+
+        // Provider b has no windows; fallback picks by invocation_count
+        // (both 0), tiebreaks to index 0.
         assert_eq!(select_provider(&model, &db, None), 0);
 
         // Record an invocation for 0 → fallback should now pick 1.

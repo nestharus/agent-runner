@@ -19,21 +19,55 @@ pub struct ProviderRecord {
     pub last_invoked_at: Option<DateTime<Utc>>,
 }
 
-/// Per-provider (account) quota snapshot. Keyed on provider name (e.g.
-/// `claude`, `claude2`), which spans every model routed through that account.
+/// Per-provider (account) metadata. Keyed on provider name (e.g. `claude`,
+/// `claude2`), which spans every model routed through that account.
+/// The actual quota numbers live in `provider_quota_windows` — one row per
+/// rolling window the CLI exposes (e.g. 5-hour + 7-day).
 #[derive(Debug, Clone)]
 pub struct QuotaRecord {
     pub provider_name: String,
-    /// Usage as a 0..1 ratio. 0.12 = 12% of the weekly window consumed.
-    pub used_percent: f64,
-    pub resets_at: Option<DateTime<Utc>>,
     /// Calls recorded against this provider since the last refresh.
     pub calls_since_refresh: u64,
     pub refreshed_at: Option<DateTime<Utc>>,
-    /// Δused_percent observed at the most recent refresh (vs. the refresh before).
+    /// Δused_percent observed at the most recent refresh on the longest
+    /// (most stable) window, vs the refresh before.
     pub last_delta_percent: Option<f64>,
-    /// Δcalls_since_refresh observed at the most recent refresh.
+    /// Δturns (agent + CLI session turns) between the two refreshes used
+    /// to compute `last_delta_percent`.
     pub last_delta_calls: Option<u64>,
+}
+
+/// One rolling-quota window reported by a provider's quota script.
+/// `window_id` is a stable per-provider position index (window 0, 1, …)
+/// so the same window survives across refreshes for delta-learning.
+#[derive(Debug, Clone)]
+pub struct QuotaWindow {
+    pub provider_name: String,
+    pub window_id: u32,
+    /// 0..1 ratio. 0.23 = 23% of this window's budget consumed.
+    pub used_percent: f64,
+    pub resets_at: DateTime<Utc>,
+}
+
+/// Input to `upsert_quota_refresh` — one window's freshly-fetched values.
+#[derive(Debug, Clone)]
+pub struct QuotaWindowInput {
+    pub used_percent: f64,
+    pub resets_at: DateTime<Utc>,
+}
+
+/// One turn ingested from a CLI session log. The unified store across
+/// every CLI we know how to parse — Claude Code, Codex, etc.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct SessionTurnRecord {
+    pub provider_name: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub timestamp: DateTime<Utc>,
+    /// "user" or "assistant" — only "assistant" turns count toward quota.
+    pub role: String,
+    pub source_file: String,
 }
 
 #[derive(Debug, Clone)]
@@ -219,6 +253,21 @@ impl StateDb {
                 last_delta_calls INTEGER
             );
 
+            CREATE TABLE IF NOT EXISTS provider_quota_windows (
+                provider_name TEXT NOT NULL,
+                window_id INTEGER NOT NULL,
+                used_percent REAL NOT NULL DEFAULT 0,
+                resets_at TEXT NOT NULL,
+                PRIMARY KEY (provider_name, window_id)
+            );
+
+            -- Migrate pre-multi-window rows: any provider_quotas row with a
+            -- resets_at that doesn't yet have a window becomes window 0.
+            INSERT OR IGNORE INTO provider_quota_windows (provider_name, window_id, used_percent, resets_at)
+            SELECT provider_name, 0, used_percent, resets_at
+            FROM provider_quotas
+            WHERE resets_at IS NOT NULL;
+
             CREATE TABLE IF NOT EXISTS memory_nodes (
                 id TEXT PRIMARY KEY,
                 node_type TEXT NOT NULL,
@@ -295,6 +344,21 @@ impl StateDb {
                 cli_mapping TEXT NOT NULL,
                 PRIMARY KEY (model_name, provider, name)
             );
+
+            CREATE TABLE IF NOT EXISTS session_turns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider_name TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                turn_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                role TEXT NOT NULL,
+                source_file TEXT NOT NULL,
+                ingested_at TEXT NOT NULL,
+                UNIQUE (provider_name, session_id, turn_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_session_turns_provider_ts
+                ON session_turns (provider_name, role, timestamp);
             ",
         )
         .map_err(|e| format!("Failed to initialize schema: {e}"))?;
@@ -431,13 +495,13 @@ impl StateDb {
 
     // --- Provider quota operations ---
 
-    /// Fetch a quota snapshot by provider name. Returns None if the provider
-    /// has never been refreshed.
+    /// Fetch provider-level quota metadata. Windows live in a separate
+    /// table — use `get_windows` to get the actual quota numbers.
     pub fn get_quota(&self, provider_name: &str) -> Result<Option<QuotaRecord>, String> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT used_percent, resets_at, calls_since_refresh, refreshed_at,
+                "SELECT calls_since_refresh, refreshed_at,
                         last_delta_percent, last_delta_calls
                  FROM provider_quotas WHERE provider_name = ?1",
             )
@@ -446,18 +510,13 @@ impl StateDb {
         let result = stmt.query_row(params![provider_name], |row| {
             Ok(QuotaRecord {
                 provider_name: provider_name.to_string(),
-                used_percent: row.get(0)?,
-                resets_at: row
+                calls_since_refresh: row.get::<_, i64>(0)? as u64,
+                refreshed_at: row
                     .get::<_, Option<String>>(1)?
                     .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                     .map(|dt| dt.with_timezone(&Utc)),
-                calls_since_refresh: row.get::<_, i64>(2)? as u64,
-                refreshed_at: row
-                    .get::<_, Option<String>>(3)?
-                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
-                last_delta_percent: row.get(4)?,
-                last_delta_calls: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
+                last_delta_percent: row.get(2)?,
+                last_delta_calls: row.get::<_, Option<i64>>(3)?.map(|v| v as u64),
             })
         });
 
@@ -468,55 +527,156 @@ impl StateDb {
         }
     }
 
-    /// Record a freshly fetched quota reading. Computes the delta from the
-    /// prior refresh for use in `avg_percent_per_call` calibration, then
-    /// resets `calls_since_refresh` to 0.
+    /// Fetch every rolling-quota window a provider has reported, ordered by
+    /// `window_id`. Empty vec if the provider has never been refreshed.
+    pub fn get_windows(&self, provider_name: &str) -> Result<Vec<QuotaWindow>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT window_id, used_percent, resets_at
+                 FROM provider_quota_windows
+                 WHERE provider_name = ?1
+                 ORDER BY window_id",
+            )
+            .map_err(|e| format!("Failed to prepare windows query: {e}"))?;
+        let rows = stmt
+            .query_map(params![provider_name], |row| {
+                let resets_at_str: String = row.get(2)?;
+                let resets_at = DateTime::parse_from_rfc3339(&resets_at_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?;
+                Ok(QuotaWindow {
+                    provider_name: provider_name.to_string(),
+                    window_id: row.get::<_, i64>(0)? as u32,
+                    used_percent: row.get(1)?,
+                    resets_at,
+                })
+            })
+            .map_err(|e| format!("Failed to query windows: {e}"))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| format!("Row error: {e}"))?);
+        }
+        Ok(out)
+    }
+
+    /// Record a freshly-fetched set of quota windows. Computes the delta
+    /// (for avg_percent_per_turn learning) against the longest window — the
+    /// most stable signal. Resets `calls_since_refresh` to 0.
+    ///
+    /// Windows are replaced wholesale: anything not in `windows` is deleted,
+    /// so a script that drops a window (e.g. CLI removed a rate limit) stops
+    /// contributing to density scoring.
     pub fn upsert_quota_refresh(
         &self,
         provider_name: &str,
-        used_percent: f64,
-        resets_at: Option<&str>,
+        windows: &[QuotaWindowInput],
     ) -> Result<(), String> {
         let now = Utc::now().to_rfc3339();
 
+        // Delta-learn against the longest window (max resets_at).
+        let longest_new = windows.iter().max_by_key(|w| w.resets_at);
         let prior = self.get_quota(provider_name)?;
-        let (delta_percent, delta_calls) = match &prior {
-            Some(p) => {
-                let dp = used_percent - p.used_percent;
-                // Only treat as a positive-learning delta when both are positive —
-                // resets (percent goes down) or zero-call intervals give us no signal.
-                if dp > 0.0 && p.calls_since_refresh > 0 {
-                    (Some(dp), Some(p.calls_since_refresh))
+        let prior_windows = self.get_windows(provider_name)?;
+        let longest_prior = prior_windows.iter().max_by_key(|w| w.resets_at);
+
+        let (delta_percent, delta_calls) = match (&prior, longest_new, longest_prior) {
+            (Some(p), Some(new_w), Some(prior_w)) => {
+                let dp = new_w.used_percent - prior_w.used_percent;
+                let turns_between_refreshes = self
+                    .count_assistant_turns_since(provider_name, p.refreshed_at.as_ref())
+                    .unwrap_or(p.calls_since_refresh);
+                if dp > 0.0 && turns_between_refreshes > 0 {
+                    (Some(dp), Some(turns_between_refreshes))
                 } else {
                     (p.last_delta_percent, p.last_delta_calls)
                 }
             }
-            None => (None, None),
+            (Some(p), _, _) => (p.last_delta_percent, p.last_delta_calls),
+            _ => (None, None),
         };
 
-        self.conn
-            .execute(
-                "INSERT INTO provider_quotas
-                    (provider_name, used_percent, resets_at, calls_since_refresh,
-                     refreshed_at, last_delta_percent, last_delta_calls)
-                 VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6)
-                 ON CONFLICT (provider_name) DO UPDATE SET
-                    used_percent = ?2,
-                    resets_at = ?3,
-                    calls_since_refresh = 0,
-                    refreshed_at = ?4,
-                    last_delta_percent = ?5,
-                    last_delta_calls = ?6",
+        // Backwards-compat: keep used_percent/resets_at on provider_quotas in sync
+        // with the longest window so legacy readers see something sensible.
+        let (legacy_used, legacy_resets) = match longest_new {
+            Some(w) => (w.used_percent, Some(w.resets_at.to_rfc3339())),
+            None => (0.0, None),
+        };
+
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("Failed to begin tx: {e}"))?;
+
+        tx.execute(
+            "INSERT INTO provider_quotas
+                (provider_name, used_percent, resets_at, calls_since_refresh,
+                 refreshed_at, last_delta_percent, last_delta_calls)
+             VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6)
+             ON CONFLICT (provider_name) DO UPDATE SET
+                used_percent = ?2,
+                resets_at = ?3,
+                calls_since_refresh = 0,
+                refreshed_at = ?4,
+                last_delta_percent = ?5,
+                last_delta_calls = ?6",
+            params![
+                provider_name,
+                legacy_used,
+                legacy_resets,
+                &now,
+                delta_percent,
+                delta_calls.map(|v| v as i64),
+            ],
+        )
+        .map_err(|e| format!("Failed to upsert quota: {e}"))?;
+
+        tx.execute(
+            "DELETE FROM provider_quota_windows WHERE provider_name = ?1",
+            params![provider_name],
+        )
+        .map_err(|e| format!("Failed to clear windows: {e}"))?;
+
+        for (i, w) in windows.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO provider_quota_windows
+                    (provider_name, window_id, used_percent, resets_at)
+                 VALUES (?1, ?2, ?3, ?4)",
                 params![
                     provider_name,
-                    used_percent,
-                    resets_at,
-                    &now,
-                    delta_percent,
-                    delta_calls.map(|v| v as i64),
+                    i as i64,
+                    w.used_percent,
+                    w.resets_at.to_rfc3339()
                 ],
             )
-            .map_err(|e| format!("Failed to upsert quota: {e}"))?;
+            .map_err(|e| format!("Failed to insert window: {e}"))?;
+        }
+
+        tx.commit()
+            .map_err(|e| format!("Failed to commit refresh: {e}"))?;
+        Ok(())
+    }
+
+    /// Test-only: backdate a provider's `refreshed_at` so tests can seed
+    /// turns whose timestamps are "after" the refresh.
+    #[cfg(test)]
+    pub fn set_refreshed_at_for_test(
+        &self,
+        provider_name: &str,
+        refreshed_at: &DateTime<Utc>,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE provider_quotas SET refreshed_at = ?1 WHERE provider_name = ?2",
+                params![refreshed_at.to_rfc3339(), provider_name],
+            )
+            .map_err(|e| format!("Failed to set refreshed_at: {e}"))?;
         Ok(())
     }
 
@@ -535,15 +695,16 @@ impl StateDb {
         Ok(())
     }
 
-    /// Fetch quotas for a set of provider names in one query.
+    /// Fetch provider-level quota records for a set of names in one query.
+    /// Use `get_windows` separately to get each provider's window rows.
     pub fn get_quotas(&self, names: &[String]) -> Result<Vec<QuotaRecord>, String> {
         if names.is_empty() {
             return Ok(vec![]);
         }
         let placeholders = vec!["?"; names.len()].join(",");
         let sql = format!(
-            "SELECT provider_name, used_percent, resets_at, calls_since_refresh,
-                    refreshed_at, last_delta_percent, last_delta_calls
+            "SELECT provider_name, calls_since_refresh, refreshed_at,
+                    last_delta_percent, last_delta_calls
              FROM provider_quotas WHERE provider_name IN ({placeholders})"
         );
         let mut stmt = self
@@ -558,18 +719,13 @@ impl StateDb {
             .query_map(name_refs.as_slice(), |row| {
                 Ok(QuotaRecord {
                     provider_name: row.get(0)?,
-                    used_percent: row.get(1)?,
-                    resets_at: row
+                    calls_since_refresh: row.get::<_, i64>(1)? as u64,
+                    refreshed_at: row
                         .get::<_, Option<String>>(2)?
                         .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                         .map(|dt| dt.with_timezone(&Utc)),
-                    calls_since_refresh: row.get::<_, i64>(3)? as u64,
-                    refreshed_at: row
-                        .get::<_, Option<String>>(4)?
-                        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                        .map(|dt| dt.with_timezone(&Utc)),
-                    last_delta_percent: row.get(5)?,
-                    last_delta_calls: row.get::<_, Option<i64>>(6)?.map(|v| v as u64),
+                    last_delta_percent: row.get(3)?,
+                    last_delta_calls: row.get::<_, Option<i64>>(4)?.map(|v| v as u64),
                 })
             })
             .map_err(|e| format!("Failed to run quota batch query: {e}"))?;
@@ -912,6 +1068,116 @@ impl StateDb {
             discovered_at: row.get(2)?,
             cli_version: row.get(3)?,
         })
+    }
+
+    // --- Session log ingestion ---
+
+    /// Insert one parsed turn. Idempotent: re-running a scan against an
+    /// unchanged log is a no-op for already-seen turns.
+    pub fn ingest_session_turn(
+        &self,
+        provider_name: &str,
+        session_id: &str,
+        turn_id: &str,
+        timestamp: &DateTime<Utc>,
+        role: &str,
+        source_file: &str,
+    ) -> Result<bool, String> {
+        let now = Utc::now().to_rfc3339();
+        let ts = timestamp.to_rfc3339();
+        let changed = self
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO session_turns
+                    (provider_name, session_id, turn_id, timestamp, role, source_file, ingested_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    provider_name,
+                    session_id,
+                    turn_id,
+                    &ts,
+                    role,
+                    source_file,
+                    &now,
+                ],
+            )
+            .map_err(|e| format!("Failed to ingest session turn: {e}"))?;
+        Ok(changed > 0)
+    }
+
+    /// Bulk-insert turns inside a single transaction with a prepared
+    /// statement. Hundreds of thousands of rows go from minutes to seconds
+    /// vs the per-row method. Returns the count of newly-inserted rows
+    /// (duplicates collapsed by the UNIQUE constraint don't count).
+    pub fn ingest_session_turns_batch(
+        &self,
+        provider_name: &str,
+        turns: &[(String, String, DateTime<Utc>, String)],
+    ) -> Result<u64, String> {
+        if turns.is_empty() {
+            return Ok(0);
+        }
+        let now = Utc::now().to_rfc3339();
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("Failed to begin transaction: {e}"))?;
+        let mut new_count: u64 = 0;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT OR IGNORE INTO session_turns
+                        (provider_name, session_id, turn_id, timestamp, role, source_file, ingested_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, '', ?6)",
+                )
+                .map_err(|e| format!("Failed to prepare batch insert: {e}"))?;
+            for (session_id, turn_id, timestamp, role) in turns {
+                let n = stmt
+                    .execute(params![
+                        provider_name,
+                        session_id,
+                        turn_id,
+                        timestamp.to_rfc3339(),
+                        role,
+                        &now,
+                    ])
+                    .map_err(|e| format!("Batch insert row failed: {e}"))?;
+                new_count += n as u64;
+            }
+        }
+        tx.commit()
+            .map_err(|e| format!("Failed to commit batch: {e}"))?;
+        Ok(new_count)
+    }
+
+    /// Count assistant turns ingested for a provider since `since` (exclusive).
+    /// `None` means count everything we've ever ingested for that provider.
+    pub fn count_assistant_turns_since(
+        &self,
+        provider_name: &str,
+        since: Option<&DateTime<Utc>>,
+    ) -> Result<u64, String> {
+        let count: i64 = match since {
+            Some(ts) => self
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM session_turns
+                     WHERE provider_name = ?1 AND role = 'assistant' AND timestamp > ?2",
+                    params![provider_name, ts.to_rfc3339()],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("Failed to count session turns: {e}"))?,
+            None => self
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM session_turns
+                     WHERE provider_name = ?1 AND role = 'assistant'",
+                    params![provider_name],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("Failed to count session turns: {e}"))?,
+        };
+        Ok(count.max(0) as u64)
     }
 
     /// Helper: map a rusqlite row to an AccountRecord.

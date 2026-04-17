@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""
+Reference adapter: emit Codex CLI session turns as normalized JSONL.
+
+Usage: codex-turns BASE_DIR
+
+Codex's per-session JSONL has a `session_meta` line carrying the session id,
+and subsequent `response_item` lines whose `payload.type == "message"` are
+turns. `payload.id` is null in current Codex versions, so we synthesize a
+stable turn_id from `<file>:<line_no>`.
+
+The runner sets STATE_DIR for incremental cursor bookkeeping. We track the
+highest mtime emitted; subsequent runs skip files unchanged since.
+"""
+
+import json
+import os
+import sys
+from pathlib import Path
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        print("usage: codex-turns BASE_DIR", file=sys.stderr)
+        return 2
+    base = Path(sys.argv[1]).expanduser()
+    state_dir = Path(os.environ.get("STATE_DIR", "/tmp/codex-turns-state"))
+    state_dir.mkdir(parents=True, exist_ok=True)
+    cursor_file = state_dir / "last_mtime"
+
+    last_mtime = 0
+    if cursor_file.exists():
+        try:
+            last_mtime = int(cursor_file.read_text().strip())
+        except ValueError:
+            last_mtime = 0
+
+    new_max = last_mtime
+    out = sys.stdout
+
+    for path in base.rglob("rollout-*.jsonl"):
+        try:
+            mtime = int(path.stat().st_mtime)
+        except OSError:
+            continue
+        if mtime <= last_mtime:
+            continue
+        if mtime > new_max:
+            new_max = mtime
+        emit_file(path, out)
+
+    cursor_file.write_text(str(new_max))
+    return 0
+
+
+def emit_file(path: Path, out) -> None:
+    sid = None
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            for line_no, raw in enumerate(fh, start=1):
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                kind = obj.get("type")
+                if kind == "session_meta":
+                    sid = (obj.get("payload") or {}).get("id")
+                elif kind == "response_item" and sid:
+                    payload = obj.get("payload") or {}
+                    if payload.get("type") != "message":
+                        continue
+                    role = payload.get("role")
+                    if role not in ("user", "assistant"):
+                        continue
+                    ts = obj.get("timestamp")
+                    if not ts:
+                        continue
+                    out.write(json.dumps({
+                        "session_id": sid,
+                        "turn_id": f"{path}:{line_no}",
+                        "timestamp": ts,
+                        "role": role,
+                    }))
+                    out.write("\n")
+    except OSError:
+        return
+
+
+if __name__ == "__main__":
+    sys.exit(main())

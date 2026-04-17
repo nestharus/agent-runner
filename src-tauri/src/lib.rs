@@ -4,6 +4,7 @@ pub mod diagnostics;
 pub mod discovery;
 pub mod executor;
 pub mod quota;
+pub mod sessions;
 pub mod setup;
 pub mod state;
 
@@ -286,11 +287,16 @@ fn list_pools(state: tauri::State<AppState>) -> Result<Vec<PoolSummary>, String>
 }
 
 #[derive(Serialize)]
+pub struct QuotaRefreshWindow {
+    pub used_percent: f64,
+    pub resets_at: String,
+}
+
+#[derive(Serialize)]
 pub struct QuotaRefreshEntry {
     pub provider_name: String,
     pub status: String,
-    pub used_percent: Option<f64>,
-    pub resets_at: Option<String>,
+    pub windows: Vec<QuotaRefreshWindow>,
     pub message: Option<String>,
 }
 
@@ -329,8 +335,7 @@ async fn refresh_quotas(
         .unwrap_or(&state.models_dir)
         .join("state.db");
 
-    let db = state::StateDb::open(&db_path)
-        .map_err(|e| format!("Failed to open state DB: {e}"))?;
+    let db = state::StateDb::open(&db_path).map_err(|e| format!("Failed to open state DB: {e}"))?;
     let in_flight = &state.quota_in_flight;
     let mut results = Vec::with_capacity(candidates.len());
 
@@ -339,8 +344,7 @@ async fn refresh_quotas(
             results.push(QuotaRefreshEntry {
                 provider_name,
                 status: "fresh".into(),
-                used_percent: None,
-                resets_at: None,
+                windows: vec![],
                 message: None,
             });
             continue;
@@ -348,32 +352,34 @@ async fn refresh_quotas(
 
         let outcome = quota::refresh_provider(&provider_name, &providers_cfg, in_flight, &db);
         results.push(match outcome {
-            quota::RefreshOutcome::Updated { used_percent, resets_at } => QuotaRefreshEntry {
+            quota::RefreshOutcome::Updated { windows } => QuotaRefreshEntry {
                 provider_name,
                 status: "updated".into(),
-                used_percent: Some(used_percent),
-                resets_at,
+                windows: windows
+                    .into_iter()
+                    .map(|w| QuotaRefreshWindow {
+                        used_percent: w.used_percent,
+                        resets_at: w.resets_at.to_rfc3339(),
+                    })
+                    .collect(),
                 message: None,
             },
             quota::RefreshOutcome::NoScript => QuotaRefreshEntry {
                 provider_name,
                 status: "no_script".into(),
-                used_percent: None,
-                resets_at: None,
+                windows: vec![],
                 message: None,
             },
             quota::RefreshOutcome::AlreadyInFlight => QuotaRefreshEntry {
                 provider_name,
                 status: "in_flight".into(),
-                used_percent: None,
-                resets_at: None,
+                windows: vec![],
                 message: None,
             },
             quota::RefreshOutcome::Failed(msg) => QuotaRefreshEntry {
                 provider_name,
                 status: "failed".into(),
-                used_percent: None,
-                resets_at: None,
+                windows: vec![],
                 message: Some(msg),
             },
         });

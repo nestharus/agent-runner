@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""
+Reference adapter: emit Claude Code session turns as normalized JSONL
+for oulipoly-agent-runner's session ingester.
+
+Usage: claude-code-turns BASE_DIR
+   e.g. claude-code-turns ~/.claude/projects
+
+The runner sets STATE_DIR to a writable dir for incremental bookkeeping.
+We track the highest mtime emitted; subsequent runs skip files unchanged
+since.
+
+Emits one JSON object per line on stdout:
+  {"session_id":"<sid>","turn_id":"<uuid>","timestamp":"<rfc3339>","role":"user|assistant"}
+"""
+
+import json
+import os
+import sys
+from pathlib import Path
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        print("usage: claude-code-turns BASE_DIR", file=sys.stderr)
+        return 2
+    base = Path(sys.argv[1]).expanduser()
+    state_dir = Path(os.environ.get("STATE_DIR", "/tmp/claude-code-turns-state"))
+    state_dir.mkdir(parents=True, exist_ok=True)
+    cursor_file = state_dir / "last_mtime"
+
+    last_mtime = 0
+    if cursor_file.exists():
+        try:
+            last_mtime = int(cursor_file.read_text().strip())
+        except ValueError:
+            last_mtime = 0
+
+    new_max = last_mtime
+    out = sys.stdout
+
+    for path in base.rglob("*.jsonl"):
+        try:
+            mtime = int(path.stat().st_mtime)
+        except OSError:
+            continue
+        if mtime <= last_mtime:
+            continue
+        if mtime > new_max:
+            new_max = mtime
+        emit_file(path, out)
+
+    cursor_file.write_text(str(new_max))
+    return 0
+
+
+def emit_file(path: Path, out) -> None:
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                kind = obj.get("type")
+                if kind not in ("user", "assistant"):
+                    continue
+                uuid = obj.get("uuid")
+                ts = obj.get("timestamp")
+                sid = obj.get("sessionId")
+                if not (uuid and ts and sid):
+                    continue
+                out.write(json.dumps({
+                    "session_id": sid,
+                    "turn_id": uuid,
+                    "timestamp": ts,
+                    "role": kind,
+                }))
+                out.write("\n")
+    except OSError:
+        return
+
+
+if __name__ == "__main__":
+    sys.exit(main())

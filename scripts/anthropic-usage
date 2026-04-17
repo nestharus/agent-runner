@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+#
+# Report quota usage for a Claude (Anthropic OAuth) account.
+#
+# Usage: anthropic-usage PATH_TO_CREDENTIALS_JSON
+#   e.g. anthropic-usage ~/.claude/.credentials.json
+#
+# Prints multi-window JSON on stdout. Anthropic exposes both a 5-hour rolling
+# window and a 7-day rolling window:
+#
+#   {"windows": [
+#      {"used_percent": 23, "resets_at": "2026-04-23T19:00:00Z"},
+#      {"used_percent": 45, "resets_at": "2026-04-17T15:00:00Z"}
+#   ]}
+#
+# Window order doesn't matter — the runner identifies windows by position
+# (window_id) and uses the longest one (max resets_at) for delta learning.
+#
+# Exits 0 on success, non-zero (with diagnostic on stderr) on failure.
+
+set -euo pipefail
+
+CREDS="${1:?usage: anthropic-usage PATH_TO_CREDENTIALS_JSON}"
+
+if [[ ! -r "$CREDS" ]]; then
+  echo "credentials file not readable: $CREDS" >&2
+  exit 2
+fi
+
+ACCESS_TOKEN="$(jq -r '.claudeAiOauth.accessToken // empty' "$CREDS")"
+if [[ -z "$ACCESS_TOKEN" ]]; then
+  echo "no claudeAiOauth.accessToken in $CREDS" >&2
+  exit 3
+fi
+
+RESP="$(curl -sS --max-time 20 \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "anthropic-beta: oauth-2025-04-20" \
+  https://api.anthropic.com/api/oauth/usage)"
+
+# Anthropic response shape (verified 2026-04-17):
+#   {"five_hour":  {"utilization": <0-100>, "resets_at": "..."},
+#    "seven_day":  {"utilization": <0-100>, "resets_at": "..."}, ...}
+# Emit BOTH windows; let the runner reason about density across them.
+echo "$RESP" | jq '{
+  windows: [
+    (if .seven_day.resets_at then
+       {used_percent: (.seven_day.utilization // 0), resets_at: .seven_day.resets_at}
+     else empty end),
+    (if .five_hour.resets_at then
+       {used_percent: (.five_hour.utilization // 0), resets_at: .five_hour.resets_at}
+     else empty end)
+  ]
+}'

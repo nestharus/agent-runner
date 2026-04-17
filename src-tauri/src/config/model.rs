@@ -18,7 +18,11 @@ impl ProviderConfig {
     pub fn new(command: impl Into<String>, args: Vec<String>) -> Self {
         let command = command.into();
         let name = derive_provider_name(&command, &args);
-        Self { name, command, args }
+        Self {
+            name,
+            command,
+            args,
+        }
     }
 }
 
@@ -386,7 +390,11 @@ impl ModelConfig {
         } else if let Some(command) = raw.command {
             let args = raw.args.unwrap_or_default();
             let name = derive_provider_name(&command, &args);
-            vec![ProviderConfig { name, command, args }]
+            vec![ProviderConfig {
+                name,
+                command,
+                args,
+            }]
         } else {
             return Err(format!(
                 "Model {name}: must have either 'command' or '[[providers]]'"
@@ -472,8 +480,14 @@ mod tests {
 
     #[test]
     fn derive_provider_name_env_wrapper() {
-        let args = vec!["-u".to_string(), "CLAUDECODE".to_string(), "claude2".to_string(),
-                        "-p".to_string(), "--model".to_string(), "opus".to_string()];
+        let args = vec![
+            "-u".to_string(),
+            "CLAUDECODE".to_string(),
+            "claude2".to_string(),
+            "-p".to_string(),
+            "--model".to_string(),
+            "opus".to_string(),
+        ];
         assert_eq!(derive_provider_name("env", &args), "claude2");
     }
 

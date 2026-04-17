@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+#
+# Report quota usage for a Z.ai (GLM Coding Plan) account.
+#
+# Usage: zai-usage PATH_TO_OPENCODE_AUTH_JSON
+#   e.g. zai-usage ~/.config/opencode/auth.json
+#
+# Reads the Z_AI_API_KEY from the OpenCode auth file (where the credential
+# lives when GLM is set up via the OpenCode CLI).
+#
+# Z.ai exposes multiple TOKENS_LIMIT entries (5h cycle + weekly) and a
+# TIME_LIMIT entry (MCP tool usage — not API quota). We emit the
+# TOKENS_LIMIT entries as quota windows; TIME_LIMIT is skipped.
+#
+# Output:
+#   {"windows": [
+#      {"used_percent": 45, "resets_at": "2026-04-17T15:00:00Z"},
+#      {"used_percent": 23, "resets_at": "2026-04-23T19:00:00Z"}
+#   ]}
+#
+# Exits 0 on success, non-zero (with diagnostic on stderr) on failure.
+
+set -euo pipefail
+
+CREDS="${1:?usage: zai-usage PATH_TO_OPENCODE_AUTH_JSON}"
+
+if [[ ! -r "$CREDS" ]]; then
+  echo "credentials file not readable: $CREDS" >&2
+  exit 2
+fi
+
+TOKEN="$(jq -r '.Z_AI_API_KEY // empty' "$CREDS")"
+if [[ -z "$TOKEN" ]]; then
+  echo "no Z_AI_API_KEY in $CREDS" >&2
+  exit 3
+fi
+
+# Z.ai's monitoring endpoint expects the raw token in Authorization (NO Bearer prefix).
+RESP="$(curl -sS --max-time 20 \
+  -H "Authorization: $TOKEN" \
+  -H "Accept-Language: en-US,en" \
+  -H "Content-Type: application/json" \
+  https://api.z.ai/api/monitor/usage/quota/limit)"
+
+# Response shape (verified 2026-04-17):
+#   {"code":200, "data":{"limits":[
+#     {"type":"TOKENS_LIMIT", "unit":<n>, "number":<m>, "percentage":<0-100>, "nextResetTime":<epoch_ms>?},
+#     {"type":"TIME_LIMIT",   "unit":<n>, "usage":<n>, "percentage":<0-100>, "nextResetTime":<epoch_ms>}
+#   ]}}
+# - TOKENS_LIMIT entries are the API quota windows (5h cycle + weekly).
+# - TIME_LIMIT is MCP tool usage; not API quota — skip.
+# - `nextResetTime` only appears once a window has accrued usage. We skip
+#   entries without it (no density computable, no pressure to balance).
+echo "$RESP" | jq '{
+  windows: [
+    .data.limits[]?
+    | select(.type == "TOKENS_LIMIT")
+    | select(.nextResetTime != null)
+    | {
+        used_percent: (.percentage // 0),
+        resets_at: ((.nextResetTime / 1000) | strftime("%Y-%m-%dT%H:%M:%SZ"))
+      }
+  ]
+}'

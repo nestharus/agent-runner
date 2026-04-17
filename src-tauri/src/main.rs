@@ -237,14 +237,19 @@ fn run_with_balancing(
 
     // Load providers.toml from the same config dir as models; quota refresh
     // only runs when actual load-balancing is possible (n > 1 providers).
-    let providers_path = dirs::config_dir()
-        .map(|d| d.join("oulipoly-agent-runner").join("providers.toml"))
-        .unwrap_or_else(|| std::path::PathBuf::from("providers.toml"));
-    let providers_cfg = agent_runner_lib::config::ProvidersConfig::load(&providers_path)
-        .unwrap_or_default();
+    let config_root = dirs::config_dir()
+        .map(|d| d.join("oulipoly-agent-runner"))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let providers_path = config_root.join("providers.toml");
+    let sessions_path = config_root.join("sessions.toml");
+    let providers_cfg =
+        agent_runner_lib::config::ProvidersConfig::load(&providers_path).unwrap_or_default();
+    let sessions_cfg =
+        agent_runner_lib::config::SessionsConfig::load(&sessions_path).unwrap_or_default();
     let in_flight = agent_runner_lib::quota::InFlight::new();
     let ctx = balancer::BalanceContext {
         providers_cfg: &providers_cfg,
+        sessions_cfg: &sessions_cfg,
         in_flight: &in_flight,
     };
     let provider_index = balancer::select_provider(model, &state, Some(&ctx));

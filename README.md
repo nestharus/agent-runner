@@ -172,19 +172,21 @@ oulipoly-agent-runner -m seedance-i2v-low -i image=cat.jpeg "The cat blinks slow
 
 Models with multiple `[[providers]]` are automatically load balanced. The runner picks a provider per invocation using, in order of preference:
 
-1. **Quota-aware scoring** (when every provider has a cached quota reading): picks the provider with the lowest *projected* usage, where projection = `used_percent + calls_since_refresh × avg_percent_per_call`. The `avg_percent_per_call` is learned globally across refreshes, so fresh accounts with no learned delta fall back to raw `used_percent` ordering.
+1. **Density-based scoring** (when every provider has at least one quota window): picks the provider with the highest **binding density** = `min(remaining / hours_until_reset)` across its rolling-quota windows. A near-exhausted short window (e.g. 5h hitting 95%) drops binding density to ~0 and forces traffic away even if the weekly quota is fine. Projected usage = `used_percent + turns_since_refresh × avg_percent_per_turn`, where `turns_since_refresh` comes from CLI session log ingestion (see [Session Ingestion](#session-ingestion)).
 2. **Invocation-count round-robin** (fallback when any provider lacks a quota reading): picks the provider with the fewest lifetime invocations.
 3. **Error avoidance** (always applied): providers with 3+ errors in the last 30 minutes are deprioritized regardless of score.
 
-Quota readings are refreshed lazily — each CLI invocation checks if any participating provider's cached reading is older than 12 hours and, if so, runs that provider's `quota_script` (see [`providers.toml`](#providerstoml) below) synchronously before picking. Refreshes are deduplicated across concurrent callers by an in-process lock.
+**Why density?** Accounts often have different reset days/times. A 50%-used account resetting in 1 hour has *less* headroom-per-hour than a 10%-used account resetting in 7 days, even though raw "used percent" suggests the opposite. Density normalizes both.
+
+Quota readings are refreshed lazily — each CLI invocation runs the participating providers' `quota_script` (see [`providers.toml`](#providerstoml) below) when their cached reading is older than the **dynamic TTL**: `min(hours_until_reset across windows) / 5`, clamped to `[5min, 24h]`. So a provider with a 5-hour window gets re-queried hourly; a provider with only a weekly window gets re-queried every ~33 hours. Refreshes are deduplicated across concurrent callers by an in-process lock.
 
 Provider state is keyed by the provider's `name` field (the CLI account — e.g. `claude`, `claude2`) and is shared across every model routed through that account. This means two models pointing at the same provider share quota and error history.
 
-**Persistent state**: all invocation history and quota snapshots live in SQLite at `~/.local/share/oulipoly-agent-runner/state.db`. No daemon or background process — state is shared via filesystem-level SQLite WAL locking, so multiple CLI invocations coordinate safely.
+**Persistent state**: invocation history, quota snapshots, and ingested session turns live in SQLite at `~/.local/share/oulipoly-agent-runner/state.db`. No daemon or background process — state is shared via filesystem-level SQLite WAL locking, so multiple CLI invocations coordinate safely.
 
 ### `providers.toml`
 
-To enable quota-aware balancing, create `~/.config/oulipoly-agent-runner/providers.toml` with one entry per provider account. Each entry declares a `quota_script` — a shell command that prints JSON `{"used_percent": <0..100>, "resets_at": "..."}` on stdout:
+To enable quota-aware balancing, create `~/.config/oulipoly-agent-runner/providers.toml` with one entry per provider account. Each entry declares a `quota_script` — a shell command that prints JSON on stdout describing one or more rolling-quota windows:
 
 ```toml
 [claude]
@@ -192,19 +194,89 @@ quota_script = "anthropic-usage ~/.claude/.credentials.json"
 
 [claude2]
 quota_script = "anthropic-usage ~/.claude2/.credentials.json"
+
+[opencode]
+quota_script = "zai-usage ~/.config/opencode/auth.json"
 ```
 
-The `used_percent` field is on a 0..100 scale (matching what provider APIs typically return). `resets_at` is optional (RFC 3339 timestamp). Scripts have a 30-second timeout and run via `sh -c`, so `~` expansion and pipelines work.
+**Script output (multi-window)**:
 
-Providers without a `quota_script` entry cause that model to fall back to invocation-count scoring.
+```json
+{
+  "windows": [
+    {"used_percent": 23, "resets_at": "2026-04-23T19:00:00Z"},
+    {"used_percent": 45, "resets_at": "2026-04-17T15:00:00Z"}
+  ]
+}
+```
 
-### Diagnostic tool
+`used_percent` is on a 0..100 scale (or 0..1 — both are accepted). `resets_at` is required RFC 3339. Window count is arbitrary — emit one for each rolling-quota tier the provider exposes (Anthropic has 5h + 7d, z.ai has 5h + weekly, etc.).
+
+**Backwards compatibility**: the legacy single-window shape `{"used_percent": X, "resets_at": "..."}` is still parsed and treated as one window.
+
+Scripts have a 30-second timeout and run via `sh -c`, so `~` expansion and pipelines work. Providers without a `quota_script` entry fall back to invocation-count scoring.
+
+**Reference quota adapters** (in [`scripts/`](scripts/)):
+
+| Script | API | Windows |
+|---|---|---|
+| `anthropic-usage CREDS` | `/api/oauth/usage` | 5-hour + 7-day |
+| `zai-usage AUTH_JSON` | `/api/monitor/usage/quota/limit` | 5-hour + weekly (when usage > 0) |
+
+Install them on your `$PATH`:
 
 ```bash
-cd src-tauri && cargo run --release --example quota_check
+install -m 755 scripts/anthropic-usage scripts/zai-usage ~/.local/bin/
 ```
 
-Loads the installed models + `providers.toml`, refreshes any stale quotas, then prints — for every multi-provider model — what `select_provider` would pick and the score breakdown.
+## Session Ingestion
+
+Direct CLI usage burns the same weekly/5h quota as agent-runner invocations, but the balancer can't see those calls without help. Session ingestion solves this by reading each CLI's session logs and counting **assistant turns** — each one is one API call.
+
+Configure adapters in `~/.config/oulipoly-agent-runner/sessions.toml`:
+
+```toml
+[claude]
+turn_script = "claude-code-turns ~/.claude/projects"
+
+[claude2]
+turn_script = "claude-code-turns ~/.claude2/projects"
+
+[codex]
+turn_script = "codex-turns ~/.codex/sessions"
+
+# Optional: override where the script keeps its incremental cursor.
+[claude3]
+turn_script = "claude-code-turns ~/.claude3/projects"
+state_dir   = "~/.cache/oulipoly/claude3-cursor"
+```
+
+**Turn script contract** — same adapter pattern as quota scripts. The runner spawns the script with `STATE_DIR` env (a writable dir for the script's own incremental cursor) and parses one JSON object per line on stdout:
+
+```json
+{"session_id": "...", "turn_id": "...", "timestamp": "<RFC 3339>", "role": "user|assistant"}
+```
+
+Idempotent — re-running with no source changes outputs nothing. The runner's `session_turns` table has `UNIQUE(provider, session_id, turn_id)` so duplicate emission is also tolerated.
+
+**Reference turn adapters** (in [`scripts/`](scripts/)):
+
+| Script | Adapts | Storage |
+|---|---|---|
+| `claude-code-turns BASE_DIR` | Claude Code | JSONL tree under `BASE_DIR` |
+| `codex-turns BASE_DIR` | Codex CLI | Date-sharded JSONL under `BASE_DIR` |
+
+For other CLIs (SQLite history, remote API, etc.), write your own script — see [`scripts/README.md`](scripts/README.md). The application stays format-agnostic; everything CLI-specific lives in adapter scripts.
+
+### Diagnostic tools
+
+```bash
+cd src-tauri
+cargo run --release --example quota_check     # Refresh quotas, show density picks
+cargo run --release --example session_scan    # Run all turn scripts, show counts
+```
+
+`quota_check` loads `providers.toml`, refreshes stale windows, and prints — for every multi-provider model — the binding density and which provider would be picked. `session_scan` runs every `turn_script`, ingests new turns into `session_turns`, and prints per-provider totals.
 
 ## Diagnostics
 
@@ -224,6 +296,7 @@ All user config lives in `~/.config/oulipoly-agent-runner/`:
 ~/.config/oulipoly-agent-runner/
   config.toml          Global settings
   providers.toml       Per-provider quota scripts (optional, for quota-aware balancing)
+  sessions.toml        Per-provider turn-count adapters (optional, for accurate cross-source projection)
   models/              Model configs (one .toml per model)
   agents/              Agent configs (one .md per agent)
 ```
