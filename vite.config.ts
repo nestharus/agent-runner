@@ -9,6 +9,14 @@ export default defineConfig({
 		strictPort: true,
 	},
 	build: {
-		target: ["es2021", "chrome105", "safari13"],
+		// Tauri v2 ships with WebView2 (Win), WKWebView (macOS), and
+		// webkit2gtk (Linux), all of which are modern enough to handle
+		// every JS feature the SolidJS compiler emits. Targeting older
+		// browsers (es2021/chrome105/safari13) caused esbuild to fail
+		// with "Transforming destructuring to the configured target
+		// environment is not supported yet" on every release build
+		// since SolidJS started emitting more aggressive destructuring
+		// patterns (broken since ~March 2026). Drop to esnext.
+		target: "esnext",
 	},
 });
