@@ -9,7 +9,7 @@
 //!   - Run as `sh -c <turn_script>` with `STATE_DIR` env set to a writable dir
 //!     the script may use for incremental cursor bookkeeping.
 //!   - Stdout: one JSON object per line per turn (in any order):
-//!     `{"session_id":"...","turn_id":"...","timestamp":"<ISO8601>","role":"user"|"assistant"}`
+//!     `{"session_id":"...","turn_id":"...","timestamp":"<ISO8601>","role":"user"|"assistant","parent_turn_id":"...","is_sidechain":true}`
 //!   - Empty stdout = no new turns. Non-zero exit = error.
 //!   - Idempotent: re-running with no source changes outputs nothing.
 //!
@@ -18,7 +18,7 @@
 //! safe even if a script over-emits (e.g. doesn't honor its cursor).
 
 use crate::config::{SessionSourceEntry, SessionsConfig};
-use crate::state::StateDb;
+use crate::state::{SessionTurnIngest, StateDb};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -36,6 +36,10 @@ pub struct ScriptTurn {
     pub turn_id: String,
     pub timestamp: String,
     pub role: String,
+    #[serde(default)]
+    pub parent_turn_id: Option<String>,
+    #[serde(default)]
+    pub is_sidechain: Option<bool>,
 }
 
 /// Outcome of scanning one provider's session source.
@@ -81,7 +85,7 @@ pub fn scan_provider(
     // Collect all turns first, then batch-insert in one transaction. For
     // the bootstrap scan (hundreds of thousands of rows), per-row inserts
     // are 100x slower than a transactional batch.
-    let mut batch: Vec<(String, String, DateTime<Utc>, String)> = Vec::new();
+    let mut batch: Vec<SessionTurnIngest> = Vec::new();
     for line in stdout.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -106,7 +110,14 @@ pub fn scan_provider(
                 continue;
             }
         };
-        batch.push((turn.session_id, turn.turn_id, timestamp, turn.role));
+        batch.push(SessionTurnIngest {
+            session_id: turn.session_id,
+            turn_id: turn.turn_id,
+            timestamp,
+            role: turn.role,
+            parent_turn_id: turn.parent_turn_id,
+            is_sidechain: turn.is_sidechain.unwrap_or(false),
+        });
     }
     match db.ingest_session_turns_batch(provider_name, &batch) {
         Ok(n) => report.new_turns = n,
@@ -347,6 +358,33 @@ EOF"#,
         let r = scan_provider("p", &cfg, &db);
         assert_eq!(r.new_turns, 1, "second emission deduped by UNIQUE");
         assert_eq!(r.script_lines, 2);
+    }
+
+    #[test]
+    fn script_turn_legacy_json_deserializes_with_none_defaults() {
+        let turn: ScriptTurn = serde_json::from_str(
+            r#"{"session_id":"S1","turn_id":"t1","timestamp":"2026-04-17T08:00:00Z","role":"assistant"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(turn.session_id, "S1");
+        assert_eq!(turn.turn_id, "t1");
+        assert_eq!(turn.role, "assistant");
+        assert_eq!(turn.parent_turn_id, None);
+        assert_eq!(turn.is_sidechain, None);
+    }
+
+    #[test]
+    fn script_turn_full_json_deserializes_parent_and_sidechain_fields() {
+        let turn: ScriptTurn = serde_json::from_str(
+            r#"{"session_id":"S1","turn_id":"t2","timestamp":"2026-04-17T08:00:01Z","role":"assistant","parent_turn_id":"t1","is_sidechain":true}"#,
+        )
+        .unwrap();
+
+        assert_eq!(turn.session_id, "S1");
+        assert_eq!(turn.turn_id, "t2");
+        assert_eq!(turn.parent_turn_id.as_deref(), Some("t1"));
+        assert_eq!(turn.is_sidechain, Some(true));
     }
 
     #[test]

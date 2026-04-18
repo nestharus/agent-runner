@@ -69,7 +69,29 @@ pub struct SessionTurnRecord {
     pub timestamp: DateTime<Utc>,
     /// "user" or "assistant" — only "assistant" turns count toward quota.
     pub role: String,
+    pub parent_turn_id: Option<String>,
+    pub is_sidechain: bool,
     pub source_file: String,
+}
+
+/// One turn batched into `ingest_session_turns_batch`. Named struct
+/// instead of a tuple so callers can't accidentally swap positional
+/// fields (the role / parent_turn_id pair is otherwise easy to mix up).
+#[derive(Debug, Clone)]
+pub struct SessionTurnIngest {
+    pub session_id: String,
+    pub turn_id: String,
+    pub timestamp: DateTime<Utc>,
+    pub role: String,
+    pub parent_turn_id: Option<String>,
+    pub is_sidechain: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionTurnCounts {
+    pub total: u64,
+    pub assistant: u64,
+    pub sidechain: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -430,16 +452,16 @@ impl StateDb {
                 turn_id TEXT NOT NULL,
                 timestamp TEXT NOT NULL,
                 role TEXT NOT NULL,
+                parent_turn_id TEXT,
+                is_sidechain INTEGER NOT NULL DEFAULT 0,
                 source_file TEXT NOT NULL,
                 ingested_at TEXT NOT NULL,
                 UNIQUE (provider_name, session_id, turn_id)
             );
-
-            CREATE INDEX IF NOT EXISTS idx_session_turns_provider_ts
-                ON session_turns (provider_name, role, timestamp);
             ",
         )
         .map_err(|e| format!("Failed to initialize schema: {e}"))?;
+        Self::ensure_session_turns_schema(&conn)?;
 
         Ok(StateDb { conn })
     }
@@ -497,6 +519,42 @@ impl StateDb {
         Ok(columns)
     }
 
+    fn ensure_session_turns_schema(conn: &Connection) -> Result<(), String> {
+        let columns = Self::session_turns_columns(conn)?;
+        if !columns.iter().any(|column| column == "parent_turn_id") {
+            conn.execute(
+                "ALTER TABLE session_turns ADD COLUMN parent_turn_id TEXT",
+                [],
+            )
+            .map_err(|e| format!("Failed to add session_turns.parent_turn_id: {e}"))?;
+        }
+        if !columns.iter().any(|column| column == "is_sidechain") {
+            conn.execute(
+                "ALTER TABLE session_turns ADD COLUMN is_sidechain INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| format!("Failed to add session_turns.is_sidechain: {e}"))?;
+        }
+        conn.execute_batch(Self::session_turns_index_sql())
+            .map_err(|e| format!("Failed to ensure session_turns indexes: {e}"))?;
+        Ok(())
+    }
+
+    fn session_turns_columns(conn: &Connection) -> Result<Vec<String>, String> {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(session_turns)")
+            .map_err(|e| format!("Failed to inspect session_turns schema: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| format!("Failed to inspect session_turns columns: {e}"))?;
+
+        let mut columns = Vec::new();
+        for row in rows {
+            columns.push(row.map_err(|e| format!("Failed to read session_turns column: {e}"))?);
+        }
+        Ok(columns)
+    }
+
     fn invocations_schema_sql() -> &'static str {
         "CREATE TABLE IF NOT EXISTS invocations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -536,6 +594,15 @@ impl StateDb {
         CREATE INDEX IF NOT EXISTS idx_invocations_provider_session
             ON invocations (provider_name, session_id)
             WHERE session_id IS NOT NULL;"
+    }
+
+    fn session_turns_index_sql() -> &'static str {
+        "CREATE INDEX IF NOT EXISTS idx_session_turns_provider_ts
+            ON session_turns (provider_name, role, timestamp);
+        CREATE INDEX IF NOT EXISTS idx_session_turns_session_ts
+            ON session_turns (provider_name, session_id, timestamp);
+        CREATE INDEX IF NOT EXISTS idx_session_turns_parent
+            ON session_turns (provider_name, session_id, parent_turn_id, timestamp);"
     }
 
     fn migrate_legacy_invocations(conn: &Connection) -> Result<(), String> {
@@ -1616,7 +1683,7 @@ impl StateDb {
     pub fn ingest_session_turns_batch(
         &self,
         provider_name: &str,
-        turns: &[(String, String, DateTime<Utc>, String)],
+        turns: &[SessionTurnIngest],
     ) -> Result<u64, String> {
         if turns.is_empty() {
             return Ok(0);
@@ -1631,18 +1698,30 @@ impl StateDb {
             let mut stmt = tx
                 .prepare(
                     "INSERT OR IGNORE INTO session_turns
-                        (provider_name, session_id, turn_id, timestamp, role, source_file, ingested_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, '', ?6)",
+                        (
+                            provider_name,
+                            session_id,
+                            turn_id,
+                            timestamp,
+                            role,
+                            parent_turn_id,
+                            is_sidechain,
+                            source_file,
+                            ingested_at
+                        )
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '', ?8)",
                 )
                 .map_err(|e| format!("Failed to prepare batch insert: {e}"))?;
-            for (session_id, turn_id, timestamp, role) in turns {
+            for turn in turns {
                 let n = stmt
                     .execute(params![
                         provider_name,
-                        session_id,
-                        turn_id,
-                        timestamp.to_rfc3339(),
-                        role,
+                        turn.session_id,
+                        turn.turn_id,
+                        turn.timestamp.to_rfc3339(),
+                        turn.role,
+                        turn.parent_turn_id,
+                        if turn.is_sidechain { 1i64 } else { 0i64 },
                         &now,
                     ])
                     .map_err(|e| format!("Batch insert row failed: {e}"))?;
@@ -1652,6 +1731,32 @@ impl StateDb {
         tx.commit()
             .map_err(|e| format!("Failed to commit batch: {e}"))?;
         Ok(new_count)
+    }
+
+    pub fn count_session_turns(
+        &self,
+        provider_name: &str,
+        session_id: &str,
+    ) -> Result<SessionTurnCounts, String> {
+        let (total, assistant, sidechain): (i64, i64, i64) = self
+            .conn
+            .query_row(
+                "SELECT
+                    COUNT(*) AS total,
+                    COUNT(CASE WHEN role = 'assistant' THEN 1 END) AS assistant,
+                    COUNT(CASE WHEN is_sidechain = 1 THEN 1 END) AS sidechain
+                 FROM session_turns
+                 WHERE provider_name = ?1 AND session_id = ?2",
+                params![provider_name, session_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|e| format!("Failed to count session turns for trace: {e}"))?;
+
+        Ok(SessionTurnCounts {
+            total: total.max(0) as u64,
+            assistant: assistant.max(0) as u64,
+            sidechain: sidechain.max(0) as u64,
+        })
     }
 
     /// Count assistant turns ingested for a provider since `since` (exclusive).
@@ -1709,6 +1814,12 @@ mod tests {
 
     fn test_db() -> StateDb {
         StateDb::open(Path::new(":memory:")).unwrap()
+    }
+
+    fn ts(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value)
+            .unwrap()
+            .with_timezone(&Utc)
     }
 
     fn insert_invocation_fixture(
@@ -1803,6 +1914,27 @@ mod tests {
         dir
     }
 
+    fn legacy_session_turns_db() -> TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_turns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider_name TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                turn_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                role TEXT NOT NULL,
+                source_file TEXT NOT NULL,
+                ingested_at TEXT NOT NULL,
+                UNIQUE (provider_name, session_id, turn_id)
+            );",
+        )
+        .unwrap();
+        dir
+    }
+
     fn invocation_table_sql(db: &StateDb) -> String {
         db.conn
             .query_row(
@@ -1846,6 +1978,52 @@ mod tests {
                 "sqlite_autoindex_invocations_1".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn session_turns_schema_creation_includes_sidechain_columns() {
+        let db = test_db();
+        let sql: String = db
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'session_turns'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!(sql.contains("parent_turn_id TEXT"));
+        assert!(sql.contains("is_sidechain INTEGER NOT NULL DEFAULT 0"));
+    }
+
+    #[test]
+    fn session_turns_schema_migration_adds_parent_and_sidechain_columns() {
+        let dir = legacy_session_turns_db();
+        let db = StateDb::open(&dir.path().join("state.db")).unwrap();
+
+        let columns: Vec<(String, String, i64, Option<String>)> = db
+            .conn
+            .prepare("PRAGMA table_info(session_turns)")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+
+        assert!(columns.iter().any(|column| {
+            column.0 == "parent_turn_id"
+                && column.1 == "TEXT"
+                && column.2 == 0
+                && column.3.is_none()
+        }));
+        assert!(columns.iter().any(|column| {
+            column.0 == "is_sidechain"
+                && column.1 == "INTEGER"
+                && column.2 == 1
+                && column.3.as_deref() == Some("0")
+        }));
     }
 
     #[test]
@@ -2361,6 +2539,103 @@ command = "fixture"
 
         let count = db.recent_error_count("m", 0, 60).unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn ingest_session_turns_batch_persists_parent_and_sidechain_columns() {
+        let db = test_db();
+
+        let inserted = db
+            .ingest_session_turns_batch(
+                "fixture-provider",
+                &[SessionTurnIngest {
+                    session_id: "session-a".to_string(),
+                    turn_id: "child-turn".to_string(),
+                    timestamp: ts("2026-04-17T08:00:01Z"),
+                    role: "assistant".to_string(),
+                    parent_turn_id: Some("root-turn".to_string()),
+                    is_sidechain: true,
+                }],
+            )
+            .unwrap();
+
+        assert_eq!(inserted, 1);
+        let row: (Option<String>, i64) = db
+            .conn
+            .query_row(
+                "SELECT parent_turn_id, is_sidechain
+                 FROM session_turns
+                 WHERE provider_name = ?1 AND session_id = ?2 AND turn_id = ?3",
+                params!["fixture-provider", "session-a", "child-turn"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0.as_deref(), Some("root-turn"));
+        assert_eq!(row.1, 1);
+    }
+
+    #[test]
+    fn count_session_turns_reports_total_assistant_and_sidechain_counts() {
+        let db = test_db();
+
+        db.ingest_session_turns_batch(
+            "fixture-provider",
+            &[
+                SessionTurnIngest {
+                    session_id: "session-a".to_string(),
+                    turn_id: "root".to_string(),
+                    timestamp: ts("2026-04-17T08:00:00Z"),
+                    role: "user".to_string(),
+                    parent_turn_id: None,
+                    is_sidechain: false,
+                },
+                SessionTurnIngest {
+                    session_id: "session-a".to_string(),
+                    turn_id: "assistant-main".to_string(),
+                    timestamp: ts("2026-04-17T08:00:01Z"),
+                    role: "assistant".to_string(),
+                    parent_turn_id: Some("root".to_string()),
+                    is_sidechain: false,
+                },
+                SessionTurnIngest {
+                    session_id: "session-a".to_string(),
+                    turn_id: "assistant-side".to_string(),
+                    timestamp: ts("2026-04-17T08:00:02Z"),
+                    role: "assistant".to_string(),
+                    parent_turn_id: Some("assistant-main".to_string()),
+                    is_sidechain: true,
+                },
+                SessionTurnIngest {
+                    session_id: "session-b".to_string(),
+                    turn_id: "other-session".to_string(),
+                    timestamp: ts("2026-04-17T08:00:03Z"),
+                    role: "assistant".to_string(),
+                    parent_turn_id: None,
+                    is_sidechain: true,
+                },
+            ],
+        )
+        .unwrap();
+        db.ingest_session_turns_batch(
+            "other-provider",
+            &[SessionTurnIngest {
+                session_id: "session-a".to_string(),
+                turn_id: "other-provider-turn".to_string(),
+                timestamp: ts("2026-04-17T08:00:04Z"),
+                role: "assistant".to_string(),
+                parent_turn_id: None,
+                is_sidechain: true,
+            }],
+        )
+        .unwrap();
+
+        let counts: SessionTurnCounts = db
+            .count_session_turns("fixture-provider", "session-a")
+            .unwrap();
+
+        assert_eq!(counts.total, 3);
+        assert_eq!(counts.assistant, 2);
+        assert_eq!(counts.sidechain, 1);
     }
 
     #[test]

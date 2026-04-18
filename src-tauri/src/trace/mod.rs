@@ -156,7 +156,7 @@ fn build_trace_node(
     sessions_cfg: Option<&SessionsConfig>,
     visited: &mut HashSet<i64>,
 ) -> Result<TraceNode, String> {
-    let (session, mut node_warnings) = build_trace_session(&record, sessions_cfg);
+    let (session, mut node_warnings) = build_trace_session(db, &record, sessions_cfg)?;
     let mut node = TraceNode {
         invocation: TraceInvocation {
             row_id: record.id,
@@ -218,9 +218,10 @@ fn build_trace_node(
 }
 
 fn build_trace_session(
+    db: &StateDb,
     record: &InvocationRecord,
     sessions_cfg: Option<&SessionsConfig>,
-) -> (TraceSession, Vec<String>) {
+) -> Result<(TraceSession, Vec<String>), String> {
     let mut warnings = Vec::new();
     if record.session_capture_method.as_deref() == Some("failed") {
         warnings.push(
@@ -230,7 +231,7 @@ fn build_trace_session(
     }
 
     let Some(session_id) = record.session_id.clone() else {
-        return (
+        return Ok((
             TraceSession {
                 id: None,
                 capture_method: record.session_capture_method.clone(),
@@ -241,12 +242,12 @@ fn build_trace_session(
                 sidechain_turn_count: None,
             },
             warnings,
-        );
+        ));
     };
 
     let Some(provider_name) = record.provider_name.as_deref() else {
         warnings.push("session_id is present but provider_name is missing".to_string());
-        return (
+        return Ok((
             TraceSession {
                 id: Some(session_id),
                 capture_method: record.session_capture_method.clone(),
@@ -257,75 +258,93 @@ fn build_trace_session(
                 sidechain_turn_count: None,
             },
             warnings,
-        );
+        ));
     };
 
+    // Per V10 (failures observable, never silent): a DB error counting
+    // turns shouldn't abort the entire trace — push a warning, fall back
+    // to None counts, and let the caller render the rest of the tree.
+    // This mirrors how locate_transcript failures are handled below.
+    let counts = match db.count_session_turns(provider_name, &session_id) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            warnings.push(format!(
+                "failed to count session turns for {provider_name}/{session_id}: {e}"
+            ));
+            None
+        }
+    };
+    let (turn_count, assistant_turn_count, sidechain_turn_count) = counts
+        .as_ref()
+        .map(|c| (Some(c.total), Some(c.assistant), Some(c.sidechain)))
+        .unwrap_or((None, None, None));
+
     let Some(sessions_cfg) = sessions_cfg else {
-        return (
+        return Ok((
             TraceSession {
                 id: Some(session_id),
                 capture_method: record.session_capture_method.clone(),
                 transcript_path: None,
                 transcript_state: TranscriptState::NoLocator,
-                turn_count: None,
-                assistant_turn_count: None,
-                sidechain_turn_count: None,
+                turn_count,
+                assistant_turn_count,
+                sidechain_turn_count,
             },
             warnings,
-        );
+        ));
     };
 
     match locate_transcript(sessions_cfg, provider_name, &session_id) {
-        Ok(None) => (
+        Ok(None) => Ok((
             TraceSession {
                 id: Some(session_id),
                 capture_method: record.session_capture_method.clone(),
                 transcript_path: None,
                 transcript_state: TranscriptState::NoLocator,
-                turn_count: None,
-                assistant_turn_count: None,
-                sidechain_turn_count: None,
+                turn_count,
+                assistant_turn_count,
+                sidechain_turn_count,
             },
             warnings,
-        ),
-        Ok(Some(path)) if path.exists() => (
+        )),
+        Ok(Some(path)) if path.exists() => Ok((
             TraceSession {
                 id: Some(session_id),
                 capture_method: record.session_capture_method.clone(),
                 transcript_path: Some(path.display().to_string()),
                 transcript_state: TranscriptState::Available,
-                turn_count: None,
-                assistant_turn_count: None,
-                sidechain_turn_count: None,
+                turn_count,
+                assistant_turn_count,
+                sidechain_turn_count,
             },
             warnings,
-        ),
-        Ok(Some(_path)) => (
+        )),
+        Ok(Some(_path)) => Ok((
             TraceSession {
                 id: Some(session_id),
                 capture_method: record.session_capture_method.clone(),
                 transcript_path: None,
                 transcript_state: TranscriptState::Missing,
-                turn_count: None,
-                assistant_turn_count: None,
-                sidechain_turn_count: None,
+                turn_count,
+                assistant_turn_count,
+                sidechain_turn_count,
             },
             warnings,
-        ),
+        )),
         Err(err) => {
             warnings.push(format!("transcript locator failed: {err}"));
-            (
+            Ok((
                 TraceSession {
                     id: Some(session_id),
                     capture_method: record.session_capture_method.clone(),
                     transcript_path: None,
                     transcript_state: TranscriptState::Missing,
-                    turn_count: None,
-                    assistant_turn_count: None,
-                    sidechain_turn_count: None,
+                    turn_count,
+                    assistant_turn_count,
+                    sidechain_turn_count,
                 },
                 warnings,
-            )
+            ))
         }
     }
 }
@@ -377,8 +396,8 @@ fn format_ascii_node(node: &TraceNode) -> String {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::state::StateDb;
-    use chrono::DateTime;
+    use crate::state::{SessionTurnIngest, StateDb};
+    use chrono::{DateTime, Utc};
     use rusqlite::{Connection, params};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -457,6 +476,11 @@ mod tests {
 
         fn db(&self) -> StateDb {
             StateDb::open(&self.db_path).unwrap()
+        }
+
+        fn ingest_session_turns(&self, provider_name: &str, turns: &[SessionTurnIngest]) {
+            let db = self.db();
+            db.ingest_session_turns_batch(provider_name, turns).unwrap();
         }
 
         fn set_session_capture(
@@ -1055,5 +1079,68 @@ transcript_locator = "{}"
         // null — both are acceptable per the contract; assert it isn't
         // misleadingly reported as available.
         assert_ne!(json["root"]["session"]["transcript_state"], "available");
+    }
+
+    #[test]
+    fn json_output_populates_sidechain_turn_count_from_session_turns() {
+        let fixture = TraceFixture::new(&base_rows());
+        fixture.set_session_capture(
+            1,
+            Some("5169694d-de0f-40d1-890c-6e28e55bab27"),
+            Some("forced_flag_verified"),
+        );
+        fixture.ingest_session_turns(
+            "fixture-provider",
+            &[
+                SessionTurnIngest {
+                    session_id: "5169694d-de0f-40d1-890c-6e28e55bab27".to_string(),
+                    turn_id: "root-turn".to_string(),
+                    timestamp: DateTime::parse_from_rfc3339("2026-04-17T08:00:00Z")
+                        .unwrap()
+                        .with_timezone(&Utc),
+                    role: "user".to_string(),
+                    parent_turn_id: None,
+                    is_sidechain: false,
+                },
+                SessionTurnIngest {
+                    session_id: "5169694d-de0f-40d1-890c-6e28e55bab27".to_string(),
+                    turn_id: "assistant-main".to_string(),
+                    timestamp: DateTime::parse_from_rfc3339("2026-04-17T08:00:01Z")
+                        .unwrap()
+                        .with_timezone(&Utc),
+                    role: "assistant".to_string(),
+                    parent_turn_id: Some("root-turn".to_string()),
+                    is_sidechain: false,
+                },
+                SessionTurnIngest {
+                    session_id: "5169694d-de0f-40d1-890c-6e28e55bab27".to_string(),
+                    turn_id: "assistant-side".to_string(),
+                    timestamp: DateTime::parse_from_rfc3339("2026-04-17T08:00:02Z")
+                        .unwrap()
+                        .with_timezone(&Utc),
+                    role: "assistant".to_string(),
+                    parent_turn_id: Some("assistant-main".to_string()),
+                    is_sidechain: true,
+                },
+            ],
+        );
+        let db = fixture.db();
+
+        let report = trace_invocation(
+            &db,
+            ROOT_UUID,
+            TraceOptions {
+                max_depth: 64,
+                json: true,
+                inline_transcript: false,
+                transcript: false,
+            },
+        )
+        .unwrap();
+        let json = serde_json::to_value(&report).unwrap();
+
+        assert_eq!(json["root"]["session"]["turn_count"], 3);
+        assert_eq!(json["root"]["session"]["assistant_turn_count"], 2);
+        assert_eq!(json["root"]["session"]["sidechain_turn_count"], 1);
     }
 }

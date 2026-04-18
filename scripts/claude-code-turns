@@ -11,7 +11,7 @@ We track the highest mtime emitted; subsequent runs skip files unchanged
 since.
 
 Emits one JSON object per line on stdout:
-  {"session_id":"<sid>","turn_id":"<uuid>","timestamp":"<rfc3339>","role":"user|assistant"}
+  {"session_id":"<sid>","turn_id":"<uuid>","timestamp":"<rfc3339>","role":"user|assistant","parent_turn_id":"<uuid|null>","is_sidechain":true|false|null}
 """
 
 import json
@@ -78,6 +78,8 @@ def emit_file(path: Path, out) -> None:
                     "turn_id": uuid,
                     "timestamp": ts,
                     "role": kind,
+                    "parent_turn_id": obj.get("parentUuid"),
+                    "is_sidechain": obj.get("isSidechain"),
                 }))
                 out.write("\n")
     except OSError:
