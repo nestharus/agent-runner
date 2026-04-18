@@ -134,7 +134,7 @@ fn wait_for_path(path: &Path) {
         if path.exists() {
             return;
         }
-        std::thread::yield_now();
+        std::thread::sleep(Duration::from_millis(10));
     }
     panic!("timed out waiting for {}", path.display());
 }
@@ -146,7 +146,7 @@ fn repl_happy_path_emits_single_invocation_line_and_finalizes_succeeded_row() {
     let script = fixture.write_script(
         "fixture-provider.sh",
         &format!(
-            r#"printf '%s' "${{OULIPOLY_PARENT_INVOCATION-}}" > {dump}
+            r#"printf '%s' "${{OULIPOLY_PARENT_INVOCATION-}}" > "{dump}"
 exit 0"#,
             dump = env_dump_path.display()
         ),
@@ -181,7 +181,7 @@ fn repl_resolves_parent_env_and_overwrites_child_parent_env_payload() {
     let script = fixture.write_script(
         "fixture-provider.sh",
         &format!(
-            r#"printf '%s' "${{OULIPOLY_PARENT_INVOCATION-}}" > {dump}
+            r#"printf '%s' "${{OULIPOLY_PARENT_INVOCATION-}}" > "{dump}"
 exit 0"#,
             dump = env_dump_path.display()
         ),
@@ -222,8 +222,8 @@ fn repl_sigterm_to_parent_is_forwarded_to_child_and_finalized() {
     let script = fixture.write_script(
         "fixture-sigterm.sh",
         &format!(
-            r#"trap 'printf term > {term_marker}; exit 0' TERM
-: > {ready}
+            r#"trap 'printf term > "{term_marker}"; exit 0' TERM
+: > "{ready}"
 while :; do
   sleep 1
 done"#,
@@ -267,8 +267,8 @@ fn repl_sigint_to_process_group_allows_parent_to_reap_and_finalize() {
     let script = fixture.write_script(
         "fixture-sigint.sh",
         &format!(
-            r#"trap 'printf int > {int_marker}; exit 130' INT
-: > {ready}
+            r#"trap 'printf int > "{int_marker}"; exit 130' INT
+: > "{ready}"
 while :; do
   sleep 1
 done"#,
