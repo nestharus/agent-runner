@@ -5,7 +5,21 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::process::Child;
 use std::process::{Command, Stdio};
+#[cfg(unix)]
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+#[cfg(unix)]
+use std::thread;
+
+#[cfg(unix)]
+use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
+#[cfg(unix)]
+use signal_hook::iterator::{Handle as SignalsHandle, Signals};
 
 use super::{ExecutionResult, SessionCaptureMethod, SessionCaptureResult};
 
@@ -218,14 +232,12 @@ struct RawResult {
     session_capture: SessionCaptureResult,
 }
 
-fn execute_provider(
+fn build_command(
     provider: &ProviderConfig,
-    prompt_mode: PromptMode,
-    prompt: &str,
+    provider_args: &[String],
     working_dir: Option<&Path>,
-    input_args: &[String],
     parent_invocation_env: Option<&str>,
-) -> Result<(RawResult, Vec<PathBuf>), String> {
+) -> Result<Command, String> {
     let parts = shell_split(&provider.command);
     if parts.is_empty() {
         return Err("Empty command".to_string());
@@ -235,9 +247,29 @@ fn execute_provider(
     for part in &parts[1..] {
         cmd.arg(part);
     }
-    for arg in &provider.args {
+    for arg in provider_args {
         cmd.arg(arg);
     }
+
+    if let Some(dir) = working_dir {
+        cmd.current_dir(dir);
+    }
+    if let Some(parent_invocation_env) = parent_invocation_env {
+        cmd.env("OULIPOLY_PARENT_INVOCATION", parent_invocation_env);
+    }
+
+    Ok(cmd)
+}
+
+fn execute_provider(
+    provider: &ProviderConfig,
+    prompt_mode: PromptMode,
+    prompt: &str,
+    working_dir: Option<&Path>,
+    input_args: &[String],
+    parent_invocation_env: Option<&str>,
+) -> Result<(RawResult, Vec<PathBuf>), String> {
+    let mut cmd = build_command(provider, &provider.args, working_dir, parent_invocation_env)?;
 
     // Append input flags
     for arg in input_args {
@@ -248,13 +280,6 @@ fn execute_provider(
         build_capture_plan(provider.session_capture.as_ref())?;
     for arg in capture_args {
         cmd.arg(arg);
-    }
-
-    if let Some(dir) = working_dir {
-        cmd.current_dir(dir);
-    }
-    if let Some(parent_invocation_env) = parent_invocation_env {
-        cmd.env("OULIPOLY_PARENT_INVOCATION", parent_invocation_env);
     }
 
     let mut temp_files = capture_files;
@@ -308,6 +333,45 @@ fn execute_provider(
     };
 
     Ok((result, temp_files))
+}
+
+pub fn execute_interactive(
+    provider: &ProviderConfig,
+    working_dir: Option<&Path>,
+    parent_invocation_env: Option<&str>,
+) -> Result<i32, String> {
+    let interactive_args = provider.interactive_args.as_ref().ok_or_else(|| {
+        format!(
+            "provider {} has no interactive_args; cannot launch interactively",
+            provider.name
+        )
+    })?;
+
+    let mut cmd = build_command(
+        provider,
+        interactive_args,
+        working_dir,
+        parent_invocation_env,
+    )?;
+    cmd.stdin(Stdio::inherit());
+    cmd.stdout(Stdio::inherit());
+    cmd.stderr(Stdio::inherit());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to spawn '{}': {e}", provider.command))?;
+
+    #[cfg(unix)]
+    let signal_guard = InteractiveSignalGuard::install(&mut child)?;
+
+    let status = child
+        .wait()
+        .map_err(|e| format!("Failed to wait for process: {e}"))?;
+
+    #[cfg(unix)]
+    drop(signal_guard);
+
+    Ok(exit_code_from_status(status))
 }
 
 enum CapturePlan {
@@ -524,6 +588,73 @@ pub fn provider_name(command: &str) -> String {
         .unwrap_or_else(|| command.to_string())
 }
 
+fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+
+        if let Some(code) = status.code() {
+            return code;
+        }
+        if let Some(signal) = status.signal() {
+            return 128 + signal;
+        }
+    }
+
+    status.code().unwrap_or(-1)
+}
+
+#[cfg(unix)]
+struct InteractiveSignalGuard {
+    handle: SignalsHandle,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl InteractiveSignalGuard {
+    fn install(child: &mut Child) -> Result<Self, String> {
+        let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP])
+            .map_err(|e| format!("Failed to install signal handlers: {e}"))?;
+        let handle = signals.handle();
+        let child_pid = child.id() as i32;
+        let forwarded_sigterm = Arc::new(AtomicBool::new(false));
+        let thread_forwarded_sigterm = Arc::clone(&forwarded_sigterm);
+
+        let thread = thread::spawn(move || {
+            for signal in signals.forever() {
+                if signal == SIGTERM && !thread_forwarded_sigterm.swap(true, Ordering::SeqCst) {
+                    send_sigterm(child_pid);
+                }
+            }
+        });
+
+        Ok(Self {
+            handle,
+            thread: Some(thread),
+        })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for InteractiveSignalGuard {
+    fn drop(&mut self) {
+        self.handle.close();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn send_sigterm(pid: i32) {
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+
+    // Best-effort forward so the parent survives long enough to reap/finalize.
+    let _ = unsafe { kill(pid, SIGTERM) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -586,6 +717,97 @@ mod tests {
     #[test]
     fn provider_name_with_spaces() {
         assert_eq!(provider_name(r#"env -u FOO "my provider""#), "my provider");
+    }
+
+    #[test]
+    fn execute_interactive_errors_when_provider_has_no_interactive_args() {
+        let provider = ProviderConfig {
+            name: "fixture-provider".to_string(),
+            command: "echo".to_string(),
+            args: vec!["one-shot".to_string()],
+            interactive_args: None,
+            session_capture: None,
+        };
+
+        let err = execute_interactive(&provider, None, None).unwrap_err();
+        assert!(
+            err.contains("provider fixture-provider has no interactive_args"),
+            "{err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_interactive_uses_interactive_args_for_child_argv() {
+        let argv_dump = tempfile::NamedTempFile::new().unwrap();
+        let argv_dump_path = argv_dump.path().to_path_buf();
+        let script = fixture_script(&format!(
+            r#"printf '%s\n' "$@" > {dump}"#,
+            dump = argv_dump_path.display()
+        ));
+        let provider = ProviderConfig {
+            name: "fixture-provider".to_string(),
+            command: script.path.to_string_lossy().into_owned(),
+            args: vec!["one-shot-only".to_string()],
+            interactive_args: Some(vec!["hello".to_string(), "world".to_string()]),
+            session_capture: None,
+        };
+
+        let exit_code = execute_interactive(&provider, None, None).unwrap();
+
+        assert_eq!(exit_code, 0);
+        assert_eq!(
+            std::fs::read_to_string(&argv_dump_path).unwrap(),
+            "hello\nworld\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_interactive_propagates_working_directory() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let cwd_dump = tempdir.path().join("cwd.txt");
+        let script = fixture_script(&format!(r#"pwd > {dump}"#, dump = cwd_dump.display()));
+        let provider = ProviderConfig {
+            name: "fixture-provider".to_string(),
+            command: script.path.to_string_lossy().into_owned(),
+            args: vec!["one-shot-only".to_string()],
+            interactive_args: Some(vec!["launch".to_string()]),
+            session_capture: None,
+        };
+
+        let exit_code = execute_interactive(&provider, Some(tempdir.path()), None).unwrap();
+
+        assert_eq!(exit_code, 0);
+        assert_eq!(
+            std::fs::read_to_string(&cwd_dump).unwrap().trim(),
+            tempdir.path().display().to_string()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_interactive_propagates_parent_invocation_env() {
+        let env_dump = tempfile::NamedTempFile::new().unwrap();
+        let env_dump_path = env_dump.path().to_path_buf();
+        let script = fixture_script(&format!(
+            r#"printf '%s' "${{OULIPOLY_PARENT_INVOCATION-}}" > {dump}"#,
+            dump = env_dump_path.display()
+        ));
+        let provider = ProviderConfig {
+            name: "fixture-provider".to_string(),
+            command: script.path.to_string_lossy().into_owned(),
+            args: vec!["one-shot-only".to_string()],
+            interactive_args: Some(vec!["launch".to_string()]),
+            session_capture: None,
+        };
+        let parent_env =
+            r#"{"source":"fixture-provider","id":"11111111-1111-1111-1111-111111111111"}"#;
+
+        let exit_code = execute_interactive(&provider, None, Some(parent_env)).unwrap();
+
+        assert_eq!(exit_code, 0);
+        assert_eq!(std::fs::read_to_string(&env_dump_path).unwrap(), parent_env);
     }
 
     #[test]
@@ -816,6 +1038,7 @@ printf '{{"type":"system","subtype":"init","session_id":"%s"}}\n' "$requested""#
                 name: "claude-fixture".to_string(),
                 command: script.path.to_string_lossy().into_owned(),
                 args: vec!["-p".to_string()],
+                interactive_args: None,
                 session_capture: Some(SessionCapture {
                     kind: SessionCaptureKind::ForcedFlagVerified,
                     flag: Some("--session-id".to_string()),
@@ -900,6 +1123,7 @@ printf '{"type":"system","subtype":"init","session_id":"11111111-1111-1111-1111-
                 name: "claude-fixture".to_string(),
                 command: script.path.to_string_lossy().into_owned(),
                 args: vec!["-p".to_string()],
+                interactive_args: None,
                 session_capture: Some(SessionCapture {
                     kind: SessionCaptureKind::ForcedFlagVerified,
                     flag: Some("--session-id".to_string()),
@@ -960,6 +1184,7 @@ printf 'assistant text from tmpfile\n' > "$output_file""#,
                 name: "codex-fixture".to_string(),
                 command: script.path.to_string_lossy().into_owned(),
                 args: vec!["exec".to_string()],
+                interactive_args: None,
                 session_capture: Some(SessionCapture {
                     kind: SessionCaptureKind::StdoutJsonEvent,
                     flag: None,
@@ -1015,6 +1240,7 @@ printf 'assistant text from tmpfile\n' > "$output_file""#,
                 name: "codex-fixture".to_string(),
                 command: script.path.to_string_lossy().into_owned(),
                 args: vec!["exec".to_string()],
+                interactive_args: None,
                 session_capture: Some(SessionCapture {
                     kind: SessionCaptureKind::StdoutJsonEvent,
                     flag: None,

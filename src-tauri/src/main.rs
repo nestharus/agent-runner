@@ -86,6 +86,19 @@ enum Subcommands {
         #[arg(long, default_value = "64")]
         max_depth: usize,
     },
+    /// Launch a model interactively without a prompt payload.
+    Repl {
+        /// Model id to launch interactively
+        model: String,
+
+        /// Working directory for the wrapped CLI
+        #[arg(short = 'p', long = "project")]
+        project: Option<PathBuf>,
+
+        /// Override models directory
+        #[arg(long = "models-dir")]
+        models_dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug)]
@@ -175,6 +188,10 @@ fn resolve_models_dir(cli: &Cli) -> PathBuf {
     if let Some(ref dir) = cli.models_dir {
         return dir.clone();
     }
+    default_models_dir()
+}
+
+fn default_models_dir() -> PathBuf {
     dirs::config_dir()
         .map(|d| d.join("oulipoly-agent-runner").join("models"))
         .unwrap_or_else(|| PathBuf::from("models"))
@@ -198,6 +215,11 @@ fn run(cli: Cli) -> Result<i32, String> {
                 },
                 &invocation_uuid,
             ),
+            Subcommands::Repl {
+                model,
+                project,
+                models_dir,
+            } => run_repl(&model, project.as_deref(), models_dir.as_deref()),
         };
     }
 
@@ -309,6 +331,124 @@ fn resolve_agent(cli: &Cli) -> Result<AgentConfig, String> {
     }
 
     Err("No agent specified. Use a positional argument or --agent-file.".to_string())
+}
+
+struct FinalizerGuard<'a> {
+    db: &'a StateDb,
+    invocation_id: i64,
+    finalized: bool,
+}
+
+impl<'a> FinalizerGuard<'a> {
+    fn new(db: &'a StateDb, invocation_id: i64) -> Self {
+        Self {
+            db,
+            invocation_id,
+            finalized: false,
+        }
+    }
+
+    fn mark_finalized(&mut self) {
+        self.finalized = true;
+    }
+}
+
+impl Drop for FinalizerGuard<'_> {
+    fn drop(&mut self) {
+        if self.finalized {
+            return;
+        }
+
+        if let Err(err) =
+            self.db
+                .finalize_invocation(self.invocation_id, false, -1, Some("guard_drop"), None)
+        {
+            eprintln!("Warning: Failed to finalize invocation in guard: {err}");
+        }
+    }
+}
+
+fn should_emit_invocation_line(is_terminal: bool) -> bool {
+    !is_terminal
+}
+
+fn run_repl(
+    model_name: &str,
+    working_dir: Option<&Path>,
+    models_dir_override: Option<&Path>,
+) -> Result<i32, String> {
+    let state = StateDb::open_default()?;
+    let models_dir = models_dir_override
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_models_dir);
+    let models = load_models(&models_dir)?;
+    let model = models
+        .get(model_name)
+        .ok_or_else(|| format!("Unknown model: {model_name}"))?;
+
+    let config_root = dirs::config_dir()
+        .map(|d| d.join("oulipoly-agent-runner"))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let providers_path = config_root.join("providers.toml");
+    let sessions_path = config_root.join("sessions.toml");
+    let providers_cfg =
+        agent_runner_lib::config::ProvidersConfig::load(&providers_path).unwrap_or_default();
+    let sessions_cfg =
+        agent_runner_lib::config::SessionsConfig::load(&sessions_path).unwrap_or_default();
+    let in_flight = agent_runner_lib::quota::InFlight::new();
+    let ctx = balancer::BalanceContext {
+        providers_cfg: &providers_cfg,
+        sessions_cfg: &sessions_cfg,
+        in_flight: &in_flight,
+    };
+
+    let parent_invocation_id = resolve_parent_invocation_id(&state);
+    let provider_index = balancer::select_provider(model, &state, Some(&ctx));
+    let provider = &model.providers[provider_index];
+    if provider.interactive_args.is_none() {
+        return Err(format!(
+            "Provider {} has no interactive_args; cannot launch interactively",
+            provider.name
+        ));
+    }
+
+    let invocation = CompositeInvocationId {
+        source: provider.name.clone(),
+        id: Uuid::new_v4().to_string(),
+    };
+    let invocation_row_id = state.start_invocation(&InvocationStart {
+        invocation_uuid: invocation.id.clone(),
+        model_name: model.name.clone(),
+        provider_name: provider.name.clone(),
+        provider_index,
+        parent_invocation_id,
+    })?;
+    let mut guard = FinalizerGuard::new(&state, invocation_row_id);
+    let invocation_env = serde_json::to_string(&invocation)
+        .map_err(|e| format!("Failed to serialize invocation id: {e}"))?;
+
+    if should_emit_invocation_line(std::io::stderr().is_terminal()) {
+        eprintln!("{}", invocation.stderr_line());
+    }
+
+    match executor::cli::execute_interactive(provider, working_dir, Some(&invocation_env)) {
+        Ok(exit_code) => {
+            state.finalize_invocation(invocation_row_id, exit_code == 0, exit_code, None, None)?;
+            guard.mark_finalized();
+            Ok(exit_code)
+        }
+        Err(spawn_err) => {
+            state.finalize_invocation(
+                invocation_row_id,
+                false,
+                1,
+                Some("spawn_error"),
+                Some(&spawn_err),
+            )?;
+            guard.mark_finalized();
+            Ok(1)
+        }
+    }
 }
 
 fn run_with_balancing(
@@ -486,8 +626,49 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_runner_lib::state::InvocationStatus;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::{Mutex, OnceLock};
 
     const TRACE_UUID: &str = "11111111-1111-1111-1111-111111111111";
+    const REPL_MODEL: &str = "fixture-model";
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn with_parent_invocation_env(value: Option<&str>, test: impl FnOnce()) {
+        let _guard = env_lock().lock().unwrap();
+        let previous = std::env::var_os("OULIPOLY_PARENT_INVOCATION");
+        match value {
+            Some(value) => unsafe {
+                std::env::set_var("OULIPOLY_PARENT_INVOCATION", value);
+            },
+            None => unsafe {
+                std::env::remove_var("OULIPOLY_PARENT_INVOCATION");
+            },
+        }
+
+        let result = catch_unwind(AssertUnwindSafe(test));
+
+        match previous {
+            Some(value) => unsafe {
+                std::env::set_var("OULIPOLY_PARENT_INVOCATION", value);
+            },
+            None => unsafe {
+                std::env::remove_var("OULIPOLY_PARENT_INVOCATION");
+            },
+        }
+
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    fn test_db() -> StateDb {
+        StateDb::open(Path::new(":memory:")).unwrap()
+    }
 
     #[test]
     fn trace_subcommand_parses_json_and_inline_transcript_flags() {
@@ -587,5 +768,227 @@ mod tests {
             rendered.contains("--transcript") || rendered.contains("--json"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn repl_subcommand_parses_required_model_without_optional_paths() {
+        let cli = Cli::try_parse_from(["oulipoly-agent-runner", "repl", REPL_MODEL]).unwrap();
+
+        match cli.command {
+            Some(Subcommands::Repl {
+                model,
+                project,
+                models_dir,
+            }) => {
+                assert_eq!(model, REPL_MODEL);
+                assert_eq!(project, None);
+                assert_eq!(models_dir, None);
+            }
+            _ => panic!("expected repl subcommand"),
+        }
+    }
+
+    #[test]
+    fn repl_subcommand_parses_project_path() {
+        let cli = Cli::try_parse_from(["oulipoly-agent-runner", "repl", REPL_MODEL, "-p", "/tmp"])
+            .unwrap();
+
+        match cli.command {
+            Some(Subcommands::Repl { project, .. }) => {
+                assert_eq!(project, Some(PathBuf::from("/tmp")));
+            }
+            _ => panic!("expected repl subcommand"),
+        }
+    }
+
+    #[test]
+    fn repl_subcommand_parses_models_dir_override() {
+        let cli = Cli::try_parse_from([
+            "oulipoly-agent-runner",
+            "repl",
+            "--models-dir",
+            "/tmp/models",
+            REPL_MODEL,
+        ])
+        .unwrap();
+
+        match cli.command {
+            Some(Subcommands::Repl { models_dir, .. }) => {
+                assert_eq!(models_dir, Some(PathBuf::from("/tmp/models")));
+            }
+            _ => panic!("expected repl subcommand"),
+        }
+    }
+
+    #[test]
+    fn repl_subcommand_requires_model_argument() {
+        let err = match Cli::try_parse_from(["oulipoly-agent-runner", "repl"]) {
+            Ok(_) => panic!("expected clap to reject repl without a model"),
+            Err(err) => err,
+        };
+
+        let rendered = err.to_string().to_lowercase();
+        assert!(rendered.contains("model"), "{rendered}");
+    }
+
+    #[test]
+    fn repl_subcommand_rejects_extra_positional_arguments() {
+        let err = match Cli::try_parse_from(["oulipoly-agent-runner", "repl", REPL_MODEL, "extra"])
+        {
+            Ok(_) => panic!("expected clap to reject extra repl positional arguments"),
+            Err(err) => err,
+        };
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("extra"), "{rendered}");
+    }
+
+    #[test]
+    fn resolve_parent_invocation_id_returns_none_when_env_is_unset() {
+        let db = test_db();
+
+        with_parent_invocation_env(None, || {
+            assert_eq!(resolve_parent_invocation_id(&db), None);
+        });
+    }
+
+    #[test]
+    fn resolve_parent_invocation_id_returns_existing_parent_rowid() {
+        let db = test_db();
+        let parent = CompositeInvocationId {
+            source: "fixture-provider".to_string(),
+            id: Uuid::new_v4().to_string(),
+        };
+        let row_id = db
+            .start_invocation(&InvocationStart {
+                invocation_uuid: parent.id.clone(),
+                model_name: "fixture-model".to_string(),
+                provider_name: parent.source.clone(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        let parent_env = serde_json::to_string(&parent).unwrap();
+
+        with_parent_invocation_env(Some(&parent_env), || {
+            assert_eq!(resolve_parent_invocation_id(&db), Some(row_id));
+        });
+    }
+
+    #[test]
+    fn resolve_parent_invocation_id_returns_none_for_malformed_or_unknown_env() {
+        let db = test_db();
+
+        for raw in [
+            "not-json".to_string(),
+            r#"{"source":"fixture-provider","id":"00000000-0000-0000-0000-000000000000"}"#
+                .to_string(),
+            r#"{"source":"fixture-provider","id":"not-a-uuid"}"#.to_string(),
+        ] {
+            with_parent_invocation_env(Some(&raw), || {
+                assert_eq!(resolve_parent_invocation_id(&db), None, "{raw}");
+            });
+        }
+    }
+
+    #[test]
+    fn stderr_emission_helper_emits_for_non_tty_stderr() {
+        assert!(should_emit_invocation_line(false));
+    }
+
+    #[test]
+    fn stderr_emission_helper_suppresses_for_tty_stderr() {
+        assert!(!should_emit_invocation_line(true));
+    }
+
+    #[test]
+    fn finalizer_guard_mark_finalized_makes_drop_a_no_op() {
+        let db = test_db();
+        let start = InvocationStart {
+            invocation_uuid: Uuid::new_v4().to_string(),
+            model_name: "fixture-model".to_string(),
+            provider_name: "fixture-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        };
+        let invocation_id = db.start_invocation(&start).unwrap();
+
+        {
+            let mut guard = FinalizerGuard::new(&db, invocation_id);
+            db.finalize_invocation(invocation_id, true, 0, None, None)
+                .unwrap();
+            guard.mark_finalized();
+        }
+
+        let row = db
+            .get_invocation_by_uuid(&start.invocation_uuid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, InvocationStatus::Succeeded);
+        assert_eq!(row.success, Some(true));
+        assert_eq!(row.exit_code, Some(0));
+    }
+
+    #[test]
+    fn finalizer_guard_drop_finalizes_failed_row_during_panic_unwind() {
+        let db = test_db();
+        let start = InvocationStart {
+            invocation_uuid: Uuid::new_v4().to_string(),
+            model_name: "fixture-model".to_string(),
+            provider_name: "fixture-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        };
+        let invocation_id = db.start_invocation(&start).unwrap();
+
+        let panic_result = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = FinalizerGuard::new(&db, invocation_id);
+            panic!("force guard drop");
+        }));
+        assert!(panic_result.is_err());
+
+        let row = db
+            .get_invocation_by_uuid(&start.invocation_uuid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, InvocationStatus::Failed);
+        assert_eq!(row.success, Some(false));
+        assert_eq!(row.exit_code, Some(-1));
+        assert_eq!(row.error_category.as_deref(), Some("guard_drop"));
+    }
+
+    #[test]
+    fn finalizer_guard_drop_is_no_op_after_explicit_spawn_error_finalize() {
+        let db = test_db();
+        let start = InvocationStart {
+            invocation_uuid: Uuid::new_v4().to_string(),
+            model_name: "fixture-model".to_string(),
+            provider_name: "fixture-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        };
+        let invocation_id = db.start_invocation(&start).unwrap();
+
+        {
+            let mut guard = FinalizerGuard::new(&db, invocation_id);
+            db.finalize_invocation(
+                invocation_id,
+                false,
+                1,
+                Some("spawn_error"),
+                Some("spawn failed"),
+            )
+            .unwrap();
+            guard.mark_finalized();
+        }
+
+        let row = db
+            .get_invocation_by_uuid(&start.invocation_uuid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, InvocationStatus::Failed);
+        assert_eq!(row.success, Some(false));
+        assert_eq!(row.exit_code, Some(1));
+        assert_eq!(row.error_category.as_deref(), Some("spawn_error"));
     }
 }

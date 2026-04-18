@@ -19,6 +19,7 @@ tempfile = "3"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 regex = "1"
+signal-hook = "0.3"
 tauri = { version = "2", features = ["devtools"] }
 tokio = { version = "1", features = ["sync"] }
 

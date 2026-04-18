@@ -12,6 +12,8 @@ pub struct ProviderConfig {
     pub command: String,
     pub args: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interactive_args: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_capture: Option<SessionCapture>,
 }
 
@@ -24,8 +26,16 @@ impl ProviderConfig {
             name,
             command,
             args,
+            interactive_args: None,
             session_capture: None,
         }
+    }
+
+    fn validate_interactive_args(&self) -> Result<(), String> {
+        if matches!(self.interactive_args.as_ref(), Some(args) if args.is_empty()) {
+            return Err("interactive_args must not be empty when provided".into());
+        }
+        Ok(())
     }
 }
 
@@ -222,6 +232,7 @@ impl ModelConfig {
 struct RawModelToml {
     command: Option<String>,
     args: Option<Vec<String>>,
+    interactive_args: Option<Vec<String>>,
     prompt_mode: Option<String>,
     session_capture: Option<SessionCapture>,
     providers: Option<Vec<RawProvider>>,
@@ -234,6 +245,7 @@ struct RawProvider {
     name: Option<String>,
     command: String,
     args: Option<Vec<String>>,
+    interactive_args: Option<Vec<String>>,
     session_capture: Option<SessionCapture>,
 }
 
@@ -340,18 +352,21 @@ impl ModelConfig {
 
         if self.providers.len() == 1 {
             let p = &self.providers[0];
-            let args_toml: Vec<String> = p.args.iter().map(|a| format!("\"{}\"", a)).collect();
             out.push_str(&format!(
                 "command = \"{}\"\nargs = [{}]\nprompt_mode = \"{}\"\n",
                 p.command,
-                args_toml.join(", "),
+                format_string_list(&p.args),
                 mode_str
             ));
+            append_optional_string_list(
+                &mut out,
+                "interactive_args",
+                p.interactive_args.as_deref(),
+            );
             append_session_capture_toml(&mut out, "session_capture", p.session_capture.as_ref());
         } else {
             out.push_str(&format!("prompt_mode = \"{}\"\n", mode_str));
             for p in &self.providers {
-                let args_toml: Vec<String> = p.args.iter().map(|a| format!("\"{}\"", a)).collect();
                 out.push_str("\n[[providers]]\n");
                 // Only emit an explicit name line when the stored name differs
                 // from what would be auto-derived — keeps round-trips stable
@@ -362,8 +377,13 @@ impl ModelConfig {
                 out.push_str(&format!(
                     "command = \"{}\"\nargs = [{}]\n",
                     p.command,
-                    args_toml.join(", ")
+                    format_string_list(&p.args)
                 ));
+                append_optional_string_list(
+                    &mut out,
+                    "interactive_args",
+                    p.interactive_args.as_deref(),
+                );
                 append_session_capture_toml(
                     &mut out,
                     "providers.session_capture",
@@ -463,6 +483,7 @@ impl ModelConfig {
                         name,
                         command: p.command,
                         args,
+                        interactive_args: p.interactive_args,
                         session_capture: p.session_capture,
                     }
                 })
@@ -474,6 +495,7 @@ impl ModelConfig {
                 name,
                 command,
                 args,
+                interactive_args: raw.interactive_args,
                 session_capture: raw.session_capture,
             }]
         } else {
@@ -487,6 +509,8 @@ impl ModelConfig {
         // executor never sees a kind=ForcedFlagVerified missing `flag`
         // (silent capture failure → silent transcript_state=missing).
         for p in &providers {
+            p.validate_interactive_args()
+                .map_err(|e| format!("Model {name} provider {}: {e}", p.name))?;
             if let Some(capture) = &p.session_capture {
                 capture
                     .validate()
@@ -554,13 +578,16 @@ fn append_optional_string(out: &mut String, key: &str, value: Option<&str>) {
 
 fn append_optional_string_list(out: &mut String, key: &str, values: Option<&[String]>) {
     if let Some(values) = values {
-        let values_toml = values
-            .iter()
-            .map(|value| toml_string_literal(value))
-            .collect::<Vec<_>>()
-            .join(", ");
-        out.push_str(&format!("{key} = [{values_toml}]\n"));
+        out.push_str(&format!("{key} = [{}]\n", format_string_list(values)));
     }
+}
+
+fn format_string_list(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| toml_string_literal(value))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn input_type_name(t: &InputType) -> &'static str {
@@ -845,6 +872,150 @@ args = ["exec", "-m", "gpt-5.3-codex"]
         assert_eq!(c1.providers.len(), c2.providers.len());
         assert_eq!(c1.providers[0].command, c2.providers[0].command);
         assert_eq!(c1.providers[1].command, c2.providers[1].command);
+    }
+
+    #[test]
+    fn roundtrip_model_with_interactive_args() {
+        let original = r#"
+prompt_mode = "arg"
+
+[[providers]]
+name = "claude-interactive"
+command = "env"
+args = ["-u", "CLAUDECODE", "claude2", "-p", "--model", "opus"]
+interactive_args = ["-u", "CLAUDECODE", "claude2", "--model", "opus"]
+"#;
+        let c1 = ModelConfig::from_toml("test", original).unwrap();
+        let c2 = ModelConfig::from_toml("test", &c1.to_toml()).unwrap();
+
+        assert_eq!(
+            c2.providers[0].interactive_args.as_deref(),
+            Some(
+                &[
+                    "-u".to_string(),
+                    "CLAUDECODE".to_string(),
+                    "claude2".to_string(),
+                    "--model".to_string(),
+                    "opus".to_string(),
+                ][..]
+            )
+        );
+    }
+
+    #[test]
+    fn roundtrip_model_without_interactive_args_keeps_none() {
+        let original = r#"
+prompt_mode = "arg"
+
+[[providers]]
+name = "claude-interactive"
+command = "claude"
+args = ["-p"]
+"#;
+        let c1 = ModelConfig::from_toml("test", original).unwrap();
+        let c2 = ModelConfig::from_toml("test", &c1.to_toml()).unwrap();
+
+        assert_eq!(c1.providers[0].interactive_args, None);
+        assert_eq!(c2.providers[0].interactive_args, None);
+    }
+
+    #[test]
+    fn rejects_empty_interactive_args_at_load_time() {
+        let toml = r#"
+prompt_mode = "arg"
+
+[[providers]]
+name = "claude-interactive"
+command = "claude"
+args = ["-p"]
+interactive_args = []
+"#;
+        let err = ModelConfig::from_toml("test", toml).unwrap_err();
+        assert!(err.contains("interactive_args"), "{err}");
+    }
+
+    #[test]
+    fn parse_canonical_claude_interactive_shape() {
+        let toml = r#"
+prompt_mode = "arg"
+
+[[providers]]
+name = "claude2"
+command = "env"
+args = ["-u", "CLAUDECODE", "claude2", "-p", "--model", "opus", "--dangerously-skip-permissions"]
+interactive_args = ["-u", "CLAUDECODE", "claude2", "--model", "opus", "--dangerously-skip-permissions"]
+"#;
+        let config = ModelConfig::from_toml("claude", toml).unwrap();
+        let provider = &config.providers[0];
+
+        assert_eq!(provider.name, "claude2");
+        assert_eq!(provider.command, "env");
+        assert_eq!(
+            provider.args,
+            vec![
+                "-u",
+                "CLAUDECODE",
+                "claude2",
+                "-p",
+                "--model",
+                "opus",
+                "--dangerously-skip-permissions",
+            ]
+        );
+        assert_eq!(
+            provider.interactive_args.as_deref(),
+            Some(
+                &[
+                    "-u".to_string(),
+                    "CLAUDECODE".to_string(),
+                    "claude2".to_string(),
+                    "--model".to_string(),
+                    "opus".to_string(),
+                    "--dangerously-skip-permissions".to_string(),
+                ][..]
+            )
+        );
+    }
+
+    #[test]
+    fn parse_canonical_codex_interactive_shape() {
+        let toml = r#"
+prompt_mode = "arg"
+
+[[providers]]
+name = "codex"
+command = "codex"
+args = ["exec", "--dangerously-bypass-approvals-and-sandbox", "-m", "gpt-5.4", "-c", "model_reasoning_effort=high"]
+interactive_args = ["--dangerously-bypass-approvals-and-sandbox", "-m", "gpt-5.4", "-c", "model_reasoning_effort=high"]
+"#;
+        let config = ModelConfig::from_toml("codex", toml).unwrap();
+        let provider = &config.providers[0];
+
+        assert_eq!(provider.name, "codex");
+        assert_eq!(provider.command, "codex");
+        assert_eq!(
+            provider.args,
+            vec![
+                "exec",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "-m",
+                "gpt-5.4",
+                "-c",
+                "model_reasoning_effort=high",
+            ]
+        );
+        assert_eq!(
+            provider.interactive_args.as_deref(),
+            Some(
+                &[
+                    "--dangerously-bypass-approvals-and-sandbox".to_string(),
+                    "-m".to_string(),
+                    "gpt-5.4".to_string(),
+                    "-c".to_string(),
+                    "model_reasoning_effort=high".to_string(),
+                ][..]
+            )
+        );
     }
 
     #[test]
