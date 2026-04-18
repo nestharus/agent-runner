@@ -7,6 +7,7 @@ pub mod quota;
 pub mod sessions;
 pub mod setup;
 pub mod state;
+pub mod trace;
 
 use config::ModelConfig;
 use serde::{Deserialize, Serialize};

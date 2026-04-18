@@ -805,6 +805,30 @@ impl StateDb {
         }
     }
 
+    pub fn list_invocation_children(
+        &self,
+        parent_id: i64,
+    ) -> Result<Vec<InvocationRecord>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, invocation_uuid, model_name, provider_name, provider_index,
+                        parent_invocation_id, status, success, exit_code, error_category,
+                        created_at, finished_at
+                 FROM invocations
+                 WHERE parent_invocation_id = ?1
+                 ORDER BY created_at, id",
+            )
+            .map_err(|e| format!("Failed to prepare invocation child lookup: {e}"))?;
+
+        let rows = stmt
+            .query_map(params![parent_id], Self::map_invocation_row)
+            .map_err(|e| format!("Failed to query invocation children: {e}"))?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to map invocation children: {e}"))
+    }
+
     fn map_invocation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<InvocationRecord> {
         let created_at_raw: String = row.get(10)?;
         let finished_at_raw: Option<String> = row.get(11)?;
@@ -1629,6 +1653,30 @@ mod tests {
         StateDb::open(Path::new(":memory:")).unwrap()
     }
 
+    fn insert_invocation_fixture(
+        db: &StateDb,
+        invocation_uuid: &str,
+        parent_invocation_id: Option<i64>,
+        created_at: &str,
+    ) -> i64 {
+        let id = db
+            .start_invocation(&InvocationStart {
+                invocation_uuid: invocation_uuid.to_string(),
+                model_name: "fixture-model".to_string(),
+                provider_name: "fixture-provider".to_string(),
+                provider_index: 0,
+                parent_invocation_id,
+            })
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE invocations SET created_at = ?1 WHERE id = ?2",
+                params![created_at, id],
+            )
+            .unwrap();
+        id
+    }
+
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -2230,6 +2278,102 @@ command = "fixture"
                         .is_none()
                 );
             },
+        );
+    }
+
+    #[test]
+    fn list_invocation_children_returns_empty_for_unknown_parent() {
+        let db = test_db();
+
+        let children = db.list_invocation_children(999).unwrap();
+
+        assert!(children.is_empty());
+    }
+
+    #[test]
+    fn list_invocation_children_orders_by_created_at_then_row_id() {
+        let db = test_db();
+        let root_id = insert_invocation_fixture(
+            &db,
+            "10000000-0000-0000-0000-000000000000",
+            None,
+            "2026-04-17T08:00:00Z",
+        );
+        insert_invocation_fixture(
+            &db,
+            "30000000-0000-0000-0000-000000000000",
+            Some(root_id),
+            "2026-04-17T08:02:00Z",
+        );
+        insert_invocation_fixture(
+            &db,
+            "20000000-0000-0000-0000-000000000000",
+            Some(root_id),
+            "2026-04-17T08:01:00Z",
+        );
+        insert_invocation_fixture(
+            &db,
+            "40000000-0000-0000-0000-000000000000",
+            Some(root_id),
+            "2026-04-17T08:01:00Z",
+        );
+
+        let children = db.list_invocation_children(root_id).unwrap();
+        let ordered: Vec<&str> = children
+            .iter()
+            .map(|record| record.invocation_uuid.as_str())
+            .collect();
+
+        assert_eq!(
+            ordered,
+            vec![
+                "20000000-0000-0000-0000-000000000000",
+                "40000000-0000-0000-0000-000000000000",
+                "30000000-0000-0000-0000-000000000000",
+            ]
+        );
+    }
+
+    #[test]
+    fn list_invocation_children_returns_only_direct_children() {
+        let db = test_db();
+        let root_id = insert_invocation_fixture(
+            &db,
+            "50000000-0000-0000-0000-000000000000",
+            None,
+            "2026-04-17T08:00:00Z",
+        );
+        let child_id = insert_invocation_fixture(
+            &db,
+            "60000000-0000-0000-0000-000000000000",
+            Some(root_id),
+            "2026-04-17T08:01:00Z",
+        );
+        insert_invocation_fixture(
+            &db,
+            "70000000-0000-0000-0000-000000000000",
+            Some(child_id),
+            "2026-04-17T08:02:00Z",
+        );
+        insert_invocation_fixture(
+            &db,
+            "80000000-0000-0000-0000-000000000000",
+            Some(root_id),
+            "2026-04-17T08:03:00Z",
+        );
+
+        let children = db.list_invocation_children(root_id).unwrap();
+        let uuids: Vec<&str> = children
+            .iter()
+            .map(|record| record.invocation_uuid.as_str())
+            .collect();
+
+        assert_eq!(
+            uuids,
+            vec![
+                "60000000-0000-0000-0000-000000000000",
+                "80000000-0000-0000-0000-000000000000",
+            ]
         );
     }
 

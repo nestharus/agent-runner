@@ -5,8 +5,9 @@ use agent_runner_lib::config::{
 use agent_runner_lib::diagnostics;
 use agent_runner_lib::executor;
 use agent_runner_lib::state::{CompositeInvocationId, InvocationStart, StateDb};
+use agent_runner_lib::trace::{TraceOptions, render_ascii_trace, trace_invocation};
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::collections::HashMap;
 use std::io::{IsTerminal, Read, Write as _};
 use std::path::{Path, PathBuf};
@@ -16,9 +17,13 @@ use uuid::Uuid;
 #[derive(Parser)]
 #[command(
     name = "oulipoly-agent-runner",
-    about = "LLM agent runner with load balancing"
+    about = "LLM agent runner with load balancing",
+    args_conflicts_with_subcommands = true
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Subcommands>,
+
     /// Agent name (from agents directory)
     agent: Option<String>,
 
@@ -53,6 +58,34 @@ struct Cli {
     /// Pass model inputs as key=value pairs (repeatable)
     #[arg(short = 'i', long = "input", value_name = "KEY=VALUE")]
     inputs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+enum Subcommands {
+    /// Walk the invocation tree from a UUID.
+    Trace {
+        /// The invocation UUID to start the walk from.
+        invocation_uuid: String,
+
+        /// Emit structured JSON instead of an ASCII tree.
+        #[arg(long)]
+        json: bool,
+
+        /// Embed raw transcript records inline (PR-B returns null placeholders).
+        #[arg(long, requires = "json")]
+        inline_transcript: bool,
+
+        /// Append a transcript placeholder after the tree in human mode.
+        /// Per contract `tmp/01-pr-b-contract.md` §"`--transcript` (human
+        /// mode)", this flag is mutually exclusive with `--json`. Use
+        /// `--json --inline-transcript` for the structured equivalent.
+        #[arg(long, conflicts_with = "json")]
+        transcript: bool,
+
+        /// Maximum tree depth before truncating descendants.
+        #[arg(long, default_value = "64")]
+        max_depth: usize,
+    },
 }
 
 #[derive(Debug)]
@@ -148,6 +181,26 @@ fn resolve_models_dir(cli: &Cli) -> PathBuf {
 }
 
 fn run(cli: Cli) -> Result<i32, String> {
+    if let Some(command) = cli.command.clone() {
+        return match command {
+            Subcommands::Trace {
+                invocation_uuid,
+                json,
+                inline_transcript,
+                transcript,
+                max_depth,
+            } => run_trace_command(
+                TraceOptions {
+                    max_depth,
+                    json,
+                    inline_transcript,
+                    transcript,
+                },
+                &invocation_uuid,
+            ),
+        };
+    }
+
     let models_dir = resolve_models_dir(&cli);
     let models = load_models(&models_dir)?;
     let extra_inputs = parse_inputs(&cli.inputs)?;
@@ -201,6 +254,28 @@ fn run(cli: Cli) -> Result<i32, String> {
         working_dir.as_deref(),
         &extra_inputs,
     )
+}
+
+fn run_trace_command(options: TraceOptions, invocation_uuid: &str) -> Result<i32, String> {
+    let state = StateDb::open_default()?;
+    let report = match trace_invocation(&state, invocation_uuid, options) {
+        Ok(report) => report,
+        Err(err) if err.starts_with("Invocation not found:") => {
+            eprintln!("{err}");
+            return Ok(1);
+        }
+        Err(err) => return Err(err),
+    };
+
+    if options.json {
+        let json = serde_json::to_string_pretty(&report)
+            .map_err(|e| format!("Failed to serialize trace report: {e}"))?;
+        println!("{json}");
+    } else {
+        print!("{}", render_ascii_trace(&report));
+    }
+
+    Ok(0)
 }
 
 fn resolve_agent(cli: &Cli) -> Result<AgentConfig, String> {
@@ -381,5 +456,112 @@ fn main() -> ExitCode {
             eprintln!("Error: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TRACE_UUID: &str = "11111111-1111-1111-1111-111111111111";
+
+    #[test]
+    fn trace_subcommand_parses_json_and_inline_transcript_flags() {
+        let cli = Cli::try_parse_from([
+            "oulipoly-agent-runner",
+            "trace",
+            TRACE_UUID,
+            "--json",
+            "--inline-transcript",
+            "--max-depth",
+            "10",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Some(Subcommands::Trace {
+                invocation_uuid,
+                json,
+                inline_transcript,
+                transcript,
+                max_depth,
+            }) => {
+                assert_eq!(invocation_uuid, TRACE_UUID);
+                assert!(json);
+                assert!(inline_transcript);
+                assert!(!transcript);
+                assert_eq!(max_depth, 10);
+            }
+            _ => panic!("expected trace subcommand"),
+        }
+    }
+
+    #[test]
+    fn trace_subcommand_rejects_inline_transcript_without_json() {
+        let err = match Cli::try_parse_from([
+            "oulipoly-agent-runner",
+            "trace",
+            TRACE_UUID,
+            "--inline-transcript",
+        ]) {
+            Ok(_) => panic!("expected clap to reject --inline-transcript without --json"),
+            Err(err) => err,
+        };
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("--json"), "{rendered}");
+    }
+
+    #[test]
+    fn no_subcommand_still_parses_existing_model_flow() {
+        // `agent` is the first positional in `Cli`, so a single bare arg
+        // (`ping`) lands there — `prompt_args` only captures any *additional*
+        // trailing args. The existing `collect_positional_prompt(_, true)`
+        // path joins agent + prompt_args, so the runtime prompt still
+        // becomes "ping". Exercised end-to-end by the integration test
+        // `default_cli_flow_still_runs_without_subcommand`.
+        let cli =
+            Cli::try_parse_from(["oulipoly-agent-runner", "--model", "fixture", "ping"]).unwrap();
+
+        assert!(cli.command.is_none());
+        assert_eq!(cli.model.as_deref(), Some("fixture"));
+        assert_eq!(cli.agent.as_deref(), Some("ping"));
+        assert!(cli.prompt_args.is_empty());
+
+        // Two trailing args: the first goes to `agent`, the rest into
+        // `prompt_args`. This is the existing PR-A behavior preserved
+        // under subcommand dispatch.
+        let cli = Cli::try_parse_from([
+            "oulipoly-agent-runner",
+            "--model",
+            "fixture",
+            "ping",
+            "pong",
+        ])
+        .unwrap();
+        assert_eq!(cli.agent.as_deref(), Some("ping"));
+        assert_eq!(cli.prompt_args, vec!["pong"]);
+    }
+
+    #[test]
+    fn trace_subcommand_rejects_transcript_with_json() {
+        // Per contract: `--transcript` is the human-mode footer; `--json`
+        // surfaces transcripts via `--inline-transcript` instead. Clap
+        // must reject the combination.
+        let err = match Cli::try_parse_from([
+            "oulipoly-agent-runner",
+            "trace",
+            "00000000-0000-0000-0000-000000000000",
+            "--json",
+            "--transcript",
+        ]) {
+            Ok(_) => panic!("expected clap to reject --json --transcript"),
+            Err(e) => e,
+        };
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("--transcript") || rendered.contains("--json"),
+            "{rendered}"
+        );
     }
 }
