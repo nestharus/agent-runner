@@ -391,10 +391,11 @@ fn resume_model_pool_mismatch_message(
     let mut suggestions: Vec<String> = models
         .values()
         .filter(|model| {
-            model
-                .providers
-                .iter()
-                .any(|provider| provider.name == provider_name)
+            model.providers.iter().any(|provider| {
+                provider.name == provider_name
+                    && provider.interactive_args.is_some()
+                    && provider.resume.is_some()
+            })
         })
         .map(|model| model.name.clone())
         .collect();

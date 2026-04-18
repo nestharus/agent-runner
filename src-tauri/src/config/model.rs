@@ -565,6 +565,12 @@ impl ModelConfig {
                 resume
                     .validate()
                     .map_err(|e| format!("Model {name} provider {}: {e}", p.name))?;
+                if p.interactive_args.is_none() {
+                    return Err(format!(
+                        "Model {name} provider {}: [providers.resume] requires interactive_args",
+                        p.name
+                    ));
+                }
             }
             if let Some(capture) = &p.session_capture {
                 capture
