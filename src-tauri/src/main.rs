@@ -382,6 +382,10 @@ fn should_emit_invocation_line(is_terminal: bool) -> bool {
     !is_terminal
 }
 
+fn should_emit_resume_detail_line(match_count: usize, is_terminal: bool) -> bool {
+    match_count > 1 && !is_terminal
+}
+
 fn resume_model_pool_mismatch_message(
     models: &HashMap<String, ModelConfig>,
     model_name: &str,
@@ -391,11 +395,10 @@ fn resume_model_pool_mismatch_message(
     let mut suggestions: Vec<String> = models
         .values()
         .filter(|model| {
-            model.providers.iter().any(|provider| {
-                provider.name == provider_name
-                    && provider.interactive_args.is_some()
-                    && provider.resume.is_some()
-            })
+            model
+                .providers
+                .iter()
+                .any(|provider| provider.name == provider_name)
         })
         .map(|model| model.name.clone())
         .collect();
@@ -463,7 +466,7 @@ fn run_repl(
 
         let selected_provider = &matches[0].provider_name;
         eprintln!("[resume] -> {selected_provider}");
-        if matches.len() > 1 && !stderr_is_terminal {
+        if should_emit_resume_detail_line(matches.len(), stderr_is_terminal) {
             let providers = matches
                 .iter()
                 .map(|matched| matched.provider_name.as_str())
@@ -1108,6 +1111,25 @@ mod tests {
     #[test]
     fn stderr_emission_helper_suppresses_for_tty_stderr() {
         assert!(!should_emit_invocation_line(true));
+    }
+
+    #[test]
+    fn resume_detail_helper_suppresses_for_single_match_regardless_of_tty() {
+        assert!(!should_emit_resume_detail_line(1, false));
+        assert!(!should_emit_resume_detail_line(1, true));
+        assert!(!should_emit_resume_detail_line(0, false));
+    }
+
+    #[test]
+    fn resume_detail_helper_emits_when_multi_match_and_non_tty() {
+        assert!(should_emit_resume_detail_line(2, false));
+        assert!(should_emit_resume_detail_line(5, false));
+    }
+
+    #[test]
+    fn resume_detail_helper_suppresses_when_multi_match_but_tty() {
+        assert!(!should_emit_resume_detail_line(2, true));
+        assert!(!should_emit_resume_detail_line(5, true));
     }
 
     #[test]

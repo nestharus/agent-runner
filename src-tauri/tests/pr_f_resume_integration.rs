@@ -308,6 +308,36 @@ flag = "--resume"
 }
 
 #[test]
+fn resume_model_pool_mismatch_says_no_other_model_when_no_suggestions() {
+    let fixture = Fixture::new();
+    let session_id = "0824f7d1-7a3d-4ff8-8e4b-8c1d3b0d3e2c";
+    let script = fixture.write_script("fixture.sh", "exit 0");
+    // Only one model exists, and its provider list does NOT include
+    // the resolved provider. This exercises the
+    // resume_model_pool_mismatch_message empty-suggestions branch.
+    fixture.write_single_provider_model(
+        "wrong-model",
+        "codex",
+        &script,
+        r#"
+[providers.resume]
+kind = "subcommand"
+subcommand = ["resume"]
+"#,
+    );
+    fixture.seed_session_turns("claude2", session_id, &[("turn-1", "2026-04-17T08:00:00Z")]);
+
+    let output = fixture.run_repl("wrong-model", Some(session_id));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        stderr.contains("(no other model in the loaded config includes claude2)"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn resume_rejects_malformed_uuid_before_lookup() {
     let fixture = Fixture::new();
     let script = fixture.write_script("claude.sh", "exit 0");

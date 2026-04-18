@@ -1,6 +1,6 @@
 use crate::config::load_models;
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, named_params, params};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use uuid::Uuid;
@@ -1776,14 +1776,14 @@ impl StateDb {
             .prepare(
                 "SELECT provider_name, MAX(timestamp) AS latest_timestamp
                  FROM session_turns
-                 WHERE session_id = ?1
+                 WHERE session_id = :session_id
                  GROUP BY provider_name
                  ORDER BY latest_timestamp DESC, provider_name ASC",
             )
             .map_err(|e| format!("Failed to prepare session provider lookup: {e}"))?;
 
         let rows = stmt
-            .query_map(params![session_id], |row| {
+            .query_map(named_params! { ":session_id": session_id }, |row| {
                 let latest_timestamp_raw: String = row.get(1)?;
                 let latest_timestamp = DateTime::parse_from_rfc3339(&latest_timestamp_raw)
                     .map(|dt| dt.with_timezone(&Utc))
