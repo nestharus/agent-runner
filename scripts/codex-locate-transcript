@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+exec python3 - "$@" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        print("usage: codex-locate-transcript BASE_DIR", file=sys.stderr)
+        return 2
+
+    session_id = os.environ.get("SESSION_ID")
+    if not session_id:
+        print("SESSION_ID is required", file=sys.stderr)
+        return 2
+
+    base = Path(sys.argv[1]).expanduser()
+
+    # Codex names rollout files `rollout-<timestamp>-<session_id>.jsonl`,
+    # so the session id appears as a suffix on the filename. Filter
+    # by suffix first to avoid scanning every rollout file's content.
+    # Filename match is iterated through rglob (NOT used as a glob
+    # pattern containing session_id) to avoid glob/path injection
+    # via SESSION_ID — same defensive shape as the Claude locator.
+    suffix = f"-{session_id}.jsonl"
+    for path in base.rglob("rollout-*.jsonl"):
+        if path.name.endswith(suffix):
+            print(path.resolve())
+            return 0
+
+    # Fallback: defensively inspect content in case the filename
+    # convention changes in a future Codex version but session_meta
+    # still records the id internally.
+    for path in base.rglob("rollout-*.jsonl"):
+        if file_contains_session_id(path, session_id):
+            print(path.resolve())
+            return 0
+
+    print(f"session not found: {session_id}", file=sys.stderr)
+    return 1
+
+
+def file_contains_session_id(path: Path, session_id: str) -> bool:
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("type") != "session_meta":
+                    continue
+                payload = obj.get("payload") or {}
+                if payload.get("id") == session_id:
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PY

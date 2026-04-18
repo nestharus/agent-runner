@@ -4,6 +4,8 @@
 //! invocation tree from SQLite parent edges, renders deterministic human output,
 //! and exposes a structured JSON shape for machine consumers.
 
+use crate::config::SessionsConfig;
+use crate::sessions::locate_transcript;
 use crate::state::{InvocationRecord, StateDb};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Serialize;
@@ -96,6 +98,15 @@ pub fn trace_invocation(
     root_uuid: &str,
     options: TraceOptions,
 ) -> Result<TraceReport, String> {
+    trace_invocation_with_sessions(db, root_uuid, options, None)
+}
+
+pub fn trace_invocation_with_sessions(
+    db: &StateDb,
+    root_uuid: &str,
+    options: TraceOptions,
+    sessions_cfg: Option<&SessionsConfig>,
+) -> Result<TraceReport, String> {
     Uuid::parse_str(root_uuid)
         .map_err(|e| format!("Invalid invocation UUID '{root_uuid}': {e}"))?;
 
@@ -104,7 +115,15 @@ pub fn trace_invocation(
         .ok_or_else(|| format!("Invocation not found: {root_uuid}"))?;
 
     let mut visited = HashSet::from([root_record.id]);
-    let root = build_trace_node(db, root_record, None, 0, options, &mut visited)?;
+    let root = build_trace_node(
+        db,
+        root_record,
+        None,
+        0,
+        options,
+        sessions_cfg,
+        &mut visited,
+    )?;
 
     Ok(TraceReport {
         requested_id: root_uuid.to_string(),
@@ -134,8 +153,10 @@ fn build_trace_node(
     parent_uuid: Option<String>,
     depth: usize,
     options: TraceOptions,
+    sessions_cfg: Option<&SessionsConfig>,
     visited: &mut HashSet<i64>,
 ) -> Result<TraceNode, String> {
+    let (session, mut node_warnings) = build_trace_session(&record, sessions_cfg);
     let mut node = TraceNode {
         invocation: TraceInvocation {
             row_id: record.id,
@@ -150,17 +171,9 @@ fn build_trace_node(
             started_at: record.created_at,
             finished_at: record.finished_at,
         },
-        session: TraceSession {
-            id: None,
-            capture_method: None,
-            transcript_path: None,
-            transcript_state: TranscriptState::Unresolved,
-            turn_count: None,
-            assistant_turn_count: None,
-            sidechain_turn_count: None,
-        },
+        session,
         transcript: options.inline_transcript.then_some(()),
-        warnings: Vec::new(),
+        warnings: std::mem::take(&mut node_warnings),
         children: Vec::new(),
         ascii_leaves: Vec::new(),
     };
@@ -193,6 +206,7 @@ fn build_trace_node(
             Some(node.invocation.id.clone()),
             depth + 1,
             options,
+            sessions_cfg,
             visited,
         )?;
         node.warnings.extend(child_node.warnings.iter().cloned());
@@ -201,6 +215,119 @@ fn build_trace_node(
     }
 
     Ok(node)
+}
+
+fn build_trace_session(
+    record: &InvocationRecord,
+    sessions_cfg: Option<&SessionsConfig>,
+) -> (TraceSession, Vec<String>) {
+    let mut warnings = Vec::new();
+    if record.session_capture_method.as_deref() == Some("failed") {
+        warnings.push(
+            "session capture failed during execution; reason was logged to stderr at execution time"
+                .to_string(),
+        );
+    }
+
+    let Some(session_id) = record.session_id.clone() else {
+        return (
+            TraceSession {
+                id: None,
+                capture_method: record.session_capture_method.clone(),
+                transcript_path: None,
+                transcript_state: TranscriptState::Unresolved,
+                turn_count: None,
+                assistant_turn_count: None,
+                sidechain_turn_count: None,
+            },
+            warnings,
+        );
+    };
+
+    let Some(provider_name) = record.provider_name.as_deref() else {
+        warnings.push("session_id is present but provider_name is missing".to_string());
+        return (
+            TraceSession {
+                id: Some(session_id),
+                capture_method: record.session_capture_method.clone(),
+                transcript_path: None,
+                transcript_state: TranscriptState::Unresolved,
+                turn_count: None,
+                assistant_turn_count: None,
+                sidechain_turn_count: None,
+            },
+            warnings,
+        );
+    };
+
+    let Some(sessions_cfg) = sessions_cfg else {
+        return (
+            TraceSession {
+                id: Some(session_id),
+                capture_method: record.session_capture_method.clone(),
+                transcript_path: None,
+                transcript_state: TranscriptState::NoLocator,
+                turn_count: None,
+                assistant_turn_count: None,
+                sidechain_turn_count: None,
+            },
+            warnings,
+        );
+    };
+
+    match locate_transcript(sessions_cfg, provider_name, &session_id) {
+        Ok(None) => (
+            TraceSession {
+                id: Some(session_id),
+                capture_method: record.session_capture_method.clone(),
+                transcript_path: None,
+                transcript_state: TranscriptState::NoLocator,
+                turn_count: None,
+                assistant_turn_count: None,
+                sidechain_turn_count: None,
+            },
+            warnings,
+        ),
+        Ok(Some(path)) if path.exists() => (
+            TraceSession {
+                id: Some(session_id),
+                capture_method: record.session_capture_method.clone(),
+                transcript_path: Some(path.display().to_string()),
+                transcript_state: TranscriptState::Available,
+                turn_count: None,
+                assistant_turn_count: None,
+                sidechain_turn_count: None,
+            },
+            warnings,
+        ),
+        Ok(Some(_path)) => (
+            TraceSession {
+                id: Some(session_id),
+                capture_method: record.session_capture_method.clone(),
+                transcript_path: None,
+                transcript_state: TranscriptState::Missing,
+                turn_count: None,
+                assistant_turn_count: None,
+                sidechain_turn_count: None,
+            },
+            warnings,
+        ),
+        Err(err) => {
+            warnings.push(format!("transcript locator failed: {err}"));
+            (
+                TraceSession {
+                    id: Some(session_id),
+                    capture_method: record.session_capture_method.clone(),
+                    transcript_path: None,
+                    transcript_state: TranscriptState::Missing,
+                    turn_count: None,
+                    assistant_turn_count: None,
+                    sidechain_turn_count: None,
+                },
+                warnings,
+            )
+        }
+    }
 }
 
 fn render_ascii_node(node: &TraceNode, depth: usize, output: &mut String) {
@@ -244,13 +371,19 @@ fn format_ascii_node(node: &TraceNode) -> String {
     )
 }
 
-#[cfg(test)]
+// Tests use `set_permissions` with Unix mode bits to make fixture
+// scripts executable. Gate the whole module on Unix; the trace logic
+// itself is platform-agnostic, but the test fixtures are not.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::state::StateDb;
     use chrono::DateTime;
     use rusqlite::{Connection, params};
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
 
     const ROOT_UUID: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
     const CHILD_ALPHA_UUID: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
@@ -325,6 +458,46 @@ mod tests {
         fn db(&self) -> StateDb {
             StateDb::open(&self.db_path).unwrap()
         }
+
+        fn set_session_capture(
+            &self,
+            row_id: i64,
+            session_id: Option<&str>,
+            capture_method: Option<&str>,
+        ) {
+            let conn = Connection::open(&self.db_path).unwrap();
+            conn.execute(
+                "UPDATE invocations
+                 SET session_id = ?1, session_capture_method = ?2
+                 WHERE id = ?3",
+                params![session_id, capture_method, row_id],
+            )
+            .unwrap();
+        }
+    }
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn write_sessions_config(config_home: &std::path::Path, body: &str) {
+        let app_dir = config_home.join("oulipoly-agent-runner");
+        fs::create_dir_all(&app_dir).unwrap();
+        fs::write(app_dir.join("sessions.toml"), body).unwrap();
+    }
+
+    fn fixture_script(dir: &tempfile::TempDir, name: &str, body: &str) -> PathBuf {
+        let path = dir.path().join(name);
+        fs::write(
+            &path,
+            format!("#!/usr/bin/env bash\nset -euo pipefail\n{body}\n"),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).unwrap();
+        path
     }
 
     fn trace_options(max_depth: usize) -> TraceOptions {
@@ -715,5 +888,172 @@ mod tests {
         assert!(json["root"]["transcript"].is_null());
         assert!(json["root"]["children"][0]["transcript"].is_null());
         assert!(json["root"]["children"][0]["children"][0]["transcript"].is_null());
+    }
+
+    #[test]
+    fn json_output_reports_available_transcript_when_locator_finds_existing_file() {
+        let _guard = env_lock().lock().unwrap();
+        let fixture = TraceFixture::new(&base_rows());
+        fixture.set_session_capture(
+            1,
+            Some("5169694d-de0f-40d1-890c-6e28e55bab27"),
+            Some("forced_flag_verified"),
+        );
+        let db = fixture.db();
+
+        let env_dir = tempfile::tempdir().unwrap();
+        let transcript = env_dir.path().join("trace-session.jsonl");
+        fs::write(&transcript, "{\"type\":\"system\"}\n").unwrap();
+        let locator = fixture_script(
+            &env_dir,
+            "locator.sh",
+            &format!(r#"printf '%s\n' "{}""#, transcript.display()),
+        );
+        write_sessions_config(
+            env_dir.path(),
+            &format!(
+                r#"[fixture-provider]
+turn_script = "ignored"
+transcript_locator = "{}"
+"#,
+                locator.display()
+            ),
+        );
+
+        let sessions_cfg = SessionsConfig::load(
+            &env_dir
+                .path()
+                .join("oulipoly-agent-runner")
+                .join("sessions.toml"),
+        )
+        .unwrap();
+        let report = trace_invocation_with_sessions(
+            &db,
+            ROOT_UUID,
+            TraceOptions {
+                max_depth: 64,
+                json: true,
+                inline_transcript: false,
+                transcript: false,
+            },
+            Some(&sessions_cfg),
+        )
+        .unwrap();
+        let json = serde_json::to_value(&report).unwrap();
+
+        assert_eq!(
+            json["root"]["session"]["id"],
+            "5169694d-de0f-40d1-890c-6e28e55bab27"
+        );
+        assert_eq!(
+            json["root"]["session"]["capture_method"],
+            "forced_flag_verified"
+        );
+        assert_eq!(json["root"]["session"]["transcript_state"], "available");
+        assert_eq!(
+            json["root"]["session"]["transcript_path"],
+            transcript.display().to_string()
+        );
+    }
+
+    #[test]
+    fn json_output_reports_no_locator_when_session_id_is_present_but_unconfigured() {
+        let fixture = TraceFixture::new(&base_rows());
+        fixture.set_session_capture(
+            1,
+            Some("019d9d09-2de9-7902-b148-f9f3bed4fa41"),
+            Some("stdout_json_event"),
+        );
+        let db = fixture.db();
+
+        let report = trace_invocation(
+            &db,
+            ROOT_UUID,
+            TraceOptions {
+                max_depth: 64,
+                json: true,
+                inline_transcript: false,
+                transcript: false,
+            },
+        )
+        .unwrap();
+        let json = serde_json::to_value(&report).unwrap();
+
+        assert_eq!(
+            json["root"]["session"]["id"],
+            "019d9d09-2de9-7902-b148-f9f3bed4fa41"
+        );
+        assert_eq!(
+            json["root"]["session"]["capture_method"],
+            "stdout_json_event"
+        );
+        assert_eq!(json["root"]["session"]["transcript_state"], "no_locator");
+        assert!(json["root"]["session"]["transcript_path"].is_null());
+    }
+
+    /// `transcript_state = "missing"` — locator returns a path but the
+    /// file doesn't exist on disk. V10 says degraded states must be
+    /// observable; this exercise confirms the runtime distinguishes
+    /// "missing" from "available" rather than collapsing them.
+    #[test]
+    fn json_output_reports_missing_when_locator_path_does_not_exist() {
+        let _guard = env_lock().lock().unwrap();
+        let fixture = TraceFixture::new(&base_rows());
+        fixture.set_session_capture(
+            1,
+            Some("5169694d-de0f-40d1-890c-6e28e55bab27"),
+            Some("forced_flag_verified"),
+        );
+        let db = fixture.db();
+
+        let env_dir = tempfile::tempdir().unwrap();
+        // Locator points at a path that does NOT exist on disk.
+        let nonexistent = env_dir.path().join("does-not-exist.jsonl");
+        let locator = fixture_script(
+            &env_dir,
+            "missing-locator.sh",
+            &format!(r#"printf '%s\n' "{}""#, nonexistent.display()),
+        );
+        write_sessions_config(
+            env_dir.path(),
+            &format!(
+                r#"[fixture-provider]
+turn_script = "ignored"
+transcript_locator = "{}"
+"#,
+                locator.display()
+            ),
+        );
+
+        let sessions_cfg = SessionsConfig::load(
+            &env_dir
+                .path()
+                .join("oulipoly-agent-runner")
+                .join("sessions.toml"),
+        )
+        .unwrap();
+        let report = trace_invocation_with_sessions(
+            &db,
+            ROOT_UUID,
+            TraceOptions {
+                max_depth: 64,
+                json: true,
+                inline_transcript: false,
+                transcript: false,
+            },
+            Some(&sessions_cfg),
+        )
+        .unwrap();
+        let json = serde_json::to_value(&report).unwrap();
+
+        assert_eq!(
+            json["root"]["session"]["id"],
+            "5169694d-de0f-40d1-890c-6e28e55bab27"
+        );
+        assert_eq!(json["root"]["session"]["transcript_state"], "missing");
+        // transcript_path may be the unresolved path (as a hint) or
+        // null — both are acceptable per the contract; assert it isn't
+        // misleadingly reported as available.
+        assert_ne!(json["root"]["session"]["transcript_state"], "available");
     }
 }

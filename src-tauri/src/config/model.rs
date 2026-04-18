@@ -11,6 +11,8 @@ pub struct ProviderConfig {
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_capture: Option<SessionCapture>,
 }
 
 impl ProviderConfig {
@@ -22,6 +24,75 @@ impl ProviderConfig {
             name,
             command,
             args,
+            session_capture: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionCapture {
+    pub kind: SessionCaptureKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readback_args: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_flag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_message_flag: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCaptureKind {
+    None,
+    ForcedFlagVerified,
+    StdoutJsonEvent,
+}
+
+impl SessionCapture {
+    /// Per-kind required fields per `tmp/01-pr-c-contract.md`. Catches
+    /// malformed configs at load time instead of letting them surface
+    /// as silent capture failures at execution time (V10 — observable).
+    pub fn validate(&self) -> Result<(), String> {
+        match self.kind {
+            SessionCaptureKind::None => Ok(()),
+            SessionCaptureKind::ForcedFlagVerified => {
+                if self.flag.is_none() {
+                    return Err(
+                        "session_capture.kind = forced_flag_verified requires `flag`".into(),
+                    );
+                }
+                Ok(())
+            }
+            SessionCaptureKind::StdoutJsonEvent => {
+                if self.json_flag.is_none() {
+                    return Err(
+                        "session_capture.kind = stdout_json_event requires `json_flag`".into(),
+                    );
+                }
+                if self.last_message_flag.is_none() {
+                    return Err(
+                        "session_capture.kind = stdout_json_event requires `last_message_flag`"
+                            .into(),
+                    );
+                }
+                if self.event_type.is_none() {
+                    return Err(
+                        "session_capture.kind = stdout_json_event requires `event_type`".into(),
+                    );
+                }
+                if self.event_id_path.is_none() {
+                    return Err(
+                        "session_capture.kind = stdout_json_event requires `event_id_path`".into(),
+                    );
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -152,6 +223,7 @@ struct RawModelToml {
     command: Option<String>,
     args: Option<Vec<String>>,
     prompt_mode: Option<String>,
+    session_capture: Option<SessionCapture>,
     providers: Option<Vec<RawProvider>>,
     inputs: Option<Vec<RawInput>>,
 }
@@ -162,6 +234,7 @@ struct RawProvider {
     name: Option<String>,
     command: String,
     args: Option<Vec<String>>,
+    session_capture: Option<SessionCapture>,
 }
 
 #[derive(Deserialize)]
@@ -274,6 +347,7 @@ impl ModelConfig {
                 args_toml.join(", "),
                 mode_str
             ));
+            append_session_capture_toml(&mut out, "session_capture", p.session_capture.as_ref());
         } else {
             out.push_str(&format!("prompt_mode = \"{}\"\n", mode_str));
             for p in &self.providers {
@@ -290,6 +364,11 @@ impl ModelConfig {
                     p.command,
                     args_toml.join(", ")
                 ));
+                append_session_capture_toml(
+                    &mut out,
+                    "providers.session_capture",
+                    p.session_capture.as_ref(),
+                );
             }
         }
 
@@ -384,6 +463,7 @@ impl ModelConfig {
                         name,
                         command: p.command,
                         args,
+                        session_capture: p.session_capture,
                     }
                 })
                 .collect()
@@ -394,12 +474,25 @@ impl ModelConfig {
                 name,
                 command,
                 args,
+                session_capture: raw.session_capture,
             }]
         } else {
             return Err(format!(
                 "Model {name}: must have either 'command' or '[[providers]]'"
             ));
         };
+
+        // Validate per-kind required fields on session_capture before
+        // returning. Catching malformed configs at load time means the
+        // executor never sees a kind=ForcedFlagVerified missing `flag`
+        // (silent capture failure → silent transcript_state=missing).
+        for p in &providers {
+            if let Some(capture) = &p.session_capture {
+                capture
+                    .validate()
+                    .map_err(|e| format!("Model {name} provider {}: {e}", p.name))?;
+            }
+        }
 
         if providers.is_empty() {
             return Err(format!("Model {name}: no providers defined"));
@@ -411,6 +504,62 @@ impl ModelConfig {
             providers,
             inputs,
         })
+    }
+}
+
+fn append_session_capture_toml(
+    out: &mut String,
+    table_name: &str,
+    capture: Option<&SessionCapture>,
+) {
+    let Some(capture) = capture else {
+        return;
+    };
+
+    out.push('\n');
+    out.push_str(&format!("[{table_name}]\n"));
+    out.push_str(&format!(
+        "kind = \"{}\"\n",
+        match capture.kind {
+            SessionCaptureKind::None => "none",
+            SessionCaptureKind::ForcedFlagVerified => "forced_flag_verified",
+            SessionCaptureKind::StdoutJsonEvent => "stdout_json_event",
+        }
+    ));
+    append_optional_string(out, "flag", capture.flag.as_deref());
+    append_optional_string_list(out, "readback_args", capture.readback_args.as_deref());
+    append_optional_string(out, "event_type", capture.event_type.as_deref());
+    append_optional_string(out, "event_id_path", capture.event_id_path.as_deref());
+    append_optional_string(out, "json_flag", capture.json_flag.as_deref());
+    append_optional_string(
+        out,
+        "last_message_flag",
+        capture.last_message_flag.as_deref(),
+    );
+}
+
+/// Render a Rust string as a TOML basic-string literal, escaping
+/// backslashes, quotes, and control characters per the TOML spec.
+/// Defers to the `toml` crate's serializer to avoid hand-rolling
+/// escape rules that drift from the spec.
+fn toml_string_literal(value: &str) -> String {
+    toml::Value::String(value.to_string()).to_string()
+}
+
+fn append_optional_string(out: &mut String, key: &str, value: Option<&str>) {
+    if let Some(value) = value {
+        out.push_str(&format!("{key} = {}\n", toml_string_literal(value)));
+    }
+}
+
+fn append_optional_string_list(out: &mut String, key: &str, values: Option<&[String]>) {
+    if let Some(values) = values {
+        let values_toml = values
+            .iter()
+            .map(|value| toml_string_literal(value))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!("{key} = [{values_toml}]\n"));
     }
 }
 
@@ -561,6 +710,109 @@ prompt_mode = "arg"
         assert!(ModelConfig::from_toml("test", toml).is_err());
     }
 
+    /// `validate()` for ForcedFlagVerified must reject configs missing the
+    /// required `flag` field — otherwise `build_capture_plan` would silently
+    /// fall through to capture failure at execution time (V10).
+    #[test]
+    fn rejects_forced_flag_verified_without_flag() {
+        let toml = r#"
+prompt_mode = "arg"
+
+[[providers]]
+command = "claude"
+args = ["-p"]
+
+[providers.session_capture]
+kind = "forced_flag_verified"
+"#;
+        let err = ModelConfig::from_toml("test", toml).unwrap_err();
+        assert!(err.contains("`flag`"), "{err}");
+    }
+
+    /// Same V10 reasoning for StdoutJsonEvent's required fields.
+    #[test]
+    fn rejects_stdout_json_event_without_required_fields() {
+        let cases = [
+            (
+                "missing json_flag",
+                "`json_flag`",
+                r#"
+prompt_mode = "arg"
+
+[[providers]]
+command = "codex"
+args = ["exec"]
+
+[providers.session_capture]
+kind = "stdout_json_event"
+last_message_flag = "-o"
+event_type = "thread.started"
+event_id_path = "thread_id"
+"#,
+            ),
+            (
+                "missing last_message_flag",
+                "`last_message_flag`",
+                r#"
+prompt_mode = "arg"
+
+[[providers]]
+command = "codex"
+args = ["exec"]
+
+[providers.session_capture]
+kind = "stdout_json_event"
+json_flag = "--json"
+event_type = "thread.started"
+event_id_path = "thread_id"
+"#,
+            ),
+            (
+                "missing event_type",
+                "`event_type`",
+                r#"
+prompt_mode = "arg"
+
+[[providers]]
+command = "codex"
+args = ["exec"]
+
+[providers.session_capture]
+kind = "stdout_json_event"
+json_flag = "--json"
+last_message_flag = "-o"
+event_id_path = "thread_id"
+"#,
+            ),
+            (
+                "missing event_id_path",
+                "`event_id_path`",
+                r#"
+prompt_mode = "arg"
+
+[[providers]]
+command = "codex"
+args = ["exec"]
+
+[providers.session_capture]
+kind = "stdout_json_event"
+json_flag = "--json"
+last_message_flag = "-o"
+event_type = "thread.started"
+"#,
+            ),
+        ];
+        for (label, expected_substr, toml) in cases {
+            match ModelConfig::from_toml("test", toml) {
+                Ok(_) => panic!("{label}: expected validation failure, got Ok"),
+                Err(e) => assert!(
+                    e.contains(expected_substr),
+                    "{label}: error must mention {expected_substr}, got: {e}"
+                ),
+            }
+        }
+    }
+
     #[test]
     fn roundtrip_single_provider() {
         let original = r#"
@@ -593,6 +845,208 @@ args = ["exec", "-m", "gpt-5.3-codex"]
         assert_eq!(c1.providers.len(), c2.providers.len());
         assert_eq!(c1.providers[0].command, c2.providers[0].command);
         assert_eq!(c1.providers[1].command, c2.providers[1].command);
+    }
+
+    #[test]
+    fn parse_provider_with_forced_flag_verified_session_capture() {
+        let toml = r#"
+prompt_mode = "arg"
+
+[[providers]]
+command = "claude"
+args = ["-p"]
+
+[providers.session_capture]
+kind = "forced_flag_verified"
+flag = "--session-id"
+readback_args = ["--verbose", "--output-format", "stream-json"]
+"#;
+        let config = ModelConfig::from_toml("test", toml).unwrap();
+        let capture = config.providers[0].session_capture.as_ref().unwrap();
+
+        assert_eq!(capture.kind, SessionCaptureKind::ForcedFlagVerified);
+        assert_eq!(capture.flag.as_deref(), Some("--session-id"));
+        assert_eq!(
+            capture.readback_args.as_deref(),
+            Some(
+                [
+                    "--verbose".to_string(),
+                    "--output-format".to_string(),
+                    "stream-json".to_string(),
+                ]
+                .as_slice()
+            )
+        );
+        assert_eq!(capture.event_type, None);
+        assert_eq!(capture.event_id_path, None);
+    }
+
+    #[test]
+    fn parse_provider_with_stdout_json_event_session_capture() {
+        let toml = r#"
+prompt_mode = "arg"
+
+[[providers]]
+command = "codex"
+args = ["exec"]
+
+[providers.session_capture]
+kind = "stdout_json_event"
+json_flag = "--json"
+last_message_flag = "-o"
+event_type = "thread.started"
+event_id_path = "thread_id"
+"#;
+        let config = ModelConfig::from_toml("test", toml).unwrap();
+        let capture = config.providers[0].session_capture.as_ref().unwrap();
+
+        assert_eq!(capture.kind, SessionCaptureKind::StdoutJsonEvent);
+        assert_eq!(capture.json_flag.as_deref(), Some("--json"));
+        assert_eq!(capture.last_message_flag.as_deref(), Some("-o"));
+        assert_eq!(capture.event_type.as_deref(), Some("thread.started"));
+        assert_eq!(capture.event_id_path.as_deref(), Some("thread_id"));
+        assert_eq!(capture.flag, None);
+        assert_eq!(capture.readback_args, None);
+    }
+
+    #[test]
+    fn roundtrip_model_with_session_capture() {
+        let original = r#"
+prompt_mode = "arg"
+
+[[providers]]
+name = "codex-account"
+command = "codex"
+args = ["exec"]
+
+[providers.session_capture]
+kind = "stdout_json_event"
+json_flag = "--json"
+last_message_flag = "-o"
+event_type = "thread.started"
+event_id_path = "thread_id"
+"#;
+        let c1 = ModelConfig::from_toml("test", original).unwrap();
+        let c2 = ModelConfig::from_toml("test", &c1.to_toml()).unwrap();
+
+        assert_eq!(
+            c2.providers[0].session_capture.as_ref().unwrap().kind,
+            SessionCaptureKind::StdoutJsonEvent
+        );
+        assert_eq!(
+            c2.providers[0]
+                .session_capture
+                .as_ref()
+                .unwrap()
+                .event_type
+                .as_deref(),
+            Some("thread.started")
+        );
+        assert_eq!(
+            c2.providers[0]
+                .session_capture
+                .as_ref()
+                .unwrap()
+                .last_message_flag
+                .as_deref(),
+            Some("-o")
+        );
+    }
+
+    /// kind = "none" round-trip: parses cleanly, requires no extra
+    /// fields, validate() accepts it.
+    #[test]
+    fn parse_and_roundtrip_kind_none() {
+        let toml = r#"
+prompt_mode = "arg"
+
+[[providers]]
+command = "claude"
+args = ["-p"]
+
+[providers.session_capture]
+kind = "none"
+"#;
+        let c1 = ModelConfig::from_toml("test", toml).unwrap();
+        let capture = c1.providers[0].session_capture.as_ref().unwrap();
+        assert_eq!(capture.kind, SessionCaptureKind::None);
+        assert!(capture.flag.is_none());
+
+        let c2 = ModelConfig::from_toml("test", &c1.to_toml()).unwrap();
+        assert_eq!(
+            c2.providers[0].session_capture.as_ref().unwrap().kind,
+            SessionCaptureKind::None
+        );
+    }
+
+    /// Forced-flag round-trip — the existing tests only round-trip the
+    /// stdout_json_event variant. Cover the FFV variant explicitly.
+    #[test]
+    fn roundtrip_model_with_forced_flag_verified_session_capture() {
+        let original = r#"
+prompt_mode = "arg"
+
+[[providers]]
+name = "claude-account"
+command = "claude"
+args = ["-p"]
+
+[providers.session_capture]
+kind = "forced_flag_verified"
+flag = "--session-id"
+readback_args = ["--verbose", "--output-format", "stream-json"]
+"#;
+        let c1 = ModelConfig::from_toml("test", original).unwrap();
+        let c2 = ModelConfig::from_toml("test", &c1.to_toml()).unwrap();
+
+        let capture = c2.providers[0].session_capture.as_ref().unwrap();
+        assert_eq!(capture.kind, SessionCaptureKind::ForcedFlagVerified);
+        assert_eq!(capture.flag.as_deref(), Some("--session-id"));
+        assert_eq!(
+            capture.readback_args.as_deref(),
+            Some(
+                &[
+                    "--verbose".to_string(),
+                    "--output-format".to_string(),
+                    "stream-json".to_string()
+                ][..]
+            )
+        );
+    }
+
+    /// Unknown `kind` must be rejected — protects against typos like
+    /// `forced_flag` or `json_event` that would silently disable
+    /// capture if accepted as None.
+    #[test]
+    fn rejects_unknown_session_capture_kind() {
+        let toml = r#"
+prompt_mode = "arg"
+
+[[providers]]
+command = "claude"
+args = ["-p"]
+
+[providers.session_capture]
+kind = "magic_capture"
+flag = "--session-id"
+"#;
+        assert!(
+            ModelConfig::from_toml("test", toml).is_err(),
+            "unknown session_capture.kind must be rejected"
+        );
+    }
+
+    /// Provider without a `session_capture` block has `None` — the
+    /// behavior `pr-a` callers depend on for the no-capture path.
+    #[test]
+    fn absent_session_capture_is_none() {
+        let toml = r#"
+command = "claude"
+args = ["-p"]
+"#;
+        let cfg = ModelConfig::from_toml("test", toml).unwrap();
+        assert_eq!(cfg.providers.len(), 1);
+        assert!(cfg.providers[0].session_capture.is_none());
     }
 
     #[test]

@@ -139,18 +139,60 @@ fn resolve_state_dir(provider_name: &str, entry: &SessionSourceEntry) -> PathBuf
 }
 
 fn run_turn_script(script: &str, state_dir: &std::path::Path) -> Result<String, String> {
+    run_session_script(script, state_dir, None, "turn script")
+}
+
+pub fn locate_transcript(
+    sessions_cfg: &SessionsConfig,
+    provider_name: &str,
+    session_id: &str,
+) -> Result<Option<PathBuf>, String> {
+    let Some(entry) = sessions_cfg.get(provider_name) else {
+        return Ok(None);
+    };
+    let Some(locator) = entry.transcript_locator.as_deref() else {
+        return Ok(None);
+    };
+
+    let state_dir = resolve_state_dir(provider_name, entry);
+    std::fs::create_dir_all(&state_dir)
+        .map_err(|e| format!("could not create state_dir {}: {e}", state_dir.display()))?;
+
+    let stdout = run_session_script(locator, &state_dir, Some(session_id), "transcript locator")?;
+    let lines = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+
+    match lines.as_slice() {
+        [] => Err("transcript locator returned empty stdout".to_string()),
+        [line] => Ok(Some(PathBuf::from(line))),
+        _ => Err("transcript locator stdout was not a single line".to_string()),
+    }
+}
+
+fn run_session_script(
+    script: &str,
+    state_dir: &std::path::Path,
+    session_id: Option<&str>,
+    script_kind: &str,
+) -> Result<String, String> {
     use std::io::Read;
 
     let mut cmd = Command::new("sh");
     cmd.arg("-c").arg(script);
     cmd.env("STATE_DIR", state_dir);
+    if let Some(session_id) = session_id {
+        cmd.env("SESSION_ID", session_id);
+    }
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("Failed to spawn turn script: {e}"))?;
+        .map_err(|e| format!("Failed to spawn {script_kind}: {e}"))?;
 
     // Drain stdout/stderr concurrently. A naive `try_wait` loop deadlocks
     // for scripts that produce more than ~64KB on stdout: the kernel pipe
@@ -179,12 +221,18 @@ fn run_turn_script(script: &str, state_dir: &std::path::Path) -> Result<String, 
                 if start.elapsed() >= timeout {
                     let _ = child.kill();
                     return Err(format!(
-                        "Turn script timed out after {SCRIPT_TIMEOUT_SECS}s"
+                        "{} timed out after {SCRIPT_TIMEOUT_SECS}s",
+                        capitalize_script_kind(script_kind)
                     ));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            Err(e) => return Err(format!("Turn script wait failed: {e}")),
+            Err(e) => {
+                return Err(format!(
+                    "{} wait failed: {e}",
+                    capitalize_script_kind(script_kind)
+                ));
+            }
         }
     };
 
@@ -193,12 +241,21 @@ fn run_turn_script(script: &str, state_dir: &std::path::Path) -> Result<String, 
 
     if !status.success() {
         return Err(format!(
-            "Turn script exited {}: {}",
+            "{} exited {}: {}",
+            capitalize_script_kind(script_kind),
             status.code().unwrap_or(-1),
             stderr_text.trim()
         ));
     }
     Ok(stdout_text)
+}
+
+fn capitalize_script_kind(kind: &str) -> String {
+    let mut chars = kind.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => kind.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -235,7 +292,25 @@ mod tests {
             provider.to_string(),
             SessionSourceEntry {
                 turn_script: script_path.to_string_lossy().into_owned(),
+                transcript_locator: None,
                 state_dir: None,
+            },
+        );
+        SessionsConfig { entries }
+    }
+
+    fn cfg_with_locator(
+        provider: &str,
+        locator_path: &std::path::Path,
+        state_dir: Option<std::path::PathBuf>,
+    ) -> SessionsConfig {
+        let mut entries = HashMap::new();
+        entries.insert(
+            provider.to_string(),
+            SessionSourceEntry {
+                turn_script: "true".to_string(),
+                transcript_locator: Some(locator_path.to_string_lossy().into_owned()),
+                state_dir,
             },
         );
         SessionsConfig { entries }
@@ -314,6 +389,7 @@ echo "STATE_DIR=$STATE_DIR" > "$STATE_DIR/marker.txt""#,
             "p".to_string(),
             SessionSourceEntry {
                 turn_script: script.path.to_string_lossy().into_owned(),
+                transcript_locator: None,
                 state_dir: Some(tempdir.path().to_path_buf()),
             },
         );
@@ -323,5 +399,63 @@ echo "STATE_DIR=$STATE_DIR" > "$STATE_DIR/marker.txt""#,
         assert_eq!(r.new_turns, 1);
         let marker = std::fs::read_to_string(tempdir.path().join("marker.txt")).unwrap();
         assert!(marker.contains(tempdir.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn locate_transcript_returns_none_when_no_locator_is_configured() {
+        let cfg = cfg_with("p", std::path::Path::new("/bin/true"));
+
+        let path = locate_transcript(&cfg, "p", "session-123").unwrap();
+
+        assert_eq!(path, None);
+    }
+
+    #[test]
+    fn locate_transcript_returns_script_stdout_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("session.jsonl");
+        std::fs::write(&transcript, "{\"type\":\"system\"}\n").unwrap();
+        let script = fixture_script(&format!(
+            r#"printf '%s\n' "$SESSION_ID" > "$STATE_DIR/seen-session.txt"
+printf '%s\n' "{}""#,
+            transcript.display()
+        ));
+        let cfg = cfg_with_locator("p", &script.path, Some(dir.path().join("state")));
+
+        let path = locate_transcript(&cfg, "p", "session-123")
+            .unwrap()
+            .expect("locator should return a path");
+
+        assert_eq!(path, transcript);
+        let seen =
+            std::fs::read_to_string(dir.path().join("state").join("seen-session.txt")).unwrap();
+        assert_eq!(seen.trim(), "session-123");
+    }
+
+    #[test]
+    fn locate_transcript_returns_error_on_nonzero_exit() {
+        let script = fixture_script("echo missing >&2; exit 9");
+        let cfg = cfg_with_locator("p", &script.path, None);
+
+        let err = locate_transcript(&cfg, "p", "session-123").unwrap_err();
+
+        assert!(err.contains("exited 9"), "{err}");
+    }
+
+    /// Per contract: a locator that exits 0 but emits nothing on stdout
+    /// is malformed (the script's contract requires a single line). The
+    /// runner must surface this as Err so trace can show the user a
+    /// degraded state, not silently succeed with an empty PathBuf.
+    #[test]
+    fn locate_transcript_returns_error_on_empty_stdout() {
+        let script = fixture_script("# emit nothing; exit 0");
+        let cfg = cfg_with_locator("p", &script.path, None);
+
+        let err = locate_transcript(&cfg, "p", "session-123").unwrap_err();
+
+        assert!(
+            err.to_lowercase().contains("empty") || err.to_lowercase().contains("no path"),
+            "expected 'empty' or 'no path' in error, got: {err}"
+        );
     }
 }

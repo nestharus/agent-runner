@@ -5,7 +5,7 @@ use agent_runner_lib::config::{
 use agent_runner_lib::diagnostics;
 use agent_runner_lib::executor;
 use agent_runner_lib::state::{CompositeInvocationId, InvocationStart, StateDb};
-use agent_runner_lib::trace::{TraceOptions, render_ascii_trace, trace_invocation};
+use agent_runner_lib::trace::{TraceOptions, render_ascii_trace, trace_invocation_with_sessions};
 
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
@@ -258,14 +258,26 @@ fn run(cli: Cli) -> Result<i32, String> {
 
 fn run_trace_command(options: TraceOptions, invocation_uuid: &str) -> Result<i32, String> {
     let state = StateDb::open_default()?;
-    let report = match trace_invocation(&state, invocation_uuid, options) {
-        Ok(report) => report,
-        Err(err) if err.starts_with("Invocation not found:") => {
-            eprintln!("{err}");
-            return Ok(1);
-        }
-        Err(err) => return Err(err),
-    };
+    let config_root = dirs::config_dir()
+        .map(|d| d.join("oulipoly-agent-runner"))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let sessions_path = config_root.join("sessions.toml");
+    // Per V10 (failures observable, never silent): a malformed
+    // sessions.toml must surface as an error, not silently degrade
+    // every transcript_state to "no_locator". An ABSENT file is fine
+    // — `SessionsConfig::load` returns an empty config in that case.
+    let sessions_cfg = agent_runner_lib::config::SessionsConfig::load(&sessions_path)
+        .map_err(|e| format!("Failed to load {}: {e}", sessions_path.display()))?;
+    let report =
+        match trace_invocation_with_sessions(&state, invocation_uuid, options, Some(&sessions_cfg))
+        {
+            Ok(report) => report,
+            Err(err) if err.starts_with("Invocation not found:") => {
+                eprintln!("{err}");
+                return Ok(1);
+            }
+            Err(err) => return Err(err),
+        };
 
     if options.json {
         let json = serde_json::to_string_pretty(&report)
@@ -367,6 +379,18 @@ fn run_with_balancing(
             return Err(err);
         }
     };
+
+    if let executor::SessionCaptureMethod::Failed(reason) = &result.session_capture.method {
+        eprintln!("[session-capture] {reason}");
+    }
+
+    state
+        .update_session_capture(
+            invocation_row_id,
+            result.session_capture.session_id.as_deref(),
+            result.session_capture.method.db_value(),
+        )
+        .unwrap_or_else(|e| eprintln!("Warning: Failed to update session capture: {e}"));
 
     let success = result.exit_code == 0;
 

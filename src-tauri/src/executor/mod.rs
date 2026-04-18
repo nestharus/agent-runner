@@ -10,6 +10,32 @@ pub struct ExecutionResult {
     pub stderr: String,
     pub exit_code: i32,
     pub provider_index: usize,
+    pub session_capture: SessionCaptureResult,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionCaptureResult {
+    pub session_id: Option<String>,
+    pub method: SessionCaptureMethod,
+}
+
+#[derive(Debug, Clone)]
+pub enum SessionCaptureMethod {
+    None,
+    ForcedFlagVerified,
+    StdoutJsonEvent,
+    Failed(String),
+}
+
+impl SessionCaptureMethod {
+    pub fn db_value(&self) -> &'static str {
+        match self {
+            SessionCaptureMethod::None => "none",
+            SessionCaptureMethod::ForcedFlagVerified => "forced_flag_verified",
+            SessionCaptureMethod::StdoutJsonEvent => "stdout_json_event",
+            SessionCaptureMethod::Failed(_) => "failed",
+        }
+    }
 }
 
 pub use cli::provider_name;

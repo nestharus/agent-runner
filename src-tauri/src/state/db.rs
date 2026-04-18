@@ -85,6 +85,8 @@ pub struct InvocationRecord {
     pub success: Option<bool>,
     pub exit_code: Option<i32>,
     pub error_category: Option<String>,
+    pub session_id: Option<String>,
+    pub session_capture_method: Option<String>,
     pub created_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
 }
@@ -458,6 +460,20 @@ impl StateDb {
         }
 
         if columns.iter().any(|column| column == "invocation_uuid") {
+            if !columns.iter().any(|column| column == "session_id") {
+                conn.execute("ALTER TABLE invocations ADD COLUMN session_id TEXT", [])
+                    .map_err(|e| format!("Failed to add invocations.session_id: {e}"))?;
+            }
+            if !columns
+                .iter()
+                .any(|column| column == "session_capture_method")
+            {
+                conn.execute(
+                    "ALTER TABLE invocations ADD COLUMN session_capture_method TEXT",
+                    [],
+                )
+                .map_err(|e| format!("Failed to add invocations.session_capture_method: {e}"))?;
+            }
             conn.execute_batch(Self::invocations_index_sql())
                 .map_err(|e| format!("Failed to ensure invocation indexes: {e}"))?;
             return Ok(());
@@ -493,6 +509,8 @@ impl StateDb {
             success INTEGER,
             exit_code INTEGER,
             error_category TEXT,
+            session_id TEXT,
+            session_capture_method TEXT,
             created_at TEXT NOT NULL,
             finished_at TEXT
         );
@@ -502,7 +520,10 @@ impl StateDb {
         CREATE INDEX IF NOT EXISTS idx_invocations_parent
             ON invocations (parent_invocation_id, created_at);
         CREATE INDEX IF NOT EXISTS idx_invocations_provider_created
-            ON invocations (provider_name, created_at);"
+            ON invocations (provider_name, created_at);
+        CREATE INDEX IF NOT EXISTS idx_invocations_provider_session
+            ON invocations (provider_name, session_id)
+            WHERE session_id IS NOT NULL;"
     }
 
     fn invocations_index_sql() -> &'static str {
@@ -511,7 +532,10 @@ impl StateDb {
         CREATE INDEX IF NOT EXISTS idx_invocations_parent
             ON invocations (parent_invocation_id, created_at);
         CREATE INDEX IF NOT EXISTS idx_invocations_provider_created
-            ON invocations (provider_name, created_at);"
+            ON invocations (provider_name, created_at);
+        CREATE INDEX IF NOT EXISTS idx_invocations_provider_session
+            ON invocations (provider_name, session_id)
+            WHERE session_id IS NOT NULL;"
     }
 
     fn migrate_legacy_invocations(conn: &Connection) -> Result<(), String> {
@@ -568,6 +592,8 @@ impl StateDb {
                 success INTEGER,
                 exit_code INTEGER,
                 error_category TEXT,
+                session_id TEXT,
+                session_capture_method TEXT,
                 created_at TEXT NOT NULL,
                 finished_at TEXT
             );",
@@ -587,9 +613,11 @@ impl StateDb {
                         success,
                         exit_code,
                         error_category,
+                        session_id,
+                        session_capture_method,
                         created_at,
                         finished_at
-                     ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, ?9, ?9)",
+                     ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, NULL, NULL, ?9, ?9)",
                 )
                 .map_err(|e| format!("Failed to prepare migrated invocation insert: {e}"))?;
 
@@ -785,13 +813,41 @@ impl StateDb {
             .map_err(|e| format!("Failed to commit invocation finalize tx: {e}"))
     }
 
+    /// Update an invocation row's session correlation columns. Per
+    /// `tmp/01-pr-c-contract.md` §"DB method additions", this method
+    /// takes `method` as a `&str` so the DB layer stays decoupled from
+    /// `SessionCaptureMethod` (an executor-internal type).
+    ///
+    /// Always writes both columns. Per V10 (failures observable, never
+    /// silent), a completed invocation with no capture attempted
+    /// records `("None", "none")` explicitly — that's a positive
+    /// signal distinct from NULL (the row was never finalized). The
+    /// last call wins, which matches the multi-call safety semantics.
+    pub fn update_session_capture(
+        &self,
+        id: i64,
+        session_id: Option<&str>,
+        method: &str,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE invocations
+                 SET session_id = ?1,
+                     session_capture_method = ?2
+                 WHERE id = ?3",
+                params![session_id, method, id],
+            )
+            .map_err(|e| format!("Failed to update session capture for invocation {id}: {e}"))?;
+        Ok(())
+    }
+
     pub fn get_invocation_by_uuid(&self, uuid: &str) -> Result<Option<InvocationRecord>, String> {
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT id, invocation_uuid, model_name, provider_name, provider_index,
                         parent_invocation_id, status, success, exit_code, error_category,
-                        created_at, finished_at
+                        session_id, session_capture_method, created_at, finished_at
                  FROM invocations
                  WHERE invocation_uuid = ?1",
             )
@@ -814,7 +870,7 @@ impl StateDb {
             .prepare(
                 "SELECT id, invocation_uuid, model_name, provider_name, provider_index,
                         parent_invocation_id, status, success, exit_code, error_category,
-                        created_at, finished_at
+                        session_id, session_capture_method, created_at, finished_at
                  FROM invocations
                  WHERE parent_invocation_id = ?1
                  ORDER BY created_at, id",
@@ -830,14 +886,14 @@ impl StateDb {
     }
 
     fn map_invocation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<InvocationRecord> {
-        let created_at_raw: String = row.get(10)?;
-        let finished_at_raw: Option<String> = row.get(11)?;
+        let created_at_raw: String = row.get(12)?;
+        let finished_at_raw: Option<String> = row.get(13)?;
         let status_raw: String = row.get(6)?;
         let created_at = DateTime::parse_from_rfc3339(&created_at_raw)
             .map(|dt| dt.with_timezone(&Utc))
             .map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    10,
+                    12,
                     rusqlite::types::Type::Text,
                     Box::new(e),
                 )
@@ -848,7 +904,7 @@ impl StateDb {
                     .map(|dt| dt.with_timezone(&Utc))
                     .map_err(|e| {
                         rusqlite::Error::FromSqlConversionFailure(
-                            11,
+                            13,
                             rusqlite::types::Type::Text,
                             Box::new(e),
                         )
@@ -874,6 +930,8 @@ impl StateDb {
             success: row.get::<_, Option<i64>>(7)?.map(|value| value != 0),
             exit_code: row.get(8)?,
             error_category: row.get(9)?,
+            session_id: row.get(10)?,
+            session_capture_method: row.get(11)?,
             created_at,
             finished_at,
         })
@@ -1767,6 +1825,8 @@ mod tests {
         ));
         assert!(sql.contains("success INTEGER"));
         assert!(sql.contains("finished_at TEXT"));
+        assert!(sql.contains("session_id TEXT"));
+        assert!(sql.contains("session_capture_method TEXT"));
 
         let indexes: Vec<String> = db
             .conn
@@ -1781,6 +1841,7 @@ mod tests {
             vec![
                 "idx_invocations_parent".to_string(),
                 "idx_invocations_provider_created".to_string(),
+                "idx_invocations_provider_session".to_string(),
                 "idx_invocations_uuid".to_string(),
                 "sqlite_autoindex_invocations_1".to_string(),
             ]
@@ -2138,6 +2199,140 @@ command = "fixture"
 
         let err = db.finalize_invocation(id, true, 0, None, None).unwrap_err();
         assert!(err.contains("already"));
+    }
+
+    #[test]
+    fn update_session_capture_persists_verified_session_id_and_method() {
+        let db = test_db();
+        let start = InvocationStart {
+            invocation_uuid: Uuid::new_v4().to_string(),
+            model_name: "test-model".to_string(),
+            provider_name: "fixture-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        };
+        let id = db.start_invocation(&start).unwrap();
+
+        db.update_session_capture(
+            id,
+            Some("5169694d-de0f-40d1-890c-6e28e55bab27"),
+            "forced_flag_verified",
+        )
+        .unwrap();
+
+        let row = db
+            .get_invocation_by_uuid(&start.invocation_uuid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.session_id.as_deref(),
+            Some("5169694d-de0f-40d1-890c-6e28e55bab27")
+        );
+        assert_eq!(
+            row.session_capture_method.as_deref(),
+            Some("forced_flag_verified")
+        );
+    }
+
+    /// Per V10 (failures observable, never silent): a completed
+    /// invocation with no capture configured must persist `"none"`
+    /// explicitly so trace can distinguish "no capture attempted" from
+    /// "still running" (NULL). Calling
+    /// `update_session_capture(id, None, "none")` must write the
+    /// column, NOT no-op.
+    #[test]
+    fn update_session_capture_none_none_persists_none_marker() {
+        let db = test_db();
+        let start = InvocationStart {
+            invocation_uuid: Uuid::new_v4().to_string(),
+            model_name: "test-model".to_string(),
+            provider_name: "fixture-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        };
+        let id = db.start_invocation(&start).unwrap();
+
+        // Before any update: column is NULL (start_invocation doesn't set it).
+        let before = db
+            .get_invocation_by_uuid(&start.invocation_uuid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.session_capture_method, None);
+
+        db.update_session_capture(id, None, "none").unwrap();
+
+        let after = db
+            .get_invocation_by_uuid(&start.invocation_uuid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.session_id, None);
+        assert_eq!(
+            after.session_capture_method.as_deref(),
+            Some("none"),
+            "completed-no-capture rows must record 'none' explicitly per V10"
+        );
+    }
+
+    /// Per contract: update_session_capture is safe to call multiple
+    /// times (idempotency for retries). The latest call wins.
+    #[test]
+    fn update_session_capture_safe_to_call_multiple_times() {
+        let db = test_db();
+        let start = InvocationStart {
+            invocation_uuid: Uuid::new_v4().to_string(),
+            model_name: "test-model".to_string(),
+            provider_name: "fixture-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        };
+        let id = db.start_invocation(&start).unwrap();
+
+        db.update_session_capture(id, Some("first"), "forced_flag_verified")
+            .unwrap();
+        db.update_session_capture(id, Some("second"), "stdout_json_event")
+            .unwrap();
+        db.update_session_capture(id, Some("third"), "failed")
+            .unwrap();
+
+        let row = db
+            .get_invocation_by_uuid(&start.invocation_uuid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.session_id.as_deref(), Some("third"));
+        assert_eq!(row.session_capture_method.as_deref(), Some("failed"));
+    }
+
+    /// "Leaves others alone" — update_session_capture must NOT clobber
+    /// fields outside session_id/session_capture_method (e.g.
+    /// invocation_uuid, model_name, status).
+    #[test]
+    fn update_session_capture_leaves_other_columns_alone() {
+        let db = test_db();
+        let start = InvocationStart {
+            invocation_uuid: Uuid::new_v4().to_string(),
+            model_name: "specific-model".to_string(),
+            provider_name: "fixture-provider".to_string(),
+            provider_index: 7,
+            parent_invocation_id: None,
+        };
+        let id = db.start_invocation(&start).unwrap();
+        let before = db
+            .get_invocation_by_uuid(&start.invocation_uuid)
+            .unwrap()
+            .unwrap();
+
+        db.update_session_capture(id, Some("sid"), "forced_flag_verified")
+            .unwrap();
+
+        let after = db
+            .get_invocation_by_uuid(&start.invocation_uuid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.invocation_uuid, before.invocation_uuid);
+        assert_eq!(after.model_name, before.model_name);
+        assert_eq!(after.provider_index, before.provider_index);
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.created_at, before.created_at);
     }
 
     #[test]

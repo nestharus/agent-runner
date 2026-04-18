@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+exec python3 - "$@" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        print("usage: claude-code-locate-transcript BASE_DIR", file=sys.stderr)
+        return 2
+
+    session_id = os.environ.get("SESSION_ID")
+    if not session_id:
+        print("SESSION_ID is required", file=sys.stderr)
+        return 2
+
+    base = Path(sys.argv[1]).expanduser()
+
+    # Claude Code names transcript files exactly `<session_id>.jsonl`.
+    # Iterate every .jsonl and filter by exact stem match — passing
+    # session_id through rglob would treat glob metacharacters (`*`,
+    # `?`, `[`) as patterns, opening a path/glob injection vector.
+    #
+    # NOTE: each rglob call below is a generator with early-exit on
+    # match. On a real Claude projects tree (thousands of session
+    # files), the first pass typically returns on the first hit
+    # without walking the whole tree. Materializing into a cached
+    # list would force a complete walk before any match, regressing
+    # the common case. The double-iteration cost only applies in the
+    # rare fallback case where filename match misses.
+    target_filename = f"{session_id}.jsonl"
+    for path in base.rglob("*.jsonl"):
+        if path.name == target_filename:
+            print(path.resolve())
+            return 0
+
+    # Fallback: defensively scan and inspect content in case a Claude
+    # Code version uses a different file naming convention but still
+    # records sessionId inside.
+    for path in base.rglob("*.jsonl"):
+        if file_contains_session_id(path, session_id):
+            print(path.resolve())
+            return 0
+
+    print(f"session not found: {session_id}", file=sys.stderr)
+    return 1
+
+
+def file_contains_session_id(path: Path, session_id: str) -> bool:
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("sessionId") == session_id:
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PY

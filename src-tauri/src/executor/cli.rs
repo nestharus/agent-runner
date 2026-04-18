@@ -1,10 +1,13 @@
-use crate::config::{InputType, ModelConfig, PromptMode, ProviderConfig};
+use crate::config::{
+    InputType, ModelConfig, PromptMode, ProviderConfig, SessionCapture, SessionCaptureKind,
+};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use super::ExecutionResult;
+use super::{ExecutionResult, SessionCaptureMethod, SessionCaptureResult};
 
 const LARGE_PROMPT_THRESHOLD: usize = 100 * 1024; // 100KB
 
@@ -26,7 +29,7 @@ pub fn execute(
     // Resolve inputs to flag args
     let input_args = resolve_input_flags(model, extra_inputs)?;
 
-    let (result, temp_file) = execute_provider(
+    let (result, temp_files) = execute_provider(
         provider,
         model.prompt_mode,
         prompt,
@@ -34,7 +37,7 @@ pub fn execute(
         &input_args,
         parent_invocation_env,
     )?;
-    if let Some(path) = temp_file {
+    for path in temp_files {
         let _ = std::fs::remove_file(path);
     }
 
@@ -43,6 +46,7 @@ pub fn execute(
         stderr: result.stderr,
         exit_code: result.exit_code,
         provider_index,
+        session_capture: result.session_capture,
     })
 }
 
@@ -211,6 +215,7 @@ struct RawResult {
     stdout: Vec<u8>,
     stderr: String,
     exit_code: i32,
+    session_capture: SessionCaptureResult,
 }
 
 fn execute_provider(
@@ -220,7 +225,7 @@ fn execute_provider(
     working_dir: Option<&Path>,
     input_args: &[String],
     parent_invocation_env: Option<&str>,
-) -> Result<(RawResult, Option<PathBuf>), String> {
+) -> Result<(RawResult, Vec<PathBuf>), String> {
     let parts = shell_split(&provider.command);
     if parts.is_empty() {
         return Err("Empty command".to_string());
@@ -239,6 +244,12 @@ fn execute_provider(
         cmd.arg(arg);
     }
 
+    let (capture_plan, capture_args, capture_files) =
+        build_capture_plan(provider.session_capture.as_ref())?;
+    for arg in capture_args {
+        cmd.arg(arg);
+    }
+
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
     }
@@ -246,7 +257,7 @@ fn execute_provider(
         cmd.env("OULIPOLY_PARENT_INVOCATION", parent_invocation_env);
     }
 
-    let mut temp_path = None;
+    let mut temp_files = capture_files;
 
     match prompt_mode {
         PromptMode::Arg => {
@@ -257,7 +268,7 @@ fn execute_provider(
                 std::fs::write(&path, prompt)
                     .map_err(|e| format!("Failed to write temp prompt file: {e}"))?;
                 cmd.arg(format!("Follow the instructions in {filename}"));
-                temp_path = Some(path);
+                temp_files.push(path);
             } else {
                 cmd.arg(prompt);
             }
@@ -287,13 +298,201 @@ fn execute_provider(
         .wait_with_output()
         .map_err(|e| format!("Failed to wait for process: {e}"))?;
 
+    let capture_outcome = finalize_capture(&capture_plan, &output.stdout);
+    let stdout = maybe_restore_plain_stdout(&capture_plan, &capture_outcome, &output.stdout);
     let result = RawResult {
-        stdout: output.stdout,
+        stdout,
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         exit_code: output.status.code().unwrap_or(-1),
+        session_capture: capture_outcome,
     };
 
-    Ok((result, temp_path))
+    Ok((result, temp_files))
+}
+
+enum CapturePlan {
+    None,
+    ForcedFlagVerified {
+        requested_session_id: String,
+    },
+    StdoutJsonEvent {
+        event_type: String,
+        event_id_path: String,
+        last_message_path: PathBuf,
+    },
+}
+
+fn build_capture_plan(
+    capture: Option<&SessionCapture>,
+) -> Result<(CapturePlan, Vec<String>, Vec<PathBuf>), String> {
+    let Some(capture) = capture else {
+        return Ok((CapturePlan::None, Vec::new(), Vec::new()));
+    };
+
+    match capture.kind {
+        SessionCaptureKind::None => Ok((CapturePlan::None, Vec::new(), Vec::new())),
+        SessionCaptureKind::ForcedFlagVerified => {
+            let flag = capture
+                .flag
+                .clone()
+                .ok_or_else(|| "session_capture.flag is required".to_string())?;
+            let requested_session_id = uuid::Uuid::new_v4().to_string();
+            let mut args = vec![flag, requested_session_id.clone()];
+            if let Some(readback_args) = &capture.readback_args {
+                args.extend(readback_args.clone());
+            }
+            Ok((
+                CapturePlan::ForcedFlagVerified {
+                    requested_session_id,
+                },
+                args,
+                Vec::new(),
+            ))
+        }
+        SessionCaptureKind::StdoutJsonEvent => {
+            let json_flag = capture
+                .json_flag
+                .clone()
+                .ok_or_else(|| "session_capture.json_flag is required".to_string())?;
+            let last_message_flag = capture
+                .last_message_flag
+                .clone()
+                .ok_or_else(|| "session_capture.last_message_flag is required".to_string())?;
+            let event_type = capture
+                .event_type
+                .clone()
+                .ok_or_else(|| "session_capture.event_type is required".to_string())?;
+            let event_id_path = capture
+                .event_id_path
+                .clone()
+                .ok_or_else(|| "session_capture.event_id_path is required".to_string())?;
+            let last_message_path = std::env::temp_dir()
+                .join(format!("oulipoly-last-message-{}", uuid::Uuid::new_v4()));
+            Ok((
+                CapturePlan::StdoutJsonEvent {
+                    event_type,
+                    event_id_path,
+                    last_message_path: last_message_path.clone(),
+                },
+                vec![
+                    json_flag,
+                    last_message_flag,
+                    last_message_path.to_string_lossy().into_owned(),
+                ],
+                vec![last_message_path],
+            ))
+        }
+    }
+}
+
+fn finalize_capture(plan: &CapturePlan, stdout: &[u8]) -> SessionCaptureResult {
+    match plan {
+        CapturePlan::None => SessionCaptureResult {
+            session_id: None,
+            method: SessionCaptureMethod::None,
+        },
+        CapturePlan::ForcedFlagVerified {
+            requested_session_id,
+        } => match parse_forced_flag_verified_session_id(stdout) {
+            Ok(observed) if observed == *requested_session_id => SessionCaptureResult {
+                session_id: Some(requested_session_id.clone()),
+                method: SessionCaptureMethod::ForcedFlagVerified,
+            },
+            Ok(observed) => SessionCaptureResult {
+                session_id: None,
+                method: SessionCaptureMethod::Failed(format!(
+                    "readback mismatch: requested {requested_session_id}, observed {observed}"
+                )),
+            },
+            Err(err) => SessionCaptureResult {
+                session_id: None,
+                method: SessionCaptureMethod::Failed(err),
+            },
+        },
+        CapturePlan::StdoutJsonEvent {
+            event_type,
+            event_id_path,
+            ..
+        } => match parse_stdout_json_event_session_id(stdout, event_type, event_id_path) {
+            Ok(session_id) => SessionCaptureResult {
+                session_id: Some(session_id),
+                method: SessionCaptureMethod::StdoutJsonEvent,
+            },
+            Err(err) => SessionCaptureResult {
+                session_id: None,
+                method: SessionCaptureMethod::Failed(err),
+            },
+        },
+    }
+}
+
+fn maybe_restore_plain_stdout(
+    plan: &CapturePlan,
+    capture: &SessionCaptureResult,
+    stdout: &[u8],
+) -> Vec<u8> {
+    match plan {
+        CapturePlan::StdoutJsonEvent {
+            last_message_path, ..
+        } => match std::fs::read(last_message_path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                if matches!(capture.method, SessionCaptureMethod::StdoutJsonEvent) {
+                    eprintln!(
+                        "Warning: failed to read reconstructed last-message output {}: {err}",
+                        last_message_path.display()
+                    );
+                }
+                stdout.to_vec()
+            }
+        },
+        _ => stdout.to_vec(),
+    }
+}
+
+fn parse_forced_flag_verified_session_id(stdout: &[u8]) -> Result<String, String> {
+    for line in String::from_utf8_lossy(stdout).lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("system") {
+            continue;
+        }
+        if value.get("subtype").and_then(Value::as_str) != Some("init") {
+            continue;
+        }
+        return value
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| "system.init event missing session_id".to_string());
+    }
+    Err("stdout did not contain a system.init session_id event".to_string())
+}
+
+fn parse_stdout_json_event_session_id(
+    stdout: &[u8],
+    event_type: &str,
+    event_id_path: &str,
+) -> Result<String, String> {
+    for line in String::from_utf8_lossy(stdout).lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some(event_type) {
+            continue;
+        }
+        return lookup_json_path(&value, event_id_path)
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| format!("event '{event_type}' missing id path '{event_id_path}'"));
+    }
+    Err(format!("stdout did not contain event '{event_type}'"))
+}
+
+fn lookup_json_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
+    path.split('.')
+        .try_fold(value, |current, segment| current.get(segment))
 }
 
 pub fn shell_split(s: &str) -> Vec<String> {
@@ -328,7 +527,28 @@ pub fn provider_name(command: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{InputDef, InputType, ProviderConfig};
+    use crate::config::{InputDef, InputType, ProviderConfig, SessionCapture, SessionCaptureKind};
+    use crate::executor::{SessionCaptureMethod, SessionCaptureResult};
+    use std::os::unix::fs::PermissionsExt;
+
+    struct FixtureScript {
+        _dir: tempfile::TempDir,
+        path: PathBuf,
+    }
+
+    fn fixture_script(body: &str) -> FixtureScript {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixture-provider.sh");
+        std::fs::write(
+            &path,
+            format!("#!/usr/bin/env bash\nset -euo pipefail\n{body}\n"),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        FixtureScript { _dir: dir, path }
+    }
 
     #[test]
     fn shell_split_simple() {
@@ -500,6 +720,28 @@ mod tests {
         );
     }
 
+    /// Per contract: when a provider has no `session_capture` config,
+    /// execution proceeds normally and the SessionCaptureResult is
+    /// `(None, SessionCaptureMethod::None)` — confirming the dispatch
+    /// doesn't accidentally engage capture logic.
+    #[cfg(unix)]
+    #[test]
+    fn execute_without_session_capture_returns_none_capture_result() {
+        let model = ModelConfig {
+            name: "test".to_string(),
+            prompt_mode: PromptMode::Arg,
+            providers: vec![ProviderConfig::new("echo", vec![])],
+            inputs: vec![],
+        };
+        let result = execute(&model, 0, "no capture", None, &HashMap::new(), None).unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.session_capture.session_id, None);
+        assert!(matches!(
+            result.session_capture.method,
+            SessionCaptureMethod::None
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn execute_cat_stdin_mode() {
@@ -539,5 +781,270 @@ mod tests {
             String::from_utf8_lossy(&result.stdout).trim(),
             "--greet hello"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_claude_forced_flag_verified_happy_path_captures_requested_session_id() {
+        // Fixture script also writes its observed argv to a sidecar
+        // file so the test can prove the runner injected `--session-id`
+        // and the configured `readback_args` into the spawned command.
+        let argv_dump = tempfile::NamedTempFile::new().unwrap();
+        let argv_dump_path = argv_dump.path().to_path_buf();
+        let script = fixture_script(&format!(
+            r#"requested=""
+# Dump every arg seen by the script so the test can assert injection.
+printf '%s\n' "$@" > {dump}
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --session-id)
+      requested="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+printf '{{"type":"system","subtype":"init","session_id":"%s"}}\n' "$requested""#,
+            dump = argv_dump_path.display()
+        ));
+        let model = ModelConfig {
+            name: "claude-test".to_string(),
+            prompt_mode: PromptMode::Arg,
+            providers: vec![ProviderConfig {
+                name: "claude-fixture".to_string(),
+                command: script.path.to_string_lossy().into_owned(),
+                args: vec!["-p".to_string()],
+                session_capture: Some(SessionCapture {
+                    kind: SessionCaptureKind::ForcedFlagVerified,
+                    flag: Some("--session-id".to_string()),
+                    readback_args: Some(vec![
+                        "--verbose".to_string(),
+                        "--output-format".to_string(),
+                        "stream-json".to_string(),
+                    ]),
+                    event_type: None,
+                    event_id_path: None,
+                    json_flag: None,
+                    last_message_flag: None,
+                }),
+            }],
+            inputs: vec![],
+        };
+
+        let result = execute(&model, 0, "hello", None, &HashMap::new(), None).unwrap();
+        let capture: &SessionCaptureResult = &result.session_capture;
+        let stdout = String::from_utf8_lossy(&result.stdout);
+
+        assert_eq!(result.exit_code, 0);
+        assert!(stdout.contains("\"type\":\"system\""));
+        assert!(matches!(
+            capture.method,
+            SessionCaptureMethod::ForcedFlagVerified
+        ));
+
+        // Capture must have produced a session id...
+        let captured_id = capture
+            .session_id
+            .as_deref()
+            .expect("FFV happy path must populate session_id");
+
+        // ...and that captured id must equal the runner-supplied UUID
+        // that the script saw on argv (proves readback verification
+        // matched, not just "any session_id surfaced from the CLI").
+        let argv_seen = std::fs::read_to_string(&argv_dump_path).unwrap();
+        let argv_lines: Vec<&str> = argv_seen.lines().collect();
+        let session_id_idx = argv_lines
+            .iter()
+            .position(|a| *a == "--session-id")
+            .expect("--session-id must have been injected onto argv");
+        let injected_id = argv_lines
+            .get(session_id_idx + 1)
+            .expect("--session-id needs a value");
+        assert_eq!(
+            captured_id, *injected_id,
+            "captured id must equal the injected --session-id value"
+        );
+
+        // Per contract, readback_args must have been appended onto argv
+        // alongside the --session-id flag.
+        for required_readback in &["--verbose", "--output-format", "stream-json"] {
+            assert!(
+                argv_lines.iter().any(|a| a == required_readback),
+                "expected readback arg {required_readback:?} on argv, got: {argv_lines:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_claude_forced_flag_verified_mismatch_fails_closed() {
+        let script = fixture_script(
+            r#"while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --session-id)
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+printf '{"type":"system","subtype":"init","session_id":"11111111-1111-1111-1111-111111111111"}\n'"#,
+        );
+        let model = ModelConfig {
+            name: "claude-test".to_string(),
+            prompt_mode: PromptMode::Arg,
+            providers: vec![ProviderConfig {
+                name: "claude-fixture".to_string(),
+                command: script.path.to_string_lossy().into_owned(),
+                args: vec!["-p".to_string()],
+                session_capture: Some(SessionCapture {
+                    kind: SessionCaptureKind::ForcedFlagVerified,
+                    flag: Some("--session-id".to_string()),
+                    readback_args: Some(vec![
+                        "--verbose".to_string(),
+                        "--output-format".to_string(),
+                        "stream-json".to_string(),
+                    ]),
+                    event_type: None,
+                    event_id_path: None,
+                    json_flag: None,
+                    last_message_flag: None,
+                }),
+            }],
+            inputs: vec![],
+        };
+
+        let result = execute(&model, 0, "hello", None, &HashMap::new(), None).unwrap();
+
+        assert!(result.session_capture.session_id.is_none());
+        // Per contract: failure reason must be the canonical
+        // "readback mismatch: ..." text so trace can surface a
+        // consistent diagnostic to the user (V10).
+        match &result.session_capture.method {
+            SessionCaptureMethod::Failed(reason) => {
+                assert!(
+                    reason.contains("readback mismatch"),
+                    "expected 'readback mismatch' in failure reason, got: {reason}"
+                );
+            }
+            other => panic!("expected Failed(_), got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_codex_stdout_json_event_replays_last_message_file_to_stdout() {
+        let script = fixture_script(
+            r#"output_file=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o)
+      output_file="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+printf '{"type":"thread.started","thread_id":"thread-123"}\n'
+printf 'assistant text from tmpfile\n' > "$output_file""#,
+        );
+        let model = ModelConfig {
+            name: "codex-test".to_string(),
+            prompt_mode: PromptMode::Arg,
+            providers: vec![ProviderConfig {
+                name: "codex-fixture".to_string(),
+                command: script.path.to_string_lossy().into_owned(),
+                args: vec!["exec".to_string()],
+                session_capture: Some(SessionCapture {
+                    kind: SessionCaptureKind::StdoutJsonEvent,
+                    flag: None,
+                    readback_args: None,
+                    event_type: Some("thread.started".to_string()),
+                    event_id_path: Some("thread_id".to_string()),
+                    json_flag: Some("--json".to_string()),
+                    last_message_flag: Some("-o".to_string()),
+                }),
+            }],
+            inputs: vec![],
+        };
+
+        let result = execute(&model, 0, "hello", None, &HashMap::new(), None).unwrap();
+
+        assert_eq!(
+            String::from_utf8_lossy(&result.stdout),
+            "assistant text from tmpfile\n"
+        );
+        assert_eq!(
+            result.session_capture.session_id.as_deref(),
+            Some("thread-123")
+        );
+        assert!(matches!(
+            result.session_capture.method,
+            SessionCaptureMethod::StdoutJsonEvent
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_codex_stdout_json_event_without_thread_started_marks_capture_failed() {
+        let script = fixture_script(
+            r#"output_file=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o)
+      output_file="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+printf '{"type":"response.completed"}\n'
+printf 'assistant text from tmpfile\n' > "$output_file""#,
+        );
+        let model = ModelConfig {
+            name: "codex-test".to_string(),
+            prompt_mode: PromptMode::Arg,
+            providers: vec![ProviderConfig {
+                name: "codex-fixture".to_string(),
+                command: script.path.to_string_lossy().into_owned(),
+                args: vec!["exec".to_string()],
+                session_capture: Some(SessionCapture {
+                    kind: SessionCaptureKind::StdoutJsonEvent,
+                    flag: None,
+                    readback_args: None,
+                    event_type: Some("thread.started".to_string()),
+                    event_id_path: Some("thread_id".to_string()),
+                    json_flag: Some("--json".to_string()),
+                    last_message_flag: Some("-o".to_string()),
+                }),
+            }],
+            inputs: vec![],
+        };
+
+        let result = execute(&model, 0, "hello", None, &HashMap::new(), None).unwrap();
+
+        assert!(result.session_capture.session_id.is_none());
+        // Per contract: when the configured event_type doesn't appear
+        // in the JSON event stream, the failure reason must mention
+        // either the missing event type or "no event" so trace can
+        // surface a useful diagnostic (V10).
+        match &result.session_capture.method {
+            SessionCaptureMethod::Failed(reason) => {
+                assert!(
+                    reason.contains("thread.started")
+                        || reason.contains("event_type")
+                        || reason.to_lowercase().contains("no event"),
+                    "expected thread.started/event_type/'no event' in reason, got: {reason}"
+                );
+            }
+            other => panic!("expected Failed(_), got {other:?}"),
+        }
     }
 }

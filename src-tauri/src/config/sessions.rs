@@ -16,6 +16,9 @@ pub struct SessionSourceEntry {
     /// stdout, one line per turn:
     /// `{"session_id":"...","turn_id":"...","timestamp":"<ISO8601>","role":"user"|"assistant"}`
     pub turn_script: String,
+    /// Optional adapter that resolves a session id to the raw transcript path.
+    /// Same shell/env contract as `turn_script`, but stdout is a single path.
+    pub transcript_locator: Option<String>,
     /// Optional override for where the script keeps its bookkeeping. If
     /// unset, defaults to `<data_dir>/sessions/<provider_name>`.
     pub state_dir: Option<PathBuf>,
@@ -29,6 +32,8 @@ pub struct SessionsConfig {
 #[derive(Deserialize)]
 struct RawEntry {
     turn_script: String,
+    #[serde(default)]
+    transcript_locator: Option<String>,
     #[serde(default)]
     state_dir: Option<String>,
 }
@@ -50,6 +55,7 @@ impl SessionsConfig {
                     k,
                     SessionSourceEntry {
                         turn_script: v.turn_script,
+                        transcript_locator: v.transcript_locator,
                         state_dir: v.state_dir.map(|s| expand_tilde(&s)),
                     },
                 )
@@ -85,9 +91,11 @@ mod tests {
             r#"
 [claude]
 turn_script = "claude-code-turns ~/.claude/projects"
+transcript_locator = "claude-code-locate-transcript ~/.claude/projects"
 
 [codex]
 turn_script = "codex-turns ~/.codex/sessions"
+transcript_locator = "codex-locate-transcript ~/.codex/sessions"
 state_dir = "~/.cache/oulipoly/codex-cursor"
 "#
         )
@@ -100,6 +108,10 @@ state_dir = "~/.cache/oulipoly/codex-cursor"
                 .turn_script
                 .contains("claude-code-turns")
         );
+        assert_eq!(
+            cfg.get("claude").unwrap().transcript_locator.as_deref(),
+            Some("claude-code-locate-transcript ~/.claude/projects")
+        );
         assert!(cfg.get("claude").unwrap().state_dir.is_none());
         assert!(
             cfg.get("codex")
@@ -109,6 +121,10 @@ state_dir = "~/.cache/oulipoly/codex-cursor"
                 .unwrap()
                 .to_string_lossy()
                 .contains(".cache/oulipoly")
+        );
+        assert_eq!(
+            cfg.get("codex").unwrap().transcript_locator.as_deref(),
+            Some("codex-locate-transcript ~/.codex/sessions")
         );
     }
 
@@ -123,5 +139,26 @@ state_dir = "~/.cache/oulipoly/codex-cursor"
         let mut f = tempfile::NamedTempFile::new().unwrap();
         writeln!(f, "[claude]\nstate_dir = \"~/x\"\n").unwrap();
         assert!(SessionsConfig::load(f.path()).is_err());
+    }
+
+    /// `transcript_locator` is OPTIONAL — a valid SessionsConfig entry
+    /// without it must parse cleanly and present `transcript_locator =
+    /// None`. Trace then maps that to `transcript_state = "no_locator"`.
+    #[test]
+    fn entry_without_transcript_locator_is_valid() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            r#"
+[claude]
+turn_script = "claude-code-turns ~/.claude/projects"
+"#
+        )
+        .unwrap();
+        let cfg = SessionsConfig::load(f.path()).unwrap();
+        assert_eq!(cfg.entries.len(), 1);
+        let entry = cfg.get("claude").unwrap();
+        assert!(entry.transcript_locator.is_none());
+        assert!(entry.state_dir.is_none());
     }
 }
