@@ -511,6 +511,17 @@ mod tests {
             )
             .unwrap();
         }
+
+        fn set_exit_status(&self, row_id: i64, status: &str, success: bool, exit_code: i32) {
+            let conn = Connection::open(&self.db_path).unwrap();
+            conn.execute(
+                "UPDATE invocations
+                 SET status = ?1, success = ?2, exit_code = ?3
+                 WHERE id = ?4",
+                params![status, success, exit_code, row_id],
+            )
+            .unwrap();
+        }
     }
 
     fn env_lock() -> &'static Mutex<()> {
@@ -1274,6 +1285,34 @@ transcript_locator = "{}"
         assert!(
             ascii.contains("Resume target: 5169694d-de0f-40d1-890c-6e28e55bab27"),
             "{ascii}"
+        );
+    }
+
+    #[test]
+    fn resumed_session_warning_persists_when_invocation_exited_nonzero() {
+        // Per PR-F contract §test-contract item 9: trace must surface the
+        // attempted-resume warning specifically when the invocation row
+        // shows the child failed to attach (non-zero exit). Verifies
+        // build_trace_session does NOT short-circuit the resume warning
+        // based on success/exit_code.
+        let fixture = TraceFixture::new(&base_rows());
+        fixture.set_session_capture(
+            1,
+            Some("5169694d-de0f-40d1-890c-6e28e55bab27"),
+            Some("resumed"),
+        );
+        fixture.set_exit_status(1, "failed", false, 7);
+
+        let report = trace_invocation(&fixture.db(), ROOT_UUID, trace_options(64)).unwrap();
+
+        assert!(
+            report
+                .root
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("attempted resume target")),
+            "{:?}",
+            report.root.warnings
         );
     }
 

@@ -411,6 +411,56 @@ flag = "--resume"
 }
 
 #[test]
+fn resume_codex_subcommand_happy_path_executes_and_records_provenance() {
+    // Per PR-F contract §test-contract item 6 + proposal §11 followup:
+    // end-to-end runtime verification that kind = "subcommand" composition
+    // actually launches and records resumed provenance, not just argv
+    // assembly. Mirrors the Claude (kind = "flag") happy-path test but
+    // exercises the Codex composition shape under a full repl --resume
+    // lifecycle.
+    let fixture = Fixture::new();
+    let session_id = "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22";
+    // Fixture script accepts the appended `resume <UUID>` argv shape and
+    // exits cleanly; this proves the runner composed the subcommand
+    // strategy correctly through to spawn.
+    // The fixture model declares `interactive_args = ["launch"]`, so the
+    // composed argv is `["launch", "resume", "<UUID>"]`: `$1` is the
+    // interactive_args token and `$2`/`$3` are the resume strategy
+    // composition. Asserting both halves proves the runner appended the
+    // strategy after interactive_args, not the other way around.
+    let script = fixture.write_script(
+        "codex.sh",
+        r#"if [ "$1" = "launch" ] && [ "$2" = "resume" ] && [ -n "$3" ]; then exit 0; else exit 99; fi"#,
+    );
+    fixture.write_single_provider_model(
+        "codex-high",
+        "codex",
+        &script,
+        r#"
+[providers.resume]
+kind = "subcommand"
+subcommand = ["resume"]
+"#,
+    );
+    fixture.seed_session_turns("codex", session_id, &[("turn-1", "2026-04-17T08:00:00Z")]);
+
+    let output = fixture.run_repl("codex-high", Some(session_id));
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("[resume] -> codex"), "{stderr}");
+
+    let invocation = parse_invocation(&stderr);
+    let row = fixture
+        .open_db()
+        .get_invocation_by_uuid(&invocation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.session_id.as_deref(), Some(session_id));
+    assert_eq!(row.session_capture_method.as_deref(), Some("resumed"));
+}
+
+#[test]
 fn repl_without_resume_records_none_capture_method_regression() {
     let fixture = Fixture::new();
     let script = fixture.write_script("claude.sh", "exit 0");
