@@ -123,6 +123,14 @@ Options:
       --models-dir <MODELS_DIR>  Override models directory
       --agents-dir <AGENTS_DIR>  Override agents directory
   -h, --help                     Print help
+
+Subcommands:
+  trace <invocation_uuid> [--json] [--transcript] [--max-depth N]
+        Walk a recorded invocation tree (see Inspecting a Run)
+
+  repl <model> [--resume <session-id>] [-p <project>] [--models-dir <path>]
+        Launch a balanced interactive session of the wrapped CLI
+        (see Interactive REPL)
 ```
 
 **Prompt resolution priority:** `--file` > positional arguments > stdin
@@ -167,6 +175,26 @@ oulipoly-agent-runner -m seedream-i2i -i image=input.png "Make it warmer" > edit
 oulipoly-agent-runner -m seedream-t2i "A cat painting" > cat.jpeg
 oulipoly-agent-runner -m seedance-i2v-low -i image=cat.jpeg "The cat blinks slowly" > cat.mp4
 ```
+
+## Interactive REPL
+
+`oulipoly-agent-runner repl <model>` launches the wrapped CLI as an interactive session through the load balancer instead of as a one-shot. Stdin / stdout / stderr are inherited (TTY pass-through), so terminal-generated `Ctrl+C` reaches the child directly. The runner stays alive only long enough to reap and finalize the invocation row.
+
+```bash
+# Launch a balanced Claude REPL
+oulipoly-agent-runner repl claude-opus
+
+# Resume a specific session by full UUID — picks the right provider
+# automatically, regardless of which account owns the session
+oulipoly-agent-runner repl claude-opus --resume 9e69e8cc-616d-4640-bf1d-96f5391b1a2e
+
+# Codex resume composes via subcommand instead of a flag, transparently
+oulipoly-agent-runner repl codex-high --resume 5169694d-de0f-40d1-890c-6e28e55bab27
+```
+
+Each `repl` invocation requires the resolved provider to declare `interactive_args` (the argv shape used for interactive launch — distinct from `args`, which encodes one-shot mode like Claude `-p` or Codex `exec`). With `--resume`, the resolved provider must additionally declare a `[providers.resume]` block; see [Resuming a session](#resuming-a-session) below.
+
+On Unix, signal handling forwards `SIGTERM` once and lets `SIGINT` / `SIGHUP` reach the child through the foreground process group. Windows console-control handling is not implemented yet.
 
 ## Load Balancing
 
@@ -368,6 +396,59 @@ event_id_path     = "thread_id"
 ```
 
 Without `session_capture`, invocations record `session_capture_method = "none"` and `trace` shows `transcript_state = "unresolved"` — clean degradation, no breakage.
+
+### Resuming a session
+
+When a provider declares a `[providers.resume]` block, `repl --resume <UUID>` looks the session up across all providers (via the `session_turns` ingest table), validates that the owning provider belongs to the requested model's provider pool, and composes the right resume argv:
+
+```toml
+# Claude: --resume <UUID> as a flag on the existing interactive launch
+[[providers]]
+name = "claude2"
+command = "env"
+args             = ["-u", "CLAUDECODE", "claude2", "-p", "--model", "opus", "--dangerously-skip-permissions"]
+interactive_args = ["-u", "CLAUDECODE", "claude2", "--model", "opus", "--dangerously-skip-permissions"]
+
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+```
+
+```toml
+# Codex: resume <UUID> as a subcommand appended after interactive_args
+[[providers]]
+name = "codex"
+command = "codex"
+args             = ["exec", "--dangerously-bypass-approvals-and-sandbox", "-m", "gpt-5.4"]
+interactive_args = ["--dangerously-bypass-approvals-and-sandbox", "-m", "gpt-5.4"]
+
+[providers.resume]
+kind = "subcommand"
+subcommand = ["resume"]
+```
+
+The runner always emits a short selection line on stderr regardless of TTY:
+
+```
+[resume] -> claude2
+```
+
+When a session id matched multiple providers (rare; requires cross-provider session id collisions in the ingest table), a longer detail line lists all matches but only when stderr is **not** a TTY:
+
+```
+[resume] session 9e69e8cc-... matched claude2, claude3; selected claude2 by latest turn timestamp
+```
+
+Resume failures all exit `1` with a specific stderr message:
+
+- **No session found** — the UUID is not in `session_turns` (typically: session ingestion isn't configured, or the provider's local store has dropped the session)
+- **Invalid session UUID** — the input wasn't a valid full UUID (no prefix matching)
+- **Provider/model mismatch** — the resolved provider is not in the requested model's provider pool. The error suggests other models that include the resolved provider, e.g. `Try a model that includes claude2: claude-opus, claude-sonnet`.
+- **Provider has no `[providers.resume]` block** — the resolved provider exists in the model's pool but doesn't declare a resume strategy.
+
+The invocation row records `session_capture_method = "resumed"` and the user-supplied `session_id` *before* spawn. This means `trace` can show what session the runner attempted to resume even if the wrapped CLI rejects the id (e.g. "No conversation found"). Trace renders the session as `Resume target: <UUID>` instead of `Session: <UUID>` to make this distinction explicit, and adds a warning: `session marked as attempted resume target; child acceptance is not confirmed by this row — check exit_code and recent_errors for outcome`.
+
+Plain `repl <model>` (no `--resume`) records `session_capture_method = "none"`; the proposal explicitly does not invent a fresh-session capture mechanism for interactive launches.
 
 ### Inspecting via SQL
 

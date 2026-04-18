@@ -180,6 +180,14 @@ Without `[providers.session_capture]`, the column records `"none"` and
 trace shows `transcript_state = "unresolved"` — graceful degradation
 again, no breakage.
 
+`session_capture` is the **fresh-session** capture mechanism for one-shot
+runs. It is intentionally bypassed by `oulipoly-agent-runner repl --resume
+<UUID>`: the user has already supplied the session id explicitly, so the
+runner records `session_capture_method = "resumed"` directly and never
+runs the capture parser. See the README's "Resuming a session" section
+for the parallel `[providers.resume]` declaration that controls how
+the user-supplied UUID is composed onto the wrapped CLI's argv.
+
 ## Quota scripts (`providers.toml`)
 
 A **quota script** emits multi-window quota data on stdout:
