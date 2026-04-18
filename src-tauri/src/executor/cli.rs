@@ -660,6 +660,7 @@ mod tests {
     use super::*;
     use crate::config::{InputDef, InputType, ProviderConfig, SessionCapture, SessionCaptureKind};
     use crate::executor::{SessionCaptureMethod, SessionCaptureResult};
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     struct FixtureScript {
