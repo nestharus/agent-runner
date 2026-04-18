@@ -4,13 +4,14 @@ use agent_runner_lib::config::{
 };
 use agent_runner_lib::diagnostics;
 use agent_runner_lib::executor;
-use agent_runner_lib::state::StateDb;
+use agent_runner_lib::state::{CompositeInvocationId, InvocationStart, StateDb};
 
 use clap::Parser;
 use std::collections::HashMap;
 use std::io::{IsTerminal, Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use uuid::Uuid;
 
 #[derive(Parser)]
 #[command(
@@ -252,9 +253,45 @@ fn run_with_balancing(
         sessions_cfg: &sessions_cfg,
         in_flight: &in_flight,
     };
+    // Resolve parent invocation BEFORE provider selection so the provider
+    // selection itself can be attributed to a parent context if needed
+    // (matches contract `tmp/01-pr-a-contract.md` lifecycle ordering).
+    let parent_invocation_id = resolve_parent_invocation_id(&state);
     let provider_index = balancer::select_provider(model, &state, Some(&ctx));
-    let result =
-        executor::execute_with_inputs(model, provider_index, prompt, working_dir, extra_inputs)?;
+    let provider_name = &model.providers[provider_index].name;
+    let invocation = CompositeInvocationId {
+        source: provider_name.clone(),
+        id: Uuid::new_v4().to_string(),
+    };
+    let invocation_row_id = state.start_invocation(&InvocationStart {
+        invocation_uuid: invocation.id.clone(),
+        model_name: model.name.clone(),
+        provider_name: provider_name.clone(),
+        provider_index,
+        parent_invocation_id,
+    })?;
+    let invocation_env = serde_json::to_string(&invocation)
+        .map_err(|e| format!("Failed to serialize invocation id: {e}"))?;
+    eprintln!("{}", invocation.stderr_line());
+
+    let result = match executor::execute_with_inputs_and_env(
+        model,
+        provider_index,
+        prompt,
+        working_dir,
+        extra_inputs,
+        Some(&invocation_env),
+    ) {
+        Ok(result) => result,
+        Err(err) => {
+            state
+                .finalize_invocation(invocation_row_id, false, -1, None, Some(&err))
+                .unwrap_or_else(|finalize_err| {
+                    eprintln!("Warning: Failed to finalize invocation: {finalize_err}")
+                });
+            return Err(err);
+        }
+    };
 
     let success = result.exit_code == 0;
 
@@ -265,19 +302,17 @@ fn run_with_balancing(
     };
 
     state
-        .record_invocation(
-            &model.name,
-            provider_index,
+        .finalize_invocation(
+            invocation_row_id,
             success,
             result.exit_code,
             error_category.as_deref(),
             if success { None } else { Some(&result.stderr) },
         )
-        .unwrap_or_else(|e| eprintln!("Warning: Failed to record invocation: {e}"));
+        .unwrap_or_else(|e| eprintln!("Warning: Failed to finalize invocation: {e}"));
 
     // Bump calls_since_refresh for this provider (account). Errors here are
     // non-fatal — missing a tick just slightly skews the next projection.
-    let provider_name = &model.providers[provider_index].name;
     state
         .increment_calls_since_refresh(provider_name)
         .unwrap_or_else(|e| eprintln!("Warning: Failed to bump quota tick: {e}"));
@@ -292,6 +327,17 @@ fn run_with_balancing(
     }
 
     Ok(result.exit_code)
+}
+
+fn resolve_parent_invocation_id(state: &StateDb) -> Option<i64> {
+    let raw = std::env::var("OULIPOLY_PARENT_INVOCATION").ok()?;
+    let composite = CompositeInvocationId::parse_env_value(&raw).ok()?;
+    let record = state.get_invocation_by_uuid(&composite.id).ok()??;
+    if record.provider_name.as_deref() == Some(composite.source.as_str()) {
+        Some(record.id)
+    } else {
+        None
+    }
 }
 
 fn run_diagnostics(

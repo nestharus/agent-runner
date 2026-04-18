@@ -1,7 +1,9 @@
+use crate::config::load_models;
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use uuid::Uuid;
 
 pub struct StateDb {
     conn: Connection,
@@ -73,12 +75,97 @@ pub struct SessionTurnRecord {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct InvocationRecord {
+    pub id: i64,
+    pub invocation_uuid: String,
     pub model_name: String,
+    pub provider_name: Option<String>,
     pub provider_index: usize,
-    pub success: bool,
-    pub exit_code: i32,
+    pub parent_invocation_id: Option<i64>,
+    pub status: InvocationStatus,
+    pub success: Option<bool>,
+    pub exit_code: Option<i32>,
     pub error_category: Option<String>,
     pub created_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InvocationStart {
+    pub invocation_uuid: String,
+    pub model_name: String,
+    pub provider_name: String,
+    pub provider_index: usize,
+    pub parent_invocation_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvocationStatus {
+    Running,
+    Succeeded,
+    Failed,
+    Legacy,
+}
+
+impl InvocationStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            InvocationStatus::Running => "running",
+            InvocationStatus::Succeeded => "succeeded",
+            InvocationStatus::Failed => "failed",
+            InvocationStatus::Legacy => "legacy",
+        }
+    }
+
+    /// Inherent `from_str` returning `Option<Self>` per the PR-A contract
+    /// (`tmp/01-pr-a-contract.md` §"Struct contract"). The `FromStr` trait
+    /// impl below provides the `Result`-returning idiomatic Rust surface;
+    /// this inherent method is the contracted API caller-facing surface.
+    /// Clippy's `should_implement_trait` lint flags the name collision —
+    /// allowed here because both surfaces are intentional and the contract
+    /// pins this specific shape.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        s.parse().ok()
+    }
+}
+
+impl std::str::FromStr for InvocationStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "running" => Ok(InvocationStatus::Running),
+            "succeeded" => Ok(InvocationStatus::Succeeded),
+            "failed" => Ok(InvocationStatus::Failed),
+            "legacy" => Ok(InvocationStatus::Legacy),
+            _ => Err(format!("Unknown invocation status: {s}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CompositeInvocationId {
+    pub source: String,
+    pub id: String,
+}
+
+impl CompositeInvocationId {
+    /// Format as `OULIPOLY_INVOCATION=...` without a trailing newline.
+    pub fn stderr_line(&self) -> String {
+        format!(
+            "OULIPOLY_INVOCATION={}",
+            serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
+        )
+    }
+
+    /// Parse from a raw env-var value and validate the UUID payload.
+    pub fn parse_env_value(s: &str) -> Result<Self, String> {
+        let parsed: CompositeInvocationId =
+            serde_json::from_str(s).map_err(|e| format!("Invalid invocation JSON: {e}"))?;
+        Uuid::parse_str(&parsed.id).map_err(|e| format!("Invalid invocation UUID: {e}"))?;
+        Ok(parsed)
+    }
 }
 
 // --- Model discovery entities ---
@@ -218,6 +305,8 @@ impl StateDb {
         conn.execute_batch("PRAGMA journal_mode=WAL;")
             .map_err(|e| format!("Failed to set WAL mode: {e}"))?;
 
+        Self::ensure_invocations_schema(&conn)?;
+
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS providers (
                 model_name TEXT NOT NULL,
@@ -229,19 +318,6 @@ impl StateDb {
                 last_invoked_at TEXT,
                 PRIMARY KEY (model_name, provider_index)
             );
-
-            CREATE TABLE IF NOT EXISTS invocations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                model_name TEXT NOT NULL,
-                provider_index INTEGER NOT NULL,
-                success INTEGER NOT NULL,
-                exit_code INTEGER NOT NULL,
-                error_category TEXT,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_invocations_model
-                ON invocations (model_name, provider_index, created_at);
 
             CREATE TABLE IF NOT EXISTS provider_quotas (
                 provider_name TEXT PRIMARY KEY,
@@ -373,64 +449,410 @@ impl StateDb {
         Self::open(&db_path)
     }
 
-    pub fn record_invocation(
+    fn ensure_invocations_schema(conn: &Connection) -> Result<(), String> {
+        let columns = Self::invocations_columns(conn)?;
+        if columns.is_empty() {
+            conn.execute_batch(Self::invocations_schema_sql())
+                .map_err(|e| format!("Failed to initialize invocations schema: {e}"))?;
+            return Ok(());
+        }
+
+        if columns.iter().any(|column| column == "invocation_uuid") {
+            conn.execute_batch(Self::invocations_index_sql())
+                .map_err(|e| format!("Failed to ensure invocation indexes: {e}"))?;
+            return Ok(());
+        }
+
+        Self::migrate_legacy_invocations(conn)
+    }
+
+    fn invocations_columns(conn: &Connection) -> Result<Vec<String>, String> {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(invocations)")
+            .map_err(|e| format!("Failed to inspect invocations schema: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| format!("Failed to inspect invocations columns: {e}"))?;
+
+        let mut columns = Vec::new();
+        for row in rows {
+            columns.push(row.map_err(|e| format!("Failed to read invocations column: {e}"))?);
+        }
+        Ok(columns)
+    }
+
+    fn invocations_schema_sql() -> &'static str {
+        "CREATE TABLE IF NOT EXISTS invocations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            invocation_uuid TEXT NOT NULL UNIQUE,
+            model_name TEXT NOT NULL,
+            provider_name TEXT,
+            provider_index INTEGER NOT NULL,
+            parent_invocation_id INTEGER REFERENCES invocations(id),
+            status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'legacy')),
+            success INTEGER,
+            exit_code INTEGER,
+            error_category TEXT,
+            created_at TEXT NOT NULL,
+            finished_at TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_invocations_uuid
+            ON invocations (invocation_uuid);
+        CREATE INDEX IF NOT EXISTS idx_invocations_parent
+            ON invocations (parent_invocation_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_invocations_provider_created
+            ON invocations (provider_name, created_at);"
+    }
+
+    fn invocations_index_sql() -> &'static str {
+        "CREATE INDEX IF NOT EXISTS idx_invocations_uuid
+            ON invocations (invocation_uuid);
+        CREATE INDEX IF NOT EXISTS idx_invocations_parent
+            ON invocations (parent_invocation_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_invocations_provider_created
+            ON invocations (provider_name, created_at);"
+    }
+
+    fn migrate_legacy_invocations(conn: &Connection) -> Result<(), String> {
+        #[derive(Debug)]
+        struct LegacyInvocationRow {
+            model_name: String,
+            provider_index: i64,
+            success: i64,
+            exit_code: i64,
+            error_category: Option<String>,
+            created_at: String,
+        }
+
+        let provider_names = Self::provider_name_lookup()?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("Failed to begin invocation migration: {e}"))?;
+
+        let mut old_rows = Vec::new();
+        {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT model_name, provider_index, success, exit_code, error_category, created_at
+                     FROM invocations
+                     ORDER BY id",
+                )
+                .map_err(|e| format!("Failed to read legacy invocations: {e}"))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(LegacyInvocationRow {
+                        model_name: row.get(0)?,
+                        provider_index: row.get(1)?,
+                        success: row.get(2)?,
+                        exit_code: row.get(3)?,
+                        error_category: row.get(4)?,
+                        created_at: row.get(5)?,
+                    })
+                })
+                .map_err(|e| format!("Failed to scan legacy invocations: {e}"))?;
+            for row in rows {
+                old_rows.push(row.map_err(|e| format!("Failed to parse legacy invocation: {e}"))?);
+            }
+        }
+
+        tx.execute_batch(
+            "CREATE TABLE invocations_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                invocation_uuid TEXT NOT NULL UNIQUE,
+                model_name TEXT NOT NULL,
+                provider_name TEXT,
+                provider_index INTEGER NOT NULL,
+                parent_invocation_id INTEGER REFERENCES invocations_new(id),
+                status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'legacy')),
+                success INTEGER,
+                exit_code INTEGER,
+                error_category TEXT,
+                created_at TEXT NOT NULL,
+                finished_at TEXT
+            );",
+        )
+        .map_err(|e| format!("Failed to create migrated invocations table: {e}"))?;
+
+        {
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO invocations_new (
+                        invocation_uuid,
+                        model_name,
+                        provider_name,
+                        provider_index,
+                        parent_invocation_id,
+                        status,
+                        success,
+                        exit_code,
+                        error_category,
+                        created_at,
+                        finished_at
+                     ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, ?9, ?9)",
+                )
+                .map_err(|e| format!("Failed to prepare migrated invocation insert: {e}"))?;
+
+            for row in old_rows {
+                let provider_name = provider_names
+                    .get(&(row.model_name.clone(), row.provider_index as usize))
+                    .cloned();
+                let status = match provider_name {
+                    Some(_) if row.success != 0 => InvocationStatus::Succeeded,
+                    Some(_) => InvocationStatus::Failed,
+                    None => InvocationStatus::Legacy,
+                };
+
+                insert
+                    .execute(params![
+                        Uuid::new_v4().to_string(),
+                        row.model_name,
+                        provider_name,
+                        row.provider_index,
+                        status.as_str(),
+                        row.success,
+                        row.exit_code,
+                        row.error_category,
+                        row.created_at,
+                    ])
+                    .map_err(|e| format!("Failed to copy legacy invocation: {e}"))?;
+            }
+        }
+
+        tx.execute_batch(
+            "DROP TABLE invocations;
+             ALTER TABLE invocations_new RENAME TO invocations;",
+        )
+        .map_err(|e| format!("Failed to replace invocations table: {e}"))?;
+
+        tx.execute_batch(Self::invocations_index_sql())
+            .map_err(|e| format!("Failed to create migrated invocation indexes: {e}"))?;
+
+        tx.commit()
+            .map_err(|e| format!("Failed to commit invocation migration: {e}"))
+    }
+
+    /// Resolve `(model_name, provider_index) -> provider_name` from the
+    /// installed models config, used by the legacy-row migration. A corrupt
+    /// or missing models directory must not block DB open: log on stderr and
+    /// return an empty lookup so unmappable rows fall through to
+    /// `status='legacy'` with `provider_name=NULL` (per V10 — degradation
+    /// is observable via the legacy status, not silent).
+    fn provider_name_lookup() -> Result<std::collections::HashMap<(String, usize), String>, String>
+    {
+        let models_dir = dirs::config_dir()
+            .map(|dir| dir.join("oulipoly-agent-runner").join("models"))
+            .unwrap_or_else(|| std::path::PathBuf::from("models"));
+        let models = match load_models(&models_dir) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!(
+                    "Warning: failed to load models config during invocation migration ({e}); \
+                     pre-existing invocation rows will migrate as status='legacy'."
+                );
+                return Ok(std::collections::HashMap::new());
+            }
+        };
+        let mut lookup = std::collections::HashMap::new();
+        for (model_name, model) in models {
+            for (provider_index, provider) in model.providers.iter().enumerate() {
+                lookup.insert((model_name.clone(), provider_index), provider.name.clone());
+            }
+        }
+        Ok(lookup)
+    }
+
+    pub fn start_invocation(&self, start: &InvocationStart) -> Result<i64, String> {
+        let now = Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO invocations (
+                    invocation_uuid,
+                    model_name,
+                    provider_name,
+                    provider_index,
+                    parent_invocation_id,
+                    status,
+                    success,
+                    exit_code,
+                    error_category,
+                    created_at,
+                    finished_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, ?7, NULL)",
+                params![
+                    &start.invocation_uuid,
+                    &start.model_name,
+                    &start.provider_name,
+                    start.provider_index as i64,
+                    start.parent_invocation_id,
+                    InvocationStatus::Running.as_str(),
+                    &now,
+                ],
+            )
+            .map_err(|e| format!("Failed to insert invocation: {e}"))?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn finalize_invocation(
         &self,
-        model_name: &str,
-        provider_index: usize,
+        id: i64,
         success: bool,
         exit_code: i32,
         error_category: Option<&str>,
         stderr_snippet: Option<&str>,
     ) -> Result<(), String> {
         let now = Utc::now().to_rfc3339();
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("Failed to begin invocation finalize tx: {e}"))?;
 
-        // Upsert provider stats
-        self.conn
-            .execute(
-                "INSERT INTO providers (model_name, provider_index, invocation_count, error_count, last_invoked_at)
-                 VALUES (?1, ?2, 1, ?3, ?4)
-                 ON CONFLICT (model_name, provider_index)
-                 DO UPDATE SET
-                    invocation_count = invocation_count + 1,
-                    error_count = error_count + ?3,
-                    last_invoked_at = ?4",
-                params![model_name, provider_index as i64, if success { 0i64 } else { 1 }, &now],
+        let (model_name, provider_index, status) = tx
+            .query_row(
+                "SELECT model_name, provider_index, status FROM invocations WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
             )
-            .map_err(|e| format!("Failed to upsert provider: {e}"))?;
+            .optional()
+            .map_err(|e| format!("Failed to load invocation {id}: {e}"))?
+            .ok_or_else(|| format!("Invocation {id} not found"))?;
 
-        // Record error details if failed
+        if status.parse::<InvocationStatus>().ok() != Some(InvocationStatus::Running) {
+            return Err(format!("Invocation {id} is already finalized"));
+        }
+
+        tx.execute(
+            "UPDATE invocations
+             SET status = ?1,
+                 success = ?2,
+                 exit_code = ?3,
+                 error_category = ?4,
+                 finished_at = ?5
+             WHERE id = ?6",
+            params![
+                if success {
+                    InvocationStatus::Succeeded.as_str()
+                } else {
+                    InvocationStatus::Failed.as_str()
+                },
+                success as i64,
+                exit_code,
+                error_category,
+                &now,
+                id,
+            ],
+        )
+        .map_err(|e| format!("Failed to finalize invocation {id}: {e}"))?;
+
+        tx.execute(
+            "INSERT INTO providers (model_name, provider_index, invocation_count, error_count, last_invoked_at)
+             VALUES (?1, ?2, 1, ?3, ?4)
+             ON CONFLICT (model_name, provider_index)
+             DO UPDATE SET
+                invocation_count = invocation_count + 1,
+                error_count = error_count + ?3,
+                last_invoked_at = ?4",
+            params![
+                &model_name,
+                provider_index,
+                if success { 0i64 } else { 1i64 },
+                &now
+            ],
+        )
+        .map_err(|e| format!("Failed to upsert provider: {e}"))?;
+
         if !success {
             let snippet = stderr_snippet
                 .unwrap_or("")
                 .chars()
                 .take(500)
                 .collect::<String>();
-            self.conn
-                .execute(
-                    "UPDATE providers SET last_error = ?1, last_error_at = ?2
-                     WHERE model_name = ?3 AND provider_index = ?4",
-                    params![&snippet, &now, model_name, provider_index as i64],
-                )
-                .map_err(|e| format!("Failed to update error info: {e}"))?;
+            tx.execute(
+                "UPDATE providers SET last_error = ?1, last_error_at = ?2
+                 WHERE model_name = ?3 AND provider_index = ?4",
+                params![&snippet, &now, &model_name, provider_index],
+            )
+            .map_err(|e| format!("Failed to update error info: {e}"))?;
         }
 
-        // Insert invocation log
-        self.conn
-            .execute(
-                "INSERT INTO invocations (model_name, provider_index, success, exit_code, error_category, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    model_name,
-                    provider_index as i64,
-                    success as i64,
-                    exit_code,
-                    error_category,
-                    &now,
-                ],
-            )
-            .map_err(|e| format!("Failed to insert invocation: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("Failed to commit invocation finalize tx: {e}"))
+    }
 
-        Ok(())
+    pub fn get_invocation_by_uuid(&self, uuid: &str) -> Result<Option<InvocationRecord>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, invocation_uuid, model_name, provider_name, provider_index,
+                        parent_invocation_id, status, success, exit_code, error_category,
+                        created_at, finished_at
+                 FROM invocations
+                 WHERE invocation_uuid = ?1",
+            )
+            .map_err(|e| format!("Failed to prepare invocation lookup: {e}"))?;
+
+        let result = stmt.query_row(params![uuid], Self::map_invocation_row);
+        match result {
+            Ok(record) => Ok(Some(record)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(format!("Failed to query invocation: {e}")),
+        }
+    }
+
+    fn map_invocation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<InvocationRecord> {
+        let created_at_raw: String = row.get(10)?;
+        let finished_at_raw: Option<String> = row.get(11)?;
+        let status_raw: String = row.get(6)?;
+        let created_at = DateTime::parse_from_rfc3339(&created_at_raw)
+            .map(|dt| dt.with_timezone(&Utc))
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    10,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+        let finished_at = finished_at_raw
+            .map(|s| {
+                DateTime::parse_from_rfc3339(&s)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            11,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })
+            })
+            .transpose()?;
+        let status = status_raw.parse::<InvocationStatus>().map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                6,
+                rusqlite::types::Type::Text,
+                format!("Unknown invocation status: {status_raw}").into(),
+            )
+        })?;
+
+        Ok(InvocationRecord {
+            id: row.get(0)?,
+            invocation_uuid: row.get(1)?,
+            model_name: row.get(2)?,
+            provider_name: row.get(3)?,
+            provider_index: row.get::<_, i64>(4)? as usize,
+            parent_invocation_id: row.get(5)?,
+            status,
+            success: row.get::<_, Option<i64>>(7)?.map(|value| value != 0),
+            exit_code: row.get(8)?,
+            error_category: row.get(9)?,
+            created_at,
+            finished_at,
+        })
     }
 
     pub fn get_provider(
@@ -1198,45 +1620,617 @@ impl StateDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
+    use std::sync::{Mutex, OnceLock};
+    use tempfile::TempDir;
+    use uuid::Uuid;
 
     fn test_db() -> StateDb {
         StateDb::open(Path::new(":memory:")).unwrap()
     }
 
-    #[test]
-    fn schema_creation() {
-        let _db = test_db();
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn with_models_config(model_name: &str, body: &str, test: impl FnOnce()) {
+        let _guard = env_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let app_dir = dir.path().join("oulipoly-agent-runner");
+        let models_dir = app_dir.join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join(format!("{model_name}.toml")), body).unwrap();
+
+        let old = std::env::var_os("XDG_CONFIG_HOME");
+        // Tests need to isolate config-driven provider-name resolution.
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", dir.path());
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(test));
+        match old {
+            Some(value) => unsafe {
+                std::env::set_var("XDG_CONFIG_HOME", value);
+            },
+            None => unsafe {
+                std::env::remove_var("XDG_CONFIG_HOME");
+            },
+        }
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    type LegacyInvocationFixtureRow<'a> = (&'a str, i64, i64, i64, Option<&'a str>, &'a str);
+
+    fn legacy_invocations_db(rows: &[LegacyInvocationFixtureRow<'_>]) -> TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE invocations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                model_name TEXT NOT NULL,
+                provider_index INTEGER NOT NULL,
+                success INTEGER NOT NULL,
+                exit_code INTEGER NOT NULL,
+                error_category TEXT,
+                created_at TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        for (model_name, provider_index, success, exit_code, error_category, created_at) in rows {
+            conn.execute(
+                "INSERT INTO invocations (model_name, provider_index, success, exit_code, error_category, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    model_name,
+                    provider_index,
+                    success,
+                    exit_code,
+                    error_category,
+                    created_at
+                ],
+            )
+            .unwrap();
+        }
+        dir
+    }
+
+    fn invocation_table_sql(db: &StateDb) -> String {
+        db.conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'invocations'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
     }
 
     #[test]
-    fn record_and_query() {
+    fn schema_creation() {
         let db = test_db();
-        db.record_invocation("test-model", 0, true, 0, None, None)
+        let sql = invocation_table_sql(&db);
+        assert!(sql.contains("invocation_uuid TEXT NOT NULL UNIQUE"));
+        assert!(sql.contains("provider_name TEXT"));
+        assert!(sql.contains("parent_invocation_id INTEGER REFERENCES invocations(id)"));
+        assert!(sql.contains(
+            "status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'legacy'))"
+        ));
+        assert!(sql.contains("success INTEGER"));
+        assert!(sql.contains("finished_at TEXT"));
+
+        let indexes: Vec<String> = db
+            .conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'invocations' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            indexes,
+            vec![
+                "idx_invocations_parent".to_string(),
+                "idx_invocations_provider_created".to_string(),
+                "idx_invocations_uuid".to_string(),
+                "sqlite_autoindex_invocations_1".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn migration_backfills_resolved_and_legacy_rows() {
+        with_models_config(
+            "mapped-model",
+            r#"
+prompt_mode = "arg"
+
+[[providers]]
+name = "fixture-provider"
+command = "fixture"
+"#,
+            || {
+                let dir = legacy_invocations_db(&[
+                    ("mapped-model", 0, 1, 0, None, "2026-04-17T08:00:00Z"),
+                    (
+                        "missing-model",
+                        0,
+                        0,
+                        7,
+                        Some("rate_limit"),
+                        "2026-04-17T08:05:00Z",
+                    ),
+                ]);
+                let db = StateDb::open(&dir.path().join("state.db")).unwrap();
+
+                let rows: Vec<(String, Option<String>, String, String, String)> = db
+                    .conn
+                    .prepare(
+                        "SELECT model_name, provider_name, status, invocation_uuid, finished_at
+                         FROM invocations ORDER BY created_at",
+                    )
+                    .unwrap()
+                    .query_map([], |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    })
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect();
+
+                assert_eq!(rows[0].0, "mapped-model");
+                assert_eq!(rows[0].1.as_deref(), Some("fixture-provider"));
+                assert_eq!(rows[0].2, "succeeded");
+                assert_eq!(rows[0].4, "2026-04-17T08:00:00Z");
+                assert!(Uuid::parse_str(&rows[0].3).is_ok());
+
+                assert_eq!(rows[1].0, "missing-model");
+                assert_eq!(rows[1].1, None);
+                assert_eq!(rows[1].2, "legacy");
+                assert_eq!(rows[1].4, "2026-04-17T08:05:00Z");
+                assert!(Uuid::parse_str(&rows[1].3).is_ok());
+            },
+        );
+    }
+
+    #[test]
+    fn migration_rolls_back_when_rebuild_fails() {
+        let dir = legacy_invocations_db(&[("mapped-model", 0, 1, 0, None, "2026-04-17T08:00:00Z")]);
+        let path = dir.path().join("state.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE invocations_new (id INTEGER PRIMARY KEY);
+             CREATE TABLE blocker (name TEXT);
+             CREATE INDEX idx_invocations_uuid ON blocker(name);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let err = match StateDb::open(&path) {
+            Ok(_) => panic!("migration should fail"),
+            Err(err) => err,
+        };
+        assert!(!err.is_empty());
+
+        let conn = Connection::open(&path).unwrap();
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(invocations)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            columns,
+            vec![
+                "id",
+                "model_name",
+                "provider_index",
+                "success",
+                "exit_code",
+                "error_category",
+                "created_at",
+            ]
+        );
+        let row_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM invocations", [], |row| row.get(0))
             .unwrap();
-        db.record_invocation(
-            "test-model",
-            0,
+        assert_eq!(row_count, 1);
+    }
+
+    /// Per V10 (failures observable, never silent): if the models config
+    /// is unloadable mid-migration, the rebuild must still succeed and
+    /// degrade rows to `status='legacy'` / `provider_name=NULL`. Opening
+    /// the DB MUST NOT fail just because the config is corrupt.
+    #[test]
+    fn migration_succeeds_with_corrupt_models_config_and_marks_rows_legacy() {
+        let _guard = env_lock().lock().unwrap();
+        let dir = legacy_invocations_db(&[
+            ("any-model", 0, 1, 0, None, "2026-04-17T08:00:00Z"),
+            (
+                "other-model",
+                1,
+                0,
+                1,
+                Some("rate_limit"),
+                "2026-04-17T08:05:00Z",
+            ),
+        ]);
+        let path = dir.path().join("state.db");
+
+        // Plant a corrupt models/ directory at XDG_CONFIG_HOME so the
+        // load_models() call inside migration fails.
+        let config_root = dir.path().join("oulipoly-agent-runner");
+        let models_dir = config_root.join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(
+            models_dir.join("broken.toml"),
+            "this = is = not = valid = toml",
+        )
+        .unwrap();
+
+        let old = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", dir.path());
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // The DB open must succeed despite the corrupt config.
+            let db = StateDb::open(&path).expect("DB open must not fail on corrupt models config");
+
+            // Verify both legacy rows migrated cleanly with provider_name=NULL
+            // and status='legacy' since the lookup couldn't resolve anything.
+            let conn = Connection::open(&path).unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT model_name, provider_name, status, invocation_uuid, finished_at
+                     FROM invocations ORDER BY created_at",
+                )
+                .unwrap();
+            let rows: Vec<(String, Option<String>, String, String, String)> = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(rows.len(), 2);
+            for r in &rows {
+                assert!(
+                    r.1.is_none(),
+                    "provider_name must be NULL on corrupt config"
+                );
+                assert_eq!(r.2, "legacy", "status must be legacy on corrupt config");
+                assert!(Uuid::parse_str(&r.3).is_ok());
+                assert!(!r.4.is_empty(), "finished_at must be backfilled");
+            }
+            drop(db);
+        }));
+        match old {
+            Some(value) => unsafe {
+                std::env::set_var("XDG_CONFIG_HOME", value);
+            },
+            None => unsafe {
+                std::env::remove_var("XDG_CONFIG_HOME");
+            },
+        }
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
+    fn start_invocation_inserts_running_row_with_null_terminal_fields() {
+        let db = test_db();
+        let start = InvocationStart {
+            invocation_uuid: Uuid::new_v4().to_string(),
+            model_name: "test-model".to_string(),
+            provider_name: "fixture-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        };
+
+        let id = db.start_invocation(&start).unwrap();
+        let row = db
+            .get_invocation_by_uuid(&start.invocation_uuid)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(row.id, id);
+        assert_eq!(row.status, InvocationStatus::Running);
+        assert_eq!(row.provider_name.as_deref(), Some("fixture-provider"));
+        assert_eq!(row.parent_invocation_id, None);
+        assert_eq!(row.success, None);
+        assert_eq!(row.exit_code, None);
+        assert_eq!(row.finished_at, None);
+    }
+
+    #[test]
+    fn start_invocation_rejects_duplicate_uuid() {
+        let db = test_db();
+        let start = InvocationStart {
+            invocation_uuid: Uuid::new_v4().to_string(),
+            model_name: "test-model".to_string(),
+            provider_name: "fixture-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        };
+
+        db.start_invocation(&start).unwrap();
+        let err = db.start_invocation(&start).unwrap_err();
+        assert!(err.contains("invocation"));
+    }
+
+    #[test]
+    fn start_invocation_accepts_parent_rowid() {
+        let db = test_db();
+        let parent = InvocationStart {
+            invocation_uuid: Uuid::new_v4().to_string(),
+            model_name: "test-model".to_string(),
+            provider_name: "fixture-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        };
+        let parent_id = db.start_invocation(&parent).unwrap();
+
+        let child = InvocationStart {
+            invocation_uuid: Uuid::new_v4().to_string(),
+            model_name: "test-model".to_string(),
+            provider_name: "fixture-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: Some(parent_id),
+        };
+        db.start_invocation(&child).unwrap();
+
+        let row = db
+            .get_invocation_by_uuid(&child.invocation_uuid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.parent_invocation_id, Some(parent_id));
+    }
+
+    #[test]
+    fn finalize_invocation_sets_terminal_fields() {
+        let db = test_db();
+        let start = InvocationStart {
+            invocation_uuid: Uuid::new_v4().to_string(),
+            model_name: "test-model".to_string(),
+            provider_name: "fixture-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        };
+        let id = db.start_invocation(&start).unwrap();
+
+        db.finalize_invocation(id, true, 0, None, None).unwrap();
+
+        let row = db
+            .get_invocation_by_uuid(&start.invocation_uuid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, InvocationStatus::Succeeded);
+        assert_eq!(row.success, Some(true));
+        assert_eq!(row.exit_code, Some(0));
+        assert_eq!(row.error_category, None);
+        assert!(row.finished_at.is_some());
+    }
+
+    #[test]
+    fn finalize_invocation_updates_provider_aggregate_stats() {
+        let db = test_db();
+        let failed = InvocationStart {
+            invocation_uuid: Uuid::new_v4().to_string(),
+            model_name: "test-model".to_string(),
+            provider_name: "fixture-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        };
+        let succeeded = InvocationStart {
+            invocation_uuid: Uuid::new_v4().to_string(),
+            model_name: "test-model".to_string(),
+            provider_name: "fixture-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        };
+
+        let failed_id = db.start_invocation(&failed).unwrap();
+        db.finalize_invocation(
+            failed_id,
             false,
             1,
             Some("rate_limit"),
             Some("429 Too Many Requests"),
         )
         .unwrap();
+        let succeeded_id = db.start_invocation(&succeeded).unwrap();
+        db.finalize_invocation(succeeded_id, true, 0, None, None)
+            .unwrap();
 
         let provider = db.get_provider("test-model", 0).unwrap().unwrap();
         assert_eq!(provider.invocation_count, 2);
         assert_eq!(provider.error_count, 1);
-        assert!(provider.last_error.is_some());
+        assert_eq!(
+            provider.last_error.as_deref(),
+            Some("429 Too Many Requests")
+        );
+        assert!(provider.last_invoked_at.is_some());
+    }
+
+    #[test]
+    fn finalize_invocation_errors_for_missing_row() {
+        let db = test_db();
+        let err = db
+            .finalize_invocation(99, false, 1, Some("rate_limit"), None)
+            .unwrap_err();
+        assert!(err.contains("99"));
+    }
+
+    #[test]
+    fn finalize_invocation_errors_when_called_twice() {
+        let db = test_db();
+        let start = InvocationStart {
+            invocation_uuid: Uuid::new_v4().to_string(),
+            model_name: "test-model".to_string(),
+            provider_name: "fixture-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        };
+        let id = db.start_invocation(&start).unwrap();
+        db.finalize_invocation(id, true, 0, None, None).unwrap();
+
+        let err = db.finalize_invocation(id, true, 0, None, None).unwrap_err();
+        assert!(err.contains("already"));
     }
 
     #[test]
     fn recent_errors() {
         let db = test_db();
-        db.record_invocation("m", 0, false, 1, None, None).unwrap();
-        db.record_invocation("m", 0, true, 0, None, None).unwrap();
+        let failed = InvocationStart {
+            invocation_uuid: Uuid::new_v4().to_string(),
+            model_name: "m".to_string(),
+            provider_name: "fixture-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        };
+        let succeeded = InvocationStart {
+            invocation_uuid: Uuid::new_v4().to_string(),
+            model_name: "m".to_string(),
+            provider_name: "fixture-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        };
+        let failed_id = db.start_invocation(&failed).unwrap();
+        db.finalize_invocation(failed_id, false, 1, None, None)
+            .unwrap();
+        let succeeded_id = db.start_invocation(&succeeded).unwrap();
+        db.finalize_invocation(succeeded_id, true, 0, None, None)
+            .unwrap();
 
         let count = db.recent_error_count("m", 0, 60).unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn composite_invocation_id_formats_and_round_trips() {
+        let composite = CompositeInvocationId {
+            source: "fixture-provider".to_string(),
+            id: "7ad2916c-38dd-49e6-a1f7-3ef22766ff70".to_string(),
+        };
+        let line = composite.stderr_line();
+        assert_eq!(
+            line,
+            r#"OULIPOLY_INVOCATION={"source":"fixture-provider","id":"7ad2916c-38dd-49e6-a1f7-3ef22766ff70"}"#
+        );
+
+        let parsed = CompositeInvocationId::parse_env_value(
+            line.strip_prefix("OULIPOLY_INVOCATION=").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(parsed, composite);
+    }
+
+    #[test]
+    fn composite_invocation_id_rejects_malformed_env_values() {
+        for raw in [
+            "not-json",
+            r#"{"source":"fixture-provider"}"#,
+            r#"{"source":"fixture-provider","id":"not-a-uuid"}"#,
+            r#"{"source":"fixture-provider","id":"7ad2916c-38dd-49e6-a1f7-3ef22766ff70","extra":true}"#,
+        ] {
+            assert!(
+                CompositeInvocationId::parse_env_value(raw).is_err(),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn invocation_status_round_trips_through_strings() {
+        for status in [
+            InvocationStatus::Running,
+            InvocationStatus::Succeeded,
+            InvocationStatus::Failed,
+            InvocationStatus::Legacy,
+        ] {
+            // Inherent contracted API: Option<Self>.
+            assert_eq!(InvocationStatus::from_str(status.as_str()), Some(status));
+            // FromStr trait surface: Result<Self, _>. Both must work.
+            assert_eq!(
+                status.as_str().parse::<InvocationStatus>().ok(),
+                Some(status)
+            );
+        }
+        assert_eq!(InvocationStatus::from_str("unknown"), None);
+        assert!("unknown".parse::<InvocationStatus>().is_err());
+    }
+
+    #[test]
+    fn get_invocation_by_uuid_returns_matching_and_missing_rows() {
+        with_models_config(
+            "legacy-model",
+            r#"
+prompt_mode = "arg"
+
+[[providers]]
+name = "fixture-provider"
+command = "fixture"
+"#,
+            || {
+                let db = test_db();
+                let start = InvocationStart {
+                    invocation_uuid: Uuid::new_v4().to_string(),
+                    model_name: "legacy-model".to_string(),
+                    provider_name: "fixture-provider".to_string(),
+                    provider_index: 0,
+                    parent_invocation_id: None,
+                };
+                db.start_invocation(&start).unwrap();
+                let running = db
+                    .get_invocation_by_uuid(&start.invocation_uuid)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(running.invocation_uuid, start.invocation_uuid);
+
+                let dir = legacy_invocations_db(&[(
+                    "missing-model",
+                    0,
+                    0,
+                    7,
+                    None,
+                    "2026-04-17T08:05:00Z",
+                )]);
+                let migrated = StateDb::open(&dir.path().join("state.db")).unwrap();
+                let legacy_uuid: String = migrated
+                    .conn
+                    .query_row(
+                        "SELECT invocation_uuid FROM invocations LIMIT 1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let legacy = migrated
+                    .get_invocation_by_uuid(&legacy_uuid)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(legacy.status, InvocationStatus::Legacy);
+                assert!(
+                    migrated
+                        .get_invocation_by_uuid("00000000-0000-0000-0000-000000000000")
+                        .unwrap()
+                        .is_none()
+                );
+            },
+        );
     }
 
     #[test]
