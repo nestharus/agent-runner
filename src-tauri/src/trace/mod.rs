@@ -228,6 +228,11 @@ fn build_trace_session(
             "session capture failed during execution; reason was logged to stderr at execution time"
                 .to_string(),
         );
+    } else if record.session_capture_method.as_deref() == Some("resumed") {
+        warnings.push(
+            "session capture method 'resumed' marks an attempted resume target; child acceptance is unconfirmed, so inspect exit_code and recent stderr for outcome"
+                .to_string(),
+        );
     }
 
     let Some(session_id) = record.session_id.clone() else {
@@ -376,8 +381,16 @@ fn render_ascii_node(node: &TraceNode, depth: usize, output: &mut String) {
 }
 
 fn format_ascii_node(node: &TraceNode) -> String {
+    let session_field = if node.session.capture_method.as_deref() == Some("resumed") {
+        format!(
+            "Resume target: {}",
+            node.session.id.as_deref().unwrap_or("—")
+        )
+    } else {
+        format!("session={}", node.session.id.as_deref().unwrap_or("—"))
+    };
     format!(
-        "{}  {}  {}  {}  {}  session={}  {}",
+        "{}  {}  {}  {}  {}  {}  {}",
         node.invocation.id,
         node.invocation.source.as_deref().unwrap_or("—"),
         node.invocation.model_name,
@@ -385,7 +398,7 @@ fn format_ascii_node(node: &TraceNode) -> String {
         node.invocation
             .started_at
             .to_rfc3339_opts(SecondsFormat::Secs, true),
-        node.session.id.as_deref().unwrap_or("—"),
+        session_field,
         node.session.transcript_state.as_str(),
     )
 }
@@ -531,6 +544,80 @@ mod tests {
             inline_transcript: false,
             transcript: false,
         }
+    }
+
+    fn build_resumed_trace_report(options: TraceOptions) -> TraceReport {
+        let fixture = TraceFixture::new(&base_rows());
+        fixture.set_session_capture(
+            1,
+            Some("5169694d-de0f-40d1-890c-6e28e55bab27"),
+            Some("resumed"),
+        );
+        fixture.ingest_session_turns(
+            "fixture-provider",
+            &[
+                SessionTurnIngest {
+                    session_id: "5169694d-de0f-40d1-890c-6e28e55bab27".to_string(),
+                    turn_id: "root-turn".to_string(),
+                    timestamp: DateTime::parse_from_rfc3339("2026-04-17T08:00:00Z")
+                        .unwrap()
+                        .with_timezone(&Utc),
+                    role: "user".to_string(),
+                    parent_turn_id: None,
+                    is_sidechain: false,
+                },
+                SessionTurnIngest {
+                    session_id: "5169694d-de0f-40d1-890c-6e28e55bab27".to_string(),
+                    turn_id: "assistant-main".to_string(),
+                    timestamp: DateTime::parse_from_rfc3339("2026-04-17T08:00:01Z")
+                        .unwrap()
+                        .with_timezone(&Utc),
+                    role: "assistant".to_string(),
+                    parent_turn_id: Some("root-turn".to_string()),
+                    is_sidechain: false,
+                },
+                SessionTurnIngest {
+                    session_id: "5169694d-de0f-40d1-890c-6e28e55bab27".to_string(),
+                    turn_id: "assistant-side".to_string(),
+                    timestamp: DateTime::parse_from_rfc3339("2026-04-17T08:00:02Z")
+                        .unwrap()
+                        .with_timezone(&Utc),
+                    role: "assistant".to_string(),
+                    parent_turn_id: Some("assistant-main".to_string()),
+                    is_sidechain: true,
+                },
+            ],
+        );
+
+        let env_dir = tempfile::tempdir().unwrap();
+        let transcript = env_dir.path().join("resume-session.jsonl");
+        fs::write(&transcript, "{\"type\":\"system\"}\n").unwrap();
+        let locator = fixture_script(
+            &env_dir,
+            "resume-locator.sh",
+            &format!(r#"printf '%s\n' "{}""#, transcript.display()),
+        );
+        write_sessions_config(
+            env_dir.path(),
+            &format!(
+                r#"[fixture-provider]
+turn_script = "ignored"
+transcript_locator = "{}"
+"#,
+                locator.display()
+            ),
+        );
+
+        let sessions_cfg = SessionsConfig::load(
+            &env_dir
+                .path()
+                .join("oulipoly-agent-runner")
+                .join("sessions.toml"),
+        )
+        .unwrap();
+        let db = fixture.db();
+
+        trace_invocation_with_sessions(&db, ROOT_UUID, options, Some(&sessions_cfg)).unwrap()
     }
 
     fn base_rows() -> Vec<FixtureRow<'static>> {
@@ -1142,5 +1229,64 @@ transcript_locator = "{}"
         assert_eq!(json["root"]["session"]["turn_count"], 3);
         assert_eq!(json["root"]["session"]["assistant_turn_count"], 2);
         assert_eq!(json["root"]["session"]["sidechain_turn_count"], 1);
+    }
+
+    #[test]
+    fn resumed_session_pushes_attempted_resume_warning() {
+        let report = build_resumed_trace_report(trace_options(64));
+
+        assert!(
+            report
+                .root
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("attempted resume target")),
+            "{:?}",
+            report.root.warnings
+        );
+    }
+
+    #[test]
+    fn resumed_session_still_resolves_transcript_state() {
+        let report = build_resumed_trace_report(trace_options(64));
+
+        assert!(matches!(
+            report.root.session.transcript_state,
+            TranscriptState::Available
+        ));
+        assert!(report.root.session.transcript_path.is_some());
+    }
+
+    #[test]
+    fn resumed_session_still_counts_turns() {
+        let report = build_resumed_trace_report(trace_options(64));
+
+        assert_eq!(report.root.session.turn_count, Some(3));
+        assert_eq!(report.root.session.assistant_turn_count, Some(2));
+        assert_eq!(report.root.session.sidechain_turn_count, Some(1));
+    }
+
+    #[test]
+    fn ascii_output_uses_resume_target_label_for_resumed_session() {
+        let report = build_resumed_trace_report(trace_options(64));
+        let ascii = render_ascii_trace(&report);
+
+        assert!(
+            ascii.contains("Resume target: 5169694d-de0f-40d1-890c-6e28e55bab27"),
+            "{ascii}"
+        );
+    }
+
+    #[test]
+    fn json_output_preserves_resumed_capture_method() {
+        let report = build_resumed_trace_report(TraceOptions {
+            max_depth: 64,
+            json: true,
+            inline_transcript: false,
+            transcript: false,
+        });
+        let json = serde_json::to_value(&report).unwrap();
+
+        assert_eq!(json["root"]["session"]["capture_method"], "resumed");
     }
 }

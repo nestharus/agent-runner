@@ -1,5 +1,6 @@
 use crate::config::{
-    InputType, ModelConfig, PromptMode, ProviderConfig, SessionCapture, SessionCaptureKind,
+    InputType, ModelConfig, PromptMode, ProviderConfig, ResumeKind, ResumeStrategy, SessionCapture,
+    SessionCaptureKind,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -232,6 +233,11 @@ struct RawResult {
     session_capture: SessionCaptureResult,
 }
 
+pub struct ResumePayload<'a> {
+    pub session_id: &'a str,
+    pub strategy: &'a ResumeStrategy,
+}
+
 fn build_command(
     provider: &ProviderConfig,
     provider_args: &[String],
@@ -339,6 +345,7 @@ pub fn execute_interactive(
     provider: &ProviderConfig,
     working_dir: Option<&Path>,
     parent_invocation_env: Option<&str>,
+    resume: Option<ResumePayload<'_>>,
 ) -> Result<i32, String> {
     let interactive_args = provider.interactive_args.as_ref().ok_or_else(|| {
         format!(
@@ -347,12 +354,34 @@ pub fn execute_interactive(
         )
     })?;
 
-    let mut cmd = build_command(
-        provider,
-        interactive_args,
-        working_dir,
-        parent_invocation_env,
-    )?;
+    let mut provider_args = interactive_args.clone();
+    if let Some(resume) = resume {
+        match resume.strategy.kind {
+            ResumeKind::Flag => {
+                let flag = resume
+                    .strategy
+                    .flag
+                    .as_ref()
+                    .ok_or_else(|| "resume.flag is required".to_string())?;
+                provider_args.push(flag.clone());
+                provider_args.push(resume.session_id.to_string());
+            }
+            ResumeKind::Subcommand => {
+                let subcommand = resume
+                    .strategy
+                    .subcommand
+                    .as_ref()
+                    .ok_or_else(|| "resume.subcommand is required".to_string())?;
+                if subcommand.is_empty() {
+                    return Err("resume.subcommand is required".to_string());
+                }
+                provider_args.extend(subcommand.iter().cloned());
+                provider_args.push(resume.session_id.to_string());
+            }
+        }
+    }
+
+    let mut cmd = build_command(provider, &provider_args, working_dir, parent_invocation_env)?;
     cmd.stdin(Stdio::inherit());
     cmd.stdout(Stdio::inherit());
     cmd.stderr(Stdio::inherit());
@@ -658,7 +687,10 @@ fn send_sigterm(pid: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{InputDef, InputType, ProviderConfig, SessionCapture, SessionCaptureKind};
+    use crate::config::{
+        InputDef, InputType, ProviderConfig, ResumeKind, ResumeStrategy, SessionCapture,
+        SessionCaptureKind,
+    };
     use crate::executor::{SessionCaptureMethod, SessionCaptureResult};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -727,10 +759,11 @@ mod tests {
             command: "echo".to_string(),
             args: vec!["one-shot".to_string()],
             interactive_args: None,
+            resume: None,
             session_capture: None,
         };
 
-        let err = execute_interactive(&provider, None, None).unwrap_err();
+        let err = execute_interactive(&provider, None, None, None).unwrap_err();
         assert!(
             err.contains("provider fixture-provider has no interactive_args"),
             "{err}"
@@ -751,10 +784,11 @@ mod tests {
             command: script.path.to_string_lossy().into_owned(),
             args: vec!["one-shot-only".to_string()],
             interactive_args: Some(vec!["hello".to_string(), "world".to_string()]),
+            resume: None,
             session_capture: None,
         };
 
-        let exit_code = execute_interactive(&provider, None, None).unwrap();
+        let exit_code = execute_interactive(&provider, None, None, None).unwrap();
 
         assert_eq!(exit_code, 0);
         assert_eq!(
@@ -774,10 +808,11 @@ mod tests {
             command: script.path.to_string_lossy().into_owned(),
             args: vec!["one-shot-only".to_string()],
             interactive_args: Some(vec!["launch".to_string()]),
+            resume: None,
             session_capture: None,
         };
 
-        let exit_code = execute_interactive(&provider, Some(tempdir.path()), None).unwrap();
+        let exit_code = execute_interactive(&provider, Some(tempdir.path()), None, None).unwrap();
 
         assert_eq!(exit_code, 0);
         assert_eq!(
@@ -800,15 +835,131 @@ mod tests {
             command: script.path.to_string_lossy().into_owned(),
             args: vec!["one-shot-only".to_string()],
             interactive_args: Some(vec!["launch".to_string()]),
+            resume: None,
             session_capture: None,
         };
         let parent_env =
             r#"{"source":"fixture-provider","id":"11111111-1111-1111-1111-111111111111"}"#;
 
-        let exit_code = execute_interactive(&provider, None, Some(parent_env)).unwrap();
+        let exit_code = execute_interactive(&provider, None, Some(parent_env), None).unwrap();
 
         assert_eq!(exit_code, 0);
         assert_eq!(std::fs::read_to_string(&env_dump_path).unwrap(), parent_env);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_interactive_appends_flag_resume_args_to_child_argv() {
+        let argv_dump = tempfile::NamedTempFile::new().unwrap();
+        let argv_dump_path = argv_dump.path().to_path_buf();
+        let script = fixture_script(&format!(
+            r#"printf '%s\n' "$@" > "{dump}""#,
+            dump = argv_dump_path.display()
+        ));
+        let provider = ProviderConfig {
+            name: "claude2".to_string(),
+            command: script.path.to_string_lossy().into_owned(),
+            args: vec!["one-shot-only".to_string()],
+            interactive_args: Some(vec!["--model".to_string(), "opus".to_string()]),
+            resume: None,
+            session_capture: None,
+        };
+        let strategy = ResumeStrategy {
+            kind: ResumeKind::Flag,
+            flag: Some("--resume".to_string()),
+            subcommand: None,
+        };
+        let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+
+        let exit_code = execute_interactive(
+            &provider,
+            None,
+            None,
+            Some(ResumePayload {
+                session_id,
+                strategy: &strategy,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(exit_code, 0);
+        assert_eq!(
+            std::fs::read_to_string(&argv_dump_path).unwrap(),
+            "--model\nopus\n--resume\n5169694d-de0f-40d1-890c-6e28e55bab27\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_interactive_appends_subcommand_resume_args_to_child_argv() {
+        let argv_dump = tempfile::NamedTempFile::new().unwrap();
+        let argv_dump_path = argv_dump.path().to_path_buf();
+        let script = fixture_script(&format!(
+            r#"printf '%s\n' "$@" > "{dump}""#,
+            dump = argv_dump_path.display()
+        ));
+        let provider = ProviderConfig {
+            name: "codex".to_string(),
+            command: script.path.to_string_lossy().into_owned(),
+            args: vec!["exec".to_string()],
+            interactive_args: Some(vec![
+                "--dangerously-bypass-approvals-and-sandbox".to_string(),
+                "-m".to_string(),
+                "gpt-5.4".to_string(),
+            ]),
+            resume: None,
+            session_capture: None,
+        };
+        let strategy = ResumeStrategy {
+            kind: ResumeKind::Subcommand,
+            flag: None,
+            subcommand: Some(vec!["resume".to_string()]),
+        };
+        let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+
+        let exit_code = execute_interactive(
+            &provider,
+            None,
+            None,
+            Some(ResumePayload {
+                session_id,
+                strategy: &strategy,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(exit_code, 0);
+        assert_eq!(
+            std::fs::read_to_string(&argv_dump_path).unwrap(),
+            "--dangerously-bypass-approvals-and-sandbox\n-m\ngpt-5.4\nresume\n5169694d-de0f-40d1-890c-6e28e55bab27\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_interactive_without_resume_preserves_pr_e_argv_shape() {
+        let argv_dump = tempfile::NamedTempFile::new().unwrap();
+        let argv_dump_path = argv_dump.path().to_path_buf();
+        let script = fixture_script(&format!(
+            r#"printf '%s\n' "$@" > "{dump}""#,
+            dump = argv_dump_path.display()
+        ));
+        let provider = ProviderConfig {
+            name: "fixture-provider".to_string(),
+            command: script.path.to_string_lossy().into_owned(),
+            args: vec!["one-shot-only".to_string()],
+            interactive_args: Some(vec!["launch".to_string(), "interactive".to_string()]),
+            resume: None,
+            session_capture: None,
+        };
+
+        let exit_code = execute_interactive(&provider, None, None, None).unwrap();
+
+        assert_eq!(exit_code, 0);
+        assert_eq!(
+            std::fs::read_to_string(&argv_dump_path).unwrap(),
+            "launch\ninteractive\n"
+        );
     }
 
     #[test]
@@ -1040,6 +1191,7 @@ printf '{{"type":"system","subtype":"init","session_id":"%s"}}\n' "$requested""#
                 command: script.path.to_string_lossy().into_owned(),
                 args: vec!["-p".to_string()],
                 interactive_args: None,
+                resume: None,
                 session_capture: Some(SessionCapture {
                     kind: SessionCaptureKind::ForcedFlagVerified,
                     flag: Some("--session-id".to_string()),
@@ -1125,6 +1277,7 @@ printf '{"type":"system","subtype":"init","session_id":"11111111-1111-1111-1111-
                 command: script.path.to_string_lossy().into_owned(),
                 args: vec!["-p".to_string()],
                 interactive_args: None,
+                resume: None,
                 session_capture: Some(SessionCapture {
                     kind: SessionCaptureKind::ForcedFlagVerified,
                     flag: Some("--session-id".to_string()),
@@ -1186,6 +1339,7 @@ printf 'assistant text from tmpfile\n' > "$output_file""#,
                 command: script.path.to_string_lossy().into_owned(),
                 args: vec!["exec".to_string()],
                 interactive_args: None,
+                resume: None,
                 session_capture: Some(SessionCapture {
                     kind: SessionCaptureKind::StdoutJsonEvent,
                     flag: None,
@@ -1242,6 +1396,7 @@ printf 'assistant text from tmpfile\n' > "$output_file""#,
                 command: script.path.to_string_lossy().into_owned(),
                 args: vec!["exec".to_string()],
                 interactive_args: None,
+                resume: None,
                 session_capture: Some(SessionCapture {
                     kind: SessionCaptureKind::StdoutJsonEvent,
                     flag: None,

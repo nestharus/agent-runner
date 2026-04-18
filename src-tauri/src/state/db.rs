@@ -95,6 +95,12 @@ pub struct SessionTurnCounts {
 }
 
 #[derive(Debug, Clone)]
+pub struct ProviderSessionMatch {
+    pub provider_name: String,
+    pub latest_timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct InvocationRecord {
     pub id: i64,
@@ -601,6 +607,8 @@ impl StateDb {
             ON session_turns (provider_name, role, timestamp);
         CREATE INDEX IF NOT EXISTS idx_session_turns_session_ts
             ON session_turns (provider_name, session_id, timestamp);
+        CREATE INDEX IF NOT EXISTS idx_session_turns_session_lookup
+            ON session_turns (session_id, timestamp);
         CREATE INDEX IF NOT EXISTS idx_session_turns_parent
             ON session_turns (provider_name, session_id, parent_turn_id, timestamp);"
     }
@@ -1759,6 +1767,45 @@ impl StateDb {
         })
     }
 
+    pub fn find_provider_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<ProviderSessionMatch>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT provider_name, MAX(timestamp) AS latest_timestamp
+                 FROM session_turns
+                 WHERE session_id = ?1
+                 GROUP BY provider_name
+                 ORDER BY latest_timestamp DESC, provider_name ASC",
+            )
+            .map_err(|e| format!("Failed to prepare session provider lookup: {e}"))?;
+
+        let rows = stmt
+            .query_map(params![session_id], |row| {
+                let latest_timestamp_raw: String = row.get(1)?;
+                let latest_timestamp = DateTime::parse_from_rfc3339(&latest_timestamp_raw)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?;
+
+                Ok(ProviderSessionMatch {
+                    provider_name: row.get(0)?,
+                    latest_timestamp,
+                })
+            })
+            .map_err(|e| format!("Failed to query session provider lookup: {e}"))?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read session provider lookup: {e}"))
+    }
+
     /// Count assistant turns ingested for a provider since `since` (exclusive).
     /// `None` means count everything we've ever ingested for that provider.
     pub fn count_assistant_turns_since(
@@ -2024,6 +2071,51 @@ mod tests {
                 && column.2 == 1
                 && column.3.as_deref() == Some("0")
         }));
+    }
+
+    #[test]
+    fn session_turns_schema_creation_includes_resume_lookup_index() {
+        let db = test_db();
+        let indexes: Vec<String> = db
+            .conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'index' AND tbl_name = 'session_turns'
+                 ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+
+        assert!(
+            indexes.contains(&"idx_session_turns_session_lookup".to_string()),
+            "resume lookup index must exist on fresh DB bootstrap: {indexes:?}"
+        );
+    }
+
+    #[test]
+    fn session_turns_schema_migration_adds_resume_lookup_index() {
+        let dir = legacy_session_turns_db();
+        let db = StateDb::open(&dir.path().join("state.db")).unwrap();
+        let indexes: Vec<String> = db
+            .conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'index' AND tbl_name = 'session_turns'
+                 ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+
+        assert!(
+            indexes.contains(&"idx_session_turns_session_lookup".to_string()),
+            "resume lookup index must be added on existing DB open: {indexes:?}"
+        );
     }
 
     #[test]
@@ -2636,6 +2728,97 @@ command = "fixture"
         assert_eq!(counts.total, 3);
         assert_eq!(counts.assistant, 2);
         assert_eq!(counts.sidechain, 1);
+    }
+
+    #[test]
+    fn find_provider_for_session_returns_empty_for_unknown_session() {
+        let db = test_db();
+
+        let matches = db.find_provider_for_session("missing-session").unwrap();
+
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn find_provider_for_session_returns_single_provider_match_with_latest_timestamp() {
+        let db = test_db();
+        db.ingest_session_turns_batch(
+            "claude2",
+            &[
+                SessionTurnIngest {
+                    session_id: "session-a".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    timestamp: ts("2026-04-17T08:00:00Z"),
+                    role: "user".to_string(),
+                    parent_turn_id: None,
+                    is_sidechain: false,
+                },
+                SessionTurnIngest {
+                    session_id: "session-a".to_string(),
+                    turn_id: "turn-2".to_string(),
+                    timestamp: ts("2026-04-17T08:00:05Z"),
+                    role: "assistant".to_string(),
+                    parent_turn_id: Some("turn-1".to_string()),
+                    is_sidechain: false,
+                },
+            ],
+        )
+        .unwrap();
+
+        let matches = db.find_provider_for_session("session-a").unwrap();
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].provider_name, "claude2");
+        assert_eq!(matches[0].latest_timestamp, ts("2026-04-17T08:00:05Z"));
+    }
+
+    #[test]
+    fn find_provider_for_session_orders_by_latest_timestamp_then_provider_name() {
+        let db = test_db();
+        db.ingest_session_turns_batch(
+            "claude2",
+            &[SessionTurnIngest {
+                session_id: "shared-session".to_string(),
+                turn_id: "claude-turn".to_string(),
+                timestamp: ts("2026-04-17T08:00:10Z"),
+                role: "assistant".to_string(),
+                parent_turn_id: None,
+                is_sidechain: false,
+            }],
+        )
+        .unwrap();
+        db.ingest_session_turns_batch(
+            "codex-a",
+            &[SessionTurnIngest {
+                session_id: "shared-session".to_string(),
+                turn_id: "codex-a-turn".to_string(),
+                timestamp: ts("2026-04-17T08:00:05Z"),
+                role: "assistant".to_string(),
+                parent_turn_id: None,
+                is_sidechain: false,
+            }],
+        )
+        .unwrap();
+        db.ingest_session_turns_batch(
+            "codex-b",
+            &[SessionTurnIngest {
+                session_id: "shared-session".to_string(),
+                turn_id: "codex-b-turn".to_string(),
+                timestamp: ts("2026-04-17T08:00:05Z"),
+                role: "assistant".to_string(),
+                parent_turn_id: None,
+                is_sidechain: false,
+            }],
+        )
+        .unwrap();
+
+        let matches = db.find_provider_for_session("shared-session").unwrap();
+        let providers: Vec<&str> = matches.iter().map(|m| m.provider_name.as_str()).collect();
+
+        assert_eq!(providers, vec!["claude2", "codex-a", "codex-b"]);
+        assert_eq!(matches[0].latest_timestamp, ts("2026-04-17T08:00:10Z"));
+        assert_eq!(matches[1].latest_timestamp, ts("2026-04-17T08:00:05Z"));
+        assert_eq!(matches[2].latest_timestamp, ts("2026-04-17T08:00:05Z"));
     }
 
     #[test]

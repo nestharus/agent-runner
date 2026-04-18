@@ -14,6 +14,8 @@ pub struct ProviderConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interactive_args: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<ResumeStrategy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_capture: Option<SessionCapture>,
 }
 
@@ -27,6 +29,7 @@ impl ProviderConfig {
             command,
             args,
             interactive_args: None,
+            resume: None,
             session_capture: None,
         }
     }
@@ -36,6 +39,47 @@ impl ProviderConfig {
             return Err("interactive_args must not be empty when provided".into());
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResumeStrategy {
+    pub kind: ResumeKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subcommand: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumeKind {
+    Flag,
+    Subcommand,
+}
+
+impl ResumeStrategy {
+    pub fn validate(&self) -> Result<(), String> {
+        match self.kind {
+            ResumeKind::Flag => {
+                if self.flag.is_none() {
+                    return Err("resume.kind = flag requires `flag`".into());
+                }
+                if self.subcommand.is_some() {
+                    return Err("resume.kind = flag does not allow `subcommand`".into());
+                }
+                Ok(())
+            }
+            ResumeKind::Subcommand => {
+                if !matches!(self.subcommand.as_ref(), Some(parts) if !parts.is_empty()) {
+                    return Err("resume.kind = subcommand requires non-empty `subcommand`".into());
+                }
+                if self.flag.is_some() {
+                    return Err("resume.kind = subcommand does not allow `flag`".into());
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -233,6 +277,7 @@ struct RawModelToml {
     command: Option<String>,
     args: Option<Vec<String>>,
     interactive_args: Option<Vec<String>>,
+    resume: Option<ResumeStrategy>,
     prompt_mode: Option<String>,
     session_capture: Option<SessionCapture>,
     providers: Option<Vec<RawProvider>>,
@@ -246,6 +291,7 @@ struct RawProvider {
     command: String,
     args: Option<Vec<String>>,
     interactive_args: Option<Vec<String>>,
+    resume: Option<ResumeStrategy>,
     session_capture: Option<SessionCapture>,
 }
 
@@ -363,6 +409,7 @@ impl ModelConfig {
                 "interactive_args",
                 p.interactive_args.as_deref(),
             );
+            append_resume_toml(&mut out, "resume", p.resume.as_ref());
             append_session_capture_toml(&mut out, "session_capture", p.session_capture.as_ref());
         } else {
             out.push_str(&format!("prompt_mode = \"{}\"\n", mode_str));
@@ -384,6 +431,7 @@ impl ModelConfig {
                     "interactive_args",
                     p.interactive_args.as_deref(),
                 );
+                append_resume_toml(&mut out, "providers.resume", p.resume.as_ref());
                 append_session_capture_toml(
                     &mut out,
                     "providers.session_capture",
@@ -484,6 +532,7 @@ impl ModelConfig {
                         command: p.command,
                         args,
                         interactive_args: p.interactive_args,
+                        resume: p.resume,
                         session_capture: p.session_capture,
                     }
                 })
@@ -496,6 +545,7 @@ impl ModelConfig {
                 command,
                 args,
                 interactive_args: raw.interactive_args,
+                resume: raw.resume,
                 session_capture: raw.session_capture,
             }]
         } else {
@@ -511,6 +561,11 @@ impl ModelConfig {
         for p in &providers {
             p.validate_interactive_args()
                 .map_err(|e| format!("Model {name} provider {}: {e}", p.name))?;
+            if let Some(resume) = &p.resume {
+                resume
+                    .validate()
+                    .map_err(|e| format!("Model {name} provider {}: {e}", p.name))?;
+            }
             if let Some(capture) = &p.session_capture {
                 capture
                     .validate()
@@ -529,6 +584,24 @@ impl ModelConfig {
             inputs,
         })
     }
+}
+
+fn append_resume_toml(out: &mut String, table_name: &str, resume: Option<&ResumeStrategy>) {
+    let Some(resume) = resume else {
+        return;
+    };
+
+    out.push('\n');
+    out.push_str(&format!("[{table_name}]\n"));
+    out.push_str(&format!(
+        "kind = \"{}\"\n",
+        match resume.kind {
+            ResumeKind::Flag => "flag",
+            ResumeKind::Subcommand => "subcommand",
+        }
+    ));
+    append_optional_string(out, "flag", resume.flag.as_deref());
+    append_optional_string_list(out, "subcommand", resume.subcommand.as_deref());
 }
 
 fn append_session_capture_toml(
@@ -1015,6 +1088,200 @@ interactive_args = ["--dangerously-bypass-approvals-and-sandbox", "-m", "gpt-5.4
                     "model_reasoning_effort=high".to_string(),
                 ][..]
             )
+        );
+    }
+
+    #[test]
+    fn roundtrip_model_with_flag_resume_strategy() {
+        let original = r#"
+prompt_mode = "arg"
+
+[[providers]]
+name = "claude-account"
+command = "claude"
+args = ["-p"]
+interactive_args = ["--model", "opus"]
+
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+"#;
+        let c1 = ModelConfig::from_toml("test", original).unwrap();
+        let c2 = ModelConfig::from_toml("test", &c1.to_toml()).unwrap();
+
+        let resume = c2.providers[0].resume.as_ref().unwrap();
+        assert_eq!(resume.kind, ResumeKind::Flag);
+        assert_eq!(resume.flag.as_deref(), Some("--resume"));
+        assert_eq!(resume.subcommand, None);
+    }
+
+    #[test]
+    fn roundtrip_model_with_subcommand_resume_strategy() {
+        let original = r#"
+prompt_mode = "arg"
+
+[[providers]]
+name = "codex"
+command = "codex"
+args = ["exec", "-m", "gpt-5.4"]
+interactive_args = ["-m", "gpt-5.4"]
+
+[providers.resume]
+kind = "subcommand"
+subcommand = ["resume"]
+"#;
+        let c1 = ModelConfig::from_toml("test", original).unwrap();
+        let c2 = ModelConfig::from_toml("test", &c1.to_toml()).unwrap();
+
+        let resume = c2.providers[0].resume.as_ref().unwrap();
+        assert_eq!(resume.kind, ResumeKind::Subcommand);
+        assert_eq!(resume.flag, None);
+        assert_eq!(
+            resume.subcommand.as_deref(),
+            Some(&["resume".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn rejects_flag_resume_without_flag() {
+        let toml = r#"
+prompt_mode = "arg"
+
+[[providers]]
+command = "claude"
+args = ["-p"]
+interactive_args = ["--model", "opus"]
+
+[providers.resume]
+kind = "flag"
+"#;
+        let err = ModelConfig::from_toml("test", toml).unwrap_err();
+        assert!(err.contains("`flag`"), "{err}");
+    }
+
+    #[test]
+    fn rejects_flag_resume_with_subcommand() {
+        let toml = r#"
+prompt_mode = "arg"
+
+[[providers]]
+command = "claude"
+args = ["-p"]
+interactive_args = ["--model", "opus"]
+
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+subcommand = ["resume"]
+"#;
+        let err = ModelConfig::from_toml("test", toml).unwrap_err();
+        assert!(err.contains("subcommand"), "{err}");
+    }
+
+    #[test]
+    fn rejects_subcommand_resume_without_subcommand() {
+        let toml = r#"
+prompt_mode = "arg"
+
+[[providers]]
+command = "codex"
+args = ["exec"]
+interactive_args = ["-m", "gpt-5.4"]
+
+[providers.resume]
+kind = "subcommand"
+"#;
+        let err = ModelConfig::from_toml("test", toml).unwrap_err();
+        assert!(err.contains("subcommand"), "{err}");
+    }
+
+    #[test]
+    fn rejects_subcommand_resume_with_empty_subcommand() {
+        let toml = r#"
+prompt_mode = "arg"
+
+[[providers]]
+command = "codex"
+args = ["exec"]
+interactive_args = ["-m", "gpt-5.4"]
+
+[providers.resume]
+kind = "subcommand"
+subcommand = []
+"#;
+        let err = ModelConfig::from_toml("test", toml).unwrap_err();
+        assert!(err.contains("subcommand"), "{err}");
+    }
+
+    #[test]
+    fn rejects_subcommand_resume_with_flag() {
+        let toml = r#"
+prompt_mode = "arg"
+
+[[providers]]
+command = "codex"
+args = ["exec"]
+interactive_args = ["-m", "gpt-5.4"]
+
+[providers.resume]
+kind = "subcommand"
+flag = "--resume"
+subcommand = ["resume"]
+"#;
+        let err = ModelConfig::from_toml("test", toml).unwrap_err();
+        assert!(err.contains("flag"), "{err}");
+    }
+
+    #[test]
+    fn parse_canonical_claude_resume_shape() {
+        let toml = r#"
+prompt_mode = "arg"
+
+[[providers]]
+name = "claude2"
+command = "env"
+args = ["-u", "CLAUDECODE", "claude2", "-p", "--model", "opus", "--dangerously-skip-permissions"]
+interactive_args = ["-u", "CLAUDECODE", "claude2", "--model", "opus", "--dangerously-skip-permissions"]
+
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+"#;
+        let config = ModelConfig::from_toml("claude", toml).unwrap();
+        let provider = &config.providers[0];
+        let resume = provider.resume.as_ref().unwrap();
+
+        assert_eq!(provider.name, "claude2");
+        assert_eq!(resume.kind, ResumeKind::Flag);
+        assert_eq!(resume.flag.as_deref(), Some("--resume"));
+        assert_eq!(resume.subcommand, None);
+    }
+
+    #[test]
+    fn parse_canonical_codex_resume_shape() {
+        let toml = r#"
+prompt_mode = "arg"
+
+[[providers]]
+name = "codex"
+command = "codex"
+args = ["exec", "--dangerously-bypass-approvals-and-sandbox", "-m", "gpt-5.4", "-c", "model_reasoning_effort=high"]
+interactive_args = ["--dangerously-bypass-approvals-and-sandbox", "-m", "gpt-5.4", "-c", "model_reasoning_effort=high"]
+
+[providers.resume]
+kind = "subcommand"
+subcommand = ["resume"]
+"#;
+        let config = ModelConfig::from_toml("codex", toml).unwrap();
+        let provider = &config.providers[0];
+        let resume = provider.resume.as_ref().unwrap();
+
+        assert_eq!(provider.name, "codex");
+        assert_eq!(resume.kind, ResumeKind::Subcommand);
+        assert_eq!(resume.flag, None);
+        assert_eq!(
+            resume.subcommand.as_deref(),
+            Some(&["resume".to_string()][..])
         );
     }
 

@@ -91,6 +91,10 @@ enum Subcommands {
         /// Model id to launch interactively
         model: String,
 
+        /// Resume an existing session by full UUID
+        #[arg(long = "resume")]
+        resume: Option<String>,
+
         /// Working directory for the wrapped CLI
         #[arg(short = 'p', long = "project")]
         project: Option<PathBuf>,
@@ -217,9 +221,15 @@ fn run(cli: Cli) -> Result<i32, String> {
             ),
             Subcommands::Repl {
                 model,
+                resume,
                 project,
                 models_dir,
-            } => run_repl(&model, project.as_deref(), models_dir.as_deref()),
+            } => run_repl(
+                &model,
+                resume.as_deref(),
+                project.as_deref(),
+                models_dir.as_deref(),
+            ),
         };
     }
 
@@ -372,8 +382,40 @@ fn should_emit_invocation_line(is_terminal: bool) -> bool {
     !is_terminal
 }
 
+fn resume_model_pool_mismatch_message(
+    models: &HashMap<String, ModelConfig>,
+    model_name: &str,
+    session_id: &str,
+    provider_name: &str,
+) -> String {
+    let mut suggestions: Vec<String> = models
+        .values()
+        .filter(|model| {
+            model
+                .providers
+                .iter()
+                .any(|provider| provider.name == provider_name)
+        })
+        .map(|model| model.name.clone())
+        .collect();
+    suggestions.sort();
+    suggestions.dedup();
+
+    if suggestions.is_empty() {
+        format!(
+            "session {session_id} belongs to provider {provider_name}, which is not in model {model_name}'s provider pool.\nTry a model that includes {provider_name}: (no other model in the loaded config includes {provider_name})"
+        )
+    } else {
+        format!(
+            "session {session_id} belongs to provider {provider_name}, which is not in model {model_name}'s provider pool.\nTry a model that includes {provider_name}: {}",
+            suggestions.join(", ")
+        )
+    }
+}
+
 fn run_repl(
     model_name: &str,
+    resume: Option<&str>,
     working_dir: Option<&Path>,
     models_dir_override: Option<&Path>,
 ) -> Result<i32, String> {
@@ -403,7 +445,70 @@ fn run_repl(
     };
 
     let parent_invocation_id = resolve_parent_invocation_id(&state);
-    let provider_index = balancer::select_provider(model, &state, Some(&ctx));
+    let stderr_is_terminal = std::io::stderr().is_terminal();
+    let (provider_index, resume_payload) = if let Some(session_id) = resume {
+        if Uuid::parse_str(session_id).is_err() {
+            eprintln!("invalid session UUID: {session_id}");
+            return Ok(1);
+        }
+
+        let matches = state.find_provider_for_session(session_id)?;
+        if matches.is_empty() {
+            eprintln!(
+                "No session found matching {session_id}. Check that session ingestion is configured and that the provider still has resumable local state."
+            );
+            return Ok(1);
+        }
+
+        let selected_provider = &matches[0].provider_name;
+        eprintln!("[resume] -> {selected_provider}");
+        if matches.len() > 1 && !stderr_is_terminal {
+            let providers = matches
+                .iter()
+                .map(|matched| matched.provider_name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            eprintln!(
+                "[resume] session {session_id} matched {providers}; selected {selected_provider} by latest turn timestamp"
+            );
+        }
+
+        let Some(provider_index) = model
+            .providers
+            .iter()
+            .position(|provider| provider.name == *selected_provider)
+        else {
+            eprintln!(
+                "{}",
+                resume_model_pool_mismatch_message(
+                    &models,
+                    model_name,
+                    session_id,
+                    selected_provider,
+                )
+            );
+            return Ok(1);
+        };
+
+        let provider = &model.providers[provider_index];
+        let Some(strategy) = provider.resume.as_ref() else {
+            eprintln!(
+                "provider {} has no [providers.resume] block; cannot resume",
+                provider.name
+            );
+            return Ok(1);
+        };
+
+        (
+            provider_index,
+            Some(executor::cli::ResumePayload {
+                session_id,
+                strategy,
+            }),
+        )
+    } else {
+        (balancer::select_provider(model, &state, Some(&ctx)), None)
+    };
     let provider = &model.providers[provider_index];
     if provider.interactive_args.is_none() {
         return Err(format!(
@@ -427,17 +532,32 @@ fn run_repl(
     let invocation_env = serde_json::to_string(&invocation)
         .map_err(|e| format!("Failed to serialize invocation id: {e}"))?;
 
-    if should_emit_invocation_line(std::io::stderr().is_terminal()) {
+    if let Some(session_id) = resume {
+        state.update_session_capture(invocation_row_id, Some(session_id), "resumed")?;
+    }
+
+    if should_emit_invocation_line(stderr_is_terminal) {
         eprintln!("{}", invocation.stderr_line());
     }
 
-    match executor::cli::execute_interactive(provider, working_dir, Some(&invocation_env)) {
+    match executor::cli::execute_interactive(
+        provider,
+        working_dir,
+        Some(&invocation_env),
+        resume_payload,
+    ) {
         Ok(exit_code) => {
+            if resume.is_none() {
+                state.update_session_capture(invocation_row_id, None, "none")?;
+            }
             state.finalize_invocation(invocation_row_id, exit_code == 0, exit_code, None, None)?;
             guard.mark_finalized();
             Ok(exit_code)
         }
         Err(spawn_err) => {
+            if resume.is_none() {
+                state.update_session_capture(invocation_row_id, None, "none")?;
+            }
             state.finalize_invocation(
                 invocation_row_id,
                 false,
@@ -777,10 +897,12 @@ mod tests {
         match cli.command {
             Some(Subcommands::Repl {
                 model,
+                resume,
                 project,
                 models_dir,
             }) => {
                 assert_eq!(model, REPL_MODEL);
+                assert_eq!(resume, None);
                 assert_eq!(project, None);
                 assert_eq!(models_dir, None);
             }
@@ -794,7 +916,10 @@ mod tests {
             .unwrap();
 
         match cli.command {
-            Some(Subcommands::Repl { project, .. }) => {
+            Some(Subcommands::Repl {
+                resume, project, ..
+            }) => {
+                assert_eq!(resume, None);
                 assert_eq!(project, Some(PathBuf::from("/tmp")));
             }
             _ => panic!("expected repl subcommand"),
@@ -813,8 +938,53 @@ mod tests {
         .unwrap();
 
         match cli.command {
-            Some(Subcommands::Repl { models_dir, .. }) => {
+            Some(Subcommands::Repl {
+                resume, models_dir, ..
+            }) => {
+                assert_eq!(resume, None);
                 assert_eq!(models_dir, Some(PathBuf::from("/tmp/models")));
+            }
+            _ => panic!("expected repl subcommand"),
+        }
+    }
+
+    #[test]
+    fn repl_subcommand_parses_resume_after_model() {
+        let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+        let cli = Cli::try_parse_from([
+            "oulipoly-agent-runner",
+            "repl",
+            REPL_MODEL,
+            "--resume",
+            session_id,
+        ])
+        .unwrap();
+
+        match cli.command {
+            Some(Subcommands::Repl { model, resume, .. }) => {
+                assert_eq!(model, REPL_MODEL);
+                assert_eq!(resume.as_deref(), Some(session_id));
+            }
+            _ => panic!("expected repl subcommand"),
+        }
+    }
+
+    #[test]
+    fn repl_subcommand_parses_resume_before_model() {
+        let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+        let cli = Cli::try_parse_from([
+            "oulipoly-agent-runner",
+            "repl",
+            "--resume",
+            session_id,
+            REPL_MODEL,
+        ])
+        .unwrap();
+
+        match cli.command {
+            Some(Subcommands::Repl { model, resume, .. }) => {
+                assert_eq!(model, REPL_MODEL);
+                assert_eq!(resume.as_deref(), Some(session_id));
             }
             _ => panic!("expected repl subcommand"),
         }
@@ -829,6 +999,34 @@ mod tests {
 
         let rendered = err.to_string().to_lowercase();
         assert!(rendered.contains("model"), "{rendered}");
+    }
+
+    #[test]
+    fn repl_subcommand_requires_model_argument_even_with_resume() {
+        let err = match Cli::try_parse_from([
+            "oulipoly-agent-runner",
+            "repl",
+            "--resume",
+            "5169694d-de0f-40d1-890c-6e28e55bab27",
+        ]) {
+            Ok(_) => panic!("expected clap to reject repl without a model"),
+            Err(err) => err,
+        };
+
+        let rendered = err.to_string().to_lowercase();
+        assert!(rendered.contains("model"), "{rendered}");
+    }
+
+    #[test]
+    fn repl_subcommand_requires_resume_value() {
+        let err =
+            match Cli::try_parse_from(["oulipoly-agent-runner", "repl", REPL_MODEL, "--resume"]) {
+                Ok(_) => panic!("expected clap to reject --resume without a value"),
+                Err(err) => err,
+            };
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("--resume"), "{rendered}");
     }
 
     #[test]
