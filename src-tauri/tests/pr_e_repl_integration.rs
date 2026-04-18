@@ -344,11 +344,7 @@ fn repl_exits_one_when_model_is_unknown() {
 fn repl_exits_one_when_provider_has_no_interactive_args() {
     let fixture = Fixture::new();
     let script = fixture.write_script("fixture-noop.sh", "exit 0");
-    fixture.write_model_without_interactive_args(
-        "fixture",
-        "fixture-provider",
-        &script,
-    );
+    fixture.write_model_without_interactive_args("fixture", "fixture-provider", &script);
 
     let output = fixture.run_repl("fixture", None);
 
