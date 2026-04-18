@@ -223,6 +223,27 @@ mod tests {
     use super::*;
     use crate::config::{ProviderConfig, model::PromptMode};
     use std::path::Path;
+    use uuid::Uuid;
+
+    fn record_invocation_for_test(
+        db: &StateDb,
+        model_name: &str,
+        provider_name: &str,
+        provider_index: usize,
+        success: bool,
+    ) {
+        let id = db
+            .start_invocation(&crate::state::InvocationStart {
+                invocation_uuid: Uuid::new_v4().to_string(),
+                model_name: model_name.to_string(),
+                provider_name: provider_name.to_string(),
+                provider_index,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        db.finalize_invocation(id, success, if success { 0 } else { 1 }, None, None)
+            .unwrap();
+    }
 
     fn two_provider_model() -> ModelConfig {
         ModelConfig {
@@ -269,8 +290,7 @@ mod tests {
         let first = select_provider(&model, &db, None);
         assert_eq!(first, 0);
 
-        db.record_invocation("test", 0, true, 0, None, None)
-            .unwrap();
+        record_invocation_for_test(&db, "test", "a", 0, true);
 
         let second = select_provider(&model, &db, None);
         assert_eq!(second, 1);
@@ -282,8 +302,7 @@ mod tests {
         let model = two_provider_model();
 
         for _ in 0..3 {
-            db.record_invocation("test", 0, false, 1, None, None)
-                .unwrap();
+            record_invocation_for_test(&db, "test", "a", 0, false);
         }
 
         assert_eq!(select_provider(&model, &db, None), 1);
@@ -409,8 +428,7 @@ mod tests {
         assert_eq!(select_provider(&model, &db, None), 0);
 
         // Record an invocation for 0 → fallback should now pick 1.
-        db.record_invocation("test", 0, true, 0, None, None)
-            .unwrap();
+        record_invocation_for_test(&db, "test", "a", 0, true);
         assert_eq!(select_provider(&model, &db, None), 1);
     }
 }

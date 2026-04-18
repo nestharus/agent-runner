@@ -14,6 +14,7 @@ pub fn execute(
     prompt: &str,
     working_dir: Option<&Path>,
     extra_inputs: &HashMap<String, Vec<String>>,
+    parent_invocation_env: Option<&str>,
 ) -> Result<ExecutionResult, String> {
     let provider = model.providers.get(provider_index).ok_or_else(|| {
         format!(
@@ -31,6 +32,7 @@ pub fn execute(
         prompt,
         working_dir,
         &input_args,
+        parent_invocation_env,
     )?;
     if let Some(path) = temp_file {
         let _ = std::fs::remove_file(path);
@@ -217,6 +219,7 @@ fn execute_provider(
     prompt: &str,
     working_dir: Option<&Path>,
     input_args: &[String],
+    parent_invocation_env: Option<&str>,
 ) -> Result<(RawResult, Option<PathBuf>), String> {
     let parts = shell_split(&provider.command);
     if parts.is_empty() {
@@ -238,6 +241,9 @@ fn execute_provider(
 
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
+    }
+    if let Some(parent_invocation_env) = parent_invocation_env {
+        cmd.env("OULIPOLY_PARENT_INVOCATION", parent_invocation_env);
     }
 
     let mut temp_path = None;
@@ -486,7 +492,7 @@ mod tests {
             providers: vec![ProviderConfig::new("echo", vec![])],
             inputs: vec![],
         };
-        let result = execute(&model, 0, "hello world", None, &HashMap::new()).unwrap();
+        let result = execute(&model, 0, "hello world", None, &HashMap::new(), None).unwrap();
         assert_eq!(result.exit_code, 0);
         assert_eq!(
             String::from_utf8_lossy(&result.stdout).trim(),
@@ -503,7 +509,7 @@ mod tests {
             providers: vec![ProviderConfig::new("cat", vec![])],
             inputs: vec![],
         };
-        let result = execute(&model, 0, "piped input", None, &HashMap::new()).unwrap();
+        let result = execute(&model, 0, "piped input", None, &HashMap::new(), None).unwrap();
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.stdout, b"piped input");
     }
@@ -528,7 +534,7 @@ mod tests {
         let mut inputs = HashMap::new();
         inputs.insert("greeting".to_string(), vec!["hello".to_string()]);
         // echo ignores stdin, prints its args
-        let result = execute(&model, 0, "", None, &inputs).unwrap();
+        let result = execute(&model, 0, "", None, &inputs, None).unwrap();
         assert_eq!(
             String::from_utf8_lossy(&result.stdout).trim(),
             "--greet hello"
