@@ -40,3 +40,4 @@ credentials.json
 
 # Process scratch — agent prompts, transient outputs
 tmp/
+.tmp/
