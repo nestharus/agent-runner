@@ -558,12 +558,22 @@ mod tests {
     }
 
     fn build_resumed_trace_report(options: TraceOptions) -> TraceReport {
+        build_resumed_trace_report_with_exit(options, None)
+    }
+
+    fn build_resumed_trace_report_with_exit(
+        options: TraceOptions,
+        exit_override: Option<(&str, bool, i32)>,
+    ) -> TraceReport {
         let fixture = TraceFixture::new(&base_rows());
         fixture.set_session_capture(
             1,
             Some("5169694d-de0f-40d1-890c-6e28e55bab27"),
             Some("resumed"),
         );
+        if let Some((status, success, exit_code)) = exit_override {
+            fixture.set_exit_status(1, status, success, exit_code);
+        }
         fixture.ingest_session_turns(
             "fixture-provider",
             &[
@@ -1314,6 +1324,53 @@ transcript_locator = "{}"
             "{:?}",
             report.root.warnings
         );
+    }
+
+    #[test]
+    fn resumed_session_with_nonzero_exit_carries_full_trace_bundle() {
+        // Per PR-F contract §test-contract item 9: a single end-to-end
+        // scenario that combines resumed provenance, a non-zero child
+        // exit, and a transcript fixture. Asserts the entire bundle the
+        // contract names — warning text, transcript still resolved,
+        // turn counts populated, ASCII label switched to Resume target,
+        // JSON capture_method preserved — in one place so a future
+        // regression cannot pass by satisfying only some elements.
+        let report = build_resumed_trace_report_with_exit(
+            TraceOptions {
+                max_depth: 64,
+                json: true,
+                inline_transcript: false,
+                transcript: false,
+            },
+            Some(("failed", false, 7)),
+        );
+
+        assert!(
+            report
+                .root
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("attempted resume target")),
+            "{:?}",
+            report.root.warnings
+        );
+        assert!(matches!(
+            report.root.session.transcript_state,
+            TranscriptState::Available
+        ));
+        assert!(report.root.session.transcript_path.is_some());
+        assert_eq!(report.root.session.turn_count, Some(3));
+        assert_eq!(report.root.session.assistant_turn_count, Some(2));
+        assert_eq!(report.root.session.sidechain_turn_count, Some(1));
+
+        let ascii = render_ascii_trace(&report);
+        assert!(
+            ascii.contains("Resume target: 5169694d-de0f-40d1-890c-6e28e55bab27"),
+            "{ascii}"
+        );
+
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["root"]["session"]["capture_method"], "resumed");
     }
 
     #[test]
