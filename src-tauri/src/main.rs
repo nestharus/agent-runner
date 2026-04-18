@@ -386,6 +386,15 @@ fn should_emit_resume_detail_line(match_count: usize, is_terminal: bool) -> bool
     match_count > 1 && !is_terminal
 }
 
+/// The short `[resume] -> <provider>` line is always emitted regardless of
+/// TTY (per proposal §5: V10 wins over V15 here — even at a terminal, the
+/// runner's selection must be visible). Factored as a helper so the
+/// "always-on" semantic has an explicit, unit-testable surface that mirrors
+/// `should_emit_invocation_line` and `should_emit_resume_detail_line`.
+fn should_emit_resume_short_line(_is_terminal: bool) -> bool {
+    true
+}
+
 fn resume_model_pool_mismatch_message(
     models: &HashMap<String, ModelConfig>,
     model_name: &str,
@@ -465,7 +474,9 @@ fn run_repl(
         }
 
         let selected_provider = &matches[0].provider_name;
-        eprintln!("[resume] -> {selected_provider}");
+        if should_emit_resume_short_line(stderr_is_terminal) {
+            eprintln!("[resume] -> {selected_provider}");
+        }
         if should_emit_resume_detail_line(matches.len(), stderr_is_terminal) {
             let providers = matches
                 .iter()
@@ -1130,6 +1141,20 @@ mod tests {
     fn resume_detail_helper_suppresses_when_multi_match_but_tty() {
         assert!(!should_emit_resume_detail_line(2, true));
         assert!(!should_emit_resume_detail_line(5, true));
+    }
+
+    #[test]
+    fn resume_short_line_helper_emits_for_non_tty_stderr() {
+        assert!(should_emit_resume_short_line(false));
+    }
+
+    #[test]
+    fn resume_short_line_helper_also_emits_for_tty_stderr() {
+        // The short [resume] -> <provider> line is unconditional per
+        // proposal §5: V10 (observable selection) wins over V15
+        // (caller-controlled surface) for this single line. The test
+        // pins the "always-on" guarantee against future drift.
+        assert!(should_emit_resume_short_line(true));
     }
 
     #[test]
