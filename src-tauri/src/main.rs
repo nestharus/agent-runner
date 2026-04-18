@@ -876,19 +876,29 @@ mod tests {
     }
 
     #[test]
-    fn resolve_parent_invocation_id_returns_none_for_malformed_or_unknown_env() {
+    fn resolve_parent_invocation_id_returns_none_for_malformed_json() {
         let db = test_db();
+        with_parent_invocation_env(Some("not-json"), || {
+            assert_eq!(resolve_parent_invocation_id(&db), None);
+        });
+    }
 
-        for raw in [
-            "not-json".to_string(),
-            r#"{"source":"fixture-provider","id":"00000000-0000-0000-0000-000000000000"}"#
-                .to_string(),
-            r#"{"source":"fixture-provider","id":"not-a-uuid"}"#.to_string(),
-        ] {
-            with_parent_invocation_env(Some(&raw), || {
-                assert_eq!(resolve_parent_invocation_id(&db), None, "{raw}");
-            });
-        }
+    #[test]
+    fn resolve_parent_invocation_id_returns_none_for_unknown_uuid() {
+        let db = test_db();
+        let raw = r#"{"source":"fixture-provider","id":"00000000-0000-0000-0000-000000000000"}"#;
+        with_parent_invocation_env(Some(raw), || {
+            assert_eq!(resolve_parent_invocation_id(&db), None);
+        });
+    }
+
+    #[test]
+    fn resolve_parent_invocation_id_returns_none_for_invalid_uuid_format() {
+        let db = test_db();
+        let raw = r#"{"source":"fixture-provider","id":"not-a-uuid"}"#;
+        with_parent_invocation_env(Some(raw), || {
+            assert_eq!(resolve_parent_invocation_id(&db), None);
+        });
     }
 
     #[test]

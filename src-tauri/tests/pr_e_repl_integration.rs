@@ -73,6 +73,28 @@ interactive_args = ["launch"]
         .unwrap();
     }
 
+    fn write_model_without_interactive_args(
+        &self,
+        model_name: &str,
+        provider_name: &str,
+        script_path: &Path,
+    ) {
+        fs::write(
+            self.models_dir.join(format!("{model_name}.toml")),
+            format!(
+                r#"prompt_mode = "arg"
+
+[[providers]]
+name = "{provider_name}"
+command = "{}"
+args = ["one-shot-only"]
+"#,
+                script_path.display()
+            ),
+        )
+        .unwrap();
+    }
+
     fn base_repl_command(&self, model_name: &str, parent_env: Option<&str>) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
         cmd.arg("repl")
@@ -303,4 +325,37 @@ done"#,
     assert_eq!(row.success, Some(false));
     assert_eq!(row.exit_code, Some(130));
     assert!(row.finished_at.is_some());
+}
+
+#[test]
+fn repl_exits_one_when_model_is_unknown() {
+    let fixture = Fixture::new();
+    let output = fixture.run_repl("nonexistent-model", None);
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.to_lowercase().contains("nonexistent-model"),
+        "stderr should name the unknown model: {stderr}"
+    );
+}
+
+#[test]
+fn repl_exits_one_when_provider_has_no_interactive_args() {
+    let fixture = Fixture::new();
+    let script = fixture.write_script("fixture-noop.sh", "exit 0");
+    fixture.write_model_without_interactive_args(
+        "fixture",
+        "fixture-provider",
+        &script,
+    );
+
+    let output = fixture.run_repl("fixture", None);
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("interactive_args"),
+        "stderr should mention interactive_args: {stderr}"
+    );
 }

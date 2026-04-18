@@ -742,7 +742,7 @@ mod tests {
         let argv_dump = tempfile::NamedTempFile::new().unwrap();
         let argv_dump_path = argv_dump.path().to_path_buf();
         let script = fixture_script(&format!(
-            r#"printf '%s\n' "$@" > {dump}"#,
+            r#"printf '%s\n' "$@" > "{dump}""#,
             dump = argv_dump_path.display()
         ));
         let provider = ProviderConfig {
@@ -767,7 +767,7 @@ mod tests {
     fn execute_interactive_propagates_working_directory() {
         let tempdir = tempfile::tempdir().unwrap();
         let cwd_dump = tempdir.path().join("cwd.txt");
-        let script = fixture_script(&format!(r#"pwd > {dump}"#, dump = cwd_dump.display()));
+        let script = fixture_script(&format!(r#"pwd > "{dump}""#, dump = cwd_dump.display()));
         let provider = ProviderConfig {
             name: "fixture-provider".to_string(),
             command: script.path.to_string_lossy().into_owned(),
@@ -791,7 +791,7 @@ mod tests {
         let env_dump = tempfile::NamedTempFile::new().unwrap();
         let env_dump_path = env_dump.path().to_path_buf();
         let script = fixture_script(&format!(
-            r#"printf '%s' "${{OULIPOLY_PARENT_INVOCATION-}}" > {dump}"#,
+            r#"printf '%s' "${{OULIPOLY_PARENT_INVOCATION-}}" > "{dump}""#,
             dump = env_dump_path.display()
         ));
         let provider = ProviderConfig {
