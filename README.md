@@ -254,8 +254,17 @@ state_dir   = "~/.cache/oulipoly/claude3-cursor"
 **Turn script contract** — same adapter pattern as quota scripts. The runner spawns the script with `STATE_DIR` env (a writable dir for the script's own incremental cursor) and parses one JSON object per line on stdout:
 
 ```json
-{"session_id": "...", "turn_id": "...", "timestamp": "<RFC 3339>", "role": "user|assistant"}
+{
+  "session_id": "...",
+  "turn_id": "...",
+  "timestamp": "<RFC 3339>",
+  "role": "user|assistant",
+  "parent_turn_id": "<turn_id|null>",
+  "is_sidechain": true
+}
 ```
+
+`parent_turn_id` and `is_sidechain` are **optional**. Adapters that don't track within-session parentage emit only the first four fields; the runner treats those turns as linear with `is_sidechain = false`. The Claude Code reference adapter passes through the raw `parentUuid` and `isSidechain` fields it sees in Claude's per-session JSONL — those surface as branch counts in `trace --json`'s `session.sidechain_turn_count`.
 
 Idempotent — re-running with no source changes outputs nothing. The runner's `session_turns` table has `UNIQUE(provider, session_id, turn_id)` so duplicate emission is also tolerated.
 
@@ -263,10 +272,117 @@ Idempotent — re-running with no source changes outputs nothing. The runner's `
 
 | Script | Adapts | Storage |
 |---|---|---|
-| `claude-code-turns BASE_DIR` | Claude Code | JSONL tree under `BASE_DIR` |
+| `claude-code-turns BASE_DIR` | Claude Code | JSONL tree under `BASE_DIR`; preserves `parentUuid` + `isSidechain` |
 | `codex-turns BASE_DIR` | Codex CLI | Date-sharded JSONL under `BASE_DIR` |
 
 For other CLIs (SQLite history, remote API, etc.), write your own script — see [`scripts/README.md`](scripts/README.md). The application stays format-agnostic; everything CLI-specific lives in adapter scripts.
+
+### Optional: `transcript_locator`
+
+`sessions.toml` entries may also declare a `transcript_locator` script that resolves a `session_id` to the absolute path of its raw transcript file. Used by `trace --json` to fill `transcript_path` and `transcript_state` per node. The lookup is **lazy at trace time** — never at invocation time — so unused providers cost nothing.
+
+```toml
+[claude]
+turn_script        = "claude-code-turns ~/.claude/projects"
+transcript_locator = "claude-code-locate-transcript ~/.claude/projects"
+```
+
+The script receives `SESSION_ID` and `STATE_DIR` env vars and prints a single absolute path on stdout. Reference scripts: `claude-code-locate-transcript` (matches `<session_id>.jsonl` directly) and `codex-locate-transcript` (matches `rollout-*-<session_id>.jsonl`).
+
+When unset, `trace` shows `transcript_state = "no_locator"` for that provider — graceful degradation.
+
+## Inspecting a Run
+
+Every invocation emits a stable identifier on **stderr** before spawning the wrapped CLI:
+
+```
+OULIPOLY_INVOCATION={"source":"claude2","id":"9e69e8cc-616d-4640-bf1d-96f5391b1a2e"}
+```
+
+`stdout` stays the model's response (binary-safe for image/video models). The line is always emitted, exactly once per process.
+
+Capture it from a wrapper:
+
+```bash
+oulipoly-agent-runner -m claude-haiku "Refactor X" 2> >(tee /tmp/run.err >&2)
+INV=$(grep '^OULIPOLY_INVOCATION=' /tmp/run.err | cut -d= -f2- | jq -r .id)
+```
+
+### `trace` subcommand
+
+```bash
+oulipoly-agent-runner trace <invocation_uuid>          # ASCII tree
+oulipoly-agent-runner trace <invocation_uuid> --json   # structured JSON
+```
+
+DFS walk over `parent_invocation_id` edges in the `invocations` table — shows the captured invocation and every child invocation it spawned, with model, provider/account, status, timing, and per-node session/transcript state. Cycle protection (HashSet of visited row IDs); depth limit via `--max-depth` (default 64).
+
+Each node's `session.transcript_state` is one of:
+
+- `available` — locator returned a path that exists; `transcript_path` populated
+- `missing` — locator returned a path but the file is gone
+- `no_locator` — `session_id` known, but no `transcript_locator` configured for that provider
+- `unresolved` — no `session_id` was captured (e.g. the provider has no `session_capture` config, or capture was attempted and failed)
+
+Flags:
+
+- `--json` — structured output for piping into other tools
+- `--inline-transcript` (requires `--json`) — embed raw provider records inline; null in this version (placeholder for future)
+- `--transcript` (human mode only; conflicts with `--json`) — append a transcript footer
+- `--max-depth N` — truncate descendants past depth N
+
+### Cross-invocation tracking
+
+When `oulipoly-agent-runner` invokes a wrapped CLI that itself spawns another `oulipoly-agent-runner` (e.g. via the `Task` tool in Claude Code), the runner propagates `OULIPOLY_PARENT_INVOCATION` as an env var to the subprocess. The child's invocation row records `parent_invocation_id` pointing at the parent. `trace` walks that tree.
+
+If the env var is malformed, points at an unknown invocation, or has an invalid UUID, the child silently treats itself as a root invocation (no panic; observable via `parent_id = null` in trace output).
+
+### Configuring session capture
+
+To populate `trace`'s `session.id` and `transcript_path`, add a `session_capture` block to the provider in your model TOML:
+
+```toml
+# Claude Code: force a runner-generated UUID via --session-id and verify readback
+[[providers]]
+command = "claude"
+args    = ["-p"]
+
+[providers.session_capture]
+kind          = "forced_flag_verified"
+flag          = "--session-id"
+readback_args = ["--verbose", "--output-format", "stream-json"]
+```
+
+```toml
+# Codex: parse the `thread.started` event from --json mode; restore plain text from -o tmpfile
+[[providers]]
+command = "codex"
+args    = ["exec"]
+
+[providers.session_capture]
+kind              = "stdout_json_event"
+json_flag         = "--json"
+last_message_flag = "-o"
+event_type        = "thread.started"
+event_id_path     = "thread_id"
+```
+
+Without `session_capture`, invocations record `session_capture_method = "none"` and `trace` shows `transcript_state = "unresolved"` — clean degradation, no breakage.
+
+### Inspecting via SQL
+
+For ad-hoc questions that don't fit the `trace` shape, query SQLite directly:
+
+```bash
+# All invocations for one account today
+sqlite3 ~/.local/share/oulipoly-agent-runner/state.db "
+  SELECT invocation_uuid, model_name, status, created_at
+  FROM invocations
+  WHERE provider_name = 'claude2'
+    AND created_at > date('now')
+  ORDER BY created_at DESC
+"
+```
 
 ### Diagnostic tools
 
@@ -296,8 +412,10 @@ All user config lives in `~/.config/oulipoly-agent-runner/`:
 ~/.config/oulipoly-agent-runner/
   config.toml          Global settings
   providers.toml       Per-provider quota scripts (optional, for quota-aware balancing)
-  sessions.toml        Per-provider turn-count adapters (optional, for accurate cross-source projection)
-  models/              Model configs (one .toml per model)
+  sessions.toml        Per-provider turn ingestion + transcript locator adapters
+                       (optional, for accurate cross-source projection + trace inspection)
+  models/              Model configs (one .toml per model; provider entries can declare
+                       `[providers.session_capture]` for trace's session correlation)
   agents/              Agent configs (one .md per agent)
 ```
 
