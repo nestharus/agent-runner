@@ -37,3 +37,6 @@ credentials.json
 *.db
 *.db-wal
 *.db-shm
+
+# Process scratch — agent prompts, transient outputs
+tmp/
