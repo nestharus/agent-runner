@@ -129,6 +129,7 @@ pub fn refresh_provider(
 /// True if the provider has no cached quota OR its oldest refresh is past
 /// the dynamic TTL computed from its window lengths. TTL is
 /// `min(hours_until_reset) / DIVISOR`, clamped to `[MIN_TTL, MAX_TTL]`.
+/// A provider row with zero windows is inconsistent state; force stale.
 pub fn is_stale(state: &StateDb, provider_name: &str) -> bool {
     let Ok(Some(q)) = state.get_quota(provider_name) else {
         return true;
@@ -137,6 +138,9 @@ pub fn is_stale(state: &StateDb, provider_name: &str) -> bool {
         return true;
     };
     let windows = state.get_windows(provider_name).unwrap_or_default();
+    if windows.is_empty() {
+        return true;
+    }
     let ttl_secs = dynamic_ttl_secs(&windows);
     let age_secs = (Utc::now() - refreshed_at).num_seconds();
     age_secs >= ttl_secs

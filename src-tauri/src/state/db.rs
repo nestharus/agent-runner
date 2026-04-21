@@ -355,6 +355,7 @@ impl StateDb {
                 resets_at TEXT,
                 calls_since_refresh INTEGER NOT NULL DEFAULT 0,
                 refreshed_at TEXT,
+                last_empty_refresh_at TEXT,
                 last_delta_percent REAL,
                 last_delta_calls INTEGER
             );
@@ -467,6 +468,7 @@ impl StateDb {
             ",
         )
         .map_err(|e| format!("Failed to initialize schema: {e}"))?;
+        Self::ensure_provider_quotas_schema(&conn)?;
         Self::ensure_session_turns_schema(&conn)?;
 
         Ok(StateDb { conn })
@@ -557,6 +559,36 @@ impl StateDb {
         let mut columns = Vec::new();
         for row in rows {
             columns.push(row.map_err(|e| format!("Failed to read session_turns column: {e}"))?);
+        }
+        Ok(columns)
+    }
+
+    fn ensure_provider_quotas_schema(conn: &Connection) -> Result<(), String> {
+        let columns = Self::provider_quotas_columns(conn)?;
+        if !columns
+            .iter()
+            .any(|column| column == "last_empty_refresh_at")
+        {
+            conn.execute(
+                "ALTER TABLE provider_quotas ADD COLUMN last_empty_refresh_at TEXT",
+                [],
+            )
+            .map_err(|e| format!("Failed to add provider_quotas.last_empty_refresh_at: {e}"))?;
+        }
+        Ok(())
+    }
+
+    fn provider_quotas_columns(conn: &Connection) -> Result<Vec<String>, String> {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(provider_quotas)")
+            .map_err(|e| format!("Failed to inspect provider_quotas schema: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| format!("Failed to inspect provider_quotas columns: {e}"))?;
+
+        let mut columns = Vec::new();
+        for row in rows {
+            columns.push(row.map_err(|e| format!("Failed to read provider_quotas column: {e}"))?);
         }
         Ok(columns)
     }
@@ -1159,10 +1191,63 @@ impl StateDb {
     ) -> Result<(), String> {
         let now = Utc::now().to_rfc3339();
 
-        // Delta-learn against the longest window (max resets_at).
-        let longest_new = windows.iter().max_by_key(|w| w.resets_at);
         let prior = self.get_quota(provider_name)?;
         let prior_windows = self.get_windows(provider_name)?;
+
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("Failed to begin tx: {e}"))?;
+
+        if windows.is_empty() {
+            // Empty input: preserve any prior windows (the DELETE below only
+            // runs on the non-empty branch) and do not reset calls_since_refresh.
+            //
+            // When prior windows exist we must ALSO preserve prior.refreshed_at,
+            // because the per-window delta learner (PR 3) computes
+            //   delta_percent = new.used_percent - prior.used_percent
+            //   delta_calls   = count_assistant_turns_since(prior.refreshed_at)
+            // on the next successful refresh. Advancing refreshed_at here
+            // would count only the turns since the empty refresh while still
+            // measuring delta against the older preserved window sample,
+            // inflating the learned burn rate. Only last_empty_refresh_at
+            // advances — that is the audit timestamp the empty refresh is
+            // observed through.
+            //
+            // When no prior windows exist, we need refreshed_at populated so
+            // is_stale returns the expected values — but the §5.1 empty-
+            // windows guard already forces stale on this shape, so whatever
+            // we write is diagnostic only.
+            if prior_windows.is_empty() {
+                tx.execute(
+                    "INSERT INTO provider_quotas
+                        (provider_name, refreshed_at, last_empty_refresh_at)
+                     VALUES (?1, ?2, ?2)
+                     ON CONFLICT (provider_name) DO UPDATE SET
+                        refreshed_at = ?2,
+                        last_empty_refresh_at = ?2",
+                    params![provider_name, &now],
+                )
+                .map_err(|e| format!("Failed to record empty quota refresh: {e}"))?;
+            } else {
+                tx.execute(
+                    "INSERT INTO provider_quotas
+                        (provider_name, refreshed_at, last_empty_refresh_at)
+                     VALUES (?1, ?2, ?2)
+                     ON CONFLICT (provider_name) DO UPDATE SET
+                        last_empty_refresh_at = ?2",
+                    params![provider_name, &now],
+                )
+                .map_err(|e| format!("Failed to record empty quota refresh: {e}"))?;
+            }
+
+            tx.commit()
+                .map_err(|e| format!("Failed to commit refresh: {e}"))?;
+            return Ok(());
+        }
+
+        // Delta-learn against the longest window (max resets_at).
+        let longest_new = windows.iter().max_by_key(|w| w.resets_at);
         let longest_prior = prior_windows.iter().max_by_key(|w| w.resets_at);
 
         let (delta_percent, delta_calls) = match (&prior, longest_new, longest_prior) {
@@ -1187,11 +1272,6 @@ impl StateDb {
             Some(w) => (w.used_percent, Some(w.resets_at.to_rfc3339())),
             None => (0.0, None),
         };
-
-        let tx = self
-            .conn
-            .unchecked_transaction()
-            .map_err(|e| format!("Failed to begin tx: {e}"))?;
 
         tx.execute(
             "INSERT INTO provider_quotas
