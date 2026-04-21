@@ -341,9 +341,16 @@ score_by_density(model, state, quotas, windows, risk_class) -> Result<Selection,
       max_proj = max(max_proj, projected_used_w)
       if projected_used_w >= failure_threshold: any_hard_block = true
       if risk_class == User and projected_used_w >= user_threshold: any_user_block = true
-      remaining_turns_w = (1 - projected_used_w) / br
       hours_until_reset_w = max((w.resets_at - now).seconds / 3600, EPS_HOURS)
-      window_rates.push(remaining_turns_w / hours_until_reset_w)
+      remaining_headroom_w = max(0, 1 - projected_used_w)
+      # Score shape: (remaining fraction) * (hours until reset). A larger
+      # product means more fractional headroom spread over more hours and
+      # is the preferred tier to burn against. Per-window burn rates still
+      # matter for correctness — they drive `projected_used_w`, which is
+      # what the threshold gates read — but they do NOT enter the below-
+      # threshold ranking directly. The `density_picks_account_with_more_time_when_used_equal`
+      # test pins this formula (more time = higher score = wins).
+      window_rates.push(remaining_headroom_w * hours_until_reset_w)
     binding_score = if any_unlearned or any_hard_block or window_rates.is_empty()
                       { None }
                     else
