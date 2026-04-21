@@ -152,8 +152,9 @@ test_chatgpt_usage_emits_two_windows_on_normal_response() {
 
   assert_status_zero "$RUN_STATUS" "$FUNCNAME"
   assert_jq_eq '.windows | length' "2" "$FUNCNAME window count"
-  assert_weekly_window 0 "42" "2026-04-28T16:15:00Z" "$FUNCNAME weekly window"
-  assert_five_hour_window 1 "17" "2026-04-21T21:15:00Z" "$FUNCNAME five-hour window"
+  # Fixture uses unix `reset_at`; script converts via jq `todate` to RFC3339.
+  assert_weekly_window 0 "42" "2026-04-27T14:26:40Z" "$FUNCNAME weekly window"
+  assert_five_hour_window 1 "17" "2026-04-21T22:20:00Z" "$FUNCNAME five-hour window"
 }
 
 test_chatgpt_usage_emits_one_window_when_only_weekly_present() {
@@ -168,7 +169,7 @@ test_chatgpt_usage_emits_one_window_when_only_weekly_present() {
 
   assert_status_zero "$RUN_STATUS" "$FUNCNAME"
   assert_jq_eq '.windows | length' "1" "$FUNCNAME window count"
-  assert_weekly_window 0 "64" "2026-04-29T03:30:00Z" "$FUNCNAME weekly window"
+  assert_weekly_window 0 "64" "2026-04-28T18:13:20Z" "$FUNCNAME weekly window"
 }
 
 test_chatgpt_usage_emits_one_window_when_only_five_hour_present() {
@@ -183,7 +184,7 @@ test_chatgpt_usage_emits_one_window_when_only_five_hour_present() {
 
   assert_status_zero "$RUN_STATUS" "$FUNCNAME"
   assert_jq_eq '.windows | length' "1" "$FUNCNAME window count"
-  assert_five_hour_window 0 "23" "2026-04-21T22:45:00Z" "$FUNCNAME five-hour window"
+  assert_five_hour_window 0 "23" "2026-04-22T01:06:40Z" "$FUNCNAME five-hour window"
 }
 
 assert_credential_failure() {

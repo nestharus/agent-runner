@@ -2,7 +2,9 @@
   "rate_limit": {
     "primary_window": {
       "used_percent": 23,
-      "resets_at": "2026-04-21T22:45:00Z"
+      "limit_window_seconds": 18000,
+      "reset_after_seconds": 16000,
+      "reset_at": 1776820000
     }
   }
 }
