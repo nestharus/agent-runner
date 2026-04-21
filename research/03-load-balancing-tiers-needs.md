@@ -300,8 +300,11 @@ $ chatgpt-usage ~/.codex/auth.json
 That matches the DB — `codex` has one window row on `2026-04-27` and
 no 5h row (phase 1 §3). The scraper is dropping the 5h window. Codex
 providers will not benefit from this initiative's tier weighting
-until `chatgpt-usage` is fixed to emit both windows. Track as its own
-scraper bug; do not absorb into this initiative.
+until `chatgpt-usage` is fixed to emit both windows. §1.3 pulled this
+fix **into** this initiative as prerequisite PR 1; the scoring
+redesign in PR 3 cannot be validated on Codex accounts until PR 1
+lands. The earlier "track as its own scraper bug" framing has been
+superseded by the §1.3 decision.
 
 ## 6. Phase 3 design questions (not answered here)
 
