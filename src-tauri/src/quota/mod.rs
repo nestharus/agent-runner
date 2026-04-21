@@ -320,6 +320,35 @@ mod tests {
     }
 
     #[test]
+    fn is_stale_forces_refresh_when_windows_empty() {
+        let state = StateDb::open(std::path::Path::new(":memory:")).unwrap();
+        state
+            .insert_quota_row_without_windows_for_test("p", &Utc::now())
+            .unwrap();
+
+        assert!(is_stale(&state, "p"));
+    }
+
+    #[test]
+    fn is_stale_honors_ttl_when_windows_present() {
+        let state = StateDb::open(std::path::Path::new(":memory:")).unwrap();
+        let window = QuotaWindowInput {
+            used_percent: 0.10,
+            resets_at: hours_from_now(24),
+        };
+        state.upsert_quota_refresh("p", &[window]).unwrap();
+
+        assert!(!is_stale(&state, "p"));
+    }
+
+    #[test]
+    fn is_stale_treats_missing_quota_row_as_stale() {
+        let state = StateDb::open(std::path::Path::new(":memory:")).unwrap();
+
+        assert!(is_stale(&state, "p"));
+    }
+
+    #[test]
     fn ttl_shrinks_for_short_windows() {
         use crate::state::QuotaWindow;
         let five_hour = QuotaWindow {
