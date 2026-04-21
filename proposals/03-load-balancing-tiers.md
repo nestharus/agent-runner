@@ -191,14 +191,22 @@ Add `RiskClass { User, Background }` to `src-tauri/src/balancer/mod.rs`, next to
 Heuristic cascade:
 
 1. If `--risk-class user|background` is present, use it.
-2. Else if `OULIPOLY_RISK_CLASS=user|background`, use it.
-3. Else if running `repl`, use `User`.
+2. Else if running `repl`, use `User`. The repl override sits above the
+   env-var check because an interactive human session cannot tolerate a
+   background-class routing inherited from a shell export; the
+   `repl_subcommand_always_user_class` test pins this. A workflow that
+   genuinely wants background-class repl sets `--risk-class background`
+   explicitly, and the `--risk-class` flag is marked `global = true` so
+   it reaches the `repl` subcommand under the root parser's
+   `args_conflicts_with_subcommands = true` setting.
+3. Else if `OULIPOLY_RISK_CLASS=user|background`, use it (validated;
+   bogus values error out).
 4. Else for one-shot, use `Background` when `-f/--file` is provided.
 5. Else use `Background` when `OULIPOLY_PARENT_INVOCATION` is set.
 6. Else use `Background` when stdin is not a TTY (pipe or redirect, regardless of whether a positional prompt was also provided). The runner cannot distinguish human-typed pipes (`cat spec.md | agents`, cluster H, 3 of 92 invocations) from scripted pipes, and the majority of observed pipe-stdin cases are workflows. Explicit classification via `--risk-class` or the env var overrides.
 7. Else use `User` (positional prompt at a TTY — clusters C, D, and G, 24 of 92 invocations).
 
-This is the authoritative Q6 cascade as revised (`research/03-load-balancing-tiers-answers.md:166-214`; revision reconciles the earlier rule-5 `cat | agents` example that conflicted with rule 4's scripted-pipe treatment — audit-risk finding 2 on the prior revision). Hookpoints: `resolve_prompt` already checks stdin TTY and prompt/file state (`src-tauri/src/main.rs:165-188`); `run` has the direct-model and agent execution branches that call `run_with_balancing` (`src-tauri/src/main.rs:204-289`); `resolve_parent_invocation_id` reads `OULIPOLY_PARENT_INVOCATION` (`src-tauri/src/main.rs:706-714`).
+This is the authoritative Q6 cascade as revised (`research/03-load-balancing-tiers-answers.md:166-214`; revision reconciles the earlier rule-5 `cat | agents` example that conflicted with rule 4's scripted-pipe treatment — audit-risk finding 2 on the prior revision, plus the repl/env-var precedence reordering from the phase-7 CodeRabbit loop). Hookpoints: `resolve_prompt` already checks stdin TTY and prompt/file state (`src-tauri/src/main.rs:165-188`); `run` has the direct-model and agent execution branches that call `run_with_balancing` (`src-tauri/src/main.rs:204-289`); `resolve_parent_invocation_id` reads `OULIPOLY_PARENT_INVOCATION` (`src-tauri/src/main.rs:706-714`).
 
 Change `select_provider` from:
 
