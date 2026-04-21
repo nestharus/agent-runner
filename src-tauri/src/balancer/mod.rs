@@ -308,12 +308,74 @@ mod tests {
         assert_eq!(select_provider(&model, &db, None), 1);
     }
 
-    fn one_window(used: f64, hours_until_reset: i64) -> Vec<crate::state::QuotaWindowInput> {
+    fn quota_window(used: f64, hours_until_reset: i64) -> crate::state::QuotaWindowInput {
         use chrono::Duration;
-        vec![crate::state::QuotaWindowInput {
+        crate::state::QuotaWindowInput {
             used_percent: used,
             resets_at: Utc::now() + Duration::hours(hours_until_reset),
-        }]
+        }
+    }
+
+    fn one_window(used: f64, hours_until_reset: i64) -> Vec<crate::state::QuotaWindowInput> {
+        vec![quota_window(used, hours_until_reset)]
+    }
+
+    fn seed_windows_with_deltas(
+        db: &StateDb,
+        provider_name: &str,
+        windows: &[(f64, i64, f64, u64)],
+    ) {
+        let inputs: Vec<_> = windows
+            .iter()
+            .map(|(used, hours, _, _)| quota_window(*used, *hours))
+            .collect();
+        db.upsert_quota_refresh(provider_name, &inputs).unwrap();
+        for (window_id, (_, _, delta_percent, delta_calls)) in windows.iter().enumerate() {
+            db.set_window_delta_for_test(
+                provider_name,
+                window_id as u32,
+                *delta_percent,
+                *delta_calls,
+            )
+            .unwrap();
+        }
+    }
+
+    fn seed_assistant_turns_since_refresh(db: &StateDb, provider_name: &str, count: usize) {
+        use chrono::Duration;
+
+        let refreshed_at = Utc::now() - Duration::hours(1);
+        db.set_refreshed_at_for_test(provider_name, &refreshed_at)
+            .unwrap();
+        let turns: Vec<_> = (0..count)
+            .map(|i| crate::state::SessionTurnIngest {
+                session_id: format!("{provider_name}-session"),
+                turn_id: format!("{provider_name}-turn-{i}"),
+                timestamp: refreshed_at + Duration::seconds((i + 1) as i64),
+                role: "assistant".to_string(),
+                parent_turn_id: None,
+                is_sidechain: false,
+            })
+            .collect();
+        db.ingest_session_turns_batch(provider_name, &turns)
+            .unwrap();
+    }
+
+    fn selected_provider_index(model: &ModelConfig, db: &StateDb, risk_class: RiskClass) -> usize {
+        select_provider(model, db, None, risk_class)
+            .expect("provider should be selectable")
+            .provider_index
+    }
+
+    fn selected_provider(model: &ModelConfig, db: &StateDb, risk_class: RiskClass) -> Selection {
+        select_provider(model, db, None, risk_class).expect("provider should be selectable")
+    }
+
+    fn assert_approx(actual: f64, expected: f64, tolerance: f64) {
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "expected {actual} to be within {tolerance} of {expected}"
+        );
     }
 
     #[test]
@@ -324,14 +386,11 @@ mod tests {
         // All three providers reset in the same window length (7d) so density
         // collapses to remaining-headroom comparison: a=0.50, b=0.10, c=0.30.
         // Highest remaining = b (0.90) → pick b.
-        db.upsert_quota_refresh("a", &one_window(0.50, 24 * 7))
-            .unwrap();
-        db.upsert_quota_refresh("b", &one_window(0.10, 24 * 7))
-            .unwrap();
-        db.upsert_quota_refresh("c", &one_window(0.30, 24 * 7))
-            .unwrap();
+        seed_windows_with_deltas(&db, "a", &[(0.50, 24 * 7, 0.01, 22)]);
+        seed_windows_with_deltas(&db, "b", &[(0.10, 24 * 7, 0.01, 22)]);
+        seed_windows_with_deltas(&db, "c", &[(0.30, 24 * 7, 0.01, 22)]);
 
-        assert_eq!(select_provider(&model, &db, None), 1);
+        assert_eq!(selected_provider_index(&model, &db, RiskClass::User), 1);
     }
 
     #[test]
@@ -339,78 +398,23 @@ mod tests {
         let db = StateDb::open(Path::new(":memory:")).unwrap();
         let model = two_provider_model();
 
-        // Both used 50%, but `b` has a week left vs `a`'s 1 hour left.
-        // Density: a = 0.5/1, b = 0.5/168 → a is higher density (more
-        // headroom per unit time). Pick a.
-        db.upsert_quota_refresh("a", &one_window(0.50, 1)).unwrap();
-        db.upsert_quota_refresh("b", &one_window(0.50, 24 * 7))
-            .unwrap();
+        // Both providers have learned equivalent burn rates and equal usage.
+        // The account with more time to reset has more projected turns left.
+        seed_windows_with_deltas(&db, "a", &[(0.50, 1, 0.01, 22)]);
+        seed_windows_with_deltas(&db, "b", &[(0.50, 24 * 7, 0.01, 22)]);
 
-        assert_eq!(select_provider(&model, &db, None), 0);
+        assert_eq!(selected_provider_index(&model, &db, RiskClass::User), 1);
     }
 
     #[test]
     fn binding_constraint_avoids_account_with_pressed_short_window() {
-        use chrono::Duration;
         let db = StateDb::open(Path::new(":memory:")).unwrap();
         let model = two_provider_model();
 
-        // `a` has a healthy weekly window (10% used, 7d) BUT a near-exhausted
-        // 5h window (95% used, 30min left). `b` is only at 30% on its weekly
-        // and similarly fresh on its 5h. Density should reject `a`.
-        let a_windows = vec![
-            crate::state::QuotaWindowInput {
-                used_percent: 0.10,
-                resets_at: Utc::now() + Duration::hours(24 * 7),
-            },
-            crate::state::QuotaWindowInput {
-                used_percent: 0.95,
-                resets_at: Utc::now() + Duration::minutes(30),
-            },
-        ];
-        let b_windows = vec![
-            crate::state::QuotaWindowInput {
-                used_percent: 0.30,
-                resets_at: Utc::now() + Duration::hours(24 * 7),
-            },
-            crate::state::QuotaWindowInput {
-                used_percent: 0.20,
-                resets_at: Utc::now() + Duration::hours(4),
-            },
-        ];
-        db.upsert_quota_refresh("a", &a_windows).unwrap();
-        db.upsert_quota_refresh("b", &b_windows).unwrap();
+        seed_windows_with_deltas(&db, "a", &[(0.10, 24 * 7, 0.01, 22), (0.95, 5, 0.30, 22)]);
+        seed_windows_with_deltas(&db, "b", &[(0.30, 24 * 7, 0.01, 22), (0.20, 5, 0.30, 22)]);
 
-        // a's binding density ≈ 0.05/0.5h = 0.1
-        // b's binding density ≈ min(0.7/168, 0.8/4) = min(0.0042, 0.2) = 0.0042
-        // Hmm, a actually has higher binding density here. Let me reconsider:
-        // a's 5h: remaining=0.05, hours=0.5 → density=0.1
-        // a's weekly: remaining=0.9, hours=168 → density=0.0054
-        // a binding = min(0.1, 0.0054) = 0.0054
-        // b's 4h: remaining=0.8, hours=4 → density=0.2
-        // b's weekly: remaining=0.7, hours=168 → density=0.0042
-        // b binding = min(0.2, 0.0042) = 0.0042
-        // a binding > b binding → pick a (counter-intuitive!)
-        // The weekly window dominates because it has by far the longest
-        // horizon and lots of headroom remaining for both. The "pressed
-        // short window" only matters when its density falls *below* the
-        // long window's density, which requires either much higher %used
-        // on the short window OR a relatively constrained weekly.
-        // Use a tighter weekly for `a` to demonstrate proper rejection:
-        let a_pressed = vec![
-            crate::state::QuotaWindowInput {
-                used_percent: 0.50,
-                resets_at: Utc::now() + Duration::hours(24 * 7),
-            },
-            crate::state::QuotaWindowInput {
-                used_percent: 0.95,
-                resets_at: Utc::now() + Duration::minutes(30),
-            },
-        ];
-        db.upsert_quota_refresh("a", &a_pressed).unwrap();
-        // Now a binding = min(0.05/0.5, 0.5/168) = min(0.1, 0.003) = 0.003
-        // b binding = 0.0042 → b wins.
-        assert_eq!(select_provider(&model, &db, None), 1);
+        assert_eq!(selected_provider_index(&model, &db, RiskClass::User), 1);
     }
 
     #[test]
@@ -418,17 +422,197 @@ mod tests {
         let db = StateDb::open(Path::new(":memory:")).unwrap();
         let model = two_provider_model();
 
-        // Only one provider has windows → fallback to invocation-count
-        // where both are at 0.
-        db.upsert_quota_refresh("a", &one_window(0.90, 24 * 7))
+        seed_windows_with_deltas(&db, "a", &[(0.90, 24 * 7, 0.01, 22)]);
+        record_invocation_for_test(&db, "test", "a", 0, true);
+
+        assert_eq!(selected_provider_index(&model, &db, RiskClass::User), 1);
+    }
+
+    #[test]
+    fn high_weekly_account_stops_winning_after_cumulative_turns() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = two_provider_model();
+        let long_delta = 0.01;
+        let long_calls = 22;
+
+        seed_windows_with_deltas(
+            &db,
+            "a",
+            &[
+                (0.80, 24 * 7, long_delta, long_calls),
+                (0.04, 5, 0.30, long_calls),
+            ],
+        );
+        seed_windows_with_deltas(
+            &db,
+            "b",
+            &[
+                (0.10, 24 * 7, long_delta, long_calls),
+                (0.85, 5, 0.30, long_calls),
+            ],
+        );
+        seed_assistant_turns_since_refresh(&db, "a", 500);
+
+        assert_eq!(selected_provider_index(&model, &db, RiskClass::User), 1);
+    }
+
+    #[test]
+    fn user_threshold_hides_provider_from_user_class_only() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = two_provider_model();
+
+        seed_windows_with_deltas(&db, "a", &[(0.75, 24 * 7, 0.01, 22)]);
+        seed_windows_with_deltas(&db, "b", &[(0.10, 1, 0.01, 22)]);
+
+        assert_eq!(selected_provider_index(&model, &db, RiskClass::User), 1);
+        assert_eq!(
+            selected_provider_index(&model, &db, RiskClass::Background),
+            0
+        );
+    }
+
+    #[test]
+    fn user_threshold_soft_degrades_with_quota_tight_flag_when_all_fail() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = two_provider_model();
+
+        seed_windows_with_deltas(&db, "a", &[(0.80, 24 * 7, 0.01, 22)]);
+        seed_windows_with_deltas(&db, "b", &[(0.75, 24 * 7, 0.01, 22)]);
+
+        let selection = selected_provider(&model, &db, RiskClass::User);
+        assert_eq!(selection.provider_index, 1);
+        assert!(selection.quota_tight_routing);
+    }
+
+    #[test]
+    fn failure_threshold_hard_blocks_all_classes() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = two_provider_model();
+
+        seed_windows_with_deltas(&db, "a", &[(0.96, 24 * 7, 0.01, 22)]);
+        seed_windows_with_deltas(&db, "b", &[(0.20, 24 * 7, 0.01, 22)]);
+
+        assert_eq!(selected_provider_index(&model, &db, RiskClass::User), 1);
+        assert_eq!(
+            selected_provider_index(&model, &db, RiskClass::Background),
+            1
+        );
+    }
+
+    #[test]
+    fn failure_threshold_returns_exhausted_not_roundrobin_when_all_fail() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = two_provider_model();
+
+        seed_windows_with_deltas(&db, "a", &[(0.96, 24 * 7, 0.01, 22)]);
+        seed_windows_with_deltas(&db, "b", &[(0.99, 24 * 7, 0.01, 22)]);
+
+        for risk_class in [RiskClass::User, RiskClass::Background] {
+            match select_provider(&model, &db, None, risk_class) {
+                Err(BalanceError::Exhausted(err)) => {
+                    assert_eq!(err.model_name, model.name);
+                    assert_eq!(err.risk_class, risk_class);
+                    assert_eq!(err.providers.len(), 2);
+                    assert!(err.providers.iter().all(|provider| {
+                        provider.projected_max_used_percent >= provider.failure_threshold
+                            && provider.projected_max_used_percent >= 0.95
+                    }));
+                }
+                other => panic!("expected exhausted error for {risk_class:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn per_window_burn_rate_projects_short_window_faster_than_long() {
+        let long_rate = 0.01 / 22.0;
+        let short_rate = long_rate * 30.0;
+
+        let long_projected = project_used_percent_for_test(0.10, 100, long_rate);
+        let short_projected = project_used_percent_for_test(0.10, 100, short_rate);
+
+        assert_approx(short_projected - 0.10, (long_projected - 0.10) * 30.0, 1e-9);
+        assert!(short_projected >= 0.95);
+        assert!(long_projected < 0.95);
+    }
+
+    #[test]
+    fn bootstrap_uses_sibling_pool_when_own_delta_absent() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = two_provider_model();
+        let sibling_rate = 0.012 / 24.0;
+
+        db.upsert_quota_refresh("a", &one_window(0.20, 24 * 7))
+            .unwrap();
+        seed_windows_with_deltas(&db, "b", &[(0.30, 24 * 7, 0.012, 24)]);
+
+        let bootstrapped = bootstrap_burn_rate_for_test(&model, &db, 0, 0).unwrap();
+        assert_approx(bootstrapped, sibling_rate, 1e-12);
+        assert_eq!(selected_provider_index(&model, &db, RiskClass::User), 0);
+    }
+
+    #[test]
+    fn bootstrap_uses_duration_ratio_when_pool_has_only_long_delta() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = two_provider_model();
+        let long_rate = 0.01 / 22.0;
+        let expected_short_rate = long_rate * (168.0 / 5.0);
+
+        db.upsert_quota_refresh("a", &[quota_window(0.20, 24 * 7), quota_window(0.20, 5)])
+            .unwrap();
+        seed_windows_with_deltas(&db, "b", &[(0.30, 24 * 7, 0.01, 22)]);
+
+        let bootstrapped = bootstrap_burn_rate_for_test(&model, &db, 0, 1).unwrap();
+        assert_approx(
+            bootstrapped,
+            expected_short_rate,
+            expected_short_rate * 0.10,
+        );
+    }
+
+    #[test]
+    fn bootstrap_short_window_rate_exceeds_long_window_rate_by_duration_ratio() {
+        let long_rate = 0.01 / 22.0;
+        let derived = bootstrap_duration_ratio_for_test(long_rate, 168.0, 5.0);
+
+        assert_approx(derived, long_rate * (168.0 / 5.0), long_rate * 0.05);
+        assert!(derived > long_rate);
+    }
+
+    #[test]
+    fn bootstrap_returns_none_when_no_sibling_has_learned_rate() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = two_provider_model();
+
+        db.upsert_quota_refresh("a", &one_window(0.20, 24 * 7))
+            .unwrap();
+        db.upsert_quota_refresh("b", &one_window(0.30, 24 * 7))
             .unwrap();
 
-        // Provider b has no windows; fallback picks by invocation_count
-        // (both 0), tiebreaks to index 0.
-        assert_eq!(select_provider(&model, &db, None), 0);
+        assert!(bootstrap_burn_rate_for_test(&model, &db, 0, 0).is_none());
+    }
 
-        // Record an invocation for 0 → fallback should now pick 1.
+    #[test]
+    fn unlearned_provider_is_ineligible_when_siblings_are_learned() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = two_provider_model();
+
+        db.upsert_quota_refresh("a", &one_window(0.10, 24 * 7))
+            .unwrap();
+        seed_windows_with_deltas(&db, "b", &[(0.90, 24 * 7, 0.01, 22)]);
+
+        assert_eq!(selected_provider_index(&model, &db, RiskClass::User), 1);
+    }
+
+    #[test]
+    fn fresh_pool_falls_through_to_invocation_count_round_robin() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = two_provider_model();
+
         record_invocation_for_test(&db, "test", "a", 0, true);
-        assert_eq!(select_provider(&model, &db, None), 1);
+
+        let selection = selected_provider(&model, &db, RiskClass::User);
+        assert_eq!(selection.provider_index, 1);
+        assert!(!selection.quota_tight_routing);
     }
 }

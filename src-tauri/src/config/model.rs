@@ -1098,6 +1098,106 @@ interactive_args = ["--dangerously-bypass-approvals-and-sandbox", "-m", "gpt-5.4
     }
 
     #[test]
+    fn parse_balancer_defaults_when_block_absent() {
+        let toml = r#"
+command = "codex"
+args = ["exec"]
+prompt_mode = "arg"
+"#;
+
+        let config = ModelConfig::from_toml("test", toml).unwrap();
+
+        assert_eq!(config.balancer.user_threshold, 0.70);
+        assert_eq!(config.balancer.failure_threshold, 0.95);
+    }
+
+    #[test]
+    fn parse_balancer_overrides_thresholds() {
+        let toml = r#"
+command = "codex"
+args = ["exec"]
+prompt_mode = "arg"
+
+[balancer]
+user_threshold = 0.65
+failure_threshold = 0.90
+"#;
+
+        let config = ModelConfig::from_toml("test", toml).unwrap();
+
+        assert_eq!(config.balancer.user_threshold, 0.65);
+        assert_eq!(config.balancer.failure_threshold, 0.90);
+    }
+
+    #[test]
+    fn rejects_balancer_threshold_outside_unit_interval() {
+        for toml in [
+            r#"
+command = "codex"
+args = ["exec"]
+prompt_mode = "arg"
+
+[balancer]
+user_threshold = -0.1
+failure_threshold = 0.90
+"#,
+            r#"
+command = "codex"
+args = ["exec"]
+prompt_mode = "arg"
+
+[balancer]
+user_threshold = 0.70
+failure_threshold = 1.5
+"#,
+        ] {
+            let err = ModelConfig::from_toml("test", toml).unwrap_err();
+            assert!(
+                err.contains("threshold") || err.contains("balancer"),
+                "error should identify balancer threshold validation: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_balancer_user_threshold_above_failure_threshold() {
+        let toml = r#"
+command = "codex"
+args = ["exec"]
+prompt_mode = "arg"
+
+[balancer]
+user_threshold = 0.98
+failure_threshold = 0.90
+"#;
+
+        let err = ModelConfig::from_toml("test", toml).unwrap_err();
+        assert!(
+            err.contains("user_threshold") && err.contains("failure_threshold"),
+            "error should identify threshold ordering: {err}"
+        );
+    }
+
+    #[test]
+    fn roundtrip_model_with_balancer_config() {
+        let original = r#"
+command = "codex"
+args = ["exec"]
+prompt_mode = "arg"
+
+[balancer]
+user_threshold = 0.64
+failure_threshold = 0.91
+"#;
+
+        let c1 = ModelConfig::from_toml("test", original).unwrap();
+        let c2 = ModelConfig::from_toml("test", &c1.to_toml()).unwrap();
+
+        assert_eq!(c2.balancer.user_threshold, 0.64);
+        assert_eq!(c2.balancer.failure_threshold, 0.91);
+    }
+
+    #[test]
     fn roundtrip_model_with_flag_resume_strategy() {
         let original = r#"
 prompt_mode = "arg"

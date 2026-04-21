@@ -761,6 +761,7 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_runner_lib::balancer::RiskClass;
     use agent_runner_lib::state::InvocationStatus;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::{Mutex, OnceLock};
@@ -788,6 +789,55 @@ mod tests {
         let result = catch_unwind(AssertUnwindSafe(test));
 
         match previous {
+            Some(value) => unsafe {
+                std::env::set_var("OULIPOLY_PARENT_INVOCATION", value);
+            },
+            None => unsafe {
+                std::env::remove_var("OULIPOLY_PARENT_INVOCATION");
+            },
+        }
+
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    fn with_risk_envs(
+        risk_class: Option<&str>,
+        parent_invocation: Option<&str>,
+        test: impl FnOnce(),
+    ) {
+        let _guard = env_lock().lock().unwrap();
+        let previous_risk = std::env::var_os("OULIPOLY_RISK_CLASS");
+        let previous_parent = std::env::var_os("OULIPOLY_PARENT_INVOCATION");
+        match risk_class {
+            Some(value) => unsafe {
+                std::env::set_var("OULIPOLY_RISK_CLASS", value);
+            },
+            None => unsafe {
+                std::env::remove_var("OULIPOLY_RISK_CLASS");
+            },
+        }
+        match parent_invocation {
+            Some(value) => unsafe {
+                std::env::set_var("OULIPOLY_PARENT_INVOCATION", value);
+            },
+            None => unsafe {
+                std::env::remove_var("OULIPOLY_PARENT_INVOCATION");
+            },
+        }
+
+        let result = catch_unwind(AssertUnwindSafe(test));
+
+        match previous_risk {
+            Some(value) => unsafe {
+                std::env::set_var("OULIPOLY_RISK_CLASS", value);
+            },
+            None => unsafe {
+                std::env::remove_var("OULIPOLY_RISK_CLASS");
+            },
+        }
+        match previous_parent {
             Some(value) => unsafe {
                 std::env::set_var("OULIPOLY_PARENT_INVOCATION", value);
             },
@@ -1042,6 +1092,106 @@ mod tests {
 
         let rendered = err.to_string();
         assert!(rendered.contains("--resume"), "{rendered}");
+    }
+
+    #[test]
+    fn risk_class_cli_flag_overrides_env_var() {
+        let cli = Cli::try_parse_from([
+            "oulipoly-agent-runner",
+            "--risk-class",
+            "background",
+            "--model",
+            "fixture",
+            "prompt",
+        ])
+        .unwrap();
+
+        with_risk_envs(Some("user"), None, || {
+            assert_eq!(
+                resolve_risk_class(&cli, true).unwrap(),
+                RiskClass::Background
+            );
+        });
+    }
+
+    #[test]
+    fn risk_class_env_var_overrides_heuristic() {
+        let cli = Cli::try_parse_from([
+            "oulipoly-agent-runner",
+            "--model",
+            "fixture",
+            "-f",
+            "prompt.md",
+        ])
+        .unwrap();
+
+        with_risk_envs(Some("user"), None, || {
+            assert_eq!(resolve_risk_class(&cli, true).unwrap(), RiskClass::User);
+        });
+    }
+
+    #[test]
+    fn risk_class_heuristic_classifies_file_flag_as_background() {
+        let cli = Cli::try_parse_from([
+            "oulipoly-agent-runner",
+            "--model",
+            "fixture",
+            "-f",
+            "prompt.md",
+        ])
+        .unwrap();
+
+        with_risk_envs(None, None, || {
+            assert_eq!(
+                resolve_risk_class(&cli, true).unwrap(),
+                RiskClass::Background
+            );
+        });
+    }
+
+    #[test]
+    fn risk_class_heuristic_classifies_tty_prompt_as_user() {
+        let cli =
+            Cli::try_parse_from(["oulipoly-agent-runner", "--model", "fixture", "prompt"]).unwrap();
+
+        with_risk_envs(None, None, || {
+            assert_eq!(resolve_risk_class(&cli, true).unwrap(), RiskClass::User);
+        });
+    }
+
+    #[test]
+    fn risk_class_heuristic_classifies_parent_invocation_as_background() {
+        let cli =
+            Cli::try_parse_from(["oulipoly-agent-runner", "--model", "fixture", "prompt"]).unwrap();
+        let parent = r#"{"source":"fixture-provider","id":"00000000-0000-0000-0000-000000000000"}"#;
+
+        with_risk_envs(None, Some(parent), || {
+            assert_eq!(
+                resolve_risk_class(&cli, true).unwrap(),
+                RiskClass::Background
+            );
+        });
+    }
+
+    #[test]
+    fn risk_class_heuristic_classifies_piped_stdin_as_background() {
+        let cli = Cli::try_parse_from(["oulipoly-agent-runner", "--model", "fixture"]).unwrap();
+
+        with_risk_envs(None, None, || {
+            assert_eq!(
+                resolve_risk_class(&cli, false).unwrap(),
+                RiskClass::Background
+            );
+        });
+    }
+
+    #[test]
+    fn repl_subcommand_always_user_class() {
+        let cli = Cli::try_parse_from(["oulipoly-agent-runner", "repl", REPL_MODEL]).unwrap();
+
+        with_risk_envs(Some("background"), Some("parent"), || {
+            assert_eq!(resolve_risk_class(&cli, false).unwrap(), RiskClass::User);
+        });
     }
 
     #[test]

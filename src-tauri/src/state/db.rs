@@ -1339,6 +1339,34 @@ impl StateDb {
         Ok(())
     }
 
+    /// Test-only: seed the PR 3 per-window burn-rate learning columns without
+    /// adding a migration here. This intentionally fails at runtime until the
+    /// production schema owns these columns.
+    #[cfg(test)]
+    pub(crate) fn set_window_delta_for_test(
+        &self,
+        provider_name: &str,
+        window_id: u32,
+        last_delta_percent: f64,
+        last_delta_calls: u64,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE provider_quota_windows
+                 SET last_delta_percent = ?3,
+                     last_delta_calls = ?4
+                 WHERE provider_name = ?1 AND window_id = ?2",
+                params![
+                    provider_name,
+                    window_id as i64,
+                    last_delta_percent,
+                    last_delta_calls as i64
+                ],
+            )
+            .map_err(|e| format!("Failed to set window delta: {e}"))?;
+        Ok(())
+    }
+
     /// Test-only: seed a provider quota row without any window rows.
     #[cfg(test)]
     pub(crate) fn insert_quota_row_without_windows_for_test(
@@ -2002,6 +2030,27 @@ mod tests {
             .collect()
     }
 
+    fn insert_assistant_turns_after(
+        db: &StateDb,
+        provider_name: &str,
+        since: DateTime<Utc>,
+        count: usize,
+        id_prefix: &str,
+    ) {
+        let turns: Vec<_> = (0..count)
+            .map(|i| SessionTurnIngest {
+                session_id: format!("{id_prefix}-session"),
+                turn_id: format!("{id_prefix}-turn-{i}"),
+                timestamp: since + chrono::Duration::seconds((i + 1) as i64),
+                role: "assistant".to_string(),
+                parent_turn_id: None,
+                is_sidechain: false,
+            })
+            .collect();
+        db.ingest_session_turns_batch(provider_name, &turns)
+            .unwrap();
+    }
+
     fn last_empty_refresh_at(db: &StateDb, provider_name: &str) -> Option<DateTime<Utc>> {
         db.conn
             .query_row(
@@ -2560,6 +2609,110 @@ command = "fixture"
         db.upsert_quota_refresh(provider, &[]).unwrap();
 
         assert_eq!(calls_since_refresh(&db, provider), 5);
+    }
+
+    #[test]
+    fn upsert_quota_refresh_writes_per_window_delta_for_matching_window_id() {
+        let db = test_db();
+        let provider = "p";
+        db.upsert_quota_refresh(
+            provider,
+            &[
+                quota_input(0.20, "2026-04-22T00:00:00Z"),
+                quota_input(0.30, "2026-04-28T00:00:00Z"),
+            ],
+        )
+        .unwrap();
+
+        let refreshed_at = ts("2026-04-21T00:00:00Z");
+        db.set_refreshed_at_for_test(provider, &refreshed_at)
+            .unwrap();
+        insert_assistant_turns_after(&db, provider, refreshed_at, 50, "delta-n1");
+
+        db.upsert_quota_refresh(
+            provider,
+            &[
+                quota_input(0.25, "2026-04-22T00:00:00Z"),
+                quota_input(0.38, "2026-04-28T00:00:00Z"),
+            ],
+        )
+        .unwrap();
+
+        let windows = db.get_windows(provider).unwrap();
+        assert_eq!(windows.len(), 2);
+        assert!((windows[0].last_delta_percent.unwrap() - 0.05).abs() < 1e-9);
+        assert_eq!(windows[0].last_delta_calls, Some(50));
+        assert!((windows[1].last_delta_percent.unwrap() - 0.08).abs() < 1e-9);
+        assert_eq!(windows[1].last_delta_calls, Some(50));
+    }
+
+    #[test]
+    fn upsert_quota_refresh_carries_prior_window_delta_on_reset_or_no_change() {
+        let db = test_db();
+        let provider = "p";
+        db.upsert_quota_refresh(
+            provider,
+            &[
+                quota_input(0.20, "2026-04-22T00:00:00Z"),
+                quota_input(0.30, "2026-04-28T00:00:00Z"),
+            ],
+        )
+        .unwrap();
+
+        let first_refreshed_at = ts("2026-04-21T00:00:00Z");
+        db.set_refreshed_at_for_test(provider, &first_refreshed_at)
+            .unwrap();
+        insert_assistant_turns_after(&db, provider, first_refreshed_at, 50, "delta-n1");
+        db.upsert_quota_refresh(
+            provider,
+            &[
+                quota_input(0.25, "2026-04-22T00:00:00Z"),
+                quota_input(0.38, "2026-04-28T00:00:00Z"),
+            ],
+        )
+        .unwrap();
+
+        let second_refreshed_at = ts("2026-04-21T12:00:00Z");
+        db.set_refreshed_at_for_test(provider, &second_refreshed_at)
+            .unwrap();
+        insert_assistant_turns_after(&db, provider, second_refreshed_at, 20, "delta-n2");
+        db.upsert_quota_refresh(
+            provider,
+            &[
+                quota_input(0.25, "2026-04-22T00:00:00Z"),
+                quota_input(0.05, "2026-04-28T00:00:00Z"),
+            ],
+        )
+        .unwrap();
+
+        let windows = db.get_windows(provider).unwrap();
+        assert_eq!(windows.len(), 2);
+        assert!((windows[1].last_delta_percent.unwrap() - 0.08).abs() < 1e-9);
+        assert_eq!(windows[1].last_delta_calls, Some(50));
+    }
+
+    #[test]
+    fn quota_tight_routing_column_persisted_to_invocations() {
+        let db = test_db();
+        let start = InvocationStart {
+            invocation_uuid: Uuid::new_v4().to_string(),
+            model_name: "test-model".to_string(),
+            provider_name: "fixture-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+            quota_tight_routing: true,
+        };
+
+        let id = db.start_invocation(&start).unwrap();
+        let persisted: i64 = db
+            .conn
+            .query_row(
+                "SELECT quota_tight_routing FROM invocations WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(persisted, 1);
     }
 
     #[test]

@@ -731,6 +731,7 @@ pub fn run_tauri() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use balancer::RiskClass;
     use config::{ModelConfig, PromptMode, ProviderConfig};
 
     fn make_model(name: &str, commands: &[&str]) -> ModelConfig {
@@ -815,5 +816,47 @@ mod tests {
         assert_eq!(pools.len(), 1);
         assert_eq!(pools[0].commands, vec!["claude".to_string()]);
         assert_eq!(pools[0].model_count, 2);
+    }
+
+    #[test]
+    fn test_model_returns_structured_quota_exhausted_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let model = make_model("quota-model", &["a", "b"]);
+        let mut models = HashMap::new();
+        models.insert(model.name.clone(), model);
+
+        let db = StateDb::open(&dir.path().join("state.db")).unwrap();
+        db.upsert_quota_refresh(
+            "a",
+            &[state::QuotaWindowInput {
+                used_percent: 0.96,
+                resets_at: chrono::Utc::now() + chrono::Duration::hours(24 * 7),
+            }],
+        )
+        .unwrap();
+        db.set_window_delta_for_test("a", 0, 0.01, 22).unwrap();
+        db.upsert_quota_refresh(
+            "b",
+            &[state::QuotaWindowInput {
+                used_percent: 0.99,
+                resets_at: chrono::Utc::now() + chrono::Duration::hours(24 * 7),
+            }],
+        )
+        .unwrap();
+        db.set_window_delta_for_test("b", 0, 0.01, 22).unwrap();
+        drop(db);
+
+        let result = test_model_for_test(models, models_dir, "quota-model").unwrap();
+
+        assert!(!result.success);
+        assert_eq!(result.stdout, "");
+        assert_eq!(result.exit_code, 1);
+        let error = result.error.expect("quota exhaustion should be structured");
+        assert_eq!(error.category, "quota_exhausted");
+        assert_eq!(error.model_name, "quota-model");
+        assert_eq!(error.risk_class, RiskClass::User);
+        assert!(!error.providers.is_empty());
     }
 }
