@@ -249,12 +249,13 @@ Scripts have a 30-second timeout and run via `sh -c`, so `~` expansion and pipel
 | Script | API | Windows |
 |---|---|---|
 | `anthropic-usage CREDS` | `/api/oauth/usage` | 5-hour + 7-day |
+| `chatgpt-usage ~/.codex/auth.json` | `/backend-api/wham/usage` | weekly + 5-hour |
 | `zai-usage AUTH_JSON` | `/api/monitor/usage/quota/limit` | 5-hour + weekly (when usage > 0) |
 
 Install them on your `$PATH`:
 
 ```bash
-install -m 755 scripts/anthropic-usage scripts/zai-usage ~/.local/bin/
+install -m 755 scripts/anthropic-usage scripts/chatgpt-usage scripts/zai-usage ~/.local/bin/
 ```
 
 ## Session Ingestion

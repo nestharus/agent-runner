@@ -205,5 +205,6 @@ Backwards-compat: the legacy single-window shape `{"used_percent": X,
 "resets_at": "..."}` is still parsed and treated as one window.
 
 Reference: see `anthropic-usage` (5h + 7d windows from
-`/api/oauth/usage`) and `zai-usage` (GLM via z.ai). Same adapter pattern
-as turn scripts.
+`/api/oauth/usage`), `chatgpt-usage ~/.codex/auth.json` (weekly + 5h
+windows from `/backend-api/wham/usage`), and `zai-usage` (GLM via z.ai).
+Same adapter pattern as turn scripts.

@@ -41,3 +41,6 @@ credentials.json
 # Process scratch — agent prompts, transient outputs
 tmp/
 .tmp/
+
+# Worktrees (per-PR isolation for phase 6)
+/worktrees/

@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+#
+# Report quota usage for a ChatGPT (OpenAI OAuth, e.g. Codex / opencode)
+# account.
+#
+# Usage: chatgpt-usage PATH_TO_AUTH_JSON
+#   e.g. chatgpt-usage ~/.codex/auth.json
+#        chatgpt-usage ~/.config/opencode/auth.json
+#
+# Prints multi-window JSON on stdout. ChatGPT exposes both a 5-hour rolling
+# window and a weekly rolling window:
+#
+#   {"windows": [
+#      {"used_percent": 45, "resets_at": "2026-04-27T23:26:11Z"},
+#      {"used_percent": 23, "resets_at": "2026-04-21T14:27:00Z"}
+#   ]}
+#
+# Exits 0 on success, non-zero (with diagnostic on stderr) on failure.
+
+set -euo pipefail
+
+CREDS="${1:?usage: chatgpt-usage PATH_TO_AUTH_JSON}"
+
+if [[ ! -r "$CREDS" ]]; then
+  echo "auth file not readable: $CREDS" >&2
+  exit 2
+fi
+
+ACCESS_TOKEN="$(jq -r '.tokens.access_token // empty' "$CREDS")"
+ACCOUNT_ID="$(jq -r '.tokens.account_id // empty' "$CREDS")"
+if [[ -z "$ACCESS_TOKEN" || -z "$ACCOUNT_ID" ]]; then
+  echo "missing tokens.access_token or tokens.account_id in $CREDS" >&2
+  exit 3
+fi
+
+RESP="$(curl -sS --max-time 20 \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "ChatGPT-Account-Id: $ACCOUNT_ID" \
+  https://chatgpt.com/backend-api/wham/usage)"
+
+# Response shape (verified 2026-04-21):
+#   {"rate_limit":{"primary_window":{...}, "secondary_window":{...}}, ...}
+# secondary_window is weekly; primary_window is the 5-hour window.
+echo "$RESP" | jq '{
+  windows: [
+    (if .rate_limit.secondary_window.resets_at then
+       {used_percent: (.rate_limit.secondary_window.used_percent // 0), resets_at: .rate_limit.secondary_window.resets_at}
+     else empty end),
+    (if .rate_limit.primary_window.resets_at then
+       {used_percent: (.rate_limit.primary_window.used_percent // 0), resets_at: .rate_limit.primary_window.resets_at}
+     else empty end)
+  ]
+}'
