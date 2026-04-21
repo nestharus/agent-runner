@@ -191,22 +191,14 @@ Add `RiskClass { User, Background }` to `src-tauri/src/balancer/mod.rs`, next to
 Heuristic cascade:
 
 1. If `--risk-class user|background` is present, use it.
-2. Else if running `repl`, use `User`. The repl override sits above the
-   env-var check because an interactive human session cannot tolerate a
-   background-class routing inherited from a shell export; the
-   `repl_subcommand_always_user_class` test pins this. A workflow that
-   genuinely wants background-class repl sets `--risk-class background`
-   explicitly, and the `--risk-class` flag is marked `global = true` so
-   it reaches the `repl` subcommand under the root parser's
-   `args_conflicts_with_subcommands = true` setting.
-3. Else if `OULIPOLY_RISK_CLASS=user|background`, use it (validated;
-   bogus values error out).
+2. Else if `OULIPOLY_RISK_CLASS=user|background`, use it.
+3. Else if running `repl`, use `User`.
 4. Else for one-shot, use `Background` when `-f/--file` is provided.
 5. Else use `Background` when `OULIPOLY_PARENT_INVOCATION` is set.
 6. Else use `Background` when stdin is not a TTY (pipe or redirect, regardless of whether a positional prompt was also provided). The runner cannot distinguish human-typed pipes (`cat spec.md | agents`, cluster H, 3 of 92 invocations) from scripted pipes, and the majority of observed pipe-stdin cases are workflows. Explicit classification via `--risk-class` or the env var overrides.
 7. Else use `User` (positional prompt at a TTY — clusters C, D, and G, 24 of 92 invocations).
 
-This is the authoritative Q6 cascade as revised (`research/03-load-balancing-tiers-answers.md:166-214`; revision reconciles the earlier rule-5 `cat | agents` example that conflicted with rule 4's scripted-pipe treatment — audit-risk finding 2 on the prior revision, plus the repl/env-var precedence reordering from the phase-7 CodeRabbit loop). Hookpoints: `resolve_prompt` already checks stdin TTY and prompt/file state (`src-tauri/src/main.rs:165-188`); `run` has the direct-model and agent execution branches that call `run_with_balancing` (`src-tauri/src/main.rs:204-289`); `resolve_parent_invocation_id` reads `OULIPOLY_PARENT_INVOCATION` (`src-tauri/src/main.rs:706-714`).
+This is the authoritative Q6 cascade as revised (`research/03-load-balancing-tiers-answers.md:166-214`; revision reconciles the earlier rule-5 `cat | agents` example that conflicted with rule 4's scripted-pipe treatment — audit-risk finding 2 on the prior revision). Hookpoints: `resolve_prompt` already checks stdin TTY and prompt/file state (`src-tauri/src/main.rs:165-188`); `run` has the direct-model and agent execution branches that call `run_with_balancing` (`src-tauri/src/main.rs:204-289`); `resolve_parent_invocation_id` reads `OULIPOLY_PARENT_INVOCATION` (`src-tauri/src/main.rs:706-714`).
 
 Change `select_provider` from:
 
@@ -341,16 +333,9 @@ score_by_density(model, state, quotas, windows, risk_class) -> Result<Selection,
       max_proj = max(max_proj, projected_used_w)
       if projected_used_w >= failure_threshold: any_hard_block = true
       if risk_class == User and projected_used_w >= user_threshold: any_user_block = true
+      remaining_turns_w = (1 - projected_used_w) / br
       hours_until_reset_w = max((w.resets_at - now).seconds / 3600, EPS_HOURS)
-      remaining_headroom_w = max(0, 1 - projected_used_w)
-      # Score shape: (remaining fraction) * (hours until reset). A larger
-      # product means more fractional headroom spread over more hours and
-      # is the preferred tier to burn against. Per-window burn rates still
-      # matter for correctness — they drive `projected_used_w`, which is
-      # what the threshold gates read — but they do NOT enter the below-
-      # threshold ranking directly. The `density_picks_account_with_more_time_when_used_equal`
-      # test pins this formula (more time = higher score = wins).
-      window_rates.push(remaining_headroom_w * hours_until_reset_w)
+      window_rates.push(remaining_turns_w / hours_until_reset_w)
     binding_score = if any_unlearned or any_hard_block or window_rates.is_empty()
                       { None }
                     else

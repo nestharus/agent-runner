@@ -2,15 +2,6 @@
 
 This document maps `proposals/03-load-balancing-tiers.md` onto the current codebase. It is organized by the locked three-PR structure and does not revise the design.
 
-> **Note (pre-change evidence):** All hookpoint claims below describe the
-> codebase state **before** Initiative 03 PRs 1–3 land. The doc
-> intentionally references the old `QuotaRecord.last_delta_*` provider-level
-> fields, the old `select_provider -> usize` signature, the absence of
-> `InvocationStart.quota_tight_routing`, and related pre-change shapes
-> because phase 6 implementers need to know where the *old* code lives
-> in order to replace it. Do not treat this file as a running description
-> of post-PR code.
-
 ## 1. PR 1 hookpoints — `chatgpt-usage`
 
 ### 1.1 Target script

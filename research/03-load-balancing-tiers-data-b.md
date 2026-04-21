@@ -109,13 +109,6 @@ Shell search in `~/work`, `~/projects/server-manager`, `~/.claude/commands`, and
 
 ## 6.4 — Existing flags and env vars available
 
-> **Note (pre-change evidence):** this section captures the CLI and
-> env-var surface *before* Initiative 03 PR 3. PR 3 adds a
-> `--risk-class user|background` main-CLI flag and an
-> `OULIPOLY_RISK_CLASS` env-var read. Those are intentionally absent
-> from the tables below because the tables document the baseline this
-> initiative builds on.
-
 ### CLI flags and positional args in the current parser
 
 Source: `/home/nes/projects/agent-runner/src-tauri/src/main.rs:17-61` and `/home/nes/projects/agent-runner/src-tauri/src/main.rs:63-105`.

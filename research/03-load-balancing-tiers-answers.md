@@ -20,40 +20,30 @@ implements these, not re-evaluates them.
 
 ## Q1 — Binding score unit
 
-**Answer: `(remaining headroom fraction) × (hours until reset)`,
-with per-window burn rate threaded through `projected_used` so the
-threshold gates (70 / 95) see tier-aware projections.**
+**Answer: turns-per-hour (expected time-budget remaining rate).**
 
 Per window *w* of provider *p*:
 
 ```
-projected_used_{p,w} = clamp(used_percent_{p,w} + turns * burn_rate_{p,w}, 0, 1)
-remaining_headroom_{p,w} = max(0, 1 − projected_used_{p,w})
-rate_{p,w}            = remaining_headroom_{p,w} × max(hours_until_reset_{p,w}, ε)
+remaining_turns_{p,w} = (1 − projected_used_{p,w}) / burn_rate_{p,w}
+rate_{p,w}            = remaining_turns_{p,w} / max(hours_until_reset_{p,w}, ε)
 ```
 
 Provider's binding score = `min_w rate_{p,w}`. Pick the provider with
 the highest binding score.
 
-Evidence basis: per-window `burn_rate_{p,w}` (stored post-PR-3, see
-Q2) makes the projection tier-aware — a 5h tier projects ~33× faster
-per turn than a 7d tier on the same account because of the duration-
-ratio relationship between their capacities. That projection feeds
-both threshold gates and the score, which is where "smaller tiers
-are slices of larger tiers" ends up reflected in the math. The
-below-threshold ranking itself is back to the fraction-headroom form
-(not turns-per-hour) because the `density_picks_account_with_more_time_when_used_equal`
-test locks the direction *more time remaining = higher score*, and
-the score formula only has to tie-break safely among providers that
-are all below the hard and user thresholds (the real user-visible
-behavior lives in the gates, not the ranker). An earlier revision
-of this doc proposed `rate = remaining_turns / hours_until_reset`,
-which would have inverted that tie-break direction; that was
-flagged by CodeRabbit on the proposal and corrected to match the
-test and the implementation.
+Evidence basis: the current formula uses "fraction of window per
+hour" which is incommensurable across tiers of different sizes (data
+probe A §1). Turns is the one absolute unit the system already
+ingests (`count_assistant_turns_since`, data-a §1 evidence table), so
+normalizing to turns-per-hour produces a unit that compares
+meaningfully between the 5h slice and the 7d parent. Phase 1 §4.2
+worked example and user's own framing ("the smaller tiers are just
+slices of the large tiers") both require this unit change.
 
-No new stored field is required to express the score. `burn_rate_{p,w}`
-must still be available per window (for projection), which is Q2.
+No new stored field is strictly required to express the score —
+`remaining_turns` is derived, not stored — but `burn_rate_{p,w}`
+must be available per window, which is Q2.
 
 ## Q2 — Per-window burn rate: storage
 
@@ -187,24 +177,18 @@ Shape of the change:
 
 **Answer: two-signal classification.**
 
-Precedence order (first match wins):
+**Explicit signals** (checked in order, first match wins):
 
 1. CLI flag `--risk-class user|background` on the main
    `agents` command (new flag added to the parser in `main.rs`
-   alongside the existing `-m/-a/-f/-p/-i`). This is the caller's
-   explicit per-invocation override.
-2. `repl` subcommand → always `User`. The repl override lands
-   above the env-var check because an interactive human session
-   cannot tolerate a background-class routing decision inherited
-   from a shell export (data-b §6.3 shows `stderr().is_terminal()`
-   is already used to gate interactive-mode stderr decorations).
-   A workflow that genuinely wants a background-class repl sets
-   `--risk-class background` explicitly.
-3. Env var `OULIPOLY_RISK_CLASS=user|background` (new variable).
-   Applies to one-shot invocations and to the heuristic default
-   paths below.
-**Heuristic defaults** (applied only when steps 1–3 did not resolve):
+   alongside the existing `-m/-a/-f/-p/-i`).
+2. Env var `OULIPOLY_RISK_CLASS=user|background` (new variable).
 
+**Implicit default** (when neither is set):
+
+3. `repl` subcommand → always `User` (it is interactive by
+   definition; data-b §6.3 shows `stderr().is_terminal()` is
+   already used to gate interactive-mode stderr decorations).
 4. Main one-shot subcommand → `Background` if any of these hold:
    - `-f/--file` is provided (workflow/automation pattern —
      data-b §6.5 clusters A, B, E, F, I, J, K, L — 60 of 92
@@ -370,12 +354,11 @@ Fix shape (in `StateDb::upsert_quota_refresh`):
 1. Query `SELECT COUNT(*) FROM provider_quota_windows WHERE
    provider_name = ?1` before the DELETE.
 2. If incoming `windows.len() == 0` and prior count > 0 → do NOT
-   delete or modify the window rows; update only `refreshed_at`
-   and `last_empty_refresh_at` (new audit column, see below) so
-   the next caller can see that a refresh happened and produced
-   no windows. Return an Ok-shaped result so callers don't
-   spuriously hit error paths, but the audit column captures the
-   soft-failure for later diagnosis.
+   delete or modify anything; update only `refreshed_at` and
+   `last_error` (new optional column, see below) so the next caller
+   can see that a refresh happened and failed softly. Return an
+   Ok-shaped result so callers don't spuriously hit error paths,
+   but annotate.
 3. If incoming `windows.len() == 0` and prior count == 0 → still
    upsert `provider_quotas` row (so subsequent `is_stale` gets the
    forced-stale signal from §5.1) but don't delete or insert window
