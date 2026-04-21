@@ -1,17 +1,18 @@
 name: Release
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'src-tauri/**'
-      - 'src/**'
-      - 'index.html'
-      - 'package.json'
-      - 'bun.lock'
-      - 'vite.config.ts'
-      - 'tsconfig.json'
-      - '.github/workflows/release.yml'
+  # Manual-only. Every push to main used to fire this workflow, which
+  # meant merging a docs-only change or a small fix produced a new
+  # release and shipped an unverified binary to consumers. Releases
+  # are now gated on an explicit human trigger (Actions tab ->
+  # "Release" -> "Run workflow"), decoupled from merge cadence. CI
+  # (ci.yml) still runs on every PR for test/lint feedback.
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Short note explaining why this release is being cut (shows up in the run's title)."
+        required: false
+        default: "manual release"
 
 permissions:
   contents: write
