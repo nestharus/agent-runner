@@ -5,6 +5,17 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use uuid::Uuid;
 
+/// Ceiling on the per-turn burn rate that `upsert_quota_refresh` is willing
+/// to learn from a single refresh-to-refresh sample. A transient upstream
+/// spike (observed on the ChatGPT usage endpoint: `used_percent` briefly
+/// reported as 1.0 before the window reset) paired with a small turn count
+/// produced a learned rate of ~0.05/turn that then got carried forward across
+/// subsequent no-change refreshes, projecting every provider over the 95%
+/// failure threshold and blocking the whole pool. The highest plausible real
+/// rate observed in live data is ~5e-4/turn on a 5h Claude window; 0.1/turn
+/// is a 200× safety margin that still filters the spike case.
+const MAX_LEARNABLE_BURN_RATE: f64 = 0.1;
+
 pub struct StateDb {
     conn: Connection,
 }
@@ -1353,7 +1364,24 @@ impl StateDb {
                 Some(prior_w) => {
                     let dp = (w.used_percent - prior_w.used_percent).max(0.0);
                     if dp > 0.0 && turns_between_refreshes > 0 {
-                        (Some(dp), Some(turns_between_refreshes))
+                        // Sanity cap on learnable per-turn burn rate. An upstream
+                        // sample spike (API reports used_percent briefly at 1.0
+                        // before resetting; observed on ChatGPT usage endpoint
+                        // 2026-04-21) can otherwise get learned as a permanent
+                        // ~5% per-turn rate when paired with a small turn count,
+                        // then carried forward across subsequent no-change
+                        // refreshes — projecting every provider over
+                        // failure_threshold and blocking the whole pool. The
+                        // highest plausible real rate observed in live DB is
+                        // ~5e-4/turn (Claude 5h); 0.1/turn is a 200× safety
+                        // margin that still filters pathological spikes.
+                        // Reject the sample and carry forward the prior learn.
+                        let new_rate = dp / (turns_between_refreshes as f64);
+                        if new_rate > MAX_LEARNABLE_BURN_RATE {
+                            (prior_w.last_delta_percent, prior_w.last_delta_calls)
+                        } else {
+                            (Some(dp), Some(turns_between_refreshes))
+                        }
                     } else {
                         (prior_w.last_delta_percent, prior_w.last_delta_calls)
                     }
@@ -2705,6 +2733,74 @@ command = "fixture"
         assert_eq!(windows.len(), 2);
         assert!((windows[1].last_delta_percent.unwrap() - 0.08).abs() < 1e-9);
         assert_eq!(windows[1].last_delta_calls, Some(50));
+    }
+
+    #[test]
+    fn upsert_quota_refresh_rejects_pathological_burn_rate_sample() {
+        // Regression: an upstream API spike (used_percent briefly reported as
+        // 1.0) paired with a small turn count would previously learn a
+        // pathological per-turn rate (~0.05/turn), carry it forward across
+        // every subsequent no-change refresh, and permanently project every
+        // provider above failure_threshold. The sanity cap at
+        // MAX_LEARNABLE_BURN_RATE = 0.1/turn rejects this sample and carries
+        // the prior learn forward instead, so the pool stays usable.
+        let db = test_db();
+        let provider = "p";
+
+        // Seed a plausible prior learn (0.05 / 100 calls = 5e-4 per turn).
+        db.upsert_quota_refresh(provider, &[quota_input(0.20, "2026-04-22T00:00:00Z")])
+            .unwrap();
+        let t0 = ts("2026-04-21T00:00:00Z");
+        db.set_refreshed_at_for_test(provider, &t0).unwrap();
+        insert_assistant_turns_after(&db, provider, t0, 100, "prior-learn");
+        db.upsert_quota_refresh(provider, &[quota_input(0.25, "2026-04-22T00:00:00Z")])
+            .unwrap();
+
+        let prior = db.get_windows(provider).unwrap();
+        assert!((prior[0].last_delta_percent.unwrap() - 0.05).abs() < 1e-9);
+        assert_eq!(prior[0].last_delta_calls, Some(100));
+
+        // Now feed a pathological sample: used_percent jumps from 0.25 to
+        // 0.95 over just 5 turns. dp = 0.70, dc = 5, so new_rate = 0.14/turn,
+        // which exceeds MAX_LEARNABLE_BURN_RATE (0.1/turn).
+        let t1 = ts("2026-04-21T06:00:00Z");
+        db.set_refreshed_at_for_test(provider, &t1).unwrap();
+        insert_assistant_turns_after(&db, provider, t1, 5, "spike");
+        db.upsert_quota_refresh(provider, &[quota_input(0.95, "2026-04-22T00:00:00Z")])
+            .unwrap();
+
+        let after_spike = db.get_windows(provider).unwrap();
+        // Pathological sample rejected: delta is still the prior 0.05/100.
+        assert!(
+            (after_spike[0].last_delta_percent.unwrap() - 0.05).abs() < 1e-9,
+            "spike sample should not overwrite prior learn; got {:?}",
+            after_spike[0].last_delta_percent
+        );
+        assert_eq!(after_spike[0].last_delta_calls, Some(100));
+        // used_percent still reflects the incoming sample — we only reject
+        // the delta learn, not the quota observation itself.
+        assert!((after_spike[0].used_percent - 0.95).abs() < 1e-9);
+    }
+
+    #[test]
+    fn upsert_quota_refresh_learns_sample_at_cap_boundary() {
+        // Counterpart to the spike rejection: a plausible-high rate just
+        // below the cap DOES get learned, confirming the cap doesn't
+        // accidentally reject real workloads. 0.09/turn over 10 turns is
+        // below 0.1/turn and should overwrite prior.
+        let db = test_db();
+        let provider = "p";
+        db.upsert_quota_refresh(provider, &[quota_input(0.0, "2026-04-22T00:00:00Z")])
+            .unwrap();
+        let t0 = ts("2026-04-21T00:00:00Z");
+        db.set_refreshed_at_for_test(provider, &t0).unwrap();
+        insert_assistant_turns_after(&db, provider, t0, 10, "boundary");
+        db.upsert_quota_refresh(provider, &[quota_input(0.90, "2026-04-22T00:00:00Z")])
+            .unwrap();
+
+        let w = db.get_windows(provider).unwrap();
+        assert!((w[0].last_delta_percent.unwrap() - 0.90).abs() < 1e-9);
+        assert_eq!(w[0].last_delta_calls, Some(10));
     }
 
     #[test]
