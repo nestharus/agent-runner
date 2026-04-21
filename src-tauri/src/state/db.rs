@@ -355,6 +355,7 @@ impl StateDb {
                 resets_at TEXT,
                 calls_since_refresh INTEGER NOT NULL DEFAULT 0,
                 refreshed_at TEXT,
+                last_empty_refresh_at TEXT,
                 last_delta_percent REAL,
                 last_delta_calls INTEGER
             );
@@ -467,6 +468,7 @@ impl StateDb {
             ",
         )
         .map_err(|e| format!("Failed to initialize schema: {e}"))?;
+        Self::ensure_provider_quotas_schema(&conn)?;
         Self::ensure_session_turns_schema(&conn)?;
 
         Ok(StateDb { conn })
@@ -557,6 +559,36 @@ impl StateDb {
         let mut columns = Vec::new();
         for row in rows {
             columns.push(row.map_err(|e| format!("Failed to read session_turns column: {e}"))?);
+        }
+        Ok(columns)
+    }
+
+    fn ensure_provider_quotas_schema(conn: &Connection) -> Result<(), String> {
+        let columns = Self::provider_quotas_columns(conn)?;
+        if !columns
+            .iter()
+            .any(|column| column == "last_empty_refresh_at")
+        {
+            conn.execute(
+                "ALTER TABLE provider_quotas ADD COLUMN last_empty_refresh_at TEXT",
+                [],
+            )
+            .map_err(|e| format!("Failed to add provider_quotas.last_empty_refresh_at: {e}"))?;
+        }
+        Ok(())
+    }
+
+    fn provider_quotas_columns(conn: &Connection) -> Result<Vec<String>, String> {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(provider_quotas)")
+            .map_err(|e| format!("Failed to inspect provider_quotas schema: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| format!("Failed to inspect provider_quotas columns: {e}"))?;
+
+        let mut columns = Vec::new();
+        for row in rows {
+            columns.push(row.map_err(|e| format!("Failed to read provider_quotas column: {e}"))?);
         }
         Ok(columns)
     }
@@ -1159,10 +1191,63 @@ impl StateDb {
     ) -> Result<(), String> {
         let now = Utc::now().to_rfc3339();
 
-        // Delta-learn against the longest window (max resets_at).
-        let longest_new = windows.iter().max_by_key(|w| w.resets_at);
         let prior = self.get_quota(provider_name)?;
         let prior_windows = self.get_windows(provider_name)?;
+
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("Failed to begin tx: {e}"))?;
+
+        if windows.is_empty() {
+            // Empty input: preserve any prior windows (the DELETE below only
+            // runs on the non-empty branch) and do not reset calls_since_refresh.
+            //
+            // When prior windows exist we must ALSO preserve prior.refreshed_at,
+            // because the per-window delta learner (PR 3) computes
+            //   delta_percent = new.used_percent - prior.used_percent
+            //   delta_calls   = count_assistant_turns_since(prior.refreshed_at)
+            // on the next successful refresh. Advancing refreshed_at here
+            // would count only the turns since the empty refresh while still
+            // measuring delta against the older preserved window sample,
+            // inflating the learned burn rate. Only last_empty_refresh_at
+            // advances — that is the audit timestamp the empty refresh is
+            // observed through.
+            //
+            // When no prior windows exist, we need refreshed_at populated so
+            // is_stale returns the expected values — but the §5.1 empty-
+            // windows guard already forces stale on this shape, so whatever
+            // we write is diagnostic only.
+            if prior_windows.is_empty() {
+                tx.execute(
+                    "INSERT INTO provider_quotas
+                        (provider_name, refreshed_at, last_empty_refresh_at)
+                     VALUES (?1, ?2, ?2)
+                     ON CONFLICT (provider_name) DO UPDATE SET
+                        refreshed_at = ?2,
+                        last_empty_refresh_at = ?2",
+                    params![provider_name, &now],
+                )
+                .map_err(|e| format!("Failed to record empty quota refresh: {e}"))?;
+            } else {
+                tx.execute(
+                    "INSERT INTO provider_quotas
+                        (provider_name, refreshed_at, last_empty_refresh_at)
+                     VALUES (?1, ?2, ?2)
+                     ON CONFLICT (provider_name) DO UPDATE SET
+                        last_empty_refresh_at = ?2",
+                    params![provider_name, &now],
+                )
+                .map_err(|e| format!("Failed to record empty quota refresh: {e}"))?;
+            }
+
+            tx.commit()
+                .map_err(|e| format!("Failed to commit refresh: {e}"))?;
+            return Ok(());
+        }
+
+        // Delta-learn against the longest window (max resets_at).
+        let longest_new = windows.iter().max_by_key(|w| w.resets_at);
         let longest_prior = prior_windows.iter().max_by_key(|w| w.resets_at);
 
         let (delta_percent, delta_calls) = match (&prior, longest_new, longest_prior) {
@@ -1187,11 +1272,6 @@ impl StateDb {
             Some(w) => (w.used_percent, Some(w.resets_at.to_rfc3339())),
             None => (0.0, None),
         };
-
-        let tx = self
-            .conn
-            .unchecked_transaction()
-            .map_err(|e| format!("Failed to begin tx: {e}"))?;
 
         tx.execute(
             "INSERT INTO provider_quotas
@@ -1256,6 +1336,38 @@ impl StateDb {
                 params![refreshed_at.to_rfc3339(), provider_name],
             )
             .map_err(|e| format!("Failed to set refreshed_at: {e}"))?;
+        Ok(())
+    }
+
+    /// Test-only: seed a provider quota row without any window rows.
+    #[cfg(test)]
+    pub(crate) fn insert_quota_row_without_windows_for_test(
+        &self,
+        provider_name: &str,
+        refreshed_at: &DateTime<Utc>,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO provider_quotas
+                    (provider_name, used_percent, resets_at, calls_since_refresh,
+                     refreshed_at, last_delta_percent, last_delta_calls)
+                 VALUES (?1, 0, NULL, 0, ?2, NULL, NULL)
+                 ON CONFLICT (provider_name) DO UPDATE SET
+                    used_percent = 0,
+                    resets_at = NULL,
+                    calls_since_refresh = 0,
+                    refreshed_at = ?2,
+                    last_delta_percent = NULL,
+                    last_delta_calls = NULL",
+                params![provider_name, refreshed_at.to_rfc3339()],
+            )
+            .map_err(|e| format!("Failed to insert quota row: {e}"))?;
+        self.conn
+            .execute(
+                "DELETE FROM provider_quota_windows WHERE provider_name = ?1",
+                params![provider_name],
+            )
+            .map_err(|e| format!("Failed to clear quota windows: {e}"))?;
         Ok(())
     }
 
@@ -1869,6 +1981,56 @@ mod tests {
             .with_timezone(&Utc)
     }
 
+    fn quota_input(used_percent: f64, resets_at: &str) -> QuotaWindowInput {
+        QuotaWindowInput {
+            used_percent,
+            resets_at: ts(resets_at),
+        }
+    }
+
+    fn quota_window_rows(db: &StateDb, provider_name: &str) -> Vec<(u32, f64, String)> {
+        db.get_windows(provider_name)
+            .unwrap()
+            .into_iter()
+            .map(|window| {
+                (
+                    window.window_id,
+                    window.used_percent,
+                    window.resets_at.to_rfc3339(),
+                )
+            })
+            .collect()
+    }
+
+    fn last_empty_refresh_at(db: &StateDb, provider_name: &str) -> Option<DateTime<Utc>> {
+        db.conn
+            .query_row(
+                "SELECT last_empty_refresh_at
+                 FROM provider_quotas
+                 WHERE provider_name = ?1",
+                params![provider_name],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+            .map(|value| {
+                DateTime::parse_from_rfc3339(&value)
+                    .unwrap()
+                    .with_timezone(&Utc)
+            })
+    }
+
+    fn calls_since_refresh(db: &StateDb, provider_name: &str) -> u64 {
+        db.conn
+            .query_row(
+                "SELECT calls_since_refresh
+                 FROM provider_quotas
+                 WHERE provider_name = ?1",
+                params![provider_name],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap() as u64
+    }
+
     fn insert_invocation_fixture(
         db: &StateDb,
         invocation_uuid: &str,
@@ -2307,6 +2469,97 @@ command = "fixture"
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
         }
+    }
+
+    #[test]
+    fn upsert_quota_refresh_preserves_windows_on_empty_input() {
+        let db = test_db();
+        let provider = "p";
+        let windows = [
+            quota_input(0.10, "2026-04-22T00:00:00Z"),
+            quota_input(0.20, "2026-04-28T00:00:00Z"),
+        ];
+        db.upsert_quota_refresh(provider, &windows).unwrap();
+        let before = quota_window_rows(&db, provider);
+
+        db.upsert_quota_refresh(provider, &[]).unwrap();
+
+        assert_eq!(quota_window_rows(&db, provider), before);
+    }
+
+    #[test]
+    fn upsert_quota_refresh_wipes_on_nonempty_input_with_all_replaced() {
+        let db = test_db();
+        let provider = "p";
+        let windows = [
+            quota_input(0.10, "2026-04-22T00:00:00Z"),
+            quota_input(0.20, "2026-04-28T00:00:00Z"),
+        ];
+        db.upsert_quota_refresh(provider, &windows).unwrap();
+
+        let replacement = [quota_input(0.30, "2026-04-23T12:00:00Z")];
+        db.upsert_quota_refresh(provider, &replacement).unwrap();
+
+        assert_eq!(
+            quota_window_rows(&db, provider),
+            vec![(0, 0.30, "2026-04-23T12:00:00+00:00".to_string())]
+        );
+    }
+
+    #[test]
+    fn upsert_quota_refresh_records_last_empty_refresh_at_on_empty_input() {
+        let db = test_db();
+        let provider = "p";
+        let windows = [
+            quota_input(0.10, "2026-04-22T00:00:00Z"),
+            quota_input(0.20, "2026-04-28T00:00:00Z"),
+        ];
+        db.upsert_quota_refresh(provider, &windows).unwrap();
+
+        let before = Utc::now();
+        db.upsert_quota_refresh(provider, &[]).unwrap();
+        let after = Utc::now();
+
+        let last_empty = last_empty_refresh_at(&db, provider).unwrap();
+        assert!(
+            last_empty >= before - chrono::Duration::seconds(1)
+                && last_empty <= after + chrono::Duration::seconds(1),
+            "last_empty_refresh_at {last_empty} should be near empty refresh"
+        );
+    }
+
+    #[test]
+    fn upsert_quota_refresh_empty_input_with_no_prior_windows_creates_forced_stale_quota_row() {
+        let db = test_db();
+        let provider = "p";
+
+        db.upsert_quota_refresh(provider, &[]).unwrap();
+
+        let quota = db.get_quota(provider).unwrap().unwrap();
+        assert!(quota.refreshed_at.is_some());
+        assert!(last_empty_refresh_at(&db, provider).is_some());
+        assert!(db.get_windows(provider).unwrap().is_empty());
+        assert!(crate::quota::is_stale(&db, provider));
+    }
+
+    #[test]
+    fn upsert_quota_refresh_empty_input_does_not_reset_calls_since_refresh_when_prior_windows_exist()
+     {
+        let db = test_db();
+        let provider = "p";
+        let windows = [
+            quota_input(0.10, "2026-04-22T00:00:00Z"),
+            quota_input(0.20, "2026-04-28T00:00:00Z"),
+        ];
+        db.upsert_quota_refresh(provider, &windows).unwrap();
+        for _ in 0..5 {
+            db.increment_calls_since_refresh(provider).unwrap();
+        }
+        assert_eq!(calls_since_refresh(&db, provider), 5);
+
+        db.upsert_quota_refresh(provider, &[]).unwrap();
+
+        assert_eq!(calls_since_refresh(&db, provider), 5);
     }
 
     #[test]
