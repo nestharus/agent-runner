@@ -38,16 +38,21 @@ RESP="$(curl -sS --max-time 20 \
   -H "ChatGPT-Account-Id: $ACCOUNT_ID" \
   https://chatgpt.com/backend-api/wham/usage)"
 
-# Response shape (verified 2026-04-21):
-#   {"rate_limit":{"primary_window":{...}, "secondary_window":{...}}, ...}
+# Response shape (live API sample captured during QA 2026-04-21):
+#   {"rate_limit":{"primary_window":{"used_percent":N,"reset_at":<unix-sec>},
+#                  "secondary_window":{"used_percent":N,"reset_at":<unix-sec>}}, ...}
 # secondary_window is weekly; primary_window is the 5-hour window.
+# The field is `reset_at` (unix seconds), not `resets_at` (RFC3339) —
+# convert via jq `todate` for the runner's `QuotaWindowInput.resets_at`.
 echo "$RESP" | jq '{
   windows: [
-    (if .rate_limit.secondary_window.resets_at then
-       {used_percent: (.rate_limit.secondary_window.used_percent // 0), resets_at: .rate_limit.secondary_window.resets_at}
+    (if .rate_limit.secondary_window.reset_at then
+       {used_percent: (.rate_limit.secondary_window.used_percent // 0),
+        resets_at: (.rate_limit.secondary_window.reset_at | todate)}
      else empty end),
-    (if .rate_limit.primary_window.resets_at then
-       {used_percent: (.rate_limit.primary_window.used_percent // 0), resets_at: .rate_limit.primary_window.resets_at}
+    (if .rate_limit.primary_window.reset_at then
+       {used_percent: (.rate_limit.primary_window.used_percent // 0),
+        resets_at: (.rate_limit.primary_window.reset_at | todate)}
      else empty end)
   ]
 }'
