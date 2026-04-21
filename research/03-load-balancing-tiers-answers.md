@@ -20,30 +20,40 @@ implements these, not re-evaluates them.
 
 ## Q1 — Binding score unit
 
-**Answer: turns-per-hour (expected time-budget remaining rate).**
+**Answer: `(remaining headroom fraction) × (hours until reset)`,
+with per-window burn rate threaded through `projected_used` so the
+threshold gates (70 / 95) see tier-aware projections.**
 
 Per window *w* of provider *p*:
 
 ```
-remaining_turns_{p,w} = (1 − projected_used_{p,w}) / burn_rate_{p,w}
-rate_{p,w}            = remaining_turns_{p,w} / max(hours_until_reset_{p,w}, ε)
+projected_used_{p,w} = clamp(used_percent_{p,w} + turns * burn_rate_{p,w}, 0, 1)
+remaining_headroom_{p,w} = max(0, 1 − projected_used_{p,w})
+rate_{p,w}            = remaining_headroom_{p,w} × max(hours_until_reset_{p,w}, ε)
 ```
 
 Provider's binding score = `min_w rate_{p,w}`. Pick the provider with
 the highest binding score.
 
-Evidence basis: the current formula uses "fraction of window per
-hour" which is incommensurable across tiers of different sizes (data
-probe A §1). Turns is the one absolute unit the system already
-ingests (`count_assistant_turns_since`, data-a §1 evidence table), so
-normalizing to turns-per-hour produces a unit that compares
-meaningfully between the 5h slice and the 7d parent. Phase 1 §4.2
-worked example and user's own framing ("the smaller tiers are just
-slices of the large tiers") both require this unit change.
+Evidence basis: per-window `burn_rate_{p,w}` (stored post-PR-3, see
+Q2) makes the projection tier-aware — a 5h tier projects ~33× faster
+per turn than a 7d tier on the same account because of the duration-
+ratio relationship between their capacities. That projection feeds
+both threshold gates and the score, which is where "smaller tiers
+are slices of larger tiers" ends up reflected in the math. The
+below-threshold ranking itself is back to the fraction-headroom form
+(not turns-per-hour) because the `density_picks_account_with_more_time_when_used_equal`
+test locks the direction *more time remaining = higher score*, and
+the score formula only has to tie-break safely among providers that
+are all below the hard and user thresholds (the real user-visible
+behavior lives in the gates, not the ranker). An earlier revision
+of this doc proposed `rate = remaining_turns / hours_until_reset`,
+which would have inverted that tie-break direction; that was
+flagged by CodeRabbit on the proposal and corrected to match the
+test and the implementation.
 
-No new stored field is strictly required to express the score —
-`remaining_turns` is derived, not stored — but `burn_rate_{p,w}`
-must be available per window, which is Q2.
+No new stored field is required to express the score. `burn_rate_{p,w}`
+must still be available per window (for projection), which is Q2.
 
 ## Q2 — Per-window burn rate: storage
 
