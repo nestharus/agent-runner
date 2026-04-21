@@ -177,18 +177,24 @@ Shape of the change:
 
 **Answer: two-signal classification.**
 
-**Explicit signals** (checked in order, first match wins):
+Precedence order (first match wins):
 
 1. CLI flag `--risk-class user|background` on the main
    `agents` command (new flag added to the parser in `main.rs`
-   alongside the existing `-m/-a/-f/-p/-i`).
-2. Env var `OULIPOLY_RISK_CLASS=user|background` (new variable).
+   alongside the existing `-m/-a/-f/-p/-i`). This is the caller's
+   explicit per-invocation override.
+2. `repl` subcommand → always `User`. The repl override lands
+   above the env-var check because an interactive human session
+   cannot tolerate a background-class routing decision inherited
+   from a shell export (data-b §6.3 shows `stderr().is_terminal()`
+   is already used to gate interactive-mode stderr decorations).
+   A workflow that genuinely wants a background-class repl sets
+   `--risk-class background` explicitly.
+3. Env var `OULIPOLY_RISK_CLASS=user|background` (new variable).
+   Applies to one-shot invocations and to the heuristic default
+   paths below.
+**Heuristic defaults** (applied only when steps 1–3 did not resolve):
 
-**Implicit default** (when neither is set):
-
-3. `repl` subcommand → always `User` (it is interactive by
-   definition; data-b §6.3 shows `stderr().is_terminal()` is
-   already used to gate interactive-mode stderr decorations).
 4. Main one-shot subcommand → `Background` if any of these hold:
    - `-f/--file` is provided (workflow/automation pattern —
      data-b §6.5 clusters A, B, E, F, I, J, K, L — 60 of 92
@@ -354,11 +360,12 @@ Fix shape (in `StateDb::upsert_quota_refresh`):
 1. Query `SELECT COUNT(*) FROM provider_quota_windows WHERE
    provider_name = ?1` before the DELETE.
 2. If incoming `windows.len() == 0` and prior count > 0 → do NOT
-   delete or modify anything; update only `refreshed_at` and
-   `last_error` (new optional column, see below) so the next caller
-   can see that a refresh happened and failed softly. Return an
-   Ok-shaped result so callers don't spuriously hit error paths,
-   but annotate.
+   delete or modify the window rows; update only `refreshed_at`
+   and `last_empty_refresh_at` (new audit column, see below) so
+   the next caller can see that a refresh happened and produced
+   no windows. Return an Ok-shaped result so callers don't
+   spuriously hit error paths, but the audit column captures the
+   soft-failure for later diagnosis.
 3. If incoming `windows.len() == 0` and prior count == 0 → still
    upsert `provider_quotas` row (so subsequent `is_stale` gets the
    forced-stale signal from §5.1) but don't delete or insert window
