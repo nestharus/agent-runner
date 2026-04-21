@@ -1,0 +1,12 @@
+{
+  "rate_limit": {
+    "primary_window": {
+      "used_percent": 17,
+      "resets_at": "2026-04-21T21:15:00Z"
+    },
+    "secondary_window": {
+      "used_percent": 42,
+      "resets_at": "2026-04-28T16:15:00Z"
+    }
+  }
+}
