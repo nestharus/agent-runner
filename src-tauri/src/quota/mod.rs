@@ -360,12 +360,16 @@ mod tests {
             window_id: 0,
             used_percent: 0.0,
             resets_at: hours_from_now(5),
+            last_delta_percent: None,
+            last_delta_calls: None,
         };
         let seven_day = QuotaWindow {
             provider_name: "x".into(),
             window_id: 1,
             used_percent: 0.0,
             resets_at: hours_from_now(24 * 7),
+            last_delta_percent: None,
+            last_delta_calls: None,
         };
         // min(5h, 168h) / 5 ≈ 1h, clamped within [5min, 24h] → 1h
         let ttl = dynamic_ttl_secs(&[five_hour, seven_day]);
@@ -380,6 +384,8 @@ mod tests {
             window_id: 0,
             used_percent: 0.0,
             resets_at: Utc::now() + chrono::Duration::seconds(10),
+            last_delta_percent: None,
+            last_delta_calls: None,
         };
         let ttl = dynamic_ttl_secs(&[near_reset]);
         assert_eq!(ttl, MIN_TTL_SECS);

@@ -31,12 +31,6 @@ pub struct QuotaRecord {
     /// Calls recorded against this provider since the last refresh.
     pub calls_since_refresh: u64,
     pub refreshed_at: Option<DateTime<Utc>>,
-    /// Δused_percent observed at the most recent refresh on the longest
-    /// (most stable) window, vs the refresh before.
-    pub last_delta_percent: Option<f64>,
-    /// Δturns (agent + CLI session turns) between the two refreshes used
-    /// to compute `last_delta_percent`.
-    pub last_delta_calls: Option<u64>,
 }
 
 /// One rolling-quota window reported by a provider's quota script.
@@ -49,6 +43,8 @@ pub struct QuotaWindow {
     /// 0..1 ratio. 0.23 = 23% of this window's budget consumed.
     pub used_percent: f64,
     pub resets_at: DateTime<Utc>,
+    pub last_delta_percent: Option<f64>,
+    pub last_delta_calls: Option<u64>,
 }
 
 /// Input to `upsert_quota_refresh` — one window's freshly-fetched values.
@@ -115,6 +111,7 @@ pub struct InvocationRecord {
     pub error_category: Option<String>,
     pub session_id: Option<String>,
     pub session_capture_method: Option<String>,
+    pub quota_tight_routing: bool,
     pub created_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
 }
@@ -126,6 +123,7 @@ pub struct InvocationStart {
     pub provider_name: String,
     pub provider_index: usize,
     pub parent_invocation_id: Option<i64>,
+    pub quota_tight_routing: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -355,9 +353,7 @@ impl StateDb {
                 resets_at TEXT,
                 calls_since_refresh INTEGER NOT NULL DEFAULT 0,
                 refreshed_at TEXT,
-                last_empty_refresh_at TEXT,
-                last_delta_percent REAL,
-                last_delta_calls INTEGER
+                last_empty_refresh_at TEXT
             );
 
             CREATE TABLE IF NOT EXISTS provider_quota_windows (
@@ -365,6 +361,8 @@ impl StateDb {
                 window_id INTEGER NOT NULL,
                 used_percent REAL NOT NULL DEFAULT 0,
                 resets_at TEXT NOT NULL,
+                last_delta_percent REAL,
+                last_delta_calls INTEGER,
                 PRIMARY KEY (provider_name, window_id)
             );
 
@@ -469,6 +467,7 @@ impl StateDb {
         )
         .map_err(|e| format!("Failed to initialize schema: {e}"))?;
         Self::ensure_provider_quotas_schema(&conn)?;
+        Self::ensure_provider_quota_windows_schema(&conn)?;
         Self::ensure_session_turns_schema(&conn)?;
 
         Ok(StateDb { conn })
@@ -503,6 +502,13 @@ impl StateDb {
                     [],
                 )
                 .map_err(|e| format!("Failed to add invocations.session_capture_method: {e}"))?;
+            }
+            if !columns.iter().any(|column| column == "quota_tight_routing") {
+                conn.execute(
+                    "ALTER TABLE invocations ADD COLUMN quota_tight_routing BOOLEAN NOT NULL DEFAULT 0",
+                    [],
+                )
+                .map_err(|e| format!("Failed to add invocations.quota_tight_routing: {e}"))?;
             }
             conn.execute_batch(Self::invocations_index_sql())
                 .map_err(|e| format!("Failed to ensure invocation indexes: {e}"))?;
@@ -575,6 +581,39 @@ impl StateDb {
             )
             .map_err(|e| format!("Failed to add provider_quotas.last_empty_refresh_at: {e}"))?;
         }
+        if columns.iter().any(|column| column == "last_delta_percent") {
+            conn.execute(
+                "ALTER TABLE provider_quotas DROP COLUMN last_delta_percent",
+                [],
+            )
+            .map_err(|e| format!("Failed to drop provider_quotas.last_delta_percent: {e}"))?;
+        }
+        if columns.iter().any(|column| column == "last_delta_calls") {
+            conn.execute(
+                "ALTER TABLE provider_quotas DROP COLUMN last_delta_calls",
+                [],
+            )
+            .map_err(|e| format!("Failed to drop provider_quotas.last_delta_calls: {e}"))?;
+        }
+        Ok(())
+    }
+
+    fn ensure_provider_quota_windows_schema(conn: &Connection) -> Result<(), String> {
+        let columns = Self::provider_quota_windows_columns(conn)?;
+        if !columns.iter().any(|column| column == "last_delta_percent") {
+            conn.execute(
+                "ALTER TABLE provider_quota_windows ADD COLUMN last_delta_percent REAL NULL",
+                [],
+            )
+            .map_err(|e| format!("Failed to add provider_quota_windows.last_delta_percent: {e}"))?;
+        }
+        if !columns.iter().any(|column| column == "last_delta_calls") {
+            conn.execute(
+                "ALTER TABLE provider_quota_windows ADD COLUMN last_delta_calls INTEGER NULL",
+                [],
+            )
+            .map_err(|e| format!("Failed to add provider_quota_windows.last_delta_calls: {e}"))?;
+        }
         Ok(())
     }
 
@@ -593,6 +632,23 @@ impl StateDb {
         Ok(columns)
     }
 
+    fn provider_quota_windows_columns(conn: &Connection) -> Result<Vec<String>, String> {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(provider_quota_windows)")
+            .map_err(|e| format!("Failed to inspect provider_quota_windows schema: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| format!("Failed to inspect provider_quota_windows columns: {e}"))?;
+
+        let mut columns = Vec::new();
+        for row in rows {
+            columns.push(
+                row.map_err(|e| format!("Failed to read provider_quota_windows column: {e}"))?,
+            );
+        }
+        Ok(columns)
+    }
+
     fn invocations_schema_sql() -> &'static str {
         "CREATE TABLE IF NOT EXISTS invocations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -607,6 +663,7 @@ impl StateDb {
             error_category TEXT,
             session_id TEXT,
             session_capture_method TEXT,
+            quota_tight_routing BOOLEAN NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
             finished_at TEXT
         );
@@ -701,6 +758,7 @@ impl StateDb {
                 error_category TEXT,
                 session_id TEXT,
                 session_capture_method TEXT,
+                quota_tight_routing BOOLEAN NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 finished_at TEXT
             );",
@@ -722,9 +780,10 @@ impl StateDb {
                         error_category,
                         session_id,
                         session_capture_method,
+                        quota_tight_routing,
                         created_at,
                         finished_at
-                     ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, NULL, NULL, ?9, ?9)",
+                     ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, NULL, NULL, 0, ?9, ?9)",
                 )
                 .map_err(|e| format!("Failed to prepare migrated invocation insert: {e}"))?;
 
@@ -811,9 +870,10 @@ impl StateDb {
                     success,
                     exit_code,
                     error_category,
+                    quota_tight_routing,
                     created_at,
                     finished_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, ?7, NULL)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, ?7, ?8, NULL)",
                 params![
                     &start.invocation_uuid,
                     &start.model_name,
@@ -821,6 +881,7 @@ impl StateDb {
                     start.provider_index as i64,
                     start.parent_invocation_id,
                     InvocationStatus::Running.as_str(),
+                    start.quota_tight_routing as i64,
                     &now,
                 ],
             )
@@ -954,7 +1015,8 @@ impl StateDb {
             .prepare(
                 "SELECT id, invocation_uuid, model_name, provider_name, provider_index,
                         parent_invocation_id, status, success, exit_code, error_category,
-                        session_id, session_capture_method, created_at, finished_at
+                        session_id, session_capture_method, quota_tight_routing, created_at,
+                        finished_at
                  FROM invocations
                  WHERE invocation_uuid = ?1",
             )
@@ -977,7 +1039,8 @@ impl StateDb {
             .prepare(
                 "SELECT id, invocation_uuid, model_name, provider_name, provider_index,
                         parent_invocation_id, status, success, exit_code, error_category,
-                        session_id, session_capture_method, created_at, finished_at
+                        session_id, session_capture_method, quota_tight_routing, created_at,
+                        finished_at
                  FROM invocations
                  WHERE parent_invocation_id = ?1
                  ORDER BY created_at, id",
@@ -993,14 +1056,14 @@ impl StateDb {
     }
 
     fn map_invocation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<InvocationRecord> {
-        let created_at_raw: String = row.get(12)?;
-        let finished_at_raw: Option<String> = row.get(13)?;
+        let created_at_raw: String = row.get(13)?;
+        let finished_at_raw: Option<String> = row.get(14)?;
         let status_raw: String = row.get(6)?;
         let created_at = DateTime::parse_from_rfc3339(&created_at_raw)
             .map(|dt| dt.with_timezone(&Utc))
             .map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    12,
+                    13,
                     rusqlite::types::Type::Text,
                     Box::new(e),
                 )
@@ -1011,7 +1074,7 @@ impl StateDb {
                     .map(|dt| dt.with_timezone(&Utc))
                     .map_err(|e| {
                         rusqlite::Error::FromSqlConversionFailure(
-                            13,
+                            14,
                             rusqlite::types::Type::Text,
                             Box::new(e),
                         )
@@ -1039,6 +1102,7 @@ impl StateDb {
             error_category: row.get(9)?,
             session_id: row.get(10)?,
             session_capture_method: row.get(11)?,
+            quota_tight_routing: row.get::<_, i64>(12)? != 0,
             created_at,
             finished_at,
         })
@@ -1112,8 +1176,7 @@ impl StateDb {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT calls_since_refresh, refreshed_at,
-                        last_delta_percent, last_delta_calls
+                "SELECT calls_since_refresh, refreshed_at
                  FROM provider_quotas WHERE provider_name = ?1",
             )
             .map_err(|e| format!("Failed to prepare quota query: {e}"))?;
@@ -1126,8 +1189,6 @@ impl StateDb {
                     .get::<_, Option<String>>(1)?
                     .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                     .map(|dt| dt.with_timezone(&Utc)),
-                last_delta_percent: row.get(2)?,
-                last_delta_calls: row.get::<_, Option<i64>>(3)?.map(|v| v as u64),
             })
         });
 
@@ -1144,7 +1205,7 @@ impl StateDb {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT window_id, used_percent, resets_at
+                "SELECT window_id, used_percent, resets_at, last_delta_percent, last_delta_calls
                  FROM provider_quota_windows
                  WHERE provider_name = ?1
                  ORDER BY window_id",
@@ -1167,6 +1228,8 @@ impl StateDb {
                     window_id: row.get::<_, i64>(0)? as u32,
                     used_percent: row.get(1)?,
                     resets_at,
+                    last_delta_percent: row.get(3)?,
+                    last_delta_calls: row.get::<_, Option<i64>>(4)?.map(|v| v as u64),
                 })
             })
             .map_err(|e| format!("Failed to query windows: {e}"))?;
@@ -1177,9 +1240,8 @@ impl StateDb {
         Ok(out)
     }
 
-    /// Record a freshly-fetched set of quota windows. Computes the delta
-    /// (for avg_percent_per_turn learning) against the longest window — the
-    /// most stable signal. Resets `calls_since_refresh` to 0.
+    /// Record a freshly-fetched set of quota windows. Computes per-window
+    /// deltas for percent-per-turn learning. Resets `calls_since_refresh` to 0.
     ///
     /// Windows are replaced wholesale: anything not in `windows` is deleted,
     /// so a script that drops a window (e.g. CLI removed a rate limit) stops
@@ -1246,25 +1308,18 @@ impl StateDb {
             return Ok(());
         }
 
-        // Delta-learn against the longest window (max resets_at).
         let longest_new = windows.iter().max_by_key(|w| w.resets_at);
-        let longest_prior = prior_windows.iter().max_by_key(|w| w.resets_at);
-
-        let (delta_percent, delta_calls) = match (&prior, longest_new, longest_prior) {
-            (Some(p), Some(new_w), Some(prior_w)) => {
-                let dp = new_w.used_percent - prior_w.used_percent;
-                let turns_between_refreshes = self
-                    .count_assistant_turns_since(provider_name, p.refreshed_at.as_ref())
-                    .unwrap_or(p.calls_since_refresh);
-                if dp > 0.0 && turns_between_refreshes > 0 {
-                    (Some(dp), Some(turns_between_refreshes))
-                } else {
-                    (p.last_delta_percent, p.last_delta_calls)
-                }
-            }
-            (Some(p), _, _) => (p.last_delta_percent, p.last_delta_calls),
-            _ => (None, None),
-        };
+        let turns_between_refreshes = prior
+            .as_ref()
+            .map(|p| {
+                self.count_assistant_turns_since(provider_name, p.refreshed_at.as_ref())
+                    .unwrap_or(p.calls_since_refresh)
+            })
+            .unwrap_or(0);
+        let prior_windows_by_id: std::collections::HashMap<u32, &QuotaWindow> = prior_windows
+            .iter()
+            .map(|window| (window.window_id, window))
+            .collect();
 
         // Backwards-compat: keep used_percent/resets_at on provider_quotas in sync
         // with the longest window so legacy readers see something sensible.
@@ -1275,24 +1330,14 @@ impl StateDb {
 
         tx.execute(
             "INSERT INTO provider_quotas
-                (provider_name, used_percent, resets_at, calls_since_refresh,
-                 refreshed_at, last_delta_percent, last_delta_calls)
-             VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6)
+                (provider_name, used_percent, resets_at, calls_since_refresh, refreshed_at)
+             VALUES (?1, ?2, ?3, 0, ?4)
              ON CONFLICT (provider_name) DO UPDATE SET
                 used_percent = ?2,
                 resets_at = ?3,
                 calls_since_refresh = 0,
-                refreshed_at = ?4,
-                last_delta_percent = ?5,
-                last_delta_calls = ?6",
-            params![
-                provider_name,
-                legacy_used,
-                legacy_resets,
-                &now,
-                delta_percent,
-                delta_calls.map(|v| v as i64),
-            ],
+                refreshed_at = ?4",
+            params![provider_name, legacy_used, legacy_resets, &now],
         )
         .map_err(|e| format!("Failed to upsert quota: {e}"))?;
 
@@ -1303,15 +1348,30 @@ impl StateDb {
         .map_err(|e| format!("Failed to clear windows: {e}"))?;
 
         for (i, w) in windows.iter().enumerate() {
+            let prior_window = prior_windows_by_id.get(&(i as u32)).copied();
+            let (delta_percent, delta_calls) = match prior_window {
+                Some(prior_w) => {
+                    let dp = (w.used_percent - prior_w.used_percent).max(0.0);
+                    if dp > 0.0 && turns_between_refreshes > 0 {
+                        (Some(dp), Some(turns_between_refreshes))
+                    } else {
+                        (prior_w.last_delta_percent, prior_w.last_delta_calls)
+                    }
+                }
+                None => (None, None),
+            };
             tx.execute(
                 "INSERT INTO provider_quota_windows
-                    (provider_name, window_id, used_percent, resets_at)
-                 VALUES (?1, ?2, ?3, ?4)",
+                    (provider_name, window_id, used_percent, resets_at,
+                     last_delta_percent, last_delta_calls)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     provider_name,
                     i as i64,
                     w.used_percent,
-                    w.resets_at.to_rfc3339()
+                    w.resets_at.to_rfc3339(),
+                    delta_percent,
+                    delta_calls.map(|v| v as i64),
                 ],
             )
             .map_err(|e| format!("Failed to insert window: {e}"))?;
@@ -1377,16 +1437,13 @@ impl StateDb {
         self.conn
             .execute(
                 "INSERT INTO provider_quotas
-                    (provider_name, used_percent, resets_at, calls_since_refresh,
-                     refreshed_at, last_delta_percent, last_delta_calls)
-                 VALUES (?1, 0, NULL, 0, ?2, NULL, NULL)
+                    (provider_name, used_percent, resets_at, calls_since_refresh, refreshed_at)
+                 VALUES (?1, 0, NULL, 0, ?2)
                  ON CONFLICT (provider_name) DO UPDATE SET
                     used_percent = 0,
                     resets_at = NULL,
                     calls_since_refresh = 0,
-                    refreshed_at = ?2,
-                    last_delta_percent = NULL,
-                    last_delta_calls = NULL",
+                    refreshed_at = ?2",
                 params![provider_name, refreshed_at.to_rfc3339()],
             )
             .map_err(|e| format!("Failed to insert quota row: {e}"))?;
@@ -1412,48 +1469,6 @@ impl StateDb {
             )
             .map_err(|e| format!("Failed to increment calls_since_refresh: {e}"))?;
         Ok(())
-    }
-
-    /// Fetch provider-level quota records for a set of names in one query.
-    /// Use `get_windows` separately to get each provider's window rows.
-    pub fn get_quotas(&self, names: &[String]) -> Result<Vec<QuotaRecord>, String> {
-        if names.is_empty() {
-            return Ok(vec![]);
-        }
-        let placeholders = vec!["?"; names.len()].join(",");
-        let sql = format!(
-            "SELECT provider_name, calls_since_refresh, refreshed_at,
-                    last_delta_percent, last_delta_calls
-             FROM provider_quotas WHERE provider_name IN ({placeholders})"
-        );
-        let mut stmt = self
-            .conn
-            .prepare(&sql)
-            .map_err(|e| format!("Failed to prepare quota batch query: {e}"))?;
-
-        let name_refs: Vec<&dyn rusqlite::ToSql> =
-            names.iter().map(|n| n as &dyn rusqlite::ToSql).collect();
-
-        let rows = stmt
-            .query_map(name_refs.as_slice(), |row| {
-                Ok(QuotaRecord {
-                    provider_name: row.get(0)?,
-                    calls_since_refresh: row.get::<_, i64>(1)? as u64,
-                    refreshed_at: row
-                        .get::<_, Option<String>>(2)?
-                        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                        .map(|dt| dt.with_timezone(&Utc)),
-                    last_delta_percent: row.get(3)?,
-                    last_delta_calls: row.get::<_, Option<i64>>(4)?.map(|v| v as u64),
-                })
-            })
-            .map_err(|e| format!("Failed to run quota batch query: {e}"))?;
-
-        let mut out = Vec::with_capacity(names.len());
-        for r in rows {
-            out.push(r.map_err(|e| format!("Failed to parse quota row: {e}"))?);
-        }
-        Ok(out)
     }
 
     // --- CLI Provider operations ---
@@ -2093,6 +2108,7 @@ mod tests {
                 provider_name: "fixture-provider".to_string(),
                 provider_index: 0,
                 parent_invocation_id,
+                quota_tight_routing: false,
             })
             .unwrap();
         db.conn
@@ -2724,6 +2740,7 @@ command = "fixture"
             provider_name: "fixture-provider".to_string(),
             provider_index: 0,
             parent_invocation_id: None,
+            quota_tight_routing: false,
         };
 
         let id = db.start_invocation(&start).unwrap();
@@ -2750,6 +2767,7 @@ command = "fixture"
             provider_name: "fixture-provider".to_string(),
             provider_index: 0,
             parent_invocation_id: None,
+            quota_tight_routing: false,
         };
 
         db.start_invocation(&start).unwrap();
@@ -2766,6 +2784,7 @@ command = "fixture"
             provider_name: "fixture-provider".to_string(),
             provider_index: 0,
             parent_invocation_id: None,
+            quota_tight_routing: false,
         };
         let parent_id = db.start_invocation(&parent).unwrap();
 
@@ -2775,6 +2794,7 @@ command = "fixture"
             provider_name: "fixture-provider".to_string(),
             provider_index: 0,
             parent_invocation_id: Some(parent_id),
+            quota_tight_routing: false,
         };
         db.start_invocation(&child).unwrap();
 
@@ -2794,6 +2814,7 @@ command = "fixture"
             provider_name: "fixture-provider".to_string(),
             provider_index: 0,
             parent_invocation_id: None,
+            quota_tight_routing: false,
         };
         let id = db.start_invocation(&start).unwrap();
 
@@ -2819,6 +2840,7 @@ command = "fixture"
             provider_name: "fixture-provider".to_string(),
             provider_index: 0,
             parent_invocation_id: None,
+            quota_tight_routing: false,
         };
         let succeeded = InvocationStart {
             invocation_uuid: Uuid::new_v4().to_string(),
@@ -2826,6 +2848,7 @@ command = "fixture"
             provider_name: "fixture-provider".to_string(),
             provider_index: 0,
             parent_invocation_id: None,
+            quota_tight_routing: false,
         };
 
         let failed_id = db.start_invocation(&failed).unwrap();
@@ -2869,6 +2892,7 @@ command = "fixture"
             provider_name: "fixture-provider".to_string(),
             provider_index: 0,
             parent_invocation_id: None,
+            quota_tight_routing: false,
         };
         let id = db.start_invocation(&start).unwrap();
         db.finalize_invocation(id, true, 0, None, None).unwrap();
@@ -2886,6 +2910,7 @@ command = "fixture"
             provider_name: "fixture-provider".to_string(),
             provider_index: 0,
             parent_invocation_id: None,
+            quota_tight_routing: false,
         };
         let id = db.start_invocation(&start).unwrap();
 
@@ -2925,6 +2950,7 @@ command = "fixture"
             provider_name: "fixture-provider".to_string(),
             provider_index: 0,
             parent_invocation_id: None,
+            quota_tight_routing: false,
         };
         let id = db.start_invocation(&start).unwrap();
 
@@ -2960,6 +2986,7 @@ command = "fixture"
             provider_name: "fixture-provider".to_string(),
             provider_index: 0,
             parent_invocation_id: None,
+            quota_tight_routing: false,
         };
         let id = db.start_invocation(&start).unwrap();
 
@@ -2990,6 +3017,7 @@ command = "fixture"
             provider_name: "fixture-provider".to_string(),
             provider_index: 7,
             parent_invocation_id: None,
+            quota_tight_routing: false,
         };
         let id = db.start_invocation(&start).unwrap();
         let before = db
@@ -3020,6 +3048,7 @@ command = "fixture"
             provider_name: "fixture-provider".to_string(),
             provider_index: 0,
             parent_invocation_id: None,
+            quota_tight_routing: false,
         };
         let succeeded = InvocationStart {
             invocation_uuid: Uuid::new_v4().to_string(),
@@ -3027,6 +3056,7 @@ command = "fixture"
             provider_name: "fixture-provider".to_string(),
             provider_index: 0,
             parent_invocation_id: None,
+            quota_tight_routing: false,
         };
         let failed_id = db.start_invocation(&failed).unwrap();
         db.finalize_invocation(failed_id, false, 1, None, None)
@@ -3300,6 +3330,7 @@ command = "fixture"
                     provider_name: "fixture-provider".to_string(),
                     provider_index: 0,
                     parent_invocation_id: None,
+                    quota_tight_routing: false,
                 };
                 db.start_invocation(&start).unwrap();
                 let running = db
