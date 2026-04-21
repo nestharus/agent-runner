@@ -28,6 +28,25 @@ pub struct TestModelResult {
     pub stdout: String,
     pub stderr: String,
     pub exit_code: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<TestModelError>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct TestModelError {
+    pub category: String,
+    pub message: String,
+    pub model_name: String,
+    pub risk_class: balancer::RiskClass,
+    pub providers: Vec<TestModelProviderInfo>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct TestModelProviderInfo {
+    pub provider_name: String,
+    pub projected_max_used_percent: f64,
+    pub failure_threshold: f64,
+    pub user_threshold: f64,
 }
 
 #[derive(Serialize)]
@@ -257,6 +276,7 @@ fn save_model(state: tauri::State<AppState>, model: ModelConfig) -> Result<(), S
             return Err(format!("Provider {} has empty command", i + 1));
         }
     }
+    model.balancer.validate()?;
 
     let toml_content = model.to_toml();
     let path = state.models_dir.join(format!("{}.toml", model.name));
@@ -488,19 +508,77 @@ async fn test_model(
         .join("state.db");
 
     let result = tauri::async_runtime::spawn_blocking(move || {
-        let db = state::StateDb::open(&db_path).map_err(|e| e.to_string())?;
-        let provider_index = balancer::select_provider(&model, &db, None);
-        executor::execute(&model, provider_index, "Say hello in one sentence.", None)
+        test_model_with_db_path(model, db_path, "Say hello in one sentence.")
     })
     .await
     .map_err(|e| e.to_string())??;
 
+    Ok(result)
+}
+
+fn test_model_with_db_path(
+    model: ModelConfig,
+    db_path: PathBuf,
+    prompt: &str,
+) -> Result<TestModelResult, String> {
+    let db = state::StateDb::open(&db_path).map_err(|e| e.to_string())?;
+    let selection = match balancer::select_provider(&model, &db, None, balancer::RiskClass::User) {
+        Ok(selection) => selection,
+        Err(balancer::BalanceError::Exhausted(err)) => {
+            let message = balancer::BalanceError::Exhausted(err.clone()).to_string();
+            return Ok(TestModelResult {
+                success: false,
+                stdout: String::new(),
+                stderr: message.clone(),
+                exit_code: 1,
+                error: Some(test_model_error_from_exhausted(err, message)),
+            });
+        }
+    };
+    let result = executor::execute(&model, selection.provider_index, prompt, None)?;
     Ok(TestModelResult {
         success: result.exit_code == 0,
         stdout: String::from_utf8_lossy(&result.stdout).into_owned(),
         stderr: result.stderr,
         exit_code: result.exit_code,
+        error: None,
     })
+}
+
+fn test_model_error_from_exhausted(
+    err: balancer::ExhaustedError,
+    message: String,
+) -> TestModelError {
+    TestModelError {
+        category: "quota_exhausted".to_string(),
+        message,
+        model_name: err.model_name,
+        risk_class: err.risk_class,
+        providers: err
+            .providers
+            .into_iter()
+            .map(|provider| TestModelProviderInfo {
+                provider_name: provider.provider_name,
+                projected_max_used_percent: provider.projected_max_used_percent,
+                failure_threshold: provider.failure_threshold,
+                user_threshold: provider.user_threshold,
+            })
+            .collect(),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_model_for_test(
+    models: HashMap<String, ModelConfig>,
+    models_dir: PathBuf,
+    name: &str,
+) -> Result<TestModelResult, String> {
+    let model = models
+        .get(name)
+        .cloned()
+        .ok_or_else(|| format!("Model '{}' not found", name))?;
+    let db_path = models_dir.parent().unwrap_or(&models_dir).join("state.db");
+    test_model_with_db_path(model, db_path, "Say hello in one sentence.")
 }
 
 // --- Provider & Account commands ---
@@ -731,6 +809,7 @@ pub fn run_tauri() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use balancer::RiskClass;
     use config::{ModelConfig, PromptMode, ProviderConfig};
 
     fn make_model(name: &str, commands: &[&str]) -> ModelConfig {
@@ -741,6 +820,7 @@ mod tests {
                 .iter()
                 .map(|c| ProviderConfig::new(c.to_string(), vec![]))
                 .collect(),
+            balancer: Default::default(),
             inputs: vec![],
         }
     }
@@ -784,6 +864,7 @@ mod tests {
                     ProviderConfig::new("claude", vec![]),
                     ProviderConfig::new("claude", vec!["-p".to_string()]),
                 ],
+                balancer: Default::default(),
                 inputs: vec![],
             },
         );
@@ -805,6 +886,7 @@ mod tests {
                 name: "a".to_string(),
                 prompt_mode: PromptMode::Stdin,
                 providers: vec![ProviderConfig::new("env -u CLAUDECODE claude", vec![])],
+                balancer: Default::default(),
                 inputs: vec![],
             },
         );
@@ -815,5 +897,47 @@ mod tests {
         assert_eq!(pools.len(), 1);
         assert_eq!(pools[0].commands, vec!["claude".to_string()]);
         assert_eq!(pools[0].model_count, 2);
+    }
+
+    #[test]
+    fn test_model_returns_structured_quota_exhausted_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let model = make_model("quota-model", &["a", "b"]);
+        let mut models = HashMap::new();
+        models.insert(model.name.clone(), model);
+
+        let db = StateDb::open(&dir.path().join("state.db")).unwrap();
+        db.upsert_quota_refresh(
+            "a",
+            &[state::QuotaWindowInput {
+                used_percent: 0.96,
+                resets_at: chrono::Utc::now() + chrono::Duration::hours(24 * 7),
+            }],
+        )
+        .unwrap();
+        db.set_window_delta_for_test("a", 0, 0.01, 22).unwrap();
+        db.upsert_quota_refresh(
+            "b",
+            &[state::QuotaWindowInput {
+                used_percent: 0.99,
+                resets_at: chrono::Utc::now() + chrono::Duration::hours(24 * 7),
+            }],
+        )
+        .unwrap();
+        db.set_window_delta_for_test("b", 0, 0.01, 22).unwrap();
+        drop(db);
+
+        let result = test_model_for_test(models, models_dir, "quota-model").unwrap();
+
+        assert!(!result.success);
+        assert_eq!(result.stdout, "");
+        assert_eq!(result.exit_code, 1);
+        let error = result.error.expect("quota exhaustion should be structured");
+        assert_eq!(error.category, "quota_exhausted");
+        assert_eq!(error.model_name, "quota-model");
+        assert_eq!(error.risk_class, RiskClass::User);
+        assert!(!error.providers.is_empty());
     }
 }

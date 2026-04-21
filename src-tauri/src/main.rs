@@ -1,4 +1,4 @@
-use agent_runner_lib::balancer;
+use agent_runner_lib::balancer::{self, BalanceError, RiskClass};
 use agent_runner_lib::config::{
     AgentConfig, ModelConfig, load_agent_file, load_agents, load_models,
 };
@@ -7,7 +7,7 @@ use agent_runner_lib::executor;
 use agent_runner_lib::state::{CompositeInvocationId, InvocationStart, StateDb};
 use agent_runner_lib::trace::{TraceOptions, render_ascii_trace, trace_invocation_with_sessions};
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::collections::HashMap;
 use std::io::{IsTerminal, Read, Write as _};
 use std::path::{Path, PathBuf};
@@ -58,6 +58,27 @@ struct Cli {
     /// Pass model inputs as key=value pairs (repeatable)
     #[arg(short = 'i', long = "input", value_name = "KEY=VALUE")]
     inputs: Vec<String>,
+
+    /// Quota routing tolerance for this invocation. Marked `global` so
+    /// it can also be passed alongside subcommands (e.g. `repl`) under
+    /// the root parser's `args_conflicts_with_subcommands = true` setting.
+    #[arg(long = "risk-class", value_enum, global = true)]
+    risk_class: Option<RiskClassArg>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum RiskClassArg {
+    User,
+    Background,
+}
+
+impl From<RiskClassArg> for RiskClass {
+    fn from(value: RiskClassArg) -> Self {
+        match value {
+            RiskClassArg::User => RiskClass::User,
+            RiskClassArg::Background => RiskClass::Background,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Subcommand)]
@@ -188,6 +209,40 @@ fn resolve_prompt(cli: &Cli, include_agent_as_prompt: bool) -> Result<String, St
     Ok(input)
 }
 
+fn resolve_risk_class(cli: &Cli, stdin_is_terminal: bool) -> Result<RiskClass, String> {
+    // Precedence: explicit --risk-class flag > repl subcommand (always User)
+    // > OULIPOLY_RISK_CLASS env var > heuristic. The repl override lands
+    // above the env-var check because an interactive human session cannot
+    // tolerate a background-class routing decision inherited from a shell
+    // export; the repl_subcommand_always_user_class test pins this.
+    if let Some(risk_class) = cli.risk_class {
+        return Ok(risk_class.into());
+    }
+
+    if matches!(&cli.command, Some(Subcommands::Repl { .. })) {
+        return Ok(RiskClass::User);
+    }
+
+    if let Some(value) = std::env::var_os("OULIPOLY_RISK_CLASS") {
+        return match value.to_string_lossy().as_ref() {
+            "user" => Ok(RiskClass::User),
+            "background" => Ok(RiskClass::Background),
+            other => Err(format!(
+                "Invalid OULIPOLY_RISK_CLASS value '{other}'; expected 'user' or 'background'"
+            )),
+        };
+    }
+
+    if cli.file.is_some()
+        || std::env::var_os("OULIPOLY_PARENT_INVOCATION").is_some()
+        || !stdin_is_terminal
+    {
+        return Ok(RiskClass::Background);
+    }
+
+    Ok(RiskClass::User)
+}
+
 fn resolve_models_dir(cli: &Cli) -> PathBuf {
     if let Some(ref dir) = cli.models_dir {
         return dir.clone();
@@ -229,6 +284,7 @@ fn run(cli: Cli) -> Result<i32, String> {
                 resume.as_deref(),
                 project.as_deref(),
                 models_dir.as_deref(),
+                cli.risk_class.map(Into::into),
             ),
         };
     }
@@ -236,6 +292,7 @@ fn run(cli: Cli) -> Result<i32, String> {
     let models_dir = resolve_models_dir(&cli);
     let models = load_models(&models_dir)?;
     let extra_inputs = parse_inputs(&cli.inputs)?;
+    let risk_class = resolve_risk_class(&cli, std::io::stdin().is_terminal())?;
 
     let working_dir = cli.project.clone();
 
@@ -259,6 +316,7 @@ fn run(cli: Cli) -> Result<i32, String> {
             &models,
             working_dir.as_deref(),
             &extra_inputs,
+            risk_class,
         );
     }
 
@@ -285,6 +343,7 @@ fn run(cli: Cli) -> Result<i32, String> {
         &models,
         working_dir.as_deref(),
         &extra_inputs,
+        risk_class,
     )
 }
 
@@ -431,6 +490,7 @@ fn run_repl(
     resume: Option<&str>,
     working_dir: Option<&Path>,
     models_dir_override: Option<&Path>,
+    risk_class_override: Option<RiskClass>,
 ) -> Result<i32, String> {
     let state = StateDb::open_default()?;
     let models_dir = models_dir_override
@@ -459,7 +519,7 @@ fn run_repl(
 
     let parent_invocation_id = resolve_parent_invocation_id(&state);
     let stderr_is_terminal = std::io::stderr().is_terminal();
-    let (provider_index, resume_payload) = if let Some(session_id) = resume {
+    let (provider_index, resume_payload, quota_tight_routing) = if let Some(session_id) = resume {
         if Uuid::parse_str(session_id).is_err() {
             eprintln!("invalid session UUID: {session_id}");
             return Ok(1);
@@ -520,9 +580,29 @@ fn run_repl(
                 session_id,
                 strategy,
             }),
+            false,
         )
     } else {
-        (balancer::select_provider(model, &state, Some(&ctx)), None)
+        let selection = match balancer::select_provider(
+            model,
+            &state,
+            Some(&ctx),
+            risk_class_override.unwrap_or(RiskClass::User),
+        ) {
+            Ok(selection) => selection,
+            Err(err @ BalanceError::Exhausted(_)) => {
+                emit_balance_error(&err);
+                return Ok(1);
+            }
+        };
+        if selection.quota_tight_routing {
+            eprintln!("[warn: no provider below user_threshold; routing via quota-tight path]");
+        }
+        (
+            selection.provider_index,
+            None,
+            selection.quota_tight_routing,
+        )
     };
     let provider = &model.providers[provider_index];
     if provider.interactive_args.is_none() {
@@ -542,6 +622,7 @@ fn run_repl(
         provider_name: provider.name.clone(),
         provider_index,
         parent_invocation_id,
+        quota_tight_routing,
     })?;
     let mut guard = FinalizerGuard::new(&state, invocation_row_id);
     let invocation_env = serde_json::to_string(&invocation)
@@ -592,6 +673,7 @@ fn run_with_balancing(
     all_models: &HashMap<String, ModelConfig>,
     working_dir: Option<&Path>,
     extra_inputs: &HashMap<String, Vec<String>>,
+    risk_class: RiskClass,
 ) -> Result<i32, String> {
     let state = StateDb::open_default().unwrap_or_else(|e| {
         eprintln!("Warning: Could not open state DB ({e}), running without state tracking.");
@@ -619,7 +701,17 @@ fn run_with_balancing(
     // selection itself can be attributed to a parent context if needed
     // (matches contract `tmp/01-pr-a-contract.md` lifecycle ordering).
     let parent_invocation_id = resolve_parent_invocation_id(&state);
-    let provider_index = balancer::select_provider(model, &state, Some(&ctx));
+    let selection = match balancer::select_provider(model, &state, Some(&ctx), risk_class) {
+        Ok(selection) => selection,
+        Err(err @ BalanceError::Exhausted(_)) => {
+            emit_balance_error(&err);
+            return Ok(1);
+        }
+    };
+    if selection.quota_tight_routing {
+        eprintln!("[warn: no provider below user_threshold; routing via quota-tight path]");
+    }
+    let provider_index = selection.provider_index;
     let provider_name = &model.providers[provider_index].name;
     let invocation = CompositeInvocationId {
         source: provider_name.clone(),
@@ -631,6 +723,7 @@ fn run_with_balancing(
         provider_name: provider_name.clone(),
         provider_index,
         parent_invocation_id,
+        quota_tight_routing: selection.quota_tight_routing,
     })?;
     let invocation_env = serde_json::to_string(&invocation)
         .map_err(|e| format!("Failed to serialize invocation id: {e}"))?;
@@ -714,6 +807,14 @@ fn resolve_parent_invocation_id(state: &StateDb) -> Option<i64> {
     }
 }
 
+fn emit_balance_error(err: &BalanceError) {
+    eprintln!("{err}");
+    eprintln!(
+        "[diagnostics: {}]",
+        diagnostics::ErrorCategory::QuotaExhausted.as_str()
+    );
+}
+
 fn run_diagnostics(
     stderr: &str,
     exit_code: i32,
@@ -761,6 +862,7 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_runner_lib::balancer::RiskClass;
     use agent_runner_lib::state::InvocationStatus;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::{Mutex, OnceLock};
@@ -788,6 +890,55 @@ mod tests {
         let result = catch_unwind(AssertUnwindSafe(test));
 
         match previous {
+            Some(value) => unsafe {
+                std::env::set_var("OULIPOLY_PARENT_INVOCATION", value);
+            },
+            None => unsafe {
+                std::env::remove_var("OULIPOLY_PARENT_INVOCATION");
+            },
+        }
+
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    fn with_risk_envs(
+        risk_class: Option<&str>,
+        parent_invocation: Option<&str>,
+        test: impl FnOnce(),
+    ) {
+        let _guard = env_lock().lock().unwrap();
+        let previous_risk = std::env::var_os("OULIPOLY_RISK_CLASS");
+        let previous_parent = std::env::var_os("OULIPOLY_PARENT_INVOCATION");
+        match risk_class {
+            Some(value) => unsafe {
+                std::env::set_var("OULIPOLY_RISK_CLASS", value);
+            },
+            None => unsafe {
+                std::env::remove_var("OULIPOLY_RISK_CLASS");
+            },
+        }
+        match parent_invocation {
+            Some(value) => unsafe {
+                std::env::set_var("OULIPOLY_PARENT_INVOCATION", value);
+            },
+            None => unsafe {
+                std::env::remove_var("OULIPOLY_PARENT_INVOCATION");
+            },
+        }
+
+        let result = catch_unwind(AssertUnwindSafe(test));
+
+        match previous_risk {
+            Some(value) => unsafe {
+                std::env::set_var("OULIPOLY_RISK_CLASS", value);
+            },
+            None => unsafe {
+                std::env::remove_var("OULIPOLY_RISK_CLASS");
+            },
+        }
+        match previous_parent {
             Some(value) => unsafe {
                 std::env::set_var("OULIPOLY_PARENT_INVOCATION", value);
             },
@@ -1045,6 +1196,135 @@ mod tests {
     }
 
     #[test]
+    fn risk_class_cli_flag_overrides_env_var() {
+        let cli = Cli::try_parse_from([
+            "oulipoly-agent-runner",
+            "--risk-class",
+            "background",
+            "--model",
+            "fixture",
+            "prompt",
+        ])
+        .unwrap();
+
+        with_risk_envs(Some("user"), None, || {
+            assert_eq!(
+                resolve_risk_class(&cli, true).unwrap(),
+                RiskClass::Background
+            );
+        });
+    }
+
+    #[test]
+    fn risk_class_env_var_overrides_heuristic() {
+        let cli = Cli::try_parse_from([
+            "oulipoly-agent-runner",
+            "--model",
+            "fixture",
+            "-f",
+            "prompt.md",
+        ])
+        .unwrap();
+
+        with_risk_envs(Some("user"), None, || {
+            assert_eq!(resolve_risk_class(&cli, true).unwrap(), RiskClass::User);
+        });
+    }
+
+    #[test]
+    fn risk_class_heuristic_classifies_file_flag_as_background() {
+        let cli = Cli::try_parse_from([
+            "oulipoly-agent-runner",
+            "--model",
+            "fixture",
+            "-f",
+            "prompt.md",
+        ])
+        .unwrap();
+
+        with_risk_envs(None, None, || {
+            assert_eq!(
+                resolve_risk_class(&cli, true).unwrap(),
+                RiskClass::Background
+            );
+        });
+    }
+
+    #[test]
+    fn risk_class_heuristic_classifies_tty_prompt_as_user() {
+        let cli =
+            Cli::try_parse_from(["oulipoly-agent-runner", "--model", "fixture", "prompt"]).unwrap();
+
+        with_risk_envs(None, None, || {
+            assert_eq!(resolve_risk_class(&cli, true).unwrap(), RiskClass::User);
+        });
+    }
+
+    #[test]
+    fn risk_class_heuristic_classifies_parent_invocation_as_background() {
+        let cli =
+            Cli::try_parse_from(["oulipoly-agent-runner", "--model", "fixture", "prompt"]).unwrap();
+        let parent = r#"{"source":"fixture-provider","id":"00000000-0000-0000-0000-000000000000"}"#;
+
+        with_risk_envs(None, Some(parent), || {
+            assert_eq!(
+                resolve_risk_class(&cli, true).unwrap(),
+                RiskClass::Background
+            );
+        });
+    }
+
+    #[test]
+    fn risk_class_heuristic_classifies_piped_stdin_as_background() {
+        let cli = Cli::try_parse_from(["oulipoly-agent-runner", "--model", "fixture"]).unwrap();
+
+        with_risk_envs(None, None, || {
+            assert_eq!(
+                resolve_risk_class(&cli, false).unwrap(),
+                RiskClass::Background
+            );
+        });
+    }
+
+    #[test]
+    fn repl_subcommand_always_user_class() {
+        let cli = Cli::try_parse_from(["oulipoly-agent-runner", "repl", REPL_MODEL]).unwrap();
+
+        with_risk_envs(Some("background"), Some("parent"), || {
+            assert_eq!(resolve_risk_class(&cli, false).unwrap(), RiskClass::User);
+        });
+    }
+
+    #[test]
+    fn risk_class_flag_reaches_repl_subcommand() {
+        // Regression guard for the #[arg(global = true)] on --risk-class.
+        // Without global, clap rejects root-level args when a subcommand is
+        // present (because args_conflicts_with_subcommands = true on the root
+        // parser), which would make the flag unreachable for repl callers
+        // and silently drop the override.
+        let cli = Cli::try_parse_from([
+            "oulipoly-agent-runner",
+            "--risk-class",
+            "background",
+            "repl",
+            REPL_MODEL,
+        ])
+        .unwrap();
+
+        assert_eq!(
+            cli.risk_class,
+            Some(RiskClassArg::Background),
+            "root-level --risk-class must parse with subcommand"
+        );
+        with_risk_envs(None, None, || {
+            assert_eq!(
+                resolve_risk_class(&cli, false).unwrap(),
+                RiskClass::Background
+            );
+        });
+    }
+
+    #[test]
     fn repl_subcommand_rejects_extra_positional_arguments() {
         let err = match Cli::try_parse_from(["oulipoly-agent-runner", "repl", REPL_MODEL, "extra"])
         {
@@ -1079,6 +1359,7 @@ mod tests {
                 provider_name: parent.source.clone(),
                 provider_index: 0,
                 parent_invocation_id: None,
+                quota_tight_routing: false,
             })
             .unwrap();
         let parent_env = serde_json::to_string(&parent).unwrap();
@@ -1166,6 +1447,7 @@ mod tests {
             provider_name: "fixture-provider".to_string(),
             provider_index: 0,
             parent_invocation_id: None,
+            quota_tight_routing: false,
         };
         let invocation_id = db.start_invocation(&start).unwrap();
 
@@ -1194,6 +1476,7 @@ mod tests {
             provider_name: "fixture-provider".to_string(),
             provider_index: 0,
             parent_invocation_id: None,
+            quota_tight_routing: false,
         };
         let invocation_id = db.start_invocation(&start).unwrap();
 
@@ -1222,6 +1505,7 @@ mod tests {
             provider_name: "fixture-provider".to_string(),
             provider_index: 0,
             parent_invocation_id: None,
+            quota_tight_routing: false,
         };
         let invocation_id = db.start_invocation(&start).unwrap();
 

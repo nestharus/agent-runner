@@ -968,6 +968,7 @@ mod tests {
             name: "test".to_string(),
             prompt_mode: PromptMode::Stdin,
             providers: vec![ProviderConfig::new("test", vec![])],
+            balancer: Default::default(),
             inputs: vec![
                 InputDef {
                     name: "prompt".to_string(),
@@ -1003,6 +1004,7 @@ mod tests {
             name: "test".to_string(),
             prompt_mode: PromptMode::Stdin,
             providers: vec![ProviderConfig::new("test", vec![])],
+            balancer: Default::default(),
             inputs: vec![InputDef {
                 name: "format".to_string(),
                 input_type: InputType::Enum {
@@ -1025,6 +1027,7 @@ mod tests {
             name: "test".to_string(),
             prompt_mode: PromptMode::Stdin,
             providers: vec![ProviderConfig::new("test", vec![])],
+            balancer: Default::default(),
             inputs: vec![InputDef {
                 name: "size".to_string(),
                 input_type: InputType::Enum {
@@ -1049,6 +1052,7 @@ mod tests {
             name: "test".to_string(),
             prompt_mode: PromptMode::Stdin,
             providers: vec![ProviderConfig::new("test", vec![])],
+            balancer: Default::default(),
             inputs: vec![InputDef {
                 name: "image".to_string(),
                 input_type: InputType::String,
@@ -1069,6 +1073,7 @@ mod tests {
             name: "test".to_string(),
             prompt_mode: PromptMode::Stdin,
             providers: vec![ProviderConfig::new("test", vec![])],
+            balancer: Default::default(),
             inputs: vec![],
         };
         let mut inputs = HashMap::new();
@@ -1084,6 +1089,7 @@ mod tests {
             name: "test".to_string(),
             prompt_mode: PromptMode::Arg,
             providers: vec![ProviderConfig::new("echo", vec![])],
+            balancer: Default::default(),
             inputs: vec![],
         };
         let result = execute(&model, 0, "hello world", None, &HashMap::new(), None).unwrap();
@@ -1105,6 +1111,7 @@ mod tests {
             name: "test".to_string(),
             prompt_mode: PromptMode::Arg,
             providers: vec![ProviderConfig::new("echo", vec![])],
+            balancer: Default::default(),
             inputs: vec![],
         };
         let result = execute(&model, 0, "no capture", None, &HashMap::new(), None).unwrap();
@@ -1123,6 +1130,7 @@ mod tests {
             name: "test".to_string(),
             prompt_mode: PromptMode::Stdin,
             providers: vec![ProviderConfig::new("cat", vec![])],
+            balancer: Default::default(),
             inputs: vec![],
         };
         let result = execute(&model, 0, "piped input", None, &HashMap::new(), None).unwrap();
@@ -1137,6 +1145,7 @@ mod tests {
             name: "test".to_string(),
             prompt_mode: PromptMode::Stdin,
             providers: vec![ProviderConfig::new("echo", vec![])],
+            balancer: Default::default(),
             inputs: vec![InputDef {
                 name: "greeting".to_string(),
                 input_type: InputType::String,
@@ -1206,6 +1215,7 @@ printf '{{"type":"system","subtype":"init","session_id":"%s"}}\n' "$requested""#
                     last_message_flag: None,
                 }),
             }],
+            balancer: Default::default(),
             inputs: vec![],
         };
 
@@ -1292,6 +1302,7 @@ printf '{"type":"system","subtype":"init","session_id":"11111111-1111-1111-1111-
                     last_message_flag: None,
                 }),
             }],
+            balancer: Default::default(),
             inputs: vec![],
         };
 
@@ -1350,6 +1361,7 @@ printf 'assistant text from tmpfile\n' > "$output_file""#,
                     last_message_flag: Some("-o".to_string()),
                 }),
             }],
+            balancer: Default::default(),
             inputs: vec![],
         };
 
@@ -1407,6 +1419,7 @@ printf 'assistant text from tmpfile\n' > "$output_file""#,
                     last_message_flag: Some("-o".to_string()),
                 }),
             }],
+            balancer: Default::default(),
             inputs: vec![],
         };
 

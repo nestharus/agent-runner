@@ -205,8 +205,49 @@ pub struct ModelConfig {
     pub name: String,
     pub prompt_mode: PromptMode,
     pub providers: Vec<ProviderConfig>,
+    #[serde(default)]
+    pub balancer: BalancerConfig,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<InputDef>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct BalancerConfig {
+    pub user_threshold: f64,
+    pub failure_threshold: f64,
+}
+
+impl Default for BalancerConfig {
+    fn default() -> Self {
+        Self {
+            user_threshold: 0.70,
+            failure_threshold: 0.95,
+        }
+    }
+}
+
+impl BalancerConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, value) in [
+            ("user_threshold", self.user_threshold),
+            ("failure_threshold", self.failure_threshold),
+        ] {
+            if !value.is_finite() {
+                return Err(format!("balancer.{name} threshold must be finite"));
+            }
+            if !(0.0..=1.0).contains(&value) {
+                return Err(format!(
+                    "balancer.{name} threshold must be between 0.0 and 1.0"
+                ));
+            }
+        }
+        if self.user_threshold > self.failure_threshold {
+            return Err(
+                "balancer.user_threshold must be <= balancer.failure_threshold".to_string(),
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -282,6 +323,13 @@ struct RawModelToml {
     session_capture: Option<SessionCapture>,
     providers: Option<Vec<RawProvider>>,
     inputs: Option<Vec<RawInput>>,
+    balancer: Option<RawBalancerBlock>,
+}
+
+#[derive(Deserialize)]
+struct RawBalancerBlock {
+    user_threshold: Option<f64>,
+    failure_threshold: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -440,6 +488,8 @@ impl ModelConfig {
             }
         }
 
+        append_balancer_toml(&mut out, &self.balancer);
+
         // Inputs
         for input in &self.inputs {
             out.push('\n');
@@ -519,6 +569,8 @@ impl ModelConfig {
             vec![]
         };
 
+        let balancer = parse_balancer(raw.balancer).map_err(|e| format!("Model {name}: {e}"))?;
+
         let providers = if let Some(providers) = raw.providers {
             providers
                 .into_iter()
@@ -587,9 +639,37 @@ impl ModelConfig {
             name: name.to_string(),
             prompt_mode,
             providers,
+            balancer,
             inputs,
         })
     }
+}
+
+fn parse_balancer(raw: Option<RawBalancerBlock>) -> Result<BalancerConfig, String> {
+    let defaults = BalancerConfig::default();
+    let balancer = match raw {
+        Some(raw) => BalancerConfig {
+            user_threshold: raw.user_threshold.unwrap_or(defaults.user_threshold),
+            failure_threshold: raw.failure_threshold.unwrap_or(defaults.failure_threshold),
+        },
+        None => defaults,
+    };
+    balancer.validate()?;
+    Ok(balancer)
+}
+
+fn append_balancer_toml(out: &mut String, balancer: &BalancerConfig) {
+    if *balancer == BalancerConfig::default() {
+        return;
+    }
+
+    out.push('\n');
+    out.push_str("[balancer]\n");
+    out.push_str(&format!("user_threshold = {}\n", balancer.user_threshold));
+    out.push_str(&format!(
+        "failure_threshold = {}\n",
+        balancer.failure_threshold
+    ));
 }
 
 fn append_resume_toml(out: &mut String, table_name: &str, resume: Option<&ResumeStrategy>) {
@@ -1095,6 +1175,106 @@ interactive_args = ["--dangerously-bypass-approvals-and-sandbox", "-m", "gpt-5.4
                 ][..]
             )
         );
+    }
+
+    #[test]
+    fn parse_balancer_defaults_when_block_absent() {
+        let toml = r#"
+command = "codex"
+args = ["exec"]
+prompt_mode = "arg"
+"#;
+
+        let config = ModelConfig::from_toml("test", toml).unwrap();
+
+        assert_eq!(config.balancer.user_threshold, 0.70);
+        assert_eq!(config.balancer.failure_threshold, 0.95);
+    }
+
+    #[test]
+    fn parse_balancer_overrides_thresholds() {
+        let toml = r#"
+command = "codex"
+args = ["exec"]
+prompt_mode = "arg"
+
+[balancer]
+user_threshold = 0.65
+failure_threshold = 0.90
+"#;
+
+        let config = ModelConfig::from_toml("test", toml).unwrap();
+
+        assert_eq!(config.balancer.user_threshold, 0.65);
+        assert_eq!(config.balancer.failure_threshold, 0.90);
+    }
+
+    #[test]
+    fn rejects_balancer_threshold_outside_unit_interval() {
+        for toml in [
+            r#"
+command = "codex"
+args = ["exec"]
+prompt_mode = "arg"
+
+[balancer]
+user_threshold = -0.1
+failure_threshold = 0.90
+"#,
+            r#"
+command = "codex"
+args = ["exec"]
+prompt_mode = "arg"
+
+[balancer]
+user_threshold = 0.70
+failure_threshold = 1.5
+"#,
+        ] {
+            let err = ModelConfig::from_toml("test", toml).unwrap_err();
+            assert!(
+                err.contains("threshold") || err.contains("balancer"),
+                "error should identify balancer threshold validation: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_balancer_user_threshold_above_failure_threshold() {
+        let toml = r#"
+command = "codex"
+args = ["exec"]
+prompt_mode = "arg"
+
+[balancer]
+user_threshold = 0.98
+failure_threshold = 0.90
+"#;
+
+        let err = ModelConfig::from_toml("test", toml).unwrap_err();
+        assert!(
+            err.contains("user_threshold") && err.contains("failure_threshold"),
+            "error should identify threshold ordering: {err}"
+        );
+    }
+
+    #[test]
+    fn roundtrip_model_with_balancer_config() {
+        let original = r#"
+command = "codex"
+args = ["exec"]
+prompt_mode = "arg"
+
+[balancer]
+user_threshold = 0.64
+failure_threshold = 0.91
+"#;
+
+        let c1 = ModelConfig::from_toml("test", original).unwrap();
+        let c2 = ModelConfig::from_toml("test", &c1.to_toml()).unwrap();
+
+        assert_eq!(c2.balancer.user_threshold, 0.64);
+        assert_eq!(c2.balancer.failure_threshold, 0.91);
     }
 
     #[test]

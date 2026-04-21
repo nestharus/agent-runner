@@ -7,7 +7,7 @@
 //! DB, refreshes any stale quotas, then prints — for every multi-provider
 //! model — what `select_provider` would pick and the score breakdown.
 
-use agent_runner_lib::balancer::{BalanceContext, select_provider};
+use agent_runner_lib::balancer::{BalanceContext, RiskClass, select_provider};
 use agent_runner_lib::config::{ProvidersConfig, SessionsConfig, load_models};
 use agent_runner_lib::quota::{InFlight, RefreshOutcome, is_stale, refresh_provider};
 use agent_runner_lib::state::StateDb;
@@ -88,9 +88,8 @@ fn main() {
                     })
                     .collect();
                 println!(
-                    "  {name:<12} {} last_delta={:?} refreshed={}",
+                    "  {name:<12} {} refreshed={}",
                     parts.join(" "),
-                    q.last_delta_percent.zip(q.last_delta_calls),
                     q.refreshed_at
                         .map(|d| d.to_rfc3339())
                         .unwrap_or_else(|| "-".into()),
@@ -114,9 +113,19 @@ fn main() {
         if m.providers.len() <= 1 {
             continue;
         }
-        let pick = select_provider(m, &db, None);
+        let selection = match select_provider(m, &db, None, RiskClass::Background) {
+            Ok(selection) => selection,
+            Err(err) => {
+                println!("  model {name:<18} -> {err}");
+                continue;
+            }
+        };
+        let pick = selection.provider_index;
         let pick_name = &m.providers[pick].name;
-        println!("  model {name:<18} -> provider[{pick}] = {pick_name}");
+        println!(
+            "  model {name:<18} -> provider[{pick}] = {pick_name} quota_tight={}",
+            selection.quota_tight_routing
+        );
         for (i, p) in m.providers.iter().enumerate() {
             let ws = db.get_windows(&p.name).unwrap_or_default();
             let marker = if i == pick { ">>" } else { "  " };
