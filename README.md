@@ -120,6 +120,14 @@ Options:
   -f, --file <FILE>              Read prompt from file
   -p, --project <PROJECT>        Working directory for subprocess
   -i, --input <KEY=VALUE>        Pass model inputs as key=value (repeatable)
+      --risk-class <CLASS>       Routing tolerance: `user` (soft-blocks at
+                                 70% projected) or `background` (hard-blocks
+                                 only at 95%). Global — works with any
+                                 subcommand. Overridable via OULIPOLY_RISK_CLASS
+                                 env var; `repl` always runs as `user` unless
+                                 this flag overrides. Default is heuristic:
+                                 `background` when `-f`, `OULIPOLY_PARENT_INVOCATION`,
+                                 or non-TTY stdin, else `user`.
       --models-dir <MODELS_DIR>  Override models directory
       --agents-dir <AGENTS_DIR>  Override agents directory
   -h, --help                     Print help
@@ -200,13 +208,32 @@ On Unix, signal handling forwards `SIGTERM` once and lets `SIGINT` / `SIGHUP` re
 
 Models with multiple `[[providers]]` are automatically load balanced. The runner picks a provider per invocation using, in order of preference:
 
-1. **Density-based scoring** (when every provider has at least one quota window): picks the provider with the highest **binding density** = `min(remaining / hours_until_reset)` across its rolling-quota windows. A near-exhausted short window (e.g. 5h hitting 95%) drops binding density to ~0 and forces traffic away even if the weekly quota is fine. Projected usage = `used_percent + turns_since_refresh × avg_percent_per_turn`, where `turns_since_refresh` comes from CLI session log ingestion (see [Session Ingestion](#session-ingestion)).
-2. **Invocation-count round-robin** (fallback when any provider lacks a quota reading): picks the provider with the fewest lifetime invocations.
+1. **Per-window binding-rate scoring** (when every provider has at least one quota window): for each window `w` of each provider, project forward with a **per-window burn rate** — `projected_used_w = used_percent_w + turns_since_refresh × burn_rate_w`, where `burn_rate_w` is learned refresh-to-refresh from observed `Δused_percent / Δturns` and stored per window. Score = `(1 − projected_used_w) × hours_until_reset_w`; binding score per provider = `min_w`; pick = `argmax`. A near-exhausted short window (e.g. 5h hitting 95%) drops binding score toward 0 and forces traffic away even if the weekly is fine, and a heavily-used weekly tier is correctly weighted against a fresh 5h tier because each projects at its own rate.
+2. **Invocation-count round-robin** (fallback when no provider has learned any burn rate yet — a true first-run pool): picks the provider with the fewest lifetime invocations.
 3. **Error avoidance** (always applied): providers with 3+ errors in the last 30 minutes are deprioritized regardless of score.
 
-**Why density?** Accounts often have different reset days/times. A 50%-used account resetting in 1 hour has *less* headroom-per-hour than a 10%-used account resetting in 7 days, even though raw "used percent" suggests the opposite. Density normalizes both.
+**Bootstrap cascade.** A window with no directly-learned rate falls through: own-provider → pool sibling on the same `window_id` → duration-ratio from a longer sibling window (scaled by `long_hours / target_hours`, so a 5h slot derived from a 7d learned rate gets a ~33.6× multiplier — shorter tiers burn proportionally faster per turn). If every window of every provider returns `None`, the pool goes to invocation-count round-robin.
 
-Quota readings are refreshed lazily — each CLI invocation runs the participating providers' `quota_script` (see [`providers.toml`](#providerstoml) below) when their cached reading is older than the **dynamic TTL**: `min(hours_until_reset across windows) / 5`, clamped to `[5min, 24h]`. So a provider with a 5-hour window gets re-queried hourly; a provider with only a weekly window gets re-queried every ~33 hours. Refreshes are deduplicated across concurrent callers by an in-process lock.
+### Risk classes
+
+Callers declare a tolerance class per invocation:
+
+- `User` — interactive / user-facing; a mid-call quota exhaustion is visible and unrecoverable. Providers projected above `user_threshold` (default **0.70**) are hidden from the eligible set. If all providers fail the gate, the call soft-degrades to the best remaining hard-eligible provider and the invocation row is flagged `quota_tight_routing = true` with a stderr warning.
+- `Background` — workflow / automation; a failure is retryable at the workflow layer. Only blocked when a window is projected above `failure_threshold` (default **0.95**).
+
+Both classes share the **95% hard refuse**: if every provider's max projected window is ≥ `failure_threshold`, the call returns `quota_exhausted` (CLI: `[diagnostics: quota_exhausted]` + exit 1) instead of routing to a provider that will likely fail mid-call.
+
+Resolution cascade (first match wins): `--risk-class` CLI flag → `repl` subcommand (always `User`) → `OULIPOLY_RISK_CLASS` env var → heuristic default (`Background` if `-f` / `OULIPOLY_PARENT_INVOCATION` / non-TTY stdin; else `User`). Thresholds are overridable per model via an optional `[balancer]` block in model TOML:
+
+```toml
+[balancer]
+user_threshold = 0.70
+failure_threshold = 0.95
+```
+
+**Why per-window + risk-class?** Accounts often have different reset days/times AND different tier structures. Comparing a 50%-used 1h tier to a 10%-used 7d tier on raw `used_percent` is misleading because the same turn consumes a much larger fraction of the shorter tier. Per-window burn rates make the projection tier-aware, and risk classes separate interactive runway safety from background retry tolerance.
+
+Quota readings are refreshed lazily — each CLI invocation runs the participating providers' `quota_script` (see [`providers.toml`](#providerstoml) below) when their cached reading is older than the **dynamic TTL**: `min(hours_until_reset across windows) / 5`, clamped to `[5min, 24h]`. So a provider with a 5-hour window gets re-queried hourly; a provider with only a weekly window gets re-queried every ~33 hours. Refreshes are deduplicated across concurrent callers by an in-process lock. Empty-window responses are rejected (prior windows preserved, `provider_quotas.last_empty_refresh_at` recorded for audit); a provider whose quota row ends up with zero windows is **force-stale** on the next `is_stale` check so it self-heals on the next `select_provider` call.
 
 Provider state is keyed by the provider's `name` field (the CLI account — e.g. `claude`, `claude2`) and is shared across every model routed through that account. This means two models pointing at the same provider share quota and error history.
 
