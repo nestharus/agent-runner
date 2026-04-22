@@ -119,6 +119,22 @@ fn score_by_density(
     let now = Utc::now();
     let mut evals = Vec::with_capacity(candidates.len());
 
+    // Compute the max number of live (not past-reset) windows any candidate
+    // reports. A provider whose upstream API returns fewer windows than
+    // siblings (observed 2026-04-22: `anthropic-usage` returns only the 7d
+    // window for heavily-used accounts because Anthropic's API hides the 5h
+    // timer when the account is near weekly cap) would otherwise dodge the
+    // constraining short-tier term in `min_w` and beat its siblings on the
+    // 7d-tier-only score — the exact opposite of what we want. Defensive
+    // pessimism: when this provider has fewer live windows than the pool
+    // max, penalize the binding as if the missing slots were at 1.0 used
+    // (capacity effectively consumed).
+    let pool_max_live_windows = candidates
+        .iter()
+        .map(|&i| windows[i].iter().filter(|w| w.resets_at > now).count())
+        .max()
+        .unwrap_or(0);
+
     for &i in candidates {
         let ws = &windows[i];
         let recent_errors = state
@@ -145,6 +161,20 @@ fn score_by_density(
         let mut binding_score = f64::INFINITY;
         let mut unlearned = false;
         let mut scored_window = false;
+
+        // If a sibling reports more live windows than we do, penalize the
+        // binding for each missing slot by folding in a worst-case
+        // (0 remaining headroom) contribution. The exact hours figure
+        // doesn't matter — zero headroom multiplied by any positive hours
+        // is still zero, pulling binding to zero for this provider. Only
+        // apply the penalty when at least one sibling DOES report more
+        // live windows; pools where every provider has the same live
+        // window count skip this branch and rank on their own data.
+        let live_window_count = ws.iter().filter(|w| w.resets_at > now).count();
+        if live_window_count < pool_max_live_windows {
+            binding_score = binding_score.min(0.0);
+            scored_window = true;
+        }
 
         for window in ws {
             // Skip windows whose reset already happened: the stored
@@ -628,6 +658,41 @@ mod tests {
         // (much more headroom than b's 7d). Without the skip, a's
         // near-zero 5h binding would lose to b.
         assert_eq!(selected_provider_index(&model, &db), 0);
+    }
+
+    #[test]
+    fn score_by_density_penalizes_provider_missing_window_siblings_have() {
+        // Live-caught 2026-04-22: claude in the claude-opus pool had
+        // only a 7d window reported (anthropic-usage returned 1 window
+        // because Anthropic's API hides the 5h timer when the account
+        // is near weekly cap), while claude2 and claude3 both had 2
+        // windows. Claude's 7d was at 91% used — the MOST pressed
+        // account in the pool. But with only one window to min over
+        // vs siblings' two, claude's binding ((1-0.91)*41h ≈ 3.65)
+        // beat claude3's min((1-0.64)*41h, (1-0.04)*3.6h) ≈ 3.46
+        // simply because claude3's 5h tier pulled its binding down.
+        // 10/10 live invocations routed to the near-exhausted account.
+        //
+        // Defensive pessimism: when a sibling reports more live windows
+        // than this provider, assume the missing slots are fully
+        // consumed (0 remaining headroom) and pull the provider's
+        // binding to zero. The "hidden 5h window" observation
+        // strongly correlates with "account is out of budget."
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = two_provider_model();
+
+        // Provider `a`: ONE 7d window (mimics claude's "hidden 5h"
+        // state), moderately used.
+        seed_windows_with_deltas(&db, "a", &[(0.50, 24 * 7, 0.01, 22)]);
+
+        // Provider `b`: TWO windows (7d + 5h), more used on 7d than `a`.
+        seed_windows_with_deltas(&db, "b", &[(0.60, 24 * 7, 0.01, 22), (0.30, 5, 0.01, 22)]);
+
+        // Without the penalty, `a` would win (0.50 7d < 0.60 7d, and
+        // no 5h tier to constrain it). With the penalty, `a`'s binding
+        // is forced to 0 because it's missing a window siblings have,
+        // so `b` wins.
+        assert_eq!(selected_provider_index(&model, &db), 1);
     }
 
     #[test]
