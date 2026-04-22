@@ -7,7 +7,7 @@
 //! DB, refreshes any stale quotas, then prints — for every multi-provider
 //! model — what `select_provider` would pick and the score breakdown.
 
-use agent_runner_lib::balancer::{BalanceContext, RiskClass, select_provider};
+use agent_runner_lib::balancer::{BalanceContext, select_provider};
 use agent_runner_lib::config::{ProvidersConfig, SessionsConfig, load_models};
 use agent_runner_lib::quota::{InFlight, RefreshOutcome, is_stale, refresh_provider};
 use agent_runner_lib::state::StateDb;
@@ -113,19 +113,9 @@ fn main() {
         if m.providers.len() <= 1 {
             continue;
         }
-        let selection = match select_provider(m, &db, None, RiskClass::Background) {
-            Ok(selection) => selection,
-            Err(err) => {
-                println!("  model {name:<18} -> {err}");
-                continue;
-            }
-        };
-        let pick = selection.provider_index;
+        let pick = select_provider(m, &db, Some(&ctx));
         let pick_name = &m.providers[pick].name;
-        println!(
-            "  model {name:<18} -> provider[{pick}] = {pick_name} quota_tight={}",
-            selection.quota_tight_routing
-        );
+        println!("  model {name:<18} -> provider[{pick}] = {pick_name}");
         for (i, p) in m.providers.iter().enumerate() {
             let ws = db.get_windows(&p.name).unwrap_or_default();
             let marker = if i == pick { ">>" } else { "  " };

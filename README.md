@@ -120,14 +120,6 @@ Options:
   -f, --file <FILE>              Read prompt from file
   -p, --project <PROJECT>        Working directory for subprocess
   -i, --input <KEY=VALUE>        Pass model inputs as key=value (repeatable)
-      --risk-class <CLASS>       Routing tolerance: `user` (soft-blocks at
-                                 70% projected) or `background` (hard-blocks
-                                 only at 95%). Global — works with any
-                                 subcommand. Overridable via OULIPOLY_RISK_CLASS
-                                 env var; `repl` always runs as `user` unless
-                                 this flag overrides. Default is heuristic:
-                                 `background` when `-f`, `OULIPOLY_PARENT_INVOCATION`,
-                                 or non-TTY stdin, else `user`.
       --models-dir <MODELS_DIR>  Override models directory
       --agents-dir <AGENTS_DIR>  Override agents directory
   -h, --help                     Print help
@@ -214,24 +206,9 @@ Models with multiple `[[providers]]` are automatically load balanced. The runner
 
 **Bootstrap cascade.** A window with no directly-learned rate falls through: own-provider → pool sibling on the same `window_id` → duration-ratio from a longer sibling window (scaled by `long_hours / target_hours`, so a 5h slot derived from a 7d learned rate gets a ~33.6× multiplier — shorter tiers burn proportionally faster per turn). If every window of every provider returns `None`, the pool goes to invocation-count round-robin.
 
-### Risk classes
+Accounts often have different reset days/times AND different tier structures. Comparing a 50%-used 1h tier to a 10%-used 7d tier on raw `used_percent` is misleading because the same turn consumes a much larger fraction of the shorter tier. Per-window burn rates make the projection tier-aware.
 
-Callers declare a tolerance class per invocation:
-
-- `User` — interactive / user-facing; a mid-call quota exhaustion is visible and unrecoverable. Providers projected above `user_threshold` (default **0.70**) are hidden from the eligible set. If all providers fail the gate, the call soft-degrades to the best remaining hard-eligible provider and the invocation row is flagged `quota_tight_routing = true` with a stderr warning.
-- `Background` — workflow / automation; a failure is retryable at the workflow layer. Only blocked when a window is projected above `failure_threshold` (default **0.95**).
-
-Both classes share the **95% hard refuse**: if every provider's max projected window is ≥ `failure_threshold`, the call returns `quota_exhausted` (CLI: `[diagnostics: quota_exhausted]` + exit 1) instead of routing to a provider that will likely fail mid-call.
-
-Resolution cascade (first match wins): `--risk-class` CLI flag → `repl` subcommand (always `User`) → `OULIPOLY_RISK_CLASS` env var → heuristic default (`Background` if `-f` / `OULIPOLY_PARENT_INVOCATION` / non-TTY stdin; else `User`). Thresholds are overridable per model via an optional `[balancer]` block in model TOML:
-
-```toml
-[balancer]
-user_threshold = 0.70
-failure_threshold = 0.95
-```
-
-**Why per-window + risk-class?** Accounts often have different reset days/times AND different tier structures. Comparing a 50%-used 1h tier to a 10%-used 7d tier on raw `used_percent` is misleading because the same turn consumes a much larger fraction of the shorter tier. Per-window burn rates make the projection tier-aware, and risk classes separate interactive runway safety from background retry tolerance.
+When a provider actually fails with a quota-exhausted diagnostic (`quota`, `billing`, or `usage limit` in stderr), the account is marked exhausted in SQLite. The balancer skips that provider account for future selections until the next successful non-empty quota refresh clears the flag. There are no threshold gates or pre-emptive blocking; projection ranks providers, and reactive failures temporarily remove accounts from the candidate set.
 
 Quota readings are refreshed lazily — each CLI invocation runs the participating providers' `quota_script` (see [`providers.toml`](#providerstoml) below) when their cached reading is older than the **dynamic TTL**: `min(hours_until_reset across windows) / 5`, clamped to `[5min, 24h]`. So a provider with a 5-hour window gets re-queried hourly; a provider with only a weekly window gets re-queried every ~33 hours. Refreshes are deduplicated across concurrent callers by an in-process lock. Empty-window responses are rejected (prior windows preserved, `provider_quotas.last_empty_refresh_at` recorded for audit); a provider whose quota row ends up with zero windows is **force-stale** on the next `is_stale` check so it self-heals on the next `select_provider` call.
 

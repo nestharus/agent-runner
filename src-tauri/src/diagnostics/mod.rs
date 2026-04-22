@@ -34,6 +34,11 @@ impl ErrorCategory {
     }
 }
 
+pub fn classify_exhaustion(stderr: &str) -> bool {
+    let lower = stderr.to_lowercase();
+    lower.contains("quota") || lower.contains("billing") || lower.contains("usage limit")
+}
+
 pub fn diagnose_error(
     stderr: &str,
     exit_code: i32,
@@ -107,8 +112,7 @@ fn heuristic_diagnosis(stderr: &str, _exit_code: i32) -> Diagnosis {
         || lower.contains("too many requests")
     {
         ErrorCategory::RateLimit
-    } else if lower.contains("quota") || lower.contains("billing") || lower.contains("usage limit")
-    {
+    } else if classify_exhaustion(stderr) {
         ErrorCategory::QuotaExhausted
     } else if lower.contains("unauthorized")
         || lower.contains("auth")
