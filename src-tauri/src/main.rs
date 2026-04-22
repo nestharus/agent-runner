@@ -867,6 +867,17 @@ mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::{Mutex, OnceLock};
 
+    // Tests removed in initiative 04 (see proposals/04-reactive-routing.md §8):
+    // - risk_class_cli_flag_overrides_env_var
+    // - risk_class_env_var_overrides_heuristic
+    // - risk_class_heuristic_classifies_file_flag_as_background
+    // - risk_class_heuristic_classifies_tty_prompt_as_user
+    // - risk_class_heuristic_classifies_parent_invocation_as_background
+    // - risk_class_heuristic_classifies_piped_stdin_as_background
+    // - repl_subcommand_always_user_class
+    // - risk_class_flag_reaches_repl_subcommand
+    // (code agent removes the actual test fns)
+
     const TRACE_UUID: &str = "11111111-1111-1111-1111-111111111111";
     const REPL_MODEL: &str = "fixture-model";
 

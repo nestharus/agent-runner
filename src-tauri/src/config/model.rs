@@ -808,6 +808,14 @@ pub fn load_models(models_dir: &Path) -> Result<HashMap<String, ModelConfig>, St
 mod tests {
     use super::*;
 
+    // Tests removed in initiative 04 (see proposals/04-reactive-routing.md §8):
+    // - parse_balancer_defaults_when_block_absent
+    // - parse_balancer_overrides_thresholds
+    // - rejects_balancer_threshold_outside_unit_interval
+    // - rejects_balancer_user_threshold_above_failure_threshold
+    // - roundtrip_model_with_balancer_config
+    // (code agent removes the actual test fns)
+
     #[test]
     fn derive_provider_name_simple() {
         assert_eq!(derive_provider_name("claude", &[]), "claude");

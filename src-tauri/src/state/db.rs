@@ -2073,6 +2073,10 @@ mod tests {
     use tempfile::TempDir;
     use uuid::Uuid;
 
+    // Tests removed in initiative 04 (see proposals/04-reactive-routing.md §8):
+    // - quota_tight_routing_column_persisted_to_invocations
+    // (code agent removes the actual test fn)
+
     fn test_db() -> StateDb {
         StateDb::open(Path::new(":memory:")).unwrap()
     }
@@ -2152,6 +2156,26 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .unwrap() as u64
+    }
+
+    fn exhausted_at_raw(db: &StateDb, provider_name: &str) -> Option<String> {
+        db.conn
+            .query_row(
+                "SELECT exhausted_at
+                 FROM provider_quotas
+                 WHERE provider_name = ?1",
+                params![provider_name],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+    }
+
+    fn exhausted_at(db: &StateDb, provider_name: &str) -> Option<DateTime<Utc>> {
+        exhausted_at_raw(db, provider_name).map(|value| {
+            DateTime::parse_from_rfc3339(&value)
+                .unwrap()
+                .with_timezone(&Utc)
+        })
     }
 
     fn insert_invocation_fixture(
@@ -2276,6 +2300,113 @@ mod tests {
                 |row| row.get::<_, String>(0),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn mark_exhausted_writes_timestamp_on_existing_quota_row() {
+        let db = test_db();
+        let provider = "p";
+        db.upsert_quota_refresh(provider, &[quota_input(0.10, "2026-04-22T00:00:00Z")])
+            .unwrap();
+
+        let before = Utc::now();
+        db.mark_exhausted(provider).unwrap();
+        let after = Utc::now();
+
+        let exhausted = exhausted_at(&db, provider).expect("exhausted_at should be set");
+        assert!(
+            exhausted >= before - chrono::Duration::seconds(1)
+                && exhausted <= after + chrono::Duration::seconds(1),
+            "exhausted_at {exhausted} should be near mark_exhausted call"
+        );
+    }
+
+    #[test]
+    fn mark_exhausted_is_noop_when_no_quota_row() {
+        let db = test_db();
+
+        db.mark_exhausted("missing-provider").unwrap();
+
+        let row_count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM provider_quotas", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(row_count, 0);
+    }
+
+    #[test]
+    fn upsert_quota_refresh_clears_exhausted_at_on_nonempty_refresh() {
+        let db = test_db();
+        let provider = "p";
+        db.upsert_quota_refresh(provider, &[quota_input(0.10, "2026-04-22T00:00:00Z")])
+            .unwrap();
+        db.mark_exhausted(provider).unwrap();
+        assert!(exhausted_at_raw(&db, provider).is_some());
+
+        db.upsert_quota_refresh(provider, &[quota_input(0.20, "2026-04-23T00:00:00Z")])
+            .unwrap();
+
+        assert_eq!(exhausted_at_raw(&db, provider), None);
+    }
+
+    #[test]
+    fn upsert_quota_refresh_preserves_exhausted_at_on_empty_refresh() {
+        let db = test_db();
+        let provider = "p";
+        db.upsert_quota_refresh(provider, &[quota_input(0.10, "2026-04-22T00:00:00Z")])
+            .unwrap();
+        db.mark_exhausted(provider).unwrap();
+        let exhausted_before = exhausted_at_raw(&db, provider).expect("exhausted_at should be set");
+
+        db.upsert_quota_refresh(provider, &[]).unwrap();
+
+        assert_eq!(
+            exhausted_at_raw(&db, provider).as_deref(),
+            Some(exhausted_before.as_str())
+        );
+    }
+
+    #[test]
+    fn quota_tight_routing_column_dropped_after_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE invocations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                invocation_uuid TEXT NOT NULL UNIQUE,
+                model_name TEXT NOT NULL,
+                provider_name TEXT,
+                provider_index INTEGER NOT NULL,
+                parent_invocation_id INTEGER REFERENCES invocations(id),
+                status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'legacy')),
+                success INTEGER,
+                exit_code INTEGER,
+                error_category TEXT,
+                session_id TEXT,
+                session_capture_method TEXT,
+                quota_tight_routing BOOLEAN NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                finished_at TEXT
+            );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = StateDb::open(&path).unwrap();
+
+        let columns: Vec<String> = db
+            .conn
+            .prepare("PRAGMA table_info(invocations)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            !columns.iter().any(|column| column == "quota_tight_routing"),
+            "quota_tight_routing should be removed by migration: {columns:?}"
+        );
     }
 
     #[test]

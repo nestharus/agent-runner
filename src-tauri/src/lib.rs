@@ -812,6 +812,10 @@ mod tests {
     use balancer::RiskClass;
     use config::{ModelConfig, PromptMode, ProviderConfig};
 
+    // Tests removed in initiative 04 (see proposals/04-reactive-routing.md §8):
+    // - test_model_returns_structured_quota_exhausted_error
+    // (code agent removes the actual test fn)
+
     fn make_model(name: &str, commands: &[&str]) -> ModelConfig {
         ModelConfig {
             name: name.to_string(),

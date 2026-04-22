@@ -137,6 +137,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn classify_exhaustion_matches_quota_billing_usage_limit_stderr() {
+        for stderr in [
+            "error: QUOTA exceeded for this account",
+            "Billing limit reached for the workspace",
+            "USAGE LIMIT has been hit; try again later",
+        ] {
+            assert!(
+                classify_exhaustion(stderr),
+                "expected quota exhaustion classification for {stderr:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_exhaustion_ignores_non_quota_errors() {
+        for stderr in [
+            "authentication failed: token expired",
+            "network error: connection timed out",
+            "compile error: expected expression before token",
+            "unknown flag: --definitely-not-real",
+            "process exited with status 1",
+        ] {
+            assert!(
+                !classify_exhaustion(stderr),
+                "did not expect quota exhaustion classification for {stderr:?}"
+            );
+        }
+    }
+
+    #[test]
     fn heuristic_rate_limit() {
         let d = heuristic_diagnosis("Error: 429 Too Many Requests", 1);
         assert_eq!(d.category, ErrorCategory::RateLimit);

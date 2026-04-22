@@ -480,6 +480,13 @@ mod tests {
     use std::path::Path;
     use uuid::Uuid;
 
+    // Tests removed in initiative 04 (see proposals/04-reactive-routing.md §8):
+    // - failure_threshold_returns_exhausted_not_roundrobin_when_all_fail
+    // - failure_threshold_hard_blocks_all_classes
+    // - user_threshold_hides_provider_from_user_class_only
+    // - user_threshold_soft_degrades_with_quota_tight_flag_when_all_fail
+    // (code agent removes the actual test fns)
+
     fn record_invocation_for_test(
         db: &StateDb,
         model_name: &str,
@@ -644,11 +651,59 @@ mod tests {
         select_provider(model, db, None, risk_class).expect("provider should be selectable")
     }
 
+    fn selected_provider_after_phase_04(model: &ModelConfig, db: &StateDb) -> usize {
+        select_provider(model, db, None)
+    }
+
     fn assert_approx(actual: f64, expected: f64, tolerance: f64) {
         assert!(
             (actual - expected).abs() <= tolerance,
             "expected {actual} to be within {tolerance} of {expected}"
         );
+    }
+
+    #[test]
+    fn select_provider_filters_exhausted_accounts() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = two_provider_model();
+
+        seed_windows_with_deltas(&db, "a", &[(0.10, 24 * 7, 0.01, 22)]);
+        seed_windows_with_deltas(&db, "b", &[(0.60, 24 * 7, 0.01, 22)]);
+        db.mark_exhausted("a").unwrap();
+
+        assert_eq!(selected_provider_after_phase_04(&model, &db), 1);
+    }
+
+    #[test]
+    fn all_providers_exhausted_falls_through_to_round_robin() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = two_provider_model();
+
+        db.upsert_quota_refresh("a", &[]).unwrap();
+        db.upsert_quota_refresh("b", &[]).unwrap();
+        db.mark_exhausted("a").unwrap();
+        db.mark_exhausted("b").unwrap();
+        record_invocation_for_test(&db, "test", "a", 0, true);
+
+        assert_eq!(selected_provider_after_phase_04(&model, &db), 1);
+    }
+
+    #[test]
+    fn exhausted_filter_does_not_prevent_refresh_loop_from_clearing() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = two_provider_model();
+
+        seed_windows_with_deltas(&db, "a", &[(0.10, 24 * 7, 0.01, 22)]);
+        seed_windows_with_deltas(&db, "b", &[(0.60, 24 * 7, 0.01, 22)]);
+        db.mark_exhausted("a").unwrap();
+        db.mark_exhausted("b").unwrap();
+
+        // Simulate a successful non-empty refresh for b. The production
+        // refresh loop must make this same state transition before filtering.
+        db.upsert_quota_refresh("b", &[quota_window(0.60, 24 * 7)])
+            .unwrap();
+
+        assert_eq!(selected_provider_after_phase_04(&model, &db), 1);
     }
 
     #[test]
