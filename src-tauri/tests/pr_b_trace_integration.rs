@@ -80,7 +80,6 @@ command = "{}"
                 provider_name: "fixture-provider".to_string(),
                 provider_index: 0,
                 parent_invocation_id: None,
-                quota_tight_routing: false,
             })
             .unwrap();
         db.finalize_invocation(root_id, true, 0, None, None)
@@ -93,7 +92,6 @@ command = "{}"
                 provider_name: "fixture-provider".to_string(),
                 provider_index: 0,
                 parent_invocation_id: Some(root_id),
-                quota_tight_routing: false,
             })
             .unwrap();
         db.finalize_invocation(child_id, false, 7, Some("fixture_error"), None)

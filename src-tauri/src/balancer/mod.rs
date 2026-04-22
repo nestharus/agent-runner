@@ -3,64 +3,15 @@ use crate::quota::{InFlight, RefreshOutcome, is_stale, refresh_provider};
 use crate::sessions::scan_provider;
 use crate::state::{QuotaRecord, QuotaWindow, StateDb};
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
 
 const ERROR_WINDOW_MINUTES: i64 = 30;
 const ERROR_THRESHOLD: u64 = 3;
 const EPS_HOURS: f64 = 1.0 / 60.0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RiskClass {
-    User,
-    Background,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Selection {
-    pub provider_index: usize,
-    pub quota_tight_routing: bool,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum BalanceError {
-    Exhausted(ExhaustedError),
-}
-
-impl std::fmt::Display for BalanceError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            BalanceError::Exhausted(_) => {
-                write!(f, "All providers projected above failure_threshold")
-            }
-        }
-    }
-}
-
-impl std::error::Error for BalanceError {}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ExhaustedError {
-    pub model_name: String,
-    pub risk_class: RiskClass,
-    pub providers: Vec<ExhaustedProviderInfo>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ExhaustedProviderInfo {
-    pub provider_name: String,
-    pub projected_max_used_percent: f64,
-    pub failure_threshold: f64,
-    pub user_threshold: f64,
-}
-
 #[derive(Debug, Clone)]
 struct ProviderEval {
     index: usize,
     binding_score: Option<f64>,
-    hard_blocked: bool,
-    user_blocked: bool,
-    max_projected_used_percent: f64,
     unlearned: bool,
 }
 
@@ -80,14 +31,10 @@ pub fn select_provider(
     model: &ModelConfig,
     state: &StateDb,
     ctx: Option<&BalanceContext<'_>>,
-    risk_class: RiskClass,
-) -> Result<Selection, BalanceError> {
+) -> usize {
     let n = model.providers.len();
     if n <= 1 {
-        return Ok(Selection {
-            provider_index: 0,
-            quota_tight_routing: false,
-        });
+        return 0;
     }
 
     // 1) Opportunistic refresh of any stale provider whose quota we can fetch.
@@ -119,18 +66,47 @@ pub fn select_provider(
         .iter()
         .map(|p| state.get_windows(&p.name).unwrap_or_default())
         .collect();
+    let all_indices: Vec<usize> = (0..n).collect();
+    let filtered_indices: Vec<usize> = all_indices
+        .iter()
+        .copied()
+        .filter(|i| {
+            quotas
+                .get(*i)
+                .and_then(|quota| quota.as_ref())
+                .and_then(|quota| quota.exhausted_at.as_ref())
+                .is_none()
+        })
+        .collect();
+    // If every provider is flagged exhausted, DO NOT restore all_indices and
+    // route back into the known-bad pool via normal scoring — that spams
+    // already-exhausted accounts on every invocation and contradicts the
+    // user-locked "wait until refresh" invariant. Short-circuit and return
+    // the oldest-exhausted index directly (most likely to have recovered
+    // on its next successful refresh). Callers see this choice as
+    // best-guess routing; the subprocess will report quota_exhausted
+    // stderr as ground truth either way.
+    if filtered_indices.is_empty() {
+        return all_indices
+            .into_iter()
+            .min_by(|&a, &b| {
+                let ta = quotas[a].as_ref().and_then(|q| q.exhausted_at.as_ref());
+                let tb = quotas[b].as_ref().and_then(|q| q.exhausted_at.as_ref());
+                // Oldest exhausted_at first; ties break on provider index.
+                ta.cmp(&tb).then_with(|| a.cmp(&b))
+            })
+            .unwrap_or(0);
+    }
+    let candidates: &[usize] = filtered_indices.as_slice();
 
     // 3) If every provider has at least one window, use density scoring.
-    let all_have_windows = windows.iter().all(|w| !w.is_empty());
+    let all_have_windows = candidates.iter().all(|i| !windows[*i].is_empty());
     if all_have_windows {
-        return score_by_density(model, state, &quotas, &windows, risk_class);
+        return score_by_density(model, state, &quotas, &windows, candidates);
     }
 
     // 4) Otherwise, fall back to lifetime invocation-count scoring.
-    Ok(Selection {
-        provider_index: score_by_invocation_count(model, state),
-        quota_tight_routing: false,
-    })
+    score_by_invocation_count(model, state, candidates)
 }
 
 fn score_by_density(
@@ -138,12 +114,13 @@ fn score_by_density(
     state: &StateDb,
     quotas: &[Option<QuotaRecord>],
     windows: &[Vec<QuotaWindow>],
-    risk_class: RiskClass,
-) -> Result<Selection, BalanceError> {
+    candidates: &[usize],
+) -> usize {
     let now = Utc::now();
-    let mut evals = Vec::with_capacity(model.providers.len());
+    let mut evals = Vec::with_capacity(candidates.len());
 
-    for (i, ws) in windows.iter().enumerate() {
+    for &i in candidates {
+        let ws = &windows[i];
         let recent_errors = state
             .recent_error_count(&model.name, i, ERROR_WINDOW_MINUTES)
             .unwrap_or(0);
@@ -151,9 +128,6 @@ fn score_by_density(
             evals.push(ProviderEval {
                 index: i,
                 binding_score: None,
-                hard_blocked: true,
-                user_blocked: true,
-                max_projected_used_percent: 1.0,
                 unlearned: false,
             });
             continue;
@@ -169,27 +143,28 @@ fn score_by_density(
             .unwrap_or(0);
 
         let mut binding_score = f64::INFINITY;
-        let mut max_projected_used_percent = 0.0_f64;
-        let mut hard_blocked = false;
-        let mut user_blocked = false;
         let mut unlearned = false;
         let mut scored_window = false;
 
         for window in ws {
+            // Skip windows whose reset already happened: the stored
+            // used_percent is from the prior window instance, so treating it
+            // as "how much headroom remains" is wrong. The refresh loop
+            // should replace this row on its next successful fetch; if the
+            // scraper keeps returning empty (observed 2026-04-22 on claude3
+            // when anthropic-usage returned `{"windows":[]}`), preserving
+            // the past-reset row poisons the binding score by clamping
+            // hours-until-reset to EPS_HOURS and torpedoing the provider.
+            // Drop it from ranking entirely.
+            if window.resets_at <= now {
+                continue;
+            }
             let Some(burn_rate) = bootstrap_burn_rate(i, window, quotas, windows) else {
                 unlearned = true;
                 continue;
             };
 
             let projected = project_used_percent(window.used_percent, turns, burn_rate);
-            max_projected_used_percent = max_projected_used_percent.max(projected);
-            if projected >= model.balancer.failure_threshold {
-                hard_blocked = true;
-            }
-            if projected >= model.balancer.user_threshold {
-                user_blocked = true;
-            }
-
             let hours = ((window.resets_at - now).num_seconds() as f64 / 3600.0).max(EPS_HOURS);
             let remaining_headroom = (1.0 - projected).max(0.0);
             binding_score = binding_score.min(remaining_headroom * hours);
@@ -198,57 +173,25 @@ fn score_by_density(
 
         evals.push(ProviderEval {
             index: i,
-            binding_score: if unlearned || hard_blocked || !scored_window {
+            binding_score: if unlearned || !scored_window {
                 None
             } else {
                 Some(binding_score)
             },
-            hard_blocked,
-            user_blocked,
-            max_projected_used_percent,
             unlearned,
         });
     }
 
-    let hard_eligible: Vec<&ProviderEval> = evals
+    let eligible: Vec<&ProviderEval> = evals
         .iter()
-        .filter(|eval| !eval.hard_blocked && !eval.unlearned)
+        .filter(|eval| !eval.unlearned && eval.binding_score.is_some())
         .collect();
 
-    if hard_eligible.is_empty() {
-        if evals.iter().all(|eval| eval.unlearned) && evals.iter().all(|eval| !eval.hard_blocked) {
-            return Ok(Selection {
-                provider_index: round_robin_fallback(model, state),
-                quota_tight_routing: false,
-            });
-        }
-        return Err(BalanceError::Exhausted(exhausted_error(
-            model, risk_class, &evals,
-        )));
+    if eligible.is_empty() {
+        return round_robin_fallback(model, state, candidates);
     }
 
-    let winner = if risk_class == RiskClass::User {
-        let user_eligible: Vec<&ProviderEval> = hard_eligible
-            .iter()
-            .copied()
-            .filter(|eval| !eval.user_blocked)
-            .collect();
-        if user_eligible.is_empty() {
-            let winner = best_binding_score(&hard_eligible);
-            return Ok(Selection {
-                provider_index: winner.index,
-                quota_tight_routing: true,
-            });
-        }
-        best_binding_score(&user_eligible)
-    } else {
-        best_binding_score(&hard_eligible)
-    };
-
-    Ok(Selection {
-        provider_index: winner.index,
-        quota_tight_routing: false,
-    })
+    best_binding_score(&eligible).index
 }
 
 fn best_binding_score<'a>(evals: &[&'a ProviderEval]) -> &'a ProviderEval {
@@ -267,26 +210,6 @@ fn best_binding_score<'a>(evals: &[&'a ProviderEval]) -> &'a ProviderEval {
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
         .unwrap()
-}
-
-fn exhausted_error(
-    model: &ModelConfig,
-    risk_class: RiskClass,
-    evals: &[ProviderEval],
-) -> ExhaustedError {
-    ExhaustedError {
-        model_name: model.name.clone(),
-        risk_class,
-        providers: evals
-            .iter()
-            .map(|eval| ExhaustedProviderInfo {
-                provider_name: model.providers[eval.index].name.clone(),
-                projected_max_used_percent: eval.max_projected_used_percent,
-                failure_threshold: model.balancer.failure_threshold,
-                user_threshold: model.balancer.user_threshold,
-            })
-            .collect(),
-    }
 }
 
 fn project_used_percent(base_used_percent: f64, turns: u64, burn_rate: f64) -> f64 {
@@ -419,11 +342,10 @@ pub(crate) fn bootstrap_duration_ratio_for_test(
     duration_ratio_rate(long_rate, long_hours, target_hours)
 }
 
-fn score_by_invocation_count(model: &ModelConfig, state: &StateDb) -> usize {
-    let n = model.providers.len();
-    let mut scores: Vec<(usize, f64)> = Vec::with_capacity(n);
+fn score_by_invocation_count(model: &ModelConfig, state: &StateDb, candidates: &[usize]) -> usize {
+    let mut scores: Vec<(usize, f64)> = Vec::with_capacity(candidates.len());
 
-    for i in 0..n {
+    for &i in candidates {
         let recent_errors = state
             .recent_error_count(&model.name, i, ERROR_WINDOW_MINUTES)
             .unwrap_or(0);
@@ -447,17 +369,20 @@ fn score_by_invocation_count(model: &ModelConfig, state: &StateDb) -> usize {
     scores.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
 
     if scores.iter().all(|(_, s)| *s == f64::MAX) {
-        return round_robin_fallback(model, state);
+        return round_robin_fallback(model, state, candidates);
     }
     scores[0].0
 }
 
-fn round_robin_fallback(model: &ModelConfig, state: &StateDb) -> usize {
-    let n = model.providers.len();
+fn round_robin_fallback(model: &ModelConfig, state: &StateDb, candidates: &[usize]) -> usize {
+    debug_assert!(
+        !candidates.is_empty(),
+        "round_robin_fallback: caller must pass a non-empty candidates slice"
+    );
     let mut min_count = u64::MAX;
-    let mut best = 0;
+    let mut best = candidates.first().copied().unwrap_or(0);
 
-    for i in 0..n {
+    for &i in candidates {
         let count = state
             .get_provider(&model.name, i)
             .ok()
@@ -494,7 +419,6 @@ mod tests {
                 provider_name: provider_name.to_string(),
                 provider_index,
                 parent_invocation_id: None,
-                quota_tight_routing: false,
             })
             .unwrap();
         db.finalize_invocation(id, success, if success { 0 } else { 1 }, None, None)
@@ -509,7 +433,6 @@ mod tests {
                 ProviderConfig::new("a", vec![]),
                 ProviderConfig::new("b", vec![]),
             ],
-            balancer: Default::default(),
             inputs: vec![],
         }
     }
@@ -523,7 +446,6 @@ mod tests {
                 ProviderConfig::new("b", vec![]),
                 ProviderConfig::new("c", vec![]),
             ],
-            balancer: Default::default(),
             inputs: vec![],
         }
     }
@@ -535,15 +457,9 @@ mod tests {
             name: "single".to_string(),
             prompt_mode: PromptMode::Arg,
             providers: vec![ProviderConfig::new("x", vec![])],
-            balancer: Default::default(),
             inputs: vec![],
         };
-        assert_eq!(
-            select_provider(&model, &db, None, RiskClass::User)
-                .unwrap()
-                .provider_index,
-            0
-        );
+        assert_eq!(select_provider(&model, &db, None), 0);
     }
 
     #[test]
@@ -551,16 +467,12 @@ mod tests {
         let db = StateDb::open(Path::new(":memory:")).unwrap();
         let model = two_provider_model();
 
-        let first = select_provider(&model, &db, None, RiskClass::User)
-            .unwrap()
-            .provider_index;
+        let first = select_provider(&model, &db, None);
         assert_eq!(first, 0);
 
         record_invocation_for_test(&db, "test", "a", 0, true);
 
-        let second = select_provider(&model, &db, None, RiskClass::User)
-            .unwrap()
-            .provider_index;
+        let second = select_provider(&model, &db, None);
         assert_eq!(second, 1);
     }
 
@@ -573,12 +485,7 @@ mod tests {
             record_invocation_for_test(&db, "test", "a", 0, false);
         }
 
-        assert_eq!(
-            select_provider(&model, &db, None, RiskClass::User)
-                .unwrap()
-                .provider_index,
-            1
-        );
+        assert_eq!(select_provider(&model, &db, None), 1);
     }
 
     fn quota_window(used: f64, hours_until_reset: i64) -> crate::state::QuotaWindowInput {
@@ -634,14 +541,8 @@ mod tests {
             .unwrap();
     }
 
-    fn selected_provider_index(model: &ModelConfig, db: &StateDb, risk_class: RiskClass) -> usize {
-        select_provider(model, db, None, risk_class)
-            .expect("provider should be selectable")
-            .provider_index
-    }
-
-    fn selected_provider(model: &ModelConfig, db: &StateDb, risk_class: RiskClass) -> Selection {
-        select_provider(model, db, None, risk_class).expect("provider should be selectable")
+    fn selected_provider_index(model: &ModelConfig, db: &StateDb) -> usize {
+        select_provider(model, db, None)
     }
 
     fn assert_approx(actual: f64, expected: f64, tolerance: f64) {
@@ -649,6 +550,102 @@ mod tests {
             (actual - expected).abs() <= tolerance,
             "expected {actual} to be within {tolerance} of {expected}"
         );
+    }
+
+    #[test]
+    fn select_provider_filters_exhausted_accounts() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = two_provider_model();
+
+        seed_windows_with_deltas(&db, "a", &[(0.10, 24 * 7, 0.01, 22)]);
+        seed_windows_with_deltas(&db, "b", &[(0.60, 24 * 7, 0.01, 22)]);
+        db.mark_exhausted("a").unwrap();
+
+        assert_eq!(selected_provider_index(&model, &db), 1);
+    }
+
+    #[test]
+    fn all_providers_exhausted_picks_oldest_exhausted() {
+        // CodeRabbit pass 1 finding: when every provider is flagged
+        // exhausted, the prior "fall back to round-robin on invocation
+        // count" behavior routed right back into the known-bad pool,
+        // effectively retrying exhausted accounts on every invocation —
+        // contradicting the user-locked "wait until refresh" invariant.
+        // The new behavior picks whichever exhausted provider has the
+        // oldest `exhausted_at` (most likely to have recovered on its
+        // next refresh). Ties break by first-seen index via stable sort.
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = two_provider_model();
+
+        db.upsert_quota_refresh("a", &[]).unwrap();
+        db.upsert_quota_refresh("b", &[]).unwrap();
+
+        // Mark `b` exhausted FIRST (older timestamp), `a` second.
+        db.mark_exhausted("b").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        db.mark_exhausted("a").unwrap();
+
+        // Even though invocation count would prefer `b`, the older
+        // exhausted flag makes `b` the better bet on next refresh.
+        // Expected: `b` (index 1) wins.
+        assert_eq!(selected_provider_index(&model, &db), 1);
+    }
+
+    #[test]
+    fn score_by_density_skips_past_reset_windows() {
+        // Live-caught 2026-04-22: claude3 had a 5h window whose resets_at
+        // was hours in the past (anthropic-usage returning empty kept the
+        // stale row alive via PR #6's preserve-on-empty path). The stored
+        // used_percent is from the previous window instance, so it has no
+        // bearing on current headroom. Previously the code clamped
+        // hours_until_reset to EPS_HOURS = 1/60h, which torpedoed the
+        // provider's binding score to near-zero and made a low-usage
+        // account (64% weekly) lose to a heavily-used one (91% weekly).
+        // Now past-reset windows are skipped during binding computation.
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = two_provider_model();
+
+        // Provider `a`: healthy 7d window (low usage) + stale past-reset
+        // 5h window.
+        use chrono::Duration;
+        let a_windows = vec![
+            crate::state::QuotaWindowInput {
+                used_percent: 0.10,
+                resets_at: Utc::now() + Duration::hours(24 * 7),
+            },
+            crate::state::QuotaWindowInput {
+                used_percent: 0.90,
+                resets_at: Utc::now() - Duration::hours(1), // RESET PASSED
+            },
+        ];
+        db.upsert_quota_refresh("a", &a_windows).unwrap();
+        db.set_window_delta_for_test("a", 0, 0.01, 22).unwrap();
+
+        // Provider `b`: heavily-used 7d window, nothing past-reset.
+        seed_windows_with_deltas(&db, "b", &[(0.85, 24 * 7, 0.01, 22)]);
+
+        // With past-reset skipping, `a` is ranked only on its 7d window
+        // (much more headroom than b's 7d). Without the skip, a's
+        // near-zero 5h binding would lose to b.
+        assert_eq!(selected_provider_index(&model, &db), 0);
+    }
+
+    #[test]
+    fn exhausted_filter_does_not_prevent_refresh_loop_from_clearing() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = two_provider_model();
+
+        seed_windows_with_deltas(&db, "a", &[(0.10, 24 * 7, 0.01, 22)]);
+        seed_windows_with_deltas(&db, "b", &[(0.60, 24 * 7, 0.01, 22)]);
+        db.mark_exhausted("a").unwrap();
+        db.mark_exhausted("b").unwrap();
+
+        // Simulate a successful non-empty refresh for b. The production
+        // refresh loop must make this same state transition before filtering.
+        db.upsert_quota_refresh("b", &[quota_window(0.60, 24 * 7)])
+            .unwrap();
+
+        assert_eq!(selected_provider_index(&model, &db), 1);
     }
 
     #[test]
@@ -663,7 +660,7 @@ mod tests {
         seed_windows_with_deltas(&db, "b", &[(0.10, 24 * 7, 0.01, 22)]);
         seed_windows_with_deltas(&db, "c", &[(0.30, 24 * 7, 0.01, 22)]);
 
-        assert_eq!(selected_provider_index(&model, &db, RiskClass::User), 1);
+        assert_eq!(selected_provider_index(&model, &db), 1);
     }
 
     #[test]
@@ -676,7 +673,7 @@ mod tests {
         seed_windows_with_deltas(&db, "a", &[(0.50, 1, 0.01, 22)]);
         seed_windows_with_deltas(&db, "b", &[(0.50, 24 * 7, 0.01, 22)]);
 
-        assert_eq!(selected_provider_index(&model, &db, RiskClass::User), 1);
+        assert_eq!(selected_provider_index(&model, &db), 1);
     }
 
     #[test]
@@ -687,7 +684,7 @@ mod tests {
         seed_windows_with_deltas(&db, "a", &[(0.10, 24 * 7, 0.01, 22), (0.95, 5, 0.30, 22)]);
         seed_windows_with_deltas(&db, "b", &[(0.30, 24 * 7, 0.01, 22), (0.20, 5, 0.30, 22)]);
 
-        assert_eq!(selected_provider_index(&model, &db, RiskClass::User), 1);
+        assert_eq!(selected_provider_index(&model, &db), 1);
     }
 
     #[test]
@@ -698,7 +695,7 @@ mod tests {
         seed_windows_with_deltas(&db, "a", &[(0.90, 24 * 7, 0.01, 22)]);
         record_invocation_for_test(&db, "test", "a", 0, true);
 
-        assert_eq!(selected_provider_index(&model, &db, RiskClass::User), 1);
+        assert_eq!(selected_provider_index(&model, &db), 1);
     }
 
     #[test]
@@ -726,74 +723,7 @@ mod tests {
         );
         seed_assistant_turns_since_refresh(&db, "a", 500);
 
-        assert_eq!(selected_provider_index(&model, &db, RiskClass::User), 1);
-    }
-
-    #[test]
-    fn user_threshold_hides_provider_from_user_class_only() {
-        let db = StateDb::open(Path::new(":memory:")).unwrap();
-        let model = two_provider_model();
-
-        seed_windows_with_deltas(&db, "a", &[(0.75, 24 * 7, 0.01, 22)]);
-        seed_windows_with_deltas(&db, "b", &[(0.10, 1, 0.01, 22)]);
-
-        assert_eq!(selected_provider_index(&model, &db, RiskClass::User), 1);
-        assert_eq!(
-            selected_provider_index(&model, &db, RiskClass::Background),
-            0
-        );
-    }
-
-    #[test]
-    fn user_threshold_soft_degrades_with_quota_tight_flag_when_all_fail() {
-        let db = StateDb::open(Path::new(":memory:")).unwrap();
-        let model = two_provider_model();
-
-        seed_windows_with_deltas(&db, "a", &[(0.80, 24 * 7, 0.01, 22)]);
-        seed_windows_with_deltas(&db, "b", &[(0.75, 24 * 7, 0.01, 22)]);
-
-        let selection = selected_provider(&model, &db, RiskClass::User);
-        assert_eq!(selection.provider_index, 1);
-        assert!(selection.quota_tight_routing);
-    }
-
-    #[test]
-    fn failure_threshold_hard_blocks_all_classes() {
-        let db = StateDb::open(Path::new(":memory:")).unwrap();
-        let model = two_provider_model();
-
-        seed_windows_with_deltas(&db, "a", &[(0.96, 24 * 7, 0.01, 22)]);
-        seed_windows_with_deltas(&db, "b", &[(0.20, 24 * 7, 0.01, 22)]);
-
-        assert_eq!(selected_provider_index(&model, &db, RiskClass::User), 1);
-        assert_eq!(
-            selected_provider_index(&model, &db, RiskClass::Background),
-            1
-        );
-    }
-
-    #[test]
-    fn failure_threshold_returns_exhausted_not_roundrobin_when_all_fail() {
-        let db = StateDb::open(Path::new(":memory:")).unwrap();
-        let model = two_provider_model();
-
-        seed_windows_with_deltas(&db, "a", &[(0.96, 24 * 7, 0.01, 22)]);
-        seed_windows_with_deltas(&db, "b", &[(0.99, 24 * 7, 0.01, 22)]);
-
-        for risk_class in [RiskClass::User, RiskClass::Background] {
-            match select_provider(&model, &db, None, risk_class) {
-                Err(BalanceError::Exhausted(err)) => {
-                    assert_eq!(err.model_name, model.name);
-                    assert_eq!(err.risk_class, risk_class);
-                    assert_eq!(err.providers.len(), 2);
-                    assert!(err.providers.iter().all(|provider| {
-                        provider.projected_max_used_percent >= provider.failure_threshold
-                            && provider.projected_max_used_percent >= 0.95
-                    }));
-                }
-                other => panic!("expected exhausted error for {risk_class:?}, got {other:?}"),
-            }
-        }
+        assert_eq!(selected_provider_index(&model, &db), 1);
     }
 
     #[test]
@@ -821,7 +751,7 @@ mod tests {
 
         let bootstrapped = bootstrap_burn_rate_for_test(&model, &db, 0, 0).unwrap();
         assert_approx(bootstrapped, sibling_rate, 1e-12);
-        assert_eq!(selected_provider_index(&model, &db, RiskClass::User), 0);
+        assert_eq!(selected_provider_index(&model, &db), 0);
     }
 
     #[test]
@@ -885,8 +815,6 @@ mod tests {
 
         record_invocation_for_test(&db, "test", "a", 0, true);
 
-        let selection = selected_provider(&model, &db, RiskClass::User);
-        assert_eq!(selection.provider_index, 1);
-        assert!(!selection.quota_tight_routing);
+        assert_eq!(selected_provider_index(&model, &db), 1);
     }
 }

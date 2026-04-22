@@ -10,8 +10,8 @@ use uuid::Uuid;
 /// spike (observed on the ChatGPT usage endpoint: `used_percent` briefly
 /// reported as 1.0 before the window reset) paired with a small turn count
 /// produced a learned rate of ~0.05/turn that then got carried forward across
-/// subsequent no-change refreshes, projecting every provider over the 95%
-/// failure threshold and blocking the whole pool. The highest plausible real
+/// subsequent no-change refreshes, projecting every provider near the ceiling
+/// and making the whole pool look unusable. The highest plausible real
 /// rate observed in live data is ~5e-4/turn on a 5h Claude window; 0.1/turn
 /// is a 200× safety margin that still filters the spike case.
 const MAX_LEARNABLE_BURN_RATE: f64 = 0.1;
@@ -21,8 +21,7 @@ const MAX_LEARNABLE_BURN_RATE: f64 = 0.1;
 /// extrapolates to rates that are dominated by sample noise — when the
 /// rate is then multiplied by `turns_since_refresh` at scoring time, a
 /// 65%-used window can project to 97% on nothing but measurement error,
-/// and `score_by_density` hard-blocks the provider as if it were actually
-/// exhausted. Live-caught 2026-04-21 on `claude2` with
+/// making the provider look nearly exhausted. Live-caught 2026-04-21 on `claude2` with
 /// `last_delta_percent=0.01 / last_delta_calls=6` → projected
 /// 0.65 + 193×0.00167 = 0.972, blocking the whole claude-opus pool. 20
 /// turns is the empirical floor where per-turn rates stabilize to within
@@ -38,7 +37,7 @@ const MIN_LEARN_SAMPLE_CALLS: u64 = 20;
 /// ChatGPT upstream spike reported `used_percent=1.0` on the 7-day
 /// window: learned rate became 1.0/34 ≈ 0.029/turn on WEEKLY (where real
 /// rates live near 6e-5/turn), projecting every subsequent invocation
-/// over `failure_threshold` on nothing but a bad sample. User intuition:
+/// near the ceiling on nothing but a bad sample. User intuition:
 /// "turns barely budge weekly" — so any single sample imputing a weekly
 /// move > 1 point is suspect, and the cleanest marker of "suspect" is
 /// "the sample is at the rail." Matching ceiling from score_by_density.
@@ -70,6 +69,7 @@ pub struct QuotaRecord {
     /// Calls recorded against this provider since the last refresh.
     pub calls_since_refresh: u64,
     pub refreshed_at: Option<DateTime<Utc>>,
+    pub exhausted_at: Option<DateTime<Utc>>,
 }
 
 /// One rolling-quota window reported by a provider's quota script.
@@ -150,7 +150,6 @@ pub struct InvocationRecord {
     pub error_category: Option<String>,
     pub session_id: Option<String>,
     pub session_capture_method: Option<String>,
-    pub quota_tight_routing: bool,
     pub created_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
 }
@@ -162,7 +161,6 @@ pub struct InvocationStart {
     pub provider_name: String,
     pub provider_index: usize,
     pub parent_invocation_id: Option<i64>,
-    pub quota_tight_routing: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -392,7 +390,8 @@ impl StateDb {
                 resets_at TEXT,
                 calls_since_refresh INTEGER NOT NULL DEFAULT 0,
                 refreshed_at TEXT,
-                last_empty_refresh_at TEXT
+                last_empty_refresh_at TEXT,
+                exhausted_at TEXT NULL
             );
 
             CREATE TABLE IF NOT EXISTS provider_quota_windows (
@@ -542,12 +541,12 @@ impl StateDb {
                 )
                 .map_err(|e| format!("Failed to add invocations.session_capture_method: {e}"))?;
             }
-            if !columns.iter().any(|column| column == "quota_tight_routing") {
+            if columns.iter().any(|column| column == "quota_tight_routing") {
                 conn.execute(
-                    "ALTER TABLE invocations ADD COLUMN quota_tight_routing BOOLEAN NOT NULL DEFAULT 0",
+                    "ALTER TABLE invocations DROP COLUMN quota_tight_routing",
                     [],
                 )
-                .map_err(|e| format!("Failed to add invocations.quota_tight_routing: {e}"))?;
+                .map_err(|e| format!("Failed to drop invocations.quota_tight_routing: {e}"))?;
             }
             conn.execute_batch(Self::invocations_index_sql())
                 .map_err(|e| format!("Failed to ensure invocation indexes: {e}"))?;
@@ -619,6 +618,13 @@ impl StateDb {
                 [],
             )
             .map_err(|e| format!("Failed to add provider_quotas.last_empty_refresh_at: {e}"))?;
+        }
+        if !columns.iter().any(|column| column == "exhausted_at") {
+            conn.execute(
+                "ALTER TABLE provider_quotas ADD COLUMN exhausted_at TEXT NULL",
+                [],
+            )
+            .map_err(|e| format!("Failed to add provider_quotas.exhausted_at: {e}"))?;
         }
         if columns.iter().any(|column| column == "last_delta_percent") {
             conn.execute(
@@ -702,7 +708,6 @@ impl StateDb {
             error_category TEXT,
             session_id TEXT,
             session_capture_method TEXT,
-            quota_tight_routing BOOLEAN NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
             finished_at TEXT
         );
@@ -797,7 +802,6 @@ impl StateDb {
                 error_category TEXT,
                 session_id TEXT,
                 session_capture_method TEXT,
-                quota_tight_routing BOOLEAN NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 finished_at TEXT
             );",
@@ -819,10 +823,9 @@ impl StateDb {
                         error_category,
                         session_id,
                         session_capture_method,
-                        quota_tight_routing,
                         created_at,
                         finished_at
-                     ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, NULL, NULL, 0, ?9, ?9)",
+                     ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, NULL, NULL, ?9, ?9)",
                 )
                 .map_err(|e| format!("Failed to prepare migrated invocation insert: {e}"))?;
 
@@ -909,10 +912,9 @@ impl StateDb {
                     success,
                     exit_code,
                     error_category,
-                    quota_tight_routing,
                     created_at,
                     finished_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, ?7, ?8, NULL)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, ?7, NULL)",
                 params![
                     &start.invocation_uuid,
                     &start.model_name,
@@ -920,7 +922,6 @@ impl StateDb {
                     start.provider_index as i64,
                     start.parent_invocation_id,
                     InvocationStatus::Running.as_str(),
-                    start.quota_tight_routing as i64,
                     &now,
                 ],
             )
@@ -1054,8 +1055,7 @@ impl StateDb {
             .prepare(
                 "SELECT id, invocation_uuid, model_name, provider_name, provider_index,
                         parent_invocation_id, status, success, exit_code, error_category,
-                        session_id, session_capture_method, quota_tight_routing, created_at,
-                        finished_at
+                        session_id, session_capture_method, created_at, finished_at
                  FROM invocations
                  WHERE invocation_uuid = ?1",
             )
@@ -1078,8 +1078,7 @@ impl StateDb {
             .prepare(
                 "SELECT id, invocation_uuid, model_name, provider_name, provider_index,
                         parent_invocation_id, status, success, exit_code, error_category,
-                        session_id, session_capture_method, quota_tight_routing, created_at,
-                        finished_at
+                        session_id, session_capture_method, created_at, finished_at
                  FROM invocations
                  WHERE parent_invocation_id = ?1
                  ORDER BY created_at, id",
@@ -1095,14 +1094,14 @@ impl StateDb {
     }
 
     fn map_invocation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<InvocationRecord> {
-        let created_at_raw: String = row.get(13)?;
-        let finished_at_raw: Option<String> = row.get(14)?;
+        let created_at_raw: String = row.get(12)?;
+        let finished_at_raw: Option<String> = row.get(13)?;
         let status_raw: String = row.get(6)?;
         let created_at = DateTime::parse_from_rfc3339(&created_at_raw)
             .map(|dt| dt.with_timezone(&Utc))
             .map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    13,
+                    12,
                     rusqlite::types::Type::Text,
                     Box::new(e),
                 )
@@ -1113,7 +1112,7 @@ impl StateDb {
                     .map(|dt| dt.with_timezone(&Utc))
                     .map_err(|e| {
                         rusqlite::Error::FromSqlConversionFailure(
-                            14,
+                            13,
                             rusqlite::types::Type::Text,
                             Box::new(e),
                         )
@@ -1141,7 +1140,6 @@ impl StateDb {
             error_category: row.get(9)?,
             session_id: row.get(10)?,
             session_capture_method: row.get(11)?,
-            quota_tight_routing: row.get::<_, i64>(12)? != 0,
             created_at,
             finished_at,
         })
@@ -1215,7 +1213,7 @@ impl StateDb {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT calls_since_refresh, refreshed_at
+                "SELECT calls_since_refresh, refreshed_at, exhausted_at
                  FROM provider_quotas WHERE provider_name = ?1",
             )
             .map_err(|e| format!("Failed to prepare quota query: {e}"))?;
@@ -1228,6 +1226,10 @@ impl StateDb {
                     .get::<_, Option<String>>(1)?
                     .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                     .map(|dt| dt.with_timezone(&Utc)),
+                exhausted_at: row
+                    .get::<_, Option<String>>(2)?
+                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                    .map(|dt| dt.with_timezone(&Utc)),
             })
         });
 
@@ -1236,6 +1238,27 @@ impl StateDb {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(format!("Failed to query quota: {e}")),
         }
+    }
+
+    pub fn mark_exhausted(&self, provider_name: &str) -> Result<(), String> {
+        let now = Utc::now().to_rfc3339();
+        // Upsert so first-use quota failures land the flag even when the
+        // provider has never produced a `provider_quotas` row (e.g.,
+        // misconfigured quota_script that only ever fails, or a provider
+        // whose first call returns quota_exhausted before any refresh has
+        // succeeded). Previously a plain UPDATE silently dropped the write
+        // for these cases, leaving the account eligible to be routed to
+        // again on the next call.
+        self.conn
+            .execute(
+                "INSERT INTO provider_quotas (provider_name, exhausted_at)
+                 VALUES (?1, ?2)
+                 ON CONFLICT (provider_name) DO UPDATE SET
+                    exhausted_at = excluded.exhausted_at",
+                params![provider_name, &now],
+            )
+            .map_err(|e| format!("Failed to mark provider exhausted: {e}"))?;
+        Ok(())
     }
 
     /// Fetch every rolling-quota window a provider has reported, ordered by
@@ -1375,7 +1398,8 @@ impl StateDb {
                 used_percent = ?2,
                 resets_at = ?3,
                 calls_since_refresh = 0,
-                refreshed_at = ?4",
+                refreshed_at = ?4,
+                exhausted_at = NULL",
             params![provider_name, legacy_used, legacy_resets, &now],
         )
         .map_err(|e| format!("Failed to upsert quota: {e}"))?;
@@ -2154,6 +2178,26 @@ mod tests {
             .unwrap() as u64
     }
 
+    fn exhausted_at_raw(db: &StateDb, provider_name: &str) -> Option<String> {
+        db.conn
+            .query_row(
+                "SELECT exhausted_at
+                 FROM provider_quotas
+                 WHERE provider_name = ?1",
+                params![provider_name],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+    }
+
+    fn exhausted_at(db: &StateDb, provider_name: &str) -> Option<DateTime<Utc>> {
+        exhausted_at_raw(db, provider_name).map(|value| {
+            DateTime::parse_from_rfc3339(&value)
+                .unwrap()
+                .with_timezone(&Utc)
+        })
+    }
+
     fn insert_invocation_fixture(
         db: &StateDb,
         invocation_uuid: &str,
@@ -2167,7 +2211,6 @@ mod tests {
                 provider_name: "fixture-provider".to_string(),
                 provider_index: 0,
                 parent_invocation_id,
-                quota_tight_routing: false,
             })
             .unwrap();
         db.conn
@@ -2276,6 +2319,133 @@ mod tests {
                 |row| row.get::<_, String>(0),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn mark_exhausted_writes_timestamp_on_existing_quota_row() {
+        let db = test_db();
+        let provider = "p";
+        db.upsert_quota_refresh(provider, &[quota_input(0.10, "2026-04-22T00:00:00Z")])
+            .unwrap();
+
+        let before = Utc::now();
+        db.mark_exhausted(provider).unwrap();
+        let after = Utc::now();
+
+        let exhausted = exhausted_at(&db, provider).expect("exhausted_at should be set");
+        assert!(
+            exhausted >= before - chrono::Duration::seconds(1)
+                && exhausted <= after + chrono::Duration::seconds(1),
+            "exhausted_at {exhausted} should be near mark_exhausted call"
+        );
+    }
+
+    #[test]
+    fn mark_exhausted_creates_row_when_missing() {
+        // CodeRabbit pass 1 finding: a plain UPDATE silently dropped the
+        // write when a provider had no quota row yet (e.g. misconfigured
+        // quota_script that only ever fails, or first-call quota rejection
+        // before any refresh succeeded). mark_exhausted must upsert so the
+        // flag always lands — otherwise the balancer routes to a known-bad
+        // account on the next invocation and we get a guaranteed
+        // re-failure that the reactive model is meant to prevent.
+        let db = test_db();
+        let provider = "never-refreshed";
+
+        let before = Utc::now();
+        db.mark_exhausted(provider).unwrap();
+        let after = Utc::now();
+
+        let row_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM provider_quotas WHERE provider_name = ?1",
+                params![provider],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(row_count, 1, "mark_exhausted must upsert the quota row");
+
+        let exhausted = exhausted_at(&db, provider).expect("exhausted_at set");
+        assert!(
+            exhausted >= before - chrono::Duration::seconds(1)
+                && exhausted <= after + chrono::Duration::seconds(1)
+        );
+    }
+
+    #[test]
+    fn upsert_quota_refresh_clears_exhausted_at_on_nonempty_refresh() {
+        let db = test_db();
+        let provider = "p";
+        db.upsert_quota_refresh(provider, &[quota_input(0.10, "2026-04-22T00:00:00Z")])
+            .unwrap();
+        db.mark_exhausted(provider).unwrap();
+        assert!(exhausted_at_raw(&db, provider).is_some());
+
+        db.upsert_quota_refresh(provider, &[quota_input(0.20, "2026-04-23T00:00:00Z")])
+            .unwrap();
+
+        assert_eq!(exhausted_at_raw(&db, provider), None);
+    }
+
+    #[test]
+    fn upsert_quota_refresh_preserves_exhausted_at_on_empty_refresh() {
+        let db = test_db();
+        let provider = "p";
+        db.upsert_quota_refresh(provider, &[quota_input(0.10, "2026-04-22T00:00:00Z")])
+            .unwrap();
+        db.mark_exhausted(provider).unwrap();
+        let exhausted_before = exhausted_at_raw(&db, provider).expect("exhausted_at should be set");
+
+        db.upsert_quota_refresh(provider, &[]).unwrap();
+
+        assert_eq!(
+            exhausted_at_raw(&db, provider).as_deref(),
+            Some(exhausted_before.as_str())
+        );
+    }
+
+    #[test]
+    fn quota_tight_routing_column_dropped_after_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE invocations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                invocation_uuid TEXT NOT NULL UNIQUE,
+                model_name TEXT NOT NULL,
+                provider_name TEXT,
+                provider_index INTEGER NOT NULL,
+                parent_invocation_id INTEGER REFERENCES invocations(id),
+                status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'legacy')),
+                success INTEGER,
+                exit_code INTEGER,
+                error_category TEXT,
+                session_id TEXT,
+                session_capture_method TEXT,
+                quota_tight_routing BOOLEAN NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                finished_at TEXT
+            );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = StateDb::open(&path).unwrap();
+
+        let columns: Vec<String> = db
+            .conn
+            .prepare("PRAGMA table_info(invocations)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            !columns.iter().any(|column| column == "quota_tight_routing"),
+            "quota_tight_routing should be removed by migration: {columns:?}"
+        );
     }
 
     #[test]
@@ -2772,7 +2942,7 @@ command = "fixture"
         // 1.0) paired with a small turn count would previously learn a
         // pathological per-turn rate (~0.05/turn), carry it forward across
         // every subsequent no-change refresh, and permanently project every
-        // provider above failure_threshold. The sanity cap at
+        // provider near the ceiling. The sanity cap at
         // MAX_LEARNABLE_BURN_RATE = 0.1/turn rejects this sample and carries
         // the prior learn forward instead, so the pool stays usable.
         let db = test_db();
@@ -2842,8 +3012,8 @@ command = "fixture"
         // paired with 34 turns since prior refresh. The learner computed
         // rate ≈ 0.029/turn on WEEKLY (real weekly rates are ~6e-5/turn;
         // the 100% sample was a cap-hit trajectory, not a natural fill),
-        // which then projected every future invocation over
-        // failure_threshold. User framing: "turns barely budge weekly" —
+        // which then projected every future invocation near the ceiling.
+        // User framing: "turns barely budge weekly" —
         // so a weekly sample that moves 100 points in one interval is
         // distrusted. The marker we key on is "new used_percent at the
         // rail (>= 0.99)"; this test pins that gate.
@@ -2927,30 +3097,6 @@ command = "fixture"
     }
 
     #[test]
-    fn quota_tight_routing_column_persisted_to_invocations() {
-        let db = test_db();
-        let start = InvocationStart {
-            invocation_uuid: Uuid::new_v4().to_string(),
-            model_name: "test-model".to_string(),
-            provider_name: "fixture-provider".to_string(),
-            provider_index: 0,
-            parent_invocation_id: None,
-            quota_tight_routing: true,
-        };
-
-        let id = db.start_invocation(&start).unwrap();
-        let persisted: i64 = db
-            .conn
-            .query_row(
-                "SELECT quota_tight_routing FROM invocations WHERE id = ?1",
-                params![id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(persisted, 1);
-    }
-
-    #[test]
     fn start_invocation_inserts_running_row_with_null_terminal_fields() {
         let db = test_db();
         let start = InvocationStart {
@@ -2959,7 +3105,6 @@ command = "fixture"
             provider_name: "fixture-provider".to_string(),
             provider_index: 0,
             parent_invocation_id: None,
-            quota_tight_routing: false,
         };
 
         let id = db.start_invocation(&start).unwrap();
@@ -2986,7 +3131,6 @@ command = "fixture"
             provider_name: "fixture-provider".to_string(),
             provider_index: 0,
             parent_invocation_id: None,
-            quota_tight_routing: false,
         };
 
         db.start_invocation(&start).unwrap();
@@ -3003,7 +3147,6 @@ command = "fixture"
             provider_name: "fixture-provider".to_string(),
             provider_index: 0,
             parent_invocation_id: None,
-            quota_tight_routing: false,
         };
         let parent_id = db.start_invocation(&parent).unwrap();
 
@@ -3013,7 +3156,6 @@ command = "fixture"
             provider_name: "fixture-provider".to_string(),
             provider_index: 0,
             parent_invocation_id: Some(parent_id),
-            quota_tight_routing: false,
         };
         db.start_invocation(&child).unwrap();
 
@@ -3033,7 +3175,6 @@ command = "fixture"
             provider_name: "fixture-provider".to_string(),
             provider_index: 0,
             parent_invocation_id: None,
-            quota_tight_routing: false,
         };
         let id = db.start_invocation(&start).unwrap();
 
@@ -3059,7 +3200,6 @@ command = "fixture"
             provider_name: "fixture-provider".to_string(),
             provider_index: 0,
             parent_invocation_id: None,
-            quota_tight_routing: false,
         };
         let succeeded = InvocationStart {
             invocation_uuid: Uuid::new_v4().to_string(),
@@ -3067,7 +3207,6 @@ command = "fixture"
             provider_name: "fixture-provider".to_string(),
             provider_index: 0,
             parent_invocation_id: None,
-            quota_tight_routing: false,
         };
 
         let failed_id = db.start_invocation(&failed).unwrap();
@@ -3111,7 +3250,6 @@ command = "fixture"
             provider_name: "fixture-provider".to_string(),
             provider_index: 0,
             parent_invocation_id: None,
-            quota_tight_routing: false,
         };
         let id = db.start_invocation(&start).unwrap();
         db.finalize_invocation(id, true, 0, None, None).unwrap();
@@ -3129,7 +3267,6 @@ command = "fixture"
             provider_name: "fixture-provider".to_string(),
             provider_index: 0,
             parent_invocation_id: None,
-            quota_tight_routing: false,
         };
         let id = db.start_invocation(&start).unwrap();
 
@@ -3169,7 +3306,6 @@ command = "fixture"
             provider_name: "fixture-provider".to_string(),
             provider_index: 0,
             parent_invocation_id: None,
-            quota_tight_routing: false,
         };
         let id = db.start_invocation(&start).unwrap();
 
@@ -3205,7 +3341,6 @@ command = "fixture"
             provider_name: "fixture-provider".to_string(),
             provider_index: 0,
             parent_invocation_id: None,
-            quota_tight_routing: false,
         };
         let id = db.start_invocation(&start).unwrap();
 
@@ -3236,7 +3371,6 @@ command = "fixture"
             provider_name: "fixture-provider".to_string(),
             provider_index: 7,
             parent_invocation_id: None,
-            quota_tight_routing: false,
         };
         let id = db.start_invocation(&start).unwrap();
         let before = db
@@ -3267,7 +3401,6 @@ command = "fixture"
             provider_name: "fixture-provider".to_string(),
             provider_index: 0,
             parent_invocation_id: None,
-            quota_tight_routing: false,
         };
         let succeeded = InvocationStart {
             invocation_uuid: Uuid::new_v4().to_string(),
@@ -3275,7 +3408,6 @@ command = "fixture"
             provider_name: "fixture-provider".to_string(),
             provider_index: 0,
             parent_invocation_id: None,
-            quota_tight_routing: false,
         };
         let failed_id = db.start_invocation(&failed).unwrap();
         db.finalize_invocation(failed_id, false, 1, None, None)
@@ -3549,7 +3681,6 @@ command = "fixture"
                     provider_name: "fixture-provider".to_string(),
                     provider_index: 0,
                     parent_invocation_id: None,
-                    quota_tight_routing: false,
                 };
                 db.start_invocation(&start).unwrap();
                 let running = db
