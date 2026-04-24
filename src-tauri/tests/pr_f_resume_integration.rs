@@ -41,6 +41,23 @@ impl Fixture {
         StateDb::open(&self.db_path()).unwrap()
     }
 
+    fn write_sessions_config(&self, provider_name: &str, transcript_path: &Path) {
+        let app_config_dir = self.config_home.join("oulipoly-agent-runner");
+        fs::create_dir_all(&app_config_dir).unwrap();
+        fs::write(
+            app_config_dir.join("sessions.toml"),
+            format!(
+                r#"[{provider_name}]
+turn_script = 'cat "{}"'
+state_dir = '{}'
+"#,
+                transcript_path.display(),
+                self.dir.path().join("session-state").display()
+            ),
+        )
+        .unwrap();
+    }
+
     fn write_script(&self, name: &str, body: &str) -> PathBuf {
         let path = self.dir.path().join(name);
         fs::write(
@@ -119,6 +136,18 @@ flag = "--resume"
                 provider_b_script.display()
             ),
         );
+    }
+
+    fn base_model_command(&self, model_name: &str) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+        cmd.arg("-m")
+            .arg(model_name)
+            .arg("--models-dir")
+            .arg(&self.models_dir);
+        cmd.env("XDG_CONFIG_HOME", &self.config_home);
+        cmd.env("XDG_DATA_HOME", &self.data_home);
+        cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+        cmd
     }
 
     fn seed_session_turns(&self, provider_name: &str, session_id: &str, turns: &[(&str, &str)]) {
@@ -217,6 +246,134 @@ fn parse_invocation(stderr: &str) -> CompositeInvocationId {
     );
     let raw = lines[0].strip_prefix("OULIPOLY_INVOCATION=").unwrap();
     CompositeInvocationId::parse_env_value(raw).unwrap()
+}
+
+fn parse_session_line(stderr: &str, invocation_uuid: &str) -> String {
+    let lines: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("OULIPOLY_SESSION="))
+        .collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "stderr should contain exactly one session line: {stderr}"
+    );
+    let raw = lines[0].strip_prefix("OULIPOLY_SESSION=").unwrap();
+    let value: serde_json::Value = serde_json::from_str(raw).unwrap();
+    assert_eq!(value["id"].as_str(), Some(invocation_uuid));
+    value["session_id"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn noninteractive_invocation_ingests_session_and_emits_oulipoly_session_line() {
+    let fixture = Fixture::new();
+    let transcript_path = fixture.dir.path().join("turns.jsonl");
+    fs::write(&transcript_path, "").unwrap();
+    fixture.write_sessions_config("claude2", &transcript_path);
+
+    let expected_session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+    let script = fixture.write_script(
+        "claude-session-writer.sh",
+        &format!(
+            r#"ts="$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"
+turn_id="turn-$(date +%s%N)-$$"
+printf '{{"session_id":"{expected_session_id}","turn_id":"%s","timestamp":"%s","role":"assistant"}}\n' "$turn_id" "$ts" >> "{}"
+printf 'mock answer\n'
+"#,
+            transcript_path.display()
+        ),
+    );
+    fixture.write_single_provider_model("claude-opus", "claude2", &script, "");
+
+    let output = fixture
+        .base_model_command("claude-opus")
+        .arg("answer once")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let invocation = parse_invocation(&stderr);
+    let emitted_session_id = parse_session_line(&stderr, &invocation.id);
+    assert_eq!(emitted_session_id, expected_session_id);
+
+    let row = fixture
+        .open_db()
+        .get_invocation_by_uuid(&invocation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.session_id.as_deref(), Some(expected_session_id));
+}
+
+#[test]
+fn resume_invocation_re_emits_session_line_with_resumed_session_id() {
+    let fixture = Fixture::new();
+    let transcript_path = fixture.dir.path().join("resume-turns.jsonl");
+    fs::write(&transcript_path, "").unwrap();
+    fixture.write_sessions_config("claude2", &transcript_path);
+
+    let initial_session_id = "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22";
+    let script = fixture.write_script(
+        "claude-resume-session-writer.sh",
+        &format!(
+            r#"sid="{initial_session_id}"
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--resume" ]; then
+    shift
+    sid="$1"
+  fi
+  shift || true
+done
+ts="$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"
+turn_id="turn-$(date +%s%N)-$$"
+printf '{{"session_id":"%s","turn_id":"%s","timestamp":"%s","role":"assistant"}}\n' "$sid" "$turn_id" "$ts" >> "{}"
+printf 'mock answer for %s\n' "$sid"
+"#,
+            transcript_path.display()
+        ),
+    );
+    fixture.write_single_provider_model(
+        "claude-opus",
+        "claude2",
+        &script,
+        r#"
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+"#,
+    );
+
+    let initial_output = fixture
+        .base_model_command("claude-opus")
+        .arg("start session")
+        .output()
+        .unwrap();
+    assert_eq!(initial_output.status.code(), Some(0), "{initial_output:?}");
+    let initial_stderr = String::from_utf8_lossy(&initial_output.stderr);
+    let initial_invocation = parse_invocation(&initial_stderr);
+    let captured_session_id = parse_session_line(&initial_stderr, &initial_invocation.id);
+    assert_eq!(captured_session_id, initial_session_id);
+
+    let resume_output = fixture
+        .base_top_level_resume_command("claude-opus", &captured_session_id)
+        .arg("continue session")
+        .output()
+        .unwrap();
+    assert_eq!(resume_output.status.code(), Some(0), "{resume_output:?}");
+    let resume_stderr = String::from_utf8_lossy(&resume_output.stderr);
+    let resume_invocation = parse_invocation(&resume_stderr);
+    let resumed_session_id = parse_session_line(&resume_stderr, &resume_invocation.id);
+    assert_eq!(resumed_session_id, captured_session_id);
+
+    let row = fixture
+        .open_db()
+        .get_invocation_by_uuid(&resume_invocation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.session_id.as_deref(),
+        Some(captured_session_id.as_str())
+    );
 }
 
 #[test]

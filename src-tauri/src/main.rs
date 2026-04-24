@@ -509,6 +509,80 @@ fn should_emit_invocation_line(is_terminal: bool) -> bool {
     !is_terminal
 }
 
+fn ingest_and_emit_session_id(
+    state: &StateDb,
+    sessions_cfg: &agent_runner_lib::config::SessionsConfig,
+    provider_name: &str,
+    invocation_row_id: i64,
+    invocation_uuid: &str,
+    capture_method: &str,
+) -> bool {
+    let invocation = match state.get_invocation_by_uuid(invocation_uuid) {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            eprintln!("Warning: Could not resolve invocation {invocation_uuid} for session ingest");
+            return false;
+        }
+        Err(err) => {
+            eprintln!(
+                "Warning: Failed to load invocation {invocation_uuid} for session ingest: {err}"
+            );
+            return false;
+        }
+    };
+    let Some(finished_at) = invocation.finished_at else {
+        eprintln!("Warning: Invocation {invocation_uuid} was not finalized before session ingest");
+        return false;
+    };
+
+    let report = agent_runner_lib::sessions::scan_provider(provider_name, sessions_cfg, state);
+    for err in report.errors {
+        eprintln!("Warning: Session ingest failed for {provider_name}: {err}");
+    }
+
+    let session_id = match state.find_session_for_invocation_window(
+        provider_name,
+        &invocation.created_at,
+        &finished_at,
+    ) {
+        Ok(Some(session_id)) => session_id,
+        Ok(None) => return false,
+        Err(err) => {
+            eprintln!("Warning: Failed to resolve session for invocation {invocation_uuid}: {err}");
+            return false;
+        }
+    };
+
+    emit_known_session_id(
+        state,
+        invocation_row_id,
+        invocation_uuid,
+        session_id.as_str(),
+        capture_method,
+    )
+}
+
+fn emit_known_session_id(
+    state: &StateDb,
+    invocation_row_id: i64,
+    invocation_uuid: &str,
+    session_id: &str,
+    capture_method: &str,
+) -> bool {
+    if let Err(err) =
+        state.update_session_capture(invocation_row_id, Some(session_id), capture_method)
+    {
+        eprintln!("Warning: Failed to update invocation session_id: {err}");
+        return false;
+    }
+    let payload = serde_json::json!({
+        "id": invocation_uuid,
+        "session_id": session_id,
+    });
+    eprintln!("OULIPOLY_SESSION={payload}");
+    true
+}
+
 fn should_emit_resume_detail_line(match_count: usize, is_terminal: bool) -> bool {
     match_count > 1 && !is_terminal
 }
@@ -694,6 +768,29 @@ fn run_repl(
             }
             state.finalize_invocation(invocation_row_id, exit_code == 0, exit_code, None, None)?;
             guard.mark_finalized();
+            if exit_code == 0 {
+                let emitted = ingest_and_emit_session_id(
+                    &state,
+                    &sessions_cfg,
+                    &provider.name,
+                    invocation_row_id,
+                    &invocation.id,
+                    if resume.is_some() {
+                        "resumed"
+                    } else {
+                        "turn_script"
+                    },
+                );
+                if !emitted && let Some(session_id) = resume {
+                    emit_known_session_id(
+                        &state,
+                        invocation_row_id,
+                        &invocation.id,
+                        session_id,
+                        "resumed",
+                    );
+                }
+            }
             Ok(exit_code)
         }
         Err(spawn_err) => {
@@ -735,6 +832,12 @@ fn run_resume(
     let model = models
         .get(model_name)
         .ok_or_else(|| format!("Unknown model: {model_name}"))?;
+    let config_root = dirs::config_dir()
+        .map(|d| d.join("oulipoly-agent-runner"))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let sessions_path = config_root.join("sessions.toml");
+    let sessions_cfg =
+        agent_runner_lib::config::SessionsConfig::load(&sessions_path).unwrap_or_default();
 
     let stderr_is_terminal = std::io::stderr().is_terminal();
     let matches = state.find_provider_for_session(session_id)?;
@@ -850,6 +953,23 @@ fn run_resume(
     guard.mark_finalized();
 
     if success {
+        let emitted = ingest_and_emit_session_id(
+            &state,
+            &sessions_cfg,
+            &provider.name,
+            invocation_row_id,
+            &invocation.id,
+            "resumed",
+        );
+        if !emitted {
+            emit_known_session_id(
+                &state,
+                invocation_row_id,
+                &invocation.id,
+                session_id,
+                "resumed",
+            );
+        }
         let _ = std::io::stdout().write_all(&result.stdout);
     } else {
         eprintln!("{}", result.stderr);
@@ -963,6 +1083,26 @@ fn run_with_balancing(
             if success { None } else { Some(&result.stderr) },
         )
         .unwrap_or_else(|e| eprintln!("Warning: Failed to finalize invocation: {e}"));
+
+    if success {
+        let emitted = ingest_and_emit_session_id(
+            &state,
+            &sessions_cfg,
+            provider_name,
+            invocation_row_id,
+            &invocation.id,
+            "turn_script",
+        );
+        if !emitted && let Some(session_id) = result.session_capture.session_id.as_deref() {
+            emit_known_session_id(
+                &state,
+                invocation_row_id,
+                &invocation.id,
+                session_id,
+                result.session_capture.method.db_value(),
+            );
+        }
+    }
 
     // Bump calls_since_refresh for this provider (account). Errors here are
     // non-fatal — missing a tick just slightly skews the next projection.

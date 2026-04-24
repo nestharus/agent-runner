@@ -408,8 +408,10 @@ pub fn execute_resume(
 ) -> Result<ExecutionResult, String> {
     let session_id = resume.session_id.to_string();
     let provider_args = compose_resume_args(provider.args.clone(), resume)?;
+    let mut provider_without_capture = provider.clone();
+    provider_without_capture.session_capture = None;
     let (result, temp_files) = execute_provider_with_args(
-        provider,
+        &provider_without_capture,
         &provider_args,
         prompt_mode,
         prompt,
@@ -693,6 +695,11 @@ fn parse_forced_flag_verified_session_id(stdout: &[u8]) -> Result<String, String
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
+        if value.get("type").and_then(Value::as_str) == Some("result")
+            && let Some(session_id) = value.get("session_id").and_then(Value::as_str)
+        {
+            return Ok(session_id.to_string());
+        }
         if value.get("type").and_then(Value::as_str) != Some("system") {
             continue;
         }
@@ -705,7 +712,7 @@ fn parse_forced_flag_verified_session_id(stdout: &[u8]) -> Result<String, String
             .map(ToOwned::to_owned)
             .ok_or_else(|| "system.init event missing session_id".to_string());
     }
-    Err("stdout did not contain a system.init session_id event".to_string())
+    Err("stdout did not contain a result or system.init session_id event".to_string())
 }
 
 fn parse_stdout_json_event_session_id(

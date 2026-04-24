@@ -2,6 +2,7 @@ use crate::config::load_models;
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, named_params, params};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 use uuid::Uuid;
 
@@ -2065,9 +2066,17 @@ impl StateDb {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT provider_name, MAX(timestamp) AS latest_timestamp
-                 FROM session_turns
-                 WHERE session_id = :session_id
+                "SELECT provider_name, MAX(latest_timestamp) AS latest_timestamp
+                 FROM (
+                    SELECT provider_name, timestamp AS latest_timestamp
+                    FROM session_turns
+                    WHERE session_id = :session_id
+                    UNION ALL
+                    SELECT provider_name, COALESCE(finished_at, created_at) AS latest_timestamp
+                    FROM invocations
+                    WHERE session_id = :session_id
+                      AND provider_name IS NOT NULL
+                 )
                  GROUP BY provider_name
                  ORDER BY latest_timestamp DESC, provider_name ASC",
             )
@@ -2095,6 +2104,61 @@ impl StateDb {
 
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("Failed to read session provider lookup: {e}"))
+    }
+
+    pub fn find_session_for_invocation_window(
+        &self,
+        provider_name: &str,
+        started_at: &DateTime<Utc>,
+        finished_at: &DateTime<Utc>,
+    ) -> Result<Option<String>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT session_id, timestamp
+                 FROM session_turns
+                 WHERE provider_name = ?1",
+            )
+            .map_err(|e| format!("Failed to prepare invocation session lookup: {e}"))?;
+
+        let rows = stmt
+            .query_map(params![provider_name], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| format!("Failed to query invocation session lookup: {e}"))?;
+
+        let mut candidates: HashMap<String, (DateTime<Utc>, u64)> = HashMap::new();
+        for row in rows {
+            let (session_id, timestamp_raw) =
+                row.map_err(|e| format!("Failed to read invocation session lookup row: {e}"))?;
+            let timestamp = DateTime::parse_from_rfc3339(&timestamp_raw)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|e| format!("Bad session turn timestamp {timestamp_raw}: {e}"))?;
+            if timestamp <= *started_at || timestamp > *finished_at {
+                continue;
+            }
+
+            candidates
+                .entry(session_id)
+                .and_modify(|(earliest, in_window)| {
+                    if timestamp < *earliest {
+                        *earliest = timestamp;
+                    }
+                    *in_window += 1;
+                })
+                .or_insert((timestamp, 1));
+        }
+
+        let mut ranked = candidates.into_iter().collect::<Vec<_>>();
+        ranked.sort_by(
+            |(session_a, (earliest_a, count_a)), (session_b, (earliest_b, count_b))| {
+                count_b
+                    .cmp(count_a)
+                    .then_with(|| earliest_a.cmp(earliest_b))
+                    .then_with(|| session_a.cmp(session_b))
+            },
+        );
+        Ok(ranked.into_iter().next().map(|(session_id, _)| session_id))
     }
 
     /// Count assistant turns ingested for a provider since `since` (exclusive).
@@ -3638,6 +3702,35 @@ command = "fixture"
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].provider_name, "claude2");
         assert_eq!(matches[0].latest_timestamp, ts("2026-04-17T08:00:05Z"));
+    }
+
+    #[test]
+    fn find_provider_for_session_uses_invocation_capture_when_no_turns_exist() {
+        let db = test_db();
+        let invocation_id = db
+            .start_invocation(&InvocationStart {
+                invocation_uuid: "7ad2916c-38dd-49e6-a1f7-3ef22766ff70".to_string(),
+                model_name: "claude-opus".to_string(),
+                provider_name: "claude".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        db.update_session_capture(
+            invocation_id,
+            Some("5169694d-de0f-40d1-890c-6e28e55bab27"),
+            "forced_flag_verified",
+        )
+        .unwrap();
+        db.finalize_invocation(invocation_id, true, 0, None, None)
+            .unwrap();
+
+        let matches = db
+            .find_provider_for_session("5169694d-de0f-40d1-890c-6e28e55bab27")
+            .unwrap();
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].provider_name, "claude");
     }
 
     #[test]
