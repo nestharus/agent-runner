@@ -35,6 +35,15 @@ struct Cli {
     #[arg(short, long)]
     model: Option<String>,
 
+    /// Resume an existing session by UUID at the top level. Routes by
+    /// prompt presence: a prompt (positional, `--file`, or piped stdin)
+    /// dispatches to non-interactive headless mode; no prompt drops into
+    /// the provider's interactive REPL. Equivalent to `repl --resume`
+    /// (no prompt) or `resume --session-id <sid>` (with prompt), but
+    /// unified at the top level.
+    #[arg(long = "resume")]
+    resume: Option<String>,
+
     /// Path to an agent .md file
     #[arg(short = 'a', long = "agent-file")]
     agent_file: Option<PathBuf>,
@@ -295,6 +304,60 @@ fn run(cli: Cli) -> Result<i32, String> {
                 models_dir.as_deref(),
             ),
         };
+    }
+
+    // Top-level --resume unifies REPL and headless paths. A prompt source
+    // (--file, positional args, or piped stdin) dispatches to headless;
+    // no prompt dispatches to the provider's interactive REPL. Subcommand
+    // forms (`repl --resume`, `resume`) still work unchanged.
+    if let Some(ref session_id) = cli.resume {
+        if cli.agent_file.is_some() {
+            return Err("--resume is incompatible with --agent-file.".to_string());
+        }
+
+        let model_name = cli
+            .model
+            .as_deref()
+            .ok_or_else(|| "--resume requires --model <model-id>.".to_string())?;
+
+        let prompt_text = collect_positional_prompt(&cli, true);
+        let stdin_prompt =
+            if prompt_text.is_none() && cli.file.is_none() && !std::io::stdin().is_terminal() {
+                let mut input = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut input)
+                    .map_err(|e| format!("Failed to read stdin: {e}"))?;
+                if input.trim().is_empty() {
+                    None
+                } else {
+                    Some(input)
+                }
+            } else {
+                None
+            };
+
+        let has_positional_prompt = prompt_text.is_some();
+        let has_file = cli.file.is_some();
+        let has_prompt = has_positional_prompt || has_file || stdin_prompt.is_some();
+
+        if has_prompt {
+            let prompt_text = prompt_text.as_deref().or(stdin_prompt.as_deref());
+            return run_resume(
+                model_name,
+                session_id,
+                prompt_text,
+                cli.file.as_deref(),
+                cli.project.as_deref(),
+                cli.models_dir.as_deref(),
+            );
+        } else {
+            return run_repl(
+                model_name,
+                Some(session_id),
+                cli.project.as_deref(),
+                cli.models_dir.as_deref(),
+            );
+        }
     }
 
     let models_dir = resolve_models_dir(&cli);

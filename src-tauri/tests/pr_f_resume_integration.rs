@@ -171,6 +171,32 @@ flag = "--resume"
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
         cmd
     }
+
+    fn base_top_level_resume_command(&self, model_name: &str, session_id: &str) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+        cmd.arg("-m")
+            .arg(model_name)
+            .arg("--resume")
+            .arg(session_id)
+            .arg("--models-dir")
+            .arg(&self.models_dir);
+        cmd.env("XDG_CONFIG_HOME", &self.config_home);
+        cmd.env("XDG_DATA_HOME", &self.data_home);
+        cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+        cmd
+    }
+
+    fn base_top_level_resume_without_model_command(&self, session_id: &str) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+        cmd.arg("--resume")
+            .arg(session_id)
+            .arg("--models-dir")
+            .arg(&self.models_dir);
+        cmd.env("XDG_CONFIG_HOME", &self.config_home);
+        cmd.env("XDG_DATA_HOME", &self.data_home);
+        cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+        cmd
+    }
 }
 
 fn ts(value: &str) -> DateTime<Utc> {
@@ -191,6 +217,192 @@ fn parse_invocation(stderr: &str) -> CompositeInvocationId {
     );
     let raw = lines[0].strip_prefix("OULIPOLY_INVOCATION=").unwrap();
     CompositeInvocationId::parse_env_value(raw).unwrap()
+}
+
+#[test]
+fn top_level_resume_without_prompt_routes_to_interactive_repl() {
+    let fixture = Fixture::new();
+    let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+    let provider_a_marker = fixture.dir.path().join("top-level-repl-provider-a.txt");
+    let provider_b_argv = fixture
+        .dir
+        .path()
+        .join("top-level-repl-provider-b-argv.txt");
+    let provider_a = fixture.write_script(
+        "top-level-repl-provider-a.sh",
+        &format!(
+            r#"printf 'provider-a\n' > "{}"; exit 0"#,
+            provider_a_marker.display()
+        ),
+    );
+    let provider_b = fixture.write_script(
+        "top-level-repl-provider-b.sh",
+        &format!(
+            r#"printf 'TOP_LEVEL_REPL_RESUME_MARKER\n'; printf '%s\n' "$@" > "{}"; exit 0"#,
+            provider_b_argv.display()
+        ),
+    );
+    fixture.write_two_provider_model(
+        "balanced-model",
+        "claude-default",
+        &provider_a,
+        "claude-owner",
+        &provider_b,
+    );
+    fixture.seed_session_turns(
+        "claude-owner",
+        session_id,
+        &[("owner-turn", "2026-04-17T08:00:00Z")],
+    );
+
+    let output = fixture
+        .base_top_level_resume_command("balanced-model", session_id)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        !provider_a_marker.exists(),
+        "top-level --resume must route to the session owner"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("TOP_LEVEL_REPL_RESUME_MARKER"),
+        "{output:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&provider_b_argv).unwrap(),
+        "launch-b\n--resume\n5169694d-de0f-40d1-890c-6e28e55bab27\n"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("[resume] -> claude-owner"), "{stderr}");
+    let invocation = parse_invocation(&stderr);
+    let row = fixture
+        .open_db()
+        .get_invocation_by_uuid(&invocation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.session_id.as_deref(), Some(session_id));
+    assert_eq!(row.session_capture_method.as_deref(), Some("resumed"));
+}
+
+#[test]
+fn top_level_resume_with_positional_prompt_routes_to_headless() {
+    let fixture = Fixture::new();
+    let session_id = "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22";
+    let argv_dump = fixture.dir.path().join("top-level-positional-argv.txt");
+    let script = fixture.write_script(
+        "top-level-positional.sh",
+        &format!(
+            r#"printf 'TOP_LEVEL_HEADLESS_RESUME_MARKER\n'; printf '%s\n' "$@" > "{}"; exit 0"#,
+            argv_dump.display()
+        ),
+    );
+    fixture.write_single_provider_model(
+        "claude-opus",
+        "claude2",
+        &script,
+        r#"
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+"#,
+    );
+    fixture.seed_session_turns("claude2", session_id, &[("turn-1", "2026-04-17T08:00:00Z")]);
+
+    let output = fixture
+        .base_top_level_resume_command("claude-opus", session_id)
+        .arg("continuation prompt")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("TOP_LEVEL_HEADLESS_RESUME_MARKER"),
+        "{output:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&argv_dump).unwrap(),
+        "one-shot-only\n--resume\n8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22\ncontinuation prompt\n"
+    );
+
+    let invocation = parse_invocation(&String::from_utf8_lossy(&output.stderr));
+    let row = fixture
+        .open_db()
+        .get_invocation_by_uuid(&invocation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.session_id.as_deref(), Some(session_id));
+    assert_eq!(row.session_capture_method.as_deref(), Some("resumed"));
+}
+
+#[test]
+fn top_level_resume_with_file_prompt_routes_to_headless() {
+    let fixture = Fixture::new();
+    let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+    let answer_path = fixture.dir.path().join("answer.md");
+    fs::write(&answer_path, "answer from file\n").unwrap();
+    let argv_dump = fixture.dir.path().join("top-level-file-argv.txt");
+    let script = fixture.write_script(
+        "top-level-file.sh",
+        &format!(
+            r#"printf 'TOP_LEVEL_FILE_RESUME_MARKER\n'; printf '%s\n' "$@" > "{}"; exit 0"#,
+            argv_dump.display()
+        ),
+    );
+    fixture.write_single_provider_model(
+        "claude-opus",
+        "claude2",
+        &script,
+        r#"
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+"#,
+    );
+    fixture.seed_session_turns("claude2", session_id, &[("turn-1", "2026-04-17T08:00:00Z")]);
+
+    let output = fixture
+        .base_top_level_resume_command("claude-opus", session_id)
+        .arg("-f")
+        .arg(&answer_path)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("TOP_LEVEL_FILE_RESUME_MARKER"),
+        "{output:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&argv_dump).unwrap(),
+        "one-shot-only\n--resume\n5169694d-de0f-40d1-890c-6e28e55bab27\nanswer from file\n\n"
+    );
+
+    let invocation = parse_invocation(&String::from_utf8_lossy(&output.stderr));
+    let row = fixture
+        .open_db()
+        .get_invocation_by_uuid(&invocation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.session_id.as_deref(), Some(session_id));
+    assert_eq!(row.session_capture_method.as_deref(), Some("resumed"));
+}
+
+#[test]
+fn top_level_resume_without_model_errors_cleanly() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .base_top_level_resume_without_model_command("5169694d-de0f-40d1-890c-6e28e55bab27")
+        .output()
+        .unwrap();
+
+    assert_ne!(output.status.code(), Some(0), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--resume requires --model <model-id>."),
+        "{stderr}"
+    );
 }
 
 #[test]
