@@ -150,6 +150,8 @@ pub struct InvocationRecord {
     pub error_category: Option<String>,
     pub session_id: Option<String>,
     pub session_capture_method: Option<String>,
+    pub resume_acceptance_status: Option<String>,
+    pub resume_acceptance_evidence: Option<String>,
     pub created_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
 }
@@ -369,7 +371,6 @@ impl StateDb {
 
         conn.execute_batch("PRAGMA journal_mode=WAL;")
             .map_err(|e| format!("Failed to set WAL mode: {e}"))?;
-
         Self::ensure_invocations_schema(&conn)?;
 
         conn.execute_batch(
@@ -541,6 +542,28 @@ impl StateDb {
                 )
                 .map_err(|e| format!("Failed to add invocations.session_capture_method: {e}"))?;
             }
+            if !columns
+                .iter()
+                .any(|column| column == "resume_acceptance_status")
+            {
+                conn.execute(
+                    "ALTER TABLE invocations ADD COLUMN resume_acceptance_status TEXT",
+                    [],
+                )
+                .map_err(|e| format!("Failed to add invocations.resume_acceptance_status: {e}"))?;
+            }
+            if !columns
+                .iter()
+                .any(|column| column == "resume_acceptance_evidence")
+            {
+                conn.execute(
+                    "ALTER TABLE invocations ADD COLUMN resume_acceptance_evidence TEXT",
+                    [],
+                )
+                .map_err(|e| {
+                    format!("Failed to add invocations.resume_acceptance_evidence: {e}")
+                })?;
+            }
             if columns.iter().any(|column| column == "quota_tight_routing") {
                 conn.execute(
                     "ALTER TABLE invocations DROP COLUMN quota_tight_routing",
@@ -708,6 +731,8 @@ impl StateDb {
             error_category TEXT,
             session_id TEXT,
             session_capture_method TEXT,
+            resume_acceptance_status TEXT,
+            resume_acceptance_evidence TEXT,
             created_at TEXT NOT NULL,
             finished_at TEXT
         );
@@ -802,6 +827,8 @@ impl StateDb {
                 error_category TEXT,
                 session_id TEXT,
                 session_capture_method TEXT,
+                resume_acceptance_status TEXT,
+                resume_acceptance_evidence TEXT,
                 created_at TEXT NOT NULL,
                 finished_at TEXT
             );",
@@ -823,9 +850,11 @@ impl StateDb {
                         error_category,
                         session_id,
                         session_capture_method,
+                        resume_acceptance_status,
+                        resume_acceptance_evidence,
                         created_at,
                         finished_at
-                     ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, NULL, NULL, ?9, ?9)",
+                     ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, NULL, NULL, NULL, NULL, ?9, ?9)",
                 )
                 .map_err(|e| format!("Failed to prepare migrated invocation insert: {e}"))?;
 
@@ -1049,13 +1078,33 @@ impl StateDb {
         Ok(())
     }
 
+    pub fn update_resume_acceptance(
+        &self,
+        id: i64,
+        status: &str,
+        evidence: Option<&str>,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE invocations
+                 SET resume_acceptance_status = ?1,
+                     resume_acceptance_evidence = ?2
+                 WHERE id = ?3",
+                params![status, evidence, id],
+            )
+            .map_err(|e| format!("Failed to update resume acceptance for invocation {id}: {e}"))?;
+        Ok(())
+    }
+
     pub fn get_invocation_by_uuid(&self, uuid: &str) -> Result<Option<InvocationRecord>, String> {
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT id, invocation_uuid, model_name, provider_name, provider_index,
                         parent_invocation_id, status, success, exit_code, error_category,
-                        session_id, session_capture_method, created_at, finished_at
+                        session_id, session_capture_method,
+                        resume_acceptance_status, resume_acceptance_evidence,
+                        created_at, finished_at
                  FROM invocations
                  WHERE invocation_uuid = ?1",
             )
@@ -1078,7 +1127,9 @@ impl StateDb {
             .prepare(
                 "SELECT id, invocation_uuid, model_name, provider_name, provider_index,
                         parent_invocation_id, status, success, exit_code, error_category,
-                        session_id, session_capture_method, created_at, finished_at
+                        session_id, session_capture_method,
+                        resume_acceptance_status, resume_acceptance_evidence,
+                        created_at, finished_at
                  FROM invocations
                  WHERE parent_invocation_id = ?1
                  ORDER BY created_at, id",
@@ -1094,14 +1145,14 @@ impl StateDb {
     }
 
     fn map_invocation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<InvocationRecord> {
-        let created_at_raw: String = row.get(12)?;
-        let finished_at_raw: Option<String> = row.get(13)?;
+        let created_at_raw: String = row.get(14)?;
+        let finished_at_raw: Option<String> = row.get(15)?;
         let status_raw: String = row.get(6)?;
         let created_at = DateTime::parse_from_rfc3339(&created_at_raw)
             .map(|dt| dt.with_timezone(&Utc))
             .map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    12,
+                    14,
                     rusqlite::types::Type::Text,
                     Box::new(e),
                 )
@@ -1112,7 +1163,7 @@ impl StateDb {
                     .map(|dt| dt.with_timezone(&Utc))
                     .map_err(|e| {
                         rusqlite::Error::FromSqlConversionFailure(
-                            13,
+                            15,
                             rusqlite::types::Type::Text,
                             Box::new(e),
                         )
@@ -1140,6 +1191,8 @@ impl StateDb {
             error_category: row.get(9)?,
             session_id: row.get(10)?,
             session_capture_method: row.get(11)?,
+            resume_acceptance_status: row.get(12)?,
+            resume_acceptance_evidence: row.get(13)?,
             created_at,
             finished_at,
         })
@@ -2462,6 +2515,8 @@ mod tests {
         assert!(sql.contains("finished_at TEXT"));
         assert!(sql.contains("session_id TEXT"));
         assert!(sql.contains("session_capture_method TEXT"));
+        assert!(sql.contains("resume_acceptance_status TEXT"));
+        assert!(sql.contains("resume_acceptance_evidence TEXT"));
 
         let indexes: Vec<String> = db
             .conn
@@ -2480,6 +2535,32 @@ mod tests {
                 "idx_invocations_uuid".to_string(),
                 "sqlite_autoindex_invocations_1".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn update_resume_acceptance_persists_status_and_evidence() {
+        let db = test_db();
+        let start = InvocationStart {
+            invocation_uuid: Uuid::new_v4().to_string(),
+            model_name: "test-model".to_string(),
+            provider_name: "fixture-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        };
+        let id = db.start_invocation(&start).unwrap();
+
+        db.update_resume_acceptance(id, "accepted", Some("matched session id"))
+            .unwrap();
+
+        let row = db
+            .get_invocation_by_uuid(&start.invocation_uuid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.resume_acceptance_status.as_deref(), Some("accepted"));
+        assert_eq!(
+            row.resume_acceptance_evidence.as_deref(),
+            Some("matched session id")
         );
     }
 

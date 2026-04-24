@@ -1,0 +1,29 @@
+prompt_mode = "arg"
+
+[[providers]]
+name = "claude"
+command = "claude"
+args = [
+  "-p",
+  "--output-format", "stream-json",
+  "--verbose",
+]
+interactive_args = [
+  "--model", "sonnet",
+]
+
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+
+[providers.resume_acceptance]
+accepted_output_patterns = [
+  "\"session_id\":\"{session_id}\"",
+  "\"session_id\": \"{session_id}\"",
+]
+rejected_output_patterns = [
+  "No conversation found",
+  "No conversation found with session ID",
+  "Invalid resume",
+  "session not found",
+]

@@ -65,6 +65,8 @@ pub struct TraceSession {
     pub turn_count: Option<u64>,
     pub assistant_turn_count: Option<u64>,
     pub sidechain_turn_count: Option<u64>,
+    pub resume_acceptance: Option<String>,
+    pub resume_acceptance_evidence: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -228,13 +230,14 @@ fn build_trace_session(
             "session capture failed during execution; reason was logged to stderr at execution time"
                 .to_string(),
         );
-    } else if record.session_capture_method.as_deref() == Some("resumed") {
+    } else if record.session_capture_method.as_deref() == Some("resumed")
+        && record.resume_acceptance_status.as_deref() != Some("accepted")
+    {
         warnings.push(
-            "session capture method 'resumed' marks an attempted resume target; child acceptance is unconfirmed, so inspect exit_code and recent stderr for outcome"
+            "session capture method 'resumed' marks an attempted resume target; child acceptance is not accepted, so inspect resume_acceptance and exit_code"
                 .to_string(),
         );
     }
-
     let Some(session_id) = record.session_id.clone() else {
         return Ok((
             TraceSession {
@@ -245,6 +248,8 @@ fn build_trace_session(
                 turn_count: None,
                 assistant_turn_count: None,
                 sidechain_turn_count: None,
+                resume_acceptance: record.resume_acceptance_status.clone(),
+                resume_acceptance_evidence: record.resume_acceptance_evidence.clone(),
             },
             warnings,
         ));
@@ -261,6 +266,8 @@ fn build_trace_session(
                 turn_count: None,
                 assistant_turn_count: None,
                 sidechain_turn_count: None,
+                resume_acceptance: record.resume_acceptance_status.clone(),
+                resume_acceptance_evidence: record.resume_acceptance_evidence.clone(),
             },
             warnings,
         ));
@@ -294,6 +301,8 @@ fn build_trace_session(
                 turn_count,
                 assistant_turn_count,
                 sidechain_turn_count,
+                resume_acceptance: record.resume_acceptance_status.clone(),
+                resume_acceptance_evidence: record.resume_acceptance_evidence.clone(),
             },
             warnings,
         ));
@@ -309,6 +318,8 @@ fn build_trace_session(
                 turn_count,
                 assistant_turn_count,
                 sidechain_turn_count,
+                resume_acceptance: record.resume_acceptance_status.clone(),
+                resume_acceptance_evidence: record.resume_acceptance_evidence.clone(),
             },
             warnings,
         )),
@@ -321,6 +332,8 @@ fn build_trace_session(
                 turn_count,
                 assistant_turn_count,
                 sidechain_turn_count,
+                resume_acceptance: record.resume_acceptance_status.clone(),
+                resume_acceptance_evidence: record.resume_acceptance_evidence.clone(),
             },
             warnings,
         )),
@@ -333,6 +346,8 @@ fn build_trace_session(
                 turn_count,
                 assistant_turn_count,
                 sidechain_turn_count,
+                resume_acceptance: record.resume_acceptance_status.clone(),
+                resume_acceptance_evidence: record.resume_acceptance_evidence.clone(),
             },
             warnings,
         )),
@@ -347,6 +362,8 @@ fn build_trace_session(
                     turn_count,
                     assistant_turn_count,
                     sidechain_turn_count,
+                    resume_acceptance: record.resume_acceptance_status.clone(),
+                    resume_acceptance_evidence: record.resume_acceptance_evidence.clone(),
                 },
                 warnings,
             ))
@@ -389,8 +406,14 @@ fn format_ascii_node(node: &TraceNode) -> String {
     } else {
         format!("session={}", node.session.id.as_deref().unwrap_or("—"))
     };
+    let resume_acceptance = node
+        .session
+        .resume_acceptance
+        .as_deref()
+        .map(|status| format!(" resume={status}"))
+        .unwrap_or_default();
     format!(
-        "{}  {}  {}  {}  {}  {}  {}",
+        "{}  {}  {}  {}  {}  {}{}  {}",
         node.invocation.id,
         node.invocation.source.as_deref().unwrap_or("—"),
         node.invocation.model_name,
@@ -399,6 +422,7 @@ fn format_ascii_node(node: &TraceNode) -> String {
             .started_at
             .to_rfc3339_opts(SecondsFormat::Secs, true),
         session_field,
+        resume_acceptance,
         node.session.transcript_state.as_str(),
     )
 }
@@ -510,6 +534,12 @@ mod tests {
                 params![session_id, capture_method, row_id],
             )
             .unwrap();
+        }
+
+        fn set_resume_acceptance(&self, row_id: i64, status: &str, evidence: Option<&str>) {
+            let db = self.db();
+            db.update_resume_acceptance(row_id, status, evidence)
+                .unwrap();
         }
 
         fn set_exit_status(&self, row_id: i64, status: &str, success: bool, exit_code: i32) {
@@ -858,6 +888,7 @@ transcript_locator = "{}"
             ascii.trim_end(),
             "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee  —  legacy-model  legacy  2026-04-17T09:00:00Z  session=—  unresolved"
         );
+        assert!(!ascii.contains(" resume="), "{ascii}");
     }
 
     #[test]
@@ -877,6 +908,7 @@ transcript_locator = "{}"
         assert!(lines[1].contains(CHILD_ALPHA_UUID), "{ascii}");
         assert!(lines[2].starts_with("    "), "{ascii}");
         assert!(lines[2].contains(GRANDCHILD_UUID), "{ascii}");
+        assert!(!ascii.contains(" resume="), "{ascii}");
     }
 
     #[test]
@@ -1289,13 +1321,21 @@ transcript_locator = "{}"
 
     #[test]
     fn ascii_output_uses_resume_target_label_for_resumed_session() {
-        let report = build_resumed_trace_report(trace_options(64));
+        let fixture = TraceFixture::new(&base_rows());
+        fixture.set_session_capture(
+            1,
+            Some("5169694d-de0f-40d1-890c-6e28e55bab27"),
+            Some("resumed"),
+        );
+        fixture.set_resume_acceptance(1, "accepted", Some("matched session id"));
+        let report = trace_invocation(&fixture.db(), ROOT_UUID, trace_options(64)).unwrap();
         let ascii = render_ascii_trace(&report);
 
         assert!(
             ascii.contains("Resume target: 5169694d-de0f-40d1-890c-6e28e55bab27"),
             "{ascii}"
         );
+        assert!(ascii.contains(" resume=accepted"), "{ascii}");
     }
 
     #[test]
@@ -1384,5 +1424,35 @@ transcript_locator = "{}"
         let json = serde_json::to_value(&report).unwrap();
 
         assert_eq!(json["root"]["session"]["capture_method"], "resumed");
+    }
+
+    #[test]
+    fn json_output_includes_resume_acceptance_status() {
+        let fixture = TraceFixture::new(&base_rows());
+        fixture.set_session_capture(
+            1,
+            Some("5169694d-de0f-40d1-890c-6e28e55bab27"),
+            Some("resumed"),
+        );
+        fixture.set_resume_acceptance(1, "accepted", Some("matched session id"));
+
+        let report = trace_invocation(
+            &fixture.db(),
+            ROOT_UUID,
+            TraceOptions {
+                max_depth: 64,
+                json: true,
+                inline_transcript: false,
+                transcript: false,
+            },
+        )
+        .unwrap();
+        let json = serde_json::to_value(&report).unwrap();
+
+        assert_eq!(json["root"]["session"]["resume_acceptance"], "accepted");
+        assert_eq!(
+            json["root"]["session"]["resume_acceptance_evidence"],
+            "matched session id"
+        );
     }
 }

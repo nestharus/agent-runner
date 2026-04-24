@@ -22,7 +22,10 @@ use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
 #[cfg(unix)]
 use signal_hook::iterator::{Handle as SignalsHandle, Signals};
 
-use super::{ExecutionResult, SessionCaptureMethod, SessionCaptureResult};
+use super::{
+    ExecutionResult, ResumeAcceptanceResult, ResumeAcceptanceStatus, SessionCaptureMethod,
+    SessionCaptureResult,
+};
 
 const LARGE_PROMPT_THRESHOLD: usize = 100 * 1024; // 100KB
 
@@ -62,6 +65,7 @@ pub fn execute(
         exit_code: result.exit_code,
         provider_index,
         session_capture: result.session_capture,
+        resume_acceptance: None,
     })
 }
 
@@ -228,6 +232,7 @@ fn toml_value_to_string(v: &toml::Value) -> String {
 
 struct RawResult {
     stdout: Vec<u8>,
+    telemetry_stdout: Vec<u8>,
     stderr: String,
     exit_code: i32,
     session_capture: SessionCaptureResult,
@@ -236,6 +241,36 @@ struct RawResult {
 pub struct ResumePayload<'a> {
     pub session_id: &'a str,
     pub strategy: &'a ResumeStrategy,
+}
+
+fn compose_resume_args(
+    mut provider_args: Vec<String>,
+    resume: ResumePayload<'_>,
+) -> Result<Vec<String>, String> {
+    match resume.strategy.kind {
+        ResumeKind::Flag => {
+            let flag = resume
+                .strategy
+                .flag
+                .as_ref()
+                .ok_or_else(|| "resume.flag is required".to_string())?;
+            provider_args.push(flag.clone());
+            provider_args.push(resume.session_id.to_string());
+        }
+        ResumeKind::Subcommand => {
+            let subcommand = resume
+                .strategy
+                .subcommand
+                .as_ref()
+                .ok_or_else(|| "resume.subcommand is required".to_string())?;
+            if subcommand.is_empty() {
+                return Err("resume.subcommand is required".to_string());
+            }
+            provider_args.extend(subcommand.iter().cloned());
+            provider_args.push(resume.session_id.to_string());
+        }
+    }
+    Ok(provider_args)
 }
 
 fn build_command(
@@ -275,7 +310,27 @@ fn execute_provider(
     input_args: &[String],
     parent_invocation_env: Option<&str>,
 ) -> Result<(RawResult, Vec<PathBuf>), String> {
-    let mut cmd = build_command(provider, &provider.args, working_dir, parent_invocation_env)?;
+    execute_provider_with_args(
+        provider,
+        &provider.args,
+        prompt_mode,
+        prompt,
+        working_dir,
+        input_args,
+        parent_invocation_env,
+    )
+}
+
+fn execute_provider_with_args(
+    provider: &ProviderConfig,
+    provider_args: &[String],
+    prompt_mode: PromptMode,
+    prompt: &str,
+    working_dir: Option<&Path>,
+    input_args: &[String],
+    parent_invocation_env: Option<&str>,
+) -> Result<(RawResult, Vec<PathBuf>), String> {
+    let mut cmd = build_command(provider, provider_args, working_dir, parent_invocation_env)?;
 
     // Append input flags
     for arg in input_args {
@@ -333,12 +388,124 @@ fn execute_provider(
     let stdout = maybe_restore_plain_stdout(&capture_plan, &capture_outcome, &output.stdout);
     let result = RawResult {
         stdout,
+        telemetry_stdout: output.stdout.clone(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         exit_code: output.status.code().unwrap_or(-1),
         session_capture: capture_outcome,
     };
 
     Ok((result, temp_files))
+}
+
+pub fn execute_resume(
+    provider: &ProviderConfig,
+    provider_index: usize,
+    prompt_mode: PromptMode,
+    prompt: &str,
+    working_dir: Option<&Path>,
+    parent_invocation_env: Option<&str>,
+    resume: ResumePayload<'_>,
+) -> Result<ExecutionResult, String> {
+    let session_id = resume.session_id.to_string();
+    let provider_args = compose_resume_args(provider.args.clone(), resume)?;
+    let (result, temp_files) = execute_provider_with_args(
+        provider,
+        &provider_args,
+        prompt_mode,
+        prompt,
+        working_dir,
+        &[],
+        parent_invocation_env,
+    )?;
+    for path in temp_files {
+        let _ = std::fs::remove_file(path);
+    }
+    let resume_acceptance = classify_resume_acceptance(
+        provider.resume_acceptance.as_ref(),
+        result.exit_code,
+        &result.telemetry_stdout,
+        result.stderr.as_bytes(),
+        &session_id,
+    );
+    Ok(ExecutionResult {
+        stdout: result.stdout,
+        stderr: result.stderr,
+        exit_code: result.exit_code,
+        provider_index,
+        session_capture: SessionCaptureResult {
+            session_id: None,
+            method: SessionCaptureMethod::None,
+        },
+        resume_acceptance: Some(resume_acceptance),
+    })
+}
+
+fn classify_resume_acceptance(
+    rules: Option<&crate::config::ResumeAcceptanceRules>,
+    exit_code: i32,
+    stdout: &[u8],
+    stderr: &[u8],
+    session_id: &str,
+) -> ResumeAcceptanceResult {
+    let output = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(stdout),
+        String::from_utf8_lossy(stderr)
+    );
+    if let Some(rules) = rules {
+        if let Some(pattern) = first_matching_pattern(
+            rules.rejected_output_patterns.as_deref(),
+            &output,
+            session_id,
+        ) {
+            return ResumeAcceptanceResult {
+                status: ResumeAcceptanceStatus::Rejected,
+                evidence: Some(format!("matched reject pattern: {pattern}")),
+            };
+        }
+        if exit_code == 0
+            && let Some(pattern) = first_matching_pattern(
+                rules.accepted_output_patterns.as_deref(),
+                &output,
+                session_id,
+            )
+        {
+            return ResumeAcceptanceResult {
+                status: ResumeAcceptanceStatus::Accepted,
+                evidence: Some(format!("matched accept pattern: {pattern}")),
+            };
+        }
+    }
+
+    if exit_code == 0 {
+        let evidence = if rules.is_none() {
+            "child exited 0 but provider has no resume_acceptance rules configured"
+        } else {
+            "child exited 0 but no accepted resume pattern matched"
+        };
+        ResumeAcceptanceResult {
+            status: ResumeAcceptanceStatus::Unconfirmed,
+            evidence: Some(evidence.to_string()),
+        }
+    } else {
+        ResumeAcceptanceResult {
+            status: ResumeAcceptanceStatus::Rejected,
+            evidence: Some(format!(
+                "child exited {exit_code}; no rejection patterns matched"
+            )),
+        }
+    }
+}
+
+fn first_matching_pattern(
+    patterns: Option<&[String]>,
+    output: &str,
+    session_id: &str,
+) -> Option<String> {
+    patterns?.iter().find_map(|pattern| {
+        let expanded = pattern.replace("{session_id}", session_id);
+        output.contains(&expanded).then(|| pattern.clone())
+    })
 }
 
 pub fn execute_interactive(
@@ -356,29 +523,7 @@ pub fn execute_interactive(
 
     let mut provider_args = interactive_args.clone();
     if let Some(resume) = resume {
-        match resume.strategy.kind {
-            ResumeKind::Flag => {
-                let flag = resume
-                    .strategy
-                    .flag
-                    .as_ref()
-                    .ok_or_else(|| "resume.flag is required".to_string())?;
-                provider_args.push(flag.clone());
-                provider_args.push(resume.session_id.to_string());
-            }
-            ResumeKind::Subcommand => {
-                let subcommand = resume
-                    .strategy
-                    .subcommand
-                    .as_ref()
-                    .ok_or_else(|| "resume.subcommand is required".to_string())?;
-                if subcommand.is_empty() {
-                    return Err("resume.subcommand is required".to_string());
-                }
-                provider_args.extend(subcommand.iter().cloned());
-                provider_args.push(resume.session_id.to_string());
-            }
-        }
+        provider_args = compose_resume_args(provider_args, resume)?;
     }
 
     let mut cmd = build_command(provider, &provider_args, working_dir, parent_invocation_env)?;
@@ -761,6 +906,7 @@ mod tests {
             interactive_args: None,
             resume: None,
             session_capture: None,
+            resume_acceptance: None,
         };
 
         let err = execute_interactive(&provider, None, None, None).unwrap_err();
@@ -786,6 +932,7 @@ mod tests {
             interactive_args: Some(vec!["hello".to_string(), "world".to_string()]),
             resume: None,
             session_capture: None,
+            resume_acceptance: None,
         };
 
         let exit_code = execute_interactive(&provider, None, None, None).unwrap();
@@ -810,6 +957,7 @@ mod tests {
             interactive_args: Some(vec!["launch".to_string()]),
             resume: None,
             session_capture: None,
+            resume_acceptance: None,
         };
 
         let exit_code = execute_interactive(&provider, Some(tempdir.path()), None, None).unwrap();
@@ -837,6 +985,7 @@ mod tests {
             interactive_args: Some(vec!["launch".to_string()]),
             resume: None,
             session_capture: None,
+            resume_acceptance: None,
         };
         let parent_env =
             r#"{"source":"fixture-provider","id":"11111111-1111-1111-1111-111111111111"}"#;
@@ -863,6 +1012,7 @@ mod tests {
             interactive_args: Some(vec!["--model".to_string(), "opus".to_string()]),
             resume: None,
             session_capture: None,
+            resume_acceptance: None,
         };
         let strategy = ResumeStrategy {
             kind: ResumeKind::Flag,
@@ -891,6 +1041,96 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn execute_resume_appends_flag_resume_args_and_prompt_to_one_shot_args() {
+        let argv_dump = tempfile::NamedTempFile::new().unwrap();
+        let argv_dump_path = argv_dump.path().to_path_buf();
+        let script = fixture_script(&format!(
+            r#"printf '%s\n' "$@" > "{dump}""#,
+            dump = argv_dump_path.display()
+        ));
+        let provider = ProviderConfig {
+            name: "claude2".to_string(),
+            command: script.path.to_string_lossy().into_owned(),
+            args: vec!["-p".to_string(), "--model".to_string(), "opus".to_string()],
+            interactive_args: Some(vec!["--model".to_string(), "opus".to_string()]),
+            resume: None,
+            session_capture: None,
+            resume_acceptance: None,
+        };
+        let strategy = ResumeStrategy {
+            kind: ResumeKind::Flag,
+            flag: Some("--resume".to_string()),
+            subcommand: None,
+        };
+
+        let result = execute_resume(
+            &provider,
+            0,
+            PromptMode::Arg,
+            "answer text",
+            None,
+            None,
+            ResumePayload {
+                session_id: "5169694d-de0f-40d1-890c-6e28e55bab27",
+                strategy: &strategy,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(
+            std::fs::read_to_string(&argv_dump_path).unwrap(),
+            "-p\n--model\nopus\n--resume\n5169694d-de0f-40d1-890c-6e28e55bab27\nanswer text\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_resume_appends_subcommand_resume_args_and_prompt_to_one_shot_args() {
+        let argv_dump = tempfile::NamedTempFile::new().unwrap();
+        let argv_dump_path = argv_dump.path().to_path_buf();
+        let script = fixture_script(&format!(
+            r#"printf '%s\n' "$@" > "{dump}""#,
+            dump = argv_dump_path.display()
+        ));
+        let provider = ProviderConfig {
+            name: "codex".to_string(),
+            command: script.path.to_string_lossy().into_owned(),
+            args: vec!["exec".to_string(), "-m".to_string(), "gpt-5.4".to_string()],
+            interactive_args: Some(vec!["-m".to_string(), "gpt-5.4".to_string()]),
+            resume: None,
+            session_capture: None,
+            resume_acceptance: None,
+        };
+        let strategy = ResumeStrategy {
+            kind: ResumeKind::Subcommand,
+            flag: None,
+            subcommand: Some(vec!["resume".to_string()]),
+        };
+
+        let result = execute_resume(
+            &provider,
+            0,
+            PromptMode::Arg,
+            "answer text",
+            None,
+            None,
+            ResumePayload {
+                session_id: "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22",
+                strategy: &strategy,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(
+            std::fs::read_to_string(&argv_dump_path).unwrap(),
+            "exec\n-m\ngpt-5.4\nresume\n8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22\nanswer text\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn execute_interactive_appends_subcommand_resume_args_to_child_argv() {
         let argv_dump = tempfile::NamedTempFile::new().unwrap();
         let argv_dump_path = argv_dump.path().to_path_buf();
@@ -909,6 +1149,7 @@ mod tests {
             ]),
             resume: None,
             session_capture: None,
+            resume_acceptance: None,
         };
         let strategy = ResumeStrategy {
             kind: ResumeKind::Subcommand,
@@ -951,6 +1192,7 @@ mod tests {
             interactive_args: Some(vec!["launch".to_string(), "interactive".to_string()]),
             resume: None,
             session_capture: None,
+            resume_acceptance: None,
         };
 
         let exit_code = execute_interactive(&provider, None, None, None).unwrap();
@@ -1116,6 +1358,18 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn classify_resume_acceptance_without_rules_uses_no_rules_evidence() {
+        let result =
+            classify_resume_acceptance(None, 0, b"ok", b"", "5169694d-de0f-40d1-890c-6e28e55bab27");
+
+        assert_eq!(result.status, ResumeAcceptanceStatus::Unconfirmed);
+        assert_eq!(
+            result.evidence.as_deref(),
+            Some("child exited 0 but provider has no resume_acceptance rules configured")
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn execute_cat_stdin_mode() {
@@ -1205,6 +1459,7 @@ printf '{{"type":"system","subtype":"init","session_id":"%s"}}\n' "$requested""#
                     json_flag: None,
                     last_message_flag: None,
                 }),
+                resume_acceptance: None,
             }],
             inputs: vec![],
         };
@@ -1291,6 +1546,7 @@ printf '{"type":"system","subtype":"init","session_id":"11111111-1111-1111-1111-
                     json_flag: None,
                     last_message_flag: None,
                 }),
+                resume_acceptance: None,
             }],
             inputs: vec![],
         };
@@ -1349,6 +1605,7 @@ printf 'assistant text from tmpfile\n' > "$output_file""#,
                     json_flag: Some("--json".to_string()),
                     last_message_flag: Some("-o".to_string()),
                 }),
+                resume_acceptance: None,
             }],
             inputs: vec![],
         };
@@ -1406,6 +1663,7 @@ printf 'assistant text from tmpfile\n' > "$output_file""#,
                     json_flag: Some("--json".to_string()),
                     last_message_flag: Some("-o".to_string()),
                 }),
+                resume_acceptance: None,
             }],
             inputs: vec![],
         };

@@ -131,6 +131,9 @@ Subcommands:
   repl <model> [--resume <session-id>] [-p <project>] [--models-dir <path>]
         Launch a balanced interactive session of the wrapped CLI
         (see Interactive REPL)
+
+  resume -m <model> --session-id <session-id> [-f <answer.md>|--prompt <text>] [-p <project>] [--models-dir <path>]
+        Resume a provider session non-interactively with an answer payload
 ```
 
 **Prompt resolution priority:** `--file` > positional arguments > stdin
@@ -404,7 +407,16 @@ Without `session_capture`, invocations record `session_capture_method = "none"` 
 
 ### Resuming a session
 
-When a provider declares a `[providers.resume]` block, `repl --resume <UUID>` looks the session up across all providers (via the `session_turns` ingest table), validates that the owning provider belongs to the requested model's provider pool, and composes the right resume argv:
+When a provider declares a `[providers.resume]` block, `repl --resume <UUID>` looks the session up across all providers (via the `session_turns` ingest table), validates that the owning provider belongs to the requested model's provider pool, and composes the right interactive resume argv.
+
+For non-interactive answer handoff, use `resume`:
+
+```bash
+oulipoly-agent-runner resume -m claude-opus --session-id 9e69e8cc-616d-4640-bf1d-96f5391b1a2e -f answer.md
+oulipoly-agent-runner resume -m codex-high --session-id 5169694d-de0f-40d1-890c-6e28e55bab27 --prompt "answer text"
+```
+
+`resume` uses the same owner lookup and provider-pool validation as `repl --resume`, but launches the provider's one-shot `args` with the resume strategy and answer payload. It records `resume_acceptance` in `trace`.
 
 ```toml
 # Claude: --resume <UUID> as a flag on the existing interactive launch

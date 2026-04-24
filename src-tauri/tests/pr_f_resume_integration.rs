@@ -82,6 +82,45 @@ interactive_args = ["launch"]
         );
     }
 
+    fn write_two_provider_model(
+        &self,
+        model_name: &str,
+        provider_a_name: &str,
+        provider_a_script: &Path,
+        provider_b_name: &str,
+        provider_b_script: &Path,
+    ) {
+        self.write_model_body(
+            model_name,
+            &format!(
+                r#"prompt_mode = "arg"
+
+[[providers]]
+name = "{provider_a_name}"
+command = "{}"
+args = ["exec-a"]
+interactive_args = ["launch-a"]
+
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+
+[[providers]]
+name = "{provider_b_name}"
+command = "{}"
+args = ["exec-b"]
+interactive_args = ["launch-b"]
+
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+"#,
+                provider_a_script.display(),
+                provider_b_script.display()
+            ),
+        );
+    }
+
     fn seed_session_turns(&self, provider_name: &str, session_id: &str, turns: &[(&str, &str)]) {
         let db = self.open_db();
         let turns: Vec<SessionTurnIngest> = turns
@@ -117,6 +156,21 @@ interactive_args = ["launch"]
     fn run_repl(&self, model_name: &str, resume: Option<&str>) -> Output {
         self.base_repl_command(model_name, resume).output().unwrap()
     }
+
+    fn base_resume_command(&self, model_name: &str, session_id: &str) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+        cmd.arg("resume")
+            .arg("-m")
+            .arg(model_name)
+            .arg("--session-id")
+            .arg(session_id)
+            .arg("--models-dir")
+            .arg(&self.models_dir);
+        cmd.env("XDG_CONFIG_HOME", &self.config_home);
+        cmd.env("XDG_DATA_HOME", &self.data_home);
+        cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+        cmd
+    }
 }
 
 fn ts(value: &str) -> DateTime<Utc> {
@@ -137,6 +191,177 @@ fn parse_invocation(stderr: &str) -> CompositeInvocationId {
     );
     let raw = lines[0].strip_prefix("OULIPOLY_INVOCATION=").unwrap();
     CompositeInvocationId::parse_env_value(raw).unwrap()
+}
+
+#[test]
+fn noninteractive_resume_reads_answer_file_and_records_resumed_target() {
+    let fixture = Fixture::new();
+    let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+    let answer_path = fixture.dir.path().join("answer.md");
+    fs::write(&answer_path, "answer from root\n").unwrap();
+    let stdin_dump = fixture.dir.path().join("stdin.txt");
+    let argv_dump = fixture.dir.path().join("argv.txt");
+    let script = fixture.write_script(
+        "claude.sh",
+        &format!(
+            r#"printf '%s\n' "$@" > "{argv}"; cat > "{stdin}"; exit 0"#,
+            argv = argv_dump.display(),
+            stdin = stdin_dump.display()
+        ),
+    );
+    fixture.write_single_provider_model(
+        "claude-opus",
+        "claude2",
+        &script,
+        r#"
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+"#,
+    );
+    fixture.seed_session_turns("claude2", session_id, &[("turn-1", "2026-04-17T08:00:00Z")]);
+
+    let output = fixture
+        .base_resume_command("claude-opus", session_id)
+        .arg("-f")
+        .arg(&answer_path)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(&argv_dump).unwrap(),
+        "one-shot-only\n--resume\n5169694d-de0f-40d1-890c-6e28e55bab27\nanswer from root\n\n"
+    );
+    assert_eq!(fs::read_to_string(&stdin_dump).unwrap(), "");
+
+    let invocation = parse_invocation(&String::from_utf8_lossy(&output.stderr));
+    let row = fixture
+        .open_db()
+        .get_invocation_by_uuid(&invocation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.session_id.as_deref(), Some(session_id));
+    assert_eq!(row.session_capture_method.as_deref(), Some("resumed"));
+}
+
+#[test]
+fn noninteractive_resume_routes_to_session_owner_in_multi_provider_model() {
+    let fixture = Fixture::new();
+    let session_id = "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22";
+    let provider_a_marker = fixture.dir.path().join("provider-a.txt");
+    let provider_b_marker = fixture.dir.path().join("provider-b.txt");
+    let provider_a = fixture.write_script(
+        "provider-a.sh",
+        &format!(
+            r#"printf 'provider-a\n' > "{}"; exit 0"#,
+            provider_a_marker.display()
+        ),
+    );
+    let provider_b = fixture.write_script(
+        "provider-b.sh",
+        &format!(
+            r#"printf '%s\n' "$@" > "{}"; exit 0"#,
+            provider_b_marker.display()
+        ),
+    );
+    fixture.write_two_provider_model(
+        "balanced-model",
+        "claude-default",
+        &provider_a,
+        "claude-owner",
+        &provider_b,
+    );
+    fixture.seed_session_turns(
+        "claude-owner",
+        session_id,
+        &[("owner-turn", "2026-04-17T08:00:00Z")],
+    );
+
+    let output = fixture
+        .base_resume_command("balanced-model", session_id)
+        .arg("--prompt")
+        .arg("answer text")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        !provider_a_marker.exists(),
+        "resume must not launch provider A/default provider"
+    );
+    assert_eq!(
+        fs::read_to_string(&provider_b_marker).unwrap(),
+        "exec-b\n--resume\n8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22\nanswer text\n"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("[resume] -> claude-owner"), "{stderr}");
+
+    let invocation = parse_invocation(&stderr);
+    let row = fixture
+        .open_db()
+        .get_invocation_by_uuid(&invocation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.provider_name.as_deref(), Some("claude-owner"));
+    assert_eq!(row.provider_index, 1);
+}
+
+#[test]
+fn interactive_repl_resume_routes_to_session_owner_in_multi_provider_model() {
+    let fixture = Fixture::new();
+    let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+    let provider_a_marker = fixture.dir.path().join("interactive-provider-a.txt");
+    let provider_b_marker = fixture.dir.path().join("interactive-provider-b.txt");
+    let provider_a = fixture.write_script(
+        "interactive-provider-a.sh",
+        &format!(
+            r#"printf 'provider-a\n' > "{}"; exit 0"#,
+            provider_a_marker.display()
+        ),
+    );
+    let provider_b = fixture.write_script(
+        "interactive-provider-b.sh",
+        &format!(
+            r#"printf '%s\n' "$@" > "{}"; exit 0"#,
+            provider_b_marker.display()
+        ),
+    );
+    fixture.write_two_provider_model(
+        "balanced-model",
+        "claude-default",
+        &provider_a,
+        "claude-owner",
+        &provider_b,
+    );
+    fixture.seed_session_turns(
+        "claude-owner",
+        session_id,
+        &[("owner-turn", "2026-04-17T08:00:00Z")],
+    );
+
+    let output = fixture.run_repl("balanced-model", Some(session_id));
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        !provider_a_marker.exists(),
+        "repl --resume must not launch provider A/default provider"
+    );
+    assert_eq!(
+        fs::read_to_string(&provider_b_marker).unwrap(),
+        "launch-b\n--resume\n5169694d-de0f-40d1-890c-6e28e55bab27\n"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("[resume] -> claude-owner"), "{stderr}");
+
+    let invocation = parse_invocation(&stderr);
+    let row = fixture
+        .open_db()
+        .get_invocation_by_uuid(&invocation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.provider_name.as_deref(), Some("claude-owner"));
+    assert_eq!(row.provider_index, 1);
 }
 
 #[test]

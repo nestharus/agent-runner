@@ -17,6 +17,8 @@ pub struct ProviderConfig {
     pub resume: Option<ResumeStrategy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_capture: Option<SessionCapture>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_acceptance: Option<ResumeAcceptanceRules>,
 }
 
 impl ProviderConfig {
@@ -31,6 +33,7 @@ impl ProviderConfig {
             interactive_args: None,
             resume: None,
             session_capture: None,
+            resume_acceptance: None,
         }
     }
 
@@ -81,6 +84,14 @@ impl ResumeStrategy {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResumeAcceptanceRules {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_output_patterns: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejected_output_patterns: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -280,6 +291,7 @@ struct RawModelToml {
     resume: Option<ResumeStrategy>,
     prompt_mode: Option<String>,
     session_capture: Option<SessionCapture>,
+    resume_acceptance: Option<ResumeAcceptanceRules>,
     providers: Option<Vec<RawProvider>>,
     inputs: Option<Vec<RawInput>>,
 }
@@ -293,6 +305,7 @@ struct RawProvider {
     interactive_args: Option<Vec<String>>,
     resume: Option<ResumeStrategy>,
     session_capture: Option<SessionCapture>,
+    resume_acceptance: Option<ResumeAcceptanceRules>,
 }
 
 #[derive(Deserialize)]
@@ -411,6 +424,11 @@ impl ModelConfig {
             );
             append_resume_toml(&mut out, "resume", p.resume.as_ref());
             append_session_capture_toml(&mut out, "session_capture", p.session_capture.as_ref());
+            append_resume_acceptance_toml(
+                &mut out,
+                "resume_acceptance",
+                p.resume_acceptance.as_ref(),
+            );
         } else {
             out.push_str(&format!("prompt_mode = \"{}\"\n", mode_str));
             for p in &self.providers {
@@ -436,6 +454,11 @@ impl ModelConfig {
                     &mut out,
                     "providers.session_capture",
                     p.session_capture.as_ref(),
+                );
+                append_resume_acceptance_toml(
+                    &mut out,
+                    "providers.resume_acceptance",
+                    p.resume_acceptance.as_ref(),
                 );
             }
         }
@@ -534,6 +557,7 @@ impl ModelConfig {
                         interactive_args: p.interactive_args,
                         resume: p.resume,
                         session_capture: p.session_capture,
+                        resume_acceptance: p.resume_acceptance,
                     }
                 })
                 .collect()
@@ -547,6 +571,7 @@ impl ModelConfig {
                 interactive_args: raw.interactive_args,
                 resume: raw.resume,
                 session_capture: raw.session_capture,
+                resume_acceptance: raw.resume_acceptance,
             }]
         } else {
             return Err(format!(
@@ -638,6 +663,28 @@ fn append_session_capture_toml(
         out,
         "last_message_flag",
         capture.last_message_flag.as_deref(),
+    );
+}
+
+fn append_resume_acceptance_toml(
+    out: &mut String,
+    table_name: &str,
+    rules: Option<&ResumeAcceptanceRules>,
+) {
+    let Some(rules) = rules else {
+        return;
+    };
+    out.push('\n');
+    out.push_str(&format!("[{table_name}]\n"));
+    append_optional_string_list(
+        out,
+        "accepted_output_patterns",
+        rules.accepted_output_patterns.as_deref(),
+    );
+    append_optional_string_list(
+        out,
+        "rejected_output_patterns",
+        rules.rejected_output_patterns.as_deref(),
     );
 }
 
@@ -1633,5 +1680,57 @@ default = "2048*2048"
         assert_eq!(c1.inputs.len(), c2.inputs.len());
         assert_eq!(c1.inputs[0].name, c2.inputs[0].name);
         assert_eq!(c1.inputs[1].flag, c2.inputs[1].flag);
+    }
+
+    #[test]
+    fn roundtrip_model_with_resume_acceptance_patterns() {
+        let original = r#"
+prompt_mode = "arg"
+
+[[providers]]
+name = "claude-account"
+command = "claude"
+args = ["-p", "--output-format", "stream-json", "--verbose"]
+interactive_args = ["--model", "opus"]
+
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+
+[providers.resume_acceptance]
+accepted_output_patterns = ["\"session_id\":\"{session_id}\""]
+rejected_output_patterns = ["No conversation found", "Invalid resume"]
+"#;
+        let c1 = ModelConfig::from_toml("test", original).unwrap();
+        let c2 = ModelConfig::from_toml("test", &c1.to_toml()).unwrap();
+        let rules = c2.providers[0].resume_acceptance.as_ref().unwrap();
+        assert_eq!(
+            rules.accepted_output_patterns.as_deref(),
+            Some(&["\"session_id\":\"{session_id}\"".to_string()][..])
+        );
+        assert_eq!(
+            rules.rejected_output_patterns.as_deref(),
+            Some(
+                &[
+                    "No conversation found".to_string(),
+                    "Invalid resume".to_string()
+                ][..]
+            )
+        );
+    }
+
+    #[test]
+    fn committed_resume_example_models_parse() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        for rel in [
+            "examples/models/claude-resume.toml",
+            "examples/models/codex-resume.toml",
+        ] {
+            let path = root.join(rel);
+            let content = std::fs::read_to_string(&path).unwrap();
+            let name = path.file_stem().unwrap().to_string_lossy();
+            ModelConfig::from_toml(&name, &content)
+                .unwrap_or_else(|err| panic!("{} should parse: {err}", path.display()));
+        }
     }
 }

@@ -11,6 +11,30 @@ pub struct ExecutionResult {
     pub exit_code: i32,
     pub provider_index: usize,
     pub session_capture: SessionCaptureResult,
+    pub resume_acceptance: Option<ResumeAcceptanceResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeAcceptanceResult {
+    pub status: ResumeAcceptanceStatus,
+    pub evidence: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeAcceptanceStatus {
+    Accepted,
+    Rejected,
+    Unconfirmed,
+}
+
+impl ResumeAcceptanceStatus {
+    pub fn db_value(self) -> &'static str {
+        match self {
+            ResumeAcceptanceStatus::Accepted => "accepted",
+            ResumeAcceptanceStatus::Rejected => "rejected",
+            ResumeAcceptanceStatus::Unconfirmed => "unconfirmed",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

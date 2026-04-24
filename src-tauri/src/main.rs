@@ -103,6 +103,32 @@ enum Subcommands {
         #[arg(long = "models-dir")]
         models_dir: Option<PathBuf>,
     },
+    /// Resume a provider session non-interactively with an answer payload.
+    Resume {
+        /// Model id whose provider pool must include the session owner.
+        #[arg(short, long)]
+        model: String,
+
+        /// Provider session UUID to resume.
+        #[arg(long = "session-id")]
+        session_id: String,
+
+        /// Inline answer payload. Use --file for larger payloads.
+        #[arg(long = "prompt", conflicts_with = "file")]
+        prompt: Option<String>,
+
+        /// Read answer payload from file.
+        #[arg(short, long, conflicts_with = "prompt")]
+        file: Option<PathBuf>,
+
+        /// Working directory for the wrapped CLI.
+        #[arg(short = 'p', long = "project")]
+        project: Option<PathBuf>,
+
+        /// Override models directory.
+        #[arg(long = "models-dir")]
+        models_dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug)]
@@ -188,6 +214,29 @@ fn resolve_prompt(cli: &Cli, include_agent_as_prompt: bool) -> Result<String, St
     Ok(input)
 }
 
+fn resolve_resume_answer(prompt: Option<&str>, file: Option<&Path>) -> Result<String, String> {
+    if let Some(path) = file {
+        return std::fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read answer file: {e}"));
+    }
+    if let Some(prompt) = prompt {
+        return Ok(prompt.to_string());
+    }
+    if std::io::stdin().is_terminal() {
+        return Err(
+            "No answer payload provided. Pass --prompt, --file, or pipe to stdin.".to_string(),
+        );
+    }
+    let mut input = String::new();
+    std::io::stdin()
+        .read_to_string(&mut input)
+        .map_err(|e| format!("Failed to read stdin: {e}"))?;
+    if input.trim().is_empty() {
+        return Err("Empty answer payload from stdin.".to_string());
+    }
+    Ok(input)
+}
+
 fn resolve_models_dir(cli: &Cli) -> PathBuf {
     if let Some(ref dir) = cli.models_dir {
         return dir.clone();
@@ -227,6 +276,21 @@ fn run(cli: Cli) -> Result<i32, String> {
             } => run_repl(
                 &model,
                 resume.as_deref(),
+                project.as_deref(),
+                models_dir.as_deref(),
+            ),
+            Subcommands::Resume {
+                model,
+                session_id,
+                prompt,
+                file,
+                project,
+                models_dir,
+            } => run_resume(
+                &model,
+                &session_id,
+                prompt.as_deref(),
+                file.as_deref(),
                 project.as_deref(),
                 models_dir.as_deref(),
             ),
@@ -584,6 +648,153 @@ fn run_repl(
             Ok(1)
         }
     }
+}
+
+fn run_resume(
+    model_name: &str,
+    session_id: &str,
+    prompt: Option<&str>,
+    file: Option<&Path>,
+    working_dir: Option<&Path>,
+    models_dir_override: Option<&Path>,
+) -> Result<i32, String> {
+    if Uuid::parse_str(session_id).is_err() {
+        eprintln!("invalid session UUID: {session_id}");
+        return Ok(1);
+    }
+
+    let answer = resolve_resume_answer(prompt, file)?;
+    let state = StateDb::open_default()?;
+    let models_dir = models_dir_override
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_models_dir);
+    let models = load_models(&models_dir)?;
+    let model = models
+        .get(model_name)
+        .ok_or_else(|| format!("Unknown model: {model_name}"))?;
+
+    let stderr_is_terminal = std::io::stderr().is_terminal();
+    let matches = state.find_provider_for_session(session_id)?;
+    if matches.is_empty() {
+        eprintln!(
+            "No session found matching {session_id}. Check that session ingestion is configured and that the provider still has resumable local state."
+        );
+        return Ok(1);
+    }
+
+    let selected_provider = &matches[0].provider_name;
+    if should_emit_resume_short_line(stderr_is_terminal) {
+        eprintln!("[resume] -> {selected_provider}");
+    }
+    if should_emit_resume_detail_line(matches.len(), stderr_is_terminal) {
+        let providers = matches
+            .iter()
+            .map(|matched| matched.provider_name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "[resume] session {session_id} matched {providers}; selected {selected_provider} by latest turn timestamp"
+        );
+    }
+
+    let Some(provider_index) = model
+        .providers
+        .iter()
+        .position(|provider| provider.name == *selected_provider)
+    else {
+        eprintln!(
+            "{}",
+            resume_model_pool_mismatch_message(&models, model_name, session_id, selected_provider)
+        );
+        return Ok(1);
+    };
+
+    let provider = &model.providers[provider_index];
+    let Some(strategy) = provider.resume.as_ref() else {
+        eprintln!(
+            "provider {} has no [providers.resume] block; cannot resume",
+            provider.name
+        );
+        return Ok(1);
+    };
+
+    let parent_invocation_id = resolve_parent_invocation_id(&state);
+    let invocation = CompositeInvocationId {
+        source: provider.name.clone(),
+        id: Uuid::new_v4().to_string(),
+    };
+    let invocation_row_id = state.start_invocation(&InvocationStart {
+        invocation_uuid: invocation.id.clone(),
+        model_name: model.name.clone(),
+        provider_name: provider.name.clone(),
+        provider_index,
+        parent_invocation_id,
+    })?;
+    let mut guard = FinalizerGuard::new(&state, invocation_row_id);
+    state.update_session_capture(invocation_row_id, Some(session_id), "resumed")?;
+
+    let invocation_env = serde_json::to_string(&invocation)
+        .map_err(|e| format!("Failed to serialize invocation id: {e}"))?;
+    eprintln!("{}", invocation.stderr_line());
+
+    let result = match executor::cli::execute_resume(
+        provider,
+        provider_index,
+        model.prompt_mode,
+        &answer,
+        working_dir,
+        Some(&invocation_env),
+        executor::cli::ResumePayload {
+            session_id,
+            strategy,
+        },
+    ) {
+        Ok(result) => result,
+        Err(spawn_err) => {
+            state.finalize_invocation(
+                invocation_row_id,
+                false,
+                1,
+                Some("spawn_error"),
+                Some(&spawn_err),
+            )?;
+            guard.mark_finalized();
+            return Ok(1);
+        }
+    };
+
+    if let Some(acceptance) = &result.resume_acceptance {
+        state.update_resume_acceptance(
+            invocation_row_id,
+            acceptance.status.db_value(),
+            acceptance.evidence.as_deref(),
+        )?;
+    }
+
+    let success = result.exit_code == 0;
+    let error_category = if !success {
+        run_diagnostics(&result.stderr, result.exit_code, &models, working_dir)
+    } else {
+        None
+    };
+    state.finalize_invocation(
+        invocation_row_id,
+        success,
+        result.exit_code,
+        error_category.as_deref(),
+        if success { None } else { Some(&result.stderr) },
+    )?;
+    guard.mark_finalized();
+
+    if success {
+        let _ = std::io::stdout().write_all(&result.stdout);
+    } else {
+        eprintln!("{}", result.stderr);
+        if let Some(ref cat) = error_category {
+            eprintln!("[diagnostics: {cat}]");
+        }
+    }
+    Ok(result.exit_code)
 }
 
 fn run_with_balancing(
@@ -987,6 +1198,93 @@ mod tests {
             }
             _ => panic!("expected repl subcommand"),
         }
+    }
+
+    #[test]
+    fn resume_subcommand_parses_answer_file_and_project() {
+        let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+        let cli = Cli::try_parse_from([
+            "oulipoly-agent-runner",
+            "resume",
+            "-m",
+            REPL_MODEL,
+            "--session-id",
+            session_id,
+            "-f",
+            "/tmp/answer.md",
+            "-p",
+            "/tmp/project",
+            "--models-dir",
+            "/tmp/models",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Some(Subcommands::Resume {
+                model,
+                session_id: parsed_session,
+                prompt,
+                file,
+                project,
+                models_dir,
+            }) => {
+                assert_eq!(model, REPL_MODEL);
+                assert_eq!(parsed_session, session_id);
+                assert_eq!(prompt, None);
+                assert_eq!(file, Some(PathBuf::from("/tmp/answer.md")));
+                assert_eq!(project, Some(PathBuf::from("/tmp/project")));
+                assert_eq!(models_dir, Some(PathBuf::from("/tmp/models")));
+            }
+            _ => panic!("expected resume subcommand"),
+        }
+    }
+
+    #[test]
+    fn resume_subcommand_parses_inline_prompt() {
+        let cli = Cli::try_parse_from([
+            "oulipoly-agent-runner",
+            "resume",
+            "-m",
+            REPL_MODEL,
+            "--session-id",
+            "5169694d-de0f-40d1-890c-6e28e55bab27",
+            "--prompt",
+            "answer text",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Some(Subcommands::Resume { prompt, file, .. }) => {
+                assert_eq!(prompt.as_deref(), Some("answer text"));
+                assert_eq!(file, None);
+            }
+            _ => panic!("expected resume subcommand"),
+        }
+    }
+
+    #[test]
+    fn resume_subcommand_rejects_prompt_and_file_together() {
+        let err = match Cli::try_parse_from([
+            "oulipoly-agent-runner",
+            "resume",
+            "-m",
+            REPL_MODEL,
+            "--session-id",
+            "5169694d-de0f-40d1-890c-6e28e55bab27",
+            "--prompt",
+            "answer text",
+            "-f",
+            "/tmp/answer.md",
+        ]) {
+            Ok(_) => panic!("expected clap to reject --prompt with --file"),
+            Err(err) => err,
+        };
+
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("--prompt") || rendered.contains("--file"),
+            "{rendered}"
+        );
     }
 
     #[test]
