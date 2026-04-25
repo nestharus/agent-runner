@@ -201,6 +201,10 @@ A **quota script** emits multi-window quota data on stdout:
 }
 ```
 
+`used_percent` is on a **0..100 scale**. Values outside that range are
+rejected. Scripts wrapping APIs that report a 0..1 fraction must
+multiply by 100 before emitting — the runner does not auto-detect.
+
 Backwards-compat: the legacy single-window shape `{"used_percent": X,
 "resets_at": "..."}` is still parsed and treated as one window.
 

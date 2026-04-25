@@ -78,7 +78,9 @@ struct QuotaScriptOutput {
 
 #[derive(Debug, Deserialize)]
 struct QuotaScriptWindow {
-    /// Either a 0..1 fraction or 0..100 percent. Normalized during parsing.
+    /// Percent on a 0..100 scale. Values outside that range are rejected.
+    /// Scripts wrapping APIs that report a 0..1 fraction must multiply by 100
+    /// before emitting.
     used_percent: f64,
     resets_at: String,
 }
@@ -254,13 +256,13 @@ fn parse_output(stdout: &str) -> Result<Vec<QuotaWindowInput>, String> {
         let resets_at = DateTime::parse_from_rfc3339(&w.resets_at)
             .map_err(|e| format!("Bad resets_at {}: {e}", w.resets_at))?
             .with_timezone(&Utc);
-        // Normalize used_percent: scripts can emit 0..1 OR 0..100.
-        // Heuristic: values >1.0 are treated as 0..100 and divided.
-        let used = if w.used_percent > 1.0 {
-            (w.used_percent / 100.0).clamp(0.0, 1.0)
-        } else {
-            w.used_percent.clamp(0.0, 1.0)
-        };
+        if !(0.0..=100.0).contains(&w.used_percent) || w.used_percent.is_nan() {
+            return Err(format!(
+                "quota script emitted used_percent={} outside 0..100 (got: {stdout})",
+                w.used_percent
+            ));
+        }
+        let used = w.used_percent / 100.0;
         out.push(QuotaWindowInput {
             used_percent: used,
             resets_at,
@@ -299,14 +301,13 @@ mod tests {
     #[test]
     fn parse_multi_window_output() {
         let json = r#"{"windows":[
-            {"used_percent":23, "resets_at":"2026-04-23T19:00:00Z"},
-            {"used_percent":0.45, "resets_at":"2026-04-17T15:00:00Z"}
+            {"used_percent":1, "resets_at":"2026-04-23T19:00:00Z"},
+            {"used_percent":86, "resets_at":"2026-04-17T15:00:00Z"}
         ]}"#;
         let windows = parse_output(json).unwrap();
         assert_eq!(windows.len(), 2);
-        // First: 23 → 0.23; second: already 0.45
-        assert!((windows[0].used_percent - 0.23).abs() < 1e-6);
-        assert!((windows[1].used_percent - 0.45).abs() < 1e-6);
+        assert!((windows[0].used_percent - 0.01).abs() < 1e-6);
+        assert!((windows[1].used_percent - 0.86).abs() < 1e-6);
     }
 
     #[test]
@@ -321,6 +322,20 @@ mod tests {
     fn parse_rejects_legacy_without_resets_at() {
         let json = r#"{"used_percent":12}"#;
         assert!(parse_output(json).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_used_percent_above_100() {
+        let json = r#"{"windows":[{"used_percent":150, "resets_at":"2026-04-23T19:00:00Z"}]}"#;
+        let err = parse_output(json).unwrap_err();
+        assert!(err.contains("outside 0..100"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn parse_rejects_negative_used_percent() {
+        let json = r#"{"windows":[{"used_percent":-1, "resets_at":"2026-04-23T19:00:00Z"}]}"#;
+        let err = parse_output(json).unwrap_err();
+        assert!(err.contains("outside 0..100"), "unexpected error: {err}");
     }
 
     #[test]

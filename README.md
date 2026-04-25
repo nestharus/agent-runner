@@ -245,7 +245,7 @@ quota_script = "zai-usage ~/.config/opencode/auth.json"
 }
 ```
 
-`used_percent` is on a 0..100 scale (or 0..1 — both are accepted). `resets_at` is required RFC 3339. Window count is arbitrary — emit one for each rolling-quota tier the provider exposes (Anthropic has 5h + 7d, z.ai has 5h + weekly, etc.).
+`used_percent` is on a **0..100 scale** — values outside that range are rejected with an error naming the offending script and value. Scripts wrapping APIs that report a 0..1 fraction must multiply by 100 before emitting. The runner does not auto-detect the scale; conforming to the contract is the script's job. `resets_at` is required RFC 3339. Window count is arbitrary — emit one for each rolling-quota tier the provider exposes (Anthropic has 5h + 7d, z.ai has 5h + weekly, etc.).
 
 **Backwards compatibility**: the legacy single-window shape `{"used_percent": X, "resets_at": "..."}` is still parsed and treated as one window.
 
