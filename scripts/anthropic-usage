@@ -33,10 +33,29 @@ if [[ -z "$ACCESS_TOKEN" ]]; then
   exit 3
 fi
 
-RESP="$(curl -sS --max-time 20 \
+TMP="$(mktemp)"
+trap 'rm -f "$TMP"' EXIT
+HTTP_CODE="$(curl -sS --max-time 20 -o "$TMP" -w '%{http_code}' \
   -H "Authorization: Bearer $ACCESS_TOKEN" \
   -H "anthropic-beta: oauth-2025-04-20" \
   https://api.anthropic.com/api/oauth/usage)"
+RESP="$(cat "$TMP")"
+
+if [[ "$HTTP_CODE" != 2* ]]; then
+  echo "Anthropic API returned HTTP $HTTP_CODE: $RESP" >&2
+  exit 4
+fi
+
+# Some auth errors come back as HTTP 200 with an in-band error body.
+# Detect and surface them so the runner records a real failure (and can
+# trigger an auth_refresh_command) instead of silently degrading to empty
+# windows.
+if [[ "$(echo "$RESP" | jq -r '.type // ""')" == "error" ]]; then
+  ERR_TYPE="$(echo "$RESP" | jq -r '.error.type // "unknown"')"
+  ERR_MSG="$(echo "$RESP" | jq -r '.error.message // "unknown"')"
+  echo "Anthropic API error ($ERR_TYPE): $ERR_MSG" >&2
+  exit 5
+fi
 
 # Anthropic response shape (verified 2026-04-17):
 #   {"five_hour":  {"utilization": <0-100>, "resets_at": "..."},

@@ -225,10 +225,16 @@ To enable quota-aware balancing, create `~/.config/oulipoly-agent-runner/provide
 
 ```toml
 [claude]
-quota_script = "anthropic-usage ~/.claude/.credentials.json"
+quota_script         = "anthropic-usage ~/.claude/.credentials.json"
+auth_refresh_command = "claude auth status"
 
 [claude2]
-quota_script = "anthropic-usage ~/.claude2/.credentials.json"
+quota_script         = "anthropic-usage ~/.claude2/.credentials.json"
+auth_refresh_command = "claude auth status"
+
+[codex]
+quota_script         = "chatgpt-usage ~/.codex/auth.json"
+auth_refresh_command = "codex login status"
 
 [opencode]
 quota_script = "zai-usage ~/.config/opencode/auth.json"
@@ -250,6 +256,8 @@ quota_script = "zai-usage ~/.config/opencode/auth.json"
 **Backwards compatibility**: the legacy single-window shape `{"used_percent": X, "resets_at": "..."}` is still parsed and treated as one window.
 
 Scripts have a 30-second timeout and run via `sh -c`, so `~` expansion and pipelines work. Providers without a `quota_script` entry fall back to invocation-count scoring.
+
+**Auth refresh.** Provider OAuth tokens (Claude, Codex) expire and the upstream APIs return errors, which the bundled scripts surface as a non-zero exit. When that happens — or when a script returns an empty `windows: []` on a provider that previously had non-empty windows — the runner shells out to the optional `auth_refresh_command`, lets the CLI's own auth code refresh the token, then retries `quota_script` once. The runner does not implement OAuth itself; it delegates to whichever command the CLI exposes (`claude auth status`, `codex login status`, etc.). The refresh command runs with closed stdin, a 15-second timeout, and stdout discarded; only its exit code matters. If both the refresh and the retry fail, the failure is recorded in the resulting `RefreshOutcome` so it surfaces in diagnostics.
 
 **Reference quota adapters** (in [`scripts/`](scripts/)):
 

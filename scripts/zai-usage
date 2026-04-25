@@ -36,11 +36,27 @@ if [[ -z "$TOKEN" ]]; then
 fi
 
 # Z.ai's monitoring endpoint expects the raw token in Authorization (NO Bearer prefix).
-RESP="$(curl -sS --max-time 20 \
+TMP="$(mktemp)"
+trap 'rm -f "$TMP"' EXIT
+HTTP_CODE="$(curl -sS --max-time 20 -o "$TMP" -w '%{http_code}' \
   -H "Authorization: $TOKEN" \
   -H "Accept-Language: en-US,en" \
   -H "Content-Type: application/json" \
   https://api.z.ai/api/monitor/usage/quota/limit)"
+RESP="$(cat "$TMP")"
+
+if [[ "$HTTP_CODE" != 2* ]]; then
+  echo "Z.ai API returned HTTP $HTTP_CODE: $RESP" >&2
+  exit 4
+fi
+
+# Z.ai uses an in-band code field; non-200 means error even when HTTP was 200.
+ZAI_CODE="$(echo "$RESP" | jq -r '.code // empty')"
+if [[ -n "$ZAI_CODE" && "$ZAI_CODE" != "200" ]]; then
+  ZAI_MSG="$(echo "$RESP" | jq -r '.msg // .message // "unknown"')"
+  echo "Z.ai API error (code=$ZAI_CODE): $ZAI_MSG" >&2
+  exit 5
+fi
 
 # Response shape (verified 2026-04-17):
 #   {"code":200, "data":{"limits":[

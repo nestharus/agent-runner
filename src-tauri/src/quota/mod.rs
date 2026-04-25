@@ -21,6 +21,9 @@ const REFRESH_WINDOW_DIVISOR: i64 = 5;
 
 /// Script timeout — scripts hitting the internet shouldn't hang the caller.
 const SCRIPT_TIMEOUT_SECS: u64 = 30;
+/// Auth-refresh command timeout. Should be quick (the CLI hits its own auth
+/// endpoint and exits); kept tight to avoid hanging the quota path.
+const REFRESH_TIMEOUT_SECS: u64 = 15;
 
 /// Tracks in-flight refreshes so two callers for the same provider collapse
 /// into one run. The set holds provider names currently being refreshed.
@@ -100,6 +103,14 @@ pub enum RefreshOutcome {
 }
 
 /// Refresh one provider's quota. Caller is responsible for checking staleness.
+///
+/// If the script fails or returns an empty windows list on a provider that
+/// previously had non-empty windows (the typical signature of an expired
+/// OAuth token where the bundled script silently degrades to empty output),
+/// and an `auth_refresh_command` is configured, the runner shells out to it
+/// — letting each CLI's own OAuth code handle token refresh — and retries
+/// the quota script once. Refresh-command failure is non-fatal on its own;
+/// only the retry's outcome is recorded.
 pub fn refresh_provider(
     provider_name: &str,
     providers_cfg: &ProvidersConfig,
@@ -117,7 +128,29 @@ pub fn refresh_provider(
         return RefreshOutcome::AlreadyInFlight;
     };
 
-    match run_script(script) {
+    let first = run_script(script);
+    if should_attempt_auth_refresh(provider_name, &first, state)
+        && let Some(refresh_cmd) = entry.auth_refresh_command.as_deref()
+    {
+        let refresh_err = run_refresh_command(refresh_cmd).err();
+        match run_script(script) {
+            Ok(windows) => {
+                if let Err(e) = state.upsert_quota_refresh(provider_name, &windows) {
+                    return RefreshOutcome::Failed(e);
+                }
+                return RefreshOutcome::Updated { windows };
+            }
+            Err(retry_err) => {
+                let msg = match refresh_err {
+                    Some(r) => format!("{retry_err} (auth_refresh_command also failed: {r})"),
+                    None => retry_err,
+                };
+                return RefreshOutcome::Failed(msg);
+            }
+        }
+    }
+
+    match first {
         Ok(windows) => {
             if let Err(e) = state.upsert_quota_refresh(provider_name, &windows) {
                 return RefreshOutcome::Failed(e);
@@ -125,6 +158,25 @@ pub fn refresh_provider(
             RefreshOutcome::Updated { windows }
         }
         Err(e) => RefreshOutcome::Failed(e),
+    }
+}
+
+/// Decide whether to invoke `auth_refresh_command` after a quota script run.
+/// Triggers on hard failure or on an empty-windows result for a provider that
+/// previously had non-empty windows (transient empty on first contact is not
+/// a refresh signal — there's no stale token to repair).
+fn should_attempt_auth_refresh(
+    provider_name: &str,
+    result: &Result<Vec<QuotaWindowInput>, String>,
+    state: &StateDb,
+) -> bool {
+    match result {
+        Err(_) => true,
+        Ok(windows) if windows.is_empty() => state
+            .get_windows(provider_name)
+            .map(|prior| !prior.is_empty())
+            .unwrap_or(false),
+        Ok(_) => false,
     }
 }
 
@@ -162,6 +214,55 @@ pub fn dynamic_ttl_secs(windows: &[crate::state::QuotaWindow]) -> i64 {
         .min()
         .unwrap_or(MAX_TTL_SECS);
     (min_hours / REFRESH_WINDOW_DIVISOR).clamp(MIN_TTL_SECS, MAX_TTL_SECS)
+}
+
+fn run_refresh_command(cmd_str: &str) -> Result<(), String> {
+    use std::io::Read;
+
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(cmd_str);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to spawn auth_refresh_command: {e}"))?;
+
+    let stderr = child.stderr.take().expect("piped");
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = { stderr }.read_to_string(&mut buf);
+        buf
+    });
+
+    let timeout = std::time::Duration::from_secs(REFRESH_TIMEOUT_SECS);
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    return Err(format!(
+                        "auth_refresh_command timed out after {REFRESH_TIMEOUT_SECS}s"
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => return Err(format!("auth_refresh_command wait failed: {e}")),
+        }
+    };
+
+    let stderr_text = stderr_handle.join().unwrap_or_default();
+    if !status.success() {
+        return Err(format!(
+            "auth_refresh_command exited {}: {}",
+            status.code().unwrap_or(-1),
+            stderr_text.trim()
+        ));
+    }
+    Ok(())
 }
 
 fn run_script(script: &str) -> Result<Vec<QuotaWindowInput>, String> {
@@ -409,5 +510,150 @@ mod tests {
     #[test]
     fn ttl_empty_windows_falls_back_to_max() {
         assert_eq!(dynamic_ttl_secs(&[]), MAX_TTL_SECS);
+    }
+
+    /// Build a ProvidersConfig with one provider, optionally configured
+    /// with an auth_refresh_command.
+    fn cfg(name: &str, quota_script: &str, refresh: Option<&str>) -> ProvidersConfig {
+        use crate::config::ProviderEntry;
+        let mut c = ProvidersConfig::default();
+        c.entries.insert(
+            name.to_string(),
+            ProviderEntry {
+                quota_script: Some(quota_script.to_string()),
+                auth_refresh_command: refresh.map(|s| s.to_string()),
+            },
+        );
+        c
+    }
+
+    /// Pre-populate one window so `should_attempt_auth_refresh` sees prior data.
+    fn seed_prior_windows(state: &StateDb, provider: &str) {
+        state
+            .upsert_quota_refresh(
+                provider,
+                &[QuotaWindowInput {
+                    used_percent: 0.50,
+                    resets_at: hours_from_now(48),
+                }],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn refresh_runs_auth_refresh_when_script_empty_and_prior_exists() {
+        // First quota_script call emits empty windows; auth_refresh_command
+        // creates a marker; second quota_script call sees the marker and
+        // emits populated windows.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("refreshed");
+        let quota_script = format!(
+            "if [ -e {m} ]; then echo '{{\"windows\":[{{\"used_percent\":7,\"resets_at\":\"2099-01-01T00:00:00Z\"}}]}}'; else echo '{{\"windows\":[]}}'; fi",
+            m = marker.display()
+        );
+        let refresh_cmd = format!("touch {}", marker.display());
+        let providers = cfg("p", &quota_script, Some(&refresh_cmd));
+
+        let state = StateDb::open(std::path::Path::new(":memory:")).unwrap();
+        seed_prior_windows(&state, "p");
+        let in_flight = InFlight::new();
+
+        let outcome = refresh_provider("p", &providers, &in_flight, &state);
+        match outcome {
+            RefreshOutcome::Updated { windows } => {
+                assert_eq!(windows.len(), 1);
+                assert!((windows[0].used_percent - 0.07).abs() < 1e-6);
+            }
+            other => panic!("expected Updated, got {other:?}"),
+        }
+        assert!(marker.exists(), "auth_refresh_command should have run");
+    }
+
+    #[test]
+    fn refresh_skips_auth_refresh_when_no_prior_windows() {
+        // Empty windows on a first-time fetch is normal (not an expired
+        // token). auth_refresh_command must NOT run.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        let quota_script = "echo '{\"windows\":[]}'".to_string();
+        let refresh_cmd = format!("touch {}", marker.display());
+        let providers = cfg("p", &quota_script, Some(&refresh_cmd));
+
+        let state = StateDb::open(std::path::Path::new(":memory:")).unwrap();
+        let in_flight = InFlight::new();
+
+        let outcome = refresh_provider("p", &providers, &in_flight, &state);
+        assert!(
+            matches!(outcome, RefreshOutcome::Updated { ref windows } if windows.is_empty()),
+            "expected Updated with empty windows, got {outcome:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "auth_refresh_command must not run on a first-time empty result"
+        );
+    }
+
+    #[test]
+    fn refresh_runs_auth_refresh_on_script_failure_then_retries() {
+        // First call exits 1; refresh creates marker; second call succeeds.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("refreshed");
+        let quota_script = format!(
+            "if [ -e {m} ]; then echo '{{\"windows\":[{{\"used_percent\":3,\"resets_at\":\"2099-01-01T00:00:00Z\"}}]}}'; else echo 'auth error' >&2; exit 1; fi",
+            m = marker.display()
+        );
+        let refresh_cmd = format!("touch {}", marker.display());
+        let providers = cfg("p", &quota_script, Some(&refresh_cmd));
+
+        let state = StateDb::open(std::path::Path::new(":memory:")).unwrap();
+        let in_flight = InFlight::new();
+
+        let outcome = refresh_provider("p", &providers, &in_flight, &state);
+        match outcome {
+            RefreshOutcome::Updated { windows } => {
+                assert_eq!(windows.len(), 1);
+                assert!((windows[0].used_percent - 0.03).abs() < 1e-6);
+            }
+            other => panic!("expected Updated after retry, got {other:?}"),
+        }
+        assert!(marker.exists());
+    }
+
+    #[test]
+    fn refresh_returns_failed_when_retry_still_fails() {
+        let quota_script = "exit 1".to_string();
+        let refresh_cmd = "true".to_string();
+        let providers = cfg("p", &quota_script, Some(&refresh_cmd));
+
+        let state = StateDb::open(std::path::Path::new(":memory:")).unwrap();
+        let in_flight = InFlight::new();
+
+        let outcome = refresh_provider("p", &providers, &in_flight, &state);
+        assert!(
+            matches!(outcome, RefreshOutcome::Failed(_)),
+            "expected Failed, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn refresh_includes_auth_refresh_error_when_both_fail() {
+        let quota_script = "exit 1".to_string();
+        let refresh_cmd = "echo 'token gone' >&2; exit 7".to_string();
+        let providers = cfg("p", &quota_script, Some(&refresh_cmd));
+
+        let state = StateDb::open(std::path::Path::new(":memory:")).unwrap();
+        let in_flight = InFlight::new();
+
+        let outcome = refresh_provider("p", &providers, &in_flight, &state);
+        match outcome {
+            RefreshOutcome::Failed(msg) => {
+                assert!(
+                    msg.contains("auth_refresh_command also failed"),
+                    "expected combined message, got: {msg}"
+                );
+                assert!(msg.contains("token gone"), "missing refresh stderr: {msg}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 }

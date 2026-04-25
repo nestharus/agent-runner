@@ -33,10 +33,19 @@ if [[ -z "$ACCESS_TOKEN" || -z "$ACCOUNT_ID" ]]; then
   exit 3
 fi
 
-RESP="$(curl -sS --max-time 20 \
+TMP="$(mktemp)"
+trap 'rm -f "$TMP"' EXIT
+HTTP_CODE="$(curl -sS --max-time 20 -o "$TMP" -w '%{http_code}' \
   -H "Authorization: Bearer $ACCESS_TOKEN" \
   -H "ChatGPT-Account-Id: $ACCOUNT_ID" \
   https://chatgpt.com/backend-api/wham/usage)"
+RESP="$(cat "$TMP")"
+
+if [[ "$HTTP_CODE" != 2* ]]; then
+  ERR_DETAIL="$(echo "$RESP" | jq -r '.detail // .error.message // .' 2>/dev/null)"
+  echo "ChatGPT API returned HTTP $HTTP_CODE: ${ERR_DETAIL:-$RESP}" >&2
+  exit 4
+fi
 
 # Response shape (live API sample captured during QA 2026-04-21):
 #   {"rate_limit":{"primary_window":{"used_percent":N,"reset_at":<unix-sec>},

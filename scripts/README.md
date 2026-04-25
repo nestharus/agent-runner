@@ -208,6 +208,29 @@ multiply by 100 before emitting — the runner does not auto-detect.
 Backwards-compat: the legacy single-window shape `{"used_percent": X,
 "resets_at": "..."}` is still parsed and treated as one window.
 
+A quota script **must exit non-zero on auth/API errors** (rather than
+silently emitting `{"windows":[]}`). The bundled scripts check both the
+HTTP status and any in-band error response (Anthropic's `{"type":"error"}`
+on a 200, z.ai's `code != 200`, etc.) and exit with a diagnostic on
+stderr. Empty `windows` arrays are reserved for the legitimate
+"no rolling-quota tier configured for this account" case.
+
+Each provider entry may also declare an `auth_refresh_command`:
+
+```toml
+[claude]
+quota_script         = "anthropic-usage ~/.claude/.credentials.json"
+auth_refresh_command = "claude auth status"
+```
+
+When the quota script fails (or returns empty windows on a previously-
+populated provider), the runner shells out to the refresh command, lets
+the CLI's own OAuth code refresh the token, and retries the quota script
+once. Use whatever command your CLI exposes for an auth-refresh-and-
+verify (Claude Code: `claude auth status`; Codex: `codex login status`).
+15-second timeout, closed stdin, stdout discarded; only the exit code
+matters.
+
 Reference: see `anthropic-usage` (5h + 7d windows from
 `/api/oauth/usage`), `chatgpt-usage ~/.codex/auth.json` (weekly + 5h
 windows from `/backend-api/wham/usage`), and `zai-usage` (GLM via z.ai).

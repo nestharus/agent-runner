@@ -6,9 +6,16 @@ use std::path::Path;
 /// One entry in `providers.toml`, keyed by the provider name.
 #[derive(Debug, Clone)]
 pub struct ProviderEntry {
-    /// Shell command that prints JSON `{"used_percent": <0..1>, "resets_at": "..."}`
-    /// on stdout. Empty if the provider has no quota check wired up.
+    /// Shell command that prints JSON on stdout describing rolling-quota
+    /// windows. Empty if the provider has no quota check wired up.
     pub quota_script: Option<String>,
+    /// Optional shell command that hits the provider's API and triggers the
+    /// CLI's own OAuth token refresh (e.g. `claude auth status`,
+    /// `codex login status`). Run when `quota_script` fails or returns an
+    /// empty windows list on a previously-populated provider, then
+    /// `quota_script` is retried once. Provider-agnostic: the runner does
+    /// not implement OAuth itself; it delegates to the CLI.
+    pub auth_refresh_command: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -20,6 +27,8 @@ pub struct ProvidersConfig {
 struct RawEntry {
     #[serde(default)]
     quota_script: Option<String>,
+    #[serde(default)]
+    auth_refresh_command: Option<String>,
 }
 
 impl ProvidersConfig {
@@ -39,6 +48,7 @@ impl ProvidersConfig {
                     k,
                     ProviderEntry {
                         quota_script: v.quota_script,
+                        auth_refresh_command: v.auth_refresh_command,
                     },
                 )
             })
@@ -80,6 +90,29 @@ quota_script = "anthropic-usage ~/.claude2/.credentials.json"
                 .unwrap()
                 .contains("anthropic-usage")
         );
+    }
+
+    #[test]
+    fn parses_auth_refresh_command() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            r#"
+[claude]
+quota_script         = "anthropic-usage ~/.claude/.credentials.json"
+auth_refresh_command = "claude auth status"
+
+[claude2]
+quota_script = "anthropic-usage ~/.claude2/.credentials.json"
+"#
+        )
+        .unwrap();
+        let cfg = ProvidersConfig::load(f.path()).unwrap();
+        assert_eq!(
+            cfg.get("claude").unwrap().auth_refresh_command.as_deref(),
+            Some("claude auth status")
+        );
+        assert!(cfg.get("claude2").unwrap().auth_refresh_command.is_none());
     }
 
     #[test]
