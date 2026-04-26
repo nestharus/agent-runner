@@ -7,6 +7,15 @@ use chrono::Utc;
 const ERROR_WINDOW_MINUTES: i64 = 30;
 const ERROR_THRESHOLD: u64 = 3;
 const EPS_HOURS: f64 = 1.0 / 60.0;
+/// Visible-usage threshold for the missing-window penalty. Anthropic's
+/// usage API hides the 5h window when an account is near weekly cap
+/// (observed live at 91% weekly). ChatGPT's API hides the 5h window
+/// when there's *no recent activity* — the opposite signal. We only
+/// trust "missing window means exhausted" when at least one of the
+/// visible windows is itself near cap; otherwise the gap is benign
+/// (idle account, different upstream behavior) and the provider should
+/// not be torpedoed for it.
+const HIDDEN_WINDOW_PENALTY_THRESHOLD: f64 = 0.85;
 
 #[derive(Debug, Clone)]
 struct ProviderEval {
@@ -127,8 +136,12 @@ fn score_by_density(
     // constraining short-tier term in `min_w` and beat its siblings on the
     // 7d-tier-only score — the exact opposite of what we want. Defensive
     // pessimism: when this provider has fewer live windows than the pool
-    // max, penalize the binding as if the missing slots were at 1.0 used
-    // (capacity effectively consumed).
+    // max AND at least one visible window is near cap, penalize the binding
+    // as if the missing slots were at 1.0 used (capacity effectively
+    // consumed). The visible-usage gate is required because ChatGPT's API
+    // also hides the 5h window — but only when the account has had no
+    // recent activity, which is the opposite signal. See
+    // `HIDDEN_WINDOW_PENALTY_THRESHOLD` above.
     let pool_max_live_windows = candidates
         .iter()
         .map(|&i| windows[i].iter().filter(|w| w.resets_at > now).count())
@@ -162,16 +175,22 @@ fn score_by_density(
         let mut unlearned = false;
         let mut scored_window = false;
 
-        // If a sibling reports more live windows than we do, penalize the
+        // If a sibling reports more live windows than we do AND at least
+        // one of our visible windows is itself near cap, penalize the
         // binding for each missing slot by folding in a worst-case
         // (0 remaining headroom) contribution. The exact hours figure
         // doesn't matter — zero headroom multiplied by any positive hours
-        // is still zero, pulling binding to zero for this provider. Only
-        // apply the penalty when at least one sibling DOES report more
-        // live windows; pools where every provider has the same live
-        // window count skip this branch and rank on their own data.
+        // is still zero, pulling binding to zero for this provider. Pools
+        // where every provider has the same live window count, or where
+        // this provider's visible windows show plenty of headroom, skip
+        // the penalty and rank on their own data. The visible-usage gate
+        // is what distinguishes Anthropic's "hide 5h near cap" (penalize)
+        // from ChatGPT's "hide 5h when idle" (don't penalize).
         let live_window_count = ws.iter().filter(|w| w.resets_at > now).count();
-        if live_window_count < pool_max_live_windows {
+        let any_visible_near_cap = ws
+            .iter()
+            .any(|w| w.resets_at > now && w.used_percent >= HIDDEN_WINDOW_PENALTY_THRESHOLD);
+        if live_window_count < pool_max_live_windows && any_visible_near_cap {
             binding_score = binding_score.min(0.0);
             scored_window = true;
         }
@@ -674,25 +693,62 @@ mod tests {
         // 10/10 live invocations routed to the near-exhausted account.
         //
         // Defensive pessimism: when a sibling reports more live windows
-        // than this provider, assume the missing slots are fully
-        // consumed (0 remaining headroom) and pull the provider's
-        // binding to zero. The "hidden 5h window" observation
-        // strongly correlates with "account is out of budget."
+        // than this provider AND the provider's visible window is
+        // itself near cap, assume the missing slots are fully consumed
+        // (0 remaining headroom) and pull the provider's binding to
+        // zero. The "hidden 5h window" + "visible 7d near cap"
+        // combination is the Anthropic "near weekly cap" signal.
         let db = StateDb::open(Path::new(":memory:")).unwrap();
         let model = two_provider_model();
 
-        // Provider `a`: ONE 7d window (mimics claude's "hidden 5h"
-        // state), moderately used.
-        seed_windows_with_deltas(&db, "a", &[(0.50, 24 * 7, 0.01, 22)]);
+        // Provider `a`: ONE 7d window at 91% used (mimics claude's
+        // "hidden 5h while near weekly cap" state).
+        seed_windows_with_deltas(&db, "a", &[(0.91, 24 * 7, 0.01, 22)]);
 
-        // Provider `b`: TWO windows (7d + 5h), more used on 7d than `a`.
-        seed_windows_with_deltas(&db, "b", &[(0.60, 24 * 7, 0.01, 22), (0.30, 5, 0.01, 22)]);
+        // Provider `b`: TWO windows (7d + 5h), less used than `a`.
+        seed_windows_with_deltas(&db, "b", &[(0.64, 24 * 7, 0.01, 22), (0.04, 5, 0.01, 22)]);
 
-        // Without the penalty, `a` would win (0.50 7d < 0.60 7d, and
-        // no 5h tier to constrain it). With the penalty, `a`'s binding
-        // is forced to 0 because it's missing a window siblings have,
-        // so `b` wins.
+        // Without the penalty, `a` would win on its single 7d binding
+        // ((1-0.91)*168h ≈ 15.1) over `b`'s short-window-constrained
+        // min((1-0.64)*168h, (1-0.04)*5h) ≈ 4.8. With the penalty,
+        // `a`'s binding is forced to 0 because (i) it has fewer live
+        // windows than `b` and (ii) its visible 7d is near cap, so
+        // `b` wins.
         assert_eq!(selected_provider_index(&model, &db), 1);
+    }
+
+    #[test]
+    fn score_by_density_does_not_penalize_idle_provider_missing_short_window() {
+        // Live-caught 2026-04-26: codex (98% remaining, near-zero
+        // recent usage) had only a 7d window reported by chatgpt-usage
+        // because ChatGPT's API only emits `primary_window` when an
+        // account has an active 5h timer (i.e. recent activity). Codex2
+        // (64% remaining, actively in use) had both windows. Under the
+        // unconditional missing-window penalty, codex's binding was
+        // forced to 0 and every invocation routed to the more-pressed
+        // codex2 — codex stayed idle, which kept it 5h-windowless,
+        // which kept it penalized. Vicious cycle.
+        //
+        // ChatGPT's "hide 5h when idle" is the OPPOSITE signal from
+        // Anthropic's "hide 5h when near cap". The visible-usage gate
+        // distinguishes them: only penalize when a visible window is
+        // itself near cap. An idle account's visible 7d is far from
+        // cap, so no penalty applies, and the lower-usage provider
+        // wins on its actual headroom.
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = two_provider_model();
+
+        // Provider `a`: ONE 7d window at 2% used (mimics codex's idle
+        // "no primary_window emitted" state).
+        seed_windows_with_deltas(&db, "a", &[(0.02, 24 * 7, 0.01, 22)]);
+
+        // Provider `b`: TWO windows (7d + 5h), actively in use.
+        seed_windows_with_deltas(&db, "b", &[(0.36, 24 * 7, 0.01, 22), (0.20, 5, 0.01, 22)]);
+
+        // No penalty for `a` (its visible 7d is nowhere near cap), so
+        // `a` wins on raw headroom: (1-0.02)*168h ≈ 164.6 beats
+        // min((1-0.36)*168h, (1-0.20)*5h) ≈ 4.0.
+        assert_eq!(selected_provider_index(&model, &db), 0);
     }
 
     #[test]
