@@ -74,7 +74,7 @@ Follow-up on compaction:
 - Two new SQLite tables: `session_chains` (stable chain identity) and
   `session_chain_segments` (append-only ledger of provider/session_id
   occupancy).
-- Resolver `resolve_resume(state, config, input, model_override) →
+- Resolver `resolve_resume(state, input, model_override) →
   ResolvedResume`, replacing today's `find_provider_for_session()`.
 - Best-on-resume policy: at resume time, pick the highest-scored
   storage-backed provider; hard trigger when `exhausted_at` is set.
@@ -87,11 +87,9 @@ Follow-up on compaction:
   proposal §15.
 - New per-provider `[providers.session_storage]` block in model TOML
   (kinds: `claude_code`, `codex`).
-- New per-provider `default_model` field in `providers.toml` for UI
-  session model fallback.
-- Lift `--resume requires --model` enforcement: model inferred from
-  chain's invocation history → chain's recorded model → provider's
-  `default_model` → fail.
+- Make `-m` optional on resume: model inferred from
+  chain's invocation history → chain's recorded model → otherwise spawn
+  the active provider CLI without a model override and let the CLI default.
 - Compaction-aware target build: new `session_turns.is_compaction_boundary`
   column; truncate target JSONL at latest compaction boundary; retain
   pre-compaction turns in source and DB for search/audit.

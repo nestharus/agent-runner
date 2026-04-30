@@ -1,5 +1,5 @@
 use crate::balancer::TransitionReason;
-use crate::config::{ModelConfig, ProvidersConfig, load_models};
+use crate::config::{ModelConfig, load_models};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -131,10 +131,9 @@ pub type DbError = String;
 #[derive(Debug, Clone)]
 pub struct ResolvedResume {
     pub chain_id: String,
-    pub model_name: String,
-    pub model: ModelConfig,
+    pub model_name: Option<String>,
+    pub model: Option<ModelConfig>,
     pub active_provider: String,
-    pub active_provider_index: usize,
     pub active_session_id: String,
 }
 
@@ -150,15 +149,13 @@ pub enum ResumeError {
         input: String,
         previews: Vec<ChainPreview>,
     },
-    ModelInferenceImpossible {
-        chain_id: String,
-        active_provider: String,
-        hint: String,
-    },
     ProviderModelMismatch {
         model_name: String,
         active_provider: String,
         suggestions: Vec<String>,
+    },
+    ProviderNotConfigured {
+        provider: String,
     },
     UnknownModel {
         model_name: String,
@@ -2579,7 +2576,6 @@ impl StateDb {
 
     pub fn resolve_resume(
         &self,
-        config: &ProvidersConfig,
         models: &ModelStore,
         input: &str,
         model_override: Option<&str>,
@@ -2618,71 +2614,62 @@ impl StateDb {
             })?;
 
         let model_name = if let Some(model_override) = model_override {
-            model_override.to_string()
-        } else if let Some(model_name) = self
-            .latest_invocation_model_for_chain(&chain_id)
-            .map_err(|message| ResumeError::Db { message })?
-        {
-            model_name
-        } else if let Some(model_name) = self
-            .chain_model_name(&chain_id)
-            .map_err(|message| ResumeError::Db { message })?
-            .filter(|name| name != "<unknown>")
-        {
-            model_name
-        } else if let Some(default_model) = config
-            .get(&active_provider)
-            .and_then(|entry| entry.default_model.clone())
-        {
-            default_model
+            Some(model_override.to_string())
         } else {
-            return Err(ResumeError::ModelInferenceImpossible {
-                chain_id,
-                active_provider,
-                hint: "pass --model or set default_model in providers.toml".to_string(),
-            });
+            self.latest_invocation_model_for_chain(&chain_id)
+                .map_err(|message| ResumeError::Db { message })?
+                .filter(|name| name != "<unknown>")
+                .or(self
+                    .chain_model_name(&chain_id)
+                    .map_err(|message| ResumeError::Db { message })?
+                    .filter(|name| name != "<unknown>"))
         };
 
-        let model = models
-            .get(&model_name)
-            .cloned()
-            .ok_or_else(|| ResumeError::UnknownModel {
-                model_name: model_name.clone(),
-            })?;
-        let Some(active_provider_index) = model
-            .providers
-            .iter()
-            .position(|provider| provider.name == active_provider)
-        else {
-            let mut suggestions = models
+        let model = if let Some(model_name) = model_name.as_ref() {
+            let model =
+                models
+                    .get(model_name)
+                    .cloned()
+                    .ok_or_else(|| ResumeError::UnknownModel {
+                        model_name: model_name.clone(),
+                    })?;
+            let Some(active_provider_index) = model
+                .providers
                 .iter()
-                .filter(|(_, model)| {
-                    model
-                        .providers
-                        .iter()
-                        .any(|provider| provider.name == active_provider)
-                })
-                .map(|(name, _)| name.clone())
-                .collect::<Vec<_>>();
-            suggestions.sort();
-            return Err(ResumeError::ProviderModelMismatch {
-                model_name,
-                active_provider,
-                suggestions,
-            });
+                .position(|provider| provider.name == active_provider)
+            else {
+                let mut suggestions = models
+                    .iter()
+                    .filter(|(_, model)| {
+                        model
+                            .providers
+                            .iter()
+                            .any(|provider| provider.name == active_provider)
+                    })
+                    .map(|(name, _)| name.clone())
+                    .collect::<Vec<_>>();
+                suggestions.sort();
+                return Err(ResumeError::ProviderModelMismatch {
+                    model_name: model_name.clone(),
+                    active_provider,
+                    suggestions,
+                });
+            };
+            if model.providers[active_provider_index].resume.is_none() {
+                return Err(ResumeError::ProviderMissingResume {
+                    provider_name: active_provider,
+                });
+            }
+            Some(model)
+        } else {
+            None
         };
-        if model.providers[active_provider_index].resume.is_none() {
-            return Err(ResumeError::ProviderMissingResume {
-                provider_name: active_provider,
-            });
-        }
 
         Ok(ResolvedResume {
             chain_id,
             model_name,
             model,
             active_provider,
-            active_provider_index,
             active_session_id,
         })
     }
@@ -5021,23 +5008,6 @@ command = "fixture"
     const CHAIN_A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     const CHAIN_B: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 
-    fn providers_with_defaults(
-        defaults: &[(&str, Option<&str>)],
-    ) -> crate::config::ProvidersConfig {
-        let mut entries = std::collections::HashMap::new();
-        for (name, default_model) in defaults {
-            entries.insert(
-                (*name).to_string(),
-                crate::config::ProviderEntry {
-                    quota_script: None,
-                    auth_refresh_command: None,
-                    default_model: default_model.map(str::to_string),
-                },
-            );
-        }
-        crate::config::ProvidersConfig { entries }
-    }
-
     fn model_store_from_toml(
         fixtures: &[(&str, &str)],
     ) -> std::collections::HashMap<String, crate::config::ModelConfig> {
@@ -5426,17 +5396,14 @@ flag = "--resume"
             None,
             "quota_threshold",
         );
-        let providers = providers_with_defaults(&[("claude2", None)]);
         let models = resolver_model_store();
 
-        let resolved = db
-            .resolve_resume(&providers, &models, CHAIN_A, None)
-            .unwrap();
+        let resolved = db.resolve_resume(&models, CHAIN_A, None).unwrap();
 
         assert_eq!(resolved.chain_id, CHAIN_A);
         assert_eq!(resolved.active_provider, "claude2");
         assert_eq!(resolved.active_session_id, SESSION_B);
-        assert_eq!(resolved.active_provider_index, 1);
+        assert_eq!(resolved.model_name.as_deref(), Some("claude-opus"));
     }
 
     // risk: Resolver disambiguation and model inference; level: particular-integration; source: proposal §11.1 Resolver disambiguation and model inference.
@@ -5448,12 +5415,9 @@ flag = "--resume"
         let stale = (now - chrono::Duration::hours(48)).to_rfc3339();
         seed_test_chain(&db, CHAIN_A, "claude", SESSION_A, "claude-opus", &recent);
         seed_test_chain(&db, CHAIN_B, "claude", SESSION_A, "claude-opus", &stale);
-        let providers = providers_with_defaults(&[("claude", None)]);
         let models = resolver_model_store();
 
-        let resolved = db
-            .resolve_resume(&providers, &models, SESSION_A, None)
-            .unwrap();
+        let resolved = db.resolve_resume(&models, SESSION_A, None).unwrap();
 
         assert_eq!(resolved.chain_id, CHAIN_A);
     }
@@ -5466,12 +5430,9 @@ flag = "--resume"
         let recent_b = (Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
         seed_test_chain(&db, CHAIN_A, "claude", SESSION_A, "claude-opus", &recent_a);
         seed_test_chain(&db, CHAIN_B, "claude2", SESSION_A, "claude-opus", &recent_b);
-        let providers = providers_with_defaults(&[("claude", None), ("claude2", None)]);
         let models = resolver_model_store();
 
-        let err = db
-            .resolve_resume(&providers, &models, SESSION_A, None)
-            .unwrap_err();
+        let err = db.resolve_resume(&models, SESSION_A, None).unwrap_err();
 
         match err {
             ResumeError::Ambiguous { input, previews } => {
@@ -5500,12 +5461,9 @@ flag = "--resume"
         let less_old = (Utc::now() - chrono::Duration::hours(48)).to_rfc3339();
         seed_test_chain(&db, CHAIN_A, "claude", SESSION_A, "claude-opus", &older);
         seed_test_chain(&db, CHAIN_B, "claude2", SESSION_A, "claude-opus", &less_old);
-        let providers = providers_with_defaults(&[("claude", None), ("claude2", None)]);
         let models = resolver_model_store();
 
-        let resolved = db
-            .resolve_resume(&providers, &models, SESSION_A, None)
-            .unwrap();
+        let resolved = db.resolve_resume(&models, SESSION_A, None).unwrap();
 
         assert_eq!(resolved.chain_id, CHAIN_B);
     }
@@ -5536,14 +5494,11 @@ flag = "--resume"
             SESSION_A,
             "2026-04-17T09:00:00Z",
         );
-        let providers = providers_with_defaults(&[("claude", None)]);
         let models = resolver_model_store();
 
-        let resolved = db
-            .resolve_resume(&providers, &models, SESSION_A, None)
-            .unwrap();
+        let resolved = db.resolve_resume(&models, SESSION_A, None).unwrap();
 
-        assert_eq!(resolved.model_name, "claude-opus");
+        assert_eq!(resolved.model_name.as_deref(), Some("claude-opus"));
     }
 
     // risk: Resolver disambiguation and model inference; level: particular-integration; source: proposal §11.1 Resolver disambiguation and model inference.
@@ -5558,19 +5513,16 @@ flag = "--resume"
             "claude-haiku",
             "2026-04-17T08:00:00Z",
         );
-        let providers = providers_with_defaults(&[("claude", None)]);
         let models = resolver_model_store();
 
-        let resolved = db
-            .resolve_resume(&providers, &models, SESSION_A, None)
-            .unwrap();
+        let resolved = db.resolve_resume(&models, SESSION_A, None).unwrap();
 
-        assert_eq!(resolved.model_name, "claude-haiku");
+        assert_eq!(resolved.model_name.as_deref(), Some("claude-haiku"));
     }
 
     // risk: Resolver disambiguation and model inference; level: particular-integration; source: proposal §11.1 Resolver disambiguation and model inference / A8.
     #[test]
-    fn resolve_resume_falls_back_to_provider_default_model_for_ui_session() {
+    fn resolve_resume_returns_none_model_when_no_inference_source() {
         let db = test_db();
         seed_test_chain(
             &db,
@@ -5580,47 +5532,12 @@ flag = "--resume"
             "<unknown>",
             "2026-04-17T08:00:00Z",
         );
-        let providers = providers_with_defaults(&[("claude", Some("claude-opus"))]);
         let models = resolver_model_store();
 
-        let resolved = db
-            .resolve_resume(&providers, &models, SESSION_A, None)
-            .unwrap();
+        let resolved = db.resolve_resume(&models, SESSION_A, None).unwrap();
 
-        assert_eq!(resolved.model_name, "claude-opus");
-    }
-
-    // risk: Resolver disambiguation and model inference; level: particular-integration; source: proposal §11.1 Resolver disambiguation and model inference / A8.
-    #[test]
-    fn resolve_resume_errors_when_model_inference_impossible() {
-        let db = test_db();
-        seed_test_chain(
-            &db,
-            CHAIN_A,
-            "claude",
-            SESSION_A,
-            "<unknown>",
-            "2026-04-17T08:00:00Z",
-        );
-        let providers = providers_with_defaults(&[("claude", None)]);
-        let models = resolver_model_store();
-
-        let err = db
-            .resolve_resume(&providers, &models, SESSION_A, None)
-            .unwrap_err();
-
-        match err {
-            ResumeError::ModelInferenceImpossible {
-                chain_id,
-                active_provider,
-                hint,
-            } => {
-                assert_eq!(chain_id, CHAIN_A);
-                assert_eq!(active_provider, "claude");
-                assert!(hint.contains("default_model"), "{hint}");
-            }
-            other => panic!("expected model inference error, got {other:?}"),
-        }
+        assert_eq!(resolved.model_name, None);
+        assert!(resolved.model.is_none());
     }
 
     // risk: Resolver disambiguation and model inference; level: particular-integration; source: proposal §11.1 Resolver disambiguation and model inference.
@@ -5635,12 +5552,9 @@ flag = "--resume"
             "claude-haiku",
             "2026-04-17T08:00:00Z",
         );
-        let providers = providers_with_defaults(&[("claude2", None)]);
         let models = resolver_model_store();
 
-        let err = db
-            .resolve_resume(&providers, &models, SESSION_A, None)
-            .unwrap_err();
+        let err = db.resolve_resume(&models, SESSION_A, None).unwrap_err();
 
         match err {
             ResumeError::ProviderModelMismatch {

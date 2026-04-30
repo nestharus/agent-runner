@@ -1,9 +1,7 @@
 #![cfg(unix)]
 
 use agent_runner_lib::balancer::TransitionReason;
-use agent_runner_lib::config::{
-    ModelConfig, ProviderEntry, ProvidersConfig, SessionSourceEntry, SessionsConfig,
-};
+use agent_runner_lib::config::{ModelConfig, SessionSourceEntry, SessionsConfig};
 use agent_runner_lib::migration::{MigrationError, migrate_chain_segment};
 use agent_runner_lib::sessions::scan_provider;
 use agent_runner_lib::state::{ResolvedResume, SessionTurnIngest, StateDb};
@@ -88,28 +86,15 @@ impl Fixture {
         fs::write(self.models_dir.join(format!("{model_name}.toml")), body).unwrap();
     }
 
-    fn write_providers_config(&self, defaults: &[(&str, Option<&str>)]) -> ProvidersConfig {
+    fn write_providers_config(&self, providers: &[&str]) {
         let app_dir = self.config_home.join("oulipoly-agent-runner");
         fs::create_dir_all(&app_dir).unwrap();
         let mut body = String::new();
-        let mut entries = HashMap::new();
-        for (provider, default_model) in defaults {
+        for provider in providers {
             body.push_str(&format!("[{provider}]\n"));
-            if let Some(model) = default_model {
-                body.push_str(&format!("default_model = \"{model}\"\n"));
-            }
             body.push('\n');
-            entries.insert(
-                (*provider).to_string(),
-                ProviderEntry {
-                    quota_script: None,
-                    auth_refresh_command: None,
-                    default_model: default_model.map(str::to_string),
-                },
-            );
         }
         fs::write(app_dir.join("providers.toml"), body).unwrap();
-        ProvidersConfig { entries }
     }
 
     fn write_sessions_config(&self, provider: &str, script: &Path) -> SessionsConfig {
@@ -252,10 +237,9 @@ impl Fixture {
         let provider = &model.providers[provider_index];
         ResolvedResume {
             chain_id: CHAIN_A.to_string(),
-            model_name: model.name.clone(),
-            model: model.clone(),
+            model_name: Some(model.name.clone()),
+            model: Some(model.clone()),
             active_provider: provider.name.clone(),
-            active_provider_index: provider_index,
             active_session_id: SESSION_A.to_string(),
         }
     }
@@ -377,6 +361,25 @@ prompt_mode = "arg"
 name = "claude"
 command = "{}"
 interactive_args = ["launch"]
+
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+"#,
+        command.display()
+    )
+}
+
+fn resume_provider_with_model_flags_toml(command: &Path) -> String {
+    format!(
+        r#"
+prompt_mode = "arg"
+
+[[providers]]
+name = "claude"
+command = "{}"
+args = ["-p", "--model", "opus"]
+interactive_args = ["launch", "-m", "opus"]
 
 [providers.resume]
 kind = "flag"
@@ -547,29 +550,14 @@ fn agent_session_chain_records_model_at_mint() {
 
 // risk: Chain identity write paths; level: particular-integration; source: proposal §11.1 Chain identity write paths / A3, A8.
 #[test]
-fn ui_session_chain_minted_at_ingestion_uses_provider_default() {
+fn ui_session_chain_minted_with_unknown() {
     let fixture = Fixture::new();
     let db = fixture.open_db();
     let script = fixture.write_turn_emitter("turns.sh", SESSION_A, "ui-1");
     let sessions = fixture.write_sessions_config("claude", &script);
-    let providers = fixture.write_providers_config(&[("claude", Some("claude-opus"))]);
+    fixture.write_providers_config(&["claude"]);
 
-    let result = scan_provider("claude", &sessions, &providers, &db);
-
-    assert_eq!(result.errors, Vec::<String>::new());
-    assert_eq!(chain_model_name(&fixture, SESSION_A), "claude-opus");
-}
-
-// risk: Chain identity write paths; level: particular-integration; source: proposal §11.1 Chain identity write paths / A3, A8.
-#[test]
-fn ui_session_chain_minted_with_unknown_when_no_provider_default() {
-    let fixture = Fixture::new();
-    let db = fixture.open_db();
-    let script = fixture.write_turn_emitter("turns.sh", SESSION_A, "ui-1");
-    let sessions = fixture.write_sessions_config("claude", &script);
-    let providers = fixture.write_providers_config(&[("claude", None)]);
-
-    let result = scan_provider("claude", &sessions, &providers, &db);
+    let result = scan_provider("claude", &sessions, &db);
 
     assert_eq!(result.errors, Vec::<String>::new());
     assert_eq!(chain_model_name(&fixture, SESSION_A), "<unknown>");
@@ -582,12 +570,12 @@ fn chain_mint_works_for_codex_ingestion() {
     let db = fixture.open_db();
     let script = fixture.write_turn_emitter("codex-turns.sh", SESSION_A, "codex-1");
     let sessions = fixture.write_sessions_config("codex", &script);
-    let providers = fixture.write_providers_config(&[("codex", Some("codex-high"))]);
+    fixture.write_providers_config(&["codex"]);
 
-    let result = scan_provider("codex", &sessions, &providers, &db);
+    let result = scan_provider("codex", &sessions, &db);
 
     assert_eq!(result.errors, Vec::<String>::new());
-    assert_eq!(chain_model_name(&fixture, SESSION_A), "codex-high");
+    assert_eq!(chain_model_name(&fixture, SESSION_A), "<unknown>");
     assert_eq!(segment_count(&fixture, "codex"), 1);
 }
 
@@ -739,10 +727,9 @@ fn migration_overwrites_target_when_same_chain_revisits_provider() {
     let db = fixture.open_db();
     let resolved = ResolvedResume {
         chain_id: CHAIN_A.to_string(),
-        model_name: model.name.clone(),
-        model: model.clone(),
+        model_name: Some(model.name.clone()),
+        model: Some(model.clone()),
         active_provider: "claude2".to_string(),
-        active_provider_index: 1,
         active_session_id: SESSION_A.to_string(),
     };
     let mut stderr = Vec::new();
@@ -819,10 +806,9 @@ fn migration_refuses_when_other_chain_owns_target_session() {
     let db = fixture.open_db();
     let resolved = ResolvedResume {
         chain_id: CHAIN_A.to_string(),
-        model_name: model.name.clone(),
-        model: model.clone(),
+        model_name: Some(model.name.clone()),
+        model: Some(model.clone()),
         active_provider: "claude2".to_string(),
-        active_provider_index: 1,
         active_session_id: SESSION_A.to_string(),
     };
     let mut stderr = Vec::new();
@@ -901,10 +887,9 @@ fn migration_overwrites_when_other_chain_segment_is_closed() {
     let db = fixture.open_db();
     let resolved = ResolvedResume {
         chain_id: CHAIN_A.to_string(),
-        model_name: model.name.clone(),
-        model: model.clone(),
+        model_name: Some(model.name.clone()),
+        model: Some(model.clone()),
         active_provider: "claude2".to_string(),
-        active_provider_index: 1,
         active_session_id: SESSION_A.to_string(),
     };
     let mut stderr = Vec::new();
@@ -1252,10 +1237,14 @@ fn top_level_resume_without_model_succeeds_when_chain_exists() {
 
 // risk: CLI surface; level: end-to-end; source: proposal §11.1 CLI surface / A8.
 #[test]
-fn top_level_resume_without_model_errors_when_no_invocation_history() {
+fn run_resume_spawns_without_model_flag_when_model_none() {
     let fixture = Fixture::new();
-    let script = fixture.write_script("provider.sh", ok_provider_body());
-    fixture.write_model("claude-opus", &single_resume_provider_model_toml(&script));
+    let argv = fixture.dir.path().join("argv.txt");
+    let script = fixture.write_script("provider.sh", &argv_dump_provider_body(&argv));
+    fixture.write_model(
+        "claude-opus",
+        &resume_provider_with_model_flags_toml(&script),
+    );
     fixture.seed_active_chain(CHAIN_A, "claude", SESSION_A, "<unknown>");
 
     let output = fixture
@@ -1268,10 +1257,46 @@ fn top_level_resume_without_model_errors_when_no_invocation_history() {
         .output()
         .unwrap();
 
-    assert_ne!(output.status.code(), Some(0), "{output:?}");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("Cannot infer model"), "{stderr}");
-    assert!(stderr.contains("default_model"), "{stderr}");
+    assert_success(&output);
+    let argv = fs::read_to_string(argv).unwrap();
+    assert!(!argv.contains("--model\n"), "{argv}");
+    assert!(!argv.contains("-m\n"), "{argv}");
+    assert!(!argv.contains("opus\n"), "{argv}");
+    assert!(argv.contains("-p\n"), "{argv}");
+    assert!(argv.contains("--resume\n"), "{argv}");
+    let recorded_model: String = fixture
+        .conn()
+        .query_row("SELECT model_name FROM invocations", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(recorded_model, "<unknown>");
+}
+
+// risk: CLI surface; level: end-to-end; source: proposal §11.1 CLI surface / A8.
+#[test]
+fn run_repl_spawns_without_model_flag_when_model_none() {
+    let fixture = Fixture::new();
+    let argv = fixture.dir.path().join("argv.txt");
+    let script = fixture.write_script("provider.sh", &argv_dump_provider_body(&argv));
+    fixture.write_model(
+        "claude-opus",
+        &resume_provider_with_model_flags_toml(&script),
+    );
+    fixture.seed_active_chain(CHAIN_A, "claude", SESSION_A, "<unknown>");
+
+    let output = fixture
+        .command()
+        .args(["repl", "--resume", SESSION_A, "--models-dir"])
+        .arg(&fixture.models_dir)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    let argv = fs::read_to_string(argv).unwrap();
+    assert!(!argv.contains("--model\n"), "{argv}");
+    assert!(!argv.contains("-m\n"), "{argv}");
+    assert!(!argv.contains("opus\n"), "{argv}");
+    assert!(argv.contains("launch\n"), "{argv}");
+    assert!(argv.contains("--resume\n"), "{argv}");
 }
 
 // risk: CLI surface / Best-on-resume decision; level: end-to-end; source: proposal §11.1 CLI surface and Best-on-resume decision / A2, A4.

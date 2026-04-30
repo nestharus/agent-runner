@@ -109,7 +109,7 @@ pub fn select_provider(
             }
             // Session scan errors don't abort the pick — we just project with
             // a stale turn count instead of an up-to-date one.
-            let _ = scan_provider(&p.name, ctx.sessions_cfg, ctx.providers_cfg, state);
+            let _ = scan_provider(&p.name, ctx.sessions_cfg, state);
         }
     }
 
@@ -209,7 +209,7 @@ pub fn compute_projections(
                 let _: RefreshOutcome =
                     refresh_provider(&p.name, ctx.providers_cfg, ctx.in_flight, state);
             }
-            let _ = scan_provider(&p.name, ctx.sessions_cfg, ctx.providers_cfg, state);
+            let _ = scan_provider(&p.name, ctx.sessions_cfg, state);
         }
     }
 
@@ -1163,10 +1163,9 @@ sessions_dir = "/tmp/{name}/sessions"
         let provider = &model.providers[provider_index];
         crate::state::ResolvedResume {
             chain_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string(),
-            model_name: model.name.clone(),
-            model: model.clone(),
+            model_name: Some(model.name.clone()),
+            model: Some(model.clone()),
             active_provider: provider.name.clone(),
-            active_provider_index: provider_index,
             active_session_id: "5169694d-de0f-40d1-890c-6e28e55bab27".to_string(),
         }
     }

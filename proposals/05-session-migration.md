@@ -13,7 +13,7 @@ Initiative 05 depends on initiative 04 — the migration trigger reads `provider
 - §6.6 step 3: missing JSONL line for a recorded compaction boundary returns `MigrationError::CompactionBoundaryNotInJsonl` — no silent offset=0 fallback.
 - §6 cross-references: "§6.4 / §6.5 / §6.9" replaced with "step 4 / step 5 / step 10 of §6" since the linear list inside §6 is not subsection-anchored.
 - §11: added `chain_last_used_at_updates_after_successful_invocation` and `migration_errors_when_compaction_boundary_not_in_jsonl`.
-- §12: README scope extended with `:131-136` (CLI synopsis where `-m` becomes optional) and `:467-475` (resume failure-mode list gains `Ambiguous` and `ModelInferenceImpossible` variants).
+- §12: README scope extended with `:131-136` (CLI synopsis where `-m` becomes optional) and `:467-475` (resume failure-mode list gains `Ambiguous` and `ProviderNotConfigured` variants).
 - §14: backfill-performance escape hatch revised — chain-aware code paths do NOT fall back to `find_provider_for_session()`. Backfill is mandatory at first open; if perf exceeds the 2s budget, ship the backfill as a one-shot `agents migrate-db` step but never as a runtime fallback (per `~/ai/conventions/no-backwards-compatibility.md`).
 
 **Phase 3 compliance amendments (post-Rev-2-LOW)**: §1.1 assumption register validated and extended from problem-map §7; §1.2 net-value statement; §11.1 test-intent track grouping the §11.2 test list by change-risk theme; §13.1 supported-surface track covering deployment, cohort, adjacent paths, migration, rollback, observability.
@@ -46,7 +46,7 @@ This is the approved register validated and extended from `research/05-session-m
 | A5 | First-open backfill is acceptable when run in one transaction, with `agents migrate-db` as the explicit retry/foreground path if user-visible delay or write failure occurs. | Problem-map calls out synchronous open-path risk and backfill data sources (`research/05-session-migration-problem-map.md:107-117`); Rev 2 risk gates accepted the mandatory-backfill/no-fallback design (`risk/05-audit.md`, `risk/05-shortcut.md`). | Representative user DBs, slow I/O, locks, or write failures make startup backfill too slow or unreliable without a different migration path. | §2 backfill, §8.5.1 `agents migrate-db`, §14 backfill risk, §13.1 migration/rollback. |
 | A6 | Claude Code compaction records can be identified well enough for `claude-code-turns` to emit `is_compaction_boundary`. | Locked answer Q8 defines the compaction-aware strategy and confidence (`research/05-session-migration-answers.md:131-150`); hookpoints identify the reference adapter update site (`research/05-session-migration-hookpoints.md:114-117`). | Claude Code JSONL record drift, multiple incompatible compaction formats, missing turn IDs, or summaries that cannot be replayed cleanly from a line boundary. | §3.4 ingest plumbing, §6.6 compaction-aware target build, §9.1.1 adapter contract, §15 Claude compaction unresolved. |
 | A7 | Codex cross-account file-copy migration is not verified for v1 because the CLI has no documented path-resume surface. Codex chain identity still works through ingestion and same-provider resume-by-id. | Rev 4 verification found `experimental_resume` is not documented or working, `codex resume <SESSION_ID>` requires the target HOME's `state_5.sqlite`, and `ThreadResumeParams.path` is internal-only (`research/05-codex-resume-verification.md`). | Codex exposes a documented path-resume/import mechanism, or a later PR deliberately implements a state-DB-aware migration path. | §6 Codex deferred guard, §9.1 `codex` storage identity-only note, §11 Codex deferral/identity tests, §15 Codex migration deferred residual. |
-| A8 | UI-started sessions have no reliable per-session model provenance, so provider `default_model` is the intended fallback when invocation history and chain model are unknown. | Locked answer Q4 distinguishes agent vs UI sessions and gives the fallback order (`research/05-session-migration-answers.md:48-65`); problem-map notes direct CLI sessions lack invocation model provenance (`research/05-session-migration-problem-map.md:100`). | Upstream CLI exposes reliable per-session model metadata through ingestion, or configured defaults prove too ambiguous for real provider accounts. | §3.1.1 UI mint, §4 model resolution, §8.6 resume without `-m`, §9.2 `default_model`, §12 README. |
+| A8 | UI-started sessions have no reliable per-session model provenance, so the runner must avoid inventing one and let the upstream CLI default apply when no model can be inferred. | Locked answer Q4 distinguishes agent vs UI sessions; problem-map notes direct CLI sessions lack invocation model provenance (`research/05-session-migration-problem-map.md:100`). | Upstream CLI exposes reliable per-session model metadata through ingestion. | §3.1.1 UI mint, §4 model resolution, §8.6 resume without `-m`, §12 README. |
 
 ## 1.2 Net-value statement
 
@@ -144,18 +144,18 @@ WHERE provider_name = ? AND session_id = ?
 LIMIT 1;
 ```
 
-If absent, mint with the same shape as §3.1 but use the provider's configured `default_model` from `providers.toml`:
+If absent, mint with the same shape as §3.1 and `model_name = '<unknown>'`:
 
 ```sql
 INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
-VALUES (?, ?turn_timestamp, ?turn_timestamp, ?providers_default_model);
+VALUES (?, ?turn_timestamp, ?turn_timestamp, '<unknown>');
 
 INSERT INTO session_chain_segments
     (chain_id, provider_name, session_id, started_at, transition_reason)
 VALUES (?, ?, ?, ?turn_timestamp, 'imported');
 ```
 
-If the provider has no `default_model` configured, mint with `model_name = '<unknown>'`. The resolver's fallback chain (§4.5) will then defer model selection to `-m` at resume time.
+The resolver's fallback chain (§4.5) will then either use an explicit/inferred model or fall through to the upstream provider CLI's built-in default model.
 
 Migration of UI sessions is identical to agent sessions for the same provider family — same `[providers.session_storage]` layout, same chain ledger, and for Claude Code the same copy mechanic. Codex UI sessions still mint chain identity through ingestion, but Codex cross-account file-copy migration is deferred in v1 (§15). The only distinction between agent and UI sessions is the model resolution fallback.
 
@@ -206,15 +206,14 @@ Extend or wrap the existing `find_provider_for_session()` (`src-tauri/src/state/
 ```rust
 pub struct ResolvedResume {
     pub chain_id: String,
-    pub model_name: String,
-    pub model: ModelConfig,
+    pub model_name: Option<String>,
+    pub model: Option<ModelConfig>,
     pub active_provider: String,
     pub active_session_id: String,
 }
 
 pub fn resolve_resume(
     state: &StateDb,
-    config: &ConfigStore,
     user_input: &str,           // session_id or chain_id, full UUID
     model_override: Option<&str>,
 ) -> Result<ResolvedResume, ResumeError>
@@ -243,14 +242,13 @@ Algorithm:
    ```
    If no active segment exists (defensive — shouldn't happen): pick the segment with max(started_at).
 
-5. **Resolve model** (agent → chain → provider default → user input):
+5. **Resolve model** (user input → invocation history → chain model → CLI default):
    - If `model_override` is `Some(m)`: use `m`.
    - Else: SELECT `model_name` FROM `invocations` WHERE `session_id` IN (chain's segment session_ids) ORDER BY `created_at` DESC LIMIT 1. If non-empty: use it. (Hits for any session that has ever been agent-mediated, including UI sessions resumed once through agent-runner.)
    - Else: use `session_chains.model_name`. If non-`'<unknown>'`: use it. (Hits for agent sessions that minted with a known model.)
-   - Else: read `providers.<active_provider>.default_model` from `providers.toml`. If set: use it. (UI fallback for sessions that were only ever ingested.)
-   - Else: return `ResumeError::ModelInferenceImpossible { hint = "pass --model or set default_model in providers.toml" }`.
+   - Else: return success with `model_name = None` and `model = None`. The spawn path will use the active provider's CLI command shape without any `--model`/`-m` override and let the CLI choose its built-in default model.
 
-6. **Validate provider/model pool inclusion** (existing logic at `main.rs:599-628`, reframed): the active provider must appear in `model.providers`. If not, return `ResumeError::ProviderModelMismatch { active_provider, suggestions }`. Suggestions are model names whose pool includes `active_provider`.
+6. **Validate provider/model pool inclusion** only when `model` is `Some`: the active provider must appear in `model.providers`. If not, return `ResumeError::ProviderModelMismatch { active_provider, suggestions }`. Suggestions are model names whose pool includes `active_provider`. When `model` is `None`, skip this check; the spawn path performs the provider lookup.
 
 7. Return `ResolvedResume`.
 
@@ -289,6 +287,12 @@ Re-run with: agents resume <chain_id> ...
 # 5. Best-on-resume policy
 
 After `resolve_resume` succeeds, the executor decides whether to stay or migrate.
+
+When `ResolvedResume.model` is `None`, the spawn path first picks the
+lexicographically first model TOML whose provider pool contains the active
+provider, then runs this same migration policy against that pool. This preserves
+manual `--migrate` and best-on-resume behavior for UI-only sessions while still
+spawning the final provider command without a model override.
 
 ```rust
 pub enum MigrationDecision {
@@ -500,7 +504,7 @@ Same backfill loop as the `StateDb::open` synchronous path — `migrate-db` is a
 
 The combined effect of §3.1 (chain records model at mint), §4.5 (resolver fallback), and §8.1–8.3 (`-m` becomes optional) is that **agents which resume sessions never need to pass `-m`**. Once a session has been started via `agents -m <model> ...`, every subsequent `agents --resume <UUID>` (or `agents resume <UUID>`, or `agents repl --resume <UUID>`) returns to the same model automatically.
 
-UI sessions get the same ergonomics via `providers.toml`'s `default_model`: a user who runs `claude` directly and later wants to resume through agent-runner does so with `agents --resume <UUID>` — the active provider's default model is used. They can override with `-m` if they want a different model for the continuation.
+UI sessions get the same ergonomics without runner-side model inference: a user who runs `claude` directly and later wants to resume through agent-runner does so with `agents --resume <UUID>`; the active provider's CLI is spawned without a model override, so the CLI uses its own default model. They can override with `-m` if they want a specific runner model/pool for the continuation.
 
 # 9. Provider config
 
@@ -564,33 +568,6 @@ Update the `claude-code-turns` reference adapter (`scripts/claude-code-turns`) t
 
 `codex-turns` is **not** updated in this PR. The adapter remains capable of ingestion without the flag; Codex chain identity works without compaction-boundary detection because Codex cross-account migration is deferred in v1 (§15).
 
-## 9.2 `default_model` (per provider, in `providers.toml`)
-
-`providers.toml` already declares per-provider quota and auth-refresh scripts. Extend each entry with an optional `default_model`:
-
-```toml
-[claude]
-quota_script         = "anthropic-usage ~/.claude/.credentials.json"
-auth_refresh_command = "claude auth status"
-default_model        = "claude-opus"
-
-[claude2]
-quota_script         = "anthropic-usage ~/.claude2/.credentials.json"
-auth_refresh_command = "claude auth status"
-default_model        = "claude-opus"
-
-[codex]
-quota_script         = "chatgpt-usage ~/.codex/auth.json"
-auth_refresh_command = "codex login status"
-default_model        = "codex-high"
-```
-
-Used by:
-- `session_turns` ingestion (§3.1.1) when minting a chain for a UI session.
-- The resolver's model fallback (§4.5) when neither invocation history nor chain.model_name disambiguate.
-
-Validation at config load: `default_model` must be a model name present in the models directory. If absent, fail config load with a clear error. If `default_model` is omitted, UI sessions on that provider can still be resumed but require `-m` at the call site.
-
 # 10. Trace integration
 
 `trace --json` adds `chain_id` to each session block, sourced from the latest segment row tied to the invocation's session_id:
@@ -618,8 +595,8 @@ Fixtures are applied outside test bodies per Phase 6: DB state comes from dedica
 | Theme / expected test group | Change risk or verification risk | Acceptance condition | Level | Fixture source / application point | Assumption-register link | Observable signal | Residual risk |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Schema migration and backfill (`backfill_*`, `migrate_db_command_*`, `startup_refuses_chain_ops_on_backfill_failure`) | Existing DBs may open without chain rows, double-backfill, or fall back to deleted resolver behavior. | `CREATE TABLE IF NOT EXISTS` and `ALTER TABLE ... DEFAULT 0` are idempotent; each distinct `(provider_name, session_id)` becomes one imported chain/segment; `StateDb::open` and `agents migrate-db` produce equivalent rows; failures stop chain-aware startup with a recovery hint. | particular-integration | SQLite temp DB fixtures seeded from `session_turns`/`invocations`; CLI fixture invokes `agents migrate-db` against the temp DB. | A5 | SQL row counts and values in `session_chains`/`session_chain_segments`; command exit code 0/1; stderr substring naming `agents migrate-db` on startup failure. | Does not prove performance on every user DB or filesystem; backfill scale remains a §14 watched risk. |
-| Chain identity write paths (`mint_chain_*`, `agent_session_chain_records_model_at_mint`, `ui_session_chain_*`, `chain_last_used_at_updates_after_successful_invocation`) | New agent/UI sessions may fail to mint stable chain identity, record wrong model provenance, or leave stale `last_used_at`, breaking resume without `-m` and 24h disambiguation. | Agent session capture mints an initial segment with model name; UI ingestion mints an imported segment using provider `default_model` or `'<unknown>'`; resume no-ops against existing chain; successful chain-tied invocation advances `last_used_at`. | particular-integration | Invocation/ingestion fixture builders with stub provider output, provider TOML defaults, and temp DB applied through existing state APIs. | A3, A8 | SQL row values: `transition_reason`, `model_name`, active segment count, and `last_used_at` within the call window. | Does not verify direct upstream CLI behavior beyond adapter-emitted turns; delayed adapters remain an A3 invalidator. |
-| Resolver disambiguation and model inference (`resolve_resume_*`, `agent_resume_no_dash_m_*`) | `--resume` may select the wrong logical conversation, accept ambiguous ownership, or fail to infer the model where proposal promises it. | Full UUID only; single-chain resolves active segment; duplicate session IDs filter by 24h then max `last_used_at`; true ambiguity returns previews; model precedence is override → latest invocation → chain model → provider default → `ModelInferenceImpossible`; provider/model pool mismatch reports suggestions. | particular-integration | Resolver DB/config builders with seeded chains, segments, invocations, provider defaults, and model pools; agent CLI fixture for no-`-m` resume. | A8 for provider-default fallback; none for pure disambiguation mechanics. | Returned `ResolvedResume` fields, `ResumeError` variants/previews, model name string, suggestions list, CLI exit code/stderr. | Preview snippets are intentionally absent until the §15 `transcript_preview` follow-up; UUID collisions outside seeded cases are not exhaustively generated. |
+| Chain identity write paths (`mint_chain_*`, `agent_session_chain_records_model_at_mint`, `ui_session_chain_*`, `chain_last_used_at_updates_after_successful_invocation`) | New agent/UI sessions may fail to mint stable chain identity, record wrong model provenance, or leave stale `last_used_at`, breaking resume without `-m` and 24h disambiguation. | Agent session capture mints an initial segment with model name; UI ingestion mints an imported segment with `'<unknown>'`; resume no-ops against existing chain; successful chain-tied invocation advances `last_used_at`. | particular-integration | Invocation/ingestion fixture builders with stub provider output and temp DB applied through existing state APIs. | A3, A8 | SQL row values: `transition_reason`, `model_name`, active segment count, and `last_used_at` within the call window. | Does not verify direct upstream CLI behavior beyond adapter-emitted turns; delayed adapters remain an A3 invalidator. |
+| Resolver disambiguation and model inference (`resolve_resume_*`, `agent_resume_no_dash_m_*`) | `--resume` may select the wrong logical conversation, accept ambiguous ownership, or fail to infer the model where proposal promises CLI-default fallback. | Full UUID only; single-chain resolves active segment; duplicate session IDs filter by 24h then max `last_used_at`; true ambiguity returns previews; model precedence is override → latest invocation → chain model → `None`; provider/model pool mismatch reports suggestions only when a model is known. | particular-integration | Resolver DB/config builders with seeded chains, segments, invocations, and model pools; agent CLI fixture for no-`-m` resume. | A8 for CLI-default fallback; none for pure disambiguation mechanics. | Returned `ResolvedResume` fields, `ResumeError` variants/previews, optional model name, suggestions list, CLI exit code/stderr. | Preview snippets are intentionally absent until the §15 `transcript_preview` follow-up; UUID collisions outside seeded cases are not exhaustively generated. |
 | Best-on-resume decision (`decide_migration_*`, `manual_migrate_flag_overrides_best_score_via_cli`) | Migration may fail to happen when a better provider exists at resume, ignore exhaustion, or choose a provider without session storage. | Every resume picks the highest-scored provider with `[providers.session_storage]`; active best stays; ties break by lower provider index; `exhausted_at` triggers migration to the best sibling; single-provider/no-storage pools stay; manual target overrides best score and records `manual`; Codex source/target policy decisions are deferred by the migration mechanic before writes. | particular-integration | Balancer state/config fixture builders with quota-window rows, exhausted flags, model pools, and session-storage blocks; CLI fixture applies `--migrate`. | A2, A4, A7 | `MigrationDecision` enum value, target provider index, transition reason, logged Codex-deferred reason, and resulting segment `transition_reason = 'manual'` for CLI path. | Does not model real provider API quota correctness; Codex cross-account migration remains §15 residual. |
 | Migration mechanic: Claude JSONL copy, Codex deferred guard, segment ledger, and races (`migration_copies_*`, `migration_appends_chain_segment_*`, `migration_returning_clause_aborts_on_concurrent_close`, source-path errors, `migration_mechanic_errors_codex_deferred_*`) | Copying transcripts may write the wrong target, corrupt source/target files, leave multiple active segments, hide missing/malformed source paths, or accidentally exercise unverified Codex migration. | Source JSONL remains unchanged; Claude target path is provider-kind correct; plain copy writes `source[offset..]`; Codex source/target returns `MigrationError::CodexMigrationDeferred`; missing/malformed sources produce typed errors; close/open segment transaction records `ended_at`, `last_turn_id`, new active segment, and aborts concurrent close losers. | particular-integration | Tempdir transcript trees for Claude layouts, transcript-locator stub outputs, SQLite chain/turn fixtures, Codex storage config fixtures, and transaction-race harness. | A1 for Claude replay layout; A7 for Codex deferral; A3 for `last_turn_id` from ingested turns. | File existence/path, byte contents, absence/presence of `.tmp`, `MigrationError` variant, SQL segment fields, and one failed concurrent close result. | Does not prove real CLIs accept every copied JSONL; Codex cross-account migration is deferred to a follow-up PR per §15; chain identity for Codex sessions is verified but the file-copy path is not exercised. |
 | Migration mechanic: Codex deferred negative emission (`migration_does_not_emit_migrate_stderr_on_codex_deferred`) | Observability may claim a migration occurred even when the Codex-deferred guard short-circuits before segment insertion. | When Codex migration returns `MigrationError::CodexMigrationDeferred`, the `[migrate]` stderr line is not emitted and no target segment row is inserted. | particular-integration | CLI/migration fixture with Codex active provider, eligible Claude-Code sibling, stderr capture, and SQLite segment-count assertion. | A7 | Stderr does not contain `[migrate]`; `session_chain_segments` has no newly inserted target row. | Does not prove future Codex migration observability; the path remains deferred to §15. |
@@ -644,11 +621,9 @@ Unit tests (Rust, `#[test]`):
 - `resolve_resume_falls_back_to_max_last_used_when_none_within_24h`: both chains older than 24h, assert resolver picks max(last_used_at).
 - `resolve_resume_infers_model_from_latest_invocation`: chain with two invocations, latest carrying `claude-opus`. Resolver with no override returns model `claude-opus`.
 - `resolve_resume_falls_back_to_chain_model_name_when_no_invocations`: chain with no invocation rows (backfilled only), `session_chains.model_name = "claude-haiku"`. Resolver returns `claude-haiku`.
-- `resolve_resume_falls_back_to_provider_default_model_for_ui_session`: chain with `model_name = '<unknown>'` and no invocation rows, `providers.toml` has `claude.default_model = "claude-opus"`. Resolver returns `claude-opus`.
-- `resolve_resume_errors_when_model_inference_impossible`: chain with no invocations, `model_name = '<unknown>'`, and provider has no `default_model`. Assert `ResumeError::ModelInferenceImpossible` with hint mentioning `default_model`.
+- `resolve_resume_returns_none_model_when_no_inference_source`: chain with no invocations and `chain.model_name = '<unknown>'`. Assert `resolved.model_name.is_none()` and `resolved.model.is_none()`.
 - `agent_session_chain_records_model_at_mint`: invoke `agents -m claude-opus ...`, capture session_id, assert `session_chains.model_name = "claude-opus"`.
-- `ui_session_chain_minted_at_ingestion_uses_provider_default`: ingest a turn for a fresh `(provider, session_id)` pair; provider has `default_model = "claude-opus"`. Assert chain row exists with `model_name = "claude-opus"` and `transition_reason = 'imported'`.
-- `ui_session_chain_minted_with_unknown_when_no_provider_default`: same as above but provider has no `default_model`. Assert chain row exists with `model_name = '<unknown>'`.
+- `ui_session_chain_minted_with_unknown`: ingest a turn for a fresh `(provider, session_id)` pair. Assert chain row exists with `model_name = '<unknown>'`.
 - `chain_mint_works_for_codex_ingestion`: ingest a Codex turn for a fresh `(provider, session_id)` pair; assert `session_chains` and `session_chain_segments` rows exist. This pins that Codex chain identity is preserved even though migration is deferred.
 - `agent_resume_no_dash_m_uses_session_recorded_model`: start an agent session under `claude-opus`, then run `agents --resume <UUID>` with no `-m`. Assert the second invocation runs against `claude-opus`.
 - `resolve_resume_validates_provider_in_model_pool`: chain owned by `claude2`, request a model whose pool excludes `claude2`, assert `ResumeError::ProviderModelMismatch` with non-empty suggestions.
@@ -685,7 +660,8 @@ Unit tests (Rust, `#[test]`):
 - `migration_errors_on_source_jsonl_missing`: source path absent, assert `MigrationError::SourceMissing`.
 - `compose_resume_args_rejects_config_kind`: parse a model TOML fixture with `[providers.resume] kind = "config"` and assert validation rejects it. Pins the v1 invariant that no config resume strategy is recognized.
 - `top_level_resume_without_model_succeeds_when_chain_exists`: invoke `agents --resume <UUID>` with no `-m`, assert resolver picks the model and the run completes.
-- `top_level_resume_without_model_errors_when_no_invocation_history`: chain seeded only via backfill with `model_name = '<unknown>'`, `agents --resume <UUID>` errors with `ModelInferenceImpossible`.
+- `run_resume_spawns_without_model_flag_when_model_none`: chain seeded only via backfill with `model_name = '<unknown>'`, model TOML provider args include `--model`; `agents --resume <UUID>` strips model flags and succeeds.
+- `run_repl_spawns_without_model_flag_when_model_none`: same assertion for `interactive_args`.
 - `manual_migrate_flag_overrides_best_score_via_cli`: `agents resume --migrate <other-provider> <UUID>`, assert migration occurs and reason is `'manual'` even when the active provider has the better score.
 - `resume_list_subcommand_prints_all_chains_for_session_id`: two chains share session_id, assert `agents resume --list <UUID>` prints both with last_used_at, active provider, and turn count.
 - `trace_json_includes_chain_id`: invoke `trace --json <invocation_uuid>` over a chained invocation, assert `session.chain_id` matches the segment row.
@@ -703,7 +679,7 @@ Replace the "Resuming a session" subsection (`README.md:417-477`) with chain-awa
 
 - A chain is the stable identity of a logical conversation; session_id is per-segment and may change at migration.
 - `--resume <UUID>` accepts a session_id or chain_id; if a session_id matches multiple chains, disambiguates by 24h-window and falls back to user choice.
-- `-m` is now optional on `resume` and the top-level form. For agent sessions, the model is inferred from the chain's recorded model (set when the agent first started the session). For UI sessions started outside agent-runner, the runner falls back to `providers.<provider>.default_model` in `providers.toml`. Pass `-m` to override.
+- `-m` is now optional on `resume` and the top-level form. For agent sessions, the model is inferred from the chain's recorded model (set when the agent first started the session). For UI sessions started outside agent-runner, the runner spawns the active provider CLI without a model override and lets the CLI use its own default. Pass `-m` to override.
 - Both agent and UI sessions can be migrated for Claude-Code providers — the chain layer abstracts over how the session was started. Codex sessions preserve chain identity but not cross-account migration in v1.
 - `--migrate <provider>` forces migration; otherwise the runner picks the best-scored storage-backed provider at resume entry.
 - `[providers.session_storage] kind = "claude_code"` is required on any provider that participates in migration (source or target). `kind = "codex"` is declarable for chain identity but migration is deferred in v1.
@@ -713,15 +689,13 @@ Add a new subsection "Session migration" under Load Balancing covering the best-
 
 Add a `[providers.session_storage]` example to the existing Adding a Model section.
 
-Update the `providers.toml` reference (`README.md:222-258`) to document the new optional `default_model` field, with an example showing it set for each Anthropic/OpenAI provider.
-
 Update the Session Ingestion turn-script contract (`README.md:298-310`) to document the new optional `is_compaction_boundary` field. Note that `claude-code-turns` emits it; `codex-turns` does not yet (limitation in §15).
 
 Update the `transcript_locator` subsection (`README.md:324-336`) to note that the locator is now invoked at **migration time** as well as trace time. Today's wording ("lazy at trace time — never at invocation time") becomes stale once §6.1 calls the locator during a `resume`-triggered migration to resolve the source JSONL path. Reword to "lazy — invoked only when a chain is being inspected (`trace`) or migrated (`resume` with cross-provider migration). Unused providers cost nothing." Cross-link to §6.1's source-path resolution path.
 
 Update the CLI synopsis (`README.md:131-136`) to mark `-m, --model` as optional when `--resume` is present, and document the new `--migrate <provider>` flag plus the `agents resume --list <UUID>` subcommand.
 
-Update the resume failure-modes list (`README.md:467-475`) — the "Resume failures all exit 1 with a specific stderr message" enumeration today lists four error classes (`No session found`, `Invalid session UUID`, `Provider/model mismatch`, `Provider has no [providers.resume] block`). Rev 2 adds two more: `ResumeError::Ambiguous` (multiple chains share session_id, all within 24h — user must rerun with `--resume <chain_id>`) and `ResumeError::ModelInferenceImpossible` (chain has no recorded model, no invocation history, and active provider has no `default_model` — user must pass `-m`). The existing `Provider/model mismatch` text is kept; phrasing now references "active segment's owning provider" rather than "owning provider" since segments can change.
+Update the resume failure-modes list (`README.md:467-475`) — the "Resume failures all exit 1 with a specific stderr message" enumeration today lists four error classes (`No session found`, `Invalid session UUID`, `Provider/model mismatch`, `Provider has no [providers.resume] block`). Add `ResumeError::Ambiguous` (multiple chains share session_id, all within 24h — user must rerun with `--resume <chain_id>`) and `ResumeError::ProviderNotConfigured` (the active provider is no longer present in any loaded model TOML). The existing `Provider/model mismatch` text is kept; phrasing now references "active segment's owning provider" rather than "owning provider" since segments can change.
 
 # 13. Cross-cutting considerations
 

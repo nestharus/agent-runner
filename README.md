@@ -470,11 +470,18 @@ When a session id matched multiple providers (rare; requires cross-provider sess
 [resume] session 9e69e8cc-... matched claude2, claude3; selected claude2 by latest turn timestamp
 ```
 
+If no model can be inferred for a UI-started session, the runner uses the
+active provider's configured command shape but removes `--model <value>` and
+`-m <value>` from the spawned argv. The upstream CLI then chooses its own
+default model.
+
 Resume failures all exit `1` with a specific stderr message:
 
 - **No session found** — the UUID is not in `session_turns` (typically: session ingestion isn't configured, or the provider's local store has dropped the session)
 - **Invalid session UUID** — the input wasn't a valid full UUID (no prefix matching)
+- **Ambiguous session** — the UUID maps to multiple recent chains; rerun with a printed `chain_id`
 - **Provider/model mismatch** — the resolved provider is not in the requested model's provider pool. The error suggests other models that include the resolved provider, e.g. `Try a model that includes claude2: claude-opus, claude-sonnet`.
+- **Provider not configured** — the active provider is no longer present in any loaded model TOML, so the runner has no command shape to spawn.
 - **Provider has no `[providers.resume]` block** — the resolved provider exists in the model's pool but doesn't declare a resume strategy.
 
 The invocation row records `session_capture_method = "resumed"` and the user-supplied `session_id` *before* spawn. This means `trace` can show what session the runner attempted to resume even if the wrapped CLI rejects the id (e.g. "No conversation found"). Trace renders the session as `Resume target: <UUID>` instead of `Session: <UUID>` to make this distinction explicit, and adds a warning: `session marked as attempted resume target; child acceptance is not confirmed by this row — check exit_code and recent_errors for outcome`.

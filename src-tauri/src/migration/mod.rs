@@ -87,7 +87,8 @@ pub fn migrate_chain_segment(
 ) -> Result<MigratedSegment, MigrationError> {
     let source = model
         .providers
-        .get(resolved.active_provider_index)
+        .iter()
+        .find(|provider| provider.name == resolved.active_provider)
         .ok_or_else(|| MigrationError::ProviderNotInModelPool {
             provider: resolved.active_provider.clone(),
             model_name: model.name.clone(),
@@ -358,10 +359,9 @@ projects_dir = "{}"
         let model = model_with_storage(&source_projects, &target_projects);
         let resolved = ResolvedResume {
             chain_id: chain_id.clone(),
-            model_name: model.name.clone(),
-            model: model.clone(),
+            model_name: Some(model.name.clone()),
+            model: Some(model.clone()),
             active_provider: "claude".to_string(),
-            active_provider_index: 0,
             active_session_id: session_id.to_string(),
         };
         let mut stderr = Vec::new();

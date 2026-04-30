@@ -1,6 +1,6 @@
 use agent_runner_lib::balancer;
 use agent_runner_lib::config::{
-    AgentConfig, ModelConfig, load_agent_file, load_agents, load_models,
+    AgentConfig, ModelConfig, ProviderConfig, load_agent_file, load_agents, load_models,
 };
 use agent_runner_lib::diagnostics;
 use agent_runner_lib::executor;
@@ -101,8 +101,8 @@ enum Subcommands {
     },
     /// Launch a model interactively without a prompt payload.
     Repl {
-        /// Model id to launch interactively
-        #[arg(required = true)]
+        /// Model id to launch interactively. Optional when --resume can infer
+        /// a model or fall through to the provider CLI's default model.
         model: Option<String>,
 
         /// Resume an existing session by full UUID
@@ -556,13 +556,7 @@ fn ingest_and_emit_session_id(
         return false;
     };
 
-    let providers_cfg = agent_runner_lib::config::ProvidersConfig::default();
-    let report = agent_runner_lib::sessions::scan_provider(
-        provider_name,
-        sessions_cfg,
-        &providers_cfg,
-        state,
-    );
+    let report = agent_runner_lib::sessions::scan_provider(provider_name, sessions_cfg, state);
     for err in report.errors {
         eprintln!("Warning: Session ingest failed for {provider_name}: {err}");
     }
@@ -677,13 +671,6 @@ fn format_resume_error(err: agent_runner_lib::state::ResumeError) -> String {
             out.push_str("Re-run with: agents resume <chain_id>");
             out
         }
-        ResumeError::ModelInferenceImpossible {
-            chain_id,
-            active_provider,
-            hint,
-        } => format!(
-            "Cannot infer model for chain {chain_id} on active provider {active_provider}; {hint}"
-        ),
         ResumeError::ProviderModelMismatch {
             model_name,
             active_provider,
@@ -702,11 +689,102 @@ fn format_resume_error(err: agent_runner_lib::state::ResumeError) -> String {
         ResumeError::ActiveSegmentMissing { chain_id } => {
             format!("No active segment found for chain {chain_id}")
         }
+        ResumeError::ProviderNotConfigured { provider } => {
+            format!("provider {provider} is not configured in any loaded model")
+        }
         ResumeError::ProviderMissingResume { provider_name } => {
             format!("provider {provider_name} has no [providers.resume] block; cannot resume")
         }
         ResumeError::Db { message } => message,
     }
+}
+
+#[derive(Clone)]
+struct ResumeExecutionTarget {
+    model: ModelConfig,
+    provider_index: usize,
+    provider: ProviderConfig,
+}
+
+fn strip_model_override_args(args: &[String]) -> Vec<String> {
+    let mut stripped = Vec::with_capacity(args.len());
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--model" || arg == "-m" {
+            let _ = iter.next();
+            continue;
+        }
+        stripped.push(arg.clone());
+    }
+    stripped
+}
+
+fn provider_without_model_override(provider: &ProviderConfig) -> ProviderConfig {
+    let mut provider = provider.clone();
+    provider.args = strip_model_override_args(&provider.args);
+    provider.interactive_args = provider
+        .interactive_args
+        .as_ref()
+        .map(|args| strip_model_override_args(args));
+    provider
+}
+
+fn first_matching_model_for_provider(
+    models: &HashMap<String, ModelConfig>,
+    provider_name: &str,
+) -> Option<(ModelConfig, usize)> {
+    let mut names = models.keys().collect::<Vec<_>>();
+    names.sort();
+    names.into_iter().find_map(|name| {
+        let model = models.get(name)?;
+        let provider_index = model
+            .providers
+            .iter()
+            .position(|provider| provider.name == provider_name)?;
+        Some((model.clone(), provider_index))
+    })
+}
+
+fn resume_execution_target(
+    resolved: &agent_runner_lib::state::ResolvedResume,
+    models: &HashMap<String, ModelConfig>,
+) -> Result<ResumeExecutionTarget, agent_runner_lib::state::ResumeError> {
+    let (model, provider_index, strip_model_override) = if let Some(model) = resolved.model.as_ref()
+    {
+        let provider_index = model
+            .providers
+            .iter()
+            .position(|provider| provider.name == resolved.active_provider)
+            .ok_or_else(
+                || agent_runner_lib::state::ResumeError::ProviderModelMismatch {
+                    model_name: model.name.clone(),
+                    active_provider: resolved.active_provider.clone(),
+                    suggestions: Vec::new(),
+                },
+            )?;
+        (model.clone(), provider_index, false)
+    } else {
+        let (model, provider_index) =
+            first_matching_model_for_provider(models, &resolved.active_provider).ok_or_else(
+                || agent_runner_lib::state::ResumeError::ProviderNotConfigured {
+                    provider: resolved.active_provider.clone(),
+                },
+            )?;
+        (model, provider_index, true)
+    };
+
+    let provider = model.providers[provider_index].clone();
+    let provider = if strip_model_override {
+        provider_without_model_override(&provider)
+    } else {
+        provider
+    };
+
+    Ok(ResumeExecutionTarget {
+        model,
+        provider_index,
+        provider,
+    })
 }
 
 fn run_repl(
@@ -732,13 +810,8 @@ fn run_repl(
         agent_runner_lib::config::SessionsConfig::load(&sessions_path).unwrap_or_default();
     let mut resolved_resume = if let Some(session_id) = resume {
         Some(
-            match state.resolve_resume(&providers_cfg, &models, session_id, model_name) {
+            match state.resolve_resume(&models, session_id, model_name) {
                 Ok(resolved) => resolved,
-                Err(agent_runner_lib::state::ResumeError::NoChainFound { .. })
-                    if model_name.is_none() =>
-                {
-                    return Err("--resume requires --model <model-id>.".to_string());
-                }
                 Err(agent_runner_lib::state::ResumeError::ProviderModelMismatch {
                     active_provider,
                     ..
@@ -756,14 +829,29 @@ fn run_repl(
     } else {
         None
     };
-    let model_name = resolved_resume
+    let mut fallback_target = match resolved_resume.as_ref() {
+        Some(resolved) => {
+            Some(resume_execution_target(resolved, &models).map_err(format_resume_error)?)
+        }
+        None => None,
+    };
+    let direct_model = if fallback_target.is_none() {
+        let model_name =
+            model_name.ok_or_else(|| "model is required unless --resume is present".to_string())?;
+        Some(
+            models
+                .get(model_name)
+                .cloned()
+                .ok_or_else(|| format!("Unknown model: {model_name}"))?,
+        )
+    } else {
+        None
+    };
+    let model = fallback_target
         .as_ref()
-        .map(|resolved| resolved.model_name.as_str())
-        .or(model_name)
-        .ok_or_else(|| "model is required unless --resume can infer it".to_string())?;
-    let model = models
-        .get(model_name)
-        .ok_or_else(|| format!("Unknown model: {model_name}"))?;
+        .map(|target| target.model.clone())
+        .or(direct_model)
+        .expect("resume or direct model must be available");
 
     let in_flight = agent_runner_lib::quota::InFlight::new();
     let ctx = balancer::BalanceContext {
@@ -774,7 +862,9 @@ fn run_repl(
 
     let parent_invocation_id = resolve_parent_invocation_id(&state);
     let stderr_is_terminal = std::io::stderr().is_terminal();
-    let (provider_index, resume_payload) = if let Some(resolved) = resolved_resume.as_mut() {
+    let (provider_index, provider, resume_session_id) = if let Some(resolved) =
+        resolved_resume.as_mut()
+    {
         let selected_provider = &resolved.active_provider;
         if should_emit_resume_short_line(stderr_is_terminal) {
             eprintln!("[resume] -> {selected_provider}");
@@ -782,13 +872,13 @@ fn run_repl(
         if let Ok(balancer::MigrationDecision::Migrate {
             target_provider_index,
             reason,
-        }) = balancer::decide_migration(&state, model, resolved, manual_migrate)
+        }) = balancer::decide_migration(&state, &model, resolved, manual_migrate)
         {
             let mut stderr = std::io::stderr();
             match agent_runner_lib::migration::migrate_chain_segment(
                 &state,
                 &sessions_cfg,
-                model,
+                &model,
                 resolved,
                 target_provider_index,
                 reason,
@@ -796,8 +886,10 @@ fn run_repl(
             ) {
                 Ok(migrated) => {
                     resolved.active_provider = migrated.target_provider.clone();
-                    resolved.active_provider_index = migrated.target_provider_index;
                     resolved.active_session_id = migrated.target_session_id.clone();
+                    fallback_target = Some(
+                        resume_execution_target(resolved, &models).map_err(format_resume_error)?,
+                    );
                 }
                 Err(err) => {
                     eprintln!("migration failed: {err:?}");
@@ -806,28 +898,32 @@ fn run_repl(
             }
         }
 
-        let provider_index = resolved.active_provider_index;
-        let provider = &model.providers[provider_index];
-        let Some(strategy) = provider.resume.as_ref() else {
+        let target = fallback_target
+            .as_ref()
+            .expect("resume target must be resolved before spawn");
+        let provider_index = target.provider_index;
+        let provider = target.provider.clone();
+        if provider.resume.is_none() {
             eprintln!(
                 "provider {} has no [providers.resume] block; cannot resume",
                 provider.name
             );
             return Ok(1);
-        };
+        }
 
         (
             provider_index,
-            Some(executor::cli::ResumePayload {
-                session_id: &resolved.active_session_id,
-                strategy,
-                target_jsonl_path: None,
-            }),
+            provider,
+            Some(resolved.active_session_id.clone()),
         )
     } else {
-        (balancer::select_provider(model, &state, Some(&ctx)), None)
+        let provider_index = balancer::select_provider(&model, &state, Some(&ctx));
+        (
+            provider_index,
+            model.providers[provider_index].clone(),
+            None,
+        )
     };
-    let provider = &model.providers[provider_index];
     if provider.interactive_args.is_none() {
         return Err(format!(
             "Provider {} has no interactive_args; cannot launch interactively",
@@ -839,9 +935,19 @@ fn run_repl(
         source: provider.name.clone(),
         id: Uuid::new_v4().to_string(),
     };
+    let invocation_model_name = resolved_resume
+        .as_ref()
+        .and_then(|resolved| resolved.model_name.clone())
+        .unwrap_or_else(|| {
+            if resume.is_some() {
+                "<unknown>".to_string()
+            } else {
+                model.name.clone()
+            }
+        });
     let invocation_row_id = state.start_invocation(&InvocationStart {
         invocation_uuid: invocation.id.clone(),
-        model_name: model.name.clone(),
+        model_name: invocation_model_name,
         provider_name: provider.name.clone(),
         provider_index,
         parent_invocation_id,
@@ -858,8 +964,20 @@ fn run_repl(
         eprintln!("{}", invocation.stderr_line());
     }
 
+    let resume_payload = resume_session_id.as_deref().map(|session_id| {
+        let strategy = provider
+            .resume
+            .as_ref()
+            .expect("resumable provider must have a resume strategy");
+        executor::cli::ResumePayload {
+            session_id,
+            strategy,
+            target_jsonl_path: None,
+        }
+    });
+
     match executor::cli::execute_interactive(
-        provider,
+        &provider,
         working_dir,
         Some(&invocation_env),
         resume_payload,
@@ -935,20 +1053,13 @@ fn run_resume(
     let config_root = dirs::config_dir()
         .map(|d| d.join("oulipoly-agent-runner"))
         .unwrap_or_else(|| PathBuf::from("."));
-    let providers_path = config_root.join("providers.toml");
     let sessions_path = config_root.join("sessions.toml");
-    let providers_cfg =
-        agent_runner_lib::config::ProvidersConfig::load(&providers_path).unwrap_or_default();
     let sessions_cfg =
         agent_runner_lib::config::SessionsConfig::load(&sessions_path).unwrap_or_default();
 
     let stderr_is_terminal = std::io::stderr().is_terminal();
-    let mut resolved = match state.resolve_resume(&providers_cfg, &models, session_id, model_name) {
+    let mut resolved = match state.resolve_resume(&models, session_id, model_name) {
         Ok(resolved) => resolved,
-        Err(agent_runner_lib::state::ResumeError::NoChainFound { .. }) if model_name.is_none() => {
-            eprintln!("--resume requires --model <model-id>.");
-            return Ok(1);
-        }
         Err(agent_runner_lib::state::ResumeError::ProviderModelMismatch {
             active_provider,
             ..
@@ -969,10 +1080,14 @@ fn run_resume(
             return Ok(1);
         }
     };
-    let model_name = resolved.model_name.clone();
-    let model = models
-        .get(&model_name)
-        .ok_or_else(|| format!("Unknown model: {model_name}"))?;
+    let mut target = match resume_execution_target(&resolved, &models) {
+        Ok(target) => target,
+        Err(err) => {
+            eprintln!("{}", format_resume_error(err));
+            return Ok(1);
+        }
+    };
+    let mut model = target.model.clone();
 
     let selected_provider = &resolved.active_provider;
     if should_emit_resume_short_line(stderr_is_terminal) {
@@ -981,13 +1096,13 @@ fn run_resume(
     if let Ok(balancer::MigrationDecision::Migrate {
         target_provider_index,
         reason,
-    }) = balancer::decide_migration(&state, model, &resolved, manual_migrate)
+    }) = balancer::decide_migration(&state, &model, &resolved, manual_migrate)
     {
         let mut stderr = std::io::stderr();
         match agent_runner_lib::migration::migrate_chain_segment(
             &state,
             &sessions_cfg,
-            model,
+            &model,
             &resolved,
             target_provider_index,
             reason,
@@ -995,8 +1110,15 @@ fn run_resume(
         ) {
             Ok(migrated) => {
                 resolved.active_provider = migrated.target_provider.clone();
-                resolved.active_provider_index = migrated.target_provider_index;
                 resolved.active_session_id = migrated.target_session_id.clone();
+                target = match resume_execution_target(&resolved, &models) {
+                    Ok(target) => target,
+                    Err(err) => {
+                        eprintln!("{}", format_resume_error(err));
+                        return Ok(1);
+                    }
+                };
+                model = target.model.clone();
             }
             Err(err) => {
                 eprintln!("migration failed: {err:?}");
@@ -1005,8 +1127,8 @@ fn run_resume(
         }
     }
 
-    let provider_index = resolved.active_provider_index;
-    let provider = &model.providers[provider_index];
+    let provider_index = target.provider_index;
+    let provider = target.provider;
     let Some(strategy) = provider.resume.as_ref() else {
         eprintln!(
             "provider {} has no [providers.resume] block; cannot resume",
@@ -1020,9 +1142,13 @@ fn run_resume(
         source: provider.name.clone(),
         id: Uuid::new_v4().to_string(),
     };
+    let invocation_model_name = resolved
+        .model_name
+        .clone()
+        .unwrap_or_else(|| "<unknown>".to_string());
     let invocation_row_id = state.start_invocation(&InvocationStart {
         invocation_uuid: invocation.id.clone(),
-        model_name: model.name.clone(),
+        model_name: invocation_model_name,
         provider_name: provider.name.clone(),
         provider_index,
         parent_invocation_id,
@@ -1035,7 +1161,7 @@ fn run_resume(
     eprintln!("{}", invocation.stderr_line());
 
     let result = match executor::cli::execute_resume(
-        provider,
+        &provider,
         provider_index,
         model.prompt_mode,
         &answer,
@@ -1811,30 +1937,25 @@ mod tests {
     }
 
     #[test]
-    fn repl_subcommand_requires_model_argument() {
-        let err = match Cli::try_parse_from(["oulipoly-agent-runner", "repl"]) {
-            Ok(_) => panic!("expected clap to reject repl without a model"),
-            Err(err) => err,
-        };
-
-        let rendered = err.to_string().to_lowercase();
-        assert!(rendered.contains("model"), "{rendered}");
-    }
-
-    #[test]
-    fn repl_subcommand_requires_model_argument_even_with_resume() {
-        let err = match Cli::try_parse_from([
+    fn repl_subcommand_allows_missing_model_with_resume() {
+        let cli = Cli::try_parse_from([
             "oulipoly-agent-runner",
             "repl",
             "--resume",
             "5169694d-de0f-40d1-890c-6e28e55bab27",
-        ]) {
-            Ok(_) => panic!("expected clap to reject repl without a model"),
-            Err(err) => err,
-        };
+        ])
+        .unwrap();
 
-        let rendered = err.to_string().to_lowercase();
-        assert!(rendered.contains("model"), "{rendered}");
+        match cli.command {
+            Some(Subcommands::Repl { model, resume, .. }) => {
+                assert_eq!(model, None);
+                assert_eq!(
+                    resume.as_deref(),
+                    Some("5169694d-de0f-40d1-890c-6e28e55bab27")
+                );
+            }
+            _ => panic!("expected repl subcommand"),
+        }
     }
 
     #[test]
@@ -2103,6 +2224,65 @@ mod tests {
         assert!(line.contains("active_session_id=dd116a3c-6819-42b1-b3d2-f512331eb5ec"));
         assert!(line.contains("turn_count=42"));
         assert!(line.contains("recent_turns_count=1"));
+    }
+
+    #[test]
+    fn decide_migration_works_for_model_none_via_first_matching_pool() {
+        let db = test_db();
+        let model = ModelConfig::from_toml(
+            "claude-opus",
+            r#"
+prompt_mode = "arg"
+
+[[providers]]
+name = "claude"
+command = "claude"
+interactive_args = ["launch"]
+
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+
+[providers.session_storage]
+kind = "claude_code"
+projects_dir = "/tmp/source"
+
+[[providers]]
+name = "claude2"
+command = "claude2"
+interactive_args = ["launch"]
+
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+
+[providers.session_storage]
+kind = "claude_code"
+projects_dir = "/tmp/target"
+"#,
+        )
+        .unwrap();
+        let mut models = HashMap::new();
+        models.insert("claude-opus".to_string(), model);
+        let resolved = agent_runner_lib::state::ResolvedResume {
+            chain_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string(),
+            model_name: None,
+            model: None,
+            active_provider: "claude".to_string(),
+            active_session_id: "5169694d-de0f-40d1-890c-6e28e55bab27".to_string(),
+        };
+
+        let target = resume_execution_target(&resolved, &models).unwrap();
+        let decision =
+            balancer::decide_migration(&db, &target.model, &resolved, Some("claude2")).unwrap();
+
+        assert_eq!(
+            decision,
+            balancer::MigrationDecision::Migrate {
+                target_provider_index: 1,
+                reason: balancer::TransitionReason::Manual,
+            }
+        );
     }
 
     // risk: Schema migration and backfill; level: particular-integration; source: proposal §11.1 Schema migration and backfill / A5, A6.

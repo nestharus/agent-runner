@@ -677,7 +677,7 @@ flag = "--resume"
 }
 
 #[test]
-fn top_level_resume_without_model_errors_cleanly() {
+fn top_level_resume_without_model_reports_missing_session() {
     let fixture = Fixture::new();
     let output = fixture
         .base_top_level_resume_without_model_command("5169694d-de0f-40d1-890c-6e28e55bab27")
@@ -686,10 +686,7 @@ fn top_level_resume_without_model_errors_cleanly() {
 
     assert_ne!(output.status.code(), Some(0), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("--resume requires --model <model-id>."),
-        "{stderr}"
-    );
+    assert!(stderr.contains("No session found matching"), "{stderr}");
 }
 
 #[test]
