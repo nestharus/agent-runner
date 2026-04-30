@@ -633,7 +633,7 @@ fn round_robin_fallback(model: &ModelConfig, state: &StateDb, candidates: &[usiz
 mod tests {
     use super::*;
     use crate::config::{ProviderConfig, model::PromptMode};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use uuid::Uuid;
 
     fn record_invocation_for_test(
@@ -1123,40 +1123,41 @@ mod tests {
     }
 
     fn migratable_model(provider_names: &[(&str, &str)]) -> ModelConfig {
-        let mut body = String::from("prompt_mode = \"arg\"\n");
-        for (name, storage_kind) in provider_names {
-            body.push_str(&format!(
-                r#"
-[[providers]]
-name = "{name}"
-command = "{name}"
-interactive_args = ["launch"]
-
-[providers.resume]
-kind = "flag"
-flag = "--resume"
-"#
-            ));
-            match *storage_kind {
-                "claude_code" => body.push_str(&format!(
-                    r#"
-[providers.session_storage]
-kind = "claude_code"
-projects_dir = "/tmp/{name}/projects"
-"#
-                )),
-                "codex" => body.push_str(&format!(
-                    r#"
-[providers.session_storage]
-kind = "codex"
-sessions_dir = "/tmp/{name}/sessions"
-"#
-                )),
-                "none" => {}
-                other => panic!("unknown storage kind fixture {other}"),
-            }
+        let providers = provider_names
+            .iter()
+            .map(|(name, storage_kind)| {
+                let session_storage = match *storage_kind {
+                    "claude_code" => Some(crate::config::SessionStorage::ClaudeCode {
+                        projects_dir: PathBuf::from(format!("/tmp/{name}/projects")),
+                    }),
+                    "codex" => Some(crate::config::SessionStorage::Codex {
+                        sessions_dir: PathBuf::from(format!("/tmp/{name}/sessions")),
+                    }),
+                    "none" => None,
+                    other => panic!("unknown storage kind fixture {other}"),
+                };
+                crate::config::ProviderConfig {
+                    name: (*name).to_string(),
+                    command: (*name).to_string(),
+                    args: Vec::new(),
+                    interactive_args: Some(vec!["launch".to_string()]),
+                    resume: Some(crate::config::ResumeStrategy {
+                        kind: crate::config::ResumeKind::Flag,
+                        flag: Some("--resume".to_string()),
+                        subcommand: None,
+                    }),
+                    session_capture: None,
+                    resume_acceptance: None,
+                    session_storage,
+                }
+            })
+            .collect();
+        ModelConfig {
+            name: "migration-fixture".to_string(),
+            prompt_mode: PromptMode::Arg,
+            providers,
+            inputs: Vec::new(),
         }
-        ModelConfig::from_toml("migration-fixture", &body).unwrap()
     }
 
     fn resolved_for(model: &ModelConfig, provider_index: usize) -> crate::state::ResolvedResume {

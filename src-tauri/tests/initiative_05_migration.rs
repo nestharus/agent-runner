@@ -1,7 +1,10 @@
 #![cfg(unix)]
 
 use agent_runner_lib::balancer::TransitionReason;
-use agent_runner_lib::config::{ModelConfig, SessionSourceEntry, SessionsConfig};
+use agent_runner_lib::config::{
+    ModelConfig, PromptMode, ProviderConfig, ResumeKind, ResumeStrategy, SessionSourceEntry,
+    SessionStorage, SessionsConfig,
+};
 use agent_runner_lib::migration::{MigrationError, migrate_chain_segment};
 use agent_runner_lib::sessions::scan_provider;
 use agent_runner_lib::state::{ResolvedResume, SessionTurnIngest, StateDb};
@@ -94,6 +97,57 @@ impl Fixture {
             body.push_str(&format!("[{provider}]\n"));
             body.push('\n');
         }
+        fs::write(app_dir.join("providers.toml"), body).unwrap();
+    }
+
+    fn write_runtime_provider(&self, provider: &str, command: &Path) {
+        self.write_runtime_provider_with_storage(provider, command, None);
+    }
+
+    fn write_runtime_provider_with_storage(
+        &self,
+        provider: &str,
+        command: &Path,
+        storage: Option<(&str, &Path)>,
+    ) {
+        let app_dir = self.config_home.join("oulipoly-agent-runner");
+        fs::create_dir_all(&app_dir).unwrap();
+        let storage = storage
+            .map(|(kind, path)| match kind {
+                "claude_code" => format!(
+                    r#"
+[{provider}.session_storage]
+kind = "claude_code"
+projects_dir = "{}"
+"#,
+                    path.display()
+                ),
+                "codex" => format!(
+                    r#"
+[{provider}.session_storage]
+kind = "codex"
+sessions_dir = "{}"
+"#,
+                    path.display()
+                ),
+                other => panic!("unknown storage kind {other}"),
+            })
+            .unwrap_or_default();
+        let body = format!(
+            r#"
+[{provider}]
+command = "{}"
+args = ["-p"]
+interactive_args = ["launch"]
+prompt_mode = "arg"
+
+[{provider}.resume]
+kind = "flag"
+flag = "--resume"
+{storage}
+"#,
+            command.display()
+        );
         fs::write(app_dir.join("providers.toml"), body).unwrap();
     }
 
@@ -218,19 +272,53 @@ impl Fixture {
     }
 
     fn migration_model(&self, source_projects: &Path, target_projects: &Path) -> ModelConfig {
-        ModelConfig::from_toml(
-            "claude-opus",
-            &claude_migration_model_toml(source_projects, target_projects),
-        )
-        .unwrap()
+        ModelConfig {
+            name: "claude-opus".to_string(),
+            prompt_mode: PromptMode::Arg,
+            providers: vec![
+                runtime_provider(
+                    "claude",
+                    SessionStorage::ClaudeCode {
+                        projects_dir: source_projects.to_path_buf(),
+                    },
+                ),
+                runtime_provider(
+                    "claude2",
+                    SessionStorage::ClaudeCode {
+                        projects_dir: target_projects.to_path_buf(),
+                    },
+                ),
+            ],
+            inputs: Vec::new(),
+        }
     }
 
     fn codex_source_model(&self, codex_sessions: &Path, target_projects: &Path) -> ModelConfig {
-        ModelConfig::from_toml(
-            "codex-high",
-            &codex_source_model_toml(codex_sessions, target_projects),
-        )
-        .unwrap()
+        let mut codex = runtime_provider(
+            "codex",
+            SessionStorage::Codex {
+                sessions_dir: codex_sessions.to_path_buf(),
+            },
+        );
+        codex.resume = Some(ResumeStrategy {
+            kind: ResumeKind::Subcommand,
+            flag: None,
+            subcommand: Some(vec!["resume".to_string()]),
+        });
+        ModelConfig {
+            name: "codex-high".to_string(),
+            prompt_mode: PromptMode::Arg,
+            providers: vec![
+                codex,
+                runtime_provider(
+                    "claude",
+                    SessionStorage::ClaudeCode {
+                        projects_dir: target_projects.to_path_buf(),
+                    },
+                ),
+            ],
+            inputs: Vec::new(),
+        }
     }
 
     fn resolved(&self, model: &ModelConfig, provider_index: usize) -> ResolvedResume {
@@ -280,113 +368,41 @@ fn ok_provider_body() -> &'static str {
     "printf 'ok\n'"
 }
 
-fn claude_migration_model_toml(source_projects: &Path, target_projects: &Path) -> String {
-    format!(
-        r#"
-prompt_mode = "arg"
-
-[[providers]]
-name = "claude"
-command = "claude"
-interactive_args = ["launch"]
-
-[providers.resume]
-kind = "flag"
-flag = "--resume"
-
-[providers.session_storage]
-kind = "claude_code"
-projects_dir = "{}"
-
-[[providers]]
-name = "claude2"
-command = "claude2"
-interactive_args = ["launch"]
-
-[providers.resume]
-kind = "flag"
-flag = "--resume"
-
-[providers.session_storage]
-kind = "claude_code"
-projects_dir = "{}"
-"#,
-        source_projects.display(),
-        target_projects.display()
-    )
-}
-
-fn codex_source_model_toml(codex_sessions: &Path, target_projects: &Path) -> String {
-    format!(
-        r#"
-prompt_mode = "arg"
-
-[[providers]]
-name = "codex"
-command = "codex"
-interactive_args = ["launch"]
-
-[providers.resume]
-kind = "subcommand"
-subcommand = ["resume"]
-
-[providers.session_storage]
-kind = "codex"
-sessions_dir = "{}"
-
-[[providers]]
-name = "claude"
-command = "claude"
-interactive_args = ["launch"]
-
-[providers.resume]
-kind = "flag"
-flag = "--resume"
-
-[providers.session_storage]
-kind = "claude_code"
-projects_dir = "{}"
-"#,
-        codex_sessions.display(),
-        target_projects.display()
-    )
+fn runtime_provider(name: &str, session_storage: SessionStorage) -> ProviderConfig {
+    ProviderConfig {
+        name: name.to_string(),
+        command: name.to_string(),
+        args: Vec::new(),
+        interactive_args: Some(vec!["launch".to_string()]),
+        resume: Some(ResumeStrategy {
+            kind: ResumeKind::Flag,
+            flag: Some("--resume".to_string()),
+            subcommand: None,
+        }),
+        session_capture: None,
+        resume_acceptance: None,
+        session_storage: Some(session_storage),
+    }
 }
 
 fn single_resume_provider_model_toml(command: &Path) -> String {
-    format!(
-        r#"
-prompt_mode = "arg"
-
+    let _ = command;
+    r#"
 [[providers]]
 name = "claude"
-command = "{}"
-interactive_args = ["launch"]
-
-[providers.resume]
-kind = "flag"
-flag = "--resume"
-"#,
-        command.display()
-    )
+"#
+    .to_string()
 }
 
 fn resume_provider_with_model_flags_toml(command: &Path) -> String {
-    format!(
-        r#"
-prompt_mode = "arg"
-
+    let _ = command;
+    r#"
 [[providers]]
 name = "claude"
-command = "{}"
 args = ["-p", "--model", "opus"]
-interactive_args = ["launch", "-m", "opus"]
-
-[providers.resume]
-kind = "flag"
-flag = "--resume"
-"#,
-        command.display()
-    )
+interactive_args = ["-m", "opus"]
+"#
+    .to_string()
 }
 
 fn manual_migrate_cli_model_toml(
@@ -394,41 +410,15 @@ fn manual_migrate_cli_model_toml(
     source_projects: &Path,
     target_projects: &Path,
 ) -> String {
-    format!(
-        r#"
-prompt_mode = "arg"
-
+    let _ = (command, source_projects, target_projects);
+    r#"
 [[providers]]
 name = "claude"
-command = "{}"
-interactive_args = ["launch"]
-
-[providers.resume]
-kind = "flag"
-flag = "--resume"
-
-[providers.session_storage]
-kind = "claude_code"
-projects_dir = "{}"
 
 [[providers]]
 name = "claude2"
-command = "{}"
-interactive_args = ["launch"]
-
-[providers.resume]
-kind = "flag"
-flag = "--resume"
-
-[providers.session_storage]
-kind = "claude_code"
-projects_dir = "{}"
-"#,
-        command.display(),
-        source_projects.display(),
-        command.display(),
-        target_projects.display()
-    )
+"#
+    .to_string()
 }
 
 fn missing_source_locator_body(missing: &Path) -> String {
@@ -506,17 +496,12 @@ fn run_session_capture_chain_fixture() -> Fixture {
         fixture.write_session_appending_provider("session-writer.sh", &transcript_path, None);
     fixture.write_model(
         "claude-opus",
-        &format!(
-            r#"
-prompt_mode = "arg"
-
+        r#"
 [[providers]]
 name = "claude"
-command = "{}"
 "#,
-            script.display()
-        ),
     );
+    fixture.write_runtime_provider("claude", &script);
     fixture.write_sessions_config_from_transcript("claude", &transcript_path);
 
     let output = fixture
@@ -592,6 +577,7 @@ fn agent_resume_no_dash_m_uses_session_recorded_model() {
         Some(&argv_dump),
     );
     fixture.write_model("claude-opus", &single_resume_provider_model_toml(&script));
+    fixture.write_runtime_provider("claude", &script);
     fixture.write_sessions_config_from_transcript("claude", &transcript_path);
     let initial = fixture
         .command()
@@ -1219,6 +1205,7 @@ fn top_level_resume_without_model_succeeds_when_chain_exists() {
     let argv = fixture.dir.path().join("argv.txt");
     let script = fixture.write_script("provider.sh", &argv_dump_provider_body(&argv));
     fixture.write_model("claude-opus", &single_resume_provider_model_toml(&script));
+    fixture.write_runtime_provider("claude", &script);
     fixture.seed_active_chain(CHAIN_A, "claude", SESSION_A, "claude-opus");
 
     let output = fixture
@@ -1237,7 +1224,7 @@ fn top_level_resume_without_model_succeeds_when_chain_exists() {
 
 // risk: CLI surface; level: end-to-end; source: proposal §11.1 CLI surface / A8.
 #[test]
-fn run_resume_spawns_without_model_flag_when_model_none() {
+fn model_none_resume_uses_providers_toml_only() {
     let fixture = Fixture::new();
     let argv = fixture.dir.path().join("argv.txt");
     let script = fixture.write_script("provider.sh", &argv_dump_provider_body(&argv));
@@ -1245,6 +1232,7 @@ fn run_resume_spawns_without_model_flag_when_model_none() {
         "claude-opus",
         &resume_provider_with_model_flags_toml(&script),
     );
+    fixture.write_runtime_provider("claude", &script);
     fixture.seed_active_chain(CHAIN_A, "claude", SESSION_A, "<unknown>");
 
     let output = fixture
@@ -1273,6 +1261,36 @@ fn run_resume_spawns_without_model_flag_when_model_none() {
 
 // risk: CLI surface; level: end-to-end; source: proposal §11.1 CLI surface / A8.
 #[test]
+fn model_set_resume_combines_providers_and_model_args() {
+    let fixture = Fixture::new();
+    let argv = fixture.dir.path().join("argv.txt");
+    let script = fixture.write_script("provider.sh", &argv_dump_provider_body(&argv));
+    fixture.write_model(
+        "claude-opus",
+        &resume_provider_with_model_flags_toml(&script),
+    );
+    fixture.write_runtime_provider("claude", &script);
+    fixture.seed_active_chain(CHAIN_A, "claude", SESSION_A, "claude-opus");
+
+    let output = fixture
+        .command()
+        .arg("--resume")
+        .arg(SESSION_A)
+        .args(["--models-dir"])
+        .arg(&fixture.models_dir)
+        .arg("continue")
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    let argv = fs::read_to_string(argv).unwrap();
+    assert!(argv.contains("-p\n"), "{argv}");
+    assert!(argv.contains("--model\nopus\n"), "{argv}");
+    assert!(argv.contains("--resume\n"), "{argv}");
+}
+
+// risk: CLI surface; level: end-to-end; source: proposal §11.1 CLI surface / A8.
+#[test]
 fn run_repl_spawns_without_model_flag_when_model_none() {
     let fixture = Fixture::new();
     let argv = fixture.dir.path().join("argv.txt");
@@ -1281,6 +1299,7 @@ fn run_repl_spawns_without_model_flag_when_model_none() {
         "claude-opus",
         &resume_provider_with_model_flags_toml(&script),
     );
+    fixture.write_runtime_provider("claude", &script);
     fixture.seed_active_chain(CHAIN_A, "claude", SESSION_A, "<unknown>");
 
     let output = fixture
@@ -1311,6 +1330,47 @@ fn manual_migrate_flag_overrides_best_score_via_cli() {
         "claude-opus",
         &manual_migrate_cli_model_toml(&script, &source_projects, &target_projects),
     );
+    let app_dir = fixture.config_home.join("oulipoly-agent-runner");
+    fs::create_dir_all(&app_dir).unwrap();
+    fs::write(
+        app_dir.join("providers.toml"),
+        format!(
+            r#"
+[claude]
+command = "{}"
+args = []
+interactive_args = ["launch"]
+prompt_mode = "arg"
+
+[claude.resume]
+kind = "flag"
+flag = "--resume"
+
+[claude.session_storage]
+kind = "claude_code"
+projects_dir = "{}"
+
+[claude2]
+command = "{}"
+args = []
+interactive_args = ["launch"]
+prompt_mode = "arg"
+
+[claude2.resume]
+kind = "flag"
+flag = "--resume"
+
+[claude2.session_storage]
+kind = "claude_code"
+projects_dir = "{}"
+"#,
+            script.display(),
+            source_projects.display(),
+            script.display(),
+            target_projects.display()
+        ),
+    )
+    .unwrap();
     fixture.seed_active_chain(CHAIN_A, "claude", SESSION_A, "claude-opus");
     fixture.seed_turns("claude", SESSION_A, &[]);
 

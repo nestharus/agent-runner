@@ -23,7 +23,8 @@ Execute a shell command. Only these commands are allowed: which, type, claude, c
 ### write_config
 Write a configuration file. Only paths under ~/.config/oulipoly-agent-runner/ or ~/.local/bin/ are allowed.
 ```json
-{{"type": "write_config", "path": "~/.config/oulipoly-agent-runner/models/claude-sonnet.toml", "content": "command = \"claude\"\nargs = [\"-p\", \"--model\", \"sonnet\"]\nprompt_mode = \"stdin\"", "description": "Creating Claude Sonnet model config"}}
+{{"type": "write_config", "path": "~/.config/oulipoly-agent-runner/providers.toml", "content": "[claude]\ncommand = \"claude\"\nargs = [\"-p\"]\ninteractive_args = []\nprompt_mode = \"stdin\"", "description": "Creating Claude provider runtime config"}}
+{{"type": "write_config", "path": "~/.config/oulipoly-agent-runner/models/claude-sonnet.toml", "content": "[[providers]]\nname = \"claude\"\nargs = [\"--model\", \"sonnet\"]", "description": "Creating Claude Sonnet model config"}}
 ```
 
 ### test_integration
@@ -69,7 +70,8 @@ const RULES: &str = r#"## Rules
 3. Use "update_memory" to remember what you've configured for future sessions
 4. Use "test_integration" to verify configurations work before completing
 5. Model configs are TOML files in ~/.config/oulipoly-agent-runner/models/
-6. Model TOML format: command, args (array), prompt_mode ("stdin" or "arg"), optionally [[providers]] for multi-provider
+6. providers.toml owns runtime provider config: command, args, interactive_args, prompt_mode, resume/session blocks
+7. Model TOML format: [[providers]] entries with name plus model-specific args/interactive_args only
 7. Agent configs are Markdown files with YAML frontmatter in ~/.config/oulipoly-agent-runner/agents/
 8. When setup is complete, emit a "complete" action"#;
 

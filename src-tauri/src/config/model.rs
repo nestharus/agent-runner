@@ -9,6 +9,7 @@ pub struct ProviderConfig {
     /// Used as the key for per-account state like quota tracking.
     /// If omitted in TOML, derived from command+args via `derive_provider_name`.
     pub name: String,
+    #[serde(default)]
     pub command: String,
     pub args: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -58,6 +59,19 @@ impl ProviderConfig {
             );
         }
         Ok(())
+    }
+
+    pub fn model_provider(name: impl Into<String>, args: Vec<String>) -> Self {
+        Self {
+            name: name.into(),
+            command: String::new(),
+            args,
+            interactive_args: None,
+            resume: None,
+            session_capture: None,
+            resume_acceptance: None,
+            session_storage: None,
+        }
     }
 }
 
@@ -367,10 +381,11 @@ struct RawModelToml {
 struct RawProvider {
     #[serde(default)]
     name: Option<String>,
-    command: String,
+    command: Option<String>,
     args: Option<Vec<String>>,
     interactive_args: Option<Vec<String>>,
     resume: Option<ResumeStrategy>,
+    prompt_mode: Option<String>,
     session_capture: Option<SessionCapture>,
     resume_acceptance: Option<ResumeAcceptanceRules>,
     session_storage: Option<SessionStorage>,
@@ -395,13 +410,6 @@ struct RawInput {
     item_type: Option<String>,
     min_items: Option<usize>,
     max_items: Option<usize>,
-}
-
-fn parse_prompt_mode(s: &str) -> PromptMode {
-    match s {
-        "arg" => PromptMode::Arg,
-        _ => PromptMode::Stdin,
-    }
 }
 
 fn parse_input_type(raw: &RawInput) -> Result<InputType, String> {
@@ -479,60 +487,24 @@ impl ModelConfig {
 
         if self.providers.len() == 1 {
             let p = &self.providers[0];
-            out.push_str(&format!(
-                "command = \"{}\"\nargs = [{}]\nprompt_mode = \"{}\"\n",
-                p.command,
-                format_string_list(&p.args),
-                mode_str
-            ));
+            out.push_str("[[providers]]\n");
+            out.push_str(&format!("name = \"{}\"\n", p.name));
+            out.push_str(&format!("args = [{}]\n", format_string_list(&p.args)));
             append_optional_string_list(
                 &mut out,
                 "interactive_args",
                 p.interactive_args.as_deref(),
             );
-            append_resume_toml(&mut out, "resume", p.resume.as_ref());
-            append_session_capture_toml(&mut out, "session_capture", p.session_capture.as_ref());
-            append_resume_acceptance_toml(
-                &mut out,
-                "resume_acceptance",
-                p.resume_acceptance.as_ref(),
-            );
-            append_session_storage_toml(&mut out, "session_storage", p.session_storage.as_ref());
         } else {
-            out.push_str(&format!("prompt_mode = \"{}\"\n", mode_str));
+            let _ = mode_str;
             for p in &self.providers {
                 out.push_str("\n[[providers]]\n");
-                // Only emit an explicit name line when the stored name differs
-                // from what would be auto-derived — keeps round-trips stable
-                // while preserving any user-set disambiguation.
-                if p.name != derive_provider_name(&p.command, &p.args) {
-                    out.push_str(&format!("name = \"{}\"\n", p.name));
-                }
-                out.push_str(&format!(
-                    "command = \"{}\"\nargs = [{}]\n",
-                    p.command,
-                    format_string_list(&p.args)
-                ));
+                out.push_str(&format!("name = \"{}\"\n", p.name));
+                out.push_str(&format!("args = [{}]\n", format_string_list(&p.args)));
                 append_optional_string_list(
                     &mut out,
                     "interactive_args",
                     p.interactive_args.as_deref(),
-                );
-                append_resume_toml(&mut out, "providers.resume", p.resume.as_ref());
-                append_session_capture_toml(
-                    &mut out,
-                    "providers.session_capture",
-                    p.session_capture.as_ref(),
-                );
-                append_resume_acceptance_toml(
-                    &mut out,
-                    "providers.resume_acceptance",
-                    p.resume_acceptance.as_ref(),
-                );
-                append_session_storage_toml(
-                    &mut out,
-                    "providers.session_storage",
-                    p.session_storage.as_ref(),
                 );
             }
         }
@@ -608,7 +580,21 @@ impl ModelConfig {
         let raw: RawModelToml =
             toml::from_str(content).map_err(|e| format!("TOML parse error for {name}: {e}"))?;
 
-        let prompt_mode = parse_prompt_mode(raw.prompt_mode.as_deref().unwrap_or("stdin"));
+        if raw.command.is_some()
+            || raw.args.is_some()
+            || raw.interactive_args.is_some()
+            || raw.resume.is_some()
+            || raw.session_capture.is_some()
+            || raw.session_storage.is_some()
+            || raw.resume_acceptance.is_some()
+            || raw.prompt_mode.is_some()
+        {
+            return Err(format!(
+                "Old per-provider config detected in {name}.toml; run `agents migrate-config` to migrate."
+            ));
+        }
+
+        let prompt_mode = PromptMode::Stdin;
 
         let inputs = if let Some(raw_inputs) = raw.inputs {
             parse_inputs(raw_inputs)?
@@ -620,38 +606,36 @@ impl ModelConfig {
             providers
                 .into_iter()
                 .map(|p| {
+                    if p.command.is_some()
+                        || p.resume.is_some()
+                        || p.session_capture.is_some()
+                        || p.session_storage.is_some()
+                        || p.resume_acceptance.is_some()
+                        || p.prompt_mode.is_some()
+                    {
+                        return Err(format!(
+                            "Old per-provider config detected in {name}.toml; run `agents migrate-config` to migrate."
+                        ));
+                    }
                     let args = p.args.unwrap_or_default();
                     let name = p
                         .name
-                        .unwrap_or_else(|| derive_provider_name(&p.command, &args));
-                    ProviderConfig {
+                        .ok_or_else(|| format!("Model {name}: provider entry missing `name`"))?;
+                    Ok(ProviderConfig {
                         name,
-                        command: p.command,
+                        command: String::new(),
                         args,
                         interactive_args: p.interactive_args,
-                        resume: p.resume,
-                        session_capture: p.session_capture,
-                        resume_acceptance: p.resume_acceptance,
-                        session_storage: p.session_storage.map(SessionStorage::expand_tilde),
-                    }
+                        resume: None,
+                        session_capture: None,
+                        resume_acceptance: None,
+                        session_storage: None,
+                    })
                 })
-                .collect()
-        } else if let Some(command) = raw.command {
-            let args = raw.args.unwrap_or_default();
-            let name = derive_provider_name(&command, &args);
-            vec![ProviderConfig {
-                name,
-                command,
-                args,
-                interactive_args: raw.interactive_args,
-                resume: raw.resume,
-                session_capture: raw.session_capture,
-                resume_acceptance: raw.resume_acceptance,
-                session_storage: raw.session_storage.map(SessionStorage::expand_tilde),
-            }]
+                .collect::<Result<Vec<_>, String>>()?
         } else {
             return Err(format!(
-                "Model {name}: must have either 'command' or '[[providers]]'"
+                "Model {name}: must define at least one [[providers]] entry"
             ));
         };
 
@@ -694,110 +678,12 @@ impl ModelConfig {
     }
 }
 
-fn append_session_storage_toml(
-    out: &mut String,
-    table_name: &str,
-    storage: Option<&SessionStorage>,
-) {
-    let Some(storage) = storage else {
-        return;
-    };
-    out.push_str(&format!("\n[{table_name}]\n"));
-    match storage {
-        SessionStorage::ClaudeCode { projects_dir } => {
-            out.push_str("kind = \"claude_code\"\n");
-            out.push_str(&format!("projects_dir = \"{}\"\n", projects_dir.display()));
-        }
-        SessionStorage::Codex { sessions_dir } => {
-            out.push_str("kind = \"codex\"\n");
-            out.push_str(&format!("sessions_dir = \"{}\"\n", sessions_dir.display()));
-        }
-    }
-}
-
-fn append_resume_toml(out: &mut String, table_name: &str, resume: Option<&ResumeStrategy>) {
-    let Some(resume) = resume else {
-        return;
-    };
-
-    out.push('\n');
-    out.push_str(&format!("[{table_name}]\n"));
-    out.push_str(&format!(
-        "kind = \"{}\"\n",
-        match resume.kind {
-            ResumeKind::Flag => "flag",
-            ResumeKind::Subcommand => "subcommand",
-        }
-    ));
-    append_optional_string(out, "flag", resume.flag.as_deref());
-    append_optional_string_list(out, "subcommand", resume.subcommand.as_deref());
-}
-
-fn append_session_capture_toml(
-    out: &mut String,
-    table_name: &str,
-    capture: Option<&SessionCapture>,
-) {
-    let Some(capture) = capture else {
-        return;
-    };
-
-    out.push('\n');
-    out.push_str(&format!("[{table_name}]\n"));
-    out.push_str(&format!(
-        "kind = \"{}\"\n",
-        match capture.kind {
-            SessionCaptureKind::None => "none",
-            SessionCaptureKind::ForcedFlagVerified => "forced_flag_verified",
-            SessionCaptureKind::StdoutJsonEvent => "stdout_json_event",
-        }
-    ));
-    append_optional_string(out, "flag", capture.flag.as_deref());
-    append_optional_string_list(out, "readback_args", capture.readback_args.as_deref());
-    append_optional_string(out, "event_type", capture.event_type.as_deref());
-    append_optional_string(out, "event_id_path", capture.event_id_path.as_deref());
-    append_optional_string(out, "json_flag", capture.json_flag.as_deref());
-    append_optional_string(
-        out,
-        "last_message_flag",
-        capture.last_message_flag.as_deref(),
-    );
-}
-
-fn append_resume_acceptance_toml(
-    out: &mut String,
-    table_name: &str,
-    rules: Option<&ResumeAcceptanceRules>,
-) {
-    let Some(rules) = rules else {
-        return;
-    };
-    out.push('\n');
-    out.push_str(&format!("[{table_name}]\n"));
-    append_optional_string_list(
-        out,
-        "accepted_output_patterns",
-        rules.accepted_output_patterns.as_deref(),
-    );
-    append_optional_string_list(
-        out,
-        "rejected_output_patterns",
-        rules.rejected_output_patterns.as_deref(),
-    );
-}
-
 /// Render a Rust string as a TOML basic-string literal, escaping
 /// backslashes, quotes, and control characters per the TOML spec.
 /// Defers to the `toml` crate's serializer to avoid hand-rolling
 /// escape rules that drift from the spec.
 fn toml_string_literal(value: &str) -> String {
     toml::Value::String(value.to_string()).to_string()
-}
-
-fn append_optional_string(out: &mut String, key: &str, value: Option<&str>) {
-    if let Some(value) = value {
-        out.push_str(&format!("{key} = {}\n", toml_string_literal(value)));
-    }
 }
 
 fn append_optional_string_list(out: &mut String, key: &str, values: Option<&[String]>) {
@@ -912,820 +798,78 @@ mod tests {
     }
 
     #[test]
-    fn parse_single_provider() {
+    fn parse_model_provider_flags_only() {
         let toml = r#"
-command = "codex"
-args = ["exec", "-m", "gpt-5.3"]
-prompt_mode = "arg"
+[[providers]]
+name = "claude2"
+args = ["-p", "--model", "opus", "--output-format", "json"]
+interactive_args = ["--model", "opus"]
 "#;
-        let config = ModelConfig::from_toml("test", toml).unwrap();
-        assert_eq!(config.providers.len(), 1);
-        assert_eq!(config.providers[0].command, "codex");
-        assert_eq!(config.providers[0].args, vec!["exec", "-m", "gpt-5.3"]);
-        assert_eq!(config.prompt_mode, PromptMode::Arg);
-        assert!(config.inputs.is_empty());
+        let config = ModelConfig::from_toml("claude-opus", toml).unwrap();
+        let provider = &config.providers[0];
+
+        assert_eq!(provider.name, "claude2");
+        assert_eq!(provider.command, "");
+        assert_eq!(
+            provider.args,
+            ["-p", "--model", "opus", "--output-format", "json"]
+        );
+        assert_eq!(
+            provider.interactive_args.as_deref(),
+            Some(&["--model".to_string(), "opus".to_string()][..])
+        );
+        assert!(provider.resume.is_none());
+        assert!(provider.session_capture.is_none());
+        assert!(provider.session_storage.is_none());
     }
 
     #[test]
-    fn parse_multi_provider() {
-        let toml = r#"
-prompt_mode = "arg"
+    fn model_roundtrip_keeps_model_provider_fields_only() {
+        let original = r#"
+[[providers]]
+name = "claude"
+args = ["-p", "--model", "sonnet"]
 
 [[providers]]
-command = "codex"
-args = ["exec", "-m", "gpt-5.3-codex"]
+name = "claude2"
+args = ["-p", "--model", "opus"]
+interactive_args = ["--model", "opus"]
 
-[[providers]]
-command = "codex2"
-args = ["exec", "-m", "gpt-5.3-codex"]
+[[inputs]]
+name = "prompt"
+type = "string"
+default_input = true
 "#;
-        let config = ModelConfig::from_toml("test", toml).unwrap();
-        assert_eq!(config.providers.len(), 2);
-    }
+        let c1 = ModelConfig::from_toml("claude-opus", original).unwrap();
+        let rendered = c1.to_toml();
+        assert!(!rendered.contains("command ="));
+        assert!(!rendered.contains("prompt_mode"));
+        assert!(!rendered.contains("session_storage"));
 
-    #[test]
-    fn parse_defaults_to_stdin() {
-        let toml = r#"
-command = "claude"
-args = ["-p"]
-"#;
-        let config = ModelConfig::from_toml("test", toml).unwrap();
-        assert_eq!(config.prompt_mode, PromptMode::Stdin);
+        let c2 = ModelConfig::from_toml("claude-opus", &rendered).unwrap();
+        assert_eq!(c1.providers.len(), c2.providers.len());
+        assert_eq!(
+            c1.providers[1].interactive_args,
+            c2.providers[1].interactive_args
+        );
+        assert_eq!(c1.inputs.len(), c2.inputs.len());
     }
 
     #[test]
     fn rejects_no_providers() {
         let toml = r#"
-prompt_mode = "arg"
+[[inputs]]
+name = "prompt"
+type = "string"
 "#;
         assert!(ModelConfig::from_toml("test", toml).is_err());
-    }
-
-    /// `validate()` for ForcedFlagVerified must reject configs missing the
-    /// required `flag` field — otherwise `build_capture_plan` would silently
-    /// fall through to capture failure at execution time (V10).
-    #[test]
-    fn rejects_forced_flag_verified_without_flag() {
-        let toml = r#"
-prompt_mode = "arg"
-
-[[providers]]
-command = "claude"
-args = ["-p"]
-
-[providers.session_capture]
-kind = "forced_flag_verified"
-"#;
-        let err = ModelConfig::from_toml("test", toml).unwrap_err();
-        assert!(err.contains("`flag`"), "{err}");
-    }
-
-    /// Same V10 reasoning for StdoutJsonEvent's required fields.
-    #[test]
-    fn rejects_stdout_json_event_without_required_fields() {
-        let cases = [
-            (
-                "missing json_flag",
-                "`json_flag`",
-                r#"
-prompt_mode = "arg"
-
-[[providers]]
-command = "codex"
-args = ["exec"]
-
-[providers.session_capture]
-kind = "stdout_json_event"
-last_message_flag = "-o"
-event_type = "thread.started"
-event_id_path = "thread_id"
-"#,
-            ),
-            (
-                "missing last_message_flag",
-                "`last_message_flag`",
-                r#"
-prompt_mode = "arg"
-
-[[providers]]
-command = "codex"
-args = ["exec"]
-
-[providers.session_capture]
-kind = "stdout_json_event"
-json_flag = "--json"
-event_type = "thread.started"
-event_id_path = "thread_id"
-"#,
-            ),
-            (
-                "missing event_type",
-                "`event_type`",
-                r#"
-prompt_mode = "arg"
-
-[[providers]]
-command = "codex"
-args = ["exec"]
-
-[providers.session_capture]
-kind = "stdout_json_event"
-json_flag = "--json"
-last_message_flag = "-o"
-event_id_path = "thread_id"
-"#,
-            ),
-            (
-                "missing event_id_path",
-                "`event_id_path`",
-                r#"
-prompt_mode = "arg"
-
-[[providers]]
-command = "codex"
-args = ["exec"]
-
-[providers.session_capture]
-kind = "stdout_json_event"
-json_flag = "--json"
-last_message_flag = "-o"
-event_type = "thread.started"
-"#,
-            ),
-        ];
-        for (label, expected_substr, toml) in cases {
-            match ModelConfig::from_toml("test", toml) {
-                Ok(_) => panic!("{label}: expected validation failure, got Ok"),
-                Err(e) => assert!(
-                    e.contains(expected_substr),
-                    "{label}: error must mention {expected_substr}, got: {e}"
-                ),
-            }
-        }
-    }
-
-    #[test]
-    fn roundtrip_single_provider() {
-        let original = r#"
-command = "codex"
-args = ["exec", "-m", "gpt-5.3"]
-prompt_mode = "arg"
-"#;
-        let c1 = ModelConfig::from_toml("test", original).unwrap();
-        let c2 = ModelConfig::from_toml("test", &c1.to_toml()).unwrap();
-        assert_eq!(c1.providers[0].command, c2.providers[0].command);
-        assert_eq!(c1.providers[0].args, c2.providers[0].args);
-        assert_eq!(c1.prompt_mode, c2.prompt_mode);
-    }
-
-    #[test]
-    fn roundtrip_multi_provider() {
-        let original = r#"
-prompt_mode = "stdin"
-
-[[providers]]
-command = "codex"
-args = ["exec", "-m", "gpt-5.3-codex"]
-
-[[providers]]
-command = "codex2"
-args = ["exec", "-m", "gpt-5.3-codex"]
-"#;
-        let c1 = ModelConfig::from_toml("test", original).unwrap();
-        let c2 = ModelConfig::from_toml("test", &c1.to_toml()).unwrap();
-        assert_eq!(c1.providers.len(), c2.providers.len());
-        assert_eq!(c1.providers[0].command, c2.providers[0].command);
-        assert_eq!(c1.providers[1].command, c2.providers[1].command);
-    }
-
-    #[test]
-    fn roundtrip_model_with_interactive_args() {
-        let original = r#"
-prompt_mode = "arg"
-
-[[providers]]
-name = "claude-interactive"
-command = "env"
-args = ["-u", "CLAUDECODE", "claude2", "-p", "--model", "opus"]
-interactive_args = ["-u", "CLAUDECODE", "claude2", "--model", "opus"]
-"#;
-        let c1 = ModelConfig::from_toml("test", original).unwrap();
-        let c2 = ModelConfig::from_toml("test", &c1.to_toml()).unwrap();
-
-        assert_eq!(
-            c2.providers[0].interactive_args.as_deref(),
-            Some(
-                &[
-                    "-u".to_string(),
-                    "CLAUDECODE".to_string(),
-                    "claude2".to_string(),
-                    "--model".to_string(),
-                    "opus".to_string(),
-                ][..]
-            )
-        );
-    }
-
-    #[test]
-    fn roundtrip_model_without_interactive_args_keeps_none() {
-        let original = r#"
-prompt_mode = "arg"
-
-[[providers]]
-name = "claude-interactive"
-command = "claude"
-args = ["-p"]
-"#;
-        let c1 = ModelConfig::from_toml("test", original).unwrap();
-        let c2 = ModelConfig::from_toml("test", &c1.to_toml()).unwrap();
-
-        assert_eq!(c1.providers[0].interactive_args, None);
-        assert_eq!(c2.providers[0].interactive_args, None);
-    }
-
-    #[test]
-    fn rejects_empty_interactive_args_at_load_time() {
-        let toml = r#"
-prompt_mode = "arg"
-
-[[providers]]
-name = "claude-interactive"
-command = "claude"
-args = ["-p"]
-interactive_args = []
-"#;
-        let err = ModelConfig::from_toml("test", toml).unwrap_err();
-        assert!(err.contains("interactive_args"), "{err}");
-    }
-
-    #[test]
-    fn parse_canonical_claude_interactive_shape() {
-        let toml = r#"
-prompt_mode = "arg"
-
-[[providers]]
-name = "claude2"
-command = "env"
-args = ["-u", "CLAUDECODE", "claude2", "-p", "--model", "opus", "--dangerously-skip-permissions"]
-interactive_args = ["-u", "CLAUDECODE", "claude2", "--model", "opus", "--dangerously-skip-permissions"]
-"#;
-        let config = ModelConfig::from_toml("claude", toml).unwrap();
-        let provider = &config.providers[0];
-
-        assert_eq!(provider.name, "claude2");
-        assert_eq!(provider.command, "env");
-        assert_eq!(
-            provider.args,
-            vec![
-                "-u",
-                "CLAUDECODE",
-                "claude2",
-                "-p",
-                "--model",
-                "opus",
-                "--dangerously-skip-permissions",
-            ]
-        );
-        assert_eq!(
-            provider.interactive_args.as_deref(),
-            Some(
-                &[
-                    "-u".to_string(),
-                    "CLAUDECODE".to_string(),
-                    "claude2".to_string(),
-                    "--model".to_string(),
-                    "opus".to_string(),
-                    "--dangerously-skip-permissions".to_string(),
-                ][..]
-            )
-        );
-    }
-
-    #[test]
-    fn parse_canonical_codex_interactive_shape() {
-        let toml = r#"
-prompt_mode = "arg"
-
-[[providers]]
-name = "codex"
-command = "codex"
-args = ["exec", "--dangerously-bypass-approvals-and-sandbox", "-m", "gpt-5.4", "-c", "model_reasoning_effort=high"]
-interactive_args = ["--dangerously-bypass-approvals-and-sandbox", "-m", "gpt-5.4", "-c", "model_reasoning_effort=high"]
-"#;
-        let config = ModelConfig::from_toml("codex", toml).unwrap();
-        let provider = &config.providers[0];
-
-        assert_eq!(provider.name, "codex");
-        assert_eq!(provider.command, "codex");
-        assert_eq!(
-            provider.args,
-            vec![
-                "exec",
-                "--dangerously-bypass-approvals-and-sandbox",
-                "-m",
-                "gpt-5.4",
-                "-c",
-                "model_reasoning_effort=high",
-            ]
-        );
-        assert_eq!(
-            provider.interactive_args.as_deref(),
-            Some(
-                &[
-                    "--dangerously-bypass-approvals-and-sandbox".to_string(),
-                    "-m".to_string(),
-                    "gpt-5.4".to_string(),
-                    "-c".to_string(),
-                    "model_reasoning_effort=high".to_string(),
-                ][..]
-            )
-        );
-    }
-
-    #[test]
-    fn roundtrip_model_with_flag_resume_strategy() {
-        let original = r#"
-prompt_mode = "arg"
-
-[[providers]]
-name = "claude-account"
-command = "claude"
-args = ["-p"]
-interactive_args = ["--model", "opus"]
-
-[providers.resume]
-kind = "flag"
-flag = "--resume"
-"#;
-        let c1 = ModelConfig::from_toml("test", original).unwrap();
-        let c2 = ModelConfig::from_toml("test", &c1.to_toml()).unwrap();
-
-        let resume = c2.providers[0].resume.as_ref().unwrap();
-        assert_eq!(resume.kind, ResumeKind::Flag);
-        assert_eq!(resume.flag.as_deref(), Some("--resume"));
-        assert_eq!(resume.subcommand, None);
-    }
-
-    #[test]
-    fn roundtrip_model_with_subcommand_resume_strategy() {
-        let original = r#"
-prompt_mode = "arg"
-
-[[providers]]
-name = "codex"
-command = "codex"
-args = ["exec", "-m", "gpt-5.4"]
-interactive_args = ["-m", "gpt-5.4"]
-
-[providers.resume]
-kind = "subcommand"
-subcommand = ["resume"]
-"#;
-        let c1 = ModelConfig::from_toml("test", original).unwrap();
-        let c2 = ModelConfig::from_toml("test", &c1.to_toml()).unwrap();
-
-        let resume = c2.providers[0].resume.as_ref().unwrap();
-        assert_eq!(resume.kind, ResumeKind::Subcommand);
-        assert_eq!(resume.flag, None);
-        assert_eq!(
-            resume.subcommand.as_deref(),
-            Some(&["resume".to_string()][..])
-        );
-    }
-
-    #[test]
-    fn rejects_flag_resume_without_flag() {
-        let toml = r#"
-prompt_mode = "arg"
-
-[[providers]]
-command = "claude"
-args = ["-p"]
-interactive_args = ["--model", "opus"]
-
-[providers.resume]
-kind = "flag"
-"#;
-        let err = ModelConfig::from_toml("test", toml).unwrap_err();
-        assert!(err.contains("`flag`"), "{err}");
-    }
-
-    #[test]
-    fn rejects_flag_resume_with_subcommand() {
-        let toml = r#"
-prompt_mode = "arg"
-
-[[providers]]
-command = "claude"
-args = ["-p"]
-interactive_args = ["--model", "opus"]
-
-[providers.resume]
-kind = "flag"
-flag = "--resume"
-subcommand = ["resume"]
-"#;
-        let err = ModelConfig::from_toml("test", toml).unwrap_err();
-        assert!(err.contains("subcommand"), "{err}");
-    }
-
-    #[test]
-    fn rejects_subcommand_resume_without_subcommand() {
-        let toml = r#"
-prompt_mode = "arg"
-
-[[providers]]
-command = "codex"
-args = ["exec"]
-interactive_args = ["-m", "gpt-5.4"]
-
-[providers.resume]
-kind = "subcommand"
-"#;
-        let err = ModelConfig::from_toml("test", toml).unwrap_err();
-        assert!(err.contains("subcommand"), "{err}");
-    }
-
-    #[test]
-    fn rejects_subcommand_resume_with_empty_subcommand() {
-        let toml = r#"
-prompt_mode = "arg"
-
-[[providers]]
-command = "codex"
-args = ["exec"]
-interactive_args = ["-m", "gpt-5.4"]
-
-[providers.resume]
-kind = "subcommand"
-subcommand = []
-"#;
-        let err = ModelConfig::from_toml("test", toml).unwrap_err();
-        assert!(err.contains("subcommand"), "{err}");
-    }
-
-    #[test]
-    fn rejects_subcommand_resume_with_flag() {
-        let toml = r#"
-prompt_mode = "arg"
-
-[[providers]]
-command = "codex"
-args = ["exec"]
-interactive_args = ["-m", "gpt-5.4"]
-
-[providers.resume]
-kind = "subcommand"
-flag = "--resume"
-subcommand = ["resume"]
-"#;
-        let err = ModelConfig::from_toml("test", toml).unwrap_err();
-        assert!(err.contains("flag"), "{err}");
-    }
-
-    #[test]
-    fn parse_canonical_claude_resume_shape() {
-        let toml = r#"
-prompt_mode = "arg"
-
-[[providers]]
-name = "claude2"
-command = "env"
-args = ["-u", "CLAUDECODE", "claude2", "-p", "--model", "opus", "--dangerously-skip-permissions"]
-interactive_args = ["-u", "CLAUDECODE", "claude2", "--model", "opus", "--dangerously-skip-permissions"]
-
-[providers.resume]
-kind = "flag"
-flag = "--resume"
-"#;
-        let config = ModelConfig::from_toml("claude", toml).unwrap();
-        let provider = &config.providers[0];
-        let resume = provider.resume.as_ref().unwrap();
-
-        assert_eq!(provider.name, "claude2");
-        assert_eq!(resume.kind, ResumeKind::Flag);
-        assert_eq!(resume.flag.as_deref(), Some("--resume"));
-        assert_eq!(resume.subcommand, None);
-    }
-
-    #[test]
-    fn parse_canonical_codex_resume_shape() {
-        let toml = r#"
-prompt_mode = "arg"
-
-[[providers]]
-name = "codex"
-command = "codex"
-args = ["exec", "--dangerously-bypass-approvals-and-sandbox", "-m", "gpt-5.4", "-c", "model_reasoning_effort=high"]
-interactive_args = ["--dangerously-bypass-approvals-and-sandbox", "-m", "gpt-5.4", "-c", "model_reasoning_effort=high"]
-
-[providers.resume]
-kind = "subcommand"
-subcommand = ["resume"]
-"#;
-        let config = ModelConfig::from_toml("codex", toml).unwrap();
-        let provider = &config.providers[0];
-        let resume = provider.resume.as_ref().unwrap();
-
-        assert_eq!(provider.name, "codex");
-        assert_eq!(resume.kind, ResumeKind::Subcommand);
-        assert_eq!(resume.flag, None);
-        assert_eq!(
-            resume.subcommand.as_deref(),
-            Some(&["resume".to_string()][..])
-        );
-    }
-
-    #[test]
-    fn parse_provider_with_forced_flag_verified_session_capture() {
-        let toml = r#"
-prompt_mode = "arg"
-
-[[providers]]
-command = "claude"
-args = ["-p"]
-
-[providers.session_capture]
-kind = "forced_flag_verified"
-flag = "--session-id"
-readback_args = ["--verbose", "--output-format", "stream-json"]
-"#;
-        let config = ModelConfig::from_toml("test", toml).unwrap();
-        let capture = config.providers[0].session_capture.as_ref().unwrap();
-
-        assert_eq!(capture.kind, SessionCaptureKind::ForcedFlagVerified);
-        assert_eq!(capture.flag.as_deref(), Some("--session-id"));
-        assert_eq!(
-            capture.readback_args.as_deref(),
-            Some(
-                [
-                    "--verbose".to_string(),
-                    "--output-format".to_string(),
-                    "stream-json".to_string(),
-                ]
-                .as_slice()
-            )
-        );
-        assert_eq!(capture.event_type, None);
-        assert_eq!(capture.event_id_path, None);
-    }
-
-    #[test]
-    fn parse_provider_with_stdout_json_event_session_capture() {
-        let toml = r#"
-prompt_mode = "arg"
-
-[[providers]]
-command = "codex"
-args = ["exec"]
-
-[providers.session_capture]
-kind = "stdout_json_event"
-json_flag = "--json"
-last_message_flag = "-o"
-event_type = "thread.started"
-event_id_path = "thread_id"
-"#;
-        let config = ModelConfig::from_toml("test", toml).unwrap();
-        let capture = config.providers[0].session_capture.as_ref().unwrap();
-
-        assert_eq!(capture.kind, SessionCaptureKind::StdoutJsonEvent);
-        assert_eq!(capture.json_flag.as_deref(), Some("--json"));
-        assert_eq!(capture.last_message_flag.as_deref(), Some("-o"));
-        assert_eq!(capture.event_type.as_deref(), Some("thread.started"));
-        assert_eq!(capture.event_id_path.as_deref(), Some("thread_id"));
-        assert_eq!(capture.flag, None);
-        assert_eq!(capture.readback_args, None);
-    }
-
-    #[test]
-    fn roundtrip_model_with_session_capture() {
-        let original = r#"
-prompt_mode = "arg"
-
-[[providers]]
-name = "codex-account"
-command = "codex"
-args = ["exec"]
-
-[providers.session_capture]
-kind = "stdout_json_event"
-json_flag = "--json"
-last_message_flag = "-o"
-event_type = "thread.started"
-event_id_path = "thread_id"
-"#;
-        let c1 = ModelConfig::from_toml("test", original).unwrap();
-        let c2 = ModelConfig::from_toml("test", &c1.to_toml()).unwrap();
-
-        assert_eq!(
-            c2.providers[0].session_capture.as_ref().unwrap().kind,
-            SessionCaptureKind::StdoutJsonEvent
-        );
-        assert_eq!(
-            c2.providers[0]
-                .session_capture
-                .as_ref()
-                .unwrap()
-                .event_type
-                .as_deref(),
-            Some("thread.started")
-        );
-        assert_eq!(
-            c2.providers[0]
-                .session_capture
-                .as_ref()
-                .unwrap()
-                .last_message_flag
-                .as_deref(),
-            Some("-o")
-        );
-    }
-
-    /// kind = "none" round-trip: parses cleanly, requires no extra
-    /// fields, validate() accepts it.
-    #[test]
-    fn parse_and_roundtrip_kind_none() {
-        let toml = r#"
-prompt_mode = "arg"
-
-[[providers]]
-command = "claude"
-args = ["-p"]
-
-[providers.session_capture]
-kind = "none"
-"#;
-        let c1 = ModelConfig::from_toml("test", toml).unwrap();
-        let capture = c1.providers[0].session_capture.as_ref().unwrap();
-        assert_eq!(capture.kind, SessionCaptureKind::None);
-        assert!(capture.flag.is_none());
-
-        let c2 = ModelConfig::from_toml("test", &c1.to_toml()).unwrap();
-        assert_eq!(
-            c2.providers[0].session_capture.as_ref().unwrap().kind,
-            SessionCaptureKind::None
-        );
-    }
-
-    /// Forced-flag round-trip — the existing tests only round-trip the
-    /// stdout_json_event variant. Cover the FFV variant explicitly.
-    #[test]
-    fn roundtrip_model_with_forced_flag_verified_session_capture() {
-        let original = r#"
-prompt_mode = "arg"
-
-[[providers]]
-name = "claude-account"
-command = "claude"
-args = ["-p"]
-
-[providers.session_capture]
-kind = "forced_flag_verified"
-flag = "--session-id"
-readback_args = ["--verbose", "--output-format", "stream-json"]
-"#;
-        let c1 = ModelConfig::from_toml("test", original).unwrap();
-        let c2 = ModelConfig::from_toml("test", &c1.to_toml()).unwrap();
-
-        let capture = c2.providers[0].session_capture.as_ref().unwrap();
-        assert_eq!(capture.kind, SessionCaptureKind::ForcedFlagVerified);
-        assert_eq!(capture.flag.as_deref(), Some("--session-id"));
-        assert_eq!(
-            capture.readback_args.as_deref(),
-            Some(
-                &[
-                    "--verbose".to_string(),
-                    "--output-format".to_string(),
-                    "stream-json".to_string()
-                ][..]
-            )
-        );
-    }
-
-    /// Unknown `kind` must be rejected — protects against typos like
-    /// `forced_flag` or `json_event` that would silently disable
-    /// capture if accepted as None.
-    #[test]
-    fn rejects_unknown_session_capture_kind() {
-        let toml = r#"
-prompt_mode = "arg"
-
-[[providers]]
-command = "claude"
-args = ["-p"]
-
-[providers.session_capture]
-kind = "magic_capture"
-flag = "--session-id"
-"#;
-        assert!(
-            ModelConfig::from_toml("test", toml).is_err(),
-            "unknown session_capture.kind must be rejected"
-        );
-    }
-
-    /// Provider without a `session_capture` block has `None` — the
-    /// behavior `pr-a` callers depend on for the no-capture path.
-    #[test]
-    fn absent_session_capture_is_none() {
-        let toml = r#"
-command = "claude"
-args = ["-p"]
-"#;
-        let cfg = ModelConfig::from_toml("test", toml).unwrap();
-        assert_eq!(cfg.providers.len(), 1);
-        assert!(cfg.providers[0].session_capture.is_none());
-    }
-
-    #[test]
-    fn parse_model_with_flagged_inputs() {
-        let toml = r#"
-command = "atlas-image"
-prompt_mode = "stdin"
-
-[[inputs]]
-name = "prompt"
-type = "string"
-required = true
-default_input = true
-
-[[inputs]]
-name = "size"
-type = "enum"
-flag = "--size"
-options = ["2048*2048", "1024*1024"]
-default = "2048*2048"
-description = "Image size"
-
-[[inputs]]
-name = "duration"
-type = "integer"
-flag = "--duration"
-min = 5.0
-max = 10.0
-default = 5
-"#;
-        let config = ModelConfig::from_toml("test", toml).unwrap();
-        assert_eq!(config.inputs.len(), 3);
-        assert!(config.default_input().is_some());
-
-        let size = &config.inputs[1];
-        assert_eq!(size.flag.as_deref(), Some("--size"));
-        assert!(matches!(&size.input_type, InputType::Enum { options } if options.len() == 2));
-
-        let duration = &config.inputs[2];
-        assert_eq!(duration.flag.as_deref(), Some("--duration"));
-        match &duration.input_type {
-            InputType::Integer { min, max } => {
-                assert_eq!(*min, Some(5));
-                assert_eq!(*max, Some(10));
-            }
-            _ => panic!("Expected integer type"),
-        }
-    }
-
-    #[test]
-    fn parse_model_with_array_input() {
-        let toml = r#"
-command = "atlas-edit"
-prompt_mode = "stdin"
-
-[[inputs]]
-name = "prompt"
-type = "string"
-required = true
-default_input = true
-
-[[inputs]]
-name = "images"
-type = "array"
-flag = "--image"
-item_type = "string"
-required = true
-min_items = 1
-max_items = 14
-"#;
-        let config = ModelConfig::from_toml("test", toml).unwrap();
-        let images = &config.inputs[1];
-        assert_eq!(images.flag.as_deref(), Some("--image"));
-        match &images.input_type {
-            InputType::Array {
-                min_items,
-                max_items,
-                ..
-            } => {
-                assert_eq!(*min_items, Some(1));
-                assert_eq!(*max_items, Some(14));
-            }
-            _ => panic!("Expected array type"),
-        }
     }
 
     #[test]
     fn rejects_duplicate_default_input() {
         let toml = r#"
-command = "test"
+[[providers]]
+name = "test"
 
 [[inputs]]
 name = "a"
@@ -1744,7 +888,8 @@ default_input = true
     #[test]
     fn rejects_enum_without_options() {
         let toml = r#"
-command = "test"
+[[providers]]
+name = "test"
 
 [[inputs]]
 name = "format"
@@ -1755,215 +900,31 @@ type = "enum"
     }
 
     #[test]
-    fn roundtrip_model_with_inputs() {
+    fn config_load_rejects_old_per_provider_blocks_in_model_toml() {
         let toml = r#"
-command = "atlas-image"
-prompt_mode = "stdin"
-
-[[inputs]]
-name = "prompt"
-type = "string"
-required = true
-default_input = true
-
-[[inputs]]
-name = "size"
-type = "enum"
-flag = "--size"
-options = ["2048*2048", "1024*1024"]
-default = "2048*2048"
-"#;
-        let c1 = ModelConfig::from_toml("test", toml).unwrap();
-        let c2 = ModelConfig::from_toml("test", &c1.to_toml()).unwrap();
-        assert_eq!(c1.inputs.len(), c2.inputs.len());
-        assert_eq!(c1.inputs[0].name, c2.inputs[0].name);
-        assert_eq!(c1.inputs[1].flag, c2.inputs[1].flag);
-    }
-
-    #[test]
-    fn roundtrip_model_with_resume_acceptance_patterns() {
-        let original = r#"
-prompt_mode = "arg"
-
 [[providers]]
-name = "claude-account"
-command = "claude"
-args = ["-p", "--output-format", "stream-json", "--verbose"]
-interactive_args = ["--model", "opus"]
+name = "claude2"
+command = "env"
+args = ["-u", "CLAUDECODE", "claude2", "-p", "--model", "opus"]
+prompt_mode = "stdin"
 
 [providers.resume]
 kind = "flag"
 flag = "--resume"
-
-[providers.resume_acceptance]
-accepted_output_patterns = ["\"session_id\":\"{session_id}\""]
-rejected_output_patterns = ["No conversation found", "Invalid resume"]
 "#;
-        let c1 = ModelConfig::from_toml("test", original).unwrap();
-        let c2 = ModelConfig::from_toml("test", &c1.to_toml()).unwrap();
-        let rules = c2.providers[0].resume_acceptance.as_ref().unwrap();
-        assert_eq!(
-            rules.accepted_output_patterns.as_deref(),
-            Some(&["\"session_id\":\"{session_id}\"".to_string()][..])
-        );
-        assert_eq!(
-            rules.rejected_output_patterns.as_deref(),
-            Some(
-                &[
-                    "No conversation found".to_string(),
-                    "Invalid resume".to_string()
-                ][..]
-            )
-        );
+        let err = ModelConfig::from_toml("claude-opus", toml).unwrap_err();
+        assert!(err.contains("Old per-provider config detected in claude-opus.toml"));
+        assert!(err.contains("agents migrate-config"));
     }
 
     #[test]
-    fn committed_resume_example_models_parse() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        for rel in [
-            "examples/models/claude-resume.toml",
-            "examples/models/codex-resume.toml",
-        ] {
-            let path = root.join(rel);
-            let content = std::fs::read_to_string(&path).unwrap();
-            let name = path.file_stem().unwrap().to_string_lossy();
-            ModelConfig::from_toml(&name, &content)
-                .unwrap_or_else(|err| panic!("{} should parse: {err}", path.display()));
-        }
-    }
-
-    fn test_provider_with_session_storage(kind: &str, field: &str, path: &str) -> String {
-        format!(
-            r#"
-prompt_mode = "arg"
-
-[[providers]]
-name = "stored-provider"
+    fn old_top_level_model_config_is_rejected() {
+        let toml = r#"
 command = "claude"
-
-[providers.session_storage]
-kind = "{kind}"
-{field} = "{path}"
-"#
-        )
-    }
-
-    fn config_kind_resume_toml() -> &'static str {
-        r#"
-prompt_mode = "arg"
-
-[[providers]]
-name = "codex"
-command = "codex"
-
-[providers.resume]
-kind = "config"
-key = "experimental_resume"
-"#
-    }
-
-    fn resume_without_interactive_args_toml(kind: &str, field: &str) -> String {
-        format!(
-            r#"
-prompt_mode = "arg"
-
-[[providers]]
-name = "claude"
-command = "claude"
-
-[providers.resume]
-kind = "{kind}"
-{field}
-"#
-        )
-    }
-
-    // risk: Resume strategy compatibility; level: unit; source: proposal §11.1 Resume strategy compatibility / A1, A7.
-    #[test]
-    fn compose_resume_args_rejects_config_kind() {
-        let err = ModelConfig::from_toml("codex-invalid", config_kind_resume_toml()).unwrap_err();
-
-        assert!(err.contains("config"), "{err}");
-    }
-
-    // risk: Resume strategy compatibility; level: unit; source: proposal §11.1 Resume strategy compatibility / A1, A7.
-    #[test]
-    fn flag_resume_requires_interactive_args() {
-        let toml = resume_without_interactive_args_toml("flag", r#"flag = "--resume""#);
-
-        let err = ModelConfig::from_toml("flag-without-interactive", &toml).unwrap_err();
-
-        assert!(err.contains("interactive_args"), "{err}");
-    }
-
-    // risk: Resume strategy compatibility; level: unit; source: proposal §11.1 Resume strategy compatibility / A1, A7.
-    #[test]
-    fn subcommand_resume_requires_interactive_args() {
-        let toml = resume_without_interactive_args_toml("subcommand", r#"subcommand = ["resume"]"#);
-
-        let err = ModelConfig::from_toml("subcommand-without-interactive", &toml).unwrap_err();
-
-        assert!(err.contains("interactive_args"), "{err}");
-    }
-
-    // risk: Resume strategy compatibility; level: unit; source: proposal §11.1 Resume strategy compatibility / A1, A7.
-    #[test]
-    fn session_storage_parses_claude_code_and_codex() {
-        let claude = ModelConfig::from_toml(
-            "claude-storage",
-            &test_provider_with_session_storage(
-                "claude_code",
-                "projects_dir",
-                "/tmp/claude/projects",
-            ),
-        )
-        .unwrap();
-        let codex = ModelConfig::from_toml(
-            "codex-storage",
-            &test_provider_with_session_storage("codex", "sessions_dir", "/tmp/codex/sessions"),
-        )
-        .unwrap();
-
-        assert!(matches!(
-            claude.providers[0].session_storage,
-            Some(SessionStorage::ClaudeCode { ref projects_dir }) if projects_dir.ends_with("projects")
-        ));
-        assert!(matches!(
-            codex.providers[0].session_storage,
-            Some(SessionStorage::Codex { ref sessions_dir }) if sessions_dir.ends_with("sessions")
-        ));
-    }
-
-    // risk: Session storage path resolution; level: unit; source: proposal §11.2 session_storage_expands_tilde_in_projects_dir / A1.
-    #[test]
-    fn session_storage_expands_tilde_in_projects_dir() {
-        let Some(home) = dirs::home_dir() else {
-            return;
-        };
-        let claude = ModelConfig::from_toml(
-            "claude-storage-tilde",
-            &test_provider_with_session_storage(
-                "claude_code",
-                "projects_dir",
-                "~/.claude/projects",
-            ),
-        )
-        .unwrap();
-        let codex = ModelConfig::from_toml(
-            "codex-storage-tilde",
-            &test_provider_with_session_storage("codex", "sessions_dir", "~/.codex/sessions"),
-        )
-        .unwrap();
-
-        assert!(matches!(
-            claude.providers[0].session_storage,
-            Some(SessionStorage::ClaudeCode { ref projects_dir })
-                if projects_dir == &home.join(".claude/projects")
-        ));
-        assert!(matches!(
-            codex.providers[0].session_storage,
-            Some(SessionStorage::Codex { ref sessions_dir })
-                if sessions_dir == &home.join(".codex/sessions")
-        ));
+args = ["-p", "--model", "opus"]
+prompt_mode = "stdin"
+"#;
+        let err = ModelConfig::from_toml("claude-opus", toml).unwrap_err();
+        assert!(err.contains("agents migrate-config"));
     }
 }

@@ -69,6 +69,41 @@ pub fn execute(
     })
 }
 
+pub struct EffectiveExecuteRequest<'a> {
+    pub model: &'a ModelConfig,
+    pub provider: &'a ProviderConfig,
+    pub provider_index: usize,
+    pub prompt_mode: PromptMode,
+    pub prompt: &'a str,
+    pub working_dir: Option<&'a Path>,
+    pub extra_inputs: &'a HashMap<String, Vec<String>>,
+    pub parent_invocation_env: Option<&'a str>,
+}
+
+pub fn execute_effective(request: EffectiveExecuteRequest<'_>) -> Result<ExecutionResult, String> {
+    let input_args = resolve_input_flags(request.model, request.extra_inputs)?;
+    let (result, temp_files) = execute_provider(
+        request.provider,
+        request.prompt_mode,
+        request.prompt,
+        request.working_dir,
+        &input_args,
+        request.parent_invocation_env,
+    )?;
+    for path in temp_files {
+        let _ = std::fs::remove_file(path);
+    }
+
+    Ok(ExecutionResult {
+        stdout: result.stdout,
+        stderr: result.stderr,
+        exit_code: result.exit_code,
+        provider_index: request.provider_index,
+        session_capture: result.session_capture,
+        resume_acceptance: None,
+    })
+}
+
 /// Map user-provided inputs to CLI flag arguments based on the model's input schema.
 fn resolve_input_flags(
     model: &ModelConfig,

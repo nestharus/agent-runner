@@ -1,6 +1,6 @@
 # 1. Scope statement (Rev 5)
 
-Initiative 05 introduces a session-chain abstraction that decouples conversation identity from the upstream provider's session_id, so a single logical conversation can move across provider accounts (e.g. `claude` → `claude2`) without renaming or losing history. The PR adds two SQLite tables (`session_chains`, `session_chain_segments`), one per-provider config block (`[providers.session_storage]`), a Claude-Code transcript-copy step in the executor, a best-on-resume policy keyed off initiative 04's projection scoring, and lifts `--resume`'s `--model` requirement by inferring the model from the chain's invocation history. This ships as one PR because chain identity, the resolver, and the Claude migration mechanic are mutually dependent: schema, write paths, resolver, executor, and CLI all participate in the same data flow; splitting them produces dead intermediate code with the same shape as the rejected splits in initiative 04.
+Initiative 05 introduces a session-chain abstraction that decouples conversation identity from the upstream provider's session_id, so a single logical conversation can move across provider accounts (e.g. `claude` → `claude2`) without renaming or losing history. The PR adds two SQLite tables (`session_chains`, `session_chain_segments`), per-provider runtime config in `providers.toml`, a Claude-Code transcript-copy step in the executor, a best-on-resume policy keyed off initiative 04's projection scoring, and lifts `--resume`'s `--model` requirement by inferring the model from the chain's invocation history or falling through to provider-only spawn. This ships as one PR because chain identity, the resolver, and the Claude migration mechanic are mutually dependent: schema, write paths, resolver, executor, and CLI all participate in the same data flow; splitting them produces dead intermediate code with the same shape as the rejected splits in initiative 04.
 
 Initiative 05 depends on initiative 04 — the migration trigger reads `provider_quotas.exhausted_at` and reuses initiative 04's per-window projection. Land 04 first.
 
@@ -508,9 +508,42 @@ UI sessions get the same ergonomics without runner-side model inference: a user 
 
 # 9. Provider config
 
-## 9.1 `[providers.session_storage]` (per-provider, in model TOML)
+## 9.1 Provider runtime config in `providers.toml`
 
-New optional block per provider in model TOML. Parsed in `src-tauri/src/config/model.rs` alongside existing `[providers.resume]` and `[providers.session_capture]` blocks.
+Per-provider runtime config lives in `~/.config/oulipoly-agent-runner/providers.toml`, keyed by provider/account name. Model TOMLs do not carry command, prompt, resume, capture, acceptance, or storage config.
+
+```toml
+[claude2]
+quota_script         = "anthropic-usage ~/.claude2/.credentials.json"
+auth_refresh_command = "claude auth status"
+command              = "env"
+args                 = ["-u", "CLAUDECODE", "claude2", "--dangerously-skip-permissions"]
+interactive_args     = ["-u", "CLAUDECODE", "claude2", "--dangerously-skip-permissions"]
+prompt_mode          = "stdin"
+
+[claude2.resume]
+kind = "flag"
+flag = "--resume"
+
+[claude2.session_capture]
+kind = "forced_flag_verified"
+flag = "--session-id"
+
+[claude2.session_storage]
+kind = "claude_code"
+projects_dir = "~/.claude2/projects"
+
+[claude2.resume_acceptance]
+accepted_output_patterns = ["\"session_id\":\"{session_id}\""]
+```
+
+Spawn composition:
+
+- With a model: `providers[name].command + providers[name].args + model.providers[name].args + resume_args`.
+- Without a model: `providers[name].command + providers[name].args + resume_args`; no model TOML is consulted.
+- REPL uses `interactive_args` on both sides with the same provider-first ordering.
+
+Session storage is parsed from `providers.toml`:
 
 ```rust
 pub enum SessionStorage {
@@ -519,12 +552,12 @@ pub enum SessionStorage {
 }
 ```
 
-Parse via tagged union with `kind = "claude_code" | "codex"`. Path fields use `~` expansion (matches existing quota/turn script convention).
+Parse via tagged union with `kind = "claude_code" | "codex"`. Path fields use `~` expansion.
 
 Claude-Code storage example:
 
 ```toml
-[providers.session_storage]
+[claude2.session_storage]
 kind         = "claude_code"
 projects_dir = "~/.claude2/projects"
 ```
@@ -532,7 +565,7 @@ projects_dir = "~/.claude2/projects"
 Codex storage example:
 
 ```toml
-[providers.session_storage]
+[codex.session_storage]
 kind         = "codex"
 sessions_dir = "~/.codex2/sessions"
 ```
@@ -544,7 +577,22 @@ Validation at config load:
 - Two `kind = "claude_code"` providers in the same model pool must not declare the same `projects_dir` (would cause source-equals-target collisions during migration). Reject at config load.
 - `kind = "codex"` providers are not validated against migration-target-pair uniqueness in v1 because they do not participate in the migration mechanic.
 
-Providers without `[providers.session_storage]` cannot be migration targets. Providers with `kind = "codex"` also cannot be migration targets in v1; their storage declaration is identity-only. A Claude-Code provider can still be the source of an outbound migration **only** if the runner can locate the source JSONL via convention — but for v1, **require both source and target Claude-Code providers to declare storage**. Simplifies the resolver and guarantees deterministic failure modes.
+Providers without session storage cannot be migration targets. Providers with `kind = "codex"` also cannot be migration targets in v1; their storage declaration is identity-only. A Claude-Code provider can still be the source of an outbound migration **only** if the runner can locate the source JSONL via convention — but for v1, **require both source and target Claude-Code providers to declare storage**. Simplifies the resolver and guarantees deterministic failure modes.
+
+## 9.2 Model TOML provider entries are model flags only
+
+Each model TOML provider entry contains the provider name and model-specific flags only:
+
+```toml
+[[providers]]
+name = "claude2"
+args = ["-p", "--model", "opus", "--output-format", "json"]
+interactive_args = ["--model", "opus"]
+```
+
+Config load rejects old per-provider blocks in model TOMLs with: `Old per-provider config detected in <file>; run agents migrate-config to migrate.`
+
+`agents migrate-config` lifts old runtime blocks into `providers.toml`, rewrites model TOMLs to the reduced shape, aborts on conflicting per-provider runtime declarations, and is idempotent.
 
 ## 9.1.1 Turn-script adapter contract: `is_compaction_boundary`
 
@@ -660,7 +708,7 @@ Unit tests (Rust, `#[test]`):
 - `migration_errors_on_source_jsonl_missing`: source path absent, assert `MigrationError::SourceMissing`.
 - `compose_resume_args_rejects_config_kind`: parse a model TOML fixture with `[providers.resume] kind = "config"` and assert validation rejects it. Pins the v1 invariant that no config resume strategy is recognized.
 - `top_level_resume_without_model_succeeds_when_chain_exists`: invoke `agents --resume <UUID>` with no `-m`, assert resolver picks the model and the run completes.
-- `run_resume_spawns_without_model_flag_when_model_none`: chain seeded only via backfill with `model_name = '<unknown>'`, model TOML provider args include `--model`; `agents --resume <UUID>` strips model flags and succeeds.
+- `run_resume_spawns_without_model_flag_when_model_none`: chain seeded only via backfill with `model_name = '<unknown>'`; `agents --resume <UUID>` spawns from `providers.toml` only and succeeds without model flags.
 - `run_repl_spawns_without_model_flag_when_model_none`: same assertion for `interactive_args`.
 - `manual_migrate_flag_overrides_best_score_via_cli`: `agents resume --migrate <other-provider> <UUID>`, assert migration occurs and reason is `'manual'` even when the active provider has the better score.
 - `resume_list_subcommand_prints_all_chains_for_session_id`: two chains share session_id, assert `agents resume --list <UUID>` prints both with last_used_at, active provider, and turn count.

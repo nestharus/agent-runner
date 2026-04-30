@@ -128,12 +128,15 @@ Subcommands:
   trace <invocation_uuid> [--json] [--transcript] [--max-depth N]
         Walk a recorded invocation tree (see Inspecting a Run)
 
-  repl <model> [--resume <session-id>] [-p <project>] [--models-dir <path>]
+  repl [<model>] [--resume <session-id>] [-p <project>] [--models-dir <path>]
         Launch a balanced interactive session of the wrapped CLI
         (see Interactive REPL)
 
-  resume -m <model> --session-id <session-id> [-f <answer.md>|--prompt <text>] [-p <project>] [--models-dir <path>]
+  resume [-m <model>] --session-id <session-id> [-f <answer.md>|--prompt <text>] [-p <project>] [--models-dir <path>]
         Resume a provider session non-interactively with an answer payload
+
+  migrate-config [--models-dir <path>]
+        Move provider runtime blocks from old model TOMLs into providers.toml
 ```
 
 **Prompt resolution priority:** `--file` > positional arguments > stdin
@@ -195,7 +198,7 @@ oulipoly-agent-runner repl claude-opus --resume 9e69e8cc-616d-4640-bf1d-96f5391b
 oulipoly-agent-runner repl codex-high --resume 5169694d-de0f-40d1-890c-6e28e55bab27
 ```
 
-Each `repl` invocation requires the resolved provider to declare `interactive_args` (the argv shape used for interactive launch — distinct from `args`, which encodes one-shot mode like Claude `-p` or Codex `exec`). With `--resume`, the resolved provider must additionally declare a `[providers.resume]` block; see [Resuming a session](#resuming-a-session) below.
+Each `repl` invocation requires the resolved provider to declare `interactive_args` in `providers.toml` (the argv shape used for interactive launch — distinct from `args`, which encodes one-shot mode like Claude `-p` or Codex `exec`). With `--resume`, the provider must additionally declare a `[<provider>.resume]` block; see [Resuming a session](#resuming-a-session) below.
 
 On Unix, signal handling forwards `SIGTERM` once and lets `SIGINT` / `SIGHUP` reach the child through the foreground process group. Windows console-control handling is not implemented yet.
 
@@ -221,24 +224,62 @@ Provider state is keyed by the provider's `name` field (the CLI account — e.g.
 
 ### `providers.toml`
 
-To enable quota-aware balancing, create `~/.config/oulipoly-agent-runner/providers.toml` with one entry per provider account. Each entry declares a `quota_script` — a shell command that prints JSON on stdout describing one or more rolling-quota windows:
+Create `~/.config/oulipoly-agent-runner/providers.toml` with one entry per provider account. This is the runtime config for that account: how to invoke the CLI, how prompts are passed, how resume is composed, where local session files live, and optional quota/auth hooks.
 
 ```toml
 [claude]
 quota_script         = "anthropic-usage ~/.claude/.credentials.json"
 auth_refresh_command = "claude auth status"
+command              = "claude"
+args                 = ["-p"]
+interactive_args     = []
+prompt_mode          = "stdin"
+
+[claude.resume]
+kind = "flag"
+flag = "--resume"
 
 [claude2]
 quota_script         = "anthropic-usage ~/.claude2/.credentials.json"
 auth_refresh_command = "claude auth status"
+command              = "env"
+args                 = ["-u", "CLAUDECODE", "claude2", "--dangerously-skip-permissions"]
+interactive_args     = ["-u", "CLAUDECODE", "claude2", "--dangerously-skip-permissions"]
+prompt_mode          = "stdin"
+
+[claude2.resume]
+kind = "flag"
+flag = "--resume"
+
+[claude2.session_capture]
+kind = "forced_flag_verified"
+flag = "--session-id"
+
+[claude2.session_storage]
+kind = "claude_code"
+projects_dir = "~/.claude2/projects"
+
+[claude2.resume_acceptance]
+accepted_output_patterns = ["\"session_id\":\"{session_id}\""]
+rejected_output_patterns = ["No conversation found", "Invalid resume"]
 
 [codex]
 quota_script         = "chatgpt-usage ~/.codex/auth.json"
 auth_refresh_command = "codex login status"
+command              = "codex"
+args                 = ["exec"]
+interactive_args     = []
+prompt_mode          = "arg"
+
+[codex.resume]
+kind = "subcommand"
+subcommand = ["resume"]
 
 [opencode]
 quota_script = "zai-usage ~/.config/opencode/auth.json"
 ```
+
+`args` and `interactive_args` are provider/account defaults only. Do not put model flags there; model flags live in model TOMLs and are appended at spawn time.
 
 **Script output (multi-window)**:
 
@@ -389,15 +430,11 @@ If the env var is malformed, points at an unknown invocation, or has an invalid 
 
 ### Configuring session capture
 
-To populate `trace`'s `session.id` and `transcript_path`, add a `session_capture` block to the provider in your model TOML:
+To populate `trace`'s `session.id` and `transcript_path`, add a `session_capture` block to the provider in `providers.toml`:
 
 ```toml
 # Claude Code: force a runner-generated UUID via --session-id and verify readback
-[[providers]]
-command = "claude"
-args    = ["-p"]
-
-[providers.session_capture]
+[claude.session_capture]
 kind          = "forced_flag_verified"
 flag          = "--session-id"
 readback_args = ["--verbose", "--output-format", "stream-json"]
@@ -405,11 +442,7 @@ readback_args = ["--verbose", "--output-format", "stream-json"]
 
 ```toml
 # Codex: parse the `thread.started` event from --json mode; restore plain text from -o tmpfile
-[[providers]]
-command = "codex"
-args    = ["exec"]
-
-[providers.session_capture]
+[codex.session_capture]
 kind              = "stdout_json_event"
 json_flag         = "--json"
 last_message_flag = "-o"
@@ -421,7 +454,7 @@ Without `session_capture`, invocations record `session_capture_method = "none"` 
 
 ### Resuming a session
 
-When a provider declares a `[providers.resume]` block, `repl --resume <UUID>` looks the session up across all providers (via the `session_turns` ingest table), validates that the owning provider belongs to the requested model's provider pool, and composes the right interactive resume argv.
+When a provider declares a `[<provider>.resume]` block in `providers.toml`, `repl --resume <UUID>` looks the session up across all providers (via the `session_turns` ingest table), validates that the owning provider belongs to the requested model's provider pool when a model is known, and composes the right interactive resume argv.
 
 For non-interactive answer handoff, use `resume`:
 
@@ -432,31 +465,7 @@ oulipoly-agent-runner resume -m codex-high --session-id 5169694d-de0f-40d1-890c-
 
 `resume` uses the same owner lookup and provider-pool validation as `repl --resume`, but launches the provider's one-shot `args` with the resume strategy and answer payload. It records `resume_acceptance` in `trace`.
 
-```toml
-# Claude: --resume <UUID> as a flag on the existing interactive launch
-[[providers]]
-name = "claude2"
-command = "env"
-args             = ["-u", "CLAUDECODE", "claude2", "-p", "--model", "opus", "--dangerously-skip-permissions"]
-interactive_args = ["-u", "CLAUDECODE", "claude2", "--model", "opus", "--dangerously-skip-permissions"]
-
-[providers.resume]
-kind = "flag"
-flag = "--resume"
-```
-
-```toml
-# Codex: resume <UUID> as a subcommand appended after interactive_args
-[[providers]]
-name = "codex"
-command = "codex"
-args             = ["exec", "--dangerously-bypass-approvals-and-sandbox", "-m", "gpt-5.4"]
-interactive_args = ["--dangerously-bypass-approvals-and-sandbox", "-m", "gpt-5.4"]
-
-[providers.resume]
-kind = "subcommand"
-subcommand = ["resume"]
-```
+With a model, one-shot spawn is `providers[name].command + providers[name].args + model.providers[name].args + resume_args`. Without a model, the model TOML is not loaded for spawn; the runner uses only `providers[name].command + providers[name].args + resume_args`, so the upstream CLI uses its own default model.
 
 The runner always emits a short selection line on stderr regardless of TTY:
 
@@ -470,10 +479,7 @@ When a session id matched multiple providers (rare; requires cross-provider sess
 [resume] session 9e69e8cc-... matched claude2, claude3; selected claude2 by latest turn timestamp
 ```
 
-If no model can be inferred for a UI-started session, the runner uses the
-active provider's configured command shape but removes `--model <value>` and
-`-m <value>` from the spawned argv. The upstream CLI then chooses its own
-default model.
+If no model can be inferred for a UI-started session, the runner uses the active provider's `providers.toml` command shape only. No model TOML is consulted and no model flag is injected.
 
 Resume failures all exit `1` with a specific stderr message:
 
@@ -481,8 +487,8 @@ Resume failures all exit `1` with a specific stderr message:
 - **Invalid session UUID** — the input wasn't a valid full UUID (no prefix matching)
 - **Ambiguous session** — the UUID maps to multiple recent chains; rerun with a printed `chain_id`
 - **Provider/model mismatch** — the resolved provider is not in the requested model's provider pool. The error suggests other models that include the resolved provider, e.g. `Try a model that includes claude2: claude-opus, claude-sonnet`.
-- **Provider not configured** — the active provider is no longer present in any loaded model TOML, so the runner has no command shape to spawn.
-- **Provider has no `[providers.resume]` block** — the resolved provider exists in the model's pool but doesn't declare a resume strategy.
+- **Provider not configured** — the active provider is missing from `providers.toml`, so the runner has no command shape to spawn.
+- **Provider has no `[<provider>.resume]` block** — the resolved provider exists but doesn't declare a resume strategy.
 
 The invocation row records `session_capture_method = "resumed"` and the user-supplied `session_id` *before* spawn. This means `trace` can show what session the runner attempted to resume even if the wrapped CLI rejects the id (e.g. "No conversation found"). Trace renders the session as `Resume target: <UUID>` instead of `Session: <UUID>` to make this distinction explicit, and adds a warning: `session marked as attempted resume target; child acceptance is not confirmed by this row — check exit_code and recent_errors for outcome`.
 
@@ -530,23 +536,36 @@ All user config lives in `~/.config/oulipoly-agent-runner/`:
 ```
 ~/.config/oulipoly-agent-runner/
   config.toml          Global settings
-  providers.toml       Per-provider quota scripts (optional, for quota-aware balancing)
+  providers.toml       Per-provider runtime config, resume/session storage, quota scripts
   sessions.toml        Per-provider turn ingestion + transcript locator adapters
                        (optional, for accurate cross-source projection + trace inspection)
-  models/              Model configs (one .toml per model; provider entries can declare
-                       `[providers.session_capture]` for trace's session correlation)
+  models/              Model configs (one .toml per model; provider entries contain
+                       provider names plus model-specific args only)
   agents/              Agent configs (one .md per agent)
 ```
 
 ### Adding a Model
 
-Create a `.toml` file in the models directory. The filename becomes the model name.
+Create or update the account entry in `providers.toml`, then create a `.toml` file in the models directory. The filename becomes the model name.
+
+**Runtime provider entry:**
+```toml
+[claude]
+command = "claude"
+args = ["-p"]
+interactive_args = []
+prompt_mode = "stdin"
+
+[claude.resume]
+kind = "flag"
+flag = "--resume"
+```
 
 **Text model (single provider):**
 ```toml
-command = "claude"
-args = ["-p", "--model", "haiku"]
-prompt_mode = "stdin"
+[[providers]]
+name = "claude"
+args = ["--model", "haiku"]
 
 [[inputs]]
 name = "prompt"
@@ -558,19 +577,13 @@ description = "The text prompt"
 
 **Text model (multiple providers, load balanced):**
 ```toml
-prompt_mode = "arg"
+[[providers]]
+name = "codex"
+args = ["-m", "gpt-5.3-codex"]
 
 [[providers]]
-command = "codex"
-args = ["exec", "-m", "gpt-5.3-codex"]
-
-[[providers]]
-command = "codex2"
-args = ["exec", "-m", "gpt-5.3-codex"]
-
-# Optional: set `name = "..."` on a provider to pin the identity used for
-# quota/error tracking. If omitted, the name is auto-derived from the command
-# (e.g. `env -u CLAUDECODE claude2` → `claude2`).
+name = "codex2"
+args = ["-m", "gpt-5.3-codex"]
 
 [[inputs]]
 name = "prompt"
@@ -582,8 +595,8 @@ description = "The text prompt"
 
 **Image/video model with typed inputs:**
 ```toml
-command = "atlas-i2v-fast"
-prompt_mode = "arg"
+[[providers]]
+name = "atlas-i2v-fast"
 
 [[inputs]]
 name = "prompt"

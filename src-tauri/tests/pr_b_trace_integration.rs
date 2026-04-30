@@ -40,12 +40,18 @@ printf 'fixture-response\n'
 
         fs::write(
             models_dir.join("fixture.toml"),
-            format!(
-                r#"prompt_mode = "arg"
-
-[[providers]]
+            r#"[[providers]]
 name = "fixture-provider"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            app_config_dir.join("providers.toml"),
+            format!(
+                r#"[fixture-provider]
 command = "{}"
+args = []
+prompt_mode = "arg"
 "#,
                 script_path.display()
             ),

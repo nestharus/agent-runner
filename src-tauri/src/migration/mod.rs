@@ -273,50 +273,36 @@ pub fn find_claude_source_from_storage(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ModelConfig, SessionsConfig};
+    use crate::config::{ModelConfig, ProviderConfig, ResumeKind, ResumeStrategy, SessionsConfig};
     use crate::state::{InvocationStart, StateDb};
 
     fn model_with_storage(
         source_projects: &std::path::Path,
         target_projects: &std::path::Path,
     ) -> ModelConfig {
-        ModelConfig::from_toml(
-            "claude-opus",
-            &format!(
-                r#"
-prompt_mode = "arg"
-
-[[providers]]
-name = "claude"
-command = "claude"
-interactive_args = ["launch"]
-
-[providers.resume]
-kind = "flag"
-flag = "--resume"
-
-[providers.session_storage]
-kind = "claude_code"
-projects_dir = "{}"
-
-[[providers]]
-name = "claude2"
-command = "claude2"
-interactive_args = ["launch"]
-
-[providers.resume]
-kind = "flag"
-flag = "--resume"
-
-[providers.session_storage]
-kind = "claude_code"
-projects_dir = "{}"
-"#,
-                source_projects.display(),
-                target_projects.display()
-            ),
-        )
-        .unwrap()
+        let provider = |name: &str, projects_dir: PathBuf| ProviderConfig {
+            name: name.to_string(),
+            command: name.to_string(),
+            args: Vec::new(),
+            interactive_args: Some(vec!["launch".to_string()]),
+            resume: Some(ResumeStrategy {
+                kind: ResumeKind::Flag,
+                flag: Some("--resume".to_string()),
+                subcommand: None,
+            }),
+            session_capture: None,
+            resume_acceptance: None,
+            session_storage: Some(SessionStorage::ClaudeCode { projects_dir }),
+        };
+        ModelConfig {
+            name: "claude-opus".to_string(),
+            prompt_mode: crate::config::PromptMode::Arg,
+            providers: vec![
+                provider("claude", source_projects.to_path_buf()),
+                provider("claude2", target_projects.to_path_buf()),
+            ],
+            inputs: Vec::new(),
+        }
     }
 
     // risk: Migration mechanic source UUID reuse; level: particular-integration; source: proposal §11.1 Migration mechanic / A1.

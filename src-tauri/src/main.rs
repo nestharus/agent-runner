@@ -1,6 +1,7 @@
 use agent_runner_lib::balancer;
 use agent_runner_lib::config::{
-    AgentConfig, ModelConfig, ProviderConfig, load_agent_file, load_agents, load_models,
+    AgentConfig, ModelConfig, PromptMode, ProviderConfig, ProvidersConfig, load_agent_file,
+    load_agents, load_models,
 };
 use agent_runner_lib::diagnostics;
 use agent_runner_lib::executor;
@@ -156,6 +157,12 @@ enum Subcommands {
     ResumeList { uuid: String },
     /// Run chain-table backfill explicitly.
     MigrateDb,
+    /// Move runtime provider config from model TOMLs into providers.toml.
+    MigrateConfig {
+        /// Override models directory.
+        #[arg(long = "models-dir")]
+        models_dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug)]
@@ -327,6 +334,7 @@ fn run(cli: Cli) -> Result<i32, String> {
             ),
             Subcommands::ResumeList { uuid } => run_resume_list(&uuid),
             Subcommands::MigrateDb => run_migrate_db(),
+            Subcommands::MigrateConfig { models_dir } => run_migrate_config(models_dir.as_deref()),
         };
     }
 
@@ -701,56 +709,17 @@ fn format_resume_error(err: agent_runner_lib::state::ResumeError) -> String {
 
 #[derive(Clone)]
 struct ResumeExecutionTarget {
-    model: ModelConfig,
+    model: Option<ModelConfig>,
     provider_index: usize,
     provider: ProviderConfig,
-}
-
-fn strip_model_override_args(args: &[String]) -> Vec<String> {
-    let mut stripped = Vec::with_capacity(args.len());
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        if arg == "--model" || arg == "-m" {
-            let _ = iter.next();
-            continue;
-        }
-        stripped.push(arg.clone());
-    }
-    stripped
-}
-
-fn provider_without_model_override(provider: &ProviderConfig) -> ProviderConfig {
-    let mut provider = provider.clone();
-    provider.args = strip_model_override_args(&provider.args);
-    provider.interactive_args = provider
-        .interactive_args
-        .as_ref()
-        .map(|args| strip_model_override_args(args));
-    provider
-}
-
-fn first_matching_model_for_provider(
-    models: &HashMap<String, ModelConfig>,
-    provider_name: &str,
-) -> Option<(ModelConfig, usize)> {
-    let mut names = models.keys().collect::<Vec<_>>();
-    names.sort();
-    names.into_iter().find_map(|name| {
-        let model = models.get(name)?;
-        let provider_index = model
-            .providers
-            .iter()
-            .position(|provider| provider.name == provider_name)?;
-        Some((model.clone(), provider_index))
-    })
+    prompt_mode: PromptMode,
 }
 
 fn resume_execution_target(
     resolved: &agent_runner_lib::state::ResolvedResume,
-    models: &HashMap<String, ModelConfig>,
+    providers_cfg: &ProvidersConfig,
 ) -> Result<ResumeExecutionTarget, agent_runner_lib::state::ResumeError> {
-    let (model, provider_index, strip_model_override) = if let Some(model) = resolved.model.as_ref()
-    {
+    if let Some(model) = resolved.model.as_ref() {
         let provider_index = model
             .providers
             .iter()
@@ -762,29 +731,79 @@ fn resume_execution_target(
                     suggestions: Vec::new(),
                 },
             )?;
-        (model.clone(), provider_index, false)
+        let (provider, prompt_mode) = providers_cfg
+            .effective_provider(&model.providers[provider_index])
+            .map_err(|message| agent_runner_lib::state::ResumeError::Db { message })?;
+        Ok(ResumeExecutionTarget {
+            model: Some(model.clone()),
+            provider_index,
+            provider,
+            prompt_mode,
+        })
     } else {
-        let (model, provider_index) =
-            first_matching_model_for_provider(models, &resolved.active_provider).ok_or_else(
-                || agent_runner_lib::state::ResumeError::ProviderNotConfigured {
-                    provider: resolved.active_provider.clone(),
-                },
-            )?;
-        (model, provider_index, true)
-    };
+        let (provider, prompt_mode) = providers_cfg
+            .runtime_provider(&resolved.active_provider)
+            .map_err(|message| agent_runner_lib::state::ResumeError::Db { message })?;
+        let provider_index =
+            provider_index_in_providers_cfg(providers_cfg, &resolved.active_provider);
+        Ok(ResumeExecutionTarget {
+            model: None,
+            provider_index,
+            provider,
+            prompt_mode,
+        })
+    }
+}
 
-    let provider = model.providers[provider_index].clone();
-    let provider = if strip_model_override {
-        provider_without_model_override(&provider)
-    } else {
-        provider
-    };
+fn provider_index_in_providers_cfg(providers_cfg: &ProvidersConfig, provider_name: &str) -> usize {
+    let mut names = providers_cfg.entries.keys().collect::<Vec<_>>();
+    names.sort();
+    names
+        .into_iter()
+        .position(|name| name == provider_name)
+        .unwrap_or(0)
+}
 
-    Ok(ResumeExecutionTarget {
-        model,
-        provider_index,
-        provider,
-    })
+fn effective_model_for_execution(
+    model: &ModelConfig,
+    provider_index: usize,
+    providers_cfg: &ProvidersConfig,
+) -> Result<(ProviderConfig, PromptMode), String> {
+    providers_cfg.effective_provider(&model.providers[provider_index])
+}
+
+fn resume_migration_pool(
+    resolved: &agent_runner_lib::state::ResolvedResume,
+    providers_cfg: &ProvidersConfig,
+) -> ModelConfig {
+    if let Some(model) = resolved.model.as_ref() {
+        let mut effective = model.clone();
+        effective.providers = model
+            .providers
+            .iter()
+            .filter_map(|provider| providers_cfg.effective_provider(provider).ok().map(|p| p.0))
+            .collect();
+        return effective;
+    }
+
+    let mut names = providers_cfg.entries.keys().cloned().collect::<Vec<_>>();
+    names.sort();
+    let mut providers = Vec::new();
+    for name in names {
+        let is_candidate = name == resolved.active_provider
+            || providers_cfg
+                .get(&name)
+                .is_some_and(|entry| entry.session_storage.is_some());
+        if is_candidate && let Ok((provider, _)) = providers_cfg.runtime_provider(&name) {
+            providers.push(provider);
+        }
+    }
+    ModelConfig {
+        name: "<provider-default>".to_string(),
+        prompt_mode: PromptMode::Stdin,
+        providers,
+        inputs: Vec::new(),
+    }
 }
 
 fn run_repl(
@@ -831,7 +850,7 @@ fn run_repl(
     };
     let mut fallback_target = match resolved_resume.as_ref() {
         Some(resolved) => {
-            Some(resume_execution_target(resolved, &models).map_err(format_resume_error)?)
+            Some(resume_execution_target(resolved, &providers_cfg).map_err(format_resume_error)?)
         }
         None => None,
     };
@@ -849,9 +868,14 @@ fn run_repl(
     };
     let model = fallback_target
         .as_ref()
-        .map(|target| target.model.clone())
+        .and_then(|target| target.model.clone())
         .or(direct_model)
-        .expect("resume or direct model must be available");
+        .unwrap_or_else(|| ModelConfig {
+            name: "<provider-default>".to_string(),
+            prompt_mode: PromptMode::Stdin,
+            providers: Vec::new(),
+            inputs: Vec::new(),
+        });
 
     let in_flight = agent_runner_lib::quota::InFlight::new();
     let ctx = balancer::BalanceContext {
@@ -869,16 +893,17 @@ fn run_repl(
         if should_emit_resume_short_line(stderr_is_terminal) {
             eprintln!("[resume] -> {selected_provider}");
         }
+        let migration_model = resume_migration_pool(resolved, &providers_cfg);
         if let Ok(balancer::MigrationDecision::Migrate {
             target_provider_index,
             reason,
-        }) = balancer::decide_migration(&state, &model, resolved, manual_migrate)
+        }) = balancer::decide_migration(&state, &migration_model, resolved, manual_migrate)
         {
             let mut stderr = std::io::stderr();
             match agent_runner_lib::migration::migrate_chain_segment(
                 &state,
                 &sessions_cfg,
-                &model,
+                &migration_model,
                 resolved,
                 target_provider_index,
                 reason,
@@ -888,7 +913,8 @@ fn run_repl(
                     resolved.active_provider = migrated.target_provider.clone();
                     resolved.active_session_id = migrated.target_session_id.clone();
                     fallback_target = Some(
-                        resume_execution_target(resolved, &models).map_err(format_resume_error)?,
+                        resume_execution_target(resolved, &providers_cfg)
+                            .map_err(format_resume_error)?,
                     );
                 }
                 Err(err) => {
@@ -918,11 +944,8 @@ fn run_repl(
         )
     } else {
         let provider_index = balancer::select_provider(&model, &state, Some(&ctx));
-        (
-            provider_index,
-            model.providers[provider_index].clone(),
-            None,
-        )
+        let (provider, _) = effective_model_for_execution(&model, provider_index, &providers_cfg)?;
+        (provider_index, provider, None)
     };
     if provider.interactive_args.is_none() {
         return Err(format!(
@@ -1053,7 +1076,10 @@ fn run_resume(
     let config_root = dirs::config_dir()
         .map(|d| d.join("oulipoly-agent-runner"))
         .unwrap_or_else(|| PathBuf::from("."));
+    let providers_path = config_root.join("providers.toml");
     let sessions_path = config_root.join("sessions.toml");
+    let providers_cfg =
+        agent_runner_lib::config::ProvidersConfig::load(&providers_path).unwrap_or_default();
     let sessions_cfg =
         agent_runner_lib::config::SessionsConfig::load(&sessions_path).unwrap_or_default();
 
@@ -1080,29 +1106,28 @@ fn run_resume(
             return Ok(1);
         }
     };
-    let mut target = match resume_execution_target(&resolved, &models) {
+    let mut target = match resume_execution_target(&resolved, &providers_cfg) {
         Ok(target) => target,
         Err(err) => {
             eprintln!("{}", format_resume_error(err));
             return Ok(1);
         }
     };
-    let mut model = target.model.clone();
-
     let selected_provider = &resolved.active_provider;
     if should_emit_resume_short_line(stderr_is_terminal) {
         eprintln!("[resume] -> {selected_provider}");
     }
+    let migration_model = resume_migration_pool(&resolved, &providers_cfg);
     if let Ok(balancer::MigrationDecision::Migrate {
         target_provider_index,
         reason,
-    }) = balancer::decide_migration(&state, &model, &resolved, manual_migrate)
+    }) = balancer::decide_migration(&state, &migration_model, &resolved, manual_migrate)
     {
         let mut stderr = std::io::stderr();
         match agent_runner_lib::migration::migrate_chain_segment(
             &state,
             &sessions_cfg,
-            &model,
+            &migration_model,
             &resolved,
             target_provider_index,
             reason,
@@ -1111,14 +1136,13 @@ fn run_resume(
             Ok(migrated) => {
                 resolved.active_provider = migrated.target_provider.clone();
                 resolved.active_session_id = migrated.target_session_id.clone();
-                target = match resume_execution_target(&resolved, &models) {
+                target = match resume_execution_target(&resolved, &providers_cfg) {
                     Ok(target) => target,
                     Err(err) => {
                         eprintln!("{}", format_resume_error(err));
                         return Ok(1);
                     }
                 };
-                model = target.model.clone();
             }
             Err(err) => {
                 eprintln!("migration failed: {err:?}");
@@ -1163,7 +1187,7 @@ fn run_resume(
     let result = match executor::cli::execute_resume(
         &provider,
         provider_index,
-        model.prompt_mode,
+        target.prompt_mode,
         &answer,
         working_dir,
         Some(&invocation_env),
@@ -1272,7 +1296,9 @@ fn run_with_balancing(
     // (matches contract `tmp/01-pr-a-contract.md` lifecycle ordering).
     let parent_invocation_id = resolve_parent_invocation_id(&state);
     let provider_index = balancer::select_provider(model, &state, Some(&ctx));
-    let provider_name = &model.providers[provider_index].name;
+    let (provider, prompt_mode) =
+        effective_model_for_execution(model, provider_index, &providers_cfg)?;
+    let provider_name = &provider.name;
     let invocation = CompositeInvocationId {
         source: provider_name.clone(),
         id: Uuid::new_v4().to_string(),
@@ -1288,13 +1314,17 @@ fn run_with_balancing(
         .map_err(|e| format!("Failed to serialize invocation id: {e}"))?;
     eprintln!("{}", invocation.stderr_line());
 
-    let result = match executor::execute_with_inputs_and_env(
-        model,
-        provider_index,
-        prompt,
-        working_dir,
-        extra_inputs,
-        Some(&invocation_env),
+    let result = match executor::execute_effective_with_inputs_and_env(
+        executor::cli::EffectiveExecuteRequest {
+            model,
+            provider: &provider,
+            provider_index,
+            prompt_mode,
+            prompt,
+            working_dir,
+            extra_inputs,
+            parent_invocation_env: Some(&invocation_env),
+        },
     ) {
         Ok(result) => result,
         Err(err) => {
@@ -1430,6 +1460,317 @@ fn run_migrate_db() -> Result<i32, String> {
         compaction_report.turns_flagged, compaction_report.sessions_processed
     );
     Ok(0)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ConfigMigrationReport {
+    providers_touched: usize,
+    model_files_rewritten: usize,
+    moved_blocks: Vec<String>,
+}
+
+fn run_migrate_config(models_dir_override: Option<&Path>) -> Result<i32, String> {
+    let models_dir = models_dir_override
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_models_dir);
+    let config_root = models_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let providers_path = config_root.join("providers.toml");
+    let report = migrate_config_files(&models_dir, &providers_path)?;
+    println!(
+        "migrate-config: providers_touched={} model_files_rewritten={}",
+        report.providers_touched, report.model_files_rewritten
+    );
+    for moved in &report.moved_blocks {
+        println!("  moved {moved}");
+    }
+    Ok(0)
+}
+
+fn migrate_config_files(
+    models_dir: &Path,
+    providers_path: &Path,
+) -> Result<ConfigMigrationReport, String> {
+    let mut providers_root = if providers_path.exists() {
+        std::fs::read_to_string(providers_path)
+            .map_err(|e| format!("Failed to read {}: {e}", providers_path.display()))?
+            .parse::<toml::Table>()
+            .map_err(|e| format!("TOML parse error in {}: {e}", providers_path.display()))?
+    } else {
+        toml::Table::new()
+    };
+    let mut moved_blocks = Vec::new();
+    let mut rewritten = 0usize;
+
+    let mut model_paths = if models_dir.exists() {
+        std::fs::read_dir(models_dir)
+            .map_err(|e| format!("Failed to read {}: {e}", models_dir.display()))?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    model_paths.sort();
+
+    for path in model_paths {
+        let original = std::fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+        let mut table = original
+            .parse::<toml::Table>()
+            .map_err(|e| format!("TOML parse error in {}: {e}", path.display()))?;
+        let before = toml::to_string_pretty(&table)
+            .map_err(|e| format!("Failed to serialize {}: {e}", path.display()))?;
+
+        let mut changed = false;
+        let global_prompt_mode = table.remove("prompt_mode");
+        changed |= global_prompt_mode.is_some();
+
+        if table.contains_key("command") {
+            let provider_table = old_top_level_provider_table(&mut table)?;
+            let migrated = migrate_provider_table(
+                provider_table,
+                global_prompt_mode.clone(),
+                &mut providers_root,
+                &path,
+                &mut moved_blocks,
+            )?;
+            table.insert("providers".to_string(), toml::Value::Array(vec![migrated]));
+            changed = true;
+        } else if let Some(toml::Value::Array(providers)) = table.get_mut("providers") {
+            for provider in providers.iter_mut() {
+                let migrated = migrate_provider_table(
+                    provider.clone(),
+                    global_prompt_mode.clone(),
+                    &mut providers_root,
+                    &path,
+                    &mut moved_blocks,
+                )?;
+                if migrated != *provider {
+                    *provider = migrated;
+                    changed = true;
+                }
+            }
+        }
+
+        let after = toml::to_string_pretty(&table)
+            .map_err(|e| format!("Failed to serialize {}: {e}", path.display()))?;
+        if changed && after != before {
+            std::fs::write(&path, after)
+                .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
+            rewritten += 1;
+        }
+    }
+
+    let providers_text = toml::to_string_pretty(&providers_root)
+        .map_err(|e| format!("Failed to serialize {}: {e}", providers_path.display()))?;
+    let current = if providers_path.exists() {
+        std::fs::read_to_string(providers_path)
+            .map_err(|e| format!("Failed to read {}: {e}", providers_path.display()))?
+    } else {
+        String::new()
+    };
+    let providers_touched = providers_root
+        .iter()
+        .filter(|(_, value)| {
+            value
+                .as_table()
+                .is_some_and(|table| table.contains_key("command"))
+        })
+        .count();
+    if providers_text != current {
+        if let Some(parent) = providers_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
+        }
+        std::fs::write(providers_path, providers_text)
+            .map_err(|e| format!("Failed to write {}: {e}", providers_path.display()))?;
+    }
+
+    Ok(ConfigMigrationReport {
+        providers_touched,
+        model_files_rewritten: rewritten,
+        moved_blocks,
+    })
+}
+
+fn old_top_level_provider_table(table: &mut toml::Table) -> Result<toml::Value, String> {
+    let mut provider = toml::Table::new();
+    for key in [
+        "command",
+        "args",
+        "interactive_args",
+        "resume",
+        "session_capture",
+        "session_storage",
+        "resume_acceptance",
+    ] {
+        if let Some(value) = table.remove(key) {
+            provider.insert(key.to_string(), value);
+        }
+    }
+    if !provider.contains_key("command") {
+        return Err("old model provider is missing command".to_string());
+    }
+    Ok(toml::Value::Table(provider))
+}
+
+fn migrate_provider_table(
+    provider_value: toml::Value,
+    global_prompt_mode: Option<toml::Value>,
+    providers_root: &mut toml::Table,
+    path: &Path,
+    moved_blocks: &mut Vec<String>,
+) -> Result<toml::Value, String> {
+    let mut provider = provider_value
+        .as_table()
+        .cloned()
+        .ok_or_else(|| format!("provider entry in {} is not a table", path.display()))?;
+    if !provider.contains_key("command")
+        && !provider.contains_key("resume")
+        && !provider.contains_key("session_capture")
+        && !provider.contains_key("session_storage")
+        && !provider.contains_key("resume_acceptance")
+        && !provider.contains_key("prompt_mode")
+    {
+        return Ok(toml::Value::Table(provider));
+    }
+
+    let command = provider
+        .remove("command")
+        .and_then(|value| value.as_str().map(ToString::to_string))
+        .ok_or_else(|| {
+            format!(
+                "Old per-provider config in {} is missing command; run `agents migrate-config` after adding it.",
+                path.display()
+            )
+        })?;
+    let model_args = take_string_array(&mut provider, "args")?;
+    let model_interactive_args = take_optional_string_array(&mut provider, "interactive_args")?;
+    let provider_name = provider
+        .remove("name")
+        .and_then(|value| value.as_str().map(ToString::to_string))
+        .unwrap_or_else(|| agent_runner_lib::config::derive_provider_name(&command, &model_args));
+
+    let command_parts = executor::cli::shell_split(&command);
+    let runtime_command = command_parts.first().cloned().unwrap_or(command);
+    let runtime_args = command_parts.iter().skip(1).cloned().collect::<Vec<_>>();
+
+    let prompt_mode = provider
+        .remove("prompt_mode")
+        .or(global_prompt_mode)
+        .unwrap_or_else(|| toml::Value::String("stdin".to_string()));
+    let resume = provider.remove("resume");
+    let session_capture = provider.remove("session_capture");
+    let session_storage = provider.remove("session_storage");
+    let resume_acceptance = provider.remove("resume_acceptance");
+
+    let runtime = providers_root
+        .entry(provider_name.clone())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let runtime = runtime
+        .as_table_mut()
+        .ok_or_else(|| format!("providers.toml entry [{provider_name}] is not a table"))?;
+    set_or_conflict(
+        runtime,
+        "command",
+        toml::Value::String(runtime_command),
+        &provider_name,
+        path,
+    )?;
+    set_or_conflict(
+        runtime,
+        "args",
+        string_array_value(runtime_args),
+        &provider_name,
+        path,
+    )?;
+    if model_interactive_args.is_some() {
+        set_or_conflict(
+            runtime,
+            "interactive_args",
+            string_array_value(command_parts.iter().skip(1).cloned().collect()),
+            &provider_name,
+            path,
+        )?;
+    }
+    set_or_conflict(runtime, "prompt_mode", prompt_mode, &provider_name, path)?;
+    for (key, value) in [
+        ("resume", resume),
+        ("session_capture", session_capture),
+        ("session_storage", session_storage),
+        ("resume_acceptance", resume_acceptance),
+    ] {
+        if let Some(value) = value {
+            set_or_conflict(runtime, key, value, &provider_name, path)?;
+            moved_blocks.push(format!(
+                "{}.{} -> providers.toml[{provider_name}]",
+                path.display(),
+                key
+            ));
+        }
+    }
+
+    let mut reduced = toml::Table::new();
+    reduced.insert("name".to_string(), toml::Value::String(provider_name));
+    reduced.insert("args".to_string(), string_array_value(model_args));
+    if let Some(interactive_args) = model_interactive_args {
+        reduced.insert(
+            "interactive_args".to_string(),
+            string_array_value(interactive_args),
+        );
+    }
+    Ok(toml::Value::Table(reduced))
+}
+
+fn set_or_conflict(
+    table: &mut toml::Table,
+    key: &str,
+    value: toml::Value,
+    provider_name: &str,
+    path: &Path,
+) -> Result<(), String> {
+    if let Some(existing) = table.get(key) {
+        if existing != &value {
+            return Err(format!(
+                "conflicting {key} for provider {provider_name} while migrating {}: existing providers.toml value {existing:?}, model TOML value {value:?}",
+                path.display()
+            ));
+        }
+        return Ok(());
+    }
+    table.insert(key.to_string(), value);
+    Ok(())
+}
+
+fn take_string_array(table: &mut toml::Table, key: &str) -> Result<Vec<String>, String> {
+    take_optional_string_array(table, key).map(|value| value.unwrap_or_default())
+}
+
+fn take_optional_string_array(
+    table: &mut toml::Table,
+    key: &str,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(value) = table.remove(key) else {
+        return Ok(None);
+    };
+    value
+        .as_array()
+        .ok_or_else(|| format!("{key} must be an array of strings"))?
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(ToString::to_string)
+                .ok_or_else(|| format!("{key} must be an array of strings"))
+        })
+        .collect::<Result<Vec<_>, String>>()
+        .map(Some)
+}
+
+fn string_array_value(values: Vec<String>) -> toml::Value {
+    toml::Value::Array(values.into_iter().map(toml::Value::String).collect())
 }
 
 fn run_resume_list(uuid: &str) -> Result<i32, String> {
@@ -1645,6 +1986,28 @@ mod tests {
 
     fn test_db() -> StateDb {
         StateDb::open(Path::new(":memory:")).unwrap()
+    }
+
+    fn providers_cfg_with_storage(names: &[&str]) -> ProvidersConfig {
+        let mut cfg = ProvidersConfig::default();
+        for name in names {
+            cfg.entries.insert(
+                (*name).to_string(),
+                agent_runner_lib::config::ProviderEntry {
+                    command: Some((*name).to_string()),
+                    session_storage: Some(agent_runner_lib::config::SessionStorage::ClaudeCode {
+                        projects_dir: PathBuf::from(format!("/tmp/{name}/projects")),
+                    }),
+                    resume: Some(agent_runner_lib::config::ResumeStrategy {
+                        kind: agent_runner_lib::config::ResumeKind::Flag,
+                        flag: Some("--resume".to_string()),
+                        subcommand: None,
+                    }),
+                    ..agent_runner_lib::config::ProviderEntry::default()
+                },
+            );
+        }
+        cfg
     }
 
     #[test]
@@ -2227,43 +2590,7 @@ mod tests {
     }
 
     #[test]
-    fn decide_migration_works_for_model_none_via_first_matching_pool() {
-        let db = test_db();
-        let model = ModelConfig::from_toml(
-            "claude-opus",
-            r#"
-prompt_mode = "arg"
-
-[[providers]]
-name = "claude"
-command = "claude"
-interactive_args = ["launch"]
-
-[providers.resume]
-kind = "flag"
-flag = "--resume"
-
-[providers.session_storage]
-kind = "claude_code"
-projects_dir = "/tmp/source"
-
-[[providers]]
-name = "claude2"
-command = "claude2"
-interactive_args = ["launch"]
-
-[providers.resume]
-kind = "flag"
-flag = "--resume"
-
-[providers.session_storage]
-kind = "claude_code"
-projects_dir = "/tmp/target"
-"#,
-        )
-        .unwrap();
-        let mut models = HashMap::new();
-        models.insert("claude-opus".to_string(), model);
+    fn migration_target_pool_when_model_none_is_all_storage_providers() {
         let resolved = agent_runner_lib::state::ResolvedResume {
             chain_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string(),
             model_name: None,
@@ -2271,17 +2598,172 @@ projects_dir = "/tmp/target"
             active_provider: "claude".to_string(),
             active_session_id: "5169694d-de0f-40d1-890c-6e28e55bab27".to_string(),
         };
+        let providers_cfg = providers_cfg_with_storage(&["claude", "claude2", "claude3"]);
 
-        let target = resume_execution_target(&resolved, &models).unwrap();
-        let decision =
-            balancer::decide_migration(&db, &target.model, &resolved, Some("claude2")).unwrap();
+        let pool = resume_migration_pool(&resolved, &providers_cfg);
+        let names = pool
+            .providers
+            .iter()
+            .map(|provider| provider.name.as_str())
+            .collect::<Vec<_>>();
 
+        assert_eq!(names, vec!["claude", "claude2", "claude3"]);
+    }
+
+    #[test]
+    fn migration_target_pool_when_model_set_is_model_pool() {
+        let model = ModelConfig::from_toml(
+            "claude-opus",
+            r#"
+[[providers]]
+name = "claude"
+args = ["--model", "opus"]
+
+[[providers]]
+name = "claude2"
+args = ["--model", "opus"]
+"#,
+        )
+        .unwrap();
+        let resolved = agent_runner_lib::state::ResolvedResume {
+            chain_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string(),
+            model_name: Some("claude-opus".to_string()),
+            model: Some(model),
+            active_provider: "claude".to_string(),
+            active_session_id: "5169694d-de0f-40d1-890c-6e28e55bab27".to_string(),
+        };
+        let providers_cfg = providers_cfg_with_storage(&["claude", "claude2", "claude3"]);
+
+        let pool = resume_migration_pool(&resolved, &providers_cfg);
+        let names = pool
+            .providers
+            .iter()
+            .map(|provider| provider.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["claude", "claude2"]);
+    }
+
+    #[test]
+    fn migrate_config_lifts_per_provider_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let providers_path = dir.path().join("providers.toml");
+        std::fs::write(
+            models_dir.join("claude-opus.toml"),
+            r#"
+prompt_mode = "stdin"
+
+[[providers]]
+name = "claude2"
+command = "env -u CLAUDECODE claude2"
+args = ["-p", "--model", "opus", "--output-format", "json"]
+interactive_args = ["--model", "opus"]
+
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+
+[providers.session_capture]
+kind = "forced_flag_verified"
+flag = "--session-id"
+
+[providers.session_storage]
+kind = "claude_code"
+projects_dir = "/tmp/claude2/projects"
+
+[providers.resume_acceptance]
+accepted_output_patterns = ["\"session_id\":\"{session_id}\""]
+"#,
+        )
+        .unwrap();
+
+        let report = migrate_config_files(&models_dir, &providers_path).unwrap();
+
+        assert_eq!(report.model_files_rewritten, 1);
+        let model = std::fs::read_to_string(models_dir.join("claude-opus.toml")).unwrap();
+        assert!(model.contains("name = \"claude2\""), "{model}");
+        assert!(model.contains("\"--model\""), "{model}");
+        assert!(model.contains("\"opus\""), "{model}");
+        assert!(model.contains("\"--output-format\""), "{model}");
+        assert!(!model.contains("command ="), "{model}");
+        assert!(!model.contains("session_storage"), "{model}");
+
+        let providers = std::fs::read_to_string(&providers_path).unwrap();
+        assert!(providers.contains("[claude2]"), "{providers}");
+        assert!(providers.contains("command = \"env\""), "{providers}");
+        assert!(providers.contains("\"-u\""), "{providers}");
+        assert!(providers.contains("\"CLAUDECODE\""), "{providers}");
+        assert!(providers.contains("\"claude2\""), "{providers}");
+        assert!(providers.contains("[claude2.resume]"), "{providers}");
+        assert!(
+            providers.contains("[claude2.session_storage]"),
+            "{providers}"
+        );
+    }
+
+    #[test]
+    fn migrate_config_aborts_on_conflicting_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let providers_path = dir.path().join("providers.toml");
+        for (name, command) in [("a", "claude"), ("b", "claude-other")] {
+            std::fs::write(
+                models_dir.join(format!("{name}.toml")),
+                format!(
+                    r#"
+[[providers]]
+name = "p"
+command = "{command}"
+"#
+                ),
+            )
+            .unwrap();
+        }
+
+        let err = migrate_config_files(&models_dir, &providers_path).unwrap_err();
+
+        assert!(err.contains("conflicting command for provider p"), "{err}");
+    }
+
+    #[test]
+    fn migrate_config_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let providers_path = dir.path().join("providers.toml");
+        std::fs::write(
+            models_dir.join("claude-opus.toml"),
+            r#"
+[[providers]]
+name = "claude"
+command = "claude"
+args = ["-p", "--model", "opus"]
+
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+"#,
+        )
+        .unwrap();
+
+        let first = migrate_config_files(&models_dir, &providers_path).unwrap();
+        let model_after_first =
+            std::fs::read_to_string(models_dir.join("claude-opus.toml")).unwrap();
+        let providers_after_first = std::fs::read_to_string(&providers_path).unwrap();
+        let second = migrate_config_files(&models_dir, &providers_path).unwrap();
+
+        assert_eq!(first.model_files_rewritten, 1);
+        assert_eq!(second.model_files_rewritten, 0);
         assert_eq!(
-            decision,
-            balancer::MigrationDecision::Migrate {
-                target_provider_index: 1,
-                reason: balancer::TransitionReason::Manual,
-            }
+            model_after_first,
+            std::fs::read_to_string(models_dir.join("claude-opus.toml")).unwrap()
+        );
+        assert_eq!(
+            providers_after_first,
+            std::fs::read_to_string(&providers_path).unwrap()
         );
     }
 

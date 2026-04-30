@@ -114,8 +114,10 @@ export interface TestModelResult {
 }
 
 export interface ProviderConfig {
-	command: string;
+	name: string;
+	command?: string;
 	args: string[];
+	interactive_args?: string[];
 }
 
 export type PromptMode = "stdin" | "arg";

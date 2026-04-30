@@ -2633,7 +2633,7 @@ impl StateDb {
                     .ok_or_else(|| ResumeError::UnknownModel {
                         model_name: model_name.clone(),
                     })?;
-            let Some(active_provider_index) = model
+            let Some(_active_provider_index) = model
                 .providers
                 .iter()
                 .position(|provider| provider.name == active_provider)
@@ -2655,11 +2655,6 @@ impl StateDb {
                     suggestions,
                 });
             };
-            if model.providers[active_provider_index].resume.is_none() {
-                return Err(ResumeError::ProviderMissingResume {
-                    provider_name: active_provider,
-                });
-            }
             Some(model)
         } else {
             None
@@ -3494,11 +3489,8 @@ mod tests {
         with_models_config(
             "mapped-model",
             r#"
-prompt_mode = "arg"
-
 [[providers]]
 name = "fixture-provider"
-command = "fixture"
 "#,
             || {
                 let dir = legacy_invocations_db(&[
@@ -4497,11 +4489,8 @@ command = "fixture"
         with_models_config(
             "legacy-model",
             r#"
-prompt_mode = "arg"
-
 [[providers]]
 name = "fixture-provider"
-command = "fixture"
 "#,
             || {
                 let db = test_db();
@@ -5027,40 +5016,21 @@ command = "fixture"
             (
                 "claude-opus",
                 r#"
-prompt_mode = "arg"
-
 [[providers]]
 name = "claude"
-command = "claude"
 interactive_args = ["launch"]
-
-[providers.resume]
-kind = "flag"
-flag = "--resume"
 
 [[providers]]
 name = "claude2"
-command = "claude2"
 interactive_args = ["launch"]
-
-[providers.resume]
-kind = "flag"
-flag = "--resume"
 "#,
             ),
             (
                 "claude-haiku",
                 r#"
-prompt_mode = "arg"
-
 [[providers]]
 name = "claude"
-command = "claude"
 interactive_args = ["launch"]
-
-[providers.resume]
-kind = "flag"
-flag = "--resume"
 "#,
             ),
         ])

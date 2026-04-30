@@ -69,7 +69,7 @@ export default function ModelPanel(props: ModelPanelProps) {
 			const entries: { modelName: string; args: string[] }[] = [];
 			for (const model of models) {
 				for (const provider of model.providers) {
-					if (provider.command === cmd) {
+					if (provider.name === cmd) {
 						entries.push({ modelName: model.name, args: provider.args });
 					}
 				}
@@ -122,7 +122,7 @@ export default function ModelPanel(props: ModelPanelProps) {
 				if (val) args.push(val);
 			}
 
-			providers.push({ command: form.command, args });
+			providers.push({ name: form.command, args });
 		}
 
 		return { name, prompt_mode: "stdin", providers, inputs: [] };

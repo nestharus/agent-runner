@@ -1,8 +1,5 @@
-prompt_mode = "arg"
-
 [[providers]]
 name = "codex"
-command = "codex"
 args = [
   "exec",
   "--json",
@@ -10,21 +7,4 @@ args = [
 ]
 interactive_args = [
   "-m", "gpt-5.4",
-]
-
-[providers.resume]
-kind = "subcommand"
-subcommand = ["resume"]
-
-[providers.resume_acceptance]
-accepted_output_patterns = [
-  "session id: {session_id}",
-  "\"thread_id\":\"{session_id}\"",
-  "\"thread_id\": \"{session_id}\"",
-]
-rejected_output_patterns = [
-  "No session found",
-  "session not found",
-  "invalid session",
-  "not a valid session",
 ]

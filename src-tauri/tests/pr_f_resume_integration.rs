@@ -81,6 +81,12 @@ state_dir = '{}'
         fs::write(self.models_dir.join(format!("{model_name}.toml")), body).unwrap();
     }
 
+    fn write_providers_body(&self, body: &str) {
+        let app_config_dir = self.config_home.join("oulipoly-agent-runner");
+        fs::create_dir_all(&app_config_dir).unwrap();
+        fs::write(app_config_dir.join("providers.toml"), body).unwrap();
+    }
+
     fn write_single_provider_model(
         &self,
         model_name: &str,
@@ -91,18 +97,24 @@ state_dir = '{}'
         self.write_model_body(
             model_name,
             &format!(
-                r#"prompt_mode = "arg"
-
-[[providers]]
+                r#"[[providers]]
 name = "{provider_name}"
-command = "{}"
 args = ["one-shot-only"]
-interactive_args = ["launch"]
-{resume_block}
 "#,
-                script_path.display()
             ),
         );
+        let resume_block =
+            resume_block.replace("[providers.resume]", &format!("[{provider_name}.resume]"));
+        self.write_providers_body(&format!(
+            r#"[{provider_name}]
+command = "{}"
+args = []
+interactive_args = ["launch"]
+prompt_mode = "arg"
+{resume_block}
+"#,
+            script_path.display()
+        ));
     }
 
     fn write_two_provider_model(
@@ -116,32 +128,40 @@ interactive_args = ["launch"]
         self.write_model_body(
             model_name,
             &format!(
-                r#"prompt_mode = "arg"
-
-[[providers]]
+                r#"[[providers]]
 name = "{provider_a_name}"
-command = "{}"
 args = ["exec-a"]
-interactive_args = ["launch-a"]
-
-[providers.resume]
-kind = "flag"
-flag = "--resume"
 
 [[providers]]
 name = "{provider_b_name}"
-command = "{}"
 args = ["exec-b"]
-interactive_args = ["launch-b"]
+"#,
+            ),
+        );
+        self.write_providers_body(&format!(
+            r#"[{provider_a_name}]
+command = "{}"
+args = []
+interactive_args = ["launch-a"]
+prompt_mode = "arg"
 
-[providers.resume]
+[{provider_a_name}.resume]
+kind = "flag"
+flag = "--resume"
+
+[{provider_b_name}]
+command = "{}"
+args = []
+interactive_args = ["launch-b"]
+prompt_mode = "arg"
+
+[{provider_b_name}.resume]
 kind = "flag"
 flag = "--resume"
 "#,
-                provider_a_script.display(),
-                provider_b_script.display()
-            ),
-        );
+            provider_a_script.display(),
+            provider_b_script.display()
+        ));
     }
 
     fn write_migratable_two_provider_model(
@@ -154,43 +174,49 @@ flag = "--resume"
     ) {
         self.write_model_body(
             model_name,
-            &format!(
-                r#"prompt_mode = "arg"
-
-[[providers]]
+            r#"[[providers]]
 name = "claude-a"
-command = "{}"
 args = ["exec-a"]
-interactive_args = ["launch-a"]
-
-[providers.resume]
-kind = "flag"
-flag = "--resume"
-
-[providers.session_storage]
-kind = "claude_code"
-projects_dir = "{}"
 
 [[providers]]
 name = "claude-b"
-command = "{}"
 args = ["exec-b"]
-interactive_args = ["launch-b"]
+"#,
+        );
+        self.write_providers_body(&format!(
+            r#"[claude-a]
+command = "{}"
+args = []
+interactive_args = ["launch-a"]
+prompt_mode = "arg"
 
-[providers.resume]
+[claude-a.resume]
 kind = "flag"
 flag = "--resume"
 
-[providers.session_storage]
+[claude-a.session_storage]
+kind = "claude_code"
+projects_dir = "{}"
+
+[claude-b]
+command = "{}"
+args = []
+interactive_args = ["launch-b"]
+prompt_mode = "arg"
+
+[claude-b.resume]
+kind = "flag"
+flag = "--resume"
+
+[claude-b.session_storage]
 kind = "claude_code"
 projects_dir = "{}"
 "#,
-                provider_a_script.display(),
-                provider_a_projects.display(),
-                provider_b_script.display(),
-                provider_b_projects.display()
-            ),
-        );
+            provider_a_script.display(),
+            provider_a_projects.display(),
+            provider_b_script.display(),
+            provider_b_projects.display()
+        ));
     }
 
     fn stage_claude_jsonl(&self, projects_dir: &Path, session_id: &str) -> PathBuf {

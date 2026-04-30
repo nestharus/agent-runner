@@ -49,11 +49,7 @@ fn derive_pools(models: &HashMap<String, config::ModelConfig>) -> Vec<PoolSummar
     let mut groups: HashMap<Vec<String>, Vec<String>> = HashMap::new();
 
     for model in models.values() {
-        let mut cmds: Vec<String> = model
-            .providers
-            .iter()
-            .map(|p| executor::provider_name(&p.command))
-            .collect();
+        let mut cmds: Vec<String> = model.providers.iter().map(|p| p.name.clone()).collect();
         cmds.sort();
         cmds.dedup();
         groups.entry(cmds).or_default().push(model.name.clone());
@@ -254,8 +250,8 @@ fn save_model(state: tauri::State<AppState>, model: ModelConfig) -> Result<(), S
         return Err("Model must have at least one provider".to_string());
     }
     for (i, p) in model.providers.iter().enumerate() {
-        if p.command.is_empty() {
-            return Err(format!("Provider {} has empty command", i + 1));
+        if p.name.is_empty() {
+            return Err(format!("Provider {} has empty name", i + 1));
         }
     }
     let toml_content = model.to_toml();
@@ -413,11 +409,7 @@ fn update_pool(
     let matching_names: Vec<String> = models
         .values()
         .filter(|m| {
-            let mut cmds: Vec<String> = m
-                .providers
-                .iter()
-                .map(|p| executor::provider_name(&p.command))
-                .collect();
+            let mut cmds: Vec<String> = m.providers.iter().map(|p| p.name.clone()).collect();
             cmds.sort();
             cmds.dedup();
             cmds == orig_sorted
@@ -443,15 +435,14 @@ fn update_pool(
         let model = models.get_mut(name).unwrap();
 
         // Remove providers whose extracted provider name is in the removed set
-        model
-            .providers
-            .retain(|p| !removed.contains(&&executor::provider_name(&p.command)));
+        model.providers.retain(|p| !removed.contains(&&p.name));
 
         // Add providers with empty args for new commands
         for cmd in &added {
-            model
-                .providers
-                .push(config::ProviderConfig::new((*cmd).clone(), vec![]));
+            model.providers.push(config::ProviderConfig::model_provider(
+                (*cmd).clone(),
+                vec![],
+            ));
         }
 
         if model.providers.is_empty() {
@@ -822,19 +813,17 @@ mod tests {
     }
 
     #[test]
-    fn derive_pools_extracts_provider_from_prefixed_command() {
+    fn derive_pools_groups_by_provider_name() {
         let mut models = HashMap::new();
-        // Command with env prefix should group by the last token ("claude")
         models.insert(
             "a".into(),
             ModelConfig {
                 name: "a".to_string(),
                 prompt_mode: PromptMode::Stdin,
-                providers: vec![ProviderConfig::new("env -u CLAUDECODE claude", vec![])],
+                providers: vec![ProviderConfig::model_provider("claude", vec![])],
                 inputs: vec![],
             },
         );
-        // Plain command should also group as "claude"
         models.insert("b".into(), make_model("b", &["claude"]));
 
         let pools = derive_pools(&models);

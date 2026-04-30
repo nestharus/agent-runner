@@ -59,13 +59,24 @@ impl Fixture {
         fs::write(
             self.models_dir.join(format!("{model_name}.toml")),
             format!(
-                r#"prompt_mode = "arg"
-
-[[providers]]
+                r#"[[providers]]
 name = "{provider_name}"
-command = "{}"
 args = ["one-shot-only"]
+interactive_args = ["model-interactive"]
+"#,
+            ),
+        )
+        .unwrap();
+        fs::write(
+            self.config_home
+                .join("oulipoly-agent-runner")
+                .join("providers.toml"),
+            format!(
+                r#"[{provider_name}]
+command = "{}"
+args = []
 interactive_args = ["launch"]
+prompt_mode = "arg"
 "#,
                 script_path.display()
             ),
@@ -82,12 +93,22 @@ interactive_args = ["launch"]
         fs::write(
             self.models_dir.join(format!("{model_name}.toml")),
             format!(
-                r#"prompt_mode = "arg"
-
-[[providers]]
+                r#"[[providers]]
 name = "{provider_name}"
-command = "{}"
 args = ["one-shot-only"]
+            "#,
+            ),
+        )
+        .unwrap();
+        fs::write(
+            self.config_home
+                .join("oulipoly-agent-runner")
+                .join("providers.toml"),
+            format!(
+                r#"[{provider_name}]
+command = "{}"
+args = []
+prompt_mode = "arg"
 "#,
                 script_path.display()
             ),
