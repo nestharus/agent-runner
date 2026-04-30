@@ -1252,6 +1252,17 @@ impl StateDb {
                     params![chain_id, model_name],
                 )
                 .map_err(|e| format!("Failed to update invocation session chain model: {e}"))?;
+            self.conn
+                .execute(
+                    "UPDATE session_chain_segments
+                     SET transition_reason = 'initial'
+                     WHERE chain_id = ?1
+                       AND provider_name = ?2
+                       AND session_id = ?3
+                       AND transition_reason = 'imported'",
+                    params![chain_id, provider_name, session_id],
+                )
+                .map_err(|e| format!("Failed to promote imported session chain segment: {e}"))?;
             return Ok(());
         }
         let chain_id = Uuid::new_v4().to_string();
@@ -2364,9 +2375,13 @@ impl StateDb {
     ) -> Result<i64, DbError> {
         self.conn
             .execute(
-                "INSERT OR IGNORE INTO session_chain_segments
+                "INSERT INTO session_chain_segments
                     (chain_id, provider_name, session_id, started_at, transition_reason)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (chain_id, provider_name, session_id)
+                 DO UPDATE SET transition_reason = 'initial'
+                 WHERE excluded.transition_reason = 'initial'
+                   AND session_chain_segments.transition_reason = 'imported'",
                 params![
                     chain_id,
                     provider_name,
@@ -2496,6 +2511,45 @@ impl StateDb {
                 .map_err(|e| format!("Bad compaction boundary timestamp {raw_ts}: {e}"))
         })
         .transpose()
+    }
+
+    pub fn distinct_chain_segments(&self) -> Result<Vec<(String, String)>, DbError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT provider_name, session_id
+                 FROM session_chain_segments
+                 ORDER BY provider_name, session_id",
+            )
+            .map_err(|e| format!("Failed to prepare chain segment list: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| format!("Failed to query chain segment list: {e}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read chain segment list: {e}"))
+    }
+
+    pub fn flag_compaction_boundary(
+        &self,
+        provider_name: &str,
+        session_id: &str,
+        turn_id: &str,
+    ) -> Result<bool, DbError> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE session_turns
+                 SET is_compaction_boundary = 1
+                 WHERE provider_name = ?1
+                   AND session_id = ?2
+                   AND turn_id = ?3
+                   AND is_compaction_boundary = 0",
+                params![provider_name, session_id, turn_id],
+            )
+            .map_err(|e| format!("Failed to flag compaction boundary: {e}"))?;
+        Ok(changed > 0)
     }
 
     pub fn resolve_resume(
@@ -5260,6 +5314,68 @@ flag = "--resume"
             )
             .unwrap();
         assert_eq!(active, 1);
+    }
+
+    // risk: Chain identity write paths; level: particular-integration; source: proposal §11.1 Chain identity write paths / A3, A8.
+    #[test]
+    fn agent_session_chain_records_initial_reason_even_if_ingestion_minted_first() {
+        let db = test_db();
+        db.mint_imported_chain_if_absent(
+            "claude",
+            SESSION_A,
+            &ts("2026-04-17T08:00:00Z"),
+            "<unknown>",
+        )
+        .unwrap();
+        let id = db
+            .start_invocation(&InvocationStart {
+                invocation_uuid: Uuid::new_v4().to_string(),
+                model_name: "claude-opus".to_string(),
+                provider_name: "claude".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        db.update_session_capture(id, Some(SESSION_A), "fixture")
+            .unwrap();
+
+        db.mint_chain_for_invocation_session(id).unwrap();
+
+        let reason: String = db
+            .conn
+            .query_row(
+                "SELECT transition_reason FROM session_chain_segments
+                 WHERE provider_name = 'claude' AND session_id = ?1",
+                params![SESSION_A],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reason, "initial");
+    }
+
+    // risk: Chain identity write paths; level: particular-integration; source: proposal §11.1 Chain identity write paths / A3, A8.
+    #[test]
+    fn imported_session_stays_imported_when_no_agent_mint_fires() {
+        let db = test_db();
+
+        db.mint_imported_chain_if_absent(
+            "claude",
+            SESSION_A,
+            &ts("2026-04-17T08:00:00Z"),
+            "<unknown>",
+        )
+        .unwrap();
+
+        let reason: String = db
+            .conn
+            .query_row(
+                "SELECT transition_reason FROM session_chain_segments
+                 WHERE provider_name = 'claude' AND session_id = ?1",
+                params![SESSION_A],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reason, "imported");
     }
 
     // risk: Resolver disambiguation and model inference; level: particular-integration; source: proposal §11.1 Resolver disambiguation and model inference.

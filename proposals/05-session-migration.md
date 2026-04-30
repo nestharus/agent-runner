@@ -33,7 +33,7 @@ This is the approved register validated and extended from `research/05-session-m
 
 | ID | Assumption | Evidence | Invalidator | Used by |
 | --- | --- | --- | --- | --- |
-| A1 | Claude Code `--resume <UUID>` replays local JSONL state rather than requiring server-side session state. | Locked answer Q2 says the JSONL is the source of truth and cites Claude Code session docs plus `claude --help` (`research/05-session-migration-answers.md:25-36`); current runner already supports flag resume (`src-tauri/src/config/model.rs:57-87`). | A Claude Code release or observed session where copied JSONL plus `--resume` cannot continue without server-side state. | §6 migration mechanic, §7 `flag` resume path, §9.1 `claude_code` storage, §11.1 migration tests. |
+| A1 | Claude Code `--resume <UUID>` replays local JSONL state rather than requiring server-side session state, and migration must reuse the source UUID on the target side. | Locked answer Q2 says the JSONL is the source of truth and cites Claude Code session docs plus `claude --help` (`research/05-session-migration-answers.md:25-36`); its first sentence verifies `~/.claude2/projects/<hash>/<UUID>.jsonl` plus `--resume <UUID>` works. Live QA empirically rejected the safer-practice idea of minting a new target UUID because Claude Code compares `--resume` against embedded JSONL `sessionId` fields. | A Claude Code release or observed session where copied JSONL plus `--resume` cannot continue without server-side state. | §6 migration mechanic, §7 `flag` resume path, §9.1 `claude_code` storage, §11.1 migration tests. |
 | A2 | Prompt-cache cost makes sticky-then-migrate valuable: Anthropic cache is org-scoped today and workspace-scoped after February 5, 2026; cross-org/workspace migration cost is bounded to one prefix rewrite. | Locked answer Q1 cites Anthropic prompt-cache docs and pricing (`research/05-session-migration-answers.md:5-23`); problem statement explains the sticky-then-migrate cost model (`research/05-session-migration-problem.md:13-22`). | Provider docs, account behavior, or usage data showing cache isolation/cost differs materially for the accounts the runner balances. | §5 threshold policy, §12 README migration explanation, §14 cross-org cache residual, §1.2 net-value statement. |
 | A3 | `session_turns` ingestion captures every adapter-emitted turn soon enough for resolver, quota projection, and compaction-boundary decisions. | Problem-map notes `select_provider` scans providers before scoring and scripts use cursors (`research/05-session-migration-problem-map.md:133-135`); hookpoints identify `scan_provider` and both DB insert paths (`research/05-session-migration-hookpoints.md:45-52`, `research/05-session-migration-hookpoints.md:84-89`). | Adapter cursor bugs, delayed/batched emission, skipped malformed lines, partial writes, or script failures that leave the DB missing turns the proposal relies on. | §3.1.1 UI chain mint, §3.3 last-used updates, §4 resolver previews, §6.6 compaction-aware copy, §10 trace counts. |
 | A4 | `score_by_density` can be extracted into `compute_projections` without changing provider selection. | Problem-map identifies the local projection body and existing density tests (`research/05-session-migration-problem-map.md:136`); hookpoints locate the exact extraction surface and non-hookpoint keep-list (`research/05-session-migration-hookpoints.md:54-63`, `research/05-session-migration-hookpoints.md:128-131`). | Any branch reorder, tie behavior change, hidden-window penalty change, bootstrap/fallback change, or balancer test regression after extraction. | §5.1 refactor, §5 migration decision, §13/§13.1 blast-radius notes, §11.1 projection-equivalence tests. |
@@ -354,10 +354,10 @@ When `decide_migration` returns `Migrate { target_provider_index, reason }`:
 
    **Encoder note**: replicating Claude Code's project-path-to-cwd_hash encoding is explicitly out of scope. Migration only needs the *current* hash for the *current* session, which is already encoded in the source path on disk. New session creation under agent-runner is unchanged — the upstream CLI continues to do its own encoding when it writes new JSONLs.
 
-2. **Mint target session_id** via `uuid_v4()`. Avoids dup-UUID collisions in target HOME and Claude Code's undocumented dup-id behavior.
+2. **Reuse source session_id** on the target side. Cross-HOME UUID collisions don't happen because each Claude HOME has its own JSONL space; this matches answers Q2's first sentence which already verified `~/.claude2/projects/<hash>/<UUID>.jsonl` resolves cleanly.
 
 3. **Compute target path** via target's `[providers.session_storage]`:
-   - `kind = "claude_code"`: `<target.projects_dir>/<cwd_hash>/<target_session_id>.jsonl`. `cwd_hash` is the value extracted from the source path in step 1.
+   - `kind = "claude_code"`: `<target.projects_dir>/<cwd_hash>/<source_session_id>.jsonl`. `cwd_hash` is the value extracted from the source path in step 1.
    - `kind = "codex"`: return `MigrationError::CodexMigrationDeferred { provider }`. Codex cannot be a migration target in v1.
 
 4. **Determine compaction-anchor offset** (see §6.6). If a compaction boundary exists for the source `(provider, session_id)`, find its byte offset in the source JSONL; otherwise offset = 0. If a boundary is recorded in `session_turns` but the matching JSONL line cannot be located (turn_id mismatch, JSONL truncated, format drift): `MigrationError::CompactionBoundaryNotInJsonl { session_id, turn_id }` — **no silent offset=0 fallback** (would mask the very overflow §6.6 prevents).
@@ -372,13 +372,13 @@ When `decide_migration` returns `Migrate { target_provider_index, reason }`:
    ```sql
    INSERT INTO session_chain_segments
        (chain_id, provider_name, session_id, started_at, transition_reason)
-   VALUES (?, ?target_provider, ?target_session_id, ?now, ?reason);
+   VALUES (?, ?target_provider, ?source_session_id, ?now, ?reason);
    ```
    The transaction-with-RETURNING from §3.2 guarantees no concurrent migration races to write two open segments.
 
 7. **Compose target argv** via `[providers.resume]`:
-   - `kind = "flag"`: `--resume <target_session_id>` (Claude).
-   - `kind = "subcommand"`: `<subcommand> <target_session_id>` (Codex one-shot/REPL fresh-session resume; not used for Codex migration in v1).
+   - `kind = "flag"`: `--resume <source_session_id>` (Claude).
+   - `kind = "subcommand"`: `<subcommand> <source_session_id>` (Codex one-shot/REPL fresh-session resume; not used for Codex migration in v1).
 
 8. **Spawn target provider** with composed argv and the user's prompt. The target's `command` field already encodes the right HOME-switching env (e.g. `env -u CLAUDECODE claude2`); no new env handling needed.
 
@@ -386,7 +386,7 @@ When `decide_migration` returns `Migrate { target_provider_index, reason }`:
 
 10. **On target CLI failure**: leave the new segment open; record the failed invocation. The resolver's "max(started_at)" tiebreak picks the failed segment on next resume — defensive but correct. Document that a user can re-issue `--migrate <other-provider>` to fork again. Cleanup of stale target JSONLs is deferred to a follow-up GC pass.
 
-11. **Format normalization caveat**: first-pass implementation copies bytes unchanged within the post-compaction slice and assumes the target CLI accepts arbitrary session_id metadata embedded in the JSONL records. If a CLI rejects copied JSONLs because record-level fields embed the source session_id, that requires a deliberate normalization PR — **do not silently sed-edit JSONL bytes**. Document in §14 as a watched failure mode.
+11. **Format normalization caveat**: first-pass implementation copies bytes unchanged within the post-compaction slice and keeps the source session_id so record-level JSONL metadata and the resume UUID agree. If a future CLI requires additional normalization, that requires a deliberate normalization PR — **do not silently sed-edit JSONL bytes**. Document in §14 as a watched failure mode.
 
 ## 6.6 Compaction-aware target build
 
@@ -449,7 +449,7 @@ fn compose_resume_args(
 ) -> Result<Vec<String>, ComposeError>
 ```
 
-Update both call sites at `executor/cli.rs:410` (one-shot resume) and `:528` (interactive resume) to thread the optional target path. The parameter is reserved for the deferred Codex migration follow-up — see §15. In v1, the only migration path that passes a target path is Claude-Code JSONL copy, and the existing `flag` strategy still composes `--resume <target_session_id>`.
+Update both call sites at `executor/cli.rs:410` (one-shot resume) and `:528` (interactive resume) to thread the optional target path. The parameter is reserved for the deferred Codex migration follow-up — see §15. In v1, the only migration path that passes a target path is Claude-Code JSONL copy, and the existing `flag` strategy still composes `--resume <source_session_id>`.
 
 Codex provider example:
 
@@ -664,7 +664,8 @@ Unit tests (Rust, `#[test]`):
 - `decide_migration_stays_when_no_sibling_has_session_storage`: sibling lacks `[providers.session_storage]`, assert `Stay`.
 - `decide_migration_manual_overrides_threshold`: `manual_target = Some("claude2")`, active at 50%, assert `Migrate { reason = Manual }`.
 - `decide_migration_returns_codex_deferred_for_codex_provider`: active provider has `kind = "codex"` storage. With a migration-eligible Claude-Code sibling, assert `Migrate`; without one, assert `Stay` and a logged reason that Codex migration is deferred.
-- `migration_copies_claude_jsonl_to_target_projects_dir`: stage a fake JSONL under source projects_dir, run migration, assert target projects_dir contains the file at `<cwd_hash>/<new_session_id>.jsonl`.
+- `migration_copies_claude_jsonl_to_target_projects_dir`: stage a fake JSONL under source projects_dir, run migration, assert target projects_dir contains the file at `<cwd_hash>/<source_session_id>.jsonl`.
+- `migration_reuses_source_session_id_on_target_side`: run a Claude-Code migration and assert `MigratedSegment.target_session_id == source_session_id`, target path uses the source UUID, and the new segment is unique by `(chain_id, target_provider, source_session_id)`.
 - `migration_mechanic_errors_codex_deferred_on_codex_active_provider`: invoke the migration mechanic with a Codex source provider and a Claude-Code target candidate, assert `MigrationError::CodexMigrationDeferred { provider }` and no target file/segment is written.
 - `migration_does_not_emit_migrate_stderr_on_codex_deferred`: invoke the migration mechanic with a Codex active provider, triggering `MigrationError::CodexMigrationDeferred`; assert stderr does NOT contain `[migrate]`; assert no segment row was inserted.
 - `migration_truncates_target_jsonl_at_latest_compaction_boundary`: source JSONL has 10 turns with `is_compaction_boundary = 1` on turn 6. Target JSONL contains turns 6-10 only; turns 1-5 are absent. Source JSONL is unchanged.
@@ -674,6 +675,10 @@ Unit tests (Rust, `#[test]`):
 - `pre_compaction_turns_remain_queryable_after_migration`: assert `session_turns` rows for the pre-compaction span are still SELECT-able after migration completes.
 - `turn_script_optional_compaction_field_defaults_false`: ingest a turn with no `is_compaction_boundary` field, assert column is `0`.
 - `turn_script_compaction_field_propagates_to_session_turns`: ingest a turn with `is_compaction_boundary: true`, assert column is `1`.
+- `migrate_db_compaction_backfill_idempotent_on_second_run`: seed an existing `session_turns` row with `is_compaction_boundary = 0`, re-read a Claude JSONL containing `isCompactSummary: true`, assert the first pass flags one row and the second pass flags zero rows.
+- `session_storage_expands_tilde_in_projects_dir`: parse model TOML with `projects_dir = "~/.claude/projects"` and `sessions_dir = "~/.codex/sessions"`, assert both paths are expanded against `dirs::home_dir()`.
+- `agent_session_chain_records_initial_reason_even_if_ingestion_minted_first`: mint an imported segment from ingestion, then mint the agent-session chain for the same `(provider, session_id)`, assert `transition_reason = 'initial'`.
+- `imported_session_stays_imported_when_no_agent_mint_fires`: mint only from ingestion and assert `transition_reason = 'imported'`.
 - `chain_last_used_at_updates_after_successful_invocation`: invoke a chain-tied invocation, assert `session_chains.last_used_at` advances to within the call window. Pins §3.3's write hook directly so the 24h disambiguation rule is verified end-to-end (not just on seeded data).
 - `migration_errors_on_source_path_malformed`: stage a `[providers.session_storage]` whose `transcript_locator` returns a path with no parent (e.g. a bare filename). Assert `MigrationError::SourcePathMalformed`. Defensive but pins the `MigrationError` variant against accidental removal during refactor.
 - `migrate_db_command_runs_backfill_to_completion`: invoke `agents migrate-db` against a fresh DB with seeded `session_turns` rows. Assert exit 0; assert resulting `session_chains` and `session_chain_segments` rows match what `StateDb::open`'s synchronous backfill produces on the same seed. Pins the equivalence guarantee in §8.5.1.

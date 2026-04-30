@@ -270,7 +270,13 @@ Scripts have a 30-second timeout and run via `sh -c`, so `~` expansion and pipel
 Install them on your `$PATH`:
 
 ```bash
-install -m 755 scripts/anthropic-usage scripts/chatgpt-usage scripts/zai-usage ~/.local/bin/
+install -m 755 \
+  scripts/anthropic-usage \
+  scripts/chatgpt-usage \
+  scripts/zai-usage \
+  scripts/claude-code-turns \
+  scripts/codex-turns \
+  ~/.local/bin/
 ```
 
 ## Session Ingestion

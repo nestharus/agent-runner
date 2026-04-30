@@ -9,7 +9,7 @@ use agent_runner_lib::trace::{TraceOptions, render_ascii_trace, trace_invocation
 
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
-use std::io::{IsTerminal, Read, Write as _};
+use std::io::{BufRead, IsTerminal, Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use uuid::Uuid;
@@ -1281,6 +1281,11 @@ fn run_migrate_db() -> Result<i32, String> {
         "session chain backfill: chains={} segments={} skipped_existing={}",
         report.chains_inserted, report.segments_inserted, report.skipped_existing
     );
+    let compaction_report = run_compaction_backfill(&state)?;
+    println!(
+        "compaction backfill: {} turns flagged across {} sessions",
+        compaction_report.turns_flagged, compaction_report.sessions_processed
+    );
     Ok(0)
 }
 
@@ -1295,15 +1300,122 @@ fn run_resume_list(uuid: &str) -> Result<i32, String> {
         return Ok(0);
     }
     for preview in previews {
-        println!(
-            "{} {} {} {} turns",
-            preview.chain_id,
-            preview.active_provider,
-            preview.active_session_id,
-            preview.turn_count
-        );
+        println!("{}", format_resume_list_line(&preview));
     }
     Ok(0)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CompactionBackfillReport {
+    turns_flagged: u64,
+    sessions_processed: u64,
+}
+
+fn run_compaction_backfill(state: &StateDb) -> Result<CompactionBackfillReport, String> {
+    let config_root = dirs::config_dir()
+        .map(|d| d.join("oulipoly-agent-runner"))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let sessions_path = config_root.join("sessions.toml");
+    let sessions_cfg = agent_runner_lib::config::SessionsConfig::load(&sessions_path)
+        .map_err(|e| format!("Failed to load {}: {e}", sessions_path.display()))?;
+    let models_dir = default_models_dir();
+    let models = if models_dir.is_dir() {
+        load_models(&models_dir)?
+    } else {
+        HashMap::new()
+    };
+
+    let mut report = CompactionBackfillReport {
+        turns_flagged: 0,
+        sessions_processed: 0,
+    };
+    for (provider_name, session_id) in state.distinct_chain_segments()? {
+        let Some(path) =
+            locate_compaction_backfill_source(&provider_name, &session_id, &sessions_cfg, &models)
+        else {
+            continue;
+        };
+        let flagged =
+            flag_compaction_boundaries_from_jsonl(state, &provider_name, &session_id, &path)?;
+        report.turns_flagged += flagged;
+        report.sessions_processed += 1;
+        println!(
+            "compaction backfill session: provider={} session_id={} flagged={}",
+            provider_name, session_id, flagged
+        );
+    }
+    Ok(report)
+}
+
+fn locate_compaction_backfill_source(
+    provider_name: &str,
+    session_id: &str,
+    sessions_cfg: &agent_runner_lib::config::SessionsConfig,
+    models: &HashMap<String, ModelConfig>,
+) -> Option<PathBuf> {
+    if let Ok(Some(path)) =
+        agent_runner_lib::sessions::locate_transcript(sessions_cfg, provider_name, session_id)
+        && path.exists()
+    {
+        return Some(path);
+    }
+
+    models
+        .values()
+        .flat_map(|model| model.providers.iter())
+        .filter(|provider| provider.name == provider_name)
+        .find_map(|provider| {
+            agent_runner_lib::migration::find_claude_source_from_storage(provider, session_id)
+        })
+        .filter(|path| path.exists())
+}
+
+fn flag_compaction_boundaries_from_jsonl(
+    state: &StateDb,
+    provider_name: &str,
+    session_id: &str,
+    path: &Path,
+) -> Result<u64, String> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| format!("Failed to open compaction source {}: {e}", path.display()))?;
+    let mut flagged = 0u64;
+    for line in std::io::BufReader::new(file).lines() {
+        let line = line.map_err(|e| {
+            format!(
+                "Failed to read compaction source line from {}: {e}",
+                path.display()
+            )
+        })?;
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if obj
+            .get("isCompactSummary")
+            .and_then(|value| value.as_bool())
+            != Some(true)
+        {
+            continue;
+        }
+        let Some(turn_id) = obj.get("uuid").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if state.flag_compaction_boundary(provider_name, session_id, turn_id)? {
+            flagged += 1;
+        }
+    }
+    Ok(flagged)
+}
+
+fn format_resume_list_line(preview: &agent_runner_lib::state::ChainPreview) -> String {
+    format!(
+        "chain_id={} last_used_at={} active_provider={} active_session_id={} turn_count={} recent_turns_count={}",
+        preview.chain_id,
+        preview.last_used_at.to_rfc3339(),
+        preview.active_provider,
+        preview.active_session_id,
+        preview.turn_count,
+        preview.recent_turns.len()
+    )
 }
 
 fn normalize_resume_list_args<I, S>(args: I) -> Vec<String>
@@ -1945,5 +2057,65 @@ mod tests {
             }
             other => panic!("expected hidden resume-list variant, got {other:?}"),
         }
+    }
+
+    // risk: CLI surface; level: unit; source: proposal §11.1 CLI surface / A5, A8.
+    #[test]
+    fn resume_list_line_includes_required_chain_fields() {
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-04-17T08:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let preview = agent_runner_lib::state::ChainPreview {
+            chain_id: "5169694d-de0f-40d1-890c-6e28e55bab27".to_string(),
+            last_used_at: ts,
+            active_provider: "claude".to_string(),
+            active_session_id: "dd116a3c-6819-42b1-b3d2-f512331eb5ec".to_string(),
+            turn_count: 42,
+            recent_turns: vec![agent_runner_lib::state::TurnPreview {
+                role: "assistant".to_string(),
+                timestamp: ts,
+                snippet: None,
+            }],
+        };
+
+        let line = format_resume_list_line(&preview);
+
+        assert!(line.contains("chain_id=5169694d-de0f-40d1-890c-6e28e55bab27"));
+        assert!(line.contains("last_used_at=2026-04-17T08:00:00+00:00"));
+        assert!(line.contains("active_provider=claude"));
+        assert!(line.contains("active_session_id=dd116a3c-6819-42b1-b3d2-f512331eb5ec"));
+        assert!(line.contains("turn_count=42"));
+        assert!(line.contains("recent_turns_count=1"));
+    }
+
+    // risk: Schema migration and backfill; level: particular-integration; source: proposal §11.1 Schema migration and backfill / A5, A6.
+    #[test]
+    fn migrate_db_compaction_backfill_idempotent_on_second_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(&dir.path().join("state.db")).unwrap();
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-04-17T08:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        db.ingest_session_turn("claude", "session-a", "turn-1", &ts, "assistant", "")
+            .unwrap();
+        let jsonl = dir.path().join("session-a.jsonl");
+        std::fs::write(
+            &jsonl,
+            r#"{"uuid":"turn-1","sessionId":"session-a","timestamp":"2026-04-17T08:00:00Z","type":"assistant","isCompactSummary":true}"#,
+        )
+        .unwrap();
+
+        let first =
+            flag_compaction_boundaries_from_jsonl(&db, "claude", "session-a", &jsonl).unwrap();
+        let second =
+            flag_compaction_boundaries_from_jsonl(&db, "claude", "session-a", &jsonl).unwrap();
+
+        assert_eq!(first, 1);
+        assert_eq!(second, 0);
+        assert!(
+            db.latest_compaction_boundary("claude", "session-a")
+                .unwrap()
+                .is_some()
+        );
     }
 }

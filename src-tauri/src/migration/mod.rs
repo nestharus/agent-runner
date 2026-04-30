@@ -4,7 +4,6 @@ use crate::sessions::locate_transcript;
 use crate::state::{ResolvedResume, StateDb};
 use std::io::Write;
 use std::path::PathBuf;
-use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub enum MigrationError {
@@ -134,7 +133,7 @@ pub fn migrate_chain_segment(
         });
     }
 
-    let target_session_id = Uuid::new_v4().to_string();
+    let target_session_id = resolved.active_session_id.clone();
     let SessionStorage::ClaudeCode { projects_dir } =
         target
             .session_storage
@@ -244,7 +243,7 @@ pub fn migrate_chain_segment(
     })
 }
 
-fn find_claude_source_from_storage(
+pub fn find_claude_source_from_storage(
     provider: &crate::config::ProviderConfig,
     session_id: &str,
 ) -> Option<PathBuf> {
@@ -259,4 +258,127 @@ fn find_claude_source_from_storage(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ModelConfig, SessionsConfig};
+    use crate::state::{InvocationStart, StateDb};
+
+    fn model_with_storage(
+        source_projects: &std::path::Path,
+        target_projects: &std::path::Path,
+    ) -> ModelConfig {
+        ModelConfig::from_toml(
+            "claude-opus",
+            &format!(
+                r#"
+prompt_mode = "arg"
+
+[[providers]]
+name = "claude"
+command = "claude"
+interactive_args = ["launch"]
+
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+
+[providers.session_storage]
+kind = "claude_code"
+projects_dir = "{}"
+
+[[providers]]
+name = "claude2"
+command = "claude2"
+interactive_args = ["launch"]
+
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+
+[providers.session_storage]
+kind = "claude_code"
+projects_dir = "{}"
+"#,
+                source_projects.display(),
+                target_projects.display()
+            ),
+        )
+        .unwrap()
+    }
+
+    // risk: Migration mechanic source UUID reuse; level: particular-integration; source: proposal §11.1 Migration mechanic / A1.
+    #[test]
+    fn migration_reuses_source_session_id_on_target_side() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_projects = dir.path().join("source-projects");
+        let target_projects = dir.path().join("target-projects");
+        let cwd_hash = "cwd-hash";
+        let session_id = "dd116a3c-6819-42b1-b3d2-f512331eb5ec";
+        let source_dir = source_projects.join(cwd_hash);
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(
+            source_dir.join(format!("{session_id}.jsonl")),
+            format!(
+                r#"{{"uuid":"turn-1","sessionId":"{session_id}","timestamp":"2026-04-17T08:00:00Z","type":"assistant"}}"#
+            ),
+        )
+        .unwrap();
+        let state = StateDb::open(&dir.path().join("state.db")).unwrap();
+        let invocation_id = state
+            .start_invocation(&InvocationStart {
+                invocation_uuid: uuid::Uuid::new_v4().to_string(),
+                model_name: "claude-opus".to_string(),
+                provider_name: "claude".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        state
+            .update_session_capture(invocation_id, Some(session_id), "fixture")
+            .unwrap();
+        state
+            .mint_chain_for_invocation_session(invocation_id)
+            .unwrap();
+        let chain_id = state
+            .chain_id_for_segment("claude", session_id)
+            .unwrap()
+            .unwrap();
+        let model = model_with_storage(&source_projects, &target_projects);
+        let resolved = ResolvedResume {
+            chain_id: chain_id.clone(),
+            model_name: model.name.clone(),
+            model: model.clone(),
+            active_provider: "claude".to_string(),
+            active_provider_index: 0,
+            active_session_id: session_id.to_string(),
+        };
+        let mut stderr = Vec::new();
+
+        let migrated = migrate_chain_segment(
+            &state,
+            &SessionsConfig::default(),
+            &model,
+            &resolved,
+            1,
+            TransitionReason::Manual,
+            &mut stderr,
+        )
+        .unwrap();
+
+        assert_eq!(migrated.target_session_id, session_id);
+        assert_eq!(
+            migrated.target_jsonl_path,
+            target_projects
+                .join(cwd_hash)
+                .join(format!("{session_id}.jsonl"))
+        );
+        assert!(migrated.target_jsonl_path.exists());
+        assert_eq!(
+            state.chain_id_for_segment("claude2", session_id).unwrap(),
+            Some(chain_id)
+        );
+    }
 }

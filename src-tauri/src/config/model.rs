@@ -186,6 +186,17 @@ pub enum SessionStorage {
 }
 
 impl SessionStorage {
+    pub fn expand_tilde(self) -> Self {
+        match self {
+            SessionStorage::ClaudeCode { projects_dir } => SessionStorage::ClaudeCode {
+                projects_dir: expand_leading_tilde(projects_dir),
+            },
+            SessionStorage::Codex { sessions_dir } => SessionStorage::Codex {
+                sessions_dir: expand_leading_tilde(sessions_dir),
+            },
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         match self {
             SessionStorage::ClaudeCode { projects_dir } => {
@@ -201,6 +212,20 @@ impl SessionStorage {
         }
         Ok(())
     }
+}
+
+fn expand_leading_tilde(path: PathBuf) -> PathBuf {
+    let raw = path.to_string_lossy();
+    let Some(home) = dirs::home_dir() else {
+        return path;
+    };
+    if raw == "~" {
+        return home;
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        return home.join(rest);
+    }
+    path
 }
 
 /// Derive a provider name from a command + args vector.
@@ -635,7 +660,7 @@ impl ModelConfig {
                         resume: p.resume,
                         session_capture: p.session_capture,
                         resume_acceptance: p.resume_acceptance,
-                        session_storage: p.session_storage,
+                        session_storage: p.session_storage.map(SessionStorage::expand_tilde),
                     }
                 })
                 .collect()
@@ -650,7 +675,7 @@ impl ModelConfig {
                 resume: raw.resume,
                 session_capture: raw.session_capture,
                 resume_acceptance: raw.resume_acceptance,
-                session_storage: raw.session_storage,
+                session_storage: raw.session_storage.map(SessionStorage::expand_tilde),
             }]
         } else {
             return Err(format!(
@@ -1950,6 +1975,39 @@ kind = "{kind}"
         assert!(matches!(
             codex.providers[0].session_storage,
             Some(SessionStorage::Codex { ref sessions_dir }) if sessions_dir.ends_with("sessions")
+        ));
+    }
+
+    // risk: Session storage path resolution; level: unit; source: proposal §11.2 session_storage_expands_tilde_in_projects_dir / A1.
+    #[test]
+    fn session_storage_expands_tilde_in_projects_dir() {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        let claude = ModelConfig::from_toml(
+            "claude-storage-tilde",
+            &test_provider_with_session_storage(
+                "claude_code",
+                "projects_dir",
+                "~/.claude/projects",
+            ),
+        )
+        .unwrap();
+        let codex = ModelConfig::from_toml(
+            "codex-storage-tilde",
+            &test_provider_with_session_storage("codex", "sessions_dir", "~/.codex/sessions"),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            claude.providers[0].session_storage,
+            Some(SessionStorage::ClaudeCode { ref projects_dir })
+                if projects_dir == &home.join(".claude/projects")
+        ));
+        assert!(matches!(
+            codex.providers[0].session_storage,
+            Some(SessionStorage::Codex { ref sessions_dir })
+                if sessions_dir == &home.join(".codex/sessions")
         ));
     }
 
