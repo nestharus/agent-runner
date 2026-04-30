@@ -887,7 +887,7 @@ fn interactive_repl_resume_routes_to_session_owner_in_multi_provider_model() {
 }
 
 #[test]
-fn repl_resume_migrates_to_best_scored_provider() {
+fn repl_resume_migrates_to_least_loaded_provider() {
     let fixture = Fixture::new();
     let chain_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
@@ -951,7 +951,7 @@ fn repl_resume_migrates_to_best_scored_provider() {
 }
 
 #[test]
-fn repl_resume_stays_when_active_is_best_scored() {
+fn repl_resume_stays_when_active_is_least_loaded() {
     let fixture = Fixture::new();
     let chain_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
@@ -990,7 +990,7 @@ fn repl_resume_stays_when_active_is_best_scored() {
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert!(
         !provider_b_marker.exists(),
-        "repl --resume should stay on active provider when it is best scored"
+        "repl --resume should stay on active provider when it is least loaded"
     );
     assert_eq!(
         fs::read_to_string(&provider_a_marker).unwrap(),

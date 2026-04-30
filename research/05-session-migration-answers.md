@@ -79,13 +79,13 @@ Last-3-turns preview source: `session_turns` joined to the active segment, order
 
 ## Q6: Migration trigger policy
 
-Pick the best-scored sibling at every resume. The decision uses the existing balancer projection (`score_by_density` produces per-window projected_used_percent at `src-tauri/src/balancer/mod.rs:162-196`) and compares provider binding scores, with ties broken by lower provider index.
+Pick the least-loaded sibling at every resume. The decision reuses the existing balancer projection (`compute_projections` produces per-window `projected_used` values), but it does **not** compare binding scores. For each provider, resume ranking uses `max(projected_used)` across that provider's visible windows; lower is better, and ties break by lower provider index. Providers with no learned windows have an empty projection vector and are treated as load `0.0`.
 
 Reasoning: resume is rare and happens between invocations, not per turn, so thrashing is not a concern. Cache stickiness rarely buys much because agents fan out and often miss cache anyway.
 
 There is no `migration_threshold` config field and no `[migration]` block. Removed policy config is deleted, not retained as ignored compatibility surface.
 
-A second, hard trigger: if the current provider has `provider_quotas.exhausted_at IS NOT NULL` (set by initiative 04's reactive flag), migrate to the highest-scored storage-backed sibling regardless of the active provider's score.
+A second, hard trigger: if the current provider has `provider_quotas.exhausted_at IS NOT NULL` (set by initiative 04's reactive flag), migrate to the lowest-load storage-backed sibling regardless of the active provider's load.
 
 A short-circuit: if the model's pool has only one provider with `[providers.session_storage]` declared, no migration target exists — stay.
 

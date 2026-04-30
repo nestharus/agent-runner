@@ -373,7 +373,7 @@ pub fn decide_migration(
 
     if active_exhausted {
         if let Some(target) =
-            best_scored_migration_target(model, &projections, Some(active_provider_index))
+            lowest_load_migration_target(model, &projections, Some(active_provider_index))
         {
             return Ok(MigrationDecision::Migrate {
                 target_provider_index: target.provider_index,
@@ -383,7 +383,7 @@ pub fn decide_migration(
         return Ok(MigrationDecision::Stay);
     }
 
-    let Some(best) = best_scored_migration_target(model, &projections, None) else {
+    let Some(best) = lowest_load_migration_target(model, &projections, None) else {
         return Ok(MigrationDecision::Stay);
     };
     if best.provider_index == active_provider_index {
@@ -400,7 +400,20 @@ fn has_session_storage(provider: &crate::config::ProviderConfig) -> bool {
     provider.session_storage.is_some()
 }
 
-fn best_scored_migration_target<'a>(
+fn provider_load(projection: &ProviderProjection) -> f64 {
+    let max_projected_used = projection
+        .projections_per_window
+        .iter()
+        .map(|window| window.projected_used)
+        .fold(f64::NEG_INFINITY, f64::max);
+    if max_projected_used.is_finite() {
+        max_projected_used
+    } else {
+        0.0
+    }
+}
+
+fn lowest_load_migration_target<'a>(
     model: &ModelConfig,
     projections: &'a [ProviderProjection],
     exclude_provider_index: Option<usize>,
@@ -414,14 +427,11 @@ fn best_scored_migration_target<'a>(
                 .get(projection.provider_index)
                 .is_some_and(has_session_storage)
         })
-        .filter(|projection| projection.binding_score.is_some())
         .min_by(|a, b| {
-            let score_order = b
-                .binding_score
-                .unwrap()
-                .partial_cmp(&a.binding_score.unwrap())
+            let load_order = provider_load(a)
+                .partial_cmp(&provider_load(b))
                 .unwrap_or(std::cmp::Ordering::Equal);
-            score_order.then_with(|| a.provider_index.cmp(&b.provider_index))
+            load_order.then_with(|| a.provider_index.cmp(&b.provider_index))
         })
 }
 
@@ -1180,8 +1190,12 @@ mod tests {
     fn decide_migration_picks_best_scored_sibling_on_resume() {
         let db = StateDb::open(Path::new(":memory:")).unwrap();
         let model = migratable_model(&[("claude", "claude_code"), ("claude2", "claude_code")]);
-        seed_windows_with_deltas(&db, "claude", &[(0.80, 5, 0.01, 22)]);
-        seed_windows_with_deltas(&db, "claude2", &[(0.30, 5, 0.01, 22)]);
+        seed_windows_with_deltas(&db, "claude", &[(0.83, 50, 0.01, 22)]);
+        seed_windows_with_deltas(
+            &db,
+            "claude2",
+            &[(0.19, 24 * 7, 0.01, 22), (0.09, 3, 0.01, 22)],
+        );
 
         let decision = decide_migration(&db, &model, &resolved_for(&model, 0), None).unwrap();
 
@@ -1196,7 +1210,7 @@ mod tests {
 
     // risk: Best-on-resume decision; level: particular-integration; source: proposal §11.1 Best-on-resume decision / A2, A4.
     #[test]
-    fn decide_migration_stays_when_active_is_best_scored() {
+    fn decide_migration_stays_when_active_is_least_loaded() {
         let db = StateDb::open(Path::new(":memory:")).unwrap();
         let model = migratable_model(&[("claude", "claude_code"), ("claude2", "claude_code")]);
         seed_windows_with_deltas(&db, "claude", &[(0.30, 5, 0.01, 22)]);
@@ -1205,6 +1219,29 @@ mod tests {
         let decision = decide_migration(&db, &model, &resolved_for(&model, 0), None).unwrap();
 
         assert_eq!(decision, MigrationDecision::Stay);
+    }
+
+    // risk: Best-on-resume decision; level: particular-integration; source: proposal §11.1 Best-on-resume decision / A2, A4.
+    #[test]
+    fn decide_migration_ignores_short_window_pressure_on_siblings() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = migratable_model(&[("claude", "claude_code"), ("claude3", "claude_code")]);
+        seed_windows_with_deltas(&db, "claude", &[(0.83, 50, 0.01, 22)]);
+        seed_windows_with_deltas(
+            &db,
+            "claude3",
+            &[(0.19, 24 * 7, 0.01, 22), (0.09, 3, 0.01, 22)],
+        );
+
+        let decision = decide_migration(&db, &model, &resolved_for(&model, 0), None).unwrap();
+
+        assert_eq!(
+            decision,
+            MigrationDecision::Migrate {
+                target_provider_index: 1,
+                reason: TransitionReason::QuotaThreshold
+            }
+        );
     }
 
     // risk: Best-on-resume decision; level: particular-integration; source: proposal §11.1 Best-on-resume decision / A2, A4.
