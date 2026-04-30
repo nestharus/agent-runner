@@ -28,6 +28,11 @@ pub enum MigrationError {
         provider: String,
         path: String,
     },
+    TargetSessionInUseByOtherChain {
+        provider: String,
+        session_id: String,
+        conflicting_chain_id: String,
+    },
     TargetDirectoryCreateFailed {
         path: String,
         message: String,
@@ -187,10 +192,14 @@ pub fn migrate_chain_segment(
         }
     })?;
     let target_path = target_dir.join(format!("{target_session_id}.jsonl"));
-    if target_path.exists() {
-        return Err(MigrationError::TargetAlreadyExists {
+    if let Some(conflicting_chain_id) = state
+        .find_conflicting_active_segment(&target.name, &target_session_id, &resolved.chain_id)
+        .map_err(|message| MigrationError::Db { message })?
+    {
+        return Err(MigrationError::TargetSessionInUseByOtherChain {
             provider: target.name.clone(),
-            path: target_path.display().to_string(),
+            session_id: target_session_id.clone(),
+            conflicting_chain_id,
         });
     }
     let tmp = target_path.with_extension("jsonl.tmp");

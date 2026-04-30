@@ -2379,9 +2379,11 @@ impl StateDb {
                     (chain_id, provider_name, session_id, started_at, transition_reason)
                  VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT (chain_id, provider_name, session_id)
-                 DO UPDATE SET transition_reason = 'initial'
-                 WHERE excluded.transition_reason = 'initial'
-                   AND session_chain_segments.transition_reason = 'imported'",
+                 DO UPDATE SET
+                    started_at = excluded.started_at,
+                    ended_at = NULL,
+                    last_turn_id = NULL,
+                    transition_reason = excluded.transition_reason",
                 params![
                     chain_id,
                     provider_name,
@@ -2400,6 +2402,29 @@ impl StateDb {
                 |row| row.get(0),
             )
             .map_err(|e| format!("Failed to read session chain segment id: {e}"))
+    }
+
+    pub fn find_conflicting_active_segment(
+        &self,
+        provider_name: &str,
+        session_id: &str,
+        own_chain_id: &str,
+    ) -> Result<Option<String>, DbError> {
+        self.conn
+            .query_row(
+                "SELECT chain_id
+                 FROM session_chain_segments
+                 WHERE provider_name = ?1
+                   AND session_id = ?2
+                   AND chain_id != ?3
+                   AND ended_at IS NULL
+                 ORDER BY started_at DESC, id DESC
+                 LIMIT 1",
+                params![provider_name, session_id, own_chain_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to check conflicting active session segment: {e}"))
     }
 
     pub fn mint_imported_chain_if_absent(

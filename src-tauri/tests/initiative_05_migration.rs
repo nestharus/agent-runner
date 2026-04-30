@@ -17,6 +17,7 @@ use std::process::{Command, Output};
 
 const SESSION_A: &str = "5169694d-de0f-40d1-890c-6e28e55bab27";
 const CHAIN_A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const CHAIN_B: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 
 struct Fixture {
     dir: tempfile::TempDir,
@@ -682,6 +683,247 @@ fn migration_copies_claude_jsonl_to_target_projects_dir() {
     assert_eq!(
         fixture_lines(&migrated.target_jsonl_path),
         fixture_lines(&source_jsonl)
+    );
+}
+
+// risk: Migration mechanic: same-chain provider rejoin overwrites stale target transcript; level: particular-integration; source: live QA TargetAlreadyExists regression.
+#[test]
+fn migration_overwrites_target_when_same_chain_revisits_provider() {
+    let fixture = Fixture::new();
+    let source_projects = fixture.dir.path().join("source-projects");
+    let target_projects = fixture.dir.path().join("target-projects");
+    let cwd_hash = "cwd-hash-fixture";
+    let stale_target = source_projects
+        .join(cwd_hash)
+        .join(format!("{SESSION_A}.jsonl"));
+    let current_source = target_projects
+        .join(cwd_hash)
+        .join(format!("{SESSION_A}.jsonl"));
+    fs::create_dir_all(stale_target.parent().unwrap()).unwrap();
+    fs::create_dir_all(current_source.parent().unwrap()).unwrap();
+    fs::write(&stale_target, "{\"turn\":\"stale\"}\n").unwrap();
+    fs::write(
+        &current_source,
+        "{\"turn\":\"current-1\"}\n{\"turn\":\"current-2\"}\n",
+    )
+    .unwrap();
+    let locator = fixture.write_script(
+        "claude2-locator.sh",
+        &format!(r#"printf '%s\n' "{}""#, current_source.display()),
+    );
+    let sessions = fixture.sessions_config_with_locator("claude2", &locator);
+    let model = fixture.migration_model(&source_projects, &target_projects);
+    let _ = fixture.open_db();
+    let conn = fixture.conn();
+    conn.execute(
+        "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
+         VALUES (?1, '2026-04-17T08:00:00Z', '2026-04-17T08:10:00Z', 'claude-opus')",
+        params![CHAIN_A],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session_chain_segments
+            (chain_id, provider_name, session_id, started_at, ended_at, transition_reason)
+         VALUES (?1, 'claude', ?2, '2026-04-17T08:00:00Z', '2026-04-17T08:05:00Z', 'initial')",
+        params![CHAIN_A, SESSION_A],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session_chain_segments
+            (chain_id, provider_name, session_id, started_at, transition_reason)
+         VALUES (?1, 'claude2', ?2, '2026-04-17T08:05:00Z', 'quota_threshold')",
+        params![CHAIN_A, SESSION_A],
+    )
+    .unwrap();
+    drop(conn);
+    let db = fixture.open_db();
+    let resolved = ResolvedResume {
+        chain_id: CHAIN_A.to_string(),
+        model_name: model.name.clone(),
+        model: model.clone(),
+        active_provider: "claude2".to_string(),
+        active_provider_index: 1,
+        active_session_id: SESSION_A.to_string(),
+    };
+    let mut stderr = Vec::new();
+
+    let migrated = migrate_chain_segment(
+        &db,
+        &sessions,
+        &model,
+        &resolved,
+        0,
+        TransitionReason::Manual,
+        &mut stderr,
+    )
+    .unwrap();
+
+    assert_eq!(migrated.target_jsonl_path, stale_target);
+    assert_eq!(
+        fixture_lines(&migrated.target_jsonl_path),
+        fixture_lines(&current_source)
+    );
+    let active_provider: String = fixture
+        .conn()
+        .query_row(
+            "SELECT provider_name FROM session_chain_segments WHERE chain_id = ?1 AND ended_at IS NULL",
+            params![CHAIN_A],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(active_provider, "claude");
+}
+
+// risk: Migration mechanic: target session UUID conflict detection; level: particular-integration; source: live QA TargetAlreadyExists regression / Q5.
+#[test]
+fn migration_refuses_when_other_chain_owns_target_session() {
+    let fixture = Fixture::new();
+    let source_projects = fixture.dir.path().join("source-projects");
+    let target_projects = fixture.dir.path().join("target-projects");
+    let current_source = target_projects
+        .join("cwd-hash-fixture")
+        .join(format!("{SESSION_A}.jsonl"));
+    fs::create_dir_all(current_source.parent().unwrap()).unwrap();
+    fs::write(&current_source, "{\"turn\":\"current\"}\n").unwrap();
+    let locator = fixture.write_script(
+        "conflict-locator.sh",
+        &format!(r#"printf '%s\n' "{}""#, current_source.display()),
+    );
+    let sessions = fixture.sessions_config_with_locator("claude2", &locator);
+    let model = fixture.migration_model(&source_projects, &target_projects);
+    let _ = fixture.open_db();
+    let conn = fixture.conn();
+    for chain_id in [CHAIN_A, CHAIN_B] {
+        conn.execute(
+            "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
+             VALUES (?1, '2026-04-17T08:00:00Z', '2026-04-17T08:00:00Z', 'claude-opus')",
+            params![chain_id],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "INSERT INTO session_chain_segments
+            (chain_id, provider_name, session_id, started_at, transition_reason)
+         VALUES (?1, 'claude2', ?2, '2026-04-17T08:05:00Z', 'initial')",
+        params![CHAIN_A, SESSION_A],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session_chain_segments
+            (chain_id, provider_name, session_id, started_at, transition_reason)
+         VALUES (?1, 'claude', ?2, '2026-04-17T08:05:00Z', 'initial')",
+        params![CHAIN_B, SESSION_A],
+    )
+    .unwrap();
+    drop(conn);
+    let db = fixture.open_db();
+    let resolved = ResolvedResume {
+        chain_id: CHAIN_A.to_string(),
+        model_name: model.name.clone(),
+        model: model.clone(),
+        active_provider: "claude2".to_string(),
+        active_provider_index: 1,
+        active_session_id: SESSION_A.to_string(),
+    };
+    let mut stderr = Vec::new();
+
+    let err = migrate_chain_segment(
+        &db,
+        &sessions,
+        &model,
+        &resolved,
+        0,
+        TransitionReason::Manual,
+        &mut stderr,
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        err,
+        MigrationError::TargetSessionInUseByOtherChain {
+            provider,
+            session_id,
+            conflicting_chain_id
+        } if provider == "claude"
+            && session_id == SESSION_A
+            && conflicting_chain_id == CHAIN_B
+    ));
+}
+
+// risk: Migration mechanic: closed segments do not block target UUID overwrite; level: particular-integration; source: live QA TargetAlreadyExists regression / Q5.
+#[test]
+fn migration_overwrites_when_other_chain_segment_is_closed() {
+    let fixture = Fixture::new();
+    let source_projects = fixture.dir.path().join("source-projects");
+    let target_projects = fixture.dir.path().join("target-projects");
+    let cwd_hash = "cwd-hash-fixture";
+    let target_path = source_projects
+        .join(cwd_hash)
+        .join(format!("{SESSION_A}.jsonl"));
+    let current_source = target_projects
+        .join(cwd_hash)
+        .join(format!("{SESSION_A}.jsonl"));
+    fs::create_dir_all(target_path.parent().unwrap()).unwrap();
+    fs::create_dir_all(current_source.parent().unwrap()).unwrap();
+    fs::write(&target_path, "{\"turn\":\"closed-chain-stale\"}\n").unwrap();
+    fs::write(&current_source, "{\"turn\":\"current\"}\n").unwrap();
+    let locator = fixture.write_script(
+        "closed-conflict-locator.sh",
+        &format!(r#"printf '%s\n' "{}""#, current_source.display()),
+    );
+    let sessions = fixture.sessions_config_with_locator("claude2", &locator);
+    let model = fixture.migration_model(&source_projects, &target_projects);
+    let _ = fixture.open_db();
+    let conn = fixture.conn();
+    for chain_id in [CHAIN_A, CHAIN_B] {
+        conn.execute(
+            "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
+             VALUES (?1, '2026-04-17T08:00:00Z', '2026-04-17T08:00:00Z', 'claude-opus')",
+            params![chain_id],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "INSERT INTO session_chain_segments
+            (chain_id, provider_name, session_id, started_at, transition_reason)
+         VALUES (?1, 'claude2', ?2, '2026-04-17T08:05:00Z', 'initial')",
+        params![CHAIN_A, SESSION_A],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session_chain_segments
+            (chain_id, provider_name, session_id, started_at, ended_at, transition_reason)
+         VALUES (?1, 'claude', ?2, '2026-04-17T08:00:00Z', '2026-04-17T08:04:00Z', 'initial')",
+        params![CHAIN_B, SESSION_A],
+    )
+    .unwrap();
+    drop(conn);
+    let db = fixture.open_db();
+    let resolved = ResolvedResume {
+        chain_id: CHAIN_A.to_string(),
+        model_name: model.name.clone(),
+        model: model.clone(),
+        active_provider: "claude2".to_string(),
+        active_provider_index: 1,
+        active_session_id: SESSION_A.to_string(),
+    };
+    let mut stderr = Vec::new();
+
+    let migrated = migrate_chain_segment(
+        &db,
+        &sessions,
+        &model,
+        &resolved,
+        0,
+        TransitionReason::Manual,
+        &mut stderr,
+    )
+    .unwrap();
+
+    assert_eq!(migrated.target_jsonl_path, target_path);
+    assert_eq!(
+        fixture_lines(&migrated.target_jsonl_path),
+        fixture_lines(&current_source)
     );
 }
 
