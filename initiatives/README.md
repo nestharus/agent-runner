@@ -26,7 +26,7 @@ gets a `.DROPPED` suffix.
 | 02 | Interactive resume — non-interactive resume-with-answer, session_id ingest, top-level `--resume` unification | landed | 01 |
 | 03 | Load balancing tiers — per-window scoring, bootstrap cascade, risk classes (gating later removed by 04) | landed (3 PRs) | 02 |
 | 04 | Reactive routing — replace 03's threshold/risk-class gating with per-account `exhausted_at` flag set on quota failure, cleared on successful refresh | landed (PRs #12, #13) | 03 |
-| 05 | Session migration — chain identity decoupled from session_id; sticky-then-migrate at resume; resume without `-m`; compaction-aware target build | landed (commits `15c121a`, `a344bd0`, `91403a0`, `5f17d95`) | 04 |
+| 05 | Session migration — chain identity decoupled from session_id; sticky-then-migrate at resume; resume without `-m`; compaction-aware target build | landed (commits `15c121a`, `a344bd0`, `91403a0`, `5f17d95`, `21c67f7`) | 04 |
 
 ## Backfill note
 

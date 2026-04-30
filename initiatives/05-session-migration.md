@@ -1,6 +1,6 @@
 # Initiative 05 — Session Migration
 
-**Status:** landed (commits `15c121a` docs backfill, `a344bd0` planning + risk gates, `91403a0` implementation, `5f17d95` post-review cleanup; merged to main)
+**Status:** landed (commits `15c121a` docs backfill, `a344bd0` planning + risk gates, `91403a0` implementation, `5f17d95` post-review cleanup, `21c67f7` live-QA hotfixes; live QA verified — see `review/05-qa-live.md`)
 **Depends on:** Initiative 04 (reactive routing — uses `provider_quotas.exhausted_at` and `score_by_density` projection)
 **Blocks:** —
 
