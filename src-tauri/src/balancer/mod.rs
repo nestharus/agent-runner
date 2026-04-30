@@ -1,8 +1,10 @@
-use crate::config::{ModelConfig, ProvidersConfig, SessionsConfig};
+use crate::config::{ModelConfig, ProvidersConfig, SessionStorage, SessionsConfig};
+use crate::migration::MigrationError;
 use crate::quota::{InFlight, RefreshOutcome, is_stale, refresh_provider};
 use crate::sessions::scan_provider;
-use crate::state::{QuotaRecord, QuotaWindow, StateDb};
+use crate::state::{QuotaRecord, QuotaWindow, ResolvedResume, StateDb};
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 
 const ERROR_WINDOW_MINUTES: i64 = 30;
 const ERROR_THRESHOLD: u64 = 3;
@@ -22,6 +24,53 @@ struct ProviderEval {
     index: usize,
     binding_score: Option<f64>,
     unlearned: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderProjection {
+    pub provider_index: usize,
+    pub projections_per_window: Vec<WindowProjection>,
+    pub binding_score: Option<f64>,
+    pub recent_error_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowProjection {
+    pub window_id: i64,
+    pub projected_used: f64,
+    pub hours_until_reset: f64,
+    pub remaining_headroom: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MigrationDecision {
+    Stay,
+    Migrate {
+        target_provider_index: usize,
+        reason: TransitionReason,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransitionReason {
+    Initial,
+    Manual,
+    QuotaThreshold,
+    Exhausted,
+    Imported,
+}
+
+impl TransitionReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TransitionReason::Initial => "initial",
+            TransitionReason::Manual => "manual",
+            TransitionReason::QuotaThreshold => "quota_threshold",
+            TransitionReason::Exhausted => "exhausted",
+            TransitionReason::Imported => "imported",
+        }
+    }
 }
 
 /// Contextual dependencies for quota-aware balancing. When present,
@@ -60,7 +109,7 @@ pub fn select_provider(
             }
             // Session scan errors don't abort the pick — we just project with
             // a stale turn count instead of an up-to-date one.
-            let _ = scan_provider(&p.name, ctx.sessions_cfg, state);
+            let _ = scan_provider(&p.name, ctx.sessions_cfg, ctx.providers_cfg, state);
         }
     }
 
@@ -241,6 +290,204 @@ fn score_by_density(
     }
 
     best_binding_score(&eligible).index
+}
+
+pub fn compute_projections(
+    model: &ModelConfig,
+    state: &StateDb,
+    ctx: Option<&BalanceContext<'_>>,
+) -> Vec<ProviderProjection> {
+    if let Some(ctx) = ctx {
+        for p in &model.providers {
+            if is_stale(state, &p.name) {
+                let _: RefreshOutcome =
+                    refresh_provider(&p.name, ctx.providers_cfg, ctx.in_flight, state);
+            }
+            let _ = scan_provider(&p.name, ctx.sessions_cfg, ctx.providers_cfg, state);
+        }
+    }
+
+    let quotas: Vec<Option<QuotaRecord>> = model
+        .providers
+        .iter()
+        .map(|p| state.get_quota(&p.name).ok().flatten())
+        .collect();
+    let windows: Vec<Vec<QuotaWindow>> = model
+        .providers
+        .iter()
+        .map(|p| state.get_windows(&p.name).unwrap_or_default())
+        .collect();
+    let now = Utc::now();
+    let candidates: Vec<usize> = (0..model.providers.len()).collect();
+    let pool_max_live_windows = candidates
+        .iter()
+        .map(|&i| windows[i].iter().filter(|w| w.resets_at > now).count())
+        .max()
+        .unwrap_or(0);
+
+    candidates
+        .into_iter()
+        .map(|i| {
+            let ws = &windows[i];
+            let recent_errors = state
+                .recent_error_count(&model.name, i, ERROR_WINDOW_MINUTES)
+                .unwrap_or(0);
+            if recent_errors >= ERROR_THRESHOLD {
+                return ProviderProjection {
+                    provider_index: i,
+                    projections_per_window: Vec::new(),
+                    binding_score: None,
+                    recent_error_count: recent_errors as u32,
+                };
+            }
+
+            let q = quotas[i].as_ref();
+            let turns = q
+                .and_then(|q| {
+                    state
+                        .count_assistant_turns_since(
+                            &model.providers[i].name,
+                            q.refreshed_at.as_ref(),
+                        )
+                        .ok()
+                })
+                .unwrap_or(0);
+            let mut binding_score = f64::INFINITY;
+            let mut unlearned = false;
+            let mut scored_window = false;
+            let mut projections = Vec::new();
+
+            let live_window_count = ws.iter().filter(|w| w.resets_at > now).count();
+            let any_visible_near_cap = ws
+                .iter()
+                .any(|w| w.resets_at > now && w.used_percent >= HIDDEN_WINDOW_PENALTY_THRESHOLD);
+            if live_window_count < pool_max_live_windows && any_visible_near_cap {
+                binding_score = binding_score.min(0.0);
+                scored_window = true;
+            }
+
+            for window in ws {
+                if window.resets_at <= now {
+                    continue;
+                }
+                let Some(burn_rate) = bootstrap_burn_rate(i, window, &quotas, &windows) else {
+                    unlearned = true;
+                    continue;
+                };
+                let projected = project_used_percent(window.used_percent, turns, burn_rate);
+                let hours = ((window.resets_at - now).num_seconds() as f64 / 3600.0).max(EPS_HOURS);
+                let remaining_headroom = (1.0 - projected).max(0.0);
+                binding_score = binding_score.min(remaining_headroom * hours);
+                scored_window = true;
+                projections.push(WindowProjection {
+                    window_id: window.window_id as i64,
+                    projected_used: projected,
+                    hours_until_reset: hours,
+                    remaining_headroom,
+                });
+            }
+
+            ProviderProjection {
+                provider_index: i,
+                projections_per_window: projections,
+                binding_score: if unlearned || !scored_window {
+                    None
+                } else {
+                    Some(binding_score)
+                },
+                recent_error_count: recent_errors as u32,
+            }
+        })
+        .collect()
+}
+
+pub fn decide_migration(
+    state: &StateDb,
+    model: &ModelConfig,
+    resolved: &ResolvedResume,
+    threshold: f64,
+    manual_target: Option<&str>,
+) -> Result<MigrationDecision, MigrationError> {
+    if model.providers.len() <= 1 {
+        return Ok(MigrationDecision::Stay);
+    }
+
+    if let Some(target) = manual_target {
+        if let Some(target_provider_index) = model.providers.iter().position(|p| p.name == target) {
+            let target_provider = &model.providers[target_provider_index];
+            if target_provider.resume.is_some()
+                && is_claude_code_storage(target_provider.session_storage.as_ref())
+            {
+                return Ok(MigrationDecision::Migrate {
+                    target_provider_index,
+                    reason: TransitionReason::Manual,
+                });
+            }
+        }
+        return Ok(MigrationDecision::Stay);
+    }
+
+    let active = &model.providers[resolved.active_provider_index];
+    let active_exhausted = state
+        .get_quota(&active.name)
+        .map_err(|message| MigrationError::Db { message })?
+        .and_then(|quota| quota.exhausted_at)
+        .is_some();
+    let projections = compute_projections(model, state, None);
+    let active_projected = projections
+        .iter()
+        .find(|projection| projection.provider_index == resolved.active_provider_index)
+        .and_then(|projection| {
+            projection
+                .projections_per_window
+                .iter()
+                .map(|window| window.projected_used)
+                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        })
+        .unwrap_or(0.0);
+
+    if !active_exhausted && active_projected < threshold {
+        return Ok(MigrationDecision::Stay);
+    }
+
+    let target = projections
+        .iter()
+        .filter(|projection| projection.provider_index != resolved.active_provider_index)
+        .filter(|projection| {
+            let provider = &model.providers[projection.provider_index];
+            provider.resume.is_some() && is_claude_code_storage(provider.session_storage.as_ref())
+        })
+        .filter(|projection| {
+            active_exhausted
+                || projection
+                    .projections_per_window
+                    .iter()
+                    .all(|window| window.projected_used < active_projected)
+        })
+        .filter(|projection| projection.binding_score.is_some())
+        .max_by(|a, b| {
+            a.binding_score
+                .unwrap()
+                .partial_cmp(&b.binding_score.unwrap())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+    if let Some(target) = target {
+        Ok(MigrationDecision::Migrate {
+            target_provider_index: target.provider_index,
+            reason: if active_exhausted {
+                TransitionReason::Exhausted
+            } else {
+                TransitionReason::QuotaThreshold
+            },
+        })
+    } else {
+        Ok(MigrationDecision::Stay)
+    }
+}
+
+fn is_claude_code_storage(storage: Option<&SessionStorage>) -> bool {
+    matches!(storage, Some(SessionStorage::ClaudeCode { .. }))
 }
 
 fn best_binding_score<'a>(evals: &[&'a ProviderEval]) -> &'a ProviderEval {
@@ -483,6 +730,7 @@ mod tests {
                 ProviderConfig::new("b", vec![]),
             ],
             inputs: vec![],
+            migration_threshold: 0.95,
         }
     }
 
@@ -496,6 +744,7 @@ mod tests {
                 ProviderConfig::new("c", vec![]),
             ],
             inputs: vec![],
+            migration_threshold: 0.95,
         }
     }
 
@@ -507,6 +756,7 @@ mod tests {
             prompt_mode: PromptMode::Arg,
             providers: vec![ProviderConfig::new("x", vec![])],
             inputs: vec![],
+            migration_threshold: 0.95,
         };
         assert_eq!(select_provider(&model, &db, None), 0);
     }
@@ -584,6 +834,7 @@ mod tests {
                 role: "assistant".to_string(),
                 parent_turn_id: None,
                 is_sidechain: false,
+                is_compaction_boundary: false,
             })
             .collect();
         db.ingest_session_turns_batch(provider_name, &turns)
@@ -937,5 +1188,207 @@ mod tests {
         record_invocation_for_test(&db, "test", "a", 0, true);
 
         assert_eq!(selected_provider_index(&model, &db), 1);
+    }
+
+    fn migratable_model(provider_names: &[(&str, &str)]) -> ModelConfig {
+        let mut body = String::from("prompt_mode = \"arg\"\n\n[migration]\nthreshold = 0.95\n");
+        for (name, storage_kind) in provider_names {
+            body.push_str(&format!(
+                r#"
+[[providers]]
+name = "{name}"
+command = "{name}"
+
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+"#
+            ));
+            match *storage_kind {
+                "claude_code" => body.push_str(&format!(
+                    r#"
+[providers.session_storage]
+kind = "claude_code"
+projects_dir = "/tmp/{name}/projects"
+"#
+                )),
+                "codex" => body.push_str(&format!(
+                    r#"
+[providers.session_storage]
+kind = "codex"
+sessions_dir = "/tmp/{name}/sessions"
+"#
+                )),
+                "none" => {}
+                other => panic!("unknown storage kind fixture {other}"),
+            }
+        }
+        ModelConfig::from_toml("migration-fixture", &body).unwrap()
+    }
+
+    fn resolved_for(model: &ModelConfig, provider_index: usize) -> crate::state::ResolvedResume {
+        let provider = &model.providers[provider_index];
+        crate::state::ResolvedResume {
+            chain_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string(),
+            model_name: model.name.clone(),
+            model: model.clone(),
+            active_provider: provider.name.clone(),
+            active_provider_index: provider_index,
+            active_session_id: "5169694d-de0f-40d1-890c-6e28e55bab27".to_string(),
+        }
+    }
+
+    // risk: Sticky-then-migrate decision; level: particular-integration; source: proposal §11.1 Sticky-then-migrate decision / A2, A4.
+    #[test]
+    fn decide_migration_stays_under_threshold() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = migratable_model(&[("claude", "claude_code"), ("claude2", "claude_code")]);
+        seed_windows_with_deltas(&db, "claude", &[(0.80, 5, 0.01, 22)]);
+        seed_windows_with_deltas(&db, "claude2", &[(0.30, 5, 0.01, 22)]);
+
+        let decision = decide_migration(&db, &model, &resolved_for(&model, 0), 0.95, None).unwrap();
+
+        assert_eq!(decision, MigrationDecision::Stay);
+    }
+
+    // risk: Sticky-then-migrate decision; level: particular-integration; source: proposal §11.1 Sticky-then-migrate decision / A2, A4.
+    #[test]
+    fn decide_migration_migrates_above_threshold() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = migratable_model(&[("claude", "claude_code"), ("claude2", "claude_code")]);
+        seed_windows_with_deltas(&db, "claude", &[(0.96, 5, 0.01, 22)]);
+        seed_windows_with_deltas(&db, "claude2", &[(0.30, 5, 0.01, 22)]);
+
+        let decision = decide_migration(&db, &model, &resolved_for(&model, 0), 0.95, None).unwrap();
+
+        assert_eq!(
+            decision,
+            MigrationDecision::Migrate {
+                target_provider_index: 1,
+                reason: TransitionReason::QuotaThreshold
+            }
+        );
+    }
+
+    // risk: Sticky-then-migrate decision; level: particular-integration; source: proposal §11.1 Sticky-then-migrate decision / A2, A4.
+    #[test]
+    fn decide_migration_migrates_when_exhausted_flag_set() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = migratable_model(&[("claude", "claude_code"), ("claude2", "claude_code")]);
+        seed_windows_with_deltas(&db, "claude", &[(0.20, 5, 0.01, 22)]);
+        seed_windows_with_deltas(&db, "claude2", &[(0.30, 5, 0.01, 22)]);
+        db.mark_exhausted("claude").unwrap();
+
+        let decision = decide_migration(&db, &model, &resolved_for(&model, 0), 0.95, None).unwrap();
+
+        assert_eq!(
+            decision,
+            MigrationDecision::Migrate {
+                target_provider_index: 1,
+                reason: TransitionReason::Exhausted
+            }
+        );
+    }
+
+    // risk: Sticky-then-migrate decision; level: particular-integration; source: proposal §11.1 Sticky-then-migrate decision / A2, A4.
+    #[test]
+    fn decide_migration_stays_when_no_better_sibling() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = migratable_model(&[("claude", "claude_code"), ("claude2", "claude_code")]);
+        seed_windows_with_deltas(&db, "claude", &[(0.96, 5, 0.01, 22)]);
+        seed_windows_with_deltas(&db, "claude2", &[(0.98, 5, 0.01, 22)]);
+
+        let decision = decide_migration(&db, &model, &resolved_for(&model, 0), 0.95, None).unwrap();
+
+        assert_eq!(decision, MigrationDecision::Stay);
+    }
+
+    // risk: Sticky-then-migrate decision; level: particular-integration; source: proposal §11.1 Sticky-then-migrate decision / A2, A4.
+    #[test]
+    fn decide_migration_stays_when_single_provider_pool() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = migratable_model(&[("claude", "claude_code")]);
+        seed_windows_with_deltas(&db, "claude", &[(0.99, 5, 0.01, 22)]);
+
+        let decision = decide_migration(&db, &model, &resolved_for(&model, 0), 0.95, None).unwrap();
+
+        assert_eq!(decision, MigrationDecision::Stay);
+    }
+
+    // risk: Sticky-then-migrate decision; level: particular-integration; source: proposal §11.1 Sticky-then-migrate decision / A2, A4.
+    #[test]
+    fn decide_migration_stays_when_no_sibling_has_session_storage() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = migratable_model(&[("claude", "claude_code"), ("claude2", "none")]);
+        seed_windows_with_deltas(&db, "claude", &[(0.99, 5, 0.01, 22)]);
+        seed_windows_with_deltas(&db, "claude2", &[(0.30, 5, 0.01, 22)]);
+
+        let decision = decide_migration(&db, &model, &resolved_for(&model, 0), 0.95, None).unwrap();
+
+        assert_eq!(decision, MigrationDecision::Stay);
+    }
+
+    // risk: Sticky-then-migrate decision; level: particular-integration; source: proposal §11.1 Sticky-then-migrate decision / A2, A4.
+    #[test]
+    fn decide_migration_manual_overrides_threshold() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = migratable_model(&[("claude", "claude_code"), ("claude2", "claude_code")]);
+        seed_windows_with_deltas(&db, "claude", &[(0.50, 5, 0.01, 22)]);
+        seed_windows_with_deltas(&db, "claude2", &[(0.60, 5, 0.01, 22)]);
+
+        let decision =
+            decide_migration(&db, &model, &resolved_for(&model, 0), 0.95, Some("claude2")).unwrap();
+
+        assert_eq!(
+            decision,
+            MigrationDecision::Migrate {
+                target_provider_index: 1,
+                reason: TransitionReason::Manual
+            }
+        );
+    }
+
+    // risk: Sticky-then-migrate decision; level: particular-integration; source: proposal §11.1 Sticky-then-migrate decision / A2, A4, A7.
+    #[test]
+    fn decide_migration_returns_codex_deferred_for_codex_provider() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let mixed = migratable_model(&[("codex", "codex"), ("claude", "claude_code")]);
+        seed_windows_with_deltas(&db, "codex", &[(0.99, 5, 0.01, 22)]);
+        seed_windows_with_deltas(&db, "claude", &[(0.30, 5, 0.01, 22)]);
+
+        let decision = decide_migration(&db, &mixed, &resolved_for(&mixed, 0), 0.95, None).unwrap();
+
+        assert_eq!(
+            decision,
+            MigrationDecision::Migrate {
+                target_provider_index: 1,
+                reason: TransitionReason::QuotaThreshold
+            }
+        );
+
+        let codex_only = migratable_model(&[("codex", "codex"), ("codex2", "codex")]);
+        seed_windows_with_deltas(&db, "codex2", &[(0.30, 5, 0.01, 22)]);
+        let stay =
+            decide_migration(&db, &codex_only, &resolved_for(&codex_only, 0), 0.95, None).unwrap();
+        assert_eq!(stay, MigrationDecision::Stay);
+    }
+
+    // risk: compute_projections refactor equivalence; level: unit; source: proposal §11.1 compute_projections refactor equivalence / A4.
+    #[test]
+    fn compute_projections_exposes_window_projection_used_by_selection() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = migratable_model(&[("claude", "claude_code"), ("claude2", "claude_code")]);
+        seed_windows_with_deltas(&db, "claude", &[(0.40, 5, 0.01, 22)]);
+        seed_assistant_turns_since_refresh(&db, "claude", 10);
+
+        let projections = compute_projections(&model, &db, None);
+
+        let active = projections
+            .iter()
+            .find(|projection| projection.provider_index == 0)
+            .expect("active provider projection");
+        assert_eq!(active.projections_per_window.len(), 1);
+        assert!(active.projections_per_window[0].projected_used >= 0.40);
+        assert!(active.binding_score.is_some());
     }
 }

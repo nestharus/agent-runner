@@ -66,7 +66,8 @@ def emit_file(path: Path, out) -> None:
                 except json.JSONDecodeError:
                     continue
                 kind = obj.get("type")
-                if kind not in ("user", "assistant"):
+                is_compaction_boundary = obj.get("isCompactSummary") is True
+                if kind not in ("user", "assistant") and not is_compaction_boundary:
                     continue
                 uuid = obj.get("uuid")
                 ts = obj.get("timestamp")
@@ -80,6 +81,7 @@ def emit_file(path: Path, out) -> None:
                     "role": kind,
                     "parent_turn_id": obj.get("parentUuid"),
                     "is_sidechain": obj.get("isSidechain"),
+                    "is_compaction_boundary": is_compaction_boundary,
                 }))
                 out.write("\n")
     except OSError:

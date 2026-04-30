@@ -16,6 +16,9 @@ pub struct ProviderEntry {
     /// `quota_script` is retried once. Provider-agnostic: the runner does
     /// not implement OAuth itself; it delegates to the CLI.
     pub auth_refresh_command: Option<String>,
+    /// Optional default model used when a UI-started provider session has no
+    /// invocation history tying it to a model.
+    pub default_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -29,6 +32,8 @@ struct RawEntry {
     quota_script: Option<String>,
     #[serde(default)]
     auth_refresh_command: Option<String>,
+    #[serde(default)]
+    default_model: Option<String>,
 }
 
 impl ProvidersConfig {
@@ -49,6 +54,7 @@ impl ProvidersConfig {
                     ProviderEntry {
                         quota_script: v.quota_script,
                         auth_refresh_command: v.auth_refresh_command,
+                        default_model: v.default_model,
                     },
                 )
             })
@@ -119,5 +125,27 @@ quota_script = "anthropic-usage ~/.claude2/.credentials.json"
     fn missing_file_is_empty_config() {
         let cfg = ProvidersConfig::load(Path::new("/nonexistent/path/providers.toml")).unwrap();
         assert!(cfg.entries.is_empty());
+    }
+
+    // risk: Resolver disambiguation and model inference; level: unit; source: proposal §11.1 Resolver disambiguation and model inference / A8.
+    #[test]
+    fn parses_default_model() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            r#"
+[claude]
+quota_script = "anthropic-usage ~/.claude/.credentials.json"
+default_model = "claude-opus"
+"#
+        )
+        .unwrap();
+
+        let cfg = ProvidersConfig::load(f.path()).unwrap();
+
+        assert_eq!(
+            cfg.get("claude").unwrap().default_model.as_deref(),
+            Some("claude-opus")
+        );
     }
 }

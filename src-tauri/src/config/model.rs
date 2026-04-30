@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
@@ -19,6 +19,8 @@ pub struct ProviderConfig {
     pub session_capture: Option<SessionCapture>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_acceptance: Option<ResumeAcceptanceRules>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_storage: Option<SessionStorage>,
 }
 
 impl ProviderConfig {
@@ -34,6 +36,7 @@ impl ProviderConfig {
             resume: None,
             session_capture: None,
             resume_acceptance: None,
+            session_storage: None,
         }
     }
 
@@ -162,6 +165,31 @@ impl SessionCapture {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SessionStorage {
+    ClaudeCode { projects_dir: PathBuf },
+    Codex { sessions_dir: PathBuf },
+}
+
+impl SessionStorage {
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            SessionStorage::ClaudeCode { projects_dir } => {
+                if projects_dir.as_os_str().is_empty() {
+                    return Err("session_storage.kind = claude_code requires `projects_dir`".into());
+                }
+            }
+            SessionStorage::Codex { sessions_dir } => {
+                if sessions_dir.as_os_str().is_empty() {
+                    return Err("session_storage.kind = codex requires `sessions_dir`".into());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Derive a provider name from a command + args vector.
 ///
 /// The heuristic picks the first token that looks like an executable name —
@@ -218,6 +246,12 @@ pub struct ModelConfig {
     pub providers: Vec<ProviderConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<InputDef>,
+    #[serde(default = "default_migration_threshold")]
+    pub migration_threshold: f64,
+}
+
+fn default_migration_threshold() -> f64 {
+    0.95
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -292,8 +326,10 @@ struct RawModelToml {
     prompt_mode: Option<String>,
     session_capture: Option<SessionCapture>,
     resume_acceptance: Option<ResumeAcceptanceRules>,
+    session_storage: Option<SessionStorage>,
     providers: Option<Vec<RawProvider>>,
     inputs: Option<Vec<RawInput>>,
+    migration: Option<RawMigration>,
 }
 
 #[derive(Deserialize)]
@@ -306,6 +342,12 @@ struct RawProvider {
     resume: Option<ResumeStrategy>,
     session_capture: Option<SessionCapture>,
     resume_acceptance: Option<ResumeAcceptanceRules>,
+    session_storage: Option<SessionStorage>,
+}
+
+#[derive(Deserialize)]
+struct RawMigration {
+    threshold: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -429,8 +471,15 @@ impl ModelConfig {
                 "resume_acceptance",
                 p.resume_acceptance.as_ref(),
             );
+            append_session_storage_toml(&mut out, "session_storage", p.session_storage.as_ref());
         } else {
             out.push_str(&format!("prompt_mode = \"{}\"\n", mode_str));
+            if (self.migration_threshold - default_migration_threshold()).abs() > f64::EPSILON {
+                out.push_str(&format!(
+                    "\n[migration]\nthreshold = {}\n",
+                    self.migration_threshold
+                ));
+            }
             for p in &self.providers {
                 out.push_str("\n[[providers]]\n");
                 // Only emit an explicit name line when the stored name differs
@@ -459,6 +508,11 @@ impl ModelConfig {
                     &mut out,
                     "providers.resume_acceptance",
                     p.resume_acceptance.as_ref(),
+                );
+                append_session_storage_toml(
+                    &mut out,
+                    "providers.session_storage",
+                    p.session_storage.as_ref(),
                 );
             }
         }
@@ -535,6 +589,16 @@ impl ModelConfig {
             toml::from_str(content).map_err(|e| format!("TOML parse error for {name}: {e}"))?;
 
         let prompt_mode = parse_prompt_mode(raw.prompt_mode.as_deref().unwrap_or("stdin"));
+        let migration_threshold = raw
+            .migration
+            .as_ref()
+            .and_then(|m| m.threshold)
+            .unwrap_or_else(default_migration_threshold);
+        if !(migration_threshold > 0.0 && migration_threshold <= 1.0) {
+            return Err(format!(
+                "Model {name}: [migration].threshold must be > 0.0 and <= 1.0"
+            ));
+        }
 
         let inputs = if let Some(raw_inputs) = raw.inputs {
             parse_inputs(raw_inputs)?
@@ -558,6 +622,7 @@ impl ModelConfig {
                         resume: p.resume,
                         session_capture: p.session_capture,
                         resume_acceptance: p.resume_acceptance,
+                        session_storage: p.session_storage,
                     }
                 })
                 .collect()
@@ -572,6 +637,7 @@ impl ModelConfig {
                 resume: raw.resume,
                 session_capture: raw.session_capture,
                 resume_acceptance: raw.resume_acceptance,
+                session_storage: raw.session_storage,
             }]
         } else {
             return Err(format!(
@@ -590,15 +656,14 @@ impl ModelConfig {
                 resume
                     .validate()
                     .map_err(|e| format!("Model {name} provider {}: {e}", p.name))?;
-                if p.interactive_args.is_none() {
-                    return Err(format!(
-                        "Model {name} provider {}: [providers.resume] requires interactive_args",
-                        p.name
-                    ));
-                }
             }
             if let Some(capture) = &p.session_capture {
                 capture
+                    .validate()
+                    .map_err(|e| format!("Model {name} provider {}: {e}", p.name))?;
+            }
+            if let Some(storage) = &p.session_storage {
+                storage
                     .validate()
                     .map_err(|e| format!("Model {name} provider {}: {e}", p.name))?;
             }
@@ -613,7 +678,29 @@ impl ModelConfig {
             prompt_mode,
             providers,
             inputs,
+            migration_threshold,
         })
+    }
+}
+
+fn append_session_storage_toml(
+    out: &mut String,
+    table_name: &str,
+    storage: Option<&SessionStorage>,
+) {
+    let Some(storage) = storage else {
+        return;
+    };
+    out.push_str(&format!("\n[{table_name}]\n"));
+    match storage {
+        SessionStorage::ClaudeCode { projects_dir } => {
+            out.push_str("kind = \"claude_code\"\n");
+            out.push_str(&format!("projects_dir = \"{}\"\n", projects_dir.display()));
+        }
+        SessionStorage::Codex { sessions_dir } => {
+            out.push_str("kind = \"codex\"\n");
+            out.push_str(&format!("sessions_dir = \"{}\"\n", sessions_dir.display()));
+        }
     }
 }
 
@@ -1731,6 +1818,109 @@ rejected_output_patterns = ["No conversation found", "Invalid resume"]
             let name = path.file_stem().unwrap().to_string_lossy();
             ModelConfig::from_toml(&name, &content)
                 .unwrap_or_else(|err| panic!("{} should parse: {err}", path.display()));
+        }
+    }
+
+    fn test_provider_with_session_storage(kind: &str, field: &str, path: &str) -> String {
+        format!(
+            r#"
+prompt_mode = "arg"
+
+[[providers]]
+name = "stored-provider"
+command = "claude"
+
+[providers.session_storage]
+kind = "{kind}"
+{field} = "{path}"
+"#
+        )
+    }
+
+    // risk: Resume strategy compatibility; level: unit; source: proposal §11.1 Resume strategy compatibility / A1, A7.
+    #[test]
+    fn compose_resume_args_rejects_config_kind() {
+        let toml = r#"
+prompt_mode = "arg"
+
+[[providers]]
+name = "codex"
+command = "codex"
+
+[providers.resume]
+kind = "config"
+key = "experimental_resume"
+"#;
+
+        let err = ModelConfig::from_toml("codex-invalid", toml).unwrap_err();
+
+        assert!(err.contains("config"), "{err}");
+    }
+
+    // risk: Resume strategy compatibility; level: unit; source: proposal §11.1 Resume strategy compatibility / A1, A7.
+    #[test]
+    fn session_storage_parses_claude_code_and_codex() {
+        let claude = ModelConfig::from_toml(
+            "claude-storage",
+            &test_provider_with_session_storage(
+                "claude_code",
+                "projects_dir",
+                "/tmp/claude/projects",
+            ),
+        )
+        .unwrap();
+        let codex = ModelConfig::from_toml(
+            "codex-storage",
+            &test_provider_with_session_storage("codex", "sessions_dir", "/tmp/codex/sessions"),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            claude.providers[0].session_storage,
+            Some(SessionStorage::ClaudeCode { ref projects_dir }) if projects_dir.ends_with("projects")
+        ));
+        assert!(matches!(
+            codex.providers[0].session_storage,
+            Some(SessionStorage::Codex { ref sessions_dir }) if sessions_dir.ends_with("sessions")
+        ));
+    }
+
+    // risk: Sticky-then-migrate decision; level: unit; source: proposal §11.1 Sticky-then-migrate decision / A2, A4.
+    #[test]
+    fn migration_threshold_defaults_to_095() {
+        let config = ModelConfig::from_toml(
+            "threshold-default",
+            r#"
+prompt_mode = "arg"
+
+[[providers]]
+name = "claude"
+command = "claude"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.migration_threshold, 0.95);
+    }
+
+    // risk: Sticky-then-migrate decision; level: unit; source: proposal §11.1 Sticky-then-migrate decision / A2, A4.
+    #[test]
+    fn migration_threshold_rejects_out_of_range_values() {
+        for threshold in ["0.0", "1.01"] {
+            let toml = format!(
+                r#"
+prompt_mode = "arg"
+
+[migration]
+threshold = {threshold}
+
+[[providers]]
+name = "claude"
+command = "claude"
+"#
+            );
+            let err = ModelConfig::from_toml("threshold-invalid", &toml).unwrap_err();
+            assert!(err.contains("[migration].threshold"), "{err}");
         }
     }
 }

@@ -1,4 +1,5 @@
-use crate::config::load_models;
+use crate::balancer::TransitionReason;
+use crate::config::{ModelConfig, ProvidersConfig, load_models};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, named_params, params};
 use serde::{Deserialize, Serialize};
@@ -121,6 +122,80 @@ pub struct SessionTurnIngest {
     pub role: String,
     pub parent_turn_id: Option<String>,
     pub is_sidechain: bool,
+    pub is_compaction_boundary: bool,
+}
+
+pub type ModelStore = std::collections::HashMap<String, ModelConfig>;
+pub type DbError = String;
+
+#[derive(Debug, Clone)]
+pub struct ResolvedResume {
+    pub chain_id: String,
+    pub model_name: String,
+    pub model: ModelConfig,
+    pub active_provider: String,
+    pub active_provider_index: usize,
+    pub active_session_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum ResumeError {
+    InvalidUuid {
+        input: String,
+    },
+    NoChainFound {
+        input: String,
+    },
+    Ambiguous {
+        input: String,
+        previews: Vec<ChainPreview>,
+    },
+    ModelInferenceImpossible {
+        chain_id: String,
+        active_provider: String,
+        hint: String,
+    },
+    ProviderModelMismatch {
+        model_name: String,
+        active_provider: String,
+        suggestions: Vec<String>,
+    },
+    UnknownModel {
+        model_name: String,
+    },
+    ActiveSegmentMissing {
+        chain_id: String,
+    },
+    ProviderMissingResume {
+        provider_name: String,
+    },
+    Db {
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct ChainPreview {
+    pub chain_id: String,
+    pub last_used_at: DateTime<Utc>,
+    pub active_provider: String,
+    pub active_session_id: String,
+    pub turn_count: usize,
+    pub recent_turns: Vec<TurnPreview>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TurnPreview {
+    pub role: String,
+    pub timestamp: DateTime<Utc>,
+    pub snippet: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackfillReport {
+    pub skipped_existing: bool,
+    pub chains_inserted: u64,
+    pub segments_inserted: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -371,7 +446,7 @@ impl StateDb {
         let conn = Connection::open(path).map_err(|e| format!("Failed to open state DB: {e}"))?;
 
         conn.execute_batch("PRAGMA journal_mode=WAL;")
-            .map_err(|e| format!("Failed to set WAL mode: {e}"))?;
+            .map_err(|e| format!("Failed to set WAL mode: {e}; run `agents migrate-db` first"))?;
         Self::ensure_invocations_schema(&conn)?;
 
         conn.execute_batch(
@@ -499,18 +574,47 @@ impl StateDb {
                 role TEXT NOT NULL,
                 parent_turn_id TEXT,
                 is_sidechain INTEGER NOT NULL DEFAULT 0,
+                is_compaction_boundary INTEGER NOT NULL DEFAULT 0,
                 source_file TEXT NOT NULL,
                 ingested_at TEXT NOT NULL,
                 UNIQUE (provider_name, session_id, turn_id)
             );
+
+            CREATE TABLE IF NOT EXISTS session_chains (
+                chain_id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                last_used_at TEXT NOT NULL,
+                model_name TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS session_chain_segments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chain_id TEXT NOT NULL REFERENCES session_chains(chain_id),
+                provider_name TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                last_turn_id TEXT,
+                transition_reason TEXT NOT NULL CHECK (transition_reason IN
+                    ('initial', 'manual', 'quota_threshold', 'exhausted', 'imported')),
+                UNIQUE(chain_id, provider_name, session_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_segments_session
+                ON session_chain_segments(session_id);
+            CREATE INDEX IF NOT EXISTS idx_segments_chain_active
+                ON session_chain_segments(chain_id, ended_at);
             ",
         )
         .map_err(|e| format!("Failed to initialize schema: {e}"))?;
         Self::ensure_provider_quotas_schema(&conn)?;
         Self::ensure_provider_quota_windows_schema(&conn)?;
         Self::ensure_session_turns_schema(&conn)?;
+        let db = StateDb { conn };
+        db.backfill_session_chains()
+            .map_err(|e| format!("{e}; run `agents migrate-db` first"))?;
 
-        Ok(StateDb { conn })
+        Ok(db)
     }
 
     pub fn open_default() -> Result<Self, String> {
@@ -610,6 +714,16 @@ impl StateDb {
                 [],
             )
             .map_err(|e| format!("Failed to add session_turns.is_sidechain: {e}"))?;
+        }
+        if !columns
+            .iter()
+            .any(|column| column == "is_compaction_boundary")
+        {
+            conn.execute(
+                "ALTER TABLE session_turns ADD COLUMN is_compaction_boundary INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| format!("Failed to add session_turns.is_compaction_boundary: {e}"))?;
         }
         conn.execute_batch(Self::session_turns_index_sql())
             .map_err(|e| format!("Failed to ensure session_turns indexes: {e}"))?;
@@ -1094,6 +1208,70 @@ impl StateDb {
                 params![status, evidence, id],
             )
             .map_err(|e| format!("Failed to update resume acceptance for invocation {id}: {e}"))?;
+        Ok(())
+    }
+
+    pub fn mint_chain_for_invocation_session(&self, invocation_row_id: i64) -> Result<(), DbError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT model_name, provider_name, session_id, COALESCE(finished_at, created_at)
+                 FROM invocations
+                 WHERE id = ?1
+                   AND provider_name IS NOT NULL
+                   AND session_id IS NOT NULL",
+                params![invocation_row_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| format!("Failed to read invocation for chain mint: {e}"))?;
+        let Some((model_name, provider_name, session_id, raw_ts)) = row else {
+            return Ok(());
+        };
+        let ts = DateTime::parse_from_rfc3339(&raw_ts)
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now());
+        let exists = self
+            .conn
+            .query_row(
+                "SELECT chain_id FROM session_chain_segments
+                 WHERE provider_name = ?1 AND session_id = ?2
+                 LIMIT 1",
+                params![provider_name, session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to check existing invocation chain: {e}"))?;
+        if exists.is_some() {
+            return Ok(());
+        }
+        let chain_id = Uuid::new_v4().to_string();
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("Failed to begin invocation chain mint: {e}"))?;
+        tx.execute(
+            "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
+             VALUES (?1, ?2, ?2, ?3)",
+            params![chain_id, ts.to_rfc3339(), model_name],
+        )
+        .map_err(|e| format!("Failed to mint invocation session chain: {e}"))?;
+        tx.execute(
+            "INSERT INTO session_chain_segments
+                (chain_id, provider_name, session_id, started_at, transition_reason)
+             VALUES (?1, ?2, ?3, ?4, 'initial')",
+            params![chain_id, provider_name, session_id, ts.to_rfc3339()],
+        )
+        .map_err(|e| format!("Failed to mint invocation session segment: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("Failed to commit invocation chain mint: {e}"))?;
         Ok(())
     }
 
@@ -1960,8 +2138,8 @@ impl StateDb {
             .conn
             .execute(
                 "INSERT OR IGNORE INTO session_turns
-                    (provider_name, session_id, turn_id, timestamp, role, source_file, ingested_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    (provider_name, session_id, turn_id, timestamp, role, is_compaction_boundary, source_file, ingested_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)",
                 params![
                     provider_name,
                     session_id,
@@ -2006,10 +2184,11 @@ impl StateDb {
                             role,
                             parent_turn_id,
                             is_sidechain,
+                            is_compaction_boundary,
                             source_file,
                             ingested_at
                         )
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '', ?8)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '', ?9)",
                 )
                 .map_err(|e| format!("Failed to prepare batch insert: {e}"))?;
             for turn in turns {
@@ -2022,6 +2201,11 @@ impl StateDb {
                         turn.role,
                         turn.parent_turn_id,
                         if turn.is_sidechain { 1i64 } else { 0i64 },
+                        if turn.is_compaction_boundary {
+                            1i64
+                        } else {
+                            0i64
+                        },
                         &now,
                     ])
                     .map_err(|e| format!("Batch insert row failed: {e}"))?;
@@ -2057,6 +2241,555 @@ impl StateDb {
             assistant: assistant.max(0) as u64,
             sidechain: sidechain.max(0) as u64,
         })
+    }
+
+    pub fn backfill_session_chains(&self) -> Result<BackfillReport, DbError> {
+        let exists: i64 = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM session_chains LIMIT 1)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to check session chain backfill state: {e}"))?;
+        if exists != 0 {
+            return Ok(BackfillReport {
+                skipped_existing: true,
+                chains_inserted: 0,
+                segments_inserted: 0,
+            });
+        }
+
+        #[derive(Debug)]
+        struct Row {
+            provider: String,
+            session: String,
+            started_at: String,
+            last_used_at: String,
+            last_turn_id: String,
+        }
+
+        let rows = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT st.provider_name,
+                            st.session_id,
+                            MIN(st.timestamp) AS started_at,
+                            MAX(st.timestamp) AS last_used_at,
+                            (
+                                SELECT st2.turn_id
+                                FROM session_turns st2
+                                WHERE st2.provider_name = st.provider_name
+                                  AND st2.session_id = st.session_id
+                                ORDER BY st2.timestamp DESC, st2.id DESC
+                                LIMIT 1
+                            ) AS last_turn_id
+                     FROM session_turns st
+                     GROUP BY st.provider_name, st.session_id",
+                )
+                .map_err(|e| format!("Failed to prepare session chain backfill: {e}"))?;
+            let iter = stmt
+                .query_map([], |row| {
+                    Ok(Row {
+                        provider: row.get(0)?,
+                        session: row.get(1)?,
+                        started_at: row.get(2)?,
+                        last_used_at: row.get(3)?,
+                        last_turn_id: row.get(4)?,
+                    })
+                })
+                .map_err(|e| format!("Failed to query session chain backfill rows: {e}"))?;
+            iter.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed to read session chain backfill rows: {e}"))?
+        };
+
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("Failed to begin session chain backfill: {e}"))?;
+        let mut chains_inserted = 0;
+        let mut segments_inserted = 0;
+        for row in rows {
+            let model_name = tx
+                .query_row(
+                    "SELECT model_name
+                     FROM invocations
+                     WHERE session_id = ?1
+                     ORDER BY COALESCE(finished_at, created_at) DESC, id DESC
+                     LIMIT 1",
+                    params![row.session],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|e| format!("Failed to infer model during backfill: {e}"))?
+                .unwrap_or_else(|| "<unknown>".to_string());
+            let chain_id = Uuid::new_v4().to_string();
+            chains_inserted += tx
+                .execute(
+                    "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![chain_id, row.started_at, row.last_used_at, model_name],
+                )
+                .map_err(|e| format!("Failed to insert session chain during backfill: {e}"))?
+                as u64;
+            segments_inserted += tx
+                .execute(
+                    "INSERT INTO session_chain_segments
+                        (chain_id, provider_name, session_id, started_at, ended_at, last_turn_id, transition_reason)
+                     VALUES (?1, ?2, ?3, ?4, NULL, ?5, 'imported')",
+                    params![chain_id, row.provider, row.session, row.started_at, row.last_turn_id],
+                )
+                .map_err(|e| format!("Failed to insert session chain segment during backfill: {e}"))?
+                as u64;
+        }
+        tx.commit()
+            .map_err(|e| format!("Failed to commit session chain backfill: {e}"))?;
+        Ok(BackfillReport {
+            skipped_existing: false,
+            chains_inserted,
+            segments_inserted,
+        })
+    }
+
+    pub fn open_chain_segment(
+        &self,
+        chain_id: &str,
+        provider_name: &str,
+        session_id: &str,
+        started_at: &DateTime<Utc>,
+        reason: TransitionReason,
+    ) -> Result<i64, DbError> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO session_chain_segments
+                    (chain_id, provider_name, session_id, started_at, transition_reason)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    chain_id,
+                    provider_name,
+                    session_id,
+                    started_at.to_rfc3339(),
+                    reason.as_str()
+                ],
+            )
+            .map_err(|e| format!("Failed to open session chain segment: {e}"))?;
+        self.conn
+            .query_row(
+                "SELECT id FROM session_chain_segments
+                 WHERE chain_id = ?1 AND provider_name = ?2 AND session_id = ?3
+                 ORDER BY id DESC LIMIT 1",
+                params![chain_id, provider_name, session_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to read session chain segment id: {e}"))
+    }
+
+    pub fn mint_imported_chain_if_absent(
+        &self,
+        provider_name: &str,
+        session_id: &str,
+        started_at: &DateTime<Utc>,
+        model_name: &str,
+    ) -> Result<(), DbError> {
+        let exists: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM session_chain_segments
+                 WHERE provider_name = ?1 AND session_id = ?2
+                 LIMIT 1",
+                params![provider_name, session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to check existing session chain segment: {e}"))?;
+        if exists.is_some() {
+            return Ok(());
+        }
+        let chain_id = Uuid::new_v4().to_string();
+        let ts = started_at.to_rfc3339();
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("Failed to begin imported chain mint: {e}"))?;
+        tx.execute(
+            "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
+             VALUES (?1, ?2, ?2, ?3)
+             ON CONFLICT DO NOTHING",
+            params![chain_id, ts, model_name],
+        )
+        .map_err(|e| format!("Failed to mint imported session chain: {e}"))?;
+        tx.execute(
+            "INSERT INTO session_chain_segments
+                (chain_id, provider_name, session_id, started_at, transition_reason)
+             VALUES (?1, ?2, ?3, ?4, 'imported')
+             ON CONFLICT DO NOTHING",
+            params![chain_id, provider_name, session_id, ts],
+        )
+        .map_err(|e| format!("Failed to mint imported session chain segment: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("Failed to commit imported chain mint: {e}"))?;
+        Ok(())
+    }
+
+    pub fn close_active_segment_returning(
+        &self,
+        chain_id: &str,
+        ended_at: &DateTime<Utc>,
+    ) -> Result<Option<i64>, DbError> {
+        self.conn
+            .query_row(
+                "UPDATE session_chain_segments
+                 SET ended_at = ?2,
+                     last_turn_id = (
+                        SELECT st.turn_id
+                        FROM session_turns st
+                        WHERE st.provider_name = session_chain_segments.provider_name
+                          AND st.session_id = session_chain_segments.session_id
+                        ORDER BY st.timestamp DESC, st.id DESC
+                        LIMIT 1
+                     )
+                 WHERE chain_id = ?1 AND ended_at IS NULL
+                 RETURNING id",
+                params![chain_id, ended_at.to_rfc3339()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to close active session chain segment: {e}"))
+    }
+
+    pub fn update_chain_last_used(&self, chain_id: &str) -> Result<(), DbError> {
+        self.conn
+            .execute(
+                "UPDATE session_chains SET last_used_at = ?2 WHERE chain_id = ?1",
+                params![chain_id, Utc::now().to_rfc3339()],
+            )
+            .map_err(|e| format!("Failed to update session chain last_used_at: {e}"))?;
+        Ok(())
+    }
+
+    pub fn latest_compaction_boundary(
+        &self,
+        provider_name: &str,
+        session_id: &str,
+    ) -> Result<Option<(String, DateTime<Utc>)>, DbError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT turn_id, timestamp
+                 FROM session_turns
+                 WHERE provider_name = ?1
+                   AND session_id = ?2
+                   AND is_compaction_boundary = 1
+                 ORDER BY timestamp DESC, id DESC
+                 LIMIT 1",
+                params![provider_name, session_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to query latest compaction boundary: {e}"))?;
+        row.map(|(turn_id, raw_ts)| {
+            DateTime::parse_from_rfc3339(&raw_ts)
+                .map(|dt| (turn_id, dt.with_timezone(&Utc)))
+                .map_err(|e| format!("Bad compaction boundary timestamp {raw_ts}: {e}"))
+        })
+        .transpose()
+    }
+
+    pub fn resolve_resume(
+        &self,
+        config: &ProvidersConfig,
+        models: &ModelStore,
+        input: &str,
+        model_override: Option<&str>,
+    ) -> Result<ResolvedResume, ResumeError> {
+        Uuid::try_parse(input).map_err(|_| ResumeError::InvalidUuid {
+            input: input.to_string(),
+        })?;
+
+        let chain_ids = self
+            .candidate_chain_ids(input)
+            .map_err(|message| ResumeError::Db { message })?;
+        if chain_ids.is_empty() {
+            return Err(ResumeError::NoChainFound {
+                input: input.to_string(),
+            });
+        }
+        let chain_id = self
+            .choose_resume_chain(input, chain_ids)
+            .map_err(|message| ResumeError::Db { message })?;
+
+        let Some(chain_id) = chain_id else {
+            let previews = self
+                .chain_previews(input)
+                .map_err(|message| ResumeError::Db { message })?;
+            return Err(ResumeError::Ambiguous {
+                input: input.to_string(),
+                previews,
+            });
+        };
+
+        let (active_provider, active_session_id) = self
+            .active_segment_for_chain(&chain_id)
+            .map_err(|message| ResumeError::Db { message })?
+            .ok_or_else(|| ResumeError::ActiveSegmentMissing {
+                chain_id: chain_id.clone(),
+            })?;
+
+        let model_name = if let Some(model_override) = model_override {
+            model_override.to_string()
+        } else if let Some(model_name) = self
+            .latest_invocation_model_for_chain(&chain_id)
+            .map_err(|message| ResumeError::Db { message })?
+        {
+            model_name
+        } else if let Some(model_name) = self
+            .chain_model_name(&chain_id)
+            .map_err(|message| ResumeError::Db { message })?
+            .filter(|name| name != "<unknown>")
+        {
+            model_name
+        } else if let Some(default_model) = config
+            .get(&active_provider)
+            .and_then(|entry| entry.default_model.clone())
+        {
+            default_model
+        } else {
+            return Err(ResumeError::ModelInferenceImpossible {
+                chain_id,
+                active_provider,
+                hint: "pass --model or set default_model in providers.toml".to_string(),
+            });
+        };
+
+        let model = models
+            .get(&model_name)
+            .cloned()
+            .ok_or_else(|| ResumeError::UnknownModel {
+                model_name: model_name.clone(),
+            })?;
+        let Some(active_provider_index) = model
+            .providers
+            .iter()
+            .position(|provider| provider.name == active_provider)
+        else {
+            let mut suggestions = models
+                .iter()
+                .filter(|(_, model)| {
+                    model
+                        .providers
+                        .iter()
+                        .any(|provider| provider.name == active_provider)
+                })
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>();
+            suggestions.sort();
+            return Err(ResumeError::ProviderModelMismatch {
+                model_name,
+                active_provider,
+                suggestions,
+            });
+        };
+        if model.providers[active_provider_index].resume.is_none() {
+            return Err(ResumeError::ProviderMissingResume {
+                provider_name: active_provider,
+            });
+        }
+
+        Ok(ResolvedResume {
+            chain_id,
+            model_name,
+            model,
+            active_provider,
+            active_provider_index,
+            active_session_id,
+        })
+    }
+
+    pub fn resume_previews(&self, input: &str) -> Result<Vec<ChainPreview>, DbError> {
+        Uuid::try_parse(input).map_err(|e| format!("Invalid UUID {input}: {e}"))?;
+        self.chain_previews(input)
+    }
+
+    pub fn chain_id_for_segment(
+        &self,
+        provider_name: &str,
+        session_id: &str,
+    ) -> Result<Option<String>, DbError> {
+        self.conn
+            .query_row(
+                "SELECT chain_id
+                 FROM session_chain_segments
+                 WHERE provider_name = ?1 AND session_id = ?2
+                 ORDER BY ended_at IS NULL DESC, started_at DESC, id DESC
+                 LIMIT 1",
+                params![provider_name, session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to look up session chain id: {e}"))
+    }
+
+    fn candidate_chain_ids(&self, input: &str) -> Result<Vec<String>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT chain_id
+                 FROM session_chain_segments
+                 WHERE session_id = ?1 OR chain_id = ?1
+                 ORDER BY chain_id",
+            )
+            .map_err(|e| format!("Failed to prepare resume chain lookup: {e}"))?;
+        let rows = stmt
+            .query_map(params![input], |row| row.get::<_, String>(0))
+            .map_err(|e| format!("Failed to query resume chain lookup: {e}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read resume chain lookup: {e}"))
+    }
+
+    fn choose_resume_chain(
+        &self,
+        _input: &str,
+        mut chain_ids: Vec<String>,
+    ) -> Result<Option<String>, String> {
+        if chain_ids.len() == 1 {
+            return Ok(chain_ids.pop());
+        }
+        let cutoff = Utc::now() - chrono::Duration::hours(24);
+        let mut rows = Vec::new();
+        for chain_id in chain_ids {
+            let raw: String = self
+                .conn
+                .query_row(
+                    "SELECT last_used_at FROM session_chains WHERE chain_id = ?1",
+                    params![chain_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("Failed to read chain last_used_at: {e}"))?;
+            let last_used = DateTime::parse_from_rfc3339(&raw)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|e| format!("Bad chain last_used_at {raw}: {e}"))?;
+            rows.push((chain_id, last_used));
+        }
+        let recent = rows
+            .iter()
+            .filter(|(_, last_used)| *last_used >= cutoff)
+            .collect::<Vec<_>>();
+        if recent.len() == 1 {
+            return Ok(Some(recent[0].0.clone()));
+        }
+        if recent.is_empty() {
+            rows.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+            return Ok(rows.pop().map(|(chain_id, _)| chain_id));
+        }
+        Ok(None)
+    }
+
+    fn active_segment_for_chain(&self, chain_id: &str) -> Result<Option<(String, String)>, String> {
+        self.conn
+            .query_row(
+                "SELECT provider_name, session_id
+                 FROM session_chain_segments
+                 WHERE chain_id = ?1 AND ended_at IS NULL
+                 ORDER BY started_at DESC, id DESC
+                 LIMIT 1",
+                params![chain_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to read active chain segment: {e}"))
+    }
+
+    fn chain_model_name(&self, chain_id: &str) -> Result<Option<String>, String> {
+        self.conn
+            .query_row(
+                "SELECT model_name FROM session_chains WHERE chain_id = ?1",
+                params![chain_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to read session chain model: {e}"))
+    }
+
+    fn latest_invocation_model_for_chain(&self, chain_id: &str) -> Result<Option<String>, String> {
+        self.conn
+            .query_row(
+                "SELECT i.model_name
+                 FROM invocations i
+                 WHERE i.session_id IN (
+                    SELECT session_id FROM session_chain_segments WHERE chain_id = ?1
+                 )
+                 ORDER BY COALESCE(i.finished_at, i.created_at) DESC, i.id DESC
+                 LIMIT 1",
+                params![chain_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to infer session chain model from invocations: {e}"))
+    }
+
+    fn chain_previews(&self, input: &str) -> Result<Vec<ChainPreview>, String> {
+        let chain_ids = self.candidate_chain_ids(input)?;
+        let mut out = Vec::new();
+        for chain_id in chain_ids {
+            let raw_last: String = self
+                .conn
+                .query_row(
+                    "SELECT last_used_at FROM session_chains WHERE chain_id = ?1",
+                    params![chain_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("Failed to read chain preview: {e}"))?;
+            let last_used_at = DateTime::parse_from_rfc3339(&raw_last)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|e| format!("Bad chain preview timestamp {raw_last}: {e}"))?;
+            let (active_provider, active_session_id) = self
+                .active_segment_for_chain(&chain_id)?
+                .unwrap_or_else(|| ("<none>".to_string(), "<none>".to_string()));
+            let turn_count: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM session_turns WHERE provider_name = ?1 AND session_id = ?2",
+                params![active_provider, active_session_id],
+                |row| row.get(0),
+            ).unwrap_or(0);
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT role, timestamp
+                 FROM session_turns
+                 WHERE provider_name = ?1 AND session_id = ?2
+                 ORDER BY timestamp DESC, id DESC
+                 LIMIT 3",
+                )
+                .map_err(|e| format!("Failed to prepare recent turns preview: {e}"))?;
+            let rows = stmt
+                .query_map(params![active_provider, active_session_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| format!("Failed to query recent turns preview: {e}"))?;
+            let mut recent_turns = Vec::new();
+            for row in rows {
+                let (role, raw_ts) = row.map_err(|e| format!("Failed to read recent turn: {e}"))?;
+                let timestamp = DateTime::parse_from_rfc3339(&raw_ts)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .map_err(|e| format!("Bad recent turn timestamp {raw_ts}: {e}"))?;
+                recent_turns.push(TurnPreview {
+                    role,
+                    timestamp,
+                    snippet: None,
+                });
+            }
+            recent_turns.reverse();
+            out.push(ChainPreview {
+                chain_id,
+                last_used_at,
+                active_provider,
+                active_session_id,
+                turn_count: turn_count.max(0) as usize,
+                recent_turns,
+            });
+        }
+        out.sort_by(|a, b| b.last_used_at.cmp(&a.last_used_at));
+        Ok(out)
     }
 
     pub fn find_provider_for_session(
@@ -2260,6 +2993,7 @@ mod tests {
                 role: "assistant".to_string(),
                 parent_turn_id: None,
                 is_sidechain: false,
+                is_compaction_boundary: false,
             })
             .collect();
         db.ingest_session_turns_batch(provider_name, &turns)
@@ -3579,6 +4313,7 @@ command = "fixture"
                     role: "assistant".to_string(),
                     parent_turn_id: Some("root-turn".to_string()),
                     is_sidechain: true,
+                    is_compaction_boundary: false,
                 }],
             )
             .unwrap();
@@ -3612,6 +4347,7 @@ command = "fixture"
                     role: "user".to_string(),
                     parent_turn_id: None,
                     is_sidechain: false,
+                    is_compaction_boundary: false,
                 },
                 SessionTurnIngest {
                     session_id: "session-a".to_string(),
@@ -3620,6 +4356,7 @@ command = "fixture"
                     role: "assistant".to_string(),
                     parent_turn_id: Some("root".to_string()),
                     is_sidechain: false,
+                    is_compaction_boundary: false,
                 },
                 SessionTurnIngest {
                     session_id: "session-a".to_string(),
@@ -3628,6 +4365,7 @@ command = "fixture"
                     role: "assistant".to_string(),
                     parent_turn_id: Some("assistant-main".to_string()),
                     is_sidechain: true,
+                    is_compaction_boundary: false,
                 },
                 SessionTurnIngest {
                     session_id: "session-b".to_string(),
@@ -3636,6 +4374,7 @@ command = "fixture"
                     role: "assistant".to_string(),
                     parent_turn_id: None,
                     is_sidechain: true,
+                    is_compaction_boundary: false,
                 },
             ],
         )
@@ -3649,6 +4388,7 @@ command = "fixture"
                 role: "assistant".to_string(),
                 parent_turn_id: None,
                 is_sidechain: true,
+                is_compaction_boundary: false,
             }],
         )
         .unwrap();
@@ -3684,6 +4424,7 @@ command = "fixture"
                     role: "user".to_string(),
                     parent_turn_id: None,
                     is_sidechain: false,
+                    is_compaction_boundary: false,
                 },
                 SessionTurnIngest {
                     session_id: "session-a".to_string(),
@@ -3692,6 +4433,7 @@ command = "fixture"
                     role: "assistant".to_string(),
                     parent_turn_id: Some("turn-1".to_string()),
                     is_sidechain: false,
+                    is_compaction_boundary: false,
                 },
             ],
         )
@@ -3745,6 +4487,7 @@ command = "fixture"
                 role: "assistant".to_string(),
                 parent_turn_id: None,
                 is_sidechain: false,
+                is_compaction_boundary: false,
             }],
         )
         .unwrap();
@@ -3757,6 +4500,7 @@ command = "fixture"
                 role: "assistant".to_string(),
                 parent_turn_id: None,
                 is_sidechain: false,
+                is_compaction_boundary: false,
             }],
         )
         .unwrap();
@@ -3769,6 +4513,7 @@ command = "fixture"
                 role: "assistant".to_string(),
                 parent_turn_id: None,
                 is_sidechain: false,
+                is_compaction_boundary: false,
             }],
         )
         .unwrap();
@@ -4345,5 +5090,645 @@ command = "fixture"
         db.upsert_model_parameter("m", "p", &param).unwrap();
         let params = db.list_model_parameters("m", "p").unwrap();
         assert_eq!(params[0].param_type, ParamType::String);
+    }
+
+    const SESSION_A: &str = "5169694d-de0f-40d1-890c-6e28e55bab27";
+    const SESSION_B: &str = "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22";
+    const CHAIN_A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const CHAIN_B: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+    fn providers_with_defaults(
+        defaults: &[(&str, Option<&str>)],
+    ) -> crate::config::ProvidersConfig {
+        let mut entries = std::collections::HashMap::new();
+        for (name, default_model) in defaults {
+            entries.insert(
+                (*name).to_string(),
+                crate::config::ProviderEntry {
+                    quota_script: None,
+                    auth_refresh_command: None,
+                    default_model: default_model.map(str::to_string),
+                },
+            );
+        }
+        crate::config::ProvidersConfig { entries }
+    }
+
+    fn model_store_from_toml(
+        fixtures: &[(&str, &str)],
+    ) -> std::collections::HashMap<String, crate::config::ModelConfig> {
+        fixtures
+            .iter()
+            .map(|(name, body)| {
+                (
+                    (*name).to_string(),
+                    crate::config::ModelConfig::from_toml(name, body).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn resolver_model_store() -> std::collections::HashMap<String, crate::config::ModelConfig> {
+        model_store_from_toml(&[
+            (
+                "claude-opus",
+                r#"
+prompt_mode = "arg"
+
+[[providers]]
+name = "claude"
+command = "claude"
+
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+
+[[providers]]
+name = "claude2"
+command = "claude2"
+
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+"#,
+            ),
+            (
+                "claude-haiku",
+                r#"
+prompt_mode = "arg"
+
+[[providers]]
+name = "claude"
+command = "claude"
+
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+"#,
+            ),
+        ])
+    }
+
+    fn seed_chain_row(db: &StateDb, chain_id: &str, model_name: &str, last_used_at: &str) {
+        db.conn
+            .execute(
+                "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
+                 VALUES (?1, ?2, ?2, ?3)",
+                params![chain_id, last_used_at, model_name],
+            )
+            .unwrap();
+    }
+
+    fn seed_segment_row(
+        db: &StateDb,
+        chain_id: &str,
+        provider_name: &str,
+        session_id: &str,
+        started_at: &str,
+        ended_at: Option<&str>,
+        reason: &str,
+    ) {
+        db.conn
+            .execute(
+                "INSERT INTO session_chain_segments
+                    (chain_id, provider_name, session_id, started_at, ended_at, transition_reason)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    chain_id,
+                    provider_name,
+                    session_id,
+                    started_at,
+                    ended_at,
+                    reason
+                ],
+            )
+            .unwrap();
+    }
+
+    pub(crate) fn seed_test_chain(
+        db: &StateDb,
+        chain_id: &str,
+        provider_name: &str,
+        session_id: &str,
+        model_name: &str,
+        last_used_at: &str,
+    ) {
+        seed_chain_row(db, chain_id, model_name, last_used_at);
+        seed_segment_row(
+            db,
+            chain_id,
+            provider_name,
+            session_id,
+            last_used_at,
+            None,
+            "initial",
+        );
+    }
+
+    fn seed_invocation_for_session(
+        db: &StateDb,
+        model_name: &str,
+        provider_name: &str,
+        session_id: &str,
+        created_at: &str,
+    ) {
+        let id = db
+            .start_invocation(&InvocationStart {
+                invocation_uuid: Uuid::new_v4().to_string(),
+                model_name: model_name.to_string(),
+                provider_name: provider_name.to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        db.update_session_capture(id, Some(session_id), "fixture")
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE invocations SET created_at = ?1, finished_at = ?1 WHERE id = ?2",
+                params![created_at, id],
+            )
+            .unwrap();
+    }
+
+    fn pre_chain_db_with_turns(rows: &[(&str, &str, &str, &str, &str)]) -> TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_turns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider_name TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                turn_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                role TEXT NOT NULL,
+                source_file TEXT NOT NULL,
+                ingested_at TEXT NOT NULL,
+                UNIQUE (provider_name, session_id, turn_id)
+            );
+            CREATE TABLE invocations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                invocation_uuid TEXT NOT NULL UNIQUE,
+                model_name TEXT NOT NULL,
+                provider_name TEXT,
+                provider_index INTEGER NOT NULL,
+                parent_invocation_id INTEGER,
+                status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'legacy')),
+                success INTEGER,
+                exit_code INTEGER,
+                error_category TEXT,
+                session_id TEXT,
+                session_capture_method TEXT,
+                resume_acceptance_status TEXT,
+                resume_acceptance_evidence TEXT,
+                created_at TEXT NOT NULL,
+                finished_at TEXT
+            );",
+        )
+        .unwrap();
+        for (provider, session, turn, timestamp, role) in rows {
+            conn.execute(
+                "INSERT INTO session_turns
+                    (provider_name, session_id, turn_id, timestamp, role, source_file, ingested_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, '', ?4)",
+                params![provider, session, turn, timestamp, role],
+            )
+            .unwrap();
+        }
+        dir
+    }
+
+    fn chain_count(db: &StateDb) -> i64 {
+        db.conn
+            .query_row("SELECT COUNT(*) FROM session_chains", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn segment_count(db: &StateDb) -> i64 {
+        db.conn
+            .query_row("SELECT COUNT(*) FROM session_chain_segments", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    // risk: Schema migration and backfill; level: particular-integration; source: proposal §11.1 Schema migration and backfill / A5.
+    #[test]
+    fn backfill_creates_one_chain_per_provider_session_pair() {
+        let dir = pre_chain_db_with_turns(&[
+            (
+                "claude",
+                SESSION_A,
+                "turn-a1",
+                "2026-04-17T08:00:00Z",
+                "assistant",
+            ),
+            (
+                "claude",
+                SESSION_A,
+                "turn-a2",
+                "2026-04-17T08:00:01Z",
+                "assistant",
+            ),
+            (
+                "claude2",
+                SESSION_B,
+                "turn-b1",
+                "2026-04-17T09:00:00Z",
+                "assistant",
+            ),
+        ]);
+
+        let db = StateDb::open(&dir.path().join("state.db")).unwrap();
+
+        assert_eq!(chain_count(&db), 2);
+        assert_eq!(segment_count(&db), 2);
+        let imported: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_chain_segments WHERE transition_reason = 'imported' AND ended_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(imported, 2);
+    }
+
+    // risk: Schema migration and backfill; level: particular-integration; source: proposal §11.1 Schema migration and backfill / A5.
+    #[test]
+    fn backfill_idempotent_on_second_open() {
+        let dir = pre_chain_db_with_turns(&[(
+            "claude",
+            SESSION_A,
+            "turn-a1",
+            "2026-04-17T08:00:00Z",
+            "assistant",
+        )]);
+        let path = dir.path().join("state.db");
+
+        let first = StateDb::open(&path).unwrap();
+        let first_count = chain_count(&first);
+        drop(first);
+        let second = StateDb::open(&path).unwrap();
+
+        assert_eq!(chain_count(&second), first_count);
+        assert_eq!(segment_count(&second), 1);
+    }
+
+    // risk: Chain identity write paths; level: particular-integration; source: proposal §11.1 Chain identity write paths / A3, A8.
+    #[test]
+    fn mint_chain_no_op_on_resume_of_existing_chain() {
+        let db = test_db();
+        seed_chain_row(&db, CHAIN_A, "claude-opus", "2026-04-17T08:00:00Z");
+
+        let first_id = db
+            .open_chain_segment(
+                CHAIN_A,
+                "claude",
+                SESSION_A,
+                &ts("2026-04-17T08:00:00Z"),
+                crate::balancer::TransitionReason::Initial,
+            )
+            .unwrap();
+        let second_id = db
+            .open_chain_segment(
+                CHAIN_A,
+                "claude",
+                SESSION_A,
+                &ts("2026-04-17T08:01:00Z"),
+                crate::balancer::TransitionReason::Initial,
+            )
+            .unwrap();
+
+        assert_eq!(first_id, second_id);
+        assert_eq!(segment_count(&db), 1);
+        let active: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_chain_segments WHERE chain_id = ?1 AND ended_at IS NULL",
+                params![CHAIN_A],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active, 1);
+    }
+
+    // risk: Resolver disambiguation and model inference; level: particular-integration; source: proposal §11.1 Resolver disambiguation and model inference.
+    #[test]
+    fn resolve_resume_returns_active_segment_for_single_chain() {
+        let db = test_db();
+        seed_chain_row(&db, CHAIN_A, "claude-opus", "2026-04-17T09:00:00Z");
+        seed_segment_row(
+            &db,
+            CHAIN_A,
+            "claude",
+            SESSION_A,
+            "2026-04-17T08:00:00Z",
+            Some("2026-04-17T08:30:00Z"),
+            "initial",
+        );
+        seed_segment_row(
+            &db,
+            CHAIN_A,
+            "claude2",
+            SESSION_B,
+            "2026-04-17T08:31:00Z",
+            None,
+            "quota_threshold",
+        );
+        let providers = providers_with_defaults(&[("claude2", None)]);
+        let models = resolver_model_store();
+
+        let resolved = db
+            .resolve_resume(&providers, &models, CHAIN_A, None)
+            .unwrap();
+
+        assert_eq!(resolved.chain_id, CHAIN_A);
+        assert_eq!(resolved.active_provider, "claude2");
+        assert_eq!(resolved.active_session_id, SESSION_B);
+        assert_eq!(resolved.active_provider_index, 1);
+    }
+
+    // risk: Resolver disambiguation and model inference; level: particular-integration; source: proposal §11.1 Resolver disambiguation and model inference.
+    #[test]
+    fn resolve_resume_filters_by_24h_when_two_chains_share_session_id() {
+        let db = test_db();
+        let now = Utc::now();
+        let recent = (now - chrono::Duration::hours(1)).to_rfc3339();
+        let stale = (now - chrono::Duration::hours(48)).to_rfc3339();
+        seed_test_chain(&db, CHAIN_A, "claude", SESSION_A, "claude-opus", &recent);
+        seed_test_chain(&db, CHAIN_B, "claude", SESSION_A, "claude-opus", &stale);
+        let providers = providers_with_defaults(&[("claude", None)]);
+        let models = resolver_model_store();
+
+        let resolved = db
+            .resolve_resume(&providers, &models, SESSION_A, None)
+            .unwrap();
+
+        assert_eq!(resolved.chain_id, CHAIN_A);
+    }
+
+    // risk: Resolver disambiguation and model inference; level: particular-integration; source: proposal §11.1 Resolver disambiguation and model inference.
+    #[test]
+    fn resolve_resume_errors_ambiguous_when_both_recent() {
+        let db = test_db();
+        let recent_a = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let recent_b = (Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+        seed_test_chain(&db, CHAIN_A, "claude", SESSION_A, "claude-opus", &recent_a);
+        seed_test_chain(&db, CHAIN_B, "claude2", SESSION_A, "claude-opus", &recent_b);
+        let providers = providers_with_defaults(&[("claude", None), ("claude2", None)]);
+        let models = resolver_model_store();
+
+        let err = db
+            .resolve_resume(&providers, &models, SESSION_A, None)
+            .unwrap_err();
+
+        match err {
+            ResumeError::Ambiguous { input, previews } => {
+                assert_eq!(input, SESSION_A);
+                let ids: Vec<_> = previews
+                    .iter()
+                    .map(|preview| preview.chain_id.as_str())
+                    .collect();
+                assert!(ids.contains(&CHAIN_A));
+                assert!(ids.contains(&CHAIN_B));
+                assert!(
+                    previews
+                        .iter()
+                        .all(|preview| preview.recent_turns.len() <= 3)
+                );
+            }
+            other => panic!("expected ambiguous resume error, got {other:?}"),
+        }
+    }
+
+    // risk: Resolver disambiguation and model inference; level: particular-integration; source: proposal §11.1 Resolver disambiguation and model inference.
+    #[test]
+    fn resolve_resume_falls_back_to_max_last_used_when_none_within_24h() {
+        let db = test_db();
+        let older = (Utc::now() - chrono::Duration::hours(72)).to_rfc3339();
+        let less_old = (Utc::now() - chrono::Duration::hours(48)).to_rfc3339();
+        seed_test_chain(&db, CHAIN_A, "claude", SESSION_A, "claude-opus", &older);
+        seed_test_chain(&db, CHAIN_B, "claude2", SESSION_A, "claude-opus", &less_old);
+        let providers = providers_with_defaults(&[("claude", None), ("claude2", None)]);
+        let models = resolver_model_store();
+
+        let resolved = db
+            .resolve_resume(&providers, &models, SESSION_A, None)
+            .unwrap();
+
+        assert_eq!(resolved.chain_id, CHAIN_B);
+    }
+
+    // risk: Resolver disambiguation and model inference; level: particular-integration; source: proposal §11.1 Resolver disambiguation and model inference.
+    #[test]
+    fn resolve_resume_infers_model_from_latest_invocation() {
+        let db = test_db();
+        seed_test_chain(
+            &db,
+            CHAIN_A,
+            "claude",
+            SESSION_A,
+            "<unknown>",
+            "2026-04-17T08:00:00Z",
+        );
+        seed_invocation_for_session(
+            &db,
+            "claude-haiku",
+            "claude",
+            SESSION_A,
+            "2026-04-17T08:00:00Z",
+        );
+        seed_invocation_for_session(
+            &db,
+            "claude-opus",
+            "claude",
+            SESSION_A,
+            "2026-04-17T09:00:00Z",
+        );
+        let providers = providers_with_defaults(&[("claude", None)]);
+        let models = resolver_model_store();
+
+        let resolved = db
+            .resolve_resume(&providers, &models, SESSION_A, None)
+            .unwrap();
+
+        assert_eq!(resolved.model_name, "claude-opus");
+    }
+
+    // risk: Resolver disambiguation and model inference; level: particular-integration; source: proposal §11.1 Resolver disambiguation and model inference.
+    #[test]
+    fn resolve_resume_falls_back_to_chain_model_name_when_no_invocations() {
+        let db = test_db();
+        seed_test_chain(
+            &db,
+            CHAIN_A,
+            "claude",
+            SESSION_A,
+            "claude-haiku",
+            "2026-04-17T08:00:00Z",
+        );
+        let providers = providers_with_defaults(&[("claude", None)]);
+        let models = resolver_model_store();
+
+        let resolved = db
+            .resolve_resume(&providers, &models, SESSION_A, None)
+            .unwrap();
+
+        assert_eq!(resolved.model_name, "claude-haiku");
+    }
+
+    // risk: Resolver disambiguation and model inference; level: particular-integration; source: proposal §11.1 Resolver disambiguation and model inference / A8.
+    #[test]
+    fn resolve_resume_falls_back_to_provider_default_model_for_ui_session() {
+        let db = test_db();
+        seed_test_chain(
+            &db,
+            CHAIN_A,
+            "claude",
+            SESSION_A,
+            "<unknown>",
+            "2026-04-17T08:00:00Z",
+        );
+        let providers = providers_with_defaults(&[("claude", Some("claude-opus"))]);
+        let models = resolver_model_store();
+
+        let resolved = db
+            .resolve_resume(&providers, &models, SESSION_A, None)
+            .unwrap();
+
+        assert_eq!(resolved.model_name, "claude-opus");
+    }
+
+    // risk: Resolver disambiguation and model inference; level: particular-integration; source: proposal §11.1 Resolver disambiguation and model inference / A8.
+    #[test]
+    fn resolve_resume_errors_when_model_inference_impossible() {
+        let db = test_db();
+        seed_test_chain(
+            &db,
+            CHAIN_A,
+            "claude",
+            SESSION_A,
+            "<unknown>",
+            "2026-04-17T08:00:00Z",
+        );
+        let providers = providers_with_defaults(&[("claude", None)]);
+        let models = resolver_model_store();
+
+        let err = db
+            .resolve_resume(&providers, &models, SESSION_A, None)
+            .unwrap_err();
+
+        match err {
+            ResumeError::ModelInferenceImpossible {
+                chain_id,
+                active_provider,
+                hint,
+            } => {
+                assert_eq!(chain_id, CHAIN_A);
+                assert_eq!(active_provider, "claude");
+                assert!(hint.contains("default_model"), "{hint}");
+            }
+            other => panic!("expected model inference error, got {other:?}"),
+        }
+    }
+
+    // risk: Resolver disambiguation and model inference; level: particular-integration; source: proposal §11.1 Resolver disambiguation and model inference.
+    #[test]
+    fn resolve_resume_validates_provider_in_model_pool() {
+        let db = test_db();
+        seed_test_chain(
+            &db,
+            CHAIN_A,
+            "claude2",
+            SESSION_A,
+            "claude-haiku",
+            "2026-04-17T08:00:00Z",
+        );
+        let providers = providers_with_defaults(&[("claude2", None)]);
+        let models = resolver_model_store();
+
+        let err = db
+            .resolve_resume(&providers, &models, SESSION_A, None)
+            .unwrap_err();
+
+        match err {
+            ResumeError::ProviderModelMismatch {
+                model_name,
+                active_provider,
+                suggestions,
+            } => {
+                assert_eq!(model_name, "claude-haiku");
+                assert_eq!(active_provider, "claude2");
+                assert!(suggestions.contains(&"claude-opus".to_string()));
+            }
+            other => panic!("expected provider/model mismatch, got {other:?}"),
+        }
+    }
+
+    // risk: Chain identity write paths; level: particular-integration; source: proposal §11.1 Chain identity write paths / A3, A8.
+    #[test]
+    fn chain_last_used_at_updates_after_successful_invocation() {
+        let db = test_db();
+        seed_test_chain(
+            &db,
+            CHAIN_A,
+            "claude",
+            SESSION_A,
+            "claude-opus",
+            "2026-04-17T08:00:00Z",
+        );
+
+        let before = Utc::now();
+        db.update_chain_last_used(CHAIN_A).unwrap();
+        let after = Utc::now();
+
+        let last_used_raw: String = db
+            .conn
+            .query_row(
+                "SELECT last_used_at FROM session_chains WHERE chain_id = ?1",
+                params![CHAIN_A],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let last_used = DateTime::parse_from_rfc3339(&last_used_raw)
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(last_used >= before - chrono::Duration::seconds(1));
+        assert!(last_used <= after + chrono::Duration::seconds(1));
+    }
+
+    // risk: Migration mechanic: Claude JSONL copy, Codex deferred guard, segment ledger, and races; level: particular-integration; source: proposal §11.1 Migration mechanic / A3.
+    #[test]
+    fn migration_returning_clause_aborts_on_concurrent_close() {
+        let db = test_db();
+        seed_test_chain(
+            &db,
+            CHAIN_A,
+            "claude",
+            SESSION_A,
+            "claude-opus",
+            "2026-04-17T08:00:00Z",
+        );
+
+        let first = db
+            .close_active_segment_returning(CHAIN_A, &ts("2026-04-17T09:00:00Z"))
+            .unwrap();
+        let second = db
+            .close_active_segment_returning(CHAIN_A, &ts("2026-04-17T09:00:01Z"))
+            .unwrap();
+
+        assert!(first.is_some(), "first close should win RETURNING guard");
+        assert_eq!(second, None, "concurrent loser must abort");
+        let active: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_chain_segments WHERE chain_id = ?1 AND ended_at IS NULL",
+                params![CHAIN_A],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active, 0);
     }
 }

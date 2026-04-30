@@ -1,0 +1,10 @@
+{"session_id":"5169694d-de0f-40d1-890c-6e28e55bab27","turn_id":"turn-1","timestamp":"2026-04-17T08:00:00Z","role":"user","message":"one"}
+{"session_id":"5169694d-de0f-40d1-890c-6e28e55bab27","turn_id":"turn-2","timestamp":"2026-04-17T08:00:01Z","role":"assistant","message":"two"}
+{"session_id":"5169694d-de0f-40d1-890c-6e28e55bab27","turn_id":"turn-3","timestamp":"2026-04-17T08:00:02Z","role":"user","message":"three"}
+{"session_id":"5169694d-de0f-40d1-890c-6e28e55bab27","turn_id":"turn-4","timestamp":"2026-04-17T08:00:03Z","role":"assistant","message":"four"}
+{"session_id":"5169694d-de0f-40d1-890c-6e28e55bab27","turn_id":"turn-5","timestamp":"2026-04-17T08:00:04Z","role":"user","message":"five"}
+{"session_id":"5169694d-de0f-40d1-890c-6e28e55bab27","turn_id":"turn-6","timestamp":"2026-04-17T08:00:05Z","role":"assistant","message":"summary-six"}
+{"session_id":"5169694d-de0f-40d1-890c-6e28e55bab27","turn_id":"turn-7","timestamp":"2026-04-17T08:00:06Z","role":"user","message":"seven"}
+{"session_id":"5169694d-de0f-40d1-890c-6e28e55bab27","turn_id":"turn-8","timestamp":"2026-04-17T08:00:07Z","role":"assistant","message":"summary-eight"}
+{"session_id":"5169694d-de0f-40d1-890c-6e28e55bab27","turn_id":"turn-9","timestamp":"2026-04-17T08:00:08Z","role":"user","message":"nine"}
+{"session_id":"5169694d-de0f-40d1-890c-6e28e55bab27","turn_id":"turn-10","timestamp":"2026-04-17T08:00:09Z","role":"assistant","message":"ten"}

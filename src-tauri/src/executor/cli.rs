@@ -241,25 +241,43 @@ struct RawResult {
 pub struct ResumePayload<'a> {
     pub session_id: &'a str,
     pub strategy: &'a ResumeStrategy,
+    pub target_jsonl_path: Option<&'a Path>,
 }
 
-fn compose_resume_args(
+pub fn compose_resume_args(
+    strategy: &ResumeStrategy,
+    session_id: &str,
+    _target_jsonl_path: Option<&Path>,
+) -> Result<Vec<String>, String> {
+    let mut args = Vec::new();
+    append_resume_args(&mut args, strategy, session_id)?;
+    Ok(args)
+}
+
+fn compose_resume_provider_args(
     mut provider_args: Vec<String>,
     resume: ResumePayload<'_>,
 ) -> Result<Vec<String>, String> {
-    match resume.strategy.kind {
+    append_resume_args(&mut provider_args, resume.strategy, resume.session_id)?;
+    Ok(provider_args)
+}
+
+fn append_resume_args(
+    provider_args: &mut Vec<String>,
+    strategy: &ResumeStrategy,
+    session_id: &str,
+) -> Result<(), String> {
+    match strategy.kind {
         ResumeKind::Flag => {
-            let flag = resume
-                .strategy
+            let flag = strategy
                 .flag
                 .as_ref()
                 .ok_or_else(|| "resume.flag is required".to_string())?;
             provider_args.push(flag.clone());
-            provider_args.push(resume.session_id.to_string());
+            provider_args.push(session_id.to_string());
         }
         ResumeKind::Subcommand => {
-            let subcommand = resume
-                .strategy
+            let subcommand = strategy
                 .subcommand
                 .as_ref()
                 .ok_or_else(|| "resume.subcommand is required".to_string())?;
@@ -267,10 +285,10 @@ fn compose_resume_args(
                 return Err("resume.subcommand is required".to_string());
             }
             provider_args.extend(subcommand.iter().cloned());
-            provider_args.push(resume.session_id.to_string());
+            provider_args.push(session_id.to_string());
         }
     }
-    Ok(provider_args)
+    Ok(())
 }
 
 fn build_command(
@@ -407,7 +425,7 @@ pub fn execute_resume(
     resume: ResumePayload<'_>,
 ) -> Result<ExecutionResult, String> {
     let session_id = resume.session_id.to_string();
-    let provider_args = compose_resume_args(provider.args.clone(), resume)?;
+    let provider_args = compose_resume_provider_args(provider.args.clone(), resume)?;
     let mut provider_without_capture = provider.clone();
     provider_without_capture.session_capture = None;
     let (result, temp_files) = execute_provider_with_args(
@@ -525,7 +543,7 @@ pub fn execute_interactive(
 
     let mut provider_args = interactive_args.clone();
     if let Some(resume) = resume {
-        provider_args = compose_resume_args(provider_args, resume)?;
+        provider_args = compose_resume_provider_args(provider_args, resume)?;
     }
 
     let mut cmd = build_command(provider, &provider_args, working_dir, parent_invocation_env)?;
@@ -914,6 +932,7 @@ mod tests {
             resume: None,
             session_capture: None,
             resume_acceptance: None,
+            session_storage: None,
         };
 
         let err = execute_interactive(&provider, None, None, None).unwrap_err();
@@ -940,6 +959,7 @@ mod tests {
             resume: None,
             session_capture: None,
             resume_acceptance: None,
+            session_storage: None,
         };
 
         let exit_code = execute_interactive(&provider, None, None, None).unwrap();
@@ -965,6 +985,7 @@ mod tests {
             resume: None,
             session_capture: None,
             resume_acceptance: None,
+            session_storage: None,
         };
 
         let exit_code = execute_interactive(&provider, Some(tempdir.path()), None, None).unwrap();
@@ -993,6 +1014,7 @@ mod tests {
             resume: None,
             session_capture: None,
             resume_acceptance: None,
+            session_storage: None,
         };
         let parent_env =
             r#"{"source":"fixture-provider","id":"11111111-1111-1111-1111-111111111111"}"#;
@@ -1020,6 +1042,7 @@ mod tests {
             resume: None,
             session_capture: None,
             resume_acceptance: None,
+            session_storage: None,
         };
         let strategy = ResumeStrategy {
             kind: ResumeKind::Flag,
@@ -1035,6 +1058,7 @@ mod tests {
             Some(ResumePayload {
                 session_id,
                 strategy: &strategy,
+                target_jsonl_path: None,
             }),
         )
         .unwrap();
@@ -1063,6 +1087,7 @@ mod tests {
             resume: None,
             session_capture: None,
             resume_acceptance: None,
+            session_storage: None,
         };
         let strategy = ResumeStrategy {
             kind: ResumeKind::Flag,
@@ -1080,6 +1105,7 @@ mod tests {
             ResumePayload {
                 session_id: "5169694d-de0f-40d1-890c-6e28e55bab27",
                 strategy: &strategy,
+                target_jsonl_path: None,
             },
         )
         .unwrap();
@@ -1108,6 +1134,7 @@ mod tests {
             resume: None,
             session_capture: None,
             resume_acceptance: None,
+            session_storage: None,
         };
         let strategy = ResumeStrategy {
             kind: ResumeKind::Subcommand,
@@ -1125,6 +1152,7 @@ mod tests {
             ResumePayload {
                 session_id: "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22",
                 strategy: &strategy,
+                target_jsonl_path: None,
             },
         )
         .unwrap();
@@ -1157,6 +1185,7 @@ mod tests {
             resume: None,
             session_capture: None,
             resume_acceptance: None,
+            session_storage: None,
         };
         let strategy = ResumeStrategy {
             kind: ResumeKind::Subcommand,
@@ -1172,6 +1201,7 @@ mod tests {
             Some(ResumePayload {
                 session_id,
                 strategy: &strategy,
+                target_jsonl_path: None,
             }),
         )
         .unwrap();
@@ -1200,6 +1230,7 @@ mod tests {
             resume: None,
             session_capture: None,
             resume_acceptance: None,
+            session_storage: None,
         };
 
         let exit_code = execute_interactive(&provider, None, None, None).unwrap();
@@ -1239,6 +1270,7 @@ mod tests {
                     flag: Some("--size".to_string()),
                 },
             ],
+            migration_threshold: 0.95,
         };
         let mut inputs = HashMap::new();
         inputs.insert("size".to_string(), vec!["1024*1024".to_string()]);
@@ -1263,6 +1295,7 @@ mod tests {
                 description: None,
                 flag: Some("--format".to_string()),
             }],
+            migration_threshold: 0.95,
         };
         let flags = resolve_input_flags(&model, &HashMap::new()).unwrap();
         assert_eq!(flags, vec!["--format", "jpeg"]);
@@ -1285,6 +1318,7 @@ mod tests {
                 description: None,
                 flag: Some("--size".to_string()),
             }],
+            migration_threshold: 0.95,
         };
         let mut inputs = HashMap::new();
         inputs.insert("size".to_string(), vec!["huge".to_string()]);
@@ -1307,6 +1341,7 @@ mod tests {
                 description: None,
                 flag: Some("--image".to_string()),
             }],
+            migration_threshold: 0.95,
         };
         let result = resolve_input_flags(&model, &HashMap::new());
         assert!(result.unwrap_err().contains("Required input 'image'"));
@@ -1319,6 +1354,7 @@ mod tests {
             prompt_mode: PromptMode::Stdin,
             providers: vec![ProviderConfig::new("test", vec![])],
             inputs: vec![],
+            migration_threshold: 0.95,
         };
         let mut inputs = HashMap::new();
         inputs.insert("custom".to_string(), vec!["value".to_string()]);
@@ -1334,6 +1370,7 @@ mod tests {
             prompt_mode: PromptMode::Arg,
             providers: vec![ProviderConfig::new("echo", vec![])],
             inputs: vec![],
+            migration_threshold: 0.95,
         };
         let result = execute(&model, 0, "hello world", None, &HashMap::new(), None).unwrap();
         assert_eq!(result.exit_code, 0);
@@ -1355,6 +1392,7 @@ mod tests {
             prompt_mode: PromptMode::Arg,
             providers: vec![ProviderConfig::new("echo", vec![])],
             inputs: vec![],
+            migration_threshold: 0.95,
         };
         let result = execute(&model, 0, "no capture", None, &HashMap::new(), None).unwrap();
         assert_eq!(result.exit_code, 0);
@@ -1385,6 +1423,7 @@ mod tests {
             prompt_mode: PromptMode::Stdin,
             providers: vec![ProviderConfig::new("cat", vec![])],
             inputs: vec![],
+            migration_threshold: 0.95,
         };
         let result = execute(&model, 0, "piped input", None, &HashMap::new(), None).unwrap();
         assert_eq!(result.exit_code, 0);
@@ -1407,6 +1446,7 @@ mod tests {
                 description: None,
                 flag: Some("--greet".to_string()),
             }],
+            migration_threshold: 0.95,
         };
         let mut inputs = HashMap::new();
         inputs.insert("greeting".to_string(), vec!["hello".to_string()]);
@@ -1467,8 +1507,10 @@ printf '{{"type":"system","subtype":"init","session_id":"%s"}}\n' "$requested""#
                     last_message_flag: None,
                 }),
                 resume_acceptance: None,
+                session_storage: None,
             }],
             inputs: vec![],
+            migration_threshold: 0.95,
         };
 
         let result = execute(&model, 0, "hello", None, &HashMap::new(), None).unwrap();
@@ -1554,8 +1596,10 @@ printf '{"type":"system","subtype":"init","session_id":"11111111-1111-1111-1111-
                     last_message_flag: None,
                 }),
                 resume_acceptance: None,
+                session_storage: None,
             }],
             inputs: vec![],
+            migration_threshold: 0.95,
         };
 
         let result = execute(&model, 0, "hello", None, &HashMap::new(), None).unwrap();
@@ -1613,8 +1657,10 @@ printf 'assistant text from tmpfile\n' > "$output_file""#,
                     last_message_flag: Some("-o".to_string()),
                 }),
                 resume_acceptance: None,
+                session_storage: None,
             }],
             inputs: vec![],
+            migration_threshold: 0.95,
         };
 
         let result = execute(&model, 0, "hello", None, &HashMap::new(), None).unwrap();
@@ -1671,8 +1717,10 @@ printf 'assistant text from tmpfile\n' > "$output_file""#,
                     last_message_flag: Some("-o".to_string()),
                 }),
                 resume_acceptance: None,
+                session_storage: None,
             }],
             inputs: vec![],
+            migration_threshold: 0.95,
         };
 
         let result = execute(&model, 0, "hello", None, &HashMap::new(), None).unwrap();
@@ -1693,5 +1741,63 @@ printf 'assistant text from tmpfile\n' > "$output_file""#,
             }
             other => panic!("expected Failed(_), got {other:?}"),
         }
+    }
+
+    fn resume_strategy_flag_fixture() -> ResumeStrategy {
+        ResumeStrategy {
+            kind: ResumeKind::Flag,
+            flag: Some("--resume".to_string()),
+            subcommand: None,
+        }
+    }
+
+    fn resume_strategy_subcommand_fixture() -> ResumeStrategy {
+        ResumeStrategy {
+            kind: ResumeKind::Subcommand,
+            flag: None,
+            subcommand: Some(vec!["resume".to_string()]),
+        }
+    }
+
+    // risk: Resume strategy compatibility; level: unit; source: proposal §11.1 Resume strategy compatibility / A1, A7.
+    #[test]
+    fn compose_resume_args_ignores_target_jsonl_for_flag_strategy() {
+        let target_jsonl = std::path::Path::new("/tmp/target-session.jsonl");
+
+        let args = compose_resume_args(
+            &resume_strategy_flag_fixture(),
+            "5169694d-de0f-40d1-890c-6e28e55bab27",
+            Some(target_jsonl),
+        )
+        .unwrap();
+
+        assert_eq!(
+            args,
+            vec![
+                "--resume".to_string(),
+                "5169694d-de0f-40d1-890c-6e28e55bab27".to_string()
+            ]
+        );
+    }
+
+    // risk: Resume strategy compatibility; level: unit; source: proposal §11.1 Resume strategy compatibility / A1, A7.
+    #[test]
+    fn compose_resume_args_ignores_target_jsonl_for_subcommand_strategy() {
+        let target_jsonl = std::path::Path::new("/tmp/target-session.jsonl");
+
+        let args = compose_resume_args(
+            &resume_strategy_subcommand_fixture(),
+            "5169694d-de0f-40d1-890c-6e28e55bab27",
+            Some(target_jsonl),
+        )
+        .unwrap();
+
+        assert_eq!(
+            args,
+            vec![
+                "resume".to_string(),
+                "5169694d-de0f-40d1-890c-6e28e55bab27".to_string()
+            ]
+        );
     }
 }

@@ -522,6 +522,7 @@ mod tests {
             ProviderEntry {
                 quota_script: Some(quota_script.to_string()),
                 auth_refresh_command: refresh.map(|s| s.to_string()),
+                default_model: None,
             },
         );
         c

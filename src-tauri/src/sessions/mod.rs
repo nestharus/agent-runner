@@ -17,7 +17,7 @@
 //! UNIQUE constraint on `(provider, session_id, turn_id)` makes ingestion
 //! safe even if a script over-emits (e.g. doesn't honor its cursor).
 
-use crate::config::{SessionSourceEntry, SessionsConfig};
+use crate::config::{ProvidersConfig, SessionSourceEntry, SessionsConfig};
 use crate::state::{SessionTurnIngest, StateDb};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -40,6 +40,8 @@ pub struct ScriptTurn {
     pub parent_turn_id: Option<String>,
     #[serde(default)]
     pub is_sidechain: Option<bool>,
+    #[serde(default)]
+    pub is_compaction_boundary: Option<bool>,
 }
 
 /// Outcome of scanning one provider's session source.
@@ -58,6 +60,7 @@ pub struct ScanReport {
 pub fn scan_provider(
     provider_name: &str,
     sessions_cfg: &SessionsConfig,
+    providers_cfg: &ProvidersConfig,
     db: &StateDb,
 ) -> ScanReport {
     let mut report = ScanReport::default();
@@ -117,10 +120,27 @@ pub fn scan_provider(
             role: turn.role,
             parent_turn_id: turn.parent_turn_id,
             is_sidechain: turn.is_sidechain.unwrap_or(false),
+            is_compaction_boundary: turn.is_compaction_boundary.unwrap_or(false),
         });
     }
     match db.ingest_session_turns_batch(provider_name, &batch) {
-        Ok(n) => report.new_turns = n,
+        Ok(n) => {
+            report.new_turns = n;
+            let default_model = providers_cfg
+                .get(provider_name)
+                .and_then(|entry| entry.default_model.as_deref())
+                .unwrap_or("<unknown>");
+            for turn in &batch {
+                if let Err(e) = db.mint_imported_chain_if_absent(
+                    provider_name,
+                    &turn.session_id,
+                    &turn.timestamp,
+                    default_model,
+                ) {
+                    report.errors.push(e);
+                }
+            }
+        }
         Err(e) => report.errors.push(e),
     }
     report
@@ -130,8 +150,9 @@ pub fn scan_provider(
 /// don't abort the others.
 pub fn scan_all(sessions_cfg: &SessionsConfig, db: &StateDb) -> Vec<(String, ScanReport)> {
     let mut out = Vec::new();
+    let providers_cfg = ProvidersConfig::default();
     for name in sessions_cfg.entries.keys() {
-        let report = scan_provider(name, sessions_cfg, db);
+        let report = scan_provider(name, sessions_cfg, &providers_cfg, db);
         out.push((name.clone(), report));
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -339,7 +360,7 @@ mod tests {
 EOF"#,
         );
         let cfg = cfg_with("p", &script.path);
-        let r = scan_provider("p", &cfg, &db);
+        let r = scan_provider("p", &cfg, &ProvidersConfig::default(), &db);
         assert_eq!(r.errors, Vec::<String>::new());
         assert_eq!(r.new_turns, 4);
         assert_eq!(db.count_assistant_turns_since("p", None).unwrap(), 2);
@@ -355,7 +376,7 @@ EOF"#,
 EOF"#,
         );
         let cfg = cfg_with("p", &script.path);
-        let r = scan_provider("p", &cfg, &db);
+        let r = scan_provider("p", &cfg, &ProvidersConfig::default(), &db);
         assert_eq!(r.new_turns, 1, "second emission deduped by UNIQUE");
         assert_eq!(r.script_lines, 2);
     }
@@ -397,7 +418,7 @@ not-json
 EOF"#,
         );
         let cfg = cfg_with("p", &script.path);
-        let r = scan_provider("p", &cfg, &db);
+        let r = scan_provider("p", &cfg, &ProvidersConfig::default(), &db);
         assert_eq!(r.new_turns, 1);
         assert_eq!(r.errors.len(), 1);
         assert!(r.errors[0].contains("malformed"));
@@ -408,7 +429,7 @@ EOF"#,
         let db = db();
         let script = fixture_script("echo something-bad >&2; exit 7");
         let cfg = cfg_with("p", &script.path);
-        let r = scan_provider("p", &cfg, &db);
+        let r = scan_provider("p", &cfg, &ProvidersConfig::default(), &db);
         assert_eq!(r.new_turns, 0);
         assert_eq!(r.errors.len(), 1);
         assert!(r.errors[0].contains("exited 7"));
@@ -432,7 +453,7 @@ echo "STATE_DIR=$STATE_DIR" > "$STATE_DIR/marker.txt""#,
             },
         );
         let cfg = SessionsConfig { entries };
-        let r = scan_provider("p", &cfg, &db);
+        let r = scan_provider("p", &cfg, &ProvidersConfig::default(), &db);
         assert_eq!(r.errors, Vec::<String>::new());
         assert_eq!(r.new_turns, 1);
         let marker = std::fs::read_to_string(tempdir.path().join("marker.txt")).unwrap();
@@ -495,5 +516,51 @@ printf '%s\n' "{}""#,
             err.to_lowercase().contains("empty") || err.to_lowercase().contains("no path"),
             "expected 'empty' or 'no path' in error, got: {err}"
         );
+    }
+
+    fn cfg_from_adapter_fixture(provider: &str, fixture_name: &str) -> (Fixture, SessionsConfig) {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("jsonl")
+            .join("adapter")
+            .join(fixture_name);
+        let script = fixture_script(&format!(r#"cat "{}""#, path.display()));
+        let cfg = cfg_with(provider, &script.path);
+        (script, cfg)
+    }
+
+    // risk: is_compaction_boundary ingest plumbing; level: particular-integration; source: proposal §11.1 is_compaction_boundary ingest plumbing / A3, A6.
+    #[test]
+    fn turn_script_optional_compaction_field_defaults_false() {
+        let db = db();
+        let (_script, cfg) = cfg_from_adapter_fixture("claude", "without_compaction.jsonl");
+
+        let result = scan_provider("claude", &cfg, &ProvidersConfig::default(), &db);
+
+        assert_eq!(result.errors, Vec::<String>::new());
+        assert_eq!(result.new_turns, 1);
+        assert_eq!(
+            db.latest_compaction_boundary("claude", "11111111-1111-4111-8111-111111111111")
+                .unwrap(),
+            None
+        );
+    }
+
+    // risk: is_compaction_boundary ingest plumbing; level: particular-integration; source: proposal §11.1 is_compaction_boundary ingest plumbing / A3, A6.
+    #[test]
+    fn turn_script_compaction_field_propagates_to_session_turns() {
+        let db = db();
+        let (_script, cfg) = cfg_from_adapter_fixture("claude", "with_compaction.jsonl");
+
+        let result = scan_provider("claude", &cfg, &ProvidersConfig::default(), &db);
+
+        assert_eq!(result.errors, Vec::<String>::new());
+        assert_eq!(result.new_turns, 1);
+        let boundary = db
+            .latest_compaction_boundary("claude", "11111111-1111-4111-8111-111111111111")
+            .unwrap()
+            .expect("boundary turn should be persisted");
+        assert_eq!(boundary.0, "boundary-1");
     }
 }

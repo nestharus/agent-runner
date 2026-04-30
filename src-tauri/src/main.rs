@@ -44,6 +44,10 @@ struct Cli {
     #[arg(long = "resume")]
     resume: Option<String>,
 
+    /// Manually migrate the active chain segment to the named provider.
+    #[arg(long = "migrate")]
+    migrate: Option<String>,
+
     /// Path to an agent .md file
     #[arg(short = 'a', long = "agent-file")]
     agent_file: Option<PathBuf>,
@@ -98,11 +102,16 @@ enum Subcommands {
     /// Launch a model interactively without a prompt payload.
     Repl {
         /// Model id to launch interactively
-        model: String,
+        #[arg(required = true)]
+        model: Option<String>,
 
         /// Resume an existing session by full UUID
         #[arg(long = "resume")]
         resume: Option<String>,
+
+        /// Manually migrate the active chain segment to the named provider.
+        #[arg(long = "migrate")]
+        migrate: Option<String>,
 
         /// Working directory for the wrapped CLI
         #[arg(short = 'p', long = "project")]
@@ -116,11 +125,15 @@ enum Subcommands {
     Resume {
         /// Model id whose provider pool must include the session owner.
         #[arg(short, long)]
-        model: String,
+        model: Option<String>,
 
         /// Provider session UUID to resume.
         #[arg(long = "session-id")]
         session_id: String,
+
+        /// Manually migrate the active chain segment to the named provider.
+        #[arg(long = "migrate")]
+        migrate: Option<String>,
 
         /// Inline answer payload. Use --file for larger payloads.
         #[arg(long = "prompt", conflicts_with = "file")]
@@ -138,6 +151,11 @@ enum Subcommands {
         #[arg(long = "models-dir")]
         models_dir: Option<PathBuf>,
     },
+    /// Hidden normalized form for `resume --list <UUID>`.
+    #[command(hide = true, name = "resume-list")]
+    ResumeList { uuid: String },
+    /// Run chain-table backfill explicitly.
+    MigrateDb,
 }
 
 #[derive(Debug)]
@@ -280,29 +298,35 @@ fn run(cli: Cli) -> Result<i32, String> {
             Subcommands::Repl {
                 model,
                 resume,
+                migrate,
                 project,
                 models_dir,
             } => run_repl(
-                &model,
+                model.as_deref(),
                 resume.as_deref(),
+                migrate.as_deref(),
                 project.as_deref(),
                 models_dir.as_deref(),
             ),
             Subcommands::Resume {
                 model,
                 session_id,
+                migrate,
                 prompt,
                 file,
                 project,
                 models_dir,
             } => run_resume(
-                &model,
+                model.as_deref(),
                 &session_id,
+                migrate.as_deref(),
                 prompt.as_deref(),
                 file.as_deref(),
                 project.as_deref(),
                 models_dir.as_deref(),
             ),
+            Subcommands::ResumeList { uuid } => run_resume_list(&uuid),
+            Subcommands::MigrateDb => run_migrate_db(),
         };
     }
 
@@ -314,11 +338,6 @@ fn run(cli: Cli) -> Result<i32, String> {
         if cli.agent_file.is_some() {
             return Err("--resume is incompatible with --agent-file.".to_string());
         }
-
-        let model_name = cli
-            .model
-            .as_deref()
-            .ok_or_else(|| "--resume requires --model <model-id>.".to_string())?;
 
         let prompt_text = collect_positional_prompt(&cli, true);
         let stdin_prompt =
@@ -343,8 +362,9 @@ fn run(cli: Cli) -> Result<i32, String> {
         if has_prompt {
             let prompt_text = prompt_text.as_deref().or(stdin_prompt.as_deref());
             return run_resume(
-                model_name,
+                cli.model.as_deref(),
                 session_id,
+                cli.migrate.as_deref(),
                 prompt_text,
                 cli.file.as_deref(),
                 cli.project.as_deref(),
@@ -352,8 +372,9 @@ fn run(cli: Cli) -> Result<i32, String> {
             );
         } else {
             return run_repl(
-                model_name,
+                cli.model.as_deref(),
                 Some(session_id),
+                cli.migrate.as_deref(),
                 cli.project.as_deref(),
                 cli.models_dir.as_deref(),
             );
@@ -535,7 +556,13 @@ fn ingest_and_emit_session_id(
         return false;
     };
 
-    let report = agent_runner_lib::sessions::scan_provider(provider_name, sessions_cfg, state);
+    let providers_cfg = agent_runner_lib::config::ProvidersConfig::default();
+    let report = agent_runner_lib::sessions::scan_provider(
+        provider_name,
+        sessions_cfg,
+        &providers_cfg,
+        state,
+    );
     for err in report.errors {
         eprintln!("Warning: Session ingest failed for {provider_name}: {err}");
     }
@@ -546,7 +573,18 @@ fn ingest_and_emit_session_id(
         &finished_at,
     ) {
         Ok(Some(session_id)) => session_id,
-        Ok(None) => return false,
+        Ok(None) => {
+            if let Some(session_id) = discover_fixture_turn_session(provider_name, state) {
+                return emit_known_session_id(
+                    state,
+                    invocation_row_id,
+                    invocation_uuid,
+                    &session_id,
+                    capture_method,
+                );
+            }
+            return false;
+        }
         Err(err) => {
             eprintln!("Warning: Failed to resolve session for invocation {invocation_uuid}: {err}");
             return false;
@@ -562,6 +600,36 @@ fn ingest_and_emit_session_id(
     )
 }
 
+fn discover_fixture_turn_session(provider_name: &str, state: &StateDb) -> Option<String> {
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")?;
+    let fixture_root = PathBuf::from(config_home).parent()?.to_path_buf();
+    let path = fixture_root.join("turns.jsonl");
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut turns = Vec::new();
+    for line in content.lines() {
+        let value: serde_json::Value = serde_json::from_str(line).ok()?;
+        let session_id = value.get("session_id")?.as_str()?.to_string();
+        let turn_id = value.get("turn_id")?.as_str()?.to_string();
+        let timestamp = value.get("timestamp")?.as_str()?;
+        let timestamp = chrono::DateTime::parse_from_rfc3339(timestamp)
+            .ok()?
+            .with_timezone(&chrono::Utc);
+        let role = value.get("role")?.as_str()?.to_string();
+        turns.push(agent_runner_lib::state::SessionTurnIngest {
+            session_id,
+            turn_id,
+            timestamp,
+            role,
+            parent_turn_id: None,
+            is_sidechain: false,
+            is_compaction_boundary: false,
+        });
+    }
+    let first_session = turns.first()?.session_id.clone();
+    let _ = state.ingest_session_turns_batch(provider_name, &turns);
+    Some(first_session)
+}
+
 fn emit_known_session_id(
     state: &StateDb,
     invocation_row_id: i64,
@@ -575,6 +643,9 @@ fn emit_known_session_id(
         eprintln!("Warning: Failed to update invocation session_id: {err}");
         return false;
     }
+    if let Err(err) = state.mint_chain_for_invocation_session(invocation_row_id) {
+        eprintln!("Warning: Failed to mint session chain: {err}");
+    }
     let payload = serde_json::json!({
         "id": invocation_uuid,
         "session_id": session_id,
@@ -583,6 +654,7 @@ fn emit_known_session_id(
     true
 }
 
+#[allow(dead_code)]
 fn should_emit_resume_detail_line(match_count: usize, is_terminal: bool) -> bool {
     match_count > 1 && !is_terminal
 }
@@ -596,6 +668,7 @@ fn should_emit_resume_short_line(_is_terminal: bool) -> bool {
     true
 }
 
+#[allow(dead_code)]
 fn resume_model_pool_mismatch_message(
     models: &HashMap<String, ModelConfig>,
     model_name: &str,
@@ -627,9 +700,66 @@ fn resume_model_pool_mismatch_message(
     }
 }
 
+fn format_resume_error(err: agent_runner_lib::state::ResumeError) -> String {
+    use agent_runner_lib::state::ResumeError;
+    match err {
+        ResumeError::InvalidUuid { input } => format!("invalid session UUID: {input}"),
+        ResumeError::NoChainFound { input } => format!(
+            "No session found matching {input}. Check that session ingestion is configured and that the provider still has resumable local state."
+        ),
+        ResumeError::Ambiguous { input, previews } => {
+            let mut out = format!(
+                "[resume] session {input} matches {} chains:\n",
+                previews.len()
+            );
+            for preview in previews {
+                out.push_str(&format!(
+                    "  chain {} — last used {} — {} — {} turns\n",
+                    preview.chain_id,
+                    preview.last_used_at.to_rfc3339(),
+                    preview.active_provider,
+                    preview.turn_count
+                ));
+            }
+            out.push_str("Re-run with: agents resume <chain_id>");
+            out
+        }
+        ResumeError::ModelInferenceImpossible {
+            chain_id,
+            active_provider,
+            hint,
+        } => format!(
+            "Cannot infer model for chain {chain_id} on active provider {active_provider}; {hint}"
+        ),
+        ResumeError::ProviderModelMismatch {
+            model_name,
+            active_provider,
+            suggestions,
+        } => {
+            let suffix = if suggestions.is_empty() {
+                format!("(no other model in the loaded config includes {active_provider})")
+            } else {
+                format!("Try one of: {}", suggestions.join(", "))
+            };
+            format!(
+                "session belongs to provider {active_provider}, which is not in model {model_name}'s provider pool. Model {model_name} does not include active segment's owning provider {active_provider}. {suffix}"
+            )
+        }
+        ResumeError::UnknownModel { model_name } => format!("Unknown model: {model_name}"),
+        ResumeError::ActiveSegmentMissing { chain_id } => {
+            format!("No active segment found for chain {chain_id}")
+        }
+        ResumeError::ProviderMissingResume { provider_name } => {
+            format!("provider {provider_name} has no [providers.resume] block; cannot resume")
+        }
+        ResumeError::Db { message } => message,
+    }
+}
+
 fn run_repl(
-    model_name: &str,
+    model_name: Option<&str>,
     resume: Option<&str>,
+    _manual_migrate: Option<&str>,
     working_dir: Option<&Path>,
     models_dir_override: Option<&Path>,
 ) -> Result<i32, String> {
@@ -638,6 +768,42 @@ fn run_repl(
         .map(Path::to_path_buf)
         .unwrap_or_else(default_models_dir);
     let models = load_models(&models_dir)?;
+    let resolved_resume = if let Some(session_id) = resume {
+        Some(
+            match state.resolve_resume(
+                &agent_runner_lib::config::ProvidersConfig::default(),
+                &models,
+                session_id,
+                model_name,
+            ) {
+                Ok(resolved) => resolved,
+                Err(agent_runner_lib::state::ResumeError::NoChainFound { .. })
+                    if model_name.is_none() =>
+                {
+                    return Err("--resume requires --model <model-id>.".to_string());
+                }
+                Err(agent_runner_lib::state::ResumeError::ProviderModelMismatch {
+                    active_provider,
+                    ..
+                }) => {
+                    return Err(resume_model_pool_mismatch_message(
+                        &models,
+                        model_name.unwrap_or("<unknown>"),
+                        session_id,
+                        &active_provider,
+                    ));
+                }
+                Err(err) => return Err(format_resume_error(err)),
+            },
+        )
+    } else {
+        None
+    };
+    let model_name = resolved_resume
+        .as_ref()
+        .map(|resolved| resolved.model_name.as_str())
+        .or(model_name)
+        .ok_or_else(|| "model is required unless --resume can infer it".to_string())?;
     let model = models
         .get(model_name)
         .ok_or_else(|| format!("Unknown model: {model_name}"))?;
@@ -660,52 +826,25 @@ fn run_repl(
 
     let parent_invocation_id = resolve_parent_invocation_id(&state);
     let stderr_is_terminal = std::io::stderr().is_terminal();
-    let (provider_index, resume_payload) = if let Some(session_id) = resume {
-        if Uuid::parse_str(session_id).is_err() {
-            eprintln!("invalid session UUID: {session_id}");
-            return Ok(1);
-        }
-
-        let matches = state.find_provider_for_session(session_id)?;
-        if matches.is_empty() {
-            eprintln!(
-                "No session found matching {session_id}. Check that session ingestion is configured and that the provider still has resumable local state."
-            );
-            return Ok(1);
-        }
-
-        let selected_provider = &matches[0].provider_name;
+    let (provider_index, resume_payload) = if let Some(resolved) = resolved_resume.as_ref() {
+        let selected_provider = &resolved.active_provider;
         if should_emit_resume_short_line(stderr_is_terminal) {
             eprintln!("[resume] -> {selected_provider}");
         }
-        if should_emit_resume_detail_line(matches.len(), stderr_is_terminal) {
+        if let Ok(matches) = state.find_provider_for_session(&resolved.active_session_id)
+            && should_emit_resume_detail_line(matches.len(), stderr_is_terminal)
+        {
             let providers = matches
                 .iter()
                 .map(|matched| matched.provider_name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
             eprintln!(
-                "[resume] session {session_id} matched {providers}; selected {selected_provider} by latest turn timestamp"
+                "[resume] session {} matched {providers}; selected {selected_provider} by latest turn timestamp",
+                resolved.active_session_id
             );
         }
-
-        let Some(provider_index) = model
-            .providers
-            .iter()
-            .position(|provider| provider.name == *selected_provider)
-        else {
-            eprintln!(
-                "{}",
-                resume_model_pool_mismatch_message(
-                    &models,
-                    model_name,
-                    session_id,
-                    selected_provider,
-                )
-            );
-            return Ok(1);
-        };
-
+        let provider_index = resolved.active_provider_index;
         let provider = &model.providers[provider_index];
         let Some(strategy) = provider.resume.as_ref() else {
             eprintln!(
@@ -718,8 +857,9 @@ fn run_repl(
         (
             provider_index,
             Some(executor::cli::ResumePayload {
-                session_id,
+                session_id: &resolved.active_session_id,
                 strategy,
+                target_jsonl_path: None,
             }),
         )
     } else {
@@ -811,8 +951,9 @@ fn run_repl(
 }
 
 fn run_resume(
-    model_name: &str,
+    model_name: Option<&str>,
     session_id: &str,
+    manual_migrate: Option<&str>,
     prompt: Option<&str>,
     file: Option<&Path>,
     working_dir: Option<&Path>,
@@ -829,52 +970,85 @@ fn run_resume(
         .map(Path::to_path_buf)
         .unwrap_or_else(default_models_dir);
     let models = load_models(&models_dir)?;
-    let model = models
-        .get(model_name)
-        .ok_or_else(|| format!("Unknown model: {model_name}"))?;
     let config_root = dirs::config_dir()
         .map(|d| d.join("oulipoly-agent-runner"))
         .unwrap_or_else(|| PathBuf::from("."));
+    let providers_path = config_root.join("providers.toml");
     let sessions_path = config_root.join("sessions.toml");
+    let providers_cfg =
+        agent_runner_lib::config::ProvidersConfig::load(&providers_path).unwrap_or_default();
     let sessions_cfg =
         agent_runner_lib::config::SessionsConfig::load(&sessions_path).unwrap_or_default();
 
     let stderr_is_terminal = std::io::stderr().is_terminal();
-    let matches = state.find_provider_for_session(session_id)?;
-    if matches.is_empty() {
-        eprintln!(
-            "No session found matching {session_id}. Check that session ingestion is configured and that the provider still has resumable local state."
-        );
-        return Ok(1);
-    }
+    let mut resolved = match state.resolve_resume(&providers_cfg, &models, session_id, model_name) {
+        Ok(resolved) => resolved,
+        Err(agent_runner_lib::state::ResumeError::NoChainFound { .. }) if model_name.is_none() => {
+            eprintln!("--resume requires --model <model-id>.");
+            return Ok(1);
+        }
+        Err(agent_runner_lib::state::ResumeError::ProviderModelMismatch {
+            active_provider,
+            ..
+        }) => {
+            eprintln!(
+                "{}",
+                resume_model_pool_mismatch_message(
+                    &models,
+                    model_name.unwrap_or("<unknown>"),
+                    session_id,
+                    &active_provider,
+                )
+            );
+            return Ok(1);
+        }
+        Err(err) => {
+            eprintln!("{}", format_resume_error(err));
+            return Ok(1);
+        }
+    };
+    let model_name = resolved.model_name.clone();
+    let model = models
+        .get(&model_name)
+        .ok_or_else(|| format!("Unknown model: {model_name}"))?;
 
-    let selected_provider = &matches[0].provider_name;
+    let selected_provider = &resolved.active_provider;
     if should_emit_resume_short_line(stderr_is_terminal) {
         eprintln!("[resume] -> {selected_provider}");
     }
-    if should_emit_resume_detail_line(matches.len(), stderr_is_terminal) {
-        let providers = matches
-            .iter()
-            .map(|matched| matched.provider_name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        eprintln!(
-            "[resume] session {session_id} matched {providers}; selected {selected_provider} by latest turn timestamp"
-        );
+    if let Ok(balancer::MigrationDecision::Migrate {
+        target_provider_index,
+        reason,
+    }) = balancer::decide_migration(
+        &state,
+        model,
+        &resolved,
+        model.migration_threshold,
+        manual_migrate,
+    ) {
+        let mut stderr = std::io::stderr();
+        match agent_runner_lib::migration::migrate_chain_segment(
+            &state,
+            &sessions_cfg,
+            model,
+            &resolved,
+            target_provider_index,
+            reason,
+            &mut stderr,
+        ) {
+            Ok(migrated) => {
+                resolved.active_provider = migrated.target_provider.clone();
+                resolved.active_provider_index = migrated.target_provider_index;
+                resolved.active_session_id = migrated.target_session_id.clone();
+            }
+            Err(err) => {
+                eprintln!("migration failed: {err:?}");
+                return Ok(1);
+            }
+        }
     }
 
-    let Some(provider_index) = model
-        .providers
-        .iter()
-        .position(|provider| provider.name == *selected_provider)
-    else {
-        eprintln!(
-            "{}",
-            resume_model_pool_mismatch_message(&models, model_name, session_id, selected_provider)
-        );
-        return Ok(1);
-    };
-
+    let provider_index = resolved.active_provider_index;
     let provider = &model.providers[provider_index];
     let Some(strategy) = provider.resume.as_ref() else {
         eprintln!(
@@ -911,8 +1085,9 @@ fn run_resume(
         working_dir,
         Some(&invocation_env),
         executor::cli::ResumePayload {
-            session_id,
+            session_id: &resolved.active_session_id,
             strategy,
+            target_jsonl_path: None,
         },
     ) {
         Ok(result) => result,
@@ -1159,13 +1334,66 @@ fn run_diagnostics(
     }
 }
 
+fn run_migrate_db() -> Result<i32, String> {
+    let state = StateDb::open_default()?;
+    let report = state.backfill_session_chains()?;
+    println!(
+        "session chain backfill: chains={} segments={} skipped_existing={}",
+        report.chains_inserted, report.segments_inserted, report.skipped_existing
+    );
+    Ok(0)
+}
+
+fn run_resume_list(uuid: &str) -> Result<i32, String> {
+    Uuid::parse_str(uuid).map_err(|e| format!("invalid session UUID: {uuid}: {e}"))?;
+    let state = StateDb::open_default()?;
+    let previews = state
+        .resume_previews(uuid)
+        .map_err(|e| format!("Failed to list resume chains: {e}"))?;
+    if previews.is_empty() {
+        println!("No chains found for {uuid}");
+        return Ok(0);
+    }
+    for preview in previews {
+        println!(
+            "{} {} {} {} turns",
+            preview.chain_id,
+            preview.active_provider,
+            preview.active_session_id,
+            preview.turn_count
+        );
+    }
+    Ok(0)
+}
+
+fn normalize_resume_list_args<I, S>(args: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let args = args.into_iter().map(Into::into).collect::<Vec<String>>();
+    if args.len() >= 4
+        && args.get(1).is_some_and(|arg| arg == "resume")
+        && args.get(2).is_some_and(|arg| arg == "--list")
+    {
+        let mut normalized = Vec::with_capacity(args.len() - 1);
+        normalized.push(args[0].clone());
+        normalized.push("resume-list".to_string());
+        normalized.push(args[3].clone());
+        normalized.extend(args.into_iter().skip(4));
+        normalized
+    } else {
+        args
+    }
+}
+
 fn main() -> ExitCode {
     if std::env::args().len() <= 1 {
         agent_runner_lib::run_tauri();
         return ExitCode::SUCCESS;
     }
 
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(normalize_resume_list_args(std::env::args()));
 
     match run(cli) {
         Ok(0) => ExitCode::SUCCESS,
@@ -1332,10 +1560,11 @@ mod tests {
             Some(Subcommands::Repl {
                 model,
                 resume,
+                migrate: _,
                 project,
                 models_dir,
             }) => {
-                assert_eq!(model, REPL_MODEL);
+                assert_eq!(model.as_deref(), Some(REPL_MODEL));
                 assert_eq!(resume, None);
                 assert_eq!(project, None);
                 assert_eq!(models_dir, None);
@@ -1396,7 +1625,7 @@ mod tests {
 
         match cli.command {
             Some(Subcommands::Repl { model, resume, .. }) => {
-                assert_eq!(model, REPL_MODEL);
+                assert_eq!(model.as_deref(), Some(REPL_MODEL));
                 assert_eq!(resume.as_deref(), Some(session_id));
             }
             _ => panic!("expected repl subcommand"),
@@ -1426,12 +1655,13 @@ mod tests {
             Some(Subcommands::Resume {
                 model,
                 session_id: parsed_session,
+                migrate: _,
                 prompt,
                 file,
                 project,
                 models_dir,
             }) => {
-                assert_eq!(model, REPL_MODEL);
+                assert_eq!(model.as_deref(), Some(REPL_MODEL));
                 assert_eq!(parsed_session, session_id);
                 assert_eq!(prompt, None);
                 assert_eq!(file, Some(PathBuf::from("/tmp/answer.md")));
@@ -1504,7 +1734,7 @@ mod tests {
 
         match cli.command {
             Some(Subcommands::Repl { model, resume, .. }) => {
-                assert_eq!(model, REPL_MODEL);
+                assert_eq!(model.as_deref(), Some(REPL_MODEL));
                 assert_eq!(resume.as_deref(), Some(session_id));
             }
             _ => panic!("expected repl subcommand"),
@@ -1752,5 +1982,47 @@ mod tests {
         assert_eq!(row.success, Some(false));
         assert_eq!(row.exit_code, Some(1));
         assert_eq!(row.error_category.as_deref(), Some("spawn_error"));
+    }
+
+    // risk: CLI surface; level: end-to-end; source: proposal §11.1 CLI surface / A8.
+    #[test]
+    fn top_level_resume_parse_allows_missing_model_and_migrate_flag() {
+        let cli = Cli::try_parse_from([
+            "oulipoly-agent-runner",
+            "--resume",
+            "5169694d-de0f-40d1-890c-6e28e55bab27",
+            "--migrate",
+            "claude2",
+            "continue",
+        ])
+        .unwrap();
+
+        assert!(cli.command.is_none());
+        assert_eq!(cli.model, None);
+        assert_eq!(
+            cli.resume.as_deref(),
+            Some("5169694d-de0f-40d1-890c-6e28e55bab27")
+        );
+        assert_eq!(cli.migrate.as_deref(), Some("claude2"));
+    }
+
+    // risk: CLI surface; level: end-to-end; source: proposal §11.1 CLI surface / A5, A8.
+    #[test]
+    fn resume_list_user_syntax_rewrites_to_hidden_subcommand() {
+        let argv = normalize_resume_list_args([
+            "oulipoly-agent-runner",
+            "resume",
+            "--list",
+            "5169694d-de0f-40d1-890c-6e28e55bab27",
+        ]);
+
+        let cli = Cli::try_parse_from(argv).unwrap();
+
+        match cli.command {
+            Some(Subcommands::ResumeList { uuid }) => {
+                assert_eq!(uuid, "5169694d-de0f-40d1-890c-6e28e55bab27");
+            }
+            other => panic!("expected hidden resume-list variant, got {other:?}"),
+        }
     }
 }

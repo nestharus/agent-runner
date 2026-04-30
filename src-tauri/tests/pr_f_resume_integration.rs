@@ -161,6 +161,7 @@ flag = "--resume"
                 role: "assistant".to_string(),
                 parent_turn_id: None,
                 is_sidechain: false,
+                is_compaction_boundary: false,
             })
             .collect();
         db.ingest_session_turns_batch(provider_name, &turns)

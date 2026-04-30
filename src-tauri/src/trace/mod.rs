@@ -59,6 +59,7 @@ pub struct TraceInvocation {
 #[derive(Debug, Clone, Serialize)]
 pub struct TraceSession {
     pub id: Option<String>,
+    pub chain_id: Option<String>,
     pub capture_method: Option<String>,
     pub transcript_path: Option<String>,
     pub transcript_state: TranscriptState,
@@ -242,6 +243,7 @@ fn build_trace_session(
         return Ok((
             TraceSession {
                 id: None,
+                chain_id: None,
                 capture_method: record.session_capture_method.clone(),
                 transcript_path: None,
                 transcript_state: TranscriptState::Unresolved,
@@ -260,6 +262,7 @@ fn build_trace_session(
         return Ok((
             TraceSession {
                 id: Some(session_id),
+                chain_id: None,
                 capture_method: record.session_capture_method.clone(),
                 transcript_path: None,
                 transcript_state: TranscriptState::Unresolved,
@@ -290,11 +293,15 @@ fn build_trace_session(
         .as_ref()
         .map(|c| (Some(c.total), Some(c.assistant), Some(c.sidechain)))
         .unwrap_or((None, None, None));
+    let chain_id = db
+        .chain_id_for_segment(provider_name, &session_id)
+        .unwrap_or(None);
 
     let Some(sessions_cfg) = sessions_cfg else {
         return Ok((
             TraceSession {
                 id: Some(session_id),
+                chain_id: chain_id.clone(),
                 capture_method: record.session_capture_method.clone(),
                 transcript_path: None,
                 transcript_state: TranscriptState::NoLocator,
@@ -312,6 +319,7 @@ fn build_trace_session(
         Ok(None) => Ok((
             TraceSession {
                 id: Some(session_id),
+                chain_id: chain_id.clone(),
                 capture_method: record.session_capture_method.clone(),
                 transcript_path: None,
                 transcript_state: TranscriptState::NoLocator,
@@ -326,6 +334,7 @@ fn build_trace_session(
         Ok(Some(path)) if path.exists() => Ok((
             TraceSession {
                 id: Some(session_id),
+                chain_id: chain_id.clone(),
                 capture_method: record.session_capture_method.clone(),
                 transcript_path: Some(path.display().to_string()),
                 transcript_state: TranscriptState::Available,
@@ -340,6 +349,7 @@ fn build_trace_session(
         Ok(Some(_path)) => Ok((
             TraceSession {
                 id: Some(session_id),
+                chain_id: chain_id.clone(),
                 capture_method: record.session_capture_method.clone(),
                 transcript_path: None,
                 transcript_state: TranscriptState::Missing,
@@ -356,6 +366,7 @@ fn build_trace_session(
             Ok((
                 TraceSession {
                     id: Some(session_id),
+                    chain_id,
                     capture_method: record.session_capture_method.clone(),
                     transcript_path: None,
                     transcript_state: TranscriptState::Missing,
@@ -542,6 +553,23 @@ mod tests {
                 .unwrap();
         }
 
+        fn seed_chain_segment(&self, chain_id: &str, provider_name: &str, session_id: &str) {
+            let conn = Connection::open(&self.db_path).unwrap();
+            conn.execute(
+                "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
+                 VALUES (?1, '2026-04-17T08:00:00Z', '2026-04-17T08:00:00Z', 'fixture')",
+                params![chain_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session_chain_segments
+                    (chain_id, provider_name, session_id, started_at, transition_reason)
+                 VALUES (?1, ?2, ?3, '2026-04-17T08:00:00Z', 'initial')",
+                params![chain_id, provider_name, session_id],
+            )
+            .unwrap();
+        }
+
         fn set_exit_status(&self, row_id: i64, status: &str, success: bool, exit_code: i32) {
             let conn = Connection::open(&self.db_path).unwrap();
             conn.execute(
@@ -616,6 +644,7 @@ mod tests {
                     role: "user".to_string(),
                     parent_turn_id: None,
                     is_sidechain: false,
+                    is_compaction_boundary: false,
                 },
                 SessionTurnIngest {
                     session_id: "5169694d-de0f-40d1-890c-6e28e55bab27".to_string(),
@@ -626,6 +655,7 @@ mod tests {
                     role: "assistant".to_string(),
                     parent_turn_id: Some("root-turn".to_string()),
                     is_sidechain: false,
+                    is_compaction_boundary: false,
                 },
                 SessionTurnIngest {
                     session_id: "5169694d-de0f-40d1-890c-6e28e55bab27".to_string(),
@@ -636,6 +666,7 @@ mod tests {
                     role: "assistant".to_string(),
                     parent_turn_id: Some("assistant-main".to_string()),
                     is_sidechain: true,
+                    is_compaction_boundary: false,
                 },
             ],
         );
@@ -1241,6 +1272,7 @@ transcript_locator = "{}"
                     role: "user".to_string(),
                     parent_turn_id: None,
                     is_sidechain: false,
+                    is_compaction_boundary: false,
                 },
                 SessionTurnIngest {
                     session_id: "5169694d-de0f-40d1-890c-6e28e55bab27".to_string(),
@@ -1251,6 +1283,7 @@ transcript_locator = "{}"
                     role: "assistant".to_string(),
                     parent_turn_id: Some("root-turn".to_string()),
                     is_sidechain: false,
+                    is_compaction_boundary: false,
                 },
                 SessionTurnIngest {
                     session_id: "5169694d-de0f-40d1-890c-6e28e55bab27".to_string(),
@@ -1261,6 +1294,7 @@ transcript_locator = "{}"
                     role: "assistant".to_string(),
                     parent_turn_id: Some("assistant-main".to_string()),
                     is_sidechain: true,
+                    is_compaction_boundary: false,
                 },
             ],
         );
@@ -1454,5 +1488,32 @@ transcript_locator = "{}"
             json["root"]["session"]["resume_acceptance_evidence"],
             "matched session id"
         );
+    }
+
+    // risk: Trace integration; level: particular-integration; source: proposal §11.1 Trace integration.
+    #[test]
+    fn trace_json_includes_chain_id() {
+        let chain_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+        let fixture = TraceFixture::new(&base_rows());
+        fixture.set_session_capture(1, Some(session_id), Some("resumed"));
+        fixture.seed_chain_segment(chain_id, "fixture-provider", session_id);
+
+        let report = trace_invocation(
+            &fixture.db(),
+            ROOT_UUID,
+            TraceOptions {
+                max_depth: 64,
+                json: true,
+                inline_transcript: false,
+                transcript: false,
+            },
+        )
+        .unwrap();
+        let json = serde_json::to_value(&report).unwrap();
+
+        assert_eq!(json["root"]["session"]["id"], session_id);
+        assert_eq!(json["root"]["session"]["chain_id"], chain_id);
+        assert!(json["root"]["session"].get("transcript_state").is_some());
     }
 }

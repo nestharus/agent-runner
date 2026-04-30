@@ -3,6 +3,7 @@ pub mod config;
 pub mod diagnostics;
 pub mod discovery;
 pub mod executor;
+pub mod migration;
 pub mod quota;
 pub mod sessions;
 pub mod setup;
@@ -767,6 +768,7 @@ mod tests {
                 .map(|c| ProviderConfig::new(c.to_string(), vec![]))
                 .collect(),
             inputs: vec![],
+            migration_threshold: 0.95,
         }
     }
 
@@ -810,6 +812,7 @@ mod tests {
                     ProviderConfig::new("claude", vec!["-p".to_string()]),
                 ],
                 inputs: vec![],
+                migration_threshold: 0.95,
             },
         );
         models.insert("y".into(), make_model("y", &["claude"]));
@@ -831,6 +834,7 @@ mod tests {
                 prompt_mode: PromptMode::Stdin,
                 providers: vec![ProviderConfig::new("env -u CLAUDECODE claude", vec![])],
                 inputs: vec![],
+                migration_threshold: 0.95,
             },
         );
         // Plain command should also group as "claude"
@@ -859,6 +863,7 @@ mod tests {
                 ],
             )],
             inputs: vec![],
+            migration_threshold: 0.95,
         };
         let mut models = HashMap::new();
         models.insert(model.name.clone(), model);
