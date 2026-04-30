@@ -2844,7 +2844,7 @@ impl StateDb {
                 recent_turns,
             });
         }
-        out.sort_by(|a, b| b.last_used_at.cmp(&a.last_used_at));
+        out.sort_by_key(|preview| std::cmp::Reverse(preview.last_used_at));
         Ok(out)
     }
 
