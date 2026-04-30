@@ -284,12 +284,6 @@ pub struct ModelConfig {
     pub providers: Vec<ProviderConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<InputDef>,
-    #[serde(default = "default_migration_threshold")]
-    pub migration_threshold: f64,
-}
-
-fn default_migration_threshold() -> f64 {
-    0.95
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -367,7 +361,6 @@ struct RawModelToml {
     session_storage: Option<SessionStorage>,
     providers: Option<Vec<RawProvider>>,
     inputs: Option<Vec<RawInput>>,
-    migration: Option<RawMigration>,
 }
 
 #[derive(Deserialize)]
@@ -381,11 +374,6 @@ struct RawProvider {
     session_capture: Option<SessionCapture>,
     resume_acceptance: Option<ResumeAcceptanceRules>,
     session_storage: Option<SessionStorage>,
-}
-
-#[derive(Deserialize)]
-struct RawMigration {
-    threshold: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -512,12 +500,6 @@ impl ModelConfig {
             append_session_storage_toml(&mut out, "session_storage", p.session_storage.as_ref());
         } else {
             out.push_str(&format!("prompt_mode = \"{}\"\n", mode_str));
-            if (self.migration_threshold - default_migration_threshold()).abs() > f64::EPSILON {
-                out.push_str(&format!(
-                    "\n[migration]\nthreshold = {}\n",
-                    self.migration_threshold
-                ));
-            }
             for p in &self.providers {
                 out.push_str("\n[[providers]]\n");
                 // Only emit an explicit name line when the stored name differs
@@ -627,16 +609,6 @@ impl ModelConfig {
             toml::from_str(content).map_err(|e| format!("TOML parse error for {name}: {e}"))?;
 
         let prompt_mode = parse_prompt_mode(raw.prompt_mode.as_deref().unwrap_or("stdin"));
-        let migration_threshold = raw
-            .migration
-            .as_ref()
-            .and_then(|m| m.threshold)
-            .unwrap_or_else(default_migration_threshold);
-        if !(migration_threshold > 0.0 && migration_threshold <= 1.0) {
-            return Err(format!(
-                "Model {name}: [migration].threshold must be > 0.0 and <= 1.0"
-            ));
-        }
 
         let inputs = if let Some(raw_inputs) = raw.inputs {
             parse_inputs(raw_inputs)?
@@ -718,7 +690,6 @@ impl ModelConfig {
             prompt_mode,
             providers,
             inputs,
-            migration_threshold,
         })
     }
 }
@@ -1891,21 +1862,6 @@ key = "experimental_resume"
 "#
     }
 
-    fn migration_threshold_toml(threshold: Option<&str>) -> String {
-        let migration = threshold
-            .map(|value| format!("\n[migration]\nthreshold = {value}\n"))
-            .unwrap_or_default();
-        format!(
-            r#"
-prompt_mode = "arg"
-{migration}
-[[providers]]
-name = "claude"
-command = "claude"
-"#
-        )
-    }
-
     fn resume_without_interactive_args_toml(kind: &str, field: &str) -> String {
         format!(
             r#"
@@ -2009,24 +1965,5 @@ kind = "{kind}"
             Some(SessionStorage::Codex { ref sessions_dir })
                 if sessions_dir == &home.join(".codex/sessions")
         ));
-    }
-
-    // risk: Sticky-then-migrate decision; level: unit; source: proposal §11.1 Sticky-then-migrate decision / A2, A4.
-    #[test]
-    fn migration_threshold_defaults_to_095() {
-        let config =
-            ModelConfig::from_toml("threshold-default", &migration_threshold_toml(None)).unwrap();
-
-        assert_eq!(config.migration_threshold, 0.95);
-    }
-
-    // risk: Sticky-then-migrate decision; level: unit; source: proposal §11.1 Sticky-then-migrate decision / A2, A4.
-    #[test]
-    fn migration_threshold_rejects_out_of_range_values() {
-        for threshold in ["0.0", "1.01"] {
-            let toml = migration_threshold_toml(Some(threshold));
-            let err = ModelConfig::from_toml("threshold-invalid", &toml).unwrap_err();
-            assert!(err.contains("[migration].threshold"), "{err}");
-        }
     }
 }

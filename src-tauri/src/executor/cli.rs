@@ -1270,7 +1270,6 @@ mod tests {
                     flag: Some("--size".to_string()),
                 },
             ],
-            migration_threshold: 0.95,
         };
         let mut inputs = HashMap::new();
         inputs.insert("size".to_string(), vec!["1024*1024".to_string()]);
@@ -1295,7 +1294,6 @@ mod tests {
                 description: None,
                 flag: Some("--format".to_string()),
             }],
-            migration_threshold: 0.95,
         };
         let flags = resolve_input_flags(&model, &HashMap::new()).unwrap();
         assert_eq!(flags, vec!["--format", "jpeg"]);
@@ -1318,7 +1316,6 @@ mod tests {
                 description: None,
                 flag: Some("--size".to_string()),
             }],
-            migration_threshold: 0.95,
         };
         let mut inputs = HashMap::new();
         inputs.insert("size".to_string(), vec!["huge".to_string()]);
@@ -1341,7 +1338,6 @@ mod tests {
                 description: None,
                 flag: Some("--image".to_string()),
             }],
-            migration_threshold: 0.95,
         };
         let result = resolve_input_flags(&model, &HashMap::new());
         assert!(result.unwrap_err().contains("Required input 'image'"));
@@ -1354,7 +1350,6 @@ mod tests {
             prompt_mode: PromptMode::Stdin,
             providers: vec![ProviderConfig::new("test", vec![])],
             inputs: vec![],
-            migration_threshold: 0.95,
         };
         let mut inputs = HashMap::new();
         inputs.insert("custom".to_string(), vec!["value".to_string()]);
@@ -1370,7 +1365,6 @@ mod tests {
             prompt_mode: PromptMode::Arg,
             providers: vec![ProviderConfig::new("echo", vec![])],
             inputs: vec![],
-            migration_threshold: 0.95,
         };
         let result = execute(&model, 0, "hello world", None, &HashMap::new(), None).unwrap();
         assert_eq!(result.exit_code, 0);
@@ -1392,7 +1386,6 @@ mod tests {
             prompt_mode: PromptMode::Arg,
             providers: vec![ProviderConfig::new("echo", vec![])],
             inputs: vec![],
-            migration_threshold: 0.95,
         };
         let result = execute(&model, 0, "no capture", None, &HashMap::new(), None).unwrap();
         assert_eq!(result.exit_code, 0);
@@ -1423,7 +1416,6 @@ mod tests {
             prompt_mode: PromptMode::Stdin,
             providers: vec![ProviderConfig::new("cat", vec![])],
             inputs: vec![],
-            migration_threshold: 0.95,
         };
         let result = execute(&model, 0, "piped input", None, &HashMap::new(), None).unwrap();
         assert_eq!(result.exit_code, 0);
@@ -1446,7 +1438,6 @@ mod tests {
                 description: None,
                 flag: Some("--greet".to_string()),
             }],
-            migration_threshold: 0.95,
         };
         let mut inputs = HashMap::new();
         inputs.insert("greeting".to_string(), vec!["hello".to_string()]);
@@ -1510,7 +1501,6 @@ printf '{{"type":"system","subtype":"init","session_id":"%s"}}\n' "$requested""#
                 session_storage: None,
             }],
             inputs: vec![],
-            migration_threshold: 0.95,
         };
 
         let result = execute(&model, 0, "hello", None, &HashMap::new(), None).unwrap();
@@ -1599,7 +1589,6 @@ printf '{"type":"system","subtype":"init","session_id":"11111111-1111-1111-1111-
                 session_storage: None,
             }],
             inputs: vec![],
-            migration_threshold: 0.95,
         };
 
         let result = execute(&model, 0, "hello", None, &HashMap::new(), None).unwrap();
@@ -1660,7 +1649,6 @@ printf 'assistant text from tmpfile\n' > "$output_file""#,
                 session_storage: None,
             }],
             inputs: vec![],
-            migration_threshold: 0.95,
         };
 
         let result = execute(&model, 0, "hello", None, &HashMap::new(), None).unwrap();
@@ -1720,7 +1708,6 @@ printf 'assistant text from tmpfile\n' > "$output_file""#,
                 session_storage: None,
             }],
             inputs: vec![],
-            migration_threshold: 0.95,
         };
 
         let result = execute(&model, 0, "hello", None, &HashMap::new(), None).unwrap();

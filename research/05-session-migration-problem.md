@@ -19,7 +19,7 @@ Two implications:
 1. Different agents on the same provider account do **not** share cache with each other — caches are per-prefix, and each agent has its own system prompt + history. Stickiness across agents on one account does not buy cache hits.
 2. Stickiness **within** a single conversation does buy cache hits. Migrating mid-conversation costs ~1.25× one prefix rewrite. Break-even after one subsequent turn.
 
-So the policy must be sticky-then-migrate: stay on the current provider until projection says we're near a quota wall, then move. Always-migrate-on-resume burns cache for no reason; never-migrate hits the wall.
+Rev 5 policy update: resume is rare and happens between invocations, so the policy should pick the best-scored storage-backed provider at every resume. Cache stickiness is not a useful gate because agents fan out and often miss cache anyway.
 
 ## What needs to change
 
@@ -31,7 +31,7 @@ So the policy must be sticky-then-migrate: stay on the current provider until pr
 
 4. **Two chains can share a session_id.** This isn't pathological — a chain that was migrated mid-conversation, where the original side then continued independently before the user noticed, can fork the upstream UUID across two now-independent chains. The resolver must surface both with previews and let the user pick.
 
-5. **Sticky-then-migrate policy at resume.** Stay on the current provider while projected usage < threshold (default 95%) to keep the prefix cache warm; migrate to the best-projected sibling only when the current provider is near-cap or already exhausted.
+5. **Best-on-resume policy.** At resume entry, pick the highest-scored storage-backed provider and migrate when it differs from the active segment's provider. If the active provider is marked exhausted, pick the best-scored storage-backed sibling.
 
 ## Open questions (resolved in answers doc)
 

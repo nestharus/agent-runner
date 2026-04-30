@@ -1032,9 +1032,9 @@ fn top_level_resume_without_model_errors_when_no_invocation_history() {
     assert!(stderr.contains("default_model"), "{stderr}");
 }
 
-// risk: CLI surface / Sticky-then-migrate decision; level: end-to-end; source: proposal §11.1 CLI surface and Sticky-then-migrate decision / A2, A4.
+// risk: CLI surface / Best-on-resume decision; level: end-to-end; source: proposal §11.1 CLI surface and Best-on-resume decision / A2, A4.
 #[test]
-fn manual_migrate_flag_overrides_threshold_via_cli() {
+fn manual_migrate_flag_overrides_best_score_via_cli() {
     let fixture = Fixture::new();
     let source_projects = fixture.dir.path().join("source-projects");
     let target_projects = fixture.dir.path().join("target-projects");

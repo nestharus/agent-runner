@@ -1,6 +1,6 @@
-# 1. Scope statement (Rev 4)
+# 1. Scope statement (Rev 5)
 
-Initiative 05 introduces a session-chain abstraction that decouples conversation identity from the upstream provider's session_id, so a single logical conversation can move across provider accounts (e.g. `claude` → `claude2`) without renaming or losing history. The PR adds two SQLite tables (`session_chains`, `session_chain_segments`), one per-provider config block (`[providers.session_storage]`), a Claude-Code transcript-copy step in the executor, a sticky-then-migrate policy at resume time keyed off initiative 04's projection scoring, and lifts `--resume`'s `--model` requirement by inferring the model from the chain's invocation history. This ships as one PR because chain identity, the resolver, and the Claude migration mechanic are mutually dependent: schema, write paths, resolver, executor, and CLI all participate in the same data flow; splitting them produces dead intermediate code with the same shape as the rejected splits in initiative 04.
+Initiative 05 introduces a session-chain abstraction that decouples conversation identity from the upstream provider's session_id, so a single logical conversation can move across provider accounts (e.g. `claude` → `claude2`) without renaming or losing history. The PR adds two SQLite tables (`session_chains`, `session_chain_segments`), one per-provider config block (`[providers.session_storage]`), a Claude-Code transcript-copy step in the executor, a best-on-resume policy keyed off initiative 04's projection scoring, and lifts `--resume`'s `--model` requirement by inferring the model from the chain's invocation history. This ships as one PR because chain identity, the resolver, and the Claude migration mechanic are mutually dependent: schema, write paths, resolver, executor, and CLI all participate in the same data flow; splitting them produces dead intermediate code with the same shape as the rejected splits in initiative 04.
 
 Initiative 05 depends on initiative 04 — the migration trigger reads `provider_quotas.exhausted_at` and reuses initiative 04's per-window projection. Land 04 first.
 
@@ -20,12 +20,18 @@ Initiative 05 depends on initiative 04 — the migration trigger reads `provider
 
 **Rev 4 changes** (Codex migration deferral):
 
-- §6 Step 1 / Step 3: Codex providers (`kind = "codex"` in `[providers.session_storage]`) remain declarable but cannot be migration sources or targets in v1. If `--migrate` or a threshold trigger reaches the migration mechanic for a Codex chain, return `MigrationError::CodexMigrationDeferred { provider }`.
+- §6 Step 1 / Step 3: Codex providers (`kind = "codex"` in `[providers.session_storage]`) remain declarable but cannot be migration sources or targets in v1. If `--migrate` or the best-on-resume policy reaches the migration mechanic for a Codex chain, return `MigrationError::CodexMigrationDeferred { provider }`.
 - §6 Step 5 / §6.6: Codex `.zst` migration is deferred; only plaintext Claude-Code JSONL copy ships in v1, so the `zstd` crate dependency is NOT added.
 - §7: drop `kind = "config"` / `experimental_resume`. Keep `kind = "flag"` for Claude and `kind = "subcommand"` for Codex one-shot/REPL fresh-session resume. `compose_resume_args()` still gains `target_jsonl_path: Option<&Path>` for the deferred follow-up; only the Claude migration path uses the path-aware plumbing in v1.
 - §9.1: `kind = "codex"` remains for forward-compatible chain identity (chain_id mint at ingestion, segment ledger, resume-by-id within the same provider), but is ignored for migration in v1 pending a documented Codex path-resume mechanism.
 - §11 / §13.1: remove Codex `.zst` and `experimental_resume` tests/surface; add Codex-deferred mechanic coverage and Codex chain-identity coverage.
 - §15: replace the Codex compaction-format migration residual with a broader Codex migration deferral entry citing `research/05-codex-resume-verification.md`.
+
+**Rev 5 changes** (policy fix):
+
+- §5: migration policy reframed as best-on-resume. At every resume, pick the highest-scored sibling provider with session storage and migrate if it differs from the active segment's provider; drop the threshold gate entirely.
+- Per user feedback, resume is rare and happens between invocations, not per turn, so thrashing is not a concern. Cache continuity rarely benefits because agents fan out and miss cache anyway.
+- Drop `migration_threshold` from `ModelConfig` and remove `[migration] threshold = ...` parsing/emission entirely.
 
 ## 1.1 Assumption register
 
@@ -34,7 +40,7 @@ This is the approved register validated and extended from `research/05-session-m
 | ID | Assumption | Evidence | Invalidator | Used by |
 | --- | --- | --- | --- | --- |
 | A1 | Claude Code `--resume <UUID>` replays local JSONL state rather than requiring server-side session state, and migration must reuse the source UUID on the target side. | Locked answer Q2 says the JSONL is the source of truth and cites Claude Code session docs plus `claude --help` (`research/05-session-migration-answers.md:25-36`); its first sentence verifies `~/.claude2/projects/<hash>/<UUID>.jsonl` plus `--resume <UUID>` works. Live QA empirically rejected the safer-practice idea of minting a new target UUID because Claude Code compares `--resume` against embedded JSONL `sessionId` fields. | A Claude Code release or observed session where copied JSONL plus `--resume` cannot continue without server-side state. | §6 migration mechanic, §7 `flag` resume path, §9.1 `claude_code` storage, §11.1 migration tests. |
-| A2 | Prompt-cache cost makes sticky-then-migrate valuable: Anthropic cache is org-scoped today and workspace-scoped after February 5, 2026; cross-org/workspace migration cost is bounded to one prefix rewrite. | Locked answer Q1 cites Anthropic prompt-cache docs and pricing (`research/05-session-migration-answers.md:5-23`); problem statement explains the sticky-then-migrate cost model (`research/05-session-migration-problem.md:13-22`). | Provider docs, account behavior, or usage data showing cache isolation/cost differs materially for the accounts the runner balances. | §5 threshold policy, §12 README migration explanation, §14 cross-org cache residual, §1.2 net-value statement. |
+| A2 | Resume is a rare, between-invocation event. Picking the best-scored provider at resume entry does not cause thrashing. | Live user feedback for Rev 5: resume is not a per-turn operation, and agents fan out enough that cache stickiness rarely buys continuity. | Observed resume workflows that repeatedly bounce the same chain between providers in a way that materially harms reliability or cost. | §5 best-on-resume policy, §12 README migration explanation, §14 cross-org cache residual, §1.2 net-value statement. |
 | A3 | `session_turns` ingestion captures every adapter-emitted turn soon enough for resolver, quota projection, and compaction-boundary decisions. | Problem-map notes `select_provider` scans providers before scoring and scripts use cursors (`research/05-session-migration-problem-map.md:133-135`); hookpoints identify `scan_provider` and both DB insert paths (`research/05-session-migration-hookpoints.md:45-52`, `research/05-session-migration-hookpoints.md:84-89`). | Adapter cursor bugs, delayed/batched emission, skipped malformed lines, partial writes, or script failures that leave the DB missing turns the proposal relies on. | §3.1.1 UI chain mint, §3.3 last-used updates, §4 resolver previews, §6.6 compaction-aware copy, §10 trace counts. |
 | A4 | `score_by_density` can be extracted into `compute_projections` without changing provider selection. | Problem-map identifies the local projection body and existing density tests (`research/05-session-migration-problem-map.md:136`); hookpoints locate the exact extraction surface and non-hookpoint keep-list (`research/05-session-migration-hookpoints.md:54-63`, `research/05-session-migration-hookpoints.md:128-131`). | Any branch reorder, tie behavior change, hidden-window penalty change, bootstrap/fallback change, or balancer test regression after extraction. | §5.1 refactor, §5 migration decision, §13/§13.1 blast-radius notes, §11.1 projection-equivalence tests. |
 | A5 | First-open backfill is acceptable when run in one transaction, with `agents migrate-db` as the explicit retry/foreground path if user-visible delay or write failure occurs. | Problem-map calls out synchronous open-path risk and backfill data sources (`research/05-session-migration-problem-map.md:107-117`); Rev 2 risk gates accepted the mandatory-backfill/no-fallback design (`risk/05-audit.md`, `risk/05-shortcut.md`). | Representative user DBs, slow I/O, locks, or write failures make startup backfill too slow or unreliable without a different migration path. | §2 backfill, §8.5.1 `agents migrate-db`, §14 backfill risk, §13.1 migration/rollback. |
@@ -280,7 +286,7 @@ Snippet content is `None` in v1 (deferred to a follow-up that adds a `transcript
 Re-run with: agents resume <chain_id> ...
 ```
 
-# 5. Sticky-then-migrate policy
+# 5. Best-on-resume policy
 
 After `resolve_resume` succeeds, the executor decides whether to stay or migrate.
 
@@ -302,24 +308,23 @@ pub fn decide_migration(
     state: &StateDb,
     model: &ModelConfig,
     resolved: &ResolvedResume,
-    threshold: f64,    // default 0.95
     manual_target: Option<&str>,
 ) -> Result<MigrationDecision, MigrationError>
 ```
 
 Algorithm:
 
-1. If `manual_target` is `Some(name)`: validate name is in `model.providers` and has migration-eligible `[providers.session_storage]` (Claude-Code only in v1). Return `Migrate { reason = Manual }`.
+1. If `manual_target` is `Some(name)`: validate name is in `model.providers` and has `[providers.session_storage]` declared. Return `Migrate { reason = Manual }`.
 2. Look up the active provider's index in `model.providers`. If absent: caller already handled the mismatch via the resolver's pool validation step — defensive return `Stay`.
-3. Read `provider_quotas.exhausted_at` for the active provider. If non-NULL: pick the highest-scored sibling with migration-eligible `[providers.session_storage]` (Claude-Code only in v1); return `Migrate { reason = Exhausted }`. If no eligible sibling: `Stay`.
+3. Read `provider_quotas.exhausted_at` for the active provider. If non-NULL: pick the highest-scored sibling with `[providers.session_storage]` declared; return `Migrate { reason = Exhausted }`. If no eligible sibling: `Stay`.
 4. Call `compute_projections(model, state, ctx) -> Vec<ProviderProjection>` (new helper — see §5.1) which performs the same refresh-then-evaluate flow `score_by_density` uses today (`src-tauri/src/balancer/mod.rs:93-121`) and returns the per-provider projection vector instead of selecting a single index.
-5. Compute `tightest_projected = min over windows of projected_used_w` from the active provider's `ProviderProjection`. If no windows yet learned, treat as 0.0.
-6. If `tightest_projected >= threshold`: pick the highest-scored other provider with migration-eligible `[providers.session_storage]` (Claude-Code only in v1) AND a strictly better score than active (using the same binding-score ranking `score_by_density` uses). If found: `Migrate { reason = QuotaThreshold }`. If none: `Stay`.
-7. Else: `Stay`.
+5. Compute the highest-scored provider in the model pool that has `[providers.session_storage]` declared. Tie-break by lowest provider index. Call this `best`.
+6. If `best.provider_index == active_provider_index`: `Stay`; the active provider is already the best scored.
+7. Else: `Migrate { target_provider_index: best.provider_index, reason: QuotaThreshold }`. The historical `quota_threshold` reason string is retained, but it now means "active provider is not the best-scored provider at resume entry."
 
-Single-provider models always `Stay`. Pools where no sibling has migration-eligible `[providers.session_storage]` always `Stay` (no migration target available).
+Single-provider models always `Stay`. Pools where no provider with a learned score has `[providers.session_storage]` always `Stay` (no migration target available).
 
-Rev 4 v1 limitation: a migration-eligible target is a sibling with `[providers.session_storage] kind = "claude_code"`. `kind = "codex"` remains visible to the chain layer but is ignored as a migration target. If the active provider is Codex and a Claude-Code sibling is otherwise eligible, `decide_migration` may still return `Migrate` so the normal threshold/manual policy is observable; the §6 mechanic then returns `MigrationError::CodexMigrationDeferred { provider }`. If the active provider is Codex and no Claude-Code sibling is eligible, return `Stay` and log that Codex migration is deferred.
+Rev 4 v1 limitation remains in the migration mechanic: `kind = "codex"` is declarable for chain identity, but if policy or `--migrate` routes through a Codex source or target, §6 returns `MigrationError::CodexMigrationDeferred { provider }` before writing files or chain segments.
 
 ## 5.1 `compute_projections` refactor
 
@@ -329,18 +334,9 @@ Initiative 05 needs the projection data without selecting. Refactor:
 
 - Extract the refresh + per-provider evaluation loop into `pub fn compute_projections(model, state, ctx) -> Vec<ProviderProjection>` where `ProviderProjection` carries `{ provider_index, projections_per_window: Vec<WindowProjection>, binding_score: Option<f64>, recent_error_count: u32 }`. The function does NO selection.
 - `score_by_density` becomes a thin caller: `compute_projections` → `argmax(binding_score)` → fall through to invocation-count if all-unlearned (preserving existing behavior).
-- `decide_migration` calls `compute_projections` directly and reads `tightest_projected` and `binding_score` for the active provider and siblings.
+- `decide_migration` calls `compute_projections` directly and reads `binding_score` for the active provider and siblings.
 
 This is a refactor, not a behavior change — `score_by_density`'s output is bit-for-bit identical. Pin with the existing balancer test suite (kept by initiative 04). The refactor lives in the same file as §3.8's keep-list per initiative 04, so the §13 cross-cutting note about "no incidental change to balancer projection or refresh" is satisfied: the math moves but does not change.
-
-`migration_threshold` is configurable per-model via:
-
-```toml
-[migration]
-threshold = 0.95
-```
-
-Optional block; defaults to 0.95. Add `migration_threshold: f64` to `ModelConfig`; parse from `[migration]` block in `src-tauri/src/config/model.rs`.
 
 # 6. Migration mechanic
 
@@ -483,7 +479,7 @@ Delete the explicit error at `src-tauri/src/main.rs:318-321`. Replace with the r
 
 ## 8.4 New `--migrate <provider>` flag
 
-On `resume` and `repl --resume` subcommands and the top-level form, accept `--migrate <provider_name>` to force migration to the named provider regardless of threshold. Validates pool inclusion and `[providers.session_storage]` presence. Sets `transition_reason = 'manual'`.
+On `resume` and `repl --resume` subcommands and the top-level form, accept `--migrate <provider_name>` to force migration to the named provider regardless of score. Validates pool inclusion and `[providers.session_storage]` presence. Sets `transition_reason = 'manual'`.
 
 ## 8.5 New `agents resume --list <UUID>`
 
@@ -624,7 +620,7 @@ Fixtures are applied outside test bodies per Phase 6: DB state comes from dedica
 | Schema migration and backfill (`backfill_*`, `migrate_db_command_*`, `startup_refuses_chain_ops_on_backfill_failure`) | Existing DBs may open without chain rows, double-backfill, or fall back to deleted resolver behavior. | `CREATE TABLE IF NOT EXISTS` and `ALTER TABLE ... DEFAULT 0` are idempotent; each distinct `(provider_name, session_id)` becomes one imported chain/segment; `StateDb::open` and `agents migrate-db` produce equivalent rows; failures stop chain-aware startup with a recovery hint. | particular-integration | SQLite temp DB fixtures seeded from `session_turns`/`invocations`; CLI fixture invokes `agents migrate-db` against the temp DB. | A5 | SQL row counts and values in `session_chains`/`session_chain_segments`; command exit code 0/1; stderr substring naming `agents migrate-db` on startup failure. | Does not prove performance on every user DB or filesystem; backfill scale remains a §14 watched risk. |
 | Chain identity write paths (`mint_chain_*`, `agent_session_chain_records_model_at_mint`, `ui_session_chain_*`, `chain_last_used_at_updates_after_successful_invocation`) | New agent/UI sessions may fail to mint stable chain identity, record wrong model provenance, or leave stale `last_used_at`, breaking resume without `-m` and 24h disambiguation. | Agent session capture mints an initial segment with model name; UI ingestion mints an imported segment using provider `default_model` or `'<unknown>'`; resume no-ops against existing chain; successful chain-tied invocation advances `last_used_at`. | particular-integration | Invocation/ingestion fixture builders with stub provider output, provider TOML defaults, and temp DB applied through existing state APIs. | A3, A8 | SQL row values: `transition_reason`, `model_name`, active segment count, and `last_used_at` within the call window. | Does not verify direct upstream CLI behavior beyond adapter-emitted turns; delayed adapters remain an A3 invalidator. |
 | Resolver disambiguation and model inference (`resolve_resume_*`, `agent_resume_no_dash_m_*`) | `--resume` may select the wrong logical conversation, accept ambiguous ownership, or fail to infer the model where proposal promises it. | Full UUID only; single-chain resolves active segment; duplicate session IDs filter by 24h then max `last_used_at`; true ambiguity returns previews; model precedence is override → latest invocation → chain model → provider default → `ModelInferenceImpossible`; provider/model pool mismatch reports suggestions. | particular-integration | Resolver DB/config builders with seeded chains, segments, invocations, provider defaults, and model pools; agent CLI fixture for no-`-m` resume. | A8 for provider-default fallback; none for pure disambiguation mechanics. | Returned `ResolvedResume` fields, `ResumeError` variants/previews, model name string, suggestions list, CLI exit code/stderr. | Preview snippets are intentionally absent until the §15 `transcript_preview` follow-up; UUID collisions outside seeded cases are not exhaustively generated. |
-| Sticky-then-migrate decision (`decide_migration_*`, `manual_migrate_flag_overrides_threshold_via_cli`) | Migration may happen too early, fail to happen near quota/exhaustion, or choose a provider without migration-eligible storage. | Below threshold stays; above threshold migrates only to a better Claude-Code sibling with storage; `exhausted_at` triggers migration; single-provider/no-storage/worse-sibling pools stay; manual target overrides threshold and records `manual`; Codex active provider returns `Migrate` only when a Claude-Code sibling exists, otherwise `Stay` with a logged deferred reason. | particular-integration | Balancer state/config fixture builders with quota-window rows, exhausted flags, model pools, and session-storage blocks; CLI fixture applies `--migrate`. | A2, A4, A7 | `MigrationDecision` enum value, target provider index, transition reason, logged Codex-deferred reason, and resulting segment `transition_reason = 'manual'` for CLI path. | Does not model real cross-org cache cost or provider API quota correctness; cross-org/workspace cache remains §14 residual. |
+| Best-on-resume decision (`decide_migration_*`, `manual_migrate_flag_overrides_best_score_via_cli`) | Migration may fail to happen when a better provider exists at resume, ignore exhaustion, or choose a provider without session storage. | Every resume picks the highest-scored provider with `[providers.session_storage]`; active best stays; ties break by lower provider index; `exhausted_at` triggers migration to the best sibling; single-provider/no-storage pools stay; manual target overrides best score and records `manual`; Codex source/target policy decisions are deferred by the migration mechanic before writes. | particular-integration | Balancer state/config fixture builders with quota-window rows, exhausted flags, model pools, and session-storage blocks; CLI fixture applies `--migrate`. | A2, A4, A7 | `MigrationDecision` enum value, target provider index, transition reason, logged Codex-deferred reason, and resulting segment `transition_reason = 'manual'` for CLI path. | Does not model real provider API quota correctness; Codex cross-account migration remains §15 residual. |
 | Migration mechanic: Claude JSONL copy, Codex deferred guard, segment ledger, and races (`migration_copies_*`, `migration_appends_chain_segment_*`, `migration_returning_clause_aborts_on_concurrent_close`, source-path errors, `migration_mechanic_errors_codex_deferred_*`) | Copying transcripts may write the wrong target, corrupt source/target files, leave multiple active segments, hide missing/malformed source paths, or accidentally exercise unverified Codex migration. | Source JSONL remains unchanged; Claude target path is provider-kind correct; plain copy writes `source[offset..]`; Codex source/target returns `MigrationError::CodexMigrationDeferred`; missing/malformed sources produce typed errors; close/open segment transaction records `ended_at`, `last_turn_id`, new active segment, and aborts concurrent close losers. | particular-integration | Tempdir transcript trees for Claude layouts, transcript-locator stub outputs, SQLite chain/turn fixtures, Codex storage config fixtures, and transaction-race harness. | A1 for Claude replay layout; A7 for Codex deferral; A3 for `last_turn_id` from ingested turns. | File existence/path, byte contents, absence/presence of `.tmp`, `MigrationError` variant, SQL segment fields, and one failed concurrent close result. | Does not prove real CLIs accept every copied JSONL; Codex cross-account migration is deferred to a follow-up PR per §15; chain identity for Codex sessions is verified but the file-copy path is not exercised. |
 | Migration mechanic: Codex deferred negative emission (`migration_does_not_emit_migrate_stderr_on_codex_deferred`) | Observability may claim a migration occurred even when the Codex-deferred guard short-circuits before segment insertion. | When Codex migration returns `MigrationError::CodexMigrationDeferred`, the `[migrate]` stderr line is not emitted and no target segment row is inserted. | particular-integration | CLI/migration fixture with Codex active provider, eligible Claude-Code sibling, stderr capture, and SQLite segment-count assertion. | A7 | Stderr does not contain `[migrate]`; `session_chain_segments` has no newly inserted target row. | Does not prove future Codex migration observability; the path remains deferred to §15. |
 | Migration mechanic: compaction-aware Claude target build (`migration_truncates_*`, `migration_errors_when_compaction_boundary_not_in_jsonl`, `pre_compaction_turns_remain_*`) | Compacted Claude sessions may be copied from the wrong offset, causing context overflow or data loss. | Latest compaction boundary wins; no boundary copies full file; missing boundary line errors without partial target; pre-compaction `session_turns` remain queryable. | particular-integration | Plaintext transcript fixtures with known JSON lines and turn IDs; DB fixture marks `is_compaction_boundary`; tempdir copy target. | A3, A6 | Target line set, error variant `CompactionBoundaryNotInJsonl`, missing partial target, SQL query returning pre-compaction rows. | Tests use synthetic boundaries and cannot prove future upstream JSONL stability; Claude compaction record format remains a §15 implementation-discovery item. |
@@ -656,14 +652,14 @@ Unit tests (Rust, `#[test]`):
 - `chain_mint_works_for_codex_ingestion`: ingest a Codex turn for a fresh `(provider, session_id)` pair; assert `session_chains` and `session_chain_segments` rows exist. This pins that Codex chain identity is preserved even though migration is deferred.
 - `agent_resume_no_dash_m_uses_session_recorded_model`: start an agent session under `claude-opus`, then run `agents --resume <UUID>` with no `-m`. Assert the second invocation runs against `claude-opus`.
 - `resolve_resume_validates_provider_in_model_pool`: chain owned by `claude2`, request a model whose pool excludes `claude2`, assert `ResumeError::ProviderModelMismatch` with non-empty suggestions.
-- `decide_migration_stays_under_threshold`: provider at 80% projected, threshold 0.95, assert `Stay`.
-- `decide_migration_migrates_above_threshold`: provider at 96% projected, sibling at 30%, threshold 0.95, assert `Migrate { target = sibling, reason = QuotaThreshold }`.
+- `decide_migration_picks_best_scored_sibling_on_resume`: active at 80% projection (score = 0.20×hours), sibling at 30% (score = 0.70×hours). Assert `Migrate { target = sibling, reason = QuotaThreshold }`.
+- `decide_migration_stays_when_active_is_best_scored`: active is the highest-scored provider. Assert `Stay`.
+- `decide_migration_breaks_ties_by_provider_index`: two siblings with identical scores. Assert the lower-index provider wins.
 - `decide_migration_migrates_when_exhausted_flag_set`: active provider has `exhausted_at` non-null, sibling clear, assert `Migrate { reason = Exhausted }` regardless of projection.
-- `decide_migration_stays_when_no_better_sibling`: all siblings above threshold and worse-scored, assert `Stay`.
 - `decide_migration_stays_when_single_provider_pool`: one-provider model at 99%, assert `Stay`.
 - `decide_migration_stays_when_no_sibling_has_session_storage`: sibling lacks `[providers.session_storage]`, assert `Stay`.
-- `decide_migration_manual_overrides_threshold`: `manual_target = Some("claude2")`, active at 50%, assert `Migrate { reason = Manual }`.
-- `decide_migration_returns_codex_deferred_for_codex_provider`: active provider has `kind = "codex"` storage. With a migration-eligible Claude-Code sibling, assert `Migrate`; without one, assert `Stay` and a logged reason that Codex migration is deferred.
+- `decide_migration_manual_overrides_best_score`: `manual_target = Some("claude2")`, active has the better score, assert `Migrate { reason = Manual }`.
+- `decide_migration_returns_codex_deferred_for_codex_provider`: active provider has `kind = "codex"` storage. With a better storage-backed sibling, assert `Migrate`; the migration mechanic returns `MigrationError::CodexMigrationDeferred` before writes.
 - `migration_copies_claude_jsonl_to_target_projects_dir`: stage a fake JSONL under source projects_dir, run migration, assert target projects_dir contains the file at `<cwd_hash>/<source_session_id>.jsonl`.
 - `migration_reuses_source_session_id_on_target_side`: run a Claude-Code migration and assert `MigratedSegment.target_session_id == source_session_id`, target path uses the source UUID, and the new segment is unique by `(chain_id, target_provider, source_session_id)`.
 - `migration_mechanic_errors_codex_deferred_on_codex_active_provider`: invoke the migration mechanic with a Codex source provider and a Claude-Code target candidate, assert `MigrationError::CodexMigrationDeferred { provider }` and no target file/segment is written.
@@ -690,7 +686,7 @@ Unit tests (Rust, `#[test]`):
 - `compose_resume_args_rejects_config_kind`: parse a model TOML fixture with `[providers.resume] kind = "config"` and assert validation rejects it. Pins the v1 invariant that no config resume strategy is recognized.
 - `top_level_resume_without_model_succeeds_when_chain_exists`: invoke `agents --resume <UUID>` with no `-m`, assert resolver picks the model and the run completes.
 - `top_level_resume_without_model_errors_when_no_invocation_history`: chain seeded only via backfill with `model_name = '<unknown>'`, `agents --resume <UUID>` errors with `ModelInferenceImpossible`.
-- `manual_migrate_flag_overrides_threshold_via_cli`: `agents resume --migrate <other-provider> <UUID>`, assert migration occurs and reason is `'manual'` even at 50% projection.
+- `manual_migrate_flag_overrides_best_score_via_cli`: `agents resume --migrate <other-provider> <UUID>`, assert migration occurs and reason is `'manual'` even when the active provider has the better score.
 - `resume_list_subcommand_prints_all_chains_for_session_id`: two chains share session_id, assert `agents resume --list <UUID>` prints both with last_used_at, active provider, and turn count.
 - `trace_json_includes_chain_id`: invoke `trace --json <invocation_uuid>` over a chained invocation, assert `session.chain_id` matches the segment row.
 
@@ -709,11 +705,11 @@ Replace the "Resuming a session" subsection (`README.md:417-477`) with chain-awa
 - `--resume <UUID>` accepts a session_id or chain_id; if a session_id matches multiple chains, disambiguates by 24h-window and falls back to user choice.
 - `-m` is now optional on `resume` and the top-level form. For agent sessions, the model is inferred from the chain's recorded model (set when the agent first started the session). For UI sessions started outside agent-runner, the runner falls back to `providers.<provider>.default_model` in `providers.toml`. Pass `-m` to override.
 - Both agent and UI sessions can be migrated for Claude-Code providers — the chain layer abstracts over how the session was started. Codex sessions preserve chain identity but not cross-account migration in v1.
-- `--migrate <provider>` forces migration; otherwise the runner stays sticky until 95% of the tightest window's projected usage.
+- `--migrate <provider>` forces migration; otherwise the runner picks the best-scored storage-backed provider at resume entry.
 - `[providers.session_storage] kind = "claude_code"` is required on any provider that participates in migration (source or target). `kind = "codex"` is declarable for chain identity but migration is deferred in v1.
 - Resume strategies remain `kind = "flag"` and `kind = "subcommand"`; no `kind = "config"` strategy ships in v1.
 
-Add a new subsection "Session migration" under Load Balancing covering the sticky-then-migrate policy, the cache-cost reasoning (95% threshold default; cache write 1.25× → break-even after one cache read), and the `[migration] threshold = 0.95` config block.
+Add a new subsection "Session migration" under Load Balancing covering the best-on-resume policy and the retained historical `quota_threshold` transition reason string.
 
 Add a `[providers.session_storage]` example to the existing Adding a Model section.
 
@@ -732,7 +728,7 @@ Update the resume failure-modes list (`README.md:467-475`) — the "Resume failu
 - `find_provider_for_session()` (`src-tauri/src/state/db.rs:2062-2107`) is replaced by `resolve_resume()`. All callers — `run_resume`, `run_repl` resume branches, the Tauri command if any — switch over. Old function deleted, not deprecated.
 - The `resume_acceptance` field in invocation rows (already present) reflects the **target** CLI's acceptance after migration. The chain ledger answers "was the migration recorded"; `resume_acceptance` answers "did the new provider accept the copied transcript". Document the distinction in §10's trace output.
 - `compose_resume_args()` signature changes (gains optional `target_jsonl_path`). Update both call sites.
-- `ModelConfig` gains `migration_threshold: f64` (default 0.95). Existing test fixtures that build `ModelConfig` directly need the field — set via `Default` impl, not by adding it to every fixture literal.
+- `ModelConfig` does not carry migration policy knobs. Removed policy config is deleted, not retained as ignored compatibility surface.
 - E2E: defer Tauri mock scenarios for chain disambiguation; the UI does not surface chains in v1. PoolsView/StatusView remain unchanged.
 - The chain abstraction is observable only via CLI (`resume --list`, `trace --json`). No frontend changes.
 
@@ -861,13 +857,13 @@ ORDER BY scs.started_at ASC;
 
 **Audit risk: copy-then-resume failure modes.** If the file copy succeeds but the target CLI rejects the JSONL (format mismatch, permissions, dup UUID inside record-level fields), the new segment row stays open and a stray target JSONL exists. Mitigation: copy to `.tmp`, rename atomically AFTER segment row is written (so a crash before rename leaves no stale segment); the failed invocation row is sufficient evidence; user reissues `--migrate` to retry. Document in step 10 of §6. GC of stray JSONLs is deferred.
 
-**Scope risk: no incidental change to balancer projection or refresh behavior.** §5.1 commits to extracting `compute_projections` from `score_by_density` — a refactor that moves code, not a behavior change. The mathematics, refresh ordering, fall-through to invocation-count, and recent-error penalty must be bit-for-bit equivalent before and after. Pin via the existing balancer test suite kept by initiative 04. Watch for diff under `src-tauri/src/balancer/mod.rs` in this PR: per-window projection math, bootstrap cascade, and selection logic must be unchanged. Any branch reorder, threshold tweak, or fall-through condition change is a separate proposal.
+**Scope risk: no incidental change to balancer projection or refresh behavior.** §5.1 commits to extracting `compute_projections` from `score_by_density` — a refactor that moves code, not a behavior change. The mathematics, refresh ordering, fall-through to invocation-count, and recent-error penalty must be bit-for-bit equivalent before and after. Pin via the existing balancer test suite kept by initiative 04. Watch for diff under `src-tauri/src/balancer/mod.rs` in this PR: per-window projection math, bootstrap cascade, and selection logic must be unchanged. Any branch reorder or fall-through condition change is a separate proposal.
 
 **Shortcut risk: no silent JSONL byte edits.** First-pass copies bytes unchanged for Claude Code. If a target CLI rejects the copy because record-level fields embed the source session_id, that's a deliberate normalization PR — `sed`-style rewrites are explicitly rejected. Provider-specific locator/copy helpers can be extended later to provide canonical copy-with-rewrite if the format demands it.
 
-**Cross-org cache cost is not modeled.** The migration policy assumes same-org siblings (cache shared). Cross-org migration costs ≈1.25× one prefix rewrite. The runner cannot detect orgs from OAuth state; cost is bounded and acceptable. After Anthropic's Feb 5 2026 workspace-isolation change, even same-org cross-workspace migration pays the rewrite. Document but do not solve.
+**Cross-org cache cost is not modeled.** The migration policy does not optimize for cache stickiness. Cross-org migration can cost a prefix rewrite, and after Anthropic's Feb 5 2026 workspace-isolation change, even same-org cross-workspace migration may pay the rewrite. User feedback for Rev 5 accepts this cost because resume is rare and agent fan-out already makes cache continuity weak. Document but do not solve.
 
-**Heuristic-coverage scope.** Initiative 04's exhausted flag is set only when stderr matches `quota`/`billing`/`usage limit`. If a CLI emits a different phrase on quota exhaustion, the flag isn't set, and migration's `Exhausted` trigger doesn't fire — but the projection threshold trigger still does at 95%. Defense-in-depth.
+**Heuristic-coverage scope.** Initiative 04's exhausted flag is set only when stderr matches `quota`/`billing`/`usage limit`. If a CLI emits a different phrase on quota exhaustion, the flag isn't set, but the next resume still picks the best-scored storage-backed provider. Defense-in-depth.
 
 # 15. Unresolved
 
@@ -875,7 +871,7 @@ ORDER BY scs.started_at ASC;
 - **Codex compaction format**: subsumed by the broader Codex migration deferral. `codex-turns` continues to ingest turns without `is_compaction_boundary`; chain identity works without it.
 - **Claude Code compaction record format**: the `claude-code-turns` adapter update in §9.1.1 is implementation discovery — the exact record type Claude Code writes for compaction events must be confirmed against real JSONL samples before merge. If the format is unstable across Claude Code versions, the adapter needs a version detection step.
 - **Multi-cwd Claude Code sessions**: a session JSONL is keyed by `cwd_hash`. If a user resumes from a DIFFERENT cwd than where the chain originated, Claude Code returns a fresh session — current behavior. Migration faces the same constraint: the target's `<projects_dir>/<cwd_hash>/<id>.jsonl` path uses the cwd at migration time. Document, do not solve. Users who change cwd lose chain continuity, same as today.
-- **REPL mid-session migration**: a long-running `repl` session that hits the threshold mid-conversation cannot migrate without restarting. Out of scope. The user restarts via `agents repl --resume <chain_id>`; the next-turn evaluation triggers the migration cleanly.
+- **REPL mid-session migration**: a long-running `repl` session that depletes a provider mid-conversation cannot migrate without restarting. Out of scope. The user restarts via `agents repl --resume <chain_id>`; the resume-time evaluation picks the best-scored provider cleanly.
 - **Cross-CLI migration** (claude → codex): transcript formats differ; out of scope.
 - **Chain pruning / archival**: chains accumulate forever. GC is a follow-up PR; for now `last_used_at` lets users grep stale chains via SQL.
 - **`transcript_preview` adapter for ambiguity disambiguation**: v1 ships without snippet content. Follow-up PR adds a `[providers.transcript_preview]` adapter pattern parallel to the existing turn/quota/locator adapters.

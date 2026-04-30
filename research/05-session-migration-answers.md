@@ -77,17 +77,17 @@ When `SELECT DISTINCT chain_id FROM session_chain_segments WHERE session_id = ?`
 
 Last-3-turns preview source: `session_turns` joined to the active segment, ordered by `timestamp` desc, limit 3, role-tagged. Snippet content (first 120 chars) requires a `transcript_preview` adapter — **defer adapter implementation to a follow-up PR**; v1 prints chain_id, last_used_at, active provider, and turn count without snippet text.
 
-## Q6: Migration trigger threshold
+## Q6: Migration trigger policy
 
-Default 95% projected usage on the current provider's tightest window, evaluated via the existing balancer projection (`score_by_density` produces per-window projected_used_percent at `src-tauri/src/balancer/mod.rs:162-196`).
+Pick the best-scored sibling at every resume. The decision uses the existing balancer projection (`score_by_density` produces per-window projected_used_percent at `src-tauri/src/balancer/mod.rs:162-196`) and compares provider binding scores, with ties broken by lower provider index.
 
-Reasoning: cache write cost is 1.25× one prefix; staying lets every subsequent turn hit cache reads at 0.1×. Migrating early (e.g. 70%) burns cache for no reason. Migrating late (>99%) risks a quota error mid-turn. 95% gives one to two turns of safety margin on most window sizes.
+Reasoning: resume is rare and happens between invocations, not per turn, so thrashing is not a concern. Cache stickiness rarely buys much because agents fan out and often miss cache anyway.
 
-Configurable per-pool via a new `migration_threshold` field on `ModelConfig`, default 0.95.
+There is no `migration_threshold` config field and no `[migration]` block. Removed policy config is deleted, not retained as ignored compatibility surface.
 
-A second, hard trigger: if the current provider has `provider_quotas.exhausted_at IS NOT NULL` (set by initiative 04's reactive flag), migrate unconditionally regardless of projection.
+A second, hard trigger: if the current provider has `provider_quotas.exhausted_at IS NOT NULL` (set by initiative 04's reactive flag), migrate to the highest-scored storage-backed sibling regardless of the active provider's score.
 
-A short-circuit: if the model's pool has only one provider with migration-eligible `[providers.session_storage]` declared (Claude-Code only in v1), no migration target exists — stay.
+A short-circuit: if the model's pool has only one provider with `[providers.session_storage]` declared, no migration target exists — stay.
 
 ## Q7: Provider session-storage declaration
 

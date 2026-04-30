@@ -959,13 +959,8 @@ fn run_resume(
     if let Ok(balancer::MigrationDecision::Migrate {
         target_provider_index,
         reason,
-    }) = balancer::decide_migration(
-        &state,
-        model,
-        &resolved,
-        model.migration_threshold,
-        manual_migrate,
-    ) {
+    }) = balancer::decide_migration(&state, model, &resolved, manual_migrate)
+    {
         let mut stderr = std::io::stderr();
         match agent_runner_lib::migration::migrate_chain_segment(
             &state,

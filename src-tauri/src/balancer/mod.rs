@@ -1,4 +1,4 @@
-use crate::config::{ModelConfig, ProvidersConfig, SessionStorage, SessionsConfig};
+use crate::config::{ModelConfig, ProvidersConfig, SessionsConfig};
 use crate::migration::MigrationError;
 use crate::quota::{InFlight, RefreshOutcome, is_stale, refresh_provider};
 use crate::sessions::scan_provider;
@@ -336,7 +336,6 @@ pub fn decide_migration(
     state: &StateDb,
     model: &ModelConfig,
     resolved: &ResolvedResume,
-    threshold: f64,
     manual_target: Option<&str>,
 ) -> Result<MigrationDecision, MigrationError> {
     if model.providers.len() <= 1 {
@@ -346,9 +345,7 @@ pub fn decide_migration(
     if let Some(target) = manual_target {
         if let Some(target_provider_index) = model.providers.iter().position(|p| p.name == target) {
             let target_provider = &model.providers[target_provider_index];
-            if target_provider.resume.is_some()
-                && is_claude_code_storage(target_provider.session_storage.as_ref())
-            {
+            if has_session_storage(target_provider) {
                 return Ok(MigrationDecision::Migrate {
                     target_provider_index,
                     reason: TransitionReason::Manual,
@@ -358,67 +355,74 @@ pub fn decide_migration(
         return Ok(MigrationDecision::Stay);
     }
 
-    let active = &model.providers[resolved.active_provider_index];
+    let Some(active_provider_index) = model
+        .providers
+        .iter()
+        .position(|provider| provider.name == resolved.active_provider)
+    else {
+        return Ok(MigrationDecision::Stay);
+    };
+
+    let active = &model.providers[active_provider_index];
     let active_exhausted = state
         .get_quota(&active.name)
         .map_err(|message| MigrationError::Db { message })?
         .and_then(|quota| quota.exhausted_at)
         .is_some();
     let projections = compute_projections(model, state, None);
-    let active_projected = projections
-        .iter()
-        .find(|projection| projection.provider_index == resolved.active_provider_index)
-        .and_then(|projection| {
-            projection
-                .projections_per_window
-                .iter()
-                .map(|window| window.projected_used)
-                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        })
-        .unwrap_or(0.0);
 
-    if !active_exhausted && active_projected < threshold {
+    if active_exhausted {
+        if let Some(target) =
+            best_scored_migration_target(model, &projections, Some(active_provider_index))
+        {
+            return Ok(MigrationDecision::Migrate {
+                target_provider_index: target.provider_index,
+                reason: TransitionReason::Exhausted,
+            });
+        }
         return Ok(MigrationDecision::Stay);
     }
 
-    let target = projections
-        .iter()
-        .filter(|projection| projection.provider_index != resolved.active_provider_index)
-        .filter(|projection| {
-            let provider = &model.providers[projection.provider_index];
-            provider.resume.is_some() && is_claude_code_storage(provider.session_storage.as_ref())
-        })
-        .filter(|projection| {
-            active_exhausted
-                || projection
-                    .projections_per_window
-                    .iter()
-                    .all(|window| window.projected_used < active_projected)
-        })
-        .filter(|projection| projection.binding_score.is_some())
-        .max_by(|a, b| {
-            a.binding_score
-                .unwrap()
-                .partial_cmp(&b.binding_score.unwrap())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-    if let Some(target) = target {
-        Ok(MigrationDecision::Migrate {
-            target_provider_index: target.provider_index,
-            reason: if active_exhausted {
-                TransitionReason::Exhausted
-            } else {
-                TransitionReason::QuotaThreshold
-            },
-        })
-    } else {
-        Ok(MigrationDecision::Stay)
+    let Some(best) = best_scored_migration_target(model, &projections, None) else {
+        return Ok(MigrationDecision::Stay);
+    };
+    if best.provider_index == active_provider_index {
+        return Ok(MigrationDecision::Stay);
     }
+
+    Ok(MigrationDecision::Migrate {
+        target_provider_index: best.provider_index,
+        reason: TransitionReason::QuotaThreshold,
+    })
 }
 
-fn is_claude_code_storage(storage: Option<&SessionStorage>) -> bool {
-    matches!(storage, Some(SessionStorage::ClaudeCode { .. }))
+fn has_session_storage(provider: &crate::config::ProviderConfig) -> bool {
+    provider.session_storage.is_some()
+}
+
+fn best_scored_migration_target<'a>(
+    model: &ModelConfig,
+    projections: &'a [ProviderProjection],
+    exclude_provider_index: Option<usize>,
+) -> Option<&'a ProviderProjection> {
+    projections
+        .iter()
+        .filter(|projection| Some(projection.provider_index) != exclude_provider_index)
+        .filter(|projection| {
+            model
+                .providers
+                .get(projection.provider_index)
+                .is_some_and(has_session_storage)
+        })
+        .filter(|projection| projection.binding_score.is_some())
+        .min_by(|a, b| {
+            let score_order = b
+                .binding_score
+                .unwrap()
+                .partial_cmp(&a.binding_score.unwrap())
+                .unwrap_or(std::cmp::Ordering::Equal);
+            score_order.then_with(|| a.provider_index.cmp(&b.provider_index))
+        })
 }
 
 fn best_binding_score<'a>(evals: &[&'a ProviderEval]) -> &'a ProviderEval {
@@ -661,7 +665,6 @@ mod tests {
                 ProviderConfig::new("b", vec![]),
             ],
             inputs: vec![],
-            migration_threshold: 0.95,
         }
     }
 
@@ -675,7 +678,6 @@ mod tests {
                 ProviderConfig::new("c", vec![]),
             ],
             inputs: vec![],
-            migration_threshold: 0.95,
         }
     }
 
@@ -687,7 +689,6 @@ mod tests {
             prompt_mode: PromptMode::Arg,
             providers: vec![ProviderConfig::new("x", vec![])],
             inputs: vec![],
-            migration_threshold: 0.95,
         };
         assert_eq!(select_provider(&model, &db, None), 0);
     }
@@ -1122,7 +1123,7 @@ mod tests {
     }
 
     fn migratable_model(provider_names: &[(&str, &str)]) -> ModelConfig {
-        let mut body = String::from("prompt_mode = \"arg\"\n\n[migration]\nthreshold = 0.95\n");
+        let mut body = String::from("prompt_mode = \"arg\"\n");
         for (name, storage_kind) in provider_names {
             body.push_str(&format!(
                 r#"
@@ -1174,28 +1175,15 @@ sessions_dir = "/tmp/{name}/sessions"
         db.drop_provider_quotas_for_test();
     }
 
-    // risk: Sticky-then-migrate decision; level: particular-integration; source: proposal §11.1 Sticky-then-migrate decision / A2, A4.
+    // risk: Best-on-resume decision; level: particular-integration; source: proposal §11.1 Best-on-resume decision / A2, A4.
     #[test]
-    fn decide_migration_stays_under_threshold() {
+    fn decide_migration_picks_best_scored_sibling_on_resume() {
         let db = StateDb::open(Path::new(":memory:")).unwrap();
         let model = migratable_model(&[("claude", "claude_code"), ("claude2", "claude_code")]);
         seed_windows_with_deltas(&db, "claude", &[(0.80, 5, 0.01, 22)]);
         seed_windows_with_deltas(&db, "claude2", &[(0.30, 5, 0.01, 22)]);
 
-        let decision = decide_migration(&db, &model, &resolved_for(&model, 0), 0.95, None).unwrap();
-
-        assert_eq!(decision, MigrationDecision::Stay);
-    }
-
-    // risk: Sticky-then-migrate decision; level: particular-integration; source: proposal §11.1 Sticky-then-migrate decision / A2, A4.
-    #[test]
-    fn decide_migration_migrates_above_threshold() {
-        let db = StateDb::open(Path::new(":memory:")).unwrap();
-        let model = migratable_model(&[("claude", "claude_code"), ("claude2", "claude_code")]);
-        seed_windows_with_deltas(&db, "claude", &[(0.96, 5, 0.01, 22)]);
-        seed_windows_with_deltas(&db, "claude2", &[(0.30, 5, 0.01, 22)]);
-
-        let decision = decide_migration(&db, &model, &resolved_for(&model, 0), 0.95, None).unwrap();
+        let decision = decide_migration(&db, &model, &resolved_for(&model, 0), None).unwrap();
 
         assert_eq!(
             decision,
@@ -1206,7 +1194,44 @@ sessions_dir = "/tmp/{name}/sessions"
         );
     }
 
-    // risk: Sticky-then-migrate decision; level: particular-integration; source: proposal §11.1 Sticky-then-migrate decision / A2, A4.
+    // risk: Best-on-resume decision; level: particular-integration; source: proposal §11.1 Best-on-resume decision / A2, A4.
+    #[test]
+    fn decide_migration_stays_when_active_is_best_scored() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = migratable_model(&[("claude", "claude_code"), ("claude2", "claude_code")]);
+        seed_windows_with_deltas(&db, "claude", &[(0.30, 5, 0.01, 22)]);
+        seed_windows_with_deltas(&db, "claude2", &[(0.80, 5, 0.01, 22)]);
+
+        let decision = decide_migration(&db, &model, &resolved_for(&model, 0), None).unwrap();
+
+        assert_eq!(decision, MigrationDecision::Stay);
+    }
+
+    // risk: Best-on-resume decision; level: particular-integration; source: proposal §11.1 Best-on-resume decision / A2, A4.
+    #[test]
+    fn decide_migration_breaks_ties_by_provider_index() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = migratable_model(&[
+            ("claude", "claude_code"),
+            ("claude2", "claude_code"),
+            ("claude3", "claude_code"),
+        ]);
+        seed_windows_with_deltas(&db, "claude", &[(0.30, 5, 0.01, 22)]);
+        seed_windows_with_deltas(&db, "claude2", &[(0.30, 5, 0.01, 22)]);
+        seed_windows_with_deltas(&db, "claude3", &[(0.90, 5, 0.01, 22)]);
+
+        let decision = decide_migration(&db, &model, &resolved_for(&model, 2), None).unwrap();
+
+        assert_eq!(
+            decision,
+            MigrationDecision::Migrate {
+                target_provider_index: 0,
+                reason: TransitionReason::QuotaThreshold
+            }
+        );
+    }
+
+    // risk: Best-on-resume decision; level: particular-integration; source: proposal §11.1 Best-on-resume decision / A2, A4.
     #[test]
     fn decide_migration_migrates_when_exhausted_flag_set() {
         let db = StateDb::open(Path::new(":memory:")).unwrap();
@@ -1215,7 +1240,7 @@ sessions_dir = "/tmp/{name}/sessions"
         seed_windows_with_deltas(&db, "claude2", &[(0.30, 5, 0.01, 22)]);
         db.mark_exhausted("claude").unwrap();
 
-        let decision = decide_migration(&db, &model, &resolved_for(&model, 0), 0.95, None).unwrap();
+        let decision = decide_migration(&db, &model, &resolved_for(&model, 0), None).unwrap();
 
         assert_eq!(
             decision,
@@ -1226,32 +1251,19 @@ sessions_dir = "/tmp/{name}/sessions"
         );
     }
 
-    // risk: Sticky-then-migrate decision; level: particular-integration; source: proposal §11.1 Sticky-then-migrate decision / A2, A4.
-    #[test]
-    fn decide_migration_stays_when_no_better_sibling() {
-        let db = StateDb::open(Path::new(":memory:")).unwrap();
-        let model = migratable_model(&[("claude", "claude_code"), ("claude2", "claude_code")]);
-        seed_windows_with_deltas(&db, "claude", &[(0.96, 5, 0.01, 22)]);
-        seed_windows_with_deltas(&db, "claude2", &[(0.98, 5, 0.01, 22)]);
-
-        let decision = decide_migration(&db, &model, &resolved_for(&model, 0), 0.95, None).unwrap();
-
-        assert_eq!(decision, MigrationDecision::Stay);
-    }
-
-    // risk: Sticky-then-migrate decision; level: particular-integration; source: proposal §11.1 Sticky-then-migrate decision / A2, A4.
+    // risk: Best-on-resume decision; level: particular-integration; source: proposal §11.1 Best-on-resume decision / A2, A4.
     #[test]
     fn decide_migration_stays_when_single_provider_pool() {
         let db = StateDb::open(Path::new(":memory:")).unwrap();
         let model = migratable_model(&[("claude", "claude_code")]);
         seed_windows_with_deltas(&db, "claude", &[(0.99, 5, 0.01, 22)]);
 
-        let decision = decide_migration(&db, &model, &resolved_for(&model, 0), 0.95, None).unwrap();
+        let decision = decide_migration(&db, &model, &resolved_for(&model, 0), None).unwrap();
 
         assert_eq!(decision, MigrationDecision::Stay);
     }
 
-    // risk: Sticky-then-migrate decision; level: particular-integration; source: proposal §11.1 Sticky-then-migrate decision / A2, A4.
+    // risk: Best-on-resume decision; level: particular-integration; source: proposal §11.1 Best-on-resume decision / A2, A4.
     #[test]
     fn decide_migration_stays_when_no_sibling_has_session_storage() {
         let db = StateDb::open(Path::new(":memory:")).unwrap();
@@ -1259,21 +1271,21 @@ sessions_dir = "/tmp/{name}/sessions"
         seed_windows_with_deltas(&db, "claude", &[(0.99, 5, 0.01, 22)]);
         seed_windows_with_deltas(&db, "claude2", &[(0.30, 5, 0.01, 22)]);
 
-        let decision = decide_migration(&db, &model, &resolved_for(&model, 0), 0.95, None).unwrap();
+        let decision = decide_migration(&db, &model, &resolved_for(&model, 0), None).unwrap();
 
         assert_eq!(decision, MigrationDecision::Stay);
     }
 
-    // risk: Sticky-then-migrate decision; level: particular-integration; source: proposal §11.1 Sticky-then-migrate decision / A2, A4.
+    // risk: Best-on-resume decision; level: particular-integration; source: proposal §11.1 Best-on-resume decision / A2, A4.
     #[test]
-    fn decide_migration_manual_overrides_threshold() {
+    fn decide_migration_manual_overrides_best_score() {
         let db = StateDb::open(Path::new(":memory:")).unwrap();
         let model = migratable_model(&[("claude", "claude_code"), ("claude2", "claude_code")]);
         seed_windows_with_deltas(&db, "claude", &[(0.50, 5, 0.01, 22)]);
         seed_windows_with_deltas(&db, "claude2", &[(0.60, 5, 0.01, 22)]);
 
         let decision =
-            decide_migration(&db, &model, &resolved_for(&model, 0), 0.95, Some("claude2")).unwrap();
+            decide_migration(&db, &model, &resolved_for(&model, 0), Some("claude2")).unwrap();
 
         assert_eq!(
             decision,
@@ -1284,7 +1296,7 @@ sessions_dir = "/tmp/{name}/sessions"
         );
     }
 
-    // risk: Sticky-then-migrate decision; level: particular-integration; source: proposal §11.1 Sticky-then-migrate decision / A2, A4, A7.
+    // risk: Best-on-resume decision; level: particular-integration; source: proposal §11.1 Best-on-resume decision / A2, A4, A7.
     #[test]
     fn decide_migration_returns_codex_deferred_for_codex_provider() {
         let db = StateDb::open(Path::new(":memory:")).unwrap();
@@ -1292,7 +1304,7 @@ sessions_dir = "/tmp/{name}/sessions"
         seed_windows_with_deltas(&db, "codex", &[(0.99, 5, 0.01, 22)]);
         seed_windows_with_deltas(&db, "claude", &[(0.30, 5, 0.01, 22)]);
 
-        let decision = decide_migration(&db, &mixed, &resolved_for(&mixed, 0), 0.95, None).unwrap();
+        let decision = decide_migration(&db, &mixed, &resolved_for(&mixed, 0), None).unwrap();
 
         assert_eq!(
             decision,
@@ -1304,19 +1316,25 @@ sessions_dir = "/tmp/{name}/sessions"
 
         let codex_only = migratable_model(&[("codex", "codex"), ("codex2", "codex")]);
         seed_windows_with_deltas(&db, "codex2", &[(0.30, 5, 0.01, 22)]);
-        let stay =
-            decide_migration(&db, &codex_only, &resolved_for(&codex_only, 0), 0.95, None).unwrap();
-        assert_eq!(stay, MigrationDecision::Stay);
+        let decision =
+            decide_migration(&db, &codex_only, &resolved_for(&codex_only, 0), None).unwrap();
+        assert_eq!(
+            decision,
+            MigrationDecision::Migrate {
+                target_provider_index: 1,
+                reason: TransitionReason::QuotaThreshold
+            }
+        );
     }
 
-    // risk: Sticky-then-migrate decision; level: particular-integration; source: proposal §11.1 Sticky-then-migrate decision / A2, A4.
+    // risk: Best-on-resume decision; level: particular-integration; source: proposal §11.1 Best-on-resume decision / A2, A4.
     #[test]
     fn decide_migration_reports_projection_state_errors() {
         let db = StateDb::open(Path::new(":memory:")).unwrap();
         let model = migratable_model(&[("claude", "claude_code"), ("claude2", "claude_code")]);
         drop_quota_table(&db);
 
-        let err = decide_migration(&db, &model, &resolved_for(&model, 0), 0.95, None).unwrap_err();
+        let err = decide_migration(&db, &model, &resolved_for(&model, 0), None).unwrap_err();
 
         assert!(matches!(err, MigrationError::Db { .. }));
     }

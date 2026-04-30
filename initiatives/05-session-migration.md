@@ -76,9 +76,8 @@ Follow-up on compaction:
   occupancy).
 - Resolver `resolve_resume(state, config, input, model_override) →
   ResolvedResume`, replacing today's `find_provider_for_session()`.
-- Sticky-then-migrate policy at resume time, default 95% projected-usage
-  threshold (configurable per-model via `[migration] threshold = 0.95`),
-  hard trigger when `exhausted_at` is set.
+- Best-on-resume policy: at resume time, pick the highest-scored
+  storage-backed provider; hard trigger when `exhausted_at` is set.
 - Migration mechanic: copy source JSONL to target HOME, mint new
   target-side session_id, append segment ledger entry, compose target
   argv per provider's resume strategy.

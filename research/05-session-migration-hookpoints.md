@@ -51,7 +51,7 @@
   - `finalize_invocation` succeeds at `main.rs:1077-1085` (one-shot), `:946-952` (direct-model), `:920-925` (agent), `:1078-1090` (resume), `:769-774` (REPL exit).
   - Cleanest: write a helper `update_chain_last_used(state, invocation_row_id)` and call it once per finalized success. The chain_id is derivable from the invocation row's session_id via `session_chain_segments`.
 
-## 5. Sticky-then-migrate / `compute_projections` refactor hookpoints
+## 5. Best-on-resume / `compute_projections` refactor hookpoints
 
 - `score_by_density` body: `src-tauri/src/balancer/mod.rs:121-244` (proposal §5.1 acknowledges the `:121-232` typo; actual end is `:244`). The per-candidate eval loop spans `:151-232`; the eligibility filter and selection are `:234-243`.
 - `ProviderEval` struct: `src-tauri/src/balancer/mod.rs:20-25`. Currently private (`struct`, not `pub struct`). Either (a) make `pub` and reuse, or (b) introduce `pub struct ProviderProjection { provider_index, projections_per_window: Vec<WindowProjection>, binding_score: Option<f64>, recent_error_count: u32 }` alongside it (proposal §5.1 names this shape).
@@ -59,7 +59,7 @@
 - `compute_projections` signature: `pub fn compute_projections(model, state, ctx) -> Vec<ProviderProjection>` extracted from the refresh-then-eval flow at `:53-77` (refresh + scan loop) and `:121-232` (per-candidate scoring loop). `score_by_density` becomes a thin caller that owns only the eligibility filter and `best_binding_score` selection (`:234-243`).
 - `decide_migration` location: place adjacent to `compute_projections` in `balancer/mod.rs`. Body is small (proposal §5 algorithm steps 1-7). Returns `MigrationDecision`. Imports `provider_quotas.exhausted_at` via existing `state.get_quota(&provider_name)` at `balancer/mod.rs:71`.
 - `MigrationDecision` and `TransitionReason` enums: same module, `pub`. `TransitionReason` mirrors the `CHECK` constraint values in §2's segment schema literal.
-- `migration_threshold` field: add to `ModelConfig` at `src-tauri/src/config/model.rs:214-221` as `pub migration_threshold: f64` with `#[serde(default = "default_migration_threshold")]`. Parse from `[migration]` block in `RawModelToml` at `:286-297` (add `migration: Option<RawMigration>` field) and the `from_toml` flatten at `:533-580`.
+- No policy config field: `ModelConfig` must not retain `migration_threshold`, and `[migration]` TOML parsing/emission is removed rather than ignored for compatibility.
 
 ## 6. Migration mechanic hookpoints (§6)
 
