@@ -157,7 +157,7 @@ enum Subcommands {
     ResumeList { uuid: String },
     /// Run chain-table backfill explicitly.
     MigrateDb,
-    /// Move runtime provider config from model TOMLs into providers.toml.
+    /// Move runtime provider config from model TOMLs into providers.toml. Idempotent - safe to re-run if a previous run left empty args.
     MigrateConfig {
         /// Override models directory.
         #[arg(long = "models-dir")]
@@ -1628,35 +1628,72 @@ fn migrate_provider_table(
         .as_table()
         .cloned()
         .ok_or_else(|| format!("provider entry in {} is not a table", path.display()))?;
-    if !provider.contains_key("command")
-        && !provider.contains_key("resume")
-        && !provider.contains_key("session_capture")
-        && !provider.contains_key("session_storage")
-        && !provider.contains_key("resume_acceptance")
-        && !provider.contains_key("prompt_mode")
-    {
-        return Ok(toml::Value::Table(provider));
-    }
+    let original_provider = provider.clone();
+    let has_runtime_blocks = provider.contains_key("command")
+        || provider.contains_key("resume")
+        || provider.contains_key("session_capture")
+        || provider.contains_key("session_storage")
+        || provider.contains_key("resume_acceptance")
+        || provider.contains_key("prompt_mode");
 
     let command = provider
         .remove("command")
-        .and_then(|value| value.as_str().map(ToString::to_string))
-        .ok_or_else(|| {
-            format!(
-                "Old per-provider config in {} is missing command; run `agents migrate-config` after adding it.",
-                path.display()
-            )
-        })?;
+        .map(|value| {
+            value.as_str().map(ToString::to_string).ok_or_else(|| {
+                format!(
+                    "command in old per-provider config in {} must be a string",
+                    path.display()
+                )
+            })
+        })
+        .transpose()?;
     let model_args = take_string_array(&mut provider, "args")?;
     let model_interactive_args = take_optional_string_array(&mut provider, "interactive_args")?;
     let provider_name = provider
         .remove("name")
         .and_then(|value| value.as_str().map(ToString::to_string))
-        .unwrap_or_else(|| agent_runner_lib::config::derive_provider_name(&command, &model_args));
+        .or_else(|| {
+            command
+                .as_deref()
+                .map(|command| derive_migration_provider_name(command, &model_args))
+        });
+    if !has_runtime_blocks
+        && provider_name
+            .as_ref()
+            .and_then(|name| providers_root.get(name))
+            .is_none()
+    {
+        return Ok(toml::Value::Table(original_provider));
+    }
+    let provider_name = provider_name.ok_or_else(|| {
+        format!(
+            "Old per-provider config in {} is missing command; run `agents migrate-config` after adding it.",
+            path.display()
+        )
+    })?;
 
-    let command_parts = executor::cli::shell_split(&command);
-    let runtime_command = command_parts.first().cloned().unwrap_or(command);
-    let runtime_args = command_parts.iter().skip(1).cloned().collect::<Vec<_>>();
+    let command_parts = command
+        .as_deref()
+        .map(executor::cli::shell_split)
+        .unwrap_or_default();
+    let runtime_command = command.as_ref().map(|command| {
+        command_parts
+            .first()
+            .cloned()
+            .unwrap_or_else(|| command.clone())
+    });
+    let command_runtime_args = command_parts.iter().skip(1).cloned().collect::<Vec<_>>();
+    let (mut runtime_args, model_args) = partition_model_specific_args(model_args);
+    let had_interactive_args = model_interactive_args.is_some();
+    let (runtime_interactive_args, model_interactive_args) = model_interactive_args
+        .map(partition_model_specific_args)
+        .map(|(runtime, model)| (Some(runtime), Some(model)))
+        .unwrap_or((None, None));
+    if !command_runtime_args.is_empty() {
+        let mut combined = command_runtime_args.clone();
+        combined.extend(runtime_args);
+        runtime_args = combined;
+    }
 
     let prompt_mode = provider
         .remove("prompt_mode")
@@ -1673,30 +1710,44 @@ fn migrate_provider_table(
     let runtime = runtime
         .as_table_mut()
         .ok_or_else(|| format!("providers.toml entry [{provider_name}] is not a table"))?;
-    set_or_conflict(
-        runtime,
-        "command",
-        toml::Value::String(runtime_command),
-        &provider_name,
-        path,
-    )?;
-    set_or_conflict(
-        runtime,
-        "args",
-        string_array_value(runtime_args),
-        &provider_name,
-        path,
-    )?;
-    if model_interactive_args.is_some() {
-        set_or_conflict(
+    if let Some(runtime_command) = runtime_command {
+        set_or_repair_empty_array(
             runtime,
-            "interactive_args",
-            string_array_value(command_parts.iter().skip(1).cloned().collect()),
+            "command",
+            toml::Value::String(runtime_command),
             &provider_name,
             path,
         )?;
     }
-    set_or_conflict(runtime, "prompt_mode", prompt_mode, &provider_name, path)?;
+    if has_runtime_blocks || !runtime_args.is_empty() {
+        set_or_repair_empty_array(
+            runtime,
+            "args",
+            string_array_value(runtime_args),
+            &provider_name,
+            path,
+        )?;
+    }
+    if had_interactive_args
+        || runtime_interactive_args
+            .as_ref()
+            .is_some_and(|args| !args.is_empty())
+    {
+        let mut combined = command_runtime_args;
+        if let Some(runtime_interactive_args) = runtime_interactive_args {
+            combined.extend(runtime_interactive_args);
+        }
+        set_or_repair_empty_array(
+            runtime,
+            "interactive_args",
+            string_array_value(combined),
+            &provider_name,
+            path,
+        )?;
+    }
+    if has_runtime_blocks {
+        set_or_conflict(runtime, "prompt_mode", prompt_mode, &provider_name, path)?;
+    }
     for (key, value) in [
         ("resume", resume),
         ("session_capture", session_capture),
@@ -1745,6 +1796,22 @@ fn set_or_conflict(
     Ok(())
 }
 
+fn set_or_repair_empty_array(
+    table: &mut toml::Table,
+    key: &str,
+    value: toml::Value,
+    provider_name: &str,
+    path: &Path,
+) -> Result<(), String> {
+    if matches!(table.get(key), Some(toml::Value::Array(existing)) if existing.is_empty())
+        && !matches!(&value, toml::Value::Array(value) if value.is_empty())
+    {
+        table.insert(key.to_string(), value);
+        return Ok(());
+    }
+    set_or_conflict(table, key, value, provider_name, path)
+}
+
 fn take_string_array(table: &mut toml::Table, key: &str) -> Result<Vec<String>, String> {
     take_optional_string_array(table, key).map(|value| value.unwrap_or_default())
 }
@@ -1771,6 +1838,50 @@ fn take_optional_string_array(
 
 fn string_array_value(values: Vec<String>) -> toml::Value {
     toml::Value::Array(values.into_iter().map(toml::Value::String).collect())
+}
+
+fn derive_migration_provider_name(command: &str, args: &[String]) -> String {
+    let command_parts = executor::cli::shell_split(command);
+    let Some(command) = command_parts.first() else {
+        return command.to_string();
+    };
+    let mut derived_args = command_parts.iter().skip(1).cloned().collect::<Vec<_>>();
+    derived_args.extend(args.iter().cloned());
+    agent_runner_lib::config::derive_provider_name(command, &derived_args)
+}
+
+fn partition_model_specific_args(args: Vec<String>) -> (Vec<String>, Vec<String>) {
+    let mut runtime = Vec::new();
+    let mut model_specific = Vec::new();
+    let mut iter = args.into_iter().peekable();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--model" | "-m" => {
+                model_specific.push(arg);
+                if let Some(value) = iter.next() {
+                    model_specific.push(value);
+                }
+            }
+            "-c" => {
+                if let Some(value) = iter.next() {
+                    if value
+                        .split_once('=')
+                        .is_some_and(|(key, _)| key.starts_with("model_"))
+                    {
+                        model_specific.push(arg);
+                        model_specific.push(value);
+                    } else {
+                        runtime.push(arg);
+                        runtime.push(value);
+                    }
+                } else {
+                    runtime.push(arg);
+                }
+            }
+            _ => runtime.push(arg),
+        }
+    }
+    (runtime, model_specific)
 }
 
 fn run_resume_list(uuid: &str) -> Result<i32, String> {
@@ -2008,6 +2119,39 @@ mod tests {
             );
         }
         cfg
+    }
+
+    fn toml_array_strings(table: &toml::Table, key: &str) -> Vec<String> {
+        table
+            .get(key)
+            .and_then(toml::Value::as_array)
+            .unwrap_or_else(|| panic!("missing array key {key} in {table:?}"))
+            .iter()
+            .map(|value| value.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn migrated_model_provider(path: &Path) -> toml::Table {
+        let table = std::fs::read_to_string(path)
+            .unwrap()
+            .parse::<toml::Table>()
+            .unwrap();
+        table["providers"]
+            .as_array()
+            .unwrap()
+            .first()
+            .unwrap()
+            .as_table()
+            .unwrap()
+            .clone()
+    }
+
+    fn migrated_runtime_provider(path: &Path, provider: &str) -> toml::Table {
+        let table = std::fs::read_to_string(path)
+            .unwrap()
+            .parse::<toml::Table>()
+            .unwrap();
+        table[provider].as_table().unwrap().clone()
     }
 
     #[test]
@@ -2686,7 +2830,7 @@ accepted_output_patterns = ["\"session_id\":\"{session_id}\""]
         assert!(model.contains("name = \"claude2\""), "{model}");
         assert!(model.contains("\"--model\""), "{model}");
         assert!(model.contains("\"opus\""), "{model}");
-        assert!(model.contains("\"--output-format\""), "{model}");
+        assert!(!model.contains("\"--output-format\""), "{model}");
         assert!(!model.contains("command ="), "{model}");
         assert!(!model.contains("session_storage"), "{model}");
 
@@ -2700,6 +2844,252 @@ accepted_output_patterns = ["\"session_id\":\"{session_id}\""]
         assert!(
             providers.contains("[claude2.session_storage]"),
             "{providers}"
+        );
+        assert!(providers.contains("\"--output-format\""), "{providers}");
+    }
+
+    #[test]
+    fn migrate_config_lifts_runtime_args_strips_model_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let providers_path = dir.path().join("providers.toml");
+        let model_path = models_dir.join("claude-opus.toml");
+        std::fs::write(
+            &model_path,
+            r#"
+[[providers]]
+name = "claude"
+command = "env"
+args = ["-u", "CLAUDECODE", "claude", "-p", "--model", "opus", "--dangerously-skip-permissions"]
+"#,
+        )
+        .unwrap();
+
+        migrate_config_files(&models_dir, &providers_path).unwrap();
+
+        let runtime = migrated_runtime_provider(&providers_path, "claude");
+        assert_eq!(
+            toml_array_strings(&runtime, "args"),
+            [
+                "-u",
+                "CLAUDECODE",
+                "claude",
+                "-p",
+                "--dangerously-skip-permissions"
+            ]
+        );
+        let model = migrated_model_provider(&model_path);
+        assert_eq!(toml_array_strings(&model, "args"), ["--model", "opus"]);
+    }
+
+    #[test]
+    fn migrate_config_strips_dash_m_pairs() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let providers_path = dir.path().join("providers.toml");
+        let model_path = models_dir.join("gpt-high.toml");
+        std::fs::write(
+            &model_path,
+            r#"
+[[providers]]
+name = "codex"
+command = "codex"
+args = ["exec", "--dangerously-bypass-approvals-and-sandbox", "-m", "gpt-5.5"]
+"#,
+        )
+        .unwrap();
+
+        migrate_config_files(&models_dir, &providers_path).unwrap();
+
+        let runtime = migrated_runtime_provider(&providers_path, "codex");
+        assert_eq!(
+            toml_array_strings(&runtime, "args"),
+            ["exec", "--dangerously-bypass-approvals-and-sandbox"]
+        );
+        let model = migrated_model_provider(&model_path);
+        assert_eq!(toml_array_strings(&model, "args"), ["-m", "gpt-5.5"]);
+    }
+
+    #[test]
+    fn migrate_config_strips_model_prefixed_c_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let providers_path = dir.path().join("providers.toml");
+        let model_path = models_dir.join("gpt-high.toml");
+        std::fs::write(
+            &model_path,
+            r#"
+[[providers]]
+name = "codex"
+command = "codex"
+args = ["exec", "-c", "model_reasoning_effort=high", "-c", "sandbox=workspace-write"]
+"#,
+        )
+        .unwrap();
+
+        migrate_config_files(&models_dir, &providers_path).unwrap();
+
+        let runtime = migrated_runtime_provider(&providers_path, "codex");
+        assert_eq!(
+            toml_array_strings(&runtime, "args"),
+            ["exec", "-c", "sandbox=workspace-write"]
+        );
+        let model = migrated_model_provider(&model_path);
+        assert_eq!(
+            toml_array_strings(&model, "args"),
+            ["-c", "model_reasoning_effort=high"]
+        );
+    }
+
+    #[test]
+    fn migrate_config_strips_interactive_args_same_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let providers_path = dir.path().join("providers.toml");
+        let model_path = models_dir.join("gpt-high.toml");
+        std::fs::write(
+            &model_path,
+            r#"
+[[providers]]
+name = "codex"
+command = "codex"
+args = ["exec", "-m", "gpt-5.5"]
+interactive_args = ["exec", "-c", "model_reasoning_effort=high", "-c", "sandbox=workspace-write"]
+"#,
+        )
+        .unwrap();
+
+        migrate_config_files(&models_dir, &providers_path).unwrap();
+
+        let runtime = migrated_runtime_provider(&providers_path, "codex");
+        assert_eq!(toml_array_strings(&runtime, "args"), ["exec"]);
+        assert_eq!(
+            toml_array_strings(&runtime, "interactive_args"),
+            ["exec", "-c", "sandbox=workspace-write"]
+        );
+        let model = migrated_model_provider(&model_path);
+        assert_eq!(toml_array_strings(&model, "args"), ["-m", "gpt-5.5"]);
+        assert_eq!(
+            toml_array_strings(&model, "interactive_args"),
+            ["-c", "model_reasoning_effort=high"]
+        );
+    }
+
+    #[test]
+    fn migrate_config_aborts_on_conflicting_runtime_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let providers_path = dir.path().join("providers.toml");
+        for (name, env_name) in [("a", "CLAUDECODE"), ("b", "CLAUDE_CONFIG_DIR")] {
+            std::fs::write(
+                models_dir.join(format!("{name}.toml")),
+                format!(
+                    r#"
+[[providers]]
+name = "claude"
+command = "env"
+args = ["-u", "{env_name}", "claude", "-p", "--model", "opus"]
+"#
+                ),
+            )
+            .unwrap();
+        }
+
+        let err = migrate_config_files(&models_dir, &providers_path).unwrap_err();
+
+        assert!(
+            err.contains("conflicting args for provider claude"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn migrate_config_idempotent_after_proper_lift() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let providers_path = dir.path().join("providers.toml");
+        let model_path = models_dir.join("claude-opus.toml");
+        std::fs::write(
+            &model_path,
+            r#"
+[[providers]]
+name = "claude"
+command = "env"
+args = ["-u", "CLAUDECODE", "claude", "-p", "--model", "opus"]
+"#,
+        )
+        .unwrap();
+
+        migrate_config_files(&models_dir, &providers_path).unwrap();
+        let model_after_first = std::fs::read_to_string(&model_path).unwrap();
+        let providers_after_first = std::fs::read_to_string(&providers_path).unwrap();
+        let second = migrate_config_files(&models_dir, &providers_path).unwrap();
+
+        assert_eq!(second.model_files_rewritten, 0);
+        assert_eq!(
+            model_after_first,
+            std::fs::read_to_string(&model_path).unwrap()
+        );
+        assert_eq!(
+            providers_after_first,
+            std::fs::read_to_string(&providers_path).unwrap()
+        );
+    }
+
+    #[test]
+    fn migrate_config_repairs_prior_empty_runtime_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let providers_path = dir.path().join("providers.toml");
+        let model_path = models_dir.join("claude-opus.toml");
+        std::fs::write(
+            &providers_path,
+            r#"
+[claude]
+command = "env"
+args = []
+interactive_args = []
+
+[claude.resume]
+kind = "flag"
+flag = "--resume"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &model_path,
+            r#"
+[[providers]]
+name = "claude"
+args = ["-u", "CLAUDECODE", "claude", "-p", "--model", "opus"]
+interactive_args = ["-u", "CLAUDECODE", "claude", "--model", "opus"]
+"#,
+        )
+        .unwrap();
+
+        migrate_config_files(&models_dir, &providers_path).unwrap();
+
+        let runtime = migrated_runtime_provider(&providers_path, "claude");
+        assert_eq!(
+            toml_array_strings(&runtime, "args"),
+            ["-u", "CLAUDECODE", "claude", "-p"]
+        );
+        assert_eq!(
+            toml_array_strings(&runtime, "interactive_args"),
+            ["-u", "CLAUDECODE", "claude"]
+        );
+        let model = migrated_model_provider(&model_path);
+        assert_eq!(toml_array_strings(&model, "args"), ["--model", "opus"]);
+        assert_eq!(
+            toml_array_strings(&model, "interactive_args"),
+            ["--model", "opus"]
         );
     }
 

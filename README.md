@@ -136,7 +136,8 @@ Subcommands:
         Resume a provider session non-interactively with an answer payload
 
   migrate-config [--models-dir <path>]
-        Move provider runtime blocks from old model TOMLs into providers.toml
+        Move provider runtime blocks from old model TOMLs into providers.toml.
+        Idempotent - safe to re-run if a previous run left empty args.
 ```
 
 **Prompt resolution priority:** `--file` > positional arguments > stdin
@@ -280,6 +281,8 @@ quota_script = "zai-usage ~/.config/opencode/auth.json"
 ```
 
 `args` and `interactive_args` are provider/account defaults only. Do not put model flags there; model flags live in model TOMLs and are appended at spawn time.
+
+If you already ran `migrate-config` from `98e692c` and it left provider `args` or `interactive_args` empty, re-run the fixed `migrate-config`. It will repair the provider runtime command shape without duplicating existing resume/session blocks.
 
 **Script output (multi-window)**:
 
