@@ -1,6 +1,6 @@
 # Initiative 05 — Session Migration
 
-**Status:** awaiting-decision
+**Status:** landed (commits `15c121a` docs backfill, `a344bd0` planning + risk gates, `91403a0` implementation, `5f17d95` post-review cleanup; merged to main)
 **Depends on:** Initiative 04 (reactive routing — uses `provider_quotas.exhausted_at` and `score_by_density` projection)
 **Blocks:** —
 
