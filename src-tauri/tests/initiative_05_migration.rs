@@ -67,6 +67,22 @@ impl Fixture {
         path
     }
 
+    fn write_turn_emitter(&self, name: &str, session_id: &str, turn_id: &str) -> PathBuf {
+        self.write_script(name, &static_turn_stdout(session_id, turn_id))
+    }
+
+    fn write_session_appending_provider(
+        &self,
+        name: &str,
+        transcript_path: &Path,
+        argv_dump: Option<&Path>,
+    ) -> PathBuf {
+        self.write_script(
+            name,
+            &session_appending_provider_body(transcript_path, argv_dump),
+        )
+    }
+
     fn write_model(&self, model_name: &str, body: &str) {
         fs::write(self.models_dir.join(format!("{model_name}.toml")), body).unwrap();
     }
@@ -96,13 +112,37 @@ impl Fixture {
     }
 
     fn write_sessions_config(&self, provider: &str, script: &Path) -> SessionsConfig {
+        self.write_sessions_entry(provider, &script.to_string_lossy())
+    }
+
+    fn write_sessions_config_from_transcript(
+        &self,
+        provider: &str,
+        transcript_path: &Path,
+    ) -> SessionsConfig {
+        self.write_sessions_entry(provider, &format!("cat {}", sh_path(transcript_path)))
+    }
+
+    fn write_sessions_entry(&self, provider: &str, turn_script: &str) -> SessionsConfig {
+        let app_dir = self.config_home.join("oulipoly-agent-runner");
+        fs::create_dir_all(&app_dir).unwrap();
+        let state_dir = self.dir.path().join("session-state");
+        fs::write(
+            app_dir.join("sessions.toml"),
+            format!(
+                "[{provider}]\nturn_script = {:?}\nstate_dir = {:?}\n",
+                turn_script,
+                state_dir.to_string_lossy()
+            ),
+        )
+        .unwrap();
         let mut entries = HashMap::new();
         entries.insert(
             provider.to_string(),
             SessionSourceEntry {
-                turn_script: script.to_string_lossy().into_owned(),
+                turn_script: turn_script.to_string(),
                 transcript_locator: None,
-                state_dir: Some(self.dir.path().join("session-state")),
+                state_dir: Some(state_dir),
             },
         );
         SessionsConfig { entries }
@@ -180,40 +220,21 @@ impl Fixture {
         db.ingest_session_turns_batch(provider, &turns).unwrap();
     }
 
+    fn seed_missing_compaction_boundary(&self, provider: &str, session_id: &str) {
+        self.conn()
+            .execute(
+                "INSERT INTO session_turns
+                    (provider_name, session_id, turn_id, timestamp, role, source_file, ingested_at, is_compaction_boundary)
+                 VALUES (?1, ?2, 'missing-turn', '2026-04-17T08:00:10Z', 'assistant', '', '2026-04-17T08:00:10Z', 1)",
+                params![provider, session_id],
+            )
+            .unwrap();
+    }
+
     fn migration_model(&self, source_projects: &Path, target_projects: &Path) -> ModelConfig {
         ModelConfig::from_toml(
             "claude-opus",
-            &format!(
-                r#"
-prompt_mode = "arg"
-
-[[providers]]
-name = "claude"
-command = "claude"
-
-[providers.resume]
-kind = "flag"
-flag = "--resume"
-
-[providers.session_storage]
-kind = "claude_code"
-projects_dir = "{}"
-
-[[providers]]
-name = "claude2"
-command = "claude2"
-
-[providers.resume]
-kind = "flag"
-flag = "--resume"
-
-[providers.session_storage]
-kind = "claude_code"
-projects_dir = "{}"
-"#,
-                source_projects.display(),
-                target_projects.display()
-            ),
+            &claude_migration_model_toml(source_projects, target_projects),
         )
         .unwrap()
     }
@@ -221,37 +242,7 @@ projects_dir = "{}"
     fn codex_source_model(&self, codex_sessions: &Path, target_projects: &Path) -> ModelConfig {
         ModelConfig::from_toml(
             "codex-high",
-            &format!(
-                r#"
-prompt_mode = "arg"
-
-[[providers]]
-name = "codex"
-command = "codex"
-
-[providers.resume]
-kind = "subcommand"
-subcommand = ["resume"]
-
-[providers.session_storage]
-kind = "codex"
-sessions_dir = "{}"
-
-[[providers]]
-name = "claude"
-command = "claude"
-
-[providers.resume]
-kind = "flag"
-flag = "--resume"
-
-[providers.session_storage]
-kind = "claude_code"
-projects_dir = "{}"
-"#,
-                codex_sessions.display(),
-                target_projects.display()
-            ),
+            &codex_source_model_toml(codex_sessions, target_projects),
         )
         .unwrap()
     }
@@ -267,6 +258,181 @@ projects_dir = "{}"
             active_session_id: SESSION_A.to_string(),
         }
     }
+}
+
+fn sh_path(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
+
+fn static_turn_stdout(session_id: &str, turn_id: &str) -> String {
+    format!(
+        r#"printf '{{"session_id":"{session_id}","turn_id":"{turn_id}","timestamp":"2026-04-17T08:00:00Z","role":"assistant"}}\n'"#
+    )
+}
+
+fn session_appending_provider_body(transcript_path: &Path, argv_dump: Option<&Path>) -> String {
+    let argv_dump = argv_dump
+        .map(|path| format!("printf '%s\n' \"$@\" > {}\n", sh_path(path)))
+        .unwrap_or_default();
+    format!(
+        r#"{argv_dump}ts="$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"
+turn_id="t-$$-$RANDOM"
+printf '{{"session_id":"{SESSION_A}","turn_id":"%s","timestamp":"%s","role":"assistant"}}\n' "$turn_id" "$ts" >> {}
+printf 'ok\n'"#,
+        sh_path(transcript_path)
+    )
+}
+
+fn argv_dump_provider_body(argv_dump: &Path) -> String {
+    format!(
+        r#"printf '%s\n' "$@" > {}
+printf 'ok\n'"#,
+        sh_path(argv_dump)
+    )
+}
+
+fn ok_provider_body() -> &'static str {
+    "printf 'ok\n'"
+}
+
+fn claude_migration_model_toml(source_projects: &Path, target_projects: &Path) -> String {
+    format!(
+        r#"
+prompt_mode = "arg"
+
+[[providers]]
+name = "claude"
+command = "claude"
+interactive_args = ["launch"]
+
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+
+[providers.session_storage]
+kind = "claude_code"
+projects_dir = "{}"
+
+[[providers]]
+name = "claude2"
+command = "claude2"
+interactive_args = ["launch"]
+
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+
+[providers.session_storage]
+kind = "claude_code"
+projects_dir = "{}"
+"#,
+        source_projects.display(),
+        target_projects.display()
+    )
+}
+
+fn codex_source_model_toml(codex_sessions: &Path, target_projects: &Path) -> String {
+    format!(
+        r#"
+prompt_mode = "arg"
+
+[[providers]]
+name = "codex"
+command = "codex"
+interactive_args = ["launch"]
+
+[providers.resume]
+kind = "subcommand"
+subcommand = ["resume"]
+
+[providers.session_storage]
+kind = "codex"
+sessions_dir = "{}"
+
+[[providers]]
+name = "claude"
+command = "claude"
+interactive_args = ["launch"]
+
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+
+[providers.session_storage]
+kind = "claude_code"
+projects_dir = "{}"
+"#,
+        codex_sessions.display(),
+        target_projects.display()
+    )
+}
+
+fn single_resume_provider_model_toml(command: &Path) -> String {
+    format!(
+        r#"
+prompt_mode = "arg"
+
+[[providers]]
+name = "claude"
+command = "{}"
+interactive_args = ["launch"]
+
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+"#,
+        command.display()
+    )
+}
+
+fn manual_migrate_cli_model_toml(
+    command: &Path,
+    source_projects: &Path,
+    target_projects: &Path,
+) -> String {
+    format!(
+        r#"
+prompt_mode = "arg"
+
+[[providers]]
+name = "claude"
+command = "{}"
+interactive_args = ["launch"]
+
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+
+[providers.session_storage]
+kind = "claude_code"
+projects_dir = "{}"
+
+[[providers]]
+name = "claude2"
+command = "{}"
+interactive_args = ["launch"]
+
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+
+[providers.session_storage]
+kind = "claude_code"
+projects_dir = "{}"
+"#,
+        command.display(),
+        source_projects.display(),
+        command.display(),
+        target_projects.display()
+    )
+}
+
+fn missing_source_locator_body(missing: &Path) -> String {
+    format!(r#"printf '%s\n' "{}""#, missing.display())
+}
+
+fn malformed_source_locator_body(path: &Path) -> String {
+    format!(r#"printf '%s\n' "{}""#, path.display())
 }
 
 fn ts(value: &str) -> DateTime<Utc> {
@@ -312,7 +478,7 @@ fn parse_session(stderr: &str) -> String {
     let line = stderr
         .lines()
         .find(|line| line.starts_with("OULIPOLY_SESSION="))
-        .expect("OULIPOLY_SESSION line");
+        .unwrap_or_else(|| panic!("OULIPOLY_SESSION line in stderr: {stderr}"));
     let value: serde_json::Value =
         serde_json::from_str(line.strip_prefix("OULIPOLY_SESSION=").unwrap()).unwrap();
     value["session_id"].as_str().unwrap().to_string()
@@ -322,18 +488,18 @@ fn assert_success(output: &Output) {
     assert_eq!(output.status.code(), Some(0), "{output:?}");
 }
 
+fn data_home_file_fixture(fixture: &Fixture) -> PathBuf {
+    let path = fixture.dir.path().join("data-home-file");
+    fs::write(&path, "not a directory").unwrap();
+    path
+}
+
 fn run_session_capture_chain_fixture() -> Fixture {
     let fixture = Fixture::new();
     let transcript_path = fixture.dir.path().join("turns.jsonl");
     fs::write(&transcript_path, "").unwrap();
-    let script = fixture.write_script(
-        "session-writer.sh",
-        &format!(
-            r#"printf '{{"session_id":"{SESSION_A}","turn_id":"t1","timestamp":"2026-04-17T08:00:00Z","role":"assistant"}}\n' >> "{}"
-printf 'ok\n'"#,
-            transcript_path.display()
-        ),
-    );
+    let script =
+        fixture.write_session_appending_provider("session-writer.sh", &transcript_path, None);
     fixture.write_model(
         "claude-opus",
         &format!(
@@ -347,7 +513,7 @@ command = "{}"
             script.display()
         ),
     );
-    fixture.write_sessions_config("claude", &script);
+    fixture.write_sessions_config_from_transcript("claude", &transcript_path);
 
     let output = fixture
         .command()
@@ -383,12 +549,7 @@ fn agent_session_chain_records_model_at_mint() {
 fn ui_session_chain_minted_at_ingestion_uses_provider_default() {
     let fixture = Fixture::new();
     let db = fixture.open_db();
-    let script = fixture.write_script(
-        "turns.sh",
-        &format!(
-            r#"printf '{{"session_id":"{SESSION_A}","turn_id":"ui-1","timestamp":"2026-04-17T08:00:00Z","role":"assistant"}}\n'"#
-        ),
-    );
+    let script = fixture.write_turn_emitter("turns.sh", SESSION_A, "ui-1");
     let sessions = fixture.write_sessions_config("claude", &script);
     let providers = fixture.write_providers_config(&[("claude", Some("claude-opus"))]);
 
@@ -403,12 +564,7 @@ fn ui_session_chain_minted_at_ingestion_uses_provider_default() {
 fn ui_session_chain_minted_with_unknown_when_no_provider_default() {
     let fixture = Fixture::new();
     let db = fixture.open_db();
-    let script = fixture.write_script(
-        "turns.sh",
-        &format!(
-            r#"printf '{{"session_id":"{SESSION_A}","turn_id":"ui-1","timestamp":"2026-04-17T08:00:00Z","role":"assistant"}}\n'"#
-        ),
-    );
+    let script = fixture.write_turn_emitter("turns.sh", SESSION_A, "ui-1");
     let sessions = fixture.write_sessions_config("claude", &script);
     let providers = fixture.write_providers_config(&[("claude", None)]);
 
@@ -423,12 +579,7 @@ fn ui_session_chain_minted_with_unknown_when_no_provider_default() {
 fn chain_mint_works_for_codex_ingestion() {
     let fixture = Fixture::new();
     let db = fixture.open_db();
-    let script = fixture.write_script(
-        "codex-turns.sh",
-        &format!(
-            r#"printf '{{"session_id":"{SESSION_A}","turn_id":"codex-1","timestamp":"2026-04-17T08:00:00Z","role":"assistant"}}\n'"#
-        ),
-    );
+    let script = fixture.write_turn_emitter("codex-turns.sh", SESSION_A, "codex-1");
     let sessions = fixture.write_sessions_config("codex", &script);
     let providers = fixture.write_providers_config(&[("codex", Some("codex-high"))]);
 
@@ -444,35 +595,15 @@ fn chain_mint_works_for_codex_ingestion() {
 fn agent_resume_no_dash_m_uses_session_recorded_model() {
     let fixture = Fixture::new();
     let argv_dump = fixture.dir.path().join("argv.txt");
-    let script = fixture.write_script(
+    let transcript_path = fixture.dir.path().join("turns.jsonl");
+    fs::write(&transcript_path, "").unwrap();
+    let script = fixture.write_session_appending_provider(
         "resume-provider.sh",
-        &format!(
-            r#"printf '%s\n' "$@" > "{}"
-printf '{{"session_id":"{SESSION_A}","turn_id":"t-$RANDOM","timestamp":"2026-04-17T08:00:00Z","role":"assistant"}}\n' >> "{}/turns.jsonl"
-printf 'ok\n'"#,
-            argv_dump.display(),
-            fixture.dir.path().display()
-        ),
+        &transcript_path,
+        Some(&argv_dump),
     );
-    fs::write(fixture.dir.path().join("turns.jsonl"), "").unwrap();
-    fixture.write_model(
-        "claude-opus",
-        &format!(
-            r#"
-prompt_mode = "arg"
-
-[[providers]]
-name = "claude"
-command = "{}"
-
-[providers.resume]
-kind = "flag"
-flag = "--resume"
-"#,
-            script.display()
-        ),
-    );
-    fixture.write_sessions_config("claude", &script);
+    fixture.write_model("claude-opus", &single_resume_provider_model_toml(&script));
+    fixture.write_sessions_config_from_transcript("claude", &transcript_path);
     let initial = fixture
         .command()
         .args(["--models-dir"])
@@ -603,10 +734,8 @@ fn migration_errors_on_source_jsonl_missing() {
     let missing = source_projects
         .join("cwd")
         .join(format!("{SESSION_A}.jsonl"));
-    let locator = fixture.write_script(
-        "missing-locator.sh",
-        &format!(r#"printf '%s\n' "{}""#, missing.display()),
-    );
+    let locator =
+        fixture.write_script("missing-locator.sh", &missing_source_locator_body(&missing));
     let sessions = fixture.sessions_config_with_locator("claude", &locator);
     let model = fixture.migration_model(&source_projects, &target_projects);
     fixture.seed_active_chain(CHAIN_A, "claude", SESSION_A, "claude-opus");
@@ -636,11 +765,7 @@ fn migration_errors_on_source_path_malformed() {
     let source_projects = fixture.dir.path().join("source-projects");
     let target_projects = fixture.dir.path().join("target-projects");
     let bare = PathBuf::from("bare-session.jsonl");
-    fs::write(&bare, "{}\n").unwrap();
-    let locator = fixture.write_script(
-        "bare-locator.sh",
-        &format!(r#"printf '%s\n' "{}""#, bare.display()),
-    );
+    let locator = fixture.write_script("bare-locator.sh", &malformed_source_locator_body(&bare));
     let sessions = fixture.sessions_config_with_locator("claude", &locator);
     let model = fixture.migration_model(&source_projects, &target_projects);
     fixture.seed_active_chain(CHAIN_A, "claude", SESSION_A, "claude-opus");
@@ -657,8 +782,6 @@ fn migration_errors_on_source_path_malformed() {
         &mut stderr,
     )
     .unwrap_err();
-    let _ = fs::remove_file(&bare);
-
     assert!(
         matches!(err, MigrationError::SourcePathMalformed { provider, .. } if provider == "claude")
     );
@@ -751,15 +874,7 @@ fn migration_errors_when_compaction_boundary_not_in_jsonl() {
     let (fixture, model, sessions, _source_projects, target_projects, _source_jsonl) =
         migration_fixture();
     fixture.seed_turns("claude", SESSION_A, &[]);
-    fixture
-        .conn()
-        .execute(
-            "INSERT INTO session_turns
-                (provider_name, session_id, turn_id, timestamp, role, source_file, ingested_at, is_compaction_boundary)
-             VALUES ('claude', ?1, 'missing-turn', '2026-04-17T08:00:10Z', 'assistant', '', '2026-04-17T08:00:10Z', 1)",
-            params![SESSION_A],
-        )
-        .unwrap();
+    fixture.seed_missing_compaction_boundary("claude", SESSION_A);
     let db = fixture.open_db();
     let mut stderr = Vec::new();
 
@@ -875,30 +990,8 @@ fn migration_does_not_emit_migrate_stderr_on_codex_deferred() {
 fn top_level_resume_without_model_succeeds_when_chain_exists() {
     let fixture = Fixture::new();
     let argv = fixture.dir.path().join("argv.txt");
-    let script = fixture.write_script(
-        "provider.sh",
-        &format!(
-            r#"printf '%s\n' "$@" > "{}"; printf 'ok\n'"#,
-            argv.display()
-        ),
-    );
-    fixture.write_model(
-        "claude-opus",
-        &format!(
-            r#"
-prompt_mode = "arg"
-
-[[providers]]
-name = "claude"
-command = "{}"
-
-[providers.resume]
-kind = "flag"
-flag = "--resume"
-"#,
-            script.display()
-        ),
-    );
+    let script = fixture.write_script("provider.sh", &argv_dump_provider_body(&argv));
+    fixture.write_model("claude-opus", &single_resume_provider_model_toml(&script));
     fixture.seed_active_chain(CHAIN_A, "claude", SESSION_A, "claude-opus");
 
     let output = fixture
@@ -919,24 +1012,8 @@ flag = "--resume"
 #[test]
 fn top_level_resume_without_model_errors_when_no_invocation_history() {
     let fixture = Fixture::new();
-    let script = fixture.write_script("provider.sh", "printf 'ok\n'");
-    fixture.write_model(
-        "claude-opus",
-        &format!(
-            r#"
-prompt_mode = "arg"
-
-[[providers]]
-name = "claude"
-command = "{}"
-
-[providers.resume]
-kind = "flag"
-flag = "--resume"
-"#,
-            script.display()
-        ),
-    );
+    let script = fixture.write_script("provider.sh", ok_provider_body());
+    fixture.write_model("claude-opus", &single_resume_provider_model_toml(&script));
     fixture.seed_active_chain(CHAIN_A, "claude", SESSION_A, "<unknown>");
 
     let output = fixture
@@ -962,42 +1039,10 @@ fn manual_migrate_flag_overrides_threshold_via_cli() {
     let source_projects = fixture.dir.path().join("source-projects");
     let target_projects = fixture.dir.path().join("target-projects");
     fixture.stage_claude_jsonl(&source_projects, SESSION_A);
-    let script = fixture.write_script("provider.sh", "printf 'ok\n'");
+    let script = fixture.write_script("provider.sh", ok_provider_body());
     fixture.write_model(
         "claude-opus",
-        &format!(
-            r#"
-prompt_mode = "arg"
-
-[[providers]]
-name = "claude"
-command = "{}"
-
-[providers.resume]
-kind = "flag"
-flag = "--resume"
-
-[providers.session_storage]
-kind = "claude_code"
-projects_dir = "{}"
-
-[[providers]]
-name = "claude2"
-command = "{}"
-
-[providers.resume]
-kind = "flag"
-flag = "--resume"
-
-[providers.session_storage]
-kind = "claude_code"
-projects_dir = "{}"
-"#,
-            script.display(),
-            source_projects.display(),
-            script.display(),
-            target_projects.display()
-        ),
+        &manual_migrate_cli_model_toml(&script, &source_projects, &target_projects),
     );
     fixture.seed_active_chain(CHAIN_A, "claude", SESSION_A, "claude-opus");
     fixture.seed_turns("claude", SESSION_A, &[]);
@@ -1057,6 +1102,22 @@ fn resume_list_subcommand_prints_all_chains_for_session_id() {
     );
     assert!(stdout.contains("claude"), "{stdout}");
     assert!(stdout.contains("turns"), "{stdout}");
+}
+
+// risk: CLI surface; level: end-to-end; source: proposal §11.1 CLI surface / A5, A8.
+#[test]
+fn resume_list_subcommand_rejects_malformed_uuid() {
+    let fixture = Fixture::new();
+
+    let output = fixture
+        .command()
+        .args(["resume", "--list", "not-a-uuid"])
+        .output()
+        .unwrap();
+
+    assert_ne!(output.status.code(), Some(0), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("invalid session UUID"), "{stderr}");
 }
 
 fn seed_pre_backfill_db(path: &Path) {
@@ -1137,6 +1198,25 @@ fn migrate_db_command_idempotent_on_second_run() {
         .unwrap();
 
     assert_eq!(second_count, first_count);
+}
+
+// risk: Schema migration and backfill; level: end-to-end; source: proposal §11.1 Schema migration and backfill / A5.
+#[test]
+fn migrate_db_command_reports_open_error() {
+    let fixture = Fixture::new();
+    let data_home = data_home_file_fixture(&fixture);
+    let mut command = fixture.command();
+    command.env("XDG_DATA_HOME", data_home);
+
+    let output = command.arg("migrate-db").output().unwrap();
+
+    assert_ne!(output.status.code(), Some(0), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Failed to create state directory")
+            || stderr.contains("Failed to open state DB"),
+        "{stderr}"
+    );
 }
 
 // risk: Schema migration and backfill; level: end-to-end; source: proposal §11.1 Schema migration and backfill / A5.

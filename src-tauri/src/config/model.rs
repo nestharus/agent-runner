@@ -46,6 +46,19 @@ impl ProviderConfig {
         }
         Ok(())
     }
+
+    fn validate_resume_interactive_args(&self) -> Result<(), String> {
+        if matches!(
+            self.resume.as_ref().map(|resume| resume.kind),
+            Some(ResumeKind::Flag | ResumeKind::Subcommand)
+        ) && self.interactive_args.is_none()
+        {
+            return Err(
+                "[providers.resume] requires interactive_args for resumable providers".into(),
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -655,6 +668,8 @@ impl ModelConfig {
             if let Some(resume) = &p.resume {
                 resume
                     .validate()
+                    .map_err(|e| format!("Model {name} provider {}: {e}", p.name))?;
+                p.validate_resume_interactive_args()
                     .map_err(|e| format!("Model {name} provider {}: {e}", p.name))?;
             }
             if let Some(capture) = &p.session_capture {
@@ -1837,10 +1852,8 @@ kind = "{kind}"
         )
     }
 
-    // risk: Resume strategy compatibility; level: unit; source: proposal §11.1 Resume strategy compatibility / A1, A7.
-    #[test]
-    fn compose_resume_args_rejects_config_kind() {
-        let toml = r#"
+    fn config_kind_resume_toml() -> &'static str {
+        r#"
 prompt_mode = "arg"
 
 [[providers]]
@@ -1850,11 +1863,66 @@ command = "codex"
 [providers.resume]
 kind = "config"
 key = "experimental_resume"
-"#;
+"#
+    }
 
-        let err = ModelConfig::from_toml("codex-invalid", toml).unwrap_err();
+    fn migration_threshold_toml(threshold: Option<&str>) -> String {
+        let migration = threshold
+            .map(|value| format!("\n[migration]\nthreshold = {value}\n"))
+            .unwrap_or_default();
+        format!(
+            r#"
+prompt_mode = "arg"
+{migration}
+[[providers]]
+name = "claude"
+command = "claude"
+"#
+        )
+    }
+
+    fn resume_without_interactive_args_toml(kind: &str, field: &str) -> String {
+        format!(
+            r#"
+prompt_mode = "arg"
+
+[[providers]]
+name = "claude"
+command = "claude"
+
+[providers.resume]
+kind = "{kind}"
+{field}
+"#
+        )
+    }
+
+    // risk: Resume strategy compatibility; level: unit; source: proposal §11.1 Resume strategy compatibility / A1, A7.
+    #[test]
+    fn compose_resume_args_rejects_config_kind() {
+        let err = ModelConfig::from_toml("codex-invalid", config_kind_resume_toml()).unwrap_err();
 
         assert!(err.contains("config"), "{err}");
+    }
+
+    // risk: Resume strategy compatibility; level: unit; source: proposal §11.1 Resume strategy compatibility / A1, A7.
+    #[test]
+    fn flag_resume_requires_interactive_args() {
+        let toml = resume_without_interactive_args_toml("flag", r#"flag = "--resume""#);
+
+        let err = ModelConfig::from_toml("flag-without-interactive", &toml).unwrap_err();
+
+        assert!(err.contains("interactive_args"), "{err}");
+    }
+
+    // risk: Resume strategy compatibility; level: unit; source: proposal §11.1 Resume strategy compatibility / A1, A7.
+    #[test]
+    fn subcommand_resume_requires_interactive_args() {
+        let toml = resume_without_interactive_args_toml("subcommand", r#"subcommand = ["resume"]"#);
+
+        let err = ModelConfig::from_toml("subcommand-without-interactive", &toml).unwrap_err();
+
+        assert!(err.contains("interactive_args"), "{err}");
     }
 
     // risk: Resume strategy compatibility; level: unit; source: proposal §11.1 Resume strategy compatibility / A1, A7.
@@ -1888,17 +1956,8 @@ key = "experimental_resume"
     // risk: Sticky-then-migrate decision; level: unit; source: proposal §11.1 Sticky-then-migrate decision / A2, A4.
     #[test]
     fn migration_threshold_defaults_to_095() {
-        let config = ModelConfig::from_toml(
-            "threshold-default",
-            r#"
-prompt_mode = "arg"
-
-[[providers]]
-name = "claude"
-command = "claude"
-"#,
-        )
-        .unwrap();
+        let config =
+            ModelConfig::from_toml("threshold-default", &migration_threshold_toml(None)).unwrap();
 
         assert_eq!(config.migration_threshold, 0.95);
     }
@@ -1907,18 +1966,7 @@ command = "claude"
     #[test]
     fn migration_threshold_rejects_out_of_range_values() {
         for threshold in ["0.0", "1.01"] {
-            let toml = format!(
-                r#"
-prompt_mode = "arg"
-
-[migration]
-threshold = {threshold}
-
-[[providers]]
-name = "claude"
-command = "claude"
-"#
-            );
+            let toml = migration_threshold_toml(Some(threshold));
             let err = ModelConfig::from_toml("threshold-invalid", &toml).unwrap_err();
             assert!(err.contains("[migration].threshold"), "{err}");
         }

@@ -812,7 +812,7 @@ flag = "--resume"
 }
 
 #[test]
-fn resume_multiple_matches_emit_duplicate_detail_line_on_non_tty_stderr() {
+fn resume_multiple_matches_omit_legacy_duplicate_detail_line() {
     let fixture = Fixture::new();
     let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
     let script = fixture.write_script("claude.sh", "exit 0");
@@ -832,10 +832,9 @@ flag = "--resume"
     let output = fixture.run_repl("claude-opus", Some(session_id));
     let stderr = String::from_utf8_lossy(&output.stderr);
 
+    assert!(stderr.contains("[resume] -> claude2"), "{stderr}");
     assert!(
-        stderr.contains(&format!(
-            "[resume] session {session_id} matched claude2, codex; selected claude2 by latest turn timestamp"
-        )),
+        !stderr.contains(&format!("[resume] session {session_id} matched")),
         "{stderr}"
     );
 }

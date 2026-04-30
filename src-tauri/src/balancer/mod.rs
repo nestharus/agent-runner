@@ -174,111 +174,17 @@ fn score_by_density(
     windows: &[Vec<QuotaWindow>],
     candidates: &[usize],
 ) -> usize {
-    let now = Utc::now();
-    let mut evals = Vec::with_capacity(candidates.len());
-
-    // Compute the max number of live (not past-reset) windows any candidate
-    // reports. A provider whose upstream API returns fewer windows than
-    // siblings (observed 2026-04-22: `anthropic-usage` returns only the 7d
-    // window for heavily-used accounts because Anthropic's API hides the 5h
-    // timer when the account is near weekly cap) would otherwise dodge the
-    // constraining short-tier term in `min_w` and beat its siblings on the
-    // 7d-tier-only score — the exact opposite of what we want. Defensive
-    // pessimism: when this provider has fewer live windows than the pool
-    // max AND at least one visible window is near cap, penalize the binding
-    // as if the missing slots were at 1.0 used (capacity effectively
-    // consumed). The visible-usage gate is required because ChatGPT's API
-    // also hides the 5h window — but only when the account has had no
-    // recent activity, which is the opposite signal. See
-    // `HIDDEN_WINDOW_PENALTY_THRESHOLD` above.
-    let pool_max_live_windows = candidates
+    let projections =
+        compute_projections_from_records(model, state, quotas, windows, candidates, Utc::now());
+    let evals = projections
         .iter()
-        .map(|&i| windows[i].iter().filter(|w| w.resets_at > now).count())
-        .max()
-        .unwrap_or(0);
-
-    for &i in candidates {
-        let ws = &windows[i];
-        let recent_errors = state
-            .recent_error_count(&model.name, i, ERROR_WINDOW_MINUTES)
-            .unwrap_or(0);
-        if recent_errors >= ERROR_THRESHOLD {
-            evals.push(ProviderEval {
-                index: i,
-                binding_score: None,
-                unlearned: false,
-            });
-            continue;
-        }
-
-        let q = quotas[i].as_ref();
-        let turns = q
-            .and_then(|q| {
-                state
-                    .count_assistant_turns_since(&model.providers[i].name, q.refreshed_at.as_ref())
-                    .ok()
-            })
-            .unwrap_or(0);
-
-        let mut binding_score = f64::INFINITY;
-        let mut unlearned = false;
-        let mut scored_window = false;
-
-        // If a sibling reports more live windows than we do AND at least
-        // one of our visible windows is itself near cap, penalize the
-        // binding for each missing slot by folding in a worst-case
-        // (0 remaining headroom) contribution. The exact hours figure
-        // doesn't matter — zero headroom multiplied by any positive hours
-        // is still zero, pulling binding to zero for this provider. Pools
-        // where every provider has the same live window count, or where
-        // this provider's visible windows show plenty of headroom, skip
-        // the penalty and rank on their own data. The visible-usage gate
-        // is what distinguishes Anthropic's "hide 5h near cap" (penalize)
-        // from ChatGPT's "hide 5h when idle" (don't penalize).
-        let live_window_count = ws.iter().filter(|w| w.resets_at > now).count();
-        let any_visible_near_cap = ws
-            .iter()
-            .any(|w| w.resets_at > now && w.used_percent >= HIDDEN_WINDOW_PENALTY_THRESHOLD);
-        if live_window_count < pool_max_live_windows && any_visible_near_cap {
-            binding_score = binding_score.min(0.0);
-            scored_window = true;
-        }
-
-        for window in ws {
-            // Skip windows whose reset already happened: the stored
-            // used_percent is from the prior window instance, so treating it
-            // as "how much headroom remains" is wrong. The refresh loop
-            // should replace this row on its next successful fetch; if the
-            // scraper keeps returning empty (observed 2026-04-22 on claude3
-            // when anthropic-usage returned `{"windows":[]}`), preserving
-            // the past-reset row poisons the binding score by clamping
-            // hours-until-reset to EPS_HOURS and torpedoing the provider.
-            // Drop it from ranking entirely.
-            if window.resets_at <= now {
-                continue;
-            }
-            let Some(burn_rate) = bootstrap_burn_rate(i, window, quotas, windows) else {
-                unlearned = true;
-                continue;
-            };
-
-            let projected = project_used_percent(window.used_percent, turns, burn_rate);
-            let hours = ((window.resets_at - now).num_seconds() as f64 / 3600.0).max(EPS_HOURS);
-            let remaining_headroom = (1.0 - projected).max(0.0);
-            binding_score = binding_score.min(remaining_headroom * hours);
-            scored_window = true;
-        }
-
-        evals.push(ProviderEval {
-            index: i,
-            binding_score: if unlearned || !scored_window {
-                None
-            } else {
-                Some(binding_score)
-            },
-            unlearned,
-        });
-    }
+        .map(|projection| ProviderEval {
+            index: projection.provider_index,
+            binding_score: projection.binding_score,
+            unlearned: projection.binding_score.is_none()
+                && projection.recent_error_count < ERROR_THRESHOLD as u32,
+        })
+        .collect::<Vec<_>>();
 
     let eligible: Vec<&ProviderEval> = evals
         .iter()
@@ -317,8 +223,29 @@ pub fn compute_projections(
         .iter()
         .map(|p| state.get_windows(&p.name).unwrap_or_default())
         .collect();
-    let now = Utc::now();
     let candidates: Vec<usize> = (0..model.providers.len()).collect();
+    compute_projections_from_records(model, state, &quotas, &windows, &candidates, Utc::now())
+}
+
+fn compute_projections_from_records(
+    model: &ModelConfig,
+    state: &StateDb,
+    quotas: &[Option<QuotaRecord>],
+    windows: &[Vec<QuotaWindow>],
+    candidates: &[usize],
+    now: chrono::DateTime<Utc>,
+) -> Vec<ProviderProjection> {
+    // Compute the max number of live (not past-reset) windows any candidate
+    // reports. A provider whose upstream API returns fewer windows than
+    // siblings (observed 2026-04-22: `anthropic-usage` returns only the 7d
+    // window for heavily-used accounts because Anthropic's API hides the 5h
+    // timer when the account is near weekly cap) would otherwise dodge the
+    // constraining short-tier term in `min_w` and beat its siblings on the
+    // 7d-tier-only score. Defensive pessimism: when this provider has fewer
+    // live windows than the pool max AND at least one visible window is near
+    // cap, penalize the binding as if the missing slots were at 1.0 used.
+    // The visible-usage gate distinguishes Anthropic's "hide 5h near cap"
+    // from ChatGPT's "hide 5h when idle".
     let pool_max_live_windows = candidates
         .iter()
         .map(|&i| windows[i].iter().filter(|w| w.resets_at > now).count())
@@ -326,7 +253,8 @@ pub fn compute_projections(
         .unwrap_or(0);
 
     candidates
-        .into_iter()
+        .iter()
+        .copied()
         .map(|i| {
             let ws = &windows[i];
             let recent_errors = state
@@ -367,10 +295,13 @@ pub fn compute_projections(
             }
 
             for window in ws {
+                // Skip windows whose reset already happened: the stored
+                // used_percent is from the prior window instance, so treating
+                // it as current headroom poisons the binding score.
                 if window.resets_at <= now {
                     continue;
                 }
-                let Some(burn_rate) = bootstrap_burn_rate(i, window, &quotas, &windows) else {
+                let Some(burn_rate) = bootstrap_burn_rate(i, window, quotas, windows) else {
                     unlearned = true;
                     continue;
                 };
@@ -1198,6 +1129,7 @@ mod tests {
 [[providers]]
 name = "{name}"
 command = "{name}"
+interactive_args = ["launch"]
 
 [providers.resume]
 kind = "flag"
@@ -1236,6 +1168,10 @@ sessions_dir = "/tmp/{name}/sessions"
             active_provider_index: provider_index,
             active_session_id: "5169694d-de0f-40d1-890c-6e28e55bab27".to_string(),
         }
+    }
+
+    fn drop_quota_table(db: &StateDb) {
+        db.drop_provider_quotas_for_test();
     }
 
     // risk: Sticky-then-migrate decision; level: particular-integration; source: proposal §11.1 Sticky-then-migrate decision / A2, A4.
@@ -1373,7 +1309,19 @@ sessions_dir = "/tmp/{name}/sessions"
         assert_eq!(stay, MigrationDecision::Stay);
     }
 
-    // risk: compute_projections refactor equivalence; level: unit; source: proposal §11.1 compute_projections refactor equivalence / A4.
+    // risk: Sticky-then-migrate decision; level: particular-integration; source: proposal §11.1 Sticky-then-migrate decision / A2, A4.
+    #[test]
+    fn decide_migration_reports_projection_state_errors() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = migratable_model(&[("claude", "claude_code"), ("claude2", "claude_code")]);
+        drop_quota_table(&db);
+
+        let err = decide_migration(&db, &model, &resolved_for(&model, 0), 0.95, None).unwrap_err();
+
+        assert!(matches!(err, MigrationError::Db { .. }));
+    }
+
+    // risk: compute_projections refactor equivalence; level: particular-integration; source: proposal §11.1 compute_projections refactor equivalence / A4.
     #[test]
     fn compute_projections_exposes_window_projection_used_by_selection() {
         let db = StateDb::open(Path::new(":memory:")).unwrap();

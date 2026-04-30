@@ -573,18 +573,7 @@ fn ingest_and_emit_session_id(
         &finished_at,
     ) {
         Ok(Some(session_id)) => session_id,
-        Ok(None) => {
-            if let Some(session_id) = discover_fixture_turn_session(provider_name, state) {
-                return emit_known_session_id(
-                    state,
-                    invocation_row_id,
-                    invocation_uuid,
-                    &session_id,
-                    capture_method,
-                );
-            }
-            return false;
-        }
+        Ok(None) => return false,
         Err(err) => {
             eprintln!("Warning: Failed to resolve session for invocation {invocation_uuid}: {err}");
             return false;
@@ -598,36 +587,6 @@ fn ingest_and_emit_session_id(
         session_id.as_str(),
         capture_method,
     )
-}
-
-fn discover_fixture_turn_session(provider_name: &str, state: &StateDb) -> Option<String> {
-    let config_home = std::env::var_os("XDG_CONFIG_HOME")?;
-    let fixture_root = PathBuf::from(config_home).parent()?.to_path_buf();
-    let path = fixture_root.join("turns.jsonl");
-    let content = std::fs::read_to_string(path).ok()?;
-    let mut turns = Vec::new();
-    for line in content.lines() {
-        let value: serde_json::Value = serde_json::from_str(line).ok()?;
-        let session_id = value.get("session_id")?.as_str()?.to_string();
-        let turn_id = value.get("turn_id")?.as_str()?.to_string();
-        let timestamp = value.get("timestamp")?.as_str()?;
-        let timestamp = chrono::DateTime::parse_from_rfc3339(timestamp)
-            .ok()?
-            .with_timezone(&chrono::Utc);
-        let role = value.get("role")?.as_str()?.to_string();
-        turns.push(agent_runner_lib::state::SessionTurnIngest {
-            session_id,
-            turn_id,
-            timestamp,
-            role,
-            parent_turn_id: None,
-            is_sidechain: false,
-            is_compaction_boundary: false,
-        });
-    }
-    let first_session = turns.first()?.session_id.clone();
-    let _ = state.ingest_session_turns_batch(provider_name, &turns);
-    Some(first_session)
 }
 
 fn emit_known_session_id(
@@ -654,21 +613,15 @@ fn emit_known_session_id(
     true
 }
 
-#[allow(dead_code)]
-fn should_emit_resume_detail_line(match_count: usize, is_terminal: bool) -> bool {
-    match_count > 1 && !is_terminal
-}
-
 /// The short `[resume] -> <provider>` line is always emitted regardless of
 /// TTY (per proposal §5: V10 wins over V15 here — even at a terminal, the
 /// runner's selection must be visible). Factored as a helper so the
 /// "always-on" semantic has an explicit, unit-testable surface that mirrors
-/// `should_emit_invocation_line` and `should_emit_resume_detail_line`.
+/// `should_emit_invocation_line`.
 fn should_emit_resume_short_line(_is_terminal: bool) -> bool {
     true
 }
 
-#[allow(dead_code)]
 fn resume_model_pool_mismatch_message(
     models: &HashMap<String, ModelConfig>,
     model_name: &str,
@@ -830,19 +783,6 @@ fn run_repl(
         let selected_provider = &resolved.active_provider;
         if should_emit_resume_short_line(stderr_is_terminal) {
             eprintln!("[resume] -> {selected_provider}");
-        }
-        if let Ok(matches) = state.find_provider_for_session(&resolved.active_session_id)
-            && should_emit_resume_detail_line(matches.len(), stderr_is_terminal)
-        {
-            let providers = matches
-                .iter()
-                .map(|matched| matched.provider_name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            eprintln!(
-                "[resume] session {} matched {providers}; selected {selected_provider} by latest turn timestamp",
-                resolved.active_session_id
-            );
         }
         let provider_index = resolved.active_provider_index;
         let provider = &model.providers[provider_index];
@@ -1861,25 +1801,6 @@ mod tests {
     }
 
     #[test]
-    fn resume_detail_helper_suppresses_for_single_match_regardless_of_tty() {
-        assert!(!should_emit_resume_detail_line(1, false));
-        assert!(!should_emit_resume_detail_line(1, true));
-        assert!(!should_emit_resume_detail_line(0, false));
-    }
-
-    #[test]
-    fn resume_detail_helper_emits_when_multi_match_and_non_tty() {
-        assert!(should_emit_resume_detail_line(2, false));
-        assert!(should_emit_resume_detail_line(5, false));
-    }
-
-    #[test]
-    fn resume_detail_helper_suppresses_when_multi_match_but_tty() {
-        assert!(!should_emit_resume_detail_line(2, true));
-        assert!(!should_emit_resume_detail_line(5, true));
-    }
-
-    #[test]
     fn resume_short_line_helper_emits_for_non_tty_stderr() {
         assert!(should_emit_resume_short_line(false));
     }
@@ -1984,7 +1905,7 @@ mod tests {
         assert_eq!(row.error_category.as_deref(), Some("spawn_error"));
     }
 
-    // risk: CLI surface; level: end-to-end; source: proposal §11.1 CLI surface / A8.
+    // risk: CLI surface; level: unit; source: proposal §11.1 CLI surface / A8.
     #[test]
     fn top_level_resume_parse_allows_missing_model_and_migrate_flag() {
         let cli = Cli::try_parse_from([
@@ -2006,7 +1927,7 @@ mod tests {
         assert_eq!(cli.migrate.as_deref(), Some("claude2"));
     }
 
-    // risk: CLI surface; level: end-to-end; source: proposal §11.1 CLI surface / A5, A8.
+    // risk: CLI surface; level: unit; source: proposal §11.1 CLI surface / A5, A8.
     #[test]
     fn resume_list_user_syntax_rewrites_to_hidden_subcommand() {
         let argv = normalize_resume_list_args([

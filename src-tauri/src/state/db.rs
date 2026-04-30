@@ -1,7 +1,7 @@
 use crate::balancer::TransitionReason;
 use crate::config::{ModelConfig, ProvidersConfig, load_models};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OptionalExtension, named_params, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -203,12 +203,6 @@ pub struct SessionTurnCounts {
     pub total: u64,
     pub assistant: u64,
     pub sidechain: u64,
-}
-
-#[derive(Debug, Clone)]
-pub struct ProviderSessionMatch {
-    pub provider_name: String,
-    pub latest_timestamp: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]
@@ -1249,7 +1243,15 @@ impl StateDb {
             )
             .optional()
             .map_err(|e| format!("Failed to check existing invocation chain: {e}"))?;
-        if exists.is_some() {
+        if let Some(chain_id) = exists {
+            self.conn
+                .execute(
+                    "UPDATE session_chains
+                     SET model_name = ?2
+                     WHERE chain_id = ?1 AND model_name = '<unknown>'",
+                    params![chain_id, model_name],
+                )
+                .map_err(|e| format!("Failed to update invocation session chain model: {e}"))?;
             return Ok(());
         }
         let chain_id = Uuid::new_v4().to_string();
@@ -2792,53 +2794,6 @@ impl StateDb {
         Ok(out)
     }
 
-    pub fn find_provider_for_session(
-        &self,
-        session_id: &str,
-    ) -> Result<Vec<ProviderSessionMatch>, String> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT provider_name, MAX(latest_timestamp) AS latest_timestamp
-                 FROM (
-                    SELECT provider_name, timestamp AS latest_timestamp
-                    FROM session_turns
-                    WHERE session_id = :session_id
-                    UNION ALL
-                    SELECT provider_name, COALESCE(finished_at, created_at) AS latest_timestamp
-                    FROM invocations
-                    WHERE session_id = :session_id
-                      AND provider_name IS NOT NULL
-                 )
-                 GROUP BY provider_name
-                 ORDER BY latest_timestamp DESC, provider_name ASC",
-            )
-            .map_err(|e| format!("Failed to prepare session provider lookup: {e}"))?;
-
-        let rows = stmt
-            .query_map(named_params! { ":session_id": session_id }, |row| {
-                let latest_timestamp_raw: String = row.get(1)?;
-                let latest_timestamp = DateTime::parse_from_rfc3339(&latest_timestamp_raw)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .map_err(|e| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            1,
-                            rusqlite::types::Type::Text,
-                            Box::new(e),
-                        )
-                    })?;
-
-                Ok(ProviderSessionMatch {
-                    provider_name: row.get(0)?,
-                    latest_timestamp,
-                })
-            })
-            .map_err(|e| format!("Failed to query session provider lookup: {e}"))?;
-
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("Failed to read session provider lookup: {e}"))
-    }
-
     pub fn find_session_for_invocation_window(
         &self,
         provider_name: &str,
@@ -2924,6 +2879,13 @@ impl StateDb {
         Ok(count.max(0) as u64)
     }
 
+    #[cfg(test)]
+    pub(crate) fn drop_provider_quotas_for_test(&self) {
+        self.conn
+            .execute_batch("DROP TABLE provider_quotas")
+            .unwrap();
+    }
+
     /// Helper: map a rusqlite row to an AccountRecord.
     fn map_account_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AccountRecord> {
         let auth_method_str: String = row.get(3)?;
@@ -2949,6 +2911,14 @@ mod tests {
 
     fn test_db() -> StateDb {
         StateDb::open(Path::new(":memory:")).unwrap()
+    }
+
+    fn db_without_table(table: &str) -> StateDb {
+        let db = test_db();
+        db.conn
+            .execute_batch(&format!("DROP TABLE {table};"))
+            .unwrap();
+        db
     }
 
     fn ts(value: &str) -> DateTime<Utc> {
@@ -4403,131 +4373,6 @@ command = "fixture"
     }
 
     #[test]
-    fn find_provider_for_session_returns_empty_for_unknown_session() {
-        let db = test_db();
-
-        let matches = db.find_provider_for_session("missing-session").unwrap();
-
-        assert!(matches.is_empty());
-    }
-
-    #[test]
-    fn find_provider_for_session_returns_single_provider_match_with_latest_timestamp() {
-        let db = test_db();
-        db.ingest_session_turns_batch(
-            "claude2",
-            &[
-                SessionTurnIngest {
-                    session_id: "session-a".to_string(),
-                    turn_id: "turn-1".to_string(),
-                    timestamp: ts("2026-04-17T08:00:00Z"),
-                    role: "user".to_string(),
-                    parent_turn_id: None,
-                    is_sidechain: false,
-                    is_compaction_boundary: false,
-                },
-                SessionTurnIngest {
-                    session_id: "session-a".to_string(),
-                    turn_id: "turn-2".to_string(),
-                    timestamp: ts("2026-04-17T08:00:05Z"),
-                    role: "assistant".to_string(),
-                    parent_turn_id: Some("turn-1".to_string()),
-                    is_sidechain: false,
-                    is_compaction_boundary: false,
-                },
-            ],
-        )
-        .unwrap();
-
-        let matches = db.find_provider_for_session("session-a").unwrap();
-
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].provider_name, "claude2");
-        assert_eq!(matches[0].latest_timestamp, ts("2026-04-17T08:00:05Z"));
-    }
-
-    #[test]
-    fn find_provider_for_session_uses_invocation_capture_when_no_turns_exist() {
-        let db = test_db();
-        let invocation_id = db
-            .start_invocation(&InvocationStart {
-                invocation_uuid: "7ad2916c-38dd-49e6-a1f7-3ef22766ff70".to_string(),
-                model_name: "claude-opus".to_string(),
-                provider_name: "claude".to_string(),
-                provider_index: 0,
-                parent_invocation_id: None,
-            })
-            .unwrap();
-        db.update_session_capture(
-            invocation_id,
-            Some("5169694d-de0f-40d1-890c-6e28e55bab27"),
-            "forced_flag_verified",
-        )
-        .unwrap();
-        db.finalize_invocation(invocation_id, true, 0, None, None)
-            .unwrap();
-
-        let matches = db
-            .find_provider_for_session("5169694d-de0f-40d1-890c-6e28e55bab27")
-            .unwrap();
-
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].provider_name, "claude");
-    }
-
-    #[test]
-    fn find_provider_for_session_orders_by_latest_timestamp_then_provider_name() {
-        let db = test_db();
-        db.ingest_session_turns_batch(
-            "claude2",
-            &[SessionTurnIngest {
-                session_id: "shared-session".to_string(),
-                turn_id: "claude-turn".to_string(),
-                timestamp: ts("2026-04-17T08:00:10Z"),
-                role: "assistant".to_string(),
-                parent_turn_id: None,
-                is_sidechain: false,
-                is_compaction_boundary: false,
-            }],
-        )
-        .unwrap();
-        db.ingest_session_turns_batch(
-            "codex-a",
-            &[SessionTurnIngest {
-                session_id: "shared-session".to_string(),
-                turn_id: "codex-a-turn".to_string(),
-                timestamp: ts("2026-04-17T08:00:05Z"),
-                role: "assistant".to_string(),
-                parent_turn_id: None,
-                is_sidechain: false,
-                is_compaction_boundary: false,
-            }],
-        )
-        .unwrap();
-        db.ingest_session_turns_batch(
-            "codex-b",
-            &[SessionTurnIngest {
-                session_id: "shared-session".to_string(),
-                turn_id: "codex-b-turn".to_string(),
-                timestamp: ts("2026-04-17T08:00:05Z"),
-                role: "assistant".to_string(),
-                parent_turn_id: None,
-                is_sidechain: false,
-                is_compaction_boundary: false,
-            }],
-        )
-        .unwrap();
-
-        let matches = db.find_provider_for_session("shared-session").unwrap();
-        let providers: Vec<&str> = matches.iter().map(|m| m.provider_name.as_str()).collect();
-
-        assert_eq!(providers, vec!["claude2", "codex-a", "codex-b"]);
-        assert_eq!(matches[0].latest_timestamp, ts("2026-04-17T08:00:10Z"));
-        assert_eq!(matches[1].latest_timestamp, ts("2026-04-17T08:00:05Z"));
-        assert_eq!(matches[2].latest_timestamp, ts("2026-04-17T08:00:05Z"));
-    }
-
-    #[test]
     fn composite_invocation_id_formats_and_round_trips() {
         let composite = CompositeInvocationId {
             source: "fixture-provider".to_string(),
@@ -5138,6 +4983,7 @@ prompt_mode = "arg"
 [[providers]]
 name = "claude"
 command = "claude"
+interactive_args = ["launch"]
 
 [providers.resume]
 kind = "flag"
@@ -5146,6 +4992,7 @@ flag = "--resume"
 [[providers]]
 name = "claude2"
 command = "claude2"
+interactive_args = ["launch"]
 
 [providers.resume]
 kind = "flag"
@@ -5160,6 +5007,7 @@ prompt_mode = "arg"
 [[providers]]
 name = "claude"
 command = "claude"
+interactive_args = ["launch"]
 
 [providers.resume]
 kind = "flag"
@@ -5697,6 +5545,76 @@ flag = "--resume"
             .with_timezone(&Utc);
         assert!(last_used >= before - chrono::Duration::seconds(1));
         assert!(last_used <= after + chrono::Duration::seconds(1));
+    }
+
+    // risk: Chain identity write paths; level: particular-integration; source: proposal §11.1 Chain identity write paths / A3, A8.
+    #[test]
+    fn chain_identity_helpers_report_sql_errors() {
+        let segmentless = db_without_table("session_chain_segments");
+        let segment_open_err = segmentless
+            .open_chain_segment(
+                CHAIN_A,
+                "claude",
+                SESSION_A,
+                &ts("2026-04-17T08:00:00Z"),
+                crate::balancer::TransitionReason::Initial,
+            )
+            .unwrap_err();
+        assert!(
+            segment_open_err.contains("session chain segment"),
+            "{segment_open_err}"
+        );
+
+        let mint_err = db_without_table("session_chain_segments")
+            .mint_imported_chain_if_absent(
+                "claude",
+                SESSION_A,
+                &ts("2026-04-17T08:00:00Z"),
+                "claude-opus",
+            )
+            .unwrap_err();
+        assert!(
+            mint_err.contains("existing session chain segment"),
+            "{mint_err}"
+        );
+
+        let update_err = db_without_table("session_chains")
+            .update_chain_last_used(CHAIN_A)
+            .unwrap_err();
+        assert!(update_err.contains("last_used_at"), "{update_err}");
+
+        let chain_lookup_err = db_without_table("session_chain_segments")
+            .chain_id_for_segment("claude", SESSION_A)
+            .unwrap_err();
+        assert!(
+            chain_lookup_err.contains("session chain id"),
+            "{chain_lookup_err}"
+        );
+    }
+
+    // risk: Migration mechanic: compaction-aware Claude target build; level: particular-integration; source: proposal §11.1 Migration mechanic: compaction-aware Claude target build / A3, A6.
+    #[test]
+    fn compaction_and_preview_helpers_report_negative_paths() {
+        let malformed_uuid = test_db().resume_previews("not-a-uuid").unwrap_err();
+        assert!(malformed_uuid.contains("Invalid UUID"), "{malformed_uuid}");
+
+        let db = test_db();
+        db.conn
+            .execute(
+                "INSERT INTO session_turns
+                    (provider_name, session_id, turn_id, timestamp, role, source_file, ingested_at, is_compaction_boundary)
+                 VALUES ('claude', ?1, 'bad-boundary', 'not-a-timestamp', 'assistant', '', '2026-04-17T08:00:00Z', 1)",
+                params![SESSION_A],
+            )
+            .unwrap();
+
+        let boundary_err = db
+            .latest_compaction_boundary("claude", SESSION_A)
+            .unwrap_err();
+        assert!(
+            boundary_err.contains("Bad compaction boundary timestamp"),
+            "{boundary_err}"
+        );
     }
 
     // risk: Migration mechanic: Claude JSONL copy, Codex deferred guard, segment ledger, and races; level: particular-integration; source: proposal §11.1 Migration mechanic / A3.

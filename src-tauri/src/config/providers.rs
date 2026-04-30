@@ -72,6 +72,14 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    fn default_model_providers_toml() -> &'static str {
+        r#"
+[claude]
+quota_script = "anthropic-usage ~/.claude/.credentials.json"
+default_model = "claude-opus"
+"#
+    }
+
     #[test]
     fn parses_quota_scripts() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
@@ -127,19 +135,11 @@ quota_script = "anthropic-usage ~/.claude2/.credentials.json"
         assert!(cfg.entries.is_empty());
     }
 
-    // risk: Resolver disambiguation and model inference; level: unit; source: proposal §11.1 Resolver disambiguation and model inference / A8.
+    // risk: Resolver disambiguation and model inference; level: particular-integration; source: proposal §11.1 Resolver disambiguation and model inference / A8.
     #[test]
     fn parses_default_model() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
-        writeln!(
-            f,
-            r#"
-[claude]
-quota_script = "anthropic-usage ~/.claude/.credentials.json"
-default_model = "claude-opus"
-"#
-        )
-        .unwrap();
+        write!(f, "{}", default_model_providers_toml()).unwrap();
 
         let cfg = ProvidersConfig::load(f.path()).unwrap();
 
