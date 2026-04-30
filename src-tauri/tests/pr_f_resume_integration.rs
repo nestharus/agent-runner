@@ -1,7 +1,8 @@
 #![cfg(unix)]
 
 use agent_runner_lib::state::{CompositeInvocationId, SessionTurnIngest, StateDb};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
+use rusqlite::{Connection, params};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -39,6 +40,11 @@ impl Fixture {
 
     fn open_db(&self) -> StateDb {
         StateDb::open(&self.db_path()).unwrap()
+    }
+
+    fn conn(&self) -> Connection {
+        let _ = self.open_db();
+        Connection::open(self.db_path()).unwrap()
     }
 
     fn write_sessions_config(&self, provider_name: &str, transcript_path: &Path) {
@@ -136,6 +142,129 @@ flag = "--resume"
                 provider_b_script.display()
             ),
         );
+    }
+
+    fn write_migratable_two_provider_model(
+        &self,
+        model_name: &str,
+        provider_a_script: &Path,
+        provider_b_script: &Path,
+        provider_a_projects: &Path,
+        provider_b_projects: &Path,
+    ) {
+        self.write_model_body(
+            model_name,
+            &format!(
+                r#"prompt_mode = "arg"
+
+[[providers]]
+name = "claude-a"
+command = "{}"
+args = ["exec-a"]
+interactive_args = ["launch-a"]
+
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+
+[providers.session_storage]
+kind = "claude_code"
+projects_dir = "{}"
+
+[[providers]]
+name = "claude-b"
+command = "{}"
+args = ["exec-b"]
+interactive_args = ["launch-b"]
+
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+
+[providers.session_storage]
+kind = "claude_code"
+projects_dir = "{}"
+"#,
+                provider_a_script.display(),
+                provider_a_projects.display(),
+                provider_b_script.display(),
+                provider_b_projects.display()
+            ),
+        );
+    }
+
+    fn stage_claude_jsonl(&self, projects_dir: &Path, session_id: &str) -> PathBuf {
+        let cwd_dir = projects_dir.join("cwd-hash-fixture");
+        fs::create_dir_all(&cwd_dir).unwrap();
+        let target = cwd_dir.join(format!("{session_id}.jsonl"));
+        fs::write(
+            &target,
+            format!(
+                r#"{{"sessionId":"{session_id}","turnId":"turn-1","timestamp":"2026-04-17T08:00:00Z","type":"assistant"}}"#
+            ),
+        )
+        .unwrap();
+        target
+    }
+
+    fn seed_active_chain(&self, chain_id: &str, provider: &str, session_id: &str, model: &str) {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
+             VALUES (?1, '2026-04-17T08:00:00Z', '2026-04-17T08:00:00Z', ?2)",
+            params![chain_id, model],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_chain_segments
+                (chain_id, provider_name, session_id, started_at, transition_reason)
+             VALUES (?1, ?2, ?3, '2026-04-17T08:00:00Z', 'initial')",
+            params![chain_id, provider, session_id],
+        )
+        .unwrap();
+    }
+
+    fn seed_quota_window(&self, provider: &str, used_percent: f64) {
+        let conn = self.conn();
+        let refreshed_at = Utc::now().to_rfc3339();
+        let resets_at = (Utc::now() + Duration::hours(24)).to_rfc3339();
+        conn.execute(
+            "INSERT INTO provider_quotas
+                (provider_name, used_percent, resets_at, calls_since_refresh, refreshed_at)
+             VALUES (?1, ?2, ?3, 0, ?4)
+             ON CONFLICT (provider_name) DO UPDATE SET
+                used_percent = ?2,
+                resets_at = ?3,
+                calls_since_refresh = 0,
+                refreshed_at = ?4,
+                exhausted_at = NULL",
+            params![provider, used_percent, resets_at, refreshed_at],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM provider_quota_windows WHERE provider_name = ?1",
+            params![provider],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO provider_quota_windows
+                (provider_name, window_id, used_percent, resets_at, last_delta_percent, last_delta_calls)
+             VALUES (?1, 0, ?2, ?3, 0.01, 22)",
+            params![provider, used_percent, resets_at],
+        )
+        .unwrap();
+    }
+
+    fn active_segment(&self, chain_id: &str) -> (String, String) {
+        self.conn()
+            .query_row(
+                "SELECT provider_name, session_id
+                 FROM session_chain_segments
+                 WHERE chain_id = ?1 AND ended_at IS NULL",
+                params![chain_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
     }
 
     fn base_model_command(&self, model_name: &str) -> Command {
@@ -732,6 +861,125 @@ fn interactive_repl_resume_routes_to_session_owner_in_multi_provider_model() {
         .unwrap();
     assert_eq!(row.provider_name.as_deref(), Some("claude-owner"));
     assert_eq!(row.provider_index, 1);
+}
+
+#[test]
+fn repl_resume_migrates_to_best_scored_provider() {
+    let fixture = Fixture::new();
+    let chain_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+    let source_projects = fixture.dir.path().join("source-projects");
+    let target_projects = fixture.dir.path().join("target-projects");
+    fixture.stage_claude_jsonl(&source_projects, session_id);
+    let provider_a_marker = fixture.dir.path().join("migrate-provider-a.txt");
+    let provider_b_marker = fixture.dir.path().join("migrate-provider-b.txt");
+    let provider_a = fixture.write_script(
+        "migrate-provider-a.sh",
+        &format!(
+            r#"printf '%s\n' "$@" > "{}"; exit 0"#,
+            provider_a_marker.display()
+        ),
+    );
+    let provider_b = fixture.write_script(
+        "migrate-provider-b.sh",
+        &format!(
+            r#"printf '%s\n' "$@" > "{}"; exit 0"#,
+            provider_b_marker.display()
+        ),
+    );
+    fixture.write_migratable_two_provider_model(
+        "balanced-model",
+        &provider_a,
+        &provider_b,
+        &source_projects,
+        &target_projects,
+    );
+    fixture.seed_active_chain(chain_id, "claude-a", session_id, "balanced-model");
+    fixture.seed_quota_window("claude-a", 0.83);
+    fixture.seed_quota_window("claude-b", 0.12);
+
+    let output = fixture.run_repl("balanced-model", Some(session_id));
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        !provider_a_marker.exists(),
+        "repl --resume should launch migrated provider, not original active provider"
+    );
+    assert_eq!(
+        fs::read_to_string(&provider_b_marker).unwrap(),
+        "launch-b\n--resume\n5169694d-de0f-40d1-890c-6e28e55bab27\n"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("[resume] -> claude-a"), "{stderr}");
+    assert!(
+        stderr.contains("[migrate] claude-a -> claude-b reason=quota_threshold"),
+        "{stderr}"
+    );
+    assert_eq!(
+        fixture.active_segment(chain_id),
+        ("claude-b".to_string(), session_id.to_string())
+    );
+    assert!(
+        target_projects
+            .join("cwd-hash-fixture")
+            .join(format!("{session_id}.jsonl"))
+            .exists()
+    );
+}
+
+#[test]
+fn repl_resume_stays_when_active_is_best_scored() {
+    let fixture = Fixture::new();
+    let chain_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+    let source_projects = fixture.dir.path().join("source-projects");
+    let target_projects = fixture.dir.path().join("target-projects");
+    fixture.stage_claude_jsonl(&source_projects, session_id);
+    let provider_a_marker = fixture.dir.path().join("stay-provider-a.txt");
+    let provider_b_marker = fixture.dir.path().join("stay-provider-b.txt");
+    let provider_a = fixture.write_script(
+        "stay-provider-a.sh",
+        &format!(
+            r#"printf '%s\n' "$@" > "{}"; exit 0"#,
+            provider_a_marker.display()
+        ),
+    );
+    let provider_b = fixture.write_script(
+        "stay-provider-b.sh",
+        &format!(
+            r#"printf '%s\n' "$@" > "{}"; exit 0"#,
+            provider_b_marker.display()
+        ),
+    );
+    fixture.write_migratable_two_provider_model(
+        "balanced-model",
+        &provider_a,
+        &provider_b,
+        &source_projects,
+        &target_projects,
+    );
+    fixture.seed_active_chain(chain_id, "claude-a", session_id, "balanced-model");
+    fixture.seed_quota_window("claude-a", 0.12);
+    fixture.seed_quota_window("claude-b", 0.83);
+
+    let output = fixture.run_repl("balanced-model", Some(session_id));
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        !provider_b_marker.exists(),
+        "repl --resume should stay on active provider when it is best scored"
+    );
+    assert_eq!(
+        fs::read_to_string(&provider_a_marker).unwrap(),
+        "launch-a\n--resume\n5169694d-de0f-40d1-890c-6e28e55bab27\n"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("[resume] -> claude-a"), "{stderr}");
+    assert!(!stderr.contains("[migrate]"), "{stderr}");
+    assert_eq!(
+        fixture.active_segment(chain_id),
+        ("claude-a".to_string(), session_id.to_string())
+    );
 }
 
 #[test]

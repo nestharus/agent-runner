@@ -712,7 +712,7 @@ fn format_resume_error(err: agent_runner_lib::state::ResumeError) -> String {
 fn run_repl(
     model_name: Option<&str>,
     resume: Option<&str>,
-    _manual_migrate: Option<&str>,
+    manual_migrate: Option<&str>,
     working_dir: Option<&Path>,
     models_dir_override: Option<&Path>,
 ) -> Result<i32, String> {
@@ -721,14 +721,18 @@ fn run_repl(
         .map(Path::to_path_buf)
         .unwrap_or_else(default_models_dir);
     let models = load_models(&models_dir)?;
-    let resolved_resume = if let Some(session_id) = resume {
+    let config_root = dirs::config_dir()
+        .map(|d| d.join("oulipoly-agent-runner"))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let providers_path = config_root.join("providers.toml");
+    let sessions_path = config_root.join("sessions.toml");
+    let providers_cfg =
+        agent_runner_lib::config::ProvidersConfig::load(&providers_path).unwrap_or_default();
+    let sessions_cfg =
+        agent_runner_lib::config::SessionsConfig::load(&sessions_path).unwrap_or_default();
+    let mut resolved_resume = if let Some(session_id) = resume {
         Some(
-            match state.resolve_resume(
-                &agent_runner_lib::config::ProvidersConfig::default(),
-                &models,
-                session_id,
-                model_name,
-            ) {
+            match state.resolve_resume(&providers_cfg, &models, session_id, model_name) {
                 Ok(resolved) => resolved,
                 Err(agent_runner_lib::state::ResumeError::NoChainFound { .. })
                     if model_name.is_none() =>
@@ -761,15 +765,6 @@ fn run_repl(
         .get(model_name)
         .ok_or_else(|| format!("Unknown model: {model_name}"))?;
 
-    let config_root = dirs::config_dir()
-        .map(|d| d.join("oulipoly-agent-runner"))
-        .unwrap_or_else(|| PathBuf::from("."));
-    let providers_path = config_root.join("providers.toml");
-    let sessions_path = config_root.join("sessions.toml");
-    let providers_cfg =
-        agent_runner_lib::config::ProvidersConfig::load(&providers_path).unwrap_or_default();
-    let sessions_cfg =
-        agent_runner_lib::config::SessionsConfig::load(&sessions_path).unwrap_or_default();
     let in_flight = agent_runner_lib::quota::InFlight::new();
     let ctx = balancer::BalanceContext {
         providers_cfg: &providers_cfg,
@@ -779,11 +774,38 @@ fn run_repl(
 
     let parent_invocation_id = resolve_parent_invocation_id(&state);
     let stderr_is_terminal = std::io::stderr().is_terminal();
-    let (provider_index, resume_payload) = if let Some(resolved) = resolved_resume.as_ref() {
+    let (provider_index, resume_payload) = if let Some(resolved) = resolved_resume.as_mut() {
         let selected_provider = &resolved.active_provider;
         if should_emit_resume_short_line(stderr_is_terminal) {
             eprintln!("[resume] -> {selected_provider}");
         }
+        if let Ok(balancer::MigrationDecision::Migrate {
+            target_provider_index,
+            reason,
+        }) = balancer::decide_migration(&state, model, resolved, manual_migrate)
+        {
+            let mut stderr = std::io::stderr();
+            match agent_runner_lib::migration::migrate_chain_segment(
+                &state,
+                &sessions_cfg,
+                model,
+                resolved,
+                target_provider_index,
+                reason,
+                &mut stderr,
+            ) {
+                Ok(migrated) => {
+                    resolved.active_provider = migrated.target_provider.clone();
+                    resolved.active_provider_index = migrated.target_provider_index;
+                    resolved.active_session_id = migrated.target_session_id.clone();
+                }
+                Err(err) => {
+                    eprintln!("migration failed: {err:?}");
+                    return Ok(1);
+                }
+            }
+        }
+
         let provider_index = resolved.active_provider_index;
         let provider = &model.providers[provider_index];
         let Some(strategy) = provider.resume.as_ref() else {
