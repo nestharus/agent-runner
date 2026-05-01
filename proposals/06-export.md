@@ -32,6 +32,12 @@ not reconstruct content from `session_turns`, scan provider stores, refresh
 cursors, run turn scripts, migrate transcripts, launch providers, implement
 write paths, add GUI surface, or add formats beyond `canonical-jsonl`.
 
+**Rev 2 changes** (in response to Phase 4 Round 1 audit):
+
+- §8: explicit `STATE_DIR` mkdir clause matching 06-locate's §8.
+  Closes R1-F01 by pinning the contract; removes Phase 5 deferral
+  language.
+
 # 1.1 Assumption register
 
 This is the approved register narrowed from
@@ -332,11 +338,16 @@ modules own native mapping and compaction detection.
 
 The command may run the configured transcript locator only through
 `locate_session_metadata`, because that is already part of the current
-trace/session contract and 06-locate API. Unlike locate Rev 3's caveat,
-export depends on the 06-schema-probe read-only state open. If the current
-locator helper still creates `STATE_DIR`, Phase 5 must either identify a
-read-only locator path or revise this proposal; export's side-effect
-contract is stricter than locate's.
+trace/session contract and 06-locate API. Export depends on the
+06-schema-probe read-only state open. `agents session export` may create
+the locator adapter `state_dir` directory
+(`src-tauri/src/sessions/mod.rs:184-185`) when `locate_transcript` is
+invoked. This directory creation is the same behavior `trace --json` and
+`agents session locate` already exhibit and is part of the existing
+transcript-locator contract that the harness anti-scope explicitly permits
+("Running configured transcript locators is allowed only if already part of
+the current trace/session contract"). No file inside the directory is
+written by `export`.
 
 The CLI writes stdout only after the complete canonical transcript has been
 validated. Error exits write no canonical records to stdout.
