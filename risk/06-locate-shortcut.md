@@ -1,30 +1,102 @@
-# 06-locate — Phase 4 Shortcut Risk Assessment (Rev 1)
+# 06-locate — Phase 4 Shortcut Risk Assessment (Rev 2)
 
 ## Verdict: LOW
 
-The Rev 1 proposal does not dodge the harness's "stable, refuse-
-rather-than-corrupt JSON" purpose with any D-decision. Each of
-D1–D7 is purpose-fit on inspection: the chosen branches push the
-command toward refuse-with-stable-error rather than emit-partial-
-or-guess, and the rejected branches are turned down for documented
-reasons (initiative constraints, no second ownership path, or
-provenance unavailable in current schema). The §6 reusable API
-declares typed errors that are concretely raised in §4 step
-mappings, so it does not smell like a deferred-stub. The §6
-`TranscriptState` move is conditioned on Phase 5 hookpoint
-research, but the conditional is structured ("stop and revise
-this proposal rather than duplicating a second transcript-state
-type silently"), not a "we'll figure it out later." Anti-scope
-items (§7 D4b/D5 rejections) are driven by the cross-feature
-constraint forbidding a second ownership path, not by problem-
-shifting. The internal-`codex` / external-`codex_session`
-boundary at D2b is a public-vocabulary boundary, not a backwards-
-compatibility shim — there is no old shape preserved alongside
-a new one, and the convention's "transitional adapter" pattern
-does not apply when the two vocabularies are by-design
-asymmetric (internal config TOMLs vs. harness JSON contract).
+The Rev 2 closure changes do not import a shortcut. Each
+controversial change (Codex fail-closed, longest-prefix-existing
+tiebreaker, `unwrap_or_default` config load, `mutable` future-
+extension residual) is a purpose-fit narrowing of contract surface
+that keeps "refuse rather than corrupt" intact. None matches the
+deferred-stub shape (`~/ai/conventions/no-deferred-stubs.md`):
+there are no functions declared without raise sites, no silent
+`None`/`{}` placeholders, no unreferenced TODOs. The Rev 1 LOW
+observations close cleanly: L2 is now explicit in §10, and L1
+remains the audit pin it was always framed as. Two new LOW
+observations recorded (R2-F01 prose ambiguity in §4 step 8;
+R2-F02 malformed-config / unsupported-storage indistinguishability).
 
-Two LOW observations recorded below.
+## R1 closure
+
+| L# | Status | Evidence |
+| --- | --- | --- |
+| L1 | not closed (intentional) | Rev 2 leaves §6's "siblings should consume `SessionMetadata`" recommendation unchanged (line 204). L1 was framed in Rev 1 as "leave as a LOW audit nit; not a shortcut" — closure was not required this round. The vocabulary boundary still depends on sibling discipline rather than enforcement; same posture as Rev 1. |
+| L2 | closed | §10 line 267 explicitly documents `mutable: true` as a "read-time eligibility hint... not a safety lock" with the warning "Consumers should not treat `mutable: true` as a permission to mutate." Reinforced by §7 anti-scope and §12 residual. |
+
+## Rev 2 watchpoint judgments
+
+### W1 Codex deferral
+**Purpose-fit hand-off.** The Codex fail-closed branch in §4 step 8
+is not a deferred stub by the convention's definition: there is no
+function declared-but-not-implemented; the §6 API returns a real
+`MetadataError::UnsupportedStorage` raised at a concrete site. The
+harness contract (`01-session-locate.md:35`) explicitly accepts
+`unsupported-storage` as the response when canonical file-backed
+metadata cannot be resolved. The Phase 5 hookpoint research is
+named with a concrete trigger ("sample real Codex rollout JSONL...
+verify a stable root field"), the bad fallback ("commit to
+`payload.cwd` without evidence") is forbidden by R1-F02's
+fix, and the residual is recorded in §12 and the A4 invalidator.
+
+The harness "still has no answer for Codex" critique is real but
+not a purpose violation: the harness's contract is *stable refusal*,
+not *universal success*. Exit 12 for all Codex sessions is a stable
+contract the harness can pin against and route around (or keep its
+v1 direct-read path for Codex specifically). Honest scope.
+
+### W2 path-hash tiebreaker
+**Purpose-fit.** The §4 step 8 algorithm — enumerate decompositions
+in longest-prefix-of-existing-path-first order, succeed only when
+exactly one decoded path exists, exit 12 when two or more exist —
+is deterministic and falsifiable. The §9.1 D7-ambiguity test row
+covers zero, one, and multiple-existing decompositions, so the
+exit-12 fallback is enforced by test intent. The heuristic does
+not "mask a deeper problem"; §12 explicitly records that workspace-
+root derivation may reject valid sessions whose provider transcript
+does not expose an invertible path. Refusal is preferred over
+guessing — the very purpose the gate exists to protect.
+
+(Prose nit recorded as R2-F01 below: the §4 prose reads as if it
+short-circuits at the first existing decomposition; only §9.1
+clarifies that the rule is "exactly one existing decomposition or
+exit 12." Clarity issue, not a shortcut.)
+
+### W3 unwrap_or_default
+**Purpose-fit citation fix.** R1-F04 was a citation error (Rev 1
+implied resume used strict load semantics; resume actually uses
+`unwrap_or_default`). Rev 2 §4 step 3 corrects the citation and
+commits locate to the same lenient behavior, with downstream
+fail-closed (storage_type → exit 12) catching malformed config
+naturally. This is the right side of the no-second-ownership-path
+rule: locate must not invent a stricter config-load contract than
+resume does.
+
+The cost — a typo in `providers.toml` degrades to "unsupported-
+storage" rather than "config malformed" — is real but bounded by
+resume parity. The harness experiences exactly the same ambiguity
+when running `agents resume` today; locate adding a parallel
+command does not worsen the user-facing diagnosis path. Recorded
+as R2-F02 LOW observation (not a shortcut, an inherited
+limitation).
+
+### W4 mutable forward-extension
+**Purpose-fit forward-extension note.** The §12 residual ("Once
+06-pause-handshake lands, `mutable` will gain a sixth condition")
+is the right shape: it explicitly documents contract evolution so
+no consumer bakes in `mutable: true` → "safe to write" semantics
+in cross-process contexts. The harness misuse risk is mitigated
+through three coordinated places: §10 README ("read-time
+eligibility hint... not a safety lock"), §7 anti-scope ("No
+attempt to make `mutable` a hard import/replace safety lock;
+06-pause-handshake owns locks later"), and §13 cross-feature
+checklist row.
+
+Refusing to set `mutable: true` until 06-pause-handshake ships
+would defeat the field's legitimate read-time purpose (UI display,
+eligibility filtering, harness pre-flight checks). The current
+residual + documentation strategy is honest about the bound and
+keeps the field useful. Not problem-shifting; the lock observation
+is a sibling feature with its own surface and its own future
+work.
 
 ## Findings (severity >= MEDIUM)
 
@@ -32,167 +104,32 @@ None.
 
 ## LOW-severity observations / nits
 
-**L1. D2b vocabulary boundary is purpose-fit but worth a one-
-line audit pin.**
-The proposal commits to `internal SessionStorage::Codex →
-external "codex_session"` translation only at the locate boundary
-(§3, §4 step 6). This is not a backwards-compat shim — `codex`
-and `codex_session` were never the same shape, and §6's
-`SessionStorageType::CodexSession` is the single public
-vocabulary that 06-export and 06-import-replace will inherit
-through `SessionMetadata`. The risk is downstream: if a future
-sibling reads provider config directly (bypassing `SessionMetadata`)
-and emits its own `storage_type`, the two vocabularies will
-diverge. Mitigation already in proposal: §6 instructs siblings
-to consume `SessionMetadata` rather than `ProviderConfig`. Leave
-as a LOW audit nit; not a shortcut.
+**R2-F01. §4 step 8 path-hash tiebreaker prose is ambiguous about
+when the algorithm short-circuits.**
+The text reads "generate candidate decompositions in longest-
+prefix-of-existing-path-first order and pick the first
+interpretation whose decoded path exists on the filesystem. If
+two or more decompositions both yield existing paths, treat it as
+exit `12`." The first sentence describes a short-circuit ("pick
+the first"); the second sentence requires enumerating all matches
+("two or more... both yield"). §9.1's D7-ambiguity row clarifies
+the rule as "deterministic only when it yields a single existing
+decoded path" — i.e., enumerate all, exit 12 if >1. Phase 6 will
+need the §9.1 reading; the §4 prose should be tightened
+("enumerate all decompositions; succeed if exactly one decoded
+path exists; exit 12 otherwise"). Not a shortcut — the §9.1 row
+forces correct implementation via test intent.
 
-**L2. `mutable` excludes `exhausted_at` is purpose-fit, but the
-proposal could be more explicit that pause-handshake is the only
-hard lock.**
-D3's choice to exclude `provider_quotas.exhausted_at` from the
-`mutable` boolean is sound — quota is account-global, locate is
-session-scoped, and §7 / §13 explicitly state "No attempt to make
-`mutable` a hard import/replace safety lock; 06-pause-handshake
-owns locks later." That is the correct purpose-fit: `mutable`
-is a read-time eligibility hint, not a write guard. The harness
-contract (`01-session-locate.md:31`) does not promise quota-
-awareness either. The minor exposure is harness consumers who
-read `mutable: true` and infer "safe to write" without waiting
-for pause-handshake. The proposal documents this in §7 anti-
-scope and §12 residuals; the README update in §10 should make
-the read-only/eligibility framing explicit so harness authors
-do not over-read the field. Phase 6b/README review concern,
-not a shortcut.
-
-## Per-question verdict
-
-### Sh1 — D-decisions vs. harness purpose
-
-- **D1a (mirror resolver ambiguity)** — Purpose-fit. The
-  resolver's recency collapse already encodes the chain that
-  agent-runner would resume; the harness inheriting the same
-  collapse means `locate` and `resume` agree on which chain is
-  "the" chain. Strict multi-row ambiguity (D1b) would have been a
-  second ownership path in violation of `initiatives/06-session-
-  override-contract.md:112-113`.
-- **D2b (translate at boundary)** — See L1 above. Purpose-fit,
-  not a shim.
-- **D3 (`mutable` excludes `exhausted_at`)** — Purpose-fit. See
-  L2 above. The proposal does not let the harness confuse
-  read-time eligibility with a write lock.
-- **D4a (no `session_turns` fallback)** — Purpose-fit. Falling
-  back to `session_turns` outside the resolver would be a second
-  ownership path (forbidden by initiative). Mapping segmentless
-  rows to exit `10 session-not-found` is an honest refusal; the
-  user can run `agents migrate-db` to backfill, which §11.1
-  documents as the migration path.
-- **D5 (no `--state-db` override / no GUI state DB)** — Purpose-
-  fit for v1. The harness invokes the CLI binary, so it gets
-  `open_default`. GUI state divergence is documented in §12 as a
-  known residual. Not a shortcut.
-- **D6 (fail-closed transcript_state)** — Purpose-fit. Returning
-  exit `12` when transcript is `no_locator`/`missing` is exactly
-  the "refuse rather than corrupt" behavior the harness asks for
-  (`01-session-locate.md:35`). `trace --json` retains its
-  graceful degradation for diagnostics; locate is for action.
-  This split is not problem-shifting — it is the right surface
-  separation.
-- **D7 (JSONL-path-derived workspace_root)** — Purpose-fit. The
-  proposal acknowledges in §12 that this can reject valid
-  sessions whose provenance is not invertible from path/metadata.
-  Refusing is preferable to guessing; A4's invalidator names the
-  exact condition under which this rejection becomes wrong.
-
-### Sh2 — Backwards-compatibility shims
-
-The internal-`codex` / external-`codex_session` boundary is not
-a back-compat shim. `~/ai/conventions/no-backwards-compatibility.md`
-forbids "code that translates between old and new data shapes
-purely for compatibility" — but here the two shapes were never
-the same shape. `codex` is the internal serde tag; `codex_session`
-is the new public harness vocabulary. There is no "old" external
-vocabulary being preserved. §6's `SessionStorageType` enum is the
-single public surface; siblings that consume `SessionMetadata`
-inherit it. Audit pin recorded as L1 above for the divergence
-risk if a sibling bypasses the API.
-
-### Sh3 — Deferred stubs
-
-§6's `MetadataError::{InvalidSessionId, SessionNotFound,
-AmbiguousSession, UnsupportedStorage, Operational}` variants are
-each concretely mapped to a producing condition in §4 (steps 1,
-4, 6-8) and to an exit code in §5. None are declared without a
-raise site. The CLI wrapper's responsibilities are also pinned
-(§6 second paragraph after the function shape). Phase 6 cannot
-land a half-stubbed `MetadataError::AmbiguousSession` because §9.1
-"D1 ambiguity mirrors resolver" pins it as a component test that
-asserts the variant fires only when the resolver returns
-`Ambiguous`. Same for `SessionNotFound` (D4 row), `UnsupportedStorage`
-(D2 + D6 + D7 rows), and `InvalidSessionId` (Invalid UUID row).
-
-The lone gap is `MetadataError::Operational` — §9.1 has no
-explicit row pinning it. That is an audit/test-audit concern
-(operational errors are awkward to pin) and not a deferred-stub
-violation; the variant is wired to a concrete failure class.
-
-### Sh4 — `TranscriptState` extraction conditional
-
-§6 line 178's conditional is structured deferral, not "we'll
-figure it out later":
-1. The intent is committed (move out of trace, share the enum).
-2. The unacceptable fallback is named and forbidden ("rather
-   than duplicating a second transcript-state type silently").
-3. The trigger is concrete (Phase 5 hookpoint research showing
-   trace behavior would materially change).
-4. The escape hatch is "stop and revise this proposal" — i.e.,
-   block forward progress, not paper over.
-
-This shape — commit to the move, forbid the silent-duplicate
-fallback, route uncertainty back to revision — is exactly what
-a clean Phase 4→5 hand-off looks like. Not a shortcut.
-
-### Sh5 — Anti-scope hidden shortcuts
-
-- **D4b rejection (no `session_turns` fallback).** Is "we say
-  session-not-found instead of handling partial DBs" problem-
-  shifting? No — it is direct compliance with the initiative's
-  no-second-ownership-path constraint
-  (`initiatives/06-session-override-contract.md:112-113`). The
-  alternative (a second ownership path that reads `session_turns`
-  directly) is what the constraint exists to forbid. The user-
-  facing recourse (`agents migrate-db`) is documented in §11.1.
-- **D5 rejection (no `--state-db` override / no GUI state DB).**
-  Same shape: scope-bounded to v1's harness consumer (CLI),
-  with GUI state divergence documented as a known residual in
-  §12. Not problem-shifting; the GUI path is its own surface
-  with its own future work.
-
-### Sh6 — Test-intent track shortcuts
-
-The "README examples remain truthful" row's fallback to "Phase
-6b index maps to manual doc review residual" is an honest
-limitation, not a shortcut. README example tests are notoriously
-hard; flagging the gap in the Phase 6b output index is the
-right hand-off. The "Read-only behavior after open" row uses row-
-count and mtime snapshots as a proxy — this is a strong proxy
-(mutation would change the snapshot) and §12 names the physical
-read-only residual that 06-schema-probe will close. Acceptable.
-
-The D6 row notes it "Does not prove 600s timeout behavior except
-existing `locate_transcript` tests" — that is a documented
-residual (the 600s is `locate_transcript`'s contract, not
-`locate`'s), not a shortcut.
-
-## Conclusion
-
-Verdict: **LOW**.
-
-No D-decision substitutes the harness's literal contract for its
-purpose. No backwards-compatibility shim. No deferred stub. The
-one structurally-deferred item (TranscriptState extraction) is
-gated on a named Phase 5 finding with the bad fallback (silent
-duplicate) explicitly forbidden. Two LOW observations (L1 — D2b
-vocabulary boundary discipline for siblings; L2 — README framing
-of `mutable` as eligibility, not lock) are nits for audit/Phase
-6b README review, not shortcut compromises.
+**R2-F02. Inherited resume-parity malformed-config /
+unsupported-storage indistinguishability.**
+With Rev 2's `unwrap_or_default` config load (R1-F04 closure), a
+malformed `providers.toml` silently degrades to a default empty
+config and the harness sees exit 12 `unsupported-storage` instead
+of an operational error. This is a real ambiguity — but it is
+inherited from resume, not introduced by locate. Resume parity is
+the right call (the no-second-ownership-path constraint applies
+to config load too in spirit). Phase 6b README review should
+mention that "unsupported-storage" can also occur when provider
+config is malformed; or a future cross-feature pass could tighten
+both resume and locate together. Not a shortcut, an honest
+inherited limitation.
