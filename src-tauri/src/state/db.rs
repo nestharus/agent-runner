@@ -1,10 +1,10 @@
 use crate::balancer::TransitionReason;
 use crate::config::{ModelConfig, load_models};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 /// Ceiling on the per-turn burn rate that `upsert_quota_refresh` is willing
@@ -47,6 +47,71 @@ const NEAR_EXHAUSTED_USED_PERCENT: f64 = 0.99;
 
 pub struct StateDb {
     conn: Connection,
+}
+
+#[derive(Debug, Clone)]
+pub enum ReadOnlyOpenError {
+    Missing { path: PathBuf },
+    NotADatabase { path: PathBuf, message: String },
+    PermissionDenied { path: PathBuf },
+    WalSidecarError { path: PathBuf, message: String },
+    Operational { message: String },
+}
+
+fn classify_read_only_open_error(path: &Path, err: rusqlite::Error) -> ReadOnlyOpenError {
+    let message = err.to_string();
+    match &err {
+        rusqlite::Error::SqliteFailure(error, _) => match error.code {
+            ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt => {
+                ReadOnlyOpenError::NotADatabase {
+                    path: path.to_path_buf(),
+                    message,
+                }
+            }
+            ErrorCode::PermissionDenied => ReadOnlyOpenError::PermissionDenied {
+                path: path.to_path_buf(),
+            },
+            ErrorCode::SystemIoFailure
+                if message.contains("-wal")
+                    || message.contains("-shm")
+                    || message.to_ascii_lowercase().contains("wal")
+                    || message.to_ascii_lowercase().contains("shared memory") =>
+            {
+                ReadOnlyOpenError::WalSidecarError {
+                    path: path.to_path_buf(),
+                    message,
+                }
+            }
+            _ => ReadOnlyOpenError::Operational { message },
+        },
+        _ => ReadOnlyOpenError::Operational { message },
+    }
+}
+
+fn wal_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}-wal", path.display()))
+}
+
+fn shm_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}-shm", path.display()))
+}
+
+#[cfg(unix)]
+fn path_is_unreadable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    match std::fs::metadata(path) {
+        Ok(metadata) => metadata.permissions().mode() & 0o444 == 0,
+        Err(err) => err.kind() == std::io::ErrorKind::PermissionDenied,
+    }
+}
+
+#[cfg(not(unix))]
+fn path_is_unreadable(path: &Path) -> bool {
+    match std::fs::File::open(path) {
+        Ok(_) => false,
+        Err(err) => err.kind() == std::io::ErrorKind::PermissionDenied,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -608,11 +673,51 @@ impl StateDb {
         Ok(db)
     }
 
+    pub fn open_read_only(path: &Path) -> Result<Self, ReadOnlyOpenError> {
+        if !path.exists() {
+            return Err(ReadOnlyOpenError::Missing {
+                path: path.to_path_buf(),
+            });
+        }
+
+        if path_is_unreadable(path) {
+            return Err(ReadOnlyOpenError::PermissionDenied {
+                path: path.to_path_buf(),
+            });
+        }
+
+        for sidecar in [wal_path(path), shm_path(path)] {
+            if sidecar.exists() && path_is_unreadable(&sidecar) {
+                return Err(ReadOnlyOpenError::WalSidecarError {
+                    path: path.to_path_buf(),
+                    message: format!("SQLite sidecar is not readable: {}", sidecar.display()),
+                });
+            }
+        }
+
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY;
+        let conn = Connection::open_with_flags(path, flags)
+            .map_err(|err| classify_read_only_open_error(path, err))?;
+
+        conn.query_row("SELECT count(*) FROM sqlite_schema", [], |_row| Ok(()))
+            .map_err(|err| classify_read_only_open_error(path, err))?;
+
+        Ok(Self { conn })
+    }
+
     pub fn open_default() -> Result<Self, String> {
+        let db_path = Self::default_path()?;
+        Self::open(&db_path)
+    }
+
+    pub fn default_path() -> Result<PathBuf, String> {
         let data_dir =
             dirs::data_dir().ok_or_else(|| "Could not determine data directory".to_string())?;
-        let db_path = data_dir.join("oulipoly-agent-runner").join("state.db");
-        Self::open(&db_path)
+        Ok(data_dir.join("oulipoly-agent-runner").join("state.db"))
+    }
+
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.conn
     }
 
     fn ensure_invocations_schema(conn: &Connection) -> Result<(), String> {

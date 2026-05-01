@@ -1,5 +1,7 @@
 mod db;
 
+pub use crate::schema_probe::{BinaryInfo, FeatureMap, SchemaProbeReport, StateDbReport};
+pub use db::ReadOnlyOpenError;
 pub use db::SessionTurnCounts;
 pub use db::SessionTurnIngest;
 pub use db::StateDb;
