@@ -2249,6 +2249,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yml",
+ "sha2",
  "signal-hook",
  "tauri",
  "tauri-build",

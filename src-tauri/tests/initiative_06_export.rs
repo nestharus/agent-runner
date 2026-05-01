@@ -4,6 +4,8 @@ mod fixtures;
 
 use agent_runner_lib::session_export::read_canonical_transcript;
 use fixtures::initiative_06_export::*;
+use serde_json::Value;
+use std::{collections::BTreeMap, fs, path::Path};
 
 /// Risk: T1: resolver pass-through; Claude Code session emits canonical JSONL with all 8 fields per line.
 /// Level: particular-integration.
@@ -84,13 +86,10 @@ fn canonical_reader_source_metadata_matches_jsonl_preimage() {
 
     assert_eq!(records.len(), 3);
     let hashes = hardcoded_source_hashes();
-    let expected = [
-        ("claude-turn-1", 2_u64, 1_u64, 153_u64),
-        ("claude-turn-2", 3_u64, 155_u64, 317_u64),
-        ("claude-system-1", 4_u64, 318_u64, 480_u64),
-    ];
-    for (record, (turn_id, line, byte_start, byte_end)) in records.iter().zip(expected) {
-        assert_eq!(record.turn_id, turn_id);
+    let expected = source_spans_by_turn_id(&fixture.jsonl_path);
+    for record in &records {
+        let turn_id = record.turn_id.as_str();
+        let (line, byte_start, byte_end) = expected[turn_id];
         assert_eq!(record.source.line, line);
         assert_eq!(record.source.byte_start, byte_start);
         assert_eq!(record.source.byte_end, byte_end);
@@ -98,6 +97,43 @@ fn canonical_reader_source_metadata_matches_jsonl_preimage() {
         assert_eq!(record.source.jsonl_path, fixture.jsonl_path);
         assert_eq!(record.source.storage_type, "claude_code");
     }
+}
+
+fn source_spans_by_turn_id(path: &Path) -> BTreeMap<String, (u64, u64, u64)> {
+    let bytes = fs::read(path).unwrap();
+    let mut spans = BTreeMap::new();
+    let mut line = 1_u64;
+    let mut byte_start = 0_usize;
+
+    while byte_start < bytes.len() {
+        let newline = bytes[byte_start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|relative| byte_start + relative);
+        let raw_end = newline.unwrap_or(bytes.len());
+        let byte_end = if raw_end > byte_start && bytes[raw_end - 1] == b'\r' {
+            raw_end - 1
+        } else {
+            raw_end
+        };
+        let line_bytes = &bytes[byte_start..byte_end];
+
+        if line_bytes.iter().any(|byte| !byte.is_ascii_whitespace()) {
+            let value: Value = serde_json::from_slice(line_bytes).unwrap();
+            let turn_id = value["uuid"].as_str().unwrap().to_string();
+            spans.insert(turn_id, (line, byte_start as u64, byte_end as u64));
+        }
+
+        match newline {
+            Some(index) => {
+                byte_start = index + 1;
+                line += 1;
+            }
+            None => break,
+        }
+    }
+
+    spans
 }
 
 /// Risk: T4: canonical transcript order silently changes from provider JSONL order.

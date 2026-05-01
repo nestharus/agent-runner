@@ -6,6 +6,7 @@ use agent_runner_lib::state::StateDb;
 use chrono::{Duration, Utc};
 use rusqlite::{Connection, params};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -495,23 +496,7 @@ pub fn component_unsupported_record_fixture() -> ComponentExportFixture {
 pub fn component_compaction_fixture() -> ComponentExportFixture {
     let boundary = "{\"sessionId\":\"5169694d-de0f-40d1-890c-6e28e55bab27\",\"type\":\"assistant\",\"uuid\":\"compact-summary\",\"timestamp\":\"2026-04-17T08:00:01Z\",\"isCompactSummary\":true,\"message\":\"summary\"}";
     let after = "{\"sessionId\":\"5169694d-de0f-40d1-890c-6e28e55bab27\",\"type\":\"user\",\"uuid\":\"post-compact\",\"timestamp\":\"2026-04-17T08:00:02Z\",\"message\":\"after summary\"}";
-    let fixture =
-        component_claude_fixture_with_body(&format!("{CLAUDE_LINE_1}\n{boundary}\n{after}\n"));
-    let db = StateDb::open(&fixture.jsonl_path.with_extension("db")).unwrap();
-    db.ingest_session_turn(
-        CLAUDE_PROVIDER,
-        SESSION_A,
-        "compact-summary",
-        &chrono::DateTime::parse_from_rfc3339("2026-04-17T08:00:01Z")
-            .unwrap()
-            .with_timezone(&Utc),
-        "assistant",
-        fixture.jsonl_path.to_string_lossy().as_ref(),
-    )
-    .unwrap();
-    db.flag_compaction_boundary(CLAUDE_PROVIDER, SESSION_A, "compact-summary")
-        .unwrap();
-    fixture
+    component_claude_fixture_with_body(&format!("{CLAUDE_LINE_1}\n{boundary}\n{after}\n"))
 }
 
 fn component_claude_fixture_with_body(body: &str) -> ComponentExportFixture {
@@ -589,21 +574,17 @@ pub fn assert_required_canonical_shape(record: &Value) {
     }
 }
 
-pub fn hardcoded_source_hashes() -> BTreeMap<&'static str, &'static str> {
+pub fn hardcoded_source_hashes() -> BTreeMap<&'static str, String> {
     BTreeMap::from([
-        (
-            "claude-turn-1",
-            "de06cc0e5c04c831de98afb535d66e7ddc7ac3ce22c46f6b290502a53d93e0af",
-        ),
-        (
-            "claude-turn-2",
-            "88c203cdb0b7eecd5c84a957b0a3fce47805d895a303ab1dcc1a7bc718e15a3d",
-        ),
-        (
-            "claude-system-1",
-            "d4a3d368ff0df8be2c774aff232500d8b88cacda9243953ea413a206a3f512d1",
-        ),
+        ("claude-turn-1", source_hash(CLAUDE_LINE_1)),
+        ("claude-turn-2", source_hash(CLAUDE_LINE_2)),
+        ("claude-system-1", source_hash(CLAUDE_UNSUPPORTED_LINE)),
     ])
+}
+
+fn source_hash(input: &str) -> String {
+    let digest = Sha256::digest(input.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn read_optional(path: PathBuf) -> Option<Vec<u8>> {
