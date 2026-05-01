@@ -115,6 +115,14 @@ gates at LOW with no oscillation. Phase 4 closed; Phase 5 next.
 
   and emits `research/06-locate-hookpoints.md` mapping every Rev 2 proposal action to file:line code sites with reuse, deletion, and conflict notes. Phase 5 has a human gate.
 
+### Round 3 — Phase 5 fired A4 invalidator; Rev 3 setup
+
+- Phase 5 hookpoint research at `research/06-locate-hookpoints.md` §I.WS1: real Codex rollout JSONL exists under `/home/nes/.codex/sessions/` (5,739 files). Sample of 25 files across Codex 0.46.0 and 0.58.0 found `session_meta.payload.cwd` present in every sampled file. `payload.workspace_root` absent (but `payload.cwd` is the field needed for derivation).
+- Pipeline rule (Phase 5): "if hookpoint research shows the approved problem map or assumption register is wrong, stop and return to research; resume at Phase 2.5 with an updated problem map before implementation continues."
+- A4 invalidator literal: "Phase 5 proves a stable Codex workspace-root field and risk gates require folding it into v1 rather than a follow-up." Phase 5 has provided the empirical evidence; risk gates will decide whether folding is required.
+- Workflow path: update problem map §7 A4 (light Phase 2.5 edit), dispatch Rev 3 proposal-revision agent to fold Codex `payload.cwd` derivation into v1, re-run all four risk gates against Rev 3.
+- Round 3 verdict pending Round 3 risk-gate completion.
+
 ## Role histories
 
 ### Writer
@@ -132,6 +140,12 @@ gates at LOW with no oscillation. Phase 4 closed; Phase 5 next.
 - Reason: closed all nine R1 findings at original severities; +20 net lines; no fresh design surface; A4 rephrased; Codex deferred fail-closed
 - Self-oscillation signal: none — Rev 2 changes block traces 1:1 to R1-F0N
 - Next role-local watch: Phase 5 hookpoint research carries WS1 (Codex schema sampling); R2-F01 (path-hash prose) is a candidate one-line tightening if a future pass touches §4 step 8
+
+#### Round 3 (pending)
+- Input to read: Phase 5 hookpoint research, Rev 2 proposal, problem map (with §7 A4 updated), initiative
+- Role decision: pending — emit Rev 3
+- Reason: Phase 5 fired A4 invalidator. Rev 3 must (a) drop the Codex deferral; (b) update §1.1 A4 to record Phase 5 finding and rephrase invalidator to "real Codex schema diverges from sampled `payload.cwd`"; (c) replace §4 step 8 Codex branch with `payload.cwd` derivation (parse JSONL, canonicalize, exists, UTF-8); (d) update §9.1 D7 row to cover Codex success path; (e) drop the Codex-deferral residual from §12; (f) add Rev 3 changes block.
+- Self-oscillation watch: Rev 3 must NOT introduce design surface beyond the WS1 closure. The R2-F01 path-hash prose ambiguity is fair game for tightening if §4 step 8 prose is being edited anyway.
 
 ### Reviewer
 
@@ -187,6 +201,7 @@ gates at LOW with no oscillation. Phase 4 closed; Phase 5 next.
 | --- | --- | --- | --- | --- | --- |
 | 1 | continue | audit HIGH; pipeline rule "any MEDIUM or HIGH report means revise the proposal and re-run all four" | Audit's two HIGH findings (B1, F4) are surgical and closable without redesign; supported-surface, scope, and shortcut all LOW | none | dispatch Rev 2 proposal-revision agent on `worktrees/06-locate`; re-run all four risk gates against Rev 2 |
 | 2 | apply | audit LOW, scope LOW, shortcut LOW, supported-surface LOW (termination none); pipeline rule "all four reports must return LOW" | All nine R1 findings closed at original severities; no R1 finding regressed; no oscillation classified; two R2 LOW nits accepted as residual (path-hash prose pinned by §9.1; resume-parity malformed-config inherited limitation) | none | advance to Phase 5 (hookpoint research) |
+| 3 | continue | Phase 5 sampled real Codex rollout JSONL and found `session_meta.payload.cwd` present in every sampled file (25 files, Codex 0.46.0 and 0.58.0); A4 invalidator's "Phase 5 proves a stable Codex workspace-root field" trigger fires; pipeline rule "if hookpoint research shows the approved problem map or assumption register is wrong, stop and return to research; resume at Phase 2.5 with an updated problem map before implementation continues" | Codex deferral was deliberately drafted as a Phase-5-conditional branch; Phase 5 evidence has now flipped that branch. Folding Codex into v1 via Rev 3 is the workflow's prescribed path, costs ~30 LOC of `payload.cwd` parsing in the proposal, and avoids a follow-up PR | none | update problem map §7 A4; dispatch Rev 3 proposal-revision agent on `worktrees/06-locate`; re-run all four risk gates against Rev 3 |
 
 ## User Q&A Inputs
 
@@ -206,4 +221,12 @@ Two rounds; full detail retained for both per `~/ai/conventions/audit-history.md
 
 ## Final state
 
-**Phase 4 closed.** Round 2 verdict: `apply`. All four gates LOW; no termination signal; no oscillation. Phase 5 (hookpoint research) is the next phase. Watch signals WS1, WS4, WS5 carry forward as Phase 5 / Phase 6 obligations.
+**Phase 5 fired A4 invalidator.** Real Codex rollout JSONL sampling found `session_meta.payload.cwd` present in every sampled file (`/home/nes/.codex/sessions/`, 25 files across Codex 0.46.0 and 0.58.0). A4's invalidator condition met. Per `~/ai/workflows/implementation-pipeline.md` Phase 5 rule "if hookpoint research shows the assumption register is wrong, return to research; resume at Phase 2.5", advancing to Round 3:
+
+- Problem map §7 A4 updated in place to record the empirical finding.
+- Round 3 will revise the proposal as Rev 3 to fold Codex `payload.cwd` derivation into v1 (drop the deferral).
+- Round 3 will re-run all four risk gates against Rev 3.
+
+WS1 closure: empirical evidence found; Rev 3 incorporates it.
+
+WS4, WS5: still active for Phase 6, unchanged by Phase 5 / Round 3.
