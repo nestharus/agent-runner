@@ -150,5 +150,3 @@
 8. It does not redesign `StateDb::open`, read-only DB access, or schema-probe feature flags.
 9. It does not change the current resume ambiguity, active-segment, or model/provider ownership semantics.
 10. It does not cover frontend/Tauri UI visibility, HomeView/StatusView, or design-system work.
-
-deliberately does NOT cover

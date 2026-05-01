@@ -43,7 +43,7 @@ pub struct ReleaseReceipt {
 }
 
 pub enum LockError {
-    Busy { token: String, expires_at: String },
+    Busy { expires_at: String },
     TokenInvalid,
     LockExpired,
     Operational { message: String },
@@ -95,7 +95,7 @@ Sentinel: `<lock_dir>/sentinel.lock`, created with `O_CREAT | O_RDWR` (idempoten
 ### Pause success (stdout)
 
 ```json
-{"session_id":"...","provider_name":"...","token":"pause_...","expires_at":"...","lock_path":"/abs/.../session-uuid.lock"}
+{"session_id":"...","chain_id":"...","provider_name":"...","token":"pause_...","expires_at":"...","lock_path":"/abs/.../session-uuid.lock"}
 ```
 
 ### Resume success (stdout)
@@ -119,6 +119,7 @@ Sentinel: `<lock_dir>/sentinel.lock`, created with `O_CREAT | O_RDWR` (idempoten
 | 2 | Clap usage / invalid session-id |
 | 10 | session-not-found |
 | 11 | ambiguous-session |
+| 12 | model-resolution-failed |
 | 13 | session-busy (acquire while held) |
 | 16 | lock-token-invalid |
 | 17 | lock-expired |

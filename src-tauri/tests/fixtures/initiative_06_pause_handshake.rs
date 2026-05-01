@@ -189,12 +189,19 @@ prompt_mode = "arg"
             "version": 1,
             "session_id": session_id,
             "token_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-            "token": "pause_00000000000000000000000000000000",
             "created_at": created_at,
             "expires_at": expires_at,
             "owner_pid": 0,
         });
         write_private_json(&self.lock_path(session_id), &body);
+    }
+
+    pub fn read_lock_json(&self, session_id: &str) -> Value {
+        read_json_file(&self.lock_path(session_id))
+    }
+
+    pub fn read_release_marker_json(&self, session_id: &str) -> Value {
+        read_json_file(&self.release_marker_path(session_id))
     }
 }
 
@@ -324,9 +331,10 @@ pub fn assert_pause_token(value: &Value) {
     );
 }
 
-pub fn required_pause_fields() -> [&'static str; 5] {
+pub fn required_pause_fields() -> [&'static str; 6] {
     [
         "session_id",
+        "chain_id",
         "provider_name",
         "token",
         "expires_at",
@@ -355,4 +363,8 @@ fn write_private_json(path: &Path, value: &Value) {
     let mut perms = fs::metadata(path).unwrap().permissions();
     perms.set_mode(0o600);
     fs::set_permissions(path, perms).unwrap();
+}
+
+fn read_json_file(path: &Path) -> Value {
+    serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
 }

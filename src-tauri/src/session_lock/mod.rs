@@ -30,7 +30,7 @@ pub struct ReleaseReceipt {
 
 #[derive(Debug, Clone)]
 pub enum LockError {
-    Busy { token: String, expires_at: String },
+    Busy { expires_at: String },
     TokenInvalid,
     LockExpired,
     Operational { message: String },
@@ -48,8 +48,6 @@ struct StoredLease {
     session_id: String,
     #[serde(default)]
     token_hash: Option<String>,
-    #[serde(default)]
-    token: Option<String>,
     expires_at: String,
 }
 
@@ -58,7 +56,6 @@ struct StoredLeaseOut<'a> {
     version: u32,
     session_id: &'a str,
     provider_name: &'a str,
-    token: &'a str,
     token_hash: String,
     created_at: String,
     expires_at: String,
@@ -70,7 +67,6 @@ struct StoredReleaseMarker {
     version: u32,
     session_id: String,
     token_hash: Option<String>,
-    token: Option<String>,
     released_at: String,
 }
 
@@ -78,7 +74,6 @@ struct StoredReleaseMarker {
 struct StoredReleaseMarkerOut<'a> {
     version: u32,
     session_id: &'a str,
-    token: &'a str,
     token_hash: String,
     released_at: String,
 }
@@ -118,7 +113,6 @@ impl SessionLock {
                     let expires_at = parse_time(&existing.expires_at)?;
                     if expires_at > now {
                         return Err(LockError::Busy {
-                            token: existing.token.unwrap_or_default(),
                             expires_at: existing.expires_at,
                         });
                     }
@@ -138,7 +132,6 @@ impl SessionLock {
                 version: 1,
                 session_id,
                 provider_name,
-                token: &token,
                 token_hash: token_hash(&token),
                 created_at,
                 expires_at: expires_at.clone(),
@@ -183,7 +176,6 @@ impl SessionLock {
                     let marker = StoredReleaseMarkerOut {
                         version: 1,
                         session_id,
-                        token,
                         token_hash: token_hash(token),
                         released_at: now.clone(),
                     };
@@ -334,17 +326,11 @@ fn parse_time(value: &str) -> Result<DateTime<Utc>, LockError> {
 }
 
 fn stored_token_matches(lease: &StoredLease, token: &str) -> bool {
-    if let Some(hash) = lease.token_hash.as_deref() {
-        return hash == token_hash(token) || lease.token.as_deref() == Some(token);
-    }
-    lease.token.as_deref() == Some(token)
+    lease.token_hash.as_deref() == Some(token_hash(token).as_str())
 }
 
 fn marker_token_matches(marker: &StoredReleaseMarker, token: &str) -> bool {
-    if let Some(hash) = marker.token_hash.as_deref() {
-        return hash == token_hash(token) || marker.token.as_deref() == Some(token);
-    }
-    marker.token.as_deref() == Some(token)
+    marker.token_hash.as_deref() == Some(token_hash(token).as_str())
 }
 
 fn valid_token(token: &str) -> bool {

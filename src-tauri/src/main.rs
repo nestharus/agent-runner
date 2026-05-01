@@ -1261,9 +1261,17 @@ fn run_pause_handshake(session_id: &str, ttl_ms: Option<u64>) -> Result<i32, Str
         std::time::Duration::from_millis(ttl_ms),
     ) {
         Ok(lease) => {
+            let payload = serde_json::json!({
+                "session_id": lease.session_id,
+                "chain_id": resolved.chain_id,
+                "provider_name": lease.provider_name,
+                "token": lease.token,
+                "expires_at": lease.expires_at,
+                "lock_path": lease.lock_path,
+            });
             println!(
                 "{}",
-                serde_json::to_string(&lease)
+                serde_json::to_string(&payload)
                     .map_err(|err| format!("failed to encode pause receipt: {err}"))?
             );
             Ok(0)
@@ -1370,7 +1378,7 @@ fn emit_resume_resolution_error(err: agent_runner_lib::state::ResumeError) -> i3
 
 fn emit_lock_error(err: LockError) -> i32 {
     match err {
-        LockError::Busy { expires_at, .. } => emit_json_error(
+        LockError::Busy { expires_at } => emit_json_error(
             13,
             "session-busy",
             format!("session is paused until {expires_at}"),

@@ -23,8 +23,12 @@ fn pause_success_receipt_uses_resolved_active_session_and_provider() {
         assert!(json.get(field).is_some(), "missing {field} in {json}");
     }
     assert_eq!(json["session_id"], prepared.session_id);
+    assert_eq!(json["chain_id"], prepared.chain_id);
     assert_eq!(json["provider_name"], prepared.provider_name);
     assert_pause_token(&json);
+    let lock_json = prepared.fixture.read_lock_json(&prepared.session_id);
+    assert!(lock_json["token"].is_null(), "{lock_json}");
+    assert!(lock_json["token_hash"].as_str().is_some(), "{lock_json}");
     assert!(
         json["lock_path"]
             .as_str()
@@ -82,7 +86,7 @@ fn pause_resolver_error_mapping_covers_not_found_ambiguous_and_twelve() {
         "{unsupported_output:?}"
     );
     let json = parse_stderr_json(&unsupported_output);
-    assert!(json["error"]["code"].is_string(), "{json}");
+    assert_eq!(json["error"]["code"], "model-resolution-failed", "{json}");
 }
 
 /// Risk: T4 — concurrent harnesses may both receive valid leases.
@@ -238,7 +242,7 @@ fn concurrent_stale_pause_only_one_subprocess_replaces_expired_lock() {
 fn active_pause_blocks_second_pause_until_release_or_expiry() {
     let prepared = prepared_single_session();
 
-    assert_success(
+    let first = assert_success(
         &prepared
             .fixture
             .run_pause(&prepared.session_id, Some(60_000)),
@@ -249,6 +253,11 @@ fn active_pause_blocks_second_pause_until_release_or_expiry() {
 
     assert_eq!(second.status.code(), Some(13), "{second:?}");
     assert_json_error(&second, "session-busy");
+    let stderr = String::from_utf8(second.stderr.clone()).unwrap();
+    assert!(
+        !stderr.contains(first["token"].as_str().unwrap()),
+        "{stderr}"
+    );
 }
 
 /// Risk: T10 — valid release may fail to clear the lease or may not be idempotent.
@@ -271,6 +280,14 @@ fn pause_release_cycle_is_idempotent_and_allows_future_pause() {
     assert_eq!(release["session_id"], prepared.session_id);
     assert_eq!(release["token"], token);
     assert_eq!(release["already_released"], false);
+    let marker_json = prepared
+        .fixture
+        .read_release_marker_json(&prepared.session_id);
+    assert!(marker_json["token"].is_null(), "{marker_json}");
+    assert!(
+        marker_json["token_hash"].as_str().is_some(),
+        "{marker_json}"
+    );
 
     let replay = assert_success(&prepared.fixture.run_resume(&prepared.session_id, token));
     assert_eq!(replay["already_released"], true);
