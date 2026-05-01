@@ -1,110 +1,105 @@
-# 06-pause-handshake — Phase 4 Scope Risk Assessment (Rev 1)
+# 06-pause-handshake — Phase 4 Scope Risk Assessment (Rev 2)
 
 **Assessor:** scope reviewer
-**Verdict:** **LOW** — The proposal stays inside the harness ask
+**Verdict:** **LOW** — Rev 2 closes Round 1 audit findings R1-F01..R1-F04
+without expanding scope. The proposal still stays inside the harness ask
 (`04-session-pause-handshake.md`) and the Initiative 06 cross-feature
 constraints (`initiatives/06-session-override-contract.md:106-122`).
-Every §2–§6 design hunk traces back to a harness behavior, an
-initiative constraint, or a problem-map gap; every §7 anti-scope clause
-is consistent with what §2–§6 actually build. The only structural
-decomposition decision (D4b — defer sibling write-path observation to
-later PRs) is the exact decomposition the initiative artifact already
-sanctions in its PR-by-PR sequencing. No scope creep, no missing
-in-scope work, no useful further decomposition available.
+Every §2–§6 design hunk traces back to a harness behavior, an initiative
+constraint, or a problem-map gap; every §7 anti-scope clause holds
+across §2–§6. The only structural decomposition decision (D4b — defer
+sibling write-path observation to later PRs) is sanctioned by the
+initiative and is now disclosed *more* honestly via Rev 2's "advisory
+in v1" framing.
 
-## Coverage matrix
+## Round 1 closure check (audit only)
 
-| Source ask / constraint | Proposal section | Coverage |
-| --- | --- | --- |
-| Harness: `agents session pause-handshake <id> [--ttl-ms <ms>]` | §2 clap shape | complete |
-| Harness: `agents session resume-handshake <id> --token <T>` | §2 clap shape | complete |
-| Harness: pause stdout JSON with `session_id`, `provider_name`, `token`, `expires_at`, `lock_path` | §3.1 schema | complete — adds `chain_id` (justified: initiative §13 names chain id as part of resolver result) |
-| Harness: resume releases only matching token; idempotent same-token replay | §4 steps 12–16; §3.2 `already_released` | complete |
-| Harness: refuse wrong-token release | §4 step 15; §5.2 exit `16` | complete |
-| Harness: exit codes `0`/`1`/`2`/`10`/`11`/`13`/`16`/`17` | §5.1, §5.2 | complete |
-| Harness: side-effect contract — lock state only, no transcript mutation | §7 anti-scope, §8 side-effect contract | complete |
-| Harness: crash-safe with TTL cleanup | §4 D3/D5; §1.1 A5 | complete (lazy-on-acquire, no daemon) |
-| Harness AC: `agents resume`/`repl --resume` check lock before write | §13 row "Partial by design" via D4b | **deferred to sibling PRs** — see F1 |
-| Harness: tests cover concurrent pause/import/resume, lease expiry, crash recovery | §9 test track rows "Atomic acquire", "Busy lock", "Stale acquire", "Expired release", "Idempotent replay" | complete (sibling-write concurrency tests appropriately deferred with D4b) |
-| Initiative §106 shared error-code namespace | §5 uses only `0`/`1`/`2`/`10`/`11`/`13`/`16`/`17`; reserves `12`/`14`/`15` | complete |
-| Initiative §112 reuse `StateDb::resolve_resume`, no second ownership path | §4 step 2–3, §1.1 A1, §13 row | complete |
-| Initiative §115 deferred lock observation by import-replace, migration, repl/resume, balanced one-shot | §7 D4b; §13 "Partial by design" | complete (per-PR sequencing) |
-| Initiative §118 read-only `StateDb` open belongs to schema-probe | §12 inherits mutating open; does not introduce read-only here | complete (correct deferral) |
-| Initiative §121 anti-scope: no auto-resume / spawn / quota / config-edit / migrate-config | §7, §8 | complete |
-| Problem-map §3 risk: no token identity for releaser | §6 token + sha256 hash, single-print of raw token | complete |
-| Problem-map §3 risk: no `expires_at`/TTL field | §6 metadata `expires_at`; §4 D3 bounds | complete |
-| Problem-map §3 risk: no crash-recovery for lock state | §4 D5 lazy stale removal; §1.1 A5 | complete |
-| Problem-map §3 risk: no stable `lock_path` value | §3.1, §4 step 4 deterministic path | complete |
-| Problem-map §6 observability gaps: no JSON pause receipt; no structured stderr for `session-busy` / `lock-token-invalid` / `lock-expired` | §3.1, §3.2, §3.3 | complete |
-
-Every harness behavior maps to a §2–§6 hunk; every §2–§6 hunk traces
-back to either the harness ask, an initiative constraint, or a
-problem-map gap. No orphaned design surface.
-
-## Scope-direction analysis
-
-| Direction | Where | Magnitude | Justification |
+| ID | Round 1 ask | Rev 2 close | Closed |
 | --- | --- | --- | --- |
-| Add `chain_id` to receipts beyond harness's named fields | §3.1, §3.2 | tiny | Initiative §112 fixes ownership through `resolve_resume`, which returns `(chain_id, active_provider, active_session_id)`. Surfacing `chain_id` lets the harness disambiguate without a second resolver call. Consistent with `06-locate`'s `SessionMetadata` shape. |
-| TTL bounds (1s min / 30m max / 5m default) | §4 D3 | small | Guardrail not in harness ask; default value is the conservative middle of the harness's "lease + retry" envelope. Bounds prevent abuse without restricting the documented use case. |
-| Hex-32 token format with `pause_` prefix; reject ULID / UUIDv4 / UUIDv7 | §3.1 D2 | small | Harness example shows `pause_01HV...` (ULID-shaped), but the harness ask does not require ULID. D2 rejects ULID/UUIDv7 because their time bits cut entropy and rejects UUIDv4 because version/variant bits do the same. The `pause_` prefix is preserved. Defensible on security grounds; harness contract is not broken because it never specified an inner format. |
-| New `src-tauri/src/session_lock/` module with `acquire`/`release`/`observe` | §6 | bounded | Initiative §53 explicitly says this PR establishes the "session-scoped exclusive lease lock observed by import-replace, migration, resume/repl write paths." Providing the module + reusable types is the feature itself, not a separable concern. |
-| `observe()` exposed but unused in this PR | §6 | bounded | Sibling PRs (`run_repl`, `run_resume`, balanced one-shot, migration, import-replace) will consume `observe()`. Initiative §115 explicitly defers those wirings to later PRs. Exposing the read shape now keeps sibling PRs from introducing a parallel API. |
-| Idempotent-release marker shape deferred to Phase 5 | §6 final paragraph | clarification | Behavior is committed (same-token replay returns `0` with `already_released: true`); the storage shape (in-place marker vs sibling marker file) is left to Phase 5 with two enumerated options. Appropriate behavior-vs-mechanism split. |
+| R1-F01 | Idempotent-release marker storage was a Phase 5 deferral with two enumerated options. | Rev 2 §6 picks the sibling-file shape concretely (`session-<uuid>.released`, JSON with `version`, `token_hash`, `released_at`); §3.2 surfaces `release_marker_path` in the resume receipt; §4 step 11 removes a stale marker on acquire and step 17 writes one on release; §8 lists marker creation/removal as the only new file mutations; §12 deletes the "marker-shape deferral" residual. | yes |
+| R1-F02 | Writer-path observers were deferred without explicit harness-AC narrowing. | Rev 2 §1 names every deferred sibling path (`import-replace`, `migrate_chain_segment`, `run_repl`, `run_resume`, balanced one-shot), states the v1 lock is **advisory** until those land, and points at 06-import-replace specifically as the "first observer" PR. §12 D4b mirrors the same narrowing. §13 row 3 ("Partial by design") spells out the cross-PR completion path. | yes |
+| R1-F03 | `StateDb::open` mutation exception was unpinned. | Rev 2 §8 adds an explicit `StateDb::open_default()` clause that enumerates accepted side effects (parent dir creation, WAL enable, schema-ensure, chain backfill) and pins them to the same shape as 06-locate / 06-export §8. §12 keeps the read-only-open follow-up tied to 06-schema-probe. | yes |
+| R1-F04 | §9.1 lacked `assumption_link` / `residual_risk` columns. | Rev 2 §9.1 now has both columns on every row; assumption ids reference §1.1 (A1..A7), and each row carries a residual-risk note bounding what the test does *not* prove. | yes |
 
-**Net direction:** in-scope build with three small expansions (chain_id
-in receipt, TTL bounds, new lock module), all justified by either
-problem-map gaps or initiative cross-feature constraints. No expansion
-crosses into anti-scope territory.
+All four R1 findings are closed without producing follow-on scope creep
+(see "Fresh assessment" below).
 
-## Anti-scope §7 audit vs §2–§6
+## Fresh assessment of Rev 2 deltas
 
-I cross-checked each §7 clause against every clap arg, JSON field, and
-behavior in §2–§6 for leakage:
+| Rev 2 change | Direction | Magnitude | Scope verdict |
+| --- | --- | --- | --- |
+| Sibling marker file `session-<uuid>.released` with versioned JSON containing `token_hash` + `released_at` | adds one bounded file artifact and one new receipt field (`release_marker_path`) | small | In-scope. The harness ask requires same-token idempotent replay; Rev 1 already committed the behavior. Rev 2 only fixes the storage shape, which is mechanism, not behavior. The marker is data-only (no DB rows, no transcript, no provider IO) and lives next to the lockfile under the existing `locks/` dir. §8 bounds the file mutations precisely. |
+| `release_marker_path` field in `resume-handshake` stdout | new receipt field beyond harness's named fields | tiny | In-scope. Same justification class as `chain_id` (Rev 1 LOW): the field surfaces a path the implementer already commits to creating, and observability gap §6.1 of the problem map asked for a structured release receipt. Harness contract specifies required fields, not forbidden ones. |
+| §1 / §12 / §13 explicit narrowing of v1 harness acceptance surface to "advisory" | disclosure of existing D4b decomposition | none (clarification) | In-scope and **scope-positive**: Rev 2 makes the cross-PR completion path explicit instead of leaving R1 readers to infer it from D4b alone. The actual decomposition shape is unchanged — initiative §115 already names the deferred observers — Rev 2 just stops papering over it. Honest disclosure improves the harness consumer's mental model without enlarging the build. |
+| §8 explicit `StateDb::open_default()` side-effect clause aligned with 06-locate / 06-export | side-effect bound, written down | none (consistency) | In-scope. This is alignment with sibling proposals' contracts, not new behavior. Inheriting `StateDb::open`'s open-time effects is the same posture every Initiative 06 feature takes. |
+| §9.1 `assumption_link` + `residual_risk` columns | test-track metadata | none (process) | Documentation completeness, not scope. |
+| §9.1 added test row "Writer-path advisory scope" + "Marker token mismatch" + "Missing lock wrong token" | new test rows tied to Rev 2's concretized behaviors | bounded | In-scope. Each row maps to a §4/§6 behavior Rev 2 commits to (advisory v1 disclosure, marker-vs-token mismatch on `16`, missing-lock + missing-marker on `16`). No row tests anti-scope behavior. |
 
-| §7 clause | Check | Result |
+**Net direction:** Rev 2 narrows v1 acceptance (advisory framing),
+concretizes one previously deferred mechanism (marker shape), and pins
+one previously implicit side-effect contract (`StateDb::open`). All
+three moves *shrink* uncertainty without growing the build envelope.
+The Rev 1 expansions (chain_id receipt, TTL bounds, lock module,
+`observe()` API, hex-32 token) are unchanged in Rev 2 and still inside
+scope.
+
+## Anti-scope §7 audit vs Rev 2 §2–§6
+
+Re-checked each §7 clause against Rev 2's marker-file additions and
+advisory-narrowing language:
+
+| §7 clause | Rev 2 leakage check | Result |
 | --- | --- | --- |
-| No transcript content mutation or import-replace implementation | §6 `acquire`/`release`/`observe` touch only lockfile metadata; §8 enumerates allowed FS effects (lockfile + release marker only) | honored |
-| No provider spawn / signal / suspend / resume / kill | §4 has no executor invocation; §6 API has no process handle; §8 names "no provider commands" | honored |
-| No proof of safety for provider CLIs launched outside agent-runner | §4 makes no claim about external CLI processes; A3 explicitly notes invocation rows are not safe writer leases | honored |
-| No global runner lock | Lock path is `session-<session_id>.lock`, keyed off resolved active session — per-session scope | honored |
-| No DB lock table in v1 | D1 chose lockfile; §6 metadata is JSON-on-disk, not SQLite | honored |
-| No strict ambiguity query outside the shared resolver | §4 step 3 calls shared resolver only; ambiguity propagates through `Ambiguous` | honored |
-| No fallback to raw `session_turns` | §4 only consults resolver path | honored |
-| No GUI / frontend lock indicator | No Tauri command, no frontend file mentioned | honored |
-| No quota/auth refresh, provider selection, config edit, `migrate-config` coupling | §4 does not touch `quota`, `balancer`, `migrate_config`, or any provider-config writer; §8 explicit about not running quota scripts | honored |
+| No transcript content mutation or import-replace implementation | Marker file is JSON-on-disk under `locks/`; not a transcript, not a `session_turns` row, not import-replace | honored |
+| No provider spawn / signal / suspend / resume / kill | Marker write happens inside `release()`, not via any executor | honored |
+| No proof of safety for provider CLIs launched outside agent-runner | Advisory-v1 framing explicitly accepts this gap until sibling observers land | honored |
+| No global runner lock | Marker path is per-session, same scope as lockfile | honored |
+| No DB lock table in v1 | Marker is filesystem JSON, not SQLite | honored |
+| No strict ambiguity query outside the shared resolver | §4 unchanged in Rev 2 on this dimension | honored |
+| No fallback to raw `session_turns` | §4 unchanged | honored |
+| No GUI / frontend lock indicator | No frontend file added | honored |
+| No quota/auth refresh, provider selection, config edit, `migrate-config` coupling | §4/§8 do not invoke quota, balancer, or any provider-config writer | honored |
 
-All nine anti-scope clauses hold across §2–§6. The classic creep smell
-(an anti-scope item silently violated by a §4 step or a §6 method) is
-absent.
+D4b's wording in Rev 2 §7 is unchanged. The advisory-v1 framing in §1
+*describes* the same decomposition but does not weaken any anti-scope
+clause; the v1 lock primitive still does not silently spawn, drain, or
+write transcripts.
 
-## Decomposition assessment
+## Decomposition assessment (unchanged from Rev 1)
 
-Pause + resume must ship as one PR. Splitting them would either:
+Pause + resume must ship as one PR (Rev 1 analysis stands). D4b's
+sibling-observer deferral is the only meaningful split, and Rev 2 makes
+it more discoverable to readers. Rev 2 introduces no new merge surface
+that would invite further decomposition: the marker file is owned by
+the same `acquire`/`release` pair and cannot be split off without
+duplicating the lock metadata format.
 
-1. **Pause-only first** — leaves users with no release path except TTL
-   expiry. Anti-scope D5 explicitly disallows a background reaper, so
-   pause-without-resume strands lockfiles for the full TTL on every
-   acquisition. The lock primitive cannot be validated end-to-end by
-   tests without `release`. Dead intermediate state.
-2. **Resume-only first** — releases nothing because no acquirer exists.
-   The §9 "Correct release" / "Wrong token" / "Idempotent replay" tests
-   would all be unreachable. Worse than a no-op.
+## Coverage matrix delta vs Rev 1
 
-Splitting would also fork the `src-tauri/src/session_lock/` module API
-into two separate landings (acquire-only, then release added later),
-which contradicts the initiative §53 framing of this PR as
-"the lock primitive."
+| Source ask / constraint | Rev 2 status |
+| --- | --- |
+| Harness same-token idempotent replay | Now backed by a concrete sibling marker (`release_marker_path` in §3.2; §6 marker schema; §4 steps 13–17) — was abstract behavior in Rev 1. |
+| Initiative §112 reuse `StateDb::resolve_resume` | Unchanged; §4 step 2–3. |
+| Initiative §115 deferred observers | Now explicitly named in §1 with the v1-advisory consequence, plus the four-PR follow-up sequence in §12 and §13. |
+| Initiative §118 read-only `StateDb` open belongs to schema-probe | §8 explicitly inherits mutating open and pins follow-up to schema-probe. |
+| Problem-map §3.1 risk: no token identity | §6 token + sha256 hash, plus marker `token_hash` for replay attestation. |
+| Problem-map §6.2 gap: no JSON pause/release receipts | §3.2 release receipt now includes the marker path, closing the gap further. |
 
-D4b's deferral of sibling observers is the *only* meaningful
-decomposition this PR can offer, and the proposal already takes it.
-Each sibling PR (import-replace, migration, run_repl, run_resume,
-balanced one-shot) gets its own `observe()` wiring in its own
-proposal/risk/hookpoint cycle. That mirrors `06-locate`'s established
-pattern of "primitive lands first, observers wire in later PRs"
-(initiative artifact §76–§89 sequencing rationale).
+No previously covered row regresses; three rows tighten.
 
-No further useful split exists.
+## Cross-feature consistency (no regression)
+
+- Shared error namespace (`10`/`11`/`13`/`16`/`17`; `12`/`14`/`15`
+  reserved): aligned with initiative §107–§110. Rev 2 unchanged.
+- Ownership through `resolve_resume`: aligned with initiative §112.
+  Rev 2 unchanged.
+- Lock observation by sibling features: Rev 2 §13 row 3 still reads
+  "Partial by design" but now names each deferred observer PR;
+  aligned with initiative §115 ("once 06-pause-handshake lands").
+- Read-only `StateDb` open belongs to schema-probe: Rev 2 §8 pins this
+  explicitly; aligned with initiative §118.
+- No auto-resume / spawn / quota / config-edit / migrate-config:
+  aligned with initiative §121–§122; honored throughout §7/§8.
 
 ## Findings (severity ≥ MEDIUM)
 
@@ -112,156 +107,29 @@ None.
 
 ## Findings (LOW)
 
-### F1 — LOW — Harness AC bullet #6 satisfied only across multiple PRs
+- **F1 (carried) — Harness AC bullet #6 satisfied across multiple PRs.**
+  Rev 2 explicitly narrows v1 to "advisory" and names the four sibling
+  observer PRs (§1, §12, §13). The decomposition matches initiative
+  §115 ("once 06-pause-handshake lands"); Phase 5 hookpoint research
+  will pin the exact sibling hookpoints. No Phase 4 remediation.
+- **F2 (carried) — `observe()` API exposed but not consumed in this PR.**
+  §6 defines the read shape; no §4 flow calls it; consumer set is the
+  four sibling PRs named in §12. One shared read shape beats per-PR
+  copy-paste. Cosmetic nit unchanged: §6 itself does not name the
+  consumers (§1 and §12 do).
+- **F3 (carried) — TTL bounds (1s / 30m / 5m default) without harness
+  mandate.** Reasonable guardrails; out-of-range exits `2`.
+- **F4 (carried) — Token format diverges from harness's ULID-shaped
+  example.** `pause_<32 hex>` keeps prefix; ULID/UUID rejection
+  defensible on entropy grounds.
+- **F5 (closed by Rev 2) — Idempotent-release marker shape was
+  deferred to Phase 5.** §6 commits to sibling-file shape with explicit
+  JSON schema; §3.2 surfaces `release_marker_path`; §12 deletes the
+  "marker-shape deferral" residual. R1-F01 closure verified.
 
-§13 row 3 ("Lock observation by import-replace, migration, repl/resume,
-balanced one-shot once pause lands") is marked "Partial by design" with
-D4b. The harness's acceptance criteria includes:
+## Recommended revisions
 
-> `agents resume` / `repl --resume` check the lock before starting a
-> write path and fail closed or wait according to documented behavior.
-
-This PR alone does not satisfy that criterion. The criterion is
-satisfied only after sibling observer PRs land.
-
-This is correctly scoped per the initiative artifact: §53 names this
-PR as "establishes the lock primitive"; §115 defers observer wiring;
-§77–§89 sequencing rationale puts pause-handshake fourth and
-import-replace fifth, with the explicit understanding that observers
-adopt the API after it lands. The proposal honestly marks the §13 row
-"Partial by design" rather than claiming end-to-end blocking.
-
-Suggestion: none. The decomposition is consistent with the initiative
-contract. Phase 5 hookpoint research should record the exact sibling
-hookpoints that future PRs will edit, so the gap is narrowable into a
-concrete checklist; that is a Phase 5 concern, not a Phase 4 scope
-concern.
-
-### F2 — LOW — `observe()` API exposed but not consumed in this PR
-
-§6 lists `observe(&self, target) -> Result<Option<ExistingLockInfo>,
-SessionLockError>`. Neither §4's `pause-handshake` flow nor
-`resume-handshake` flow invokes `observe()`. It exists for future
-sibling features (§13 row 3, D4b).
-
-This is the smallest example of "API surface ahead of consumer." It is
-defensible because:
-
-- The initiative §115 names this PR as the home of the lock primitive
-  observed by named siblings.
-- Forcing each sibling PR to either copy-paste the observe path or
-  refactor §6 fragments back into a shared module is worse than
-  defining the read shape once.
-- `ExistingLockInfo` shape decisions (TTL semantics, release marker
-  semantics, error mapping) belong with the writer that owns the
-  metadata format.
-
-Suggestion: none required. Optionally, §6 could add one sentence
-naming the consumer set ("expected callers: future
-`agents session import-replace`, `migrate_chain_segment`, `run_repl`,
-`run_resume`, balanced one-shot") to make the deferred consumption
-explicit. Cosmetic.
-
-### F3 — LOW — TTL bounds (1s / 30m / 5m default) introduced without harness mandate
-
-§4 D3 sets minimum 1000 ms, maximum 1800000 ms, default 300000 ms.
-The harness ask shows `[--ttl-ms <ms>]` with no specified bounds and
-no default. Out-of-range values exit `2` (clap usage).
-
-Justification: 5 minutes is a sensible default for an interactive
-import-replace handshake; 30 minutes prevents abuse; 1 second
-prevents accidental near-zero leases that would race their own
-acquirer. These are reasonable guardrails for a lease primitive, and
-exit `2` on out-of-range is consistent with usage-class errors.
-
-Suggestion: none. The bounds are documented in §10 README work, so the
-constraint is discoverable.
-
-### F4 — LOW — Token format diverges from harness's ULID-shaped example
-
-Harness ask shows `pause_01HV...` (ULID-shaped). §3.1 D2 chooses
-random 128-bit hex (`pause_<32 hex>`) and rejects ULID/UUIDv4/UUIDv7
-on entropy grounds.
-
-The harness's example is illustrative, not normative — the harness
-ask never says "must be ULID." The `pause_` prefix is preserved, so
-prefix-matching consumers continue to work. CSPRNG hex avoids the
-time-structure entropy loss that ULID would impose on a secret.
-
-Suggestion: none. The choice is defensible and the §10 README work
-documents the regex.
-
-### F5 — LOW — Idempotent-release marker shape deferred to Phase 5
-
-§6 enumerates two options for release-marker storage (in-place
-overwrite vs sibling marker file under `locks/releases/`) and defers
-the choice to Phase 5. Behavior (`already_released: true` for
-same-token replay) is committed.
-
-This is appropriate behavior-vs-mechanism scope discipline. The
-behavior contract is in the proposal; the file-layout choice belongs
-with the implementer who can weigh atomicity tradeoffs against
-filesystem semantics. Two enumerated options is bounded — Phase 5 will
-not invent a third.
-
-Suggestion: none.
-
-## Cross-feature consistency
-
-Cross-checked each row of §13 against `initiatives/06-session-override-contract.md:106-122`:
-
-- Shared error namespace (`10`/`11`/`13`/`16`/`17` used; `12`/`14`/`15` reserved): aligned with initiative §107–§110.
-- Ownership through `resolve_resume`: aligned with initiative §112.
-- Lock observation by sibling features: marked "Partial by design"; aligned with initiative §115 ("once 06-pause-handshake lands").
-- Read-only `StateDb` open belongs to schema-probe: aligned with initiative §118; §12 explicitly inherits mutating open here.
-- No auto-resume / spawn / quota / config-edit / migrate-config: aligned with initiative §121–§122; honored throughout §7/§8.
-
-No initiative constraint is violated. No initiative constraint is
-silently extended.
-
-## Spot-checks verified
-
-- `~/.local/share/oulipoly-agent-runner/locks/` does not exist today
-  (problem-map §1.12 confirms README documents only `state.db` under
-  that directory). §3.1's `lock_path` is genuinely net-new state, not
-  re-using a path that another command already owns.
-- `StateDb::resolve_resume` is the existing single ownership path
-  (problem-map §1.22). §4 step 2–3 calls it directly when unstacked
-  and through locate's wrapper when stacked — neither introduces a
-  parallel resolver.
-- Initiative shared-error-code namespace
-  (`initiatives/06-session-override-contract.md:107-110`) reserves
-  `12 unsupported-storage`, `14 schema-incompatible`, `15
-  invalid-input or preimage mismatch`. §5.1 / §5.2 do not use any of
-  these codes — confirming sibling-feature codes are not silently
-  reused here.
-- Initiative §76–§89 sequencing places this PR fourth (after locate,
-  schema-probe, export) and before import-replace. §1 statement matches
-  this ordering.
-- Problem-map §3.1 risk ("no current way to block a second writer for
-  a resolved session") is addressed structurally by §6 + §8; the
-  cross-process concurrency test row in §9 ("Atomic acquire") covers
-  the actual blocking behavior.
-
-## Recommended revisions (if any)
-
-None that change the scope shape. F1–F5 are all LOW and are honestly
-documented by the proposal itself (D4b in §7, D2 in §3.1, D3 in §4,
-the two-option marker in §6, "Partial by design" in §13).
-
-Optional cosmetic nits the author can take or leave:
-
-1. **§6 — name the deferred consumer set for `observe()`.** One
-   sentence ("expected callers: future `agents session import-replace`,
-   `migrate_chain_segment`, `run_repl`, `run_resume`, balanced
-   one-shot") would make F2's deferred-consumption justification
-   self-evident in the proposal text. Cosmetic.
-
-2. **§13 — surface F1 explicitly.** §13 row 3 says "Partial by design"
-   and points to D4b. A second sentence noting "the harness AC bullet
-   `agents resume`/`repl --resume` check is satisfied across this PR
-   plus the four sibling observer PRs named in the initiative
-   artifact" makes the cross-PR completion path explicit. Cosmetic.
-
-Neither nit is a scope concern. The proposal as written is correctly
-scoped.
+None that change scope. Round 1 findings are closed; the proposal as
+written is correctly scoped. Optional cosmetic nit (carried from Rev 1):
+§6 could name the deferred consumer set inline next to the API
+definition, mirroring §1/§12. Not a scope concern.

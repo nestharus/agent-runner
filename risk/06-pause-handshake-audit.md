@@ -1,50 +1,138 @@
-# 06-pause-handshake - Phase 4 Audit Risk Report (Rev 1)
+# 06-pause-handshake - Phase 4 Audit Risk Report (Round 2 / Rev 2)
 
 **Verdict: HIGH**
 
-Rev 1 has the major proposal sections expected by Phase 3: scope, assumptions, command shape, JSON receipts, exit codes, side effects, tests, README work, supported-surface notes, residuals, and cross-feature compliance. The audit gate does not clear because two required contract surfaces remain unresolved before implementation: idempotent release marker storage is explicitly left for Phase 5, and lock observation by current/future writer paths is deferred despite being part of the harness and Initiative 06 acceptance surface. There is also a side-effect/test-intent mismatch around `StateDb::open` write behavior.
+Rev 2 closes the four Round 1 audit findings on their stated surfaces: the
+idempotent release marker shape is selected, writer-path observation is now an
+explicit accepted cross-PR residual, `StateDb::open` side effects are pinned as
+accepted open-time behavior, and the test matrix carries assumption/residual
+columns.
 
-## Findings
+The audit gate still does not clear. Fresh review of the now-concrete lockfile
+algorithm found a high-risk synchronization flaw: Rev 2 uses `flock` on the same
+path that acquire/release may remove or recreate. On POSIX systems, `flock`
+coordinates open file descriptions/inodes, not a pathname. Removing and
+recreating the path can split the critical section and permit concurrent lease
+granting under realistic stale-acquire interleavings.
 
-### F1 - HIGH - Idempotent release marker storage is still a design fork
+## Round 1 Closure Check
 
-Rev 1 requires same-token replay to succeed (`already_released: true`) and says a missing lockfile may be accepted only when a release marker proves the same token (`proposals/06-pause-handshake.md:158`, `proposals/06-pause-handshake.md:210`). But the storage contract for that proof is not selected: §6 says "Phase 5 chooses one shape" between replacing the lockfile and writing a sibling marker (`proposals/06-pause-handshake.md:294`). §12 repeats that "release idempotency needs a marker policy selected in Phase 5" (`proposals/06-pause-handshake.md:429`).
+### R1-F01 - Closed
 
-This is not hookpoint research; it is part of the public behavior contract for `resume-handshake` exit `0` vs `16`, lock cleanup, permissions, stale-state handling, rollback, and tests. Phase 4 audit is specifically responsible for contracts, migrations, test intent, fixture source, and residual artifacts (`~/ai/workflows/implementation-pipeline.md:105`). Phase 5 may map the chosen design to files, but it should not choose between two externally visible storage semantics.
+Rev 1 left idempotent release marker storage as a Phase 5 design fork. Rev 2
+selects a sibling marker file, includes it in success JSON, computes its path
+beside the lockfile, defines its JSON body, and records that there is no future
+marker-shape deferral (`proposals/06-pause-handshake.md:173`,
+`proposals/06-pause-handshake.md:206`, `proposals/06-pause-handshake.md:325`,
+`proposals/06-pause-handshake.md:528`).
 
-Impact: Phase 6 cannot write a stable contract or first tests for idempotent replay, missing-lock wrong-token behavior, marker permissions, cleanup, or rollback without making a design decision the proposal left open.
+This is sufficient for Phase 6 contract/test authors to know where same-token
+release evidence lives and how missing-lock replay maps to `0` vs `16`.
 
-### F2 - HIGH - Writer-path lock observation is deferred outside the feature despite being required acceptance surface
+### R1-F02 - Closed As Accepted Residual
 
-The harness behavior spec says `pause-handshake` acquires a lock that blocks new agent-runner writes/imports/migrations, waits for active agent-runner-owned writes to drain, and returns `session-busy` if an active provider process cannot be paused safely (`04-session-pause-handshake.md:16`). Its acceptance criteria explicitly require preventing concurrent `import-replace` or migration and requiring `agents resume` / `repl --resume` to check the lock before write paths (`04-session-pause-handshake.md:56`, `04-session-pause-handshake.md:61`).
+Rev 1 deferred writer-path observation without an explicit acceptance decision.
+Rev 2 now states that v1 ships the primitive only, sibling writers are deferred
+to their own PRs, and the harness acceptance surface is narrowed until those
+observers land (`proposals/06-pause-handshake.md:22`,
+`proposals/06-pause-handshake.md:61`, `proposals/06-pause-handshake.md:382`,
+`proposals/06-pause-handshake.md:518`, `proposals/06-pause-handshake.md:546`).
 
-Initiative 06 carries the same constraint into every proposal: `import-replace`, `migrate_chain_segment`, `run_repl`, `run_resume`, and balanced one-shot must observe pause-handshake locks once 06-pause-handshake lands (`06-session-override-contract.md:114`). The problem map identifies these as current supported/user-reachable write paths and adjacent blast radius (`research/06-pause-handshake-problem-map.md:34`, `research/06-pause-handshake-problem-map.md:92`).
+This conflicts with the initiative's original "observe once pause lands" wording
+(`/home/nes/projects/agent-runner/worktrees/06-locate/initiatives/06-session-override-contract.md:114`),
+but the proposal now makes the narrowing explicit enough for this audit surface.
+The risk remains a named residual rather than an unresolved contract fork.
 
-Rev 1 instead makes "no sibling writer-path observation in this PR" explicit (`proposals/06-pause-handshake.md:41`), records A6 as an assumption that sibling paths observe in later PRs (`proposals/06-pause-handshake.md:53`), and marks the cross-feature constraint only "Partial by design" (`proposals/06-pause-handshake.md:442`). The test-intent track correspondingly covers only lock-vs-lock concurrency and never covers pause/import, pause/migration, pause/resume, pause/repl, or observer fail-closed behavior (`proposals/06-pause-handshake.md:352`).
+### R1-F03 - Closed With Explicit Side-Effect Residual
 
-Impact: the proposed feature can pass its tests while failing the harness-level purpose of being the common guard before transcript override. If Rev 2 keeps observer wiring out of scope, it needs an explicit Phase-level decision that narrows the harness acceptance surface and records the accepted residual; otherwise the audit contract is incomplete.
+Rev 1 allowed an unbounded `StateDb::open` exception while claiming lock-state
+only behavior. Rev 2 names the exact inherited open-time effects accepted for
+v1: parent directory creation, WAL enable, schema ensure, and chain backfill
+(`proposals/06-pause-handshake.md:416`). It also records read-only open as a
+follow-up after schema-probe is mergeable (`proposals/06-pause-handshake.md:425`,
+`proposals/06-pause-handshake.md:531`).
 
-### F3 - MEDIUM - The side-effect contract permits unbounded existing `StateDb::open` mutations while claiming lock-state-only behavior
+The §8 wording is still easy to misread because it says "No DDL, no row
+mutation" immediately after accepting schema ensure and chain backfill
+(`proposals/06-pause-handshake.md:418`). The §12 wording clarifies the intended
+meaning as "no command-added DDL or row mutation beyond open-time effects"
+(`proposals/06-pause-handshake.md:533`). Treat as closed, not reopened.
 
-The harness says side effects are lock state only (`04-session-pause-handshake.md:52`). The problem map records that `StateDb::open_default` calls mutating `open`, and `StateDb::open` creates directories, ensures schemas, and runs chain backfill before returning (`research/06-pause-handshake-problem-map.md:20`, `research/06-pause-handshake-problem-map.md:21`). It also records open-path backfill as a session-state write not tied to a named user operation (`research/06-pause-handshake-problem-map.md:70`).
+### R1-F04 - Closed
 
-Rev 1 says pause may open default state/config (`proposals/06-pause-handshake.md:330`) and that neither command may modify `session_turns` or chain/segment ownership (`proposals/06-pause-handshake.md:339`), but then carves out "unavoidable existing `StateDb::open` behavior" (`proposals/06-pause-handshake.md:345`). The side-effect test also allows "unchanged except existing open effects" (`proposals/06-pause-handshake.md:372`). That exception makes the side-effect contract passable even if the command mutates session tables before touching lock state.
+Rev 2 adds `assumption_link` and `residual_risk` columns to the test-intent
+matrix and fills them for each test group (`proposals/06-pause-handshake.md:436`).
+Rows now explicitly connect resolver, TTL, token, permissions, advisory scope,
+and README verification to assumptions A1-A7 and named unverified residuals.
 
-Impact: the proposal does not pin whether pause-handshake must consume the preceding schema-probe/read-only open surface or tolerate DB backfill side effects. This weakens the lock-state-only contract and makes the side-effect test insufficiently strict.
+## Fresh Rev 2 Findings
 
-### F4 - MEDIUM - Test-intent track is missing required assumption links and residuals per test group
+### R2-F01 - HIGH - Removable flock target can split the lock critical section
 
-Phase 3 requires each expected test or test group to name the change or verification risk, intended behavior, selected level, fixture source/application point, assumption-register link when applicable, expected observable signal, and residual risk the test will not verify (`~/ai/workflows/implementation-pipeline.md:96`). Rev 1's test-intent table has risk, behavior, level, fixture/application point, and signal columns only (`proposals/06-pause-handshake.md:354`).
+Rev 2 makes the durable lease a file-backed lock at
+`locks/session-<session_id>.lock` and says `flock` is held around
+acquire/release/read critical sections (`proposals/06-pause-handshake.md:216`).
+It then specifies that `pause-handshake` opens or creates that lockfile and
+takes an exclusive `flock` (`proposals/06-pause-handshake.md:222`).
 
-Several rows depend directly on assumptions but do not identify them: resolver pass-through depends on A1/A2, TTL and stale acquisition depend on A5, permissions and lockfile behavior depend on A7, and the side-effect row depends on the unresolved read-only/open behavior above. The table also does not state residuals per group, even though §12 names residuals such as no active provider drain, sibling observer deferral, Windows semantics, and balanced one-shot post-hoc session discovery (`proposals/06-pause-handshake.md:421`).
+The same algorithm also permits stale metadata to be "remove/truncate[d] under
+the same flock" before acquiring (`proposals/06-pause-handshake.md:225`) and
+requires matching release to write the sibling marker and remove the lockfile
+while still in the critical section (`proposals/06-pause-handshake.md:248`).
+The side-effect contract repeats that acquire/release may create, replace, or
+remove `locks/session-<session_id>.lock` (`proposals/06-pause-handshake.md:392`,
+`proposals/06-pause-handshake.md:400`).
 
-Impact: Phase 6b would have to infer which assumptions each test validates and which named risks remain unverified. That undermines the Step 6b output index and any later `risk/NN-test-residuals.md` decision.
+This is not a stable mutual-exclusion primitive. POSIX advisory locks protect
+the opened file/inode. If process A holds a flock on the old lockfile and
+unlinks it, process B can create the same pathname as a new file and take a
+separate flock on the new inode. Both processes can believe they are inside the
+exclusive section.
+
+The highest-risk interleaving is stale acquire. A locks an expired file and
+unlinks it as allowed by §4. B then creates and locks a new file at the same
+path, sees no metadata, writes a fresh lease, and returns exit `0`. A can still
+complete its own "acquire" path against the old fd or a replacement write path
+and return a different token. That violates the core test-intent claim that two
+concurrent pause calls grant one lease and one `13 session-busy`
+(`proposals/06-pause-handshake.md:442`).
+
+Release/acquire races are also underspecified. A matching release removes the
+lockfile while holding a flock on the old inode. A fresh pause can create and
+lock a new inode before the release critical section has completed marker fsync
+and directory fsync work. The proposal relies on marker deletion by fresh
+acquire for idempotency isolation (`proposals/06-pause-handshake.md:366`), but
+does not define a stable guard that serializes marker and metadata updates.
+
+Impact: Phase 6 could implement exactly the proposed file-backed design and pass
+ordinary concurrent-process tests while retaining a split-brain race under
+stale cleanup or release/acquire timing. The external harness depends on the
+lease token as the exclusive write guard; a double `0` acquire collapses the
+feature's safety case even under the narrowed advisory v1 surface.
+
+Required Rev 3 closure: define a synchronization object that is never unlinked
+or replaced while used for `flock`, or choose an atomic-create/rename protocol
+that does not depend on flocking a removable pathname. Examples that would close
+the contract gap: a separate per-session guard file such as
+`session-<uuid>.guard` that is created once and never removed, with `.lock` and
+`.released` metadata mutated only while holding the guard; or a lock-directory
+protocol using atomic `mkdir` plus explicit stale-owner replacement rules. The
+proposal must then update §4, §6, §8, and the atomic-acquire/release tests to
+cover stale-acquire and release/acquire interleavings against that stable guard.
 
 ## Checklist Notes
 
-- Present: proposal artifact, approved problem-map input, assumption register, supported-surface track, net-value statement, command schemas, exit namespace, JSON receipts, side-effect section, README work, residual section.
-- Not audit-clear: unresolved release-marker design; deferred writer-path observation; side-effect exception around mutable DB open; test-intent table missing assumption links/residual-risk mapping.
+- Present: proposal artifact, assumption register, net-value statement,
+  command schemas, JSON receipts, exit namespace, lock/marker paths,
+  side-effect section, README work, supported-surface track, residuals, and
+  cross-feature compliance table.
+- Closed from Round 1: R1-F01, R1-F02, R1-F03, R1-F04.
+- No regression found on the Round 1 closure surfaces.
+- Not audit-clear: Rev 2's lockfile/flock contract does not guarantee single
+  lease ownership when the flock target can be removed or recreated.
 
-## Required Rev 2 Closure
+## Required Rev 3 Closure
 
-Rev 2 should close F1-F4 in the proposal itself, not by relying on Phase 5 or implementation discretion. Because the verdict is HIGH, Phase 4 must be rerun across all four risk reports after substantive revision.
+Rev 3 should keep the Round 1 closures intact and replace the removable-lockfile
+critical section with a stable synchronization contract. Because R2-F01 is HIGH,
+Phase 4 audit must rerun after the proposal revision.
