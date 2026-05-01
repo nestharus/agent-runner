@@ -175,17 +175,17 @@ pub fn parse_codex_rollout_jsonl(
             continue;
         };
         match native_type {
-            "session_meta" => {
+            "session_meta"
                 if line
                     .value
                     .get("payload")
                     .and_then(|payload| payload.get("id"))
                     .and_then(Value::as_str)
-                    == Some(metadata.session_id.as_str())
-                {
-                    saw_matching_session_meta = true;
-                }
+                    == Some(metadata.session_id.as_str()) =>
+            {
+                saw_matching_session_meta = true;
             }
+            "session_meta" => {}
             "response_item" => {
                 let Some(payload) = line.value.get("payload") else {
                     continue;
@@ -371,9 +371,9 @@ fn extract_content_chunks(value: Option<&Value>) -> Vec<ContentChunk> {
         Some(Value::String(text)) => vec![text_chunk(text)],
         Some(Value::Array(items)) => items
             .iter()
-            .filter_map(|item| {
+            .map(|item| {
                 if let Some(text) = item.as_str() {
-                    return Some(text_chunk(text));
+                    return text_chunk(text);
                 }
                 let item_type = item
                     .get("type")
@@ -385,10 +385,10 @@ fn extract_content_chunks(value: Option<&Value>) -> Vec<ContentChunk> {
                     .or_else(|| item.get("content"))
                     .and_then(Value::as_str)
                     .map(str::to_string);
-                Some(ContentChunk {
+                ContentChunk {
                     r#type: canonical_chunk_type(&item_type).to_string(),
                     text,
-                })
+                }
             })
             .collect(),
         Some(Value::Object(_)) => value

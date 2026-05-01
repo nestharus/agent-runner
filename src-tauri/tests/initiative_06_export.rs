@@ -39,7 +39,7 @@ fn export_claude_session_emits_canonical_jsonl_records() {
             prepared.jsonl_path.to_string_lossy().as_ref()
         );
         assert_eq!(record["unsupported_record"], false);
-        assert!(record["content"].as_array().unwrap().len() >= 1);
+        assert!(!record["content"].as_array().unwrap().is_empty());
     }
     assert_eq!(records[0]["turn_id"], "claude-turn-1");
     assert_eq!(records[0]["role"], "user");
