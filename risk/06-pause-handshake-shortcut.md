@@ -70,8 +70,8 @@ simultaneously.
 
 | Step | Process | Effect |
 | --- | --- | --- |
-| 1 | A | Opens `sentinel.lock` `O_CREAT|O_RDWR` → fd_A (inode `S`); `flock(fd_A, LOCK_EX)` succeeds. |
-| 2 | B | Opens `sentinel.lock` `O_CREAT|O_RDWR` → fd_B (inode `S`); `flock(fd_B, LOCK_EX)` **blocks** because A holds the lock on the same inode (POSIX/Linux flock is per-inode across fds). |
+| 1 | A | Opens `sentinel.lock` `O_CREAT\|O_RDWR` → fd_A (inode `S`); `flock(fd_A, LOCK_EX)` succeeds. |
+| 2 | B | Opens `sentinel.lock` `O_CREAT\|O_RDWR` → fd_B (inode `S`); `flock(fd_B, LOCK_EX)` **blocks** because A holds the lock on the same inode (POSIX/Linux flock is per-inode across fds). |
 | 3 | A | Opens session lock read-only, reads `L0`, sees `expires_at <= now`. Stale path. |
 | 4 | A | Writes lease `L_A` (token `T_A`) to `<session>.lock.acquire-<pidA>-<r>.tmp`, fsyncs, `rename(...tmp, <session>.lock)`. Path entry → `I_A`. |
 | 5 | A | Removes any old `.released` marker, fsyncs dir, closes fd_A (releasing flock). Returns `0` with `T_A`. |

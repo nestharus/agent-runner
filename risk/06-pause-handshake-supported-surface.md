@@ -36,8 +36,8 @@ Under Rev 4 (`proposals/06-pause-handshake.md:259-289`):
    `session-<uuid>.{lock,released}` happen while the sentinel flock is
    held (`proposals/06-pause-handshake.md:260-289`,
    `proposals/06-pause-handshake.md:296-319`).
-3. Inside the critical section, lease installation is `tmpfile + fsync
-   + rename` onto the same directory
+3. Inside the critical section, lease installation is `tmpfile + fsync + rename`
+   onto the same directory
    (`proposals/06-pause-handshake.md:271-282`).
 
 Replay of the R3-F01 interleaving:
