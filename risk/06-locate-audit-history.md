@@ -359,3 +359,93 @@ Next phase: Phase 7 (CodeRabbit loop).
     `research/06-locate-contract.md` §3 Step 3 requires resume-parity
     `unwrap_or_default` semantics, and WS5 records this as an accepted residual.
 - Determination: continue after amend and tests.
+
+## Phase 8 README Fix-Pass CodeRabbit Loop
+
+### Pass 1 — CodeRabbit review against `main`
+
+- Raw pass log: `.tmp/phase8-fix/coderabbit-pass1.md`
+- Findings: 10 total; 2 README findings applied; 8 skipped.
+- Applied:
+  - **`R6-F01`** — real README contract finding. CodeRabbit found that the
+    new `session locate` success schema still advertised degraded
+    `transcript_state` values (`unresolved`, `no_locator`, `missing`) even
+    though locate succeeds only with a canonical file-backed transcript. The
+    README now documents `transcript_state` as `available` on success.
+  - **`R6-F02`** — real README consistency finding. CodeRabbit found that the
+    SQL/debugging paragraph switched from the README's
+    `oulipoly-agent-runner` executable to `agents session locate`. The
+    paragraph now uses `oulipoly-agent-runner session locate` consistently.
+- Skipped:
+  - **`R6-F03`** — skipped test-only SQL identifier hardening nitpick for
+    `table_count`; all callers are hardcoded fixture internals.
+  - **`R6-F04`** — skipped duplicate-test nitpick; the no-locator tests remain
+    intentionally separate because they map distinct risk IDs.
+  - **`R6-F05`** — skipped markdown spacing nitpick in
+    `research/06-locate-contract.md`.
+  - **`R6-F06`** — skipped contract conflict. CodeRabbit suggested skipping
+    malformed non-`session_meta` Codex JSONL lines, but Step 6a explicitly
+    treats malformed JSON as `unsupported-storage`.
+  - **`R6-F07`** — skipped recursion-depth churn for the Claude path-hash
+    decoder, same family as prior Phase 7 defensive-churn finding.
+  - **`R6-F08`** — skipped markdown spacing nitpick in
+    `risk/06-locate-shortcut.md`.
+  - **`R6-F09`** — skipped internal timing-documentation suggestion in
+    `risk/06-locate-process-tree-audit-r2.md`; unrelated to the README
+    fix-pass.
+  - **`R6-F10`** — skipped markdown spacing nitpick in this audit history.
+- Determination: continue after README amend and tests.
+
+### Pass 2 — CodeRabbit review against `main`
+
+- Raw pass log: `.tmp/phase8-fix/coderabbit-pass2.md`
+- Findings: 7 total; 0 applied in this pass.
+- Operator note: the README patch from pass 1 had not been staged before the
+  first amend, so CodeRabbit correctly repeated the README schema finding
+  against the committed tree. The patch was then staged and amended into
+  `217a4f5`.
+- Skipped:
+  - **`R7-F01`** — skipped expected-process session-ID consistency finding as
+    unrelated to the README fix-pass.
+  - **`R7-F02`** — skipped markdown spacing nitpick in
+    `research/06-locate-contract.md`.
+  - **`R7-F03`** — skipped markdown spacing nitpick in
+    `risk/06-locate-shortcut.md`.
+  - **`R7-F04`** — skipped test-only `table_count` hardening nitpick, same
+    family as `R6-F03`.
+  - **`R7-F05`** — skipped markdown spacing nitpick in this audit history.
+  - **`R7-F06`** — repeated README schema finding; closed by staging and
+    amending the already-prepared README fix.
+  - **`R7-F07`** — skipped malformed provider/session config operational-error
+    suggestion; it conflicts with the approved resume-parity
+    `unwrap_or_default` contract and active WS5 residual.
+- Verification after corrected amend: `cargo test --manifest-path
+  src-tauri/Cargo.toml` PASS.
+- Determination: continue to verify the corrected commit.
+
+### Pass 3 — CodeRabbit review against `main`
+
+- Raw pass log: `.tmp/phase8-fix/coderabbit-pass3.md`
+- Findings: 6 total; 0 applied; 6 skipped.
+- Skipped:
+  - **`R8-F01`** — skipped markdown spacing nitpick in
+    `risk/06-locate-shortcut.md`, same family as `R6-F08`/`R7-F03`.
+  - **`R8-F02`** — skipped test-only `table_count` hardening nitpick, same
+    family as `R6-F03`/`R7-F04`.
+  - **`R8-F03`** — skipped markdown spacing nitpick in
+    `research/06-locate-contract.md`, same family as `R6-F05`/`R7-F02`.
+  - **`R8-F04`** — skipped optional recursion-depth comment for the Claude
+    path-hash decoder, same family as `R6-F07`.
+  - **`R8-F05`** — skipped unrelated health-monitoring Tauri-command
+    suggestion; this belongs to future home-screen work, not 06-locate.
+  - **`R8-F06`** — skipped malformed provider/session config
+    operational-error suggestion, same WS5 contract conflict as `R7-F07`.
+- Determination: `CONVERGED:ALL_CHURN`. No README-specific findings remain.
+
+### Fix-pass summary
+
+- Summary artifact: `.tmp/phase8-fix/coderabbit-summary.md`
+- Final CodeRabbit-reviewed commit: `217a4f5`
+- Applied changes were folded into the README fix-pass commit with
+  `git commit --amend --no-edit`.
+- No `Co-Authored-By:` trailers were added.
