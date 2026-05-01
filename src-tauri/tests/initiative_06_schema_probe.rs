@@ -25,7 +25,7 @@ fn schema_probe_current_schema_db_emits_compatible_report() {
 
     let json = parse_stdout_json(&output);
     assert_eq!(json["binary"]["name"], "oulipoly-agent-runner");
-    assert!(json["binary"]["version"].as_str().unwrap().len() > 0);
+    assert!(!json["binary"]["version"].as_str().unwrap().is_empty());
     assert!(json["binary"]["commit"].as_str().is_some());
     assert_eq!(
         json["state_db"]["path"],
@@ -325,24 +325,24 @@ fn open_read_only_classifies_other_operational_error() {
 #[test]
 fn schema_probe_report_safe_for_import_replace_predicate_follows_inputs() {
     let safe = report_for_predicate(true, true, true, true, supported_storage_types());
-    assert_eq!(safe.safe_for_import_replace, true);
+    assert!(safe.safe_for_import_replace);
 
     let import_replace_disabled =
         report_for_predicate(true, true, false, true, supported_storage_types());
-    assert_eq!(import_replace_disabled.safe_for_import_replace, false);
+    assert!(!import_replace_disabled.safe_for_import_replace);
 
     let pause_disabled = report_for_predicate(true, true, true, false, supported_storage_types());
-    assert_eq!(pause_disabled.safe_for_import_replace, false);
+    assert!(!pause_disabled.safe_for_import_replace);
 
     let missing_db = report_for_predicate(false, true, true, true, supported_storage_types());
-    assert_eq!(missing_db.safe_for_import_replace, false);
+    assert!(!missing_db.safe_for_import_replace);
 
     let incompatible_db = report_for_predicate(true, false, true, true, supported_storage_types());
-    assert_eq!(incompatible_db.safe_for_import_replace, false);
+    assert!(!incompatible_db.safe_for_import_replace);
 
     let incomplete_storage_vocab =
         report_for_predicate(true, true, true, true, vec!["claude_code".to_string()]);
-    assert_eq!(incomplete_storage_vocab.safe_for_import_replace, false);
+    assert!(!incomplete_storage_vocab.safe_for_import_replace);
 }
 
 /// Risk: T8 — JSON shape stability: compatibility maps emit nested, not dotted, keys.
