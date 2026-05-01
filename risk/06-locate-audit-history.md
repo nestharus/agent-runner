@@ -115,13 +115,49 @@ gates at LOW with no oscillation. Phase 4 closed; Phase 5 next.
 
   and emits `research/06-locate-hookpoints.md` mapping every Rev 2 proposal action to file:line code sites with reuse, deletion, and conflict notes. Phase 5 has a human gate.
 
-### Round 3 — Phase 5 fired A4 invalidator; Rev 3 setup
+### Round 3 — `proposals/06-locate.md` (Rev 3) reviewed
 
-- Phase 5 hookpoint research at `research/06-locate-hookpoints.md` §I.WS1: real Codex rollout JSONL exists under `/home/nes/.codex/sessions/` (5,739 files). Sample of 25 files across Codex 0.46.0 and 0.58.0 found `session_meta.payload.cwd` present in every sampled file. `payload.workspace_root` absent (but `payload.cwd` is the field needed for derivation).
-- Pipeline rule (Phase 5): "if hookpoint research shows the approved problem map or assumption register is wrong, stop and return to research; resume at Phase 2.5 with an updated problem map before implementation continues."
-- A4 invalidator literal: "Phase 5 proves a stable Codex workspace-root field and risk gates require folding it into v1 rather than a follow-up." Phase 5 has provided the empirical evidence; risk gates will decide whether folding is required.
-- Workflow path: update problem map §7 A4 (light Phase 2.5 edit), dispatch Rev 3 proposal-revision agent to fold Codex `payload.cwd` derivation into v1, re-run all four risk gates against Rev 3.
-- Round 3 verdict pending Round 3 risk-gate completion.
+- Artifact under review: `proposals/06-locate.md` (Rev 3, 331 lines)
+- Round artifacts:
+  - `proposals/06-locate.md` (Rev 3)
+  - `risk/06-locate-audit.md` (Rev 3)
+  - `risk/06-locate-scope.md` (Rev 3)
+  - `risk/06-locate-shortcut.md` (Rev 3)
+  - `risk/06-locate-supported-surface.md` (Rev 3)
+  - `research/06-locate-hookpoints.md` (Phase 5; consumed)
+  - `research/06-locate-problem-map.md` (§7 A4 updated)
+- Report artifacts: none
+- Prior finding counters:
+  - closed: 11 (R1-F01..R1-F09 still standing; R2-F01 closed by Rev 3 prose tightening; R2-F02 unchanged inherited)
+  - intact: 1 (R2-F02 carried as accepted residual)
+  - weakened: 0
+  - regressed: 0
+  - not closed: 0
+- New findings:
+  - **`R3-F01`** — non-blocking (cosmetic); shortcut + supported-surface: §4 step 8 Codex branch does not specify behavior for multiple `session_meta` records in one rollout JSONL, nor the line-record-type discriminator (e.g., `type == "session_meta"`); Phase 5's 25-file sample saw one per file; Phase 6 implementer follows existing `scripts/codex-locate-transcript` line-walk precedent; `§9.1 D7 row pins behavior via tests; ancestor chain: none; oscillation: none.
+- Oscillation:
+  - same-label: 0
+  - same-family: 0
+  - fix-created: 0
+  - two-generation: 0
+  - named three-generation: 0
+- Decompose trigger: not fired; reason: R3-F01 is bounded by the existing locator-script precedent and §9.1 D7 test obligations; no MEDIUM+ surface.
+- Watch signals for Phase 6:
+  - **WS1** (closed for v1): A4 invalidator names "upstream Codex schema drift" as future trigger.
+  - **WS4** (closed by Rev 3): path-hash prose tightening resolves R2-F01.
+  - **WS5** (still active): resume parity malformed-config — Phase 6b README or future cross-feature pass.
+  - **WS6 (new)**: Phase 6 Codex parser follows `scripts/codex-locate-transcript` for `type == "session_meta"` discrimination; first-match for multi-record edge.
+- Verdict or determination: **apply** (advance to Phase 6).
+- Role outputs:
+  - audit (`gpt-high`): LOW; 0 findings; all R1/R2 closures standing; `risk/06-locate-audit.md` (Rev 3)
+  - scope (`claude-opus`): LOW; 0 findings; net direction = controlled expansion (one reduction action D, one clarification action E); no drift beyond actions A-F; `risk/06-locate-scope.md` (Rev 3)
+  - shortcut (`claude-opus`): LOW; 0 findings ≥MEDIUM; 1 sub-LOW R3-F01 (multi-record edge); `risk/06-locate-shortcut.md` (Rev 3)
+  - supported-surface (`claude-opus`): LOW; termination `none`; A1-A9 HOLD (A4 in Rev 3 form); §6 #8 retired for both providers; harness Codex coverage flips from partial-by-design to covered; `risk/06-locate-supported-surface.md` (Rev 3)
+- Next handoff: Phase 6 implementation.
+  - **6a Contract**: orchestrator-owned. Define schemas, signatures, fixture-application points, test-intent handoff. Consume proposal §6 SessionMetadata API + §3 JSON schema + §5 exit codes + §9.1 test-intent track.
+  - **6b Tests-first**: separate agent invocation. Test writer must NOT see Step 6c implementation. Encodes intended behavior from contract + proposal test-intent track + hookpoints.
+  - **6c Code**: separate agent invocation. Reads tests + contract + Step 6b output index. Makes tests pass while respecting approved design.
+  - Process-tree-auditor runs after 6c.
 
 ## Role histories
 
@@ -141,11 +177,12 @@ gates at LOW with no oscillation. Phase 4 closed; Phase 5 next.
 - Self-oscillation signal: none — Rev 2 changes block traces 1:1 to R1-F0N
 - Next role-local watch: Phase 5 hookpoint research carries WS1 (Codex schema sampling); R2-F01 (path-hash prose) is a candidate one-line tightening if a future pass touches §4 step 8
 
-#### Round 3 (pending)
-- Input to read: Phase 5 hookpoint research, Rev 2 proposal, problem map (with §7 A4 updated), initiative
-- Role decision: pending — emit Rev 3
-- Reason: Phase 5 fired A4 invalidator. Rev 3 must (a) drop the Codex deferral; (b) update §1.1 A4 to record Phase 5 finding and rephrase invalidator to "real Codex schema diverges from sampled `payload.cwd`"; (c) replace §4 step 8 Codex branch with `payload.cwd` derivation (parse JSONL, canonicalize, exists, UTF-8); (d) update §9.1 D7 row to cover Codex success path; (e) drop the Codex-deferral residual from §12; (f) add Rev 3 changes block.
-- Self-oscillation watch: Rev 3 must NOT introduce design surface beyond the WS1 closure. The R2-F01 path-hash prose ambiguity is fair game for tightening if §4 step 8 prose is being edited anyway.
+#### Round 3
+- Input read: Phase 5 hookpoint research, all Rev 2 risk reports, audit history Rounds 1/2, Rev 2 proposal, problem map (§7 A4 updated), initiative
+- Role decision: emitted Rev 3 (apply)
+- Reason: closed R2-F01 (path-hash prose); folded Codex `payload.cwd` derivation into v1 cleanly; A4 evidence cites Phase 5 sample; new invalidator forward-looking
+- Self-oscillation signal: none — Rev 3 changes block traces 1:1 to the six authorized actions A-F; no drift detected by scope gate
+- Next role-local watch: Phase 6 implementation. WS6 (multi-record `session_meta` edge) is a Phase 6 implementer note, not a writer concern
 
 ### Reviewer
 
@@ -195,6 +232,29 @@ gates at LOW with no oscillation. Phase 4 closed; Phase 5 next.
   - Self-oscillation signal: none
   - Next role-local watch: WS1 — Phase 5 hookpoint research carries the Codex schema-sampling obligation
 
+#### Round 3
+- audit (`gpt-high`):
+  - Input read: audit history Rounds 1/2 + Round 3 setup, Rev 2 audit report, Rev 3 proposal, problem map (with §7 A4 updated), Phase 5 hookpoint research, initiative, harness spec, `scripts/codex-locate-transcript`
+  - Role decision: LOW
+  - Reason: all R1/R2 closures intact; R2-F01 closed by Rev 3 prose tightening; A4 Rev 3 invalidator forward-looking and falsifiable; §4 step 8 Codex derivation spec complete (line-walk + canonicalize + exists + UTF-8 + fail-closed for missing/absent/invalid); spot-check of `scripts/codex-locate-transcript` confirms line-walk precedent; Rev 3 changes block truthful; no fresh R3 finding from audit
+  - Self-oscillation signal: none
+  - Next role-local watch: Phase 6 implementer treats existing `scripts/codex-locate-transcript` as the line-walk precedent for the new `payload.cwd` parser
+- scope (`claude-opus`):
+  - Role decision: LOW
+  - Reason: Rev 3 net direction = controlled expansion (action B) + reduction (action D) + clarification (action E); expansion is exactly what A4 invalidator authorized; drift audit found no edits outside the six authorized actions A-F; §13 cross-feature checklist unchanged; §7 anti-scope unchanged; §11.1 supported-surface track left untouched (correctly — its provider-agnostic framing already covered Codex)
+  - Self-oscillation signal: none — no R1/R2 nit regressed
+  - Next role-local watch: none for scope; Phase 6 implementation does not raise scope concerns
+- shortcut (`claude-opus`):
+  - Role decision: LOW
+  - Reason: Codex `payload.cwd` derivation is purpose-fit (two Codex versions sampled, falsifiable forward-looking invalidator, fail-closed wrapper); R2-F01 path-hash tightening complete (no §4 step 8 sentence still implies short-circuit on path candidates); Codex line-walk first-match parallels existing locator pattern; R1 closures all standing; R1-F09 README mutable framing intact (load-bearing for Codex sessions now potentially returning `mutable: true`)
+  - Self-oscillation signal: none
+  - Next role-local watch: WS6 (Phase 6 implementer awareness for multi-record `session_meta` edge) recorded as R3-F01
+- supported-surface (`claude-opus`):
+  - Role decision: LOW; termination `none`
+  - Reason: A1-A9 HOLD (A4 Rev 3 form retains fail-closed shape); net value strictly increased over Rev 2 (#8 now retired for BOTH providers); harness "Codex storage" coverage flips from partial-by-design to covered; adjacent path blast radius unchanged; migration / rollback / observability claims unchanged; §11.1 provider-agnostic framing remains accurate; `SessionMetadata` field set unchanged (forward-compat preserved)
+  - Self-oscillation signal: none
+  - Next role-local watch: future Codex schema drift fires the new A4 invalidator clause; locate's fail-closed shape preserves stable refusal behavior
+
 ## Decision register
 
 | Round | Decision | Deciding inputs | Reason | Dissent | Next action |
@@ -202,6 +262,7 @@ gates at LOW with no oscillation. Phase 4 closed; Phase 5 next.
 | 1 | continue | audit HIGH; pipeline rule "any MEDIUM or HIGH report means revise the proposal and re-run all four" | Audit's two HIGH findings (B1, F4) are surgical and closable without redesign; supported-surface, scope, and shortcut all LOW | none | dispatch Rev 2 proposal-revision agent on `worktrees/06-locate`; re-run all four risk gates against Rev 2 |
 | 2 | apply | audit LOW, scope LOW, shortcut LOW, supported-surface LOW (termination none); pipeline rule "all four reports must return LOW" | All nine R1 findings closed at original severities; no R1 finding regressed; no oscillation classified; two R2 LOW nits accepted as residual (path-hash prose pinned by §9.1; resume-parity malformed-config inherited limitation) | none | advance to Phase 5 (hookpoint research) |
 | 3 | continue | Phase 5 sampled real Codex rollout JSONL and found `session_meta.payload.cwd` present in every sampled file (25 files, Codex 0.46.0 and 0.58.0); A4 invalidator's "Phase 5 proves a stable Codex workspace-root field" trigger fires; pipeline rule "if hookpoint research shows the approved problem map or assumption register is wrong, stop and return to research; resume at Phase 2.5 with an updated problem map before implementation continues" | Codex deferral was deliberately drafted as a Phase-5-conditional branch; Phase 5 evidence has now flipped that branch. Folding Codex into v1 via Rev 3 is the workflow's prescribed path, costs ~30 LOC of `payload.cwd` parsing in the proposal, and avoids a follow-up PR | none | update problem map §7 A4; dispatch Rev 3 proposal-revision agent on `worktrees/06-locate`; re-run all four risk gates against Rev 3 |
+| 3 (post-gates) | apply | audit LOW, scope LOW, shortcut LOW, supported-surface LOW (termination none); pipeline rule "all four reports must return LOW" | Rev 3 closes R2-F01 by tightening §4 step 8 Claude prose; Codex `payload.cwd` derivation folded in cleanly with fail-closed wrapper and falsifiable forward-looking invalidator; A1-A9 all HOLD (A4 in Rev 3 form); §6 problem-map #8 retired for both providers; harness "Codex storage" coverage flips from partial-by-design to covered; no R1/R2 finding regressed; two R3 cosmetic findings (multi-record `session_meta` edge case; `type` discriminator unspecified) bounded by Phase 6 implementer following existing `scripts/codex-locate-transcript` precedent | none | advance to Phase 6 (implementation: 6a contract → 6b tests → 6c code) |
 
 ## User Q&A Inputs
 
@@ -221,12 +282,17 @@ Two rounds; full detail retained for both per `~/ai/conventions/audit-history.md
 
 ## Final state
 
-**Phase 5 fired A4 invalidator.** Real Codex rollout JSONL sampling found `session_meta.payload.cwd` present in every sampled file (`/home/nes/.codex/sessions/`, 25 files across Codex 0.46.0 and 0.58.0). A4's invalidator condition met. Per `~/ai/workflows/implementation-pipeline.md` Phase 5 rule "if hookpoint research shows the assumption register is wrong, return to research; resume at Phase 2.5", advancing to Round 3:
+**Phase 4 closed (Round 3, Rev 3).** All four gates LOW; no termination signal; no R1/R2 regression. Codex `payload.cwd` derivation folded into v1 per Phase 5 evidence. Two cosmetic R3 findings (multi-record `session_meta` edge; `type` discriminator unspecified) bounded by existing locator pattern; Phase 6 implementer notes only.
 
-- Problem map §7 A4 updated in place to record the empirical finding.
-- Round 3 will revise the proposal as Rev 3 to fold Codex `payload.cwd` derivation into v1 (drop the deferral).
-- Round 3 will re-run all four risk gates against Rev 3.
+Watch signals carrying into Phase 6:
 
-WS1 closure: empirical evidence found; Rev 3 incorporates it.
+- **WS1 (Codex schema)**: closed for v1; A4 invalidator names "upstream Codex schema drift" as the future falsification trigger.
+- **WS4 (path-hash prose)**: closed; R2-F01 resolved by Rev 3 §4 step 8 prose tightening.
+- **WS5 (resume parity malformed config)**: still active; not a 06-locate concern; Phase 6b README review or future cross-feature pass.
+- **WS6 (new — `session_meta` discriminator)**: Phase 6 implementer follows `scripts/codex-locate-transcript` line-walk precedent for line-record-type discrimination; documents the choice in code.
 
-WS4, WS5: still active for Phase 6, unchanged by Phase 5 / Round 3.
+Next phase: Phase 6 (implementation).
+- 6a contract (orchestrator)
+- 6b test writer (separate agent invocation; must not see implementation)
+- 6c code writer (separate agent invocation; reads tests + contract; makes tests pass)
+- Process-tree audit after 6c.
