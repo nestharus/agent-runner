@@ -1,4 +1,4 @@
-# 1. Scope statement (Rev 1)
+# 1. Scope statement (Rev 2)
 
 06-schema-probe adds one read-only CLI surface:
 
@@ -31,6 +31,16 @@ top-level `--resume`, hidden `resume-list`, `migrate-db`, and
 Initiative 06 commands; provider spawn/resume/quota/config/transcript
 work. No existing command is retrofitted to read-only open in this PR
 (D7).
+
+**Rev 2 changes** (in response to Phase 4 Round 1 audit):
+
+- §3: pin compatibility-map shape (flat for tables; nested
+  table→column / table→index for required_columns and
+  required_indexes); §9.1 D-tests assert canonical structure
+  (R1-F01).
+- §6: enumerate `ReadOnlyOpenError` variants (Missing,
+  NotADatabase, PermissionDenied, WalSidecarError, Operational);
+  map each to exit code and §9 test row (R1-F02).
 
 ## 1.1 Assumption register
 
@@ -114,12 +124,43 @@ Required success fields:
 | `state_db.current_schema_version` | integer | yes | Binary-declared current schema version. Rev 1 sets this to `3`. |
 | `state_db.minimum_supported_schema_version` | integer | yes | Lowest schema version this binary accepts for the public session surface. Rev 1 sets this to `3`. |
 | `state_db.compatible` | boolean | yes | True only when version and structural checks pass. |
-| `state_db.tables` | object boolean map | yes | Presence of `invocations`, `session_turns`, `session_chains`, and `session_chain_segments`. |
-| `state_db.required_columns` | object boolean map | yes | Presence of required public-session columns grouped by table. |
-| `state_db.required_indexes` | object boolean map | yes | Presence of required public-session indexes. |
+| `state_db.tables` | object boolean map | yes | Flat boolean map keyed by required table name: `invocations`, `session_turns`, `session_chains`, and `session_chain_segments`. |
+| `state_db.required_columns` | nested object boolean map | yes | Two-level boolean map keyed by table, then required public-session column. |
+| `state_db.required_indexes` | nested object boolean map | yes | Two-level boolean map keyed by table, then required public-session index. |
 | `features` | object boolean map | yes | Compiled session feature claims (D2a). |
 | `supported_storage_types` | string array | yes | Stable public vocabulary: `claude_code`, `codex_session`, `other` (D5). |
 | `safe_for_import_replace` | boolean | yes | Predicate defined in §3.4 / D4. |
+
+Compatibility maps have this exact serialized shape. `tables` is a flat
+object with table-name keys and boolean values. `required_columns` is a
+nested table → column → boolean object. `required_indexes` is a nested
+table → index → boolean object. No dotted keys such as
+`"session_turns.parent_turn_id"` are allowed in these maps.
+
+```json
+{
+  "state_db": {
+    "schema_version": 3,
+    "tables": {
+      "invocations": true,
+      "session_turns": true,
+      "session_chains": true,
+      "session_chain_segments": true
+    },
+    "required_columns": {
+      "invocations": { "session_id": true, "session_capture_method": true, "resume_acceptance_status": true, "resume_acceptance_evidence": true },
+      "session_turns": { "parent_turn_id": true, "is_sidechain": true, "is_compaction_boundary": true },
+      "session_chains": { "chain_id": true, "created_at": true, "last_used_at": true, "model_name": true },
+      "session_chain_segments": { "chain_id": true, "provider_name": true, "session_id": true, "started_at": true, "ended_at": true, "last_turn_id": true, "transition_reason": true }
+    },
+    "required_indexes": {
+      "invocations": { "idx_invocations_provider_session": true },
+      "session_turns": { "idx_session_turns_session_lookup": true },
+      "session_chain_segments": { "idx_segments_session": true, "idx_segments_chain_active": true }
+    }
+  }
+}
+```
 
 ## 3.1 D1: `schema_version` source
 
@@ -205,15 +246,21 @@ pause-handshake. In this PR it is expected to be `false`.
    shell out to `git` at runtime; missing build commit emits `"unknown"`.
 4. If the DB file does not exist, emit success JSON with
    `state_db.exists: false`, `schema_version: 0`, all required
-   table/column/index booleans `false`, `compatible: false`, and
-   `safe_for_import_replace: false`; exit `0`.
+   table/column/index booleans `false` using the canonical §3 map shape,
+   `compatible: false`, and `safe_for_import_replace: false`; exit `0`.
 5. Open the DB through `StateDb::open_read_only(&path)` (D3). This step
    must not create parent directories, create the DB file, set
    `journal_mode`, ensure schema, or run backfill.
 6. Read `PRAGMA user_version` and store it as both `user_version` and
    `schema_version`.
 7. Inspect required tables, columns, and indexes through `sqlite_master`,
-   `PRAGMA table_info`, and, where needed, `PRAGMA index_info`.
+   `PRAGMA table_info`, and, where needed, `PRAGMA index_info`. Build
+   `state_db.tables` as a flat table → boolean map. Build
+   `state_db.required_columns` as table → column → boolean, initializing
+   every required table and column from §3 even when the table is absent.
+   Build `state_db.required_indexes` as table → index → boolean,
+   initializing every required index from §3 even when the table is
+   absent. Absent structures keep their canonical keys and report `false`.
 8. Compute compatibility: false when `schema_version` is below
    `MINIMUM_SUPPORTED_SCHEMA_VERSION`, above `CURRENT_SCHEMA_VERSION`, or
    any required table/column/index is missing; true otherwise.
@@ -252,10 +299,28 @@ impl StateDb {
     pub fn default_path() -> Result<PathBuf, String>;
     pub fn open_read_only(path: &Path) -> Result<Self, ReadOnlyOpenError>;
 }
+
+pub enum ReadOnlyOpenError {
+    Missing { path: PathBuf },
+    NotADatabase { path: PathBuf, message: String },
+    PermissionDenied { path: PathBuf },
+    WalSidecarError { path: PathBuf, message: String },
+    Operational { message: String },
+}
 ```
 
 Naming may become `open_ro` in implementation if that matches local style,
 but the semantics are fixed.
+
+Variant mapping:
+
+| Variant | Triggering condition | CLI exit behavior | §9.1 test obligation |
+| --- | --- | --- | --- |
+| `Missing { path }` | Default DB file does not exist before SQLite open. | Exit `0`; success JSON with `exists: false`, `compatible: false`, and `safe_for_import_replace: false`. | `D6 exit mapping for missing DB`. |
+| `NotADatabase { path, message }` | File exists but SQLite rejects it as non-database or invalid database bytes/header. | Exit `1`; stderr JSON code `state-open-failed`; no success stdout. | `D6 exit mapping for unreadable/present invalid DB`. |
+| `PermissionDenied { path }` | File or containing directory permissions prevent read-only SQLite open. | Exit `1`; stderr JSON code `state-open-failed`; no success stdout. | `D6 exit mapping for unreadable/present invalid DB`. |
+| `WalSidecarError { path, message }` | Main DB exists but SQLite cannot read required WAL/shm sidecar state in read-only mode. | Exit `1`; stderr JSON code `state-open-failed` or `state-inspect-failed`; no success stdout. | `D3 WAL read behavior`. |
+| `Operational { message }` | Other SQLite open failure or environmental I/O failure not classified above. | Exit `1`; stderr JSON code `state-open-failed`; no success stdout. | `D6 exit mapping for unreadable/present invalid DB`. |
 
 ## 6.1 D3: read-only open semantics
 
@@ -326,12 +391,12 @@ WAL/shm sidecar state for a read-only snapshot.
 | D1 existing migration assignments | Fixtures representing version 2 (Initiative 04 shape) fail as older than min; fixtures representing version 3 pass when structures are present. | component | Hand-seeded temp DBs matching required table/column/index subsets. | A2, A6 | Version 2 exits `14`; version 3 exits `0`. | Structural fixtures may not cover all legacy data combinations. |
 | D2 hardcoded feature enumeration | Feature map contains the exact Rev 1 keys and values; no clap-only command appears automatically. | unit | Pure function test for feature map. | A3 | `session_schema_probe: true`; future siblings false until implemented. | Does not prove future PRs update the map; review/test-intent must carry that forward. |
 | D3 read-only open has no schema/backfill side effects | Probe against legacy DB does not create missing tables, add missing columns, set WAL mode, stamp `user_version`, or populate chains. | particular-integration | Temp DB seeded with old `session_turns` only; snapshot schema, `PRAGMA user_version`, row counts, and mtime before/after. | A1 | Exit `14`; before/after schema and row counts identical; no chain rows created. | Filesystem mtime granularity may need content-based checks. |
-| D3 WAL read behavior | Existing WAL-mode DB can be read when SQLite can access sidecars; inaccessible WAL/shm state maps to operational exit `1`. | particular-integration | Temp WAL DB fixture plus permission-adjusted sidecar/directory case where supported by OS. | A1 | Success for readable WAL; exit `1` with `state-open-failed`/`state-inspect-failed` for inaccessible case. | Permission behavior can vary by platform; unsupported chmod cases become documented residuals. |
+| D3 WAL read behavior | Existing WAL-mode DB can be read when SQLite can access sidecars; inaccessible WAL/shm state maps to `ReadOnlyOpenError::WalSidecarError` or inspection failure and operational exit `1`. | particular-integration | Temp WAL DB fixture plus permission-adjusted sidecar/directory case where supported by OS. | A1 | Success for readable WAL; exit `1` with `state-open-failed`/`state-inspect-failed` for inaccessible case. | Permission behavior can vary by platform; unsupported chmod cases become documented residuals. |
 | D4 `safe_for_import_replace` predicate | Compatible DB with `session_import_replace: false` reports `safe_for_import_replace: false`; when fixture toggles import-replace and pause flags true, predicate follows schema/storage conditions. | unit + component | Pure predicate test plus report-builder fixture. | A3, A6 | Boolean is true only for all §3.4 conditions. | Does not test actual future import-replace implementation. |
 | D5 storage vocabulary stability | Probe emits `["claude_code","codex_session","other"]` exactly; no internal `codex` config tag appears. | unit | Pure enum/serialization test. | A5 | JSON array matches stable public vocabulary. | Does not prove locate/export use the same Rust type if branches merge differently. |
-| D6 exit mapping for missing DB | Missing default DB exits `0` and reports `exists: false`, version `0`, all required structures false, safe false. | end-to-end | Isolated `XDG_DATA_HOME` or data-dir fixture with no state file. | A4 | Exit `0`; stdout JSON; no directory or DB file created. | Platform-specific data-dir resolution may need fixture control. |
-| D6 exit mapping for unreadable/present invalid DB | Present unreadable or non-SQLite file exits `1`, not `14`. | end-to-end | Temp data-dir fixture with unreadable file or invalid bytes. | A1 | Exit `1`; stderr JSON code `state-open-failed`; no stdout. | Permission simulation may differ on Windows. |
-| D6 exit mapping for older/newer/missing structures | Older version, newer version, and required missing table/column/index all exit `14`. | particular-integration | Temp DB fixtures varying one incompatibility at a time. | A2, A6 | Exit `14`; stderr JSON code `schema-incompatible` with failed booleans. | Does not validate deep data integrity. |
+| D6 exit mapping for missing DB | Missing default DB maps to `ReadOnlyOpenError::Missing`, exits `0`, and reports `exists: false`, version `0`, all required structures false using the canonical §3 map shape, safe false. | end-to-end | Isolated `XDG_DATA_HOME` or data-dir fixture with no state file. | A4 | Exit `0`; stdout JSON has flat `tables`, nested `required_columns`, nested `required_indexes`, and no directory or DB file is created. | Platform-specific data-dir resolution may need fixture control. |
+| D6 exit mapping for unreadable/present invalid DB | Present unreadable, non-SQLite, or other operational open failure maps to `PermissionDenied`, `NotADatabase`, or `Operational` and exits `1`, not `14`. | end-to-end | Temp data-dir fixture with unreadable file, invalid bytes, and one non-permission operational open failure if reliably constructible. | A1 | Exit `1`; stderr JSON code `state-open-failed`; no stdout. | Permission simulation may differ on Windows. |
+| D6 exit mapping for older/newer/missing structures | Older version, newer version, and required missing table/column/index all exit `14`; incompatibility report uses the canonical §3 map shape. | particular-integration | Temp DB fixtures varying one incompatibility at a time. | A2, A6 | Exit `14`; stderr JSON code `schema-incompatible` with flat `tables`, nested `required_columns`, nested `required_indexes`, and failed booleans preserved at canonical keys. | Does not validate deep data integrity. |
 | D7 no existing command retrofit | `agents trace` and other existing commands retain their current open paths and behavior in this PR. | unit/static | Grep/static assertion or review-gate checklist over call sites. | none | Diff only adds read-only usage to schema-probe path. | Static test can miss indirect refactors; Phase 8 review still checks diff. |
 | Side-effect contract | Probe does not touch config, transcript files, adapter state dirs, quota/discovery tables, or invocation rows. | particular-integration | Temp config/data dirs with sentinel files and seeded DB rows; snapshot before/after. | A1, A4 | Sentinels unchanged; row counts unchanged; no new files except pre-existing SQLite sidecars. | Cannot prove absence of all possible OS metadata reads. |
 | README examples remain truthful | Documented command, JSON fields, exit codes, and migration note match implementation. | unit/documentation check | README snippet or grep test if project convention supports it; otherwise Phase 6b residual entry. | none | README includes `session schema-probe`, schema fields, and exit `0/1/14`. | Documentation examples may not execute against real CLI. |
