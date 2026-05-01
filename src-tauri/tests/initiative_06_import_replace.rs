@@ -126,6 +126,12 @@ fn t3_from_file_is_equivalent_to_stdin_after_bytes_are_loaded() {
     assert_export_semantics_match_canonical(&prepared.fixture, &prepared.session_id, &input);
 }
 
+/// Risk: T-unrelated-session-preserved — replacing one session may mutate unrelated transcript or DB rows.
+/// Level: component.
+/// Source: contract §7 DB transactional; proposal §9.1 T-unrelated-session-preserved; A7.
+/// Round-1 Source: TA-F06.
+/// Observable: exit 0; target session is replaced; unrelated session transcript bytes and DB rows remain unchanged.
+/// Residual: does not cover unrelated sessions under a different provider namespace.
 #[test]
 fn t_unrelated_session_unchanged_after_replace() {
     let fixture = ImportReplaceFixture::new();
@@ -759,6 +765,12 @@ fn invalid_timestamp_record_exits_15_before_mutation() {
     assert_no_replace_journal_pollution(&prepared.fixture, &prepared.session_id);
 }
 
+/// Risk: T-mismatched-record-session — canonical input for another session may overwrite the locked target session.
+/// Level: component.
+/// Source: proposal §9.1 T-mismatched-record-session; A1, A2.
+/// Round-1 Source: TA-F02.
+/// Observable: exit 15 invalid-input-transcript; stderr names session/provider mismatch; transcript, DB rows, and journal remain unchanged.
+/// Residual: exact mismatch message text is not asserted beyond the stable session/provider signal.
 #[test]
 fn t_session_id_mismatch_in_input() {
     let prepared = prepared_claude_replace_fixture();
@@ -798,6 +810,12 @@ fn t_session_id_mismatch_in_input() {
     assert_no_replace_journal_pollution(&prepared.fixture, SESSION_B);
 }
 
+/// Risk: T-mismatched-record-session — canonical input for another provider may overwrite the locked target provider session.
+/// Level: component.
+/// Source: proposal §9.1 T-mismatched-record-session; A1, A2.
+/// Round-1 Source: TA-F02.
+/// Observable: exit 15 invalid-input-transcript; stderr names session/provider mismatch; transcript, DB rows, and journal remain unchanged.
+/// Residual: exact mismatch message text is not asserted beyond the stable session/provider signal.
 #[test]
 fn t_provider_name_mismatch_in_input() {
     let prepared = prepared_claude_replace_fixture();
@@ -836,6 +854,12 @@ fn t_provider_name_mismatch_in_input() {
     assert_no_replace_journal_pollution(&prepared.fixture, &prepared.session_id);
 }
 
+/// Risk: T-unsupported-record-class — v1 may silently drop or lossy-render unsupported canonical record classes.
+/// Level: component.
+/// Source: proposal §9.1 T-unsupported-record-class; proposal §11 cohort A v1 record-class scope; A3, A5.
+/// Round-1 Source: TA-F03.
+/// Observable: exit 15 invalid-input-transcript; stderr names unsupported record class; transcript, DB rows, and journal remain unchanged.
+/// Residual: exact unsupported class taxonomy may grow with future canonical schema versions.
 #[test]
 fn t_unsupported_record_class() {
     let prepared = prepared_claude_replace_fixture();
@@ -873,6 +897,12 @@ fn t_unsupported_record_class() {
     assert_no_replace_journal_pollution(&prepared.fixture, &prepared.session_id);
 }
 
+/// Risk: T-schema-incompatible — import-replace may write input before rejecting an unsafe state DB schema.
+/// Level: component.
+/// Source: proposal §9.1 T-schema-incompatible; A6 schema-preflight.
+/// Round-1 Source: TA-F04.
+/// Observable: exit 14 schema-incompatible; database bytes are unchanged; replace journal is not created.
+/// Residual: does not exercise every future schema-probe incompatibility variant.
 #[test]
 fn t_schema_incompatible_exit_14() {
     let fixture = ImportReplaceFixture::new();
@@ -894,11 +924,23 @@ fn t_schema_incompatible_exit_14() {
     assert!(!fixture.replace_journal_dir().exists());
 }
 
+/// Risk: T-malformed-input — empty stdin may be treated as a valid empty replacement and mutate the session.
+/// Level: component.
+/// Source: contract §6 input contract; proposal §9.1 T-malformed-input; A2.
+/// Round-1 Source: TA-F05.
+/// Observable: exit 15 invalid-input-transcript; transcript, DB rows, and journal remain unchanged.
+/// Residual: exact validation message text is not asserted.
 #[test]
 fn t_empty_input_exits_15_before_mutation() {
     assert_invalid_input_has_no_mutation(|_| Vec::new());
 }
 
+/// Risk: T-malformed-input — blank JSONL records may be accepted or reported without a useful line signal.
+/// Level: component.
+/// Source: contract §6 input contract; proposal §9.1 T-malformed-input; A2.
+/// Round-1 Source: TA-F05.
+/// Observable: exit 15 invalid-input-transcript with line 2; transcript, DB rows, and journal remain unchanged.
+/// Residual: exact validation message text is not asserted.
 #[test]
 fn t_blank_line_input_exits_15_before_mutation() {
     let json = assert_invalid_input_has_no_mutation(|prepared| {
@@ -914,6 +956,12 @@ fn t_blank_line_input_exits_15_before_mutation() {
     assert_eq!(json["error"]["line"].as_u64(), Some(2), "{json}");
 }
 
+/// Risk: T-malformed-input — records missing required canonical fields may be accepted and mutate the session.
+/// Level: component.
+/// Source: contract §6 input contract; proposal §9.1 T-malformed-input; A2.
+/// Round-1 Source: TA-F05.
+/// Observable: exit 15 invalid-input-transcript; transcript, DB rows, and journal remain unchanged.
+/// Residual: only one representative required field is removed.
 #[test]
 fn t_missing_required_canonical_field_exits_15_before_mutation() {
     assert_invalid_input_has_no_mutation(|prepared| {
@@ -935,6 +983,12 @@ fn t_missing_required_canonical_field_exits_15_before_mutation() {
     });
 }
 
+/// Risk: T-malformed-input — non-UTF-8 stdin may bypass canonical JSONL parsing and mutate the session.
+/// Level: component.
+/// Source: contract §6 input contract; proposal §9.1 T-malformed-input; A2.
+/// Round-1 Source: TA-F05.
+/// Observable: exit 15 invalid-input-transcript; stderr names UTF-8; transcript, DB rows, and journal remain unchanged.
+/// Residual: does not enumerate every malformed byte sequence.
 #[test]
 fn t_non_utf8_stdin_exits_15_before_mutation() {
     let json = assert_invalid_input_has_no_mutation(|_| vec![0xff, 0xfe, b'\n']);
