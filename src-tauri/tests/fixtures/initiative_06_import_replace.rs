@@ -880,6 +880,7 @@ pub fn kill_after_test_hook(mut child: Child, phase: &str) -> Output {
     child.wait_with_output().unwrap()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn canonical_record(
     session_id: &str,
     provider_name: &str,
