@@ -1,3 +1,10 @@
+**Rev 2 changes** (in response to Phase 4 Round 1 audit):
+
+- §6 / §3 / §4 / §12: idempotent release marker is sibling marker file `session-<uuid>.released` (R1-F01).
+- §1 / §12 / §13: writer-path observer wiring explicitly deferred to sibling PRs; harness acceptance surface narrowed for v1; lock is advisory in v1 until 06-import-replace etc. retrofit (R1-F02).
+- §8: explicit `StateDb::open` side-effect clause matching 06-locate / 06-export (R1-F03).
+- §9.1: added assumption_link and residual_risk columns (R1-F04).
+
 # 1. Scope statement
 
 06-pause-handshake adds two CLI surfaces:
@@ -11,6 +18,19 @@ They provide a session-scoped exclusive lease for the Initiative 06
 override flow. `agent-harness` obtains a bounded lease before transcript
 replacement and releases it afterward. While valid, the lease is the
 stable refusal signal for future lock-aware session writers.
+
+06-pause-handshake v1 ships the lock primitive only. Sibling writer-path
+observation in `import-replace`, migration's `migrate_chain_segment`,
+`run_repl`, `run_resume`, and balanced one-shot is deferred to those
+features' own PRs as a cross-cutting concern. Specifically,
+06-import-replace's PR will observe the lock during write attempts and
+exit `13 session-busy` on conflict; migration's
+`migrate_chain_segment` retrofit is a follow-up; resume/repl observe in
+their own follow-up. This narrows the harness acceptance surface for v1:
+pause-handshake acquires a lock, but cannot prevent concurrent writes by
+sibling commands until those commands are retrofitted in subsequent PRs.
+The harness consumer should treat the lock as advisory in v1; full
+mutual-exclusion arrives when 06-import-replace lands.
 
 This is the fourth Initiative 06 feature in technical order, after
 `locate`, `schema-probe`, and `export`, and before `import-replace`.
@@ -39,7 +59,8 @@ What does not change:
   config edit.
 - No GUI/Tauri frontend surface.
 - No sibling writer-path observation in this PR beyond adding the API
-  those paths will use later.
+  those paths will use later; v1 lock enforcement is advisory until
+  sibling PRs wire observers.
 
 ## 1.1 Assumption register
 
@@ -151,12 +172,15 @@ as `getrandom`.
   "provider_name": "claude2",
   "released": true,
   "already_released": false,
-  "lock_path": "/home/me/.local/share/oulipoly-agent-runner/locks/session-9e69e8cc-616d-4640-bf1d-96f5391b1a2e.lock"
+  "lock_path": "/home/me/.local/share/oulipoly-agent-runner/locks/session-9e69e8cc-616d-4640-bf1d-96f5391b1a2e.lock",
+  "release_marker_path": "/home/me/.local/share/oulipoly-agent-runner/locks/session-9e69e8cc-616d-4640-bf1d-96f5391b1a2e.released"
 }
 ```
 
 `already_released` is `true` only for idempotent same-token replay.
-`released` is always `true` on exit `0`.
+`released` is always `true` on exit `0`. `lock_path` is the active
+lease file path. `release_marker_path` is the sibling marker written on
+successful release and consulted for same-token idempotent replay.
 
 ## 3.3 Error stderr
 
@@ -179,10 +203,12 @@ when known.
 3. Resolve ownership through the shared path. `NoChainFound` maps to
    exit `10`; `Ambiguous` maps to exit `11`; there is no fallback to
    direct `session_turns` queries.
-4. Compute lock path from the resolved active provider session id:
+4. Compute lock and release-marker paths from the resolved active
+   provider session id:
 
    ```text
    <data_dir>/oulipoly-agent-runner/locks/session-<session_id>.lock
+   <data_dir>/oulipoly-agent-runner/locks/session-<session_id>.released
    ```
 
 5. Create the lock directory with owner-private permissions where Unix
@@ -203,21 +229,25 @@ when known.
 10. D3 decision: default TTL is `300000` ms (5 minutes), minimum is
     `1000` ms, maximum is `1800000` ms (30 minutes). Out-of-range
     `--ttl-ms` is clap usage exit `2`.
-11. Generate the token, write metadata atomically, fsync the file, and
-    release the flock.
+11. Generate the token, remove any previous sibling release marker under
+    the same critical section, write lock metadata atomically, fsync the
+    file, and release the flock.
 12. `resume-handshake` resolves the session, computes the same path, and
     takes exclusive `flock`.
-13. If the lockfile is missing, accept only an idempotent same-token
-    release proven by the release marker in §6; otherwise return
-    `16 lock-token-invalid`.
-14. If metadata exists and `now > expires_at`, return
-    `17 lock-expired`. The command may remove stale state after
-    classification.
-15. If metadata exists and token mismatches, return
+13. Read the sibling release marker, if present, as idempotency evidence.
+14. If the lockfile is missing, accept only a same-token marker replay:
+    marker hash match returns `0` with `already_released: true`; marker
+    hash mismatch or no marker returns `16 lock-token-invalid`.
+15. If metadata exists and `now > expires_at`, return idempotent success
+    only when the marker hash matches the supplied token; otherwise
+    return `17 lock-expired`. The command may remove stale lock state
+    only after classification and only if it does not remove a matching
+    release marker.
+16. If metadata exists and token mismatches, return
     `16 lock-token-invalid` without altering the lock.
-16. If metadata exists and token matches, remove the lockfile or replace
-    it with a release marker, fsync the directory when practical, and
-    exit `0`.
+17. If metadata exists and token matches, write the sibling release
+    marker `session-<session_id>.released`, remove the lockfile, fsync
+    the marker and directory when practical, and exit `0`.
 
 # 5. Exit codes
 
@@ -260,7 +290,7 @@ Public types:
 ```rust
 pub struct SessionLockTarget { session_id, chain_id, provider_name }
 pub struct SessionLockReceipt { session_id, chain_id, provider_name, token, expires_at, lock_path }
-pub struct SessionLockRelease { session_id, chain_id, provider_name, released, already_released, lock_path }
+pub struct SessionLockRelease { session_id, chain_id, provider_name, released, already_released, lock_path, release_marker_path }
 pub enum SessionLockError { Busy, TokenInvalid, Expired, Operational }
 pub struct SessionLockManager { root: PathBuf }
 ```
@@ -269,6 +299,7 @@ Core methods:
 
 - `SessionLockManager::from_default_data_dir()`.
 - `lock_path(&self, session_id: &str) -> PathBuf`.
+- `release_marker_path(&self, session_id: &str) -> PathBuf`.
 - `acquire(&self, target, ttl) -> Result<SessionLockReceipt, SessionLockError>`.
 - `release(&self, target, token) -> Result<SessionLockRelease, SessionLockError>`.
 - `observe(&self, target) -> Result<Option<ExistingLockInfo>, SessionLockError>`.
@@ -291,15 +322,49 @@ Lockfile metadata is JSON and versioned:
 The lockfile stores `token_hash`, not the raw token. The raw token is
 printed once to stdout. Release hashes the supplied token for comparison.
 
-Idempotent release requires short-lived release evidence. Phase 5 chooses
-one shape:
+Idempotent release evidence is a sibling marker file in the same lock
+directory:
 
-- Replace the lockfile with a release marker containing `released_at`
-  and `token_hash`, overwritten by the next acquire.
-- Write a sibling marker under `locks/releases/session-<uuid>.json`.
+```text
+<lock_dir>/session-<session_id>.released
+```
+
+`acquire()` writes:
+
+```text
+<lock_dir>/session-<session_id>.lock
+```
+
+`release()` writes:
+
+```text
+<lock_dir>/session-<session_id>.released
+```
+
+The marker is JSON and versioned:
+
+```json
+{
+  "version": 1,
+  "session_id": "...",
+  "chain_id": "...",
+  "provider_name": "...",
+  "token_hash": "sha256:<hex>",
+  "released_at": "2026-04-30T12:33:10Z"
+}
+```
+
+It contains token evidence (`token_hash`, derived from the release
+token) and `released_at`; the raw token is not persisted.
 
 The marker is not an active lock. It only distinguishes same-token retry
-from arbitrary missing-lock release.
+from arbitrary missing-lock release. Same-token release replay succeeds
+with `already_released: true` when this marker exists and the token hash
+matches. Wrong-token release returns `16 lock-token-invalid` when this
+marker exists and the token hash differs. Stale lockfile release returns
+`17 lock-expired` unless the sibling marker already proves a same-token
+release. A fresh acquire removes the old sibling marker before writing
+new lock metadata so a previous token cannot shadow a later lease.
 
 # 7. Anti-scope
 
@@ -326,15 +391,18 @@ behavior.
 
 - Create `~/.local/share/oulipoly-agent-runner/locks/`.
 - Create, replace, or remove `locks/session-<session_id>.lock`.
-- Create or update same-token release marker state.
+- Remove a stale `locks/session-<session_id>.released` marker while
+  acquiring a new lock for the same session.
 - Open default state/config for shared session resolution.
 
 `resume-handshake` may:
 
 - Remove an active matching lockfile.
-- Replace an active lockfile with a release marker.
-- Remove stale lockfiles after classifying `lock-expired`, if Phase 5
-  chooses cleanup-on-expired-release.
+- Create or update
+  `locks/session-<session_id>.released` with token evidence
+  (`token_hash`) and `released_at` for idempotent release replay.
+- Remove stale lockfiles after classifying `lock-expired`, without
+  removing a same-token release marker.
 
 Neither command may:
 
@@ -342,8 +410,20 @@ Neither command may:
   rows, provider/model/session config, or invocation lifecycle rows.
 - Run provider commands, quota scripts, auth refresh commands, migration
   code, or scanner/import logic.
-- Backfill or repair chains beyond unavoidable existing `StateDb::open`
-  behavior in the local codebase.
+- Backfill or repair chains beyond accepted `StateDb::open` behavior in
+  the local codebase.
+
+`agents session pause-handshake` and `resume-handshake` open the state
+DB via `StateDb::open_default()` for resolver-only access. Inherent
+`StateDb::open` side effects (parent dir creation, WAL enable,
+schema-ensure, chain backfill) are accepted, matching 06-locate and
+06-export's §8 contracts. No DDL, no row mutation, no
+`session_turns`/`session_chains`/`session_chain_segments` writes. Lock
+state lives outside the DB at
+`<lock_dir>/session-<uuid>.{lock,released}`.
+
+When 06-schema-probe's `StateDb::open_read_only` lands and is mergeable,
+switch pause/resume resolver access to read-only open as a follow-up.
 
 Permissions are contract surface. On Unix, new lock directories are
 `0700` and lock/marker files are `0600`. Failure to set or verify those
@@ -351,26 +431,30 @@ permissions is exit `1`, not a silent downgrade.
 
 # 9. Test-intent track
 
-| Risk | Intended behavior | Level | Fixture/application point | Signal |
-| --- | --- | --- | --- | --- |
-| Resolver pass-through | Pause receipt uses resolved active session, chain, and provider. | component + CLI | Temp DB/config from locate fixtures. | Exit `0`; stdout fields match owner. |
-| Invalid UUID | Bad id fails before state/lock access. | e2e | CLI with invalid id. | Exit `2`; no lock dir. |
-| Not found | Unknown UUID maps to `10`. | integration | Empty/unrelated temp DB. | stderr code `session-not-found`. |
-| Ambiguous | Resolver ambiguity maps to `11`. | component | Two recent candidate chains. | stderr code `ambiguous-session`. |
-| Atomic acquire | Two concurrent pause calls grant one token. | process integration | Two CLI processes, same temp data dir. | One `0`, one `13`. |
-| Per-session scope | Different sessions can be locked concurrently. | component | Two active sessions. | Two lockfiles; both `0`. |
-| Token format | Token matches `pause_[0-9a-f]{32}` and differs across acquisitions. | unit | Token generator. | Regex pass; repeated values differ. |
-| TTL bounds | Default/min/max policy enforced. | unit + CLI | Parser and injected clock. | Default 5m; out-of-range exits `2`. |
-| Stale acquire | Expired lockfile is lazily replaced. | component | Prewritten expired metadata. | New pause exits `0`. |
-| Busy lock | Non-expired lock blocks second pause. | integration | Pause twice before expiry. | Second exits `13`. |
-| Correct release | Matching token releases. | integration | Pause then resume. | Resume `0`; future pause succeeds. |
-| Wrong token | Mismatch cannot release. | integration | Pause then wrong token. | Exit `16`; lock remains. |
-| Expired release | Release after expiry returns `17`. | component | Injected clock. | stderr code `lock-expired`. |
-| Idempotent replay | Same-token release retry succeeds. | integration | Pause, release, release again. | Second `0`, `already_released: true`. |
-| Missing lock wrong token | Unknown token with no marker returns `16`. | component | No lock/marker. | stderr code `lock-token-invalid`. |
-| Permissions | Lock state is owner-private on Unix. | Unix integration | Inspect mode bits. | Dir `0700`, files `0600`. |
-| Side effects | Only lock state mutates. | integration | Snapshot DB counts/transcript mtimes. | Unchanged except existing open effects. |
-| README truth | Docs match synopsis, JSON, TTL, exits. | doc check | README snippets/manual checklist. | Fields and codes match proposal. |
+## 9.1 Test matrix
+
+| Track | Risk | Intended behavior | Level | Fixture/application point | assumption_link | Signal | residual_risk |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Resolver pass-through | Pause may lock the wrong mutable target. | Pause receipt uses resolved active session, chain, and provider. | component + CLI | Temp DB/config from locate fixtures. | A1, A2 | Exit `0`; stdout fields match owner. | Does not re-prove the shared resolver's own correctness beyond fixture coverage. |
+| Invalid UUID | Bad input may create lock state before validation. | Bad id fails before state/lock access. | e2e | CLI with invalid id. | A1 | Exit `2`; no lock dir. | Does not constrain clap's exact human-readable usage text. |
+| Not found | Missing sessions may collapse into operational failure. | Unknown UUID maps to `10`. | integration | Empty/unrelated temp DB. | A1 | stderr code `session-not-found`. | Covers resolver absence, not every corrupt-state variant. |
+| Ambiguous | Ambiguous ownership may silently choose one writer target. | Resolver ambiguity maps to `11`. | component | Two recent candidate chains. | A1 | stderr code `ambiguous-session`. | Synthetic ambiguity may not cover all future resolver ambiguity causes. |
+| Atomic acquire | Concurrent harnesses may both receive valid leases. | Two concurrent pause calls grant one token. | process integration | Two CLI processes, same temp data dir. | A4, A5, A7 | One `0`, one `13`. | Does not prove behavior on non-local/network filesystems. |
+| Per-session scope | One session lock may over-block unrelated sessions. | Different sessions can be locked concurrently. | component | Two active sessions. | A2, A7 | Two lockfiles; both `0`. | Does not test cross-user shared data dirs, which are out of scope. |
+| Token format | Tokens may be predictable or malformed. | Token matches `pause_[0-9a-f]{32}` and differs across acquisitions. | unit | Token generator. | A7 | Regex pass; repeated values differ. | Does not statistically certify OS CSPRNG quality. |
+| TTL bounds | Leases may be unbounded or too short to be useful. | Default/min/max policy enforced. | unit + CLI | Parser and injected clock. | A5 | Default 5m; out-of-range exits `2`. | Does not model wall-clock skew between processes. |
+| Stale acquire | Crashed harness may block forever. | Expired lockfile is lazily replaced. | component | Prewritten expired metadata. | A5, A7 | New pause exits `0`. | Does not add a background reaper; cleanup remains lazy by design. |
+| Busy lock | Active lease may not refuse a second pause. | Non-expired lock blocks second pause. | integration | Pause twice before expiry. | A4, A5, A7 | Second exits `13`. | Does not prove sibling writer paths observe the lock in v1. |
+| Correct release | Valid token may fail to release or leave stale lock state. | Matching token releases and writes sibling release marker. | integration | Pause then resume. | A4, A7 | Resume `0`; future pause succeeds; marker path exists before next acquire. | Does not fully simulate crash during the release critical section. |
+| Wrong token | Caller may release a lock it does not own. | Mismatch cannot release. | integration | Pause then wrong token. | A7 | Exit `16`; lock remains. | Does not prove token secrecy outside filesystem and stdout handling. |
+| Expired release | Expired lock may be treated as a valid release. | Release after expiry returns `17` unless a same-token marker already exists. | component | Injected clock with expired metadata and no matching marker. | A5, A7 | stderr code `lock-expired`. | Boundary precision at exact `expires_at` is covered only by unit clock tests. |
+| Idempotent replay | Harness retry after successful release may fail. | Same-token release retry succeeds through `session-<uuid>.released`. | integration | Pause, release, release again. | A5, A7 | Second `0`, `already_released: true`. | Does not preserve idempotency after a later acquire removes the marker. |
+| Missing lock wrong token | Arbitrary token may be accepted when lockfile is absent. | Unknown token with no marker returns `16`. | component | No lock/marker. | A7 | stderr code `lock-token-invalid`. | Cannot distinguish manual lock deletion from never-acquired state. |
+| Marker token mismatch | Stale or foreign marker may authorize the wrong caller. | Existing marker with different token returns `16`. | component | Prewritten `session-<uuid>.released` with different token hash. | A5, A7 | stderr code `lock-token-invalid`. | Does not prove manual marker tampering is impossible, only that mismatch fails. |
+| Permissions | Lock files may leak token evidence or permit tampering. | Lock state is owner-private on Unix. | Unix integration | Inspect mode bits. | A7 | Dir `0700`, files `0600`. | Windows ACL behavior remains implementation discovery. |
+| Side effects | Pause/resume may mutate transcripts or DB rows. | Only lock state mutates beyond accepted `StateDb::open` side effects. | integration | Snapshot DB counts/transcript mtimes. | A1, A3, A7 | Unchanged except parent dir/WAL/schema/backfill effects inherent to open. | Cannot enforce future `StateDb::open` internals; read-only open is a follow-up. |
+| Writer-path advisory scope | Harness may assume full mutual exclusion before sibling PRs land. | v1 docs/tests state lock primitive is advisory until import-replace/migration/resume/repl observers ship. | doc + integration | README/proposal check plus locked session followed by existing sibling command fixture if available. | A6 | Docs name deferred paths; no v1 test expects sibling command refusal. | Full mutual exclusion remains cross-PR work, not validated in this PR. |
+| README truth | Public docs may drift from contract. | Docs match synopsis, JSON, TTL, exits, marker path, and advisory scope. | doc check | README snippets/manual checklist. | A5, A6, A7 | Fields and codes match proposal. | Manual doc checks can miss wording ambiguity. |
 
 Test fixtures should reuse locate/session metadata fixtures once merged.
 If this worktree is temporarily unstacked, Phase 6b may provide a
@@ -384,8 +468,13 @@ Update `README.md` near the CLI synopsis and session/resume sections:
 - Document pause and resume receipt fields exactly as §3.
 - Document token format, token secrecy, and TTL default/min/max: `300000`, `1000`, `1800000`.
 - Document exit codes `0`, `1`, `2`, `10`, `11`, `13`, `16`, `17`.
+- Document the sibling release marker
+  `session-<uuid>.released` and same-token idempotent replay.
 - Document that this is a session lease, not provider process suspension,
-  and that v1 creates/removes lock state only.
+  and that v1 creates/removes lock state only. State that sibling
+  writer-path enforcement is advisory until 06-import-replace,
+  migration, resume/repl, and balanced one-shot wire observers in their
+  own PRs.
 - Mention `~/.local/share/oulipoly-agent-runner/locks/` next to the
   existing `state.db` persistent-state paragraph.
 
@@ -426,10 +515,25 @@ telemetry is added.
   because the CLI exits; lockfile metadata is the lease.
 - No active provider process drain is implemented in v1. Existing running
   invocation rows are not sufficient session writer leases.
-- D4b leaves sibling write-path observation to later PRs; release
-  idempotency needs a marker policy selected in Phase 5.
-- Physical read-only DB open is inherited; Windows semantics are not
-  designed; token hashing must use a cryptographic hash, not a checksum.
+- D4b leaves sibling writer-path observation to later PRs by design.
+  06-import-replace's PR must observe the lock during write attempts and
+  fail with `13 session-busy` on conflict. Migration's
+  `migrate_chain_segment` retrofit is a follow-up. `run_repl` and
+  `run_resume` observe in their own follow-up. Until those sibling PRs
+  land, the harness acceptance surface is narrowed: pause-handshake
+  acquires and releases the lock primitive, but sibling commands can
+  still write unless they have been retrofitted. The harness consumer
+  should treat the lock as advisory in v1; full mutual-exclusion arrives
+  when 06-import-replace lands.
+- Release idempotency uses the concrete sibling marker
+  `<lock_dir>/session-<uuid>.released`; there is no future marker-shape
+  deferral.
+- Physical read-only DB open is inherited until
+  06-schema-probe's `StateDb::open_read_only` lands and is mergeable.
+  Inherent `StateDb::open` side effects are accepted per §8; no command
+  should add DDL or row mutation beyond those open-time effects.
+- Windows semantics are not designed; token hashing must use a
+  cryptographic hash, not a checksum.
 - Balanced one-shot observation needs a future fail-closed point for
   sessions discovered only after provider execution.
 
@@ -439,7 +543,7 @@ telemetry is added.
 | --- | --- | --- |
 | Shared error namespace uses `10`, `11`, `13`, `16`, `17`. | Yes | §5. |
 | Ownership resolution reuses shared locate/resume path. | Yes | §4 steps 1-3. |
-| Lock observation by import-replace, migration, repl/resume, balanced one-shot once pause lands. | Partial by design | D4b: primitive/API here, sibling PRs wire observers. |
+| Lock observation by import-replace, migration, repl/resume, balanced one-shot once pause lands. | Partial by design (deferred to sibling PRs) | Cross-PR dependency: 06-import-replace observes during write attempts and exits `13 session-busy`; migration's `migrate_chain_segment`, resume/repl, and balanced one-shot wire observers in follow-ups. v1 harness lock is advisory until those land. |
 | Read-only `StateDb` open belongs to schema-probe. | Yes / inherited | §8, §12. |
 | No auto-resume. | Yes | §7, §8. |
 | No provider spawn/suspension. | Yes | §7, §8. |
