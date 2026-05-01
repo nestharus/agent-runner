@@ -13,7 +13,7 @@ mode, and (c) a fail-closed wrapper exiting `12` for any deviation
 (`proposals/06-locate.md:60`, `:144`). R2-F01's path-hash short-
 circuit prose closes (`proposals/06-locate.md:143`); R2-F02
 (resume-parity malformed-config) is unchanged and carried as LOW.
-No deferred stubs (`~/ai/conventions/no-deferred-stubs.md`); no
+No deferred stubs (workflow convention `no-deferred-stubs.md`); no
 backwards-compatibility shims.
 
 ## R2 LOW closure

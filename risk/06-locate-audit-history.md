@@ -278,21 +278,84 @@ None for Round 1.
 
 ## Summarization tail
 
-Two rounds; full detail retained for both per `~/ai/conventions/audit-history.md` summarization rules ("keeps the current round and two prior rounds in full"). No summarization needed.
+Two rounds; full detail retained for both per workflow convention `audit-history.md` summarization rules ("keeps the current round and two prior rounds in full"). No summarization needed.
 
 ## Final state
 
-**Phase 4 closed (Round 3, Rev 3).** All four gates LOW; no termination signal; no R1/R2 regression. Codex `payload.cwd` derivation folded into v1 per Phase 5 evidence. Two cosmetic R3 findings (multi-record `session_meta` edge; `type` discriminator unspecified) bounded by existing locator pattern; Phase 6 implementer notes only.
+**Phase 6 closed (Step 6a contract → Step 6b tests → Step 6c REDO code → process-tree audit PASS-WITH-ADVISORY).** Implementation complete; 418 tests pass; Phase 6 process-tree-auditor verdict `PASS-WITH-ADVISORY` with prior `PTA-06-P6-001` `REPAIRED-VERIFIED` after Repair option B applied.
 
-Watch signals carrying into Phase 6:
+Phase 6 timeline:
+- Step 6a contract committed at `c85744d`; clarification at `737063b` after Step 6b NEEDS_INPUT round.
+- Step 6b tests committed at `2c1416b` (test writer; gpt-high; separate invocation).
+- Step 6b raised one NEEDS_INPUT (caught real contract inconsistency about `SessionStorageType::Other` v1 reachability); orchestrator clarified contract; agent resumed via session resume.
+- Step 6c (FIRST attempt) committed at `58cb2eb`; product code correct (all 418 tests passed) but firstness-evidence missing; process-tree audit FAIL.
+- Step 6c first commit reset via `git reset --hard HEAD~1`; Step 6c re-dispatched with file-based read-evidence requirement.
+- Step 6c REDO committed at `b681ba8`; firstness-evidence file `.tmp/phase6/step6c-reads.md` written 21:06:19, product code mtime 21:09:28; process-tree re-audit PASS-WITH-ADVISORY.
+- Audit reports preserved at `risk/06-locate-process-tree-audit-r1.md` (FAIL) and `risk/06-locate-process-tree-audit-r2.md` (PASS-WITH-ADVISORY); expected-process manifest at `risk/06-locate-expected-process.md`.
+- Advisory remaining (non-blocking): codex-source agents resist printing the literal `=== Step 6c reads ===` stdout block; Phase 6 firstness rule satisfied via file-based evidence in original position.
 
-- **WS1 (Codex schema)**: closed for v1; A4 invalidator names "upstream Codex schema drift" as the future falsification trigger.
-- **WS4 (path-hash prose)**: closed; R2-F01 resolved by Rev 3 §4 step 8 prose tightening.
-- **WS5 (resume parity malformed config)**: still active; not a 06-locate concern; Phase 6b README review or future cross-feature pass.
-- **WS6 (new — `session_meta` discriminator)**: Phase 6 implementer follows `scripts/codex-locate-transcript` line-walk precedent for line-record-type discrimination; documents the choice in code.
+Watch signals carrying into Phase 7:
+- **WS5 (resume parity malformed config)**: still active; Phase 6b README review or future cross-feature pass.
+- **WS6 (`session_meta` discriminator)**: Phase 6c implemented first-match per `scripts/codex-locate-transcript` precedent.
+- **WS7 (new)**: codex agent prompt-compliance for stdout-echo blocks. Future Phase 6 prompts should rely on file-based evidence rather than stdout-echo when the implementer is a codex agent. Recorded for Initiative 06's sibling features (06-schema-probe, 06-export, 06-pause-handshake, 06-import-replace).
 
-Next phase: Phase 6 (implementation).
-- 6a contract (orchestrator)
-- 6b test writer (separate agent invocation; must not see implementation)
-- 6c code writer (separate agent invocation; reads tests + contract; makes tests pass)
-- Process-tree audit after 6c.
+Next phase: Phase 7 (CodeRabbit loop).
+
+## Phase 7 CodeRabbit Loop
+
+### Pass 1 — CodeRabbit review against `main`
+
+- Raw pass log: `.tmp/phase7/coderabbit-pass1.md`
+- Findings: 6 total; 1 real applied; 5 skipped.
+- Applied:
+  - **`R4-F01`** — real documentation/privacy finding. CodeRabbit found
+    workstation-specific Codex sample paths and concrete rollout filenames in
+    `research/06-locate-hookpoints.md`. The paths were generalized to
+    `$HOME/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` while preserving the
+    empirical counts and `session_meta.payload.cwd` evidence.
+- Skipped:
+  - **`R4-F02`** — skipped defensive churn. Recursive Claude path-hash
+    decoder guard was classified by CodeRabbit as a nitpick and practically
+    safe; the contract already pins ambiguity semantics, and an arbitrary depth
+    budget could reject valid long workspace paths.
+  - **`R4-F03`** — skipped markdown spacing nitpick in
+    `risk/06-locate-shortcut.md`.
+  - **`R4-F04`** — skipped markdown spacing nitpick in this audit history.
+  - **`R4-F05`** — skipped markdown spacing nitpick in
+    `research/06-locate-contract.md`.
+  - **`R4-F06`** — skipped style churn. The `MetadataError` mapping helpers are
+    local, exhaustive over the enum, and covered by Rust match exhaustiveness;
+    centralizing them now would not improve the locate contract.
+- Determination: continue after amend and tests.
+
+### Pass 2 — CodeRabbit review against `main`
+
+- Raw pass log: `.tmp/phase7/coderabbit-pass2.md`
+- Findings: 7 total; 2 direct real findings applied; 5 skipped.
+- Applied:
+  - **`R5-F01`** — real documentation/privacy finding. CodeRabbit found a
+    workstation-specific Codex sample path in `risk/06-locate-audit.md`; the
+    audit now cites the sanitized Phase 5 sample record rather than the local
+    home-directory path.
+  - **`R5-F02`** — real documentation/privacy finding. CodeRabbit found
+    workstation-specific harness and workflow-library paths in
+    `initiatives/06-session-override-contract.md`; these were replaced with
+    neutral external-directory and workflow-convention references.
+- Same-pattern cleanup:
+  - Sanitized remaining branch-local `/home/nes/...` and `~/ai/...`
+    references in 06-locate proposal, problem-map, contract, hookpoints, and
+    Phase 6 risk artifacts so the path-leak issue does not recur file by file.
+- Skipped:
+  - **`R5-F03`** — skipped markdown spacing nitpick in
+    `research/06-locate-contract.md`.
+  - **`R5-F04`** — skipped style nitpick. The `jsonl_path.is_absolute()` and
+    `workspace_root.is_absolute()` checks are redundant after canonicalization
+    but intentionally mirror the Step 6a `mutable` truth-condition list.
+  - **`R5-F05`** — skipped markdown spacing nitpick in
+    `risk/06-locate-shortcut.md`.
+  - **`R5-F06`** — skipped markdown spacing nitpick in this audit history.
+  - **`R5-F07`** — skipped contract conflict. CodeRabbit recommended surfacing
+    malformed provider/session config as operational errors, but
+    `research/06-locate-contract.md` §3 Step 3 requires resume-parity
+    `unwrap_or_default` semantics, and WS5 records this as an accepted residual.
+- Determination: continue after amend and tests.

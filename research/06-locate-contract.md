@@ -546,7 +546,7 @@ those reads.
 - Problem map: `research/06-locate-problem-map.md`
 - Initiative: `initiatives/06-session-override-contract.md`
 - Audit history: `risk/06-locate-audit-history.md`
-- Harness spec (read-only context): `/home/nes/projects/agent-harness/tmp/scratch/agent-runner-feature-requests/01-session-locate.md`
+- Harness spec (read-only context): external `agent-harness` scratch file `01-session-locate.md`
 
 ## 11. Glossary
 

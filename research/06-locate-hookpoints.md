@@ -162,14 +162,12 @@
   paths is exit `12`, exactly one succeeds, multiple existing decoded paths is
   exit `12` (`proposals/06-locate.md:252-253`). See WS4 below.
 - **Step 8, Codex WS1 empirical sample:** real local rollout files exist under
-  `/home/nes/.codex/sessions/2025/11/13/rollout-*.jsonl`; there are 5739 files
-  under `/home/nes/.codex/sessions`. A 25-file sample showed
+  `$HOME/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`; there are 5739 files
+  under `$HOME/.codex/sessions`. A 25-file sample showed
   `session_meta.payload.cwd` present in every sampled file and
   `session_meta.payload.workspace_root` absent; versions included `0.46.0` and
-  `0.58.0`. Example sampled files:
-  `/home/nes/.codex/sessions/2025/11/13/rollout-2025-11-13T14-54-48-019a7f6d-baa6-7212-8e61-6f500d9c742f.jsonl`
-  and
-  `/home/nes/.codex/sessions/2025/11/13/rollout-2025-11-13T23-49-44-019a8157-7678-7500-b817-5a486f11d413.jsonl`.
+  `0.58.0`. Example sampled files matched
+  `$HOME/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`.
   The repo's bundled Codex locator only checks `payload.id`
   (`scripts/codex-locate-transcript`, cited by problem map at
   `research/06-locate-problem-map.md:44-45`), so product code has no current
@@ -379,7 +377,7 @@
 ## I. Watch signal closures
 
 - **WS1 (Codex rollout sample): empirical evidence found.** Local Codex rollout
-  JSONL exists under `/home/nes/.codex/sessions`; sampled `session_meta.payload`
+  JSONL exists under `$HOME/.codex/sessions`; sampled `session_meta.payload`
   objects include `cwd` and do not include `workspace_root`. `turn_context`
   payloads in sampled files also include `cwd`. This suggests Codex workspace
   root may be derivable from `payload.cwd`, but product code has no parser and
@@ -423,7 +421,7 @@
 | Transcript location | `src-tauri/src/sessions/mod.rs:171-199` | reuse |
 | Locator state dir mkdir classification | `src-tauri/src/sessions/mod.rs:183-185` | reuse / allowed side effect |
 | Claude workspace-root derivation | inverse of `src-tauri/src/migration/mod.rs:155-195` | new helper |
-| Codex workspace-root derivation | sampled `/home/nes/.codex/sessions/.../rollout-*.jsonl` has `payload.cwd` | follow-up or Phase 3 revision |
+| Codex workspace-root derivation | sampled `$HOME/.codex/sessions/.../rollout-*.jsonl` has `payload.cwd` | follow-up or Phase 3 revision |
 | Mutable active segment | `src-tauri/src/state/db.rs:2609-2614`, `:2751-2764` | reuse |
 | Mutable storage/resume checks | `src-tauri/src/config/model.rs:21-24`; `src-tauri/src/main.rs:1154-1162` | reuse predicate |
 | Compact stdout JSON | new locate CLI wrapper; contrast `src-tauri/src/main.rs:470-473` | new |

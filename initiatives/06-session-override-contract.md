@@ -10,11 +10,11 @@ Captured from the conversation that opened this initiative on 2026-04-30:
 
 > Another product is requesting these features.
 >
-> /home/nes/projects/agent-harness/tmp/scratch/agent-runner-feature-requests/
+> [local agent-harness scratch directory]/agent-runner-feature-requests/
 
 The companion product `agent-harness` has authored five `agents`-CLI
-feature requests under
-`/home/nes/projects/agent-harness/tmp/scratch/agent-runner-feature-requests/`.
+feature requests under the external `agent-harness`
+`tmp/scratch/agent-runner-feature-requests/` directory.
 Together they form an upstream replacement for the v1
 `SessionOverrideContract` adapter that today reads `state.db` and
 provider JSONL files directly. The v2 contract goes through stable CLI
@@ -90,13 +90,13 @@ dependencies already in place.
 
 ## Reference framework
 
-- Harness feature request files at
-  `/home/nes/projects/agent-harness/tmp/scratch/agent-runner-feature-requests/`
+- Harness feature request files in the external `agent-harness`
+  `tmp/scratch/agent-runner-feature-requests/` directory
   (01-session-locate.md, 02-session-export.md, 03-session-import-replace.md,
   04-session-pause-handshake.md, 05-session-schema-probe.md, INDEX.md).
-- `~/ai/conventions/no-backwards-compatibility.md` — new subcommand
+- Workflow convention `no-backwards-compatibility.md` — new subcommand
   surface; no shims.
-- `~/ai/conventions/no-deferred-stubs.md` — each feature lands fully
+- Workflow convention `no-deferred-stubs.md` — each feature lands fully
   functional or not at all.
 - Initiative 05 artifacts establishing the resume/chain/segment
   vocabulary that `locate` consumes:
