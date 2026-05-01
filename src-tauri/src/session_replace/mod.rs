@@ -663,10 +663,13 @@ pub fn export_session_canonical(session_id: &str) -> Result<Vec<u8>, ReplaceErro
 fn parse_canonical_jsonl(input: &str) -> Result<Vec<CanonicalRecord>, ReplaceError> {
     let mut records = Vec::new();
     for (idx, line) in input.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
         let line_no = idx as u64 + 1;
+        if line.trim().is_empty() {
+            return Err(ReplaceError::InvalidInputTranscript {
+                reason: "blank line in canonical JSONL".to_string(),
+                line: Some(line_no),
+            });
+        }
         let record = serde_json::from_str::<CanonicalRecord>(line).map_err(|e| {
             ReplaceError::InvalidInputTranscript {
                 reason: format!("malformed canonical JSONL: {e}"),
@@ -700,7 +703,8 @@ fn parse_canonical_jsonl(input: &str) -> Result<Vec<CanonicalRecord>, ReplaceErr
     }
     if records.iter().all(|record| record.unsupported_record) {
         return Err(ReplaceError::InvalidInputTranscript {
-            reason: "canonical transcript has no replaceable records".to_string(),
+            reason: "unsupported record class: canonical transcript has no replaceable records"
+                .to_string(),
             line: None,
         });
     }

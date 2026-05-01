@@ -195,12 +195,21 @@ flag = "--resume"
             &format!("{provider_name}-locator.sh"),
             &format!("printf '%s\\n' {}", sh_path(transcript_path)),
         );
+        self.write_sessions_with_locator_command(provider_name, &locator.to_string_lossy());
+    }
+
+    pub fn write_sessions_with_locator_body(&self, provider_name: &str, body: &str) {
+        let locator = self.write_script(&format!("{provider_name}-locator.sh"), body);
+        self.write_sessions_with_locator_command(provider_name, &locator.to_string_lossy());
+    }
+
+    fn write_sessions_with_locator_command(&self, provider_name: &str, locator: &str) {
         fs::create_dir_all(&self.app_config_dir).unwrap();
         let sessions_path = self.app_config_dir.join("sessions.toml");
         let mut body = fs::read_to_string(&sessions_path).unwrap_or_default();
         body.push_str(&format!(
             "[{provider_name}]\nturn_script = \"true\"\ntranscript_locator = {:?}\nstate_dir = {:?}\n",
-            locator.to_string_lossy(),
+            locator,
             self.dir
                 .path()
                 .join(format!("{provider_name}-locator-state"))
@@ -312,6 +321,15 @@ flag = "--resume"
     }
 
     pub fn run_import_replace(&self, session_id: &str, input: &str, extra_args: &[&str]) -> Output {
+        self.run_import_replace_bytes(session_id, input.as_bytes(), extra_args)
+    }
+
+    pub fn run_import_replace_bytes(
+        &self,
+        session_id: &str,
+        input: &[u8],
+        extra_args: &[&str],
+    ) -> Output {
         let mut cmd = self.import_replace_command(session_id);
         cmd.args(extra_args);
         let mut child = cmd
@@ -324,7 +342,7 @@ flag = "--resume"
             .stdin
             .take()
             .unwrap()
-            .write_all(input.as_bytes())
+            .write_all(input)
             .expect("failed to write stdin for import-replace");
         child.wait_with_output().unwrap()
     }
@@ -447,6 +465,26 @@ flag = "--resume"
                     "ended_at": row.get::<_, Option<String>>(3)?,
                 }))
             },
+        )
+        .unwrap()
+    }
+
+    pub fn active_segment_id(&self, chain_id: &str) -> i64 {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT id FROM session_chain_segments WHERE chain_id = ?1 AND ended_at IS NULL",
+            params![chain_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    pub fn chain_last_used_at(&self, chain_id: &str) -> String {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT last_used_at FROM session_chains WHERE chain_id = ?1",
+            params![chain_id],
+            |row| row.get(0),
         )
         .unwrap()
     }

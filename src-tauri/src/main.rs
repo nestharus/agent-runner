@@ -345,6 +345,7 @@ fn run(cli: Cli) -> Result<i32, String> {
         eprintln!("{}", err.to_json());
         return Ok(err.exit_code());
     }
+
     if let Some(command) = cli.command.clone() {
         return match command {
             Subcommands::Trace {
@@ -571,10 +572,6 @@ fn run_session_import_replace(
         let err = ReplaceError::InvalidArgument {
             message: "preimage sha256 must be 64 hex characters".to_string(),
         };
-        eprintln!("{}", err.to_json());
-        return Ok(err.exit_code());
-    }
-    if let Err(err) = session_replace::recover_pending_replaces() {
         eprintln!("{}", err.to_json());
         return Ok(err.exit_code());
     }

@@ -7,6 +7,7 @@ use agent_runner_lib::session_replace::{
     ReplaceError, ReplaceReceipt, run_import_replace,
 };
 use fixtures::initiative_06_import_replace::*;
+use rusqlite::Connection;
 use std::fs;
 
 /// Risk: T1 — valid Claude stdin replacement may write canonical bytes instead of provider-native bytes.
@@ -48,6 +49,7 @@ fn t1_valid_replace_claude_stdin_emits_receipt_and_provider_native_transcript() 
         !transcript.contains("\"unsupported_record\""),
         "{transcript}"
     );
+    assert_receipt_postimage_matches_export(&prepared.fixture, &prepared.session_id, &receipt);
     assert_export_semantics_match_canonical(&prepared.fixture, &prepared.session_id, &input);
     assert_no_replace_journal_pollution(&prepared.fixture, &prepared.session_id);
 }
@@ -86,6 +88,7 @@ fn t2_codex_replace_writes_codex_rollout_jsonl() {
     );
     assert!(transcript.contains("codex assistant"), "{transcript}");
     assert!(!transcript.contains("\"provider_name\""), "{transcript}");
+    assert_receipt_postimage_matches_export(&prepared.fixture, &prepared.session_id, &receipt);
     assert_export_semantics_match_canonical(&prepared.fixture, &prepared.session_id, &input);
 }
 
@@ -121,6 +124,80 @@ fn t3_from_file_is_equivalent_to_stdin_after_bytes_are_loaded() {
         &prepared.jsonl_path,
     );
     assert_export_semantics_match_canonical(&prepared.fixture, &prepared.session_id, &input);
+}
+
+#[test]
+fn t_unrelated_session_unchanged_after_replace() {
+    let fixture = ImportReplaceFixture::new();
+    let projects_dir = fixture.root().join("claude-projects");
+    let workspace_root = fixture.root().join("workspace");
+    let path_a = fixture.stage_claude_jsonl(
+        &projects_dir,
+        &workspace_root,
+        SESSION_A,
+        &format!(
+            "{}\n{}\n",
+            claude_seed_line(SESSION_A, "old-turn-1", "user", "old user", 0),
+            claude_seed_line(SESSION_A, "old-turn-2", "assistant", "old assistant", 1)
+        ),
+    );
+    let path_b = fixture.stage_claude_jsonl(
+        &projects_dir,
+        &workspace_root,
+        SESSION_B,
+        &format!(
+            "{}\n{}\n",
+            claude_seed_line(SESSION_B, "b-turn-1", "user", "b user", 0),
+            claude_seed_line(SESSION_B, "b-turn-2", "assistant", "b assistant", 1)
+        ),
+    );
+    fixture.write_model(MODEL, &[CLAUDE_PROVIDER]);
+    fixture.write_provider(
+        CLAUDE_PROVIDER,
+        StorageKind::ClaudeCode {
+            projects_dir: &projects_dir,
+        },
+    );
+    fixture.write_sessions_with_locator_body(
+        CLAUDE_PROVIDER,
+        &format!(
+            "case \"$SESSION_ID\" in\n  \"{SESSION_A}\") printf '%s\\n' {:?} ;;\n  \"{SESSION_B}\") printf '%s\\n' {:?} ;;\n  *) exit 1 ;;\nesac",
+            path_a.to_string_lossy(),
+            path_b.to_string_lossy()
+        ),
+    );
+    fixture.seed_active_chain(
+        CHAIN_A,
+        CLAUDE_PROVIDER,
+        SESSION_A,
+        MODEL,
+        "2026-04-17T08:00:00Z",
+    );
+    fixture.seed_active_chain(
+        CHAIN_B,
+        CLAUDE_PROVIDER,
+        SESSION_B,
+        MODEL,
+        "2026-04-17T08:05:00Z",
+    );
+    fixture.seed_turns_with_metadata(CLAUDE_PROVIDER, SESSION_A, &path_a);
+    fixture.seed_turns_with_metadata(CLAUDE_PROVIDER, SESSION_B, &path_b);
+    let before_b = fixture.turn_rows(CLAUDE_PROVIDER, SESSION_B);
+    let before_segment_id = fixture.active_segment_id(CHAIN_A);
+    let before_last_used = fixture.chain_last_used_at(CHAIN_A);
+    let input = canonical_jsonl(SESSION_A, CLAUDE_PROVIDER, &path_a, "unrelated");
+
+    let output = fixture.run_import_replace(SESSION_A, &input, &[]);
+
+    assert_success(&output);
+    assert_eq!(fixture.turn_rows(CLAUDE_PROVIDER, SESSION_B), before_b);
+    assert_eq!(fixture.active_segment_id(CHAIN_A), before_segment_id);
+    assert_ne!(fixture.chain_last_used_at(CHAIN_A), before_last_used);
+    assert_eq!(fixture.chain_last_used_at(CHAIN_A), "2026-04-17T09:00:01Z");
+    assert_eq!(
+        fixture.segment_state(CHAIN_A)["last_turn_id"],
+        "unrelated-turn-2"
+    );
 }
 
 /// Risk: T4 — preimage protection may compare the wrong hash domain or run outside the lock.
@@ -683,6 +760,191 @@ fn invalid_timestamp_record_exits_15_before_mutation() {
 }
 
 #[test]
+fn t_session_id_mismatch_in_input() {
+    let prepared = prepared_claude_replace_fixture();
+    let before = prepared.fixture.mutation_snapshot(
+        &prepared.jsonl_path,
+        &prepared.provider_name,
+        &prepared.session_id,
+    );
+    let input = canonical_jsonl(
+        SESSION_B,
+        &prepared.provider_name,
+        &prepared.jsonl_path,
+        "session-mismatch",
+    );
+
+    let output = prepared
+        .fixture
+        .run_import_replace(&prepared.session_id, &input, &[]);
+
+    assert_eq!(output.status.code(), Some(15), "{output:?}");
+    let json = assert_json_error(&output, "invalid-input-transcript");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("session/provider"),
+        "{json}"
+    );
+    let after = prepared.fixture.mutation_snapshot(
+        &prepared.jsonl_path,
+        &prepared.provider_name,
+        &prepared.session_id,
+    );
+    assert_eq!(after.transcript_bytes, before.transcript_bytes);
+    assert_eq!(after.turn_rows, before.turn_rows);
+    assert_no_replace_journal_pollution(&prepared.fixture, &prepared.session_id);
+    assert_no_replace_journal_pollution(&prepared.fixture, SESSION_B);
+}
+
+#[test]
+fn t_provider_name_mismatch_in_input() {
+    let prepared = prepared_claude_replace_fixture();
+    let before = prepared.fixture.mutation_snapshot(
+        &prepared.jsonl_path,
+        &prepared.provider_name,
+        &prepared.session_id,
+    );
+    let input = canonical_jsonl(
+        &prepared.session_id,
+        CODEX_PROVIDER,
+        &prepared.jsonl_path,
+        "provider-mismatch",
+    );
+
+    let output = prepared
+        .fixture
+        .run_import_replace(&prepared.session_id, &input, &[]);
+
+    assert_eq!(output.status.code(), Some(15), "{output:?}");
+    let json = assert_json_error(&output, "invalid-input-transcript");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("session/provider"),
+        "{json}"
+    );
+    let after = prepared.fixture.mutation_snapshot(
+        &prepared.jsonl_path,
+        &prepared.provider_name,
+        &prepared.session_id,
+    );
+    assert_eq!(after.transcript_bytes, before.transcript_bytes);
+    assert_eq!(after.turn_rows, before.turn_rows);
+    assert_no_replace_journal_pollution(&prepared.fixture, &prepared.session_id);
+}
+
+#[test]
+fn t_unsupported_record_class() {
+    let prepared = prepared_claude_replace_fixture();
+    let before = prepared.fixture.mutation_snapshot(
+        &prepared.jsonl_path,
+        &prepared.provider_name,
+        &prepared.session_id,
+    );
+    let input = unsupported_record_only_jsonl(
+        &prepared.session_id,
+        &prepared.provider_name,
+        &prepared.jsonl_path,
+    );
+
+    let output = prepared
+        .fixture
+        .run_import_replace(&prepared.session_id, &input, &[]);
+
+    assert_eq!(output.status.code(), Some(15), "{output:?}");
+    let json = assert_json_error(&output, "invalid-input-transcript");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unsupported record class"),
+        "{json}"
+    );
+    let after = prepared.fixture.mutation_snapshot(
+        &prepared.jsonl_path,
+        &prepared.provider_name,
+        &prepared.session_id,
+    );
+    assert_eq!(after.transcript_bytes, before.transcript_bytes);
+    assert_eq!(after.turn_rows, before.turn_rows);
+    assert_no_replace_journal_pollution(&prepared.fixture, &prepared.session_id);
+}
+
+#[test]
+fn t_schema_incompatible_exit_14() {
+    let fixture = ImportReplaceFixture::new();
+    fs::create_dir_all(fixture.db_path().parent().unwrap()).unwrap();
+    Connection::open(fixture.db_path()).unwrap();
+    let before_db = fs::read(fixture.db_path()).unwrap();
+    let input = canonical_jsonl(
+        SESSION_A,
+        CLAUDE_PROVIDER,
+        &fixture.root().join("schema-incompatible.jsonl"),
+        "schema",
+    );
+
+    let output = fixture.run_import_replace(SESSION_A, &input, &[]);
+
+    assert_eq!(output.status.code(), Some(14), "{output:?}");
+    assert_json_error(&output, "schema-incompatible");
+    assert_eq!(fs::read(fixture.db_path()).unwrap(), before_db);
+    assert!(!fixture.replace_journal_dir().exists());
+}
+
+#[test]
+fn t_empty_input_exits_15_before_mutation() {
+    assert_invalid_input_has_no_mutation(|_| Vec::new());
+}
+
+#[test]
+fn t_blank_line_input_exits_15_before_mutation() {
+    let json = assert_invalid_input_has_no_mutation(|prepared| {
+        canonical_jsonl(
+            &prepared.session_id,
+            &prepared.provider_name,
+            &prepared.jsonl_path,
+            "blank-line",
+        )
+        .replacen('\n', "\n\n", 1)
+        .into_bytes()
+    });
+    assert_eq!(json["error"]["line"].as_u64(), Some(2), "{json}");
+}
+
+#[test]
+fn t_missing_required_canonical_field_exits_15_before_mutation() {
+    assert_invalid_input_has_no_mutation(|prepared| {
+        let input = canonical_jsonl(
+            &prepared.session_id,
+            &prepared.provider_name,
+            &prepared.jsonl_path,
+            "missing-field",
+        );
+        let mut records = normalize_jsonl(&input);
+        records[0].as_object_mut().unwrap().remove("turn_id");
+        (records
+            .into_iter()
+            .map(|record| serde_json::to_string(&record).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n")
+            .into_bytes()
+    });
+}
+
+#[test]
+fn t_non_utf8_stdin_exits_15_before_mutation() {
+    let json = assert_invalid_input_has_no_mutation(|_| vec![0xff, 0xfe, b'\n']);
+    assert!(
+        json["error"]["message"].as_str().unwrap().contains("utf-8"),
+        "{json}"
+    );
+}
+
+#[test]
 fn malformed_preimage_sha_exits_2_as_invalid_argument() {
     let prepared = prepared_claude_replace_fixture();
     let input = canonical_jsonl(
@@ -810,6 +1072,64 @@ fn t16_session_not_found_exits_10_for_well_formed_uuid_with_no_chain() {
         !fixture.pending_journal_path(SESSION_B).exists(),
         "not-found must not publish a pending journal"
     );
+}
+
+fn assert_receipt_postimage_matches_export(
+    fixture: &ImportReplaceFixture,
+    session_id: &str,
+    receipt: &serde_json::Value,
+) {
+    let export = fixture.run_export(session_id);
+    assert_eq!(export.status.code(), Some(0), "{export:?}");
+    assert_eq!(
+        receipt["postimage_sha256"].as_str().unwrap(),
+        sha256sum_bytes(&export.stdout)
+    );
+}
+
+fn assert_invalid_input_has_no_mutation(
+    build_input: impl FnOnce(&PreparedReplace) -> Vec<u8>,
+) -> serde_json::Value {
+    let prepared = prepared_claude_replace_fixture();
+    let before = prepared.fixture.mutation_snapshot(
+        &prepared.jsonl_path,
+        &prepared.provider_name,
+        &prepared.session_id,
+    );
+    let input = build_input(&prepared);
+
+    let output = prepared
+        .fixture
+        .run_import_replace_bytes(&prepared.session_id, &input, &[]);
+
+    assert_eq!(output.status.code(), Some(15), "{output:?}");
+    let json = assert_json_error(&output, "invalid-input-transcript");
+    let after = prepared.fixture.mutation_snapshot(
+        &prepared.jsonl_path,
+        &prepared.provider_name,
+        &prepared.session_id,
+    );
+    assert_eq!(after.transcript_bytes, before.transcript_bytes);
+    assert_eq!(after.turn_rows, before.turn_rows);
+    assert_no_replace_journal_pollution(&prepared.fixture, &prepared.session_id);
+    json
+}
+
+fn claude_seed_line(
+    session_id: &str,
+    turn_id: &str,
+    role: &str,
+    message: &str,
+    offset: i64,
+) -> String {
+    serde_json::json!({
+        "sessionId": session_id,
+        "type": role,
+        "uuid": turn_id,
+        "timestamp": format!("2026-04-17T08:00:{offset:02}Z"),
+        "message": message,
+    })
+    .to_string()
 }
 
 fn assert_public_session_replace_contract_types_are_reachable() {
