@@ -5,6 +5,7 @@ use agent_runner_lib::config::{
 };
 use agent_runner_lib::diagnostics;
 use agent_runner_lib::executor;
+use agent_runner_lib::session_metadata::{MetadataError, locate_session_metadata};
 use agent_runner_lib::state::{CompositeInvocationId, InvocationStart, StateDb};
 use agent_runner_lib::trace::{TraceOptions, render_ascii_trace, trace_invocation_with_sessions};
 
@@ -152,6 +153,11 @@ enum Subcommands {
         #[arg(long = "models-dir")]
         models_dir: Option<PathBuf>,
     },
+    /// Inspect metadata for a provider session.
+    Session {
+        #[command(subcommand)]
+        command: SessionSubcommands,
+    },
     /// Hidden normalized form for `resume --list <UUID>`.
     #[command(hide = true, name = "resume-list")]
     ResumeList { uuid: String },
@@ -162,6 +168,19 @@ enum Subcommands {
         /// Override models directory.
         #[arg(long = "models-dir")]
         models_dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Clone, Debug, Subcommand)]
+enum SessionSubcommands {
+    /// Locate transcript and workspace metadata for a session.
+    Locate {
+        /// Provider session UUID to locate.
+        session_id: String,
+
+        /// Emit JSON. Accepted for symmetry; locate always emits JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -332,6 +351,11 @@ fn run(cli: Cli) -> Result<i32, String> {
                 project.as_deref(),
                 models_dir.as_deref(),
             ),
+            Subcommands::Session { command } => match command {
+                SessionSubcommands::Locate { session_id, json } => {
+                    run_session_locate(&session_id, json)
+                }
+            },
             Subcommands::ResumeList { uuid } => run_resume_list(&uuid),
             Subcommands::MigrateDb => run_migrate_db(),
             Subcommands::MigrateConfig { models_dir } => run_migrate_config(models_dir.as_deref()),
@@ -476,6 +500,111 @@ fn run_trace_command(options: TraceOptions, invocation_uuid: &str) -> Result<i32
     }
 
     Ok(0)
+}
+
+fn run_session_locate(session_id: &str, _json: bool) -> Result<i32, String> {
+    if Uuid::parse_str(session_id).is_err() {
+        emit_metadata_error(&MetadataError::InvalidSessionId {
+            input: session_id.to_string(),
+        });
+        return Ok(2);
+    }
+
+    let state = match StateDb::open_default() {
+        Ok(state) => state,
+        Err(message) => {
+            emit_metadata_error(&MetadataError::Operational { message });
+            return Ok(1);
+        }
+    };
+
+    let models_dir = default_models_dir();
+    let models = match load_models(&models_dir) {
+        Ok(models) => models,
+        Err(message) => {
+            emit_metadata_error(&MetadataError::Operational { message });
+            return Ok(1);
+        }
+    };
+
+    let config_root = dirs::config_dir()
+        .map(|d| d.join("oulipoly-agent-runner"))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let providers_path = config_root.join("providers.toml");
+    let sessions_path = config_root.join("sessions.toml");
+    let providers_cfg =
+        agent_runner_lib::config::ProvidersConfig::load(&providers_path).unwrap_or_default();
+    let sessions_cfg =
+        agent_runner_lib::config::SessionsConfig::load(&sessions_path).unwrap_or_default();
+
+    match locate_session_metadata(&state, &models, &providers_cfg, &sessions_cfg, session_id) {
+        Ok(metadata) => match serde_json::to_string(&metadata) {
+            Ok(json) => {
+                println!("{json}");
+                Ok(0)
+            }
+            Err(err) => {
+                emit_metadata_error(&MetadataError::Operational {
+                    message: format!("failed to serialize session metadata: {err}"),
+                });
+                Ok(1)
+            }
+        },
+        Err(err) => {
+            let code = metadata_error_exit_code(&err);
+            emit_metadata_error(&err);
+            Ok(code)
+        }
+    }
+}
+
+fn metadata_error_exit_code(err: &MetadataError) -> i32 {
+    match err {
+        MetadataError::InvalidSessionId { .. } => 2,
+        MetadataError::SessionNotFound { .. } => 10,
+        MetadataError::AmbiguousSession { .. } => 11,
+        MetadataError::UnsupportedStorage { .. } => 12,
+        MetadataError::Operational { .. } => 1,
+    }
+}
+
+fn metadata_error_code(err: &MetadataError) -> &'static str {
+    match err {
+        MetadataError::InvalidSessionId { .. } => "invalid-session-id",
+        MetadataError::SessionNotFound { .. } => "session-not-found",
+        MetadataError::AmbiguousSession { .. } => "ambiguous-session",
+        MetadataError::UnsupportedStorage { .. } => "unsupported-storage",
+        MetadataError::Operational { .. } => "operational-error",
+    }
+}
+
+fn metadata_error_message(err: &MetadataError) -> String {
+    match err {
+        MetadataError::InvalidSessionId { input } => {
+            format!("invalid session id: {input}")
+        }
+        MetadataError::SessionNotFound { input } => {
+            format!("session not found: {input}")
+        }
+        MetadataError::AmbiguousSession { input } => {
+            format!("ambiguous session: {input}")
+        }
+        MetadataError::UnsupportedStorage {
+            provider_name,
+            reason,
+        } => format!("unsupported storage for provider {provider_name}: {reason}"),
+        MetadataError::Operational { message } => message.clone(),
+    }
+}
+
+fn emit_metadata_error(err: &MetadataError) {
+    let payload = serde_json::json!({
+        "error": {
+            "code": metadata_error_code(err),
+            "message": metadata_error_message(err),
+        }
+    });
+    eprintln!("{payload}");
 }
 
 fn resolve_agent(cli: &Cli) -> Result<AgentConfig, String> {

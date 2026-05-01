@@ -5,6 +5,7 @@ pub mod discovery;
 pub mod executor;
 pub mod migration;
 pub mod quota;
+pub mod session_metadata;
 pub mod sessions;
 pub mod setup;
 pub mod state;
