@@ -1,194 +1,217 @@
-# 06-pause-handshake — Phase 4 Shortcut Risk Assessment (Rev 3)
+# 06-pause-handshake — Phase 4 Shortcut Risk Assessment (Rev 4)
 
-## Verdict: LOW (shortcut posture); race-free verification FAILS — see §"Algorithm verification (obligation 2)"
+## Verdict: LOW — R3-F01 closed; algorithm verified race-free
 
-Shortcut-indicator grep on Rev 3 is clean: the §4 / §6 / §8 edits that
-swap `flock` for atomic `O_CREAT | O_EXCL` introduce no new
-compat/shim/transitional/feature-flag/temporary/workaround/fallback/
-defer/partial language, and the prior negation-by-naming "advisory in
-v1" frame from Rev 2 carries over unchanged in substance. R1-F01..R1-F04
-closures from Rev 2 are not touched by Rev 3 and remain intact. R2-F01
-on its **stated surface** (the flock-on-removable-path race) is closed:
-no `flock` calls remain in §4, §6, or §8.
+Rev 4 replaces Rev 3's `unlink + retry-create_new` stale-eviction with a
+**sentinel-flock + atomic-rename** protocol. The sentinel
+(`<lock_dir>/sentinel.lock`) is created idempotently with `O_CREAT |
+O_RDWR`, never unlinked, and its open-fd `flock(LOCK_EX)` is held across
+every read/decision/write in both `acquire` and `release`. Inside the
+critical section, lease state is installed via `O_CREAT | O_TRUNC |
+O_WRONLY` to a unique sibling temp file plus same-directory
+`rename(2)`. The proposal also adds A8 to §1.1 to record the new
+filesystem dependency. Shortcut-indicator grep on the Rev 4 deltas is
+clean; R1-F01..R1-F04 and R2-F01 closures are untouched and still
+standing; the obligation-2 trace from Round 3 cannot reproduce. Verdict
+returns to LOW with no cross-track escalation.
 
-However, obligation 2 (verify Rev 3 algorithm is race-free) **does not
-clear**. The replacement protocol — read-T_old → unlink → retry-
-`create_new` once — has a residual TOCTOU under concurrent stale-acquire
-that lets two contenders both emit a `0` lease for the same session.
-The shortcut posture is preserved (Rev 3 does not "advisory-away" the
-gap; it asserts the gap is closed), but the assertion is incorrect, so
-this report flags the algorithm finding for the next audit pass rather
-than relaxing the shortcut verdict.
+## Obligation 1 — R3-F01 closure
 
-## R2-F01 closure check (audit-only, on stated surface)
+R3-F01 named the stale-acquire TOCTOU between `read(expired) → unlink →
+retry create_new` as the HIGH defect: two contenders could both classify
+the lockfile as expired, then B's unconditional `unlink` could remove A's
+freshly created replacement inode, allowing both to emit `0`.
 
-R2-F01 named the flock/inode mismatch under contention as the HIGH
-defect. Rev 3 retires the flock primitive entirely:
+Rev 4 eliminates that surface:
 
-- §4 step 6 explicitly rejects POSIX advisory locks: "The
-  implementation must not rely on POSIX advisory locks for mutual
-  exclusion because the lockfile path may be unlinked during stale
-  cleanup"
-  (`proposals/06-pause-handshake.md:230-231`).
-- §4 step 7 replaces the lock-then-truncate-or-create pattern with
-  pure `OpenOptions::new().create_new(true).write(true).open(...)`
-  (= `O_CREAT | O_EXCL | O_WRONLY`)
-  (`proposals/06-pause-handshake.md:233-241`).
-- §6 mirror: "`acquire()` uses only atomic create-if-absent for mutual
-  exclusion" (`proposals/06-pause-handshake.md:350-352`).
-- §8 side-effect bullets describe atomic create / unlink-then-retry-
-  create only; no `flock` mention
-  (`proposals/06-pause-handshake.md:451-468`).
+- `proposals/06-pause-handshake.md:17-29` (changelog) explicitly tags the
+  sentinel-flock pattern as "Eliminates the TOCTOU window in Rev 3
+  between stale-read and unlink (R3-F01)".
+- `:248-259` (§4 step 7) introduces the sentinel: opened
+  `O_CREAT | O_RDWR` (no `O_EXCL`, idempotent), then `flock(sentinel_fd,
+  LOCK_EX)` is held "for the full session-lock read/write decision".
+- `:261-282` (§4 step 10) replaces the prior unlink-then-retry with:
+  write temp → fsync → atomic `rename` onto session lock path → remove
+  any stale `.released` marker → fsync directory → release sentinel
+  flock.
+- `:284-289` states the structural argument explicitly: "all contenders
+  serialize on the never-unlinked sentinel inode, no process can unlink
+  or replace a session lock created by another contender between
+  stale-read and stale-eviction. Inside the critical section,
+  same-directory `rename` provides atomic installation of the new
+  lease."
+- `:366-385` (§6) mirrors the runtime: a private `Sentinel { path,
+  file }` helper with `with_locked<F, R>(F) -> R` wraps every
+  `acquire`/`release` body; "The sentinel file is never deleted by
+  acquire or release."
+- `:510-538` (§8) updates the side-effect contract: "all contenders
+  serialize on …", "Read, write, rename, and unlink session lock files
+  only while holding the sentinel flock", and the temp-file naming rule
+  (`.acquire-<pid>-<random>.tmp`, `.release-<pid>-<random>.tmp`) so a
+  crashed mid-write does not collide with the live lock path.
+- §9.1 row "Stale acquire" updated (`:587`) to "Expired lockfile is
+  lazily replaced under the sentinel flock by atomic rename" with
+  fixture `Prewritten expired metadata` and assumption_link `A5, A7,
+  A8`.
+- §1.1 A8 (`:98`) records the new dependency: "Atomic rename plus
+  advisory flock on a non-removable sentinel is sufficient … on POSIX
+  filesystems supporting `flock(2)` and `rename(2)` atomicity",
+  evidence/invalidator filled in.
 
-On the literal surface R2-F01 named ("flock target can be removed and
-replaced under contention"), the defect is gone — there is no flock
-target anymore. **Closed on stated surface.** A different race emerges
-from the replacement protocol; see obligation 2 below.
+R3-F01 is **closed**.
 
-## R1 closure check (still standing)
+## Obligation 2 — Algorithm verification (race-free for documented threat model)
 
-| Finding | Rev 3 evidence | Status |
-| --- | --- | --- |
-| **R1-F01** marker shape | Rev 3 does not edit §3.2, §6 marker schema, or §4 marker steps. Sibling marker `session-<uuid>.released` and same-token replay rule unchanged. | **STILL CLOSED** |
-| **R1-F02** advisory-scope framing | Rev 3 does not edit §1, §1.2, §10, §11, §12, or §13's advisory-scope language. Five-place narrowing intact. | **STILL CLOSED** |
-| **R1-F03** `StateDb::open` clause | §8's "matching 06-locate and 06-export's §8 contracts" sentence and the §12 read-only follow-up commitment are unchanged. | **STILL CLOSED** |
-| **R1-F04** §9.1 columns | `assumption_link` and `residual_risk` columns intact; no row removed. | **STILL CLOSED** |
+### Two concurrent stale-acquire contenders (the R3-F01 trace)
 
-No regression on Rev 2's closure surfaces.
-
-## Algorithm verification (obligation 2)
-
-**Result: NOT race-free.** Two concurrent stale-acquire contenders can
-both emit a `0` lease for the same session.
-
-### Trace
-
-Initial state: expired lease `L0` exists at `lock_path`, inode `I0`.
-Two pause-handshake processes A and B start near-simultaneously after a
-crashed predecessor.
+Initial state: lock dir contains expired lease `L0` and the sentinel
+inode `S` (created on first run). Processes A and B start near
+simultaneously.
 
 | Step | Process | Effect |
 | --- | --- | --- |
-| 1 | A | step 7 `create_new` → EEXIST. step 9 reads `L0`, sees expired. |
-| 2 | B | step 7 `create_new` → EEXIST. step 9 reads `L0`, sees expired. |
-| 3 | A | step 10.2 `unlink(lock_path)` → success. Path empty. |
-| 4 | A | step 10.3 `create_new` → success. Path → `I1`. |
-| 5 | A | step 10.5 writes lease `L1` (token T_A), fsync, close. **A returns 0.** |
-| 6 | B | step 10.2 `unlink(lock_path)` → success. **This unlinks A's `I1`.** Path empty. |
-| 7 | B | step 10.3 `create_new` → success. Path → `I2`. |
-| 8 | B | step 10.5 writes lease `L2` (token T_B), fsync, close. **B returns 0.** |
+| 1 | A | Opens `sentinel.lock` `O_CREAT|O_RDWR` → fd_A (inode `S`); `flock(fd_A, LOCK_EX)` succeeds. |
+| 2 | B | Opens `sentinel.lock` `O_CREAT|O_RDWR` → fd_B (inode `S`); `flock(fd_B, LOCK_EX)` **blocks** because A holds the lock on the same inode (POSIX/Linux flock is per-inode across fds). |
+| 3 | A | Opens session lock read-only, reads `L0`, sees `expires_at <= now`. Stale path. |
+| 4 | A | Writes lease `L_A` (token `T_A`) to `<session>.lock.acquire-<pidA>-<r>.tmp`, fsyncs, `rename(...tmp, <session>.lock)`. Path entry → `I_A`. |
+| 5 | A | Removes any old `.released` marker, fsyncs dir, closes fd_A (releasing flock). Returns `0` with `T_A`. |
+| 6 | B | `flock(fd_B, LOCK_EX)` unblocks. |
+| 7 | B | Opens session lock read-only; sees `L_A` with `expires_at > now`. |
+| 8 | B | `expires_at > now` → release sentinel flock, exit `13 session-busy`. |
 
-Both processes have valid pause receipts with distinct tokens. Step 10's
-core test-intent claim — "two concurrent pause calls grant one token,
-one `13 session-busy`" (§9.1 Atomic acquire row,
-`proposals/06-pause-handshake.md:504`) — is violated.
+The Rev 3 trace step 6 ("B: `unlink(P)` removes the directory entry for
+`I_A`") is unreachable in Rev 4: B does not perform any
+`unlink(session-<uuid>.lock)` during acquire — Rev 4 only mutates the
+session lock via atomic rename, never unconditional unlink. And B's
+read-and-decide cycle runs after A's rename, not before, because the
+sentinel flock serializes them.
 
-### Why §4 step 10's atomicity claim does not cover this
+### Stale-acquire vs concurrent release (the R3-F01 §"Failure mode" trace)
 
-The proposal (`proposals/06-pause-handshake.md:264-266`) states: "The
-race between `unlink` and retry-create is closed by the same kernel
-atomic create-if-absent guarantee: only one contender can create the
-replacement lockfile."
+Round 3's secondary trace had A holding an expired lease and racing a
+parallel B's stale-acquire. Under Rev 4 both `acquire` and `release` run
+inside `Sentinel::with_locked` (§6, `:366-381`; §4 steps 7, 14;
+`:510-526` and `:531-538`). Whichever process first wins
+`flock(LOCK_EX)` runs read-decide-write to completion (rename or
+unlink + marker rename) before the other observes any state. There is no
+window where one process's `unlink` of `<session>.lock` can race another
+process's `rename` onto it: the loser sees the post-mutation state.
+Concretely:
 
-The kernel guarantee for `O_CREAT|O_EXCL` is per-call: at most one of
-N simultaneous `open(..., O_CREAT|O_EXCL)` calls on the same path
-succeeds when the path starts empty. It does **not** sequence
-`unlink` against another process's already-completed `create_new`. In
-the trace above, B's `unlink` at step 6 occurs after A's `create_new`
-already completed at step 4 — B's `unlink` removes the path entry to
-A's freshly linked inode `I1`, leaving the path empty for B's own
-`create_new` at step 7. Both create_new calls are individually atomic
-and individually successful; the race is between A's create and B's
-unlink, which the spec does not synchronize.
+- If release wins first: lockfile is unlinked, marker is renamed in.
+  Stale-acquire then sees `ENOENT` on the lockfile (and the new marker
+  is irrelevant to acquire — `:280-281` removes any old marker on the
+  way out), writes via temp+rename, exits `0` with a fresh token.
+- If stale-acquire wins first: lease is replaced by atomic rename to a
+  new token-hash. Release then reads the new lease, sees a different
+  `token_hash`, and exits `16 lock-token-invalid`. This is the correct
+  outcome — the original token no longer owns the lease — and matches
+  §5.2's `lock-token-invalid` semantics.
 
-Step 10.2 is unconditional. The spec reads `T_old` at step 10.1 but
-does not use it to predicate the unlink (POSIX has no compare-and-
-swap unlink). Without that gate, B cannot tell whether the file at
-`lock_path` at the moment of its `unlink` call is `I0` (the expired
-file it observed at step 2) or `I1` (A's fresh replacement).
+### First-acquire (no prior lockfile)
 
-### Failure mode under release/acquire interleaving
+Same pattern: acquire takes the sentinel flock, opens session lock
+read-only → `ENOENT`, writes temp + atomic rename, releases flock,
+returns `0`. A second contender blocks on the sentinel flock, then on
+unblock reads the freshly renamed lease and exits `13`. Race-free.
 
-The same class of race appears between release and a parallel stale-
-acquire. If A holds an expired lease and is at §4 step 15 (write
-marker → unlink lockfile), a parallel B in stale-acquire can `unlink`
-A's I1 before A's own `unlink`, and `create_new` a fresh I2 that A's
-trailing `unlink` then removes. Outcome: B holds an open fd to I2,
-the path is empty, and B's later `resume-handshake` finds neither
-lockfile nor matching marker (only A's release marker for the
-original session) and exits `16 lock-token-invalid`. B is wedged.
+### Crash-during-write
 
-### What would close the algorithm gap
+If A crashes between writing the temp file and the rename, the temp file
+has a unique path (`.acquire-<pid>-<r>.tmp`) and never appears at
+`<session>.lock`; the lock path remains in its pre-attempt state (or
+`ENOENT`). §8 (`:558-564`) explicitly notes the orphaned temp does not
+collide with the lock path and is not a future stale-eviction concern.
+If A crashes between rename and flock-release, the kernel releases the
+flock on fd close. The lease lives at the lock path with the recorded
+TTL; crash recovery is the documented TTL-driven lazy replacement (D5,
+A5) — now safely serialized through the sentinel.
 
-R2-F01's required-closure list (`risk/06-pause-handshake-audit.md:113-
-121`) named the two structural fixes that work against this whole
-class:
+### A8 invalidators
 
-1. A separate per-session **stable guard** (e.g.
-   `session-<uuid>.guard`) that is `O_CREAT|O_EXCL`-created once,
-   never unlinked, and `flock`ed before any acquire/release. The
-   guard's pathname is never reused, so flock semantics are stable;
-   `.lock` and `.released` mutate only under the guard.
-2. A **lock-directory** protocol using atomic `mkdir` (which is
-   compare-and-create at the directory entry level, like `O_EXCL`,
-   but with stale-owner replacement rules that do not require
-   unconditional `unlink` of a directory entry another contender may
-   have just refreshed).
+A8 (`:98`) names the two filesystem regimes that would invalidate the
+race-free claim: "Filesystems without working `flock` such as NFSv2/3
+quirks, or non-atomic rename across mount points." The lock dir is fixed
+at `~/.local/share/oulipoly-agent-runner/locks/`, so all temp files
+share the lock dir's mount and `rename(2)` atomicity is preserved. The
+"local POSIX filesystem with working flock" assumption is consistent
+with the supported-surface deployment mode (§11, local CLI binary,
+owner-private state).
 
-A non-structural patch that would also close the trace above:
-serialize stale-acquire on the guard, or replace step 10.2's
-unconditional `unlink` with a `renameat2(RENAME_EXCHANGE)`-style
-atomic swap against a temp file (Linux-only; the spec already accepts
-non-portability per §12 Windows residual). Rev 3 takes none of these.
+**Algorithm verified race-free for the documented threat model.**
 
-## Shortcut-indicator grep (Rev 3 deltas only)
+## Obligation 3 — R1 / R2 closures still standing
 
-Re-ran the canonical flag list against the Rev 3 changelog header
-(`proposals/06-pause-handshake.md:8-14`) and the changed §4/§6/§8
-spans (`:208-291`, `:343-358`, `:451-468`).
+| Finding | Rev 4 evidence | Status |
+| --- | --- | --- |
+| **R1-F01** sibling marker shape | §3.2 `release_marker_path` field unchanged (`:199`); §4 step 16 marker write/rename path (`:303-311`) keeps `session-<uuid>.released`; §6 marker schema (`:466-474`) and idempotency rule (`:480-488`) untouched. | **STILL CLOSED** |
+| **R1-F02** advisory-scope framing | §1 narrowing (`:47-55`), §1.2 (`:108-112`), §10 README bullets (`:614-618`), §11 deferred observers list (`:638-640`), §12 (`:670-673`), §13 row (`:692`) — all unchanged. Five-place narrowing intact; named retrofit owners preserved. | **STILL CLOSED** |
+| **R1-F03** `StateDb::open` clause | §8 (`:549-557`) "matching 06-locate and 06-export's §8 contracts" sentence preserved; §12 read-only follow-up commitment (`:677-680`) intact. | **STILL CLOSED** |
+| **R1-F04** §9.1 columns | `assumption_link` and `residual_risk` columns present on every row (`:577-598`); A8 added to relevant rows ("Atomic acquire", "Per-session scope", "Stale acquire", "Busy lock", "Correct release", "Expired matching release", "Permissions", "Side effects"). | **STILL CLOSED** |
+| **R2-F01** flock-on-removable-inode | Rev 4 reintroduces flock, but on a *non-removable* sentinel — exactly the structural fix R2-F01's required-closure list named ("a separate per-session **stable guard** … created once, never unlinked, and `flock`ed before any acquire/release"). §4 step 7, §6 `Sentinel`, §8 "never deleted by acquire or release" all enforce this. | **STILL CLOSED** (now closed structurally rather than by removal) |
 
-- **`atomic`**, **`bounded`**, **`race-free`**, **`Eliminates`**
-  (changelog and §4 step 10 lead-in) — assertions of correctness, not
-  shortcut indicators. Whether they are technically accurate is the
-  obligation-2 finding above; whether they paper over a deferral is
-  what the shortcut grep checks, and they do not.
-- **`advisory`** (line 13, line 230, plus the carried-over Rev 2
-  occurrences) — line 13 ("POSIX advisory locks") and line 230
-  ("rely on POSIX advisory locks") use the term in its precise POSIX
-  sense (the `flock`/`fcntl` family is *advisory* as opposed to
-  *mandatory* locking). Not a shortcut indicator. The Rev 2-era
-  "advisory in v1" framing for sibling-writer scope is unchanged and
-  remains negation-by-naming with named retrofit owners.
-- **`bounded`** (changelog line 11, §4 step 10 lead-in) — describes
-  the retry budget (one retry, then exit 13). Not a shortcut.
-- **`defer` / `follow-up` / `followup` / `partial`** — only the
-  carried-over Rev 2 occurrences (sibling-PR retrofits, schema-probe
-  read-only open, §13 D4b row). No new occurrences in Rev 3 spans.
+No regression on Round 1 or Round 2 closure surfaces.
+
+## Shortcut-indicator grep (Rev 4 deltas only)
+
+Re-ran the canonical flag list against the Rev 4 changelog (`:17-29`),
+A8 row (`:98`), §4 steps 6–10 (`:241-291`), §4 steps 14–17 (`:296-319`),
+§6 sentinel/acquire/release prose (`:366-417, :454-461`), §8 bullets
+(`:510-538, :558-564`), §9.1 row updates (`:583-598`), §12 (`:660-661`),
+A8 column citations (`:691-700`).
+
+- **`atomic`**, **`race-free`**, **`Eliminates`**, **`serialize`** —
+  correctness assertions tied to the sentinel-flock + atomic-rename
+  protocol. Verified above in obligation 2; not shortcut hedges.
+- **`advisory`** — used in two distinct senses, both legitimate:
+  (a) "POSIX advisory lock" in §1 A8 line `:98` and §6/§8 sentinel
+  description (the technical opposite of mandatory locking — the
+  protocol is precisely an advisory-lock-based mutex on a non-removable
+  inode); (b) the carried-over Rev 2 "advisory in v1" framing for
+  sibling-writer scope (R1-F02 closure surface, retrofit owners named).
+  Neither is a shortcut hedge.
+- **`when practical`** (§4 step 10.6, §8 bullet for fsync directory) —
+  carries forward from Rev 3; portability hedge for `fsync(dir_fd)` on
+  filesystems where it is a no-op. Not a Rev 4 introduction.
+- **`defer` / `follow-up` / `partial`** — only the carried-over Rev 2
+  occurrences (sibling-PR retrofits in §1, §12, §13; schema-probe
+  read-only open in §8, §12). No new occurrences in Rev 4 spans.
 - **`compat`, `shim`, `backward`, `legacy`, `transitional`,
   `dual-write`, `feature flag`, `for now`, `in the future`, `TODO`,
   `FIXME`, `workaround`, `temporary`, `graceful`, `self-heal`,
-  `placeholder`, `hardcode`, `magic`, `symptom`, `hack`, `fallback`**
-  — zero hits in Rev 3 deltas. (`fallback` still appears at lines
-  204 and 377 from Rev 1, both negations.)
+  `placeholder`, `hardcode`, `magic`, `symptom`, `hack`, `fallback`** —
+  zero hits in Rev 4 deltas. (`fallback` still appears at `:230` and
+  `:498` from Rev 1, both negations.)
 
-Rev 3 introduces no new shortcut posture.
+Rev 4 introduces no new shortcut posture.
 
-## Regression check vs Rev 2
+## Regression check vs Rev 3
 
-No shortcut regression. Rev 3's edits are confined to §4 steps 6–10,
-§6 acquire description, §8 side-effect bullets, and the changelog
-header. The R1 closure surfaces (§1, §1.2, §3.2, §6 marker schema,
-§9.1 columns, §10, §11, §12, §13) are not touched. Rev 1 LOW
-observations L1, L3, L4, L5 carry forward unchanged as Phase 5
-implementer notes.
+Rev 4 edits are confined to:
+
+- Changelog header (`:17-29`).
+- A8 row added to §1.1 register (`:98`).
+- §4 steps 6–10 (acquire), step 14 (release sentinel-open), step 16
+  (release write/rename) (`:241-291, :296-311`).
+- §6 sentinel struct + acquire/release prose (`:366-417`); shared
+  sentinel paragraph (`:454-461`).
+- §8 acquire/release/sentinel side-effect bullets and the temp-file
+  naming clause (`:510-538, :558-564`).
+- §9.1 assumption_link updates on the rows that depend on the new
+  serialization (`:583-598`).
+- §12 file-backed lease residual updated (`:660-661`).
+- §13 cross-feature row notes preserved (`:691-700`).
+
+R1 closure surfaces (§1, §1.2, §3.2, §6 marker schema, §9.1 column
+shape, §10, §11, §12 advisory-scope residual, §13 D4b row) are not
+substantively touched. Rev 1 LOW observations L1, L3, L4, L5 carry
+forward unchanged as Phase 5 implementer notes. No shortcut regression.
 
 ## Findings (severity >= MEDIUM)
 
-None on shortcut surface. The obligation-2 finding above is escalated
-to the next audit pass because it concerns algorithmic correctness,
-not shortcut posture: the Rev 3 algorithm asserts a fix that does not
-hold, but it asserts it directly rather than via a shortcut hedge, so
-the shortcut-track gate is preserved at LOW. The audit reviewer
-should treat this as a fresh HIGH (R3-F01 candidate) and decide
-whether to require Rev 4 with a stable-guard or atomic-rename
-protocol per the R2-F01-required-closure menu.
+None on shortcut surface. The Round 3 cross-track escalation (R3-F01)
+is closed by Rev 4. The algorithm is race-free under the documented
+threat model (POSIX local fs with working `flock(2)` + atomic
+same-directory `rename(2)`); the invalidator regimes are recorded as A8.
+Shortcut-track gate clears at LOW; no further audit-track escalation
+required from this report.
