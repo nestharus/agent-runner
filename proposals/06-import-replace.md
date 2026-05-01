@@ -1,4 +1,4 @@
-# 1. Scope statement (Rev 2)
+# 1. Scope statement (Rev 3)
 
 06-import-replace adds one mutating CLI surface:
 
@@ -37,6 +37,23 @@ replaces the draft register in that map.
 - §6 / §9 / §12: explicit canonical-record field-loss model
   (parent_turn_id, is_sidechain, is_compaction_boundary stored as
   NULL); future canonical-schema extensions preserve them (AIR-R1-F04).
+
+**Rev 3 changes** (Round 2 audit AIR-R2-F01 closure):
+
+- §4 / §6: expanded journal schema with resolved identity
+  (chain_id, active_segment_id, provider_name, storage_type)
+  + canonical_records_path; recovery rebuilds DB rows from
+  journal-attached canonical file, not stale resolver state.
+- §4: reordered flow so journal deletion is the LAST step,
+  AFTER postimage_sha256 verification AND fresh export round-trip
+  verification. Verification failures leave journal in place.
+- §4: startup recovery flow specified for both hash-matches-postimage
+  (re-apply DB) and hash-matches-preimage (no-op cleanup) and
+  ambiguous (quarantine) cases.
+- §9: 4 new T-rows for recovery scenarios (rename-only, ambiguous-hash,
+  canonical-records-preserved, no-delete-before-verify).
+- §8: side-effect contract updated to include canonical_records_path
+  write + quarantine directory.
 
 What changes:
 
@@ -81,10 +98,10 @@ there; do not maintain a competing register.
 | A2 | `StateDb::resolve_resume` remains the sole ownership resolver. | Initiative 06 requires reuse of `StateDb::resolve_resume`; current resolver owns chain/segment selection (`src-tauri/src/state/db.rs:2577-2670`). | A preceding feature changes public session ownership away from chain/segment resume semantics. | §4 resolution flow; §5 exits `10`/`11`; §13 checklist. |
 | A3 | Canonical input is the 06-export `CanonicalRecord` JSONL family, not provider-native JSONL and not `session_turns`. The on-disk replacement bytes are provider-native renderings of that canonical input. | Harness anti-scope excludes provider-native JSONL as input; export defines `CanonicalRecord` fields and parser selection (`03-session-import-replace.md`, `06-export/src-tauri/src/session_export/mod.rs:8-99`). | Export contract changes before import-replace starts, or a provider adds a native renderer with incompatible losslessness rules. | §3 validation/rendering; §6 replacement renderer; §9 tests. |
 | A4 | Preimage/postimage hashes are over the canonical transcript byte stream emitted by the export serializer, not over summary DB rows. | `session_turns` lacks content/source hashes, while harness requests current canonical transcript hash (`src-tauri/src/state/db.rs:559-572`, `03-session-import-replace.md`). | Harness explicitly pins preimage to raw provider JSONL bytes instead of canonical export bytes. | D2 in §4; §6 receipt; §9 preimage tests. |
-| A5 | Storage type remains the discriminator for supported replace behavior: `claude_code` and `codex_session` are supported; `other` is refused in v1. | Export parser supports Claude/Codex and rejects `other`; locate maps config storage to public types (`06-export/src-tauri/src/session_export/mod.rs:36-52`, `06-locate/src-tauri/src/session_metadata/mod.rs:23-39`). | A later storage API supplies a renderer for `other` before this feature lands. | §4 step 5; §5 exit `12`; §6 renderer. |
+| A5 | Storage type remains the discriminator for supported replace behavior: `claude_code` and `codex_session` are supported; `other` is refused in v1. | Export parser supports Claude/Codex and rejects `other`; locate maps config storage to public types (`06-export/src-tauri/src/session_export/mod.rs:36-52`, `06-locate/src-tauri/src/session_metadata/mod.rs:23-39`). | A later storage API supplies a renderer for `other` before this feature lands. | §4 pre-mutation setup; §5 exit `12`; §6 renderer. |
 | A6 | Current `running` invocation rows are not sufficient as replace locks. | Running rows may lack session id before provider spawn, can survive hard process death, and are not tokenized leases (`research/06-import-replace-problem-map.md` §5 #10-13). | A preceding feature turns invocation lifecycle into durable active-writer leases. | D1 in §4; §8 lock API; §12 residuals. |
-| A7 | State consistency must replace `session_turns` and refresh existing chain/segment rows after file commit. | Resolver, trace, export metadata, and migration all read session tables; `session_turns` uniqueness is `(provider_name, session_id, turn_id)` (`src-tauri/src/state/db.rs:559-597`, `src-tauri/src/state/db.rs:2577-2764`). | A preceding feature introduces a new canonical transcript-state table that supersedes these rows. | D4 in §4; §7 state update; §9 tests. |
-| A8 | Crash recovery cannot make filesystem rename and SQLite update one physical transaction, so import-replace v1 must use a durable pending-operation journal to make startup recovery deterministic. | Current migration renames before DB segment updates and has no pending-op table (`src-tauri/src/migration/mod.rs:206-231`); Phase 4 audit requires deterministic recovery for injected failures. | A prior feature lands an equivalent durable transcript-replace journal used by import-replace. | D5 in §4; §6 recovery API; §8 recovery; §9 tests. |
+| A7 | State consistency must replace `session_turns` and refresh existing chain/segment rows after file commit. | Resolver, trace, export metadata, and migration all read session tables; `session_turns` uniqueness is `(provider_name, session_id, turn_id)` (`src-tauri/src/state/db.rs:559-597`, `src-tauri/src/state/db.rs:2577-2764`). | A preceding feature introduces a new canonical transcript-state table that supersedes these rows. | D4 in §7; §7 state update; §9 tests. |
+| A8 | Crash recovery cannot make filesystem rename and SQLite update one physical transaction, so import-replace v1 must use a durable pending-operation journal to make startup recovery deterministic. | Current migration renames before DB segment updates and has no pending-op table (`src-tauri/src/migration/mod.rs:206-231`); Phase 4 audit requires deterministic recovery for injected failures. | A prior feature lands an equivalent durable transcript-replace journal used by import-replace. | D5 in §8; §6 recovery API; §8 recovery; §9 tests. |
 | A9 | `--from-file` and stdin are equivalent after bytes are loaded. | Harness specifies stdin unless `--from-file`; existing code has no transcript-oriented reader (`03-session-import-replace.md`, `research/06-import-replace-problem-map.md` §1 #26). | Harness adds format-specific behavior for file input. | §2 CLI; §3 input validation; §9 tests. |
 | A10 | Postimage hash and mutation receipt are new observability fields, not reuse of an existing receipt. | Existing receipts carry ids, providers, paths, or lock tokens, not transcript hashes (`research/06-import-replace-problem-map.md` §6 #12). | Export/schema-probe gains a stable transcript hash field first. | §6 JSON receipt; §11 observability. |
 
@@ -231,7 +248,7 @@ D2 decision: use a two-phase replace with same-directory temp file, fsync,
 atomic rename, and a durable replace journal. The authoritative commit window is
 protected by `SessionLock`.
 
-Flow:
+Pre-mutation setup:
 
 1. Parse `<session-id>` and `--preimage-sha256`.
 2. Load input bytes from stdin or `--from-file`.
@@ -244,79 +261,113 @@ Flow:
 6. Resolve session metadata through `SessionMetadata`. Map resolver not-found to
    `10`, ambiguity to `11`, and unsupported/non-mutable storage to `12`.
 7. Reject `storage_type: "other"` with exit `12 unsupported-storage`.
-8. Validate the input canonical JSONL against the resolved `session_id`,
+8. Freeze the resolved identity for the operation: `session_id`, `chain_id`,
+   `active_segment_id`, `provider_name`, `storage_type`, and `jsonl_path`.
+9. Validate the input canonical JSONL against the resolved `session_id`,
    `provider_name`, and storage renderer support. Render canonical records into
    provider-native bytes for the resolved storage type. Invalid input or lossy
    render cases exit `15`.
-9. Clean stale import-replace temp files in the target transcript directory whose
-   names match this feature's temp-file convention and are not currently locked
-   by another live replace operation.
-10. Compute a preflight `preimage_sha256` over the current canonical export stream
-   for the resolved session. If `--preimage-sha256` is present and mismatches,
-   exit `15` before lock acquisition.
-11. Compute the expected `postimage_sha256` over the normalized canonical input
+10. Clean stale import-replace temp files in the target transcript directory
+    whose names match this feature's temp-file convention and are not currently
+    locked by another live replace operation.
+11. Compute a preflight `preimage_sha256` over the current canonical export
+    stream for the resolved session. If `--preimage-sha256` is present and
+    mismatches, exit `15` before journal creation or lock acquisition.
+12. Compute the expected `postimage_sha256` over the normalized canonical input
     stream. This is the canonical export hash expected after the provider-native
     file is committed and parsed back through export.
-12. Write the durable pending journal entry at
-    `<state-data-dir>/replace_journal/session-<session_id>.pending`, then fsync
-    the journal file and its parent directory.
-13. Acquire `SessionLock` for the resolved active provider session id with owner
-    `"import-replace"`. Busy deletes the pre-mutation journal entry, fsyncs the
-    journal directory, and exits `13`.
-14. Re-read and re-hash the current canonical export stream while holding the
-    lock. This second hash is the receipt `preimage_sha256`. If the optional
-    caller-provided preimage now mismatches, delete the journal entry, release
-    the lock, and exit `15`.
-15. If the under-lock preimage differs from the journal's `preimage_sha256`,
-    atomically rewrite and fsync the journal before writing a transcript temp
-    file. No transcript mutation may happen unless the durable journal matches
-    the under-lock preimage and expected postimage.
-16. Write provider-native bytes to `<jsonl_path>.tmp-import-replace-<uuid>` in the same
-    directory.
-17. Fsync the temp file.
-18. Atomically rename the temp file to `jsonl_path`.
-19. Fsync the parent directory.
-20. Update DB rows for state consistency in one SQLite transaction.
-21. Delete the durable journal entry after the DB transaction has committed and
-    fsync the journal directory. If the process crashes after DB commit but
-    before journal deletion, startup recovery re-applies the DB update
-    idempotently and removes the journal.
-22. Compute `postimage_sha256` by reading the newly committed transcript through
-    the same canonical export path used for preimage hashing.
-23. Emit one receipt JSON on stdout, release the lock, and exit `0`.
+
+Success flow:
+
+1. Validate input, write normalized canonical records to
+   `<state-data-dir>/replace_journal/session-<session_id>.canonical.jsonl`,
+   write the durable pending journal entry, and fsync both files and the
+   `replace_journal` directory. The journal includes the frozen resolved
+   identity and points at the canonical records file.
+2. Acquire `SessionLock` for the resolved active provider session id with owner
+   `"import-replace"`. Busy maps to exit `13`. Because no transcript mutation
+   has occurred, this handled busy failure may unlink the journal and canonical
+   records file idempotently before exit.
+3. Read the existing provider transcript, parse it through the canonical reader,
+   compute `preimage_sha256`, and verify it against `--preimage-sha256` when
+   given. A preimage mismatch exits `15` before transcript mutation and leaves
+   the journal plus canonical records file in place for inspection.
+4. If the under-lock preimage differs from the journal's `preimage_sha256`,
+   atomically rewrite and fsync the journal before writing a transcript temp
+   file. Then write provider-native bytes to
+   `<jsonl_path>.tmp-import-replace-<uuid>` in the same directory and fsync the
+   temp file.
+5. Atomically rename `<jsonl_path>.tmp-import-replace-<uuid>` to `jsonl_path`
+   and fsync the parent directory.
+6. Begin a SQLite transaction. Replace `session_turns` rows for this
+   provider/session from `canonical_records_path` and refresh segment/chain
+   recency, but do not commit yet.
+7. Compute `postimage_sha256` by reading the newly written transcript file
+   through the canonical reader. Verify it matches the journal's recorded
+   `postimage_sha256`. If it mismatches, roll back the SQLite transaction, exit
+   `1 operational-error`, and leave the journal plus canonical records file in
+   place for operator inspection.
+8. Run fresh export verification: parse the new transcript through the canonical
+   reader and compare the resulting canonical bytes to
+   `canonical_records_path`. If it mismatches, roll back the SQLite transaction,
+   exit `1 operational-error` with a specific fresh-export verification error,
+   and leave the journal plus canonical records file in place.
+9. Only after step 8 succeeds, commit the SQLite transaction.
+10. Delete the journal entry and canonical records file with idempotent unlink,
+    then fsync the `replace_journal` directory. This is the last durable cleanup
+    step.
+11. Release `SessionLock`.
+12. Emit one receipt JSON on stdout and exit `0`.
 
 The second preimage check after lock acquisition is intentional. It preserves the
 harness preimage behavior while closing the time-of-check/time-of-use gap between
-early hashing and the protected commit window.
+early hashing and the protected commit window. Any failure in success-flow steps
+3-9 leaves the journal plus canonical records file in place; that journal is the
+recovery signal.
 
 Journal format:
 
 ```json
 {
+  "schema_version": 1,
   "operation": "import-replace",
+  "started_at": "2026-04-30T12:34:56Z",
   "session_id": "9e69e8cc-616d-4640-bf1d-96f5391b1a2e",
+  "chain_id": "33d5e6ec-f8a5-4cf8-9f65-9fe7ec3f6a0a",
+  "active_segment_id": 42,
+  "provider_name": "claude2",
+  "storage_type": "claude_code",
   "jsonl_path": "/home/me/.claude2/projects/.../9e69e8cc.jsonl",
   "preimage_sha256": "...",
   "postimage_sha256": "...",
+  "canonical_records_path": "/home/me/.local/share/agent-runner/replace_journal/session-9e69e8cc-616d-4640-bf1d-96f5391b1a2e.canonical.jsonl",
   "db_state_pending": true,
-  "started_at": "2026-04-30T12:34:56Z"
+  "expected_turn_count": 18
 }
 ```
 
 The journal is private implementation state, not a public receipt log.
 Its hashes are canonical export hashes for recovery comparison, not raw
 provider-native file-byte hashes.
+`chain_id`, `active_segment_id`, `provider_name`, and `storage_type` are
+resolved before transcript mutation and frozen in the journal. The
+`canonical_records_path` file is written before the transcript rename and is the
+recovery source of truth for rebuilding `session_turns`; recovery must not
+re-read the postimage transcript and infer DB rows from provider-rendered bytes.
+`storage_type` is limited to `claude_code` or `codex_session` in v1 because
+`other` is rejected before journal creation.
 
 DB finalization transaction contents:
 
 1. Replace `session_turns` rows for the resolved provider/session with rows
-   reconstructed from canonical records.
+   reconstructed from `canonical_records_path`.
 2. Refresh `session_chain_segments.last_used_at` and `last_turn_id` for the
    active segment.
 3. Refresh `session_chains.last_used_at` for the owning chain.
 
-The filesystem journal entry is deleted only after the SQLite transaction
-commits, then the journal directory is fsynced before the success receipt.
+The filesystem journal entry and canonical records file are deleted only after
+postimage verification, fresh export verification, and SQLite commit all
+succeed. The journal directory is fsynced before the success receipt.
 
 # 5. Exit codes
 
@@ -325,7 +376,7 @@ D7 decision: use the harness exit namespace exactly.
 | Exit | Error code | Producing condition | Mutation guarantee |
 | --- | --- | --- | --- |
 | `0` | none | Transcript file replaced, state consistency transaction committed, receipt emitted. | Transcript and DB update both completed. |
-| `1` | `operational-error` or specific internal code | Unexpected I/O, DB, serialization, fsync, rename, lock-store operational error, or post-commit verification error not covered below. | Depends on phase; stderr must state whether rename happened when known. |
+| `1` | `operational-error` or specific internal code | Unexpected I/O, DB, serialization, fsync, rename, lock-store operational error, or post-rename verification error not covered below. | Depends on phase; stderr must state whether rename happened when known. |
 | `2` | `invalid-session-id` or clap usage | Invalid UUID, invalid flag value, missing args, duplicate/unknown args. | No mutation. |
 | `10` | `session-not-found` | Resolver cannot find a chain/active session for the input. | No mutation. |
 | `11` | `ambiguous-session` | Resolver returns ambiguous owner. | No mutation. |
@@ -356,6 +407,12 @@ Reusable implementation modules:
   `timestamp`, and `role`. Fields not present in `CanonicalRecord`
   (`parent_turn_id`, `is_sidechain`, `is_compaction_boundary`) are intentionally
   written as `NULL` or schema defaults in `session_turns`.
+- The journal API writes both
+  `<state-data-dir>/replace_journal/session-<session_id>.pending` and
+  `<state-data-dir>/replace_journal/session-<session_id>.canonical.jsonl`.
+  The pending entry contains the resolved `chain_id`, `active_segment_id`,
+  `provider_name`, `storage_type`, `jsonl_path`, canonical hashes, and
+  `canonical_records_path`.
 - The recovery API scans `<state-data-dir>/replace_journal/` on startup and
   reconciles pending replace operations before normal session resolution work
   relies on derived rows.
@@ -364,22 +421,32 @@ Startup recovery contract:
 
 1. Scan `<state-data-dir>/replace_journal/` for files named
    `session-<session_id>.pending`.
-2. Parse the journal JSON and ignore files whose `operation` is not
-   `"import-replace"`.
-3. Read `jsonl_path` through the storage parser and canonical serializer, then
-   compare that canonical export SHA-256 to the journal hashes. The journal
-   hashes remain canonical hashes even though the file bytes are provider-native.
-4. If the transcript matches `postimage_sha256`, the rename happened. Re-apply
-   the DB updates idempotently from the transcript rows, refresh segment
-   `last_used_at`, delete the journal entry, and fsync the journal directory.
-5. If the transcript matches `preimage_sha256`, the rename did not happen or was
-   rolled back. Delete the journal entry and fsync the journal directory.
-6. If the transcript matches neither hash, the state is ambiguous. Log a warning,
-   rename the journal to a quarantined marker, and leave the transcript and DB
-   untouched for explicit operator recovery.
+2. Read journal JSON; extract resolved identity (`chain_id`,
+   `active_segment_id`, `provider_name`, `storage_type`, `jsonl_path`), hashes,
+   and `canonical_records_path`. Ignore files whose `operation` is not
+   `"import-replace"` or whose `schema_version` is unsupported.
+3. Read the transcript at `jsonl_path` through the storage parser and canonical
+   serializer, then compare that canonical export SHA-256 to the journal hashes.
+   The journal hashes remain canonical hashes even though the file bytes are
+   provider-native.
+4. If the transcript hash equals `postimage_sha256`, the rename landed.
+   Re-apply DB updates idempotently from `canonical_records_path`: replace
+   `session_turns` rows for `(provider_name, session_id)` and update the frozen
+   active segment's `last_used_at` / `last_turn_id` plus the owning chain's
+   `last_used_at`. Then delete the journal entry and canonical records file and
+   fsync the journal directory.
+5. If the transcript hash equals `preimage_sha256`, the rename never landed or
+   was rolled back. Delete the journal entry and canonical records file and
+   fsync the journal directory. Do not mutate DB state.
+6. If the transcript hash matches neither hash, or the transcript cannot be
+   parsed into canonical export bytes, the state is ambiguous. Move the journal
+   to `<state-data-dir>/replace_journal/quarantine/`, leave the canonical
+   records file in place for manual inspection, and log
+   `"import-replace recovery: ambiguous transcript state for session X; manual recovery needed"`.
+   Leave the transcript and DB untouched.
 
 The future `agents migrate-db --recover` flag, or a separate
-`agents session import-replace --recover`, is anti-scope for v1. Rev 2 only
+`agents session import-replace --recover`, is anti-scope for v1. Rev 3 only
 requires on-startup auto-recovery.
 
 D6 decision: stdout on success is exactly one JSON object with the harness
@@ -479,7 +546,8 @@ Lock behavior:
 - It calls `SessionLock::acquire` for the resolved active provider session id.
 - Busy maps to exit `13`.
 - Operational lock-store failures map to exit `1`.
-- The lock is released on normal success and on handled pre-rename failures.
+- The lock is released on normal success and on handled failures when the
+  process remains alive.
 - If the process dies, the lock lease expires according to `SessionLock`
   semantics; import-replace does not invent a second lock format.
 
@@ -492,20 +560,29 @@ Temp-file convention:
 Durable journal side effects:
 
 - Before acquiring the session lock and before writing the transcript temp file,
-  import-replace writes
+  import-replace writes the normalized canonical records file at
+  `<state-data-dir>/replace_journal/session-<session_id>.canonical.jsonl`.
+- It then writes
   `<state-data-dir>/replace_journal/session-<session_id>.pending`.
-- The journal records `operation`, `session_id`, `jsonl_path`,
-  `preimage_sha256`, `postimage_sha256`, `db_state_pending`, and `started_at`.
-- The journal file and `replace_journal` directory are fsynced before transcript
-  mutation.
-- Handled failures after journal creation but before rename, including lock busy
-  and under-lock preimage mismatch, delete the journal entry and fsync the
-  journal directory before exiting.
-- After a successful DB consistency transaction, import-replace deletes the
-  journal entry and fsyncs the `replace_journal` directory before emitting the
-  receipt.
-- If the process exits after rename and before journal deletion, the journal is
-  the durable recovery signal.
+- The journal records `schema_version`, `operation`, `started_at`,
+  `session_id`, `chain_id`, `active_segment_id`, `provider_name`,
+  `storage_type`, `jsonl_path`, `preimage_sha256`, `postimage_sha256`,
+  `canonical_records_path`, `db_state_pending`, and `expected_turn_count`.
+- The canonical records file, journal file, and `replace_journal` directory are
+  fsynced before transcript mutation.
+- Handled lock busy before transcript mutation may delete the journal entry and
+  canonical records file before exiting `13`.
+- Failures in the protected flow after lock acquisition and before SQLite
+  commit, including under-lock preimage mismatch, postimage hash mismatch, and
+  fresh export verification mismatch, leave the journal entry and canonical
+  records file in place.
+- After postimage verification, fresh export verification, and SQLite commit all
+  succeed, import-replace deletes the journal entry and canonical records file
+  and fsyncs the `replace_journal` directory before emitting the receipt.
+- Recovery quarantine lives under
+  `<state-data-dir>/replace_journal/quarantine/`.
+- If the process exits after rename and before journal deletion, the journal and
+  canonical records file are the durable recovery signal.
 
 Crash states:
 
@@ -515,22 +592,26 @@ Crash states:
 3. Crash after fsync before rename: same as #2.
 4. Crash after rename before DB update: startup recovery sees `jsonl_path` whose
    canonical export hash matches `postimage_sha256`, re-applies the DB update
-   idempotently, refreshes segment recency, deletes the journal, and leaves a
-   deterministic committed state.
+   idempotently from `canonical_records_path`, refreshes segment recency,
+   deletes the journal and canonical records file, and leaves a deterministic
+   committed state.
 5. Crash during DB transaction: SQLite rolls the transaction back or commits it
    according to SQLite durability. Startup recovery sees the postimage and
-   re-applies the DB update idempotently if needed, then deletes the journal.
+   re-applies the DB update idempotently from `canonical_records_path` if
+   needed, then deletes the journal and canonical records file.
 6. Crash after DB commit before journal deletion or receipt: startup recovery
-   sees the postimage, re-applies the same DB update idempotently, deletes the
-   journal, and the caller can export/hash to discover the committed postimage.
+   sees the postimage, re-applies the same DB update idempotently from
+   `canonical_records_path`, deletes the journal and canonical records file, and
+   the caller can export/hash to discover the committed postimage.
 7. Startup recovery sees the transcript's canonical export hash matching
    `preimage_sha256`: rename did not happen or was rolled back; recovery deletes
-   the journal only.
+   the journal and canonical records file only.
 8. Startup recovery sees a canonical export hash matching neither preimage nor
    postimage, or cannot parse the provider-native transcript at all: recovery
-   logs a warning, marks the journal entry as quarantined, and leaves state
-   untouched for explicit operator cleanup. The recovery CLI flag is not part of
-   v1.
+   logs the required manual-recovery warning, moves the journal entry to
+   `replace_journal/quarantine/`, preserves the canonical records file for
+   inspection, and leaves state untouched for explicit operator cleanup. The
+   recovery CLI flag is not part of v1.
 
 D5 decision: add the durable pending-operation journal in v1. Stale temp files
 are still cleaned opportunistically by prefix/age, but the post-rename/pre-DB
@@ -559,10 +640,14 @@ Directory fsync:
 | Unsupported storage | `other` storage or missing renderer exits `12`. | integration | Metadata fixture from locate with no supported storage. | A5 | Exit `12`; no lock/write. | Future storage support may alter expected result. |
 | Unsupported record class | Canonical records that cannot be represented losslessly in the target provider format exit `15`. | component | Canonical multi-modal/tool-use fixture without clean Claude or Codex native rendering. | A3, A5 | Exit `15`; stderr names unsupported record class; no journal, temp file, transcript, or DB mutation. | Exact unsupported class taxonomy may grow. |
 | Schema incompatible | Probe says unsafe for import-replace exits `14`. | component | Temp DB missing required tables/indexes or feature flag fixture. | A1 | Exit `14`; no input write. | Depends on schema-probe helper shape after merge. |
-| Atomic temp/rename | Failure injected before temp, after temp, after fsync, before rename, and after rename produces deterministic state. | component | Replace primitive with injectable failure points and journal inspection. | A8 | Pre-rename failures leave target unchanged; journal recovery deletes preimage-matching journals; post-rename failures recover DB from postimage and delete journal. | Real OS crash cannot be perfectly simulated. |
-| Journal post-rename recovery | Crash after rename and before DB update is reconciled on next startup. | integration | Inject failure immediately after rename/fsync with seeded `session_turns`. | A8 | Startup scan finds pending journal, transcript canonical export hash matches postimage, DB rows are replaced idempotently, journal is deleted. | Requires startup hook to run in test harness. |
-| Journal pre-rename recovery | Crash before rename does not mutate DB and clears stale journal. | integration | Inject failure after journal write but before temp rename. | A8 | Startup scan sees transcript canonical export hash matching preimage, leaves transcript/DB unchanged, deletes journal. | External mutation between crash and startup becomes ambiguous case. |
-| Journal ambiguous recovery | Transcript canonical export hash matching neither preimage nor postimage is quarantined. | component | Mutate transcript after pending journal creation. | A8 | Startup scan logs warning, renames/marks journal quarantined, does not rewrite transcript or DB. | Operator recovery command is anti-scope. |
+| Atomic temp/rename | Failure injected before temp, after temp, after fsync, before rename, and after rename produces deterministic state. | component | Replace primitive with injectable failure points and journal inspection. | A8 | Pre-rename failures leave target unchanged; recovery deletes preimage-matching journals and canonical records files; post-rename failures recover DB from postimage and delete recovery artifacts. | Real OS crash cannot be perfectly simulated. |
+| Journal post-rename recovery | Crash after rename and before DB update is reconciled on next startup. | integration | Inject failure immediately after rename/fsync with seeded `session_turns`. | A8 | Startup scan finds pending journal, transcript canonical export hash matches postimage, DB rows are replaced idempotently from `canonical_records_path`, journal and canonical records file are deleted. | Requires startup hook to run in test harness. |
+| T-recovery-rename-only | Kill process between rename and DB commit; restart recovers derived state from the journal-attached canonical records file. | integration | Injectable kill point after rename/fsync and before SQLite commit, with stale `session_turns`. | A8 | Startup scan finds postimage hash, replaces `session_turns` from `canonical_records_path`, refreshes frozen segment, deletes journal and canonical records file. | Requires deterministic crash injection around transaction boundary. |
+| Journal pre-rename recovery | Crash before rename does not mutate DB and clears stale journal. | integration | Inject failure after journal write but before temp rename. | A8 | Startup scan sees transcript canonical export hash matching preimage, leaves transcript/DB unchanged, deletes journal and canonical records file. | External mutation between crash and startup becomes ambiguous case. |
+| Journal ambiguous recovery | Transcript canonical export hash matching neither preimage nor postimage is quarantined. | component | Mutate transcript after pending journal creation. | A8 | Startup scan logs warning, moves journal to quarantine, preserves canonical records file, does not rewrite transcript or DB. | Operator recovery command is anti-scope. |
+| T-recovery-ambiguous-hash | Kill process with pending journal, manually corrupt transcript, restart. | integration | Pending journal plus transcript bytes edited so canonical export hash matches neither preimage nor postimage, or parser rejects it. | A8 | Startup scan moves journal to `replace_journal/quarantine/`, logs manual-recovery warning, leaves transcript and DB untouched. | Manual repair remains outside v1. |
+| T-recovery-canonical-records-preserved | Canonical records file survives crash and remains byte-for-byte equal to normalized input. | component + integration | Inject crash after canonical records write and after rename-before-commit. | A8 | `canonical_records_path` exists after crash; content equals normalized canonical JSONL and is used for DB recovery. | Does not validate future canonical schema extensions. |
+| T-no-deletion-before-verify | Inject postimage hash mismatch after rename; command exits operationally without deleting recovery artifacts. | component | Replace primitive test hook mutates rendered transcript or expected hash before postimage verification. | A8 | Exit `1`; stderr names postimage verification failure; journal and `canonical_records_path` still exist; SQLite transaction is not committed. | Requires a targeted fault injection hook. |
 | DB row replacement | Existing `session_turns` for the session are deleted/reinserted; unrelated sessions remain unchanged. | component | Seed two sessions under same provider and replace one. | A7 | Row counts and latest turn ids match imported canonical records. | Summary mapping from unsupported records remains intentionally limited. |
 | DB metadata loss is explicit | Imported rows intentionally lose `parent_turn_id`, `is_sidechain`, and `is_compaction_boundary`. | component | Seed existing rows with parent/sidechain/compaction metadata, then import canonical records. | A7 | Reinserted rows have canonical fields populated and absent fields set to `NULL` or defaults. | Future canonical schema may change this expectation. |
 | Chain/segment refresh | Existing active segment remains same row; `last_turn_id` and chain `last_used_at` refresh. | component | Seed active chain/segment with old turns. | A7 | Same chain/segment identity; refreshed fields only. | Does not prove future resolver changes. |
@@ -648,9 +733,9 @@ of a particular session requires importing a prior exported transcript with the
 current postimage as preimage.
 
 Observability: the receipt JSON is the durable caller-facing success signal, and
-the private replace journal is the crash-recovery signal. The command does not
-create invocation rows, run provider commands, refresh quotas, or emit GUI
-events. Stderr JSON is the failure signal.
+the private replace journal plus its `canonical_records_path` file are the
+crash-recovery signal. The command does not create invocation rows, run provider
+commands, refresh quotas, or emit GUI events. Stderr JSON is the failure signal.
 
 # 12. Implementation residuals
 
@@ -683,15 +768,15 @@ omissions:
 | Constraint | Compliance | Citation / note |
 | --- | --- | --- |
 | Shared error-code namespace uses `10` session-not-found, `11` ambiguous-session, `12` unsupported-storage, `13` session-busy, `14` schema-incompatible, `15` invalid input/preimage mismatch. | Yes | Namespace in `initiatives/06-session-override-contract.md:106-111`; mapping in §5. |
-| Ownership resolution reuses `StateDb::resolve_resume`; no second ownership path. | Yes | A2 and §4 steps 4-7; partial segmentless DBs remain not-found. |
+| Ownership resolution reuses `StateDb::resolve_resume`; no second ownership path. | Yes | A2 and §4 pre-mutation setup; partial segmentless DBs remain not-found. |
 | Lock observation for import-replace once pause-handshake lands. | Yes | D1 in §4: import-replace acquires `SessionLock`; busy exits `13`. 06-pause-handshake PR #17 supplies the lock primitive dependency. |
 | Import-replace refuses if the session is in-flight or not exclusively owned by the replace operation. | Yes within cooperative lock surface | Existing lock or failed acquire exits `13`; non-cooperating external writers are residual in §12. Lock observation by writer paths (`run_repl`, `run_resume`, balanced one-shot, `migrate_chain_segment`) is a sibling-PR concern per 06-pause-handshake's PR #17 narrowed harness acceptance. v1 import-replace observes locks; concurrent runner writers observe per their own retrofit timeline. The harness consumer of v1 should treat `session-busy` as advisory until full retrofit lands. |
-| Read-only `StateDb` open / schema compatibility supplied by schema-probe. | Yes | §4 step 5 exits `14` when probe says unsafe. |
+| Read-only `StateDb` open / schema compatibility supplied by schema-probe. | Yes | §4 pre-mutation setup exits `14` when probe says unsafe. |
 | Export canonical reader defines import input family and round-trip oracle. | Yes | A3, §3 validation, §9 postimage round-trip. |
 | Provider transcript file receives provider-native bytes, not canonical bytes. | Yes | §3 and §6 define `CanonicalToProviderRenderer`; `claude_code` and `codex_session` render native records; `other` returns `UnsupportedStorage`. |
 | Lossy canonical-to-provider re-encoding is refused. | Yes | §3 renderer contract and §9 unsupported-record-class test exit `15 invalid-input-transcript`. |
 | Two-phase atomic file replacement uses same-directory temp, fsync, rename. | Yes | D2 in §4 and fsync details in §8. |
-| Durable journal closes post-rename/pre-DB crash recovery. | Yes | §4 journal flow, §6 startup recovery API, §8 side effects/crash states, §9 recovery tests. |
+| Durable journal closes post-rename/pre-DB crash recovery. | Yes | §4 journal flow, §6 startup recovery API, §8 side effects/crash states, §9 recovery tests. The journal carries resolved identity and `canonical_records_path`, and deletion happens only after verification plus DB commit. |
 | State consistency covers required rows. | Yes, with documented canonical-field loss | D4a in §7 replaces `session_turns` and refreshes chain/segment metadata. `parent_turn_id`, `is_sidechain`, and `is_compaction_boundary` are set to `NULL`/defaults because `CanonicalRecord` does not carry them. |
 | No auto-resume. | Yes | §1, §11, and residuals state no provider launch. |
 | No provider spawn. | Yes | §1 and §11. |
