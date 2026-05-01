@@ -9,6 +9,7 @@ use agent_runner_lib::schema_probe::{self, ProbeError};
 use agent_runner_lib::session_export::{
     ExportError, ExportSessionMetadata, SessionStorageType, read_canonical_transcript,
 };
+use agent_runner_lib::session_lock::{LockError, SessionLock};
 use agent_runner_lib::session_metadata::{MetadataError, locate_session_metadata};
 use agent_runner_lib::state::{CompositeInvocationId, InvocationStart, ReadOnlyOpenError, StateDb};
 use agent_runner_lib::trace::{TraceOptions, render_ascii_trace, trace_invocation_with_sessions};
@@ -19,6 +20,9 @@ use std::io::{BufRead, IsTerminal, Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use uuid::Uuid;
+
+const DEFAULT_PAUSE_HANDSHAKE_TTL_MS: u64 = 60_000;
+const MAX_PAUSE_HANDSHAKE_TTL_MS: u64 = 600_000;
 
 #[derive(Parser)]
 #[command(
@@ -157,7 +161,7 @@ enum Subcommands {
         #[arg(long = "models-dir")]
         models_dir: Option<PathBuf>,
     },
-    /// Session inspection and compatibility commands.
+    /// Inspect and coordinate session control-plane operations.
     Session {
         #[command(subcommand)]
         command: SessionSubcommands,
@@ -193,6 +197,18 @@ enum SessionSubcommands {
         session_id: String,
         #[arg(long, default_value = "canonical-jsonl")]
         format: String,
+    },
+    /// Acquire an advisory pause lease for a resolved session.
+    PauseHandshake {
+        session_id: String,
+        #[arg(long)]
+        ttl_ms: Option<u64>,
+    },
+    /// Release a previously acquired advisory pause lease.
+    ResumeHandshake {
+        session_id: String,
+        #[arg(long)]
+        token: String,
     },
 }
 
@@ -370,6 +386,12 @@ fn run(cli: Cli) -> Result<i32, String> {
                 SessionSubcommands::SchemaProbe => run_session_schema_probe(),
                 SessionSubcommands::Export { session_id, format } => {
                     run_session_export(&session_id, &format)
+                }
+                SessionSubcommands::PauseHandshake { session_id, ttl_ms } => {
+                    run_pause_handshake(&session_id, ttl_ms)
+                }
+                SessionSubcommands::ResumeHandshake { session_id, token } => {
+                    run_resume_handshake(&session_id, &token)
                 }
             },
             Subcommands::ResumeList { uuid } => run_resume_list(&uuid),
@@ -1187,6 +1209,203 @@ fn provider_index_in_providers_cfg(providers_cfg: &ProvidersConfig, provider_nam
         .into_iter()
         .position(|name| name == provider_name)
         .unwrap_or(0)
+}
+
+fn run_pause_handshake(session_id: &str, ttl_ms: Option<u64>) -> Result<i32, String> {
+    if Uuid::parse_str(session_id).is_err() {
+        return Ok(emit_json_error(
+            2,
+            "invalid-session-id",
+            format!("invalid session UUID: {session_id}"),
+        ));
+    }
+
+    let ttl_ms = ttl_ms.unwrap_or(DEFAULT_PAUSE_HANDSHAKE_TTL_MS);
+    if ttl_ms > MAX_PAUSE_HANDSHAKE_TTL_MS {
+        return Ok(emit_json_error(
+            2,
+            "invalid-ttl",
+            format!("ttl-ms must be at most {MAX_PAUSE_HANDSHAKE_TTL_MS}"),
+        ));
+    }
+
+    let state = match StateDb::open_default() {
+        Ok(state) => state,
+        Err(message) => return Ok(emit_json_error(1, "operational-error", message)),
+    };
+    let models = match load_models(&default_models_dir()) {
+        Ok(models) => models,
+        Err(message) => return Ok(emit_json_error(1, "operational-error", message)),
+    };
+    let resolved = match state.resolve_resume(&models, session_id, None) {
+        Ok(resolved) => resolved,
+        Err(err) => return Ok(emit_resume_resolution_error(err)),
+    };
+    let lock_dir = match default_lock_dir() {
+        Ok(lock_dir) => lock_dir,
+        Err(message) => return Ok(emit_json_error(1, "operational-error", message)),
+    };
+    let lock = match SessionLock::new(&lock_dir) {
+        Ok(lock) => lock,
+        Err(err) => {
+            return Ok(emit_json_error(
+                1,
+                "operational-error",
+                format!("failed to open locks: {err}"),
+            ));
+        }
+    };
+    match lock.acquire(
+        &resolved.active_session_id,
+        &resolved.active_provider,
+        std::time::Duration::from_millis(ttl_ms),
+    ) {
+        Ok(lease) => {
+            let payload = serde_json::json!({
+                "session_id": lease.session_id,
+                "chain_id": resolved.chain_id,
+                "provider_name": lease.provider_name,
+                "token": lease.token,
+                "expires_at": lease.expires_at,
+                "lock_path": lease.lock_path,
+            });
+            println!(
+                "{}",
+                serde_json::to_string(&payload)
+                    .map_err(|err| format!("failed to encode pause receipt: {err}"))?
+            );
+            Ok(0)
+        }
+        Err(err) => Ok(emit_lock_error(err)),
+    }
+}
+
+fn run_resume_handshake(session_id: &str, token: &str) -> Result<i32, String> {
+    if Uuid::parse_str(session_id).is_err() {
+        return Ok(emit_json_error(
+            2,
+            "invalid-session-id",
+            format!("invalid session UUID: {session_id}"),
+        ));
+    }
+
+    if let Err(message) = StateDb::open_default() {
+        return Ok(emit_json_error(1, "operational-error", message));
+    }
+    let lock_dir = match default_lock_dir() {
+        Ok(lock_dir) => lock_dir,
+        Err(message) => return Ok(emit_json_error(1, "operational-error", message)),
+    };
+    let lock = match SessionLock::new(&lock_dir) {
+        Ok(lock) => lock,
+        Err(err) => {
+            return Ok(emit_json_error(
+                1,
+                "operational-error",
+                format!("failed to open locks: {err}"),
+            ));
+        }
+    };
+    match lock.release(session_id, token) {
+        Ok(receipt) => {
+            println!(
+                "{}",
+                serde_json::to_string(&receipt)
+                    .map_err(|err| format!("failed to encode resume receipt: {err}"))?
+            );
+            Ok(0)
+        }
+        Err(err) => Ok(emit_lock_error(err)),
+    }
+}
+
+fn default_lock_dir() -> Result<PathBuf, String> {
+    dirs::data_dir()
+        .map(|dir| dir.join("oulipoly-agent-runner").join("locks"))
+        .ok_or_else(|| "Could not determine data directory".to_string())
+}
+
+fn emit_resume_resolution_error(err: agent_runner_lib::state::ResumeError) -> i32 {
+    use agent_runner_lib::state::ResumeError;
+    match err {
+        ResumeError::InvalidUuid { input } => emit_json_error(
+            2,
+            "invalid-session-id",
+            format!("invalid session UUID: {input}"),
+        ),
+        ResumeError::NoChainFound { input } => emit_json_error(
+            10,
+            "session-not-found",
+            format!("no session found matching {input}"),
+        ),
+        ResumeError::Ambiguous { input, .. } => emit_json_error(
+            11,
+            "ambiguous-session",
+            format!("session {input} resolves to multiple chains"),
+        ),
+        ResumeError::UnknownModel { model_name } => emit_json_error(
+            12,
+            "model-resolution-failed",
+            format!("unknown model for session: {model_name}"),
+        ),
+        ResumeError::ProviderModelMismatch {
+            model_name,
+            active_provider,
+            ..
+        } => emit_json_error(
+            12,
+            "model-resolution-failed",
+            format!("model {model_name} does not include active provider {active_provider}"),
+        ),
+        ResumeError::ActiveSegmentMissing { chain_id } => emit_json_error(
+            12,
+            "model-resolution-failed",
+            format!("no active segment found for chain {chain_id}"),
+        ),
+        ResumeError::ProviderNotConfigured { provider } => emit_json_error(
+            12,
+            "model-resolution-failed",
+            format!("provider {provider} is not configured"),
+        ),
+        ResumeError::ProviderMissingResume { provider_name } => emit_json_error(
+            12,
+            "model-resolution-failed",
+            format!("provider {provider_name} has no resume configuration"),
+        ),
+        ResumeError::Db { message } => emit_json_error(1, "operational-error", message),
+    }
+}
+
+fn emit_lock_error(err: LockError) -> i32 {
+    match err {
+        LockError::Busy { expires_at } => emit_json_error(
+            13,
+            "session-busy",
+            format!("session is paused until {expires_at}"),
+        ),
+        LockError::TokenInvalid => emit_json_error(
+            16,
+            "lock-token-invalid",
+            "pause token is invalid for this session",
+        ),
+        LockError::LockExpired => emit_json_error(
+            17,
+            "lock-expired",
+            "pause lock is absent or expired without release evidence",
+        ),
+        LockError::Operational { message } => emit_json_error(1, "operational-error", message),
+    }
+}
+
+fn emit_json_error(code: i32, error_code: &str, message: impl Into<String>) -> i32 {
+    let payload = serde_json::json!({
+        "error": {
+            "code": error_code,
+            "message": message.into(),
+        }
+    });
+    let _ = writeln!(std::io::stderr(), "{payload}");
+    code
 }
 
 fn effective_model_for_execution(
