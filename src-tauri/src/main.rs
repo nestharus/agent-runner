@@ -6,6 +6,9 @@ use agent_runner_lib::config::{
 use agent_runner_lib::diagnostics;
 use agent_runner_lib::executor;
 use agent_runner_lib::schema_probe::{self, ProbeError};
+use agent_runner_lib::session_export::{
+    ExportError, ExportSessionMetadata, SessionStorageType, read_canonical_transcript,
+};
 use agent_runner_lib::session_metadata::{MetadataError, locate_session_metadata};
 use agent_runner_lib::state::{CompositeInvocationId, InvocationStart, ReadOnlyOpenError, StateDb};
 use agent_runner_lib::trace::{TraceOptions, render_ascii_trace, trace_invocation_with_sessions};
@@ -185,6 +188,12 @@ enum SessionSubcommands {
     },
     /// Inspect the default state database schema and supported session features.
     SchemaProbe,
+    /// Export a provider session as canonical JSONL.
+    Export {
+        session_id: String,
+        #[arg(long, default_value = "canonical-jsonl")]
+        format: String,
+    },
 }
 
 #[derive(Debug)]
@@ -359,6 +368,9 @@ fn run(cli: Cli) -> Result<i32, String> {
                     run_session_locate(&session_id, json)
                 }
                 SessionSubcommands::SchemaProbe => run_session_schema_probe(),
+                SessionSubcommands::Export { session_id, format } => {
+                    run_session_export(&session_id, &format)
+                }
             },
             Subcommands::ResumeList { uuid } => run_resume_list(&uuid),
             Subcommands::MigrateDb => run_migrate_db(),
@@ -630,6 +642,155 @@ fn run_session_locate(session_id: &str, _json: bool) -> Result<i32, String> {
     }
 }
 
+fn run_session_export(session_id: &str, format: &str) -> Result<i32, String> {
+    if format != "canonical-jsonl" {
+        emit_export_json_error(
+            "invalid-format",
+            &format!("unsupported export format {format}; expected canonical-jsonl"),
+        );
+        return Ok(2);
+    }
+
+    if Uuid::parse_str(session_id).is_err() {
+        let err = ExportError::InvalidSessionId {
+            input: session_id.to_string(),
+        };
+        emit_export_error(&err);
+        return Ok(export_error_exit_code(&err));
+    }
+
+    let metadata = match resolve_export_session_metadata(session_id) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            emit_export_error(&err);
+            return Ok(export_error_exit_code(&err));
+        }
+    };
+
+    let records = match read_canonical_transcript(&metadata) {
+        Ok(records) => records,
+        Err(err) => {
+            emit_export_error(&err);
+            return Ok(export_error_exit_code(&err));
+        }
+    };
+
+    let mut output = String::new();
+    for record in records {
+        let line = serde_json::to_string(&record).map_err(|e| {
+            format!(
+                "Failed to serialize canonical export for session {}: {e}",
+                metadata.session_id
+            )
+        })?;
+        output.push_str(&line);
+        output.push('\n');
+    }
+    print!("{output}");
+    Ok(0)
+}
+
+fn resolve_export_session_metadata(session_id: &str) -> Result<ExportSessionMetadata, ExportError> {
+    let state = StateDb::open_default().map_err(|message| ExportError::Operational { message })?;
+    let models_dir = default_models_dir();
+    let models =
+        load_models(&models_dir).map_err(|message| ExportError::Operational { message })?;
+    let config_root = dirs::config_dir()
+        .map(|d| d.join("oulipoly-agent-runner"))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let providers_path = config_root.join("providers.toml");
+    let sessions_path = config_root.join("sessions.toml");
+    let providers_cfg =
+        agent_runner_lib::config::ProvidersConfig::load(&providers_path).unwrap_or_default();
+    let sessions_cfg =
+        agent_runner_lib::config::SessionsConfig::load(&sessions_path).unwrap_or_default();
+
+    let resolved = state
+        .resolve_resume(&models, session_id, None)
+        .map_err(|err| match err {
+            agent_runner_lib::state::ResumeError::InvalidUuid { input } => {
+                ExportError::InvalidSessionId { input }
+            }
+            agent_runner_lib::state::ResumeError::NoChainFound { input } => {
+                ExportError::SessionNotFound { input }
+            }
+            agent_runner_lib::state::ResumeError::Ambiguous { input, .. } => {
+                ExportError::AmbiguousSession { input }
+            }
+            agent_runner_lib::state::ResumeError::ProviderModelMismatch {
+                active_provider, ..
+            } => ExportError::UnsupportedStorage {
+                provider_name: active_provider,
+                reason: "session owner is not in the resolved model provider pool".to_string(),
+            },
+            agent_runner_lib::state::ResumeError::UnknownModel { model_name } => {
+                ExportError::Operational {
+                    message: format!("unknown model referenced by session chain: {model_name}"),
+                }
+            }
+            agent_runner_lib::state::ResumeError::ActiveSegmentMissing { chain_id } => {
+                ExportError::Operational {
+                    message: format!("no active segment found for chain {chain_id}"),
+                }
+            }
+            agent_runner_lib::state::ResumeError::ProviderNotConfigured { provider } => {
+                ExportError::UnsupportedStorage {
+                    provider_name: provider,
+                    reason: "session owner provider is not configured".to_string(),
+                }
+            }
+            agent_runner_lib::state::ResumeError::ProviderMissingResume { provider_name } => {
+                ExportError::UnsupportedStorage {
+                    provider_name,
+                    reason: "session owner provider has no resume configuration".to_string(),
+                }
+            }
+            agent_runner_lib::state::ResumeError::Db { message } => {
+                ExportError::Operational { message }
+            }
+        })?;
+
+    let provider_entry = providers_cfg
+        .get(&resolved.active_provider)
+        .ok_or_else(|| ExportError::UnsupportedStorage {
+            provider_name: resolved.active_provider.clone(),
+            reason: "provider is missing from providers.toml".to_string(),
+        })?;
+    let storage_type = match provider_entry.session_storage.as_ref() {
+        Some(agent_runner_lib::config::SessionStorage::ClaudeCode { .. }) => {
+            SessionStorageType::ClaudeCode
+        }
+        Some(agent_runner_lib::config::SessionStorage::Codex { .. }) => {
+            SessionStorageType::CodexSession
+        }
+        None => {
+            return Err(ExportError::UnsupportedStorage {
+                provider_name: resolved.active_provider,
+                reason: "provider has no session_storage configuration".to_string(),
+            });
+        }
+    };
+
+    let jsonl_path = agent_runner_lib::sessions::locate_transcript(
+        &sessions_cfg,
+        &resolved.active_provider,
+        &resolved.active_session_id,
+    )
+    .map_err(|message| ExportError::Operational { message })?
+    .ok_or_else(|| ExportError::UnsupportedStorage {
+        provider_name: resolved.active_provider.clone(),
+        reason: "provider has no transcript_locator configuration".to_string(),
+    })?;
+
+    Ok(ExportSessionMetadata {
+        session_id: resolved.active_session_id,
+        chain_id: resolved.chain_id,
+        provider_name: resolved.active_provider,
+        storage_type,
+        jsonl_path,
+    })
+}
+
 fn metadata_error_exit_code(err: &MetadataError) -> i32 {
     match err {
         MetadataError::InvalidSessionId { .. } => 2,
@@ -674,6 +835,69 @@ fn emit_metadata_error(err: &MetadataError) {
         "error": {
             "code": metadata_error_code(err),
             "message": metadata_error_message(err),
+        }
+    });
+    eprintln!("{payload}");
+}
+
+fn export_error_exit_code(err: &ExportError) -> i32 {
+    match err {
+        ExportError::InvalidSessionId { .. } => 2,
+        ExportError::SessionNotFound { .. } => 10,
+        ExportError::AmbiguousSession { .. } => 11,
+        ExportError::UnsupportedStorage { .. } => 12,
+        ExportError::MalformedTranscript { .. } => 15,
+        ExportError::Operational { .. } => 1,
+    }
+}
+
+fn export_error_code(err: &ExportError) -> &'static str {
+    match err {
+        ExportError::InvalidSessionId { .. } => "invalid-session-id",
+        ExportError::SessionNotFound { .. } => "session-not-found",
+        ExportError::AmbiguousSession { .. } => "ambiguous-session",
+        ExportError::UnsupportedStorage { .. } => "unsupported-storage",
+        ExportError::MalformedTranscript { .. } => "malformed-provider-transcript",
+        ExportError::Operational { .. } => "operational-error",
+    }
+}
+
+fn export_error_message(err: &ExportError) -> String {
+    match err {
+        ExportError::InvalidSessionId { input } => format!("invalid session UUID: {input}"),
+        ExportError::SessionNotFound { input } => format!("session not found: {input}"),
+        ExportError::AmbiguousSession { input } => {
+            format!("session id matches multiple recent chains: {input}")
+        }
+        ExportError::UnsupportedStorage {
+            provider_name,
+            reason,
+        } => {
+            format!("unsupported storage for provider {provider_name}: {reason}")
+        }
+        ExportError::MalformedTranscript { path, line, reason } => {
+            if *line == 0 {
+                format!("malformed transcript {}: {reason}", path.display())
+            } else {
+                format!(
+                    "malformed transcript {} line {line}: {reason}",
+                    path.display()
+                )
+            }
+        }
+        ExportError::Operational { message } => message.clone(),
+    }
+}
+
+fn emit_export_error(err: &ExportError) {
+    emit_export_json_error(export_error_code(err), &export_error_message(err));
+}
+
+fn emit_export_json_error(code: &str, message: &str) {
+    let payload = serde_json::json!({
+        "error": {
+            "code": code,
+            "message": message,
         }
     });
     eprintln!("{payload}");
