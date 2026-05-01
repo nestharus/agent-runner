@@ -5,13 +5,27 @@
 - §8: explicit `StateDb::open` side-effect clause matching 06-locate / 06-export (R1-F03).
 - §9.1: added assumption_link and residual_risk columns (R1-F04).
 
-**Rev 3 changes** (Round 2 audit R2-F01 closure):
+**Rev 3 changes** (Round 2 audit R2-F01 closure; superseded by Rev 4
+for stale eviction):
 
-- §4 / §6 / §8: replace `flock` on removable path with race-free
-  `O_CREAT | O_EXCL` atomic create-or-fail. Stale-acquire uses
-  bounded `unlink + retry-create_new` (kernel atomic). Eliminates
-  the inode/path mismatch race POSIX advisory locks introduce when
-  the lockfile is unlinked under contention (R2-F01).
+- §4 / §6 / §8: previously replaced `flock` on removable path with
+  `O_CREAT | O_EXCL` atomic create-or-fail plus bounded
+  `unlink + retry-create_new`. This addressed the removable-inode
+  advisory-lock issue from R2-F01 but left the stale-eviction TOCTOU
+  closed by Rev 4 below.
+
+**Rev 4 changes** (Round 3 audit R3-F01 closure):
+
+- §4 / §6 / §8: replace stale-eviction `unlink + retry-create_new`
+  with sentinel-flock pattern. A never-unlinked sentinel file's
+  `flock` is the real mutex; session lock state is written via
+  `O_CREAT | O_TRUNC | O_WRONLY` to a tempfile and atomically
+  renamed onto the session-lock-path under the sentinel flock.
+  Eliminates the TOCTOU window in Rev 3 between stale-read and
+  unlink (R3-F01).
+- §1.1 A8 (new): assumption that atomic rename + advisory flock on
+  a non-removable sentinel is sufficient mutual exclusion on POSIX
+  filesystems with working `flock(2)` and same-mount `rename(2)`.
 
 # 1. Scope statement
 
@@ -81,6 +95,7 @@ What does not change:
 | A5 | TTL-based crash recovery is sufficient for v1. | No daemon exists; harness asks for crash-safe TTL cleanup. | A lock manager daemon or stricter cleanup requirement appears. | D3, D5, §9 |
 | A6 | v1 should add the primitive first; scattered sibling write paths should observe in their own PRs. | Write paths span migration, repl/resume, balanced execution, ingestion, backfill, and future import-replace. | Phase 4 requires all observers in this PR. | D4, §7, §13 |
 | A7 | File-backed lock receipts are acceptable if files are owner-private. | Harness response includes `lock_path`; runner state already lives in the per-user data dir. | Shared multi-user state dirs become supported. | D1, §8, §11 |
+| A8 | Atomic rename plus advisory flock on a non-removable sentinel is sufficient for cross-process mutual exclusion on POSIX filesystems supporting `flock(2)` and `rename(2)` atomicity. | The sentinel inode is never unlinked, all contenders serialize on its open file descriptor, and session state is installed by same-directory atomic rename. | Filesystems without working `flock` such as NFSv2/3 quirks, or non-atomic rename across mount points. | §4, §6, §8, §9 |
 
 ## 1.2 Net-value statement
 
@@ -219,75 +234,89 @@ when known.
    ```text
    <data_dir>/oulipoly-agent-runner/locks/session-<session_id>.lock
    <data_dir>/oulipoly-agent-runner/locks/session-<session_id>.released
+   <data_dir>/oulipoly-agent-runner/locks/sentinel.lock
    ```
 
 5. Create the lock directory with owner-private permissions where Unix
    mode bits are available: directory `0700`, files `0600`.
-6. D1 decision: choose D1a, lockfile-backed lease, with clarification.
-   The durable lease is lockfile metadata created by atomic
-   create-if-absent. The implementation must not rely on POSIX advisory
-   locks for mutual exclusion because the lockfile path may be unlinked
-   during stale cleanup. This preserves the harness `lock_path` contract
-   and avoids a DB schema migration.
-7. `pause-handshake` attempts:
+6. D1 decision: choose D1a, lockfile-backed lease, with Rev 4
+   sentinel-mutex clarification. The durable lease is session lockfile
+   metadata, while mutual exclusion is provided by an exclusive `flock`
+   on `<lock_dir>/sentinel.lock`. The sentinel file is created
+   idempotently on first use and is never removed. This preserves the
+   harness `lock_path` contract and avoids a DB schema migration.
+7. `pause-handshake` opens the sentinel with create-if-needed semantics:
 
    ```rust
    OpenOptions::new()
-       .create_new(true)
+       .create(true)
+       .read(true)
        .write(true)
-       .open(&lock_path)
+       .open(&sentinel_path)
    ```
 
-   This is `O_CREAT | O_EXCL | O_WRONLY`: the filesystem atomically
-   creates the path only if it does not already exist.
-8. If creation succeeds, generate the token, write lease JSON containing
-   `version`, `session_id`, `token_hash`, `owner_pid`, `created_at`, and
-   `expires_at`, fsync the file, close it, remove any previous sibling
-   release marker for the same session, fsync the directory when
-   practical, emit the success JSON, and exit `0`.
-9. If creation fails with `EEXIST`, read the existing lease JSON. If the
-   lease is malformed, unreadable, or missing required fields, return
-   exit `1 operational-error`; do not guess whether the lease is stale.
-   If `expires_at >= now`, return exit `13 session-busy`.
-10. If `expires_at < now`, the existing lease is stale. Stale-acquire is
-    bounded and atomic at the create step:
+   This is `O_CREAT | O_RDWR` without `O_EXCL`. After open,
+   `pause-handshake` takes `flock(sentinel_fd, LOCK_EX)` and holds it
+   for the full session-lock read/write decision.
+8. Under the sentinel flock, try to open
+   `session-<session_id>.lock` read-only.
+9. If the session lock exists, read the lease JSON. If the lease is
+   malformed, unreadable, or missing required fields, release the
+   sentinel flock and return exit `1 operational-error`; do not guess
+   whether the lease is stale. If `expires_at > now`, release the
+   sentinel flock and return exit `13 session-busy`.
+10. If the session lock is absent (`ENOENT`) or the existing lease is
+    stale (`expires_at <= now`), acquire by atomic replace-or-create:
 
-    1. Read the existing token evidence `T_old` from the lease.
-    2. `unlink(lock_path)`.
-    3. Re-attempt `create_new(true).write(true).open(&lock_path)` once.
-    4. If the retry fails with `EEXIST`, another process won the race;
-       return exit `13 session-busy` and do not retry further.
-    5. If the retry succeeds, write the new lease JSON, fsync, close,
-       remove any previous sibling release marker, emit success JSON,
-       and exit `0`.
+    1. Generate the token.
+    2. Write lease JSON containing `version`, `session_id`,
+       `token_hash`, `owner_pid`, `created_at`, and `expires_at` to a
+       unique temp file such as
+       `<session_lock_path>.acquire-<pid>-<random>.tmp` using
+       `O_CREAT | O_TRUNC | O_WRONLY`.
+    3. Fsync the temp file.
+    4. Rename the temp file onto `session-<session_id>.lock` while still
+       holding the sentinel flock.
+    5. Remove any previous sibling release marker for the same session.
+    6. Fsync the directory when practical.
+    7. Release the sentinel flock, emit success JSON, and exit `0`.
 
-    The race between `unlink` and retry-create is closed by the same
-    kernel atomic create-if-absent guarantee: only one contender can
-    create the replacement lockfile.
-11. D5 decision: stale means `expires_at < now`. Stale removal is lazy
+    The sentinel flock is the real mutex. Because all contenders
+    serialize on the never-unlinked sentinel inode, no process can
+    unlink or replace a session lock created by another contender
+    between stale-read and stale-eviction. Inside the critical section,
+    same-directory `rename` provides atomic installation of the new
+    lease.
+11. D5 decision: stale means `expires_at <= now`. Stale removal is lazy
     on the next acquire attempt. There is no background reaper.
 12. D3 decision: default TTL is `300000` ms (5 minutes), minimum is
     `1000` ms, maximum is `1800000` ms (30 minutes). Out-of-range
     `--ttl-ms` is clap usage exit `2`.
 13. `resume-handshake` resolves the session and computes the same lock
     and marker paths.
-14. If the lockfile exists, read the lease JSON and compare the supplied
+14. `resume-handshake` opens the sentinel, takes `LOCK_EX`, and holds it
+    through lockfile/marker inspection and mutation.
+15. If the lockfile exists, read the lease JSON and compare the supplied
     token to the persisted token evidence. If the token mismatches,
-    return `16 lock-token-invalid` without altering the lock.
-15. If the lockfile exists and the token matches, write the sibling
-    release marker `session-<session_id>.released`, fsync the marker,
-    unlink the lockfile, fsync the directory when practical, and exit
-    `0`. If the lease had already expired, use the same release path and
-    include an implementation note/message equivalent to
+    release the sentinel flock and return `16 lock-token-invalid`
+    without altering the lock.
+16. If the lockfile exists and the token matches, write release marker
+    JSON to a unique temp file such as
+    `<release_marker_path>.release-<pid>-<random>.tmp`, fsync it, rename
+    it onto `session-<session_id>.released`, unlink the session lockfile,
+    fsync the directory when practical, release the sentinel flock, and
+    exit `0`. If the lease had already expired, use the same release
+    path and include an implementation note/message equivalent to
     `"released expired token"`; this is still exit `0` because the token
     proves ownership of the stale lease.
-16. If the lockfile does not exist, read the sibling release marker, if
-    present, as idempotency evidence. Same-token marker hash match
-    returns `0` with `already_released: true`. Marker hash mismatch
-    returns `16 lock-token-invalid`.
-17. If neither lockfile nor release marker exists, return
-    `17 lock-expired`: the lease is absent and no marker proves a prior
-    release for this token.
+17. If the lockfile does not exist, read the sibling release marker, if
+    present, as idempotency evidence while still holding the sentinel
+    flock. Same-token marker hash match returns `0` with
+    `already_released: true`. Marker hash mismatch returns
+    `16 lock-token-invalid`.
+18. If neither lockfile nor release marker exists, release the sentinel
+    flock and return `17 lock-expired`: the lease is absent and no marker
+    proves a prior release for this token.
 
 # 5. Exit codes
 
@@ -334,6 +363,23 @@ pub enum LockError { Busy, TokenInvalid, LockExpired, Operational }
 pub struct SessionLock { root: PathBuf }
 ```
 
+`SessionLock` uses a private sentinel helper internally:
+
+```rust
+struct Sentinel { path: PathBuf, file: File }
+
+impl Sentinel {
+    fn with_locked<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce() -> R;
+}
+```
+
+The sentinel opens `<lock_dir>/sentinel.lock` with `O_CREAT | O_RDWR`,
+takes an exclusive `flock` on the open file descriptor, runs the
+closure, releases the flock, and closes the fd. The sentinel file is
+never deleted by acquire or release.
+
 Core methods:
 
 - `SessionLock::from_default_data_dir()`.
@@ -347,17 +393,22 @@ The command layer resolves `session_id`, `chain_id`, and `provider_name`
 before calling `SessionLock`; it then combines resolver metadata with
 `Lease` or `ReleaseReceipt` for the CLI stdout JSON in §3.
 
-`acquire()` uses only atomic create-if-absent for mutual exclusion:
-`OpenOptions::new().create_new(true).write(true).open(&lock_path)`.
-On success it writes the lease JSON, fsyncs, closes, removes any stale
-sibling release marker for that session, and returns `Lease`. On
-`EEXIST` it reads the existing lease. A non-expired lease returns
-`LockError::Busy`; an expired lease is unlinked and replaced by one
-single retry of the same `create_new` open. If that retry sees `EEXIST`,
-another contender won and the result is `LockError::Busy`.
+`acquire()` runs under `Sentinel::with_locked`. It tries to open the
+session lock read-only. A non-expired lease (`expires_at > now`) returns
+`LockError::Busy`; malformed or unreadable lease metadata returns
+`LockError::Operational`. If the session lock is absent or stale
+(`expires_at <= now`), it writes the new lease JSON to a unique sibling
+temp file using `O_CREAT | O_TRUNC | O_WRONLY`, fsyncs the temp file,
+atomically renames it onto the session lock path, removes any stale
+sibling release marker for that session, fsyncs the directory when
+practical, and returns `Lease`. The stale path never unlinks the lock
+before replacement; the atomic rename happens while all contenders are
+serialized by the sentinel flock.
 
-`release()` reads the lockfile when it exists. Matching token evidence
-writes the sibling release marker, unlinks the lockfile, and returns
+`release()` also runs under `Sentinel::with_locked`. When the lockfile
+exists, it reads the lease JSON and compares token evidence. Matching
+token evidence writes the sibling release marker via unique temp file,
+fsync, and atomic rename, then unlinks the session lockfile and returns
 `ReleaseReceipt`, even if the matching lease has already expired; the
 receipt note records that an expired token was released. Token mismatch
 returns `LockError::TokenInvalid`. If the lockfile is absent, a matching
@@ -399,6 +450,15 @@ directory:
 ```text
 <lock_dir>/session-<session_id>.released
 ```
+
+Both acquire and release serialize through:
+
+```text
+<lock_dir>/sentinel.lock
+```
+
+This sentinel file is the only advisory-lock target. It is shared across
+all sessions in the lock directory and is never removed.
 
 The marker is JSON and versioned:
 
@@ -451,20 +511,31 @@ behavior.
 `pause-handshake` may:
 
 - Create `~/.local/share/oulipoly-agent-runner/locks/`.
-- Atomically create `locks/session-<session_id>.lock` with
-  `O_CREAT | O_EXCL`.
-- Unlink an expired `locks/session-<session_id>.lock` during
-  stale-acquire, followed by one atomic retry-create.
+- Create `locks/sentinel.lock` idempotently with `O_CREAT`; acquire,
+  release, and stale-eviction operations hold an exclusive `flock` on
+  this never-deleted sentinel file's open file descriptor.
+- Read, write, rename, and unlink session lock files only while holding
+  the sentinel flock.
+- Write a unique temp file such as
+  `locks/session-<session_id>.lock.acquire-<pid>-<random>.tmp` with
+  `O_CREAT | O_TRUNC | O_WRONLY`, fsync it, and atomically rename it
+  onto `locks/session-<session_id>.lock`.
+- Atomically replace an expired `locks/session-<session_id>.lock` by
+  rename under the sentinel flock.
 - Remove a stale `locks/session-<session_id>.released` marker while
   acquiring a new lock for the same session.
 - Open default state/config for shared session resolution.
 
 `resume-handshake` may:
 
+- Open and flock `locks/sentinel.lock` as above.
+- Read, write, rename, and unlink session lock files only while holding
+  the sentinel flock.
 - Remove a matching lockfile, including a matching expired lockfile.
-- Create or update
-  `locks/session-<session_id>.released` with token evidence
-  (`token_hash`) and `released_at` for idempotent release replay.
+- Create or update `locks/session-<session_id>.released` with token
+  evidence (`token_hash`) and `released_at` for idempotent release
+  replay by writing a unique temp file, fsyncing it, and atomically
+  renaming it onto the marker path.
 
 Neither command may:
 
@@ -482,14 +553,22 @@ schema-ensure, chain backfill) are accepted, matching 06-locate and
 06-export's §8 contracts. No DDL, no row mutation, no
 `session_turns`/`session_chains`/`session_chain_segments` writes. Lock
 state lives outside the DB at
+`<lock_dir>/sentinel.lock` and
 `<lock_dir>/session-<uuid>.{lock,released}`.
+
+The sentinel file is never deleted by acquire or release. Temp files use
+unique names such as `<session_lock_path>.acquire-<pid>-<random>.tmp` or
+`<release_marker_path>.release-<pid>-<random>.tmp`. They do not linger
+under normal operation. If a process crashes mid-acquire or mid-release,
+an orphaned temp file does not share the lock-path's name and does not
+need to be cleaned by a future stale-eviction cycle.
 
 When 06-schema-probe's `StateDb::open_read_only` lands and is mergeable,
 switch pause/resume resolver access to read-only open as a follow-up.
 
 Permissions are contract surface. On Unix, new lock directories are
-`0700` and lock/marker files are `0600`. Failure to set or verify those
-permissions is exit `1`, not a silent downgrade.
+`0700` and sentinel, lock, marker, and temp files are `0600`. Failure to
+set or verify those permissions is exit `1`, not a silent downgrade.
 
 # 9. Test-intent track
 
@@ -501,20 +580,20 @@ permissions is exit `1`, not a silent downgrade.
 | Invalid UUID | Bad input may create lock state before validation. | Bad id fails before state/lock access. | e2e | CLI with invalid id. | A1 | Exit `2`; no lock dir. | Does not constrain clap's exact human-readable usage text. |
 | Not found | Missing sessions may collapse into operational failure. | Unknown UUID maps to `10`. | integration | Empty/unrelated temp DB. | A1 | stderr code `session-not-found`. | Covers resolver absence, not every corrupt-state variant. |
 | Ambiguous | Ambiguous ownership may silently choose one writer target. | Resolver ambiguity maps to `11`. | component | Two recent candidate chains. | A1 | stderr code `ambiguous-session`. | Synthetic ambiguity may not cover all future resolver ambiguity causes. |
-| Atomic acquire | Concurrent harnesses may both receive valid leases. | Two concurrent pause calls grant one token. | process integration | Two CLI processes, same temp data dir. | A4, A5, A7 | One `0`, one `13`. | Does not prove behavior on non-local/network filesystems. |
-| Per-session scope | One session lock may over-block unrelated sessions. | Different sessions can be locked concurrently. | component | Two active sessions. | A2, A7 | Two lockfiles; both `0`. | Does not test cross-user shared data dirs, which are out of scope. |
+| Atomic acquire | Concurrent harnesses may both receive valid leases. | Two concurrent pause calls grant one token. | process integration | Two CLI processes, same temp data dir. | A4, A5, A7, A8 | One `0`, one `13`. | Does not prove behavior on non-local/network filesystems. |
+| Per-session scope | One session lock may over-block unrelated sessions. | Different sessions can both hold leases; their short acquire critical sections serialize through the shared sentinel. | component | Two active sessions. | A2, A7, A8 | Two lockfiles; both `0`. | Does not test cross-user shared data dirs, which are out of scope. |
 | Token format | Tokens may be predictable or malformed. | Token matches `pause_[0-9a-f]{32}` and differs across acquisitions. | unit | Token generator. | A7 | Regex pass; repeated values differ. | Does not statistically certify OS CSPRNG quality. |
 | TTL bounds | Leases may be unbounded or too short to be useful. | Default/min/max policy enforced. | unit + CLI | Parser and injected clock. | A5 | Default 5m; out-of-range exits `2`. | Does not model wall-clock skew between processes. |
-| Stale acquire | Crashed harness may block forever. | Expired lockfile is lazily replaced. | component | Prewritten expired metadata. | A5, A7 | New pause exits `0`. | Does not add a background reaper; cleanup remains lazy by design. |
-| Busy lock | Active lease may not refuse a second pause. | Non-expired lock blocks second pause. | integration | Pause twice before expiry. | A4, A5, A7 | Second exits `13`. | Does not prove sibling writer paths observe the lock in v1. |
-| Correct release | Valid token may fail to release or leave stale lock state. | Matching token releases and writes sibling release marker. | integration | Pause then resume. | A4, A7 | Resume `0`; future pause succeeds; marker path exists before next acquire. | Does not fully simulate crash during the release critical section. |
+| Stale acquire | Crashed harness may block forever. | Expired lockfile is lazily replaced under the sentinel flock by atomic rename. | component | Prewritten expired metadata. | A5, A7, A8 | New pause exits `0`. | Does not add a background reaper; cleanup remains lazy by design. |
+| Busy lock | Active lease may not refuse a second pause. | Non-expired lock blocks second pause. | integration | Pause twice before expiry. | A4, A5, A7, A8 | Second exits `13`. | Does not prove sibling writer paths observe the lock in v1. |
+| Correct release | Valid token may fail to release or leave stale lock state. | Matching token releases and writes sibling release marker under the sentinel flock. | integration | Pause then resume. | A4, A7, A8 | Resume `0`; future pause succeeds; marker path exists before next acquire. | Does not fully simulate crash during the release critical section. |
 | Wrong token | Caller may release a lock it does not own. | Mismatch cannot release. | integration | Pause then wrong token. | A7 | Exit `16`; lock remains. | Does not prove token secrecy outside filesystem and stdout handling. |
-| Expired matching release | Expired lock ownership may become unreleasable. | Release after expiry succeeds when the token matches the expired lease and writes the marker. | component | Injected clock with expired metadata and matching token. | A5, A7 | Exit `0`; receipt note says released expired token. | Boundary precision at exact `expires_at` is covered only by unit clock tests. |
+| Expired matching release | Expired lock ownership may become unreleasable. | Release after expiry succeeds when the token matches the expired lease and writes the marker. | component | Injected clock with expired metadata and matching token. | A5, A7, A8 | Exit `0`; receipt note says released expired token. | Boundary precision at exact `expires_at` is covered only by unit clock tests. |
 | Idempotent replay | Harness retry after successful release may fail. | Same-token release retry succeeds through `session-<uuid>.released`. | integration | Pause, release, release again. | A5, A7 | Second `0`, `already_released: true`. | Does not preserve idempotency after a later acquire removes the marker. |
 | Missing lock no marker | Absent lease may be mistaken for a valid idempotent release. | Unknown token with no marker returns `17`. | component | No lock/marker. | A7 | stderr code `lock-expired`. | Cannot distinguish manual lock deletion from never-acquired state. |
 | Marker token mismatch | Stale or foreign marker may authorize the wrong caller. | Existing marker with different token returns `16`. | component | Prewritten `session-<uuid>.released` with different token hash. | A5, A7 | stderr code `lock-token-invalid`. | Does not prove manual marker tampering is impossible, only that mismatch fails. |
-| Permissions | Lock files may leak token evidence or permit tampering. | Lock state is owner-private on Unix. | Unix integration | Inspect mode bits. | A7 | Dir `0700`, files `0600`. | Windows ACL behavior remains implementation discovery. |
-| Side effects | Pause/resume may mutate transcripts or DB rows. | Only lock state mutates beyond accepted `StateDb::open` side effects. | integration | Snapshot DB counts/transcript mtimes. | A1, A3, A7 | Unchanged except parent dir/WAL/schema/backfill effects inherent to open. | Cannot enforce future `StateDb::open` internals; read-only open is a follow-up. |
+| Permissions | Lock state files may leak token evidence or permit tampering. | Sentinel, lock, marker, and temp files are owner-private on Unix. | Unix integration | Inspect mode bits. | A7, A8 | Dir `0700`, files `0600`. | Windows ACL behavior remains implementation discovery. |
+| Side effects | Pause/resume may mutate transcripts or DB rows. | Only lock state mutates beyond accepted `StateDb::open` side effects. | integration | Snapshot DB counts/transcript mtimes. | A1, A3, A7, A8 | Unchanged except parent dir/WAL/schema/backfill effects inherent to open. | Cannot enforce future `StateDb::open` internals; read-only open is a follow-up. |
 | Writer-path advisory scope | Harness may assume full mutual exclusion before sibling PRs land. | v1 docs/tests state lock primitive is advisory until import-replace/migration/resume/repl observers ship. | doc + integration | README/proposal check plus locked session followed by existing sibling command fixture if available. | A6 | Docs name deferred paths; no v1 test expects sibling command refusal. | Full mutual exclusion remains cross-PR work, not validated in this PR. |
 | README truth | Public docs may drift from contract. | Docs match synopsis, JSON, TTL, exits, marker path, and advisory scope. | doc check | README snippets/manual checklist. | A5, A6, A7 | Fields and codes match proposal. | Manual doc checks can miss wording ambiguity. |
 
@@ -538,7 +617,9 @@ Update `README.md` near the CLI synopsis and session/resume sections:
   migration, resume/repl, and balanced one-shot wire observers in their
   own PRs.
 - Mention `~/.local/share/oulipoly-agent-runner/locks/` next to the
-  existing `state.db` persistent-state paragraph.
+  existing `state.db` persistent-state paragraph, including the
+  never-deleted `sentinel.lock` and per-session `.lock` / `.released`
+  files.
 
 # 11. Supported-surface track
 
@@ -561,21 +642,23 @@ Adjacent paths:
 Migration path: no user state migration beyond on-demand lock directory
 creation. Existing sessions are unlocked because no lockfile exists.
 
-Rollback path: remove or stop invoking the subcommands. Existing lockfiles
-are inert to older binaries. Operators may delete stale files after
-confirming no newer binary is observing them.
+Rollback path: remove or stop invoking the subcommands. Existing lock
+state files are inert to older binaries. Operators may delete stale
+session lock, marker, or orphaned temp files after confirming no newer
+binary is observing them. The sentinel file is harmless to leave in
+place.
 
-Observability: stdout receipts, stderr JSON errors, and lockfiles are the
-entire v1 surface. No invocation row, trace event, audit table, or
-telemetry is added.
+Observability: stdout receipts, stderr JSON errors, and lock state files
+are the entire v1 surface. No invocation row, trace event, audit table,
+or telemetry is added.
 
 # 12. Implementation residuals
 
 - D1a is file-backed, not DB-backed. It avoids schema migration and
-  matches `lock_path`, but depends on local filesystem atomic
-  `O_CREAT | O_EXCL` behavior and private filesystem permissions.
-  Lockfile metadata is the lease because the CLI exits after printing
-  the receipt.
+  matches `lock_path`, but depends on POSIX filesystems with working
+  `flock(2)` on a never-unlinked sentinel, same-directory atomic
+  `rename(2)`, and private filesystem permissions. Lockfile metadata is
+  the lease because the CLI exits after printing the receipt.
 - No active provider process drain is implemented in v1. Existing running
   invocation rows are not sufficient session writer leases.
 - D4b leaves sibling writer-path observation to later PRs by design.
