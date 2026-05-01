@@ -1,138 +1,163 @@
-# 06-pause-handshake - Phase 4 Audit Risk Report (Round 2 / Rev 2)
+# 06-pause-handshake - Phase 4 Audit Risk Report (Round 3 / Rev 3)
 
 **Verdict: HIGH**
 
-Rev 2 closes the four Round 1 audit findings on their stated surfaces: the
-idempotent release marker shape is selected, writer-path observation is now an
-explicit accepted cross-PR residual, `StateDb::open` side effects are pinned as
-accepted open-time behavior, and the test matrix carries assumption/residual
-columns.
+Rev 3 closes the specific Round 2 `flock`-on-removable-inode failure mode: the
+proposal no longer relies on POSIX advisory locks for mutual exclusion and now
+uses `OpenOptions::create_new(true)` / `O_CREAT | O_EXCL` for the create step
+(`proposals/06-pause-handshake.md:226`, `proposals/06-pause-handshake.md:232`,
+`proposals/06-pause-handshake.md:350`).
 
-The audit gate still does not clear. Fresh review of the now-concrete lockfile
-algorithm found a high-risk synchronization flaw: Rev 2 uses `flock` on the same
-path that acquire/release may remove or recreate. On POSIX systems, `flock`
-coordinates open file descriptions/inodes, not a pathname. Removing and
-recreating the path can split the critical section and permit concurrent lease
-granting under realistic stale-acquire interleavings.
+The audit gate still does not clear. The replacement algorithm remains
+path-racy during stale acquisition because stale contenders unlink by pathname
+after reading old metadata, without proving the path still names that same old
+lease. A process that already read the expired lease can delete a newer lockfile
+created by another contender, then successfully create its own lock. This still
+permits two `pause-handshake` calls to return `0` for the same session under
+realistic stale-acquire interleavings.
 
-## Round 1 Closure Check
+## Round 2 Closure Check
 
-### R1-F01 - Closed
+### R2-F01 - Not Fully Closed
 
-Rev 1 left idempotent release marker storage as a Phase 5 design fork. Rev 2
-selects a sibling marker file, includes it in success JSON, computes its path
-beside the lockfile, defines its JSON body, and records that there is no future
-marker-shape deferral (`proposals/06-pause-handshake.md:173`,
-`proposals/06-pause-handshake.md:206`, `proposals/06-pause-handshake.md:325`,
-`proposals/06-pause-handshake.md:528`).
+The Rev 2 bug was specifically that `flock` was held on a pathname that the
+algorithm could unlink and recreate. Rev 3 removes that primitive and correctly
+states that `flock` must not be used for this lockfile because the path may be
+unlinked during stale cleanup (`proposals/06-pause-handshake.md:226`).
 
-This is sufficient for Phase 6 contract/test authors to know where same-token
-release evidence lives and how missing-lock replay maps to `0` vs `16`.
+That part of R2-F01 is closed. However, the replacement protocol does not supply
+an equivalent stable compare-and-replace guard. Stale acquire now does:
 
-### R1-F02 - Closed As Accepted Residual
+1. read expired lease evidence,
+2. `unlink(lock_path)`,
+3. retry `create_new` once,
+4. treat retry `EEXIST` as another winner (`proposals/06-pause-handshake.md:252`).
 
-Rev 1 deferred writer-path observation without an explicit acceptance decision.
-Rev 2 now states that v1 ships the primitive only, sibling writers are deferred
-to their own PRs, and the harness acceptance surface is narrowed until those
-observers land (`proposals/06-pause-handshake.md:22`,
-`proposals/06-pause-handshake.md:61`, `proposals/06-pause-handshake.md:382`,
-`proposals/06-pause-handshake.md:518`, `proposals/06-pause-handshake.md:546`).
+The race is not between `unlink` and retry-create alone. It is between an old
+stale read and a later pathname unlink. The proposal never proves that the file
+being unlinked is still the expired file that was read.
 
-This conflicts with the initiative's original "observe once pause lands" wording
-(`/home/nes/projects/agent-runner/worktrees/06-locate/initiatives/06-session-override-contract.md:114`),
-but the proposal now makes the narrowing explicit enough for this audit surface.
-The risk remains a named residual rather than an unresolved contract fork.
+Failing interleaving:
 
-### R1-F03 - Closed With Explicit Side-Effect Residual
+1. Expired lockfile `E` exists.
+2. Process A and process B both fail `create_new` with `EEXIST`, read `E`, and
+   classify it as expired.
+3. A unlinks `E`.
+4. A retries `create_new`, creates replacement lockfile `A`, and proceeds toward
+   success.
+5. B executes its already-authorized `unlink(lock_path)`. The pathname now names
+   `A`, not `E`, so B removes A's replacement.
+6. B retries `create_new`, creates replacement lockfile `B`, and proceeds toward
+   success.
+7. A may still write/fsync/return success through its open fd even though its
+   lease is no longer reachable at `lock_path`; B also returns success with a
+   different token.
 
-Rev 1 allowed an unbounded `StateDb::open` exception while claiming lock-state
-only behavior. Rev 2 names the exact inherited open-time effects accepted for
-v1: parent directory creation, WAL enable, schema ensure, and chain backfill
-(`proposals/06-pause-handshake.md:416`). It also records read-only open as a
-follow-up after schema-probe is mergeable (`proposals/06-pause-handshake.md:425`,
-`proposals/06-pause-handshake.md:531`).
+Impact: this violates the core single-lease guarantee and the test-intent row
+that two concurrent pause calls grant one token and one `13 session-busy`
+(`proposals/06-pause-handshake.md:504`). It is the same safety-class failure as
+R2-F01, even though the concrete mechanism changed from split `flock` inodes to
+stale-read pathname deletion.
 
-The §8 wording is still easy to misread because it says "No DDL, no row
-mutation" immediately after accepting schema ensure and chain backfill
-(`proposals/06-pause-handshake.md:418`). The §12 wording clarifies the intended
-meaning as "no command-added DDL or row mutation beyond open-time effects"
-(`proposals/06-pause-handshake.md:533`). Treat as closed, not reopened.
+## Rev 3 Algorithm Check
 
-### R1-F04 - Closed
+### R3-F01 - HIGH - Stale-acquire unlink is not compare-and-replace
 
-Rev 2 adds `assumption_link` and `residual_risk` columns to the test-intent
-matrix and fills them for each test group (`proposals/06-pause-handshake.md:436`).
-Rows now explicitly connect resolver, TTL, token, permissions, advisory scope,
-and README verification to assumptions A1-A7 and named unverified residuals.
+Rev 3 says the race is closed because only one contender can create the
+replacement lockfile with `O_CREAT | O_EXCL` (`proposals/06-pause-handshake.md:264`).
+That statement is incomplete. `O_EXCL` makes each individual create atomic, but
+it does not protect the preceding pathname `unlink` from deleting a replacement
+created after the stale metadata read.
 
-## Fresh Rev 2 Findings
+The side-effect contract explicitly permits stale acquire to unlink an expired
+lockfile and then retry create (`proposals/06-pause-handshake.md:456`). The API
+section repeats the same behavior (`proposals/06-pause-handshake.md:350`). There
+is no stable guard file, no lock directory ownership token, no generation CAS,
+no inode validation tied atomically to unlink, and no "rename only if old token
+still matches" primitive. The old token evidence `T_old` is read
+(`proposals/06-pause-handshake.md:255`) but is not used to constrain the unlink.
 
-### R2-F01 - HIGH - Removable flock target can split the lock critical section
+Release has a related race with stale acquisition. `resume-handshake` may read
+an expired matching lockfile, then write a marker and unlink `lock_path`
+(`proposals/06-pause-handshake.md:277`). If a stale acquire replaces the expired
+lockfile between the resume read and resume unlink, the old-token resume can
+remove the new lease. That can leave a successful new pause without a reachable
+lockfile or allow a later pause to acquire again.
 
-Rev 2 makes the durable lease a file-backed lock at
-`locks/session-<session_id>.lock` and says `flock` is held around
-acquire/release/read critical sections (`proposals/06-pause-handshake.md:216`).
-It then specifies that `pause-handshake` opens or creates that lockfile and
-takes an exclusive `flock` (`proposals/06-pause-handshake.md:222`).
+Required closure: replace the stale cleanup protocol with a stable
+synchronization or true compare-and-replace contract. Acceptable shapes include:
 
-The same algorithm also permits stale metadata to be "remove/truncate[d] under
-the same flock" before acquiring (`proposals/06-pause-handshake.md:225`) and
-requires matching release to write the sibling marker and remove the lockfile
-while still in the critical section (`proposals/06-pause-handshake.md:248`).
-The side-effect contract repeats that acquire/release may create, replace, or
-remove `locks/session-<session_id>.lock` (`proposals/06-pause-handshake.md:392`,
-`proposals/06-pause-handshake.md:400`).
+- a separate per-session guard file that is created once and never removed, with
+  lock and marker mutation serialized while holding the guard;
+- a lock directory or generation protocol where stale cleanup cannot delete a
+  newer owner after an old read;
+- a platform-specific implementation that proves the unlink applies to the same
+  object that was read, not merely the same pathname.
 
-This is not a stable mutual-exclusion primitive. POSIX advisory locks protect
-the opened file/inode. If process A holds a flock on the old lockfile and
-unlinks it, process B can create the same pathname as a new file and take a
-separate flock on the new inode. Both processes can believe they are inside the
-exclusive section.
+The proposal must update §4, §6, §8, and §9.1 to cover concurrent stale-acquire
+and stale-acquire/resume interleavings. The acceptance signal should explicitly
+require one success and one `13`, with the winning token's lockfile still
+present and containing the winning token hash after all contenders exit.
 
-The highest-risk interleaving is stale acquire. A locks an expired file and
-unlinks it as allowed by §4. B then creates and locks a new file at the same
-path, sees no metadata, writes a fresh lease, and returns exit `0`. A can still
-complete its own "acquire" path against the old fd or a replacement write path
-and return a different token. That violates the core test-intent claim that two
-concurrent pause calls grant one lease and one `13 session-busy`
-(`proposals/06-pause-handshake.md:442`).
+### R3-F02 - MEDIUM - Loser can observe partial metadata during initial acquire
 
-Release/acquire races are also underspecified. A matching release removes the
-lockfile while holding a flock on the old inode. A fresh pause can create and
-lock a new inode before the release critical section has completed marker fsync
-and directory fsync work. The proposal relies on marker deletion by fresh
-acquire for idempotency isolation (`proposals/06-pause-handshake.md:366`), but
-does not define a stable guard that serializes marker and metadata updates.
+Rev 3 creates the lockfile before writing lease JSON (`proposals/06-pause-handshake.md:243`).
+A concurrent pause that loses `create_new` can immediately read the just-created
+file before the winner has written complete metadata. The current contract maps
+malformed, unreadable, or missing required fields to exit `1 operational-error`
+(`proposals/06-pause-handshake.md:248`).
 
-Impact: Phase 6 could implement exactly the proposed file-backed design and pass
-ordinary concurrent-process tests while retaining a split-brain race under
-stale cleanup or release/acquire timing. The external harness depends on the
-lease token as the exclusive write guard; a double `0` acquire collapses the
-feature's safety case even under the narrowed advisory v1 surface.
+This does not create a double lease, but it weakens the stated concurrent-acquire
+surface. The matrix expects two concurrent pause calls to produce one `0` and
+one `13` (`proposals/06-pause-handshake.md:504`), not intermittent operational
+errors caused by a normal in-progress writer.
 
-Required Rev 3 closure: define a synchronization object that is never unlinked
-or replaced while used for `flock`, or choose an atomic-create/rename protocol
-that does not depend on flocking a removable pathname. Examples that would close
-the contract gap: a separate per-session guard file such as
-`session-<uuid>.guard` that is created once and never removed, with `.lock` and
-`.released` metadata mutated only while holding the guard; or a lock-directory
-protocol using atomic `mkdir` plus explicit stale-owner replacement rules. The
-proposal must then update §4, §6, §8, and the atomic-acquire/release tests to
-cover stale-acquire and release/acquire interleavings against that stable guard.
+This can be closed together with R3-F01 by serializing metadata writes under a
+stable guard, or by defining an in-progress state that losers treat as
+`session-busy` rather than corruption.
 
-## Checklist Notes
+## Round 1 Closure Recheck
 
-- Present: proposal artifact, assumption register, net-value statement,
-  command schemas, JSON receipts, exit namespace, lock/marker paths,
-  side-effect section, README work, supported-surface track, residuals, and
-  cross-feature compliance table.
-- Closed from Round 1: R1-F01, R1-F02, R1-F03, R1-F04.
-- No regression found on the Round 1 closure surfaces.
-- Not audit-clear: Rev 2's lockfile/flock contract does not guarantee single
-  lease ownership when the flock target can be removed or recreated.
+### R1-F01 - Still Closed
 
-## Required Rev 3 Closure
+The sibling release marker remains concrete: `session-<uuid>.released` is in the
+resume receipt, path computation, marker schema, idempotent replay behavior, and
+residuals (`proposals/06-pause-handshake.md:174`,
+`proposals/06-pause-handshake.md:216`, `proposals/06-pause-handshake.md:384`,
+`proposals/06-pause-handshake.md:591`).
 
-Rev 3 should keep the Round 1 closures intact and replace the removable-lockfile
-critical section with a stable synchronization contract. Because R2-F01 is HIGH,
-Phase 4 audit must rerun after the proposal revision.
+### R1-F02 - Still Closed As Accepted Residual
+
+Writer-path observation remains explicitly deferred with narrowed v1 acceptance:
+scope statement, anti-scope, tests, README work, residuals, and cross-feature
+table all say the primitive is advisory until sibling PRs wire observers
+(`proposals/06-pause-handshake.md:30`, `proposals/06-pause-handshake.md:443`,
+`proposals/06-pause-handshake.md:518`, `proposals/06-pause-handshake.md:535`,
+`proposals/06-pause-handshake.md:581`, `proposals/06-pause-handshake.md:609`).
+
+### R1-F03 - Still Closed With Explicit Side-Effect Residual
+
+The `StateDb::open` exception remains pinned to inherited open-time behavior:
+parent directory creation, WAL enable, schema ensure, and chain backfill are
+accepted; command-added DDL/row mutation remains out of scope
+(`proposals/06-pause-handshake.md:478`, `proposals/06-pause-handshake.md:594`).
+
+### R1-F04 - Still Closed
+
+The test matrix still includes `assumption_link` and `residual_risk` columns on
+each row (`proposals/06-pause-handshake.md:498`).
+
+## Regression Check
+
+No regression found on the Round 1 closure surfaces.
+
+Rev 3 does regress the Round 2 closure intent by replacing the `flock` race with
+an insufficient pathname-unlink protocol. The proposed `O_CREAT | O_EXCL` create
+step is atomic, but the full stale-acquire/release algorithm is not race-free.
+
+## Required Rev 4 Closure
+
+Rev 4 must keep the Round 1 closures intact and define a stale-replacement
+protocol that cannot unlink a newer lease after reading an older expired lease.
+Because R3-F01 is HIGH and affects the core single-token guarantee, Phase 4 audit
+must rerun after the proposal revision.
