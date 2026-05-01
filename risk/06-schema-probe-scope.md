@@ -1,88 +1,76 @@
-# 06-schema-probe — Phase 4 scope risk gate (claude-opus)
+# 06-schema-probe — Phase 4 scope risk gate (claude-opus, Round 2)
 
-**Verdict: LOW (one MEDIUM finding to clarify before Phase 5).**
+**Verdict: LOW.**
 
-The proposal stays inside the initiative's lane: one new `agents session
-schema-probe` subcommand, one new read-only `StateDb` open variant
-(`open_read_only` / `open_ro`), and small probe-only inspection helpers.
-The seven D-decisions all answer questions raised by the harness ask
-(`05-session-schema-probe.md`) or by Initiative 06's cross-feature
-constraints; none of them quietly add adjacent work. D7 is an explicit
-contraction (no retrofit of `trace`, etc.), §6 does not refactor
-`StateDb` beyond the new variant + helpers, §7/§8 cover every harness
-and initiative anti-scope item with one minor implicit-only gap, and the
-test-intent track in §9.1 verifies the probe rather than re-proving
-existing schema-ensure correctness.
+Rev 2's only diff against Rev 1 is the two authorized audit closures
+(R1-F01 §3 compatibility-map shape; R1-F02 §6 `ReadOnlyOpenError`
+variants), plus the §1 change-log block and the §4 / §9.1 wording that
+references the now-pinned shape. Both closures are clarification — they
+narrow ambiguity that already existed in Rev 1 without adding any new
+field, command, helper, decision, side effect, or surface promise. No
+new D-decision was introduced, no anti-scope item was relaxed, and no
+prior LOW nit was silently widened. Round 1's MEDIUM observation about
+`PRAGMA user_version` stamping (carried in audit-history as scope's
+verdict-line caveat) is not on the authorized closure list for this
+round and remains outside Round 2 scope.
 
-The single non-trivial scope ambiguity is whether mutating schema-ensure
-paths gain `PRAGMA user_version` stamping in *this* PR — §1 / §3.1 use
-"may stamp" while §11 implies a future stamper. That is the only place
-the diff could quietly grow. Flagged as MEDIUM for clarification.
+## Round 2 direction analysis (Rev 2 changes only)
 
-## Scope-direction analysis
+| Change | Closure target | Direction | Notes |
+| --- | --- | --- | --- |
+| §1 lines 35-43 add a "Rev 2 changes" change-log block. | meta | clarification | Names R1-F01 and R1-F02 explicitly; no new commitment. |
+| §3 row text for `state_db.tables` / `required_columns` / `required_indexes` (lines 127-129) and the new shape paragraph (lines 134-138) pin flat-for-tables vs nested-for-columns/indexes; no dotted keys. | R1-F01 | clarification (reduction of ambiguity) | The Rev 1 schema row already named these as "object boolean map"; Rev 2 fixes the serialization shape. No new field; no field renamed; no field removed. The illustrative JSON block (lines 140-163) is non-normative and matches the pinned text. |
+| §4 step 7 (lines 259-263) describes how the inspector builds the maps — flat for tables, nested for columns/indexes, with every required key initialized to `false` even when the parent table is absent. | R1-F01 | clarification | Aligns the resolution flow with the §3 shape. Does not add or remove an inspection step; PRAGMA/`sqlite_master` calls are unchanged from Rev 1. |
+| §9.1 rows D3 / D6-missing / D6-older-newer-missing now assert "canonical §3 map shape" and "booleans preserved at canonical keys". | R1-F01 | clarification | Tests the existing observable; no new fixture class; no new tooling beyond what Rev 1 already required. |
+| §6 lines 303-309 enumerate `ReadOnlyOpenError::{Missing, NotADatabase, PermissionDenied, WalSidecarError, Operational}`. | R1-F02 | clarification (named contract for an existing return type) | Rev 1 already declared `open_read_only` returns `Result<Self, ReadOnlyOpenError>`. Rev 2 fixes the variant set; it does not add a sixth public return type, change `default_path` / `user_version` / `inspect_session_schema`, or refactor `StateDb::open`. |
+| §6 lines 315-323 map each variant to a triggering condition, CLI exit behavior, and a §9.1 test obligation. | R1-F02 | clarification | The exit codes and stderr error codes (`0`, `1` `state-open-failed` / `state-inspect-failed`, no `14` for these variants) are identical to Rev 1's §5 table; the mapping just makes the linkage explicit. `Missing` cleanly produces exit `0` with the §3-shape success object, matching Rev 1 §4 step 4. |
 
-| Question | Direction | Notes |
-| --- | --- | --- |
-| S1 — single command + read-only open variant | within lane (one ambiguity) | §1 names: `session schema-probe`, `StateDb::open_read_only`, inspection helpers, schema-version constants. Constants are binary-side and read-only. The "mutating schema-ensure paths may stamp `user_version`" wording (§1, §3.1, §11) is the one place the PR could grow into write-side schema-ensure code. See M1. |
-| S2 — D-decisions vs harness ask | within lane | D1 (`PRAGMA user_version`), D2 (hardcoded feature map), D3 (read-only open semantics), D4 (`safe_for_import_replace`), D5 (storage vocabulary), D6 (exit codes) all answer fields/codes named in `05-session-schema-probe.md`. D7 is a contraction. None silently add a new surface. |
-| S3 — no retrofit of existing commands | correctly held | §1 ¶3, §7 D7, §9.1 D7 row, §13 line "Read-only `StateDb` open variant lands in 06-schema-probe". `trace`, `repl`, `resume`, `--resume`, `migrate-db`, `migrate-config`, `resume-list`, GUI Tauri callers all continue to use mutating `StateDb::open`. |
-| S4 — §6 API stays narrow | within lane | New surface = `default_path()`, `open_read_only(&Path) -> Result<Self, ReadOnlyOpenError>`, `user_version(&self)`, `inspect_session_schema(&self)`. No mode flag on `StateDb`, no shared helper extraction from `open`, no public API churn on existing methods. `default_path()` is a small split-out so the probe can resolve without opening; consistent with the harness ask for a no-side-effect path. |
-| S5 — anti-scope coverage vs harness §Anti-scope and initiative cross-feature anti-scope | within lane (one implicit-only gap) | Harness items: locate/export/replace ✓ (§7), repair/migrate ✓ (§7 "No DB repair/migration"), third-party `state.db` writes ✓ (§7). Initiative items: auto-resume ✓, provider spawn ✓, quota refresh ✓, config edits ✓, `migrate-config` coupling ✓ (all in §7 + §13). One implicit-only gap: harness "does not expose provider secrets or raw transcript contents" — §8 forbids transcript reads, but config-secret reads are not explicitly forbidden in §7/§8. The §3 JSON shape contains no secret-bearing fields, so this is excluded by construction, just not by named anti-scope. See L1. |
-| S6 — test-intent track scope | within lane | §9.1 tests probe-side observables only: PRAGMA authority, feature map shape, no-side-effect on legacy fixtures, WAL read behavior, predicate truth table, storage vocabulary, exit-code mapping, no-retrofit static check, side-effect contract, README truthfulness. None re-prove Initiative 04/05 ensure or backfill correctness; the version-2 / version-3 fixture rows test the *comparison*, not the migration. |
+### Drift check (no Rev-2 change found outside the two closures)
+
+- §2 subcommand surface, §3.1-§3.4 D-decisions, §5 exit-code table, §7
+  anti-scope, §8 side-effect contract, §10 README updates, §11
+  supported-surface, §12 residuals, §13 cross-feature checklist — all
+  match Rev 1 textually.
+- No new helper on `StateDb`. The Rev 1 surface (`default_path`,
+  `open_read_only`, `user_version`, `inspect_session_schema`) is
+  unchanged.
+- No new feature flag, no new storage-vocabulary entry, no new exit
+  code, no change to `safe_for_import_replace` predicate conditions.
+- The `WalSidecarError` variant is permitted by Rev 1's §3.1 D3 / §5
+  WAL classification; it does not move WAL failures from operational
+  exit `1` into schema-incompatible exit `14`.
+
+## Round 1 LOW nits — closure status
+
+- **L1 (provider-secret anti-scope only implicit).** Not on the
+  authorized closure list for Round 2. §7/§8 still forbid config edits
+  and transcript reads; explicit "no config / credential reads" line is
+  still absent. Carry forward; not a blocker.
+- **L2 (`default_path()` mini-API split-out).** Unchanged in Rev 2.
+  Still within the harness ask. No action.
+- **L3 (D5 storage-vocabulary duplication).** Unchanged; §3.3 and §12
+  still acknowledge the on-merge reuse path.
+- **L4 (`inspect_session_schema` shape).** Unchanged; §6.2 still leaves
+  naming to Phase 5 while keeping the helper non-mutating.
+- **L5 (README framing as documentation).** Unchanged; §10 still
+  documentation-only.
 
 ## Findings ≥ MEDIUM
 
-### M1 — `PRAGMA user_version` stamping work is ambiguous in this PR
+None for Round 2. R1-F01 and R1-F02 are closed by §3 / §6 wording that
+matches the Round 1 watch signals (WS1: §3 shape stability; WS2: API
+error-variant discipline). The Round 1 scope caveat about
+`user_version` stamping ambiguity is unchanged in Rev 2 but is not an
+authorized Round 2 closure target and is outside this round's
+direction-analysis remit.
 
-§1: "Mutating schema-ensure paths **may** stamp `PRAGMA user_version`;
-the probe only reads it." §3.1: same "may" wording. §11: "existing DBs
-have `user_version = 0` until a new mutating schema path stamps the
-current version after ensuring schema." §12 lists the unstamped state as
-a residual. §13's compliance checklist has no row for stamping.
+## LOW nits (Round 2)
 
-Two readings are both consistent with the proposal text:
-
-1. **Stamping ships in this PR** — `StateDb::open` (or
-   `ensure_*_schema`) gains a `PRAGMA user_version =
-   CURRENT_SCHEMA_VERSION` write after schema-ensure completes. That is
-   write-side code outside the "read-only open variant" lane the
-   initiative explicitly assigned to this feature
-   (`initiatives/06-session-override-contract.md:118-120`).
-2. **Stamping is deferred** — only the probe + constants land. Every
-   currently-installed DB then reports `user_version = 0` and fails the
-   `MINIMUM_SUPPORTED_SCHEMA_VERSION = 3` check, so `compatible` is
-   `false` for every real-world DB until a follow-up PR teaches some
-   write path to stamp.
-
-The current "may" phrasing leaves the question for Phase 5/6. Either
-answer is defensible, but the choice changes the diff's blast radius
-(touching `StateDb::open` / `ensure_*_schema` vs. not). Phase 4 cannot
-verify the lane boundary without that decision being explicit.
-
-## LOW nits
-
-- **L1 — Provider-secret anti-scope only implicit.** §7 names config
-  edits and transcript reads as forbidden but does not explicitly forbid
-  *reading* config files / provider credentials. The §3 schema contains
-  no secret fields, so secrets cannot leak through the documented JSON;
-  still, the harness anti-scope line "does not expose provider secrets"
-  has no direct counterpart in §7/§8. Adding "no config or credential
-  reads" to §7 would close the implicit-only gap.
-- **L2 — `default_path()` is a small additive split-out of
-  `open_default()`.** Strictly within the harness ask ("no
-  side-effect path to ask where the default state DB is",
-  problem-map §6 #6), but worth naming as a mini-API addition so Phase 5
-  hookpoints don't treat it as zero-cost.
-- **L3 — D5 storage-vocabulary duplication is acknowledged.** §3.3 and
-  §12 already note that if 06-locate has not landed, schema-probe
-  defines its own `claude_code` / `codex_session` / `other` enum.
-  Initiative-level convention `no-backwards-compatibility.md` is
-  consistent with this; reuse on merge is correctly framed as a Phase 5
-  hookpoint decision, not a v1 dependency.
-- **L4 — `inspect_session_schema` returns a structured probe-only type.**
-  §6.2 keeps the helper non-mutating and probe-shaped; naming is left to
-  Phase 5. No drift toward a general-purpose `StateDb` introspection
-  API.
-- **L5 — README updates (§10) are framed as documentation, not as a
-  separate user-facing surface change.** Stays within the harness ask
-  ("README documents the JSON shape and refusal semantics").
+- **R2-L1.** §3 illustrative JSON (lines 140-163) is partial — it shows
+  only the `state_db` subtree. The §3 row table remains the normative
+  source. Acceptable; flagged so Phase 5 reads the table, not the
+  example, when generating the report builder.
+- **R2-L2.** §6 variant mapping table cites two §9.1 test obligation
+  labels for a single variant in the WAL row ("`state-open-failed` or
+  `state-inspect-failed`"). This matches §5 exit table and §9.1 D3 row,
+  so it is internally consistent; no action.

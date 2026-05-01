@@ -1,172 +1,110 @@
-# 06-schema-probe — Phase 4 Supported-Surface Risk Report (Rev 1)
+# 06-schema-probe — Phase 4 Supported-Surface Risk Report (Rev 2)
 
 **Termination signal:** `none`
 **LOW / MEDIUM / HIGH:** **LOW**
 
-The proposal lands `agents session schema-probe` as a strictly additive,
-physically read-only CLI surface. Every assumption in §1.1 holds against
-problem-map evidence; six of the ten observability gaps in
-`research/06-schema-probe-problem-map.md` §6 are closed, three are
-addressed via structured exit/JSON, and the one remaining gap (GUI DB
-divergence) is honestly residualized. Adjacent paths (trace, resume,
-repl, migrate-db, migrate-config, hidden resume-list, direct CLI
-ingestion, GUI Tauri commands) are not retrofitted in v1 (D7) and
-remain bit-identical. Harness acceptance criteria (1-7) are all
-covered. The largest soft spot is a sequencing dependency, not an
-assumption fault: until a future mutating-open PR stamps
-`PRAGMA user_version`, every existing DB returns exit `14`, so the
-near-term harness experience is permanent refusal — but that refusal
-is the product behavior the harness explicitly asked for, so net
-value remains positive. Phase 5 (hookpoints) and Phase 6
-(implementation) may proceed with the residual coordination items
-below.
+Rev 2 closes Round 1's two MEDIUM audit findings (R1-F01, R1-F02) without
+disturbing the supported-surface posture established in Rev 1. The proposal
+remains a strictly additive, physically read-only CLI surface: §1.1 register,
+§7 anti-scope, §8 side-effect contract, §11 supported surface, and §13
+cross-feature checklist are unchanged in substance. Net value is preserved
+and modestly improved — the JSON shape and `ReadOnlyOpenError` variant table
+make harness implementations less ambiguous and §9.1 test obligations
+auditable. No assumption is invalidated. Adjacent paths remain bit-identical
+under D7. Phase 5 hookpoints may proceed.
 
-## Concern 1 — Assumption walk on §1.1
+## Concern 1 — Assumption walk on §1.1 (delta-only)
 
-| ID | Verdict | Note |
+The §1.1 register text is byte-identical to Rev 1; the Rev 1 verdicts carry
+forward. Spot-checking the assumptions whose evidence intersects the Rev 2
+deltas:
+
+| ID | Verdict | Rev 2 note |
 | --- | --- | --- |
-| A1 read-only open is feasible | **HOLDS** | `StateDb` is a thin `rusqlite::Connection` wrapper (problem-map §1 #9). SQLite `mode=ro` + `PRAGMA user_version` + `sqlite_master` + `PRAGMA table_info`/`index_info` are all non-mutating. §6.1 D3 is concretely scoped: no parent-dir create, no `journal_mode=WAL`, no schema-ensure, no backfill. Invalidator (compatibility requires mutation) does not fire — A6 confines compatibility to structural-plus-version checks. |
-| A2 `PRAGMA user_version` is the right source | **HOLDS (REPHRASED)** | The slot is correct (problem-map §5 #7-9: currently unused, no competing metadata table). The honest read is that v1 *defines* the contract; *populating* it on legacy DBs is a separate mutating-open PR's job. The proposal is explicit: probe never stamps; mutating paths "may" stamp. This is not a fault — it is an acknowledged sequencing seam (§12 residual #1) — but see Findings #1. |
-| A3 compiled features are binary-bound | **HOLDS** | Command support is compiled into clap arms/modules (problem-map §2 #13). D2a hardcodes the map so clap-only/Cargo-feature accidents cannot leak into the contract. Each sibling PR owns its own row update. Invalidator (feature safety depends on runtime config) does not fire because schema-probe reports *compiled* support, not config validity. |
-| A4 CLI default DB is the right v1 target | **HOLDS** | Harness invokes the CLI binary; CLI callers consistently use `StateDb::open_default()` at `dirs::data_dir()/oulipoly-agent-runner/state.db` (problem-map §1 #11-12). GUI/Tauri DB divergence is honestly out-of-scope (§12 residual #3). Invalidator does not fire — the harness request itself targets CLI state. |
-| A5 reviewable parallel to 06-locate | **HOLDS** | §2 handles both branches: extend locate's `SessionSubcommands` if present, else introduce the group with only `SchemaProbe`. The "final merged surface must have one `session` group" rule prevents top-level alias drift. §3.3 D5 storage vocabulary is duplicated locally if needed and reused if locate is upstream. |
-| A6 structural+version inspection sufficient | **HOLDS** | Required tables, columns, and indexes are enumerated in §6.2 and traceable to current `db.rs` (problem-map §1 #13-22). Compatibility deliberately does *not* claim chain-backfill repair completeness; the partial-chain skip condition surfaced in problem-map §2 #6 is honestly carried forward as §12 residual #2. Invalidator (compatibility requires data invariants) does not fire — schema-probe scopes itself out of data-correctness claims. |
+| A1 read-only open feasible | **HOLDS** | Enumerated `ReadOnlyOpenError` variants are all non-mutating classifications of an attempted read-only open. None of `Missing`, `NotADatabase`, `PermissionDenied`, `WalSidecarError`, `Operational` implies a write or schema-ensure path. The invalidator (compatibility requires mutation) still does not fire. |
+| A2 `PRAGMA user_version` source | **HOLDS** | Untouched. |
+| A3 compiled features binary-bound | **HOLDS** | Untouched. |
+| A4 CLI default DB v1 target | **HOLDS** | Untouched. |
+| A5 reviewable parallel to 06-locate | **HOLDS** | Untouched; §3 canonical map shape is locally defined and does not depend on locate's enum landing first. |
+| A6 structural+version sufficient | **HOLDS** | The pinned nested map in §3 enumerates the same required tables/columns/indexes as §6.2 and Rev 1, just with a fixed serialization. No invariant scope expansion. |
 
 **Termination signal #1 (`invalidated-assumption`) — DOES NOT FIRE.**
 
-## Concern 2 — Net value vs. problem-map §6
+## Concern 2 — Net value vs. Rev 1 + Round 1 watch signals
 
-| §6 gap | Closed by | Status |
-| --- | --- | --- |
-| §6.1 no CLI-level "DB compatible" check | §3 success JSON + §5 exit `14` | Closed |
-| §6.2 no way to discover `schema_version`/`user_version` | §3 `state_db.schema_version`/`user_version` | Closed |
-| §6.3 no binary feature list | §3 `features` map (D2a) | Closed |
-| §6.4 no CLI output naming supported storage types | §3 `supported_storage_types` (D5) | Closed |
-| §6.5 no structured refusal report | §5 stderr JSON with `code: schema-incompatible` + failed booleans | Closed |
-| §6.6 no no-side-effect path to ask where the default DB is | §3 `state_db.path` + `StateDb::default_path()` | Closed |
-| §6.7 GUI/CLI path divergence not surfaced | §11.1 honest exclusion + §12 residual | Residualized (acceptable, A4 scope) |
-| §6.8 `trace --json` does not observe binary/schema | new surface owns this | Closed |
-| §6.9 no command reports DB path without opening it | §3 + §4 step 4 (missing-DB success path) | Closed |
-| §6.10 no structured missing/old/incompatible/inaccessible distinction | §5 exit matrix `0`/`1`/`2`/`14` with three subcodes | Closed |
+Rev 1 closed nine of ten problem-map §6 gaps. Rev 2 does not change that
+count, but tightens two:
 
-Nine of ten §6 gaps are closed; the tenth is honestly residualized
-within the v1 scope statement. The proposal also retires problem-map
-§2 risks #1 (mutating open inspection), #2 (WAL-on-open hint), #3
-(silent schema drift on newer binary), #7 (no public compatibility
-surface), and #18 (missing-DB invisible). It does not retire #5/#6
-(unconditional backfill, partial-chain skip) nor #19 (`CREATE IF NOT
-EXISTS` masking absence) — those remain attached to mutating `open`,
-which D7 deliberately does not modify.
+- **WS1 (JSON shape stability for compatibility map) — CLEARED.** §3 now
+  pins `tables` as a flat object, `required_columns` and `required_indexes`
+  as nested table→key→boolean objects, with explicit prose ("No dotted keys
+  such as `\"session_turns.parent_turn_id\"` are allowed in these maps") and
+  a worked JSON example. §4 step 7 mirrors this in the resolution flow:
+  required keys initialize even when their parent table is absent, so the
+  shape is stable across missing/incompatible/compatible cases. §9.1 D6
+  rows now assert "canonical §3 map shape" and "flat `tables`, nested
+  `required_columns`, nested `required_indexes`." Harness can pre-compile
+  the schema.
+- **WS2 (`ReadOnlyOpenError` variant discipline) — CLEARED.** §6 now lists
+  five named variants and a mapping table that ties each to its triggering
+  condition, CLI exit behavior, stderr JSON code, and the §9.1 test row
+  carrying the obligation. `Missing` → exit `0`; the four operational
+  variants → exit `1` with `state-open-failed` (or `state-inspect-failed`
+  for WAL inspection failures). The exit-code table in §5 and the variant
+  table in §6 are mutually consistent.
 
-**Net value:** positive. The harness can pin `schema_version`, gate on
-`features`, refuse on exit `14`, and refuse-write-ops on
-`safe_for_import_replace == false` from the day this PR lands, even
-before sibling features ship.
+Net value relative to Rev 1: **preserved and modestly improved.** The
+harness contract is more deterministic; ambiguity that would have surfaced
+in Phase 6 is decided in Phase 3. No surface is lost or weakened.
 
 **Termination signal #2 (`non-positive-value`) — DOES NOT FIRE.**
 
 ## Concern 3 — Adjacent path preservation
 
-§1 line 28-33 and §7 enumerate unchanged surfaces: `trace`, `repl`,
-`resume`, top-level `--resume`, hidden `resume-list`, `migrate-db`,
-`migrate-config`, the existing mutating `StateDb::open`, all sibling
-Initiative 06 commands, GUI/Tauri state commands, `session_scan`,
-`quota_check`, direct CLI ingestion via `turn_script`. D7 forbids
-retrofitting any existing read-intent command to `open_read_only` in
-v1. §13 cross-feature checklist confirms no auto-resume, no provider
-spawn, no quota refresh, no config edits, no `migrate-config`
-coupling. §8 side-effect contract forbids transcript reads, config
-edits, invocation/telemetry rows, adapter state, and quota/discovery
-mutation. **PRESERVED.**
+§7 D7 still forbids retrofitting any existing read-intent command in v1.
+§8 still forbids transcript reads, config edits, telemetry, and adapter
+state mutation. The new variant enumeration is internal to a new API
+(`StateDb::open_read_only`) consumed only by the new probe call site;
+existing `StateDb::open` callers (`trace`, `repl`, `resume`, top-level
+`--resume`, `migrate-db`, `migrate-config`, hidden `resume-list`, GUI/Tauri
+state commands, direct CLI ingestion) are not touched. §13 cross-feature
+checklist is unchanged. **PRESERVED.**
 
 ## Concern 4 — Migration / rollback / observability accuracy
 
-- **Migration:** §11.1 correctly reports that existing DBs have
-  `user_version = 0` and harness must treat exit `14` as refusal.
-  This is honest. The proposal does *not* claim schema-probe stamps
-  the version; it explicitly assigns stamping to a future mutating
-  schema-ensure path (§1 line 25-26, §12 residual #1).
-- **Rollback:** schema-probe writes no durable state; revert is
-  binary uninstall. A future-stamped `user_version` is inert under
-  the prior binary (no compatibility shim required, consistent with
-  `no-backwards-compatibility.md`).
-- **Observability:** stdout JSON on success, stderr JSON on refusal,
-  no telemetry, no invocation/trace/quota rows, no transcript reads.
-  Side-effect contract in §8 is the binding promise; §9.1 includes a
-  particular-integration test that snapshots config/data sentinels
-  and row counts. Accurate.
+Unchanged from Rev 1. Migration story (§11.1: existing DBs report
+`user_version = 0`, harness treats exit `14` as refusal until a future
+mutating-open PR stamps the version) is identical. Rollback (§11.1:
+binary uninstall; probe writes no durable state) is identical. The Rev 2
+JSON shape pin actually *improves* observability because the absent-table
+case still emits canonical keys with `false`, so harness diffing against
+expected schemas is well-defined.
 
-## Concern 5 — Harness acceptance criteria coverage
+## Concern 5 — Findings carried forward from Rev 1
 
-Walking the seven checkboxes in
-`agent-harness/.../05-session-schema-probe.md:55-62`:
+| Rev 1 finding | Rev 2 status |
+| --- | --- |
+| #1 Stamping-PR coordination (permanent exit `14` until a future PR stamps) | **Carried.** Substantive coordination item for Phase 5 hookpoints; Rev 2 did not address it because it is out-of-scope for an additive read-only PR. §1 line 25-26 and §12 residual #1 still document the seam. |
+| #2 `safe_for_import_replace` permanently `false` in v1 | **Carried.** §3.4 unchanged; README §10 still owes a sentence calling this out. Minor. |
+| #3 D7 leaves locate's A6 caveat documentary | **Carried.** Coordination item between schema-probe Phase 6 and any future 06-locate Rev. Not a blocker. |
+| #4 Storage-vocabulary duplication risk | **Carried.** §3.3 D5 still allows reuse-if-present, duplicate-otherwise. Phase 5 should pin the branch. |
+| #5 WAL/permission read variability is platform-dependent | **Carried.** §9.1 "D3 WAL read behavior" row still residualizes platform variance honestly, and Rev 2's `WalSidecarError`/`Operational` split actually makes the residual more inspectable. |
 
-1. Binary identity + DB path + schema/user_version + features +
-   storage types — §3 covers all five.
-2. Read-only open, no schema-ensure/migration — §6.1 D3 + §8.
-3. Missing/incompatible tables/columns/indexes → exit `14` structured
-   stderr — §5 + §9.1 row "D6 exit mapping for older/newer/missing
-   structures."
-4. Feature flags reflect compiled support for
-   locate/export/import-replace/pause-handshake — §3.2 D2.
-5. Tests verify no mtime/schema change — §9.1 row "D3 read-only open
-   has no schema/backfill side effects" (mtime + content snapshot).
-6. README documents JSON shape + refusal — §10.
-7. Harness can decide adapter-vs-fallback — yes via `features` plus
-   `safe_for_import_replace`.
+No new findings emerge from the Rev 2 deltas. Both audit findings are
+closed at the §3 and §6 source rather than papered over with prose.
 
-**All seven covered.**
+## Concern 6 — 06-locate forward-compat unchanged
 
-## Concern 6 — Forward-compat for 06-locate's residual A6
+§6 still lands `StateDb::open_read_only(&Path)` with the semantics 06-locate's
+A6 residual was waiting on. The added `ReadOnlyOpenError` enum is the public
+error type 06-locate's eventual retrofit will need to pattern-match against,
+which strengthens — not weakens — that forward-compat. D7 still forbids the
+retrofit in this PR.
 
-06-locate (`/home/nes/projects/agent-runner/worktrees/06-locate/proposals/06-locate.md:245`,
-:310) carries the caveat: "Physical read-only DB open is not in
-06-locate. Current `StateDb::open` side effects remain until
-06-schema-probe introduces the read-only variant." The initiative
-contract (`initiatives/06-session-override-contract.md:118-120`)
-binds: "Read-only `StateDb` open variant lands in 06-schema-probe."
+## Verdict
 
-§6 of this proposal lands `StateDb::open_read_only(&Path)` with the
-exact semantics 06-locate's A6 residual was waiting on. **The API
-unblocks the residual.** §7 D7 explicitly does *not* retrofit locate
-or trace onto the new variant in this PR. That is consistent with
-the initiative wording ("variant lands" ≠ "all callers retrofit") and
-with `no-deferred-stubs.md` (no half-finished retrofit), but it does
-mean 06-locate's residual A6 remains documented in locate's proposal
-even after schema-probe merges. A separate cleanup PR is required to
-flip locate to `open_read_only`. See Findings #3.
-
-## Findings
-
-1. **Stamping-PR coordination (medium-impact, near-term).** The
-   proposal's near-term harness experience is permanent exit `14`
-   because no shipped command stamps `PRAGMA user_version`.
-   Functionally this is the requested "refuse rather than corrupt"
-   behavior, so net value stays positive — but Phase 5 hookpoints
-   should record an explicit pointer to the future PR that adds
-   stamping to `StateDb::open` and/or `migrate-db`, and §10 README
-   text should make the user-facing recovery path concrete (e.g.
-   "until release X, exit 14 is expected; harness should fall back").
-2. **`safe_for_import_replace` is permanently `false` in Rev 1** by
-   construction (both gating features are `false`). The structured
-   JSON does let callers distinguish "false because features missing"
-   from "false because DB incompatible," but the README in §10
-   should call this out so harness authors do not interpret the
-   boolean as a DB diagnostic in v1. Minor.
-3. **D7 leaves locate's A6 caveat documentary, not retired.** The
-   open_read_only API lands and is consumed by schema-probe's own
-   call site; locate's A6 residual remains attached to locate's
-   proposal until a follow-on retrofit PR. Track this as a
-   coordination item between Phase 6 implementation and any future
-   06-locate Rev. Not a blocker.
-4. **Storage-vocabulary duplication risk.** §3.3 D5 already
-   addresses this: if locate has landed, reuse the public enum;
-   otherwise duplicate locally. Phase 5 should pin which branch the
-   implementation expects so the merge order is unambiguous.
-5. **WAL/permission read variability is platform-dependent.** §9.1
-   row "D3 WAL read behavior" honestly residualizes this; no action
-   required beyond the current note.
-
-**Verdict: LOW. No termination signal fires. Proposal is cleared for
-Phase 5 hookpoints with the five findings above carried forward as
-coordination items, not blockers.**
+**LOW. No termination signal fires.** Rev 2 closes WS1 and WS2 cleanly,
+preserves all six §1.1 assumptions, and improves net value by removing
+ambiguity around the compatibility-map shape and the read-only open error
+surface. The five Rev 1 findings remain valid coordination items for Phase
+5/6/10, none are blockers. Cleared for Phase 5 hookpoints.

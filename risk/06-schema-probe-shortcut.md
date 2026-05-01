@@ -1,149 +1,91 @@
-# 06-schema-probe — Phase 4 Shortcut Risk Gate
+# 06-schema-probe — Phase 4 Shortcut Risk Gate (Rev 2)
 
 **Verdict: LOW**
 
-Each D-decision picks the branch that preserves the harness's
-"refuse rather than corrupt" stance. None smuggles a problem
-elsewhere by retitling it "anti-scope" or hides it behind a
-deferred stub.
+Rev 2 only tightens §3 (compat-map JSON shape) and §6
+(`ReadOnlyOpenError` enumeration). Both are clarifications of
+contract that already existed in Rev 1, not new design surface.
+Each Rev 2 change strengthens the "refuse rather than corrupt"
+posture rather than weakening it. Per-D verdicts from Round 1
+are unchanged; D1–D7 remain LOW. No Rev 2 change introduces a
+deferred stub, backwards-compat shim, or anti-scope problem
+shift.
 
-## Per-D judgments
+## Rev 2 deltas
 
-### D1 — `schema_version` source = `PRAGMA user_version` (LOW)
+### R1-F01 — compat-map shape pinning (LOW)
 
-Purpose-fit. SQLite already owns the integer slot, so the
-proposal does not introduce a fresh metadata table that would
-itself require bootstrap migration. D1b (metadata table) was
-correctly rejected on that exact ground (§3.1, A2 invalidator).
-The probe never stamps `user_version`; mutating schema-ensure
-owns stamping (§1, §3.1).
+Purpose-fit. §3 fixes serialized shape: `state_db.tables` flat
+table → boolean; `required_columns` nested
+table → column → boolean; `required_indexes` nested
+table → index → boolean. Dotted keys such as
+`"session_turns.parent_turn_id"` are explicitly forbidden.
 
-The deliberate consequence — current DBs report
-`user_version = 0` and are refused with exit `14` until a
-mutating open stamps version `3` (§11, §12) — is disclosed,
-not hidden. Bootstrap rides existing mutating paths
-(`migrate-db` or any normal open), so no new bootstrap path
-is created.
+This clarifies an existing field surface, not new design.
+Pinning the shape closes a corruption-shaped degeneracy: a
+caller parsing dotted keys versus one walking nested objects
+would otherwise disagree about column presence without either
+being wrong by Rev 1's text. §4 step 7 reinforces this by
+requiring every required key to be initialized to `false` even
+when its parent table is absent — canonical keys are
+contractual, not optional. §9.1 D6 rows name the shape as a
+test obligation on both success and §14 incompatibility paths,
+so the contract is verified, not advisory. No anti-scope shift:
+rigor lands inside the existing surface, not on a residual.
 
-Residual: `CURRENT_SCHEMA_VERSION = 3` relies on every future
-schema-touching PR remembering to bump it. §9.1 D1 acknowledges
-this and pushes enforcement onto review. No probe-internal
-mechanism would help.
+### R1-F02 — `ReadOnlyOpenError` variant enumeration (LOW)
 
-### D2 — Feature flag enumeration = hardcoded list (LOW)
+Purpose-fit. §6 enumerates five variants — `Missing`,
+`NotADatabase`, `PermissionDenied`, `WalSidecarError`,
+`Operational` — and maps each to triggering condition, CLI
+exit, and §9.1 test row.
 
-Purpose-fit and not documentation-only. §3.4 makes
-`safe_for_import_replace` require both `session_import_replace`
-and `session_pause_handshake` to be `true`, so a binary missing
-either causes the predicate to report `false`. That is
-functional gating, not advisory.
+This is API discipline, not new behavior. Rev 1 flow steps 4,
+5, 9, 10 already required distinguishing missing files
+(exit `0`), schema incompatibility (exit `14`), and operational
+failures (exit `1`); Rev 2 names the Rust types Rev 1 implied.
+The enum is the boundary preventing an implementation from
+collapsing missing-DB and permission-denied into the same code
+path and emitting the wrong exit.
 
-Clap-introspection rejection is correct: command presence does
-not prove harness contract semantics. Cargo-feature rejection is
-correct: these are ordinary product commands.
+No catch-all hidden under opaque prose. `Operational` is named
+and carries an exit `1` mapping plus a test obligation.
+`WalSidecarError` separates sidecar-access failure from
+`NotADatabase` so §9.1 D3 WAL row has a typed target. `Missing`
+anchors the exit `0` path so missing-DB success cannot silently
+regress to exit `1`. The enum stays inside the read-only open
+surface; mutating `StateDb::open` is untouched and §7 D7 still
+forbids retrofit. No backwards-compat shim — the type is new in
+this PR.
 
-No deferred stubs. The `false` entries for unimplemented
-siblings are truthful absence claims; §12 explicitly forbids
-adding stub code for them and requires each sibling PR to update
-the map when it ships.
+## Watchpoint coverage
 
-### D3 — Read-only open semantics (LOW)
+- **WS1 (compat-map shape stability):** closed by §3 prose
+  pinning flat vs nested, the canonical example block, the
+  dotted-key prohibition, and §9.1 D6 rows asserting the shape
+  on both success and incompatibility paths. Watchpoint does
+  not sneak forward into a shortcut.
+- **WS2 (error-variant discipline):** closed by §6 enum
+  declaration plus the variant → exit → test mapping table.
+  Each variant has a §9.1 anchor; none routes to an unstated
+  catch-all. Watchpoint does not sneak forward into a shortcut.
 
-Purpose-fit. Partial-migration state is inspected structurally,
-not repaired: missing tables/columns/indexes route to exit `14`
-with failing booleans named on stderr (§4 step 9, §5). That is
-the opposite of silent failure.
+## Cross-cutting checks (re-verified for Rev 2)
 
-WAL handling is conservative. The proposal explicitly refuses
-`immutable=1` because it can ignore live WAL content (§6.1);
-inaccessible sidecars map to operational exit `1`, not schema
-exit `14` (§9.1 D3 WAL row). The right distinction.
+- **Deferred stubs:** still none. R1-F02 adds named error
+  variants for behavior that already had to exist; the
+  enumeration is not a stub for future error sources.
+- **Backwards-compat shims:** still none. The Rev 2 type
+  surface is new alongside the new read-only open path; the
+  mutating `StateDb::open` is unchanged.
+- **Anti-scope problem-shifting:** unchanged from Round 1. §7
+  exclusions remain genuine boundaries; Rev 2 does not move
+  any work into §12 residuals.
 
-Observation: a DB with all required structures and
-`user_version = 3` may still carry segmentless legacy
-`session_turns` rows (Initiative 05 backfill skip), and the
-probe will report `compatible = true`. Disclosed as a residual
-in §12 — a known cross-feature limitation, not probe-side
-silence.
+## LOW observations (carried, unchanged by Rev 2)
 
-### D4 — `safe_for_import_replace` predicate (LOW)
-
-Conservative by construction. Seven §3.4 conditions must all
-hold; failure of any returns `false`. Two are particularly
-load-bearing:
-
-- Requirement 6 (`session_pause_handshake == true`) prevents
-  the predicate from going `true` until the lock primitive
-  ships, even after import-replace lands. Without this guard, a
-  future PR could ship import-replace alone and the predicate
-  would advertise "safe" while concurrent writers raced.
-- Requirement 7 (storage-type coverage) blocks reporting safety
-  on a binary missing required storage support.
-
-§3.4 explicitly notes this PR ships with the predicate expected
-`false`. Pessimistic-in-doubt is the right default.
-
-### D5 — Storage vocabulary = local public enum (LOW)
-
-`{claude_code, codex_session, other}` matches 06-locate
-verbatim (§3.3). Local duplication if schema-probe lands first
-is acceptable because §3.3 explicitly forbids introducing a
-second JSON vocabulary or aliases — pre-empting the
-no-backwards-compatibility failure mode. §12 lists the
-duplication as a Phase-5 reconciliation residual, not a shim.
-
-### D6 — Exit code mapping (LOW)
-
-Missing DB → exit `0` does not hide a degeneracy. The success
-JSON carries `exists: false`, `schema_version: 0`,
-`compatible: false`, `safe_for_import_replace: false` (§4 step
-4, §5 row 2). The harness reads JSON, not exit alone; the
-combination is unambiguous. The harness's own old-DB example
-(spec lines 90-92, `/tmp/old-data`) is a different scenario
-(unstamped DB present) and correctly routes to `14`.
-
-The four-way split (`0` healthy / `0` missing / `1` operational
-/ `14` incompatible) gives the harness more diagnostic
-resolution. Operational errors (permission, invalid header,
-WAL/shm access) stay on `1` and do not pollute `14` (§5 rows
-3-4), keeping "schema mismatch" a clean signal.
-
-### D7 — No retrofit of existing commands (LOW)
-
-Correct. The proposal does not advertise that `agents trace` or
-any other existing command is read-only; it only adds the
-read-only path for schema-probe (§7, §9.1 D7). No claim, no
-inconsistency to hide. Trace continues to mutate WAL state via
-the existing mutating `StateDb::open`, unchanged.
-
-The two opens have different purposes (mutating product paths
-vs read-only inspection), not different vintages of the same
-purpose, so this is not a parallel old/new shim under the
-no-backwards-compatibility rule.
-
-## Cross-cutting checks
-
-- **Deferred stubs:** none. `false` feature flags are truthful
-  absence claims; §12 forbids stubs for future siblings.
-- **Backwards-compat shims:** none. Mutating `StateDb::open`
-  is unchanged; `open_read_only` is additive and serves a
-  different caller.
-- **Anti-scope problem-shifting:** §7 exclusions (no retrofit,
-  no GUI DB, no `--state-db` override, no probe-side stamping)
-  are genuine boundaries. Each excluded item is either disclosed
-  as a residual (§12) or routed to an existing mutating path
-  (stamping → migrate-db). The harness's day-one need is
-  satisfied, not deferred.
-
-## LOW observations
-
-1. `CURRENT_SCHEMA_VERSION = 3` depends on PR discipline; no
-   probe-side mechanism enforces future bumps.
-2. `compatible = true` does not validate complete chain
-   backfill integrity; segmentless legacy turns can survive a
-   "compatible" verdict. Disclosed §12.
-3. `--state-db` override is anti-scope in v1, so harnesses
-   cannot probe non-default paths without manipulating
-   `XDG_DATA_HOME`. Disclosed §7, §11.
-4. GUI/CLI DB-path divergence is preserved, not resolved.
-   Disclosed §11.
+1. `CURRENT_SCHEMA_VERSION = 3` still depends on PR discipline.
+2. `compatible = true` still does not validate complete chain
+   backfill integrity (Initiative 05 segmentless-turn skip).
+3. `--state-db` override remains anti-scope in v1.
+4. GUI/CLI DB-path divergence remains preserved, not resolved.
