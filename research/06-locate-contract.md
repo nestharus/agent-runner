@@ -90,7 +90,7 @@ required on success.
 pub enum SessionStorageType {
     ClaudeCode,    // Serializes as "claude_code"
     CodexSession,  // Serializes as "codex_session"
-    Other,         // Serializes as "other"
+    Other,         // Serializes as "other"; v1 forward-compat only (see below)
 }
 ```
 
@@ -99,7 +99,23 @@ The mapping from internal `config::model::SessionStorage` to
 
 - `SessionStorage::ClaudeCode { .. }` → `ClaudeCode`
 - `SessionStorage::Codex { .. }` → `CodexSession`
-- Provider has no `[providers.session_storage]` block → `Other` (only when later transcript/workspace checks succeed; otherwise exit `12`)
+- Provider has no `[providers.session_storage]` block → `Other`
+
+**v1 reachability of `Other`**: the `Other` variant is exposed in
+the type and reachable as the result of the storage-type mapping
+function (unit-testable). However, the v1 `locate_session_metadata`
+success path NEVER emits `storage_type == "other"` to stdout because
+Step 8.C fails closed for `Other` (no v1 workspace_root derivation
+is supported for storage types without `[providers.session_storage]`).
+`Other` remains in the public type for forward-compat with future
+locator/storage extensions and for downstream consumers (06-export,
+06-import-replace) that may surface storage-type metadata for
+sessions that locate cannot fully resolve.
+
+When the CLI is invoked with a session whose provider has no
+`[providers.session_storage]` block, the result is exit `12
+unsupported-storage` (the type mapping internally produces
+`Other`, then Step 8.C converts to `UnsupportedStorage`).
 
 ### 2.3 `TranscriptState`
 
@@ -417,9 +433,9 @@ row; Step 6c implements code that makes them pass.
 | --- | --- | --- | --- | --- | --- | --- |
 | T1 | Resolver pass-through, single chain, single segment: known active segment returns one JSON object with required fields, `transcript_state == "available"`, exit `0` | particular-integration | New `src-tauri/tests/initiative_06_locate.rs`; seed `session_chains` + `session_chain_segments` with one row each; provider config with storage; sessions config with locator script; temp JSONL transcript | A1, A3 | exit `0`, parsed stdout has all fields | Does not validate provider-native transcript content |
 | T2 | D1 ambiguity mirrors resolver: multi-chain input with multiple recent chains returns `AmbiguousSession` (exit `11`); recency-collapsed multi-chain returns success (exit `0`) | component | `StateDb` temp DB with controlled `last_used_at`; call `locate_session_metadata` directly | A2 | `MetadataError::AmbiguousSession` only when resolver returns `Ambiguous`; success otherwise | Time-window edges bounded by deterministic timestamps |
-| T3 | D2 storage mapping: `ClaudeCode` → `claude_code`; `Codex` → `codex_session`; provider with no storage and valid file-backed transcript+workspace → `other` | unit + component | Unit mapping tests + metadata fixtures with provider entries | A5 | JSON `storage_type` equals expected enum value | Does not validate future variants |
-| T4 | D2 unsupported no-storage case: provider without `[providers.session_storage]` AND no usable canonical locator → exit `12 unsupported-storage` | particular-integration | Temp DB + provider config without storage + sessions config with missing locator | A3, A5 | exit `12`, stderr JSON code `unsupported-storage`, no stdout JSON | Not all third-party locator failures classified ideally |
-| T5 | D3 mutable truth conditions: matrix varying each of 5 conditions → `mutable: true` only when all five hold; `mutable: false` for missing storage/resume when location succeeds | component | `locate_session_metadata` fixtures varying one condition at a time | A8, A9 | Boolean flips only for specified condition; `provider_quotas.exhausted_at` does NOT affect result | Does not prove future pause-handshake lock semantics |
+| T3 | D2 storage mapping (type level): `ClaudeCode` config → `SessionStorageType::ClaudeCode` (serializes `claude_code`); `Codex` config → `CodexSession` (serializes `codex_session`); `None` config → `Other` (serializes `other`). Test the mapping function in isolation. | unit | Unit tests over the storage-type mapping function (no DB or transcript fixtures needed) | A5 | Mapping function returns expected variant; serde renders expected lowercase string | Does not validate future variants |
+| T4 | D2 unsupported no-storage case (CLI level): provider without `[providers.session_storage]` → exit `12 unsupported-storage` (mapping produces `Other`; Step 8.C fails closed). Holds regardless of locator state. | particular-integration | Temp DB + provider config without storage + sessions config with present-or-absent locator | A3, A5 | exit `12`, stderr JSON code `unsupported-storage`, no stdout success; `storage_type == "other"` never appears on stdout in v1 | Not all third-party locator failures classified ideally |
+| T5 | D3 mutable truth conditions: matrix varying conditions 1, 3, 4, 5 from contract §3 Step 9. Condition 2 (`storage_type != Other`) is structurally unreachable in v1 success path because Step 8.C fails closed for `Other`; verify the invariant by including a no-storage fixture asserting the call returns `UnsupportedStorage` (not `Other` + `mutable: false`). | component | `locate_session_metadata` fixtures varying one of conditions 1, 3, 4, 5 at a time, plus a no-storage fixture | A8, A9 | Boolean flips only for specified condition; `provider_quotas.exhausted_at` does NOT affect result; no-storage case returns `UnsupportedStorage`, never `Other` + `mutable: false` | Does not prove future pause-handshake lock semantics; condition 2 is structurally unreachable in v1 |
 | T6 | D4 partial DB invisible: segmentless `session_turns` row → `SessionNotFound` (exit `10`) | component | Temp DB with one `session_turns` row + one unrelated chain row (so `backfill_session_chains` skip condition holds) | A7 | `MetadataError::SessionNotFound`; CLI exit `10` | Open-time backfill side effects may need direct DB setup after open |
 | T7 | D5 default DB only: clap rejects unknown `--state-db <path>` flag; locate uses `open_default()` only; no GUI state DB integration | unit | clap parser test in `src-tauri/src/main.rs` (no fixture) | A6 | Clap usage error / parse failure | GUI state DB integration out of scope |
 | T8 | Missing UUID: well-formed unknown UUID → `SessionNotFound` (exit `10`) | particular-integration | Temp empty/chainless DB after open | A1 | exit `10`, stderr JSON code `session-not-found` | None |
