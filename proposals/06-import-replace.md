@@ -74,9 +74,9 @@ What changes:
 - Add `session import-replace` under the `session` subcommand group in
   `src-tauri/src/main.rs`.
 - Add reusable Rust code under a new module at
-  `src-tauri/src/session_import_replace/`.
+  `src-tauri/src/session_replace/`.
 - Add provider-native transcript renderers under
-  `src-tauri/src/session_replace/render/`.
+  `src-tauri/src/session_replace/`.
 - Reuse 06-locate metadata, 06-export canonical parsing, and
   06-pause-handshake locking.
 - Add state-DB helper(s) that replace derived `session_turns` rows for one
@@ -225,7 +225,7 @@ not canonical bytes. Import-replace renders canonical input into the resolved
 storage type through a new renderer module:
 
 ```text
-src-tauri/src/session_replace/render/
+src-tauri/src/session_replace/
 ```
 
 Renderer contract:
@@ -255,7 +255,7 @@ disk.
 
 D1 decision: import-replace acquires its own session lock. It does not merely
 check for locks created by pause-handshake. The lock target is the resolved
-active provider session id, not the raw user input. If `SessionLock::acquire`
+active provider/session pair, not the raw user input. If `SessionLock::acquire`
 returns busy, import-replace exits `13 session-busy`.
 
 D2 decision: use a two-phase replace with same-directory temp file, fsync,
@@ -286,9 +286,10 @@ Pre-mutation setup, expanded from success-flow steps 1-2:
    `provider_name`, and storage renderer support. Invalid input or known lossy
    render cases exit `15`; provider-native byte rendering happens in the
    protected success flow after the journal is published under lock.
-11. Clean stale import-replace temp files in the target transcript directory
-    whose names match this feature's temp-file convention and are not currently
-    locked by another live replace operation.
+11. Clean stale import-replace temp files for the resolved transcript path only:
+    `<jsonl_path>.tmp-import-replace-*`. Do not sweep unrelated session temp
+    files in the same directory, and skip files owned by another live replace
+    operation.
 12. Compute the expected `postimage_sha256` over the normalized canonical input
     stream. This is the canonical export hash expected after the provider-native
     file is committed and parsed back through export.
@@ -305,9 +306,9 @@ Success flow:
    This is per-process scratch state and never collides with another contender.
 2. Resolve session ownership through `SessionMetadata` and freeze the resolved
    identity for the operation.
-3. Acquire `SessionLock` for the resolved active provider session id with owner
-   `"import-replace"`. Busy maps to exit `13`; before returning, unlink the
-   staging file. No per-session journal artifact has been published.
+3. Acquire `SessionLock` for the resolved active provider/session pair with
+   owner `"import-replace"`. Busy maps to exit `13`; before returning, unlink
+   the staging file. No per-session journal artifact has been published.
 4. Now under lock, atomically rename the staging canonical file to its
    journal-attached per-session path:
    `<state-data-dir>/replace_journal/session-<session_id>.canonical.jsonl`.
@@ -414,7 +415,7 @@ D7 decision: use the harness exit namespace exactly.
 | `10` | `session-not-found` | Resolver cannot find a chain/active session for the input. | No mutation. |
 | `11` | `ambiguous-session` | Resolver returns ambiguous owner. | No mutation. |
 | `12` | `unsupported-storage` | No supported storage, missing/unavailable transcript path, `other` storage, non-UTF-8 path, unsupported renderer, or metadata says the session is not file-backed/mutable. | No mutation. |
-| `13` | `session-busy` | `SessionLock::acquire` reports an unexpired lock for the resolved session, or exclusive ownership cannot be established. | No mutation by this process. |
+| `13` | `session-busy` | `SessionLock::acquire` reports an unexpired lock for the resolved provider/session pair, or exclusive ownership cannot be established. | No mutation by this process. |
 | `14` | `schema-incompatible` | Schema-probe/read-only compatibility says import-replace is unsafe for this state DB or required feature flags are absent. | No mutation. |
 | `15` | `invalid-input-transcript` or `preimage-mismatch` | Input canonical JSONL is malformed, schema-invalid, session/provider mismatched, not reconstructable for v1 state, contains a record class that cannot be rendered losslessly to the target provider format, or `--preimage-sha256` does not match the current canonical transcript. | No mutation when detected before rename; no DB mutation if detected after lock before write. |
 
@@ -425,10 +426,10 @@ text on stdout.
 
 Reusable implementation modules:
 
-- `src-tauri/src/session_import_replace/` owns the CLI command handler,
+- `src-tauri/src/session_replace/` owns the CLI command handler,
   validation orchestration, preimage checks, journal lifecycle, file replace
   primitive, DB update call, and receipt/error mapping.
-- `src-tauri/src/session_replace/render/` owns
+- `src-tauri/src/session_replace/` owns
   `CanonicalToProviderRenderer`, with implementations for `claude_code` and
   `codex_session`. `other` returns `UnsupportedStorage`.
 - The renderer API accepts canonical records and returns provider-native bytes
@@ -456,6 +457,12 @@ Startup recovery contract:
 
 1. Scan `<state-data-dir>/replace_journal/` for files named
    `session-<session_id>.pending`.
+   Also scan for `session-<session_id>.canonical.jsonl` files without a
+   matching pending journal. These are orphan side files from a crash between
+   the under-lock canonical rename and pending-journal write; if no live
+   `SessionLock` exists for the session, delete them, fsync `replace_journal/`,
+   and do not mutate transcript or DB state. If a live lock exists, leave the
+   side file for the active owner.
 2. Read journal JSON; extract resolved identity (`chain_id`,
    `active_segment_id`, `provider_name`, `storage_type`, `jsonl_path`), hashes,
    `operation_uuid`, and `canonical_records_path`. Ignore files whose
@@ -582,7 +589,7 @@ Lock behavior:
 
 - Import-replace creates a `SessionLock` rooted at the same lock directory used
   by 06-pause-handshake.
-- It calls `SessionLock::acquire` for the resolved active provider session id.
+- It calls `SessionLock::acquire` for the resolved active provider/session pair.
 - Busy maps to exit `13`.
 - Operational lock-store failures map to exit `1`.
 - The lock is released on normal success and on handled failures when the
@@ -638,30 +645,36 @@ Crash states:
    operation-unique file may remain under `replace_journal/staging/`; future
    startup or import-replace runs may unlink stale staging files by age and
    operation UUID.
-2. Crash after staging rename and pending journal write, but before transcript
-   temp write: startup recovery sees a pending journal whose transcript hash
-   still matches preimage, deletes the journal and canonical records file, and
-   does not mutate DB state.
-3. Crash after transcript temp write before transcript rename: temp file lingers; future
+2. Crash after staging rename before pending journal write: startup recovery
+   sees an orphan `session-<session_id>.canonical.jsonl`. It deletes the side
+   file only when no live `SessionLock` exists for that session, fsyncs
+   `replace_journal/`, and does not mutate transcript or DB state. If a live
+   lock exists, recovery leaves the side file for the active owner.
+3. Crash after staging rename and pending journal write, but before
+   `preimage_sha256` is recorded or transcript temp write begins: startup
+   recovery treats the no-preimage pending journal as a pre-rename no-op,
+   deletes the journal and canonical records file, fsyncs `replace_journal/`,
+   and does not mutate DB state.
+4. Crash after transcript temp write before transcript rename: temp file lingers; future
    import-replace startup may unlink stale temp files with this feature prefix.
-4. Crash after transcript temp fsync before transcript rename: same as #3.
-5. Crash after transcript rename before DB update: startup recovery sees `jsonl_path` whose
+5. Crash after transcript temp fsync before transcript rename: same as #4.
+6. Crash after transcript rename before DB update: startup recovery sees `jsonl_path` whose
    canonical export hash matches `postimage_sha256`, re-applies the DB update
    idempotently from `canonical_records_path`, refreshes segment recency,
    deletes the journal and canonical records file, and leaves a deterministic
    committed state.
-6. Crash during DB transaction: SQLite rolls the transaction back or commits it
+7. Crash during DB transaction: SQLite rolls the transaction back or commits it
    according to SQLite durability. Startup recovery sees the postimage and
    re-applies the DB update idempotently from `canonical_records_path` if
    needed, then deletes the journal and canonical records file.
-7. Crash after DB commit before journal deletion or receipt: startup recovery
+8. Crash after DB commit before journal deletion or receipt: startup recovery
    sees the postimage, re-applies the same DB update idempotently from
    `canonical_records_path`, deletes the journal and canonical records file, and
    the caller can export/hash to discover the committed postimage.
-8. Startup recovery sees the transcript's canonical export hash matching
+9. Startup recovery sees the transcript's canonical export hash matching
    `preimage_sha256`: rename did not happen or was rolled back; recovery deletes
    the journal and canonical records file only.
-9. Startup recovery sees a canonical export hash matching neither preimage nor
+10. Startup recovery sees a canonical export hash matching neither preimage nor
    postimage, or cannot parse the provider-native transcript at all: recovery
    logs the required manual-recovery warning, moves the journal entry to
    `replace_journal/quarantine/`, preserves the canonical records file for

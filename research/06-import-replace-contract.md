@@ -86,15 +86,15 @@ pub fn run_import_replace(
    <state-data-dir>/replace_journal/session-<session_id>.pending
    Schema: {schema_version, operation, operation_uuid, started_at, session_id,
             chain_id, active_segment_id, provider_name, storage_type,
-            jsonl_path, preimage_sha256, postimage_sha256_expected,
+           jsonl_path, preimage_sha256, postimage_sha256,
             canonical_records_path, db_state_pending: true,
             expected_turn_count}
 7. Read existing transcript at jsonl_path; compute preimage_sha256.
    If --preimage-sha256 given and mismatch → exit 15 PreimageMismatch.
 8. Render canonical → provider-native via CanonicalToProviderRenderer.
    Lossy records → exit 15 InvalidInputTranscript with reason.
-9. Write rendered bytes to <jsonl_path>.replace-<operation_uuid>.tmp; fsync.
-10. rename(<jsonl_path>.tmp, <jsonl_path>) — atomic.
+9. Write rendered bytes to `<jsonl_path>.tmp-import-replace-<operation_uuid>`; fsync.
+10. rename(<jsonl_path>.tmp-import-replace-<operation_uuid>, <jsonl_path>) — atomic.
 11. SQLite BEGIN; replace session_turns rows for (provider_name, session_id);
     refresh segment last_used_at. Do NOT commit yet.
 12. Compute postimage_sha256 by reading <jsonl_path>; verify matches expected.
@@ -110,18 +110,29 @@ pub fn run_import_replace(
 
 ## 4. Crash recovery on agent-runner startup
 
-Scan `<state-data-dir>/replace_journal/session-*.pending`:
+Scan `<state-data-dir>/replace_journal/session-*.pending` and orphan
+`session-*.canonical.jsonl` side files:
+1. If `session-<id>.canonical.jsonl` exists without a matching
+   `session-<id>.pending`, treat it as a crash between the under-lock canonical
+   rename and pending-journal write only when no live `SessionLock` exists for
+   that session. Delete the orphan canonical file, fsync `replace_journal/`, and
+   do not mutate transcript or DB state; if a live lock exists, leave the side
+   file for the active owner.
 For each entry (parsed JSON):
-1. Read transcript at `jsonl_path`; compute hash.
-2. If hash == `postimage_sha256_expected`:
+1. If the journal has no completed `preimage_sha256`, treat it as an incomplete
+   pre-transcript-write operation: delete the pending journal and canonical
+   records file, fsync `replace_journal/`, and do not mutate DB state.
+2. Read transcript at `jsonl_path`; compute hash.
+3. If hash == `postimage_sha256`:
    - Re-apply DB updates from `canonical_records_path`: replace session_turns
      for (provider_name, session_id); refresh segment last_used_at.
    - Delete journal + canonical records file.
    - Log recovery success.
-3. If hash == `preimage_sha256`:
+4. If hash == `preimage_sha256`:
    - Rename never landed (or rolled back). Delete journal + canonical records.
-4. Else (ambiguous):
-   - Move journal + canonical records to `<state-data-dir>/replace_journal/quarantine/`.
+5. Else (ambiguous):
+   - Move the journal to `<state-data-dir>/replace_journal/quarantine/`.
+   - Preserve `canonical_records_path` in place for manual inspection.
    - Log warning.
 
 ## 5. Exit codes
@@ -145,7 +156,7 @@ Permitted:
 - Read input JSONL (stdin or `--from-file`).
 - Create `<state-data-dir>/replace_journal/staging/`, `<state-data-dir>/replace_journal/`, `<state-data-dir>/replace_journal/quarantine/`.
 - Write/rename/unlink files in `replace_journal/` (per-process staging + per-session canonical records + journal).
-- Write `<jsonl_path>.replace-<uuid>.tmp` and rename onto `<jsonl_path>`.
+- Write `<jsonl_path>.tmp-import-replace-<uuid>` and rename onto `<jsonl_path>`.
 - SQLite UPDATE/DELETE/INSERT on session_turns + UPDATE on session_chain_segments under transaction.
 - SessionLock acquire/release.
 

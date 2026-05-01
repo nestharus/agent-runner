@@ -50,12 +50,10 @@
 ## B. Reusable `CanonicalToProviderRenderer` API hookpoints (proposal §3 / §6)
 
 - **New module:** create `src-tauri/src/session_replace/render/` for provider
-  native rendering. Export it through a parent `session_replace` or through
-  `session_import_replace` only if no other module needs it immediately.
+  native rendering. Export it through the parent `session_replace` module.
 - **Public module export:** add new public modules in `src-tauri/src/lib.rs`,
   beside existing exports at `src-tauri/src/lib.rs:1-11`. Expected additions are
-  `pub mod session_import_replace;` and either `pub mod session_replace;` or a
-  public renderer submodule reachable by tests.
+  `pub mod session_replace;` or a public renderer submodule reachable by tests.
 - **Reader dual:** 06-export's canonical reader currently defines
   `CanonicalRecord`, `ContentChunk`, `RecordSource`, and `SessionStorageType` at
   `/home/nes/projects/agent-runner/worktrees/06-export/src-tauri/src/session_export/mod.rs:8-52`.
@@ -209,13 +207,15 @@
 
 ## E. Crash-recovery startup scan hookpoints (proposal §6 / §8)
 
-- **Startup hook:** run `session_import_replace::recover_pending_replaces()` on
+- **Startup hook:** run `session_replace::recover_pending_replaces()` on
   CLI startup before commands that rely on session-derived state, or in the
   state-open/session-command setup path before locate/export/resume/migration
   resolution. Avoid running recovery from GUI-only paths unless the default CLI
   state root is the same.
-- **Scan pattern:** enumerate `replace_journal/session-*.pending`. Ignore
-  non-matching files, staging files, and quarantine entries.
+- **Scan pattern:** enumerate `replace_journal/session-*.pending` and orphan
+  `replace_journal/session-*.canonical.jsonl` files that have no matching
+  pending journal. Ignore other non-matching files, staging files, and
+  quarantine entries.
 - **Parse journal:** extract frozen identity and hashes from the journal:
   `chain_id`, `active_segment_id`, `provider_name`, `storage_type`,
   `jsonl_path`, `operation_uuid`, and `canonical_records_path`.
@@ -223,6 +223,12 @@
   died before reading the old transcript. Treat it as pre-rename no-op: delete
   the pending journal and canonical side file, fsync `replace_journal/`, and do
   not mutate DB state.
+- **Orphan canonical side file:** if `session-<id>.canonical.jsonl` exists with
+  no matching `session-<id>.pending`, the process died between the under-lock
+  canonical rename and pending-journal write. First check for a live
+  `SessionLock` for that session id. If no live lock exists, delete the orphan
+  canonical file, fsync `replace_journal/`, and do not mutate DB state. If a
+  live lock exists, leave the side file for the active owner.
 - **Compute current hash:** read `jsonl_path` through the storage-specific
   export parser and canonical serializer. Hash canonical export bytes, not raw
   provider-native bytes.
@@ -356,7 +362,7 @@
 
 ## I. Test-intent track hookpoints (proposal §9.1)
 
-- **Test homes:** unit/component tests belong in `src-tauri/src/session_import_replace/`
+- **Test homes:** unit/component tests belong in `src-tauri/src/session_replace/`
   and `src-tauri/src/session_replace/render/`. CLI integration tests belong in
   a new `src-tauri/tests/initiative_06_import_replace.rs`, following existing
   binary-test patterns that use `env!("CARGO_BIN_EXE_oulipoly-agent-runner")`.
@@ -416,7 +422,7 @@
 
 - **CLI:** extend the stacked `SessionSubcommands` with `import-replace` and add
   `run_session_import_replace` in `src-tauri/src/main.rs`.
-- **Core module:** add `src-tauri/src/session_import_replace/` for command
+- **Core module:** add `src-tauri/src/session_replace/` for command
   orchestration, canonical input validation, normalized serialization, hash
   computation, journal lifecycle, recovery scan, error mapping, receipt structs,
   and fault-injection test seams.

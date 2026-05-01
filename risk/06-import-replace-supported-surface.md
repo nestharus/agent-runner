@@ -299,7 +299,7 @@ identity, not anybody else's.
 | Before staging write | None | None needed (no per-session journal exists) | Fine — §8 crash state #1; staging-file cleanup deferred. |
 | After staging write, before lock acquire | None | None needed (still no per-session journal) | Fine — staging file may linger; opportunistic cleanup contemplated. §8 crash state #1. |
 | After lock acquire, before staging→canonical rename | None | None needed (staging-only state) | Fine — staging file may linger; opportunistic cleanup. |
-| After staging→canonical rename, before journal write | Canonical file present, no `.pending` | §6 step 2: a pending journal lacking `preimage_sha256` is treated as pre-rename no-op; without any pending journal at all, the canonical file is orphaned and must be cleaned. §8 crash state #2 needs to read against the *staging-orphan* and *canonical-orphan* cases; current §8 covers crash state #2 as "after staging rename and pending journal write, but before transcript temp write" and does **not** explicitly cover the post-rename / pre-pending-write hairline window | See R4-F05 below. |
+| After staging→canonical rename, before journal write | Canonical file present, no `.pending` | §6 / §8 now explicitly handle the orphan canonical side-file case: recovery deletes it only when no live `SessionLock` exists, fsyncs `replace_journal/`, and does not mutate transcript or DB state. | R4-F05 resolved in Phase 6. |
 | After pending journal write, before transcript temp write | Canonical file + `.pending` (preimage TBD) | §6 step 2 fallback: pending journal lacks completed `preimage_sha256` → treat as pre-rename no-op; delete journal + canonical records, no DB mutation | §8 crash state #2; deterministic. |
 | After transcript temp write, before transcript rename | Same as above | Same recovery (preimage matches; no rename landed) | §8 crash state #3; deterministic. |
 | After transcript rename, before SQLite begin | Canonical file + `.pending` (preimage recorded) | §6 step 4: postimage match → re-apply DB from canonical records; delete artifacts | §8 crash state #5; deterministic. |
@@ -311,15 +311,12 @@ identity, not anybody else's.
 
 Every named crash window has a deterministic recovery rule, and every
 recovery rule reads identity from the per-session journal that was written
-under lock. The only residual is the hairline window between staging→
-canonical rename and pending-journal write (both occur under lock, but they
-are not one syscall). Recovery encounters a canonical-records file with no
-matching `.pending`. §6 / §8 do not name this case explicitly; the safe
-behavior is to delete the orphan canonical file (no journal means no
-authority to mutate transcript/DB), but the proposal does not say so. This
-is registered as R4-F05 below; non-terminal because the cohort-A
-threat-model expectation already excludes mutation-without-journal, and the
-file is private state under the existing data-dir.
+under lock. The hairline window between staging→canonical rename and
+pending-journal write is now explicitly covered by §6 / §8: recovery sees a
+canonical-records file with no matching `.pending`, deletes it only when no
+live `SessionLock` exists, and never mutates transcript or DB state without
+journal authority. R4-F05 is therefore retained only as a resolved Phase 6
+note.
 
 ### Race-free verdict
 
@@ -330,8 +327,8 @@ session id.** The expanded journal carries enough frozen identity for
 deterministic recovery; the under-lock publication of per-session
 artifacts means the only writer of per-session paths is the lock owner;
 the operation-unique staging path means contenders never collide on disk
-pre-lock. One non-terminal hairline-window observation (R4-F05) is
-registered for Phase 6 §6 / §8 prose tightening.
+pre-lock. The prior hairline-window observation (R4-F05) is resolved by the
+Phase 6 orphan canonical recovery rule.
 
 ## Concern 4 — Fresh assessment of Rev 4 changes (assumption / net-value)
 
@@ -378,16 +375,16 @@ Blast-radius items vs Round 3:
 | Quarantine subdirectory | Bounded private filesystem state under existing data-dir | Bounded (unchanged). |
 | **Pre-lock per-session journal publication race** (Rev 3 R3-F01 / Rev 3 audit AIR-R3-F01) | OPEN (Rev 3 supported-surface logged as non-terminal under threat model; Rev 3 audit logged as HIGH blocker) | **CLOSED**: §4 / §6 / §8 / §9.1 reordering. |
 | **NEW** Staging subdirectory (`replace_journal/staging/`) | n/a | Bounded private filesystem state under existing data-dir; opportunistic stale-file cleanup contemplated. |
-| **NEW** Hairline window between staging→canonical rename and pending-journal write (both under lock) | n/a | Bounded; recovery sees canonical-records orphan with no journal → safe behavior is delete (no mutation authority); §6 / §8 prose does not name explicitly (R4-F05). |
+| **NEW** Hairline window between staging→canonical rename and pending-journal write (both under lock) | n/a | Resolved in Phase 6; recovery sees canonical-records orphan with no journal, deletes only when no live `SessionLock` exists, and has no mutation authority. |
 | Receipt lost after commit | Bounded (export+hash recovery) | Bounded (§12 residual #6 unchanged). |
 | `migrate-db` / `migrate_chain_segment` adjacency | UNCOUPLED | UNCOUPLED unchanged. |
 
 Fourteen problem-map / audit entries retired total; nine existing
 blast-radius items preserved or tightened; one prior open item (the Rev 3
 audit blocker AIR-R3-F01 / R3-F01) explicitly closed; one new item added
-(staging subdirectory, bounded private state); one new hairline window
-identified and registered as R4-F05. Net value is unambiguously positive
-against (a) the v1 adapter the harness uses today, (b) the Rev 1 / Rev 2 /
+(staging subdirectory, bounded private state); the hairline window tracked
+as R4-F05 is resolved. Net value is unambiguously positive against (a) the
+v1 adapter the harness uses today, (b) the Rev 1 / Rev 2 /
 Rev 3 supported surfaces.
 
 **Termination signal #2 (`non-positive-value`) does not fire.**
@@ -562,9 +559,9 @@ withdrawn.
 problem-map / audit entries retired (one more than Round 3); one HIGH audit
 finding closed (AIR-R3-F01); one prior implicit blast-radius item
 (concurrent-process pre-lock journal race) explicitly closed; one new
-private filesystem item added (`replace_journal/staging/`); one new
-hairline window identified and registered as R4-F05, bounded by lock-
-holding and private filesystem state.
+private filesystem item added (`replace_journal/staging/`); the hairline
+window tracked as R4-F05 is resolved by the Phase 6 orphan canonical
+recovery rule.
 
 **Standard verdict: LOW.** Adjacent-path blast-radius is bounded — twelve
 adjacent paths, zero BROKEN, two paths still carrying conditional partial
@@ -579,14 +576,13 @@ expansion, and journal schema versioning (Concern 8). All five cohorts
 non-regressed; cohorts A, B, and E strengthened (Concern 9). The Rev 4
 lock-before-journal reorder is race-free under the documented threat
 model and additionally race-free against the Rev 3 boundary case
-(non-orchestrated concurrent same-session import-replace), with one
-non-terminal hairline-window prose observation (Concern 3 / R4-F05).
+(non-orchestrated concurrent same-session import-replace); the prior
+hairline-window prose observation (Concern 3 / R4-F05) is resolved.
 
 **Recommendation:** Phase 5 (hookpoints) and Phase 6 (implementation) may
-proceed. Five non-terminal findings below; none fires a termination signal.
-R4-F05 is a Rev 4-specific prose tightening for §6 / §8 (recovery behavior
-when canonical-records file exists with no matching pending journal — the
-under-lock hairline window). R4-F01..R4-F04 are Round 3 carryovers
+proceed. Four live non-terminal findings below; none fires a termination
+signal. R4-F05 is retained only as a resolved Phase 6 note for the under-lock
+hairline recovery window. R4-F01..R4-F04 are Round 3 carryovers
 (R3-F02..R3-F05 prose issues that Rev 4 did not touch).
 
 ## Findings
@@ -643,29 +639,14 @@ under-lock hairline window). R4-F01..R4-F04 are Round 3 carryovers
   contract is documented in §6 / §7 / §12 prose.
 
 - **R4-F05 (hairline window between staging→canonical rename and
-  pending-journal write, LOW, non-terminal)** — Rev 4 §4 success-flow
-  steps 4 and 5 are both under lock, but they are not one syscall: a
-  crash between rename and pending-journal write leaves
-  `<state-data-dir>/replace_journal/session-<id>.canonical.jsonl` on disk
-  with no matching `.pending` file. §6 startup recovery scans for
-  `session-<id>.pending` files (step 1) and ignores orphan canonical-
-  records files; §8 crash states #1 and #2 do not enumerate this hairline
-  case explicitly. The implicit safe behavior is: orphan canonical-
-  records file confers no authority to mutate transcript or DB, so
-  recovery should idempotently delete the orphan when no matching
-  pending journal exists. Recommendation: Phase 6 should add one §6 prose
-  sentence ("If a `session-<id>.canonical.jsonl` exists with no matching
-  `session-<id>.pending`, delete the canonical file and fsync the
-  `replace_journal` directory; this is the recovery rule for crash
-  between under-lock rename and under-lock journal write") and one
-  matching §8 crash state. Non-terminal because (a) the orphan is private
-  filesystem state under the existing data-dir, (b) recovery cannot be
-  misled into mutating transcript or DB without a journal, and (c) the
-  next successful import-replace for that session will atomically
-  overwrite the orphan via the staging→canonical rename anyway. Rev 4's
-  closure of AIR-R3-F01 holds independent of this hairline window
-  because the orphan never carries authority; this finding is a prose
-  completeness item.
+  pending-journal write, RESOLVED in Phase 6)** — The current
+  `proposals/06-import-replace.md` now explicitly handles the case where
+  `<state-data-dir>/replace_journal/session-<id>.canonical.jsonl` exists
+  without a matching `session-<id>.pending`: startup recovery deletes the
+  orphan canonical side file only when no live `SessionLock` exists, fsyncs
+  `replace_journal/`, and does not mutate transcript or DB state. The matching
+  crash state is also named in §8, so this supported-surface concern is
+  obsolete for the implementation under review.
 
 ## Audit-history note
 
@@ -673,5 +654,5 @@ This is a Phase 4 supported-surface gate only. I did not review or change
 an implementation; Rev 4 remains a proposal artifact. Termination signal
 is `none`; verdict is LOW; Phase 5 and Phase 6 may proceed once the audit
 track also clears AIR-R3-F01 closure (verified in Concern 1 of this
-report). The five non-terminal findings above are recommendations for
-Phase 6 prose / scoping rather than blockers.
+report). The four live non-terminal findings above are recommendations for
+Phase 6 prose / scoping rather than blockers; R4-F05 is now resolved.

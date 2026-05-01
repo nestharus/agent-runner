@@ -90,7 +90,7 @@ per-session path. The pending entry contains the resolved identity plus
 
 §4 journal format (`:359-377`) adds `operation_uuid` to the on-disk schema:
 
-```
+```json
 "operation_uuid": "0b67fdde-92c1-45d1-832c-4b1fbf5c8306"
 ```
 
@@ -257,7 +257,7 @@ documented threat surface. Rev 4 must be race-free against both.
 
 ### Rev 4 success-flow timeline (per process)
 
-```
+```text
 T0  validate input, allocate operation_uuid
 T1  write staging canonical at staging/<operation_uuid>.canonical.jsonl, fsync
 T2  resolve ownership through SessionMetadata; freeze identity
