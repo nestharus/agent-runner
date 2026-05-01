@@ -128,6 +128,9 @@ Subcommands:
   trace <invocation_uuid> [--json] [--transcript] [--max-depth N]
         Walk a recorded invocation tree (see Inspecting a Run)
 
+  session locate <session-id> [--json]
+        Locate stable metadata for a provider session (see Locating a Session)
+
   repl [<model>] [--resume <session-id>] [-p <project>] [--models-dir <path>]
         Launch a balanced interactive session of the wrapped CLI
         (see Interactive REPL)
@@ -425,6 +428,43 @@ Flags:
 - `--transcript` (human mode only; conflicts with `--json`) — append a transcript footer
 - `--max-depth N` — truncate descendants past depth N
 
+### Locating a Session
+
+```bash
+oulipoly-agent-runner session locate <session-id>
+oulipoly-agent-runner session locate <session-id> --json
+```
+
+`session locate` resolves one provider session to stable metadata. Output is always JSON. On success, stdout is one compact single-line JSON object with a trailing newline. `--json` is accepted for symmetry with `trace --json`; it does not change the output format.
+
+Success requires a canonical file-backed transcript. If the location cannot be completed, `session locate` emits no partial JSON on stdout. Failures return a JSON error object on stderr instead.
+
+Success JSON fields are required:
+
+- `session_id` — active provider session UUID
+- `chain_id` — logical chain UUID
+- `provider_name` — active provider/account name
+- `storage_type` — one of `claude_code`, `codex_session`, `other`
+- `jsonl_path` — canonical absolute UTF-8 transcript path
+- `workspace_root` — canonical absolute UTF-8 workspace path
+- `transcript_state` — `available` on success
+- `mutable` — boolean read-time eligibility hint
+
+`mutable: true` is a **read-time eligibility hint** derived from current chain, storage, resume, transcript, and workspace state. It is not a safety lock or write permission, and consumers should not treat it as permission to mutate. Cross-process write safety requires the future `pause-handshake` sibling feature.
+
+Exit codes:
+
+| Exit | Error code | Trigger |
+|------|------------|---------|
+| `0` | none | Success: complete `SessionMetadata` JSON on stdout. |
+| `1` | `operational-error` | DB open/read failure, model-load failure, JSON serialization failure, unexpected I/O outside transcript/storage classification. |
+| `2` | `invalid-session-id` | Non-UUID `<session-id>` (parse before DB open). Clap structural usage errors may use clap's default formatting. |
+| `10` | `session-not-found` | `MetadataError::SessionNotFound`; partial-DB segmentless sessions also map here. |
+| `11` | `ambiguous-session` | `MetadataError::AmbiguousSession`; only when resolver returns `ResumeError::Ambiguous`. |
+| `12` | `unsupported-storage` | `MetadataError::UnsupportedStorage`; absent storage block, transcript not canonical/available, workspace_root not derivable, etc. No partial success JSON ever emitted. |
+
+`trace --json` remains invocation-tree scoped and degrades to `no_locator` or `missing` transcript states for diagnostics. `session locate` is action-oriented and refuses partial locations with `unsupported-storage`.
+
 ### Cross-invocation tracking
 
 When `oulipoly-agent-runner` invokes a wrapped CLI that itself spawns another `oulipoly-agent-runner` (e.g. via the `Task` tool in Claude Code), the runner propagates `OULIPOLY_PARENT_INVOCATION` as an env var to the subprocess. The child's invocation row records `parent_invocation_id` pointing at the parent. `trace` walks that tree.
@@ -499,7 +539,7 @@ Plain `repl <model>` (no `--resume`) records `session_capture_method = "none"`; 
 
 ### Inspecting via SQL
 
-For ad-hoc questions that don't fit the `trace` shape, query SQLite directly:
+SQL is for ad-hoc debugging when `trace` or `oulipoly-agent-runner session locate <session-id>` do not answer the question. The supported command path for stable session metadata is `oulipoly-agent-runner session locate`; the SQLite schema is not the contract.
 
 ```bash
 # All invocations for one account today

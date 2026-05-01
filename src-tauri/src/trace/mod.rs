@@ -5,6 +5,7 @@
 //! and exposes a structured JSON shape for machine consumers.
 
 use crate::config::SessionsConfig;
+use crate::session_metadata::TranscriptState;
 use crate::sessions::locate_transcript;
 use crate::state::{InvocationRecord, StateDb};
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -68,26 +69,6 @@ pub struct TraceSession {
     pub sidechain_turn_count: Option<u64>,
     pub resume_acceptance: Option<String>,
     pub resume_acceptance_evidence: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TranscriptState {
-    Unresolved,
-    NoLocator,
-    Missing,
-    Available,
-}
-
-impl TranscriptState {
-    fn as_str(self) -> &'static str {
-        match self {
-            TranscriptState::Unresolved => "unresolved",
-            TranscriptState::NoLocator => "no_locator",
-            TranscriptState::Missing => "missing",
-            TranscriptState::Available => "available",
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
