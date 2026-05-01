@@ -5,6 +5,7 @@ use agent_runner_lib::state::StateDb;
 use chrono::{Duration, Utc};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -122,11 +123,13 @@ impl ImportReplaceFixture {
             .join(format!("session-{session_id}.canonical.jsonl"))
     }
 
-    pub fn lock_path(&self, session_id: &str) -> PathBuf {
+    pub fn lock_path(&self, provider_name: &str, session_id: &str) -> PathBuf {
         self.data_home
             .join("oulipoly-agent-runner")
             .join("locks")
-            .join(format!("session-{session_id}.lock"))
+            .join(format!(
+                "provider-{provider_name}-session-{session_id}.lock"
+            ))
     }
 
     pub fn open_db(&self) -> StateDb {
@@ -134,6 +137,7 @@ impl ImportReplaceFixture {
     }
 
     pub fn conn(&self) -> Connection {
+        // Initialize the schema before opening a raw rusqlite connection.
         let _ = self.open_db();
         Connection::open(self.db_path()).unwrap()
     }
@@ -283,7 +287,7 @@ flag = "--resume"
                     provider_name,
                     session_id,
                     turn_id,
-                    format!("2026-04-17T08:00:0{offset}Z"),
+                    format!("2026-04-17T08:00:{offset:02}Z"),
                     role,
                     source_file.to_string_lossy(),
                 ],
@@ -292,11 +296,12 @@ flag = "--resume"
         }
     }
 
-    pub fn write_active_lock(&self, session_id: &str) {
-        let path = self.lock_path(session_id);
+    pub fn write_active_lock(&self, provider_name: &str, session_id: &str) {
+        let path = self.lock_path(provider_name, session_id);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let value = json!({
             "version": 1,
+            "provider_name": provider_name,
             "session_id": session_id,
             "token_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
             "created_at": Utc::now().to_rfc3339(),
@@ -317,10 +322,10 @@ flag = "--resume"
             .unwrap();
         child
             .stdin
-            .as_mut()
+            .take()
             .unwrap()
             .write_all(input.as_bytes())
-            .unwrap();
+            .expect("failed to write stdin for import-replace");
         child.wait_with_output().unwrap()
     }
 
@@ -359,7 +364,12 @@ flag = "--resume"
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let _ = child.stdin.as_mut().unwrap().write_all(input.as_bytes());
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .expect("failed to write stdin for import-replace");
         child
     }
 
@@ -592,20 +602,10 @@ pub fn ambiguous_session_fixture() -> ImportReplaceFixture {
         );
         fixture.write_sessions_with_locator_path(provider, &jsonl_path);
     }
-    fixture.seed_active_chain(
-        CHAIN_A,
-        CLAUDE_PROVIDER,
-        SESSION_A,
-        MODEL,
-        &Utc::now().to_rfc3339(),
-    );
-    fixture.seed_active_chain(
-        CHAIN_B,
-        "claude2",
-        SESSION_A,
-        MODEL,
-        &(Utc::now() - Duration::minutes(5)).to_rfc3339(),
-    );
+    let recent = "2099-04-17T08:00:00Z";
+    let older = "2099-04-17T07:55:00Z";
+    fixture.seed_active_chain(CHAIN_A, CLAUDE_PROVIDER, SESSION_A, MODEL, recent);
+    fixture.seed_active_chain(CHAIN_B, "claude2", SESSION_A, MODEL, older);
     fixture
 }
 
@@ -793,20 +793,8 @@ pub fn normalize_jsonl(input: &str) -> Vec<Value> {
 }
 
 pub fn sha256sum_bytes(bytes: &[u8]) -> String {
-    let mut child = Command::new("sha256sum")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child.stdin.as_mut().unwrap().write_all(bytes).unwrap();
-    let output = child.wait_with_output().unwrap();
-    assert_eq!(output.status.code(), Some(0), "{output:?}");
-    String::from_utf8(output.stdout)
-        .unwrap()
-        .split_whitespace()
-        .next()
-        .unwrap()
-        .to_string()
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 pub fn collect_outputs(children: Vec<Child>) -> Vec<Output> {
@@ -836,6 +824,8 @@ pub fn wait_for_test_hook_line(child: &mut Child, phase: &str) {
 /// block when `OULIPOLY_IMPORT_REPLACE_TEST_HOOK` equals the requested phase.
 /// The test then sends SIGKILL through `Child::kill()` after seeing that line.
 pub fn kill_after_test_hook(mut child: Child, phase: &str) -> Output {
+    // stderr is consumed up to the hook marker; callers use the returned Output
+    // for exit status only.
     let stderr = child.stderr.take().unwrap();
     let mut reader = BufReader::new(stderr);
     let marker = format!("import-replace-test-hook:{phase}");
@@ -875,6 +865,8 @@ fn canonical_record(
 }
 
 fn source_json(storage_type: &str, jsonl_path: &Path, line: u64) -> Value {
+    // Tests that use this helper compare canonical semantics after stripping
+    // source; byte_start, byte_end, and sha256 are dummy provenance values.
     json!({
         "storage_type": storage_type,
         "jsonl_path": jsonl_path,
@@ -896,7 +888,7 @@ fn claude_native_line(
         "sessionId": session_id,
         "type": role,
         "uuid": turn_id,
-        "timestamp": format!("2026-04-17T08:00:0{offset}Z"),
+        "timestamp": format!("2026-04-17T08:00:{offset:02}Z"),
         "message": message,
     })
     .to_string()

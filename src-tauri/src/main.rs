@@ -568,12 +568,15 @@ fn run_session_import_replace(
     if let Some(hash) = preimage_sha256
         && (hash.len() != 64 || !hash.chars().all(|ch| ch.is_ascii_hexdigit()))
     {
-        let err = ReplaceError::InvalidInputTranscript {
-            reason: "preimage sha256 must be 64 hex characters".to_string(),
-            line: None,
+        let err = ReplaceError::InvalidArgument {
+            message: "preimage sha256 must be 64 hex characters".to_string(),
         };
         eprintln!("{}", err.to_json());
-        return Ok(2);
+        return Ok(err.exit_code());
+    }
+    if let Err(err) = session_replace::recover_pending_replaces() {
+        eprintln!("{}", err.to_json());
+        return Ok(err.exit_code());
     }
     match session_replace::run_import_replace(session_id, from_file, preimage_sha256) {
         Ok(receipt) => {

@@ -211,7 +211,9 @@ fn t5_preimage_mismatch_exits_15_without_transcript_or_db_mutation() {
 #[test]
 fn t6_busy_lock_exits_13_and_does_not_publish_session_journal() {
     let prepared = prepared_claude_replace_fixture();
-    prepared.fixture.write_active_lock(&prepared.session_id);
+    prepared
+        .fixture
+        .write_active_lock(&prepared.provider_name, &prepared.session_id);
     let input = canonical_jsonl(
         &prepared.session_id,
         &prepared.provider_name,
@@ -231,7 +233,7 @@ fn t6_busy_lock_exits_13_and_does_not_publish_session_journal() {
 /// Risk: T7 — a crash after transcript rename but before DB commit may leave derived state stale forever.
 /// Level: subprocess crash-recovery integration.
 /// Source: contract §7 T-recovery-rename-only; proposal §6 Startup recovery; A8.
-/// Observable: SIGKILL after the after-rename test hook; next startup rebuilds session_turns from canonical_records_path and deletes journal files.
+/// Observable: SIGKILL after the after-rename test hook; the next import-replace command first rebuilds session_turns from canonical_records_path and deletes journal files.
 /// Residual: relies on the Step 6c test hook documented in the fixture rather than a real power loss.
 #[test]
 fn t7_recovery_rename_only_rebuilds_db_from_journal_attached_canonical_records() {
@@ -267,12 +269,16 @@ fn t7_recovery_rename_only_rebuilds_db_from_journal_attached_canonical_records()
         input
     );
 
-    let recovery_trigger = prepared.fixture.run_recovery_trigger();
+    let recovery_trigger =
+        prepared
+            .fixture
+            .run_import_replace(&prepared.session_id, "{not-json", &[]);
     assert_eq!(
         recovery_trigger.status.code(),
-        Some(0),
+        Some(15),
         "{recovery_trigger:?}"
     );
+    assert_json_error(&recovery_trigger, "invalid-input-transcript");
     let rows = prepared
         .fixture
         .turn_rows(&prepared.provider_name, &prepared.session_id);
@@ -345,6 +351,98 @@ fn t8_recovery_ambiguous_hash_quarantines_journal_and_leaves_db_unchanged() {
         .fixture
         .turn_rows(&prepared.provider_name, &prepared.session_id);
     assert_eq!(after_rows, before_rows);
+}
+
+#[test]
+fn recovery_deletes_orphan_canonical_records_without_pending_journal() {
+    let prepared = prepared_claude_replace_fixture();
+    let before_rows = prepared
+        .fixture
+        .turn_rows(&prepared.provider_name, &prepared.session_id);
+    let orphan = prepared
+        .fixture
+        .canonical_records_path(&prepared.session_id);
+    fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+    fs::write(
+        &orphan,
+        canonical_jsonl(
+            &prepared.session_id,
+            &prepared.provider_name,
+            &prepared.jsonl_path,
+            "orphan",
+        ),
+    )
+    .unwrap();
+
+    let recovery_trigger = prepared.fixture.run_recovery_trigger();
+
+    assert_eq!(
+        recovery_trigger.status.code(),
+        Some(0),
+        "{recovery_trigger:?}"
+    );
+    assert!(!orphan.exists());
+    assert_eq!(
+        prepared
+            .fixture
+            .turn_rows(&prepared.provider_name, &prepared.session_id),
+        before_rows
+    );
+}
+
+#[test]
+fn recovery_keeps_orphan_canonical_records_while_session_lock_is_live() {
+    let prepared = prepared_claude_replace_fixture();
+    let before_rows = prepared
+        .fixture
+        .turn_rows(&prepared.provider_name, &prepared.session_id);
+    let orphan = prepared
+        .fixture
+        .canonical_records_path(&prepared.session_id);
+    fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+    fs::write(
+        &orphan,
+        canonical_jsonl(
+            &prepared.session_id,
+            &prepared.provider_name,
+            &prepared.jsonl_path,
+            "live-orphan",
+        ),
+    )
+    .unwrap();
+    prepared
+        .fixture
+        .write_active_lock(&prepared.provider_name, &prepared.session_id);
+
+    let recovery_trigger = prepared.fixture.run_recovery_trigger();
+
+    assert_eq!(
+        recovery_trigger.status.code(),
+        Some(0),
+        "{recovery_trigger:?}"
+    );
+    assert!(orphan.exists());
+    fs::remove_file(
+        prepared
+            .fixture
+            .lock_path(&prepared.provider_name, &prepared.session_id),
+    )
+    .unwrap();
+
+    let recovery_trigger = prepared.fixture.run_recovery_trigger();
+
+    assert_eq!(
+        recovery_trigger.status.code(),
+        Some(0),
+        "{recovery_trigger:?}"
+    );
+    assert!(!orphan.exists());
+    assert_eq!(
+        prepared
+            .fixture
+            .turn_rows(&prepared.provider_name, &prepared.session_id),
+        before_rows
+    );
 }
 
 /// Risk: T9 — two import-replace processes may both pass the lock gate and publish colliding journal files.
@@ -557,6 +655,51 @@ fn t13_malformed_input_record_exits_15_with_line_number() {
         json["error"]["line"].as_u64() == Some(1) || json["line"].as_u64() == Some(1),
         "{json}"
     );
+    assert_no_replace_journal_pollution(&prepared.fixture, &prepared.session_id);
+}
+
+#[test]
+fn invalid_timestamp_record_exits_15_before_mutation() {
+    let prepared = prepared_claude_replace_fixture();
+    let input = canonical_jsonl(
+        &prepared.session_id,
+        &prepared.provider_name,
+        &prepared.jsonl_path,
+        "bad-timestamp",
+    )
+    .replacen("2026-04-17T09:00:00Z", "not-a-timestamp", 1);
+
+    let output = prepared
+        .fixture
+        .run_import_replace(&prepared.session_id, &input, &[]);
+
+    assert_eq!(output.status.code(), Some(15), "{output:?}");
+    let json = assert_json_error(&output, "invalid-input-transcript");
+    assert!(
+        json["error"]["line"].as_u64() == Some(1) || json["line"].as_u64() == Some(1),
+        "{json}"
+    );
+    assert_no_replace_journal_pollution(&prepared.fixture, &prepared.session_id);
+}
+
+#[test]
+fn malformed_preimage_sha_exits_2_as_invalid_argument() {
+    let prepared = prepared_claude_replace_fixture();
+    let input = canonical_jsonl(
+        &prepared.session_id,
+        &prepared.provider_name,
+        &prepared.jsonl_path,
+        "bad-preimage-arg",
+    );
+
+    let output = prepared.fixture.run_import_replace(
+        &prepared.session_id,
+        &input,
+        &["--preimage-sha256", "abc"],
+    );
+
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert_json_error(&output, "invalid-argument");
     assert_no_replace_journal_pollution(&prepared.fixture, &prepared.session_id);
 }
 
