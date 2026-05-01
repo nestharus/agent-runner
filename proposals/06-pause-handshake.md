@@ -5,6 +5,14 @@
 - §8: explicit `StateDb::open` side-effect clause matching 06-locate / 06-export (R1-F03).
 - §9.1: added assumption_link and residual_risk columns (R1-F04).
 
+**Rev 3 changes** (Round 2 audit R2-F01 closure):
+
+- §4 / §6 / §8: replace `flock` on removable path with race-free
+  `O_CREAT | O_EXCL` atomic create-or-fail. Stale-acquire uses
+  bounded `unlink + retry-create_new` (kernel atomic). Eliminates
+  the inode/path mismatch race POSIX advisory locks introduce when
+  the lockfile is unlinked under contention (R2-F01).
+
 # 1. Scope statement
 
 06-pause-handshake adds two CLI surfaces:
@@ -69,7 +77,7 @@ What does not change:
 | A1 | Pause/resume uses the same owner semantics as locate, ultimately backed by `StateDb::resolve_resume`. | Harness says pause resolves through locate; Initiative 06 forbids a second ownership path. | Locate changes ownership semantics before this lands. | §4, §5, §6 |
 | A2 | The lock key is the resolved active provider session id, with chain/provider metadata retained in receipts. | `ResolvedResume` exposes chain id and active provider/session; harness response names `session_id` and `provider_name`. | A prior feature introduces a distinct mutable-target key. | §3, §4, §6 |
 | A3 | Existing `running` invocation rows are not a safe active-writer lock. | They are not session-scoped leases, can survive hard crash, and lack token/TTL semantics. | Invocation lifecycle gains durable session writer leases first. | §4, §7, §12 |
-| A4 | The lease must outlive the `pause-handshake` process. | The command returns a token and exits; an fd-held `flock` would release on exit. | Harness changes to a long-lived pause process. | D1, §6, §12 |
+| A4 | The lease must outlive the `pause-handshake` process. | The command returns a token and exits; an fd-held process lock would release on exit. | Harness changes to a long-lived pause process. | D1, §6, §12 |
 | A5 | TTL-based crash recovery is sufficient for v1. | No daemon exists; harness asks for crash-safe TTL cleanup. | A lock manager daemon or stricter cleanup requirement appears. | D3, D5, §9 |
 | A6 | v1 should add the primitive first; scattered sibling write paths should observe in their own PRs. | Write paths span migration, repl/resume, balanced execution, ingestion, backfill, and future import-replace. | Phase 4 requires all observers in this PR. | D4, §7, §13 |
 | A7 | File-backed lock receipts are acceptable if files are owner-private. | Harness response includes `lock_path`; runner state already lives in the per-user data dir. | Shared multi-user state dirs become supported. | D1, §8, §11 |
@@ -181,6 +189,8 @@ as `getrandom`.
 `released` is always `true` on exit `0`. `lock_path` is the active
 lease file path. `release_marker_path` is the sibling marker written on
 successful release and consulted for same-token idempotent replay.
+`note` may be included with value `"released expired token"` when the
+matching lockfile had already expired before release.
 
 ## 3.3 Error stderr
 
@@ -214,40 +224,70 @@ when known.
 5. Create the lock directory with owner-private permissions where Unix
    mode bits are available: directory `0700`, files `0600`.
 6. D1 decision: choose D1a, lockfile-backed lease, with clarification.
-   The durable lease is lockfile metadata. POSIX `flock` is held only
-   around acquire/release/read critical sections; it is not the entire
-   returned lease because the pause process exits after printing JSON.
-   This preserves the harness `lock_path` contract and avoids a DB
-   schema migration.
-7. `pause-handshake` opens/creates the lockfile and takes exclusive
-   `flock`.
-8. If metadata is valid and `now <= expires_at`, return exit
-   `13 session-busy`. If no metadata exists, acquire. If metadata is
-   stale, remove/truncate under the same flock and acquire.
-9. D5 decision: stale means `now > expires_at`. Stale removal is lazy on
-   the next acquire attempt. There is no background reaper.
-10. D3 decision: default TTL is `300000` ms (5 minutes), minimum is
+   The durable lease is lockfile metadata created by atomic
+   create-if-absent. The implementation must not rely on POSIX advisory
+   locks for mutual exclusion because the lockfile path may be unlinked
+   during stale cleanup. This preserves the harness `lock_path` contract
+   and avoids a DB schema migration.
+7. `pause-handshake` attempts:
+
+   ```rust
+   OpenOptions::new()
+       .create_new(true)
+       .write(true)
+       .open(&lock_path)
+   ```
+
+   This is `O_CREAT | O_EXCL | O_WRONLY`: the filesystem atomically
+   creates the path only if it does not already exist.
+8. If creation succeeds, generate the token, write lease JSON containing
+   `version`, `session_id`, `token_hash`, `owner_pid`, `created_at`, and
+   `expires_at`, fsync the file, close it, remove any previous sibling
+   release marker for the same session, fsync the directory when
+   practical, emit the success JSON, and exit `0`.
+9. If creation fails with `EEXIST`, read the existing lease JSON. If the
+   lease is malformed, unreadable, or missing required fields, return
+   exit `1 operational-error`; do not guess whether the lease is stale.
+   If `expires_at >= now`, return exit `13 session-busy`.
+10. If `expires_at < now`, the existing lease is stale. Stale-acquire is
+    bounded and atomic at the create step:
+
+    1. Read the existing token evidence `T_old` from the lease.
+    2. `unlink(lock_path)`.
+    3. Re-attempt `create_new(true).write(true).open(&lock_path)` once.
+    4. If the retry fails with `EEXIST`, another process won the race;
+       return exit `13 session-busy` and do not retry further.
+    5. If the retry succeeds, write the new lease JSON, fsync, close,
+       remove any previous sibling release marker, emit success JSON,
+       and exit `0`.
+
+    The race between `unlink` and retry-create is closed by the same
+    kernel atomic create-if-absent guarantee: only one contender can
+    create the replacement lockfile.
+11. D5 decision: stale means `expires_at < now`. Stale removal is lazy
+    on the next acquire attempt. There is no background reaper.
+12. D3 decision: default TTL is `300000` ms (5 minutes), minimum is
     `1000` ms, maximum is `1800000` ms (30 minutes). Out-of-range
     `--ttl-ms` is clap usage exit `2`.
-11. Generate the token, remove any previous sibling release marker under
-    the same critical section, write lock metadata atomically, fsync the
-    file, and release the flock.
-12. `resume-handshake` resolves the session, computes the same path, and
-    takes exclusive `flock`.
-13. Read the sibling release marker, if present, as idempotency evidence.
-14. If the lockfile is missing, accept only a same-token marker replay:
-    marker hash match returns `0` with `already_released: true`; marker
-    hash mismatch or no marker returns `16 lock-token-invalid`.
-15. If metadata exists and `now > expires_at`, return idempotent success
-    only when the marker hash matches the supplied token; otherwise
-    return `17 lock-expired`. The command may remove stale lock state
-    only after classification and only if it does not remove a matching
-    release marker.
-16. If metadata exists and token mismatches, return
-    `16 lock-token-invalid` without altering the lock.
-17. If metadata exists and token matches, write the sibling release
-    marker `session-<session_id>.released`, remove the lockfile, fsync
-    the marker and directory when practical, and exit `0`.
+13. `resume-handshake` resolves the session and computes the same lock
+    and marker paths.
+14. If the lockfile exists, read the lease JSON and compare the supplied
+    token to the persisted token evidence. If the token mismatches,
+    return `16 lock-token-invalid` without altering the lock.
+15. If the lockfile exists and the token matches, write the sibling
+    release marker `session-<session_id>.released`, fsync the marker,
+    unlink the lockfile, fsync the directory when practical, and exit
+    `0`. If the lease had already expired, use the same release path and
+    include an implementation note/message equivalent to
+    `"released expired token"`; this is still exit `0` because the token
+    proves ownership of the stale lease.
+16. If the lockfile does not exist, read the sibling release marker, if
+    present, as idempotency evidence. Same-token marker hash match
+    returns `0` with `already_released: true`. Marker hash mismatch
+    returns `16 lock-token-invalid`.
+17. If neither lockfile nor release marker exists, return
+    `17 lock-expired`: the lease is absent and no marker proves a prior
+    release for this token.
 
 # 5. Exit codes
 
@@ -256,7 +296,7 @@ when known.
 | Exit | Error code | Condition |
 | --- | --- | --- |
 | `0` | none | Lease acquired. |
-| `1` | `operational-error` | DB/config/load/serialization/I/O/flock/randomness failure. |
+| `1` | `operational-error` | DB/config/load/serialization/I/O/randomness failure. |
 | `2` | `invalid-session-id` or clap usage | Bad UUID, missing args, invalid TTL. |
 | `10` | `session-not-found` | Shared resolver cannot find a chain/session. |
 | `11` | `ambiguous-session` | Shared resolver returns ambiguous. |
@@ -267,12 +307,12 @@ when known.
 | Exit | Error code | Condition |
 | --- | --- | --- |
 | `0` | none | Matching token released, or same-token replay accepted. |
-| `1` | `operational-error` | DB/config/load/serialization/I/O/flock failure. |
+| `1` | `operational-error` | DB/config/load/serialization/I/O failure. |
 | `2` | `invalid-session-id` or clap usage | Bad UUID or missing `--token`. |
 | `10` | `session-not-found` | Shared resolver cannot find a chain/session. |
 | `11` | `ambiguous-session` | Shared resolver returns ambiguous. |
-| `16` | `lock-token-invalid` | Wrong token, or no marker proves this token. |
-| `17` | `lock-expired` | Matching lock exists but `now > expires_at`. |
+| `16` | `lock-token-invalid` | Wrong token for an existing lock or release marker. |
+| `17` | `lock-expired` | Lockfile is absent and no release marker proves this token. |
 
 Exit `12`, `14`, and `15` remain reserved for sibling Initiative 06
 features and are not used here.
@@ -288,21 +328,42 @@ src-tauri/src/session_lock/
 Public types:
 
 ```rust
-pub struct SessionLockTarget { session_id, chain_id, provider_name }
-pub struct SessionLockReceipt { session_id, chain_id, provider_name, token, expires_at, lock_path }
-pub struct SessionLockRelease { session_id, chain_id, provider_name, released, already_released, lock_path, release_marker_path }
-pub enum SessionLockError { Busy, TokenInvalid, Expired, Operational }
-pub struct SessionLockManager { root: PathBuf }
+pub struct Lease { session_id, token, expires_at, lock_path }
+pub struct ReleaseReceipt { session_id, released, already_released, lock_path, release_marker_path, note }
+pub enum LockError { Busy, TokenInvalid, LockExpired, Operational }
+pub struct SessionLock { root: PathBuf }
 ```
 
 Core methods:
 
-- `SessionLockManager::from_default_data_dir()`.
+- `SessionLock::from_default_data_dir()`.
 - `lock_path(&self, session_id: &str) -> PathBuf`.
 - `release_marker_path(&self, session_id: &str) -> PathBuf`.
-- `acquire(&self, target, ttl) -> Result<SessionLockReceipt, SessionLockError>`.
-- `release(&self, target, token) -> Result<SessionLockRelease, SessionLockError>`.
-- `observe(&self, target) -> Result<Option<ExistingLockInfo>, SessionLockError>`.
+- `acquire(&self, session_id, ttl) -> Result<Lease, LockError>`.
+- `release(&self, session_id, token) -> Result<ReleaseReceipt, LockError>`.
+- `observe(&self, session_id) -> Result<Option<ExistingLockInfo>, LockError>`.
+
+The command layer resolves `session_id`, `chain_id`, and `provider_name`
+before calling `SessionLock`; it then combines resolver metadata with
+`Lease` or `ReleaseReceipt` for the CLI stdout JSON in §3.
+
+`acquire()` uses only atomic create-if-absent for mutual exclusion:
+`OpenOptions::new().create_new(true).write(true).open(&lock_path)`.
+On success it writes the lease JSON, fsyncs, closes, removes any stale
+sibling release marker for that session, and returns `Lease`. On
+`EEXIST` it reads the existing lease. A non-expired lease returns
+`LockError::Busy`; an expired lease is unlinked and replaced by one
+single retry of the same `create_new` open. If that retry sees `EEXIST`,
+another contender won and the result is `LockError::Busy`.
+
+`release()` reads the lockfile when it exists. Matching token evidence
+writes the sibling release marker, unlinks the lockfile, and returns
+`ReleaseReceipt`, even if the matching lease has already expired; the
+receipt note records that an expired token was released. Token mismatch
+returns `LockError::TokenInvalid`. If the lockfile is absent, a matching
+marker returns idempotent success, a mismatching marker returns
+`LockError::TokenInvalid`, and no marker returns
+`LockError::LockExpired`.
 
 Lockfile metadata is JSON and versioned:
 
@@ -310,8 +371,6 @@ Lockfile metadata is JSON and versioned:
 {
   "version": 1,
   "session_id": "...",
-  "chain_id": "...",
-  "provider_name": "...",
   "token_hash": "sha256:<hex>",
   "created_at": "2026-04-30T12:30:56Z",
   "expires_at": "2026-04-30T12:35:56Z",
@@ -361,10 +420,12 @@ The marker is not an active lock. It only distinguishes same-token retry
 from arbitrary missing-lock release. Same-token release replay succeeds
 with `already_released: true` when this marker exists and the token hash
 matches. Wrong-token release returns `16 lock-token-invalid` when this
-marker exists and the token hash differs. Stale lockfile release returns
-`17 lock-expired` unless the sibling marker already proves a same-token
-release. A fresh acquire removes the old sibling marker before writing
-new lock metadata so a previous token cannot shadow a later lease.
+marker exists and the token hash differs. Expired lockfile release
+succeeds when the supplied token matches the expired lease and returns
+`16 lock-token-invalid` when it does not. A missing lockfile with no
+marker returns `17 lock-expired`. A fresh acquire removes the old
+sibling marker after writing new lock metadata so a previous token cannot
+shadow a later lease.
 
 # 7. Anti-scope
 
@@ -390,19 +451,20 @@ behavior.
 `pause-handshake` may:
 
 - Create `~/.local/share/oulipoly-agent-runner/locks/`.
-- Create, replace, or remove `locks/session-<session_id>.lock`.
+- Atomically create `locks/session-<session_id>.lock` with
+  `O_CREAT | O_EXCL`.
+- Unlink an expired `locks/session-<session_id>.lock` during
+  stale-acquire, followed by one atomic retry-create.
 - Remove a stale `locks/session-<session_id>.released` marker while
   acquiring a new lock for the same session.
 - Open default state/config for shared session resolution.
 
 `resume-handshake` may:
 
-- Remove an active matching lockfile.
+- Remove a matching lockfile, including a matching expired lockfile.
 - Create or update
   `locks/session-<session_id>.released` with token evidence
   (`token_hash`) and `released_at` for idempotent release replay.
-- Remove stale lockfiles after classifying `lock-expired`, without
-  removing a same-token release marker.
 
 Neither command may:
 
@@ -447,9 +509,9 @@ permissions is exit `1`, not a silent downgrade.
 | Busy lock | Active lease may not refuse a second pause. | Non-expired lock blocks second pause. | integration | Pause twice before expiry. | A4, A5, A7 | Second exits `13`. | Does not prove sibling writer paths observe the lock in v1. |
 | Correct release | Valid token may fail to release or leave stale lock state. | Matching token releases and writes sibling release marker. | integration | Pause then resume. | A4, A7 | Resume `0`; future pause succeeds; marker path exists before next acquire. | Does not fully simulate crash during the release critical section. |
 | Wrong token | Caller may release a lock it does not own. | Mismatch cannot release. | integration | Pause then wrong token. | A7 | Exit `16`; lock remains. | Does not prove token secrecy outside filesystem and stdout handling. |
-| Expired release | Expired lock may be treated as a valid release. | Release after expiry returns `17` unless a same-token marker already exists. | component | Injected clock with expired metadata and no matching marker. | A5, A7 | stderr code `lock-expired`. | Boundary precision at exact `expires_at` is covered only by unit clock tests. |
+| Expired matching release | Expired lock ownership may become unreleasable. | Release after expiry succeeds when the token matches the expired lease and writes the marker. | component | Injected clock with expired metadata and matching token. | A5, A7 | Exit `0`; receipt note says released expired token. | Boundary precision at exact `expires_at` is covered only by unit clock tests. |
 | Idempotent replay | Harness retry after successful release may fail. | Same-token release retry succeeds through `session-<uuid>.released`. | integration | Pause, release, release again. | A5, A7 | Second `0`, `already_released: true`. | Does not preserve idempotency after a later acquire removes the marker. |
-| Missing lock wrong token | Arbitrary token may be accepted when lockfile is absent. | Unknown token with no marker returns `16`. | component | No lock/marker. | A7 | stderr code `lock-token-invalid`. | Cannot distinguish manual lock deletion from never-acquired state. |
+| Missing lock no marker | Absent lease may be mistaken for a valid idempotent release. | Unknown token with no marker returns `17`. | component | No lock/marker. | A7 | stderr code `lock-expired`. | Cannot distinguish manual lock deletion from never-acquired state. |
 | Marker token mismatch | Stale or foreign marker may authorize the wrong caller. | Existing marker with different token returns `16`. | component | Prewritten `session-<uuid>.released` with different token hash. | A5, A7 | stderr code `lock-token-invalid`. | Does not prove manual marker tampering is impossible, only that mismatch fails. |
 | Permissions | Lock files may leak token evidence or permit tampering. | Lock state is owner-private on Unix. | Unix integration | Inspect mode bits. | A7 | Dir `0700`, files `0600`. | Windows ACL behavior remains implementation discovery. |
 | Side effects | Pause/resume may mutate transcripts or DB rows. | Only lock state mutates beyond accepted `StateDb::open` side effects. | integration | Snapshot DB counts/transcript mtimes. | A1, A3, A7 | Unchanged except parent dir/WAL/schema/backfill effects inherent to open. | Cannot enforce future `StateDb::open` internals; read-only open is a follow-up. |
@@ -510,9 +572,10 @@ telemetry is added.
 # 12. Implementation residuals
 
 - D1a is file-backed, not DB-backed. It avoids schema migration and
-  matches `lock_path`, but depends on POSIX advisory locking and private
-  filesystem permissions. A pure fd-held `flock` cannot be the lease
-  because the CLI exits; lockfile metadata is the lease.
+  matches `lock_path`, but depends on local filesystem atomic
+  `O_CREAT | O_EXCL` behavior and private filesystem permissions.
+  Lockfile metadata is the lease because the CLI exits after printing
+  the receipt.
 - No active provider process drain is implemented in v1. Existing running
   invocation rows are not sufficient session writer leases.
 - D4b leaves sibling writer-path observation to later PRs by design.
