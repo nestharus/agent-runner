@@ -156,6 +156,8 @@ prompt_mode = "arg"
         if let Some(ttl_ms) = ttl_ms {
             cmd.arg("--ttl-ms").arg(ttl_ms.to_string());
         }
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
         cmd.spawn().unwrap()
     }
 
