@@ -1,86 +1,115 @@
-# 06-export - Phase 4 Audit Risk Report (Rev 1)
+# 06-export - Phase 4 Audit Risk Report (Rev 2 / Round 2)
 
-**Verdict: MEDIUM**
+**Verdict: LOW**
 
-The proposal satisfies most Phase 4 audit obligations: it defines the CLI
-surface, canonical JSONL record contract, error namespace, parser/API
-boundary, anti-scope, supported-surface track, assumption register,
-test-intent track with fixture sources, and residual-risk expectations.
-One audit finding remains: the no-side-effect contract depends on a
-read-only transcript-locator path that the proposal has not made
-contractual.
+R1-F01 is closed. Rev 2 makes the previously conditional `STATE_DIR`
+mkdir behavior a proposal-level contract, so the side-effect surface is
+reviewable before Phase 5. No new audit findings or regressions were found
+in the Rev 2 delta.
 
-## Prior-round status
+## Round 2 scope
 
-No prior `06-export` audit report exists in this worktree, so there are no
-prior findings to close, regress, weaken, or carry forward.
+Inputs reviewed:
 
-## Checklist audit
+- `proposals/06-export.md` Rev 2.
+- Prior Rev 1 report at `risk/06-export-audit.md`.
+- `risk/06-export-audit-history.md`.
+- `research/06-export-problem-map.md`.
+- `/home/nes/projects/agent-runner/worktrees/06-locate/initiatives/06-session-override-contract.md`.
+- `/home/nes/projects/agent-runner/worktrees/06-locate/proposals/06-locate.md` for the matching locate-side `STATE_DIR` clause.
 
-| Obligation | Status | Evidence |
+Round 2 was limited to closure of R1-F01, fresh assessment of the Rev 2
+§8 change, and regression review against the Rev 1 audit surface.
+
+## Prior finding closure
+
+### R1-F01 (MEDIUM) - CLOSED
+
+Rev 1 found that export inherited `locate_session_metadata(...)` while
+leaving today's `locate_transcript` adapter `STATE_DIR` mkdir behavior to
+a future Phase 5 hookpoint decision. That made the no-side-effect contract
+conditional rather than reviewable.
+
+Rev 2 resolves that gap:
+
+- The revision log explicitly identifies the §8 `STATE_DIR` mkdir clause
+  as the R1-F01 closure item (`proposals/06-export.md:35-39`).
+- §4 still requires the 06-schema-probe read-only `StateDb` open variant
+  and forbids use of today's mutating `StateDb::open_default()` unless
+  Phase 4 revises the dependency (`proposals/06-export.md:183-186`).
+- §8 now states that export may run the configured transcript locator only
+  through `locate_session_metadata`, depends on the read-only state open,
+  and may create only the locator adapter `state_dir` directory when
+  `locate_transcript` is invoked (`proposals/06-export.md:339-350`).
+- The clause matches 06-locate's accepted contract: locate may create the
+  locator adapter `state_dir` directory, and writes no file inside it
+  (`/home/nes/projects/agent-runner/worktrees/06-locate/proposals/06-locate.md:232-245`).
+
+This closes the audit issue because the implementation is no longer asked
+to discover the side-effect policy later. The accepted contract is explicit:
+read-only DB open is mandatory; the configured locator path may perform
+the existing directory creation; export writes no canonical records on
+error and writes no files inside the adapter state directory.
+
+## Fresh Rev 2 assessment
+
+The Rev 2 change does not weaken the command/output contract. Export still
+has one CLI surface, one v1 format, compact JSONL success stdout, JSON
+stderr errors, and no partial canonical stdout on malformed transcripts
+(`proposals/06-export.md:73-107`, `proposals/06-export.md:215-217`).
+
+The side-effect contract is now internally reviewable. §7 forbids provider
+spawn, DB writes, transcript writes, temp files, adapter cursor writes,
+scans, turn scripts, migrations, and config writes
+(`proposals/06-export.md:312-327`). §8 narrows the only accepted filesystem
+exception to the existing locator adapter directory creation and forbids
+files inside that directory (`proposals/06-export.md:328-353`).
+
+The cross-feature dependency remains aligned with Initiative 06: export is
+third in sequence, depends on locate and schema-probe, and consumes the
+read-only `StateDb` variant that schema-probe is assigned to provide
+(`/home/nes/projects/agent-runner/worktrees/06-locate/initiatives/06-session-override-contract.md:41-50`,
+`/home/nes/projects/agent-runner/worktrees/06-locate/initiatives/06-session-override-contract.md:118-122`).
+
+The test-intent track remains sufficient for audit gate purposes. The
+read-only row snapshots DB rows, transcript mtimes, adapter state, and temp
+dirs (`proposals/06-export.md:370`). In Phase 6, that fixture should either
+pre-create the allowed locator `state_dir` or assert the exact permitted
+delta: directory creation only, no files written. That is test-shaping work,
+not a new Phase 4 finding, because §8 now pins the behavior being tested.
+
+## Regression review
+
+No regression found against the Rev 1 checklist:
+
+| Area | Round 2 status | Evidence |
 | --- | --- | --- |
-| Command and output contract present | Present | `session export <session-id> [--format canonical-jsonl]`, compact JSONL stdout, buffered validation, and stderr JSON are defined in `proposals/06-export.md:67-101`. |
-| Canonical schema present | Present | Required record fields and source preimage fields are defined in `proposals/06-export.md:103-168`. |
-| Resolution and parser contract present | Present with one finding below | UUID parse, read-only state open, locate reuse, storage dispatch, compaction, ordering, and no partial stdout are defined in `proposals/06-export.md:170-216`. |
-| Exit-code contract present | Present | Exit codes `0`, `1`, `2`, `10`, `11`, `12`, and `15` are mapped in `proposals/06-export.md:218-233`, matching the harness request at `02-session-export.md:44-54`. |
-| Reusable API contract present | Present | `CanonicalRecord`, `ContentChunk`, `RecordSource`, `ExportError`, and `read_canonical_transcript` are defined in `proposals/06-export.md:235-304`. |
-| Migration / rollback track present | Present | No user-state migration, fail-closed existing-session behavior, additive rollback, and observability are covered in `proposals/06-export.md:384-414`. |
-| Test-intent track present | Present | The table names change risks, acceptance behavior, test level, fixture source/application point, assumptions, observable signal, and residual risk in `proposals/06-export.md:344-360`. |
-| Fixture source present | Present | New byte-level JSONL, parser-level Claude/Codex, and CLI route fixtures are called out in `proposals/06-export.md:362-366`. |
-| Residual-risk artifact expectation present | Present | Parser drift residuals are directed to `risk/06-export-test-residuals.md` in `proposals/06-export.md:362-366`; implementation residuals are listed in `proposals/06-export.md:416-435`. |
-| Cross-feature constraints present | Present | The compliance table covers shared errors, resolver reuse, read-only state open, no provider spawn, no quota refresh, no config edits, and canonical reader handoff in `proposals/06-export.md:437-450`. |
+| CLI and format surface | Unchanged / acceptable | `session export <session-id> [--format canonical-jsonl]`; only `canonical-jsonl`; invalid formats exit `2` (`proposals/06-export.md:73-107`). |
+| Canonical schema and source preimage | Unchanged / acceptable | Required record fields and source line/byte/hash metadata remain defined (`proposals/06-export.md:109-174`). |
+| Resolution flow | Improved | Read-only state open remains mandatory; locator side-effect exception is now explicit (`proposals/06-export.md:176-222`, `proposals/06-export.md:339-350`). |
+| Exit codes | Unchanged / acceptable | Exit codes `0`, `1`, `2`, `10`, `11`, `12`, and `15` remain mapped (`proposals/06-export.md:224-239`). |
+| Reusable API | Unchanged / acceptable | `CanonicalRecord`, `RecordSource`, `ExportError`, and `read_canonical_transcript` remain defined (`proposals/06-export.md:241-310`). |
+| Anti-scope | Unchanged / acceptable | No DB writes, no `session_turns` reconstruction, no provider spawn, no scans, no migrations, no GUI surface (`proposals/06-export.md:312-327`). |
+| Test-intent and residuals | Unchanged / acceptable | Parser drift, compaction, ordering, no partial stdout, and read-only behavior are covered; parser drift remains an accepted residual (`proposals/06-export.md:355-377`, `proposals/06-export.md:427-447`). |
+| Cross-feature constraints | Unchanged / acceptable | Error namespace, resolver reuse, read-only state dependency, and anti-scope remain listed (`proposals/06-export.md:448-461`). |
 
 ## Findings
 
-### R1-F01 (MEDIUM) - The read-only locator dependency is conditional, not a proposal-level contract
+None.
 
-The harness requires export to be read-only and specifically says it must
-not mutate `state.db`, update ingest cursors, write temp files, or launch a
-provider session (`02-session-export.md:54-64`). The approved problem map
-identifies a current collision with that requirement: `locate_transcript`
-creates the adapter `STATE_DIR` before running the locator
-(`research/06-export-problem-map.md:59`; `src-tauri/src/sessions/mod.rs:183-185`).
-06-locate explicitly accepted that mkdir as a locate-side caveat
-(`/home/nes/projects/agent-runner/worktrees/06-locate/risk/06-locate-audit.md:13`).
+## Accepted residuals
 
-The export proposal inherits `locate_session_metadata(...)` for transcript
-path resolution (`proposals/06-export.md:185-187`) while also forbidding
-temp files, parent-directory mutations, provider maintenance commands,
-turn scripts, scans, and quota jobs (`proposals/06-export.md:306-331`).
-The proposal then says that if the current locator helper still creates
-`STATE_DIR`, Phase 5 must identify a read-only locator path or revise the
-proposal (`proposals/06-export.md:333-339`).
-
-That leaves a required acceptance property outside the reviewed contract.
-Phase 4 is supposed to review the proposal artifact, not a future
-hookpoint discovery outcome. The test-intent row for read-only behavior
-would snapshot DB rows, transcript mtimes, adapter state, and temp dirs
-(`proposals/06-export.md:359`), but the design under review does not say
-which non-side-effecting path the implementation is obligated to use when
-`locate_session_metadata` reaches today’s side-effecting helper. As written,
-an implementation could follow the proposed resolution flow and still
-violate the harness side-effect requirement before the parser starts.
-
-Closure expectation: the proposal must make the transcript path resolution
-contract reviewable without relying on a Phase 5 conditional, and the
-test-intent track must verify that exact contract. Until then, the
-read-only side-effect guarantee remains medium audit risk.
-
-## Non-findings / accepted residuals
-
-- Parser drift is adequately identified as the largest residual, with
-  Claude/Codex fixture coverage and `risk/06-export-test-residuals.md`
-  expected for unverified cases (`proposals/06-export.md:352-366`,
-  `proposals/06-export.md:420-435`).
-- Codex compaction being unsupported in v1 is explicit and fail-closed at
-  the value-contract level: Codex emits full mappable transcript unless a
-  marker is proven and the proposal is revised (`proposals/06-export.md:48`,
-  `proposals/06-export.md:195-202`, `proposals/06-export.md:423-425`).
-- Whole-transcript buffering is a documented implementation residual and
-  aligns with the no-partial-stdout contract (`proposals/06-export.md:209-211`,
-  `proposals/06-export.md:296-300`, `proposals/06-export.md:428-429`).
+- Parser drift remains the main implementation residual for private Claude
+  Code and Codex JSONL formats (`proposals/06-export.md:431-433`).
+- Codex compaction remains unsupported in v1 unless Phase 5 proves a stable
+  raw marker and the proposal is revised (`proposals/06-export.md:434-436`).
+- Timestamp regression remains fail-closed, which may reject real provider
+  transcripts with benign clock skew (`proposals/06-export.md:437-438`).
+- Whole-transcript buffering remains the chosen tradeoff for no partial
+  stdout (`proposals/06-export.md:439-440`).
 
 ## Determination
 
-This report is `MEDIUM`, so Phase 4 does not clear. The proposal needs a
-Rev 2 risk round after the read-only locator contract is made reviewable.
+Audit risk is `LOW`. R1-F01 is closed, Rev 2 introduces no blocking audit
+issue, and the proposal can proceed to the next Phase 4 gate/exit decision
+from the audit perspective.

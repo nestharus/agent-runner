@@ -1,173 +1,109 @@
-# 06-export — Phase 4 Shortcut Risk Assessment (Rev 1)
+# 06-export — Phase 4 Shortcut Risk Assessment (Rev 2, Round 2)
 
 ## Verdict: LOW
 
-The Rev 1 proposal does not contain shortcuts that defeat the
-underlying purpose of `agents session export`. The five purpose
-threads — (a) replace harness-side direct provider parsing with one
-canonical CLI surface; (b) auditable per-record source preimage
-metadata (line/byte/sha); (c) reusable canonical reader for
-06-import-replace round-trip; (d) reuse of 06-locate ownership/path;
-(e) read-only side-effect contract — are each carried by a
-non-trivially-costed design choice, not by a corner-cut. Every
-identified tradeoff (compaction asymmetry, timestamp-regression fail-
-closed, in-memory `Vec` buffering, deferred read-only `StateDb`
-dependency, deferred locator side-effect resolution) is documented
-as a residual with a concrete falsifiable invalidator and a Phase 5
-or Phase 6 disposition rule. No purpose thread is silently degraded.
+Rev 2 makes one targeted change (`proposals/06-export.md:35-39`,
+`:339-350`): §8 now pins the `STATE_DIR` mkdir behavior of
+`locate_transcript` as accepted-residual by anchoring to the
+harness's transcript-locator anti-scope clause (`01-session-locate.md:46`
+— "Running configured transcript locators is allowed only if already
+part of the current trace/session contract"), and notes the same
+behavior is already exhibited by `trace --json` and `agents session
+locate`. The clause also affirms that no file inside the directory
+is written by `export`. This change closes the audit-owned finding
+R1-F01 (audit's domain, verified below) and resolves the prior
+shortcut-side watchpoint Sh-W3 by promoting it from "Phase 5 evidence
+requirement / silent-violation risk if Phase 5 is mute" to "explicit
+carried-residual with cited harness-contract authorization." No new
+shortcut surface is introduced. Rev 1's other watchpoints (Sh-W1
+Codex compaction marker, Sh-W2 timestamp-regression real-fixture
+coverage, Sh-W4 large-transcript memory ceiling) carry forward
+unchanged. No `MEDIUM` or `HIGH` shortcut findings.
 
-No `MEDIUM` or `HIGH` shortcut findings. Four sub-LOW watchpoints
-documented below for Phase 5 / Phase 6 awareness.
+## R1-F01 closure check (audit-owned; shortcut-side verification only)
 
-## Purpose-thread shortcut analysis
+R1-F01 is an audit-domain finding (see
+`risk/06-export-audit-history.md:11-14`). The shortcut reviewer's
+obligation is to confirm closure does not introduce shortcut
+regressions. Verification:
 
-| Purpose thread | Could a shortcut here defeat purpose? | Proposal's choice | Verdict |
-| --- | --- | --- | --- |
-| (a) Stable canonical surface that replaces harness direct parsing | A canonical schema that flattens tool calls into prose, or that drops `unsupported_record`, would force the harness to keep parsing private formats. | D2 keeps text/tool_call/tool_result as typed chunks (`proposals/06-export.md:118-127`); `unsupported_record` is mandatory on every record (`:115-116`); `canonical-jsonl` is the only v1 format with a clap-typed enum so format drift is fail-closed (`:88-94`). Purpose-fit, not a shortcut. | LOW |
-| (b) Auditable source preimage on every record | A "best-effort" or "sometimes-omit" source object would defeat preimage audit — the harness is the consumer of these fields. | D1 makes all six source fields mandatory on every emitted record (`:146-156`); SHA-256 is over the exact native record byte slice excluding terminator, with explicit CRLF/LF rules (`:158-162`); the byte-preserving JSONL scanner is named as a non-trivial implementation cost (`:164-168`). Purpose-fit, not a shortcut. | LOW |
-| (c) Reusable canonical reader for import-replace round-trip | Returning a streaming iterator would have been cheaper but would defeat both the no-partial-stdout invariant *and* the round-trip-from-buffer reuse pattern import-replace expects. | D7 returns `Vec<CanonicalRecord>` and §6 exposes the public types `CanonicalRecord` / `ContentChunk` / `RecordSource` / `ExportError` from `src-tauri/src/session_export/` (`:236-300`). Public types are explicit so import-replace can parse replacement input and compare post-replace export output (`:298-300`). The memory cost is documented as residual (`:428-429`). Purpose-fit. | LOW |
-| (d) Reuse of 06-locate ownership/path | Re-implementing ownership inside export, or bypassing `resolve_resume`, would create a second ownership path. | §4 step 5 calls `locate_session_metadata`, inheriting ownership/ambiguity/storage vocabulary/canonicalization/workspace-root validation from locate (`:181-187`); §13 cross-feature constraints row confirms reuse (`:441-442`). No second ownership path exists. Purpose-fit. | LOW |
-| (e) Read-only side-effect contract | A "we'll use the existing mutating `StateDb::open_default`" or "we'll call `locate_transcript` and accept its STATE_DIR mkdir" would silently violate the harness's strict no-side-effect rule (`02-session-export.md:54-64`). | §4 step 3 explicitly forbids today's mutating `StateDb::open_default` and depends on 06-schema-probe's read-only variant (`:177-180`). §8 names the `STATE_DIR`-mkdir residue inside `locate_transcript` as a Phase 5 must-resolve-or-revise (`:336-339`). Phase 5 either supplies a read-only locator path or this proposal is revised — fail-closed deferral, not silent acceptance. | LOW |
+- Audit history records R1-F01 as the open Round 1 issue and Rev 2
+  as the closure dispatch (`risk/06-export-audit-history.md:11-14`).
+- Proposal §1 Rev 2 changes block names the §8 STATE_DIR clause as
+  the closure mechanism (`proposals/06-export.md:35-39`).
+- Proposal §8 contains the new explicit clause naming
+  `src-tauri/src/sessions/mod.rs:184-185`, citing the matching
+  behavior in `trace --json` and `agents session locate`, citing
+  the harness anti-scope authorization, and asserting "No file
+  inside the directory is written by `export`"
+  (`proposals/06-export.md:339-350`).
+- The cited harness anti-scope language is verbatim present at
+  `01-session-locate.md:46`. The export spec (`02-session-export.md:54`)
+  does not contradict it — its forbidden list is `state.db` mutation,
+  ingest cursor updates, temp file writes, and provider launches; an
+  empty parent-directory creation is not on that list.
+- The closure stance matches 06-locate Rev 3's accepted carried-
+  residual disposition (R1-F03 closure, referenced in Sh-W3 below),
+  preserving cross-feature consistency.
 
-## Specific shortcut surfaces evaluated
+Audit-side closure verdict (LOW vs. carried-residual; pinned-clause
+adequacy) is the audit reviewer's call. From the shortcut layer:
+**closure is consistent and introduces no shortcut regression.**
 
-### Sh-1 D5 ordering: file order with regression-as-error
+## Fresh assessment of Rev 2 §8 STATE_DIR clause
 
-§4 step 9 emits records in JSONL file order after the compaction
-cutoff and exits `15` on timestamp regression rather than re-sorting
-(`proposals/06-export.md:203-208`). §12 residual names "Real
-transcripts with benign clock skew would be rejected" (`:427`). The
-alternative (timestamp-sort) would silently re-order records that
-the provider wrote in a specific causal order — that is the larger
-shortcut against the canonical-replay purpose. Refuse-rather-than-
-corrupt is the correct shortcut-avoidant choice for v1. Watchpoint
-Sh-W2 below covers Phase 6 fixture coverage.
+The new clause (`proposals/06-export.md:339-350`) is the only Rev 2
+proposal change. Shortcut analysis:
 
-### Sh-2 D4 compaction: Claude live, Codex full
+| Question | Finding |
+| --- | --- |
+| Does pinning rather than deferring this residual constitute a shortcut against the §8 read-only side-effect contract? | No. The clause does not weaken the contract; it documents that the directory creation is *outside* the contract's forbidden set, citing the harness anti-scope clause that explicitly authorizes "configured transcript locator" side effects when those side effects are already part of the trace/session contract — which they are (`trace --json`, `agents session locate`). |
+| Does the clause silently launder a side effect through "we are reusing locate"? | No. The clause names the exact source line (`src-tauri/src/sessions/mod.rs:184-185`), names the precedent surfaces, and explicitly carves out that no *file* inside the directory is written. The reader can verify the claim. |
+| Does pinning remove a Phase 5 evidence requirement that should have been kept? | No. The Phase 5 evidence requirement was about resolving an *unresolved* contract conflict between export's "stricter than locate" stance and locate's accepted-mkdir stance. By harmonizing export's contract to locate's at the proposal level — with cited harness-contract authority — the conflict no longer exists, so Phase 5 has no live question to answer here. The "lift the helper into a read-only mode" alternative remains a possible future refinement; deferring it indefinitely is not a shortcut because the harness contract permits the current behavior. |
+| Does the clause silently widen export's anti-scope? | No. §7 anti-scope (`:312-326`) is unchanged. The carve-out is narrow: parent-directory creation only, no file writes, only via the same `locate_transcript` path that locate and trace already exercise. Anything beyond that (writing inside the directory, creating it on a code path other than the locator) would violate §8 as written. |
+| Round-trip with import-replace: does the clause weaken what import-replace can rely on? | No. Import-replace can still trust that export does not mutate transcript bytes, DB rows, cursors, or temp files. The directory creation is a property of `locate_transcript` itself, not of export's transcript-reading work. |
 
-§4 step 8 emits live canonical transcript starting at the latest
-supported boundary for Claude (`isCompactSummary == true`) and emits
-the full transcript for Codex because no stable raw marker is
-currently known (`:198-202`). A7 names this asymmetry with a
-falsifiable invalidator ("Codex compaction must be live-state
-accurate in v1, or Claude changes compaction marker shape" — `:48`)
-and §12 residual reinforces (`:424-425`). The harness spec
-(`02-session-export.md:56-64`) does not require live-state
-compaction for either provider; export's choice to apply it where a
-marker exists *exceeds* the harness ask, not falls short of it. Not
-a shortcut. Watchpoint Sh-W1 below covers the Codex marker hunt.
+**Verdict: LOW.** The §8 clause is purpose-fit. It chooses
+contract-pinning with explicit harness-anchored authorization over
+silent acceptance or indefinite deferral.
 
-### Sh-3 In-memory `Vec<CanonicalRecord>` buffer
+## Purpose-thread shortcut analysis (Rev 2)
 
-§4 step 10 builds the complete `Vec` and validates every record /
-every source hash before any stdout write (`:209-211`). §3
-reinforces the no-partial-stdout invariant at the CLI seam
-(`:99-101`). §12 names the proportional-memory residual (`:428-429`).
-The harness spec line 64 explicitly forbids partial transcript on
-error; in-memory buffering is the *minimum* mechanism that achieves
-that invariant for a non-streaming validator. A streaming
-implementation would either defeat the invariant or require a
-staging temp file (which §7 anti-scope forbids). Purpose-fit. Sh-W4
-below carries the Phase 6 memory ceiling as a watchpoint.
+Rev 2 does not alter any of the five purpose threads identified in
+Rev 1. The Rev 1 table (`risk/06-export-shortcut.md` Rev 1 §
+"Purpose-thread shortcut analysis") carries forward verbatim. Spot
+re-check:
 
-### Sh-4 `SessionStorageType::Other` rejected with exit `12`
+| Purpose thread | Rev 2 status |
+| --- | --- |
+| (a) Stable canonical surface that replaces harness direct parsing | Unchanged. D2 typed chunks, mandatory `unsupported_record`, single `canonical-jsonl` v1 format intact (`:118-127`, `:88-94`, `:115-116`). |
+| (b) Auditable source preimage on every record | Unchanged. D1 mandatory source object and SHA-256 byte-slice rules intact (`:146-156`, `:158-162`, `:164-168`). |
+| (c) Reusable canonical reader for import-replace round-trip | Unchanged. `Vec<CanonicalRecord>` return shape, public type exports, no-partial-stdout invariant intact (`:236-300`, `:99-101`, `:209-211`). |
+| (d) Reuse of 06-locate ownership/path | **Strengthened.** Rev 2 §8 explicitly anchors the locator-side-effect carve-out to the harness contract that 06-locate's own §8 cites, removing the "export is stricter than locate" tension and making the reuse boundary cleaner. |
+| (e) Read-only side-effect contract | **Pinned, not weakened.** Rev 2 makes the contract explicit about what is forbidden (DB writes, cursor writes, transcript writes, temp files, provider launches) and what is permitted (parent-directory creation as part of the existing locator contract). The stricter-than-locate ambiguity is resolved without silently relaxing. The dependency on 06-schema-probe's read-only `StateDb` open variant remains intact (`:177-180`). |
 
-§4 step 6 fail-closes on `Other` storage (`:188-189`). The
-alternative — a generic line-by-line emitter over unknown JSONL —
-would defeat purpose (a) by handing the harness records that the
-agent-runner side has not actually parsed into canonical content.
-Better to refuse than to launder unparsed bytes through a
-"canonical" envelope. Purpose-fit.
+No purpose-thread regression detected.
 
-### Sh-5 Public reader API surface (D7)
+## Specific shortcut surfaces re-evaluated against Rev 2
 
-§6 exposes `read_canonical_transcript(metadata: &SessionMetadata) ->
-Result<Vec<CanonicalRecord>, ExportError>` plus the canonical
-record/content/source/error types directly from
-`src-tauri/src/session_export/` (`:288-300`). This is the
-load-bearing public surface for 06-import-replace's round-trip
-reader. Returning a `Vec` instead of an iterator is a deliberate
-cost paid for the no-partial-stdout invariant and for round-trip
-buffering at the import side. Documented in `proposals/06-export.md:296-300`.
-Purpose-fit.
+Sh-1 through Sh-8 from Rev 1 carry forward unchanged — Rev 2 did
+not touch ordering policy (Sh-1), compaction asymmetry (Sh-2),
+in-memory `Vec` buffer (Sh-3), `Other`-storage rejection (Sh-4),
+public reader API surface (Sh-5), `sha2` dep policy (Sh-6),
+`session_turns` non-fallback (Sh-7), or provider-native bookkeeping
+skip (Sh-8). No regressions introduced.
 
-### Sh-6 Sha-2 direct dependency (A8)
+The only change touches §8, addressed in the dedicated section
+above.
 
-A8 carries the cost of adding `sha2` as a direct dep instead of
-hand-rolling SHA-256 (`:49`). Hand-rolling would be the shortcut;
-declaring the dep is the right call. §12 names the dep policy
-escape hatch (`:430-431`). Not a shortcut.
+## Watchpoint disposition (Rev 2)
 
-### Sh-7 No `session_turns` content/ordering/source fallback
-
-§4 final paragraph and §13 reinforce that `session_turns` is not
-used for content, source metadata, ordering, or compaction cutoff
-(`:213-216`, `:441-442`). The shortcut would have been "reconstruct
-content from `session_turns` rows" — that is impossible because
-`session_turns` stores no content (problem map §1 #23, db.rs:559-572).
-Anti-scope §7 forbids it explicitly (`:312-313`). Purpose-fit refusal,
-not a shortcut.
-
-### Sh-8 Provider-native bookkeeping skipped
-
-§3 skips thinking/reasoning/event/session-metadata/usage records
-when they do not represent transcript turns (`:130-134`). The
-harness spec line 78 explicitly disclaims byte-for-byte provider-
-native output and asks for canonical transcript JSONL — this skip
-is what *makes* it canonical. The five-condition gate for
-`unsupported_record` emission (`:135-141`) prevents the alternate
-shortcut (silently dropping ambiguously-bookkeeping records) by
-requiring the parser to prove safe placeholder emission or fail
-closed at exit `15`. Both directions covered. Purpose-fit.
-
-## Watchpoint signals (sub-LOW; Phase 5 / Phase 6 awareness)
-
-### Sh-W1 Codex compaction marker hunt
-
-§4 step 8 and A7 both name a Phase 5 hunt for a stable Codex
-compaction marker (`:200-202`, `:48`). If Phase 5 finds one and the
-proposal is not revised, Codex export silently misses it. If Phase
-5 does *not* find one, the v1 asymmetry persists as documented. Phase
-5 must record the result either way. The asymmetry itself is not a
-shortcut today, but Phase 5 silence on the question would be one.
-
-### Sh-W2 Real-transcript timestamp regression coverage
-
-§9 names a "regressing timestamps" component-level fixture (`:357`),
-but Phase 5/6 fixtures should sample real Claude and Codex
-transcripts — including sidechain branches and any retry paths —
-to confirm they do not regress in practice. If real transcripts
-*do* regress, D5's fail-closed behavior (`:206-208`) blocks
-legitimate exports and the proposal needs revision toward a
-boundary-aware ordering policy. The Phase 6 implementer should
-treat unexpected regressions in real fixtures as a Phase 2.5 re-
-entry signal, not a fixture-skipping signal.
-
-### Sh-W3 `locate_transcript` STATE_DIR mkdir residue
-
-§8 acknowledges that the current `locate_transcript` helper creates
-`STATE_DIR` (`:336-339`, problem map §2 #5). Export's side-effect
-contract is stricter than locate's; 06-locate Rev 3 accepted this
-mkdir as carried-residual (R1-F03 closure), but locate's contract
-permits the side effect. Export's does not. Phase 5 must either
-identify a read-only locator path, lift the helper into a read-
-only mode, or revise §8. If Phase 5 does not resolve this, export
-silently violates the harness's no-temp-files / no-state rule. The
-proposal correctly defers without silently accepting; the watchpoint
-is the Phase 5 evidence requirement.
-
-### Sh-W4 Memory ceiling for very large transcripts
-
-§12 names proportional-memory as a residual (`:428-429`). Phase 6
-fixtures should include at least one large-transcript case (order-
-of-magnitude estimate from the largest real Claude/Codex transcripts
-the implementer can sample) to confirm the in-memory buffer fits a
-realistic upper bound. If a real session OOMs the export binary
-under default platform limits, the no-partial-stdout invariant and
-the single-pass `Vec` cost would need to be reconciled (likely via
-a staging temp file with atomic-rename emission, which would re-open
-§7 anti-scope and require Phase 2.5 re-entry). Treat this as a
-Phase 6 fixture-coverage gate, not a Phase 4 blocker.
+| ID | Rev 1 status | Rev 2 disposition |
+| --- | --- | --- |
+| Sh-W1 Codex compaction marker hunt | Open Phase 5 watchpoint | **Unchanged.** Rev 2 did not touch §4 step 8 or A7. The Phase 5 evidence requirement to record the marker-hunt outcome (found / not found) carries forward verbatim. Silence by Phase 5 would still convert this into a shortcut. |
+| Sh-W2 Real-transcript timestamp regression coverage | Open Phase 5/6 fixture watchpoint | **Unchanged.** Rev 2 did not touch §9 fixture intent or D5 ordering. Phase 6 fixture sampling of real Claude/Codex transcripts (including sidechain/retry paths) for regression behavior remains required. |
+| Sh-W3 `locate_transcript` STATE_DIR mkdir residue | Open Phase 5 evidence watchpoint with silent-violation risk if Phase 5 mute | **Resolved.** Rev 2 §8 (`:339-350`) pins the residual at the proposal contract level by anchoring to the harness anti-scope clause at `01-session-locate.md:46` and citing matching `trace --json` / `agents session locate` precedent. The Phase-5-must-resolve-or-revise requirement is replaced by an in-contract carve-out with explicit scope (parent dir only; no files written by export). The "lift the helper into a strict read-only mode" alternative remains available but is no longer load-bearing for this proposal's correctness. |
+| Sh-W4 Memory ceiling for very large transcripts | Open Phase 6 fixture-coverage gate | **Unchanged.** Rev 2 did not touch §4 step 10 or §12 memory residual. Phase 6 large-transcript fixture remains the gate; OOM under default platform limits is still a Phase 2.5 re-entry signal. |
 
 ## Findings (severity >= MEDIUM)
 
@@ -175,12 +111,18 @@ None.
 
 ## LOW-severity observations / nits
 
-None beyond the four sub-LOW watchpoints above.
+None beyond the three remaining sub-LOW watchpoints above (Sh-W1,
+Sh-W2, Sh-W4). Sh-W3 is closed at the shortcut layer per the
+disposition above.
 
 ## What this report does not cover
 
 Per Phase 4 role separation, this report only evaluates whether
-proposed shortcuts defeat the underlying purpose. It does not
-evaluate audit completeness (`risk/06-export-audit.md`), scope
-adherence (`risk/06-export-scope.md`), or net-value on the supported
-surface (`risk/06-export-supported-surface.md`).
+proposed shortcuts defeat the underlying purpose. R1-F01's audit-
+side closure verdict (whether the §8 pinning text is sufficient as
+an audit artifact) is the audit reviewer's call, not the shortcut
+reviewer's; this report only confirms the closure introduces no
+shortcut regression. Scope adherence
+(`risk/06-export-scope.md`) and net-value on the supported
+surface (`risk/06-export-supported-surface.md`) remain out of
+scope for this report.

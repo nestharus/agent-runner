@@ -1,252 +1,206 @@
-# 06-export — Phase 4 Scope Risk Assessment (Rev 1)
+# 06-export — Phase 4 Scope Risk Assessment (Rev 2)
 
 **Assessor:** `claude-opus` (scope)
-**Verdict:** **LOW** — Rev 1 ships an additive, well-bounded scope: one
-new `agents session export` subcommand attached to the locate-introduced
-`SessionSubcommands` enum, plus one new read-only Rust module
-`src-tauri/src/session_export/`. No existing surface (resume, repl,
-trace, migration, locate, sessions adapter, GUI) is mutated. Anti-scope
-(§7) is exhaustive and consistent with the side-effect contract (§8).
-All ten cross-feature constraints in §13 hold under the proposed
-mechanics. The §1.1 register replaces the problem-map draft register
-correctly; the two register expansions (A6 ordering, A8 `sha2`) are
-surfaced honestly with invalidators rather than being slipped in. No
-finding rises to MEDIUM. Three LOW drafting nits captured in §7
-(boundary-summary canonical shape, in-memory Vec residual phrasing,
-Other-storage in `RecordSource` enum).
+**Verdict:** **LOW** — Rev 2 makes a single, surgical edit (§8 pins the
+`STATE_DIR` mkdir clause by importing 06-locate's accepted wording and
+deletes the Rev 1 "Phase 5 must either identify a read-only locator path
+or revise this proposal" escape hatch). The change tightens the
+side-effect contract; it does not expand surface, anti-scope, exit
+codes, schema, public types, or assumption register. R1-F01 is an audit
+finding; this scope report verifies its closure as audit-only and
+confirms no scope regression. The three Rev 1 LOW drafting nits (L1
+boundary-summary canonical shape, L2 `RecordSource` storage_type
+tightening, L3 in-memory residual phrasing) remain unchanged in Rev 2;
+they were not in the R1 cure scope and stay parked for Phase 5/6
+hookpoints. No new scope finding.
 
 ---
 
-## 1. Scope statement audit
+## 1. R1-F01 closure check (audit-only)
 
-| Aspect | Result | Evidence |
+R1-F01 was raised by the Phase 4 Round 1 **audit** gate (MEDIUM):
+"§8 deferred read-only locator clause to Phase 5; pin in proposal
+contract" (`risk/06-export-audit-history.md` Round 1).
+
+| Cure obligation | Rev 2 evidence | Status |
 | --- | --- | --- |
-| One CLI surface added | confirmed | §1, §2: `session export <session-id> [--format canonical-jsonl]` extends locate's `SessionSubcommands` enum; no second top-level command. |
-| One Rust module added | confirmed | §1, §6: `src-tauri/src/session_export/` with `mod.rs`, `jsonl.rs`, `claude_code.rs`, `codex_session.rs`; consistent placement with locate's `session_metadata/` precedent. |
-| Existing surfaces unchanged | confirmed | §1: "Existing resume/repl/trace/migration/locate behavior remains unchanged." Cross-checked against §7 anti-scope (no trace JSON edits, no `--inline-transcript` change, no migrate-db coupling) and §11.1 (no GUI, no daemon, no server). |
-| One direct dependency added | confirmed, justified | §1.1 A8 + §12: `sha2` direct dep; already transitive in `Cargo.lock`; flagged as residual subject to Phase 5 dep-policy validation. |
-| Register hygiene | confirmed | §1.1: "consumes the approved current-state map at `research/06-export-problem-map.md`; this proposal's §1.1 register replaces the draft register in that map." No competing register kept. |
+| Pin the STATE_DIR mkdir behavior in the proposal contract rather than deferring to Phase 5. | §8 third paragraph (`proposals/06-export.md:339-350`) now reads: "`agents session export` may create the locator adapter `state_dir` directory (`src-tauri/src/sessions/mod.rs:184-185`) when `locate_transcript` is invoked. This directory creation is the same behavior `trace --json` and `agents session locate` already exhibit and is part of the existing transcript-locator contract that the harness anti-scope explicitly permits ('Running configured transcript locators is allowed only if already part of the current trace/session contract'). No file inside the directory is written by `export`." | **closed** |
+| Match 06-locate's §8 wording (precedent already accepted by Phase 4). | Compared to `worktrees/06-locate/proposals/06-locate.md:243`. Export's clause is the locate clause with `agents session locate` → `agents session export` and "the same behavior `trace --json` already exhibits" → "the same behavior `trace --json` and `agents session locate` already exhibit". Substantively identical. | **closed** |
+| Remove Rev 1's Phase 5 escape hatch ("Phase 5 must either identify a read-only locator path or revise this proposal"). | String absent from Rev 2 §8 and absent from §12 residuals. The §1 changelog entry confirms "removes Phase 5 deferral language." | **closed** |
 
-Scope statement holds. The only design surface introduced is contained
-inside the new `session_export` module; the only external touch points
-are the locate `SessionMetadata` API (read), the schema-probe read-only
-`StateDb` open (read), and the `SessionSubcommands` enum (one new
-variant).
+R1-F01 status: **closed**.
 
-## 2. Anti-scope integrity check
+The closure is correct for the audit gate's framing. From a scope
+perspective the cure is also tighter than Rev 1: by adopting locate's
+already-accepted clause, the contract loses its conditional escape
+("Phase 5 may revise") and binds export to the same already-permitted
+side-effect envelope as locate and trace.
 
-§7 anti-scope clauses walked against §3–§8 mechanics:
+## 2. Fresh assessment of Rev 2 deltas
 
-| Anti-scope clause | Verified by | Note |
-| --- | --- | --- |
-| No provider spawn / auto-resume / login / quota refresh / model discovery | §4 step-list (no launch step), §8 second bullet | resolution flow ends at validated `Vec<CanonicalRecord>` + stdout write. |
-| No DB writes / cursor writes / transcript writes / temp files / state repair / migrations / lock commands | §4 step 3 (read-only DB open from schema-probe), §8 first/second bullets | strict superset of locate's read-only contract. |
-| No `session_turns` fallback for content / source / ordering / parser dispatch | §4 step 7 (D3) + closing paragraph after §4 step 10 | "raw JSONL file is the transcript source of truth"; §13 row 2 also pins this. |
-| No `SessionStorageType::Other` parser in v1 | §4 step 6, §5 (exit `12`), §3 schema enum row | failure path is fail-closed exit `12`; not a silent skip. |
-| No alternate formats (pretty JSON / Markdown / native JSONL / archives) | §2 `ExportFormat::CanonicalJsonl` only; clap rejects others as exit `2` | no `--pretty`, `--inline`, or archive flags introduced. |
-| No byte-for-byte provider-native promise | §3 schema (canonical chunk variants) + §7 bullet 5 | preserves preimage via `source.sha256` of native bytes, but emitted JSON is canonical. |
-| No import / replace / append / truncate / rewrite | §6 declares `read_canonical_transcript` (read-only) only | reusable types defined for `06-import-replace` to consume, but no write API. |
-| No GUI / Tauri frontend surface | §11.1 first paragraph | no Tauri command, no `lib.rs` invoke wiring beyond `pub mod session_export;`. |
-| No preservation of provider-private metadata beyond canonical schema | §3 chunk variants, §7 bullet 7 | unsupported records carry `unsupported_record: true` placeholder, not native payload passthrough. |
+The Rev 2 changelog (`proposals/06-export.md:35-39`) lists exactly one
+delta:
 
-All clauses hold. No drift between anti-scope text and mechanics
-elsewhere in the proposal.
+> §8: explicit `STATE_DIR` mkdir clause matching 06-locate's §8.
+> Closes R1-F01 by pinning the contract; removes Phase 5 deferral
+> language.
 
-## 3. Cross-feature constraint compliance
+Walked the diff against §1, §1.1, §1.2, §2, §3, §4, §5, §6, §7, §9, §10,
+§11, §12, §13. Only §1 changelog and §8 paragraph 3 changed in scope-
+relevant text. The rest of the proposal is unchanged from Rev 1, and my
+Rev 1 audit (sections 1–8, including the L1–L3 drafting nits) carries
+forward verbatim.
 
-§13 row-by-row verification against
-`initiatives/06-session-override-contract.md:106-122`:
+### 2.1 §8 paragraph 3 — anti-scope and side-effect coherence
 
-| Constraint | Compliance | Verification anchor |
-| --- | --- | --- |
-| Shared error namespace (`10`/`11`/`12`/`15` for export-relevant cases) | yes | §5 table; export-specific `15` is `malformed-transcript` / `unsupported-record`, not initiative-wide `invalid-input`. Naming is harness-aligned (`02-session-export.md:44-53`). |
-| Single ownership via `StateDb::resolve_resume`; no second ownership path | yes | §4 steps 5 + 10 invoke `locate_session_metadata`, which proxies to `resolve_resume`; D3 explicitly forbids ownership reads from `session_turns`. |
-| Read-only `StateDb` open variant (06-schema-probe) | yes | §4 step 3 + §8 third paragraph; A2 invalidator names "export starts from today's mutating `StateDb::open_default()` without an accepted exception" as the explicit failure mode if schema-probe slips. |
-| Lock observation for import-replace / migration / repl / resume / one-shot once 06-pause-handshake lands | N/A for read-only export | §11.1 reflects that 06-export is locker-free; future pause-handshake observation lands in import-replace, not here. |
-| No auto-resume | yes | §7 bullet 1, §8 second bullet; resolution flow has no resume call site. |
-| No provider spawn | yes | §7 bullet 1, §8 second bullet. |
-| No quota refresh | yes | §7 bullet 1; no scan/refresh job step in §4. |
-| No config edits | yes | §7 + §8; config is read via locate, never mutated. |
-| No coupling to `migrate-config` | yes | §7 bullet 2, §11.1 third paragraph: "`migrate-db` and `migrate-config` are not called or coupled." |
-| Reusable canonical reader for import-replace round-trip | yes | §6: `CanonicalRecord`, `RecordSource`, `ContentChunk`, `ExportError`, `read_canonical_transcript` are public; D7 names import-replace as direct consumer. |
-| Harness receives canonical JSONL, not provider-native | yes | §3 schema is canonical; §7 bullet 5 forbids byte-for-byte promise. |
+The new sentence permits one named filesystem side effect: creation of
+the locator adapter `state_dir` directory at
+`src-tauri/src/sessions/mod.rs:184-185`. Three coherence checks:
 
-All ten constraint rows hold. No row composition changed; all citations
-resolve.
-
-## 4. Net-value and blast-radius framing audit
-
-§1.2 claim is honest:
-
-- **Risk reduction is concrete.** Today the harness must parse private
-  Claude/Codex JSONL or read summary rows that omit content
-  (problem-map §6 #1–#5). Centralizing the parser behind a stable CLI
-  contract removes that obligation from the harness. The benefit is
-  not speculative.
-- **Blast radius is bounded.** One enum variant, one new module, one
-  README section. No edits to existing CLI dispatch beyond the
-  locate-introduced `Subcommands::Session` arm; no edits to existing
-  state, sessions adapter, trace, or migration code paths.
-- **Migration cost is correctly stated as none for user state.** No
-  schema migration, no transcript rewrite, no cursor reset.
-- **Rollback cost is correctly stated as low.** Additive subcommand
-  with no durable state writes; revert binary or avoid the subcommand.
-- **Ongoing burden is correctly framed.** Provider JSONL drift is the
-  one large recurring cost (§12 first bullet). The proposal does not
-  hide this — it explicitly names parser drift as the largest
-  residual.
-
-The framing does not overstate value or understate cost. No "free
-lunch" claim.
-
-## 5. Watch-flag judgments
-
-| Watch flag | Source | Judgment |
-| --- | --- | --- |
-| WF1: `STATE_DIR` mkdir side effect inherited via locate | §8 final paragraph | **acceptably escalated.** The proposal explicitly states "Phase 5 must either identify a read-only locator path or revise this proposal." This is honest Phase 5 escalation, not silent scope creep. The export side-effect contract is documented as strictly stricter than locate's; the dependency is named, not hidden. Not a Phase 4 scope finding. |
-| WF2: D4 compaction policy is asymmetric (Claude post-boundary suffix; Codex full transcript) | §4 step 8, §12 bullet 2, §1.1 A7 | **bounded asymmetry.** One CLI surface, two storage-type behaviors, both documented. The harness consumer can detect the regime from `source.line` of the first record (boundary line vs. line 1). A7 invalidator names "Codex compaction must be live-state accurate in v1, or Claude changes compaction marker shape" as the trigger to revise. Acceptable for v1 because no stable Codex marker is currently known (problem-map §1 #36, §2 #18); a fail-closed alternative would over-reject Codex sessions. |
-| WF3: D5 strict timestamp regression → exit `15` | §4 step 9, §12 bullet 3 | **fail-closed by design.** §12 acknowledges "A real provider transcript with valid causal order but regressing timestamps would exit `15`." The alternative — sort by timestamp — would silently reorder records relative to JSONL append order, which problem-map §1 #35–#36 establishes as today's stable conversation order. Fail-closed is consistent with harness ask "no partial stdout transcript on error" (`02-session-export.md:58-64`). Not a scope finding. |
-| WF4: D7 returns `Vec<CanonicalRecord>`, not streaming iterator | §6 D7, §12 bullet 4 | **honest tradeoff.** Required by harness ask "no partial transcript on error" (`02-session-export.md:54-64`); streaming would force partial stdout cleanup on late-record failure. Memory cost residual is named in §12. Internal helpers may stream; public API is buffered. Not a scope finding. |
-| WF5: D3 places parsers in Rust (not `scripts/`) | §4 step 7, §6 module list | **bounded module addition.** Justified by harness's preimage requirements (byte offsets, SHA-256, no cursor writes), which existing adapter scripts cannot supply (problem-map §1 #26, §2 #2, §6 #3). Existing adapter scripts are explicitly preserved as "summary-ingestion helpers only" (§4 step 7). Not a duplicate code path: scripts feed `session_turns`; Rust parsers feed canonical export. Two separate consumers, two separate purposes. |
-| WF6: New direct `sha2` dependency | §1.1 A8, §12 bullet 5 | **single, transitive-already-present dep.** `Cargo.lock:3142-3149` confirms transitive presence. A8 invalidator names "dependency policy rejects a direct hash crate" as the only failure mode. Not a scope finding; defer to Phase 5 dep-policy gate. |
-| WF7: `SessionStorageType::Other` rejected even when locator returns a path | §4 step 6, §12 bullet 6 | **correct fail-closed.** No v1 parser → no contract → exit `12`. Consistent with harness exit-code map (`02-session-export.md:51`). Not a scope finding. |
-
-No watch flag escalates to a Phase 4 finding. Each is either
-controlled by an invalidator clause or by the harness contract.
-
-## 6. Drift audit
-
-### 6.1 vs. harness ask (`02-session-export.md`)
-
-| Harness requirement | Proposal coverage | Gap? |
-| --- | --- | --- |
-| `agents session export <id> [--format canonical-jsonl]` (`:7-21`) | §2 clap shape; same id resolution as locate | none |
-| Line-delimited JSON; one canonical record (not summary row) per line (`:20`) | §3 schema, §1 statement | none |
-| Minimum record shape with session/provider/turn/role/timestamp/content + source.{storage_type,jsonl_path,line,byte_start,byte_end,sha256} + unsupported_record (`:22-41`) | §3 schema; D1 makes all source fields required; D2 keeps `content` as typed array | none |
-| Exit codes `0`/`1`/`2`/`10`/`11`/`12`/`15` (`:44-53`) | §5 table, §13 row 1 | none |
-| Read-only: no `state.db` mutation, no cursor updates, no temp files, no provider launch (`:54-64`) | §4 step 3 (read-only DB), §7, §8 | none |
-| Stable, chronological export order (`:58`) | §4 step 9 (D5) | none — JSONL file order is stable+chronological for supported storage per problem-map §1 #35–#36 |
-| Source metadata sufficient for harness audit/preimage checks (`:60`) | §3 source object; D1 hash-of-native-bytes precision | none |
-| Claude Code and Codex fixtures export without call-site native-shape knowledge (`:61`) | §6 reusable reader API; §9 Claude/Codex fixture rows | none |
-| Unsupported native records → safe placeholder OR exit `15` if unsafe (`:62`) | §3 unsupported-record 5-condition gate; §5 exit `15`; §9 row "Unsupported native record policy" | none |
-| Missing/ambiguous/unsupported sessions → stable error codes, no partial stdout (`:63`) | §5 + §4 step 10 (validate-then-write) | none |
-| Read-only proven by tests against state DB and transcript files (`:64`) | §9 row "Read-only behavior" | none |
-| Reuse `locate` ownership/path logic; do not re-scan arbitrary files (`:66-72`) | §4 step 5; §13 row 2 | none |
-| Trace placeholder `--inline-transcript` not changed (`:70`) | §11.1, §10 README clarification (trace/locate do not emit transcript content) | none |
-| `agents resume` / `agents repl --resume` continue to launch providers; export must not imply resume (`:72`) | §7 + §8 | none |
-
-No drift from harness ask; one expansion (D2 typed `content` chunks
-beyond the harness's text-only example) is a refinement, not a
-deviation, since it preserves text and adds structured tool/result
-shapes the harness can ignore.
-
-### 6.2 vs. problem-map draft register (§7)
-
-| Problem-map draft | Proposal disposition |
+| Check | Result |
 | --- | --- |
-| Draft A1 (locate before export) | A1 carried, evidence enriched with locate Rev 3 module path. |
-| Draft A2 (schema-probe before export, read-only `StateDb`) | A2 carried, citation deepened. |
-| Draft A3 (canonical source = JSONL, not `session_turns`) | A3 carried, used by D3. |
-| Draft A4 (storage type sufficient for parser family) | renumbered to A5; substance preserved. |
-| Draft A5 (per-record source metadata at read time) | renumbered to A4; substance preserved. |
-| Draft A6 (compaction state sufficient) | narrowed to A7: Claude detectable via `isCompactSummary == true`; Codex deferred unless Phase 5 finds a marker. Narrowing tightens, does not expand. |
-| Draft A7 (locate error vocabulary shareable) | folded into §13 row 1 + §5 table (constraint, not assumption). Acceptable migration. |
-| — | A6 added: JSONL line order is stable conversation order. New assumption with cited evidence and forward-looking invalidator. |
-| — | A8 added: `sha2` can become a direct dependency. New assumption with explicit invalidator. |
+| Does the new sentence contradict §7 anti-scope? | No. §7 forbids "DB writes, transcript writes, temp files, adapter cursor writes, state repair, scans, turn scripts, migrations, or pause/resume lock commands." Directory creation by the locator adapter is none of those: it is not a transcript write, not a temp file owned by export, not an adapter cursor write (the new clause explicitly says "No file inside the directory is written by `export`"). |
+| Does the new sentence contradict §8 paragraphs 1–2? | No. §8 paragraph 1 lists DB row writes, cursor writes, telemetry, invocation, trace, cache. §8 paragraph 2 lists transcript bytes/permissions/mtimes, parent dirs, temp files, replacement files, provider launches, turn scripts. The new paragraph 3 is the documented exception that exists *because* the locator adapter is invoked — and the proposal cites the harness anti-scope exception verbatim. |
+| Does the new sentence introduce a side effect not already present in 06-locate's accepted contract? | No. Export inherits this exact behavior from locate (which is the gate it depends on for `locate_session_metadata`). The clause was always implicit in §4 step 5; Rev 2 makes it explicit. |
 
-Net: 6 problem-map drafts → 8 proposal entries. Two additions are
-distinct, narrow assumptions with invalidators; one (A6) is load-bearing
-for D5 ordering policy and was not surfaced as a draft assumption — its
-addition is correct, not improper. Register expansion is controlled.
+§8 paragraph 3 is therefore a pin, not an expansion.
 
-### 6.3 vs. initiative scope
-(`/home/nes/projects/agent-runner/worktrees/06-locate/initiatives/06-session-override-contract.md`)
+### 2.2 §1 changelog — register integrity
 
-| Initiative requirement | Proposal | Gap? |
+The Rev 2 changelog adds one bullet under "**Rev 2 changes**" describing
+the §8 pin and its motivation. No assumption rows were added to §1.1, no
+register row was deleted, no row's `Used by` column was renumbered. A6
+("provider JSONL line order is the stable conversation order") and A8
+("`sha2` can be added as a direct dependency") remain the only Rev 1
+register additions; A7 (Codex compaction-deferral) remains the only
+narrowed assumption. Register hygiene preserved.
+
+### 2.3 No regression on §13 cross-feature constraints
+
+Re-walked all ten constraint rows in §13 against Rev 2 §8:
+
+| Constraint | Status under Rev 2 |
+| --- | --- |
+| Shared error namespace (`10`/`11`/`12`/`15`) | unchanged |
+| Single ownership via `StateDb::resolve_resume` | unchanged |
+| Read-only `StateDb` open variant from 06-schema-probe | unchanged; Rev 2 explicit STATE_DIR clause is *not* a substitute for schema-probe's read-only open — it covers a different side effect (filesystem dir vs. SQLite open). |
+| Lock observation for sibling features | N/A (export is locker-free) |
+| No auto-resume | unchanged |
+| No provider spawn | unchanged |
+| No quota refresh | unchanged |
+| No config edits | unchanged; STATE_DIR mkdir is not a config edit |
+| No coupling to `migrate-config` | unchanged |
+| Reusable canonical reader | unchanged |
+| Harness receives canonical JSONL, not provider-native | unchanged |
+
+All ten rows continue to hold. Rev 2 §8 strengthens row 8 (no config
+edits) by explicitly drawing the boundary between "configured locator
+script may create its state_dir" and "config files are mutated."
+
+### 2.4 No regression on §7 anti-scope
+
+Re-walked §7's nine bullets against Rev 2 §8. All bullets continue to
+hold. The STATE_DIR mkdir is not a temp file, scan, turn script, or
+migration; it is not a write to `state.db`; it is not a transcript
+mutation; it is not an alternate format; it is not import/replace; it is
+not GUI; it is not provider-private metadata preservation. Anti-scope
+unchanged.
+
+### 2.5 No regression on §6 public API
+
+Public types in §6 (`CanonicalRecord`, `CanonicalRole`, `ContentChunk`,
+`RecordSource`, `ExportError`, `read_canonical_transcript`) are
+untouched by Rev 2. The reusable reader API contract for
+`06-import-replace` consumption is preserved. L2 (RecordSource
+storage_type tightening) remains a Phase 5/6 ergonomics nit — not
+escalated.
+
+### 2.6 No regression on §3 schema or §5 exit codes
+
+§3 record schema (8 required top-level fields, 6 required source
+subfields, 3 chunk variants) and §5 exit-code table (`0`/`1`/`2`/`10`/
+`11`/`12`/`15`) are unchanged. L1 (boundary-summary canonical shape)
+remains a Phase 5/6 drafting nit — not escalated.
+
+### 2.7 No regression on §11 supported-surface
+
+§11.1 (local CLI binary only, harness primary consumer, additive
+rollback) is unchanged. The STATE_DIR mkdir disclosure does not change
+deployment mode, cohort, blast-radius framing, migration path, rollback
+path, or observability claim. Sibling supported-surface report is
+unaffected.
+
+### 2.8 No regression on §12 residuals
+
+§12 lists seven residuals (parser drift, Codex compaction, timestamp
+regression, in-memory buffering, `sha2` direct dep, `Other` rejection,
+no native-payload preservation). None changed in Rev 2. The Rev 1
+"STATE_DIR escalation to Phase 5" was *not* in §12 (it lived in §8 prose
+only); removing it from §8 does not require a §12 edit. L3 (in-memory
+residual phrasing) remains a Phase 5/6 drafting nit.
+
+## 3. Drift audit (S5)
+
+| Section | Rev 2 surface | Drift? |
 | --- | --- | --- |
-| 06-export third in technical order (`:48-50`, `:75-89`) | A1 + A2 enforce sequencing | none |
-| Builds canonical-transcript reader that 06-import-replace round-trips against (`:48-50`, `:83-89`) | §6 public types defined; §13 row 9 | none |
-| Cross-feature anti-scope: no auto-resume / spawn / quota / config edits / `migrate-config` coupling (`:106-122`) | §7, §8, §13 | none |
-| Out-of-scope items: cross-CLI migration, `.zst` ingestion, cross-org cache, frontend visibility, alternate formats (`:64-73`) | §7 + §11.1 | none |
+| §1 scope statement | unchanged + 1 changelog bullet | no |
+| §1.1 assumption register | unchanged (8 rows) | no |
+| §1.2 net-value statement | unchanged | no |
+| §2 subcommand surface | unchanged | no |
+| §3 per-record schema | unchanged | no |
+| §4 resolution flow (10 steps) | unchanged | no |
+| §5 exit codes | unchanged | no |
+| §6 reusable reader API | unchanged | no |
+| §7 anti-scope (9 bullets) | unchanged | no |
+| §8 side-effect contract | paragraph 3 added (STATE_DIR mkdir clause matching locate) | scope-tightening, not expansion |
+| §9 test-intent track | unchanged | no |
+| §10 README updates | unchanged | no |
+| §11 supported-surface track | unchanged | no |
+| §12 residuals | unchanged | no |
+| §13 cross-feature constraints (10 rows) | unchanged | no |
 
-No initiative scope drift.
+No drift. Rev 2 is a single targeted pin.
 
-## 7. Findings
+## 4. Watch-flag re-evaluation
+
+Rev 1 captured seven watch flags (WF1–WF7). WF1 was the STATE_DIR Phase
+5 escalation; Rev 2 closes its underlying concern by pinning the clause,
+so WF1 is **discharged**. WF2–WF7 carry forward unchanged (each was
+already judged "not a Phase 4 scope finding" in Rev 1; the Rev 2 §8 edit
+does not affect any of them).
+
+## 5. Findings
 
 ### Severity ≥ MEDIUM
 
 None.
 
-### Severity LOW (drafting nits)
+### Severity LOW (drafting nits — carried from Rev 1, unchanged in Rev 2)
 
-**L1 — §4 step 8 + §3 do not pin the canonical shape of the
-emitted Claude compaction-boundary record.** §4 step 8 says "the
-boundary summary record is included as the first emitted record" but
-does not state which `role`, which `content` chunk variant(s), or
-whether `unsupported_record` is true. The §3 schema requires `role`
-to be `system|user|assistant|tool|unknown` and `unknown` only when
-`unsupported_record: true`; without explicit pinning, two reasonable
-implementations (assistant + text chunk vs. system + text chunk vs.
-unsupported placeholder) are equally consistent with the proposal.
-Recommend Phase 5 hookpoints pin this concretely; or that §4 step 8
-add one sentence ("emit boundary as `role: assistant` with `text`
-chunk built from the summary payload, `unsupported_record: false`")
-to make D4 enforceable from §3 alone. **Severity: LOW (drafting).**
+- **L1** — §4 step 8 + §3 do not pin canonical shape of Claude
+  compaction-boundary record (role / chunk / `unsupported_record`).
+  Phase 5 hookpoint or Rev 3 prose pin would resolve.
+- **L2** — `RecordSource.storage_type: SessionStorageType` includes
+  `Other` even though §4 step 6 fails before any record is built.
+  Tighter public type or one-line invariant note in §6 would
+  resolve.
+- **L3** — §12 bullet 4 in-memory residual is softer than §6 D7's
+  commitment. A stated size band or explicit post-v1 streaming
+  deferral would make the residual actionable.
 
-**L2 — §6 `RecordSource.storage_type: SessionStorageType` includes
-`Other` even though §4 step 6 fails before any record is built.**
-The public `SessionStorageType` enum from locate is
-`{ClaudeCode, CodexSession, Other}`. Strictly, the typestate of an
-emitted `RecordSource` cannot be `Other`. This is not a bug — `Other`
-is structurally reachable but dynamically unreachable on the success
-path — but the public type would be marginally more honest as a
-parser-supported subset (e.g. `enum CanonicalStorageType {
-ClaudeCode, CodexSession }`) or §6 should add a one-line invariant
-note that `RecordSource.storage_type ∈ {claude_code, codex_session}`.
-Either fix is a Phase 5/6 implementation decision; the contract risk
-is that a future caller could over-trust the field. **Severity: LOW
-(drafting / public-type ergonomics).**
+L1–L3 are not Phase 4 scope concerns. They were not in R1-F01's cure
+scope and are not Rev 2 regressions. They remain available for Rev 3 or
+Phase 5/6 hookpoint adoption.
 
-**L3 — §12 bullet 4 in-memory residual phrasing is softer than §6
-D7's commitment.** §6 D7 commits the public API to a `Vec` ("Later
-internal helpers may stream source lines into parser state, but the
-public API returns a fully validated transcript"); §12 bullet 4
-notes "Very large transcripts pay memory cost proportional to
-exported records" without naming a budget or a Phase 6 mitigation.
-Not a scope expansion, but the residual would be more useful with
-either (a) a stated tolerable size band ("transcripts up to N records
-fit in memory budget B") or (b) an explicit deferral
-("post-v1 streaming variant tracked under future-residuals/…"). As
-written, the residual is observable but not actionable. **Severity:
-LOW (drafting).**
+## 6. Verdict and recommendation
 
-None of L1–L3 raises a Phase 4 scope concern; all are drafting
-clarifications appropriate for Rev 2 fold-in or Phase 5 hookpoints.
+**Verdict: LOW.**
 
-## 8. Drift audit (S5)
-
-Cross-checked the proposal against §1–§13 for surface beyond the §1
-scope statement. Sections walked:
-
-- §1, §1.1, §1.2: scope, register, net-value — bounded.
-- §2: subcommand surface — one enum variant, one format enum.
-- §3: per-record schema — fields match harness ask + D1/D2 refinements.
-- §4: 10-step resolution flow — every step traceable to harness ask
-  or constraint.
-- §5: exit codes — match harness ask + namespace constraint.
-- §6: reader API — public types match §3 schema; D7 returns `Vec`.
-- §7: anti-scope — exhaustive, no internal contradictions.
-- §8: side-effect contract — strictly read-only with explicit
-  STATE_DIR Phase 5 escalation.
-- §9: test-intent track — covers all six harness acceptance criteria
-  plus D1–D5 decisions; no extra-scope test categories.
-- §10: README updates — strictly additive, scoped to CLI sections.
-- §11: supported-surface track — local CLI binary only.
-- §12: residuals — seven items, all with invalidator citations or
-  bounded scope.
-- §13: cross-feature compliance — all ten rows hold.
-
-No surface found outside §1's stated scope. No silent edit to
-existing files beyond the additive `SessionSubcommands` enum
-extension and a new top-level module declaration in `src-tauri/src/lib.rs`.
-No anti-scope violation. No constraint row breakage.
+R1-F01 is closed (audit-only). Rev 2 introduces no scope regression,
+no anti-scope drift, no constraint breakage, no register expansion, no
+public-type change, no schema/exit/test-intent change, no residual
+churn. The single edit (§8 paragraph 3) tightens the side-effect
+contract by removing the Phase 5 escape hatch and binding export to the
+same STATE_DIR mkdir envelope that 06-locate already enjoys under
+already-accepted harness contract terms. No further scope action
+required for Round 2.
