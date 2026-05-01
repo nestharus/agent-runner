@@ -1,186 +1,131 @@
-# 06-import-replace - Phase 4 Audit Risk Report (Rev 2)
+# 06-import-replace - Phase 4 Audit Risk Report (Rev 3)
 
 **Verdict: HIGH / NOT CLEARED**
 
-Rev 2 materially improves the proposal: it stops writing canonical export bytes
-to provider transcript files, adds a durable replace journal, narrows the
-cooperative-lock claim, and makes DB field loss explicit. AIR-R1-F01, F03, and
-F04 are closed at proposal level.
+Rev 3 closes the specific Round 2 blocker. The journal now carries the resolved
+identity needed for deterministic DB recovery, keeps the normalized canonical
+records in a journal-attached file, and deletes recovery artifacts only after
+postimage verification, fresh export verification, and SQLite commit all
+succeed (`proposals/06-import-replace.md:282`,
+`proposals/06-import-replace.md:328`,
+`proposals/06-import-replace.md:368`,
+`proposals/06-import-replace.md:420`).
 
-AIR-R1-F02 is not fully cleared. Rev 2 adds the right recovery mechanism, but
-the proposed journal contract is still insufficient for deterministic
-post-rename recovery because it does not persist the resolved identity required
-to rebuild state rows, and the success flow deletes the journal before the fresh
-postimage export verification. That leaves a Phase 6 implementer with a
-mutation path that can lose the only recovery signal before proving the provider
-transcript is export-readable.
+The proposal is still not cleared because the revised journal lifecycle is not
+race-free inside the documented cooperative-lock threat model. Rev 3 writes and
+may delete shared per-session journal artifacts before acquiring
+`SessionLock`. Two concurrent `import-replace` invocations for the same resolved
+session can overwrite or remove each other's recovery signal before one of them
+observes `session-busy`.
 
-Note: the requested prior files were absent from the current checkout, but they
-exist in git at `4a598ac` (`risk/06-import-replace-audit.md`,
-`risk/06-import-replace-supported-surface.md`, and
-`risk/06-import-replace-audit-history.md`). This review used that committed
-Round 1 material plus the current Rev 2 proposal.
+Note: `risk/06-import-replace-audit-history.md` is not present in the current
+checkout. This review used the current Round 2 audit file plus the Round 1
+history available from git, which records AIR-R1-F01..F04 and the Round 1
+closure path.
 
 ## Closure Check
 
-| ID | Rev 2 status | Audit result |
+| ID | Rev 3 audit result | Notes |
 | --- | --- | --- |
-| AIR-R1-F01 | Provider-native rendering replaces canonical-byte writes. | CLOSED |
-| AIR-R1-F02 | Durable journal and startup recovery added. | PARTIAL / NOT CLEARED |
-| AIR-R1-F03 | Cooperative-lock limitation is explicitly documented. | CLOSED |
-| AIR-R1-F04 | Canonical-record field loss is explicit and tested. | CLOSED |
+| AIR-R1-F01 | CLOSED | Provider-native rendering remains the write contract; canonical JSONL remains input/hash/round-trip oracle. |
+| AIR-R1-F02 | CLOSED WITH NEW R3 BLOCKER | The original durable-recovery gap is addressed, but the new pre-lock journal race blocks clearance separately. |
+| AIR-R1-F03 | CLOSED | The lock claim remains scoped to `SessionLock`; non-cooperating writers remain residual. |
+| AIR-R1-F04 | CLOSED | Canonical-record field loss remains explicit and tested. |
+| AIR-R2-F01 | CLOSED | Resolved journal identity, canonical recovery source, delayed deletion, and recovery tests are now specified. |
 
-### AIR-R1-F01 - CLOSED
+### AIR-R2-F01 - CLOSED
 
-Round 1 blocked on Rev 1 writing canonical export JSONL directly to provider
-transcript paths. Rev 2 changes the write contract: input remains canonical
-JSONL, but the replacement file stores provider-native bytes rendered through
-`CanonicalToProviderRenderer`; `other` storage is refused; lossy record classes
-exit `15` before mutation (`proposals/06-import-replace.md:26-29`,
-`proposals/06-import-replace.md:247-250`,
-`proposals/06-import-replace.md:344-352`,
-`proposals/06-import-replace.md:691-692`). The test-intent track now checks
-that the provider path contains native JSONL and export after replace matches
-the canonical import stream (`proposals/06-import-replace.md:553`,
-`proposals/06-import-replace.md:569`).
+Round 2 required three proposal changes: persist resolved recovery identity,
+preserve enough canonical postimage material to rebuild `session_turns` without
+stale resolver rediscovery, and move postimage/fresh-export verification before
+journal deletion.
 
-This resolves the original audit blocker. Phase 6 still needs renderer-level
-proof for Claude and Codex, but the proposal now gives implementers the right
-contract and fail-closed behavior.
+Rev 3 now freezes `session_id`, `chain_id`, `active_segment_id`,
+`provider_name`, `storage_type`, and `jsonl_path` before mutation
+(`proposals/06-import-replace.md:264`). The journal stores those fields plus
+`canonical_records_path`, preimage/postimage hashes, and expected turn count
+(`proposals/06-import-replace.md:328`,
+`proposals/06-import-replace.md:560`). Recovery explicitly rebuilds DB rows from
+`canonical_records_path`, refreshes the frozen segment/chain, and does not infer
+DB rows from provider-rendered bytes (`proposals/06-import-replace.md:352`,
+`proposals/06-import-replace.md:432`). Journal deletion is now the final durable
+cleanup after postimage verification, fresh export verification, and commit
+(`proposals/06-import-replace.md:305`,
+`proposals/06-import-replace.md:310`,
+`proposals/06-import-replace.md:315`,
+`proposals/06-import-replace.md:316`).
 
-### AIR-R1-F02 - PARTIAL / NOT CLEARED
-
-Round 1 blocked on the missing durable recovery signal after file rename and
-before DB commit. Rev 2 adds a replace journal, startup scan, preimage/postimage
-hash comparison, and explicit recovery tests (`proposals/06-import-replace.md:30-33`,
-`proposals/06-import-replace.md:260-285`,
-`proposals/06-import-replace.md:363-379`,
-`proposals/06-import-replace.md:562-565`). That is the correct direction.
-
-The closure is incomplete because the new journal/recovery spec has a blocking
-gap described in AIR-R2-F01 below.
-
-### AIR-R1-F03 - CLOSED
-
-Round 1 flagged overclaiming around exclusive ownership. Rev 2 now says
-import-replace acquires `SessionLock`, maps busy to `13`, cites the
-06-pause-handshake lock primitive dependency, and explicitly scopes full writer
-retrofit to sibling timelines (`proposals/06-import-replace.md:225-228`,
-`proposals/06-import-replace.md:666-668`,
-`proposals/06-import-replace.md:687-688`). The supported claim is now accurate:
-`session-busy` is reliable inside the cooperative lock surface, while
-non-cooperating writers remain a documented residual.
-
-### AIR-R1-F04 - CLOSED
-
-Round 1 flagged ambiguous DB field preservation. Rev 2 now says the DB helper
-writes only fields present in `CanonicalRecord`, and
-`parent_turn_id`, `is_sidechain`, and `is_compaction_boundary` are intentionally
-written as `NULL` or defaults (`proposals/06-import-replace.md:353-358`,
-`proposals/06-import-replace.md:439-443`,
-`proposals/06-import-replace.md:469-471`). The test-intent track includes a
-dedicated fixture for this explicit loss model (`proposals/06-import-replace.md:567`).
+The new test rows cover rename-only recovery, ambiguous hash quarantine,
+canonical-record preservation, and no deletion before verify
+(`proposals/06-import-replace.md:645`,
+`proposals/06-import-replace.md:648`,
+`proposals/06-import-replace.md:649`,
+`proposals/06-import-replace.md:650`). That satisfies AIR-R2-F01 at proposal
+level.
 
 ## Findings
 
 | ID | Severity | Status | Summary |
 | --- | --- | --- | --- |
-| AIR-R2-F01 | HIGH | open | The Rev 2 journal/recovery contract is not sufficient to guarantee deterministic state recovery. |
+| AIR-R3-F01 | HIGH | open | Per-session journal artifacts are written and may be deleted before acquiring the session lock. |
 
-### AIR-R2-F01 - Journal recovery is underspecified and cleared too early
+### AIR-R3-F01 - Pre-lock journal publication is racy
 
-Rev 2's durable journal is the new safety mechanism for the highest-risk crash
-window. The journal format records only `operation`, `session_id`, `jsonl_path`,
-`preimage_sha256`, `postimage_sha256`, `db_state_pending`, and `started_at`
-(`proposals/06-import-replace.md:292-303`). Startup recovery then says to read
-`jsonl_path` through the storage parser and, if the transcript matches
-`postimage_sha256`, re-apply DB updates from transcript rows and refresh the
-segment (`proposals/06-import-replace.md:363-374`).
+Rev 3's protected mutation window is supposed to be guarded by
+`SessionLock` (`proposals/06-import-replace.md:242`,
+`proposals/06-import-replace.md:247`). However, the success flow writes
+`<state-data-dir>/replace_journal/session-<session_id>.canonical.jsonl` and
+`session-<session_id>.pending` before acquiring the lock
+(`proposals/06-import-replace.md:282`,
+`proposals/06-import-replace.md:287`). The durable side-effect section repeats
+that ordering: canonical file first, journal second, both before lock and before
+transcript temp write (`proposals/06-import-replace.md:560`).
 
-That does not persist enough resolved identity to do the DB recovery
-deterministically. The normal DB update API requires the resolved
-provider/session identity, replaced path, and canonical records
-(`proposals/06-import-replace.md:353-358`), and the state update needs the
-resolved `provider_name`, `session_id`, `chain_id`, and active segment identity
-(`proposals/06-import-replace.md:431-456`). The current-state map shows why this
-matters: `session_turns` is keyed by `(provider_name, session_id, turn_id)`,
-chain/segment rows drive resolver ownership, and partial stale rows can make
-future resume/export select stale owners
-(`research/06-import-replace-problem-map.md:121-129`). A recovery routine that
-only has `session_id` and `jsonl_path` must rediscover provider/storage/chain
-context from potentially stale DB/config state, which is exactly the state it is
-supposed to repair.
+Those paths are keyed only by session id (`proposals/06-import-replace.md:410`,
+`proposals/06-import-replace.md:562`). A second concurrent `import-replace`
+process for the same resolved session can therefore overwrite the first
+process's canonical records and pending journal before it tries to acquire the
+lock. If the second process then receives `session-busy`, Rev 3 allows it to
+unlink the journal and canonical records file because it has not mutated the
+transcript itself (`proposals/06-import-replace.md:287`,
+`proposals/06-import-replace.md:573`).
 
-There is a second ordering problem. The success flow deletes and fsyncs the
-journal immediately after the DB transaction commits, then computes
-`postimage_sha256` by reading the newly committed transcript through export
-(`proposals/06-import-replace.md:279-285`). If the provider-native renderer
-wrote bytes that do not actually round-trip through export, or if the final
-export verification fails for any operational reason after DB commit, the
-command has already removed the only durable recovery signal. This contradicts
-Rev 2's own model that the private replace journal is the crash-recovery signal
-(`proposals/06-import-replace.md:650-652`) and that unparsable or
-neither-hash transcript states should be quarantined with the journal preserved
-for operator recovery (`proposals/06-import-replace.md:529-532`).
-
-This is not an implementation nit. Rev 2's main claim is that the durable
-journal closes the post-rename/pre-DB gap (`proposals/06-import-replace.md:535-537`,
-`proposals/06-import-replace.md:693-694`). With the current payload and deletion
-order, Phase 6 can still produce a committed transcript/DB mutation that cannot
-be recovered or even diagnosed by startup recovery.
+That breaks the recovery invariant. A lock-owning process may reach DB
+reconstruction with `canonical_records_path` missing or containing another
+operation's records; a crash after transcript rename may leave startup recovery
+with the wrong pending entry or no entry at all. This is not an external
+non-cooperating writer problem. It is a race between two instances of the new
+cooperative command, so it is inside the documented threat model.
 
 Required proposal change:
 
-- Persist the resolved recovery identity in the journal before transcript
-  mutation: at minimum `provider_name`, `storage_type`, `chain_id`,
-  active `segment_id` or an equivalent stable segment key, `session_id`,
-  canonical `jsonl_path`, expected preimage/postimage hashes, and enough
-  canonical postimage material or parser metadata to rebuild `session_turns`
-  without relying on stale resolver output.
-- Move fresh postimage export verification before journal deletion, or state
-  that any post-DB verification failure leaves/quarantines the journal instead
-  of deleting it.
-- Add a recovery test that simulates stale or ambiguous resolver-visible DB
-  rows after rename and proves startup recovery uses journal identity rather
-  than rediscovery through the broken state.
-
-## Fresh Rev 2 Assessment
-
-No new adjacent-surface regression was found outside the recovery contract.
-Rev 2 preserves the CLI-only scope, keeps provider-native JSONL out of the
-public input surface, avoids provider spawn/config/quota changes, and leaves
-resume/repl/trace/migration behavior unchanged
-(`proposals/06-import-replace.md:56-70`,
-`proposals/06-import-replace.md:626-653`,
-`proposals/06-import-replace.md:696-701`).
-
-The supported-surface Round 1 cosmetic issue about stale temp cleanup remains
-worth carrying into implementation: §4 still says to clean matching temp files
-in the target transcript directory rather than explicitly scoping cleanup to
-`<resolved.jsonl_path>.tmp-import-replace-*`
-(`proposals/06-import-replace.md:251-253`). This is non-blocking for the audit
-verdict because the temp-file convention itself is per target path
-(`proposals/06-import-replace.md:489`), but Phase 6 should make the narrower
-scope explicit.
+- Acquire `SessionLock` before publishing per-session journal artifacts; or
+- Use operation-unique journal/canonical paths plus an ownership token so only
+  the lock owner can publish, consume, or delete the active per-session pending
+  entry; and
+- Add a concurrency test where two `import-replace` processes target the same
+  session, one wins the lock, the loser exits `13`, and the winner's journal,
+  canonical records, transcript, and DB update remain intact.
 
 ## Passed Checks
 
-- CLI shape, input source behavior, receipt fields, and exit namespace still
-  match the harness-requested surface (`proposals/06-import-replace.md:3-7`,
-  `proposals/06-import-replace.md:385-426`).
-- Resolver ownership remains delegated to the Initiative 06 metadata/resume
-  path; no second ownership path is introduced (`proposals/06-import-replace.md:61-62`,
-  `proposals/06-import-replace.md:244-246`).
-- The under-lock preimage recheck remains present and protects the normal
-  preimage TOCTOU gap inside the cooperative lock model
-  (`proposals/06-import-replace.md:266-273`).
-- State consistency still targets replacement of one resolved
-  provider/session's turn rows and refreshes the existing chain/segment rather
-  than creating a new chain (`proposals/06-import-replace.md:431-456`).
+- The public surface remains CLI-only and additive; no GUI/Tauri command,
+  provider spawn, quota refresh, config edit, or cross-provider migration path is
+  introduced (`proposals/06-import-replace.md:56`,
+  `proposals/06-import-replace.md:697`).
+- Provider-native JSONL remains out of the public input surface, and supported
+  writes still require a lossless renderer (`proposals/06-import-replace.md:167`,
+  `proposals/06-import-replace.md:217`).
+- `other` storage still fails closed (`proposals/06-import-replace.md:226`,
+  `proposals/06-import-replace.md:263`).
+- Under-lock preimage recheck still protects the normal preimage TOCTOU gap once
+  the lock is held (`proposals/06-import-replace.md:291`).
+- Ambiguous startup recovery now quarantines the journal and preserves canonical
+  records for manual inspection (`proposals/06-import-replace.md:441`,
+  `proposals/06-import-replace.md:609`).
 
 ## Audit-History Note
 
-This is a Phase 4 audit gate only. I did not review or change an implementation
-because Rev 2 remains a proposal artifact. The report should block Phase 5/6
-consumption until AIR-R2-F01 is revised or explicitly accepted by the human
-owner.
+This remains a proposal-phase audit. No implementation was reviewed. Phase 5/6
+should not consume Rev 3 until AIR-R3-F01 is revised or explicitly accepted by
+the human owner.

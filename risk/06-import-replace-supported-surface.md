@@ -1,552 +1,634 @@
-# 06-import-replace — Phase 4 Supported-Surface Risk Report (Rev 2)
+# 06-import-replace — Phase 4 Supported-Surface Risk Report (Rev 3)
 
 **Termination signal:** `none`
 **LOW / MEDIUM / HIGH:** **LOW**
 
-This is the Round 2 supported-surface review of `proposals/06-import-replace.md`
-Rev 2. Round 1 verdict was LOW with two non-terminal findings (R1-F01
-cooperative-lock contract clarification, R1-F02 cosmetic temp-cleanup scoping);
-the audit track was HIGH with four findings (AIR-R1-F01 canonical-vs-native
-bytes mismatch, AIR-R1-F02 missing crash recovery for post-rename/pre-DB-commit,
-AIR-R1-F03 lock observation outside cooperative surface, AIR-R1-F04 canonical
-record field-loss ambiguity). Rev 2's announced scope is to close all four
-audit findings while preserving Round 1's supported-surface verdict. This
-review confirms that closure from the supported-surface lens, runs the no-
-regression check on adjacent paths and cohorts, and registers the carryover
-of R1-F01 / R1-F02 prose plus three new bounded blast-radius items intrinsic
-to the Rev 2 closures. Net value remains positive on the supported surface;
-no termination signal fires.
+This is the Round 3 supported-surface review of `proposals/06-import-replace.md`
+Rev 3. Round 1 verdict was LOW with two non-terminal findings; the audit
+track was HIGH (AIR-R1-F01..F04). Rev 2 closed AIR-R1-F01, F03, F04 and was
+re-reviewed at Round 2 supported-surface as LOW with five carryover findings
+(R2-F01..R2-F05). Round 2 audit re-opened HIGH on AIR-R2-F01 (journal
+recovery underspecified and cleared too early). Rev 3's announced scope is to
+close AIR-R2-F01 by (a) expanding the journal schema with frozen resolved
+identity plus `canonical_records_path`, (b) reordering the success flow so
+journal deletion is the last step (after postimage_sha256 verification, fresh
+export verification, and SQLite commit), (c) specifying recovery for both
+postimage-matching and preimage-matching cases plus quarantining the ambiguous
+case, and (d) adding four T-rows for recovery scenarios. This review confirms
+that closure from the supported-surface lens, runs the no-regression check on
+adjacent paths and cohorts under the documented threat model, registers the
+five Round 2 prose carryovers (still untouched in Rev 3), and adds one new
+non-terminal finding tied to the Rev 3 ordering of journal write versus lock
+acquisition. Net value remains positive on the supported surface; no
+termination signal fires.
 
-## Concern 1 — Closure of AIR-R1-F01..F04 from the supported-surface lens
+The originally referenced `risk/06-import-replace-audit-history.md` is not
+present at HEAD; the Round 1 history exists at git commit `4a598ac` and is
+treated as authoritative for prior rounds.
 
-This concern is closure-only audit on the four audit findings. It does not
-re-derive the audit verdict; it asks whether each closure is real on the
-public-CLI surface and whether each closure introduces an unbounded blast-
-radius item.
+## Concern 1 — Closure of AIR-R2-F01 from the supported-surface lens
 
-### AIR-R1-F01 — canonical bytes vs provider-native bytes mismatch — CLOSED
+This concern is closure-only audit on the single Round 2 audit finding. It
+asks whether the closure is real on the public-CLI surface and whether it
+introduces an unbounded blast-radius item.
 
-Rev 2 §3 / §6 / §10 / §13 introduce `CanonicalToProviderRenderer` under
-`src-tauri/src/session_replace/render/`, with `claude_code` and
-`codex_session` implementations and an `UnsupportedStorage` return for
-`other`. §3's renderer contract requires every supported rendered record to
-round-trip through 06-export back to the canonical input, and §1 states
-plainly that "the replacement transcript file does not store canonical JSONL
-in v1. It stores provider-native bytes rendered from canonical input for the
-resolved storage type."
+### AIR-R2-F01 — journal recovery underspecified and cleared too early — CLOSED
 
-Supported-surface effects of the closure:
+Round 2 audit had three required changes:
 
-- `agents resume`, `agents repl --resume`, top-level `--resume`, and direct
-  CLI `claude` / `codex` continue reading their own native transcript shapes
-  unchanged after a replace. Round 1's R1 concern that Rev 1 might silently
-  break provider CLIs is now eliminated by construction (provider files
-  receive provider-native bytes).
-- `agents session export <id>` after replace remains the round-trip oracle:
-  §6 step 4 keeps `postimage_sha256` defined as the canonical export stream
-  hash, not raw native file bytes. The receipt continues to be byte-for-byte
-  comparable to the canonical input the harness shipped in.
-- `other` storage continues to refuse with exit `12` (§3 / §4 step 7 / §5);
-  it never guesses a native layout. This preserves Round 1's bounded
-  unsupported-storage handling.
-- New refusal mode: lossy re-encoding (multi-modal blocks, tool-use records,
-  or any provider-specific record class without a clean native representation)
-  exits `15 invalid-input-transcript` with `unsupported-record-class:<class>`
-  before mutation (§3, §13 row "Lossy canonical-to-provider re-encoding is
-  refused"). This is loud refusal in place of Rev 1's silent provider-CLI
-  breakage; it is a strict positive even though it narrows effective coverage.
-  See R2-F02 for the cohort-coverage callout.
+1. Persist the resolved recovery identity in the journal before transcript
+   mutation, with enough canonical postimage material or parser metadata to
+   rebuild `session_turns` without relying on stale resolver output.
+2. Move fresh postimage export verification before journal deletion, or state
+   that any post-DB verification failure leaves/quarantines the journal
+   instead of deleting it.
+3. Add a recovery test that simulates stale or ambiguous resolver-visible DB
+   rows after rename and proves startup recovery uses journal identity rather
+   than rediscovery through the broken state.
 
-Closure verdict: **real and complete on the supported surface.** No
-adjacent-path regression. One bounded new blast-radius item (renderer record-
-class scope) that is captured under R2-F02.
+Rev 3 delivers all three.
 
-### AIR-R1-F02 — missing crash recovery for post-rename/pre-DB-commit — CLOSED
+**Frozen resolved identity in the journal.** §4 step 8 now says: "Freeze the
+resolved identity for the operation: `session_id`, `chain_id`,
+`active_segment_id`, `provider_name`, `storage_type`, and `jsonl_path`." The
+journal format (§4 lines 330-347) records `session_id`, `chain_id`,
+`active_segment_id`, `provider_name`, `storage_type`, `jsonl_path`,
+`preimage_sha256`, `postimage_sha256`, `canonical_records_path`,
+`db_state_pending`, and `expected_turn_count`. The §4 closing prose makes the
+authority explicit: "`chain_id`, `active_segment_id`, `provider_name`, and
+`storage_type` are resolved before transcript mutation and frozen in the
+journal. The `canonical_records_path` file is written before the transcript
+rename and is the recovery source of truth for rebuilding `session_turns`;
+recovery must not re-read the postimage transcript and infer DB rows from
+provider-rendered bytes."
 
-Rev 2 §4 / §6 / §8 / §9 / §13 introduce a durable replace journal at
-`<state-data-dir>/replace_journal/session-<session_id>.pending`. §4 sequences
-journal write before lock acquire, journal-with-fsync before transcript
-mutation, and journal delete with directory fsync after DB transaction
-commit. §6 startup recovery scans `<state-data-dir>/replace_journal/`,
-compares the canonical export hash of the on-disk transcript to the
-journal's `preimage_sha256` / `postimage_sha256`, and reconciles
-deterministically (re-apply DB idempotently if postimage; clear journal if
-preimage; quarantine if neither). §8 crash states 4–8 enumerate the recovery
-behavior for the post-rename/pre-DB window that Round 1 audit flagged.
+**Canonical postimage material persisted before mutation.** §4 step 1 now
+requires the validator to write normalized canonical records to
+`<state-data-dir>/replace_journal/session-<session_id>.canonical.jsonl`,
+fsync that file plus the journal plus the `replace_journal` directory, all
+before lock acquisition or transcript mutation. §6 startup recovery step 4
+explicitly says recovery rebuilds `session_turns` rows from
+`canonical_records_path` rather than re-parsing the post-rename provider
+transcript and inferring rows from native bytes. This is exactly the
+"persist enough canonical postimage material" requirement Round 2 asked for.
 
-Supported-surface effects of the closure:
+**Verification-before-deletion ordering.** Rev 2 deleted the journal
+immediately after the SQLite transaction committed and then computed
+`postimage_sha256` against the committed transcript. Rev 3 §4 success flow
+inverts the dependency:
 
-- New private filesystem path: `<state-data-dir>/replace_journal/`. This is
-  a sibling directory to existing state-DB layout (`state.db`, `locks/`).
-  No public CLI flag exposes it; §6 calls it private implementation state.
-  Cohort A / B do not gain or need to read this directory.
-- Receipt JSON shape is unchanged from Round 1; the journal does not leak
-  into stdout. Cohort A consumers parse the same fields.
-- The per-startup recovery scan changes the no-op latency profile of any
-  command that triggers it. §6 says "scans `<state-data-dir>/replace_journal/`
-  on startup and reconciles pending replace operations before normal session
-  resolution work relies on derived rows." The scope of "on startup" is not
-  pinned to a specific entry point — it could mean "every `agents` binary
-  invocation" or "every command that performs session resolution" or "only
-  `agents session import-replace` startup." This ambiguity is non-terminal
-  but is a Phase 6 hookpoint question; see R2-F01.
-- Manual recovery commands (`agents migrate-db --recover`,
-  `agents session import-replace --recover`) remain anti-scope (§6 / §12 /
-  §13). UNCOUPLED status of `agents migrate-db` from Round 1 is preserved.
-- Quarantine behavior on hash-mismatch (§6 step 6, §8 crash state 8) is a
-  fail-safe leave-alone with a renamed journal marker. Cohort A does not get
-  silent overwrite of its transcript on ambiguous state. Round 1's Concern 4
-  rollback story is unchanged.
+| Rev 3 success-flow step | Verification gate |
+| --- | --- |
+| 6 | Begin SQLite transaction; replace `session_turns` from `canonical_records_path`; do not commit. |
+| 7 | Compute `postimage_sha256` from new transcript through canonical reader; compare to journal's recorded hash. Mismatch → SQLite rollback, exit `1`, journal + canonical records preserved. |
+| 8 | Run fresh export verification (parse new transcript, compare bytes to `canonical_records_path`). Mismatch → SQLite rollback, exit `1`, journal + canonical records preserved. |
+| 9 | Commit SQLite transaction. |
+| 10 | Idempotent unlink of journal and canonical records file; fsync `replace_journal` directory. |
 
-Closure verdict: **real and complete on the supported surface.** Recovery
-is now deterministic for the audit-flagged window. One bounded ambiguity
-(startup-recovery scope) captured under R2-F01.
+This satisfies "verification before deletion" and the "leaves/quarantines on
+failure" alternative. The §4 closing prose is now consistent with §6 / §8
+quarantine: "Any failure in success-flow steps 3-9 leaves the journal plus
+canonical records file in place; that journal is the recovery signal."
 
-### AIR-R1-F03 — lock observation outside cooperative surface — CLOSED
+**T-rows for recovery scenarios.** §9.1 adds four explicit T-rows that match
+the Round 2 required test:
 
-Rev 2 §13 row "Lock observation for import-replace once pause-handshake
-lands" now reads: "06-pause-handshake's PR #17 supplies the lock primitive
-dependency. Lock observation by writer paths (`run_repl`, `run_resume`,
-balanced one-shot, `migrate_chain_segment`) is a sibling-PR concern per
-06-pause-handshake's PR #17 narrowed harness acceptance. v1 import-replace
-observes locks; concurrent runner writers observe per their own retrofit
-timeline. The harness consumer of v1 should treat `session-busy` as advisory
-until full retrofit lands."
-
-This is the contract-prose tightening Round 1 R1-F01 recommended for the
-§13 row. The in-binary writers are now named explicitly, the deferral is
-attributed to PR #17, and the harness is told to treat `session-busy` as
-advisory. From the supported-surface lens this is the correct evolution
-shape: cooperative-lock contract is bounded by sibling-PR retrofits, and
-the harness as orchestrator absorbs the v1 caveat.
-
-Carryover gap: §12 residual #3 still reads "Running invocation rows are not
-treated as authoritative busy locks. The supported cross-process signal is
-`SessionLock`; non-cooperating external provider processes remain outside
-this contract." Round 1 R1-F01 specifically asked for §12 prose to name the
-in-binary writers. §13 names them; §12 still does not. This is non-terminal
-because §13 carries the explicit contract — but it is the same prose
-inconsistency Round 1 raised. Carried as R2-F03.
-
-Cohort-A orchestrator note also recommended by R1-F01 was not added to
-§11.1 in Rev 2. §11.1 cohort prose still treats `agent-harness` as "primary
-consumer" without a sentence that the harness is expected to be the sole
-orchestrator of `agents` invocations against any session it is actively
-replacing. Same severity as the §12 prose gap; carried as R2-F03.
-
-Closure verdict: **closed at the cross-feature constraint table (§13)** but
-the §12 / §11.1 prose carryover persists. Non-terminal — the harness reads
-§13 as the contract and the orchestrator role is implied by "advisory until
-full retrofit lands."
-
-### AIR-R1-F04 — canonical record field-loss ambiguity — CLOSED
-
-Rev 2 §6 (DB update API), §7 step 4 (DB consistency update), §12 (residual),
-and §13 (compliance row) explicitly enumerate the lost fields:
-`parent_turn_id`, `is_sidechain`, and `is_compaction_boundary` are written as
-`NULL` or schema defaults in `session_turns` after a replace. §7 adds:
-"This is documented data loss in v1; downstream features such as resume and
-trace should not rely on these fields after a replace." §13 row carries
-"Yes, with documented canonical-field loss." A future canonical-schema
-extension is named as the path to preserve the fields (§6, §12).
+- `T-recovery-rename-only` — kill between rename and DB commit; restart
+  recovers `session_turns` from `canonical_records_path` against frozen
+  segment identity, not via fresh resolver output. This is the Round 2
+  required test almost verbatim.
+- `T-recovery-ambiguous-hash` — corrupt transcript so it matches neither
+  hash; recovery quarantines the journal, preserves the canonical records
+  file, leaves transcript and DB untouched.
+- `T-recovery-canonical-records-preserved` — canonical records file survives
+  crash byte-for-byte equal to normalized input.
+- `T-no-deletion-before-verify` — postimage hash mismatch after rename
+  exits operationally without deleting recovery artifacts; SQLite is not
+  committed.
 
 Supported-surface effects of the closure:
 
-- The contract for cohort A / B is explicit: a session that has been
-  import-replaced will not have parent/sidechain/compaction metadata in
-  `session_turns`. Callers can plan around this rather than discovering it
-  empirically.
-- `agents resume`, `repl --resume`, `--resume`: the resolver
-  (`StateDb::resolve_resume`) reads `session_chain_segments` for active
-  segment selection, not the three lost fields directly, so resume continues
-  to find the active segment. Behavior that depends on parent_turn_id,
-  is_sidechain, or is_compaction_boundary in turn-level traversal will see
-  defaults instead. This is partial DEGRADED behavior on replaced sessions
-  only; non-replaced sessions retain full metadata.
-- `agents trace --json`: trace reads invocation rows, not these
-  `session_turns` fields directly, so trace remains PRESERVED for
-  invocation-tree shape. Any future trace features that walk turn parentage
-  on a replaced session would see defaults.
-- Cross-provider migration (`migration::migrate_chain_segment`) remains
-  UNCOUPLED.
+- Receipt JSON shape is unchanged from Rev 2 (`session_id`, `provider_name`,
+  `storage_type`, `operation`, `preimage_sha256`, `postimage_sha256`,
+  `jsonl_path`, `state_updated`, `committed_at`); cohort A parsers do not need
+  to update.
+- Two new private filesystem surfaces are introduced under the existing
+  `<state-data-dir>/replace_journal/`: the per-session canonical records file
+  (`session-<id>.canonical.jsonl`) and the quarantine subdirectory
+  (`replace_journal/quarantine/`). Both are documented as private
+  implementation state in §4 / §8 / §11.1; no public CLI flag exposes them.
+  Cohort A / B do not gain or need to read these paths.
+- Quarantine semantics on hash-mismatch (§6 step 6, §8 crash state 8) is a
+  fail-safe leave-alone: journal moved aside, canonical records preserved
+  for inspection, transcript and DB left untouched. Cohort A still has no
+  silent-overwrite risk on ambiguous state.
+- The recovery contract now explicitly preserves DB-recovery determinism
+  even when resolver-visible DB rows are stale (the AIR-R2-F01 specific
+  failure mode), because identity comes from the journal, not from a
+  re-resolution that would itself depend on the rows recovery is meant to
+  fix.
 
-§11.1 cohort C ("existing `agents repl` / `agents resume` users not using
-import-replace") remains PRESERVED unconditionally — they cannot be import-
-replaced without a caller invoking the new subcommand. Cohort C users
-*whose sessions are import-replaced by the harness* see the partial
-DEGRADED state above. This conditional partial degradation is documented in
-§7 / §12 prose; §11.1 cohort discussion does not enumerate it. Carried as
-R2-F05.
+Closure verdict: **real and complete on the supported surface.** The audit
+HIGH retires; no new unbounded blast-radius item is introduced. The two new
+private filesystem surfaces (`canonical_records_path`, quarantine directory)
+are scoped, fsynced, and documented as private. One new bounded ordering
+concern (journal write happens before lock acquire) is captured under R3-F01.
 
-Closure verdict: **real and complete on the supported surface.** The data
-loss is documented in three places (§6, §7, §12) and called out in the §13
-compliance row. One bounded cohort-discussion gap (R2-F05).
+## Concern 2 — Closures of AIR-R1-F01..F04 still standing
 
-### AIR-R1 closure summary
+Round 2 supported-surface review confirmed all four R1 closures real and
+complete on the supported surface. Rev 3 changes are restricted to the
+journal/recovery contract (§4, §6, §8, §9) plus the §1 "Rev 3 changes" log;
+no Rev 3 change touches the rendering contract, the lock contract, the
+field-loss contract, or the cooperative-lock prose. Each prior closure is
+re-verified below.
 
-| Audit finding | Closure status | Supported-surface residual |
-| --- | --- | --- |
-| AIR-R1-F01 (HIGH, native bytes) | Closed | New record-class refusal mode (R2-F02). |
-| AIR-R1-F02 (HIGH, crash recovery) | Closed | Startup-recovery scope ambiguity (R2-F01). |
-| AIR-R1-F03 (MEDIUM, lock observation) | Closed at §13 | §12 / §11.1 prose carryover (R2-F03). |
-| AIR-R1-F04 (MEDIUM, field loss) | Closed | Cohort-discussion gap (R2-F05). |
+### AIR-R1-F01 — provider-native rendering — STILL CLOSED
 
-All four closures are real and bounded on the supported surface. No
+§3 renderer contract is unchanged in Rev 3 (`CanonicalToProviderRenderer`,
+`claude_code` and `codex_session` implementations, `UnsupportedStorage` for
+`other`, `15 invalid-input-transcript` with
+`unsupported-record-class:<class>` for lossy classes,
+round-trip-through-export requirement). §1 still states: "The replacement
+transcript file does not store canonical JSONL in v1. It stores
+provider-native bytes rendered from canonical input for the resolved storage
+type." §13 compliance row "Provider transcript file receives provider-native
+bytes, not canonical bytes" is unchanged. Round 2 supported-surface evidence
+holds.
+
+### AIR-R1-F02 — durable journal recovery — STILL CLOSED (and tightened)
+
+Rev 3 expansion of the journal and the verification-before-deletion ordering
+are themselves the AIR-R2-F01 closure. The R1-F02 mechanism (durable
+journal, startup recovery, deterministic reconciliation) is preserved and
+strengthened, not retracted. Crash states 4–8 in §8 now branch through the
+expanded recovery contract; the post-rename/pre-DB window is closed and the
+post-DB/pre-deletion window is also covered (DB rollback + leave artifacts
+on verification failure). Round 2 supported-surface evidence holds; the
+closure is now stronger, not weaker.
+
+### AIR-R1-F03 — cooperative-lock contract — STILL CLOSED at §13
+
+§13 row "Lock observation for import-replace once pause-handshake lands"
+prose is unchanged in Rev 3: "v1 import-replace observes locks; concurrent
+runner writers observe per their own retrofit timeline. The harness consumer
+of v1 should treat `session-busy` as advisory until full retrofit lands."
+Round 2 noted that §12 residual #3 and §11.1 cohort-A prose did not echo
+this; Rev 3 also did not update those two locations. The contract is still
+unambiguous to a §13 reader (the supported-surface contract source of
+truth), so the closure stands; the prose carryover is re-registered as
+R3-F03 below (same content as R2-F03).
+
+### AIR-R1-F04 — canonical record field-loss — STILL CLOSED
+
+§6 DB update API, §7 step 4, §12 residual, and §13 compliance row are
+unchanged in Rev 3. Replaced sessions still write `parent_turn_id`,
+`is_sidechain`, and `is_compaction_boundary` as `NULL` or schema defaults;
+§9.1 T-row "DB metadata loss is explicit" is unchanged. The R2-F05 cohort-C
+prose gap (§11.1 does not enumerate the partial DEGRADED state) is also
+unchanged in Rev 3 and is re-registered as R3-F05 below.
+
+### AIR-R1 closure summary (Rev 3)
+
+| Audit finding | Round 2 status | Rev 3 status | Supported-surface residual |
+| --- | --- | --- | --- |
+| AIR-R1-F01 (HIGH, native bytes) | Closed | Still closed | Renderer record-class scope (R3-F02). |
+| AIR-R1-F02 (HIGH, crash recovery) | Closed | Tightened by AIR-R2-F01 closure | Startup-recovery scope ambiguity (R3-F01b carry of R2-F01). |
+| AIR-R1-F03 (MEDIUM, lock observation) | Closed at §13 | Still closed at §13 | §12 / §11.1 prose carryover (R3-F03). |
+| AIR-R1-F04 (MEDIUM, field loss) | Closed | Still closed | Cohort-C prose gap (R3-F05). |
+| AIR-R2-F01 (HIGH, journal underspecified / cleared early) | n/a (Round 2) | Closed | New ordering note: journal write before lock (R3-F01a). |
+
+All five closures are real and bounded on the supported surface. No
 termination signal fires from the closure check.
 
-## Concern 2 — Fresh assessment of Rev 2 changes (assumption / net-value)
+## Concern 3 — Race-free check on the Rev 3 expanded journal + reordered flow
 
-### Assumption register (Rev 2)
+The Round 3 obligation specifically asks whether the Rev 3 expanded journal
+and reordered flow are race-free for the documented threat model. The
+documented threat model (R1-F03 / §13 / §11.1) is:
 
-Rev 2 §1.1 republishes A1–A10 with two material changes vs Round 1:
+- Cooperative-lock surface keyed by `SessionLock` for the resolved active
+  provider session id.
+- v1 in-binary writer paths (`run_repl`, `run_resume`, balanced one-shot,
+  `migration::migrate_chain_segment`) retrofit on PR #17's timeline; until
+  retrofit, `session-busy` is advisory.
+- Cohort A (`agent-harness`) is the primary consumer and is expected to be
+  the sole orchestrator of `agents` invocations against any session it is
+  actively replacing.
 
-- A3's evidence row is rewritten: "The on-disk replacement bytes are
-  provider-native renderings of that canonical input." Round 1 A3 said
-  canonical input is the export `CanonicalRecord` family; Rev 2 A3 keeps
-  that and additionally pins the on-disk byte family to provider-native.
-  This is the explicit byte-family clarification AIR-R1-F01 asked for and
-  Round 1 A3 already implicitly held.
-- A8's invariant tightens from "two-phase replace ordering" to "must use a
-  durable pending-operation journal to make startup recovery deterministic."
-  This makes A8 a load-bearing claim for AIR-R1-F02's closure and shifts
-  A8's invalidator to "a prior feature lands an equivalent durable
-  transcript-replace journal used by import-replace."
+Under that threat model, the Rev 3 sequencing is race-free. The argument is
+walked through both the success path and each crash window:
 
-A1, A2, A4, A5, A6, A7, A9, A10 are unchanged in their substantive content.
-All ten **HOLD** under the same evidence Round 1 cited.
+### Success path under documented threat model
 
-The Round 1 A5 fail-stop hedge ("If Phase 5 hookpoints prove provider-native
-renderers cannot consume that canonical byte stream directly, stop and
-revise") is no longer needed because Rev 2 has chosen the renderer path
-and committed to the provider-native disk format. A5 in Rev 2 reads cleanly:
-"`claude_code` and `codex_session` are supported; `other` is refused in
-v1," with the renderer module supplying the conversion.
+1. **Pre-mutation hashing window (steps 1-12 of pre-mutation).** Pre-image
+   hashing occurs both before lock acquire (to fail fast on caller-supplied
+   `--preimage-sha256`) and after lock acquire (success-flow step 3, the
+   under-lock TOCTOU re-check). Round 1 noted the second check closes the
+   stale-preimage gap; Rev 3 preserves it. No new race surface introduced.
+2. **Journal write under expected-postimage hash.** §4 success-flow step 1
+   computes the expected `postimage_sha256` over the normalized canonical
+   input stream and stores it in the journal before mutation. This means
+   recovery can detect both "rename landed" (transcript hash equals stored
+   postimage) and "rename did not land or rolled back" (transcript hash
+   equals stored preimage) without re-parsing intent from on-disk bytes.
+3. **Renamed-but-not-committed window.** Steps 5-9 hold the lock. The
+   SQLite transaction is begun but uncommitted until both verifications
+   pass. A concurrent same-session caller is excluded by `SessionLock`
+   under the cooperative threat model; non-cooperating external writers
+   are residual per §12.
+4. **Post-commit-pre-deletion window.** Step 10 deletes the journal and
+   canonical records file only after step 9 commits the SQLite transaction.
+   A crash here leaves both the durable post-DB state on disk and the
+   journal pointing at a postimage-matching transcript; recovery (§6 step
+   4) re-applies the DB update idempotently from `canonical_records_path`
+   and deletes the artifacts, leaving identical durable state.
+5. **Lock release and receipt.** Steps 11-12 release the lock and emit the
+   receipt; the durable contract ends at step 10.
+
+No verification step happens after deletion. No deletion happens before
+verification. The verification + deletion chain is monotonic and audit-
+visible.
+
+### Crash windows under documented threat model
+
+| Crash point | Recovery action | Determinism guarantee |
+| --- | --- | --- |
+| Before journal + canonical records write | None needed (no journal exists) | Fine. |
+| After journal write, before lock acquire | Recovery sees journal; transcript hash equals preimage; recovery deletes journal + canonical records file | §6 step 5. |
+| After lock acquire, before temp write | Same as above; under-lock preimage matches; no transcript mutation | §6 step 5. |
+| After temp write before rename | Same as above; rename did not land | §6 step 5. |
+| After rename, before SQLite begin | Transcript hash equals postimage; recovery rebuilds `session_turns` from `canonical_records_path` against frozen segment identity, refreshes chain/segment recency, deletes artifacts | §6 step 4 / §8 crash state 4. |
+| During SQLite txn (uncommitted) | SQLite rolls back; same as "after rename, before SQLite begin" on next start | §8 crash state 5. |
+| After SQLite commit, before deletion | Recovery re-applies idempotently; deletes artifacts | §6 step 4 / §8 crash state 6. |
+| After deletion, before lock release | No journal; lock leases expire per `SessionLock`; durable state equals post-commit | Fine. |
+| Ambiguous hash (transcript mutated externally between rename and recovery) | Recovery moves journal to quarantine, preserves canonical records, leaves DB untouched | §6 step 6 / §8 crash state 8 / §9.1 `T-recovery-ambiguous-hash`. |
+| Postimage hash mismatch under lock (verification step 7 fails) | SQLite rollback; journal + canonical records preserved; exit `1`; next-start recovery either re-applies or quarantines depending on disk hash | §4 step 7 / §9.1 `T-no-deletion-before-verify`. |
+| Fresh export verification mismatch under lock (step 8 fails) | Same as above; this is the AIR-R2-F01 specific window now closed | §4 step 8. |
+
+Every crash window has a deterministic recovery rule, and every recovery
+rule reads identity from the journal rather than rediscovering it through
+DB state that may itself be the artifact recovery is meant to fix.
+
+### Boundary call-out: outside the documented threat model
+
+The Rev 3 ordering writes the journal and canonical records file **before**
+acquiring `SessionLock`. Under the documented threat model (single-
+orchestrator cohort A, advisory busy), this ordering is race-free. Outside
+that threat model — specifically, two concurrent invocations of
+`agents session import-replace <same-session-id>` from a non-cooperating
+caller without orchestration — the journal-before-lock ordering admits a
+narrow race window:
+
+- Process A writes journal + canonical records (fsync), starts lock acquire.
+- Process B writes journal + canonical records (fsync), overwriting A's
+  pending journal and canonical records at the same per-session paths,
+  starts lock acquire.
+- Process A wins the lock; B fails with busy and per §4 step 2 "may unlink
+  the journal and canonical records file idempotently before exit."
+- A continues mutation against in-memory state, but the on-disk journal /
+  canonical records file now reflect B's intent, not A's.
+- If A then crashes after rename and before deletion, recovery reads B's
+  journal hashes and B's canonical records file, applies B's DB rows
+  against A's transcript, producing inconsistent state.
+
+This is bounded by the documented threat model: cohort A is the sole
+orchestrator, advisory busy is acceptable for v1, and concurrent same-
+session attempts are not in the contract. The cohort-A note R2-F03 already
+asks for §11.1 to make this orchestrator role explicit. Re-registered as
+R3-F01 below; non-terminal because (a) it is outside the documented threat
+model, (b) `SessionLock` is the supported cross-process serialization
+primitive, and (c) the cleaner fix (acquire lock before journal write,
+write journal under lock, idempotent unlink remains for handled in-flow
+errors) is a Phase 6 implementation choice, not a contract change.
+
+**Verdict for Concern 3: race-free under the documented threat model.** The
+expanded journal carries enough frozen identity for deterministic recovery;
+the reordered verification-before-deletion sequence preserves the journal
+through every failure mode the proposal documents. One non-terminal
+ordering note (R3-F01) is registered for Phase 6.
+
+## Concern 4 — Fresh assessment of Rev 3 changes (assumption / net-value)
+
+### Assumption register (Rev 3)
+
+Rev 3 §1.1 republishes A1–A10. A1, A2, A3, A4, A5, A6, A7, A9, A10 are
+unchanged in their substantive content. A8's invariant in Rev 3 reads:
+"Crash recovery cannot make filesystem rename and SQLite update one
+physical transaction, so import-replace v1 must use a durable
+pending-operation journal to make startup recovery deterministic." This is
+verbatim Rev 2's tightening; Rev 3 adds the canonical_records_path and
+verification-before-deletion specifics to satisfy A8 rather than restate
+it. A8 still **HOLDS** under the same evidence (current migration code does
+not have a pending-op table; no equivalent durable transcript-replace
+journal landed in another sibling feature).
+
+All ten **HOLD** under Rev 3 evidence.
 
 **Termination signal #1 (`assumption_invalidated`) does not fire.**
 
-### Net value (Rev 2 vs Rev 1 vs current state)
+### Net value (Rev 3 vs Rev 2 vs Rev 1 vs current state)
 
-Round 1 retired ten distinct problem-map entries; Rev 2 retains all ten and
-adds two more closures from problem-map §2 / §3:
+Round 2 retired twelve problem-map entries; Rev 3 retains all twelve and
+additionally retires the problem-map entry that AIR-R2-F01 surfaced as
+unfinished business (deterministic post-rename DB recovery from journal
+identity rather than from potentially stale resolver state):
 
-| Additional problem-map entry | Retired by Rev 2 |
+| Additional retirement | Retired by Rev 3 |
 | --- | --- |
-| §2 #7 / §2 #10 No durable transaction marker / pending-op table for replace recovery | §4 / §6 / §8 durable replace journal at `<state-data-dir>/replace_journal/`. |
-| §2 #11 No two-phase sequence with temp write + fsync + rename + DB update under one recovery boundary | §4 / §6 / §8 sequence with journal as the recovery boundary. |
+| AIR-R2-F01 underlying gap: post-rename DB recovery cannot rely on stale resolver context | §4 step 8 frozen identity + `canonical_records_path` (§6 step 4 recovery from canonical records, §9.1 `T-recovery-rename-only`). |
 
-Twelve problem-map entries retired total.
+Thirteen problem-map / audit entries retired total against pre-Rev-1 state.
 
-Blast-radius items vs Round 1:
+Blast-radius items vs Round 2:
 
-| Blast-radius item | Round 1 status | Rev 2 status |
+| Blast-radius item | Round 2 status | Rev 3 status |
 | --- | --- | --- |
-| Wrong canonical bytes written under a valid lock | Bounded | Bounded (§3 / §5 / §6 unchanged). |
-| Caller-supplied preimage stale by acquisition time | Bounded | Bounded (§4 step 14 second under-lock check). |
-| Crash after rename before DB commit | Residual (recovered via next ingestion / migrate-db / repeat) | **Closed by durable journal + startup recovery** (§4 / §6 / §8). |
-| Stale temp files in transcript dir | Bounded (R1-F02 cosmetic) | Bounded (carryover R2-F04). |
-| Codex canonical→canonical writeback round-trip | Phase-5 fail-stop | Replaced by Codex renderer scope; deferral becomes "explicit unsupported-storage refusal if renderer absent" (§9.1 last row). |
-| In-binary writers not honoring `SessionLock` | Residual (R1-F01) | **Tightened at §13** ("advisory until full retrofit lands"); §12 / §11.1 prose carryover (R2-F03). |
+| Wrong canonical bytes written under a valid lock | Bounded | Bounded (§3 / §6 unchanged). |
+| Caller-supplied preimage stale by acquisition time | Bounded | Bounded (§4 success-flow step 3 second under-lock check). |
+| Crash after rename before DB commit | Closed by durable journal + startup recovery | **Closed deterministically** via frozen identity in journal + canonical_records_path (§4, §6 step 4). |
+| Crash after DB commit before journal deletion | Bounded (re-apply idempotent) | **Closed**: §4 step 10 unchanged but verification-before-deletion ordering means a hash mismatch leaves recovery artifacts (§9.1 `T-no-deletion-before-verify`). |
+| Postimage hash mismatch under lock | Implicit operational error | **Explicit**: §4 step 7 names the rollback / leave-artifacts behavior. |
+| Fresh export verification mismatch | Not addressed | **Explicit**: §4 step 8 names the rollback / leave-artifacts behavior. |
+| Stale temp files in transcript dir | Bounded (R2-F04 cosmetic) | Bounded (R3-F04 carryover). |
+| In-binary writers not honoring `SessionLock` | Tightened at §13 | Tightened at §13 (unchanged); §12 / §11.1 prose carryover (R3-F03). |
+| Provider-native renderer record-class scope | Bounded by `15 invalid-input-transcript` (R2-F02 cohort-A note) | Bounded (R3-F02 carryover). |
+| Startup-recovery scope on every `agents` invocation | Bounded but ambiguous (R2-F01 hookpoint) | Bounded but ambiguous (R3-F01b carryover). |
+| Replaced-session metadata loss on resume / trace | Bounded by §6 / §7 / §12 (R2-F05 cohort gap) | Bounded (R3-F05 carryover). |
+| **NEW** Journal write before lock acquire | n/a | Bounded by cohort-A orchestrator threat model (R3-F01a). |
+| **NEW** Quarantine subdirectory | n/a | Bounded private filesystem state under existing data-dir (§6 step 6 / §8). |
 | Receipt lost after commit | Bounded (export+hash recovery) | Bounded (§12 residual #6 unchanged). |
 | `migrate-db` / `migrate_chain_segment` adjacency | UNCOUPLED | UNCOUPLED unchanged. |
-| **NEW** Provider-native renderer record-class scope | n/a | Bounded by `15 invalid-input-transcript` + `unsupported-record-class:<class>` (R2-F02 cohort-A note). |
-| **NEW** Startup-recovery scope on every `agents` invocation | n/a | Bounded but ambiguous (R2-F01 hookpoint question). |
-| **NEW** Replaced-session metadata loss on resume / trace | n/a | Bounded by §6 / §7 / §12 explicit field-loss prose (R2-F05 cohort gap). |
 
-Twelve problem-map entries retired; eight existing blast-radius items
-preserved or tightened; three new bounded blast-radius items added. Net
-value remains unambiguously positive: the closures of AIR-R1-F01 and
-AIR-R1-F02 each retire a HIGH-severity audit gap, and the new items are
-bounded by structured exit codes (`12`, `15`), explicit deferral language,
-or non-public filesystem state.
+Thirteen problem-map / audit entries retired; nine existing blast-radius
+items preserved or tightened; three new blast-radius items added (two of
+which are tighter specifications of behaviors that were implicit in Rev 2,
+plus the journal-before-lock ordering note). Net value is unambiguously
+positive against (a) the v1 adapter the harness uses today, (b) the Rev 1
+supported surface, and (c) the Rev 2 supported surface.
 
 **Termination signal #2 (`non-positive-value`) does not fire.**
 
-## Concern 3 — Adjacent-path no-regression check (Rev 2)
+## Concern 5 — Adjacent-path no-regression check (Rev 3)
 
-Round 1 classified twelve adjacent paths PRESERVED, PRESERVED + REUSED, or
-UNCOUPLED. Rev 2 changes that affect adjacency are:
+Rev 3 changes are restricted to §4 (success flow + journal format), §6
+(startup recovery), §8 (side-effect contract / crash states), and §9.1
+(four new T-rows). No change touches §1 scope, §2 CLI surface, §3 input
+validation / rendering, §5 exit codes, §7 DB consistency contract, §10
+README, §11 supported-surface customer cohort prose, §12 residuals, or §13
+constraint compliance. The adjacent-path table from Round 2 is unchanged.
 
-1. **Provider-native renderer** changes nothing about how `agents resume`,
-   `repl --resume`, top-level `--resume`, direct `claude`, or direct `codex`
-   read transcript files. They continue to see native bytes. Verdict
-   unchanged: PRESERVED.
-2. **Durable replace journal** under `<state-data-dir>/replace_journal/` is
-   a new sibling to `state.db` and `locks/`. No existing CLI command reads
-   or writes this path. `agents migrate-db` does not consume the journal in
-   v1 (§13 anti-scope). Verdict for `migrate-db`: UNCOUPLED unchanged.
-3. **Startup recovery scan** is the one Rev 2 change with potential adjacent
-   effect: any `agents` command path that triggers the scan absorbs the
-   scan's latency and may see the journal's idempotent DB update applied
-   before its own session resolution. For non-pending journals (the common
-   case) this is an empty directory listing — negligible cost. For pending
-   journals, recovery is the correct behavior even from cohort C's
-   perspective: a stale `session_turns` view that has not been reconciled
-   would otherwise mislead `agents resume`. Net: this is a corrective
-   adjacency, not a regression. Phase 6 should still pin the trigger scope
-   (R2-F01).
-4. **`session_turns` field-loss on replaced sessions** is a conditional
-   DEGRADED state for `agents resume`, `repl --resume`, `--resume`, and
-   `trace --json` — but only on sessions that have been import-replaced.
-   Sessions that have never been replaced retain full metadata. Verdict for
-   resume / repl / trace: PRESERVED for non-replaced sessions; partial
-   DEGRADED for replaced sessions. Round 1 row updated below.
-5. **`migration::migrate_chain_segment`** is unchanged by Rev 2; does not
-   call the journal, does not consume the renderer, does not observe
-   import-replace's lock. Verdict: UNCOUPLED unchanged.
-6. **GUI / Tauri** is unchanged by Rev 2; `<state-data-dir>/replace_journal/`
-   sits under the same default state root as 06-pause-handshake's `locks/`,
-   so the existing GUI/CLI state-DB-location divergence (problem map §4 #12)
-   is unchanged in scope.
-
-Updated adjacent-path table for Rev 2:
-
-| Path | Verdict | Evidence |
+| Path | Verdict | Evidence (Rev 3 delta) |
 | --- | --- | --- |
-| `agents resume`, `repl --resume`, top-level `--resume` | PRESERVED for non-replaced sessions; partial DEGRADED for replaced sessions on parent_turn_id / is_sidechain / is_compaction_boundary | §1 / §11.1; §6 / §7 explicit field-loss; R2-F05 cohort gap. |
-| `agents trace --json` | PRESERVED for invocation-tree; partial DEGRADED for any future per-turn parentage feature on replaced sessions | §11.1; §6 / §7. |
-| `agents migrate-config` | UNCOUPLED | §1 / §11.1. |
-| `agents migrate-db` | UNCOUPLED | §11.1; not auto-called; no consumer of the journal in v1. |
-| Hidden `agents resume-list` | PRESERVED | Not referenced by import-replace. |
-| Direct CLI `claude` / `codex` | PRESERVED | §1; provider files receive provider-native bytes via renderer. |
-| `agents session locate` | PRESERVED + REUSED | A1 / §4 step 6. |
-| `agents session schema-probe` | PRESERVED + REUSED | §4 step 5. |
-| `agents session export` | PRESERVED + REUSED | A3 / §3 / §6 round-trip oracle still holds for `postimage_sha256`. |
-| `agents session pause-handshake` / `resume-handshake` | PRESERVED + REUSED | §4 D1; same `SessionLock` lock-dir convention. |
-| `migration::migrate_chain_segment` | UNCOUPLED | §11.1. |
-| GUI / Tauri command surface | UNCOUPLED | §1 / §11.1; no GUI surface added in v1. |
+| `agents resume`, `repl --resume`, top-level `--resume` | PRESERVED for non-replaced sessions; partial DEGRADED for replaced sessions on parent_turn_id / is_sidechain / is_compaction_boundary | Rev 3 unchanged. |
+| `agents trace --json` | PRESERVED for invocation-tree; partial DEGRADED for any future per-turn parentage feature on replaced sessions | Rev 3 unchanged. |
+| `agents migrate-config` | UNCOUPLED | Rev 3 unchanged. |
+| `agents migrate-db` | UNCOUPLED | Rev 3 unchanged; journal still not consumed by `migrate-db`; manual-recovery flag still anti-scope (§13). |
+| Hidden `agents resume-list` | PRESERVED | Rev 3 unchanged. |
+| Direct CLI `claude` / `codex` | PRESERVED | Rev 3 unchanged; provider files still receive provider-native bytes. |
+| `agents session locate` | PRESERVED + REUSED | Rev 3 unchanged. |
+| `agents session schema-probe` | PRESERVED + REUSED | Rev 3 unchanged. |
+| `agents session export` | PRESERVED + REUSED | Rev 3 strengthens use as round-trip oracle: §4 step 8 fresh-export verification before commit means callers get more reliable round-trip semantics post-replace. |
+| `agents session pause-handshake` / `resume-handshake` | PRESERVED + REUSED | Rev 3 unchanged. |
+| `migration::migrate_chain_segment` | UNCOUPLED | Rev 3 unchanged. |
+| GUI / Tauri command surface | UNCOUPLED | Rev 3 unchanged; new private `quarantine/` subdirectory is under same default state root, no GUI surface added. |
 
-Zero BROKEN paths. The two paths that move from "PRESERVED" to "PRESERVED
-for non-replaced sessions; partial DEGRADED for replaced sessions" do so
-because of an opt-in mutation cohort A explicitly invokes. This is not a
-regression of the pre-PR surface — it is a documented bounded effect of the
-new mutation surface.
+Zero BROKEN paths. The two paths carrying conditional partial DEGRADED for
+replaced sessions only (R1 / R2 / R3 unchanged) remain bounded by opt-in.
+The new private `replace_journal/quarantine/` subdirectory introduces no
+public-CLI adjacency; cohort A / B do not need to read it. `agents export`
+adjacency is materially strengthened by the Rev 3 fresh-export verification
+gate before SQLite commit (§4 step 8): the round-trip oracle now blocks the
+SQLite commit on its own success.
 
-## Concern 4 — Migration / rollback / observability (Rev 2 deltas)
+## Concern 6 — Migration / rollback / observability (Rev 3 deltas)
 
-**No user state one-shot.** Rev 2 §11.1 unchanged: "no user state one-shot
-is required before using this command when schema-probe reports
-compatibility." The new `<state-data-dir>/replace_journal/` directory is
-created on demand by import-replace; existing installs without that
-directory are not affected by its absence. Existing partial DBs still
-return not-found (`10`).
+**No user state one-shot.** Rev 3 §11.1 unchanged. The new
+`<state-data-dir>/replace_journal/quarantine/` subdirectory is created on
+demand by recovery; existing installs without it are not affected by its
+absence. The new `canonical_records_path` file lives inside the existing
+`<state-data-dir>/replace_journal/` and follows the same on-demand creation
+pattern as the pending journal.
 
-**Rollback.** Two paths from Round 1 are preserved and one is added:
+**Rollback.** Three paths from Round 2 are preserved:
 
-1. PR-level rollback: Rev 2 adds new modules (`session_replace/render/`,
-   `replace_journal/` private directory under state-data-dir) but no DB
-   schema, so `git revert` is still clean at the binary level. A
-   `replace_journal/` directory left on disk after revert is benign — it
-   contains only `.pending` JSON files that nothing else reads.
+1. PR-level rollback: Rev 3 adds no DB schema and no public-CLI surface
+   delta. `git revert` remains clean at the binary level. Leftover
+   `replace_journal/` and `replace_journal/quarantine/` directories on disk
+   after revert are benign — they contain only `.pending` JSON and
+   `.canonical.jsonl` files that nothing else reads.
 2. Operation-level rollback: re-import the prior canonical transcript with
-   the current postimage as preimage. Unchanged from Round 1.
-3. **NEW** Crash-window rollback: if the binary crashes between
-   `agents session import-replace` rename and DB commit, the next
-   `agents` startup runs recovery (§6) and either (a) re-applies the DB
-   update idempotently and clears the journal, (b) clears the journal if
-   the on-disk transcript still hashes to the preimage, or (c) quarantines
-   the journal entry for operator action. Cohort A no longer needs to run
-   manual recovery for the audit-flagged window.
+   the current postimage as preimage. Unchanged from Round 2.
+3. Crash-window rollback: identical to Round 2 in shape, strengthened by
+   Rev 3's verification-before-deletion ordering. Cohort A no longer needs
+   to run manual recovery for the audit-flagged windows; ambiguous-hash
+   cases land in `quarantine/` for explicit operator inspection rather
+   than touching transcript or DB.
 
-**Observability.** Receipt JSON shape is unchanged from Round 1; cohort A
-parsers do not need to update. The new journal file is private (§4 prose:
-"The journal is private implementation state, not a public receipt log.").
-Stderr structured JSON still covers every domain failure (§5). `committed_at`
-remains a post-DB-commit timestamp.
+**Observability.** Receipt JSON shape is unchanged from Round 2; cohort A
+parsers do not need to update. The journal file remains private (§4
+unchanged). Stderr structured JSON still covers every domain failure (§5).
+`committed_at` remains a post-DB-commit timestamp. Two new private
+filesystem signals are introduced: `canonical_records_path` (recovery
+source of truth for DB rebuild) and `replace_journal/quarantine/` (operator
+inspection target on hash-mismatch). Neither is a public observability
+surface; both are documented as private implementation state in §4 / §6 /
+§8 / §11.1.
 
-## Concern 5 — Harness acceptance criteria coverage (Rev 2)
+## Concern 7 — Harness acceptance criteria coverage (Rev 3)
 
-Round 1's eight bullet → §9.1 row mapping is preserved. Rev 2 §9.1 adds
-three new rows that match three Rev 2 capabilities:
+Round 2's eight bullet → §9.1 row mapping is preserved. Rev 3 §9.1 adds
+four new rows that match the four AIR-R2-F01 closure capabilities:
 
-| Rev 2 capability | §9.1 row added | Closure |
+| Rev 3 capability | §9.1 row added | Closure |
 | --- | --- | --- |
-| Provider-native rendering | "Unsupported record class" + "Postimage round-trip" updated for native-on-disk + canonical-export-hash receipt | AIR-R1-F01. |
-| Durable journal recovery | "Journal post-rename recovery" + "Journal pre-rename recovery" + "Journal ambiguous recovery" | AIR-R1-F02. |
-| Field-loss documentation | "DB metadata loss is explicit" | AIR-R1-F04. |
+| Frozen-identity journal recovery | `T-recovery-rename-only` | AIR-R2-F01 (1) + (3). |
+| Quarantine on ambiguous hash | `T-recovery-ambiguous-hash` | AIR-R2-F01 (2) ambiguous arm. |
+| Canonical records preserved across crash | `T-recovery-canonical-records-preserved` | AIR-R2-F01 (1) durability. |
+| Verification-before-deletion enforcement | `T-no-deletion-before-verify` | AIR-R2-F01 (2) verify-first. |
 
-The Round 1 caveat "in-flight sessions return exit `13`" remains covered for
-cooperative observers. Rev 2 §13 row tightens the contract prose to make
-the cooperative-only scope explicit ("advisory until full retrofit lands"),
-which is the contract clarification AIR-R1-F03 / R1-F01 asked for. Coverage
-is unchanged; clarity is improved.
+All fifteen test-intent rows in Rev 3 §9.1 map to declared behaviors in
+§3 / §4 / §5 / §6 / §7 / §8. No bullet is orphaned. The Round 1 / Round 2
+caveat "in-flight sessions return exit `13`" remains covered for
+cooperative observers; §13 prose remains the contract authority.
 
-All eleven test-intent rows (§9.1) map to declared behaviors in §3 / §4 /
-§5 / §6 / §7 / §8. No bullet is orphaned.
-
-## Concern 6 — Initiative-06 sequencing forward-compat (Rev 2)
+## Concern 8 — Initiative-06 sequencing forward-compat (Rev 3)
 
 Import-replace is still the **last** Initiative-06 feature; there is no
-downstream sibling consumer of its surface. Rev 2 changes that touch
+downstream sibling consumer of its surface. Rev 3 changes that touch
 forward-compat:
 
-- **Receipt JSON evolution.** §6 fields are unchanged; the journal is
-  private and does not enter the receipt. Future fields can still be added
-  additively. Stable consumer pin remains `operation: "import-replace"`.
-- **Reserved exit codes 16 / 17.** Unchanged: import-replace owns its own
-  lock and does not expose token-handling.
+- **Receipt JSON evolution.** §6 fields are unchanged. Stable consumer pin
+  remains `operation: "import-replace"`. The expanded journal is private
+  and does not enter the receipt; future fields can still be added
+  additively.
+- **Reserved exit codes 16 / 17.** Unchanged.
 - **Cross-provider migration adjacency.** UNCOUPLED unchanged. A future
   refactor that lifts the renderer + atomic-replace primitive +
-  replace_journal into `migration::migrate_chain_segment` is allowed but
-  not required.
+  replace_journal + quarantine into `migration::migrate_chain_segment` is
+  allowed but not required.
 - **Future canonical-schema extension** (parent_turn_id, is_sidechain,
-  is_compaction_boundary). §6 / §12 explicitly leave room for this; a later
-  feature can extend `CanonicalRecord` and `session_turns` storage without
-  changing the import-replace public CLI shape.
-- **Future manual recovery CLI.** Round 1 noted §8 D5 left space for a
-  follow-up to add a journal table; Rev 2 has now added the journal but
-  kept manual recovery commands (`agents migrate-db --recover`,
-  `agents session import-replace --recover`) as anti-scope. A subsequent
-  feature can layer the manual recovery flag without changing the v1 CLI
-  surface.
-- **Provider renderer scope expansion.** A future feature can add a
-  renderer for an additional storage type or for additional record classes
-  within Claude / Codex without changing the v1 CLI surface; existing
-  callers still see `15 invalid-input-transcript` for currently-unsupported
-  classes.
+  is_compaction_boundary). §6 / §12 explicitly leave room for this.
+- **Future manual recovery CLI.** Anti-scope confirmed at §12 / §13.
+  `agents migrate-db --recover` and `agents session import-replace
+  --recover` can be layered without changing v1 CLI shape. The Rev 3
+  quarantine path gives a future CLI a stable input directory to drain.
+- **Provider renderer scope expansion.** Unchanged.
+- **Journal schema versioning.** §4 journal format pins
+  `schema_version: 1`; §6 step 2 says recovery should "ignore files whose
+  `operation` is not `"import-replace"` or whose `schema_version` is
+  unsupported." This gives forward extension room (e.g. adding optional
+  fields for fcntl-style cross-process exclusion or future renderer
+  record-class metadata) without breaking existing recovery code.
 
-No forward-compat hazard. Five additive evolution paths are open.
+No forward-compat hazard. Six additive evolution paths are open.
 
-## Concern 7 — Cohort-specific concerns (Rev 2)
+## Concern 9 — Cohort-specific concerns (Rev 3)
 
-**Cohort A: `agent-harness` (primary consumer).** §11.1 unchanged. Rev 2
-benefits cohort A in three ways: (a) provider-native disk format means the
-harness no longer needs to run the canonical-bytes-on-disk experiment with
-`agents resume` and risk silent breakage; (b) durable journal closes the
-post-rename/pre-DB recovery window the harness would otherwise have had to
-detect manually; (c) §13 explicit "advisory until full retrofit lands"
-bounds the cooperative-lock contract for the harness's orchestrator role.
-Rev 2 narrows cohort A in one way: any harness session whose canonical
-transcript contains record classes that the renderer cannot represent
-losslessly will now refuse with `15 invalid-input-transcript`. Cohort A
-discovers this at first refusal rather than via silent data corruption,
-which is a strict positive even though it narrows effective coverage.
+**Cohort A: `agent-harness` (primary consumer).** §11.1 cohort prose
+unchanged. Rev 3 strengthens cohort A in three ways: (a) crash recovery is
+now deterministic against stale resolver state, removing the AIR-R2-F01
+risk that the harness would have had to reconcile manually; (b) postimage
+verification before SQLite commit means a successful exit `0` carries a
+stronger round-trip guarantee than Rev 2; (c) ambiguous-hash quarantine
+gives the harness a clear operator-visible signal for the rare external-
+mutation case rather than silent DB drift.
+
+Rev 3 narrows cohort A in zero new ways relative to Rev 2 — the renderer
+record-class refusal scope (R3-F02) is unchanged, and the journal-before-
+lock ordering (R3-F01) only matters under non-orchestrated concurrent
+calls, which the cohort-A contract already excludes.
 
 **Cohort B: local automation scripts using `agents session export`.**
-§11.1 unchanged. Same surface as cohort A; same renderer-scope caveat.
+§11.1 unchanged. Same surface as cohort A; same renderer-scope caveat
+(R3-F02). The journal-before-lock ordering (R3-F01) is more relevant here
+in principle since cohort B does not have a single-orchestrator
+expectation; in practice the supported-surface contract is "treat
+`session-busy` as advisory until full retrofit lands," which means cohort
+B is already advised that `SessionLock` is the supported serialization
+primitive and concurrent same-session attempts are out of scope.
 
 **Cohort C: existing `agents repl` / `agents resume` / `agents -m <model>
-<prompt>` users not using import-replace.** PRESERVED for any session never
-import-replaced. Partial DEGRADED for any session that the harness has
-import-replaced (parent / sidechain / compaction metadata defaults). This
-is an opt-in cohort transition, not a regression: cohort C cannot be
-import-replaced without a caller invoking the new subcommand. R2-F05 asks
-that §11.1 cohort C prose explicitly enumerate this conditional state.
+<prompt>` users not using import-replace.** PRESERVED for any session
+never import-replaced. Partial DEGRADED for any session import-replaced by
+an authorized caller (R3-F05 carryover prose gap).
 
-**Cohort D: GUI / Tauri users.** PRESERVED unchanged. No GUI surface added.
+**Cohort D: GUI / Tauri users.** PRESERVED unchanged.
 
 **Cohort E: direct CLI `claude` / `codex` users.** PRESERVED unchanged.
-Rev 2's renderer choice strictly improves cohort E: their tools continue to
-recognize their own native transcript format on disk after replace, which
-was implicit at best in Rev 1.
+Rev 3 strengthens this cohort indirectly: the fresh-export verification
+gate before SQLite commit (§4 step 8) means a session that would not
+round-trip through canonical reading after replace fails the import
+explicitly rather than corrupting the on-disk file.
 
-No cohort regressed. One cohort (C) gains a documented partial DEGRADED
-state for opt-in replaced sessions.
+No cohort regressed. Cohort A and Cohort E are strengthened by the Rev 3
+verification gates.
 
 ## Verdict rationale
 
 **Termination signal #1** (`assumption_invalidated`) does not fire — A1–A10
-all hold under Rev 2 evidence; A3 and A8 are tightened in ways that match
-the AIR-R1-F01 / AIR-R1-F02 closures.
+all hold under Rev 3 evidence; A8's content unchanged from Rev 2 but its
+closure mechanism is now stronger.
 
-**Termination signal #2** (`non-positive-value`) does not fire — twelve
-problem-map entries retired (two more than Round 1); two HIGH audit findings
-closed; two MEDIUM audit findings closed (one with §12 / §11.1 prose
-carryover); three new bounded blast-radius items added, each guarded by a
-structured exit, an explicit deferral, or private filesystem state. Net
-value is unambiguously positive against (a) the v1 adapter the harness uses
-today and (b) the Rev 1 supported surface.
+**Termination signal #2** (`non-positive-value`) does not fire — thirteen
+problem-map / audit entries retired (one more than Round 2); one HIGH audit
+finding closed (AIR-R2-F01); two implicit blast-radius items now explicit
+(postimage hash mismatch, fresh-export verification mismatch); three new
+items registered (journal-before-lock ordering, quarantine subdirectory,
+expanded private filesystem footprint), each guarded by frozen identity,
+private filesystem state, or the documented threat model.
 
 **Standard verdict: LOW.** Adjacent-path blast-radius is bounded — twelve
-adjacent paths, zero BROKEN, with two paths now carrying conditional partial
-DEGRADED for opt-in replaced sessions only (Concern 3). Migration / rollback
-mechanized: no schema added; uninstall is clean; operation-level rollback
-documented; crash-window rollback now closed via durable journal (Concern
-4). All eleven harness acceptance bullets covered, including three new
-journal-recovery and field-loss rows (Concern 5). Forward-compat preserved
-on receipt JSON, exit-code reservation, migration uncoupling, canonical-
-schema extensibility, manual-recovery layering, and renderer scope
-expansion (Concern 6). All five cohorts non-regressed; cohort C gains a
-documented opt-in conditional partial DEGRADED state (Concern 7).
+adjacent paths, zero BROKEN, two paths still carrying conditional partial
+DEGRADED for opt-in replaced sessions only (Concern 5). Migration /
+rollback mechanized: no schema added; uninstall is clean; operation-level
+rollback documented; crash-window rollback strengthened by verification-
+before-deletion (Concern 6). All fifteen harness acceptance bullets covered,
+including four new journal-recovery rows (Concern 7). Forward-compat
+preserved on receipt JSON, exit-code reservation, migration uncoupling,
+canonical-schema extensibility, manual-recovery layering, renderer scope
+expansion, and journal schema versioning (Concern 8). All five cohorts
+non-regressed; cohorts A and E strengthened (Concern 9). The Rev 3
+expanded journal + reordered flow is race-free under the documented threat
+model, with one non-terminal ordering note (Concern 3 / R3-F01).
 
 **Recommendation:** Phase 5 (hookpoints) and Phase 6 (implementation) may
-proceed. Five non-terminal findings below; none fires a termination
-signal. R2-F01 and R2-F02 are Phase 5 / Phase 6 hookpoint questions to pin
-during scope freeze. R2-F03 and R2-F04 are Round-1 prose carryovers
-already covered elsewhere in the document. R2-F05 is a §11.1 cohort-prose
-addition.
+proceed. Five non-terminal findings below; none fires a termination signal.
+R3-F01 is a Rev 3-specific ordering observation that Phase 6 should weigh
+against the recovery-determinism reason for journal-before-lock. R3-F02,
+R3-F03, R3-F04, R3-F05 are Round 2 carryovers (R2-F02..R2-F05 prose
+issues that Rev 3 did not touch).
 
 ## Findings
 
-- **R2-F01 (startup-recovery scope ambiguity, LOW, non-terminal)** — §6
-  step "scans `<state-data-dir>/replace_journal/` on startup and reconciles
-  pending replace operations before normal session resolution work relies
-  on derived rows" does not pin the trigger scope. This could mean (a)
-  every `agents` binary invocation, (b) every command path that performs
-  session resolution, or (c) only `agents session import-replace` itself.
-  Each interpretation has a different supported-surface profile: (a) adds
-  no-op directory-listing latency to fast read commands like `trace`; (b)
-  scopes the cost to commands that already pay session-resolution cost; (c)
-  leaves stale post-rename/pre-DB state visible to non-import-replace
-  commands until the next import-replace runs. Recommendation: Phase 5
-  hookpoint research should pin the trigger to (b) — every command path
-  whose correctness depends on `session_turns` consistency for the resolved
-  session — and Phase 6 should add a guard that no-ops the scan if
-  `<state-data-dir>/replace_journal/` is missing or empty. This is a
-  hookpoint question, not a contract question; the §6 / §8 recovery
-  semantics are correct under any of (a) / (b) / (c).
+- **R3-F01 (journal-write-before-lock ordering, LOW, non-terminal)** —
+  Rev 3 §4 success-flow step 1 writes the journal and canonical records
+  file, fsyncs both, and then step 2 acquires `SessionLock`. Under the
+  documented threat model (cohort-A single-orchestrator, advisory busy),
+  this is race-free. Outside that threat model — two concurrent
+  non-cooperating callers invoking import-replace against the same
+  session id — process B's pre-lock journal write can overwrite process
+  A's pending journal at the same per-session paths
+  (`session-<id>.pending`, `session-<id>.canonical.jsonl`); B then fails
+  the lock and per §4 step 2 "may unlink the journal and canonical records
+  file idempotently before exit," after which an A crash before step 10
+  produces a recovery from B's identity rather than A's. Recommendation:
+  Phase 6 should consider acquiring `SessionLock` first and writing the
+  journal under lock; the lock provides cross-process exclusion for the
+  same per-session paths and removes the need for step 2's "may unlink"
+  clause. Non-terminal because the contract is explicit that
+  `session-busy` is advisory in v1 and the supported cross-process
+  serialization primitive is `SessionLock`; non-cooperating concurrent
+  callers are already documented as out-of-scope (§12 residual #3, §13
+  "advisory until full retrofit lands").
 
-- **R2-F02 (renderer record-class coverage, LOW, non-terminal)** — §3's
-  renderer contract refuses lossy record classes with
+- **R3-F02 (renderer record-class coverage, LOW, non-terminal — carryover
+  of R2-F02)** — §3's renderer contract refuses lossy record classes with
   `15 invalid-input-transcript` and `unsupported-record-class:<class>`.
-  Multi-modal blocks and tool-use are listed as examples. The proposal
+  Multi-modal blocks and tool-use are listed as examples; the proposal
   does not enumerate the exact set of record classes the v1 renderer
-  supports, leaving cohort A's effective coverage as a Phase 6 implementation
-  detail. Recommendation: §11.1 add a cohort-A note that "import-replace's
-  effective session coverage in v1 is bounded by the
-  `CanonicalToProviderRenderer` implementations for `claude_code` and
-  `codex_session`; harness consumers should be prepared for
-  `15 invalid-input-transcript` on sessions whose canonical transcripts
-  contain record classes outside the v1 renderer scope, and Phase 6 should
-  publish the supported record-class list at PR time." Non-terminal because
-  the refusal is loud (exit 15 with a structured error code), but cohort A
-  needs to know the effective coverage at scope-freeze rather than discover
-  it at first refusal.
+  supports, leaving cohort A's effective coverage as a Phase 6
+  implementation detail. Recommendation: §11.1 should add a cohort-A note
+  bounding effective coverage to the v1 `CanonicalToProviderRenderer`
+  scope for `claude_code` and `codex_session`, and Phase 6 should publish
+  the supported record-class list at PR time. Non-terminal because the
+  refusal is loud (exit `15` with a structured error code).
 
-- **R2-F03 (R1-F01 prose carryover, cosmetic, non-terminal)** — Round 1
-  R1-F01 asked for two prose changes: (i) tighten §12 residual #3 to name
-  the in-binary writers (`run_resume`, `run_repl`, balanced one-shot,
-  `migration::migrate_chain_segment`) explicitly, and (ii) add a §11.1
-  cohort-A note that the harness is expected to be the sole orchestrator of
-  `agents` invocations against any session it is actively replacing. Rev 2
-  delivers an equivalent contract clarification at §13 row "Lock
-  observation" ("advisory until full retrofit lands"), but the §12 prose
-  and §11.1 cohort-A note were not updated. The contract is not ambiguous
-  to a cohort A reader who reads §13, but the §12 / §11.1 prose drift makes
-  the document internally inconsistent. Recommendation: a one-paragraph
-  edit to §12 residual #3 and one sentence in §11.1 cohort A. Non-terminal
+- **R3-F03 (R1-F01 prose carryover, cosmetic, non-terminal — carryover of
+  R2-F03)** — Rev 3 did not update §12 residual #3 to name in-binary
+  writers (`run_resume`, `run_repl`, balanced one-shot,
+  `migration::migrate_chain_segment`), nor add the §11.1 cohort-A
+  orchestrator-role sentence. The §13 row prose remains the contract
+  authority. Recommendation unchanged from R2-F03: a one-paragraph edit
+  to §12 residual #3 and one sentence in §11.1 cohort A. Non-terminal
   because §13 carries the contract.
 
-- **R2-F04 (R1-F02 cosmetic carryover, cosmetic, non-terminal)** — §4 step
-  9 still reads "Clean stale import-replace temp files in the target
-  transcript directory whose names match this feature's temp-file convention
-  and are not currently locked by another live replace operation." The §8
+- **R3-F04 (stale-temp cleanup scoping, cosmetic, non-terminal —
+  carryover of R2-F04)** — Rev 3 §4 pre-mutation step 10 still reads
+  "Clean stale import-replace temp files in the target transcript
+  directory whose names match this feature's temp-file convention and are
+  not currently locked by another live replace operation." The §8
   convention is `<jsonl_path>.tmp-import-replace-<uuid>` (per-jsonl-path),
   and Claude / Codex place many sessions' JSONLs in shared directories.
   Phase 5 / Phase 6 implementer should scope cleanup to
-  `<resolved.jsonl_path>.tmp-import-replace-*` rather than a directory-wide
-  sweep matching the feature prefix. Cosmetic — §9.1 atomic-temp/rename
-  test bound this in code; the prose is the only ambiguity.
+  `<resolved.jsonl_path>.tmp-import-replace-*` rather than a directory-
+  wide sweep matching the feature prefix. Cosmetic — §9.1 atomic-temp/
+  rename test bound this in code; the prose is the only ambiguity.
 
-- **R2-F05 (cohort-C partial-degraded prose gap, cosmetic, non-terminal)**
-  — AIR-R1-F04's closure documents parent_turn_id / is_sidechain /
-  is_compaction_boundary loss in §6 / §7 / §12 and a §13 compliance row.
-  §11.1 cohort prose does not enumerate the resulting partial DEGRADED
-  state for `agents resume` / `repl --resume` / `--resume` / `trace --json`
-  on replaced sessions. Recommendation: §11.1 cohort C add a sentence:
-  "Sessions that have been import-replaced will have parent_turn_id,
-  is_sidechain, and is_compaction_boundary set to NULL or schema defaults;
-  resume / repl / trace continue to function but downstream features that
-  walk per-turn parentage on a replaced session will see defaults until the
-  canonical schema extends." Non-terminal because the contract is
-  documented in §6 / §7 / §12 prose; the cohort discussion is the only
-  place that does not echo it.
+- **R3-F05 (cohort-C partial-degraded prose gap, cosmetic, non-terminal —
+  carryover of R2-F05)** — AIR-R1-F04's closure documents
+  `parent_turn_id` / `is_sidechain` / `is_compaction_boundary` loss in
+  §6 / §7 / §12 and a §13 compliance row. Rev 3 §11.1 cohort-C prose
+  still does not enumerate the resulting partial DEGRADED state for
+  `agents resume` / `repl --resume` / `--resume` / `trace --json` on
+  replaced sessions. Recommendation unchanged from R2-F05. Non-terminal
+  because the contract is documented in §6 / §7 / §12 prose.
+
+## Audit-history note
+
+This is a Phase 4 supported-surface gate only. I did not review or change
+an implementation; Rev 3 remains a proposal artifact. Termination signal
+is `none`; verdict is LOW; Phase 5 and Phase 6 may proceed once the audit
+track also clears AIR-R2-F01 closure (verified in Concern 1 of this
+report). The five non-terminal findings above are recommendations for
+Phase 6 prose / scoping rather than blockers.
