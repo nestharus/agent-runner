@@ -2263,6 +2263,7 @@ dependencies = [
  "clap",
  "dirs",
  "getrandom 0.2.17",
+ "libc",
  "nix",
  "regex",
  "rusqlite",
