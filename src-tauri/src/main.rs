@@ -5,8 +5,9 @@ use agent_runner_lib::config::{
 };
 use agent_runner_lib::diagnostics;
 use agent_runner_lib::executor;
+use agent_runner_lib::schema_probe::{self, ProbeError};
 use agent_runner_lib::session_metadata::{MetadataError, locate_session_metadata};
-use agent_runner_lib::state::{CompositeInvocationId, InvocationStart, StateDb};
+use agent_runner_lib::state::{CompositeInvocationId, InvocationStart, ReadOnlyOpenError, StateDb};
 use agent_runner_lib::trace::{TraceOptions, render_ascii_trace, trace_invocation_with_sessions};
 
 use clap::{Parser, Subcommand};
@@ -153,7 +154,7 @@ enum Subcommands {
         #[arg(long = "models-dir")]
         models_dir: Option<PathBuf>,
     },
-    /// Inspect metadata for a provider session.
+    /// Session inspection and compatibility commands.
     Session {
         #[command(subcommand)]
         command: SessionSubcommands,
@@ -182,6 +183,8 @@ enum SessionSubcommands {
         #[arg(long)]
         json: bool,
     },
+    /// Inspect the default state database schema and supported session features.
+    SchemaProbe,
 }
 
 #[derive(Debug)]
@@ -355,6 +358,7 @@ fn run(cli: Cli) -> Result<i32, String> {
                 SessionSubcommands::Locate { session_id, json } => {
                     run_session_locate(&session_id, json)
                 }
+                SessionSubcommands::SchemaProbe => run_session_schema_probe(),
             },
             Subcommands::ResumeList { uuid } => run_resume_list(&uuid),
             Subcommands::MigrateDb => run_migrate_db(),
@@ -466,6 +470,74 @@ fn run(cli: Cli) -> Result<i32, String> {
         working_dir.as_deref(),
         &extra_inputs,
     )
+}
+
+fn run_session_schema_probe() -> Result<i32, String> {
+    match schema_probe::run_schema_probe() {
+        Ok(report) if report.state_db.exists && !report.state_db.compatible => {
+            write_json_error(
+                "schema-incompatible",
+                &format!(
+                    "state database schema is incompatible: {}",
+                    report.state_db.path.display()
+                ),
+            )?;
+            Ok(14)
+        }
+        Ok(report) => {
+            let json = serde_json::to_string(&report)
+                .map_err(|e| format!("Failed to serialize schema probe report: {e}"))?;
+            println!("{json}");
+            Ok(0)
+        }
+        Err(error) => {
+            write_json_error("operational-error", &probe_error_message(error))?;
+            Ok(1)
+        }
+    }
+}
+
+fn probe_error_message(error: ProbeError) -> String {
+    match error {
+        ProbeError::StatePath { message } | ProbeError::Inspect { message } => message,
+        ProbeError::Open { error } => match error {
+            ReadOnlyOpenError::Missing { path } => {
+                format!("state database is missing: {}", path.display())
+            }
+            ReadOnlyOpenError::NotADatabase { path, message } => {
+                format!(
+                    "state database is not a SQLite database at {}: {message}",
+                    path.display()
+                )
+            }
+            ReadOnlyOpenError::PermissionDenied { path } => {
+                format!(
+                    "permission denied reading state database at {}",
+                    path.display()
+                )
+            }
+            ReadOnlyOpenError::WalSidecarError { path, message } => {
+                format!(
+                    "failed to read SQLite WAL sidecar for state database at {}: {message}",
+                    path.display()
+                )
+            }
+            ReadOnlyOpenError::Operational { message } => message,
+        },
+    }
+}
+
+fn write_json_error(code: &str, message: &str) -> Result<(), String> {
+    let value = serde_json::json!({
+        "error": {
+            "code": code,
+            "message": message,
+        }
+    });
+    let json = serde_json::to_string(&value)
+        .map_err(|e| format!("Failed to serialize schema probe error: {e}"))?;
+    eprintln!("{json}");
+    Ok(())
 }
 
 fn run_trace_command(options: TraceOptions, invocation_uuid: &str) -> Result<i32, String> {

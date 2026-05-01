@@ -112,6 +112,36 @@ fn schema_probe_old_user_version_exits_schema_incompatible() {
     );
 }
 
+/// Risk: D6 — Newer schema versions are not safe for the current binary's public session surface.
+/// Level: particular-integration.
+/// Source: proposal §5 / §9.1 row D6.
+/// Observable: exit 14; stderr JSON code `schema-incompatible`.
+/// Residual: does not predict future compatibility policy after the current constant is bumped.
+#[test]
+fn schema_probe_future_user_version_exits_schema_incompatible() {
+    let fixture = future_schema_db_fixture();
+
+    let output = fixture.run_schema_probe(&[]);
+
+    assert_eq!(output.status.code(), Some(14), "{output:?}");
+    assert_json_error(&output, "schema-incompatible");
+}
+
+/// Risk: D6 — Required indexes with matching names but wrong definitions must not satisfy compatibility.
+/// Level: particular-integration.
+/// Source: proposal §9.1 row D6.
+/// Observable: exit 14; stderr JSON code `schema-incompatible`.
+/// Residual: validates column order for required indexes, not every SQLite index property.
+#[test]
+fn schema_probe_wrong_index_definition_exits_schema_incompatible() {
+    let fixture = wrong_index_definition_db_fixture();
+
+    let output = fixture.run_schema_probe(&[]);
+
+    assert_eq!(output.status.code(), Some(14), "{output:?}");
+    assert_json_error(&output, "schema-incompatible");
+}
+
 /// Risk: T4 — Operational error case: DB file unreadable returns exit 1.
 /// Level: particular-integration.
 /// Source: contract §7 row T4.

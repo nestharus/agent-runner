@@ -80,6 +80,29 @@ impl SchemaProbeFixture {
         path
     }
 
+    pub fn create_future_user_version_db(&self) -> PathBuf {
+        let path = self.create_current_schema_db();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA user_version = 4;").unwrap();
+        drop(conn);
+        path
+    }
+
+    pub fn create_wrong_index_definition_db(&self) -> PathBuf {
+        let path = self.create_current_schema_db();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "
+            DROP INDEX idx_session_turns_session_lookup;
+            CREATE INDEX idx_session_turns_session_lookup
+                ON session_turns(provider_name, session_id, timestamp);
+            ",
+        )
+        .unwrap();
+        drop(conn);
+        path
+    }
+
     pub fn create_invalid_database_file(&self) -> PathBuf {
         let path = self.db_path();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -164,6 +187,18 @@ pub fn incompatible_schema_db_fixture() -> SchemaProbeFixture {
     fixture
 }
 
+pub fn future_schema_db_fixture() -> SchemaProbeFixture {
+    let fixture = SchemaProbeFixture::new();
+    fixture.create_future_user_version_db();
+    fixture
+}
+
+pub fn wrong_index_definition_db_fixture() -> SchemaProbeFixture {
+    let fixture = SchemaProbeFixture::new();
+    fixture.create_wrong_index_definition_db();
+    fixture
+}
+
 pub fn unreadable_db_fixture() -> SchemaProbeFixture {
     let fixture = SchemaProbeFixture::new();
     fixture.create_unreadable_db();
@@ -219,7 +254,7 @@ pub fn create_current_schema_db_at(path: &Path) -> PathBuf {
             is_compaction_boundary INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX idx_session_turns_session_lookup
-            ON session_turns(provider_name, session_id, timestamp);
+            ON session_turns(session_id, timestamp);
 
         CREATE TABLE session_chains (
             chain_id TEXT PRIMARY KEY,
@@ -239,7 +274,7 @@ pub fn create_current_schema_db_at(path: &Path) -> PathBuf {
             transition_reason TEXT NOT NULL
         );
         CREATE INDEX idx_segments_session
-            ON session_chain_segments(provider_name, session_id);
+            ON session_chain_segments(session_id);
         CREATE INDEX idx_segments_chain_active
             ON session_chain_segments(chain_id, ended_at);
         ",

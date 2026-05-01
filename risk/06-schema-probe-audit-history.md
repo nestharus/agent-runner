@@ -49,6 +49,40 @@ Round 1 audit returned MEDIUM; Rev 2 closes findings.
 - WS1: §3 JSON shape stability for compatibility map.
 - WS2: reusable API error-variant discipline for `ReadOnlyOpenError`.
 
+## CodeRabbit loop — Phase 7
+
+### Pass 1 — branch implementation reviewed against `main`
+
+- Raw/classified log: `.tmp/phase7/coderabbit-pass1.md`
+- Findings: 6 total.
+- Applied:
+  - **`R1-F03`** — consistency win; added Cargo rerun directives for `.git/HEAD` and active branch ref so `BUILD_COMMIT` refreshes on amend/checkout.
+  - **`R1-F04`** — correctness; column PRAGMA inspection failures now propagate as operational inspect errors instead of missing-column incompatibility.
+  - **`R1-F05`** — correctness; required indexes now validate expected table plus ordered column list, with a wrong-definition regression test.
+  - **`R1-F06`** — correctness; future `user_version` values above `CURRENT_SCHEMA_VERSION` are incompatible, with a regression test.
+- Skipped:
+  - **`R1-F01`** — false positive; `research/06-schema-probe-hookpoints.md` is intentionally a Phase 5 hookpoints artifact in the branch lineage.
+  - **`R1-F02`** — markdownlint nitpick; blank-line-only contract formatting churn.
+- Verification:
+  - `cargo test --manifest-path src-tauri/Cargo.toml --test initiative_06_schema_probe` — PASS, 15 passed.
+  - `cargo test --manifest-path src-tauri/Cargo.toml` — PASS, 397 passed.
+- Determination: continue after amend; real findings were applied.
+
+### Pass 2 — amended implementation reviewed against `main`
+
+- Raw/classified log: `.tmp/phase7/coderabbit-pass2.md`
+- Findings: 4 total.
+- Applied: none.
+- Skipped:
+  - **`R2-F01`** — nitpick; set-based `supported_storage_types` predicate is acceptable future extensibility work because Rev 1 emits the fixed vocabulary and import-replace remains disabled.
+  - **`R2-F02`** — markdownlint nitpick; blank-line-only risk-report formatting churn.
+  - **`R2-F03`** — contradicts Step 6a contract; schema-probe report types intentionally remain exported through `state` as public state-surface types.
+  - **`R2-F04`** — nitpick; test fixture comment-only suggestion for an intentional WAL sidecar connection leak.
+- Verification:
+  - No pass 2 code changes.
+  - Most recent post-amend `cargo test --manifest-path src-tauri/Cargo.toml` — PASS, 397 passed.
+- Determination: converge; all findings were churn.
+
 ## Final state
 
-In progress. Round 2 setup pending Rev 2 proposal commit.
+CodeRabbit Phase 7 converged after pass 2 with `ALL_CHURN`.
