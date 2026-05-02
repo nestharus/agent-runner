@@ -1,0 +1,33 @@
+{
+  "requested_id": "2956181c-8467-4fd6-9426-6278c5da7e7d",
+  "generated_at": "2026-05-02T03:02:41.529900748Z",
+  "root": {
+    "invocation": {
+      "row_id": 5418,
+      "id": "2956181c-8467-4fd6-9426-6278c5da7e7d",
+      "source": "codex2",
+      "model_name": "gpt-high",
+      "parent_id": null,
+      "status": "succeeded",
+      "success": true,
+      "exit_code": 0,
+      "error_category": null,
+      "started_at": "2026-05-02T02:47:57.957189561Z",
+      "finished_at": "2026-05-02T02:54:04.489850206Z"
+    },
+    "session": {
+      "id": "019de695-ebbf-78b3-aa61-9e1991d1cbe5",
+      "chain_id": "16fa4453-46e2-4dc5-bd35-13f36a39e409",
+      "capture_method": "turn_script",
+      "transcript_path": null,
+      "transcript_state": "no_locator",
+      "turn_count": 14,
+      "assistant_turn_count": 12,
+      "sidechain_turn_count": 0,
+      "resume_acceptance": null,
+      "resume_acceptance_evidence": null
+    },
+    "warnings": [],
+    "children": []
+  }
+}

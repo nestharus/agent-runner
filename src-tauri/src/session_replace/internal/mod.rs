@@ -1,5 +1,4 @@
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
@@ -7,27 +6,6 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use super::ReplaceError;
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct CanonicalRecord {
-    pub session_id: String,
-    pub provider_name: String,
-    pub turn_id: String,
-    pub role: String,
-    pub timestamp: String,
-    #[serde(default)]
-    pub content: Vec<ContentChunk>,
-    #[serde(default)]
-    pub source: Value,
-    #[serde(default)]
-    pub unsupported_record: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ContentChunk {
-    Text { text: String },
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorageType {
@@ -42,6 +20,14 @@ impl StorageType {
             StorageType::ClaudeCode => "claude_code",
             StorageType::CodexSession => "codex_session",
             StorageType::Other => "other",
+        }
+    }
+
+    pub fn to_export(&self) -> crate::session_export::SessionStorageType {
+        match self {
+            StorageType::ClaudeCode => crate::session_export::SessionStorageType::ClaudeCode,
+            StorageType::CodexSession => crate::session_export::SessionStorageType::CodexSession,
+            StorageType::Other => crate::session_export::SessionStorageType::Other,
         }
     }
 }
