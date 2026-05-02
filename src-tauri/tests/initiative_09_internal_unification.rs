@@ -76,6 +76,11 @@ fn t_busy_token_hash_preserved() {
     let error = assert_json_error(&output, "session-busy");
     let token_hash = error["error"]["token"].as_str().unwrap();
     assert_hash_hex(token_hash);
+    let expected_hash = sha256sum_bytes(token.as_bytes());
+    assert_eq!(
+        token_hash, expected_hash,
+        "busy JSON token must equal sha256(live pause token)"
+    );
 }
 
 /// Risk: T-error-path-release — a post-acquire import-replace failure may leave a stuck session lease.
