@@ -126,6 +126,9 @@ fn extract_session_id(stderr: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::setup::actions::AgentAction;
+    use crate::setup::test_support::env_lock;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     #[test]
     fn agent_creation() {
@@ -151,5 +154,190 @@ mod tests {
             extract_session_id(stderr),
             Some("550e8400-e29b-41d4-a716-446655440000".to_string())
         );
+    }
+
+    #[cfg(unix)]
+    fn with_fake_claude(script: &str, test: impl FnOnce(&std::path::Path, &std::path::Path)) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = env_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("claude");
+        let args_log = dir.path().join("args.log");
+        std::fs::write(&bin, script).unwrap();
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin, perms).unwrap();
+
+        let previous_path = std::env::var_os("PATH");
+        let previous_args_log = std::env::var_os("CLAUDE_ARGS_LOG");
+        let new_path = match previous_path.as_ref() {
+            Some(path) => {
+                let mut paths = vec![dir.path().to_path_buf()];
+                paths.extend(std::env::split_paths(path));
+                std::env::join_paths(paths).unwrap()
+            }
+            None => dir.path().as_os_str().to_os_string(),
+        };
+
+        unsafe {
+            std::env::set_var("PATH", new_path);
+            std::env::set_var("CLAUDE_ARGS_LOG", &args_log);
+        }
+
+        let result = catch_unwind(AssertUnwindSafe(|| test(dir.path(), &args_log)));
+
+        match previous_path {
+            Some(value) => unsafe {
+                std::env::set_var("PATH", value);
+            },
+            None => unsafe {
+                std::env::remove_var("PATH");
+            },
+        }
+        match previous_args_log {
+            Some(value) => unsafe {
+                std::env::set_var("CLAUDE_ARGS_LOG", value);
+            },
+            None => unsafe {
+                std::env::remove_var("CLAUDE_ARGS_LOG");
+            },
+        }
+
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    fn successful_fake_claude_script() -> &'static str {
+        r#"#!/usr/bin/env bash
+{
+  echo "---ARGV---"
+  for arg in "$@"; do
+    printf '%s\n' "$arg"
+  done
+} >> "$CLAUDE_ARGS_LOG"
+echo "Session: setup-session-123" >&2
+printf '%s' '{"actions":[{"type":"status","message":"Ready"}],"done":true}'
+"#
+    }
+
+    fn logged_invocations(path: &std::path::Path) -> Vec<Vec<String>> {
+        let content = std::fs::read_to_string(path).unwrap();
+        content
+            .split("---ARGV---\n")
+            .filter(|part| !part.trim().is_empty())
+            .map(|part| part.lines().map(ToOwned::to_owned).collect())
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn send_turn_uses_schema_constrained_json_mode_and_parses_actions() {
+        with_fake_claude(successful_fake_claude_script(), |_, args_log| {
+            let mut agent = SetupAgent::new("system prompt".to_string());
+
+            let result = agent
+                .send_turn("begin setup", "{\"type\":\"object\"}")
+                .unwrap();
+
+            assert!(result.done);
+            assert_eq!(result.actions.len(), 1);
+            match &result.actions[0] {
+                AgentAction::Status { message } => assert_eq!(message, "Ready"),
+                _ => panic!("expected status action"),
+            }
+            assert_eq!(agent.session_id(), Some("setup-session-123"));
+
+            let invocations = logged_invocations(args_log);
+            assert_eq!(invocations.len(), 1);
+            let args = &invocations[0];
+            assert_eq!(args[0], "-p");
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--output-format", "json"])
+            );
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--model", "claude-sonnet-4-6"])
+            );
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--allowedTools", "Read,Bash,Glob,Grep"])
+            );
+            assert!(args.iter().any(|arg| arg == "--no-session-persistence"));
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--json-schema", "{\"type\":\"object\"}"])
+            );
+            assert!(!args.iter().any(|arg| arg == "--resume"));
+
+            assert!(args.iter().any(|arg| arg == "system prompt"), "{args:?}");
+            assert!(args.iter().any(|arg| arg == "---"), "{args:?}");
+            assert!(args.iter().any(|arg| arg == "begin setup"), "{args:?}");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn send_turn_resumes_with_learned_session_id_and_message_only_prompt() {
+        with_fake_claude(successful_fake_claude_script(), |_, args_log| {
+            let mut agent = SetupAgent::new("system prompt".to_string());
+
+            agent.send_turn("first turn", "{}").unwrap();
+            agent.send_turn("second turn", "{}").unwrap();
+
+            let invocations = logged_invocations(args_log);
+            assert_eq!(invocations.len(), 2);
+            let second_args = &invocations[1];
+            assert!(
+                second_args
+                    .windows(2)
+                    .any(|pair| pair == ["--resume", "setup-session-123"])
+            );
+            assert_eq!(second_args.last().unwrap(), "second turn");
+            assert!(!second_args.last().unwrap().contains("system prompt"));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn send_turn_reports_nonzero_claude_exit() {
+        let script = r#"#!/usr/bin/env bash
+echo "oauth expired" >&2
+exit 7
+"#;
+
+        with_fake_claude(script, |_, _| {
+            let mut agent = SetupAgent::new("system prompt".to_string());
+
+            let err = match agent.send_turn("begin setup", "{}") {
+                Ok(_) => panic!("expected nonzero Claude exit to fail"),
+                Err(err) => err,
+            };
+
+            assert!(err.contains("Claude CLI failed (exit 7)"), "{err}");
+            assert!(err.contains("oauth expired"), "{err}");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn send_turn_rejects_malformed_agent_json() {
+        let script = r#"#!/usr/bin/env bash
+printf '%s' 'not-json'
+"#;
+
+        with_fake_claude(script, |_, _| {
+            let mut agent = SetupAgent::new("system prompt".to_string());
+
+            let err = match agent.send_turn("begin setup", "{}") {
+                Ok(_) => panic!("expected malformed JSON to fail"),
+                Err(err) => err,
+            };
+
+            assert!(err.contains("Failed to parse agent response"), "{err}");
+            assert!(err.contains("Raw output: not-json"), "{err}");
+        });
     }
 }
