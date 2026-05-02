@@ -5,21 +5,21 @@ use super::sessions::SessionsConfig;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-pub trait ModelConfigRepository {
+pub trait ModelConfigRepository: Send + Sync {
     fn load_models(&self) -> Result<HashMap<String, ModelConfig>, String>;
     fn save_model(&self, model: &ModelConfig) -> Result<(), String>;
     fn delete_model(&self, name: &str) -> Result<(), String>;
 }
 
-pub trait ProviderConfigSource {
+pub trait ProviderConfigSource: Send + Sync {
     fn load_providers(&self) -> Result<ProvidersConfig, String>;
 }
 
-pub trait SessionsConfigSource {
+pub trait SessionsConfigSource: Send + Sync {
     fn load_sessions(&self) -> Result<SessionsConfig, String>;
 }
 
-pub trait AgentConfigRepository {
+pub trait AgentConfigRepository: Send + Sync {
     fn load_agent_file(&self, path: &Path) -> Result<AgentConfig, String>;
     fn load_agents(&self) -> Result<HashMap<String, AgentConfig>, String>;
 }
@@ -58,6 +58,20 @@ impl ModelConfigRepository for FilesystemModelConfigRepository {
     }
 }
 
+impl ModelConfigRepository for HashMap<String, ModelConfig> {
+    fn load_models(&self) -> Result<HashMap<String, ModelConfig>, String> {
+        Ok(self.clone())
+    }
+
+    fn save_model(&self, _model: &ModelConfig) -> Result<(), String> {
+        Err("in-memory model repository is read-only".to_string())
+    }
+
+    fn delete_model(&self, _name: &str) -> Result<(), String> {
+        Err("in-memory model repository is read-only".to_string())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FilesystemProviderConfigSource {
     providers_path: PathBuf,
@@ -75,6 +89,12 @@ impl ProviderConfigSource for FilesystemProviderConfigSource {
     }
 }
 
+impl ProviderConfigSource for ProvidersConfig {
+    fn load_providers(&self) -> Result<ProvidersConfig, String> {
+        Ok(self.clone())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FilesystemSessionsConfigSource {
     sessions_path: PathBuf,
@@ -89,6 +109,12 @@ impl FilesystemSessionsConfigSource {
 impl SessionsConfigSource for FilesystemSessionsConfigSource {
     fn load_sessions(&self) -> Result<SessionsConfig, String> {
         SessionsConfig::load(&self.sessions_path)
+    }
+}
+
+impl SessionsConfigSource for SessionsConfig {
+    fn load_sessions(&self) -> Result<SessionsConfig, String> {
+        Ok(self.clone())
     }
 }
 

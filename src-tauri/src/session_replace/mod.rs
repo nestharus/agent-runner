@@ -1,12 +1,21 @@
-use crate::config::{ProvidersConfig, SessionsConfig, load_models};
+use crate::config::{
+    FilesystemModelConfigRepository, FilesystemProviderConfigSource,
+    FilesystemSessionsConfigSource, ModelConfigRepository, ProviderConfigSource,
+    SessionsConfigSource,
+};
+use crate::process::{OsProcessRunner, ProcessRunner};
+use crate::runtime::{DefaultRuntimePaths, RuntimePaths};
 use crate::session_export::{self as export, ContentChunk, ExportError, ExportSessionMetadata};
-use crate::session_lock::{Lease, LockError, SessionLock};
+use crate::session_lock::{FilesystemSessionLockProvider, Lease, LockError, SessionLockProvider};
 use crate::session_metadata::{
     MetadataError, SessionMetadata, SessionStorageType, TranscriptState, locate_session_metadata,
 };
-use crate::state::StateDb;
+use crate::state::{
+    DefaultStateDbOpener, SessionTurnReplacement, SessionTurnReplacementTurn,
+    SessionTurnRepository, StateDbOpener,
+};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -37,7 +46,7 @@ pub struct ReplaceReceipt {
     pub committed_at: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum ReplaceError {
     InvalidSessionId {
         input: String,
@@ -73,6 +82,70 @@ pub enum ReplaceError {
     OperationalError {
         message: String,
     },
+}
+
+pub struct ImportReplaceDeps<'a> {
+    pub paths: &'a dyn RuntimePaths,
+    pub state_opener: &'a dyn StateDbOpener,
+    pub model_repo: &'a dyn ModelConfigRepository,
+    pub provider_source: &'a dyn ProviderConfigSource,
+    pub sessions_source: &'a dyn SessionsConfigSource,
+    pub locator_runner: &'a dyn ProcessRunner,
+    pub lock_provider: &'a dyn SessionLockProvider,
+}
+
+impl std::fmt::Debug for ReplaceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReplaceError::InvalidSessionId { input } => f
+                .debug_struct("InvalidSessionId")
+                .field("input", input)
+                .finish(),
+            ReplaceError::InvalidArgument { message } => f
+                .debug_struct("InvalidArgument")
+                .field("message", message)
+                .finish(),
+            ReplaceError::SessionNotFound { input } => f
+                .debug_struct("SessionNotFound")
+                .field("input", input)
+                .finish(),
+            ReplaceError::AmbiguousSession { input } => f
+                .debug_struct("AmbiguousSession")
+                .field("input", input)
+                .finish(),
+            ReplaceError::UnsupportedStorage {
+                provider_name,
+                reason,
+            } => f
+                .debug_struct("UnsupportedStorage")
+                .field("provider_name", provider_name)
+                .field("reason", reason)
+                .finish(),
+            ReplaceError::SessionBusy { token, expires_at } => f
+                .debug_struct("SessionBusy")
+                .field("token", token)
+                .field("expires_at", expires_at)
+                .finish(),
+            ReplaceError::SchemaIncompatible { reason } => f
+                .debug_struct("SchemaIncompatible")
+                .field("reason", reason)
+                .finish(),
+            ReplaceError::InvalidInputTranscript { reason, line } => f
+                .debug_struct("InvalidInputTranscript")
+                .field("reason", reason)
+                .field("line", line)
+                .finish(),
+            ReplaceError::PreimageMismatch { expected, actual } => f
+                .debug_struct("preimage-mismatch")
+                .field("expected", expected)
+                .field("actual", actual)
+                .finish(),
+            ReplaceError::OperationalError { message } => f
+                .debug_struct("OperationalError")
+                .field("message", message)
+                .finish(),
+        }
+    }
 }
 
 impl ReplaceError {
@@ -186,7 +259,8 @@ pub trait CanonicalToProviderRenderer {
 }
 
 struct ImportReplaceLease<'a> {
-    lock: &'a SessionLock,
+    lock_provider: &'a dyn SessionLockProvider,
+    lock_dir: PathBuf,
     session_id: String,
     lease: Option<Lease>,
 }
@@ -194,8 +268,8 @@ struct ImportReplaceLease<'a> {
 impl<'a> ImportReplaceLease<'a> {
     fn commit(mut self) -> Result<(), ReplaceError> {
         if let Some(lease) = self.lease.take() {
-            self.lock
-                .release(&self.session_id, &lease.token)
+            self.lock_provider
+                .release(&self.lock_dir, &self.session_id, &lease.token)
                 .map_err(map_lock_error)?;
         }
         Ok(())
@@ -205,7 +279,9 @@ impl<'a> ImportReplaceLease<'a> {
 impl Drop for ImportReplaceLease<'_> {
     fn drop(&mut self) {
         if let Some(lease) = self.lease.take() {
-            let _ = self.lock.release(&self.session_id, &lease.token);
+            let _ = self
+                .lock_provider
+                .release(&self.lock_dir, &self.session_id, &lease.token);
         }
     }
 }
@@ -308,6 +384,47 @@ pub fn run_import_replace(
     input_path_or_stdin: Option<&Path>,
     preimage_sha256: Option<&str>,
 ) -> Result<ReplaceReceipt, ReplaceError> {
+    let paths = DefaultRuntimePaths::new();
+    let opener = DefaultStateDbOpener;
+    let model_repo = FilesystemModelConfigRepository::new(paths.models_dir());
+    let provider_source = FilesystemProviderConfigSource::new(paths.providers_path());
+    let sessions_source = FilesystemSessionsConfigSource::new(paths.sessions_path());
+    let runner = OsProcessRunner;
+    let lock_provider = FilesystemSessionLockProvider::default();
+    let deps = ImportReplaceDeps {
+        paths: &paths,
+        state_opener: &opener,
+        model_repo: &model_repo,
+        provider_source: &provider_source,
+        sessions_source: &sessions_source,
+        locator_runner: &runner,
+        lock_provider: &lock_provider,
+    };
+    run_import_replace_with_deps_order(
+        &deps,
+        session_id,
+        input_path_or_stdin,
+        preimage_sha256,
+        false,
+    )
+}
+
+pub fn run_import_replace_with_deps(
+    deps: &ImportReplaceDeps<'_>,
+    session_id: &str,
+    input_path_or_stdin: Option<&Path>,
+    preimage_sha256: Option<&str>,
+) -> Result<ReplaceReceipt, ReplaceError> {
+    run_import_replace_with_deps_order(deps, session_id, input_path_or_stdin, preimage_sha256, true)
+}
+
+fn run_import_replace_with_deps_order(
+    deps: &ImportReplaceDeps<'_>,
+    session_id: &str,
+    input_path_or_stdin: Option<&Path>,
+    preimage_sha256: Option<&str>,
+    check_preimage_before_journal: bool,
+) -> Result<ReplaceReceipt, ReplaceError> {
     let input = match input_path_or_stdin {
         Some(path) => fs::read(path).map_err(|e| ReplaceError::InvalidInputTranscript {
             reason: format!("failed to read input file: {e}"),
@@ -315,7 +432,13 @@ pub fn run_import_replace(
         })?,
         None => read_stdin_jsonl_bytes()?,
     };
-    run_import_replace_bytes(session_id, &input, preimage_sha256)
+    run_import_replace_bytes_with_deps_order(
+        deps,
+        session_id,
+        &input,
+        preimage_sha256,
+        check_preimage_before_journal,
+    )
 }
 
 fn read_stdin_jsonl_bytes() -> Result<Vec<u8>, ReplaceError> {
@@ -333,15 +456,14 @@ fn read_stdin_to_end(mut stdin: std::io::Stdin) -> Result<Vec<u8>, ReplaceError>
     Ok(input)
 }
 
-fn probe_state_schema_compatible(data_root: &Path, session_id: &str) -> Result<(), ReplaceError> {
-    let db_path = data_root.join("state.db");
+fn probe_state_schema_compatible(db_path: &Path, session_id: &str) -> Result<(), ReplaceError> {
     if !db_path.exists() {
         return Err(ReplaceError::SessionNotFound {
             input: session_id.to_string(),
         });
     }
     let conn =
-        Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e| {
+        Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e| {
             ReplaceError::SchemaIncompatible {
                 reason: format!("state db is not readable without mutation: {e}"),
             }
@@ -414,10 +536,22 @@ fn require_columns(conn: &Connection, table: &str, required: &[&str]) -> Result<
     Ok(())
 }
 
-fn run_import_replace_bytes(
+#[allow(dead_code)]
+pub(crate) fn run_import_replace_bytes_with_deps(
+    deps: &ImportReplaceDeps<'_>,
     session_id: &str,
     input: &[u8],
     preimage_sha256: Option<&str>,
+) -> Result<ReplaceReceipt, ReplaceError> {
+    run_import_replace_bytes_with_deps_order(deps, session_id, input, preimage_sha256, true)
+}
+
+fn run_import_replace_bytes_with_deps_order(
+    deps: &ImportReplaceDeps<'_>,
+    session_id: &str,
+    input: &[u8],
+    preimage_sha256: Option<&str>,
+    check_preimage_before_journal: bool,
 ) -> Result<ReplaceReceipt, ReplaceError> {
     Uuid::try_parse(session_id).map_err(|_| ReplaceError::InvalidSessionId {
         input: session_id.to_string(),
@@ -433,9 +567,15 @@ fn run_import_replace_bytes(
     }
     let canonical_bytes = input_text.as_bytes().to_vec();
 
-    let data_root = default_data_root()?;
-    probe_state_schema_compatible(&data_root, session_id)?;
-    let journal_root = data_root.join("replace_journal");
+    let state_db_path = deps
+        .paths
+        .state_db_path()
+        .map_err(|message| ReplaceError::OperationalError { message })?;
+    probe_state_schema_compatible(&state_db_path, session_id)?;
+    let journal_root = deps
+        .paths
+        .replace_journal_dir()
+        .map_err(|message| ReplaceError::OperationalError { message })?;
     let staging_dir = journal_root.join("staging");
     let quarantine_dir = journal_root.join("quarantine");
     ensure_journal_dirs(&staging_dir, &quarantine_dir)?;
@@ -444,7 +584,7 @@ fn run_import_replace_bytes(
     let staging_path = staging_dir.join(format!("{operation_uuid}.canonical.jsonl"));
     atomic_write_bytes(&staging_path, &canonical_bytes)?;
 
-    let metadata = match resolve_replace_metadata(session_id) {
+    let metadata = match resolve_replace_metadata_with_deps(deps, session_id) {
         Ok(metadata) => metadata,
         Err(err) => {
             let _ = fs::remove_file(&staging_path);
@@ -462,14 +602,15 @@ fn run_import_replace_bytes(
         let _ = fs::remove_file(&staging_path);
     })?;
 
-    let rendered = render_for_storage(&metadata.storage_type, &records)?;
+    let rendered = render_for_storage(&metadata, &records)?;
     let postimage_expected = canonical_hash_from_provider_bytes(&metadata, &rendered)?;
 
-    let lock_dir = data_root.join("locks");
-    let lock = SessionLock::new(&lock_dir).map_err(|e| ReplaceError::OperationalError {
-        message: format!("failed to initialize session lock: {e}"),
-    })?;
-    let lease = match lock.acquire(
+    let lock_dir = deps
+        .paths
+        .lock_dir()
+        .map_err(|message| ReplaceError::OperationalError { message })?;
+    let lease = match deps.lock_provider.acquire(
+        &lock_dir,
         &metadata.session_id,
         &metadata.provider_name,
         Duration::from_secs(300),
@@ -481,7 +622,8 @@ fn run_import_replace_bytes(
         }
     };
     let lease = ImportReplaceLease {
-        lock: &lock,
+        lock_provider: deps.lock_provider,
+        lock_dir,
         session_id: metadata.session_id.clone(),
         lease: Some(lease),
     };
@@ -494,6 +636,16 @@ fn run_import_replace_bytes(
             return Err(err);
         }
     };
+    if check_preimage_before_journal
+        && let Some(expected) = preimage_sha256
+        && expected != preimage
+    {
+        let _ = fs::remove_file(&staging_path);
+        return Err(ReplaceError::PreimageMismatch {
+            expected: expected.to_string(),
+            actual: preimage,
+        });
+    }
 
     let canonical_records_path =
         journal_root.join(format!("session-{}.canonical.jsonl", metadata.session_id));
@@ -524,7 +676,8 @@ fn run_import_replace_bytes(
         expected_turn_count: records.len(),
     };
     atomic_write_json(&pending_path, &journal)?;
-    if let Some(expected) = preimage_sha256
+    if !check_preimage_before_journal
+        && let Some(expected) = preimage_sha256
         && expected != preimage
     {
         return Err(ReplaceError::PreimageMismatch {
@@ -567,11 +720,11 @@ fn run_import_replace_bytes(
         });
     }
 
-    let db_path = data_root.join("state.db");
-    let mut conn = Connection::open(&db_path).map_err(|e| ReplaceError::OperationalError {
-        message: format!("failed to open state db: {e}"),
-    })?;
-    replace_db_turns(&mut conn, &metadata, &records)?;
+    let db = deps
+        .state_opener
+        .open(&state_db_path)
+        .map_err(|message| ReplaceError::OperationalError { message })?;
+    replace_db_turns_with_repo(&db, &metadata, &records)?;
 
     fs::remove_file(&pending_path).ok();
     fs::remove_file(&canonical_records_path).ok();
@@ -592,8 +745,40 @@ fn run_import_replace_bytes(
 }
 
 pub fn recover_pending_replaces() -> Result<(), ReplaceError> {
-    let data_root = default_data_root()?;
-    let journal_root = data_root.join("replace_journal");
+    let paths = DefaultRuntimePaths::new();
+    let opener = DefaultStateDbOpener;
+    let model_repo = FilesystemModelConfigRepository::new(paths.models_dir());
+    let provider_source = FilesystemProviderConfigSource::new(paths.providers_path());
+    let sessions_source = FilesystemSessionsConfigSource::new(paths.sessions_path());
+    let runner = OsProcessRunner;
+    let lock_provider = FilesystemSessionLockProvider::default();
+    let deps = ImportReplaceDeps {
+        paths: &paths,
+        state_opener: &opener,
+        model_repo: &model_repo,
+        provider_source: &provider_source,
+        sessions_source: &sessions_source,
+        locator_runner: &runner,
+        lock_provider: &lock_provider,
+    };
+    recover_pending_replaces_with_deps(&deps)
+}
+
+pub fn recover_pending_replaces_with_deps(
+    deps: &ImportReplaceDeps<'_>,
+) -> Result<(), ReplaceError> {
+    let state_db_path = deps
+        .paths
+        .state_db_path()
+        .map_err(|message| ReplaceError::OperationalError { message })?;
+    let journal_root = deps
+        .paths
+        .replace_journal_dir()
+        .map_err(|message| ReplaceError::OperationalError { message })?;
+    let data_root = deps
+        .paths
+        .data_root()
+        .map_err(|message| ReplaceError::OperationalError { message })?;
     if !journal_root.exists() {
         return Ok(());
     }
@@ -650,12 +835,12 @@ pub fn recover_pending_replaces() -> Result<(), ReplaceError> {
                     move_to_quarantine(&path, &quarantine_dir);
                     continue;
                 };
-                let mut conn = Connection::open(data_root.join("state.db")).map_err(|e| {
+                let db = deps.state_opener.open(&state_db_path).map_err(|message| {
                     ReplaceError::OperationalError {
-                        message: format!("failed to open state db during recovery: {e}"),
+                        message: format!("failed to open state db during recovery: {message}"),
                     }
                 })?;
-                replace_db_turns(&mut conn, &metadata, &records)?;
+                replace_db_turns_with_repo(&db, &metadata, &records)?;
                 fs::remove_file(&path).ok();
                 fs::remove_file(&journal.canonical_records_path).ok();
                 fsync_dir(&journal_root)?;
@@ -675,11 +860,17 @@ pub fn recover_pending_replaces() -> Result<(), ReplaceError> {
             }
         }
     }
-    cleanup_orphan_canonical_records(&data_root, &journal_root, &quarantine_dir)?;
+    cleanup_orphan_canonical_records_with_provider(
+        deps.lock_provider,
+        &data_root,
+        &journal_root,
+        &quarantine_dir,
+    )?;
     Ok(())
 }
 
-fn cleanup_orphan_canonical_records(
+fn cleanup_orphan_canonical_records_with_provider(
+    lock_provider: &dyn SessionLockProvider,
     data_root: &Path,
     journal_root: &Path,
     quarantine_dir: &Path,
@@ -703,7 +894,8 @@ fn cleanup_orphan_canonical_records(
         }
         let session_id = session_part.trim_start_matches("session-");
         let lock_dir = data_root.join("locks");
-        if crate::session_lock::any_active_for_session(&lock_dir, session_id)
+        if lock_provider
+            .any_active_for_session(&lock_dir, session_id)
             .map_err(map_lock_error)?
         {
             continue;
@@ -833,12 +1025,12 @@ fn content_json(record: &CanonicalRecord) -> Result<Vec<Value>, ReplaceError> {
 }
 
 fn render_for_storage(
-    storage_type: &SessionStorageType,
+    metadata: &SessionMetadata,
     records: &[CanonicalRecord],
 ) -> Result<Vec<u8>, ReplaceError> {
-    match storage_type {
+    match metadata.storage_type {
         SessionStorageType::ClaudeCode => ClaudeCodeRenderer.render(records),
-        SessionStorageType::CodexSession => CodexSessionRenderer.render(records),
+        SessionStorageType::CodexSession => render_codex_session(metadata, records),
         SessionStorageType::Other => Err(ReplaceError::UnsupportedStorage {
             provider_name: records
                 .first()
@@ -849,83 +1041,124 @@ fn render_for_storage(
     }
 }
 
-fn resolve_replace_metadata(session_id: &str) -> Result<SessionMetadata, ReplaceError> {
-    let state =
-        StateDb::open_default().map_err(|e| ReplaceError::OperationalError { message: e })?;
-    let models = load_models(&default_models_dir())
-        .map_err(|e| ReplaceError::OperationalError { message: e })?;
-    let providers = ProvidersConfig::load(&default_config_root().join("providers.toml"))
-        .map_err(|e| ReplaceError::OperationalError { message: e })?;
-    let sessions = SessionsConfig::load(&default_config_root().join("sessions.toml"))
-        .map_err(|e| ReplaceError::OperationalError { message: e })?;
-    locate_session_metadata(&state, &models, &providers, &sessions, session_id)
-        .map_err(map_metadata_error)
+fn render_codex_session(
+    metadata: &SessionMetadata,
+    records: &[CanonicalRecord],
+) -> Result<Vec<u8>, ReplaceError> {
+    let mut out = Vec::new();
+    writeln_json(
+        &mut out,
+        &json!({
+            "type": "session_meta",
+            "payload": {
+                "id": metadata.session_id,
+                "cwd": metadata.workspace_root,
+            }
+        }),
+    )?;
+    for record in records {
+        validate_record_for_render(record)?;
+        let role = &record.role;
+        let content_type = if role == "assistant" {
+            "output_text"
+        } else {
+            "input_text"
+        };
+        let content = record
+            .content
+            .iter()
+            .map(|chunk| {
+                let item_type = if chunk.r#type == "text" {
+                    content_type
+                } else {
+                    chunk.r#type.as_str()
+                };
+                json!({"type": item_type, "text": chunk.text.as_deref().unwrap_or("")})
+            })
+            .collect::<Vec<_>>();
+        writeln_json(
+            &mut out,
+            &json!({
+                "type": "response_item",
+                "id": record.turn_id,
+                "timestamp": record.timestamp,
+                "payload": {
+                    "id": record.turn_id,
+                    "type": "message",
+                    "role": role,
+                    "content": content,
+                },
+            }),
+        )?;
+    }
+    Ok(out)
 }
 
-fn replace_db_turns(
-    conn: &mut Connection,
+fn resolve_replace_metadata(session_id: &str) -> Result<SessionMetadata, ReplaceError> {
+    let paths = DefaultRuntimePaths::new();
+    let opener = DefaultStateDbOpener;
+    let model_repo = FilesystemModelConfigRepository::new(paths.models_dir());
+    let provider_source = FilesystemProviderConfigSource::new(paths.providers_path());
+    let sessions_source = FilesystemSessionsConfigSource::new(paths.sessions_path());
+    let runner = OsProcessRunner;
+    let lock_provider = FilesystemSessionLockProvider::default();
+    let deps = ImportReplaceDeps {
+        paths: &paths,
+        state_opener: &opener,
+        model_repo: &model_repo,
+        provider_source: &provider_source,
+        sessions_source: &sessions_source,
+        locator_runner: &runner,
+        lock_provider: &lock_provider,
+    };
+    resolve_replace_metadata_with_deps(&deps, session_id)
+}
+
+fn resolve_replace_metadata_with_deps(
+    deps: &ImportReplaceDeps<'_>,
+    session_id: &str,
+) -> Result<SessionMetadata, ReplaceError> {
+    let state_db_path = deps
+        .paths
+        .state_db_path()
+        .map_err(|message| ReplaceError::OperationalError { message })?;
+    let state = deps
+        .state_opener
+        .open(&state_db_path)
+        .map_err(|message| ReplaceError::OperationalError { message })?;
+    locate_session_metadata(
+        &state,
+        deps.model_repo,
+        deps.provider_source,
+        deps.sessions_source,
+        deps.locator_runner,
+        session_id,
+    )
+    .map_err(map_metadata_error)
+}
+
+fn replace_db_turns_with_repo(
+    repo: &dyn SessionTurnRepository,
     metadata: &SessionMetadata,
     records: &[CanonicalRecord],
 ) -> Result<(), ReplaceError> {
-    let tx = conn
-        .transaction()
-        .map_err(|e| ReplaceError::OperationalError {
-            message: format!("failed to begin db transaction: {e}"),
-        })?;
-    tx.execute(
-        "DELETE FROM session_turns WHERE provider_name = ?1 AND session_id = ?2",
-        params![metadata.provider_name, metadata.session_id],
-    )
-    .map_err(|e| ReplaceError::OperationalError {
-        message: format!("failed to delete old turns: {e}"),
-    })?;
-    let now = Utc::now().to_rfc3339();
-    // Canonical v1 records intentionally do not carry parentage, sidechain, or
-    // compaction metadata, so imported rows reset those lineage fields.
-    for record in records {
-        tx.execute(
-            "INSERT INTO session_turns
-                (provider_name, session_id, turn_id, timestamp, role,
-                 parent_turn_id, is_sidechain, is_compaction_boundary, source_file, ingested_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, 0, 0, ?6, ?7)",
-            params![
-                metadata.provider_name,
-                metadata.session_id,
-                record.turn_id,
-                record.timestamp,
-                record.role,
-                metadata.jsonl_path.to_string_lossy(),
-                now,
-            ],
-        )
-        .map_err(|e| ReplaceError::OperationalError {
-            message: format!("failed to insert replacement turn: {e}"),
-        })?;
-    }
-    let last = records
-        .last()
-        .ok_or_else(|| ReplaceError::OperationalError {
-            message: "cannot replace db with empty records".to_string(),
-        })?;
-    tx.execute(
-        "UPDATE session_chain_segments
-         SET last_turn_id = ?2
-         WHERE id = ?1",
-        params![metadata.active_segment_id, last.turn_id],
-    )
-    .map_err(|e| ReplaceError::OperationalError {
-        message: format!("failed to refresh active segment: {e}"),
-    })?;
-    tx.execute(
-        "UPDATE session_chains SET last_used_at = ?2 WHERE chain_id = ?1",
-        params![metadata.chain_id, last.timestamp],
-    )
-    .map_err(|e| ReplaceError::OperationalError {
-        message: format!("failed to refresh chain: {e}"),
-    })?;
-    tx.commit().map_err(|e| ReplaceError::OperationalError {
-        message: format!("failed to commit db replacement: {e}"),
-    })
+    let replacement = SessionTurnReplacement {
+        provider_name: metadata.provider_name.clone(),
+        session_id: metadata.session_id.clone(),
+        chain_id: metadata.chain_id.clone(),
+        active_segment_id: metadata.active_segment_id,
+        source_file: metadata.jsonl_path.clone(),
+        turns: records
+            .iter()
+            .map(|record| SessionTurnReplacementTurn {
+                turn_id: record.turn_id.clone(),
+                timestamp: record.timestamp.clone(),
+                role: record.role.clone(),
+            })
+            .collect(),
+    };
+    repo.replace_session_turns(&replacement)
+        .map_err(|message| ReplaceError::OperationalError { message })
 }
 
 fn canonical_records_from_provider_file(
@@ -1100,20 +1333,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
-fn default_data_root() -> Result<PathBuf, ReplaceError> {
-    dirs::data_dir()
-        .map(|dir| dir.join("oulipoly-agent-runner"))
-        .ok_or_else(|| ReplaceError::OperationalError {
-            message: "could not determine data directory".to_string(),
-        })
-}
-
-fn default_config_root() -> PathBuf {
-    dirs::config_dir()
-        .map(|dir| dir.join("oulipoly-agent-runner"))
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
 fn storage_type_from_str(raw: &str) -> SessionStorageType {
     match raw {
         "claude_code" => SessionStorageType::ClaudeCode,
@@ -1138,12 +1357,6 @@ fn storage_type_to_export(
         SessionStorageType::CodexSession => crate::session_export::SessionStorageType::CodexSession,
         SessionStorageType::Other => crate::session_export::SessionStorageType::Other,
     }
-}
-
-fn default_models_dir() -> PathBuf {
-    dirs::config_dir()
-        .map(|dir| dir.join("oulipoly-agent-runner").join("models"))
-        .unwrap_or_else(|| PathBuf::from("models"))
 }
 
 fn maybe_test_hook(name: &str) {

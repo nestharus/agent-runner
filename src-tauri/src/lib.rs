@@ -6,6 +6,7 @@ pub mod executor;
 pub mod migration;
 pub mod process;
 pub mod quota;
+pub mod runtime;
 pub mod schema_probe;
 pub mod session_export;
 pub mod session_lock;
@@ -14,6 +15,7 @@ pub mod session_replace;
 pub mod sessions;
 pub mod setup;
 pub mod state;
+pub mod test_support;
 pub mod trace;
 
 use config::{

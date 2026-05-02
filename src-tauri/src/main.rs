@@ -1,14 +1,17 @@
 use agent_runner_lib::balancer;
 use agent_runner_lib::config::{
     AgentConfig, AgentConfigRepository, FilesystemAgentConfigRepository,
-    FilesystemModelConfigRepository, ModelConfig, ModelConfigRepository, PromptMode,
-    ProviderConfig, ProvidersConfig, load_models,
+    FilesystemModelConfigRepository, FilesystemProviderConfigSource,
+    FilesystemSessionsConfigSource, ModelConfig, ModelConfigRepository, PromptMode, ProviderConfig,
+    ProvidersConfig, load_models,
 };
 use agent_runner_lib::diagnostics;
 use agent_runner_lib::executor;
+use agent_runner_lib::process::{OsProcessRunner, ProcessRunner};
 use agent_runner_lib::schema_probe::{self, ProbeError};
 use agent_runner_lib::session_export::{
-    ExportError, ExportSessionMetadata, SessionStorageType, read_canonical_transcript,
+    ExportError, ExportSessionMetadata, read_canonical_transcript,
+    resolve_export_session_metadata_with_deps,
 };
 use agent_runner_lib::session_lock::{LockError, SessionLock};
 use agent_runner_lib::session_metadata::{MetadataError, locate_session_metadata};
@@ -25,6 +28,38 @@ use uuid::Uuid;
 
 const DEFAULT_PAUSE_HANDSHAKE_TTL_MS: u64 = 60_000;
 const MAX_PAUSE_HANDSHAKE_TTL_MS: u64 = 600_000;
+
+struct CliBalanceEffects<'a> {
+    providers_cfg: &'a agent_runner_lib::config::ProvidersConfig,
+    sessions_cfg: &'a agent_runner_lib::config::SessionsConfig,
+    in_flight: &'a agent_runner_lib::quota::InFlight,
+    state: &'a StateDb,
+    runner: &'a dyn ProcessRunner,
+}
+
+impl balancer::BalanceEffects for CliBalanceEffects<'_> {
+    fn refresh_quota_if_stale(&self, provider_name: &str) {
+        if agent_runner_lib::quota::is_stale(self.state, provider_name) {
+            let _ = agent_runner_lib::quota::refresh_provider(
+                provider_name,
+                self.providers_cfg,
+                self.in_flight,
+                self.state,
+                self.runner,
+            );
+        }
+    }
+
+    fn scan_provider_sessions(&self, provider_name: &str) {
+        let _ = agent_runner_lib::sessions::scan_provider_with_runner(
+            provider_name,
+            self.sessions_cfg,
+            self.state,
+            self.state,
+            self.runner,
+        );
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -689,26 +724,22 @@ fn run_session_locate(session_id: &str, _json: bool) -> Result<i32, String> {
         }
     };
 
-    let models_dir = default_models_dir();
-    let models = match load_models(&models_dir) {
-        Ok(models) => models,
-        Err(message) => {
-            emit_metadata_error(&MetadataError::Operational { message });
-            return Ok(1);
-        }
-    };
-
     let config_root = dirs::config_dir()
         .map(|d| d.join("oulipoly-agent-runner"))
         .unwrap_or_else(|| PathBuf::from("."));
-    let providers_path = config_root.join("providers.toml");
-    let sessions_path = config_root.join("sessions.toml");
-    let providers_cfg =
-        agent_runner_lib::config::ProvidersConfig::load(&providers_path).unwrap_or_default();
-    let sessions_cfg =
-        agent_runner_lib::config::SessionsConfig::load(&sessions_path).unwrap_or_default();
+    let model_repo = FilesystemModelConfigRepository::new(default_models_dir());
+    let provider_source = FilesystemProviderConfigSource::new(config_root.join("providers.toml"));
+    let sessions_source = FilesystemSessionsConfigSource::new(config_root.join("sessions.toml"));
+    let runner = OsProcessRunner;
 
-    match locate_session_metadata(&state, &models, &providers_cfg, &sessions_cfg, session_id) {
+    match locate_session_metadata(
+        &state,
+        &model_repo,
+        &provider_source,
+        &sessions_source,
+        &runner,
+        session_id,
+    ) {
         Ok(metadata) => match serde_json::to_string(&metadata) {
             Ok(json) => {
                 println!("{json}");
@@ -779,103 +810,21 @@ fn run_session_export(session_id: &str, format: &str) -> Result<i32, String> {
 
 fn resolve_export_session_metadata(session_id: &str) -> Result<ExportSessionMetadata, ExportError> {
     let state = StateDb::open_default().map_err(|message| ExportError::Operational { message })?;
-    let models_dir = default_models_dir();
-    let models =
-        load_models(&models_dir).map_err(|message| ExportError::Operational { message })?;
     let config_root = dirs::config_dir()
         .map(|d| d.join("oulipoly-agent-runner"))
         .unwrap_or_else(|| PathBuf::from("."));
-    let providers_path = config_root.join("providers.toml");
-    let sessions_path = config_root.join("sessions.toml");
-    let providers_cfg =
-        agent_runner_lib::config::ProvidersConfig::load(&providers_path).unwrap_or_default();
-    let sessions_cfg =
-        agent_runner_lib::config::SessionsConfig::load(&sessions_path).unwrap_or_default();
-
-    let resolved = state
-        .resolve_resume(&models, session_id, None)
-        .map_err(|err| match err {
-            agent_runner_lib::state::ResumeError::InvalidUuid { input } => {
-                ExportError::InvalidSessionId { input }
-            }
-            agent_runner_lib::state::ResumeError::NoChainFound { input } => {
-                ExportError::SessionNotFound { input }
-            }
-            agent_runner_lib::state::ResumeError::Ambiguous { input, .. } => {
-                ExportError::AmbiguousSession { input }
-            }
-            agent_runner_lib::state::ResumeError::ProviderModelMismatch {
-                active_provider, ..
-            } => ExportError::UnsupportedStorage {
-                provider_name: active_provider,
-                reason: "session owner is not in the resolved model provider pool".to_string(),
-            },
-            agent_runner_lib::state::ResumeError::UnknownModel { model_name } => {
-                ExportError::Operational {
-                    message: format!("unknown model referenced by session chain: {model_name}"),
-                }
-            }
-            agent_runner_lib::state::ResumeError::ActiveSegmentMissing { chain_id } => {
-                ExportError::Operational {
-                    message: format!("no active segment found for chain {chain_id}"),
-                }
-            }
-            agent_runner_lib::state::ResumeError::ProviderNotConfigured { provider } => {
-                ExportError::UnsupportedStorage {
-                    provider_name: provider,
-                    reason: "session owner provider is not configured".to_string(),
-                }
-            }
-            agent_runner_lib::state::ResumeError::ProviderMissingResume { provider_name } => {
-                ExportError::UnsupportedStorage {
-                    provider_name,
-                    reason: "session owner provider has no resume configuration".to_string(),
-                }
-            }
-            agent_runner_lib::state::ResumeError::Db { message } => {
-                ExportError::Operational { message }
-            }
-        })?;
-
-    let provider_entry = providers_cfg
-        .get(&resolved.active_provider)
-        .ok_or_else(|| ExportError::UnsupportedStorage {
-            provider_name: resolved.active_provider.clone(),
-            reason: "provider is missing from providers.toml".to_string(),
-        })?;
-    let storage_type = match provider_entry.session_storage.as_ref() {
-        Some(agent_runner_lib::config::SessionStorage::ClaudeCode { .. }) => {
-            SessionStorageType::ClaudeCode
-        }
-        Some(agent_runner_lib::config::SessionStorage::Codex { .. }) => {
-            SessionStorageType::CodexSession
-        }
-        None => {
-            return Err(ExportError::UnsupportedStorage {
-                provider_name: resolved.active_provider,
-                reason: "provider has no session_storage configuration".to_string(),
-            });
-        }
-    };
-
-    let jsonl_path = agent_runner_lib::sessions::locate_transcript(
-        &sessions_cfg,
-        &resolved.active_provider,
-        &resolved.active_session_id,
+    let model_repo = FilesystemModelConfigRepository::new(default_models_dir());
+    let provider_source = FilesystemProviderConfigSource::new(config_root.join("providers.toml"));
+    let sessions_source = FilesystemSessionsConfigSource::new(config_root.join("sessions.toml"));
+    let runner = OsProcessRunner;
+    resolve_export_session_metadata_with_deps(
+        &state,
+        &model_repo,
+        &provider_source,
+        &sessions_source,
+        &runner,
+        session_id,
     )
-    .map_err(|message| ExportError::Operational { message })?
-    .ok_or_else(|| ExportError::UnsupportedStorage {
-        provider_name: resolved.active_provider.clone(),
-        reason: "provider has no transcript_locator configuration".to_string(),
-    })?;
-
-    Ok(ExportSessionMetadata {
-        session_id: resolved.active_session_id,
-        chain_id: resolved.chain_id,
-        provider_name: resolved.active_provider,
-        storage_type,
-        jsonl_path,
-    })
 }
 
 fn metadata_error_exit_code(err: &MetadataError) -> i32 {
@@ -1589,10 +1538,13 @@ fn run_repl(
         });
 
     let in_flight = agent_runner_lib::quota::InFlight::new();
-    let ctx = balancer::BalanceContext {
+    let runner = OsProcessRunner;
+    let effects = CliBalanceEffects {
         providers_cfg: &providers_cfg,
         sessions_cfg: &sessions_cfg,
         in_flight: &in_flight,
+        state: &state,
+        runner: &runner,
     };
 
     let parent_invocation_id = resolve_parent_invocation_id(&state);
@@ -1654,7 +1606,7 @@ fn run_repl(
             Some(resolved.active_session_id.clone()),
         )
     } else {
-        let provider_index = balancer::select_provider(&model, &state, Some(&ctx));
+        let provider_index = balancer::select_provider(&model, &state, Some(&effects));
         let (provider, _) = effective_model_for_execution(&model, provider_index, &providers_cfg)?;
         (provider_index, provider, None)
     };
@@ -1997,16 +1949,19 @@ fn run_with_balancing(
     let sessions_cfg =
         agent_runner_lib::config::SessionsConfig::load(&sessions_path).unwrap_or_default();
     let in_flight = agent_runner_lib::quota::InFlight::new();
-    let ctx = balancer::BalanceContext {
+    let runner = OsProcessRunner;
+    let effects = CliBalanceEffects {
         providers_cfg: &providers_cfg,
         sessions_cfg: &sessions_cfg,
         in_flight: &in_flight,
+        state: &state,
+        runner: &runner,
     };
     // Resolve parent invocation BEFORE provider selection so the provider
     // selection itself can be attributed to a parent context if needed
     // (matches contract `tmp/01-pr-a-contract.md` lifecycle ordering).
     let parent_invocation_id = resolve_parent_invocation_id(&state);
-    let provider_index = balancer::select_provider(model, &state, Some(&ctx));
+    let provider_index = balancer::select_provider(model, &state, Some(&effects));
     let (provider, prompt_mode) =
         effective_model_for_execution(model, provider_index, &providers_cfg)?;
     let provider_name = &provider.name;

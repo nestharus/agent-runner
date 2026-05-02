@@ -10,9 +10,10 @@ pub use db::{AccountRecord, AuthMethod, AuthStatus, CliProviderRecord};
 pub use db::{BackfillReport, ChainPreview, ModelStore, ResolvedResume, ResumeError, TurnPreview};
 pub use db::{CliMapping, DiscoveredModel, ModelParameter, ParamType};
 pub use db::{CompositeInvocationId, InvocationRecord, InvocationStart, InvocationStatus};
-pub use db::{QuotaRecord, QuotaWindow, QuotaWindowInput};
+pub use db::{ProviderRecord, QuotaRecord, QuotaWindow, QuotaWindowInput};
 pub use repository::{
     CliProviderRepository, DefaultStateDbOpener, DiscoveryRepository, InvocationRepository,
-    QuotaRepository, ResumeDbFacts, RoutingRepository, SessionChainRepository, StateDbOpener,
+    QuotaRepository, ResumeDbFacts, RoutingRepository, SessionChainRepository,
+    SessionTurnReplacement, SessionTurnReplacementTurn, SessionTurnRepository, StateDbOpener,
     TransitionReason,
 };
