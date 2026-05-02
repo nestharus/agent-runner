@@ -2,6 +2,7 @@
 
 mod fixtures;
 
+use agent_runner_lib::session_lock::SessionLock;
 use agent_runner_lib::session_replace::{
     CanonicalRecord, CanonicalToProviderRenderer, ClaudeCodeRenderer, CodexSessionRenderer,
     ReplaceError, ReplaceReceipt, run_import_replace,
@@ -9,6 +10,8 @@ use agent_runner_lib::session_replace::{
 use fixtures::initiative_06_import_replace::*;
 use rusqlite::Connection;
 use std::fs;
+use std::thread;
+use std::time::Duration;
 
 /// Risk: T1 — valid Claude stdin replacement may write canonical bytes instead of provider-native bytes.
 /// Level: CLI integration.
@@ -570,6 +573,107 @@ fn recovery_keeps_orphan_canonical_records_while_session_lock_is_live() {
     );
     assert!(orphan.exists());
     fs::remove_file(prepared.fixture.lock_path(&prepared.session_id)).unwrap();
+
+    let recovery_trigger = prepared.fixture.run_recovery_trigger();
+
+    assert_eq!(
+        recovery_trigger.status.code(),
+        Some(0),
+        "{recovery_trigger:?}"
+    );
+    assert!(!orphan.exists());
+    assert_eq!(
+        prepared
+            .fixture
+            .turn_rows(&prepared.provider_name, &prepared.session_id),
+        before_rows
+    );
+}
+
+/// Verdict: VERIFIED 6 — orphan canonical records are not orphaned while a matching pending journal is quarantined.
+/// Level: startup recovery integration.
+/// Source: spec-session-replace-recovery.md#verified-6--orphan-canonical-records-respect-active-locks.
+/// Observable: recovery preserves the side file and leaves DB state untouched when quarantine contains the matching pending journal.
+#[test]
+fn recovery_keeps_orphan_canonical_records_when_pending_journal_is_quarantined() {
+    let prepared = prepared_claude_replace_fixture();
+    let before_rows = prepared
+        .fixture
+        .turn_rows(&prepared.provider_name, &prepared.session_id);
+    let orphan = prepared
+        .fixture
+        .canonical_records_path(&prepared.session_id);
+    fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+    fs::write(
+        &orphan,
+        canonical_jsonl(
+            &prepared.session_id,
+            &prepared.provider_name,
+            &prepared.jsonl_path,
+            "quarantined-orphan",
+        ),
+    )
+    .unwrap();
+    fs::create_dir_all(prepared.fixture.quarantine_dir()).unwrap();
+    let quarantined_pending = prepared.fixture.quarantine_dir().join(
+        prepared
+            .fixture
+            .pending_journal_path(&prepared.session_id)
+            .file_name()
+            .unwrap(),
+    );
+    fs::write(&quarantined_pending, "{}").unwrap();
+
+    let recovery_trigger = prepared.fixture.run_recovery_trigger();
+
+    assert_eq!(
+        recovery_trigger.status.code(),
+        Some(0),
+        "{recovery_trigger:?}"
+    );
+    assert!(orphan.exists());
+    assert!(quarantined_pending.exists());
+    assert_eq!(
+        prepared
+            .fixture
+            .turn_rows(&prepared.provider_name, &prepared.session_id),
+        before_rows
+    );
+}
+
+/// Verdict: VERIFIED 6 — orphan cleanup checks lock liveness, not only lock-file presence.
+/// Level: startup recovery integration.
+/// Source: spec-session-replace-recovery.md#verified-6--orphan-canonical-records-respect-active-locks.
+/// Observable: after the matching session lock expires, recovery deletes the orphan side file and leaves DB state untouched.
+#[test]
+fn recovery_deletes_orphan_canonical_records_when_session_lock_is_expired() {
+    let prepared = prepared_claude_replace_fixture();
+    let before_rows = prepared
+        .fixture
+        .turn_rows(&prepared.provider_name, &prepared.session_id);
+    let orphan = prepared
+        .fixture
+        .canonical_records_path(&prepared.session_id);
+    fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+    fs::write(
+        &orphan,
+        canonical_jsonl(
+            &prepared.session_id,
+            &prepared.provider_name,
+            &prepared.jsonl_path,
+            "expired-lock-orphan",
+        ),
+    )
+    .unwrap();
+    let lock = SessionLock::new(&prepared.fixture.locks_dir()).unwrap();
+    let _lease = lock
+        .acquire(
+            &prepared.session_id,
+            &prepared.provider_name,
+            Duration::from_millis(1),
+        )
+        .unwrap();
+    thread::sleep(Duration::from_millis(100));
 
     let recovery_trigger = prepared.fixture.run_recovery_trigger();
 
