@@ -234,6 +234,70 @@ fn t4_preimage_match_succeeds_with_current_canonical_export_hash() {
     assert_eq!(receipt["preimage_sha256"], preimage);
 }
 
+/// Risk: canonical hash reporting may accidentally use raw provider transcript bytes as the preimage domain.
+/// Level: CLI integration.
+/// Source: spec Behavior 4; proposal §2 hash domain; README import-replace receipt.
+/// Observable: receipt.preimage_sha256 equals the canonical export byte hash captured before replacement, not the provider JSONL byte hash.
+/// Residual: covers Claude-native storage; Codex-native storage has a sibling postimage-domain assertion below.
+#[test]
+fn preimage_sha256_reports_canonical_export_hash_not_provider_jsonl_hash() {
+    let prepared = prepared_claude_replace_fixture();
+    let before_export = prepared.fixture.run_export(&prepared.session_id);
+    assert_eq!(before_export.status.code(), Some(0), "{before_export:?}");
+    let canonical_preimage = sha256sum_bytes(&before_export.stdout);
+    let provider_preimage = sha256sum_bytes(&fs::read(&prepared.jsonl_path).unwrap());
+    assert_ne!(
+        canonical_preimage, provider_preimage,
+        "fixture must distinguish canonical export bytes from provider transcript bytes"
+    );
+    let input = canonical_jsonl(
+        &prepared.session_id,
+        &prepared.provider_name,
+        &prepared.jsonl_path,
+        "hash-domain-preimage",
+    );
+
+    let output = prepared
+        .fixture
+        .run_import_replace(&prepared.session_id, &input, &[]);
+
+    let receipt = assert_success(&output);
+    assert_eq!(receipt["preimage_sha256"], canonical_preimage);
+    assert_ne!(receipt["preimage_sha256"], provider_preimage);
+}
+
+/// Risk: canonical hash reporting may accidentally use the replaced provider-native transcript bytes as the postimage domain.
+/// Level: CLI integration.
+/// Source: spec Behavior 4; proposal §2 hash domain; README import-replace receipt.
+/// Observable: receipt.postimage_sha256 equals the fresh canonical export byte hash after replacement, not the provider JSONL byte hash.
+/// Residual: does not independently assert preimage reporting.
+#[test]
+fn postimage_sha256_reports_canonical_export_hash_not_provider_jsonl_hash() {
+    let prepared = prepared_codex_replace_fixture();
+    let input = canonical_jsonl(
+        &prepared.session_id,
+        &prepared.provider_name,
+        &prepared.jsonl_path,
+        "hash-domain-postimage",
+    );
+
+    let output = prepared
+        .fixture
+        .run_import_replace(&prepared.session_id, &input, &[]);
+
+    let receipt = assert_success(&output);
+    let after_export = prepared.fixture.run_export(&prepared.session_id);
+    assert_eq!(after_export.status.code(), Some(0), "{after_export:?}");
+    let canonical_postimage = sha256sum_bytes(&after_export.stdout);
+    let provider_postimage = sha256sum_bytes(&fs::read(&prepared.jsonl_path).unwrap());
+    assert_ne!(
+        canonical_postimage, provider_postimage,
+        "fixture must distinguish canonical export bytes from provider transcript bytes"
+    );
+    assert_eq!(receipt["postimage_sha256"], canonical_postimage);
+    assert_ne!(receipt["postimage_sha256"], provider_postimage);
+}
+
 /// Risk: T5 — preimage mismatch may mutate the transcript before refusing stale input.
 /// Level: CLI integration.
 /// Source: contract §7 T-preimage-mismatch; proposal §5 exit 15; A4, A8.
@@ -890,6 +954,32 @@ fn t_unsupported_record_class() {
     assert_eq!(after.transcript_bytes, before.transcript_bytes);
     assert_eq!(after.turn_rows, before.turn_rows);
     assert_no_replace_journal_pollution(&prepared.fixture, &prepared.session_id);
+}
+
+/// Risk: unsupported canonical roles may be rendered as provider-native turns instead of being rejected as lossy.
+/// Level: component.
+/// Source: spec Behavior 3; proposal §3 renderer contract; README import-replace validation.
+/// Observable: exit 15 invalid-input-transcript; transcript, DB rows, and journal remain unchanged.
+/// Residual: covers one representative unsupported role.
+#[test]
+fn unsupported_role_exits_15_before_mutation() {
+    assert_invalid_input_has_no_mutation(|prepared| {
+        let input = canonical_jsonl(
+            &prepared.session_id,
+            &prepared.provider_name,
+            &prepared.jsonl_path,
+            "unsupported-role",
+        );
+        let mut records = normalize_jsonl(&input);
+        records[0]["role"] = serde_json::json!("system");
+        (records
+            .into_iter()
+            .map(|record| serde_json::to_string(&record).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n")
+            .into_bytes()
+    });
 }
 
 /// Risk: canonical chunks without text may be lossy-rendered as empty text after journal staging.
