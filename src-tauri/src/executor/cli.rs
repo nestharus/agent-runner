@@ -1392,6 +1392,283 @@ mod tests {
         assert_eq!(flags, vec!["--custom", "value"]);
     }
 
+    fn test_input_def(name: &str, input_type: InputType) -> InputDef {
+        InputDef {
+            name: name.to_string(),
+            input_type,
+            required: false,
+            default_input: false,
+            default: None,
+            description: None,
+            flag: None,
+        }
+    }
+
+    #[test]
+    fn resolve_flags_rejects_schema_backed_input_before_returning_provider_args() {
+        let mut input = test_input_def(
+            "quality",
+            InputType::Enum {
+                options: vec!["draft".to_string(), "final".to_string()],
+            },
+        );
+        input.flag = Some("--quality".to_string());
+        let model = ModelConfig {
+            name: "test".to_string(),
+            prompt_mode: PromptMode::Stdin,
+            providers: vec![ProviderConfig::new("test", vec![])],
+            inputs: vec![input],
+        };
+        let mut inputs = HashMap::new();
+        inputs.insert("quality".to_string(), vec!["preview".to_string()]);
+
+        let err = resolve_input_flags(&model, &inputs).unwrap_err();
+
+        assert!(err.contains("not a valid option"), "{err}");
+    }
+
+    #[test]
+    fn validate_enum_accepts_configured_option() {
+        let input = test_input_def(
+            "format",
+            InputType::Enum {
+                options: vec!["jpeg".to_string(), "png".to_string()],
+            },
+        );
+
+        assert!(validate_input_values(&["png".to_string()], &input).is_ok());
+    }
+
+    #[test]
+    fn validate_enum_rejects_unconfigured_option() {
+        let input = test_input_def(
+            "format",
+            InputType::Enum {
+                options: vec!["jpeg".to_string(), "png".to_string()],
+            },
+        );
+
+        let err = validate_input_values(&["gif".to_string()], &input).unwrap_err();
+
+        assert!(err.contains("not a valid option"), "{err}");
+    }
+
+    #[test]
+    fn validate_integer_rejects_non_integer_value() {
+        let input = test_input_def(
+            "steps",
+            InputType::Integer {
+                min: None,
+                max: None,
+            },
+        );
+
+        let err = validate_input_values(&["4.5".to_string()], &input).unwrap_err();
+
+        assert!(err.contains("not a valid integer"), "{err}");
+    }
+
+    #[test]
+    fn validate_integer_accepts_minimum_boundary() {
+        let input = test_input_def(
+            "steps",
+            InputType::Integer {
+                min: Some(1),
+                max: None,
+            },
+        );
+
+        assert!(validate_input_values(&["1".to_string()], &input).is_ok());
+    }
+
+    #[test]
+    fn validate_integer_rejects_value_below_minimum() {
+        let input = test_input_def(
+            "steps",
+            InputType::Integer {
+                min: Some(1),
+                max: None,
+            },
+        );
+
+        let err = validate_input_values(&["0".to_string()], &input).unwrap_err();
+
+        assert!(err.contains("below minimum 1"), "{err}");
+    }
+
+    #[test]
+    fn validate_integer_accepts_maximum_boundary() {
+        let input = test_input_def(
+            "steps",
+            InputType::Integer {
+                min: None,
+                max: Some(8),
+            },
+        );
+
+        assert!(validate_input_values(&["8".to_string()], &input).is_ok());
+    }
+
+    #[test]
+    fn validate_integer_rejects_value_above_maximum() {
+        let input = test_input_def(
+            "steps",
+            InputType::Integer {
+                min: None,
+                max: Some(8),
+            },
+        );
+
+        let err = validate_input_values(&["9".to_string()], &input).unwrap_err();
+
+        assert!(err.contains("exceeds maximum 8"), "{err}");
+    }
+
+    #[test]
+    fn validate_number_rejects_non_number_value() {
+        let input = test_input_def(
+            "temperature",
+            InputType::Number {
+                min: None,
+                max: None,
+            },
+        );
+
+        let err = validate_input_values(&["warm".to_string()], &input).unwrap_err();
+
+        assert!(err.contains("not a valid number"), "{err}");
+    }
+
+    #[test]
+    fn validate_number_accepts_minimum_boundary() {
+        let input = test_input_def(
+            "temperature",
+            InputType::Number {
+                min: Some(0.0),
+                max: None,
+            },
+        );
+
+        assert!(validate_input_values(&["0.0".to_string()], &input).is_ok());
+    }
+
+    #[test]
+    fn validate_number_rejects_value_below_minimum() {
+        let input = test_input_def(
+            "temperature",
+            InputType::Number {
+                min: Some(0.0),
+                max: None,
+            },
+        );
+
+        let err = validate_input_values(&["-0.1".to_string()], &input).unwrap_err();
+
+        assert!(err.contains("below minimum 0"), "{err}");
+    }
+
+    #[test]
+    fn validate_number_accepts_maximum_boundary() {
+        let input = test_input_def(
+            "temperature",
+            InputType::Number {
+                min: None,
+                max: Some(2.0),
+            },
+        );
+
+        assert!(validate_input_values(&["2.0".to_string()], &input).is_ok());
+    }
+
+    #[test]
+    fn validate_number_rejects_value_above_maximum() {
+        let input = test_input_def(
+            "temperature",
+            InputType::Number {
+                min: None,
+                max: Some(2.0),
+            },
+        );
+
+        let err = validate_input_values(&["2.1".to_string()], &input).unwrap_err();
+
+        assert!(err.contains("exceeds maximum 2"), "{err}");
+    }
+
+    #[test]
+    fn validate_array_accepts_minimum_item_count_boundary() {
+        let input = test_input_def(
+            "image",
+            InputType::Array {
+                item_type: "string".to_string(),
+                min_items: Some(2),
+                max_items: None,
+            },
+        );
+
+        assert!(
+            validate_input_values(&["front.png".to_string(), "back.png".to_string()], &input)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_array_rejects_item_count_below_minimum() {
+        let input = test_input_def(
+            "image",
+            InputType::Array {
+                item_type: "string".to_string(),
+                min_items: Some(2),
+                max_items: None,
+            },
+        );
+
+        let err = validate_input_values(&["front.png".to_string()], &input).unwrap_err();
+
+        assert!(err.contains("need at least 2 items"), "{err}");
+    }
+
+    #[test]
+    fn validate_array_accepts_maximum_item_count_boundary() {
+        let input = test_input_def(
+            "image",
+            InputType::Array {
+                item_type: "string".to_string(),
+                min_items: None,
+                max_items: Some(2),
+            },
+        );
+
+        assert!(
+            validate_input_values(&["front.png".to_string(), "back.png".to_string()], &input)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_array_rejects_item_count_above_maximum() {
+        let input = test_input_def(
+            "image",
+            InputType::Array {
+                item_type: "string".to_string(),
+                min_items: None,
+                max_items: Some(2),
+            },
+        );
+
+        let err = validate_input_values(
+            &[
+                "front.png".to_string(),
+                "back.png".to_string(),
+                "side.png".to_string(),
+            ],
+            &input,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("maximum 2 items"), "{err}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn execute_echo_arg_mode() {
