@@ -507,7 +507,10 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use crate::setup::test_support::env_lock;
+    use rusqlite::Connection;
+    use serde_json::Value;
     use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::{Arc, Mutex};
 
     fn with_temp_home(test: impl FnOnce(&std::path::Path)) {
         let _guard = env_lock().lock().unwrap();
@@ -532,6 +535,269 @@ mod tests {
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
         }
+    }
+
+    #[cfg(unix)]
+    fn with_fake_claude(script: &str, test: impl FnOnce(&std::path::Path, &std::path::Path)) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = env_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("claude");
+        let prompt_log = dir.path().join("prompts.log");
+        let count_file = dir.path().join("count");
+        std::fs::write(&bin, script).unwrap();
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin, perms).unwrap();
+
+        let previous_path = std::env::var_os("PATH");
+        let previous_prompt_log = std::env::var_os("CLAUDE_PROMPT_LOG");
+        let previous_count_file = std::env::var_os("CLAUDE_COUNT_FILE");
+        let new_path = match previous_path.as_ref() {
+            Some(path) => {
+                let mut paths = vec![dir.path().to_path_buf()];
+                paths.extend(std::env::split_paths(path));
+                std::env::join_paths(paths).unwrap()
+            }
+            None => dir.path().as_os_str().to_os_string(),
+        };
+
+        unsafe {
+            std::env::set_var("PATH", new_path);
+            std::env::set_var("CLAUDE_PROMPT_LOG", &prompt_log);
+            std::env::set_var("CLAUDE_COUNT_FILE", &count_file);
+        }
+
+        let result = catch_unwind(AssertUnwindSafe(|| test(dir.path(), &prompt_log)));
+
+        match previous_path {
+            Some(value) => unsafe {
+                std::env::set_var("PATH", value);
+            },
+            None => unsafe {
+                std::env::remove_var("PATH");
+            },
+        }
+        match previous_prompt_log {
+            Some(value) => unsafe {
+                std::env::set_var("CLAUDE_PROMPT_LOG", value);
+            },
+            None => unsafe {
+                std::env::remove_var("CLAUDE_PROMPT_LOG");
+            },
+        }
+        match previous_count_file {
+            Some(value) => unsafe {
+                std::env::set_var("CLAUDE_COUNT_FILE", value);
+            },
+            None => unsafe {
+                std::env::remove_var("CLAUDE_COUNT_FILE");
+            },
+        }
+
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    fn capture_channel(events: Arc<Mutex<Vec<Value>>>) -> Channel<SetupEvent> {
+        Channel::new(move |body| {
+            let value: Value = body.deserialize().unwrap();
+            events.lock().unwrap().push(value);
+            Ok(())
+        })
+    }
+
+    fn logged_prompts(path: &std::path::Path) -> Vec<String> {
+        let content = std::fs::read_to_string(path).unwrap();
+        content
+            .split("---PROMPT---\n")
+            .filter(|part| !part.trim().is_empty())
+            .map(|part| part.trim_end_matches('\n').to_string())
+            .collect()
+    }
+
+    fn session_outcome_and_turn_count(
+        db_path: &std::path::Path,
+        session_id: &str,
+    ) -> (Option<String>, i64) {
+        let conn = Connection::open(db_path).unwrap();
+        conn.query_row(
+            "SELECT outcome, turn_count FROM setup_sessions WHERE id = ?1",
+            [session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    fn setup_turn_count(db_path: &std::path::Path, session_id: &str) -> i64 {
+        let conn = Connection::open(db_path).unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM setup_turns WHERE session_id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn run_agent_loop_with_memory(
+        channel: Channel<SetupEvent>,
+        input_rx: mpsc::Receiver<UserResponse>,
+        db_path: &std::path::Path,
+        session_id: &str,
+    ) {
+        let memory = MemoryGraph::open(db_path).unwrap();
+        memory.create_session(session_id).unwrap();
+        let mut flow = SetupFlow::new(channel, input_rx, memory, session_id.to_string());
+
+        tauri::async_runtime::block_on(
+            flow.run_agent_loop("test system prompt".to_string(), "begin setup"),
+        );
+    }
+
+    #[cfg(unix)]
+    fn complete_fake_claude_script() -> &'static str {
+        r#"#!/usr/bin/env bash
+{
+  echo "---PROMPT---"
+  printf '%s\n' "${!#}"
+} >> "$CLAUDE_PROMPT_LOG"
+echo "Session: setup-flow-session" >&2
+printf '%s' '{"actions":[{"type":"complete","summary":"Setup finished","items":["claude","codex~high"]}],"done":false}'
+"#
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn complete_action_emits_complete_event_and_records_success() {
+        with_fake_claude(complete_fake_claude_script(), |dir, prompt_log| {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let channel = capture_channel(events.clone());
+            let (_input_tx, input_rx) = mpsc::channel(1);
+            let db_path = dir.join("memory.sqlite");
+            let session_id = "setup-flow-complete";
+
+            run_agent_loop_with_memory(channel, input_rx, &db_path, session_id);
+
+            let captured = events.lock().unwrap();
+            let complete = captured
+                .iter()
+                .find(|event| event.get("event").and_then(Value::as_str) == Some("complete"))
+                .expect("expected complete event");
+            assert_eq!(complete["data"]["summary"], "Setup finished");
+            assert_eq!(
+                complete["data"]["items_configured"],
+                serde_json::json!(["claude", "codex~high"])
+            );
+
+            let (outcome, session_turn_count) =
+                session_outcome_and_turn_count(&db_path, session_id);
+            assert_eq!(outcome.as_deref(), Some("success"));
+            assert_eq!(session_turn_count, 1);
+            assert_eq!(setup_turn_count(&db_path, session_id), 1);
+
+            let prompts = logged_prompts(prompt_log);
+            assert_eq!(prompts.len(), 1);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_turn_failure_emits_recoverable_agent_error_and_records_agent_error() {
+        let script = r#"#!/usr/bin/env bash
+{
+  echo "---PROMPT---"
+  printf '%s\n' "${!#}"
+} >> "$CLAUDE_PROMPT_LOG"
+echo "oauth expired" >&2
+exit 7
+"#;
+
+        with_fake_claude(script, |dir, _prompt_log| {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let channel = capture_channel(events.clone());
+            let (_input_tx, input_rx) = mpsc::channel(1);
+            let db_path = dir.join("memory.sqlite");
+            let session_id = "setup-flow-agent-error";
+
+            run_agent_loop_with_memory(channel, input_rx, &db_path, session_id);
+
+            let captured = events.lock().unwrap();
+            let error = captured
+                .iter()
+                .find(|event| event.get("event").and_then(Value::as_str) == Some("error"))
+                .expect("expected error event");
+            let message = error["data"]["message"].as_str().unwrap();
+            assert!(message.starts_with("Agent error:"), "{message}");
+            assert_eq!(error["data"]["recoverable"], true);
+
+            let (outcome, session_turn_count) =
+                session_outcome_and_turn_count(&db_path, session_id);
+            assert_eq!(outcome.as_deref(), Some("agent_error"));
+            assert_eq!(session_turn_count, 0);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ask_user_emits_need_input_and_sends_serialized_response_to_next_turn() {
+        let script = r#"#!/usr/bin/env bash
+{
+  echo "---PROMPT---"
+  printf '%s\n' "${!#}"
+} >> "$CLAUDE_PROMPT_LOG"
+count=0
+if [ -f "$CLAUDE_COUNT_FILE" ]; then
+  count="$(cat "$CLAUDE_COUNT_FILE")"
+fi
+count=$((count + 1))
+printf '%s' "$count" > "$CLAUDE_COUNT_FILE"
+echo "Session: setup-flow-session" >&2
+if [ "$count" -eq 1 ]; then
+  printf '%s' '{"actions":[{"type":"ask_user","action":{"type":"confirm","title":"Authorize setup","message":"Continue?","confirm_id":"continue-setup","confirm_label":"Continue","cancel_label":"Stop"}}],"done":false}'
+else
+  printf '%s' '{"actions":[{"type":"complete","summary":"User answered","items":["confirmed"]}],"done":false}'
+fi
+"#;
+
+        with_fake_claude(script, |dir, prompt_log| {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let channel = capture_channel(events.clone());
+            let (input_tx, input_rx) = mpsc::channel(1);
+            input_tx
+                .try_send(UserResponse::Confirm {
+                    confirm_id: "continue-setup".to_string(),
+                    confirmed: true,
+                })
+                .unwrap();
+            let db_path = dir.join("memory.sqlite");
+            let session_id = "setup-flow-ask-user";
+
+            run_agent_loop_with_memory(channel, input_rx, &db_path, session_id);
+
+            let captured = events.lock().unwrap();
+            let need_input = captured
+                .iter()
+                .find(|event| event.get("event").and_then(Value::as_str) == Some("need_input"))
+                .expect("expected need_input event");
+            assert_eq!(need_input["data"]["action"]["type"], "confirm");
+            assert_eq!(need_input["data"]["action"]["confirm_id"], "continue-setup");
+
+            let prompts = logged_prompts(prompt_log);
+            assert_eq!(prompts.len(), 2);
+            let second_prompt = &prompts[1];
+            assert!(
+                second_prompt.contains("Results from previous actions"),
+                "{second_prompt}"
+            );
+            assert!(
+                second_prompt.contains(
+                    r#"User responded: {"type":"confirm","confirm_id":"continue-setup","confirmed":true}"#
+                ),
+                "{second_prompt}"
+            );
+        });
     }
 
     #[test]
