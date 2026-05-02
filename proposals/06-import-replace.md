@@ -781,6 +781,54 @@ direct mutation of `state.db` and provider JSONL. Secondary consumers are local
 automation scripts that already use `agents session export` and need a stable
 write-back primitive.
 
+**Cohort-A orchestrator-role note** (closes R4-F02): `agent-harness` is the
+single orchestrator that drives `agents session import-replace` for v1.
+Concurrent in-binary writers — `run_repl`, `run_resume`, the balanced one-shot
+path, and `migration::migrate_chain_segment` — do **not** observe the
+`SessionLock` in v1 because the lock primitive is exposed only via
+`session_lock::SessionLock` and is consulted only by `import-replace` and the
+`pause-handshake` / `resume-handshake` CLI surfaces. Cohort A treats
+`session-busy` as advisory until those writer paths retrofit onto
+`SessionLock`. Non-cooperating external writers (provider CLIs editing the
+JSONL out-of-band) are out of contract in either case (also recorded in §12
+residuals).
+
+**Cohort-A renderer record-class scope** (closes R4-F01): the v1
+`CanonicalToProviderRenderer` supports text-only `user` and `assistant` turns
+for `claude_code` and `codex_session` storage. Lossy record classes
+(`tool_use`, image, multimodal blocks, structured non-text content,
+`unsupported_record: true`) are refused at render time with
+`exit 15 invalid-input-transcript` and a structured-stderr error code. The
+07-canonical-reader unification (PR #19) extended this with a parse-time reject
+for chunks whose `text` is `None`, which inherits the export oracle's
+strictness — also exit 15. Cohort A should therefore treat the renderer as
+"text-only round-trip is supported; structured content must be rejected before
+import-replace runs."
+
+**Cohort-C partial-DEGRADED prose** (closes R4-F04): when a session is
+replaced via `import-replace`, `parent_turn_id`, `is_sidechain`, and
+`is_compaction_boundary` are written as `NULL` (per §6 / §7 / §12), so cohort
+C consumers — `agents resume`, `agents repl --resume`, top-level `--resume`,
+and `agents trace --json` — see partial-DEGRADED behavior on replaced
+sessions:
+
+- `trace --json` reports `parent_turn_id: null`, `is_sidechain: false`, and
+  `is_compaction_boundary: false` for replaced turns; the trace tree is still
+  walkable (root turns remain identifiable), but compaction summaries and
+  Claude sub-thread sidechains are no longer distinguishable in trace output.
+- `resume`, `repl --resume`, and top-level `--resume` resume the session
+  successfully; the missing fields do not block resumption because the
+  resolver path uses `(provider_name, session_id, last_turn_id)` rather than
+  the field-loss columns.
+- The `13` constraint compliance row (§13) is unaffected: ownership identity
+  is preserved through the chain segment row that `import-replace` mutates in
+  place.
+
+This DEGRADED state is the documented v1 trade-off for keeping the canonical
+schema text-only. The 06-export / 06-import-replace pair will lift this
+restriction when the canonical schema extends to carry these fields end-to-end
+(out of scope for v1; tracked as a future residual).
+
 Adjacent public/user-reachable paths and blast-radius notes:
 
 - `agents session locate` remains read-only metadata and supplies the reusable
@@ -826,6 +874,22 @@ omissions:
 - Running invocation rows are not treated as authoritative busy locks. The
   supported cross-process signal is `SessionLock`; non-cooperating external
   provider processes remain outside this contract.
+- **In-binary writers do not observe SessionLock in v1** (closes R4-F02
+  residual #3 enumeration): `run_repl`, `run_resume`, the balanced one-shot
+  path, and `migration::migrate_chain_segment` do not call
+  `session_lock::SessionLock` before mutating `session_turns` or transcript
+  bytes. The harness consumer treats `session-busy` as advisory until those
+  writer paths retrofit onto `SessionLock`. The 06-pause-handshake PR #17
+  established the primitive; the per-writer retrofit is a separate
+  initiative.
+- **Stale-temp cleanup is per-jsonl-path scoped** (closes R4-F03): the
+  staging temp convention `<jsonl_path>.tmp-import-replace-<operation_uuid>`
+  is per-target-jsonl-path, and §4 step 11's "clean stale import-replace
+  temp files" is scoped to `<resolved.jsonl_path>.tmp-import-replace-*` —
+  not a directory-wide sweep matching the feature prefix. Phase 6
+  implementation honors this scope and the §9.1 atomic-temp/rename test
+  binds it; `replace_journal/staging/<operation_uuid>.canonical.jsonl`
+  cleanup is similarly age-and-uuid scoped.
 - `other` storage is not replaceable in v1 even if locate can identify a path.
   Without a renderer/parser contract, writing would be guesswork.
 - Imported sessions lose parent/sidechain/compaction metadata until the
