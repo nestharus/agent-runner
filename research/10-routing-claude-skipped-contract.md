@@ -51,8 +51,24 @@ sole creator of the `providers` table.
 
 ### Behavior — by observed shape
 
-Use a `providers_columns` helper (mirroring
-`provider_quotas_columns`) to inspect `PRAGMA table_info(providers)`.
+Validation has three ordered layers; each must pass before the next
+runs:
+
+1. **Object-type check.** Query
+   `SELECT type FROM sqlite_master WHERE name = 'providers'`. If the
+   row is absent, treat the table as missing (Case 1 below). If the
+   returned `type` is anything other than `'table'` (e.g., `'view'`
+   because SQLite shares table/view namespace), return `Err` whose
+   message names the observed object type.
+2. **Foreign-key check.** Run `PRAGMA foreign_key_list(providers)`.
+   The contract's pre-fix and post-fix shapes carry no foreign keys.
+   If any FK is declared, return `Err` whose message names that
+   foreign-key constraints are present.
+3. **Column-shape check.** Use a `providers_columns` helper
+   (mirroring `provider_quotas_columns`) to inspect
+   `PRAGMA table_info(providers)`.
+
+After all three layers, switch on the column shape:
 
 1. **Table missing.** Create the post-fix table. Return `Ok(())`.
 2. **Post-fix shape** (`provider_name` present, `provider_index`

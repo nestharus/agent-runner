@@ -879,6 +879,22 @@ impl StateDb {
     }
 
     fn validate_providers_schema(conn: &Connection) -> Result<(), String> {
+        match Self::providers_object_type(conn)? {
+            None => return Ok(()),
+            Some(object_type) if object_type != "table" => {
+                return Err(format!(
+                    "Unexpected providers schema shape: object type={object_type}"
+                ));
+            }
+            _ => {}
+        }
+
+        if Self::providers_has_foreign_keys(conn)? {
+            return Err(
+                "Unexpected providers schema shape: foreign-key constraints present".to_string(),
+            );
+        }
+
         let columns = Self::providers_columns(conn)?;
         if columns.is_empty()
             || Self::providers_shape_is_post_fix(&columns)
@@ -891,6 +907,29 @@ impl StateDb {
             "Unexpected providers schema shape: {}",
             Self::describe_columns(&columns)
         ))
+    }
+
+    fn providers_object_type(conn: &Connection) -> Result<Option<String>, String> {
+        conn.query_row(
+            "SELECT type FROM sqlite_master WHERE name = 'providers'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| format!("Failed to inspect providers object type: {e}"))
+    }
+
+    fn providers_has_foreign_keys(conn: &Connection) -> Result<bool, String> {
+        let mut stmt = conn
+            .prepare("PRAGMA foreign_key_list(providers)")
+            .map_err(|e| format!("Failed to inspect providers foreign keys: {e}"))?;
+        let mut rows = stmt
+            .query([])
+            .map_err(|e| format!("Failed to inspect providers foreign keys: {e}"))?;
+        Ok(rows
+            .next()
+            .map_err(|e| format!("Failed to read providers foreign keys: {e}"))?
+            .is_some())
     }
 
     fn providers_columns(conn: &Connection) -> Result<Vec<ProviderColumn>, String> {
@@ -4196,6 +4235,95 @@ mod tests {
         assert!(
             err.contains("provider_index(type=TEXT"),
             "unexpected-shape error should describe the wrong affinity; got {err}"
+        );
+    }
+
+    // Risk: Migration error contract — providers as non-table object rejected | level: particular-integration
+    // Source: proposals/10-routing-claude-skipped.md §Test-intent track
+    #[test]
+    fn providers_migration_rejects_non_table_object_named_providers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(StateDb::invocations_schema_sql())
+            .unwrap();
+        // SQLite shares table/view namespace; create a VIEW named providers.
+        conn.execute_batch(
+            "CREATE TABLE providers_source (
+                 model_name TEXT NOT NULL,
+                 provider_name TEXT NOT NULL,
+                 invocation_count INTEGER NOT NULL DEFAULT 0,
+                 error_count INTEGER NOT NULL DEFAULT 0,
+                 last_error TEXT,
+                 last_error_at TEXT,
+                 last_invoked_at TEXT,
+                 PRIMARY KEY (model_name, provider_name)
+             );
+             CREATE VIEW providers AS
+                 SELECT model_name, provider_name, invocation_count, error_count,
+                        last_error, last_error_at, last_invoked_at
+                   FROM providers_source;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let err = match StateDb::open(&path) {
+            Ok(_) => panic!("non-table object named providers should fail StateDb::open"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("object type=view"),
+            "object-type rejection should name the unexpected type; got {err}"
+        );
+
+        let conn = Connection::open(&path).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT type FROM sqlite_master WHERE name = 'providers'")
+            .unwrap();
+        let observed_type: String = stmt
+            .query_row([], |row| row.get(0))
+            .expect("providers object should still exist after rejected open");
+        assert_eq!(
+            observed_type, "view",
+            "rejected open must not mutate the providers object"
+        );
+    }
+
+    // Risk: Migration error contract — providers with foreign keys rejected | level: particular-integration
+    // Source: proposals/10-routing-claude-skipped.md §Test-intent track
+    #[test]
+    fn providers_migration_rejects_table_with_foreign_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(StateDb::invocations_schema_sql())
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE models (
+                 name TEXT NOT NULL PRIMARY KEY
+             );
+             INSERT INTO models (name) VALUES ('routing-model');
+             CREATE TABLE providers (
+                 model_name TEXT NOT NULL REFERENCES models(name),
+                 provider_index INTEGER NOT NULL,
+                 invocation_count INTEGER NOT NULL DEFAULT 0,
+                 error_count INTEGER NOT NULL DEFAULT 0,
+                 last_error TEXT,
+                 last_error_at TEXT,
+                 last_invoked_at TEXT,
+                 PRIMARY KEY (model_name, provider_index)
+             );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let err = match StateDb::open(&path) {
+            Ok(_) => panic!("providers with foreign keys should fail StateDb::open"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("foreign-key constraints present"),
+            "foreign-key rejection should name foreign keys; got {err}"
         );
     }
 
