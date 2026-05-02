@@ -119,6 +119,48 @@ revisited.
   to `recover_pending_replaces`; it is not technically blocked, just not
   prioritized.
 
+## D-006 — Windows is not a supported target
+
+- **Source**: Initiative 06 PR #17 (`session_lock`) and PR #18
+  (`session_replace`) introduced POSIX-only primitives:
+  `nix::fcntl::flock`, `std::os::fd::AsRawFd`, hard-link publication
+  (`fs::hard_link`), atomic rename semantics (POSIX rename atomicity is
+  stronger than Windows MoveFileEx), 0o600 file modes, and Claude path-hash
+  decomposition that assumes `/`-separated paths. Discovered when the manual
+  Release workflow's `windows-latest` build started failing on `cargo build`
+  with `error[E0432]: unresolved import nix::fcntl` after PR #17 merged.
+  CI (`ci.yml`) runs only `ubuntu-latest`, so the regression went unflagged
+  until the first post-Initiative-06 release attempt.
+- **Decision**: Linux and macOS are the supported targets. Windows is
+  removed from the Release workflow matrix. The CLI is documented as a
+  Unix-only tool. No Windows shim, no `#[cfg(unix)]` gates, no NTFS-based
+  alternative locking implementation.
+- **Rationale**:
+  - The features that depend on POSIX primitives (`agents session
+    pause-handshake` / `import-replace` / `locate` / `export`) are core to
+    the project's value, not optional surfaces. A Windows port would have
+    to provide functionally-equivalent semantics for: advisory file locks
+    that release on process exit (Windows lacks POSIX `flock` semantics
+    natively — `LockFileEx` is the closest, with different exclusivity and
+    inheritance rules); atomic rename across same-volume directory entries
+    (NTFS-via-`MoveFileEx` is close enough); hard-link publication
+    (NTFS supports it, but the same-inode invariant differs); and Claude /
+    Codex transcript path conventions that the providers themselves only
+    document on Linux/macOS.
+  - The harness consumer (`agent-harness`) and the user's actual day-to-day
+    usage are on Linux. macOS coverage already exercises the same POSIX
+    code paths.
+  - Maintaining a Windows port would double the QA surface for a feature
+    set that is primarily about coordinating local-machine provider CLIs
+    (`claude`, `codex`) which themselves are not first-class on Windows.
+- **Revisit when**: a real user reports needing Windows. At that point,
+  evaluate whether to (a) implement a separate `session_lock_windows`
+  module with `LockFileEx` semantics and equivalent rename/publish
+  primitives, or (b) provide a "feature-gated stub" that compiles on
+  Windows but returns "unsupported on this platform" errors for every
+  affected CLI subcommand. Either route is several days of work plus a
+  Windows-shaped test environment; not warranted absent demand.
+
 ---
 
 ## Process
