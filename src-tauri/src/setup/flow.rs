@@ -502,3 +502,118 @@ fn truncate(s: &str, max: usize) -> String {
         format!("{}...", &s[..max])
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn with_temp_home(test: impl FnOnce(&std::path::Path)) {
+        let _guard = env_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let previous_home = std::env::var_os("HOME");
+
+        unsafe {
+            std::env::set_var("HOME", dir.path());
+        }
+
+        let result = catch_unwind(AssertUnwindSafe(|| test(dir.path())));
+
+        match previous_home {
+            Some(value) => unsafe {
+                std::env::set_var("HOME", value);
+            },
+            None => unsafe {
+                std::env::remove_var("HOME");
+            },
+        }
+
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
+    fn unlisted_command_name_is_rejected_before_execution() {
+        let err = execute_allowlisted("not-in-setup-allowlist", &[]).unwrap_err();
+
+        assert!(err.contains("not-in-setup-allowlist"), "{err}");
+        assert!(err.contains("not in the allowlist"), "{err}");
+    }
+
+    #[test]
+    fn listed_command_name_executes_and_returns_process_output() {
+        let args = vec!["sh".to_string()];
+        let (stdout, stderr, exit_code) = execute_allowlisted("which", &args).unwrap();
+
+        assert_eq!(exit_code, 0);
+        assert!(
+            stdout.lines().any(|line| line.ends_with("/sh")),
+            "stdout should identify the sh executable path, got: {stdout:?}"
+        );
+        assert_eq!(stderr, "");
+    }
+
+    #[test]
+    fn config_root_path_creates_parent_directories_and_writes_requested_content() {
+        with_temp_home(|home| {
+            let path = "~/.config/oulipoly-agent-runner/models/test-model.toml";
+            let content = "name = \"test-model\"\n";
+
+            let resolved = validate_and_write(path, content).unwrap();
+
+            let expected_path = home
+                .join(".config/oulipoly-agent-runner/models/test-model.toml")
+                .to_string_lossy()
+                .to_string();
+            assert_eq!(resolved, expected_path);
+            assert_eq!(std::fs::read_to_string(expected_path).unwrap(), content);
+        });
+    }
+
+    #[test]
+    fn local_bin_path_creates_parent_directories_and_writes_requested_content() {
+        with_temp_home(|home| {
+            let path = "~/.local/bin/oulipoly-test-wrapper";
+            let content = "#!/usr/bin/env bash\n";
+
+            let resolved = validate_and_write(path, content).unwrap();
+
+            let expected_path = home
+                .join(".local/bin/oulipoly-test-wrapper")
+                .to_string_lossy()
+                .to_string();
+            assert_eq!(resolved, expected_path);
+            assert_eq!(std::fs::read_to_string(expected_path).unwrap(), content);
+        });
+    }
+
+    #[test]
+    fn path_outside_approved_roots_is_rejected() {
+        with_temp_home(|_| {
+            let err = validate_and_write("~/outside-approved-roots.toml", "content").unwrap_err();
+
+            assert!(err.contains("not in allowed directories"), "{err}");
+        });
+    }
+
+    #[test]
+    #[ignore = "Confirmed bug: intended behavior from commit db3b73808a5be6ba38bada4770ef77740cf4b62c; see /home/nes/projects/agent-runner/planning/coverage/spec-setup-flow-security-helpers.md#behavior-2-setup-writes-are-limited-to-approved-roots"]
+    fn parent_directory_traversal_out_of_approved_root_is_rejected() {
+        with_temp_home(|_| {
+            let err = validate_and_write(
+                "~/.config/oulipoly-agent-runner/../../escaped.toml",
+                "content",
+            )
+            .unwrap_err();
+
+            assert!(err.contains("not in allowed directories"), "{err}");
+        });
+    }
+}
