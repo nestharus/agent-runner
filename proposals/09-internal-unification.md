@@ -1,18 +1,30 @@
-# Proposal — `session_replace` consumes `session_lock` + `session_metadata` (Rev 2)
+# Proposal — `session_replace` consumes `session_lock` + `session_metadata` (Rev 3)
 
 Closes `S-PR-F02` (06-import-replace forward-compat carryover) and
 `AIR-SUPPORTED-SURFACE-F04` (07-canonical-reader chain_id synthesis hazard).
 
-**Rev 2 changes**: closes Phase 4 R1 audit / supported-surface / scope /
-shortcut findings on Rev 1. Specifically: D1 / D5 add `active_segment_id` to
-`session_metadata::SessionMetadata` (closes `AIR-AUDIT-F01`); D3 specifies an
-RAII release guard (closes `AIR-AUDIT-F02`); D4 adds the public
-`session_lock::any_active_for_session` listing API and acknowledges it as a
-deliberate supported-surface expansion (closes `AIR-SUPPORTED-SURFACE-F02`);
-D7 carries `LockError::Busy.token_hash` through to the import-replace error
-JSON (closes `AIR-SUPPORTED-SURFACE-F01`); D8 documents the on-disk layout
-migration explicitly (closes `AIR-SUPPORTED-SURFACE-F03`); §5 names the test
-fixture file as a hookpoint (closes `AIR-SUPPORTED-SURFACE-F05`).
+**Rev 3 changes** (close Phase 4 R2 audit / scope / shortcut findings):
+- D5 marks `active_segment_id` as `#[serde(skip)]` so the `agents session locate`
+  JSON contract is unchanged (closes `AIR-SCOPE-R2-F02`).
+- D6 rewritten to acknowledge `session_replace` does **not** currently load
+  models, and specifies the four loads required (closes `AIR-AUDIT-R2-F02`,
+  `AIR-SHORTCUT-R2-F01`).
+- §4 `T-active-segment-id-flows` rewritten to assert the correct schema
+  (`last_turn_id` on `session_chain_segments`, `last_used_at` on
+  `session_chains`) (closes `AIR-AUDIT-R2-F01`).
+- §5 adds `src-tauri/src/main.rs` as a hookpoint for the
+  `LockError::Busy { expires_at, .. }` pattern update; the false claim that
+  CLI dispatch is untouched is removed (closes `AIR-SCOPE-R2-F01`).
+
+**Rev 2 changes** (closed Phase 4 R1 findings):
+- D1 / D5 add `active_segment_id` to `session_metadata::SessionMetadata`
+  (closes `AIR-AUDIT-F01`); D3 specifies an RAII release guard (closes
+  `AIR-AUDIT-F02`); D4 adds public `session_lock::any_active_for_session`
+  listing API (closes `AIR-SUPPORTED-SURFACE-F02`); D7 carries
+  `LockError::Busy.token_hash` through to the import-replace error JSON
+  (closes `AIR-SUPPORTED-SURFACE-F01`); D8 documents the on-disk layout
+  migration explicitly (closes `AIR-SUPPORTED-SURFACE-F03`); §5 names the
+  test fixture file as a hookpoint (closes `AIR-SUPPORTED-SURFACE-F05`).
 
 ## §1 What changes
 
@@ -133,14 +145,16 @@ Extend `session_metadata::SessionMetadata`:
 ```rust
 pub struct SessionMetadata {
     // ... existing fields ...
-    pub active_segment_id: i64,    // NEW
+    #[serde(skip)]
+    pub active_segment_id: i64,    // NEW; not in agents session locate JSON
 }
 ```
 
-`locate_session_metadata` populates it from `session_chain_segments.id` of
-the chosen active segment row. Existing callers (`agents session locate`,
-canonical reader's `export_metadata_for`) ignore the new field; it is
-informational for them.
+`locate_session_metadata` populates `active_segment_id` from
+`session_chain_segments.id` of the chosen active segment row.
+`#[serde(skip)]` keeps it out of the `agents session locate` JSON contract
+documented in `README.md` "Locating a Session"; only `session_replace`
+consumes it.
 
 `session_replace::run_import_replace_bytes` consumes `metadata.active_segment_id`
 where it currently uses the private `SessionMetadata.active_segment_id`. The
@@ -150,14 +164,41 @@ via the public field.
 `export_metadata_for(metadata, ...)` copies `metadata.chain_id` into
 `ExportSessionMetadata.chain_id` — the synthesized `String::new()` is gone.
 
-### D6 — Resolver call requires loaded `ProvidersConfig` / `SessionsConfig`
+### D6 — `session_replace` loads models for the public resolver call
 
-`session_metadata::locate_session_metadata` already takes
-`&StateDb, &ModelStore, &ProvidersConfig, &SessionsConfig, &str`. The call
-site in `session_replace::run_import_replace_bytes` already loads all four
-via `ProvidersConfig::load(...)` / `SessionsConfig::load(...)` /
-`StateDb::open_default()` / `load_models(...)`. Wire the existing loads into
-the public call.
+`session_metadata::locate_session_metadata` requires
+`&StateDb, &ModelStore, &ProvidersConfig, &SessionsConfig, &str`. The current
+private resolver in `session_replace/mod.rs:803-844` opens `StateDb` and
+loads `ProvidersConfig` + `SessionsConfig` but **does not load models** —
+model-aware resolution is currently unique to other call sites
+(`main.rs::run_session_locate`, `main.rs::run_resume_list`, etc).
+
+The lift adds a model-load step to `session_replace::run_import_replace_bytes`:
+
+```rust
+let state = StateDb::open_default().map_err(/* op error */)?;
+let models = load_models(&default_models_dir())
+    .map_err(/* op error */)?;
+let providers = ProvidersConfig::load(&default_config_root().join("providers.toml"))
+    .map_err(/* op error */)?;
+let sessions = SessionsConfig::load(&default_config_root().join("sessions.toml"))
+    .map_err(/* op error */)?;
+let metadata = locate_session_metadata(&state, &models, &providers, &sessions, session_id)
+    .map_err(map_metadata_error)?;
+```
+
+Side-effect contract for the load:
+- Adds a `crate::config::load_models` call to `session_replace`. No new
+  filesystem dependency — the models dir is the same one consumed by every
+  other resolver call site.
+- The public locator's model-validation surface (via
+  `state.resolve_resume(models, ...)`) now applies to the import-replace
+  resolution path. This tightens — not loosens — error reporting:
+  `ResumeError::UnknownModel` and
+  `ResumeError::ProviderModelMismatch` become reachable.
+  `map_metadata_error` routes both to `ReplaceError::OperationalError` /
+  `ReplaceError::UnsupportedStorage` per the existing `MetadataError`
+  variants. Exit codes remain in {1, 12}; no new code introduced.
 
 ### D7 — Carry `token_hash` through `LockError::Busy`
 
@@ -261,10 +302,16 @@ Phase 6 tests:
   acquires immediately. Closes `AIR-AUDIT-F02`'s release-on-error
   contract.
 
-- **New T-active-segment-id-flows**: replace a session, then read
-  `session_chain_segments` directly via SQLite and assert the
-  `last_turn_id` and `last_used_at` were updated on the **same row** that
-  `locate_session_metadata` returned. Closes `AIR-AUDIT-F01`.
+- **New T-active-segment-id-flows**: replace a session and assert:
+  (a) `session_metadata::locate_session_metadata(...).active_segment_id`
+      returns the chosen active segment row id pre-replace.
+  (b) `session_chain_segments.last_turn_id` is updated on that exact
+      `id` post-replace.
+  (c) `session_chains.last_used_at` is updated for `metadata.chain_id`
+      post-replace.
+  Closes `AIR-AUDIT-F01` and `AIR-AUDIT-R2-F01` (correct schema:
+  `last_turn_id` lives on `session_chain_segments`; `last_used_at` lives
+  on `session_chains`).
 
 - **New T-any-active-for-session-public**: component test on
   `session_lock::any_active_for_session` covering: missing lock dir,
@@ -278,11 +325,22 @@ Files touched (additive vs delete):
 - `src-tauri/src/session_lock/mod.rs` — extend `LockError::Busy` with
   `token_hash`; populate it on acquire from existing on-disk JSON. Add
   `pub fn any_active_for_session`.
-- `src-tauri/src/session_metadata/mod.rs` — add `active_segment_id: i64`
-  to `SessionMetadata`; populate it in `locate_session_metadata`.
+- `src-tauri/src/session_metadata/mod.rs` — add
+  `#[serde(skip)] pub active_segment_id: i64` to `SessionMetadata`;
+  populate it in `locate_session_metadata`. The `#[serde(skip)]` keeps the
+  `agents session locate` JSON contract unchanged.
 - `src-tauri/src/state/db.rs` — `ResolvedResume` may need
   `active_segment_id` (verify at Step 6c; if not, the resolver can
   perform the lookup as a single extra column read).
+
+**CLI consumer update (additive pattern fix):**
+- `src-tauri/src/main.rs` — `emit_lock_error` (or the equivalent caller of
+  `LockError`) currently destructures `LockError::Busy { expires_at }`. After
+  D7, that pattern needs `Busy { expires_at, .. }` (or
+  `Busy { expires_at, token_hash, .. }` if `pause-handshake` opts to expose
+  `token_hash` in its busy JSON). One-line pattern fix; no semantic change.
+  The `pause-handshake` busy JSON does NOT change in this PR; the opt-in is
+  a separate decision.
 
 **Net delete + lift:**
 - `src-tauri/src/session_replace/internal/mod.rs` — **deleted entirely**.
@@ -318,7 +376,9 @@ Files touched (additive vs delete):
   T-error-path-release, T-active-segment-id-flows,
   T-any-active-for-session-public.
 
-CLI dispatch in `src-tauri/src/main.rs` is untouched.
+CLI dispatch is touched only in the one spot listed above (the
+`LockError::Busy` pattern); no functional behavior change to
+`agents session pause-handshake` / `resume-handshake`.
 
 ## §6 Supported-surface migration record
 
