@@ -792,6 +792,29 @@ mod tests {
         }
     }
 
+    fn provider_names(model: &ModelConfig) -> Vec<String> {
+        model.providers.iter().map(|p| p.name.clone()).collect()
+    }
+
+    fn assert_model_provider_names(
+        app: &tauri::App<tauri::test::MockRuntime>,
+        name: &str,
+        expected: &[&str],
+    ) {
+        let state = app.state::<AppState>();
+        let models = state.models.lock().unwrap();
+        let model = models
+            .get(name)
+            .unwrap_or_else(|| panic!("missing model {name}"));
+        let expected: Vec<String> = expected.iter().map(|name| name.to_string()).collect();
+        assert_eq!(provider_names(model), expected);
+    }
+
+    fn read_model_from_disk(models_dir: &std::path::Path, name: &str) -> ModelConfig {
+        let content = std::fs::read_to_string(models_dir.join(format!("{name}.toml"))).unwrap();
+        ModelConfig::from_toml(name, &content).unwrap()
+    }
+
     #[test]
     fn derive_pools_groups_by_command_set() {
         let mut models = HashMap::new();
@@ -929,10 +952,120 @@ mod tests {
         models.insert("existing".into(), make_model("existing", &["claude"]));
         let app = mock_app_with_state(models, models_dir);
 
-        let result = save_model(app.state::<AppState>(), make_model("write-fails", &["claude"]));
+        let result = save_model(
+            app.state::<AppState>(),
+            make_model("write-fails", &["claude"]),
+        );
 
         assert!(result.is_err());
         assert_model_keys(&app, &["existing"]);
+    }
+
+    #[test]
+    fn update_pool_with_empty_new_commands_returns_error_without_mutating_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        let mut models = HashMap::new();
+        models.insert("existing".into(), make_model("existing", &["claude"]));
+        let app = mock_app_with_state(models, models_dir.clone());
+
+        let result = update_pool(app.state::<AppState>(), vec!["claude".to_string()], vec![]);
+
+        assert!(result.is_err());
+        assert!(!models_dir.join("existing.toml").exists());
+        assert_model_provider_names(&app, "existing", &["claude"]);
+    }
+
+    #[test]
+    fn update_pool_rejects_unmatched_original_commands_without_mutating_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        let mut models = HashMap::new();
+        models.insert("existing".into(), make_model("existing", &["claude"]));
+        let app = mock_app_with_state(models, models_dir.clone());
+
+        let result = update_pool(
+            app.state::<AppState>(),
+            vec!["codex".to_string()],
+            vec!["gemini".to_string()],
+        );
+
+        assert!(result.is_err());
+        assert!(!models_dir.join("existing.toml").exists());
+        assert_model_provider_names(&app, "existing", &["claude"]);
+    }
+
+    #[test]
+    fn update_pool_applies_deduped_command_set_to_all_matching_models_and_persists_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let mut models = HashMap::new();
+        models.insert("alpha".into(), make_model("alpha", &["claude", "codex"]));
+        models.insert("beta".into(), make_model("beta", &["codex", "claude"]));
+        models.insert("gamma".into(), make_model("gamma", &["gemini"]));
+        let app = mock_app_with_state(models, models_dir.clone());
+
+        let result = update_pool(
+            app.state::<AppState>(),
+            vec![
+                "codex".to_string(),
+                "claude".to_string(),
+                "claude".to_string(),
+            ],
+            vec![
+                "gemini".to_string(),
+                "claude".to_string(),
+                "gemini".to_string(),
+            ],
+        );
+
+        assert!(result.is_ok());
+        assert_model_provider_names(&app, "alpha", &["claude", "gemini"]);
+        assert_model_provider_names(&app, "beta", &["claude", "gemini"]);
+        assert_model_provider_names(&app, "gamma", &["gemini"]);
+
+        assert_eq!(
+            provider_names(&read_model_from_disk(&models_dir, "alpha")),
+            vec!["claude".to_string(), "gemini".to_string()]
+        );
+        assert_eq!(
+            provider_names(&read_model_from_disk(&models_dir, "beta")),
+            vec!["claude".to_string(), "gemini".to_string()]
+        );
+        assert!(!models_dir.join("gamma.toml").exists());
+    }
+
+    #[test]
+    fn update_pool_matches_prefixed_runtime_provider_by_provider_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let mut model = make_model("prefixed", &[]);
+        model.providers = vec![ProviderConfig::new(
+            "env",
+            vec![
+                "-u".to_string(),
+                "CLAUDECODE".to_string(),
+                "claude".to_string(),
+            ],
+        )];
+        let mut models = HashMap::new();
+        models.insert("prefixed".into(), model);
+        let app = mock_app_with_state(models, models_dir.clone());
+
+        let result = update_pool(
+            app.state::<AppState>(),
+            vec!["claude".to_string()],
+            vec!["codex".to_string()],
+        );
+
+        assert!(result.is_ok());
+        assert_model_provider_names(&app, "prefixed", &["codex"]);
+        assert_eq!(
+            provider_names(&read_model_from_disk(&models_dir, "prefixed")),
+            vec!["codex".to_string()]
+        );
     }
 
     #[cfg(unix)]
