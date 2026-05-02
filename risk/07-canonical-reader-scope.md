@@ -24,7 +24,7 @@ Proposal §1 / §2 / §5 declared:
 
 Diff (`git diff main..07-canonical-reader-rca --stat`):
 
-```
+```text
 src-tauri/src/session_export/mod.rs             |  61 ++++-
 src-tauri/src/session_replace/internal/mod.rs   |  44 ++--
 src-tauri/src/session_replace/mod.rs            | 320 +++++++-----------------
@@ -85,33 +85,22 @@ The plumbing is mechanical and stays inside the module's private surface
 
 **What would close it:** none required for LOW verdict.
 
-### AIR-SCOPE-F03 — Two metadata-bridge helpers exist; one is dead code
+### AIR-SCOPE-F03 — Metadata bridge helper duplication resolved
 
 **Severity:** LOW
 
 **Evidence:**
-- `session_replace/internal/mod.rs:46-56` defines
-  `SessionMetadata::to_export_metadata(&self)` annotated
-  `#[allow(dead_code)]`.
-- `session_replace/mod.rs:1074-1093` defines a separate free function
-  `export_metadata_for(storage_type, session_id, provider_name, jsonl_path)`.
-- All call sites use the free function (`mod.rs:1123, 1162`); the inherent
-  method has zero callers (per `Grep`).
+- `session_replace/internal/mod.rs` now defines only `SessionMetadata` and
+  `StorageType`; there is no `SessionMetadata::to_export_metadata` helper.
+- `session_replace/mod.rs` keeps the single private `export_metadata_for(...)`
+  bridge used by the canonical reader calls.
 
-Proposal §5 prescribed exactly one helper:
-`pub fn export_metadata_for(meta: &SessionMetadata) -> ExportSessionMetadata`.
-The implementation has both a method matching the prescribed shape (unused)
-and a differently-shaped free function (used).
+**Why this is LOW, not MEDIUM:** this is documentation cleanup for a stale
+audit note. The code surface already has one helper, so there is no production
+path divergence.
 
-**Why this is LOW, not MEDIUM:** non-functional duplication. Both helpers
-produce the same `ExportSessionMetadata`, just with different argument
-plumbing. The `#[allow(dead_code)]` annotation makes the duplication
-intentional/visible. No production-path divergence.
-
-**What would close it:** delete `SessionMetadata::to_export_metadata`, OR
-re-route call sites at `mod.rs:1123, 1162` to use it and remove the
-free-function wrapper. Either resolves the unused symbol without altering
-behavior.
+**What would close it:** closed as of the CodeRabbit loop; no code change is
+needed for this finding.
 
 ### AIR-SCOPE-F04 — `ExportError → ReplaceError` mapping is more precise than proposal D6 anticipated
 

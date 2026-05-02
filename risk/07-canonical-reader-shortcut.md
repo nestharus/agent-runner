@@ -13,7 +13,7 @@ purpose, as the RCA states, is the invariant:
 The proposal selects option (a) — `session_replace` consumes
 `session_export::parse_*` directly — and the implementation does exactly that,
 deleting the duplicate parsers rather than patching them. RC-1..RC-6 are closed
-by deletion of the duplicated code path; they are not re-introducable without
+by deletion of the duplicated code path; they are not reintroducible without
 reverting the unification. Tests T1, T2, T4 (red on `941e6e8`) un-`#[ignore]`
 and pass; the full `initiative_06_import_replace` suite is green at 29/29; and
 `cargo clippy --all-targets -- -D warnings` is clean.
@@ -129,7 +129,7 @@ focused follow-up after audit/supported-surface verdicts.
 
 ## Build / test evidence
 
-```
+```text
 $ cargo build --manifest-path src-tauri/Cargo.toml --tests
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 32s
 

@@ -364,6 +364,9 @@ fn run_import_replace_bytes(
             line: None,
         })?;
     let records = parse_canonical_jsonl(input_text)?;
+    for record in &records {
+        validate_record_for_render(record)?;
+    }
     let canonical_bytes = input_text.as_bytes().to_vec();
 
     let data_root = default_data_root()?;
@@ -740,6 +743,17 @@ fn validate_record_for_render(record: &CanonicalRecord) -> Result<(), ReplaceErr
             reason: format!("unsupported role {}", record.role),
             line: None,
         });
+    }
+    for chunk in &record.content {
+        if chunk.text.is_none() {
+            return Err(ReplaceError::InvalidInputTranscript {
+                reason: format!(
+                    "content chunk type {} cannot be rendered losslessly without text",
+                    chunk.r#type
+                ),
+                line: None,
+            });
+        }
     }
     Ok(())
 }
@@ -1163,7 +1177,7 @@ fn map_export_error(err: ExportError) -> ReplaceError {
         ExportError::MalformedTranscript { line, reason, .. } => {
             ReplaceError::InvalidInputTranscript {
                 reason,
-                line: Some(line),
+                line: if line == 0 { None } else { Some(line) },
             }
         }
         ExportError::Operational { message } => ReplaceError::OperationalError { message },

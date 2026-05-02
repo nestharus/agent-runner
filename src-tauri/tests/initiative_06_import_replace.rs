@@ -897,6 +897,48 @@ fn t_unsupported_record_class() {
     assert_no_replace_journal_pollution(&prepared.fixture, &prepared.session_id);
 }
 
+/// Risk: canonical chunks without text may be lossy-rendered as empty text after journal staging.
+/// Level: component.
+/// Source: CodeRabbit R1-F08.
+/// Observable: exit 15 invalid-input-transcript before transcript, DB rows, or journal mutate.
+/// Residual: covers one representative structured chunk; future canonical schemas may add explicit payload fields.
+#[test]
+fn t_non_text_chunk_without_text_rejects_without_mutation() {
+    let prepared = prepared_claude_replace_fixture();
+    let before = prepared.fixture.mutation_snapshot(
+        &prepared.jsonl_path,
+        &prepared.provider_name,
+        &prepared.session_id,
+    );
+    let input = canonical_jsonl_with_unrenderable_chunk(
+        &prepared.session_id,
+        &prepared.provider_name,
+        &prepared.jsonl_path,
+    );
+
+    let output = prepared
+        .fixture
+        .run_import_replace(&prepared.session_id, &input, &[]);
+
+    assert_eq!(output.status.code(), Some(15), "{output:?}");
+    let json = assert_json_error(&output, "invalid-input-transcript");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("cannot be rendered losslessly without text"),
+        "{json}"
+    );
+    let after = prepared.fixture.mutation_snapshot(
+        &prepared.jsonl_path,
+        &prepared.provider_name,
+        &prepared.session_id,
+    );
+    assert_eq!(after.transcript_bytes, before.transcript_bytes);
+    assert_eq!(after.turn_rows, before.turn_rows);
+    assert_no_replace_journal_pollution(&prepared.fixture, &prepared.session_id);
+}
+
 /// Risk: T-schema-incompatible — import-replace may write input before rejecting an unsafe state DB schema.
 /// Level: component.
 /// Source: proposal §9.1 T-schema-incompatible; A6 schema-preflight.
@@ -1196,4 +1238,24 @@ fn assert_public_session_replace_contract_types_are_reachable() {
     type RunImportReplaceFn =
         fn(&str, Option<&std::path::Path>, Option<&str>) -> Result<ReplaceReceipt, ReplaceError>;
     let _runner: RunImportReplaceFn = run_import_replace;
+}
+
+fn canonical_jsonl_with_unrenderable_chunk(
+    session_id: &str,
+    provider_name: &str,
+    jsonl_path: &std::path::Path,
+) -> String {
+    canonical_jsonl(session_id, provider_name, jsonl_path, "unrenderable")
+        .lines()
+        .enumerate()
+        .map(|(idx, line)| {
+            let mut record: serde_json::Value = serde_json::from_str(line).unwrap();
+            if idx == 1 {
+                record["content"] = serde_json::json!([{"type": "tool_use"}]);
+            }
+            serde_json::to_string(&record).unwrap()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
 }

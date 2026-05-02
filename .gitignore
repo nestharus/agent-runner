@@ -41,6 +41,7 @@ credentials.json
 # Process scratch — agent prompts, transient outputs
 tmp/
 .tmp/
+CODERABBIT_*.md
 
 # Worktrees (per-PR isolation for phase 6)
 /worktrees/

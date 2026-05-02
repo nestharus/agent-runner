@@ -26,7 +26,7 @@ cargo test --test initiative_06_import_replace -- --include-ignored \
 
 Captured output at HEAD `941e6e8` (post-merge, pre-fix):
 
-```
+```text
 test t4_preimage_match_succeeds_with_current_canonical_export_hash ... FAILED
 test t2_codex_replace_writes_codex_rollout_jsonl ... FAILED
 test t1_valid_replace_claude_stdin_emits_receipt_and_provider_native_transcript ... FAILED
@@ -146,7 +146,7 @@ cargo test --test initiative_07_canonical_reader_unification
 
 Captured red output:
 
-```
+```text
 test rc2_preimage_with_claude_tool_use_chunk_matches_export_hash ... FAILED
 test rc4_preimage_with_claude_compaction_summary_matches_export_hash ... FAILED
 test rc5_out_of_order_timestamps_surface_consistently ... FAILED
@@ -181,7 +181,7 @@ The RCA reveals a process gap, not a code gap:
 After the fix, for every supported provider transcript T and resolved session
 S:
 
-```
+```text
 sha256(agents session export <S>.stdout)
   == receipt.postimage_sha256 produced by import-replace whose postimage
      transcript bytes are the result of importing canonical(T)
