@@ -131,6 +131,25 @@ Subcommands:
   session locate <session-id> [--json]
         Locate stable metadata for a provider session (see Locating a Session)
 
+  session schema-probe
+        Inspect the default state-DB schema and supported session features
+        (see Probing the Session Surface).
+
+  session export <session-id> [--format canonical-jsonl]
+        Export a provider session as canonical JSONL on stdout
+        (see Exporting a Session).
+
+  session import-replace <session-id> [--from-file <path>] [--preimage-sha256 <hex>]
+        Atomically replace a provider transcript and its derived state from
+        canonical JSONL on stdin or `--from-file` (see Replacing a Session
+        Transcript).
+
+  session pause-handshake <session-id> [--ttl-ms <ms>]
+        Acquire an advisory pause lease for a session (see Session Locks).
+
+  session resume-handshake <session-id> --token <token>
+        Release a previously acquired advisory pause lease.
+
   repl [<model>] [--resume <session-id>] [-p <project>] [--models-dir <path>]
         Launch a balanced interactive session of the wrapped CLI
         (see Interactive REPL)
@@ -464,6 +483,124 @@ Exit codes:
 | `12` | `unsupported-storage` | `MetadataError::UnsupportedStorage`; absent storage block, transcript not canonical/available, workspace_root not derivable, etc. No partial success JSON ever emitted. |
 
 `trace --json` remains invocation-tree scoped and degrades to `no_locator` or `missing` transcript states for diagnostics. `session locate` is action-oriented and refuses partial locations with `unsupported-storage`.
+
+### Probing the Session Surface
+
+```bash
+oulipoly-agent-runner session schema-probe
+```
+
+`session schema-probe` is a **read-only** inspector for the default state DB. It reports binary metadata, schema versions, structural compatibility, supported feature flags, and a `safe_for_import_replace` predicate. It does not open the DB read-write, does not run migrations, and does not create state if it is missing.
+
+Use it before scripting any other `session` subcommand to confirm the local DB is current and the feature you want is supported on this build.
+
+| Exit | Error code | Trigger |
+|------|------------|---------|
+| `0` | none | Probe completed (DB present and compatible, OR DB absent — both are non-error states). |
+| `1` | `operational-error` | DB unreadable or corrupt at the OS level. |
+| `14` | `schema-incompatible` | DB present but `user_version` is below the binary's minimum supported schema version. |
+
+### Exporting a Session
+
+```bash
+oulipoly-agent-runner session export <session-id>
+```
+
+`session export` resolves the session, opens the provider transcript read-only, and emits **canonical JSONL** on stdout — one record per turn with stable, provider-agnostic fields plus a `source` block carrying the byte range and SHA-256 preimage of the source line. The default `--format canonical-jsonl` is the only supported format today.
+
+Canonical record fields:
+
+```json
+{
+  "session_id": "…", "provider_name": "…", "turn_id": "…",
+  "role": "user|assistant", "timestamp": "<RFC 3339>",
+  "content": [{"type": "text|tool_use|…", "text": "…"}],
+  "source": {
+    "storage_type": "claude_code|codex_session",
+    "jsonl_path": "<absolute path>",
+    "line": 1, "byte_start": 0, "byte_end": 192,
+    "sha256": "<hex>"
+  },
+  "unsupported_record": false
+}
+```
+
+The reader is the round-trip oracle for `session import-replace`: `sha256(session export <id>)` byte-equals `import-replace`'s `preimage_sha256` / `postimage_sha256` for the same transcript file.
+
+| Exit | Error code | Trigger |
+|------|------------|---------|
+| `0` | none | Compact JSONL on stdout. |
+| `1` | `operational-error` | DB / I/O failure. |
+| `2` | `invalid-session-id` | Non-UUID input or unsupported `--format`. |
+| `10` | `session-not-found` | No chain owns this session. |
+| `11` | `ambiguous-session` | Multiple chains match; refuses partial answer. |
+| `12` | `unsupported-storage` | Provider has no `session_storage` config or transcript is not canonical. |
+| `15` | `malformed-provider-transcript` | Provider transcript is invalid (out-of-order timestamps, missing required fields, non-UTF-8). |
+
+### Replacing a Session Transcript
+
+```bash
+# stdin
+oulipoly-agent-runner session export <id> | edit-canonical | \
+  oulipoly-agent-runner session import-replace <id>
+
+# --from-file
+oulipoly-agent-runner session import-replace <id> --from-file ./edited.jsonl
+
+# preimage-gated (recommended): refuses if the transcript drifted between read and write
+PREIMAGE=$(oulipoly-agent-runner session export <id> | sha256sum | awk '{print $1}')
+…edit canonical…
+oulipoly-agent-runner session import-replace <id> \
+  --preimage-sha256 "$PREIMAGE" --from-file ./edited.jsonl
+```
+
+`session import-replace` accepts **canonical JSONL only** (the same shape `session export` emits). It renders that input back into provider-native bytes, swaps the on-disk transcript atomically, replaces the session's `session_turns` rows, and emits a receipt JSON to stdout:
+
+```json
+{
+  "session_id": "…", "provider_name": "…",
+  "storage_type": "claude_code|codex_session",
+  "operation": "import-replace",
+  "preimage_sha256": "<canonical export hash before>",
+  "postimage_sha256": "<canonical export hash after>",
+  "jsonl_path": "<absolute path>",
+  "state_updated": true,
+  "committed_at": "<RFC 3339>"
+}
+```
+
+Atomicity contract:
+- The transcript-on-disk write and the `session_turns` row replacement happen in a two-phase commit (rename + SQLite transaction). Either both land or neither lands.
+- Acquires an advisory `SessionLock` for the duration; concurrent import-replace on the same session returns exit `13` `session-busy`.
+- If the runner crashes between the rename and the SQLite commit, the next agent-runner startup scans `<state-data-dir>/replace_journal/` and either re-applies the DB change or quarantines the journal entry.
+- `--preimage-sha256` is the optimistic-concurrency guard: if it does not match the canonical hash of the transcript at acquire time, the operation aborts before any mutation.
+- Lossless rendering is required; canonical records that cannot be losslessly rendered (non-text content chunks without `text`, unsupported roles, etc.) cause exit `15` with no transcript or DB mutation.
+
+| Exit | Error code | Trigger |
+|------|------------|---------|
+| `0` | none | Receipt JSON on stdout; transcript and DB updated atomically. |
+| `1` | `operational-error` | I/O, lock, or SQLite failure outside the structured contract. |
+| `2` | `invalid-session-id` / `invalid-argument` | Non-UUID input or malformed `--preimage-sha256`. |
+| `10` | `session-not-found` | No chain owns this session. |
+| `11` | `ambiguous-session` | Multiple chains match. |
+| `12` | `unsupported-storage` | Provider has no compatible `session_storage` block. |
+| `13` | `session-busy` | Another holder owns the `SessionLock`. |
+| `14` | `schema-incompatible` | State DB schema is below minimum. |
+| `15` | `invalid-input-transcript` / `preimage-mismatch` | Canonical input is malformed, lossy under the renderer, or `--preimage-sha256` did not match. |
+
+Anti-scope: `session import-replace --recover` and `migrate-db --recover` do not exist. Recovery runs implicitly at the top of every CLI invocation.
+
+### Session Locks
+
+```bash
+TOKEN=$(oulipoly-agent-runner session pause-handshake <session-id> --ttl-ms 30000 | jq -r '.token')
+# … hold the lease while you read or modify the transcript out-of-band …
+oulipoly-agent-runner session resume-handshake <session-id> --token "$TOKEN"
+```
+
+`pause-handshake` acquires an advisory lease on a session and emits a JSON object with `token`, `expires_at`, and the resolved storage block. While the lease is held, `session import-replace` on the same session returns exit `13` `session-busy`. The lease auto-expires after the TTL (default ≈5 minutes); `resume-handshake` releases it explicitly.
+
+The lock is advisory: it coordinates well-behaved `oulipoly-agent-runner` consumers but does not block external writers from mutating the on-disk transcript. Use it together with `session import-replace`'s `--preimage-sha256` for safe concurrent edits.
 
 ### Cross-invocation tracking
 
