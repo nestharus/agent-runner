@@ -258,9 +258,9 @@ fn compute_projections_from_records(
         .map(|i| {
             let ws = &windows[i];
             let recent_errors = state
-                .recent_error_count(&model.name, i, ERROR_WINDOW_MINUTES)
+                .recent_error_count(&model.name, &model.providers[i].name, ERROR_WINDOW_MINUTES)
                 .unwrap_or(0);
-            if recent_errors >= ERROR_THRESHOLD {
+            if recent_errors >= ERROR_THRESHOLD as i64 {
                 return ProviderProjection {
                     provider_index: i,
                     projections_per_window: Vec::new(),
@@ -588,16 +588,16 @@ fn score_by_invocation_count(model: &ModelConfig, state: &StateDb, candidates: &
 
     for &i in candidates {
         let recent_errors = state
-            .recent_error_count(&model.name, i, ERROR_WINDOW_MINUTES)
+            .recent_error_count(&model.name, &model.providers[i].name, ERROR_WINDOW_MINUTES)
             .unwrap_or(0);
 
-        if recent_errors >= ERROR_THRESHOLD {
+        if recent_errors >= ERROR_THRESHOLD as i64 {
             scores.push((i, f64::MAX));
             continue;
         }
 
         let invocation_count = state
-            .get_provider(&model.name, i)
+            .get_provider(&model.name, &model.providers[i].name)
             .ok()
             .flatten()
             .map(|p| p.invocation_count)
@@ -620,12 +620,12 @@ fn round_robin_fallback(model: &ModelConfig, state: &StateDb, candidates: &[usiz
         !candidates.is_empty(),
         "round_robin_fallback: caller must pass a non-empty candidates slice"
     );
-    let mut min_count = u64::MAX;
+    let mut min_count = i64::MAX;
     let mut best = candidates.first().copied().unwrap_or(0);
 
     for &i in candidates {
         let count = state
-            .get_provider(&model.name, i)
+            .get_provider(&model.name, &model.providers[i].name)
             .ok()
             .flatten()
             .map(|p| p.invocation_count)
@@ -727,6 +727,24 @@ mod tests {
         }
 
         assert_eq!(select_provider(&model, &db, None), 1);
+    }
+
+    // Risk: Balancer recent-error call-site | level: unit
+    // Source: proposals/10-routing-claude-skipped.md §Test-intent track
+    #[test]
+    fn fallback_recent_error_scoring_uses_provider_name_not_reused_index() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = two_provider_model();
+
+        for _ in 0..3 {
+            record_invocation_for_test(&db, "test", "old-a", 0, false);
+        }
+
+        let selected = select_provider(&model, &db, None);
+        assert_eq!(
+            model.providers[selected].name, "a",
+            "stale failures for old-a at index 0 must not suppress current provider a"
+        );
     }
 
     fn quota_window(used: f64, hours_until_reset: i64) -> crate::state::QuotaWindowInput {
