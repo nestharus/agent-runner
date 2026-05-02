@@ -1219,6 +1219,42 @@ mod tests {
     }
 
     #[test]
+    fn delete_model_removes_persisted_config_and_model_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let model = make_model("removable", &["claude"]);
+        std::fs::write(models_dir.join("removable.toml"), model.to_toml()).unwrap();
+        let mut models = HashMap::new();
+        models.insert("removable".into(), model);
+        models.insert("kept".into(), make_model("kept", &["codex"]));
+        let app = mock_app_with_state(models, models_dir.clone());
+
+        let result = delete_model(app.state::<AppState>(), "removable".to_string());
+
+        assert!(result.is_ok());
+        assert!(!models_dir.join("removable.toml").exists());
+        assert_model_keys(&app, &["kept"]);
+    }
+
+    #[test]
+    fn delete_model_when_file_removal_fails_returns_error_without_mutating_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(models_dir.join("undeletable.toml")).unwrap();
+        let mut models = HashMap::new();
+        models.insert("undeletable".into(), make_model("undeletable", &["claude"]));
+        models.insert("kept".into(), make_model("kept", &["codex"]));
+        let app = mock_app_with_state(models, models_dir.clone());
+
+        let result = delete_model(app.state::<AppState>(), "undeletable".to_string());
+
+        assert!(result.is_err());
+        assert!(models_dir.join("undeletable.toml").exists());
+        assert_model_keys(&app, &["kept", "undeletable"]);
+    }
+
+    #[test]
     fn update_pool_with_empty_new_commands_returns_error_without_mutating_models() {
         let dir = tempfile::tempdir().unwrap();
         let models_dir = dir.path().join("models");
