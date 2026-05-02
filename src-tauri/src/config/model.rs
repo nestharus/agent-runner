@@ -927,4 +927,114 @@ prompt_mode = "stdin"
         let err = ModelConfig::from_toml("claude-opus", toml).unwrap_err();
         assert!(err.contains("agents migrate-config"));
     }
+
+    #[test]
+    fn session_capture_none_requires_no_capture_fields() {
+        let capture = SessionCapture {
+            kind: SessionCaptureKind::None,
+            flag: None,
+            readback_args: None,
+            event_type: None,
+            event_id_path: None,
+            json_flag: None,
+            last_message_flag: None,
+        };
+
+        assert!(capture.validate().is_ok());
+    }
+
+    #[test]
+    fn session_capture_forced_flag_verified_requires_flag() {
+        let capture = SessionCapture {
+            kind: SessionCaptureKind::ForcedFlagVerified,
+            flag: None,
+            readback_args: None,
+            event_type: None,
+            event_id_path: None,
+            json_flag: None,
+            last_message_flag: None,
+        };
+
+        let err = capture.validate().unwrap_err();
+        assert!(err.contains("requires `flag`"));
+    }
+
+    #[test]
+    fn session_capture_stdout_json_event_requires_json_flag() {
+        let capture = SessionCapture {
+            kind: SessionCaptureKind::StdoutJsonEvent,
+            flag: None,
+            readback_args: None,
+            event_type: Some("message".to_string()),
+            event_id_path: Some("session.id".to_string()),
+            json_flag: None,
+            last_message_flag: Some("--last-message".to_string()),
+        };
+
+        let err = capture.validate().unwrap_err();
+        assert!(err.contains("requires `json_flag`"));
+    }
+
+    #[test]
+    fn session_capture_stdout_json_event_requires_last_message_flag() {
+        let capture = SessionCapture {
+            kind: SessionCaptureKind::StdoutJsonEvent,
+            flag: None,
+            readback_args: None,
+            event_type: Some("message".to_string()),
+            event_id_path: Some("session.id".to_string()),
+            json_flag: Some("--json".to_string()),
+            last_message_flag: None,
+        };
+
+        let err = capture.validate().unwrap_err();
+        assert!(err.contains("requires `last_message_flag`"));
+    }
+
+    #[test]
+    fn session_capture_stdout_json_event_requires_event_type() {
+        let capture = SessionCapture {
+            kind: SessionCaptureKind::StdoutJsonEvent,
+            flag: None,
+            readback_args: None,
+            event_type: None,
+            event_id_path: Some("session.id".to_string()),
+            json_flag: Some("--json".to_string()),
+            last_message_flag: Some("--last-message".to_string()),
+        };
+
+        let err = capture.validate().unwrap_err();
+        assert!(err.contains("requires `event_type`"));
+    }
+
+    #[test]
+    fn session_capture_stdout_json_event_requires_event_id_path() {
+        let capture = SessionCapture {
+            kind: SessionCaptureKind::StdoutJsonEvent,
+            flag: None,
+            readback_args: None,
+            event_type: Some("message".to_string()),
+            event_id_path: None,
+            json_flag: Some("--json".to_string()),
+            last_message_flag: Some("--last-message".to_string()),
+        };
+
+        let err = capture.validate().unwrap_err();
+        assert!(err.contains("requires `event_id_path`"));
+    }
+
+    #[test]
+    fn session_capture_stdout_json_event_accepts_all_structured_fields() {
+        let capture = SessionCapture {
+            kind: SessionCaptureKind::StdoutJsonEvent,
+            flag: None,
+            readback_args: None,
+            event_type: Some("message".to_string()),
+            event_id_path: Some("session.id".to_string()),
+            json_flag: Some("--json".to_string()),
+            last_message_flag: Some("--last-message".to_string()),
+        };
+
+        assert!(capture.validate().is_ok());
+    }
 }

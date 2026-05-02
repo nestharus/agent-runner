@@ -314,4 +314,24 @@ projects_dir = "/tmp/claude2/projects"
         let cfg = ProvidersConfig::load(Path::new("/nonexistent/path/providers.toml")).unwrap();
         assert!(cfg.entries.is_empty());
     }
+
+    #[test]
+    fn provider_loading_rejects_invalid_session_capture_before_runtime_use() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            r#"
+[claude]
+command = "claude"
+
+[claude.session_capture]
+kind = "forced_flag_verified"
+"#
+        )
+        .unwrap();
+
+        let err = ProvidersConfig::load(f.path()).unwrap_err();
+        assert!(err.contains("providers.toml provider claude"));
+        assert!(err.contains("requires `flag`"));
+    }
 }
