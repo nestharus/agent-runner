@@ -815,6 +815,263 @@ mod tests {
         ModelConfig::from_toml(name, &content).unwrap()
     }
 
+    fn account_test_app(dir: &tempfile::TempDir) -> tauri::App<tauri::test::MockRuntime> {
+        let models_dir = dir.path().join("models");
+        mock_app_with_state(HashMap::new(), models_dir)
+    }
+
+    fn account_test_db(app: &tauri::App<tauri::test::MockRuntime>) -> StateDb {
+        open_state_db(&app.state::<AppState>()).unwrap()
+    }
+
+    fn cli_provider(cli_name: &str) -> CliProviderRecord {
+        CliProviderRecord {
+            cli_name: cli_name.to_string(),
+            display_name: format!("{cli_name} display"),
+            installed: true,
+            version: Some("1.0.0".to_string()),
+            config_dir: Some(format!("/tmp/{cli_name}")),
+            last_synced: None,
+        }
+    }
+
+    fn seed_cli_provider(app: &tauri::App<tauri::test::MockRuntime>, cli_name: &str) {
+        account_test_db(app)
+            .upsert_cli_provider(&cli_provider(cli_name))
+            .unwrap();
+    }
+
+    fn account_record(
+        id: &str,
+        provider: &str,
+        profile_name: &str,
+        auth_method: AuthMethod,
+        auth_status: AuthStatus,
+    ) -> AccountRecord {
+        AccountRecord {
+            id: id.to_string(),
+            provider: provider.to_string(),
+            profile_name: profile_name.to_string(),
+            auth_method,
+            auth_status,
+            created_at: "2026-05-02T00:00:00Z".to_string(),
+        }
+    }
+
+    fn seed_account(app: &tauri::App<tauri::test::MockRuntime>, account: AccountRecord) {
+        account_test_db(app).insert_account(&account).unwrap();
+    }
+
+    fn persisted_accounts(app: &tauri::App<tauri::test::MockRuntime>) -> Vec<AccountRecord> {
+        account_test_db(app).list_accounts(None).unwrap()
+    }
+
+    #[test]
+    fn add_account_rejects_empty_account_id_without_inserting_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = account_test_app(&dir);
+        seed_cli_provider(&app, "claude");
+
+        let result = add_account(
+            app.state::<AppState>(),
+            AddAccountInput {
+                id: "".to_string(),
+                provider: "claude".to_string(),
+                profile_name: "work-profile".to_string(),
+                auth_method: AuthMethod::OAuth,
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(persisted_accounts(&app).is_empty());
+    }
+
+    #[test]
+    fn add_account_rejects_empty_provider_id_without_inserting_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = account_test_app(&dir);
+
+        let result = add_account(
+            app.state::<AppState>(),
+            AddAccountInput {
+                id: "work".to_string(),
+                provider: "".to_string(),
+                profile_name: "work-profile".to_string(),
+                auth_method: AuthMethod::OAuth,
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(persisted_accounts(&app).is_empty());
+    }
+
+    #[test]
+    fn add_account_rejects_empty_profile_name_without_inserting_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = account_test_app(&dir);
+        seed_cli_provider(&app, "claude");
+
+        let result = add_account(
+            app.state::<AppState>(),
+            AddAccountInput {
+                id: "work".to_string(),
+                provider: "claude".to_string(),
+                profile_name: "".to_string(),
+                auth_method: AuthMethod::OAuth,
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(persisted_accounts(&app).is_empty());
+    }
+
+    #[test]
+    fn add_account_rejects_unknown_provider_without_inserting_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = account_test_app(&dir);
+
+        let result = add_account(
+            app.state::<AppState>(),
+            AddAccountInput {
+                id: "work".to_string(),
+                provider: "claude".to_string(),
+                profile_name: "work-profile".to_string(),
+                auth_method: AuthMethod::OAuth,
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(persisted_accounts(&app).is_empty());
+    }
+
+    #[test]
+    fn add_account_inserts_returns_and_persists_valid_account_with_unknown_auth_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = account_test_app(&dir);
+        seed_cli_provider(&app, "claude");
+        let auth_method = AuthMethod::ApiKey {
+            env_var: "ANTHROPIC_API_KEY".to_string(),
+            config_path: Some("/tmp/anthropic-key".to_string()),
+        };
+
+        let inserted = add_account(
+            app.state::<AppState>(),
+            AddAccountInput {
+                id: "work".to_string(),
+                provider: "claude".to_string(),
+                profile_name: "work-profile".to_string(),
+                auth_method: auth_method.clone(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(inserted.id, "work");
+        assert_eq!(inserted.provider, "claude");
+        assert_eq!(inserted.profile_name, "work-profile");
+        assert_eq!(inserted.auth_method, auth_method);
+        assert_eq!(inserted.auth_status, AuthStatus::Unknown);
+        assert!(!inserted.created_at.is_empty());
+
+        let accounts = persisted_accounts(&app);
+        assert_eq!(accounts.len(), 1);
+        let persisted = &accounts[0];
+        assert_eq!(persisted.id, inserted.id);
+        assert_eq!(persisted.provider, inserted.provider);
+        assert_eq!(persisted.profile_name, inserted.profile_name);
+        assert_eq!(persisted.auth_method, inserted.auth_method);
+        assert_eq!(persisted.auth_status, AuthStatus::Unknown);
+        assert_eq!(persisted.created_at, inserted.created_at);
+    }
+
+    #[test]
+    fn remove_account_deletes_existing_id_provider_pair_and_returns_true() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = account_test_app(&dir);
+        seed_cli_provider(&app, "claude");
+        seed_account(
+            &app,
+            account_record(
+                "work",
+                "claude",
+                "work-profile",
+                AuthMethod::ConfigFile {
+                    path: "~/.claude/config".to_string(),
+                },
+                AuthStatus::Valid,
+            ),
+        );
+
+        let removed = remove_account(
+            app.state::<AppState>(),
+            "work".to_string(),
+            "claude".to_string(),
+        )
+        .unwrap();
+
+        assert!(removed);
+        assert!(persisted_accounts(&app).is_empty());
+    }
+
+    #[test]
+    fn remove_account_returns_false_for_missing_pair_and_leaves_existing_rows_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = account_test_app(&dir);
+        seed_cli_provider(&app, "claude");
+        seed_cli_provider(&app, "codex");
+        seed_account(
+            &app,
+            account_record(
+                "work",
+                "claude",
+                "work-profile",
+                AuthMethod::OAuth,
+                AuthStatus::Valid,
+            ),
+        );
+        seed_account(
+            &app,
+            account_record(
+                "personal",
+                "codex",
+                "personal-profile",
+                AuthMethod::ApiKey {
+                    env_var: "OPENAI_API_KEY".to_string(),
+                    config_path: None,
+                },
+                AuthStatus::Unknown,
+            ),
+        );
+
+        let removed = remove_account(
+            app.state::<AppState>(),
+            "missing".to_string(),
+            "claude".to_string(),
+        )
+        .unwrap();
+
+        assert!(!removed);
+        let accounts = persisted_accounts(&app);
+        assert_eq!(accounts.len(), 2);
+        assert!(accounts.iter().any(|account| {
+            account.id == "work"
+                && account.provider == "claude"
+                && account.profile_name == "work-profile"
+                && account.auth_method == AuthMethod::OAuth
+                && account.auth_status == AuthStatus::Valid
+        }));
+        assert!(accounts.iter().any(|account| {
+            account.id == "personal"
+                && account.provider == "codex"
+                && account.profile_name == "personal-profile"
+                && account.auth_method
+                    == (AuthMethod::ApiKey {
+                        env_var: "OPENAI_API_KEY".to_string(),
+                        config_path: None,
+                    })
+                && account.auth_status == AuthStatus::Unknown
+        }));
+    }
+
     #[test]
     fn derive_pools_groups_by_command_set() {
         let mut models = HashMap::new();
