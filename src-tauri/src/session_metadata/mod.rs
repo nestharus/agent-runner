@@ -201,7 +201,7 @@ fn effective_provider_for_resolved(
         Ok(provider)
     } else {
         let (provider, _) = providers_cfg
-            .runtime_provider(&resolved.active_provider)
+            .runtime_provider_with_mode(&resolved.active_provider)
             .map_err(|message| MetadataError::UnsupportedStorage {
                 provider_name: resolved.active_provider.clone(),
                 reason: message,
