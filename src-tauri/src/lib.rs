@@ -754,6 +754,7 @@ pub fn run_tauri() {
 mod tests {
     use super::*;
     use config::{ModelConfig, PromptMode, ProviderConfig};
+    use tauri::Manager;
 
     fn make_model(name: &str, commands: &[&str]) -> ModelConfig {
         ModelConfig {
@@ -764,6 +765,30 @@ mod tests {
                 .map(|c| ProviderConfig::new(c.to_string(), vec![]))
                 .collect(),
             inputs: vec![],
+        }
+    }
+
+    fn mock_app_with_state(
+        models: HashMap<String, ModelConfig>,
+        models_dir: PathBuf,
+    ) -> tauri::App<tauri::test::MockRuntime> {
+        tauri::test::mock_builder()
+            .manage(AppState {
+                models: Mutex::new(models),
+                models_dir,
+                setup_input_tx: Mutex::new(None),
+                quota_in_flight: quota::InFlight::new(),
+            })
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap()
+    }
+
+    fn assert_model_keys(app: &tauri::App<tauri::test::MockRuntime>, expected: &[&str]) {
+        let state = app.state::<AppState>();
+        let models = state.models.lock().unwrap();
+        assert_eq!(models.len(), expected.len());
+        for name in expected {
+            assert!(models.contains_key(*name), "missing model key {name}");
         }
     }
 
@@ -835,6 +860,79 @@ mod tests {
         assert_eq!(pools.len(), 1);
         assert_eq!(pools[0].commands, vec!["claude".to_string()]);
         assert_eq!(pools[0].model_count, 2);
+    }
+
+    #[test]
+    fn save_model_with_empty_name_returns_error_without_writing_or_mutating_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        let mut models = HashMap::new();
+        models.insert("existing".into(), make_model("existing", &["claude"]));
+        let app = mock_app_with_state(models, models_dir.clone());
+
+        let result = save_model(app.state::<AppState>(), make_model("", &["claude"]));
+
+        assert!(result.is_err());
+        assert!(!models_dir.join(".toml").exists());
+        assert_model_keys(&app, &["existing"]);
+    }
+
+    #[test]
+    fn save_model_with_no_providers_returns_error_without_writing_or_mutating_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        let mut models = HashMap::new();
+        models.insert("existing".into(), make_model("existing", &["claude"]));
+        let app = mock_app_with_state(models, models_dir.clone());
+        let model = ModelConfig {
+            name: "no-providers".to_string(),
+            prompt_mode: PromptMode::Stdin,
+            providers: vec![],
+            inputs: vec![],
+        };
+
+        let result = save_model(app.state::<AppState>(), model);
+
+        assert!(result.is_err());
+        assert!(!models_dir.join("no-providers.toml").exists());
+        assert_model_keys(&app, &["existing"]);
+    }
+
+    #[test]
+    fn save_model_with_empty_provider_name_returns_error_without_writing_or_mutating_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        let mut models = HashMap::new();
+        models.insert("existing".into(), make_model("existing", &["claude"]));
+        let app = mock_app_with_state(models, models_dir.clone());
+        let model = ModelConfig {
+            name: "empty-provider".to_string(),
+            prompt_mode: PromptMode::Stdin,
+            providers: vec![ProviderConfig::model_provider("", vec![])],
+            inputs: vec![],
+        };
+
+        let result = save_model(app.state::<AppState>(), model);
+
+        assert!(result.is_err());
+        assert!(!models_dir.join("empty-provider.toml").exists());
+        assert_model_keys(&app, &["existing"]);
+    }
+
+    #[test]
+    fn save_model_when_models_directory_cannot_be_created_returns_error_without_mutating_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocking_file = dir.path().join("not-a-directory");
+        std::fs::write(&blocking_file, "blocks directory creation").unwrap();
+        let models_dir = blocking_file.join("models");
+        let mut models = HashMap::new();
+        models.insert("existing".into(), make_model("existing", &["claude"]));
+        let app = mock_app_with_state(models, models_dir);
+
+        let result = save_model(app.state::<AppState>(), make_model("write-fails", &["claude"]));
+
+        assert!(result.is_err());
+        assert_model_keys(&app, &["existing"]);
     }
 
     #[cfg(unix)]
