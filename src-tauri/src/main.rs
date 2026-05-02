@@ -11,6 +11,7 @@ use agent_runner_lib::session_export::{
 };
 use agent_runner_lib::session_lock::{LockError, SessionLock};
 use agent_runner_lib::session_metadata::{MetadataError, locate_session_metadata};
+use agent_runner_lib::session_replace::{self, ReplaceError};
 use agent_runner_lib::state::{CompositeInvocationId, InvocationStart, ReadOnlyOpenError, StateDb};
 use agent_runner_lib::trace::{TraceOptions, render_ascii_trace, trace_invocation_with_sessions};
 
@@ -210,6 +211,14 @@ enum SessionSubcommands {
         #[arg(long)]
         token: String,
     },
+    /// Replace a provider transcript from canonical JSONL.
+    ImportReplace {
+        session_id: String,
+        #[arg(long = "from-file")]
+        from_file: Option<PathBuf>,
+        #[arg(long = "preimage-sha256")]
+        preimage_sha256: Option<String>,
+    },
 }
 
 #[derive(Debug)]
@@ -332,6 +341,11 @@ fn default_models_dir() -> PathBuf {
 }
 
 fn run(cli: Cli) -> Result<i32, String> {
+    if let Err(err) = session_replace::recover_pending_replaces() {
+        eprintln!("{}", err.to_json());
+        return Ok(err.exit_code());
+    }
+
     if let Some(command) = cli.command.clone() {
         return match command {
             Subcommands::Trace {
@@ -393,6 +407,15 @@ fn run(cli: Cli) -> Result<i32, String> {
                 SessionSubcommands::ResumeHandshake { session_id, token } => {
                     run_resume_handshake(&session_id, &token)
                 }
+                SessionSubcommands::ImportReplace {
+                    session_id,
+                    from_file,
+                    preimage_sha256,
+                } => run_session_import_replace(
+                    &session_id,
+                    from_file.as_deref(),
+                    preimage_sha256.as_deref(),
+                ),
             },
             Subcommands::ResumeList { uuid } => run_resume_list(&uuid),
             Subcommands::MigrateDb => run_migrate_db(),
@@ -527,6 +550,41 @@ fn run_session_schema_probe() -> Result<i32, String> {
         Err(error) => {
             write_json_error("operational-error", &probe_error_message(error))?;
             Ok(1)
+        }
+    }
+}
+
+fn run_session_import_replace(
+    session_id: &str,
+    from_file: Option<&Path>,
+    preimage_sha256: Option<&str>,
+) -> Result<i32, String> {
+    if Uuid::try_parse(session_id).is_err() {
+        let err = ReplaceError::InvalidSessionId {
+            input: session_id.to_string(),
+        };
+        eprintln!("{}", err.to_json());
+        return Ok(err.exit_code());
+    }
+    if let Some(hash) = preimage_sha256
+        && (hash.len() != 64 || !hash.chars().all(|ch| ch.is_ascii_hexdigit()))
+    {
+        let err = ReplaceError::InvalidArgument {
+            message: "preimage sha256 must be 64 hex characters".to_string(),
+        };
+        eprintln!("{}", err.to_json());
+        return Ok(err.exit_code());
+    }
+    match session_replace::run_import_replace(session_id, from_file, preimage_sha256) {
+        Ok(receipt) => {
+            let json = serde_json::to_string(&receipt)
+                .map_err(|e| format!("Failed to serialize replace receipt: {e}"))?;
+            println!("{json}");
+            Ok(0)
+        }
+        Err(err) => {
+            eprintln!("{}", err.to_json());
+            Ok(err.exit_code())
         }
     }
 }
