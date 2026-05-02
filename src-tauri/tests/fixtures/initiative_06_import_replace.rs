@@ -1,8 +1,8 @@
 #![cfg(unix)]
 #![allow(dead_code)]
 
+use agent_runner_lib::session_lock::{Lease, SessionLock};
 use agent_runner_lib::state::StateDb;
-use chrono::{Duration, Utc};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -11,6 +11,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::time::Duration;
 
 pub const SESSION_A: &str = "5169694d-de0f-40d1-890c-6e28e55bab27";
 pub const SESSION_B: &str = "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22";
@@ -123,13 +124,24 @@ impl ImportReplaceFixture {
             .join(format!("session-{session_id}.canonical.jsonl"))
     }
 
-    pub fn lock_path(&self, provider_name: &str, session_id: &str) -> PathBuf {
-        self.data_home
-            .join("oulipoly-agent-runner")
-            .join("locks")
-            .join(format!(
-                "provider-{provider_name}-session-{session_id}.lock"
-            ))
+    pub fn models_dir(&self) -> &Path {
+        &self.models_dir
+    }
+
+    pub fn providers_path(&self) -> PathBuf {
+        self.app_config_dir.join("providers.toml")
+    }
+
+    pub fn sessions_path(&self) -> PathBuf {
+        self.app_config_dir.join("sessions.toml")
+    }
+
+    pub fn locks_dir(&self) -> PathBuf {
+        self.data_home.join("oulipoly-agent-runner").join("locks")
+    }
+
+    pub fn lock_path(&self, session_id: &str) -> PathBuf {
+        self.locks_dir().join(format!("session-{session_id}.lock"))
     }
 
     pub fn open_db(&self) -> StateDb {
@@ -305,19 +317,10 @@ flag = "--resume"
         }
     }
 
-    pub fn write_active_lock(&self, provider_name: &str, session_id: &str) {
-        let path = self.lock_path(provider_name, session_id);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let value = json!({
-            "version": 1,
-            "provider_name": provider_name,
-            "session_id": session_id,
-            "token_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-            "created_at": Utc::now().to_rfc3339(),
-            "expires_at": (Utc::now() + Duration::minutes(5)).to_rfc3339(),
-            "owner_pid": std::process::id(),
-        });
-        write_private_json(&path, &value);
+    pub fn write_active_lock(&self, provider_name: &str, session_id: &str) -> Lease {
+        let lock = SessionLock::new(&self.locks_dir()).unwrap();
+        lock.acquire(session_id, provider_name, Duration::from_secs(300))
+            .unwrap()
     }
 
     pub fn run_import_replace(&self, session_id: &str, input: &str, extra_args: &[&str]) -> Output {
@@ -394,6 +397,22 @@ flag = "--resume"
     pub fn run_export(&self, session_id: &str) -> Output {
         let mut cmd = base_command(&self.config_home, &self.data_home);
         cmd.arg("session").arg("export").arg(session_id);
+        cmd.output().unwrap()
+    }
+
+    pub fn run_pause_handshake(&self, session_id: &str) -> Output {
+        let mut cmd = base_command(&self.config_home, &self.data_home);
+        cmd.arg("session").arg("pause-handshake").arg(session_id);
+        cmd.output().unwrap()
+    }
+
+    pub fn run_resume_handshake(&self, session_id: &str, token: &str) -> Output {
+        let mut cmd = base_command(&self.config_home, &self.data_home);
+        cmd.arg("session")
+            .arg("resume-handshake")
+            .arg(session_id)
+            .arg("--token")
+            .arg(token);
         cmd.output().unwrap()
     }
 

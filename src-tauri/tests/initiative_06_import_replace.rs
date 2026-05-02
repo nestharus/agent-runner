@@ -505,12 +505,7 @@ fn recovery_keeps_orphan_canonical_records_while_session_lock_is_live() {
         "{recovery_trigger:?}"
     );
     assert!(orphan.exists());
-    fs::remove_file(
-        prepared
-            .fixture
-            .lock_path(&prepared.provider_name, &prepared.session_id),
-    )
-    .unwrap();
+    fs::remove_file(prepared.fixture.lock_path(&prepared.session_id)).unwrap();
 
     let recovery_trigger = prepared.fixture.run_recovery_trigger();
 
