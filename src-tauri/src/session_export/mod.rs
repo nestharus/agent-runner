@@ -88,9 +88,22 @@ pub enum ExportError {
 pub fn read_canonical_transcript(
     metadata: &ExportSessionMetadata,
 ) -> Result<Vec<CanonicalRecord>, ExportError> {
+    let bytes = fs::read(&metadata.jsonl_path).map_err(|e| ExportError::Operational {
+        message: format!(
+            "failed to read transcript {}: {e}",
+            metadata.jsonl_path.display()
+        ),
+    })?;
+    read_canonical_transcript_from_bytes(metadata, &bytes)
+}
+
+pub fn read_canonical_transcript_from_bytes(
+    metadata: &ExportSessionMetadata,
+    bytes: &[u8],
+) -> Result<Vec<CanonicalRecord>, ExportError> {
     match metadata.storage_type {
-        SessionStorageType::ClaudeCode => parse_claude_code_jsonl(metadata),
-        SessionStorageType::CodexSession => parse_codex_rollout_jsonl(metadata),
+        SessionStorageType::ClaudeCode => parse_claude_code_jsonl_bytes(metadata, bytes),
+        SessionStorageType::CodexSession => parse_codex_rollout_jsonl_bytes(metadata, bytes),
         SessionStorageType::Other => Err(ExportError::UnsupportedStorage {
             provider_name: metadata.provider_name.clone(),
             reason: "storage type is other".to_string(),
@@ -98,10 +111,35 @@ pub fn read_canonical_transcript(
     }
 }
 
+pub fn canonical_jsonl_bytes(records: &[CanonicalRecord]) -> Result<Vec<u8>, ExportError> {
+    let mut out = Vec::new();
+    for record in records {
+        let line = serde_json::to_string(record).map_err(|e| ExportError::Operational {
+            message: format!("failed to serialize canonical record: {e}"),
+        })?;
+        out.extend_from_slice(line.as_bytes());
+        out.push(b'\n');
+    }
+    Ok(out)
+}
+
 pub fn parse_claude_code_jsonl(
     metadata: &ExportSessionMetadata,
 ) -> Result<Vec<CanonicalRecord>, ExportError> {
-    let lines = scan_jsonl(&metadata.jsonl_path)?;
+    let bytes = fs::read(&metadata.jsonl_path).map_err(|e| ExportError::Operational {
+        message: format!(
+            "failed to read transcript {}: {e}",
+            metadata.jsonl_path.display()
+        ),
+    })?;
+    parse_claude_code_jsonl_bytes(metadata, &bytes)
+}
+
+fn parse_claude_code_jsonl_bytes(
+    metadata: &ExportSessionMetadata,
+    bytes: &[u8],
+) -> Result<Vec<CanonicalRecord>, ExportError> {
+    let lines = scan_jsonl_bytes(bytes, &metadata.jsonl_path)?;
     let mut records = Vec::new();
     let mut latest_compaction_boundary = None;
 
@@ -166,7 +204,20 @@ pub fn parse_claude_code_jsonl(
 pub fn parse_codex_rollout_jsonl(
     metadata: &ExportSessionMetadata,
 ) -> Result<Vec<CanonicalRecord>, ExportError> {
-    let lines = scan_jsonl(&metadata.jsonl_path)?;
+    let bytes = fs::read(&metadata.jsonl_path).map_err(|e| ExportError::Operational {
+        message: format!(
+            "failed to read transcript {}: {e}",
+            metadata.jsonl_path.display()
+        ),
+    })?;
+    parse_codex_rollout_jsonl_bytes(metadata, &bytes)
+}
+
+fn parse_codex_rollout_jsonl_bytes(
+    metadata: &ExportSessionMetadata,
+    bytes: &[u8],
+) -> Result<Vec<CanonicalRecord>, ExportError> {
+    let lines = scan_jsonl_bytes(bytes, &metadata.jsonl_path)?;
     let mut saw_matching_session_meta = false;
     let mut records = Vec::new();
 
@@ -257,10 +308,7 @@ impl SourceLine {
     }
 }
 
-fn scan_jsonl(path: &Path) -> Result<Vec<SourceLine>, ExportError> {
-    let bytes = fs::read(path).map_err(|e| ExportError::Operational {
-        message: format!("failed to read transcript {}: {e}", path.display()),
-    })?;
+fn scan_jsonl_bytes(bytes: &[u8], path: &Path) -> Result<Vec<SourceLine>, ExportError> {
     let mut out = Vec::new();
     let mut line_no = 1_u64;
     let mut offset = 0_usize;

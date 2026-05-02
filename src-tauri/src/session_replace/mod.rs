@@ -1,9 +1,10 @@
 mod internal;
 
 use crate::config::{ProvidersConfig, SessionStorage, SessionsConfig};
+use crate::session_export::{self as export, ContentChunk, ExportError, ExportSessionMetadata};
 use crate::state::StateDb;
 use chrono::{DateTime, Utc};
-use internal::{ContentChunk, SessionLock, SessionMetadata, StorageType};
+use internal::{SessionLock, SessionMetadata, StorageType};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -16,7 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-pub use internal::CanonicalRecord;
+pub use crate::session_export::CanonicalRecord;
 
 const TEST_HOOK_ENV: &str = "OULIPOLY_IMPORT_REPLACE_TEST_HOOK";
 const TEST_SLEEP_AFTER_LOCK_MS: &str = "sleep-after-lock-ms";
@@ -192,8 +193,13 @@ impl CanonicalToProviderRenderer for CodexSessionRenderer {
             let content = record
                 .content
                 .iter()
-                .map(|chunk| match chunk {
-                    ContentChunk::Text { text } => json!({"type": content_type, "text": text}),
+                .map(|chunk| {
+                    let item_type = if chunk.r#type == "text" {
+                        content_type
+                    } else {
+                        chunk.r#type.as_str()
+                    };
+                    json!({"type": item_type, "text": chunk.text.as_deref().unwrap_or("")})
                 })
                 .collect::<Vec<_>>();
             let line = json!({
@@ -392,6 +398,7 @@ fn run_import_replace_bytes(
     let rendered = render_for_storage(&metadata.storage_type, &records)?;
     let postimage_expected = canonical_hash_from_provider_bytes(
         &metadata.storage_type,
+        &metadata.session_id,
         &metadata.provider_name,
         &rendered,
         &metadata.jsonl_path,
@@ -407,6 +414,20 @@ fn run_import_replace_bytes(
     };
     maybe_test_hook(TEST_SLEEP_AFTER_LOCK_MS);
 
+    let preimage = match canonical_hash_from_provider_file(
+        &metadata.storage_type,
+        &metadata.session_id,
+        &metadata.provider_name,
+        &metadata.jsonl_path,
+    ) {
+        Ok(preimage) => preimage,
+        Err(err) => {
+            drop(lock);
+            let _ = fs::remove_file(&staging_path);
+            return Err(err);
+        }
+    };
+
     let canonical_records_path =
         journal_root.join(format!("session-{}.canonical.jsonl", metadata.session_id));
     fs::rename(&staging_path, &canonical_records_path).map_err(|e| {
@@ -418,7 +439,7 @@ fn run_import_replace_bytes(
     fsync_dir(&journal_root)?;
 
     let pending_path = journal_root.join(format!("session-{}.pending", metadata.session_id));
-    let mut journal = ReplaceJournal {
+    let journal = ReplaceJournal {
         schema_version: 1,
         operation: "import-replace".to_string(),
         operation_uuid: operation_uuid.clone(),
@@ -429,20 +450,12 @@ fn run_import_replace_bytes(
         provider_name: metadata.provider_name.clone(),
         storage_type: metadata.storage_type.as_str().to_string(),
         jsonl_path: metadata.jsonl_path.clone(),
-        preimage_sha256: None,
+        preimage_sha256: Some(preimage.clone()),
         postimage_sha256: postimage_expected.clone(),
         canonical_records_path: canonical_records_path.clone(),
         db_state_pending: true,
         expected_turn_count: records.len(),
     };
-    atomic_write_json(&pending_path, &journal)?;
-
-    let preimage = canonical_hash_from_provider_file(
-        &metadata.storage_type,
-        &metadata.provider_name,
-        &metadata.jsonl_path,
-    )?;
-    journal.preimage_sha256 = Some(preimage.clone());
     atomic_write_json(&pending_path, &journal)?;
     if let Some(expected) = preimage_sha256
         && expected != preimage
@@ -477,6 +490,7 @@ fn run_import_replace_bytes(
 
     let actual_postimage = canonical_hash_from_provider_file(
         &metadata.storage_type,
+        &metadata.session_id,
         &metadata.provider_name,
         &metadata.jsonl_path,
     )?;
@@ -487,6 +501,7 @@ fn run_import_replace_bytes(
     }
     let fresh = canonical_records_from_provider_file(
         &metadata.storage_type,
+        &metadata.session_id,
         &metadata.provider_name,
         &metadata.jsonl_path,
     )?;
@@ -559,6 +574,7 @@ pub fn recover_pending_replaces() -> Result<(), ReplaceError> {
         let storage_type = storage_type_from_str(&journal.storage_type);
         let current_hash = canonical_hash_from_provider_file(
             &storage_type,
+            &journal.session_id,
             &journal.provider_name,
             &journal.jsonl_path,
         );
@@ -654,6 +670,7 @@ pub fn export_session_canonical(session_id: &str) -> Result<Vec<u8>, ReplaceErro
     let metadata = locate_session_metadata(session_id)?;
     let records = canonical_records_from_provider_file(
         &metadata.storage_type,
+        &metadata.session_id,
         &metadata.provider_name,
         &metadata.jsonl_path,
     )?;
@@ -748,9 +765,7 @@ fn content_json(record: &CanonicalRecord) -> Result<Vec<Value>, ReplaceError> {
     Ok(record
         .content
         .iter()
-        .map(|chunk| match chunk {
-            ContentChunk::Text { text } => json!({"type": "text", "text": text}),
-        })
+        .map(|chunk| json!({"type": chunk.r#type, "text": chunk.text.as_deref().unwrap_or("")}))
         .collect())
 }
 
@@ -1063,212 +1078,100 @@ fn replace_db_turns(
 
 fn canonical_records_from_provider_file(
     storage_type: &StorageType,
+    session_id: &str,
     provider_name: &str,
     jsonl_path: &Path,
 ) -> Result<Vec<CanonicalRecord>, ReplaceError> {
     let bytes = fs::read(jsonl_path).map_err(|e| ReplaceError::OperationalError {
         message: format!("failed to read transcript {}: {e}", jsonl_path.display()),
     })?;
-    canonical_records_from_provider_bytes(storage_type, provider_name, &bytes, jsonl_path)
+    canonical_records_from_provider_bytes(
+        storage_type,
+        session_id,
+        provider_name,
+        &bytes,
+        jsonl_path,
+    )
 }
 
 fn canonical_hash_from_provider_file(
     storage_type: &StorageType,
+    session_id: &str,
     provider_name: &str,
     jsonl_path: &Path,
 ) -> Result<String, ReplaceError> {
-    let records = canonical_records_from_provider_file(storage_type, provider_name, jsonl_path)?;
+    let records =
+        canonical_records_from_provider_file(storage_type, session_id, provider_name, jsonl_path)?;
     Ok(sha256_hex(&canonical_jsonl_bytes(&records)?))
 }
 
 fn canonical_hash_from_provider_bytes(
     storage_type: &StorageType,
+    session_id: &str,
     provider_name: &str,
     bytes: &[u8],
     jsonl_path: &Path,
 ) -> Result<String, ReplaceError> {
-    let records =
-        canonical_records_from_provider_bytes(storage_type, provider_name, bytes, jsonl_path)?;
+    let records = canonical_records_from_provider_bytes(
+        storage_type,
+        session_id,
+        provider_name,
+        bytes,
+        jsonl_path,
+    )?;
     Ok(sha256_hex(&canonical_jsonl_bytes(&records)?))
 }
 
 fn canonical_records_from_provider_bytes(
     storage_type: &StorageType,
+    session_id: &str,
     provider_name: &str,
     bytes: &[u8],
     jsonl_path: &Path,
 ) -> Result<Vec<CanonicalRecord>, ReplaceError> {
-    let text = std::str::from_utf8(bytes).map_err(|e| ReplaceError::OperationalError {
-        message: format!("provider transcript is not utf-8: {e}"),
-    })?;
-    match storage_type {
-        StorageType::ClaudeCode => parse_claude_native(text, provider_name, jsonl_path),
-        StorageType::CodexSession => parse_codex_native(text, provider_name, jsonl_path),
-        StorageType::Other => Err(ReplaceError::UnsupportedStorage {
-            provider_name: provider_name.to_string(),
-            reason: "unsupported storage".to_string(),
-        }),
-    }
+    let metadata = export_metadata_for(storage_type, session_id, provider_name, jsonl_path)?;
+    export::read_canonical_transcript_from_bytes(&metadata, bytes).map_err(map_export_error)
 }
 
-fn parse_claude_native(
-    text: &str,
+fn export_metadata_for(
+    storage_type: &StorageType,
+    session_id: &str,
     provider_name: &str,
     jsonl_path: &Path,
-) -> Result<Vec<CanonicalRecord>, ReplaceError> {
-    let mut records = Vec::new();
-    for line in jsonl_data_lines(text) {
-        let value: Value =
-            serde_json::from_str(line.text).map_err(|e| ReplaceError::OperationalError {
-                message: format!("malformed Claude transcript line {}: {e}", line.number),
-            })?;
-        let role = value
-            .get("type")
-            .and_then(Value::as_str)
-            .or_else(|| value.pointer("/message/role").and_then(Value::as_str))
-            .unwrap_or("assistant");
-        let unsupported_role = !matches!(role, "user" | "assistant");
-        let (content, unsupported_content) = extract_claude_content(&value);
-        records.push(CanonicalRecord {
-            session_id: string_field(&value, "sessionId")?,
-            provider_name: provider_name.to_string(),
-            turn_id: string_field(&value, "uuid")?,
-            role: role.to_string(),
-            timestamp: string_field(&value, "timestamp")?,
-            content,
-            source: source_value(
-                "claude_code",
-                jsonl_path,
-                line.number,
-                line.byte_start,
-                line.byte_end,
-                line.text.as_bytes(),
-            ),
-            unsupported_record: unsupported_role || unsupported_content,
-        });
-    }
-    Ok(records)
+) -> Result<ExportSessionMetadata, ReplaceError> {
+    Ok(ExportSessionMetadata {
+        session_id: session_id.to_string(),
+        chain_id: String::new(),
+        provider_name: provider_name.to_string(),
+        storage_type: storage_type.to_export(),
+        jsonl_path: jsonl_path.to_path_buf(),
+    })
 }
 
-fn parse_codex_native(
-    text: &str,
-    provider_name: &str,
-    jsonl_path: &Path,
-) -> Result<Vec<CanonicalRecord>, ReplaceError> {
-    let mut session_id = String::new();
-    let mut records = Vec::new();
-    for line in jsonl_data_lines(text) {
-        let value: Value =
-            serde_json::from_str(line.text).map_err(|e| ReplaceError::OperationalError {
-                message: format!("malformed Codex transcript line {}: {e}", line.number),
-            })?;
-        if value.get("type").and_then(Value::as_str) == Some("session_meta") {
-            session_id = value
-                .pointer("/payload/id")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            continue;
-        }
-        if value.get("type").and_then(Value::as_str) != Some("response_item") {
-            continue;
-        }
-        let payload = value.get("payload").unwrap_or(&Value::Null);
-        if payload.get("type").and_then(Value::as_str) != Some("message") {
-            continue;
-        }
-        let role = payload
-            .get("role")
-            .and_then(Value::as_str)
-            .unwrap_or("assistant");
-        let unsupported_role = !matches!(role, "user" | "assistant");
-        let turn_id = value
-            .get("id")
-            .and_then(Value::as_str)
-            .or_else(|| payload.get("id").and_then(Value::as_str))
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("codex-line-{}", line.number));
-        let (content, unsupported_content) = extract_codex_content(payload);
-        records.push(CanonicalRecord {
-            session_id: session_id.clone(),
-            provider_name: provider_name.to_string(),
-            turn_id,
-            role: role.to_string(),
-            timestamp: string_field(&value, "timestamp")?,
-            content,
-            source: source_value(
-                "codex_session",
-                jsonl_path,
-                line.number,
-                line.byte_start,
-                line.byte_end,
-                line.text.as_bytes(),
-            ),
-            unsupported_record: unsupported_role || unsupported_content,
-        });
-    }
-    Ok(records)
-}
-
-fn extract_claude_content(value: &Value) -> (Vec<ContentChunk>, bool) {
-    let Some(message) = value.get("message") else {
-        return (Vec::new(), false);
-    };
-    if let Some(text) = message.as_str() {
-        return (
-            vec![ContentChunk::Text {
-                text: text.to_string(),
-            }],
-            false,
-        );
-    }
-    if let Some(text) = message.get("content").and_then(Value::as_str) {
-        return (
-            vec![ContentChunk::Text {
-                text: text.to_string(),
-            }],
-            false,
-        );
-    }
-    extract_text_items(message.get("content").and_then(Value::as_array))
-}
-
-fn extract_codex_content(payload: &Value) -> (Vec<ContentChunk>, bool) {
-    extract_text_items(payload.get("content").and_then(Value::as_array))
-}
-
-fn extract_text_items(items: Option<&Vec<Value>>) -> (Vec<ContentChunk>, bool) {
-    let Some(items) = items else {
-        return (Vec::new(), false);
-    };
-    let mut unsupported = false;
-    let content = items
-        .iter()
-        .filter_map(|item| {
-            if let Some(text) = item.get("text").and_then(Value::as_str) {
-                Some(ContentChunk::Text {
-                    text: text.to_string(),
-                })
-            } else {
-                unsupported = true;
-                None
+fn map_export_error(err: ExportError) -> ReplaceError {
+    match err {
+        ExportError::InvalidSessionId { input } => ReplaceError::InvalidSessionId { input },
+        ExportError::SessionNotFound { input } => ReplaceError::SessionNotFound { input },
+        ExportError::AmbiguousSession { input } => ReplaceError::AmbiguousSession { input },
+        ExportError::UnsupportedStorage {
+            provider_name,
+            reason,
+        } => ReplaceError::UnsupportedStorage {
+            provider_name,
+            reason,
+        },
+        ExportError::MalformedTranscript { line, reason, .. } => {
+            ReplaceError::InvalidInputTranscript {
+                reason,
+                line: Some(line),
             }
-        })
-        .collect();
-    (content, unsupported)
+        }
+        ExportError::Operational { message } => ReplaceError::OperationalError { message },
+    }
 }
 
 fn canonical_jsonl_bytes(records: &[CanonicalRecord]) -> Result<Vec<u8>, ReplaceError> {
-    let mut out = Vec::new();
-    for record in records {
-        writeln_json(
-            &mut out,
-            &serde_json::to_value(record).map_err(|e| ReplaceError::OperationalError {
-                message: format!("failed to serialize canonical record: {e}"),
-            })?,
-        )?;
-    }
-    Ok(out)
+    export::canonical_jsonl_bytes(records).map_err(map_export_error)
 }
 
 fn canonical_semantics_equal(left: &[CanonicalRecord], right: &[CanonicalRecord]) -> bool {
@@ -1279,65 +1182,17 @@ fn canonical_semantics_equal(left: &[CanonicalRecord], right: &[CanonicalRecord]
                 && a.turn_id == b.turn_id
                 && a.role == b.role
                 && a.timestamp == b.timestamp
-                && a.content == b.content
+                && content_chunks_equal(&a.content, &b.content)
                 && a.unsupported_record == b.unsupported_record
         })
 }
 
-struct JsonlDataLine<'a> {
-    number: u64,
-    text: &'a str,
-    byte_start: u64,
-    byte_end: u64,
-}
-
-fn jsonl_data_lines(text: &str) -> Vec<JsonlDataLine<'_>> {
-    let mut lines = Vec::new();
-    let mut offset = 0_usize;
-    for (idx, segment) in text.split_inclusive('\n').enumerate() {
-        let raw = segment.strip_suffix('\n').unwrap_or(segment);
-        let line = raw.strip_suffix('\r').unwrap_or(raw);
-        let byte_start = offset;
-        let byte_end = byte_start + line.len();
-        offset += segment.len();
-        if !line.trim().is_empty() {
-            lines.push(JsonlDataLine {
-                number: idx as u64 + 1,
-                text: line,
-                byte_start: byte_start as u64,
-                byte_end: byte_end as u64,
-            });
-        }
-    }
-    lines
-}
-
-fn source_value(
-    storage_type: &str,
-    jsonl_path: &Path,
-    line: u64,
-    byte_start: u64,
-    byte_end: u64,
-    source_bytes: &[u8],
-) -> Value {
-    json!({
-        "storage_type": storage_type,
-        "jsonl_path": jsonl_path,
-        "line": line,
-        "byte_start": byte_start,
-        "byte_end": byte_end,
-        "sha256": sha256_hex(source_bytes),
-    })
-}
-
-fn string_field(value: &Value, field: &str) -> Result<String, ReplaceError> {
-    value
-        .get(field)
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| ReplaceError::OperationalError {
-            message: format!("provider transcript missing {field}"),
-        })
+fn content_chunks_equal(left: &[ContentChunk], right: &[ContentChunk]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(a, b)| a.r#type == b.r#type && a.text == b.text)
 }
 
 fn writeln_json(out: &mut Vec<u8>, value: &Value) -> Result<(), ReplaceError> {
