@@ -816,6 +816,43 @@ pub fn summarize(report: &DetectionReport) -> Vec<super::actions::CliSummaryItem
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::setup::test_support::env_lock;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    fn with_isolated_detection_env(test: impl FnOnce(&Path)) {
+        let _guard = env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let previous_home = std::env::var_os("HOME");
+        let previous_openai_api_key = std::env::var_os("OPENAI_API_KEY");
+
+        unsafe {
+            std::env::set_var("HOME", home.path());
+            std::env::remove_var("OPENAI_API_KEY");
+        }
+
+        let result = catch_unwind(AssertUnwindSafe(|| test(home.path())));
+
+        match previous_home {
+            Some(value) => unsafe {
+                std::env::set_var("HOME", value);
+            },
+            None => unsafe {
+                std::env::remove_var("HOME");
+            },
+        }
+        match previous_openai_api_key {
+            Some(value) => unsafe {
+                std::env::set_var("OPENAI_API_KEY", value);
+            },
+            None => unsafe {
+                std::env::remove_var("OPENAI_API_KEY");
+            },
+        }
+
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
 
     #[test]
     fn detect_os_info() {
@@ -833,6 +870,65 @@ mod tests {
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("clis"));
+    }
+
+    #[test]
+    fn known_provider_cli_table_includes_setup_provider_names() {
+        let names: Vec<&str> = KNOWN_CLIS.iter().map(|(name, _)| *name).collect();
+
+        for expected in ["claude", "codex", "opencode", "gemini", "forge"] {
+            assert!(
+                names.contains(&expected),
+                "full detection provider table should include {expected}; got {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn uninstalled_cli_credentials_do_not_mark_cli_authenticated() {
+        with_isolated_detection_env(|home| {
+            let codex_dir = home.join(".codex");
+            std::fs::create_dir_all(&codex_dir).unwrap();
+            std::fs::write(codex_dir.join("auth.json"), "{}").unwrap();
+
+            let info = detect_cli("missing_cli_with_codex_auth_fixture_xyz", &[".codex"], None);
+
+            assert!(!info.installed);
+            assert!(!info.authenticated);
+        });
+    }
+
+    #[test]
+    fn codex_api_key_presence_marks_auth_authenticated() {
+        with_isolated_detection_env(|_| {
+            unsafe {
+                std::env::set_var("OPENAI_API_KEY", "test-api-key");
+            }
+
+            assert!(check_auth("codex"));
+        });
+    }
+
+    #[test]
+    fn codex_auth_json_marks_auth_authenticated() {
+        with_isolated_detection_env(|home| {
+            let codex_dir = home.join(".codex");
+            std::fs::create_dir_all(&codex_dir).unwrap();
+            std::fs::write(codex_dir.join("auth.json"), "{}").unwrap();
+
+            assert!(check_auth("codex"));
+        });
+    }
+
+    #[test]
+    fn claude_primary_credentials_file_marks_auth_authenticated() {
+        with_isolated_detection_env(|home| {
+            let claude_dir = home.join(".claude");
+            std::fs::create_dir_all(&claude_dir).unwrap();
+            std::fs::write(claude_dir.join(".credentials.json"), "{}").unwrap();
+
+            assert!(check_auth("claude"));
+        });
     }
 
     #[test]

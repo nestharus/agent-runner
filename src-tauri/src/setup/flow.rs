@@ -506,13 +506,8 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::setup::test_support::env_lock;
     use std::panic::{AssertUnwindSafe, catch_unwind};
-    use std::sync::{Mutex, OnceLock};
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     fn with_temp_home(test: impl FnOnce(&std::path::Path)) {
         let _guard = env_lock().lock().unwrap();
