@@ -118,12 +118,20 @@ fn path_is_unreadable(path: &Path) -> bool {
 #[allow(dead_code)]
 pub struct ProviderRecord {
     pub model_name: String,
-    pub provider_index: usize,
-    pub invocation_count: u64,
-    pub error_count: u64,
+    pub provider_name: String,
+    pub invocation_count: i64,
+    pub error_count: i64,
     pub last_error: Option<String>,
-    pub last_error_at: Option<DateTime<Utc>>,
-    pub last_invoked_at: Option<DateTime<Utc>>,
+    pub last_error_at: Option<String>,
+    pub last_invoked_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderColumn {
+    name: String,
+    data_type: String,
+    notnull: i64,
+    pk: i64,
 }
 
 /// Per-provider (account) metadata. Keyed on provider name (e.g. `claude`,
@@ -499,25 +507,17 @@ impl StateDb {
                 .map_err(|e| format!("Failed to create state directory: {e}"))?;
         }
 
-        let conn = Connection::open(path).map_err(|e| format!("Failed to open state DB: {e}"))?;
+        let mut conn =
+            Connection::open(path).map_err(|e| format!("Failed to open state DB: {e}"))?;
 
         conn.execute_batch("PRAGMA journal_mode=WAL;")
             .map_err(|e| format!("Failed to set WAL mode: {e}; run `agents migrate-db` first"))?;
+        Self::validate_providers_schema(&conn)?;
         Self::ensure_invocations_schema(&conn)?;
+        Self::ensure_providers_schema(&mut conn)?;
 
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS providers (
-                model_name TEXT NOT NULL,
-                provider_index INTEGER NOT NULL,
-                invocation_count INTEGER NOT NULL DEFAULT 0,
-                error_count INTEGER NOT NULL DEFAULT 0,
-                last_error TEXT,
-                last_error_at TEXT,
-                last_invoked_at TEXT,
-                PRIMARY KEY (model_name, provider_index)
-            );
-
-            CREATE TABLE IF NOT EXISTS provider_quotas (
+            "CREATE TABLE IF NOT EXISTS provider_quotas (
                 provider_name TEXT PRIMARY KEY,
                 used_percent REAL NOT NULL DEFAULT 0,
                 resets_at TEXT,
@@ -795,6 +795,220 @@ impl StateDb {
         Ok(columns)
     }
 
+    fn ensure_providers_schema(conn: &mut Connection) -> Result<(), String> {
+        let columns = Self::providers_columns(conn)?;
+        if columns.is_empty() {
+            conn.execute_batch(Self::providers_schema_sql())
+                .map_err(|e| format!("Failed to initialize providers schema: {e}"))?;
+            return Ok(());
+        }
+
+        if Self::providers_shape_is_post_fix(&columns) {
+            return Ok(());
+        }
+
+        if Self::providers_shape_is_pre_fix(&columns) {
+            let tx = conn
+                .transaction()
+                .map_err(|e| format!("Failed to begin providers migration: {e}"))?;
+            tx.execute_batch("ALTER TABLE providers RENAME TO providers_legacy_index_keyed;")
+                .map_err(|e| format!("Failed to rename legacy providers table: {e}"))?;
+            tx.execute_batch(Self::providers_schema_sql())
+                .map_err(|e| format!("Failed to create migrated providers table: {e}"))?;
+            tx.execute_batch(
+                "INSERT INTO providers (
+                    model_name, provider_name,
+                    invocation_count, error_count,
+                    last_error, last_error_at, last_invoked_at
+                )
+                SELECT
+                    model_name,
+                    provider_name,
+                    COUNT(*) AS invocation_count,
+                    SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS error_count,
+                    NULL AS last_error,
+                    NULL AS last_error_at,
+                    MAX(finished_at) AS last_invoked_at
+                FROM invocations
+                WHERE provider_name IS NOT NULL
+                  AND status IN ('succeeded', 'failed')
+                  AND success IS NOT NULL
+                GROUP BY model_name, provider_name;",
+            )
+            .map_err(|e| format!("Failed to rebuild providers aggregate: {e}"))?;
+            tx.execute_batch(
+                "UPDATE providers
+                    SET last_error_at = (
+                            SELECT i.finished_at
+                              FROM invocations i
+                             WHERE i.model_name = providers.model_name
+                               AND i.provider_name = providers.provider_name
+                               AND i.success = 0
+                             ORDER BY i.finished_at DESC, i.id DESC
+                             LIMIT 1
+                        ),
+                        last_error = (
+                            SELECT i.error_category
+                              FROM invocations i
+                             WHERE i.model_name = providers.model_name
+                               AND i.provider_name = providers.provider_name
+                               AND i.success = 0
+                             ORDER BY i.finished_at DESC, i.id DESC
+                             LIMIT 1
+                        )
+                  WHERE EXISTS (
+                            SELECT 1
+                              FROM invocations i
+                             WHERE i.model_name = providers.model_name
+                               AND i.provider_name = providers.provider_name
+                               AND i.success = 0
+                        );",
+            )
+            .map_err(|e| format!("Failed to rebuild provider error metadata: {e}"))?;
+            tx.execute_batch("DROP TABLE providers_legacy_index_keyed;")
+                .map_err(|e| format!("Failed to drop legacy providers table: {e}"))?;
+            tx.commit()
+                .map_err(|e| format!("Failed to commit providers migration: {e}"))?;
+            return Ok(());
+        }
+
+        Err(format!(
+            "Unexpected providers schema shape: {}",
+            Self::describe_columns(&columns)
+        ))
+    }
+
+    fn validate_providers_schema(conn: &Connection) -> Result<(), String> {
+        match Self::providers_object_type(conn)? {
+            None => return Ok(()),
+            Some(object_type) if object_type != "table" => {
+                return Err(format!(
+                    "Unexpected providers schema shape: object type={object_type}"
+                ));
+            }
+            _ => {}
+        }
+
+        if Self::providers_has_foreign_keys(conn)? {
+            return Err(
+                "Unexpected providers schema shape: foreign-key constraints present".to_string(),
+            );
+        }
+
+        let columns = Self::providers_columns(conn)?;
+        if columns.is_empty()
+            || Self::providers_shape_is_post_fix(&columns)
+            || Self::providers_shape_is_pre_fix(&columns)
+        {
+            return Ok(());
+        }
+
+        Err(format!(
+            "Unexpected providers schema shape: {}",
+            Self::describe_columns(&columns)
+        ))
+    }
+
+    fn providers_object_type(conn: &Connection) -> Result<Option<String>, String> {
+        conn.query_row(
+            "SELECT type FROM sqlite_master WHERE name = 'providers'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| format!("Failed to inspect providers object type: {e}"))
+    }
+
+    fn providers_has_foreign_keys(conn: &Connection) -> Result<bool, String> {
+        let mut stmt = conn
+            .prepare("PRAGMA foreign_key_list(providers)")
+            .map_err(|e| format!("Failed to inspect providers foreign keys: {e}"))?;
+        let mut rows = stmt
+            .query([])
+            .map_err(|e| format!("Failed to inspect providers foreign keys: {e}"))?;
+        Ok(rows
+            .next()
+            .map_err(|e| format!("Failed to read providers foreign keys: {e}"))?
+            .is_some())
+    }
+
+    fn providers_columns(conn: &Connection) -> Result<Vec<ProviderColumn>, String> {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(providers)")
+            .map_err(|e| format!("Failed to inspect providers schema: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(ProviderColumn {
+                    name: row.get(1)?,
+                    data_type: row.get(2)?,
+                    notnull: row.get(3)?,
+                    pk: row.get(5)?,
+                })
+            })
+            .map_err(|e| format!("Failed to inspect providers columns: {e}"))?;
+
+        let mut columns = Vec::new();
+        for row in rows {
+            columns.push(row.map_err(|e| format!("Failed to read providers column: {e}"))?);
+        }
+        Ok(columns)
+    }
+
+    fn providers_shape_is_post_fix(columns: &[ProviderColumn]) -> bool {
+        Self::columns_match(
+            columns,
+            &[
+                ("model_name", "TEXT", 1, 1),
+                ("provider_name", "TEXT", 1, 2),
+                ("invocation_count", "INTEGER", 1, 0),
+                ("error_count", "INTEGER", 1, 0),
+                ("last_error", "TEXT", 0, 0),
+                ("last_error_at", "TEXT", 0, 0),
+                ("last_invoked_at", "TEXT", 0, 0),
+            ],
+        )
+    }
+
+    fn providers_shape_is_pre_fix(columns: &[ProviderColumn]) -> bool {
+        Self::columns_match(
+            columns,
+            &[
+                ("model_name", "TEXT", 1, 1),
+                ("provider_index", "INTEGER", 1, 2),
+                ("invocation_count", "INTEGER", 1, 0),
+                ("error_count", "INTEGER", 1, 0),
+                ("last_error", "TEXT", 0, 0),
+                ("last_error_at", "TEXT", 0, 0),
+                ("last_invoked_at", "TEXT", 0, 0),
+            ],
+        )
+    }
+
+    fn columns_match(columns: &[ProviderColumn], expected: &[(&str, &str, i64, i64)]) -> bool {
+        columns.len() == expected.len()
+            && columns.iter().zip(expected.iter()).all(
+                |(column, (expected_name, expected_type, expected_notnull, expected_pk))| {
+                    column.name == *expected_name
+                        && column.data_type.eq_ignore_ascii_case(expected_type)
+                        && column.notnull == *expected_notnull
+                        && column.pk == *expected_pk
+                },
+            )
+    }
+
+    fn describe_columns(columns: &[ProviderColumn]) -> String {
+        columns
+            .iter()
+            .map(|column| {
+                format!(
+                    "{}(type={}, notnull={}, pk={})",
+                    column.name, column.data_type, column.notnull, column.pk
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     fn ensure_session_turns_schema(conn: &Connection) -> Result<(), String> {
         let columns = Self::session_turns_columns(conn)?;
         if !columns.iter().any(|column| column == "parent_turn_id") {
@@ -928,6 +1142,19 @@ impl StateDb {
         Ok(columns)
     }
 
+    fn providers_schema_sql() -> &'static str {
+        "CREATE TABLE IF NOT EXISTS providers (
+            model_name TEXT NOT NULL,
+            provider_name TEXT NOT NULL,
+            invocation_count INTEGER NOT NULL DEFAULT 0,
+            error_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            last_error_at TEXT,
+            last_invoked_at TEXT,
+            PRIMARY KEY (model_name, provider_name)
+        );"
+    }
+
     fn invocations_schema_sql() -> &'static str {
         "CREATE TABLE IF NOT EXISTS invocations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -997,6 +1224,7 @@ impl StateDb {
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| format!("Failed to begin invocation migration: {e}"))?;
+        Self::validate_providers_schema(&tx)?;
 
         let mut old_rows = Vec::new();
         {
@@ -1183,15 +1411,17 @@ impl StateDb {
             .unchecked_transaction()
             .map_err(|e| format!("Failed to begin invocation finalize tx: {e}"))?;
 
-        let (model_name, provider_index, status) = tx
+        let (model_name, provider_name, _provider_index, status) = tx
             .query_row(
-                "SELECT model_name, provider_index, status FROM invocations WHERE id = ?1",
+                "SELECT model_name, provider_name, provider_index, status
+                 FROM invocations WHERE id = ?1",
                 params![id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
                     ))
                 },
             )
@@ -1226,35 +1456,36 @@ impl StateDb {
         )
         .map_err(|e| format!("Failed to finalize invocation {id}: {e}"))?;
 
-        tx.execute(
-            "INSERT INTO providers (model_name, provider_index, invocation_count, error_count, last_invoked_at)
-             VALUES (?1, ?2, 1, ?3, ?4)
-             ON CONFLICT (model_name, provider_index)
-             DO UPDATE SET
-                invocation_count = invocation_count + 1,
-                error_count = error_count + ?3,
-                last_invoked_at = ?4",
-            params![
-                &model_name,
-                provider_index,
-                if success { 0i64 } else { 1i64 },
-                &now
-            ],
-        )
-        .map_err(|e| format!("Failed to upsert provider: {e}"))?;
-
-        if !success {
-            let snippet = stderr_snippet
-                .unwrap_or("")
-                .chars()
-                .take(500)
-                .collect::<String>();
+        if let Some(provider_name) = provider_name {
             tx.execute(
-                "UPDATE providers SET last_error = ?1, last_error_at = ?2
-                 WHERE model_name = ?3 AND provider_index = ?4",
-                params![&snippet, &now, &model_name, provider_index],
+                "INSERT INTO providers (
+                    model_name, provider_name,
+                    invocation_count, error_count, last_invoked_at
+                 ) VALUES (?1, ?2, 1, ?3, ?4)
+                 ON CONFLICT (model_name, provider_name)
+                 DO UPDATE SET
+                    invocation_count = invocation_count + 1,
+                    error_count = error_count + ?3,
+                    last_invoked_at = ?4",
+                params![
+                    &model_name,
+                    &provider_name,
+                    if success { 0i64 } else { 1i64 },
+                    &now
+                ],
             )
-            .map_err(|e| format!("Failed to update error info: {e}"))?;
+            .map_err(|e| format!("Failed to upsert provider: {e}"))?;
+
+            if !success {
+                let snippet =
+                    stderr_snippet.map(|value| value.chars().take(500).collect::<String>());
+                tx.execute(
+                    "UPDATE providers SET last_error = ?1, last_error_at = ?2
+                     WHERE model_name = ?3 AND provider_name = ?4",
+                    params![&snippet, &now, &model_name, &provider_name],
+                )
+                .map_err(|e| format!("Failed to update error info: {e}"))?;
+            }
         }
 
         tx.commit()
@@ -1495,31 +1726,27 @@ impl StateDb {
     pub fn get_provider(
         &self,
         model_name: &str,
-        provider_index: usize,
+        provider_name: &str,
     ) -> Result<Option<ProviderRecord>, String> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT invocation_count, error_count, last_error, last_error_at, last_invoked_at
-                 FROM providers WHERE model_name = ?1 AND provider_index = ?2",
+                "SELECT model_name, provider_name, invocation_count, error_count,
+                        last_error, last_error_at, last_invoked_at
+                 FROM providers
+                 WHERE model_name = ?1 AND provider_name = ?2",
             )
             .map_err(|e| format!("Failed to prepare query: {e}"))?;
 
-        let result = stmt.query_row(params![model_name, provider_index as i64], |row| {
+        let result = stmt.query_row(params![model_name, provider_name], |row| {
             Ok(ProviderRecord {
-                model_name: model_name.to_string(),
-                provider_index,
-                invocation_count: row.get::<_, i64>(0)? as u64,
-                error_count: row.get::<_, i64>(1)? as u64,
-                last_error: row.get(2)?,
-                last_error_at: row
-                    .get::<_, Option<String>>(3)?
-                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
-                last_invoked_at: row
-                    .get::<_, Option<String>>(4)?
-                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
+                model_name: row.get(0)?,
+                provider_name: row.get(1)?,
+                invocation_count: row.get(2)?,
+                error_count: row.get(3)?,
+                last_error: row.get(4)?,
+                last_error_at: row.get(5)?,
+                last_invoked_at: row.get(6)?,
             })
         });
 
@@ -1533,23 +1760,23 @@ impl StateDb {
     pub fn recent_error_count(
         &self,
         model_name: &str,
-        provider_index: usize,
+        provider_name: &str,
         window_minutes: i64,
-    ) -> Result<u64, String> {
+    ) -> Result<i64, String> {
         let cutoff = (Utc::now() - chrono::Duration::minutes(window_minutes)).to_rfc3339();
 
         let count: i64 = self
             .conn
             .query_row(
                 "SELECT COUNT(*) FROM invocations
-                 WHERE model_name = ?1 AND provider_index = ?2
+                 WHERE model_name = ?1 AND provider_name = ?2
                    AND success = 0 AND created_at > ?3",
-                params![model_name, provider_index as i64, &cutoff],
+                params![model_name, provider_name, &cutoff],
                 |row| row.get(0),
             )
             .map_err(|e| format!("Failed to count recent errors: {e}"))?;
 
-        Ok(count as u64)
+        Ok(count)
     }
 
     // --- Provider quota operations ---
@@ -3232,6 +3459,35 @@ mod tests {
         id
     }
 
+    fn record_provider_invocation(
+        db: &StateDb,
+        model_name: &str,
+        provider_name: &str,
+        provider_index: usize,
+        success: bool,
+        error_category: Option<&str>,
+        stderr_snippet: Option<&str>,
+    ) -> i64 {
+        let id = db
+            .start_invocation(&InvocationStart {
+                invocation_uuid: Uuid::new_v4().to_string(),
+                model_name: model_name.to_string(),
+                provider_name: provider_name.to_string(),
+                provider_index,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        db.finalize_invocation(
+            id,
+            success,
+            if success { 0 } else { 1 },
+            error_category,
+            stderr_snippet,
+        )
+        .unwrap();
+        id
+    }
+
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -3298,6 +3554,386 @@ mod tests {
             .unwrap();
         }
         dir
+    }
+
+    struct ProviderMigrationInvocationFixture<'a> {
+        model_name: &'a str,
+        provider_name: Option<&'a str>,
+        provider_index: i64,
+        status: &'a str,
+        success: Option<i64>,
+        exit_code: Option<i64>,
+        error_category: Option<&'a str>,
+        created_at: &'a str,
+        finished_at: Option<&'a str>,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct ProviderAggregateSnapshot {
+        model_name: String,
+        provider_name: String,
+        invocation_count: i64,
+        error_count: i64,
+        last_error: Option<String>,
+        last_error_at: Option<String>,
+        last_invoked_at: Option<String>,
+    }
+
+    fn legacy_providers_db(rows: &[ProviderMigrationInvocationFixture<'_>]) -> TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(StateDb::invocations_schema_sql())
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE providers (
+                model_name TEXT NOT NULL,
+                provider_index INTEGER NOT NULL,
+                invocation_count INTEGER NOT NULL DEFAULT 0,
+                error_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                last_error_at TEXT,
+                last_invoked_at TEXT,
+                PRIMARY KEY (model_name, provider_index)
+            );
+            INSERT INTO providers (
+                model_name, provider_index, invocation_count, error_count,
+                last_error, last_error_at, last_invoked_at
+            ) VALUES (
+                'routing-model', 0, 99, 88,
+                'stale-index-aggregate', '2026-04-01T00:00:00+00:00',
+                '2026-04-01T00:00:00+00:00'
+            );",
+        )
+        .unwrap();
+        for row in rows {
+            conn.execute(
+                "INSERT INTO invocations (
+                    invocation_uuid, model_name, provider_name, provider_index,
+                    status, success, exit_code, error_category, created_at, finished_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    row.model_name,
+                    row.provider_name,
+                    row.provider_index,
+                    row.status,
+                    row.success,
+                    row.exit_code,
+                    row.error_category,
+                    row.created_at,
+                    row.finished_at,
+                ],
+            )
+            .unwrap();
+        }
+        dir
+    }
+
+    fn provider_rebuild_fixture_db() -> TempDir {
+        legacy_providers_db(&[
+            ProviderMigrationInvocationFixture {
+                model_name: "routing-model",
+                provider_name: Some("claude2"),
+                provider_index: 0,
+                status: "succeeded",
+                success: Some(1),
+                exit_code: Some(0),
+                error_category: None,
+                created_at: "2026-04-20T10:00:00+00:00",
+                finished_at: Some("2026-04-20T10:00:01+00:00"),
+            },
+            ProviderMigrationInvocationFixture {
+                model_name: "routing-model",
+                provider_name: Some("claude2"),
+                provider_index: 2,
+                status: "failed",
+                success: Some(0),
+                exit_code: Some(1),
+                error_category: Some("rate_limit"),
+                created_at: "2026-04-20T11:00:00+00:00",
+                finished_at: Some("2026-04-20T11:00:01+00:00"),
+            },
+            ProviderMigrationInvocationFixture {
+                model_name: "routing-model",
+                provider_name: Some("claude"),
+                provider_index: 1,
+                status: "succeeded",
+                success: Some(1),
+                exit_code: Some(0),
+                error_category: None,
+                created_at: "2026-04-20T12:00:00+00:00",
+                finished_at: Some("2026-04-20T12:00:01+00:00"),
+            },
+            ProviderMigrationInvocationFixture {
+                model_name: "routing-model",
+                provider_name: None,
+                provider_index: 0,
+                status: "succeeded",
+                success: Some(1),
+                exit_code: Some(0),
+                error_category: None,
+                created_at: "2026-04-20T13:00:00+00:00",
+                finished_at: Some("2026-04-20T13:00:01+00:00"),
+            },
+            ProviderMigrationInvocationFixture {
+                model_name: "routing-model",
+                provider_name: Some("claude3"),
+                provider_index: 3,
+                status: "running",
+                success: None,
+                exit_code: None,
+                error_category: None,
+                created_at: "2026-04-20T14:00:00+00:00",
+                finished_at: None,
+            },
+        ])
+    }
+
+    fn provider_last_error_fixture_db() -> TempDir {
+        legacy_providers_db(&[
+            ProviderMigrationInvocationFixture {
+                model_name: "routing-model",
+                provider_name: Some("claude"),
+                provider_index: 0,
+                status: "failed",
+                success: Some(0),
+                exit_code: Some(1),
+                error_category: Some("rate_limit"),
+                created_at: "2026-04-20T10:00:00+00:00",
+                finished_at: Some("2026-04-20T10:00:10+00:00"),
+            },
+            ProviderMigrationInvocationFixture {
+                model_name: "routing-model",
+                provider_name: Some("claude"),
+                provider_index: 0,
+                status: "succeeded",
+                success: Some(1),
+                exit_code: Some(0),
+                error_category: None,
+                created_at: "2026-04-20T11:00:00+00:00",
+                finished_at: Some("2026-04-20T11:00:10+00:00"),
+            },
+            ProviderMigrationInvocationFixture {
+                model_name: "routing-model",
+                provider_name: Some("claude"),
+                provider_index: 0,
+                status: "failed",
+                success: Some(0),
+                exit_code: Some(1),
+                error_category: Some("auth_error"),
+                created_at: "2026-04-20T10:30:00+00:00",
+                finished_at: Some("2026-04-20T10:30:10+00:00"),
+            },
+        ])
+    }
+
+    fn provider_last_error_tie_fixture_db() -> TempDir {
+        legacy_providers_db(&[
+            ProviderMigrationInvocationFixture {
+                model_name: "routing-model",
+                provider_name: Some("claude"),
+                provider_index: 0,
+                status: "failed",
+                success: Some(0),
+                exit_code: Some(1),
+                error_category: Some("rate_limit"),
+                created_at: "2026-04-20T10:00:00+00:00",
+                finished_at: Some("2026-04-20T10:00:10+00:00"),
+            },
+            ProviderMigrationInvocationFixture {
+                model_name: "routing-model",
+                provider_name: Some("claude"),
+                provider_index: 0,
+                status: "failed",
+                success: Some(0),
+                exit_code: Some(1),
+                error_category: Some("auth_error"),
+                created_at: "2026-04-20T10:00:01+00:00",
+                finished_at: Some("2026-04-20T10:00:10+00:00"),
+            },
+        ])
+    }
+
+    fn malformed_providers_shape_db() -> TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(StateDb::invocations_schema_sql())
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE providers (
+                model_name TEXT NOT NULL,
+                provider_index INTEGER NOT NULL,
+                provider_name TEXT NOT NULL,
+                invocation_count INTEGER NOT NULL DEFAULT 0,
+                error_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                last_error_at TEXT,
+                last_invoked_at TEXT,
+                PRIMARY KEY (model_name, provider_index)
+            );
+            INSERT INTO providers (
+                model_name, provider_index, provider_name,
+                invocation_count, error_count, last_error, last_error_at, last_invoked_at
+            ) VALUES (
+                'routing-model', 0, 'claude', 7, 1,
+                'do-not-touch', '2026-04-20T10:00:00+00:00',
+                '2026-04-20T10:00:00+00:00'
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO invocations (
+                invocation_uuid, model_name, provider_name, provider_index,
+                status, success, exit_code, error_category, created_at, finished_at
+             ) VALUES (?1, 'routing-model', 'claude', 0, 'failed', 0, 1,
+                       'rate_limit', '2026-04-20T10:00:00+00:00',
+                       '2026-04-20T10:00:01+00:00')",
+            params![Uuid::new_v4().to_string()],
+        )
+        .unwrap();
+        dir
+    }
+
+    fn malformed_providers_affinity_db() -> TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(StateDb::invocations_schema_sql())
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE providers (
+                model_name TEXT NOT NULL,
+                provider_index TEXT NOT NULL,
+                invocation_count INTEGER NOT NULL DEFAULT 0,
+                error_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                last_error_at TEXT,
+                last_invoked_at TEXT,
+                PRIMARY KEY (model_name, provider_index)
+            );
+            INSERT INTO providers (
+                model_name, provider_index, invocation_count, error_count,
+                last_error, last_error_at, last_invoked_at
+            ) VALUES (
+                'routing-model', '0', 7, 1,
+                'do-not-touch', '2026-04-20T10:00:00+00:00',
+                '2026-04-20T10:00:00+00:00'
+            );",
+        )
+        .unwrap();
+        dir
+    }
+
+    fn legacy_invocations_with_malformed_providers_db() -> TempDir {
+        let dir =
+            legacy_invocations_db(&[("routing-model", 0, 0, 1, Some("rate_limit"), "created-a")]);
+        let path = dir.path().join("state.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE providers (
+                model_name TEXT NOT NULL,
+                provider_index INTEGER NOT NULL,
+                provider_name TEXT NOT NULL,
+                invocation_count INTEGER NOT NULL DEFAULT 0,
+                error_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                last_error_at TEXT,
+                last_invoked_at TEXT,
+                PRIMARY KEY (model_name, provider_index)
+            );",
+        )
+        .unwrap();
+        dir
+    }
+
+    fn table_columns_with_pk(conn: &Connection, table_name: &str) -> Vec<(String, i64)> {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table_name})"))
+            .unwrap();
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
+            })
+            .unwrap();
+        rows.map(|row| row.unwrap()).collect()
+    }
+
+    fn provider_aggregate_snapshot(conn: &Connection) -> Vec<ProviderAggregateSnapshot> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT model_name, provider_name, invocation_count, error_count,
+                        last_error, last_error_at, last_invoked_at
+                   FROM providers
+                  ORDER BY model_name, provider_name",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(ProviderAggregateSnapshot {
+                    model_name: row.get(0)?,
+                    provider_name: row.get(1)?,
+                    invocation_count: row.get(2)?,
+                    error_count: row.get(3)?,
+                    last_error: row.get(4)?,
+                    last_error_at: row.get(5)?,
+                    last_invoked_at: row.get(6)?,
+                })
+            })
+            .unwrap();
+        rows.map(|row| row.unwrap()).collect()
+    }
+
+    fn quoted_snapshot(conn: &Connection, schema_sql: &str, rows_sql: &str) -> Vec<String> {
+        let mut snapshot = Vec::new();
+        snapshot.push(
+            conn.query_row(schema_sql, [], |row| row.get::<_, String>(0))
+                .unwrap(),
+        );
+        let mut stmt = conn.prepare(rows_sql).unwrap();
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0)).unwrap();
+        snapshot.extend(rows.map(|row| row.unwrap()));
+        snapshot
+    }
+
+    fn malformed_providers_snapshot(conn: &Connection) -> Vec<String> {
+        quoted_snapshot(
+            conn,
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'providers'",
+            "SELECT quote(model_name) || '|' || quote(provider_index) || '|' ||
+                    quote(provider_name) || '|' || quote(invocation_count) || '|' ||
+                    quote(error_count) || '|' || quote(last_error) || '|' ||
+                    quote(last_error_at) || '|' || quote(last_invoked_at)
+               FROM providers
+              ORDER BY model_name, provider_index, provider_name",
+        )
+    }
+
+    fn invocations_snapshot(conn: &Connection) -> Vec<String> {
+        quoted_snapshot(
+            conn,
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'invocations'",
+            "SELECT quote(invocation_uuid) || '|' || quote(model_name) || '|' ||
+                    quote(provider_name) || '|' || quote(provider_index) || '|' ||
+                    quote(status) || '|' || quote(success) || '|' ||
+                    quote(exit_code) || '|' || quote(error_category) || '|' ||
+                    quote(created_at) || '|' || quote(finished_at)
+               FROM invocations
+              ORDER BY id",
+        )
+    }
+
+    fn legacy_invocations_snapshot(conn: &Connection) -> Vec<String> {
+        quoted_snapshot(
+            conn,
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'invocations'",
+            "SELECT quote(model_name) || '|' || quote(provider_index) || '|' ||
+                    quote(success) || '|' || quote(exit_code) || '|' ||
+                    quote(error_category) || '|' || quote(created_at)
+               FROM invocations
+              ORDER BY id",
+        )
     }
 
     fn legacy_session_turns_db() -> TempDir {
@@ -3455,6 +4091,328 @@ mod tests {
         assert!(
             !columns.iter().any(|column| column == "quota_tight_routing"),
             "quota_tight_routing should be removed by migration: {columns:?}"
+        );
+    }
+
+    // Risk: Providers migration from pre-fix aggregate shape | level: particular-integration
+    // Source: proposals/10-routing-claude-skipped.md §Test-intent track
+    #[test]
+    fn providers_migration_rebuilds_aggregate_from_invocations_by_provider_name() {
+        let dir = provider_rebuild_fixture_db();
+        let path = dir.path().join("state.db");
+
+        let db = StateDb::open(&path).unwrap();
+
+        let columns = table_columns_with_pk(&db.conn, "providers");
+        assert!(
+            columns
+                .iter()
+                .any(|(name, pk)| name == "provider_name" && *pk == 2),
+            "providers must be keyed by provider_name after migration: {columns:?}"
+        );
+        assert!(
+            !columns.iter().any(|(name, _)| name == "provider_index"),
+            "providers.provider_index must be removed after migration: {columns:?}"
+        );
+
+        let rows = provider_aggregate_snapshot(&db.conn);
+        assert_eq!(
+            rows,
+            vec![
+                ProviderAggregateSnapshot {
+                    model_name: "routing-model".to_string(),
+                    provider_name: "claude".to_string(),
+                    invocation_count: 1,
+                    error_count: 0,
+                    last_error: None,
+                    last_error_at: None,
+                    last_invoked_at: Some("2026-04-20T12:00:01+00:00".to_string()),
+                },
+                ProviderAggregateSnapshot {
+                    model_name: "routing-model".to_string(),
+                    provider_name: "claude2".to_string(),
+                    invocation_count: 2,
+                    error_count: 1,
+                    last_error: Some("rate_limit".to_string()),
+                    last_error_at: Some("2026-04-20T11:00:01+00:00".to_string()),
+                    last_invoked_at: Some("2026-04-20T11:00:01+00:00".to_string()),
+                },
+            ]
+        );
+    }
+
+    // Risk: Quota path unchanged regression | level: unit
+    // Source: proposals/10-routing-claude-skipped.md §Test-intent track
+    #[test]
+    fn quota_schema_remains_name_keyed_after_provider_migration() {
+        let dir = provider_rebuild_fixture_db();
+        let path = dir.path().join("state.db");
+
+        let db = StateDb::open(&path).unwrap();
+
+        let quota_columns = table_columns_with_pk(&db.conn, "provider_quotas");
+        assert!(
+            quota_columns
+                .iter()
+                .any(|(name, pk)| name == "provider_name" && *pk == 1),
+            "provider_quotas must remain keyed only by provider_name: {quota_columns:?}"
+        );
+        assert!(
+            !quota_columns
+                .iter()
+                .any(|(name, _)| name == "model_name" || name == "provider_index"),
+            "provider_quotas must not gain aggregate identity columns: {quota_columns:?}"
+        );
+
+        let window_columns = table_columns_with_pk(&db.conn, "provider_quota_windows");
+        assert!(
+            window_columns
+                .iter()
+                .any(|(name, pk)| name == "provider_name" && *pk == 1),
+            "provider_quota_windows must remain provider-name keyed: {window_columns:?}"
+        );
+        assert!(
+            !window_columns
+                .iter()
+                .any(|(name, _)| name == "model_name" || name == "provider_index"),
+            "provider_quota_windows must not gain aggregate identity columns: {window_columns:?}"
+        );
+    }
+
+    // Risk: Migration error contract — unexpected shape rejected | level: particular-integration
+    // Source: proposals/10-routing-claude-skipped.md §Test-intent track
+    #[test]
+    fn providers_migration_rejects_unexpected_shape_without_mutating_source_tables() {
+        let dir = malformed_providers_shape_db();
+        let path = dir.path().join("state.db");
+        let conn = Connection::open(&path).unwrap();
+        let providers_before = malformed_providers_snapshot(&conn);
+        let invocations_before = invocations_snapshot(&conn);
+        drop(conn);
+
+        let err = match StateDb::open(&path) {
+            Ok(_) => panic!("unexpected providers shape should fail StateDb::open"),
+            Err(err) => err,
+        };
+        let err_lower = err.to_ascii_lowercase();
+        assert!(
+            err_lower.contains("providers") && err_lower.contains("unexpected"),
+            "unexpected-shape error should name providers and unexpected shape; got {err}"
+        );
+
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(malformed_providers_snapshot(&conn), providers_before);
+        assert_eq!(invocations_snapshot(&conn), invocations_before);
+        conn.execute_batch("DROP TABLE providers").unwrap();
+        drop(conn);
+
+        let recovered = StateDb::open(&path).unwrap();
+        let columns = table_columns_with_pk(&recovered.conn, "providers");
+        assert!(
+            columns
+                .iter()
+                .any(|(name, pk)| name == "provider_name" && *pk == 2),
+            "operator cleanup should let missing-table branch create post-fix providers: {columns:?}"
+        );
+        assert!(
+            !columns.iter().any(|(name, _)| name == "provider_index"),
+            "operator cleanup must not recreate provider_index: {columns:?}"
+        );
+    }
+
+    // Risk: Migration error contract rejects malformed provider column metadata | level: particular-integration
+    // Source: proposals/10-routing-claude-skipped.md §Test-intent track
+    #[test]
+    fn providers_migration_rejects_wrong_affinity_shape() {
+        let dir = malformed_providers_affinity_db();
+        let path = dir.path().join("state.db");
+
+        let err = match StateDb::open(&path) {
+            Ok(_) => panic!("wrong providers affinity should fail StateDb::open"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.contains("provider_index(type=TEXT"),
+            "unexpected-shape error should describe the wrong affinity; got {err}"
+        );
+    }
+
+    // Risk: Migration error contract — providers as non-table object rejected | level: particular-integration
+    // Source: proposals/10-routing-claude-skipped.md §Test-intent track
+    #[test]
+    fn providers_migration_rejects_non_table_object_named_providers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(StateDb::invocations_schema_sql())
+            .unwrap();
+        // SQLite shares table/view namespace; create a VIEW named providers.
+        conn.execute_batch(
+            "CREATE TABLE providers_source (
+                 model_name TEXT NOT NULL,
+                 provider_name TEXT NOT NULL,
+                 invocation_count INTEGER NOT NULL DEFAULT 0,
+                 error_count INTEGER NOT NULL DEFAULT 0,
+                 last_error TEXT,
+                 last_error_at TEXT,
+                 last_invoked_at TEXT,
+                 PRIMARY KEY (model_name, provider_name)
+             );
+             CREATE VIEW providers AS
+                 SELECT model_name, provider_name, invocation_count, error_count,
+                        last_error, last_error_at, last_invoked_at
+                   FROM providers_source;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let err = match StateDb::open(&path) {
+            Ok(_) => panic!("non-table object named providers should fail StateDb::open"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("object type=view"),
+            "object-type rejection should name the unexpected type; got {err}"
+        );
+
+        let conn = Connection::open(&path).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT type FROM sqlite_master WHERE name = 'providers'")
+            .unwrap();
+        let observed_type: String = stmt
+            .query_row([], |row| row.get(0))
+            .expect("providers object should still exist after rejected open");
+        assert_eq!(
+            observed_type, "view",
+            "rejected open must not mutate the providers object"
+        );
+    }
+
+    // Risk: Migration error contract — providers with foreign keys rejected | level: particular-integration
+    // Source: proposals/10-routing-claude-skipped.md §Test-intent track
+    #[test]
+    fn providers_migration_rejects_table_with_foreign_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(StateDb::invocations_schema_sql())
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE models (
+                 name TEXT NOT NULL PRIMARY KEY
+             );
+             INSERT INTO models (name) VALUES ('routing-model');
+             CREATE TABLE providers (
+                 model_name TEXT NOT NULL REFERENCES models(name),
+                 provider_index INTEGER NOT NULL,
+                 invocation_count INTEGER NOT NULL DEFAULT 0,
+                 error_count INTEGER NOT NULL DEFAULT 0,
+                 last_error TEXT,
+                 last_error_at TEXT,
+                 last_invoked_at TEXT,
+                 PRIMARY KEY (model_name, provider_index)
+             );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let err = match StateDb::open(&path) {
+            Ok(_) => panic!("providers with foreign keys should fail StateDb::open"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("foreign-key constraints present"),
+            "foreign-key rejection should name foreign keys; got {err}"
+        );
+    }
+
+    // Risk: Migration error contract rejects before source-table mutation | level: particular-integration
+    // Source: proposals/10-routing-claude-skipped.md §Test-intent track; research/10-routing-claude-skipped-contract.md §2 Migration helper
+    #[test]
+    fn providers_preflight_rejects_malformed_shape_before_invocations_migration() {
+        let dir = legacy_invocations_with_malformed_providers_db();
+        let path = dir.path().join("state.db");
+        let conn = Connection::open(&path).unwrap();
+        let invocations_before = legacy_invocations_snapshot(&conn);
+        drop(conn);
+
+        let err = match StateDb::open(&path) {
+            Ok(_) => panic!("malformed providers shape should fail before invocations migration"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.contains("Unexpected providers schema shape"),
+            "unexpected-shape error should come from providers preflight; got {err}"
+        );
+
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(legacy_invocations_snapshot(&conn), invocations_before);
+    }
+
+    // Risk: Migration ensure_providers_schema is idempotent across reopens | level: unit
+    // Source: proposals/10-routing-claude-skipped.md §Test-intent track
+    #[test]
+    fn providers_migration_is_idempotent_across_reopens() {
+        let dir = provider_rebuild_fixture_db();
+        let path = dir.path().join("state.db");
+
+        let first = StateDb::open(&path).unwrap();
+        let first_rows = provider_aggregate_snapshot(&first.conn);
+        drop(first);
+
+        let second = StateDb::open(&path).unwrap();
+        let second_rows = provider_aggregate_snapshot(&second.conn);
+
+        assert_eq!(second_rows, first_rows);
+    }
+
+    // Risk: Migration last_error_at reflects most recent failed invocation | level: particular-integration
+    // Source: proposals/10-routing-claude-skipped.md §Test-intent track
+    #[test]
+    fn providers_migration_last_error_at_uses_most_recent_failure_not_later_success() {
+        let dir = provider_last_error_fixture_db();
+        let path = dir.path().join("state.db");
+
+        let db = StateDb::open(&path).unwrap();
+        let rows = provider_aggregate_snapshot(&db.conn);
+
+        assert_eq!(
+            rows,
+            vec![ProviderAggregateSnapshot {
+                model_name: "routing-model".to_string(),
+                provider_name: "claude".to_string(),
+                invocation_count: 3,
+                error_count: 2,
+                last_error: Some("auth_error".to_string()),
+                last_error_at: Some("2026-04-20T10:30:10+00:00".to_string()),
+                last_invoked_at: Some("2026-04-20T11:00:10+00:00".to_string()),
+            }]
+        );
+    }
+
+    // Risk: Migration last_error_at deterministic tie-break | level: particular-integration
+    // Source: proposals/10-routing-claude-skipped.md §Test-intent track; research/10-routing-claude-skipped-contract.md §2 Migration helper
+    #[test]
+    fn providers_migration_last_error_ties_use_highest_invocation_id() {
+        let dir = provider_last_error_tie_fixture_db();
+        let path = dir.path().join("state.db");
+
+        let db = StateDb::open(&path).unwrap();
+        let rows = provider_aggregate_snapshot(&db.conn);
+
+        assert_eq!(
+            rows,
+            vec![ProviderAggregateSnapshot {
+                model_name: "routing-model".to_string(),
+                provider_name: "claude".to_string(),
+                invocation_count: 2,
+                error_count: 2,
+                last_error: Some("auth_error".to_string()),
+                last_error_at: Some("2026-04-20T10:00:10+00:00".to_string()),
+                last_invoked_at: Some("2026-04-20T10:00:10+00:00".to_string()),
+            }]
         );
     }
 
@@ -4257,7 +5215,10 @@ name = "fixture-provider"
         db.finalize_invocation(succeeded_id, true, 0, None, None)
             .unwrap();
 
-        let provider = db.get_provider("test-model", 0).unwrap().unwrap();
+        let provider = db
+            .get_provider("test-model", "fixture-provider")
+            .unwrap()
+            .unwrap();
         assert_eq!(provider.invocation_count, 2);
         assert_eq!(provider.error_count, 1);
         assert_eq!(
@@ -4265,6 +5226,45 @@ name = "fixture-provider"
             Some("429 Too Many Requests")
         );
         assert!(provider.last_invoked_at.is_some());
+    }
+
+    // Risk: Null-provider legacy rows must not synthesize aggregate identity | level: unit
+    // Source: proposals/10-routing-claude-skipped.md §Test-intent track; research/10-routing-claude-skipped-contract.md §5 finalize_invocation
+    #[test]
+    fn finalize_invocation_skips_provider_aggregate_for_null_provider_name() {
+        let db = test_db();
+
+        let mut ids = Vec::new();
+        for provider_index in [0, 1] {
+            db.conn
+                .execute(
+                    "INSERT INTO invocations (
+                        invocation_uuid, model_name, provider_name, provider_index,
+                        status, created_at
+                     ) VALUES (?1, 'legacy-model', NULL, ?2, 'running', ?3)",
+                    params![
+                        Uuid::new_v4().to_string(),
+                        provider_index,
+                        Utc::now().to_rfc3339(),
+                    ],
+                )
+                .unwrap();
+            ids.push(db.conn.last_insert_rowid());
+        }
+
+        db.finalize_invocation(ids[0], true, 0, None, None).unwrap();
+        db.finalize_invocation(ids[1], false, 1, Some("rate_limit"), Some("429"))
+            .unwrap();
+
+        let provider_rows: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM providers WHERE model_name = 'legacy-model'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(provider_rows, 0);
     }
 
     #[test]
@@ -4451,8 +5451,98 @@ name = "fixture-provider"
         db.finalize_invocation(succeeded_id, true, 0, None, None)
             .unwrap();
 
-        let count = db.recent_error_count("m", 0, 60).unwrap();
+        let count = db.recent_error_count("m", "fixture-provider", 60).unwrap();
         assert_eq!(count, 1);
+    }
+
+    // Risk: recent_error_count identity drift | level: unit
+    // Source: proposals/10-routing-claude-skipped.md §Test-intent track
+    #[test]
+    fn recent_error_count_uses_provider_name_not_reused_index_history() {
+        let db = test_db();
+
+        for _ in 0..3 {
+            record_provider_invocation(
+                &db,
+                "routing-model",
+                "claude-old",
+                0,
+                false,
+                Some("rate_limit"),
+                None,
+            );
+        }
+
+        assert_eq!(
+            db.recent_error_count("routing-model", "claude", 60)
+                .unwrap(),
+            0,
+            "current provider name must not inherit recent failures from a prior occupant of index 0"
+        );
+        assert_eq!(
+            db.recent_error_count("routing-model", "claude-old", 60)
+                .unwrap(),
+            3,
+            "the failed provider name still owns its own recent failures"
+        );
+    }
+
+    // Risk: Aggregate writer/reader round-trip after provider reorder | level: unit
+    // Source: proposals/10-routing-claude-skipped.md §Test-intent track
+    #[test]
+    fn provider_aggregate_round_trip_follows_name_after_reorder() {
+        let db = test_db();
+        record_provider_invocation(&db, "routing-model", "claude2", 0, true, None, None);
+
+        let claude2 = db
+            .get_provider("routing-model", "claude2")
+            .unwrap()
+            .expect("claude2 aggregate should exist by provider name");
+        assert_eq!(claude2.provider_name, "claude2");
+        assert_eq!(claude2.invocation_count, 1);
+        assert!(
+            db.get_provider("routing-model", "claude")
+                .unwrap()
+                .is_none(),
+            "claude must not inherit claude2 history after taking index 0"
+        );
+
+        let model = crate::config::ModelConfig {
+            name: "routing-model".to_string(),
+            prompt_mode: crate::config::PromptMode::Arg,
+            providers: vec![
+                crate::config::ProviderConfig::model_provider("claude", vec![]),
+                crate::config::ProviderConfig::model_provider("claude3", vec![]),
+                crate::config::ProviderConfig::model_provider("claude2", vec![]),
+            ],
+            inputs: vec![],
+        };
+        let selected = crate::balancer::select_provider(&model, &db, None);
+        assert_eq!(
+            model.providers[selected].name, "claude",
+            "fallback scoring should treat the current claude provider as unused"
+        );
+    }
+
+    // Risk: Aggregate writer/reader round-trip after provider rename | level: unit
+    // Source: proposals/10-routing-claude-skipped.md §Test-intent track
+    #[test]
+    fn provider_aggregate_round_trip_does_not_inherit_renamed_provider_history() {
+        let db = test_db();
+        record_provider_invocation(&db, "routing-model", "claude-old", 0, true, None, None);
+
+        let old = db
+            .get_provider("routing-model", "claude-old")
+            .unwrap()
+            .expect("old provider name should retain its aggregate");
+        assert_eq!(old.provider_name, "claude-old");
+        assert_eq!(old.invocation_count, 1);
+        assert!(
+            db.get_provider("routing-model", "claude")
+                .unwrap()
+                .is_none(),
+            "renamed provider claude starts without aggregate history unless invocations use that name"
+        );
     }
 
     #[test]
@@ -4767,7 +5857,7 @@ name = "fixture-provider"
     #[test]
     fn missing_provider_returns_none() {
         let db = test_db();
-        assert!(db.get_provider("nonexistent", 0).unwrap().is_none());
+        assert!(db.get_provider("nonexistent", "missing").unwrap().is_none());
     }
 
     // --- CLI Provider & Account tests ---

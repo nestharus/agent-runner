@@ -120,7 +120,7 @@ fn main() {
             let ws = db.get_windows(&p.name).unwrap_or_default();
             let marker = if i == pick { ">>" } else { "  " };
             if ws.is_empty() {
-                let rec = db.get_provider(name, i).unwrap();
+                let rec = db.get_provider(name, &p.name).unwrap();
                 let count = rec.map(|r| r.invocation_count).unwrap_or(0);
                 println!(
                     "    {marker} [{i}] {:<10} <no windows> invocations={}",
