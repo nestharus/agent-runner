@@ -1,20 +1,20 @@
-mod internal;
-
-use crate::config::{ProvidersConfig, SessionStorage, SessionsConfig};
+use crate::config::{ProvidersConfig, SessionsConfig, load_models};
 use crate::session_export::{self as export, ContentChunk, ExportError, ExportSessionMetadata};
+use crate::session_lock::{Lease, LockError, SessionLock};
+use crate::session_metadata::{
+    MetadataError, SessionMetadata, SessionStorageType, TranscriptState, locate_session_metadata,
+};
 use crate::state::StateDb;
 use chrono::{DateTime, Utc};
-use internal::{SessionLock, SessionMetadata, StorageType};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use uuid::Uuid;
 
 pub use crate::session_export::CanonicalRecord;
@@ -23,7 +23,6 @@ const TEST_HOOK_ENV: &str = "OULIPOLY_IMPORT_REPLACE_TEST_HOOK";
 const TEST_SLEEP_AFTER_LOCK_MS: &str = "sleep-after-lock-ms";
 const TEST_BLOCK_AFTER_RENAME: &str = "block-after-transcript-rename-before-db-commit";
 const TEST_FAIL_POSTIMAGE_VERIFY: &str = "fail-postimage-verification";
-const LOCATOR_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplaceReceipt {
@@ -142,8 +141,73 @@ impl ReplaceError {
     }
 }
 
+fn map_lock_error(err: LockError) -> ReplaceError {
+    match err {
+        LockError::Busy {
+            expires_at,
+            token_hash,
+        } => ReplaceError::SessionBusy {
+            token: token_hash
+                .as_deref()
+                .and_then(|value| value.strip_prefix("sha256:"))
+                .or(token_hash.as_deref())
+                .unwrap_or_default()
+                .to_string(),
+            expires_at,
+        },
+        LockError::TokenInvalid => ReplaceError::OperationalError {
+            message: "lock token became invalid during import-replace".to_string(),
+        },
+        LockError::LockExpired => ReplaceError::OperationalError {
+            message: "lock expired during import-replace".to_string(),
+        },
+        LockError::Operational { message } => ReplaceError::OperationalError { message },
+    }
+}
+
+fn map_metadata_error(err: MetadataError) -> ReplaceError {
+    match err {
+        MetadataError::InvalidSessionId { input } => ReplaceError::InvalidSessionId { input },
+        MetadataError::SessionNotFound { input } => ReplaceError::SessionNotFound { input },
+        MetadataError::AmbiguousSession { input } => ReplaceError::AmbiguousSession { input },
+        MetadataError::UnsupportedStorage {
+            provider_name,
+            reason,
+        } => ReplaceError::UnsupportedStorage {
+            provider_name,
+            reason,
+        },
+        MetadataError::Operational { message } => ReplaceError::OperationalError { message },
+    }
+}
+
 pub trait CanonicalToProviderRenderer {
     fn render(&self, records: &[CanonicalRecord]) -> Result<Vec<u8>, ReplaceError>;
+}
+
+struct ImportReplaceLease<'a> {
+    lock: &'a SessionLock,
+    session_id: String,
+    lease: Option<Lease>,
+}
+
+impl<'a> ImportReplaceLease<'a> {
+    fn commit(mut self) -> Result<(), ReplaceError> {
+        if let Some(lease) = self.lease.take() {
+            self.lock
+                .release(&self.session_id, &lease.token)
+                .map_err(map_lock_error)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ImportReplaceLease<'_> {
+    fn drop(&mut self) {
+        if let Some(lease) = self.lease.take() {
+            let _ = self.lock.release(&self.session_id, &lease.token);
+        }
+    }
 }
 
 pub struct ClaudeCodeRenderer;
@@ -380,14 +444,14 @@ fn run_import_replace_bytes(
     let staging_path = staging_dir.join(format!("{operation_uuid}.canonical.jsonl"));
     atomic_write_bytes(&staging_path, &canonical_bytes)?;
 
-    let metadata = match locate_session_metadata(session_id) {
+    let metadata = match resolve_replace_metadata(session_id) {
         Ok(metadata) => metadata,
         Err(err) => {
             let _ = fs::remove_file(&staging_path);
             return Err(err);
         }
     };
-    if metadata.storage_type == StorageType::Other {
+    if metadata.storage_type == SessionStorageType::Other {
         let _ = fs::remove_file(&staging_path);
         return Err(ReplaceError::UnsupportedStorage {
             provider_name: metadata.provider_name,
@@ -399,33 +463,33 @@ fn run_import_replace_bytes(
     })?;
 
     let rendered = render_for_storage(&metadata.storage_type, &records)?;
-    let postimage_expected = canonical_hash_from_provider_bytes(
-        &metadata.storage_type,
+    let postimage_expected = canonical_hash_from_provider_bytes(&metadata, &rendered)?;
+
+    let lock_dir = data_root.join("locks");
+    let lock = SessionLock::new(&lock_dir).map_err(|e| ReplaceError::OperationalError {
+        message: format!("failed to initialize session lock: {e}"),
+    })?;
+    let lease = match lock.acquire(
         &metadata.session_id,
         &metadata.provider_name,
-        &rendered,
-        &metadata.jsonl_path,
-    )?;
-
-    let lock = match SessionLock::acquire(&data_root, &metadata.provider_name, &metadata.session_id)
-    {
-        Ok(lock) => lock,
+        Duration::from_secs(300),
+    ) {
+        Ok(lease) => lease,
         Err(err) => {
             let _ = fs::remove_file(&staging_path);
-            return Err(err);
+            return Err(map_lock_error(err));
         }
+    };
+    let lease = ImportReplaceLease {
+        lock: &lock,
+        session_id: metadata.session_id.clone(),
+        lease: Some(lease),
     };
     maybe_test_hook(TEST_SLEEP_AFTER_LOCK_MS);
 
-    let preimage = match canonical_hash_from_provider_file(
-        &metadata.storage_type,
-        &metadata.session_id,
-        &metadata.provider_name,
-        &metadata.jsonl_path,
-    ) {
+    let preimage = match canonical_hash_from_provider_file(&metadata) {
         Ok(preimage) => preimage,
         Err(err) => {
-            drop(lock);
             let _ = fs::remove_file(&staging_path);
             return Err(err);
         }
@@ -451,7 +515,7 @@ fn run_import_replace_bytes(
         chain_id: metadata.chain_id.clone(),
         active_segment_id: metadata.active_segment_id,
         provider_name: metadata.provider_name.clone(),
-        storage_type: metadata.storage_type.as_str().to_string(),
+        storage_type: storage_type_as_str(metadata.storage_type).to_string(),
         jsonl_path: metadata.jsonl_path.clone(),
         preimage_sha256: Some(preimage.clone()),
         postimage_sha256: postimage_expected.clone(),
@@ -463,7 +527,6 @@ fn run_import_replace_bytes(
     if let Some(expected) = preimage_sha256
         && expected != preimage
     {
-        drop(lock);
         return Err(ReplaceError::PreimageMismatch {
             expected: expected.to_string(),
             actual: preimage,
@@ -491,23 +554,13 @@ fn run_import_replace_bytes(
         });
     }
 
-    let actual_postimage = canonical_hash_from_provider_file(
-        &metadata.storage_type,
-        &metadata.session_id,
-        &metadata.provider_name,
-        &metadata.jsonl_path,
-    )?;
+    let actual_postimage = canonical_hash_from_provider_file(&metadata)?;
     if actual_postimage != postimage_expected {
         return Err(ReplaceError::OperationalError {
             message: "postimage verification hash mismatch".to_string(),
         });
     }
-    let fresh = canonical_records_from_provider_file(
-        &metadata.storage_type,
-        &metadata.session_id,
-        &metadata.provider_name,
-        &metadata.jsonl_path,
-    )?;
+    let fresh = canonical_records_from_provider_file(&metadata)?;
     if !canonical_semantics_equal(&records, &fresh) {
         return Err(ReplaceError::OperationalError {
             message: "fresh export verification mismatch".to_string(),
@@ -523,12 +576,12 @@ fn run_import_replace_bytes(
     fs::remove_file(&pending_path).ok();
     fs::remove_file(&canonical_records_path).ok();
     fsync_dir(&journal_root)?;
-    drop(lock);
+    lease.commit()?;
 
     Ok(ReplaceReceipt {
         session_id: metadata.session_id,
         provider_name: metadata.provider_name,
-        storage_type: metadata.storage_type.as_str().to_string(),
+        storage_type: storage_type_as_str(metadata.storage_type).to_string(),
         operation: "import-replace".to_string(),
         preimage_sha256: preimage,
         postimage_sha256: actual_postimage,
@@ -575,12 +628,18 @@ pub fn recover_pending_replaces() -> Result<(), ReplaceError> {
             continue;
         }
         let storage_type = storage_type_from_str(&journal.storage_type);
-        let current_hash = canonical_hash_from_provider_file(
-            &storage_type,
-            &journal.session_id,
-            &journal.provider_name,
-            &journal.jsonl_path,
-        );
+        let metadata = SessionMetadata {
+            session_id: journal.session_id.clone(),
+            chain_id: journal.chain_id.clone(),
+            active_segment_id: journal.active_segment_id,
+            provider_name: journal.provider_name.clone(),
+            storage_type,
+            jsonl_path: journal.jsonl_path.clone(),
+            workspace_root: PathBuf::new(),
+            transcript_state: TranscriptState::Available,
+            mutable: true,
+        };
+        let current_hash = canonical_hash_from_provider_file(&metadata);
         match (journal.preimage_sha256.as_deref(), current_hash) {
             (_, Ok(hash)) if hash == journal.postimage_sha256 => {
                 let Ok(canonical) = fs::read_to_string(&journal.canonical_records_path) else {
@@ -596,14 +655,6 @@ pub fn recover_pending_replaces() -> Result<(), ReplaceError> {
                         message: format!("failed to open state db during recovery: {e}"),
                     }
                 })?;
-                let metadata = SessionMetadata {
-                    session_id: journal.session_id.clone(),
-                    chain_id: journal.chain_id.clone(),
-                    active_segment_id: journal.active_segment_id,
-                    provider_name: journal.provider_name.clone(),
-                    storage_type,
-                    jsonl_path: journal.jsonl_path.clone(),
-                };
                 replace_db_turns(&mut conn, &metadata, &records)?;
                 fs::remove_file(&path).ok();
                 fs::remove_file(&journal.canonical_records_path).ok();
@@ -651,7 +702,10 @@ fn cleanup_orphan_canonical_records(
             continue;
         }
         let session_id = session_part.trim_start_matches("session-");
-        if SessionLock::any_active_for_session(data_root, session_id)? {
+        let lock_dir = data_root.join("locks");
+        if crate::session_lock::any_active_for_session(&lock_dir, session_id)
+            .map_err(map_lock_error)?
+        {
             continue;
         }
         let pending = journal_root.join(format!("{session_part}.pending"));
@@ -670,13 +724,8 @@ pub fn export_session_canonical(session_id: &str) -> Result<Vec<u8>, ReplaceErro
     Uuid::try_parse(session_id).map_err(|_| ReplaceError::InvalidSessionId {
         input: session_id.to_string(),
     })?;
-    let metadata = locate_session_metadata(session_id)?;
-    let records = canonical_records_from_provider_file(
-        &metadata.storage_type,
-        &metadata.session_id,
-        &metadata.provider_name,
-        &metadata.jsonl_path,
-    )?;
+    let metadata = resolve_replace_metadata(session_id)?;
+    let records = canonical_records_from_provider_file(&metadata)?;
     canonical_jsonl_bytes(&records)
 }
 
@@ -784,13 +833,13 @@ fn content_json(record: &CanonicalRecord) -> Result<Vec<Value>, ReplaceError> {
 }
 
 fn render_for_storage(
-    storage_type: &StorageType,
+    storage_type: &SessionStorageType,
     records: &[CanonicalRecord],
 ) -> Result<Vec<u8>, ReplaceError> {
     match storage_type {
-        StorageType::ClaudeCode => ClaudeCodeRenderer.render(records),
-        StorageType::CodexSession => CodexSessionRenderer.render(records),
-        StorageType::Other => Err(ReplaceError::UnsupportedStorage {
+        SessionStorageType::ClaudeCode => ClaudeCodeRenderer.render(records),
+        SessionStorageType::CodexSession => CodexSessionRenderer.render(records),
+        SessionStorageType::Other => Err(ReplaceError::UnsupportedStorage {
             provider_name: records
                 .first()
                 .map(|record| record.provider_name.clone())
@@ -800,228 +849,17 @@ fn render_for_storage(
     }
 }
 
-fn locate_session_metadata(input: &str) -> Result<SessionMetadata, ReplaceError> {
-    // Keep StateDb's schema/backfill side effects centralized, then use a raw
-    // connection for the frozen identity queries below.
-    StateDb::open_default().map_err(|e| ReplaceError::OperationalError { message: e })?;
-    let data_root = default_data_root()?;
-    let db_path = data_root.join("state.db");
-    let conn = Connection::open(&db_path).map_err(|e| ReplaceError::OperationalError {
-        message: format!("failed to open state db: {e}"),
-    })?;
-    let chain_ids = candidate_chain_ids(&conn, input)?;
-    if chain_ids.is_empty() {
-        return Err(ReplaceError::SessionNotFound {
-            input: input.to_string(),
-        });
-    }
-    let Some(chain_id) = choose_chain(&conn, chain_ids)? else {
-        return Err(ReplaceError::AmbiguousSession {
-            input: input.to_string(),
-        });
-    };
-    let (active_segment_id, provider_name, active_session_id): (i64, String, String) = conn
-        .query_row(
-            "SELECT id, provider_name, session_id
-             FROM session_chain_segments
-             WHERE chain_id = ?1 AND ended_at IS NULL
-             ORDER BY started_at DESC, id DESC
-             LIMIT 1",
-            params![chain_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()
-        .map_err(|e| ReplaceError::OperationalError {
-            message: format!("failed to read active segment: {e}"),
-        })?
-        .ok_or_else(|| ReplaceError::SessionNotFound {
-            input: input.to_string(),
-        })?;
-    let config_root = default_config_root();
-    let providers = ProvidersConfig::load(&config_root.join("providers.toml"))
+fn resolve_replace_metadata(session_id: &str) -> Result<SessionMetadata, ReplaceError> {
+    let state =
+        StateDb::open_default().map_err(|e| ReplaceError::OperationalError { message: e })?;
+    let models = load_models(&default_models_dir())
         .map_err(|e| ReplaceError::OperationalError { message: e })?;
-    let sessions = SessionsConfig::load(&config_root.join("sessions.toml"))
+    let providers = ProvidersConfig::load(&default_config_root().join("providers.toml"))
         .map_err(|e| ReplaceError::OperationalError { message: e })?;
-    let provider = providers.get(&provider_name);
-    let storage_type = match provider.and_then(|p| p.session_storage.as_ref()) {
-        Some(SessionStorage::ClaudeCode { .. }) => StorageType::ClaudeCode,
-        Some(SessionStorage::Codex { .. }) => StorageType::CodexSession,
-        None => StorageType::Other,
-    };
-    let jsonl_path = locate_transcript_path(&sessions, &provider_name, &active_session_id)?;
-    Ok(SessionMetadata {
-        session_id: active_session_id,
-        chain_id,
-        active_segment_id,
-        provider_name,
-        storage_type,
-        jsonl_path,
-    })
-}
-
-fn candidate_chain_ids(conn: &Connection, input: &str) -> Result<Vec<String>, ReplaceError> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT DISTINCT chain_id
-             FROM session_chain_segments
-             WHERE session_id = ?1 OR chain_id = ?1
-             ORDER BY chain_id",
-        )
-        .map_err(|e| ReplaceError::OperationalError {
-            message: format!("failed to prepare chain lookup: {e}"),
-        })?;
-    let rows = stmt
-        .query_map(params![input], |row| row.get::<_, String>(0))
-        .map_err(|e| ReplaceError::OperationalError {
-            message: format!("failed to query chain lookup: {e}"),
-        })?;
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|e| ReplaceError::OperationalError {
-            message: format!("failed to read chain lookup: {e}"),
-        })
-}
-
-fn choose_chain(
-    conn: &Connection,
-    mut chain_ids: Vec<String>,
-) -> Result<Option<String>, ReplaceError> {
-    if chain_ids.len() == 1 {
-        return Ok(chain_ids.pop());
-    }
-    let cutoff = Utc::now() - chrono::Duration::hours(24);
-    let mut rows = Vec::new();
-    for chain_id in chain_ids {
-        let raw: String = conn
-            .query_row(
-                "SELECT last_used_at FROM session_chains WHERE chain_id = ?1",
-                params![chain_id],
-                |row| row.get(0),
-            )
-            .map_err(|e| ReplaceError::OperationalError {
-                message: format!("failed to read chain last_used_at: {e}"),
-            })?;
-        let last_used = DateTime::parse_from_rfc3339(&raw)
-            .map_err(|e| ReplaceError::OperationalError {
-                message: format!("bad chain timestamp: {e}"),
-            })?
-            .with_timezone(&Utc);
-        rows.push((chain_id, last_used));
-    }
-    let recent = rows
-        .iter()
-        .filter(|(_, last_used)| *last_used >= cutoff)
-        .collect::<Vec<_>>();
-    if recent.len() == 1 {
-        return Ok(Some(recent[0].0.clone()));
-    }
-    if recent.is_empty() {
-        rows.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-        return Ok(rows.pop().map(|(chain_id, _)| chain_id));
-    }
-    Ok(None)
-}
-
-fn locate_transcript_path(
-    sessions: &SessionsConfig,
-    provider_name: &str,
-    session_id: &str,
-) -> Result<PathBuf, ReplaceError> {
-    let entry = sessions
-        .get(provider_name)
-        .ok_or_else(|| ReplaceError::UnsupportedStorage {
-            provider_name: provider_name.to_string(),
-            reason: "provider has no sessions.toml entry".to_string(),
-        })?;
-    let locator =
-        entry
-            .transcript_locator
-            .as_ref()
-            .ok_or_else(|| ReplaceError::UnsupportedStorage {
-                provider_name: provider_name.to_string(),
-                reason: "provider has no transcript locator".to_string(),
-            })?;
-    let state_dir = entry.state_dir.clone().unwrap_or_else(|| {
-        default_data_root()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join("sessions")
-            .join(provider_name)
-    });
-    fs::create_dir_all(&state_dir).map_err(|e| ReplaceError::OperationalError {
-        message: format!("failed to create locator state dir: {e}"),
-    })?;
-    // `locator` is user-configured in sessions.toml; the session id reaches the
-    // shell only as a UUID-validated environment value.
-    let output = run_locator_with_timeout(locator, &state_dir, session_id)?;
-    if !output.status.success() {
-        return Err(ReplaceError::OperationalError {
-            message: format!(
-                "transcript locator failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ),
-        });
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let path = stdout.trim();
-    if path.is_empty() {
-        return Err(ReplaceError::SessionNotFound {
-            input: session_id.to_string(),
-        });
-    }
-    Ok(PathBuf::from(path))
-}
-
-fn run_locator_with_timeout(
-    locator: &str,
-    state_dir: &Path,
-    session_id: &str,
-) -> Result<Output, ReplaceError> {
-    let mut child = Command::new("sh")
-        .arg("-c")
-        .arg(locator)
-        .env("STATE_DIR", state_dir)
-        .env("SESSION_ID", session_id)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| ReplaceError::OperationalError {
-            message: format!("failed to run transcript locator: {e}"),
-        })?;
-    let deadline = Instant::now() + LOCATOR_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                return child
-                    .wait_with_output()
-                    .map_err(|e| ReplaceError::OperationalError {
-                        message: format!("failed to collect transcript locator output: {e}"),
-                    });
-            }
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let output =
-                    child
-                        .wait_with_output()
-                        .map_err(|e| ReplaceError::OperationalError {
-                            message: format!("failed to collect timed-out transcript locator: {e}"),
-                        })?;
-                return Err(ReplaceError::OperationalError {
-                    message: format!(
-                        "transcript locator timed out after {}s: {}",
-                        LOCATOR_TIMEOUT.as_secs(),
-                        String::from_utf8_lossy(&output.stderr)
-                    ),
-                });
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(20)),
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(ReplaceError::OperationalError {
-                    message: format!("failed to wait for transcript locator: {e}"),
-                });
-            }
-        }
-    }
+    let sessions = SessionsConfig::load(&default_config_root().join("sessions.toml"))
+        .map_err(|e| ReplaceError::OperationalError { message: e })?;
+    locate_session_metadata(&state, &models, &providers, &sessions, session_id)
+        .map_err(map_metadata_error)
 }
 
 fn replace_db_turns(
@@ -1091,75 +929,46 @@ fn replace_db_turns(
 }
 
 fn canonical_records_from_provider_file(
-    storage_type: &StorageType,
-    session_id: &str,
-    provider_name: &str,
-    jsonl_path: &Path,
+    metadata: &SessionMetadata,
 ) -> Result<Vec<CanonicalRecord>, ReplaceError> {
-    let bytes = fs::read(jsonl_path).map_err(|e| ReplaceError::OperationalError {
-        message: format!("failed to read transcript {}: {e}", jsonl_path.display()),
+    let bytes = fs::read(&metadata.jsonl_path).map_err(|e| ReplaceError::OperationalError {
+        message: format!(
+            "failed to read transcript {}: {e}",
+            metadata.jsonl_path.display()
+        ),
     })?;
-    canonical_records_from_provider_bytes(
-        storage_type,
-        session_id,
-        provider_name,
-        &bytes,
-        jsonl_path,
-    )
+    canonical_records_from_provider_bytes(metadata, &bytes)
 }
 
-fn canonical_hash_from_provider_file(
-    storage_type: &StorageType,
-    session_id: &str,
-    provider_name: &str,
-    jsonl_path: &Path,
-) -> Result<String, ReplaceError> {
-    let records =
-        canonical_records_from_provider_file(storage_type, session_id, provider_name, jsonl_path)?;
+fn canonical_hash_from_provider_file(metadata: &SessionMetadata) -> Result<String, ReplaceError> {
+    let records = canonical_records_from_provider_file(metadata)?;
     Ok(sha256_hex(&canonical_jsonl_bytes(&records)?))
 }
 
 fn canonical_hash_from_provider_bytes(
-    storage_type: &StorageType,
-    session_id: &str,
-    provider_name: &str,
+    metadata: &SessionMetadata,
     bytes: &[u8],
-    jsonl_path: &Path,
 ) -> Result<String, ReplaceError> {
-    let records = canonical_records_from_provider_bytes(
-        storage_type,
-        session_id,
-        provider_name,
-        bytes,
-        jsonl_path,
-    )?;
+    let records = canonical_records_from_provider_bytes(metadata, bytes)?;
     Ok(sha256_hex(&canonical_jsonl_bytes(&records)?))
 }
 
 fn canonical_records_from_provider_bytes(
-    storage_type: &StorageType,
-    session_id: &str,
-    provider_name: &str,
+    metadata: &SessionMetadata,
     bytes: &[u8],
-    jsonl_path: &Path,
 ) -> Result<Vec<CanonicalRecord>, ReplaceError> {
-    let metadata = export_metadata_for(storage_type, session_id, provider_name, jsonl_path)?;
-    export::read_canonical_transcript_from_bytes(&metadata, bytes).map_err(map_export_error)
+    let export_metadata = export_metadata_for(metadata);
+    export::read_canonical_transcript_from_bytes(&export_metadata, bytes).map_err(map_export_error)
 }
 
-fn export_metadata_for(
-    storage_type: &StorageType,
-    session_id: &str,
-    provider_name: &str,
-    jsonl_path: &Path,
-) -> Result<ExportSessionMetadata, ReplaceError> {
-    Ok(ExportSessionMetadata {
-        session_id: session_id.to_string(),
-        chain_id: String::new(),
-        provider_name: provider_name.to_string(),
-        storage_type: storage_type.to_export(),
-        jsonl_path: jsonl_path.to_path_buf(),
-    })
+fn export_metadata_for(metadata: &SessionMetadata) -> ExportSessionMetadata {
+    ExportSessionMetadata {
+        session_id: metadata.session_id.clone(),
+        chain_id: metadata.chain_id.clone(),
+        provider_name: metadata.provider_name.clone(),
+        storage_type: storage_type_to_export(metadata.storage_type),
+        jsonl_path: metadata.jsonl_path.clone(),
+    }
 }
 
 fn map_export_error(err: ExportError) -> ReplaceError {
@@ -1305,12 +1114,36 @@ fn default_config_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn storage_type_from_str(raw: &str) -> StorageType {
+fn storage_type_from_str(raw: &str) -> SessionStorageType {
     match raw {
-        "claude_code" => StorageType::ClaudeCode,
-        "codex_session" | "codex" => StorageType::CodexSession,
-        _ => StorageType::Other,
+        "claude_code" => SessionStorageType::ClaudeCode,
+        "codex_session" | "codex" => SessionStorageType::CodexSession,
+        _ => SessionStorageType::Other,
     }
+}
+
+fn storage_type_as_str(storage_type: SessionStorageType) -> &'static str {
+    match storage_type {
+        SessionStorageType::ClaudeCode => "claude_code",
+        SessionStorageType::CodexSession => "codex_session",
+        SessionStorageType::Other => "other",
+    }
+}
+
+fn storage_type_to_export(
+    storage_type: SessionStorageType,
+) -> crate::session_export::SessionStorageType {
+    match storage_type {
+        SessionStorageType::ClaudeCode => crate::session_export::SessionStorageType::ClaudeCode,
+        SessionStorageType::CodexSession => crate::session_export::SessionStorageType::CodexSession,
+        SessionStorageType::Other => crate::session_export::SessionStorageType::Other,
+    }
+}
+
+fn default_models_dir() -> PathBuf {
+    dirs::config_dir()
+        .map(|dir| dir.join("oulipoly-agent-runner").join("models"))
+        .unwrap_or_else(|| PathBuf::from("models"))
 }
 
 fn maybe_test_hook(name: &str) {

@@ -1436,7 +1436,7 @@ fn emit_resume_resolution_error(err: agent_runner_lib::state::ResumeError) -> i3
 
 fn emit_lock_error(err: LockError) -> i32 {
     match err {
-        LockError::Busy { expires_at } => emit_json_error(
+        LockError::Busy { expires_at, .. } => emit_json_error(
             13,
             "session-busy",
             format!("session is paused until {expires_at}"),

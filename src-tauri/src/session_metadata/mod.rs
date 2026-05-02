@@ -12,6 +12,8 @@ use uuid::Uuid;
 pub struct SessionMetadata {
     pub session_id: String,
     pub chain_id: String,
+    #[serde(skip)]
+    pub active_segment_id: i64,
     pub provider_name: String,
     pub storage_type: SessionStorageType,
     pub jsonl_path: PathBuf,
@@ -95,6 +97,12 @@ pub fn locate_session_metadata(
     let provider = effective_provider_for_resolved(&resolved, providers_cfg)?;
     let provider_name = resolved.active_provider.clone();
     let storage_type = SessionStorageType::from(&provider.session_storage);
+    let active_segment_id = state
+        .active_segment_id_for_chain(&resolved.chain_id)
+        .map_err(|message| MetadataError::Operational { message })?
+        .ok_or_else(|| MetadataError::SessionNotFound {
+            input: resolved.chain_id.clone(),
+        })?;
 
     let jsonl_path =
         available_jsonl_path(sessions_cfg, &provider_name, &resolved.active_session_id)?;
@@ -122,6 +130,7 @@ pub fn locate_session_metadata(
         session_id: normalize_uuid(&resolved.active_session_id)
             .unwrap_or_else(|| parsed_input.to_string()),
         chain_id: normalize_uuid(&resolved.chain_id).unwrap_or_else(|| resolved.chain_id.clone()),
+        active_segment_id,
         provider_name,
         storage_type,
         jsonl_path,

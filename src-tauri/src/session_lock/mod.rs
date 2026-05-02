@@ -30,10 +30,15 @@ pub struct ReleaseReceipt {
 
 #[derive(Debug, Clone)]
 pub enum LockError {
-    Busy { expires_at: String },
+    Busy {
+        expires_at: String,
+        token_hash: Option<String>,
+    },
     TokenInvalid,
     LockExpired,
-    Operational { message: String },
+    Operational {
+        message: String,
+    },
 }
 
 #[derive(Debug)]
@@ -114,6 +119,7 @@ impl SessionLock {
                     if expires_at > now {
                         return Err(LockError::Busy {
                             expires_at: existing.expires_at,
+                            token_hash: existing.token_hash,
                         });
                     }
                 }
@@ -242,6 +248,27 @@ impl SessionLock {
     fn release_marker_path(&self, session_id: &str) -> PathBuf {
         self.lock_dir.join(format!("session-{session_id}.released"))
     }
+}
+
+pub fn any_active_for_session(lock_dir: &Path, session_id: &str) -> Result<bool, LockError> {
+    if !lock_dir.exists() {
+        return Ok(false);
+    }
+    let lock_path = lock_dir.join(format!("session-{session_id}.lock"));
+    let Some(existing) = read_json::<StoredLease>(&lock_path)? else {
+        return Ok(false);
+    };
+    validate_version(existing.version)?;
+    if existing.session_id != session_id {
+        return Err(LockError::Operational {
+            message: format!(
+                "lock metadata session mismatch: expected {session_id}, got {}",
+                existing.session_id
+            ),
+        });
+    }
+    let expires_at = parse_time(&existing.expires_at)?;
+    Ok(expires_at > Utc::now())
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>, LockError> {
