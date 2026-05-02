@@ -2853,6 +2853,29 @@ impl StateDb {
         Ok(None)
     }
 
+    pub fn active_segment_id_for_chain_provider_session(
+        &self,
+        chain_id: &str,
+        provider_name: &str,
+        session_id: &str,
+    ) -> Result<Option<i64>, String> {
+        self.conn
+            .query_row(
+                "SELECT id
+                 FROM session_chain_segments
+                 WHERE chain_id = ?1
+                   AND provider_name = ?2
+                   AND session_id = ?3
+                   AND ended_at IS NULL
+                 ORDER BY started_at DESC, id DESC
+                 LIMIT 1",
+                params![chain_id, provider_name, session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to read active chain segment id: {e}"))
+    }
+
     fn active_segment_for_chain(&self, chain_id: &str) -> Result<Option<(String, String)>, String> {
         self.conn
             .query_row(

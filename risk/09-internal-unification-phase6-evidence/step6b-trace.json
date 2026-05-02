@@ -1,0 +1,33 @@
+{
+  "requested_id": "f3fe1f9e-a83b-4b7a-8996-aa60e95af1b8",
+  "generated_at": "2026-05-02T05:01:45.486582472Z",
+  "root": {
+    "invocation": {
+      "row_id": 5482,
+      "id": "f3fe1f9e-a83b-4b7a-8996-aa60e95af1b8",
+      "source": "codex",
+      "model_name": "gpt-high",
+      "parent_id": null,
+      "status": "succeeded",
+      "success": true,
+      "exit_code": 0,
+      "error_category": null,
+      "started_at": "2026-05-02T04:45:04.575881057Z",
+      "finished_at": "2026-05-02T04:51:19.875503630Z"
+    },
+    "session": {
+      "id": "019de701-23a8-77e0-8296-10ddd14675d2",
+      "chain_id": "19843754-86d3-4bc6-9baa-8f69b2260cf1",
+      "capture_method": "turn_script",
+      "transcript_path": null,
+      "transcript_state": "no_locator",
+      "turn_count": 10,
+      "assistant_turn_count": 8,
+      "sidechain_turn_count": 0,
+      "resume_acceptance": null,
+      "resume_acceptance_evidence": null
+    },
+    "warnings": [],
+    "children": []
+  }
+}

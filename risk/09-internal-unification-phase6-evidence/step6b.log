@@ -1,0 +1,20 @@
+OULIPOLY_INVOCATION={"source":"codex","id":"f3fe1f9e-a83b-4b7a-8996-aa60e95af1b8"}
+OULIPOLY_SESSION={"id":"f3fe1f9e-a83b-4b7a-8996-aa60e95af1b8","session_id":"019de701-23a8-77e0-8296-10ddd14675d2"}
+Implemented and committed Step 6b.
+
+Commit: `6763500 test(09-internal-unification): Phase 6 Step 6b — RC regression tests + fixture migration`
+
+Changed:
+- Added [initiative_09_internal_unification.rs](/home/nes/projects/agent-runner/worktrees/09-internal-unification/src-tauri/tests/initiative_09_internal_unification.rs)
+- Migrated lock fixture helpers in [initiative_06_import_replace.rs](/home/nes/projects/agent-runner/worktrees/09-internal-unification/src-tauri/tests/fixtures/initiative_06_import_replace.rs)
+- Updated existing canonical lock-path call site in [initiative_06_import_replace.rs](/home/nes/projects/agent-runner/worktrees/09-internal-unification/src-tauri/tests/initiative_06_import_replace.rs)
+- Added [.tmp/phase6/step6b-output-index.md](/home/nes/projects/agent-runner/worktrees/09-internal-unification/.tmp/phase6/step6b-output-index.md)
+
+Verification:
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check` passes.
+- `cargo build --manifest-path src-tauri/Cargo.toml --tests` fails only on expected Step 6c gaps:
+  - missing `session_lock::any_active_for_session`
+  - missing `SessionMetadata::active_segment_id`
+  - missing `LockError::Busy { token_hash }`
+
+Working tree is clean.
