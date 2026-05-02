@@ -232,17 +232,18 @@ RC-class divergence with a different proximate cause.
 `ExportSessionMetadata` via `export_metadata_for` (preimage hash,
 postimage hash check, recovery hash check, and fresh-export verify) all
 pass through the same helper, so a future fix is one helper away.
-`internal::SessionMetadata::to_export_metadata()` (added in
-`src-tauri/src/session_replace/internal/mod.rs:46`) already threads
-`chain_id` correctly and could replace the current free function, but
-that is a Phase-6 ergonomics improvement rather than a supported-surface
-break.
 
-**What would close it (if elevated):** thread
-`metadata.chain_id` through `export_metadata_for` (or have the four
-call sites use `metadata.to_export_metadata()` instead), and add a unit
-test that asserts a non-empty `chain_id` does not affect the canonical
-bytes for either parser. Not required at LOW.
+**Status (closed by PR #21 / Initiative 09):** `session_replace::internal::*`
+has been deleted entirely; `session_replace` now consumes
+`session_metadata::SessionMetadata` (which includes `chain_id`) via the
+public `locate_session_metadata` resolver. `export_metadata_for` populates
+`ExportSessionMetadata.chain_id` from `metadata.chain_id` directly. The
+forward-compat hazard described above is resolved on `main`.
+
+(Stale-prose note: an earlier draft of this section referenced
+`internal::SessionMetadata::to_export_metadata()` as a future helper. That
+method never landed; `internal::*` was deleted instead. The closure is
+PR #21's full lift, not a helper introduction. F-DOC-01 carryover closed.)
 
 ### AIR-SUPPORTED-SURFACE-F05 — pre-fix in-flight pending journals quarantine on first post-fix start
 
