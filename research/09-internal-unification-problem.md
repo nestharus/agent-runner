@@ -90,8 +90,13 @@ After the fix:
 
 - Lease renewal (Phase 7 max-pass design-scope expansion; documented as a
   separate decision, not in this PR).
-- `SessionLock`'s `any_active_for_session` listing API expansion.
 - `session_metadata::TranscriptState` / `mutable` field changes.
+
+(Rev 3 note: the proposal moves
+`session_lock::any_active_for_session` listing API expansion **into scope**
+because the orphan-canonical-records recovery scanner requires it. The
+problem-statement out-of-scope line that previously listed it is therefore
+deleted; see `proposals/09-internal-unification.md` D4.)
 
 ## Observable contract preserved
 
