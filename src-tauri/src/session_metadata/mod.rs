@@ -98,7 +98,11 @@ pub fn locate_session_metadata(
     let provider_name = resolved.active_provider.clone();
     let storage_type = SessionStorageType::from(&provider.session_storage);
     let active_segment_id = state
-        .active_segment_id_for_chain(&resolved.chain_id)
+        .active_segment_id_for_chain_provider_session(
+            &resolved.chain_id,
+            &resolved.active_provider,
+            &resolved.active_session_id,
+        )
         .map_err(|message| MetadataError::Operational { message })?
         .ok_or_else(|| MetadataError::SessionNotFound {
             input: resolved.chain_id.clone(),

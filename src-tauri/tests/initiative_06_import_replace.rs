@@ -294,7 +294,7 @@ fn t5_preimage_mismatch_exits_15_without_transcript_or_db_mutation() {
 #[test]
 fn t6_busy_lock_exits_13_and_does_not_publish_session_journal() {
     let prepared = prepared_claude_replace_fixture();
-    prepared
+    let _lock = prepared
         .fixture
         .write_active_lock(&prepared.provider_name, &prepared.session_id);
     let input = canonical_jsonl(
@@ -493,7 +493,7 @@ fn recovery_keeps_orphan_canonical_records_while_session_lock_is_live() {
         ),
     )
     .unwrap();
-    prepared
+    let _lock = prepared
         .fixture
         .write_active_lock(&prepared.provider_name, &prepared.session_id);
 

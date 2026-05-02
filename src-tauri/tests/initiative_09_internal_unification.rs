@@ -144,6 +144,26 @@ fn t_active_segment_id_flows() {
             |row| row.get::<_, i64>(0),
         )
         .unwrap();
+    assert_eq!(
+        state
+            .active_segment_id_for_chain_provider_session(
+                &metadata.chain_id,
+                &prepared.provider_name,
+                &prepared.session_id,
+            )
+            .unwrap(),
+        Some(active_segment_id)
+    );
+    assert_eq!(
+        state
+            .active_segment_id_for_chain_provider_session(
+                &metadata.chain_id,
+                "other-provider",
+                &prepared.session_id,
+            )
+            .unwrap(),
+        None
+    );
     assert_eq!(metadata.active_segment_id, active_segment_id);
 
     let chain_id = metadata.chain_id.clone();
