@@ -1,7 +1,7 @@
+use crate::process::{CommandSpec, OsProcessRunner, OutputSpec, ProcessRunner, StdinSpec};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -216,7 +216,6 @@ const KNOWN_CLIS: &[(&str, &[&str])] = &[
     ("codex", &[".codex"]),
     ("opencode", &[".opencode"]),
     ("gemini", &[".gemini"]),
-    ("forge", &["forge"]),
 ];
 
 // ---------------------------------------------------------------------------
@@ -226,15 +225,26 @@ const KNOWN_CLIS: &[(&str, &[&str])] = &[
 /// Run full detection for all known CLIs.  When `tracker` is `Some`, version
 /// changes are detected and recorded.
 pub fn detect_all() -> DetectionReport {
-    detect_all_with_tracker(None)
+    detect_all_with_runner(&OsProcessRunner)
 }
 
 /// Run full detection with an optional `VersionTracker` for persistent version
 /// change monitoring.
 pub fn detect_all_with_tracker(tracker: Option<&VersionTracker>) -> DetectionReport {
+    detect_all_with_tracker_and_runner(tracker, &OsProcessRunner)
+}
+
+pub fn detect_all_with_runner(runner: &dyn ProcessRunner) -> DetectionReport {
+    detect_all_with_tracker_and_runner(None, runner)
+}
+
+pub fn detect_all_with_tracker_and_runner(
+    tracker: Option<&VersionTracker>,
+    runner: &dyn ProcessRunner,
+) -> DetectionReport {
     let clis: Vec<CliInfo> = KNOWN_CLIS
         .iter()
-        .map(|(name, config_dirs)| detect_cli(name, config_dirs, tracker))
+        .map(|(name, config_dirs)| detect_cli(name, config_dirs, tracker, runner))
         .collect();
 
     let wrappers = scan_wrappers();
@@ -247,16 +257,28 @@ pub fn detect_all_with_tracker(tracker: Option<&VersionTracker>) -> DetectionRep
 }
 
 pub fn detect_single_cli(name: &str) -> CliInfo {
-    detect_single_cli_with_tracker(name, None)
+    detect_single_cli_with_runner(name, &OsProcessRunner)
 }
 
 pub fn detect_single_cli_with_tracker(name: &str, tracker: Option<&VersionTracker>) -> CliInfo {
+    detect_single_cli_with_tracker_and_runner(name, tracker, &OsProcessRunner)
+}
+
+pub fn detect_single_cli_with_runner(name: &str, runner: &dyn ProcessRunner) -> CliInfo {
+    detect_single_cli_with_tracker_and_runner(name, None, runner)
+}
+
+pub fn detect_single_cli_with_tracker_and_runner(
+    name: &str,
+    tracker: Option<&VersionTracker>,
+    runner: &dyn ProcessRunner,
+) -> CliInfo {
     let config_dirs: &[&str] = KNOWN_CLIS
         .iter()
         .find(|(n, _)| *n == name)
         .map(|(_, dirs)| *dirs)
         .unwrap_or(&[]);
-    detect_cli(name, config_dirs, tracker)
+    detect_cli(name, config_dirs, tracker, runner)
 }
 
 pub fn detect_os_public() -> OsInfo {
@@ -267,18 +289,37 @@ pub fn detect_os_public() -> OsInfo {
 // Core detection
 // ---------------------------------------------------------------------------
 
-fn detect_cli(name: &str, config_dirs: &[&str], tracker: Option<&VersionTracker>) -> CliInfo {
-    let which_result = Command::new("which").arg(name).output();
+fn detect_cli(
+    name: &str,
+    config_dirs: &[&str],
+    tracker: Option<&VersionTracker>,
+    runner: &dyn ProcessRunner,
+) -> CliInfo {
+    let which_result = runner.run(CommandSpec {
+        program: "which".to_string(),
+        args: vec![name.to_string()],
+        cwd: None,
+        env: Default::default(),
+        stdin: StdinSpec::Null,
+        stdout: OutputSpec::Capture,
+        stderr: OutputSpec::Capture,
+        timeout: None,
+        description: format!("detect {name} path"),
+    });
 
     let (installed, path) = match which_result {
-        Ok(output) if output.status.success() => {
+        Ok(output) if output.exit_code == 0 => {
             let p = String::from_utf8_lossy(&output.stdout).trim().to_string();
             (true, Some(p))
         }
         _ => (false, None),
     };
 
-    let version = if installed { get_version(name) } else { None };
+    let version = if installed {
+        get_version(name, runner)
+    } else {
+        None
+    };
 
     let home = dirs::home_dir().unwrap_or_default();
     let config_dir = config_dirs
@@ -289,7 +330,7 @@ fn detect_cli(name: &str, config_dirs: &[&str], tracker: Option<&VersionTracker>
     let authenticated = if installed { check_auth(name) } else { false };
 
     let profiles = if installed {
-        enumerate_profiles(name)
+        enumerate_profiles(name, runner)
     } else {
         vec![]
     };
@@ -318,9 +359,21 @@ fn detect_cli(name: &str, config_dirs: &[&str], tracker: Option<&VersionTracker>
     }
 }
 
-fn get_version(cli: &str) -> Option<String> {
-    let output = Command::new(cli).arg("--version").output().ok()?;
-    if output.status.success() {
+fn get_version(cli: &str, runner: &dyn ProcessRunner) -> Option<String> {
+    let output = runner
+        .run(CommandSpec {
+            program: cli.to_string(),
+            args: vec!["--version".to_string()],
+            cwd: None,
+            env: Default::default(),
+            stdin: StdinSpec::Null,
+            stdout: OutputSpec::Capture,
+            stderr: OutputSpec::Capture,
+            timeout: None,
+            description: format!("detect {cli} version"),
+        })
+        .ok()?;
+    if output.exit_code == 0 {
         Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
         None
@@ -365,10 +418,10 @@ fn check_auth(cli: &str) -> bool {
 // Profile / account enumeration
 // ---------------------------------------------------------------------------
 
-fn enumerate_profiles(cli: &str) -> Vec<CliProfile> {
+fn enumerate_profiles(cli: &str, runner: &dyn ProcessRunner) -> Vec<CliProfile> {
     match cli {
-        "claude" => enumerate_claude_profiles(),
-        "codex" => enumerate_codex_profiles(),
+        "claude" => enumerate_claude_profiles(runner),
+        "codex" => enumerate_codex_profiles(runner),
         "gemini" => enumerate_gemini_profiles(),
         "opencode" => enumerate_opencode_profiles(),
         "forge" => enumerate_forge_profiles(),
@@ -378,9 +431,19 @@ fn enumerate_profiles(cli: &str) -> Vec<CliProfile> {
 
 /// Claude: `claude auth status` returns JSON with email, authMethod,
 /// subscriptionType, etc.
-fn enumerate_claude_profiles() -> Vec<CliProfile> {
-    let output = match Command::new("claude").args(["auth", "status"]).output() {
-        Ok(o) if o.status.success() => o,
+fn enumerate_claude_profiles(runner: &dyn ProcessRunner) -> Vec<CliProfile> {
+    let output = match runner.run(CommandSpec {
+        program: "claude".to_string(),
+        args: vec!["auth".to_string(), "status".to_string()],
+        cwd: None,
+        env: Default::default(),
+        stdin: StdinSpec::Null,
+        stdout: OutputSpec::Capture,
+        stderr: OutputSpec::Capture,
+        timeout: None,
+        description: "detect claude auth status".to_string(),
+    }) {
+        Ok(o) if o.exit_code == 0 => o,
         _ => return vec![],
     };
 
@@ -428,15 +491,25 @@ fn enumerate_claude_profiles() -> Vec<CliProfile> {
 /// Codex: `codex login status` returns a single line like "Logged in using
 /// ChatGPT".  Profile names come from `[profile.*]` sections in
 /// `~/.codex/config.toml` (selected via `codex -p <name>`).
-fn enumerate_codex_profiles() -> Vec<CliProfile> {
+fn enumerate_codex_profiles(runner: &dyn ProcessRunner) -> Vec<CliProfile> {
     let mut profiles = Vec::new();
 
     // 1. Active login
-    let output = Command::new("codex").args(["login", "status"]).output();
+    let output = runner.run(CommandSpec {
+        program: "codex".to_string(),
+        args: vec!["login".to_string(), "status".to_string()],
+        cwd: None,
+        env: Default::default(),
+        stdin: StdinSpec::Null,
+        stdout: OutputSpec::Capture,
+        stderr: OutputSpec::Capture,
+        timeout: None,
+        description: "detect codex login status".to_string(),
+    });
 
     if let Ok(o) = output {
         let text = String::from_utf8_lossy(&o.stdout).trim().to_string();
-        let logged_in = o.status.success() && text.to_lowercase().contains("logged in");
+        let logged_in = o.exit_code == 0 && text.to_lowercase().contains("logged in");
         if logged_in {
             // Try to extract email from auth.json for a richer ID
             let id = read_codex_email().unwrap_or_else(|| text.clone());
@@ -876,7 +949,7 @@ mod tests {
     fn known_provider_cli_table_includes_setup_provider_names() {
         let names: Vec<&str> = KNOWN_CLIS.iter().map(|(name, _)| *name).collect();
 
-        for expected in ["claude", "codex", "opencode", "gemini", "forge"] {
+        for expected in ["claude", "codex", "opencode", "gemini"] {
             assert!(
                 names.contains(&expected),
                 "full detection provider table should include {expected}; got {names:?}"
@@ -891,7 +964,13 @@ mod tests {
             std::fs::create_dir_all(&codex_dir).unwrap();
             std::fs::write(codex_dir.join("auth.json"), "{}").unwrap();
 
-            let info = detect_cli("missing_cli_with_codex_auth_fixture_xyz", &[".codex"], None);
+            let runner = OsProcessRunner;
+            let info = detect_cli(
+                "missing_cli_with_codex_auth_fixture_xyz",
+                &[".codex"],
+                None,
+                &runner,
+            );
 
             assert!(!info.installed);
             assert!(!info.authenticated);
@@ -1010,7 +1089,8 @@ mod tests {
 
     #[test]
     fn detect_cli_without_tracker_has_no_version_change() {
-        let info = detect_cli("nonexistent_cli_xyz", &[], None);
+        let runner = OsProcessRunner;
+        let info = detect_cli("nonexistent_cli_xyz", &[], None, &runner);
         assert!(!info.installed);
         assert!(info.version_changed.is_none());
         assert!(info.previous_version.is_none());
