@@ -232,22 +232,223 @@ Each round:
   prompt+log+commit chain is sufficient to reconstruct the process
   tree.
 
-## Watch signals
-
-- `WS-1`: any future round must re-check that the migration helper
-  remains transactional and rejects unexpected shapes — it must not
-  acquire heuristic recovery affordances.
-- `WS-2`: any future round must re-check that no index-keyed reader
-  alias has been kept on the routing-history surface
-  (`providers`/`get_provider`/`recent_error_count`).
-- `WS-3`: rollback during mid-rebuild failure is now an explicit
-  residual verified by code review only. Future rounds must not
-  silently re-promote it to a runtime test claim without specifying a
-  viable failure-injection mechanism that does not require test-only
-  product source.
-
 ## Final state
 
 Phase 4 passed at round 3 with all four gates LOW and
 termination=none. Determination: `apply`. Pipeline advances to
 Phase 5.
+
+## CodeRabbit loop
+
+IDs in this section are scoped to the CodeRabbit loop.
+
+### Round 1 CodeRabbit pass
+
+- Artifact under review: full branch diff against `main` at `b4f2a50`.
+- Raw pass log: `CODERABBIT_pass1.md`.
+- Findings: 7 total.
+- Breakdown: 5 real findings applied; 2 style nitpicks applied because
+  they were trivial markdown hygiene; 0 skipped.
+- Applied finding IDs:
+  - `R1-F01`: removed duplicated `## Watch signals` block from this
+    file.
+  - `R1-F02`: added markdown spacing after
+    `risk/10-shortcut.md` `## Prior finding status`.
+  - `R1-F03`: anchored hookpoint line references to commit/date and
+    stable symbol-search verification.
+  - `R1-F04`: renumbered a resumed ordered-list marker in the proposal.
+  - `R1-F05`: corrected the manual-drop recovery text to state that
+    `StateDb::open` / `agents migrate-db` recreate an empty
+    `providers` table and do not replay existing `invocations`.
+  - `R1-F06`: strengthened `providers` shape validation to include
+    type affinity and not-null metadata; added regression coverage.
+  - `R1-F07`: made migrated `last_error` selection deterministic on
+    tied `finished_at` values by ordering failed invocations with
+    `id` as the secondary key; added regression coverage.
+- Flip-flops: none.
+- Skipped rationales: none.
+- Watch signals: `WS-1` upheld by stricter unexpected-shape rejection;
+  `WS-2` not implicated; `WS-3` remains a code-review residual.
+- Test result after fixes: PASS —
+  `cd src-tauri && cargo test 2>&1 | tail -5`.
+- Determination: `continue` — amend latest commit and run CodeRabbit
+  pass 2.
+
+### Round 2 CodeRabbit pass
+
+- Artifact under review: full branch diff against `main` at `8dd13cb`.
+- Raw pass log: `CODERABBIT_pass2.md`.
+- Findings: 5 total.
+- Breakdown: 3 real findings applied; 2 style/staleness nitpicks
+  applied because they were low-cost hygiene; 0 skipped.
+- Applied finding IDs:
+  - `R2-F01`: added a staleness warning to `risk/10-audit.md` for
+    source line-number evidence.
+  - `R2-F02`: fixed markdown heading spacing in
+    `risk/10-supported-surface.md`.
+  - `R2-F03`: updated the implementation contract to encode the
+    deterministic `finished_at DESC, id DESC` failure tie-break.
+  - `R2-F04`: added non-mutating `providers` shape preflight before
+    `invocations` migration and regression coverage for malformed
+    providers plus legacy invocations.
+  - `R2-F05`: corrected the contract signature and open-ordering text
+    for `ensure_providers_schema(&mut Connection)`.
+- Flip-flops: none.
+- Skipped rationales: none.
+- Watch signals: `WS-1` strengthened by the preflight rejection order;
+  `WS-2` not implicated; `WS-3` remains a code-review residual.
+- Test result after fixes: PASS —
+  `cd src-tauri && cargo test 2>&1 | tail -5`.
+- Determination: `continue` — amend latest commit and run CodeRabbit
+  pass 3.
+
+### Round 3 CodeRabbit pass
+
+- Artifact under review: full branch diff against `main` at `d68ed53`.
+- Raw pass log: `CODERABBIT_pass3.md`.
+- Findings: 2 total.
+- Breakdown: 1 real consistency finding applied; 1 skipped as
+  design-contradicting churn.
+- Applied finding IDs:
+  - `R3-F01`: added risk/level/source comments to the three new
+    provider-migration regression tests.
+- Skipped finding IDs:
+  - `R3-F02`: skipped order-insensitive `providers` shape matching.
+    Rationale: the approved contract and `WS-1` intentionally accept
+    only exact pre-fix/post-fix binary-produced shapes and reject
+    foreign/hybrid shapes without heuristic compatibility. Accepting a
+    reordered externally-created table would weaken that posture.
+- Flip-flops: none.
+- Watch signals: `WS-1` explicitly upheld by skipping heuristic
+  reordered-shape acceptance; `WS-2` not implicated; `WS-3` remains a
+  code-review residual.
+- Test result after fixes: PASS —
+  `cd src-tauri && cargo test 2>&1 | tail -5`.
+- Determination: `continue` — amend latest commit and run CodeRabbit
+  pass 4.
+
+### Round 4 CodeRabbit pass
+
+- Artifact under review: full branch diff against `main` at `23912eb`.
+- Raw pass log: `CODERABBIT_pass4.md`.
+- Findings: 4 total.
+- Breakdown: 1 real documentation correctness finding applied; 3
+  markdown style findings applied; 0 skipped.
+- Applied finding IDs:
+  - `R4-F01`: added blank lines after affected headings in
+    `risk/10-scope.md`.
+  - `R4-F02`: added a blank line after `risk/10-shortcut.md`
+    `## Notes`.
+  - `R4-F03`: added a blank line after `risk/10-shortcut.md`
+    `## Watch signal status`.
+  - `R4-F04`: narrowed the contract's `provider_index` removal claim to
+    `ProviderRecord`, while preserving `provider_index` on invocation
+    structs and the invocation-row load.
+- Flip-flops: none.
+- Skipped rationales: none.
+- Watch signals: no change; `WS-1`, `WS-2`, and `WS-3` remain as
+  recorded in round 3.
+- Test result after fixes: PASS —
+  `cd src-tauri && cargo test 2>&1 | tail -5`.
+- Determination: `continue` — amend latest commit and run CodeRabbit
+  pass 5.
+
+### Round 5 CodeRabbit pass
+
+- Artifact under review: full branch diff against `main` at `bd20806`.
+- Raw pass log: `CODERABBIT_pass5.md`.
+- Findings: 2 total.
+- Breakdown: 2 real contract/documentation findings applied; 0
+  skipped.
+- Applied finding IDs:
+  - `R5-F01`: replaced fragile source line-number references in
+    `research/10-routing-claude-skipped-contract.md` with stable
+    symbol/test names.
+  - `R5-F02`: completed the documented `get_provider` and
+    `recent_error_count` return types as `Result<..., String>`.
+- Flip-flops: none.
+- Skipped rationales: none.
+- Watch signals: no change; `WS-1`, `WS-2`, and `WS-3` remain as
+  recorded in round 3.
+- Test result after fixes: PASS —
+  `cd src-tauri && cargo test 2>&1 | tail -5`.
+- Determination: `continue` — amend latest commit and run CodeRabbit
+  pass 6.
+
+### Round 6 CodeRabbit pass
+
+- Artifact under review: full branch diff against `main` at `69ecb60`.
+- Raw pass log: `CODERABBIT_pass6.md`.
+- Findings: 3 total.
+- Breakdown: 1 real architectural finding applied; 2 style nitpicks
+  applied; 0 skipped.
+- Applied finding IDs:
+  - `R6-F01`: tightened phrasing in `risk/10-shortcut.md`.
+  - `R6-F02`: varied repeated sentence openings in `risk/10-scope.md`.
+  - `R6-F03`: re-ran `validate_providers_schema` inside
+    `migrate_legacy_invocations` after its transaction starts and
+    before legacy `invocations` rows are read or rewritten.
+- Flip-flops: none.
+- Skipped rationales: none.
+- Watch signals: `WS-1` strengthened by validating provider shape
+  inside the legacy invocation migration transaction; `WS-2` not
+  implicated; `WS-3` remains a code-review residual.
+- Test result after fixes: PASS —
+  `cd src-tauri && cargo test 2>&1 | tail -5`.
+- Determination: `continue` — amend latest commit and run CodeRabbit
+  pass 7 as the stability check before convergence or cap escalation.
+
+### Round 7 CodeRabbit pass
+
+- Artifact under review: full branch diff against `main` at `43c1db8`.
+- Raw pass log: `CODERABBIT_pass7.md`.
+- Findings: 3 total.
+- Breakdown: 2 useful findings applied; 1 performance nitpick skipped.
+- Applied finding IDs:
+  - `R7-F01`: corrected the `recent_error_count` contract to state that
+    `StateDb::recent_error_count` receives `window_minutes` and computes
+    the `created_at` cutoff internally.
+  - `R7-F02`: added
+    `finalize_invocation_skips_provider_aggregate_for_null_provider_name`
+    to cover success and failure finalization with `provider_name = NULL`.
+- Skipped finding IDs:
+  - `R7-F03`: skipped new recent-error composite index suggestion.
+    Rationale: speculative performance nitpick outside the proposal's
+    required schema surface; adding an index expands schema/write
+    overhead without evidence from this loop.
+- Flip-flops: none.
+- Watch signals: `WS-1` and `WS-2` unchanged; `WS-3` remains a
+  code-review residual.
+- Test result after fixes: PASS —
+  `cd src-tauri && cargo test 2>&1 | tail -5`.
+- Determination: `continue` — amend latest commit and run CodeRabbit
+  pass 8, the configured cap pass.
+
+### Round 8 CodeRabbit pass
+
+- Artifact under review: full branch diff against `main` at `6addfce`.
+- Raw pass log: `CODERABBIT_pass8.md`.
+- Findings: 4 total.
+- Breakdown: 0 applied; 1 style nitpick not applied; 3 substantive
+  findings not applied because pass 8 is the configured max-pass cap.
+- Not-applied finding IDs:
+  - `R8-F01`: optional prose tightening in
+    `risk/10-supported-surface.md`; style churn.
+  - `R8-F02`: new test metadata comments cite the contract path rather
+    than the proposal test-intent path.
+  - `R8-F03`: contract promises malformed-schema cases that the current
+    `PRAGMA table_info(providers)`-based validation cannot enforce
+    (non-table object and foreign-key constraints).
+  - `R8-F04`: implementation-side pair to `R8-F03`; suggested
+    `providers` object-type and FK validation.
+- Flip-flops: none.
+- Skipped rationales: `R8-F01` is style churn; `R8-F02`-`R8-F04`
+  require human review because they arrived on the cap pass and may
+  require choosing between stricter schema validation and narrowing the
+  contract.
+- Watch signals: `WS-1` remains the affected signal. The cap-pass
+  findings show the unexpected-shape contract still needs a human
+  decision on object-type/FK scope.
+- Test result after fixes: not run; no pass-8 edits were applied.
+- Determination: `MAX_PASSES_REACHED` — CodeRabbit did not converge
+  within 8 passes.
