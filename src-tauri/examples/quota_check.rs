@@ -107,6 +107,10 @@ fn main() {
         providers_cfg: &providers_cfg,
         sessions_cfg: &sessions_cfg,
         in_flight: &in_flight,
+        quota_repo: &db,
+        turn_repo: &db,
+        chain_repo: Some(&db),
+        runner: &runner,
     };
     let mut model_names: Vec<&String> = models.keys().collect();
     model_names.sort();

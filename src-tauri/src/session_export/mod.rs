@@ -5,6 +5,13 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::config::{
+    ModelConfigRepository, ProviderConfigSource, SessionStorage, SessionsConfigSource,
+};
+use crate::process::ProcessRunner;
+use crate::sessions::locate_transcript_with_runner;
+use crate::state::{ResumeError, SessionChainRepository};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CanonicalRecord {
     pub session_id: String,
@@ -83,6 +90,108 @@ pub enum ExportError {
     Operational {
         message: String,
     },
+}
+
+pub fn resolve_export_session_metadata_with_deps(
+    chain_repo: &dyn SessionChainRepository,
+    model_repo: &dyn ModelConfigRepository,
+    provider_source: &dyn ProviderConfigSource,
+    sessions_source: &dyn SessionsConfigSource,
+    locator_runner: &dyn ProcessRunner,
+    session_id: &str,
+) -> Result<ExportSessionMetadata, ExportError> {
+    let models = model_repo
+        .load_models()
+        .map_err(|message| ExportError::Operational { message })?;
+    let providers_cfg = provider_source.load_providers().unwrap_or_default();
+    let sessions_cfg = sessions_source.load_sessions().unwrap_or_default();
+    let facts = chain_repo
+        .resolve_resume_facts(session_id, None)
+        .map_err(map_resume_error)?;
+
+    if let Some(model_name) = &facts.inferred_model_name {
+        let model = models
+            .get(model_name)
+            .ok_or_else(|| ExportError::Operational {
+                message: format!("unknown model referenced by session chain: {model_name}"),
+            })?;
+        if !model
+            .providers
+            .iter()
+            .any(|provider| provider.name == facts.active_provider)
+        {
+            return Err(ExportError::UnsupportedStorage {
+                provider_name: facts.active_provider,
+                reason: "session owner is not in the resolved model provider pool".to_string(),
+            });
+        }
+    }
+
+    let provider_entry = providers_cfg.get(&facts.active_provider).ok_or_else(|| {
+        ExportError::UnsupportedStorage {
+            provider_name: facts.active_provider.clone(),
+            reason: "provider is missing from providers.toml".to_string(),
+        }
+    })?;
+    let storage_type = match provider_entry.session_storage.as_ref() {
+        Some(SessionStorage::ClaudeCode { .. }) => SessionStorageType::ClaudeCode,
+        Some(SessionStorage::Codex { .. }) => SessionStorageType::CodexSession,
+        None => {
+            return Err(ExportError::UnsupportedStorage {
+                provider_name: facts.active_provider,
+                reason: "provider has no session_storage configuration".to_string(),
+            });
+        }
+    };
+
+    let jsonl_path = locate_transcript_with_runner(
+        &sessions_cfg,
+        &facts.active_provider,
+        &facts.active_session_id,
+        locator_runner,
+    )
+    .map_err(|message| ExportError::Operational { message })?
+    .ok_or_else(|| ExportError::UnsupportedStorage {
+        provider_name: facts.active_provider.clone(),
+        reason: "provider has no transcript_locator configuration".to_string(),
+    })?;
+
+    Ok(ExportSessionMetadata {
+        session_id: facts.active_session_id,
+        chain_id: facts.chain_id,
+        provider_name: facts.active_provider,
+        storage_type,
+        jsonl_path,
+    })
+}
+
+fn map_resume_error(err: ResumeError) -> ExportError {
+    match err {
+        ResumeError::InvalidUuid { input } => ExportError::InvalidSessionId { input },
+        ResumeError::NoChainFound { input } => ExportError::SessionNotFound { input },
+        ResumeError::Ambiguous { input, .. } => ExportError::AmbiguousSession { input },
+        ResumeError::ProviderModelMismatch {
+            active_provider, ..
+        } => ExportError::UnsupportedStorage {
+            provider_name: active_provider,
+            reason: "session owner is not in the resolved model provider pool".to_string(),
+        },
+        ResumeError::UnknownModel { model_name } => ExportError::Operational {
+            message: format!("unknown model referenced by session chain: {model_name}"),
+        },
+        ResumeError::ActiveSegmentMissing { chain_id } => ExportError::Operational {
+            message: format!("no active segment found for chain {chain_id}"),
+        },
+        ResumeError::ProviderNotConfigured { provider } => ExportError::UnsupportedStorage {
+            provider_name: provider,
+            reason: "session owner provider is not configured".to_string(),
+        },
+        ResumeError::ProviderMissingResume { provider_name } => ExportError::UnsupportedStorage {
+            provider_name,
+            reason: "session owner provider has no resume configuration".to_string(),
+        },
+        ResumeError::Db { message } => ExportError::Operational { message },
+    }
 }
 
 pub fn read_canonical_transcript(
