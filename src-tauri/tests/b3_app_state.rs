@@ -8,6 +8,7 @@ use agent_runner_lib::state::{CliProviderRepository, DiscoveryRepository, QuotaR
 use agent_runner_lib::{DefaultRuntimePaths, RuntimePaths};
 use b3_app_state::{B3ServiceBundle, invoke_json, ok_output};
 use serde_json::json;
+use std::sync::Arc;
 
 fn quota_json() -> &'static str {
     r#"{"windows":[{"used_percent":0.25,"resets_at":"2027-01-01T00:00:00Z"}]}"#
@@ -28,6 +29,47 @@ fn default_runtime_paths_state_db_stays_next_to_models_dir_parent() {
 
     assert_eq!(actual, expected);
     assert_ne!(actual, data_based);
+}
+
+/// Drift pin F1: the concrete runtime bundle built by `run_tauri()` must keep
+/// `state.db` beside the default config `models` directory, matching pre-B.
+#[test]
+fn run_tauri_paths_bundle_state_db_stays_at_pre_b_config_dir_path() {
+    let default_paths = DefaultRuntimePaths::new();
+    let models_dir = default_paths.models_dir();
+    let paths: Arc<dyn RuntimePaths> =
+        Arc::new(DefaultRuntimePaths::with_models_dir(models_dir.clone()));
+
+    let actual = paths.state_db_path().unwrap();
+    let expected = models_dir
+        .parent()
+        .expect("default models_dir has parent")
+        .join("state.db");
+    let data_based = default_paths.data_root().unwrap().join("state.db");
+
+    assert_eq!(actual, expected);
+    assert_ne!(actual, data_based);
+    assert_eq!(
+        expected,
+        default_paths.config_root().join("state.db"),
+        "Linux pre-B state.db path should stay under the app config root"
+    );
+
+    let run_tauri_body = include_str!("../src/lib.rs")
+        .split_once("pub fn run_tauri() {")
+        .expect("lib.rs contains run_tauri")
+        .1
+        .split_once("\npub fn configure_tauri_app")
+        .expect("run_tauri is followed by configure_tauri_app")
+        .0;
+    assert!(
+        !run_tauri_body.contains("DefaultRuntimePaths::new()"),
+        "run_tauri must not build DefaultRuntimePaths::new(); it should build \
+         DefaultRuntimePaths::with_models_dir(default models_dir) so state.db \
+         stays at {} instead of {}",
+        expected.display(),
+        data_based.display()
+    );
 }
 
 /// Risk: T14 - `refresh_quotas` can keep constructing concrete paths/runners
