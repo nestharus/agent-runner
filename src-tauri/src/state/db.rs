@@ -1,5 +1,5 @@
-use crate::balancer::TransitionReason;
-use crate::config::{ModelConfig, load_models};
+use super::repository::{ResumeDbFacts, TransitionReason};
+use crate::config::{FilesystemModelConfigRepository, ModelConfig, ModelConfigRepository};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -1347,7 +1347,7 @@ impl StateDb {
         let models_dir = dirs::config_dir()
             .map(|dir| dir.join("oulipoly-agent-runner").join("models"))
             .unwrap_or_else(|| std::path::PathBuf::from("models"));
-        let models = match load_models(&models_dir) {
+        let models = match FilesystemModelConfigRepository::new(models_dir.clone()).load_models() {
             Ok(m) => m,
             Err(e) => {
                 eprintln!(
@@ -2996,6 +2996,64 @@ impl StateDb {
             chain_id,
             model_name,
             model,
+            active_provider,
+            active_session_id,
+        })
+    }
+
+    pub(crate) fn resolve_resume_facts(
+        &self,
+        input: &str,
+        model_override: Option<&str>,
+    ) -> Result<ResumeDbFacts, ResumeError> {
+        Uuid::try_parse(input).map_err(|_| ResumeError::InvalidUuid {
+            input: input.to_string(),
+        })?;
+
+        let chain_ids = self
+            .candidate_chain_ids(input)
+            .map_err(|message| ResumeError::Db { message })?;
+        if chain_ids.is_empty() {
+            return Err(ResumeError::NoChainFound {
+                input: input.to_string(),
+            });
+        }
+        let chain_id = self
+            .choose_resume_chain(input, chain_ids)
+            .map_err(|message| ResumeError::Db { message })?;
+
+        let Some(chain_id) = chain_id else {
+            let previews = self
+                .chain_previews(input)
+                .map_err(|message| ResumeError::Db { message })?;
+            return Err(ResumeError::Ambiguous {
+                input: input.to_string(),
+                previews,
+            });
+        };
+
+        let (active_provider, active_session_id) = self
+            .active_segment_for_chain(&chain_id)
+            .map_err(|message| ResumeError::Db { message })?
+            .ok_or_else(|| ResumeError::ActiveSegmentMissing {
+                chain_id: chain_id.clone(),
+            })?;
+
+        let inferred_model_name = if let Some(model_override) = model_override {
+            Some(model_override.to_string())
+        } else {
+            self.latest_invocation_model_for_chain(&chain_id)
+                .map_err(|message| ResumeError::Db { message })?
+                .filter(|name| name != "<unknown>")
+                .or(self
+                    .chain_model_name(&chain_id)
+                    .map_err(|message| ResumeError::Db { message })?
+                    .filter(|name| name != "<unknown>"))
+        };
+
+        Ok(ResumeDbFacts {
+            chain_id,
+            inferred_model_name,
             active_provider,
             active_session_id,
         })
@@ -6473,7 +6531,7 @@ interactive_args = ["launch"]
                 "claude",
                 SESSION_A,
                 &ts("2026-04-17T08:00:00Z"),
-                crate::balancer::TransitionReason::Initial,
+                crate::state::TransitionReason::Initial,
             )
             .unwrap();
         let second_id = db
@@ -6482,7 +6540,7 @@ interactive_args = ["launch"]
                 "claude",
                 SESSION_A,
                 &ts("2026-04-17T08:01:00Z"),
-                crate::balancer::TransitionReason::Initial,
+                crate::state::TransitionReason::Initial,
             )
             .unwrap();
 
@@ -6800,7 +6858,7 @@ interactive_args = ["launch"]
                 "claude",
                 SESSION_A,
                 &ts("2026-04-17T08:00:00Z"),
-                crate::balancer::TransitionReason::Initial,
+                crate::state::TransitionReason::Initial,
             )
             .unwrap_err();
         assert!(

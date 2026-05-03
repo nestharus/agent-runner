@@ -2,9 +2,9 @@ use crate::config::{ModelConfig, ProvidersConfig, SessionsConfig};
 use crate::migration::MigrationError;
 use crate::quota::{InFlight, RefreshOutcome, is_stale, refresh_provider};
 use crate::sessions::scan_provider;
+pub use crate::state::TransitionReason;
 use crate::state::{QuotaRecord, QuotaWindow, ResolvedResume, StateDb};
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
 
 const ERROR_WINDOW_MINUTES: i64 = 30;
 const ERROR_THRESHOLD: u64 = 3;
@@ -49,28 +49,6 @@ pub enum MigrationDecision {
         target_provider_index: usize,
         reason: TransitionReason,
     },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TransitionReason {
-    Initial,
-    Manual,
-    QuotaThreshold,
-    Exhausted,
-    Imported,
-}
-
-impl TransitionReason {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            TransitionReason::Initial => "initial",
-            TransitionReason::Manual => "manual",
-            TransitionReason::QuotaThreshold => "quota_threshold",
-            TransitionReason::Exhausted => "exhausted",
-            TransitionReason::Imported => "imported",
-        }
-    }
 }
 
 /// Contextual dependencies for quota-aware balancing. When present,
