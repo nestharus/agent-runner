@@ -9,6 +9,7 @@
 
 use agent_runner_lib::balancer::{BalanceContext, select_provider};
 use agent_runner_lib::config::{ProvidersConfig, SessionsConfig, load_models};
+use agent_runner_lib::process::OsProcessRunner;
 use agent_runner_lib::quota::{InFlight, RefreshOutcome, is_stale, refresh_provider};
 use agent_runner_lib::state::StateDb;
 
@@ -33,6 +34,7 @@ fn main() {
         SessionsConfig::load(&config_dir.join("sessions.toml")).expect("load sessions.toml");
     let db = StateDb::open(&db_path).expect("open state db");
     let in_flight = InFlight::new();
+    let runner = OsProcessRunner;
 
     // Distinct provider names across multi-provider models.
     let mut distinct: std::collections::BTreeSet<String> = Default::default();
@@ -47,7 +49,7 @@ fn main() {
     println!("=== Quota refresh ===");
     for name in &distinct {
         let stale_before = is_stale(&db, name);
-        let outcome = refresh_provider(name, &providers_cfg, &in_flight, &db);
+        let outcome = refresh_provider(name, &providers_cfg, &in_flight, &db, &runner);
         let tag = match outcome {
             RefreshOutcome::Updated { ref windows } => {
                 let parts: Vec<String> = windows

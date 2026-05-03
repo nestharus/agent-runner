@@ -1,6 +1,7 @@
 pub mod cli;
 
 use crate::config::ModelConfig;
+use crate::process::ProcessRunner;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -118,8 +119,28 @@ pub fn execute_with_inputs_and_env(
     )
 }
 
-pub fn execute_effective_with_inputs_and_env(
-    request: cli::EffectiveExecuteRequest<'_>,
+pub fn execute_with_runner(
+    runner: &dyn ProcessRunner,
+    model: &ModelConfig,
+    provider_index: usize,
+    prompt: &str,
+    working_dir: Option<&Path>,
+    extra_inputs: &HashMap<String, Vec<String>>,
+    parent_invocation_env: Option<&str>,
 ) -> Result<ExecutionResult, String> {
-    cli::execute_effective(request)
+    cli::execute_with_runner(
+        runner,
+        model,
+        provider_index,
+        prompt,
+        working_dir,
+        extra_inputs,
+        parent_invocation_env,
+    )
+}
+
+pub fn execute_effective_with_inputs_and_env(
+    request: cli::EffectiveExecuteWithInputsRequest<'_>,
+) -> Result<ExecutionResult, String> {
+    cli::execute_effective_with_inputs(request)
 }

@@ -5,6 +5,8 @@ use super::detection;
 use super::memory::MemoryGraph;
 use super::schemas::AGENT_TURN_SCHEMA;
 use super::sync;
+use crate::process::ProcessRunner;
+use std::sync::Arc;
 use tauri::ipc::Channel;
 use tokio::sync::mpsc;
 
@@ -21,6 +23,7 @@ pub struct SetupFlow {
     input_rx: mpsc::Receiver<UserResponse>,
     memory: MemoryGraph,
     session_id: String,
+    runner: Arc<dyn ProcessRunner>,
 }
 
 impl SetupFlow {
@@ -35,6 +38,23 @@ impl SetupFlow {
             input_rx,
             memory,
             session_id,
+            runner: Arc::new(crate::process::OsProcessRunner),
+        }
+    }
+
+    pub fn new_with_runner(
+        channel: Channel<SetupEvent>,
+        input_rx: mpsc::Receiver<UserResponse>,
+        memory: MemoryGraph,
+        session_id: String,
+        runner: Arc<dyn ProcessRunner>,
+    ) -> Self {
+        SetupFlow {
+            channel,
+            input_rx,
+            memory,
+            session_id,
+            runner,
         }
     }
 
@@ -47,7 +67,7 @@ impl SetupFlow {
             message: "Detecting installed CLIs...".into(),
         });
 
-        let report = detection::detect_all();
+        let report = detection::detect_all_with_runner(self.runner.as_ref());
         let _ = self.channel.send(SetupEvent::ShowResult {
             content: ResultContent::DetectionSummary {
                 clis: detection::summarize(&report),
@@ -81,7 +101,7 @@ impl SetupFlow {
                         message: "Verifying Claude CLI installation...".into(),
                     });
                     // Re-detect
-                    let new_report = detection::detect_all();
+                    let new_report = detection::detect_all_with_runner(self.runner.as_ref());
                     if !new_report
                         .clis
                         .iter()
@@ -123,7 +143,7 @@ impl SetupFlow {
             message: format!("Detecting {} CLI...", cli_name),
         });
 
-        let cli_info = detection::detect_single_cli(cli_name);
+        let cli_info = detection::detect_single_cli_with_runner(cli_name, self.runner.as_ref());
         let report = detection::DetectionReport {
             clis: vec![cli_info],
             os: detection::detect_os_public(),
@@ -169,7 +189,11 @@ impl SetupFlow {
                 message: "Thinking...".into(),
             });
 
-            let result = match agent.send_turn(&next_message, AGENT_TURN_SCHEMA) {
+            let result = match agent.send_turn_with_runner(
+                self.runner.as_ref(),
+                &next_message,
+                AGENT_TURN_SCHEMA,
+            ) {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = self.channel.send(SetupEvent::Error {

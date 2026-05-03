@@ -4,6 +4,7 @@ pub mod diagnostics;
 pub mod discovery;
 pub mod executor;
 pub mod migration;
+pub mod process;
 pub mod quota;
 pub mod schema_probe;
 pub mod session_export;
@@ -94,13 +95,29 @@ pub struct AppState {
 #[tauri::command]
 fn check_setup_needed(state: tauri::State<AppState>) -> Result<bool, String> {
     let models = state.models.lock().map_err(|e| e.to_string())?;
-    if models.is_empty() {
+    check_setup_needed_with_runner(&process::OsProcessRunner, models.is_empty())
+}
+
+pub fn check_setup_needed_with_runner(
+    runner: &dyn process::ProcessRunner,
+    models_empty: bool,
+) -> Result<bool, String> {
+    if models_empty {
         return Ok(true);
     }
-    // Check if claude CLI is available
-    let output = std::process::Command::new("which").arg("claude").output();
+    let output = runner.run(process::CommandSpec {
+        program: "which".to_string(),
+        args: vec!["claude".to_string()],
+        cwd: None,
+        env: Default::default(),
+        stdin: process::StdinSpec::Null,
+        stdout: process::OutputSpec::Capture,
+        stderr: process::OutputSpec::Capture,
+        timeout: None,
+        description: "check claude cli".to_string(),
+    });
     match output {
-        Ok(o) if o.status.success() => Ok(false),
+        Ok(o) if o.exit_code == 0 => Ok(false),
         _ => Ok(true),
     }
 }
@@ -345,6 +362,7 @@ async fn refresh_quotas(
         .open(&db_path)
         .map_err(|e| format!("Failed to open state DB: {e}"))?;
     let in_flight = &state.quota_in_flight;
+    let runner = process::OsProcessRunner;
     let mut results = Vec::with_capacity(candidates.len());
 
     for provider_name in candidates {
@@ -358,7 +376,14 @@ async fn refresh_quotas(
             continue;
         }
 
-        let outcome = quota::refresh_provider(&provider_name, &providers_cfg, in_flight, &db);
+        let quota_repo: &dyn QuotaRepository = &db;
+        let outcome = quota::refresh_provider(
+            &provider_name,
+            &providers_cfg,
+            in_flight,
+            quota_repo,
+            &runner,
+        );
         results.push(match outcome {
             quota::RefreshOutcome::Updated { windows } => QuotaRefreshEntry {
                 provider_name,

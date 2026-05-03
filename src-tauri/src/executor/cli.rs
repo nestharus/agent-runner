@@ -2,25 +2,14 @@ use crate::config::{
     InputType, ModelConfig, PromptMode, ProviderConfig, ResumeKind, ResumeStrategy, SessionCapture,
     SessionCaptureKind,
 };
+use crate::process::{
+    CommandSpec, InteractiveCommandSpec, OsProcessRunner, OutputSpec, ProcessErrorPhase,
+    ProcessRunner, StdinSpec, process_error_phase_and_detail,
+};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
-use std::process::Child;
-use std::process::{Command, Stdio};
-#[cfg(unix)]
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
-#[cfg(unix)]
-use std::thread;
-
-#[cfg(unix)]
-use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
-#[cfg(unix)]
-use signal_hook::iterator::{Handle as SignalsHandle, Signals};
+use std::time::Duration;
 
 use super::{
     ExecutionResult, ResumeAcceptanceResult, ResumeAcceptanceStatus, SessionCaptureMethod,
@@ -30,6 +19,26 @@ use super::{
 const LARGE_PROMPT_THRESHOLD: usize = 100 * 1024; // 100KB
 
 pub fn execute(
+    model: &ModelConfig,
+    provider_index: usize,
+    prompt: &str,
+    working_dir: Option<&Path>,
+    extra_inputs: &HashMap<String, Vec<String>>,
+    parent_invocation_env: Option<&str>,
+) -> Result<ExecutionResult, String> {
+    execute_with_runner(
+        &OsProcessRunner,
+        model,
+        provider_index,
+        prompt,
+        working_dir,
+        extra_inputs,
+        parent_invocation_env,
+    )
+}
+
+pub fn execute_with_runner(
+    runner: &dyn ProcessRunner,
     model: &ModelConfig,
     provider_index: usize,
     prompt: &str,
@@ -48,6 +57,7 @@ pub fn execute(
     let input_args = resolve_input_flags(model, extra_inputs)?;
 
     let (result, temp_files) = execute_provider(
+        runner,
         provider,
         model.prompt_mode,
         prompt,
@@ -70,7 +80,6 @@ pub fn execute(
 }
 
 pub struct EffectiveExecuteRequest<'a> {
-    pub model: &'a ModelConfig,
     pub provider: &'a ProviderConfig,
     pub provider_index: usize,
     pub prompt_mode: PromptMode,
@@ -81,8 +90,71 @@ pub struct EffectiveExecuteRequest<'a> {
 }
 
 pub fn execute_effective(request: EffectiveExecuteRequest<'_>) -> Result<ExecutionResult, String> {
+    execute_effective_with_runner(&OsProcessRunner, request)
+}
+
+pub fn execute_effective_with_runner(
+    runner: &dyn ProcessRunner,
+    request: EffectiveExecuteRequest<'_>,
+) -> Result<ExecutionResult, String> {
+    let (result, temp_files) = execute_provider(
+        runner,
+        request.provider,
+        request.prompt_mode,
+        request.prompt,
+        request.working_dir,
+        &raw_extra_input_flags(request.extra_inputs),
+        request.parent_invocation_env,
+    )?;
+    for path in temp_files {
+        let _ = std::fs::remove_file(path);
+    }
+
+    Ok(ExecutionResult {
+        stdout: result.stdout,
+        stderr: result.stderr,
+        exit_code: result.exit_code,
+        provider_index: request.provider_index,
+        session_capture: result.session_capture,
+        resume_acceptance: None,
+    })
+}
+
+fn raw_extra_input_flags(extra_inputs: &HashMap<String, Vec<String>>) -> Vec<String> {
+    let mut args = Vec::new();
+    for (key, values) in extra_inputs {
+        for value in values {
+            args.push(format!("--{key}"));
+            args.push(value.clone());
+        }
+    }
+    args
+}
+
+pub struct EffectiveExecuteWithInputsRequest<'a> {
+    pub model: &'a ModelConfig,
+    pub provider: &'a ProviderConfig,
+    pub provider_index: usize,
+    pub prompt_mode: PromptMode,
+    pub prompt: &'a str,
+    pub working_dir: Option<&'a Path>,
+    pub extra_inputs: &'a HashMap<String, Vec<String>>,
+    pub parent_invocation_env: Option<&'a str>,
+}
+
+pub fn execute_effective_with_inputs(
+    request: EffectiveExecuteWithInputsRequest<'_>,
+) -> Result<ExecutionResult, String> {
+    execute_effective_with_inputs_and_runner(&OsProcessRunner, request)
+}
+
+pub fn execute_effective_with_inputs_and_runner(
+    runner: &dyn ProcessRunner,
+    request: EffectiveExecuteWithInputsRequest<'_>,
+) -> Result<ExecutionResult, String> {
     let input_args = resolve_input_flags(request.model, request.extra_inputs)?;
     let (result, temp_files) = execute_provider(
+        runner,
         request.provider,
         request.prompt_mode,
         request.prompt,
@@ -326,36 +398,48 @@ fn append_resume_args(
     Ok(())
 }
 
-fn build_command(
+fn build_command_spec(
     provider: &ProviderConfig,
     provider_args: &[String],
     working_dir: Option<&Path>,
     parent_invocation_env: Option<&str>,
-) -> Result<Command, String> {
+    stdin: StdinSpec,
+    stdout: OutputSpec,
+    stderr: OutputSpec,
+    timeout: Option<Duration>,
+    description: impl Into<String>,
+) -> Result<CommandSpec, String> {
     let parts = shell_split(&provider.command);
     if parts.is_empty() {
         return Err("Empty command".to_string());
     }
 
-    let mut cmd = Command::new(&parts[0]);
-    for part in &parts[1..] {
-        cmd.arg(part);
-    }
-    for arg in provider_args {
-        cmd.arg(arg);
-    }
+    let mut args = parts[1..].to_vec();
+    args.extend(provider_args.iter().cloned());
 
-    if let Some(dir) = working_dir {
-        cmd.current_dir(dir);
-    }
+    let mut env = HashMap::new();
     if let Some(parent_invocation_env) = parent_invocation_env {
-        cmd.env("OULIPOLY_PARENT_INVOCATION", parent_invocation_env);
+        env.insert(
+            "OULIPOLY_PARENT_INVOCATION".to_string(),
+            parent_invocation_env.to_string(),
+        );
     }
 
-    Ok(cmd)
+    Ok(CommandSpec {
+        program: parts[0].clone(),
+        args,
+        cwd: working_dir.map(Path::to_path_buf),
+        env,
+        stdin,
+        stdout,
+        stderr,
+        timeout,
+        description: description.into(),
+    })
 }
 
 fn execute_provider(
+    runner: &dyn ProcessRunner,
     provider: &ProviderConfig,
     prompt_mode: PromptMode,
     prompt: &str,
@@ -364,6 +448,7 @@ fn execute_provider(
     parent_invocation_env: Option<&str>,
 ) -> Result<(RawResult, Vec<PathBuf>), String> {
     execute_provider_with_args(
+        runner,
         provider,
         &provider.args,
         prompt_mode,
@@ -375,6 +460,7 @@ fn execute_provider(
 }
 
 fn execute_provider_with_args(
+    runner: &dyn ProcessRunner,
     provider: &ProviderConfig,
     provider_args: &[String],
     prompt_mode: PromptMode,
@@ -383,22 +469,22 @@ fn execute_provider_with_args(
     input_args: &[String],
     parent_invocation_env: Option<&str>,
 ) -> Result<(RawResult, Vec<PathBuf>), String> {
-    let mut cmd = build_command(provider, provider_args, working_dir, parent_invocation_env)?;
+    let mut final_args = provider_args.to_vec();
 
     // Append input flags
     for arg in input_args {
-        cmd.arg(arg);
+        final_args.push(arg.clone());
     }
 
     let (capture_plan, capture_args, capture_files) =
         build_capture_plan(provider.session_capture.as_ref())?;
     for arg in capture_args {
-        cmd.arg(arg);
+        final_args.push(arg);
     }
 
     let mut temp_files = capture_files;
 
-    match prompt_mode {
+    let stdin = match prompt_mode {
         PromptMode::Arg => {
             if prompt.len() > LARGE_PROMPT_THRESHOLD {
                 let dir = working_dir.unwrap_or(Path::new("."));
@@ -406,36 +492,31 @@ fn execute_provider_with_args(
                 let path = dir.join(&filename);
                 std::fs::write(&path, prompt)
                     .map_err(|e| format!("Failed to write temp prompt file: {e}"))?;
-                cmd.arg(format!("Follow the instructions in {filename}"));
+                final_args.push(format!("Follow the instructions in {filename}"));
                 temp_files.push(path);
             } else {
-                cmd.arg(prompt);
+                final_args.push(prompt.to_string());
             }
-            cmd.stdin(Stdio::null());
+            StdinSpec::Null
         }
-        PromptMode::Stdin => {
-            cmd.stdin(Stdio::piped());
-        }
-    }
+        PromptMode::Stdin => StdinSpec::Bytes(prompt.as_bytes().to_vec()),
+    };
 
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+    let spec = build_command_spec(
+        provider,
+        &final_args,
+        working_dir,
+        parent_invocation_env,
+        stdin,
+        OutputSpec::Capture,
+        OutputSpec::Capture,
+        None,
+        provider.command.clone(),
+    )?;
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed to spawn '{}': {e}", provider.command))?;
-
-    if prompt_mode == PromptMode::Stdin
-        && let Some(mut stdin) = child.stdin.take()
-    {
-        stdin
-            .write_all(prompt.as_bytes())
-            .map_err(|e| format!("Failed to write to stdin: {e}"))?;
-    }
-
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("Failed to wait for process: {e}"))?;
+    let output = runner
+        .run(spec)
+        .map_err(|e| execute_process_error(&provider.command, &e))?;
 
     let capture_outcome = finalize_capture(&capture_plan, &output.stdout);
     let stdout = maybe_restore_plain_stdout(&capture_plan, &capture_outcome, &output.stdout);
@@ -443,7 +524,7 @@ fn execute_provider_with_args(
         stdout,
         telemetry_stdout: output.stdout.clone(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        exit_code: output.status.code().unwrap_or(-1),
+        exit_code: output.exit_code,
         session_capture: capture_outcome,
     };
 
@@ -459,11 +540,34 @@ pub fn execute_resume(
     parent_invocation_env: Option<&str>,
     resume: ResumePayload<'_>,
 ) -> Result<ExecutionResult, String> {
+    execute_resume_with_runner(
+        &OsProcessRunner,
+        provider,
+        provider_index,
+        prompt_mode,
+        prompt,
+        working_dir,
+        parent_invocation_env,
+        resume,
+    )
+}
+
+pub fn execute_resume_with_runner(
+    runner: &dyn ProcessRunner,
+    provider: &ProviderConfig,
+    provider_index: usize,
+    prompt_mode: PromptMode,
+    prompt: &str,
+    working_dir: Option<&Path>,
+    parent_invocation_env: Option<&str>,
+    resume: ResumePayload<'_>,
+) -> Result<ExecutionResult, String> {
     let session_id = resume.session_id.to_string();
     let provider_args = compose_resume_provider_args(provider.args.clone(), resume)?;
     let mut provider_without_capture = provider.clone();
     provider_without_capture.session_capture = None;
     let (result, temp_files) = execute_provider_with_args(
+        runner,
         &provider_without_capture,
         &provider_args,
         prompt_mode,
@@ -569,6 +673,22 @@ pub fn execute_interactive(
     parent_invocation_env: Option<&str>,
     resume: Option<ResumePayload<'_>>,
 ) -> Result<i32, String> {
+    execute_interactive_with_runner(
+        &OsProcessRunner,
+        provider,
+        working_dir,
+        parent_invocation_env,
+        resume,
+    )
+}
+
+pub fn execute_interactive_with_runner(
+    runner: &dyn ProcessRunner,
+    provider: &ProviderConfig,
+    working_dir: Option<&Path>,
+    parent_invocation_env: Option<&str>,
+    resume: Option<ResumePayload<'_>>,
+) -> Result<i32, String> {
     let interactive_args = provider.interactive_args.as_ref().ok_or_else(|| {
         format!(
             "provider {} has no interactive_args; cannot launch interactively",
@@ -581,26 +701,63 @@ pub fn execute_interactive(
         provider_args = compose_resume_provider_args(provider_args, resume)?;
     }
 
-    let mut cmd = build_command(provider, &provider_args, working_dir, parent_invocation_env)?;
-    cmd.stdin(Stdio::inherit());
-    cmd.stdout(Stdio::inherit());
-    cmd.stderr(Stdio::inherit());
+    let spec = build_interactive_command_spec(
+        provider,
+        &provider_args,
+        working_dir,
+        parent_invocation_env,
+        provider.command.clone(),
+    )?;
+    runner
+        .run_interactive(spec)
+        .map_err(|e| execute_process_error(&provider.command, &e))
+}
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed to spawn '{}': {e}", provider.command))?;
+fn execute_process_error(command: &str, error: &str) -> String {
+    let (phase, detail) = process_error_phase_and_detail(error);
+    match phase {
+        Some(ProcessErrorPhase::Wait) => format!("Failed to wait for process: {detail}"),
+        Some(ProcessErrorPhase::WriteStdin) => format!("Failed to write to stdin: {detail}"),
+        Some(ProcessErrorPhase::Spawn) | None => {
+            if phase.is_none() && error.starts_with("Failed to install signal handlers:") {
+                error.to_string()
+            } else {
+                format!("Failed to spawn '{command}': {detail}")
+            }
+        }
+    }
+}
 
-    #[cfg(unix)]
-    let signal_guard = InteractiveSignalGuard::install(&mut child)?;
+fn build_interactive_command_spec(
+    provider: &ProviderConfig,
+    provider_args: &[String],
+    working_dir: Option<&Path>,
+    parent_invocation_env: Option<&str>,
+    description: impl Into<String>,
+) -> Result<InteractiveCommandSpec, String> {
+    let parts = shell_split(&provider.command);
+    if parts.is_empty() {
+        return Err("Empty command".to_string());
+    }
 
-    let status = child
-        .wait()
-        .map_err(|e| format!("Failed to wait for process: {e}"))?;
+    let mut args = parts[1..].to_vec();
+    args.extend(provider_args.iter().cloned());
 
-    #[cfg(unix)]
-    drop(signal_guard);
+    let mut env = HashMap::new();
+    if let Some(parent_invocation_env) = parent_invocation_env {
+        env.insert(
+            "OULIPOLY_PARENT_INVOCATION".to_string(),
+            parent_invocation_env.to_string(),
+        );
+    }
 
-    Ok(exit_code_from_status(status))
+    Ok(InteractiveCommandSpec {
+        program: parts[0].clone(),
+        args,
+        cwd: working_dir.map(Path::to_path_buf),
+        env,
+        description: description.into(),
+    })
 }
 
 enum CapturePlan {
@@ -820,73 +977,6 @@ pub fn provider_name(command: &str) -> String {
         .last()
         .cloned()
         .unwrap_or_else(|| command.to_string())
-}
-
-fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-
-        if let Some(code) = status.code() {
-            return code;
-        }
-        if let Some(signal) = status.signal() {
-            return 128 + signal;
-        }
-    }
-
-    status.code().unwrap_or(-1)
-}
-
-#[cfg(unix)]
-struct InteractiveSignalGuard {
-    handle: SignalsHandle,
-    thread: Option<thread::JoinHandle<()>>,
-}
-
-#[cfg(unix)]
-impl InteractiveSignalGuard {
-    fn install(child: &mut Child) -> Result<Self, String> {
-        let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP])
-            .map_err(|e| format!("Failed to install signal handlers: {e}"))?;
-        let handle = signals.handle();
-        let child_pid = child.id() as i32;
-        let forwarded_sigterm = Arc::new(AtomicBool::new(false));
-        let thread_forwarded_sigterm = Arc::clone(&forwarded_sigterm);
-
-        let thread = thread::spawn(move || {
-            for signal in signals.forever() {
-                if signal == SIGTERM && !thread_forwarded_sigterm.swap(true, Ordering::SeqCst) {
-                    send_sigterm(child_pid);
-                }
-            }
-        });
-
-        Ok(Self {
-            handle,
-            thread: Some(thread),
-        })
-    }
-}
-
-#[cfg(unix)]
-impl Drop for InteractiveSignalGuard {
-    fn drop(&mut self) {
-        self.handle.close();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-#[cfg(unix)]
-fn send_sigterm(pid: i32) {
-    unsafe extern "C" {
-        fn kill(pid: i32, sig: i32) -> i32;
-    }
-
-    // Best-effort forward so the parent survives long enough to reap/finalize.
-    let _ = unsafe { kill(pid, SIGTERM) };
 }
 
 #[cfg(test)]

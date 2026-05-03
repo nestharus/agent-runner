@@ -1,6 +1,9 @@
 use super::actions::AgentTurnResult;
-use std::process::Command;
-use std::time::{Duration, Instant};
+use crate::process::{
+    CommandSpec, OsProcessRunner, OutputSpec, ProcessErrorPhase, ProcessRunner, StdinSpec,
+    process_error_phase_and_detail,
+};
+use std::time::Duration;
 
 pub struct SetupAgent {
     session_id: Option<String>,
@@ -17,21 +20,30 @@ impl SetupAgent {
 
     /// Send a turn to Claude Code. Returns the parsed structured response.
     pub fn send_turn(&mut self, message: &str, schema: &str) -> Result<AgentTurnResult, String> {
-        let mut cmd = Command::new("claude");
-        cmd.arg("-p")
-            .arg("--output-format")
-            .arg("json")
-            .arg("--model")
-            .arg("claude-sonnet-4-6")
-            .arg("--allowedTools")
-            .arg("Read,Bash,Glob,Grep")
-            .arg("--no-session-persistence");
+        self.send_turn_with_runner(&OsProcessRunner, message, schema)
+    }
 
-        // Add JSON schema constraint
-        cmd.arg("--json-schema").arg(schema);
-
+    pub fn send_turn_with_runner(
+        &mut self,
+        runner: &dyn ProcessRunner,
+        message: &str,
+        schema: &str,
+    ) -> Result<AgentTurnResult, String> {
+        let mut args = vec![
+            "-p".to_string(),
+            "--output-format".to_string(),
+            "json".to_string(),
+            "--model".to_string(),
+            "claude-sonnet-4-6".to_string(),
+            "--allowedTools".to_string(),
+            "Read,Bash,Glob,Grep".to_string(),
+            "--no-session-persistence".to_string(),
+            "--json-schema".to_string(),
+            schema.to_string(),
+        ];
         if let Some(ref sid) = self.session_id {
-            cmd.arg("--resume").arg(sid);
+            args.push("--resume".to_string());
+            args.push(sid.clone());
         }
 
         let prompt = if self.session_id.is_none() {
@@ -39,66 +51,49 @@ impl SetupAgent {
         } else {
             message.to_string()
         };
+        args.push(prompt);
 
-        cmd.arg(&prompt);
-
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("Failed to spawn claude CLI: {e}"))?;
-
-        let timeout = Duration::from_secs(120);
-        let start = Instant::now();
-
-        let output = loop {
-            match child.try_wait() {
-                Ok(Some(_status)) => {
-                    break child
-                        .wait_with_output()
-                        .map_err(|e| format!("Failed to read claude CLI output: {e}"))?;
+        let output = runner
+            .run(CommandSpec {
+                program: "claude".to_string(),
+                args,
+                cwd: None,
+                env: Default::default(),
+                stdin: StdinSpec::Null,
+                stdout: OutputSpec::Capture,
+                stderr: OutputSpec::Capture,
+                timeout: Some(Duration::from_secs(120)),
+                description: "Claude CLI".to_string(),
+            })
+            .map_err(|e| {
+                if e.contains("timed out") {
+                    "Claude CLI timed out after 120 seconds".to_string()
+                } else {
+                    setup_agent_process_error(&e)
                 }
-                Ok(None) => {
-                    if start.elapsed() > timeout {
-                        let _ = child.kill();
-                        return Err("Claude CLI timed out after 120 seconds".to_string());
-                    }
-                    std::thread::sleep(Duration::from_millis(250));
-                }
-                Err(e) => {
-                    let _ = child.kill();
-                    return Err(format!("Failed to check claude CLI status: {e}"));
-                }
-            }
-        };
+            })?;
 
-        if !output.status.success() {
+        if output.exit_code != 0 {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(format!(
                 "Claude CLI failed (exit {}): {}",
-                output.status.code().unwrap_or(-1),
+                output.exit_code,
                 stderr.chars().take(500).collect::<String>()
             ));
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr_str = String::from_utf8_lossy(&output.stderr);
+        if let Some(sid) = extract_session_id(&stderr_str) {
+            self.session_id = Some(sid);
+        }
 
-        // Parse the JSON response
-        // Claude --output-format json wraps the result; we need to extract the structured content
+        let stdout = String::from_utf8_lossy(&output.stdout);
         let result: AgentTurnResult = serde_json::from_str(&stdout).map_err(|e| {
             format!(
                 "Failed to parse agent response: {e}\nRaw output: {}",
                 stdout.chars().take(200).collect::<String>()
             )
         })?;
-
-        // Try to extract session_id from stderr or response metadata
-        // Claude CLI outputs session info to stderr
-        let stderr_str = String::from_utf8_lossy(&output.stderr);
-        if let Some(sid) = extract_session_id(&stderr_str) {
-            self.session_id = Some(sid);
-        }
 
         Ok(result)
     }
@@ -121,6 +116,14 @@ fn extract_session_id(stderr: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn setup_agent_process_error(error: &str) -> String {
+    let (phase, detail) = process_error_phase_and_detail(error);
+    match phase {
+        Some(ProcessErrorPhase::Wait) => format!("Failed to check claude CLI status: {detail}"),
+        _ => format!("Failed to spawn claude CLI: {detail}"),
+    }
 }
 
 #[cfg(test)]
