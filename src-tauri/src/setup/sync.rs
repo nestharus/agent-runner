@@ -298,4 +298,126 @@ mod tests {
         assert_eq!(names.len(), 2);
         assert!(names.contains(&"firecrawl".to_string()));
     }
+
+    #[test]
+    fn install_mcp_json_creates_config_with_named_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+
+        install_mcp_json(
+            &config_path,
+            "firecrawl",
+            r#"{"command":"npx","args":["firecrawl-mcp"]}"#,
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let config: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            config["mcpServers"]["firecrawl"],
+            serde_json::json!({"command": "npx", "args": ["firecrawl-mcp"]})
+        );
+    }
+
+    #[test]
+    fn install_mcp_json_merges_server_without_removing_existing_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        std::fs::write(
+            &config_path,
+            r#"{
+  "theme": "dark",
+  "mcpServers": {
+    "github": {"command": "github-mcp"}
+  }
+}"#,
+        )
+        .unwrap();
+
+        install_mcp_json(
+            &config_path,
+            "firecrawl",
+            r#"{"command":"npx","args":["firecrawl-mcp"]}"#,
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let config: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(config["theme"], "dark");
+        assert_eq!(config["mcpServers"]["github"]["command"], "github-mcp");
+        assert_eq!(config["mcpServers"]["firecrawl"]["command"], "npx");
+    }
+
+    #[test]
+    fn install_mcp_toml_preserves_existing_settings_and_adds_mcp_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+model = "codex~high"
+
+[profiles.default]
+approval_policy = "never"
+"#,
+        )
+        .unwrap();
+
+        install_mcp_toml(
+            &config_path,
+            "firecrawl",
+            r#"{"command":"npx","args":["firecrawl-mcp"]}"#,
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let config: toml::Table = content.parse().unwrap();
+        assert_eq!(config["model"].as_str(), Some("codex~high"));
+        assert_eq!(
+            config["profiles"]["default"]["approval_policy"].as_str(),
+            Some("never")
+        );
+        assert_eq!(
+            config["mcp"]["firecrawl"].as_str(),
+            Some(r#"{"command":"npx","args":["firecrawl-mcp"]}"#)
+        );
+    }
+
+    #[test]
+    fn copy_dir_recursive_copies_nested_skill_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source-skill");
+        let nested = src.join("references");
+        let dst = dir.path().join("target-skill");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(src.join("SKILL.md"), "# Skill\n").unwrap();
+        std::fs::write(nested.join("notes.md"), "details\n").unwrap();
+
+        copy_dir_recursive(&src, &dst).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dst.join("SKILL.md")).unwrap(),
+            "# Skill\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.join("references").join("notes.md")).unwrap(),
+            "details\n"
+        );
+    }
+
+    #[test]
+    fn copy_dir_recursive_rejects_non_directory_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("not-a-directory.md");
+        let dst = dir.path().join("target-skill");
+        std::fs::write(&src, "# Skill\n").unwrap();
+
+        let err = copy_dir_recursive(&src, &dst).unwrap_err();
+
+        assert!(
+            err.contains("Source is not a directory"),
+            "unexpected error: {err}"
+        );
+        assert!(!dst.exists());
+    }
 }

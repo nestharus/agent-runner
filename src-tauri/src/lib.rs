@@ -754,6 +754,7 @@ pub fn run_tauri() {
 mod tests {
     use super::*;
     use config::{ModelConfig, PromptMode, ProviderConfig};
+    use tauri::Manager;
 
     fn make_model(name: &str, commands: &[&str]) -> ModelConfig {
         ModelConfig {
@@ -765,6 +766,310 @@ mod tests {
                 .collect(),
             inputs: vec![],
         }
+    }
+
+    fn mock_app_with_state(
+        models: HashMap<String, ModelConfig>,
+        models_dir: PathBuf,
+    ) -> tauri::App<tauri::test::MockRuntime> {
+        tauri::test::mock_builder()
+            .manage(AppState {
+                models: Mutex::new(models),
+                models_dir,
+                setup_input_tx: Mutex::new(None),
+                quota_in_flight: quota::InFlight::new(),
+            })
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap()
+    }
+
+    fn assert_model_keys(app: &tauri::App<tauri::test::MockRuntime>, expected: &[&str]) {
+        let state = app.state::<AppState>();
+        let models = state.models.lock().unwrap();
+        assert_eq!(models.len(), expected.len());
+        for name in expected {
+            assert!(models.contains_key(*name), "missing model key {name}");
+        }
+    }
+
+    fn provider_names(model: &ModelConfig) -> Vec<String> {
+        model.providers.iter().map(|p| p.name.clone()).collect()
+    }
+
+    fn assert_model_provider_names(
+        app: &tauri::App<tauri::test::MockRuntime>,
+        name: &str,
+        expected: &[&str],
+    ) {
+        let state = app.state::<AppState>();
+        let models = state.models.lock().unwrap();
+        let model = models
+            .get(name)
+            .unwrap_or_else(|| panic!("missing model {name}"));
+        let expected: Vec<String> = expected.iter().map(|name| name.to_string()).collect();
+        assert_eq!(provider_names(model), expected);
+    }
+
+    fn read_model_from_disk(models_dir: &std::path::Path, name: &str) -> ModelConfig {
+        let content = std::fs::read_to_string(models_dir.join(format!("{name}.toml"))).unwrap();
+        ModelConfig::from_toml(name, &content).unwrap()
+    }
+
+    fn account_test_app(dir: &tempfile::TempDir) -> tauri::App<tauri::test::MockRuntime> {
+        let models_dir = dir.path().join("models");
+        mock_app_with_state(HashMap::new(), models_dir)
+    }
+
+    fn account_test_db(app: &tauri::App<tauri::test::MockRuntime>) -> StateDb {
+        open_state_db(&app.state::<AppState>()).unwrap()
+    }
+
+    fn cli_provider(cli_name: &str) -> CliProviderRecord {
+        CliProviderRecord {
+            cli_name: cli_name.to_string(),
+            display_name: format!("{cli_name} display"),
+            installed: true,
+            version: Some("1.0.0".to_string()),
+            config_dir: Some(format!("/tmp/{cli_name}")),
+            last_synced: None,
+        }
+    }
+
+    fn seed_cli_provider(app: &tauri::App<tauri::test::MockRuntime>, cli_name: &str) {
+        account_test_db(app)
+            .upsert_cli_provider(&cli_provider(cli_name))
+            .unwrap();
+    }
+
+    fn account_record(
+        id: &str,
+        provider: &str,
+        profile_name: &str,
+        auth_method: AuthMethod,
+        auth_status: AuthStatus,
+    ) -> AccountRecord {
+        AccountRecord {
+            id: id.to_string(),
+            provider: provider.to_string(),
+            profile_name: profile_name.to_string(),
+            auth_method,
+            auth_status,
+            created_at: "2026-05-02T00:00:00Z".to_string(),
+        }
+    }
+
+    fn seed_account(app: &tauri::App<tauri::test::MockRuntime>, account: AccountRecord) {
+        account_test_db(app).insert_account(&account).unwrap();
+    }
+
+    fn persisted_accounts(app: &tauri::App<tauri::test::MockRuntime>) -> Vec<AccountRecord> {
+        account_test_db(app).list_accounts(None).unwrap()
+    }
+
+    #[test]
+    fn add_account_rejects_empty_account_id_without_inserting_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = account_test_app(&dir);
+        seed_cli_provider(&app, "claude");
+
+        let result = add_account(
+            app.state::<AppState>(),
+            AddAccountInput {
+                id: "".to_string(),
+                provider: "claude".to_string(),
+                profile_name: "work-profile".to_string(),
+                auth_method: AuthMethod::OAuth,
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(persisted_accounts(&app).is_empty());
+    }
+
+    #[test]
+    fn add_account_rejects_empty_provider_id_without_inserting_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = account_test_app(&dir);
+
+        let result = add_account(
+            app.state::<AppState>(),
+            AddAccountInput {
+                id: "work".to_string(),
+                provider: "".to_string(),
+                profile_name: "work-profile".to_string(),
+                auth_method: AuthMethod::OAuth,
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(persisted_accounts(&app).is_empty());
+    }
+
+    #[test]
+    fn add_account_rejects_empty_profile_name_without_inserting_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = account_test_app(&dir);
+        seed_cli_provider(&app, "claude");
+
+        let result = add_account(
+            app.state::<AppState>(),
+            AddAccountInput {
+                id: "work".to_string(),
+                provider: "claude".to_string(),
+                profile_name: "".to_string(),
+                auth_method: AuthMethod::OAuth,
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(persisted_accounts(&app).is_empty());
+    }
+
+    #[test]
+    fn add_account_rejects_unknown_provider_without_inserting_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = account_test_app(&dir);
+
+        let result = add_account(
+            app.state::<AppState>(),
+            AddAccountInput {
+                id: "work".to_string(),
+                provider: "claude".to_string(),
+                profile_name: "work-profile".to_string(),
+                auth_method: AuthMethod::OAuth,
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(persisted_accounts(&app).is_empty());
+    }
+
+    #[test]
+    fn add_account_inserts_returns_and_persists_valid_account_with_unknown_auth_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = account_test_app(&dir);
+        seed_cli_provider(&app, "claude");
+        let auth_method = AuthMethod::ApiKey {
+            env_var: "ANTHROPIC_API_KEY".to_string(),
+            config_path: Some("/tmp/anthropic-key".to_string()),
+        };
+
+        let inserted = add_account(
+            app.state::<AppState>(),
+            AddAccountInput {
+                id: "work".to_string(),
+                provider: "claude".to_string(),
+                profile_name: "work-profile".to_string(),
+                auth_method: auth_method.clone(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(inserted.id, "work");
+        assert_eq!(inserted.provider, "claude");
+        assert_eq!(inserted.profile_name, "work-profile");
+        assert_eq!(inserted.auth_method, auth_method);
+        assert_eq!(inserted.auth_status, AuthStatus::Unknown);
+        assert!(!inserted.created_at.is_empty());
+
+        let accounts = persisted_accounts(&app);
+        assert_eq!(accounts.len(), 1);
+        let persisted = &accounts[0];
+        assert_eq!(persisted.id, inserted.id);
+        assert_eq!(persisted.provider, inserted.provider);
+        assert_eq!(persisted.profile_name, inserted.profile_name);
+        assert_eq!(persisted.auth_method, inserted.auth_method);
+        assert_eq!(persisted.auth_status, AuthStatus::Unknown);
+        assert_eq!(persisted.created_at, inserted.created_at);
+    }
+
+    #[test]
+    fn remove_account_deletes_existing_id_provider_pair_and_returns_true() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = account_test_app(&dir);
+        seed_cli_provider(&app, "claude");
+        seed_account(
+            &app,
+            account_record(
+                "work",
+                "claude",
+                "work-profile",
+                AuthMethod::ConfigFile {
+                    path: "~/.claude/config".to_string(),
+                },
+                AuthStatus::Valid,
+            ),
+        );
+
+        let removed = remove_account(
+            app.state::<AppState>(),
+            "work".to_string(),
+            "claude".to_string(),
+        )
+        .unwrap();
+
+        assert!(removed);
+        assert!(persisted_accounts(&app).is_empty());
+    }
+
+    #[test]
+    fn remove_account_returns_false_for_missing_pair_and_leaves_existing_rows_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = account_test_app(&dir);
+        seed_cli_provider(&app, "claude");
+        seed_cli_provider(&app, "codex");
+        seed_account(
+            &app,
+            account_record(
+                "work",
+                "claude",
+                "work-profile",
+                AuthMethod::OAuth,
+                AuthStatus::Valid,
+            ),
+        );
+        seed_account(
+            &app,
+            account_record(
+                "personal",
+                "codex",
+                "personal-profile",
+                AuthMethod::ApiKey {
+                    env_var: "OPENAI_API_KEY".to_string(),
+                    config_path: None,
+                },
+                AuthStatus::Unknown,
+            ),
+        );
+
+        let removed = remove_account(
+            app.state::<AppState>(),
+            "missing".to_string(),
+            "claude".to_string(),
+        )
+        .unwrap();
+
+        assert!(!removed);
+        let accounts = persisted_accounts(&app);
+        assert_eq!(accounts.len(), 2);
+        assert!(accounts.iter().any(|account| {
+            account.id == "work"
+                && account.provider == "claude"
+                && account.profile_name == "work-profile"
+                && account.auth_method == AuthMethod::OAuth
+                && account.auth_status == AuthStatus::Valid
+        }));
+        assert!(accounts.iter().any(|account| {
+            account.id == "personal"
+                && account.provider == "codex"
+                && account.profile_name == "personal-profile"
+                && account.auth_method
+                    == (AuthMethod::ApiKey {
+                        env_var: "OPENAI_API_KEY".to_string(),
+                        config_path: None,
+                    })
+                && account.auth_status == AuthStatus::Unknown
+        }));
     }
 
     #[test]
@@ -835,6 +1140,225 @@ mod tests {
         assert_eq!(pools.len(), 1);
         assert_eq!(pools[0].commands, vec!["claude".to_string()]);
         assert_eq!(pools[0].model_count, 2);
+    }
+
+    #[test]
+    fn save_model_with_empty_name_returns_error_without_writing_or_mutating_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        let mut models = HashMap::new();
+        models.insert("existing".into(), make_model("existing", &["claude"]));
+        let app = mock_app_with_state(models, models_dir.clone());
+
+        let result = save_model(app.state::<AppState>(), make_model("", &["claude"]));
+
+        assert!(result.is_err());
+        assert!(!models_dir.join(".toml").exists());
+        assert_model_keys(&app, &["existing"]);
+    }
+
+    #[test]
+    fn save_model_with_no_providers_returns_error_without_writing_or_mutating_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        let mut models = HashMap::new();
+        models.insert("existing".into(), make_model("existing", &["claude"]));
+        let app = mock_app_with_state(models, models_dir.clone());
+        let model = ModelConfig {
+            name: "no-providers".to_string(),
+            prompt_mode: PromptMode::Stdin,
+            providers: vec![],
+            inputs: vec![],
+        };
+
+        let result = save_model(app.state::<AppState>(), model);
+
+        assert!(result.is_err());
+        assert!(!models_dir.join("no-providers.toml").exists());
+        assert_model_keys(&app, &["existing"]);
+    }
+
+    #[test]
+    fn save_model_with_empty_provider_name_returns_error_without_writing_or_mutating_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        let mut models = HashMap::new();
+        models.insert("existing".into(), make_model("existing", &["claude"]));
+        let app = mock_app_with_state(models, models_dir.clone());
+        let model = ModelConfig {
+            name: "empty-provider".to_string(),
+            prompt_mode: PromptMode::Stdin,
+            providers: vec![ProviderConfig::model_provider("", vec![])],
+            inputs: vec![],
+        };
+
+        let result = save_model(app.state::<AppState>(), model);
+
+        assert!(result.is_err());
+        assert!(!models_dir.join("empty-provider.toml").exists());
+        assert_model_keys(&app, &["existing"]);
+    }
+
+    #[test]
+    fn save_model_when_models_directory_cannot_be_created_returns_error_without_mutating_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocking_file = dir.path().join("not-a-directory");
+        std::fs::write(&blocking_file, "blocks directory creation").unwrap();
+        let models_dir = blocking_file.join("models");
+        let mut models = HashMap::new();
+        models.insert("existing".into(), make_model("existing", &["claude"]));
+        let app = mock_app_with_state(models, models_dir);
+
+        let result = save_model(
+            app.state::<AppState>(),
+            make_model("write-fails", &["claude"]),
+        );
+
+        assert!(result.is_err());
+        assert_model_keys(&app, &["existing"]);
+    }
+
+    #[test]
+    fn delete_model_removes_persisted_config_and_model_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let model = make_model("removable", &["claude"]);
+        std::fs::write(models_dir.join("removable.toml"), model.to_toml()).unwrap();
+        let mut models = HashMap::new();
+        models.insert("removable".into(), model);
+        models.insert("kept".into(), make_model("kept", &["codex"]));
+        let app = mock_app_with_state(models, models_dir.clone());
+
+        let result = delete_model(app.state::<AppState>(), "removable".to_string());
+
+        assert!(result.is_ok());
+        assert!(!models_dir.join("removable.toml").exists());
+        assert_model_keys(&app, &["kept"]);
+    }
+
+    #[test]
+    fn delete_model_when_file_removal_fails_returns_error_without_mutating_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(models_dir.join("undeletable.toml")).unwrap();
+        let mut models = HashMap::new();
+        models.insert("undeletable".into(), make_model("undeletable", &["claude"]));
+        models.insert("kept".into(), make_model("kept", &["codex"]));
+        let app = mock_app_with_state(models, models_dir.clone());
+
+        let result = delete_model(app.state::<AppState>(), "undeletable".to_string());
+
+        assert!(result.is_err());
+        assert!(models_dir.join("undeletable.toml").exists());
+        assert_model_keys(&app, &["kept", "undeletable"]);
+    }
+
+    #[test]
+    fn update_pool_with_empty_new_commands_returns_error_without_mutating_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        let mut models = HashMap::new();
+        models.insert("existing".into(), make_model("existing", &["claude"]));
+        let app = mock_app_with_state(models, models_dir.clone());
+
+        let result = update_pool(app.state::<AppState>(), vec!["claude".to_string()], vec![]);
+
+        assert!(result.is_err());
+        assert!(!models_dir.join("existing.toml").exists());
+        assert_model_provider_names(&app, "existing", &["claude"]);
+    }
+
+    #[test]
+    fn update_pool_rejects_unmatched_original_commands_without_mutating_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        let mut models = HashMap::new();
+        models.insert("existing".into(), make_model("existing", &["claude"]));
+        let app = mock_app_with_state(models, models_dir.clone());
+
+        let result = update_pool(
+            app.state::<AppState>(),
+            vec!["codex".to_string()],
+            vec!["gemini".to_string()],
+        );
+
+        assert!(result.is_err());
+        assert!(!models_dir.join("existing.toml").exists());
+        assert_model_provider_names(&app, "existing", &["claude"]);
+    }
+
+    #[test]
+    fn update_pool_applies_deduped_command_set_to_all_matching_models_and_persists_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let mut models = HashMap::new();
+        models.insert("alpha".into(), make_model("alpha", &["claude", "codex"]));
+        models.insert("beta".into(), make_model("beta", &["codex", "claude"]));
+        models.insert("gamma".into(), make_model("gamma", &["gemini"]));
+        let app = mock_app_with_state(models, models_dir.clone());
+
+        let result = update_pool(
+            app.state::<AppState>(),
+            vec![
+                "codex".to_string(),
+                "claude".to_string(),
+                "claude".to_string(),
+            ],
+            vec![
+                "gemini".to_string(),
+                "claude".to_string(),
+                "gemini".to_string(),
+            ],
+        );
+
+        assert!(result.is_ok());
+        assert_model_provider_names(&app, "alpha", &["claude", "gemini"]);
+        assert_model_provider_names(&app, "beta", &["claude", "gemini"]);
+        assert_model_provider_names(&app, "gamma", &["gemini"]);
+
+        assert_eq!(
+            provider_names(&read_model_from_disk(&models_dir, "alpha")),
+            vec!["claude".to_string(), "gemini".to_string()]
+        );
+        assert_eq!(
+            provider_names(&read_model_from_disk(&models_dir, "beta")),
+            vec!["claude".to_string(), "gemini".to_string()]
+        );
+        assert!(!models_dir.join("gamma.toml").exists());
+    }
+
+    #[test]
+    fn update_pool_matches_prefixed_runtime_provider_by_provider_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let mut model = make_model("prefixed", &[]);
+        model.providers = vec![ProviderConfig::new(
+            "env",
+            vec![
+                "-u".to_string(),
+                "CLAUDECODE".to_string(),
+                "claude".to_string(),
+            ],
+        )];
+        let mut models = HashMap::new();
+        models.insert("prefixed".into(), model);
+        let app = mock_app_with_state(models, models_dir.clone());
+
+        let result = update_pool(
+            app.state::<AppState>(),
+            vec!["claude".to_string()],
+            vec!["codex".to_string()],
+        );
+
+        assert!(result.is_ok());
+        assert_model_provider_names(&app, "prefixed", &["codex"]);
+        assert_eq!(
+            provider_names(&read_model_from_disk(&models_dir, "prefixed")),
+            vec!["codex".to_string()]
+        );
     }
 
     #[cfg(unix)]
