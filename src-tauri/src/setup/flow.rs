@@ -138,7 +138,7 @@ impl SetupFlow {
     }
 
     async fn run_agent_loop(&mut self, system_prompt: String, initial_message: &str) {
-        let mut agent = SetupAgent::new(system_prompt);
+        let mut agent = SetupAgent::with_system_prompt(system_prompt);
         let mut turn_number = 0;
         let mut next_message = initial_message.to_string();
 

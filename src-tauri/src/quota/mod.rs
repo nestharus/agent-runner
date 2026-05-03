@@ -3,12 +3,14 @@
 //! stdout. The parsed reading lands in `provider_quotas` + `provider_quota_windows`.
 
 use crate::config::ProvidersConfig;
-use crate::state::{QuotaWindowInput, StateDb};
+use crate::process::{CommandSpec, OutputSpec, ProcessRunner, StdinSpec};
+use crate::state::QuotaRepository;
+use crate::state::QuotaWindowInput;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::collections::HashSet;
-use std::process::{Command, Stdio};
 use std::sync::Mutex;
+use std::time::Duration;
 
 /// Minimum refresh TTL. Below 5 minutes we burn API calls without useful
 /// signal change; the density projection already catches short-term spikes.
@@ -88,6 +90,13 @@ struct QuotaScriptWindow {
     resets_at: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum QuotaScriptEnvelope {
+    Object(QuotaScriptOutput),
+    Windows(Vec<QuotaScriptWindow>),
+}
+
 #[derive(Debug)]
 pub enum RefreshOutcome {
     Updated {
@@ -115,7 +124,8 @@ pub fn refresh_provider(
     provider_name: &str,
     providers_cfg: &ProvidersConfig,
     in_flight: &InFlight,
-    state: &StateDb,
+    quota_repo: &dyn QuotaRepository,
+    runner: &dyn ProcessRunner,
 ) -> RefreshOutcome {
     let Some(entry) = providers_cfg.get(provider_name) else {
         return RefreshOutcome::NoScript;
@@ -128,14 +138,14 @@ pub fn refresh_provider(
         return RefreshOutcome::AlreadyInFlight;
     };
 
-    let first = run_script(script);
-    if should_attempt_auth_refresh(provider_name, &first, state)
+    let first = run_script(runner, script);
+    if should_attempt_auth_refresh(provider_name, &first, quota_repo)
         && let Some(refresh_cmd) = entry.auth_refresh_command.as_deref()
     {
-        let refresh_err = run_refresh_command(refresh_cmd).err();
-        match run_script(script) {
+        let refresh_err = run_refresh_command(runner, refresh_cmd).err();
+        match run_script(runner, script) {
             Ok(windows) => {
-                if let Err(e) = state.upsert_quota_refresh(provider_name, &windows) {
+                if let Err(e) = quota_repo.upsert_quota_refresh(provider_name, &windows) {
                     return RefreshOutcome::Failed(e);
                 }
                 return RefreshOutcome::Updated { windows };
@@ -152,7 +162,7 @@ pub fn refresh_provider(
 
     match first {
         Ok(windows) => {
-            if let Err(e) = state.upsert_quota_refresh(provider_name, &windows) {
+            if let Err(e) = quota_repo.upsert_quota_refresh(provider_name, &windows) {
                 return RefreshOutcome::Failed(e);
             }
             RefreshOutcome::Updated { windows }
@@ -168,11 +178,11 @@ pub fn refresh_provider(
 fn should_attempt_auth_refresh(
     provider_name: &str,
     result: &Result<Vec<QuotaWindowInput>, String>,
-    state: &StateDb,
+    quota_repo: &dyn QuotaRepository,
 ) -> bool {
     match result {
         Err(_) => true,
-        Ok(windows) if windows.is_empty() => state
+        Ok(windows) if windows.is_empty() => quota_repo
             .get_windows(provider_name)
             .map(|prior| !prior.is_empty())
             .unwrap_or(false),
@@ -184,14 +194,14 @@ fn should_attempt_auth_refresh(
 /// the dynamic TTL computed from its window lengths. TTL is
 /// `min(hours_until_reset) / DIVISOR`, clamped to `[MIN_TTL, MAX_TTL]`.
 /// A provider row with zero windows is inconsistent state; force stale.
-pub fn is_stale(state: &StateDb, provider_name: &str) -> bool {
-    let Ok(Some(q)) = state.get_quota(provider_name) else {
+pub fn is_stale(quota_repo: &dyn QuotaRepository, provider_name: &str) -> bool {
+    let Ok(Some(q)) = quota_repo.get_quota(provider_name) else {
         return true;
     };
     let Some(refreshed_at) = q.refreshed_at else {
         return true;
     };
-    let windows = state.get_windows(provider_name).unwrap_or_default();
+    let windows = quota_repo.get_windows(provider_name).unwrap_or_default();
     if windows.is_empty() {
         return true;
     }
@@ -216,109 +226,66 @@ pub fn dynamic_ttl_secs(windows: &[crate::state::QuotaWindow]) -> i64 {
     (min_hours / REFRESH_WINDOW_DIVISOR).clamp(MIN_TTL_SECS, MAX_TTL_SECS)
 }
 
-fn run_refresh_command(cmd_str: &str) -> Result<(), String> {
-    use std::io::Read;
-
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(cmd_str);
-    cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::null());
-    cmd.stderr(Stdio::piped());
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed to spawn auth_refresh_command: {e}"))?;
-
-    let stderr = child.stderr.take().expect("piped");
-    let stderr_handle = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = { stderr }.read_to_string(&mut buf);
-        buf
-    });
-
-    let timeout = std::time::Duration::from_secs(REFRESH_TIMEOUT_SECS);
-    let start = std::time::Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(s)) => break s,
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    return Err(format!(
-                        "auth_refresh_command timed out after {REFRESH_TIMEOUT_SECS}s"
-                    ));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
+fn run_refresh_command(runner: &dyn ProcessRunner, cmd_str: &str) -> Result<(), String> {
+    let output = runner
+        .run(CommandSpec {
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), cmd_str.to_string()],
+            cwd: None,
+            env: Default::default(),
+            stdin: StdinSpec::Null,
+            stdout: OutputSpec::Null,
+            stderr: OutputSpec::Capture,
+            timeout: Some(Duration::from_secs(REFRESH_TIMEOUT_SECS)),
+            description: "auth_refresh_command".to_string(),
+        })
+        .map_err(|e| {
+            if e.contains("timed out") {
+                format!("auth_refresh_command timed out after {REFRESH_TIMEOUT_SECS}s")
+            } else {
+                format!("Failed to spawn auth_refresh_command: {e}")
             }
-            Err(e) => return Err(format!("auth_refresh_command wait failed: {e}")),
-        }
-    };
+        })?;
 
-    let stderr_text = stderr_handle.join().unwrap_or_default();
-    if !status.success() {
+    if output.exit_code != 0 {
+        let stderr_text = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
             "auth_refresh_command exited {}: {}",
-            status.code().unwrap_or(-1),
+            output.exit_code,
             stderr_text.trim()
         ));
     }
     Ok(())
 }
 
-fn run_script(script: &str) -> Result<Vec<QuotaWindowInput>, String> {
-    use std::io::Read;
-
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(script);
-    cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed to spawn quota script: {e}"))?;
-
-    // Drain stdout/stderr concurrently to avoid pipe-full deadlocks for
-    // scripts that write a lot (unlikely for quota scripts but consistent
-    // with the sessions-module pattern).
-    let stdout = child.stdout.take().expect("piped");
-    let stderr = child.stderr.take().expect("piped");
-    let stdout_handle = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = { stdout }.read_to_string(&mut buf);
-        buf
-    });
-    let stderr_handle = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = { stderr }.read_to_string(&mut buf);
-        buf
-    });
-
-    let timeout = std::time::Duration::from_secs(SCRIPT_TIMEOUT_SECS);
-    let start = std::time::Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(s)) => break s,
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    return Err(format!(
-                        "Quota script timed out after {SCRIPT_TIMEOUT_SECS}s"
-                    ));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
+fn run_script(runner: &dyn ProcessRunner, script: &str) -> Result<Vec<QuotaWindowInput>, String> {
+    let output = runner
+        .run(CommandSpec {
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            cwd: None,
+            env: Default::default(),
+            stdin: StdinSpec::Null,
+            stdout: OutputSpec::Capture,
+            stderr: OutputSpec::Capture,
+            timeout: Some(Duration::from_secs(SCRIPT_TIMEOUT_SECS)),
+            description: "Quota script".to_string(),
+        })
+        .map_err(|e| {
+            if e.contains("timed out") {
+                format!("Quota script timed out after {SCRIPT_TIMEOUT_SECS}s")
+            } else {
+                format!("Failed to spawn quota script: {e}")
             }
-            Err(e) => return Err(format!("Quota script wait failed: {e}")),
-        }
-    };
+        })?;
 
-    let stdout_text = stdout_handle.join().unwrap_or_default();
-    let stderr_text = stderr_handle.join().unwrap_or_default();
+    let stdout_text = String::from_utf8_lossy(&output.stdout);
+    let stderr_text = String::from_utf8_lossy(&output.stderr);
 
-    if !status.success() {
+    if output.exit_code != 0 {
         return Err(format!(
             "Quota script exited {}: {}",
-            status.code().unwrap_or(-1),
+            output.exit_code,
             stderr_text.trim()
         ));
     }
@@ -328,28 +295,31 @@ fn run_script(script: &str) -> Result<Vec<QuotaWindowInput>, String> {
 
 fn parse_output(stdout: &str) -> Result<Vec<QuotaWindowInput>, String> {
     let trimmed = stdout.trim();
-    let parsed: QuotaScriptOutput = serde_json::from_str(trimmed)
+    let parsed: QuotaScriptEnvelope = serde_json::from_str(trimmed)
         .map_err(|e| format!("Invalid JSON from quota script: {e} (got: {stdout})"))?;
 
-    let raw_windows: Vec<QuotaScriptWindow> = match parsed.windows {
-        Some(ws) => ws,
-        None => {
-            // Legacy single-window shape.
-            let Some(pct) = parsed.used_percent else {
-                return Err(format!(
-                    "quota script emitted neither `windows` nor `used_percent` (got: {stdout})"
-                ));
-            };
-            let Some(resets_at) = parsed.resets_at else {
-                return Err(format!(
-                    "legacy quota script emitted `used_percent` without `resets_at` (got: {stdout})"
-                ));
-            };
-            vec![QuotaScriptWindow {
-                used_percent: pct,
-                resets_at,
-            }]
-        }
+    let raw_windows: Vec<QuotaScriptWindow> = match parsed {
+        QuotaScriptEnvelope::Windows(ws) => ws,
+        QuotaScriptEnvelope::Object(parsed) => match parsed.windows {
+            Some(ws) => ws,
+            None => {
+                // Legacy single-window shape.
+                let Some(pct) = parsed.used_percent else {
+                    return Err(format!(
+                        "quota script emitted neither `windows` nor `used_percent` (got: {stdout})"
+                    ));
+                };
+                let Some(resets_at) = parsed.resets_at else {
+                    return Err(format!(
+                        "legacy quota script emitted `used_percent` without `resets_at` (got: {stdout})"
+                    ));
+                };
+                vec![QuotaScriptWindow {
+                    used_percent: pct,
+                    resets_at,
+                }]
+            }
+        },
     };
 
     let mut out = Vec::with_capacity(raw_windows.len());
@@ -382,6 +352,8 @@ fn hours_from_now(h: i64) -> DateTime<Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process::OsProcessRunner;
+    use crate::state::StateDb;
 
     #[test]
     fn in_flight_single_claim() {
@@ -559,7 +531,8 @@ mod tests {
         seed_prior_windows(&state, "p");
         let in_flight = InFlight::new();
 
-        let outcome = refresh_provider("p", &providers, &in_flight, &state);
+        let runner = OsProcessRunner;
+        let outcome = refresh_provider("p", &providers, &in_flight, &state, &runner);
         match outcome {
             RefreshOutcome::Updated { windows } => {
                 assert_eq!(windows.len(), 1);
@@ -583,7 +556,8 @@ mod tests {
         let state = StateDb::open(std::path::Path::new(":memory:")).unwrap();
         let in_flight = InFlight::new();
 
-        let outcome = refresh_provider("p", &providers, &in_flight, &state);
+        let runner = OsProcessRunner;
+        let outcome = refresh_provider("p", &providers, &in_flight, &state, &runner);
         assert!(
             matches!(outcome, RefreshOutcome::Updated { ref windows } if windows.is_empty()),
             "expected Updated with empty windows, got {outcome:?}"
@@ -609,7 +583,8 @@ mod tests {
         let state = StateDb::open(std::path::Path::new(":memory:")).unwrap();
         let in_flight = InFlight::new();
 
-        let outcome = refresh_provider("p", &providers, &in_flight, &state);
+        let runner = OsProcessRunner;
+        let outcome = refresh_provider("p", &providers, &in_flight, &state, &runner);
         match outcome {
             RefreshOutcome::Updated { windows } => {
                 assert_eq!(windows.len(), 1);
@@ -629,7 +604,8 @@ mod tests {
         let state = StateDb::open(std::path::Path::new(":memory:")).unwrap();
         let in_flight = InFlight::new();
 
-        let outcome = refresh_provider("p", &providers, &in_flight, &state);
+        let runner = OsProcessRunner;
+        let outcome = refresh_provider("p", &providers, &in_flight, &state, &runner);
         assert!(
             matches!(outcome, RefreshOutcome::Failed(_)),
             "expected Failed, got {outcome:?}"
@@ -645,7 +621,8 @@ mod tests {
         let state = StateDb::open(std::path::Path::new(":memory:")).unwrap();
         let in_flight = InFlight::new();
 
-        let outcome = refresh_provider("p", &providers, &in_flight, &state);
+        let runner = OsProcessRunner;
+        let outcome = refresh_provider("p", &providers, &in_flight, &state, &runner);
         match outcome {
             RefreshOutcome::Failed(msg) => {
                 assert!(

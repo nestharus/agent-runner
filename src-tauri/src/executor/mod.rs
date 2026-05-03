@@ -119,7 +119,7 @@ pub fn execute_with_inputs_and_env(
 }
 
 pub fn execute_effective_with_inputs_and_env(
-    request: cli::EffectiveExecuteRequest<'_>,
+    request: cli::EffectiveExecuteWithInputsRequest<'_>,
 ) -> Result<ExecutionResult, String> {
-    cli::execute_effective(request)
+    cli::execute_effective_with_inputs(request)
 }

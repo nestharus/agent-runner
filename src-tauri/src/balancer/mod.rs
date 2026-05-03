@@ -1,5 +1,6 @@
 use crate::config::{ModelConfig, ProvidersConfig, SessionsConfig};
 use crate::migration::MigrationError;
+use crate::process::OsProcessRunner;
 use crate::quota::{InFlight, RefreshOutcome, is_stale, refresh_provider};
 use crate::sessions::scan_provider;
 pub use crate::state::TransitionReason;
@@ -78,12 +79,13 @@ pub fn select_provider(
     //    Also scan CLI session logs so calls_since_refresh reflects ALL
     //    activity (agent-runner invocations + direct user UI prompts).
     if let Some(ctx) = ctx {
+        let runner = OsProcessRunner;
         for p in &model.providers {
             if is_stale(state, &p.name) {
                 // Swallow the result — a failed refresh just leaves stale
                 // (or missing) data, which the fallback logic below handles.
                 let _: RefreshOutcome =
-                    refresh_provider(&p.name, ctx.providers_cfg, ctx.in_flight, state);
+                    refresh_provider(&p.name, ctx.providers_cfg, ctx.in_flight, state, &runner);
             }
             // Session scan errors don't abort the pick — we just project with
             // a stale turn count instead of an up-to-date one.
@@ -182,10 +184,11 @@ pub fn compute_projections(
     ctx: Option<&BalanceContext<'_>>,
 ) -> Vec<ProviderProjection> {
     if let Some(ctx) = ctx {
+        let runner = OsProcessRunner;
         for p in &model.providers {
             if is_stale(state, &p.name) {
                 let _: RefreshOutcome =
-                    refresh_provider(&p.name, ctx.providers_cfg, ctx.in_flight, state);
+                    refresh_provider(&p.name, ctx.providers_cfg, ctx.in_flight, state, &runner);
             }
             let _ = scan_provider(&p.name, ctx.sessions_cfg, state);
         }
