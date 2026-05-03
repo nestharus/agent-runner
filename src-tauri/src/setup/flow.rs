@@ -442,24 +442,51 @@ fn validate_and_write(path: &str, content: &str) -> Result<String, String> {
     };
 
     let resolved = expanded.to_string_lossy().to_string();
-
-    // Validate path is in allowed prefixes
-    let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
-    let allowed = ALLOWED_WRITE_PREFIXES.iter().any(|prefix| {
-        let full_prefix = home.join(prefix);
-        expanded.starts_with(&full_prefix)
-    });
-
-    if !allowed {
+    if expanded
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
         return Err(format!(
             "Write path '{resolved}' is not in allowed directories"
         ));
     }
 
-    // Create parent directories
-    if let Some(parent) = expanded.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create directories: {e}"))?;
+    let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
+    let allowed_root = ALLOWED_WRITE_PREFIXES.iter().find_map(|prefix| {
+        let full_prefix = home.join(prefix);
+        expanded.starts_with(&full_prefix).then_some(full_prefix)
+    });
+
+    let Some(allowed_root) = allowed_root else {
+        return Err(format!(
+            "Write path '{resolved}' is not in allowed directories"
+        ));
+    };
+
+    let parent = expanded
+        .parent()
+        .ok_or_else(|| format!("Write path '{resolved}' is not in allowed directories"))?;
+    std::fs::create_dir_all(&allowed_root)
+        .map_err(|e| format!("Failed to create directories: {e}"))?;
+    let canonical_allowed_root = allowed_root
+        .canonicalize()
+        .map_err(|e| format!("Failed to validate write directory: {e}"))?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create directories: {e}"))?;
+    let canonical_parent = parent
+        .canonicalize()
+        .map_err(|e| format!("Failed to validate write directory: {e}"))?;
+    if !canonical_parent.starts_with(&canonical_allowed_root) {
+        return Err(format!(
+            "Write path '{resolved}' is not in allowed directories"
+        ));
+    }
+    if std::fs::symlink_metadata(&expanded)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(format!(
+            "Write path '{resolved}' is not in allowed directories"
+        ));
     }
 
     std::fs::write(&expanded, content).map_err(|e| format!("Failed to write file: {e}"))?;
@@ -808,6 +835,7 @@ fi
         assert!(err.contains("not in the allowlist"), "{err}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn listed_command_name_executes_and_returns_process_output() {
         let args = vec!["sh".to_string()];
@@ -865,7 +893,6 @@ fi
     }
 
     #[test]
-    #[ignore = "Confirmed bug: intended behavior from commit db3b73808a5be6ba38bada4770ef77740cf4b62c; see /home/nes/projects/agent-runner/planning/coverage/spec-setup-flow-security-helpers.md#behavior-2-setup-writes-are-limited-to-approved-roots"]
     fn parent_directory_traversal_out_of_approved_root_is_rejected() {
         with_temp_home(|_| {
             let err = validate_and_write(
@@ -875,6 +902,27 @@ fi
             .unwrap_err();
 
             assert!(err.contains("not in allowed directories"), "{err}");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_escape_out_of_approved_root_is_rejected() {
+        with_temp_home(|home| {
+            let outside = home.join("outside");
+            let link = home.join(".config/oulipoly-agent-runner/link");
+            std::fs::create_dir_all(&outside).unwrap();
+            std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+            let err = validate_and_write(
+                "~/.config/oulipoly-agent-runner/link/escaped.toml",
+                "content",
+            )
+            .unwrap_err();
+
+            assert!(err.contains("not in allowed directories"), "{err}");
+            assert!(!outside.join("escaped.toml").exists());
         });
     }
 }

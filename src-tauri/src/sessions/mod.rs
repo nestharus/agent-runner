@@ -18,11 +18,12 @@
 //! safe even if a script over-emits (e.g. doesn't honor its cursor).
 
 use crate::config::{SessionSourceEntry, SessionsConfig};
-use crate::state::{SessionTurnIngest, StateDb};
+use crate::process::{CommandSpec, OsProcessRunner, OutputSpec, ProcessRunner, StdinSpec};
+use crate::state::{SessionChainRepository, SessionTurnIngest, SessionTurnRepository, StateDb};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 
 // Generous to accommodate first-run scans across thousands of historical
 // session files. Subsequent scans are bounded by the script's mtime cursor
@@ -62,6 +63,16 @@ pub fn scan_provider(
     sessions_cfg: &SessionsConfig,
     db: &StateDb,
 ) -> ScanReport {
+    scan_provider_with_runner(provider_name, sessions_cfg, db, db, &OsProcessRunner)
+}
+
+pub fn scan_provider_with_runner(
+    provider_name: &str,
+    sessions_cfg: &SessionsConfig,
+    turn_repo: &dyn SessionTurnRepository,
+    chain_repo: &dyn SessionChainRepository,
+    runner: &dyn ProcessRunner,
+) -> ScanReport {
     let mut report = ScanReport::default();
     let Some(entry) = sessions_cfg.get(provider_name) else {
         return report;
@@ -76,7 +87,7 @@ pub fn scan_provider(
         return report;
     }
 
-    let stdout = match run_turn_script(&entry.turn_script, &state_dir) {
+    let stdout = match run_turn_script_with_runner(runner, &entry.turn_script, &state_dir) {
         Ok(s) => s,
         Err(e) => {
             report.errors.push(e);
@@ -122,11 +133,11 @@ pub fn scan_provider(
             is_compaction_boundary: turn.is_compaction_boundary.unwrap_or(false),
         });
     }
-    match db.ingest_session_turns_batch(provider_name, &batch) {
+    match turn_repo.ingest_session_turns_batch(provider_name, &batch) {
         Ok(n) => {
             report.new_turns = n;
             for turn in &batch {
-                if let Err(e) = db.mint_imported_chain_if_absent(
+                if let Err(e) = chain_repo.mint_imported_chain_if_absent(
                     provider_name,
                     &turn.session_id,
                     &turn.timestamp,
@@ -164,8 +175,12 @@ fn resolve_state_dir(provider_name: &str, entry: &SessionSourceEntry) -> PathBuf
     base.join(provider_name)
 }
 
-fn run_turn_script(script: &str, state_dir: &std::path::Path) -> Result<String, String> {
-    run_session_script(script, state_dir, None, "turn script")
+fn run_turn_script_with_runner(
+    runner: &dyn ProcessRunner,
+    script: &str,
+    state_dir: &std::path::Path,
+) -> Result<String, String> {
+    run_session_script_with_runner(runner, script, state_dir, None, "turn script")
 }
 
 pub fn locate_transcript(
@@ -184,7 +199,44 @@ pub fn locate_transcript(
     std::fs::create_dir_all(&state_dir)
         .map_err(|e| format!("could not create state_dir {}: {e}", state_dir.display()))?;
 
-    let stdout = run_session_script(locator, &state_dir, Some(session_id), "transcript locator")?;
+    let stdout = run_session_script_with_runner(
+        &OsProcessRunner,
+        locator,
+        &state_dir,
+        Some(session_id),
+        "transcript locator",
+    )?;
+    transcript_path_from_locator_stdout(stdout)
+}
+
+pub fn locate_transcript_with_runner(
+    sessions_cfg: &SessionsConfig,
+    provider_name: &str,
+    session_id: &str,
+    runner: &dyn ProcessRunner,
+) -> Result<Option<PathBuf>, String> {
+    let Some(entry) = sessions_cfg.get(provider_name) else {
+        return Ok(None);
+    };
+    let Some(locator) = entry.transcript_locator.as_deref() else {
+        return Ok(None);
+    };
+
+    let state_dir = resolve_state_dir(provider_name, entry);
+    std::fs::create_dir_all(&state_dir)
+        .map_err(|e| format!("could not create state_dir {}: {e}", state_dir.display()))?;
+
+    let stdout = run_session_script_with_runner(
+        runner,
+        locator,
+        &state_dir,
+        Some(session_id),
+        "transcript locator",
+    )?;
+    transcript_path_from_locator_stdout(stdout)
+}
+
+fn transcript_path_from_locator_stdout(stdout: String) -> Result<Option<PathBuf>, String> {
     let lines = stdout
         .lines()
         .map(str::trim)
@@ -198,78 +250,40 @@ pub fn locate_transcript(
     }
 }
 
-fn run_session_script(
+fn run_session_script_with_runner(
+    runner: &dyn ProcessRunner,
     script: &str,
     state_dir: &std::path::Path,
     session_id: Option<&str>,
     script_kind: &str,
 ) -> Result<String, String> {
-    use std::io::Read;
-
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(script);
-    cmd.env("STATE_DIR", state_dir);
+    let mut env = HashMap::new();
+    env.insert(
+        "STATE_DIR".to_string(),
+        state_dir.to_string_lossy().to_string(),
+    );
     if let Some(session_id) = session_id {
-        cmd.env("SESSION_ID", session_id);
+        env.insert("SESSION_ID".to_string(), session_id.to_string());
     }
-    cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+    let output = runner.run(CommandSpec {
+        program: "sh".to_string(),
+        args: vec!["-c".to_string(), script.to_string()],
+        cwd: None,
+        env,
+        stdin: StdinSpec::Null,
+        stdout: OutputSpec::Capture,
+        stderr: OutputSpec::Capture,
+        timeout: Some(std::time::Duration::from_secs(SCRIPT_TIMEOUT_SECS)),
+        description: script_kind.to_string(),
+    })?;
+    let stdout_text = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr_text = String::from_utf8_lossy(&output.stderr).to_string();
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed to spawn {script_kind}: {e}"))?;
-
-    // Drain stdout/stderr concurrently. A naive `try_wait` loop deadlocks
-    // for scripts that produce more than ~64KB on stdout: the kernel pipe
-    // fills up, the script blocks on write, the loop waits for exit forever.
-    let stdout = child.stdout.take().expect("piped");
-    let stderr = child.stderr.take().expect("piped");
-    let stdout_handle = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let mut s = stdout;
-        s.read_to_string(&mut buf).ok();
-        buf
-    });
-    let stderr_handle = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let mut s = stderr;
-        s.read_to_string(&mut buf).ok();
-        buf
-    });
-
-    let timeout = std::time::Duration::from_secs(SCRIPT_TIMEOUT_SECS);
-    let start = std::time::Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(s)) => break s,
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    return Err(format!(
-                        "{} timed out after {SCRIPT_TIMEOUT_SECS}s",
-                        capitalize_script_kind(script_kind)
-                    ));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Err(e) => {
-                return Err(format!(
-                    "{} wait failed: {e}",
-                    capitalize_script_kind(script_kind)
-                ));
-            }
-        }
-    };
-
-    let stdout_text = stdout_handle.join().unwrap_or_default();
-    let stderr_text = stderr_handle.join().unwrap_or_default();
-
-    if !status.success() {
+    if output.exit_code != 0 {
         return Err(format!(
             "{} exited {}: {}",
             capitalize_script_kind(script_kind),
-            status.code().unwrap_or(-1),
+            output.exit_code,
             stderr_text.trim()
         ));
     }
