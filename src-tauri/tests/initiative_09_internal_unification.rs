@@ -137,15 +137,9 @@ fn t_active_segment_id_flows() {
     let models = load_models(prepared.fixture.models_dir()).unwrap();
     let providers = ProvidersConfig::load(&prepared.fixture.providers_path()).unwrap();
     let sessions = SessionsConfig::load(&prepared.fixture.sessions_path()).unwrap();
-    let metadata = locate_session_metadata(
-        &state,
-        &models,
-        &providers,
-        &sessions,
-        &agent_runner_lib::process::OsProcessRunner,
-        &prepared.session_id,
-    )
-    .unwrap();
+    let metadata =
+        locate_session_metadata(&state, &models, &providers, &sessions, &prepared.session_id)
+            .unwrap();
     let conn = prepared.fixture.conn();
     let active_segment_id = conn
         .query_row(

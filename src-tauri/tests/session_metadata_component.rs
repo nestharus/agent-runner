@@ -2,7 +2,6 @@
 
 mod fixtures;
 
-use agent_runner_lib::process::OsProcessRunner;
 use agent_runner_lib::session_metadata::{
     MetadataError, SessionMetadata, SessionStorageType, locate_session_metadata,
 };
@@ -17,7 +16,6 @@ fn locate(prepared: &PreparedLocate) -> Result<SessionMetadata, MetadataError> {
         &prepared.fixture.models(),
         &prepared.fixture.providers_config(),
         &prepared.fixture.sessions_config(),
-        &OsProcessRunner,
         &prepared.session_id,
     )
 }

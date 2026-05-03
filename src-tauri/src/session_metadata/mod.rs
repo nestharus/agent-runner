@@ -1,10 +1,6 @@
-use crate::config::{
-    ModelConfigRepository, ProviderConfig, ProviderConfigSource, ProvidersConfig, SessionStorage,
-    SessionsConfig, SessionsConfigSource,
-};
-use crate::process::ProcessRunner;
-use crate::sessions::locate_transcript_with_runner;
-use crate::state::{ResumeDbFacts, ResumeError, SessionChainRepository};
+use crate::config::{ProviderConfig, ProvidersConfig, SessionStorage, SessionsConfig};
+use crate::sessions::locate_transcript;
+use crate::state::{ModelStore, ResumeError, StateDb};
 use serde::Serialize;
 use serde_json::Value;
 use std::fs::File;
@@ -85,33 +81,23 @@ pub enum MetadataError {
 }
 
 pub fn locate_session_metadata(
-    chain_repo: &dyn SessionChainRepository,
-    model_repo: &dyn ModelConfigRepository,
-    provider_source: &dyn ProviderConfigSource,
-    sessions_source: &dyn SessionsConfigSource,
-    locator_runner: &dyn ProcessRunner,
+    state: &StateDb,
+    models: &ModelStore,
+    providers_cfg: &ProvidersConfig,
+    sessions_cfg: &SessionsConfig,
     input: &str,
 ) -> Result<SessionMetadata, MetadataError> {
     let parsed_input = Uuid::parse_str(input).map_err(|_| MetadataError::InvalidSessionId {
         input: input.to_string(),
     })?;
 
-    let resolved = chain_repo
-        .resolve_resume_facts(input, None)
+    let resolved = state
+        .resolve_resume(models, input, None)
         .map_err(map_resume_error)?;
-    let models = model_repo
-        .load_models()
-        .map_err(|message| MetadataError::Operational { message })?;
-    let providers_cfg = provider_source
-        .load_providers()
-        .map_err(|message| MetadataError::Operational { message })?;
-    let sessions_cfg = sessions_source
-        .load_sessions()
-        .map_err(|message| MetadataError::Operational { message })?;
-    let provider = effective_provider_for_resolved(&resolved, &models, &providers_cfg)?;
+    let provider = effective_provider_for_resolved(&resolved, providers_cfg)?;
     let provider_name = resolved.active_provider.clone();
     let storage_type = SessionStorageType::from(&provider.session_storage);
-    let active_segment_id = chain_repo
+    let active_segment_id = state
         .active_segment_id_for_chain_provider_session(
             &resolved.chain_id,
             &resolved.active_provider,
@@ -122,12 +108,8 @@ pub fn locate_session_metadata(
             input: resolved.chain_id.clone(),
         })?;
 
-    let jsonl_path = available_jsonl_path(
-        &sessions_cfg,
-        &provider_name,
-        &resolved.active_session_id,
-        locator_runner,
-    )?;
+    let jsonl_path =
+        available_jsonl_path(sessions_cfg, &provider_name, &resolved.active_session_id)?;
     let workspace_root = match &provider.session_storage {
         Some(SessionStorage::ClaudeCode { projects_dir }) => {
             derive_claude_workspace_root(projects_dir, &jsonl_path, &provider_name)?
@@ -195,16 +177,10 @@ fn map_resume_error(err: ResumeError) -> MetadataError {
 }
 
 fn effective_provider_for_resolved(
-    resolved: &ResumeDbFacts,
-    models: &std::collections::HashMap<String, crate::config::ModelConfig>,
+    resolved: &crate::state::ResolvedResume,
     providers_cfg: &ProvidersConfig,
 ) -> Result<ProviderConfig, MetadataError> {
-    if let Some(model_name) = resolved.inferred_model_name.as_ref() {
-        let model = models
-            .get(model_name)
-            .ok_or_else(|| MetadataError::Operational {
-                message: format!("unknown model {model_name}"),
-            })?;
+    if let Some(model) = resolved.model.as_ref() {
         let model_provider = model
             .providers
             .iter()
@@ -212,7 +188,7 @@ fn effective_provider_for_resolved(
             .ok_or_else(|| MetadataError::Operational {
                 message: format!(
                     "model {} does not include active provider {}",
-                    model_name, resolved.active_provider
+                    model.name, resolved.active_provider
                 ),
             })?;
         let (provider, _) =
@@ -225,7 +201,7 @@ fn effective_provider_for_resolved(
         Ok(provider)
     } else {
         let (provider, _) = providers_cfg
-            .runtime_provider_with_mode(&resolved.active_provider)
+            .runtime_provider(&resolved.active_provider)
             .map_err(|message| MetadataError::UnsupportedStorage {
                 provider_name: resolved.active_provider.clone(),
                 reason: message,
@@ -238,14 +214,13 @@ fn available_jsonl_path(
     sessions_cfg: &SessionsConfig,
     provider_name: &str,
     session_id: &str,
-    locator_runner: &dyn ProcessRunner,
 ) -> Result<PathBuf, MetadataError> {
-    let path =
-        locate_transcript_with_runner(sessions_cfg, provider_name, session_id, locator_runner)
-            .map_err(|message| MetadataError::UnsupportedStorage {
-                provider_name: provider_name.to_string(),
-                reason: format!("locator_error: {message}"),
-            })?;
+    let path = locate_transcript(sessions_cfg, provider_name, session_id).map_err(|message| {
+        MetadataError::UnsupportedStorage {
+            provider_name: provider_name.to_string(),
+            reason: format!("locator_error: {message}"),
+        }
+    })?;
     let Some(path) = path else {
         return Err(MetadataError::UnsupportedStorage {
             provider_name: provider_name.to_string(),

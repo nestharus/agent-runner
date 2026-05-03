@@ -178,7 +178,7 @@ pub enum UserResponse {
 }
 
 /// What the agent returns per turn
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct AgentTurnResult {
     pub actions: Vec<AgentAction>,
     pub done: bool,
@@ -230,77 +230,6 @@ pub enum AgentAction {
         summary: String,
         items: Vec<String>,
     },
-}
-
-impl std::fmt::Debug for AgentAction {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            AgentAction::Status { message } => {
-                f.debug_struct("Status").field("message", message).finish()
-            }
-            AgentAction::RunCommand {
-                command,
-                args,
-                description,
-            } => f
-                .debug_struct("RunCommand")
-                .field("command", command)
-                .field("args", args)
-                .field("description", description)
-                .finish(),
-            AgentAction::WriteConfig {
-                path, description, ..
-            } => f
-                .debug_struct("WriteConfig")
-                .field("path", path)
-                .field("description", description)
-                .finish(),
-            AgentAction::TestIntegration {
-                model_name,
-                command,
-                args,
-            } => f
-                .debug_struct("TestIntegration")
-                .field("model_name", model_name)
-                .field("command", command)
-                .field("args", args)
-                .finish(),
-            AgentAction::AskUser { .. } => f.write_str("AskUser { .. }"),
-            AgentAction::SyncSkill {
-                source_cli,
-                target_cli,
-                skill_name,
-            } => f
-                .debug_struct("SyncSkill")
-                .field("source_cli", source_cli)
-                .field("target_cli", target_cli)
-                .field("skill_name", skill_name)
-                .finish(),
-            AgentAction::SyncMcp {
-                source_cli,
-                target_cli,
-                mcp_name,
-                ..
-            } => f
-                .debug_struct("SyncMcp")
-                .field("source_cli", source_cli)
-                .field("target_cli", target_cli)
-                .field("mcp_name", mcp_name)
-                .finish(),
-            AgentAction::UpdateMemory {
-                node_type, label, ..
-            } => f
-                .debug_struct("UpdateMemory")
-                .field("node_type", node_type)
-                .field("label", label)
-                .finish(),
-            AgentAction::Complete { summary, items } => f
-                .debug_struct("Complete")
-                .field("summary", summary)
-                .field("items", items)
-                .finish(),
-        }
-    }
 }
 
 #[derive(Deserialize)]

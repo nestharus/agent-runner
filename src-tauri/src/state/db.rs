@@ -1,5 +1,5 @@
-use super::repository::{ResumeDbFacts, TransitionReason};
-use crate::config::ModelConfig;
+use crate::balancer::TransitionReason;
+use crate::config::{ModelConfig, load_models};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -45,7 +45,6 @@ const MIN_LEARN_SAMPLE_CALLS: u64 = 20;
 /// "the sample is at the rail." Matching ceiling from score_by_density.
 const NEAR_EXHAUSTED_USED_PERCENT: f64 = 0.99;
 
-#[derive(Debug)]
 pub struct StateDb {
     conn: Connection,
 }
@@ -379,7 +378,7 @@ impl CompositeInvocationId {
 // --- Model discovery entities ---
 
 /// The type of a model parameter, stored as JSON in SQLite.
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ParamType {
     /// A parameter that accepts one of a fixed set of values.
@@ -390,41 +389,6 @@ pub enum ParamType {
     Number { min: Option<f64>, max: Option<f64> },
     /// A boolean flag parameter.
     Boolean,
-}
-
-impl<'de> Deserialize<'de> for ParamType {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = serde_json::Value::deserialize(deserializer)?;
-        if let Some(kind) = value.as_str() {
-            return match kind {
-                "string" => Ok(ParamType::String),
-                "boolean" => Ok(ParamType::Boolean),
-                other => Err(serde::de::Error::custom(format!(
-                    "unsupported parameter type {other}"
-                ))),
-            };
-        }
-
-        #[derive(Deserialize)]
-        #[serde(tag = "kind", rename_all = "snake_case")]
-        enum TaggedParamType {
-            Enum { options: Vec<String> },
-            String,
-            Number { min: Option<f64>, max: Option<f64> },
-            Boolean,
-        }
-
-        let tagged = TaggedParamType::deserialize(value).map_err(serde::de::Error::custom)?;
-        Ok(match tagged {
-            TaggedParamType::Enum { options } => ParamType::Enum { options },
-            TaggedParamType::String => ParamType::String,
-            TaggedParamType::Number { min, max } => ParamType::Number { min, max },
-            TaggedParamType::Boolean => ParamType::Boolean,
-        })
-    }
 }
 
 /// How a parameter maps to CLI flags when invoking the model.
@@ -446,40 +410,13 @@ pub struct DiscoveredModel {
 }
 
 /// A parameter for a discovered model.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelParameter {
     pub name: String,
     pub display_name: String,
     pub param_type: ParamType,
     pub description: String,
     pub cli_mapping: CliMapping,
-}
-
-impl<'de> Deserialize<'de> for ModelParameter {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct RawModelParameter {
-            name: String,
-            #[serde(default)]
-            display_name: Option<String>,
-            param_type: ParamType,
-            #[serde(default)]
-            description: String,
-            cli_mapping: CliMapping,
-        }
-
-        let raw = RawModelParameter::deserialize(deserializer)?;
-        Ok(ModelParameter {
-            display_name: raw.display_name.unwrap_or_else(|| raw.name.clone()),
-            name: raw.name,
-            param_type: raw.param_type,
-            description: raw.description,
-            cli_mapping: raw.cli_mapping,
-        })
-    }
 }
 
 // --- Provider & Account entities (provider-accounts redesign) ---
@@ -573,13 +510,11 @@ impl StateDb {
         let mut conn =
             Connection::open(path).map_err(|e| format!("Failed to open state DB: {e}"))?;
 
-        Self::validate_providers_schema(&conn)?;
         conn.execute_batch("PRAGMA journal_mode=WAL;")
             .map_err(|e| format!("Failed to set WAL mode: {e}; run `agents migrate-db` first"))?;
+        Self::validate_providers_schema(&conn)?;
         Self::ensure_invocations_schema(&conn)?;
         Self::ensure_providers_schema(&mut conn)?;
-
-        let quota_windows_existed = Self::table_exists(&conn, "provider_quota_windows")?;
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS provider_quotas (
@@ -601,6 +536,13 @@ impl StateDb {
                 last_delta_calls INTEGER,
                 PRIMARY KEY (provider_name, window_id)
             );
+
+            -- Migrate pre-multi-window rows: any provider_quotas row with a
+            -- resets_at that doesn't yet have a window becomes window 0.
+            INSERT OR IGNORE INTO provider_quota_windows (provider_name, window_id, used_percent, resets_at)
+            SELECT provider_name, 0, used_percent, resets_at
+            FROM provider_quotas
+            WHERE resets_at IS NOT NULL;
 
             CREATE TABLE IF NOT EXISTS memory_nodes (
                 id TEXT PRIMARY KEY,
@@ -721,9 +663,6 @@ impl StateDb {
             ",
         )
         .map_err(|e| format!("Failed to initialize schema: {e}"))?;
-        if !quota_windows_existed {
-            Self::migrate_legacy_quota_windows(&conn)?;
-        }
         Self::ensure_provider_quotas_schema(&conn)?;
         Self::ensure_provider_quota_windows_schema(&conn)?;
         Self::ensure_session_turns_schema(&conn)?;
@@ -978,32 +917,6 @@ impl StateDb {
         )
         .optional()
         .map_err(|e| format!("Failed to inspect providers object type: {e}"))
-    }
-
-    fn table_exists(conn: &Connection, table_name: &str) -> Result<bool, String> {
-        let exists: i64 = conn
-            .query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1
-                )",
-                params![table_name],
-                |row| row.get(0),
-            )
-            .map_err(|e| format!("Failed to inspect table {table_name}: {e}"))?;
-        Ok(exists != 0)
-    }
-
-    fn migrate_legacy_quota_windows(conn: &Connection) -> Result<(), String> {
-        conn.execute(
-            "INSERT OR IGNORE INTO provider_quota_windows
-                (provider_name, window_id, used_percent, resets_at)
-             SELECT provider_name, 0, used_percent, resets_at
-             FROM provider_quotas
-             WHERE resets_at IS NOT NULL",
-            [],
-        )
-        .map_err(|e| format!("Failed to migrate legacy quota windows: {e}"))?;
-        Ok(())
     }
 
     fn providers_has_foreign_keys(conn: &Connection) -> Result<bool, String> {
@@ -1431,82 +1344,23 @@ impl StateDb {
     /// is observable via the legacy status, not silent).
     fn provider_name_lookup() -> Result<std::collections::HashMap<(String, usize), String>, String>
     {
-        let mut lookup = std::collections::HashMap::new();
-        let Some(models_dir) =
-            dirs::config_dir().map(|dir| dir.join("oulipoly-agent-runner").join("models"))
-        else {
-            return Ok(lookup);
-        };
-        if !models_dir.is_dir() {
-            return Ok(lookup);
-        }
-
-        #[derive(Deserialize)]
-        struct RawProvider {
-            name: Option<String>,
-        }
-
-        #[derive(Deserialize)]
-        struct RawModel {
-            providers: Option<Vec<RawProvider>>,
-        }
-
-        let entries = match std::fs::read_dir(&models_dir) {
-            Ok(entries) => entries,
+        let models_dir = dirs::config_dir()
+            .map(|dir| dir.join("oulipoly-agent-runner").join("models"))
+            .unwrap_or_else(|| std::path::PathBuf::from("models"));
+        let models = match load_models(&models_dir) {
+            Ok(m) => m,
             Err(e) => {
                 eprintln!(
-                    "Warning: failed to read models directory during invocation migration ({e}); \
-                     pre-existing invocation rows may migrate as status='legacy'."
+                    "Warning: failed to load models config during invocation migration ({e}); \
+                     pre-existing invocation rows will migrate as status='legacy'."
                 );
-                return Ok(lookup);
+                return Ok(std::collections::HashMap::new());
             }
         };
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(e) => {
-                    eprintln!(
-                        "Warning: failed to read model directory entry during invocation migration ({e}); \
-                         some pre-existing invocation rows may migrate as status='legacy'."
-                    );
-                    continue;
-                }
-            };
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
-                continue;
-            }
-            let Some(model_name) = path.file_stem().and_then(|stem| stem.to_str()) else {
-                continue;
-            };
-            let content = match std::fs::read_to_string(&path) {
-                Ok(content) => content,
-                Err(e) => {
-                    eprintln!(
-                        "Warning: failed to read models config during invocation migration ({e}); \
-                         pre-existing invocation rows from {} may migrate as status='legacy'.",
-                        path.display()
-                    );
-                    continue;
-                }
-            };
-            let raw: RawModel = match toml::from_str(&content) {
-                Ok(raw) => raw,
-                Err(e) => {
-                    eprintln!(
-                        "Warning: failed to parse models config during invocation migration ({e}); \
-                         pre-existing invocation rows from {} may migrate as status='legacy'.",
-                        path.display()
-                    );
-                    continue;
-                }
-            };
-            for (provider_index, provider) in
-                raw.providers.unwrap_or_default().into_iter().enumerate()
-            {
-                if let Some(provider_name) = provider.name {
-                    lookup.insert((model_name.to_string(), provider_index), provider_name);
-                }
+        let mut lookup = std::collections::HashMap::new();
+        for (model_name, model) in models {
+            for (provider_index, provider) in model.providers.iter().enumerate() {
+                lookup.insert((model_name.clone(), provider_index), provider.name.clone());
             }
         }
         Ok(lookup)
@@ -1623,11 +1477,8 @@ impl StateDb {
             .map_err(|e| format!("Failed to upsert provider: {e}"))?;
 
             if !success {
-                let snippet = stderr_snippet
-                    .unwrap_or("")
-                    .chars()
-                    .take(500)
-                    .collect::<String>();
+                let snippet =
+                    stderr_snippet.map(|value| value.chars().take(500).collect::<String>());
                 tx.execute(
                     "UPDATE providers SET last_error = ?1, last_error_at = ?2
                      WHERE model_name = ?3 AND provider_name = ?4",
@@ -1911,7 +1762,7 @@ impl StateDb {
         model_name: &str,
         provider_name: &str,
         window_minutes: i64,
-    ) -> Result<u64, String> {
+    ) -> Result<i64, String> {
         let cutoff = (Utc::now() - chrono::Duration::minutes(window_minutes)).to_rfc3339();
 
         let count: i64 = self
@@ -1919,14 +1770,13 @@ impl StateDb {
             .query_row(
                 "SELECT COUNT(*) FROM invocations
                  WHERE model_name = ?1 AND provider_name = ?2
-                   AND success = 0
-                   AND created_at > ?3",
+                   AND success = 0 AND created_at > ?3",
                 params![model_name, provider_name, &cutoff],
                 |row| row.get(0),
             )
             .map_err(|e| format!("Failed to count recent errors: {e}"))?;
 
-        u64::try_from(count).map_err(|_| format!("Recent error count was negative: {count}"))
+        Ok(count)
     }
 
     // --- Provider quota operations ---
@@ -3151,64 +3001,6 @@ impl StateDb {
         })
     }
 
-    pub fn resolve_resume_facts(
-        &self,
-        input: &str,
-        model_override: Option<&str>,
-    ) -> Result<ResumeDbFacts, ResumeError> {
-        Uuid::try_parse(input).map_err(|_| ResumeError::InvalidUuid {
-            input: input.to_string(),
-        })?;
-
-        let chain_ids = self
-            .candidate_chain_ids(input)
-            .map_err(|message| ResumeError::Db { message })?;
-        if chain_ids.is_empty() {
-            return Err(ResumeError::NoChainFound {
-                input: input.to_string(),
-            });
-        }
-        let chain_id = self
-            .choose_resume_chain(input, chain_ids)
-            .map_err(|message| ResumeError::Db { message })?;
-
-        let Some(chain_id) = chain_id else {
-            let previews = self
-                .chain_previews(input)
-                .map_err(|message| ResumeError::Db { message })?;
-            return Err(ResumeError::Ambiguous {
-                input: input.to_string(),
-                previews,
-            });
-        };
-
-        let (active_provider, active_session_id) = self
-            .active_segment_for_chain(&chain_id)
-            .map_err(|message| ResumeError::Db { message })?
-            .ok_or_else(|| ResumeError::ActiveSegmentMissing {
-                chain_id: chain_id.clone(),
-            })?;
-
-        let inferred_model_name = if let Some(model_override) = model_override {
-            Some(model_override.to_string())
-        } else {
-            self.latest_invocation_model_for_chain(&chain_id)
-                .map_err(|message| ResumeError::Db { message })?
-                .filter(|name| name != "<unknown>")
-                .or(self
-                    .chain_model_name(&chain_id)
-                    .map_err(|message| ResumeError::Db { message })?
-                    .filter(|name| name != "<unknown>"))
-        };
-
-        Ok(ResumeDbFacts {
-            chain_id,
-            inferred_model_name,
-            active_provider,
-            active_session_id,
-        })
-    }
-
     pub fn resume_previews(&self, input: &str) -> Result<Vec<ChainPreview>, DbError> {
         Uuid::try_parse(input).map_err(|e| format!("Invalid UUID {input}: {e}"))?;
         self.chain_previews(input)
@@ -3239,8 +3031,7 @@ impl StateDb {
             .prepare(
                 "SELECT DISTINCT chain_id
                  FROM session_chain_segments
-                 WHERE session_id = ?1
-                    OR chain_id = ?1
+                 WHERE session_id = ?1 OR chain_id = ?1
                  ORDER BY chain_id",
             )
             .map_err(|e| format!("Failed to prepare resume chain lookup: {e}"))?;
@@ -3481,8 +3272,17 @@ impl StateDb {
         provider_name: &str,
         since: Option<&DateTime<Utc>>,
     ) -> Result<u64, String> {
-        let Some(since) = since else {
-            let count: i64 = self
+        let count: i64 = match since {
+            Some(ts) => self
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM session_turns
+                     WHERE provider_name = ?1 AND role = 'assistant' AND timestamp > ?2",
+                    params![provider_name, ts.to_rfc3339()],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("Failed to count session turns: {e}"))?,
+            None => self
                 .conn
                 .query_row(
                     "SELECT COUNT(*) FROM session_turns
@@ -3490,22 +3290,8 @@ impl StateDb {
                     params![provider_name],
                     |row| row.get(0),
                 )
-                .map_err(|e| format!("Failed to count session turns: {e}"))?;
-            return Ok(count.max(0) as u64);
+                .map_err(|e| format!("Failed to count session turns: {e}"))?,
         };
-
-        let since_rfc3339 = since.to_rfc3339();
-        let count: i64 = self
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM session_turns
-                 WHERE provider_name = ?1
-                   AND role = 'assistant'
-                   AND timestamp > ?2",
-                params![provider_name, since_rfc3339],
-                |row| row.get(0),
-            )
-            .map_err(|e| format!("Failed to count session turns: {e}"))?;
         Ok(count.max(0) as u64)
     }
 
@@ -4906,8 +4692,8 @@ name = "fixture-provider"
         ]);
         let path = dir.path().join("state.db");
 
-        // Plant a corrupt models/ directory at XDG_CONFIG_HOME so migration
-        // cannot derive provider names.
+        // Plant a corrupt models/ directory at XDG_CONFIG_HOME so the
+        // load_models() call inside migration fails.
         let config_root = dir.path().join("oulipoly-agent-runner");
         let models_dir = config_root.join("models");
         std::fs::create_dir_all(&models_dir).unwrap();
@@ -6687,7 +6473,7 @@ interactive_args = ["launch"]
                 "claude",
                 SESSION_A,
                 &ts("2026-04-17T08:00:00Z"),
-                crate::state::TransitionReason::Initial,
+                crate::balancer::TransitionReason::Initial,
             )
             .unwrap();
         let second_id = db
@@ -6696,7 +6482,7 @@ interactive_args = ["launch"]
                 "claude",
                 SESSION_A,
                 &ts("2026-04-17T08:01:00Z"),
-                crate::state::TransitionReason::Initial,
+                crate::balancer::TransitionReason::Initial,
             )
             .unwrap();
 
@@ -7014,7 +6800,7 @@ interactive_args = ["launch"]
                 "claude",
                 SESSION_A,
                 &ts("2026-04-17T08:00:00Z"),
-                crate::state::TransitionReason::Initial,
+                crate::balancer::TransitionReason::Initial,
             )
             .unwrap_err();
         assert!(

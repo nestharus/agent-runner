@@ -1,9 +1,10 @@
-use crate::config::ModelConfig;
+use crate::config::{ModelConfig, ProvidersConfig, SessionsConfig};
 use crate::migration::MigrationError;
-use crate::state::{QuotaRecord, QuotaWindow, ResolvedResume, RoutingRepository};
+use crate::quota::{InFlight, RefreshOutcome, is_stale, refresh_provider};
+use crate::sessions::scan_provider;
+use crate::state::{QuotaRecord, QuotaWindow, ResolvedResume, StateDb};
 use chrono::Utc;
-
-pub use crate::state::TransitionReason;
+use serde::{Deserialize, Serialize};
 
 const ERROR_WINDOW_MINUTES: i64 = 30;
 const ERROR_THRESHOLD: u64 = 3;
@@ -50,15 +51,44 @@ pub enum MigrationDecision {
     },
 }
 
-pub trait BalanceEffects {
-    fn refresh_quota_if_stale(&self, provider_name: &str);
-    fn scan_provider_sessions(&self, provider_name: &str);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransitionReason {
+    Initial,
+    Manual,
+    QuotaThreshold,
+    Exhausted,
+    Imported,
+}
+
+impl TransitionReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TransitionReason::Initial => "initial",
+            TransitionReason::Manual => "manual",
+            TransitionReason::QuotaThreshold => "quota_threshold",
+            TransitionReason::Exhausted => "exhausted",
+            TransitionReason::Imported => "imported",
+        }
+    }
+}
+
+/// Contextual dependencies for quota-aware balancing. When present,
+/// `select_provider` will trigger a synchronous refresh for any provider
+/// whose cached quota is stale (older than `REFRESH_TTL_HOURS`) AND scan
+/// each provider's CLI session logs for new turns. Pass `None` to use
+/// cached-only scoring (e.g. from inside an async handler where blocking
+/// on a network call isn't desirable).
+pub struct BalanceContext<'a> {
+    pub providers_cfg: &'a ProvidersConfig,
+    pub sessions_cfg: &'a SessionsConfig,
+    pub in_flight: &'a InFlight,
 }
 
 pub fn select_provider(
     model: &ModelConfig,
-    routing_repo: &dyn RoutingRepository,
-    effects: Option<&dyn BalanceEffects>,
+    state: &StateDb,
+    ctx: Option<&BalanceContext<'_>>,
 ) -> usize {
     let n = model.providers.len();
     if n <= 1 {
@@ -69,10 +99,17 @@ pub fn select_provider(
     //    Only worthwhile when we're actually load-balancing (n > 1).
     //    Also scan CLI session logs so calls_since_refresh reflects ALL
     //    activity (agent-runner invocations + direct user UI prompts).
-    if let Some(effects) = effects {
+    if let Some(ctx) = ctx {
         for p in &model.providers {
-            effects.refresh_quota_if_stale(&p.name);
-            effects.scan_provider_sessions(&p.name);
+            if is_stale(state, &p.name) {
+                // Swallow the result — a failed refresh just leaves stale
+                // (or missing) data, which the fallback logic below handles.
+                let _: RefreshOutcome =
+                    refresh_provider(&p.name, ctx.providers_cfg, ctx.in_flight, state);
+            }
+            // Session scan errors don't abort the pick — we just project with
+            // a stale turn count instead of an up-to-date one.
+            let _ = scan_provider(&p.name, ctx.sessions_cfg, state);
         }
     }
 
@@ -80,12 +117,12 @@ pub fn select_provider(
     let quotas: Vec<Option<QuotaRecord>> = model
         .providers
         .iter()
-        .map(|p| routing_repo.get_quota(&p.name).ok().flatten())
+        .map(|p| state.get_quota(&p.name).ok().flatten())
         .collect();
     let windows: Vec<Vec<QuotaWindow>> = model
         .providers
         .iter()
-        .map(|p| routing_repo.get_windows(&p.name).unwrap_or_default())
+        .map(|p| state.get_windows(&p.name).unwrap_or_default())
         .collect();
     let all_indices: Vec<usize> = (0..n).collect();
     let filtered_indices: Vec<usize> = all_indices
@@ -123,28 +160,22 @@ pub fn select_provider(
     // 3) If every provider has at least one window, use density scoring.
     let all_have_windows = candidates.iter().all(|i| !windows[*i].is_empty());
     if all_have_windows {
-        return score_by_density(model, routing_repo, &quotas, &windows, candidates);
+        return score_by_density(model, state, &quotas, &windows, candidates);
     }
 
     // 4) Otherwise, fall back to lifetime invocation-count scoring.
-    score_by_invocation_count(model, routing_repo, candidates)
+    score_by_invocation_count(model, state, candidates)
 }
 
 fn score_by_density(
     model: &ModelConfig,
-    routing_repo: &dyn RoutingRepository,
+    state: &StateDb,
     quotas: &[Option<QuotaRecord>],
     windows: &[Vec<QuotaWindow>],
     candidates: &[usize],
 ) -> usize {
-    let projections = compute_projections_from_records(
-        model,
-        routing_repo,
-        quotas,
-        windows,
-        candidates,
-        Utc::now(),
-    );
+    let projections =
+        compute_projections_from_records(model, state, quotas, windows, candidates, Utc::now());
     let evals = projections
         .iter()
         .map(|projection| ProviderEval {
@@ -161,7 +192,7 @@ fn score_by_density(
         .collect();
 
     if eligible.is_empty() {
-        return round_robin_fallback(model, routing_repo, candidates);
+        return round_robin_fallback(model, state, candidates);
     }
 
     best_binding_score(&eligible).index
@@ -169,40 +200,36 @@ fn score_by_density(
 
 pub fn compute_projections(
     model: &ModelConfig,
-    routing_repo: &dyn RoutingRepository,
-    effects: Option<&dyn BalanceEffects>,
+    state: &StateDb,
+    ctx: Option<&BalanceContext<'_>>,
 ) -> Vec<ProviderProjection> {
-    if let Some(effects) = effects {
+    if let Some(ctx) = ctx {
         for p in &model.providers {
-            effects.refresh_quota_if_stale(&p.name);
-            effects.scan_provider_sessions(&p.name);
+            if is_stale(state, &p.name) {
+                let _: RefreshOutcome =
+                    refresh_provider(&p.name, ctx.providers_cfg, ctx.in_flight, state);
+            }
+            let _ = scan_provider(&p.name, ctx.sessions_cfg, state);
         }
     }
 
     let quotas: Vec<Option<QuotaRecord>> = model
         .providers
         .iter()
-        .map(|p| routing_repo.get_quota(&p.name).ok().flatten())
+        .map(|p| state.get_quota(&p.name).ok().flatten())
         .collect();
     let windows: Vec<Vec<QuotaWindow>> = model
         .providers
         .iter()
-        .map(|p| routing_repo.get_windows(&p.name).unwrap_or_default())
+        .map(|p| state.get_windows(&p.name).unwrap_or_default())
         .collect();
     let candidates: Vec<usize> = (0..model.providers.len()).collect();
-    compute_projections_from_records(
-        model,
-        routing_repo,
-        &quotas,
-        &windows,
-        &candidates,
-        Utc::now(),
-    )
+    compute_projections_from_records(model, state, &quotas, &windows, &candidates, Utc::now())
 }
 
 fn compute_projections_from_records(
     model: &ModelConfig,
-    routing_repo: &dyn RoutingRepository,
+    state: &StateDb,
     quotas: &[Option<QuotaRecord>],
     windows: &[Vec<QuotaWindow>],
     candidates: &[usize],
@@ -230,10 +257,10 @@ fn compute_projections_from_records(
         .copied()
         .map(|i| {
             let ws = &windows[i];
-            let recent_errors = routing_repo
+            let recent_errors = state
                 .recent_error_count(&model.name, &model.providers[i].name, ERROR_WINDOW_MINUTES)
                 .unwrap_or(0);
-            if recent_errors >= ERROR_THRESHOLD {
+            if recent_errors >= ERROR_THRESHOLD as i64 {
                 return ProviderProjection {
                     provider_index: i,
                     projections_per_window: Vec::new(),
@@ -245,7 +272,7 @@ fn compute_projections_from_records(
             let q = quotas[i].as_ref();
             let turns = q
                 .and_then(|q| {
-                    routing_repo
+                    state
                         .count_assistant_turns_since(
                             &model.providers[i].name,
                             q.refreshed_at.as_ref(),
@@ -306,7 +333,7 @@ fn compute_projections_from_records(
 }
 
 pub fn decide_migration(
-    routing_repo: &dyn RoutingRepository,
+    state: &StateDb,
     model: &ModelConfig,
     resolved: &ResolvedResume,
     manual_target: Option<&str>,
@@ -325,10 +352,7 @@ pub fn decide_migration(
                 });
             }
         }
-        return Err(MigrationError::ProviderNotInModelPool {
-            provider: target.to_string(),
-            model_name: model.name.clone(),
-        });
+        return Ok(MigrationDecision::Stay);
     }
 
     let Some(active_provider_index) = model
@@ -340,12 +364,12 @@ pub fn decide_migration(
     };
 
     let active = &model.providers[active_provider_index];
-    let active_exhausted = routing_repo
+    let active_exhausted = state
         .get_quota(&active.name)
         .map_err(|message| MigrationError::Db { message })?
         .and_then(|quota| quota.exhausted_at)
         .is_some();
-    let projections = compute_projections(model, routing_repo, None);
+    let projections = compute_projections(model, state, None);
 
     if active_exhausted {
         if let Some(target) =
@@ -529,7 +553,7 @@ pub(crate) fn project_used_percent_for_test(
 #[cfg(test)]
 pub(crate) fn bootstrap_burn_rate_for_test(
     model: &ModelConfig,
-    state: &dyn RoutingRepository,
+    state: &StateDb,
     provider_index: usize,
     window_id: u32,
 ) -> Option<f64> {
@@ -559,24 +583,20 @@ pub(crate) fn bootstrap_duration_ratio_for_test(
     duration_ratio_rate(long_rate, long_hours, target_hours)
 }
 
-fn score_by_invocation_count(
-    model: &ModelConfig,
-    routing_repo: &dyn RoutingRepository,
-    candidates: &[usize],
-) -> usize {
+fn score_by_invocation_count(model: &ModelConfig, state: &StateDb, candidates: &[usize]) -> usize {
     let mut scores: Vec<(usize, f64)> = Vec::with_capacity(candidates.len());
 
     for &i in candidates {
-        let recent_errors = routing_repo
+        let recent_errors = state
             .recent_error_count(&model.name, &model.providers[i].name, ERROR_WINDOW_MINUTES)
             .unwrap_or(0);
 
-        if recent_errors >= ERROR_THRESHOLD {
+        if recent_errors >= ERROR_THRESHOLD as i64 {
             scores.push((i, f64::MAX));
             continue;
         }
 
-        let invocation_count = routing_repo
+        let invocation_count = state
             .get_provider(&model.name, &model.providers[i].name)
             .ok()
             .flatten()
@@ -590,16 +610,12 @@ fn score_by_invocation_count(
     scores.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
 
     if scores.iter().all(|(_, s)| *s == f64::MAX) {
-        return round_robin_fallback(model, routing_repo, candidates);
+        return round_robin_fallback(model, state, candidates);
     }
     scores[0].0
 }
 
-fn round_robin_fallback(
-    model: &ModelConfig,
-    routing_repo: &dyn RoutingRepository,
-    candidates: &[usize],
-) -> usize {
+fn round_robin_fallback(model: &ModelConfig, state: &StateDb, candidates: &[usize]) -> usize {
     debug_assert!(
         !candidates.is_empty(),
         "round_robin_fallback: caller must pass a non-empty candidates slice"
@@ -608,7 +624,7 @@ fn round_robin_fallback(
     let mut best = candidates.first().copied().unwrap_or(0);
 
     for &i in candidates {
-        let count = routing_repo
+        let count = state
             .get_provider(&model.name, &model.providers[i].name)
             .ok()
             .flatten()
@@ -627,7 +643,6 @@ fn round_robin_fallback(
 mod tests {
     use super::*;
     use crate::config::{ProviderConfig, model::PromptMode};
-    use crate::state::StateDb;
     use std::path::{Path, PathBuf};
     use uuid::Uuid;
 

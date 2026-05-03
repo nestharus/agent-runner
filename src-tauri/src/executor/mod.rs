@@ -4,7 +4,6 @@ use crate::config::ModelConfig;
 use std::collections::HashMap;
 use std::path::Path;
 
-#[derive(Debug)]
 #[allow(dead_code)]
 pub struct ExecutionResult {
     pub stdout: Vec<u8>,

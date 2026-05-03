@@ -4,9 +4,7 @@ pub mod diagnostics;
 pub mod discovery;
 pub mod executor;
 pub mod migration;
-pub mod process;
 pub mod quota;
-pub mod runtime;
 pub mod schema_probe;
 pub mod session_export;
 pub mod session_lock;
@@ -17,18 +15,12 @@ pub mod setup;
 pub mod state;
 pub mod trace;
 
-use config::{
-    FilesystemModelConfigRepository, FilesystemProviderConfigSource, ModelConfig,
-    ModelConfigRepository, ProviderConfigSource,
-};
+use config::ModelConfig;
 use serde::{Deserialize, Serialize};
 use setup::actions::{SetupEvent, UserResponse};
 #[allow(unused_imports)]
 use state::StateDb;
-use state::{
-    AccountRecord, AuthMethod, AuthStatus, CliProviderRecord, CliProviderRepository,
-    DefaultStateDbOpener, DiscoveryRepository, QuotaRepository, StateDbOpener,
-};
+use state::{AccountRecord, AuthMethod, AuthStatus, CliProviderRecord};
 use state::{DiscoveredModel, ModelParameter};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -92,70 +84,16 @@ pub struct AppState {
     pub quota_in_flight: quota::InFlight,
 }
 
-pub fn configure_tauri_app<R: tauri::Runtime>(
-    builder: tauri::Builder<R>,
-    state: AppState,
-) -> tauri::Builder<R> {
-    builder
-        .manage(state)
-        .invoke_handler(tauri::generate_handler![
-            check_setup_needed,
-            start_setup,
-            start_cli_setup,
-            reload_models,
-            setup_respond,
-            cancel_setup,
-            detect_clis,
-            get_memory_graph,
-            list_models,
-            get_model,
-            save_model,
-            delete_model,
-            list_pools,
-            refresh_quotas,
-            update_pool,
-            test_model,
-            list_cli_providers,
-            get_cli_provider,
-            list_accounts,
-            add_account,
-            remove_account,
-            sync_provider,
-            discover_models_cmd,
-            list_discovered_models,
-            get_model_parameters,
-        ])
-}
-
 #[tauri::command]
 fn check_setup_needed(state: tauri::State<AppState>) -> Result<bool, String> {
-    let runner = process::OsProcessRunner;
-    check_setup_needed_with_runner(&state, &runner)
-}
-
-fn check_setup_needed_with_runner(
-    state: &AppState,
-    runner: &dyn process::ProcessRunner,
-) -> Result<bool, String> {
     let models = state.models.lock().map_err(|e| e.to_string())?;
     if models.is_empty() {
         return Ok(true);
     }
-
-    // Check if claude CLI is available.
-    let output = runner.run(process::CommandSpec {
-        program: "which".to_string(),
-        args: vec!["claude".to_string()],
-        cwd: None,
-        env: Default::default(),
-        stdin: process::StdinSpec::Null,
-        stdout: process::OutputSpec::Capture,
-        stderr: process::OutputSpec::Capture,
-        timeout: None,
-        description: "check claude setup".to_string(),
-    });
+    // Check if claude CLI is available
+    let output = std::process::Command::new("which").arg("claude").output();
     match output {
-        Ok(o) if o.exit_code == 0 => Ok(false),
+        Ok(o) if o.status.success() => Ok(false),
         _ => Ok(true),
     }
 }
@@ -260,10 +198,7 @@ async fn start_cli_setup(
 
 #[tauri::command]
 fn reload_models(state: tauri::State<AppState>) -> Result<(), String> {
-    let model_repo = FilesystemModelConfigRepository::new(state.models_dir.clone());
-    let fresh = model_repo
-        .load_models()
-        .map_err(|e| format!("Failed to reload models: {e}"))?;
+    let fresh = config::load_models(&state.models_dir).unwrap_or_default();
     let mut models = state.models.lock().map_err(|e| e.to_string())?;
     *models = fresh;
     Ok(())
@@ -324,8 +259,12 @@ fn save_model(state: tauri::State<AppState>, model: ModelConfig) -> Result<(), S
             return Err(format!("Provider {} has empty name", i + 1));
         }
     }
-    let model_repo = FilesystemModelConfigRepository::new(state.models_dir.clone());
-    model_repo.save_model(&model)?;
+    let toml_content = model.to_toml();
+    let path = state.models_dir.join(format!("{}.toml", model.name));
+
+    std::fs::create_dir_all(&state.models_dir)
+        .map_err(|e| format!("Failed to create models directory: {e}"))?;
+    std::fs::write(&path, &toml_content).map_err(|e| format!("Failed to write model file: {e}"))?;
 
     let mut models = state.models.lock().map_err(|e| e.to_string())?;
     models.insert(model.name.clone(), model);
@@ -334,8 +273,10 @@ fn save_model(state: tauri::State<AppState>, model: ModelConfig) -> Result<(), S
 
 #[tauri::command]
 fn delete_model(state: tauri::State<AppState>, name: String) -> Result<(), String> {
-    let model_repo = FilesystemModelConfigRepository::new(state.models_dir.clone());
-    model_repo.delete_model(&name)?;
+    let path = state.models_dir.join(format!("{}.toml", name));
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(|e| format!("Failed to delete model file: {e}"))?;
+    }
     let mut models = state.models.lock().map_err(|e| e.to_string())?;
     models.remove(&name);
     Ok(())
@@ -388,10 +329,7 @@ async fn refresh_quotas(
         .parent()
         .unwrap_or(&state.models_dir)
         .join("providers.toml");
-    let provider_source = FilesystemProviderConfigSource::new(providers_path);
-    let providers_cfg = provider_source
-        .load_providers()
-        .map_err(|e| format!("Failed to load providers.toml: {e}"))?;
+    let providers_cfg = config::ProvidersConfig::load(&providers_path).unwrap_or_default();
 
     let db_path = state
         .models_dir
@@ -399,12 +337,8 @@ async fn refresh_quotas(
         .unwrap_or(&state.models_dir)
         .join("state.db");
 
-    let opener = DefaultStateDbOpener;
-    let db = opener
-        .open(&db_path)
-        .map_err(|e| format!("Failed to open state DB: {e}"))?;
+    let db = state::StateDb::open(&db_path).map_err(|e| format!("Failed to open state DB: {e}"))?;
     let in_flight = &state.quota_in_flight;
-    let runner = process::OsProcessRunner;
     let mut results = Vec::with_capacity(candidates.len());
 
     for provider_name in candidates {
@@ -418,8 +352,7 @@ async fn refresh_quotas(
             continue;
         }
 
-        let outcome =
-            quota::refresh_provider(&provider_name, &providers_cfg, in_flight, &db, &runner);
+        let outcome = quota::refresh_provider(&provider_name, &providers_cfg, in_flight, &db);
         results.push(match outcome {
             quota::RefreshOutcome::Updated { windows } => QuotaRefreshEntry {
                 provider_name,
@@ -503,7 +436,6 @@ fn update_pool(
         .filter(|c| !orig_sorted.contains(c))
         .collect();
 
-    let model_repo = FilesystemModelConfigRepository::new(state.models_dir.clone());
     for name in &matching_names {
         let model = models.get_mut(name).unwrap();
 
@@ -522,8 +454,10 @@ fn update_pool(
             return Err(format!("Model '{}' would end up with zero providers", name));
         }
 
-        model_repo
-            .save_model(model)
+        // Write updated toml
+        let toml_content = model.to_toml();
+        let path = state.models_dir.join(format!("{}.toml", name));
+        std::fs::write(&path, &toml_content)
             .map_err(|e| format!("Failed to write model file for '{}': {e}", name))?;
     }
 
@@ -563,13 +497,11 @@ fn test_model_with_db_path(
     db_path: PathBuf,
     prompt: &str,
 ) -> Result<TestModelResult, String> {
-    let opener = DefaultStateDbOpener;
-    let db = opener.open(&db_path).map_err(|e| e.to_string())?;
+    let db = state::StateDb::open(&db_path).map_err(|e| e.to_string())?;
     let provider_index = balancer::select_provider(&model, &db, None);
     let result = executor::execute(&model, provider_index, prompt, None)?;
     if result.exit_code != 0 && diagnostics::classify_exhaustion(&result.stderr) {
-        let repo: &dyn QuotaRepository = &db;
-        repo.mark_exhausted(&model.providers[provider_index].name)?;
+        db.mark_exhausted(&model.providers[provider_index].name)?;
     }
     Ok(TestModelResult {
         success: result.exit_code == 0,
@@ -602,15 +534,13 @@ fn open_state_db(state: &AppState) -> Result<StateDb, String> {
         .parent()
         .unwrap_or(&state.models_dir)
         .join("state.db");
-    let opener = DefaultStateDbOpener;
-    opener.open(&db_path)
+    StateDb::open(&db_path)
 }
 
 #[tauri::command]
 fn list_cli_providers(state: tauri::State<AppState>) -> Result<Vec<CliProviderRecord>, String> {
     let db = open_state_db(&state)?;
-    let repo: &dyn CliProviderRepository = &db;
-    repo.list_cli_providers()
+    db.list_cli_providers()
 }
 
 #[tauri::command]
@@ -619,8 +549,7 @@ fn get_cli_provider(
     cli_name: String,
 ) -> Result<CliProviderRecord, String> {
     let db = open_state_db(&state)?;
-    let repo: &dyn CliProviderRepository = &db;
-    repo.get_cli_provider(&cli_name)?
+    db.get_cli_provider(&cli_name)?
         .ok_or_else(|| format!("Provider '{}' not found", cli_name))
 }
 
@@ -630,8 +559,7 @@ fn list_accounts(
     provider: Option<String>,
 ) -> Result<Vec<AccountRecord>, String> {
     let db = open_state_db(&state)?;
-    let repo: &dyn CliProviderRepository = &db;
-    repo.list_accounts(provider.as_deref())
+    db.list_accounts(provider.as_deref())
 }
 
 /// Input payload for adding a new account.
@@ -659,10 +587,9 @@ fn add_account(
     }
 
     let db = open_state_db(&state)?;
-    let repo: &dyn CliProviderRepository = &db;
 
     // Verify the provider exists
-    repo.get_cli_provider(&account.provider)?
+    db.get_cli_provider(&account.provider)?
         .ok_or_else(|| format!("Provider '{}' not found", account.provider))?;
 
     let now = chrono::Utc::now().to_rfc3339();
@@ -675,7 +602,7 @@ fn add_account(
         created_at: now,
     };
 
-    repo.insert_account(&record)?;
+    db.insert_account(&record)?;
     Ok(record)
 }
 
@@ -686,8 +613,7 @@ fn remove_account(
     provider: String,
 ) -> Result<bool, String> {
     let db = open_state_db(&state)?;
-    let repo: &dyn CliProviderRepository = &db;
-    repo.delete_account(&id, &provider)
+    db.delete_account(&id, &provider)
 }
 
 #[tauri::command]
@@ -717,8 +643,7 @@ fn sync_provider(
     };
 
     let db = open_state_db(&state)?;
-    let repo: &dyn CliProviderRepository = &db;
-    repo.upsert_cli_provider(&record)?;
+    db.upsert_cli_provider(&record)?;
     Ok(record)
 }
 
@@ -738,23 +663,21 @@ async fn discover_models_cmd(
     tauri::async_runtime::spawn_blocking(move || {
         let result = discovery::discover_models(&cli_name)?;
 
-        let opener = DefaultStateDbOpener;
-        let db = opener.open(&db_path)?;
-        let repo: &dyn DiscoveryRepository = &db;
+        let db = StateDb::open(&db_path)?;
 
         // Clean out models from older CLI versions
         if !result.models.is_empty() {
-            repo.delete_stale_models(&cli_name, &result.cli_version)?;
+            db.delete_stale_models(&cli_name, &result.cli_version)?;
         }
 
         // Store discovered models
         for model in &result.models {
-            repo.upsert_discovered_model(model)?;
+            db.upsert_discovered_model(model)?;
         }
 
         // Store discovered parameters
         for (model_name, param) in &result.parameters {
-            repo.upsert_model_parameter(model_name, &cli_name, param)?;
+            db.upsert_model_parameter(model_name, &cli_name, param)?;
         }
 
         Ok(result.models)
@@ -769,8 +692,7 @@ fn list_discovered_models(
     provider: Option<String>,
 ) -> Result<Vec<DiscoveredModel>, String> {
     let db = open_state_db(&state)?;
-    let repo: &dyn DiscoveryRepository = &db;
-    repo.list_discovered_models(provider.as_deref())
+    db.list_discovered_models(provider.as_deref())
 }
 
 #[tauri::command]
@@ -780,8 +702,7 @@ fn get_model_parameters(
     provider: String,
 ) -> Result<Vec<ModelParameter>, String> {
     let db = open_state_db(&state)?;
-    let repo: &dyn DiscoveryRepository = &db;
-    repo.list_model_parameters(&model_name, &provider)
+    db.list_model_parameters(&model_name, &provider)
 }
 
 pub fn run_tauri() {
@@ -789,20 +710,44 @@ pub fn run_tauri() {
         .map(|d| d.join("oulipoly-agent-runner").join("models"))
         .unwrap_or_else(|| PathBuf::from("models"));
 
-    let model_repo = FilesystemModelConfigRepository::new(models_dir.clone());
-    let models = model_repo.load_models().unwrap_or_default();
+    let models = config::load_models(&models_dir).unwrap_or_default();
 
-    configure_tauri_app(
-        tauri::Builder::default(),
-        AppState {
+    tauri::Builder::default()
+        .manage(AppState {
             models: Mutex::new(models),
             models_dir: models_dir.clone(),
             setup_input_tx: Mutex::new(None),
             quota_in_flight: quota::InFlight::new(),
-        },
-    )
-    .run(tauri::generate_context!())
-    .expect("error while running tauri application");
+        })
+        .invoke_handler(tauri::generate_handler![
+            check_setup_needed,
+            start_setup,
+            start_cli_setup,
+            reload_models,
+            setup_respond,
+            cancel_setup,
+            detect_clis,
+            get_memory_graph,
+            list_models,
+            get_model,
+            save_model,
+            delete_model,
+            list_pools,
+            refresh_quotas,
+            update_pool,
+            test_model,
+            list_cli_providers,
+            get_cli_provider,
+            list_accounts,
+            add_account,
+            remove_account,
+            sync_provider,
+            discover_models_cmd,
+            list_discovered_models,
+            get_model_parameters,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
 }
 
 #[cfg(test)]

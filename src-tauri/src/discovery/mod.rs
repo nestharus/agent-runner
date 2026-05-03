@@ -1,5 +1,5 @@
-use crate::process::{CommandSpec, OsProcessRunner, OutputSpec, ProcessRunner, StdinSpec};
 use crate::state::{CliMapping, DiscoveredModel, ModelParameter, ParamType};
+use std::process::Command;
 
 /// Result of a model discovery attempt for a single CLI.
 #[derive(Debug)]
@@ -45,14 +45,7 @@ const STRATEGIES: &[CliDiscoveryStrategy] = &[
 /// Tries known discovery commands in order, returning the first successful parse.
 /// Returns an error only if the CLI is not found at all; empty results are OK.
 pub fn discover_models(cli_name: &str) -> Result<DiscoveryResult, String> {
-    discover_models_with_runner(cli_name, &OsProcessRunner)
-}
-
-pub fn discover_models_with_runner(
-    cli_name: &str,
-    runner: &dyn ProcessRunner,
-) -> Result<DiscoveryResult, String> {
-    let cli_version = get_cli_version(cli_name, runner)?;
+    let cli_version = get_cli_version(cli_name)?;
 
     let strategy = STRATEGIES.iter().find(|s| s.name == cli_name);
 
@@ -65,7 +58,7 @@ pub fn discover_models_with_runner(
     let now = chrono::Utc::now().to_rfc3339();
 
     for cmd_args in commands {
-        match run_cli_command(cli_name, cmd_args, runner) {
+        match run_cli_command(cli_name, cmd_args) {
             Ok(output) => {
                 let model_names = parse_model_names(cli_name, &output);
                 if !model_names.is_empty() {
@@ -103,22 +96,13 @@ pub fn discover_models_with_runner(
 }
 
 /// Get the version string from a CLI tool.
-fn get_cli_version(cli_name: &str, runner: &dyn ProcessRunner) -> Result<String, String> {
-    let output = runner
-        .run(CommandSpec {
-            program: cli_name.to_string(),
-            args: vec!["--version".to_string()],
-            cwd: None,
-            env: Default::default(),
-            stdin: StdinSpec::Null,
-            stdout: OutputSpec::Capture,
-            stderr: OutputSpec::Capture,
-            timeout: None,
-            description: format!("discover {cli_name} version"),
-        })
+fn get_cli_version(cli_name: &str) -> Result<String, String> {
+    let output = Command::new(cli_name)
+        .arg("--version")
+        .output()
         .map_err(|e| format!("CLI '{}' not found or not executable: {}", cli_name, e))?;
 
-    if output.exit_code == 0 {
+    if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
         // Some CLIs print version to stderr or use a different flag
@@ -132,23 +116,10 @@ fn get_cli_version(cli_name: &str, runner: &dyn ProcessRunner) -> Result<String,
 }
 
 /// Run a CLI command and capture stdout.
-fn run_cli_command(
-    cli_name: &str,
-    args: &[&str],
-    runner: &dyn ProcessRunner,
-) -> Result<String, String> {
-    let output = runner
-        .run(CommandSpec {
-            program: cli_name.to_string(),
-            args: args.iter().map(|arg| (*arg).to_string()).collect(),
-            cwd: None,
-            env: Default::default(),
-            stdin: StdinSpec::Null,
-            stdout: OutputSpec::Capture,
-            stderr: OutputSpec::Capture,
-            timeout: None,
-            description: format!("discover {cli_name} models"),
-        })
+fn run_cli_command(cli_name: &str, args: &[&str]) -> Result<String, String> {
+    let output = Command::new(cli_name)
+        .args(args)
+        .output()
         .map_err(|e| format!("Failed to run {} {:?}: {}", cli_name, args, e))?;
 
     // Accept both success and some failure codes (help often returns non-zero)
@@ -160,12 +131,14 @@ fn run_cli_command(
         Ok(stdout)
     } else if !stderr.is_empty() {
         Ok(stderr)
-    } else if output.exit_code == 0 {
+    } else if output.status.success() {
         Ok(stdout)
     } else {
         Err(format!(
-            "{} {:?} failed with exit code {}",
-            cli_name, args, output.exit_code
+            "{} {:?} failed with exit code {:?}",
+            cli_name,
+            args,
+            output.status.code()
         ))
     }
 }

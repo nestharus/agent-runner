@@ -1,5 +1,4 @@
-use crate::runtime::{DefaultRuntimePaths, RuntimePaths};
-use crate::state::{DefaultStateDbOpener, ReadOnlyOpenError, StateDbOpener};
+use crate::state::{ReadOnlyOpenError, StateDb};
 use rusqlite::Connection;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -60,21 +59,12 @@ struct IndexDefinition {
 }
 
 pub fn run_schema_probe() -> Result<SchemaProbeReport, ProbeError> {
-    run_schema_probe_with_deps(&DefaultRuntimePaths::new(), &DefaultStateDbOpener)
-}
-
-pub fn run_schema_probe_with_deps(
-    paths: &dyn RuntimePaths,
-    opener: &dyn StateDbOpener,
-) -> Result<SchemaProbeReport, ProbeError> {
-    let path = paths
-        .state_db_path()
-        .map_err(|message| ProbeError::StatePath { message })?;
+    let path = StateDb::default_path().map_err(|message| ProbeError::StatePath { message })?;
     if !path.exists() {
         return Ok(missing_report(path));
     }
 
-    let db = match opener.open_read_only(&path) {
+    let db = match StateDb::open_read_only(&path) {
         Ok(db) => db,
         Err(ReadOnlyOpenError::Missing { .. }) => return Ok(missing_report(path)),
         Err(error) => return Err(ProbeError::Open { error }),

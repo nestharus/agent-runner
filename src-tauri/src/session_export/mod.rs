@@ -1,7 +1,3 @@
-use crate::config::{ModelConfigRepository, ProviderConfigSource, SessionsConfigSource};
-use crate::process::ProcessRunner;
-use crate::session_metadata::{self, locate_session_metadata};
-use crate::state::SessionChainRepository;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -87,60 +83,6 @@ pub enum ExportError {
     Operational {
         message: String,
     },
-}
-
-pub fn resolve_export_session_metadata_with_deps(
-    chain_repo: &dyn SessionChainRepository,
-    model_repo: &dyn ModelConfigRepository,
-    provider_source: &dyn ProviderConfigSource,
-    sessions_source: &dyn SessionsConfigSource,
-    locator_runner: &dyn ProcessRunner,
-    input: &str,
-) -> Result<ExportSessionMetadata, ExportError> {
-    let metadata = locate_session_metadata(
-        chain_repo,
-        model_repo,
-        provider_source,
-        sessions_source,
-        locator_runner,
-        input,
-    )
-    .map_err(map_metadata_error)?;
-    Ok(ExportSessionMetadata {
-        session_id: metadata.session_id,
-        chain_id: metadata.chain_id,
-        provider_name: metadata.provider_name,
-        storage_type: match metadata.storage_type {
-            session_metadata::SessionStorageType::ClaudeCode => SessionStorageType::ClaudeCode,
-            session_metadata::SessionStorageType::CodexSession => SessionStorageType::CodexSession,
-            session_metadata::SessionStorageType::Other => SessionStorageType::Other,
-        },
-        jsonl_path: metadata.jsonl_path,
-    })
-}
-
-fn map_metadata_error(err: session_metadata::MetadataError) -> ExportError {
-    match err {
-        session_metadata::MetadataError::InvalidSessionId { input } => {
-            ExportError::InvalidSessionId { input }
-        }
-        session_metadata::MetadataError::SessionNotFound { input } => {
-            ExportError::SessionNotFound { input }
-        }
-        session_metadata::MetadataError::AmbiguousSession { input } => {
-            ExportError::AmbiguousSession { input }
-        }
-        session_metadata::MetadataError::UnsupportedStorage {
-            provider_name,
-            reason,
-        } => ExportError::UnsupportedStorage {
-            provider_name,
-            reason,
-        },
-        session_metadata::MetadataError::Operational { message } => {
-            ExportError::Operational { message }
-        }
-    }
 }
 
 pub fn read_canonical_transcript(

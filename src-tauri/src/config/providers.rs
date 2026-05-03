@@ -126,16 +126,7 @@ impl ProvidersConfig {
         runtime.effective_provider(&model_provider.name, Some(model_provider))
     }
 
-    pub fn runtime_provider(&self, name: &str) -> Option<ProviderConfig> {
-        self.runtime_provider_with_mode(name)
-            .ok()
-            .map(|(provider, _)| provider)
-    }
-
-    pub fn runtime_provider_with_mode(
-        &self,
-        name: &str,
-    ) -> Result<(ProviderConfig, PromptMode), String> {
+    pub fn runtime_provider(&self, name: &str) -> Result<(ProviderConfig, PromptMode), String> {
         let runtime = self
             .get(name)
             .ok_or_else(|| format!("provider {name} is missing from providers.toml"))?;
