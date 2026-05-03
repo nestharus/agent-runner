@@ -21,25 +21,50 @@ fn quota_json() -> &'static str {
 #[test]
 fn refresh_quotas_command_uses_app_state_services() {
     let bundle = B3ServiceBundle::new();
+    bundle.write_model(
+        "multi-provider-model",
+        r#"[[providers]]
+name = "claude"
+
+[[providers]]
+name = "codex"
+"#,
+    );
     bundle.write_providers(
         r#"[claude]
-quota_script = "quota-json"
+quota_script = "claude-quota"
+
+[codex]
+quota_script = "codex-quota"
 "#,
     );
     bundle.runner.push_response(ok_output(quota_json(), "", 0));
+    bundle.runner.push_response(ok_output(quota_json(), "", 0));
     let (_app, webview) = bundle.mock_app();
 
-    let response =
-        invoke_json(&webview, "refresh_quotas", json!({"providers": ["claude"]})).unwrap();
+    let response = invoke_json(&webview, "refresh_quotas", json!({})).unwrap();
 
     assert!(response.to_string().contains("updated"), "{response}");
     assert_eq!(
         bundle.open_state_db().get_windows("claude").unwrap().len(),
         1
     );
-    let call = bundle.runner.single_call();
-    assert_eq!(call.program, "sh");
-    assert_eq!(call.args, ["-c", "quota-json"]);
+    assert_eq!(
+        bundle.open_state_db().get_windows("codex").unwrap().len(),
+        1
+    );
+    let mut calls = bundle.runner.calls();
+    calls.sort_by(|left, right| left.args.cmp(&right.args));
+    assert_eq!(calls.len(), 2);
+    assert!(calls.iter().all(|call| call.program == "sh"));
+    let args: Vec<_> = calls.into_iter().map(|call| call.args).collect();
+    assert_eq!(
+        args,
+        [
+            ["-c".to_string(), "claude-quota".to_string()],
+            ["-c".to_string(), "codex-quota".to_string()],
+        ]
+    );
 }
 
 /// Drift pin F-01: pre-B `refresh_quotas` accepted only `state`; an incoming
@@ -228,7 +253,7 @@ fn discover_models_command_uses_runner_and_preserves_empty_discovery_success() {
         .push_response(ok_output("claude 1.2.3\n", "", 0));
     bundle
         .runner
-        .push_response(ok_output("", "no models from strategy one", 1));
+        .push_response(ok_output("", "[]", 1));
     bundle.runner.push_response(ok_output("", "", 1));
     bundle.runner.push_response(ok_output("", "", 1));
     let (_app, webview) = bundle.mock_app();
