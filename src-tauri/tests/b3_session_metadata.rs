@@ -4,12 +4,12 @@
 mod b2_process_runner;
 mod fixtures;
 
-use agent_runner_lib::config::{
+use agent_runner_config::{
     ModelConfig, ModelConfigRepository, ProviderConfigSource, ProvidersConfig, SessionsConfig,
     SessionsConfigSource,
 };
-use agent_runner_lib::session_metadata::locate_session_metadata;
-use agent_runner_lib::state::SessionChainRepository;
+use agent_runner_session::locate_session_metadata;
+use agent_runner_state::SessionChainRepository;
 use b2_process_runner::{FakeProcessRunner, ok_output};
 use fixtures::initiative_06::{CLAUDE_PROVIDER, component_claude_success_fixture};
 use std::collections::HashMap;

@@ -1,0 +1,10 @@
+[package]
+name = "agent-runner-runtime"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dirs.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,10 +1,10 @@
 #![cfg(unix)]
 #![allow(dead_code)]
 
-use agent_runner_lib::config::{
+use agent_runner_config::{
     ModelConfig, PromptMode, ProviderConfig, ProvidersConfig, SessionStorage, SessionsConfig,
 };
-use agent_runner_lib::state::{ModelStore, StateDb};
+use agent_runner_state::{ModelStore, StateDb};
 use chrono::{Duration, Utc};
 use rusqlite::{Connection, params};
 use serde_json::Value;

@@ -1,8 +1,8 @@
 #![cfg(unix)]
 
-use agent_runner_lib::balancer::{self, BalanceEffects};
-use agent_runner_lib::config::{ModelConfig, PromptMode, ProviderConfig};
-use agent_runner_lib::state::{ProviderRecord, QuotaRecord, QuotaWindow, RoutingRepository};
+use agent_runner_balancer::{self as balancer, BalanceEffects};
+use agent_runner_config::{ModelConfig, PromptMode, ProviderConfig};
+use agent_runner_state::{ProviderRecord, QuotaRecord, QuotaWindow, RoutingRepository};
 use chrono::{DateTime, Utc};
 use std::sync::Mutex;
 

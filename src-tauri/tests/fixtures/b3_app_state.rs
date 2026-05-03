@@ -3,17 +3,18 @@
 #[path = "b2_process_runner.rs"]
 mod b2_process_runner;
 
-use agent_runner_lib::config::{
+use agent_runner_app::setup::actions::UserResponse;
+use agent_runner_app::{AppState, configure_tauri_app};
+use agent_runner_config::{
     AgentConfigRepository, FilesystemAgentConfigRepository, FilesystemModelConfigRepository,
     FilesystemProviderConfigSource, FilesystemSessionsConfigSource, ModelConfigRepository,
     ProviderConfigSource, SessionsConfigSource,
 };
-use agent_runner_lib::process::ProcessRunner;
-use agent_runner_lib::quota::InFlight;
-use agent_runner_lib::session_lock::{FilesystemSessionLockProvider, SessionLockProvider};
-use agent_runner_lib::setup::actions::UserResponse;
-use agent_runner_lib::state::{DefaultStateDbOpener, StateDb, StateDbOpener};
-use agent_runner_lib::{AppState, RuntimePaths, configure_tauri_app};
+use agent_runner_executor::ProcessRunner;
+use agent_runner_quota::InFlight;
+use agent_runner_runtime::RuntimePaths;
+use agent_runner_session::{FilesystemSessionLockProvider, SessionLockProvider};
+use agent_runner_state::{DefaultStateDbOpener, StateDb, StateDbOpener};
 #[allow(unused_imports)]
 pub use b2_process_runner::{FakeProcessRunner, ok_output, timeout_error};
 use serde_json::Value;

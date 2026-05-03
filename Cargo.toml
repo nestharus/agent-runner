@@ -1,0 +1,51 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/config",
+    "crates/state",
+    "crates/executor",
+    "crates/balancer",
+    "crates/quota",
+    "crates/diagnostics",
+    "crates/runtime",
+    "crates/session",
+    "crates/schema-probe",
+    "crates/discovery",
+    "src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+agent-runner-config = { path = "crates/config" }
+agent-runner-state = { path = "crates/state" }
+agent-runner-executor = { path = "crates/executor" }
+agent-runner-balancer = { path = "crates/balancer" }
+agent-runner-quota = { path = "crates/quota" }
+agent-runner-diagnostics = { path = "crates/diagnostics" }
+agent-runner-runtime = { path = "crates/runtime" }
+agent-runner-session = { path = "crates/session" }
+agent-runner-schema-probe = { path = "crates/schema-probe" }
+agent-runner-discovery = { path = "crates/discovery" }
+
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+toml = "1"
+serde_yml = "0.0.12"
+rusqlite = { version = "0.38", features = ["bundled"] }
+dirs = "6"
+tempfile = "3"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1"
+libc = "0.2"
+signal-hook = "0.3"
+tauri = { version = "2", features = ["devtools"] }
+tokio = { version = "1", features = ["sync"] }
+nix = { version = "0.29", features = ["fs"] }
+getrandom = "0.2"
+tauri-build = { version = "2", features = [] }

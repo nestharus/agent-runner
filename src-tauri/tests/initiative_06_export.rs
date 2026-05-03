@@ -2,7 +2,7 @@
 
 mod fixtures;
 
-use agent_runner_lib::session_export::read_canonical_transcript;
+use agent_runner_session::read_canonical_transcript;
 use fixtures::initiative_06_export::*;
 use serde_json::Value;
 use std::{collections::BTreeMap, fs, path::Path};

@@ -3,9 +3,9 @@
 #[path = "fixtures/b2_process_runner.rs"]
 mod b2_process_runner;
 
-use agent_runner_lib::check_setup_needed_with_runner;
-use agent_runner_lib::process::{OutputSpec, StdinSpec};
-use agent_runner_lib::setup::detection;
+use agent_runner_app::check_setup_needed_with_runner;
+use agent_runner_app::setup::detection;
+use agent_runner_executor::{OutputSpec, StdinSpec};
 use b2_process_runner::{FakeProcessRunner, ok_output};
 
 /// Risk: T18 - per-CLI detection can retain direct `Command::new` calls after

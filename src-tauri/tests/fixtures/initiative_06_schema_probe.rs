@@ -1,7 +1,7 @@
 #![cfg(unix)]
 #![allow(dead_code)]
 
-use agent_runner_lib::state::{BinaryInfo, FeatureMap, SchemaProbeReport, StateDbReport};
+use agent_runner_schema_probe::{BinaryInfo, FeatureMap, SchemaProbeReport, StateDbReport};
 use rusqlite::Connection;
 use serde_json::Value;
 use std::collections::BTreeMap;

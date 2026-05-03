@@ -2,14 +2,13 @@
 
 mod fixtures;
 
-use agent_runner_lib::config::{
+use agent_runner_config::{
     ModelConfig, ModelConfigRepository, ProviderConfigSource, ProvidersConfig, SessionsConfig,
     SessionsConfigSource,
 };
-use agent_runner_lib::process::OsProcessRunner;
-use agent_runner_lib::session_metadata::{
-    MetadataError, SessionMetadata, SessionStorageType, locate_session_metadata,
-};
+use agent_runner_executor::OsProcessRunner;
+use agent_runner_session::metadata::SessionStorageType;
+use agent_runner_session::{MetadataError, SessionMetadata, locate_session_metadata};
 use fixtures::initiative_06::*;
 use serde_json::Value;
 use std::collections::HashMap;

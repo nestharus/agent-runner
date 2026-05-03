@@ -3,9 +3,8 @@
 #[path = "fixtures/b3_app_state.rs"]
 mod b3_app_state;
 
-use agent_runner_lib::process::StdinSpec;
-use agent_runner_lib::state::{CliProviderRepository, DiscoveryRepository, QuotaRepository};
-use agent_runner_lib::{DefaultRuntimePaths, RuntimePaths};
+use agent_runner_app::{DefaultRuntimePaths, RuntimePaths};
+use agent_runner_executor::StdinSpec;
 use b3_app_state::{B3ServiceBundle, invoke_json, ok_output};
 use serde_json::json;
 use std::sync::Arc;
@@ -237,7 +236,9 @@ command = "alias-cli"
 prompt_mode = "stdin"
 "#,
     );
-    bundle.runner.push_response(ok_output("name model ok\n", "", 0));
+    bundle
+        .runner
+        .push_response(ok_output("name model ok\n", "", 0));
     let (_app, webview) = bundle.mock_app();
 
     let response = invoke_json(
@@ -311,9 +312,7 @@ fn discover_models_command_uses_runner_and_preserves_empty_discovery_success() {
     bundle
         .runner
         .push_response(ok_output("claude 1.2.3\n", "", 0));
-    bundle
-        .runner
-        .push_response(ok_output("", "[]", 1));
+    bundle.runner.push_response(ok_output("", "[]", 1));
     bundle.runner.push_response(ok_output("", "", 1));
     bundle.runner.push_response(ok_output("", "", 1));
     let (_app, webview) = bundle.mock_app();

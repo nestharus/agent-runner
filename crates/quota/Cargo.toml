@@ -1,0 +1,16 @@
+[package]
+name = "agent-runner-quota"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+agent-runner-config.workspace = true
+agent-runner-executor.workspace = true
+agent-runner-state.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+agent-runner-state = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true

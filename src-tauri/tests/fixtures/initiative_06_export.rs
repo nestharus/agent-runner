@@ -1,8 +1,8 @@
 #![cfg(unix)]
 #![allow(dead_code)]
 
-use agent_runner_lib::session_export::{ExportSessionMetadata, SessionStorageType};
-use agent_runner_lib::state::StateDb;
+use agent_runner_session::{ExportSessionMetadata, SessionStorageType};
+use agent_runner_state::StateDb;
 use chrono::{Duration, Utc};
 use rusqlite::{Connection, params};
 use serde_json::Value;

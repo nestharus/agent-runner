@@ -4,10 +4,9 @@
 //! invocation tree from SQLite parent edges, renders deterministic human output,
 //! and exposes a structured JSON shape for machine consumers.
 
-use crate::config::SessionsConfig;
-use crate::session_metadata::TranscriptState;
-use crate::sessions::locate_transcript;
-use crate::state::{InvocationRecord, StateDb};
+use agent_runner_config::SessionsConfig;
+use agent_runner_session::{TranscriptState, locate_transcript};
+use agent_runner_state::{InvocationRecord, StateDb};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Serialize;
 use std::collections::HashSet;
@@ -425,7 +424,7 @@ fn format_ascii_node(node: &TraceNode) -> String {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::state::{SessionTurnIngest, StateDb};
+    use agent_runner_state::{SessionTurnIngest, StateDb};
     use chrono::{DateTime, Utc};
     use rusqlite::{Connection, params};
     use std::fs;

@@ -1,0 +1,15 @@
+[package]
+name = "agent-runner-balancer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+agent-runner-config.workspace = true
+agent-runner-state.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+
+[dev-dependencies]
+agent-runner-state = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true
+uuid.workspace = true

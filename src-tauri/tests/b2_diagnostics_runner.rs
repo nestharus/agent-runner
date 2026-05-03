@@ -3,9 +3,9 @@
 #[path = "fixtures/b2_process_runner.rs"]
 mod b2_process_runner;
 
-use agent_runner_lib::config::{ModelConfig, PromptMode, ProviderConfig};
-use agent_runner_lib::diagnostics;
-use agent_runner_lib::process::StdinSpec;
+use agent_runner_config::{ModelConfig, PromptMode, ProviderConfig};
+use agent_runner_diagnostics as diagnostics;
+use agent_runner_executor::StdinSpec;
 use b2_process_runner::FakeProcessRunner;
 use std::collections::HashMap;
 

@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use agent_runner_lib::state::{InvocationStart, StateDb};
+use agent_runner_state::{InvocationStart, StateDb};
 use serde_json::Value;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;

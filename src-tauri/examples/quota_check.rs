@@ -7,11 +7,12 @@
 //! DB, refreshes any stale quotas, then prints — for every multi-provider
 //! model — what `select_provider` would pick and the score breakdown.
 
-use agent_runner_lib::balancer::{BalanceContext, select_provider};
-use agent_runner_lib::config::{ProvidersConfig, SessionsConfig, load_models};
-use agent_runner_lib::process::OsProcessRunner;
-use agent_runner_lib::quota::{InFlight, RefreshOutcome, is_stale, refresh_provider};
-use agent_runner_lib::state::StateDb;
+use agent_runner_app::balance_effects::BalanceContext;
+use agent_runner_balancer::select_provider;
+use agent_runner_config::{ProvidersConfig, SessionsConfig, load_models};
+use agent_runner_executor::OsProcessRunner;
+use agent_runner_quota::{InFlight, RefreshOutcome, is_stale, refresh_provider};
+use agent_runner_state::StateDb;
 
 fn main() {
     let config_dir = dirs::config_dir()

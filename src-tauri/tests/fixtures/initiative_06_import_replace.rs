@@ -1,8 +1,8 @@
 #![cfg(unix)]
 #![allow(dead_code)]
 
-use agent_runner_lib::session_lock::{Lease, SessionLock};
-use agent_runner_lib::state::StateDb;
+use agent_runner_session::{Lease, SessionLock};
+use agent_runner_state::StateDb;
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};

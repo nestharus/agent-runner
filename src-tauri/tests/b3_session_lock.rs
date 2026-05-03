@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use agent_runner_lib::session_lock::{FilesystemSessionLockProvider, SessionLockProvider};
+use agent_runner_session::{FilesystemSessionLockProvider, SessionLockProvider};
 use std::time::Duration;
 
 /// Risk: T11 - adding `SessionLockProvider` can drift from filesystem lock

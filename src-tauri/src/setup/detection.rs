@@ -1,4 +1,4 @@
-use crate::process::{CommandSpec, OsProcessRunner, OutputSpec, ProcessRunner, StdinSpec};
+use agent_runner_executor::{CommandSpec, OsProcessRunner, OutputSpec, ProcessRunner, StdinSpec};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};

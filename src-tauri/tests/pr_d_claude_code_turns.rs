@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use agent_runner_lib::sessions::ScriptTurn;
+use agent_runner_session::ScriptTurn;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
