@@ -19,6 +19,49 @@ import sys
 from pathlib import Path
 
 
+def canonical_chunk_type(native_type) -> str:
+    if not isinstance(native_type, str):
+        return "text"
+    if native_type in ("input_text", "output_text"):
+        return "text"
+    return native_type
+
+
+def text_chunk(text: str) -> dict:
+    return {"type": "text", "text": text}
+
+
+def extract_content_chunks(value) -> list:
+    if isinstance(value, str):
+        return [text_chunk(value)]
+    if isinstance(value, list):
+        chunks = []
+        for item in value:
+            if isinstance(item, str):
+                chunks.append(text_chunk(item))
+            elif isinstance(item, dict):
+                text = item.get("text")
+                if text is None:
+                    text = item.get("content")
+                if isinstance(text, str):
+                    native_type = item.get("type") or "text"
+                    chunks.append(
+                        {
+                            "type": canonical_chunk_type(native_type),
+                            "text": text,
+                        }
+                    )
+        return chunks
+    if isinstance(value, dict):
+        text = value.get("text")
+        if text is None:
+            text = value.get("content")
+        if isinstance(text, str):
+            native_type = value.get("type") or "text"
+            return [{"type": canonical_chunk_type(native_type), "text": text}]
+    return []
+
+
 def main() -> int:
     if len(sys.argv) < 2:
         print("usage: codex-turns BASE_DIR", file=sys.stderr)
@@ -78,12 +121,16 @@ def emit_file(path: Path, out) -> None:
                     ts = obj.get("timestamp")
                     if not ts:
                         continue
-                    out.write(json.dumps({
+                    record = {
                         "session_id": sid,
                         "turn_id": f"{path}:{line_no}",
                         "timestamp": ts,
                         "role": role,
-                    }))
+                    }
+                    body = extract_content_chunks(payload.get("content"))
+                    if body:
+                        record["body"] = body
+                    out.write(json.dumps(record))
                     out.write("\n")
     except OSError:
         return

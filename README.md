@@ -380,11 +380,14 @@ state_dir   = "~/.cache/oulipoly/claude3-cursor"
   "timestamp": "<RFC 3339>",
   "role": "user|assistant",
   "parent_turn_id": "<turn_id|null>",
-  "is_sidechain": true
+  "is_sidechain": true,
+  "body": [{"type": "text", "text": "..."}]
 }
 ```
 
 `parent_turn_id` and `is_sidechain` are **optional**. Adapters that don't track within-session parentage emit only the first four fields; the runner treats those turns as linear with `is_sidechain = false`. The Claude Code reference adapter passes through the raw `parentUuid` and `isSidechain` fields it sees in Claude's per-session JSONL — those surface as branch counts in `trace --json`'s `session.sidechain_turn_count`.
+
+Turn-script adapters also emit body content as JSON in the canonical content shape when available, and `state.db` stores this content directly in `session_turns.body`. Adapters that cannot extract content omit the `body` field, resulting in rows where `session_turns.body` is `NULL` (legacy-style rows without stored bodies).
 
 Idempotent — re-running with no source changes outputs nothing. The runner's `session_turns` table has `UNIQUE(provider, session_id, turn_id)` so duplicate emission is also tolerated.
 
@@ -447,7 +450,7 @@ Each node's `session.transcript_state` is one of:
 Flags:
 
 - `--json` — structured output for piping into other tools
-- `--inline-transcript` (requires `--json`) — embed raw provider records inline; null in this version (placeholder for future)
+- `--inline-transcript` (requires `--json`) — embed DB-stored transcript turns inline as objects with `turn_id`, `role`, `timestamp`, `body_state`, and `content`; `body_state` is `"available"` when body is stored, and `"missing"` for legacy rows where `content` is `null`
 - `--transcript` (human mode only; conflicts with `--json`) — append a transcript footer
 - `--max-depth N` — truncate descendants past depth N
 
@@ -510,7 +513,7 @@ Use it before scripting any other `session` subcommand to confirm the local DB i
 oulipoly-agent-runner session export <session-id>
 ```
 
-`session export` resolves the session, opens the provider transcript read-only, and emits **canonical JSONL** on stdout — one record per turn with stable, provider-agnostic fields plus a `source` block carrying the byte range and SHA-256 preimage of the source line. The default `--format canonical-jsonl` is the only supported format today.
+`session export` resolves the session, opens the provider transcript read-only, and emits **canonical JSONL** on stdout — one record per turn with stable, provider-agnostic fields plus a `source` block carrying provenance for the emitted content. When the provider JSONL is present, `source` carries the byte range and SHA-256 preimage of the source line. When the provider JSONL is missing or unreadable, export falls back to bodies stored directly in `state.db`; those fallback records use `source.storage_type = "state_db"`, `source.jsonl_path = "db://session_turns/<row_id>"`, `source.line = <row_id>`, zero byte offsets, and `source.sha256` computed from the stored body JSON. The default `--format canonical-jsonl` is the only supported format today.
 
 Canonical record fields:
 
@@ -520,8 +523,8 @@ Canonical record fields:
   "role": "user|assistant", "timestamp": "<RFC 3339>",
   "content": [{"type": "text|tool_use|…", "text": "…"}],
   "source": {
-    "storage_type": "claude_code|codex_session",
-    "jsonl_path": "<absolute path>",
+    "storage_type": "claude_code|codex_session|state_db",
+    "jsonl_path": "<absolute path or db://session_turns/<row_id>>",
     "line": 1, "byte_start": 0, "byte_end": 192,
     "sha256": "<hex>"
   },
@@ -558,7 +561,7 @@ oulipoly-agent-runner session import-replace <id> \
   --preimage-sha256 "$PREIMAGE" --from-file ./edited.jsonl
 ```
 
-`session import-replace` accepts **canonical JSONL only** (the same shape `session export` emits). It renders that input back into provider-native bytes, swaps the on-disk transcript atomically, replaces the session's `session_turns` rows, and emits a receipt JSON to stdout:
+`session import-replace` accepts **canonical JSONL only** (the same shape `session export` emits). It renders that input back into provider-native bytes, swaps the on-disk transcript atomically, replaces the session's `session_turns` rows, updates stored body bytes alongside metadata, and emits a receipt JSON to stdout:
 
 ```json
 {

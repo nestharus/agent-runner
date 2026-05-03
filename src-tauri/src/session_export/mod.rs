@@ -1,4 +1,6 @@
+use crate::state::StateDb;
 use chrono::{DateTime, Utc};
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -88,13 +90,10 @@ pub enum ExportError {
 pub fn read_canonical_transcript(
     metadata: &ExportSessionMetadata,
 ) -> Result<Vec<CanonicalRecord>, ExportError> {
-    let bytes = fs::read(&metadata.jsonl_path).map_err(|e| ExportError::Operational {
-        message: format!(
-            "failed to read transcript {}: {e}",
-            metadata.jsonl_path.display()
-        ),
-    })?;
-    read_canonical_transcript_from_bytes(metadata, &bytes)
+    match fs::read(&metadata.jsonl_path) {
+        Ok(bytes) => read_canonical_transcript_from_bytes(metadata, &bytes),
+        Err(_) => read_canonical_transcript_from_state_db(metadata),
+    }
 }
 
 pub fn read_canonical_transcript_from_bytes(
@@ -121,6 +120,82 @@ pub fn canonical_jsonl_bytes(records: &[CanonicalRecord]) -> Result<Vec<u8>, Exp
         out.push(b'\n');
     }
     Ok(out)
+}
+
+fn read_canonical_transcript_from_state_db(
+    metadata: &ExportSessionMetadata,
+) -> Result<Vec<CanonicalRecord>, ExportError> {
+    let db = StateDb::open_default().map_err(|message| ExportError::Operational { message })?;
+    let mut stmt = db
+        .connection()
+        .prepare(
+            "SELECT id, turn_id, timestamp, role, body
+             FROM session_turns
+             WHERE provider_name = ?1 AND session_id = ?2
+             ORDER BY timestamp, id",
+        )
+        .map_err(|e| ExportError::Operational {
+            message: format!("failed to prepare DB transcript fallback query: {e}"),
+        })?;
+    let rows = stmt
+        .query_map(
+            params![metadata.provider_name, metadata.session_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .map_err(|e| ExportError::Operational {
+            message: format!("failed to query DB transcript fallback rows: {e}"),
+        })?;
+
+    let mut records = Vec::new();
+    for row in rows {
+        let (row_id, turn_id, timestamp, role, body) =
+            row.map_err(|e| ExportError::Operational {
+                message: format!("failed to read DB transcript fallback row: {e}"),
+            })?;
+        let Some(body) = body else {
+            return Err(ExportError::Operational {
+                message: format!(
+                    "missing body in session_turns row {row_id} for {}/{}/{}",
+                    metadata.provider_name, metadata.session_id, turn_id
+                ),
+            });
+        };
+        let content = serde_json::from_str::<Vec<ContentChunk>>(&body).map_err(|e| {
+            ExportError::Operational {
+                message: format!(
+                    "invalid body JSON in session_turns row {row_id} for {}/{}/{}: {e}",
+                    metadata.provider_name, metadata.session_id, turn_id
+                ),
+            }
+        })?;
+        let line = u64::try_from(row_id).unwrap_or(0);
+        records.push(CanonicalRecord {
+            session_id: metadata.session_id.clone(),
+            provider_name: metadata.provider_name.clone(),
+            turn_id,
+            role,
+            timestamp,
+            content,
+            source: RecordSource {
+                storage_type: "state_db".to_string(),
+                jsonl_path: PathBuf::from(format!("db://session_turns/{row_id}")),
+                line,
+                byte_start: 0,
+                byte_end: 0,
+                sha256: sha256_hex(body.as_bytes()),
+            },
+            unsupported_record: false,
+        });
+    }
+    Ok(records)
 }
 
 pub fn parse_claude_code_jsonl(
@@ -464,4 +539,189 @@ fn text_chunk(text: &str) -> ContentChunk {
 fn sha256_hex(input: &[u8]) -> String {
     let digest = Sha256::digest(input);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::StateDb;
+    use crate::test_support::env_lock;
+    use rusqlite::params;
+
+    const SESSION_ID: &str = "5169694d-de0f-40d1-890c-6e28e55bab27";
+    const PROVIDER: &str = "claude";
+
+    fn with_data_home<T>(data_home: &Path, test: impl FnOnce() -> T) -> T {
+        let _guard = env_lock().lock().unwrap();
+        let old = std::env::var_os("XDG_DATA_HOME");
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", data_home);
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(test));
+        match old {
+            Some(value) => unsafe {
+                std::env::set_var("XDG_DATA_HOME", value);
+            },
+            None => unsafe {
+                std::env::remove_var("XDG_DATA_HOME");
+            },
+        }
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    fn seed_db_body(data_home: &Path, turn_id: &str, text: &str) {
+        let db_path = data_home.join("oulipoly-agent-runner").join("state.db");
+        let db = StateDb::open(&db_path).unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO session_turns
+                    (provider_name, session_id, turn_id, timestamp, role,
+                     parent_turn_id, is_sidechain, is_compaction_boundary, source_file, ingested_at, body)
+                 VALUES (?1, ?2, ?3, '2026-04-17T08:00:00Z', 'assistant', NULL, 0, 0, '', '2026-04-17T08:00:00Z', ?4)",
+                params![
+                    PROVIDER,
+                    SESSION_ID,
+                    turn_id,
+                    format!(r#"[{{"type":"text","text":"{text}"}}]"#)
+                ],
+            )
+            .unwrap();
+    }
+
+    fn metadata(jsonl_path: PathBuf) -> ExportSessionMetadata {
+        ExportSessionMetadata {
+            session_id: SESSION_ID.to_string(),
+            chain_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string(),
+            provider_name: PROVIDER.to_string(),
+            storage_type: SessionStorageType::ClaudeCode,
+            jsonl_path,
+        }
+    }
+
+    #[test]
+    fn read_canonical_transcript_keeps_jsonl_priority_when_db_body_exists() {
+        // risk: byte-stability regression; level: particular-integration; source: contract §4 T7 / proposal A3.
+        let dir = tempfile::tempdir().unwrap();
+        let data_home = dir.path().join("data");
+        let jsonl_path = dir.path().join("transcript.jsonl");
+        let line1 = format!(
+            r#"{{"sessionId":"{SESSION_ID}","type":"user","uuid":"jsonl-user","timestamp":"2026-04-17T08:00:00Z","message":"jsonl user body"}}"#
+        );
+        let line2 = format!(
+            r#"{{"sessionId":"{SESSION_ID}","type":"assistant","uuid":"jsonl-assistant","timestamp":"2026-04-17T08:00:01Z","message":"jsonl assistant body"}}"#
+        );
+        let jsonl_bytes = format!("{line1}\n{line2}\n");
+        fs::write(&jsonl_path, &jsonl_bytes).unwrap();
+
+        let actual = with_data_home(&data_home, || {
+            seed_db_body(&data_home, "jsonl-assistant", "db body must not win");
+            read_canonical_transcript(&metadata(jsonl_path.clone())).unwrap()
+        });
+        let expected = vec![
+            CanonicalRecord {
+                session_id: SESSION_ID.to_string(),
+                provider_name: PROVIDER.to_string(),
+                turn_id: "jsonl-user".to_string(),
+                role: "user".to_string(),
+                timestamp: "2026-04-17T08:00:00Z".to_string(),
+                content: vec![ContentChunk {
+                    r#type: "text".to_string(),
+                    text: Some("jsonl user body".to_string()),
+                }],
+                source: RecordSource {
+                    storage_type: "claude_code".to_string(),
+                    jsonl_path: jsonl_path.clone(),
+                    line: 1,
+                    byte_start: 0,
+                    byte_end: line1.len() as u64,
+                    sha256: sha256_hex(line1.as_bytes()),
+                },
+                unsupported_record: false,
+            },
+            CanonicalRecord {
+                session_id: SESSION_ID.to_string(),
+                provider_name: PROVIDER.to_string(),
+                turn_id: "jsonl-assistant".to_string(),
+                role: "assistant".to_string(),
+                timestamp: "2026-04-17T08:00:01Z".to_string(),
+                content: vec![ContentChunk {
+                    r#type: "text".to_string(),
+                    text: Some("jsonl assistant body".to_string()),
+                }],
+                source: RecordSource {
+                    storage_type: "claude_code".to_string(),
+                    jsonl_path,
+                    line: 2,
+                    byte_start: (line1.len() + 1) as u64,
+                    byte_end: (line1.len() + 1 + line2.len()) as u64,
+                    sha256: sha256_hex(line2.as_bytes()),
+                },
+                unsupported_record: false,
+            },
+        ];
+
+        assert_eq!(
+            canonical_jsonl_bytes(&actual).unwrap(),
+            canonical_jsonl_bytes(&expected).unwrap()
+        );
+    }
+
+    #[test]
+    fn read_canonical_transcript_falls_back_to_db_bodies_when_jsonl_missing() {
+        // risk: fallback regression; level: particular-integration; source: contract §4 T8 / proposal A3.
+        let dir = tempfile::tempdir().unwrap();
+        let data_home = dir.path().join("data");
+        let missing_jsonl_path = dir.path().join("missing.jsonl");
+
+        let records = with_data_home(&data_home, || {
+            let db_path = data_home.join("oulipoly-agent-runner").join("state.db");
+            let db = StateDb::open(&db_path).unwrap();
+            for (turn_id, role, timestamp, body) in [
+                (
+                    "db-user",
+                    "user",
+                    "2026-04-17T08:00:00Z",
+                    r#"[{"type":"text","text":"db fallback user"}]"#,
+                ),
+                (
+                    "db-assistant",
+                    "assistant",
+                    "2026-04-17T08:00:01Z",
+                    r#"[{"type":"text","text":"db fallback assistant"}]"#,
+                ),
+            ] {
+                db.connection()
+                    .execute(
+                        "INSERT INTO session_turns
+                            (provider_name, session_id, turn_id, timestamp, role,
+                             parent_turn_id, is_sidechain, is_compaction_boundary, source_file, ingested_at, body)
+                         VALUES (?1, ?2, ?3, ?4, ?5, NULL, 0, 0, '', ?4, ?6)",
+                        params![PROVIDER, SESSION_ID, turn_id, timestamp, role, body],
+                    )
+                    .unwrap();
+            }
+            read_canonical_transcript(&metadata(missing_jsonl_path.clone())).unwrap()
+        });
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records[0].content[0].text.as_deref(),
+            Some("db fallback user")
+        );
+        assert_eq!(
+            records[1].content[0].text.as_deref(),
+            Some("db fallback assistant")
+        );
+        assert!(records.iter().all(|record| {
+            record.source.storage_type == "state_db"
+                && record
+                    .source
+                    .jsonl_path
+                    .to_string_lossy()
+                    .starts_with("db://session_turns/")
+        }));
+    }
 }

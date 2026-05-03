@@ -11,13 +11,66 @@ We track the highest mtime emitted; subsequent runs skip files unchanged
 since.
 
 Emits one JSON object per line on stdout:
-  {"session_id":"<sid>","turn_id":"<uuid>","timestamp":"<rfc3339>","role":"user|assistant","parent_turn_id":"<uuid|null>","is_sidechain":true|false|null}
+  {"session_id":"<sid>","turn_id":"<uuid>","timestamp":"<rfc3339>","role":"user|assistant","parent_turn_id":"<uuid|null>","is_sidechain":true|false|null,"is_compaction_boundary":true|false,"body":[{"type":"text","text":"..."}]}
+  body is optional and is emitted only when extractable chunks exist.
 """
 
 import json
 import os
 import sys
 from pathlib import Path
+
+
+def canonical_chunk_type(native_type) -> str:
+    if not isinstance(native_type, str):
+        return "text"
+    if native_type in ("input_text", "output_text"):
+        return "text"
+    return native_type
+
+
+def text_chunk(text: str) -> dict:
+    return {"type": "text", "text": text}
+
+
+def extract_content_chunks(value) -> list:
+    if isinstance(value, str):
+        return [text_chunk(value)]
+    if isinstance(value, list):
+        chunks = []
+        for item in value:
+            if isinstance(item, str):
+                chunks.append(text_chunk(item))
+            elif isinstance(item, dict):
+                text = item.get("text")
+                if text is None:
+                    text = item.get("content")
+                if isinstance(text, str):
+                    native_type = item.get("type") or "text"
+                    chunks.append(
+                        {
+                            "type": canonical_chunk_type(native_type),
+                            "text": text,
+                        }
+                    )
+        return chunks
+    if isinstance(value, dict):
+        text = value.get("text")
+        if text is None:
+            text = value.get("content")
+        if isinstance(text, str):
+            native_type = value.get("type") or "text"
+            return [{"type": canonical_chunk_type(native_type), "text": text}]
+    return []
+
+
+def extract_claude_body(obj: dict) -> list:
+    message = obj.get("message")
+    if isinstance(message, str):
+        return [text_chunk(message)]
+    if isinstance(message, dict) and "content" in message:
+        return extract_content_chunks(message.get("content"))
+    return extract_content_chunks(obj.get("content"))
 
 
 def main() -> int:
@@ -74,7 +127,7 @@ def emit_file(path: Path, out) -> None:
                 sid = obj.get("sessionId")
                 if not (uuid and ts and sid):
                     continue
-                out.write(json.dumps({
+                record = {
                     "session_id": sid,
                     "turn_id": uuid,
                     "timestamp": ts,
@@ -82,7 +135,11 @@ def emit_file(path: Path, out) -> None:
                     "parent_turn_id": obj.get("parentUuid"),
                     "is_sidechain": obj.get("isSidechain"),
                     "is_compaction_boundary": is_compaction_boundary,
-                }))
+                }
+                body = extract_claude_body(obj)
+                if body:
+                    record["body"] = body
+                out.write(json.dumps(record))
                 out.write("\n")
     except OSError:
         return

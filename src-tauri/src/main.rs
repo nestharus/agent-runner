@@ -7,7 +7,8 @@ use agent_runner_lib::diagnostics;
 use agent_runner_lib::executor;
 use agent_runner_lib::schema_probe::{self, ProbeError};
 use agent_runner_lib::session_export::{
-    ExportError, ExportSessionMetadata, SessionStorageType, read_canonical_transcript,
+    ExportError, ExportSessionMetadata, SessionStorageType, canonical_jsonl_bytes,
+    read_canonical_transcript,
 };
 use agent_runner_lib::session_lock::{LockError, SessionLock};
 use agent_runner_lib::session_metadata::{MetadataError, locate_session_metadata};
@@ -756,18 +757,20 @@ fn run_session_export(session_id: &str, format: &str) -> Result<i32, String> {
         }
     };
 
-    let mut output = String::new();
-    for record in records {
-        let line = serde_json::to_string(&record).map_err(|e| {
-            format!(
-                "Failed to serialize canonical export for session {}: {e}",
-                metadata.session_id
-            )
-        })?;
-        output.push_str(&line);
-        output.push('\n');
+    let output = match canonical_jsonl_bytes(&records) {
+        Ok(output) => output,
+        Err(err) => {
+            emit_export_error(&err);
+            return Ok(export_error_exit_code(&err));
+        }
+    };
+    if let Err(err) = std::io::stdout().write_all(&output) {
+        emit_export_json_error(
+            "operational-error",
+            &format!("failed to write canonical export: {err}"),
+        );
+        return Ok(1);
     }
-    print!("{output}");
     Ok(0)
 }
 

@@ -254,6 +254,7 @@ flag = "--resume"
                     parent_turn_id: None,
                     is_sidechain: false,
                     is_compaction_boundary: boundaries.contains(&turn_id.as_str()),
+                    body: None,
                 }
             })
             .collect();

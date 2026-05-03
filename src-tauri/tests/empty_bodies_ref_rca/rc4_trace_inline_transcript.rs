@@ -11,9 +11,9 @@ use agent_runner_lib::trace::{TraceOptions, trace_invocation};
 /// DB-backed body read path.
 #[test]
 fn trace_inline_transcript_embeds_db_stored_turn_bodies() {
+    // risk: trace regression; level: particular-integration; source: contract §4 T4 / research/12-empty-bodies-ref-rca.md RC-4.
     let fixture = RcaFixture::new();
     let db = fixture.open_db();
-    fixture.add_contract_body_column();
     fixture.seed_body_turns();
     let invocation_id = db
         .start_invocation(&InvocationStart {
@@ -47,11 +47,21 @@ fn trace_inline_transcript_embeds_db_stored_turn_bodies() {
         "inline transcript must embed DB-stored turn bodies; got {}",
         json["root"]["transcript"]
     );
+    let transcript = json["root"]["transcript"].as_array().unwrap();
     assert!(
-        json["root"]["transcript"]
-            .to_string()
-            .contains("db stored assistant body"),
+        transcript.iter().any(|turn| {
+            turn["body_state"] == "stored"
+                && turn["content"]
+                    == serde_json::json!([{"type":"text","text":"db stored assistant body"}])
+        }),
         "inline transcript must include stored assistant content: {}",
+        json["root"]["transcript"]
+    );
+    assert!(
+        transcript
+            .iter()
+            .any(|turn| turn["role"] == "user" && turn["body_state"] == "stored"),
+        "inline transcript must include a stored user turn: {}",
         json["root"]["transcript"]
     );
 }

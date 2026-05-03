@@ -179,7 +179,8 @@ fn inline_transcript_requires_json() {
 }
 
 #[test]
-fn inline_transcript_with_json_is_accepted_and_returns_null_payloads() {
+fn inline_transcript_with_json_is_accepted_and_returns_empty_arrays_without_turn_rows() {
+    // risk: trace JSON shape regression; level: particular-integration; source: contract §4 T10 / Phase 5 R4-N02.
     let fixture = Fixture::new();
     fixture.seed_trace_rows();
 
@@ -188,8 +189,19 @@ fn inline_transcript_with_json_is_accepted_and_returns_null_payloads() {
     assert!(output.status.success(), "{output:?}");
     let json: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(json["root"].get("transcript").is_some());
-    assert!(json["root"]["transcript"].is_null());
-    assert!(json["root"]["children"][0]["transcript"].is_null());
+    assert_eq!(
+        json["root"]["transcript"].as_array().unwrap().len(),
+        0,
+        "inline transcript nodes with zero session_turns rows use an empty array"
+    );
+    assert_eq!(
+        json["root"]["children"][0]["transcript"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0,
+        "inline transcript child nodes with zero session_turns rows use an empty array"
+    );
 }
 
 #[test]

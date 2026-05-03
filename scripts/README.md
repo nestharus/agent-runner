@@ -26,13 +26,18 @@ A turn script:
     "timestamp":      "<RFC 3339>",
     "role":           "user|assistant",
     "parent_turn_id": "<turn_id|null>",
-    "is_sidechain":   true
+    "is_sidechain":   true,
+    "body":           [{"type": "text", "text": "..."}]
   }
   ```
 - `parent_turn_id` and `is_sidechain` are **optional**. Adapters that don't
   track within-session parentage (or that adapt CLIs without that surface,
   like Codex) emit only the first four fields and the runner treats those
   turns as linear with `is_sidechain = false`.
+- `body` is **optional** and, when present, is a raw JSON value matching the
+  canonical content shape: an array of chunks such as
+  `{"type":"text","text":"..."}`. Omit `body` when the adapter cannot extract
+  turn content; do not emit `null`.
 - Returns 0 on success. Non-zero with diagnostic on stderr on failure.
 - Is **idempotent**: re-running with no source changes outputs nothing.
   (The runner's `session_turns` table has `UNIQUE(provider, session_id, turn_id)`,

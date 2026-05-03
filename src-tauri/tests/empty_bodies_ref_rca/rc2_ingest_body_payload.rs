@@ -7,18 +7,19 @@ use std::collections::HashMap;
 /// the body payload before SQLite.
 ///
 /// Design-intent source: user report for Phase 0 says the DB should store the
-/// content payload for every turn directly. This harness emits a turn-script
-/// record with `content` and then expects that payload to be retrievable from
+/// body payload for every turn directly. This harness emits a turn-script
+/// record with `body` and then expects that payload to be retrievable from
 /// `session_turns`.
 #[test]
 fn turn_script_ingest_persists_body_payload_in_session_turns() {
+    // risk: ingest regression; level: particular-integration; source: contract §4 T2 / research/12-empty-bodies-ref-rca.md RC-2.
     let fixture = RcaFixture::new();
     let script = fixture.write_script(
-        "turns-with-content.sh",
+        "turns-with-body.sh",
         &format!(
             "printf '%s\\n' {}",
             super::sh_path(std::path::Path::new(&format!(
-                r#"{{"session_id":"{SESSION_ID}","turn_id":"turn-with-content","timestamp":"2026-04-17T08:00:00Z","role":"assistant","content":[{{"type":"text","text":"ingested body payload"}}]}}"#
+                r#"{{"session_id":"{SESSION_ID}","turn_id":"turn-with-body","timestamp":"2026-04-17T08:00:00Z","role":"assistant","body":[{{"type":"text","text":"ingested body payload"}}]}}"#
             )))
         ),
     );
@@ -38,8 +39,8 @@ fn turn_script_ingest_persists_body_payload_in_session_turns() {
 
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     assert_eq!(report.new_turns, 1);
-    let content = fixture
-        .fetch_turn_content("turn-with-content")
+    let body = fixture
+        .fetch_turn_body("turn-with-body")
         .expect("ingested turn body must be stored in state.db");
-    assert_eq!(content[0]["text"], "ingested body payload");
+    assert_eq!(body[0]["text"], "ingested body payload");
 }

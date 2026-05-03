@@ -74,15 +74,6 @@ impl RcaFixture {
             .unwrap()
     }
 
-    pub fn add_contract_body_column(&self) {
-        self.conn()
-            .execute(
-                "ALTER TABLE session_turns ADD COLUMN content TEXT NOT NULL DEFAULT '[]'",
-                [],
-            )
-            .unwrap();
-    }
-
     pub fn seed_chain(&self) {
         let conn = self.conn();
         conn.execute(
@@ -105,7 +96,7 @@ impl RcaFixture {
         conn.execute(
             "INSERT INTO session_turns
                 (provider_name, session_id, turn_id, timestamp, role,
-                 parent_turn_id, is_sidechain, is_compaction_boundary, source_file, ingested_at, content)
+                 parent_turn_id, is_sidechain, is_compaction_boundary, source_file, ingested_at, body)
              VALUES (?1, ?2, 'turn-user', ?3, 'user', NULL, 0, 0, '', ?3, ?4)",
             params![
                 PROVIDER,
@@ -118,7 +109,7 @@ impl RcaFixture {
         conn.execute(
             "INSERT INTO session_turns
                 (provider_name, session_id, turn_id, timestamp, role,
-                 parent_turn_id, is_sidechain, is_compaction_boundary, source_file, ingested_at, content)
+                 parent_turn_id, is_sidechain, is_compaction_boundary, source_file, ingested_at, body)
              VALUES (?1, ?2, 'turn-assistant', ?3, 'assistant', 'turn-user', 0, 0, '', ?3, ?4)",
             params![
                 PROVIDER,
@@ -130,11 +121,11 @@ impl RcaFixture {
         .unwrap();
     }
 
-    pub fn fetch_turn_content(&self, turn_id: &str) -> Result<Value, String> {
+    pub fn fetch_turn_body(&self, turn_id: &str) -> Result<Value, String> {
         let raw: String = self
             .conn()
             .query_row(
-                "SELECT content FROM session_turns
+                "SELECT body FROM session_turns
                  WHERE provider_name = ?1 AND session_id = ?2 AND turn_id = ?3",
                 params![PROVIDER, SESSION_ID, turn_id],
                 |row| row.get(0),
