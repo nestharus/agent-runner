@@ -46,7 +46,7 @@ fn provider_config_source_missing_file_returns_default_empty_config() {
 
     let providers = source.load_providers().unwrap();
 
-    assert!(providers.runtime_provider("claude").is_none());
+    assert!(providers.get("claude").is_none());
 }
 
 /// Risk: T7/T8 - sessions source extraction may change absent sessions config
