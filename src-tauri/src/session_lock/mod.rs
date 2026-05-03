@@ -1,11 +1,8 @@
 use chrono::{DateTime, Utc};
-#[allow(deprecated)]
-use nix::fcntl::{FlockArg, flock};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -108,7 +105,7 @@ impl SessionLock {
         provider_name: &str,
         ttl: Duration,
     ) -> Result<Lease, LockError> {
-        self.with_flock(|| {
+        self.with_lock(|| {
             let lock_path = self.lock_path(session_id);
             let now = Utc::now();
 
@@ -167,7 +164,7 @@ impl SessionLock {
             return Err(LockError::TokenInvalid);
         }
 
-        self.with_flock(|| {
+        self.with_lock(|| {
             let lock_path = self.lock_path(session_id);
             let marker_path = self.release_marker_path(session_id);
             let now = Utc::now().to_rfc3339();
@@ -220,24 +217,21 @@ impl SessionLock {
         })
     }
 
-    #[allow(deprecated)]
-    fn with_flock<T>(&self, f: impl FnOnce() -> Result<T, LockError>) -> Result<T, LockError> {
-        flock(self.sentinel.as_raw_fd(), FlockArg::LockExclusive).map_err(|err| {
-            LockError::Operational {
-                message: format!("failed to acquire sentinel lock: {err}"),
-            }
+    fn with_lock<T>(&self, f: impl FnOnce() -> Result<T, LockError>) -> Result<T, LockError> {
+        fs4::FileExt::lock(&self.sentinel).map_err(|err| LockError::Operational {
+            message: format!("acquire sentinel lock: {err}"),
         })?;
         let result = f();
-        let unlock = flock(self.sentinel.as_raw_fd(), FlockArg::Unlock).map_err(|err| {
-            LockError::Operational {
-                message: format!("failed to release sentinel lock: {err}"),
-            }
-        });
-        match (result, unlock) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Err(err), Ok(())) => Err(err),
-            (Ok(_), Err(err)) => Err(err),
-            (Err(err), Err(_)) => Err(err),
+        let unlock_err =
+            fs4::FileExt::unlock(&self.sentinel)
+                .err()
+                .map(|err| LockError::Operational {
+                    message: format!("release sentinel lock: {err}"),
+                });
+        match (result, unlock_err) {
+            (Ok(value), None) => Ok(value),
+            (Ok(_), Some(err)) => Err(err),
+            (Err(err), _) => Err(err),
         }
     }
 

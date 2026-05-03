@@ -99,10 +99,6 @@ jobs:
 
   build:
     needs: version
-    # Windows is intentionally absent. session_lock and session_replace use
-    # POSIX-only primitives (nix::fcntl::flock, AsRawFd, atomic rename and
-    # hard-link publication, 0o600 file modes) by design. See DECISIONS.md
-    # entry D-006. macOS and Linux are the supported targets.
     strategy:
       fail-fast: false
       matrix:
@@ -113,6 +109,9 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             bundles: dmg
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: msi,nsis
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -142,13 +141,21 @@ jobs:
         run: |
           mkdir -p artifacts
           cp src-tauri/target/${{ matrix.target }}/release/bundle/deb/*.deb artifacts/ 2>/dev/null || true
-          cp src-tauri/target/${{ matrix.target }}/release/oulipoly-agent-runner artifacts/ 2>/dev/null || true
+          cp src-tauri/target/${{ matrix.target }}/release/oulipoly-agent-runner artifacts/oulipoly-agent-runner-${{ matrix.target }} 2>/dev/null || true
       - name: Collect artifacts (macOS)
         if: runner.os == 'macOS'
         run: |
           mkdir -p artifacts
           cp src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg artifacts/ 2>/dev/null || true
-          cp src-tauri/target/${{ matrix.target }}/release/oulipoly-agent-runner artifacts/ 2>/dev/null || true
+          cp src-tauri/target/${{ matrix.target }}/release/oulipoly-agent-runner artifacts/oulipoly-agent-runner-${{ matrix.target }} 2>/dev/null || true
+      - name: Collect artifacts (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts
+          Copy-Item src-tauri/target/${{ matrix.target }}/release/bundle/msi/*.msi artifacts/ -ErrorAction SilentlyContinue
+          Copy-Item src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.exe artifacts/ -ErrorAction SilentlyContinue
+          Copy-Item src-tauri/target/${{ matrix.target }}/release/oulipoly-agent-runner.exe artifacts/oulipoly-agent-runner-${{ matrix.target }}.exe -ErrorAction SilentlyContinue
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}

@@ -119,47 +119,83 @@ revisited.
   to `recover_pending_replaces`; it is not technically blocked, just not
   prioritized.
 
-## D-006 — Windows is not a supported target
+## D-006 — Windows is a supported release target
 
-- **Source**: Initiative 06 PR #17 (`session_lock`) and PR #18
-  (`session_replace`) introduced POSIX-only primitives:
-  `nix::fcntl::flock`, `std::os::fd::AsRawFd`, hard-link publication
-  (`fs::hard_link`), atomic rename semantics (POSIX rename atomicity is
-  stronger than Windows MoveFileEx), 0o600 file modes, and Claude path-hash
-  decomposition that assumes `/`-separated paths. Discovered when the manual
-  Release workflow's `windows-latest` build started failing on `cargo build`
-  with `error[E0432]: unresolved import nix::fcntl` after PR #17 merged.
-  CI (`ci.yml`) runs only `ubuntu-latest`, so the regression went unflagged
-  until the first post-Initiative-06 release attempt.
-- **Decision**: Linux and macOS are the supported targets. Windows is
-  removed from the Release workflow matrix. The CLI is documented as a
-  Unix-only tool. No Windows shim, no `#[cfg(unix)]` gates, no NTFS-based
-  alternative locking implementation.
+- **Source**: WU-13-01 restored the Release workflow's Windows matrix row
+  and replaced the POSIX-only `session_lock` primitive that had blocked
+  Windows builds after Initiative 06.
+- **Decision**: Windows is a supported release target for the `agents`
+  binary alongside Linux and macOS. `session_lock` uses the cross-platform
+  `fs4` sentinel-file locking abstraction, which maps to Unix `flock(2)`
+  and Windows `LockFileEx`, while preserving the existing lease and release
+  API.
 - **Rationale**:
-  - The features that depend on POSIX primitives (`agents session
-    pause-handshake` / `import-replace` / `locate` / `export`) are core to
-    the project's value, not optional surfaces. A Windows port would have
-    to provide functionally-equivalent semantics for: advisory file locks
-    that release on process exit (Windows lacks POSIX `flock` semantics
-    natively — `LockFileEx` is the closest, with different exclusivity and
-    inheritance rules); atomic rename across same-volume directory entries
-    (NTFS-via-`MoveFileEx` is close enough); hard-link publication
-    (NTFS supports it, but the same-inode invariant differs); and Claude /
-    Codex transcript path conventions that the providers themselves only
-    document on Linux/macOS.
-  - The harness consumer (`agent-harness`) and the user's actual day-to-day
-    usage are on Linux. macOS coverage already exercises the same POSIX
-    code paths.
-  - Maintaining a Windows port would double the QA surface for a feature
-    set that is primarily about coordinating local-machine provider CLIs
-    (`claude`, `codex`) which themselves are not first-class on Windows.
-- **Revisit when**: a real user reports needing Windows. At that point,
-  evaluate whether to (a) implement a separate `session_lock_windows`
-  module with `LockFileEx` semantics and equivalent rename/publish
-  primitives, or (b) provide a "feature-gated stub" that compiles on
-  Windows but returns "unsupported on this platform" errors for every
-  affected CLI subcommand. Either route is several days of work plus a
-  Windows-shaped test environment; not warranted absent demand.
+  - Unix keeps owner-only lock metadata permissions: `0o700` lock
+    directories and `0o600` sentinel/temp metadata files.
+  - Windows relies on default current-user profile/app-data ACL inheritance
+    for lock metadata privacy in this single-user developer deployment.
+    Explicit DACL hardening is intentionally outside WU-13-01.
+  - `session_replace` publication continues to use same-root or sibling
+    `std::fs::rename` paths. No hard-link publication is part of the mapped
+    implementation.
+  - Release assets use platform-suffixed bare binary names, while `.deb`,
+    `.dmg`, `.msi`, and NSIS bundles keep conventional package names.
+- **Revisit when**: Windows users require stronger multi-user metadata
+  isolation than inherited app-data ACLs provide, or when release-run
+  evidence shows a platform-specific packaging or filesystem behavior that
+  needs a dedicated Windows hardening work unit.
+
+---
+
+## D-007 — Reproduction harness skipped for the Windows port and bare-binary collision regressions
+
+- **Source**: Same release-restore work unit. The ticket explicitly
+  authorized skipping the implementation pipeline's optional
+  reproduction-harness step for these two regressions.
+- **Decision**: No reproduction harness is produced for either regression.
+- **Rationale**: Both root causes are documented inline in existing
+  evidence and a harness would not clarify them:
+  - The Windows removal is the unauthorized matrix change visible in
+    `git show 9df5603 -- .github/workflows/release.yml`. That commit's
+    own message records the POSIX-only `nix::fcntl` constraint that
+    motivated it.
+  - The bare-binary collision is visible in the pre-fix
+    `.github/workflows/release.yml` upload pipeline: two build jobs
+    uploaded an artifact named `oulipoly-agent-runner` and the
+    release-publish step flattens them into a single `artifacts/`
+    directory before invoking `softprops/action-gh-release@v2`, so
+    the second-uploaded file overwrites the first by name.
+  The new portable `SessionLock` integration test and the new
+  structural `release.yml` parsing test cover both regressions
+  directly, replacing the role a reproduction harness would have
+  played.
+- **Revisit when**: A future Windows or release regression has a root
+  cause that is not directly observable from the workflow source or
+  commit history. In that case author a reproduction harness before
+  the fix.
+
+---
+
+## D-008 — Problem-map human approval gate pre-skipped for the release-restore work
+
+- **Source**: Same release-restore work unit. The ticket pre-approved
+  skipping the implementation pipeline's per-work-unit problem-map
+  human checkpoint so the pipeline could advance from problem analysis
+  to design without a manual approval round.
+- **Decision**: The pipeline did not surface a manual problem-map
+  approval prompt. `research/13-release-restore-problem-map.md` was
+  carried into the design step on the strength of its own contents and
+  the ticket's pre-approval.
+- **Rationale**: Both regressions have well-understood scope (the
+  `session_lock` POSIX surface and the `release.yml` upload step). The
+  problem map's enumeration of touched files and assumptions did not
+  surface a previously-unevaluated value, scope, or trade-off question
+  for the user. A manual gate here would have been ceremonial.
+- **Revisit when**: A future Windows-tier or release-pipeline work
+  unit has a problem map that surfaces a previously-unevaluated value,
+  scope, or trade-off question. In that case the pipeline must emit a
+  problem-map question to the root and block on the answer rather than
+  relying on this work unit's pre-approval.
 
 ---
 
