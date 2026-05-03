@@ -2,20 +2,62 @@
 
 mod fixtures;
 
+use agent_runner_lib::config::{
+    ModelConfig, ModelConfigRepository, ProviderConfigSource, ProvidersConfig, SessionsConfig,
+    SessionsConfigSource,
+};
+use agent_runner_lib::process::OsProcessRunner;
 use agent_runner_lib::session_metadata::{
     MetadataError, SessionMetadata, SessionStorageType, locate_session_metadata,
 };
 use fixtures::initiative_06::*;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::Path;
+
+struct StaticModelRepo(HashMap<String, ModelConfig>);
+struct StaticProviderSource(ProvidersConfig);
+struct StaticSessionsSource(SessionsConfig);
+
+impl ModelConfigRepository for StaticModelRepo {
+    fn load_models(&self) -> Result<HashMap<String, ModelConfig>, String> {
+        Ok(self.0.clone())
+    }
+
+    fn save_model(&self, _model: &ModelConfig) -> Result<(), String> {
+        unreachable!("metadata lookup must not mutate models")
+    }
+
+    fn delete_model(&self, _name: &str) -> Result<(), String> {
+        unreachable!("metadata lookup must not mutate models")
+    }
+}
+
+impl ProviderConfigSource for StaticProviderSource {
+    fn load_providers(&self) -> Result<ProvidersConfig, String> {
+        Ok(self.0.clone())
+    }
+}
+
+impl SessionsConfigSource for StaticSessionsSource {
+    fn load_sessions(&self) -> Result<SessionsConfig, String> {
+        Ok(self.0.clone())
+    }
+}
 
 fn locate(prepared: &PreparedLocate) -> Result<SessionMetadata, MetadataError> {
     let db = prepared.fixture.open_db();
+    let model_repo = StaticModelRepo(prepared.fixture.models());
+    let provider_source = StaticProviderSource(prepared.fixture.providers_config());
+    let sessions_source = StaticSessionsSource(prepared.fixture.sessions_config());
+    let runner = OsProcessRunner;
+
     locate_session_metadata(
         &db,
-        &prepared.fixture.models(),
-        &prepared.fixture.providers_config(),
-        &prepared.fixture.sessions_config(),
+        &model_repo,
+        &provider_source,
+        &sessions_source,
+        &runner,
         &prepared.session_id,
     )
 }
