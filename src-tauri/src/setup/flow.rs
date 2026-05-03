@@ -5,6 +5,8 @@ use super::detection;
 use super::memory::MemoryGraph;
 use super::schemas::AGENT_TURN_SCHEMA;
 use super::sync;
+use crate::process::{CommandSpec, OutputSpec, ProcessRunner, StdinSpec};
+use std::sync::Arc;
 use tauri::ipc::Channel;
 use tokio::sync::mpsc;
 
@@ -21,6 +23,7 @@ pub struct SetupFlow {
     input_rx: mpsc::Receiver<UserResponse>,
     memory: MemoryGraph,
     session_id: String,
+    runner: Arc<dyn ProcessRunner>,
 }
 
 impl SetupFlow {
@@ -35,6 +38,23 @@ impl SetupFlow {
             input_rx,
             memory,
             session_id,
+            runner: Arc::new(crate::process::OsProcessRunner),
+        }
+    }
+
+    pub fn new_with_runner(
+        channel: Channel<SetupEvent>,
+        input_rx: mpsc::Receiver<UserResponse>,
+        memory: MemoryGraph,
+        session_id: String,
+        runner: Arc<dyn ProcessRunner>,
+    ) -> Self {
+        SetupFlow {
+            channel,
+            input_rx,
+            memory,
+            session_id,
+            runner,
         }
     }
 
@@ -47,7 +67,7 @@ impl SetupFlow {
             message: "Detecting installed CLIs...".into(),
         });
 
-        let report = detection::detect_all();
+        let report = detection::detect_all_with_runner(self.runner.as_ref());
         let _ = self.channel.send(SetupEvent::ShowResult {
             content: ResultContent::DetectionSummary {
                 clis: detection::summarize(&report),
@@ -81,7 +101,7 @@ impl SetupFlow {
                         message: "Verifying Claude CLI installation...".into(),
                     });
                     // Re-detect
-                    let new_report = detection::detect_all();
+                    let new_report = detection::detect_all_with_runner(self.runner.as_ref());
                     if !new_report
                         .clis
                         .iter()
@@ -123,7 +143,7 @@ impl SetupFlow {
             message: format!("Detecting {} CLI...", cli_name),
         });
 
-        let cli_info = detection::detect_single_cli(cli_name);
+        let cli_info = detection::detect_single_cli_with_runner(cli_name, self.runner.as_ref());
         let report = detection::DetectionReport {
             clis: vec![cli_info],
             os: detection::detect_os_public(),
@@ -138,7 +158,7 @@ impl SetupFlow {
     }
 
     async fn run_agent_loop(&mut self, system_prompt: String, initial_message: &str) {
-        let mut agent = SetupAgent::new(system_prompt);
+        let mut agent = SetupAgent::with_system_prompt(system_prompt);
         let mut turn_number = 0;
         let mut next_message = initial_message.to_string();
 
@@ -169,7 +189,11 @@ impl SetupFlow {
                 message: "Thinking...".into(),
             });
 
-            let result = match agent.send_turn(&next_message, AGENT_TURN_SCHEMA) {
+            let result = match agent.send_turn_with_runner(
+                self.runner.as_ref(),
+                &next_message,
+                AGENT_TURN_SCHEMA,
+            ) {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = self.channel.send(SetupEvent::Error {
@@ -211,7 +235,7 @@ impl SetupFlow {
                             message: description.clone(),
                         });
 
-                        match execute_allowlisted(command, args) {
+                        match execute_allowlisted_with_runner(self.runner.as_ref(), command, args) {
                             Ok((stdout, stderr, exit_code)) => {
                                 let _ = self.channel.send(SetupEvent::ShowResult {
                                     content: ResultContent::CommandOutput {
@@ -278,7 +302,7 @@ impl SetupFlow {
                             message: format!("Testing {model_name}..."),
                         });
 
-                        match execute_allowlisted(command, args) {
+                        match execute_allowlisted_with_runner(self.runner.as_ref(), command, args) {
                             Ok((stdout, stderr, exit_code)) => {
                                 let success = exit_code == 0;
                                 let output = if success {
@@ -416,19 +440,34 @@ impl SetupFlow {
 }
 
 fn execute_allowlisted(command: &str, args: &[String]) -> Result<(String, String, i32), String> {
+    execute_allowlisted_with_runner(&crate::process::OsProcessRunner, command, args)
+}
+
+fn execute_allowlisted_with_runner(
+    runner: &dyn ProcessRunner,
+    command: &str,
+    args: &[String],
+) -> Result<(String, String, i32), String> {
     if !ALLOWED_COMMANDS.contains(&command) {
         return Err(format!("Command '{command}' is not in the allowlist"));
     }
 
-    let output = std::process::Command::new(command)
-        .args(args)
-        .output()
-        .map_err(|e| format!("Failed to execute '{command}': {e}"))?;
+    let output = runner.run(CommandSpec {
+        program: command.to_string(),
+        args: args.to_vec(),
+        cwd: None,
+        env: Default::default(),
+        stdin: StdinSpec::Null,
+        stdout: OutputSpec::Capture,
+        stderr: OutputSpec::Capture,
+        timeout: None,
+        description: format!("setup command {command}"),
+    })?;
 
     Ok((
         String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
-        output.status.code().unwrap_or(-1),
+        output.exit_code,
     ))
 }
 

@@ -184,6 +184,15 @@ pub struct AgentTurnResult {
     pub done: bool,
 }
 
+impl std::fmt::Debug for AgentTurnResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentTurnResult")
+            .field("actions_len", &self.actions.len())
+            .field("done", &self.done)
+            .finish()
+    }
+}
+
 /// An instruction from the agent to the flow orchestrator
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

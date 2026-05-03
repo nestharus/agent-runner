@@ -2017,7 +2017,7 @@ fn run_with_balancing(
     eprintln!("{}", invocation.stderr_line());
 
     let result = match executor::execute_effective_with_inputs_and_env(
-        executor::cli::EffectiveExecuteRequest {
+        executor::cli::EffectiveExecuteWithInputsRequest {
             model,
             provider: &provider,
             provider_index,
