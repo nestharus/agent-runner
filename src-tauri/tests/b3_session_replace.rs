@@ -151,13 +151,14 @@ fn busy_lock_returns_before_pending_journal_is_written() {
     let sessions = FilesystemSessionsConfigSource::new(paths.sessions_path.clone());
     let runner = FakeProcessRunner::new();
     let locks = FilesystemSessionLockProvider;
-    let held = agent_runner_lib::session_lock::SessionLock::new(
-        &paths.lock_dir,
-        &prepared.session_id,
-        &prepared.provider_name,
-    )
-    .acquire(Duration::from_secs(60))
-    .unwrap();
+    let lock = agent_runner_lib::session_lock::SessionLock::new(&paths.lock_dir).unwrap();
+    let held = lock
+        .acquire(
+            &prepared.session_id,
+            &prepared.provider_name,
+            Duration::from_secs(60),
+        )
+        .unwrap();
     let input_path = prepared.fixture.stage_jsonl(
         "busy.jsonl",
         &canonical_jsonl(
