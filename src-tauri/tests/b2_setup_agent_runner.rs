@@ -19,7 +19,7 @@ use std::time::Duration;
 #[test]
 fn send_turn_with_runner_preserves_single_combined_prompt_arg() {
     let runner = FakeProcessRunner::with_responses(vec![ok_output("not json", "", 0)]);
-    let mut agent = SetupAgent::new();
+    let mut agent = SetupAgent::new("system prompt".to_string());
 
     let _err = agent
         .send_turn_with_runner(&runner, "Install Claude", r#"{"type":"object"}"#)
@@ -70,7 +70,7 @@ fn send_turn_with_runner_preserves_single_combined_prompt_arg() {
 fn send_turn_with_runner_preserves_nonzero_exit_error_and_stderr_truncation() {
     let long_stderr = format!("{}TAIL", "x".repeat(650));
     let runner = FakeProcessRunner::with_responses(vec![ok_output("", long_stderr, 17)]);
-    let mut agent = SetupAgent::new();
+    let mut agent = SetupAgent::new("system prompt".to_string());
 
     let err = agent
         .send_turn_with_runner(&runner, "Continue", r#"{"type":"object"}"#)
@@ -90,12 +90,12 @@ fn send_turn_resumed_session_sends_only_message_in_prompt_arg() {
     let runner = FakeProcessRunner::with_responses(vec![
         ok_output(
             r#"{"actions":[{"type":"status","message":"first"}],"done":false}"#,
-            "Session ID: abc123",
+            "Session: abc123",
             0,
         ),
         ok_output("not json", "", 0),
     ]);
-    let mut agent = SetupAgent::with_system_prompt("system prompt".to_string());
+    let mut agent = SetupAgent::new("system prompt".to_string());
 
     agent
         .send_turn_with_runner(&runner, "first turn", r#"{"type":"object"}"#)
