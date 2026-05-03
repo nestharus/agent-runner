@@ -111,3 +111,38 @@ fn send_turn_with_runner_preserves_resume_session_arg_on_next_turn() {
     );
     assert!(calls[1].args.last().unwrap().ends_with("\n\n---\n\nSecond"));
 }
+
+/// Risk: T12 (setup_agent send_turn argv preservation, resumed-session path)
+/// Source: contract §1.5 anti-drift; pre-B `setup/agent.rs:33-41`
+/// (session_id.is_some() => message-only prompt)
+/// Level: component
+/// Fixture source: src-tauri/tests/fixtures/b2_process_runner.rs
+#[test]
+fn send_turn_resumed_session_sends_only_message_in_prompt_arg() {
+    let runner = FakeProcessRunner::with_responses(vec![
+        ok_output(
+            r#"{"actions":[{"type":"status","message":"first"}],"done":false}"#,
+            "Session ID: abc123",
+            0,
+        ),
+        ok_output("not json", "", 0),
+    ]);
+    let mut agent = SetupAgent::with_system_prompt("system prompt".to_string());
+
+    agent
+        .send_turn_with_runner(&runner, "first turn", r#"{"type":"object"}"#)
+        .unwrap();
+    let _err = agent
+        .send_turn_with_runner(&runner, "user message", r#"{"type":"object"}"#)
+        .unwrap_err();
+
+    let calls = runner.calls();
+    assert_eq!(calls.len(), 2);
+    assert!(
+        calls[1]
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--resume", "abc123"])
+    );
+    assert_eq!(calls[1].args.last().unwrap(), "user message");
+}
