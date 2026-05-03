@@ -20,13 +20,12 @@ pub use runtime::{DefaultRuntimePaths, RuntimePaths, RuntimeServices, cli_servic
 use serde::{Deserialize, Serialize};
 use session::SessionLockProvider;
 use setup::actions::{SetupEvent, UserResponse};
+#[cfg(test)]
+use state::DefaultStateDbOpener;
 #[allow(unused_imports)]
 use state::StateDb;
 use state::{AccountRecord, AuthMethod, AuthStatus, CliProviderRecord};
-use state::{
-    CliProviderRepository, DefaultStateDbOpener, DiscoveryRepository, QuotaRepository,
-    StateDbOpener,
-};
+use state::{CliProviderRepository, DiscoveryRepository, QuotaRepository, StateDbOpener};
 use state::{DiscoveredModel, ModelParameter};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -521,24 +520,6 @@ async fn test_model(
     Ok(result)
 }
 
-#[allow(dead_code)]
-fn test_model_with_db_path(
-    model: ModelConfig,
-    db_path: PathBuf,
-    prompt: &str,
-) -> Result<TestModelResult, String> {
-    let opener = DefaultStateDbOpener;
-    let runner = process::OsProcessRunner;
-    test_model_with_deps(
-        model,
-        &config::ProvidersConfig::default(),
-        &opener,
-        &runner,
-        db_path,
-        prompt,
-    )
-}
-
 fn test_model_with_deps(
     model: ModelConfig,
     providers_cfg: &config::ProvidersConfig,
@@ -596,7 +577,16 @@ pub(crate) fn test_model_for_test(
         .cloned()
         .ok_or_else(|| format!("Model '{}' not found", name))?;
     let db_path = models_dir.parent().unwrap_or(&models_dir).join("state.db");
-    test_model_with_db_path(model, db_path, "Say hello in one sentence.")
+    let opener = DefaultStateDbOpener;
+    let runner = process::OsProcessRunner;
+    test_model_with_deps(
+        model,
+        &config::ProvidersConfig::default(),
+        &opener,
+        &runner,
+        db_path,
+        "Say hello in one sentence.",
+    )
 }
 
 // --- Provider & Account commands ---

@@ -6,7 +6,10 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-const SCRIPT_TIMEOUT_SECS: u64 = 10;
+// TODO(post-C): dedupe with agent_runner_session::scan::SCRIPT_TIMEOUT_SECS.
+// Cannot import from agent-runner-session here (would create balancer->session edge).
+// Pre-C value: 600.
+const SCRIPT_TIMEOUT_SECS: u64 = 600;
 
 #[derive(Debug, Clone)]
 pub enum MigrationError {
