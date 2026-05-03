@@ -56,6 +56,31 @@ pub struct ProcessOutput {
     pub timed_out: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcessErrorPhase {
+    Spawn,
+    WriteStdin,
+    Wait,
+}
+
+pub(crate) fn process_error_phase_and_detail(error: &str) -> (Option<ProcessErrorPhase>, &str) {
+    let patterns = [
+        ("Failed to spawn ", ProcessErrorPhase::Spawn),
+        ("Failed to write stdin for ", ProcessErrorPhase::WriteStdin),
+        ("Failed to wait for ", ProcessErrorPhase::Wait),
+    ];
+
+    for (prefix, phase) in patterns {
+        if let Some(rest) = error.strip_prefix(prefix)
+            && let Some((_, detail)) = rest.split_once(": ")
+        {
+            return (Some(phase), detail);
+        }
+    }
+
+    (None, error)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InteractiveCommandSpec {
     pub program: String,

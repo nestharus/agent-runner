@@ -1,5 +1,8 @@
 use super::actions::AgentTurnResult;
-use crate::process::{CommandSpec, OsProcessRunner, OutputSpec, ProcessRunner, StdinSpec};
+use crate::process::{
+    CommandSpec, OsProcessRunner, OutputSpec, ProcessErrorPhase, ProcessRunner, StdinSpec,
+    process_error_phase_and_detail,
+};
 use std::time::Duration;
 
 pub struct SetupAgent {
@@ -8,11 +11,7 @@ pub struct SetupAgent {
 }
 
 impl SetupAgent {
-    pub fn new() -> Self {
-        Self::with_system_prompt(String::new())
-    }
-
-    pub fn with_system_prompt(system_prompt: String) -> Self {
+    pub fn new(system_prompt: String) -> Self {
         SetupAgent {
             session_id: None,
             system_prompt,
@@ -70,7 +69,7 @@ impl SetupAgent {
                 if e.contains("timed out") {
                     "Claude CLI timed out after 120 seconds".to_string()
                 } else {
-                    format!("Failed to spawn claude CLI: {e}")
+                    setup_agent_process_error(&e)
                 }
             })?;
 
@@ -112,14 +111,19 @@ fn extract_session_id(stderr: &str) -> Option<String> {
         if let Some(rest) = trimmed.strip_prefix("Session: ") {
             return Some(rest.trim().to_string());
         }
-        if let Some(rest) = trimmed.strip_prefix("Session ID: ") {
-            return Some(rest.trim().to_string());
-        }
         if let Some(rest) = trimmed.strip_prefix("session_id: ") {
             return Some(rest.trim().to_string());
         }
     }
     None
+}
+
+fn setup_agent_process_error(error: &str) -> String {
+    let (phase, detail) = process_error_phase_and_detail(error);
+    match phase {
+        Some(ProcessErrorPhase::Wait) => format!("Failed to check claude CLI status: {detail}"),
+        _ => format!("Failed to spawn claude CLI: {detail}"),
+    }
 }
 
 #[cfg(test)]
@@ -131,7 +135,7 @@ mod tests {
 
     #[test]
     fn agent_creation() {
-        let agent = SetupAgent::with_system_prompt("test prompt".to_string());
+        let agent = SetupAgent::new("test prompt".to_string());
         assert!(agent.session_id().is_none());
     }
 
@@ -234,7 +238,7 @@ printf '%s' '{"actions":[{"type":"status","message":"Ready"}],"done":true}'
     #[test]
     fn send_turn_uses_schema_constrained_json_mode_and_parses_actions() {
         with_fake_claude(successful_fake_claude_script(), |_, args_log| {
-            let mut agent = SetupAgent::with_system_prompt("system prompt".to_string());
+            let mut agent = SetupAgent::new("system prompt".to_string());
 
             let result = agent
                 .send_turn("begin setup", "{\"type\":\"object\"}")
@@ -281,7 +285,7 @@ printf '%s' '{"actions":[{"type":"status","message":"Ready"}],"done":true}'
     #[test]
     fn send_turn_resumes_with_learned_session_id_and_message_only_prompt() {
         with_fake_claude(successful_fake_claude_script(), |_, args_log| {
-            let mut agent = SetupAgent::with_system_prompt("system prompt".to_string());
+            let mut agent = SetupAgent::new("system prompt".to_string());
 
             agent.send_turn("first turn", "{}").unwrap();
             agent.send_turn("second turn", "{}").unwrap();
@@ -308,7 +312,7 @@ exit 7
 "#;
 
         with_fake_claude(script, |_, _| {
-            let mut agent = SetupAgent::with_system_prompt("system prompt".to_string());
+            let mut agent = SetupAgent::new("system prompt".to_string());
 
             let err = match agent.send_turn("begin setup", "{}") {
                 Ok(_) => panic!("expected nonzero Claude exit to fail"),
@@ -328,7 +332,7 @@ printf '%s' 'not-json'
 "#;
 
         with_fake_claude(script, |_, _| {
-            let mut agent = SetupAgent::with_system_prompt("system prompt".to_string());
+            let mut agent = SetupAgent::new("system prompt".to_string());
 
             let err = match agent.send_turn("begin setup", "{}") {
                 Ok(_) => panic!("expected malformed JSON to fail"),

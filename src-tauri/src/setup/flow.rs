@@ -5,7 +5,7 @@ use super::detection;
 use super::memory::MemoryGraph;
 use super::schemas::AGENT_TURN_SCHEMA;
 use super::sync;
-use crate::process::{CommandSpec, OutputSpec, ProcessRunner, StdinSpec};
+use crate::process::ProcessRunner;
 use std::sync::Arc;
 use tauri::ipc::Channel;
 use tokio::sync::mpsc;
@@ -158,7 +158,7 @@ impl SetupFlow {
     }
 
     async fn run_agent_loop(&mut self, system_prompt: String, initial_message: &str) {
-        let mut agent = SetupAgent::with_system_prompt(system_prompt);
+        let mut agent = SetupAgent::new(system_prompt);
         let mut turn_number = 0;
         let mut next_message = initial_message.to_string();
 
@@ -235,7 +235,7 @@ impl SetupFlow {
                             message: description.clone(),
                         });
 
-                        match execute_allowlisted_with_runner(self.runner.as_ref(), command, args) {
+                        match execute_allowlisted(command, args) {
                             Ok((stdout, stderr, exit_code)) => {
                                 let _ = self.channel.send(SetupEvent::ShowResult {
                                     content: ResultContent::CommandOutput {
@@ -302,7 +302,7 @@ impl SetupFlow {
                             message: format!("Testing {model_name}..."),
                         });
 
-                        match execute_allowlisted_with_runner(self.runner.as_ref(), command, args) {
+                        match execute_allowlisted(command, args) {
                             Ok((stdout, stderr, exit_code)) => {
                                 let success = exit_code == 0;
                                 let output = if success {
@@ -440,34 +440,19 @@ impl SetupFlow {
 }
 
 fn execute_allowlisted(command: &str, args: &[String]) -> Result<(String, String, i32), String> {
-    execute_allowlisted_with_runner(&crate::process::OsProcessRunner, command, args)
-}
-
-fn execute_allowlisted_with_runner(
-    runner: &dyn ProcessRunner,
-    command: &str,
-    args: &[String],
-) -> Result<(String, String, i32), String> {
     if !ALLOWED_COMMANDS.contains(&command) {
         return Err(format!("Command '{command}' is not in the allowlist"));
     }
 
-    let output = runner.run(CommandSpec {
-        program: command.to_string(),
-        args: args.to_vec(),
-        cwd: None,
-        env: Default::default(),
-        stdin: StdinSpec::Null,
-        stdout: OutputSpec::Capture,
-        stderr: OutputSpec::Capture,
-        timeout: None,
-        description: format!("setup command {command}"),
-    })?;
+    let output = std::process::Command::new(command)
+        .args(args)
+        .output()
+        .map_err(|e| format!("Failed to execute '{command}': {e}"))?;
 
     Ok((
         String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
-        output.exit_code,
+        output.status.code().unwrap_or(-1),
     ))
 }
 

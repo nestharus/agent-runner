@@ -1,4 +1,7 @@
-use crate::process::{CommandSpec, OsProcessRunner, OutputSpec, ProcessRunner, StdinSpec};
+use crate::process::{
+    CommandSpec, OsProcessRunner, OutputSpec, ProcessRunner, StdinSpec,
+    process_error_phase_and_detail,
+};
 use crate::state::{CliMapping, DiscoveredModel, ModelParameter, ParamType};
 
 /// Result of a model discovery attempt for a single CLI.
@@ -116,7 +119,10 @@ fn get_cli_version(cli_name: &str, runner: &dyn ProcessRunner) -> Result<String,
             timeout: None,
             description: "discover cli version".to_string(),
         })
-        .map_err(|e| format!("CLI '{}' not found or not executable: {}", cli_name, e))?;
+        .map_err(|e| {
+            let (_, detail) = process_error_phase_and_detail(&e);
+            format!("CLI '{}' not found or not executable: {}", cli_name, detail)
+        })?;
 
     if output.exit_code == 0 {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
@@ -149,7 +155,10 @@ fn run_cli_command(
             timeout: None,
             description: "discover models command".to_string(),
         })
-        .map_err(|e| format!("Failed to run {} {:?}: {}", cli_name, args, e))?;
+        .map_err(|e| {
+            let (_, detail) = process_error_phase_and_detail(&e);
+            format!("Failed to run {} {:?}: {}", cli_name, args, detail)
+        })?;
 
     // Accept both success and some failure codes (help often returns non-zero)
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();

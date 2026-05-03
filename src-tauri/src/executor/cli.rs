@@ -3,7 +3,8 @@ use crate::config::{
     SessionCaptureKind,
 };
 use crate::process::{
-    CommandSpec, InteractiveCommandSpec, OsProcessRunner, OutputSpec, ProcessRunner, StdinSpec,
+    CommandSpec, InteractiveCommandSpec, OsProcessRunner, OutputSpec, ProcessErrorPhase,
+    ProcessRunner, StdinSpec, process_error_phase_and_detail,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -515,7 +516,7 @@ fn execute_provider_with_args(
 
     let output = runner
         .run(spec)
-        .map_err(|e| format!("Failed to spawn '{}': {e}", provider.command))?;
+        .map_err(|e| execute_process_error(&provider.command, &e))?;
 
     let capture_outcome = finalize_capture(&capture_plan, &output.stdout);
     let stdout = maybe_restore_plain_stdout(&capture_plan, &capture_outcome, &output.stdout);
@@ -709,7 +710,22 @@ pub fn execute_interactive_with_runner(
     )?;
     runner
         .run_interactive(spec)
-        .map_err(|e| format!("Failed to spawn '{}': {e}", provider.command))
+        .map_err(|e| execute_process_error(&provider.command, &e))
+}
+
+fn execute_process_error(command: &str, error: &str) -> String {
+    let (phase, detail) = process_error_phase_and_detail(error);
+    match phase {
+        Some(ProcessErrorPhase::Wait) => format!("Failed to wait for process: {detail}"),
+        Some(ProcessErrorPhase::WriteStdin) => format!("Failed to write to stdin: {detail}"),
+        Some(ProcessErrorPhase::Spawn) | None => {
+            if phase.is_none() && error.starts_with("Failed to install signal handlers:") {
+                error.to_string()
+            } else {
+                format!("Failed to spawn '{command}': {detail}")
+            }
+        }
+    }
 }
 
 fn build_interactive_command_spec(

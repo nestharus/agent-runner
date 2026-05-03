@@ -3,7 +3,10 @@
 //! stdout. The parsed reading lands in `provider_quotas` + `provider_quota_windows`.
 
 use crate::config::ProvidersConfig;
-use crate::process::{CommandSpec, OutputSpec, ProcessRunner, StdinSpec};
+use crate::process::{
+    CommandSpec, OutputSpec, ProcessErrorPhase, ProcessRunner, StdinSpec,
+    process_error_phase_and_detail,
+};
 use crate::state::QuotaRepository;
 use crate::state::QuotaWindowInput;
 use chrono::{DateTime, Utc};
@@ -236,7 +239,7 @@ fn run_refresh_command(runner: &dyn ProcessRunner, cmd_str: &str) -> Result<(), 
             if e.contains("timed out") {
                 format!("auth_refresh_command timed out after {REFRESH_TIMEOUT_SECS}s")
             } else {
-                format!("Failed to spawn auth_refresh_command: {e}")
+                quota_process_error("auth_refresh_command", &e)
             }
         })?;
 
@@ -268,7 +271,7 @@ fn run_script(runner: &dyn ProcessRunner, script: &str) -> Result<Vec<QuotaWindo
             if e.contains("timed out") {
                 format!("Quota script timed out after {SCRIPT_TIMEOUT_SECS}s")
             } else {
-                format!("Failed to spawn quota script: {e}")
+                quota_process_error("quota script", &e)
             }
         })?;
 
@@ -284,6 +287,21 @@ fn run_script(runner: &dyn ProcessRunner, script: &str) -> Result<Vec<QuotaWindo
     }
 
     parse_output(&stdout_text)
+}
+
+fn quota_process_error(kind: &str, error: &str) -> String {
+    let (phase, detail) = process_error_phase_and_detail(error);
+    match (kind, phase) {
+        ("auth_refresh_command", Some(ProcessErrorPhase::Wait)) => {
+            format!("auth_refresh_command wait failed: {detail}")
+        }
+        ("quota script", Some(ProcessErrorPhase::Wait)) => {
+            format!("Quota script wait failed: {detail}")
+        }
+        ("auth_refresh_command", _) => format!("Failed to spawn auth_refresh_command: {detail}"),
+        ("quota script", _) => format!("Failed to spawn quota script: {detail}"),
+        _ => detail.to_string(),
+    }
 }
 
 fn parse_output(stdout: &str) -> Result<Vec<QuotaWindowInput>, String> {
