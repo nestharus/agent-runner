@@ -1,5 +1,5 @@
 use super::repository::{ResumeDbFacts, TransitionReason};
-use crate::config::ModelConfig;
+use crate::config::{FilesystemModelConfigRepository, ModelConfig, ModelConfigRepository};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -1347,7 +1347,7 @@ impl StateDb {
         let models_dir = dirs::config_dir()
             .map(|dir| dir.join("oulipoly-agent-runner").join("models"))
             .unwrap_or_else(|| std::path::PathBuf::from("models"));
-        let models = match Self::load_provider_lookup_models(&models_dir) {
+        let models = match FilesystemModelConfigRepository::new(models_dir.clone()).load_models() {
             Ok(m) => m,
             Err(e) => {
                 eprintln!(
@@ -1364,42 +1364,6 @@ impl StateDb {
             }
         }
         Ok(lookup)
-    }
-
-    fn load_provider_lookup_models(
-        models_dir: &Path,
-    ) -> Result<HashMap<String, ModelConfig>, String> {
-        let mut models = HashMap::new();
-
-        if !models_dir.is_dir() {
-            return Ok(models);
-        }
-
-        let entries = std::fs::read_dir(models_dir)
-            .map_err(|e| format!("Failed to read models directory: {e}"))?;
-
-        for entry in entries {
-            let entry = entry.map_err(|e| format!("Failed to read directory entry: {e}"))?;
-            let path = entry.path();
-
-            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
-                continue;
-            }
-
-            let name = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .ok_or_else(|| format!("Invalid filename: {}", path.display()))?
-                .to_string();
-
-            let content = std::fs::read_to_string(&path)
-                .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
-
-            let config = ModelConfig::from_toml(&name, &content)?;
-            models.insert(name, config);
-        }
-
-        Ok(models)
     }
 
     pub fn start_invocation(&self, start: &InvocationStart) -> Result<i64, String> {
