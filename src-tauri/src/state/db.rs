@@ -573,9 +573,9 @@ impl StateDb {
         let mut conn =
             Connection::open(path).map_err(|e| format!("Failed to open state DB: {e}"))?;
 
+        Self::validate_providers_schema(&conn)?;
         conn.execute_batch("PRAGMA journal_mode=WAL;")
             .map_err(|e| format!("Failed to set WAL mode: {e}; run `agents migrate-db` first"))?;
-        Self::validate_providers_schema(&conn)?;
         Self::ensure_invocations_schema(&conn)?;
         Self::ensure_providers_schema(&mut conn)?;
 
@@ -1431,10 +1431,12 @@ impl StateDb {
     /// is observable via the legacy status, not silent).
     fn provider_name_lookup() -> Result<std::collections::HashMap<(String, usize), String>, String>
     {
-        let models_dir = dirs::config_dir()
-            .map(|dir| dir.join("oulipoly-agent-runner").join("models"))
-            .unwrap_or_else(|| std::path::PathBuf::from("models"));
         let mut lookup = std::collections::HashMap::new();
+        let Some(models_dir) =
+            dirs::config_dir().map(|dir| dir.join("oulipoly-agent-runner").join("models"))
+        else {
+            return Ok(lookup);
+        };
         if !models_dir.is_dir() {
             return Ok(lookup);
         }
@@ -1449,10 +1451,27 @@ impl StateDb {
             providers: Option<Vec<RawProvider>>,
         }
 
-        let entries = std::fs::read_dir(&models_dir)
-            .map_err(|e| format!("Failed to read models directory for migration: {e}"))?;
+        let entries = match std::fs::read_dir(&models_dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                eprintln!(
+                    "Warning: failed to read models directory during invocation migration ({e}); \
+                     pre-existing invocation rows may migrate as status='legacy'."
+                );
+                return Ok(lookup);
+            }
+        };
         for entry in entries {
-            let entry = entry.map_err(|e| format!("Failed to read model directory entry: {e}"))?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    eprintln!(
+                        "Warning: failed to read model directory entry during invocation migration ({e}); \
+                         some pre-existing invocation rows may migrate as status='legacy'."
+                    );
+                    continue;
+                }
+            };
             let path = entry.path();
             if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
                 continue;
@@ -1604,8 +1623,11 @@ impl StateDb {
             .map_err(|e| format!("Failed to upsert provider: {e}"))?;
 
             if !success {
-                let snippet =
-                    stderr_snippet.map(|value| value.chars().take(500).collect::<String>());
+                let snippet = stderr_snippet
+                    .unwrap_or("")
+                    .chars()
+                    .take(500)
+                    .collect::<String>();
                 tx.execute(
                     "UPDATE providers SET last_error = ?1, last_error_at = ?2
                      WHERE model_name = ?3 AND provider_name = ?4",
@@ -1889,7 +1911,7 @@ impl StateDb {
         model_name: &str,
         provider_name: &str,
         window_minutes: i64,
-    ) -> Result<i64, String> {
+    ) -> Result<u64, String> {
         let cutoff = (Utc::now() - chrono::Duration::minutes(window_minutes)).to_rfc3339();
 
         let count: i64 = self
@@ -1897,13 +1919,14 @@ impl StateDb {
             .query_row(
                 "SELECT COUNT(*) FROM invocations
                  WHERE model_name = ?1 AND provider_name = ?2
-                   AND success = 0 AND created_at > ?3",
+                   AND success = 0
+                   AND created_at > ?3",
                 params![model_name, provider_name, &cutoff],
                 |row| row.get(0),
             )
             .map_err(|e| format!("Failed to count recent errors: {e}"))?;
 
-        Ok(count)
+        u64::try_from(count).map_err(|_| format!("Recent error count was negative: {count}"))
     }
 
     // --- Provider quota operations ---
@@ -3191,10 +3214,6 @@ impl StateDb {
         self.chain_previews(input)
     }
 
-    pub fn resume_previews_for_prefix(&self, input: &str) -> Result<Vec<ChainPreview>, DbError> {
-        self.chain_previews(input)
-    }
-
     pub fn chain_id_for_segment(
         &self,
         provider_name: &str,
@@ -3222,14 +3241,11 @@ impl StateDb {
                  FROM session_chain_segments
                  WHERE session_id = ?1
                     OR chain_id = ?1
-                    OR session_id LIKE ?2
-                    OR chain_id LIKE ?2
                  ORDER BY chain_id",
             )
             .map_err(|e| format!("Failed to prepare resume chain lookup: {e}"))?;
-        let prefix = format!("{input}%");
         let rows = stmt
-            .query_map(params![input, prefix], |row| row.get::<_, String>(0))
+            .query_map(params![input], |row| row.get::<_, String>(0))
             .map_err(|e| format!("Failed to query resume chain lookup: {e}"))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("Failed to read resume chain lookup: {e}"))
@@ -3478,27 +3494,19 @@ impl StateDb {
             return Ok(count.max(0) as u64);
         };
 
-        let mut stmt = self
+        let since_rfc3339 = since.to_rfc3339();
+        let count: i64 = self
             .conn
-            .prepare(
-                "SELECT timestamp FROM session_turns
-                 WHERE provider_name = ?1 AND role = 'assistant'",
+            .query_row(
+                "SELECT COUNT(*) FROM session_turns
+                 WHERE provider_name = ?1
+                   AND role = 'assistant'
+                   AND timestamp > ?2",
+                params![provider_name, since_rfc3339],
+                |row| row.get(0),
             )
-            .map_err(|e| format!("Failed to prepare session turn count: {e}"))?;
-        let rows = stmt
-            .query_map(params![provider_name], |row| row.get::<_, String>(0))
-            .map_err(|e| format!("Failed to query session turns: {e}"))?;
-        let mut count = 0;
-        for row in rows {
-            let raw_ts = row.map_err(|e| format!("Failed to read session turn timestamp: {e}"))?;
-            let timestamp = DateTime::parse_from_rfc3339(&raw_ts)
-                .map(|dt| dt.with_timezone(&Utc))
-                .map_err(|e| format!("Bad session turn timestamp {raw_ts}: {e}"))?;
-            if timestamp > *since {
-                count += 1;
-            }
-        }
-        Ok(count)
+            .map_err(|e| format!("Failed to count session turns: {e}"))?;
+        Ok(count.max(0) as u64)
     }
 
     #[cfg(test)]

@@ -43,13 +43,12 @@ impl SetupAgent {
             args.push(sid.clone());
         }
 
-        if self.session_id.is_none() {
-            args.push(self.system_prompt.clone());
-            args.push("---".to_string());
-            args.push(message.to_string());
+        let prompt = if self.session_id.is_none() {
+            format!("{}\n\n---\n\n{}", self.system_prompt, message)
         } else {
-            args.push(message.to_string());
-        }
+            message.to_string()
+        };
+        args.push(prompt);
 
         let output = runner
             .run(CommandSpec {

@@ -238,6 +238,8 @@ pub fn recent_time() -> chrono::DateTime<Utc> {
 }
 
 pub fn isolated_xdg_data_home<F: FnOnce()>(body: F) {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     let _guard = LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
     let dir = tempfile::tempdir().unwrap();
@@ -245,11 +247,14 @@ pub fn isolated_xdg_data_home<F: FnOnce()>(body: F) {
     unsafe {
         std::env::set_var("XDG_DATA_HOME", dir.path().join("data"));
     }
-    body();
+    let result = catch_unwind(AssertUnwindSafe(body));
     unsafe {
         match previous {
             Some(value) => std::env::set_var("XDG_DATA_HOME", value),
             None => std::env::remove_var("XDG_DATA_HOME"),
         }
+    }
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
     }
 }

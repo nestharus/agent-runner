@@ -65,15 +65,9 @@ fn setup_agent_send_turn_with_runner_uses_schema_json_mode_and_parses_actions() 
             .any(|pair| pair == ["--json-schema", r#"{"type":"object"}"#])
     );
     assert!(!call.args.iter().any(|arg| arg == "--resume"));
-    assert!(
-        call.args.iter().any(|arg| arg == "system prompt"),
-        "{:?}",
-        call.args
-    );
-    assert!(
-        call.args.iter().any(|arg| arg == "begin setup"),
-        "{:?}",
-        call.args
+    assert_eq!(
+        call.args.last().map(String::as_str),
+        Some("system prompt\n\n---\n\nbegin setup")
     );
 }
 

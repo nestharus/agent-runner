@@ -96,7 +96,7 @@ fn executor_run_with_runner_sends_stdin_prompt_as_stdin_spec_bytes() {
 fn executor_run_with_runner_large_arg_prompt_uses_temp_file_instruction_arg() {
     let runner = FakeProcessRunner::new();
     runner.push_stdout(b"large-ok");
-    let prompt = "x".repeat(70_000);
+    let prompt = "x".repeat(110_000);
     let model = model_with_provider(
         "fixture-model",
         PromptMode::Arg,

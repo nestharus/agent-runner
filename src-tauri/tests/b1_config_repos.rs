@@ -83,6 +83,48 @@ fn model_config_repository_save_model_creates_directory_and_writes_toml() {
     assert!(written.contains("codex"), "{written}");
 }
 
+/// Risk: T7/T8 (model save cannot escape configured models directory)
+/// Source: CodeRabbit Phase 7 pass 4; contract §5 ModelConfigRepository
+/// Level: component
+/// Fixture source: src-tauri/tests/fixtures/b1_config_repos.rs
+#[test]
+fn model_config_repository_save_model_rejects_path_traversal_name() {
+    let fixture = ConfigRepoFixture::new();
+    let repo = FilesystemModelConfigRepository::new(fixture.models_dir().to_path_buf());
+    let repo: &dyn ModelConfigRepository = &repo;
+
+    let err = repo
+        .save_model(&model("../escaped", &["claude"]))
+        .unwrap_err();
+
+    assert!(err.contains("Invalid model name"), "{err}");
+    assert!(!fixture.root().join("escaped.toml").exists());
+}
+
+/// Risk: T7/T8 (model save rejects platform-unsafe filenames)
+/// Source: CodeRabbit Phase 7 pass 6; contract §5 ModelConfigRepository
+/// Level: component
+/// Fixture source: src-tauri/tests/fixtures/b1_config_repos.rs
+#[test]
+fn model_config_repository_save_model_rejects_platform_unsafe_names() {
+    let fixture = ConfigRepoFixture::new();
+    let repo = FilesystemModelConfigRepository::new(fixture.models_dir().to_path_buf());
+    let repo: &dyn ModelConfigRepository = &repo;
+
+    for name in [
+        "",
+        " ",
+        "C:escaped",
+        "CON",
+        "nul.txt",
+        "trailing.",
+        "trailing ",
+    ] {
+        let err = repo.save_model(&model(name, &["claude"])).unwrap_err();
+        assert!(err.contains("Invalid model name"), "{name}: {err}");
+    }
+}
+
 /// Risk: T7/T8 (model save reports filesystem write failures)
 /// Source: proposal §8 T7/T8; contract §5 ModelConfigRepository
 /// Level: component
@@ -117,6 +159,24 @@ fn model_config_repository_delete_model_removes_file_and_succeeds_when_absent() 
     repo.delete_model("removable").unwrap();
 
     assert!(!fixture.models_dir().join("removable.toml").exists());
+}
+
+/// Risk: T7/T8 (model delete cannot escape configured models directory)
+/// Source: CodeRabbit Phase 7 pass 5; contract §5 ModelConfigRepository
+/// Level: component
+/// Fixture source: src-tauri/tests/fixtures/b1_config_repos.rs
+#[test]
+fn model_config_repository_delete_model_rejects_path_traversal_name() {
+    let fixture = ConfigRepoFixture::new();
+    let escaped = fixture.root().join("escaped.toml");
+    std::fs::write(&escaped, "must remain").unwrap();
+    let repo = FilesystemModelConfigRepository::new(fixture.models_dir().to_path_buf());
+    let repo: &dyn ModelConfigRepository = &repo;
+
+    let err = repo.delete_model("../escaped").unwrap_err();
+
+    assert!(err.contains("Invalid model name"), "{err}");
+    assert_eq!(std::fs::read_to_string(escaped).unwrap(), "must remain");
 }
 
 /// Risk: T7/T14/T15/T16 (provider source missing-file default is preserved)

@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+#![cfg(unix)]
 
 use agent_runner_lib::config::{ModelConfig, PromptMode, ProviderConfig};
 use std::ffi::OsString;
@@ -152,17 +153,22 @@ Use the configured model.
 }
 
 pub fn isolated_home<F: FnOnce()>(home: &Path, body: F) {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     let _guard = LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
     let previous = std::env::var_os("HOME");
     unsafe {
         std::env::set_var("HOME", home);
     }
-    body();
+    let result = catch_unwind(AssertUnwindSafe(body));
     unsafe {
         match previous {
             Some(value) => std::env::set_var("HOME", value),
             None => std::env::remove_var("HOME"),
         }
+    }
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
     }
 }

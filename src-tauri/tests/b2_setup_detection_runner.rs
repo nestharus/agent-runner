@@ -16,7 +16,9 @@ fn detection_claude_branch_uses_which_version_and_auth_status_runner_specs() {
         let runner = FakeProcessRunner::new();
         runner.push_stdout(b"/usr/bin/claude\n");
         runner.push_stdout(b"claude 1.2.3\n");
-        runner.push_stdout(br#"{"accounts":[{"email":"dev@example.com","active":true}]}"#);
+        runner.push_stdout(
+            br#"{"loggedIn":true,"email":"dev@example.com","authMethod":"oauth","subscriptionType":"pro"}"#,
+        );
 
         let info = detect_single_cli_with_runner("claude", &runner);
 
@@ -24,6 +26,9 @@ fn detection_claude_branch_uses_which_version_and_auth_status_runner_specs() {
         assert!(info.installed);
         assert_eq!(info.path.as_deref(), Some("/usr/bin/claude"));
         assert!(info.version.as_deref().unwrap_or("").contains("1.2.3"));
+        assert_eq!(info.profiles.len(), 1);
+        assert_eq!(info.profiles[0].id, "dev@example.com");
+        assert_eq!(info.profiles[0].auth_method, "oauth");
         let calls = runner.calls();
         assert_eq!(calls.len(), 3);
         assert_eq!(calls[0].program, "which");

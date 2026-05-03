@@ -64,7 +64,6 @@ pub fn discover_models_with_runner(
 
     let now = chrono::Utc::now().to_rfc3339();
 
-    let mut first_error = None;
     for cmd_args in commands {
         match run_cli_command(cli_name, cmd_args, runner) {
             Ok(output) => {
@@ -90,17 +89,8 @@ pub fn discover_models_with_runner(
                     });
                 }
             }
-            Err(err) => {
-                if first_error.is_none() {
-                    first_error = Some(err);
-                }
-                continue;
-            }
+            Err(_) => continue,
         }
-    }
-
-    if let Some(err) = first_error {
-        return Err(err);
     }
 
     // No discovery command succeeded, return empty result (not an error)

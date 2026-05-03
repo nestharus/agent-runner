@@ -207,9 +207,9 @@ fn routing_repository_missing_quota_and_windows_are_not_errors() {
 #[test]
 fn routing_repository_count_assistant_turns_since_is_exclusive() {
     let fixture = StateRepoFixture::new();
-    fixture.seed_turn(PROVIDER, SESSION_A, "before", "2026-05-02T08:59:59Z");
-    fixture.seed_turn(PROVIDER, SESSION_A, "boundary", "2026-05-02T09:00:00Z");
-    fixture.seed_turn(PROVIDER, SESSION_A, "after", "2026-05-02T09:00:01Z");
+    fixture.seed_turn(PROVIDER, SESSION_A, "before", "2026-05-02T08:59:59+00:00");
+    fixture.seed_turn(PROVIDER, SESSION_A, "boundary", "2026-05-02T09:00:00+00:00");
+    fixture.seed_turn(PROVIDER, SESSION_A, "after", "2026-05-02T09:00:01+00:00");
     let db = fixture.open_db();
     let routing: &dyn RoutingRepository = &db;
     let since = chrono::Utc.with_ymd_and_hms(2026, 5, 2, 9, 0, 0).unwrap();
@@ -404,12 +404,12 @@ fn session_chain_repository_resolve_resume_facts_rejects_invalid_uuid_shape() {
     assert!(!format!("{err:?}").contains("UnknownModel"));
 }
 
-/// Risk: T1/T2/T9 (resume previews keep newest-first ordering)
+/// Risk: T1/T2/T9 (resume previews use exact resume identifiers)
 /// Source: proposal §8 T1/T2/T9; contract §5 SessionChainRepository
 /// Level: particular-integration
 /// Fixture source: src-tauri/tests/fixtures/b1_state_repos.rs
 #[test]
-fn session_chain_repository_resume_previews_sort_newest_first() {
+fn session_chain_repository_resume_previews_use_exact_session_id() {
     let fixture = StateRepoFixture::new();
     fixture.seed_active_chain(CHAIN_A, PROVIDER, SESSION_A, MODEL, "2026-05-02T09:00:00Z");
     fixture.seed_active_chain(
@@ -422,14 +422,10 @@ fn session_chain_repository_resume_previews_sort_newest_first() {
     let db = fixture.open_db();
     let repo: &dyn SessionChainRepository = &db;
 
-    let previews = repo.resume_previews("5169694d").unwrap();
+    let previews = repo.resume_previews(SESSION_A).unwrap();
 
-    assert!(previews.len() >= 1);
-    assert!(
-        previews
-            .windows(2)
-            .all(|pair| pair[0].last_used_at >= pair[1].last_used_at)
-    );
+    assert_eq!(previews.len(), 1);
+    assert_eq!(previews[0].chain_id, CHAIN_A);
 }
 
 /// Risk: T1/T2 (session chain missing lookup shape is preserved)

@@ -7,11 +7,43 @@
 //! DB, refreshes any stale quotas, then prints — for every multi-provider
 //! model — what `select_provider` would pick and the score breakdown.
 
-use agent_runner_lib::balancer::{BalanceContext, select_provider};
+use agent_runner_lib::balancer::{BalanceEffects, select_provider};
 use agent_runner_lib::config::{ProvidersConfig, SessionsConfig, load_models};
 use agent_runner_lib::process::OsProcessRunner;
 use agent_runner_lib::quota::{InFlight, RefreshOutcome, is_stale, refresh_provider};
 use agent_runner_lib::state::StateDb;
+
+struct ExampleBalanceEffects<'a> {
+    providers_cfg: &'a ProvidersConfig,
+    sessions_cfg: &'a SessionsConfig,
+    in_flight: &'a InFlight,
+    db: &'a StateDb,
+    runner: &'a OsProcessRunner,
+}
+
+impl BalanceEffects for ExampleBalanceEffects<'_> {
+    fn refresh_quota_if_stale(&self, provider_name: &str) {
+        if is_stale(self.db, provider_name) {
+            let _ = refresh_provider(
+                provider_name,
+                self.providers_cfg,
+                self.in_flight,
+                self.db,
+                self.runner,
+            );
+        }
+    }
+
+    fn scan_provider_sessions(&self, provider_name: &str) {
+        let _ = agent_runner_lib::sessions::scan_provider_with_runner(
+            provider_name,
+            self.sessions_cfg,
+            self.db,
+            self.db,
+            self.runner,
+        );
+    }
+}
 
 fn main() {
     let config_dir = dirs::config_dir()
@@ -103,10 +135,12 @@ fn main() {
     println!();
 
     println!("=== Balancer picks for multi-provider models ===");
-    let ctx = BalanceContext {
+    let effects = ExampleBalanceEffects {
         providers_cfg: &providers_cfg,
         sessions_cfg: &sessions_cfg,
         in_flight: &in_flight,
+        db: &db,
+        runner: &runner,
     };
     let mut model_names: Vec<&String> = models.keys().collect();
     model_names.sort();
@@ -115,7 +149,7 @@ fn main() {
         if m.providers.len() <= 1 {
             continue;
         }
-        let pick = select_provider(m, &db, Some(&ctx));
+        let pick = select_provider(m, &db, Some(&effects));
         let pick_name = &m.providers[pick].name;
         println!("  model {name:<18} -> provider[{pick}] = {pick_name}");
         for (i, p) in m.providers.iter().enumerate() {
@@ -146,6 +180,4 @@ fn main() {
             }
         }
     }
-
-    let _ = ctx.providers_cfg.entries.len();
 }

@@ -6,6 +6,7 @@ pub mod executor;
 pub mod migration;
 pub mod process;
 pub mod quota;
+pub mod runtime;
 pub mod schema_probe;
 pub mod session_export;
 pub mod session_lock;
@@ -91,16 +92,70 @@ pub struct AppState {
     pub quota_in_flight: quota::InFlight,
 }
 
+pub fn configure_tauri_app<R: tauri::Runtime>(
+    builder: tauri::Builder<R>,
+    state: AppState,
+) -> tauri::Builder<R> {
+    builder
+        .manage(state)
+        .invoke_handler(tauri::generate_handler![
+            check_setup_needed,
+            start_setup,
+            start_cli_setup,
+            reload_models,
+            setup_respond,
+            cancel_setup,
+            detect_clis,
+            get_memory_graph,
+            list_models,
+            get_model,
+            save_model,
+            delete_model,
+            list_pools,
+            refresh_quotas,
+            update_pool,
+            test_model,
+            list_cli_providers,
+            get_cli_provider,
+            list_accounts,
+            add_account,
+            remove_account,
+            sync_provider,
+            discover_models_cmd,
+            list_discovered_models,
+            get_model_parameters,
+        ])
+}
+
 #[tauri::command]
 fn check_setup_needed(state: tauri::State<AppState>) -> Result<bool, String> {
+    let runner = process::OsProcessRunner;
+    check_setup_needed_with_runner(&state, &runner)
+}
+
+fn check_setup_needed_with_runner(
+    state: &AppState,
+    runner: &dyn process::ProcessRunner,
+) -> Result<bool, String> {
     let models = state.models.lock().map_err(|e| e.to_string())?;
     if models.is_empty() {
         return Ok(true);
     }
-    // Check if claude CLI is available
-    let output = std::process::Command::new("which").arg("claude").output();
+
+    // Check if claude CLI is available.
+    let output = runner.run(process::CommandSpec {
+        program: "which".to_string(),
+        args: vec!["claude".to_string()],
+        cwd: None,
+        env: Default::default(),
+        stdin: process::StdinSpec::Null,
+        stdout: process::OutputSpec::Capture,
+        stderr: process::OutputSpec::Capture,
+        timeout: None,
+        description: "check claude setup".to_string(),
+    });
     match output {
-        Ok(o) if o.status.success() => Ok(false),
+        Ok(o) if o.exit_code == 0 => Ok(false),
         _ => Ok(true),
     }
 }
@@ -206,7 +261,9 @@ async fn start_cli_setup(
 #[tauri::command]
 fn reload_models(state: tauri::State<AppState>) -> Result<(), String> {
     let model_repo = FilesystemModelConfigRepository::new(state.models_dir.clone());
-    let fresh = model_repo.load_models().unwrap_or_default();
+    let fresh = model_repo
+        .load_models()
+        .map_err(|e| format!("Failed to reload models: {e}"))?;
     let mut models = state.models.lock().map_err(|e| e.to_string())?;
     *models = fresh;
     Ok(())
@@ -332,7 +389,9 @@ async fn refresh_quotas(
         .unwrap_or(&state.models_dir)
         .join("providers.toml");
     let provider_source = FilesystemProviderConfigSource::new(providers_path);
-    let providers_cfg = provider_source.load_providers().unwrap_or_default();
+    let providers_cfg = provider_source
+        .load_providers()
+        .map_err(|e| format!("Failed to load providers.toml: {e}"))?;
 
     let db_path = state
         .models_dir
@@ -444,6 +503,7 @@ fn update_pool(
         .filter(|c| !orig_sorted.contains(c))
         .collect();
 
+    let model_repo = FilesystemModelConfigRepository::new(state.models_dir.clone());
     for name in &matching_names {
         let model = models.get_mut(name).unwrap();
 
@@ -462,7 +522,6 @@ fn update_pool(
             return Err(format!("Model '{}' would end up with zero providers", name));
         }
 
-        let model_repo = FilesystemModelConfigRepository::new(state.models_dir.clone());
         model_repo
             .save_model(model)
             .map_err(|e| format!("Failed to write model file for '{}': {e}", name))?;
@@ -733,42 +792,17 @@ pub fn run_tauri() {
     let model_repo = FilesystemModelConfigRepository::new(models_dir.clone());
     let models = model_repo.load_models().unwrap_or_default();
 
-    tauri::Builder::default()
-        .manage(AppState {
+    configure_tauri_app(
+        tauri::Builder::default(),
+        AppState {
             models: Mutex::new(models),
             models_dir: models_dir.clone(),
             setup_input_tx: Mutex::new(None),
             quota_in_flight: quota::InFlight::new(),
-        })
-        .invoke_handler(tauri::generate_handler![
-            check_setup_needed,
-            start_setup,
-            start_cli_setup,
-            reload_models,
-            setup_respond,
-            cancel_setup,
-            detect_clis,
-            get_memory_graph,
-            list_models,
-            get_model,
-            save_model,
-            delete_model,
-            list_pools,
-            refresh_quotas,
-            update_pool,
-            test_model,
-            list_cli_providers,
-            get_cli_provider,
-            list_accounts,
-            add_account,
-            remove_account,
-            sync_provider,
-            discover_models_cmd,
-            list_discovered_models,
-            get_model_parameters,
-        ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        },
+    )
+    .run(tauri::generate_context!())
+    .expect("error while running tauri application");
 }
 
 #[cfg(test)]

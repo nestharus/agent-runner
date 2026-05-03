@@ -1,9 +1,9 @@
 use super::db::{
     AccountRecord, BackfillReport, ChainPreview, CliProviderRecord, DbError, DiscoveredModel,
     InvocationRecord, InvocationStart, ModelParameter, ProviderRecord, QuotaRecord, QuotaWindow,
-    QuotaWindowInput, ReadOnlyOpenError, ResumeError, StateDb,
+    QuotaWindowInput, ReadOnlyOpenError, ResumeError, SessionTurnIngest, StateDb,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -138,6 +138,31 @@ pub trait SessionChainRepository {
     ) -> Result<Option<String>, String>;
 }
 
+pub struct SessionTurnReplacement {
+    pub provider_name: String,
+    pub session_id: String,
+    pub chain_id: String,
+    pub active_segment_id: i64,
+    pub source_file: PathBuf,
+    pub turns: Vec<SessionTurnReplacementTurn>,
+}
+
+pub struct SessionTurnReplacementTurn {
+    pub turn_id: String,
+    pub timestamp: String,
+    pub role: String,
+}
+
+pub trait SessionTurnRepository {
+    fn ingest_session_turns_batch(
+        &self,
+        provider_name: &str,
+        turns: &[SessionTurnIngest],
+    ) -> Result<u64, String>;
+
+    fn replace_session_turns(&self, replacement: &SessionTurnReplacement) -> Result<(), String>;
+}
+
 pub trait CliProviderRepository {
     fn upsert_cli_provider(&self, provider: &CliProviderRecord) -> Result<(), String>;
     fn list_cli_providers(&self) -> Result<Vec<CliProviderRecord>, String>;
@@ -168,7 +193,7 @@ pub trait DiscoveryRepository {
     ) -> Result<Vec<ModelParameter>, String>;
 }
 
-pub trait StateDbOpener {
+pub trait StateDbOpener: Send + Sync {
     fn open(&self, path: &Path) -> Result<StateDb, String>;
     fn open_default(&self) -> Result<StateDb, String>;
     fn default_path(&self) -> Result<PathBuf, String>;
@@ -237,7 +262,6 @@ impl RoutingRepository for StateDb {
         window_minutes: i64,
     ) -> Result<u64, String> {
         StateDb::recent_error_count(self, model_name, provider_name, window_minutes)
-            .map(|count| count.max(0) as u64)
     }
 
     fn get_quota(&self, provider_name: &str) -> Result<Option<QuotaRecord>, String> {
@@ -331,7 +355,7 @@ impl SessionChainRepository for StateDb {
     }
 
     fn resume_previews(&self, input: &str) -> Result<Vec<ChainPreview>, DbError> {
-        StateDb::resume_previews_for_prefix(self, input)
+        StateDb::resume_previews(self, input)
     }
 
     fn chain_id_for_segment(
@@ -363,6 +387,109 @@ impl SessionChainRepository for StateDb {
         finished_at: &DateTime<Utc>,
     ) -> Result<Option<String>, String> {
         StateDb::find_session_for_invocation_window(self, provider_name, started_at, finished_at)
+    }
+}
+
+impl SessionTurnRepository for StateDb {
+    fn ingest_session_turns_batch(
+        &self,
+        provider_name: &str,
+        turns: &[SessionTurnIngest],
+    ) -> Result<u64, String> {
+        StateDb::ingest_session_turns_batch(self, provider_name, turns)
+    }
+
+    fn replace_session_turns(&self, replacement: &SessionTurnReplacement) -> Result<(), String> {
+        if replacement.turns.is_empty() {
+            return Err("cannot replace db with empty records".to_string());
+        }
+
+        let tx = self
+            .connection()
+            .unchecked_transaction()
+            .map_err(|e| format!("failed to begin db transaction: {e}"))?;
+        tx.execute(
+            "DELETE FROM session_turns WHERE provider_name = ?1 AND session_id = ?2",
+            rusqlite::params![replacement.provider_name, replacement.session_id],
+        )
+        .map_err(|e| format!("failed to delete old turns: {e}"))?;
+        let now = Utc::now().to_rfc3339();
+        let turns = replacement
+            .turns
+            .iter()
+            .map(|turn| {
+                DateTime::parse_from_rfc3339(&turn.timestamp)
+                    .map(|timestamp| {
+                        let timestamp = timestamp.with_timezone(&Utc);
+                        let normalized_timestamp =
+                            timestamp.to_rfc3339_opts(SecondsFormat::AutoSi, true);
+                        (&turn.turn_id, timestamp, normalized_timestamp, &turn.role)
+                    })
+                    .map_err(|e| {
+                        format!("invalid replacement turn timestamp {}: {e}", turn.timestamp)
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let source_file = replacement.source_file.to_str().ok_or_else(|| {
+            format!(
+                "source_file is not valid UTF-8: {:?}",
+                replacement.source_file
+            )
+        })?;
+        for (turn_id, _, timestamp, role) in &turns {
+            tx.execute(
+                "INSERT INTO session_turns
+                    (provider_name, session_id, turn_id, timestamp, role,
+                     parent_turn_id, is_sidechain, is_compaction_boundary, source_file, ingested_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, 0, 0, ?6, ?7)",
+                rusqlite::params![
+                    replacement.provider_name,
+                    replacement.session_id,
+                    turn_id,
+                    timestamp,
+                    role,
+                    source_file,
+                    now,
+                ],
+            )
+            .map_err(|e| format!("failed to insert replacement turn: {e}"))?;
+        }
+        let (last_turn_id, _, last_timestamp, _) = turns
+            .iter()
+            .max_by(|(_, left_ts, _, _), (_, right_ts, _, _)| left_ts.cmp(right_ts))
+            .ok_or_else(|| "cannot replace db with empty records".to_string())?;
+        let segment_rows = tx
+            .execute(
+                "UPDATE session_chain_segments
+             SET last_turn_id = ?2
+             WHERE id = ?1 AND chain_id = ?3 AND provider_name = ?4 AND session_id = ?5",
+                rusqlite::params![
+                    replacement.active_segment_id,
+                    last_turn_id,
+                    replacement.chain_id,
+                    replacement.provider_name,
+                    replacement.session_id
+                ],
+            )
+            .map_err(|e| format!("failed to refresh active segment: {e}"))?;
+        if segment_rows != 1 {
+            return Err(format!(
+                "failed to refresh active segment: expected 1 row, updated {segment_rows}"
+            ));
+        }
+        let chain_rows = tx
+            .execute(
+                "UPDATE session_chains SET last_used_at = ?2 WHERE chain_id = ?1",
+                rusqlite::params![replacement.chain_id, last_timestamp],
+            )
+            .map_err(|e| format!("failed to refresh chain: {e}"))?;
+        if chain_rows != 1 {
+            return Err(format!(
+                "failed to refresh chain: expected 1 row, updated {chain_rows}"
+            ));
+        }
+        tx.commit()
+            .map_err(|e| format!("failed to commit db replacement: {e}"))
     }
 }
 

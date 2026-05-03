@@ -49,19 +49,19 @@ fn discovery_with_runner_uses_stderr_when_it_has_more_content() {
     assert_eq!(result.models[0].canonical_name, "claude-3-haiku");
 }
 
-/// Risk: T17 (discovery reports failed empty command output)
-/// Source: proposal §8 T17; contract §6 zero-byte stdout/non-zero discovery command
+/// Risk: T17 (discovery preserves empty-result success semantics)
+/// Source: proposal §8 T17; contract §3 discovery empty results are not errors
 /// Level: component
 /// Fixture source: src-tauri/tests/fixtures/b2_process_runner.rs
 #[test]
-fn discovery_with_runner_errors_when_failed_strategy_has_no_output() {
+fn discovery_with_runner_returns_empty_when_strategies_have_no_models() {
     let runner = FakeProcessRunner::new();
     runner.push_stdout(b"claude 1.2.3\n");
     runner.push_response(Ok(output(b"", b"", 1)));
 
-    let err = discover_models_with_runner("claude", &runner).unwrap_err();
+    let result = discover_models_with_runner("claude", &runner).unwrap();
 
-    assert!(err.contains("claude") || err.contains("failed"), "{err}");
+    assert!(result.models.is_empty());
     let calls = runner.calls();
     assert_eq!(calls[0].args, vec!["--version"]);
     assert!(calls.len() >= 2);

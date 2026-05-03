@@ -3,23 +3,23 @@ use super::model::{ModelConfig, load_models};
 use super::providers::ProvidersConfig;
 use super::sessions::SessionsConfig;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
-pub trait ModelConfigRepository {
+pub trait ModelConfigRepository: Send + Sync {
     fn load_models(&self) -> Result<HashMap<String, ModelConfig>, String>;
     fn save_model(&self, model: &ModelConfig) -> Result<(), String>;
     fn delete_model(&self, name: &str) -> Result<(), String>;
 }
 
-pub trait ProviderConfigSource {
+pub trait ProviderConfigSource: Send + Sync {
     fn load_providers(&self) -> Result<ProvidersConfig, String>;
 }
 
-pub trait SessionsConfigSource {
+pub trait SessionsConfigSource: Send + Sync {
     fn load_sessions(&self) -> Result<SessionsConfig, String>;
 }
 
-pub trait AgentConfigRepository {
+pub trait AgentConfigRepository: Send + Sync {
     fn load_agent_file(&self, path: &Path) -> Result<AgentConfig, String>;
     fn load_agents(&self) -> Result<HashMap<String, AgentConfig>, String>;
 }
@@ -33,6 +33,39 @@ impl FilesystemModelConfigRepository {
     pub fn new(models_dir: PathBuf) -> Self {
         Self { models_dir }
     }
+
+    fn validate_model_file_name(name: &str) -> Result<(), String> {
+        if name.trim().is_empty()
+            || name.contains("..")
+            || name.contains('/')
+            || name.contains('\\')
+            || name.contains(':')
+            || name.ends_with([' ', '.'])
+        {
+            return Err(format!("Invalid model name for file path: {name}"));
+        }
+
+        let mut components = Path::new(name).components();
+        if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+            return Err(format!("Invalid model name for file path: {name}"));
+        }
+
+        let reserved_name = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
+        let is_reserved = matches!(reserved_name.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || reserved_name
+                .strip_prefix("COM")
+                .and_then(|suffix| suffix.parse::<u8>().ok())
+                .is_some_and(|number| (1..=9).contains(&number))
+            || reserved_name
+                .strip_prefix("LPT")
+                .and_then(|suffix| suffix.parse::<u8>().ok())
+                .is_some_and(|number| (1..=9).contains(&number));
+        if is_reserved {
+            return Err(format!("Invalid model name for file path: {name}"));
+        }
+
+        Ok(())
+    }
 }
 
 impl ModelConfigRepository for FilesystemModelConfigRepository {
@@ -41,6 +74,7 @@ impl ModelConfigRepository for FilesystemModelConfigRepository {
     }
 
     fn save_model(&self, model: &ModelConfig) -> Result<(), String> {
+        Self::validate_model_file_name(&model.name)?;
         std::fs::create_dir_all(&self.models_dir)
             .map_err(|e| format!("Failed to create models directory: {e}"))?;
         let path = self.models_dir.join(format!("{}.toml", model.name));
@@ -49,12 +83,27 @@ impl ModelConfigRepository for FilesystemModelConfigRepository {
     }
 
     fn delete_model(&self, name: &str) -> Result<(), String> {
+        Self::validate_model_file_name(name)?;
         let path = self.models_dir.join(format!("{name}.toml"));
         if path.exists() {
             std::fs::remove_file(&path)
                 .map_err(|e| format!("Failed to delete {}: {e}", path.display()))?;
         }
         Ok(())
+    }
+}
+
+impl ModelConfigRepository for HashMap<String, ModelConfig> {
+    fn load_models(&self) -> Result<HashMap<String, ModelConfig>, String> {
+        Ok(self.clone())
+    }
+
+    fn save_model(&self, _model: &ModelConfig) -> Result<(), String> {
+        Err("in-memory model repository is read-only".to_string())
+    }
+
+    fn delete_model(&self, _name: &str) -> Result<(), String> {
+        Err("in-memory model repository is read-only".to_string())
     }
 }
 
@@ -75,6 +124,12 @@ impl ProviderConfigSource for FilesystemProviderConfigSource {
     }
 }
 
+impl ProviderConfigSource for ProvidersConfig {
+    fn load_providers(&self) -> Result<ProvidersConfig, String> {
+        Ok(self.clone())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FilesystemSessionsConfigSource {
     sessions_path: PathBuf,
@@ -89,6 +144,12 @@ impl FilesystemSessionsConfigSource {
 impl SessionsConfigSource for FilesystemSessionsConfigSource {
     fn load_sessions(&self) -> Result<SessionsConfig, String> {
         SessionsConfig::load(&self.sessions_path)
+    }
+}
+
+impl SessionsConfigSource for SessionsConfig {
+    fn load_sessions(&self) -> Result<SessionsConfig, String> {
+        Ok(self.clone())
     }
 }
 

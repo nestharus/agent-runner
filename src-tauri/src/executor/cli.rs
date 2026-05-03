@@ -14,7 +14,7 @@ use super::{
     SessionCaptureResult,
 };
 
-const LARGE_PROMPT_THRESHOLD: usize = 64 * 1024;
+const LARGE_PROMPT_THRESHOLD: usize = 100 * 1024;
 
 pub fn execute(
     model: &ModelConfig,
