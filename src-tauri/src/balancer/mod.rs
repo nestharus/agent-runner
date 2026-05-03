@@ -1,6 +1,6 @@
 use crate::config::{ModelConfig, ProvidersConfig, SessionsConfig};
 use crate::migration::MigrationError;
-use crate::quota::{InFlight, RefreshOutcome, is_stale, refresh_provider};
+use crate::quota::{InFlight, RefreshOutcome, is_stale, is_topology_probe_due, refresh_provider};
 use crate::sessions::scan_provider;
 use crate::state::{QuotaRecord, QuotaWindow, ResolvedResume, StateDb};
 use chrono::Utc;
@@ -18,6 +18,7 @@ const EPS_HOURS: f64 = 1.0 / 60.0;
 /// (idle account, different upstream behavior) and the provider should
 /// not be torpedoed for it.
 const HIDDEN_WINDOW_PENALTY_THRESHOLD: f64 = 0.85;
+pub const FANOUT_SCORE_BAND_RATIO: f64 = 2.0;
 
 #[derive(Debug, Clone)]
 struct ProviderEval {
@@ -114,16 +115,75 @@ pub fn select_provider(
     }
 
     // 2) Gather quota records + windows for each provider (cached reads only).
-    let quotas: Vec<Option<QuotaRecord>> = model
+    let mut quotas: Vec<Option<QuotaRecord>> = model
         .providers
         .iter()
         .map(|p| state.get_quota(&p.name).ok().flatten())
         .collect();
-    let windows: Vec<Vec<QuotaWindow>> = model
+    let mut windows: Vec<Vec<QuotaWindow>> = model
         .providers
         .iter()
         .map(|p| state.get_windows(&p.name).unwrap_or_default())
         .collect();
+    if let Some(ctx) = ctx {
+        let now = Utc::now();
+        let live_window_counts: Vec<usize> = windows
+            .iter()
+            .map(|provider_windows| {
+                provider_windows
+                    .iter()
+                    .filter(|w| w.resets_at > now)
+                    .count()
+            })
+            .collect();
+        let topology_peak_counts: Vec<usize> = quotas
+            .iter()
+            .map(|quota| {
+                quota
+                    .as_ref()
+                    .map(|quota| quota.topology_peak_live_window_count)
+                    .unwrap_or(0)
+            })
+            .collect();
+        let pool_expected_live_windows = live_window_counts
+            .iter()
+            .zip(topology_peak_counts.iter())
+            .map(|(live, peak)| (*live).max(*peak))
+            .max()
+            .unwrap_or(0);
+
+        for (i, provider) in model.providers.iter().enumerate() {
+            let has_quota_script = ctx
+                .providers_cfg
+                .get(&provider.name)
+                .and_then(|entry| entry.quota_script.as_ref())
+                .is_some();
+            if !has_quota_script {
+                continue;
+            }
+
+            let live_window_count = live_window_counts[i];
+            if is_topology_probe_due(
+                state,
+                &provider.name,
+                live_window_count,
+                pool_expected_live_windows,
+            ) {
+                let _ = state.record_topology_probe(&provider.name);
+                tracing::info!(
+                    provider_name = provider.name.as_str(),
+                    live_window_count = live_window_count,
+                    pool_expected_live_window_count = pool_expected_live_windows,
+                    topology_peak_live_window_count = topology_peak_counts[i],
+                    "topology probe fired"
+                );
+                let _: RefreshOutcome =
+                    refresh_provider(&provider.name, ctx.providers_cfg, ctx.in_flight, state);
+                quotas[i] = state.get_quota(&provider.name).ok().flatten();
+                windows[i] = state.get_windows(&provider.name).unwrap_or_default();
+            }
+        }
+    }
     let all_indices: Vec<usize> = (0..n).collect();
     let filtered_indices: Vec<usize> = all_indices
         .iter()
@@ -186,16 +246,17 @@ fn score_by_density(
         })
         .collect::<Vec<_>>();
 
-    let eligible: Vec<&ProviderEval> = evals
+    let eligible: Vec<ProviderEval> = evals
         .iter()
         .filter(|eval| !eval.unlearned && eval.binding_score.is_some())
+        .cloned()
         .collect();
 
     if eligible.is_empty() {
         return round_robin_fallback(model, state, candidates);
     }
 
-    best_binding_score(&eligible).index
+    select_binding_score_with_fanout(model, state, &eligible)
 }
 
 pub fn compute_projections(
@@ -453,6 +514,94 @@ fn best_binding_score<'a>(evals: &[&'a ProviderEval]) -> &'a ProviderEval {
         .unwrap()
 }
 
+fn select_binding_score_with_fanout(
+    model: &ModelConfig,
+    state: &StateDb,
+    eligible: &[ProviderEval],
+) -> usize {
+    let eligible_refs: Vec<&ProviderEval> = eligible.iter().collect();
+    let argmax = best_binding_score(&eligible_refs);
+
+    if eligible.len() < 2
+        || eligible
+            .iter()
+            .any(|eval| !eval.binding_score.unwrap().is_finite())
+    {
+        return argmax.index;
+    }
+
+    let best = eligible
+        .iter()
+        .filter_map(|eval| eval.binding_score.filter(|score| *score > 0.0))
+        .fold(f64::NEG_INFINITY, f64::max);
+    if !best.is_finite() || best <= 0.0 {
+        return argmax.index;
+    }
+
+    let mut band: Vec<&ProviderEval> = eligible
+        .iter()
+        .filter(|eval| eval.binding_score.unwrap() >= best / FANOUT_SCORE_BAND_RATIO)
+        .collect();
+    if band.len() < 2 {
+        return argmax.index;
+    }
+    band.sort_by_key(|eval| eval.index);
+
+    let selected = band
+        .iter()
+        .copied()
+        .min_by(|a, b| {
+            let a_provider = &model.providers[a.index];
+            let b_provider = &model.providers[b.index];
+            let a_count = state
+                .get_provider(&model.name, &a_provider.name)
+                .ok()
+                .flatten()
+                .map(|p| p.invocation_count)
+                .unwrap_or(0);
+            let b_count = state
+                .get_provider(&model.name, &b_provider.name)
+                .ok()
+                .flatten()
+                .map(|p| p.invocation_count)
+                .unwrap_or(0);
+            a_count
+                .cmp(&b_count)
+                .then_with(|| {
+                    b.binding_score
+                        .unwrap()
+                        .partial_cmp(&a.binding_score.unwrap())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| a.index.cmp(&b.index))
+        })
+        .unwrap();
+
+    if selected.index != argmax.index {
+        let selected_provider_name = &model.providers[selected.index].name;
+        let selected_invocation_count = state
+            .get_provider(&model.name, selected_provider_name)
+            .ok()
+            .flatten()
+            .map(|p| p.invocation_count)
+            .unwrap_or(0);
+        let band_member_names = band
+            .iter()
+            .map(|eval| model.providers[eval.index].name.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        tracing::info!(
+            selected_provider_name = selected_provider_name.as_str(),
+            band_member_names = band_member_names.as_str(),
+            selected_invocation_count = selected_invocation_count,
+            selected_binding_score = selected.binding_score.unwrap(),
+            "fanout selected"
+        );
+    }
+
+    selected.index
+}
+
 fn project_used_percent(base_used_percent: f64, turns: u64, burn_rate: f64) -> f64 {
     (base_used_percent + (turns as f64) * burn_rate).max(0.0)
 }
@@ -642,7 +791,10 @@ fn round_robin_fallback(model: &ModelConfig, state: &StateDb, candidates: &[usiz
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ProviderConfig, model::PromptMode};
+    use crate::config::{
+        ProviderConfig, ProviderEntry, ProvidersConfig, SessionsConfig, model::PromptMode,
+    };
+    use chrono::{Duration, SecondsFormat, Utc};
     use std::path::{Path, PathBuf};
     use uuid::Uuid;
 
@@ -664,6 +816,30 @@ mod tests {
             .unwrap();
         db.finalize_invocation(id, success, if success { 0 } else { 1 }, None, None)
             .unwrap();
+    }
+
+    fn provider_eval(index: usize, binding_score: f64) -> ProviderEval {
+        ProviderEval {
+            index,
+            binding_score: Some(binding_score),
+            unlearned: false,
+        }
+    }
+
+    fn providers_config_with_scripts(scripts: &[(&str, &str)]) -> ProvidersConfig {
+        let entries = scripts
+            .iter()
+            .map(|(provider_name, script)| {
+                (
+                    (*provider_name).to_string(),
+                    ProviderEntry {
+                        quota_script: Some((*script).to_string()),
+                        ..ProviderEntry::default()
+                    },
+                )
+            })
+            .collect();
+        ProvidersConfig { entries }
     }
 
     fn two_provider_model() -> ModelConfig {
@@ -1028,6 +1204,150 @@ mod tests {
         record_invocation_for_test(&db, "test", "a", 0, true);
 
         assert_eq!(selected_provider_index(&model, &db), 1);
+    }
+
+    /// Risk: Fanout selector might still pick pure argmax despite eligible score band.
+    /// Level: unit.
+    /// Source: proposal §Test-intent track row 3; Assumptions A4, A5.
+    #[test]
+    fn density_fanout_uses_invocation_counts_within_score_band() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = two_provider_model();
+        for _ in 0..3 {
+            record_invocation_for_test(&db, &model.name, "a", 0, true);
+        }
+        let eligible = vec![provider_eval(0, 10.0), provider_eval(1, 7.0)];
+
+        let selected = select_binding_score_with_fanout(&model, &db, &eligible);
+
+        assert_eq!(
+            selected, 1,
+            "provider b is inside the 2x score band and has the lower invocation count"
+        );
+    }
+
+    /// Risk: Deterministic fanout might become order-unstable or random.
+    /// Level: unit.
+    /// Source: proposal §Test-intent track row 4; Assumptions A4, A5.
+    #[test]
+    fn density_fanout_tiebreaks_by_score_then_index() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = two_provider_model();
+
+        let score_tie_break = vec![provider_eval(0, 9.0), provider_eval(1, 10.0)];
+        assert_eq!(
+            select_binding_score_with_fanout(&model, &db, &score_tie_break),
+            1,
+            "equal invocation counts should choose the higher binding score"
+        );
+
+        let index_tie_break = vec![provider_eval(0, 10.0), provider_eval(1, 10.0)];
+        assert_eq!(
+            select_binding_score_with_fanout(&model, &db, &index_tie_break),
+            0,
+            "equal counts and equal scores should choose the lower provider index"
+        );
+    }
+
+    /// Risk: Fanout might send traffic to much lower-capacity providers.
+    /// Level: unit.
+    /// Source: proposal §Test-intent track row 5; Assumption A5.
+    #[test]
+    fn density_hard_pins_when_score_gap_exceeds_band() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = two_provider_model();
+        for _ in 0..5 {
+            record_invocation_for_test(&db, &model.name, "a", 0, true);
+        }
+        let eligible = vec![provider_eval(0, 10.0), provider_eval(1, 4.99)];
+
+        let selected = select_binding_score_with_fanout(&model, &db, &eligible);
+
+        assert_eq!(
+            selected, 0,
+            "providers outside the 2x score band must preserve deterministic argmax"
+        );
+    }
+
+    /// Risk: Topology probe might run too late, after density already chose the stale single-window provider.
+    /// Level: component.
+    /// Source: proposal §Test-intent track row 6; Assumptions A2, A6.
+    #[test]
+    fn topology_probe_refreshes_incomplete_cached_provider_before_density() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = two_provider_model();
+
+        seed_windows_with_deltas(&db, "a", &[(0.02, 24 * 7, 0.01, 40)]);
+        seed_windows_with_deltas(&db, "b", &[(0.66, 80, 0.01, 40), (0.16, 3, 0.01, 40)]);
+
+        let long_resets =
+            (Utc::now() + Duration::hours(80)).to_rfc3339_opts(SecondsFormat::Secs, true);
+        let short_resets =
+            (Utc::now() + Duration::hours(5)).to_rfc3339_opts(SecondsFormat::Secs, true);
+        let repaired_a_script = format!(
+            r#"printf '%s' '{{"windows":[{{"used_percent":4,"resets_at":"{long_resets}"}},{{"used_percent":90,"resets_at":"{short_resets}"}}]}}'"#
+        );
+        let providers_cfg = providers_config_with_scripts(&[
+            ("a", repaired_a_script.as_str()),
+            ("b", "printf '%s' '{\"windows\":[]}'"),
+        ]);
+        let sessions_cfg = SessionsConfig::default();
+        let in_flight = InFlight::new();
+        let ctx = BalanceContext {
+            providers_cfg: &providers_cfg,
+            sessions_cfg: &sessions_cfg,
+            in_flight: &in_flight,
+        };
+
+        let selected = select_provider(&model, &db, Some(&ctx));
+
+        assert_eq!(
+            db.get_windows("a").unwrap().len(),
+            2,
+            "topology probe should refresh the incomplete cached provider before scoring"
+        );
+        assert_eq!(
+            selected, 1,
+            "after the repaired short-window constraint is visible, provider b should win"
+        );
+    }
+
+    /// Risk: Persistently one-window providers could run quota scripts every invocation.
+    /// Level: component.
+    /// Source: proposal §Test-intent track row 7; Assumptions A2, A6.
+    #[test]
+    fn topology_probe_respects_cooldown_for_persistent_short_topology() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = two_provider_model();
+
+        seed_windows_with_deltas(&db, "a", &[(0.02, 24 * 7, 0.01, 40)]);
+        seed_windows_with_deltas(&db, "b", &[(0.66, 80, 0.01, 40), (0.16, 3, 0.01, 40)]);
+        db.record_topology_probe("a").unwrap();
+
+        let would_repair_a_script = r#"printf '%s' '{"windows":[{"used_percent":4,"resets_at":"2036-05-09T14:00:00Z"},{"used_percent":90,"resets_at":"2036-05-03T03:50:00Z"}]}'"#;
+        let providers_cfg = providers_config_with_scripts(&[
+            ("a", would_repair_a_script),
+            ("b", "printf '%s' '{\"windows\":[]}'"),
+        ]);
+        let sessions_cfg = SessionsConfig::default();
+        let in_flight = InFlight::new();
+        let ctx = BalanceContext {
+            providers_cfg: &providers_cfg,
+            sessions_cfg: &sessions_cfg,
+            in_flight: &in_flight,
+        };
+
+        let selected = select_provider(&model, &db, Some(&ctx));
+
+        assert_eq!(
+            db.get_windows("a").unwrap().len(),
+            1,
+            "recent topology probe timestamp should suppress a repeat probe"
+        );
+        assert_eq!(
+            selected, 0,
+            "cooldown preserves cached routing rather than repeatedly running quota scripts"
+        );
     }
 
     #[test]
