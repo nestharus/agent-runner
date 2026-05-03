@@ -163,6 +163,56 @@ revisited.
 
 ---
 
+## D-007 — WU-11-01 Phase 2.5 problem-map human gate: skipped per user pre-approval
+
+- **Source**: WU-11-01 (routing-fanout) implementation pipeline run on
+  branch `impl/wu-11-01` (PR #36). The implementation-pipeline-orchestrator's
+  Phase 2.5 ("Existing-State Risk Profile") emits a `NEEDS_INPUT`
+  human gate to the root for problem-map approval before Phase 3
+  proposal authoring (`~/ai/workflows/implementation-pipeline.md`
+  Phase 2.5; orchestrator spec "human-gate-restricted" rule). The
+  question artifact for WU-11-01 is at
+  `tmp/scratch/wu-11-01/questions/q-9cfb2e90-9935-4cdd-bcff-7e993a189b46.question.json`;
+  the answer artifact (Option A — approve as-is) is at the matching
+  `.answer.json`. The root provided the answer with `decision_summary`:
+  "Phase 2.5 problem-map approved as-is via user's pre-approval to
+  skip this human gate."
+- **Decision**: For WU-11-01 specifically, the orchestrator advanced
+  to Phase 3 without surfacing the problem-map to the user for an
+  interactive approval response. The Phase 2.5 problem map at
+  `worktrees/impl-wu-11-01/research/11-routing-fanout-problem-map.md`
+  (109 lines, six required sections present, file:line references
+  validated against worktree HEAD) is treated as approved.
+- **Rationale**:
+  - The user pre-authorized skipping this specific human gate before
+    the orchestrator was dispatched.
+  - The Phase 2.5 artifact independently satisfies its quality bar
+    (size, section coverage, verified file:line references); the
+    orchestrator's Phase 2.5 verification step explicitly checks
+    these criteria before emitting the human gate, and they all
+    passed.
+  - The downstream Phase 4 risk gates (audit, scope, shortcut,
+    supported-surface) would catch any framing problem the human
+    gate would have caught — and did, in fact, surface the round-1
+    MEDIUM verdicts for observability (supported-surface) and AC-3/
+    AC-4 test-intent track gaps (audit). Round 2 closed both with
+    LOW after a `gpt-high` proposal-revision pass.
+  - The orchestrator session-files-fallback mechanism handled a
+    mid-resume provider auto-migration (`claude3 → claude` on
+    `quota_threshold`) that broke the original `resume-by-session-id`
+    path; continuation evidence is at
+    `tmp/scratch/wu-11-01/session-graph/b526007b-c996-4b07-96ae-87cde636f0c0/continuations/q-9cfb2e90-9935-4cdd-bcff-7e993a189b46.fallback.json`.
+    The skipped human-gate decision is preserved end-to-end across
+    that fallback.
+- **Revisit when**: A future WU surfaces a Phase 2.5 problem map
+  that the orchestrator's verification step does not catch and that
+  Phase 4 risk gates also miss. At that point, evaluate whether to
+  reinstate the Phase 2.5 human gate per-WU rather than relying on
+  the user's blanket pre-approval, or to add a stronger orchestrator-
+  side verification check that closes the specific gap.
+
+---
+
 ## Process
 
 When a CodeRabbit pass / risk gate / synthesis review raises a finding that
