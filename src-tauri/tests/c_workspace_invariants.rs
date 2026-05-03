@@ -20,6 +20,7 @@ const LIBRARY_PACKAGES: &[&str] = &[
 ];
 
 const WORKSPACE_PACKAGES: &[&str] = &[
+    "agent-bin",
     "agent-runner-config",
     "agent-runner-state",
     "agent-runner-executor",

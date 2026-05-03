@@ -105,7 +105,7 @@ impl From<RuntimeServices> for AppState {
             sessions_source: services.sessions_source,
             agent_repo: services.agent_repo,
             process_runner: services.process_runner,
-            lock_provider: services.lock_provider,
+            lock_provider: Arc::new(session::FilesystemSessionLockProvider),
             quota_in_flight: services.quota_in_flight,
             setup_input_tx: Mutex::new(None),
         }

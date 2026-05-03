@@ -1,4 +1,17 @@
-use std::path::PathBuf;
+pub mod repl;
+
+use agent_runner_config::{
+    AgentConfigRepository, FilesystemAgentConfigRepository, FilesystemModelConfigRepository,
+    FilesystemProviderConfigSource, FilesystemSessionsConfigSource, ModelConfigRepository,
+    ProviderConfigSource, SessionsConfig, SessionsConfigSource,
+};
+use agent_runner_executor::{OsProcessRunner, ProcessRunner};
+use agent_runner_quota::InFlight;
+use agent_runner_state::{DefaultStateDbOpener, StateDb, StateDbOpener};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+type SessionScanner = dyn Fn(&str, &SessionsConfig, &StateDb) -> Vec<String> + Send + Sync;
 
 pub trait RuntimePaths: Send + Sync {
     fn data_root(&self) -> Result<PathBuf, String>;
@@ -83,4 +96,65 @@ impl RuntimePaths for DefaultRuntimePaths {
     fn replace_journal_dir(&self) -> Result<PathBuf, String> {
         Ok(self.data_root()?.join("replace_journal"))
     }
+}
+
+pub struct RuntimeServices {
+    pub paths: Arc<dyn RuntimePaths>,
+    pub state_opener: Arc<dyn StateDbOpener + Send + Sync>,
+    pub model_repo: Arc<dyn ModelConfigRepository + Send + Sync>,
+    pub provider_source: Arc<dyn ProviderConfigSource + Send + Sync>,
+    pub sessions_source: Arc<dyn SessionsConfigSource + Send + Sync>,
+    pub agent_repo: Arc<dyn AgentConfigRepository + Send + Sync>,
+    pub process_runner: Arc<dyn ProcessRunner>,
+    pub quota_in_flight: InFlight,
+    session_scanner: Arc<SessionScanner>,
+}
+
+impl RuntimeServices {
+    pub fn new(paths: Box<dyn RuntimePaths>, process_runner: Arc<dyn ProcessRunner>) -> Self {
+        Self::from_parts(Arc::from(paths), process_runner)
+    }
+
+    pub fn from_paths(paths: Arc<dyn RuntimePaths>) -> Self {
+        Self::from_parts(paths, Arc::new(OsProcessRunner))
+    }
+
+    fn from_parts(paths: Arc<dyn RuntimePaths>, process_runner: Arc<dyn ProcessRunner>) -> Self {
+        Self {
+            model_repo: Arc::new(FilesystemModelConfigRepository::new(paths.models_dir())),
+            provider_source: Arc::new(FilesystemProviderConfigSource::new(paths.providers_path())),
+            sessions_source: Arc::new(FilesystemSessionsConfigSource::new(paths.sessions_path())),
+            agent_repo: Arc::new(FilesystemAgentConfigRepository::new(paths.agents_dir())),
+            paths,
+            state_opener: Arc::new(DefaultStateDbOpener),
+            process_runner,
+            quota_in_flight: InFlight::new(),
+            session_scanner: Arc::new(|_, _, _| Vec::new()),
+        }
+    }
+
+    pub fn with_session_scanner<F>(mut self, scanner: F) -> Self
+    where
+        F: Fn(&str, &SessionsConfig, &StateDb) -> Vec<String> + Send + Sync + 'static,
+    {
+        self.session_scanner = Arc::new(scanner);
+        self
+    }
+
+    pub(crate) fn scan_provider_sessions(
+        &self,
+        provider_name: &str,
+        sessions_cfg: &SessionsConfig,
+        state: &StateDb,
+    ) -> Vec<String> {
+        (self.session_scanner)(provider_name, sessions_cfg, state)
+    }
+}
+
+pub fn cli_services(models_dir_override: Option<&Path>) -> RuntimeServices {
+    let paths = match models_dir_override {
+        Some(models_dir) => DefaultRuntimePaths::with_models_dir(models_dir.to_path_buf()),
+        None => DefaultRuntimePaths::new(),
+    };
+    RuntimeServices::from_paths(Arc::new(paths))
 }

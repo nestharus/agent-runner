@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/agent-bin",
     "crates/config",
     "crates/state",
     "crates/executor",
@@ -29,6 +30,7 @@ agent-runner-runtime = { path = "crates/runtime" }
 agent-runner-session = { path = "crates/session" }
 agent-runner-schema-probe = { path = "crates/schema-probe" }
 agent-runner-discovery = { path = "crates/discovery" }
+agent-bin = { path = "crates/agent-bin" }
 
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
