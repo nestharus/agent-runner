@@ -6,12 +6,12 @@ mod b2_process_runner;
 mod b3_app_state;
 mod fixtures;
 
-use agent_runner_lib::config::{
+use agent_runner_config::{
     FilesystemModelConfigRepository, FilesystemProviderConfigSource, FilesystemSessionsConfigSource,
 };
-use agent_runner_lib::session_lock::{FilesystemSessionLockProvider, SessionLockProvider};
-use agent_runner_lib::session_replace::{ImportReplaceDeps, run_import_replace_with_deps};
-use agent_runner_lib::state::DefaultStateDbOpener;
+use agent_runner_session::{FilesystemSessionLockProvider, SessionLockProvider};
+use agent_runner_session::{ImportReplaceDeps, run_import_replace_with_deps};
+use agent_runner_state::DefaultStateDbOpener;
 use b2_process_runner::{FakeProcessRunner, ok_output};
 use b3_app_state::B3RuntimePaths;
 use fixtures::initiative_06_import_replace::{canonical_jsonl, prepared_claude_replace_fixture};
@@ -155,7 +155,7 @@ fn busy_lock_returns_before_pending_journal_is_written() {
     let sessions = FilesystemSessionsConfigSource::new(paths.sessions_path.clone());
     let runner = FakeProcessRunner::new();
     let locks = FilesystemSessionLockProvider;
-    let lock = agent_runner_lib::session_lock::SessionLock::new(&paths.lock_dir).unwrap();
+    let lock = agent_runner_session::SessionLock::new(&paths.lock_dir).unwrap();
     let held = lock
         .acquire(
             &prepared.session_id,

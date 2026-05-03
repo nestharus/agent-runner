@@ -5,7 +5,7 @@ use super::detection;
 use super::memory::MemoryGraph;
 use super::schemas::AGENT_TURN_SCHEMA;
 use super::sync;
-use crate::process::ProcessRunner;
+use agent_runner_executor::ProcessRunner;
 use std::sync::Arc;
 use tauri::ipc::Channel;
 use tokio::sync::mpsc;
@@ -38,7 +38,7 @@ impl SetupFlow {
             input_rx,
             memory,
             session_id,
-            runner: Arc::new(crate::process::OsProcessRunner),
+            runner: Arc::new(agent_runner_executor::OsProcessRunner),
         }
     }
 

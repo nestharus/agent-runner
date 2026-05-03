@@ -4,11 +4,11 @@
 mod b2_process_runner;
 mod fixtures;
 
-use agent_runner_lib::config::{
+use agent_runner_config::{
     ModelConfig, ModelConfigRepository, ProviderConfigSource, ProvidersConfig, SessionsConfig,
     SessionsConfigSource,
 };
-use agent_runner_lib::session_export::{
+use agent_runner_session::{
     canonical_jsonl_bytes, read_canonical_transcript, resolve_export_session_metadata_with_deps,
 };
 use b2_process_runner::{FakeProcessRunner, ok_output};

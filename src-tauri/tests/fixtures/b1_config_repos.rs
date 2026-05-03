@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use agent_runner_lib::config::{
+use agent_runner_config::{
     FilesystemAgentConfigRepository, FilesystemModelConfigRepository,
     FilesystemProviderConfigSource, FilesystemSessionsConfigSource,
 };

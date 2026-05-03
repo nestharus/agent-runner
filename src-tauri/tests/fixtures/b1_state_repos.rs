@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use agent_runner_lib::state::{InvocationRepository, InvocationStart, StateDb};
+use agent_runner_state::{InvocationRepository, InvocationStart, StateDb};
 use chrono::{Duration, Utc};
 use rusqlite::{Connection, params};
 use std::path::{Path, PathBuf};

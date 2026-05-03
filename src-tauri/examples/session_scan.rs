@@ -9,9 +9,9 @@
 //! and turns since the most recent quota refresh (the value the balancer
 //! actually projects with).
 
-use agent_runner_lib::config::SessionsConfig;
-use agent_runner_lib::sessions::scan_all;
-use agent_runner_lib::state::StateDb;
+use agent_runner_config::SessionsConfig;
+use agent_runner_session::scan_all;
+use agent_runner_state::StateDb;
 
 fn main() {
     let config_dir = dirs::config_dir()

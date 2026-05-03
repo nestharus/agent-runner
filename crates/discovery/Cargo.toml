@@ -1,0 +1,10 @@
+[package]
+name = "agent-runner-discovery"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+agent-runner-executor.workspace = true
+agent-runner-state.workspace = true
+chrono.workspace = true
+serde_json.workspace = true

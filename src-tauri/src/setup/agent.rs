@@ -1,5 +1,5 @@
 use super::actions::AgentTurnResult;
-use crate::process::{
+use agent_runner_executor::{
     CommandSpec, OsProcessRunner, OutputSpec, ProcessErrorPhase, ProcessRunner, StdinSpec,
     process_error_phase_and_detail,
 };

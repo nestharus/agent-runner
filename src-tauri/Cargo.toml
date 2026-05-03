@@ -1,34 +1,42 @@
 [package]
-name = "oulipoly-agent-runner"
-version = "0.1.0"
-edition = "2024"
+name = "agent-runner-app"
+version.workspace = true
+edition.workspace = true
 
 [lib]
-name = "agent_runner_lib"
+name = "agent_runner_app"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[[bin]]
+name = "oulipoly-agent-runner"
+path = "src/main.rs"
+
 [dependencies]
-clap = { version = "4", features = ["derive"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
-toml = "1"
-serde_yml = "0.0.12"
-rusqlite = { version = "0.38", features = ["bundled"] }
-dirs = "6"
-tempfile = "3"
-uuid = { version = "1", features = ["v4"] }
-chrono = { version = "0.4", features = ["serde"] }
-regex = "1"
-libc = "0.2"
-signal-hook = "0.3"
-tauri = { version = "2", features = ["devtools"] }
-tokio = { version = "1", features = ["sync"] }
-nix = { version = "0.29", features = ["fs"] }
-getrandom = "0.2"
+agent-runner-balancer.workspace = true
+agent-runner-config.workspace = true
+agent-runner-diagnostics.workspace = true
+agent-runner-discovery.workspace = true
+agent-runner-executor.workspace = true
+agent-runner-quota.workspace = true
+agent-runner-runtime.workspace = true
+agent-runner-schema-probe.workspace = true
+agent-runner-session.workspace = true
+agent-runner-state.workspace = true
+chrono.workspace = true
+clap.workspace = true
+dirs.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tauri.workspace = true
+tokio.workspace = true
+toml.workspace = true
+uuid.workspace = true
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build.workspace = true
 
 [dev-dependencies]
+sha2.workspace = true
+tempfile.workspace = true
 tauri = { version = "2", features = ["test"] }

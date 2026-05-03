@@ -1,21 +1,24 @@
-use agent_runner_lib::balancer;
-use agent_runner_lib::config::{
+use agent_runner_app::balance_effects::BalanceContext;
+use agent_runner_app::runtime::{RuntimeServices, cli_services};
+use agent_runner_app::trace::{TraceOptions, render_ascii_trace, trace_invocation_with_sessions};
+use agent_runner_balancer as balancer;
+use agent_runner_config::{
     AgentConfig, ModelConfig, PromptMode, ProviderConfig, ProvidersConfig, load_agent_file,
     load_agents, load_models,
 };
-use agent_runner_lib::diagnostics;
-use agent_runner_lib::executor;
-use agent_runner_lib::runtime::{RuntimeServices, cli_services};
-use agent_runner_lib::schema_probe::{self, ProbeError};
-use agent_runner_lib::session_export::{
+use agent_runner_diagnostics as diagnostics;
+use agent_runner_executor as executor;
+use agent_runner_schema_probe as schema_probe;
+use agent_runner_schema_probe::ProbeError;
+use agent_runner_session as session_replace;
+use agent_runner_session::LockError;
+use agent_runner_session::ReplaceError;
+use agent_runner_session::{
     ExportError, ExportSessionMetadata, read_canonical_transcript,
     resolve_export_session_metadata_with_deps,
 };
-use agent_runner_lib::session_lock::LockError;
-use agent_runner_lib::session_metadata::{MetadataError, locate_session_metadata};
-use agent_runner_lib::session_replace::{self, ReplaceError};
-use agent_runner_lib::state::{CompositeInvocationId, InvocationStart, ReadOnlyOpenError, StateDb};
-use agent_runner_lib::trace::{TraceOptions, render_ascii_trace, trace_invocation_with_sessions};
+use agent_runner_session::{MetadataError, locate_session_metadata};
+use agent_runner_state::{CompositeInvocationId, InvocationStart, ReadOnlyOpenError, StateDb};
 
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
@@ -949,7 +952,7 @@ fn should_emit_invocation_line(is_terminal: bool) -> bool {
 
 fn ingest_and_emit_session_id(
     state: &StateDb,
-    sessions_cfg: &agent_runner_lib::config::SessionsConfig,
+    sessions_cfg: &agent_runner_config::SessionsConfig,
     provider_name: &str,
     invocation_row_id: i64,
     invocation_uuid: &str,
@@ -973,7 +976,7 @@ fn ingest_and_emit_session_id(
         return false;
     };
 
-    let report = agent_runner_lib::sessions::scan_provider(provider_name, sessions_cfg, state);
+    let report = agent_runner_session::scan_provider(provider_name, sessions_cfg, state);
     for err in report.errors {
         eprintln!("Warning: Session ingest failed for {provider_name}: {err}");
     }
@@ -1064,8 +1067,8 @@ fn resume_model_pool_mismatch_message(
     }
 }
 
-fn format_resume_error(err: agent_runner_lib::state::ResumeError) -> String {
-    use agent_runner_lib::state::ResumeError;
+fn format_resume_error(err: agent_runner_state::ResumeError) -> String {
+    use agent_runner_state::ResumeError;
     match err {
         ResumeError::InvalidUuid { input } => format!("invalid session UUID: {input}"),
         ResumeError::NoChainFound { input } => format!(
@@ -1125,24 +1128,22 @@ struct ResumeExecutionTarget {
 }
 
 fn resume_execution_target(
-    resolved: &agent_runner_lib::state::ResolvedResume,
+    resolved: &agent_runner_state::ResolvedResume,
     providers_cfg: &ProvidersConfig,
-) -> Result<ResumeExecutionTarget, agent_runner_lib::state::ResumeError> {
+) -> Result<ResumeExecutionTarget, agent_runner_state::ResumeError> {
     if let Some(model) = resolved.model.as_ref() {
         let provider_index = model
             .providers
             .iter()
             .position(|provider| provider.name == resolved.active_provider)
-            .ok_or_else(
-                || agent_runner_lib::state::ResumeError::ProviderModelMismatch {
-                    model_name: model.name.clone(),
-                    active_provider: resolved.active_provider.clone(),
-                    suggestions: Vec::new(),
-                },
-            )?;
+            .ok_or_else(|| agent_runner_state::ResumeError::ProviderModelMismatch {
+                model_name: model.name.clone(),
+                active_provider: resolved.active_provider.clone(),
+                suggestions: Vec::new(),
+            })?;
         let (provider, prompt_mode) = providers_cfg
             .effective_provider(&model.providers[provider_index])
-            .map_err(|message| agent_runner_lib::state::ResumeError::Db { message })?;
+            .map_err(|message| agent_runner_state::ResumeError::Db { message })?;
         Ok(ResumeExecutionTarget {
             model: Some(model.clone()),
             provider_index,
@@ -1152,7 +1153,7 @@ fn resume_execution_target(
     } else {
         let (provider, prompt_mode) = providers_cfg
             .runtime_provider(&resolved.active_provider)
-            .map_err(|message| agent_runner_lib::state::ResumeError::Db { message })?;
+            .map_err(|message| agent_runner_state::ResumeError::Db { message })?;
         let provider_index =
             provider_index_in_providers_cfg(providers_cfg, &resolved.active_provider);
         Ok(ResumeExecutionTarget {
@@ -1272,8 +1273,8 @@ fn run_resume_handshake(session_id: &str, token: &str) -> Result<i32, String> {
     }
 }
 
-fn emit_resume_resolution_error(err: agent_runner_lib::state::ResumeError) -> i32 {
-    use agent_runner_lib::state::ResumeError;
+fn emit_resume_resolution_error(err: agent_runner_state::ResumeError) -> i32 {
+    use agent_runner_state::ResumeError;
     match err {
         ResumeError::InvalidUuid { input } => emit_json_error(
             2,
@@ -1376,7 +1377,7 @@ fn effective_model_for_execution(
 }
 
 fn resume_migration_pool(
-    resolved: &agent_runner_lib::state::ResolvedResume,
+    resolved: &agent_runner_state::ResolvedResume,
     providers_cfg: &ProvidersConfig,
 ) -> ModelConfig {
     if let Some(model) = resolved.model.as_ref() {
@@ -1428,7 +1429,7 @@ fn run_repl(
         Some(
             match state.resolve_resume(&models, session_id, model_name) {
                 Ok(resolved) => resolved,
-                Err(agent_runner_lib::state::ResumeError::ProviderModelMismatch {
+                Err(agent_runner_state::ResumeError::ProviderModelMismatch {
                     active_provider,
                     ..
                 }) => {
@@ -1474,7 +1475,7 @@ fn run_repl(
             inputs: Vec::new(),
         });
 
-    let ctx = balancer::BalanceContext {
+    let ctx = BalanceContext {
         providers_cfg: &providers_cfg,
         sessions_cfg: &sessions_cfg,
         in_flight: &services.quota_in_flight,
@@ -1500,7 +1501,7 @@ fn run_repl(
         }) = balancer::decide_migration(&state, &migration_model, resolved, manual_migrate)
         {
             let mut stderr = std::io::stderr();
-            match agent_runner_lib::migration::migrate_chain_segment(
+            match agent_runner_balancer::migration::migrate_chain_segment(
                 &state,
                 &sessions_cfg,
                 &migration_model,
@@ -1680,9 +1681,8 @@ fn run_resume(
     let stderr_is_terminal = std::io::stderr().is_terminal();
     let mut resolved = match state.resolve_resume(&models, session_id, model_name) {
         Ok(resolved) => resolved,
-        Err(agent_runner_lib::state::ResumeError::ProviderModelMismatch {
-            active_provider,
-            ..
+        Err(agent_runner_state::ResumeError::ProviderModelMismatch {
+            active_provider, ..
         }) => {
             eprintln!(
                 "{}",
@@ -1718,7 +1718,7 @@ fn run_resume(
     }) = balancer::decide_migration(&state, &migration_model, &resolved, manual_migrate)
     {
         let mut stderr = std::io::stderr();
-        match agent_runner_lib::migration::migrate_chain_segment(
+        match agent_runner_balancer::migration::migrate_chain_segment(
             &state,
             &sessions_cfg,
             &migration_model,
@@ -1877,7 +1877,7 @@ fn run_with_balancing(
         .load_providers()
         .unwrap_or_default();
     let sessions_cfg = services.sessions_source.load_sessions().unwrap_or_default();
-    let ctx = balancer::BalanceContext {
+    let ctx = BalanceContext {
         providers_cfg: &providers_cfg,
         sessions_cfg: &sessions_cfg,
         in_flight: &services.quota_in_flight,
@@ -2443,7 +2443,7 @@ fn derive_migration_provider_name(command: &str, args: &[String]) -> String {
     };
     let mut derived_args = command_parts.iter().skip(1).cloned().collect::<Vec<_>>();
     derived_args.extend(args.iter().cloned());
-    agent_runner_lib::config::derive_provider_name(command, &derived_args)
+    agent_runner_config::derive_provider_name(command, &derived_args)
 }
 
 fn partition_model_specific_args(args: Vec<String>) -> (Vec<String>, Vec<String>) {
@@ -2507,7 +2507,7 @@ fn run_compaction_backfill(state: &StateDb) -> Result<CompactionBackfillReport, 
         .map(|d| d.join("oulipoly-agent-runner"))
         .unwrap_or_else(|| PathBuf::from("."));
     let sessions_path = config_root.join("sessions.toml");
-    let sessions_cfg = agent_runner_lib::config::SessionsConfig::load(&sessions_path)
+    let sessions_cfg = agent_runner_config::SessionsConfig::load(&sessions_path)
         .map_err(|e| format!("Failed to load {}: {e}", sessions_path.display()))?;
     let models_dir = default_models_dir();
     let models = if models_dir.is_dir() {
@@ -2541,11 +2541,11 @@ fn run_compaction_backfill(state: &StateDb) -> Result<CompactionBackfillReport, 
 fn locate_compaction_backfill_source(
     provider_name: &str,
     session_id: &str,
-    sessions_cfg: &agent_runner_lib::config::SessionsConfig,
+    sessions_cfg: &agent_runner_config::SessionsConfig,
     models: &HashMap<String, ModelConfig>,
 ) -> Option<PathBuf> {
     if let Ok(Some(path)) =
-        agent_runner_lib::sessions::locate_transcript(sessions_cfg, provider_name, session_id)
+        agent_runner_session::locate_transcript(sessions_cfg, provider_name, session_id)
         && path.exists()
     {
         return Some(path);
@@ -2556,7 +2556,7 @@ fn locate_compaction_backfill_source(
         .flat_map(|model| model.providers.iter())
         .filter(|provider| provider.name == provider_name)
         .find_map(|provider| {
-            agent_runner_lib::migration::find_claude_source_from_storage(provider, session_id)
+            agent_runner_balancer::migration::find_claude_source_from_storage(provider, session_id)
         })
         .filter(|path| path.exists())
 }
@@ -2597,7 +2597,7 @@ fn flag_compaction_boundaries_from_jsonl(
     Ok(flagged)
 }
 
-fn format_resume_list_line(preview: &agent_runner_lib::state::ChainPreview) -> String {
+fn format_resume_list_line(preview: &agent_runner_state::ChainPreview) -> String {
     format!(
         "chain_id={} last_used_at={} active_provider={} active_session_id={} turn_count={} recent_turns_count={}",
         preview.chain_id,
@@ -2632,7 +2632,7 @@ where
 
 fn main() -> ExitCode {
     if std::env::args().len() <= 1 {
-        agent_runner_lib::run_tauri();
+        agent_runner_app::run_tauri();
         return ExitCode::SUCCESS;
     }
 
@@ -2651,7 +2651,7 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_runner_lib::state::InvocationStatus;
+    use agent_runner_state::InvocationStatus;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::{Mutex, OnceLock};
 
@@ -2700,17 +2700,17 @@ mod tests {
         for name in names {
             cfg.entries.insert(
                 (*name).to_string(),
-                agent_runner_lib::config::ProviderEntry {
+                agent_runner_config::ProviderEntry {
                     command: Some((*name).to_string()),
-                    session_storage: Some(agent_runner_lib::config::SessionStorage::ClaudeCode {
+                    session_storage: Some(agent_runner_config::SessionStorage::ClaudeCode {
                         projects_dir: PathBuf::from(format!("/tmp/{name}/projects")),
                     }),
-                    resume: Some(agent_runner_lib::config::ResumeStrategy {
-                        kind: agent_runner_lib::config::ResumeKind::Flag,
+                    resume: Some(agent_runner_config::ResumeStrategy {
+                        kind: agent_runner_config::ResumeKind::Flag,
                         flag: Some("--resume".to_string()),
                         subcommand: None,
                     }),
-                    ..agent_runner_lib::config::ProviderEntry::default()
+                    ..agent_runner_config::ProviderEntry::default()
                 },
             );
         }
@@ -3306,13 +3306,13 @@ mod tests {
         let ts = chrono::DateTime::parse_from_rfc3339("2026-04-17T08:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
-        let preview = agent_runner_lib::state::ChainPreview {
+        let preview = agent_runner_state::ChainPreview {
             chain_id: "5169694d-de0f-40d1-890c-6e28e55bab27".to_string(),
             last_used_at: ts,
             active_provider: "claude".to_string(),
             active_session_id: "dd116a3c-6819-42b1-b3d2-f512331eb5ec".to_string(),
             turn_count: 42,
-            recent_turns: vec![agent_runner_lib::state::TurnPreview {
+            recent_turns: vec![agent_runner_state::TurnPreview {
                 role: "assistant".to_string(),
                 timestamp: ts,
                 snippet: None,
@@ -3331,7 +3331,7 @@ mod tests {
 
     #[test]
     fn migration_target_pool_when_model_none_is_all_storage_providers() {
-        let resolved = agent_runner_lib::state::ResolvedResume {
+        let resolved = agent_runner_state::ResolvedResume {
             chain_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string(),
             model_name: None,
             model: None,
@@ -3365,7 +3365,7 @@ args = ["--model", "opus"]
 "#,
         )
         .unwrap();
-        let resolved = agent_runner_lib::state::ResolvedResume {
+        let resolved = agent_runner_state::ResolvedResume {
             chain_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string(),
             model_name: Some("claude-opus".to_string()),
             model: Some(model),

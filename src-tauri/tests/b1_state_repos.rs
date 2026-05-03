@@ -2,7 +2,7 @@
 
 mod fixtures;
 
-use agent_runner_lib::state::{
+use agent_runner_state::{
     CliProviderRepository, DefaultStateDbOpener, DiscoveryRepository, InvocationRepository,
     QuotaRepository, RoutingRepository, SessionChainRepository, StateDbOpener,
 };

@@ -2,12 +2,12 @@
 
 mod fixtures;
 
-use agent_runner_lib::config::{
+use agent_runner_config::{
     FilesystemModelConfigRepository, FilesystemProviderConfigSource, FilesystemSessionsConfigSource,
 };
-use agent_runner_lib::process::OsProcessRunner;
-use agent_runner_lib::session_lock::{self, LockError, SessionLock};
-use agent_runner_lib::session_metadata::locate_session_metadata;
+use agent_runner_executor::OsProcessRunner;
+use agent_runner_session::locate_session_metadata;
+use agent_runner_session::{self, LockError, SessionLock};
 use fixtures::initiative_06_import_replace::*;
 use rusqlite::params;
 use std::thread;
@@ -218,16 +218,16 @@ fn t_active_segment_id_flows() {
 fn t_any_active_for_session_public() {
     let dir = tempfile::tempdir().unwrap();
     let missing_lock_dir = dir.path().join("missing-locks");
-    assert!(!session_lock::any_active_for_session(&missing_lock_dir, SESSION_A).unwrap());
+    assert!(!agent_runner_session::any_active_for_session(&missing_lock_dir, SESSION_A).unwrap());
 
     let lock_dir = dir.path().join("locks");
     let lock = SessionLock::new(&lock_dir).unwrap();
-    assert!(!session_lock::any_active_for_session(&lock_dir, SESSION_A).unwrap());
+    assert!(!agent_runner_session::any_active_for_session(&lock_dir, SESSION_A).unwrap());
 
     let _active = lock
         .acquire(SESSION_A, CLAUDE_PROVIDER, Duration::from_secs(60))
         .unwrap();
-    assert!(session_lock::any_active_for_session(&lock_dir, SESSION_A).unwrap());
+    assert!(agent_runner_session::any_active_for_session(&lock_dir, SESSION_A).unwrap());
     match lock
         .acquire(SESSION_A, CLAUDE_PROVIDER, Duration::from_secs(60))
         .unwrap_err()
@@ -244,5 +244,5 @@ fn t_any_active_for_session_public() {
         .acquire(SESSION_B, CLAUDE_PROVIDER, Duration::from_millis(1))
         .unwrap();
     thread::sleep(Duration::from_millis(100));
-    assert!(!session_lock::any_active_for_session(&lock_dir, SESSION_B).unwrap());
+    assert!(!agent_runner_session::any_active_for_session(&lock_dir, SESSION_B).unwrap());
 }

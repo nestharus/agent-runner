@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use agent_runner_lib::state::{CompositeInvocationId, InvocationStatus, StateDb};
+use agent_runner_state::{CompositeInvocationId, InvocationStatus, StateDb};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;

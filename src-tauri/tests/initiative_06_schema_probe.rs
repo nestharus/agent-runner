@@ -2,7 +2,7 @@
 
 mod fixtures;
 
-use agent_runner_lib::state::{ReadOnlyOpenError, StateDb};
+use agent_runner_state::{ReadOnlyOpenError, StateDb};
 use fixtures::initiative_06_schema_probe::*;
 
 /// Risk: T1 — Schema-probe success on current-schema DB returns full JSON with `compatible: true`, `safe_for_import_replace` per features.

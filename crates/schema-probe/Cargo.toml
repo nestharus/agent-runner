@@ -1,0 +1,13 @@
+[package]
+name = "agent-runner-schema-probe"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+agent-runner-runtime.workspace = true
+agent-runner-state.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

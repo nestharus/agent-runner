@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use agent_runner_lib::process::{
+use agent_runner_executor::{
     CommandSpec, InteractiveCommandSpec, OutputSpec, ProcessOutput, ProcessRunner,
 };
 use std::collections::VecDeque;

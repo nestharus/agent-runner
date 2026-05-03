@@ -3,8 +3,8 @@
 #[path = "fixtures/b2_process_runner.rs"]
 mod b2_process_runner;
 
-use agent_runner_lib::process::{OutputSpec, StdinSpec};
-use agent_runner_lib::setup::agent::SetupAgent;
+use agent_runner_app::setup::agent::SetupAgent;
+use agent_runner_executor::{OutputSpec, StdinSpec};
 use b2_process_runner::{FakeProcessRunner, ok_output};
 use std::time::Duration;
 

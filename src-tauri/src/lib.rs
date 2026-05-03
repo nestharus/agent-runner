@@ -1,29 +1,24 @@
-pub mod balancer;
-pub mod config;
-pub mod diagnostics;
-pub mod discovery;
-pub mod executor;
-pub mod migration;
-pub mod process;
-pub mod quota;
+pub mod balance_effects;
 pub mod runtime;
-pub mod schema_probe;
-pub mod session_export;
-pub mod session_lock;
-pub mod session_metadata;
-pub mod session_replace;
-pub mod sessions;
 pub mod setup;
-pub mod state;
 pub mod trace;
 
+use agent_runner_balancer as balancer;
+use agent_runner_config as config;
+use agent_runner_diagnostics as diagnostics;
+use agent_runner_discovery as discovery;
+use agent_runner_executor as executor;
+use agent_runner_executor as process;
+use agent_runner_quota as quota;
+use agent_runner_session as session;
+use agent_runner_state as state;
 use config::{
     AgentConfigRepository, ModelConfig, ModelConfigRepository, ProviderConfigSource,
     SessionsConfigSource,
 };
 pub use runtime::{DefaultRuntimePaths, RuntimePaths, RuntimeServices, cli_services};
 use serde::{Deserialize, Serialize};
-use session_lock::SessionLockProvider;
+use session::SessionLockProvider;
 use setup::actions::{SetupEvent, UserResponse};
 #[allow(unused_imports)]
 use state::StateDb;
@@ -526,6 +521,7 @@ async fn test_model(
     Ok(result)
 }
 
+#[allow(dead_code)]
 fn test_model_with_db_path(
     model: ModelConfig,
     db_path: PathBuf,
@@ -833,11 +829,11 @@ pub fn configure_tauri_app<R: tauri::Runtime>()
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_runner_session::FilesystemSessionLockProvider;
     use config::{
         FilesystemAgentConfigRepository, FilesystemProviderConfigSource,
         FilesystemSessionsConfigSource, ModelConfig, PromptMode, ProviderConfig,
     };
-    use session_lock::FilesystemSessionLockProvider;
     use tauri::Manager;
 
     struct TestRuntimePaths {

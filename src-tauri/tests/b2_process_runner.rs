@@ -3,7 +3,7 @@
 #[path = "fixtures/b2_process_runner.rs"]
 mod b2_process_runner;
 
-use agent_runner_lib::process::{
+use agent_runner_executor::{
     CommandSpec, InteractiveCommandSpec, OsProcessRunner, OutputSpec, ProcessRunner, StdinSpec,
 };
 use b2_process_runner::{FakeProcessRunner, ok_output};

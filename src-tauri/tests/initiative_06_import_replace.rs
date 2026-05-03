@@ -2,8 +2,8 @@
 
 mod fixtures;
 
-use agent_runner_lib::session_lock::SessionLock;
-use agent_runner_lib::session_replace::{
+use agent_runner_session::SessionLock;
+use agent_runner_session::{
     CanonicalRecord, CanonicalToProviderRenderer, ClaudeCodeRenderer, CodexSessionRenderer,
     ReplaceError, ReplaceReceipt, run_import_replace,
 };

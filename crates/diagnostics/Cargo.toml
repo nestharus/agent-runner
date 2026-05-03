@@ -1,0 +1,8 @@
+[package]
+name = "agent-runner-diagnostics"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+agent-runner-config.workspace = true
+agent-runner-executor.workspace = true

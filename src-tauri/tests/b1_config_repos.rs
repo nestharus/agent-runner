@@ -2,7 +2,7 @@
 
 mod fixtures;
 
-use agent_runner_lib::config::{
+use agent_runner_config::{
     AgentConfigRepository, ModelConfigRepository, ProviderConfigSource, SessionsConfigSource,
 };
 use fixtures::b1_config_repos::ConfigRepoFixture;

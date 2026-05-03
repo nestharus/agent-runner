@@ -3,8 +3,8 @@
 #[path = "fixtures/b3_app_state.rs"]
 mod b3_app_state;
 
-use agent_runner_lib::schema_probe::run_schema_probe_with_deps;
-use agent_runner_lib::state::DefaultStateDbOpener;
+use agent_runner_schema_probe::run_schema_probe_with_deps;
+use agent_runner_state::DefaultStateDbOpener;
 use b3_app_state::B3RuntimePaths;
 
 /// Risk: T11 - schema-probe can keep deriving the default state path or use a

@@ -1,0 +1,14 @@
+[package]
+name = "agent-runner-config"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dirs.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_yml.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

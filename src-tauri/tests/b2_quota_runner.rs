@@ -4,9 +4,9 @@
 mod b2_process_runner;
 mod fixtures;
 
-use agent_runner_lib::config::{ProviderEntry, ProvidersConfig};
-use agent_runner_lib::process::{OutputSpec, StdinSpec};
-use agent_runner_lib::quota::{self, InFlight};
+use agent_runner_config::{ProviderEntry, ProvidersConfig};
+use agent_runner_executor::{OutputSpec, StdinSpec};
+use agent_runner_quota::{self as quota, InFlight};
 use b2_process_runner::{FakeProcessRunner, ok_output};
 use fixtures::b1_state_repos::{CLAUDE_PROVIDER, StateRepoFixture};
 use std::time::Duration;
@@ -107,7 +107,10 @@ fn refresh_provider_rejects_bare_array_quota_script_output() {
 
     match outcome {
         quota::RefreshOutcome::Failed(message) => {
-            assert!(message.contains("Invalid JSON"), "unexpected error: {message}");
+            assert!(
+                message.contains("Invalid JSON"),
+                "unexpected error: {message}"
+            );
         }
         other => panic!("expected bare array output to fail, got {other:?}"),
     }
