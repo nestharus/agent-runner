@@ -2,7 +2,10 @@
 
 mod fixtures;
 
-use agent_runner_lib::config::{ProvidersConfig, SessionsConfig, load_models};
+use agent_runner_lib::config::{
+    FilesystemModelConfigRepository, FilesystemProviderConfigSource, FilesystemSessionsConfigSource,
+};
+use agent_runner_lib::process::OsProcessRunner;
 use agent_runner_lib::session_lock::{self, LockError, SessionLock};
 use agent_runner_lib::session_metadata::locate_session_metadata;
 use fixtures::initiative_06_import_replace::*;
@@ -134,12 +137,20 @@ fn t_error_path_release() {
 fn t_active_segment_id_flows() {
     let prepared = prepared_claude_replace_fixture();
     let state = prepared.fixture.open_db();
-    let models = load_models(prepared.fixture.models_dir()).unwrap();
-    let providers = ProvidersConfig::load(&prepared.fixture.providers_path()).unwrap();
-    let sessions = SessionsConfig::load(&prepared.fixture.sessions_path()).unwrap();
-    let metadata =
-        locate_session_metadata(&state, &models, &providers, &sessions, &prepared.session_id)
-            .unwrap();
+    let model_repo =
+        FilesystemModelConfigRepository::new(prepared.fixture.models_dir().to_path_buf());
+    let provider_source = FilesystemProviderConfigSource::new(prepared.fixture.providers_path());
+    let sessions_source = FilesystemSessionsConfigSource::new(prepared.fixture.sessions_path());
+    let runner = OsProcessRunner;
+    let metadata = locate_session_metadata(
+        &state,
+        &model_repo,
+        &provider_source,
+        &sessions_source,
+        &runner,
+        &prepared.session_id,
+    )
+    .unwrap();
     let conn = prepared.fixture.conn();
     let active_segment_id = conn
         .query_row(
