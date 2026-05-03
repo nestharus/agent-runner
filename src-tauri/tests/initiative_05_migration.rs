@@ -632,11 +632,17 @@ fn migration_fixture() -> (
     )
 }
 
+fn claude_project_dir_name(path: &Path) -> String {
+    path.to_string_lossy().replace('/', "-")
+}
+
 // risk: Migration mechanic: Claude JSONL copy, Codex deferred guard, segment ledger, and races; level: particular-integration; source: proposal §11.1 Migration mechanic / A1, A3.
 #[test]
 fn migration_copies_claude_jsonl_to_target_projects_dir() {
     let (fixture, model, sessions, _source_projects, target_projects, source_jsonl) =
         migration_fixture();
+    let resume_working_dir = fixture.dir.path().join("resume-workspace");
+    fs::create_dir_all(&resume_working_dir).unwrap();
     fixture.seed_turns("claude", SESSION_A, &[]);
     let db = fixture.open_db();
     let mut stderr = Vec::new();
@@ -646,6 +652,7 @@ fn migration_copies_claude_jsonl_to_target_projects_dir() {
         &sessions,
         &model,
         &fixture.resolved(&model, 0),
+        &resume_working_dir,
         1,
         TransitionReason::Manual,
         &mut stderr,
@@ -666,9 +673,10 @@ fn migration_overwrites_target_when_same_chain_revisits_provider() {
     let fixture = Fixture::new();
     let source_projects = fixture.dir.path().join("source-projects");
     let target_projects = fixture.dir.path().join("target-projects");
+    let resume_working_dir = fixture.dir.path().join("resume-workspace");
     let cwd_hash = "cwd-hash-fixture";
     let stale_target = source_projects
-        .join(cwd_hash)
+        .join(claude_project_dir_name(&resume_working_dir))
         .join(format!("{SESSION_A}.jsonl"));
     let current_source = target_projects
         .join(cwd_hash)
@@ -725,6 +733,7 @@ fn migration_overwrites_target_when_same_chain_revisits_provider() {
         &sessions,
         &model,
         &resolved,
+        &resume_working_dir,
         0,
         TransitionReason::Manual,
         &mut stderr,
@@ -753,6 +762,7 @@ fn migration_refuses_when_other_chain_owns_target_session() {
     let fixture = Fixture::new();
     let source_projects = fixture.dir.path().join("source-projects");
     let target_projects = fixture.dir.path().join("target-projects");
+    let resume_working_dir = fixture.dir.path().join("resume-workspace");
     let current_source = target_projects
         .join("cwd-hash-fixture")
         .join(format!("{SESSION_A}.jsonl"));
@@ -804,6 +814,7 @@ fn migration_refuses_when_other_chain_owns_target_session() {
         &sessions,
         &model,
         &resolved,
+        &resume_working_dir,
         0,
         TransitionReason::Manual,
         &mut stderr,
@@ -828,9 +839,10 @@ fn migration_overwrites_when_other_chain_segment_is_closed() {
     let fixture = Fixture::new();
     let source_projects = fixture.dir.path().join("source-projects");
     let target_projects = fixture.dir.path().join("target-projects");
+    let resume_working_dir = fixture.dir.path().join("resume-workspace");
     let cwd_hash = "cwd-hash-fixture";
     let target_path = source_projects
-        .join(cwd_hash)
+        .join(claude_project_dir_name(&resume_working_dir))
         .join(format!("{SESSION_A}.jsonl"));
     let current_source = target_projects
         .join(cwd_hash)
@@ -885,6 +897,7 @@ fn migration_overwrites_when_other_chain_segment_is_closed() {
         &sessions,
         &model,
         &resolved,
+        &resume_working_dir,
         0,
         TransitionReason::Manual,
         &mut stderr,
@@ -903,6 +916,7 @@ fn migration_overwrites_when_other_chain_segment_is_closed() {
 fn migration_appends_chain_segment_with_correct_reason() {
     let (fixture, model, sessions, _source_projects, _target_projects, _source_jsonl) =
         migration_fixture();
+    let resume_working_dir = fixture.dir.path().join("resume-workspace");
     fixture.seed_turns("claude", SESSION_A, &[]);
     let db = fixture.open_db();
     let mut stderr = Vec::new();
@@ -912,6 +926,7 @@ fn migration_appends_chain_segment_with_correct_reason() {
         &sessions,
         &model,
         &fixture.resolved(&model, 0),
+        &resume_working_dir,
         1,
         TransitionReason::QuotaThreshold,
         &mut stderr,
@@ -944,6 +959,7 @@ fn migration_errors_on_source_jsonl_missing() {
     let fixture = Fixture::new();
     let source_projects = fixture.dir.path().join("source-projects");
     let target_projects = fixture.dir.path().join("target-projects");
+    let resume_working_dir = fixture.dir.path().join("resume-workspace");
     let missing = source_projects
         .join("cwd")
         .join(format!("{SESSION_A}.jsonl"));
@@ -960,6 +976,7 @@ fn migration_errors_on_source_jsonl_missing() {
         &sessions,
         &model,
         &fixture.resolved(&model, 0),
+        &resume_working_dir,
         1,
         TransitionReason::Manual,
         &mut stderr,
@@ -977,6 +994,7 @@ fn migration_errors_on_source_path_malformed() {
     let fixture = Fixture::new();
     let source_projects = fixture.dir.path().join("source-projects");
     let target_projects = fixture.dir.path().join("target-projects");
+    let resume_working_dir = fixture.dir.path().join("resume-workspace");
     let bare = PathBuf::from("bare-session.jsonl");
     let locator = fixture.write_script("bare-locator.sh", &malformed_source_locator_body(&bare));
     let sessions = fixture.sessions_config_with_locator("claude", &locator);
@@ -990,6 +1008,7 @@ fn migration_errors_on_source_path_malformed() {
         &sessions,
         &model,
         &fixture.resolved(&model, 0),
+        &resume_working_dir,
         1,
         TransitionReason::Manual,
         &mut stderr,
@@ -1005,6 +1024,7 @@ fn migration_errors_on_source_path_malformed() {
 fn migration_truncates_target_jsonl_at_latest_compaction_boundary() {
     let (fixture, model, sessions, _source_projects, _target_projects, _source_jsonl) =
         migration_fixture();
+    let resume_working_dir = fixture.dir.path().join("resume-workspace");
     fixture.seed_turns("claude", SESSION_A, &["turn-6"]);
     let db = fixture.open_db();
     let mut stderr = Vec::new();
@@ -1014,6 +1034,7 @@ fn migration_truncates_target_jsonl_at_latest_compaction_boundary() {
         &sessions,
         &model,
         &fixture.resolved(&model, 0),
+        &resume_working_dir,
         1,
         TransitionReason::Manual,
         &mut stderr,
@@ -1035,6 +1056,7 @@ fn migration_truncates_target_jsonl_at_latest_compaction_boundary() {
 fn migration_copies_full_jsonl_when_no_compaction_boundary() {
     let (fixture, model, sessions, _source_projects, _target_projects, source_jsonl) =
         migration_fixture();
+    let resume_working_dir = fixture.dir.path().join("resume-workspace");
     fixture.seed_turns("claude", SESSION_A, &[]);
     let db = fixture.open_db();
     let mut stderr = Vec::new();
@@ -1044,6 +1066,7 @@ fn migration_copies_full_jsonl_when_no_compaction_boundary() {
         &sessions,
         &model,
         &fixture.resolved(&model, 0),
+        &resume_working_dir,
         1,
         TransitionReason::Manual,
         &mut stderr,
@@ -1061,6 +1084,7 @@ fn migration_copies_full_jsonl_when_no_compaction_boundary() {
 fn migration_picks_latest_of_multiple_compaction_boundaries() {
     let (fixture, model, sessions, _source_projects, _target_projects, _source_jsonl) =
         migration_fixture();
+    let resume_working_dir = fixture.dir.path().join("resume-workspace");
     fixture.seed_turns("claude", SESSION_A, &["turn-4", "turn-8"]);
     let db = fixture.open_db();
     let mut stderr = Vec::new();
@@ -1070,6 +1094,7 @@ fn migration_picks_latest_of_multiple_compaction_boundaries() {
         &sessions,
         &model,
         &fixture.resolved(&model, 0),
+        &resume_working_dir,
         1,
         TransitionReason::Manual,
         &mut stderr,
@@ -1086,6 +1111,7 @@ fn migration_picks_latest_of_multiple_compaction_boundaries() {
 fn migration_errors_when_compaction_boundary_not_in_jsonl() {
     let (fixture, model, sessions, _source_projects, target_projects, _source_jsonl) =
         migration_fixture();
+    let resume_working_dir = fixture.dir.path().join("resume-workspace");
     fixture.seed_turns("claude", SESSION_A, &[]);
     fixture.seed_missing_compaction_boundary("claude", SESSION_A);
     let db = fixture.open_db();
@@ -1096,6 +1122,7 @@ fn migration_errors_when_compaction_boundary_not_in_jsonl() {
         &sessions,
         &model,
         &fixture.resolved(&model, 0),
+        &resume_working_dir,
         1,
         TransitionReason::Manual,
         &mut stderr,
@@ -1113,6 +1140,7 @@ fn migration_errors_when_compaction_boundary_not_in_jsonl() {
 fn pre_compaction_turns_remain_queryable_after_migration() {
     let (fixture, model, sessions, _source_projects, _target_projects, _source_jsonl) =
         migration_fixture();
+    let resume_working_dir = fixture.dir.path().join("resume-workspace");
     fixture.seed_turns("claude", SESSION_A, &["turn-6"]);
     let db = fixture.open_db();
     let mut stderr = Vec::new();
@@ -1122,6 +1150,7 @@ fn pre_compaction_turns_remain_queryable_after_migration() {
         &sessions,
         &model,
         &fixture.resolved(&model, 0),
+        &resume_working_dir,
         1,
         TransitionReason::Manual,
         &mut stderr,
@@ -1143,6 +1172,7 @@ fn pre_compaction_turns_remain_queryable_after_migration() {
 #[test]
 fn migration_mechanic_errors_codex_deferred_on_codex_active_provider() {
     let fixture = Fixture::new();
+    let resume_working_dir = fixture.dir.path().join("resume-workspace");
     let model = fixture.codex_source_model(
         &fixture.dir.path().join("codex-sessions"),
         &fixture.dir.path().join("target-projects"),
@@ -1157,6 +1187,7 @@ fn migration_mechanic_errors_codex_deferred_on_codex_active_provider() {
         &sessions,
         &model,
         &fixture.resolved(&model, 0),
+        &resume_working_dir,
         1,
         TransitionReason::Manual,
         &mut stderr,
@@ -1173,6 +1204,7 @@ fn migration_mechanic_errors_codex_deferred_on_codex_active_provider() {
 #[test]
 fn migration_does_not_emit_migrate_stderr_on_codex_deferred() {
     let fixture = Fixture::new();
+    let resume_working_dir = fixture.dir.path().join("resume-workspace");
     let model = fixture.codex_source_model(
         &fixture.dir.path().join("codex-sessions"),
         &fixture.dir.path().join("target-projects"),
@@ -1187,6 +1219,7 @@ fn migration_does_not_emit_migrate_stderr_on_codex_deferred() {
         &sessions,
         &model,
         &fixture.resolved(&model, 0),
+        &resume_working_dir,
         1,
         TransitionReason::Manual,
         &mut stderr,

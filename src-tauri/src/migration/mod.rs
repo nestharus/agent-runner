@@ -3,7 +3,7 @@ use crate::config::{ModelConfig, SessionStorage, SessionsConfig};
 use crate::sessions::locate_transcript;
 use crate::state::{ResolvedResume, StateDb};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub enum MigrationError {
@@ -23,6 +23,10 @@ pub enum MigrationError {
     },
     TargetMissingStorage {
         provider: String,
+    },
+    SpawnCwdUnsupported {
+        provider: String,
+        cwd: String,
     },
     TargetAlreadyExists {
         provider: String,
@@ -76,11 +80,13 @@ pub struct MigratedSegment {
     pub reason: TransitionReason,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn migrate_chain_segment(
     state: &StateDb,
     sessions_cfg: &SessionsConfig,
     model: &ModelConfig,
     resolved: &ResolvedResume,
+    resume_working_dir: &Path,
     target_provider_index: usize,
     reason: TransitionReason,
     stderr: &mut dyn Write,
@@ -152,13 +158,7 @@ pub fn migrate_chain_segment(
             provider: target.name.clone(),
         });
     };
-    let cwd_hash = source_path
-        .parent()
-        .and_then(|p| p.file_name())
-        .ok_or_else(|| MigrationError::SourcePathMalformed {
-            provider: source.name.clone(),
-            path: source_path.display().to_string(),
-        })?;
+    let cwd_project_dir = claude_project_dir_for(&target.name, resume_working_dir)?;
     let bytes = std::fs::read(&source_path).map_err(|e| MigrationError::Io {
         path: source_path.display().to_string(),
         message: e.to_string(),
@@ -185,7 +185,7 @@ pub fn migrate_chain_segment(
         &bytes[..]
     };
 
-    let target_dir = projects_dir.join(cwd_hash);
+    let target_dir = projects_dir.join(&cwd_project_dir);
     std::fs::create_dir_all(&target_dir).map_err(|e| {
         MigrationError::TargetDirectoryCreateFailed {
             path: target_dir.display().to_string(),
@@ -253,6 +253,17 @@ pub fn migrate_chain_segment(
     })
 }
 
+pub(crate) fn claude_project_dir_for(provider: &str, cwd: &Path) -> Result<String, MigrationError> {
+    if cwd.as_os_str().is_empty() || !cwd.is_absolute() {
+        return Err(MigrationError::SpawnCwdUnsupported {
+            provider: provider.to_string(),
+            cwd: cwd.display().to_string(),
+        });
+    }
+
+    Ok(cwd.to_string_lossy().replace('/', "-"))
+}
+
 pub fn find_claude_source_from_storage(
     provider: &crate::config::ProviderConfig,
     session_id: &str,
@@ -274,7 +285,7 @@ pub fn find_claude_source_from_storage(
 mod tests {
     use super::*;
     use crate::config::{ModelConfig, ProviderConfig, ResumeKind, ResumeStrategy, SessionsConfig};
-    use crate::state::{InvocationStart, StateDb};
+    use crate::state::{InvocationStart, ResolvedResume, StateDb};
 
     fn model_with_storage(
         source_projects: &std::path::Path,
@@ -305,24 +316,33 @@ mod tests {
         }
     }
 
-    // risk: Migration mechanic source UUID reuse; level: particular-integration; source: proposal §11.1 Migration mechanic / A1.
-    #[test]
-    fn migration_reuses_source_session_id_on_target_side() {
-        let dir = tempfile::tempdir().unwrap();
-        let source_projects = dir.path().join("source-projects");
-        let target_projects = dir.path().join("target-projects");
-        let cwd_hash = "cwd-hash";
-        let session_id = "dd116a3c-6819-42b1-b3d2-f512331eb5ec";
-        let source_dir = source_projects.join(cwd_hash);
+    fn claude_project_dir_name(path: &std::path::Path) -> String {
+        path.to_string_lossy().replace('/', "-")
+    }
+
+    fn seed_source_jsonl(
+        source_projects: &std::path::Path,
+        source_workspace: &std::path::Path,
+        session_id: &str,
+    ) -> PathBuf {
+        let source_dir = source_projects.join(claude_project_dir_name(source_workspace));
         std::fs::create_dir_all(&source_dir).unwrap();
+        let source_path = source_dir.join(format!("{session_id}.jsonl"));
         std::fs::write(
-            source_dir.join(format!("{session_id}.jsonl")),
+            &source_path,
             format!(
                 r#"{{"uuid":"turn-1","sessionId":"{session_id}","timestamp":"2026-04-17T08:00:00Z","type":"assistant"}}"#
             ),
         )
         .unwrap();
-        let state = StateDb::open(&dir.path().join("state.db")).unwrap();
+        source_path
+    }
+
+    fn seed_resolved(
+        state: &StateDb,
+        model: &ModelConfig,
+        session_id: &str,
+    ) -> (ResolvedResume, String) {
         let invocation_id = state
             .start_invocation(&InvocationStart {
                 invocation_uuid: uuid::Uuid::new_v4().to_string(),
@@ -342,14 +362,30 @@ mod tests {
             .chain_id_for_segment("claude", session_id)
             .unwrap()
             .unwrap();
+        (
+            ResolvedResume {
+                chain_id: chain_id.clone(),
+                model_name: Some(model.name.clone()),
+                model: Some(model.clone()),
+                active_provider: "claude".to_string(),
+                active_session_id: session_id.to_string(),
+            },
+            chain_id,
+        )
+    }
+
+    // risk: Migration mechanic source UUID reuse; level: particular-integration; source: proposal §11.1 Migration mechanic / A1.
+    #[test]
+    fn migration_reuses_source_session_id_when_source_and_spawn_cwd_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_projects = dir.path().join("source-projects");
+        let target_projects = dir.path().join("target-projects");
+        let source_workspace = dir.path().join("worktrees").join("same-workspace");
+        let session_id = "dd116a3c-6819-42b1-b3d2-f512331eb5ec";
+        seed_source_jsonl(&source_projects, &source_workspace, session_id);
+        let state = StateDb::open(&dir.path().join("state.db")).unwrap();
         let model = model_with_storage(&source_projects, &target_projects);
-        let resolved = ResolvedResume {
-            chain_id: chain_id.clone(),
-            model_name: Some(model.name.clone()),
-            model: Some(model.clone()),
-            active_provider: "claude".to_string(),
-            active_session_id: session_id.to_string(),
-        };
+        let (resolved, chain_id) = seed_resolved(&state, &model, session_id);
         let mut stderr = Vec::new();
 
         let migrated = migrate_chain_segment(
@@ -357,6 +393,7 @@ mod tests {
             &SessionsConfig::default(),
             &model,
             &resolved,
+            &source_workspace,
             1,
             TransitionReason::Manual,
             &mut stderr,
@@ -367,7 +404,7 @@ mod tests {
         assert_eq!(
             migrated.target_jsonl_path,
             target_projects
-                .join(cwd_hash)
+                .join(claude_project_dir_name(&source_workspace))
                 .join(format!("{session_id}.jsonl"))
         );
         assert!(migrated.target_jsonl_path.exists());
@@ -375,5 +412,84 @@ mod tests {
             state.chain_id_for_segment("claude2", session_id).unwrap(),
             Some(chain_id)
         );
+    }
+
+    // risk: RC-1 cwd/source project dir mismatch; level: particular-integration; source: research/14-session-migration-rca.md (RC-1) + research/14-problem-map.md §2.
+    #[test]
+    fn migration_writes_target_under_spawn_cwd_when_source_and_spawn_cwd_differ() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_projects = dir.path().join("source-projects");
+        let target_projects = dir.path().join("target-projects");
+        let source_workspace = dir.path().join("worktrees").join("source-workspace");
+        let resume_workspace = dir.path().join("worktrees").join("resume-workspace");
+        let session_id = "dd116a3c-6819-42b1-b3d2-f512331eb5ec";
+        seed_source_jsonl(&source_projects, &source_workspace, session_id);
+        let state = StateDb::open(&dir.path().join("state.db")).unwrap();
+        let model = model_with_storage(&source_projects, &target_projects);
+        let (resolved, chain_id) = seed_resolved(&state, &model, session_id);
+        let mut stderr = Vec::new();
+
+        let migrated = migrate_chain_segment(
+            &state,
+            &SessionsConfig::default(),
+            &model,
+            &resolved,
+            &resume_workspace,
+            1,
+            TransitionReason::Manual,
+            &mut stderr,
+        )
+        .unwrap();
+
+        let source_cwd_target = target_projects
+            .join(claude_project_dir_name(&source_workspace))
+            .join(format!("{session_id}.jsonl"));
+        let resume_cwd_target = target_projects
+            .join(claude_project_dir_name(&resume_workspace))
+            .join(format!("{session_id}.jsonl"));
+
+        assert_eq!(migrated.target_session_id, session_id);
+        assert_eq!(migrated.target_jsonl_path, resume_cwd_target);
+        assert!(migrated.target_jsonl_path.exists());
+        assert!(!source_cwd_target.exists());
+        assert_eq!(
+            state.chain_id_for_segment("claude2", session_id).unwrap(),
+            Some(chain_id)
+        );
+    }
+
+    // risk: Cwd-to-project-dir encoding correctness; level: unit; source: proposal §1 helper signature / A2.
+    #[test]
+    fn claude_project_dir_for_encodes_absolute_unix_path() {
+        assert_eq!(
+            claude_project_dir_for("claude", std::path::Path::new("/home/nes/x")).unwrap(),
+            "-home-nes-x"
+        );
+    }
+
+    // risk: Cwd-to-project-dir encoding correctness; level: unit; source: proposal §1 helper signature / A2.
+    #[test]
+    fn claude_project_dir_for_rejects_relative_path() {
+        let err = claude_project_dir_for("claude", std::path::Path::new("relative/x"))
+            .expect_err("relative cwd should be rejected");
+
+        assert!(matches!(
+            err,
+            MigrationError::SpawnCwdUnsupported { provider, cwd }
+                if provider == "claude" && cwd == "relative/x"
+        ));
+    }
+
+    // risk: Cwd-to-project-dir encoding correctness; level: unit; source: proposal §1 helper signature / A2.
+    #[test]
+    fn claude_project_dir_for_rejects_empty_path() {
+        let err = claude_project_dir_for("claude", std::path::Path::new(""))
+            .expect_err("empty cwd should be rejected");
+
+        assert!(matches!(
+            err,
+            MigrationError::SpawnCwdUnsupported { provider, cwd }
+                if provider == "claude" && cwd.is_empty()
+        ));
     }
 }

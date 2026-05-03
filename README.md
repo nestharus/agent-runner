@@ -651,6 +651,8 @@ oulipoly-agent-runner resume -m codex-high --session-id 5169694d-de0f-40d1-890c-
 
 With a model, one-shot spawn is `providers[name].command + providers[name].args + model.providers[name].args + resume_args`. Without a model, the model TOML is not loaded for spawn; the runner uses only `providers[name].command + providers[name].args + resume_args`, so the upstream CLI uses its own default model.
 
+When load balancing migrates a Claude Code session during `repl --resume` or `resume`, the copied target JSONL is re-anchored under the Claude project directory derived from the child process working directory (`-p/--project`, or the current directory when omitted). This matches Claude Code's own cwd-scoped `--resume <UUID>` lookup; the resume argv remains just the configured resume flag or subcommand plus the session id.
+
 The runner always emits a short selection line on stderr regardless of TTY:
 
 ```

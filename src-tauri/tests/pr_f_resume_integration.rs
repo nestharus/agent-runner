@@ -332,6 +332,7 @@ projects_dir = "{}"
         if let Some(resume) = resume {
             cmd.arg("--resume").arg(resume);
         }
+        cmd.current_dir(self.dir.path());
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
@@ -351,6 +352,7 @@ projects_dir = "{}"
             .arg(session_id)
             .arg("--models-dir")
             .arg(&self.models_dir);
+        cmd.current_dir(self.dir.path());
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
@@ -365,6 +367,7 @@ projects_dir = "{}"
             .arg(session_id)
             .arg("--models-dir")
             .arg(&self.models_dir);
+        cmd.current_dir(self.dir.path());
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
@@ -942,11 +945,23 @@ fn repl_resume_migrates_to_least_loaded_provider() {
         fixture.active_segment(chain_id),
         ("claude-b".to_string(), session_id.to_string())
     );
+    // risk: RC-1 cwd/source project dir mismatch end-to-end via run_repl;
+    //       level: end-to-end; source: research/14-session-migration-rca.md (RC-1) + contract §5.
+    let expected_target_dir = fixture.dir.path().to_string_lossy().replace('/', "-");
     assert!(
         target_projects
+            .join(&expected_target_dir)
+            .join(format!("{session_id}.jsonl"))
+            .exists(),
+        "expected target JSONL under spawn-cwd-derived dir {}",
+        expected_target_dir
+    );
+    assert!(
+        !target_projects
             .join("cwd-hash-fixture")
             .join(format!("{session_id}.jsonl"))
-            .exists()
+            .exists(),
+        "target JSONL must not be written under the source-side fixture dir"
     );
 }
 
