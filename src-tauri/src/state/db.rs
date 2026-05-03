@@ -1,5 +1,5 @@
-use crate::balancer::TransitionReason;
-use crate::config::{ModelConfig, load_models};
+use super::repository::{ResumeDbFacts, TransitionReason};
+use crate::config::ModelConfig;
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -45,6 +45,7 @@ const MIN_LEARN_SAMPLE_CALLS: u64 = 20;
 /// "the sample is at the rail." Matching ceiling from score_by_density.
 const NEAR_EXHAUSTED_USED_PERCENT: f64 = 0.99;
 
+#[derive(Debug)]
 pub struct StateDb {
     conn: Connection,
 }
@@ -378,7 +379,7 @@ impl CompositeInvocationId {
 // --- Model discovery entities ---
 
 /// The type of a model parameter, stored as JSON in SQLite.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ParamType {
     /// A parameter that accepts one of a fixed set of values.
@@ -389,6 +390,41 @@ pub enum ParamType {
     Number { min: Option<f64>, max: Option<f64> },
     /// A boolean flag parameter.
     Boolean,
+}
+
+impl<'de> Deserialize<'de> for ParamType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if let Some(kind) = value.as_str() {
+            return match kind {
+                "string" => Ok(ParamType::String),
+                "boolean" => Ok(ParamType::Boolean),
+                other => Err(serde::de::Error::custom(format!(
+                    "unsupported parameter type {other}"
+                ))),
+            };
+        }
+
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum TaggedParamType {
+            Enum { options: Vec<String> },
+            String,
+            Number { min: Option<f64>, max: Option<f64> },
+            Boolean,
+        }
+
+        let tagged = TaggedParamType::deserialize(value).map_err(serde::de::Error::custom)?;
+        Ok(match tagged {
+            TaggedParamType::Enum { options } => ParamType::Enum { options },
+            TaggedParamType::String => ParamType::String,
+            TaggedParamType::Number { min, max } => ParamType::Number { min, max },
+            TaggedParamType::Boolean => ParamType::Boolean,
+        })
+    }
 }
 
 /// How a parameter maps to CLI flags when invoking the model.
@@ -410,13 +446,40 @@ pub struct DiscoveredModel {
 }
 
 /// A parameter for a discovered model.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ModelParameter {
     pub name: String,
     pub display_name: String,
     pub param_type: ParamType,
     pub description: String,
     pub cli_mapping: CliMapping,
+}
+
+impl<'de> Deserialize<'de> for ModelParameter {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawModelParameter {
+            name: String,
+            #[serde(default)]
+            display_name: Option<String>,
+            param_type: ParamType,
+            #[serde(default)]
+            description: String,
+            cli_mapping: CliMapping,
+        }
+
+        let raw = RawModelParameter::deserialize(deserializer)?;
+        Ok(ModelParameter {
+            display_name: raw.display_name.unwrap_or_else(|| raw.name.clone()),
+            name: raw.name,
+            param_type: raw.param_type,
+            description: raw.description,
+            cli_mapping: raw.cli_mapping,
+        })
+    }
 }
 
 // --- Provider & Account entities (provider-accounts redesign) ---
@@ -516,6 +579,8 @@ impl StateDb {
         Self::ensure_invocations_schema(&conn)?;
         Self::ensure_providers_schema(&mut conn)?;
 
+        let quota_windows_existed = Self::table_exists(&conn, "provider_quota_windows")?;
+
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS provider_quotas (
                 provider_name TEXT PRIMARY KEY,
@@ -536,13 +601,6 @@ impl StateDb {
                 last_delta_calls INTEGER,
                 PRIMARY KEY (provider_name, window_id)
             );
-
-            -- Migrate pre-multi-window rows: any provider_quotas row with a
-            -- resets_at that doesn't yet have a window becomes window 0.
-            INSERT OR IGNORE INTO provider_quota_windows (provider_name, window_id, used_percent, resets_at)
-            SELECT provider_name, 0, used_percent, resets_at
-            FROM provider_quotas
-            WHERE resets_at IS NOT NULL;
 
             CREATE TABLE IF NOT EXISTS memory_nodes (
                 id TEXT PRIMARY KEY,
@@ -663,6 +721,9 @@ impl StateDb {
             ",
         )
         .map_err(|e| format!("Failed to initialize schema: {e}"))?;
+        if !quota_windows_existed {
+            Self::migrate_legacy_quota_windows(&conn)?;
+        }
         Self::ensure_provider_quotas_schema(&conn)?;
         Self::ensure_provider_quota_windows_schema(&conn)?;
         Self::ensure_session_turns_schema(&conn)?;
@@ -917,6 +978,32 @@ impl StateDb {
         )
         .optional()
         .map_err(|e| format!("Failed to inspect providers object type: {e}"))
+    }
+
+    fn table_exists(conn: &Connection, table_name: &str) -> Result<bool, String> {
+        let exists: i64 = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1
+                )",
+                params![table_name],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to inspect table {table_name}: {e}"))?;
+        Ok(exists != 0)
+    }
+
+    fn migrate_legacy_quota_windows(conn: &Connection) -> Result<(), String> {
+        conn.execute(
+            "INSERT OR IGNORE INTO provider_quota_windows
+                (provider_name, window_id, used_percent, resets_at)
+             SELECT provider_name, 0, used_percent, resets_at
+             FROM provider_quotas
+             WHERE resets_at IS NOT NULL",
+            [],
+        )
+        .map_err(|e| format!("Failed to migrate legacy quota windows: {e}"))?;
+        Ok(())
     }
 
     fn providers_has_foreign_keys(conn: &Connection) -> Result<bool, String> {
@@ -1347,20 +1434,60 @@ impl StateDb {
         let models_dir = dirs::config_dir()
             .map(|dir| dir.join("oulipoly-agent-runner").join("models"))
             .unwrap_or_else(|| std::path::PathBuf::from("models"));
-        let models = match load_models(&models_dir) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!(
-                    "Warning: failed to load models config during invocation migration ({e}); \
-                     pre-existing invocation rows will migrate as status='legacy'."
-                );
-                return Ok(std::collections::HashMap::new());
-            }
-        };
         let mut lookup = std::collections::HashMap::new();
-        for (model_name, model) in models {
-            for (provider_index, provider) in model.providers.iter().enumerate() {
-                lookup.insert((model_name.clone(), provider_index), provider.name.clone());
+        if !models_dir.is_dir() {
+            return Ok(lookup);
+        }
+
+        #[derive(Deserialize)]
+        struct RawProvider {
+            name: Option<String>,
+        }
+
+        #[derive(Deserialize)]
+        struct RawModel {
+            providers: Option<Vec<RawProvider>>,
+        }
+
+        let entries = std::fs::read_dir(&models_dir)
+            .map_err(|e| format!("Failed to read models directory for migration: {e}"))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("Failed to read model directory entry: {e}"))?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
+                continue;
+            }
+            let Some(model_name) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            let content = match std::fs::read_to_string(&path) {
+                Ok(content) => content,
+                Err(e) => {
+                    eprintln!(
+                        "Warning: failed to read models config during invocation migration ({e}); \
+                         pre-existing invocation rows from {} may migrate as status='legacy'.",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+            let raw: RawModel = match toml::from_str(&content) {
+                Ok(raw) => raw,
+                Err(e) => {
+                    eprintln!(
+                        "Warning: failed to parse models config during invocation migration ({e}); \
+                         pre-existing invocation rows from {} may migrate as status='legacy'.",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+            for (provider_index, provider) in
+                raw.providers.unwrap_or_default().into_iter().enumerate()
+            {
+                if let Some(provider_name) = provider.name {
+                    lookup.insert((model_name.to_string(), provider_index), provider_name);
+                }
             }
         }
         Ok(lookup)
@@ -3001,8 +3128,70 @@ impl StateDb {
         })
     }
 
+    pub fn resolve_resume_facts(
+        &self,
+        input: &str,
+        model_override: Option<&str>,
+    ) -> Result<ResumeDbFacts, ResumeError> {
+        Uuid::try_parse(input).map_err(|_| ResumeError::InvalidUuid {
+            input: input.to_string(),
+        })?;
+
+        let chain_ids = self
+            .candidate_chain_ids(input)
+            .map_err(|message| ResumeError::Db { message })?;
+        if chain_ids.is_empty() {
+            return Err(ResumeError::NoChainFound {
+                input: input.to_string(),
+            });
+        }
+        let chain_id = self
+            .choose_resume_chain(input, chain_ids)
+            .map_err(|message| ResumeError::Db { message })?;
+
+        let Some(chain_id) = chain_id else {
+            let previews = self
+                .chain_previews(input)
+                .map_err(|message| ResumeError::Db { message })?;
+            return Err(ResumeError::Ambiguous {
+                input: input.to_string(),
+                previews,
+            });
+        };
+
+        let (active_provider, active_session_id) = self
+            .active_segment_for_chain(&chain_id)
+            .map_err(|message| ResumeError::Db { message })?
+            .ok_or_else(|| ResumeError::ActiveSegmentMissing {
+                chain_id: chain_id.clone(),
+            })?;
+
+        let inferred_model_name = if let Some(model_override) = model_override {
+            Some(model_override.to_string())
+        } else {
+            self.latest_invocation_model_for_chain(&chain_id)
+                .map_err(|message| ResumeError::Db { message })?
+                .filter(|name| name != "<unknown>")
+                .or(self
+                    .chain_model_name(&chain_id)
+                    .map_err(|message| ResumeError::Db { message })?
+                    .filter(|name| name != "<unknown>"))
+        };
+
+        Ok(ResumeDbFacts {
+            chain_id,
+            inferred_model_name,
+            active_provider,
+            active_session_id,
+        })
+    }
+
     pub fn resume_previews(&self, input: &str) -> Result<Vec<ChainPreview>, DbError> {
         Uuid::try_parse(input).map_err(|e| format!("Invalid UUID {input}: {e}"))?;
+        self.chain_previews(input)
+    }
+
+    pub fn resume_previews_for_prefix(&self, input: &str) -> Result<Vec<ChainPreview>, DbError> {
         self.chain_previews(input)
     }
 
@@ -3031,12 +3220,16 @@ impl StateDb {
             .prepare(
                 "SELECT DISTINCT chain_id
                  FROM session_chain_segments
-                 WHERE session_id = ?1 OR chain_id = ?1
+                 WHERE session_id = ?1
+                    OR chain_id = ?1
+                    OR session_id LIKE ?2
+                    OR chain_id LIKE ?2
                  ORDER BY chain_id",
             )
             .map_err(|e| format!("Failed to prepare resume chain lookup: {e}"))?;
+        let prefix = format!("{input}%");
         let rows = stmt
-            .query_map(params![input], |row| row.get::<_, String>(0))
+            .query_map(params![input, prefix], |row| row.get::<_, String>(0))
             .map_err(|e| format!("Failed to query resume chain lookup: {e}"))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("Failed to read resume chain lookup: {e}"))
@@ -3272,17 +3465,8 @@ impl StateDb {
         provider_name: &str,
         since: Option<&DateTime<Utc>>,
     ) -> Result<u64, String> {
-        let count: i64 = match since {
-            Some(ts) => self
-                .conn
-                .query_row(
-                    "SELECT COUNT(*) FROM session_turns
-                     WHERE provider_name = ?1 AND role = 'assistant' AND timestamp > ?2",
-                    params![provider_name, ts.to_rfc3339()],
-                    |row| row.get(0),
-                )
-                .map_err(|e| format!("Failed to count session turns: {e}"))?,
-            None => self
+        let Some(since) = since else {
+            let count: i64 = self
                 .conn
                 .query_row(
                     "SELECT COUNT(*) FROM session_turns
@@ -3290,9 +3474,31 @@ impl StateDb {
                     params![provider_name],
                     |row| row.get(0),
                 )
-                .map_err(|e| format!("Failed to count session turns: {e}"))?,
+                .map_err(|e| format!("Failed to count session turns: {e}"))?;
+            return Ok(count.max(0) as u64);
         };
-        Ok(count.max(0) as u64)
+
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT timestamp FROM session_turns
+                 WHERE provider_name = ?1 AND role = 'assistant'",
+            )
+            .map_err(|e| format!("Failed to prepare session turn count: {e}"))?;
+        let rows = stmt
+            .query_map(params![provider_name], |row| row.get::<_, String>(0))
+            .map_err(|e| format!("Failed to query session turns: {e}"))?;
+        let mut count = 0;
+        for row in rows {
+            let raw_ts = row.map_err(|e| format!("Failed to read session turn timestamp: {e}"))?;
+            let timestamp = DateTime::parse_from_rfc3339(&raw_ts)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|e| format!("Bad session turn timestamp {raw_ts}: {e}"))?;
+            if timestamp > *since {
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 
     #[cfg(test)]
@@ -4692,8 +4898,8 @@ name = "fixture-provider"
         ]);
         let path = dir.path().join("state.db");
 
-        // Plant a corrupt models/ directory at XDG_CONFIG_HOME so the
-        // load_models() call inside migration fails.
+        // Plant a corrupt models/ directory at XDG_CONFIG_HOME so migration
+        // cannot derive provider names.
         let config_root = dir.path().join("oulipoly-agent-runner");
         let models_dir = config_root.join("models");
         std::fs::create_dir_all(&models_dir).unwrap();
@@ -6473,7 +6679,7 @@ interactive_args = ["launch"]
                 "claude",
                 SESSION_A,
                 &ts("2026-04-17T08:00:00Z"),
-                crate::balancer::TransitionReason::Initial,
+                crate::state::TransitionReason::Initial,
             )
             .unwrap();
         let second_id = db
@@ -6482,7 +6688,7 @@ interactive_args = ["launch"]
                 "claude",
                 SESSION_A,
                 &ts("2026-04-17T08:01:00Z"),
-                crate::balancer::TransitionReason::Initial,
+                crate::state::TransitionReason::Initial,
             )
             .unwrap();
 
@@ -6800,7 +7006,7 @@ interactive_args = ["launch"]
                 "claude",
                 SESSION_A,
                 &ts("2026-04-17T08:00:00Z"),
-                crate::balancer::TransitionReason::Initial,
+                crate::state::TransitionReason::Initial,
             )
             .unwrap_err();
         assert!(

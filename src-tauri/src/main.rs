@@ -1,7 +1,8 @@
 use agent_runner_lib::balancer;
 use agent_runner_lib::config::{
-    AgentConfig, ModelConfig, PromptMode, ProviderConfig, ProvidersConfig, load_agent_file,
-    load_agents, load_models,
+    AgentConfig, AgentConfigRepository, FilesystemAgentConfigRepository,
+    FilesystemModelConfigRepository, ModelConfig, ModelConfigRepository, PromptMode,
+    ProviderConfig, ProvidersConfig, load_models,
 };
 use agent_runner_lib::diagnostics;
 use agent_runner_lib::executor;
@@ -475,7 +476,8 @@ fn run(cli: Cli) -> Result<i32, String> {
     }
 
     let models_dir = resolve_models_dir(&cli);
-    let models = load_models(&models_dir)?;
+    let model_repo = FilesystemModelConfigRepository::new(models_dir.clone());
+    let models = model_repo.load_models()?;
     let extra_inputs = parse_inputs(&cli.inputs)?;
 
     let working_dir = cli.project.clone();
@@ -487,7 +489,12 @@ fn run(cli: Cli) -> Result<i32, String> {
             .ok_or_else(|| format!("Unknown model: {model_name}"))?;
 
         let prompt = if let Some(ref agent_path) = cli.agent_file {
-            let agent = load_agent_file(agent_path)?;
+            let agent_repo = FilesystemAgentConfigRepository::new(
+                cli.agents_dir
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from("agents")),
+            );
+            let agent = agent_repo.load_agent_file(agent_path)?;
             let raw_prompt = resolve_prompt(&cli, true)?;
             format!("{}\n\n{}", agent.instructions, raw_prompt)
         } else {
@@ -984,17 +991,19 @@ fn emit_export_json_error(code: &str, message: &str) {
 }
 
 fn resolve_agent(cli: &Cli) -> Result<AgentConfig, String> {
+    let agents_dir = cli.agents_dir.clone().unwrap_or_else(|| {
+        dirs::config_dir()
+            .map(|d| d.join("oulipoly-agent-runner").join("agents"))
+            .unwrap_or_else(|| PathBuf::from("agents"))
+    });
+    let agent_repo = FilesystemAgentConfigRepository::new(agents_dir);
+
     if let Some(ref path) = cli.agent_file {
-        return load_agent_file(path);
+        return agent_repo.load_agent_file(path);
     }
 
     if let Some(ref name) = cli.agent {
-        let agents_dir = cli.agents_dir.clone().unwrap_or_else(|| {
-            dirs::config_dir()
-                .map(|d| d.join("oulipoly-agent-runner").join("agents"))
-                .unwrap_or_else(|| PathBuf::from("agents"))
-        });
-        let agents = load_agents(&agents_dir)?;
+        let agents = agent_repo.load_agents()?;
         return agents
             .get(name)
             .cloned()
@@ -1247,7 +1256,7 @@ fn resume_execution_target(
         })
     } else {
         let (provider, prompt_mode) = providers_cfg
-            .runtime_provider(&resolved.active_provider)
+            .runtime_provider_with_mode(&resolved.active_provider)
             .map_err(|message| agent_runner_lib::state::ResumeError::Db { message })?;
         let provider_index =
             provider_index_in_providers_cfg(providers_cfg, &resolved.active_provider);
@@ -1496,7 +1505,7 @@ fn resume_migration_pool(
             || providers_cfg
                 .get(&name)
                 .is_some_and(|entry| entry.session_storage.is_some());
-        if is_candidate && let Ok((provider, _)) = providers_cfg.runtime_provider(&name) {
+        if is_candidate && let Ok((provider, _)) = providers_cfg.runtime_provider_with_mode(&name) {
             providers.push(provider);
         }
     }

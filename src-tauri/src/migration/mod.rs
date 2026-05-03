@@ -1,7 +1,6 @@
-use crate::balancer::TransitionReason;
 use crate::config::{ModelConfig, SessionStorage, SessionsConfig};
 use crate::sessions::locate_transcript;
-use crate::state::{ResolvedResume, StateDb};
+use crate::state::{ResolvedResume, StateDb, TransitionReason};
 use std::io::Write;
 use std::path::PathBuf;
 
