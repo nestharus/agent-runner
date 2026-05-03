@@ -89,6 +89,27 @@ fn refresh_provider_retries_script_after_auth_refresh_command() {
     assert_eq!(calls[2].args, ["-c", "quota-script --json"]);
 }
 
+/// Drift pin F-03: pre-B quota parsing accepted object envelopes only
+/// (`{"windows": [...]}` or legacy single-window), not a top-level array.
+#[test]
+fn refresh_provider_rejects_bare_array_quota_script_output() {
+    let fixture = StateRepoFixture::new();
+    let db = fixture.open_db();
+    let runner = FakeProcessRunner::with_responses(vec![ok_output(quota_json(), "", 0)]);
+    let providers = providers_with("quota-script --json", None);
+    let in_flight = InFlight::new();
+
+    let outcome = quota::refresh_provider(CLAUDE_PROVIDER, &providers, &in_flight, &db, &runner);
+
+    match outcome {
+        quota::RefreshOutcome::Failed(message) => {
+            assert!(message.contains("Invalid JSON"), "unexpected error: {message}");
+        }
+        other => panic!("expected bare array output to fail, got {other:?}"),
+    }
+    assert_eq!(fixture.quota_window_count(CLAUDE_PROVIDER), 0);
+}
+
 /// Risk: T4/T14 - moving stale checks from concrete `StateDb` to
 /// `QuotaRepository` may change the current fresh-window behavior.
 /// Level: particular-integration.

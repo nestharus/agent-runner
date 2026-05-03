@@ -42,6 +42,53 @@ quota_script = "quota-json"
     assert_eq!(call.args, ["-c", "quota-json"]);
 }
 
+/// Drift pin F-01: pre-B `refresh_quotas` accepted only `state`; an incoming
+/// `providers` field was unknown and had no observable effect.
+#[test]
+fn refresh_quotas_ignores_providers_ipc_field_and_refreshes_all_candidates() {
+    let bundle = B3ServiceBundle::new();
+    bundle.write_model(
+        "multi-provider-model",
+        r#"[[providers]]
+name = "claude"
+
+[[providers]]
+name = "codex"
+"#,
+    );
+    bundle.write_providers(
+        r#"[claude]
+quota_script = "claude-quota"
+
+[codex]
+quota_script = "codex-quota"
+"#,
+    );
+    bundle.runner.push_response(ok_output(quota_json(), "", 0));
+    bundle.runner.push_response(ok_output(quota_json(), "", 0));
+    let (_app, webview) = bundle.mock_app();
+
+    let response =
+        invoke_json(&webview, "refresh_quotas", json!({"providers": ["claude"]})).unwrap();
+    let mut providers: Vec<_> = response
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["provider_name"].as_str().unwrap().to_string())
+        .collect();
+    providers.sort();
+
+    assert_eq!(providers, ["claude", "codex"]);
+    assert_eq!(
+        bundle.open_state_db().get_windows("claude").unwrap().len(),
+        1
+    );
+    assert_eq!(
+        bundle.open_state_db().get_windows("codex").unwrap().len(),
+        1
+    );
+}
+
 /// Risk: T15 - `test_model` can bypass the AppState process runner while still
 /// returning a successful command response through the GUI.
 /// Level: hookpoint via real Tauri IPC.
@@ -81,6 +128,61 @@ prompt_mode = "stdin"
     };
     let stdin = String::from_utf8(stdin).unwrap();
     assert!(stdin.contains("Say hello"), "expected test prompt: {stdin}");
+}
+
+/// Drift pin F-02: pre-B `test_model` accepted `name` only; `modelName` was an
+/// unknown IPC field, not an alias.
+#[test]
+fn test_model_ignores_model_name_ipc_field_and_rejects_alias_only_request() {
+    let bundle = B3ServiceBundle::new();
+    bundle.write_model(
+        "name-model",
+        r#"[[providers]]
+name = "name-cli"
+"#,
+    );
+    bundle.write_model(
+        "alias-model",
+        r#"[[providers]]
+name = "alias-cli"
+"#,
+    );
+    bundle.write_providers(
+        r#"[name-cli]
+command = "name-cli"
+prompt_mode = "stdin"
+
+[alias-cli]
+command = "alias-cli"
+prompt_mode = "stdin"
+"#,
+    );
+    bundle.runner.push_response(ok_output("name model ok\n", "", 0));
+    let (_app, webview) = bundle.mock_app();
+
+    let response = invoke_json(
+        &webview,
+        "test_model",
+        json!({"name": "name-model", "modelName": "alias-model"}),
+    )
+    .unwrap();
+
+    assert!(response.to_string().contains("name model ok"), "{response}");
+    let calls = bundle.runner.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].program, "name-cli");
+
+    let err = invoke_json(&webview, "test_model", json!({"modelName": "alias-model"}))
+        .expect_err("modelName-only request should be rejected because name is required");
+    assert!(
+        err.to_string().contains("name") || err.to_string().contains("Model"),
+        "unexpected error response: {err}"
+    );
+    assert_eq!(
+        bundle.runner.calls().len(),
+        1,
+        "alias-only request must not execute a model"
+    );
 }
 
 /// Risk: T16 - `sync_provider` can keep calling the old no-runner detection

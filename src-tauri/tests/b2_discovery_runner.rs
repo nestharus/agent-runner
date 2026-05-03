@@ -59,6 +59,25 @@ fn discover_models_with_runner_returns_ok_empty_when_all_strategies_fail() {
     assert!(calls[1..].iter().all(|call| call.program == "claude"));
 }
 
+/// Drift pin F-04: pre-B discovery did not filter "no models", "failed", or
+/// "error" lines before extracting model-name candidates.
+#[test]
+fn discover_models_with_runner_keeps_no_models_and_failed_lines_as_candidates() {
+    let runner = FakeProcessRunner::with_responses(vec![
+        ok_output("claude 1.2.3\n", "", 0),
+        ok_output("no models found\nclaude-haiku failed setup\n", "", 0),
+    ]);
+
+    let result = discovery::discover_models_with_runner("claude", &runner).unwrap();
+    let names: Vec<_> = result
+        .models
+        .iter()
+        .map(|model| model.canonical_name.as_str())
+        .collect();
+
+    assert_eq!(names, ["claude-haiku", "no"]);
+}
+
 /// Risk: T17 - discovery error handling must remain narrow: a missing CLI at
 /// the version probe is still an error even though later strategy failures are
 /// tolerated.
