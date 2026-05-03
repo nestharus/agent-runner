@@ -45,3 +45,6 @@ CODERABBIT_*.md
 
 # Worktrees (per-PR isolation for phase 6)
 /worktrees/
+
+# Local planning (per-project umbrella — survives the trunk move)
+/planning/

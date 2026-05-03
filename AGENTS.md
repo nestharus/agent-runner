@@ -1,5 +1,8 @@
 # Oulipoly Plane — Agent Entry Point
 
+> Global conventions live in [`~/ai/AGENTS.md`](~/ai/AGENTS.md). Read that
+> first; this file layers project-specific context on top.
+
 ## What This Is
 
 **Oulipoly Plane** is a desktop control plane for AI coding agent CLIs
