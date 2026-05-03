@@ -1,0 +1,22 @@
+[package]
+name = "agent-bin"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "agent_runner_agent_bin"
+path = "src/lib.rs"
+
+[[bin]]
+name = "agent"
+path = "src/main.rs"
+
+[dependencies]
+agent-runner-config.workspace = true
+agent-runner-runtime.workspace = true
+agent-runner-session.workspace = true
+dirs.workspace = true
+
+[dev-dependencies]
+agent-runner-executor.workspace = true
+tempfile.workspace = true

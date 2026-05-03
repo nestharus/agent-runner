@@ -1,10 +1,12 @@
 mod agent;
+mod app;
 pub mod model;
 pub mod providers;
 pub mod repository;
 pub mod sessions;
 
 pub use agent::{AgentConfig, load_agent_file, load_agents};
+pub use app::{AppConfig, load_app_config, load_app_config_from_path};
 pub use model::{
     InputDef, InputType, ModelConfig, PromptMode, ProviderConfig, ResumeAcceptanceRules,
     ResumeKind, ResumeStrategy, SessionCapture, SessionCaptureKind, SessionStorage,

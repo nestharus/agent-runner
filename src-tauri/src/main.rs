@@ -4,19 +4,20 @@ use agent_runner_app::trace::{TraceOptions, render_ascii_trace, trace_invocation
 use agent_runner_balancer as balancer;
 use agent_runner_config::{
     AgentConfig, ModelConfig, PromptMode, ProviderConfig, ProvidersConfig, load_agent_file,
-    load_agents, load_models,
+    load_agents, load_app_config, load_models,
 };
 use agent_runner_diagnostics as diagnostics;
 use agent_runner_executor as executor;
+use agent_runner_runtime::repl::{ReplOptions, run_repl_with_services};
 use agent_runner_schema_probe as schema_probe;
 use agent_runner_schema_probe::ProbeError;
 use agent_runner_session as session_replace;
-use agent_runner_session::LockError;
 use agent_runner_session::ReplaceError;
 use agent_runner_session::{
     ExportError, ExportSessionMetadata, read_canonical_transcript,
     resolve_export_session_metadata_with_deps,
 };
+use agent_runner_session::{LockError, SessionLockProvider};
 use agent_runner_session::{MetadataError, locate_session_metadata};
 use agent_runner_state::{CompositeInvocationId, InvocationStart, ReadOnlyOpenError, StateDb};
 
@@ -224,34 +225,6 @@ enum SessionSubcommands {
         #[arg(long = "preimage-sha256")]
         preimage_sha256: Option<String>,
     },
-}
-
-#[derive(Debug)]
-struct AppConfig {
-    diagnostics_model: Option<String>,
-}
-
-fn load_app_config() -> AppConfig {
-    let config_dir = dirs::config_dir()
-        .map(|d| d.join("oulipoly-agent-runner"))
-        .unwrap_or_else(|| PathBuf::from("."));
-
-    let config_path = config_dir.join("config.toml");
-
-    if let Ok(content) = std::fs::read_to_string(&config_path)
-        && let Ok(table) = content.parse::<toml::Table>()
-    {
-        return AppConfig {
-            diagnostics_model: table
-                .get("diagnostics_model")
-                .and_then(|v| v.as_str())
-                .map(String::from),
-        };
-    }
-
-    AppConfig {
-        diagnostics_model: None,
-    }
 }
 
 /// Parse --input key=value flags into a map (repeated keys become arrays).
@@ -946,6 +919,7 @@ impl Drop for FinalizerGuard<'_> {
     }
 }
 
+#[cfg(test)]
 fn should_emit_invocation_line(is_terminal: bool) -> bool {
     !is_terminal
 }
@@ -1121,7 +1095,6 @@ fn format_resume_error(err: agent_runner_state::ResumeError) -> String {
 
 #[derive(Clone)]
 struct ResumeExecutionTarget {
-    model: Option<ModelConfig>,
     provider_index: usize,
     provider: ProviderConfig,
     prompt_mode: PromptMode,
@@ -1145,7 +1118,6 @@ fn resume_execution_target(
             .effective_provider(&model.providers[provider_index])
             .map_err(|message| agent_runner_state::ResumeError::Db { message })?;
         Ok(ResumeExecutionTarget {
-            model: Some(model.clone()),
             provider_index,
             provider,
             prompt_mode,
@@ -1157,7 +1129,6 @@ fn resume_execution_target(
         let provider_index =
             provider_index_in_providers_cfg(providers_cfg, &resolved.active_provider);
         Ok(ResumeExecutionTarget {
-            model: None,
             provider_index,
             provider,
             prompt_mode,
@@ -1209,8 +1180,8 @@ fn run_pause_handshake(session_id: &str, ttl_ms: Option<u64>) -> Result<i32, Str
         Ok(lock_dir) => lock_dir,
         Err(message) => return Ok(emit_json_error(1, "operational-error", message)),
     };
-    match services
-        .lock_provider
+    let lock_provider = agent_runner_session::FilesystemSessionLockProvider;
+    match lock_provider
         .acquire(
             &lock_dir,
             &resolved.active_session_id,
@@ -1256,8 +1227,8 @@ fn run_resume_handshake(session_id: &str, token: &str) -> Result<i32, String> {
         Ok(lock_dir) => lock_dir,
         Err(message) => return Ok(emit_json_error(1, "operational-error", message)),
     };
-    match services
-        .lock_provider
+    let lock_provider = agent_runner_session::FilesystemSessionLockProvider;
+    match lock_provider
         .release(&lock_dir, session_id, token)
         .map_err(normalize_lock_provider_error)
     {
@@ -1418,240 +1389,16 @@ fn run_repl(
     models_dir_override: Option<&Path>,
 ) -> Result<i32, String> {
     let services = cli_services(models_dir_override);
-    let state = services.state_opener.open_default()?;
-    let models = services.model_repo.load_models()?;
-    let providers_cfg = services
-        .provider_source
-        .load_providers()
-        .unwrap_or_default();
-    let sessions_cfg = services.sessions_source.load_sessions().unwrap_or_default();
-    let mut resolved_resume = if let Some(session_id) = resume {
-        Some(
-            match state.resolve_resume(&models, session_id, model_name) {
-                Ok(resolved) => resolved,
-                Err(agent_runner_state::ResumeError::ProviderModelMismatch {
-                    active_provider,
-                    ..
-                }) => {
-                    return Err(resume_model_pool_mismatch_message(
-                        &models,
-                        model_name.unwrap_or("<unknown>"),
-                        session_id,
-                        &active_provider,
-                    ));
-                }
-                Err(err) => return Err(format_resume_error(err)),
-            },
-        )
-    } else {
-        None
-    };
-    let mut fallback_target = match resolved_resume.as_ref() {
-        Some(resolved) => {
-            Some(resume_execution_target(resolved, &providers_cfg).map_err(format_resume_error)?)
-        }
-        None => None,
-    };
-    let direct_model = if fallback_target.is_none() {
-        let model_name =
-            model_name.ok_or_else(|| "model is required unless --resume is present".to_string())?;
-        Some(
-            models
-                .get(model_name)
-                .cloned()
-                .ok_or_else(|| format!("Unknown model: {model_name}"))?,
-        )
-    } else {
-        None
-    };
-    let model = fallback_target
-        .as_ref()
-        .and_then(|target| target.model.clone())
-        .or(direct_model)
-        .unwrap_or_else(|| ModelConfig {
-            name: "<provider-default>".to_string(),
-            prompt_mode: PromptMode::Stdin,
-            providers: Vec::new(),
-            inputs: Vec::new(),
-        });
-
-    let ctx = BalanceContext {
-        providers_cfg: &providers_cfg,
-        sessions_cfg: &sessions_cfg,
-        in_flight: &services.quota_in_flight,
-        quota_repo: &state,
-        turn_repo: &state,
-        chain_repo: Some(&state),
-        runner: services.process_runner.as_ref(),
-    };
-
-    let parent_invocation_id = resolve_parent_invocation_id(&state);
-    let stderr_is_terminal = std::io::stderr().is_terminal();
-    let (provider_index, provider, resume_session_id) = if let Some(resolved) =
-        resolved_resume.as_mut()
-    {
-        let selected_provider = &resolved.active_provider;
-        if should_emit_resume_short_line(stderr_is_terminal) {
-            eprintln!("[resume] -> {selected_provider}");
-        }
-        let migration_model = resume_migration_pool(resolved, &providers_cfg);
-        if let Ok(balancer::MigrationDecision::Migrate {
-            target_provider_index,
-            reason,
-        }) = balancer::decide_migration(&state, &migration_model, resolved, manual_migrate)
-        {
-            let mut stderr = std::io::stderr();
-            match agent_runner_balancer::migration::migrate_chain_segment(
-                &state,
-                &sessions_cfg,
-                &migration_model,
-                resolved,
-                target_provider_index,
-                reason,
-                &mut stderr,
-            ) {
-                Ok(migrated) => {
-                    resolved.active_provider = migrated.target_provider.clone();
-                    resolved.active_session_id = migrated.target_session_id.clone();
-                    fallback_target = Some(
-                        resume_execution_target(resolved, &providers_cfg)
-                            .map_err(format_resume_error)?,
-                    );
-                }
-                Err(err) => {
-                    eprintln!("migration failed: {err:?}");
-                    return Ok(1);
-                }
-            }
-        }
-
-        let target = fallback_target
-            .as_ref()
-            .expect("resume target must be resolved before spawn");
-        let provider_index = target.provider_index;
-        let provider = target.provider.clone();
-        if provider.resume.is_none() {
-            eprintln!(
-                "provider {} has no [providers.resume] block; cannot resume",
-                provider.name
-            );
-            return Ok(1);
-        }
-
-        (
-            provider_index,
-            provider,
-            Some(resolved.active_session_id.clone()),
-        )
-    } else {
-        let provider_index = balancer::select_provider(&model, &state, Some(&ctx));
-        let (provider, _) = effective_model_for_execution(&model, provider_index, &providers_cfg)?;
-        (provider_index, provider, None)
-    };
-    if provider.interactive_args.is_none() {
-        return Err(format!(
-            "Provider {} has no interactive_args; cannot launch interactively",
-            provider.name
-        ));
-    }
-
-    let invocation = CompositeInvocationId {
-        source: provider.name.clone(),
-        id: Uuid::new_v4().to_string(),
-    };
-    let invocation_model_name = resolved_resume
-        .as_ref()
-        .and_then(|resolved| resolved.model_name.clone())
-        .unwrap_or_else(|| {
-            if resume.is_some() {
-                "<unknown>".to_string()
-            } else {
-                model.name.clone()
-            }
-        });
-    let invocation_row_id = state.start_invocation(&InvocationStart {
-        invocation_uuid: invocation.id.clone(),
-        model_name: invocation_model_name,
-        provider_name: provider.name.clone(),
-        provider_index,
-        parent_invocation_id,
-    })?;
-    let mut guard = FinalizerGuard::new(&state, invocation_row_id);
-    let invocation_env = serde_json::to_string(&invocation)
-        .map_err(|e| format!("Failed to serialize invocation id: {e}"))?;
-
-    if let Some(session_id) = resume {
-        state.update_session_capture(invocation_row_id, Some(session_id), "resumed")?;
-    }
-
-    if should_emit_invocation_line(stderr_is_terminal) {
-        eprintln!("{}", invocation.stderr_line());
-    }
-
-    let resume_payload = resume_session_id.as_deref().map(|session_id| {
-        let strategy = provider
-            .resume
-            .as_ref()
-            .expect("resumable provider must have a resume strategy");
-        executor::cli::ResumePayload {
-            session_id,
-            strategy,
-            target_jsonl_path: None,
-        }
-    });
-
-    match executor::cli::execute_interactive(
-        &provider,
-        working_dir,
-        Some(&invocation_env),
-        resume_payload,
-    ) {
-        Ok(exit_code) => {
-            if resume.is_none() {
-                state.update_session_capture(invocation_row_id, None, "none")?;
-            }
-            state.finalize_invocation(invocation_row_id, exit_code == 0, exit_code, None, None)?;
-            guard.mark_finalized();
-            if exit_code == 0 {
-                let emitted = ingest_and_emit_session_id(
-                    &state,
-                    &sessions_cfg,
-                    &provider.name,
-                    invocation_row_id,
-                    &invocation.id,
-                    if resume.is_some() {
-                        "resumed"
-                    } else {
-                        "turn_script"
-                    },
-                );
-                if !emitted && let Some(session_id) = resume {
-                    emit_known_session_id(
-                        &state,
-                        invocation_row_id,
-                        &invocation.id,
-                        session_id,
-                        "resumed",
-                    );
-                }
-            }
-            Ok(exit_code)
-        }
-        Err(spawn_err) => {
-            if resume.is_none() {
-                state.update_session_capture(invocation_row_id, None, "none")?;
-            }
-            state.finalize_invocation(
-                invocation_row_id,
-                false,
-                1,
-                Some("spawn_error"),
-                Some(&spawn_err),
-            )?;
-            guard.mark_finalized();
-            Ok(1)
-        }
-    }
+    run_repl_with_services(
+        ReplOptions {
+            model: model_name.map(str::to_string),
+            resume: resume.map(str::to_string),
+            migrate: manual_migrate.map(str::to_string),
+            working_dir: working_dir.map(Path::to_path_buf),
+            models_dir_override: models_dir_override.map(Path::to_path_buf),
+        },
+        services,
+    )
 }
 
 fn run_resume(
