@@ -14,6 +14,7 @@ use agent_runner_lib::session_export::{
 use b2_process_runner::{FakeProcessRunner, ok_output};
 use fixtures::initiative_06::{CLAUDE_PROVIDER, component_claude_success_fixture};
 use std::collections::HashMap;
+use std::fs;
 
 struct StaticModelRepo(HashMap<String, ModelConfig>);
 struct StaticProviderSource(ProvidersConfig);
@@ -54,6 +55,15 @@ impl SessionsConfigSource for StaticSessionsSource {
 #[test]
 fn canonical_export_uses_metadata_resolved_through_di_service() {
     let prepared = component_claude_success_fixture(CLAUDE_PROVIDER, true);
+    fs::write(
+        &prepared.jsonl_path,
+        format!(
+            "{{\"sessionId\":\"{}\",\"type\":\"user\",\"uuid\":\"550e8400-e29b-41d4-a716-446655440000\",\"timestamp\":\"2026-04-17T08:00:00Z\",\"message\":\"hello from user\"}}\n\
+             {{\"sessionId\":\"{}\",\"type\":\"assistant\",\"uuid\":\"6f1b7d4c-7f1d-4c0d-9c5f-3910c57e2a11\",\"timestamp\":\"2026-04-17T08:00:01Z\",\"message\":\"hello from assistant\"}}\n",
+            prepared.session_id, prepared.session_id
+        ),
+    )
+    .unwrap();
     let db = prepared.fixture.open_db();
     let runner = FakeProcessRunner::with_responses(vec![ok_output(
         format!("{}\n", prepared.jsonl_path.display()),

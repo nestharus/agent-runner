@@ -12,7 +12,7 @@ use agent_runner_lib::config::{
 use agent_runner_lib::session_lock::{FilesystemSessionLockProvider, SessionLockProvider};
 use agent_runner_lib::session_replace::{ImportReplaceDeps, run_import_replace_with_deps};
 use agent_runner_lib::state::DefaultStateDbOpener;
-use b2_process_runner::FakeProcessRunner;
+use b2_process_runner::{FakeProcessRunner, ok_output};
 use b3_app_state::B3RuntimePaths;
 use fixtures::initiative_06_import_replace::{canonical_jsonl, prepared_claude_replace_fixture};
 use std::{fs, time::Duration};
@@ -72,7 +72,11 @@ fn run_import_replace_with_deps_uses_injected_dependency_bundle() {
     let models = FilesystemModelConfigRepository::new(paths.models_dir.clone());
     let providers = FilesystemProviderConfigSource::new(paths.providers_path.clone());
     let sessions = FilesystemSessionsConfigSource::new(paths.sessions_path.clone());
-    let runner = FakeProcessRunner::new();
+    let runner = FakeProcessRunner::with_responses(vec![ok_output(
+        format!("{}\n", prepared.jsonl_path.display()),
+        "",
+        0,
+    )]);
     let locks = FilesystemSessionLockProvider;
     let input = prepared.fixture.stage_jsonl(
         "replacement.jsonl",

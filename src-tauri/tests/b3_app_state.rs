@@ -3,6 +3,7 @@
 #[path = "fixtures/b3_app_state.rs"]
 mod b3_app_state;
 
+use agent_runner_lib::process::StdinSpec;
 use agent_runner_lib::state::{CliProviderRepository, DiscoveryRepository, QuotaRepository};
 use b3_app_state::{B3ServiceBundle, invoke_json, ok_output};
 use serde_json::json;
@@ -53,8 +54,13 @@ fn test_model_command_uses_model_repo_and_process_runner() {
     bundle.write_model(
         "fixture-model",
         r#"[[providers]]
-name = "claude"
+name = "fixture-cli"
+"#,
+    );
+    bundle.write_providers(
+        r#"[fixture-cli]
 command = "fixture-cli"
+prompt_mode = "stdin"
 "#,
     );
     bundle.runner.push_response(ok_output("model ok\n", "", 0));
@@ -70,11 +76,11 @@ command = "fixture-cli"
     assert!(response.to_string().contains("model ok"), "{response}");
     let call = bundle.runner.single_call();
     assert_eq!(call.program, "fixture-cli");
-    assert!(
-        call.args.iter().any(|arg| arg.contains("test")),
-        "expected representative test prompt in args: {:?}",
-        call.args
-    );
+    let StdinSpec::Bytes(stdin) = call.stdin else {
+        panic!("expected representative test prompt on stdin: {call:?}");
+    };
+    let stdin = String::from_utf8(stdin).unwrap();
+    assert!(stdin.contains("test"), "expected test prompt: {stdin}");
 }
 
 /// Risk: T16 - `sync_provider` can keep calling the old no-runner detection
@@ -99,7 +105,7 @@ fn sync_provider_command_uses_injected_detection_runner_and_state_repo() {
 
     let response = invoke_json(&webview, "sync_provider", json!({"cliName": "claude"})).unwrap();
 
-    assert!(response.to_string().contains("Claude"), "{response}");
+    assert!(response.to_string().contains("Anthropic"), "{response}");
     let db = bundle.open_state_db();
     assert!(db.get_cli_provider("claude").unwrap().is_some());
     assert!(
@@ -133,7 +139,7 @@ fn discover_models_command_uses_runner_and_preserves_empty_discovery_success() {
     let response = invoke_json(
         &webview,
         "discover_models_cmd",
-        json!({"provider": "claude"}),
+        json!({"cliName": "claude"}),
     )
     .unwrap();
 
