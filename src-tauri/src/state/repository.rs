@@ -4,6 +4,7 @@ use super::db::{
     QuotaWindowInput, ReadOnlyOpenError, ResumeError, StateDb,
 };
 use chrono::{DateTime, Utc};
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -135,6 +136,31 @@ pub trait SessionChainRepository {
         started_at: &DateTime<Utc>,
         finished_at: &DateTime<Utc>,
     ) -> Result<Option<String>, String>;
+}
+
+pub struct SessionTurnReplacement {
+    pub provider_name: String,
+    pub session_id: String,
+    pub chain_id: String,
+    pub active_segment_id: i64,
+    pub source_file: PathBuf,
+    pub turns: Vec<SessionTurnReplacementTurn>,
+}
+
+pub struct SessionTurnReplacementTurn {
+    pub turn_id: String,
+    pub timestamp: String,
+    pub role: String,
+}
+
+pub trait SessionTurnRepository {
+    fn ingest_session_turns_batch(
+        &self,
+        provider_name: &str,
+        turns: &[super::db::SessionTurnIngest],
+    ) -> Result<u64, String>;
+
+    fn replace_session_turns(&self, replacement: &SessionTurnReplacement) -> Result<(), String>;
 }
 
 pub trait CliProviderRepository {
@@ -379,6 +405,65 @@ impl SessionChainRepository for StateDb {
         finished_at: &DateTime<Utc>,
     ) -> Result<Option<String>, String> {
         StateDb::find_session_for_invocation_window(self, provider_name, started_at, finished_at)
+    }
+}
+
+impl SessionTurnRepository for StateDb {
+    fn ingest_session_turns_batch(
+        &self,
+        provider_name: &str,
+        turns: &[super::db::SessionTurnIngest],
+    ) -> Result<u64, String> {
+        StateDb::ingest_session_turns_batch(self, provider_name, turns)
+    }
+
+    fn replace_session_turns(&self, replacement: &SessionTurnReplacement) -> Result<(), String> {
+        let tx = self
+            .connection()
+            .unchecked_transaction()
+            .map_err(|e| format!("failed to begin db transaction: {e}"))?;
+        tx.execute(
+            "DELETE FROM session_turns WHERE provider_name = ?1 AND session_id = ?2",
+            params![replacement.provider_name, replacement.session_id],
+        )
+        .map_err(|e| format!("failed to delete old turns: {e}"))?;
+        let now = Utc::now().to_rfc3339();
+        for turn in &replacement.turns {
+            tx.execute(
+                "INSERT INTO session_turns
+                    (provider_name, session_id, turn_id, timestamp, role,
+                     parent_turn_id, is_sidechain, is_compaction_boundary, source_file, ingested_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, 0, 0, ?6, ?7)",
+                params![
+                    replacement.provider_name,
+                    replacement.session_id,
+                    turn.turn_id,
+                    turn.timestamp,
+                    turn.role,
+                    replacement.source_file.to_string_lossy(),
+                    now,
+                ],
+            )
+            .map_err(|e| format!("failed to insert replacement turn: {e}"))?;
+        }
+        let last = replacement
+            .turns
+            .last()
+            .ok_or_else(|| "cannot replace db with empty records".to_string())?;
+        tx.execute(
+            "UPDATE session_chain_segments
+             SET last_turn_id = ?2
+             WHERE id = ?1",
+            params![replacement.active_segment_id, last.turn_id],
+        )
+        .map_err(|e| format!("failed to refresh active segment: {e}"))?;
+        tx.execute(
+            "UPDATE session_chains SET last_used_at = ?2 WHERE chain_id = ?1",
+            params![replacement.chain_id, last.timestamp],
+        )
+        .map_err(|e| format!("failed to refresh chain: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("failed to commit db replacement: {e}"))
     }
 }
 

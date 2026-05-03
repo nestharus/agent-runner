@@ -18,7 +18,8 @@
 //! safe even if a script over-emits (e.g. doesn't honor its cursor).
 
 use crate::config::{SessionSourceEntry, SessionsConfig};
-use crate::state::{SessionTurnIngest, StateDb};
+use crate::process::{CommandSpec, OutputSpec, ProcessRunner, StdinSpec};
+use crate::state::{SessionChainRepository, SessionTurnIngest, SessionTurnRepository, StateDb};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -62,6 +63,31 @@ pub fn scan_provider(
     sessions_cfg: &SessionsConfig,
     db: &StateDb,
 ) -> ScanReport {
+    scan_provider_with_runner_and_chain(
+        provider_name,
+        sessions_cfg,
+        db,
+        Some(db),
+        &crate::process::OsProcessRunner,
+    )
+}
+
+pub fn scan_provider_with_runner(
+    provider_name: &str,
+    sessions_cfg: &SessionsConfig,
+    turn_repo: &dyn SessionTurnRepository,
+    runner: &dyn ProcessRunner,
+) -> ScanReport {
+    scan_provider_with_runner_and_chain(provider_name, sessions_cfg, turn_repo, None, runner)
+}
+
+pub fn scan_provider_with_runner_and_chain(
+    provider_name: &str,
+    sessions_cfg: &SessionsConfig,
+    turn_repo: &dyn SessionTurnRepository,
+    chain_repo: Option<&dyn SessionChainRepository>,
+    runner: &dyn ProcessRunner,
+) -> ScanReport {
     let mut report = ScanReport::default();
     let Some(entry) = sessions_cfg.get(provider_name) else {
         return report;
@@ -76,7 +102,13 @@ pub fn scan_provider(
         return report;
     }
 
-    let stdout = match run_turn_script(&entry.turn_script, &state_dir) {
+    let stdout = match run_session_script_with_runner(
+        runner,
+        &entry.turn_script,
+        &state_dir,
+        None,
+        "turn script",
+    ) {
         Ok(s) => s,
         Err(e) => {
             report.errors.push(e);
@@ -122,17 +154,19 @@ pub fn scan_provider(
             is_compaction_boundary: turn.is_compaction_boundary.unwrap_or(false),
         });
     }
-    match db.ingest_session_turns_batch(provider_name, &batch) {
+    match turn_repo.ingest_session_turns_batch(provider_name, &batch) {
         Ok(n) => {
             report.new_turns = n;
-            for turn in &batch {
-                if let Err(e) = db.mint_imported_chain_if_absent(
-                    provider_name,
-                    &turn.session_id,
-                    &turn.timestamp,
-                    "<unknown>",
-                ) {
-                    report.errors.push(e);
+            if let Some(chain_repo) = chain_repo {
+                for turn in &batch {
+                    if let Err(e) = chain_repo.mint_imported_chain_if_absent(
+                        provider_name,
+                        &turn.session_id,
+                        &turn.timestamp,
+                        "<unknown>",
+                    ) {
+                        report.errors.push(e);
+                    }
                 }
             }
         }
@@ -165,7 +199,13 @@ fn resolve_state_dir(provider_name: &str, entry: &SessionSourceEntry) -> PathBuf
 }
 
 fn run_turn_script(script: &str, state_dir: &std::path::Path) -> Result<String, String> {
-    run_session_script(script, state_dir, None, "turn script")
+    run_session_script_with_runner(
+        &crate::process::OsProcessRunner,
+        script,
+        state_dir,
+        None,
+        "turn script",
+    )
 }
 
 pub fn locate_transcript(
@@ -185,6 +225,37 @@ pub fn locate_transcript(
         .map_err(|e| format!("could not create state_dir {}: {e}", state_dir.display()))?;
 
     let stdout = run_session_script(locator, &state_dir, Some(session_id), "transcript locator")?;
+    transcript_locator_output(stdout)
+}
+
+pub fn locate_transcript_with_runner(
+    sessions_cfg: &SessionsConfig,
+    provider_name: &str,
+    session_id: &str,
+    runner: &dyn ProcessRunner,
+) -> Result<Option<PathBuf>, String> {
+    let Some(entry) = sessions_cfg.get(provider_name) else {
+        return Ok(None);
+    };
+    let Some(locator) = entry.transcript_locator.as_deref() else {
+        return Ok(None);
+    };
+
+    let state_dir = resolve_state_dir(provider_name, entry);
+    std::fs::create_dir_all(&state_dir)
+        .map_err(|e| format!("could not create state_dir {}: {e}", state_dir.display()))?;
+
+    let stdout = run_session_script_with_runner(
+        runner,
+        locator,
+        &state_dir,
+        Some(session_id),
+        "transcript locator",
+    )?;
+    transcript_locator_output(stdout)
+}
+
+fn transcript_locator_output(stdout: String) -> Result<Option<PathBuf>, String> {
     let lines = stdout
         .lines()
         .map(str::trim)
@@ -199,6 +270,59 @@ pub fn locate_transcript(
 }
 
 fn run_session_script(
+    script: &str,
+    state_dir: &std::path::Path,
+    session_id: Option<&str>,
+    script_kind: &str,
+) -> Result<String, String> {
+    run_session_script_with_runner(
+        &crate::process::OsProcessRunner,
+        script,
+        state_dir,
+        session_id,
+        script_kind,
+    )
+}
+
+fn run_session_script_with_runner(
+    runner: &dyn ProcessRunner,
+    script: &str,
+    state_dir: &std::path::Path,
+    session_id: Option<&str>,
+    script_kind: &str,
+) -> Result<String, String> {
+    let mut env = std::collections::HashMap::new();
+    env.insert(
+        "STATE_DIR".to_string(),
+        state_dir.to_string_lossy().to_string(),
+    );
+    if let Some(session_id) = session_id {
+        env.insert("SESSION_ID".to_string(), session_id.to_string());
+    }
+    let output = runner.run(CommandSpec {
+        program: "sh".to_string(),
+        args: vec!["-c".to_string(), script.to_string()],
+        cwd: None,
+        env,
+        stdin: StdinSpec::Null,
+        stdout: OutputSpec::Capture,
+        stderr: OutputSpec::Capture,
+        timeout: Some(std::time::Duration::from_secs(SCRIPT_TIMEOUT_SECS)),
+        description: script_kind.to_string(),
+    })?;
+    if output.exit_code != 0 {
+        return Err(format!(
+            "{} exited {}: {}",
+            capitalize_script_kind(script_kind),
+            output.exit_code,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[allow(dead_code)]
+fn run_session_script_os(
     script: &str,
     state_dir: &std::path::Path,
     session_id: Option<&str>,

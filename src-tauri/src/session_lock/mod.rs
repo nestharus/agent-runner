@@ -41,6 +41,59 @@ pub enum LockError {
     },
 }
 
+pub trait SessionLockProvider: Send + Sync {
+    fn acquire(
+        &self,
+        lock_dir: &Path,
+        session_id: &str,
+        provider_name: &str,
+        ttl: Duration,
+    ) -> Result<Lease, LockError>;
+
+    fn release(
+        &self,
+        lock_dir: &Path,
+        session_id: &str,
+        token: &str,
+    ) -> Result<ReleaseReceipt, LockError>;
+
+    fn any_active_for_session(&self, lock_dir: &Path, session_id: &str) -> Result<bool, LockError>;
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FilesystemSessionLockProvider;
+
+impl SessionLockProvider for FilesystemSessionLockProvider {
+    fn acquire(
+        &self,
+        lock_dir: &Path,
+        session_id: &str,
+        provider_name: &str,
+        ttl: Duration,
+    ) -> Result<Lease, LockError> {
+        let lock = SessionLock::new(lock_dir).map_err(|err| LockError::Operational {
+            message: format!("failed to initialize session lock: {err}"),
+        })?;
+        lock.acquire(session_id, provider_name, ttl)
+    }
+
+    fn release(
+        &self,
+        lock_dir: &Path,
+        session_id: &str,
+        token: &str,
+    ) -> Result<ReleaseReceipt, LockError> {
+        let lock = SessionLock::new(lock_dir).map_err(|err| LockError::Operational {
+            message: format!("failed to initialize session lock: {err}"),
+        })?;
+        lock.release(session_id, token)
+    }
+
+    fn any_active_for_session(&self, lock_dir: &Path, session_id: &str) -> Result<bool, LockError> {
+        any_active_for_session(lock_dir, session_id)
+    }
+}
+
 #[derive(Debug)]
 pub struct SessionLock {
     sentinel: File,

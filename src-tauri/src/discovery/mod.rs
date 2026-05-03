@@ -198,6 +198,7 @@ fn parse_model_names(cli_name: &str, output: &str) -> Vec<String> {
             || lower.starts_with("options")
             || lower.starts_with("commands")
             || lower.starts_with("flags")
+            || lower.starts_with("no models")
             || lower.contains("failed")
             || lower.contains("error")
             || lower.contains("--help")

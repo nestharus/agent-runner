@@ -14,6 +14,7 @@ pub use db::{CompositeInvocationId, InvocationRecord, InvocationStart, Invocatio
 pub use db::{QuotaRecord, QuotaWindow, QuotaWindowInput};
 pub use repository::{
     CliProviderRepository, DefaultStateDbOpener, DiscoveryRepository, InvocationRepository,
-    QuotaRepository, ResumeDbFacts, RoutingRepository, SessionChainRepository, StateDbOpener,
+    QuotaRepository, ResumeDbFacts, RoutingRepository, SessionChainRepository,
+    SessionTurnReplacement, SessionTurnReplacementTurn, SessionTurnRepository, StateDbOpener,
     TransitionReason,
 };
