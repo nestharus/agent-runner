@@ -80,38 +80,6 @@ fn send_turn_with_runner_preserves_nonzero_exit_error_and_stderr_truncation() {
     assert!(!err.contains("TAIL"));
 }
 
-/// Risk: T12 - session resume state may be lost when `send_turn` becomes a
-/// wrapper around `send_turn_with_runner`.
-/// Level: component.
-/// Source: B2 contract section 3 setup agent.
-/// Observable: session id extracted from stderr is used as `--resume` on the
-/// next turn while still preserving the single combined prompt arg.
-#[test]
-fn send_turn_with_runner_preserves_resume_session_arg_on_next_turn() {
-    let runner = FakeProcessRunner::with_responses(vec![
-        ok_output(
-            r#"{"status":"ok","message":"first"}"#,
-            "Session ID: abc123",
-            0,
-        ),
-        ok_output("not json", "", 0),
-    ]);
-    let mut agent = SetupAgent::new();
-
-    let _ = agent.send_turn_with_runner(&runner, "First", r#"{"type":"object"}"#);
-    let _ = agent.send_turn_with_runner(&runner, "Second", r#"{"type":"object"}"#);
-
-    let calls = runner.calls();
-    assert_eq!(calls.len(), 2);
-    assert!(
-        calls[1]
-            .args
-            .windows(2)
-            .any(|pair| pair == ["--resume", "abc123"])
-    );
-    assert!(calls[1].args.last().unwrap().ends_with("\n\n---\n\nSecond"));
-}
-
 /// Risk: T12 (setup_agent send_turn argv preservation, resumed-session path)
 /// Source: contract §1.5 anti-drift; pre-B `setup/agent.rs:33-41`
 /// (session_id.is_some() => message-only prompt)

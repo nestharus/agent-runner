@@ -9,7 +9,7 @@ use b3_app_state::{B3ServiceBundle, invoke_json, ok_output};
 use serde_json::json;
 
 fn quota_json() -> &'static str {
-    r#"[{"window_id":0,"used_percent":0.25,"resets_at":"2027-01-01T00:00:00Z"}]"#
+    r#"{"windows":[{"used_percent":0.25,"resets_at":"2027-01-01T00:00:00Z"}]}"#
 }
 
 /// Risk: T14 - `refresh_quotas` can keep constructing concrete paths/runners
@@ -113,12 +113,7 @@ prompt_mode = "stdin"
     bundle.runner.push_response(ok_output("model ok\n", "", 0));
     let (_app, webview) = bundle.mock_app();
 
-    let response = invoke_json(
-        &webview,
-        "test_model",
-        json!({"modelName": "fixture-model"}),
-    )
-    .unwrap();
+    let response = invoke_json(&webview, "test_model", json!({"name": "fixture-model"})).unwrap();
 
     assert!(response.to_string().contains("model ok"), "{response}");
     let call = bundle.runner.single_call();

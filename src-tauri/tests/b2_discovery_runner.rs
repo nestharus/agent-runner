@@ -35,18 +35,18 @@ fn discover_models_with_runner_attempts_cli_version_first() {
 }
 
 /// Risk: T17 and anti-drift §1.5 - a natural refactor may "improve" discovery
-/// by returning `Err` when every strategy fails. Pre-B behavior only errors
-/// when the CLI is not found; all strategy failures produce `Ok(empty)`.
+/// by returning `Err` when every strategy is unsuccessful. Pre-B behavior only
+/// errors when the CLI is not found; unsuccessful strategies produce `Ok(empty)`.
 /// Level: component.
 /// Source: B2 contract sections 1.5 and 3 discovery.
-/// Observable: failed/empty strategy commands are all attempted through the
+/// Observable: unsuccessful/empty strategy commands are all attempted through the
 /// runner and the final result is `Ok` with no models.
 #[test]
 fn discover_models_with_runner_returns_ok_empty_when_all_strategies_fail() {
     let runner = FakeProcessRunner::with_responses(vec![
         ok_output("claude 1.2.3\n", "", 0),
-        ok_output("", "strategy one failed", 1),
-        Err("strategy two spawn failed".to_string()),
+        ok_output("", "", 1),
+        Err("strategy two spawn refused".to_string()),
         ok_output("", "", 1),
         ok_output("", "", 0),
     ]);

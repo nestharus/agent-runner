@@ -28,6 +28,10 @@ fn quota_json() -> &'static str {
     r#"[{"window_id":0,"used_percent":0.25,"resets_at":"2027-01-01T00:00:00Z"}]"#
 }
 
+fn quota_windows_json() -> &'static str {
+    r#"{"windows":[{"used_percent":0.25,"resets_at":"2027-01-01T00:00:00Z"}]}"#
+}
+
 /// Risk: T4 - shell command composition may drift while moving quota scripts
 /// behind `ProcessRunner`; non-zero exits must remain caller-classified and
 /// must not persist quota windows.
@@ -69,7 +73,7 @@ fn refresh_provider_retries_script_after_auth_refresh_command() {
     let runner = FakeProcessRunner::with_responses(vec![
         ok_output("", "expired token", 1),
         ok_output("", "", 0),
-        ok_output(quota_json(), "", 0),
+        ok_output(quota_windows_json(), "", 0),
     ]);
     let providers = providers_with("quota-script --json", Some("auth-refresh"));
     let in_flight = InFlight::new();
