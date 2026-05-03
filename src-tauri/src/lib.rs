@@ -4,6 +4,7 @@ pub mod diagnostics;
 pub mod discovery;
 pub mod executor;
 pub mod migration;
+pub mod process;
 pub mod quota;
 pub mod schema_probe;
 pub mod session_export;
@@ -344,6 +345,7 @@ async fn refresh_quotas(
         .open(&db_path)
         .map_err(|e| format!("Failed to open state DB: {e}"))?;
     let in_flight = &state.quota_in_flight;
+    let runner = process::OsProcessRunner;
     let mut results = Vec::with_capacity(candidates.len());
 
     for provider_name in candidates {
@@ -357,7 +359,8 @@ async fn refresh_quotas(
             continue;
         }
 
-        let outcome = quota::refresh_provider(&provider_name, &providers_cfg, in_flight, &db);
+        let outcome =
+            quota::refresh_provider(&provider_name, &providers_cfg, in_flight, &db, &runner);
         results.push(match outcome {
             quota::RefreshOutcome::Updated { windows } => QuotaRefreshEntry {
                 provider_name,

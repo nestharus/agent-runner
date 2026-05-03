@@ -1,5 +1,6 @@
 use crate::config::ModelConfig;
 use crate::executor;
+use crate::process::{OsProcessRunner, ProcessRunner};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -43,6 +44,24 @@ pub fn diagnose_error(
     stderr: &str,
     exit_code: i32,
     diagnostics_model: &ModelConfig,
+    models: &HashMap<String, ModelConfig>,
+    working_dir: Option<&Path>,
+) -> Result<Diagnosis, String> {
+    diagnose_error_with_runner(
+        &OsProcessRunner,
+        stderr,
+        exit_code,
+        diagnostics_model,
+        models,
+        working_dir,
+    )
+}
+
+pub fn diagnose_error_with_runner(
+    runner: &dyn ProcessRunner,
+    stderr: &str,
+    exit_code: i32,
+    diagnostics_model: &ModelConfig,
     _models: &HashMap<String, ModelConfig>,
     working_dir: Option<&Path>,
 ) -> Result<Diagnosis, String> {
@@ -69,7 +88,15 @@ pub fn diagnose_error(
          The API returned HTTP 429 indicating too many requests."
     );
 
-    let result = executor::execute(diagnostics_model, 0, &prompt, working_dir)?;
+    let result = executor::cli::execute_with_runner(
+        runner,
+        diagnostics_model,
+        0,
+        &prompt,
+        working_dir,
+        &HashMap::new(),
+        None,
+    )?;
 
     if result.exit_code != 0 {
         // Diagnostics model itself failed — use heuristic fallback
