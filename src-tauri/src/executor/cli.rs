@@ -276,13 +276,11 @@ struct RawResult {
 pub struct ResumePayload<'a> {
     pub session_id: &'a str,
     pub strategy: &'a ResumeStrategy,
-    pub target_jsonl_path: Option<&'a Path>,
 }
 
 pub fn compose_resume_args(
     strategy: &ResumeStrategy,
     session_id: &str,
-    _target_jsonl_path: Option<&Path>,
 ) -> Result<Vec<String>, String> {
     let mut args = Vec::new();
     append_resume_args(&mut args, strategy, session_id)?;
@@ -1061,6 +1059,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    // risk: Executor resume payload/argv without target JSONL path; level: unit; source: proposal §5 / A4.
     #[test]
     fn execute_interactive_appends_flag_resume_args_to_child_argv() {
         let argv_dump = tempfile::NamedTempFile::new().unwrap();
@@ -1093,7 +1092,6 @@ mod tests {
             Some(ResumePayload {
                 session_id,
                 strategy: &strategy,
-                target_jsonl_path: None,
             }),
         )
         .unwrap();
@@ -1106,6 +1104,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    // risk: Executor resume payload/argv without target JSONL path; level: unit; source: proposal §5 / A4.
     #[test]
     fn execute_resume_appends_flag_resume_args_and_prompt_to_one_shot_args() {
         let argv_dump = tempfile::NamedTempFile::new().unwrap();
@@ -1140,7 +1139,6 @@ mod tests {
             ResumePayload {
                 session_id: "5169694d-de0f-40d1-890c-6e28e55bab27",
                 strategy: &strategy,
-                target_jsonl_path: None,
             },
         )
         .unwrap();
@@ -1153,6 +1151,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    // risk: Executor resume payload/argv without target JSONL path; level: unit; source: proposal §5 / A4.
     #[test]
     fn execute_resume_appends_subcommand_resume_args_and_prompt_to_one_shot_args() {
         let argv_dump = tempfile::NamedTempFile::new().unwrap();
@@ -1187,7 +1186,6 @@ mod tests {
             ResumePayload {
                 session_id: "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22",
                 strategy: &strategy,
-                target_jsonl_path: None,
             },
         )
         .unwrap();
@@ -1200,6 +1198,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    // risk: Executor resume payload/argv without target JSONL path; level: unit; source: proposal §5 / A4.
     #[test]
     fn execute_interactive_appends_subcommand_resume_args_to_child_argv() {
         let argv_dump = tempfile::NamedTempFile::new().unwrap();
@@ -1236,7 +1235,6 @@ mod tests {
             Some(ResumePayload {
                 session_id,
                 strategy: &strategy,
-                target_jsonl_path: None,
             }),
         )
         .unwrap();
@@ -1763,63 +1761,5 @@ printf 'assistant text from tmpfile\n' > "$output_file""#,
             }
             other => panic!("expected Failed(_), got {other:?}"),
         }
-    }
-
-    fn resume_strategy_flag_fixture() -> ResumeStrategy {
-        ResumeStrategy {
-            kind: ResumeKind::Flag,
-            flag: Some("--resume".to_string()),
-            subcommand: None,
-        }
-    }
-
-    fn resume_strategy_subcommand_fixture() -> ResumeStrategy {
-        ResumeStrategy {
-            kind: ResumeKind::Subcommand,
-            flag: None,
-            subcommand: Some(vec!["resume".to_string()]),
-        }
-    }
-
-    // risk: Resume strategy compatibility; level: unit; source: proposal §11.1 Resume strategy compatibility / A1, A7.
-    #[test]
-    fn compose_resume_args_ignores_target_jsonl_for_flag_strategy() {
-        let target_jsonl = std::path::Path::new("/tmp/target-session.jsonl");
-
-        let args = compose_resume_args(
-            &resume_strategy_flag_fixture(),
-            "5169694d-de0f-40d1-890c-6e28e55bab27",
-            Some(target_jsonl),
-        )
-        .unwrap();
-
-        assert_eq!(
-            args,
-            vec![
-                "--resume".to_string(),
-                "5169694d-de0f-40d1-890c-6e28e55bab27".to_string()
-            ]
-        );
-    }
-
-    // risk: Resume strategy compatibility; level: unit; source: proposal §11.1 Resume strategy compatibility / A1, A7.
-    #[test]
-    fn compose_resume_args_ignores_target_jsonl_for_subcommand_strategy() {
-        let target_jsonl = std::path::Path::new("/tmp/target-session.jsonl");
-
-        let args = compose_resume_args(
-            &resume_strategy_subcommand_fixture(),
-            "5169694d-de0f-40d1-890c-6e28e55bab27",
-            Some(target_jsonl),
-        )
-        .unwrap();
-
-        assert_eq!(
-            args,
-            vec![
-                "resume".to_string(),
-                "5169694d-de0f-40d1-890c-6e28e55bab27".to_string()
-            ]
-        );
     }
 }

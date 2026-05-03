@@ -1044,6 +1044,18 @@ fn should_emit_invocation_line(is_terminal: bool) -> bool {
     !is_terminal
 }
 
+fn effective_spawn_cwd(working_dir: Option<&Path>) -> Result<PathBuf, String> {
+    match working_dir {
+        Some(dir) if dir.is_absolute() => Ok(dir.to_path_buf()),
+        Some(dir) => std::env::current_dir()
+            .map(|current_dir| current_dir.join(dir))
+            .map_err(|e| format!("Failed to resolve current directory: {e}")),
+        None => {
+            std::env::current_dir().map_err(|e| format!("Failed to resolve current directory: {e}"))
+        }
+    }
+}
+
 fn ingest_and_emit_session_id(
     state: &StateDb,
     sessions_cfg: &agent_runner_lib::config::SessionsConfig,
@@ -1602,12 +1614,14 @@ fn run_repl(
             reason,
         }) = balancer::decide_migration(&state, &migration_model, resolved, manual_migrate)
         {
+            let effective_spawn_cwd = effective_spawn_cwd(working_dir)?;
             let mut stderr = std::io::stderr();
             match agent_runner_lib::migration::migrate_chain_segment(
                 &state,
                 &sessions_cfg,
                 &migration_model,
                 resolved,
+                &effective_spawn_cwd,
                 target_provider_index,
                 reason,
                 &mut stderr,
@@ -1698,7 +1712,6 @@ fn run_repl(
         executor::cli::ResumePayload {
             session_id,
             strategy,
-            target_jsonl_path: None,
         }
     });
 
@@ -1826,12 +1839,14 @@ fn run_resume(
         reason,
     }) = balancer::decide_migration(&state, &migration_model, &resolved, manual_migrate)
     {
+        let effective_spawn_cwd = effective_spawn_cwd(working_dir)?;
         let mut stderr = std::io::stderr();
         match agent_runner_lib::migration::migrate_chain_segment(
             &state,
             &sessions_cfg,
             &migration_model,
             &resolved,
+            &effective_spawn_cwd,
             target_provider_index,
             reason,
             &mut stderr,
@@ -1897,7 +1912,6 @@ fn run_resume(
         executor::cli::ResumePayload {
             session_id: &resolved.active_session_id,
             strategy,
-            target_jsonl_path: None,
         },
     ) {
         Ok(result) => result,
