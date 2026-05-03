@@ -80,7 +80,7 @@ prompt_mode = "stdin"
         panic!("expected representative test prompt on stdin: {call:?}");
     };
     let stdin = String::from_utf8(stdin).unwrap();
-    assert!(stdin.contains("test"), "expected test prompt: {stdin}");
+    assert!(stdin.contains("Say hello"), "expected test prompt: {stdin}");
 }
 
 /// Risk: T16 - `sync_provider` can keep calling the old no-runner detection
@@ -143,7 +143,7 @@ fn discover_models_command_uses_runner_and_preserves_empty_discovery_success() {
     )
     .unwrap();
 
-    assert!(response.to_string().contains("claude"), "{response}");
+    assert_eq!(response, json!([]));
     assert!(
         bundle
             .open_state_db()
