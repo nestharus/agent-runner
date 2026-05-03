@@ -145,6 +145,8 @@ pub struct QuotaRecord {
     pub calls_since_refresh: u64,
     pub refreshed_at: Option<DateTime<Utc>>,
     pub exhausted_at: Option<DateTime<Utc>>,
+    pub topology_peak_live_window_count: usize,
+    pub last_topology_probe_at: Option<DateTime<Utc>>,
 }
 
 /// One rolling-quota window reported by a provider's quota script.
@@ -524,7 +526,9 @@ impl StateDb {
                 calls_since_refresh INTEGER NOT NULL DEFAULT 0,
                 refreshed_at TEXT,
                 last_empty_refresh_at TEXT,
-                exhausted_at TEXT NULL
+                exhausted_at TEXT NULL,
+                topology_peak_live_window_count INTEGER NOT NULL DEFAULT 0,
+                last_topology_probe_at TEXT
             );
 
             CREATE TABLE IF NOT EXISTS provider_quota_windows (
@@ -664,6 +668,7 @@ impl StateDb {
         )
         .map_err(|e| format!("Failed to initialize schema: {e}"))?;
         Self::ensure_provider_quotas_schema(&conn)?;
+        Self::ensure_provider_quotas_topology_schema(&conn)?;
         Self::ensure_provider_quota_windows_schema(&conn)?;
         Self::ensure_session_turns_schema(&conn)?;
         let db = StateDb { conn };
@@ -1088,6 +1093,47 @@ impl StateDb {
             )
             .map_err(|e| format!("Failed to drop provider_quotas.last_delta_calls: {e}"))?;
         }
+        Ok(())
+    }
+
+    fn ensure_provider_quotas_topology_schema(conn: &Connection) -> Result<(), String> {
+        let columns = Self::provider_quotas_columns(conn)?;
+        let added_peak = !columns
+            .iter()
+            .any(|column| column == "topology_peak_live_window_count");
+        if added_peak {
+            conn.execute(
+                "ALTER TABLE provider_quotas
+                 ADD COLUMN topology_peak_live_window_count INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| {
+                format!("Failed to add provider_quotas.topology_peak_live_window_count: {e}")
+            })?;
+        }
+        if !columns
+            .iter()
+            .any(|column| column == "last_topology_probe_at")
+        {
+            conn.execute(
+                "ALTER TABLE provider_quotas ADD COLUMN last_topology_probe_at TEXT",
+                [],
+            )
+            .map_err(|e| format!("Failed to add provider_quotas.last_topology_probe_at: {e}"))?;
+        }
+        conn.execute(
+            "UPDATE provider_quotas
+             SET topology_peak_live_window_count = MAX(
+                topology_peak_live_window_count,
+                (
+                    SELECT COUNT(*)
+                    FROM provider_quota_windows
+                    WHERE provider_quota_windows.provider_name = provider_quotas.provider_name
+                )
+             )",
+            [],
+        )
+        .map_err(|e| format!("Failed to backfill provider_quotas topology peak counts: {e}"))?;
         Ok(())
     }
 
@@ -1787,7 +1833,8 @@ impl StateDb {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT calls_since_refresh, refreshed_at, exhausted_at
+                "SELECT calls_since_refresh, refreshed_at, exhausted_at,
+                        topology_peak_live_window_count, last_topology_probe_at
                  FROM provider_quotas WHERE provider_name = ?1",
             )
             .map_err(|e| format!("Failed to prepare quota query: {e}"))?;
@@ -1802,6 +1849,19 @@ impl StateDb {
                     .map(|dt| dt.with_timezone(&Utc)),
                 exhausted_at: row
                     .get::<_, Option<String>>(2)?
+                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                    .map(|dt| dt.with_timezone(&Utc)),
+                topology_peak_live_window_count: usize::try_from(row.get::<_, i64>(3)?).map_err(
+                    |_| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Integer,
+                            "negative topology_peak_live_window_count".into(),
+                        )
+                    },
+                )?,
+                last_topology_probe_at: row
+                    .get::<_, Option<String>>(4)?
                     .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                     .map(|dt| dt.with_timezone(&Utc)),
             })
@@ -1963,18 +2023,31 @@ impl StateDb {
             Some(w) => (w.used_percent, Some(w.resets_at.to_rfc3339())),
             None => (0.0, None),
         };
+        let topology_peak_live_window_count = prior
+            .as_ref()
+            .map(|quota| quota.topology_peak_live_window_count)
+            .unwrap_or(0)
+            .max(windows.len()) as i64;
 
         tx.execute(
             "INSERT INTO provider_quotas
-                (provider_name, used_percent, resets_at, calls_since_refresh, refreshed_at)
-             VALUES (?1, ?2, ?3, 0, ?4)
+                (provider_name, used_percent, resets_at, calls_since_refresh, refreshed_at,
+                 topology_peak_live_window_count)
+             VALUES (?1, ?2, ?3, 0, ?4, ?5)
              ON CONFLICT (provider_name) DO UPDATE SET
                 used_percent = ?2,
                 resets_at = ?3,
                 calls_since_refresh = 0,
                 refreshed_at = ?4,
-                exhausted_at = NULL",
-            params![provider_name, legacy_used, legacy_resets, &now],
+                exhausted_at = NULL,
+                topology_peak_live_window_count = MAX(topology_peak_live_window_count, ?5)",
+            params![
+                provider_name,
+                legacy_used,
+                legacy_resets,
+                &now,
+                topology_peak_live_window_count
+            ],
         )
         .map_err(|e| format!("Failed to upsert quota: {e}"))?;
 
@@ -2036,6 +2109,20 @@ impl StateDb {
 
         tx.commit()
             .map_err(|e| format!("Failed to commit refresh: {e}"))?;
+        Ok(())
+    }
+
+    pub fn record_topology_probe(&self, provider_name: &str) -> Result<(), String> {
+        let now = Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO provider_quotas (provider_name, last_topology_probe_at)
+                 VALUES (?1, ?2)
+                 ON CONFLICT (provider_name) DO UPDATE SET
+                    last_topology_probe_at = excluded.last_topology_probe_at",
+                params![provider_name, &now],
+            )
+            .map_err(|e| format!("Failed to record topology probe: {e}"))?;
         Ok(())
     }
 
@@ -3364,6 +3451,25 @@ mod tests {
             .collect()
     }
 
+    fn quota_window_detail_rows(
+        db: &StateDb,
+        provider_name: &str,
+    ) -> Vec<(u32, f64, String, Option<f64>, Option<u64>)> {
+        db.get_windows(provider_name)
+            .unwrap()
+            .into_iter()
+            .map(|window| {
+                (
+                    window.window_id,
+                    window.used_percent,
+                    window.resets_at.to_rfc3339(),
+                    window.last_delta_percent,
+                    window.last_delta_calls,
+                )
+            })
+            .collect()
+    }
+
     fn insert_assistant_turns_after(
         db: &StateDb,
         provider_name: &str,
@@ -3401,6 +3507,18 @@ mod tests {
                     .unwrap()
                     .with_timezone(&Utc)
             })
+    }
+
+    fn last_topology_probe_at_raw(db: &StateDb, provider_name: &str) -> Option<String> {
+        db.conn
+            .query_row(
+                "SELECT last_topology_probe_at
+                 FROM provider_quotas
+                 WHERE provider_name = ?1",
+                params![provider_name],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap()
     }
 
     fn calls_since_refresh(db: &StateDb, provider_name: &str) -> u64 {
@@ -4772,6 +4890,258 @@ name = "fixture-provider"
         db.upsert_quota_refresh(provider, &[]).unwrap();
 
         assert_eq!(quota_window_rows(&db, provider), before);
+    }
+
+    /// Risk: Migration might omit columns or leave legacy rows with no usable peak count.
+    /// Level: particular-integration.
+    /// Source: proposal §Test-intent track row 10; Assumption A6.
+    #[test]
+    fn provider_quotas_topology_columns_created_and_backfilled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE provider_quotas (
+                provider_name TEXT PRIMARY KEY,
+                used_percent REAL NOT NULL DEFAULT 0,
+                resets_at TEXT,
+                calls_since_refresh INTEGER NOT NULL DEFAULT 0,
+                refreshed_at TEXT,
+                last_empty_refresh_at TEXT,
+                exhausted_at TEXT NULL
+            );
+            CREATE TABLE provider_quota_windows (
+                provider_name TEXT NOT NULL,
+                window_id INTEGER NOT NULL,
+                used_percent REAL NOT NULL DEFAULT 0,
+                resets_at TEXT NOT NULL,
+                last_delta_percent REAL,
+                last_delta_calls INTEGER,
+                PRIMARY KEY (provider_name, window_id)
+            );
+            INSERT INTO provider_quotas
+                (provider_name, used_percent, resets_at, calls_since_refresh, refreshed_at)
+            VALUES
+                ('p', 0.20, '2026-04-28T00:00:00Z', 3, '2026-04-21T00:00:00Z'),
+                ('empty', 0.00, NULL, 0, '2026-04-21T00:00:00Z');
+            INSERT INTO provider_quota_windows
+                (provider_name, window_id, used_percent, resets_at)
+            VALUES
+                ('p', 0, 0.20, '2026-04-22T00:00:00Z'),
+                ('p', 1, 0.30, '2026-04-28T00:00:00Z');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = StateDb::open(&path).unwrap();
+
+        let columns: Vec<String> = db
+            .conn
+            .prepare("PRAGMA table_info(provider_quotas)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            columns
+                .iter()
+                .any(|column| column == "topology_peak_live_window_count"),
+            "provider_quotas topology peak column missing after migration: {columns:?}"
+        );
+        assert!(
+            columns
+                .iter()
+                .any(|column| column == "last_topology_probe_at"),
+            "provider_quotas probe timestamp column missing after migration: {columns:?}"
+        );
+
+        let quota = db.get_quota("p").unwrap().unwrap();
+        assert_eq!(quota.topology_peak_live_window_count, 2);
+        assert!(quota.last_topology_probe_at.is_none());
+
+        let empty_quota = db.get_quota("empty").unwrap().unwrap();
+        assert_eq!(empty_quota.topology_peak_live_window_count, 0);
+        assert!(empty_quota.last_topology_probe_at.is_none());
+    }
+
+    /// Risk: Migration backfill could clobber an existing higher
+    /// `topology_peak_live_window_count` column when a partial legacy
+    /// row already includes the column without the probe-timestamp
+    /// column.
+    /// Level: particular-integration.
+    /// Source: contract §4 (Migration helper); CodeRabbit pass 1
+    /// finding R1-F06 (idempotent self-healing backfill).
+    #[test]
+    fn provider_quotas_topology_backfill_recovers_when_column_already_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE provider_quotas (
+                provider_name TEXT PRIMARY KEY,
+                used_percent REAL NOT NULL DEFAULT 0,
+                resets_at TEXT,
+                calls_since_refresh INTEGER NOT NULL DEFAULT 0,
+                refreshed_at TEXT,
+                last_empty_refresh_at TEXT,
+                exhausted_at TEXT NULL,
+                topology_peak_live_window_count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE provider_quota_windows (
+                provider_name TEXT NOT NULL,
+                window_id INTEGER NOT NULL,
+                used_percent REAL NOT NULL DEFAULT 0,
+                resets_at TEXT NOT NULL,
+                last_delta_percent REAL,
+                last_delta_calls INTEGER,
+                PRIMARY KEY (provider_name, window_id)
+            );
+            INSERT INTO provider_quotas
+                (provider_name, used_percent, resets_at, calls_since_refresh, refreshed_at, topology_peak_live_window_count)
+            VALUES
+                ('p', 0.20, '2026-04-28T00:00:00Z', 3, '2026-04-21T00:00:00Z', 0),
+                ('already-high', 0.20, '2026-04-28T00:00:00Z', 3, '2026-04-21T00:00:00Z', 4);
+            INSERT INTO provider_quota_windows
+                (provider_name, window_id, used_percent, resets_at)
+            VALUES
+                ('p', 0, 0.20, '2026-04-22T00:00:00Z'),
+                ('p', 1, 0.30, '2026-04-28T00:00:00Z'),
+                ('already-high', 0, 0.20, '2026-04-22T00:00:00Z');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = StateDb::open(&path).unwrap();
+
+        assert_eq!(
+            db.get_quota("p")
+                .unwrap()
+                .unwrap()
+                .topology_peak_live_window_count,
+            2
+        );
+        assert_eq!(
+            db.get_quota("already-high")
+                .unwrap()
+                .unwrap()
+                .topology_peak_live_window_count,
+            4,
+            "schema repair must not lower a previously learned topology peak"
+        );
+    }
+
+    /// Risk: Non-empty incomplete refresh could erase peak topology memory.
+    /// Level: unit.
+    /// Source: proposal §Test-intent track row 11; Assumptions A2, A6.
+    #[test]
+    fn upsert_quota_refresh_updates_topology_peak_without_lowering_on_shrink() {
+        let db = test_db();
+        let provider = "p";
+
+        db.upsert_quota_refresh(
+            provider,
+            &[
+                quota_input(0.10, "2026-04-22T00:00:00Z"),
+                quota_input(0.20, "2026-04-28T00:00:00Z"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_quota(provider)
+                .unwrap()
+                .unwrap()
+                .topology_peak_live_window_count,
+            2
+        );
+
+        db.upsert_quota_refresh(provider, &[quota_input(0.30, "2026-04-23T12:00:00Z")])
+            .unwrap();
+
+        assert_eq!(db.get_windows(provider).unwrap().len(), 1);
+        assert_eq!(
+            db.get_quota(provider)
+                .unwrap()
+                .unwrap()
+                .topology_peak_live_window_count,
+            2,
+            "topology peak should preserve the prior complete topology after a non-empty shrink"
+        );
+
+        db.upsert_quota_refresh(provider, &[]).unwrap();
+        assert_eq!(
+            db.get_quota(provider)
+                .unwrap()
+                .unwrap()
+                .topology_peak_live_window_count,
+            2,
+            "empty refreshes should not lower topology peak"
+        );
+    }
+
+    /// Risk: Malformed state files could wrap a negative learned topology
+    /// count into a huge `usize`.
+    /// Level: unit.
+    /// Source: CodeRabbit pass 1 finding R1-F03.
+    #[test]
+    fn get_quota_rejects_negative_topology_peak_count() {
+        let db = test_db();
+
+        db.conn
+            .execute(
+                "INSERT INTO provider_quotas
+                    (provider_name, topology_peak_live_window_count)
+                 VALUES (?1, ?2)",
+                params!["p", -1],
+            )
+            .unwrap();
+
+        let error = db.get_quota("p").unwrap_err();
+
+        assert!(
+            error.contains("negative topology_peak_live_window_count"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Risk: Cooldown marker could mutate quota windows or reset learning data.
+    /// Level: unit.
+    /// Source: proposal §Test-intent track row 12; Assumptions A2, A6.
+    #[test]
+    fn record_topology_probe_sets_timestamp_without_changing_windows() {
+        let db = test_db();
+        let provider = "p";
+        db.upsert_quota_refresh(
+            provider,
+            &[
+                quota_input(0.10, "2026-04-22T00:00:00Z"),
+                quota_input(0.20, "2026-04-28T00:00:00Z"),
+            ],
+        )
+        .unwrap();
+        db.set_window_delta_for_test(provider, 0, 0.01, 40).unwrap();
+        db.set_window_delta_for_test(provider, 1, 0.02, 40).unwrap();
+        let before_windows = quota_window_detail_rows(&db, provider);
+        let before = Utc::now();
+
+        db.record_topology_probe(provider).unwrap();
+
+        let after = Utc::now();
+        let probe_at_raw =
+            last_topology_probe_at_raw(&db, provider).expect("probe timestamp should be set");
+        let probe_at = DateTime::parse_from_rfc3339(&probe_at_raw)
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(
+            probe_at >= before - chrono::Duration::seconds(1)
+                && probe_at <= after + chrono::Duration::seconds(1),
+            "last_topology_probe_at {probe_at} should be near record_topology_probe call"
+        );
+        assert_eq!(
+            quota_window_detail_rows(&db, provider),
+            before_windows,
+            "record_topology_probe must not mutate window rows or learning deltas"
+        );
     }
 
     #[test]

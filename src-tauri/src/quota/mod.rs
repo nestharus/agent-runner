@@ -18,6 +18,7 @@ const MIN_TTL_SECS: i64 = 5 * 60;
 const MAX_TTL_SECS: i64 = 24 * 3600;
 /// Denominator for dynamic TTL: refresh N times per window lifetime.
 const REFRESH_WINDOW_DIVISOR: i64 = 5;
+pub const TOPOLOGY_PROBE_COOLDOWN_SECS: u64 = 60 * 60;
 
 /// Script timeout — scripts hitting the internet shouldn't hang the caller.
 const SCRIPT_TIMEOUT_SECS: u64 = 30;
@@ -198,6 +199,26 @@ pub fn is_stale(state: &StateDb, provider_name: &str) -> bool {
     let ttl_secs = dynamic_ttl_secs(&windows);
     let age_secs = (Utc::now() - refreshed_at).num_seconds();
     age_secs >= ttl_secs
+}
+
+pub fn is_topology_probe_due(
+    state: &StateDb,
+    provider_name: &str,
+    live_window_count: usize,
+    pool_expected_live_windows: usize,
+) -> bool {
+    if live_window_count == 0 || live_window_count >= pool_expected_live_windows {
+        return false;
+    }
+
+    let Ok(Some(q)) = state.get_quota(provider_name) else {
+        return true;
+    };
+    let Some(last_probe_at) = q.last_topology_probe_at else {
+        return true;
+    };
+
+    (Utc::now() - last_probe_at).num_seconds() >= TOPOLOGY_PROBE_COOLDOWN_SECS as i64
 }
 
 /// Compute the refresh TTL for a provider based on its reported windows.
@@ -510,6 +531,58 @@ mod tests {
     #[test]
     fn ttl_empty_windows_falls_back_to_max() {
         assert_eq!(dynamic_ttl_secs(&[]), MAX_TTL_SECS);
+    }
+
+    /// Risk: Topology stale helper may fail to repair legacy one-window rows.
+    /// Level: unit.
+    /// Source: proposal §Test-intent track row 8; Assumptions A2, A6.
+    #[test]
+    fn topology_probe_due_when_below_expected_and_no_probe_timestamp() {
+        let state = StateDb::open(std::path::Path::new(":memory:")).unwrap();
+        state
+            .upsert_quota_refresh(
+                "p",
+                &[QuotaWindowInput {
+                    used_percent: 0.10,
+                    resets_at: hours_from_now(24),
+                }],
+            )
+            .unwrap();
+
+        assert!(is_topology_probe_due(&state, "p", 1, 2));
+    }
+
+    /// Risk: Topology helper could over-refresh complete or recently-probed providers.
+    /// Level: unit.
+    /// Source: proposal §Test-intent track row 9; Assumptions A2, A6.
+    #[test]
+    fn topology_probe_not_due_when_counts_match_or_cooldown_active() {
+        let state = StateDb::open(std::path::Path::new(":memory:")).unwrap();
+        state
+            .upsert_quota_refresh(
+                "p",
+                &[QuotaWindowInput {
+                    used_percent: 0.10,
+                    resets_at: hours_from_now(24),
+                }],
+            )
+            .unwrap();
+
+        assert!(
+            !is_topology_probe_due(&state, "p", 1, 1),
+            "matching topology must not probe"
+        );
+        assert!(
+            !is_topology_probe_due(&state, "p", 0, 2),
+            "zero-window providers are handled by provider-local stale refresh"
+        );
+
+        state.record_topology_probe("p").unwrap();
+
+        assert!(
+            !is_topology_probe_due(&state, "p", 1, 2),
+            "recent topology probe timestamp must activate cooldown"
+        );
     }
 
     /// Build a ProvidersConfig with one provider, optionally configured

@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, IsTerminal, Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 const DEFAULT_PAUSE_HANDSHAKE_TTL_MS: u64 = 60_000;
@@ -2737,6 +2738,10 @@ where
 }
 
 fn main() -> ExitCode {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .try_init();
+
     if std::env::args().len() <= 1 {
         agent_runner_lib::run_tauri();
         return ExitCode::SUCCESS;
