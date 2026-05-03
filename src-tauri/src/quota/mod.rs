@@ -90,13 +90,6 @@ struct QuotaScriptWindow {
     resets_at: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum QuotaScriptEnvelope {
-    Object(QuotaScriptOutput),
-    Windows(Vec<QuotaScriptWindow>),
-}
-
 #[derive(Debug)]
 pub enum RefreshOutcome {
     Updated {
@@ -295,31 +288,28 @@ fn run_script(runner: &dyn ProcessRunner, script: &str) -> Result<Vec<QuotaWindo
 
 fn parse_output(stdout: &str) -> Result<Vec<QuotaWindowInput>, String> {
     let trimmed = stdout.trim();
-    let parsed: QuotaScriptEnvelope = serde_json::from_str(trimmed)
+    let parsed: QuotaScriptOutput = serde_json::from_str(trimmed)
         .map_err(|e| format!("Invalid JSON from quota script: {e} (got: {stdout})"))?;
 
-    let raw_windows: Vec<QuotaScriptWindow> = match parsed {
-        QuotaScriptEnvelope::Windows(ws) => ws,
-        QuotaScriptEnvelope::Object(parsed) => match parsed.windows {
-            Some(ws) => ws,
-            None => {
-                // Legacy single-window shape.
-                let Some(pct) = parsed.used_percent else {
-                    return Err(format!(
-                        "quota script emitted neither `windows` nor `used_percent` (got: {stdout})"
-                    ));
-                };
-                let Some(resets_at) = parsed.resets_at else {
-                    return Err(format!(
-                        "legacy quota script emitted `used_percent` without `resets_at` (got: {stdout})"
-                    ));
-                };
-                vec![QuotaScriptWindow {
-                    used_percent: pct,
-                    resets_at,
-                }]
-            }
-        },
+    let raw_windows: Vec<QuotaScriptWindow> = match parsed.windows {
+        Some(ws) => ws,
+        None => {
+            // Legacy single-window shape.
+            let Some(pct) = parsed.used_percent else {
+                return Err(format!(
+                    "quota script emitted neither `windows` nor `used_percent` (got: {stdout})"
+                ));
+            };
+            let Some(resets_at) = parsed.resets_at else {
+                return Err(format!(
+                    "legacy quota script emitted `used_percent` without `resets_at` (got: {stdout})"
+                ));
+            };
+            vec![QuotaScriptWindow {
+                used_percent: pct,
+                resets_at,
+            }]
+        }
     };
 
     let mut out = Vec::with_capacity(raw_windows.len());

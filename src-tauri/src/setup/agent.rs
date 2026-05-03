@@ -47,7 +47,11 @@ impl SetupAgent {
             args.push(sid.clone());
         }
 
-        let prompt = format!("{}\n\n---\n\n{}", self.system_prompt, message);
+        let prompt = if self.session_id.is_none() {
+            format!("{}\n\n---\n\n{}", self.system_prompt, message)
+        } else {
+            message.to_string()
+        };
         args.push(prompt);
 
         let output = runner

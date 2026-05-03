@@ -319,11 +319,8 @@ pub struct QuotaRefreshEntry {
 #[tauri::command]
 async fn refresh_quotas(
     state: tauri::State<'_, AppState>,
-    providers: Option<Vec<String>>,
 ) -> Result<Vec<QuotaRefreshEntry>, String> {
-    let candidates: Vec<String> = if let Some(providers) = providers {
-        providers
-    } else {
+    let candidates: Vec<String> = {
         let models = state.model_repo.load_models()?;
         let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
         for m in models.values() {
@@ -482,12 +479,8 @@ fn save_pool_model(repo: &dyn ModelConfigRepository, model: &ModelConfig) -> Res
 #[tauri::command]
 async fn test_model(
     state: tauri::State<'_, AppState>,
-    name: Option<String>,
-    model_name: Option<String>,
+    name: String,
 ) -> Result<TestModelResult, String> {
-    let name = name
-        .or(model_name)
-        .ok_or_else(|| "Model name is required".to_string())?;
     let model = {
         let models = state.model_repo.load_models()?;
         models
