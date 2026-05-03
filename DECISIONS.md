@@ -199,6 +199,88 @@ revisited.
 
 ---
 
+## D-009 — Problem-map human approval gate pre-skipped for the session-migration-cwd work
+
+- **Source**: Session migration cwd work unit (post-migration
+  `claude --resume` failure RCA / fix). The root pre-approved
+  skipping the implementation pipeline's per-work-unit
+  problem-map human checkpoint, in parity with D-008.
+- **Decision**: The pipeline did not surface a manual problem-map
+  approval prompt. `research/14-problem-map.md` was carried into
+  the design step on the strength of its own contents and the
+  root's pre-approval; the orchestrator recorded the gate-skip in
+  the run's audit-history.
+- **Rationale**: The migration target-path mismatch has a single
+  named root cause (RC-1) reproduced by an automated harness in
+  `src-tauri/tests/session_migration_rca/rc1_cwd_project_dir_mismatch.rs`.
+  The problem map enumerated only the migration target-path
+  computation, the executor's dead `target_jsonl_path` parameter,
+  and the dead inline test that masked the bug — none of which
+  surface a previously-unevaluated value, scope, or trade-off
+  question. A manual gate here would have been ceremonial.
+- **Revisit when**: A future migration work unit has a problem
+  map that surfaces a previously-unevaluated value, scope, or
+  trade-off question. In that case the pipeline must emit a
+  problem-map question to the root and block on the answer
+  rather than relying on this work unit's pre-approval.
+
+---
+
+## D-010 — Windows Claude project-directory hashing deferred from session-migration-cwd
+
+- **Source**: Same session-migration-cwd work unit, Phase 4
+  supported-surface gate and Phase 5 hookpoint research. The
+  in-repo evidence for Claude Code's Windows cwd-hashing rule
+  is absent: there is only a Unix-shaped decoder
+  (`src-tauri/src/session_metadata/mod.rs::decode_claude_project_dir_candidates`)
+  and three test-only encoders that replace forward slashes with
+  dashes. WU-13-01 restored Windows release builds but did not
+  define Claude path hashing.
+- **Decision**: The new helper
+  `src-tauri/src/migration/mod.rs::claude_project_dir_for`
+  accepts an absolute Unix-style cwd and rejects any other shape
+  (non-absolute, empty) via `MigrationError::SpawnCwdUnsupported`.
+  Windows-style paths fall through to the same rejection in this
+  work unit instead of guessing a hash.
+- **Rationale**: Guessing a Windows hash would risk a silent
+  wrong write that the resume child would still fail to find.
+  Failing fast at the migration boundary preserves the runner's
+  ability to surface the gap and gives a future work unit a clear
+  reproduction target. Recorded as a residual in
+  `risk/14-test-residuals.md`.
+- **Revisit when**: A future work unit produces an authoritative
+  Windows Claude Code path-hash contract or an in-repo Windows
+  encoder. Reproduction harness path:
+  `src-tauri/tests/session_migration_rca/rc2_windows_cwd_project_dir_hash.rs`.
+  The follow-up WU is named `WU-14-02-windows-claude-path-hash`.
+
+---
+
+## D-011 — Symlink/canonicalization behavior deferred from session-migration-cwd
+
+- **Source**: Session-migration-cwd Phase 5 hookpoint research
+  + Phase 4 assumption A3. The runner currently forwards
+  `working_dir` directly to `cmd.current_dir(...)` without
+  canonicalizing symlinks; Claude Code's own behavior with a
+  symlinked cwd is unknown from in-repo evidence.
+- **Decision**: The new effective-cwd derivation in
+  `src-tauri/src/main.rs` for both `run_repl` and `run_resume`
+  absolutizes relative paths but does not canonicalize symlinks.
+  The migration helper does not canonicalize either.
+- **Rationale**: Canonicalizing symlinks would change observable
+  behavior compared to the existing executor handoff pattern,
+  potentially producing a different cwd hash than Claude Code
+  uses at spawn time. The conservative choice is to keep cwd
+  string-equal between migration and executor and treat symlink
+  semantics as a separate change. Recorded as a residual in
+  `risk/14-test-residuals.md`.
+- **Revisit when**: A real-Claude harness shows symlinked
+  workspaces produce a different resume hash than the literal
+  cwd, or a customer reports that symlinked workspaces fail to
+  resume after migration.
+
+---
+
 ## Process
 
 When a CodeRabbit pass / risk gate / synthesis review raises a finding that
