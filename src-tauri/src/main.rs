@@ -1,22 +1,20 @@
 use agent_runner_lib::balancer;
 use agent_runner_lib::config::{
-    AgentConfig, FilesystemModelConfigRepository, FilesystemProviderConfigSource,
-    FilesystemSessionsConfigSource, ModelConfig, PromptMode, ProviderConfig, ProvidersConfig,
-    load_agent_file, load_agents, load_models,
+    AgentConfig, ModelConfig, PromptMode, ProviderConfig, ProvidersConfig, load_agent_file,
+    load_agents, load_models,
 };
 use agent_runner_lib::diagnostics;
 use agent_runner_lib::executor;
+use agent_runner_lib::runtime::{RuntimeServices, cli_services};
 use agent_runner_lib::schema_probe::{self, ProbeError};
 use agent_runner_lib::session_export::{
     ExportError, ExportSessionMetadata, read_canonical_transcript,
     resolve_export_session_metadata_with_deps,
 };
-use agent_runner_lib::session_lock::{LockError, SessionLock};
+use agent_runner_lib::session_lock::LockError;
 use agent_runner_lib::session_metadata::{MetadataError, locate_session_metadata};
 use agent_runner_lib::session_replace::{self, ReplaceError};
-use agent_runner_lib::state::{
-    CompositeInvocationId, DefaultStateDbOpener, InvocationStart, ReadOnlyOpenError, StateDb,
-};
+use agent_runner_lib::state::{CompositeInvocationId, InvocationStart, ReadOnlyOpenError, StateDb};
 use agent_runner_lib::trace::{TraceOptions, render_ascii_trace, trace_invocation_with_sessions};
 
 use clap::{Parser, Subcommand};
@@ -331,13 +329,6 @@ fn resolve_resume_answer(prompt: Option<&str>, file: Option<&Path>) -> Result<St
     Ok(input)
 }
 
-fn resolve_models_dir(cli: &Cli) -> PathBuf {
-    if let Some(ref dir) = cli.models_dir {
-        return dir.clone();
-    }
-    default_models_dir()
-}
-
 fn default_models_dir() -> PathBuf {
     dirs::config_dir()
         .map(|d| d.join("oulipoly-agent-runner").join("models"))
@@ -478,8 +469,8 @@ fn run(cli: Cli) -> Result<i32, String> {
         }
     }
 
-    let models_dir = resolve_models_dir(&cli);
-    let models = load_models(&models_dir)?;
+    let services = cli_services(cli.models_dir.as_deref());
+    let models = services.model_repo.load_models()?;
     let extra_inputs = parse_inputs(&cli.inputs)?;
 
     let working_dir = cli.project.clone();
@@ -499,6 +490,7 @@ fn run(cli: Cli) -> Result<i32, String> {
         };
 
         return run_with_balancing(
+            &services,
             model,
             &prompt,
             &models,
@@ -525,6 +517,7 @@ fn run(cli: Cli) -> Result<i32, String> {
     };
 
     run_with_balancing(
+        &services,
         model,
         &full_prompt,
         &models,
@@ -637,16 +630,16 @@ fn write_json_error(code: &str, message: &str) -> Result<(), String> {
 }
 
 fn run_trace_command(options: TraceOptions, invocation_uuid: &str) -> Result<i32, String> {
-    let state = StateDb::open_default()?;
-    let config_root = dirs::config_dir()
-        .map(|d| d.join("oulipoly-agent-runner"))
-        .unwrap_or_else(|| PathBuf::from("."));
-    let sessions_path = config_root.join("sessions.toml");
+    let services = cli_services(None);
+    let state = services.state_opener.open_default()?;
+    let sessions_path = services.paths.sessions_path();
     // Per V10 (failures observable, never silent): a malformed
     // sessions.toml must surface as an error, not silently degrade
     // every transcript_state to "no_locator". An ABSENT file is fine
     // — `SessionsConfig::load` returns an empty config in that case.
-    let sessions_cfg = agent_runner_lib::config::SessionsConfig::load(&sessions_path)
+    let sessions_cfg = services
+        .sessions_source
+        .load_sessions()
         .map_err(|e| format!("Failed to load {}: {e}", sessions_path.display()))?;
     let report =
         match trace_invocation_with_sessions(&state, invocation_uuid, options, Some(&sessions_cfg))
@@ -678,7 +671,8 @@ fn run_session_locate(session_id: &str, _json: bool) -> Result<i32, String> {
         return Ok(2);
     }
 
-    let state = match StateDb::open_default() {
+    let services = cli_services(None);
+    let state = match services.state_opener.open_default() {
         Ok(state) => state,
         Err(message) => {
             emit_metadata_error(&MetadataError::Operational { message });
@@ -686,20 +680,12 @@ fn run_session_locate(session_id: &str, _json: bool) -> Result<i32, String> {
         }
     };
 
-    let config_root = dirs::config_dir()
-        .map(|d| d.join("oulipoly-agent-runner"))
-        .unwrap_or_else(|| PathBuf::from("."));
-    let model_repo = FilesystemModelConfigRepository::new(default_models_dir());
-    let provider_source = FilesystemProviderConfigSource::new(config_root.join("providers.toml"));
-    let sessions_source = FilesystemSessionsConfigSource::new(config_root.join("sessions.toml"));
-    let runner = agent_runner_lib::process::OsProcessRunner;
-
     match locate_session_metadata(
         &state,
-        &model_repo,
-        &provider_source,
-        &sessions_source,
-        &runner,
+        services.model_repo.as_ref(),
+        services.provider_source.as_ref(),
+        services.sessions_source.as_ref(),
+        services.process_runner.as_ref(),
         session_id,
     ) {
         Ok(metadata) => match serde_json::to_string(&metadata) {
@@ -739,7 +725,8 @@ fn run_session_export(session_id: &str, format: &str) -> Result<i32, String> {
         return Ok(export_error_exit_code(&err));
     }
 
-    let metadata = match resolve_export_session_metadata(session_id) {
+    let services = cli_services(None);
+    let metadata = match resolve_export_session_metadata(&services, session_id) {
         Ok(metadata) => metadata,
         Err(err) => {
             emit_export_error(&err);
@@ -770,21 +757,20 @@ fn run_session_export(session_id: &str, format: &str) -> Result<i32, String> {
     Ok(0)
 }
 
-fn resolve_export_session_metadata(session_id: &str) -> Result<ExportSessionMetadata, ExportError> {
-    let state = StateDb::open_default().map_err(|message| ExportError::Operational { message })?;
-    let config_root = dirs::config_dir()
-        .map(|d| d.join("oulipoly-agent-runner"))
-        .unwrap_or_else(|| PathBuf::from("."));
-    let model_repo = FilesystemModelConfigRepository::new(default_models_dir());
-    let provider_source = FilesystemProviderConfigSource::new(config_root.join("providers.toml"));
-    let sessions_source = FilesystemSessionsConfigSource::new(config_root.join("sessions.toml"));
-    let runner = agent_runner_lib::process::OsProcessRunner;
+fn resolve_export_session_metadata(
+    services: &RuntimeServices,
+    session_id: &str,
+) -> Result<ExportSessionMetadata, ExportError> {
+    let state = services
+        .state_opener
+        .open_default()
+        .map_err(|message| ExportError::Operational { message })?;
     resolve_export_session_metadata_with_deps(
         &state,
-        &model_repo,
-        &provider_source,
-        &sessions_source,
-        &runner,
+        services.model_repo.as_ref(),
+        services.provider_source.as_ref(),
+        services.sessions_source.as_ref(),
+        services.process_runner.as_ref(),
         session_id,
     )
 }
@@ -1205,11 +1191,12 @@ fn run_pause_handshake(session_id: &str, ttl_ms: Option<u64>) -> Result<i32, Str
         ));
     }
 
-    let state = match StateDb::open_default() {
+    let services = cli_services(None);
+    let state = match services.state_opener.open_default() {
         Ok(state) => state,
         Err(message) => return Ok(emit_json_error(1, "operational-error", message)),
     };
-    let models = match load_models(&default_models_dir()) {
+    let models = match services.model_repo.load_models() {
         Ok(models) => models,
         Err(message) => return Ok(emit_json_error(1, "operational-error", message)),
     };
@@ -1217,25 +1204,20 @@ fn run_pause_handshake(session_id: &str, ttl_ms: Option<u64>) -> Result<i32, Str
         Ok(resolved) => resolved,
         Err(err) => return Ok(emit_resume_resolution_error(err)),
     };
-    let lock_dir = match default_lock_dir() {
+    let lock_dir = match services.paths.lock_dir() {
         Ok(lock_dir) => lock_dir,
         Err(message) => return Ok(emit_json_error(1, "operational-error", message)),
     };
-    let lock = match SessionLock::new(&lock_dir) {
-        Ok(lock) => lock,
-        Err(err) => {
-            return Ok(emit_json_error(
-                1,
-                "operational-error",
-                format!("failed to open locks: {err}"),
-            ));
-        }
-    };
-    match lock.acquire(
-        &resolved.active_session_id,
-        &resolved.active_provider,
-        std::time::Duration::from_millis(ttl_ms),
-    ) {
+    match services
+        .lock_provider
+        .acquire(
+            &lock_dir,
+            &resolved.active_session_id,
+            &resolved.active_provider,
+            std::time::Duration::from_millis(ttl_ms),
+        )
+        .map_err(normalize_lock_provider_error)
+    {
         Ok(lease) => {
             let payload = serde_json::json!({
                 "session_id": lease.session_id,
@@ -1265,24 +1247,19 @@ fn run_resume_handshake(session_id: &str, token: &str) -> Result<i32, String> {
         ));
     }
 
-    if let Err(message) = StateDb::open_default() {
+    let services = cli_services(None);
+    if let Err(message) = services.state_opener.open_default() {
         return Ok(emit_json_error(1, "operational-error", message));
     }
-    let lock_dir = match default_lock_dir() {
+    let lock_dir = match services.paths.lock_dir() {
         Ok(lock_dir) => lock_dir,
         Err(message) => return Ok(emit_json_error(1, "operational-error", message)),
     };
-    let lock = match SessionLock::new(&lock_dir) {
-        Ok(lock) => lock,
-        Err(err) => {
-            return Ok(emit_json_error(
-                1,
-                "operational-error",
-                format!("failed to open locks: {err}"),
-            ));
-        }
-    };
-    match lock.release(session_id, token) {
+    match services
+        .lock_provider
+        .release(&lock_dir, session_id, token)
+        .map_err(normalize_lock_provider_error)
+    {
         Ok(receipt) => {
             println!(
                 "{}",
@@ -1293,12 +1270,6 @@ fn run_resume_handshake(session_id: &str, token: &str) -> Result<i32, String> {
         }
         Err(err) => Ok(emit_lock_error(err)),
     }
-}
-
-fn default_lock_dir() -> Result<PathBuf, String> {
-    dirs::data_dir()
-        .map(|dir| dir.join("oulipoly-agent-runner").join("locks"))
-        .ok_or_else(|| "Could not determine data directory".to_string())
 }
 
 fn emit_resume_resolution_error(err: agent_runner_lib::state::ResumeError) -> i32 {
@@ -1373,6 +1344,18 @@ fn emit_lock_error(err: LockError) -> i32 {
     }
 }
 
+fn normalize_lock_provider_error(err: LockError) -> LockError {
+    match err {
+        LockError::Operational { message } => LockError::Operational {
+            message: message
+                .strip_prefix("failed to initialize session lock: ")
+                .map(|source| format!("failed to open locks: {source}"))
+                .unwrap_or(message),
+        },
+        other => other,
+    }
+}
+
 fn emit_json_error(code: i32, error_code: &str, message: impl Into<String>) -> i32 {
     let payload = serde_json::json!({
         "error": {
@@ -1433,20 +1416,14 @@ fn run_repl(
     working_dir: Option<&Path>,
     models_dir_override: Option<&Path>,
 ) -> Result<i32, String> {
-    let state = StateDb::open_default()?;
-    let models_dir = models_dir_override
-        .map(Path::to_path_buf)
-        .unwrap_or_else(default_models_dir);
-    let models = load_models(&models_dir)?;
-    let config_root = dirs::config_dir()
-        .map(|d| d.join("oulipoly-agent-runner"))
-        .unwrap_or_else(|| PathBuf::from("."));
-    let providers_path = config_root.join("providers.toml");
-    let sessions_path = config_root.join("sessions.toml");
-    let providers_cfg =
-        agent_runner_lib::config::ProvidersConfig::load(&providers_path).unwrap_or_default();
-    let sessions_cfg =
-        agent_runner_lib::config::SessionsConfig::load(&sessions_path).unwrap_or_default();
+    let services = cli_services(models_dir_override);
+    let state = services.state_opener.open_default()?;
+    let models = services.model_repo.load_models()?;
+    let providers_cfg = services
+        .provider_source
+        .load_providers()
+        .unwrap_or_default();
+    let sessions_cfg = services.sessions_source.load_sessions().unwrap_or_default();
     let mut resolved_resume = if let Some(session_id) = resume {
         Some(
             match state.resolve_resume(&models, session_id, model_name) {
@@ -1497,16 +1474,14 @@ fn run_repl(
             inputs: Vec::new(),
         });
 
-    let in_flight = agent_runner_lib::quota::InFlight::new();
-    let runner = agent_runner_lib::process::OsProcessRunner;
     let ctx = balancer::BalanceContext {
         providers_cfg: &providers_cfg,
         sessions_cfg: &sessions_cfg,
-        in_flight: &in_flight,
+        in_flight: &services.quota_in_flight,
         quota_repo: &state,
         turn_repo: &state,
         chain_repo: Some(&state),
-        runner: &runner,
+        runner: services.process_runner.as_ref(),
     };
 
     let parent_invocation_id = resolve_parent_invocation_id(&state);
@@ -1693,20 +1668,14 @@ fn run_resume(
     }
 
     let answer = resolve_resume_answer(prompt, file)?;
-    let state = StateDb::open_default()?;
-    let models_dir = models_dir_override
-        .map(Path::to_path_buf)
-        .unwrap_or_else(default_models_dir);
-    let models = load_models(&models_dir)?;
-    let config_root = dirs::config_dir()
-        .map(|d| d.join("oulipoly-agent-runner"))
-        .unwrap_or_else(|| PathBuf::from("."));
-    let providers_path = config_root.join("providers.toml");
-    let sessions_path = config_root.join("sessions.toml");
-    let providers_cfg =
-        agent_runner_lib::config::ProvidersConfig::load(&providers_path).unwrap_or_default();
-    let sessions_cfg =
-        agent_runner_lib::config::SessionsConfig::load(&sessions_path).unwrap_or_default();
+    let services = cli_services(models_dir_override);
+    let state = services.state_opener.open_default()?;
+    let models = services.model_repo.load_models()?;
+    let providers_cfg = services
+        .provider_source
+        .load_providers()
+        .unwrap_or_default();
+    let sessions_cfg = services.sessions_source.load_sessions().unwrap_or_default();
 
     let stderr_is_terminal = std::io::stderr().is_terminal();
     let mut resolved = match state.resolve_resume(&models, session_id, model_name) {
@@ -1809,7 +1778,8 @@ fn run_resume(
         .map_err(|e| format!("Failed to serialize invocation id: {e}"))?;
     eprintln!("{}", invocation.stderr_line());
 
-    let result = match executor::cli::execute_resume(
+    let result = match executor::cli::execute_resume_with_runner(
+        services.process_runner.as_ref(),
         &provider,
         provider_index,
         target.prompt_mode,
@@ -1888,38 +1858,33 @@ fn run_resume(
 }
 
 fn run_with_balancing(
+    services: &RuntimeServices,
     model: &ModelConfig,
     prompt: &str,
     all_models: &HashMap<String, ModelConfig>,
     working_dir: Option<&Path>,
     extra_inputs: &HashMap<String, Vec<String>>,
 ) -> Result<i32, String> {
-    let state = StateDb::open_default().unwrap_or_else(|e| {
+    let state = services.state_opener.open_default().unwrap_or_else(|e| {
         eprintln!("Warning: Could not open state DB ({e}), running without state tracking.");
         StateDb::open(std::path::Path::new(":memory:")).unwrap()
     });
 
     // Load providers.toml from the same config dir as models; quota refresh
     // only runs when actual load-balancing is possible (n > 1 providers).
-    let config_root = dirs::config_dir()
-        .map(|d| d.join("oulipoly-agent-runner"))
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let providers_path = config_root.join("providers.toml");
-    let sessions_path = config_root.join("sessions.toml");
-    let providers_cfg =
-        agent_runner_lib::config::ProvidersConfig::load(&providers_path).unwrap_or_default();
-    let sessions_cfg =
-        agent_runner_lib::config::SessionsConfig::load(&sessions_path).unwrap_or_default();
-    let in_flight = agent_runner_lib::quota::InFlight::new();
-    let runner = agent_runner_lib::process::OsProcessRunner;
+    let providers_cfg = services
+        .provider_source
+        .load_providers()
+        .unwrap_or_default();
+    let sessions_cfg = services.sessions_source.load_sessions().unwrap_or_default();
     let ctx = balancer::BalanceContext {
         providers_cfg: &providers_cfg,
         sessions_cfg: &sessions_cfg,
-        in_flight: &in_flight,
+        in_flight: &services.quota_in_flight,
         quota_repo: &state,
         turn_repo: &state,
         chain_repo: Some(&state),
-        runner: &runner,
+        runner: services.process_runner.as_ref(),
     };
     // Resolve parent invocation BEFORE provider selection so the provider
     // selection itself can be attributed to a parent context if needed
@@ -1944,7 +1909,8 @@ fn run_with_balancing(
         .map_err(|e| format!("Failed to serialize invocation id: {e}"))?;
     eprintln!("{}", invocation.stderr_line());
 
-    let result = match executor::execute_effective_with_inputs_and_env(
+    let result = match executor::cli::execute_effective_with_inputs_and_runner(
+        services.process_runner.as_ref(),
         executor::cli::EffectiveExecuteWithInputsRequest {
             model,
             provider: &provider,

@@ -18,13 +18,12 @@ pub mod state;
 pub mod trace;
 
 use config::{
-    AgentConfigRepository, FilesystemAgentConfigRepository, FilesystemModelConfigRepository,
-    FilesystemProviderConfigSource, FilesystemSessionsConfigSource, ModelConfig,
-    ModelConfigRepository, ProviderConfigSource, SessionsConfigSource,
+    AgentConfigRepository, ModelConfig, ModelConfigRepository, ProviderConfigSource,
+    SessionsConfigSource,
 };
-pub use runtime::{DefaultRuntimePaths, RuntimePaths};
+pub use runtime::{DefaultRuntimePaths, RuntimePaths, RuntimeServices, cli_services};
 use serde::{Deserialize, Serialize};
-use session_lock::{FilesystemSessionLockProvider, SessionLockProvider};
+use session_lock::SessionLockProvider;
 use setup::actions::{SetupEvent, UserResponse};
 #[allow(unused_imports)]
 use state::StateDb;
@@ -100,6 +99,23 @@ pub struct AppState {
     pub lock_provider: Arc<dyn SessionLockProvider>,
     pub quota_in_flight: quota::InFlight,
     pub setup_input_tx: Mutex<Option<mpsc::Sender<UserResponse>>>,
+}
+
+impl From<RuntimeServices> for AppState {
+    fn from(services: RuntimeServices) -> Self {
+        Self {
+            paths: services.paths,
+            state_opener: services.state_opener,
+            model_repo: services.model_repo,
+            provider_source: services.provider_source,
+            sessions_source: services.sessions_source,
+            agent_repo: services.agent_repo,
+            process_runner: services.process_runner,
+            lock_provider: services.lock_provider,
+            quota_in_flight: services.quota_in_flight,
+            setup_input_tx: Mutex::new(None),
+        }
+    }
 }
 
 #[tauri::command]
@@ -771,29 +787,13 @@ fn get_model_parameters(
 }
 
 pub fn run_tauri() {
-    let paths = Arc::new(DefaultRuntimePaths::new()) as Arc<dyn RuntimePaths>;
-    let model_repo = Arc::new(FilesystemModelConfigRepository::new(paths.models_dir()))
-        as Arc<dyn ModelConfigRepository + Send + Sync>;
-    let provider_source = Arc::new(FilesystemProviderConfigSource::new(paths.providers_path()))
-        as Arc<dyn ProviderConfigSource + Send + Sync>;
-    let sessions_source = Arc::new(FilesystemSessionsConfigSource::new(paths.sessions_path()))
-        as Arc<dyn SessionsConfigSource + Send + Sync>;
-    let agent_repo = Arc::new(FilesystemAgentConfigRepository::new(paths.agents_dir()))
-        as Arc<dyn AgentConfigRepository + Send + Sync>;
+    let models_dir = DefaultRuntimePaths::default_models_dir();
+    let paths =
+        Arc::new(DefaultRuntimePaths::with_models_dir(models_dir.clone())) as Arc<dyn RuntimePaths>;
+    let services = RuntimeServices::from_paths(paths);
 
     tauri::Builder::default()
-        .manage(AppState {
-            paths,
-            state_opener: Arc::new(DefaultStateDbOpener),
-            model_repo,
-            provider_source,
-            sessions_source,
-            agent_repo,
-            process_runner: Arc::new(process::OsProcessRunner),
-            lock_provider: Arc::new(FilesystemSessionLockProvider),
-            quota_in_flight: quota::InFlight::new(),
-            setup_input_tx: Mutex::new(None),
-        })
+        .manage(AppState::from(services))
         .invoke_handler(configure_tauri_app())
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -833,7 +833,11 @@ pub fn configure_tauri_app<R: tauri::Runtime>()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use config::{ModelConfig, PromptMode, ProviderConfig};
+    use config::{
+        FilesystemAgentConfigRepository, FilesystemProviderConfigSource,
+        FilesystemSessionsConfigSource, ModelConfig, PromptMode, ProviderConfig,
+    };
+    use session_lock::FilesystemSessionLockProvider;
     use tauri::Manager;
 
     struct TestRuntimePaths {
