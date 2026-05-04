@@ -948,7 +948,17 @@ fn repl_resume_migrates_to_least_loaded_provider() {
     );
     // risk: RC-1 cwd/source project dir mismatch end-to-end via run_repl;
     //       level: end-to-end; source: research/14-session-migration-rca.md (RC-1) + contract §5.
-    let expected_target_dir = fixture.dir.path().to_string_lossy().replace('/', "-");
+    let expected_target_dir: String = fixture
+        .dir
+        .path()
+        .to_string_lossy()
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' => '-',
+            c if (c.is_ascii() && c.is_alphanumeric()) || c == '-' => c,
+            _ => '-',
+        })
+        .collect();
     assert!(
         target_projects
             .join(&expected_target_dir)
