@@ -330,6 +330,44 @@ revisited.
 
 ---
 
+## D-015 — WU-16-01 reproduction-harness skip
+
+- **Source**: WU-16-01 ticket §"Source"; the cause is a
+  well-understood release-process gap — `.github/workflows/release.yml`
+  uploaded `artifacts/*` only, so binary-install users never received
+  the body-aware adapter scripts shipped in #40. The `.deb`
+  `data.tar.gz` audit confirmed no scripts in the package.
+- **Decision**: Phase 0 (RCA reproduction harness) was skipped for
+  WU-16-01.
+- **Rationale**: The ticket evidence (`.deb` content audit, the
+  WU-15-01 install-QA finding, and v0.1.26 binary expecting `body`)
+  was fully diagnostic. The structural release-yml-contract test
+  extension in `src-tauri/tests/release_yml_contract.rs` is the
+  canonical regression guard — it RED-runs against pre-fix HEAD
+  and GREEN-runs after the workflow change. A separate reproduction
+  harness would not have added signal beyond the structural test.
+- **Revisit when**: A future release-flow work unit produces a
+  symptom whose cause is not visible from the workflow file or
+  the contract test alone.
+
+## D-016 — WU-16-01 Phase 2.5 human-gate skip
+
+- **Source**: WU-16-01 process record and the standing pre-approval
+  policy from WU-11-01 / WU-13-01 / WU-14-01 / WU-15-01.
+- **Decision**: Phase 2.5 human gate was skipped under the standing
+  pre-approval policy.
+- **Rationale**: The problem map did not surface a new value,
+  scope, or trade-off question beyond the ticket's stated install-QA
+  fix. The touched surface (release.yml publish step, contract test,
+  README install snippet, optional scripts/README.md cross-reference)
+  matched the ticket Code Boundary exactly.
+- **Revisit when**: A future release-asset / install-process work
+  unit surfaces a new product policy question (e.g., versioned
+  scripts, runtime version-skew detection, or bundling scripts into
+  `.deb`/`.dmg`/`.msi`).
+
+---
+
 ## Process
 
 When a CodeRabbit pass / risk gate / synthesis review raises a finding that

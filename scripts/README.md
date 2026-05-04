@@ -4,6 +4,8 @@ These are reference adapter scripts for `oulipoly-agent-runner`. They aren't
 linked into the binary — they're standalone executables wired in via TOML
 config, the same way `anthropic-usage` is wired into `providers.toml`.
 
+For release-asset installation of the bundled reference adapters, see README §Reference quota adapters.
+
 ## Turn scripts (`sessions.toml`)
 
 A **turn script** lets the runner count how many assistant turns each

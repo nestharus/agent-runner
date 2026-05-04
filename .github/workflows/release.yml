@@ -178,4 +178,12 @@ jobs:
         with:
           tag_name: ${{ needs.version.outputs.tag }}
           generate_release_notes: true
-          files: artifacts/*
+          files: |
+            artifacts/*
+            scripts/claude-code-turns
+            scripts/codex-turns
+            scripts/anthropic-usage
+            scripts/chatgpt-usage
+            scripts/zai-usage
+            scripts/claude-code-locate-transcript
+            scripts/codex-locate-transcript

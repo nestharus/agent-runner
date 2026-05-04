@@ -349,6 +349,19 @@ install -m 755 \
   ~/.local/bin/
 ```
 
+The bundled reference adapters are also available as release assets. For binary installs, use `gh release download` from the same release tag as the `oulipoly-agent-runner` binary; script and binary versions must match for body ingestion to work, because stale scripts may silently omit `body` and leave new ingests with empty `session_turns.body`.
+
+```bash
+gh release download v0.1.X --repo nestharus/agent-runner \
+  --pattern "claude-code-turns" --pattern "codex-turns" \
+  --pattern "anthropic-usage" --pattern "chatgpt-usage" \
+  --pattern "zai-usage" \
+  --pattern "claude-code-locate-transcript" \
+  --pattern "codex-locate-transcript" \
+  --dir ~/.local/bin/
+chmod +x ~/.local/bin/{claude-code-turns,codex-turns,anthropic-usage,chatgpt-usage,zai-usage,claude-code-locate-transcript,codex-locate-transcript}
+```
+
 ## Session Ingestion
 
 Direct CLI usage burns the same weekly/5h quota as agent-runner invocations, but the balancer can't see those calls without help. Session ingestion solves this by reading each CLI's session logs and counting **assistant turns** — each one is one API call.
