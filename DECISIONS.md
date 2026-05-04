@@ -253,6 +253,7 @@ revisited.
   encoder. Reproduction harness path:
   `src-tauri/tests/session_migration_rca/rc2_windows_cwd_project_dir_hash.rs`.
   The follow-up WU is named `WU-14-02-windows-claude-path-hash`.
+- **Resolved by**: WU-14-02 / PR #N — 2026-05-04.
 
 ---
 
@@ -278,6 +279,7 @@ revisited.
   workspaces produce a different resume hash than the literal
   cwd, or a customer reports that symlinked workspaces fail to
   resume after migration.
+- **Resolved by**: WU-14-02 / PR #N — 2026-05-04.
 
 ---
 
@@ -365,6 +367,39 @@ revisited.
   unit surfaces a new product policy question (e.g., versioned
   scripts, runtime version-skew detection, or bundling scripts into
   `.deb`/`.dmg`/`.msi`).
+
+---
+
+## D-017 — WU-14-02 Phase 2.5 human-gate skip
+
+- **Source**: WU-14-02 process record and the orchestrator's
+  standing pre-approval policy for problem-map human-gate skips.
+- **Decision**: The Phase 2.5 problem-map human gate was skipped
+  under the standing pre-approval policy.
+- **Rationale**: The problem map did not surface a new value,
+  scope, or trade-off question beyond the approved Claude
+  project-dir encoder contract.
+- **Revisit when**: A future migration work unit surfaces a new
+  product policy question or expands beyond the approved migration
+  encoder surface.
+
+---
+
+## D-018 — WU-14-02 narrow two-locus Anti-scope amendment
+
+- **Source**:
+  `tmp/scratch/wu-14-02/questions/phase-3-r3-ticket-scope-contradiction.md`.
+- **Decision**: WU-14-02 may update exactly two
+  `src-tauri/tests/session_migration_rca/mod.rs` encoder mirrors:
+  the Rust helper at lines 129-130 and the fake-Claude Bash snippet
+  at lines 109-115.
+- **Rationale**: Those two mirrors must apply the same character
+  filter as the production Claude project-dir encoder so the
+  WU-14-01 RC-1 harness remains a valid cwd-mismatch contract test.
+  The WU-14-01 RC-1 test body and assertion contract are preserved.
+- **Revisit when**: A future work unit needs to change any other
+  `session_migration_rca` fixture behavior or broader slash-only
+  helpers outside these two loci.
 
 ---
 
