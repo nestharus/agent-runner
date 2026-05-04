@@ -253,7 +253,7 @@ revisited.
   encoder. Reproduction harness path:
   `src-tauri/tests/session_migration_rca/rc2_windows_cwd_project_dir_hash.rs`.
   The follow-up WU is named `WU-14-02-windows-claude-path-hash`.
-- **Resolved by**: WU-14-02 / PR #N — 2026-05-04.
+- **Resolved by**: WU-14-02 / PR #42 — 2026-05-04.
 
 ---
 
@@ -279,7 +279,7 @@ revisited.
   workspaces produce a different resume hash than the literal
   cwd, or a customer reports that symlinked workspaces fail to
   resume after migration.
-- **Resolved by**: WU-14-02 / PR #N — 2026-05-04.
+- **Resolved by**: WU-14-02 / PR #42 — 2026-05-04.
 
 ---
 
@@ -385,21 +385,56 @@ revisited.
 
 ---
 
-## D-018 — WU-14-02 narrow two-locus Anti-scope amendment
+## D-018 — WU-14-02 Anti-scope amendment: encoder-mirror updates in five test loci
 
-- **Source**:
-  `tmp/scratch/wu-14-02/questions/phase-3-r3-ticket-scope-contradiction.md`.
-- **Decision**: WU-14-02 may update exactly two
-  `src-tauri/tests/session_migration_rca/mod.rs` encoder mirrors:
-  the Rust helper at lines 129-130 and the fake-Claude Bash snippet
-  at lines 109-115.
-- **Rationale**: Those two mirrors must apply the same character
-  filter as the production Claude project-dir encoder so the
-  WU-14-01 RC-1 harness remains a valid cwd-mismatch contract test.
-  The WU-14-01 RC-1 test body and assertion contract are preserved.
+- **Source**: Two NEEDS_INPUT round-trips during WU-14-02 surfaced a
+  ticket-language contradiction (Anti-scope vs AC-4) and then a
+  follow-up misclassification of additional encoder mirrors:
+  - `tmp/scratch/wu-14-02/questions/phase-3-r3-ticket-scope-contradiction.{md,answer.md}`
+  - `tmp/scratch/wu-14-02/questions/phase-6c-third-encoder-mirror-conflict.{md,answer.md}`
+- **Decision**: All encoder mirrors that depend on the slash-only
+  rule are brought into agreement with the new full-rule production
+  encoder. Five loci are updated; nothing else in the named test
+  files is touched. The five loci are:
+  1. `src-tauri/tests/session_migration_rca/mod.rs:129-130` — the
+     `claude_project_dir_name` Rust helper (function body rewrite).
+  2. `src-tauri/tests/session_migration_rca/mod.rs:109-115` — the
+     fake-Claude Bash heredoc's `project="${PWD//\//-}"` lookup
+     snippet (rewrite to apply the full rule via `sed`).
+  3. `src-tauri/tests/initiative_05_migration.rs:636-638` — the
+     `claude_project_dir_name` Rust helper (function body rewrite;
+     same shape as locus 1, separate file).
+  4. `src-tauri/tests/initiative_05_migration.rs` call sites at
+     lines 680 and 846 — implicitly fixed by locus 3 (the helper
+     update; the call sites themselves are untouched).
+  5. `src-tauri/tests/pr_f_resume_integration.rs:951` — the inline
+     `replace('/', "-")` expression (rewrite as a small character
+     filter producing the same output as the production encoder).
+- **Rationale**: Encoder mirrors that diverge from the production
+  encoder produce false-negative test failures (the test fixture
+  computes a different expected path than the production code
+  writes). Each affected test still verifies the same observable
+  invariant — migration writes under the resume workspace's encoded
+  project directory, not the source workspace's. The test bodies,
+  assertions, and contract semantics are preserved; only the
+  encoder mirrors that previously aliased the old slash-only rule
+  are updated. The WU-14-01 RC-1 cwd-mismatch contract remains
+  intact.
 - **Revisit when**: A future work unit needs to change any other
-  `session_migration_rca` fixture behavior or broader slash-only
-  helpers outside these two loci.
+  fixture behavior in the named files, or a sixth encoder-mirror
+  site is discovered. The orchestrator-recommended discovery method
+  for the latter is `rg "replace\('/', \"-\"\)"` over
+  `src-tauri/tests/` and `src-tauri/src/` after a future production
+  encoder change.
+- **Process-improvement watch signal**: Phase 5 hookpoint research
+  for this WU misclassified two of the three additional mirror
+  sites (`tests/initiative_05_migration.rs` and
+  `tests/pr_f_resume_integration.rs`) as "adjacent watchpoints"
+  rather than "required conflicts" because static analysis cannot
+  infer the `tempfile::tempdir()` `.` interaction. Future WUs that
+  change encoder shape should explicitly enumerate slash-only
+  encoder usages across the entire test suite, not just the
+  worktree-immediately-touched files.
 
 ---
 
