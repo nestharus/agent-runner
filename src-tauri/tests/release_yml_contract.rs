@@ -251,14 +251,30 @@ fn release_yml_restores_windows_and_target_suffixed_bare_binaries() {
     );
 
     let gh_release = step_by_uses(release_steps, "softprops/action-gh-release@v2");
+    let files = string_at(
+        gh_release,
+        "jobs.release.steps[softprops/action-gh-release@v2].with.files",
+        &["with", "files"],
+    );
+    let actual_files = files
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
     assert_eq!(
-        string_at(
-            gh_release,
-            "jobs.release.steps[softprops/action-gh-release@v2].with.files",
-            &["with", "files"],
-        ),
-        "artifacts/*",
-        "jobs.release.steps[softprops/action-gh-release@v2].with.files must be artifacts/*"
+        actual_files,
+        BTreeSet::from([
+            "artifacts/*".to_string(),
+            "scripts/anthropic-usage".to_string(),
+            "scripts/chatgpt-usage".to_string(),
+            "scripts/claude-code-locate-transcript".to_string(),
+            "scripts/claude-code-turns".to_string(),
+            "scripts/codex-locate-transcript".to_string(),
+            "scripts/codex-turns".to_string(),
+            "scripts/zai-usage".to_string()
+        ]),
+        "jobs.release.steps[softprops/action-gh-release@v2].with.files must contain exactly the required release assets"
     );
 
     let bare_binary_hits = collect_step_run_bare_binary_hits(build_steps);
