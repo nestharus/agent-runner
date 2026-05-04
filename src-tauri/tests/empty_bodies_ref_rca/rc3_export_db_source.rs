@@ -9,7 +9,7 @@ use super::RcaFixture;
 /// locator at a missing JSONL file; export should still succeed from SQLite.
 #[test]
 fn session_export_emits_db_stored_bodies_when_jsonl_is_missing() {
-    // risk: export regression; level: end-to-end; source: contract §4 T3 / research/12-empty-bodies-ref-rca.md RC-3.
+    // risk: export regression; level: end-to-end; source: contract §4 T3 / ~/projects/agent-runner/planning/trunk/research/12-empty-bodies-ref-rca.md RC-3.
     let fixture = RcaFixture::new();
     let _db = fixture.open_db();
     fixture.seed_chain();

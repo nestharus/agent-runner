@@ -448,7 +448,7 @@ mod tests {
         );
     }
 
-    // risk: RC-1 cwd/source project dir mismatch; level: particular-integration; source: research/14-session-migration-rca.md (RC-1) + research/14-problem-map.md §2.
+    // risk: RC-1 cwd/source project dir mismatch; level: particular-integration; source: ~/projects/agent-runner/planning/trunk/research/14-session-migration-rca.md (RC-1) + ~/projects/agent-runner/planning/trunk/research/14-problem-map.md §2.
     #[test]
     fn migration_writes_target_under_spawn_cwd_when_source_and_spawn_cwd_differ() {
         let dir = tempfile::tempdir().unwrap();

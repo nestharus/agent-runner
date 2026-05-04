@@ -3,7 +3,7 @@ use super::*;
 /// RC-1 reproduction: Claude Code replaces every non-ASCII-alphanumeric
 /// character except '-' with '-', so '.', '_', and CJK characters must not
 /// survive in the project directory name.
-// risk: RC-1 incomplete Claude Code project-dir encoder; level: particular-integration; source: research/15-claude-path-hash-rca.md (RC-1).
+// risk: RC-1 incomplete Claude Code project-dir encoder; level: particular-integration; source: ~/projects/agent-runner/planning/trunk/research/15-claude-path-hash-rca.md (RC-1).
 #[test]
 fn rc1_project_dir_encoder_replaces_all_non_alnum_except_dash() {
     let fixture = ClaudePathHashFixture::new();

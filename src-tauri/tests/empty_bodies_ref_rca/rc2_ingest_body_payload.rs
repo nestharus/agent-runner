@@ -12,7 +12,7 @@ use std::collections::HashMap;
 /// `session_turns`.
 #[test]
 fn turn_script_ingest_persists_body_payload_in_session_turns() {
-    // risk: ingest regression; level: particular-integration; source: contract §4 T2 / research/12-empty-bodies-ref-rca.md RC-2.
+    // risk: ingest regression; level: particular-integration; source: contract §4 T2 / ~/projects/agent-runner/planning/trunk/research/12-empty-bodies-ref-rca.md RC-2.
     let fixture = RcaFixture::new();
     let script = fixture.write_script(
         "turns-with-body.sh",

@@ -183,7 +183,7 @@ revisited.
   human checkpoint so the pipeline could advance from problem analysis
   to design without a manual approval round.
 - **Decision**: The pipeline did not surface a manual problem-map
-  approval prompt. `research/13-release-restore-problem-map.md` was
+  approval prompt. `~/projects/agent-runner/planning/trunk/research/13-release-restore-problem-map.md` was
   carried into the design step on the strength of its own contents and
   the ticket's pre-approval.
 - **Rationale**: Both regressions have well-understood scope (the
@@ -206,7 +206,7 @@ revisited.
   skipping the implementation pipeline's per-work-unit
   problem-map human checkpoint, in parity with D-008.
 - **Decision**: The pipeline did not surface a manual problem-map
-  approval prompt. `research/14-problem-map.md` was carried into
+  approval prompt. `~/projects/agent-runner/planning/trunk/research/14-problem-map.md` was carried into
   the design step on the strength of its own contents and the
   root's pre-approval; the orchestrator recorded the gate-skip in
   the run's audit-history.
@@ -247,7 +247,7 @@ revisited.
   Failing fast at the migration boundary preserves the runner's
   ability to surface the gap and gives a future work unit a clear
   reproduction target. Recorded as a residual in
-  `risk/14-test-residuals.md`.
+  `~/projects/agent-runner/planning/trunk/risk/14-test-residuals.md`.
 - **Revisit when**: A future work unit produces an authoritative
   Windows Claude Code path-hash contract or an in-repo Windows
   encoder. Reproduction harness path:
@@ -274,7 +274,7 @@ revisited.
   uses at spawn time. The conservative choice is to keep cwd
   string-equal between migration and executor and treat symlink
   semantics as a separate change. Recorded as a residual in
-  `risk/14-test-residuals.md`.
+  `~/projects/agent-runner/planning/trunk/risk/14-test-residuals.md`.
 - **Revisit when**: A real-Claude harness shows symlinked
   workspaces produce a different resume hash than the literal
   cwd, or a customer reports that symlinked workspaces fail to
@@ -291,7 +291,7 @@ revisited.
   session turn body storage. Proposals 01-trace-inspection,
   06-export, and 06-import-replace are superseded for
   body-storage purposes only. The canonical-record wire shape from
-  `proposals/06-export.md` remains authoritative for
+  `~/projects/agent-runner/planning/trunk/proposals/06-export.md` remains authoritative for
   `agents session export` output.
 - **Rationale**: The work unit's explicit design intent is that
   `state.db` stores turn bodies directly, while those earlier
