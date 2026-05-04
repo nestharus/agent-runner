@@ -31,7 +31,7 @@ fn record_invocation(db: &StateDb, model_name: &str, provider_name: &str, provid
 }
 
 // Risk: RC-1 fallback identity (claude pool 0% while claude2/claude3 absorb routing) | level: unit
-// Source: proposals/10-routing-claude-skipped.md §Test-intent track; research/10-routing-claude-skipped-rca.md §Reproduction
+// Source: ~/projects/agent-runner/planning/trunk/proposals/10-routing-claude-skipped.md §Test-intent track; ~/projects/agent-runner/planning/trunk/research/10-routing-claude-skipped-rca.md §Reproduction
 #[test]
 fn fallback_count_routing_uses_current_provider_identity_not_stale_index_history() {
     let model = claude_accounts_model();

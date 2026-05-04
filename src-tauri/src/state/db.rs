@@ -4218,7 +4218,7 @@ mod tests {
     }
 
     // Risk: Providers migration from pre-fix aggregate shape | level: particular-integration
-    // Source: proposals/10-routing-claude-skipped.md §Test-intent track
+    // Source: ~/projects/agent-runner/planning/trunk/proposals/10-routing-claude-skipped.md §Test-intent track
     #[test]
     fn providers_migration_rebuilds_aggregate_from_invocations_by_provider_name() {
         let dir = provider_rebuild_fixture_db();
@@ -4265,7 +4265,7 @@ mod tests {
     }
 
     // Risk: Quota path unchanged regression | level: unit
-    // Source: proposals/10-routing-claude-skipped.md §Test-intent track
+    // Source: ~/projects/agent-runner/planning/trunk/proposals/10-routing-claude-skipped.md §Test-intent track
     #[test]
     fn quota_schema_remains_name_keyed_after_provider_migration() {
         let dir = provider_rebuild_fixture_db();
@@ -4303,7 +4303,7 @@ mod tests {
     }
 
     // Risk: Migration error contract — unexpected shape rejected | level: particular-integration
-    // Source: proposals/10-routing-claude-skipped.md §Test-intent track
+    // Source: ~/projects/agent-runner/planning/trunk/proposals/10-routing-claude-skipped.md §Test-intent track
     #[test]
     fn providers_migration_rejects_unexpected_shape_without_mutating_source_tables() {
         let dir = malformed_providers_shape_db();
@@ -4344,7 +4344,7 @@ mod tests {
     }
 
     // Risk: Migration error contract rejects malformed provider column metadata | level: particular-integration
-    // Source: proposals/10-routing-claude-skipped.md §Test-intent track
+    // Source: ~/projects/agent-runner/planning/trunk/proposals/10-routing-claude-skipped.md §Test-intent track
     #[test]
     fn providers_migration_rejects_wrong_affinity_shape() {
         let dir = malformed_providers_affinity_db();
@@ -4362,7 +4362,7 @@ mod tests {
     }
 
     // Risk: Migration error contract — providers as non-table object rejected | level: particular-integration
-    // Source: proposals/10-routing-claude-skipped.md §Test-intent track
+    // Source: ~/projects/agent-runner/planning/trunk/proposals/10-routing-claude-skipped.md §Test-intent track
     #[test]
     fn providers_migration_rejects_non_table_object_named_providers() {
         let dir = tempfile::tempdir().unwrap();
@@ -4413,7 +4413,7 @@ mod tests {
     }
 
     // Risk: Migration error contract — providers with foreign keys rejected | level: particular-integration
-    // Source: proposals/10-routing-claude-skipped.md §Test-intent track
+    // Source: ~/projects/agent-runner/planning/trunk/proposals/10-routing-claude-skipped.md §Test-intent track
     #[test]
     fn providers_migration_rejects_table_with_foreign_keys() {
         let dir = tempfile::tempdir().unwrap();
@@ -4451,7 +4451,7 @@ mod tests {
     }
 
     // Risk: Migration error contract rejects before source-table mutation | level: particular-integration
-    // Source: proposals/10-routing-claude-skipped.md §Test-intent track; research/10-routing-claude-skipped-contract.md §2 Migration helper
+    // Source: ~/projects/agent-runner/planning/trunk/proposals/10-routing-claude-skipped.md §Test-intent track; ~/projects/agent-runner/planning/trunk/research/10-routing-claude-skipped-contract.md §2 Migration helper
     #[test]
     fn providers_preflight_rejects_malformed_shape_before_invocations_migration() {
         let dir = legacy_invocations_with_malformed_providers_db();
@@ -4475,7 +4475,7 @@ mod tests {
     }
 
     // Risk: Migration ensure_providers_schema is idempotent across reopens | level: unit
-    // Source: proposals/10-routing-claude-skipped.md §Test-intent track
+    // Source: ~/projects/agent-runner/planning/trunk/proposals/10-routing-claude-skipped.md §Test-intent track
     #[test]
     fn providers_migration_is_idempotent_across_reopens() {
         let dir = provider_rebuild_fixture_db();
@@ -4492,7 +4492,7 @@ mod tests {
     }
 
     // Risk: Migration last_error_at reflects most recent failed invocation | level: particular-integration
-    // Source: proposals/10-routing-claude-skipped.md §Test-intent track
+    // Source: ~/projects/agent-runner/planning/trunk/proposals/10-routing-claude-skipped.md §Test-intent track
     #[test]
     fn providers_migration_last_error_at_uses_most_recent_failure_not_later_success() {
         let dir = provider_last_error_fixture_db();
@@ -4516,7 +4516,7 @@ mod tests {
     }
 
     // Risk: Migration last_error_at deterministic tie-break | level: particular-integration
-    // Source: proposals/10-routing-claude-skipped.md §Test-intent track; research/10-routing-claude-skipped-contract.md §2 Migration helper
+    // Source: ~/projects/agent-runner/planning/trunk/proposals/10-routing-claude-skipped.md §Test-intent track; ~/projects/agent-runner/planning/trunk/research/10-routing-claude-skipped-contract.md §2 Migration helper
     #[test]
     fn providers_migration_last_error_ties_use_highest_invocation_id() {
         let dir = provider_last_error_tie_fixture_db();
@@ -5670,7 +5670,7 @@ name = "fixture-provider"
     }
 
     // Risk: Null-provider legacy rows must not synthesize aggregate identity | level: unit
-    // Source: proposals/10-routing-claude-skipped.md §Test-intent track; research/10-routing-claude-skipped-contract.md §5 finalize_invocation
+    // Source: ~/projects/agent-runner/planning/trunk/proposals/10-routing-claude-skipped.md §Test-intent track; ~/projects/agent-runner/planning/trunk/research/10-routing-claude-skipped-contract.md §5 finalize_invocation
     #[test]
     fn finalize_invocation_skips_provider_aggregate_for_null_provider_name() {
         let db = test_db();
@@ -5897,7 +5897,7 @@ name = "fixture-provider"
     }
 
     // Risk: recent_error_count identity drift | level: unit
-    // Source: proposals/10-routing-claude-skipped.md §Test-intent track
+    // Source: ~/projects/agent-runner/planning/trunk/proposals/10-routing-claude-skipped.md §Test-intent track
     #[test]
     fn recent_error_count_uses_provider_name_not_reused_index_history() {
         let db = test_db();
@@ -5929,7 +5929,7 @@ name = "fixture-provider"
     }
 
     // Risk: Aggregate writer/reader round-trip after provider reorder | level: unit
-    // Source: proposals/10-routing-claude-skipped.md §Test-intent track
+    // Source: ~/projects/agent-runner/planning/trunk/proposals/10-routing-claude-skipped.md §Test-intent track
     #[test]
     fn provider_aggregate_round_trip_follows_name_after_reorder() {
         let db = test_db();
@@ -5966,7 +5966,7 @@ name = "fixture-provider"
     }
 
     // Risk: Aggregate writer/reader round-trip after provider rename | level: unit
-    // Source: proposals/10-routing-claude-skipped.md §Test-intent track
+    // Source: ~/projects/agent-runner/planning/trunk/proposals/10-routing-claude-skipped.md §Test-intent track
     #[test]
     fn provider_aggregate_round_trip_does_not_inherit_renamed_provider_history() {
         let db = test_db();

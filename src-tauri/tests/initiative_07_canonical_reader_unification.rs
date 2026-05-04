@@ -11,7 +11,7 @@ use std::path::Path;
 
 /// Risk: RC-2 — Claude array content containing non-text chunks may hash differently between export and import-replace.
 /// Level: CLI integration.
-/// Source: research/07-canonical-reader-divergence-rca.md RC-2; proposals/07-canonical-reader-unification.md §4.
+/// Source: ~/projects/agent-runner/planning/trunk/research/07-canonical-reader-divergence-rca.md RC-2; ~/projects/agent-runner/planning/trunk/proposals/07-canonical-reader-unification.md §4.
 /// Observable: export-derived preimage hash is accepted; receipt preimage_sha256 equals that oracle.
 /// Residual: covers one representative tool_use chunk, not every Claude structured content kind.
 #[test]
@@ -43,7 +43,7 @@ fn t_rc2_claude_content_array_with_tool_use_chunk_accepts_export_preimage() {
 
 /// Risk: RC-4 — Claude compaction summaries may leave pre-summary turns in import-replace's preimage hash.
 /// Level: CLI integration.
-/// Source: research/07-canonical-reader-divergence-rca.md RC-4; proposals/07-canonical-reader-unification.md §4.
+/// Source: ~/projects/agent-runner/planning/trunk/research/07-canonical-reader-divergence-rca.md RC-4; ~/projects/agent-runner/planning/trunk/proposals/07-canonical-reader-unification.md §4.
 /// Observable: export-derived preimage hash is accepted; receipt preimage_sha256 equals that oracle.
 /// Residual: covers one latest compaction boundary, not multiple summary markers.
 #[test]
@@ -76,7 +76,7 @@ fn t_rc4_claude_compaction_summary_accepts_export_preimage() {
 
 /// Risk: RC-5 — out-of-order Claude timestamps may be accepted by import-replace after export rejects them.
 /// Level: CLI integration.
-/// Source: research/07-canonical-reader-divergence-rca.md RC-5; proposals/07-canonical-reader-unification.md §4; TA-07-F03.
+/// Source: ~/projects/agent-runner/planning/trunk/research/07-canonical-reader-divergence-rca.md RC-5; ~/projects/agent-runner/planning/trunk/proposals/07-canonical-reader-unification.md §4; TA-07-F03.
 /// Observable: export and import-replace both exit non-zero; transcript bytes, session_turns, and pending journals are unchanged.
 /// Residual: asserts one decreasing timestamp pair, not every timestamp normalization edge.
 #[test]
@@ -118,7 +118,7 @@ fn t_rc5_claude_out_of_order_timestamps_reject_without_mutation() {
 
 /// Risk: RC-6 — Codex transcripts missing session_meta may be accepted by import-replace after export rejects them.
 /// Level: CLI integration.
-/// Source: research/07-canonical-reader-divergence-rca.md RC-6; proposals/07-canonical-reader-unification.md §4; TA-07-F03.
+/// Source: ~/projects/agent-runner/planning/trunk/research/07-canonical-reader-divergence-rca.md RC-6; ~/projects/agent-runner/planning/trunk/proposals/07-canonical-reader-unification.md §4; TA-07-F03.
 /// Observable: export and import-replace both exit non-zero; transcript bytes, session_turns, and pending journals are unchanged.
 /// Residual: covers absent session_meta, not mismatched session_meta id.
 #[test]

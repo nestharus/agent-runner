@@ -11,7 +11,7 @@ use agent_runner_lib::trace::{TraceOptions, trace_invocation};
 /// DB-backed body read path.
 #[test]
 fn trace_inline_transcript_embeds_db_stored_turn_bodies() {
-    // risk: trace regression; level: particular-integration; source: contract §4 T4 / research/12-empty-bodies-ref-rca.md RC-4.
+    // risk: trace regression; level: particular-integration; source: contract §4 T4 / ~/projects/agent-runner/planning/trunk/research/12-empty-bodies-ref-rca.md RC-4.
     let fixture = RcaFixture::new();
     let db = fixture.open_db();
     fixture.seed_body_turns();

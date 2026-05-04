@@ -906,7 +906,7 @@ mod tests {
     }
 
     // Risk: Balancer recent-error call-site | level: unit
-    // Source: proposals/10-routing-claude-skipped.md §Test-intent track
+    // Source: ~/projects/agent-runner/planning/trunk/proposals/10-routing-claude-skipped.md §Test-intent track
     #[test]
     fn fallback_recent_error_scoring_uses_provider_name_not_reused_index() {
         let db = StateDb::open(Path::new(":memory:")).unwrap();

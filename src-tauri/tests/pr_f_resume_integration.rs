@@ -947,7 +947,7 @@ fn repl_resume_migrates_to_least_loaded_provider() {
         ("claude-b".to_string(), session_id.to_string())
     );
     // risk: RC-1 cwd/source project dir mismatch end-to-end via run_repl;
-    //       level: end-to-end; source: research/14-session-migration-rca.md (RC-1) + contract §5.
+    //       level: end-to-end; source: ~/projects/agent-runner/planning/trunk/research/14-session-migration-rca.md (RC-1) + contract §5.
     let expected_target_dir: String = fixture
         .dir
         .path()

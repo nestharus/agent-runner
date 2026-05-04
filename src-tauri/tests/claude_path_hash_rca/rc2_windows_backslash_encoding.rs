@@ -2,7 +2,7 @@ use super::*;
 
 /// RC-2 reproduction: Claude Code applies the same encoder to Windows-shaped
 /// paths by treating backslashes as separators before non-alnum filtering.
-// risk: RC-2 Windows-shaped Claude Code project-dir hashing; level: particular-integration; source: research/15-claude-path-hash-rca.md (RC-2).
+// risk: RC-2 Windows-shaped Claude Code project-dir hashing; level: particular-integration; source: ~/projects/agent-runner/planning/trunk/research/15-claude-path-hash-rca.md (RC-2).
 #[test]
 fn rc2_windows_shape_path_uses_backslash_and_non_alnum_encoding_rule() {
     let fixture = ClaudePathHashFixture::new();

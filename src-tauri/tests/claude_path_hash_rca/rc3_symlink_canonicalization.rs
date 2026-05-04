@@ -3,7 +3,7 @@ use super::*;
 /// RC-3 reproduction: real-Claude probing showed `--resume` resolves a
 /// symlinked cwd before hashing, so migration must write under the resolved
 /// workspace's encoded project directory.
-// risk: RC-3 symlinked cwd hashing; level: particular-integration; source: research/15-claude-path-hash-rca.md (RC-3).
+// risk: RC-3 symlinked cwd hashing; level: particular-integration; source: ~/projects/agent-runner/planning/trunk/research/15-claude-path-hash-rca.md (RC-3).
 #[test]
 fn rc3_symlinked_workspace_hashes_resolved_path_not_literal_link_path() {
     let fixture = ClaudePathHashFixture::new();

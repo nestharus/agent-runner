@@ -8,7 +8,7 @@ use super::RcaFixture;
 /// the fix must establish.
 #[test]
 fn session_turns_schema_has_direct_body_storage_column() {
-    // risk: schema regression; level: particular-integration; source: contract §4 T1 / research/12-empty-bodies-ref-rca.md RC-1.
+    // risk: schema regression; level: particular-integration; source: contract §4 T1 / ~/projects/agent-runner/planning/trunk/research/12-empty-bodies-ref-rca.md RC-1.
     let fixture = RcaFixture::new();
     let columns = fixture.session_turns_columns();
 

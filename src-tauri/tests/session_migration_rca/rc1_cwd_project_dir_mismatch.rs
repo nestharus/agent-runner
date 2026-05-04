@@ -7,7 +7,7 @@ use agent_runner_lib::migration::migrate_chain_segment;
 /// honor the resumed session from the actual spawn cwd. This fails pre-fix
 /// because migration writes under the source transcript's project directory,
 /// while Claude Code resolves `--resume <id>` under the child process cwd.
-// risk: RC-1 cwd/source project dir mismatch; level: particular-integration; source: research/14-session-migration-rca.md (RC-1).
+// risk: RC-1 cwd/source project dir mismatch; level: particular-integration; source: ~/projects/agent-runner/planning/trunk/research/14-session-migration-rca.md (RC-1).
 #[test]
 fn rc1_migrated_transcript_must_be_honorable_from_resume_working_dir() {
     let fixture = MigrationFixture::new();
