@@ -634,7 +634,14 @@ fn migration_fixture() -> (
 }
 
 fn claude_project_dir_name(path: &Path) -> String {
-    path.to_string_lossy().replace('/', "-")
+    path.to_string_lossy()
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' => '-',
+            c if (c.is_ascii() && c.is_alphanumeric()) || c == '-' => c,
+            _ => '-',
+        })
+        .collect()
 }
 
 // risk: Migration mechanic: Claude JSONL copy, Codex deferred guard, segment ledger, and races; level: particular-integration; source: proposal §11.1 Migration mechanic / A1, A3.

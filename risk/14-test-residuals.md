@@ -18,6 +18,9 @@ Phase: 6b encode-tests-first
 
 ### Windows Claude project directory hashing
 
+- Status: **resolved** by WU-14-02 / PR #N.
+- Resolution evidence:
+  `src-tauri/tests/claude_path_hash_rca/rc2_windows_backslash_encoding.rs`.
 - Unverified risk: A5, Windows cwd hashing is not defined by this repository.
 - Residual class: `bounded-model`
 - Technique considered: symbolic
@@ -27,9 +30,13 @@ Phase: 6b encode-tests-first
 - Remaining residual: the Unix helper tests do not prove Windows placement semantics.
 - Invalidating inputs: authoritative Windows Claude Code hashing contract or an in-repo Windows encoder.
 - Net-value impact: does not change the approved net-value case; Windows behavior is explicitly out of scope.
+- Resolved by WU-14-02 / PR #N.
 
 ### Symlink and canonicalization behavior
 
+- Status: **resolved** by WU-14-02 / PR #N.
+- Resolution evidence:
+  `src-tauri/tests/claude_path_hash_rca/rc3_symlink_canonicalization.rs`.
 - Unverified risk: A3, Claude Code may canonicalize symlinked cwd paths before hashing.
 - Residual class: `combinatorial/path-state`
 - Technique considered: property-based
@@ -39,6 +46,7 @@ Phase: 6b encode-tests-first
 - Remaining residual: tests cover absolute path encoding and relative rejection, not symlink equivalence.
 - Invalidating inputs: a real-Claude harness showing canonicalized symlink cwd hashing is required.
 - Net-value impact: does not change the approved net-value case; the proposal names this as a future investigation.
+- Resolved by WU-14-02 / PR #N.
 
 ### `working_dir = None` production call-site behavior
 

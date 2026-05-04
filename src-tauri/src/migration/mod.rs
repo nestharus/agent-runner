@@ -158,7 +158,7 @@ pub fn migrate_chain_segment(
             provider: target.name.clone(),
         });
     };
-    let cwd_project_dir = claude_project_dir_for(&target.name, resume_working_dir)?;
+    let cwd_project_dir = claude_project_dir_for(&target.name, resume_working_dir, stderr)?;
     let bytes = std::fs::read(&source_path).map_err(|e| MigrationError::Io {
         path: source_path.display().to_string(),
         message: e.to_string(),
@@ -253,15 +253,42 @@ pub fn migrate_chain_segment(
     })
 }
 
-pub(crate) fn claude_project_dir_for(provider: &str, cwd: &Path) -> Result<String, MigrationError> {
-    if cwd.as_os_str().is_empty() || !cwd.is_absolute() {
+pub(crate) fn claude_project_dir_for(
+    provider: &str,
+    cwd: &Path,
+    stderr: &mut dyn Write,
+) -> Result<String, MigrationError> {
+    if cwd.as_os_str().is_empty() {
         return Err(MigrationError::SpawnCwdUnsupported {
             provider: provider.to_string(),
             cwd: cwd.display().to_string(),
         });
     }
 
-    Ok(cwd.to_string_lossy().replace('/', "-"))
+    let path_for_hash = match std::fs::canonicalize(cwd) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            let _ = writeln!(
+                stderr,
+                "Warning: Claude project-dir canonicalize failed for provider={provider} cwd={} error={}; falling back to literal cwd",
+                cwd.display(),
+                error
+            );
+            cwd.to_path_buf()
+        }
+    };
+
+    let input = path_for_hash.to_string_lossy();
+    let mut encoded = String::with_capacity(input.len());
+    for ch in input.chars() {
+        let mapped = match ch {
+            '/' | '\\' => '-',
+            c if (c.is_ascii() && c.is_alphanumeric()) || c == '-' => c,
+            _ => '-',
+        };
+        encoded.push(mapped);
+    }
+    Ok(encoded)
 }
 
 pub fn find_claude_source_from_storage(
@@ -317,7 +344,14 @@ mod tests {
     }
 
     fn claude_project_dir_name(path: &std::path::Path) -> String {
-        path.to_string_lossy().replace('/', "-")
+        path.to_string_lossy()
+            .chars()
+            .map(|c| match c {
+                '/' | '\\' => '-',
+                c if (c.is_ascii() && c.is_alphanumeric()) || c == '-' => c,
+                _ => '-',
+            })
+            .collect()
     }
 
     fn seed_source_jsonl(
@@ -461,29 +495,39 @@ mod tests {
     // risk: Cwd-to-project-dir encoding correctness; level: unit; source: proposal §1 helper signature / A2.
     #[test]
     fn claude_project_dir_for_encodes_absolute_unix_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("work_tree").join("project.v1");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let expected = claude_project_dir_name(&cwd.canonicalize().unwrap());
+        let mut stderr = Vec::new();
+
         assert_eq!(
-            claude_project_dir_for("claude", std::path::Path::new("/home/nes/x")).unwrap(),
-            "-home-nes-x"
+            claude_project_dir_for("claude", &cwd, &mut stderr).unwrap(),
+            expected
         );
     }
 
     // risk: Cwd-to-project-dir encoding correctness; level: unit; source: proposal §1 helper signature / A2.
     #[test]
-    fn claude_project_dir_for_rejects_relative_path() {
-        let err = claude_project_dir_for("claude", std::path::Path::new("relative/x"))
-            .expect_err("relative cwd should be rejected");
+    fn claude_project_dir_for_accepts_relative_non_empty_path() {
+        let cwd = std::path::Path::new("relative/work_tree/project.v1");
+        let expected = match cwd.canonicalize() {
+            Ok(resolved) => claude_project_dir_name(&resolved),
+            Err(_) => claude_project_dir_name(cwd),
+        };
+        let mut stderr = Vec::new();
 
-        assert!(matches!(
-            err,
-            MigrationError::SpawnCwdUnsupported { provider, cwd }
-                if provider == "claude" && cwd == "relative/x"
-        ));
+        assert_eq!(
+            claude_project_dir_for("claude", cwd, &mut stderr).unwrap(),
+            expected
+        );
     }
 
     // risk: Cwd-to-project-dir encoding correctness; level: unit; source: proposal §1 helper signature / A2.
     #[test]
     fn claude_project_dir_for_rejects_empty_path() {
-        let err = claude_project_dir_for("claude", std::path::Path::new(""))
+        let mut stderr = Vec::new();
+        let err = claude_project_dir_for("claude", std::path::Path::new(""), &mut stderr)
             .expect_err("empty cwd should be rejected");
 
         assert!(matches!(
@@ -491,5 +535,25 @@ mod tests {
             MigrationError::SpawnCwdUnsupported { provider, cwd }
                 if provider == "claude" && cwd.is_empty()
         ));
+    }
+
+    // risk: Canonicalize failure silently hashes the wrong cwd; level: unit; source: contract §4 invariant 3.
+    #[test]
+    fn claude_project_dir_for_warns_and_uses_literal_path_when_canonicalize_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("missing_work_tree").join("project.v1");
+        let expected = claude_project_dir_name(&cwd);
+        let mut stderr = Vec::new();
+
+        assert_eq!(
+            claude_project_dir_for("claude-target", &cwd, &mut stderr).unwrap(),
+            expected
+        );
+
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(stderr.contains("Warning:"));
+        assert!(stderr.contains("provider=claude-target"));
+        assert!(stderr.contains(&format!("cwd={}", cwd.display())));
+        assert!(stderr.contains("falling back to literal cwd"));
     }
 }

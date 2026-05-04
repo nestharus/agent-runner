@@ -106,7 +106,7 @@ while [ "$#" -gt 0 ]; do
   fi
   shift
 done
-project="${{PWD//\//-}}"
+project=$(printf '%s' "$PWD" | sed -e 's#[/\\]#-#g' -e 's/[^A-Za-z0-9-]/-/g')
 candidate="{}/$project/$sid.jsonl"
 if [ -n "$sid" ] && [ -f "$candidate" ]; then
   printf '{{"session_id":"%s","status":"resumed"}}\n' "$sid"
@@ -127,7 +127,14 @@ exit 1
 }
 
 pub fn claude_project_dir_name(path: &Path) -> String {
-    path.to_string_lossy().replace('/', "-")
+    path.to_string_lossy()
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' => '-',
+            c if (c.is_ascii() && c.is_alphanumeric()) || c == '-' => c,
+            _ => '-',
+        })
+        .collect()
 }
 
 fn claude_provider(name: &str, command: &Path, projects_dir: &Path) -> ProviderConfig {
