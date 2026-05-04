@@ -198,6 +198,7 @@ pub struct SessionTurnIngest {
     pub parent_turn_id: Option<String>,
     pub is_sidechain: bool,
     pub is_compaction_boundary: bool,
+    pub body: Option<String>,
 }
 
 pub type ModelStore = std::collections::HashMap<String, ModelConfig>;
@@ -637,6 +638,7 @@ impl StateDb {
                 is_compaction_boundary INTEGER NOT NULL DEFAULT 0,
                 source_file TEXT NOT NULL,
                 ingested_at TEXT NOT NULL,
+                body TEXT,
                 UNIQUE (provider_name, session_id, turn_id)
             );
 
@@ -1039,6 +1041,10 @@ impl StateDb {
                 [],
             )
             .map_err(|e| format!("Failed to add session_turns.is_compaction_boundary: {e}"))?;
+        }
+        if !columns.iter().any(|column| column == "body") {
+            conn.execute("ALTER TABLE session_turns ADD COLUMN body TEXT", [])
+                .map_err(|e| format!("Failed to add session_turns.body: {e}"))?;
         }
         conn.execute_batch(Self::session_turns_index_sql())
             .map_err(|e| format!("Failed to ensure session_turns indexes: {e}"))?;
@@ -2567,8 +2573,8 @@ impl StateDb {
             .conn
             .execute(
                 "INSERT OR IGNORE INTO session_turns
-                    (provider_name, session_id, turn_id, timestamp, role, is_compaction_boundary, source_file, ingested_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)",
+                    (provider_name, session_id, turn_id, timestamp, role, is_compaction_boundary, source_file, ingested_at, body)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8)",
                 params![
                     provider_name,
                     session_id,
@@ -2577,6 +2583,7 @@ impl StateDb {
                     role,
                     source_file,
                     &now,
+                    Option::<&str>::None,
                 ],
             )
             .map_err(|e| format!("Failed to ingest session turn: {e}"))?;
@@ -2615,9 +2622,10 @@ impl StateDb {
                             is_sidechain,
                             is_compaction_boundary,
                             source_file,
-                            ingested_at
+                            ingested_at,
+                            body
                         )
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '', ?9)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '', ?9, ?10)",
                 )
                 .map_err(|e| format!("Failed to prepare batch insert: {e}"))?;
             for turn in turns {
@@ -2636,6 +2644,7 @@ impl StateDb {
                             0i64
                         },
                         &now,
+                        turn.body.as_deref(),
                     ])
                     .map_err(|e| format!("Batch insert row failed: {e}"))?;
                 new_count += n as u64;
@@ -3407,8 +3416,8 @@ impl StateDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::env_lock;
     use rusqlite::Connection;
-    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
     use uuid::Uuid;
 
@@ -3486,6 +3495,7 @@ mod tests {
                 parent_turn_id: None,
                 is_sidechain: false,
                 is_compaction_boundary: false,
+                body: None,
             })
             .collect();
         db.ingest_session_turns_batch(provider_name, &turns)
@@ -3604,11 +3614,6 @@ mod tests {
         )
         .unwrap();
         id
-    }
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
     }
 
     fn with_models_config(model_name: &str, body: &str, test: impl FnOnce()) {
@@ -4611,6 +4616,7 @@ mod tests {
 
         assert!(sql.contains("parent_turn_id TEXT"));
         assert!(sql.contains("is_sidechain INTEGER NOT NULL DEFAULT 0"));
+        assert!(sql.contains("body TEXT"));
     }
 
     #[test]
@@ -4641,6 +4647,71 @@ mod tests {
                 && column.2 == 1
                 && column.3.as_deref() == Some("0")
         }));
+    }
+
+    #[test]
+    fn session_turns_schema_migration_adds_nullable_body_to_legacy_db() {
+        // risk: legacy-DB upgrade; level: unit; source: contract §4 T5 / proposal A2,A8.
+        let dir = legacy_session_turns_db();
+        let path = dir.path().join("state.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO session_turns
+                (provider_name, session_id, turn_id, timestamp, role, source_file, ingested_at)
+             VALUES ('fixture-provider', 'session-a', 'legacy-turn', '2026-04-17T08:00:00Z', 'assistant', '', '2026-04-17T08:00:00Z')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = StateDb::open(&path).unwrap();
+
+        let session_columns: Vec<(String, String, i64)> = db
+            .conn
+            .prepare("PRAGMA table_info(session_turns)")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(1)?, row.get(2)?, row.get(3)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            session_columns
+                .iter()
+                .any(|(name, data_type, notnull)| name == "body"
+                    && data_type == "TEXT"
+                    && *notnull == 0),
+            "legacy migration must add nullable body TEXT; columns={session_columns:?}"
+        );
+        let body: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT body FROM session_turns WHERE turn_id = 'legacy-turn'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(body, None);
+
+        let quota_columns: Vec<String> = db
+            .conn
+            .prepare("PRAGMA table_info(provider_quotas)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            quota_columns
+                .iter()
+                .any(|column| column == "topology_peak_live_window_count"),
+            "body migration must coexist with WU-13 quota topology migration; columns={quota_columns:?}"
+        );
+        assert!(
+            quota_columns
+                .iter()
+                .any(|column| column == "last_topology_probe_at"),
+            "body migration must coexist with WU-13 quota topology migration; columns={quota_columns:?}"
+        );
     }
 
     #[test]
@@ -5930,6 +6001,7 @@ name = "fixture-provider"
                     parent_turn_id: Some("root-turn".to_string()),
                     is_sidechain: true,
                     is_compaction_boundary: false,
+                    body: None,
                 }],
             )
             .unwrap();
@@ -5964,6 +6036,7 @@ name = "fixture-provider"
                     parent_turn_id: None,
                     is_sidechain: false,
                     is_compaction_boundary: false,
+                    body: None,
                 },
                 SessionTurnIngest {
                     session_id: "session-a".to_string(),
@@ -5973,6 +6046,7 @@ name = "fixture-provider"
                     parent_turn_id: Some("root".to_string()),
                     is_sidechain: false,
                     is_compaction_boundary: false,
+                    body: None,
                 },
                 SessionTurnIngest {
                     session_id: "session-a".to_string(),
@@ -5982,6 +6056,7 @@ name = "fixture-provider"
                     parent_turn_id: Some("assistant-main".to_string()),
                     is_sidechain: true,
                     is_compaction_boundary: false,
+                    body: None,
                 },
                 SessionTurnIngest {
                     session_id: "session-b".to_string(),
@@ -5991,6 +6066,7 @@ name = "fixture-provider"
                     parent_turn_id: None,
                     is_sidechain: true,
                     is_compaction_boundary: false,
+                    body: None,
                 },
             ],
         )
@@ -6005,6 +6081,7 @@ name = "fixture-provider"
                 parent_turn_id: None,
                 is_sidechain: true,
                 is_compaction_boundary: false,
+                body: None,
             }],
         )
         .unwrap();

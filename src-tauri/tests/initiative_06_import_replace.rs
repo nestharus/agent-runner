@@ -961,6 +961,40 @@ fn t_schema_incompatible_exit_14() {
     assert!(!fixture.replace_journal_dir().exists());
 }
 
+/// Risk: WU-15-01 schema preflight may miss the direct body column required by the DB write path.
+/// Level: component.
+/// Source: CodeRabbit R1-F02.
+/// Observable: exit 14 schema-incompatible before journal creation when session_turns.body is absent.
+/// Residual: relies on SQLite DROP COLUMN support from the bundled rusqlite version.
+#[test]
+fn t_schema_incompatible_missing_body_column_exit_14() {
+    let fixture = ImportReplaceFixture::new();
+    let db = fixture.open_db();
+    drop(db);
+    let conn = Connection::open(fixture.db_path()).unwrap();
+    conn.execute("ALTER TABLE session_turns DROP COLUMN body", [])
+        .unwrap();
+    let before_db = fs::read(fixture.db_path()).unwrap();
+    let input = canonical_jsonl(
+        SESSION_A,
+        CLAUDE_PROVIDER,
+        &fixture.root().join("schema-missing-body.jsonl"),
+        "schema",
+    );
+
+    let output = fixture.run_import_replace(SESSION_A, &input, &[]);
+
+    assert_eq!(output.status.code(), Some(14), "{output:?}");
+    assert_json_error(&output, "schema-incompatible");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("missing required column session_turns.body"),
+        "{output:?}"
+    );
+    assert_eq!(fs::read(fixture.db_path()).unwrap(), before_db);
+    assert!(!fixture.replace_journal_dir().exists());
+}
+
 /// Risk: T-malformed-input — empty stdin may be treated as a valid empty replacement and mutate the session.
 /// Level: component.
 /// Source: contract §6 input contract; proposal §9.1 T-malformed-input; A2.

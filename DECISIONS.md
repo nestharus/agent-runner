@@ -281,6 +281,55 @@ revisited.
 
 ---
 
+## D-012 — WU-15-01 design intent override
+
+- **Source**: WU-15-01 Phase 6 contract and Phase 0 RCA for
+  empty-bodies-ref.
+- **Decision**: Bodies-in-DB is the authoritative contract for
+  session turn body storage. Proposals 01-trace-inspection,
+  06-export, and 06-import-replace are superseded for
+  body-storage purposes only. The canonical-record wire shape from
+  `proposals/06-export.md` remains authoritative for
+  `agents session export` output.
+- **Rationale**: The work unit's explicit design intent is that
+  `state.db` stores turn bodies directly, while those earlier
+  proposals described provider JSONL as the body source of truth.
+  This decision narrows the override to storage so export and
+  import-replace keep their public canonical JSONL contract.
+- **Revisit when**: A future work unit intentionally changes the
+  canonical export record family or reopens the body-source policy.
+
+---
+
+## D-013 — WU-15-01 Phase 0 done
+
+- **Source**: WU-15-01 Phase 0 RCA.
+- **Decision**: The empty-bodies-ref RCA was performed pre-merge on
+  `rca/empty-bodies-ref` at commit `242cb87`; reproduction
+  harnesses shipped as RED on pre-fix HEAD `e9649a1`.
+- **Rationale**: Recording the RCA and RED harness provenance makes
+  the schema, ingest, export, and trace failures auditable after the
+  fix lands.
+- **Revisit when**: The Phase 0 provenance is found to point at the
+  wrong branch or commit.
+
+---
+
+## D-014 — WU-15-01 Phase 2.5 human-gate skip
+
+- **Source**: WU-15-01 process record and the standing
+  pre-approval policy from WU-11-01 / WU-13-01 / WU-14-01.
+- **Decision**: Phase 2.5 human gate was skipped under the standing
+  pre-approval policy.
+- **Rationale**: The problem map did not surface a new value,
+  scope, or trade-off question beyond the already-approved
+  bodies-in-DB contract.
+- **Revisit when**: A future body-storage work unit surfaces a new
+  product policy question or expands beyond the approved storage,
+  export, import-replace, and trace surfaces.
+
+---
+
 ## Process
 
 When a CodeRabbit pass / risk gate / synthesis review raises a finding that

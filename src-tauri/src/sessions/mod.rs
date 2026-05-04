@@ -21,6 +21,7 @@ use crate::config::{SessionSourceEntry, SessionsConfig};
 use crate::state::{SessionTurnIngest, StateDb};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use serde_json::Value;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -42,6 +43,8 @@ pub struct ScriptTurn {
     pub is_sidechain: Option<bool>,
     #[serde(default)]
     pub is_compaction_boundary: Option<bool>,
+    #[serde(default)]
+    pub body: Option<Value>,
 }
 
 /// Outcome of scanning one provider's session source.
@@ -50,6 +53,19 @@ pub struct ScanReport {
     pub new_turns: u64,
     pub script_lines: u64,
     pub errors: Vec<String>,
+}
+
+fn is_canonical_body_shape(body: &Value) -> bool {
+    let Value::Array(chunks) = body else {
+        return false;
+    };
+    chunks.iter().all(|chunk| {
+        let Value::Object(map) = chunk else {
+            return false;
+        };
+        map.get("type").is_some_and(Value::is_string)
+            && map.get("text").map(Value::is_string).unwrap_or(true)
+    })
 }
 
 /// Run the adapter script for `provider_name` and ingest every turn it emits.
@@ -112,6 +128,26 @@ pub fn scan_provider(
                 continue;
             }
         };
+        let body = match turn.body {
+            Some(body) if !is_canonical_body_shape(&body) => {
+                report.errors.push(format!(
+                    "invalid body shape for provider {provider_name} line {}: expected canonical content chunk array",
+                    report.script_lines
+                ));
+                None
+            }
+            Some(body) => match serde_json::to_string(&body) {
+                Ok(serialized) => Some(serialized),
+                Err(e) => {
+                    report.errors.push(format!(
+                        "failed to serialize body for provider {provider_name} line {}: {e}",
+                        report.script_lines
+                    ));
+                    None
+                }
+            },
+            None => None,
+        };
         batch.push(SessionTurnIngest {
             session_id: turn.session_id,
             turn_id: turn.turn_id,
@@ -120,6 +156,7 @@ pub fn scan_provider(
             parent_turn_id: turn.parent_turn_id,
             is_sidechain: turn.is_sidechain.unwrap_or(false),
             is_compaction_boundary: turn.is_compaction_boundary.unwrap_or(false),
+            body,
         });
     }
     match db.ingest_session_turns_batch(provider_name, &batch) {
@@ -387,6 +424,7 @@ EOF"#,
         assert_eq!(turn.role, "assistant");
         assert_eq!(turn.parent_turn_id, None);
         assert_eq!(turn.is_sidechain, None);
+        assert_eq!(turn.body, None);
     }
 
     #[test]
@@ -400,6 +438,72 @@ EOF"#,
         assert_eq!(turn.turn_id, "t2");
         assert_eq!(turn.parent_turn_id.as_deref(), Some("t1"));
         assert_eq!(turn.is_sidechain, Some(true));
+    }
+
+    #[test]
+    fn scan_provider_persists_body_encoding_edge_cases() {
+        // risk: encoding regression; level: particular-integration; source: contract §4 T6 / proposal A5,A7.
+        let db = db();
+        let script = fixture_script(
+            r#"cat <<'EOF'
+{"session_id":"S1","turn_id":"edge-body","timestamp":"2026-04-17T08:00:00Z","role":"assistant","body":[{"type":"text","text":"line one\n日本語\n{\"escaped\":true}\u0007"}]}
+EOF"#,
+        );
+        let cfg = cfg_with("p", &script.path);
+
+        let report = scan_provider("p", &cfg, &db);
+
+        assert_eq!(report.errors, Vec::<String>::new());
+        assert_eq!(report.new_turns, 1);
+        let raw_body: String = db
+            .connection()
+            .query_row(
+                "SELECT body FROM session_turns
+                 WHERE provider_name = 'p' AND session_id = 'S1' AND turn_id = 'edge-body'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&raw_body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!([{"type":"text","text":"line one\n日本語\n{\"escaped\":true}\u{0007}"}])
+        );
+    }
+
+    #[test]
+    fn scan_provider_rejects_non_canonical_body_shape() {
+        // risk: invalid adapter body poisons downstream canonical export; level: unit; source: CodeRabbit R4-F05.
+        let db = db();
+        let script = fixture_script(
+            r#"cat <<'EOF'
+{"session_id":"S1","turn_id":"bad-body","timestamp":"2026-04-17T08:00:00Z","role":"assistant","body":{"type":"text","text":"not an array"}}
+{"session_id":"S1","turn_id":"bad-text","timestamp":"2026-04-17T08:00:01Z","role":"assistant","body":[{"type":"text","text":7}]}
+EOF"#,
+        );
+        let cfg = cfg_with("p", &script.path);
+
+        let report = scan_provider("p", &cfg, &db);
+
+        assert_eq!(report.new_turns, 2);
+        assert_eq!(report.errors.len(), 2);
+        assert!(report.errors.iter().all(|error| {
+            error.contains("invalid body shape")
+                && error.contains("expected canonical content chunk array")
+        }));
+        let stored_bodies: Vec<Option<String>> = db
+            .connection()
+            .prepare(
+                "SELECT body FROM session_turns
+                 WHERE provider_name = 'p' AND session_id = 'S1'
+                 ORDER BY turn_id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(stored_bodies, vec![None, None]);
     }
 
     #[test]

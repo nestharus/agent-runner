@@ -378,6 +378,7 @@ fn probe_state_schema_compatible(data_root: &Path, session_id: &str) -> Result<(
             "is_compaction_boundary",
             "source_file",
             "ingested_at",
+            "body",
         ],
     )
 }
@@ -883,11 +884,15 @@ fn replace_db_turns(
     // Canonical v1 records intentionally do not carry parentage, sidechain, or
     // compaction metadata, so imported rows reset those lineage fields.
     for record in records {
+        let body =
+            serde_json::to_string(&record.content).map_err(|e| ReplaceError::OperationalError {
+                message: format!("failed to serialize replacement body: {e}"),
+            })?;
         tx.execute(
             "INSERT INTO session_turns
                 (provider_name, session_id, turn_id, timestamp, role,
-                 parent_turn_id, is_sidechain, is_compaction_boundary, source_file, ingested_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, 0, 0, ?6, ?7)",
+                 parent_turn_id, is_sidechain, is_compaction_boundary, source_file, ingested_at, body)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, 0, 0, ?6, ?7, ?8)",
             params![
                 metadata.provider_name,
                 metadata.session_id,
@@ -896,6 +901,7 @@ fn replace_db_turns(
                 record.role,
                 metadata.jsonl_path.to_string_lossy(),
                 now,
+                body,
             ],
         )
         .map_err(|e| ReplaceError::OperationalError {
@@ -1173,4 +1179,237 @@ fn move_to_quarantine(path: &Path, quarantine_dir: &Path) {
     };
     let dest = quarantine_dir.join(name);
     let _ = fs::rename(path, dest);
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::session_export::RecordSource;
+    use crate::test_support::env_lock;
+    use rusqlite::params;
+    use std::os::unix::fs::PermissionsExt;
+
+    const SESSION_ID: &str = "5169694d-de0f-40d1-890c-6e28e55bab27";
+    const CHAIN_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const PROVIDER: &str = "codex";
+    const MODEL: &str = "codex-high";
+
+    fn with_homes<T>(config_home: &Path, data_home: &Path, test: impl FnOnce() -> T) -> T {
+        let _guard = env_lock().lock().unwrap();
+        let old_config = std::env::var_os("XDG_CONFIG_HOME");
+        let old_data = std::env::var_os("XDG_DATA_HOME");
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", config_home);
+            std::env::set_var("XDG_DATA_HOME", data_home);
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(test));
+        match old_config {
+            Some(value) => unsafe {
+                std::env::set_var("XDG_CONFIG_HOME", value);
+            },
+            None => unsafe {
+                std::env::remove_var("XDG_CONFIG_HOME");
+            },
+        }
+        match old_data {
+            Some(value) => unsafe {
+                std::env::set_var("XDG_DATA_HOME", value);
+            },
+            None => unsafe {
+                std::env::remove_var("XDG_DATA_HOME");
+            },
+        }
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    fn write_script(path: &Path, body: &str) {
+        fs::write(
+            path,
+            format!("#!/usr/bin/env bash\nset -euo pipefail\n{body}\n"),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms).unwrap();
+    }
+
+    fn sh_path(path: &Path) -> String {
+        format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+    }
+
+    fn replacement_records(jsonl_path: &Path) -> Vec<CanonicalRecord> {
+        vec![
+            CanonicalRecord {
+                session_id: SESSION_ID.to_string(),
+                provider_name: PROVIDER.to_string(),
+                turn_id: "new-user".to_string(),
+                role: "user".to_string(),
+                timestamp: "2026-04-17T08:00:00Z".to_string(),
+                content: vec![ContentChunk {
+                    r#type: "text".to_string(),
+                    text: Some("replacement user body".to_string()),
+                }],
+                source: RecordSource {
+                    storage_type: "codex_session".to_string(),
+                    jsonl_path: jsonl_path.to_path_buf(),
+                    line: 2,
+                    byte_start: 0,
+                    byte_end: 0,
+                    sha256: "fixture".to_string(),
+                },
+                unsupported_record: false,
+            },
+            CanonicalRecord {
+                session_id: SESSION_ID.to_string(),
+                provider_name: PROVIDER.to_string(),
+                turn_id: "new-assistant".to_string(),
+                role: "assistant".to_string(),
+                timestamp: "2026-04-17T08:00:01Z".to_string(),
+                content: vec![ContentChunk {
+                    r#type: "text".to_string(),
+                    text: Some("replacement assistant body".to_string()),
+                }],
+                source: RecordSource {
+                    storage_type: "codex_session".to_string(),
+                    jsonl_path: jsonl_path.to_path_buf(),
+                    line: 3,
+                    byte_start: 0,
+                    byte_end: 0,
+                    sha256: "fixture".to_string(),
+                },
+                unsupported_record: false,
+            },
+        ]
+    }
+
+    #[test]
+    fn import_replace_round_trips_canonical_content_into_session_turn_bodies() {
+        // risk: atomic-transaction regression; level: particular-integration; source: contract §4 T9 / proposal A4.
+        let dir = tempfile::tempdir().unwrap();
+        let config_home = dir.path().join("config");
+        let data_home = dir.path().join("data");
+        let app_dir = config_home.join("oulipoly-agent-runner");
+        let models_dir = app_dir.join("models");
+        let codex_sessions = dir.path().join("codex-sessions");
+        let workspace = dir.path().join("workspace");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::create_dir_all(&codex_sessions).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        let jsonl_path = codex_sessions.join("rollout-2026-04-17.jsonl");
+        fs::write(
+            &jsonl_path,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{SESSION_ID}\",\"cwd\":\"{}\"}}}}\n\
+                 {{\"type\":\"response_item\",\"timestamp\":\"2026-04-17T08:00:00Z\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"old user\"}}]}}}}\n\
+                 {{\"type\":\"response_item\",\"timestamp\":\"2026-04-17T08:00:01Z\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"old assistant\"}}]}}}}\n",
+                workspace.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            models_dir.join(format!("{MODEL}.toml")),
+            format!("[[providers]]\nname = \"{PROVIDER}\"\n"),
+        )
+        .unwrap();
+        fs::write(
+            app_dir.join("providers.toml"),
+            format!(
+                r#"[{PROVIDER}]
+command = "codex"
+args = []
+prompt_mode = "arg"
+
+[{PROVIDER}.resume]
+kind = "subcommand"
+subcommand = ["resume"]
+
+[{PROVIDER}.session_storage]
+kind = "codex"
+sessions_dir = "{}"
+"#,
+                codex_sessions.display()
+            ),
+        )
+        .unwrap();
+        let locator_path = dir.path().join("locator.sh");
+        write_script(
+            &locator_path,
+            &format!("printf '%s\\n' {}", sh_path(&jsonl_path)),
+        );
+        fs::write(
+            app_dir.join("sessions.toml"),
+            format!(
+                "[{PROVIDER}]\nturn_script = \"true\"\ntranscript_locator = {:?}\nstate_dir = {:?}\n",
+                locator_path.to_string_lossy(),
+                dir.path().join("locator-state").to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        with_homes(&config_home, &data_home, || {
+            let db = StateDb::open_default().unwrap();
+            db.connection()
+                .execute(
+                    "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
+                     VALUES (?1, '2026-04-17T08:00:00Z', '2026-04-17T08:00:01Z', ?2)",
+                    params![CHAIN_ID, MODEL],
+                )
+                .unwrap();
+            db.connection()
+                .execute(
+                    "INSERT INTO session_chain_segments
+                        (chain_id, provider_name, session_id, started_at, last_turn_id, transition_reason)
+                     VALUES (?1, ?2, ?3, '2026-04-17T08:00:00Z', 'old-assistant', 'initial')",
+                    params![CHAIN_ID, PROVIDER, SESSION_ID],
+                )
+                .unwrap();
+            for (turn_id, role) in [("old-user", "user"), ("old-assistant", "assistant")] {
+                db.connection()
+                    .execute(
+                        "INSERT INTO session_turns
+                            (provider_name, session_id, turn_id, timestamp, role,
+                             parent_turn_id, is_sidechain, is_compaction_boundary, source_file, ingested_at)
+                         VALUES (?1, ?2, ?3, '2026-04-17T08:00:00Z', ?4, NULL, 0, 0, ?5, '2026-04-17T08:00:00Z')",
+                        params![PROVIDER, SESSION_ID, turn_id, role, jsonl_path.to_string_lossy()],
+                    )
+                    .unwrap();
+            }
+
+            let records = replacement_records(&jsonl_path);
+            let input = canonical_jsonl_bytes(&records).unwrap();
+            let receipt = run_import_replace_bytes(SESSION_ID, &input, None).unwrap();
+
+            assert!(receipt.state_updated);
+            assert_eq!(receipt.session_id, SESSION_ID);
+            assert_eq!(receipt.provider_name, PROVIDER);
+            let rows = db
+                .connection()
+                .prepare(
+                    "SELECT turn_id, body FROM session_turns
+                     WHERE provider_name = ?1 AND session_id = ?2
+                     ORDER BY timestamp, id",
+                )
+                .unwrap()
+                .query_map(params![PROVIDER, SESSION_ID], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].0, "new-user");
+            assert_eq!(
+                rows[0].1,
+                serde_json::to_string(&records[0].content).unwrap()
+            );
+            assert_eq!(rows[1].0, "new-assistant");
+            assert_eq!(
+                rows[1].1,
+                serde_json::to_string(&records[1].content).unwrap()
+            );
+        });
+    }
 }

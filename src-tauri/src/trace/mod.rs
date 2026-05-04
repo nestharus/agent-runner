@@ -5,6 +5,7 @@
 //! and exposes a structured JSON shape for machine consumers.
 
 use crate::config::SessionsConfig;
+use crate::session_export::ContentChunk;
 use crate::session_metadata::TranscriptState;
 use crate::sessions::locate_transcript;
 use crate::state::{InvocationRecord, StateDb};
@@ -35,7 +36,7 @@ pub struct TraceNode {
     pub invocation: TraceInvocation,
     pub session: TraceSession,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub transcript: Option<()>,
+    pub transcript: Option<Vec<TraceTranscriptTurn>>,
     pub warnings: Vec<String>,
     pub children: Vec<TraceNode>,
     #[serde(skip)]
@@ -69,6 +70,23 @@ pub struct TraceSession {
     pub sidechain_turn_count: Option<u64>,
     pub resume_acceptance: Option<String>,
     pub resume_acceptance_evidence: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TraceTranscriptTurn {
+    pub turn_id: String,
+    pub role: String,
+    pub timestamp: String,
+    pub body_state: TraceBodyState,
+    pub content: Option<Vec<ContentChunk>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceBodyState {
+    Stored,
+    Missing,
+    Invalid,
 }
 
 #[derive(Debug, Clone)]
@@ -141,6 +159,17 @@ fn build_trace_node(
     visited: &mut HashSet<i64>,
 ) -> Result<TraceNode, String> {
     let (session, mut node_warnings) = build_trace_session(db, &record, sessions_cfg)?;
+    let transcript = if options.inline_transcript {
+        match read_inline_transcript(db, record.provider_name.as_deref(), session.id.as_deref()) {
+            Ok(turns) => Some(turns),
+            Err(err) => {
+                node_warnings.push(err);
+                Some(Vec::new())
+            }
+        }
+    } else {
+        None
+    };
     let mut node = TraceNode {
         invocation: TraceInvocation {
             row_id: record.id,
@@ -156,7 +185,7 @@ fn build_trace_node(
             finished_at: record.finished_at,
         },
         session,
-        transcript: options.inline_transcript.then_some(()),
+        transcript,
         warnings: std::mem::take(&mut node_warnings),
         children: Vec::new(),
         ascii_leaves: Vec::new(),
@@ -199,6 +228,56 @@ fn build_trace_node(
     }
 
     Ok(node)
+}
+
+fn read_inline_transcript(
+    db: &StateDb,
+    provider_name: Option<&str>,
+    session_id: Option<&str>,
+) -> Result<Vec<TraceTranscriptTurn>, String> {
+    let (Some(provider_name), Some(session_id)) = (provider_name, session_id) else {
+        return Ok(Vec::new());
+    };
+    let mut stmt = db
+        .connection()
+        .prepare(
+            "SELECT turn_id, timestamp, role, body
+             FROM session_turns
+             WHERE provider_name = ?1 AND session_id = ?2
+             ORDER BY timestamp, id",
+        )
+        .map_err(|e| format!("failed to prepare inline transcript query: {e}"))?;
+    let rows = stmt
+        .query_map(rusqlite::params![provider_name, session_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .map_err(|e| format!("failed to query inline transcript rows: {e}"))?;
+
+    let mut turns = Vec::new();
+    for row in rows {
+        let (turn_id, timestamp, role, body) =
+            row.map_err(|e| format!("failed to read inline transcript row: {e}"))?;
+        let (body_state, content) = match body {
+            Some(body) => match serde_json::from_str::<Vec<ContentChunk>>(&body) {
+                Ok(content) => (TraceBodyState::Stored, Some(content)),
+                Err(_) => (TraceBodyState::Invalid, None),
+            },
+            None => (TraceBodyState::Missing, None),
+        };
+        turns.push(TraceTranscriptTurn {
+            turn_id,
+            role,
+            timestamp,
+            body_state,
+            content,
+        });
+    }
+    Ok(turns)
 }
 
 fn build_trace_session(
@@ -426,12 +505,12 @@ fn format_ascii_node(node: &TraceNode) -> String {
 mod tests {
     use super::*;
     use crate::state::{SessionTurnIngest, StateDb};
+    use crate::test_support::env_lock;
     use chrono::{DateTime, Utc};
     use rusqlite::{Connection, params};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
-    use std::sync::{Mutex, OnceLock};
 
     const ROOT_UUID: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
     const CHILD_ALPHA_UUID: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
@@ -563,11 +642,6 @@ mod tests {
         }
     }
 
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
     fn write_sessions_config(config_home: &std::path::Path, body: &str) {
         let app_dir = config_home.join("oulipoly-agent-runner");
         fs::create_dir_all(&app_dir).unwrap();
@@ -626,6 +700,7 @@ mod tests {
                     parent_turn_id: None,
                     is_sidechain: false,
                     is_compaction_boundary: false,
+                    body: None,
                 },
                 SessionTurnIngest {
                     session_id: "5169694d-de0f-40d1-890c-6e28e55bab27".to_string(),
@@ -637,6 +712,7 @@ mod tests {
                     parent_turn_id: Some("root-turn".to_string()),
                     is_sidechain: false,
                     is_compaction_boundary: false,
+                    body: None,
                 },
                 SessionTurnIngest {
                     session_id: "5169694d-de0f-40d1-890c-6e28e55bab27".to_string(),
@@ -648,6 +724,7 @@ mod tests {
                     parent_turn_id: Some("assistant-main".to_string()),
                     is_sidechain: true,
                     is_compaction_boundary: false,
+                    body: None,
                 },
             ],
         );
@@ -1044,8 +1121,45 @@ transcript_locator = "{}"
     }
 
     #[test]
-    fn inline_transcript_adds_null_field_to_each_json_node() {
+    fn inline_transcript_reports_mixed_body_states_and_empty_arrays() {
+        // risk: mixed-state regression; level: component; source: contract §4 T10 / proposal A6.
         let fixture = TraceFixture::new(&base_rows());
+        fixture.set_session_capture(
+            1,
+            Some("5169694d-de0f-40d1-890c-6e28e55bab27"),
+            Some("forced_flag_verified"),
+        );
+        fixture.ingest_session_turns(
+            "fixture-provider",
+            &[
+                SessionTurnIngest {
+                    session_id: "5169694d-de0f-40d1-890c-6e28e55bab27".to_string(),
+                    turn_id: "legacy-turn".to_string(),
+                    timestamp: DateTime::parse_from_rfc3339("2026-04-17T08:00:00Z")
+                        .unwrap()
+                        .with_timezone(&Utc),
+                    role: "user".to_string(),
+                    parent_turn_id: None,
+                    is_sidechain: false,
+                    is_compaction_boundary: false,
+                    body: None,
+                },
+                SessionTurnIngest {
+                    session_id: "5169694d-de0f-40d1-890c-6e28e55bab27".to_string(),
+                    turn_id: "body-turn".to_string(),
+                    timestamp: DateTime::parse_from_rfc3339("2026-04-17T08:00:01Z")
+                        .unwrap()
+                        .with_timezone(&Utc),
+                    role: "assistant".to_string(),
+                    parent_turn_id: Some("legacy-turn".to_string()),
+                    is_sidechain: false,
+                    is_compaction_boundary: false,
+                    body: Some(
+                        r#"[{"type":"text","text":"db stored assistant body"}]"#.to_string(),
+                    ),
+                },
+            ],
+        );
         let db = fixture.db();
 
         let report = trace_invocation(
@@ -1061,9 +1175,28 @@ transcript_locator = "{}"
         .unwrap();
         let json = serde_json::to_value(&report).unwrap();
 
-        assert!(json["root"]["transcript"].is_null());
-        assert!(json["root"]["children"][0]["transcript"].is_null());
-        assert!(json["root"]["children"][0]["children"][0]["transcript"].is_null());
+        let transcript = json["root"]["transcript"].as_array().unwrap();
+        assert!(transcript.iter().any(|turn| {
+            turn["turn_id"] == "legacy-turn"
+                && turn["role"] == "user"
+                && turn["body_state"] == "missing"
+                && turn["content"].is_null()
+        }));
+        assert!(transcript.iter().any(|turn| {
+            turn["turn_id"] == "body-turn"
+                && turn["role"] == "assistant"
+                && turn["body_state"] == "stored"
+                && turn["content"]
+                    == serde_json::json!([{"type":"text","text":"db stored assistant body"}])
+        }));
+        assert_eq!(
+            json["root"]["children"][0]["transcript"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0,
+            "inline transcript nodes with zero session_turns rows use an empty array"
+        );
     }
 
     #[test]
@@ -1254,6 +1387,7 @@ transcript_locator = "{}"
                     parent_turn_id: None,
                     is_sidechain: false,
                     is_compaction_boundary: false,
+                    body: None,
                 },
                 SessionTurnIngest {
                     session_id: "5169694d-de0f-40d1-890c-6e28e55bab27".to_string(),
@@ -1265,6 +1399,7 @@ transcript_locator = "{}"
                     parent_turn_id: Some("root-turn".to_string()),
                     is_sidechain: false,
                     is_compaction_boundary: false,
+                    body: None,
                 },
                 SessionTurnIngest {
                     session_id: "5169694d-de0f-40d1-890c-6e28e55bab27".to_string(),
@@ -1276,6 +1411,7 @@ transcript_locator = "{}"
                     parent_turn_id: Some("assistant-main".to_string()),
                     is_sidechain: true,
                     is_compaction_boundary: false,
+                    body: None,
                 },
             ],
         );

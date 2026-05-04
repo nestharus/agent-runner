@@ -317,6 +317,7 @@ projects_dir = "{}"
                 parent_turn_id: None,
                 is_sidechain: false,
                 is_compaction_boundary: false,
+                body: None,
             })
             .collect();
         db.ingest_session_turns_batch(provider_name, &turns)
