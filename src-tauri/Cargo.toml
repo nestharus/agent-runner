@@ -1,33 +1,44 @@
 [package]
 name = "oulipoly-agent-runner"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 
 [lib]
 name = "agent_runner_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[[bin]]
+name = "oulipoly-agent-runner"
+path = "src/main.rs"
+
 [dependencies]
-clap = { version = "4", features = ["derive"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
-toml = "1"
-serde_yml = "0.0.12"
-rusqlite = { version = "0.38", features = ["bundled"] }
-dirs = "6"
-tempfile = "3"
-fs4 = { version = "1.1", default-features = false, features = ["sync"] }
-uuid = { version = "1", features = ["v4"] }
-chrono = { version = "0.4", features = ["serde"] }
-regex = "1"
-libc = "0.2"
-signal-hook = "0.3"
-tauri = { version = "2", features = ["devtools"] }
-tokio = { version = "1", features = ["sync"] }
-getrandom = "0.2"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono.workspace = true
+clap.workspace = true
+dirs.workspace = true
+oulipoly-config = { path = "../crates/oulipoly-config" }
+oulipoly-core = { path = "../crates/oulipoly-core" }
+oulipoly-runtime = { path = "../crates/oulipoly-runtime" }
+oulipoly-setup = { path = "../crates/oulipoly-setup" }
+oulipoly-state = { path = "../crates/oulipoly-state" }
+serde.workspace = true
+serde_json.workspace = true
+tauri.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build.workspace = true
+
+[dev-dependencies]
+regex.workspace = true
+rusqlite.workspace = true
+serde_yml.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+
+[lints.clippy]
+bool-assert-comparison = "allow"
+filter-map-bool-then = "allow"

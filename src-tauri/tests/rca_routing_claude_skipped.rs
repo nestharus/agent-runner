@@ -1,6 +1,6 @@
-use agent_runner_lib::balancer::select_provider;
-use agent_runner_lib::config::{ModelConfig, PromptMode, ProviderConfig};
-use agent_runner_lib::state::{InvocationStart, StateDb};
+use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig};
+use oulipoly_runtime::balancer::select_provider;
+use oulipoly_state::{InvocationStart, StateDb};
 use std::path::Path;
 use uuid::Uuid;
 

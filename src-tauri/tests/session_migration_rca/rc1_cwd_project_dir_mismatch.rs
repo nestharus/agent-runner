@@ -1,7 +1,7 @@
 use super::*;
-use agent_runner_lib::balancer::TransitionReason;
-use agent_runner_lib::executor::cli::{ResumePayload, execute_resume};
-use agent_runner_lib::migration::migrate_chain_segment;
+use oulipoly_runtime::balancer::TransitionReason;
+use oulipoly_runtime::executor::cli::{ResumePayload, execute_resume};
+use oulipoly_runtime::migration::migrate_chain_segment;
 
 /// RC-1 reproduction: after migration, the target provider must be able to
 /// honor the resumed session from the actual spawn cwd. This fails pre-fix

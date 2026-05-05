@@ -1,4 +1,4 @@
-use agent_runner_lib::session_lock::{LockError, SessionLock};
+use oulipoly_runtime::session_lock::{LockError, SessionLock};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};

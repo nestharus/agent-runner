@@ -1,6 +1,6 @@
 use super::{PROVIDER, RcaFixture, SESSION_ID};
-use agent_runner_lib::config::{SessionSourceEntry, SessionsConfig};
-use agent_runner_lib::sessions::scan_provider;
+use oulipoly_config::{SessionSourceEntry, SessionsConfig};
+use oulipoly_runtime::sessions::scan_provider;
 use std::collections::HashMap;
 
 /// RC-2 — the turn-script ingest boundary accepts only summary fields and drops

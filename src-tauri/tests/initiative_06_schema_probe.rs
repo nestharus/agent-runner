@@ -2,8 +2,8 @@
 
 mod fixtures;
 
-use agent_runner_lib::state::{ReadOnlyOpenError, StateDb};
 use fixtures::initiative_06_schema_probe::*;
+use oulipoly_state::{ReadOnlyOpenError, StateDb};
 
 /// Risk: T1 — Schema-probe success on current-schema DB returns full JSON with `compatible: true`, `safe_for_import_replace` per features.
 /// Level: particular-integration.

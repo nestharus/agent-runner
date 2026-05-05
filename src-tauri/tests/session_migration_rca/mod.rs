@@ -1,8 +1,8 @@
-use agent_runner_lib::config::{
+use oulipoly_config::{
     ModelConfig, PromptMode, ProviderConfig, ResumeKind, ResumeStrategy, SessionStorage,
     SessionsConfig,
 };
-use agent_runner_lib::state::{InvocationStart, ModelStore, ResolvedResume, StateDb};
+use oulipoly_state::{InvocationStart, ModelStore, ResolvedResume, StateDb};
 use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;

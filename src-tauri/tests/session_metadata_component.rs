@@ -2,10 +2,10 @@
 
 mod fixtures;
 
-use agent_runner_lib::session_metadata::{
+use fixtures::initiative_06::*;
+use oulipoly_runtime::session_metadata::{
     MetadataError, SessionMetadata, SessionStorageType, locate_session_metadata,
 };
-use fixtures::initiative_06::*;
 use serde_json::Value;
 use std::path::Path;
 

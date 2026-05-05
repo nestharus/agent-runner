@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use agent_runner_lib::state::{CompositeInvocationId, InvocationStatus, StateDb};
+use oulipoly_state::{CompositeInvocationId, InvocationStatus, StateDb};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;

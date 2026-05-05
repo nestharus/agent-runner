@@ -15,7 +15,7 @@ within structure, mathematical elegance, playful geometry.
 
 | Layer | Tech | Notes |
 |-------|------|-------|
-| Backend | Rust + Tauri v2 | `src-tauri/` — state DB, CLI detection, setup agent, model discovery |
+| Backend | Rust + Tauri v2 | `src-tauri/` client + `crates/oulipoly-*` internal libs for state, setup, config, discovery, runtime |
 | Frontend | SolidJS + TypeScript | `src/` — reactive UI with signals |
 | Components | Ark UI (headless) | Dialog, Field, Steps, Progress, Popover, Switch, Checkbox |
 | Styling | Tailwind CSS v4 | `@theme` tokens in `src/app.css`, `tailwind-variants` for component styles |
@@ -147,7 +147,8 @@ execution. Only the extracted provider name is used for pool grouping
 (`derive_pools` in `lib.rs`) and display (`PoolCard.tsx`).
 
 Parsing is handled by `shell_split()` and `provider_name()` in
-`src-tauri/src/executor/cli.rs`.
+`crates/oulipoly-runtime/src/executor/cli.rs`; config-side provider
+derivation remains in `crates/oulipoly-config/src/model.rs`.
 
 ## Design Workflow
 
@@ -266,23 +267,20 @@ cargo tauri build        # Full app build
 bunx playwright test e2e/screenshots.spec.ts  # Generate screenshot catalog
 ```
 
-## Tauri Backend Structure
+## Rust Workspace Structure
 
 ```
+Cargo.toml                  # Workspace manifest
+crates/
+├── oulipoly-core/          # Shared leaf types
+├── oulipoly-config/        # Model, provider, agent, and session config
+├── oulipoly-state/         # SQLite state DB + schema probe
+├── oulipoly-runtime/       # Balancer, executor, discovery, sessions, quota, trace
+└── oulipoly-setup/         # Setup agent, detection, memory, schemas, sync
 src-tauri/src/
 ├── main.rs              # Entry point + CLI arg parsing (-m, -i, -f, -p)
 ├── lib.rs               # Tauri command handlers (IPC bridge)
-├── config/              # Model + agent config (TOML files)
-│   ├── model.rs         # ModelConfig, InputDef, InputType, TOML parsing
-│   └── agent.rs         # AgentConfig
-├── state/               # SQLite state DB (invocations, health, accounts)
-├── setup/               # CLI detection, setup wizard agent, memory
-├── discovery/           # Model discovery pipeline
-├── balancer/            # Load balancing across providers
-├── executor/            # CLI execution engine
-│   ├── mod.rs           # ExecutionResult, dispatch (execute / execute_with_inputs)
-│   └── cli.rs           # Flag resolution, input validation, subprocess execution
-└── diagnostics/         # Error classification (LLM + heuristic fallback)
+└── setup/flow.rs        # Tauri channel setup orchestration
 ```
 
 ## E2E Test Infrastructure

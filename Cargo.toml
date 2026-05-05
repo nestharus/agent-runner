@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "src-tauri",
+    "crates/oulipoly-core",
+    "crates/oulipoly-config",
+    "crates/oulipoly-state",
+    "crates/oulipoly-runtime",
+    "crates/oulipoly-setup",
+]
+default-members = [
+    "src-tauri",
+    "crates/oulipoly-core",
+    "crates/oulipoly-config",
+    "crates/oulipoly-state",
+    "crates/oulipoly-runtime",
+    "crates/oulipoly-setup",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+
+[workspace.dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+fs4 = { version = "1.1", default-features = false, features = ["sync"] }
+getrandom = "0.2"
+libc = "0.2"
+regex = "1"
+rusqlite = { version = "0.38", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yml = "0.0.12"
+sha2 = "0.10"
+signal-hook = "0.3"
+tauri = { version = "2", features = ["devtools"] }
+tauri-build = { version = "2", features = [] }
+tempfile = "3"
+tokio = { version = "1", features = ["sync"] }
+toml = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }

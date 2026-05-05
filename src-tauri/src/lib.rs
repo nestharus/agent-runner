@@ -1,37 +1,15 @@
-pub mod balancer;
-pub mod config;
-pub mod diagnostics;
-pub mod discovery;
-pub mod executor;
-pub mod migration;
-pub mod quota;
-pub mod schema_probe;
-pub mod session_export;
-pub mod session_lock;
-pub mod session_metadata;
-pub mod session_replace;
-pub mod sessions;
 pub mod setup;
-pub mod state;
-pub mod trace;
 
-#[cfg(test)]
-pub(crate) mod test_support {
-    use std::sync::{Mutex, OnceLock};
-
-    pub(crate) fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-}
-
-use config::ModelConfig;
+use oulipoly_config as config;
+use oulipoly_config::ModelConfig;
+use oulipoly_runtime::{balancer, diagnostics, discovery, executor, quota};
+use oulipoly_setup as setup_core;
+use oulipoly_setup::actions::{SetupEvent, UserResponse};
+use oulipoly_state as state;
+use oulipoly_state::StateDb;
+use oulipoly_state::{AccountRecord, AuthMethod, AuthStatus, CliProviderRecord};
+use oulipoly_state::{DiscoveredModel, ModelParameter};
 use serde::{Deserialize, Serialize};
-use setup::actions::{SetupEvent, UserResponse};
-#[allow(unused_imports)]
-use state::StateDb;
-use state::{AccountRecord, AuthMethod, AuthStatus, CliProviderRecord};
-use state::{DiscoveredModel, ModelParameter};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -129,7 +107,7 @@ async fn start_setup(
         .join("state.db");
 
     tauri::async_runtime::spawn(async move {
-        let memory = match setup::memory::MemoryGraph::open(&db_path) {
+        let memory = match setup_core::memory::MemoryGraph::open(&db_path) {
             Ok(m) => m,
             Err(e) => {
                 let _ = on_event.send(SetupEvent::Error {
@@ -188,7 +166,7 @@ async fn start_cli_setup(
     let cli = cli_name.clone();
 
     tauri::async_runtime::spawn(async move {
-        let memory = match setup::memory::MemoryGraph::open(&db_path) {
+        let memory = match setup_core::memory::MemoryGraph::open(&db_path) {
             Ok(m) => m,
             Err(e) => {
                 let _ = on_event.send(SetupEvent::Error {
@@ -215,20 +193,20 @@ fn reload_models(state: tauri::State<AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn detect_clis() -> Result<setup::detection::DetectionReport, String> {
-    Ok(setup::detection::detect_all())
+fn detect_clis() -> Result<setup_core::detection::DetectionReport, String> {
+    Ok(setup_core::detection::detect_all())
 }
 
 #[tauri::command]
 fn get_memory_graph(
     state: tauri::State<AppState>,
-) -> Result<setup::memory::MemorySnapshot, String> {
+) -> Result<setup_core::memory::MemorySnapshot, String> {
     let db_path = state
         .models_dir
         .parent()
         .unwrap_or(&state.models_dir)
         .join("state.db");
-    let graph = setup::memory::MemoryGraph::open(&db_path)?;
+    let graph = setup_core::memory::MemoryGraph::open(&db_path)?;
     graph.snapshot()
 }
 
@@ -632,7 +610,7 @@ fn sync_provider(
     cli_name: String,
 ) -> Result<CliProviderRecord, String> {
     // Detect the current state of this CLI using the existing detection module
-    let cli_info = setup::detection::detect_single_cli(&cli_name);
+    let cli_info = setup_core::detection::detect_single_cli(&cli_name);
 
     let display_name = match cli_name.as_str() {
         "claude" => "Anthropic",

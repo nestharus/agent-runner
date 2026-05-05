@@ -2,10 +2,10 @@
 
 mod fixtures;
 
-use agent_runner_lib::config::{ProvidersConfig, SessionsConfig, load_models};
-use agent_runner_lib::session_lock::{self, LockError, SessionLock};
-use agent_runner_lib::session_metadata::locate_session_metadata;
 use fixtures::initiative_06_import_replace::*;
+use oulipoly_config::{ProvidersConfig, SessionsConfig, load_models};
+use oulipoly_runtime::session_lock::{self, LockError, SessionLock};
+use oulipoly_runtime::session_metadata::locate_session_metadata;
 use rusqlite::params;
 use std::thread;
 use std::time::Duration;
