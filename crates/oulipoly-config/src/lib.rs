@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod app;
 pub mod model;
 pub mod providers;
 pub mod sessions;

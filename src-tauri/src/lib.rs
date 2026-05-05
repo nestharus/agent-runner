@@ -16,6 +16,17 @@ use std::sync::Mutex;
 use tauri::ipc::Channel;
 use tokio::sync::mpsc;
 
+pub type AppConfig = oulipoly_config::app::AppConfig;
+
+pub fn load_app_config() -> AppConfig {
+    let config_dir = dirs::config_dir()
+        .map(|d| d.join("oulipoly-agent-runner"))
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let config_path = config_dir.join("config.toml");
+    oulipoly_config::app::AppConfig::load(&config_path).unwrap_or_default()
+}
+
 #[derive(Serialize, Clone)]
 pub struct TestModelResult {
     pub success: bool,
