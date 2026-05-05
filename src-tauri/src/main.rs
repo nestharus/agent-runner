@@ -1,3 +1,4 @@
+use agent_runner_lib::load_app_config;
 use oulipoly_config::{
     AgentConfig, ModelConfig, PromptMode, ProviderConfig, ProvidersConfig, load_agent_file,
     load_agents, load_models,
@@ -221,34 +222,6 @@ enum SessionSubcommands {
         #[arg(long = "preimage-sha256")]
         preimage_sha256: Option<String>,
     },
-}
-
-#[derive(Debug)]
-struct AppConfig {
-    diagnostics_model: Option<String>,
-}
-
-fn load_app_config() -> AppConfig {
-    let config_dir = dirs::config_dir()
-        .map(|d| d.join("oulipoly-agent-runner"))
-        .unwrap_or_else(|| PathBuf::from("."));
-
-    let config_path = config_dir.join("config.toml");
-
-    if let Ok(content) = std::fs::read_to_string(&config_path)
-        && let Ok(table) = content.parse::<toml::Table>()
-    {
-        return AppConfig {
-            diagnostics_model: table
-                .get("diagnostics_model")
-                .and_then(|v| v.as_str())
-                .map(String::from),
-        };
-    }
-
-    AppConfig {
-        diagnostics_model: None,
-    }
 }
 
 /// Parse --input key=value flags into a map (repeated keys become arrays).

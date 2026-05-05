@@ -16,6 +16,34 @@ use std::sync::Mutex;
 use tauri::ipc::Channel;
 use tokio::sync::mpsc;
 
+#[derive(Debug)]
+pub struct AppConfig {
+    pub diagnostics_model: Option<String>,
+}
+
+pub fn load_app_config() -> AppConfig {
+    let config_dir = dirs::config_dir()
+        .map(|d| d.join("oulipoly-agent-runner"))
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let config_path = config_dir.join("config.toml");
+
+    if let Ok(content) = std::fs::read_to_string(&config_path)
+        && let Ok(table) = content.parse::<toml::Table>()
+    {
+        return AppConfig {
+            diagnostics_model: table
+                .get("diagnostics_model")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+        };
+    }
+
+    AppConfig {
+        diagnostics_model: None,
+    }
+}
+
 #[derive(Serialize, Clone)]
 pub struct TestModelResult {
     pub success: bool,
