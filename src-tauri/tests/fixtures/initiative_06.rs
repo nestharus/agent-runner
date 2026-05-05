@@ -1,11 +1,11 @@
 #![cfg(unix)]
 #![allow(dead_code)]
 
-use agent_runner_lib::config::{
+use chrono::{Duration, Utc};
+use oulipoly_config::{
     ModelConfig, PromptMode, ProviderConfig, ProvidersConfig, SessionStorage, SessionsConfig,
 };
-use agent_runner_lib::state::{ModelStore, StateDb};
-use chrono::{Duration, Utc};
+use oulipoly_state::{ModelStore, StateDb};
 use rusqlite::{Connection, params};
 use serde_json::Value;
 use std::collections::HashMap;

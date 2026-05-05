@@ -1,0 +1,23 @@
+[package]
+name = "oulipoly-state"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "oulipoly_state"
+
+[features]
+test-support = []
+
+[dependencies]
+chrono.workspace = true
+dirs.workspace = true
+oulipoly-config = { path = "../oulipoly-config" }
+oulipoly-core = { path = "../oulipoly-core" }
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

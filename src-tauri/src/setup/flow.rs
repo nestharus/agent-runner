@@ -1,10 +1,10 @@
-use super::actions::{AgentAction, ResultContent, SetupEvent, UserResponse};
-use super::agent::SetupAgent;
-use super::context;
-use super::detection;
-use super::memory::MemoryGraph;
-use super::schemas::AGENT_TURN_SCHEMA;
-use super::sync;
+use oulipoly_setup::actions::{AgentAction, ResultContent, SetupEvent, UserResponse};
+use oulipoly_setup::agent::SetupAgent;
+use oulipoly_setup::context;
+use oulipoly_setup::detection;
+use oulipoly_setup::memory::MemoryGraph;
+use oulipoly_setup::schemas::AGENT_TURN_SCHEMA;
+use oulipoly_setup::sync;
 use tauri::ipc::Channel;
 use tokio::sync::mpsc;
 
@@ -67,7 +67,7 @@ impl SetupFlow {
         if !claude_available {
             // Phase A: Static bootstrap — no agent available
             let _ = self.channel.send(SetupEvent::NeedInput {
-                action: super::actions::Action::OauthFlow {
+                action: oulipoly_setup::actions::Action::OauthFlow {
                     provider: "claude".into(),
                     login_command: "claude login".into(),
                     instructions: get_install_instructions(),

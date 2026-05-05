@@ -1,0 +1,10 @@
+[package]
+name = "oulipoly-core"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "oulipoly_core"
+
+[dependencies]
+serde.workspace = true

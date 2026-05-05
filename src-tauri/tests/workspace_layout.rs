@@ -1,0 +1,277 @@
+use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+const WORKSPACE_MEMBERS: &[&str] = &[
+    "src-tauri",
+    "crates/oulipoly-core",
+    "crates/oulipoly-config",
+    "crates/oulipoly-state",
+    "crates/oulipoly-runtime",
+    "crates/oulipoly-setup",
+];
+
+const LIB_CRATES: &[&str] = &[
+    "oulipoly-core",
+    "oulipoly-config",
+    "oulipoly-state",
+    "oulipoly-runtime",
+    "oulipoly-setup",
+];
+
+const EXPECTED_EDGES: &[(&str, &str)] = &[
+    ("src-tauri", "oulipoly-runtime"),
+    ("src-tauri", "oulipoly-setup"),
+    ("src-tauri", "oulipoly-state"),
+    ("src-tauri", "oulipoly-config"),
+    ("src-tauri", "oulipoly-core"),
+    ("oulipoly-runtime", "oulipoly-state"),
+    ("oulipoly-runtime", "oulipoly-config"),
+    ("oulipoly-runtime", "oulipoly-core"),
+    ("oulipoly-state", "oulipoly-config"),
+    ("oulipoly-state", "oulipoly-core"),
+];
+
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("src-tauri manifest should have a parent repo root")
+        .to_path_buf()
+}
+
+fn expected_members() -> BTreeSet<String> {
+    WORKSPACE_MEMBERS
+        .iter()
+        .map(|member| member.to_string())
+        .collect()
+}
+
+fn expected_edges() -> BTreeSet<(String, String)> {
+    EXPECTED_EDGES
+        .iter()
+        .map(|(dependent, dependency)| (dependent.to_string(), dependency.to_string()))
+        .collect()
+}
+
+fn metadata(root: &Path, args: &[&str]) -> Value {
+    let output = Command::new(env!("CARGO"))
+        .args(args)
+        .current_dir(root)
+        .output()
+        .expect("failed to execute cargo metadata");
+
+    assert!(
+        output.status.success(),
+        "cargo metadata failed with status {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    serde_json::from_slice(&output.stdout).expect("cargo metadata stdout should be JSON")
+}
+
+fn package_name(package: &Value) -> &str {
+    package
+        .get("name")
+        .and_then(Value::as_str)
+        .expect("metadata package should have a string name")
+}
+
+fn package_id(package: &Value) -> &str {
+    package
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("metadata package should have a string id")
+}
+
+fn edge_label(package_name: &str) -> String {
+    if package_name == "oulipoly-agent-runner" {
+        "src-tauri".to_string()
+    } else {
+        package_name.to_string()
+    }
+}
+
+fn workspace_edge_set(root: &Path) -> BTreeSet<(String, String)> {
+    let metadata = metadata(root, &["metadata", "--format-version", "1"]);
+    let workspace_ids: BTreeSet<&str> = metadata
+        .get("workspace_members")
+        .and_then(Value::as_array)
+        .expect("metadata should include workspace_members")
+        .iter()
+        .map(|id| id.as_str().expect("workspace member id should be a string"))
+        .collect();
+
+    let packages = metadata
+        .get("packages")
+        .and_then(Value::as_array)
+        .expect("metadata should include packages");
+
+    let workspace_names: BTreeSet<String> = packages
+        .iter()
+        .filter(|package| workspace_ids.contains(package_id(package)))
+        .map(|package| package_name(package).to_string())
+        .collect();
+
+    let mut edges = BTreeSet::new();
+
+    for package in packages
+        .iter()
+        .filter(|package| workspace_ids.contains(package_id(package)))
+    {
+        let dependent = edge_label(package_name(package));
+        let dependencies = package
+            .get("dependencies")
+            .and_then(Value::as_array)
+            .expect("metadata package should include dependencies");
+
+        for dependency in dependencies
+            .iter()
+            .filter(|dependency| dependency.get("path").is_some())
+        {
+            let dependency_name = dependency
+                .get("name")
+                .and_then(Value::as_str)
+                .expect("metadata dependency should have a string name");
+
+            if workspace_names.contains(dependency_name) {
+                edges.insert((dependent.clone(), dependency_name.to_string()));
+            }
+        }
+    }
+
+    edges
+}
+
+#[test]
+fn workspace_members_exact_set() {
+    let manifest_path = repo_root().join("Cargo.toml");
+    let manifest = std::fs::read_to_string(&manifest_path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", manifest_path.display()));
+    let parsed: toml::Value = toml::from_str(&manifest)
+        .unwrap_or_else(|error| panic!("failed to parse {}: {error}", manifest_path.display()));
+    let members: BTreeSet<String> = parsed
+        .get("workspace")
+        .and_then(|workspace| workspace.get("members"))
+        .and_then(toml::Value::as_array)
+        .expect("root Cargo.toml should define [workspace] members")
+        .iter()
+        .map(|member| {
+            member
+                .as_str()
+                .expect("workspace member should be a string")
+                .to_string()
+        })
+        .collect();
+
+    assert_eq!(members, expected_members());
+}
+
+#[test]
+fn lib_crates_resolve_via_metadata() {
+    let root = repo_root();
+
+    for crate_name in LIB_CRATES {
+        let manifest_path = root.join("crates").join(crate_name).join("Cargo.toml");
+        let manifest_arg = manifest_path.to_string_lossy().into_owned();
+        let metadata = metadata(
+            &root,
+            &[
+                "metadata",
+                "--format-version",
+                "1",
+                "--manifest-path",
+                &manifest_arg,
+                "--no-deps",
+            ],
+        );
+        let package = metadata
+            .get("packages")
+            .and_then(Value::as_array)
+            .and_then(|packages| packages.first())
+            .expect("cargo metadata --no-deps should include one package");
+
+        assert_eq!(package_name(package), *crate_name);
+    }
+}
+
+#[test]
+fn binary_target_resolves() {
+    let binary_path = Path::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+
+    assert!(
+        !binary_path.as_os_str().is_empty(),
+        "CARGO_BIN_EXE_oulipoly-agent-runner should be non-empty"
+    );
+    assert!(
+        binary_path
+            .components()
+            .any(|component| component.as_os_str() == "target"),
+        "binary path should resolve under target/: {}",
+        binary_path.display()
+    );
+    assert!(
+        binary_path.exists(),
+        "binary target should exist at test runtime: {}",
+        binary_path.display()
+    );
+}
+
+#[test]
+fn dep_graph_exact_match() {
+    let edges = workspace_edge_set(&repo_root());
+
+    assert_eq!(edges, expected_edges());
+}
+
+#[test]
+fn dep_graph_acyclic() {
+    let edges = workspace_edge_set(&repo_root());
+    let mut nodes = expected_members();
+
+    for (dependent, dependency) in &edges {
+        nodes.insert(dependent.clone());
+        nodes.insert(dependency.clone());
+    }
+
+    let mut outgoing: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut indegree: BTreeMap<String, usize> =
+        nodes.iter().map(|node| (node.clone(), 0)).collect();
+
+    for (dependent, dependency) in &edges {
+        outgoing
+            .entry(dependent.clone())
+            .or_default()
+            .insert(dependency.clone());
+        *indegree.entry(dependency.clone()).or_insert(0) += 1;
+    }
+
+    let mut ready: VecDeque<String> = indegree
+        .iter()
+        .filter_map(|(node, count)| (*count == 0).then(|| node.clone()))
+        .collect();
+    let mut visited = 0;
+
+    while let Some(node) = ready.pop_front() {
+        visited += 1;
+        if let Some(dependencies) = outgoing.get(&node) {
+            for dependency in dependencies {
+                let count = indegree
+                    .get_mut(dependency)
+                    .expect("dependency should have an indegree entry");
+                *count -= 1;
+                if *count == 0 {
+                    ready.push_back(dependency.clone());
+                }
+            }
+        }
+    }
+
+    assert_eq!(
+        visited,
+        nodes.len(),
+        "workspace dependency graph contains a cycle: {edges:?}"
+    );
+}

@@ -1,14 +1,14 @@
 #![cfg(unix)]
 
-use agent_runner_lib::balancer::TransitionReason;
-use agent_runner_lib::config::{
+use chrono::{DateTime, Utc};
+use oulipoly_config::{
     ModelConfig, PromptMode, ProviderConfig, ResumeKind, ResumeStrategy, SessionSourceEntry,
     SessionStorage, SessionsConfig,
 };
-use agent_runner_lib::migration::{MigrationError, migrate_chain_segment};
-use agent_runner_lib::sessions::scan_provider;
-use agent_runner_lib::state::{ResolvedResume, SessionTurnIngest, StateDb};
-use chrono::{DateTime, Utc};
+use oulipoly_runtime::balancer::TransitionReason;
+use oulipoly_runtime::migration::{MigrationError, migrate_chain_segment};
+use oulipoly_runtime::sessions::scan_provider;
+use oulipoly_state::{ResolvedResume, SessionTurnIngest, StateDb};
 use rusqlite::{Connection, params};
 use std::collections::HashMap;
 use std::fs;

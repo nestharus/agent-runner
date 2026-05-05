@@ -1,6 +1,6 @@
 use super::{INVOCATION_UUID, MODEL, PROVIDER, RcaFixture, SESSION_ID};
-use agent_runner_lib::state::InvocationStart;
-use agent_runner_lib::trace::{TraceOptions, trace_invocation};
+use oulipoly_runtime::trace::{TraceOptions, trace_invocation};
+use oulipoly_state::InvocationStart;
 
 /// RC-4 — `trace --json --inline-transcript` is a null placeholder and does
 /// not inline DB-stored turn bodies.

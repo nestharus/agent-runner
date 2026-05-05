@@ -232,12 +232,12 @@ revisited.
   supported-surface gate and Phase 5 hookpoint research. The
   in-repo evidence for Claude Code's Windows cwd-hashing rule
   is absent: there is only a Unix-shaped decoder
-  (`src-tauri/src/session_metadata/mod.rs::decode_claude_project_dir_candidates`)
+  (`crates/oulipoly-runtime/src/session_metadata/mod.rs::decode_claude_project_dir_candidates`)
   and three test-only encoders that replace forward slashes with
   dashes. WU-13-01 restored Windows release builds but did not
   define Claude path hashing.
 - **Decision**: The new helper
-  `src-tauri/src/migration/mod.rs::claude_project_dir_for`
+  `crates/oulipoly-runtime/src/migration/mod.rs::claude_project_dir_for`
   accepts an absolute Unix-style cwd and rejects any other shape
   (non-absolute, empty) via `MigrationError::SpawnCwdUnsupported`.
   Windows-style paths fall through to the same rejection in this
@@ -424,8 +424,8 @@ revisited.
   fixture behavior in the named files, or a sixth encoder-mirror
   site is discovered. The orchestrator-recommended discovery method
   for the latter is `rg "replace\('/', \"-\"\)"` over
-  `src-tauri/tests/` and `src-tauri/src/` after a future production
-  encoder change.
+  `src-tauri/tests/` and `crates/oulipoly-runtime/src/` after a future
+  production encoder change.
 - **Process-improvement watch signal**: Phase 5 hookpoint research
   for this WU misclassified two of the three additional mirror
   sites (`tests/initiative_05_migration.rs` and

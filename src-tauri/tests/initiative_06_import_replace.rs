@@ -2,11 +2,11 @@
 
 mod fixtures;
 
-use agent_runner_lib::session_replace::{
+use fixtures::initiative_06_import_replace::*;
+use oulipoly_runtime::session_replace::{
     CanonicalRecord, CanonicalToProviderRenderer, ClaudeCodeRenderer, CodexSessionRenderer,
     ReplaceError, ReplaceReceipt, run_import_replace,
 };
-use fixtures::initiative_06_import_replace::*;
 use rusqlite::Connection;
 use std::fs;
 

@@ -93,11 +93,18 @@ src/                          Frontend (SolidJS + TypeScript)
     ConfirmDialog.tsx          Confirmation prompts
     ResultDisplay.tsx          Detection/test result summaries
     NavBar.tsx                 Navigation tabs
-src-tauri/                    Rust backend (Tauri v2)
+Cargo.toml                    Rust workspace manifest
+crates/
+  oulipoly-core/              Shared leaf types
+  oulipoly-config/            Model/provider/agent/session config
+  oulipoly-state/             SQLite state DB + schema probe
+  oulipoly-runtime/           Executor, balancer, discovery, sessions, quota, trace
+  oulipoly-setup/             Setup agent, detection, memory, sync
+src-tauri/                    Tauri/headless client crate
   src/
-    main.rs                   Tauri entry point
+    main.rs                   CLI entry point
     lib.rs                    App builder + command registration
-    ...                       Detection, memory, sync modules
+    setup/flow.rs             Tauri channel setup orchestration
   Cargo.toml
   tauri.conf.json
 e2e/                          Playwright QA tests + screenshots

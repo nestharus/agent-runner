@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
-use agent_runner_lib::state::{CompositeInvocationId, SessionTurnIngest, StateDb};
 use chrono::{DateTime, Duration, Utc};
+use oulipoly_state::{CompositeInvocationId, SessionTurnIngest, StateDb};
 use rusqlite::{Connection, params};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;

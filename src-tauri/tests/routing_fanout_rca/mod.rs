@@ -1,10 +1,10 @@
-use agent_runner_lib::balancer::{BalanceContext, select_provider};
-use agent_runner_lib::config::{
+use chrono::{Duration, Utc};
+use oulipoly_config::{
     ModelConfig, PromptMode, ProviderConfig, ProviderEntry, ProvidersConfig, SessionsConfig,
 };
-use agent_runner_lib::quota::InFlight;
-use agent_runner_lib::state::{InvocationStart, QuotaWindowInput, SessionTurnIngest, StateDb};
-use chrono::{Duration, Utc};
+use oulipoly_runtime::balancer::{BalanceContext, select_provider};
+use oulipoly_runtime::quota::InFlight;
+use oulipoly_state::{InvocationStart, QuotaWindowInput, SessionTurnIngest, StateDb};
 use std::collections::HashMap;
 use std::path::Path;
 use uuid::Uuid;
