@@ -33,6 +33,15 @@ const EXPECTED_EDGES: &[(&str, &str)] = &[
     ("oulipoly-state", "oulipoly-core"),
 ];
 
+const GRAPH_NODES: &[&str] = &[
+    "src-tauri",
+    "oulipoly-core",
+    "oulipoly-config",
+    "oulipoly-state",
+    "oulipoly-runtime",
+    "oulipoly-setup",
+];
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -52,6 +61,10 @@ fn expected_edges() -> BTreeSet<(String, String)> {
         .iter()
         .map(|(dependent, dependency)| (dependent.to_string(), dependency.to_string()))
         .collect()
+}
+
+fn graph_nodes() -> BTreeSet<String> {
+    GRAPH_NODES.iter().map(|node| node.to_string()).collect()
 }
 
 fn metadata(root: &Path, args: &[&str]) -> Value {
@@ -172,28 +185,28 @@ fn workspace_members_exact_set() {
 #[test]
 fn lib_crates_resolve_via_metadata() {
     let root = repo_root();
+    let metadata = metadata(&root, &["metadata", "--format-version", "1", "--no-deps"]);
+    let packages = metadata
+        .get("packages")
+        .and_then(Value::as_array)
+        .expect("cargo metadata should include packages");
 
     for crate_name in LIB_CRATES {
-        let manifest_path = root.join("crates").join(crate_name).join("Cargo.toml");
-        let manifest_arg = manifest_path.to_string_lossy().into_owned();
-        let metadata = metadata(
-            &root,
-            &[
-                "metadata",
-                "--format-version",
-                "1",
-                "--manifest-path",
-                &manifest_arg,
-                "--no-deps",
-            ],
-        );
-        let package = metadata
-            .get("packages")
-            .and_then(Value::as_array)
-            .and_then(|packages| packages.first())
-            .expect("cargo metadata --no-deps should include one package");
+        let package = packages
+            .iter()
+            .find(|package| package_name(package) == *crate_name)
+            .unwrap_or_else(|| panic!("missing workspace package in metadata: {crate_name}"));
+        let manifest_path = package
+            .get("manifest_path")
+            .and_then(Value::as_str)
+            .expect("metadata package should include a manifest_path");
+        let expected_suffix = format!("/crates/{crate_name}/Cargo.toml");
 
         assert_eq!(package_name(package), *crate_name);
+        assert!(
+            manifest_path.ends_with(&expected_suffix),
+            "{crate_name} manifest_path should end with {expected_suffix}, got {manifest_path}"
+        );
     }
 }
 
@@ -229,7 +242,7 @@ fn dep_graph_exact_match() {
 #[test]
 fn dep_graph_acyclic() {
     let edges = workspace_edge_set(&repo_root());
-    let mut nodes = expected_members();
+    let mut nodes = graph_nodes();
 
     for (dependent, dependency) in &edges {
         nodes.insert(dependent.clone());
