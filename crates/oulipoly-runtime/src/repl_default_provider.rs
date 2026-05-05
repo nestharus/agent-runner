@@ -236,20 +236,20 @@ interactive_args = ["ok"]
     #[test]
     fn synthetic_carrier_name_format() {
         let temp = tempfile::tempdir().unwrap();
+        let state_path = temp.path().join("state.db");
+        StateDb::open(&state_path).unwrap();
         write_config(temp.path(), r#"default_provider = "claude""#);
         write_providers(temp.path(), &provider_fixture("claude"));
         let launcher = RecordingLauncher::default();
 
-        let error = run_repl_with_default_provider_with_launcher(
-            runtime_services(temp.path().to_path_buf()),
+        let code = run_repl_with_default_provider_with_launcher(
+            runtime_services_with_state(temp.path().to_path_buf(), state_path),
             &launcher,
         )
-        .expect_err("stub should fail before creating the synthetic carrier");
+        .expect("synthetic carrier launch should succeed");
 
-        assert_ne!(
-            error,
-            "unimplemented: WU-PREREQ-05 Phase 6c will provide the real implementation"
-        );
+        assert_eq!(code, 0);
+        assert_eq!(launcher.calls.borrow().len(), 1);
         assert_eq!(launcher.calls.borrow()[0].0, "<provider-family:claude>");
     }
 
