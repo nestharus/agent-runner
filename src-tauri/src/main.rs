@@ -58,6 +58,10 @@ struct Cli {
     #[arg(long = "resume")]
     resume: Option<String>,
 
+    /// Launch a new sessionless provider-family REPL using default_provider.
+    #[arg(short = 'n', long = "new", conflicts_with = "resume")]
+    new: bool,
+
     /// Manually migrate the active chain segment to the named provider.
     #[arg(long = "migrate")]
     migrate: Option<String>,
@@ -319,6 +323,13 @@ fn run(cli: Cli) -> Result<i32, String> {
     if let Err(err) = session_replace::recover_pending_replaces() {
         eprintln!("{}", err.to_json());
         return Ok(err.exit_code());
+    }
+
+    if cli.new {
+        let services = oulipoly_runtime::repl_default_provider::RuntimeServices::production(
+            cli.project.clone(),
+        )?;
+        return oulipoly_runtime::repl_default_provider::run_repl_with_default_provider(services);
     }
 
     if let Some(command) = cli.command.clone() {
@@ -2905,6 +2916,66 @@ mod tests {
         .unwrap();
         assert_eq!(cli.agent.as_deref(), Some("ping"));
         assert_eq!(cli.prompt_args, vec!["pong"]);
+    }
+
+    #[test]
+    fn parser_accepts_long_new() {
+        let cli = Cli::try_parse_from(["oulipoly-agent-runner", "--new"]).unwrap();
+
+        assert!(cli.new);
+        assert!(cli.command.is_none());
+        assert!(cli.agent.is_none());
+        assert!(cli.prompt_args.is_empty());
+        assert!(cli.model.is_none());
+        assert!(cli.resume.is_none());
+    }
+
+    #[test]
+    fn parser_accepts_short_n() {
+        let cli = Cli::try_parse_from(["oulipoly-agent-runner", "-n"]).unwrap();
+
+        assert!(cli.new);
+        assert!(cli.command.is_none());
+        assert!(cli.agent.is_none());
+        assert!(cli.prompt_args.is_empty());
+        assert!(cli.model.is_none());
+        assert!(cli.resume.is_none());
+    }
+
+    #[test]
+    fn parser_rejects_resume_then_new() {
+        let err = match Cli::try_parse_from([
+            "oulipoly-agent-runner",
+            "--resume",
+            "5169694d-de0f-40d1-890c-6e28e55bab27",
+            "--new",
+        ]) {
+            Ok(_) => panic!("--resume and --new should conflict"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        let rendered = err.to_string();
+        assert!(rendered.contains("--resume"), "{rendered}");
+        assert!(rendered.contains("--new"), "{rendered}");
+    }
+
+    #[test]
+    fn parser_rejects_new_then_resume() {
+        let err = match Cli::try_parse_from([
+            "oulipoly-agent-runner",
+            "--new",
+            "--resume",
+            "5169694d-de0f-40d1-890c-6e28e55bab27",
+        ]) {
+            Ok(_) => panic!("--new and --resume should conflict"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        let rendered = err.to_string();
+        assert!(rendered.contains("--new"), "{rendered}");
+        assert!(rendered.contains("--resume"), "{rendered}");
     }
 
     #[test]

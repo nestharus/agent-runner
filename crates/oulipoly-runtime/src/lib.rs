@@ -4,6 +4,7 @@ pub mod discovery;
 pub mod executor;
 pub mod migration;
 pub mod quota;
+pub mod repl_default_provider;
 pub mod session_export;
 pub mod session_lock;
 pub mod session_metadata;

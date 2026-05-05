@@ -10,6 +10,7 @@ const WORKSPACE_MEMBERS: &[&str] = &[
     "crates/oulipoly-state",
     "crates/oulipoly-runtime",
     "crates/oulipoly-setup",
+    "crates/oulipoly-agent-cli",
 ];
 
 const LIB_CRATES: &[&str] = &[
@@ -31,6 +32,8 @@ const EXPECTED_EDGES: &[(&str, &str)] = &[
     ("oulipoly-runtime", "oulipoly-core"),
     ("oulipoly-state", "oulipoly-config"),
     ("oulipoly-state", "oulipoly-core"),
+    ("oulipoly-agent-cli", "oulipoly-runtime"),
+    ("oulipoly-agent-cli", "oulipoly-config"),
 ];
 
 const GRAPH_NODES: &[&str] = &[
@@ -40,6 +43,7 @@ const GRAPH_NODES: &[&str] = &[
     "oulipoly-state",
     "oulipoly-runtime",
     "oulipoly-setup",
+    "oulipoly-agent-cli",
 ];
 
 fn repo_root() -> PathBuf {
@@ -229,6 +233,112 @@ fn binary_target_resolves() {
         binary_path.exists(),
         "binary target should exist at test runtime: {}",
         binary_path.display()
+    );
+}
+
+#[test]
+fn workspace_includes_agent_cli_member() {
+    let manifest_path = repo_root().join("Cargo.toml");
+    let manifest = std::fs::read_to_string(&manifest_path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", manifest_path.display()));
+    let parsed: toml::Value = toml::from_str(&manifest)
+        .unwrap_or_else(|error| panic!("failed to parse {}: {error}", manifest_path.display()));
+    let workspace = parsed
+        .get("workspace")
+        .expect("root Cargo.toml should define [workspace]");
+
+    for key in ["members", "default-members"] {
+        let entries: BTreeSet<String> = workspace
+            .get(key)
+            .and_then(toml::Value::as_array)
+            .unwrap_or_else(|| panic!("workspace should define {key}"))
+            .iter()
+            .map(|entry| {
+                entry
+                    .as_str()
+                    .unwrap_or_else(|| panic!("workspace {key} entry should be a string"))
+                    .to_string()
+            })
+            .collect();
+
+        assert!(
+            entries.contains("crates/oulipoly-agent-cli"),
+            "workspace {key} should include crates/oulipoly-agent-cli: {entries:?}"
+        );
+    }
+}
+
+#[test]
+fn agent_cli_binary_target_named_agent() {
+    let root = repo_root();
+    let metadata = metadata(&root, &["metadata", "--format-version", "1", "--no-deps"]);
+    let packages = metadata
+        .get("packages")
+        .and_then(Value::as_array)
+        .expect("cargo metadata should include packages");
+    let package = packages
+        .iter()
+        .find(|package| package_name(package) == "oulipoly-agent-cli")
+        .expect("metadata should include oulipoly-agent-cli");
+    let targets = package
+        .get("targets")
+        .and_then(Value::as_array)
+        .expect("metadata package should include targets");
+
+    assert!(
+        targets.iter().any(|target| {
+            let name = target.get("name").and_then(Value::as_str);
+            let kinds = target.get("kind").and_then(Value::as_array);
+            name == Some("agent")
+                && kinds.is_some_and(|kinds| kinds.iter().any(|kind| kind == "bin"))
+        }),
+        "oulipoly-agent-cli should expose a binary target named agent: {targets:?}"
+    );
+}
+
+#[test]
+fn no_binary_name_collision() {
+    let root = repo_root();
+    let metadata = metadata(&root, &["metadata", "--format-version", "1", "--no-deps"]);
+    let packages = metadata
+        .get("packages")
+        .and_then(Value::as_array)
+        .expect("cargo metadata should include packages");
+    let mut owners_by_binary_name: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+    for package in packages {
+        let package_name = package_name(package).to_string();
+        let targets = package
+            .get("targets")
+            .and_then(Value::as_array)
+            .expect("metadata package should include targets");
+
+        for target in targets {
+            let kinds = target
+                .get("kind")
+                .and_then(Value::as_array)
+                .expect("metadata target should include kind");
+            if kinds.iter().any(|kind| kind == "bin") {
+                let name = target
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .expect("metadata binary target should include name");
+                owners_by_binary_name
+                    .entry(name.to_string())
+                    .or_default()
+                    .push(package_name.clone());
+            }
+        }
+    }
+
+    let collisions: BTreeMap<_, _> = owners_by_binary_name
+        .into_iter()
+        .filter(|(_, owners)| owners.len() > 1)
+        .collect();
+
+    assert!(
+        collisions.is_empty(),
+        "workspace binary names should be unique: {collisions:?}"
     );
 }
 
