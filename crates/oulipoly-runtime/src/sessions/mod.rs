@@ -618,6 +618,10 @@ printf '%s\n' "{}""#,
 
     fn cfg_from_adapter_fixture(provider: &str, fixture_name: &str) -> (Fixture, SessionsConfig) {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("runtime crate should live under <repo>/crates/oulipoly-runtime")
+            .join("src-tauri")
             .join("tests")
             .join("fixtures")
             .join("jsonl")
