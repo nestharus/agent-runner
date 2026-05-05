@@ -2,6 +2,7 @@
 name = "oulipoly-runtime"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [lib]
 name = "oulipoly_runtime"
@@ -14,7 +15,7 @@ getrandom.workspace = true
 libc.workspace = true
 oulipoly-config = { path = "../oulipoly-config" }
 oulipoly-core = { path = "../oulipoly-core" }
-oulipoly-state = { path = "../oulipoly-state", features = ["test-support"] }
+oulipoly-state = { path = "../oulipoly-state" }
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -24,3 +25,6 @@ tempfile.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 toml.workspace = true
+
+[dev-dependencies]
+oulipoly-state = { path = "../oulipoly-state", features = ["test-support"] }

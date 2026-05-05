@@ -6,7 +6,6 @@ use oulipoly_runtime::{balancer, diagnostics, discovery, executor, quota};
 use oulipoly_setup as setup_core;
 use oulipoly_setup::actions::{SetupEvent, UserResponse};
 use oulipoly_state as state;
-#[allow(unused_imports)]
 use oulipoly_state::StateDb;
 use oulipoly_state::{AccountRecord, AuthMethod, AuthStatus, CliProviderRecord};
 use oulipoly_state::{DiscoveredModel, ModelParameter};
