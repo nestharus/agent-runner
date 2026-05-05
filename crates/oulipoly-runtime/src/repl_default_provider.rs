@@ -1,4 +1,5 @@
-use oulipoly_config::{ProviderConfig, ProvidersConfig};
+use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig, ProvidersConfig};
+use oulipoly_state::StateDb;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,24 +37,129 @@ impl InteractiveLauncher for ProductionLauncher {
     }
 }
 
-pub fn run_repl_with_default_provider(_services: RuntimeServices) -> Result<i32, String> {
-    Err("unimplemented: WU-PREREQ-05 Phase 6c will provide the real implementation".to_string())
+pub fn run_repl_with_default_provider(services: RuntimeServices) -> Result<i32, String> {
+    run_repl_with_default_provider_with_launcher(services, &ProductionLauncher)
 }
 
 #[allow(dead_code)]
 pub(crate) fn run_repl_with_default_provider_with_launcher(
     services: RuntimeServices,
-    _launcher: &dyn InteractiveLauncher,
+    launcher: &dyn InteractiveLauncher,
 ) -> Result<i32, String> {
-    run_repl_with_default_provider(services)
+    let config_path = services.config_root.join("config.toml");
+    let app = oulipoly_config::app::AppConfig::load(&config_path)?;
+    let family = app.default_provider.ok_or_else(|| {
+        format!(
+            "'default_provider' must be set in {} for 'agent' / '--new'",
+            config_path.display()
+        )
+    })?;
+
+    let providers_path = services.config_root.join("providers.toml");
+    let providers = ProvidersConfig::load(&providers_path)?;
+    let members = resolve_family_keys(&providers, &family);
+    if members.is_empty() {
+        return Err(format!(
+            "default_provider '{family}' resolved to an empty provider pool in {}",
+            providers_path.display()
+        ));
+    }
+
+    let carrier_model = ModelConfig {
+        name: format!("<provider-family:{family}>"),
+        prompt_mode: PromptMode::Stdin,
+        providers: members
+            .iter()
+            .map(|member| ProviderConfig::model_provider(*member, Vec::new()))
+            .collect(),
+        inputs: Vec::new(),
+    };
+
+    let state = match services.state_db_path.as_ref() {
+        Some(path) => StateDb::open(path),
+        None => StateDb::open_default(),
+    }?;
+
+    let idx = crate::balancer::select_provider(&carrier_model, &state, None);
+    let member_name = members
+        .get(idx)
+        .ok_or_else(|| format!("selected provider index {idx} is out of bounds"))?;
+    let (provider, _prompt_mode) = providers.runtime_provider(member_name)?;
+    let launch_provider = ProviderConfig {
+        name: carrier_model.name,
+        ..provider
+    };
+
+    launcher.launch(&launch_provider, services.working_dir.as_deref())
 }
 
 #[allow(dead_code)]
 pub(crate) fn resolve_family_keys<'a>(
-    _providers: &'a ProvidersConfig,
-    _family: &str,
+    providers: &'a ProvidersConfig,
+    family: &str,
 ) -> Vec<&'a str> {
-    vec![]
+    let mut exact = Vec::new();
+    let mut suffixed = Vec::new();
+
+    for key in providers.entries.keys() {
+        let key = key.as_str();
+        if key == family {
+            exact.push(key);
+            continue;
+        }
+
+        let Some(suffix) = key.strip_prefix(family) else {
+            continue;
+        };
+        if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+
+        suffixed.push((suffix, key));
+    }
+
+    exact.sort_unstable();
+    suffixed.sort_by(|(left_suffix, left_key), (right_suffix, right_key)| {
+        compare_digit_suffix(left_suffix, right_suffix).then_with(|| left_key.cmp(right_key))
+    });
+
+    exact
+        .into_iter()
+        .chain(suffixed.into_iter().map(|(_, key)| key))
+        .filter(|key| match providers.runtime_provider(key) {
+            Ok(_) => true,
+            Err(error) => {
+                tracing::warn!(
+                    provider_name = *key,
+                    error = error.as_str(),
+                    "dropping invalid provider-family member"
+                );
+                false
+            }
+        })
+        .collect()
+}
+
+fn compare_digit_suffix(left: &str, right: &str) -> std::cmp::Ordering {
+    let left_trimmed = left.trim_start_matches('0');
+    let right_trimmed = right.trim_start_matches('0');
+    let left_numeric = if left_trimmed.is_empty() {
+        "0"
+    } else {
+        left_trimmed
+    };
+    let right_numeric = if right_trimmed.is_empty() {
+        "0"
+    } else {
+        right_trimmed
+    };
+
+    left_numeric
+        .len()
+        .cmp(&right_numeric.len())
+        .then_with(|| left_numeric.cmp(right_numeric))
+        .then_with(|| left.len().cmp(&right.len()))
+        .then_with(|| left.cmp(right))
 }
 
 #[cfg(test)]
