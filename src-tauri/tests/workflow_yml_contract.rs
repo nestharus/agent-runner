@@ -959,6 +959,7 @@ fn assertion_a10_dependency_graph_required_edges() {
         "version".to_string(),
         "build".to_string(),
         "build-oulipoly-agent-cli".to_string(),
+        "build-oulipoly-agent-store".to_string(),
         "release".to_string(),
     ]);
     let release_expected_edges = BTreeSet::from([
@@ -979,10 +980,18 @@ fn assertion_a10_dependency_graph_required_edges() {
             "version".to_string(),
             "build-oulipoly-agent-cli".to_string(),
         ),
+        (
+            "version".to_string(),
+            "build-oulipoly-agent-store".to_string(),
+        ),
         ("version".to_string(), "release".to_string()),
         ("build".to_string(), "release".to_string()),
         (
             "build-oulipoly-agent-cli".to_string(),
+            "release".to_string(),
+        ),
+        (
+            "build-oulipoly-agent-store".to_string(),
             "release".to_string(),
         ),
     ]);
