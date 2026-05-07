@@ -372,7 +372,7 @@ fn repl_normal_nonzero_child_exit_finalizes_failed_row_with_exit_nonzero_reason(
     assert!(row.finished_at.is_some());
 }
 
-// risk: exhaustive surfaces 4-6, 10, 13-14, 17, 23-26; level: particular-integration; source: proposals/nes-261-NES-261.md L267-269, A1/A5/A10
+// risk: exhaustive surfaces 4-6, 10, 13-14, 17, 23-26; level: particular-integration; source: contract § 5.5, A1, A5, A10
 #[test]
 fn repl_raw_sigterm_child_death_finalizes_failed_row_with_128_plus_signal_exit_code() {
     // CHARACTERIZATION: T-FINAL-REPL-SIGNAL preserves D-022 exit_code=143 and adds terminal_reason=signal:SIGTERM.

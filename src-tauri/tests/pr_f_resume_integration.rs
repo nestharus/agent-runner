@@ -1688,7 +1688,7 @@ flag = "--resume"
     assert_eq!(row.terminal_reason.as_deref(), Some("exit_nonzero"));
 }
 
-// risk: exhaustive surfaces 3, 16, 18, 27-29, 57-59; level: particular-integration; source: proposals/nes-261-NES-261.md L278-282, L300-302, A1/A3/A4/A10
+// risk: exhaustive surfaces 3, 16, 18, 27-29, 57-59; level: particular-integration; source: contract § 5.4, contract § 5.7, A1, A3, A4, A10
 #[test]
 fn t_final_resume_signal_records_unified_signal_exit_code_and_terminal_reason() {
     let fixture = Fixture::new();

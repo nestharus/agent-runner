@@ -35,7 +35,7 @@ beforeEach(() => {
 });
 
 describe("ModelPanel", () => {
-	// risk: exhaustive surfaces 63-65; level: frontend component; source: proposals/nes-261-NES-261.md L303-305, A8/A10
+	// risk: exhaustive surfaces 63-65; level: frontend component; source: contract § 5.9, A8, A10
 	it("renders Rust-originated SIGTERM model test result as exit 143", async () => {
 		setHandler("test_model", () =>
 			Promise.resolve({
@@ -54,7 +54,7 @@ describe("ModelPanel", () => {
 		});
 	});
 
-	// risk: exhaustive surface 64; level: frontend component; source: proposals/nes-261-NES-261.md L303-305, L247-251, A6/A10
+	// risk: exhaustive surface 64; level: frontend component; source: contract § 5.9, A6, A10
 	it("preserves thrown Tauri invoke fallback rendering as exit -1", async () => {
 		setHandler("test_model", () => Promise.reject(new Error("invoke failed")));
 

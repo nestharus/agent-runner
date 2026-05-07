@@ -1055,7 +1055,7 @@ mod tests {
         assert_eq!(provider_name(r#"env -u FOO "my provider""#), "my provider");
     }
 
-    // risk: exhaustive surfaces 1-7 and 11-12; level: unit; source: proposals/nes-261-NES-261.md L259-261, A1/A9/A10
+    // risk: exhaustive surfaces 1-7 and 11-12; level: unit; source: contract § 5.1, A1, A9, A10
     #[cfg(unix)]
     #[test]
     fn exit_code_from_status_uses_unified_child_process_contract() {
@@ -1074,7 +1074,7 @@ mod tests {
         assert_eq!(exit_code_from_status(&unknown), -1);
     }
 
-    // risk: exhaustive surfaces 8-9; level: unit; source: proposals/nes-261-NES-261.md L263-265, A5/A10
+    // risk: exhaustive surfaces 8-9; level: unit; source: contract § 5.2, A5, A10
     #[cfg(unix)]
     #[test]
     fn t_terminal_reason_classifier_uses_stable_exit_and_signal_vocabulary() {

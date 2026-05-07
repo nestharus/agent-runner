@@ -872,7 +872,7 @@ mod tests {
         assert!(quota.exhausted_at.is_some());
     }
 
-    // risk: exhaustive surfaces 38-39; level: Rust unit; source: proposals/nes-261-NES-261.md L303-305, A8/A10
+    // risk: exhaustive surfaces 38-39; level: Rust unit; source: contract § 5.8, A8, A10
     #[cfg(unix)]
     #[test]
     fn test_model_raw_sigterm_returns_unified_signal_exit_code() {

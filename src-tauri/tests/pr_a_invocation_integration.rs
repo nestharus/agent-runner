@@ -266,7 +266,7 @@ fn direct_provider_nonzero_exit_finalizes_failed_row_with_child_exit_code() {
     assert!(row.finished_at.is_some());
 }
 
-// risk: exhaustive surfaces 2, 30-34, 37, 57-59; level: particular-integration; source: proposals/nes-261-NES-261.md L284-286, L300-302, A1/A3/A7/A10
+// risk: exhaustive surfaces 2, 30-34, 37, 57-59; level: particular-integration; source: contract § 5.3, contract § 5.7, A1, A3, A7, A10
 #[test]
 fn direct_provider_raw_signal_finalizes_failed_row_with_unified_signal_exit_code() {
     let fixture = Fixture::with_script_body(
@@ -486,7 +486,7 @@ exit 7"#,
     assert!(row.finished_at.is_some());
 }
 
-// risk: exhaustive surfaces 33 and 35; level: particular-integration; source: proposals/nes-261-NES-261.md L288-290, A6/A10
+// risk: exhaustive surfaces 33 and 35; level: particular-integration; source: contract § 5.6, A6, A10
 #[test]
 fn t_fence_supervisor_signal_parent_finalizes_captured_child_with_signal_reason() {
     let child_uuid = "66666666-6666-6666-6666-666666666666";
