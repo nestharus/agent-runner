@@ -9,7 +9,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::Child;
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 #[cfg(unix)]
 use std::sync::{
     Arc,
@@ -274,6 +274,7 @@ struct RawResult {
     stdout: Vec<u8>,
     telemetry_stdout: Vec<u8>,
     stderr: String,
+    /// Numeric child-process exit code per `exit_code_from_status`.
     exit_code: i32,
     session_capture: SessionCaptureResult,
     terminal_reason: Option<String>,
@@ -450,7 +451,7 @@ fn execute_provider_with_args(
         telemetry_stdout: output.stdout.clone(),
         captured_child_invocations: captured_child_invocations_from_stderr(&stderr),
         stderr,
-        exit_code: output.status.code().unwrap_or(-1),
+        exit_code: exit_code_from_status(&output.status),
         terminal_reason: classify_terminal_reason(&output.status),
         session_capture: capture_outcome,
     };
@@ -585,6 +586,7 @@ pub fn execute_interactive(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InteractiveExecutionResult {
+    /// Numeric child-process exit code per `exit_code_from_status` (interactive/REPL path).
     pub exit_code: i32,
     pub terminal_reason: Option<String>,
 }
@@ -628,7 +630,7 @@ pub fn execute_interactive_with_result(
 
     let terminal_reason = classify_terminal_reason(&status);
     Ok(InteractiveExecutionResult {
-        exit_code: exit_code_from_status(status),
+        exit_code: exit_code_from_status(&status),
         terminal_reason,
     })
 }
@@ -852,7 +854,24 @@ pub fn provider_name(command: &str) -> String {
         .unwrap_or_else(|| command.to_string())
 }
 
-fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
+/// `exit_code_from_status` is the canonical executor-boundary conversion from
+/// a child `ExitStatus` to the runtime's `i32` exit-code representation:
+///
+/// - `status.code()` is preserved when `Some(n)` (covers normal exits including
+///   non-zero).
+/// - On Unix, when `status.code()` is `None` and `ExitStatusExt::signal()`
+///   returns `sig`, the helper returns `128 + sig` (POSIX shell convention;
+///   e.g., SIGTERM -> 143).
+/// - When neither a normal code nor a signal is available, the helper returns
+///   `-1` (preserved fallback).
+///
+/// All executor paths that own a real child `ExitStatus` (one-shot provider,
+/// headless resume via `execute_provider_with_args`, interactive REPL via
+/// `execute_interactive_with_result`) must route their conversion through this
+/// helper. Synthetic lifecycle sentinels (spawn error, `FinalizerGuard` drop,
+/// captured-child supervisor fallback) do not have a child `ExitStatus` and do
+/// not call this helper.
+fn exit_code_from_status(status: &ExitStatus) -> i32 {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;

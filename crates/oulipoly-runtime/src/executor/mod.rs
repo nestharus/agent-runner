@@ -9,6 +9,7 @@ use std::path::Path;
 pub struct ExecutionResult {
     pub stdout: Vec<u8>,
     pub stderr: String,
+    /// Numeric child-process exit code per `exit_code_from_status`.
     pub exit_code: i32,
     pub provider_index: usize,
     pub session_capture: SessionCaptureResult,
