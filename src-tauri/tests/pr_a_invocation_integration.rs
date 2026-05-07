@@ -284,6 +284,46 @@ sleep 1"#,
     assert!(row.finished_at.is_some());
 }
 
+#[test]
+fn direct_provider_spawn_error_finalizes_failed_row_with_spawn_error_reason() {
+    let fixture = Fixture::new();
+    let missing_command = fixture
+        .config_home
+        .join("definitely-missing-fixture-provider");
+    fs::write(
+        fixture
+            .config_home
+            .join("oulipoly-agent-runner")
+            .join("providers.toml"),
+        format!(
+            r#"[fixture-provider]
+command = "{}"
+args = []
+prompt_mode = "arg"
+"#,
+            missing_command.display()
+        ),
+    )
+    .unwrap();
+
+    let output = fixture.run(None);
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let invocation = parse_invocation(&String::from_utf8_lossy(&output.stderr));
+    let row = fixture
+        .open_db()
+        .get_invocation_by_uuid(&invocation.id)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(row.status, InvocationStatus::Failed);
+    assert_eq!(row.success, Some(false));
+    assert_eq!(row.exit_code, Some(-1));
+    assert_eq!(row.error_category.as_deref(), Some("spawn_error"));
+    assert_eq!(row.terminal_reason.as_deref(), Some("spawn_error"));
+    assert!(row.finished_at.is_some());
+}
+
 // RISK: supervised direct child can emit a valid marker then exit before finalizing its row, leaving durable running state (proposal §test-intent "supervised-child fence test", assumptions A1/A2/A4)
 // LEVEL: particular-integration
 // SOURCE: contracts/nes-250-contract.md § Test catalog § Process-supervision fence (T-FENCE-SUPERVISOR-CLEAN-CHILD)
@@ -428,4 +468,58 @@ exit 7"#,
     assert_eq!(row.exit_code, Some(7));
     assert_eq!(row.terminal_reason.as_deref(), Some("exit_nonzero"));
     assert!(row.finished_at.is_some());
+}
+
+#[test]
+fn t_fence_supervisor_signal_parent_finalizes_captured_child_with_signal_reason() {
+    let child_uuid = "66666666-6666-6666-6666-666666666666";
+    let child_marker = CompositeInvocationId {
+        source: "fixture-child".to_string(),
+        id: child_uuid.to_string(),
+    }
+    .stderr_line();
+    let fixture = Fixture::with_script_body(&format!(
+        r#"printf '%s\n' "{child_marker}" >&2
+kill -TERM "$$"
+sleep 1"#
+    ));
+    seed_running_child_for_first_parent(&fixture, child_uuid);
+
+    let output = fixture.run(None);
+
+    assert_eq!(output.status.code(), Some(255), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        parse_valid_invocations(&stderr)
+            .iter()
+            .any(|invocation| invocation.id == child_uuid),
+        "child marker should be present in captured stderr: {stderr}"
+    );
+    let parent_invocation = parse_valid_invocations(&stderr)
+        .into_iter()
+        .find(|invocation| invocation.source == "fixture-provider")
+        .expect("parent invocation marker should remain parseable");
+    let db = fixture.open_db();
+    let parent_row = db
+        .get_invocation_by_uuid(&parent_invocation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(parent_row.status, InvocationStatus::Failed);
+    assert_eq!(parent_row.success, Some(false));
+    assert_eq!(parent_row.exit_code, Some(-1));
+    assert_eq!(
+        parent_row.terminal_reason.as_deref(),
+        Some("signal:SIGTERM")
+    );
+
+    let child_row = db.get_invocation_by_uuid(child_uuid).unwrap().unwrap();
+    assert_eq!(child_row.status, InvocationStatus::Failed);
+    assert_eq!(child_row.success, Some(false));
+    assert_eq!(child_row.exit_code, Some(-1));
+    assert_eq!(child_row.error_category, None);
+    assert_eq!(
+        child_row.terminal_reason.as_deref(),
+        Some("supervisor_observed_signal:SIGTERM")
+    );
+    assert!(child_row.finished_at.is_some());
 }
