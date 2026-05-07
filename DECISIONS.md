@@ -501,3 +501,15 @@ The NES-262 fix touches only `.github/workflows/release.yml` (CI workflow) and `
 - `cargo test --workspace` = OK (full workspace green)
 
 **Resolves:** NES-251 § Decision 1 — the orthogonal `assertion_a08_binary_clients_have_release_path` baseline failure documented there is now fixed by this WU's release.yml extension.
+
+## NES-256 — Phase 6c agent-store release-path coverage (2026-05-07)
+
+**WU:** NES-256 — agent-store.
+**Phase:** 6c fixup.
+
+**Decision 1 — add `agent-store` release-path job and A10 graph coverage:** The `agent-store` release-path job and A10 dependency graph extension are required because this WU adds a new `[[bin]]` to the workspace. The workflow contract enforces release-path coverage per binary, so `.github/workflows/release.yml` now includes `build-oulipoly-agent-store` and `src-tauri/tests/workflow_yml_contract.rs::assertion_a10_dependency_graph_required_edges` includes the `version -> build-oulipoly-agent-store -> release` path. After rebasing onto NES-262, both `build-oulipoly-agent-cli` and `build-oulipoly-agent-store` coexist in `release.yml` and in A10's expected_jobs/expected_edges.
+**Rationale:** Without this release-path job, the new binary would be validated in workspace checks but omitted from release artifacts. The A10 extension is the structural test for the new release graph, so no additional procedural workflow test is needed.
+**Revisit when:** The release workflow gains another workspace binary or the shared build-job pattern for binary clients changes.
+
+**Decision 2 — orthogonal A08 baseline failure (originally documented when NES-262 was pending):** During Phase 6c implementation on the un-rebased branch, the orthogonal A08 failure on `oulipoly-agent-cli` was observed and documented as NES-262 territory. NES-262 (#50) merged on 2026-05-07; the rebase onto current `main` brought in the `build-oulipoly-agent-cli` release-path job and associated A10 entries. After rebase + this WU's extension, A08 passes for both `oulipoly-agent-cli` and `oulipoly-agent-store`.
+**Evidence:** `cargo test -p oulipoly-agent-runner --test workflow_yml_contract` runs all 13 assertions green post-rebase.

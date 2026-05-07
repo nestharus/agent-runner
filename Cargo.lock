@@ -2301,6 +2301,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "oulipoly-agent-store"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
 name = "oulipoly-config"
 version = "0.1.0"
 dependencies = [

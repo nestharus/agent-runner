@@ -11,6 +11,7 @@ const WORKSPACE_MEMBERS: &[&str] = &[
     "crates/oulipoly-runtime",
     "crates/oulipoly-setup",
     "crates/oulipoly-agent-cli",
+    "crates/oulipoly-agent-store",
 ];
 
 const LIB_CRATES: &[&str] = &[

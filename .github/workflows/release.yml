@@ -253,8 +253,47 @@ jobs:
           name: agent-${{ matrix.target }}
           path: artifacts/*
 
+  build-oulipoly-agent-store:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: agent-store-${{ matrix.target }}
+      - name: Build agent store
+        run: cargo build --release --target ${{ matrix.target }} --bin agent-store -p oulipoly-agent-store
+      - name: Collect agent store artifact
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p artifacts
+          cp target/${{ matrix.target }}/release/agent-store artifacts/agent-store-${{ matrix.target }}
+      - name: Collect agent store artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts
+          Copy-Item target/${{ matrix.target }}/release/agent-store.exe artifacts/agent-store-${{ matrix.target }}.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-store-${{ matrix.target }}
+          path: artifacts/*
+
   release:
-    needs: [version, build, build-oulipoly-agent-cli]
+    needs: [version, build, build-oulipoly-agent-cli, build-oulipoly-agent-store]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
