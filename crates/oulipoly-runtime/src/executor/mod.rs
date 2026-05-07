@@ -1,6 +1,7 @@
 pub mod cli;
 
 use oulipoly_config::ModelConfig;
+use oulipoly_state::CompositeInvocationId;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -12,6 +13,14 @@ pub struct ExecutionResult {
     pub provider_index: usize,
     pub session_capture: SessionCaptureResult,
     pub resume_acceptance: Option<ResumeAcceptanceResult>,
+    pub terminal_reason: Option<String>,
+    pub captured_child_invocations: Vec<CapturedChildInvocation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedChildInvocation {
+    pub composite_id: CompositeInvocationId,
+    pub raw_marker_line: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

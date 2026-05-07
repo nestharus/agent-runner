@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
 use chrono::{DateTime, Duration, Utc};
-use oulipoly_state::{CompositeInvocationId, SessionTurnIngest, StateDb};
+use oulipoly_state::{CompositeInvocationId, InvocationStatus, SessionTurnIngest, StateDb};
 use rusqlite::{Connection, params};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -1271,6 +1271,9 @@ fn resume_requires_provider_resume_block() {
     );
 }
 
+// RISK: resume finalizer could miss terminal_reason for nonzero headless child while preserving resumed session capture (proposal §test-intent "resume terminal-reason tests", assumption A5)
+// LEVEL: particular-integration
+// SOURCE: contracts/nes-250-contract.md § Test catalog § Finalize cascade (T-FINAL-RESUME)
 #[test]
 fn resume_marks_capture_as_resumed_before_nonzero_child_exit() {
     let fixture = Fixture::new();
@@ -1299,6 +1302,53 @@ flag = "--resume"
         .unwrap();
     assert_eq!(row.session_id.as_deref(), Some(session_id));
     assert_eq!(row.session_capture_method.as_deref(), Some("resumed"));
+    assert_eq!(row.status, InvocationStatus::Failed);
+    assert_eq!(row.success, Some(false));
+    assert_eq!(row.exit_code, Some(7));
+    assert_eq!(row.terminal_reason.as_deref(), Some("exit_nonzero"));
+}
+
+// RISK: resume signal path could miss the same terminal_reason vocabulary used by one-shot (proposal §test-intent "resume terminal-reason tests", assumption A5)
+// LEVEL: particular-integration
+// SOURCE: contracts/nes-250-contract.md § Test catalog § Finalize cascade (T-FINAL-RESUME)
+#[test]
+fn t_final_resume_signal_records_terminal_reason_while_preserving_direct_exit_code_policy() {
+    let fixture = Fixture::new();
+    let session_id = "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22";
+    let script = fixture.write_script(
+        "claude-sigterm.sh",
+        r#"kill -TERM "$$"
+sleep 1"#,
+    );
+    fixture.write_single_provider_model(
+        "claude-opus",
+        "claude2",
+        &script,
+        r#"
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+"#,
+    );
+    fixture.seed_session_turns("claude2", session_id, &[("turn-1", "2026-04-17T08:00:00Z")]);
+
+    let output = fixture
+        .base_top_level_resume_command("claude-opus", session_id)
+        .arg("continue session")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(255), "{output:?}");
+    let invocation = parse_invocation(&String::from_utf8_lossy(&output.stderr));
+    let row = fixture
+        .open_db()
+        .get_invocation_by_uuid(&invocation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, InvocationStatus::Failed);
+    assert_eq!(row.success, Some(false));
+    assert_eq!(row.exit_code, Some(-1));
+    assert_eq!(row.terminal_reason.as_deref(), Some("signal:SIGTERM"));
 }
 
 #[test]

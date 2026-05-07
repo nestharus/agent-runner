@@ -1,10 +1,15 @@
 #![cfg(unix)]
 
 use oulipoly_state::{CompositeInvocationId, InvocationStatus, StateDb};
+use rusqlite::params;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Output};
+
+// These tests start with an empty invocation table. When a child row is seeded
+// before the CLI run, the supervised parent row created by that run receives id 2.
+const FIRST_PARENT_ROW_ID_IN_FRESH_FIXTURE: i64 = 2;
 
 struct Fixture {
     _dir: tempfile::TempDir,
@@ -16,6 +21,15 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_script_body(
+            r#"SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
+printf '%s' "${OULIPOLY_PARENT_INVOCATION-}" > "$SCRIPT_DIR/env_dump.txt"
+printf '{}'
+"#,
+        )
+    }
+
+    fn with_script_body(script_body: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let config_home = dir.path().join("config");
         let data_home = dir.path().join("data");
@@ -27,11 +41,7 @@ impl Fixture {
         let env_dump_path = dir.path().join("env_dump.txt");
         fs::write(
             &script_path,
-            r#"#!/usr/bin/env bash
-SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
-printf '%s' "${OULIPOLY_PARENT_INVOCATION-}" > "$SCRIPT_DIR/env_dump.txt"
-printf '{}'
-"#,
+            format!("#!/usr/bin/env bash\n{script_body}\n"),
         )
         .unwrap();
         let mut perms = fs::metadata(&script_path).unwrap().permissions();
@@ -106,6 +116,37 @@ fn parse_invocation(stderr: &str) -> CompositeInvocationId {
     );
     let raw = lines[0].strip_prefix("OULIPOLY_INVOCATION=").unwrap();
     CompositeInvocationId::parse_env_value(raw).unwrap()
+}
+
+fn parse_valid_invocations(stderr: &str) -> Vec<CompositeInvocationId> {
+    stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("OULIPOLY_INVOCATION="))
+        .filter_map(|raw| CompositeInvocationId::parse_env_value(raw).ok())
+        .collect()
+}
+
+fn seed_running_child_for_first_parent(fixture: &Fixture, child_uuid: &str) -> i64 {
+    drop(fixture.open_db());
+    let conn = rusqlite::Connection::open(fixture.db_path()).unwrap();
+    conn.pragma_update(None, "foreign_keys", false).unwrap();
+    conn.execute(
+        "INSERT INTO invocations (
+            invocation_uuid, model_name, provider_name, provider_index,
+            parent_invocation_id, status, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            child_uuid,
+            "fixture-child-model",
+            "fixture-child",
+            0,
+            FIRST_PARENT_ROW_ID_IN_FRESH_FIXTURE,
+            "running",
+            "2026-04-17T08:00:01Z"
+        ],
+    )
+    .unwrap();
+    conn.last_insert_rowid()
 }
 
 #[test]
@@ -186,4 +227,205 @@ fn ignores_malformed_and_unresolved_parent_env_values() {
             .unwrap();
         assert_eq!(row.parent_invocation_id, None, "{raw}");
     }
+}
+
+// RISK: common nonzero one-shot exits could lack terminal_reason while preserving exit_code behavior (proposal §test-intent "direct nonzero terminal-reason test", assumption A5)
+// LEVEL: particular-integration
+// SOURCE: contracts/nes-250-contract.md § Test catalog § Finalize cascade (T-FINAL-ONESHOT-EXIT7)
+#[test]
+fn direct_provider_nonzero_exit_finalizes_failed_row_with_child_exit_code() {
+    // CHARACTERIZATION: T-FINAL-ONESHOT-EXIT7 persists exit_code=7 and terminal_reason=exit_nonzero.
+    let fixture = Fixture::with_script_body("exit 7");
+
+    let output = fixture.run(None);
+
+    assert_eq!(output.status.code(), Some(7), "{output:?}");
+    let invocation = parse_invocation(&String::from_utf8_lossy(&output.stderr));
+    let row = fixture
+        .open_db()
+        .get_invocation_by_uuid(&invocation.id)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(row.status, InvocationStatus::Failed);
+    assert_eq!(row.success, Some(false));
+    assert_eq!(row.exit_code, Some(7));
+    assert_eq!(row.error_category, None);
+    assert_eq!(row.terminal_reason.as_deref(), Some("exit_nonzero"));
+    assert!(row.finished_at.is_some());
+}
+
+// RISK: one-shot raw signal terminal_reason could drift while D-022 exit_code=-1 is preserved (proposal §test-intent "direct raw-signal characterization", assumption A8)
+// LEVEL: particular-integration
+// SOURCE: contracts/nes-250-contract.md § Test catalog § Finalize cascade (T-FINAL-ONESHOT-SIGNAL)
+#[test]
+fn direct_provider_raw_signal_finalizes_failed_row_with_minus_one_exit_code() {
+    // CHARACTERIZATION: T-FINAL-ONESHOT-SIGNAL preserves D-022 exit_code=-1 and adds terminal_reason=signal:SIGTERM.
+    let fixture = Fixture::with_script_body(
+        r#"kill -TERM "$$"
+sleep 1"#,
+    );
+
+    let output = fixture.run(None);
+
+    assert_eq!(output.status.code(), Some(255), "{output:?}");
+    let invocation = parse_invocation(&String::from_utf8_lossy(&output.stderr));
+    let row = fixture
+        .open_db()
+        .get_invocation_by_uuid(&invocation.id)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(row.status, InvocationStatus::Failed);
+    assert_eq!(row.success, Some(false));
+    assert_eq!(row.exit_code, Some(-1));
+    assert_eq!(row.error_category, None);
+    assert_eq!(row.terminal_reason.as_deref(), Some("signal:SIGTERM"));
+    assert!(row.finished_at.is_some());
+}
+
+// RISK: supervised direct child can emit a valid marker then exit before finalizing its row, leaving durable running state (proposal §test-intent "supervised-child fence test", assumptions A1/A2/A4)
+// LEVEL: particular-integration
+// SOURCE: contracts/nes-250-contract.md § Test catalog § Process-supervision fence (T-FENCE-SUPERVISOR-CLEAN-CHILD)
+#[test]
+fn t_fence_supervisor_clean_child_finalizes_captured_running_child_row() {
+    let child_uuid = "33333333-3333-3333-3333-333333333333";
+    let child_marker = CompositeInvocationId {
+        source: "fixture-child".to_string(),
+        id: child_uuid.to_string(),
+    }
+    .stderr_line();
+    let fixture = Fixture::with_script_body(&format!(
+        r#"printf '%s\n' "{child_marker}" >&2
+exit 7"#
+    ));
+    seed_running_child_for_first_parent(&fixture, child_uuid);
+
+    let output = fixture.run(None);
+
+    assert_eq!(output.status.code(), Some(7), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        parse_valid_invocations(&stderr)
+            .iter()
+            .any(|invocation| invocation.id == child_uuid),
+        "child marker should be present in captured stderr: {stderr}"
+    );
+    let child_row = fixture
+        .open_db()
+        .get_invocation_by_uuid(child_uuid)
+        .unwrap()
+        .unwrap();
+    assert_eq!(child_row.status, InvocationStatus::Failed);
+    assert_eq!(child_row.success, Some(false));
+    assert_eq!(child_row.error_category, None);
+    assert_eq!(
+        child_row.terminal_reason.as_deref(),
+        Some("supervisor_observed_exit_nonzero")
+    );
+    assert!(child_row.finished_at.is_some());
+}
+
+// RISK: supervisor fallback could overwrite a child row that won the finalization race (proposal §test-intent "supervised-child fence test", assumption A4)
+// LEVEL: particular-integration
+// SOURCE: contracts/nes-250-contract.md § Test catalog § Process-supervision fence (T-FENCE-SUPERVISOR-NOOP-IF-FINALIZED)
+#[test]
+fn t_fence_supervisor_noop_if_captured_child_row_already_finalized() {
+    let child_uuid = "44444444-4444-4444-4444-444444444444";
+    let child_marker = CompositeInvocationId {
+        source: "fixture-child".to_string(),
+        id: child_uuid.to_string(),
+    }
+    .stderr_line();
+    let fixture = Fixture::with_script_body(&format!(
+        r#"printf '%s\n' "{child_marker}" >&2
+exit 7"#
+    ));
+    let child_id = seed_running_child_for_first_parent(&fixture, child_uuid);
+    let db = fixture.open_db();
+    db.finalize_invocation(child_id, false, 7, None, Some("exit_nonzero"))
+        .unwrap();
+
+    let output = fixture.run(None);
+
+    assert_eq!(output.status.code(), Some(7), "{output:?}");
+    let child_row = fixture
+        .open_db()
+        .get_invocation_by_uuid(child_uuid)
+        .unwrap()
+        .unwrap();
+    assert_eq!(child_row.status, InvocationStatus::Failed);
+    assert_eq!(child_row.success, Some(false));
+    assert_eq!(child_row.exit_code, Some(7));
+    assert_eq!(child_row.terminal_reason.as_deref(), Some("exit_nonzero"));
+}
+
+// RISK: supervisor fallback could finalize an unrelated running row if a provider spoofs another invocation marker (proposal §test-intent "supervised-child fence test", assumptions A1/A4)
+// LEVEL: particular-integration
+// SOURCE: CodeRabbit pass 2 R2-F03 lineage hardening for process-supervision fence
+#[test]
+fn t_fence_supervisor_ignores_captured_row_without_current_parent_lineage() {
+    let child_uuid = "55555555-5555-5555-5555-555555555555";
+    let child_marker = CompositeInvocationId {
+        source: "fixture-child".to_string(),
+        id: child_uuid.to_string(),
+    }
+    .stderr_line();
+    let fixture = Fixture::with_script_body(&format!(
+        r#"printf '%s\n' "{child_marker}" >&2
+exit 7"#
+    ));
+    fixture
+        .open_db()
+        .start_invocation(&oulipoly_state::InvocationStart {
+            invocation_uuid: child_uuid.to_string(),
+            model_name: "fixture-child-model".to_string(),
+            provider_name: "fixture-child".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        })
+        .unwrap();
+
+    let output = fixture.run(None);
+
+    assert_eq!(output.status.code(), Some(7), "{output:?}");
+    let child_row = fixture
+        .open_db()
+        .get_invocation_by_uuid(child_uuid)
+        .unwrap()
+        .unwrap();
+    assert_eq!(child_row.status, InvocationStatus::Running);
+    assert_eq!(child_row.success, None);
+    assert_eq!(child_row.terminal_reason, None);
+    assert_eq!(child_row.finished_at, None);
+}
+
+// RISK: post-wait supervision/diagnostics handling could prevent the one-shot owner row from terminalizing (proposal §test-intent "own-row fence ordering test", assumption A4)
+// LEVEL: particular-integration
+// SOURCE: contracts/nes-250-contract.md § Test catalog § Process-supervision fence (T-FENCE-OWN-ROW-AFTER-WAIT)
+#[test]
+fn t_fence_own_row_after_wait_finalizes_even_with_malformed_child_marker_noise() {
+    let fixture = Fixture::with_script_body(
+        r#"printf '%s\n' 'OULIPOLY_INVOCATION={"source":"fixture-child","id":"not-a-uuid"}' >&2
+exit 7"#,
+    );
+
+    let output = fixture.run(None);
+
+    assert_eq!(output.status.code(), Some(7), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let parent_invocation = parse_valid_invocations(&stderr)
+        .into_iter()
+        .find(|invocation| invocation.source == "fixture-provider")
+        .expect("parent invocation marker should remain parseable");
+    let row = fixture
+        .open_db()
+        .get_invocation_by_uuid(&parent_invocation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, InvocationStatus::Failed);
+    assert_eq!(row.success, Some(false));
+    assert_eq!(row.exit_code, Some(7));
+    assert_eq!(row.terminal_reason.as_deref(), Some("exit_nonzero"));
+    assert!(row.finished_at.is_some());
 }

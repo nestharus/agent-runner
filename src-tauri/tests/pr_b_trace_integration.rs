@@ -1,6 +1,8 @@
 #![cfg(unix)]
 
-use oulipoly_state::{InvocationStart, StateDb};
+use chrono::{Duration, Utc};
+use oulipoly_state::{InvocationStart, InvocationStatus, StateDb};
+use rusqlite::params;
 use serde_json::Value;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -100,7 +102,45 @@ prompt_mode = "arg"
                 parent_invocation_id: Some(root_id),
             })
             .unwrap();
-        db.finalize_invocation(child_id, false, 7, Some("fixture_error"), None)
+        db.finalize_invocation(
+            child_id,
+            false,
+            7,
+            Some("fixture_error"),
+            Some("exit_nonzero"),
+        )
+        .unwrap();
+    }
+
+    fn seed_running_trace_row(&self) {
+        let db = self.open_db();
+        db.start_invocation(&InvocationStart {
+            invocation_uuid: ROOT_UUID.to_string(),
+            model_name: "fixture".to_string(),
+            provider_name: "fixture-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        })
+        .unwrap();
+    }
+
+    fn seed_stale_running_trace_row(&self) {
+        let db = self.open_db();
+        let row_id = db
+            .start_invocation(&InvocationStart {
+                invocation_uuid: ROOT_UUID.to_string(),
+                model_name: "fixture".to_string(),
+                provider_name: "fixture-provider".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        let created_at = (Utc::now() - Duration::minutes(31)).to_rfc3339();
+        db.connection()
+            .execute(
+                "UPDATE invocations SET created_at = ?1 WHERE id = ?2",
+                params![created_at, row_id],
+            )
             .unwrap();
     }
 
@@ -163,6 +203,77 @@ fn trace_json_dispatches_and_returns_structured_root() {
     assert_eq!(json["requested_id"], ROOT_UUID);
     assert_eq!(json["root"]["invocation"]["id"], ROOT_UUID);
     assert_eq!(json["root"]["session"]["transcript_state"], "unresolved");
+}
+
+// RISK: trace CLI could serialize fresh running rows with non-null terminal_reason or stale warning (proposal §test-intent "terminal-reason absence characterization", assumption A5)
+// LEVEL: particular-integration
+// SOURCE: contracts/nes-250-contract.md § Test catalog § Run-row null contract (T-RUN-NULL)
+#[test]
+fn trace_json_running_row_uses_null_terminal_fields_and_no_stale_warning() {
+    // CHARACTERIZATION: T-RUN-NULL/T-TRACE-JSON-RUNNING-NON-STALE-NULL keeps fresh running rows
+    // as status=running with explicit null terminal fields and no stale_running object.
+    let fixture = Fixture::new();
+    fixture.seed_running_trace_row();
+
+    let output = fixture.run_trace(&["--json"]);
+
+    assert!(output.status.success(), "{output:?}");
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let root = &json["root"];
+    let invocation = &root["invocation"];
+    assert_eq!(invocation["status"], "running");
+    assert!(invocation["success"].is_null());
+    assert!(invocation["exit_code"].is_null());
+    assert!(invocation["terminal_reason"].is_null());
+    assert!(invocation["finished_at"].is_null());
+    assert!(root["warnings"].as_array().unwrap().is_empty());
+    assert!(
+        !invocation
+            .as_object()
+            .unwrap()
+            .contains_key("stale_running"),
+        "fresh running rows omit stale_running on invocation"
+    );
+}
+
+// RISK: trace CLI stale-running JSON lift could fail to project old running rows or could mutate DB state (proposal §test-intent "JSON-only stale-lift isolation test", assumptions A5/A7)
+// LEVEL: particular-integration
+// SOURCE: contracts/nes-250-contract.md § Test catalog § Stale-running JSON lift (T-STALE-LIFT-JSON, T-STALE-LIFT-DB-UNCHANGED)
+#[test]
+fn trace_json_stale_running_row_is_lifted_without_mutating_db() {
+    let fixture = Fixture::new();
+    fixture.seed_stale_running_trace_row();
+
+    let output = fixture.run_trace(&["--json"]);
+
+    assert!(output.status.success(), "{output:?}");
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let invocation = &json["root"]["invocation"];
+    assert_eq!(invocation["status"], "failed");
+    assert!(invocation["success"].is_null());
+    assert!(invocation["exit_code"].is_null());
+    assert!(invocation["finished_at"].is_null());
+    assert_eq!(invocation["terminal_reason"], "tracing_timeout");
+    assert!(invocation["stale_running"]["age_seconds"].as_u64().unwrap() >= 1800);
+    assert_eq!(invocation["stale_running"]["threshold_seconds"], 1800);
+    assert!(
+        json["root"]["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning.as_str().unwrap().contains("stale_running"))
+    );
+
+    let stored = fixture
+        .open_db()
+        .get_invocation_by_uuid(ROOT_UUID)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, InvocationStatus::Running);
+    assert_eq!(stored.success, None);
+    assert_eq!(stored.exit_code, None);
+    assert_eq!(stored.terminal_reason, None);
+    assert_eq!(stored.finished_at, None);
 }
 
 #[test]

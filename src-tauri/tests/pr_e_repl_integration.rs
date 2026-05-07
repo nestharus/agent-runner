@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use oulipoly_state::{CompositeInvocationId, InvocationStatus, StateDb};
+use oulipoly_state::{CompositeInvocationId, InvocationStart, InvocationStatus, StateDb};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
@@ -346,6 +346,84 @@ done"#,
     assert_eq!(row.success, Some(false));
     assert_eq!(row.exit_code, Some(130));
     assert!(row.finished_at.is_some());
+}
+
+// RISK: REPL signal path could preserve D-022 numeric exit_code but miss the shared terminal_reason vocabulary (proposal §test-intent "interactive raw-signal characterization", assumption A8)
+// LEVEL: particular-integration
+// SOURCE: contracts/nes-250-contract.md § Test catalog § Finalize cascade (T-FINAL-REPL-SIGNAL)
+#[test]
+fn repl_raw_sigterm_child_death_finalizes_failed_row_with_128_plus_signal_exit_code() {
+    // CHARACTERIZATION: T-FINAL-REPL-SIGNAL preserves D-022 exit_code=143 and adds terminal_reason=signal:SIGTERM.
+    let fixture = Fixture::new();
+    let script = fixture.write_script(
+        "fixture-raw-sigterm.sh",
+        r#"kill -TERM "$$"
+sleep 1"#,
+    );
+    fixture.write_model("fixture", "fixture-provider", &script);
+
+    let output = fixture.run_repl("fixture", None);
+
+    assert_eq!(output.status.code(), Some(143), "{output:?}");
+    let invocation = parse_invocation(&String::from_utf8_lossy(&output.stderr));
+    let row = fixture
+        .open_db()
+        .get_invocation_by_uuid(&invocation.id)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(row.status, InvocationStatus::Failed);
+    assert_eq!(row.success, Some(false));
+    assert_eq!(row.exit_code, Some(143));
+    assert_eq!(row.error_category, None);
+    assert_eq!(row.terminal_reason.as_deref(), Some("signal:SIGTERM"));
+    assert!(row.finished_at.is_some());
+}
+
+// RISK: process-supervision fence could accidentally parse inherited interactive stderr and finalize unrelated child rows (proposal §test-intent "supervised-child fence test", assumptions A1/A2/A3)
+// LEVEL: particular-integration
+// SOURCE: contracts/nes-250-contract.md § Test catalog § Process-supervision fence (T-FENCE-SUPERVISOR-INTERACTIVE-SCOPE)
+#[test]
+fn t_fence_supervisor_interactive_scope_leaves_marker_row_running() {
+    let fixture = Fixture::new();
+    let child_uuid = "55555555-5555-5555-5555-555555555555";
+    fixture
+        .open_db()
+        .start_invocation(&InvocationStart {
+            invocation_uuid: child_uuid.to_string(),
+            model_name: "fixture-child-model".to_string(),
+            provider_name: "fixture-child".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        })
+        .unwrap();
+    let child_marker = CompositeInvocationId {
+        source: "fixture-child".to_string(),
+        id: child_uuid.to_string(),
+    }
+    .stderr_line();
+    let script = fixture.write_script(
+        "fixture-marker.sh",
+        &format!(
+            r#"printf '%s\n' "{child_marker}" >&2
+exit 7"#
+        ),
+    );
+    fixture.write_model("fixture", "fixture-provider", &script);
+
+    let output = fixture.run_repl("fixture", None);
+
+    assert_eq!(output.status.code(), Some(7), "{output:?}");
+    let child_row = fixture
+        .open_db()
+        .get_invocation_by_uuid(child_uuid)
+        .unwrap()
+        .unwrap();
+    assert_eq!(child_row.status, InvocationStatus::Running);
+    assert_eq!(child_row.success, None);
+    assert_eq!(child_row.exit_code, None);
+    assert_eq!(child_row.terminal_reason, None);
+    assert_eq!(child_row.finished_at, None);
 }
 
 #[test]

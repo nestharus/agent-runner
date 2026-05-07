@@ -15,7 +15,9 @@ use oulipoly_runtime::session_metadata::{MetadataError, locate_session_metadata}
 use oulipoly_runtime::session_replace::{self, ReplaceError};
 use oulipoly_runtime::trace::{TraceOptions, render_ascii_trace, trace_invocation_with_sessions};
 use oulipoly_state::schema_probe::{self, ProbeError};
-use oulipoly_state::{CompositeInvocationId, InvocationStart, ReadOnlyOpenError, StateDb};
+use oulipoly_state::{
+    CompositeInvocationId, InvocationStart, InvocationStatus, ReadOnlyOpenError, StateDb,
+};
 
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
@@ -1006,10 +1008,13 @@ impl Drop for FinalizerGuard<'_> {
             return;
         }
 
-        if let Err(err) =
-            self.db
-                .finalize_invocation(self.invocation_id, false, -1, Some("guard_drop"), None)
-        {
+        if let Err(err) = self.db.finalize_invocation(
+            self.invocation_id,
+            false,
+            -1,
+            Some("guard_drop"),
+            Some("guard_drop"),
+        ) {
             eprintln!("Warning: Failed to finalize invocation in guard: {err}");
         }
     }
@@ -1685,17 +1690,24 @@ fn run_repl(
         }
     });
 
-    match executor::cli::execute_interactive(
+    match executor::cli::execute_interactive_with_result(
         &provider,
         working_dir,
         Some(&invocation_env),
         resume_payload,
     ) {
-        Ok(exit_code) => {
+        Ok(result) => {
+            let exit_code = result.exit_code;
             if resume.is_none() {
                 state.update_session_capture(invocation_row_id, None, "none")?;
             }
-            state.finalize_invocation(invocation_row_id, exit_code == 0, exit_code, None, None)?;
+            state.finalize_invocation(
+                invocation_row_id,
+                exit_code == 0,
+                exit_code,
+                None,
+                result.terminal_reason.as_deref(),
+            )?;
             guard.mark_finalized();
             if exit_code == 0 {
                 let emitted = ingest_and_emit_session_id(
@@ -1722,7 +1734,7 @@ fn run_repl(
             }
             Ok(exit_code)
         }
-        Err(spawn_err) => {
+        Err(_spawn_err) => {
             if resume.is_none() {
                 state.update_session_capture(invocation_row_id, None, "none")?;
             }
@@ -1731,7 +1743,7 @@ fn run_repl(
                 false,
                 1,
                 Some("spawn_error"),
-                Some(&spawn_err),
+                Some("spawn_error"),
             )?;
             guard.mark_finalized();
             Ok(1)
@@ -1882,13 +1894,13 @@ fn run_resume(
         },
     ) {
         Ok(result) => result,
-        Err(spawn_err) => {
+        Err(_spawn_err) => {
             state.finalize_invocation(
                 invocation_row_id,
                 false,
                 1,
                 Some("spawn_error"),
-                Some(&spawn_err),
+                Some("spawn_error"),
             )?;
             guard.mark_finalized();
             return Ok(1);
@@ -1914,7 +1926,7 @@ fn run_resume(
         success,
         result.exit_code,
         error_category.as_deref(),
-        if success { None } else { Some(&result.stderr) },
+        result.terminal_reason.as_deref(),
     )?;
     guard.mark_finalized();
 
@@ -2011,13 +2023,26 @@ fn run_with_balancing(
         Ok(result) => result,
         Err(err) => {
             state
-                .finalize_invocation(invocation_row_id, false, -1, None, Some(&err))
+                .finalize_invocation(
+                    invocation_row_id,
+                    false,
+                    -1,
+                    Some("spawn_error"),
+                    Some("spawn_error"),
+                )
                 .unwrap_or_else(|finalize_err| {
                     eprintln!("Warning: Failed to finalize invocation: {finalize_err}")
                 });
             return Err(err);
         }
     };
+
+    supervise_captured_child_invocations(
+        &state,
+        invocation_row_id,
+        &result.captured_child_invocations,
+        result.terminal_reason.as_deref(),
+    );
 
     if let executor::SessionCaptureMethod::Failed(reason) = &result.session_capture.method {
         eprintln!("[session-capture] {reason}");
@@ -2050,7 +2075,7 @@ fn run_with_balancing(
             success,
             result.exit_code,
             error_category.as_deref(),
-            if success { None } else { Some(&result.stderr) },
+            result.terminal_reason.as_deref(),
         )
         .unwrap_or_else(|e| eprintln!("Warning: Failed to finalize invocation: {e}"));
 
@@ -2090,6 +2115,44 @@ fn run_with_balancing(
     }
 
     Ok(result.exit_code)
+}
+
+fn supervise_captured_child_invocations(
+    state: &StateDb,
+    parent_invocation_id: i64,
+    captured: &[executor::CapturedChildInvocation],
+    parent_terminal_reason: Option<&str>,
+) {
+    let observed_reason = parent_terminal_reason.unwrap_or("unknown_exit");
+    let supervisor_reason = format!("supervisor_observed_{observed_reason}");
+
+    for child in captured {
+        let row = match state.get_invocation_by_uuid(&child.composite_id.id) {
+            Ok(Some(row)) => row,
+            Ok(None) => continue,
+            Err(err) => {
+                eprintln!(
+                    "Warning: Failed to inspect captured child invocation {}: {err}",
+                    child.composite_id.id
+                );
+                continue;
+            }
+        };
+        if row.status != InvocationStatus::Running
+            || row.parent_invocation_id != Some(parent_invocation_id)
+            || row.provider_name.as_deref() != Some(child.composite_id.source.as_str())
+        {
+            continue;
+        }
+        if let Err(err) =
+            state.finalize_invocation(row.id, false, -1, None, Some(&supervisor_reason))
+        {
+            eprintln!(
+                "Warning: Failed to finalize captured child invocation {}: {err}",
+                child.composite_id.id
+            );
+        }
+    }
 }
 
 fn resolve_parent_invocation_id(state: &StateDb) -> Option<i64> {
@@ -3345,8 +3408,12 @@ mod tests {
         assert_eq!(row.exit_code, Some(0));
     }
 
+    // RISK: FinalizerGuard panic/drop fallback could leave terminal_reason null while setting guard_drop error_category (proposal §test-intent "FinalizerGuard panic-path characterization", assumption A4)
+    // LEVEL: unit
+    // SOURCE: contracts/nes-250-contract.md § Test catalog § Finalize cascade (T-FINAL-GUARD)
     #[test]
     fn finalizer_guard_drop_finalizes_failed_row_during_panic_unwind() {
+        // CHARACTERIZATION: T-FINAL-GUARD writes error_category=guard_drop and terminal_reason=guard_drop.
         let db = test_db();
         let start = InvocationStart {
             invocation_uuid: Uuid::new_v4().to_string(),
@@ -3371,6 +3438,7 @@ mod tests {
         assert_eq!(row.success, Some(false));
         assert_eq!(row.exit_code, Some(-1));
         assert_eq!(row.error_category.as_deref(), Some("guard_drop"));
+        assert_eq!(row.terminal_reason.as_deref(), Some("guard_drop"));
     }
 
     #[test]

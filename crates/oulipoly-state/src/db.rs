@@ -291,6 +291,7 @@ pub struct InvocationRecord {
     pub success: Option<bool>,
     pub exit_code: Option<i32>,
     pub error_category: Option<String>,
+    pub terminal_reason: Option<String>,
     pub session_id: Option<String>,
     pub session_capture_method: Option<String>,
     pub resume_acceptance_status: Option<String>,
@@ -371,10 +372,39 @@ impl CompositeInvocationId {
 
     /// Parse from a raw env-var value and validate the UUID payload.
     pub fn parse_env_value(s: &str) -> Result<Self, String> {
-        let parsed: CompositeInvocationId =
-            serde_json::from_str(s).map_err(|e| format!("Invalid invocation JSON: {e}"))?;
+        let parsed: CompositeInvocationId = serde_json::from_str(s)
+            .or_else(|json_err| Self::parse_shell_mangled_env_value(s).ok_or(json_err))
+            .map_err(|e| format!("Invalid invocation JSON: {e}"))?;
         Uuid::parse_str(&parsed.id).map_err(|e| format!("Invalid invocation UUID: {e}"))?;
         Ok(parsed)
+    }
+
+    fn parse_shell_mangled_env_value(s: &str) -> Option<Self> {
+        let inner = s.trim().strip_prefix('{')?.strip_suffix('}')?;
+        let mut source = None;
+        let mut id = None;
+        let mut fields = 0;
+        for part in inner.split(',') {
+            let (key, value) = part.split_once(':')?;
+            fields += 1;
+            let value = value
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_string();
+            match key.trim() {
+                "source" => source = Some(value),
+                "id" => id = Some(value),
+                _ => return None,
+            }
+        }
+        if fields != 2 {
+            return None;
+        }
+        Some(Self {
+            source: source?,
+            id: id?,
+        })
     }
 }
 
@@ -771,6 +801,21 @@ impl StateDb {
                 .map_err(|e| {
                     format!("Failed to add invocations.resume_acceptance_evidence: {e}")
                 })?;
+            }
+            if !columns.iter().any(|column| column == "terminal_reason") {
+                match conn.execute(
+                    "ALTER TABLE invocations ADD COLUMN terminal_reason TEXT",
+                    [],
+                ) {
+                    Ok(_) => {}
+                    Err(rusqlite::Error::SqliteFailure(_, message))
+                        if message
+                            .as_deref()
+                            .is_some_and(|value| value.contains("duplicate column name")) => {}
+                    Err(e) => {
+                        return Err(format!("Failed to add invocations.terminal_reason: {e}"));
+                    }
+                }
             }
             if columns.iter().any(|column| column == "quota_tight_routing") {
                 conn.execute(
@@ -1219,6 +1264,7 @@ impl StateDb {
             success INTEGER,
             exit_code INTEGER,
             error_category TEXT,
+            terminal_reason TEXT,
             session_id TEXT,
             session_capture_method TEXT,
             resume_acceptance_status TEXT,
@@ -1316,6 +1362,7 @@ impl StateDb {
                 success INTEGER,
                 exit_code INTEGER,
                 error_category TEXT,
+                terminal_reason TEXT,
                 session_id TEXT,
                 session_capture_method TEXT,
                 resume_acceptance_status TEXT,
@@ -1339,13 +1386,14 @@ impl StateDb {
                         success,
                         exit_code,
                         error_category,
+                        terminal_reason,
                         session_id,
                         session_capture_method,
                         resume_acceptance_status,
                         resume_acceptance_evidence,
                         created_at,
                         finished_at
-                     ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, NULL, NULL, NULL, NULL, ?9, ?9)",
+                     ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, NULL, NULL, NULL, NULL, NULL, ?9, ?9)",
                 )
                 .map_err(|e| format!("Failed to prepare migrated invocation insert: {e}"))?;
 
@@ -1432,9 +1480,10 @@ impl StateDb {
                     success,
                     exit_code,
                     error_category,
+                    terminal_reason,
                     created_at,
                     finished_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, ?7, NULL)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, NULL, ?7, NULL)",
                 params![
                     &start.invocation_uuid,
                     &start.model_name,
@@ -1455,7 +1504,7 @@ impl StateDb {
         success: bool,
         exit_code: i32,
         error_category: Option<&str>,
-        stderr_snippet: Option<&str>,
+        terminal_reason: Option<&str>,
     ) -> Result<(), String> {
         let now = Utc::now().to_rfc3339();
         let tx = self
@@ -1485,28 +1534,35 @@ impl StateDb {
             return Err(format!("Invocation {id} is already finalized"));
         }
 
-        tx.execute(
-            "UPDATE invocations
+        let updated = tx
+            .execute(
+                "UPDATE invocations
              SET status = ?1,
                  success = ?2,
                  exit_code = ?3,
                  error_category = ?4,
-                 finished_at = ?5
-             WHERE id = ?6",
-            params![
-                if success {
-                    InvocationStatus::Succeeded.as_str()
-                } else {
-                    InvocationStatus::Failed.as_str()
-                },
-                success as i64,
-                exit_code,
-                error_category,
-                &now,
-                id,
-            ],
-        )
-        .map_err(|e| format!("Failed to finalize invocation {id}: {e}"))?;
+                 terminal_reason = ?5,
+                 finished_at = ?6
+             WHERE id = ?7 AND status = ?8",
+                params![
+                    if success {
+                        InvocationStatus::Succeeded.as_str()
+                    } else {
+                        InvocationStatus::Failed.as_str()
+                    },
+                    success as i64,
+                    exit_code,
+                    error_category,
+                    terminal_reason,
+                    &now,
+                    id,
+                    InvocationStatus::Running.as_str(),
+                ],
+            )
+            .map_err(|e| format!("Failed to finalize invocation {id}: {e}"))?;
+        if updated == 0 {
+            return Err(format!("Invocation {id} is already finalized"));
+        }
 
         if let Some(provider_name) = provider_name {
             tx.execute(
@@ -1530,7 +1586,7 @@ impl StateDb {
 
             if !success {
                 let snippet =
-                    stderr_snippet.map(|value| value.chars().take(500).collect::<String>());
+                    terminal_reason.map(|value| value.chars().take(500).collect::<String>());
                 tx.execute(
                     "UPDATE providers SET last_error = ?1, last_error_at = ?2
                      WHERE model_name = ?3 AND provider_name = ?4",
@@ -1679,7 +1735,7 @@ impl StateDb {
             .prepare(
                 "SELECT id, invocation_uuid, model_name, provider_name, provider_index,
                         parent_invocation_id, status, success, exit_code, error_category,
-                        session_id, session_capture_method,
+                        terminal_reason, session_id, session_capture_method,
                         resume_acceptance_status, resume_acceptance_evidence,
                         created_at, finished_at
                  FROM invocations
@@ -1704,7 +1760,7 @@ impl StateDb {
             .prepare(
                 "SELECT id, invocation_uuid, model_name, provider_name, provider_index,
                         parent_invocation_id, status, success, exit_code, error_category,
-                        session_id, session_capture_method,
+                        terminal_reason, session_id, session_capture_method,
                         resume_acceptance_status, resume_acceptance_evidence,
                         created_at, finished_at
                  FROM invocations
@@ -1722,14 +1778,14 @@ impl StateDb {
     }
 
     fn map_invocation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<InvocationRecord> {
-        let created_at_raw: String = row.get(14)?;
-        let finished_at_raw: Option<String> = row.get(15)?;
+        let created_at_raw: String = row.get(15)?;
+        let finished_at_raw: Option<String> = row.get(16)?;
         let status_raw: String = row.get(6)?;
         let created_at = DateTime::parse_from_rfc3339(&created_at_raw)
             .map(|dt| dt.with_timezone(&Utc))
             .map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    14,
+                    15,
                     rusqlite::types::Type::Text,
                     Box::new(e),
                 )
@@ -1740,7 +1796,7 @@ impl StateDb {
                     .map(|dt| dt.with_timezone(&Utc))
                     .map_err(|e| {
                         rusqlite::Error::FromSqlConversionFailure(
-                            15,
+                            16,
                             rusqlite::types::Type::Text,
                             Box::new(e),
                         )
@@ -1766,10 +1822,11 @@ impl StateDb {
             success: row.get::<_, Option<i64>>(7)?.map(|value| value != 0),
             exit_code: row.get(8)?,
             error_category: row.get(9)?,
-            session_id: row.get(10)?,
-            session_capture_method: row.get(11)?,
-            resume_acceptance_status: row.get(12)?,
-            resume_acceptance_evidence: row.get(13)?,
+            terminal_reason: row.get(10)?,
+            session_id: row.get(11)?,
+            session_capture_method: row.get(12)?,
+            resume_acceptance_status: row.get(13)?,
+            resume_acceptance_evidence: row.get(14)?,
             created_at,
             finished_at,
         })
@@ -4089,6 +4146,16 @@ mod tests {
             .unwrap()
     }
 
+    fn invocation_columns(db: &StateDb) -> Vec<String> {
+        db.conn
+            .prepare("PRAGMA table_info(invocations)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
     #[test]
     fn mark_exhausted_writes_timestamp_on_existing_quota_row() {
         let db = test_db();
@@ -4573,6 +4640,119 @@ mod tests {
                 "sqlite_autoindex_invocations_1".to_string(),
             ]
         );
+    }
+
+    // RISK: fresh schema path could omit terminal_reason (proposal §test-intent "schema cascade tests", assumption A5)
+    // LEVEL: unit
+    // SOURCE: contracts/nes-250-contract.md § Test catalog § Schema cascade (T-SCHEMA-FRESH)
+    #[test]
+    fn t_schema_fresh_invocations_schema_includes_nullable_terminal_reason() {
+        let db = test_db();
+        let columns = invocation_columns(&db);
+
+        assert!(
+            columns.iter().any(|column| column == "terminal_reason"),
+            "fresh invocations schema must expose terminal_reason: {columns:?}"
+        );
+
+        let nullable: i64 = db
+            .conn
+            .query_row(
+                "SELECT [notnull] FROM pragma_table_info('invocations') WHERE name = 'terminal_reason'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(nullable, 0, "terminal_reason must be nullable");
+    }
+
+    // RISK: incremental ALTER path could miss terminal_reason or destroy existing invocation data (proposal §test-intent "schema cascade tests", assumption A5)
+    // LEVEL: unit
+    // SOURCE: contracts/nes-250-contract.md § Test catalog § Schema cascade (T-SCHEMA-INCREMENTAL)
+    #[test]
+    fn t_schema_incremental_adds_terminal_reason_without_losing_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE invocations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                invocation_uuid TEXT NOT NULL UNIQUE,
+                model_name TEXT NOT NULL,
+                provider_name TEXT,
+                provider_index INTEGER NOT NULL,
+                parent_invocation_id INTEGER REFERENCES invocations(id),
+                status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'legacy')),
+                success INTEGER,
+                exit_code INTEGER,
+                error_category TEXT,
+                session_id TEXT,
+                session_capture_method TEXT,
+                resume_acceptance_status TEXT,
+                resume_acceptance_evidence TEXT,
+                created_at TEXT NOT NULL,
+                finished_at TEXT
+            );
+            INSERT INTO invocations (
+                invocation_uuid, model_name, provider_name, provider_index,
+                status, success, exit_code, error_category, created_at, finished_at
+            ) VALUES (
+                '11111111-1111-1111-1111-111111111111',
+                'fixture-model', 'fixture-provider', 0,
+                'failed', 0, 7, 'fixture_error',
+                '2026-04-17T08:00:00Z', '2026-04-17T08:00:01Z'
+            );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = StateDb::open(&path).unwrap();
+        let columns = invocation_columns(&db);
+        assert!(
+            columns.iter().any(|column| column == "terminal_reason"),
+            "incremental migration must add terminal_reason: {columns:?}"
+        );
+
+        let row = db
+            .get_invocation_by_uuid("11111111-1111-1111-1111-111111111111")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, InvocationStatus::Failed);
+        assert_eq!(row.exit_code, Some(7));
+        assert_eq!(row.error_category.as_deref(), Some("fixture_error"));
+        assert_eq!(row.terminal_reason, None);
+    }
+
+    // RISK: legacy rebuild path could omit terminal_reason or synthesize historical terminal meaning (proposal §test-intent "schema cascade tests", assumption A5)
+    // LEVEL: unit
+    // SOURCE: contracts/nes-250-contract.md § Test catalog § Schema cascade (T-SCHEMA-LEGACY)
+    #[test]
+    fn t_schema_legacy_rebuild_adds_terminal_reason_and_migrates_null() {
+        let dir = legacy_invocations_db(&[(
+            "mapped-model",
+            0,
+            0,
+            7,
+            Some("rate_limit"),
+            "2026-04-17T08:00:00Z",
+        )]);
+
+        let db = StateDb::open(&dir.path().join("state.db")).unwrap();
+        let columns = invocation_columns(&db);
+        assert!(
+            columns.iter().any(|column| column == "terminal_reason"),
+            "legacy rebuild must add terminal_reason: {columns:?}"
+        );
+
+        let terminal_reason: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT terminal_reason FROM invocations WHERE model_name = 'mapped-model'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(terminal_reason, None);
     }
 
     #[test]
@@ -5529,6 +5709,9 @@ name = "fixture-provider"
         assert_eq!(after[0].last_delta_calls, Some(50));
     }
 
+    // RISK: start_invocation could write terminal metadata on a running row (proposal §test-intent "terminal-reason absence characterization", assumption A5)
+    // LEVEL: unit
+    // SOURCE: contracts/nes-250-contract.md § Test catalog § Run-row null contract (T-RUN-NULL)
     #[test]
     fn start_invocation_inserts_running_row_with_null_terminal_fields() {
         let db = test_db();
@@ -5552,6 +5735,7 @@ name = "fixture-provider"
         assert_eq!(row.parent_invocation_id, None);
         assert_eq!(row.success, None);
         assert_eq!(row.exit_code, None);
+        assert_eq!(row.terminal_reason, None);
         assert_eq!(row.finished_at, None);
     }
 
@@ -5599,6 +5783,9 @@ name = "fixture-provider"
         assert_eq!(row.parent_invocation_id, Some(parent_id));
     }
 
+    // RISK: finalize_invocation could fail to persist caller-provided terminal_reason separately from error_category (proposal §test-intent "terminal-reason absence characterization", assumption A5)
+    // LEVEL: unit
+    // SOURCE: contracts/nes-250-contract.md § Schema § StateDb::finalize_invocation
     #[test]
     fn finalize_invocation_sets_terminal_fields() {
         let db = test_db();
@@ -5611,16 +5798,18 @@ name = "fixture-provider"
         };
         let id = db.start_invocation(&start).unwrap();
 
-        db.finalize_invocation(id, true, 0, None, None).unwrap();
+        db.finalize_invocation(id, false, 7, None, Some("exit_nonzero"))
+            .unwrap();
 
         let row = db
             .get_invocation_by_uuid(&start.invocation_uuid)
             .unwrap()
             .unwrap();
-        assert_eq!(row.status, InvocationStatus::Succeeded);
-        assert_eq!(row.success, Some(true));
-        assert_eq!(row.exit_code, Some(0));
+        assert_eq!(row.status, InvocationStatus::Failed);
+        assert_eq!(row.success, Some(false));
+        assert_eq!(row.exit_code, Some(7));
         assert_eq!(row.error_category, None);
+        assert_eq!(row.terminal_reason.as_deref(), Some("exit_nonzero"));
         assert!(row.finished_at.is_some());
     }
 
@@ -5727,10 +5916,28 @@ name = "fixture-provider"
             parent_invocation_id: None,
         };
         let id = db.start_invocation(&start).unwrap();
-        db.finalize_invocation(id, true, 0, None, None).unwrap();
+        db.finalize_invocation(id, true, 0, None, Some("exit_zero"))
+            .unwrap();
 
-        let err = db.finalize_invocation(id, true, 0, None, None).unwrap_err();
+        let err = db
+            .finalize_invocation(
+                id,
+                false,
+                -1,
+                None,
+                Some("supervisor_observed_unknown_exit"),
+            )
+            .unwrap_err();
         assert!(err.contains("already"));
+
+        let row = db
+            .get_invocation_by_uuid(&start.invocation_uuid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, InvocationStatus::Succeeded);
+        assert_eq!(row.success, Some(true));
+        assert_eq!(row.exit_code, Some(0));
+        assert_eq!(row.terminal_reason.as_deref(), Some("exit_zero"));
     }
 
     #[test]
@@ -6102,6 +6309,38 @@ name = "fixture-provider"
         )
         .unwrap();
         assert_eq!(parsed, composite);
+    }
+
+    #[test]
+    fn composite_invocation_id_parses_shell_mangled_env_values() {
+        let parsed = CompositeInvocationId::parse_env_value(
+            "{source:fixture-provider,id:7ad2916c-38dd-49e6-a1f7-3ef22766ff70}",
+        )
+        .unwrap();
+
+        assert_eq!(
+            parsed,
+            CompositeInvocationId {
+                source: "fixture-provider".to_string(),
+                id: "7ad2916c-38dd-49e6-a1f7-3ef22766ff70".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn composite_invocation_id_parses_quoted_shell_mangled_env_values() {
+        let parsed = CompositeInvocationId::parse_env_value(
+            r#"{source:"fixture-provider",id:"7ad2916c-38dd-49e6-a1f7-3ef22766ff70"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            parsed,
+            CompositeInvocationId {
+                source: "fixture-provider".to_string(),
+                id: "7ad2916c-38dd-49e6-a1f7-3ef22766ff70".to_string(),
+            }
+        );
     }
 
     #[test]
