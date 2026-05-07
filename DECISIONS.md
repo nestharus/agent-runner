@@ -466,3 +466,38 @@ is made explicit and dated.
 
 **Decision 2 — bun gates unavailable in this environment:** `bun install` fails to resolve `@fortawesome/sharp-solid-svg-icons` and `@fortawesome/sharp-regular-svg-icons` (FontAwesome Pro packages requiring an authenticated npm registry token not present in this dev environment). Without `node_modules`, `bun run check` (biome) and `bun run test` (vitest) cannot execute. The NES-251 fix is Rust-only — no `.ts` / `.tsx` / `.js` / `.jsx` / `.css` files were modified (verified via `git diff --name-only`). Cannot run JS-side gates here; on CI where the FontAwesome Pro token is configured, JS gates run normally and should pass trivially since no JS code changed.
 **Justification:** Per orchestrator policy ("If you can't test the UI, say so explicitly rather than claiming success"), I am explicitly stating the JS gates are environmentally unavailable, NOT failing.
+
+## NES-262 — Phase 2.5 gate decisions (2026-05-07)
+
+**WU:** NES-262 — agent-runner workflow contract fails for oulipoly-agent-cli release path.
+**Phase:** 2.5 (six sub-steps complete; gate answered).
+
+**Decision 1 — proceed in exhaustive mode (q-58424e9e):** `A`. The risk-profile WU-verdict rolled HIGH on 5 of 7 surfaces, triggering the defer-to-prototype option. The HIGH score is driven by unresolved product intent for `oulipoly-agent-cli` (q-90ce3769), not by sprawling parallel systems or by operational-unknown lifecycle. Once product intent is fixed, the touched surface collapses to `.github/workflows/release.yml` + `src-tauri/tests/workflow_yml_contract.rs` — within the implementation pipeline's exhaustive-mode capacity.
+
+**Decision 2 — `oulipoly-agent-cli` ships publicly with asset name `agent` (q-90ce3769):** `A`. The Cargo target declared at `crates/oulipoly-agent-cli/Cargo.toml:7-9` is `[[bin]] name=agent` with entrypoint `src/main.rs`. Existing tests (`crates/oulipoly-agent-cli/tests/agent_rejects_extra_argv.rs:42-53`) invoke the binary through `env!("CARGO_BIN_EXE_agent")`. This is the public-shipping `agents` CLI that the implementation-pipeline orchestrator itself dispatches every WU through (`agents -m claude-opus -p ... -f ... -a ~/ai/agents/implementation-pipeline-orchestrator.md`). Naming alignment with what already works trumps option B (asset name `oulipoly-agent-cli`), option C (both names), and option D (internal/dev-only — incompatible with the pipeline's reliance on it).
+
+**Decision 3 — fix both A8 and A10 atomically within this WU (q-e9fe1e0a):** `A`. The A8 assertion (`workflow_yml_contract.rs:868-891`) requires a `build-oulipoly-agent-cli` job. The A10 assertion (`workflow_yml_contract.rs:918-996`) currently asserts an exact release job set / dependency-edge graph that excludes any new `build-*` job. Fixing one without the other leaves CI red because the two assertions enforce mutually-exclusive states. Both live in the same file; an atomic fix is the correct shape. Phase 3 proposal must address both.
+
+**Rationale:** All three answers narrow the planned change-surface to two files (release.yml + workflow_yml_contract.rs) plus any tests Phase 6 produces. No Phase 4 supported-surface termination is implied. Anti-scope (NES-250 invocation terminal behavior, frontend, trace, state DB, unrelated workflow assertions, Phase 7 anti-scope discipline) holds.
+
+**Revisit when:** A future WU changes the public binary surface for `oulipoly-agent-cli` (e.g., adds a second binary target, renames the asset, or moves the CLI behind a feature flag), or the workflow contract's exemption mechanism is redesigned (e.g., to remove the `oulipoly-agent-runner` grandfather).
+
+## NES-262 — Phase 6c gate exceptions (2026-05-07)
+
+**WU:** NES-262 — agent-runner workflow contract fails for oulipoly-agent-cli release path.
+**Phase:** 6c (final gates).
+
+**Decision — bun gates unavailable in this environment:** `bun install` fails to resolve `@fortawesome/sharp-solid-svg-icons` and `@fortawesome/sharp-regular-svg-icons` (FontAwesome Pro packages requiring an authenticated npm registry token not present in this dev environment, identical to the NES-251 § Decision 2 baseline). Without `node_modules`, `bun run lint` (biome), `bun run typecheck`, and `bun run test` (vitest) cannot execute.
+
+The NES-262 fix touches only `.github/workflows/release.yml` (CI workflow) and `src-tauri/tests/workflow_yml_contract.rs` (Rust test). No `.ts` / `.tsx` / `.js` / `.jsx` / `.css` files were modified (verified via `git diff --name-only`). Cannot run JS-side gates here; on CI where the FontAwesome Pro token is configured, JS gates run normally and should pass trivially since no JS code changed.
+**Justification:** Per orchestrator policy ("If you can't test the UI, say so explicitly rather than claiming success"), I am explicitly stating the JS gates are environmentally unavailable, NOT failing.
+
+**Rust gate evidence (clean rerun, invocation `85a7d004-e3c5-4c23-886f-3c22f4bf8b43`):**
+
+- `cargo fmt --check` = OK
+- `cargo clippy --workspace --tests -- -D warnings` = OK
+- `cargo test -p oulipoly-agent-runner --test workflow_yml_contract` = OK (13 passed, 0 failed; A8 + A10 + A1-A7 + A9 + A11-A13 all green)
+- `cargo test -p oulipoly-agent-runner --test release_yml_contract` = OK (1 passed)
+- `cargo test --workspace` = OK (full workspace green)
+
+**Resolves:** NES-251 § Decision 1 — the orthogonal `assertion_a08_binary_clients_have_release_path` baseline failure documented there is now fixed by this WU's release.yml extension.
