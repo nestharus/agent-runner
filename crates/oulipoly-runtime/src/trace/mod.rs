@@ -22,6 +22,8 @@ pub struct TraceOptions {
     pub transcript: bool,
 }
 
+pub const STALE_RUNNING_THRESHOLD_SECONDS: u64 = 1800;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TraceReport {
     pub requested_id: String,
@@ -54,8 +56,17 @@ pub struct TraceInvocation {
     pub success: Option<bool>,
     pub exit_code: Option<i32>,
     pub error_category: Option<String>,
+    pub terminal_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale_running: Option<StaleRunning>,
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StaleRunning {
+    pub age_seconds: u64,
+    pub threshold_seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -95,6 +106,13 @@ enum AsciiLeaf {
     DepthLimit,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TraceBuildContext<'a> {
+    options: TraceOptions,
+    sessions_cfg: Option<&'a SessionsConfig>,
+    generated_at: DateTime<Utc>,
+}
+
 pub fn trace_invocation(
     db: &StateDb,
     root_uuid: &str,
@@ -117,19 +135,17 @@ pub fn trace_invocation_with_sessions(
         .ok_or_else(|| format!("Invocation not found: {root_uuid}"))?;
 
     let mut visited = HashSet::from([root_record.id]);
-    let root = build_trace_node(
-        db,
-        root_record,
-        None,
-        0,
+    let generated_at = Utc::now();
+    let context = TraceBuildContext {
         options,
         sessions_cfg,
-        &mut visited,
-    )?;
+        generated_at,
+    };
+    let root = build_trace_node(db, root_record, None, 0, context, &mut visited)?;
 
     Ok(TraceReport {
         requested_id: root_uuid.to_string(),
-        generated_at: Utc::now(),
+        generated_at,
         root,
         show_transcript_footer: options.transcript && !options.json,
     })
@@ -154,12 +170,11 @@ fn build_trace_node(
     record: InvocationRecord,
     parent_uuid: Option<String>,
     depth: usize,
-    options: TraceOptions,
-    sessions_cfg: Option<&SessionsConfig>,
+    context: TraceBuildContext<'_>,
     visited: &mut HashSet<i64>,
 ) -> Result<TraceNode, String> {
-    let (session, mut node_warnings) = build_trace_session(db, &record, sessions_cfg)?;
-    let transcript = if options.inline_transcript {
+    let (session, mut node_warnings) = build_trace_session(db, &record, context.sessions_cfg)?;
+    let transcript = if context.options.inline_transcript {
         match read_inline_transcript(db, record.provider_name.as_deref(), session.id.as_deref()) {
             Ok(turns) => Some(turns),
             Err(err) => {
@@ -170,6 +185,37 @@ fn build_trace_node(
     } else {
         None
     };
+    let stored_status = record.status.as_str().to_string();
+    let age_seconds = context
+        .generated_at
+        .signed_duration_since(record.created_at)
+        .num_seconds()
+        .max(0) as u64;
+    let stale_running = record.status == oulipoly_state::InvocationStatus::Running
+        && record.finished_at.is_none()
+        && parent_uuid.is_none()
+        && age_seconds >= STALE_RUNNING_THRESHOLD_SECONDS;
+    let stale_running = stale_running.then_some(StaleRunning {
+        age_seconds,
+        threshold_seconds: STALE_RUNNING_THRESHOLD_SECONDS,
+    });
+    let (status, terminal_reason) = if stale_running.is_some() && context.options.json {
+        (
+            oulipoly_state::InvocationStatus::Failed
+                .as_str()
+                .to_string(),
+            Some("tracing_timeout".to_string()),
+        )
+    } else {
+        (stored_status, record.terminal_reason)
+    };
+    if let Some(stale) = &stale_running {
+        node_warnings.push(format!(
+            "stale_running: row exceeded 30m running threshold (age {}s); status lifted to failed in JSON output only",
+            stale.age_seconds
+        ));
+    }
+
     let mut node = TraceNode {
         invocation: TraceInvocation {
             row_id: record.id,
@@ -177,10 +223,12 @@ fn build_trace_node(
             source: record.provider_name.clone(),
             model_name: record.model_name,
             parent_id: parent_uuid,
-            status: record.status.as_str().to_string(),
+            status,
             success: record.success,
             exit_code: record.exit_code,
             error_category: record.error_category,
+            terminal_reason,
+            stale_running,
             started_at: record.created_at,
             finished_at: record.finished_at,
         },
@@ -192,7 +240,7 @@ fn build_trace_node(
     };
 
     let children = db.list_invocation_children(node.invocation.row_id)?;
-    if depth >= options.max_depth {
+    if depth >= context.options.max_depth {
         if !children.is_empty() {
             node.warnings.push(format!(
                 "depth limit reached at child of {}",
@@ -218,8 +266,7 @@ fn build_trace_node(
             child,
             Some(node.invocation.id.clone()),
             depth + 1,
-            options,
-            sessions_cfg,
+            context,
             visited,
         )?;
         node.warnings.extend(child_node.warnings.iter().cloned());
@@ -451,6 +498,13 @@ fn render_ascii_node(node: &TraceNode, depth: usize, output: &mut String) {
     output.push_str(&format_ascii_node(node));
     output.push('\n');
 
+    for warning in &node.warnings {
+        output.push_str(&"  ".repeat(depth + 1));
+        output.push_str("! ");
+        output.push_str(warning);
+        output.push('\n');
+    }
+
     for child in &node.children {
         render_ascii_node(child, depth + 1, output);
     }
@@ -505,7 +559,7 @@ fn format_ascii_node(node: &TraceNode) -> String {
 mod tests {
     use super::*;
     use crate::test_support::env_lock;
-    use chrono::{DateTime, Utc};
+    use chrono::{DateTime, Duration, Utc};
     use oulipoly_state::{SessionTurnIngest, StateDb};
     use rusqlite::{Connection, params};
     use std::fs;
@@ -529,6 +583,7 @@ mod tests {
         success: Option<bool>,
         exit_code: Option<i32>,
         error_category: Option<&'a str>,
+        terminal_reason: Option<&'a str>,
         created_at: &'a str,
         finished_at: Option<&'a str>,
     }
@@ -558,9 +613,10 @@ mod tests {
                         success,
                         exit_code,
                         error_category,
+                        terminal_reason,
                         created_at,
                         finished_at
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                     params![
                         row.row_id,
                         row.invocation_uuid,
@@ -572,6 +628,7 @@ mod tests {
                         row.success.map(|value| if value { 1i64 } else { 0i64 }),
                         row.exit_code,
                         row.error_category,
+                        row.terminal_reason,
                         row.created_at,
                         row.finished_at,
                     ],
@@ -773,6 +830,7 @@ transcript_locator = "{}"
                 success: Some(true),
                 exit_code: Some(0),
                 error_category: None,
+                terminal_reason: None,
                 created_at: "2026-04-17T08:00:00Z",
                 finished_at: Some("2026-04-17T08:00:05Z"),
             },
@@ -787,6 +845,7 @@ transcript_locator = "{}"
                 success: Some(false),
                 exit_code: Some(7),
                 error_category: Some("fixture_error"),
+                terminal_reason: Some("exit_nonzero"),
                 created_at: "2026-04-17T08:00:02Z",
                 finished_at: Some("2026-04-17T08:00:06Z"),
             },
@@ -801,6 +860,7 @@ transcript_locator = "{}"
                 success: None,
                 exit_code: None,
                 error_category: None,
+                terminal_reason: None,
                 created_at: "2026-04-17T08:00:01Z",
                 finished_at: None,
             },
@@ -815,6 +875,7 @@ transcript_locator = "{}"
                 success: Some(true),
                 exit_code: Some(0),
                 error_category: None,
+                terminal_reason: None,
                 created_at: "2026-04-17T08:00:03Z",
                 finished_at: Some("2026-04-17T08:00:04Z"),
             },
@@ -833,6 +894,7 @@ transcript_locator = "{}"
             success: Some(false),
             exit_code: Some(1),
             error_category: Some("legacy"),
+            terminal_reason: None,
             created_at: "2026-04-17T09:00:00Z",
             finished_at: Some("2026-04-17T09:00:01Z"),
         }]
@@ -851,6 +913,7 @@ transcript_locator = "{}"
                 success: Some(true),
                 exit_code: Some(0),
                 error_category: None,
+                terminal_reason: None,
                 created_at: "2026-04-17T08:00:00Z",
                 finished_at: Some("2026-04-17T08:00:05Z"),
             },
@@ -865,6 +928,7 @@ transcript_locator = "{}"
                 success: None,
                 exit_code: None,
                 error_category: None,
+                terminal_reason: None,
                 created_at: "2026-04-17T08:00:01Z",
                 finished_at: None,
             },
@@ -879,6 +943,7 @@ transcript_locator = "{}"
                 success: Some(true),
                 exit_code: Some(0),
                 error_category: None,
+                terminal_reason: None,
                 created_at: "2026-04-17T08:00:02Z",
                 finished_at: Some("2026-04-17T08:00:03Z"),
             },
@@ -1042,6 +1107,57 @@ transcript_locator = "{}"
         );
     }
 
+    // RISK: trace JSON could drop existing fields while adding terminal_reason/stale_running (proposal §test-intent "JSON contract test", assumptions A6/A7)
+    // LEVEL: unit
+    // SOURCE: contracts/nes-250-contract.md § Test catalog § Trace JSON contract (T-TRACE-JSON-ADDITIVE)
+    #[test]
+    fn t_trace_json_additive_keeps_existing_keys_and_adds_terminal_reason() {
+        let fixture = TraceFixture::new(&base_rows());
+        let db = fixture.db();
+
+        let report = trace_invocation(
+            &db,
+            ROOT_UUID,
+            TraceOptions {
+                max_depth: 64,
+                json: true,
+                inline_transcript: false,
+                transcript: false,
+            },
+        )
+        .unwrap();
+        let json = serde_json::to_value(&report).unwrap();
+        let root = json["root"]["invocation"].as_object().unwrap();
+        for key in [
+            "row_id",
+            "id",
+            "source",
+            "model_name",
+            "parent_id",
+            "status",
+            "success",
+            "exit_code",
+            "error_category",
+            "started_at",
+            "finished_at",
+        ] {
+            assert!(
+                root.contains_key(key),
+                "missing existing key {key}: {root:?}"
+            );
+        }
+        assert!(root.contains_key("terminal_reason"));
+        assert!(root["terminal_reason"].is_null());
+
+        let failed_child = &json["root"]["children"][1]["invocation"];
+        assert_eq!(failed_child["status"], "failed");
+        assert_eq!(failed_child["error_category"], "fixture_error");
+        assert_eq!(failed_child["terminal_reason"], "exit_nonzero");
+    }
+
+    // RISK: non-stale running rows could lose the explicit null-terminal JSON contract (proposal §test-intent "terminal-reason absence characterization", assumption A5)
+    // LEVEL: unit
+    // SOURCE: contracts/nes-250-contract.md § Test catalog § Trace JSON contract (T-TRACE-JSON-RUNNING-NON-STALE-NULL)
     #[test]
     fn json_running_row_uses_null_terminal_fields() {
         let fixture = TraceFixture::new(&base_rows());
@@ -1064,7 +1180,200 @@ transcript_locator = "{}"
         assert_eq!(running["status"], "running");
         assert!(running["success"].is_null());
         assert!(running["exit_code"].is_null());
+        assert!(running["terminal_reason"].is_null());
         assert!(running["finished_at"].is_null());
+        assert!(
+            !running.as_object().unwrap().contains_key("stale_running"),
+            "T-TRACE-JSON-RUNNING-NON-STALE-NULL omits stale_running for fresh running rows"
+        );
+    }
+
+    // RISK: stale-running JSON lift could leave audit JSON in stored running/null shape (proposal §test-intent "Replace stale-running trace characterization", assumptions A5/A7)
+    // LEVEL: unit
+    // SOURCE: contracts/nes-250-contract.md § Test catalog § Stale-running JSON lift (T-STALE-LIFT-JSON)
+    #[test]
+    fn t_stale_lift_json_projects_old_running_row_to_failed_with_reason() {
+        let created_at = (Utc::now() - Duration::minutes(31)).to_rfc3339();
+        let rows = [FixtureRow {
+            row_id: 1,
+            invocation_uuid: ROOT_UUID,
+            model_name: "fixture-root",
+            provider_name: Some("fixture-provider"),
+            provider_index: 0,
+            parent_invocation_id: None,
+            status: "running",
+            success: None,
+            exit_code: None,
+            error_category: None,
+            terminal_reason: None,
+            created_at: &created_at,
+            finished_at: None,
+        }];
+        let fixture = TraceFixture::new(&rows);
+        let db = fixture.db();
+
+        let report = trace_invocation(
+            &db,
+            ROOT_UUID,
+            TraceOptions {
+                max_depth: 64,
+                json: true,
+                inline_transcript: false,
+                transcript: false,
+            },
+        )
+        .unwrap();
+        let json = serde_json::to_value(&report).unwrap();
+        let invocation = &json["root"]["invocation"];
+
+        assert_eq!(invocation["status"], "failed");
+        assert!(invocation["success"].is_null());
+        assert!(invocation["exit_code"].is_null());
+        assert!(invocation["finished_at"].is_null());
+        assert_eq!(invocation["terminal_reason"], "tracing_timeout");
+        assert!(
+            invocation["stale_running"]["age_seconds"].as_u64().unwrap()
+                >= STALE_RUNNING_THRESHOLD_SECONDS
+        );
+        assert_eq!(
+            invocation["stale_running"]["threshold_seconds"],
+            STALE_RUNNING_THRESHOLD_SECONDS
+        );
+        assert!(
+            json["root"]["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning.as_str().unwrap().contains("stale_running")),
+            "T-STALE-LIFT-JSON emits stable stale_running warning"
+        );
+    }
+
+    // RISK: stale-running JSON lift could mutate durable invocation state (proposal §test-intent "JSON-only stale-lift isolation test", assumption A5)
+    // LEVEL: unit
+    // SOURCE: contracts/nes-250-contract.md § Test catalog § Stale-running JSON lift (T-STALE-LIFT-DB-UNCHANGED)
+    #[test]
+    fn t_stale_lift_db_unchanged_after_json_trace() {
+        let created_at = (Utc::now() - Duration::minutes(31)).to_rfc3339();
+        let rows = [FixtureRow {
+            row_id: 1,
+            invocation_uuid: ROOT_UUID,
+            model_name: "fixture-root",
+            provider_name: Some("fixture-provider"),
+            provider_index: 0,
+            parent_invocation_id: None,
+            status: "running",
+            success: None,
+            exit_code: None,
+            error_category: None,
+            terminal_reason: None,
+            created_at: &created_at,
+            finished_at: None,
+        }];
+        let fixture = TraceFixture::new(&rows);
+        let db = fixture.db();
+
+        let _ = trace_invocation(
+            &db,
+            ROOT_UUID,
+            TraceOptions {
+                max_depth: 64,
+                json: true,
+                inline_transcript: false,
+                transcript: false,
+            },
+        )
+        .unwrap();
+
+        let row = db.get_invocation_by_uuid(ROOT_UUID).unwrap().unwrap();
+        assert_eq!(row.status, oulipoly_state::InvocationStatus::Running);
+        assert_eq!(row.success, None);
+        assert_eq!(row.exit_code, None);
+        assert_eq!(row.terminal_reason, None);
+        assert_eq!(row.finished_at, None);
+    }
+
+    // RISK: stale-running lift could leak JSON failed projection into human trace output (proposal §test-intent "JSON-only stale-lift isolation test", assumptions A5/A7)
+    // LEVEL: unit
+    // SOURCE: contracts/nes-250-contract.md § Test catalog § Stale-running JSON lift (T-STALE-LIFT-ASCII)
+    #[test]
+    fn t_stale_lift_ascii_preserves_running_status_and_warns() {
+        let created_at = (Utc::now() - Duration::minutes(31)).to_rfc3339();
+        let rows = [FixtureRow {
+            row_id: 1,
+            invocation_uuid: ROOT_UUID,
+            model_name: "fixture-root",
+            provider_name: Some("fixture-provider"),
+            provider_index: 0,
+            parent_invocation_id: None,
+            status: "running",
+            success: None,
+            exit_code: None,
+            error_category: None,
+            terminal_reason: None,
+            created_at: &created_at,
+            finished_at: None,
+        }];
+        let fixture = TraceFixture::new(&rows);
+        let db = fixture.db();
+
+        let report = trace_invocation(&db, ROOT_UUID, trace_options(64)).unwrap();
+        let ascii = render_ascii_trace(&report);
+
+        assert!(ascii.contains("  running  "), "{ascii}");
+        assert!(!ascii.contains("  failed  "), "{ascii}");
+        assert!(ascii.contains("stale_running"), "{ascii}");
+        assert!(
+            report
+                .root
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("stale_running"))
+        );
+    }
+
+    // RISK: fixed stale threshold could classify fresh running rows as failed (proposal §test-intent "Replace stale-running trace characterization", assumption A7)
+    // LEVEL: unit
+    // SOURCE: contracts/nes-250-contract.md § Test catalog § Stale-running JSON lift (T-STALE-NOT-STALE)
+    #[test]
+    fn t_stale_not_stale_running_row_stays_running_without_stale_object() {
+        let created_at = (Utc::now() - Duration::minutes(5)).to_rfc3339();
+        let rows = [FixtureRow {
+            row_id: 1,
+            invocation_uuid: ROOT_UUID,
+            model_name: "fixture-root",
+            provider_name: Some("fixture-provider"),
+            provider_index: 0,
+            parent_invocation_id: None,
+            status: "running",
+            success: None,
+            exit_code: None,
+            error_category: None,
+            terminal_reason: None,
+            created_at: &created_at,
+            finished_at: None,
+        }];
+        let fixture = TraceFixture::new(&rows);
+        let db = fixture.db();
+
+        let report = trace_invocation(
+            &db,
+            ROOT_UUID,
+            TraceOptions {
+                max_depth: 64,
+                json: true,
+                inline_transcript: false,
+                transcript: false,
+            },
+        )
+        .unwrap();
+        let json = serde_json::to_value(&report).unwrap();
+        let invocation = json["root"]["invocation"].as_object().unwrap();
+
+        assert_eq!(invocation["status"], "running");
+        assert!(invocation["terminal_reason"].is_null());
+        assert!(!invocation.contains_key("stale_running"));
+        assert!(json["root"]["warnings"].as_array().unwrap().is_empty());
     }
 
     #[test]
@@ -1447,6 +1756,17 @@ transcript_locator = "{}"
                 .any(|warning| warning.contains("attempted resume target")),
             "{:?}",
             report.root.warnings
+        );
+    }
+
+    #[test]
+    fn ascii_output_renders_non_stale_session_warnings() {
+        let report = build_resumed_trace_report(trace_options(64));
+        let ascii = render_ascii_trace(&report);
+
+        assert!(
+            ascii.contains("attempted resume target"),
+            "ASCII trace should surface non-stale session warnings: {ascii}"
         );
     }
 

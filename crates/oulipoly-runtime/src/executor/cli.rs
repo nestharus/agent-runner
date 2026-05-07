@@ -2,6 +2,7 @@ use oulipoly_config::{
     InputType, ModelConfig, PromptMode, ProviderConfig, ResumeKind, ResumeStrategy, SessionCapture,
     SessionCaptureKind,
 };
+use oulipoly_state::CompositeInvocationId;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::Write;
@@ -23,8 +24,8 @@ use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
 use signal_hook::iterator::{Handle as SignalsHandle, Signals};
 
 use super::{
-    ExecutionResult, ResumeAcceptanceResult, ResumeAcceptanceStatus, SessionCaptureMethod,
-    SessionCaptureResult,
+    CapturedChildInvocation, ExecutionResult, ResumeAcceptanceResult, ResumeAcceptanceStatus,
+    SessionCaptureMethod, SessionCaptureResult,
 };
 
 const LARGE_PROMPT_THRESHOLD: usize = 100 * 1024; // 100KB
@@ -66,6 +67,8 @@ pub fn execute(
         provider_index,
         session_capture: result.session_capture,
         resume_acceptance: None,
+        terminal_reason: result.terminal_reason,
+        captured_child_invocations: result.captured_child_invocations,
     })
 }
 
@@ -101,6 +104,8 @@ pub fn execute_effective(request: EffectiveExecuteRequest<'_>) -> Result<Executi
         provider_index: request.provider_index,
         session_capture: result.session_capture,
         resume_acceptance: None,
+        terminal_reason: result.terminal_reason,
+        captured_child_invocations: result.captured_child_invocations,
     })
 }
 
@@ -271,6 +276,8 @@ struct RawResult {
     stderr: String,
     exit_code: i32,
     session_capture: SessionCaptureResult,
+    terminal_reason: Option<String>,
+    captured_child_invocations: Vec<CapturedChildInvocation>,
 }
 
 pub struct ResumePayload<'a> {
@@ -437,11 +444,14 @@ fn execute_provider_with_args(
 
     let capture_outcome = finalize_capture(&capture_plan, &output.stdout);
     let stdout = maybe_restore_plain_stdout(&capture_plan, &capture_outcome, &output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let result = RawResult {
         stdout,
         telemetry_stdout: output.stdout.clone(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        captured_child_invocations: captured_child_invocations_from_stderr(&stderr),
+        stderr,
         exit_code: output.status.code().unwrap_or(-1),
+        terminal_reason: classify_terminal_reason(&output.status),
         session_capture: capture_outcome,
     };
 
@@ -490,6 +500,8 @@ pub fn execute_resume(
             method: SessionCaptureMethod::None,
         },
         resume_acceptance: Some(resume_acceptance),
+        terminal_reason: result.terminal_reason,
+        captured_child_invocations: result.captured_child_invocations,
     })
 }
 
@@ -567,6 +579,22 @@ pub fn execute_interactive(
     parent_invocation_env: Option<&str>,
     resume: Option<ResumePayload<'_>>,
 ) -> Result<i32, String> {
+    execute_interactive_with_result(provider, working_dir, parent_invocation_env, resume)
+        .map(|result| result.exit_code)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InteractiveExecutionResult {
+    pub exit_code: i32,
+    pub terminal_reason: Option<String>,
+}
+
+pub fn execute_interactive_with_result(
+    provider: &ProviderConfig,
+    working_dir: Option<&Path>,
+    parent_invocation_env: Option<&str>,
+    resume: Option<ResumePayload<'_>>,
+) -> Result<InteractiveExecutionResult, String> {
     let interactive_args = provider.interactive_args.as_ref().ok_or_else(|| {
         format!(
             "provider {} has no interactive_args; cannot launch interactively",
@@ -598,7 +626,11 @@ pub fn execute_interactive(
     #[cfg(unix)]
     drop(signal_guard);
 
-    Ok(exit_code_from_status(status))
+    let terminal_reason = classify_terminal_reason(&status);
+    Ok(InteractiveExecutionResult {
+        exit_code: exit_code_from_status(status),
+        terminal_reason,
+    })
 }
 
 enum CapturePlan {
@@ -836,6 +868,73 @@ fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
     status.code().unwrap_or(-1)
 }
 
+pub fn classify_terminal_reason(status: &std::process::ExitStatus) -> Option<String> {
+    if let Some(code) = status.code() {
+        return (code != 0).then(|| "exit_nonzero".to_string());
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+
+        if let Some(signal) = status.signal() {
+            return Some(format!("signal:{}", signal_name(signal)));
+        }
+    }
+
+    Some("unknown_exit".to_string())
+}
+
+#[cfg(unix)]
+fn signal_name(signal: i32) -> String {
+    match signal {
+        libc::SIGHUP => "SIGHUP".to_string(),
+        libc::SIGINT => "SIGINT".to_string(),
+        libc::SIGQUIT => "SIGQUIT".to_string(),
+        libc::SIGILL => "SIGILL".to_string(),
+        libc::SIGTRAP => "SIGTRAP".to_string(),
+        libc::SIGABRT => "SIGABRT".to_string(),
+        libc::SIGBUS => "SIGBUS".to_string(),
+        libc::SIGFPE => "SIGFPE".to_string(),
+        libc::SIGKILL => "SIGKILL".to_string(),
+        libc::SIGUSR1 => "SIGUSR1".to_string(),
+        libc::SIGSEGV => "SIGSEGV".to_string(),
+        libc::SIGUSR2 => "SIGUSR2".to_string(),
+        libc::SIGPIPE => "SIGPIPE".to_string(),
+        libc::SIGALRM => "SIGALRM".to_string(),
+        libc::SIGTERM => "SIGTERM".to_string(),
+        libc::SIGCHLD => "SIGCHLD".to_string(),
+        libc::SIGCONT => "SIGCONT".to_string(),
+        libc::SIGSTOP => "SIGSTOP".to_string(),
+        libc::SIGTSTP => "SIGTSTP".to_string(),
+        libc::SIGTTIN => "SIGTTIN".to_string(),
+        libc::SIGTTOU => "SIGTTOU".to_string(),
+        _ => signal.to_string(),
+    }
+}
+
+fn captured_child_invocations_from_stderr(stderr: &str) -> Vec<CapturedChildInvocation> {
+    let mut captured = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for line in stderr.lines() {
+        let Some(raw) = line.strip_prefix("OULIPOLY_INVOCATION=") else {
+            continue;
+        };
+        let Ok(composite_id) = CompositeInvocationId::parse_env_value(raw) else {
+            continue;
+        };
+        if seen.insert((composite_id.source.clone(), composite_id.id.clone())) {
+            captured.push(CapturedChildInvocation {
+                composite_id,
+                raw_marker_line: line.to_string(),
+            });
+        }
+    }
+
+    captured
+}
+
 #[cfg(unix)]
 struct InteractiveSignalGuard {
     handle: SignalsHandle,
@@ -895,6 +994,7 @@ mod tests {
         InputDef, InputType, ProviderConfig, ResumeKind, ResumeStrategy, SessionCapture,
         SessionCaptureKind,
     };
+    use oulipoly_state::CompositeInvocationId;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
@@ -953,6 +1053,52 @@ mod tests {
     #[test]
     fn provider_name_with_spaces() {
         assert_eq!(provider_name(r#"env -u FOO "my provider""#), "my provider");
+    }
+
+    // RISK: terminal_reason classifier could drift from D-022 numeric exit-code policy while adding signal vocabulary (proposal §test-intent "direct raw-signal characterization", assumption A8)
+    // LEVEL: unit
+    // SOURCE: contracts/nes-250-contract.md § Vocabulary and § Test catalog § Finalize cascade (T-FINAL-ONESHOT-SIGNAL, T-FINAL-REPL-SIGNAL)
+    #[cfg(unix)]
+    #[test]
+    fn t_terminal_reason_classifier_uses_stable_exit_and_signal_vocabulary() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let success = std::process::ExitStatus::from_raw(0);
+        let nonzero = std::process::ExitStatus::from_raw(7 << 8);
+        let sigterm = std::process::ExitStatus::from_raw(15);
+
+        assert_eq!(classify_terminal_reason(&success), None);
+        assert_eq!(
+            classify_terminal_reason(&nonzero).as_deref(),
+            Some("exit_nonzero")
+        );
+        assert_eq!(
+            classify_terminal_reason(&sigterm).as_deref(),
+            Some("signal:SIGTERM")
+        );
+        assert_eq!(exit_code_from_status(sigterm), 143);
+    }
+
+    // RISK: captured child marker parsing could accept malformed or duplicate OULIPOLY_INVOCATION lines and corrupt unrelated rows (proposal §test-intent "supervised-child fence test", assumptions A1/A2/A4)
+    // LEVEL: unit
+    // SOURCE: contracts/nes-250-contract.md § Process-supervision fence (T-FENCE-SUPERVISOR-CLEAN-CHILD)
+    #[test]
+    fn t_captured_child_marker_parser_keeps_one_valid_marker_and_drops_noise() {
+        let marker = CompositeInvocationId {
+            source: "fixture-child".to_string(),
+            id: "11111111-1111-1111-1111-111111111111".to_string(),
+        };
+        let marker_line = marker.stderr_line();
+        let stderr = format!(
+            "noise\n{}\nOULIPOLY_INVOCATION={{\"source\":\"fixture-child\",\"id\":\"not-a-uuid\"}}\n{}\n",
+            marker_line, marker_line
+        );
+
+        let captured = captured_child_invocations_from_stderr(&stderr);
+
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].composite_id, marker);
+        assert_eq!(captured[0].raw_marker_line, marker_line);
     }
 
     #[test]
