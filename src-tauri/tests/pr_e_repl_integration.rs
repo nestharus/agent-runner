@@ -372,9 +372,7 @@ fn repl_normal_nonzero_child_exit_finalizes_failed_row_with_exit_nonzero_reason(
     assert!(row.finished_at.is_some());
 }
 
-// RISK: REPL signal path could preserve D-022 numeric exit_code but miss the shared terminal_reason vocabulary (proposal §test-intent "interactive raw-signal characterization", assumption A8)
-// LEVEL: particular-integration
-// SOURCE: contracts/nes-250-contract.md § Test catalog § Finalize cascade (T-FINAL-REPL-SIGNAL)
+// risk: exhaustive surfaces 4-6, 10, 13-14, 17, 23-26; level: particular-integration; source: proposals/nes-261-NES-261.md L267-269, A1/A5/A10
 #[test]
 fn repl_raw_sigterm_child_death_finalizes_failed_row_with_128_plus_signal_exit_code() {
     // CHARACTERIZATION: T-FINAL-REPL-SIGNAL preserves D-022 exit_code=143 and adds terminal_reason=signal:SIGTERM.

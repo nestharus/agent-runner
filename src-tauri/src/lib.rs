@@ -872,9 +872,10 @@ mod tests {
         assert!(quota.exhausted_at.is_some());
     }
 
+    // risk: exhaustive surfaces 38-39; level: Rust unit; source: proposals/nes-261-NES-261.md L303-305, A8/A10
     #[cfg(unix)]
     #[test]
-    fn test_model_raw_sigterm_returns_current_direct_exit_code_policy() {
+    fn test_model_raw_sigterm_returns_unified_signal_exit_code() {
         let dir = tempfile::tempdir().unwrap();
         let models_dir = dir.path().join("models");
         std::fs::create_dir_all(&models_dir).unwrap();
@@ -893,6 +894,6 @@ mod tests {
         let result = test_model_for_test(models, models_dir, "sigterm-model").unwrap();
 
         assert!(!result.success);
-        assert_eq!(result.exit_code, -1);
+        assert_eq!(result.exit_code, 143);
     }
 }

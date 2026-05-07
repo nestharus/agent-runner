@@ -1055,9 +1055,26 @@ mod tests {
         assert_eq!(provider_name(r#"env -u FOO "my provider""#), "my provider");
     }
 
-    // RISK: terminal_reason classifier could drift from D-022 numeric exit-code policy while adding signal vocabulary (proposal §test-intent "direct raw-signal characterization", assumption A8)
-    // LEVEL: unit
-    // SOURCE: contracts/nes-250-contract.md § Vocabulary and § Test catalog § Finalize cascade (T-FINAL-ONESHOT-SIGNAL, T-FINAL-REPL-SIGNAL)
+    // risk: exhaustive surfaces 1-7 and 11-12; level: unit; source: proposals/nes-261-NES-261.md L259-261, A1/A9/A10
+    #[cfg(unix)]
+    #[test]
+    fn exit_code_from_status_uses_unified_child_process_contract() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let success = std::process::ExitStatus::from_raw(0);
+        let nonzero = std::process::ExitStatus::from_raw(7 << 8);
+        let sigterm = std::process::ExitStatus::from_raw(15);
+        let sigint = std::process::ExitStatus::from_raw(2);
+        let unknown = std::process::ExitStatus::from_raw(0x7f);
+
+        assert_eq!(exit_code_from_status(&success), 0);
+        assert_eq!(exit_code_from_status(&nonzero), 7);
+        assert_eq!(exit_code_from_status(&sigterm), 143);
+        assert_eq!(exit_code_from_status(&sigint), 130);
+        assert_eq!(exit_code_from_status(&unknown), -1);
+    }
+
+    // risk: exhaustive surfaces 8-9; level: unit; source: proposals/nes-261-NES-261.md L263-265, A5/A10
     #[cfg(unix)]
     #[test]
     fn t_terminal_reason_classifier_uses_stable_exit_and_signal_vocabulary() {
@@ -1076,7 +1093,6 @@ mod tests {
             classify_terminal_reason(&sigterm).as_deref(),
             Some("signal:SIGTERM")
         );
-        assert_eq!(exit_code_from_status(sigterm), 143);
     }
 
     // RISK: captured child marker parsing could accept malformed or duplicate OULIPOLY_INVOCATION lines and corrupt unrelated rows (proposal §test-intent "supervised-child fence test", assumptions A1/A2/A4)

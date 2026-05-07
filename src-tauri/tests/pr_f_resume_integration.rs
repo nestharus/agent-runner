@@ -1688,11 +1688,9 @@ flag = "--resume"
     assert_eq!(row.terminal_reason.as_deref(), Some("exit_nonzero"));
 }
 
-// RISK: resume signal path could miss the same terminal_reason vocabulary used by one-shot (proposal §test-intent "resume terminal-reason tests", assumption A5)
-// LEVEL: particular-integration
-// SOURCE: contracts/nes-250-contract.md § Test catalog § Finalize cascade (T-FINAL-RESUME)
+// risk: exhaustive surfaces 3, 16, 18, 27-29, 57-59; level: particular-integration; source: proposals/nes-261-NES-261.md L278-282, L300-302, A1/A3/A4/A10
 #[test]
-fn t_final_resume_signal_records_terminal_reason_while_preserving_direct_exit_code_policy() {
+fn t_final_resume_signal_records_unified_signal_exit_code_and_terminal_reason() {
     let fixture = Fixture::new();
     let session_id = "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22";
     let script = fixture.write_script(
@@ -1718,7 +1716,7 @@ flag = "--resume"
         .output()
         .unwrap();
 
-    assert_eq!(output.status.code(), Some(255), "{output:?}");
+    assert_eq!(output.status.code(), Some(143), "{output:?}");
     let invocation = parse_invocation(&String::from_utf8_lossy(&output.stderr));
     let row = fixture
         .open_db()
@@ -1727,8 +1725,17 @@ flag = "--resume"
         .unwrap();
     assert_eq!(row.status, InvocationStatus::Failed);
     assert_eq!(row.success, Some(false));
-    assert_eq!(row.exit_code, Some(-1));
+    assert_eq!(row.exit_code, Some(143));
     assert_eq!(row.terminal_reason.as_deref(), Some("signal:SIGTERM"));
+    assert_eq!(row.session_capture_method.as_deref(), Some("resumed"));
+
+    let trace = run_trace_json(&fixture, &invocation.id);
+    assert_eq!(trace["root"]["invocation"]["exit_code"], 143);
+    assert_eq!(
+        trace["root"]["invocation"]["terminal_reason"],
+        "signal:SIGTERM"
+    );
+    assert_eq!(trace["root"]["invocation"]["success"], false);
 }
 
 #[test]
