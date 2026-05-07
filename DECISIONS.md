@@ -446,3 +446,23 @@ five-field shape above (Source / Decision / Rationale / Revisit when). This
 keeps deferrals from accumulating as ambiguous "we'll do it later" notes —
 either the team commits to the work in a future Initiative, or the decision
 is made explicit and dated.
+
+## NES-251 — Phase 2.5.1 characterization-test waiver (2026-05-06)
+
+**WU:** NES-251 — agents-binary `--resume <session_id>` mints fresh session_id per turn.
+**Phase:** 2.5.1 (coverage inventory).
+**Decision:** Skip the characterization-test dispatch. The "uncovered behaviors" enumerated by `nes-251-coverage-inventory.md` (headless / interactive resume where the provider turn script reports a different in-window session id; trace continuity across resumed turns; `find_session_for_invocation_window` ranking; `emit_known_session_id` overwrite path; chain row behavior under preserved invocation row id) are precisely the surfaces NES-251 redefines. Characterization tests of *current* behavior would pin the bug for one phase before Phase 6b deletes/inverts them.
+**Justification:** Coverage inventory found no test that explicitly pins session-id-per-turn semantics on resumed turns; the only adjacent pin is `update_session_capture_safe_to_call_multiple_times` which asserts the lower-level last-write-wins primitive (and Phase 3 will decide if that primitive's caller surface or the primitive itself shifts). The bug-discovery rule (`risk-profile.md`) is self-referential here — the tracker ticket the rule would create *is* NES-251.
+**Evidence:** `planning/nes-251-resume-session-id/research/nes-251-coverage-inventory.md` § "Tests that already pin the buggy behavior" / § "Uncovered behaviors".
+
+## NES-251 — Phase 6c gate exceptions (2026-05-06)
+
+**WU:** NES-251.
+**Phase:** 6c (final gates).
+
+**Decision 1 — `cargo test` baseline failure (orthogonal):** `src-tauri/tests/workflow_yml_contract.rs::assertion_a08_binary_clients_have_release_path` fails. The assertion requires `release.yml` to contain a `build-oulipoly-agent-cli` job because `crates/oulipoly-agent-cli` is registered as a binary client. The agent-cli crate was added in commit 9a51b2f without updating `release.yml`. The user has already staged deletion of this test file in trunk (`D src-tauri/tests/workflow_yml_contract.rs` per the orchestrator's initial gitStatus). The failure is pre-existing on this branch's base (`main` @ 9a51b2f) and is orthogonal to NES-251's session_id-preservation fix. Per ticket anti-scope ("Single agents-binary fix on the resume command's session_id handling"), NES-251 does not own release.yml or this test's lifecycle.
+**Justification:** 294 of 295 cargo tests pass; the 1 failure is on the workflow-contract test and is bit-for-bit reproducible against `main` HEAD. CodeRabbit / Phase 8 multi-concern review may flag this for separate handling; NES-251 leaves it as-is.
+**Evidence:** test failure stanza at `src-tauri/tests/workflow_yml_contract.rs:882` (the panic message names `oulipoly-agent-cli` as the binary lacking a release job, which is a release.yml configuration concern).
+
+**Decision 2 — bun gates unavailable in this environment:** `bun install` fails to resolve `@fortawesome/sharp-solid-svg-icons` and `@fortawesome/sharp-regular-svg-icons` (FontAwesome Pro packages requiring an authenticated npm registry token not present in this dev environment). Without `node_modules`, `bun run check` (biome) and `bun run test` (vitest) cannot execute. The NES-251 fix is Rust-only — no `.ts` / `.tsx` / `.js` / `.jsx` / `.css` files were modified (verified via `git diff --name-only`). Cannot run JS-side gates here; on CI where the FontAwesome Pro token is configured, JS gates run normally and should pass trivially since no JS code changed.
+**Justification:** Per orchestrator policy ("If you can't test the UI, say so explicitly rather than claiming success"), I am explicitly stating the JS gates are environmentally unavailable, NOT failing.
