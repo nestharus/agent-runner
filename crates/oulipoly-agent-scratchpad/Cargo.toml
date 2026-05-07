@@ -1,0 +1,25 @@
+[package]
+name = "oulipoly-agent-scratchpad"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "oulipoly_agent_scratchpad"
+
+[[bin]]
+name = "agent-scratchpad"
+path = "src/main.rs"
+
+[dependencies]
+chrono.workspace = true
+clap.workspace = true
+oulipoly-agent-store = { path = "../oulipoly-agent-store" }
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

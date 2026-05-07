@@ -9,6 +9,7 @@ members = [
     "crates/oulipoly-setup",
     "crates/oulipoly-agent-cli",
     "crates/oulipoly-agent-store",
+    "crates/oulipoly-agent-scratchpad",
 ]
 default-members = [
     "src-tauri",
@@ -19,6 +20,7 @@ default-members = [
     "crates/oulipoly-setup",
     "crates/oulipoly-agent-cli",
     "crates/oulipoly-agent-store",
+    "crates/oulipoly-agent-scratchpad",
 ]
 
 [workspace.package]

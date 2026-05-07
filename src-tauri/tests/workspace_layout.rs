@@ -12,6 +12,7 @@ const WORKSPACE_MEMBERS: &[&str] = &[
     "crates/oulipoly-setup",
     "crates/oulipoly-agent-cli",
     "crates/oulipoly-agent-store",
+    "crates/oulipoly-agent-scratchpad",
 ];
 
 const LIB_CRATES: &[&str] = &[
@@ -35,6 +36,7 @@ const EXPECTED_EDGES: &[(&str, &str)] = &[
     ("oulipoly-state", "oulipoly-core"),
     ("oulipoly-agent-cli", "oulipoly-runtime"),
     ("oulipoly-agent-cli", "oulipoly-config"),
+    ("oulipoly-agent-scratchpad", "oulipoly-agent-store"),
 ];
 
 const GRAPH_NODES: &[&str] = &[
@@ -45,6 +47,8 @@ const GRAPH_NODES: &[&str] = &[
     "oulipoly-runtime",
     "oulipoly-setup",
     "oulipoly-agent-cli",
+    "oulipoly-agent-store",
+    "oulipoly-agent-scratchpad",
 ];
 
 fn repo_root() -> PathBuf {
@@ -188,6 +192,30 @@ fn workspace_members_exact_set() {
 }
 
 #[test]
+fn workspace_default_members_exact_set() {
+    let manifest_path = repo_root().join("Cargo.toml");
+    let manifest = std::fs::read_to_string(&manifest_path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", manifest_path.display()));
+    let parsed: toml::Value = toml::from_str(&manifest)
+        .unwrap_or_else(|error| panic!("failed to parse {}: {error}", manifest_path.display()));
+    let default_members: BTreeSet<String> = parsed
+        .get("workspace")
+        .and_then(|workspace| workspace.get("default-members"))
+        .and_then(toml::Value::as_array)
+        .expect("root Cargo.toml should define [workspace] default-members")
+        .iter()
+        .map(|member| {
+            member
+                .as_str()
+                .expect("workspace default-member should be a string")
+                .to_string()
+        })
+        .collect();
+
+    assert_eq!(default_members, expected_members());
+}
+
+#[test]
 fn lib_crates_resolve_via_metadata() {
     let root = repo_root();
     let metadata = metadata(&root, &["metadata", "--format-version", "1", "--no-deps"]);
@@ -238,7 +266,7 @@ fn binary_target_resolves() {
 }
 
 #[test]
-fn workspace_includes_agent_cli_member() {
+fn workspace_includes_agent_binary_members() {
     let manifest_path = repo_root().join("Cargo.toml");
     let manifest = std::fs::read_to_string(&manifest_path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", manifest_path.display()));
@@ -262,39 +290,51 @@ fn workspace_includes_agent_cli_member() {
             })
             .collect();
 
-        assert!(
-            entries.contains("crates/oulipoly-agent-cli"),
-            "workspace {key} should include crates/oulipoly-agent-cli: {entries:?}"
-        );
+        for expected in [
+            "crates/oulipoly-agent-cli",
+            "crates/oulipoly-agent-store",
+            "crates/oulipoly-agent-scratchpad",
+        ] {
+            assert!(
+                entries.contains(expected),
+                "workspace {key} should include {expected}: {entries:?}"
+            );
+        }
     }
 }
 
 #[test]
-fn agent_cli_binary_target_named_agent() {
+fn agent_binary_targets_have_expected_names() {
     let root = repo_root();
     let metadata = metadata(&root, &["metadata", "--format-version", "1", "--no-deps"]);
     let packages = metadata
         .get("packages")
         .and_then(Value::as_array)
         .expect("cargo metadata should include packages");
-    let package = packages
-        .iter()
-        .find(|package| package_name(package) == "oulipoly-agent-cli")
-        .expect("metadata should include oulipoly-agent-cli");
-    let targets = package
-        .get("targets")
-        .and_then(Value::as_array)
-        .expect("metadata package should include targets");
+    for (package_name, expected_binary) in [
+        ("oulipoly-agent-cli", "agent"),
+        ("oulipoly-agent-store", "agent-store"),
+        ("oulipoly-agent-scratchpad", "agent-scratchpad"),
+    ] {
+        let package = packages
+            .iter()
+            .find(|package| self::package_name(package) == package_name)
+            .unwrap_or_else(|| panic!("metadata should include {package_name}"));
+        let targets = package
+            .get("targets")
+            .and_then(Value::as_array)
+            .expect("metadata package should include targets");
 
-    assert!(
-        targets.iter().any(|target| {
-            let name = target.get("name").and_then(Value::as_str);
-            let kinds = target.get("kind").and_then(Value::as_array);
-            name == Some("agent")
-                && kinds.is_some_and(|kinds| kinds.iter().any(|kind| kind == "bin"))
-        }),
-        "oulipoly-agent-cli should expose a binary target named agent: {targets:?}"
-    );
+        assert!(
+            targets.iter().any(|target| {
+                let name = target.get("name").and_then(Value::as_str);
+                let kinds = target.get("kind").and_then(Value::as_array);
+                name == Some(expected_binary)
+                    && kinds.is_some_and(|kinds| kinds.iter().any(|kind| kind == "bin"))
+            }),
+            "{package_name} should expose a binary target named {expected_binary}: {targets:?}"
+        );
+    }
 }
 
 #[test]

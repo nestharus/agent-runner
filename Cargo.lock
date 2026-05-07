@@ -2301,6 +2301,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "oulipoly-agent-scratchpad"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "oulipoly-agent-store",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
 name = "oulipoly-agent-store"
 version = "0.1.0"
 dependencies = [

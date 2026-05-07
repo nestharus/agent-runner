@@ -127,11 +127,144 @@ fn job_steps<'a>(workflow: &'a Value, job_name: &str, label: &str) -> &'a [Value
     )
 }
 
+fn step_by_uses<'a>(
+    workflow: &'a Value,
+    workflow_name: &str,
+    job_name: &str,
+    uses: &str,
+) -> &'a Value {
+    job_steps(workflow, job_name, workflow_name)
+        .iter()
+        .find(|step| mapping_get(step, "uses").and_then(Value::as_str) == Some(uses))
+        .unwrap_or_else(|| panic!("{workflow_name} {job_name} steps must contain uses: {uses}"))
+}
+
+fn string_at<'a>(root: &'a Value, label: &str, path: &[&str]) -> &'a str {
+    match value_at(root, label, path) {
+        Value::String(value) => value,
+        other => panic!("{label} must be a string, got {other:?}"),
+    }
+}
+
 fn step_run_blocks<'a>(workflow: &'a Value, job_name: &str, label: &str) -> Vec<&'a str> {
     job_steps(workflow, job_name, label)
         .iter()
         .filter_map(|step| mapping_get(step, "run").and_then(Value::as_str))
         .collect()
+}
+
+fn standalone_binary_matrix_entries(
+    workflow: &Value,
+    workflow_name: &str,
+    job_name: &str,
+) -> BTreeSet<(String, String)> {
+    sequence_at(
+        job(workflow, job_name, workflow_name),
+        &format!("{workflow_name} jobs.{job_name}.strategy.matrix.include"),
+        &["strategy", "matrix", "include"],
+    )
+    .iter()
+    .enumerate()
+    .map(|(index, entry)| {
+        (
+            string_field(
+                entry,
+                "os",
+                &format!("{workflow_name} jobs.{job_name}.strategy.matrix.include[{index}].os"),
+            )
+            .to_string(),
+            string_field(
+                entry,
+                "target",
+                &format!("{workflow_name} jobs.{job_name}.strategy.matrix.include[{index}].target"),
+            )
+            .to_string(),
+        )
+    })
+    .collect()
+}
+
+fn assert_standalone_binary_release_job(
+    workflow: &Value,
+    job_name: &str,
+    package_name: &str,
+    binary_name: &str,
+    artifact_prefix: &str,
+    assertion: &str,
+) {
+    let workflow_name = "release.yml";
+    assert_eq!(
+        needs_list(job(workflow, job_name, workflow_name)),
+        vec!["version".to_string()],
+        "{assertion}: {job_name}.needs must be exactly [version]"
+    );
+    assert_eq!(
+        standalone_binary_matrix_entries(workflow, workflow_name, job_name),
+        BTreeSet::from([
+            (
+                "ubuntu-latest".to_string(),
+                "x86_64-unknown-linux-gnu".to_string()
+            ),
+            (
+                "macos-latest".to_string(),
+                "aarch64-apple-darwin".to_string()
+            ),
+            (
+                "windows-latest".to_string(),
+                "x86_64-pc-windows-msvc".to_string()
+            )
+        ]),
+        "{assertion}: {job_name} must build the three standalone binary targets"
+    );
+
+    let job_text = value_text(job(workflow, job_name, workflow_name));
+    assert!(
+        job_text.contains(&format!("key: {artifact_prefix}-${{{{ matrix.target }}}}")),
+        "{assertion}: {job_name} must use a target-scoped rust-cache key for {artifact_prefix}"
+    );
+    assert!(
+        job_text.contains(&format!(
+            "cargo build --release --target ${{{{ matrix.target }}}} --bin {binary_name} -p {package_name}"
+        )),
+        "{assertion}: {job_name} must build the expected package/bin"
+    );
+    assert!(
+        job_text.contains(&format!(
+            "cp target/${{{{ matrix.target }}}}/release/{binary_name} artifacts/{artifact_prefix}-${{{{ matrix.target }}}}"
+        )),
+        "{assertion}: {job_name} must copy the non-Windows binary with target suffix"
+    );
+    assert!(
+        job_text.contains(&format!(
+            "Copy-Item target/${{{{ matrix.target }}}}/release/{binary_name}.exe artifacts/{artifact_prefix}-${{{{ matrix.target }}}}.exe"
+        )),
+        "{assertion}: {job_name} must copy the Windows .exe with target suffix"
+    );
+
+    let upload = step_by_uses(
+        workflow,
+        workflow_name,
+        job_name,
+        "actions/upload-artifact@v4",
+    );
+    assert_eq!(
+        string_at(
+            upload,
+            &format!("{workflow_name} jobs.{job_name}.steps[upload].with.name"),
+            &["with", "name"],
+        ),
+        format!("{artifact_prefix}-${{{{ matrix.target }}}}"),
+        "{assertion}: {job_name} upload name must be target-suffixed"
+    );
+    let upload_path = string_at(
+        upload,
+        &format!("{workflow_name} jobs.{job_name}.steps[upload].with.path"),
+        &["with", "path"],
+    );
+    assert!(
+        upload_path == "artifacts/*" || upload_path == "artifacts",
+        "{assertion}: {job_name} upload path must be artifacts/* or artifacts, got {upload_path:?}"
+    );
 }
 
 fn all_step_run_blocks(workflow: &Value) -> Vec<(&str, &str)> {
@@ -960,6 +1093,7 @@ fn assertion_a10_dependency_graph_required_edges() {
         "build".to_string(),
         "build-oulipoly-agent-cli".to_string(),
         "build-oulipoly-agent-store".to_string(),
+        "build-oulipoly-agent-scratchpad".to_string(),
         "release".to_string(),
     ]);
     let release_expected_edges = BTreeSet::from([
@@ -984,6 +1118,10 @@ fn assertion_a10_dependency_graph_required_edges() {
             "version".to_string(),
             "build-oulipoly-agent-store".to_string(),
         ),
+        (
+            "version".to_string(),
+            "build-oulipoly-agent-scratchpad".to_string(),
+        ),
         ("version".to_string(), "release".to_string()),
         ("build".to_string(), "release".to_string()),
         (
@@ -992,6 +1130,10 @@ fn assertion_a10_dependency_graph_required_edges() {
         ),
         (
             "build-oulipoly-agent-store".to_string(),
+            "release".to_string(),
+        ),
+        (
+            "build-oulipoly-agent-scratchpad".to_string(),
             "release".to_string(),
         ),
     ]);
@@ -1033,4 +1175,33 @@ fn assertion_a13_linux_apt_deps_preserved() {
         assert_apt_packages(workflow_name, &workflow, "rust-client-check");
         assert_apt_packages(workflow_name, &workflow, "rust-integration");
     }
+}
+
+#[test]
+fn assertion_a14_standalone_binary_release_job_bodies() {
+    let release = release_workflow();
+    assert_standalone_binary_release_job(
+        &release,
+        "build-oulipoly-agent-cli",
+        "oulipoly-agent-cli",
+        "agent",
+        "agent",
+        "A14",
+    );
+    assert_standalone_binary_release_job(
+        &release,
+        "build-oulipoly-agent-store",
+        "oulipoly-agent-store",
+        "agent-store",
+        "agent-store",
+        "A14",
+    );
+    assert_standalone_binary_release_job(
+        &release,
+        "build-oulipoly-agent-scratchpad",
+        "oulipoly-agent-scratchpad",
+        "agent-scratchpad",
+        "agent-scratchpad",
+        "A14",
+    );
 }
