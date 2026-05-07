@@ -1263,6 +1263,106 @@ fn top_level_resume_without_model_succeeds_when_chain_exists() {
     assert!(fs::read_to_string(argv).unwrap().contains("--resume"));
 }
 
+#[test]
+fn top_level_resume_with_migration_preserves_raw_supplied_session_id() {
+    let fixture = Fixture::new();
+    let source_projects = fixture.dir.path().join("source-projects");
+    let target_projects = fixture.dir.path().join("target-projects");
+    fixture.stage_claude_jsonl(&source_projects, SESSION_A);
+    let transcript_path = fixture.dir.path().join("migrated-turns.jsonl");
+    let argv = fixture.dir.path().join("migrated-argv.txt");
+    fs::write(&transcript_path, "").unwrap();
+    let fresh_session_id = "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22";
+    let script = fixture.write_script(
+        "migrated-provider.sh",
+        &format!(
+            r#"printf '%s\n' "$@" > {}
+ts="$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"
+turn_id="turn-$(date +%s%N)-$$"
+printf '{{"session_id":"{fresh_session_id}","turn_id":"%s","timestamp":"%s","role":"assistant"}}\n' "$turn_id" "$ts" >> {}
+printf 'ok\n'"#,
+            sh_path(&argv),
+            sh_path(&transcript_path)
+        ),
+    );
+    fixture.write_model(
+        "claude-opus",
+        &manual_migrate_cli_model_toml(&script, &source_projects, &target_projects),
+    );
+    let app_dir = fixture.config_home.join("oulipoly-agent-runner");
+    fs::create_dir_all(&app_dir).unwrap();
+    fs::write(
+        app_dir.join("providers.toml"),
+        format!(
+            r#"
+[claude]
+command = "{}"
+args = []
+interactive_args = ["launch"]
+prompt_mode = "arg"
+
+[claude.resume]
+kind = "flag"
+flag = "--resume"
+
+[claude.session_storage]
+kind = "claude_code"
+projects_dir = "{}"
+
+[claude2]
+command = "{}"
+args = []
+interactive_args = ["launch"]
+prompt_mode = "arg"
+
+[claude2.resume]
+kind = "flag"
+flag = "--resume"
+
+[claude2.session_storage]
+kind = "claude_code"
+projects_dir = "{}"
+"#,
+            script.display(),
+            source_projects.display(),
+            script.display(),
+            target_projects.display()
+        ),
+    )
+    .unwrap();
+    fixture.write_sessions_config_from_transcript("claude2", &transcript_path);
+    fixture.seed_active_chain(CHAIN_A, "claude", SESSION_A, "claude-opus");
+    fixture.seed_turns("claude", SESSION_A, &[]);
+
+    let output = fixture
+        .command()
+        .arg("--resume")
+        .arg(CHAIN_A)
+        .arg("--migrate")
+        .arg("claude2")
+        .args(["--models-dir"])
+        .arg(&fixture.models_dir)
+        .arg("continue")
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    let argv = fs::read_to_string(argv).unwrap();
+    assert!(argv.contains("--resume\n"), "{argv}");
+    assert!(argv.contains(&format!("{SESSION_A}\n")), "{argv}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(parse_session(&stderr), CHAIN_A);
+    let recorded_session_id: String = fixture
+        .conn()
+        .query_row(
+            "SELECT session_id FROM invocations ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded_session_id, CHAIN_A);
+}
+
 // risk: CLI surface; level: end-to-end; source: proposal §11.1 CLI surface / A8.
 #[test]
 fn model_none_resume_uses_providers_toml_only() {

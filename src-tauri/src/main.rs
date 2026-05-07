@@ -1031,30 +1031,35 @@ fn effective_spawn_cwd(working_dir: Option<&Path>) -> Result<PathBuf, String> {
     }
 }
 
-fn ingest_and_emit_session_id(
+enum ResumeIngestMode<'a> {
+    Unpinned { capture_method: &'a str },
+    Pinned { resume_target: &'a str },
+}
+
+fn ingest_and_emit_session_id_resume_aware(
     state: &StateDb,
     sessions_cfg: &oulipoly_config::SessionsConfig,
     provider_name: &str,
     invocation_row_id: i64,
     invocation_uuid: &str,
-    capture_method: &str,
+    mode: ResumeIngestMode<'_>,
 ) -> bool {
     let invocation = match state.get_invocation_by_uuid(invocation_uuid) {
         Ok(Some(row)) => row,
         Ok(None) => {
             eprintln!("Warning: Could not resolve invocation {invocation_uuid} for session ingest");
-            return false;
+            return emit_pinned_session_id(state, invocation_row_id, invocation_uuid, mode);
         }
         Err(err) => {
             eprintln!(
                 "Warning: Failed to load invocation {invocation_uuid} for session ingest: {err}"
             );
-            return false;
+            return emit_pinned_session_id(state, invocation_row_id, invocation_uuid, mode);
         }
     };
     let Some(finished_at) = invocation.finished_at else {
         eprintln!("Warning: Invocation {invocation_uuid} was not finalized before session ingest");
-        return false;
+        return emit_pinned_session_id(state, invocation_row_id, invocation_uuid, mode);
     };
 
     let report = oulipoly_runtime::sessions::scan_provider(provider_name, sessions_cfg, state);
@@ -1062,26 +1067,56 @@ fn ingest_and_emit_session_id(
         eprintln!("Warning: Session ingest failed for {provider_name}: {err}");
     }
 
-    let session_id = match state.find_session_for_invocation_window(
+    let matched_session_id = match state.find_session_for_invocation_window(
         provider_name,
         &invocation.created_at,
         &finished_at,
     ) {
-        Ok(Some(session_id)) => session_id,
-        Ok(None) => return false,
+        Ok(session_id) => session_id,
         Err(err) => {
             eprintln!("Warning: Failed to resolve session for invocation {invocation_uuid}: {err}");
-            return false;
+            None
         }
     };
 
-    emit_known_session_id(
-        state,
-        invocation_row_id,
-        invocation_uuid,
-        session_id.as_str(),
-        capture_method,
-    )
+    match mode {
+        ResumeIngestMode::Unpinned { capture_method } => {
+            matched_session_id.is_some_and(|session_id| {
+                emit_known_session_id(
+                    state,
+                    invocation_row_id,
+                    invocation_uuid,
+                    session_id.as_str(),
+                    capture_method,
+                )
+            })
+        }
+        ResumeIngestMode::Pinned { resume_target } => emit_known_session_id(
+            state,
+            invocation_row_id,
+            invocation_uuid,
+            resume_target,
+            "resumed",
+        ),
+    }
+}
+
+fn emit_pinned_session_id(
+    state: &StateDb,
+    invocation_row_id: i64,
+    invocation_uuid: &str,
+    mode: ResumeIngestMode<'_>,
+) -> bool {
+    match mode {
+        ResumeIngestMode::Unpinned { .. } => false,
+        ResumeIngestMode::Pinned { resume_target } => emit_known_session_id(
+            state,
+            invocation_row_id,
+            invocation_uuid,
+            resume_target,
+            "resumed",
+        ),
+    }
 }
 
 fn emit_known_session_id(
@@ -1698,27 +1733,21 @@ fn run_repl(
             state.finalize_invocation(invocation_row_id, exit_code == 0, exit_code, None, None)?;
             guard.mark_finalized();
             if exit_code == 0 {
-                let emitted = ingest_and_emit_session_id(
+                ingest_and_emit_session_id_resume_aware(
                     &state,
                     &sessions_cfg,
                     &provider.name,
                     invocation_row_id,
                     &invocation.id,
-                    if resume.is_some() {
-                        "resumed"
-                    } else {
-                        "turn_script"
+                    match resume {
+                        Some(session_id) => ResumeIngestMode::Pinned {
+                            resume_target: session_id,
+                        },
+                        None => ResumeIngestMode::Unpinned {
+                            capture_method: "turn_script",
+                        },
                     },
                 );
-                if !emitted && let Some(session_id) = resume {
-                    emit_known_session_id(
-                        &state,
-                        invocation_row_id,
-                        &invocation.id,
-                        session_id,
-                        "resumed",
-                    );
-                }
             }
             Ok(exit_code)
         }
@@ -1919,23 +1948,16 @@ fn run_resume(
     guard.mark_finalized();
 
     if success {
-        let emitted = ingest_and_emit_session_id(
+        ingest_and_emit_session_id_resume_aware(
             &state,
             &sessions_cfg,
             &provider.name,
             invocation_row_id,
             &invocation.id,
-            "resumed",
+            ResumeIngestMode::Pinned {
+                resume_target: session_id,
+            },
         );
-        if !emitted {
-            emit_known_session_id(
-                &state,
-                invocation_row_id,
-                &invocation.id,
-                session_id,
-                "resumed",
-            );
-        }
         let _ = std::io::stdout().write_all(&result.stdout);
     } else {
         eprintln!("{}", result.stderr);
@@ -2055,13 +2077,15 @@ fn run_with_balancing(
         .unwrap_or_else(|e| eprintln!("Warning: Failed to finalize invocation: {e}"));
 
     if success {
-        let emitted = ingest_and_emit_session_id(
+        let emitted = ingest_and_emit_session_id_resume_aware(
             &state,
             &sessions_cfg,
             provider_name,
             invocation_row_id,
             &invocation.id,
-            "turn_script",
+            ResumeIngestMode::Unpinned {
+                capture_method: "turn_script",
+            },
         );
         if !emitted && let Some(session_id) = result.session_capture.session_id.as_deref() {
             emit_known_session_id(

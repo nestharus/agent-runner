@@ -3,6 +3,7 @@
 use chrono::{DateTime, Duration, Utc};
 use oulipoly_state::{CompositeInvocationId, SessionTurnIngest, StateDb};
 use rusqlite::{Connection, params};
+use serde_json::Value;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -409,6 +410,11 @@ fn parse_invocation(stderr: &str) -> CompositeInvocationId {
 }
 
 fn parse_session_line(stderr: &str, invocation_uuid: &str) -> String {
+    let value = parse_session_json(stderr, invocation_uuid);
+    value["session_id"].as_str().unwrap().to_string()
+}
+
+fn parse_session_json(stderr: &str, invocation_uuid: &str) -> Value {
     let lines: Vec<&str> = stderr
         .lines()
         .filter(|line| line.starts_with("OULIPOLY_SESSION="))
@@ -419,9 +425,96 @@ fn parse_session_line(stderr: &str, invocation_uuid: &str) -> String {
         "stderr should contain exactly one session line: {stderr}"
     );
     let raw = lines[0].strip_prefix("OULIPOLY_SESSION=").unwrap();
-    let value: serde_json::Value = serde_json::from_str(raw).unwrap();
+    let value: Value = serde_json::from_str(raw).unwrap();
+    let keys: Vec<&str> = value
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, vec!["id", "session_id"]);
     assert_eq!(value["id"].as_str(), Some(invocation_uuid));
-    value["session_id"].as_str().unwrap().to_string()
+    value
+}
+
+fn write_resume_provider_emitting_different_session_id(fixture: &Fixture, fresh_session_id: &str) {
+    let transcript_path = fixture.dir.path().join("resume-fresh-turns.jsonl");
+    fs::write(&transcript_path, "").unwrap();
+    fixture.write_sessions_config("claude2", &transcript_path);
+    let script = fixture.write_script(
+        "claude-resume-fresh-session-writer.sh",
+        &format!(
+            r#"ts="$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"
+turn_id="turn-$(date +%s%N)-$$"
+printf '{{"session_id":"{fresh_session_id}","turn_id":"%s","timestamp":"%s","role":"assistant"}}\n' "$turn_id" "$ts" >> "{}"
+printf 'mock resumed answer\n'
+"#,
+            transcript_path.display()
+        ),
+    );
+    fixture.write_single_provider_model(
+        "claude-opus",
+        "claude2",
+        &script,
+        r#"
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+"#,
+    );
+}
+
+fn run_trace_json(fixture: &Fixture, invocation_uuid: &str) -> Value {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+    cmd.arg("trace").arg(invocation_uuid).arg("--json");
+    cmd.env("XDG_CONFIG_HOME", &fixture.config_home);
+    cmd.env("XDG_DATA_HOME", &fixture.data_home);
+    let output = cmd.output().unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn assert_invocation_session(fixture: &Fixture, invocation_uuid: &str, expected_session_id: &str) {
+    let row = fixture
+        .open_db()
+        .get_invocation_by_uuid(invocation_uuid)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.session_id.as_deref(), Some(expected_session_id));
+    assert_eq!(row.session_capture_method.as_deref(), Some("resumed"));
+}
+
+fn session_turn_count(fixture: &Fixture, provider: &str, session_id: &str) -> i64 {
+    fixture
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM session_turns WHERE provider_name = ?1 AND session_id = ?2",
+            params![provider, session_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn chain_segment_count(fixture: &Fixture, provider: &str, session_id: &str) -> i64 {
+    fixture
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM session_chain_segments WHERE provider_name = ?1 AND session_id = ?2",
+            params![provider, session_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn invocation_count_for_session(fixture: &Fixture, session_id: &str) -> i64 {
+    fixture
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM invocations WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .unwrap()
 }
 
 #[test]
@@ -534,6 +627,208 @@ flag = "--resume"
         row.session_id.as_deref(),
         Some(captured_session_id.as_str())
     );
+}
+
+#[test]
+fn top_level_file_resume_preserves_supplied_session_id_when_provider_emits_fresh_id() {
+    let fixture = Fixture::new();
+    let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+    let fresh_session_id = "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22";
+    write_resume_provider_emitting_different_session_id(&fixture, fresh_session_id);
+    fixture.seed_session_turns("claude2", session_id, &[("turn-1", "2026-04-17T08:00:00Z")]);
+    let prompt_path = fixture.dir.path().join("prompt.md");
+    fs::write(&prompt_path, "continue from file\n").unwrap();
+
+    let output = fixture
+        .base_top_level_resume_command("claude-opus", session_id)
+        .arg("-f")
+        .arg(&prompt_path)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let invocation = parse_invocation(&stderr);
+    let emitted_session_id = parse_session_line(&stderr, &invocation.id);
+    assert_eq!(emitted_session_id, session_id);
+    assert_invocation_session(&fixture, &invocation.id, session_id);
+    assert!(session_turn_count(&fixture, "claude2", fresh_session_id) >= 1);
+    assert!(chain_segment_count(&fixture, "claude2", fresh_session_id) >= 1);
+    let trace = run_trace_json(&fixture, &invocation.id);
+    assert_eq!(trace["root"]["session"]["id"], session_id);
+    assert_eq!(trace["root"]["session"]["capture_method"], "resumed");
+}
+
+#[test]
+fn resume_subcommand_file_prompt_preserves_supplied_session_id_when_provider_emits_fresh_id() {
+    let fixture = Fixture::new();
+    let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+    let fresh_session_id = "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22";
+    write_resume_provider_emitting_different_session_id(&fixture, fresh_session_id);
+    fixture.seed_session_turns("claude2", session_id, &[("turn-1", "2026-04-17T08:00:00Z")]);
+    let prompt_path = fixture.dir.path().join("prompt.md");
+    fs::write(&prompt_path, "continue from explicit subcommand\n").unwrap();
+
+    let output = fixture
+        .base_resume_command("claude-opus", session_id)
+        .arg("-f")
+        .arg(&prompt_path)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let invocation = parse_invocation(&stderr);
+    assert_eq!(parse_session_line(&stderr, &invocation.id), session_id);
+    assert_invocation_session(&fixture, &invocation.id, session_id);
+    let trace = run_trace_json(&fixture, &invocation.id);
+    assert_eq!(trace["root"]["session"]["id"], session_id);
+}
+
+#[test]
+fn repl_resume_preserves_supplied_session_id_when_provider_emits_fresh_id() {
+    let fixture = Fixture::new();
+    let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+    let fresh_session_id = "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22";
+    write_resume_provider_emitting_different_session_id(&fixture, fresh_session_id);
+    fixture.seed_session_turns("claude2", session_id, &[("turn-1", "2026-04-17T08:00:00Z")]);
+
+    let output = fixture.run_repl("claude-opus", Some(session_id));
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let invocation = parse_invocation(&stderr);
+    assert_eq!(parse_session_line(&stderr, &invocation.id), session_id);
+    assert_invocation_session(&fixture, &invocation.id, session_id);
+    let trace = run_trace_json(&fixture, &invocation.id);
+    assert_eq!(trace["root"]["session"]["id"], session_id);
+}
+
+#[test]
+fn top_level_resume_without_prompt_preserves_supplied_session_id_when_provider_emits_fresh_id() {
+    let fixture = Fixture::new();
+    let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+    let fresh_session_id = "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22";
+    write_resume_provider_emitting_different_session_id(&fixture, fresh_session_id);
+    fixture.seed_session_turns("claude2", session_id, &[("turn-1", "2026-04-17T08:00:00Z")]);
+
+    let output = fixture
+        .base_top_level_resume_command("claude-opus", session_id)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let invocation = parse_invocation(&stderr);
+    assert_eq!(parse_session_line(&stderr, &invocation.id), session_id);
+    assert_invocation_session(&fixture, &invocation.id, session_id);
+    let trace = run_trace_json(&fixture, &invocation.id);
+    assert_eq!(trace["root"]["session"]["id"], session_id);
+}
+
+#[test]
+fn initial_and_resumed_turns_remain_queryable_under_supplied_session_id() {
+    let fixture = Fixture::new();
+    let transcript_path = fixture.dir.path().join("initial-turns.jsonl");
+    fs::write(&transcript_path, "").unwrap();
+    fixture.write_sessions_config("claude2", &transcript_path);
+    let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+    let fresh_session_id = "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22";
+    let script = fixture.write_script(
+        "claude-initial-session-writer.sh",
+        &format!(
+            r#"ts="$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"
+turn_id="turn-$(date +%s%N)-$$"
+printf '{{"session_id":"{session_id}","turn_id":"%s","timestamp":"%s","role":"assistant"}}\n' "$turn_id" "$ts" >> "{}"
+printf 'initial answer\n'
+"#,
+            transcript_path.display()
+        ),
+    );
+    fixture.write_single_provider_model(
+        "claude-opus",
+        "claude2",
+        &script,
+        r#"
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+"#,
+    );
+    let initial_output = fixture
+        .base_model_command("claude-opus")
+        .arg("start")
+        .output()
+        .unwrap();
+    assert_eq!(initial_output.status.code(), Some(0), "{initial_output:?}");
+    let initial_stderr = String::from_utf8_lossy(&initial_output.stderr);
+    let initial_invocation = parse_invocation(&initial_stderr);
+    assert_eq!(
+        parse_session_line(&initial_stderr, &initial_invocation.id),
+        session_id
+    );
+
+    write_resume_provider_emitting_different_session_id(&fixture, fresh_session_id);
+    for prompt in ["continue one", "continue two"] {
+        let output = fixture
+            .base_top_level_resume_command("claude-opus", session_id)
+            .arg(prompt)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let invocation = parse_invocation(&stderr);
+        assert_eq!(parse_session_line(&stderr, &invocation.id), session_id);
+        assert_invocation_session(&fixture, &invocation.id, session_id);
+        let trace = run_trace_json(&fixture, &invocation.id);
+        assert_eq!(trace["root"]["session"]["id"], session_id);
+    }
+
+    assert_eq!(invocation_count_for_session(&fixture, session_id), 3);
+}
+
+#[test]
+fn resumed_child_keeps_parent_link_while_session_id_is_pinned() {
+    let fixture = Fixture::new();
+    let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+    let fresh_session_id = "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22";
+    write_resume_provider_emitting_different_session_id(&fixture, fresh_session_id);
+    fixture.seed_session_turns("claude2", session_id, &[("turn-1", "2026-04-17T08:00:00Z")]);
+
+    let parent_output = fixture
+        .base_model_command("claude-opus")
+        .arg("parent")
+        .output()
+        .unwrap();
+    assert_eq!(parent_output.status.code(), Some(0), "{parent_output:?}");
+    let parent = parse_invocation(&String::from_utf8_lossy(&parent_output.stderr));
+    let parent_row = fixture
+        .open_db()
+        .get_invocation_by_uuid(&parent.id)
+        .unwrap()
+        .unwrap();
+
+    let parent_env = serde_json::to_string(&parent).unwrap();
+    let mut child_cmd = fixture.base_top_level_resume_command("claude-opus", session_id);
+    child_cmd
+        .arg("child")
+        .env("OULIPOLY_PARENT_INVOCATION", parent_env);
+    let child_output = child_cmd.output().unwrap();
+    assert_eq!(child_output.status.code(), Some(0), "{child_output:?}");
+    let child_stderr = String::from_utf8_lossy(&child_output.stderr);
+    let child = parse_invocation(&child_stderr);
+    assert_eq!(parse_session_line(&child_stderr, &child.id), session_id);
+    let child_row = fixture
+        .open_db()
+        .get_invocation_by_uuid(&child.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(child_row.parent_invocation_id, Some(parent_row.id));
+    assert_eq!(child_row.session_id.as_deref(), Some(session_id));
+
+    let trace = run_trace_json(&fixture, &parent.id);
+    assert_eq!(trace["root"]["children"][0]["invocation"]["id"], child.id);
+    assert_eq!(trace["root"]["children"][0]["session"]["id"], session_id);
 }
 
 #[test]
@@ -1349,6 +1644,167 @@ subcommand = ["resume"]
         .unwrap();
     assert_eq!(row.session_id.as_deref(), Some(session_id));
     assert_eq!(row.session_capture_method.as_deref(), Some("resumed"));
+}
+
+#[test]
+fn codex_repl_resume_preserves_supplied_session_id_when_provider_emits_fresh_id() {
+    let fixture = Fixture::new();
+    let transcript_path = fixture.dir.path().join("codex-fresh-turns.jsonl");
+    fs::write(&transcript_path, "").unwrap();
+    fixture.write_sessions_config("codex", &transcript_path);
+    let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+    let fresh_session_id = "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22";
+    let script = fixture.write_script(
+        "codex-fresh-session-writer.sh",
+        &format!(
+            r#"ts="$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"
+turn_id="turn-$(date +%s%N)-$$"
+printf '{{"session_id":"{fresh_session_id}","turn_id":"%s","timestamp":"%s","role":"assistant"}}\n' "$turn_id" "$ts" >> "{}"
+printf 'codex resumed answer\n'
+"#,
+            transcript_path.display()
+        ),
+    );
+    fixture.write_single_provider_model(
+        "codex-high",
+        "codex",
+        &script,
+        r#"
+[providers.resume]
+kind = "subcommand"
+subcommand = ["resume"]
+"#,
+    );
+    fixture.seed_session_turns("codex", session_id, &[("turn-1", "2026-04-17T08:00:00Z")]);
+
+    let output = fixture.run_repl("codex-high", Some(session_id));
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let invocation = parse_invocation(&stderr);
+    assert_eq!(parse_session_line(&stderr, &invocation.id), session_id);
+    assert_invocation_session(&fixture, &invocation.id, session_id);
+}
+
+#[test]
+fn resume_by_chain_id_preserves_chain_id_for_correlation_and_uses_active_session_for_provider() {
+    let fixture = Fixture::new();
+    let chain_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let active_session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+    let fresh_session_id = "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22";
+    let transcript_path = fixture.dir.path().join("chain-resume-turns.jsonl");
+    let argv_dump = fixture.dir.path().join("chain-resume-argv.txt");
+    fs::write(&transcript_path, "").unwrap();
+    fixture.write_sessions_config("claude2", &transcript_path);
+    let script = fixture.write_script(
+        "chain-resume-provider.sh",
+        &format!(
+            r#"printf '%s\n' "$@" > "{}"
+ts="$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"
+turn_id="turn-$(date +%s%N)-$$"
+printf '{{"session_id":"{fresh_session_id}","turn_id":"%s","timestamp":"%s","role":"assistant"}}\n' "$turn_id" "$ts" >> "{}"
+printf 'chain resume answer\n'
+"#,
+            argv_dump.display(),
+            transcript_path.display()
+        ),
+    );
+    fixture.write_single_provider_model(
+        "claude-opus",
+        "claude2",
+        &script,
+        r#"
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+"#,
+    );
+    fixture.seed_active_chain(chain_id, "claude2", active_session_id, "claude-opus");
+
+    let output = fixture
+        .base_top_level_resume_command("claude-opus", chain_id)
+        .arg("continue")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(&argv_dump).unwrap(),
+        "one-shot-only\n--resume\n5169694d-de0f-40d1-890c-6e28e55bab27\ncontinue\n"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let invocation = parse_invocation(&stderr);
+    assert_eq!(parse_session_line(&stderr, &invocation.id), chain_id);
+    assert_invocation_session(&fixture, &invocation.id, chain_id);
+    let trace = run_trace_json(&fixture, &invocation.id);
+    assert_eq!(trace["root"]["session"]["id"], chain_id);
+}
+
+#[test]
+fn infa_style_trace_uses_one_session_id_without_audit_waiver() {
+    let fixture = Fixture::new();
+    let transcript_path = fixture.dir.path().join("infa-initial-turns.jsonl");
+    fs::write(&transcript_path, "").unwrap();
+    fixture.write_sessions_config("claude2", &transcript_path);
+    let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+    let fresh_session_id = "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22";
+    let script = fixture.write_script(
+        "infa-initial-provider.sh",
+        &format!(
+            r#"ts="$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"
+turn_id="turn-$(date +%s%N)-$$"
+printf '{{"session_id":"{session_id}","turn_id":"%s","timestamp":"%s","role":"assistant"}}\n' "$turn_id" "$ts" >> "{}"
+printf 'initial answer\n'
+"#,
+            transcript_path.display()
+        ),
+    );
+    fixture.write_single_provider_model(
+        "claude-opus",
+        "claude2",
+        &script,
+        r#"
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+"#,
+    );
+    let root_output = fixture
+        .base_model_command("claude-opus")
+        .arg("start")
+        .output()
+        .unwrap();
+    assert_eq!(root_output.status.code(), Some(0), "{root_output:?}");
+    let root_stderr = String::from_utf8_lossy(&root_output.stderr);
+    let root_invocation = parse_invocation(&root_stderr);
+    assert_eq!(
+        parse_session_line(&root_stderr, &root_invocation.id),
+        session_id
+    );
+
+    write_resume_provider_emitting_different_session_id(&fixture, fresh_session_id);
+    let parent_env = serde_json::to_string(&root_invocation).unwrap();
+    for prompt in ["continue one", "continue two"] {
+        let mut cmd = fixture.base_top_level_resume_command("claude-opus", session_id);
+        cmd.arg(prompt)
+            .env("OULIPOLY_PARENT_INVOCATION", parent_env.as_str());
+        let output = cmd.output().unwrap();
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let invocation = parse_invocation(&stderr);
+        assert_eq!(parse_session_line(&stderr, &invocation.id), session_id);
+    }
+
+    let trace = run_trace_json(&fixture, &root_invocation.id);
+    assert_eq!(trace["root"]["session"]["id"], session_id);
+    let children = trace["root"]["children"].as_array().unwrap();
+    assert_eq!(children.len(), 2);
+    assert!(
+        children
+            .iter()
+            .all(|child| child["session"]["id"] == session_id)
+    );
+    assert_eq!(invocation_count_for_session(&fixture, session_id), 3);
 }
 
 #[test]

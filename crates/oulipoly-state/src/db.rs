@@ -6998,6 +6998,44 @@ interactive_args = ["launch"]
         assert_eq!(reason, "imported");
     }
 
+    #[test]
+    fn find_session_for_invocation_window_returns_fresh_in_window_candidate() {
+        let db = test_db();
+        let turns = vec![
+            SessionTurnIngest {
+                session_id: SESSION_A.to_string(),
+                turn_id: "old-turn".to_string(),
+                timestamp: ts("2026-04-17T08:00:00Z"),
+                role: "assistant".to_string(),
+                parent_turn_id: None,
+                is_sidechain: false,
+                is_compaction_boundary: false,
+                body: None,
+            },
+            SessionTurnIngest {
+                session_id: SESSION_B.to_string(),
+                turn_id: "fresh-turn".to_string(),
+                timestamp: ts("2026-04-17T08:00:02Z"),
+                role: "assistant".to_string(),
+                parent_turn_id: None,
+                is_sidechain: false,
+                is_compaction_boundary: false,
+                body: None,
+            },
+        ];
+        db.ingest_session_turns_batch("claude", &turns).unwrap();
+
+        let found = db
+            .find_session_for_invocation_window(
+                "claude",
+                &ts("2026-04-17T08:00:01Z"),
+                &ts("2026-04-17T08:00:03Z"),
+            )
+            .unwrap();
+
+        assert_eq!(found.as_deref(), Some(SESSION_B));
+    }
+
     // risk: Resolver disambiguation and model inference; level: particular-integration; source: proposal §11.1 Resolver disambiguation and model inference.
     #[test]
     fn resolve_resume_returns_active_segment_for_single_chain() {

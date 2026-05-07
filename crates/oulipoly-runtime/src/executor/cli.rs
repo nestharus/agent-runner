@@ -1151,6 +1151,74 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn execute_resume_suppresses_configured_session_capture() {
+        let argv_dump = tempfile::NamedTempFile::new().unwrap();
+        let argv_dump_path = argv_dump.path().to_path_buf();
+        let script = fixture_script(&format!(
+            r#"printf '%s\n' "$@" > "{dump}"
+printf '{{"type":"system","subtype":"init","session_id":"8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22"}}\n'"#,
+            dump = argv_dump_path.display()
+        ));
+        let provider = ProviderConfig {
+            name: "claude2".to_string(),
+            command: script.path.to_string_lossy().into_owned(),
+            args: vec!["-p".to_string()],
+            interactive_args: Some(vec!["launch".to_string()]),
+            resume: None,
+            session_capture: Some(SessionCapture {
+                kind: SessionCaptureKind::ForcedFlagVerified,
+                flag: Some("--session-id".to_string()),
+                readback_args: Some(vec![
+                    "--verbose".to_string(),
+                    "--output-format".to_string(),
+                    "stream-json".to_string(),
+                ]),
+                event_type: None,
+                event_id_path: None,
+                json_flag: None,
+                last_message_flag: None,
+            }),
+            resume_acceptance: None,
+            session_storage: None,
+        };
+        let strategy = ResumeStrategy {
+            kind: ResumeKind::Flag,
+            flag: Some("--resume".to_string()),
+            subcommand: None,
+        };
+
+        let result = execute_resume(
+            &provider,
+            0,
+            PromptMode::Arg,
+            "answer text",
+            None,
+            None,
+            ResumePayload {
+                session_id: "5169694d-de0f-40d1-890c-6e28e55bab27",
+                strategy: &strategy,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.session_capture.session_id, None);
+        assert!(matches!(
+            result.session_capture.method,
+            SessionCaptureMethod::None
+        ));
+        let argv = std::fs::read_to_string(&argv_dump_path).unwrap();
+        assert_eq!(
+            argv,
+            "-p\n--resume\n5169694d-de0f-40d1-890c-6e28e55bab27\nanswer text\n"
+        );
+        assert!(!argv.contains("--session-id"));
+        assert!(!argv.contains("--verbose"));
+        assert!(String::from_utf8_lossy(&result.stdout).contains("8f0a6a1f"));
+    }
+
+    #[cfg(unix)]
     // risk: Executor resume payload/argv without target JSONL path; level: unit; source: proposal §5 / A4.
     #[test]
     fn execute_resume_appends_subcommand_resume_args_and_prompt_to_one_shot_args() {
