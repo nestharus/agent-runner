@@ -9,7 +9,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::Child;
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 #[cfg(unix)]
 use std::sync::{
     Arc,
@@ -274,6 +274,7 @@ struct RawResult {
     stdout: Vec<u8>,
     telemetry_stdout: Vec<u8>,
     stderr: String,
+    /// Numeric child-process exit code per `exit_code_from_status`.
     exit_code: i32,
     session_capture: SessionCaptureResult,
     terminal_reason: Option<String>,
@@ -450,7 +451,7 @@ fn execute_provider_with_args(
         telemetry_stdout: output.stdout.clone(),
         captured_child_invocations: captured_child_invocations_from_stderr(&stderr),
         stderr,
-        exit_code: output.status.code().unwrap_or(-1),
+        exit_code: exit_code_from_status(&output.status),
         terminal_reason: classify_terminal_reason(&output.status),
         session_capture: capture_outcome,
     };
@@ -585,6 +586,7 @@ pub fn execute_interactive(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InteractiveExecutionResult {
+    /// Numeric child-process exit code per `exit_code_from_status` (interactive/REPL path).
     pub exit_code: i32,
     pub terminal_reason: Option<String>,
 }
@@ -628,7 +630,7 @@ pub fn execute_interactive_with_result(
 
     let terminal_reason = classify_terminal_reason(&status);
     Ok(InteractiveExecutionResult {
-        exit_code: exit_code_from_status(status),
+        exit_code: exit_code_from_status(&status),
         terminal_reason,
     })
 }
@@ -852,7 +854,24 @@ pub fn provider_name(command: &str) -> String {
         .unwrap_or_else(|| command.to_string())
 }
 
-fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
+/// `exit_code_from_status` is the canonical executor-boundary conversion from
+/// a child `ExitStatus` to the runtime's `i32` exit-code representation:
+///
+/// - `status.code()` is preserved when `Some(n)` (covers normal exits including
+///   non-zero).
+/// - On Unix, when `status.code()` is `None` and `ExitStatusExt::signal()`
+///   returns `sig`, the helper returns `128 + sig` (POSIX shell convention;
+///   e.g., SIGTERM -> 143).
+/// - When neither a normal code nor a signal is available, the helper returns
+///   `-1` (preserved fallback).
+///
+/// All executor paths that own a real child `ExitStatus` (one-shot provider,
+/// headless resume via `execute_provider_with_args`, interactive REPL via
+/// `execute_interactive_with_result`) must route their conversion through this
+/// helper. Synthetic lifecycle sentinels (spawn error, `FinalizerGuard` drop,
+/// captured-child supervisor fallback) do not have a child `ExitStatus` and do
+/// not call this helper.
+fn exit_code_from_status(status: &ExitStatus) -> i32 {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
@@ -1055,9 +1074,26 @@ mod tests {
         assert_eq!(provider_name(r#"env -u FOO "my provider""#), "my provider");
     }
 
-    // RISK: terminal_reason classifier could drift from D-022 numeric exit-code policy while adding signal vocabulary (proposal §test-intent "direct raw-signal characterization", assumption A8)
-    // LEVEL: unit
-    // SOURCE: contracts/nes-250-contract.md § Vocabulary and § Test catalog § Finalize cascade (T-FINAL-ONESHOT-SIGNAL, T-FINAL-REPL-SIGNAL)
+    // risk: exhaustive surfaces 1-7 and 11-12; level: unit; source: contract § 5.1, A1, A9, A10
+    #[cfg(unix)]
+    #[test]
+    fn exit_code_from_status_uses_unified_child_process_contract() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let success = std::process::ExitStatus::from_raw(0);
+        let nonzero = std::process::ExitStatus::from_raw(7 << 8);
+        let sigterm = std::process::ExitStatus::from_raw(15);
+        let sigint = std::process::ExitStatus::from_raw(2);
+        let unknown = std::process::ExitStatus::from_raw(0x7f);
+
+        assert_eq!(exit_code_from_status(&success), 0);
+        assert_eq!(exit_code_from_status(&nonzero), 7);
+        assert_eq!(exit_code_from_status(&sigterm), 143);
+        assert_eq!(exit_code_from_status(&sigint), 130);
+        assert_eq!(exit_code_from_status(&unknown), -1);
+    }
+
+    // risk: exhaustive surfaces 8-9; level: unit; source: contract § 5.2, A5, A10
     #[cfg(unix)]
     #[test]
     fn t_terminal_reason_classifier_uses_stable_exit_and_signal_vocabulary() {
@@ -1076,7 +1112,6 @@ mod tests {
             classify_terminal_reason(&sigterm).as_deref(),
             Some("signal:SIGTERM")
         );
-        assert_eq!(exit_code_from_status(sigterm), 143);
     }
 
     // RISK: captured child marker parsing could accept malformed or duplicate OULIPOLY_INVOCATION lines and corrupt unrelated rows (proposal §test-intent "supervised-child fence test", assumptions A1/A2/A4)

@@ -1129,6 +1129,91 @@ fn noninteractive_resume_routes_to_session_owner_in_multi_provider_model() {
 }
 
 #[test]
+fn noninteractive_resume_nonzero_child_exit_finalizes_failed_row_with_exit_nonzero_reason() {
+    let fixture = Fixture::new();
+    let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+    let script = fixture.write_script("claude-exit-7.sh", "exit 7");
+    fixture.write_single_provider_model(
+        "claude-opus",
+        "claude2",
+        &script,
+        r#"
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+"#,
+    );
+    fixture.seed_session_turns("claude2", session_id, &[("turn-1", "2026-04-17T08:00:00Z")]);
+
+    let output = fixture
+        .base_top_level_resume_command("claude-opus", session_id)
+        .arg("answer text")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(7), "{output:?}");
+    let invocation = parse_invocation(&String::from_utf8_lossy(&output.stderr));
+    let row = fixture
+        .open_db()
+        .get_invocation_by_uuid(&invocation.id)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(row.status, InvocationStatus::Failed);
+    assert_eq!(row.success, Some(false));
+    assert_eq!(row.exit_code, Some(7));
+    assert_eq!(row.terminal_reason.as_deref(), Some("exit_nonzero"));
+    assert_eq!(row.session_id.as_deref(), Some(session_id));
+    assert_eq!(row.session_capture_method.as_deref(), Some("resumed"));
+    assert!(row.finished_at.is_some());
+}
+
+#[test]
+fn noninteractive_resume_spawn_error_finalizes_failed_row_with_spawn_error_reason() {
+    let fixture = Fixture::new();
+    let session_id = "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22";
+    let missing_command = fixture
+        .dir
+        .path()
+        .join("definitely-missing-resume-provider");
+    fixture.write_single_provider_model(
+        "claude-opus",
+        "claude2",
+        &missing_command,
+        r#"
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+"#,
+    );
+    fixture.seed_session_turns("claude2", session_id, &[("turn-1", "2026-04-17T08:00:00Z")]);
+
+    let output = fixture
+        .base_resume_command("claude-opus", session_id)
+        .arg("--prompt")
+        .arg("answer text")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let invocation = parse_invocation(&String::from_utf8_lossy(&output.stderr));
+    let row = fixture
+        .open_db()
+        .get_invocation_by_uuid(&invocation.id)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(row.status, InvocationStatus::Failed);
+    assert_eq!(row.success, Some(false));
+    assert_eq!(row.exit_code, Some(1));
+    assert_eq!(row.error_category.as_deref(), Some("spawn_error"));
+    assert_eq!(row.terminal_reason.as_deref(), Some("spawn_error"));
+    assert_eq!(row.session_id.as_deref(), Some(session_id));
+    assert_eq!(row.session_capture_method.as_deref(), Some("resumed"));
+    assert!(row.finished_at.is_some());
+}
+
+#[test]
 fn interactive_repl_resume_routes_to_session_owner_in_multi_provider_model() {
     let fixture = Fixture::new();
     let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
@@ -1603,11 +1688,9 @@ flag = "--resume"
     assert_eq!(row.terminal_reason.as_deref(), Some("exit_nonzero"));
 }
 
-// RISK: resume signal path could miss the same terminal_reason vocabulary used by one-shot (proposal §test-intent "resume terminal-reason tests", assumption A5)
-// LEVEL: particular-integration
-// SOURCE: contracts/nes-250-contract.md § Test catalog § Finalize cascade (T-FINAL-RESUME)
+// risk: exhaustive surfaces 3, 16, 18, 27-29, 57-59; level: particular-integration; source: contract § 5.4, contract § 5.7, A1, A3, A4, A10
 #[test]
-fn t_final_resume_signal_records_terminal_reason_while_preserving_direct_exit_code_policy() {
+fn t_final_resume_signal_records_unified_signal_exit_code_and_terminal_reason() {
     let fixture = Fixture::new();
     let session_id = "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22";
     let script = fixture.write_script(
@@ -1633,7 +1716,7 @@ flag = "--resume"
         .output()
         .unwrap();
 
-    assert_eq!(output.status.code(), Some(255), "{output:?}");
+    assert_eq!(output.status.code(), Some(143), "{output:?}");
     let invocation = parse_invocation(&String::from_utf8_lossy(&output.stderr));
     let row = fixture
         .open_db()
@@ -1642,8 +1725,17 @@ flag = "--resume"
         .unwrap();
     assert_eq!(row.status, InvocationStatus::Failed);
     assert_eq!(row.success, Some(false));
-    assert_eq!(row.exit_code, Some(-1));
+    assert_eq!(row.exit_code, Some(143));
     assert_eq!(row.terminal_reason.as_deref(), Some("signal:SIGTERM"));
+    assert_eq!(row.session_capture_method.as_deref(), Some("resumed"));
+
+    let trace = run_trace_json(&fixture, &invocation.id);
+    assert_eq!(trace["root"]["invocation"]["exit_code"], 143);
+    assert_eq!(
+        trace["root"]["invocation"]["terminal_reason"],
+        "signal:SIGTERM"
+    );
+    assert_eq!(trace["root"]["invocation"]["success"], false);
 }
 
 #[test]

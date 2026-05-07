@@ -348,9 +348,31 @@ done"#,
     assert!(row.finished_at.is_some());
 }
 
-// RISK: REPL signal path could preserve D-022 numeric exit_code but miss the shared terminal_reason vocabulary (proposal §test-intent "interactive raw-signal characterization", assumption A8)
-// LEVEL: particular-integration
-// SOURCE: contracts/nes-250-contract.md § Test catalog § Finalize cascade (T-FINAL-REPL-SIGNAL)
+#[test]
+fn repl_normal_nonzero_child_exit_finalizes_failed_row_with_exit_nonzero_reason() {
+    let fixture = Fixture::new();
+    let script = fixture.write_script("fixture-exit-7.sh", "exit 7");
+    fixture.write_model("fixture", "fixture-provider", &script);
+
+    let output = fixture.run_repl("fixture", None);
+
+    assert_eq!(output.status.code(), Some(7), "{output:?}");
+    let invocation = parse_invocation(&String::from_utf8_lossy(&output.stderr));
+    let row = fixture
+        .open_db()
+        .get_invocation_by_uuid(&invocation.id)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(row.status, InvocationStatus::Failed);
+    assert_eq!(row.success, Some(false));
+    assert_eq!(row.exit_code, Some(7));
+    assert_eq!(row.error_category, None);
+    assert_eq!(row.terminal_reason.as_deref(), Some("exit_nonzero"));
+    assert!(row.finished_at.is_some());
+}
+
+// risk: exhaustive surfaces 4-6, 10, 13-14, 17, 23-26; level: particular-integration; source: contract § 5.5, A1, A5, A10
 #[test]
 fn repl_raw_sigterm_child_death_finalizes_failed_row_with_128_plus_signal_exit_code() {
     // CHARACTERIZATION: T-FINAL-REPL-SIGNAL preserves D-022 exit_code=143 and adds terminal_reason=signal:SIGTERM.
@@ -377,6 +399,30 @@ sleep 1"#,
     assert_eq!(row.exit_code, Some(143));
     assert_eq!(row.error_category, None);
     assert_eq!(row.terminal_reason.as_deref(), Some("signal:SIGTERM"));
+    assert!(row.finished_at.is_some());
+}
+
+#[test]
+fn repl_spawn_error_finalizes_failed_row_with_spawn_error_reason() {
+    let fixture = Fixture::new();
+    let missing_command = fixture.dir.path().join("definitely-missing-repl-provider");
+    fixture.write_model("fixture", "fixture-provider", &missing_command);
+
+    let output = fixture.run_repl("fixture", None);
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let invocation = parse_invocation(&String::from_utf8_lossy(&output.stderr));
+    let row = fixture
+        .open_db()
+        .get_invocation_by_uuid(&invocation.id)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(row.status, InvocationStatus::Failed);
+    assert_eq!(row.success, Some(false));
+    assert_eq!(row.exit_code, Some(1));
+    assert_eq!(row.error_category.as_deref(), Some("spawn_error"));
+    assert_eq!(row.terminal_reason.as_deref(), Some("spawn_error"));
     assert!(row.finished_at.is_some());
 }
 

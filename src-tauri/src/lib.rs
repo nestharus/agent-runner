@@ -871,4 +871,29 @@ mod tests {
         let quota = db.get_quota("sh").unwrap().unwrap();
         assert!(quota.exhausted_at.is_some());
     }
+
+    // risk: exhaustive surfaces 38-39; level: Rust unit; source: contract § 5.8, A8, A10
+    #[cfg(unix)]
+    #[test]
+    fn test_model_raw_sigterm_returns_unified_signal_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let model = ModelConfig {
+            name: "sigterm-model".to_string(),
+            prompt_mode: PromptMode::Arg,
+            providers: vec![ProviderConfig::new(
+                "sh",
+                vec!["-c".to_string(), "kill -TERM $$; sleep 1".to_string()],
+            )],
+            inputs: vec![],
+        };
+        let mut models = HashMap::new();
+        models.insert(model.name.clone(), model);
+
+        let result = test_model_for_test(models, models_dir, "sigterm-model").unwrap();
+
+        assert!(!result.success);
+        assert_eq!(result.exit_code, 143);
+    }
 }
