@@ -132,6 +132,8 @@ Options:
   -f, --file <FILE>              Read prompt from file
   -p, --project <PROJECT>        Working directory for subprocess
   -i, --input <KEY=VALUE>        Pass model inputs as key=value (repeatable)
+  -n, --new                      Start a fresh default-provider interactive session
+      --resume <SESSION_ID>      Resume an existing session at the top level
       --models-dir <MODELS_DIR>  Override models directory
       --agents-dir <AGENTS_DIR>  Override agents directory
   -h, --help                     Print help
@@ -226,9 +228,16 @@ oulipoly-agent-runner -m seedance-i2v-low -i image=cat.jpeg "The cat blinks slow
 
 ## Interactive REPL
 
+`oulipoly-agent-runner --new` starts a fresh interactive session using
+`default_provider` from `config.toml`. This is the top-level fresh-session
+entrypoint; `--resume <session-id>` is its existing-session counterpart.
+
 `oulipoly-agent-runner repl <model>` launches the wrapped CLI as an interactive session through the load balancer instead of as a one-shot. Stdin / stdout / stderr are inherited (TTY pass-through), so terminal-generated `Ctrl+C` reaches the child directly. The runner stays alive only long enough to reap and finalize the invocation row.
 
 ```bash
+# Launch a fresh default-provider REPL
+oulipoly-agent-runner --new
+
 # Launch a balanced Claude REPL
 oulipoly-agent-runner repl claude-opus
 
@@ -692,6 +701,11 @@ event_id_path     = "thread_id"
 Without `session_capture`, invocations record `session_capture_method = "none"` and `trace` shows `transcript_state = "unresolved"` — clean degradation, no breakage.
 
 ### Resuming a session
+
+For top-level interactive flows, use `--new` to start a fresh
+default-provider session and `--resume <UUID>` to continue an existing one.
+The model-specific `repl --resume <UUID>` form remains available when the
+caller wants to name the model explicitly.
 
 When a provider declares a `[<provider>.resume]` block in `providers.toml`, `repl --resume <UUID>` looks the session up across all providers (via the `session_turns` ingest table), validates that the owning provider belongs to the requested model's provider pool when a model is known, and composes the right interactive resume argv.
 

@@ -50,7 +50,7 @@ pub(crate) fn run_repl_with_default_provider_with_launcher(
     let app = oulipoly_config::app::AppConfig::load(&config_path)?;
     let family = app.default_provider.ok_or_else(|| {
         format!(
-            "'default_provider' must be set in {} for 'agent' / '--new'",
+            "'default_provider' must be set in {} for '--new'",
             config_path.display()
         )
     })?;
@@ -240,6 +240,29 @@ interactive_args = ["ok"]
     }
 
     #[test]
+    fn production_services_match_known_baseline_for_none_and_some_project() {
+        let without_project = RuntimeServices::production(None).unwrap();
+
+        assert!(
+            without_project
+                .config_root
+                .ends_with("oulipoly-agent-runner")
+        );
+        assert_eq!(without_project.state_db_path, None);
+        assert_eq!(without_project.working_dir, None);
+
+        let project = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("age31-production-services-project");
+        let with_project = RuntimeServices::production(Some(project.clone())).unwrap();
+
+        assert_eq!(with_project.config_root, without_project.config_root);
+        assert_eq!(with_project.state_db_path, None);
+        assert_eq!(with_project.working_dir.as_ref(), Some(&project));
+    }
+
+    #[test]
     fn missing_default_provider_returns_error() {
         let temp = tempfile::tempdir().unwrap();
         write_config(temp.path(), r#"diagnostics_model = "codex~high""#);
@@ -250,7 +273,7 @@ interactive_args = ["ok"]
         assert_eq!(
             error,
             format!(
-                "'default_provider' must be set in {} for 'agent' / '--new'",
+                "'default_provider' must be set in {} for '--new'",
                 temp.path().join("config.toml").display()
             )
         );
