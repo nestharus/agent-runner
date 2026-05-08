@@ -1094,6 +1094,7 @@ fn assertion_a10_dependency_graph_required_edges() {
         "build-oulipoly-agent-cli".to_string(),
         "build-oulipoly-agent-store".to_string(),
         "build-oulipoly-agent-scratchpad".to_string(),
+        "build-oulipoly-agent-messenger".to_string(),
         "release".to_string(),
     ]);
     let release_expected_edges = BTreeSet::from([
@@ -1122,6 +1123,10 @@ fn assertion_a10_dependency_graph_required_edges() {
             "version".to_string(),
             "build-oulipoly-agent-scratchpad".to_string(),
         ),
+        (
+            "version".to_string(),
+            "build-oulipoly-agent-messenger".to_string(),
+        ),
         ("version".to_string(), "release".to_string()),
         ("build".to_string(), "release".to_string()),
         (
@@ -1134,6 +1139,10 @@ fn assertion_a10_dependency_graph_required_edges() {
         ),
         (
             "build-oulipoly-agent-scratchpad".to_string(),
+            "release".to_string(),
+        ),
+        (
+            "build-oulipoly-agent-messenger".to_string(),
             "release".to_string(),
         ),
     ]);
@@ -1202,6 +1211,14 @@ fn assertion_a14_standalone_binary_release_job_bodies() {
         "oulipoly-agent-scratchpad",
         "agent-scratchpad",
         "agent-scratchpad",
+        "A14",
+    );
+    assert_standalone_binary_release_job(
+        &release,
+        "build-oulipoly-agent-messenger",
+        "oulipoly-agent-messenger",
+        "agent-messenger",
+        "agent-messenger",
         "A14",
     );
 }

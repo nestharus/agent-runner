@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use oulipoly_agent_messenger::ReturnedArtifactRef;
 use oulipoly_config::{ModelConfig, load_models};
 use oulipoly_core::TransitionReason;
 use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, params};
@@ -203,6 +204,74 @@ pub struct SessionTurnIngest {
 
 pub type ModelStore = std::collections::HashMap<String, ModelConfig>;
 pub type DbError = String;
+
+macro_rules! invocation_returned_artifacts_schema_sql {
+    () => {
+        "CREATE TABLE IF NOT EXISTS invocation_returned_artifacts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            invocation_id INTEGER NOT NULL REFERENCES invocations(id),
+            ordinal INTEGER NOT NULL,
+            version_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            workflow_run_id TEXT NOT NULL,
+            artifact_name TEXT NOT NULL,
+            version INTEGER NOT NULL CHECK(version > 0),
+            sha256 TEXT NOT NULL CHECK(length(sha256) = 64),
+            content_len INTEGER NOT NULL CHECK(content_len >= 0),
+            format_hint TEXT NULL,
+            verdict_line TEXT NULL,
+            source_kind TEXT NOT NULL,
+            source_json TEXT NOT NULL,
+            returned_at TEXT NOT NULL,
+            UNIQUE(invocation_id, ordinal),
+            UNIQUE(invocation_id, version_id)
+        );"
+    };
+}
+
+fn returned_source_kind(source: &oulipoly_agent_messenger::ReturnedArtifactSource) -> &'static str {
+    match source {
+        oulipoly_agent_messenger::ReturnedArtifactSource::Scratchpad { .. } => "scratchpad",
+        oulipoly_agent_messenger::ReturnedArtifactSource::InlineBytes => "inline_bytes",
+    }
+}
+
+fn returned_artifact_producer_uuid(workflow_run_id: &str) -> rusqlite::Result<Uuid> {
+    let uuid_text = workflow_run_id.strip_prefix("return:").ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            2,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "returned artifact workflow_run_id is not in return namespace",
+            )),
+        )
+    })?;
+    Uuid::parse_str(uuid_text).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(err))
+    })
+}
+
+fn returned_artifact_version_id(
+    invocation_uuid: Uuid,
+    artifact_name: &str,
+    version: u64,
+) -> String {
+    let mut encoded_name = String::new();
+    for byte in artifact_name.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded_name.push(byte as char);
+        } else {
+            encoded_name.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    format!("store://return/{invocation_uuid}/{encoded_name}/{version}")
+}
+
+fn returned_artifact_sql_integer(value: u64, field: &str) -> Result<i64, DbError> {
+    i64::try_from(value)
+        .map_err(|_| format!("Returned artifact {field} exceeds SQLite INTEGER range: {value}"))
+}
 
 #[derive(Debug, Clone)]
 pub struct ResolvedResume {
@@ -1253,7 +1322,8 @@ impl StateDb {
     }
 
     fn invocations_schema_sql() -> &'static str {
-        "CREATE TABLE IF NOT EXISTS invocations (
+        concat!(
+            "CREATE TABLE IF NOT EXISTS invocations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             invocation_uuid TEXT NOT NULL UNIQUE,
             model_name TEXT NOT NULL,
@@ -1281,11 +1351,14 @@ impl StateDb {
             ON invocations (provider_name, created_at);
         CREATE INDEX IF NOT EXISTS idx_invocations_provider_session
             ON invocations (provider_name, session_id)
-            WHERE session_id IS NOT NULL;"
+            WHERE session_id IS NOT NULL;",
+            invocation_returned_artifacts_schema_sql!()
+        )
     }
 
     fn invocations_index_sql() -> &'static str {
-        "CREATE INDEX IF NOT EXISTS idx_invocations_uuid
+        concat!(
+            "CREATE INDEX IF NOT EXISTS idx_invocations_uuid
             ON invocations (invocation_uuid);
         CREATE INDEX IF NOT EXISTS idx_invocations_parent
             ON invocations (parent_invocation_id, created_at);
@@ -1293,7 +1366,9 @@ impl StateDb {
             ON invocations (provider_name, created_at);
         CREATE INDEX IF NOT EXISTS idx_invocations_provider_session
             ON invocations (provider_name, session_id)
-            WHERE session_id IS NOT NULL;"
+            WHERE session_id IS NOT NULL;",
+            invocation_returned_artifacts_schema_sql!()
+        )
     }
 
     fn session_turns_index_sql() -> &'static str {
@@ -1598,6 +1673,219 @@ impl StateDb {
 
         tx.commit()
             .map_err(|e| format!("Failed to commit invocation finalize tx: {e}"))
+    }
+
+    pub fn record_returned_artifacts(
+        &self,
+        invocation_row_id: i64,
+        refs: &[ReturnedArtifactRef],
+    ) -> Result<(), DbError> {
+        let invocation_uuid_text: String = self
+            .conn
+            .query_row(
+                "SELECT invocation_uuid FROM invocations WHERE id = ?1",
+                params![invocation_row_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to load invocation for returned artifacts: {e}"))?
+            .ok_or_else(|| format!("Invocation {invocation_row_id} not found"))?;
+        let invocation_uuid = Uuid::parse_str(&invocation_uuid_text)
+            .map_err(|e| format!("Invalid invocation UUID on row {invocation_row_id}: {e}"))?;
+
+        for reference in refs {
+            let derived_uuid =
+                returned_artifact_producer_uuid(&reference.store_address.workflow_run_id)
+                    .map_err(|e| format!("Invalid returned-artifact workflow_run_id: {e}"))?;
+            if derived_uuid != reference.producer_invocation_uuid {
+                return Err(format!(
+                    "Returned artifact producer UUID mismatch: workflow_run_id encodes {derived_uuid}, ref carries {}",
+                    reference.producer_invocation_uuid
+                ));
+            }
+            if reference.producer_invocation_uuid != invocation_uuid {
+                return Err(format!(
+                    "Returned artifact belongs to {}, but invocation row {invocation_row_id} is {invocation_uuid}",
+                    reference.producer_invocation_uuid
+                ));
+            }
+            let expected_version_id = returned_artifact_version_id(
+                derived_uuid,
+                &reference.store_address.artifact_name,
+                reference.store_address.version,
+            );
+            if reference.version_id != expected_version_id {
+                return Err(format!(
+                    "Returned artifact version_id mismatch: expected {expected_version_id}, ref carries {}",
+                    reference.version_id
+                ));
+            }
+        }
+
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("Failed to begin returned-artifacts tx: {e}"))?;
+        tx.execute(
+            "DELETE FROM invocation_returned_artifacts WHERE invocation_id = ?1",
+            params![invocation_row_id],
+        )
+        .map_err(|e| format!("Failed to reset returned artifacts: {e}"))?;
+        for (ordinal, reference) in refs.iter().enumerate() {
+            let version =
+                returned_artifact_sql_integer(reference.store_address.version, "version")?;
+            let content_len = returned_artifact_sql_integer(reference.content_len, "content_len")?;
+            let source_json = serde_json::to_string(&reference.source)
+                .map_err(|e| format!("Failed to encode returned-artifact source: {e}"))?;
+            let source_kind = returned_source_kind(&reference.source);
+            tx.execute(
+                "INSERT INTO invocation_returned_artifacts (
+                    invocation_id,
+                    ordinal,
+                    version_id,
+                    name,
+                    workflow_run_id,
+                    artifact_name,
+                    version,
+                    sha256,
+                    content_len,
+                    format_hint,
+                    verdict_line,
+                    source_kind,
+                    source_json,
+                    returned_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                params![
+                    invocation_row_id,
+                    ordinal as i64,
+                    &reference.version_id,
+                    &reference.name,
+                    &reference.store_address.workflow_run_id,
+                    &reference.store_address.artifact_name,
+                    version,
+                    &reference.sha256,
+                    content_len,
+                    &reference.format_hint,
+                    &reference.verdict_line,
+                    source_kind,
+                    source_json,
+                    reference.returned_at.to_rfc3339(),
+                ],
+            )
+            .map_err(|e| format!("Failed to record returned artifact: {e}"))?;
+        }
+        tx.commit()
+            .map_err(|e| format!("Failed to commit returned-artifacts tx: {e}"))
+    }
+
+    pub fn list_returned_artifacts(
+        &self,
+        invocation_row_id: i64,
+    ) -> Result<Vec<ReturnedArtifactRef>, DbError> {
+        let object_type = self
+            .conn
+            .query_row(
+                "SELECT type
+                 FROM sqlite_master
+                 WHERE name = 'invocation_returned_artifacts'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to inspect returned-artifacts schema: {e}"))?;
+        match object_type.as_deref() {
+            None => return Ok(Vec::new()),
+            Some("table") => {}
+            Some(other) => {
+                return Err(format!(
+                    "Unexpected returned-artifacts schema shape: object type={other}"
+                ));
+            }
+        }
+
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT
+                    version_id,
+                    name,
+                    workflow_run_id,
+                    artifact_name,
+                    version,
+                    sha256,
+                    content_len,
+                    format_hint,
+                    verdict_line,
+                    source_json,
+                    returned_at
+                 FROM invocation_returned_artifacts
+                 WHERE invocation_id = ?1
+                 ORDER BY ordinal ASC",
+            )
+            .map_err(|e| format!("Failed to prepare returned-artifacts query: {e}"))?;
+        let rows = stmt
+            .query_map(params![invocation_row_id], |row| {
+                let source_json: String = row.get(9)?;
+                let workflow_run_id: String = row.get(2)?;
+                let returned_at_text: String = row.get(10)?;
+                let source = serde_json::from_str(&source_json).map_err(|err| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        9,
+                        rusqlite::types::Type::Text,
+                        Box::new(err),
+                    )
+                })?;
+                let returned_at = DateTime::parse_from_rfc3339(&returned_at_text)
+                    .map_err(|err| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            10,
+                            rusqlite::types::Type::Text,
+                            Box::new(err),
+                        )
+                    })?
+                    .with_timezone(&Utc);
+                let producer_invocation_uuid = returned_artifact_producer_uuid(&workflow_run_id)?;
+                let version = u64::try_from(row.get::<_, i64>(4)?).map_err(|_| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        4,
+                        rusqlite::types::Type::Integer,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "negative returned artifact version",
+                        )),
+                    )
+                })?;
+                let content_len = u64::try_from(row.get::<_, i64>(6)?).map_err(|_| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        6,
+                        rusqlite::types::Type::Integer,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "negative returned artifact content_len",
+                        )),
+                    )
+                })?;
+                Ok(ReturnedArtifactRef {
+                    version_id: row.get(0)?,
+                    name: row.get(1)?,
+                    store_address: oulipoly_agent_messenger::StoreAddress {
+                        workflow_run_id,
+                        artifact_name: row.get(3)?,
+                        version,
+                    },
+                    sha256: row.get(5)?,
+                    content_len,
+                    format_hint: row.get(7)?,
+                    verdict_line: row.get(8)?,
+                    source,
+                    producer_invocation_uuid,
+                    returned_at,
+                })
+            })
+            .map_err(|e| format!("Failed to query returned artifacts: {e}"))?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read returned artifact row: {e}"))
     }
 
     /// Update an invocation row's session correlation columns. Per

@@ -1,5 +1,6 @@
 pub mod cli;
 
+pub use oulipoly_agent_messenger::ReturnedArtifactRef;
 use oulipoly_config::ModelConfig;
 use oulipoly_state::CompositeInvocationId;
 use std::collections::HashMap;
@@ -16,6 +17,7 @@ pub struct ExecutionResult {
     pub resume_acceptance: Option<ResumeAcceptanceResult>,
     pub terminal_reason: Option<String>,
     pub captured_child_invocations: Vec<CapturedChildInvocation>,
+    pub returned_artifacts: Vec<ReturnedArtifactRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

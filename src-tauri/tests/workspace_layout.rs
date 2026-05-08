@@ -13,6 +13,7 @@ const WORKSPACE_MEMBERS: &[&str] = &[
     "crates/oulipoly-agent-cli",
     "crates/oulipoly-agent-store",
     "crates/oulipoly-agent-scratchpad",
+    "crates/oulipoly-agent-messenger",
 ];
 
 const LIB_CRATES: &[&str] = &[
@@ -27,16 +28,21 @@ const EXPECTED_EDGES: &[(&str, &str)] = &[
     ("src-tauri", "oulipoly-runtime"),
     ("src-tauri", "oulipoly-setup"),
     ("src-tauri", "oulipoly-state"),
+    ("src-tauri", "oulipoly-agent-messenger"),
     ("src-tauri", "oulipoly-config"),
     ("src-tauri", "oulipoly-core"),
     ("oulipoly-runtime", "oulipoly-state"),
+    ("oulipoly-runtime", "oulipoly-agent-messenger"),
     ("oulipoly-runtime", "oulipoly-config"),
     ("oulipoly-runtime", "oulipoly-core"),
     ("oulipoly-state", "oulipoly-config"),
+    ("oulipoly-state", "oulipoly-agent-messenger"),
     ("oulipoly-state", "oulipoly-core"),
     ("oulipoly-agent-cli", "oulipoly-runtime"),
     ("oulipoly-agent-cli", "oulipoly-config"),
     ("oulipoly-agent-scratchpad", "oulipoly-agent-store"),
+    ("oulipoly-agent-messenger", "oulipoly-agent-store"),
+    ("oulipoly-agent-messenger", "oulipoly-agent-scratchpad"),
 ];
 
 const GRAPH_NODES: &[&str] = &[
@@ -49,6 +55,7 @@ const GRAPH_NODES: &[&str] = &[
     "oulipoly-agent-cli",
     "oulipoly-agent-store",
     "oulipoly-agent-scratchpad",
+    "oulipoly-agent-messenger",
 ];
 
 fn repo_root() -> PathBuf {
@@ -294,6 +301,7 @@ fn workspace_includes_agent_binary_members() {
             "crates/oulipoly-agent-cli",
             "crates/oulipoly-agent-store",
             "crates/oulipoly-agent-scratchpad",
+            "crates/oulipoly-agent-messenger",
         ] {
             assert!(
                 entries.contains(expected),
@@ -315,6 +323,7 @@ fn agent_binary_targets_have_expected_names() {
         ("oulipoly-agent-cli", "agent"),
         ("oulipoly-agent-store", "agent-store"),
         ("oulipoly-agent-scratchpad", "agent-scratchpad"),
+        ("oulipoly-agent-messenger", "agent-messenger"),
     ] {
         let package = packages
             .iter()

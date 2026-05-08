@@ -10,6 +10,7 @@ members = [
     "crates/oulipoly-agent-cli",
     "crates/oulipoly-agent-store",
     "crates/oulipoly-agent-scratchpad",
+    "crates/oulipoly-agent-messenger",
 ]
 default-members = [
     "src-tauri",
@@ -21,6 +22,7 @@ default-members = [
     "crates/oulipoly-agent-cli",
     "crates/oulipoly-agent-store",
     "crates/oulipoly-agent-scratchpad",
+    "crates/oulipoly-agent-messenger",
 ]
 
 [workspace.package]
@@ -49,4 +51,4 @@ tokio = { version = "1", features = ["sync"] }
 toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "serde"] }

@@ -1950,6 +1950,21 @@ fn run_resume(
     } else {
         None
     };
+    if let Err(err) = state.record_returned_artifacts(invocation_row_id, &result.returned_artifacts)
+    {
+        eprintln!("Error: Failed to record returned artifacts: {err}");
+        state
+            .finalize_invocation(
+                invocation_row_id,
+                false,
+                1,
+                Some("returned_artifacts"),
+                Some("returned_artifacts_persist_failed"),
+            )
+            .unwrap_or_else(|e| eprintln!("Warning: Failed to finalize invocation: {e}"));
+        guard.mark_finalized();
+        return Ok(1);
+    }
     state.finalize_invocation(
         invocation_row_id,
         success,
@@ -2089,6 +2104,21 @@ fn run_with_balancing(
         state
             .mark_exhausted(provider_name)
             .unwrap_or_else(|e| eprintln!("Warning: Failed to mark provider exhausted: {e}"));
+    }
+
+    if let Err(err) = state.record_returned_artifacts(invocation_row_id, &result.returned_artifacts)
+    {
+        eprintln!("Error: Failed to record returned artifacts: {err}");
+        state
+            .finalize_invocation(
+                invocation_row_id,
+                false,
+                1,
+                Some("returned_artifacts"),
+                Some("returned_artifacts_persist_failed"),
+            )
+            .unwrap_or_else(|e| eprintln!("Warning: Failed to finalize invocation: {e}"));
+        return Ok(1);
     }
 
     state

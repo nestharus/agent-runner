@@ -25,7 +25,7 @@ use signal_hook::iterator::{Handle as SignalsHandle, Signals};
 
 use super::{
     CapturedChildInvocation, ExecutionResult, ResumeAcceptanceResult, ResumeAcceptanceStatus,
-    SessionCaptureMethod, SessionCaptureResult,
+    ReturnedArtifactRef, SessionCaptureMethod, SessionCaptureResult,
 };
 
 const LARGE_PROMPT_THRESHOLD: usize = 100 * 1024; // 100KB
@@ -69,6 +69,7 @@ pub fn execute(
         resume_acceptance: None,
         terminal_reason: result.terminal_reason,
         captured_child_invocations: result.captured_child_invocations,
+        returned_artifacts: result.returned_artifacts,
     })
 }
 
@@ -106,6 +107,7 @@ pub fn execute_effective(request: EffectiveExecuteRequest<'_>) -> Result<Executi
         resume_acceptance: None,
         terminal_reason: result.terminal_reason,
         captured_child_invocations: result.captured_child_invocations,
+        returned_artifacts: result.returned_artifacts,
     })
 }
 
@@ -279,6 +281,92 @@ struct RawResult {
     session_capture: SessionCaptureResult,
     terminal_reason: Option<String>,
     captured_child_invocations: Vec<CapturedChildInvocation>,
+    returned_artifacts: Vec<ReturnedArtifactRef>,
+}
+
+struct ReturnChannel {
+    path: PathBuf,
+    dir: PathBuf,
+}
+
+impl ReturnChannel {
+    fn cleanup(&self) {
+        if let Err(err) = std::fs::remove_file(&self.path) {
+            eprintln!(
+                "Warning: failed to delete return channel {}: {err}",
+                self.path.display()
+            );
+        }
+        if let Err(err) = std::fs::remove_dir(&self.dir)
+            && err.kind() != std::io::ErrorKind::NotFound
+            && err.kind() != std::io::ErrorKind::DirectoryNotEmpty
+        {
+            eprintln!(
+                "Warning: failed to delete return channel directory {}: {err}",
+                self.dir.display()
+            );
+        }
+    }
+}
+
+fn prepare_return_channel(
+    parent_invocation_env: Option<&str>,
+) -> Result<Option<ReturnChannel>, String> {
+    let Some(parent_invocation_env) = parent_invocation_env else {
+        return Ok(None);
+    };
+    let invocation = CompositeInvocationId::parse_env_value(parent_invocation_env)
+        .map_err(|err| format!("Failed to parse parent invocation for return channel: {err}"))?;
+    let dir = std::env::temp_dir()
+        .join("oulipoly-return-channels")
+        .join(&invocation.id);
+    std::fs::create_dir_all(&dir).map_err(|err| {
+        format!(
+            "Failed to create return channel directory {}: {err}",
+            dir.display()
+        )
+    })?;
+    let path = dir.join(format!("returns-{}.jsonl", uuid::Uuid::new_v4()));
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&path)
+        .map_err(|err| format!("Failed to create return channel {}: {err}", path.display()))?;
+    Ok(Some(ReturnChannel { path, dir }))
+}
+
+fn read_return_channel(channel: &ReturnChannel) -> Vec<ReturnedArtifactRef> {
+    let body = match std::fs::read_to_string(&channel.path) {
+        Ok(body) => body,
+        Err(err) => {
+            eprintln!(
+                "Warning: failed to read return channel {}: {err}",
+                channel.path.display()
+            );
+            return Vec::new();
+        }
+    };
+    body.lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            match serde_json::from_str::<ReturnedArtifactRef>(trimmed) {
+                Ok(reference) => Some(reference),
+                Err(err) => {
+                    eprintln!(
+                        "Warning: failed to parse return channel line {} in {}: {err}",
+                        index + 1,
+                        channel.path.display()
+                    );
+                    None
+                }
+            }
+        })
+        .collect()
 }
 
 pub struct ResumePayload<'a> {
@@ -337,6 +425,7 @@ fn build_command(
     provider_args: &[String],
     working_dir: Option<&Path>,
     parent_invocation_env: Option<&str>,
+    return_channel: Option<&Path>,
 ) -> Result<Command, String> {
     let parts = shell_split(&provider.command);
     if parts.is_empty() {
@@ -356,6 +445,11 @@ fn build_command(
     }
     if let Some(parent_invocation_env) = parent_invocation_env {
         cmd.env("OULIPOLY_PARENT_INVOCATION", parent_invocation_env);
+    }
+    if let Some(return_channel) = return_channel {
+        cmd.env("OULIPOLY_RETURN_CHANNEL", return_channel);
+    } else {
+        cmd.env_remove("OULIPOLY_RETURN_CHANNEL");
     }
 
     Ok(cmd)
@@ -389,7 +483,16 @@ fn execute_provider_with_args(
     input_args: &[String],
     parent_invocation_env: Option<&str>,
 ) -> Result<(RawResult, Vec<PathBuf>), String> {
-    let mut cmd = build_command(provider, provider_args, working_dir, parent_invocation_env)?;
+    let return_channel = prepare_return_channel(parent_invocation_env)?;
+    let mut cmd = build_command(
+        provider,
+        provider_args,
+        working_dir,
+        parent_invocation_env,
+        return_channel
+            .as_ref()
+            .map(|channel| channel.path.as_path()),
+    )?;
 
     // Append input flags
     for arg in input_args {
@@ -443,6 +546,14 @@ fn execute_provider_with_args(
         .wait_with_output()
         .map_err(|e| format!("Failed to wait for process: {e}"))?;
 
+    let returned_artifacts = return_channel
+        .as_ref()
+        .map(read_return_channel)
+        .unwrap_or_default();
+    if let Some(channel) = &return_channel {
+        channel.cleanup();
+    }
+
     let capture_outcome = finalize_capture(&capture_plan, &output.stdout);
     let stdout = maybe_restore_plain_stdout(&capture_plan, &capture_outcome, &output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -454,6 +565,7 @@ fn execute_provider_with_args(
         exit_code: exit_code_from_status(&output.status),
         terminal_reason: classify_terminal_reason(&output.status),
         session_capture: capture_outcome,
+        returned_artifacts,
     };
 
     Ok((result, temp_files))
@@ -503,6 +615,7 @@ pub fn execute_resume(
         resume_acceptance: Some(resume_acceptance),
         terminal_reason: result.terminal_reason,
         captured_child_invocations: result.captured_child_invocations,
+        returned_artifacts: result.returned_artifacts,
     })
 }
 
@@ -609,7 +722,13 @@ pub fn execute_interactive_with_result(
         provider_args = compose_resume_provider_args(provider_args, resume)?;
     }
 
-    let mut cmd = build_command(provider, &provider_args, working_dir, parent_invocation_env)?;
+    let mut cmd = build_command(
+        provider,
+        &provider_args,
+        working_dir,
+        parent_invocation_env,
+        None,
+    )?;
     cmd.stdin(Stdio::inherit());
     cmd.stdout(Stdio::inherit());
     cmd.stderr(Stdio::inherit());

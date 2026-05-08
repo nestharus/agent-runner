@@ -8,6 +8,7 @@ use crate::session_export::ContentChunk;
 use crate::session_metadata::TranscriptState;
 use crate::sessions::locate_transcript;
 use chrono::{DateTime, SecondsFormat, Utc};
+use oulipoly_agent_messenger::ReturnedArtifactRef;
 use oulipoly_config::SessionsConfig;
 use oulipoly_state::{InvocationRecord, StateDb};
 use serde::Serialize;
@@ -59,6 +60,8 @@ pub struct TraceInvocation {
     pub terminal_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stale_running: Option<StaleRunning>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub returned_artifacts: Vec<ReturnedArtifactRef>,
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
 }
@@ -215,6 +218,7 @@ fn build_trace_node(
             stale.age_seconds
         ));
     }
+    let returned_artifacts = db.list_returned_artifacts(record.id)?;
 
     let mut node = TraceNode {
         invocation: TraceInvocation {
@@ -229,6 +233,7 @@ fn build_trace_node(
             error_category: record.error_category,
             terminal_reason,
             stale_running,
+            returned_artifacts,
             started_at: record.created_at,
             finished_at: record.finished_at,
         },

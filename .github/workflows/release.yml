@@ -331,8 +331,47 @@ jobs:
           name: agent-scratchpad-${{ matrix.target }}
           path: artifacts/*
 
+  build-oulipoly-agent-messenger:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: agent-messenger-${{ matrix.target }}
+      - name: Build agent messenger
+        run: cargo build --release --target ${{ matrix.target }} --bin agent-messenger -p oulipoly-agent-messenger
+      - name: Collect agent messenger artifact
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p artifacts
+          cp target/${{ matrix.target }}/release/agent-messenger artifacts/agent-messenger-${{ matrix.target }}
+      - name: Collect agent messenger artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts
+          Copy-Item target/${{ matrix.target }}/release/agent-messenger.exe artifacts/agent-messenger-${{ matrix.target }}.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-messenger-${{ matrix.target }}
+          path: artifacts/*
+
   release:
-    needs: [version, build, build-oulipoly-agent-cli, build-oulipoly-agent-store, build-oulipoly-agent-scratchpad]
+    needs: [version, build, build-oulipoly-agent-cli, build-oulipoly-agent-store, build-oulipoly-agent-scratchpad, build-oulipoly-agent-messenger]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
