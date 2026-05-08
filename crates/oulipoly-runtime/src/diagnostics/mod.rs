@@ -1,4 +1,7 @@
 use crate::executor;
+use crate::services::{
+    DiagnosticsServiceOutput, DiagnosticsServicePort, DiagnosticsServiceRequest, ServiceError,
+};
 use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig};
 use std::collections::HashMap;
 use std::path::Path;
@@ -30,6 +33,42 @@ impl ErrorCategory {
             ErrorCategory::CliVersionMismatch => "cli_version_mismatch",
             ErrorCategory::NetworkError => "network_error",
             ErrorCategory::Unknown => "unknown",
+        }
+    }
+}
+
+pub struct RuntimeDiagnosticsService;
+
+impl DiagnosticsServicePort for RuntimeDiagnosticsService {
+    fn diagnose(
+        &self,
+        request: DiagnosticsServiceRequest,
+    ) -> Result<DiagnosticsServiceOutput, ServiceError> {
+        match request {
+            DiagnosticsServiceRequest::ClassifyExhaustion { stderr } => {
+                Ok(DiagnosticsServiceOutput::ExhaustionClassification {
+                    is_exhausted: classify_exhaustion(&stderr),
+                })
+            }
+            DiagnosticsServiceRequest::DiagnoseError {
+                diagnostics_model,
+                effective_provider,
+                provider_index,
+                prompt_mode,
+                exit_code,
+                stderr,
+                working_dir,
+            } => diagnose_error(
+                &diagnostics_model,
+                &effective_provider,
+                provider_index,
+                prompt_mode,
+                exit_code,
+                &stderr,
+                working_dir.as_deref(),
+            )
+            .map(|diagnosis| DiagnosticsServiceOutput::Diagnosis { diagnosis })
+            .map_err(|message| ServiceError::Dependency { message }),
         }
     }
 }

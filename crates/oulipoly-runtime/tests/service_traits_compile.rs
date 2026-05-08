@@ -153,3 +153,19 @@ fn service_port_traits_are_send_sync_trait_object_usable() {
     let _: Box<dyn SessionLockServicePort + Send + Sync> = Box::new(StubService);
     let _: Box<dyn MigrationMaintenanceServicePort + Send + Sync> = Box::new(StubService);
 }
+
+// Risk: R-A1 / proposal T9 - DTO expansion must keep the existing port method
+// names object-safe, and production adapters must implement those named ports.
+// Level: unit.
+// Source: AGE-34 contract "Adapter signatures" and proposal assumption A1.
+#[test]
+fn age_34_runtime_service_adapters_are_send_sync_trait_object_usable() {
+    let _: Box<dyn ExecutorServicePort + Send + Sync> =
+        Box::new(oulipoly_runtime::executor::RuntimeExecutorService);
+    let _: Box<dyn LauncherServicePort + Send + Sync> =
+        Box::new(oulipoly_runtime::repl_default_provider::RuntimeLauncherService);
+    let _: Box<dyn QuotaServicePort + Send + Sync> =
+        Box::new(oulipoly_runtime::quota::RuntimeQuotaService);
+    let _: Box<dyn DiagnosticsServicePort + Send + Sync> =
+        Box::new(oulipoly_runtime::diagnostics::RuntimeDiagnosticsService);
+}

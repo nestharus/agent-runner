@@ -2,6 +2,7 @@
 //! `providers.toml`) that hits the provider's usage API and prints JSON on
 //! stdout. The parsed reading lands in `provider_quotas` + `provider_quota_windows`.
 
+use crate::services::{QuotaServiceOutput, QuotaServicePort, QuotaServiceRequest, ServiceError};
 use chrono::{DateTime, Utc};
 use oulipoly_config::ProvidersConfig;
 use oulipoly_state::{QuotaWindowInput, StateDb};
@@ -101,6 +102,24 @@ pub enum RefreshOutcome {
     AlreadyInFlight,
     /// Script ran but the output didn't parse / exit was non-zero.
     Failed(String),
+}
+
+pub struct RuntimeQuotaService;
+
+impl QuotaServicePort for RuntimeQuotaService {
+    fn refresh_quota(
+        &self,
+        request: QuotaServiceRequest<'_>,
+    ) -> Result<QuotaServiceOutput, ServiceError> {
+        let outcome = refresh_provider(
+            &request.provider_name,
+            request.providers_cfg,
+            request.in_flight,
+            request.state,
+        );
+
+        Ok(QuotaServiceOutput { outcome })
+    }
 }
 
 /// Refresh one provider's quota. Caller is responsible for checking staleness.
