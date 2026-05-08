@@ -1,13 +1,16 @@
 pub mod error;
 
+use crate::balancer::MigrationDecision;
 use crate::diagnostics::Diagnosis;
 use crate::executor::ExecutionResult;
 use crate::quota::{InFlight, RefreshOutcome};
 pub use error::ServiceError;
 use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig, ProvidersConfig};
 use oulipoly_state::StateDb;
+use oulipoly_state::repositories::ResumeRepository;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 macro_rules! service_dto {
     ($($name:ident),+ $(,)?) => {
@@ -21,12 +24,6 @@ macro_rules! service_dto {
 service_dto!(
     ConfigServiceRequest,
     ConfigServiceOutput,
-    SessionLifecycleRequest,
-    SessionLifecycleOutput,
-    ResumeServiceRequest,
-    ResumeServiceOutput,
-    MigrationServiceRequest,
-    MigrationServiceOutput,
     TraceServiceRequest,
     TraceServiceOutput,
     SessionExportServiceRequest,
@@ -38,6 +35,77 @@ service_dto!(
     MigrationMaintenanceServiceRequest,
     MigrationMaintenanceServiceOutput,
 );
+
+pub struct ResumeServiceRequest<'a> {
+    pub state: &'a oulipoly_state::StateDb,
+    pub models: &'a oulipoly_state::ModelStore,
+    pub input: &'a str,
+    pub model_override: Option<&'a str>,
+}
+
+#[derive(Debug)]
+pub enum ResumeServiceOutput {
+    ResumeResolved {
+        resolved: oulipoly_state::ResolvedResume,
+    },
+    ResumeRejected {
+        error: oulipoly_state::ResumeError,
+    },
+}
+
+pub struct ResumeAcceptanceRequest<'a> {
+    pub state: &'a oulipoly_state::StateDb,
+    pub invocation_row_id: i64,
+    pub status: &'a str,
+    pub evidence: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResumeAcceptanceOutput;
+
+pub struct SessionLifecycleRequest<'a> {
+    pub state: &'a oulipoly_state::StateDb,
+    pub sessions_cfg: &'a oulipoly_config::SessionsConfig,
+    pub provider_name: &'a str,
+    pub invocation_row_id: i64,
+    pub invocation_uuid: &'a str,
+    pub mode: SessionLifecycleIngestMode,
+    pub stderr: &'a mut dyn Write,
+}
+
+#[derive(Debug, Clone)]
+pub enum SessionLifecycleIngestMode {
+    Pinned { resume_target: String },
+    Unpinned { capture_method: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionLifecycleOutput {
+    pub emitted: bool,
+    pub session_id: Option<String>,
+}
+
+pub struct MigrationServiceRequest<'a> {
+    pub state: &'a oulipoly_state::StateDb,
+    pub sessions_cfg: &'a oulipoly_config::SessionsConfig,
+    pub resolved: &'a oulipoly_state::ResolvedResume,
+    pub manual_target: Option<&'a str>,
+    pub active_exhausted: bool,
+    pub migration_model: &'a oulipoly_config::ModelConfig,
+    pub effective_cwd: &'a Path,
+    pub stderr: &'a mut dyn Write,
+}
+
+#[derive(Debug)]
+pub enum MigrationServiceOutput {
+    Stay,
+    DecisionFailed {
+        warning: String,
+    },
+    Migrated {
+        segment: crate::migration::MigratedSegment,
+    },
+}
 
 #[derive(Debug)]
 #[expect(
@@ -168,6 +236,33 @@ impl ProductionInvocationLifecycleService {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProductionResumeService;
+
+impl ProductionResumeService {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProductionSessionLifecycleService;
+
+impl ProductionSessionLifecycleService {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProductionMigrationService;
+
+impl ProductionMigrationService {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
 pub trait ConfigServicePort: Send + Sync {
     fn load_config(
         &self,
@@ -218,15 +313,20 @@ pub trait InvocationLifecycleServicePort: Send + Sync {
 pub trait SessionLifecycleServicePort: Send + Sync {
     fn ingest_session(
         &self,
-        request: SessionLifecycleRequest,
+        request: SessionLifecycleRequest<'_>,
     ) -> Result<SessionLifecycleOutput, ServiceError>;
 }
 
 pub trait ResumeServicePort: Send + Sync {
     fn resolve_resume(
         &self,
-        request: ResumeServiceRequest,
+        request: ResumeServiceRequest<'_>,
     ) -> Result<ResumeServiceOutput, ServiceError>;
+
+    fn record_acceptance(
+        &self,
+        request: ResumeAcceptanceRequest<'_>,
+    ) -> Result<ResumeAcceptanceOutput, ServiceError>;
 }
 
 pub trait DiagnosticsServicePort: Send + Sync {
@@ -239,7 +339,7 @@ pub trait DiagnosticsServicePort: Send + Sync {
 pub trait MigrationServicePort: Send + Sync {
     fn migrate(
         &self,
-        request: MigrationServiceRequest,
+        request: MigrationServiceRequest<'_>,
     ) -> Result<MigrationServiceOutput, ServiceError>;
 }
 
@@ -318,4 +418,269 @@ impl InvocationLifecycleServicePort for ProductionInvocationLifecycleService {
             .map(|_| InvocationLifecycleFinalizeOutput)
             .map_err(|message| ServiceError::Dependency { message })
     }
+}
+
+impl ResumeServicePort for ProductionResumeService {
+    fn resolve_resume(
+        &self,
+        request: ResumeServiceRequest<'_>,
+    ) -> Result<ResumeServiceOutput, ServiceError> {
+        match <StateDb as ResumeRepository>::resolve_resume(
+            request.state,
+            request.models,
+            request.input,
+            request.model_override,
+        ) {
+            Ok(resolved) => Ok(ResumeServiceOutput::ResumeResolved { resolved }),
+            Err(error) => Ok(ResumeServiceOutput::ResumeRejected { error }),
+        }
+    }
+
+    fn record_acceptance(
+        &self,
+        request: ResumeAcceptanceRequest<'_>,
+    ) -> Result<ResumeAcceptanceOutput, ServiceError> {
+        request
+            .state
+            .update_resume_acceptance(request.invocation_row_id, request.status, request.evidence)
+            .map(|_| ResumeAcceptanceOutput)
+            .map_err(|message| ServiceError::Dependency { message })
+    }
+}
+
+impl SessionLifecycleServicePort for ProductionSessionLifecycleService {
+    fn ingest_session(
+        &self,
+        request: SessionLifecycleRequest<'_>,
+    ) -> Result<SessionLifecycleOutput, ServiceError> {
+        let SessionLifecycleRequest {
+            state,
+            sessions_cfg,
+            provider_name,
+            invocation_row_id,
+            invocation_uuid,
+            mode,
+            stderr,
+        } = request;
+
+        let invocation = match state.get_invocation_by_uuid(invocation_uuid) {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                writeln!(
+                    stderr,
+                    "Warning: Could not resolve invocation {invocation_uuid} for session ingest"
+                )
+                .map_err(|err| ServiceError::Dependency {
+                    message: format!("Failed to write session ingest warning: {err}"),
+                })?;
+                return emit_pinned_session_id_for_service(
+                    state,
+                    stderr,
+                    invocation_row_id,
+                    invocation_uuid,
+                    mode,
+                );
+            }
+            Err(err) => {
+                writeln!(
+                    stderr,
+                    "Warning: Failed to load invocation {invocation_uuid} for session ingest: {err}"
+                )
+                .map_err(|err| ServiceError::Dependency {
+                    message: format!("Failed to write session ingest warning: {err}"),
+                })?;
+                return emit_pinned_session_id_for_service(
+                    state,
+                    stderr,
+                    invocation_row_id,
+                    invocation_uuid,
+                    mode,
+                );
+            }
+        };
+        if invocation.id != invocation_row_id {
+            return Err(ServiceError::InvalidRequest {
+                message: format!(
+                    "session ingest request mismatched invocation identifiers: row_id={invocation_row_id} uuid={invocation_uuid}"
+                ),
+            });
+        }
+        let Some(finished_at) = invocation.finished_at else {
+            writeln!(
+                stderr,
+                "Warning: Invocation {invocation_uuid} was not finalized before session ingest"
+            )
+            .map_err(|err| ServiceError::Dependency {
+                message: format!("Failed to write session ingest warning: {err}"),
+            })?;
+            return emit_pinned_session_id_for_service(
+                state,
+                stderr,
+                invocation_row_id,
+                invocation_uuid,
+                mode,
+            );
+        };
+
+        let report = crate::sessions::scan_provider(provider_name, sessions_cfg, state);
+        for err in report.errors {
+            writeln!(
+                stderr,
+                "Warning: Session ingest failed for {provider_name}: {err}"
+            )
+            .map_err(|err| ServiceError::Dependency {
+                message: format!("Failed to write session ingest warning: {err}"),
+            })?;
+        }
+
+        let matched_session_id = match state.find_session_for_invocation_window(
+            provider_name,
+            &invocation.created_at,
+            &finished_at,
+        ) {
+            Ok(session_id) => session_id,
+            Err(err) => {
+                writeln!(
+                    stderr,
+                    "Warning: Failed to resolve session for invocation {invocation_uuid}: {err}"
+                )
+                .map_err(|err| ServiceError::Dependency {
+                    message: format!("Failed to write session ingest warning: {err}"),
+                })?;
+                None
+            }
+        };
+
+        match mode {
+            SessionLifecycleIngestMode::Unpinned { capture_method } => {
+                if let Some(session_id) = matched_session_id {
+                    emit_known_session_id_for_service(
+                        state,
+                        stderr,
+                        invocation_row_id,
+                        invocation_uuid,
+                        &session_id,
+                        &capture_method,
+                    )
+                } else {
+                    Ok(SessionLifecycleOutput {
+                        emitted: false,
+                        session_id: None,
+                    })
+                }
+            }
+            SessionLifecycleIngestMode::Pinned { resume_target } => {
+                emit_known_session_id_for_service(
+                    state,
+                    stderr,
+                    invocation_row_id,
+                    invocation_uuid,
+                    &resume_target,
+                    "resumed",
+                )
+            }
+        }
+    }
+}
+
+impl MigrationServicePort for ProductionMigrationService {
+    fn migrate(
+        &self,
+        request: MigrationServiceRequest<'_>,
+    ) -> Result<MigrationServiceOutput, ServiceError> {
+        match crate::balancer::decide_migration(
+            request.state,
+            request.migration_model,
+            request.resolved,
+            request.manual_target,
+        ) {
+            Ok(MigrationDecision::Stay) => Ok(MigrationServiceOutput::Stay),
+            Err(err) => Ok(MigrationServiceOutput::DecisionFailed {
+                warning: format!("{err:?}"),
+            }),
+            Ok(MigrationDecision::Migrate {
+                target_provider_index,
+                reason,
+            }) => crate::migration::migrate_chain_segment(
+                request.state,
+                request.sessions_cfg,
+                request.migration_model,
+                request.resolved,
+                request.effective_cwd,
+                target_provider_index,
+                reason,
+                request.stderr,
+            )
+            .map(|segment| MigrationServiceOutput::Migrated { segment })
+            .map_err(|err| ServiceError::Dependency {
+                message: format!("{err:?}"),
+            }),
+        }
+    }
+}
+
+fn emit_pinned_session_id_for_service(
+    state: &StateDb,
+    stderr: &mut dyn Write,
+    invocation_row_id: i64,
+    invocation_uuid: &str,
+    mode: SessionLifecycleIngestMode,
+) -> Result<SessionLifecycleOutput, ServiceError> {
+    match mode {
+        SessionLifecycleIngestMode::Unpinned { .. } => Ok(SessionLifecycleOutput {
+            emitted: false,
+            session_id: None,
+        }),
+        SessionLifecycleIngestMode::Pinned { resume_target } => emit_known_session_id_for_service(
+            state,
+            stderr,
+            invocation_row_id,
+            invocation_uuid,
+            &resume_target,
+            "resumed",
+        ),
+    }
+}
+
+fn emit_known_session_id_for_service(
+    state: &StateDb,
+    stderr: &mut dyn Write,
+    invocation_row_id: i64,
+    invocation_uuid: &str,
+    session_id: &str,
+    capture_method: &str,
+) -> Result<SessionLifecycleOutput, ServiceError> {
+    if let Err(err) =
+        state.update_session_capture(invocation_row_id, Some(session_id), capture_method)
+    {
+        writeln!(
+            stderr,
+            "Warning: Failed to update invocation session_id: {err}"
+        )
+        .map_err(|err| ServiceError::Dependency {
+            message: format!("Failed to write session ingest warning: {err}"),
+        })?;
+        return Ok(SessionLifecycleOutput {
+            emitted: false,
+            session_id: None,
+        });
+    }
+    if let Err(err) = state.mint_chain_for_invocation_session(invocation_row_id) {
+        writeln!(stderr, "Warning: Failed to mint session chain: {err}").map_err(|err| {
+            ServiceError::Dependency {
+                message: format!("Failed to write session ingest warning: {err}"),
+            }
+        })?;
+    }
+    let payload = serde_json::json!({
+        "id": invocation_uuid,
+        "session_id": session_id,
+    });
+    writeln!(stderr, "OULIPOLY_SESSION={payload}").map_err(|err| ServiceError::Dependency {
+        message: format!("Failed to write session marker: {err}"),
+    })?;
+    Ok(SessionLifecycleOutput {
+        emitted: true,
+        session_id: Some(session_id.to_string()),
+    })
 }

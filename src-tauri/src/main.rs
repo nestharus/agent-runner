@@ -7,6 +7,12 @@ use oulipoly_config::{
 use oulipoly_runtime::balancer;
 use oulipoly_runtime::diagnostics;
 use oulipoly_runtime::executor;
+use oulipoly_runtime::services::{
+    MigrationServiceOutput, MigrationServicePort, MigrationServiceRequest,
+    ProductionMigrationService, ProductionResumeService, ProductionSessionLifecycleService,
+    ResumeAcceptanceRequest, ResumeServiceOutput, ResumeServicePort, ResumeServiceRequest,
+    ServiceError, SessionLifecycleIngestMode, SessionLifecycleRequest, SessionLifecycleServicePort,
+};
 use oulipoly_runtime::session_export::{
     ExportError, ExportSessionMetadata, SessionStorageType, canonical_jsonl_bytes,
     read_canonical_transcript,
@@ -1083,78 +1089,32 @@ fn ingest_and_emit_session_id_resume_aware(
     invocation_uuid: &str,
     mode: ResumeIngestMode<'_>,
 ) -> bool {
-    let invocation = match state.get_invocation_by_uuid(invocation_uuid) {
-        Ok(Some(row)) => row,
-        Ok(None) => {
-            eprintln!("Warning: Could not resolve invocation {invocation_uuid} for session ingest");
-            return emit_pinned_session_id(state, invocation_row_id, invocation_uuid, mode);
-        }
-        Err(err) => {
-            eprintln!(
-                "Warning: Failed to load invocation {invocation_uuid} for session ingest: {err}"
-            );
-            return emit_pinned_session_id(state, invocation_row_id, invocation_uuid, mode);
-        }
+    let service = ProductionSessionLifecycleService::new();
+    let mut stderr = std::io::stderr();
+    let mode = match mode {
+        ResumeIngestMode::Unpinned { capture_method } => SessionLifecycleIngestMode::Unpinned {
+            capture_method: capture_method.to_string(),
+        },
+        ResumeIngestMode::Pinned { resume_target } => SessionLifecycleIngestMode::Pinned {
+            resume_target: resume_target.to_string(),
+        },
     };
-    let Some(finished_at) = invocation.finished_at else {
-        eprintln!("Warning: Invocation {invocation_uuid} was not finalized before session ingest");
-        return emit_pinned_session_id(state, invocation_row_id, invocation_uuid, mode);
-    };
-
-    let report = oulipoly_runtime::sessions::scan_provider(provider_name, sessions_cfg, state);
-    for err in report.errors {
-        eprintln!("Warning: Session ingest failed for {provider_name}: {err}");
-    }
-
-    let matched_session_id = match state.find_session_for_invocation_window(
+    match service.ingest_session(SessionLifecycleRequest {
+        state,
+        sessions_cfg,
         provider_name,
-        &invocation.created_at,
-        &finished_at,
-    ) {
-        Ok(session_id) => session_id,
-        Err(err) => {
-            eprintln!("Warning: Failed to resolve session for invocation {invocation_uuid}: {err}");
-            None
+        invocation_row_id,
+        invocation_uuid,
+        mode,
+        stderr: &mut stderr,
+    }) {
+        Ok(output) => output.emitted,
+        Err(ServiceError::Dependency { message })
+        | Err(ServiceError::InvalidRequest { message })
+        | Err(ServiceError::Unavailable { message }) => {
+            eprintln!("Warning: Session ingest failed for {provider_name}: {message}");
+            false
         }
-    };
-
-    match mode {
-        ResumeIngestMode::Unpinned { capture_method } => {
-            matched_session_id.is_some_and(|session_id| {
-                emit_known_session_id(
-                    state,
-                    invocation_row_id,
-                    invocation_uuid,
-                    session_id.as_str(),
-                    capture_method,
-                )
-            })
-        }
-        ResumeIngestMode::Pinned { resume_target } => emit_known_session_id(
-            state,
-            invocation_row_id,
-            invocation_uuid,
-            resume_target,
-            "resumed",
-        ),
-    }
-}
-
-fn emit_pinned_session_id(
-    state: &StateDb,
-    invocation_row_id: i64,
-    invocation_uuid: &str,
-    mode: ResumeIngestMode<'_>,
-) -> bool {
-    match mode {
-        ResumeIngestMode::Unpinned { .. } => false,
-        ResumeIngestMode::Pinned { resume_target } => emit_known_session_id(
-            state,
-            invocation_row_id,
-            invocation_uuid,
-            resume_target,
-            "resumed",
-        ),
     }
 }
 
@@ -1587,12 +1547,22 @@ fn run_repl(
     let providers_cfg = oulipoly_config::ProvidersConfig::load(&providers_path).unwrap_or_default();
     let models = load_models(&models_dir, Some(&providers_cfg))?;
     let sessions_cfg = oulipoly_config::SessionsConfig::load(&sessions_path).unwrap_or_default();
+    let resume_service = ProductionResumeService::new();
+    let migration_service = ProductionMigrationService::new();
     let mut resolved_resume = if let Some(session_id) = resume {
         Some(
-            match state.resolve_resume(&models, session_id, model_name) {
-                Ok(resolved) => resolved,
-                Err(oulipoly_state::ResumeError::ProviderModelMismatch {
-                    active_provider, ..
+            match resume_service.resolve_resume(ResumeServiceRequest {
+                state: &state,
+                models: &models,
+                input: session_id,
+                model_override: model_name,
+            }) {
+                Ok(ResumeServiceOutput::ResumeResolved { resolved }) => resolved,
+                Ok(ResumeServiceOutput::ResumeRejected {
+                    error:
+                        oulipoly_state::ResumeError::ProviderModelMismatch {
+                            active_provider, ..
+                        },
                 }) => {
                     return Err(resume_model_pool_mismatch_message(
                         &models,
@@ -1601,7 +1571,10 @@ fn run_repl(
                         &active_provider,
                     ));
                 }
-                Err(err) => return Err(format_resume_error(err)),
+                Ok(ResumeServiceOutput::ResumeRejected { error }) => {
+                    return Err(format_resume_error(error));
+                }
+                Err(err) => return Err(format!("resume service failed: {err}")),
             },
         )
     } else {
@@ -1653,36 +1626,33 @@ fn run_repl(
             eprintln!("[resume] -> {selected_provider}");
         }
         let migration_model = resume_migration_pool(resolved, &providers_cfg);
-        if let Ok(balancer::MigrationDecision::Migrate {
-            target_provider_index,
-            reason,
-        }) = balancer::decide_migration(&state, &migration_model, resolved, manual_migrate)
-        {
-            let effective_spawn_cwd = effective_spawn_cwd(working_dir)?;
-            let mut stderr = std::io::stderr();
-            match oulipoly_runtime::migration::migrate_chain_segment(
-                &state,
-                &sessions_cfg,
-                &migration_model,
-                resolved,
-                &effective_spawn_cwd,
-                target_provider_index,
-                reason,
-                &mut stderr,
-            ) {
-                Ok(migrated) => {
-                    resolved.active_provider = migrated.target_provider.clone();
-                    resolved.active_session_id = migrated.target_session_id.clone();
-                    fallback_target = Some(
-                        resume_execution_target(resolved, &providers_cfg)
-                            .map_err(format_resume_error)?,
-                    );
-                }
-                Err(err) => {
-                    eprintln!("migration failed: {err:?}");
-                    return Ok(1);
-                }
+        let effective_spawn_cwd = effective_spawn_cwd(working_dir)?;
+        let mut migration_stderr = std::io::stderr();
+        match migration_service.migrate(MigrationServiceRequest {
+            state: &state,
+            sessions_cfg: &sessions_cfg,
+            resolved,
+            manual_target: manual_migrate,
+            active_exhausted: false,
+            migration_model: &migration_model,
+            effective_cwd: &effective_spawn_cwd,
+            stderr: &mut migration_stderr,
+        }) {
+            Ok(MigrationServiceOutput::Migrated { segment: migrated }) => {
+                resolved.active_provider = migrated.target_provider.clone();
+                resolved.active_session_id = migrated.target_session_id.clone();
+                fallback_target = Some(
+                    resume_execution_target(resolved, &providers_cfg)
+                        .map_err(format_resume_error)?,
+                );
             }
+            Ok(MigrationServiceOutput::Stay)
+            | Ok(MigrationServiceOutput::DecisionFailed { .. }) => {}
+            Err(ServiceError::Dependency { message }) => {
+                eprintln!("migration failed: {message}");
+                return Ok(1);
+            }
+            Err(err) => return Err(format!("migration service failed: {err}")),
         }
 
         let target = fallback_target
@@ -1839,12 +1809,22 @@ fn run_resume(
     let providers_cfg = oulipoly_config::ProvidersConfig::load(&providers_path).unwrap_or_default();
     let models = load_models(&models_dir, Some(&providers_cfg))?;
     let sessions_cfg = oulipoly_config::SessionsConfig::load(&sessions_path).unwrap_or_default();
+    let resume_service = ProductionResumeService::new();
+    let migration_service = ProductionMigrationService::new();
 
     let stderr_is_terminal = std::io::stderr().is_terminal();
-    let mut resolved = match state.resolve_resume(&models, session_id, model_name) {
-        Ok(resolved) => resolved,
-        Err(oulipoly_state::ResumeError::ProviderModelMismatch {
-            active_provider, ..
+    let mut resolved = match resume_service.resolve_resume(ResumeServiceRequest {
+        state: &state,
+        models: &models,
+        input: session_id,
+        model_override: model_name,
+    }) {
+        Ok(ResumeServiceOutput::ResumeResolved { resolved }) => resolved,
+        Ok(ResumeServiceOutput::ResumeRejected {
+            error:
+                oulipoly_state::ResumeError::ProviderModelMismatch {
+                    active_provider, ..
+                },
         }) => {
             eprintln!(
                 "{}",
@@ -1857,8 +1837,12 @@ fn run_resume(
             );
             return Ok(1);
         }
+        Ok(ResumeServiceOutput::ResumeRejected { error }) => {
+            eprintln!("{}", format_resume_error(error));
+            return Ok(1);
+        }
         Err(err) => {
-            eprintln!("{}", format_resume_error(err));
+            eprintln!("resume service failed: {err}");
             return Ok(1);
         }
     };
@@ -1874,38 +1858,37 @@ fn run_resume(
         eprintln!("[resume] -> {selected_provider}");
     }
     let migration_model = resume_migration_pool(&resolved, &providers_cfg);
-    if let Ok(balancer::MigrationDecision::Migrate {
-        target_provider_index,
-        reason,
-    }) = balancer::decide_migration(&state, &migration_model, &resolved, manual_migrate)
-    {
-        let effective_spawn_cwd = effective_spawn_cwd(working_dir)?;
-        let mut stderr = std::io::stderr();
-        match oulipoly_runtime::migration::migrate_chain_segment(
-            &state,
-            &sessions_cfg,
-            &migration_model,
-            &resolved,
-            &effective_spawn_cwd,
-            target_provider_index,
-            reason,
-            &mut stderr,
-        ) {
-            Ok(migrated) => {
-                resolved.active_provider = migrated.target_provider.clone();
-                resolved.active_session_id = migrated.target_session_id.clone();
-                target = match resume_execution_target(&resolved, &providers_cfg) {
-                    Ok(target) => target,
-                    Err(err) => {
-                        eprintln!("{}", format_resume_error(err));
-                        return Ok(1);
-                    }
-                };
-            }
-            Err(err) => {
-                eprintln!("migration failed: {err:?}");
-                return Ok(1);
-            }
+    let effective_spawn_cwd = effective_spawn_cwd(working_dir)?;
+    let mut migration_stderr = std::io::stderr();
+    match migration_service.migrate(MigrationServiceRequest {
+        state: &state,
+        sessions_cfg: &sessions_cfg,
+        resolved: &resolved,
+        manual_target: manual_migrate,
+        active_exhausted: false,
+        migration_model: &migration_model,
+        effective_cwd: &effective_spawn_cwd,
+        stderr: &mut migration_stderr,
+    }) {
+        Ok(MigrationServiceOutput::Migrated { segment: migrated }) => {
+            resolved.active_provider = migrated.target_provider.clone();
+            resolved.active_session_id = migrated.target_session_id.clone();
+            target = match resume_execution_target(&resolved, &providers_cfg) {
+                Ok(target) => target,
+                Err(err) => {
+                    eprintln!("{}", format_resume_error(err));
+                    return Ok(1);
+                }
+            };
+        }
+        Ok(MigrationServiceOutput::Stay) | Ok(MigrationServiceOutput::DecisionFailed { .. }) => {}
+        Err(ServiceError::Dependency { message }) => {
+            eprintln!("migration failed: {message}");
+            return Ok(1);
+        }
+        Err(err) => {
+            eprintln!("migration service failed: {err}");
+            return Ok(1);
         }
     }
 
@@ -1969,11 +1952,14 @@ fn run_resume(
     };
 
     if let Some(acceptance) = &result.resume_acceptance {
-        state.update_resume_acceptance(
-            invocation_row_id,
-            acceptance.status.db_value(),
-            acceptance.evidence.as_deref(),
-        )?;
+        resume_service
+            .record_acceptance(ResumeAcceptanceRequest {
+                state: &state,
+                invocation_row_id,
+                status: acceptance.status.db_value(),
+                evidence: acceptance.evidence.as_deref(),
+            })
+            .map_err(|err| format!("resume acceptance service failed: {err}"))?;
     }
 
     let success = result.exit_code == 0;

@@ -8,7 +8,11 @@ use oulipoly_config::repositories::{
 use oulipoly_runtime::ports::{
     DefaultProcessRunner, DefaultUuidGenerator, StderrWriter, StdoutWriter, SystemClock,
 };
-use oulipoly_runtime::services::{ProductionInvocationLifecycleService, ProductionRoutingService};
+use oulipoly_runtime::services::{
+    MigrationServicePort, ProductionInvocationLifecycleService, ProductionMigrationService,
+    ProductionResumeService, ProductionRoutingService, ProductionSessionLifecycleService,
+    ResumeServicePort, SessionLifecycleServicePort,
+};
 use oulipoly_state::repositories::ProductionStateDbOpener;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,6 +42,9 @@ pub struct AgentRuntimeServices {
     pub stderr_sink: Arc<StderrWriter>,
     pub routing_service: Arc<ProductionRoutingService>,
     pub invocation_lifecycle_service: Arc<ProductionInvocationLifecycleService>,
+    pub resume_service: Arc<dyn ResumeServicePort>,
+    pub session_lifecycle_service: Arc<dyn SessionLifecycleServicePort>,
+    pub migration_service: Arc<dyn MigrationServicePort>,
 }
 
 impl AgentRuntimeServices {
@@ -73,6 +80,9 @@ impl AgentRuntimeServices {
             stderr_sink: Arc::new(StderrWriter),
             routing_service: Arc::new(ProductionRoutingService),
             invocation_lifecycle_service: Arc::new(ProductionInvocationLifecycleService),
+            resume_service: Arc::new(ProductionResumeService::new()),
+            session_lifecycle_service: Arc::new(ProductionSessionLifecycleService::new()),
+            migration_service: Arc::new(ProductionMigrationService::new()),
         })
     }
 }

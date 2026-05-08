@@ -1,7 +1,7 @@
-use oulipoly_config::{ModelConfig, PromptMode};
+use oulipoly_config::{ModelConfig, PromptMode, SessionsConfig};
 use oulipoly_runtime::services::error::ServiceError;
 use oulipoly_runtime::services::*;
-use oulipoly_state::{InvocationStart, StateDb};
+use oulipoly_state::{InvocationStart, ModelStore, ResolvedResume, StateDb};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -71,7 +71,7 @@ impl InvocationLifecycleServicePort for StubService {
 impl SessionLifecycleServicePort for StubService {
     fn ingest_session(
         &self,
-        _request: SessionLifecycleRequest,
+        _request: SessionLifecycleRequest<'_>,
     ) -> Result<SessionLifecycleOutput, ServiceError> {
         unimplemented!()
     }
@@ -80,8 +80,15 @@ impl SessionLifecycleServicePort for StubService {
 impl ResumeServicePort for StubService {
     fn resolve_resume(
         &self,
-        _request: ResumeServiceRequest,
+        _request: ResumeServiceRequest<'_>,
     ) -> Result<ResumeServiceOutput, ServiceError> {
+        unimplemented!()
+    }
+
+    fn record_acceptance(
+        &self,
+        _request: ResumeAcceptanceRequest<'_>,
+    ) -> Result<ResumeAcceptanceOutput, ServiceError> {
         unimplemented!()
     }
 }
@@ -98,7 +105,7 @@ impl DiagnosticsServicePort for StubService {
 impl MigrationServicePort for StubService {
     fn migrate(
         &self,
-        _request: MigrationServiceRequest,
+        _request: MigrationServiceRequest<'_>,
     ) -> Result<MigrationServiceOutput, ServiceError> {
         unimplemented!()
     }
@@ -230,4 +237,92 @@ fn age_35_routing_and_invocation_lifecycle_services_are_object_safe_with_contrac
         let _: Result<InvocationLifecycleFinalizeOutput, ServiceError> =
             lifecycle.finalize_invocation(lifecycle_finalize);
     }
+}
+
+#[test]
+fn age_36_resume_session_migration_services_are_object_safe_with_contract_dtos() {
+    let resume: Arc<dyn ResumeServicePort + Send + Sync> = Arc::new(StubService);
+    let session_lifecycle: Arc<dyn SessionLifecycleServicePort + Send + Sync> =
+        Arc::new(StubService);
+    let migration: Arc<dyn MigrationServicePort + Send + Sync> = Arc::new(StubService);
+    let production_resume: Arc<dyn ResumeServicePort + Send + Sync> =
+        Arc::new(ProductionResumeService::new());
+    let _production_session_lifecycle: Arc<dyn SessionLifecycleServicePort + Send + Sync> =
+        Arc::new(ProductionSessionLifecycleService::new());
+    let _production_migration: Arc<dyn MigrationServicePort + Send + Sync> =
+        Arc::new(ProductionMigrationService::new());
+
+    let db = StateDb::open(Path::new(":memory:")).unwrap();
+    let model = ModelConfig {
+        name: "age36-compile".to_string(),
+        prompt_mode: PromptMode::Arg,
+        providers: vec![],
+        inputs: vec![],
+    };
+    let mut models = ModelStore::new();
+    models.insert(model.name.clone(), model.clone());
+    let sessions_cfg = SessionsConfig::default();
+    let resolved = ResolvedResume {
+        chain_id: "11111111-1111-4111-8111-111111111111".to_string(),
+        model_name: Some(model.name.clone()),
+        model: Some(model.clone()),
+        active_provider: "compile-provider".to_string(),
+        active_session_id: "22222222-2222-4222-8222-222222222222".to_string(),
+    };
+    let start = InvocationStart {
+        invocation_uuid: "33333333-3333-4333-8333-333333333333".to_string(),
+        model_name: model.name.clone(),
+        provider_name: "compile-provider".to_string(),
+        provider_index: 0,
+        parent_invocation_id: None,
+    };
+    let invocation_row_id = db.start_invocation(&start).unwrap();
+    let mut stderr = Vec::new();
+    let mut migration_stderr = Vec::new();
+
+    let resume_request = ResumeServiceRequest {
+        state: &db,
+        models: &models,
+        input: "33333333-3333-4333-8333-333333333333",
+        model_override: Some(&model.name),
+    };
+    let acceptance_request = ResumeAcceptanceRequest {
+        state: &db,
+        invocation_row_id,
+        status: "accepted",
+        evidence: Some("compile-only"),
+    };
+    let session_request = SessionLifecycleRequest {
+        state: &db,
+        sessions_cfg: &sessions_cfg,
+        provider_name: "compile-provider",
+        invocation_row_id,
+        invocation_uuid: &start.invocation_uuid,
+        mode: SessionLifecycleIngestMode::Unpinned {
+            capture_method: "compile-only".to_string(),
+        },
+        stderr: &mut stderr,
+    };
+    let migration_request = MigrationServiceRequest {
+        state: &db,
+        sessions_cfg: &sessions_cfg,
+        resolved: &resolved,
+        manual_target: None,
+        active_exhausted: false,
+        migration_model: &model,
+        effective_cwd: Path::new("."),
+        stderr: &mut migration_stderr,
+    };
+
+    if false {
+        let _: Result<ResumeServiceOutput, ServiceError> = resume.resolve_resume(resume_request);
+        let _: Result<SessionLifecycleOutput, ServiceError> =
+            session_lifecycle.ingest_session(session_request);
+        let _: Result<MigrationServiceOutput, ServiceError> = migration.migrate(migration_request);
+    }
+
+    let output = production_resume
+        .record_acceptance(acceptance_request)
+        .expect("production resume service records acceptance");
+    assert_eq!(output, ResumeAcceptanceOutput);
 }
