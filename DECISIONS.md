@@ -649,3 +649,13 @@ The Phase 8 justification gate flagged this as an unjustified scope-creep change
 - AGE-32 contract § 9 (no IPC shape change).
 - `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` all PASS (755 passed, 0 failed, 1 ignored).
 **Revisit when:** A future WU adds frontend changes; restore bun gates and resolve the FontAwesome registry/auth issue before that PR can ship.
+
+## D-AGE-41-Phase-6c — accept pre-existing structural_segmentation failure as out-of-scope
+
+- **Source**: AGE-41 Phase 6c gates run on 2026-05-08.
+- **Verdict**: AGE-41 product changes (5 new T1-T5 tests + parser/dispatch edit in `src-tauri/src/main.rs`) all pass `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` for every test except `tests/structural_segmentation.rs::no_dangling_doomed_dir_link_in_tracked_files`, which fails identically against `main` HEAD.
+- **Cause**: pre-existing dangling backtick-wrapped path string in the prior `D-AGE-8-Phase-8` and `AGE-40 Decision 1` entries (a planning-side artifact path under `~/projects/agent-runner/planning/...` that is not part of the tracked tree). Reproduces on a clean `main` checkout per the `AGE-40 Decision 1` precedent above. AGE-41 does not modify those entries, the failing test, or its regex.
+- **Decision**: accept the failure as out-of-scope and proceed to Phase 7. Tracker filed as `AGE-45` for the structural_segmentation regression.
+- **Rationale**: AGE-41's stated scope is the parser-only `agents resume <chain_id>` fix per ticket. Expanding scope to fix the pre-existing dangling-link failure would mix concerns and break the multi-concern gate. The failure has nothing to do with AGE-41's product or test diff.
+- **Mechanism**: Phase 7+ gates run with the structural test acknowledged as red on `main`. AGE-45 will resolve it on its own branch.
+- **Revisit when**: AGE-45 lands.
