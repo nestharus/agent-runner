@@ -25,6 +25,8 @@ Write a configuration file. Only paths under ~/.config/oulipoly-agent-runner/ or
 ```json
 {{"type": "write_config", "path": "~/.config/oulipoly-agent-runner/providers.toml", "content": "[claude]\ncommand = \"claude\"\nargs = [\"-p\"]\ninteractive_args = []\nprompt_mode = \"stdin\"", "description": "Creating Claude provider runtime config"}}
 {{"type": "write_config", "path": "~/.config/oulipoly-agent-runner/models/claude-sonnet.toml", "content": "[[providers]]\nname = \"claude\"\nargs = [\"--model\", \"sonnet\"]", "description": "Creating Claude Sonnet model config"}}
+{{"type": "write_config", "path": "~/.config/oulipoly-agent-runner/providers.toml", "content": "[codex]\ncommand = \"codex\"\nargs = [\"exec\", \"-c\", \"sandbox=workspace-write\"]\ninteractive_args = [\"exec\", \"--dangerously-bypass-approvals-and-sandbox\"]\nprompt_mode = \"stdin\"", "description": "Creating Codex provider runtime config"}}
+{{"type": "write_config", "path": "~/.config/oulipoly-agent-runner/models/gpt-5.5.toml", "content": "[[providers]]\nname = \"codex\"\nargs = [\"-m\", \"gpt-5.5\", \"-c\", \"model_reasoning_effort=high\"]", "description": "Creating Codex GPT model config with model-specific flags only"}}
 ```
 
 ### test_integration
@@ -169,4 +171,49 @@ Focus on setting up the `{cli_name}` CLI:
         detection = context.detection_json,
         memory = context.memory_json,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_context() -> AgentContext {
+        AgentContext {
+            detection_json: "{}".into(),
+            memory_json: "{}".into(),
+        }
+    }
+
+    fn assert_claude_and_codex_examples(prompt: &str) {
+        let prompt = prompt.replace("\\\"", "\"");
+
+        assert!(prompt.contains("claude-sonnet"));
+        assert!(prompt.contains("args = [\"-p\"]"));
+        assert!(prompt.contains("args = [\"--model\", \"sonnet\"]"));
+        assert!(prompt.contains("[codex]"));
+        assert!(prompt.contains("args = [\"exec\", \"-c\", \"sandbox=workspace-write\"]"));
+        assert!(prompt.contains(
+            "interactive_args = [\"exec\", \"--dangerously-bypass-approvals-and-sandbox\"]"
+        ));
+        assert!(prompt.contains("name = \"codex\""));
+        assert!(prompt.contains(
+            "args = [\"-m\", \"gpt-5.5\", \"-c\", \"model_reasoning_effort=high\"]"
+        ));
+    }
+
+    #[test]
+    fn system_prompt_contains_claude_and_codex_examples() {
+        let ctx = minimal_context();
+        let prompt = build_system_prompt(&ctx);
+
+        assert_claude_and_codex_examples(&prompt);
+    }
+
+    #[test]
+    fn cli_setup_prompt_contains_claude_and_codex_examples() {
+        let ctx = minimal_context();
+        let prompt = build_cli_setup_prompt("codex", &ctx);
+
+        assert_claude_and_codex_examples(&prompt);
+    }
 }
