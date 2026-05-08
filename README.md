@@ -169,6 +169,13 @@ Subcommands:
   resume [-m <model>] --session-id <session-id> [-f <answer.md>|--prompt <text>] [-p <project>] [--models-dir <path>]
         Resume a provider session non-interactively with an answer payload
 
+  migrate-db
+        Run the existing session-chain and compaction backfill.
+
+  migrate --rebuild
+        Back up state.db plus WAL/SHM sidecars, then create a fresh current
+        state DB. Historical live rows are not preserved after rebuild.
+
   migrate-config [--models-dir <path>]
         Move provider runtime blocks from old model TOMLs into providers.toml.
         Idempotent - safe to re-run if a previous run left empty args.
@@ -532,6 +539,26 @@ Use it before scripting any other `session` subcommand to confirm the local DB i
 | `1` | `operational-error` | DB unreadable or corrupt at the OS level. |
 | `14` | `schema-incompatible` | DB present but `user_version` is below the binary's minimum supported schema version. |
 
+### State DB Schema Migrations
+
+The persistent runner state DB uses embedded SQLite migrations from
+`crates/oulipoly-state/migrations/`. The schema version constants live in
+`crates/oulipoly-state/src/schema.rs` as `CURRENT_SCHEMA_VERSION` and
+`MINIMUM_SUPPORTED_SCHEMA_VERSION`; `StateDb::open` applies missing forward
+migrations before normal state reads or writes.
+
+To add a migration, bump `CURRENT_SCHEMA_VERSION`, add a
+`NNNN_description.sql` file whose prefix is the target `PRAGMA user_version`,
+register it in `crates/oulipoly-state/src/migrations.rs`, and run the Rust
+workspace migration tests. Use migration files for schema changes; legacy
+`ensure_*_schema` helpers are only a guarded repair allow-list.
+
+Use `session schema-probe` for read-only diagnostics. Use `agents migrate-db`
+for the existing session-chain/compaction backfill. Use
+`agents migrate --rebuild` only for destructive recovery: it backs up
+`state.db`, `state.db-wal`, and `state.db-shm`, then creates a fresh current DB,
+so historical live rows are not preserved except in the backup.
+
 ### Exporting a Session
 
 ```bash
@@ -617,10 +644,10 @@ Atomicity contract:
 | `11` | `ambiguous-session` | Multiple chains match. |
 | `12` | `unsupported-storage` | Provider has no compatible `session_storage` block. |
 | `13` | `session-busy` | Another holder owns the `SessionLock`. |
-| `14` | `schema-incompatible` | State DB schema is below minimum. |
+| `14` | `schema-incompatible` | State DB schema is unsupported; run `agents migrate --rebuild` only after deciding to replace the live DB from backup. |
 | `15` | `invalid-input-transcript` / `preimage-mismatch` | Canonical input is malformed, lossy under the renderer, or `--preimage-sha256` did not match. |
 
-Anti-scope: `session import-replace --recover` and `migrate-db --recover` do not exist. Recovery runs implicitly at the top of every CLI invocation.
+Anti-scope: `session import-replace --recover` and `migrate-db --recover` do not exist. Import-replace recovery runs implicitly at the top of every CLI invocation after the state DB migration gate.
 
 ### Session Locks
 

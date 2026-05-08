@@ -2,7 +2,9 @@
 
 use chrono::{TimeZone, Utc};
 use oulipoly_agent_messenger::{ReturnedArtifactRef, ReturnedArtifactSource, StoreAddress};
-use oulipoly_state::{InvocationStart, InvocationStatus, StateDb};
+use oulipoly_state::{
+    InvocationStart, InvocationStatus, MINIMUM_SUPPORTED_SCHEMA_VERSION, StateDb,
+};
 use rusqlite::{Connection, params};
 use serde_json::Value;
 use std::fs;
@@ -381,7 +383,9 @@ fn state_db_fresh_and_incremental_open_create_returned_artifacts_table_without_l
     let legacy_path = fixture.dir.path().join("legacy-state.db");
     let conn = Connection::open(&legacy_path).unwrap();
     conn.execute_batch(
-        "CREATE TABLE invocations (
+        &format!(
+            "PRAGMA user_version = {MINIMUM_SUPPORTED_SCHEMA_VERSION};
+        CREATE TABLE invocations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             invocation_uuid TEXT NOT NULL UNIQUE,
             model_name TEXT NOT NULL,
@@ -404,7 +408,8 @@ fn state_db_fresh_and_incremental_open_create_returned_artifacts_table_without_l
             invocation_uuid, model_name, provider_name, provider_index, status, created_at
         ) VALUES (
             '11111111-1111-1111-1111-111111111111', 'fixture', 'fixture-provider', 0, 'running', '2026-05-07T12:00:00Z'
-        );",
+        );"
+        ),
     )
     .unwrap();
     let legacy_read_only = StateDb::open_read_only(&legacy_path).unwrap();

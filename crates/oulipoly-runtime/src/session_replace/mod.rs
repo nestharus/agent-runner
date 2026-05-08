@@ -6,7 +6,7 @@ use crate::session_metadata::{
 use chrono::{DateTime, Utc};
 use oulipoly_config::{ProvidersConfig, SessionsConfig, load_models};
 use oulipoly_state::StateDb;
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -340,79 +340,11 @@ fn probe_state_schema_compatible(data_root: &Path, session_id: &str) -> Result<(
             input: session_id.to_string(),
         });
     }
-    let conn =
-        Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e| {
-            ReplaceError::SchemaIncompatible {
-                reason: format!("state db is not readable without mutation: {e}"),
-            }
-        })?;
-    require_columns(
-        &conn,
-        "session_chain_segments",
-        &[
-            "id",
-            "chain_id",
-            "provider_name",
-            "session_id",
-            "started_at",
-            "ended_at",
-            "last_turn_id",
-        ],
-    )?;
-    require_columns(
-        &conn,
-        "session_chains",
-        &["chain_id", "created_at", "last_used_at", "model_name"],
-    )?;
-    require_columns(
-        &conn,
-        "session_turns",
-        &[
-            "provider_name",
-            "session_id",
-            "turn_id",
-            "timestamp",
-            "role",
-            "parent_turn_id",
-            "is_sidechain",
-            "is_compaction_boundary",
-            "source_file",
-            "ingested_at",
-            "body",
-        ],
-    )
-}
-
-fn require_columns(conn: &Connection, table: &str, required: &[&str]) -> Result<(), ReplaceError> {
-    let mut stmt = conn
-        .prepare(&format!("PRAGMA table_info({table})"))
+    StateDb::open(&db_path)
+        .map(|_| ())
         .map_err(|e| ReplaceError::SchemaIncompatible {
-            reason: format!("failed to inspect {table} schema: {e}"),
-        })?;
-    let rows = stmt
-        .query_map([], |row| row.get::<_, String>(1))
-        .map_err(|e| ReplaceError::SchemaIncompatible {
-            reason: format!("failed to read {table} schema: {e}"),
-        })?;
-    let mut columns = Vec::new();
-    for row in rows {
-        columns.push(row.map_err(|e| ReplaceError::SchemaIncompatible {
-            reason: format!("failed to read {table} column: {e}"),
-        })?);
-    }
-    if columns.is_empty() {
-        return Err(ReplaceError::SchemaIncompatible {
-            reason: format!("missing required table {table}"),
-        });
-    }
-    for column in required {
-        if !columns.iter().any(|existing| existing == column) {
-            return Err(ReplaceError::SchemaIncompatible {
-                reason: format!("missing required column {table}.{column}"),
-            });
-        }
-    }
-    Ok(())
+            reason: format!("state db schema is incompatible: {e}"),
+        })
 }
 
 fn run_import_replace_bytes(
@@ -568,11 +500,16 @@ fn run_import_replace_bytes(
         });
     }
 
-    let db_path = data_root.join("state.db");
-    let mut conn = Connection::open(&db_path).map_err(|e| ReplaceError::OperationalError {
+    let mut state = StateDb::open_default().map_err(|e| ReplaceError::OperationalError {
         message: format!("failed to open state db: {e}"),
     })?;
-    replace_db_turns(&mut conn, &metadata, &records)?;
+    state
+        .with_write_txn(|tx| {
+            replace_db_turns(tx, &metadata, &records).map_err(|e| format!("{e:?}"))
+        })
+        .map_err(|e| ReplaceError::OperationalError {
+            message: format!("failed to update state db: {e}"),
+        })?;
 
     fs::remove_file(&pending_path).ok();
     fs::remove_file(&canonical_records_path).ok();
@@ -651,12 +588,17 @@ pub fn recover_pending_replaces() -> Result<(), ReplaceError> {
                     move_to_quarantine(&path, &quarantine_dir);
                     continue;
                 };
-                let mut conn = Connection::open(data_root.join("state.db")).map_err(|e| {
-                    ReplaceError::OperationalError {
+                let mut state =
+                    StateDb::open_default().map_err(|e| ReplaceError::OperationalError {
                         message: format!("failed to open state db during recovery: {e}"),
-                    }
-                })?;
-                replace_db_turns(&mut conn, &metadata, &records)?;
+                    })?;
+                state
+                    .with_write_txn(|tx| {
+                        replace_db_turns(tx, &metadata, &records).map_err(|e| format!("{e:?}"))
+                    })
+                    .map_err(|e| ReplaceError::OperationalError {
+                        message: format!("failed to update state db during recovery: {e}"),
+                    })?;
                 fs::remove_file(&path).ok();
                 fs::remove_file(&journal.canonical_records_path).ok();
                 fsync_dir(&journal_root)?;
@@ -864,15 +806,10 @@ fn resolve_replace_metadata(session_id: &str) -> Result<SessionMetadata, Replace
 }
 
 fn replace_db_turns(
-    conn: &mut Connection,
+    tx: &mut Transaction<'_>,
     metadata: &SessionMetadata,
     records: &[CanonicalRecord],
 ) -> Result<(), ReplaceError> {
-    let tx = conn
-        .transaction()
-        .map_err(|e| ReplaceError::OperationalError {
-            message: format!("failed to begin db transaction: {e}"),
-        })?;
     tx.execute(
         "DELETE FROM session_turns WHERE provider_name = ?1 AND session_id = ?2",
         params![metadata.provider_name, metadata.session_id],
@@ -929,9 +866,7 @@ fn replace_db_turns(
     .map_err(|e| ReplaceError::OperationalError {
         message: format!("failed to refresh chain: {e}"),
     })?;
-    tx.commit().map_err(|e| ReplaceError::OperationalError {
-        message: format!("failed to commit db replacement: {e}"),
-    })
+    Ok(())
 }
 
 fn canonical_records_from_provider_file(

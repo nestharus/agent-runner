@@ -283,6 +283,24 @@ src-tauri/src/
 └── setup/flow.rs        # Tauri channel setup orchestration
 ```
 
+## State DB Schema Migrations
+
+The runner state DB schema is owned by `crates/oulipoly-state`. The version
+source of truth is `crates/oulipoly-state/src/schema.rs`
+(`CURRENT_SCHEMA_VERSION`, `MINIMUM_SUPPORTED_SCHEMA_VERSION`), and ordered
+embedded SQL assets live in `crates/oulipoly-state/migrations/`.
+
+To add a migration: bump `CURRENT_SCHEMA_VERSION`, add a
+`NNNN_description.sql` file whose prefix is the target `PRAGMA user_version`,
+add it to `crates/oulipoly-state/src/migrations.rs`, and run the Rust
+migration tests plus the normal workspace gates. Put durable schema changes in
+migration SQL, not new ad hoc `ensure_*_schema` helpers.
+
+Command meanings are distinct: `session schema-probe` is a read-only
+diagnostic, `agents migrate-db` runs the existing chain/compaction backfill, and
+`agents migrate --rebuild` is destructive recovery that backs up `state.db` and
+sidecars before creating a fresh current DB.
+
 ## E2E Test Infrastructure
 
 Tests use a Tauri mock builder that injects fake `window.__TAURI_INTERNALS__`

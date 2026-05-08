@@ -1,7 +1,8 @@
 #![cfg(unix)]
 #![allow(dead_code)]
 
-use oulipoly_state::{BinaryInfo, FeatureMap, SchemaProbeReport, StateDbReport};
+use oulipoly_state::schema;
+use oulipoly_state::{BinaryInfo, FeatureMap, SchemaProbeReport, StateDb, StateDbReport};
 use rusqlite::Connection;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -10,8 +11,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
-pub const MINIMUM_SUPPORTED_SCHEMA_VERSION: u32 = 3;
+pub const CURRENT_SCHEMA_VERSION: u32 = schema::CURRENT_SCHEMA_VERSION as u32;
+pub const MINIMUM_SUPPORTED_SCHEMA_VERSION: u32 = schema::MINIMUM_SUPPORTED_SCHEMA_VERSION as u32;
 
 pub struct SchemaProbeFixture {
     dir: tempfile::TempDir,
@@ -83,7 +84,8 @@ impl SchemaProbeFixture {
     pub fn create_future_user_version_db(&self) -> PathBuf {
         let path = self.create_current_schema_db();
         let conn = Connection::open(&path).unwrap();
-        conn.execute_batch("PRAGMA user_version = 4;").unwrap();
+        conn.pragma_update(None, "user_version", schema::CURRENT_SCHEMA_VERSION + 1)
+            .unwrap();
         drop(conn);
         path
     }
@@ -225,61 +227,9 @@ pub fn wal_sidecar_error_fixture() -> SchemaProbeFixture {
 
 pub fn create_current_schema_db_at(path: &Path) -> PathBuf {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
+    StateDb::open(path).unwrap();
     let conn = Connection::open(path).unwrap();
-    conn.execute_batch(
-        "
-        PRAGMA journal_mode = DELETE;
-        PRAGMA user_version = 3;
-
-        CREATE TABLE invocations (
-            id INTEGER PRIMARY KEY,
-            provider_name TEXT,
-            session_id TEXT,
-            session_capture_method TEXT,
-            resume_acceptance_status TEXT,
-            resume_acceptance_evidence TEXT
-        );
-        CREATE INDEX idx_invocations_provider_session
-            ON invocations(provider_name, session_id);
-
-        CREATE TABLE session_turns (
-            id INTEGER PRIMARY KEY,
-            provider_name TEXT NOT NULL,
-            session_id TEXT NOT NULL,
-            turn_id TEXT NOT NULL,
-            timestamp TEXT NOT NULL,
-            role TEXT NOT NULL,
-            parent_turn_id TEXT,
-            is_sidechain INTEGER NOT NULL DEFAULT 0,
-            is_compaction_boundary INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE INDEX idx_session_turns_session_lookup
-            ON session_turns(session_id, timestamp);
-
-        CREATE TABLE session_chains (
-            chain_id TEXT PRIMARY KEY,
-            created_at TEXT NOT NULL,
-            last_used_at TEXT NOT NULL,
-            model_name TEXT
-        );
-
-        CREATE TABLE session_chain_segments (
-            id INTEGER PRIMARY KEY,
-            chain_id TEXT NOT NULL,
-            provider_name TEXT NOT NULL,
-            session_id TEXT NOT NULL,
-            started_at TEXT NOT NULL,
-            ended_at TEXT,
-            last_turn_id TEXT,
-            transition_reason TEXT NOT NULL
-        );
-        CREATE INDEX idx_segments_session
-            ON session_chain_segments(session_id);
-        CREATE INDEX idx_segments_chain_active
-            ON session_chain_segments(chain_id, ended_at);
-        ",
-    )
-    .unwrap();
+    conn.execute_batch("PRAGMA journal_mode = DELETE;").unwrap();
     drop(conn);
     path.to_path_buf()
 }
@@ -432,6 +382,7 @@ pub fn report_for_predicate(
             current_schema_version: CURRENT_SCHEMA_VERSION,
             minimum_supported_schema_version: MINIMUM_SUPPORTED_SCHEMA_VERSION,
             compatible,
+            migratable: false,
             tables: bool_table_map(true),
             required_columns: bool_nested_map(required_columns(), true),
             required_indexes: bool_nested_map(required_indexes(), true),

@@ -1,9 +1,10 @@
-use rusqlite::{Connection, params};
+use oulipoly_state::StateDb;
+use rusqlite::params;
 use serde::Serialize;
 use std::path::Path;
 
 pub struct MemoryGraph {
-    conn: Connection,
+    state_db: StateDb,
 }
 
 #[derive(Clone, Serialize)]
@@ -33,56 +34,8 @@ pub struct MemorySnapshot {
 
 impl MemoryGraph {
     pub fn open(path: &Path) -> Result<Self, String> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create directory: {e}"))?;
-        }
-
-        let conn = Connection::open(path).map_err(|e| format!("Failed to open memory DB: {e}"))?;
-
-        conn.execute_batch("PRAGMA journal_mode=WAL;")
-            .map_err(|e| format!("Failed to set WAL mode: {e}"))?;
-
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS memory_nodes (
-                id TEXT PRIMARY KEY,
-                node_type TEXT NOT NULL,
-                label TEXT NOT NULL,
-                data TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS memory_edges (
-                source_id TEXT NOT NULL,
-                target_id TEXT NOT NULL,
-                edge_type TEXT NOT NULL,
-                data TEXT,
-                created_at TEXT NOT NULL,
-                PRIMARY KEY (source_id, target_id, edge_type)
-            );
-
-            CREATE TABLE IF NOT EXISTS setup_sessions (
-                id TEXT PRIMARY KEY,
-                started_at TEXT NOT NULL,
-                ended_at TEXT,
-                outcome TEXT,
-                turn_count INTEGER DEFAULT 0
-            );
-
-            CREATE TABLE IF NOT EXISTS setup_turns (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                turn_number INTEGER NOT NULL,
-                agent_prompt TEXT NOT NULL,
-                agent_response TEXT NOT NULL,
-                events_emitted TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );",
-        )
-        .map_err(|e| format!("Failed to create memory tables: {e}"))?;
-
-        Ok(MemoryGraph { conn })
+        let state_db = StateDb::open_for_memory(path)?;
+        Ok(MemoryGraph { state_db })
     }
 
     pub fn upsert_node(
@@ -93,7 +46,8 @@ impl MemoryGraph {
         data: &str,
     ) -> Result<(), String> {
         let now = chrono::Utc::now().to_rfc3339();
-        self.conn
+        self.state_db
+            .connection()
             .execute(
                 "INSERT INTO memory_nodes (id, node_type, label, data, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?5)
@@ -112,7 +66,8 @@ impl MemoryGraph {
         edge_type: &str,
     ) -> Result<(), String> {
         let now = chrono::Utc::now().to_rfc3339();
-        self.conn
+        self.state_db
+            .connection()
             .execute(
                 "INSERT OR IGNORE INTO memory_edges (source_id, target_id, edge_type, created_at)
              VALUES (?1, ?2, ?3, ?4)",
@@ -123,7 +78,7 @@ impl MemoryGraph {
     }
 
     pub fn get_node(&self, id: &str) -> Result<Option<MemoryNode>, String> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.state_db.connection().prepare(
             "SELECT id, node_type, label, data, created_at, updated_at FROM memory_nodes WHERE id = ?1"
         ).map_err(|e| format!("Query error: {e}"))?;
 
@@ -147,7 +102,8 @@ impl MemoryGraph {
 
     pub fn get_neighbors(&self, node_id: &str) -> Result<Vec<(MemoryEdge, MemoryNode)>, String> {
         let mut stmt = self
-            .conn
+            .state_db
+            .connection()
             .prepare(
                 "SELECT e.source_id, e.target_id, e.edge_type, e.data, e.created_at,
                     n.id, n.node_type, n.label, n.data, n.created_at, n.updated_at
@@ -197,7 +153,8 @@ impl MemoryGraph {
         );
 
         let mut stmt = self
-            .conn
+            .state_db
+            .connection()
             .prepare(&query)
             .map_err(|e| format!("Query error: {e}"))?;
 
@@ -254,7 +211,8 @@ impl MemoryGraph {
         );
 
         let mut stmt = self
-            .conn
+            .state_db
+            .connection()
             .prepare(&query)
             .map_err(|e| format!("Query error: {e}"))?;
 
@@ -283,7 +241,8 @@ impl MemoryGraph {
 
     pub fn snapshot(&self) -> Result<MemorySnapshot, String> {
         let mut stmt = self
-            .conn
+            .state_db
+            .connection()
             .prepare("SELECT id, node_type, label, data, created_at, updated_at FROM memory_nodes")
             .map_err(|e| format!("Query error: {e}"))?;
 
@@ -303,7 +262,8 @@ impl MemoryGraph {
             .map_err(|e| format!("Failed to collect: {e}"))?;
 
         let mut stmt = self
-            .conn
+            .state_db
+            .connection()
             .prepare("SELECT source_id, target_id, edge_type, data, created_at FROM memory_edges")
             .map_err(|e| format!("Query error: {e}"))?;
 
@@ -327,7 +287,8 @@ impl MemoryGraph {
     // Session tracking
     pub fn create_session(&self, session_id: &str) -> Result<(), String> {
         let now = chrono::Utc::now().to_rfc3339();
-        self.conn
+        self.state_db
+            .connection()
             .execute(
                 "INSERT INTO setup_sessions (id, started_at) VALUES (?1, ?2)",
                 params![session_id, &now],
@@ -345,13 +306,14 @@ impl MemoryGraph {
         events: &str,
     ) -> Result<(), String> {
         let now = chrono::Utc::now().to_rfc3339();
-        self.conn.execute(
+        self.state_db.connection().execute(
             "INSERT INTO setup_turns (session_id, turn_number, agent_prompt, agent_response, events_emitted, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![session_id, turn_number, prompt, response, events, &now],
         ).map_err(|e| format!("Failed to record turn: {e}"))?;
 
-        self.conn
+        self.state_db
+            .connection()
             .execute(
                 "UPDATE setup_sessions SET turn_count = ?1 WHERE id = ?2",
                 params![turn_number, session_id],
@@ -363,7 +325,8 @@ impl MemoryGraph {
 
     pub fn end_session(&self, session_id: &str, outcome: &str) -> Result<(), String> {
         let now = chrono::Utc::now().to_rfc3339();
-        self.conn
+        self.state_db
+            .connection()
             .execute(
                 "UPDATE setup_sessions SET ended_at = ?1, outcome = ?2 WHERE id = ?3",
                 params![&now, outcome, session_id],
