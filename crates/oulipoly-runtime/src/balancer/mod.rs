@@ -25,6 +25,13 @@ struct ProviderEval {
     index: usize,
     binding_score: Option<f64>,
     unlearned: bool,
+    fanout_usage: Option<FanoutUsageKey>,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct FanoutUsageKey {
+    worst_projected_used: Option<f64>,
+    soonest_reset_hours: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -221,6 +228,7 @@ fn score_by_density(
             binding_score: projection.binding_score,
             unlearned: projection.binding_score.is_none()
                 && projection.recent_error_count < ERROR_THRESHOLD as u32,
+            fanout_usage: Some(fanout_usage_key(projection)),
         })
         .collect::<Vec<_>>();
 
@@ -234,7 +242,7 @@ fn score_by_density(
         return round_robin_fallback(model, state, candidates);
     }
 
-    select_binding_score_with_fanout(model, state, &eligible)
+    select_binding_score_with_fanout(model, &eligible)
 }
 
 pub fn compute_projections(
@@ -492,11 +500,86 @@ fn best_binding_score<'a>(evals: &[&'a ProviderEval]) -> &'a ProviderEval {
         .unwrap()
 }
 
-fn select_binding_score_with_fanout(
-    model: &ModelConfig,
-    state: &StateDb,
-    eligible: &[ProviderEval],
-) -> usize {
+fn approx_eq_usage(a: f64, b: f64) -> bool {
+    (a - b).abs() <= f64::EPSILON * a.abs().max(b.abs()).max(1.0)
+}
+
+fn fanout_usage_key(projection: &ProviderProjection) -> FanoutUsageKey {
+    let worst_projected_used = projection
+        .projections_per_window
+        .iter()
+        .map(|window| window.projected_used)
+        .filter(|projected_used| projected_used.is_finite())
+        .reduce(f64::max);
+
+    let soonest_reset_hours = if let Some(worst) = worst_projected_used {
+        projection
+            .projections_per_window
+            .iter()
+            .filter(|window| {
+                window.projected_used.is_finite()
+                    && approx_eq_usage(window.projected_used, worst)
+                    && window.hours_until_reset.is_finite()
+            })
+            .map(|window| window.hours_until_reset)
+            .reduce(f64::min)
+    } else {
+        projection
+            .projections_per_window
+            .iter()
+            .map(|window| window.hours_until_reset)
+            .filter(|hours| hours.is_finite())
+            .reduce(f64::min)
+    };
+
+    FanoutUsageKey {
+        worst_projected_used,
+        soonest_reset_hours,
+    }
+}
+
+fn finite_fanout_usage(eval: &ProviderEval) -> Option<f64> {
+    eval.fanout_usage
+        .and_then(|usage| usage.worst_projected_used)
+        .filter(|value| value.is_finite())
+}
+
+fn finite_fanout_reset(eval: &ProviderEval) -> Option<f64> {
+    eval.fanout_usage
+        .and_then(|usage| usage.soonest_reset_hours)
+        .filter(|value| value.is_finite())
+}
+
+fn fanout_candidate_order(a: &ProviderEval, b: &ProviderEval) -> std::cmp::Ordering {
+    if let (Some(a_usage), Some(b_usage)) = (finite_fanout_usage(a), finite_fanout_usage(b))
+        && !approx_eq_usage(a_usage, b_usage)
+    {
+        return a_usage
+            .partial_cmp(&b_usage)
+            .unwrap_or(std::cmp::Ordering::Equal);
+    }
+
+    if let (Some(a_score), Some(b_score)) = (a.binding_score, b.binding_score)
+        && a_score.is_finite()
+        && b_score.is_finite()
+        && !approx_eq_usage(a_score, b_score)
+    {
+        return b_score
+            .partial_cmp(&a_score)
+            .unwrap_or(std::cmp::Ordering::Equal);
+    }
+
+    match (finite_fanout_reset(a), finite_fanout_reset(b)) {
+        (Some(a_reset), Some(b_reset)) if (a_reset - b_reset).abs() > EPS_HOURS => a_reset
+            .partial_cmp(&b_reset)
+            .unwrap_or(std::cmp::Ordering::Equal),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        _ => a.index.cmp(&b.index),
+    }
+}
+
+fn select_binding_score_with_fanout(model: &ModelConfig, eligible: &[ProviderEval]) -> usize {
     let eligible_refs: Vec<&ProviderEval> = eligible.iter().collect();
     let argmax = best_binding_score(&eligible_refs);
 
@@ -528,41 +611,11 @@ fn select_binding_score_with_fanout(
     let selected = band
         .iter()
         .copied()
-        .min_by(|a, b| {
-            let a_provider = &model.providers[a.index];
-            let b_provider = &model.providers[b.index];
-            let a_count = state
-                .get_provider(&model.name, &a_provider.name)
-                .ok()
-                .flatten()
-                .map(|p| p.invocation_count)
-                .unwrap_or(0);
-            let b_count = state
-                .get_provider(&model.name, &b_provider.name)
-                .ok()
-                .flatten()
-                .map(|p| p.invocation_count)
-                .unwrap_or(0);
-            a_count
-                .cmp(&b_count)
-                .then_with(|| {
-                    b.binding_score
-                        .unwrap()
-                        .partial_cmp(&a.binding_score.unwrap())
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .then_with(|| a.index.cmp(&b.index))
-        })
+        .min_by(|a, b| fanout_candidate_order(a, b))
         .unwrap();
 
     if selected.index != argmax.index {
         let selected_provider_name = &model.providers[selected.index].name;
-        let selected_invocation_count = state
-            .get_provider(&model.name, selected_provider_name)
-            .ok()
-            .flatten()
-            .map(|p| p.invocation_count)
-            .unwrap_or(0);
         let band_member_names = band
             .iter()
             .map(|eval| model.providers[eval.index].name.as_str())
@@ -571,7 +624,6 @@ fn select_binding_score_with_fanout(
         tracing::info!(
             selected_provider_name = selected_provider_name.as_str(),
             band_member_names = band_member_names.as_str(),
-            selected_invocation_count = selected_invocation_count,
             selected_binding_score = selected.binding_score.unwrap(),
             "fanout selected"
         );
@@ -796,11 +848,20 @@ mod tests {
             .unwrap();
     }
 
-    fn provider_eval(index: usize, binding_score: f64) -> ProviderEval {
+    fn provider_eval_with_fanout_usage(
+        index: usize,
+        binding_score: f64,
+        worst_projected_used: Option<f64>,
+        soonest_reset_hours: Option<f64>,
+    ) -> ProviderEval {
         ProviderEval {
             index,
             binding_score: Some(binding_score),
             unlearned: false,
+            fanout_usage: Some(FanoutUsageKey {
+                worst_projected_used,
+                soonest_reset_hours,
+            }),
         }
     }
 
@@ -1185,66 +1246,205 @@ mod tests {
         assert_eq!(selected_provider_index(&model, &db), 1);
     }
 
-    /// Risk: Fanout selector might still pick pure argmax despite eligible score band.
+    /// Risk: Fanout selector might use local invocation count instead of projected upstream usage.
     /// Level: unit.
-    /// Source: proposal §Test-intent track row 3; Assumptions A4, A5.
+    /// Source: AGE-25 proposal §7 item 1; Assumptions A2, A4, A5.
     #[test]
     fn density_fanout_uses_invocation_counts_within_score_band() {
+        let model = two_provider_model();
+        let eligible = vec![
+            provider_eval_with_fanout_usage(0, 10.0, Some(0.40), Some(48.0)),
+            provider_eval_with_fanout_usage(1, 7.0, Some(0.70), Some(6.0)),
+        ];
+
+        let selected = select_binding_score_with_fanout(&model, &eligible);
+
+        assert_eq!(
+            selected, 0,
+            "in-band fanout must pick the lower projected-usage provider, not the lower local invocation count"
+        );
+    }
+
+    /// Risk: Public density selection could still let local invocation counts override projected usage.
+    /// Level: unit.
+    /// Source: AGE-25 proposal §7 item 2; Assumptions A2, A4, A5.
+    #[test]
+    fn density_fanout_prefers_lower_projected_usage_over_local_invocation_count() {
         let db = StateDb::open(Path::new(":memory:")).unwrap();
         let model = two_provider_model();
-        for _ in 0..3 {
+
+        seed_windows_with_deltas(&db, "a", &[(0.40, 24, 0.01, 22)]);
+        seed_windows_with_deltas(&db, "b", &[(0.55, 24, 0.01, 22)]);
+        for _ in 0..4 {
             record_invocation_for_test(&db, &model.name, "a", 0, true);
         }
-        let eligible = vec![provider_eval(0, 10.0), provider_eval(1, 7.0)];
 
-        let selected = select_binding_score_with_fanout(&model, &db, &eligible);
+        assert_eq!(
+            selected_provider_index(&model, &db),
+            0,
+            "provider a has higher score and lower projected usage; provider b's lower local count must not win"
+        );
+    }
+
+    /// Risk: Tied usage and tied score might skip the soonest-reset layer.
+    /// Level: unit.
+    /// Source: AGE-25 proposal §7 item 3; Assumptions A2, A4, A9.
+    #[test]
+    fn density_fanout_ties_score_and_usage_falls_to_soonest_reset() {
+        let model = two_provider_model();
+        let eligible = vec![
+            provider_eval_with_fanout_usage(0, 8.0, Some(0.50), Some(12.0)),
+            provider_eval_with_fanout_usage(1, 8.0, Some(0.50), Some(6.0)),
+        ];
+
+        let selected = select_binding_score_with_fanout(&model, &eligible);
 
         assert_eq!(
             selected, 1,
-            "provider b is inside the 2x score band and has the lower invocation count"
+            "equal usage and score should fall to sooner reset"
+        );
+    }
+
+    /// Risk: Unknown projected usage could make reset unavailable as the AC2 fallback.
+    /// Level: unit.
+    /// Source: AGE-25 proposal §7 item 4; Assumptions A3, A4.
+    #[test]
+    fn density_fanout_falls_to_soonest_reset_when_usage_unknown_and_scores_tied() {
+        let model = two_provider_model();
+        let eligible = vec![
+            provider_eval_with_fanout_usage(0, 8.0, None, Some(12.0)),
+            provider_eval_with_fanout_usage(1, 8.0, None, Some(6.0)),
+        ];
+
+        let selected = select_binding_score_with_fanout(&model, &eligible);
+
+        assert_eq!(
+            selected, 1,
+            "when usage and score cannot distinguish candidates, the sooner reset should win"
+        );
+    }
+
+    /// Risk: One-sided unknown usage could incorrectly lose to known usage or reset timing.
+    /// Level: unit.
+    /// Source: AGE-25 proposal §7 item 5; Assumption A3.
+    #[test]
+    fn density_fanout_higher_score_wins_when_one_usage_unknown() {
+        let model = two_provider_model();
+        let eligible = vec![
+            provider_eval_with_fanout_usage(0, 10.0, None, Some(12.0)),
+            provider_eval_with_fanout_usage(1, 7.0, Some(0.50), Some(6.0)),
+        ];
+
+        let selected = select_binding_score_with_fanout(&model, &eligible);
+
+        assert_eq!(
+            selected, 0,
+            "one-sided unknown usage should fall through to score before reset"
+        );
+    }
+
+    /// Risk: Equal projected usage could regress the codex invariant by letting reset beat score.
+    /// Level: unit.
+    /// Source: AGE-25 proposal §7 item 6; Assumptions A3, A4.
+    #[test]
+    fn density_fanout_higher_score_wins_when_lower_score_has_equal_usage() {
+        let model = two_provider_model();
+        let eligible = vec![
+            provider_eval_with_fanout_usage(0, 10.0, Some(0.50), Some(12.0)),
+            provider_eval_with_fanout_usage(1, 7.0, Some(0.50), Some(6.0)),
+        ];
+
+        let selected = select_binding_score_with_fanout(&model, &eligible);
+
+        assert_eq!(
+            selected, 0,
+            "equal projected usage must fall through to higher score before sooner reset"
         );
     }
 
     /// Risk: Deterministic fanout might become order-unstable or random.
     /// Level: unit.
-    /// Source: proposal §Test-intent track row 4; Assumptions A4, A5.
+    /// Source: AGE-25 proposal §7 item 7; Assumptions A3, A4, A9.
     #[test]
     fn density_fanout_tiebreaks_by_score_then_index() {
-        let db = StateDb::open(Path::new(":memory:")).unwrap();
         let model = two_provider_model();
 
-        let score_tie_break = vec![provider_eval(0, 9.0), provider_eval(1, 10.0)];
+        let score_tie_break = vec![
+            provider_eval_with_fanout_usage(0, 9.0, Some(0.50), Some(1.0)),
+            provider_eval_with_fanout_usage(1, 10.0, Some(0.50), Some(24.0)),
+        ];
         assert_eq!(
-            select_binding_score_with_fanout(&model, &db, &score_tie_break),
+            select_binding_score_with_fanout(&model, &score_tie_break),
             1,
-            "equal invocation counts should choose the higher binding score"
+            "tied projected usage should choose the higher binding score before reset"
         );
 
-        let index_tie_break = vec![provider_eval(0, 10.0), provider_eval(1, 10.0)];
+        let reset_tie_break = vec![
+            provider_eval_with_fanout_usage(0, 10.0, Some(0.50), Some(12.0)),
+            provider_eval_with_fanout_usage(1, 10.0, Some(0.50), Some(6.0)),
+        ];
         assert_eq!(
-            select_binding_score_with_fanout(&model, &db, &index_tie_break),
+            select_binding_score_with_fanout(&model, &reset_tie_break),
+            1,
+            "tied projected usage and score should choose the sooner reset"
+        );
+
+        let index_tie_break = vec![
+            provider_eval_with_fanout_usage(0, 10.0, Some(0.50), Some(6.0)),
+            provider_eval_with_fanout_usage(1, 10.0, Some(0.50), Some(6.0)),
+        ];
+        assert_eq!(
+            select_binding_score_with_fanout(&model, &index_tie_break),
             0,
-            "equal counts and equal scores should choose the lower provider index"
+            "tied projected usage, score, and reset should choose the lower provider index"
         );
     }
 
     /// Risk: Fanout might send traffic to much lower-capacity providers.
     /// Level: unit.
-    /// Source: proposal §Test-intent track row 5; Assumption A5.
+    /// Source: AGE-25 proposal §7 item 8; Assumption A8.
     #[test]
     fn density_hard_pins_when_score_gap_exceeds_band() {
-        let db = StateDb::open(Path::new(":memory:")).unwrap();
         let model = two_provider_model();
-        for _ in 0..5 {
-            record_invocation_for_test(&db, &model.name, "a", 0, true);
-        }
-        let eligible = vec![provider_eval(0, 10.0), provider_eval(1, 4.99)];
+        let eligible = vec![
+            provider_eval_with_fanout_usage(0, 10.0, Some(0.80), Some(96.0)),
+            provider_eval_with_fanout_usage(1, 4.99, Some(0.10), Some(1.0)),
+        ];
 
-        let selected = select_binding_score_with_fanout(&model, &db, &eligible);
+        let selected = select_binding_score_with_fanout(&model, &eligible);
 
         assert_eq!(
             selected, 0,
-            "providers outside the 2x score band must preserve deterministic argmax"
+            "providers outside the 2x score band cannot win through lower usage or sooner reset"
+        );
+    }
+
+    /// Risk: The user-visible claude/claude4 reporter case could still pick the higher-usage account.
+    /// Level: unit.
+    /// Source: AGE-25 proposal §7 item 11 / contract item 10; Assumptions A2, A4, A5.
+    #[test]
+    fn density_fanout_smoke_selects_claude_51_over_claude4_82() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = ModelConfig {
+            name: "claude-opus".to_string(),
+            prompt_mode: PromptMode::Arg,
+            providers: vec![
+                ProviderConfig::new("claude", vec![]),
+                ProviderConfig::new("claude4", vec![]),
+            ],
+            inputs: vec![],
+        };
+
+        seed_windows_with_deltas(&db, "claude", &[(0.51, 48, 0.01, 22)]);
+        seed_windows_with_deltas(&db, "claude4", &[(0.82, 96, 0.01, 22)]);
+        for _ in 0..5 {
+            record_invocation_for_test(&db, &model.name, "claude", 0, true);
+        }
+
+        assert_eq!(
+            selected_provider_index(&model, &db),
+            0,
+            "claude has lower projected usage than claude4 and must remain selected despite higher local count"
         );
     }
 
