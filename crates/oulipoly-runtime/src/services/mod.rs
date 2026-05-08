@@ -21,10 +21,6 @@ macro_rules! service_dto {
 service_dto!(
     ConfigServiceRequest,
     ConfigServiceOutput,
-    RoutingServiceRequest,
-    RoutingServiceOutput,
-    InvocationLifecycleRequest,
-    InvocationLifecycleOutput,
     SessionLifecycleRequest,
     SessionLifecycleOutput,
     ResumeServiceRequest,
@@ -121,6 +117,57 @@ pub enum DiagnosticsServiceOutput {
     Diagnosis { diagnosis: Diagnosis },
 }
 
+pub struct RoutingServiceRequest<'a> {
+    pub model: &'a oulipoly_config::ModelConfig,
+    pub state: &'a oulipoly_state::StateDb,
+    pub ctx: Option<&'a crate::balancer::BalanceContext<'a>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoutingServiceOutput {
+    pub provider_index: usize,
+}
+
+pub struct InvocationLifecycleStartRequest<'a> {
+    pub state: &'a oulipoly_state::StateDb,
+    pub start: &'a oulipoly_state::InvocationStart,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvocationLifecycleStartOutput {
+    pub invocation_row_id: i64,
+}
+
+pub struct InvocationLifecycleFinalizeRequest<'a> {
+    pub state: &'a oulipoly_state::StateDb,
+    pub invocation_row_id: i64,
+    pub success: bool,
+    pub exit_code: i32,
+    pub error_category: Option<&'a str>,
+    pub terminal_reason: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InvocationLifecycleFinalizeOutput;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProductionRoutingService;
+
+impl ProductionRoutingService {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProductionInvocationLifecycleService;
+
+impl ProductionInvocationLifecycleService {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
 pub trait ConfigServicePort: Send + Sync {
     fn load_config(
         &self,
@@ -152,15 +199,20 @@ pub trait QuotaServicePort: Send + Sync {
 pub trait RoutingServicePort: Send + Sync {
     fn select_route(
         &self,
-        request: RoutingServiceRequest,
+        request: RoutingServiceRequest<'_>,
     ) -> Result<RoutingServiceOutput, ServiceError>;
 }
 
 pub trait InvocationLifecycleServicePort: Send + Sync {
-    fn record_invocation(
+    fn start_invocation(
         &self,
-        request: InvocationLifecycleRequest,
-    ) -> Result<InvocationLifecycleOutput, ServiceError>;
+        request: InvocationLifecycleStartRequest<'_>,
+    ) -> Result<InvocationLifecycleStartOutput, ServiceError>;
+
+    fn finalize_invocation(
+        &self,
+        request: InvocationLifecycleFinalizeRequest<'_>,
+    ) -> Result<InvocationLifecycleFinalizeOutput, ServiceError>;
 }
 
 pub trait SessionLifecycleServicePort: Send + Sync {
@@ -221,4 +273,49 @@ pub trait MigrationMaintenanceServicePort: Send + Sync {
         &self,
         request: MigrationMaintenanceServiceRequest,
     ) -> Result<MigrationMaintenanceServiceOutput, ServiceError>;
+}
+
+impl RoutingServicePort for ProductionRoutingService {
+    fn select_route(
+        &self,
+        request: RoutingServiceRequest<'_>,
+    ) -> Result<RoutingServiceOutput, ServiceError> {
+        Ok(RoutingServiceOutput {
+            provider_index: crate::balancer::select_provider(
+                request.model,
+                request.state,
+                request.ctx,
+            ),
+        })
+    }
+}
+
+impl InvocationLifecycleServicePort for ProductionInvocationLifecycleService {
+    fn start_invocation(
+        &self,
+        request: InvocationLifecycleStartRequest<'_>,
+    ) -> Result<InvocationLifecycleStartOutput, ServiceError> {
+        request
+            .state
+            .start_invocation(request.start)
+            .map(|invocation_row_id| InvocationLifecycleStartOutput { invocation_row_id })
+            .map_err(|message| ServiceError::Dependency { message })
+    }
+
+    fn finalize_invocation(
+        &self,
+        request: InvocationLifecycleFinalizeRequest<'_>,
+    ) -> Result<InvocationLifecycleFinalizeOutput, ServiceError> {
+        request
+            .state
+            .finalize_invocation(
+                request.invocation_row_id,
+                request.success,
+                request.exit_code,
+                request.error_category,
+                request.terminal_reason,
+            )
+            .map(|_| InvocationLifecycleFinalizeOutput)
+            .map_err(|message| ServiceError::Dependency { message })
+    }
 }

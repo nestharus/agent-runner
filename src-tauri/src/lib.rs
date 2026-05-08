@@ -2,7 +2,10 @@ pub mod setup;
 
 use oulipoly_config as config;
 use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig, ProvidersConfig};
-use oulipoly_runtime::{balancer, diagnostics, discovery, executor, quota};
+use oulipoly_runtime::services::{
+    ProductionRoutingService, RoutingServicePort, RoutingServiceRequest,
+};
+use oulipoly_runtime::{diagnostics, discovery, executor, quota};
 use oulipoly_setup as setup_core;
 use oulipoly_setup::actions::{SetupEvent, UserResponse};
 use oulipoly_state as state;
@@ -518,7 +521,14 @@ async fn test_model(
     let db_path = models_dir.parent().unwrap_or(&models_dir).join("state.db");
 
     let result = tauri::async_runtime::spawn_blocking(move || {
-        test_model_with_db_path(model, models_dir, db_path, "Say hello in one sentence.")
+        let routing_service = ProductionRoutingService;
+        test_model_with_db_path(
+            &routing_service,
+            model,
+            models_dir,
+            db_path,
+            "Say hello in one sentence.",
+        )
     })
     .await
     .map_err(|e| e.to_string())??;
@@ -527,13 +537,21 @@ async fn test_model(
 }
 
 fn test_model_with_db_path(
+    routing_service: &dyn RoutingServicePort,
     model: ModelConfig,
     models_dir: PathBuf,
     db_path: PathBuf,
     prompt: &str,
 ) -> Result<TestModelResult, String> {
     let db = state::StateDb::open(&db_path).map_err(|e| e.to_string())?;
-    let provider_index = balancer::select_provider(&model, &db, None);
+    let provider_index = routing_service
+        .select_route(RoutingServiceRequest {
+            model: &model,
+            state: &db,
+            ctx: None,
+        })
+        .map_err(|error| error.to_string())?
+        .provider_index;
     let providers_path = models_dir
         .parent()
         .unwrap_or(&models_dir)
@@ -575,7 +593,14 @@ pub(crate) fn test_model_for_test(
         .cloned()
         .ok_or_else(|| format!("Model '{}' not found", name))?;
     let db_path = models_dir.parent().unwrap_or(&models_dir).join("state.db");
-    test_model_with_db_path(model, models_dir, db_path, "Say hello in one sentence.")
+    let routing_service = ProductionRoutingService;
+    test_model_with_db_path(
+        &routing_service,
+        model,
+        models_dir,
+        db_path,
+        "Say hello in one sentence.",
+    )
 }
 
 pub fn effective_provider_for_model_provider(
