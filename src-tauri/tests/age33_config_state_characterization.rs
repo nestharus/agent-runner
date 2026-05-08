@@ -202,8 +202,7 @@ projects_dir = {:?}
                 parent_invocation_id: None,
             })
             .unwrap();
-        db.finalize_invocation(row_id, true, 0, None, None)
-            .unwrap();
+        db.finalize_invocation(row_id, true, 0, None, None).unwrap();
     }
 
     fn stage_claude_transcript(&self, projects_dir: &Path, session_id: &str) -> PathBuf {
@@ -267,10 +266,25 @@ fn stderr_json(output: &Output) -> Value {
     serde_json::from_slice(&output.stderr).unwrap()
 }
 
+fn source_slice<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+    let start_idx = source
+        .find(start)
+        .unwrap_or_else(|| panic!("missing {start}"));
+    let end_idx = source[start_idx..]
+        .find(end)
+        .map(|idx| start_idx + idx)
+        .unwrap_or_else(|| panic!("missing {end} after {start}"));
+    &source[start_idx..end_idx]
+}
+
 #[test]
 fn age_33_one_shot_loads_models_with_provider_aware_codex_overlap_validation() {
     let fixture = CliFixture::new();
-    fixture.write_model("codex-overlap", "codex", &["-c", "sandbox_mode=danger-full-access"]);
+    fixture.write_model(
+        "codex-overlap",
+        "codex",
+        &["-c", "sandbox_mode=danger-full-access"],
+    );
     fs::write(
         fixture.app_config_dir.join("providers.toml"),
         r#"[codex]
@@ -299,7 +313,10 @@ fn age_33_one_shot_malformed_providers_defaults_before_model_provider_resolution
 
     assert_ne!(output.status.code(), Some(0), "{output:?}");
     let err = stderr(&output);
-    assert!(err.contains("provider fixture-provider is missing from providers.toml"), "{err}");
+    assert!(
+        err.contains("provider fixture-provider is missing from providers.toml"),
+        "{err}"
+    );
     assert!(
         !err.contains("TOML parse error"),
         "one-shot provider load currently defaults malformed providers.toml: {err}"
@@ -410,10 +427,134 @@ fn age_33_resolve_agent_uses_default_agents_dir_and_maps_missing_agent_to_unknow
 }
 
 #[test]
+fn age_33_resolve_agent_cutover_uses_repository_for_both_loader_paths() {
+    let source = include_str!("../src/main.rs");
+    let resolve_agent = source_slice(source, "fn resolve_agent(", "struct FinalizerGuard");
+
+    assert!(
+        resolve_agent.contains("agent_config: &dyn AgentConfigRepository"),
+        "resolve_agent must accept the post-cutover AgentConfigRepository parameter"
+    );
+    assert!(
+        resolve_agent.contains("agent_config.load_agent_file(path)"),
+        "explicit --agent-file must delegate through AgentConfigRepository::load_agent_file"
+    );
+    assert!(
+        resolve_agent.contains("agent_config.load_agents(&agents_dir)?"),
+        "named-agent lookup must delegate through AgentConfigRepository::load_agents"
+    );
+
+    let file_load = resolve_agent
+        .find("agent_config.load_agent_file(path)")
+        .expect("explicit file load");
+    let dir_load = resolve_agent
+        .find("agent_config.load_agents(&agents_dir)?")
+        .expect("directory load");
+    assert!(
+        file_load < dir_load,
+        "explicit --agent-file should remain the bypass path before named-agent directory lookup"
+    );
+}
+
+#[test]
+fn age_33_deferred_one_shot_agent_file_site_remains_direct_loader_call() {
+    let source = include_str!("../src/main.rs");
+    let run = source_slice(source, "fn run(cli: Cli)", "fn resolve_agent(");
+
+    assert!(
+        run.contains("if let Some(ref model_name) = cli.model"),
+        "direct one-shot model branch must remain in run"
+    );
+    assert!(
+        run.contains("if let Some(ref agent_path) = cli.agent_file"),
+        "direct one-shot agent-file branch must remain nested under model execution"
+    );
+    assert!(
+        run.contains("load_agent_file(agent_path)?"),
+        "deferred site #1 must keep the direct load_agent_file call"
+    );
+    assert!(
+        !run.contains("agent_config.load_agent_file(agent_path)"),
+        "deferred site #1 must not be cut over by AGE-33"
+    );
+}
+
+#[test]
+fn age_33_run_with_balancing_opens_state_via_opener_before_config_loads() {
+    let source = include_str!("../src/main.rs");
+    let run_with_balancing = source_slice(source, "fn run_with_balancing(", "fn run_diagnostics(");
+
+    assert!(
+        run_with_balancing.contains("state_db_opener: &dyn StateDbOpener"),
+        "run_with_balancing must accept the post-cutover StateDbOpener parameter"
+    );
+    let open = run_with_balancing
+        .find("state_db_opener.open_default()?")
+        .expect("state opener call");
+    let providers = run_with_balancing
+        .find("ProvidersConfig::load(&providers_path).unwrap_or_default()")
+        .or_else(|| {
+            run_with_balancing
+                .find("oulipoly_config::ProvidersConfig::load(&providers_path).unwrap_or_default()")
+        })
+        .expect("provider config defaulting load");
+    let sessions = run_with_balancing
+        .find("SessionsConfig::load(&sessions_path).unwrap_or_default()")
+        .or_else(|| {
+            run_with_balancing
+                .find("oulipoly_config::SessionsConfig::load(&sessions_path).unwrap_or_default()")
+        })
+        .expect("sessions config defaulting load");
+
+    assert!(
+        open < providers && open < sessions,
+        "state DB open must remain before provider/session config loading"
+    );
+}
+
+#[test]
+fn age_33_diagnostics_and_balancing_config_fallbacks_remain_direct() {
+    let source = include_str!("../src/main.rs");
+    let run_with_balancing = source_slice(source, "fn run_with_balancing(", "fn run_diagnostics(");
+    let run_diagnostics = source_slice(source, "fn run_diagnostics(", "fn run_migrate_db(");
+
+    assert!(
+        run_with_balancing.contains("ProvidersConfig::load(&providers_path).unwrap_or_default()")
+            || run_with_balancing.contains(
+                "oulipoly_config::ProvidersConfig::load(&providers_path).unwrap_or_default()"
+            ),
+        "run_with_balancing provider loading must keep unwrap_or_default semantics"
+    );
+    assert!(
+        run_with_balancing.contains("SessionsConfig::load(&sessions_path).unwrap_or_default()")
+            || run_with_balancing.contains(
+                "oulipoly_config::SessionsConfig::load(&sessions_path).unwrap_or_default()"
+            ),
+        "run_with_balancing sessions loading must keep unwrap_or_default semantics"
+    );
+    assert!(
+        run_diagnostics.contains("load_app_config()"),
+        "run_diagnostics must keep its direct app-config load"
+    );
+    assert!(
+        run_diagnostics.contains("ProvidersConfig::load(&providers_path).unwrap_or_default()"),
+        "run_diagnostics provider loading must keep unwrap_or_default semantics"
+    );
+    assert!(
+        !run_diagnostics.contains("state_db_opener"),
+        "run_diagnostics is out of scope for the AGE-33 state-opener cutover"
+    );
+}
+
+#[test]
 fn age_33_migrate_db_compaction_uses_provider_unaware_model_load_when_models_dir_exists() {
     let fixture = CliFixture::new();
     let _ = fixture.open_db();
-    fixture.write_model("codex-overlap", "codex", &["-c", "sandbox_mode=danger-full-access"]);
+    fixture.write_model(
+        "codex-overlap",
+        "codex",
+        &["-c", "sandbox_mode=danger-full-access"],
+    );
     fs::write(
         fixture.app_config_dir.join("providers.toml"),
         r#"[codex]
@@ -561,7 +702,11 @@ flag = "--resume"
 kind = "codex"
 sessions_dir = {:?}
 "#,
-            prepared.fixture.root().join("codex-sessions").to_string_lossy()
+            prepared
+                .fixture
+                .root()
+                .join("codex-sessions")
+                .to_string_lossy()
         ),
     )
     .unwrap();

@@ -1,15 +1,16 @@
 use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig, ProvidersConfig};
-use oulipoly_state::StateDb;
+use oulipoly_state::repositories::{ProductionStateDbOpener, StateDbOpener};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeServices {
+pub struct RuntimeServices<O: StateDbOpener = ProductionStateDbOpener> {
     pub config_root: PathBuf,
     pub state_db_path: Option<PathBuf>,
     pub working_dir: Option<PathBuf>,
+    pub state_db_opener: O,
 }
 
-impl RuntimeServices {
+impl RuntimeServices<ProductionStateDbOpener> {
     pub fn production(working_dir: Option<PathBuf>) -> Result<Self, String> {
         let config_root = dirs::config_dir()
             .map(|path| path.join("oulipoly-agent-runner"))
@@ -19,6 +20,7 @@ impl RuntimeServices {
             config_root,
             state_db_path: None,
             working_dir,
+            state_db_opener: ProductionStateDbOpener,
         })
     }
 }
@@ -37,21 +39,23 @@ impl InteractiveLauncher for ProductionLauncher {
     }
 }
 
-pub fn run_repl_with_default_provider(services: RuntimeServices) -> Result<i32, String> {
+pub fn run_repl_with_default_provider<O: StateDbOpener>(
+    services: RuntimeServices<O>,
+) -> Result<i32, String> {
     run_repl_with_default_provider_with_launcher(services, &ProductionLauncher)
 }
 
 #[allow(dead_code)]
-pub(crate) fn run_repl_with_default_provider_with_launcher(
-    services: RuntimeServices,
+pub(crate) fn run_repl_with_default_provider_with_launcher<O: StateDbOpener>(
+    services: RuntimeServices<O>,
     launcher: &dyn InteractiveLauncher,
 ) -> Result<i32, String> {
-    let config_path = services.config_root.join("config.toml");
-    let app = oulipoly_config::app::AppConfig::load(&config_path)?;
+    let app_config_path = services.config_root.join("config.toml");
+    let app = oulipoly_config::app::AppConfig::load(&app_config_path)?;
     let family = app.default_provider.ok_or_else(|| {
         format!(
             "'default_provider' must be set in {} for '--new'",
-            config_path.display()
+            app_config_path.display()
         )
     })?;
 
@@ -76,8 +80,8 @@ pub(crate) fn run_repl_with_default_provider_with_launcher(
     };
 
     let state = match services.state_db_path.as_ref() {
-        Some(path) => StateDb::open(path),
-        None => StateDb::open_default(),
+        Some(path) => services.state_db_opener.open_at(path),
+        None => services.state_db_opener.open_default(),
     }?;
 
     let idx = crate::balancer::select_provider(&carrier_model, &state, None);
@@ -177,6 +181,7 @@ mod tests {
             config_root,
             state_db_path: None,
             working_dir: None,
+            state_db_opener: ProductionStateDbOpener,
         }
     }
 
@@ -188,6 +193,7 @@ mod tests {
             config_root,
             state_db_path: Some(state_db_path),
             working_dir: None,
+            state_db_opener: ProductionStateDbOpener,
         }
     }
 
