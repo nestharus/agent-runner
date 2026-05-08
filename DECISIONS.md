@@ -502,6 +502,49 @@ The NES-262 fix touches only `.github/workflows/release.yml` (CI workflow) and `
 
 **Resolves:** NES-251 § Decision 1 — the orthogonal `assertion_a08_binary_clients_have_release_path` baseline failure documented there is now fixed by this WU's release.yml extension.
 
+## AGE-40 — Phase 2.5.4 drift-discovery disposition (2026-05-08)
+
+**WU:** AGE-40 — Codex template source fix (revised scope: A + B).
+**Phase:** 2.5.4 (duplicate-systems inventory).
+
+**Decision:** proceed-with-note for all three `divergent-bug` findings; file one umbrella follow-up ticket and do not expand AGE-40 scope.
+
+**Findings (per `planning/age-40-codex-template-source-fix/research/age-40-duplicates.md`):**
+
+1. `examples/models/codex-resume.toml` ships pre-AGE-29 shape (`exec` in per-model args). After B lands, copying this example verbatim fails load.
+2. `save_model` Tauri command (`src-tauri/src/lib.rs:249-266`) lacks semantic validation; can persist a shape that the next reload then rejects (round-trip inconsistency).
+3. `PoolsView.tsx:239-284` + `PoolSettingsPanel.tsx:11-13` toggle `--dangerously-bypass-approvals-and-sandbox` into per-model `args`, exactly the shape B rejects.
+
+**Rationale:** AGE-40's scope was constrained by the answered scope question to options A + B only: "Do NOT bundle C or D — they are different fix surfaces and would expand scope" (`planning/age-40-codex-template-source-fix/.scratch/questions/q-a861ef1a-4e16-4c9b-a7a7-953523555130.question.json`). The three findings here are similarly different fix surfaces (example file, Tauri save command, frontend toggle) and the user's pre-emptive anti-scope statement covers them. Filing one umbrella follow-up rather than three small tickets to keep the backlog shape readable; a future WU can split if needed.
+
+**Tracker ticket:** AGE-44 — https://linear.app/neshq/issue/AGE-44/age-40-follow-up-tighten-cross-surface-validation-against-root
+
+**Revisit when:** AGE-44 is picked up; or a B-rejection failure shows up in user-state telemetry caused by one of the three surfaces.
+
+## AGE-40 — Phase 2.5 problem-map gate skipped (2026-05-08)
+
+**WU:** AGE-40.
+**Phase:** 2.5 (six sub-steps complete; gate suppressed).
+
+**Decision:** The Phase 2.5 problem-map human gate was suppressed under `skip_problem_map_gate=true` (orchestrator dispatch input). The problem map (`planning/age-40-codex-template-source-fix/research/age-40-problem-map.md`) was carried into the risk profile + Phase 3 on the strength of its own contents and the standing pre-approval policy.
+
+**Rationale:** Scope was already pinned by the answered scope question to A + B; the problem map enumerates touched surface but does not surface a previously-unevaluated value, scope, or trade-off question. Defer-to-prototype detection (Phase 2.5 step 5) was still evaluated and did not fire (HIGH-on-majority criterion does not apply — touched surface is two narrow Rust files).
+
+**Revisit when:** A future AGE WU has a problem map that surfaces a previously-unevaluated value, scope, or trade-off question. In that case the pipeline must emit a problem-map question to the root and block on the answer rather than relying on this WU's pre-approval.
+
+## AGE-40 — Phase 6c gate exceptions (2026-05-08)
+
+**WU:** AGE-40 — Codex template source fix (A + B).
+**Phase:** 6c (final gates).
+
+**Decision 1 — orthogonal `structural_segmentation::no_dangling_doomed_dir_link_in_tracked_files` baseline failure:** the test fails because of a backtick-wrapped path string in the existing `D-AGE-8-Phase-8` DECISIONS.md entry (`risk/age-8-phase-8-process-tree-audit.report.md`). The failure is bit-for-bit reproducible against `origin/main` HEAD `a36ebd4` (verified by checking out `origin/main:DECISIONS.md` and `origin/main:src-tauri/tests/structural_segmentation.rs` and running the test in trunk: same panic, same line content, only line number differs because AGE-40's own DECISIONS.md entries shifted line indices). AGE-40 does NOT modify the `D-AGE-8-Phase-8` entry, the structural_segmentation test, or the regex; the failure was introduced by AGE-8-00 (#54) and inherited via rebase. Per the NES-251 § Decision 1 precedent (orthogonal pre-existing failure documented and passed through), AGE-40 leaves this as-is. A separate WU should fix the AGE-8 entry (e.g., re-quote the path or add a leading `./` so the boundary regex no longer matches).
+
+**Justification:** All OTHER cargo tests pass (workspace-wide); the structural failure is a single test in a single file and is a pre-existing housekeeping-rule violation, not introduced by AGE-40's product changes.
+
+**Decision 2 — bun gates environmentally unavailable:** parity with NES-251 § Decision 2 and NES-262 (FontAwesome Pro packages absent from local registry). AGE-40 touches only Rust files (`crates/oulipoly-config`, `crates/oulipoly-setup`, `src-tauri/src/lib.rs`, `src-tauri/src/main.rs`, etc.) plus this DECISIONS.md addendum; no `.ts`/`.tsx`/`.js`/`.jsx`/`.css` files were modified (verified via `git diff --name-only`). On CI where the FontAwesome Pro token is configured, JS gates run and pass trivially.
+
+**Justification:** Per orchestrator policy ("If you can't test the UI, say so explicitly rather than claiming success"), JS gates are explicitly environmentally unavailable, NOT failing.
+
 ## NES-256 — Phase 6c agent-store release-path coverage (2026-05-07)
 
 **WU:** NES-256 — agent-store.

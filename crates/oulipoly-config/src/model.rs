@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -721,7 +721,98 @@ fn format_toml_value(v: &toml::Value) -> String {
     }
 }
 
-pub fn load_models(models_dir: &Path) -> Result<HashMap<String, ModelConfig>, String> {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum CodexArgPart {
+    Standalone(String),
+    Pair { flag: String, value: String },
+}
+
+impl CodexArgPart {
+    fn display(&self) -> String {
+        match self {
+            Self::Standalone(token) => token.clone(),
+            Self::Pair { flag, value } => format!("({flag}, {value})"),
+        }
+    }
+}
+
+fn split_codex_arg_parts(args: &[String]) -> Vec<CodexArgPart> {
+    let mut parts = Vec::new();
+    let mut i = 0;
+
+    while i < args.len() {
+        let token = &args[i];
+        if matches!(token.as_str(), "-c" | "--config") {
+            if let Some(value) = args.get(i + 1) {
+                parts.push(CodexArgPart::Pair {
+                    flag: token.clone(),
+                    value: value.clone(),
+                });
+                i += 2;
+            } else {
+                parts.push(CodexArgPart::Standalone(token.clone()));
+                i += 1;
+            }
+        } else {
+            parts.push(CodexArgPart::Standalone(token.clone()));
+            i += 1;
+        }
+    }
+
+    parts
+}
+
+fn codex_arg_overlap(root_args: &[String], model_args: &[String]) -> Option<String> {
+    let root_parts = split_codex_arg_parts(root_args)
+        .into_iter()
+        .collect::<HashSet<_>>();
+
+    split_codex_arg_parts(model_args)
+        .into_iter()
+        .find(|part| root_parts.contains(part))
+        .map(|part| part.display())
+}
+
+pub(crate) fn validate_codex_model_arg_overlap(
+    model_name: &str,
+    model: &ModelConfig,
+    providers: &crate::providers::ProvidersConfig,
+) -> Result<(), String> {
+    let Some(root_codex) = providers.get("codex") else {
+        return Ok(());
+    };
+
+    for model_provider in model
+        .providers
+        .iter()
+        .filter(|provider| provider.name == "codex")
+    {
+        if let Some(display) = codex_arg_overlap(&root_codex.args, &model_provider.args) {
+            return Err(format!(
+                "Model {model_name} provider codex: args token \"{display}\" duplicates root [codex].args; leave provider-level Codex flags in providers.toml and keep only model-specific flags in model TOML; run `agents migrate-config` to repair existing files."
+            ));
+        }
+
+        if let (Some(root_interactive_args), Some(model_interactive_args)) = (
+            root_codex.interactive_args.as_deref(),
+            model_provider.interactive_args.as_deref(),
+        ) && !root_interactive_args.is_empty()
+            && !model_interactive_args.is_empty()
+            && let Some(display) = codex_arg_overlap(root_interactive_args, model_interactive_args)
+        {
+            return Err(format!(
+                "Model {model_name} provider codex: interactive_args token \"{display}\" duplicates root [codex].interactive_args; leave provider-level Codex flags in providers.toml and keep only model-specific flags in model TOML; run `agents migrate-config` to repair existing files."
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+pub fn load_models(
+    models_dir: &Path,
+    providers: Option<&crate::providers::ProvidersConfig>,
+) -> Result<HashMap<String, ModelConfig>, String> {
     let mut models = HashMap::new();
 
     if !models_dir.is_dir() {
@@ -749,6 +840,9 @@ pub fn load_models(models_dir: &Path) -> Result<HashMap<String, ModelConfig>, St
             .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
 
         let config = ModelConfig::from_toml(&name, &content)?;
+        if let Some(providers) = providers {
+            validate_codex_model_arg_overlap(&name, &config, providers)?;
+        }
         models.insert(name, config);
     }
 
@@ -757,7 +851,61 @@ pub fn load_models(models_dir: &Path) -> Result<HashMap<String, ModelConfig>, St
 
 #[cfg(test)]
 mod tests {
+    use crate::providers::{ProviderEntry, ProvidersConfig};
+
     use super::*;
+    use std::fs;
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    fn write_providers_toml(root: &Path, body: &str) {
+        fs::write(root.join("providers.toml"), body).unwrap();
+    }
+
+    fn write_model_toml(models_dir: &Path, name: &str, body: &str) {
+        fs::create_dir_all(models_dir).unwrap();
+        fs::write(models_dir.join(format!("{name}.toml")), body).unwrap();
+    }
+
+    fn load_temp_models(
+        providers_toml: &str,
+        model_name: &str,
+        model_toml: &str,
+    ) -> Result<HashMap<String, ModelConfig>, String> {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let models_dir = root.join("models");
+        write_providers_toml(root, providers_toml);
+        write_model_toml(&models_dir, model_name, model_toml);
+
+        let providers = ProvidersConfig::load(&root.join("providers.toml")).unwrap();
+        // AGE-40 Step 6c adds the `load_models(&Path, Option<&ProvidersConfig>)` signature.
+        load_models(&models_dir, Some(&providers))
+    }
+
+    fn test_model(provider_name: &str, args: &[&str]) -> ModelConfig {
+        ModelConfig {
+            name: "gpt-high".into(),
+            prompt_mode: PromptMode::Stdin,
+            providers: vec![ProviderConfig::model_provider(
+                provider_name,
+                args.iter().map(|arg| (*arg).to_string()).collect(),
+            )],
+            inputs: vec![],
+        }
+    }
+
+    fn test_providers(provider_name: &str, args: &[&str]) -> ProvidersConfig {
+        let mut entries = HashMap::new();
+        entries.insert(
+            provider_name.to_string(),
+            ProviderEntry {
+                args: args.iter().map(|arg| (*arg).to_string()).collect(),
+                ..ProviderEntry::default()
+            },
+        );
+        ProvidersConfig { entries }
+    }
 
     #[test]
     fn derive_provider_name_simple() {
@@ -926,5 +1074,300 @@ prompt_mode = "stdin"
 "#;
         let err = ModelConfig::from_toml("claude-opus", toml).unwrap_err();
         assert!(err.contains("agents migrate-config"));
+    }
+
+    #[test]
+    fn load_models_rejects_codex_dangerously_flag_overlap() {
+        let err = load_temp_models(
+            r#"
+[codex]
+command = "codex"
+args = ["exec", "--dangerously-bypass-approvals-and-sandbox"]
+"#,
+            "gpt-high",
+            r#"
+[[providers]]
+name = "codex"
+args = ["--dangerously-bypass-approvals-and-sandbox", "-m", "gpt-5.5"]
+"#,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("--dangerously-bypass-approvals-and-sandbox"));
+    }
+
+    #[test]
+    fn load_models_accepts_canonical_codex_split() {
+        let models = load_temp_models(
+            r#"
+[codex]
+command = "codex"
+args = ["exec", "--dangerously-bypass-approvals-and-sandbox"]
+"#,
+            "gpt-high",
+            r#"
+[[providers]]
+name = "codex"
+args = ["-m", "gpt-5.5"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            models["gpt-high"].providers[0].args,
+            vec!["-m".to_string(), "gpt-5.5".to_string()]
+        );
+    }
+
+    #[test]
+    fn load_models_accepts_age29_migrated_c_split() {
+        load_temp_models(
+            r#"
+[codex]
+command = "codex"
+args = ["exec", "-c", "sandbox=workspace-write"]
+"#,
+            "gpt-high",
+            r#"
+[[providers]]
+name = "codex"
+args = ["-c", "model_reasoning_effort=high"]
+"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn load_models_rejects_duplicate_c_pair() {
+        let err = load_temp_models(
+            r#"
+[codex]
+command = "codex"
+args = ["exec", "-c", "sandbox=workspace-write"]
+"#,
+            "gpt-high",
+            r#"
+[[providers]]
+name = "codex"
+args = ["-c", "sandbox=workspace-write"]
+"#,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("(-c, sandbox=workspace-write)"));
+        assert!(err.contains("[codex].args"));
+    }
+
+    #[test]
+    fn split_codex_arg_parts_groups_c_and_config_pairs() {
+        assert_eq!(
+            split_codex_arg_parts(&[
+                "exec".to_string(),
+                "-c".to_string(),
+                "sandbox=workspace-write".to_string(),
+                "--config".to_string(),
+                "model_reasoning_effort=high".to_string(),
+            ]),
+            vec![
+                CodexArgPart::Standalone("exec".to_string()),
+                CodexArgPart::Pair {
+                    flag: "-c".to_string(),
+                    value: "sandbox=workspace-write".to_string(),
+                },
+                CodexArgPart::Pair {
+                    flag: "--config".to_string(),
+                    value: "model_reasoning_effort=high".to_string(),
+                },
+            ]
+        );
+
+        assert_eq!(
+            codex_arg_overlap(
+                &[
+                    "exec".to_string(),
+                    "--config".to_string(),
+                    "a=1".to_string()
+                ],
+                &["--config".to_string(), "a=1".to_string()]
+            ),
+            Some("(--config, a=1)".to_string())
+        );
+        assert_eq!(
+            codex_arg_overlap(
+                &[
+                    "exec".to_string(),
+                    "--config".to_string(),
+                    "a=1".to_string()
+                ],
+                &["--config".to_string(), "b=2".to_string()]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn load_models_accepts_age29_migrated_config_split() {
+        load_temp_models(
+            r#"
+[codex]
+command = "codex"
+args = ["exec", "--config", "sandbox=workspace-write"]
+"#,
+            "gpt-high",
+            r#"
+[[providers]]
+name = "codex"
+args = ["--config", "model_reasoning_effort=high"]
+"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn load_models_rejects_duplicate_config_pair() {
+        let err = load_temp_models(
+            r#"
+[codex]
+command = "codex"
+args = ["exec", "--config", "sandbox=workspace-write"]
+"#,
+            "gpt-high",
+            r#"
+[[providers]]
+name = "codex"
+args = ["--config", "sandbox=workspace-write"]
+"#,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("(--config, sandbox=workspace-write)"));
+        assert!(err.contains("[codex].args"));
+    }
+
+    #[test]
+    fn load_models_ignores_codex_root_overlap_for_non_codex_model_provider() {
+        load_temp_models(
+            r#"
+[codex]
+command = "codex"
+args = ["exec", "--config", "sandbox=workspace-write"]
+"#,
+            "claude-sonnet",
+            r#"
+[[providers]]
+name = "claude"
+args = ["exec", "--config", "sandbox=workspace-write"]
+"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn validator_error_message_names_token_and_repair_path() {
+        let err = load_temp_models(
+            r#"
+[codex]
+command = "codex"
+args = ["exec", "--dangerously-bypass-approvals-and-sandbox"]
+"#,
+            "gpt-high",
+            r#"
+[[providers]]
+name = "codex"
+args = ["--dangerously-bypass-approvals-and-sandbox", "-m", "gpt-5.5"]
+"#,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("gpt-high"));
+        assert!(err.contains("codex"));
+        assert!(err.contains("args"));
+        assert!(err.contains("--dangerously-bypass-approvals-and-sandbox"));
+        assert!(err.contains("[codex].args"));
+        assert!(err.contains("agents migrate-config"));
+    }
+
+    #[test]
+    fn load_models_rejects_codex_interactive_args_overlap() {
+        let err = load_temp_models(
+            r#"
+[codex]
+command = "codex"
+interactive_args = ["exec", "--dangerously-bypass-approvals-and-sandbox"]
+"#,
+            "gpt-high",
+            r#"
+[[providers]]
+name = "codex"
+args = ["-m", "gpt-5.5"]
+interactive_args = ["--dangerously-bypass-approvals-and-sandbox"]
+"#,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("interactive_args"));
+        assert!(err.contains("[codex].interactive_args"));
+    }
+
+    #[test]
+    fn overlap_predicate_boundary_table() {
+        let cases = [
+            (
+                "exact standalone duplicate",
+                "codex",
+                vec!["foo", "bar"],
+                vec!["bar"],
+                false,
+            ),
+            (
+                "non-equal substring",
+                "codex",
+                vec!["foobar"],
+                vec!["foo"],
+                true,
+            ),
+            (
+                "different -c key=value",
+                "codex",
+                vec!["-c", "a=1"],
+                vec!["-c", "b=2"],
+                true,
+            ),
+            (
+                "identical -c key=value",
+                "codex",
+                vec!["-c", "a=1"],
+                vec!["-c", "a=1"],
+                false,
+            ),
+            (
+                "different provider name",
+                "claude",
+                vec!["foo"],
+                vec!["foo"],
+                true,
+            ),
+            (
+                "non-codex provider",
+                "gemini",
+                vec!["foo"],
+                vec!["foo"],
+                true,
+            ),
+        ];
+
+        for (name, provider_name, root_args, model_args, expect_ok) in cases {
+            let providers = test_providers(provider_name, &root_args);
+            let model = test_model(provider_name, &model_args);
+
+            // AGE-40 Step 6c adds `validate_codex_model_arg_overlap`.
+            let result = validate_codex_model_arg_overlap("gpt-high", &model, &providers);
+
+            assert_eq!(
+                result.is_ok(),
+                expect_ok,
+                "{name}: expected ok={expect_ok}, got {result:?}"
+            );
+        }
     }
 }

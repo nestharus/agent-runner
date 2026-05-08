@@ -853,9 +853,9 @@ fn render_for_storage(
 fn resolve_replace_metadata(session_id: &str) -> Result<SessionMetadata, ReplaceError> {
     let state =
         StateDb::open_default().map_err(|e| ReplaceError::OperationalError { message: e })?;
-    let models = load_models(&default_models_dir())
-        .map_err(|e| ReplaceError::OperationalError { message: e })?;
     let providers = ProvidersConfig::load(&default_config_root().join("providers.toml"))
+        .map_err(|e| ReplaceError::OperationalError { message: e })?;
+    let models = load_models(&default_models_dir(), Some(&providers))
         .map_err(|e| ReplaceError::OperationalError { message: e })?;
     let sessions = SessionsConfig::load(&default_config_root().join("sessions.toml"))
         .map_err(|e| ReplaceError::OperationalError { message: e })?;

@@ -134,7 +134,7 @@ fn t_error_path_release() {
 fn t_active_segment_id_flows() {
     let prepared = prepared_claude_replace_fixture();
     let state = prepared.fixture.open_db();
-    let models = load_models(prepared.fixture.models_dir()).unwrap();
+    let models = load_models(prepared.fixture.models_dir(), None).unwrap();
     let providers = ProvidersConfig::load(&prepared.fixture.providers_path()).unwrap();
     let sessions = SessionsConfig::load(&prepared.fixture.sessions_path()).unwrap();
     let metadata =

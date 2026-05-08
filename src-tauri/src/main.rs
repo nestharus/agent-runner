@@ -323,6 +323,12 @@ fn default_models_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("models"))
 }
 
+fn default_config_root() -> PathBuf {
+    dirs::config_dir()
+        .map(|d| d.join("oulipoly-agent-runner"))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 fn run(cli: Cli) -> Result<i32, String> {
     if let Err(err) = session_replace::recover_pending_replaces() {
         eprintln!("{}", err.to_json());
@@ -465,7 +471,9 @@ fn run(cli: Cli) -> Result<i32, String> {
     }
 
     let models_dir = resolve_models_dir(&cli);
-    let models = load_models(&models_dir)?;
+    let providers_cfg =
+        ProvidersConfig::load(&default_config_root().join("providers.toml")).unwrap_or_default();
+    let models = load_models(&models_dir, Some(&providers_cfg))?;
     let extra_inputs = parse_inputs(&cli.inputs)?;
 
     let working_dir = cli.project.clone();
@@ -624,9 +632,7 @@ fn write_json_error(code: &str, message: &str) -> Result<(), String> {
 
 fn run_trace_command(options: TraceOptions, invocation_uuid: &str) -> Result<i32, String> {
     let state = StateDb::open_default()?;
-    let config_root = dirs::config_dir()
-        .map(|d| d.join("oulipoly-agent-runner"))
-        .unwrap_or_else(|| PathBuf::from("."));
+    let config_root = default_config_root();
     let sessions_path = config_root.join("sessions.toml");
     // Per V10 (failures observable, never silent): a malformed
     // sessions.toml must surface as an error, not silently degrade
@@ -672,8 +678,13 @@ fn run_session_locate(session_id: &str, _json: bool) -> Result<i32, String> {
         }
     };
 
+    let config_root = default_config_root();
+    let providers_path = config_root.join("providers.toml");
+    let sessions_path = config_root.join("sessions.toml");
+    let providers_cfg = oulipoly_config::ProvidersConfig::load(&providers_path).unwrap_or_default();
+
     let models_dir = default_models_dir();
-    let models = match load_models(&models_dir) {
+    let models = match load_models(&models_dir, Some(&providers_cfg)) {
         Ok(models) => models,
         Err(message) => {
             emit_metadata_error(&MetadataError::Operational { message });
@@ -681,12 +692,6 @@ fn run_session_locate(session_id: &str, _json: bool) -> Result<i32, String> {
         }
     };
 
-    let config_root = dirs::config_dir()
-        .map(|d| d.join("oulipoly-agent-runner"))
-        .unwrap_or_else(|| PathBuf::from("."));
-    let providers_path = config_root.join("providers.toml");
-    let sessions_path = config_root.join("sessions.toml");
-    let providers_cfg = oulipoly_config::ProvidersConfig::load(&providers_path).unwrap_or_default();
     let sessions_cfg = oulipoly_config::SessionsConfig::load(&sessions_path).unwrap_or_default();
 
     match locate_session_metadata(&state, &models, &providers_cfg, &sessions_cfg, session_id) {
@@ -762,15 +767,13 @@ fn run_session_export(session_id: &str, format: &str) -> Result<i32, String> {
 
 fn resolve_export_session_metadata(session_id: &str) -> Result<ExportSessionMetadata, ExportError> {
     let state = StateDb::open_default().map_err(|message| ExportError::Operational { message })?;
-    let models_dir = default_models_dir();
-    let models =
-        load_models(&models_dir).map_err(|message| ExportError::Operational { message })?;
-    let config_root = dirs::config_dir()
-        .map(|d| d.join("oulipoly-agent-runner"))
-        .unwrap_or_else(|| PathBuf::from("."));
+    let config_root = default_config_root();
     let providers_path = config_root.join("providers.toml");
     let sessions_path = config_root.join("sessions.toml");
     let providers_cfg = oulipoly_config::ProvidersConfig::load(&providers_path).unwrap_or_default();
+    let models_dir = default_models_dir();
+    let models = load_models(&models_dir, Some(&providers_cfg))
+        .map_err(|message| ExportError::Operational { message })?;
     let sessions_cfg = oulipoly_config::SessionsConfig::load(&sessions_path).unwrap_or_default();
 
     let resolved = state
@@ -1319,7 +1322,9 @@ fn run_pause_handshake(session_id: &str, ttl_ms: Option<u64>) -> Result<i32, Str
         Ok(state) => state,
         Err(message) => return Ok(emit_json_error(1, "operational-error", message)),
     };
-    let models = match load_models(&default_models_dir()) {
+    let providers_cfg =
+        ProvidersConfig::load(&default_config_root().join("providers.toml")).unwrap_or_default();
+    let models = match load_models(&default_models_dir(), Some(&providers_cfg)) {
         Ok(models) => models,
         Err(message) => return Ok(emit_json_error(1, "operational-error", message)),
     };
@@ -1547,13 +1552,11 @@ fn run_repl(
     let models_dir = models_dir_override
         .map(Path::to_path_buf)
         .unwrap_or_else(default_models_dir);
-    let models = load_models(&models_dir)?;
-    let config_root = dirs::config_dir()
-        .map(|d| d.join("oulipoly-agent-runner"))
-        .unwrap_or_else(|| PathBuf::from("."));
+    let config_root = default_config_root();
     let providers_path = config_root.join("providers.toml");
     let sessions_path = config_root.join("sessions.toml");
     let providers_cfg = oulipoly_config::ProvidersConfig::load(&providers_path).unwrap_or_default();
+    let models = load_models(&models_dir, Some(&providers_cfg))?;
     let sessions_cfg = oulipoly_config::SessionsConfig::load(&sessions_path).unwrap_or_default();
     let mut resolved_resume = if let Some(session_id) = resume {
         Some(
@@ -1801,13 +1804,11 @@ fn run_resume(
     let models_dir = models_dir_override
         .map(Path::to_path_buf)
         .unwrap_or_else(default_models_dir);
-    let models = load_models(&models_dir)?;
-    let config_root = dirs::config_dir()
-        .map(|d| d.join("oulipoly-agent-runner"))
-        .unwrap_or_else(|| PathBuf::from("."));
+    let config_root = default_config_root();
     let providers_path = config_root.join("providers.toml");
     let sessions_path = config_root.join("sessions.toml");
     let providers_cfg = oulipoly_config::ProvidersConfig::load(&providers_path).unwrap_or_default();
+    let models = load_models(&models_dir, Some(&providers_cfg))?;
     let sessions_cfg = oulipoly_config::SessionsConfig::load(&sessions_path).unwrap_or_default();
 
     let stderr_is_terminal = std::io::stderr().is_terminal();
@@ -2735,7 +2736,7 @@ fn run_compaction_backfill(state: &StateDb) -> Result<CompactionBackfillReport, 
         .map_err(|e| format!("Failed to load {}: {e}", sessions_path.display()))?;
     let models_dir = default_models_dir();
     let models = if models_dir.is_dir() {
-        load_models(&models_dir)?
+        load_models(&models_dir, None)?
     } else {
         HashMap::new()
     };

@@ -100,7 +100,7 @@ fn model_config_repository_delegates_load_save_list_and_delete() {
     )
     .unwrap();
 
-    let direct_loaded = load_models(&models_dir).unwrap();
+    let direct_loaded = load_models(&models_dir, None).unwrap();
     let trait_loaded =
         <FilesystemModelConfigRepository as ModelConfigRepository>::load_models(&repo, &models_dir)
             .unwrap();
