@@ -2,6 +2,7 @@ pub mod agent;
 pub mod app;
 pub mod model;
 pub mod providers;
+pub mod repositories;
 pub mod sessions;
 
 pub use agent::{AgentConfig, load_agent_file, load_agents};

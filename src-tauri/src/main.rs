@@ -27,6 +27,8 @@ use std::process::ExitCode;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
+mod wiring;
+
 const DEFAULT_PAUSE_HANDSHAKE_TTL_MS: u64 = 60_000;
 const MAX_PAUSE_HANDSHAKE_TTL_MS: u64 = 600_000;
 
@@ -2925,6 +2927,89 @@ mod tests {
             .parse::<toml::Table>()
             .unwrap();
         table[provider].as_table().unwrap().clone()
+    }
+
+    // Characterization test for AGE-8 — pins current behavior of CLI adapter helpers in this inline test section.
+    fn with_deleted_current_dir(test: impl FnOnce()) {
+        let _guard = env_lock().lock().unwrap();
+        let original = std::env::current_dir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        drop(dir);
+
+        let result = catch_unwind(AssertUnwindSafe(test));
+
+        std::env::set_current_dir(original).unwrap();
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    // Characterization test for AGE-8 — pins current behavior of parse_inputs CLI adapter.
+    #[test]
+    fn parse_inputs_collects_repeated_keys_and_rejects_missing_separator() {
+        let parsed = parse_inputs(&[
+            "size=large".to_string(),
+            "style=flat".to_string(),
+            "size=small".to_string(),
+            "empty=".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(parsed["size"], vec!["large", "small"]);
+        assert_eq!(parsed["style"], vec!["flat"]);
+        assert_eq!(parsed["empty"], vec![""]);
+
+        let err = parse_inputs(&["not-key-value".to_string()]).unwrap_err();
+        assert_eq!(
+            err,
+            "Invalid input format 'not-key-value': expected KEY=VALUE"
+        );
+    }
+
+    // Characterization test for AGE-8 — pins current behavior of resolve_models_dir CLI adapter.
+    #[test]
+    fn resolve_models_dir_prefers_explicit_override() {
+        let cli = Cli::try_parse_from([
+            "oulipoly-agent-runner",
+            "--models-dir",
+            "/tmp/age8-models",
+            "--model",
+            "fixture",
+            "prompt",
+        ])
+        .unwrap();
+
+        assert_eq!(resolve_models_dir(&cli), PathBuf::from("/tmp/age8-models"));
+    }
+
+    // Characterization test for AGE-8 — pins current behavior of effective_spawn_cwd CLI adapter.
+    #[test]
+    fn effective_spawn_cwd_keeps_absolute_paths_and_absolutizes_relative_paths() {
+        let cwd = std::env::current_dir().unwrap();
+
+        assert_eq!(
+            effective_spawn_cwd(Some(Path::new("/tmp/age8-project"))).unwrap(),
+            PathBuf::from("/tmp/age8-project")
+        );
+        assert_eq!(
+            effective_spawn_cwd(Some(Path::new("relative-project"))).unwrap(),
+            cwd.join("relative-project")
+        );
+        assert_eq!(effective_spawn_cwd(None).unwrap(), cwd);
+    }
+
+    // Characterization test for AGE-8 — pins current behavior of effective_spawn_cwd error handling.
+    #[cfg(unix)]
+    #[test]
+    fn effective_spawn_cwd_reports_current_dir_resolution_errors() {
+        with_deleted_current_dir(|| {
+            let err = effective_spawn_cwd(Some(Path::new("relative-project"))).unwrap_err();
+            assert!(
+                err.starts_with("Failed to resolve current directory:"),
+                "{err}"
+            );
+        });
     }
 
     #[test]
