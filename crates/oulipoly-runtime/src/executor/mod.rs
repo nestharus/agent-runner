@@ -133,3 +133,163 @@ pub fn execute_effective_with_inputs_and_env(
 ) -> Result<ExecutionResult, String> {
     cli::execute_effective(request)
 }
+
+// Characterization test for AGE-8 — pins current behavior of executor/mod.rs facade wrappers in this inline test module.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oulipoly_config::{InputDef, InputType, PromptMode, ProviderConfig};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(unix)]
+    struct FixtureScript {
+        _dir: tempfile::TempDir,
+        path: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    fn fixture_script(body: &str) -> FixtureScript {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("executor-facade-fixture.sh");
+        std::fs::write(
+            &path,
+            format!("#!/usr/bin/env bash\nset -euo pipefail\n{body}\n"),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        FixtureScript { _dir: dir, path }
+    }
+
+    #[cfg(unix)]
+    fn arg_model(script: &FixtureScript) -> ModelConfig {
+        ModelConfig {
+            name: "facade-fixture".to_string(),
+            prompt_mode: PromptMode::Arg,
+            providers: vec![ProviderConfig::new(
+                script.path.to_string_lossy().into_owned(),
+                vec![],
+            )],
+            inputs: vec![],
+        }
+    }
+
+    // Characterization test for AGE-8 — pins current behavior of executor/mod.rs execute facade wrapper.
+    // In-bounds delegation: the wrapper passes provider_index through to cli::execute and the supplied
+    // provider runs with the given prompt. (Out-of-bounds provider_index returns Err per cli::execute;
+    // characterized by execute_wrapper_returns_err_when_provider_index_out_of_range below.)
+    #[cfg(unix)]
+    #[test]
+    fn execute_wrapper_delegates_prompt_and_provider_index_to_cli_executor() {
+        let script = fixture_script("printf 'argv=%s\\n' \"$1\"");
+        let result = execute(&arg_model(&script), 0, "hello facade", None).unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.provider_index, 0);
+        assert_eq!(
+            String::from_utf8_lossy(&result.stdout),
+            "argv=hello facade\n"
+        );
+    }
+
+    // Characterization test for AGE-8 — pins current Err behavior when provider_index is out of bounds.
+    #[cfg(unix)]
+    #[test]
+    fn execute_wrapper_returns_err_when_provider_index_out_of_range() {
+        let script = fixture_script("printf 'unused\\n'");
+        match execute(&arg_model(&script), 3, "ignored", None) {
+            Ok(_) => panic!("expected Err for out-of-range provider_index"),
+            Err(err) => assert!(
+                err.contains("Provider index 3 out of range"),
+                "unexpected err: {err}"
+            ),
+        }
+    }
+
+    // Characterization test for AGE-8 — pins current behavior of executor/mod.rs execute_with_inputs facade wrapper.
+    #[cfg(unix)]
+    #[test]
+    fn execute_with_inputs_wrapper_delegates_schema_mapped_flags() {
+        let script = fixture_script("printf '%s\\n' \"$@\"");
+        let mut model = arg_model(&script);
+        model.inputs.push(InputDef {
+            name: "size".to_string(),
+            input_type: InputType::String,
+            required: false,
+            default_input: false,
+            default: None,
+            description: None,
+            flag: Some("--size".to_string()),
+        });
+        let mut inputs = HashMap::new();
+        inputs.insert("size".to_string(), vec!["large".to_string()]);
+
+        let result = execute_with_inputs(&model, 0, "draw", None, &inputs).unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(
+            String::from_utf8_lossy(&result.stdout),
+            "--size\nlarge\ndraw\n"
+        );
+    }
+
+    // Characterization test for AGE-8 — pins current behavior of executor/mod.rs execute_with_inputs_and_env facade wrapper.
+    #[cfg(unix)]
+    #[test]
+    fn execute_with_inputs_and_env_wrapper_delegates_parent_invocation_env() {
+        let env_dump = tempfile::NamedTempFile::new().unwrap();
+        let env_dump_path = env_dump.path().to_path_buf();
+        let script = fixture_script(&format!(
+            r#"printf '%s' "${{OULIPOLY_PARENT_INVOCATION-}}" > "{dump}"
+printf 'ok\n'"#,
+            dump = env_dump_path.display()
+        ));
+        let parent_env =
+            r#"{"source":"fixture-provider","id":"11111111-1111-1111-1111-111111111111"}"#;
+
+        let result = execute_with_inputs_and_env(
+            &arg_model(&script),
+            0,
+            "prompt",
+            None,
+            &HashMap::new(),
+            Some(parent_env),
+        )
+        .unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(std::fs::read_to_string(env_dump_path).unwrap(), parent_env);
+    }
+
+    // Characterization test for AGE-8 — pins current behavior of executor/mod.rs execute_effective_with_inputs_and_env facade wrapper.
+    #[cfg(unix)]
+    #[test]
+    fn execute_effective_with_inputs_and_env_wrapper_uses_supplied_effective_provider() {
+        let model_script = fixture_script("printf 'model-provider\\n'");
+        let effective_script = fixture_script("printf 'effective=%s\\n' \"$1\"");
+        let model = arg_model(&model_script);
+        let effective_provider =
+            ProviderConfig::new(effective_script.path.to_string_lossy().into_owned(), vec![]);
+
+        let result = execute_effective_with_inputs_and_env(cli::EffectiveExecuteRequest {
+            model: &model,
+            provider: &effective_provider,
+            provider_index: 9,
+            prompt_mode: PromptMode::Arg,
+            prompt: "chosen",
+            working_dir: None,
+            extra_inputs: &HashMap::new(),
+            parent_invocation_env: None,
+        })
+        .unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.provider_index, 9);
+        assert_eq!(
+            String::from_utf8_lossy(&result.stdout),
+            "effective=chosen\n"
+        );
+    }
+}

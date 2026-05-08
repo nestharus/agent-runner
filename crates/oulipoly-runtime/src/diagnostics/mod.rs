@@ -136,9 +136,13 @@ fn heuristic_diagnosis(stderr: &str, _exit_code: i32) -> Diagnosis {
     }
 }
 
+// Characterization test for AGE-8 — pins current behavior of diagnostics model-backed subprocess execution in this inline test module.
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn classify_exhaustion_matches_quota_billing_usage_limit_stderr() {
@@ -200,5 +204,58 @@ mod tests {
     fn parse_empty_output_falls_back() {
         let d = parse_diagnosis("", "429 error", 1).unwrap();
         assert_eq!(d.category, ErrorCategory::RateLimit);
+    }
+
+    // Characterization test for AGE-8 — pins current behavior of diagnostics::diagnose_error model-backed subprocess path.
+    #[cfg(unix)]
+    #[test]
+    fn diagnose_error_invokes_configured_model_subprocess_and_parses_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompt_dump = dir.path().join("diagnostic-prompt.txt");
+        let script_path = dir.path().join("diagnostic-model.sh");
+        std::fs::write(
+            &script_path,
+            format!(
+                r#"#!/usr/bin/env bash
+set -euo pipefail
+cat > "{prompt_dump}"
+printf 'auth_expired\nDiagnostic model saw expired credentials\n'
+"#,
+                prompt_dump = prompt_dump.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+
+        let diagnostics_model = ModelConfig {
+            name: "diagnostic-fixture".to_string(),
+            prompt_mode: PromptMode::Stdin,
+            providers: vec![ProviderConfig::new(
+                script_path.to_string_lossy().into_owned(),
+                vec![],
+            )],
+            inputs: vec![],
+        };
+
+        let diagnosis = diagnose_error(
+            "opaque provider stderr",
+            7,
+            &diagnostics_model,
+            &HashMap::new(),
+            Some(dir.path()),
+        )
+        .unwrap();
+
+        assert_eq!(diagnosis.category, ErrorCategory::AuthExpired);
+        assert_eq!(
+            diagnosis.summary,
+            "Diagnostic model saw expired credentials"
+        );
+
+        let prompt = std::fs::read_to_string(prompt_dump).unwrap();
+        assert!(prompt.contains("Exit code: 7"), "{prompt}");
+        assert!(prompt.contains("opaque provider stderr"), "{prompt}");
     }
 }
