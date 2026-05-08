@@ -1,0 +1,134 @@
+#![cfg(unix)]
+
+use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig};
+use oulipoly_runtime::diagnostics::{self, ErrorCategory};
+use oulipoly_runtime::services::{
+    DiagnosticsServiceOutput, DiagnosticsServicePort, DiagnosticsServiceRequest,
+};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+
+fn write_executable(path: &Path, body: &str) {
+    std::fs::write(path, body).expect("write script");
+    let mut perms = std::fs::metadata(path).expect("metadata").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(path, perms).expect("chmod script");
+}
+
+fn migrated_diagnostic_model() -> ModelConfig {
+    ModelConfig {
+        name: "diagnostic".to_string(),
+        prompt_mode: PromptMode::Arg,
+        providers: vec![ProviderConfig::model_provider(
+            "diagnostic-provider",
+            vec!["--raw-model-arg".to_string()],
+        )],
+        inputs: vec![],
+    }
+}
+
+fn effective_diagnostic_provider(script_path: PathBuf) -> ProviderConfig {
+    ProviderConfig {
+        name: "diagnostic-provider".to_string(),
+        command: script_path.to_string_lossy().into_owned(),
+        args: vec!["--effective-provider-arg".to_string()],
+        interactive_args: None,
+        resume: None,
+        session_capture: None,
+        resume_acceptance: None,
+        session_storage: None,
+    }
+}
+
+// Risk: R-A6 / proposal T13 - diagnostics service classify mode must delegate
+// to classify_exhaustion and return data only, preserving heuristic semantics.
+// Level: unit.
+// Source: AGE-34 contract "DiagnosticsServiceRequest" classify branch;
+// assumption A6.
+#[test]
+fn runtime_diagnostics_service_classify_mode_matches_direct_classifier() {
+    let stderr = "Billing limit reached for this workspace";
+    let direct = diagnostics::classify_exhaustion(stderr);
+
+    let service: &dyn DiagnosticsServicePort = &diagnostics::RuntimeDiagnosticsService;
+    let output = service
+        .diagnose(DiagnosticsServiceRequest::ClassifyExhaustion {
+            stderr: stderr.to_string(),
+        })
+        .expect("service classify");
+
+    match output {
+        DiagnosticsServiceOutput::ExhaustionClassification { is_exhausted } => {
+            assert_eq!(is_exhausted, direct);
+        }
+        other => panic!("expected ExhaustionClassification output, got {other:?}"),
+    }
+}
+
+// Risk: R-A6 / proposal T13 - diagnostics service model-backed mode must
+// consume an already-effective provider and delegate to diagnose_error without
+// rewriting prompt/parser/fallback behavior.
+// Level: unit/component.
+// Source: AGE-34 contract "DiagnosticsServiceRequest" model-backed branch and
+// AGE-27 invariant.
+#[test]
+fn runtime_diagnostics_service_model_backed_mode_matches_direct_diagnose_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let prompt_dump = dir.path().join("diagnostic-prompt.txt");
+    let script = dir.path().join("diagnostic-provider.sh");
+    write_executable(
+        &script,
+        &format!(
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+cat > "{prompt_dump}"
+printf 'network_error\nDiagnostic model saw network trouble\n'
+"#,
+            prompt_dump = prompt_dump.display()
+        ),
+    );
+    let model = migrated_diagnostic_model();
+    let provider = effective_diagnostic_provider(script);
+    let stderr = "opaque child failure from primary provider";
+
+    let direct = diagnostics::diagnose_error(
+        &model,
+        &provider,
+        0,
+        PromptMode::Stdin,
+        7,
+        stderr,
+        Some(dir.path()),
+    )
+    .expect("direct diagnose");
+
+    let service: &dyn DiagnosticsServicePort = &diagnostics::RuntimeDiagnosticsService;
+    let output = service
+        .diagnose(DiagnosticsServiceRequest::DiagnoseError {
+            diagnostics_model: model.clone(),
+            effective_provider: provider.clone(),
+            provider_index: 0,
+            prompt_mode: PromptMode::Stdin,
+            exit_code: 7,
+            stderr: stderr.to_string(),
+            working_dir: Some(dir.path().to_path_buf()),
+        })
+        .expect("service diagnose");
+
+    match output {
+        DiagnosticsServiceOutput::Diagnosis { diagnosis } => {
+            assert_eq!(diagnosis.category, direct.category);
+            assert_eq!(diagnosis.summary, direct.summary);
+            assert_eq!(diagnosis.category, ErrorCategory::NetworkError);
+        }
+        other => panic!("expected Diagnosis output, got {other:?}"),
+    }
+
+    let prompt = std::fs::read_to_string(prompt_dump).expect("prompt dump");
+    assert!(prompt.contains("Exit code: 7"), "{prompt}");
+    assert!(prompt.contains(stderr), "{prompt}");
+    assert!(
+        !prompt.contains("Empty command"),
+        "service must use the already-effective provider supplied by the caller"
+    );
+}

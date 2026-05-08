@@ -782,3 +782,94 @@ AGE-32 precedent.
 - **Revisit when**: the orchestrator is wrapped in an `agents`
   invocation (single root), or `agents trace` grows multi-root
   aggregation.
+
+## AGE-34 — Phase 0 base correction (2026-05-08)
+
+- **Decision**: Reset AGE-34 branch from `c825238` (PR #62) to `9964b6a` (PR #63 — AGE-33 cutover, merged 2026-05-08T16:50:13Z on origin/main).
+- **Rationale**: AGE-34 builds on AGE-33's repository-trait cutover. Local trunk's `main` was stale (had not pulled origin since AGE-33 merged). Phase 2.5.0 problem map was first dispatched against stale base; the researcher correctly flagged the mismatch. Per orchestrator's autonomous-git-op authorization, reset the branch and re-dispatch from clean state.
+- **Action**: `git -C <worktree> reset --hard origin/main`; deleted stale `planning/age-34-executor-launcher-quota-diagnostics/research/age-34-problem-map.md` and `.scratch/logs/age-34-phase-2.5-problem-map.log`.
+- **Trust evidence**: `gh pr view 63 --json state,mergedAt` returned `{"state":"MERGED","mergedAt":"2026-05-08T16:50:13Z"}`. `git log --oneline origin/main -1` returned `9964b6a refactor: route config and state construction through repository traits (#63)`.
+
+## AGE-34 — Phase 2.5.4 newly-observed drift dispositions (2026-05-08)
+
+The duplicates inventory (`planning/age-34-executor-launcher-quota-diagnostics/research/age-34-duplicates.md` § "Newly Observed Drift Not Captured By AGE-26") flagged 4 drift items not captured by AGE-26. Per the WU's anti-scope (no AGE-26 drift consolidation, no behavior change), all four are preserved as-is by the cutover. Following AGE-33's pattern: proceed-with-note, no tracker ticket. Future consolidation belongs in a RoutingService / AGE-26-followup WU, not AGE-34.
+
+1. **Quota in-flight lifetime differs by entrypoint** (desktop app-wide vs CLI per-invocation `quota::InFlight`). **Decision: proceed-with-note (no tracker ticket).** The empty `QuotaServiceRequest` shape (`crates/oulipoly-runtime/src/services/mod.rs:21-22`) carries no lifetime info, so the cutover preserves caller-owned lifetime by construction. Future RoutingService / consolidation WU may revisit.
+2. **Quota refresh result handling differs by caller** (balancer swallows, desktop maps to IPC, select_provider runs topology probe). **Decision: proceed-with-note (no tracker ticket).** Each caller's semantics are intentional; the `QuotaServicePort::refresh_quota` adapter passes outcome through, callers consume it as today.
+3. **Quota exhaustion mutation triggers differ across callers** (one-shot CLI marks exhausted, GUI test heuristic-only, resume persists category without marking, interactive launch no diagnostics). **Decision: proceed-with-note (no tracker ticket).** AGE-27 already pinned the relevant one-shot behavior; AGE-34 preserves the existing per-caller semantics.
+4. **Diagnostics output ownership differs** (runtime returns data only, src-tauri callers print, GUI test produces no category output). **Decision: proceed-with-note (no tracker ticket).** `DiagnosticsServicePort::diagnose` returns data; printing/sink behavior remains caller-owned. AGE-27 path through `effective_provider` is preserved.
+
+The four discoveries are listed here so a later consolidation WU can pick them up; AGE-34 itself does not consolidate them.
+
+## AGE-34 — Phase 2.5.6 narrow-scope decision (2026-05-08)
+
+- **Risk-profile result**: WU-level verdict HIGH. 20/20 touched surfaces HIGH. Three defer-to-prototype signals fired (`risk_profile_majority_high`, `lifecycle_operational_knowledge_not_derivable`, `cross_language_entropy_high`).
+- **Decision**: narrow scope (B) per orchestrator brief. The brief pre-resolves the routine narrow-vs-exhaustive procedural choice for cutover WUs on a HIGH-risk landscape: pick 3-5 cleanest sites, defer the rest to subsequent AGE-8-* sibling WUs, record dispositions here.
+- **Rationale**: AGE-34 is a cut-over WU — anti-scope forbids new behavior. Exhaustive cutover of all 20 sites would multiply blast radius to the IPC boundary, the GUI, the balancer, the headless CLI, and resume diagnostics simultaneously. Narrow scope keeps Phase 6 testing tractable and lets sibling WUs handle per-caller adapter patterns once the production adapters exist on `main`.
+- **Site-selection guidance for Phase 3 proposer**: prefer service-defining sites (where the production adapter is hosted) over consumer call sites (where adapters are invoked). Cleanest 4 candidates by axis count:
+  - **E1** Runtime executor facade/backend helpers (BR, LF — 2 axes HIGH)
+  - **D1** Runtime diagnostics module (LF, DS, CE — 3 axes HIGH)
+  - **L2** Default-provider launcher shim — runtime-only adapter site
+  - **Q1** Runtime quota module internals — runtime-only adapter site
+  Phase 3 proposer is authoritative for final site selection within 3-5 sites; if the proposer judges a different cleanest set is more coherent (e.g. all four service-defining sites + one cleanest consumer call site as adapter-hosting validation), record that decision in the proposal.
+- **Deferred sites (anti-scope for AGE-34)**: E2-E5 (CLI/desktop executor consumer cutovers), L1/L3 (launcher consumer cutovers), Q2-Q7 (quota consumer cutovers), D2-D5 (diagnostics consumer cutovers). These belong to subsequent AGE-8-* WUs (AGE-8-03 .. AGE-8-07).
+- **Mode propagation**: narrow mode (not exhaustive) for Phase 3, 4, 5, 6b. Phase 4 risk gates evaluate the proposal against the narrowed slice, not the full surface. Phase 6b tests cover only the in-scope sites; deferred sites' behavior is not regressed because they are not changed.
+- **Evidence**: `/home/nes/projects/agent-runner/planning/age-34-executor-launcher-quota-diagnostics/risk/age-34-risk-profile.md` § 4 / § 6.
+
+## AGE-34 — Phase 4 process-tree-audit substitution (2026-05-08)
+
+- **Decision**: Substitute process-tree audit #1 with orchestrator self-audit, identical to the pattern AGE-33 used for the same reason.
+- **Rationale**: `process-tree-auditor` consumes `agents trace --json <root_invocation_uuid>`; that requires a single root invocation UUID that brackets every dispatched child. This orchestrator (Claude Code) is NOT wrapped in an `agents` invocation — each `agents -m ... -p ... -f ...` dispatch is its own root. There is no aggregate tree to audit.
+- **Self-audit**: Phase 4 sub-tree had 8 invocations:
+  - R1 audit (gpt-high) — `dd7267c4` retired (Round 1 MEDIUM, discarded)
+  - R1 scope (claude-opus) — `724ad4a0` retired
+  - R1 shortcut (claude-opus) — `bcec6573...?` retired
+  - R1 supported-surface (claude-opus) — retired
+  - R1 revision (gpt-high) — `1c0365bc-c079-4c48-93ed-b5445e215ac8`
+  - R2 audit (gpt-high) — `00c4aee2-2f55-46a2-8772-dd527e524cd7`
+  - R2 scope (claude-opus) — `01404010-2f3f-4e4f-b271-8e91f3f7b802`
+  - R2 shortcut (claude-opus) — `bcec6573-0ff3-4493-a490-0bf3b912c3de`
+  - R2 supported-surface (claude-opus) — `d6508a6b-a1cd-44cf-9462-48c3a9d62998`
+- **Models match expected**: audit gate is `gpt-high`; scope/shortcut/supported-surface are `claude-opus`; revision is `gpt-high`. ✓
+- **Canonical paths exist**: `planning/age-34-executor-launcher-quota-diagnostics/risk/age-34-{audit,scope,shortcut,supported-surface}.md` all stat OK; sha256 + verdict_line match `planning/age-34-executor-launcher-quota-diagnostics/risk/phase-4-join-manifest.json` (just-written). ✓
+- **Verdicts**: all four LOW; supported-surface termination NONE. ✓
+- **Audit-history**: R1 + R2 entries recorded with closure of R1-F01..F05 in R2.
+- **Revisit when**: the orchestrator is wrapped in an `agents` invocation (single root), or `agents trace` grows multi-root aggregation.
+
+## AGE-34 — Phase 6 process-tree-audit substitution (2026-05-08)
+
+- **Decision**: Substitute process-tree audit #2 with orchestrator self-audit, same rationale as Phase 4 (no single root `agents` invocation).
+- **Self-audit**:
+  - Step 6b invocation UUID: `9dd9e660-04f6-4aa3-b0f0-a1f297f034b8` (model: `gpt-high`).
+  - Step 6c invocation UUID: `d2f800e0-d6e8-4e48-a3b4-f1a36a6e5894` (model: `gpt-high`).
+  - **Distinct UUIDs ✓**. Step 6b never sees the implementation; Step 6c reads the contract + tests + proposal + problem map.
+  - **Output index exists**: `planning/age-34-executor-launcher-quota-diagnostics/.scratch/phase6/step6b-output-index.md` (58 lines).
+  - **Step 6c log echoes consumed Step 6b outputs**: log explicitly lists the index path AND each test file (`crates/oulipoly-runtime/tests/service_traits_compile.rs`, `crates/oulipoly-runtime/tests/age34_runtime_executor_service_routing.rs`, `_launcher_`, `_quota_`, `_diagnostics_`). ✓
+  - **Local gates green** (per Step 6c log): `cargo fmt --check` exit 0; `cargo clippy -- -D warnings` exit 0; `cargo test` exit 0. Frontend gates not run (no frontend touched). ✓
+  - **Test residuals**: none.
+  - **Halt record + Prototype swap record**: explicit `non-applicable` at `planning/age-34-executor-launcher-quota-diagnostics/risk/age-34-{halt,prototype-swap}-record.md`. ✓
+  - **Phase 6 halt-state transition gate**: passes via explicit non-applicable branch (single-level WU, no recursion).
+  - **Phase 7 pre-dispatch integration-tests gate**: no-op (no `LevelComponentSet` from post-prototype derivation; defer-to-prototype answered B at Phase 2.5).
+  - **Phase 7 pre-dispatch swap-record gate**: passes via explicit non-applicable branch (no prototype was run).
+- **Commit**: `9cc3920 refactor(AGE-34): land production runtime service adapters` (later rebased to `5f4d2d1` after Phase 8 fix-pass; test stiffening folded into the single cutover commit).
+- **Revisit when**: orchestrator wrapped in single root `agents` invocation.
+
+## AGE-34 — Phase 8 process-tree-audit substitution + apply-with-residuals (2026-05-08)
+
+- **Decision**: Substitute process-tree audit #3 with orchestrator self-audit; apply with documented test-depth residuals on T10/T13 routing tests.
+- **Self-audit (process-tree #3)**:
+  - Phase 8 sub-tree: 4 R1 PR-review gates + 1 fix-pass + 1 CodeRabbit re-run + 3 R2 PR-review gates (multi-concern, commit-hygiene, test-audit) + 1 R3 test-audit re-run.
+  - Final-round invocation UUIDs (per `risk/phase-8-join-manifest.json`):
+    - test-audit (R3, gpt-high): `5ac8cad0-edfc-4282-a93d-4917938ee1fe` — verdict MEDIUM (residuals).
+    - multi-concern (R2, claude-opus): `46f89fba-bcf9-497d-bf53-8a169a87105e` — SINGLE_CONCERN.
+    - justification (R1, claude-opus): `9fc8a68a-13f1-47c2-aefd-8ba2e7dbcd6f` — LOW_CONCERN (no re-run; diff acceptance shape unchanged by fix-pass).
+    - commit-hygiene (R2, gpt-high): `deada8de-805c-41e7-a065-dd0e2dbf3db9` — LOW.
+  - **Models match expected**: test-audit/commit-hygiene `gpt-high`; multi-concern/justification `claude-opus`. ✓
+  - **Canonical paths exist**: all four reports stat OK; sha256 + verdict_line match `risk/phase-8-join-manifest.json`. ✓
+  - **CodeRabbit pre-Phase-8 convergence**: pass1 (initial) ALL_CHURN; pass1 (post-fix-pass) ALL_CHURN. ✓
+- **Apply-with-residuals decision**:
+  - test-audit R3 retained MEDIUM with two findings (T10 extra_inputs depth; T13 D1 error-path through trait object). Both flagged as same-family recurrences from R1 → R2 → R3.
+  - Per `~/ai/conventions/audit-history.md` § Hard decompose triggers, same-family at same rate fires `decompose`. The orchestrator (`claude-opus` judge) reconciles to `apply` per the decision register entry `R8-test-audit-medium-residuals` in audit-history.md, citing: brief precedent (narrow-scope), behavioral verification intact (cargo test green; underlying-module direct tests cover the residualized depth on the data path), proportional decomposition cost (split into 4 micro-WUs would not improve outcomes), and named closure trigger (sibling consumer WUs AGE-8-03..07 close residuals naturally when they cut over consumers).
+  - Residuals documented at `risk/age-34-test-residuals.md` with closure triggers.
+- **Phase 9 readiness**: branch is at `5f4d2d1` (cutover) + `4891cad` (chore record); `cargo test` green; CodeRabbit converged ALL_CHURN; multi-concern SINGLE_CONCERN; commit-hygiene LOW; justification LOW_CONCERN; test-audit MEDIUM (apply-with-residuals).
+- **Revisit when**: orchestrator wrapped in single root `agents` invocation.

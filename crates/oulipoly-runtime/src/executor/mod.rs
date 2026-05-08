@@ -1,5 +1,8 @@
 pub mod cli;
 
+use crate::services::{
+    ExecutorServiceOutput, ExecutorServicePort, ExecutorServiceRequest, ServiceError,
+};
 pub use oulipoly_agent_messenger::ReturnedArtifactRef;
 use oulipoly_config::ModelConfig;
 use oulipoly_state::CompositeInvocationId;
@@ -76,6 +79,55 @@ impl SessionCaptureMethod {
 
 pub use cli::provider_name;
 
+pub struct RuntimeExecutorService;
+
+impl ExecutorServicePort for RuntimeExecutorService {
+    fn execute(
+        &self,
+        request: ExecutorServiceRequest,
+    ) -> Result<ExecutorServiceOutput, ServiceError> {
+        let result = match request {
+            ExecutorServiceRequest::Facade {
+                model,
+                provider_index,
+                prompt,
+                working_dir,
+                extra_inputs,
+                parent_invocation_env,
+            } => cli::execute(
+                &model,
+                provider_index,
+                &prompt,
+                working_dir.as_deref(),
+                &extra_inputs,
+                parent_invocation_env.as_deref(),
+            ),
+            ExecutorServiceRequest::Effective {
+                model,
+                provider,
+                provider_index,
+                prompt_mode,
+                prompt,
+                working_dir,
+                extra_inputs,
+                parent_invocation_env,
+            } => cli::execute_effective(cli::EffectiveExecuteRequest {
+                model: &model,
+                provider: &provider,
+                provider_index,
+                prompt_mode,
+                prompt: &prompt,
+                working_dir: working_dir.as_deref(),
+                extra_inputs: &extra_inputs,
+                parent_invocation_env: parent_invocation_env.as_deref(),
+            }),
+        }
+        .map_err(|message| ServiceError::Dependency { message })?;
+
+        Ok(ExecutorServiceOutput { result })
+    }
+}
+
 /// Execute a model with the original prompt-only interface (backwards compat).
 pub fn execute(
     model: &ModelConfig,
@@ -83,14 +135,18 @@ pub fn execute(
     prompt: &str,
     working_dir: Option<&Path>,
 ) -> Result<ExecutionResult, String> {
-    cli::execute(
-        model,
-        provider_index,
-        prompt,
-        working_dir,
-        &HashMap::new(),
-        None,
-    )
+    let service = RuntimeExecutorService;
+    service
+        .execute(ExecutorServiceRequest::Facade {
+            model: model.clone(),
+            provider_index,
+            prompt: prompt.to_string(),
+            working_dir: working_dir.map(Path::to_path_buf),
+            extra_inputs: HashMap::new(),
+            parent_invocation_env: None,
+        })
+        .map(|output| output.result)
+        .map_err(|error| error.to_string())
 }
 
 /// Execute a model with extra inputs mapped to CLI flags.
@@ -101,14 +157,18 @@ pub fn execute_with_inputs(
     working_dir: Option<&Path>,
     extra_inputs: &HashMap<String, Vec<String>>,
 ) -> Result<ExecutionResult, String> {
-    cli::execute(
-        model,
-        provider_index,
-        prompt,
-        working_dir,
-        extra_inputs,
-        None,
-    )
+    let service = RuntimeExecutorService;
+    service
+        .execute(ExecutorServiceRequest::Facade {
+            model: model.clone(),
+            provider_index,
+            prompt: prompt.to_string(),
+            working_dir: working_dir.map(Path::to_path_buf),
+            extra_inputs: extra_inputs.clone(),
+            parent_invocation_env: None,
+        })
+        .map(|output| output.result)
+        .map_err(|error| error.to_string())
 }
 
 /// Execute a model with extra inputs and an explicit parent-invocation env payload.
@@ -120,20 +180,37 @@ pub fn execute_with_inputs_and_env(
     extra_inputs: &HashMap<String, Vec<String>>,
     parent_invocation_env: Option<&str>,
 ) -> Result<ExecutionResult, String> {
-    cli::execute(
-        model,
-        provider_index,
-        prompt,
-        working_dir,
-        extra_inputs,
-        parent_invocation_env,
-    )
+    let service = RuntimeExecutorService;
+    service
+        .execute(ExecutorServiceRequest::Facade {
+            model: model.clone(),
+            provider_index,
+            prompt: prompt.to_string(),
+            working_dir: working_dir.map(Path::to_path_buf),
+            extra_inputs: extra_inputs.clone(),
+            parent_invocation_env: parent_invocation_env.map(str::to_string),
+        })
+        .map(|output| output.result)
+        .map_err(|error| error.to_string())
 }
 
 pub fn execute_effective_with_inputs_and_env(
     request: cli::EffectiveExecuteRequest<'_>,
 ) -> Result<ExecutionResult, String> {
-    cli::execute_effective(request)
+    let service = RuntimeExecutorService;
+    service
+        .execute(ExecutorServiceRequest::Effective {
+            model: request.model.clone(),
+            provider: request.provider.clone(),
+            provider_index: request.provider_index,
+            prompt_mode: request.prompt_mode,
+            prompt: request.prompt.to_string(),
+            working_dir: request.working_dir.map(Path::to_path_buf),
+            extra_inputs: request.extra_inputs.clone(),
+            parent_invocation_env: request.parent_invocation_env.map(str::to_string),
+        })
+        .map(|output| output.result)
+        .map_err(|error| error.to_string())
 }
 
 // Characterization test for AGE-8 — pins current behavior of executor/mod.rs facade wrappers in this inline test module.

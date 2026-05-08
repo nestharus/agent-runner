@@ -1,6 +1,13 @@
 pub mod error;
 
+use crate::diagnostics::Diagnosis;
+use crate::executor::ExecutionResult;
+use crate::quota::{InFlight, RefreshOutcome};
 pub use error::ServiceError;
+use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig, ProvidersConfig};
+use oulipoly_state::StateDb;
+use std::collections::HashMap;
+use std::path::PathBuf;
 
 macro_rules! service_dto {
     ($($name:ident),+ $(,)?) => {
@@ -14,12 +21,6 @@ macro_rules! service_dto {
 service_dto!(
     ConfigServiceRequest,
     ConfigServiceOutput,
-    ExecutorServiceRequest,
-    ExecutorServiceOutput,
-    LauncherServiceRequest,
-    LauncherServiceOutput,
-    QuotaServiceRequest,
-    QuotaServiceOutput,
     RoutingServiceRequest,
     RoutingServiceOutput,
     InvocationLifecycleRequest,
@@ -28,8 +29,6 @@ service_dto!(
     SessionLifecycleOutput,
     ResumeServiceRequest,
     ResumeServiceOutput,
-    DiagnosticsServiceRequest,
-    DiagnosticsServiceOutput,
     MigrationServiceRequest,
     MigrationServiceOutput,
     TraceServiceRequest,
@@ -43,6 +42,84 @@ service_dto!(
     MigrationMaintenanceServiceRequest,
     MigrationMaintenanceServiceOutput,
 );
+
+#[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "AGE-34 DTO contract pins unboxed ModelConfig and ProviderConfig fields"
+)]
+pub enum ExecutorServiceRequest {
+    Facade {
+        model: ModelConfig,
+        provider_index: usize,
+        prompt: String,
+        working_dir: Option<PathBuf>,
+        extra_inputs: HashMap<String, Vec<String>>,
+        parent_invocation_env: Option<String>,
+    },
+    Effective {
+        model: ModelConfig,
+        provider: ProviderConfig,
+        provider_index: usize,
+        prompt_mode: PromptMode,
+        prompt: String,
+        working_dir: Option<PathBuf>,
+        extra_inputs: HashMap<String, Vec<String>>,
+        parent_invocation_env: Option<String>,
+    },
+}
+
+pub struct ExecutorServiceOutput {
+    pub result: ExecutionResult,
+}
+
+#[derive(Debug)]
+pub struct LauncherServiceRequest {
+    pub provider: ProviderConfig,
+    pub working_dir: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+pub struct LauncherServiceOutput {
+    pub exit_code: i32,
+}
+
+pub struct QuotaServiceRequest<'a> {
+    pub provider_name: String,
+    pub providers_cfg: &'a ProvidersConfig,
+    pub in_flight: &'a InFlight,
+    pub state: &'a StateDb,
+}
+
+pub struct QuotaServiceOutput {
+    pub outcome: RefreshOutcome,
+}
+
+#[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "AGE-34 DTO contract pins unboxed ModelConfig and ProviderConfig fields"
+)]
+pub enum DiagnosticsServiceRequest {
+    ClassifyExhaustion {
+        stderr: String,
+    },
+    DiagnoseError {
+        diagnostics_model: ModelConfig,
+        effective_provider: ProviderConfig,
+        provider_index: usize,
+        prompt_mode: PromptMode,
+        exit_code: i32,
+        stderr: String,
+        working_dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug)]
+pub enum DiagnosticsServiceOutput {
+    ExhaustionClassification { is_exhausted: bool },
+    Diagnosis { diagnosis: Diagnosis },
+}
 
 pub trait ConfigServicePort: Send + Sync {
     fn load_config(
@@ -68,7 +145,7 @@ pub trait LauncherServicePort: Send + Sync {
 pub trait QuotaServicePort: Send + Sync {
     fn refresh_quota(
         &self,
-        request: QuotaServiceRequest,
+        request: QuotaServiceRequest<'_>,
     ) -> Result<QuotaServiceOutput, ServiceError>;
 }
 

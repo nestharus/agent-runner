@@ -2,6 +2,10 @@ use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig, ProvidersConfig};
 use oulipoly_state::repositories::{ProductionStateDbOpener, StateDbOpener};
 use std::path::{Path, PathBuf};
 
+use crate::services::{
+    LauncherServiceOutput, LauncherServicePort, LauncherServiceRequest, ServiceError,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeServices<O: StateDbOpener = ProductionStateDbOpener> {
     pub config_root: PathBuf,
@@ -30,19 +34,44 @@ pub(crate) trait InteractiveLauncher {
     fn launch(&self, provider: &ProviderConfig, working_dir: Option<&Path>) -> Result<i32, String>;
 }
 
-#[allow(dead_code)]
-struct ProductionLauncher;
+pub struct RuntimeLauncherService;
 
-impl InteractiveLauncher for ProductionLauncher {
+impl LauncherServicePort for RuntimeLauncherService {
+    fn launch(
+        &self,
+        request: LauncherServiceRequest,
+    ) -> Result<LauncherServiceOutput, ServiceError> {
+        let exit_code = crate::executor::cli::execute_interactive(
+            &request.provider,
+            request.working_dir.as_deref(),
+            None,
+            None,
+        )
+        .map_err(|message| ServiceError::Dependency { message })?;
+
+        Ok(LauncherServiceOutput { exit_code })
+    }
+}
+
+impl InteractiveLauncher for RuntimeLauncherService {
     fn launch(&self, provider: &ProviderConfig, working_dir: Option<&Path>) -> Result<i32, String> {
-        crate::executor::cli::execute_interactive(provider, working_dir, None, None)
+        <Self as LauncherServicePort>::launch(
+            self,
+            LauncherServiceRequest {
+                provider: provider.clone(),
+                working_dir: working_dir.map(Path::to_path_buf),
+            },
+        )
+        .map(|output| output.exit_code)
+        .map_err(|error| error.to_string())
     }
 }
 
 pub fn run_repl_with_default_provider<O: StateDbOpener>(
     services: RuntimeServices<O>,
 ) -> Result<i32, String> {
-    run_repl_with_default_provider_with_launcher(services, &ProductionLauncher)
+    let launcher = RuntimeLauncherService;
+    run_repl_with_default_provider_with_launcher(services, &launcher)
 }
 
 #[allow(dead_code)]
@@ -172,9 +201,12 @@ pub(crate) use resolve_family_keys as resolve_family_keys_for_test;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::{LauncherServicePort, LauncherServiceRequest};
     use oulipoly_state::StateDb;
     use rusqlite::Connection;
     use std::cell::RefCell;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     fn runtime_services(config_root: PathBuf) -> RuntimeServices {
         RuntimeServices {
@@ -243,6 +275,73 @@ interactive_args = ["ok"]
         let conn = Connection::open(db_path).unwrap();
         let sql = format!("SELECT COUNT(*) FROM {table}");
         conn.query_row(&sql, [], |row| row.get(0)).unwrap()
+    }
+
+    #[cfg(unix)]
+    fn launcher_fixture_script(body: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("launcher.sh");
+        std::fs::write(
+            &path,
+            format!("#!/usr/bin/env bash\nset -euo pipefail\n{body}\n"),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        (dir, path)
+    }
+
+    #[cfg(unix)]
+    fn runtime_launcher_test_provider(path: &Path) -> ProviderConfig {
+        ProviderConfig {
+            name: "runtime-launcher-test".to_string(),
+            command: path.to_string_lossy().into_owned(),
+            args: vec!["one-shot-only".to_string()],
+            interactive_args: Some(vec!["interactive".to_string()]),
+            resume: None,
+            session_capture: None,
+            resume_acceptance: None,
+            session_storage: None,
+        }
+    }
+
+    /// Risk: R-A4 / proposal T11 - the private InteractiveLauncher seam on
+    /// RuntimeLauncherService must stay observably equivalent to the public
+    /// LauncherServicePort path on the same concrete service.
+    /// Level: unit.
+    /// Source: AGE-34 contract risk annotation R-A4.
+    #[cfg(unix)]
+    #[test]
+    fn runtime_launcher_service_private_seam_matches_launcher_service_port() {
+        let working_dir = tempfile::tempdir().unwrap();
+        let marker = tempfile::NamedTempFile::new().unwrap();
+        let (_script_dir, script_path) = launcher_fixture_script(&format!(
+            r#"printf 'ran\n' >> "{marker}"
+exit 17"#,
+            marker = marker.path().display()
+        ));
+        let provider = runtime_launcher_test_provider(&script_path);
+        let service = RuntimeLauncherService;
+        let service_port: &dyn LauncherServicePort = &service;
+        let private_launcher: &dyn InteractiveLauncher = &service;
+
+        let service_output = service_port
+            .launch(LauncherServiceRequest {
+                provider: provider.clone(),
+                working_dir: Some(working_dir.path().to_path_buf()),
+            })
+            .expect("service launch");
+        let private_exit_code = private_launcher
+            .launch(&provider, Some(working_dir.path()))
+            .expect("private seam launch");
+
+        assert_eq!(service_output.exit_code, private_exit_code);
+        assert_eq!(service_output.exit_code, 17);
+        assert_eq!(
+            std::fs::read_to_string(marker.path()).unwrap(),
+            "ran\nran\n"
+        );
     }
 
     #[test]
