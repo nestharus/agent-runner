@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use oulipoly_runtime::repl_default_provider::{RuntimeServices, run_repl_with_default_provider};
+use oulipoly_runtime::services::ProductionRoutingService;
 use oulipoly_state::StateDb;
 use oulipoly_state::repositories::{ProductionStateDbOpener, StateDbOpener};
 use std::fs;
@@ -125,6 +126,10 @@ fn age_33_runtime_default_provider_cutover_preserves_load_open_select_launch_ord
         "RuntimeServices must carry state_db_opener as a field on the struct itself"
     );
     assert!(
+        runtime_services.contains("routing_service:"),
+        "RuntimeServices must carry the AGE-35 routing service dependency"
+    );
+    assert!(
         !source.contains("impl std::ops::Deref for RuntimeServices"),
         "RuntimeServices must not reach a static opener through the rejected Deref shortcut"
     );
@@ -143,9 +148,19 @@ fn age_33_runtime_default_provider_cutover_preserves_load_open_select_launch_ord
     let open_default = run
         .find("services.state_db_opener.open_default()")
         .expect("default state opener branch");
+    let route = run
+        .find(".select_route(")
+        .expect("routing service provider selection");
+    let _routing_request = run
+        .find("RoutingServiceRequest")
+        .expect("routing service request construction");
+    let _cached_only = run.find("ctx: None").expect("cached-only routing request");
     let provider_selection = run
         .find("providers.runtime_provider(member_name)")
         .expect("runtime provider selection");
+    let out_of_bounds = run
+        .find("provider_index >= carrier_model.providers.len()")
+        .expect("out-of-bounds provider index guard");
     let launcher = run.find(".launch(").expect("launcher invocation");
 
     assert!(
@@ -157,10 +172,23 @@ fn age_33_runtime_default_provider_cutover_preserves_load_open_select_launch_ord
         "state open must remain downstream of strict app/provider config loading"
     );
     assert!(
-        open_at < provider_selection
-            && open_default < provider_selection
+        open_at < route
+            && open_default < route
+            && route < provider_selection
             && provider_selection < launcher,
         "provider selection and launcher invocation must remain downstream of the opened state"
+    );
+    assert!(
+        run.contains("RoutingServiceRequest") && run.contains("ctx: None"),
+        "runtime default-provider should build a cached-only routing request"
+    );
+    assert!(
+        route < out_of_bounds && out_of_bounds < provider_selection,
+        "caller-owned out-of-bounds mapping must remain after service routing and before runtime provider resolution"
+    );
+    assert!(
+        !run.contains("balancer::select_provider"),
+        "runtime default-provider --new must not call select_provider directly after AGE-35 cutover"
     );
 }
 
@@ -199,6 +227,7 @@ prompt_mode = "arg"
         state_db_path: Some(missing_default.path().join("state.db")),
         working_dir: None,
         state_db_opener: ProductionStateDbOpener,
+        routing_service: Arc::new(ProductionRoutingService),
     })
     .unwrap_err();
 
@@ -223,6 +252,7 @@ prompt_mode = "arg"
         state_db_path: Some(malformed_providers.path().join("state.db")),
         working_dir: None,
         state_db_opener: ProductionStateDbOpener,
+        routing_service: Arc::new(ProductionRoutingService),
     })
     .unwrap_err();
 
@@ -261,6 +291,7 @@ prompt_mode = "arg"
         state_db_path: Some(malformed_config.path().join("state.db")),
         working_dir: None,
         state_db_opener: ProductionStateDbOpener,
+        routing_service: Arc::new(ProductionRoutingService),
     })
     .unwrap_err();
 
@@ -310,6 +341,7 @@ prompt_mode = "arg"
         state_db_path: None,
         working_dir: None,
         state_db_opener: opener,
+        routing_service: Arc::new(ProductionRoutingService),
     })
     .unwrap_err();
 
@@ -368,6 +400,7 @@ prompt_mode = "arg"
         state_db_path: Some(PathBuf::from(&explicit_state_db)),
         working_dir: None,
         state_db_opener: ProductionStateDbOpener,
+        routing_service: Arc::new(ProductionRoutingService),
     })
     .unwrap();
 

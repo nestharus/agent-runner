@@ -1,17 +1,19 @@
+use crate::services::{ProductionRoutingService, RoutingServicePort, RoutingServiceRequest};
 use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig, ProvidersConfig};
 use oulipoly_state::repositories::{ProductionStateDbOpener, StateDbOpener};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::services::{
     LauncherServiceOutput, LauncherServicePort, LauncherServiceRequest, ServiceError,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeServices<O: StateDbOpener = ProductionStateDbOpener> {
     pub config_root: PathBuf,
     pub state_db_path: Option<PathBuf>,
     pub working_dir: Option<PathBuf>,
     pub state_db_opener: O,
+    pub routing_service: Arc<dyn RoutingServicePort>,
 }
 
 impl RuntimeServices<ProductionStateDbOpener> {
@@ -25,6 +27,7 @@ impl RuntimeServices<ProductionStateDbOpener> {
             state_db_path: None,
             working_dir,
             state_db_opener: ProductionStateDbOpener,
+            routing_service: Arc::new(ProductionRoutingService),
         })
     }
 }
@@ -113,10 +116,23 @@ pub(crate) fn run_repl_with_default_provider_with_launcher<O: StateDbOpener>(
         None => services.state_db_opener.open_default(),
     }?;
 
-    let idx = crate::balancer::select_provider(&carrier_model, &state, None);
+    let provider_index = services
+        .routing_service
+        .select_route(RoutingServiceRequest {
+            model: &carrier_model,
+            state: &state,
+            ctx: None,
+        })
+        .map_err(|error| error.to_string())?
+        .provider_index;
+    if provider_index >= carrier_model.providers.len() {
+        return Err(format!(
+            "selected provider index {provider_index} is out of bounds"
+        ));
+    }
     let member_name = members
-        .get(idx)
-        .ok_or_else(|| format!("selected provider index {idx} is out of bounds"))?;
+        .get(provider_index)
+        .ok_or_else(|| format!("selected provider index {provider_index} is out of bounds"))?;
     let (provider, _prompt_mode) = providers.runtime_provider(member_name)?;
     let launch_provider = ProviderConfig {
         name: carrier_model.name,
@@ -214,6 +230,7 @@ mod tests {
             state_db_path: None,
             working_dir: None,
             state_db_opener: ProductionStateDbOpener,
+            routing_service: Arc::new(ProductionRoutingService),
         }
     }
 
@@ -226,6 +243,7 @@ mod tests {
             state_db_path: Some(state_db_path),
             working_dir: None,
             state_db_opener: ProductionStateDbOpener,
+            routing_service: Arc::new(ProductionRoutingService),
         }
     }
 
