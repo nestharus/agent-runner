@@ -907,6 +907,20 @@ mod tests {
         ProvidersConfig { entries }
     }
 
+    fn codex_providers(args: &[&str], interactive_args: Option<&[&str]>) -> ProvidersConfig {
+        let mut entries = HashMap::new();
+        entries.insert(
+            "codex".to_string(),
+            ProviderEntry {
+                args: args.iter().map(|arg| (*arg).to_string()).collect(),
+                interactive_args: interactive_args
+                    .map(|args| args.iter().map(|arg| (*arg).to_string()).collect()),
+                ..ProviderEntry::default()
+            },
+        );
+        ProvidersConfig { entries }
+    }
+
     #[test]
     fn derive_provider_name_simple() {
         assert_eq!(derive_provider_name("claude", &[]), "claude");
@@ -1117,6 +1131,58 @@ args = ["-m", "gpt-5.5"]
             models["gpt-high"].providers[0].args,
             vec!["-m".to_string(), "gpt-5.5".to_string()]
         );
+    }
+
+    #[test]
+    fn render_validated_model_toml_accepts_clean_codex_model_with_providers() {
+        let providers = codex_providers(&["exec", "-c", "sandbox=workspace-write"], None);
+        let model = test_model("codex", &["-m", "gpt-5.5"]);
+
+        let rendered = super::render_validated_model_toml(&model, Some(&providers)).unwrap();
+        let reparsed = ModelConfig::from_toml("gpt-high", &rendered).unwrap();
+
+        assert_eq!(
+            reparsed.providers[0].args,
+            vec!["-m".to_string(), "gpt-5.5".to_string()]
+        );
+    }
+
+    #[test]
+    fn render_validated_model_toml_rejects_duplicate_codex_args() {
+        let providers = codex_providers(&["exec", "-c", "sandbox=workspace-write"], None);
+        let model = test_model("codex", &["exec", "-m", "gpt-5.5"]);
+
+        let err = super::render_validated_model_toml(&model, Some(&providers)).unwrap_err();
+
+        assert!(err.contains("duplicates root [codex].args"), "{err}");
+    }
+
+    #[test]
+    fn render_validated_model_toml_rejects_duplicate_codex_interactive_args() {
+        let providers = codex_providers(
+            &["exec"],
+            Some(&["exec", "--dangerously-bypass-approvals-and-sandbox"]),
+        );
+        let mut model = test_model("codex", &["-m", "gpt-5.5"]);
+        model.providers[0].interactive_args =
+            Some(vec!["--dangerously-bypass-approvals-and-sandbox".to_string()]);
+
+        let err = super::render_validated_model_toml(&model, Some(&providers)).unwrap_err();
+
+        assert!(
+            err.contains("duplicates root [codex].interactive_args"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn render_validated_model_toml_without_providers_bypasses_overlap_check() {
+        let model = test_model("codex", &["exec", "-m", "gpt-5.5"]);
+
+        let rendered = super::render_validated_model_toml(&model, None).unwrap();
+        let reparsed = ModelConfig::from_toml("gpt-high", &rendered).unwrap();
+
+        assert_eq!(reparsed.providers[0].args[0], "exec");
     }
 
     #[test]
