@@ -859,17 +859,17 @@ The four discoveries are listed here so a later consolidation WU can pick them u
 - **Decision**: Substitute process-tree audit #3 with orchestrator self-audit; apply with documented test-depth residuals on T10/T13 routing tests.
 - **Self-audit (process-tree #3)**:
   - Phase 8 sub-tree: 4 R1 PR-review gates + 1 fix-pass + 1 CodeRabbit re-run + 3 R2 PR-review gates (multi-concern, commit-hygiene, test-audit) + 1 R3 test-audit re-run.
-  - Final-round invocation UUIDs (per `risk/phase-8-join-manifest.json`):
+  - Final-round invocation UUIDs (per `planning/age-34-executor-launcher-quota-diagnostics/risk/phase-8-join-manifest.json`):
     - test-audit (R3, gpt-high): `5ac8cad0-edfc-4282-a93d-4917938ee1fe` — verdict MEDIUM (residuals).
     - multi-concern (R2, claude-opus): `46f89fba-bcf9-497d-bf53-8a169a87105e` — SINGLE_CONCERN.
     - justification (R1, claude-opus): `9fc8a68a-13f1-47c2-aefd-8ba2e7dbcd6f` — LOW_CONCERN (no re-run; diff acceptance shape unchanged by fix-pass).
     - commit-hygiene (R2, gpt-high): `deada8de-805c-41e7-a065-dd0e2dbf3db9` — LOW.
   - **Models match expected**: test-audit/commit-hygiene `gpt-high`; multi-concern/justification `claude-opus`. ✓
-  - **Canonical paths exist**: all four reports stat OK; sha256 + verdict_line match `risk/phase-8-join-manifest.json`. ✓
+  - **Canonical paths exist**: all four reports stat OK; sha256 + verdict_line match `planning/age-34-executor-launcher-quota-diagnostics/risk/phase-8-join-manifest.json`. ✓
   - **CodeRabbit pre-Phase-8 convergence**: pass1 (initial) ALL_CHURN; pass1 (post-fix-pass) ALL_CHURN. ✓
 - **Apply-with-residuals decision**:
   - test-audit R3 retained MEDIUM with two findings (T10 extra_inputs depth; T13 D1 error-path through trait object). Both flagged as same-family recurrences from R1 → R2 → R3.
   - Per `~/ai/conventions/audit-history.md` § Hard decompose triggers, same-family at same rate fires `decompose`. The orchestrator (`claude-opus` judge) reconciles to `apply` per the decision register entry `R8-test-audit-medium-residuals` in audit-history.md, citing: brief precedent (narrow-scope), behavioral verification intact (cargo test green; underlying-module direct tests cover the residualized depth on the data path), proportional decomposition cost (split into 4 micro-WUs would not improve outcomes), and named closure trigger (sibling consumer WUs AGE-8-03..07 close residuals naturally when they cut over consumers).
-  - Residuals documented at `risk/age-34-test-residuals.md` with closure triggers.
+  - Residuals documented at `planning/age-34-executor-launcher-quota-diagnostics/risk/age-34-test-residuals.md` with closure triggers.
 - **Phase 9 readiness**: branch is at `5f4d2d1` (cutover) + `4891cad` (chore record); `cargo test` green; CodeRabbit converged ALL_CHURN; multi-concern SINGLE_CONCERN; commit-hygiene LOW; justification LOW_CONCERN; test-audit MEDIUM (apply-with-residuals).
 - **Revisit when**: orchestrator wrapped in single root `agents` invocation.
