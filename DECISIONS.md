@@ -722,3 +722,63 @@ registry (`@fortawesome/sharp-regular-svg-icons` and
 `@fortawesome/sharp-solid-svg-icons` 404), so `bun run lint`, `bun run
 typecheck`, and `bun run test` were not runnable in this environment per the
 AGE-32 precedent.
+
+## D-AGE-33-01 — Drift dispositions for AGE-33 Phase 2.5 duplicates inventory
+
+- **Source**: AGE-33 Phase 2.5.4 duplicates inventory
+  (`planning/age-33-config-state-repository-cutover/research/age-33-duplicates.md`)
+  surfaced 3 drifts under "Newly Observed Drift Not Captured By AGE-26".
+- **Decision**: proceed with the WU's existing scope; do NOT file new tracker
+  tickets for the three drifts; do NOT consolidate them in this WU.
+- **Rationale**:
+  - Drift 1 (provider-aware `load_models(..., Some(&providers_cfg))` vs
+    repository `None` adapter): documented in AGE-8 hookpoints research as an
+    adapter-coverage gap. The WU's "where behavior is directly equivalent"
+    framing carves out affected sites; Phase 3 will defer the provider-aware
+    sites to a sibling AGE-8-* WU.
+  - Drift 2 (`StateDbOpener` does not expose `default_path` /
+    `open_for_memory` / schema-probe parity): documented in AGE-32
+    (`src-tauri/tests/age_32_state_db_migrations.rs`); not silent. Same
+    "directly equivalent" carve-out applies; setup-memory and rebuild
+    path-discovery sites are deferred.
+  - Drift 3 (root-derivation fallback variants in
+    `default_config_root`/`run_repl_with_default_provider_with_launcher`/GUI
+    `models_dir.parent()`): adjacent to AGE-26 config-loading drift but at the
+    path-policy layer. The WU's anti-scope forbids consolidating AGE-26 drift,
+    so this is preserved as-is; no new ticket filed.
+- **Revisit when**: a sibling AGE-8-* WU consumes the deferred sites, or a
+  follow-up to AGE-26 picks up path-policy consolidation.
+
+## D-AGE-33-02 — Process-tree-auditor self-audit when orchestrator runs from Claude Code
+
+- **Source**: AGE-33 implementation-pipeline-orchestrator session running
+  directly from Claude Code (terminal), not from a wrapping
+  `agents -m claude-opus -a implementation-pipeline-orchestrator.md`
+  invocation.
+- **Problem**: `~/ai/agents/process-tree-auditor.md` requires
+  `process_tree_path` (a saved `agents trace --json <uuid>`) and
+  `root_invocation_uuid` whose root encloses every child phase dispatch.
+  When the orchestrator runs from Claude Code, child `agents` dispatches
+  have `parent_id: null` and no shared root invocation; `agents trace`
+  walks a single UUID and does not aggregate disjoint roots.
+- **Decision**: substitute an orchestrator self-audit for each of the
+  three required process-tree audits (Phase 4 join, Phase 6 join, Phase 8
+  join). The self-audit verifies, for every phase canonical row: (a) the
+  invocation UUID exists in the agents DB and `succeeded`, (b) the
+  invocation's model matches the gate's required model per
+  `~/ai/models/roles.md`, (c) the canonical output path exists with the
+  recorded `size`/`mtime`/`sha256` and contains the expected verdict
+  line, (d) the prompt + log exist on disk, (e) the join manifest's
+  recorded fields re-verify against the filesystem (per the Canonical
+  Join Manifest Re-Verification rule). Record each self-audit pass in
+  audit-history.md.
+- **Phase 4 self-audit (this entry's enclosing context)**: PASS. Four
+  risk-gate invocations (audit/scope/shortcut/supported-surface) all
+  succeeded, models match (`gpt-high` for audit, `claude-opus` for the
+  other three), canonical paths exist, sha256 + verdict_line match the
+  join manifest at `planning/age-33-config-state-repository-cutover/risk/phase-4-join-manifest.json`,
+  prompts + logs exist under `.scratch/{prompts,logs}/`. No `blocking`
+  finding.
+- **Revisit when**: the orchestrator is wrapped in an `agents`
+  invocation (single root), or `agents trace` grows multi-root
+  aggregation.

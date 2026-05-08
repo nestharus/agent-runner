@@ -1,7 +1,8 @@
 use agent_runner_lib::{effective_provider_for_model_provider, load_app_config};
+use oulipoly_config::repositories::{AgentConfigRepository, FilesystemAgentConfigRepository};
 use oulipoly_config::{
     AgentConfig, ModelConfig, PromptMode, ProviderConfig, ProvidersConfig, load_agent_file,
-    load_agents, load_models,
+    load_models,
 };
 use oulipoly_runtime::balancer;
 use oulipoly_runtime::diagnostics;
@@ -14,6 +15,7 @@ use oulipoly_runtime::session_lock::{LockError, SessionLock};
 use oulipoly_runtime::session_metadata::{MetadataError, locate_session_metadata};
 use oulipoly_runtime::session_replace::{self, ReplaceError};
 use oulipoly_runtime::trace::{TraceOptions, render_ascii_trace, trace_invocation_with_sessions};
+use oulipoly_state::repositories::{ProductionStateDbOpener, StateDbOpener};
 use oulipoly_state::schema_probe::{self, ProbeError};
 use oulipoly_state::{
     CompositeInvocationId, InvocationStart, InvocationStatus, ReadOnlyOpenError, StateDb,
@@ -497,6 +499,7 @@ fn run(cli: Cli) -> Result<i32, String> {
     let extra_inputs = parse_inputs(&cli.inputs)?;
 
     let working_dir = cli.project.clone();
+    let state_db_opener = ProductionStateDbOpener;
 
     // Direct model execution (--model)
     if let Some(ref model_name) = cli.model {
@@ -513,6 +516,7 @@ fn run(cli: Cli) -> Result<i32, String> {
         };
 
         return run_with_balancing(
+            &state_db_opener,
             model,
             &prompt,
             &models,
@@ -522,7 +526,8 @@ fn run(cli: Cli) -> Result<i32, String> {
     }
 
     // Agent-based execution
-    let agent = resolve_agent(&cli)?;
+    let agent_config = FilesystemAgentConfigRepository;
+    let agent = resolve_agent(&cli, &agent_config)?;
 
     let model = models.get(&agent.model).ok_or_else(|| {
         format!(
@@ -539,6 +544,7 @@ fn run(cli: Cli) -> Result<i32, String> {
     };
 
     run_with_balancing(
+        &state_db_opener,
         model,
         &full_prompt,
         &models,
@@ -986,9 +992,12 @@ fn emit_export_json_error(code: &str, message: &str) {
     eprintln!("{payload}");
 }
 
-fn resolve_agent(cli: &Cli) -> Result<AgentConfig, String> {
+fn resolve_agent(
+    cli: &Cli,
+    agent_config: &dyn AgentConfigRepository,
+) -> Result<AgentConfig, String> {
     if let Some(ref path) = cli.agent_file {
-        return load_agent_file(path);
+        return agent_config.load_agent_file(path);
     }
 
     if let Some(ref name) = cli.agent {
@@ -997,7 +1006,7 @@ fn resolve_agent(cli: &Cli) -> Result<AgentConfig, String> {
                 .map(|d| d.join("oulipoly-agent-runner").join("agents"))
                 .unwrap_or_else(|| PathBuf::from("agents"))
         });
-        let agents = load_agents(&agents_dir)?;
+        let agents = agent_config.load_agents(&agents_dir)?;
         return agents
             .get(name)
             .cloned()
@@ -2019,13 +2028,14 @@ fn run_resume(
 }
 
 fn run_with_balancing(
+    state_db_opener: &dyn StateDbOpener,
     model: &ModelConfig,
     prompt: &str,
     all_models: &HashMap<String, ModelConfig>,
     working_dir: Option<&Path>,
     extra_inputs: &HashMap<String, Vec<String>>,
 ) -> Result<i32, String> {
-    let state = StateDb::open_default()?;
+    let state = state_db_opener.open_default()?;
 
     // Load providers.toml from the same config dir as models; quota refresh
     // only runs when actual load-balancing is possible (n > 1 providers).
