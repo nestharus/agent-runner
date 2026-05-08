@@ -518,6 +518,208 @@ fn invocation_count_for_session(fixture: &Fixture, session_id: &str) -> i64 {
 }
 
 #[test]
+fn headless_resume_rejects_malformed_uuid_before_state_or_config_open() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .base_resume_command("claude-opus", "not-a-uuid")
+        .arg("--prompt")
+        .arg("answer text")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "invalid session UUID: not-a-uuid\n"
+    );
+    assert!(
+        !fixture.db_path().exists(),
+        "malformed UUID must return before state DB initialization"
+    );
+    let app_config_dir = fixture.config_home.join("oulipoly-agent-runner");
+    assert!(
+        !app_config_dir.join("providers.toml").exists(),
+        "malformed UUID must not initialize provider config"
+    );
+    assert!(
+        !app_config_dir.join("sessions.toml").exists(),
+        "malformed UUID must not initialize session config"
+    );
+}
+
+#[test]
+fn headless_resume_model_pool_mismatch_preserves_suggestions() {
+    let suggested = Fixture::new();
+    let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+    let script = suggested.write_script("fixture.sh", "exit 0");
+    suggested.write_single_provider_model(
+        "wrong-model",
+        "codex",
+        &script,
+        r#"
+[providers.resume]
+kind = "subcommand"
+subcommand = ["resume"]
+"#,
+    );
+    suggested.write_single_provider_model(
+        "claude-opus",
+        "claude2",
+        &script,
+        r#"
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+"#,
+    );
+    suggested.seed_session_turns("claude2", session_id, &[("turn-1", "2026-04-17T08:00:00Z")]);
+
+    let output = suggested
+        .base_resume_command("wrong-model", session_id)
+        .arg("--prompt")
+        .arg("answer text")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        format!(
+            "session {session_id} belongs to provider claude2, which is not in model wrong-model's provider pool.\nTry a model that includes claude2: claude-opus\n"
+        )
+    );
+
+    let no_suggestion = Fixture::new();
+    let session_id = "0824f7d1-7a3d-4ff8-8e4b-8c1d3b0d3e2c";
+    let script = no_suggestion.write_script("fixture.sh", "exit 0");
+    no_suggestion.write_single_provider_model(
+        "wrong-model",
+        "codex",
+        &script,
+        r#"
+[providers.resume]
+kind = "subcommand"
+subcommand = ["resume"]
+"#,
+    );
+    no_suggestion.seed_session_turns("claude2", session_id, &[("turn-1", "2026-04-17T08:00:00Z")]);
+
+    let output = no_suggestion
+        .base_resume_command("wrong-model", session_id)
+        .arg("--prompt")
+        .arg("answer text")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        format!(
+            "session {session_id} belongs to provider claude2, which is not in model wrong-model's provider pool.\nTry a model that includes claude2: (no other model in the loaded config includes claude2)\n"
+        )
+    );
+}
+
+#[test]
+fn headless_resume_requires_provider_resume_block() {
+    let fixture = Fixture::new();
+    let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+    let script = fixture.write_script("claude.sh", "exit 0");
+    fixture.write_single_provider_model("claude-opus", "claude2", &script, "");
+    fixture.seed_session_turns("claude2", session_id, &[("turn-1", "2026-04-17T08:00:00Z")]);
+
+    let output = fixture
+        .base_resume_command("claude-opus", session_id)
+        .arg("--prompt")
+        .arg("answer text")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "[resume] -> claude2\nprovider claude2 has no [providers.resume] block; cannot resume\n"
+    );
+}
+
+#[test]
+fn headless_resume_persists_resume_acceptance_status_and_evidence() {
+    let fixture = Fixture::new();
+    let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+    let script = fixture.write_script(
+        "claude-acceptance.sh",
+        &format!("printf 'resume accepted for {session_id}\\n'"),
+    );
+    fixture.write_single_provider_model(
+        "claude-opus",
+        "claude2",
+        &script,
+        r#"
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+
+[claude2.resume_acceptance]
+accepted_output_patterns = ["resume accepted for {session_id}"]
+rejected_output_patterns = ["resume rejected"]
+"#,
+    );
+    fixture.seed_session_turns("claude2", session_id, &[("turn-1", "2026-04-17T08:00:00Z")]);
+
+    let output = fixture
+        .base_resume_command("claude-opus", session_id)
+        .arg("--prompt")
+        .arg("answer text")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let invocation = parse_invocation(&String::from_utf8_lossy(&output.stderr));
+    let row = fixture
+        .open_db()
+        .get_invocation_by_uuid(&invocation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.resume_acceptance_status.as_deref(), Some("accepted"));
+    assert_eq!(
+        row.resume_acceptance_evidence.as_deref(),
+        Some("matched accept pattern: resume accepted for {session_id}")
+    );
+}
+
+#[test]
+fn resume_pinned_ingest_emits_supplied_target_without_new_match() {
+    let fixture = Fixture::new();
+    let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+    let script = fixture.write_script("claude-no-turn.sh", "printf 'mock resumed answer\\n'");
+    fixture.write_single_provider_model(
+        "claude-opus",
+        "claude2",
+        &script,
+        r#"
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+"#,
+    );
+    fixture.seed_session_turns("claude2", session_id, &[("turn-1", "2026-04-17T08:00:00Z")]);
+
+    let output = fixture
+        .base_resume_command("claude-opus", session_id)
+        .arg("--prompt")
+        .arg("answer text")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let invocation = parse_invocation(&stderr);
+    assert_eq!(parse_session_line(&stderr, &invocation.id), session_id);
+    assert_invocation_session(&fixture, &invocation.id, session_id);
+    assert_eq!(session_turn_count(&fixture, "claude2", session_id), 1);
+}
+
+#[test]
 fn noninteractive_invocation_ingests_session_and_emits_oulipoly_session_line() {
     let fixture = Fixture::new();
     let transcript_path = fixture.dir.path().join("turns.jsonl");
