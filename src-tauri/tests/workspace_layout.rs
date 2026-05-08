@@ -10,7 +10,6 @@ const WORKSPACE_MEMBERS: &[&str] = &[
     "crates/oulipoly-state",
     "crates/oulipoly-runtime",
     "crates/oulipoly-setup",
-    "crates/oulipoly-agent-cli",
     "crates/oulipoly-agent-store",
     "crates/oulipoly-agent-scratchpad",
     "crates/oulipoly-agent-messenger",
@@ -39,8 +38,6 @@ const EXPECTED_EDGES: &[(&str, &str)] = &[
     ("oulipoly-state", "oulipoly-config"),
     ("oulipoly-state", "oulipoly-agent-messenger"),
     ("oulipoly-state", "oulipoly-core"),
-    ("oulipoly-agent-cli", "oulipoly-runtime"),
-    ("oulipoly-agent-cli", "oulipoly-config"),
     ("oulipoly-agent-scratchpad", "oulipoly-agent-store"),
     ("oulipoly-agent-messenger", "oulipoly-agent-store"),
     ("oulipoly-agent-messenger", "oulipoly-agent-scratchpad"),
@@ -53,7 +50,6 @@ const GRAPH_NODES: &[&str] = &[
     "oulipoly-state",
     "oulipoly-runtime",
     "oulipoly-setup",
-    "oulipoly-agent-cli",
     "oulipoly-agent-store",
     "oulipoly-agent-scratchpad",
     "oulipoly-agent-messenger",
@@ -274,7 +270,7 @@ fn binary_target_resolves() {
 }
 
 #[test]
-fn workspace_includes_agent_binary_members() {
+fn workspace_excludes_removed_agent_cli_and_keeps_artifact_tools() {
     let manifest_path = repo_root().join("Cargo.toml");
     let manifest = std::fs::read_to_string(&manifest_path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", manifest_path.display()));
@@ -298,8 +294,12 @@ fn workspace_includes_agent_binary_members() {
             })
             .collect();
 
+        assert!(
+            !entries.contains("crates/oulipoly-agent-cli"),
+            "workspace {key} should not include removed crates/oulipoly-agent-cli: {entries:?}"
+        );
+
         for expected in [
-            "crates/oulipoly-agent-cli",
             "crates/oulipoly-agent-store",
             "crates/oulipoly-agent-scratchpad",
             "crates/oulipoly-agent-messenger",
@@ -320,8 +320,32 @@ fn agent_binary_targets_have_expected_names() {
         .get("packages")
         .and_then(Value::as_array)
         .expect("cargo metadata should include packages");
+
+    assert!(
+        packages
+            .iter()
+            .all(|package| self::package_name(package) != "oulipoly-agent-cli"),
+        "metadata should not include removed oulipoly-agent-cli package"
+    );
+
+    for package in packages {
+        let targets = package
+            .get("targets")
+            .and_then(Value::as_array)
+            .expect("metadata package should include targets");
+        assert!(
+            targets.iter().all(|target| {
+                let name = target.get("name").and_then(Value::as_str);
+                let kinds = target.get("kind").and_then(Value::as_array);
+                !(name == Some("agent")
+                    && kinds.is_some_and(|kinds| kinds.iter().any(|kind| kind == "bin")))
+            }),
+            "metadata should not include removed agent binary target in package {}: {targets:?}",
+            self::package_name(package)
+        );
+    }
+
     for (package_name, expected_binary) in [
-        ("oulipoly-agent-cli", "agent"),
         ("oulipoly-agent-store", "agent-store"),
         ("oulipoly-agent-scratchpad", "agent-scratchpad"),
         ("oulipoly-agent-messenger", "agent-messenger"),

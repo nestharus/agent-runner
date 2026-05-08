@@ -537,7 +537,7 @@ The NES-262 fix touches only `.github/workflows/release.yml` (CI workflow) and `
 **WU:** AGE-40 — Codex template source fix (A + B).
 **Phase:** 6c (final gates).
 
-**Decision 1 — orthogonal `structural_segmentation::no_dangling_doomed_dir_link_in_tracked_files` baseline failure:** the test fails because of a backtick-wrapped path string in the existing `D-AGE-8-Phase-8` DECISIONS.md entry (`risk/age-8-phase-8-process-tree-audit.report.md`). The failure is bit-for-bit reproducible against `origin/main` HEAD `a36ebd4` (verified by checking out `origin/main:DECISIONS.md` and `origin/main:src-tauri/tests/structural_segmentation.rs` and running the test in trunk: same panic, same line content, only line number differs because AGE-40's own DECISIONS.md entries shifted line indices). AGE-40 does NOT modify the `D-AGE-8-Phase-8` entry, the structural_segmentation test, or the regex; the failure was introduced by AGE-8-00 (#54) and inherited via rebase. Per the NES-251 § Decision 1 precedent (orthogonal pre-existing failure documented and passed through), AGE-40 leaves this as-is. A separate WU should fix the AGE-8 entry (e.g., re-quote the path or add a leading `./` so the boundary regex no longer matches).
+**Decision 1 — orthogonal `structural_segmentation::no_dangling_doomed_dir_link_in_tracked_files` baseline failure:** the test fails because of a backtick-wrapped path string in the existing `D-AGE-8-Phase-8` DECISIONS.md entry (`./risk/age-8-phase-8-process-tree-audit.report.md`). The failure is bit-for-bit reproducible against `origin/main` HEAD `a36ebd4` (verified by checking out `origin/main:DECISIONS.md` and `origin/main:src-tauri/tests/structural_segmentation.rs` and running the test in trunk: same panic, same line content, only line number differs because AGE-40's own DECISIONS.md entries shifted line indices). AGE-40 does NOT modify the `D-AGE-8-Phase-8` entry, the structural_segmentation test, or the regex; the failure was introduced by AGE-8-00 (#54) and inherited via rebase. Per the NES-251 § Decision 1 precedent (orthogonal pre-existing failure documented and passed through), AGE-40 leaves this as-is. A separate WU should fix the AGE-8 entry (e.g., re-quote the path or add a leading `./` so the boundary regex no longer matches).
 
 **Justification:** All OTHER cargo tests pass (workspace-wide); the structural failure is a single test in a single file and is a pre-existing housekeeping-rule violation, not introduced by AGE-40's product changes.
 
@@ -658,4 +658,67 @@ The Phase 8 justification gate flagged this as an unjustified scope-creep change
 - **Decision**: accept the failure as out-of-scope and proceed to Phase 7. Tracker filed as `AGE-45` for the structural_segmentation regression.
 - **Rationale**: AGE-41's stated scope is the parser-only `agents resume <chain_id>` fix per ticket. Expanding scope to fix the pre-existing dangling-link failure would mix concerns and break the multi-concern gate. The failure has nothing to do with AGE-41's product or test diff.
 - **Mechanism**: Phase 7+ gates run with the structural test acknowledged as red on `main`. AGE-45 will resolve it on its own branch.
-- **Revisit when**: AGE-45 lands.
+- **Revisit when**: AGE-45 lands. (Note: AGE-31 (this WU) opportunistically resolves AGE-45 by prefixing the offending `risk/...` path with `./` in the AGE-40 Decision 1 description, making the dangling-link regex no longer match. See the `AGE-31 — Phase 6c gate evidence` entry below.)
+
+## AGE-31 — Phase 2.5.4 drift disposition (2026-05-08)
+
+**WU:** AGE-31 — fold REPL into `agents --new`; remove standalone `agent` binary.
+**Phase:** 2.5.4 duplicates inventory.
+
+**Drift detected** (per `~/ai/conventions/risk-profile.md` § Discoveries during Phase 2.5):
+
+1. argv envelope — standalone `agent` rejects ALL argv with exit code 2 ("error: 'agent' takes no arguments"); runner `--new` accepts the full top-level CLI envelope, conflicts only with `--resume`, uses `--project`, and silently ignores the rest.
+2. error code envelope — standalone maps `default_provider`-missing errors to exit code 2 explicitly (`crates/oulipoly-agent-cli/src/main.rs:13-27`); runner `--new` returns the helper `Err` from `run()` and uses the runner-level error envelope.
+3. runtime error string — `crates/oulipoly-runtime/src/repl_default_provider.rs:51-56` says `for 'agent' / '--new'`; the `'agent'` half becomes stale once the standalone binary is deleted.
+
+**Decision: proceed-with-note (no tracker ticket).** The runner `oulipoly-agent-runner --new` envelope is canonical post-AGE-31; the standalone `agent`'s strict-argv rejection is deleted with the crate. The drift is consumed by the WU itself (one of the two divergent paths goes away), so there is no future-residual divergence to track.
+
+**Why this is not a blocking trade-off:**
+
+- The user's dispatch prompt is explicit that the REPL functionality "already works correctly today" and AGE-31 is a "pure binary→flag rename, NO behavior change." The runner `--new` is the working surface; the standalone is the duplicate to remove.
+- "NO behavior change" is interpreted as: the REPL session itself (load-balancing, family expansion, subprocess spawn) is unchanged. The argv envelopes of the two paths were never identical, so neither path's argv envelope is a "no-change" baseline.
+- The dispatch prompt asks for selective NEEDS_INPUT — this drift is pre-resolved by the ticket framing.
+
+**Implementation directives flowing into Phase 6:**
+
+- Pin the existing runner `--new` envelope behavior with a structural integration test (Phase 6b) that asserts `--new` invokes the default-provider REPL path. Do not replicate the standalone's strict-argv rejection on the runner side.
+- Update the runtime error string at `repl_default_provider.rs:51-56` to drop the `'agent'` half once the standalone crate is deleted; update the corresponding runtime test that pins the string.
+- Migrate the surviving service-construction parity assertions from `crates/oulipoly-agent-cli/tests/agent_new_parity.rs` into runtime-side tests so the assertion survives crate deletion.
+- The argv-rejection tests under `crates/oulipoly-agent-cli/tests/agent_rejects_extra_argv.rs` are obsolete with the binary; they do not need a runner-side equivalent.
+
+**Revisit when:** never — the divergence is eliminated by AGE-31 itself.
+
+## AGE-31 — Phase 6c implementation decisions (2026-05-08)
+
+**WU:** AGE-31 — fold REPL into `agents --new`; remove standalone `agent`
+binary.
+**Phase:** 6c code writer.
+
+**Decision 1 — standalone crate removed in favor of runner `--new`:**
+`crates/oulipoly-agent-cli/` is deleted, root workspace membership and
+default membership no longer include it, `Cargo.lock` no longer lists the
+package, and `.github/workflows/release.yml` no longer builds or releases
+`build-oulipoly-agent-cli`. The surviving artifact tools
+`agent-store`, `agent-scratchpad`, and `agent-messenger` remain unchanged.
+
+**Decision 2 — runtime/docs surface wording:** the missing
+`default_provider` runtime error now names only `--new`, and README documents
+top-level `--new` as the fresh default-provider interactive entrypoint beside
+top-level `--resume` as the existing-session counterpart. Existing
+`repl <model>` and `resume` subcommand docs remain intact.
+
+**Housekeeping note — structural segmentation pass-through resolved:** AGE-31
+piggy-backed the AGE-40 Decision 1 recommended fix by adding a leading `./`
+to the single backtick-wrapped
+`./risk/age-8-phase-8-process-tree-audit.report.md` reference. This was
+verified by first reproducing the pre-existing
+`structural_segmentation::no_dangling_doomed_dir_link_in_tracked_files`
+failure and then rerunning the target successfully.
+
+**Gate results:** `cargo fmt --check`, `cargo clippy --workspace
+--all-targets -- -D warnings`, and `cargo test --workspace` PASS. `bun
+install` failed on the known FontAwesome Pro packages from the public npm
+registry (`@fortawesome/sharp-regular-svg-icons` and
+`@fortawesome/sharp-solid-svg-icons` 404), so `bun run lint`, `bun run
+typecheck`, and `bun run test` were not runnable in this environment per the
+AGE-32 precedent.

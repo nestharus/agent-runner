@@ -209,50 +209,6 @@ jobs:
           name: ${{ matrix.target }}
           path: artifacts/*
 
-  build-oulipoly-agent-cli:
-    needs: version
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: macos-latest
-            target: aarch64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: agent-${{ matrix.target }}
-      - name: Install system deps (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
-      - name: Build agent CLI
-        run: cargo build --release --target ${{ matrix.target }} --bin agent -p oulipoly-agent-cli
-      - name: Collect agent artifact
-        if: runner.os != 'Windows'
-        run: |
-          mkdir -p artifacts
-          cp target/${{ matrix.target }}/release/agent artifacts/agent-${{ matrix.target }}
-      - name: Collect agent artifact (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path artifacts
-          Copy-Item target/${{ matrix.target }}/release/agent.exe artifacts/agent-${{ matrix.target }}.exe
-      - uses: actions/upload-artifact@v4
-        with:
-          name: agent-${{ matrix.target }}
-          path: artifacts/*
-
   build-oulipoly-agent-store:
     needs: version
     strategy:
@@ -371,7 +327,7 @@ jobs:
           path: artifacts/*
 
   release:
-    needs: [version, build, build-oulipoly-agent-cli, build-oulipoly-agent-store, build-oulipoly-agent-scratchpad, build-oulipoly-agent-messenger]
+    needs: [version, build, build-oulipoly-agent-store, build-oulipoly-agent-scratchpad, build-oulipoly-agent-messenger]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

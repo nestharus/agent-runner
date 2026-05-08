@@ -561,12 +561,10 @@ fn binary_workspace_members() -> Vec<String> {
             let manifest = parse_toml(&format!("../../{member_path}/Cargo.toml"));
             let has_bin = toml_table(&manifest, member_path).contains_key("bin");
             if has_bin {
-                Some(
-                    toml_value_at(&manifest, "package.name", &["package", "name"])
-                        .as_str()
-                        .unwrap_or_else(|| panic!("{member_path} package.name must be a string"))
-                        .to_string(),
-                )
+                let package_name = toml_value_at(&manifest, "package.name", &["package", "name"])
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{member_path} package.name must be a string"));
+                (package_name != "oulipoly-agent-cli").then(|| package_name.to_string())
             } else {
                 None
             }
@@ -1021,6 +1019,10 @@ fn assertion_a08_binary_clients_have_release_path() {
         release_jobs.contains("build"),
         "A8: release.yml must preserve the legacy build job for oulipoly-agent-runner"
     );
+    assert!(
+        !release_jobs.contains("build-oulipoly-agent-cli"),
+        "A8: release.yml must not keep the removed oulipoly-agent-cli release job"
+    );
 }
 
 #[test]
@@ -1091,7 +1093,6 @@ fn assertion_a10_dependency_graph_required_edges() {
         "rust-integration".to_string(),
         "version".to_string(),
         "build".to_string(),
-        "build-oulipoly-agent-cli".to_string(),
         "build-oulipoly-agent-store".to_string(),
         "build-oulipoly-agent-scratchpad".to_string(),
         "build-oulipoly-agent-messenger".to_string(),
@@ -1113,10 +1114,6 @@ fn assertion_a10_dependency_graph_required_edges() {
         ("version".to_string(), "build".to_string()),
         (
             "version".to_string(),
-            "build-oulipoly-agent-cli".to_string(),
-        ),
-        (
-            "version".to_string(),
             "build-oulipoly-agent-store".to_string(),
         ),
         (
@@ -1129,10 +1126,6 @@ fn assertion_a10_dependency_graph_required_edges() {
         ),
         ("version".to_string(), "release".to_string()),
         ("build".to_string(), "release".to_string()),
-        (
-            "build-oulipoly-agent-cli".to_string(),
-            "release".to_string(),
-        ),
         (
             "build-oulipoly-agent-store".to_string(),
             "release".to_string(),
@@ -1189,14 +1182,6 @@ fn assertion_a13_linux_apt_deps_preserved() {
 #[test]
 fn assertion_a14_standalone_binary_release_job_bodies() {
     let release = release_workflow();
-    assert_standalone_binary_release_job(
-        &release,
-        "build-oulipoly-agent-cli",
-        "oulipoly-agent-cli",
-        "agent",
-        "agent",
-        "A14",
-    );
     assert_standalone_binary_release_job(
         &release,
         "build-oulipoly-agent-store",
