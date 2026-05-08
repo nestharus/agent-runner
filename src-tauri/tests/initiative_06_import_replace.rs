@@ -7,6 +7,7 @@ use oulipoly_runtime::session_replace::{
     CanonicalRecord, CanonicalToProviderRenderer, ClaudeCodeRenderer, CodexSessionRenderer,
     ReplaceError, ReplaceReceipt, run_import_replace,
 };
+use oulipoly_state::CURRENT_SCHEMA_VERSION;
 use rusqlite::Connection;
 use std::fs;
 
@@ -944,7 +945,15 @@ fn t_non_text_chunk_without_text_rejects_without_mutation() {
 fn t_schema_incompatible_exit_14() {
     let fixture = ImportReplaceFixture::new();
     fs::create_dir_all(fixture.db_path().parent().unwrap()).unwrap();
-    Connection::open(fixture.db_path()).unwrap();
+    let conn = Connection::open(fixture.db_path()).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE unrelated_state_shape (
+            id INTEGER PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        INSERT INTO unrelated_state_shape (value) VALUES ('not an oulipoly state db');",
+    )
+    .unwrap();
     let before_db = fs::read(fixture.db_path()).unwrap();
     let input = canonical_jsonl(
         SESSION_A,
@@ -961,18 +970,17 @@ fn t_schema_incompatible_exit_14() {
     assert!(!fixture.replace_journal_dir().exists());
 }
 
-/// Risk: WU-15-01 schema preflight may miss the direct body column required by the DB write path.
+/// Risk: WU-15-01 schema preflight may miss a fail-closed state DB incompatibility.
 /// Level: component.
 /// Source: CodeRabbit R1-F02.
-/// Observable: exit 14 schema-incompatible before journal creation when session_turns.body is absent.
-/// Residual: relies on SQLite DROP COLUMN support from the bundled rusqlite version.
+/// Observable: exit 14 schema-incompatible before journal creation when the DB version is unsupported.
+/// Residual: does not exercise every migration-boundary incompatibility variant.
 #[test]
-fn t_schema_incompatible_missing_body_column_exit_14() {
+fn t_schema_incompatible_future_version_exit_14() {
     let fixture = ImportReplaceFixture::new();
-    let db = fixture.open_db();
-    drop(db);
+    fs::create_dir_all(fixture.db_path().parent().unwrap()).unwrap();
     let conn = Connection::open(fixture.db_path()).unwrap();
-    conn.execute("ALTER TABLE session_turns DROP COLUMN body", [])
+    conn.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION + 1)
         .unwrap();
     let before_db = fs::read(fixture.db_path()).unwrap();
     let input = canonical_jsonl(
@@ -987,8 +995,7 @@ fn t_schema_incompatible_missing_body_column_exit_14() {
     assert_eq!(output.status.code(), Some(14), "{output:?}");
     assert_json_error(&output, "schema-incompatible");
     assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("missing required column session_turns.body"),
+        String::from_utf8_lossy(&output.stderr).contains("run `agents migrate --rebuild`"),
         "{output:?}"
     );
     assert_eq!(fs::read(fixture.db_path()).unwrap(), before_db);

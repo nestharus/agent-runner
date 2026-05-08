@@ -1,11 +1,9 @@
+use crate::schema::{CURRENT_SCHEMA_VERSION, MINIMUM_SUPPORTED_SCHEMA_VERSION};
 use crate::{ReadOnlyOpenError, StateDb};
 use rusqlite::Connection;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
-pub const MINIMUM_SUPPORTED_SCHEMA_VERSION: u32 = 3;
 
 pub type FeatureMap = BTreeMap<String, bool>;
 
@@ -34,6 +32,7 @@ pub struct StateDbReport {
     pub current_schema_version: u32,
     pub minimum_supported_schema_version: u32,
     pub compatible: bool,
+    pub migratable: bool,
     pub tables: BTreeMap<String, bool>,
     pub required_columns: BTreeMap<String, BTreeMap<String, bool>>,
     pub required_indexes: BTreeMap<String, BTreeMap<String, bool>>,
@@ -81,9 +80,10 @@ pub fn missing_report(path: PathBuf) -> SchemaProbeReport {
         exists: false,
         schema_version: 0,
         user_version: 0,
-        current_schema_version: CURRENT_SCHEMA_VERSION,
-        minimum_supported_schema_version: MINIMUM_SUPPORTED_SCHEMA_VERSION,
+        current_schema_version: CURRENT_SCHEMA_VERSION as u32,
+        minimum_supported_schema_version: MINIMUM_SUPPORTED_SCHEMA_VERSION as u32,
         compatible: false,
+        migratable: false,
         tables: required_table_map(false),
         required_columns: required_column_map(None)
             .expect("missing report does not inspect columns"),
@@ -94,7 +94,7 @@ pub fn missing_report(path: PathBuf) -> SchemaProbeReport {
 
 pub fn inspect_schema(conn: &Connection, path: PathBuf) -> Result<StateDbReport, String> {
     let user_version = conn
-        .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
         .map_err(|e| format!("Failed to read PRAGMA user_version: {e}"))?;
 
     let mut stmt = conn
@@ -131,7 +131,11 @@ pub fn inspect_schema(conn: &Connection, path: PathBuf) -> Result<StateDbReport,
     let required_columns = required_column_map(Some(conn))?;
     let required_indexes = required_index_map(Some(conn))?;
 
-    let compatible = (MINIMUM_SUPPORTED_SCHEMA_VERSION..=CURRENT_SCHEMA_VERSION)
+    let has_required_shape = all_values(&tables)
+        && all_nested_values(&required_columns)
+        && all_nested_values(&required_indexes);
+    let compatible = user_version == CURRENT_SCHEMA_VERSION && has_required_shape;
+    let migratable = (MINIMUM_SUPPORTED_SCHEMA_VERSION..CURRENT_SCHEMA_VERSION)
         .contains(&user_version)
         && all_values(&tables)
         && all_nested_values(&required_columns)
@@ -140,11 +144,12 @@ pub fn inspect_schema(conn: &Connection, path: PathBuf) -> Result<StateDbReport,
     Ok(StateDbReport {
         path,
         exists: true,
-        schema_version: user_version,
-        user_version,
-        current_schema_version: CURRENT_SCHEMA_VERSION,
-        minimum_supported_schema_version: MINIMUM_SUPPORTED_SCHEMA_VERSION,
+        schema_version: user_version as u32,
+        user_version: user_version as u32,
+        current_schema_version: CURRENT_SCHEMA_VERSION as u32,
+        minimum_supported_schema_version: MINIMUM_SUPPORTED_SCHEMA_VERSION as u32,
         compatible,
+        migratable,
         tables,
         required_columns,
         required_indexes,

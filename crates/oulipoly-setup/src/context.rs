@@ -196,9 +196,10 @@ mod tests {
             "interactive_args = [\"exec\", \"--dangerously-bypass-approvals-and-sandbox\"]"
         ));
         assert!(prompt.contains("name = \"codex\""));
-        assert!(prompt.contains(
-            "args = [\"-m\", \"gpt-5.5\", \"-c\", \"model_reasoning_effort=high\"]"
-        ));
+        assert!(
+            prompt
+                .contains("args = [\"-m\", \"gpt-5.5\", \"-c\", \"model_reasoning_effort=high\"]")
+        );
     }
 
     #[test]

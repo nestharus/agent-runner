@@ -557,7 +557,6 @@ The NES-262 fix touches only `.github/workflows/release.yml` (CI workflow) and `
 **Decision 2 — orthogonal A08 baseline failure (originally documented when NES-262 was pending):** During Phase 6c implementation on the un-rebased branch, the orthogonal A08 failure on `oulipoly-agent-cli` was observed and documented as NES-262 territory. NES-262 (#50) merged on 2026-05-07; the rebase onto current `main` brought in the `build-oulipoly-agent-cli` release-path job and associated A10 entries. After rebase + this WU's extension, A08 passes for both `oulipoly-agent-cli` and `oulipoly-agent-store`.
 **Evidence:** `cargo test -p oulipoly-agent-runner --test workflow_yml_contract` runs all 13 assertions green post-rebase.
 
-
 ## D-AGE-8-Phase-2.5 — drift and bug discoveries: file separately, AGE-8 proceeds
 
 - **Source**: AGE-8 Phase 2.5 — duplicate-systems inventory (Step 2.5.4) and characterization-test-writer bug discovery (Step 2.5.1).
@@ -622,7 +621,6 @@ The Phase 8 justification gate flagged this as an unjustified scope-creep change
 - **Mechanism**: phase-4 + phase-8 join manifests record verdicts and sha256; both re-verify clean against on-disk files. The Phase 9 PR body notes the halt-resume context for transparency.
 - **Revisit when**: never — this aligns with the user's automation preferences for owned projects.
 
-
 ## AGE-27 — Phase 6c implementation decisions (2026-05-08)
 
 **WU:** AGE-27 — diagnostics effective provider.
@@ -639,3 +637,15 @@ The Phase 8 justification gate flagged this as an unjustified scope-creep change
 **Decision 5 — frontend gates unavailable in this environment:** `bun install` cannot resolve `@fortawesome/sharp-regular-svg-icons` or `@fortawesome/sharp-solid-svg-icons` from the public npm registry (`404`). With no `node_modules`, `bun run lint`, `bun run typecheck`, and `bun run test` fail before running because `biome`, `tsc`, and `vitest` are not installed. AGE-27 changed only Rust/fixture/decision files.
 
 **Decision 6 — rebase onto post-AGE-8-00 main (2026-05-08):** AGE-8 Phase 1 (DI/services/repositories foundation, commit 9451c75) and NES-259 (commit a36ebd4) merged to main while AGE-27 was in flight. AGE-27 rebases onto the new main; AGE-8-00's diagnostics/executor/main.rs additions did NOT fix the bypass (verified by inspecting `crates/oulipoly-runtime/src/diagnostics/mod.rs:72` and `src-tauri/src/lib.rs:501` on origin/main — both still call raw `executor::execute`), so AGE-27's work remains relevant. The AGE-8 characterization test `failed_one_shot_loads_app_config_invokes_diagnostic_model_and_persists_category` is now unignored alongside AGE-27's dedicated regression test in `src-tauri/tests/age27_diagnostics_effective_provider.rs`.
+
+## AGE-32 — Phase 6c bun gates skipped (procedural)
+
+**WU:** AGE-32 — state DB schema migrations + MemoryGraph/session_replace consolidation.
+**Phase:** 6c gate verification.
+
+**Decision — skip `bun run lint`/`typecheck`/`test`:** No TypeScript, JavaScript, or frontend asset files were modified by AGE-32. The diff is Rust-only (plus `AGENTS.md`, `README.md`). `bun install` cannot complete in this worktree because the FontAwesome Pro packages (`@fortawesome/sharp-regular-svg-icons`, `@fortawesome/sharp-solid-svg-icons`) require registry/auth not present, but the IPC shapes and Tauri command surface are unchanged per the AGE-32 contract § 9. The bun gates are therefore N/A for this WU's diff. Skipping is treated as a procedural NEEDS_INPUT resolved by the orchestrator (no TS files touched → no value-question to escalate).
+**Evidence:**
+- `git diff --stat HEAD` → no `*.ts`, `*.tsx`, `*.js`, `*.json` (other than `Cargo.lock`) entries.
+- AGE-32 contract § 9 (no IPC shape change).
+- `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` all PASS (755 passed, 0 failed, 1 ignored).
+**Revisit when:** A future WU adds frontend changes; restore bun gates and resolve the FontAwesome registry/auth issue before that PR can ship.

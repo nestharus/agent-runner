@@ -91,6 +91,15 @@ fn load_providers_for_models_dir(models_dir: &Path) -> config::ProvidersConfig {
     config::ProvidersConfig::load(&config_root.join("providers.toml")).unwrap_or_default()
 }
 
+impl AppState {
+    fn db_path(&self) -> PathBuf {
+        self.models_dir
+            .parent()
+            .unwrap_or(&self.models_dir)
+            .join("state.db")
+    }
+}
+
 #[tauri::command]
 fn check_setup_needed(state: tauri::State<AppState>) -> Result<bool, String> {
     let models = state.models.lock().map_err(|e| e.to_string())?;
@@ -569,12 +578,7 @@ pub fn effective_provider_for_model_provider(
 
 /// Helper to open the state DB from AppState.
 fn open_state_db(state: &AppState) -> Result<StateDb, String> {
-    let db_path = state
-        .models_dir
-        .parent()
-        .unwrap_or(&state.models_dir)
-        .join("state.db");
-    StateDb::open(&db_path)
+    StateDb::open(&state.db_path())
 }
 
 #[tauri::command]

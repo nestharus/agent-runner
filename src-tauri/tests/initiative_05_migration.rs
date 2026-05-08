@@ -1599,6 +1599,7 @@ fn seed_pre_backfill_db(path: &Path) {
             turn_id TEXT NOT NULL,
             timestamp TEXT NOT NULL,
             role TEXT NOT NULL,
+            parent_turn_id TEXT,
             source_file TEXT NOT NULL,
             ingested_at TEXT NOT NULL,
             UNIQUE (provider_name, session_id, turn_id)
@@ -1620,6 +1621,54 @@ fn seed_pre_backfill_db(path: &Path) {
             resume_acceptance_evidence TEXT,
             created_at TEXT NOT NULL,
             finished_at TEXT
+        );
+        CREATE TABLE providers (
+            model_name TEXT NOT NULL,
+            provider_name TEXT NOT NULL,
+            invocation_count INTEGER NOT NULL DEFAULT 0,
+            error_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            last_error_at TEXT,
+            last_invoked_at TEXT,
+            PRIMARY KEY (model_name, provider_name)
+        );
+        CREATE TABLE provider_quotas (
+            provider_name TEXT PRIMARY KEY,
+            used_percent REAL NOT NULL DEFAULT 0,
+            resets_at TEXT,
+            calls_since_refresh INTEGER NOT NULL DEFAULT 0,
+            refreshed_at TEXT,
+            last_empty_refresh_at TEXT,
+            exhausted_at TEXT NULL,
+            topology_peak_live_window_count INTEGER NOT NULL DEFAULT 0,
+            last_topology_probe_at TEXT
+        );
+        CREATE TABLE provider_quota_windows (
+            provider_name TEXT NOT NULL,
+            window_id INTEGER NOT NULL,
+            used_percent REAL NOT NULL DEFAULT 0,
+            resets_at TEXT NOT NULL,
+            last_delta_percent REAL,
+            last_delta_calls INTEGER,
+            PRIMARY KEY (provider_name, window_id)
+        );
+        CREATE TABLE session_chains (
+            chain_id TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            last_used_at TEXT NOT NULL,
+            model_name TEXT NOT NULL
+        );
+        CREATE TABLE session_chain_segments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chain_id TEXT NOT NULL REFERENCES session_chains(chain_id),
+            provider_name TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            ended_at TEXT,
+            last_turn_id TEXT,
+            transition_reason TEXT NOT NULL CHECK (transition_reason IN
+                ('initial', 'manual', 'quota_threshold', 'exhausted', 'imported')),
+            UNIQUE(chain_id, provider_name, session_id)
         );",
     )
     .unwrap();
@@ -1628,6 +1677,22 @@ fn seed_pre_backfill_db(path: &Path) {
             (provider_name, session_id, turn_id, timestamp, role, source_file, ingested_at)
          VALUES ('claude', ?1, 't1', '2026-04-17T08:00:00Z', 'assistant', '', '2026-04-17T08:00:00Z')",
         params![SESSION_A],
+    )
+    .unwrap();
+}
+
+fn seed_current_backfill_failure_db(path: &Path) {
+    seed_pre_backfill_db(path);
+    StateDb::open(path).unwrap();
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch(
+        "DELETE FROM session_chain_segments;
+        DELETE FROM session_chains;
+        CREATE TRIGGER fail_session_chain_backfill
+        BEFORE INSERT ON session_chains
+        BEGIN
+            SELECT RAISE(FAIL, 'forced session chain backfill failure');
+        END;",
     )
     .unwrap();
 }
@@ -1691,11 +1756,7 @@ fn migrate_db_command_reports_open_error() {
 #[test]
 fn startup_refuses_chain_ops_on_backfill_failure() {
     let fixture = Fixture::new();
-    seed_pre_backfill_db(&fixture.db_path());
-    let db_file = fixture.db_path();
-    let mut perms = fs::metadata(&db_file).unwrap().permissions();
-    perms.set_mode(0o444);
-    fs::set_permissions(&db_file, perms).unwrap();
+    seed_current_backfill_failure_db(&fixture.db_path());
 
     let output = fixture
         .command()

@@ -122,9 +122,10 @@ fn parse_single_invocation(stderr: &str) -> CompositeInvocationId {
     invocations.into_iter().next().unwrap()
 }
 
-// Characterization test for AGE-8 — pins current behavior of run_with_balancing in-memory StateDb::open_default fallback.
+// Characterization test for AGE-8 updated by AGE-32/TI-13 — run_with_balancing must fail closed
+// when the persistent state DB cannot open instead of falling back to in-memory state.
 #[test]
-fn one_shot_continues_with_in_memory_state_when_default_state_db_cannot_open() {
+fn one_shot_fails_closed_when_default_state_db_cannot_open() {
     let fixture = Fixture::new();
     let blocked_data_home = fixture._dir.path().join("blocked-data-home");
     fs::write(&blocked_data_home, "not a directory").unwrap();
@@ -139,21 +140,25 @@ fn one_shot_continues_with_in_memory_state_when_default_state_db_cannot_open() {
 
     let output = cmd.output().unwrap();
 
-    assert!(output.status.success(), "{output:?}");
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "fixture-ok\n");
+    assert!(!output.status.success(), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Warning: Could not open state DB"),
+        stderr.contains("Failed to create state directory"),
         "{stderr}"
     );
-    assert_eq!(parse_invocations(&stderr).len(), 1, "{stderr}");
     assert!(
-        !stderr.contains("[session]"),
-        "fallback run should not emit a session line without session capture: {stderr}"
+        stderr.contains("Not a directory"),
+        "state DB open failure should preserve actionable OS cause: {stderr}"
     );
+    assert_eq!(parse_invocations(&stderr).len(), 0, "{stderr}");
     assert!(
         !blocked_data_home.join("oulipoly-agent-runner").exists(),
-        "fallback should not create durable state below the blocked data-home path"
+        "failed run should not create durable state below the blocked data-home path"
+    );
+    assert!(
+        !fixture.prompt_dump.exists(),
+        "provider must not execute after state DB open failure"
     );
 }
 

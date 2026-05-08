@@ -21,6 +21,7 @@ use oulipoly_state::{
 
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
+use std::fs;
 use std::io::{BufRead, IsTerminal, Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -183,6 +184,12 @@ enum Subcommands {
     ResumeList { uuid: String },
     /// Run chain-table backfill explicitly.
     MigrateDb,
+    /// Recover from an unusable state DB by backing it up and creating a fresh one.
+    Migrate {
+        /// Back up state.db and sidecars, then create a fresh current schema DB.
+        #[arg(long)]
+        rebuild: bool,
+    },
     /// Move runtime provider config from model TOMLs into providers.toml. Idempotent - safe to re-run if a previous run left empty args.
     MigrateConfig {
         /// Override models directory.
@@ -415,6 +422,7 @@ fn run(cli: Cli) -> Result<i32, String> {
             },
             Subcommands::ResumeList { uuid } => run_resume_list(&uuid),
             Subcommands::MigrateDb => run_migrate_db(),
+            Subcommands::Migrate { rebuild } => run_migrate(rebuild),
             Subcommands::MigrateConfig { models_dir } => run_migrate_config(models_dir.as_deref()),
         };
     }
@@ -2005,10 +2013,7 @@ fn run_with_balancing(
     working_dir: Option<&Path>,
     extra_inputs: &HashMap<String, Vec<String>>,
 ) -> Result<i32, String> {
-    let state = StateDb::open_default().unwrap_or_else(|e| {
-        eprintln!("Warning: Could not open state DB ({e}), running without state tracking.");
-        StateDb::open(std::path::Path::new(":memory:")).unwrap()
-    });
+    let state = StateDb::open_default()?;
 
     // Load providers.toml from the same config dir as models; quota refresh
     // only runs when actual load-balancing is possible (n > 1 providers).
@@ -2281,6 +2286,92 @@ fn run_migrate_db() -> Result<i32, String> {
         compaction_report.turns_flagged, compaction_report.sessions_processed
     );
     Ok(0)
+}
+
+fn run_migrate(rebuild: bool) -> Result<i32, String> {
+    if !rebuild {
+        return Err("missing required flag: --rebuild".to_string());
+    }
+    run_migrate_rebuild()
+}
+
+fn run_migrate_rebuild() -> Result<i32, String> {
+    let db_path = StateDb::default_path()?;
+    if !db_path.exists() {
+        println!("no state.db to rebuild at {}", db_path.display());
+        return Ok(0);
+    }
+
+    let data_dir = db_path
+        .parent()
+        .ok_or_else(|| format!("state DB path has no parent: {}", db_path.display()))?;
+    let backup_root = data_dir.join("state-backups");
+    fs::create_dir_all(&backup_root)
+        .map_err(|e| format!("failed to create backup directory: {e}"))?;
+    let backup_dir = unique_backup_dir(&backup_root)?;
+    fs::create_dir(&backup_dir).map_err(|e| {
+        format!(
+            "failed to create backup directory {}: {e}",
+            backup_dir.display()
+        )
+    })?;
+
+    let sidecars = [
+        db_path.clone(),
+        PathBuf::from(format!("{}-wal", db_path.display())),
+        PathBuf::from(format!("{}-shm", db_path.display())),
+    ];
+    for source in &sidecars {
+        if source.exists() {
+            let file_name = source
+                .file_name()
+                .ok_or_else(|| format!("backup source has no file name: {}", source.display()))?;
+            fs::copy(source, backup_dir.join(file_name)).map_err(|e| {
+                format!(
+                    "failed to back up {} to {}: {e}",
+                    source.display(),
+                    backup_dir.display()
+                )
+            })?;
+        }
+    }
+
+    for source in &sidecars {
+        if source.exists() {
+            fs::remove_file(source)
+                .map_err(|e| format!("failed to remove live {}: {e}", source.display()))?;
+        }
+    }
+
+    let fresh = StateDb::open(&db_path)?;
+    drop(fresh);
+    println!("backup: {}", backup_dir.display());
+    println!("fresh state DB: {}", db_path.display());
+    println!(
+        "historical state was not preserved in the live DB; backup is at {}",
+        backup_dir.display()
+    );
+    Ok(0)
+}
+
+fn unique_backup_dir(root: &Path) -> Result<PathBuf, String> {
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.fZ");
+    let base = format!("{}-pid{}", stamp, std::process::id());
+    for suffix in 0..1000 {
+        let name = if suffix == 0 {
+            base.clone()
+        } else {
+            format!("{base}-{suffix}")
+        };
+        let candidate = root.join(name);
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(format!(
+        "failed to allocate unique backup directory under {}",
+        root.display()
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq)]

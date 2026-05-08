@@ -1,8 +1,12 @@
+use crate::migrations;
+use crate::schema::{
+    CURRENT_SCHEMA_VERSION, MINIMUM_SUPPORTED_SCHEMA_VERSION, SchemaCompatibility,
+};
 use chrono::{DateTime, Utc};
 use oulipoly_agent_messenger::ReturnedArtifactRef;
 use oulipoly_config::{ModelConfig, load_models};
 use oulipoly_core::TransitionReason;
-use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -612,162 +616,61 @@ impl StateDb {
         let mut conn =
             Connection::open(path).map_err(|e| format!("Failed to open state DB: {e}"))?;
 
-        conn.execute_batch("PRAGMA journal_mode=WAL;")
-            .map_err(|e| format!("Failed to set WAL mode: {e}; run `agents migrate-db` first"))?;
+        let compatibility = migrations::classify(&conn)?;
+        match compatibility {
+            SchemaCompatibility::Fresh => {
+                Self::set_wal_mode(&conn)?;
+                let plan = migrations::current_plan_from(0).map_err(|e| e.to_string())?;
+                migrations::run_with_db_path(&mut conn, &plan, path.to_path_buf())
+                    .map_err(|e| e.to_string())?;
+            }
+            SchemaCompatibility::Current { .. } => {
+                Self::set_wal_mode(&conn)?;
+            }
+            SchemaCompatibility::Migratable { stored } => {
+                Self::set_wal_mode(&conn)?;
+                let plan = migrations::current_plan_from(stored).map_err(|e| e.to_string())?;
+                migrations::run_with_db_path(&mut conn, &plan, path.to_path_buf())
+                    .map_err(|e| e.to_string())?;
+            }
+            SchemaCompatibility::LegacyVersionless => {
+                if migrations::classify_versionless(&conn)?.is_none() {
+                    return Err(migrations::MigrationError::UnrecognizedShape {
+                        db_path: path.to_path_buf(),
+                    }
+                    .to_string());
+                }
+                Self::set_wal_mode(&conn)?;
+                let plan = migrations::current_plan_from(MINIMUM_SUPPORTED_SCHEMA_VERSION)
+                    .map_err(|e| e.to_string())?;
+                migrations::run_with_db_path(&mut conn, &plan, path.to_path_buf())
+                    .map_err(|e| e.to_string())?;
+            }
+            SchemaCompatibility::Future { stored } => {
+                return Err(migrations::MigrationError::Incompatible {
+                    db_path: path.to_path_buf(),
+                    stored,
+                    current: CURRENT_SCHEMA_VERSION,
+                }
+                .to_string());
+            }
+            SchemaCompatibility::UnrecognizedVersionless => {
+                return Err(migrations::MigrationError::UnrecognizedShape {
+                    db_path: path.to_path_buf(),
+                }
+                .to_string());
+            }
+            SchemaCompatibility::Corrupt { reason } => {
+                return Err(format!(
+                    "Corrupt schema ({reason}); run `agents migrate --rebuild`. db={}",
+                    path.display()
+                ));
+            }
+        }
+
         Self::validate_providers_schema(&conn)?;
         Self::ensure_invocations_schema(&conn)?;
         Self::ensure_providers_schema(&mut conn)?;
-
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS provider_quotas (
-                provider_name TEXT PRIMARY KEY,
-                used_percent REAL NOT NULL DEFAULT 0,
-                resets_at TEXT,
-                calls_since_refresh INTEGER NOT NULL DEFAULT 0,
-                refreshed_at TEXT,
-                last_empty_refresh_at TEXT,
-                exhausted_at TEXT NULL,
-                topology_peak_live_window_count INTEGER NOT NULL DEFAULT 0,
-                last_topology_probe_at TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS provider_quota_windows (
-                provider_name TEXT NOT NULL,
-                window_id INTEGER NOT NULL,
-                used_percent REAL NOT NULL DEFAULT 0,
-                resets_at TEXT NOT NULL,
-                last_delta_percent REAL,
-                last_delta_calls INTEGER,
-                PRIMARY KEY (provider_name, window_id)
-            );
-
-            -- Migrate pre-multi-window rows: any provider_quotas row with a
-            -- resets_at that doesn't yet have a window becomes window 0.
-            INSERT OR IGNORE INTO provider_quota_windows (provider_name, window_id, used_percent, resets_at)
-            SELECT provider_name, 0, used_percent, resets_at
-            FROM provider_quotas
-            WHERE resets_at IS NOT NULL;
-
-            CREATE TABLE IF NOT EXISTS memory_nodes (
-                id TEXT PRIMARY KEY,
-                node_type TEXT NOT NULL,
-                label TEXT NOT NULL,
-                data TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS memory_edges (
-                source_id TEXT NOT NULL REFERENCES memory_nodes(id),
-                target_id TEXT NOT NULL REFERENCES memory_nodes(id),
-                edge_type TEXT NOT NULL,
-                data TEXT,
-                created_at TEXT NOT NULL,
-                PRIMARY KEY (source_id, target_id, edge_type)
-            );
-
-            CREATE TABLE IF NOT EXISTS setup_sessions (
-                id TEXT PRIMARY KEY,
-                started_at TEXT NOT NULL,
-                ended_at TEXT,
-                outcome TEXT,
-                turn_count INTEGER DEFAULT 0
-            );
-
-            CREATE TABLE IF NOT EXISTS setup_turns (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                turn_number INTEGER NOT NULL,
-                agent_prompt TEXT NOT NULL,
-                agent_response TEXT NOT NULL,
-                events_emitted TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS cli_providers (
-                cli_name TEXT PRIMARY KEY,
-                display_name TEXT NOT NULL,
-                installed INTEGER NOT NULL DEFAULT 0,
-                version TEXT,
-                config_dir TEXT,
-                last_synced TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS accounts (
-                id TEXT NOT NULL,
-                provider TEXT NOT NULL REFERENCES cli_providers(cli_name),
-                profile_name TEXT NOT NULL,
-                auth_method TEXT NOT NULL,
-                auth_status TEXT NOT NULL DEFAULT 'unknown',
-                created_at TEXT NOT NULL,
-                PRIMARY KEY (id, provider)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_accounts_provider
-                ON accounts (provider);
-
-            CREATE TABLE IF NOT EXISTS discovered_models (
-                canonical_name TEXT NOT NULL,
-                provider TEXT NOT NULL,
-                discovered_at TEXT NOT NULL,
-                cli_version TEXT NOT NULL,
-                PRIMARY KEY (canonical_name, provider)
-            );
-
-            CREATE TABLE IF NOT EXISTS model_parameters (
-                model_name TEXT NOT NULL,
-                provider TEXT NOT NULL,
-                name TEXT NOT NULL,
-                display_name TEXT NOT NULL,
-                param_type TEXT NOT NULL,
-                description TEXT NOT NULL DEFAULT '',
-                cli_mapping TEXT NOT NULL,
-                PRIMARY KEY (model_name, provider, name)
-            );
-
-            CREATE TABLE IF NOT EXISTS session_turns (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                provider_name TEXT NOT NULL,
-                session_id TEXT NOT NULL,
-                turn_id TEXT NOT NULL,
-                timestamp TEXT NOT NULL,
-                role TEXT NOT NULL,
-                parent_turn_id TEXT,
-                is_sidechain INTEGER NOT NULL DEFAULT 0,
-                is_compaction_boundary INTEGER NOT NULL DEFAULT 0,
-                source_file TEXT NOT NULL,
-                ingested_at TEXT NOT NULL,
-                body TEXT,
-                UNIQUE (provider_name, session_id, turn_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS session_chains (
-                chain_id TEXT PRIMARY KEY,
-                created_at TEXT NOT NULL,
-                last_used_at TEXT NOT NULL,
-                model_name TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS session_chain_segments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chain_id TEXT NOT NULL REFERENCES session_chains(chain_id),
-                provider_name TEXT NOT NULL,
-                session_id TEXT NOT NULL,
-                started_at TEXT NOT NULL,
-                ended_at TEXT,
-                last_turn_id TEXT,
-                transition_reason TEXT NOT NULL CHECK (transition_reason IN
-                    ('initial', 'manual', 'quota_threshold', 'exhausted', 'imported')),
-                UNIQUE(chain_id, provider_name, session_id)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_segments_session
-                ON session_chain_segments(session_id);
-            CREATE INDEX IF NOT EXISTS idx_segments_chain_active
-                ON session_chain_segments(chain_id, ended_at);
-            ",
-        )
-        .map_err(|e| format!("Failed to initialize schema: {e}"))?;
         Self::ensure_provider_quotas_schema(&conn)?;
         Self::ensure_provider_quotas_topology_schema(&conn)?;
         Self::ensure_provider_quota_windows_schema(&conn)?;
@@ -816,6 +719,10 @@ impl StateDb {
         Self::open(&db_path)
     }
 
+    pub fn open_for_memory(path: impl AsRef<Path>) -> Result<Self, String> {
+        Self::open(path.as_ref())
+    }
+
     pub fn default_path() -> Result<PathBuf, String> {
         let data_dir =
             dirs::data_dir().ok_or_else(|| "Could not determine data directory".to_string())?;
@@ -826,6 +733,31 @@ impl StateDb {
         &self.conn
     }
 
+    fn set_wal_mode(conn: &Connection) -> Result<(), String> {
+        conn.execute_batch("PRAGMA journal_mode=WAL;")
+            .map_err(|e| format!("Failed to set WAL mode: {e}; run `agents migrate --rebuild`"))
+    }
+
+    pub fn with_write_txn<R, F>(&mut self, f: F) -> Result<R, String>
+    where
+        F: FnOnce(&mut Transaction<'_>) -> Result<R, String>,
+    {
+        let mut tx = self
+            .conn
+            .transaction()
+            .map_err(|e| format!("Failed to begin state DB transaction: {e}"))?;
+        match f(&mut tx) {
+            Ok(value) => {
+                tx.commit()
+                    .map_err(|e| format!("Failed to commit state DB transaction: {e}"))?;
+                Ok(value)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    // Legacy repair allow-list only. Durable schema changes belong in
+    // crates/oulipoly-state/migrations/ and schema.rs owns the version.
     fn ensure_invocations_schema(conn: &Connection) -> Result<(), String> {
         let columns = Self::invocations_columns(conn)?;
         if columns.is_empty() {
@@ -3766,8 +3698,96 @@ mod tests {
     use tempfile::TempDir;
     use uuid::Uuid;
 
+    mod failing_migration {
+        include!("../tests/fixtures/failing_migration.rs");
+    }
+
     fn test_db() -> StateDb {
         StateDb::open(Path::new(":memory:")).unwrap()
+    }
+
+    fn mark_current_schema_version(conn: &Connection) {
+        seed_current_drift_required_tables(conn);
+        conn.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)
+            .unwrap();
+    }
+
+    fn seed_current_drift_required_tables(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS invocations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                invocation_uuid TEXT NOT NULL UNIQUE,
+                model_name TEXT NOT NULL,
+                provider_name TEXT,
+                provider_index INTEGER NOT NULL,
+                parent_invocation_id INTEGER REFERENCES invocations(id),
+                status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'legacy')),
+                success INTEGER,
+                exit_code INTEGER,
+                error_category TEXT,
+                terminal_reason TEXT,
+                session_id TEXT,
+                session_capture_method TEXT,
+                resume_acceptance_status TEXT,
+                resume_acceptance_evidence TEXT,
+                created_at TEXT NOT NULL,
+                finished_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS provider_quotas (
+                provider_name TEXT PRIMARY KEY,
+                used_percent REAL NOT NULL DEFAULT 0,
+                resets_at TEXT,
+                calls_since_refresh INTEGER NOT NULL DEFAULT 0,
+                refreshed_at TEXT,
+                last_empty_refresh_at TEXT,
+                exhausted_at TEXT NULL,
+                topology_peak_live_window_count INTEGER NOT NULL DEFAULT 0,
+                last_topology_probe_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS provider_quota_windows (
+                provider_name TEXT NOT NULL,
+                window_id INTEGER NOT NULL,
+                used_percent REAL NOT NULL DEFAULT 0,
+                resets_at TEXT NOT NULL,
+                last_delta_percent REAL,
+                last_delta_calls INTEGER,
+                PRIMARY KEY (provider_name, window_id)
+            );
+            CREATE TABLE IF NOT EXISTS session_turns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider_name TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                turn_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                role TEXT NOT NULL,
+                parent_turn_id TEXT,
+                is_sidechain INTEGER NOT NULL DEFAULT 0,
+                is_compaction_boundary INTEGER NOT NULL DEFAULT 0,
+                source_file TEXT NOT NULL,
+                ingested_at TEXT NOT NULL,
+                body TEXT,
+                UNIQUE (provider_name, session_id, turn_id)
+            );
+            CREATE TABLE IF NOT EXISTS session_chains (
+                chain_id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                last_used_at TEXT NOT NULL,
+                model_name TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS session_chain_segments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chain_id TEXT NOT NULL REFERENCES session_chains(chain_id),
+                provider_name TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                last_turn_id TEXT,
+                transition_reason TEXT NOT NULL CHECK (transition_reason IN
+                    ('initial', 'manual', 'quota_threshold', 'exhausted', 'imported')),
+                UNIQUE(chain_id, provider_name, session_id)
+            );",
+        )
+        .unwrap();
     }
 
     fn db_without_table(table: &str) -> StateDb {
@@ -4020,6 +4040,7 @@ mod tests {
             )
             .unwrap();
         }
+        mark_current_schema_version(&conn);
         dir
     }
 
@@ -4094,6 +4115,7 @@ mod tests {
             )
             .unwrap();
         }
+        mark_current_schema_version(&conn);
         dir
     }
 
@@ -4260,6 +4282,7 @@ mod tests {
             params![Uuid::new_v4().to_string()],
         )
         .unwrap();
+        mark_current_schema_version(&conn);
         dir
     }
 
@@ -4290,6 +4313,7 @@ mod tests {
             );",
         )
         .unwrap();
+        mark_current_schema_version(&conn);
         dir
     }
 
@@ -4312,6 +4336,7 @@ mod tests {
             );",
         )
         .unwrap();
+        mark_current_schema_version(&conn);
         dir
     }
 
@@ -4421,6 +4446,7 @@ mod tests {
             );",
         )
         .unwrap();
+        mark_current_schema_version(&conn);
         dir
     }
 
@@ -4553,6 +4579,7 @@ mod tests {
             );",
         )
         .unwrap();
+        mark_current_schema_version(&conn);
         drop(conn);
 
         let db = StateDb::open(&path).unwrap();
@@ -4742,6 +4769,7 @@ mod tests {
                    FROM providers_source;",
         )
         .unwrap();
+        mark_current_schema_version(&conn);
         drop(conn);
 
         let err = match StateDb::open(&path) {
@@ -4792,6 +4820,7 @@ mod tests {
              );",
         )
         .unwrap();
+        mark_current_schema_version(&conn);
         drop(conn);
 
         let err = match StateDb::open(&path) {
@@ -4992,6 +5021,7 @@ mod tests {
             );",
         )
         .unwrap();
+        mark_current_schema_version(&conn);
         drop(conn);
 
         let db = StateDb::open(&path).unwrap();
@@ -5469,6 +5499,7 @@ name = "fixture-provider"
                 ('p', 1, 0.30, '2026-04-28T00:00:00Z');",
         )
         .unwrap();
+        mark_current_schema_version(&conn);
         drop(conn);
 
         let db = StateDb::open(&path).unwrap();
@@ -5548,6 +5579,7 @@ name = "fixture-provider"
                 ('already-high', 0, 0.20, '2026-04-22T00:00:00Z');",
         )
         .unwrap();
+        mark_current_schema_version(&conn);
         drop(conn);
 
         let db = StateDb::open(&path).unwrap();
@@ -7345,6 +7377,7 @@ interactive_args = ["launch"]
             )
             .unwrap();
         }
+        mark_current_schema_version(&conn);
         dir
     }
 
@@ -7893,5 +7926,75 @@ interactive_args = ["launch"]
             )
             .unwrap();
         assert_eq!(active, 0);
+    }
+
+    // TI-04, TI-12, TI-24: ordered migration steps must fail with actionable
+    // rebuild guidance and roll back both schema effects and user_version.
+    #[test]
+    fn ti_04_ti_12_ti_24_ordered_migration_failure_rolls_back_and_reports_rebuild() {
+        use crate::migrations::{self, Migration, MigrationError};
+
+        let (target_version, id, sql) = failing_migration::failing_migration_parts();
+        let failing = Migration {
+            target_version,
+            id,
+            sql,
+        };
+
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("state.db");
+        let mut conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            PRAGMA user_version = 3;
+            CREATE TABLE preserved_rows (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO preserved_rows (id, value) VALUES (1, 'before');
+            ",
+        )
+        .unwrap();
+
+        let err =
+            migrations::run_with_db_path(&mut conn, &[&failing], db_path.clone()).unwrap_err();
+        let message = err.to_string();
+
+        assert!(
+            message.contains(failing_migration::FAILING_MIGRATION_ID),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!(
+                "target_version={}",
+                failing_migration::FAILING_MIGRATION_TARGET_VERSION
+            )),
+            "{message}"
+        );
+        assert!(message.contains("agents migrate --rebuild"), "{message}");
+        assert!(
+            message.contains(&format!("db={}", db_path.display())),
+            "{message}"
+        );
+        assert!(
+            matches!(err, MigrationError::StepFailed { .. }),
+            "expected StepFailed"
+        );
+
+        let version: i32 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 3);
+        let preserved: String = conn
+            .query_row("SELECT value FROM preserved_rows WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(preserved, "before");
+        let marker_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'age32_failure_marker'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker_exists, 0, "failed migration left partial schema");
     }
 }
