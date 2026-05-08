@@ -1,5 +1,9 @@
 import { Dialog, Switch } from "@ark-ui/solid";
-import { For, Show } from "solid-js";
+import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import {
+	isDeniedProviderLevelFlag,
+	PROVIDER_LEVEL_FLAG_LABELS,
+} from "../lib/providerFlags";
 
 interface PoolSettingsPanelProps {
 	poolCommands: string[];
@@ -8,25 +12,33 @@ interface PoolSettingsPanelProps {
 	onClose: () => void;
 }
 
-const FLAG_LABELS: Record<string, string> = {
-	"--dangerously-skip-permissions": "Bypass Permissions",
-	"--dangerously-bypass-approvals-and-sandbox": "Bypass Approvals & Sandbox",
-	"--dangerously-bypass-approvals": "Bypass Approvals",
-	"--yolo": "YOLO Mode",
-};
-
 export default function PoolSettingsPanel(props: PoolSettingsPanelProps) {
+	const [closeEmitted, setCloseEmitted] = createSignal(false);
+
 	function flagLabel(flag: string): string {
-		return FLAG_LABELS[flag] ?? flag;
+		return PROVIDER_LEVEL_FLAG_LABELS[flag] ?? flag;
 	}
+
+	function emitClose() {
+		if (closeEmitted()) return;
+		setCloseEmitted(true);
+		props.onClose();
+	}
+
+	onMount(() => {
+		const onKeyDown = (event: KeyboardEvent) => {
+			if (event.key === "Escape") emitClose();
+		};
+		document.addEventListener("keydown", onKeyDown);
+		onCleanup(() => document.removeEventListener("keydown", onKeyDown));
+	});
 
 	return (
 		<Dialog.Root
 			open={true}
 			onOpenChange={(e) => {
-				if (!e.open) props.onClose();
+				if (!e.open) emitClose();
 			}}
-			closeOnEscape
 		>
 			<Dialog.Backdrop class="fixed inset-0 z-40 bg-black/40" />
 			<Dialog.Positioner class="fixed inset-0 z-50 flex justify-end">
@@ -57,28 +69,36 @@ export default function PoolSettingsPanel(props: PoolSettingsPanelProps) {
 							>
 								<div class="space-y-3">
 									<For each={props.commonFlags}>
-										{(flag) => (
-											<Switch.Root
-												checked={true}
-												onCheckedChange={(e) =>
-													props.onToggleFlag(flag, e.checked)
-												}
-												class="flex cursor-pointer items-center justify-between gap-3"
-											>
-												<div>
-													<Switch.Label class="text-xs font-medium text-text">
-														{flagLabel(flag)}
-													</Switch.Label>
-													<div class="text-[10px] font-mono text-text-faint">
-														{flag}
+										{(flag) => {
+											const readOnly = isDeniedProviderLevelFlag(flag);
+											return (
+												<Switch.Root
+													checked={true}
+													disabled={readOnly}
+													onCheckedChange={(e) => {
+														if (!readOnly) props.onToggleFlag(flag, e.checked);
+													}}
+													class={`flex items-center justify-between gap-3 ${
+														readOnly
+															? "cursor-default opacity-70"
+															: "cursor-pointer"
+													}`}
+												>
+													<div>
+														<Switch.Label class="text-xs font-medium text-text">
+															{flagLabel(flag)}
+														</Switch.Label>
+														<div class="text-[10px] font-mono text-text-faint">
+															{flag}
+														</div>
 													</div>
-												</div>
-												<Switch.Control class="relative h-5 w-9 rounded-full bg-border transition-colors data-[state=checked]:bg-accent">
-													<Switch.Thumb class="absolute left-0.5 top-0.5 h-4 w-4 rounded-full bg-text-dim transition-transform data-[state=checked]:translate-x-4 data-[state=checked]:bg-white" />
-												</Switch.Control>
-												<Switch.HiddenInput />
-											</Switch.Root>
-										)}
+													<Switch.Control class="relative h-5 w-9 rounded-full bg-border transition-colors data-[state=checked]:bg-accent data-[disabled]:bg-border">
+														<Switch.Thumb class="absolute left-0.5 top-0.5 h-4 w-4 rounded-full bg-text-dim transition-transform data-[state=checked]:translate-x-4 data-[state=checked]:bg-white data-[disabled]:bg-text-faint" />
+													</Switch.Control>
+													<Switch.HiddenInput />
+												</Switch.Root>
+											);
+										}}
 									</For>
 								</div>
 							</Show>

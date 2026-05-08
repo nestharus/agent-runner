@@ -265,6 +265,10 @@ fn get_model(state: tauri::State<AppState>, name: String) -> Result<ModelConfig,
 
 #[tauri::command]
 fn save_model(state: tauri::State<AppState>, model: ModelConfig) -> Result<(), String> {
+    save_model_inner(&state, model)
+}
+
+fn save_model_inner(state: &AppState, model: ModelConfig) -> Result<(), String> {
     if model.name.is_empty() {
         return Err("Model name cannot be empty".to_string());
     }
@@ -276,7 +280,8 @@ fn save_model(state: tauri::State<AppState>, model: ModelConfig) -> Result<(), S
             return Err(format!("Provider {} has empty name", i + 1));
         }
     }
-    let toml_content = model.to_toml();
+    let providers = load_providers_for_models_dir(&state.models_dir);
+    let toml_content = config::render_validated_model_toml(&model, Some(&providers))?;
     let path = state.models_dir.join(format!("{}.toml", model.name));
 
     std::fs::create_dir_all(&state.models_dir)
@@ -413,6 +418,14 @@ fn update_pool(
     original_commands: Vec<String>,
     new_commands: Vec<String>,
 ) -> Result<(), String> {
+    update_pool_inner(&state, original_commands, new_commands)
+}
+
+fn update_pool_inner(
+    state: &AppState,
+    original_commands: Vec<String>,
+    new_commands: Vec<String>,
+) -> Result<(), String> {
     if new_commands.is_empty() {
         return Err("Pool must have at least one command".to_string());
     }
@@ -425,10 +438,11 @@ fn update_pool(
     new_sorted.sort();
     new_sorted.dedup();
 
-    let mut models = state.models.lock().map_err(|e| e.to_string())?;
+    let providers = load_providers_for_models_dir(&state.models_dir);
+    let mut models_guard = state.models.lock().map_err(|e| e.to_string())?;
 
     // Find models matching the original command set (using provider names)
-    let matching_names: Vec<String> = models
+    let matching_names: Vec<String> = models_guard
         .values()
         .filter(|m| {
             let mut cmds: Vec<String> = m.providers.iter().map(|p| p.name.clone()).collect();
@@ -443,6 +457,8 @@ fn update_pool(
         return Err("No models found with the specified command set".to_string());
     }
 
+    let mut updates = Vec::new();
+
     // Compute added and removed provider names
     let removed: Vec<&String> = orig_sorted
         .iter()
@@ -454,7 +470,7 @@ fn update_pool(
         .collect();
 
     for name in &matching_names {
-        let model = models.get_mut(name).unwrap();
+        let mut model = models_guard.get(name).unwrap().clone();
 
         // Remove providers whose extracted provider name is in the removed set
         model.providers.retain(|p| !removed.contains(&&p.name));
@@ -471,11 +487,15 @@ fn update_pool(
             return Err(format!("Model '{}' would end up with zero providers", name));
         }
 
-        // Write updated toml
-        let toml_content = model.to_toml();
+        let toml_content = config::render_validated_model_toml(&model, Some(&providers))?;
+        updates.push((name.clone(), model, toml_content));
+    }
+
+    for (name, model, toml_content) in updates {
         let path = state.models_dir.join(format!("{}.toml", name));
         std::fs::write(&path, &toml_content)
             .map_err(|e| format!("Failed to write model file for '{}': {e}", name))?;
+        models_guard.insert(name, model);
     }
 
     Ok(())
@@ -904,7 +924,11 @@ interactive_args = ["exec", "--dangerously-bypass-approvals-and-sandbox"]
         super::save_model_inner(&state, model).unwrap();
 
         assert!(models_dir.join("gpt-high.toml").exists());
-        assert!(config::load_models(&models_dir, None).unwrap().contains_key("gpt-high"));
+        assert!(
+            config::load_models(&models_dir, None)
+                .unwrap()
+                .contains_key("gpt-high")
+        );
     }
 
     #[test]
@@ -945,10 +969,7 @@ interactive_args = ["exec", "--dangerously-bypass-approvals-and-sandbox"]
         let model = model_with_provider_args("gpt-high", "codex", &["exec", "-m", "gpt-5.5"]);
         let model_path = models_dir.join("gpt-high.toml");
         std::fs::write(&model_path, "sentinel").unwrap();
-        let state = test_state(
-            models_dir,
-            HashMap::from([(model.name.clone(), model)]),
-        );
+        let state = test_state(models_dir, HashMap::from([(model.name.clone(), model)]));
 
         let err = super::update_pool_inner(
             &state,
@@ -1010,7 +1031,11 @@ interactive_args = ["exec", "--dangerously-bypass-approvals-and-sandbox"]
         )
         .unwrap();
 
-        assert!(config::load_models(&models_dir, None).unwrap().contains_key("gpt-high"));
+        assert!(
+            config::load_models(&models_dir, None)
+                .unwrap()
+                .contains_key("gpt-high")
+        );
     }
 
     #[test]

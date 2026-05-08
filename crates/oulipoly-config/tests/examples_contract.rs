@@ -1,4 +1,4 @@
-use oulipoly_config::{load_models, ProvidersConfig};
+use oulipoly_config::{ProvidersConfig, load_models};
 use std::fs;
 
 #[test]
@@ -32,7 +32,9 @@ interactive_args = ["exec", "--dangerously-bypass-approvals-and-sandbox"]
     let providers = ProvidersConfig::load(&temp.path().join("providers.toml")).unwrap();
     let models = load_models(&models_dir, Some(&providers)).unwrap();
 
-    let model = models.get("codex-resume").expect("codex-resume model loads");
+    let model = models
+        .get("codex-resume")
+        .expect("codex-resume model loads");
     assert_eq!(model.name, "codex-resume");
     assert_eq!(model.providers.len(), 1);
     assert_eq!(model.providers[0].name, "codex");

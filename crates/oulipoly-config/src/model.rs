@@ -678,6 +678,18 @@ impl ModelConfig {
     }
 }
 
+pub fn render_validated_model_toml(
+    model: &ModelConfig,
+    providers: Option<&crate::providers::ProvidersConfig>,
+) -> Result<String, String> {
+    let rendered = model.to_toml();
+    let reparsed = ModelConfig::from_toml(&model.name, &rendered)?;
+    if let Some(providers) = providers {
+        validate_codex_model_arg_overlap(&model.name, &reparsed, providers)?;
+    }
+    Ok(rendered)
+}
+
 /// Render a Rust string as a TOML basic-string literal, escaping
 /// backslashes, quotes, and control characters per the TOML spec.
 /// Defers to the `toml` crate's serializer to avoid hand-rolling
@@ -1164,8 +1176,9 @@ args = ["-m", "gpt-5.5"]
             Some(&["exec", "--dangerously-bypass-approvals-and-sandbox"]),
         );
         let mut model = test_model("codex", &["-m", "gpt-5.5"]);
-        model.providers[0].interactive_args =
-            Some(vec!["--dangerously-bypass-approvals-and-sandbox".to_string()]);
+        model.providers[0].interactive_args = Some(vec![
+            "--dangerously-bypass-approvals-and-sandbox".to_string(),
+        ]);
 
         let err = super::render_validated_model_toml(&model, Some(&providers)).unwrap_err();
 

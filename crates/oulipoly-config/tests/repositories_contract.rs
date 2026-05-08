@@ -134,7 +134,7 @@ fn model_config_repository_delegates_load_save_list_and_delete() {
 }
 
 #[test]
-fn repository_save_model_is_provider_agnostic_by_contract() {
+fn repository_load_models_validates_provider_overlap_by_contract() {
     let dir = tempfile::tempdir().unwrap();
     let models_dir = dir.path().join("models");
     fs::create_dir_all(&models_dir).unwrap();
@@ -169,7 +169,11 @@ args = ["exec", "-c", "sandbox=workspace-write"]
         <FilesystemModelConfigRepository as ModelConfigRepository>::load_models(&repo, &models_dir)
             .unwrap();
     assert!(trait_loaded.contains_key("gpt-high"));
-    assert!(load_models(&models_dir, None).unwrap().contains_key("gpt-high"));
+    assert!(
+        load_models(&models_dir, None)
+            .unwrap()
+            .contains_key("gpt-high")
+    );
 
     let err = load_models(&models_dir, Some(&providers)).unwrap_err();
     assert!(err.contains("duplicates root [codex].args"), "{err}");

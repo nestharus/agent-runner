@@ -38,7 +38,10 @@ function modelWithCodexArgs(name: string, args: string[]): ModelConfig {
 	};
 }
 
-function renderCodexEditPanel(modelNames: string[], editModelName = modelNames[0]) {
+function renderCodexEditPanel(
+	modelNames: string[],
+	editModelName = modelNames[0],
+) {
 	return render(() => (
 		<ModelPanel
 			mode="edit"
@@ -90,7 +93,7 @@ describe("ModelPanel", () => {
 	});
 
 	it("omits common bypass approvals and sandbox flags from the save payload", async () => {
-		let savedModel: ModelConfig | null = null;
+		const savedModel: { current: ModelConfig | null } = { current: null };
 		const models: Record<string, ModelConfig> = {
 			"gpt-high": modelWithCodexArgs("gpt-high", [
 				"--dangerously-bypass-approvals-and-sandbox",
@@ -105,7 +108,7 @@ describe("ModelPanel", () => {
 		};
 		setHandler("get_model", (args: any) => Promise.resolve(models[args.name]));
 		setHandler("save_model", (args: any) => {
-			savedModel = args.model;
+			savedModel.current = args.model;
 			return Promise.resolve();
 		});
 
@@ -117,15 +120,17 @@ describe("ModelPanel", () => {
 		fireEvent.click(screen.getByText("Save & Test"));
 
 		await waitFor(() => {
-			expect(savedModel).not.toBeNull();
+			expect(savedModel.current).not.toBeNull();
 		});
-		expect(savedModel?.providers[0].args).not.toContain(
+		const saved = savedModel.current;
+		if (!saved) throw new Error("expected save_model payload");
+		expect(saved.providers[0].args).not.toContain(
 			"--dangerously-bypass-approvals-and-sandbox",
 		);
 	});
 
 	it("omits variable bypass approvals and sandbox flags from the save payload", async () => {
-		let savedModel: ModelConfig | null = null;
+		const savedModel: { current: ModelConfig | null } = { current: null };
 		const models: Record<string, ModelConfig> = {
 			"gpt-high": modelWithCodexArgs("gpt-high", [
 				"--dangerously-bypass-approvals-and-sandbox",
@@ -137,21 +142,25 @@ describe("ModelPanel", () => {
 		};
 		setHandler("get_model", (args: any) => Promise.resolve(models[args.name]));
 		setHandler("save_model", (args: any) => {
-			savedModel = args.model;
+			savedModel.current = args.model;
 			return Promise.resolve();
 		});
 
 		renderCodexEditPanel(["gpt-high", "gpt-low"], "gpt-high");
 
 		await waitFor(() => {
-			expect(screen.getByText("--dangerously-bypass-approvals-and-sandbox")).toBeTruthy();
+			expect(
+				screen.getByText("--dangerously-bypass-approvals-and-sandbox"),
+			).toBeTruthy();
 		});
 		fireEvent.click(screen.getByText("Save & Test"));
 
 		await waitFor(() => {
-			expect(savedModel).not.toBeNull();
+			expect(savedModel.current).not.toBeNull();
 		});
-		expect(savedModel?.providers[0].args).not.toContain(
+		const saved = savedModel.current;
+		if (!saved) throw new Error("expected save_model payload");
+		expect(saved.providers[0].args).not.toContain(
 			"--dangerously-bypass-approvals-and-sandbox",
 		);
 	});
@@ -170,7 +179,10 @@ describe("ModelPanel", () => {
 			return Promise.resolve();
 		});
 
-		const commonRender = renderCodexEditPanel(["gpt-high", "gpt-low"], "gpt-high");
+		const commonRender = renderCodexEditPanel(
+			["gpt-high", "gpt-low"],
+			"gpt-high",
+		);
 		await waitFor(() => {
 			expect(screen.getByText("codex")).toBeTruthy();
 		});
@@ -181,6 +193,7 @@ describe("ModelPanel", () => {
 		expect(savedModels[0].providers[0].args).not.toContain("--yolo");
 		commonRender.unmount();
 		cleanup();
+		clearHandlers();
 
 		savedModels = [];
 		const variableModels: Record<string, ModelConfig> = {
@@ -195,6 +208,10 @@ describe("ModelPanel", () => {
 		setHandler("get_model", (args: any) =>
 			Promise.resolve(variableModels[args.name]),
 		);
+		setHandler("save_model", (args: any) => {
+			savedModels.push(args.model);
+			return Promise.resolve();
+		});
 
 		renderCodexEditPanel(["gpt-high", "gpt-low"], "gpt-high");
 		await waitFor(() => {

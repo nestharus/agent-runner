@@ -18,7 +18,11 @@ const clearHandlers = tauriMock.__clearHandlers as () => void;
 
 const noop = () => {};
 
-function modelWithProviderArgs(name: string, providerName: string, args: string[]) {
+function modelWithProviderArgs(
+	name: string,
+	providerName: string,
+	args: string[],
+) {
 	return {
 		name,
 		prompt_mode: "stdin",
@@ -324,9 +328,12 @@ describe("PoolsView", () => {
 		});
 
 		fireEvent.click(screen.getByText("Bypass Approvals & Sandbox"));
-		await new Promise((resolve) => setTimeout(resolve, 20));
-
-		expect(saveCalls).toBe(0);
+		await waitFor(
+			() => {
+				expect(saveCalls).toBe(0);
+			},
+			{ timeout: 50 },
+		);
 	});
 
 	it("does not save when interacting with the read-only yolo flag row", async () => {
@@ -342,11 +349,7 @@ describe("PoolsView", () => {
 		);
 		setHandler("get_model", () =>
 			Promise.resolve(
-				modelWithProviderArgs("gpt-high", "codex", [
-					"--yolo",
-					"-m",
-					"gpt-5.5",
-				]),
+				modelWithProviderArgs("gpt-high", "codex", ["--yolo", "-m", "gpt-5.5"]),
 			),
 		);
 		setHandler("save_model", () => {
@@ -365,9 +368,12 @@ describe("PoolsView", () => {
 		});
 
 		fireEvent.click(screen.getByText("YOLO Mode"));
-		await new Promise((resolve) => setTimeout(resolve, 20));
-
-		expect(saveCalls).toBe(0);
+		await waitFor(
+			() => {
+				expect(saveCalls).toBe(0);
+			},
+			{ timeout: 50 },
+		);
 	});
 
 	it("calls update_pool with original and new command arrays when removing a pool tag", async () => {

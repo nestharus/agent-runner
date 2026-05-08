@@ -76,8 +76,9 @@ describe("PoolSettingsPanel", () => {
 		fireEvent.keyDown(screen.getByText("Bypass Approvals & Sandbox"), {
 			key: "Enter",
 		});
-		await new Promise((resolve) => setTimeout(resolve, 20));
 
-		expect(onToggleFlag).not.toHaveBeenCalled();
+		await waitFor(() => {
+			expect(onToggleFlag).not.toHaveBeenCalled();
+		});
 	});
 });
