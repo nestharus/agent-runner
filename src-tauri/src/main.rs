@@ -1,4 +1,4 @@
-use agent_runner_lib::load_app_config;
+use agent_runner_lib::{effective_provider_for_model_provider, load_app_config};
 use oulipoly_config::{
     AgentConfig, ModelConfig, PromptMode, ProviderConfig, ProvidersConfig, load_agent_file,
     load_agents, load_models,
@@ -1499,7 +1499,7 @@ fn effective_model_for_execution(
     provider_index: usize,
     providers_cfg: &ProvidersConfig,
 ) -> Result<(ProviderConfig, PromptMode), String> {
-    providers_cfg.effective_provider(&model.providers[provider_index])
+    effective_provider_for_model_provider(model, provider_index, providers_cfg)
 }
 
 fn resume_migration_pool(
@@ -2231,8 +2231,27 @@ fn run_diagnostics(
     let app_config = load_app_config();
     let diag_model_name = app_config.diagnostics_model?;
     let diag_model = models.get(&diag_model_name)?;
+    let config_root = dirs::config_dir()
+        .map(|d| d.join("oulipoly-agent-runner"))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let providers_path = config_root.join("providers.toml");
+    let providers_cfg = ProvidersConfig::load(&providers_path).unwrap_or_default();
 
-    match diagnostics::diagnose_error(stderr, exit_code, diag_model, models, working_dir) {
+    let diagnosis = effective_provider_for_model_provider(diag_model, 0, &providers_cfg).and_then(
+        |(provider, prompt_mode)| {
+            diagnostics::diagnose_error(
+                diag_model,
+                &provider,
+                0,
+                prompt_mode,
+                exit_code,
+                stderr,
+                working_dir,
+            )
+        },
+    );
+
+    match diagnosis {
         Ok(diagnosis) => {
             eprintln!(
                 "[diagnostics] {}: {}",

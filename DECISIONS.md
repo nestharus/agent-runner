@@ -571,10 +571,28 @@ The Phase 8 justification gate flagged this as an unjustified scope-creep change
 
 ## D-AGE-8-Phase-8 — accept process-tree audit topology FAIL given currentness PASS
 
-- **Source**: AGE-8 Phase 8 process-tree audit (`risk/age-8-phase-8-process-tree-audit.report.md`).
+- **Source**: AGE-8 Phase 8 process-tree audit (`~/projects/agent-runner/planning/age-8-agents-binary-refactor/risk/age-8-phase-8-process-tree-audit.report.md`).
 - **Verdict**: topology FAIL (4 blocking violations: 3 missing producer UUIDs in trace + 1 stale_running root warning), but canonical-output currentness PASS for all 4 Phase 8 gates + Phase 4 manifest re-verification.
 - **Cause**: the orchestrator was halted twice mid-Phase-8 by precautionary harness halts. Post-halt re-dispatched gates inherited a different `OULIPOLY_PARENT_INVOCATION` env from the resumed claude2 session; their `parent_id` was recorded as null in the trace database. They are the canonical producers of the canonical files (sha256/verdict/content all match the join manifest), but they appear as orphan invocations rather than children of the original orchestrator-root.
 - **Decision**: accept the topology FAIL given the currentness PASS, and proceed to Phase 9. The actual gate verdicts and contents are verified by the manifest re-verification; only the trace parent-child links are broken by the halt-resume.
 - **Rationale**: per the orchestrator's Phase 8 contract, only multi-concern's split decision blocks; that returned LOW. The audit's procedure-step / role-independence violations are environmental halt-resume artifacts, not orchestrator misbehavior. Re-running the 4 gates fresh would consume ~$8 + ~30 min of wall time to reproduce identical verdicts. Halting the WU would discard correct gate work over a trace-topology artifact. The user denied a value-question NEEDS_INPUT on this point, signaling automation preference; per `~/ai/conventions/agent-questions-and-session-graph.md` § AskUserQuestion Permission-Denial and per the user's "PR merge auto-authorized for owned projects" / "don't pause on routine workflow transitions" preferences, the orchestrator resolves procedurally.
 - **Mechanism**: phase-4 + phase-8 join manifests record verdicts and sha256; both re-verify clean against on-disk files. The Phase 9 PR body notes the halt-resume context for transparency.
 - **Revisit when**: never — this aligns with the user's automation preferences for owned projects.
+
+
+## AGE-27 — Phase 6c implementation decisions (2026-05-08)
+
+**WU:** AGE-27 — diagnostics effective provider.
+**Phase:** 6c (code writer).
+
+**Decision 1 — caller-side merge resolution:** `run_diagnostics` in `src-tauri/src/main.rs` loads `ProvidersConfig` from the app config root, resolves the diagnostic model's selected provider through the caller-side helper, and passes effective provider material into `oulipoly-runtime::diagnostics::diagnose_error`. The runtime diagnostics module stays an executor client and does not learn config-file locations.
+
+**Decision 2 — no `EffectiveModelConfig` newtype:** AGE-27 keeps the existing raw executor APIs available for executor internals and tests. Production migrated-capable callers are moved to `EffectiveExecuteRequest`, with the raw-callsite allowlist test providing regression protection.
+
+**Decision 3 — AGE-27 lands independently of AGE-8:** The AGE-27-owned diagnostics regression lives in `src-tauri/tests/age27_diagnostics_effective_provider.rs`, so this fix does not depend on AGE-8's ignored characterization test.
+
+**Decision 4 — resume failure regression hard-committed:** `resume_failure_runs_effective_diagnostics_and_preserves_finalization_order` is part of this WU and must remain green with the one-shot diagnostics regressions.
+
+**Decision 5 — frontend gates unavailable in this environment:** `bun install` cannot resolve `@fortawesome/sharp-regular-svg-icons` or `@fortawesome/sharp-solid-svg-icons` from the public npm registry (`404`). With no `node_modules`, `bun run lint`, `bun run typecheck`, and `bun run test` fail before running because `biome`, `tsc`, and `vitest` are not installed. AGE-27 changed only Rust/fixture/decision files.
+
+**Decision 6 — rebase onto post-AGE-8-00 main (2026-05-08):** AGE-8 Phase 1 (DI/services/repositories foundation, commit 9451c75) and NES-259 (commit a36ebd4) merged to main while AGE-27 was in flight. AGE-27 rebases onto the new main; AGE-8-00's diagnostics/executor/main.rs additions did NOT fix the bypass (verified by inspecting `crates/oulipoly-runtime/src/diagnostics/mod.rs:72` and `src-tauri/src/lib.rs:501` on origin/main — both still call raw `executor::execute`), so AGE-27's work remains relevant. The AGE-8 characterization test `failed_one_shot_loads_app_config_invokes_diagnostic_model_and_persists_category` is now unignored alongside AGE-27's dedicated regression test in `src-tauri/tests/age27_diagnostics_effective_provider.rs`.

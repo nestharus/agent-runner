@@ -1,5 +1,5 @@
 use crate::executor;
-use oulipoly_config::ModelConfig;
+use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -40,10 +40,12 @@ pub fn classify_exhaustion(stderr: &str) -> bool {
 }
 
 pub fn diagnose_error(
-    stderr: &str,
-    exit_code: i32,
     diagnostics_model: &ModelConfig,
-    _models: &HashMap<String, ModelConfig>,
+    effective_provider: &ProviderConfig,
+    provider_index: usize,
+    prompt_mode: PromptMode,
+    exit_code: i32,
+    stderr: &str,
     working_dir: Option<&Path>,
 ) -> Result<Diagnosis, String> {
     // Truncate stderr for the diagnostic prompt
@@ -69,7 +71,18 @@ pub fn diagnose_error(
          The API returned HTTP 429 indicating too many requests."
     );
 
-    let result = executor::execute(diagnostics_model, 0, &prompt, working_dir)?;
+    let extra_inputs = HashMap::new();
+    let result =
+        executor::execute_effective_with_inputs_and_env(executor::cli::EffectiveExecuteRequest {
+            model: diagnostics_model,
+            provider: effective_provider,
+            provider_index,
+            prompt_mode,
+            prompt: &prompt,
+            working_dir,
+            extra_inputs: &extra_inputs,
+            parent_invocation_env: None,
+        })?;
 
     if result.exit_code != 0 {
         // Diagnostics model itself failed — use heuristic fallback
@@ -143,6 +156,43 @@ mod tests {
     use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use std::path::{Path, PathBuf};
+
+    #[cfg(unix)]
+    fn write_executable(path: &Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn migrated_diagnostic_model() -> ModelConfig {
+        ModelConfig {
+            name: "diagnostic".to_string(),
+            prompt_mode: PromptMode::Arg,
+            providers: vec![ProviderConfig::model_provider(
+                "diagnostic-provider",
+                vec!["--raw-model-arg".to_string()],
+            )],
+            inputs: vec![],
+        }
+    }
+
+    #[cfg(unix)]
+    fn effective_diagnostic_provider(script_path: PathBuf) -> ProviderConfig {
+        ProviderConfig {
+            name: "diagnostic-provider".to_string(),
+            command: script_path.to_string_lossy().into_owned(),
+            args: vec!["--effective-provider-arg".to_string()],
+            interactive_args: None,
+            resume: None,
+            session_capture: None,
+            resume_acceptance: None,
+            session_storage: None,
+        }
+    }
 
     #[test]
     fn classify_exhaustion_matches_quota_billing_usage_limit_stderr() {
@@ -206,16 +256,103 @@ mod tests {
         assert_eq!(d.category, ErrorCategory::RateLimit);
     }
 
-    // Characterization test for AGE-8 — pins current behavior of diagnostics::diagnose_error model-backed subprocess path.
+    #[cfg(unix)]
+    #[test]
+    fn diagnose_error_uses_effective_provider_for_migrated_diagnostic_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompt_dump = dir.path().join("diagnostic-prompt.txt");
+        let script = dir.path().join("diagnostic-provider.sh");
+        write_executable(
+            &script,
+            &format!(
+                r#"#!/usr/bin/env bash
+set -euo pipefail
+cat > "{prompt_dump}"
+printf 'network_error\nDiagnostic model saw network trouble\n'
+"#,
+                prompt_dump = prompt_dump.display()
+            ),
+        );
+        let model = migrated_diagnostic_model();
+        let provider = effective_diagnostic_provider(script);
+
+        let diagnosis = diagnose_error(
+            &model,
+            &provider,
+            0,
+            PromptMode::Stdin,
+            7,
+            "opaque child failure from primary provider",
+            Some(dir.path()),
+        )
+        .unwrap();
+
+        assert_eq!(diagnosis.category, ErrorCategory::NetworkError);
+        assert_eq!(diagnosis.summary, "Diagnostic model saw network trouble");
+        let prompt = std::fs::read_to_string(prompt_dump).unwrap();
+        assert!(prompt.contains("Exit code: 7"), "{prompt}");
+        assert!(
+            prompt.contains("opaque child failure from primary provider"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("- network_error: Connection refused"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Respond with ONLY the category name on the first line"),
+            "{prompt}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diagnose_error_effective_provider_nonzero_exit_uses_heuristic_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("diagnostic-provider.sh");
+        write_executable(
+            &script,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+printf 'diagnostic subprocess failed\n' >&2
+exit 12
+"#,
+        );
+        let model = migrated_diagnostic_model();
+        let provider = effective_diagnostic_provider(script);
+
+        let diagnosis = diagnose_error(
+            &model,
+            &provider,
+            0,
+            PromptMode::Stdin,
+            7,
+            "network timeout while connecting to upstream",
+            Some(dir.path()),
+        )
+        .unwrap();
+
+        assert_eq!(diagnosis.category, ErrorCategory::NetworkError);
+        assert_eq!(
+            diagnosis.summary,
+            "Heuristic classification based on stderr content"
+        );
+    }
+
+    // Characterization test originally added by AGE-8 (pre-AGE-27 signature) — migrated to the
+    // AGE-27 effective-provider signature so the AGE-8 prompt-content + auth_expired assertions
+    // continue to characterize the diagnostics path. The AGE-8 test was `#[ignore]`d on main
+    // pending AGE-27; AGE-27's signature change requires it to be migrated rather than just
+    // un-ignored. See `DECISIONS.md` § AGE-27 Decision 6.
     #[cfg(unix)]
     #[test]
     fn diagnose_error_invokes_configured_model_subprocess_and_parses_output() {
         let dir = tempfile::tempdir().unwrap();
         let prompt_dump = dir.path().join("diagnostic-prompt.txt");
         let script_path = dir.path().join("diagnostic-model.sh");
-        std::fs::write(
+        write_executable(
             &script_path,
-            format!(
+            &format!(
                 r#"#!/usr/bin/env bash
 set -euo pipefail
 cat > "{prompt_dump}"
@@ -223,27 +360,18 @@ printf 'auth_expired\nDiagnostic model saw expired credentials\n'
 "#,
                 prompt_dump = prompt_dump.display()
             ),
-        )
-        .unwrap();
-        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&script_path, perms).unwrap();
+        );
 
-        let diagnostics_model = ModelConfig {
-            name: "diagnostic-fixture".to_string(),
-            prompt_mode: PromptMode::Stdin,
-            providers: vec![ProviderConfig::new(
-                script_path.to_string_lossy().into_owned(),
-                vec![],
-            )],
-            inputs: vec![],
-        };
+        let model = migrated_diagnostic_model();
+        let provider = effective_diagnostic_provider(script_path);
 
         let diagnosis = diagnose_error(
-            "opaque provider stderr",
+            &model,
+            &provider,
+            0,
+            PromptMode::Stdin,
             7,
-            &diagnostics_model,
-            &HashMap::new(),
+            "opaque provider stderr",
             Some(dir.path()),
         )
         .unwrap();

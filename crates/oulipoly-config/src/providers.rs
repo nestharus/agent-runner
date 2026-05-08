@@ -314,4 +314,98 @@ projects_dir = "/tmp/claude2/projects"
         let cfg = ProvidersConfig::load(Path::new("/nonexistent/path/providers.toml")).unwrap();
         assert!(cfg.entries.is_empty());
     }
+
+    #[test]
+    fn effective_provider_missing_provider_returns_named_error() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            r#"
+[other-provider]
+command = "other"
+"#
+        )
+        .unwrap();
+        let cfg = ProvidersConfig::load(f.path()).unwrap();
+        let model_provider = ProviderConfig::model_provider("missing-provider", vec![]);
+
+        let err = cfg.effective_provider(&model_provider).unwrap_err();
+
+        assert!(
+            err.contains("provider missing-provider is missing from providers.toml"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn effective_provider_carries_runtime_fields() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            r#"
+[provider]
+command = "/bin/echo"
+args = ["--provider"]
+interactive_args = ["interactive"]
+prompt_mode = "arg"
+
+[provider.resume]
+kind = "flag"
+flag = "--resume"
+
+[provider.session_capture]
+kind = "forced_flag_verified"
+flag = "--session-id"
+
+[provider.resume_acceptance]
+accepted_output_patterns = ["accepted"]
+rejected_output_patterns = ["rejected"]
+
+[provider.session_storage]
+kind = "codex"
+sessions_dir = "/tmp/codex-sessions"
+"#
+        )
+        .unwrap();
+        let cfg = ProvidersConfig::load(f.path()).unwrap();
+        let model_provider = ProviderConfig {
+            name: "provider".to_string(),
+            command: String::new(),
+            args: vec!["--model".to_string()],
+            interactive_args: Some(vec!["interactive-model".to_string()]),
+            resume: None,
+            session_capture: None,
+            resume_acceptance: None,
+            session_storage: None,
+        };
+
+        let (provider, prompt_mode) = cfg.effective_provider(&model_provider).unwrap();
+
+        assert_eq!(prompt_mode, PromptMode::Arg);
+        assert_eq!(provider.name, "provider");
+        assert_eq!(provider.command, "/bin/echo");
+        assert_eq!(provider.args, ["--provider", "--model"]);
+        assert_eq!(
+            provider.interactive_args.as_deref(),
+            Some(&["interactive".to_string(), "interactive-model".to_string()][..])
+        );
+        assert_eq!(
+            provider.resume.as_ref().unwrap().flag.as_deref(),
+            Some("--resume")
+        );
+        assert_eq!(
+            provider.session_capture.as_ref().unwrap().flag.as_deref(),
+            Some("--session-id")
+        );
+        assert_eq!(
+            provider
+                .resume_acceptance
+                .as_ref()
+                .unwrap()
+                .accepted_output_patterns
+                .as_deref(),
+            Some(&["accepted".to_string()][..])
+        );
+        assert!(provider.session_storage.is_some());
+    }
 }

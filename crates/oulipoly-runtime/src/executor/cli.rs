@@ -1155,6 +1155,105 @@ mod tests {
         FixtureScript { _dir: dir, path }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn execute_effective_uses_explicit_provider_and_prompt_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let argv_dump = dir.path().join("argv.txt");
+        let stdin_dump = dir.path().join("stdin.txt");
+        let script_path = dir.path().join("effective-provider.sh");
+        std::fs::write(
+            &script_path,
+            format!(
+                r#"#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$@" > "{argv_dump}"
+cat > "{stdin_dump}"
+printf 'effective stdout\n'
+"#,
+                argv_dump = argv_dump.display(),
+                stdin_dump = stdin_dump.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+
+        let model = ModelConfig {
+            name: "image-model".to_string(),
+            prompt_mode: PromptMode::Stdin,
+            providers: vec![ProviderConfig::model_provider(
+                "effective-provider",
+                vec!["--raw-model-arg".to_string()],
+            )],
+            inputs: vec![
+                InputDef {
+                    name: "size".to_string(),
+                    input_type: InputType::Enum {
+                        options: vec!["small".to_string(), "large".to_string()],
+                    },
+                    required: false,
+                    default_input: false,
+                    default: None,
+                    description: None,
+                    flag: Some("--size".to_string()),
+                },
+                InputDef {
+                    name: "quality".to_string(),
+                    input_type: InputType::String,
+                    required: false,
+                    default_input: false,
+                    default: Some(toml::Value::String("standard".to_string())),
+                    description: None,
+                    flag: Some("--quality".to_string()),
+                },
+            ],
+        };
+        assert_eq!(model.providers[0].command, "");
+        let provider = ProviderConfig {
+            name: "effective-provider".to_string(),
+            command: script_path.to_string_lossy().into_owned(),
+            args: vec!["--provider".to_string()],
+            interactive_args: None,
+            resume: None,
+            session_capture: None,
+            resume_acceptance: None,
+            session_storage: None,
+        };
+        let mut extra_inputs = HashMap::new();
+        extra_inputs.insert("size".to_string(), vec!["large".to_string()]);
+
+        let result = execute_effective(EffectiveExecuteRequest {
+            model: &model,
+            provider: &provider,
+            provider_index: 0,
+            prompt_mode: PromptMode::Arg,
+            prompt: "prompt routed as argv",
+            working_dir: Some(dir.path()),
+            extra_inputs: &extra_inputs,
+            parent_invocation_env: None,
+        })
+        .unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(
+            String::from_utf8_lossy(&result.stdout),
+            "effective stdout\n"
+        );
+        assert_eq!(result.provider_index, 0);
+        assert_eq!(std::fs::read_to_string(&stdin_dump).unwrap(), "");
+        let argv = std::fs::read_to_string(&argv_dump).unwrap();
+        assert!(argv.contains("--provider\n"), "{argv}");
+        assert!(
+            !argv.contains("--raw-model-arg"),
+            "raw model-provider args must not be used without effective merge: {argv}"
+        );
+        assert!(argv.contains("--size\nlarge\n"), "{argv}");
+        assert!(argv.contains("--quality\nstandard\n"), "{argv}");
+        assert!(argv.ends_with("prompt routed as argv\n"), "{argv}");
+    }
+
     #[test]
     fn shell_split_simple() {
         assert_eq!(shell_split("echo hello"), vec!["echo", "hello"]);
