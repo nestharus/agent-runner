@@ -1,7 +1,7 @@
 pub mod setup;
 
 use oulipoly_config as config;
-use oulipoly_config::ModelConfig;
+use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig, ProvidersConfig};
 use oulipoly_runtime::{balancer, diagnostics, discovery, executor, quota};
 use oulipoly_setup as setup_core;
 use oulipoly_setup::actions::{SetupEvent, UserResponse};
@@ -476,14 +476,11 @@ async fn test_model(
             .ok_or_else(|| format!("Model '{}' not found", name))?
     };
 
-    let db_path = state
-        .models_dir
-        .parent()
-        .unwrap_or(&state.models_dir)
-        .join("state.db");
+    let models_dir = state.models_dir.clone();
+    let db_path = models_dir.parent().unwrap_or(&models_dir).join("state.db");
 
     let result = tauri::async_runtime::spawn_blocking(move || {
-        test_model_with_db_path(model, db_path, "Say hello in one sentence.")
+        test_model_with_db_path(model, models_dir, db_path, "Say hello in one sentence.")
     })
     .await
     .map_err(|e| e.to_string())??;
@@ -493,14 +490,33 @@ async fn test_model(
 
 fn test_model_with_db_path(
     model: ModelConfig,
+    models_dir: PathBuf,
     db_path: PathBuf,
     prompt: &str,
 ) -> Result<TestModelResult, String> {
     let db = state::StateDb::open(&db_path).map_err(|e| e.to_string())?;
     let provider_index = balancer::select_provider(&model, &db, None);
-    let result = executor::execute(&model, provider_index, prompt, None)?;
+    let providers_path = models_dir
+        .parent()
+        .unwrap_or(&models_dir)
+        .join("providers.toml");
+    let providers_cfg = config::ProvidersConfig::load(&providers_path).unwrap_or_default();
+    let (provider, prompt_mode) =
+        effective_provider_for_model_provider(&model, provider_index, &providers_cfg)?;
+    let extra_inputs = HashMap::new();
+    let result =
+        executor::execute_effective_with_inputs_and_env(executor::cli::EffectiveExecuteRequest {
+            model: &model,
+            provider: &provider,
+            provider_index,
+            prompt_mode,
+            prompt,
+            working_dir: None,
+            extra_inputs: &extra_inputs,
+            parent_invocation_env: None,
+        })?;
     if result.exit_code != 0 && diagnostics::classify_exhaustion(&result.stderr) {
-        db.mark_exhausted(&model.providers[provider_index].name)?;
+        db.mark_exhausted(&provider.name)?;
     }
     Ok(TestModelResult {
         success: result.exit_code == 0,
@@ -521,7 +537,23 @@ pub(crate) fn test_model_for_test(
         .cloned()
         .ok_or_else(|| format!("Model '{}' not found", name))?;
     let db_path = models_dir.parent().unwrap_or(&models_dir).join("state.db");
-    test_model_with_db_path(model, db_path, "Say hello in one sentence.")
+    test_model_with_db_path(model, models_dir, db_path, "Say hello in one sentence.")
+}
+
+pub fn effective_provider_for_model_provider(
+    model: &ModelConfig,
+    provider_index: usize,
+    providers_cfg: &ProvidersConfig,
+) -> Result<(ProviderConfig, PromptMode), String> {
+    let provider = model
+        .providers
+        .get(provider_index)
+        .ok_or_else(|| "provider_index out of range".to_string())?;
+    match providers_cfg.effective_provider(provider) {
+        Ok(effective) => Ok(effective),
+        Err(_) if !provider.command.trim().is_empty() => Ok((provider.clone(), model.prompt_mode)),
+        Err(err) => Err(err),
+    }
 }
 
 // --- Provider & Account commands ---
@@ -753,6 +785,16 @@ pub fn run_tauri() {
 mod tests {
     use super::*;
     use config::{ModelConfig, PromptMode, ProviderConfig};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(unix)]
+    fn write_executable(path: &std::path::Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
 
     fn make_model(name: &str, commands: &[&str]) -> ModelConfig {
         ModelConfig {
@@ -869,6 +911,119 @@ mod tests {
         assert!(result.stderr.contains("quota exhausted"));
         let db = StateDb::open(&db_path).unwrap();
         let quota = db.get_quota("sh").unwrap().unwrap();
+        assert!(quota.exhausted_at.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_model_migrated_provider_uses_providers_toml_effective_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let argv_dump = dir.path().join("test-model-argv.txt");
+        let stdin_dump = dir.path().join("test-model-stdin.txt");
+        let script = dir.path().join("test-model-provider.sh");
+        write_executable(
+            &script,
+            &format!(
+                r#"#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$@" > "{argv_dump}"
+cat > "{stdin_dump}"
+printf 'test-model stdout\n'
+printf 'test-model stderr\n' >&2
+"#,
+                argv_dump = argv_dump.display(),
+                stdin_dump = stdin_dump.display()
+            ),
+        );
+        std::fs::write(
+            dir.path().join("providers.toml"),
+            format!(
+                r#"[test-model-provider]
+command = "{}"
+args = ["--provider"]
+prompt_mode = "arg"
+"#,
+                script.display()
+            ),
+        )
+        .unwrap();
+        let success_model = ModelConfig {
+            name: "test-model".to_string(),
+            prompt_mode: PromptMode::Stdin,
+            providers: vec![ProviderConfig::model_provider(
+                "test-model-provider",
+                vec!["--model".to_string()],
+            )],
+            inputs: vec![],
+        };
+        let mut models = HashMap::new();
+        models.insert(success_model.name.clone(), success_model);
+
+        let result = test_model_for_test(models, models_dir.clone(), "test-model").unwrap();
+
+        assert!(result.success);
+        assert_eq!(result.stdout, "test-model stdout\n");
+        assert_eq!(result.stderr, "test-model stderr\n");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(std::fs::read_to_string(&stdin_dump).unwrap(), "");
+        let argv = std::fs::read_to_string(&argv_dump).unwrap();
+        assert!(argv.contains("--provider\n"), "{argv}");
+        assert!(argv.contains("--model\n"), "{argv}");
+        assert!(argv.ends_with("Say hello in one sentence.\n"), "{argv}");
+
+        let quota_script = dir.path().join("test-model-provider-quota.sh");
+        write_executable(
+            &quota_script,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+printf 'quota exhausted from effective provider\n' >&2
+exit 7
+"#,
+        );
+        std::fs::write(
+            dir.path().join("providers.toml"),
+            format!(
+                r#"[quota-effective-provider]
+command = "{}"
+args = []
+prompt_mode = "arg"
+"#,
+                quota_script.display()
+            ),
+        )
+        .unwrap();
+        let quota_model = ModelConfig {
+            name: "quota-model".to_string(),
+            prompt_mode: PromptMode::Stdin,
+            providers: vec![ProviderConfig::model_provider(
+                "quota-effective-provider",
+                vec![],
+            )],
+            inputs: vec![],
+        };
+        let mut quota_models = HashMap::new();
+        quota_models.insert(quota_model.name.clone(), quota_model);
+
+        let quota_result = test_model_for_test(quota_models, models_dir, "quota-model").unwrap();
+
+        assert!(!quota_result.success);
+        assert_eq!(quota_result.exit_code, 7);
+        assert!(
+            quota_result
+                .stderr
+                .contains("quota exhausted from effective provider"),
+            "{}",
+            quota_result.stderr
+        );
+        assert!(
+            !quota_result.stderr.contains("Empty command"),
+            "{}",
+            quota_result.stderr
+        );
+        let db = StateDb::open(&dir.path().join("state.db")).unwrap();
+        let quota = db.get_quota("quota-effective-provider").unwrap().unwrap();
         assert!(quota.exhausted_at.is_some());
     }
 

@@ -157,15 +157,8 @@ fn one_shot_continues_with_in_memory_state_when_default_state_db_cannot_open() {
     );
 }
 
-// Characterization test for AGE-8 — pins current behavior of run_diagnostics model-backed wiring from failed run.
-// Ignored: characterization writer surfaced a real product bug tracked as AGE-27. diagnose_error does not
-// resolve the diagnostic model provider through ProvidersConfig::effective_provider, so a migrated
-// providers.toml + per-model TOML configuration causes "Empty command" from the executor. Filed separately
-// per AGE-8 dispatch directive (anti-scope: "No drive-by improvements"). Evidence:
-//   ~/projects/agent-runner/planning/age-8-agents-binary-refactor/risk/age-8-test-residuals.md
-// Un-ignore after AGE-27 lands.
+// Characterization test for AGE-8 — pins model-backed diagnostics from a failed run.
 #[test]
-#[ignore]
 fn failed_one_shot_loads_app_config_invokes_diagnostic_model_and_persists_category() {
     let fixture = Fixture::new();
     let failure_script = fixture._dir.path().join("failure-provider.sh");

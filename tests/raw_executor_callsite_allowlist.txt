@@ -1,0 +1,7 @@
+# Raw executor facade and implementation internals.
+crates/oulipoly-runtime/src/executor/mod.rs
+crates/oulipoly-runtime/src/executor/cli.rs
+
+# Integration and unit tests are allowed to exercise raw executor APIs directly.
+src-tauri/tests/age27_raw_executor_callsite_scan.rs
+src-tauri/tests/age27_diagnostics_effective_provider.rs
