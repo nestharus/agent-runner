@@ -873,3 +873,58 @@ The four discoveries are listed here so a later consolidation WU can pick them u
   - Residuals documented at `planning/age-34-executor-launcher-quota-diagnostics/risk/age-34-test-residuals.md` with closure triggers.
 - **Phase 9 readiness**: branch is at `5f4d2d1` (cutover) + `4891cad` (chore record); `cargo test` green; CodeRabbit converged ALL_CHURN; multi-concern SINGLE_CONCERN; commit-hygiene LOW; justification LOW_CONCERN; test-audit MEDIUM (apply-with-residuals).
 - **Revisit when**: orchestrator wrapped in single root `agents` invocation.
+
+## 2026-05-08 - AGE-35 Phase 2.5 Scope Narrowing And Residuals
+
+- **WU**: AGE-35 (`AGE-8-03: RoutingService + InvocationLifecycleService`)
+- **Phase**: 2.5 - Existing-State Risk Profile
+- **Decision**: narrow-scope per dispatch brief default. Risk profile
+  rolled up HIGH on 15 of 15 touched surfaces
+  (`planning/age-35-routing-invocation-lifecycle/risk/age-35-risk-profile.md:255-261`).
+  Defer-to-prototype gate fired only 1 of 5 signals (HIGH on majority);
+  workflow rule requires 2+ signals to surface the defer-to-prototype
+  human-gate option, so defer-to-prototype is NOT triggered. The
+  dispatch brief pre-resolves narrow-vs-exhaustive as **B (narrow
+  scope)** per the AGE-33 (PR #63) precedent: "pick 3-5 cleanest sites,
+  defer rest to subsequent sibling AGE-8-* WUs".
+- **How to apply in Phase 3**: the proposer picks 3-5 cleanest
+  `directly-equivalent` or `prove-equivalence` surfaces from the risk
+  profile's mode-propagation table. Surfaces marked `narrow-scope` by
+  the risk profile (`decide_migration` adjacent migration routing,
+  `test_model_with_db_path` invocation-lifecycle adjacency) are
+  out-of-scope. Deferred surfaces handed to sibling AGE-8-* WUs follow
+  the AGE-33 pattern (AGE-36 / AGE-37 / AGE-38 / AGE-39 etc).
+- **Residuals accepted (proceed + note, not consolidated in this WU)**:
+  - **Drift Set 2 (latent topology-probe divergence)**:
+    `select_provider(Some(ctx))` has topology-probe refresh behavior at
+    `crates/oulipoly-runtime/src/balancer/mod.rs:113-170` that
+    `compute_projections(Some(ctx))` lacks at `:248-260`. Production
+    currently uses `compute_projections(..., None)`, so the divergence
+    is latent. Phase 3 must preserve current behavior and NOT
+    consolidate inside this refactor
+    (`planning/age-35-routing-invocation-lifecycle/research/age-35-duplicates.md:23-35`).
+  - **Drift Set 4 (cleanup divergence)**: one-shot
+    `run_with_balancing` cleanup is explicit-only, while REPL
+    `run_repl` and resume `run_resume` install `FinalizerGuard`
+    RAII/drop semantics. Phase 3 must preserve the divergence and NOT
+    silently "fix" it inside the lifecycle service cutover
+    (`planning/age-35-routing-invocation-lifecycle/research/age-35-duplicates.md:47-62`).
+- **Skeleton gap (in-scope for Phase 3)**: AGE-8 / PR #54 did NOT land
+  trait skeletons for `RoutingServicePort` or
+  `InvocationLifecycleServicePort` (only Executor/Launcher/Quota/
+  Diagnostics ports exist on `main` per
+  `crates/oulipoly-runtime/src/services/mod.rs:23-26` and `:75-87`).
+  Phase 3 must define the trait shape inline as part of AGE-35's slice
+  (the standard cut-over WU design pattern when the service skeleton is
+  missing).
+- **AGE-25 / AGE-27 / AGE-33 invariants preserved**: characterization
+  tests pinning balancer fanout (AGE-25), effective-provider routing
+  (AGE-27), and config/state ordering (AGE-33) remain in the green test
+  set. Five additional AGE-35 char tests landed in
+  `3605b96 test(age-35): characterize routing and lifecycle caller behavior`
+  pinning `BalanceContext` refresh/scan, one-shot route wiring, REPL
+  route wiring, GUI no-lifecycle, and one-shot post-run quota tick.
+- **Revisit when**: deferred surfaces are scheduled into sibling
+  AGE-8-* WUs; if the latent topology-probe drift surfaces in
+  production (i.e., a caller starts using `compute_projections(Some)`),
+  reticket to consolidate Drift Set 2.
