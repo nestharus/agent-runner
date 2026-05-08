@@ -267,11 +267,58 @@ fn age_35_gui_test_model_with_db_path_remains_outside_invocation_lifecycle() {
     let source_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
     let source = fs::read_to_string(&source_path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", source_path.display()));
+    let command_start = source
+        .find("async fn test_model(")
+        .expect("test_model command signature");
+    let command_decl_end = source[command_start..]
+        .find(")")
+        .map(|idx| command_start + idx)
+        .expect("test_model command signature close");
+    let command_decl = &source[command_start..=command_decl_end];
     let body = source_block_after(&source, "fn test_model_with_db_path(");
 
     assert!(
-        body.contains("balancer::select_provider(&model, &db, None)"),
+        command_decl.contains("name: String"),
+        "test_model Tauri command must keep the existing name argument"
+    );
+    assert!(
+        command_decl.contains("tauri::State"),
+        "test_model Tauri command must keep state injection internal to Tauri"
+    );
+    assert!(
+        !command_decl.contains("RoutingServicePort") && !command_decl.contains("routing"),
+        "test_model Tauri command must not expose routing over IPC"
+    );
+    assert!(
+        body.contains("RoutingServiceRequest"),
+        "test_model_with_db_path should route through the routing service request"
+    );
+    assert!(
+        body.contains(".select_route("),
+        "test_model_with_db_path should select via RoutingServicePort"
+    );
+    assert!(
+        body.contains("ctx: None"),
         "test_model_with_db_path should keep cached-only routing"
+    );
+    assert!(
+        !body.contains("balancer::select_provider"),
+        "test_model_with_db_path should not call balancer::select_provider directly after cutover"
+    );
+    let route = body.find(".select_route(").expect("routing service call");
+    let effective_provider = body
+        .find("effective_provider_for_model_provider")
+        .expect("effective provider resolution");
+    let exhausted_mark = body
+        .find("db.mark_exhausted(&provider.name)")
+        .expect("caller-owned exhausted mark");
+    assert!(
+        route < effective_provider,
+        "effective-provider resolution must remain downstream of provider index selection"
+    );
+    assert!(
+        effective_provider < exhausted_mark,
+        "quota-like stderr exhaustion marking must remain caller-owned after execution"
     );
     assert!(
         body.contains("parent_invocation_env: None"),
@@ -280,6 +327,7 @@ fn age_35_gui_test_model_with_db_path_remains_outside_invocation_lifecycle() {
     for lifecycle_call in [
         "start_invocation(",
         "finalize_invocation(",
+        "InvocationLifecycle",
         "CompositeInvocationId",
         "record_returned_artifacts(",
         "increment_calls_since_refresh(",
