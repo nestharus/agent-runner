@@ -134,6 +134,52 @@ fn model_config_repository_delegates_load_save_list_and_delete() {
 }
 
 #[test]
+fn repository_load_models_validates_provider_overlap_by_contract() {
+    let dir = tempfile::tempdir().unwrap();
+    let models_dir = dir.path().join("models");
+    fs::create_dir_all(&models_dir).unwrap();
+    let repo = FilesystemModelConfigRepository;
+    let model = ModelConfig {
+        name: "gpt-high".to_string(),
+        prompt_mode: PromptMode::Stdin,
+        providers: vec![ProviderConfig::model_provider(
+            "codex",
+            vec!["exec".to_string(), "-m".to_string(), "gpt-5.5".to_string()],
+        )],
+        inputs: vec![],
+    };
+    write(
+        &dir.path().join("providers.toml"),
+        r#"
+[codex]
+command = "codex"
+args = ["exec", "-c", "sandbox=workspace-write"]
+"#,
+    );
+    let providers = ProvidersConfig::load(&dir.path().join("providers.toml")).unwrap();
+
+    <FilesystemModelConfigRepository as ModelConfigRepository>::save_model(
+        &repo,
+        &models_dir,
+        &model,
+    )
+    .unwrap();
+
+    let trait_loaded =
+        <FilesystemModelConfigRepository as ModelConfigRepository>::load_models(&repo, &models_dir)
+            .unwrap();
+    assert!(trait_loaded.contains_key("gpt-high"));
+    assert!(
+        load_models(&models_dir, None)
+            .unwrap()
+            .contains_key("gpt-high")
+    );
+
+    let err = load_models(&models_dir, Some(&providers)).unwrap_err();
+    assert!(err.contains("duplicates root [codex].args"), "{err}");
+}
+
+#[test]
 fn providers_config_repository_delegates_load_and_provider_resolution() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("providers.toml");

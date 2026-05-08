@@ -265,6 +265,10 @@ fn get_model(state: tauri::State<AppState>, name: String) -> Result<ModelConfig,
 
 #[tauri::command]
 fn save_model(state: tauri::State<AppState>, model: ModelConfig) -> Result<(), String> {
+    save_model_inner(&state, model)
+}
+
+fn save_model_inner(state: &AppState, model: ModelConfig) -> Result<(), String> {
     if model.name.is_empty() {
         return Err("Model name cannot be empty".to_string());
     }
@@ -276,7 +280,8 @@ fn save_model(state: tauri::State<AppState>, model: ModelConfig) -> Result<(), S
             return Err(format!("Provider {} has empty name", i + 1));
         }
     }
-    let toml_content = model.to_toml();
+    let providers = load_providers_for_models_dir(&state.models_dir);
+    let toml_content = config::render_validated_model_toml(&model, Some(&providers))?;
     let path = state.models_dir.join(format!("{}.toml", model.name));
 
     std::fs::create_dir_all(&state.models_dir)
@@ -413,6 +418,14 @@ fn update_pool(
     original_commands: Vec<String>,
     new_commands: Vec<String>,
 ) -> Result<(), String> {
+    update_pool_inner(&state, original_commands, new_commands)
+}
+
+fn update_pool_inner(
+    state: &AppState,
+    original_commands: Vec<String>,
+    new_commands: Vec<String>,
+) -> Result<(), String> {
     if new_commands.is_empty() {
         return Err("Pool must have at least one command".to_string());
     }
@@ -425,10 +438,11 @@ fn update_pool(
     new_sorted.sort();
     new_sorted.dedup();
 
-    let mut models = state.models.lock().map_err(|e| e.to_string())?;
+    let providers = load_providers_for_models_dir(&state.models_dir);
+    let mut models_guard = state.models.lock().map_err(|e| e.to_string())?;
 
     // Find models matching the original command set (using provider names)
-    let matching_names: Vec<String> = models
+    let matching_names: Vec<String> = models_guard
         .values()
         .filter(|m| {
             let mut cmds: Vec<String> = m.providers.iter().map(|p| p.name.clone()).collect();
@@ -443,6 +457,8 @@ fn update_pool(
         return Err("No models found with the specified command set".to_string());
     }
 
+    let mut updates = Vec::new();
+
     // Compute added and removed provider names
     let removed: Vec<&String> = orig_sorted
         .iter()
@@ -454,7 +470,7 @@ fn update_pool(
         .collect();
 
     for name in &matching_names {
-        let model = models.get_mut(name).unwrap();
+        let mut model = models_guard.get(name).unwrap().clone();
 
         // Remove providers whose extracted provider name is in the removed set
         model.providers.retain(|p| !removed.contains(&&p.name));
@@ -471,11 +487,15 @@ fn update_pool(
             return Err(format!("Model '{}' would end up with zero providers", name));
         }
 
-        // Write updated toml
-        let toml_content = model.to_toml();
+        let toml_content = config::render_validated_model_toml(&model, Some(&providers))?;
+        updates.push((name.clone(), model, toml_content));
+    }
+
+    for (name, model, toml_content) in updates {
         let path = state.models_dir.join(format!("{}.toml", name));
         std::fs::write(&path, &toml_content)
             .map_err(|e| format!("Failed to write model file for '{}': {e}", name))?;
+        models_guard.insert(name, model);
     }
 
     Ok(())
@@ -820,6 +840,226 @@ mod tests {
                 .collect(),
             inputs: vec![],
         }
+    }
+
+    fn model_with_provider_args(name: &str, provider_name: &str, args: &[&str]) -> ModelConfig {
+        ModelConfig {
+            name: name.to_string(),
+            prompt_mode: PromptMode::Stdin,
+            providers: vec![ProviderConfig::model_provider(
+                provider_name,
+                args.iter().map(|arg| (*arg).to_string()).collect(),
+            )],
+            inputs: vec![],
+        }
+    }
+
+    fn test_state(models_dir: PathBuf, models: HashMap<String, ModelConfig>) -> AppState {
+        AppState {
+            models: Mutex::new(models),
+            models_dir,
+            setup_input_tx: Mutex::new(None),
+            quota_in_flight: quota::InFlight::new(),
+        }
+    }
+
+    fn write_codex_providers(root: &Path) {
+        std::fs::write(
+            root.join("providers.toml"),
+            r#"
+[codex]
+command = "codex"
+args = ["exec", "-c", "sandbox=workspace-write"]
+interactive_args = ["exec", "--dangerously-bypass-approvals-and-sandbox"]
+"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn save_model_inner_rejects_duplicate_codex_args_without_disk_or_memory_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        write_codex_providers(dir.path());
+        let state = test_state(models_dir.clone(), HashMap::new());
+        let model = model_with_provider_args("gpt-high", "codex", &["exec", "-m", "gpt-5.5"]);
+
+        let err = super::save_model_inner(&state, model).unwrap_err();
+
+        assert!(err.contains("duplicates root [codex].args"), "{err}");
+        assert!(!models_dir.join("gpt-high.toml").exists());
+        assert!(!state.models.lock().unwrap().contains_key("gpt-high"));
+    }
+
+    #[test]
+    fn save_model_inner_accepts_clean_model_and_provider_aware_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        write_codex_providers(dir.path());
+        let providers = config::ProvidersConfig::load(&dir.path().join("providers.toml")).unwrap();
+        let state = test_state(models_dir.clone(), HashMap::new());
+        let model = model_with_provider_args(
+            "gpt-high",
+            "codex",
+            &["-m", "gpt-5.5", "-c", "model_reasoning_effort=high"],
+        );
+
+        super::save_model_inner(&state, model).unwrap();
+
+        assert!(models_dir.join("gpt-high.toml").exists());
+        let loaded = config::load_models(&models_dir, Some(&providers)).unwrap();
+        assert!(loaded.contains_key("gpt-high"));
+    }
+
+    #[test]
+    fn save_model_inner_accepts_duplicate_shape_without_sibling_providers() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let state = test_state(models_dir.clone(), HashMap::new());
+        let model = model_with_provider_args("gpt-high", "codex", &["exec", "-m", "gpt-5.5"]);
+
+        super::save_model_inner(&state, model).unwrap();
+
+        assert!(models_dir.join("gpt-high.toml").exists());
+        assert!(
+            config::load_models(&models_dir, None)
+                .unwrap()
+                .contains_key("gpt-high")
+        );
+    }
+
+    #[test]
+    fn save_model_inner_preserves_existing_basic_validation_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path().join("models"), HashMap::new());
+
+        let empty_name = model_with_provider_args("", "codex", &["-m", "gpt-5.5"]);
+        assert_eq!(
+            super::save_model_inner(&state, empty_name).unwrap_err(),
+            "Model name cannot be empty"
+        );
+
+        let no_providers = ModelConfig {
+            name: "gpt-high".to_string(),
+            prompt_mode: PromptMode::Stdin,
+            providers: vec![],
+            inputs: vec![],
+        };
+        assert_eq!(
+            super::save_model_inner(&state, no_providers).unwrap_err(),
+            "Model must have at least one provider"
+        );
+
+        let empty_provider_name = model_with_provider_args("gpt-high", "", &["-m", "gpt-5.5"]);
+        assert_eq!(
+            super::save_model_inner(&state, empty_provider_name).unwrap_err(),
+            "Provider 1 has empty name"
+        );
+    }
+
+    #[test]
+    fn update_pool_inner_rejects_duplicate_preserving_rewrite_without_file_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        write_codex_providers(dir.path());
+        let model = model_with_provider_args("gpt-high", "codex", &["exec", "-m", "gpt-5.5"]);
+        let model_path = models_dir.join("gpt-high.toml");
+        std::fs::write(&model_path, "sentinel").unwrap();
+        let state = test_state(models_dir, HashMap::from([(model.name.clone(), model)]));
+
+        let err = super::update_pool_inner(
+            &state,
+            vec!["codex".to_string()],
+            vec!["codex".to_string(), "claude".to_string()],
+        )
+        .unwrap_err();
+
+        assert!(err.contains("duplicates root [codex].args"), "{err}");
+        assert_eq!(std::fs::read_to_string(&model_path).unwrap(), "sentinel");
+    }
+
+    #[test]
+    fn update_pool_inner_accepts_clean_rewrite_and_added_provider_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        write_codex_providers(dir.path());
+        let providers = config::ProvidersConfig::load(&dir.path().join("providers.toml")).unwrap();
+        let model = model_with_provider_args("claude-high", "claude", &["--model", "sonnet"]);
+        std::fs::write(models_dir.join("claude-high.toml"), model.to_toml()).unwrap();
+        let state = test_state(
+            models_dir.clone(),
+            HashMap::from([(model.name.clone(), model)]),
+        );
+
+        super::update_pool_inner(
+            &state,
+            vec!["claude".to_string()],
+            vec!["claude".to_string(), "codex".to_string()],
+        )
+        .unwrap();
+
+        let loaded = config::load_models(&models_dir, Some(&providers)).unwrap();
+        let codex = loaded["claude-high"]
+            .providers
+            .iter()
+            .find(|provider| provider.name == "codex")
+            .expect("codex provider was added");
+        assert!(codex.args.is_empty());
+    }
+
+    #[test]
+    fn update_pool_inner_accepts_duplicate_preserving_rewrite_without_sibling_providers() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let model = model_with_provider_args("gpt-high", "codex", &["exec", "-m", "gpt-5.5"]);
+        std::fs::write(models_dir.join("gpt-high.toml"), model.to_toml()).unwrap();
+        let state = test_state(
+            models_dir.clone(),
+            HashMap::from([(model.name.clone(), model)]),
+        );
+
+        super::update_pool_inner(
+            &state,
+            vec!["codex".to_string()],
+            vec!["codex".to_string(), "claude".to_string()],
+        )
+        .unwrap();
+
+        assert!(
+            config::load_models(&models_dir, None)
+                .unwrap()
+                .contains_key("gpt-high")
+        );
+    }
+
+    #[test]
+    fn update_pool_inner_preserves_existing_command_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = model_with_provider_args("claude-high", "claude", &["--model", "sonnet"]);
+        let state = test_state(
+            dir.path().join("models"),
+            HashMap::from([(model.name.clone(), model)]),
+        );
+
+        assert_eq!(
+            super::update_pool_inner(&state, vec!["claude".to_string()], vec![]).unwrap_err(),
+            "Pool must have at least one command"
+        );
+        assert_eq!(
+            super::update_pool_inner(
+                &state,
+                vec!["codex".to_string()],
+                vec!["codex".to_string(), "claude".to_string()],
+            )
+            .unwrap_err(),
+            "No models found with the specified command set"
+        );
     }
 
     #[test]

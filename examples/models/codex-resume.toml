@@ -1,10 +1,4 @@
 [[providers]]
 name = "codex"
-args = [
-  "exec",
-  "--json",
-  "-m", "gpt-5.4",
-]
-interactive_args = [
-  "-m", "gpt-5.4",
-]
+args = ["-m", "gpt-5.4"]
+interactive_args = ["-m", "gpt-5.4"]

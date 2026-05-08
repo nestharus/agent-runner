@@ -4,6 +4,7 @@ import { createResource, createSignal, For, Show } from "solid-js";
 import type { ArgAnalysis } from "../lib/args";
 import { analyzeProviderArgs } from "../lib/args";
 import { resolveModelName } from "../lib/grouping";
+import { isDeniedProviderLevelFlag } from "../lib/providerFlags";
 import { getModel, saveModel, testModel } from "../lib/tauri";
 import type {
 	ModelConfig,
@@ -111,12 +112,12 @@ export default function ModelPanel(props: ModelPanelProps) {
 		for (const form of providerForms()) {
 			const args: string[] = [];
 			for (const common of form.analysis.common) {
-				if (common.key.startsWith("--dangerously-") || common.key === "--yolo")
-					continue;
+				if (isDeniedProviderLevelFlag(common.key)) continue;
 				if (common.key) args.push(common.key);
 				if (common.value !== null) args.push(common.value);
 			}
 			for (const v of form.analysis.variable) {
+				if (isDeniedProviderLevelFlag(v.key)) continue;
 				const val = form.variableValues[v.key];
 				if (v.key) args.push(v.key);
 				if (val) args.push(val);

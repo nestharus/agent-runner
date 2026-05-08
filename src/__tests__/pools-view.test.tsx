@@ -18,6 +18,19 @@ const clearHandlers = tauriMock.__clearHandlers as () => void;
 
 const noop = () => {};
 
+function modelWithProviderArgs(
+	name: string,
+	providerName: string,
+	args: string[],
+) {
+	return {
+		name,
+		prompt_mode: "stdin",
+		providers: [{ name: providerName, args }],
+		inputs: [],
+	};
+}
+
 function renderWithQuery(ui: () => any) {
 	const queryClient = new QueryClient({
 		defaultOptions: { queries: { retry: false } },
@@ -241,6 +254,158 @@ describe("PoolsView", () => {
 
 		await waitFor(() => {
 			expect(screen.getByTitle("Pool settings")).toBeTruthy();
+		});
+	});
+
+	it("surfaces detected provider-level dangerous flags in pool settings", async () => {
+		setHandler("list_pools", () =>
+			Promise.resolve([
+				{
+					commands: ["codex"],
+					model_count: 1,
+					model_names: ["gpt-high"],
+				},
+			]),
+		);
+		setHandler("get_model", () =>
+			Promise.resolve(
+				modelWithProviderArgs("gpt-high", "codex", [
+					"--dangerously-bypass-approvals-and-sandbox",
+					"-m",
+					"gpt-5.5",
+				]),
+			),
+		);
+
+		renderWithQuery(() => <PoolsView onRunSetup={noop} />);
+
+		await waitFor(() => {
+			expect(screen.getByTitle("Pool settings")).toBeTruthy();
+		});
+		fireEvent.click(screen.getByTitle("Pool settings"));
+
+		await waitFor(() => {
+			expect(screen.getByText("Bypass Approvals & Sandbox")).toBeTruthy();
+			expect(
+				screen.getByText("--dangerously-bypass-approvals-and-sandbox"),
+			).toBeTruthy();
+		});
+	});
+
+	it("does not save when interacting with the read-only bypass approvals and sandbox flag row", async () => {
+		let saveCalls = 0;
+		setHandler("list_pools", () =>
+			Promise.resolve([
+				{
+					commands: ["codex"],
+					model_count: 1,
+					model_names: ["gpt-high"],
+				},
+			]),
+		);
+		setHandler("get_model", () =>
+			Promise.resolve(
+				modelWithProviderArgs("gpt-high", "codex", [
+					"--dangerously-bypass-approvals-and-sandbox",
+					"-m",
+					"gpt-5.5",
+				]),
+			),
+		);
+		setHandler("save_model", () => {
+			saveCalls += 1;
+			return Promise.resolve();
+		});
+
+		renderWithQuery(() => <PoolsView onRunSetup={noop} />);
+
+		await waitFor(() => {
+			expect(screen.getByTitle("Pool settings")).toBeTruthy();
+		});
+		fireEvent.click(screen.getByTitle("Pool settings"));
+		await waitFor(() => {
+			expect(screen.getByText("Bypass Approvals & Sandbox")).toBeTruthy();
+		});
+
+		fireEvent.click(screen.getByText("Bypass Approvals & Sandbox"));
+		await waitFor(
+			() => {
+				expect(saveCalls).toBe(0);
+			},
+			{ timeout: 50 },
+		);
+	});
+
+	it("does not save when interacting with the read-only yolo flag row", async () => {
+		let saveCalls = 0;
+		setHandler("list_pools", () =>
+			Promise.resolve([
+				{
+					commands: ["codex"],
+					model_count: 1,
+					model_names: ["gpt-high"],
+				},
+			]),
+		);
+		setHandler("get_model", () =>
+			Promise.resolve(
+				modelWithProviderArgs("gpt-high", "codex", ["--yolo", "-m", "gpt-5.5"]),
+			),
+		);
+		setHandler("save_model", () => {
+			saveCalls += 1;
+			return Promise.resolve();
+		});
+
+		renderWithQuery(() => <PoolsView onRunSetup={noop} />);
+
+		await waitFor(() => {
+			expect(screen.getByTitle("Pool settings")).toBeTruthy();
+		});
+		fireEvent.click(screen.getByTitle("Pool settings"));
+		await waitFor(() => {
+			expect(screen.getByText("YOLO Mode")).toBeTruthy();
+		});
+
+		fireEvent.click(screen.getByText("YOLO Mode"));
+		await waitFor(
+			() => {
+				expect(saveCalls).toBe(0);
+			},
+			{ timeout: 50 },
+		);
+	});
+
+	it("calls update_pool with original and new command arrays when removing a pool tag", async () => {
+		let updateArgs: any = null;
+		setHandler("list_pools", () =>
+			Promise.resolve([
+				{
+					commands: ["claude", "codex"],
+					model_count: 1,
+					model_names: ["gpt-high"],
+				},
+			]),
+		);
+		setHandler("update_pool", (args: any) => {
+			updateArgs = args;
+			return Promise.resolve();
+		});
+
+		renderWithQuery(() => <PoolsView onRunSetup={noop} />);
+
+		await waitFor(() => {
+			expect(screen.getByText("codex")).toBeTruthy();
+		});
+		const codexTag = screen.getByText("codex");
+		fireEvent.click(codexTag);
+		fireEvent.keyDown(codexTag, { key: "Backspace" });
+
+		await waitFor(() => {
+			expect(updateArgs).toEqual({
+				originalCommands: ["claude", "codex"],
+				newCommands: ["claude"],
+			});
 		});
 	});
 });

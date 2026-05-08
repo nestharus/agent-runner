@@ -7,6 +7,7 @@ import {
 } from "@solidjs/testing-library";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import ModelPanel from "../components/ModelPanel";
+import type { ModelConfig } from "../lib/types";
 
 const tauriMock = await vi.importMock<any>("@tauri-apps/api/core");
 const setHandler = tauriMock.__setHandler as (
@@ -22,6 +23,31 @@ function renderEditPanel() {
 			poolCommands={["sh"]}
 			modelNames={[]}
 			editModelName="sigterm-model"
+			onSave={() => {}}
+			onClose={() => {}}
+		/>
+	));
+}
+
+function modelWithCodexArgs(name: string, args: string[]): ModelConfig {
+	return {
+		name,
+		prompt_mode: "stdin",
+		providers: [{ name: "codex", args }],
+		inputs: [],
+	};
+}
+
+function renderCodexEditPanel(
+	modelNames: string[],
+	editModelName = modelNames[0],
+) {
+	return render(() => (
+		<ModelPanel
+			mode="edit"
+			poolCommands={["codex"]}
+			modelNames={modelNames}
+			editModelName={editModelName}
 			onSave={() => {}}
 			onClose={() => {}}
 		/>
@@ -64,5 +90,137 @@ describe("ModelPanel", () => {
 		await waitFor(() => {
 			expect(screen.getByText("Test failed (exit -1)")).toBeTruthy();
 		});
+	});
+
+	it("omits common bypass approvals and sandbox flags from the save payload", async () => {
+		const savedModel: { current: ModelConfig | null } = { current: null };
+		const models: Record<string, ModelConfig> = {
+			"gpt-high": modelWithCodexArgs("gpt-high", [
+				"--dangerously-bypass-approvals-and-sandbox",
+				"-m",
+				"gpt-5.5",
+			]),
+			"gpt-low": modelWithCodexArgs("gpt-low", [
+				"--dangerously-bypass-approvals-and-sandbox",
+				"-m",
+				"gpt-5.5",
+			]),
+		};
+		setHandler("get_model", (args: any) => Promise.resolve(models[args.name]));
+		setHandler("save_model", (args: any) => {
+			savedModel.current = args.model;
+			return Promise.resolve();
+		});
+
+		renderCodexEditPanel(["gpt-high", "gpt-low"], "gpt-high");
+
+		await waitFor(() => {
+			expect(screen.getByText("codex")).toBeTruthy();
+		});
+		fireEvent.click(screen.getByText("Save & Test"));
+
+		await waitFor(() => {
+			expect(savedModel.current).not.toBeNull();
+		});
+		const saved = savedModel.current;
+		if (!saved) throw new Error("expected save_model payload");
+		expect(saved.providers[0].args).not.toContain(
+			"--dangerously-bypass-approvals-and-sandbox",
+		);
+	});
+
+	it("omits variable bypass approvals and sandbox flags from the save payload", async () => {
+		const savedModel: { current: ModelConfig | null } = { current: null };
+		const models: Record<string, ModelConfig> = {
+			"gpt-high": modelWithCodexArgs("gpt-high", [
+				"--dangerously-bypass-approvals-and-sandbox",
+				"enabled",
+				"-m",
+				"gpt-5.5",
+			]),
+			"gpt-low": modelWithCodexArgs("gpt-low", ["-m", "gpt-5.4"]),
+		};
+		setHandler("get_model", (args: any) => Promise.resolve(models[args.name]));
+		setHandler("save_model", (args: any) => {
+			savedModel.current = args.model;
+			return Promise.resolve();
+		});
+
+		renderCodexEditPanel(["gpt-high", "gpt-low"], "gpt-high");
+
+		await waitFor(() => {
+			expect(
+				screen.getByText("--dangerously-bypass-approvals-and-sandbox"),
+			).toBeTruthy();
+		});
+		fireEvent.click(screen.getByText("Save & Test"));
+
+		await waitFor(() => {
+			expect(savedModel.current).not.toBeNull();
+		});
+		const saved = savedModel.current;
+		if (!saved) throw new Error("expected save_model payload");
+		expect(saved.providers[0].args).not.toContain(
+			"--dangerously-bypass-approvals-and-sandbox",
+		);
+	});
+
+	it("omits yolo flags from common and variable save payload paths", async () => {
+		let savedModels: ModelConfig[] = [];
+		const commonModels: Record<string, ModelConfig> = {
+			"gpt-high": modelWithCodexArgs("gpt-high", ["--yolo", "-m", "gpt-5.5"]),
+			"gpt-low": modelWithCodexArgs("gpt-low", ["--yolo", "-m", "gpt-5.5"]),
+		};
+		setHandler("get_model", (args: any) =>
+			Promise.resolve(commonModels[args.name]),
+		);
+		setHandler("save_model", (args: any) => {
+			savedModels.push(args.model);
+			return Promise.resolve();
+		});
+
+		const commonRender = renderCodexEditPanel(
+			["gpt-high", "gpt-low"],
+			"gpt-high",
+		);
+		await waitFor(() => {
+			expect(screen.getByText("codex")).toBeTruthy();
+		});
+		fireEvent.click(screen.getByText("Save & Test"));
+		await waitFor(() => {
+			expect(savedModels.length).toBe(1);
+		});
+		expect(savedModels[0].providers[0].args).not.toContain("--yolo");
+		commonRender.unmount();
+		cleanup();
+		clearHandlers();
+
+		savedModels = [];
+		const variableModels: Record<string, ModelConfig> = {
+			"gpt-high": modelWithCodexArgs("gpt-high", [
+				"--yolo",
+				"enabled",
+				"-m",
+				"gpt-5.5",
+			]),
+			"gpt-low": modelWithCodexArgs("gpt-low", ["-m", "gpt-5.4"]),
+		};
+		setHandler("get_model", (args: any) =>
+			Promise.resolve(variableModels[args.name]),
+		);
+		setHandler("save_model", (args: any) => {
+			savedModels.push(args.model);
+			return Promise.resolve();
+		});
+
+		renderCodexEditPanel(["gpt-high", "gpt-low"], "gpt-high");
+		await waitFor(() => {
+			expect(screen.getByText("--yolo")).toBeTruthy();
+		});
+		fireEvent.click(screen.getByText("Save & Test"));
+		await waitFor(() => {
+			expect(savedModels.length).toBe(1);
+		});
+		expect(savedModels[0].providers[0].args).not.toContain("--yolo");
 	});
 });

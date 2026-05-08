@@ -13,6 +13,10 @@ import PoolCard from "../components/PoolCard";
 import PoolSettingsPanel from "../components/PoolSettingsPanel";
 import SetupSession from "../components/SetupSession";
 import {
+	isDeniedProviderLevelFlag,
+	PROVIDER_LEVEL_FLAG_LABELS,
+} from "../lib/providerFlags";
+import {
 	deleteModel,
 	getModel,
 	listPools,
@@ -243,7 +247,7 @@ export default function PoolsView(props: PoolsViewProps) {
 				const model = await getModel(name);
 				for (const provider of model.providers) {
 					for (const arg of provider.args) {
-						if (arg.startsWith("--dangerously-") || arg === "--yolo") {
+						if (isDeniedProviderLevelFlag(arg)) {
 							flags.add(arg);
 						}
 					}
@@ -255,7 +259,11 @@ export default function PoolsView(props: PoolsViewProps) {
 
 		setPoolSettings({
 			poolCommands,
-			commonFlags: [...flags].sort(),
+			commonFlags: [...flags].sort((a, b) =>
+				(PROVIDER_LEVEL_FLAG_LABELS[a] ?? a).localeCompare(
+					PROVIDER_LEVEL_FLAG_LABELS[b] ?? b,
+				),
+			),
 		});
 	}
 
@@ -265,6 +273,10 @@ export default function PoolsView(props: PoolsViewProps) {
 		flag: string,
 		enabled: boolean,
 	) {
+		if (isDeniedProviderLevelFlag(flag)) {
+			return;
+		}
+
 		for (const name of modelNames) {
 			try {
 				const model = await getModel(name);
