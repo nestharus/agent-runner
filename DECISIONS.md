@@ -835,3 +835,21 @@ The four discoveries are listed here so a later consolidation WU can pick them u
 - **Verdicts**: all four LOW; supported-surface termination NONE. ✓
 - **Audit-history**: R1 + R2 entries recorded with closure of R1-F01..F05 in R2.
 - **Revisit when**: the orchestrator is wrapped in an `agents` invocation (single root), or `agents trace` grows multi-root aggregation.
+
+## AGE-34 — Phase 6 process-tree-audit substitution (2026-05-08)
+
+- **Decision**: Substitute process-tree audit #2 with orchestrator self-audit, same rationale as Phase 4 (no single root `agents` invocation).
+- **Self-audit**:
+  - Step 6b invocation UUID: `9dd9e660-04f6-4aa3-b0f0-a1f297f034b8` (model: `gpt-high`).
+  - Step 6c invocation UUID: `d2f800e0-d6e8-4e48-a3b4-f1a36a6e5894` (model: `gpt-high`).
+  - **Distinct UUIDs ✓**. Step 6b never sees the implementation; Step 6c reads the contract + tests + proposal + problem map.
+  - **Output index exists**: `planning/age-34-executor-launcher-quota-diagnostics/.scratch/phase6/step6b-output-index.md` (58 lines).
+  - **Step 6c log echoes consumed Step 6b outputs**: log explicitly lists the index path AND each test file (`crates/oulipoly-runtime/tests/service_traits_compile.rs`, `crates/oulipoly-runtime/tests/age34_runtime_executor_service_routing.rs`, `_launcher_`, `_quota_`, `_diagnostics_`). ✓
+  - **Local gates green** (per Step 6c log): `cargo fmt --check` exit 0; `cargo clippy -- -D warnings` exit 0; `cargo test` exit 0. Frontend gates not run (no frontend touched). ✓
+  - **Test residuals**: none.
+  - **Halt record + Prototype swap record**: explicit `non-applicable` at `planning/age-34-executor-launcher-quota-diagnostics/risk/age-34-{halt,prototype-swap}-record.md`. ✓
+  - **Phase 6 halt-state transition gate**: passes via explicit non-applicable branch (single-level WU, no recursion).
+  - **Phase 7 pre-dispatch integration-tests gate**: no-op (no `LevelComponentSet` from post-prototype derivation; defer-to-prototype answered B at Phase 2.5).
+  - **Phase 7 pre-dispatch swap-record gate**: passes via explicit non-applicable branch (no prototype was run).
+- **Commit**: `9cc3920 refactor(AGE-34): land production runtime service adapters`.
+- **Revisit when**: orchestrator wrapped in single root `agents` invocation.
