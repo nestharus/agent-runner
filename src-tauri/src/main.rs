@@ -145,6 +145,7 @@ enum Subcommands {
         models_dir: Option<PathBuf>,
     },
     /// Resume a provider session non-interactively with an answer payload.
+    #[command(group = clap::ArgGroup::new("resume_target").args(["session_id", "chain_id"]).required(true).multiple(false))]
     Resume {
         /// Model id whose provider pool must include the session owner.
         #[arg(short, long)]
@@ -152,7 +153,11 @@ enum Subcommands {
 
         /// Provider session UUID to resume.
         #[arg(long = "session-id")]
-        session_id: String,
+        session_id: Option<String>,
+
+        /// Provider session chain UUID to resume.
+        #[arg(value_name = "CHAIN_ID")]
+        chain_id: Option<String>,
 
         /// Manually migrate the active chain segment to the named provider.
         #[arg(long = "migrate")]
@@ -382,20 +387,27 @@ fn run(cli: Cli) -> Result<i32, String> {
             Subcommands::Resume {
                 model,
                 session_id,
+                chain_id,
                 migrate,
                 prompt,
                 file,
                 project,
                 models_dir,
-            } => run_resume(
-                model.as_deref(),
-                &session_id,
-                migrate.as_deref(),
-                prompt.as_deref(),
-                file.as_deref(),
-                project.as_deref(),
-                models_dir.as_deref(),
-            ),
+            } => {
+                let resume_target = chain_id
+                    .as_deref()
+                    .or(session_id.as_deref())
+                    .expect("clap group ensures one is set");
+                run_resume(
+                    model.as_deref(),
+                    resume_target,
+                    migrate.as_deref(),
+                    prompt.as_deref(),
+                    file.as_deref(),
+                    project.as_deref(),
+                    models_dir.as_deref(),
+                )
+            }
             Subcommands::Session { command } => match command {
                 SessionSubcommands::Locate { session_id, json } => {
                     run_session_locate(&session_id, json)
@@ -2978,6 +2990,51 @@ mod tests {
     const TRACE_UUID: &str = "11111111-1111-1111-1111-111111111111";
     const REPL_MODEL: &str = "fixture-model";
 
+    trait ResumeSessionField {
+        fn as_optional_str(&self) -> Option<&str>;
+    }
+
+    impl ResumeSessionField for String {
+        fn as_optional_str(&self) -> Option<&str> {
+            Some(self.as_str())
+        }
+    }
+
+    impl ResumeSessionField for Option<String> {
+        fn as_optional_str(&self) -> Option<&str> {
+            self.as_deref()
+        }
+    }
+
+    fn resume_session_field_as_deref(field: &impl ResumeSessionField) -> Option<&str> {
+        field.as_optional_str()
+    }
+
+    fn parse_resume_subcommand<const N: usize>(argv: [&str; N]) -> Subcommands {
+        Cli::try_parse_from(argv)
+            .unwrap()
+            .command
+            .expect("resume argv should produce a subcommand")
+    }
+
+    fn assert_resume_debug_contains_option_field(
+        command: Subcommands,
+        field_name: &str,
+        expected: &str,
+    ) {
+        match &command {
+            Subcommands::Resume { .. } => {}
+            _ => panic!("expected resume subcommand"),
+        }
+
+        let rendered = format!("{command:?}");
+        let expected_fragment = format!("{field_name}: Some(\"{expected}\")");
+        assert!(
+            rendered.contains(&expected_fragment),
+            "expected `{expected_fragment}` in parsed Resume variant: {rendered}"
+        );
+    }
+
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -3394,6 +3451,64 @@ mod tests {
     }
 
     #[test]
+    fn resume_subcommand_accepts_positional_chain_id() {
+        let chain_id = "7ec82d7d-5f83-4be7-8868-b1ce3c9c3123";
+        let command = parse_resume_subcommand(["oulipoly-agent-runner", "resume", chain_id]);
+
+        // Keep this layout-tolerant: Phase 6c may use flat fields or a flattened target Args struct.
+        assert_resume_debug_contains_option_field(command, "chain_id", chain_id);
+    }
+
+    #[test]
+    fn resume_subcommand_accepts_session_id_flag() {
+        let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+        let command = parse_resume_subcommand([
+            "oulipoly-agent-runner",
+            "resume",
+            "--session-id",
+            session_id,
+        ]);
+
+        assert_resume_debug_contains_option_field(command, "session_id", session_id);
+    }
+
+    #[test]
+    fn resume_subcommand_rejects_both_positional_and_session_id() {
+        let err = match Cli::try_parse_from([
+            "oulipoly-agent-runner",
+            "resume",
+            "7ec82d7d-5f83-4be7-8868-b1ce3c9c3123",
+            "--session-id",
+            "5169694d-de0f-40d1-890c-6e28e55bab27",
+        ]) {
+            Ok(_) => panic!("expected clap to reject both resume target forms"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn resume_subcommand_rejects_no_target() {
+        let err = match Cli::try_parse_from(["oulipoly-agent-runner", "resume"]) {
+            Ok(_) => panic!("expected clap to reject resume without a target"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn resume_subcommand_dispatch_routes_positional_to_run_resume_arg() {
+        let chain_id = "7ec82d7d-5f83-4be7-8868-b1ce3c9c3123";
+        let command = parse_resume_subcommand(["oulipoly-agent-runner", "resume", chain_id]);
+
+        // Parser-level proxy for dispatch: the field selected by the Resume arm must hold
+        // the positional target unchanged so Phase 6c can pass it directly to run_resume.
+        assert_resume_debug_contains_option_field(command, "chain_id", chain_id);
+    }
+
+    #[test]
     fn resume_subcommand_parses_answer_file_and_project() {
         let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
         let cli = Cli::try_parse_from([
@@ -3421,9 +3536,13 @@ mod tests {
                 file,
                 project,
                 models_dir,
+                ..
             }) => {
                 assert_eq!(model.as_deref(), Some(REPL_MODEL));
-                assert_eq!(parsed_session, session_id);
+                assert_eq!(
+                    resume_session_field_as_deref(&parsed_session),
+                    Some(session_id)
+                );
                 assert_eq!(prompt, None);
                 assert_eq!(file, Some(PathBuf::from("/tmp/answer.md")));
                 assert_eq!(project, Some(PathBuf::from("/tmp/project")));
