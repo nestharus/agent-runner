@@ -11,7 +11,7 @@ use oulipoly_state::{AccountRecord, AuthMethod, AuthStatus, CliProviderRecord};
 use oulipoly_state::{DiscoveredModel, ModelParameter};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tauri::ipc::Channel;
 use tokio::sync::mpsc;
@@ -81,6 +81,14 @@ pub struct AppState {
     pub setup_input_tx: Mutex<Option<mpsc::Sender<UserResponse>>>,
     /// Tracks quota-refresh calls in flight so duplicate callers collapse.
     pub quota_in_flight: quota::InFlight,
+}
+
+fn load_providers_for_models_dir(models_dir: &Path) -> config::ProvidersConfig {
+    let config_root = models_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    config::ProvidersConfig::load(&config_root.join("providers.toml")).unwrap_or_default()
 }
 
 #[tauri::command]
@@ -197,7 +205,8 @@ async fn start_cli_setup(
 
 #[tauri::command]
 fn reload_models(state: tauri::State<AppState>) -> Result<(), String> {
-    let fresh = config::load_models(&state.models_dir).unwrap_or_default();
+    let providers = load_providers_for_models_dir(&state.models_dir);
+    let fresh = config::load_models(&state.models_dir, Some(&providers)).unwrap_or_default();
     let mut models = state.models.lock().map_err(|e| e.to_string())?;
     *models = fresh;
     Ok(())
@@ -709,7 +718,8 @@ pub fn run_tauri() {
         .map(|d| d.join("oulipoly-agent-runner").join("models"))
         .unwrap_or_else(|| PathBuf::from("models"));
 
-    let models = config::load_models(&models_dir).unwrap_or_default();
+    let providers = load_providers_for_models_dir(&models_dir);
+    let models = config::load_models(&models_dir, Some(&providers)).unwrap_or_default();
 
     tauri::Builder::default()
         .manage(AppState {

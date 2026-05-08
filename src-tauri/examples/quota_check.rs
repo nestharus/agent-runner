@@ -27,8 +27,8 @@ fn main() {
     println!("db:         {}", db_path.display());
     println!();
 
-    let models = load_models(&models_dir).expect("load models");
     let providers_cfg = ProvidersConfig::load(&providers_path).expect("load providers.toml");
+    let models = load_models(&models_dir, Some(&providers_cfg)).expect("load models");
     let sessions_cfg =
         SessionsConfig::load(&config_dir.join("sessions.toml")).expect("load sessions.toml");
     let db = StateDb::open(&db_path).expect("open state db");

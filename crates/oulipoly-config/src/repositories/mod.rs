@@ -54,7 +54,7 @@ pub struct FilesystemModelConfigRepository;
 
 impl ModelConfigRepository for FilesystemModelConfigRepository {
     fn load_models(&self, dir: &Path) -> Result<HashMap<String, ModelConfig>, String> {
-        load_models(dir)
+        load_models(dir, None)
     }
 
     fn save_model(&self, dir: &Path, model: &ModelConfig) -> Result<(), String> {

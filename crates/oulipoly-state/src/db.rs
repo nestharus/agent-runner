@@ -1522,7 +1522,7 @@ impl StateDb {
         let models_dir = dirs::config_dir()
             .map(|dir| dir.join("oulipoly-agent-runner").join("models"))
             .unwrap_or_else(|| std::path::PathBuf::from("models"));
-        let models = match load_models(&models_dir) {
+        let models = match load_models(&models_dir, None) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!(
