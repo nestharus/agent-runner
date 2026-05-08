@@ -7,7 +7,8 @@ pub use error::ServiceError;
 use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig, ProvidersConfig};
 use oulipoly_state::StateDb;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 macro_rules! service_dto {
     ($($name:ident),+ $(,)?) => {
@@ -21,12 +22,6 @@ macro_rules! service_dto {
 service_dto!(
     ConfigServiceRequest,
     ConfigServiceOutput,
-    SessionLifecycleRequest,
-    SessionLifecycleOutput,
-    ResumeServiceRequest,
-    ResumeServiceOutput,
-    MigrationServiceRequest,
-    MigrationServiceOutput,
     TraceServiceRequest,
     TraceServiceOutput,
     SessionExportServiceRequest,
@@ -38,6 +33,77 @@ service_dto!(
     MigrationMaintenanceServiceRequest,
     MigrationMaintenanceServiceOutput,
 );
+
+pub struct ResumeServiceRequest<'a> {
+    pub state: &'a oulipoly_state::StateDb,
+    pub models: &'a oulipoly_state::ModelStore,
+    pub input: &'a str,
+    pub model_override: Option<&'a str>,
+}
+
+#[derive(Debug)]
+pub enum ResumeServiceOutput {
+    ResumeResolved {
+        resolved: oulipoly_state::ResolvedResume,
+    },
+    ResumeRejected {
+        error: oulipoly_state::ResumeError,
+    },
+}
+
+pub struct ResumeAcceptanceRequest<'a> {
+    pub state: &'a oulipoly_state::StateDb,
+    pub invocation_row_id: i64,
+    pub status: &'a str,
+    pub evidence: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResumeAcceptanceOutput;
+
+pub struct SessionLifecycleRequest<'a> {
+    pub state: &'a oulipoly_state::StateDb,
+    pub sessions_cfg: &'a oulipoly_config::SessionsConfig,
+    pub provider_name: &'a str,
+    pub invocation_row_id: i64,
+    pub invocation_uuid: &'a str,
+    pub mode: SessionLifecycleIngestMode,
+    pub stderr: &'a mut dyn Write,
+}
+
+#[derive(Debug, Clone)]
+pub enum SessionLifecycleIngestMode {
+    Pinned { resume_target: String },
+    Unpinned { capture_method: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionLifecycleOutput {
+    pub emitted: bool,
+    pub session_id: Option<String>,
+}
+
+pub struct MigrationServiceRequest<'a> {
+    pub state: &'a oulipoly_state::StateDb,
+    pub sessions_cfg: &'a oulipoly_config::SessionsConfig,
+    pub resolved: &'a oulipoly_state::ResolvedResume,
+    pub manual_target: Option<&'a str>,
+    pub active_exhausted: bool,
+    pub migration_model: &'a oulipoly_config::ModelConfig,
+    pub effective_cwd: &'a Path,
+    pub stderr: &'a mut dyn Write,
+}
+
+#[derive(Debug)]
+pub enum MigrationServiceOutput {
+    Stay,
+    DecisionFailed {
+        warning: String,
+    },
+    Migrated {
+        segment: crate::migration::MigratedSegment,
+    },
+}
 
 #[derive(Debug)]
 #[expect(
@@ -168,6 +234,33 @@ impl ProductionInvocationLifecycleService {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProductionResumeService;
+
+impl ProductionResumeService {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProductionSessionLifecycleService;
+
+impl ProductionSessionLifecycleService {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProductionMigrationService;
+
+impl ProductionMigrationService {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
 pub trait ConfigServicePort: Send + Sync {
     fn load_config(
         &self,
@@ -218,15 +311,20 @@ pub trait InvocationLifecycleServicePort: Send + Sync {
 pub trait SessionLifecycleServicePort: Send + Sync {
     fn ingest_session(
         &self,
-        request: SessionLifecycleRequest,
+        request: SessionLifecycleRequest<'_>,
     ) -> Result<SessionLifecycleOutput, ServiceError>;
 }
 
 pub trait ResumeServicePort: Send + Sync {
     fn resolve_resume(
         &self,
-        request: ResumeServiceRequest,
+        request: ResumeServiceRequest<'_>,
     ) -> Result<ResumeServiceOutput, ServiceError>;
+
+    fn record_acceptance(
+        &self,
+        request: ResumeAcceptanceRequest<'_>,
+    ) -> Result<ResumeAcceptanceOutput, ServiceError>;
 }
 
 pub trait DiagnosticsServicePort: Send + Sync {
@@ -239,7 +337,7 @@ pub trait DiagnosticsServicePort: Send + Sync {
 pub trait MigrationServicePort: Send + Sync {
     fn migrate(
         &self,
-        request: MigrationServiceRequest,
+        request: MigrationServiceRequest<'_>,
     ) -> Result<MigrationServiceOutput, ServiceError>;
 }
 
@@ -317,5 +415,41 @@ impl InvocationLifecycleServicePort for ProductionInvocationLifecycleService {
             )
             .map(|_| InvocationLifecycleFinalizeOutput)
             .map_err(|message| ServiceError::Dependency { message })
+    }
+}
+
+impl ResumeServicePort for ProductionResumeService {
+    fn resolve_resume(
+        &self,
+        _request: ResumeServiceRequest<'_>,
+    ) -> Result<ResumeServiceOutput, ServiceError> {
+        unimplemented!("AGE-36 Step 6c implements ProductionResumeService::resolve_resume")
+    }
+
+    fn record_acceptance(
+        &self,
+        _request: ResumeAcceptanceRequest<'_>,
+    ) -> Result<ResumeAcceptanceOutput, ServiceError> {
+        unimplemented!("AGE-36 Step 6c implements ProductionResumeService::record_acceptance")
+    }
+}
+
+impl SessionLifecycleServicePort for ProductionSessionLifecycleService {
+    fn ingest_session(
+        &self,
+        _request: SessionLifecycleRequest<'_>,
+    ) -> Result<SessionLifecycleOutput, ServiceError> {
+        unimplemented!(
+            "AGE-36 Step 6c implements ProductionSessionLifecycleService::ingest_session"
+        )
+    }
+}
+
+impl MigrationServicePort for ProductionMigrationService {
+    fn migrate(
+        &self,
+        _request: MigrationServiceRequest<'_>,
+    ) -> Result<MigrationServiceOutput, ServiceError> {
+        unimplemented!("AGE-36 Step 6c implements ProductionMigrationService::migrate")
     }
 }
