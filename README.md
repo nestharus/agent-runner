@@ -100,6 +100,9 @@ crates/
   oulipoly-state/             SQLite state DB + schema probe
   oulipoly-runtime/           Executor, balancer, discovery, sessions, quota, trace
   oulipoly-setup/             Setup agent, detection, memory, sync
+  oulipoly-agent-store/       Versioned artifact storage binary (`agent-store`)
+  oulipoly-agent-scratchpad/  Invocation-private artifact workspace (`agent-scratchpad`)
+  oulipoly-agent-messenger/   Return-to-caller artifact binary (`agent-messenger`)
 src-tauri/                    Tauri/headless client crate
   src/
     main.rs                   CLI entry point
@@ -113,6 +116,8 @@ e2e/                          Playwright QA tests + screenshots
 ## CLI Usage
 
 When launched with no arguments, the app opens the desktop GUI. When given arguments, it runs in headless CLI mode.
+
+The workspace also ships standalone artifact tools: `agent-store`, `agent-scratchpad`, and `agent-messenger`. `agent-messenger` lets a child return durable artifact refs to its caller; one-shot and headless resume invocations record those refs as terminal `returned_artifacts`, and `trace --json` projects them under each invocation without changing raw provider stdout.
 
 ```bash
 oulipoly-agent-runner [OPTIONS] [AGENT] [PROMPT...]

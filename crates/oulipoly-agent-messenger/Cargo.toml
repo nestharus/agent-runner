@@ -1,0 +1,28 @@
+[package]
+name = "oulipoly-agent-messenger"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "oulipoly_agent_messenger"
+
+[[bin]]
+name = "agent-messenger"
+path = "src/main.rs"
+
+[dependencies]
+chrono.workspace = true
+clap.workspace = true
+oulipoly-agent-scratchpad = { path = "../oulipoly-agent-scratchpad" }
+oulipoly-agent-store = { path = "../oulipoly-agent-store" }
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+sha2.workspace = true
+tempfile.workspace = true

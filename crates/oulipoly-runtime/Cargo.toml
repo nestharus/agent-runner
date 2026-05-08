@@ -15,6 +15,7 @@ getrandom.workspace = true
 libc.workspace = true
 oulipoly-config = { path = "../oulipoly-config" }
 oulipoly-core = { path = "../oulipoly-core" }
+oulipoly-agent-messenger = { path = "../oulipoly-agent-messenger" }
 oulipoly-state = { path = "../oulipoly-state" }
 rusqlite.workspace = true
 serde.workspace = true
