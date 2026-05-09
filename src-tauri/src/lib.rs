@@ -334,6 +334,10 @@ pub struct QuotaRefreshEntry {
 async fn refresh_quotas(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<QuotaRefreshEntry>, String> {
+    refresh_quotas_inner(&state)
+}
+
+fn refresh_quotas_inner(state: &AppState) -> Result<Vec<QuotaRefreshEntry>, String> {
     // Collect the set of provider names that can actually benefit from a
     // quota refresh — i.e. names that appear in any model with >1 provider.
     let candidates: Vec<String> = {
@@ -628,7 +632,11 @@ fn open_state_db(state: &AppState) -> Result<StateDb, String> {
 
 #[tauri::command]
 fn list_cli_providers(state: tauri::State<AppState>) -> Result<Vec<CliProviderRecord>, String> {
-    let db = open_state_db(&state)?;
+    list_cli_providers_inner(&state)
+}
+
+fn list_cli_providers_inner(state: &AppState) -> Result<Vec<CliProviderRecord>, String> {
+    let db = open_state_db(state)?;
     db.list_cli_providers()
 }
 
@@ -637,7 +645,11 @@ fn get_cli_provider(
     state: tauri::State<AppState>,
     cli_name: String,
 ) -> Result<CliProviderRecord, String> {
-    let db = open_state_db(&state)?;
+    get_cli_provider_inner(&state, cli_name)
+}
+
+fn get_cli_provider_inner(state: &AppState, cli_name: String) -> Result<CliProviderRecord, String> {
+    let db = open_state_db(state)?;
     db.get_cli_provider(&cli_name)?
         .ok_or_else(|| format!("Provider '{}' not found", cli_name))
 }
@@ -647,7 +659,14 @@ fn list_accounts(
     state: tauri::State<AppState>,
     provider: Option<String>,
 ) -> Result<Vec<AccountRecord>, String> {
-    let db = open_state_db(&state)?;
+    list_accounts_inner(&state, provider)
+}
+
+fn list_accounts_inner(
+    state: &AppState,
+    provider: Option<String>,
+) -> Result<Vec<AccountRecord>, String> {
+    let db = open_state_db(state)?;
     db.list_accounts(provider.as_deref())
 }
 
@@ -665,6 +684,10 @@ fn add_account(
     state: tauri::State<AppState>,
     account: AddAccountInput,
 ) -> Result<AccountRecord, String> {
+    add_account_inner(&state, account)
+}
+
+fn add_account_inner(state: &AppState, account: AddAccountInput) -> Result<AccountRecord, String> {
     if account.id.is_empty() {
         return Err("Account id cannot be empty".to_string());
     }
@@ -675,7 +698,7 @@ fn add_account(
         return Err("Account profile_name cannot be empty".to_string());
     }
 
-    let db = open_state_db(&state)?;
+    let db = open_state_db(state)?;
 
     // Verify the provider exists
     db.get_cli_provider(&account.provider)?
@@ -701,7 +724,11 @@ fn remove_account(
     id: String,
     provider: String,
 ) -> Result<bool, String> {
-    let db = open_state_db(&state)?;
+    remove_account_inner(&state, id, provider)
+}
+
+fn remove_account_inner(state: &AppState, id: String, provider: String) -> Result<bool, String> {
+    let db = open_state_db(state)?;
     db.delete_account(&id, &provider)
 }
 
@@ -712,28 +739,43 @@ fn sync_provider(
 ) -> Result<CliProviderRecord, String> {
     // Detect the current state of this CLI using the existing detection module
     let cli_info = setup_core::detection::detect_single_cli(&cli_name);
+    let record = sync_provider_record_from_cli_info(&cli_name, cli_info);
 
-    let display_name = match cli_name.as_str() {
+    sync_provider_persist_record(&state, &record)?;
+    Ok(record)
+}
+
+fn sync_provider_display_name(cli_name: &str) -> &str {
+    match cli_name {
         "claude" => "Anthropic",
         "codex" => "OpenAI",
         "gemini" => "Google",
         "opencode" => "OpenCode",
-        _ => &cli_name,
-    };
+        _ => cli_name,
+    }
+}
 
+fn sync_provider_record_from_cli_info(
+    cli_name: &str,
+    cli_info: setup_core::detection::CliInfo,
+) -> CliProviderRecord {
     let now = chrono::Utc::now().to_rfc3339();
-    let record = CliProviderRecord {
+    CliProviderRecord {
         cli_name: cli_info.name,
-        display_name: display_name.to_string(),
+        display_name: sync_provider_display_name(cli_name).to_string(),
         installed: cli_info.installed,
         version: cli_info.version,
         config_dir: cli_info.config_dir.map(|p| p.to_string_lossy().to_string()),
         last_synced: Some(now),
-    };
+    }
+}
 
-    let db = open_state_db(&state)?;
-    db.upsert_cli_provider(&record)?;
-    Ok(record)
+fn sync_provider_persist_record(
+    state: &AppState,
+    record: &CliProviderRecord,
+) -> Result<(), String> {
+    let db = open_state_db(state)?;
+    db.upsert_cli_provider(record)
 }
 
 // --- Discovery commands ---
@@ -743,36 +785,39 @@ async fn discover_models_cmd(
     state: tauri::State<'_, AppState>,
     cli_name: String,
 ) -> Result<Vec<DiscoveredModel>, String> {
-    let db_path = state
-        .models_dir
-        .parent()
-        .unwrap_or(&state.models_dir)
-        .join("state.db");
+    let db_path = state.db_path();
 
     tauri::async_runtime::spawn_blocking(move || {
         let result = discovery::discover_models(&cli_name)?;
-
-        let db = StateDb::open(&db_path)?;
-
-        // Clean out models from older CLI versions
-        if !result.models.is_empty() {
-            db.delete_stale_models(&cli_name, &result.cli_version)?;
-        }
-
-        // Store discovered models
-        for model in &result.models {
-            db.upsert_discovered_model(model)?;
-        }
-
-        // Store discovered parameters
-        for (model_name, param) in &result.parameters {
-            db.upsert_model_parameter(model_name, &cli_name, param)?;
-        }
-
-        Ok(result.models)
+        persist_discovery_result(&db_path, &cli_name, result)
     })
     .await
     .map_err(|e| format!("Discovery task failed: {e}"))?
+}
+
+fn persist_discovery_result(
+    db_path: &Path,
+    cli_name: &str,
+    result: discovery::DiscoveryResult,
+) -> Result<Vec<DiscoveredModel>, String> {
+    let db = StateDb::open(db_path)?;
+
+    // Clean out models from older CLI versions
+    if !result.models.is_empty() {
+        db.delete_stale_models(cli_name, &result.cli_version)?;
+    }
+
+    // Store discovered models
+    for model in &result.models {
+        db.upsert_discovered_model(model)?;
+    }
+
+    // Store discovered parameters
+    for (model_name, param) in &result.parameters {
+        db.upsert_model_parameter(model_name, cli_name, param)?;
+    }
+
+    Ok(result.models)
 }
 
 #[tauri::command]
@@ -780,7 +825,14 @@ fn list_discovered_models(
     state: tauri::State<AppState>,
     provider: Option<String>,
 ) -> Result<Vec<DiscoveredModel>, String> {
-    let db = open_state_db(&state)?;
+    list_discovered_models_inner(&state, provider)
+}
+
+fn list_discovered_models_inner(
+    state: &AppState,
+    provider: Option<String>,
+) -> Result<Vec<DiscoveredModel>, String> {
+    let db = open_state_db(state)?;
     db.list_discovered_models(provider.as_deref())
 }
 
@@ -790,7 +842,15 @@ fn get_model_parameters(
     model_name: String,
     provider: String,
 ) -> Result<Vec<ModelParameter>, String> {
-    let db = open_state_db(&state)?;
+    get_model_parameters_inner(&state, model_name, provider)
+}
+
+fn get_model_parameters_inner(
+    state: &AppState,
+    model_name: String,
+    provider: String,
+) -> Result<Vec<ModelParameter>, String> {
+    let db = open_state_db(state)?;
     db.list_model_parameters(&model_name, &provider)
 }
 
@@ -899,6 +959,506 @@ interactive_args = ["exec", "--dangerously-bypass-approvals-and-sandbox"]
 "#,
         )
         .unwrap();
+    }
+
+    fn cli_provider(cli_name: &str, display_name: &str) -> CliProviderRecord {
+        CliProviderRecord {
+            cli_name: cli_name.to_string(),
+            display_name: display_name.to_string(),
+            installed: true,
+            version: Some("1.2.3".to_string()),
+            config_dir: Some("/tmp/config".to_string()),
+            last_synced: Some("2026-05-08T12:00:00Z".to_string()),
+        }
+    }
+
+    fn discovered_model(provider: &str, name: &str, cli_version: &str) -> DiscoveredModel {
+        DiscoveredModel {
+            canonical_name: name.to_string(),
+            provider: provider.to_string(),
+            discovered_at: "2026-05-08T12:00:00Z".to_string(),
+            cli_version: cli_version.to_string(),
+        }
+    }
+
+    fn model_parameter(name: &str) -> ModelParameter {
+        ModelParameter {
+            name: name.to_string(),
+            display_name: name.to_string(),
+            param_type: state::ParamType::String,
+            description: format!("{name} parameter"),
+            cli_mapping: state::CliMapping {
+                flag: format!("--{name}"),
+                value_template: "{value}".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn app_state_db_path_returns_models_parent_state_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        let state = test_state(models_dir, HashMap::new());
+
+        assert_eq!(state.db_path(), dir.path().join("state.db"));
+    }
+
+    #[test]
+    fn open_state_db_opens_models_parent_state_db_and_returns_state_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        let state = test_state(models_dir, HashMap::new());
+
+        let db = super::open_state_db(&state).unwrap();
+        db.upsert_cli_provider(&cli_provider("codex", "OpenAI"))
+            .unwrap();
+        drop(db);
+
+        assert!(dir.path().join("state.db").exists());
+        let db = StateDb::open(&dir.path().join("state.db")).unwrap();
+        assert_eq!(
+            db.get_cli_provider("codex").unwrap().unwrap().display_name,
+            "OpenAI"
+        );
+    }
+
+    #[test]
+    fn load_providers_for_models_dir_loads_parent_providers_and_defaults_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(
+            dir.path().join("providers.toml"),
+            r#"
+[codex]
+command = "codex"
+args = ["exec"]
+"#,
+        )
+        .unwrap();
+
+        let providers = super::load_providers_for_models_dir(&models_dir);
+        assert!(providers.entries.contains_key("codex"));
+
+        std::fs::write(dir.path().join("providers.toml"), "not = [valid").unwrap();
+        let providers = super::load_providers_for_models_dir(&models_dir);
+        assert!(providers.entries.is_empty());
+
+        std::fs::remove_file(dir.path().join("providers.toml")).unwrap();
+        let providers = super::load_providers_for_models_dir(&models_dir);
+        assert!(providers.entries.is_empty());
+    }
+
+    #[test]
+    fn effective_provider_for_model_provider_rejects_out_of_range_index() {
+        let model = make_model("gpt-high", &["codex"]);
+
+        let err =
+            super::effective_provider_for_model_provider(&model, 1, &ProvidersConfig::default())
+                .unwrap_err();
+
+        assert_eq!(err, "provider_index out of range");
+    }
+
+    #[test]
+    fn effective_provider_for_model_provider_rejects_unresolved_empty_command() {
+        let model = ModelConfig {
+            name: "gpt-high".to_string(),
+            prompt_mode: PromptMode::Stdin,
+            providers: vec![ProviderConfig::model_provider("missing-provider", vec![])],
+            inputs: vec![],
+        };
+
+        let err =
+            super::effective_provider_for_model_provider(&model, 0, &ProvidersConfig::default())
+                .unwrap_err();
+
+        assert_eq!(
+            err,
+            "provider missing-provider is missing from providers.toml"
+        );
+    }
+
+    #[test]
+    fn refresh_quotas_filters_to_multi_provider_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        let models = HashMap::from([
+            (
+                "single".to_string(),
+                make_model("single", &["single-provider"]),
+            ),
+            (
+                "multi".to_string(),
+                make_model("multi", &["multi-a", "multi-b"]),
+            ),
+        ]);
+        let state = test_state(models_dir, models);
+
+        let mut results = super::refresh_quotas_inner(&state).unwrap();
+        results.sort_by(|a, b| a.provider_name.cmp(&b.provider_name));
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|entry| entry.provider_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["multi-a", "multi-b"]
+        );
+        assert!(results.iter().all(|entry| entry.status == "no_script"));
+    }
+
+    #[test]
+    fn refresh_quotas_skips_fresh_providers() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        let state = test_state(
+            models_dir,
+            HashMap::from([(
+                "multi".to_string(),
+                make_model("multi", &["fresh-provider", "stale-provider"]),
+            )]),
+        );
+        let db = StateDb::open(&state.db_path()).unwrap();
+        db.upsert_quota_refresh(
+            "fresh-provider",
+            &[state::QuotaWindowInput {
+                used_percent: 0.20,
+                resets_at: chrono::Utc::now() + chrono::Duration::hours(24),
+            }],
+        )
+        .unwrap();
+        drop(db);
+
+        let mut results = super::refresh_quotas_inner(&state).unwrap();
+        results.sort_by(|a, b| a.provider_name.cmp(&b.provider_name));
+
+        let fresh = results
+            .iter()
+            .find(|entry| entry.provider_name == "fresh-provider")
+            .unwrap();
+        assert_eq!(fresh.status, "fresh");
+        assert!(fresh.windows.is_empty());
+        let stale = results
+            .iter()
+            .find(|entry| entry.provider_name == "stale-provider")
+            .unwrap();
+        assert_eq!(stale.status, "no_script");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refresh_quotas_marks_in_flight_providers() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        let script = dir.path().join("quota.sh");
+        write_executable(
+            &script,
+            r#"#!/usr/bin/env bash
+printf '%s\n' '{"windows":[{"used_percent":42,"resets_at":"2099-01-01T00:00:00Z"}]}'
+"#,
+        );
+        std::fs::write(
+            dir.path().join("providers.toml"),
+            format!(
+                r#"[in-flight-provider]
+quota_script = "{}"
+"#,
+                script.display()
+            ),
+        )
+        .unwrap();
+        let state = test_state(
+            models_dir,
+            HashMap::from([(
+                "multi".to_string(),
+                make_model("multi", &["in-flight-provider", "other-provider"]),
+            )]),
+        );
+        let _guard = state
+            .quota_in_flight
+            .try_claim("in-flight-provider")
+            .unwrap();
+
+        let results = super::refresh_quotas_inner(&state).unwrap();
+
+        let entry = results
+            .iter()
+            .find(|entry| entry.provider_name == "in-flight-provider")
+            .unwrap();
+        assert_eq!(entry.status, "in_flight");
+        assert!(entry.windows.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refresh_quotas_maps_refresh_outcome_to_dto() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        let script = dir.path().join("quota.sh");
+        write_executable(
+            &script,
+            r#"#!/usr/bin/env bash
+printf '%s\n' '{"windows":[{"used_percent":42,"resets_at":"2099-01-01T00:00:00Z"}]}'
+"#,
+        );
+        std::fs::write(
+            dir.path().join("providers.toml"),
+            format!(
+                r#"[updated-provider]
+quota_script = "{}"
+
+[no-script-provider]
+"#,
+                script.display()
+            ),
+        )
+        .unwrap();
+        let state = test_state(
+            models_dir,
+            HashMap::from([(
+                "multi".to_string(),
+                make_model("multi", &["updated-provider", "no-script-provider"]),
+            )]),
+        );
+
+        let results = super::refresh_quotas_inner(&state).unwrap();
+
+        let updated = results
+            .iter()
+            .find(|entry| entry.provider_name == "updated-provider")
+            .unwrap();
+        assert_eq!(updated.status, "updated");
+        assert_eq!(updated.windows.len(), 1);
+        assert!((updated.windows[0].used_percent - 0.42).abs() < 1e-6);
+        assert_eq!(updated.windows[0].resets_at, "2099-01-01T00:00:00+00:00");
+
+        let no_script = results
+            .iter()
+            .find(|entry| entry.provider_name == "no-script-provider")
+            .unwrap();
+        assert_eq!(no_script.status, "no_script");
+        assert!(no_script.windows.is_empty());
+        assert!(no_script.message.is_none());
+    }
+
+    #[test]
+    fn provider_account_commands_validate_and_persist_through_state_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path().join("models"), HashMap::new());
+        let db = StateDb::open(&state.db_path()).unwrap();
+        db.upsert_cli_provider(&cli_provider("codex", "OpenAI"))
+            .unwrap();
+        drop(db);
+
+        assert_eq!(
+            super::add_account_inner(
+                &state,
+                AddAccountInput {
+                    id: String::new(),
+                    provider: "codex".to_string(),
+                    profile_name: "default".to_string(),
+                    auth_method: AuthMethod::OAuth,
+                },
+            )
+            .unwrap_err(),
+            "Account id cannot be empty"
+        );
+        assert_eq!(
+            super::add_account_inner(
+                &state,
+                AddAccountInput {
+                    id: "acct-1".to_string(),
+                    provider: String::new(),
+                    profile_name: "default".to_string(),
+                    auth_method: AuthMethod::OAuth,
+                },
+            )
+            .unwrap_err(),
+            "Account provider cannot be empty"
+        );
+        assert_eq!(
+            super::add_account_inner(
+                &state,
+                AddAccountInput {
+                    id: "acct-1".to_string(),
+                    provider: "codex".to_string(),
+                    profile_name: String::new(),
+                    auth_method: AuthMethod::OAuth,
+                },
+            )
+            .unwrap_err(),
+            "Account profile_name cannot be empty"
+        );
+        assert_eq!(
+            super::add_account_inner(
+                &state,
+                AddAccountInput {
+                    id: "acct-1".to_string(),
+                    provider: "missing".to_string(),
+                    profile_name: "default".to_string(),
+                    auth_method: AuthMethod::OAuth,
+                },
+            )
+            .unwrap_err(),
+            "Provider 'missing' not found"
+        );
+
+        let added = super::add_account_inner(
+            &state,
+            AddAccountInput {
+                id: "acct-1".to_string(),
+                provider: "codex".to_string(),
+                profile_name: "default".to_string(),
+                auth_method: AuthMethod::OAuth,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(added.auth_status, AuthStatus::Unknown);
+        chrono::DateTime::parse_from_rfc3339(&added.created_at).unwrap();
+        let accounts = super::list_accounts_inner(&state, Some("codex".to_string())).unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].id, "acct-1");
+        assert_eq!(super::list_cli_providers_inner(&state).unwrap().len(), 1);
+        assert_eq!(
+            super::get_cli_provider_inner(&state, "codex".to_string())
+                .unwrap()
+                .display_name,
+            "OpenAI"
+        );
+        assert!(
+            super::remove_account_inner(&state, "acct-1".to_string(), "codex".to_string()).unwrap()
+        );
+        assert!(
+            !super::remove_account_inner(&state, "acct-1".to_string(), "codex".to_string())
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn sync_provider_maps_display_name_and_persists_with_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path().join("models"), HashMap::new());
+        let cli_info = setup_core::detection::CliInfo {
+            name: "codex".to_string(),
+            installed: true,
+            path: Some("/tmp/bin/codex".to_string()),
+            version: Some("codex 1.2.3".to_string()),
+            authenticated: false,
+            config_dir: Some(dir.path().join("codex-config")),
+            profiles: vec![],
+            version_changed: None,
+            previous_version: None,
+        };
+
+        let record = super::sync_provider_record_from_cli_info("codex", cli_info);
+        super::sync_provider_persist_record(&state, &record).unwrap();
+
+        assert_eq!(record.display_name, "OpenAI");
+        let last_synced = record.last_synced.as_deref().unwrap();
+        chrono::DateTime::parse_from_rfc3339(last_synced).unwrap();
+        let stored = StateDb::open(&state.db_path())
+            .unwrap()
+            .get_cli_provider("codex")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.display_name, "OpenAI");
+        assert_eq!(stored.version.as_deref(), Some("codex 1.2.3"));
+        assert_eq!(stored.last_synced, record.last_synced);
+
+        assert_eq!(super::sync_provider_display_name("claude"), "Anthropic");
+        assert_eq!(super::sync_provider_display_name("gemini"), "Google");
+        assert_eq!(super::sync_provider_display_name("opencode"), "OpenCode");
+        assert_eq!(super::sync_provider_display_name("custom"), "custom");
+    }
+
+    #[test]
+    fn discover_models_cmd_persists_models_and_parameters_and_guards_stale_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("state.db");
+        let db = StateDb::open(&db_path).unwrap();
+        db.upsert_discovered_model(&discovered_model("codex", "old-gpt", "old-version"))
+            .unwrap();
+        drop(db);
+
+        let empty_result = discovery::DiscoveryResult {
+            cli_name: "codex".to_string(),
+            cli_version: "new-version".to_string(),
+            models: vec![],
+            parameters: vec![],
+        };
+        let returned = super::persist_discovery_result(&db_path, "codex", empty_result).unwrap();
+        assert!(returned.is_empty());
+        assert_eq!(
+            StateDb::open(&db_path)
+                .unwrap()
+                .list_discovered_models(Some("codex"))
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let new_model = discovered_model("codex", "gpt-new", "new-version");
+        let parameter = model_parameter("model");
+        let result = discovery::DiscoveryResult {
+            cli_name: "codex".to_string(),
+            cli_version: "new-version".to_string(),
+            models: vec![new_model.clone()],
+            parameters: vec![("gpt-new".to_string(), parameter.clone())],
+        };
+        let returned = super::persist_discovery_result(&db_path, "codex", result).unwrap();
+
+        assert_eq!(returned.len(), 1);
+        assert_eq!(returned[0].canonical_name, "gpt-new");
+        let db = StateDb::open(&db_path).unwrap();
+        let models = db.list_discovered_models(Some("codex")).unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].canonical_name, "gpt-new");
+        let params = db.list_model_parameters("gpt-new", "codex").unwrap();
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].name, parameter.name);
+    }
+
+    #[test]
+    fn list_discovered_models_filters_by_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path().join("models"), HashMap::new());
+        let db = StateDb::open(&state.db_path()).unwrap();
+        db.upsert_discovered_model(&discovered_model("codex", "gpt-5", "codex-1"))
+            .unwrap();
+        db.upsert_discovered_model(&discovered_model("claude", "sonnet", "claude-1"))
+            .unwrap();
+        drop(db);
+
+        let models =
+            super::list_discovered_models_inner(&state, Some("codex".to_string())).unwrap();
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].provider, "codex");
+        assert_eq!(models[0].canonical_name, "gpt-5");
+    }
+
+    #[test]
+    fn get_model_parameters_filters_by_provider_and_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path().join("models"), HashMap::new());
+        let db = StateDb::open(&state.db_path()).unwrap();
+        db.upsert_model_parameter("gpt-5", "codex", &model_parameter("model"))
+            .unwrap();
+        db.upsert_model_parameter("gpt-5", "claude", &model_parameter("max_tokens"))
+            .unwrap();
+        db.upsert_model_parameter("gpt-4", "codex", &model_parameter("temperature"))
+            .unwrap();
+        drop(db);
+
+        let params =
+            super::get_model_parameters_inner(&state, "gpt-5".to_string(), "codex".to_string())
+                .unwrap();
+
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].name, "model");
+        assert_eq!(params[0].cli_mapping.flag, "--model");
     }
 
     #[test]
