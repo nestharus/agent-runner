@@ -982,3 +982,51 @@ The four discoveries are listed here so a later consolidation WU can pick them u
 - **Evidence**:
   `planning/age-38-agent-wrapper-gui-shared/research/age-38-duplicates.md`
   (severe drift section "4. Model Save / Pool Update", lines 74-94).
+
+## 2026-05-08 — AGE-39 Phase 2.5 pre-resolved gates (skip_problem_map_gate=true)
+
+- **Phase**: Phase 2.5 (post-2.5.6 risk profile).
+- **Decision**: Proceed in exhaustive mode (per per-surface risk-profile mode list);
+  defer-to-prototype = A (proceed). Narrow-vs-exhaustive scope deferred to Phase 3
+  proposer with default B (narrow) given 19–25 remaining production call sites.
+  Mid-pipeline drift = A (proceed + note in DECISIONS as residual).
+- **Rationale**:
+  - Risk profile rolls up to HIGH on all 19 touched surfaces; signals 1 (HIGH majority)
+    and 2 (sprawling parallel-systems landscape per duplicates inventory) of the
+    defer-to-prototype detection both fire. However, AGE-8 decomposition siblings
+    AGE-33..38 (six of seven WUs) already shipped through this exact pipeline; the
+    pattern is established and known-workable. Proceeding in exhaustive mode is the
+    pre-resolved policy from the dispatch context.
+  - Coverage recommended `defer` (no `block`); duplicates recommended narrow scope B
+    (19–25 production call sites concentrated in `main.rs`).
+  - `skip_problem_map_gate=true` suppresses the routine human gate; pre-resolved
+    decisions in the dispatch context act as the user-supplied answers per the
+    orchestrator's NEEDS_INPUT-classification rule.
+- **Evidence**:
+  - `planning/age-39-thin-main-dispatch-cleanup/research/age-39-problem-map.md`
+  - `planning/age-39-thin-main-dispatch-cleanup/research/age-39-duplicates.md`
+    (section 4 "Final-batch heuristic": 19–25 call sites, recommends narrow B)
+  - `planning/age-39-thin-main-dispatch-cleanup/research/age-39-coverage-inventory.md`
+    (section 4: `defer`/`defer`, no block)
+  - `planning/age-39-thin-main-dispatch-cleanup/risk/age-39-risk-profile.md`
+    (WU verdict HIGH; per-surface mode = exhaustive across all 19 surfaces).
+
+## 2026-05-09 — AGE-39 Phase 8 commit-hygiene residual (MEDIUM accepted)
+
+- **Phase**: Phase 8 (PR-review gates).
+- **Decision**: Accept commit-hygiene MEDIUM verdict as a residual rather than splitting the path-guard test commit further.
+- **Rationale**: After two fix passes (commit-message renames at `b2f31b4` and `fbec04b`),
+  the gate still reports MEDIUM on size: the path-guard test file is 522 lines added in
+  one commit, and the source-shape rustfmt cleanup is 242 lines. All 11 commits compile
+  in isolation; multi-concern review is `SINGLE_CONCERN`; test-audit and justification
+  are `LOW`. The single-file test suite is intentionally cohesive — a single
+  `age39_main_thinning_source_guard.rs` covering all 21 cut-over rows — and splitting
+  it across commits would not reduce reviewer load. The AGE-36 PR #66 surgical-reorder
+  precedent does not apply (build isolation passes for every commit).
+- **Evidence**:
+  - `planning/age-39-thin-main-dispatch-cleanup/risk/age-39-commit-hygiene.md`
+    (post-rerun MEDIUM verdict, build isolation OK).
+  - `planning/age-39-thin-main-dispatch-cleanup/risk/age-39-multi-concern.md`
+    (`SINGLE_CONCERN`).
+  - `planning/age-39-thin-main-dispatch-cleanup/risk/age-39-test-audit.md` (LOW).
+  - `planning/age-39-thin-main-dispatch-cleanup/risk/age-39-justification.md` (LOW).

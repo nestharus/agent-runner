@@ -8,11 +8,12 @@ use oulipoly_runtime::balancer;
 use oulipoly_runtime::diagnostics;
 use oulipoly_runtime::executor;
 use oulipoly_runtime::services::{
-    MigrationServiceOutput, MigrationServicePort, MigrationServiceRequest,
-    ProductionMigrationService, ProductionResumeService, ProductionSessionLifecycleService,
-    ResumeAcceptanceRequest, ResumeServiceOutput, ResumeServicePort, ResumeServiceRequest,
-    ServiceError, SessionExportServiceRequest, SessionLifecycleIngestMode, SessionLifecycleRequest,
-    SessionLifecycleServicePort, SessionLockFailure, SessionLockServiceRequest, SessionLockSuccess,
+    DiagnosticsServiceOutput, DiagnosticsServiceRequest, ExecutorServiceRequest,
+    InvocationLifecycleFinalizeRequest, InvocationLifecycleServicePort,
+    InvocationLifecycleStartRequest, MigrationServiceOutput, MigrationServiceRequest,
+    ResumeAcceptanceRequest, ResumeServiceOutput, ResumeServiceRequest, RoutingServicePort,
+    RoutingServiceRequest, ServiceError, SessionExportServiceRequest, SessionLifecycleIngestMode,
+    SessionLifecycleRequest, SessionLockFailure, SessionLockServiceRequest, SessionLockSuccess,
     SessionReplaceServiceRequest, TraceServiceFailure, TraceServiceRequest,
 };
 use oulipoly_runtime::session_export::ExportError;
@@ -361,8 +362,9 @@ fn run(cli: Cli) -> Result<i32, String> {
         return oulipoly_runtime::repl_default_provider::run_repl_with_default_provider(services);
     }
 
+    let agent_runtime_services = wiring::AgentRuntimeServices::cli_defaults();
+
     if let Some(command) = cli.command.clone() {
-        let agent_runtime_services = wiring::AgentRuntimeServices::cli_defaults();
         return match command {
             Subcommands::Trace {
                 invocation_uuid,
@@ -387,6 +389,7 @@ fn run(cli: Cli) -> Result<i32, String> {
                 project,
                 models_dir,
             } => run_repl(
+                &agent_runtime_services,
                 model.as_deref(),
                 resume.as_deref(),
                 migrate.as_deref(),
@@ -408,6 +411,7 @@ fn run(cli: Cli) -> Result<i32, String> {
                     .or(session_id.as_deref())
                     .expect("clap group ensures one is set");
                 run_resume(
+                    &agent_runtime_services,
                     model.as_deref(),
                     resume_target,
                     migrate.as_deref(),
@@ -481,6 +485,7 @@ fn run(cli: Cli) -> Result<i32, String> {
         if has_prompt {
             let prompt_text = prompt_text.as_deref().or(stdin_prompt.as_deref());
             return run_resume(
+                &agent_runtime_services,
                 cli.model.as_deref(),
                 session_id,
                 cli.migrate.as_deref(),
@@ -491,6 +496,7 @@ fn run(cli: Cli) -> Result<i32, String> {
             );
         } else {
             return run_repl(
+                &agent_runtime_services,
                 cli.model.as_deref(),
                 Some(session_id),
                 cli.migrate.as_deref(),
@@ -524,6 +530,7 @@ fn run(cli: Cli) -> Result<i32, String> {
         };
 
         return run_with_balancing(
+            &agent_runtime_services,
             &state_db_opener,
             model,
             &prompt,
@@ -552,6 +559,7 @@ fn run(cli: Cli) -> Result<i32, String> {
     };
 
     run_with_balancing(
+        &agent_runtime_services,
         &state_db_opener,
         model,
         &full_prompt,
@@ -1017,6 +1025,7 @@ enum ResumeIngestMode<'a> {
 }
 
 fn ingest_and_emit_session_id_resume_aware(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
     state: &StateDb,
     sessions_cfg: &oulipoly_config::SessionsConfig,
     provider_name: &str,
@@ -1024,7 +1033,6 @@ fn ingest_and_emit_session_id_resume_aware(
     invocation_uuid: &str,
     mode: ResumeIngestMode<'_>,
 ) -> bool {
-    let service = ProductionSessionLifecycleService::new();
     let mut stderr = std::io::stderr();
     let mode = match mode {
         ResumeIngestMode::Unpinned { capture_method } => SessionLifecycleIngestMode::Unpinned {
@@ -1034,15 +1042,17 @@ fn ingest_and_emit_session_id_resume_aware(
             resume_target: resume_target.to_string(),
         },
     };
-    match service.ingest_session(SessionLifecycleRequest {
-        state,
-        sessions_cfg,
-        provider_name,
-        invocation_row_id,
-        invocation_uuid,
-        mode,
-        stderr: &mut stderr,
-    }) {
+    match agent_runtime_services
+        .session_lifecycle_service
+        .ingest_session(SessionLifecycleRequest {
+            state,
+            sessions_cfg,
+            provider_name,
+            invocation_row_id,
+            invocation_uuid,
+            mode,
+            stderr: &mut stderr,
+        }) {
         Ok(output) => output.emitted,
         Err(ServiceError::Dependency { message })
         | Err(ServiceError::InvalidRequest { message })
@@ -1439,6 +1449,7 @@ fn resume_migration_pool(
 }
 
 fn run_repl(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
     model_name: Option<&str>,
     resume: Option<&str>,
     manual_migrate: Option<&str>,
@@ -1455,16 +1466,16 @@ fn run_repl(
     let providers_cfg = oulipoly_config::ProvidersConfig::load(&providers_path).unwrap_or_default();
     let models = load_models(&models_dir, Some(&providers_cfg))?;
     let sessions_cfg = oulipoly_config::SessionsConfig::load(&sessions_path).unwrap_or_default();
-    let resume_service = ProductionResumeService::new();
-    let migration_service = ProductionMigrationService::new();
     let mut resolved_resume = if let Some(session_id) = resume {
         Some(
-            match resume_service.resolve_resume(ResumeServiceRequest {
-                state: &state,
-                models: &models,
-                input: session_id,
-                model_override: model_name,
-            }) {
+            match agent_runtime_services
+                .resume_service
+                .resolve_resume(ResumeServiceRequest {
+                    state: &state,
+                    models: &models,
+                    input: session_id,
+                    model_override: model_name,
+                }) {
                 Ok(ResumeServiceOutput::ResumeResolved { resolved }) => resolved,
                 Ok(ResumeServiceOutput::ResumeRejected {
                     error:
@@ -1536,16 +1547,18 @@ fn run_repl(
         let migration_model = resume_migration_pool(resolved, &providers_cfg);
         let effective_spawn_cwd = effective_spawn_cwd(working_dir)?;
         let mut migration_stderr = std::io::stderr();
-        match migration_service.migrate(MigrationServiceRequest {
-            state: &state,
-            sessions_cfg: &sessions_cfg,
-            resolved,
-            manual_target: manual_migrate,
-            active_exhausted: false,
-            migration_model: &migration_model,
-            effective_cwd: &effective_spawn_cwd,
-            stderr: &mut migration_stderr,
-        }) {
+        match agent_runtime_services
+            .migration_service
+            .migrate(MigrationServiceRequest {
+                state: &state,
+                sessions_cfg: &sessions_cfg,
+                resolved,
+                manual_target: manual_migrate,
+                active_exhausted: false,
+                migration_model: &migration_model,
+                effective_cwd: &effective_spawn_cwd,
+                stderr: &mut migration_stderr,
+            }) {
             Ok(MigrationServiceOutput::Migrated { segment: migrated }) => {
                 resolved.active_provider = migrated.target_provider.clone();
                 resolved.active_session_id = migrated.target_session_id.clone();
@@ -1582,7 +1595,15 @@ fn run_repl(
             Some(resolved.active_session_id.clone()),
         )
     } else {
-        let provider_index = balancer::select_provider(&model, &state, Some(&ctx));
+        let provider_index = agent_runtime_services
+            .routing_service
+            .select_route(RoutingServiceRequest {
+                model: &model,
+                state: &state,
+                ctx: Some(&ctx),
+            })
+            .map_err(|err| err.to_string())?
+            .provider_index;
         let (provider, _) = effective_model_for_execution(&model, provider_index, &providers_cfg)?;
         (provider_index, provider, None)
     };
@@ -1607,13 +1628,21 @@ fn run_repl(
                 model.name.clone()
             }
         });
-    let invocation_row_id = state.start_invocation(&InvocationStart {
+    let invocation_start = InvocationStart {
         invocation_uuid: invocation.id.clone(),
         model_name: invocation_model_name,
         provider_name: provider.name.clone(),
         provider_index,
         parent_invocation_id,
-    })?;
+    };
+    let invocation_row_id = agent_runtime_services
+        .invocation_lifecycle_service
+        .start_invocation(InvocationLifecycleStartRequest {
+            state: &state,
+            start: &invocation_start,
+        })
+        .map_err(|err| err.to_string())?
+        .invocation_row_id;
     let mut guard = FinalizerGuard::new(&state, invocation_row_id);
     let invocation_env = serde_json::to_string(&invocation)
         .map_err(|e| format!("Failed to serialize invocation id: {e}"))?;
@@ -1648,16 +1677,21 @@ fn run_repl(
             if resume.is_none() {
                 state.update_session_capture(invocation_row_id, None, "none")?;
             }
-            state.finalize_invocation(
-                invocation_row_id,
-                exit_code == 0,
-                exit_code,
-                None,
-                result.terminal_reason.as_deref(),
-            )?;
+            agent_runtime_services
+                .invocation_lifecycle_service
+                .finalize_invocation(InvocationLifecycleFinalizeRequest {
+                    state: &state,
+                    invocation_row_id,
+                    success: exit_code == 0,
+                    exit_code,
+                    error_category: None,
+                    terminal_reason: result.terminal_reason.as_deref(),
+                })
+                .map_err(|err| err.to_string())?;
             guard.mark_finalized();
             if exit_code == 0 {
                 ingest_and_emit_session_id_resume_aware(
+                    agent_runtime_services,
                     &state,
                     &sessions_cfg,
                     &provider.name,
@@ -1679,20 +1713,26 @@ fn run_repl(
             if resume.is_none() {
                 state.update_session_capture(invocation_row_id, None, "none")?;
             }
-            state.finalize_invocation(
-                invocation_row_id,
-                false,
-                1,
-                Some("spawn_error"),
-                Some("spawn_error"),
-            )?;
+            agent_runtime_services
+                .invocation_lifecycle_service
+                .finalize_invocation(InvocationLifecycleFinalizeRequest {
+                    state: &state,
+                    invocation_row_id,
+                    success: false,
+                    exit_code: 1,
+                    error_category: Some("spawn_error"),
+                    terminal_reason: Some("spawn_error"),
+                })
+                .map_err(|err| err.to_string())?;
             guard.mark_finalized();
             Ok(1)
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_resume(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
     model_name: Option<&str>,
     session_id: &str,
     manual_migrate: Option<&str>,
@@ -1717,43 +1757,44 @@ fn run_resume(
     let providers_cfg = oulipoly_config::ProvidersConfig::load(&providers_path).unwrap_or_default();
     let models = load_models(&models_dir, Some(&providers_cfg))?;
     let sessions_cfg = oulipoly_config::SessionsConfig::load(&sessions_path).unwrap_or_default();
-    let resume_service = ProductionResumeService::new();
-    let migration_service = ProductionMigrationService::new();
 
     let stderr_is_terminal = std::io::stderr().is_terminal();
-    let mut resolved = match resume_service.resolve_resume(ResumeServiceRequest {
-        state: &state,
-        models: &models,
-        input: session_id,
-        model_override: model_name,
-    }) {
-        Ok(ResumeServiceOutput::ResumeResolved { resolved }) => resolved,
-        Ok(ResumeServiceOutput::ResumeRejected {
-            error:
-                oulipoly_state::ResumeError::ProviderModelMismatch {
-                    active_provider, ..
-                },
-        }) => {
-            eprintln!(
-                "{}",
-                resume_model_pool_mismatch_message(
-                    &models,
-                    model_name.unwrap_or("<unknown>"),
-                    session_id,
-                    &active_provider,
-                )
-            );
-            return Ok(1);
-        }
-        Ok(ResumeServiceOutput::ResumeRejected { error }) => {
-            eprintln!("{}", format_resume_error(error));
-            return Ok(1);
-        }
-        Err(err) => {
-            eprintln!("resume service failed: {err}");
-            return Ok(1);
-        }
-    };
+    let mut resolved =
+        match agent_runtime_services
+            .resume_service
+            .resolve_resume(ResumeServiceRequest {
+                state: &state,
+                models: &models,
+                input: session_id,
+                model_override: model_name,
+            }) {
+            Ok(ResumeServiceOutput::ResumeResolved { resolved }) => resolved,
+            Ok(ResumeServiceOutput::ResumeRejected {
+                error:
+                    oulipoly_state::ResumeError::ProviderModelMismatch {
+                        active_provider, ..
+                    },
+            }) => {
+                eprintln!(
+                    "{}",
+                    resume_model_pool_mismatch_message(
+                        &models,
+                        model_name.unwrap_or("<unknown>"),
+                        session_id,
+                        &active_provider,
+                    )
+                );
+                return Ok(1);
+            }
+            Ok(ResumeServiceOutput::ResumeRejected { error }) => {
+                eprintln!("{}", format_resume_error(error));
+                return Ok(1);
+            }
+            Err(err) => {
+                eprintln!("resume service failed: {err}");
+                return Ok(1);
+            }
+        };
     let mut target = match resume_execution_target(&resolved, &providers_cfg) {
         Ok(target) => target,
         Err(err) => {
@@ -1768,16 +1809,18 @@ fn run_resume(
     let migration_model = resume_migration_pool(&resolved, &providers_cfg);
     let effective_spawn_cwd = effective_spawn_cwd(working_dir)?;
     let mut migration_stderr = std::io::stderr();
-    match migration_service.migrate(MigrationServiceRequest {
-        state: &state,
-        sessions_cfg: &sessions_cfg,
-        resolved: &resolved,
-        manual_target: manual_migrate,
-        active_exhausted: false,
-        migration_model: &migration_model,
-        effective_cwd: &effective_spawn_cwd,
-        stderr: &mut migration_stderr,
-    }) {
+    match agent_runtime_services
+        .migration_service
+        .migrate(MigrationServiceRequest {
+            state: &state,
+            sessions_cfg: &sessions_cfg,
+            resolved: &resolved,
+            manual_target: manual_migrate,
+            active_exhausted: false,
+            migration_model: &migration_model,
+            effective_cwd: &effective_spawn_cwd,
+            stderr: &mut migration_stderr,
+        }) {
         Ok(MigrationServiceOutput::Migrated { segment: migrated }) => {
             resolved.active_provider = migrated.target_provider.clone();
             resolved.active_session_id = migrated.target_session_id.clone();
@@ -1819,13 +1862,21 @@ fn run_resume(
         .model_name
         .clone()
         .unwrap_or_else(|| "<unknown>".to_string());
-    let invocation_row_id = state.start_invocation(&InvocationStart {
+    let invocation_start = InvocationStart {
         invocation_uuid: invocation.id.clone(),
         model_name: invocation_model_name,
         provider_name: provider.name.clone(),
         provider_index,
         parent_invocation_id,
-    })?;
+    };
+    let invocation_row_id = agent_runtime_services
+        .invocation_lifecycle_service
+        .start_invocation(InvocationLifecycleStartRequest {
+            state: &state,
+            start: &invocation_start,
+        })
+        .map_err(|err| err.to_string())?
+        .invocation_row_id;
     let mut guard = FinalizerGuard::new(&state, invocation_row_id);
     state.update_session_capture(invocation_row_id, Some(session_id), "resumed")?;
 
@@ -1847,20 +1898,25 @@ fn run_resume(
     ) {
         Ok(result) => result,
         Err(_spawn_err) => {
-            state.finalize_invocation(
-                invocation_row_id,
-                false,
-                1,
-                Some("spawn_error"),
-                Some("spawn_error"),
-            )?;
+            agent_runtime_services
+                .invocation_lifecycle_service
+                .finalize_invocation(InvocationLifecycleFinalizeRequest {
+                    state: &state,
+                    invocation_row_id,
+                    success: false,
+                    exit_code: 1,
+                    error_category: Some("spawn_error"),
+                    terminal_reason: Some("spawn_error"),
+                })
+                .map_err(|err| err.to_string())?;
             guard.mark_finalized();
             return Ok(1);
         }
     };
 
     if let Some(acceptance) = &result.resume_acceptance {
-        resume_service
+        agent_runtime_services
+            .resume_service
             .record_acceptance(ResumeAcceptanceRequest {
                 state: &state,
                 invocation_row_id,
@@ -1872,36 +1928,50 @@ fn run_resume(
 
     let success = result.exit_code == 0;
     let error_category = if !success {
-        run_diagnostics(&result.stderr, result.exit_code, &models, working_dir)
+        run_diagnostics(
+            agent_runtime_services,
+            &result.stderr,
+            result.exit_code,
+            &models,
+            working_dir,
+        )
     } else {
         None
     };
     if let Err(err) = state.record_returned_artifacts(invocation_row_id, &result.returned_artifacts)
     {
         eprintln!("Error: Failed to record returned artifacts: {err}");
-        state
-            .finalize_invocation(
+        agent_runtime_services
+            .invocation_lifecycle_service
+            .finalize_invocation(InvocationLifecycleFinalizeRequest {
+                state: &state,
                 invocation_row_id,
-                false,
-                1,
-                Some("returned_artifacts"),
-                Some("returned_artifacts_persist_failed"),
-            )
+                success: false,
+                exit_code: 1,
+                error_category: Some("returned_artifacts"),
+                terminal_reason: Some("returned_artifacts_persist_failed"),
+            })
+            .map(|_| ())
             .unwrap_or_else(|e| eprintln!("Warning: Failed to finalize invocation: {e}"));
         guard.mark_finalized();
         return Ok(1);
     }
-    state.finalize_invocation(
-        invocation_row_id,
-        success,
-        result.exit_code,
-        error_category.as_deref(),
-        result.terminal_reason.as_deref(),
-    )?;
+    agent_runtime_services
+        .invocation_lifecycle_service
+        .finalize_invocation(InvocationLifecycleFinalizeRequest {
+            state: &state,
+            invocation_row_id,
+            success,
+            exit_code: result.exit_code,
+            error_category: error_category.as_deref(),
+            terminal_reason: result.terminal_reason.as_deref(),
+        })
+        .map_err(|err| err.to_string())?;
     guard.mark_finalized();
 
     if success {
         ingest_and_emit_session_id_resume_aware(
+            agent_runtime_services,
             &state,
             &sessions_cfg,
             &provider.name,
@@ -1922,6 +1992,7 @@ fn run_resume(
 }
 
 fn run_with_balancing(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
     state_db_opener: &dyn StateDbOpener,
     model: &ModelConfig,
     prompt: &str,
@@ -1950,7 +2021,15 @@ fn run_with_balancing(
     // selection itself can be attributed to a parent context if needed
     // (matches contract `tmp/01-pr-a-contract.md` lifecycle ordering).
     let parent_invocation_id = resolve_parent_invocation_id(&state);
-    let provider_index = balancer::select_provider(model, &state, Some(&ctx));
+    let provider_index = agent_runtime_services
+        .routing_service
+        .select_route(RoutingServiceRequest {
+            model,
+            state: &state,
+            ctx: Some(&ctx),
+        })
+        .map_err(|err| err.to_string())?
+        .provider_index;
     let (provider, prompt_mode) =
         effective_model_for_execution(model, provider_index, &providers_cfg)?;
     let provider_name = &provider.name;
@@ -1958,45 +2037,57 @@ fn run_with_balancing(
         source: provider_name.clone(),
         id: Uuid::new_v4().to_string(),
     };
-    let invocation_row_id = state.start_invocation(&InvocationStart {
+    let invocation_start = InvocationStart {
         invocation_uuid: invocation.id.clone(),
         model_name: model.name.clone(),
         provider_name: provider_name.clone(),
         provider_index,
         parent_invocation_id,
-    })?;
+    };
+    let invocation_row_id = agent_runtime_services
+        .invocation_lifecycle_service
+        .start_invocation(InvocationLifecycleStartRequest {
+            state: &state,
+            start: &invocation_start,
+        })
+        .map_err(|err| err.to_string())?
+        .invocation_row_id;
     let invocation_env = serde_json::to_string(&invocation)
         .map_err(|e| format!("Failed to serialize invocation id: {e}"))?;
     eprintln!("{}", invocation.stderr_line());
 
-    let result = match executor::execute_effective_with_inputs_and_env(
-        executor::cli::EffectiveExecuteRequest {
-            model,
-            provider: &provider,
-            provider_index,
-            prompt_mode,
-            prompt,
-            working_dir,
-            extra_inputs,
-            parent_invocation_env: Some(&invocation_env),
-        },
-    ) {
-        Ok(result) => result,
-        Err(err) => {
-            state
-                .finalize_invocation(
-                    invocation_row_id,
-                    false,
-                    -1,
-                    Some("spawn_error"),
-                    Some("spawn_error"),
-                )
-                .unwrap_or_else(|finalize_err| {
-                    eprintln!("Warning: Failed to finalize invocation: {finalize_err}")
-                });
-            return Err(err);
-        }
-    };
+    let result =
+        match agent_runtime_services
+            .executor_service
+            .execute(ExecutorServiceRequest::Effective {
+                model: model.clone(),
+                provider: provider.clone(),
+                provider_index,
+                prompt_mode,
+                prompt: prompt.to_string(),
+                working_dir: working_dir.map(Path::to_path_buf),
+                extra_inputs: extra_inputs.clone(),
+                parent_invocation_env: Some(invocation_env.clone()),
+            }) {
+            Ok(output) => output.result,
+            Err(err) => {
+                agent_runtime_services
+                    .invocation_lifecycle_service
+                    .finalize_invocation(InvocationLifecycleFinalizeRequest {
+                        state: &state,
+                        invocation_row_id,
+                        success: false,
+                        exit_code: -1,
+                        error_category: Some("spawn_error"),
+                        terminal_reason: Some("spawn_error"),
+                    })
+                    .map(|_| ())
+                    .unwrap_or_else(|finalize_err| {
+                        eprintln!("Warning: Failed to finalize invocation: {finalize_err}")
+                    });
+                return Err(err.to_string());
+            }
+        };
 
     supervise_captured_child_invocations(
         &state,
@@ -2020,7 +2111,13 @@ fn run_with_balancing(
     let success = result.exit_code == 0;
 
     let error_category = if !success {
-        run_diagnostics(&result.stderr, result.exit_code, all_models, working_dir)
+        run_diagnostics(
+            agent_runtime_services,
+            &result.stderr,
+            result.exit_code,
+            all_models,
+            working_dir,
+        )
     } else {
         None
     };
@@ -2033,30 +2130,37 @@ fn run_with_balancing(
     if let Err(err) = state.record_returned_artifacts(invocation_row_id, &result.returned_artifacts)
     {
         eprintln!("Error: Failed to record returned artifacts: {err}");
-        state
-            .finalize_invocation(
+        agent_runtime_services
+            .invocation_lifecycle_service
+            .finalize_invocation(InvocationLifecycleFinalizeRequest {
+                state: &state,
                 invocation_row_id,
-                false,
-                1,
-                Some("returned_artifacts"),
-                Some("returned_artifacts_persist_failed"),
-            )
+                success: false,
+                exit_code: 1,
+                error_category: Some("returned_artifacts"),
+                terminal_reason: Some("returned_artifacts_persist_failed"),
+            })
+            .map(|_| ())
             .unwrap_or_else(|e| eprintln!("Warning: Failed to finalize invocation: {e}"));
         return Ok(1);
     }
 
-    state
-        .finalize_invocation(
+    agent_runtime_services
+        .invocation_lifecycle_service
+        .finalize_invocation(InvocationLifecycleFinalizeRequest {
+            state: &state,
             invocation_row_id,
             success,
-            result.exit_code,
-            error_category.as_deref(),
-            result.terminal_reason.as_deref(),
-        )
+            exit_code: result.exit_code,
+            error_category: error_category.as_deref(),
+            terminal_reason: result.terminal_reason.as_deref(),
+        })
+        .map(|_| ())
         .unwrap_or_else(|e| eprintln!("Warning: Failed to finalize invocation: {e}"));
 
     if success {
         let emitted = ingest_and_emit_session_id_resume_aware(
+            agent_runtime_services,
             &state,
             &sessions_cfg,
             provider_name,
@@ -2145,6 +2249,7 @@ fn resolve_parent_invocation_id(state: &StateDb) -> Option<i64> {
 }
 
 fn run_diagnostics(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
     stderr: &str,
     exit_code: i32,
     models: &HashMap<String, ModelConfig>,
@@ -2161,15 +2266,24 @@ fn run_diagnostics(
 
     let diagnosis = effective_provider_for_model_provider(diag_model, 0, &providers_cfg).and_then(
         |(provider, prompt_mode)| {
-            diagnostics::diagnose_error(
-                diag_model,
-                &provider,
-                0,
-                prompt_mode,
-                exit_code,
-                stderr,
-                working_dir,
-            )
+            agent_runtime_services
+                .diagnostics_service
+                .diagnose(DiagnosticsServiceRequest::DiagnoseError {
+                    diagnostics_model: diag_model.clone(),
+                    effective_provider: provider,
+                    provider_index: 0,
+                    prompt_mode,
+                    exit_code,
+                    stderr: stderr.to_string(),
+                    working_dir: working_dir.map(Path::to_path_buf),
+                })
+                .map_err(|err| err.to_string())
+                .and_then(|output| match output {
+                    DiagnosticsServiceOutput::Diagnosis { diagnosis } => Ok(diagnosis),
+                    DiagnosticsServiceOutput::ExhaustionClassification { .. } => {
+                        Err("diagnostics service returned exhaustion classification".to_string())
+                    }
+                })
         },
     );
 
@@ -2867,7 +2981,7 @@ fn main() -> ExitCode {
         .with_env_filter(EnvFilter::from_default_env())
         .try_init();
 
-    if std::env::args().len() <= 1 {
+    if std::env::args().len() == 1 {
         agent_runner_lib::run_tauri();
         return ExitCode::SUCCESS;
     }
