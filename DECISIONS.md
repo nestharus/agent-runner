@@ -1010,3 +1010,23 @@ The four discoveries are listed here so a later consolidation WU can pick them u
     (section 4: `defer`/`defer`, no block)
   - `planning/age-39-thin-main-dispatch-cleanup/risk/age-39-risk-profile.md`
     (WU verdict HIGH; per-surface mode = exhaustive across all 19 surfaces).
+
+## 2026-05-09 — AGE-39 Phase 8 commit-hygiene residual (MEDIUM accepted)
+
+- **Phase**: Phase 8 (PR-review gates).
+- **Decision**: Accept commit-hygiene MEDIUM verdict as a residual rather than splitting the path-guard test commit further.
+- **Rationale**: After two fix passes (commit-message renames at `b2f31b4` and `fbec04b`),
+  the gate still reports MEDIUM on size: the path-guard test file is 522 lines added in
+  one commit, and the source-shape rustfmt cleanup is 242 lines. All 11 commits compile
+  in isolation; multi-concern review is `SINGLE_CONCERN`; test-audit and justification
+  are `LOW`. The single-file test suite is intentionally cohesive — a single
+  `age39_main_thinning_source_guard.rs` covering all 21 cut-over rows — and splitting
+  it across commits would not reduce reviewer load. The AGE-36 PR #66 surgical-reorder
+  precedent does not apply (build isolation passes for every commit).
+- **Evidence**:
+  - `planning/age-39-thin-main-dispatch-cleanup/risk/age-39-commit-hygiene.md`
+    (post-rerun MEDIUM verdict, build isolation OK).
+  - `planning/age-39-thin-main-dispatch-cleanup/risk/age-39-multi-concern.md`
+    (`SINGLE_CONCERN`).
+  - `planning/age-39-thin-main-dispatch-cleanup/risk/age-39-test-audit.md` (LOW).
+  - `planning/age-39-thin-main-dispatch-cleanup/risk/age-39-justification.md` (LOW).
