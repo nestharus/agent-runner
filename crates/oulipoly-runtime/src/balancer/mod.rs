@@ -2,7 +2,9 @@ use crate::migration::MigrationError;
 use crate::quota::{InFlight, RefreshOutcome, is_stale, is_topology_probe_due, refresh_provider};
 use crate::sessions::scan_provider;
 use chrono::Utc;
-use oulipoly_config::{ModelConfig, ProvidersConfig, SessionsConfig};
+use oulipoly_config::{
+    ModelConfig, ProviderConfig, ProvidersConfig, SessionStorage, SessionsConfig,
+};
 pub use oulipoly_core::TransitionReason;
 use oulipoly_state::{QuotaRecord, QuotaWindow, ResolvedResume, StateDb};
 
@@ -389,10 +391,19 @@ pub fn decide_migration(
         return Ok(MigrationDecision::Stay);
     }
 
+    let Some(active_provider_index) = model
+        .providers
+        .iter()
+        .position(|provider| provider.name == resolved.active_provider)
+    else {
+        return Ok(MigrationDecision::Stay);
+    };
+    let active = &model.providers[active_provider_index];
+
     if let Some(target) = manual_target {
         if let Some(target_provider_index) = model.providers.iter().position(|p| p.name == target) {
             let target_provider = &model.providers[target_provider_index];
-            if has_session_storage(target_provider) {
+            if is_resume_migratable_pair(active, target_provider) {
                 return Ok(MigrationDecision::Migrate {
                     target_provider_index,
                     reason: TransitionReason::Manual,
@@ -402,15 +413,10 @@ pub fn decide_migration(
         return Ok(MigrationDecision::Stay);
     }
 
-    let Some(active_provider_index) = model
-        .providers
-        .iter()
-        .position(|provider| provider.name == resolved.active_provider)
-    else {
+    if !is_resume_migratable_pair(active, active) {
         return Ok(MigrationDecision::Stay);
-    };
+    }
 
-    let active = &model.providers[active_provider_index];
     let active_exhausted = state
         .get_quota(&active.name)
         .map_err(|message| MigrationError::Db { message })?
@@ -420,7 +426,7 @@ pub fn decide_migration(
 
     if active_exhausted {
         if let Some(target) =
-            lowest_load_migration_target(model, &projections, Some(active_provider_index))
+            lowest_load_migration_target(model, &projections, active, Some(active_provider_index))
         {
             return Ok(MigrationDecision::Migrate {
                 target_provider_index: target.provider_index,
@@ -430,7 +436,7 @@ pub fn decide_migration(
         return Ok(MigrationDecision::Stay);
     }
 
-    let Some(best) = lowest_load_migration_target(model, &projections, None) else {
+    let Some(best) = lowest_load_migration_target(model, &projections, active, None) else {
         return Ok(MigrationDecision::Stay);
     };
     if best.provider_index == active_provider_index {
@@ -443,8 +449,14 @@ pub fn decide_migration(
     })
 }
 
-fn has_session_storage(provider: &oulipoly_config::ProviderConfig) -> bool {
-    provider.session_storage.is_some()
+fn is_resume_migratable_pair(source: &ProviderConfig, target: &ProviderConfig) -> bool {
+    matches!(
+        (&source.session_storage, &target.session_storage),
+        (
+            Some(SessionStorage::ClaudeCode { .. }),
+            Some(SessionStorage::ClaudeCode { .. })
+        )
+    )
 }
 
 fn provider_load(projection: &ProviderProjection) -> f64 {
@@ -463,6 +475,7 @@ fn provider_load(projection: &ProviderProjection) -> f64 {
 fn lowest_load_migration_target<'a>(
     model: &ModelConfig,
     projections: &'a [ProviderProjection],
+    source_provider: &ProviderConfig,
     exclude_provider_index: Option<usize>,
 ) -> Option<&'a ProviderProjection> {
     projections
@@ -472,7 +485,7 @@ fn lowest_load_migration_target<'a>(
             model
                 .providers
                 .get(projection.provider_index)
-                .is_some_and(has_session_storage)
+                .is_some_and(|candidate| is_resume_migratable_pair(source_provider, candidate))
         })
         .min_by(|a, b| {
             let load_order = provider_load(a)
@@ -1850,32 +1863,90 @@ mod tests {
         );
     }
 
-    // risk: Best-on-resume decision; level: particular-integration; source: proposal §11.1 Best-on-resume decision / A2, A4, A7.
+    // risk: Codex/non-Claude resume migration abort; level: particular-integration; source: AGE-48 contract §Test plan #1 / proposal A1, A2, A3.
     #[test]
-    fn decide_migration_returns_codex_deferred_for_codex_provider() {
+    fn decide_migration_stays_for_codex_source_in_codex_pool() {
         let db = StateDb::open(Path::new(":memory:")).unwrap();
-        let mixed = migratable_model(&[("codex", "codex"), ("claude", "claude_code")]);
+        let model = migratable_model(&[("codex", "codex"), ("codex2", "codex")]);
+        seed_windows_with_deltas(&db, "codex", &[(0.99, 5, 0.01, 22)]);
+        seed_windows_with_deltas(&db, "codex2", &[(0.30, 5, 0.01, 22)]);
+
+        let decision = decide_migration(&db, &model, &resolved_for(&model, 0), None).unwrap();
+
+        assert_eq!(decision, MigrationDecision::Stay);
+    }
+
+    // risk: Codex/non-Claude resume migration abort; level: particular-integration; source: AGE-48 contract §Test plan #2 / proposal A1, A2, A3.
+    #[test]
+    fn decide_migration_stays_for_codex_source_with_no_storage_pool() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = migratable_model(&[("codex", "none"), ("codex2", "none")]);
+        seed_windows_with_deltas(&db, "codex", &[(0.99, 5, 0.01, 22)]);
+        seed_windows_with_deltas(&db, "codex2", &[(0.30, 5, 0.01, 22)]);
+
+        let decision = decide_migration(&db, &model, &resolved_for(&model, 0), None).unwrap();
+
+        assert_eq!(decision, MigrationDecision::Stay);
+    }
+
+    // risk: Codex/non-Claude resume migration abort; level: particular-integration; source: AGE-48 contract §Test plan #3 / proposal A1, A2, A3.
+    #[test]
+    fn decide_migration_stays_for_codex_source_with_claude_target() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = migratable_model(&[("codex", "codex"), ("claude", "claude_code")]);
         seed_windows_with_deltas(&db, "codex", &[(0.99, 5, 0.01, 22)]);
         seed_windows_with_deltas(&db, "claude", &[(0.30, 5, 0.01, 22)]);
 
-        let decision = decide_migration(&db, &mixed, &resolved_for(&mixed, 0), None).unwrap();
+        let decision = decide_migration(&db, &model, &resolved_for(&model, 0), None).unwrap();
 
-        assert_eq!(
-            decision,
-            MigrationDecision::Migrate {
-                target_provider_index: 1,
-                reason: TransitionReason::QuotaThreshold
-            }
-        );
+        assert_eq!(decision, MigrationDecision::Stay);
+    }
 
-        let codex_only = migratable_model(&[("codex", "codex"), ("codex2", "codex")]);
-        seed_windows_with_deltas(&db, "codex2", &[(0.30, 5, 0.01, 22)]);
+    // risk: Manual migration target eligibility; level: particular-integration; source: AGE-48 contract §Test plan #4 / proposal A1, A2, A3.
+    #[test]
+    fn decide_migration_stays_for_manual_migrate_to_codex_target() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = migratable_model(&[("claude", "claude_code"), ("codex", "codex")]);
+
         let decision =
-            decide_migration(&db, &codex_only, &resolved_for(&codex_only, 0), None).unwrap();
+            decide_migration(&db, &model, &resolved_for(&model, 0), Some("codex")).unwrap();
+
+        assert_eq!(decision, MigrationDecision::Stay);
+    }
+
+    // risk: Exhausted branch reaches non-migratable source; level: particular-integration; source: AGE-48 contract §Test plan #5 / proposal A1, A2, A3.
+    #[test]
+    fn decide_migration_stays_for_codex_source_when_exhausted() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = migratable_model(&[("codex", "codex"), ("claude", "claude_code")]);
+        seed_windows_with_deltas(&db, "codex", &[(0.99, 5, 0.01, 22)]);
+        seed_windows_with_deltas(&db, "claude", &[(0.30, 5, 0.01, 22)]);
+        db.mark_exhausted("codex").unwrap();
+
+        let decision = decide_migration(&db, &model, &resolved_for(&model, 0), None).unwrap();
+
+        assert_eq!(decision, MigrationDecision::Stay);
+    }
+
+    // risk: Target filtering preserves load ordering after Codex exclusion; level: particular-integration; source: AGE-48 contract §Test plan #6 / proposal A1, A2, A4.
+    #[test]
+    fn decide_migration_picks_eligible_target_skipping_codex_target() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = migratable_model(&[
+            ("claude", "claude_code"),
+            ("codex", "codex"),
+            ("claude2", "claude_code"),
+        ]);
+        seed_windows_with_deltas(&db, "claude", &[(0.90, 5, 0.01, 22)]);
+        seed_windows_with_deltas(&db, "codex", &[(0.10, 5, 0.01, 22)]);
+        seed_windows_with_deltas(&db, "claude2", &[(0.20, 5, 0.01, 22)]);
+
+        let decision = decide_migration(&db, &model, &resolved_for(&model, 0), None).unwrap();
+
         assert_eq!(
             decision,
             MigrationDecision::Migrate {
-                target_provider_index: 1,
+                target_provider_index: 2,
                 reason: TransitionReason::QuotaThreshold
             }
         );
@@ -1891,6 +1962,62 @@ mod tests {
         let err = decide_migration(&db, &model, &resolved_for(&model, 0), None).unwrap_err();
 
         assert!(matches!(err, MigrationError::Db { .. }));
+    }
+
+    #[test]
+    fn decide_migration_stays_when_manual_target_unknown() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = migratable_model(&[("claude", "claude_code"), ("claude2", "claude_code")]);
+
+        // characterization: AGE-48 may edit the manual branch, and unknown manual targets were uncovered.
+        let decision = decide_migration(
+            &db,
+            &model,
+            &resolved_for(&model, 0),
+            Some("claude-missing"),
+        )
+        .unwrap();
+
+        assert_eq!(decision, MigrationDecision::Stay);
+    }
+
+    #[test]
+    fn decide_migration_stays_when_manual_target_has_no_session_storage() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = migratable_model(&[("claude", "claude_code"), ("claude2", "none")]);
+
+        // characterization: AGE-48 may edit the manual branch, and no-storage manual targets were uncovered.
+        let decision =
+            decide_migration(&db, &model, &resolved_for(&model, 0), Some("claude2")).unwrap();
+
+        assert_eq!(decision, MigrationDecision::Stay);
+    }
+
+    #[test]
+    fn decide_migration_stays_when_exhausted_active_has_no_eligible_sibling() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = migratable_model(&[("claude", "claude_code"), ("claude2", "none")]);
+        seed_windows_with_deltas(&db, "claude", &[(0.99, 5, 0.01, 22)]);
+        seed_windows_with_deltas(&db, "claude2", &[(0.30, 5, 0.01, 22)]);
+        db.mark_exhausted("claude").unwrap();
+
+        // characterization: AGE-48 may change target eligibility, and exhausted no-target behavior was uncovered.
+        let decision = decide_migration(&db, &model, &resolved_for(&model, 0), None).unwrap();
+
+        assert_eq!(decision, MigrationDecision::Stay);
+    }
+
+    #[test]
+    fn decide_migration_stays_when_active_provider_missing_from_migration_model() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = migratable_model(&[("claude", "claude_code"), ("claude2", "claude_code")]);
+        let mut resolved = resolved_for(&model, 0);
+        resolved.active_provider = "archived-claude".to_string();
+
+        // characterization: AGE-48 will read active-provider resolution, and missing-active behavior was uncovered.
+        let decision = decide_migration(&db, &model, &resolved, None).unwrap();
+
+        assert_eq!(decision, MigrationDecision::Stay);
     }
 
     // risk: compute_projections refactor equivalence; level: particular-integration; source: proposal §11.1 compute_projections refactor equivalence / A4.
