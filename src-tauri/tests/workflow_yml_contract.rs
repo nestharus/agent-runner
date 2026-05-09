@@ -139,6 +139,25 @@ fn step_by_uses<'a>(
         .unwrap_or_else(|| panic!("{workflow_name} {job_name} steps must contain uses: {uses}"))
 }
 
+fn step_by_name<'a>(
+    workflow: &'a Value,
+    workflow_name: &str,
+    job_name: &str,
+    name: &str,
+) -> &'a Value {
+    let matching = job_steps(workflow, job_name, workflow_name)
+        .iter()
+        .filter(|step| mapping_get(step, "name").and_then(Value::as_str) == Some(name))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matching.len(),
+        1,
+        "{workflow_name} {job_name} steps must contain exactly one step named {name:?}, found {}",
+        matching.len()
+    );
+    matching[0]
+}
+
 fn string_at<'a>(root: &'a Value, label: &str, path: &[&str]) -> &'a str {
     match value_at(root, label, path) {
         Value::String(value) => value,
@@ -729,6 +748,40 @@ fn assert_apt_packages(workflow_name: &str, workflow: &Value, job_name: &str) {
     );
 }
 
+fn assert_ci_linux_install_step_condition(job_name: &str) {
+    let workflow = ci_workflow();
+    assert_eq!(
+        string_at(
+            job(&workflow, job_name, "ci.yml"),
+            &format!("ci.yml jobs.{job_name}.runs-on"),
+            &["runs-on"],
+        ),
+        "ubuntu-latest",
+        "T3: ci.yml {job_name} must stay on the characterized Ubuntu runner"
+    );
+
+    let step = step_by_name(&workflow, "ci.yml", job_name, "Install system deps (Linux)");
+    assert_eq!(
+        string_field(
+            step,
+            "if",
+            &format!("T3 ci.yml {job_name} Install system deps (Linux).if"),
+        ),
+        "runner.os == 'Linux' || runner.os == ''",
+        "T3: ci.yml {job_name} Linux install step must preserve the current redundant condition until Step 6c tightens it"
+    );
+    assert!(
+        string_field(
+            step,
+            "run",
+            &format!("T3 ci.yml {job_name} Install system deps (Linux).run"),
+        )
+        .contains("apt-get install"),
+        "T3: ci.yml {job_name} Linux install step must keep the apt install run block"
+    );
+    assert_apt_packages("ci.yml", &workflow, job_name);
+}
+
 #[test]
 fn assertion_a01_per_lib_matrix_generator_output() {
     for (workflow_name, workflow) in workflow_pairs() {
@@ -1177,6 +1230,12 @@ fn assertion_a13_linux_apt_deps_preserved() {
         assert_apt_packages(workflow_name, &workflow, "rust-client-check");
         assert_apt_packages(workflow_name, &workflow, "rust-integration");
     }
+}
+
+#[test]
+fn assertion_t3_ci_linux_install_steps_characterize_current_condition() {
+    assert_ci_linux_install_step_condition("rust-client-check");
+    assert_ci_linux_install_step_condition("rust-integration");
 }
 
 #[test]
