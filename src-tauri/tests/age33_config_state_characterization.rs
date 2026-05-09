@@ -755,9 +755,14 @@ fn age_33_tauri_private_helpers_keep_models_dir_parent_config_and_state_policy()
             && lib_source.contains("join(\"state.db\")"),
         "setup memory command helpers must keep deriving the memory DB beside models_dir"
     );
-    let discovery_opens_gui_db_path = lib_source.contains("discover_models_cmd")
-        && (lib_source.contains("StateDb::open(&db_path)?")
-            || lib_source.contains("StateDb::open(db_path)?"));
+    let discover_models_cmd = source_slice(
+        lib_source,
+        "async fn discover_models_cmd(",
+        "fn persist_discovery_result(",
+    );
+    let discovery_opens_gui_db_path = discover_models_cmd
+        .contains("let db_path = state.db_path();")
+        && discover_models_cmd.contains("state_db_opener.open_at(&db_path)?");
     assert!(
         discovery_opens_gui_db_path,
         "real backend discovery command must keep opening the GUI-derived DB path"

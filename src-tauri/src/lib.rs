@@ -951,8 +951,6 @@ fn persist_discovery_result(
     cli_name: &str,
     result: discovery::DiscoveryResult,
 ) -> Result<Vec<DiscoveredModel>, String> {
-    // AGE-33 source guard compatibility: StateDb::open(&db_path)?
-
     // Clean out models from older CLI versions
     if !result.models.is_empty() {
         repo.delete_stale_models(cli_name, &result.cli_version)?;
@@ -1619,6 +1617,19 @@ mod tests {
             Arc::new(StubExecutorService::with_exit(0, b"stub stdout", "")),
             Arc::new(StubDiagnosticsService::returning(false)),
         )
+    }
+
+    #[test]
+    fn age38_load_providers_for_models_dir_with_routes_through_stub_and_defaults_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        let repo =
+            StubProvidersConfigRepository::returning(Err("sentinel provider failure".to_string()));
+
+        let providers = super::load_providers_for_models_dir_with(&models_dir, &repo);
+
+        assert_eq!(repo.calls(), vec![dir.path().join("providers.toml")]);
+        assert!(providers.entries.is_empty());
     }
 
     #[test]
