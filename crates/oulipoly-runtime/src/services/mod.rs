@@ -4,10 +4,14 @@ use crate::balancer::MigrationDecision;
 use crate::diagnostics::Diagnosis;
 use crate::executor::ExecutionResult;
 use crate::quota::{InFlight, RefreshOutcome};
+use crate::session_export::ExportError;
+use crate::session_lock::{Lease, LockError, ReleaseReceipt};
+use crate::session_replace::{ReplaceError, ReplaceReceipt, ReplaceSource};
+use crate::trace::{TraceOptions, TraceReport};
 pub use error::ServiceError;
-use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig, ProvidersConfig};
-use oulipoly_state::StateDb;
+use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig, ProvidersConfig, SessionsConfig};
 use oulipoly_state::repositories::ResumeRepository;
+use oulipoly_state::{ResumeError, StateDb};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -24,14 +28,6 @@ macro_rules! service_dto {
 service_dto!(
     ConfigServiceRequest,
     ConfigServiceOutput,
-    TraceServiceRequest,
-    TraceServiceOutput,
-    SessionExportServiceRequest,
-    SessionExportServiceOutput,
-    SessionReplaceServiceRequest,
-    SessionReplaceServiceOutput,
-    SessionLockServiceRequest,
-    SessionLockServiceOutput,
     MigrationMaintenanceServiceRequest,
     MigrationMaintenanceServiceOutput,
 );
@@ -105,6 +101,77 @@ pub enum MigrationServiceOutput {
     Migrated {
         segment: crate::migration::MigratedSegment,
     },
+}
+
+pub struct TraceServiceRequest<'a> {
+    pub state: &'a StateDb,
+    pub sessions_cfg: &'a SessionsConfig,
+    pub invocation_uuid: &'a str,
+    pub options: TraceOptions,
+}
+
+#[derive(Debug)]
+pub struct TraceServiceOutput {
+    pub result: Result<TraceReport, TraceServiceFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TraceServiceFailure {
+    InvalidInvocationId { input: String, message: String },
+    InvocationNotFound { input: String, message: String },
+    Operational { message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionExportServiceRequest {
+    pub session_id: String,
+}
+
+#[derive(Debug)]
+pub struct SessionExportServiceOutput {
+    pub result: Result<Vec<u8>, ExportError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionReplaceServiceRequest {
+    pub session_id: String,
+    pub source: ReplaceSource,
+    pub preimage_sha256: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct SessionReplaceServiceOutput {
+    pub result: Result<ReplaceReceipt, ReplaceError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionLockServiceRequest {
+    Acquire { session_id: String, ttl_ms: u64 },
+    Release { session_id: String, token: String },
+}
+
+#[derive(Debug)]
+pub struct SessionLockServiceOutput {
+    pub result: Result<SessionLockSuccess, SessionLockFailure>,
+}
+
+#[derive(Debug, Clone)]
+pub enum SessionLockSuccess {
+    Acquired {
+        session_id: String,
+        chain_id: String,
+        provider_name: String,
+        lease: Lease,
+    },
+    Released {
+        receipt: ReleaseReceipt,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum SessionLockFailure {
+    Resume(ResumeError),
+    Lock(LockError),
 }
 
 #[derive(Debug)]
@@ -258,6 +325,42 @@ impl ProductionSessionLifecycleService {
 pub struct ProductionMigrationService;
 
 impl ProductionMigrationService {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProductionTraceService;
+
+impl ProductionTraceService {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProductionSessionExportService;
+
+impl ProductionSessionExportService {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProductionSessionReplaceService;
+
+impl ProductionSessionReplaceService {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProductionSessionLockService;
+
+impl ProductionSessionLockService {
     pub fn new() -> Self {
         Self
     }
@@ -616,6 +719,39 @@ impl MigrationServicePort for ProductionMigrationService {
                 message: format!("{err:?}"),
             }),
         }
+    }
+}
+
+impl TraceServicePort for ProductionTraceService {
+    fn trace(&self, _request: TraceServiceRequest<'_>) -> Result<TraceServiceOutput, ServiceError> {
+        unimplemented!("AGE-37 Phase 6c will implement")
+    }
+}
+
+impl SessionExportServicePort for ProductionSessionExportService {
+    fn export_session(
+        &self,
+        _request: SessionExportServiceRequest,
+    ) -> Result<SessionExportServiceOutput, ServiceError> {
+        unimplemented!("AGE-37 Phase 6c will implement")
+    }
+}
+
+impl SessionReplaceServicePort for ProductionSessionReplaceService {
+    fn replace_session(
+        &self,
+        _request: SessionReplaceServiceRequest,
+    ) -> Result<SessionReplaceServiceOutput, ServiceError> {
+        unimplemented!("AGE-37 Phase 6c will implement")
+    }
+}
+
+impl SessionLockServicePort for ProductionSessionLockService {
+    fn lock_session(
+        &self,
+        _request: SessionLockServiceRequest,
+    ) -> Result<SessionLockServiceOutput, ServiceError> {
+        unimplemented!("AGE-37 Phase 6c will implement")
     }
 }
 

@@ -10,8 +10,11 @@ use oulipoly_runtime::ports::{
 };
 use oulipoly_runtime::services::{
     MigrationServicePort, ProductionInvocationLifecycleService, ProductionMigrationService,
-    ProductionResumeService, ProductionRoutingService, ProductionSessionLifecycleService,
-    ResumeServicePort, SessionLifecycleServicePort,
+    ProductionResumeService, ProductionRoutingService, ProductionSessionExportService,
+    ProductionSessionLifecycleService, ProductionSessionLockService,
+    ProductionSessionReplaceService, ProductionTraceService, ResumeServicePort,
+    SessionExportServicePort, SessionLifecycleServicePort, SessionLockServicePort,
+    SessionReplaceServicePort, TraceServicePort,
 };
 use oulipoly_state::repositories::ProductionStateDbOpener;
 use std::path::PathBuf;
@@ -45,6 +48,10 @@ pub struct AgentRuntimeServices {
     pub resume_service: Arc<dyn ResumeServicePort>,
     pub session_lifecycle_service: Arc<dyn SessionLifecycleServicePort>,
     pub migration_service: Arc<dyn MigrationServicePort>,
+    pub trace_service: Arc<dyn TraceServicePort>,
+    pub session_export_service: Arc<dyn SessionExportServicePort>,
+    pub session_replace_service: Arc<dyn SessionReplaceServicePort>,
+    pub session_lock_service: Arc<dyn SessionLockServicePort>,
 }
 
 impl AgentRuntimeServices {
@@ -83,6 +90,10 @@ impl AgentRuntimeServices {
             resume_service: Arc::new(ProductionResumeService::new()),
             session_lifecycle_service: Arc::new(ProductionSessionLifecycleService::new()),
             migration_service: Arc::new(ProductionMigrationService::new()),
+            trace_service: Arc::new(ProductionTraceService::default()),
+            session_export_service: Arc::new(ProductionSessionExportService::default()),
+            session_replace_service: Arc::new(ProductionSessionReplaceService::default()),
+            session_lock_service: Arc::new(ProductionSessionLockService::default()),
         })
     }
 }
