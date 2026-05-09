@@ -310,7 +310,7 @@ fn age_35_gui_test_model_with_db_path_remains_outside_invocation_lifecycle() {
         .find("effective_provider_for_model_provider")
         .expect("effective provider resolution");
     let exhausted_mark = body
-        .find("db.mark_exhausted(&provider.name)")
+        .find("mark_exhausted(&")
         .expect("caller-owned exhausted mark");
     assert!(
         route < effective_provider,

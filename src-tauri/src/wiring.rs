@@ -5,16 +5,19 @@ use oulipoly_config::repositories::{
     FilesystemModelConfigRepository, FilesystemProvidersConfigRepository,
     FilesystemSessionsConfigRepository,
 };
+use oulipoly_runtime::diagnostics::RuntimeDiagnosticsService;
+use oulipoly_runtime::executor::RuntimeExecutorService;
 use oulipoly_runtime::ports::{
     DefaultProcessRunner, DefaultUuidGenerator, StderrWriter, StdoutWriter, SystemClock,
 };
+use oulipoly_runtime::quota::RuntimeQuotaService;
 use oulipoly_runtime::services::{
-    MigrationServicePort, ProductionInvocationLifecycleService, ProductionMigrationService,
-    ProductionResumeService, ProductionRoutingService, ProductionSessionExportService,
-    ProductionSessionLifecycleService, ProductionSessionLockService,
-    ProductionSessionReplaceService, ProductionTraceService, ResumeServicePort,
-    SessionExportServicePort, SessionLifecycleServicePort, SessionLockServicePort,
-    SessionReplaceServicePort, TraceServicePort,
+    DiagnosticsServicePort, ExecutorServicePort, MigrationServicePort,
+    ProductionInvocationLifecycleService, ProductionMigrationService, ProductionResumeService,
+    ProductionRoutingService, ProductionSessionExportService, ProductionSessionLifecycleService,
+    ProductionSessionLockService, ProductionSessionReplaceService, ProductionTraceService,
+    QuotaServicePort, ResumeServicePort, SessionExportServicePort, SessionLifecycleServicePort,
+    SessionLockServicePort, SessionReplaceServicePort, TraceServicePort,
 };
 use oulipoly_state::repositories::ProductionStateDbOpener;
 use std::path::PathBuf;
@@ -45,6 +48,9 @@ pub struct AgentRuntimeServices {
     pub stderr_sink: Arc<StderrWriter>,
     pub routing_service: Arc<ProductionRoutingService>,
     pub invocation_lifecycle_service: Arc<ProductionInvocationLifecycleService>,
+    pub executor_service: Arc<dyn ExecutorServicePort>,
+    pub quota_service: Arc<dyn QuotaServicePort>,
+    pub diagnostics_service: Arc<dyn DiagnosticsServicePort>,
     pub resume_service: Arc<dyn ResumeServicePort>,
     pub session_lifecycle_service: Arc<dyn SessionLifecycleServicePort>,
     pub migration_service: Arc<dyn MigrationServicePort>,
@@ -70,6 +76,9 @@ impl AgentRuntimeServices {
             stderr_sink: Arc::new(StderrWriter),
             routing_service: Arc::new(ProductionRoutingService),
             invocation_lifecycle_service: Arc::new(ProductionInvocationLifecycleService),
+            executor_service: Arc::new(RuntimeExecutorService),
+            quota_service: Arc::new(RuntimeQuotaService),
+            diagnostics_service: Arc::new(RuntimeDiagnosticsService),
             resume_service: Arc::new(ProductionResumeService::new()),
             session_lifecycle_service: Arc::new(ProductionSessionLifecycleService::new()),
             migration_service: Arc::new(ProductionMigrationService::new()),
@@ -112,6 +121,9 @@ impl AgentRuntimeServices {
             stderr_sink: Arc::new(StderrWriter),
             routing_service: Arc::new(ProductionRoutingService),
             invocation_lifecycle_service: Arc::new(ProductionInvocationLifecycleService),
+            executor_service: Arc::new(RuntimeExecutorService),
+            quota_service: Arc::new(RuntimeQuotaService),
+            diagnostics_service: Arc::new(RuntimeDiagnosticsService),
             resume_service: Arc::new(ProductionResumeService::new()),
             session_lifecycle_service: Arc::new(ProductionSessionLifecycleService::new()),
             migration_service: Arc::new(ProductionMigrationService::new()),
