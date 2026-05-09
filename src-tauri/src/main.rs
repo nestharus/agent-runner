@@ -8,7 +8,8 @@ use oulipoly_runtime::balancer;
 use oulipoly_runtime::diagnostics;
 use oulipoly_runtime::executor;
 use oulipoly_runtime::services::{
-    ExecutorServiceRequest, InvocationLifecycleFinalizeRequest, InvocationLifecycleServicePort,
+    DiagnosticsServiceOutput, DiagnosticsServiceRequest, ExecutorServiceRequest,
+    InvocationLifecycleFinalizeRequest, InvocationLifecycleServicePort,
     InvocationLifecycleStartRequest, MigrationServiceOutput, MigrationServicePort,
     MigrationServiceRequest, ProductionMigrationService, ProductionResumeService,
     ProductionSessionLifecycleService, ResumeAcceptanceRequest, ResumeServiceOutput,
@@ -2249,7 +2250,7 @@ fn resolve_parent_invocation_id(state: &StateDb) -> Option<i64> {
 }
 
 fn run_diagnostics(
-    _agent_runtime_services: &wiring::AgentRuntimeServices,
+    agent_runtime_services: &wiring::AgentRuntimeServices,
     stderr: &str,
     exit_code: i32,
     models: &HashMap<String, ModelConfig>,
@@ -2266,15 +2267,24 @@ fn run_diagnostics(
 
     let diagnosis = effective_provider_for_model_provider(diag_model, 0, &providers_cfg).and_then(
         |(provider, prompt_mode)| {
-            diagnostics::diagnose_error(
-                diag_model,
-                &provider,
-                0,
-                prompt_mode,
-                exit_code,
-                stderr,
-                working_dir,
-            )
+            agent_runtime_services
+                .diagnostics_service
+                .diagnose(DiagnosticsServiceRequest::DiagnoseError {
+                    diagnostics_model: diag_model.clone(),
+                    effective_provider: provider,
+                    provider_index: 0,
+                    prompt_mode,
+                    exit_code,
+                    stderr: stderr.to_string(),
+                    working_dir: working_dir.map(Path::to_path_buf),
+                })
+                .map_err(|err| err.to_string())
+                .and_then(|output| match output {
+                    DiagnosticsServiceOutput::Diagnosis { diagnosis } => Ok(diagnosis),
+                    DiagnosticsServiceOutput::ExhaustionClassification { .. } => {
+                        Err("diagnostics service returned exhaustion classification".to_string())
+                    }
+                })
         },
     );
 
