@@ -10,12 +10,10 @@ use oulipoly_runtime::executor;
 use oulipoly_runtime::services::{
     DiagnosticsServiceOutput, DiagnosticsServiceRequest, ExecutorServiceRequest,
     InvocationLifecycleFinalizeRequest, InvocationLifecycleServicePort,
-    InvocationLifecycleStartRequest, MigrationServiceOutput, MigrationServicePort,
-    MigrationServiceRequest, ProductionMigrationService, ProductionResumeService,
-    ProductionSessionLifecycleService, ResumeAcceptanceRequest, ResumeServiceOutput,
-    ResumeServicePort, ResumeServiceRequest, RoutingServicePort, RoutingServiceRequest,
-    ServiceError, SessionExportServiceRequest, SessionLifecycleIngestMode, SessionLifecycleRequest,
-    SessionLifecycleServicePort, SessionLockFailure, SessionLockServiceRequest, SessionLockSuccess,
+    InvocationLifecycleStartRequest, MigrationServiceOutput, MigrationServiceRequest,
+    ResumeAcceptanceRequest, ResumeServiceOutput, ResumeServiceRequest, RoutingServicePort,
+    RoutingServiceRequest, ServiceError, SessionExportServiceRequest, SessionLifecycleIngestMode,
+    SessionLifecycleRequest, SessionLockFailure, SessionLockServiceRequest, SessionLockSuccess,
     SessionReplaceServiceRequest, TraceServiceFailure, TraceServiceRequest,
 };
 use oulipoly_runtime::session_export::ExportError;
@@ -1027,7 +1025,7 @@ enum ResumeIngestMode<'a> {
 }
 
 fn ingest_and_emit_session_id_resume_aware(
-    _agent_runtime_services: &wiring::AgentRuntimeServices,
+    agent_runtime_services: &wiring::AgentRuntimeServices,
     state: &StateDb,
     sessions_cfg: &oulipoly_config::SessionsConfig,
     provider_name: &str,
@@ -1035,7 +1033,6 @@ fn ingest_and_emit_session_id_resume_aware(
     invocation_uuid: &str,
     mode: ResumeIngestMode<'_>,
 ) -> bool {
-    let service = ProductionSessionLifecycleService::new();
     let mut stderr = std::io::stderr();
     let mode = match mode {
         ResumeIngestMode::Unpinned { capture_method } => SessionLifecycleIngestMode::Unpinned {
@@ -1045,7 +1042,9 @@ fn ingest_and_emit_session_id_resume_aware(
             resume_target: resume_target.to_string(),
         },
     };
-    match service.ingest_session(SessionLifecycleRequest {
+    match agent_runtime_services
+        .session_lifecycle_service
+        .ingest_session(SessionLifecycleRequest {
         state,
         sessions_cfg,
         provider_name,
@@ -1467,11 +1466,11 @@ fn run_repl(
     let providers_cfg = oulipoly_config::ProvidersConfig::load(&providers_path).unwrap_or_default();
     let models = load_models(&models_dir, Some(&providers_cfg))?;
     let sessions_cfg = oulipoly_config::SessionsConfig::load(&sessions_path).unwrap_or_default();
-    let resume_service = ProductionResumeService::new();
-    let migration_service = ProductionMigrationService::new();
     let mut resolved_resume = if let Some(session_id) = resume {
         Some(
-            match resume_service.resolve_resume(ResumeServiceRequest {
+            match agent_runtime_services
+                .resume_service
+                .resolve_resume(ResumeServiceRequest {
                 state: &state,
                 models: &models,
                 input: session_id,
@@ -1548,7 +1547,9 @@ fn run_repl(
         let migration_model = resume_migration_pool(resolved, &providers_cfg);
         let effective_spawn_cwd = effective_spawn_cwd(working_dir)?;
         let mut migration_stderr = std::io::stderr();
-        match migration_service.migrate(MigrationServiceRequest {
+        match agent_runtime_services
+            .migration_service
+            .migrate(MigrationServiceRequest {
             state: &state,
             sessions_cfg: &sessions_cfg,
             resolved,
@@ -1730,7 +1731,7 @@ fn run_repl(
 }
 
 fn run_resume(
-    _agent_runtime_services: &wiring::AgentRuntimeServices,
+    agent_runtime_services: &wiring::AgentRuntimeServices,
     model_name: Option<&str>,
     session_id: &str,
     manual_migrate: Option<&str>,
@@ -1755,11 +1756,11 @@ fn run_resume(
     let providers_cfg = oulipoly_config::ProvidersConfig::load(&providers_path).unwrap_or_default();
     let models = load_models(&models_dir, Some(&providers_cfg))?;
     let sessions_cfg = oulipoly_config::SessionsConfig::load(&sessions_path).unwrap_or_default();
-    let resume_service = ProductionResumeService::new();
-    let migration_service = ProductionMigrationService::new();
 
     let stderr_is_terminal = std::io::stderr().is_terminal();
-    let mut resolved = match resume_service.resolve_resume(ResumeServiceRequest {
+    let mut resolved = match agent_runtime_services
+        .resume_service
+        .resolve_resume(ResumeServiceRequest {
         state: &state,
         models: &models,
         input: session_id,
@@ -1806,7 +1807,9 @@ fn run_resume(
     let migration_model = resume_migration_pool(&resolved, &providers_cfg);
     let effective_spawn_cwd = effective_spawn_cwd(working_dir)?;
     let mut migration_stderr = std::io::stderr();
-    match migration_service.migrate(MigrationServiceRequest {
+    match agent_runtime_services
+        .migration_service
+        .migrate(MigrationServiceRequest {
         state: &state,
         sessions_cfg: &sessions_cfg,
         resolved: &resolved,
@@ -1864,7 +1867,7 @@ fn run_resume(
         provider_index,
         parent_invocation_id,
     };
-    let invocation_row_id = _agent_runtime_services
+    let invocation_row_id = agent_runtime_services
         .invocation_lifecycle_service
         .start_invocation(InvocationLifecycleStartRequest {
             state: &state,
@@ -1893,7 +1896,7 @@ fn run_resume(
     ) {
         Ok(result) => result,
         Err(_spawn_err) => {
-            _agent_runtime_services
+            agent_runtime_services
                 .invocation_lifecycle_service
                 .finalize_invocation(InvocationLifecycleFinalizeRequest {
                     state: &state,
@@ -1910,7 +1913,8 @@ fn run_resume(
     };
 
     if let Some(acceptance) = &result.resume_acceptance {
-        resume_service
+        agent_runtime_services
+            .resume_service
             .record_acceptance(ResumeAcceptanceRequest {
                 state: &state,
                 invocation_row_id,
@@ -1923,7 +1927,7 @@ fn run_resume(
     let success = result.exit_code == 0;
     let error_category = if !success {
         run_diagnostics(
-            _agent_runtime_services,
+            agent_runtime_services,
             &result.stderr,
             result.exit_code,
             &models,
@@ -1935,7 +1939,7 @@ fn run_resume(
     if let Err(err) = state.record_returned_artifacts(invocation_row_id, &result.returned_artifacts)
     {
         eprintln!("Error: Failed to record returned artifacts: {err}");
-        _agent_runtime_services
+        agent_runtime_services
             .invocation_lifecycle_service
             .finalize_invocation(
                 InvocationLifecycleFinalizeRequest {
@@ -1952,7 +1956,7 @@ fn run_resume(
         guard.mark_finalized();
         return Ok(1);
     }
-    _agent_runtime_services
+    agent_runtime_services
         .invocation_lifecycle_service
         .finalize_invocation(InvocationLifecycleFinalizeRequest {
             state: &state,
@@ -1967,7 +1971,7 @@ fn run_resume(
 
     if success {
         ingest_and_emit_session_id_resume_aware(
-            _agent_runtime_services,
+            agent_runtime_services,
             &state,
             &sessions_cfg,
             &provider.name,
