@@ -8,12 +8,13 @@ use oulipoly_runtime::balancer;
 use oulipoly_runtime::diagnostics;
 use oulipoly_runtime::executor;
 use oulipoly_runtime::services::{
-    MigrationServiceOutput, MigrationServicePort, MigrationServiceRequest,
-    ProductionMigrationService, ProductionResumeService, ProductionSessionLifecycleService,
-    ResumeAcceptanceRequest, ResumeServiceOutput, ResumeServicePort, ResumeServiceRequest,
-    RoutingServicePort, RoutingServiceRequest, ServiceError, SessionExportServiceRequest,
-    SessionLifecycleIngestMode, SessionLifecycleRequest, SessionLifecycleServicePort,
-    SessionLockFailure, SessionLockServiceRequest, SessionLockSuccess, SessionReplaceServiceRequest,
+    InvocationLifecycleServicePort, InvocationLifecycleStartRequest, MigrationServiceOutput,
+    MigrationServicePort, MigrationServiceRequest, ProductionMigrationService,
+    ProductionResumeService, ProductionSessionLifecycleService, ResumeAcceptanceRequest,
+    ResumeServiceOutput, ResumeServicePort, ResumeServiceRequest, RoutingServicePort,
+    RoutingServiceRequest, ServiceError, SessionExportServiceRequest, SessionLifecycleIngestMode,
+    SessionLifecycleRequest, SessionLifecycleServicePort, SessionLockFailure,
+    SessionLockServiceRequest, SessionLockSuccess, SessionReplaceServiceRequest,
     TraceServiceFailure, TraceServiceRequest,
 };
 use oulipoly_runtime::session_export::ExportError;
@@ -1625,13 +1626,21 @@ fn run_repl(
                 model.name.clone()
             }
         });
-    let invocation_row_id = state.start_invocation(&InvocationStart {
+    let invocation_start = InvocationStart {
         invocation_uuid: invocation.id.clone(),
         model_name: invocation_model_name,
         provider_name: provider.name.clone(),
         provider_index,
         parent_invocation_id,
-    })?;
+    };
+    let invocation_row_id = agent_runtime_services
+        .invocation_lifecycle_service
+        .start_invocation(InvocationLifecycleStartRequest {
+            state: &state,
+            start: &invocation_start,
+        })
+        .map_err(|err| err.to_string())?
+        .invocation_row_id;
     let mut guard = FinalizerGuard::new(&state, invocation_row_id);
     let invocation_env = serde_json::to_string(&invocation)
         .map_err(|e| format!("Failed to serialize invocation id: {e}"))?;
@@ -1839,13 +1848,21 @@ fn run_resume(
         .model_name
         .clone()
         .unwrap_or_else(|| "<unknown>".to_string());
-    let invocation_row_id = state.start_invocation(&InvocationStart {
+    let invocation_start = InvocationStart {
         invocation_uuid: invocation.id.clone(),
         model_name: invocation_model_name,
         provider_name: provider.name.clone(),
         provider_index,
         parent_invocation_id,
-    })?;
+    };
+    let invocation_row_id = _agent_runtime_services
+        .invocation_lifecycle_service
+        .start_invocation(InvocationLifecycleStartRequest {
+            state: &state,
+            start: &invocation_start,
+        })
+        .map_err(|err| err.to_string())?
+        .invocation_row_id;
     let mut guard = FinalizerGuard::new(&state, invocation_row_id);
     state.update_session_capture(invocation_row_id, Some(session_id), "resumed")?;
 
@@ -1994,13 +2011,21 @@ fn run_with_balancing(
         source: provider_name.clone(),
         id: Uuid::new_v4().to_string(),
     };
-    let invocation_row_id = state.start_invocation(&InvocationStart {
+    let invocation_start = InvocationStart {
         invocation_uuid: invocation.id.clone(),
         model_name: model.name.clone(),
         provider_name: provider_name.clone(),
         provider_index,
         parent_invocation_id,
-    })?;
+    };
+    let invocation_row_id = agent_runtime_services
+        .invocation_lifecycle_service
+        .start_invocation(InvocationLifecycleStartRequest {
+            state: &state,
+            start: &invocation_start,
+        })
+        .map_err(|err| err.to_string())?
+        .invocation_row_id;
     let invocation_env = serde_json::to_string(&invocation)
         .map_err(|e| format!("Failed to serialize invocation id: {e}"))?;
     eprintln!("{}", invocation.stderr_line());
