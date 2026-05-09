@@ -8,14 +8,14 @@ use oulipoly_runtime::balancer;
 use oulipoly_runtime::diagnostics;
 use oulipoly_runtime::executor;
 use oulipoly_runtime::services::{
-    InvocationLifecycleServicePort, InvocationLifecycleStartRequest, MigrationServiceOutput,
-    MigrationServicePort, MigrationServiceRequest, ProductionMigrationService,
-    ProductionResumeService, ProductionSessionLifecycleService, ResumeAcceptanceRequest,
-    ResumeServiceOutput, ResumeServicePort, ResumeServiceRequest, RoutingServicePort,
-    RoutingServiceRequest, ServiceError, SessionExportServiceRequest, SessionLifecycleIngestMode,
-    SessionLifecycleRequest, SessionLifecycleServicePort, SessionLockFailure,
-    SessionLockServiceRequest, SessionLockSuccess, SessionReplaceServiceRequest,
-    TraceServiceFailure, TraceServiceRequest,
+    InvocationLifecycleFinalizeRequest, InvocationLifecycleServicePort,
+    InvocationLifecycleStartRequest, MigrationServiceOutput, MigrationServicePort,
+    MigrationServiceRequest, ProductionMigrationService, ProductionResumeService,
+    ProductionSessionLifecycleService, ResumeAcceptanceRequest, ResumeServiceOutput,
+    ResumeServicePort, ResumeServiceRequest, RoutingServicePort, RoutingServiceRequest,
+    ServiceError, SessionExportServiceRequest, SessionLifecycleIngestMode, SessionLifecycleRequest,
+    SessionLifecycleServicePort, SessionLockFailure, SessionLockServiceRequest, SessionLockSuccess,
+    SessionReplaceServiceRequest, TraceServiceFailure, TraceServiceRequest,
 };
 use oulipoly_runtime::session_export::ExportError;
 use oulipoly_runtime::session_lock::LockError;
@@ -1675,13 +1675,17 @@ fn run_repl(
             if resume.is_none() {
                 state.update_session_capture(invocation_row_id, None, "none")?;
             }
-            state.finalize_invocation(
-                invocation_row_id,
-                exit_code == 0,
-                exit_code,
-                None,
-                result.terminal_reason.as_deref(),
-            )?;
+            agent_runtime_services
+                .invocation_lifecycle_service
+                .finalize_invocation(InvocationLifecycleFinalizeRequest {
+                    state: &state,
+                    invocation_row_id,
+                    success: exit_code == 0,
+                    exit_code,
+                    error_category: None,
+                    terminal_reason: result.terminal_reason.as_deref(),
+                })
+                .map_err(|err| err.to_string())?;
             guard.mark_finalized();
             if exit_code == 0 {
                 ingest_and_emit_session_id_resume_aware(
@@ -1707,13 +1711,17 @@ fn run_repl(
             if resume.is_none() {
                 state.update_session_capture(invocation_row_id, None, "none")?;
             }
-            state.finalize_invocation(
-                invocation_row_id,
-                false,
-                1,
-                Some("spawn_error"),
-                Some("spawn_error"),
-            )?;
+            agent_runtime_services
+                .invocation_lifecycle_service
+                .finalize_invocation(InvocationLifecycleFinalizeRequest {
+                    state: &state,
+                    invocation_row_id,
+                    success: false,
+                    exit_code: 1,
+                    error_category: Some("spawn_error"),
+                    terminal_reason: Some("spawn_error"),
+                })
+                .map_err(|err| err.to_string())?;
             guard.mark_finalized();
             Ok(1)
         }
@@ -1884,13 +1892,17 @@ fn run_resume(
     ) {
         Ok(result) => result,
         Err(_spawn_err) => {
-            state.finalize_invocation(
-                invocation_row_id,
-                false,
-                1,
-                Some("spawn_error"),
-                Some("spawn_error"),
-            )?;
+            _agent_runtime_services
+                .invocation_lifecycle_service
+                .finalize_invocation(InvocationLifecycleFinalizeRequest {
+                    state: &state,
+                    invocation_row_id,
+                    success: false,
+                    exit_code: 1,
+                    error_category: Some("spawn_error"),
+                    terminal_reason: Some("spawn_error"),
+                })
+                .map_err(|err| err.to_string())?;
             guard.mark_finalized();
             return Ok(1);
         }
@@ -1922,25 +1934,34 @@ fn run_resume(
     if let Err(err) = state.record_returned_artifacts(invocation_row_id, &result.returned_artifacts)
     {
         eprintln!("Error: Failed to record returned artifacts: {err}");
-        state
+        _agent_runtime_services
+            .invocation_lifecycle_service
             .finalize_invocation(
-                invocation_row_id,
-                false,
-                1,
-                Some("returned_artifacts"),
-                Some("returned_artifacts_persist_failed"),
+                InvocationLifecycleFinalizeRequest {
+                    state: &state,
+                    invocation_row_id,
+                    success: false,
+                    exit_code: 1,
+                    error_category: Some("returned_artifacts"),
+                    terminal_reason: Some("returned_artifacts_persist_failed"),
+                },
             )
+            .map(|_| ())
             .unwrap_or_else(|e| eprintln!("Warning: Failed to finalize invocation: {e}"));
         guard.mark_finalized();
         return Ok(1);
     }
-    state.finalize_invocation(
-        invocation_row_id,
-        success,
-        result.exit_code,
-        error_category.as_deref(),
-        result.terminal_reason.as_deref(),
-    )?;
+    _agent_runtime_services
+        .invocation_lifecycle_service
+        .finalize_invocation(InvocationLifecycleFinalizeRequest {
+            state: &state,
+            invocation_row_id,
+            success,
+            exit_code: result.exit_code,
+            error_category: error_category.as_deref(),
+            terminal_reason: result.terminal_reason.as_deref(),
+        })
+        .map_err(|err| err.to_string())?;
     guard.mark_finalized();
 
     if success {
@@ -2044,14 +2065,19 @@ fn run_with_balancing(
     ) {
         Ok(result) => result,
         Err(err) => {
-            state
+            agent_runtime_services
+                .invocation_lifecycle_service
                 .finalize_invocation(
-                    invocation_row_id,
-                    false,
-                    -1,
-                    Some("spawn_error"),
-                    Some("spawn_error"),
+                    InvocationLifecycleFinalizeRequest {
+                        state: &state,
+                        invocation_row_id,
+                        success: false,
+                        exit_code: -1,
+                        error_category: Some("spawn_error"),
+                        terminal_reason: Some("spawn_error"),
+                    },
                 )
+                .map(|_| ())
                 .unwrap_or_else(|finalize_err| {
                     eprintln!("Warning: Failed to finalize invocation: {finalize_err}")
                 });
@@ -2100,26 +2126,36 @@ fn run_with_balancing(
     if let Err(err) = state.record_returned_artifacts(invocation_row_id, &result.returned_artifacts)
     {
         eprintln!("Error: Failed to record returned artifacts: {err}");
-        state
+        agent_runtime_services
+            .invocation_lifecycle_service
             .finalize_invocation(
-                invocation_row_id,
-                false,
-                1,
-                Some("returned_artifacts"),
-                Some("returned_artifacts_persist_failed"),
+                InvocationLifecycleFinalizeRequest {
+                    state: &state,
+                    invocation_row_id,
+                    success: false,
+                    exit_code: 1,
+                    error_category: Some("returned_artifacts"),
+                    terminal_reason: Some("returned_artifacts_persist_failed"),
+                },
             )
+            .map(|_| ())
             .unwrap_or_else(|e| eprintln!("Warning: Failed to finalize invocation: {e}"));
         return Ok(1);
     }
 
-    state
+    agent_runtime_services
+        .invocation_lifecycle_service
         .finalize_invocation(
-            invocation_row_id,
-            success,
-            result.exit_code,
-            error_category.as_deref(),
-            result.terminal_reason.as_deref(),
+            InvocationLifecycleFinalizeRequest {
+                state: &state,
+                invocation_row_id,
+                success,
+                exit_code: result.exit_code,
+                error_category: error_category.as_deref(),
+                terminal_reason: result.terminal_reason.as_deref(),
+            },
         )
+        .map(|_| ())
         .unwrap_or_else(|e| eprintln!("Warning: Failed to finalize invocation: {e}"));
 
     if success {
