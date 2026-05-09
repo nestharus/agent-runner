@@ -1,5 +1,5 @@
 use regex::Regex;
-use serde_yml::Value;
+use serde_yaml_ng::Value;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,7 +18,7 @@ fn read_text(relative_path: &str) -> String {
 
 fn parse_workflow(relative_path: &str) -> Value {
     let body = read_text(relative_path);
-    serde_yml::from_str(&body).unwrap_or_else(|err| {
+    serde_yaml_ng::from_str(&body).unwrap_or_else(|err| {
         panic!(
             "failed to parse {} as workflow YAML: {err}",
             path_from_test_file(relative_path).display()
@@ -88,7 +88,7 @@ fn value_at<'a>(root: &'a Value, label: &str, path: &[&str]) -> &'a Value {
     current
 }
 
-fn mapping_at<'a>(root: &'a Value, label: &str, path: &[&str]) -> &'a serde_yml::Mapping {
+fn mapping_at<'a>(root: &'a Value, label: &str, path: &[&str]) -> &'a serde_yaml_ng::Mapping {
     match value_at(root, label, path) {
         Value::Mapping(mapping) => mapping,
         other => panic!("{label} must be a mapping, got {other:?}"),
@@ -110,7 +110,7 @@ fn string_field<'a>(root: &'a Value, field: &str, label: &str) -> &'a str {
     }
 }
 
-fn jobs(workflow: &Value) -> &serde_yml::Mapping {
+fn jobs(workflow: &Value) -> &serde_yaml_ng::Mapping {
     mapping_at(workflow, "jobs", &["jobs"])
 }
 
@@ -137,6 +137,25 @@ fn step_by_uses<'a>(
         .iter()
         .find(|step| mapping_get(step, "uses").and_then(Value::as_str) == Some(uses))
         .unwrap_or_else(|| panic!("{workflow_name} {job_name} steps must contain uses: {uses}"))
+}
+
+fn step_by_name<'a>(
+    workflow: &'a Value,
+    workflow_name: &str,
+    job_name: &str,
+    name: &str,
+) -> &'a Value {
+    let matching = job_steps(workflow, job_name, workflow_name)
+        .iter()
+        .filter(|step| mapping_get(step, "name").and_then(Value::as_str) == Some(name))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matching.len(),
+        1,
+        "{workflow_name} {job_name} steps must contain exactly one step named {name:?}, found {}",
+        matching.len()
+    );
+    matching[0]
 }
 
 fn string_at<'a>(root: &'a Value, label: &str, path: &[&str]) -> &'a str {
@@ -282,7 +301,8 @@ fn all_step_run_blocks(workflow: &Value) -> Vec<(&str, &str)> {
 }
 
 fn value_text(value: &Value) -> String {
-    serde_yml::to_string(value).unwrap_or_else(|err| panic!("failed to render YAML value: {err}"))
+    serde_yaml_ng::to_string(value)
+        .unwrap_or_else(|err| panic!("failed to render YAML value: {err}"))
 }
 
 fn regex_is_match(pattern: &str, haystack: &str) -> bool {
@@ -727,6 +747,40 @@ fn assert_apt_packages(workflow_name: &str, workflow: &Value, job_name: &str) {
         ]),
         "A13: {workflow_name} {job_name} apt-get install step must list exactly the preserved Linux Tauri/WebKit packages"
     );
+}
+
+fn assert_ci_linux_install_step_condition(job_name: &str) {
+    let workflow = ci_workflow();
+    assert_eq!(
+        string_at(
+            job(&workflow, job_name, "ci.yml"),
+            &format!("ci.yml jobs.{job_name}.runs-on"),
+            &["runs-on"],
+        ),
+        "ubuntu-latest",
+        "T3: ci.yml {job_name} must stay on the characterized Ubuntu runner"
+    );
+
+    let step = step_by_name(&workflow, "ci.yml", job_name, "Install system deps (Linux)");
+    assert_eq!(
+        string_field(
+            step,
+            "if",
+            &format!("T3 ci.yml {job_name} Install system deps (Linux).if"),
+        ),
+        "runner.os == 'Linux'",
+        "T3: ci.yml {job_name} Linux install step must use the tightened Linux-only condition"
+    );
+    assert!(
+        string_field(
+            step,
+            "run",
+            &format!("T3 ci.yml {job_name} Install system deps (Linux).run"),
+        )
+        .contains("apt-get install"),
+        "T3: ci.yml {job_name} Linux install step must keep the apt install run block"
+    );
+    assert_apt_packages("ci.yml", &workflow, job_name);
 }
 
 #[test]
@@ -1177,6 +1231,12 @@ fn assertion_a13_linux_apt_deps_preserved() {
         assert_apt_packages(workflow_name, &workflow, "rust-client-check");
         assert_apt_packages(workflow_name, &workflow, "rust-integration");
     }
+}
+
+#[test]
+fn assertion_t3_ci_linux_install_steps_characterize_current_condition() {
+    assert_ci_linux_install_step_condition("rust-client-check");
+    assert_ci_linux_install_step_condition("rust-integration");
 }
 
 #[test]

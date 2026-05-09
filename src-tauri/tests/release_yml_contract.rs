@@ -1,4 +1,4 @@
-use serde_yml::Value;
+use serde_yaml_ng::Value;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
@@ -8,7 +8,7 @@ fn release_yml_restores_windows_and_target_suffixed_bare_binaries() {
     let workflow_path = Path::new("../.github/workflows/release.yml");
     let workflow_body = fs::read_to_string(workflow_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", workflow_path.display()));
-    let workflow: Value = serde_yml::from_str(&workflow_body)
+    let workflow: Value = serde_yaml_ng::from_str(&workflow_body)
         .unwrap_or_else(|err| panic!("failed to parse {}: {err}", workflow_path.display()));
 
     let matrix_include = sequence_at(
