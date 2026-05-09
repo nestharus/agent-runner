@@ -36,7 +36,7 @@ tauri-build.workspace = true
 oulipoly-agent-messenger = { path = "../crates/oulipoly-agent-messenger" }
 regex.workspace = true
 rusqlite.workspace = true
-serde_yml.workspace = true
+serde_yaml_ng.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 

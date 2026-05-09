@@ -1,5 +1,5 @@
 use regex::Regex;
-use serde_yml::Value;
+use serde_yaml_ng::Value;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,7 +18,7 @@ fn read_text(relative_path: &str) -> String {
 
 fn parse_workflow(relative_path: &str) -> Value {
     let body = read_text(relative_path);
-    serde_yml::from_str(&body).unwrap_or_else(|err| {
+    serde_yaml_ng::from_str(&body).unwrap_or_else(|err| {
         panic!(
             "failed to parse {} as workflow YAML: {err}",
             path_from_test_file(relative_path).display()
@@ -88,7 +88,7 @@ fn value_at<'a>(root: &'a Value, label: &str, path: &[&str]) -> &'a Value {
     current
 }
 
-fn mapping_at<'a>(root: &'a Value, label: &str, path: &[&str]) -> &'a serde_yml::Mapping {
+fn mapping_at<'a>(root: &'a Value, label: &str, path: &[&str]) -> &'a serde_yaml_ng::Mapping {
     match value_at(root, label, path) {
         Value::Mapping(mapping) => mapping,
         other => panic!("{label} must be a mapping, got {other:?}"),
@@ -110,7 +110,7 @@ fn string_field<'a>(root: &'a Value, field: &str, label: &str) -> &'a str {
     }
 }
 
-fn jobs(workflow: &Value) -> &serde_yml::Mapping {
+fn jobs(workflow: &Value) -> &serde_yaml_ng::Mapping {
     mapping_at(workflow, "jobs", &["jobs"])
 }
 
@@ -301,7 +301,8 @@ fn all_step_run_blocks(workflow: &Value) -> Vec<(&str, &str)> {
 }
 
 fn value_text(value: &Value) -> String {
-    serde_yml::to_string(value).unwrap_or_else(|err| panic!("failed to render YAML value: {err}"))
+    serde_yaml_ng::to_string(value)
+        .unwrap_or_else(|err| panic!("failed to render YAML value: {err}"))
 }
 
 fn regex_is_match(pattern: &str, haystack: &str) -> bool {
@@ -767,8 +768,8 @@ fn assert_ci_linux_install_step_condition(job_name: &str) {
             "if",
             &format!("T3 ci.yml {job_name} Install system deps (Linux).if"),
         ),
-        "runner.os == 'Linux' || runner.os == ''",
-        "T3: ci.yml {job_name} Linux install step must preserve the current redundant condition until Step 6c tightens it"
+        "runner.os == 'Linux'",
+        "T3: ci.yml {job_name} Linux install step must use the tightened Linux-only condition"
     );
     assert!(
         string_field(
