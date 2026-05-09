@@ -941,3 +941,44 @@ The four discoveries are listed here so a later consolidation WU can pick them u
 - **Reason**: Phase 6 process-tree audit returned BLOCKING because the original Step 6c log did not echo consumption of the Step 6b output index (`.scratch/phase6/step6b-output-index.md`). The product changes were correct, but the orchestrator non-negotiable "Step 6c log does not echo the Step 6b output paths it consumed" was violated.
 - **Re-dispatch**: Step 6c was re-invoked with a stronger logging requirement so the new stdout/log explicitly cites the Step 6b output index path before product-code changes.
 - **Evidence**: `planning/age-6-wu-prereq-03-followups/audit-history.md` Round 1; `planning/age-6-wu-prereq-03-followups/risk/phase-6-process-tree-audit.report.md`.
+
+
+---
+
+## AGE-38 Phase 2.5: ModelConfigRepository provider-aware drift residual (2026-05-08)
+
+- **WU**: AGE-38 (`AGE-8-06: agent-wrapper + GUI + shared helper service-cutover`)
+- **Phase**: 2.5.4 duplicates inventory
+- **Decision**: Proceed with narrow scope; record residual.
+  AGE-38 will NOT cut over GUI `reload_models` / `save_model_inner` / `update_pool_inner`
+  to `FilesystemModelConfigRepository::{load_models,save_model}`. Those repository methods
+  are provider-unaware (`load_models(dir, None)`, `model.to_toml()` direct write) and would
+  silently regress provider-aware overlap validation, per-provider empty-name validation,
+  and Codex overlap validation across providers.
+- **Tracker ticket**: AGE-46 — `ModelConfigRepository load/save are provider-unaware; GUI helpers diverged`
+  (https://linear.app/neshq/issue/AGE-46/modelconfigrepository-loadsave-are-provider-unaware-gui-helpers).
+  Linked to AGE-38 via comment on AGE-46 ("Related to AGE-38.") since Linear CLI does
+  not expose `related to` / `blocks` linkage on create.
+- **AGE-38 narrow scope** (the cleanest cut-over candidates retained):
+  - `refresh_quotas` → `QuotaServicePort::refresh_quota` (preserve `quota::is_stale` caller-side)
+  - `list_cli_providers` / `get_cli_provider` / `list_accounts` / `add_account` /
+    `remove_account` → `SetupRepository` (preserve command-level validation, provider
+    existence check, display-name mapping, timestamp assembly)
+  - `sync_provider` persistence → `SetupRepository::upsert_cli_provider` (preserve
+    detection / display-name mapping / timestamp at caller)
+  - `discover_models_cmd` persistence → `SetupRepository::{delete_stale_models,
+    upsert_discovered_model, upsert_model_parameter}` (preserve non-empty-result
+    stale-delete guard)
+  - `list_discovered_models` / `get_model_parameters` → `SetupRepository`
+  - `open_state_db` → `StateDbOpener::open_at` (preserve `AppState::db_path()` policy)
+  - Optionally: `test_model_with_db_path` executor / diagnostics / mark_exhausted
+    → `ExecutorServicePort` / `DiagnosticsServicePort` / `ProviderQuotaRepository`
+    (preserve cached-only routing, `ctx: None`, no invocation lifecycle, fallback
+    behavior in `effective_provider_for_model_provider`)
+- **Reason**: The dispatch prompt pre-resolved mid-pipeline drift to "A: proceed +
+  note in DECISIONS as residual"; the severe drift fix is multi-WU work that
+  requires extending the repository contract and writing provider-aware contract
+  tests. Ticket AGE-46 captures the follow-up.
+- **Evidence**:
+  `planning/age-38-agent-wrapper-gui-shared/research/age-38-duplicates.md`
+  (severe drift section "4. Model Save / Pool Update", lines 74-94).
