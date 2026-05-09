@@ -1730,6 +1730,7 @@ fn run_repl(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_resume(
     agent_runtime_services: &wiring::AgentRuntimeServices,
     model_name: Option<&str>,
