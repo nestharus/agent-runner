@@ -982,3 +982,31 @@ The four discoveries are listed here so a later consolidation WU can pick them u
 - **Evidence**:
   `planning/age-38-agent-wrapper-gui-shared/research/age-38-duplicates.md`
   (severe drift section "4. Model Save / Pool Update", lines 74-94).
+
+## 2026-05-08 — AGE-39 Phase 2.5 pre-resolved gates (skip_problem_map_gate=true)
+
+- **Phase**: Phase 2.5 (post-2.5.6 risk profile).
+- **Decision**: Proceed in exhaustive mode (per per-surface risk-profile mode list);
+  defer-to-prototype = A (proceed). Narrow-vs-exhaustive scope deferred to Phase 3
+  proposer with default B (narrow) given 19–25 remaining production call sites.
+  Mid-pipeline drift = A (proceed + note in DECISIONS as residual).
+- **Rationale**:
+  - Risk profile rolls up to HIGH on all 19 touched surfaces; signals 1 (HIGH majority)
+    and 2 (sprawling parallel-systems landscape per duplicates inventory) of the
+    defer-to-prototype detection both fire. However, AGE-8 decomposition siblings
+    AGE-33..38 (six of seven WUs) already shipped through this exact pipeline; the
+    pattern is established and known-workable. Proceeding in exhaustive mode is the
+    pre-resolved policy from the dispatch context.
+  - Coverage recommended `defer` (no `block`); duplicates recommended narrow scope B
+    (19–25 production call sites concentrated in `main.rs`).
+  - `skip_problem_map_gate=true` suppresses the routine human gate; pre-resolved
+    decisions in the dispatch context act as the user-supplied answers per the
+    orchestrator's NEEDS_INPUT-classification rule.
+- **Evidence**:
+  - `planning/age-39-thin-main-dispatch-cleanup/research/age-39-problem-map.md`
+  - `planning/age-39-thin-main-dispatch-cleanup/research/age-39-duplicates.md`
+    (section 4 "Final-batch heuristic": 19–25 call sites, recommends narrow B)
+  - `planning/age-39-thin-main-dispatch-cleanup/research/age-39-coverage-inventory.md`
+    (section 4: `defer`/`defer`, no block)
+  - `planning/age-39-thin-main-dispatch-cleanup/risk/age-39-risk-profile.md`
+    (WU verdict HIGH; per-surface mode = exhaustive across all 19 surfaces).
