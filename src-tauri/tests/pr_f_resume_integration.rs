@@ -220,6 +220,61 @@ projects_dir = "{}"
         ));
     }
 
+    fn write_codex_two_provider_model(
+        &self,
+        model_name: &str,
+        provider_a_script: &Path,
+        provider_b_script: &Path,
+        provider_a_sessions: &Path,
+        provider_b_sessions: &Path,
+    ) {
+        self.write_model_body(
+            model_name,
+            r#"[[providers]]
+name = "codex"
+args = ["exec-codex"]
+
+[[providers]]
+name = "codex2"
+args = ["exec-codex2"]
+"#,
+        );
+        self.write_providers_body(&format!(
+            r#"[codex]
+command = "{}"
+args = []
+interactive_args = ["launch"]
+prompt_mode = "arg"
+
+[codex.resume]
+kind = "subcommand"
+subcommand = ["resume"]
+
+[codex.session_storage]
+kind = "codex"
+sessions_dir = "{}"
+
+[codex2]
+command = "{}"
+args = []
+interactive_args = ["launch"]
+prompt_mode = "arg"
+
+[codex2.resume]
+kind = "subcommand"
+subcommand = ["resume"]
+
+[codex2.session_storage]
+kind = "codex"
+sessions_dir = "{}"
+"#,
+            provider_a_script.display(),
+            provider_a_sessions.display(),
+            provider_b_script.display(),
+            provider_b_sessions.display()
+        ));
+    }
+
     fn stage_claude_jsonl(&self, projects_dir: &Path, session_id: &str) -> PathBuf {
         let cwd_dir = projects_dir.join("cwd-hash-fixture");
         fs::create_dir_all(&cwd_dir).unwrap();
@@ -1611,6 +1666,78 @@ fn repl_resume_stays_when_active_is_least_loaded() {
         fixture.active_segment(chain_id),
         ("claude-a".to_string(), session_id.to_string())
     );
+}
+
+// risk: Codex/non-Claude resume migration abort at CLI boundary; level: end-to-end; source: AGE-48 contract §Test plan #8 / proposal A1, A2, A3, A7.
+#[test]
+fn repl_resume_stays_for_codex_chain_in_multi_codex_pool() {
+    let fixture = Fixture::new();
+    let chain_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+    let codex_sessions = fixture.dir.path().join("codex-sessions");
+    let codex2_sessions = fixture.dir.path().join("codex2-sessions");
+    let active_argv = fixture.dir.path().join("codex-active-argv.txt");
+    let sibling_argv = fixture.dir.path().join("codex-sibling-argv.txt");
+    let active_provider = fixture.write_script(
+        "codex-active.sh",
+        &format!(
+            r#"printf '%s\n' "$@" > "{}"
+if [ "$1" = "launch" ] && [ "$2" = "resume" ] && [ "$3" = "{session_id}" ]; then
+  exit 0
+fi
+exit 99"#,
+            active_argv.display()
+        ),
+    );
+    let sibling_provider = fixture.write_script(
+        "codex-sibling.sh",
+        &format!(
+            r#"printf '%s\n' "$@" > "{}"
+exit 0"#,
+            sibling_argv.display()
+        ),
+    );
+    fixture.write_codex_two_provider_model(
+        "gpt-high",
+        &active_provider,
+        &sibling_provider,
+        &codex_sessions,
+        &codex2_sessions,
+    );
+    fixture.seed_active_chain(chain_id, "codex", session_id, "gpt-high");
+    fixture.seed_quota_window("codex", 0.99);
+    fixture.seed_quota_window("codex2", 0.10);
+
+    let output = fixture.run_repl("gpt-high", Some(session_id));
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(&active_argv).unwrap(),
+        "launch\nresume\n5169694d-de0f-40d1-890c-6e28e55bab27\n"
+    );
+    assert!(
+        !sibling_argv.exists(),
+        "repl --resume must not migrate or spawn the alternate Codex provider"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("[resume] -> codex"), "{stderr}");
+    assert!(!stderr.contains("migration failed:"), "{stderr}");
+    assert!(!stderr.contains("[migrate]"), "{stderr}");
+    assert_eq!(
+        fixture.active_segment(chain_id),
+        ("codex".to_string(), session_id.to_string())
+    );
+
+    let invocation = parse_invocation(&stderr);
+    let row = fixture
+        .open_db()
+        .get_invocation_by_uuid(&invocation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.provider_name.as_deref(), Some("codex"));
+    assert_eq!(row.provider_index, 0);
+    assert_eq!(row.session_id.as_deref(), Some(session_id));
+    assert_eq!(row.session_capture_method.as_deref(), Some("resumed"));
 }
 
 #[test]
