@@ -928,3 +928,16 @@ The four discoveries are listed here so a later consolidation WU can pick them u
   AGE-8-* WUs; if the latent topology-probe drift surfaces in
   production (i.e., a caller starts using `compute_projections(Some)`),
   reticket to consolidate Drift Set 2.
+
+
+---
+
+## AGE-6 Phase 6c Tier-1 rewind (2026-05-08)
+
+- **WU**: AGE-6 (WU-PREREQ-03 follow-up: skipped CodeRabbit improvements)
+- **Phase**: 6c (code writer)
+- **Decision**: Tier-1 rewind per implementation-pipeline-orchestrator violation-escalation policy.
+- **Rewound commit**: `66ff097 feat(AGE-6): swap serde_yml -> serde_yaml_ng for src-tauri tests; simplify ci.yml runner.os condition` — reset HEAD back to Step 6b commit `074a628`.
+- **Reason**: Phase 6 process-tree audit returned BLOCKING because the original Step 6c log did not echo consumption of the Step 6b output index (`.scratch/phase6/step6b-output-index.md`). The product changes were correct, but the orchestrator non-negotiable "Step 6c log does not echo the Step 6b output paths it consumed" was violated.
+- **Re-dispatch**: Step 6c was re-invoked with a stronger logging requirement so the new stdout/log explicitly cites the Step 6b output index path before product-code changes.
+- **Evidence**: `planning/age-6-wu-prereq-03-followups/audit-history.md` Round 1; `planning/age-6-wu-prereq-03-followups/risk/phase-6-process-tree-audit.report.md`.
