@@ -19,6 +19,15 @@ use uuid::Uuid;
 
 pub use crate::session_export::CanonicalRecord;
 
+/// Source for replacement transcript data in session import-replace operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplaceSource {
+    /// Read replacement data from the specified file path.
+    File(PathBuf),
+    /// Read replacement data from standard input.
+    Stdin,
+}
+
 const TEST_HOOK_ENV: &str = "OULIPOLY_IMPORT_REPLACE_TEST_HOOK";
 const TEST_SLEEP_AFTER_LOCK_MS: &str = "sleep-after-lock-ms";
 const TEST_BLOCK_AFTER_RENAME: &str = "block-after-transcript-rename-before-db-commit";

@@ -1,0 +1,99 @@
+use super::{ExportError, ExportSessionMetadata, SessionStorageType};
+use oulipoly_config::{ProvidersConfig, SessionStorage, SessionsConfig, load_models};
+use oulipoly_state::{ResumeError, StateDb};
+use std::path::PathBuf;
+
+pub fn resolve_export_session_metadata(
+    session_id: &str,
+) -> Result<ExportSessionMetadata, ExportError> {
+    let state = StateDb::open_default().map_err(|message| ExportError::Operational { message })?;
+    let config_root = default_config_root();
+    let providers_path = config_root.join("providers.toml");
+    let sessions_path = config_root.join("sessions.toml");
+    let providers_cfg = ProvidersConfig::load(&providers_path).unwrap_or_default();
+    let models_dir = default_models_dir();
+    let models = load_models(&models_dir, Some(&providers_cfg))
+        .map_err(|message| ExportError::Operational { message })?;
+    let sessions_cfg = SessionsConfig::load(&sessions_path).unwrap_or_default();
+
+    let resolved = state
+        .resolve_resume(&models, session_id, None)
+        .map_err(resume_error_to_export_error)?;
+
+    let provider_entry = providers_cfg
+        .get(&resolved.active_provider)
+        .ok_or_else(|| ExportError::UnsupportedStorage {
+            provider_name: resolved.active_provider.clone(),
+            reason: "provider is missing from providers.toml".to_string(),
+        })?;
+    let storage_type = match provider_entry.session_storage.as_ref() {
+        Some(SessionStorage::ClaudeCode { .. }) => SessionStorageType::ClaudeCode,
+        Some(SessionStorage::Codex { .. }) => SessionStorageType::CodexSession,
+        None => {
+            return Err(ExportError::UnsupportedStorage {
+                provider_name: resolved.active_provider,
+                reason: "provider has no session_storage configuration".to_string(),
+            });
+        }
+    };
+
+    let jsonl_path = crate::sessions::locate_transcript(
+        &sessions_cfg,
+        &resolved.active_provider,
+        &resolved.active_session_id,
+    )
+    .map_err(|message| ExportError::Operational { message })?
+    .ok_or_else(|| ExportError::UnsupportedStorage {
+        provider_name: resolved.active_provider.clone(),
+        reason: "provider has no transcript_locator configuration".to_string(),
+    })?;
+
+    Ok(ExportSessionMetadata {
+        session_id: resolved.active_session_id,
+        chain_id: resolved.chain_id,
+        provider_name: resolved.active_provider,
+        storage_type,
+        jsonl_path,
+    })
+}
+
+fn resume_error_to_export_error(err: ResumeError) -> ExportError {
+    match err {
+        ResumeError::InvalidUuid { input } => ExportError::InvalidSessionId { input },
+        ResumeError::NoChainFound { input } => ExportError::SessionNotFound { input },
+        ResumeError::Ambiguous { input, .. } => ExportError::AmbiguousSession { input },
+        ResumeError::ProviderModelMismatch {
+            active_provider, ..
+        } => ExportError::UnsupportedStorage {
+            provider_name: active_provider,
+            reason: "session owner is not in the resolved model provider pool".to_string(),
+        },
+        ResumeError::UnknownModel { model_name } => ExportError::Operational {
+            message: format!("unknown model referenced by session chain: {model_name}"),
+        },
+        ResumeError::ActiveSegmentMissing { chain_id } => ExportError::Operational {
+            message: format!("no active segment found for chain {chain_id}"),
+        },
+        ResumeError::ProviderNotConfigured { provider } => ExportError::UnsupportedStorage {
+            provider_name: provider,
+            reason: "session owner provider is not configured".to_string(),
+        },
+        ResumeError::ProviderMissingResume { provider_name } => ExportError::UnsupportedStorage {
+            provider_name,
+            reason: "session owner provider has no resume configuration".to_string(),
+        },
+        ResumeError::Db { message } => ExportError::Operational { message },
+    }
+}
+
+fn default_config_root() -> PathBuf {
+    dirs::config_dir()
+        .map(|d| d.join("oulipoly-agent-runner"))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn default_models_dir() -> PathBuf {
+    dirs::config_dir()
+        .map(|d| d.join("oulipoly-agent-runner").join("models"))
+        .unwrap_or_else(|| PathBuf::from("models"))
+}

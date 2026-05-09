@@ -10,8 +10,11 @@ use oulipoly_runtime::ports::{
 };
 use oulipoly_runtime::services::{
     MigrationServicePort, ProductionInvocationLifecycleService, ProductionMigrationService,
-    ProductionResumeService, ProductionRoutingService, ProductionSessionLifecycleService,
-    ResumeServicePort, SessionLifecycleServicePort,
+    ProductionResumeService, ProductionRoutingService, ProductionSessionExportService,
+    ProductionSessionLifecycleService, ProductionSessionLockService,
+    ProductionSessionReplaceService, ProductionTraceService, ResumeServicePort,
+    SessionExportServicePort, SessionLifecycleServicePort, SessionLockServicePort,
+    SessionReplaceServicePort, TraceServicePort,
 };
 use oulipoly_state::repositories::ProductionStateDbOpener;
 use std::path::PathBuf;
@@ -45,9 +48,38 @@ pub struct AgentRuntimeServices {
     pub resume_service: Arc<dyn ResumeServicePort>,
     pub session_lifecycle_service: Arc<dyn SessionLifecycleServicePort>,
     pub migration_service: Arc<dyn MigrationServicePort>,
+    pub trace_service: Arc<dyn TraceServicePort>,
+    pub session_export_service: Arc<dyn SessionExportServicePort>,
+    pub session_replace_service: Arc<dyn SessionReplaceServicePort>,
+    pub session_lock_service: Arc<dyn SessionLockServicePort>,
 }
 
 impl AgentRuntimeServices {
+    pub fn cli_defaults() -> Self {
+        Self {
+            state_db_opener: Arc::new(ProductionStateDbOpener),
+            app_config: Arc::new(FilesystemAppConfigRepository),
+            agent_config: Arc::new(FilesystemAgentConfigRepository),
+            model_config: Arc::new(FilesystemModelConfigRepository),
+            providers_config: Arc::new(FilesystemProvidersConfigRepository),
+            sessions_config: Arc::new(FilesystemSessionsConfigRepository),
+            clock: Arc::new(SystemClock),
+            uuid_gen: Arc::new(DefaultUuidGenerator),
+            process_runner: Arc::new(DefaultProcessRunner),
+            stdout_sink: Arc::new(StdoutWriter),
+            stderr_sink: Arc::new(StderrWriter),
+            routing_service: Arc::new(ProductionRoutingService),
+            invocation_lifecycle_service: Arc::new(ProductionInvocationLifecycleService),
+            resume_service: Arc::new(ProductionResumeService::new()),
+            session_lifecycle_service: Arc::new(ProductionSessionLifecycleService::new()),
+            migration_service: Arc::new(ProductionMigrationService::new()),
+            trace_service: Arc::new(ProductionTraceService::default()),
+            session_export_service: Arc::new(ProductionSessionExportService::default()),
+            session_replace_service: Arc::new(ProductionSessionReplaceService::default()),
+            session_lock_service: Arc::new(ProductionSessionLockService::default()),
+        }
+    }
+
     pub fn production(paths: RuntimePaths) -> Result<Self, String> {
         std::fs::create_dir_all(&paths.config_root)
             .map_err(|e| format!("Failed to create config root: {e}"))?;
@@ -83,6 +115,10 @@ impl AgentRuntimeServices {
             resume_service: Arc::new(ProductionResumeService::new()),
             session_lifecycle_service: Arc::new(ProductionSessionLifecycleService::new()),
             migration_service: Arc::new(ProductionMigrationService::new()),
+            trace_service: Arc::new(ProductionTraceService::default()),
+            session_export_service: Arc::new(ProductionSessionExportService::default()),
+            session_replace_service: Arc::new(ProductionSessionReplaceService::default()),
+            session_lock_service: Arc::new(ProductionSessionLockService::default()),
         })
     }
 }

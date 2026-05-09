@@ -11,16 +11,15 @@ use oulipoly_runtime::services::{
     MigrationServiceOutput, MigrationServicePort, MigrationServiceRequest,
     ProductionMigrationService, ProductionResumeService, ProductionSessionLifecycleService,
     ResumeAcceptanceRequest, ResumeServiceOutput, ResumeServicePort, ResumeServiceRequest,
-    ServiceError, SessionLifecycleIngestMode, SessionLifecycleRequest, SessionLifecycleServicePort,
+    ServiceError, SessionExportServiceRequest, SessionLifecycleIngestMode, SessionLifecycleRequest,
+    SessionLifecycleServicePort, SessionLockFailure, SessionLockServiceRequest, SessionLockSuccess,
+    SessionReplaceServiceRequest, TraceServiceFailure, TraceServiceRequest,
 };
-use oulipoly_runtime::session_export::{
-    ExportError, ExportSessionMetadata, SessionStorageType, canonical_jsonl_bytes,
-    read_canonical_transcript,
-};
-use oulipoly_runtime::session_lock::{LockError, SessionLock};
+use oulipoly_runtime::session_export::ExportError;
+use oulipoly_runtime::session_lock::LockError;
 use oulipoly_runtime::session_metadata::{MetadataError, locate_session_metadata};
-use oulipoly_runtime::session_replace::{self, ReplaceError};
-use oulipoly_runtime::trace::{TraceOptions, render_ascii_trace, trace_invocation_with_sessions};
+use oulipoly_runtime::session_replace::{self, ReplaceError, ReplaceSource};
+use oulipoly_runtime::trace::{TraceOptions, render_ascii_trace};
 use oulipoly_state::repositories::{ProductionStateDbOpener, StateDbOpener};
 use oulipoly_state::schema_probe::{self, ProbeError};
 use oulipoly_state::{
@@ -363,6 +362,7 @@ fn run(cli: Cli) -> Result<i32, String> {
     }
 
     if let Some(command) = cli.command.clone() {
+        let agent_runtime_services = wiring::AgentRuntimeServices::cli_defaults();
         return match command {
             Subcommands::Trace {
                 invocation_uuid,
@@ -378,6 +378,7 @@ fn run(cli: Cli) -> Result<i32, String> {
                     transcript,
                 },
                 &invocation_uuid,
+                &agent_runtime_services,
             ),
             Subcommands::Repl {
                 model,
@@ -422,13 +423,13 @@ fn run(cli: Cli) -> Result<i32, String> {
                 }
                 SessionSubcommands::SchemaProbe => run_session_schema_probe(),
                 SessionSubcommands::Export { session_id, format } => {
-                    run_session_export(&session_id, &format)
+                    run_session_export(&session_id, &format, &agent_runtime_services)
                 }
                 SessionSubcommands::PauseHandshake { session_id, ttl_ms } => {
-                    run_pause_handshake(&session_id, ttl_ms)
+                    run_pause_handshake(&session_id, ttl_ms, &agent_runtime_services)
                 }
                 SessionSubcommands::ResumeHandshake { session_id, token } => {
-                    run_resume_handshake(&session_id, &token)
+                    run_resume_handshake(&session_id, &token, &agent_runtime_services)
                 }
                 SessionSubcommands::ImportReplace {
                     session_id,
@@ -438,6 +439,7 @@ fn run(cli: Cli) -> Result<i32, String> {
                     &session_id,
                     from_file.as_deref(),
                     preimage_sha256.as_deref(),
+                    &agent_runtime_services,
                 ),
             },
             Subcommands::ResumeList { uuid } => run_resume_list(&uuid),
@@ -588,6 +590,7 @@ fn run_session_import_replace(
     session_id: &str,
     from_file: Option<&Path>,
     preimage_sha256: Option<&str>,
+    agent_runtime_services: &wiring::AgentRuntimeServices,
 ) -> Result<i32, String> {
     if Uuid::try_parse(session_id).is_err() {
         let err = ReplaceError::InvalidSessionId {
@@ -605,7 +608,19 @@ fn run_session_import_replace(
         eprintln!("{}", err.to_json());
         return Ok(err.exit_code());
     }
-    match session_replace::run_import_replace(session_id, from_file, preimage_sha256) {
+    let source = from_file
+        .map(|path| ReplaceSource::File(path.to_path_buf()))
+        .unwrap_or(ReplaceSource::Stdin);
+    let output = agent_runtime_services
+        .session_replace_service
+        .replace_session(SessionReplaceServiceRequest {
+            session_id: session_id.to_string(),
+            source,
+            preimage_sha256: preimage_sha256.map(str::to_string),
+        })
+        .map_err(|err| err.to_string())?;
+
+    match output.result {
         Ok(receipt) => {
             let json = serde_json::to_string(&receipt)
                 .map_err(|e| format!("Failed to serialize replace receipt: {e}"))?;
@@ -662,7 +677,11 @@ fn write_json_error(code: &str, message: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn run_trace_command(options: TraceOptions, invocation_uuid: &str) -> Result<i32, String> {
+fn run_trace_command(
+    options: TraceOptions,
+    invocation_uuid: &str,
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+) -> Result<i32, String> {
     let state = StateDb::open_default()?;
     let config_root = default_config_root();
     let sessions_path = config_root.join("sessions.toml");
@@ -672,16 +691,26 @@ fn run_trace_command(options: TraceOptions, invocation_uuid: &str) -> Result<i32
     // — `SessionsConfig::load` returns an empty config in that case.
     let sessions_cfg = oulipoly_config::SessionsConfig::load(&sessions_path)
         .map_err(|e| format!("Failed to load {}: {e}", sessions_path.display()))?;
-    let report =
-        match trace_invocation_with_sessions(&state, invocation_uuid, options, Some(&sessions_cfg))
-        {
-            Ok(report) => report,
-            Err(err) if err.starts_with("Invocation not found:") => {
-                eprintln!("{err}");
-                return Ok(1);
-            }
-            Err(err) => return Err(err),
-        };
+    let output = agent_runtime_services
+        .trace_service
+        .trace(TraceServiceRequest {
+            state: &state,
+            sessions_cfg: &sessions_cfg,
+            invocation_uuid,
+            options,
+        })
+        .map_err(|err| err.to_string())?;
+    let report = match output.result {
+        Ok(report) => report,
+        Err(TraceServiceFailure::InvocationNotFound { message, .. }) => {
+            eprintln!("{message}");
+            return Ok(1);
+        }
+        Err(
+            TraceServiceFailure::InvalidInvocationId { message, .. }
+            | TraceServiceFailure::Operational { message },
+        ) => return Err(message),
+    };
 
     if options.json {
         let json = serde_json::to_string_pretty(&report)
@@ -747,7 +776,11 @@ fn run_session_locate(session_id: &str, _json: bool) -> Result<i32, String> {
     }
 }
 
-fn run_session_export(session_id: &str, format: &str) -> Result<i32, String> {
+fn run_session_export(
+    session_id: &str,
+    format: &str,
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+) -> Result<i32, String> {
     if format != "canonical-jsonl" {
         emit_export_json_error(
             "invalid-format",
@@ -764,23 +797,14 @@ fn run_session_export(session_id: &str, format: &str) -> Result<i32, String> {
         return Ok(export_error_exit_code(&err));
     }
 
-    let metadata = match resolve_export_session_metadata(session_id) {
-        Ok(metadata) => metadata,
-        Err(err) => {
-            emit_export_error(&err);
-            return Ok(export_error_exit_code(&err));
-        }
-    };
+    let service_output = agent_runtime_services
+        .session_export_service
+        .export_session(SessionExportServiceRequest {
+            session_id: session_id.to_string(),
+        })
+        .map_err(|err| err.to_string())?;
 
-    let records = match read_canonical_transcript(&metadata) {
-        Ok(records) => records,
-        Err(err) => {
-            emit_export_error(&err);
-            return Ok(export_error_exit_code(&err));
-        }
-    };
-
-    let output = match canonical_jsonl_bytes(&records) {
+    let output = match service_output.result {
         Ok(output) => output,
         Err(err) => {
             emit_export_error(&err);
@@ -795,95 +819,6 @@ fn run_session_export(session_id: &str, format: &str) -> Result<i32, String> {
         return Ok(1);
     }
     Ok(0)
-}
-
-fn resolve_export_session_metadata(session_id: &str) -> Result<ExportSessionMetadata, ExportError> {
-    let state = StateDb::open_default().map_err(|message| ExportError::Operational { message })?;
-    let config_root = default_config_root();
-    let providers_path = config_root.join("providers.toml");
-    let sessions_path = config_root.join("sessions.toml");
-    let providers_cfg = oulipoly_config::ProvidersConfig::load(&providers_path).unwrap_or_default();
-    let models_dir = default_models_dir();
-    let models = load_models(&models_dir, Some(&providers_cfg))
-        .map_err(|message| ExportError::Operational { message })?;
-    let sessions_cfg = oulipoly_config::SessionsConfig::load(&sessions_path).unwrap_or_default();
-
-    let resolved = state
-        .resolve_resume(&models, session_id, None)
-        .map_err(|err| match err {
-            oulipoly_state::ResumeError::InvalidUuid { input } => {
-                ExportError::InvalidSessionId { input }
-            }
-            oulipoly_state::ResumeError::NoChainFound { input } => {
-                ExportError::SessionNotFound { input }
-            }
-            oulipoly_state::ResumeError::Ambiguous { input, .. } => {
-                ExportError::AmbiguousSession { input }
-            }
-            oulipoly_state::ResumeError::ProviderModelMismatch {
-                active_provider, ..
-            } => ExportError::UnsupportedStorage {
-                provider_name: active_provider,
-                reason: "session owner is not in the resolved model provider pool".to_string(),
-            },
-            oulipoly_state::ResumeError::UnknownModel { model_name } => ExportError::Operational {
-                message: format!("unknown model referenced by session chain: {model_name}"),
-            },
-            oulipoly_state::ResumeError::ActiveSegmentMissing { chain_id } => {
-                ExportError::Operational {
-                    message: format!("no active segment found for chain {chain_id}"),
-                }
-            }
-            oulipoly_state::ResumeError::ProviderNotConfigured { provider } => {
-                ExportError::UnsupportedStorage {
-                    provider_name: provider,
-                    reason: "session owner provider is not configured".to_string(),
-                }
-            }
-            oulipoly_state::ResumeError::ProviderMissingResume { provider_name } => {
-                ExportError::UnsupportedStorage {
-                    provider_name,
-                    reason: "session owner provider has no resume configuration".to_string(),
-                }
-            }
-            oulipoly_state::ResumeError::Db { message } => ExportError::Operational { message },
-        })?;
-
-    let provider_entry = providers_cfg
-        .get(&resolved.active_provider)
-        .ok_or_else(|| ExportError::UnsupportedStorage {
-            provider_name: resolved.active_provider.clone(),
-            reason: "provider is missing from providers.toml".to_string(),
-        })?;
-    let storage_type = match provider_entry.session_storage.as_ref() {
-        Some(oulipoly_config::SessionStorage::ClaudeCode { .. }) => SessionStorageType::ClaudeCode,
-        Some(oulipoly_config::SessionStorage::Codex { .. }) => SessionStorageType::CodexSession,
-        None => {
-            return Err(ExportError::UnsupportedStorage {
-                provider_name: resolved.active_provider,
-                reason: "provider has no session_storage configuration".to_string(),
-            });
-        }
-    };
-
-    let jsonl_path = oulipoly_runtime::sessions::locate_transcript(
-        &sessions_cfg,
-        &resolved.active_provider,
-        &resolved.active_session_id,
-    )
-    .map_err(|message| ExportError::Operational { message })?
-    .ok_or_else(|| ExportError::UnsupportedStorage {
-        provider_name: resolved.active_provider.clone(),
-        reason: "provider has no transcript_locator configuration".to_string(),
-    })?;
-
-    Ok(ExportSessionMetadata {
-        session_id: resolved.active_session_id,
-        chain_id: resolved.chain_id,
-        provider_name: resolved.active_provider,
-        storage_type,
-        jsonl_path,
-    })
 }
 
 fn metadata_error_exit_code(err: &MetadataError) -> i32 {
@@ -1289,7 +1224,11 @@ fn provider_index_in_providers_cfg(providers_cfg: &ProvidersConfig, provider_nam
         .unwrap_or(0)
 }
 
-fn run_pause_handshake(session_id: &str, ttl_ms: Option<u64>) -> Result<i32, String> {
+fn run_pause_handshake(
+    session_id: &str,
+    ttl_ms: Option<u64>,
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+) -> Result<i32, String> {
     if Uuid::parse_str(session_id).is_err() {
         return Ok(emit_json_error(
             2,
@@ -1307,43 +1246,20 @@ fn run_pause_handshake(session_id: &str, ttl_ms: Option<u64>) -> Result<i32, Str
         ));
     }
 
-    let state = match StateDb::open_default() {
-        Ok(state) => state,
-        Err(message) => return Ok(emit_json_error(1, "operational-error", message)),
-    };
-    let providers_cfg =
-        ProvidersConfig::load(&default_config_root().join("providers.toml")).unwrap_or_default();
-    let models = match load_models(&default_models_dir(), Some(&providers_cfg)) {
-        Ok(models) => models,
-        Err(message) => return Ok(emit_json_error(1, "operational-error", message)),
-    };
-    let resolved = match state.resolve_resume(&models, session_id, None) {
-        Ok(resolved) => resolved,
-        Err(err) => return Ok(emit_resume_resolution_error(err)),
-    };
-    let lock_dir = match default_lock_dir() {
-        Ok(lock_dir) => lock_dir,
-        Err(message) => return Ok(emit_json_error(1, "operational-error", message)),
-    };
-    let lock = match SessionLock::new(&lock_dir) {
-        Ok(lock) => lock,
-        Err(err) => {
-            return Ok(emit_json_error(
-                1,
-                "operational-error",
-                format!("failed to open locks: {err}"),
-            ));
-        }
-    };
-    match lock.acquire(
-        &resolved.active_session_id,
-        &resolved.active_provider,
-        std::time::Duration::from_millis(ttl_ms),
-    ) {
-        Ok(lease) => {
+    let output = agent_runtime_services
+        .session_lock_service
+        .lock_session(SessionLockServiceRequest::Acquire {
+            session_id: session_id.to_string(),
+            ttl_ms,
+        })
+        .map_err(|err| err.to_string())?;
+    match output.result {
+        Ok(SessionLockSuccess::Acquired {
+            chain_id, lease, ..
+        }) => {
             let payload = serde_json::json!({
                 "session_id": lease.session_id,
-                "chain_id": resolved.chain_id,
+                "chain_id": chain_id,
                 "provider_name": lease.provider_name,
                 "token": lease.token,
                 "expires_at": lease.expires_at,
@@ -1356,11 +1272,17 @@ fn run_pause_handshake(session_id: &str, ttl_ms: Option<u64>) -> Result<i32, Str
             );
             Ok(0)
         }
-        Err(err) => Ok(emit_lock_error(err)),
+        Ok(SessionLockSuccess::Released { .. }) => unreachable!("acquire cannot release a lock"),
+        Err(SessionLockFailure::Resume(err)) => Ok(emit_resume_resolution_error(err)),
+        Err(SessionLockFailure::Lock(err)) => Ok(emit_lock_error(err)),
     }
 }
 
-fn run_resume_handshake(session_id: &str, token: &str) -> Result<i32, String> {
+fn run_resume_handshake(
+    session_id: &str,
+    token: &str,
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+) -> Result<i32, String> {
     if Uuid::parse_str(session_id).is_err() {
         return Ok(emit_json_error(
             2,
@@ -1369,25 +1291,15 @@ fn run_resume_handshake(session_id: &str, token: &str) -> Result<i32, String> {
         ));
     }
 
-    if let Err(message) = StateDb::open_default() {
-        return Ok(emit_json_error(1, "operational-error", message));
-    }
-    let lock_dir = match default_lock_dir() {
-        Ok(lock_dir) => lock_dir,
-        Err(message) => return Ok(emit_json_error(1, "operational-error", message)),
-    };
-    let lock = match SessionLock::new(&lock_dir) {
-        Ok(lock) => lock,
-        Err(err) => {
-            return Ok(emit_json_error(
-                1,
-                "operational-error",
-                format!("failed to open locks: {err}"),
-            ));
-        }
-    };
-    match lock.release(session_id, token) {
-        Ok(receipt) => {
+    let output = agent_runtime_services
+        .session_lock_service
+        .lock_session(SessionLockServiceRequest::Release {
+            session_id: session_id.to_string(),
+            token: token.to_string(),
+        })
+        .map_err(|err| err.to_string())?;
+    match output.result {
+        Ok(SessionLockSuccess::Released { receipt }) => {
             println!(
                 "{}",
                 serde_json::to_string(&receipt)
@@ -1395,14 +1307,10 @@ fn run_resume_handshake(session_id: &str, token: &str) -> Result<i32, String> {
             );
             Ok(0)
         }
-        Err(err) => Ok(emit_lock_error(err)),
+        Ok(SessionLockSuccess::Acquired { .. }) => unreachable!("release cannot acquire a lock"),
+        Err(SessionLockFailure::Lock(err)) => Ok(emit_lock_error(err)),
+        Err(SessionLockFailure::Resume(_)) => unreachable!("release does not resolve resume"),
     }
-}
-
-fn default_lock_dir() -> Result<PathBuf, String> {
-    dirs::data_dir()
-        .map(|dir| dir.join("oulipoly-agent-runner").join("locks"))
-        .ok_or_else(|| "Could not determine data directory".to_string())
 }
 
 fn emit_resume_resolution_error(err: oulipoly_state::ResumeError) -> i32 {

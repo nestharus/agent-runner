@@ -1,6 +1,7 @@
 use oulipoly_config::{ModelConfig, PromptMode, SessionsConfig};
 use oulipoly_runtime::services::error::ServiceError;
 use oulipoly_runtime::services::*;
+use oulipoly_runtime::trace::TraceOptions;
 use oulipoly_state::{InvocationStart, ModelStore, ResolvedResume, StateDb};
 use std::path::Path;
 use std::sync::Arc;
@@ -112,7 +113,7 @@ impl MigrationServicePort for StubService {
 }
 
 impl TraceServicePort for StubService {
-    fn trace(&self, _request: TraceServiceRequest) -> Result<TraceServiceOutput, ServiceError> {
+    fn trace(&self, _request: TraceServiceRequest<'_>) -> Result<TraceServiceOutput, ServiceError> {
         unimplemented!()
     }
 }
@@ -325,4 +326,62 @@ fn age_36_resume_session_migration_services_are_object_safe_with_contract_dtos()
         .record_acceptance(acceptance_request)
         .expect("production resume service records acceptance");
     assert_eq!(output, ResumeAcceptanceOutput);
+}
+
+#[test]
+fn age_37_trace_export_replace_lock_services_are_object_safe_with_contract_dtos() {
+    let trace: Arc<dyn TraceServicePort + Send + Sync> = Arc::new(StubService);
+    let export: Arc<dyn SessionExportServicePort + Send + Sync> = Arc::new(StubService);
+    let replace: Arc<dyn SessionReplaceServicePort + Send + Sync> = Arc::new(StubService);
+    let lock: Arc<dyn SessionLockServicePort + Send + Sync> = Arc::new(StubService);
+
+    let _production_trace: Arc<dyn TraceServicePort + Send + Sync> =
+        Arc::new(ProductionTraceService::default());
+    let _production_export: Arc<dyn SessionExportServicePort + Send + Sync> =
+        Arc::new(ProductionSessionExportService::default());
+    let _production_replace: Arc<dyn SessionReplaceServicePort + Send + Sync> =
+        Arc::new(ProductionSessionReplaceService::default());
+    let _production_lock: Arc<dyn SessionLockServicePort + Send + Sync> =
+        Arc::new(ProductionSessionLockService::default());
+
+    let db = StateDb::open(Path::new(":memory:")).unwrap();
+    let sessions_cfg = SessionsConfig::default();
+
+    let trace_request = TraceServiceRequest {
+        state: &db,
+        sessions_cfg: &sessions_cfg,
+        invocation_uuid: "11111111-1111-4111-8111-111111111111",
+        options: TraceOptions {
+            max_depth: 64,
+            json: true,
+            inline_transcript: false,
+            transcript: false,
+        },
+    };
+    let export_request = SessionExportServiceRequest {
+        session_id: "5169694d-de0f-40d1-890c-6e28e55bab27".to_string(),
+    };
+    let replace_request = SessionReplaceServiceRequest {
+        session_id: "5169694d-de0f-40d1-890c-6e28e55bab27".to_string(),
+        source: oulipoly_runtime::session_replace::ReplaceSource::Stdin,
+        preimage_sha256: Some("0".repeat(64)),
+    };
+    let acquire_request = SessionLockServiceRequest::Acquire {
+        session_id: "5169694d-de0f-40d1-890c-6e28e55bab27".to_string(),
+        ttl_ms: 30_000,
+    };
+    let release_request = SessionLockServiceRequest::Release {
+        session_id: "5169694d-de0f-40d1-890c-6e28e55bab27".to_string(),
+        token: "pause_00000000000000000000000000000000".to_string(),
+    };
+
+    if false {
+        let _: Result<TraceServiceOutput, ServiceError> = trace.trace(trace_request);
+        let _: Result<SessionExportServiceOutput, ServiceError> =
+            export.export_session(export_request);
+        let _: Result<SessionReplaceServiceOutput, ServiceError> =
+            replace.replace_session(replace_request);
+        let _: Result<SessionLockServiceOutput, ServiceError> = lock.lock_session(acquire_request);
+        let _: Result<SessionLockServiceOutput, ServiceError> = lock.lock_session(release_request);
+    }
 }
