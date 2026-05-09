@@ -361,8 +361,9 @@ fn run(cli: Cli) -> Result<i32, String> {
         return oulipoly_runtime::repl_default_provider::run_repl_with_default_provider(services);
     }
 
+    let agent_runtime_services = wiring::AgentRuntimeServices::cli_defaults();
+
     if let Some(command) = cli.command.clone() {
-        let agent_runtime_services = wiring::AgentRuntimeServices::cli_defaults();
         return match command {
             Subcommands::Trace {
                 invocation_uuid,
@@ -387,6 +388,7 @@ fn run(cli: Cli) -> Result<i32, String> {
                 project,
                 models_dir,
             } => run_repl(
+                &agent_runtime_services,
                 model.as_deref(),
                 resume.as_deref(),
                 migrate.as_deref(),
@@ -408,6 +410,7 @@ fn run(cli: Cli) -> Result<i32, String> {
                     .or(session_id.as_deref())
                     .expect("clap group ensures one is set");
                 run_resume(
+                    &agent_runtime_services,
                     model.as_deref(),
                     resume_target,
                     migrate.as_deref(),
@@ -481,6 +484,7 @@ fn run(cli: Cli) -> Result<i32, String> {
         if has_prompt {
             let prompt_text = prompt_text.as_deref().or(stdin_prompt.as_deref());
             return run_resume(
+                &agent_runtime_services,
                 cli.model.as_deref(),
                 session_id,
                 cli.migrate.as_deref(),
@@ -491,6 +495,7 @@ fn run(cli: Cli) -> Result<i32, String> {
             );
         } else {
             return run_repl(
+                &agent_runtime_services,
                 cli.model.as_deref(),
                 Some(session_id),
                 cli.migrate.as_deref(),
@@ -524,6 +529,7 @@ fn run(cli: Cli) -> Result<i32, String> {
         };
 
         return run_with_balancing(
+            &agent_runtime_services,
             &state_db_opener,
             model,
             &prompt,
@@ -552,6 +558,7 @@ fn run(cli: Cli) -> Result<i32, String> {
     };
 
     run_with_balancing(
+        &agent_runtime_services,
         &state_db_opener,
         model,
         &full_prompt,
@@ -1017,6 +1024,7 @@ enum ResumeIngestMode<'a> {
 }
 
 fn ingest_and_emit_session_id_resume_aware(
+    _agent_runtime_services: &wiring::AgentRuntimeServices,
     state: &StateDb,
     sessions_cfg: &oulipoly_config::SessionsConfig,
     provider_name: &str,
@@ -1439,6 +1447,7 @@ fn resume_migration_pool(
 }
 
 fn run_repl(
+    _agent_runtime_services: &wiring::AgentRuntimeServices,
     model_name: Option<&str>,
     resume: Option<&str>,
     manual_migrate: Option<&str>,
@@ -1658,6 +1667,7 @@ fn run_repl(
             guard.mark_finalized();
             if exit_code == 0 {
                 ingest_and_emit_session_id_resume_aware(
+                    _agent_runtime_services,
                     &state,
                     &sessions_cfg,
                     &provider.name,
@@ -1693,6 +1703,7 @@ fn run_repl(
 }
 
 fn run_resume(
+    _agent_runtime_services: &wiring::AgentRuntimeServices,
     model_name: Option<&str>,
     session_id: &str,
     manual_migrate: Option<&str>,
@@ -1872,7 +1883,13 @@ fn run_resume(
 
     let success = result.exit_code == 0;
     let error_category = if !success {
-        run_diagnostics(&result.stderr, result.exit_code, &models, working_dir)
+        run_diagnostics(
+            _agent_runtime_services,
+            &result.stderr,
+            result.exit_code,
+            &models,
+            working_dir,
+        )
     } else {
         None
     };
@@ -1902,6 +1919,7 @@ fn run_resume(
 
     if success {
         ingest_and_emit_session_id_resume_aware(
+            _agent_runtime_services,
             &state,
             &sessions_cfg,
             &provider.name,
@@ -1922,6 +1940,7 @@ fn run_resume(
 }
 
 fn run_with_balancing(
+    _agent_runtime_services: &wiring::AgentRuntimeServices,
     state_db_opener: &dyn StateDbOpener,
     model: &ModelConfig,
     prompt: &str,
@@ -2020,7 +2039,13 @@ fn run_with_balancing(
     let success = result.exit_code == 0;
 
     let error_category = if !success {
-        run_diagnostics(&result.stderr, result.exit_code, all_models, working_dir)
+        run_diagnostics(
+            _agent_runtime_services,
+            &result.stderr,
+            result.exit_code,
+            all_models,
+            working_dir,
+        )
     } else {
         None
     };
@@ -2057,6 +2082,7 @@ fn run_with_balancing(
 
     if success {
         let emitted = ingest_and_emit_session_id_resume_aware(
+            _agent_runtime_services,
             &state,
             &sessions_cfg,
             provider_name,
@@ -2145,6 +2171,7 @@ fn resolve_parent_invocation_id(state: &StateDb) -> Option<i64> {
 }
 
 fn run_diagnostics(
+    _agent_runtime_services: &wiring::AgentRuntimeServices,
     stderr: &str,
     exit_code: i32,
     models: &HashMap<String, ModelConfig>,
