@@ -8,7 +8,7 @@ use oulipoly_runtime::balancer;
 use oulipoly_runtime::diagnostics;
 use oulipoly_runtime::executor;
 use oulipoly_runtime::services::{
-    InvocationLifecycleFinalizeRequest, InvocationLifecycleServicePort,
+    ExecutorServiceRequest, InvocationLifecycleFinalizeRequest, InvocationLifecycleServicePort,
     InvocationLifecycleStartRequest, MigrationServiceOutput, MigrationServicePort,
     MigrationServiceRequest, ProductionMigrationService, ProductionResumeService,
     ProductionSessionLifecycleService, ResumeAcceptanceRequest, ResumeServiceOutput,
@@ -2051,19 +2051,19 @@ fn run_with_balancing(
         .map_err(|e| format!("Failed to serialize invocation id: {e}"))?;
     eprintln!("{}", invocation.stderr_line());
 
-    let result = match executor::execute_effective_with_inputs_and_env(
-        executor::cli::EffectiveExecuteRequest {
-            model,
-            provider: &provider,
+    let result = match agent_runtime_services.executor_service.execute(
+        ExecutorServiceRequest::Effective {
+            model: model.clone(),
+            provider: provider.clone(),
             provider_index,
             prompt_mode,
-            prompt,
-            working_dir,
-            extra_inputs,
-            parent_invocation_env: Some(&invocation_env),
+            prompt: prompt.to_string(),
+            working_dir: working_dir.map(Path::to_path_buf),
+            extra_inputs: extra_inputs.clone(),
+            parent_invocation_env: Some(invocation_env.clone()),
         },
     ) {
-        Ok(result) => result,
+        Ok(output) => output.result,
         Err(err) => {
             agent_runtime_services
                 .invocation_lifecycle_service
@@ -2081,7 +2081,7 @@ fn run_with_balancing(
                 .unwrap_or_else(|finalize_err| {
                     eprintln!("Warning: Failed to finalize invocation: {finalize_err}")
                 });
-            return Err(err);
+            return Err(err.to_string());
         }
     };
 
