@@ -11,9 +11,10 @@ use oulipoly_runtime::services::{
     MigrationServiceOutput, MigrationServicePort, MigrationServiceRequest,
     ProductionMigrationService, ProductionResumeService, ProductionSessionLifecycleService,
     ResumeAcceptanceRequest, ResumeServiceOutput, ResumeServicePort, ResumeServiceRequest,
-    ServiceError, SessionExportServiceRequest, SessionLifecycleIngestMode, SessionLifecycleRequest,
-    SessionLifecycleServicePort, SessionLockFailure, SessionLockServiceRequest, SessionLockSuccess,
-    SessionReplaceServiceRequest, TraceServiceFailure, TraceServiceRequest,
+    RoutingServicePort, RoutingServiceRequest, ServiceError, SessionExportServiceRequest,
+    SessionLifecycleIngestMode, SessionLifecycleRequest, SessionLifecycleServicePort,
+    SessionLockFailure, SessionLockServiceRequest, SessionLockSuccess, SessionReplaceServiceRequest,
+    TraceServiceFailure, TraceServiceRequest,
 };
 use oulipoly_runtime::session_export::ExportError;
 use oulipoly_runtime::session_lock::LockError;
@@ -1447,7 +1448,7 @@ fn resume_migration_pool(
 }
 
 fn run_repl(
-    _agent_runtime_services: &wiring::AgentRuntimeServices,
+    agent_runtime_services: &wiring::AgentRuntimeServices,
     model_name: Option<&str>,
     resume: Option<&str>,
     manual_migrate: Option<&str>,
@@ -1591,7 +1592,15 @@ fn run_repl(
             Some(resolved.active_session_id.clone()),
         )
     } else {
-        let provider_index = balancer::select_provider(&model, &state, Some(&ctx));
+        let provider_index = agent_runtime_services
+            .routing_service
+            .select_route(RoutingServiceRequest {
+                model: &model,
+                state: &state,
+                ctx: Some(&ctx),
+            })
+            .map_err(|err| err.to_string())?
+            .provider_index;
         let (provider, _) = effective_model_for_execution(&model, provider_index, &providers_cfg)?;
         (provider_index, provider, None)
     };
@@ -1667,7 +1676,7 @@ fn run_repl(
             guard.mark_finalized();
             if exit_code == 0 {
                 ingest_and_emit_session_id_resume_aware(
-                    _agent_runtime_services,
+                    agent_runtime_services,
                     &state,
                     &sessions_cfg,
                     &provider.name,
@@ -1940,7 +1949,7 @@ fn run_resume(
 }
 
 fn run_with_balancing(
-    _agent_runtime_services: &wiring::AgentRuntimeServices,
+    agent_runtime_services: &wiring::AgentRuntimeServices,
     state_db_opener: &dyn StateDbOpener,
     model: &ModelConfig,
     prompt: &str,
@@ -1969,7 +1978,15 @@ fn run_with_balancing(
     // selection itself can be attributed to a parent context if needed
     // (matches contract `tmp/01-pr-a-contract.md` lifecycle ordering).
     let parent_invocation_id = resolve_parent_invocation_id(&state);
-    let provider_index = balancer::select_provider(model, &state, Some(&ctx));
+    let provider_index = agent_runtime_services
+        .routing_service
+        .select_route(RoutingServiceRequest {
+            model,
+            state: &state,
+            ctx: Some(&ctx),
+        })
+        .map_err(|err| err.to_string())?
+        .provider_index;
     let (provider, prompt_mode) =
         effective_model_for_execution(model, provider_index, &providers_cfg)?;
     let provider_name = &provider.name;
@@ -2040,7 +2057,7 @@ fn run_with_balancing(
 
     let error_category = if !success {
         run_diagnostics(
-            _agent_runtime_services,
+            agent_runtime_services,
             &result.stderr,
             result.exit_code,
             all_models,
@@ -2082,7 +2099,7 @@ fn run_with_balancing(
 
     if success {
         let emitted = ingest_and_emit_session_id_resume_aware(
-            _agent_runtime_services,
+            agent_runtime_services,
             &state,
             &sessions_cfg,
             provider_name,
