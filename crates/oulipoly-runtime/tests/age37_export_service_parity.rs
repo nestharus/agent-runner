@@ -104,10 +104,22 @@ impl ExportFixture {
 
     fn write_provider(&self, provider_name: &str, storage_kind: &str, include_storage: bool) {
         let storage = if include_storage {
+            let storage_root = match storage_kind {
+                "claude_code" => format!(
+                    "projects_dir = {:?}",
+                    self.data_root.join("claude-projects").to_string_lossy()
+                ),
+                "codex" => format!(
+                    "sessions_dir = {:?}",
+                    self.data_root.join("codex-sessions").to_string_lossy()
+                ),
+                _ => String::new(),
+            };
             format!(
                 r#"
 [{provider_name}.session_storage]
 kind = "{storage_kind}"
+{storage_root}
 "#
             )
         } else {
@@ -126,7 +138,10 @@ flag = "--resume"
 {storage}
 "#
         );
-        fs::write(self.config_root.join("providers.toml"), body).unwrap();
+        let providers_path = self.config_root.join("providers.toml");
+        let mut existing = fs::read_to_string(&providers_path).unwrap_or_default();
+        existing.push_str(&body);
+        fs::write(providers_path, existing).unwrap();
     }
 
     fn write_sessions_locator(&self, provider_name: &str, path: &Path) {
@@ -143,11 +158,12 @@ flag = "--resume"
 
     fn seed_active_chain(&self, chain_id: &str, provider_name: &str, session_id: &str) {
         let db = self.db();
+        let now = chrono::Utc::now().to_rfc3339();
         db.connection()
             .execute(
                 "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
-                 VALUES (?1, '2026-04-17T08:00:00Z', '2026-04-17T08:00:00Z', ?2)",
-                params![chain_id, MODEL],
+                 VALUES (?1, ?2, ?2, ?3)",
+                params![chain_id, now, MODEL],
             )
             .unwrap();
         db.connection()
@@ -254,6 +270,7 @@ fn assert_ambiguous_session() {
     let fixture = ExportFixture::new();
     fixture.write_model(MODEL, &[CLAUDE_PROVIDER, CODEX_PROVIDER]);
     fixture.write_provider(CLAUDE_PROVIDER, "claude_code", true);
+    fixture.write_provider(CODEX_PROVIDER, "codex", true);
     fixture.seed_active_chain(CHAIN_A, CLAUDE_PROVIDER, SESSION_A);
     fixture.seed_active_chain(CHAIN_B, CODEX_PROVIDER, SESSION_A);
     match export_error_for(fixture, SESSION_A) {

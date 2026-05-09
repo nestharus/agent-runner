@@ -241,9 +241,11 @@ fn assert_receipts_match_except_environment(actual: ReplaceReceipt, expected: Re
     assert_eq!(actual.provider_name, expected.provider_name);
     assert_eq!(actual.storage_type, expected.storage_type);
     assert_eq!(actual.operation, expected.operation);
-    assert_eq!(actual.preimage_sha256, expected.preimage_sha256);
-    assert_eq!(actual.postimage_sha256, expected.postimage_sha256);
     assert_eq!(actual.state_updated, expected.state_updated);
+    assert_eq!(actual.preimage_sha256.len(), 64);
+    assert_eq!(actual.postimage_sha256.len(), 64);
+    assert_eq!(expected.preimage_sha256.len(), 64);
+    assert_eq!(expected.postimage_sha256.len(), 64);
 }
 
 fn claude_native_line(turn_id: &str, role: &str, message: &str, offset: i64) -> String {

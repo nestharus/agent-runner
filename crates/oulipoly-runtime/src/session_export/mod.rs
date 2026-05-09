@@ -1,3 +1,5 @@
+mod metadata;
+
 use chrono::{DateTime, Utc};
 use oulipoly_state::StateDb;
 use rusqlite::params;
@@ -6,6 +8,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
+
+pub use metadata::resolve_export_session_metadata;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CanonicalRecord {

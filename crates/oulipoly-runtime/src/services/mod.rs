@@ -5,16 +5,19 @@ use crate::diagnostics::Diagnosis;
 use crate::executor::ExecutionResult;
 use crate::quota::{InFlight, RefreshOutcome};
 use crate::session_export::ExportError;
-use crate::session_lock::{Lease, LockError, ReleaseReceipt};
+use crate::session_lock::{Lease, LockError, ReleaseReceipt, SessionLock};
 use crate::session_replace::{ReplaceError, ReplaceReceipt, ReplaceSource};
 use crate::trace::{TraceOptions, TraceReport};
 pub use error::ServiceError;
-use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig, ProvidersConfig, SessionsConfig};
+use oulipoly_config::{
+    ModelConfig, PromptMode, ProviderConfig, ProvidersConfig, SessionsConfig, load_models,
+};
 use oulipoly_state::repositories::ResumeRepository;
 use oulipoly_state::{ResumeError, StateDb};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 macro_rules! service_dto {
     ($($name:ident),+ $(,)?) => {
@@ -331,38 +334,46 @@ impl ProductionMigrationService {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ProductionTraceService;
+pub struct ProductionTraceService {
+    _private: (),
+}
 
 impl ProductionTraceService {
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ProductionSessionExportService;
+pub struct ProductionSessionExportService {
+    _private: (),
+}
 
 impl ProductionSessionExportService {
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ProductionSessionReplaceService;
+pub struct ProductionSessionReplaceService {
+    _private: (),
+}
 
 impl ProductionSessionReplaceService {
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ProductionSessionLockService;
+pub struct ProductionSessionLockService {
+    _private: (),
+}
 
 impl ProductionSessionLockService {
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 }
 
@@ -723,36 +734,154 @@ impl MigrationServicePort for ProductionMigrationService {
 }
 
 impl TraceServicePort for ProductionTraceService {
-    fn trace(&self, _request: TraceServiceRequest<'_>) -> Result<TraceServiceOutput, ServiceError> {
-        unimplemented!("AGE-37 Phase 6c will implement")
+    fn trace(&self, request: TraceServiceRequest<'_>) -> Result<TraceServiceOutput, ServiceError> {
+        let result = crate::trace::trace_invocation_with_sessions(
+            request.state,
+            request.invocation_uuid,
+            request.options,
+            Some(request.sessions_cfg),
+        )
+        .map_err(|message| classify_trace_failure(request.invocation_uuid, message));
+        Ok(TraceServiceOutput { result })
     }
 }
 
 impl SessionExportServicePort for ProductionSessionExportService {
     fn export_session(
         &self,
-        _request: SessionExportServiceRequest,
+        request: SessionExportServiceRequest,
     ) -> Result<SessionExportServiceOutput, ServiceError> {
-        unimplemented!("AGE-37 Phase 6c will implement")
+        let result = crate::session_export::resolve_export_session_metadata(&request.session_id)
+            .and_then(|metadata| {
+                crate::session_export::read_canonical_transcript(&metadata)
+                    .and_then(|records| crate::session_export::canonical_jsonl_bytes(&records))
+            });
+        Ok(SessionExportServiceOutput { result })
     }
 }
 
 impl SessionReplaceServicePort for ProductionSessionReplaceService {
     fn replace_session(
         &self,
-        _request: SessionReplaceServiceRequest,
+        request: SessionReplaceServiceRequest,
     ) -> Result<SessionReplaceServiceOutput, ServiceError> {
-        unimplemented!("AGE-37 Phase 6c will implement")
+        let input_path = match &request.source {
+            ReplaceSource::File(path) => Some(path.as_path()),
+            ReplaceSource::Stdin => None,
+        };
+        let result = crate::session_replace::run_import_replace(
+            &request.session_id,
+            input_path,
+            request.preimage_sha256.as_deref(),
+        );
+        Ok(SessionReplaceServiceOutput { result })
     }
 }
 
 impl SessionLockServicePort for ProductionSessionLockService {
     fn lock_session(
         &self,
-        _request: SessionLockServiceRequest,
+        request: SessionLockServiceRequest,
     ) -> Result<SessionLockServiceOutput, ServiceError> {
-        unimplemented!("AGE-37 Phase 6c will implement")
+        let result = match request {
+            SessionLockServiceRequest::Acquire { session_id, ttl_ms } => {
+                acquire_session_lock(&session_id, ttl_ms)
+            }
+            SessionLockServiceRequest::Release { session_id, token } => {
+                release_session_lock(&session_id, &token)
+            }
+        };
+        Ok(SessionLockServiceOutput { result })
     }
+}
+
+fn classify_trace_failure(input: &str, message: String) -> TraceServiceFailure {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("invalid invocation uuid") {
+        TraceServiceFailure::InvalidInvocationId {
+            input: input.to_string(),
+            message,
+        }
+    } else if lower.contains("unknown invocation") || lower.contains("invocation not found") {
+        TraceServiceFailure::InvocationNotFound {
+            input: input.to_string(),
+            message,
+        }
+    } else {
+        TraceServiceFailure::Operational { message }
+    }
+}
+
+fn acquire_session_lock(
+    session_id: &str,
+    ttl_ms: u64,
+) -> Result<SessionLockSuccess, SessionLockFailure> {
+    let state = StateDb::open_default()
+        .map_err(|message| SessionLockFailure::Lock(LockError::Operational { message }))?;
+    let providers_cfg =
+        ProvidersConfig::load(&default_config_root().join("providers.toml")).unwrap_or_default();
+    let models = load_models(&default_models_dir(), Some(&providers_cfg))
+        .map_err(|message| SessionLockFailure::Lock(LockError::Operational { message }))?;
+    let resolved = <StateDb as ResumeRepository>::resolve_resume(&state, &models, session_id, None)
+        .map_err(SessionLockFailure::Resume)?;
+    let lock_dir = default_lock_dir().map_err(SessionLockFailure::Lock)?;
+    let lock = SessionLock::new(&lock_dir).map_err(|err| {
+        SessionLockFailure::Lock(LockError::Operational {
+            message: format!("failed to open locks: {err}"),
+        })
+    })?;
+    let lease = lock
+        .acquire(
+            &resolved.active_session_id,
+            &resolved.active_provider,
+            Duration::from_millis(ttl_ms),
+        )
+        .map_err(SessionLockFailure::Lock)?;
+    Ok(SessionLockSuccess::Acquired {
+        session_id: resolved.active_session_id,
+        chain_id: resolved.chain_id,
+        provider_name: resolved.active_provider,
+        lease,
+    })
+}
+
+fn release_session_lock(
+    session_id: &str,
+    token: &str,
+) -> Result<SessionLockSuccess, SessionLockFailure> {
+    // Preserve resume-handshake's state-open gate; release itself does not resolve providers.
+    StateDb::open_default()
+        .map_err(|message| SessionLockFailure::Lock(LockError::Operational { message }))?;
+    let lock_dir = default_lock_dir().map_err(SessionLockFailure::Lock)?;
+    let lock = SessionLock::new(&lock_dir).map_err(|err| {
+        SessionLockFailure::Lock(LockError::Operational {
+            message: format!("failed to open locks: {err}"),
+        })
+    })?;
+    let receipt = lock
+        .release(session_id, token)
+        .map_err(SessionLockFailure::Lock)?;
+    Ok(SessionLockSuccess::Released { receipt })
+}
+
+fn default_config_root() -> PathBuf {
+    dirs::config_dir()
+        .map(|d| d.join("oulipoly-agent-runner"))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn default_models_dir() -> PathBuf {
+    dirs::config_dir()
+        .map(|d| d.join("oulipoly-agent-runner").join("models"))
+        .unwrap_or_else(|| PathBuf::from("models"))
+}
+
+fn default_lock_dir() -> Result<PathBuf, LockError> {
+    dirs::data_dir()
+        .map(|dir| dir.join("oulipoly-agent-runner").join("locks"))
+        .ok_or_else(|| LockError::Operational {
+            message: "Could not determine data directory".to_string(),
+        })
 }
 
 fn emit_pinned_session_id_for_service(
