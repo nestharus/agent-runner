@@ -126,11 +126,17 @@ jobs:
       - name: Resolve version
         id: resolve
         run: |
-          cargo_version=$(grep '^version' src-tauri/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          metadata=$(cargo metadata --format-version 1 --no-deps)
+          resolved_version=$(echo "$metadata" | jq -r '.packages[] | select(.name == "oulipoly-agent-runner") | .version' | head -1)
 
-          if git rev-parse "v${cargo_version}" >/dev/null 2>&1; then
-            major=$(echo "$cargo_version" | cut -d. -f1)
-            minor=$(echo "$cargo_version" | cut -d. -f2)
+          if ! [[ "$resolved_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Resolved oulipoly-agent-runner version is not semver X.Y.Z: $resolved_version"
+            exit 1
+          fi
+
+          if git rev-parse "v${resolved_version}" >/dev/null 2>&1; then
+            major=$(echo "$resolved_version" | cut -d. -f1)
+            minor=$(echo "$resolved_version" | cut -d. -f2)
             highest_patch=$(git tag --list "v${major}.${minor}.*" | sed "s/v${major}\.${minor}\.//" | sort -n | tail -1)
             if [ -z "$highest_patch" ]; then
               highest_patch=0
@@ -138,7 +144,7 @@ jobs:
             next_patch=$((highest_patch + 1))
             version="${major}.${minor}.${next_patch}"
           else
-            version="$cargo_version"
+            version="$resolved_version"
           fi
 
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -236,13 +242,13 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           mkdir -p artifacts
-          cp target/${{ matrix.target }}/release/agent-store artifacts/agent-store-${{ matrix.target }}
+          cp src-tauri/target/${{ matrix.target }}/release/agent-store artifacts/agent-store-${{ matrix.target }}
       - name: Collect agent store artifact (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path artifacts
-          Copy-Item target/${{ matrix.target }}/release/agent-store.exe artifacts/agent-store-${{ matrix.target }}.exe
+          Copy-Item src-tauri/target/${{ matrix.target }}/release/agent-store.exe artifacts/agent-store-${{ matrix.target }}.exe
       - uses: actions/upload-artifact@v4
         with:
           name: agent-store-${{ matrix.target }}
@@ -275,13 +281,13 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           mkdir -p artifacts
-          cp target/${{ matrix.target }}/release/agent-scratchpad artifacts/agent-scratchpad-${{ matrix.target }}
+          cp src-tauri/target/${{ matrix.target }}/release/agent-scratchpad artifacts/agent-scratchpad-${{ matrix.target }}
       - name: Collect agent scratchpad artifact (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path artifacts
-          Copy-Item target/${{ matrix.target }}/release/agent-scratchpad.exe artifacts/agent-scratchpad-${{ matrix.target }}.exe
+          Copy-Item src-tauri/target/${{ matrix.target }}/release/agent-scratchpad.exe artifacts/agent-scratchpad-${{ matrix.target }}.exe
       - uses: actions/upload-artifact@v4
         with:
           name: agent-scratchpad-${{ matrix.target }}
@@ -314,13 +320,13 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           mkdir -p artifacts
-          cp target/${{ matrix.target }}/release/agent-messenger artifacts/agent-messenger-${{ matrix.target }}
+          cp src-tauri/target/${{ matrix.target }}/release/agent-messenger artifacts/agent-messenger-${{ matrix.target }}
       - name: Collect agent messenger artifact (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path artifacts
-          Copy-Item target/${{ matrix.target }}/release/agent-messenger.exe artifacts/agent-messenger-${{ matrix.target }}.exe
+          Copy-Item src-tauri/target/${{ matrix.target }}/release/agent-messenger.exe artifacts/agent-messenger-${{ matrix.target }}.exe
       - uses: actions/upload-artifact@v4
         with:
           name: agent-messenger-${{ matrix.target }}

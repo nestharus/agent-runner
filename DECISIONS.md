@@ -1334,3 +1334,42 @@ The four discoveries are listed here so a later consolidation WU can pick them u
     `planning/age-62-deployment-routing-metadata/risk/age-62-halt-record.md`.
   - Coupling adjudication (HIGH on routing → resolver):
     `planning/age-62-deployment-routing-metadata/risk/age-62-coupling.md`.
+
+## AGE-30 — Phase 4 supported-surface MEDIUM accepted as residual (2026-05-10)
+
+- **WU**: AGE-30
+- **Phase**: 4 (R2)
+- **Decision**: accept Phase 4 supported-surface MEDIUM as residual; do not revise the proposal further; advance to Phase 4 code-quality gate + Process-tree audit #1.
+- **Reason**: the only non-LOW axis on the supported-surface gate is "Public-surface blast radius: HIGH (release tag and assets are externally observable), but bounded by anti-scope". This is intrinsic blast-radius — fixing the broken release pipeline is, by definition, a change to an externally-observable release surface. The gate's findings summary explicitly states all eight assumptions hold, no invalidated assumption, no non-positive value, and the integration-hidden residual is named and classified per Phase 6b output contract.
+- **Pre-resolution**: the AGE-30 dispatch's "Stable-MEDIUM intrinsic-blast-radius: accept-and-continue" applies.
+- **Evidence**:
+  - `planning/age-30-release-yml-fix/risk/age-30-supported-surface.md` — finding text.
+  - `planning/age-30-release-yml-fix/risk/age-30-risk-profile.md` — per-surface scoring (HIGH on blast-radius intrinsic to a release pipeline).
+  - `planning/age-30-release-yml-fix/audit-history.md` — Round 2 entry.
+  - `planning/age-30-release-yml-fix/proposals/age-30-AGE-30.md` — supported-surface track + assumption register + residual artifact reference.
+
+## AGE-30 — Phase 4 code-quality HIGH accepted as `stable-HIGH-on-A1-when-intrinsic` (2026-05-10)
+
+- **WU**: AGE-30
+- **Phase**: 4 code-quality gate
+- **Aggregate verdict**: HIGH (cohesion-auditor 3 findings, coupling-auditor 7 findings, all blocking-HIGH).
+- **Decision**: accept residual under `stable-HIGH-on-A1-when-intrinsic` per AGE-30 dispatch pre-resolution; do not revise the proposal further; advance to Phase 4 join manifest + Process-tree audit #1.
+- **Reason**: the surfaces flagged HIGH are intrinsic to a release-pipeline fix that the WU's anti-scope explicitly forbids restructuring:
+  - `release.yml` `Resolve version` step (orchestration step that cohesion-flags as multi-classification by virtue of doing cargo-metadata + jq + semver + tag-listing + GITHUB_OUTPUT formatting).
+  - `release.yml` helper-binary jobs (coupling to cargo build / `--target` / package + bin names + target triples / `src-tauri/target` layout — every reference is part of the contract being fixed).
+  - `release.yml` release fan-in (coupling to upstream producers + `actions/download-artifact@v4` + `softprops/action-gh-release@v2` + script asset paths — fixed contract by anti-scope "no change to which binaries get published").
+  - `src-tauri/tests/workflow_yml_contract.rs` and `src-tauri/tests/release_yml_contract.rs` (predicate / arrange-act-assert shape-guards mirroring the workflow contract).
+  - `AGENTS.md` Release section (documentation re-export of workflow / cargo / artifact identifiers).
+  - All 10 findings' closure expectations require restructuring at the touched-surface boundary or "revising the approach"; both routes hit AGE-30 anti-scope (no redesign of pipeline shape, no change to published binaries, no touching `ci.yml`, no Tauri-config touch, no machine-enforcement framing for AGENTS.md).
+- **Pre-resolution citation**: AGE-30 dispatch — "Phase 6 code-quality A1-HIGH residual on intrinsic surfaces: pre-resolved per AGE-54 / AGE-61 / AGE-62 precedent. If code-quality fanout produces HIGH on intrinsic A1 surfaces (orchestration + predicate / arrange-act-assert / namespace re-export), accept as residual + advance to Phase 7. Do NOT halt for that gate — document under `stable-HIGH-on-A1-when-intrinsic` with this ticket's surface scope." Applied to the Phase 4 code-quality fanout since the same auditors hit the same intrinsic surfaces; the rationale is identical to AGE-54/AGE-61/AGE-62.
+- **Surface scope** (`stable-HIGH-on-A1-when-intrinsic` label):
+  - orchestration: `release.yml` `Resolve version` step + helper-binary collection sequences + release fan-in.
+  - predicate / arrange-act-assert: `src-tauri/tests/workflow_yml_contract.rs` + `src-tauri/tests/release_yml_contract.rs`.
+  - namespace re-export: `AGENTS.md` Release-process section.
+- **Evidence**:
+  - `planning/age-30-release-yml-fix/code-quality/age-30-phase-4/aggregate-code-quality.md`
+  - `planning/age-30-release-yml-fix/code-quality/age-30-phase-4/findings.md`
+  - `planning/age-30-release-yml-fix/code-quality/age-30-phase-4/findings.json`
+  - `planning/age-30-release-yml-fix/code-quality/age-30-phase-4/reports/cohesion-auditor.md`
+  - `planning/age-30-release-yml-fix/code-quality/age-30-phase-4/reports/coupling-auditor.md`
+  - `planning/age-30-release-yml-fix/audit-history.md` Round 3 entry.

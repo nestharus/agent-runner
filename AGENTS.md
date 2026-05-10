@@ -267,6 +267,23 @@ cargo tauri build        # Full app build
 bunx playwright test e2e/screenshots.spec.ts  # Generate screenshot catalog
 ```
 
+## Release Process
+
+Cut releases from GitHub Actions by manually running the `Release` workflow
+with `workflow_dispatch`. The workflow creates GitHub Release tags in the
+`vX.Y.Z` pattern.
+
+The version source of truth is the root `Cargo.toml`
+`[workspace.package].version`; package manifests such as
+`oulipoly-agent-runner` inherit that value through Cargo workspace metadata.
+If the selected `vX.Y.Z` tag already exists, the workflow keeps the same
+major/minor line and bumps to the next patch tag.
+
+Published artifacts are the platform app bundles and raw
+`oulipoly-agent-runner` binaries, the helper binaries `agent-store`,
+`agent-scratchpad`, and `agent-messenger`, plus the adapter scripts already
+listed in `.github/workflows/release.yml`.
+
 ## Rust Workspace Structure
 
 ```
