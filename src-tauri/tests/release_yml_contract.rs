@@ -66,6 +66,15 @@ fn release_yml_restores_windows_and_target_suffixed_bare_binaries() {
         "jobs.build.steps[Collect artifacts (Linux)].run must target-suffix the bare binary"
     );
     assert!(
+        string_field(
+            linux,
+            "run",
+            "jobs.build.steps[Collect artifacts (Linux)].run"
+        )
+        .contains("src-tauri/target/${{ matrix.target }}/release/oulipoly-agent-runner"),
+        "jobs.build.steps[Collect artifacts (Linux)].run must copy the app binary from src-tauri/target/${{ matrix.target }}/release/oulipoly-agent-runner"
+    );
+    assert!(
         !string_field(
             linux,
             "run",
@@ -118,6 +127,15 @@ fn release_yml_restores_windows_and_target_suffixed_bare_binaries() {
             "run",
             "jobs.build.steps[Collect artifacts (macOS)].run"
         )
+        .contains("src-tauri/target/${{ matrix.target }}/release/oulipoly-agent-runner"),
+        "jobs.build.steps[Collect artifacts (macOS)].run must copy the app binary from src-tauri/target/${{ matrix.target }}/release/oulipoly-agent-runner"
+    );
+    assert!(
+        string_field(
+            macos,
+            "run",
+            "jobs.build.steps[Collect artifacts (macOS)].run"
+        )
         .contains("oulipoly-agent-runner-${{ matrix.target }}"),
         "jobs.build.steps[Collect artifacts (macOS)].run must target-suffix the bare binary"
     );
@@ -158,6 +176,15 @@ fn release_yml_restores_windows_and_target_suffixed_bare_binaries() {
         ),
         "runner.os == 'Windows'",
         "jobs.build.steps[Collect artifacts (Windows)].if must be runner.os == 'Windows'"
+    );
+    assert!(
+        string_field(
+            windows,
+            "run",
+            "jobs.build.steps[Collect artifacts (Windows)].run"
+        )
+        .contains("src-tauri/target/${{ matrix.target }}/release/oulipoly-agent-runner.exe"),
+        "jobs.build.steps[Collect artifacts (Windows)].run must copy the app binary from src-tauri/target/${{ matrix.target }}/release/oulipoly-agent-runner.exe"
     );
     assert!(
         string_field(
@@ -250,7 +277,50 @@ fn release_yml_restores_windows_and_target_suffixed_bare_binaries() {
         "jobs.release.steps[actions/download-artifact@v4].with.path must be artifacts"
     );
 
+    let tag_step = release_steps
+        .iter()
+        .find(|step| {
+            mapping_get(step, "run")
+                .and_then(Value::as_str)
+                .is_some_and(|run| {
+                    run.contains("git tag ${{ needs.version.outputs.tag }}")
+                        && run.contains("git push origin ${{ needs.version.outputs.tag }}")
+                })
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "jobs.release.steps must contain a tag creation step with git tag and git push for needs.version.outputs.tag"
+            )
+        });
+    let tag_run = string_field(tag_step, "run", "jobs.release.steps[tag creation].run");
+    assert!(
+        tag_run.contains("git tag ${{ needs.version.outputs.tag }}"),
+        "jobs.release.steps[tag creation].run must create the release tag from needs.version.outputs.tag"
+    );
+    assert!(
+        tag_run.contains("git push origin ${{ needs.version.outputs.tag }}"),
+        "jobs.release.steps[tag creation].run must push the release tag from needs.version.outputs.tag"
+    );
+
     let gh_release = step_by_uses(release_steps, "softprops/action-gh-release@v2");
+    assert_eq!(
+        string_at(
+            gh_release,
+            "jobs.release.steps[softprops/action-gh-release@v2].with.tag_name",
+            &["with", "tag_name"],
+        ),
+        "${{ needs.version.outputs.tag }}",
+        "jobs.release.steps[softprops/action-gh-release@v2].with.tag_name must use needs.version.outputs.tag"
+    );
+    assert_eq!(
+        bool_at(
+            gh_release,
+            "jobs.release.steps[softprops/action-gh-release@v2].with.generate_release_notes",
+            &["with", "generate_release_notes"],
+        ),
+        true,
+        "jobs.release.steps[softprops/action-gh-release@v2].with.generate_release_notes must be true"
+    );
     let files = string_at(
         gh_release,
         "jobs.release.steps[softprops/action-gh-release@v2].with.files",

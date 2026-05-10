@@ -247,17 +247,23 @@ fn assert_standalone_binary_release_job(
         )),
         "{assertion}: {job_name} must build the expected package/bin"
     );
+    for line in job_text.lines() {
+        assert!(
+            !line.contains("--target-dir"),
+            "{assertion}: {job_name} must not override Cargo's target directory with --target-dir, found line: {line:?}"
+        );
+    }
     assert!(
         job_text.contains(&format!(
-            "cp target/${{{{ matrix.target }}}}/release/{binary_name} artifacts/{artifact_prefix}-${{{{ matrix.target }}}}"
+            "cp src-tauri/target/${{{{ matrix.target }}}}/release/{binary_name} artifacts/{artifact_prefix}-${{{{ matrix.target }}}}"
         )),
-        "{assertion}: {job_name} must copy the non-Windows binary with target suffix"
+        "{assertion}: {job_name} must copy the non-Windows binary from src-tauri/target with target suffix"
     );
     assert!(
         job_text.contains(&format!(
-            "Copy-Item target/${{{{ matrix.target }}}}/release/{binary_name}.exe artifacts/{artifact_prefix}-${{{{ matrix.target }}}}.exe"
+            "Copy-Item src-tauri/target/${{{{ matrix.target }}}}/release/{binary_name}.exe artifacts/{artifact_prefix}-${{{{ matrix.target }}}}.exe"
         )),
-        "{assertion}: {job_name} must copy the Windows .exe with target suffix"
+        "{assertion}: {job_name} must copy the Windows .exe from src-tauri/target with target suffix"
     );
 
     let upload = step_by_uses(
@@ -588,6 +594,33 @@ fn binary_workspace_members() -> Vec<String> {
             } else {
                 None
             }
+        })
+        .collect()
+}
+
+fn workspace_members_with_inherited_version() -> Vec<String> {
+    let workspace = parse_toml("../../Cargo.toml");
+    let members = toml_value_at(&workspace, "workspace.members", &["workspace", "members"])
+        .as_array()
+        .unwrap_or_else(|| panic!("workspace.members must be a TOML array"));
+
+    members
+        .iter()
+        .filter_map(|member| {
+            let member_path = member
+                .as_str()
+                .unwrap_or_else(|| panic!("workspace member must be a string, got {member:?}"));
+            let manifest = parse_toml(&format!("../../{member_path}/Cargo.toml"));
+            let inherits_version = toml_table(&manifest, member_path)
+                .get("package")
+                .and_then(toml::Value::as_table)
+                .and_then(|package| package.get("version"))
+                .and_then(toml::Value::as_table)
+                .and_then(|version| version.get("workspace"))
+                .and_then(toml::Value::as_bool)
+                .unwrap_or(false);
+
+            inherits_version.then(|| format!("{member_path}/Cargo.toml"))
         })
         .collect()
 }
@@ -1266,4 +1299,164 @@ fn assertion_a14_standalone_binary_release_job_bodies() {
         "agent-messenger",
         "A14",
     );
+}
+
+#[test]
+fn assertion_a15_release_version_resolver_uses_cargo_metadata() {
+    let release = release_workflow();
+    let resolve = step_by_name(&release, "release.yml", "version", "Resolve version");
+    let run = string_field(
+        resolve,
+        "run",
+        "A15 release.yml jobs.version.steps[Resolve version].run",
+    );
+
+    assert!(
+        regex_is_match(
+            r"\bcargo\s+metadata\s+--format-version\s+1\s+--no-deps\b",
+            run
+        ),
+        "A15: release.yml Resolve version must invoke cargo metadata --format-version 1 --no-deps, got: {run}"
+    );
+    assert!(
+        run.contains("jq")
+            && run.contains(r#"select(.name == "oulipoly-agent-runner")"#)
+            && run.contains(".version"),
+        "A15: release.yml Resolve version must use jq to select package oulipoly-agent-runner and read .version, got: {run}"
+    );
+    assert!(
+        run.contains(r"^[0-9]+\.[0-9]+\.[0-9]+$"),
+        "A15: release.yml Resolve version must validate semver shape ^[0-9]+\\.[0-9]+\\.[0-9]+$, got: {run}"
+    );
+    assert!(
+        run.contains("exit 1") || run.contains("return 1"),
+        "A15: release.yml Resolve version must fail when semver validation fails, got: {run}"
+    );
+    assert!(
+        run.contains("git rev-parse \"v${cargo_version}\"")
+            || run.contains("git rev-parse \"v${resolved_version}\"")
+            || run.contains("git rev-parse \"${tag}\""),
+        "A15: release.yml Resolve version must preserve duplicate-tag detection against v-prefixed tag names, got: {run}"
+    );
+    assert!(
+        run.contains(r#"git tag --list "v${major}.${minor}.*""#)
+            && run.contains("highest_patch")
+            && run.contains("next_patch=$((highest_patch + 1))"),
+        "A15: release.yml Resolve version must preserve highest patch bumping for duplicate vX.Y.Z tags, got: {run}"
+    );
+    assert!(
+        run.contains(r#"echo "version=$version" >> "$GITHUB_OUTPUT""#)
+            && run.contains(r#"echo "tag=v$version" >> "$GITHUB_OUTPUT""#),
+        "A15: release.yml Resolve version must emit version= and tag=v outputs, got: {run}"
+    );
+    for manifest_path in workspace_members_with_inherited_version() {
+        let pattern = format!(r"(?m)\bgrep\s+[^|\n]*\b{}\b", regex::escape(&manifest_path));
+        assert!(
+            !regex_is_match(&pattern, run),
+            "A15: release.yml Resolve version must not grep inheriting manifest {manifest_path:?}, got: {run}"
+        );
+    }
+    assert!(
+        !run.contains("version.workspace"),
+        "A15: release.yml Resolve version must not contain the inherited version.workspace literal, got: {run}"
+    );
+}
+
+#[test]
+fn assertion_a16_workspace_version_inheritance_contract() {
+    let workspace = parse_toml("../../Cargo.toml");
+    let workspace_version = toml_value_at(
+        &workspace,
+        "root Cargo.toml workspace.package.version",
+        &["workspace", "package", "version"],
+    )
+    .as_str()
+    .unwrap_or_else(|| panic!("A16: root Cargo.toml [workspace.package].version must be a string"));
+    assert!(
+        regex_is_match(r"^[0-9]+\.[0-9]+\.[0-9]+$", workspace_version),
+        "A16: root Cargo.toml [workspace.package].version must be semver X.Y.Z, got {workspace_version:?}"
+    );
+
+    let tauri_manifest = parse_toml("../../src-tauri/Cargo.toml");
+    let package_name = toml_value_at(
+        &tauri_manifest,
+        "src-tauri package.name",
+        &["package", "name"],
+    )
+    .as_str()
+    .unwrap_or_else(|| panic!("A16: src-tauri/Cargo.toml package.name must be a string"));
+    assert_eq!(
+        package_name, "oulipoly-agent-runner",
+        "A16: src-tauri/Cargo.toml must remain the oulipoly-agent-runner package"
+    );
+    let version_workspace = toml_value_at(
+        &tauri_manifest,
+        "src-tauri package.version.workspace",
+        &["package", "version", "workspace"],
+    )
+    .as_bool()
+    .unwrap_or_else(|| {
+        panic!("A16: src-tauri/Cargo.toml must declare package.version.workspace as a boolean")
+    });
+    assert!(
+        version_workspace,
+        "A16: src-tauri/Cargo.toml must declare version.workspace = true"
+    );
+}
+
+#[test]
+fn assertion_a17_agents_release_process_documented() {
+    let agents_path = path_from_test_file("../../AGENTS.md");
+    assert!(
+        agents_path.exists(),
+        "A17: AGENTS.md must exist at {}",
+        agents_path.display()
+    );
+    let body = fs::read_to_string(&agents_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", agents_path.display()));
+    assert!(
+        body.lines().any(|line| line == "## Release Process"),
+        "A17: AGENTS.md must contain a top-level ## Release Process section"
+    );
+
+    let heading_offsets = body
+        .lines()
+        .scan(0, |offset, line| {
+            let line_start = *offset;
+            *offset += line.len() + 1;
+            Some((line_start, line))
+        })
+        .collect::<Vec<_>>();
+    let release_heading = heading_offsets
+        .iter()
+        .find_map(|(line_start, line)| (*line == "## Release Process").then_some(*line_start))
+        .unwrap_or_else(|| {
+            panic!("A17: AGENTS.md must contain a top-level ## Release Process section heading")
+        });
+    let release_section_end = body[release_heading..]
+        .lines()
+        .scan(release_heading, |offset, line| {
+            let line_start = *offset;
+            *offset += line.len() + 1;
+            Some((line_start, line))
+        })
+        .skip(1)
+        .find_map(|(line_start, line)| line.starts_with("## ").then_some(line_start))
+        .unwrap_or(body.len());
+    let release_section = &body[release_heading..release_section_end];
+
+    for needle in [
+        "workflow_dispatch",
+        "vX.Y.Z",
+        "[workspace.package].version",
+        "oulipoly-agent-runner",
+        "agent-store",
+        "agent-scratchpad",
+        "agent-messenger",
+    ] {
+        assert!(
+            release_section.contains(needle),
+            "A17: AGENTS.md Release Process section must contain {needle:?}"
+        );
+    }
 }
