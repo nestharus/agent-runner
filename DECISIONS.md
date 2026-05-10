@@ -1085,45 +1085,6 @@ The four discoveries are listed here so a later consolidation WU can pick them u
   - `cargo fmt --check` ok, `cargo clippy --workspace -- -D warnings` ok,
     `cargo test --workspace` 133 test groups all passed against the new build.
 
-## 2026-05-10 — AGE-54 Phase 7 worktree cli.rs WT mod stashed (operational, out-of-scope for AGE-54 PR)
-
-- **Phase**: Phase 7 (CodeRabbit pre-pass sanity).
-- **Decision**: Stash the uncommitted `crates/oulipoly-runtime/src/executor/cli.rs`
-  modification (`WATCHDOG_NO_PROGRESS_SECS = u64::MAX` instead of HEAD's `600`)
-  for the duration of the Phase 7 → Phase 9 pipeline run. Stash entry is
-  `stash@{0}: operational: cli.rs watchdog disabled (out-of-scope for AGE-54 PR;
-  orchestrator pipeline run)`. Pop the stash at Final after the AGE-54 PR has
-  been opened (and merged if `auto_merge_after_phase_9=true` succeeds).
-- **Rationale**: The uncommitted change disables the watchdog operationally
-  to let long orchestrator dispatches run without being killed. The currently
-  installed `~/.local/bin/agents` (sha256 `1ee4c41...`) was built from this
-  modified source, so the orchestrator's runtime behavior is unaffected by
-  stashing the WT change.
-  AGE-54's contract (`contracts/age-54-state-db-corruption-rca.md` § In-scope code surface)
-  says cli.rs must "Restore watchdog/timeout hang handling. (Per `cc2ae3d`
-  ~370 line diff.)" — restoring cc2ae3d's `600s` value, not disabling. The
-  committed `99cca5c` already has the contracted `600s` value. The
-  uncommitted `u64::MAX` change is therefore out-of-scope for the AGE-54 PR.
-  CodeRabbit's pre-pass sanity check correctly returned `NEEDS_INPUT` on the
-  dirty tree because (a) starting CodeRabbit on a dirty WT would corrupt the
-  diff CodeRabbit reviews against `main`, and (b) any amend pass would leak
-  the WT change into the AGE-54 commit.
-- **Anti-scope reconciliation**: Dispatch's "Do NOT undo any worktree edits
-  from prior orchestrator passes" anti-scope is read as protecting AGE-54
-  product-code work (the AGE-53 surface restoration etc). Stashing preserves
-  the operational change without destroying it; pop at Final restores. The
-  binary already reflects the change at runtime.
-- **Aborted prior dispatch**: The stale
-  `.scratch/coderabbit/CODERABBIT_pass1.md` (228 bytes, "Tools completed",
-  no findings) is from a prior aborted CodeRabbit dispatch (May 10 00:09);
-  renamed to `.aborted-prior-dispatch` so this dispatch's pass 1 writes a
-  fresh file.
-- **Evidence**:
-  - `git stash list` → `stash@{0}: ... operational: cli.rs watchdog
-    disabled (out-of-scope for AGE-54 PR; orchestrator pipeline run)`.
-  - `git status` → working tree clean after stash.
-  - `git log --oneline main..HEAD` → still single commit `99cca5c`.
-
 ## 2026-05-10 — AGE-54 Phase 8 row-count mismatch test residual accepted
 
 - **Phase**: Phase 8 (PR-review test-audit gate, round 2).

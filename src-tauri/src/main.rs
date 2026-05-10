@@ -2028,19 +2028,12 @@ fn run_resume(
     }
 
     let success = result.exit_code == 0;
-    let error_category = if result.watchdog_terminated {
-        Some(
-            diagnostics::ErrorCategory::HungSubprocess
-                .as_str()
-                .to_string(),
-        )
-    } else if !success
+    let error_category = if !success
         && result.resume_acceptance.as_ref().is_some_and(|acceptance| {
             acceptance.evidence.as_deref().is_some_and(|evidence| {
                 evidence.contains(diagnostics::ErrorCategory::ResumeSessionMismatch.as_str())
             })
-        })
-    {
+        }) {
         Some(
             diagnostics::ErrorCategory::ResumeSessionMismatch
                 .as_str()
@@ -2265,13 +2258,7 @@ fn run_with_balancing(
 
     let success = result.exit_code == 0;
 
-    let error_category = if result.watchdog_terminated {
-        Some(
-            diagnostics::ErrorCategory::HungSubprocess
-                .as_str()
-                .to_string(),
-        )
-    } else if !success {
+    let error_category = if !success {
         run_diagnostics(
             agent_runtime_services,
             &result.stderr,

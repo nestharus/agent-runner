@@ -1459,7 +1459,6 @@ mod tests {
                     },
                     resume_acceptance: None::<ResumeAcceptanceResult>,
                     terminal_reason: None,
-                    watchdog_terminated: false,
                     captured_child_invocations: Vec::<CapturedChildInvocation>::new(),
                     returned_artifacts: Vec::new(),
                 })),

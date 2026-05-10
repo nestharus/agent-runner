@@ -19,7 +19,6 @@ pub struct ExecutionResult {
     pub session_capture: SessionCaptureResult,
     pub resume_acceptance: Option<ResumeAcceptanceResult>,
     pub terminal_reason: Option<String>,
-    pub watchdog_terminated: bool,
     pub captured_child_invocations: Vec<CapturedChildInvocation>,
     pub returned_artifacts: Vec<ReturnedArtifactRef>,
 }
