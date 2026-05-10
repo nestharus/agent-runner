@@ -3,6 +3,7 @@
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
+pub mod age_62_deployment_fixtures;
 pub mod failing_migration;
 pub mod future_db;
 pub mod invocation_shapes;

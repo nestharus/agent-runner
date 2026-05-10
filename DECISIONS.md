@@ -1235,3 +1235,102 @@ The four discoveries are listed here so a later consolidation WU can pick them u
     (round 1 HIGH, 39 findings — preserved).
   - `planning/age-61-row-version-migration/audit-history.md` (round-1/round-2 entries).
   - NEEDS_INPUT question + answer artifacts cited above.
+
+## D-AGE-62-Phase-6 — accept code-quality A1 residual HIGH on the deployment substrate
+
+- **Phase**: Phase 6 (per-component code-quality fanout, post-Step-6c, after
+  three refactor passes).
+- **Decision**: ACCEPT the aggregate code-quality `HIGH` verdict at
+  `planning/age-62-deployment-routing-metadata/code-quality/age-62-deployment/aggregate-code-quality.md`
+  as a documented residual scoped to the AGE-62 deployment substrate, and
+  advance to Phase 7 CodeRabbit + Phase 8 PR-review gates without further
+  refactor passes. Same disposition shape as the precedent Phase-4 / Phase-6
+  A1-residual decisions on AGE-58 (`D-AGE-58-Phase-4`) and AGE-61
+  (`D-AGE-61-Phase-6`).
+- **Scope of residual** (override is intentionally narrow):
+  - `crates/oulipoly-state/src/deployment/paths/` — orchestrate + validate +
+    map by domain; the resolver pure-function bundle, the trigger predicates,
+    and the validators/mapper helpers each touch two A1 classifications by
+    construction (predicate + value-construction; orchestrate + accessor).
+  - `crates/oulipoly-state/src/deployment/routing.rs` — decide + describe +
+    look up; the `DeploymentAwareOpener` adapter bridges resolver-owned and
+    metadata-store-owned vocabularies. The `routing → resolver` pair is the
+    HIGH coupling edge (7 distinct resolver-owned symbols/methods/fields);
+    reducing the count below 6 would require duplicating the resolver value
+    types into routing or introducing a third "abstract" layer that adds no
+    behavior.
+  - `crates/oulipoly-state/src/deployment/metadata/{schema,store/*}.rs` —
+    namespace re-export + accessor patterns the Rust visibility model
+    requires; sub-component splits (`api`/`queries`/`rows`/`filters`/
+    `serde_helpers`/`error`/`parsers`/`formatters`) yield the round-3
+    increase in flagged components without lowering aggregate severity.
+- **Trajectory evidence** (refactor passes are diminishing-then-inverted):
+  - Round 1 (post-Step-6c, baseline): 18 blocking HIGH.
+  - Round 2 (after coupling refactor: extract `paths/store_backed_routing.rs`
+    + value-type split): 8 blocking HIGH.
+  - Round 3 (after function-classification + cohesion refactor: split
+    `paths/{trigger_cases,trigger_decisions,resolver_validators}.rs`,
+    `metadata/store/{api,queries,rows,filters,serde_helpers/...}.rs`, and
+    namespace-reexport reduction): 23 blocking HIGH — finer splits created
+    more components each with minor multi-classification HIGH.
+  - The strict A1 metric (cohesion = 1 classification per component;
+    function-classification = 1 classification per function) scales
+    adversarially with component count on idiomatic-Rust orchestrate-
+    accessor-validator-mapper substrates.
+- **Why not split AGE-62 further** (Tier-2 was considered and declined per
+  option D in `q-ba21d4a4-4516-44fb-885d-2a587606d524`): a per-classification
+  split would require 5+ new tickets, defer the consumer chain
+  (AGE-63..AGE-67) by the same number of cycles, and would not improve the
+  outcome — each per-classification sub-WU would itself need accessor /
+  mapper / validator helpers that re-create the same multi-classification
+  shape one indirection layer down.
+- **Why not revise the convention first** (option C declined): convention
+  revision is its own meta-WU and blocks the dependent consumer chain. The
+  precedent (AGE-58 Phase 4, AGE-61 Phase 6) already establishes that
+  intrinsic A1 surfaces are accepted as residual when remediation produces
+  inverted returns; D-AGE-62-Phase-6 inherits that precedent rather than
+  defining a new one.
+- **Rationale**:
+  - The substrate is correctly implemented and tested. `cargo fmt`,
+    `cargo clippy --workspace -- -D warnings`, and `cargo test -p oulipoly-state`
+    all pass on the worktree branch (verified at the close of Step 6c, after
+    refactor pass 3, and again at Phase 6 closure preconditions check).
+  - Phase 6 alignment review reached `ALIGNED` (round 3, after the TI-05
+    contract amendment + TI-11 SELECT-against-real-opener test addition).
+  - Phase 6 prototype risk review and Phase 6 swap-record gate are both
+    explicitly `non-applicable` (no prototype phase ran for this substrate).
+  - Phase 6 halt-state transition is valid
+    (`planning/age-62-deployment-routing-metadata/risk/age-62-halt-record.md`)
+    with all five `halt_basis` options unsatisfied; the coupling auditor's
+    HIGH verdict on `routing → resolver` is a count-metric verdict, not a
+    `merge_components` / `introduce_abstraction_component` / split-or-revise
+    structural verdict — i.e. there is no auditor verdict-conflict to
+    overrule, only a residual count threshold the override accepts.
+  - Phase 7 CodeRabbit and Phase 8 multi-concern + scope + supported-surface
+    + commit-hygiene + test-audit gates remain the third-party + structural
+    review surfaces; option A does not bypass them. CodeRabbit may surface
+    additional structural concerns; if so, those are remediated normally.
+- **Closure trigger** (when the residual is revisited):
+  - When AGE-65 (write-path cascade) lands the call-site routing through
+    `DeploymentAwareOpener::open_default`, the resolver value-vocabulary
+    leakage into routing may be reducible by exposing only `&Path` from the
+    routing port and keeping `ResolvedStateDb` / `DbRole` resolver-internal.
+    That refactor is downstream of AGE-62 and inside the AGE-65 contract.
+  - If a future code-quality convention revision establishes substrate-
+    specific A1 thresholds, re-audit the substrate against the revised
+    thresholds.
+- **Evidence**:
+  - Question + answer artifacts:
+    `planning/age-62-deployment-routing-metadata/.scratch/questions/q-ba21d4a4-4516-44fb-885d-2a587606d524.question.json`
+    + `q-ba21d4a4-4516-44fb-885d-2a587606d524.answer.json`.
+  - Aggregate code-quality (round 3, blocking HIGH):
+    `planning/age-62-deployment-routing-metadata/code-quality/age-62-deployment/aggregate-code-quality.md`.
+  - Per-auditor reports (function-classification, cohesion, coupling,
+    push-pull):
+    `planning/age-62-deployment-routing-metadata/code-quality/age-62-deployment/reports/`.
+  - Audit history rounds 7-8:
+    `planning/age-62-deployment-routing-metadata/audit-history.md`.
+  - Phase 6 halt record:
+    `planning/age-62-deployment-routing-metadata/risk/age-62-halt-record.md`.
+  - Coupling adjudication (HIGH on routing → resolver):
+    `planning/age-62-deployment-routing-metadata/risk/age-62-coupling.md`.

@@ -106,7 +106,7 @@ fn partial_schema5_session_tables_are_recreated_with_lookup_indexes() {
         "idx_segments_chain_active",
     ] {
         assert!(
-            index_names(&conn).contains(&index.to_string()),
+            index_names(&conn).contains(index),
             "missing recreated index {index}"
         );
     }
