@@ -5,21 +5,18 @@ use oulipoly_config::{
 use oulipoly_state::CompositeInvocationId;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::io::{Read, Write};
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::Child;
 use std::process::{Command, ExitStatus, Stdio};
 #[cfg(unix)]
-use std::sync::{Arc, atomic::AtomicBool};
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    mpsc,
+    Arc,
+    atomic::{AtomicBool, Ordering},
 };
+#[cfg(unix)]
 use std::thread;
-use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
@@ -32,22 +29,6 @@ use super::{
 };
 
 const LARGE_PROMPT_THRESHOLD: usize = 100 * 1024; // 100KB
-const WATCHDOG_NO_PROGRESS_SECS: u64 = 600;
-const WATCHDOG_STDERR_TAIL_BYTES: usize = 8192;
-
-static WATCHDOG_NO_PROGRESS_OVERRIDE_SECS: AtomicU64 = AtomicU64::new(0);
-
-fn watchdog_no_progress_secs() -> u64 {
-    match WATCHDOG_NO_PROGRESS_OVERRIDE_SECS.load(Ordering::SeqCst) {
-        0 => WATCHDOG_NO_PROGRESS_SECS,
-        value => value,
-    }
-}
-
-#[cfg(test)]
-fn set_watchdog_no_progress_secs_for_tests(secs: u64) {
-    WATCHDOG_NO_PROGRESS_OVERRIDE_SECS.store(secs, Ordering::SeqCst);
-}
 
 pub fn execute(
     model: &ModelConfig,
@@ -88,7 +69,6 @@ pub fn execute(
         session_capture: result.session_capture,
         resume_acceptance: None,
         terminal_reason: result.terminal_reason,
-        watchdog_terminated: result.watchdog_terminated,
         captured_child_invocations: result.captured_child_invocations,
         returned_artifacts: result.returned_artifacts,
     })
@@ -135,7 +115,6 @@ pub fn execute_effective_with_start_known_provider_session_id(
         session_capture: result.session_capture,
         resume_acceptance: None,
         terminal_reason: result.terminal_reason,
-        watchdog_terminated: result.watchdog_terminated,
         captured_child_invocations: result.captured_child_invocations,
         returned_artifacts: result.returned_artifacts,
     })
@@ -310,7 +289,6 @@ struct RawResult {
     exit_code: i32,
     session_capture: SessionCaptureResult,
     terminal_reason: Option<String>,
-    watchdog_terminated: bool,
     captured_child_invocations: Vec<CapturedChildInvocation>,
     returned_artifacts: Vec<ReturnedArtifactRef>,
 }
@@ -569,7 +547,6 @@ fn execute_provider_with_args(
 
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    configure_watchdog_process_group(&mut cmd);
 
     let mut child = cmd
         .spawn()
@@ -583,7 +560,9 @@ fn execute_provider_with_args(
             .map_err(|e| format!("Failed to write to stdin: {e}"))?;
     }
 
-    let output = supervised_wait_with_output(child)?;
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("Failed to wait for process: {e}"))?;
 
     let returned_artifacts = return_channel
         .as_ref()
@@ -601,153 +580,13 @@ fn execute_provider_with_args(
         telemetry_stdout: output.stdout.clone(),
         captured_child_invocations: captured_child_invocations_from_stderr(&stderr),
         stderr,
-        exit_code: if output.watchdog_terminated {
-            -1
-        } else {
-            exit_code_from_status(&output.status)
-        },
-        terminal_reason: if output.watchdog_terminated {
-            Some("watchdog_no_progress_timeout".to_string())
-        } else {
-            classify_terminal_reason(&output.status)
-        },
-        watchdog_terminated: output.watchdog_terminated,
+        exit_code: exit_code_from_status(&output.status),
+        terminal_reason: classify_terminal_reason(&output.status),
         session_capture: capture_outcome,
         returned_artifacts,
     };
 
     Ok((result, temp_files))
-}
-
-struct SupervisedOutput {
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    status: ExitStatus,
-    watchdog_terminated: bool,
-}
-
-fn supervised_wait_with_output(mut child: std::process::Child) -> Result<SupervisedOutput, String> {
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "child stdout was not piped".to_string())?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "child stderr was not piped".to_string())?;
-    let (progress_tx, progress_rx) = mpsc::channel::<()>();
-    let stdout_thread = spawn_output_drain(stdout, progress_tx.clone());
-    let stderr_thread = spawn_output_drain(stderr, progress_tx);
-    let threshold = Duration::from_secs(watchdog_no_progress_secs());
-    let mut last_progress_at = Instant::now();
-    let mut watchdog_terminated = false;
-
-    let status = loop {
-        while progress_rx.try_recv().is_ok() {
-            last_progress_at = Instant::now();
-        }
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|e| format!("Failed to poll process: {e}"))?
-        {
-            break status;
-        }
-        if last_progress_at.elapsed() > threshold {
-            watchdog_terminated = true;
-            terminate_watchdog_child(&mut child);
-            let status = child
-                .wait()
-                .map_err(|e| format!("Failed to wait for watchdog-killed process: {e}"))?;
-            break status;
-        }
-        thread::sleep(Duration::from_millis(200));
-    };
-
-    drop(progress_rx);
-    let stdout = stdout_thread
-        .join()
-        .map_err(|_| "stdout drain thread panicked".to_string())??;
-    let mut stderr = stderr_thread
-        .join()
-        .map_err(|_| "stderr drain thread panicked".to_string())??;
-
-    if watchdog_terminated {
-        let tail_start = stderr.len().saturating_sub(WATCHDOG_STDERR_TAIL_BYTES);
-        let tail = String::from_utf8_lossy(&stderr[tail_start..]);
-        let line = format!(
-            "\n[runner] killed by watchdog after {}s no-progress (no-progress threshold = {}s); stderr tail = {tail}\n",
-            threshold.as_secs(),
-            threshold.as_secs()
-        );
-        stderr.extend_from_slice(line.as_bytes());
-    }
-
-    Ok(SupervisedOutput {
-        stdout,
-        stderr,
-        status,
-        watchdog_terminated,
-    })
-}
-
-#[cfg(unix)]
-fn configure_watchdog_process_group(cmd: &mut Command) {
-    // SAFETY: `pre_exec` runs in the child after fork and before exec. `setpgid`
-    // is async-signal-safe and only changes the child process group so watchdog
-    // termination can include shell-spawned descendants that inherit stdio.
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setpgid(0, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-}
-
-#[cfg(not(unix))]
-fn configure_watchdog_process_group(_cmd: &mut Command) {}
-
-#[cfg(unix)]
-fn terminate_watchdog_child(child: &mut std::process::Child) {
-    let pgid = -(child.id() as i32);
-    // SAFETY: Sending a signal to a negative pid targets the process group whose
-    // id is `child.id()`, created by `configure_watchdog_process_group`.
-    unsafe {
-        libc::kill(pgid, libc::SIGTERM);
-    }
-    thread::sleep(Duration::from_millis(100));
-    // SAFETY: Same process-group signal target as above; SIGKILL is a fallback
-    // after a short grace period so inherited pipes are closed promptly.
-    unsafe {
-        libc::kill(pgid, libc::SIGKILL);
-    }
-}
-
-#[cfg(not(unix))]
-fn terminate_watchdog_child(child: &mut std::process::Child) {
-    let _ = child.kill();
-}
-
-fn spawn_output_drain<R: Read + Send + 'static>(
-    mut reader: R,
-    progress_tx: mpsc::Sender<()>,
-) -> thread::JoinHandle<Result<Vec<u8>, String>> {
-    thread::spawn(move || {
-        let mut output = Vec::new();
-        let mut buffer = [0u8; 8192];
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(n) => {
-                    output.extend_from_slice(&buffer[..n]);
-                    let _ = progress_tx.send(());
-                }
-                Err(err) => return Err(format!("Failed to drain child output: {err}")),
-            }
-        }
-        Ok(output)
-    })
 }
 
 pub fn execute_resume(
@@ -794,7 +633,6 @@ pub fn execute_resume(
         },
         resume_acceptance: Some(resume_acceptance),
         terminal_reason: result.terminal_reason,
-        watchdog_terminated: result.watchdog_terminated,
         captured_child_invocations: result.captured_child_invocations,
         returned_artifacts: result.returned_artifacts,
     })
@@ -2414,61 +2252,6 @@ printf '{{"type":"system","subtype":"init","session_id":"%s"}}\n' "$requested""#
             .and_then(|idx| argv_lines.get(idx + 1))
             .expect("--session-id value must be present on argv");
         assert_eq!(*injected_id, pinned_id);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    // AGE-53 Phase 6c unblocks this with a test-time no-progress timeout override for the supervised one-shot executor.
-    fn watchdog_kills_no_progress_child() {
-        set_watchdog_no_progress_secs_for_tests(1);
-        let script = fixture_script("sleep 999\n");
-        let model = ModelConfig {
-            name: "watchdog-test".to_string(),
-            prompt_mode: PromptMode::Arg,
-            providers: vec![ProviderConfig {
-                name: "watchdog-fixture".to_string(),
-                command: script.path.to_string_lossy().into_owned(),
-                args: vec![],
-                interactive_args: None,
-                resume: None,
-                session_capture: None,
-                resume_acceptance: None,
-                session_storage: None,
-            }],
-            inputs: vec![],
-        };
-
-        let result = execute(&model, 0, "hello", None, &HashMap::new(), None).unwrap();
-        set_watchdog_no_progress_secs_for_tests(0);
-
-        assert!(result.watchdog_terminated);
-        assert_eq!(
-            result.terminal_reason.as_deref(),
-            Some("watchdog_no_progress_timeout")
-        );
-        assert_ne!(result.exit_code, 0);
-        assert!(result.stderr.contains("killed by watchdog"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn watchdog_not_interactive() {
-        let script = fixture_script("sleep 1\nexit 0");
-        let provider = ProviderConfig {
-            name: "interactive-fixture".to_string(),
-            command: script.path.to_string_lossy().into_owned(),
-            args: vec![],
-            interactive_args: Some(vec![]),
-            resume: None,
-            session_capture: None,
-            resume_acceptance: None,
-            session_storage: None,
-        };
-
-        let result = execute_interactive_with_result(&provider, None, None, None).unwrap();
-
-        assert_eq!(result.exit_code, 0);
-        assert_eq!(result.terminal_reason, None);
     }
 
     #[cfg(unix)]

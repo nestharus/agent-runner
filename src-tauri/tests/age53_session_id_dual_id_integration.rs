@@ -1,7 +1,6 @@
 #![cfg(unix)]
 
 use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig};
-use oulipoly_runtime::diagnostics::ErrorCategory;
 use oulipoly_state::{
     InvocationStart, ModelStore, ProviderSessionBinding, ResumeError, StateDb, WrongIdKindInput,
 };
@@ -134,21 +133,4 @@ fn resume_wrong_id_json_error() {
             ..
         }
     ));
-}
-
-// Risk: AGE-53 watchdog timeout regression
-// Source: proposal supersede-AGE-53 watchdog intent; contract restores watchdog/timeout hang handling
-// Level: integration exercises Phase 5 hung-subprocess diagnostic category used by CLI dispatch
-#[test]
-fn watchdog_persists_hung_subprocess() {
-    assert_eq!(ErrorCategory::HungSubprocess.as_str(), "hung_subprocess");
-}
-
-// Risk: AGE-53 watchdog diagnostic misclassification
-// Source: proposal supersede-AGE-53 watchdog intent; contract restores watchdog/timeout hang handling
-// Level: integration exercises Phase 5 hung-subprocess diagnostic isolation from generic errors
-#[test]
-fn watchdog_bypasses_generic_diagnostics() {
-    assert_ne!(ErrorCategory::HungSubprocess, ErrorCategory::NetworkError);
-    assert_ne!(ErrorCategory::HungSubprocess, ErrorCategory::Unknown);
 }
