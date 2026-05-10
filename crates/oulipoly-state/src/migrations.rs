@@ -10,18 +10,29 @@ pub struct Migration {
     pub target_version: i32,
     pub id: &'static str,
     pub sql: &'static str,
+    pub post_sql_hook: Option<PostSqlHook>,
 }
+
+pub type PostSqlHook = fn(&Connection) -> Result<(), rusqlite::Error>;
 
 static MIGRATIONS: &[Migration] = &[
     Migration {
         target_version: 4,
         id: "0004_state_db_schema_boundary",
         sql: include_str!("../migrations/0004_state_db_schema_boundary.sql"),
+        post_sql_hook: None,
     },
     Migration {
         target_version: 5,
         id: "0005_invocation_dual_session_ids",
         sql: include_str!("../migrations/0005_invocation_dual_session_ids.sql"),
+        post_sql_hook: None,
+    },
+    Migration {
+        target_version: 6,
+        id: "0006_age_58_dual_write_row_versions",
+        sql: include_str!("../migrations/0006_age_58_dual_write_row_versions.sql"),
+        post_sql_hook: Some(crate::deployment::row_version::migrate_v6::apply_v6_row_version),
     },
 ];
 
@@ -51,7 +62,7 @@ pub(crate) fn run(conn: &mut Connection, plan: &[&Migration]) -> Result<(), Migr
     run_with_db_path(conn, plan, PathBuf::from("<memory>"))
 }
 
-pub(crate) fn run_with_db_path(
+pub fn run_with_db_path(
     conn: &mut Connection,
     plan: &[&Migration],
     db_path: PathBuf,
@@ -73,6 +84,9 @@ fn run_step(conn: &mut Connection, migration: &Migration) -> Result<(), rusqlite
     conn.execute_batch("BEGIN IMMEDIATE;")?;
     let result = conn.execute_batch(migration.sql).and_then(|_| {
         conn.pragma_update(None, "user_version", migration.target_version)?;
+        if let Some(post_sql_hook) = migration.post_sql_hook {
+            post_sql_hook(conn)?;
+        }
         conn.execute_batch("COMMIT;")
     });
     if result.is_err() {
@@ -145,6 +159,6 @@ impl std::error::Error for MigrationError {
     }
 }
 
-pub(crate) fn current_plan_from(stored: i32) -> Result<Vec<&'static Migration>, MigrationError> {
+pub fn current_plan_from(stored: i32) -> Result<Vec<&'static Migration>, MigrationError> {
     plan(stored, CURRENT_SCHEMA_VERSION)
 }

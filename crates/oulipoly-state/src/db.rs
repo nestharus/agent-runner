@@ -825,6 +825,7 @@ impl StateDb {
         if columns.is_empty() {
             conn.execute_batch(Self::invocations_schema_sql())
                 .map_err(|e| format!("Failed to initialize invocations schema: {e}"))?;
+            Self::ensure_invocations_row_version_support(conn)?;
             return Ok(());
         }
 
@@ -889,6 +890,7 @@ impl StateDb {
             }
             conn.execute_batch(Self::invocations_index_sql())
                 .map_err(|e| format!("Failed to ensure invocation indexes: {e}"))?;
+            Self::ensure_invocations_row_version_support(conn)?;
             return Ok(());
         }
 
@@ -901,10 +903,18 @@ impl StateDb {
         ))
     }
 
-    fn legacy_invocations_shape_is_pre_uuid(columns: &[String]) -> bool {
-        let mut names = columns.to_vec();
+    fn normalize_invocations_columns_excluding_maintenance(columns: &[String]) -> Vec<String> {
+        let mut names = columns
+            .iter()
+            .filter(|column| column.as_str() != "row_version")
+            .cloned()
+            .collect::<Vec<_>>();
         names.sort();
         names
+    }
+
+    fn legacy_invocations_shape_is_pre_uuid(columns: &[String]) -> bool {
+        Self::normalize_invocations_columns_excluding_maintenance(columns)
             == [
                 "created_at",
                 "error_category",
@@ -914,6 +924,27 @@ impl StateDb {
                 "provider_index",
                 "success",
             ]
+    }
+
+    fn ensure_invocations_row_version_support(conn: &Connection) -> Result<(), String> {
+        let columns = Self::invocations_columns(conn)?;
+        if !columns.iter().any(|column| column == "row_version") {
+            conn.execute(
+                "ALTER TABLE invocations ADD COLUMN row_version INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| format!("Failed to add invocations.row_version during repair: {e}"))?;
+        }
+        let registration = crate::deployment::row_version::registry::lookup("invocations")
+            .ok_or_else(|| {
+                "Missing row-version registry entry for invocations during repair".to_string()
+            })?;
+        conn.execute_batch(
+            &crate::deployment::row_version::triggers_sql::generate_triggers_for_table(
+                registration,
+            ),
+        )
+        .map_err(|e| format!("Failed to install invocation row-version triggers: {e}"))
     }
 
     fn invocations_columns(conn: &Connection) -> Result<Vec<String>, String> {
@@ -1181,7 +1212,7 @@ impl StateDb {
     }
 
     fn providers_shape_is_post_fix(columns: &[ProviderColumn]) -> bool {
-        Self::columns_match(
+        Self::columns_match_allowing_row_version(
             columns,
             &[
                 ("model_name", "TEXT", 1, 1),
@@ -1196,7 +1227,7 @@ impl StateDb {
     }
 
     fn providers_shape_is_pre_fix(columns: &[ProviderColumn]) -> bool {
-        Self::columns_match(
+        Self::columns_match_allowing_row_version(
             columns,
             &[
                 ("model_name", "TEXT", 1, 1),
@@ -1210,16 +1241,42 @@ impl StateDb {
         )
     }
 
+    fn columns_match_allowing_row_version(
+        columns: &[ProviderColumn],
+        expected: &[(&str, &str, i64, i64)],
+    ) -> bool {
+        Self::columns_match(columns, expected)
+            || columns.len() == expected.len() + 1
+                && Self::columns_match(&columns[..expected.len()], expected)
+                && Self::column_matches(&columns[expected.len()], "row_version", "INTEGER", 1, 0)
+    }
+
     fn columns_match(columns: &[ProviderColumn], expected: &[(&str, &str, i64, i64)]) -> bool {
         columns.len() == expected.len()
             && columns.iter().zip(expected.iter()).all(
                 |(column, (expected_name, expected_type, expected_notnull, expected_pk))| {
-                    column.name == *expected_name
-                        && column.data_type.eq_ignore_ascii_case(expected_type)
-                        && column.notnull == *expected_notnull
-                        && column.pk == *expected_pk
+                    Self::column_matches(
+                        column,
+                        expected_name,
+                        expected_type,
+                        *expected_notnull,
+                        *expected_pk,
+                    )
                 },
             )
+    }
+
+    fn column_matches(
+        column: &ProviderColumn,
+        expected_name: &str,
+        expected_type: &str,
+        expected_notnull: i64,
+        expected_pk: i64,
+    ) -> bool {
+        column.name == expected_name
+            && column.data_type.eq_ignore_ascii_case(expected_type)
+            && column.notnull == expected_notnull
+            && column.pk == expected_pk
     }
 
     fn describe_columns(columns: &[ProviderColumn]) -> String {
@@ -1448,7 +1505,8 @@ impl StateDb {
             resume_acceptance_status TEXT,
             resume_acceptance_evidence TEXT,
             created_at TEXT NOT NULL,
-            finished_at TEXT
+            finished_at TEXT,
+            row_version INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE INDEX IF NOT EXISTS idx_invocations_uuid
@@ -1563,7 +1621,8 @@ impl StateDb {
                 resume_acceptance_status TEXT,
                 resume_acceptance_evidence TEXT,
                 created_at TEXT NOT NULL,
-                finished_at TEXT
+                finished_at TEXT,
+                row_version INTEGER NOT NULL DEFAULT 0
             );",
         )
         .map_err(|e| format!("Failed to create migrated invocations table: {e}"))?;
@@ -1638,6 +1697,7 @@ impl StateDb {
 
         tx.execute_batch(Self::invocations_index_sql())
             .map_err(|e| format!("Failed to create migrated invocation indexes: {e}"))?;
+        Self::ensure_invocations_row_version_support(&tx)?;
 
         tx.commit()
             .map_err(|e| format!("Failed to commit invocation migration: {e}"))
@@ -4089,7 +4149,8 @@ mod tests {
                 resume_acceptance_status TEXT,
                 resume_acceptance_evidence TEXT,
                 created_at TEXT NOT NULL,
-                finished_at TEXT
+                finished_at TEXT,
+                row_version INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS provider_quotas (
                 provider_name TEXT PRIMARY KEY,
@@ -8874,6 +8935,7 @@ interactive_args = ["launch"]
             target_version,
             id,
             sql,
+            post_sql_hook: None,
         };
 
         let temp = TempDir::new().unwrap();

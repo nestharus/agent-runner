@@ -2,7 +2,7 @@ use crate::StateDbError;
 use rusqlite::Connection;
 use std::collections::BTreeSet;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 5;
+pub const CURRENT_SCHEMA_VERSION: i32 = 6;
 pub const MINIMUM_SUPPORTED_SCHEMA_VERSION: i32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
