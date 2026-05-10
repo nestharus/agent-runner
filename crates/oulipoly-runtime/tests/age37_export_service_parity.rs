@@ -199,6 +199,13 @@ fn prepared_export() -> (ExportFixture, PathBuf) {
     (fixture, transcript)
 }
 
+fn invocation_count(path: &Path) -> i64 {
+    let db = StateDb::open(path).unwrap();
+    db.connection()
+        .query_row("SELECT COUNT(*) FROM invocations", [], |row| row.get(0))
+        .unwrap()
+}
+
 #[test]
 fn export_service_returns_canonical_bytes_matching_direct_path() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
@@ -220,6 +227,24 @@ fn export_service_returns_canonical_bytes_matching_direct_path() {
         .unwrap();
 
     assert_eq!(output.result.unwrap(), direct);
+}
+
+#[test]
+fn export_service_preserves_invocation_count() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let (fixture, _transcript) = prepared_export();
+    let state_path = fixture.data_root.join("state.db");
+    let before = invocation_count(&state_path);
+    let service = ProductionSessionExportService::default();
+
+    let output = service
+        .export_session(SessionExportServiceRequest {
+            session_id: SESSION_A.to_string(),
+        })
+        .unwrap();
+
+    assert!(output.result.is_ok());
+    assert_eq!(invocation_count(&state_path), before);
 }
 
 #[test]

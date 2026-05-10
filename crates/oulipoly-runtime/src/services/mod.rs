@@ -178,7 +178,7 @@ pub enum SessionLockFailure {
 }
 
 #[derive(Debug)]
-#[expect(
+#[allow(
     clippy::large_enum_variant,
     reason = "AGE-34 DTO contract pins unboxed ModelConfig and ProviderConfig fields"
 )]
@@ -200,6 +200,17 @@ pub enum ExecutorServiceRequest {
         working_dir: Option<PathBuf>,
         extra_inputs: HashMap<String, Vec<String>>,
         parent_invocation_env: Option<String>,
+    },
+    EffectiveWithStartKnownProviderSessionId {
+        model: ModelConfig,
+        provider: ProviderConfig,
+        provider_index: usize,
+        prompt_mode: PromptMode,
+        prompt: String,
+        working_dir: Option<PathBuf>,
+        extra_inputs: HashMap<String, Vec<String>>,
+        parent_invocation_env: Option<String>,
+        start_known_provider_session_id: String,
     },
 }
 
@@ -667,7 +678,32 @@ impl SessionLifecycleServicePort for ProductionSessionLifecycleService {
 
         match mode {
             SessionLifecycleIngestMode::Unpinned { capture_method } => {
-                if let Some(session_id) = matched_session_id {
+                if let Some(session_id) = invocation.provider_session_id.as_deref() {
+                    if matched_session_id
+                        .as_deref()
+                        .is_some_and(|matched| matched != session_id)
+                    {
+                        writeln!(
+                            stderr,
+                            "Warning: post-run session inference found {matched:?}, preserving start-bound provider_session_id {session_id}",
+                            matched = matched_session_id.as_deref()
+                        )
+                        .map_err(|err| ServiceError::Dependency {
+                            message: format!("Failed to write session ingest warning: {err}"),
+                        })?;
+                    }
+                    emit_known_session_id_for_service(
+                        state,
+                        stderr,
+                        invocation_row_id,
+                        invocation_uuid,
+                        session_id,
+                        invocation
+                            .provider_session_capture_method
+                            .as_deref()
+                            .unwrap_or(&capture_method),
+                    )
+                } else if let Some(session_id) = matched_session_id {
                     emit_known_session_id_for_service(
                         state,
                         stderr,
@@ -930,18 +966,50 @@ fn emit_known_session_id_for_service(
             session_id: None,
         });
     }
-    if let Err(err) = state.mint_chain_for_invocation_session(invocation_row_id) {
+    let record = state.get_invocation_by_uuid(invocation_uuid).ok().flatten();
+    let should_mint_chain = record
+        .as_ref()
+        .is_none_or(|row| row.resume_input_id.as_deref() != row.provider_session_id.as_deref());
+    if should_mint_chain
+        && let Err(err) = state.mint_chain_for_invocation_session(invocation_row_id)
+    {
         writeln!(stderr, "Warning: Failed to mint session chain: {err}").map_err(|err| {
             ServiceError::Dependency {
                 message: format!("Failed to write session ingest warning: {err}"),
             }
         })?;
     }
-    let payload = serde_json::json!({
-        "id": invocation_uuid,
-        "session_id": session_id,
+    let provider_name = record.as_ref().and_then(|row| row.provider_name.clone());
+    let provider_session_id = record
+        .as_ref()
+        .and_then(|row| row.provider_session_id.clone())
+        .or_else(|| {
+            if capture_method == "resumed" {
+                None
+            } else {
+                Some(session_id.to_string())
+            }
+        });
+    let agent_runner_chain_id = provider_name.as_deref().and_then(|provider_name| {
+        provider_session_id
+            .as_deref()
+            .and_then(|provider_session_id| {
+                state
+                    .chain_id_for_segment(provider_name, provider_session_id)
+                    .ok()
+                    .flatten()
+            })
     });
-    writeln!(stderr, "OULIPOLY_SESSION={payload}").map_err(|err| ServiceError::Dependency {
+    let payload = oulipoly_state::SessionMarkerPayload {
+        agent_runner_invocation_id: invocation_uuid.to_string(),
+        provider_session_id: provider_session_id.clone(),
+        provider_name,
+        agent_runner_chain_id,
+        resume_input_id: record.as_ref().and_then(|row| row.resume_input_id.clone()),
+        legacy_id: invocation_uuid.to_string(),
+        legacy_session_id: Some(session_id.to_string()),
+    };
+    write!(stderr, "{}", payload.stderr_line()).map_err(|err| ServiceError::Dependency {
         message: format!("Failed to write session marker: {err}"),
     })?;
     Ok(SessionLifecycleOutput {

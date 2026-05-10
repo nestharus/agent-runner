@@ -182,6 +182,14 @@ fn wait_for_path(path: &Path) {
     panic!("timed out waiting for {}", path.display());
 }
 
+fn invocation_count(fixture: &Fixture) -> i64 {
+    fixture
+        .open_db()
+        .connection()
+        .query_row("SELECT COUNT(*) FROM invocations", [], |row| row.get(0))
+        .unwrap()
+}
+
 #[test]
 fn repl_happy_path_emits_single_invocation_line_and_finalizes_succeeded_row() {
     let fixture = Fixture::new();
@@ -215,6 +223,35 @@ exit 0"#,
         fs::read_to_string(&env_dump_path).unwrap(),
         serde_json::to_string(&invocation).unwrap()
     );
+}
+
+#[test]
+fn repl_preserves_existing_history_with_invocation_count_sentinel() {
+    let fixture = Fixture::new();
+    let existing_id = fixture
+        .open_db()
+        .start_invocation(&InvocationStart {
+            invocation_uuid: "bbbbbbbb-0000-4000-8000-000000000001".to_string(),
+            model_name: "fixture".to_string(),
+            provider_name: "fixture-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        })
+        .unwrap();
+    let before = invocation_count(&fixture);
+    let script = fixture.write_script("fixture-provider.sh", "exit 0");
+    fixture.write_model("fixture", "fixture-provider", &script);
+
+    let output = fixture.run_repl("fixture", None);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(invocation_count(&fixture), before + 1);
+    let db = fixture.open_db();
+    let existing = db
+        .get_invocation_by_uuid("bbbbbbbb-0000-4000-8000-000000000001")
+        .unwrap()
+        .unwrap();
+    assert_eq!(existing.id, existing_id);
 }
 
 #[test]

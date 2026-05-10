@@ -19,6 +19,7 @@ pub struct ExecutionResult {
     pub session_capture: SessionCaptureResult,
     pub resume_acceptance: Option<ResumeAcceptanceResult>,
     pub terminal_reason: Option<String>,
+    pub watchdog_terminated: bool,
     pub captured_child_invocations: Vec<CapturedChildInvocation>,
     pub returned_artifacts: Vec<ReturnedArtifactRef>,
 }
@@ -121,6 +122,29 @@ impl ExecutorServicePort for RuntimeExecutorService {
                 extra_inputs: &extra_inputs,
                 parent_invocation_env: parent_invocation_env.as_deref(),
             }),
+            ExecutorServiceRequest::EffectiveWithStartKnownProviderSessionId {
+                model,
+                provider,
+                provider_index,
+                prompt_mode,
+                prompt,
+                working_dir,
+                extra_inputs,
+                parent_invocation_env,
+                start_known_provider_session_id,
+            } => cli::execute_effective_with_start_known_provider_session_id(
+                cli::EffectiveExecuteRequest {
+                    model: &model,
+                    provider: &provider,
+                    provider_index,
+                    prompt_mode,
+                    prompt: &prompt,
+                    working_dir: working_dir.as_deref(),
+                    extra_inputs: &extra_inputs,
+                    parent_invocation_env: parent_invocation_env.as_deref(),
+                },
+                Some(&start_known_provider_session_id),
+            ),
         }
         .map_err(|message| ServiceError::Dependency { message })?;
 

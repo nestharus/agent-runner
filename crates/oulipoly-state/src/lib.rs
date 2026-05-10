@@ -15,7 +15,10 @@ pub use db::SessionTurnCounts;
 pub use db::SessionTurnIngest;
 pub use db::StateDb;
 pub use db::{AccountRecord, AuthMethod, AuthStatus, CliProviderRecord};
-pub use db::{BackfillReport, ChainPreview, ModelStore, ResolvedResume, ResumeError, TurnPreview};
+pub use db::{
+    BackfillReport, ChainPreview, ModelStore, ProviderSessionBinding, ResolvedResume, ResumeError,
+    SessionMarkerPayload, TurnPreview, WrongIdKindInput,
+};
 pub use db::{CliMapping, DiscoveredModel, ModelParameter, ParamType};
 pub use db::{CompositeInvocationId, InvocationRecord, InvocationStart, InvocationStatus};
 pub use db::{QuotaRecord, QuotaWindow, QuotaWindowInput};

@@ -136,6 +136,13 @@ prompt_mode = "arg"
     }
 }
 
+fn invocation_count(path: &Path) -> i64 {
+    let db = StateDb::open(path).unwrap();
+    db.connection()
+        .query_row("SELECT COUNT(*) FROM invocations", [], |row| row.get(0))
+        .unwrap()
+}
+
 #[test]
 fn lock_service_acquire_matches_pause_handshake_dependencies() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
@@ -171,6 +178,26 @@ fn lock_service_acquire_matches_pause_handshake_dependencies() {
         }
         other => panic!("expected Acquired success, got {other:?}"),
     }
+}
+
+#[test]
+fn lock_service_acquire_preserves_invocation_count() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let fixture = LockFixture::new();
+    fixture.prepare_active_session();
+    let state_path = fixture.data_root.join("state.db");
+    let before = invocation_count(&state_path);
+    let service = ProductionSessionLockService::default();
+
+    let output = service
+        .lock_session(SessionLockServiceRequest::Acquire {
+            session_id: SESSION_A.to_string(),
+            ttl_ms: 30_000,
+        })
+        .unwrap();
+
+    assert!(output.result.is_ok(), "{output:?}");
+    assert_eq!(invocation_count(&state_path), before);
 }
 
 #[test]

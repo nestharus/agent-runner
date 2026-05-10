@@ -1030,3 +1030,124 @@ The four discoveries are listed here so a later consolidation WU can pick them u
     (`SINGLE_CONCERN`).
   - `planning/age-39-thin-main-dispatch-cleanup/risk/age-39-test-audit.md` (LOW).
   - `planning/age-39-thin-main-dispatch-cleanup/risk/age-39-justification.md` (LOW).
+
+## 2026-05-09 — AGE-54 Phase 2.5.4 mid-pipeline drift (proceed + note as residual)
+
+- **Phase**: Phase 2.5.4 (duplicates inventory).
+- **Decision**: Proceed with note as residual per dispatch pre-resolved gate
+  ("Mid-pipeline drift: default A — proceed + note in DECISIONS as residual").
+- **Rationale**: Schema-5 dual-session columns (`provider_session_id`,
+  `resume_input_id`, `provider_session_capture_method`) are owned in BOTH
+  `crates/oulipoly-state/migrations/0005_invocation_dual_session_ids.sql` and
+  `crates/oulipoly-state/src/db.rs::ensure_invocations_schema` in commit
+  `cc2ae3d`, violating AGE-32's in-code ownership rule
+  ("durable schema lives in ordered migrations; legacy repair is allow-list
+  only"). Backfill semantics differ between the two owners (ordered migration
+  backfills from legacy `session_id`; helper leaves new columns null). The
+  duplicates researcher recommended "block on consolidation"; the orchestrator
+  is overridden by the dispatch's pre-resolved gate. Phase 3 proposer MUST
+  address cascade-vs-consolidate per implementation-pipeline.md Phase 3 rule.
+- **Evidence**:
+  - `planning/age-54-state-db-corruption-rca/research/age-54-duplicates.md`
+    (§ Duplicate 1, § 4 NEEDS_INPUT).
+  - `planning/age-54-state-db-corruption-rca/research/age-54-problem-map.md`
+    (§ H2 hypothesis on `ensure_invocations_schema`).
+
+## 2026-05-09 — AGE-54 Phase 6 mid-pipeline binary install (operational, not workflow's Final)
+
+- **Phase**: Phase 6 (between Step 6c r2 completion and process-tree audit #2).
+- **Decision**: Atomic-mv the freshly-built AGE-54 release binary
+  (`worktrees/age-54-state-db-corruption-rca/src-tauri/target/release/oulipoly-agent-runner`)
+  into `~/.local/bin/agents` mid-pipeline, ahead of the workflow's "Final" install step.
+- **Rationale**: cargo test runs from the AGE-54 worktree applied the
+  schema-5 migration to the live `state.db` at `~/.local/share/oulipoly-agent-runner/state.db`
+  (the test harness's default-path resolution leaked through XDG default when
+  test fixtures didn't fully isolate XDG_DATA_HOME). The AGE-37 stable binary
+  refuses to open a schema-5 DB (`schema is incompatible (stored=5, current=4); run agents migrate --rebuild`).
+  Continuing to dispatch `agents` for Phase 6/7/8 audits required either
+  a `migrate --rebuild` (lossy: wipes the WU's own pipeline trace) or installing the
+  new AGE-54 binary. Installing the new binary is non-destructive and verifies
+  the AGE-54 fix end-to-end before the PR even opens.
+- **Verification**: After install, `agents -m claude-opus echo "ping"` succeeds with
+  full AGE-53 dual-id `OULIPOLY_SESSION` envelope (`agent_runner_invocation_id`,
+  `agent_runner_chain_id`, `provider_session_id`, `session_id`, `provider_name`,
+  `resume_input_id`). Two consecutive `agents trace --json <id>` calls preserve
+  invocation row count (3 → 3 → 3). The P0 regression is verified fixed.
+- **Residual**: Phase 6 invocation rows for Step 6b / sentinel-fix / Step 6c r1 / Step 6c r2 were
+  lost from `state.db` during a pre-install WAL truncate (separate operational
+  recovery I did to clear stuck DB-locked errors). The Phase 6 process-tree audit
+  uses companion artifacts (logs, output index, output paths, git diffs) instead
+  of trace JSON for those four invocations. Trace JSON files exist on disk but
+  are 0-byte for those four UUIDs.
+- **Evidence**:
+  - `~/.local/bin/agents` — new AGE-54 build, ~20 MB.
+  - `agents trace` row-count smoke test (above).
+  - `cargo fmt --check` ok, `cargo clippy --workspace -- -D warnings` ok,
+    `cargo test --workspace` 133 test groups all passed against the new build.
+
+## 2026-05-10 — AGE-54 Phase 7 worktree cli.rs WT mod stashed (operational, out-of-scope for AGE-54 PR)
+
+- **Phase**: Phase 7 (CodeRabbit pre-pass sanity).
+- **Decision**: Stash the uncommitted `crates/oulipoly-runtime/src/executor/cli.rs`
+  modification (`WATCHDOG_NO_PROGRESS_SECS = u64::MAX` instead of HEAD's `600`)
+  for the duration of the Phase 7 → Phase 9 pipeline run. Stash entry is
+  `stash@{0}: operational: cli.rs watchdog disabled (out-of-scope for AGE-54 PR;
+  orchestrator pipeline run)`. Pop the stash at Final after the AGE-54 PR has
+  been opened (and merged if `auto_merge_after_phase_9=true` succeeds).
+- **Rationale**: The uncommitted change disables the watchdog operationally
+  to let long orchestrator dispatches run without being killed. The currently
+  installed `~/.local/bin/agents` (sha256 `1ee4c41...`) was built from this
+  modified source, so the orchestrator's runtime behavior is unaffected by
+  stashing the WT change.
+  AGE-54's contract (`contracts/age-54-state-db-corruption-rca.md` § In-scope code surface)
+  says cli.rs must "Restore watchdog/timeout hang handling. (Per `cc2ae3d`
+  ~370 line diff.)" — restoring cc2ae3d's `600s` value, not disabling. The
+  committed `99cca5c` already has the contracted `600s` value. The
+  uncommitted `u64::MAX` change is therefore out-of-scope for the AGE-54 PR.
+  CodeRabbit's pre-pass sanity check correctly returned `NEEDS_INPUT` on the
+  dirty tree because (a) starting CodeRabbit on a dirty WT would corrupt the
+  diff CodeRabbit reviews against `main`, and (b) any amend pass would leak
+  the WT change into the AGE-54 commit.
+- **Anti-scope reconciliation**: Dispatch's "Do NOT undo any worktree edits
+  from prior orchestrator passes" anti-scope is read as protecting AGE-54
+  product-code work (the AGE-53 surface restoration etc). Stashing preserves
+  the operational change without destroying it; pop at Final restores. The
+  binary already reflects the change at runtime.
+- **Aborted prior dispatch**: The stale
+  `.scratch/coderabbit/CODERABBIT_pass1.md` (228 bytes, "Tools completed",
+  no findings) is from a prior aborted CodeRabbit dispatch (May 10 00:09);
+  renamed to `.aborted-prior-dispatch` so this dispatch's pass 1 writes a
+  fresh file.
+- **Evidence**:
+  - `git stash list` → `stash@{0}: ... operational: cli.rs watchdog
+    disabled (out-of-scope for AGE-54 PR; orchestrator pipeline run)`.
+  - `git status` → working tree clean after stash.
+  - `git log --oneline main..HEAD` → still single commit `99cca5c`.
+
+## 2026-05-10 — AGE-54 Phase 8 row-count mismatch test residual accepted
+
+- **Phase**: Phase 8 (PR-review test-audit gate, round 2).
+- **Decision**: ACCEPT the row-count mismatch guard test residual documented at
+  `planning/age-54-state-db-corruption-rca/risk/age-54-test-residuals.md`
+  rather than introducing a product-code test hook to force the live mismatch
+  branch.
+- **Rationale**: The `migrate_legacy_invocations` `new_count != old_count`
+  branch is structurally unreachable from a pure SQLite fixture without a
+  product-code test hook (e.g. a feature-gated panic point or atomic counter
+  injection). Adding such a hook would expand the AGE-54 in-scope surface
+  beyond the contract's named files and would itself become a multi-concern
+  issue. The existing source-shape test
+  (`migrate_legacy_invocations_row_count_guards_abort_before_drop_in_source_shape`)
+  asserts the abort-message ordering before `DROP TABLE` directly from the
+  product source text, which is bounded protection against ordering
+  regressions in this single non-concurrent function. CodeRabbit Phase 7
+  passed 5 rounds (`CONVERGED:ALL_CHURN`) without any finding asking for a
+  behavioral mismatch test.
+- **Evidence**:
+  - `planning/age-54-state-db-corruption-rca/risk/age-54-test-residuals.md`
+    § Row-Count Mismatch Guard Branch + § Disposition.
+  - `planning/age-54-state-db-corruption-rca/risk/age-54-test-audit.md`
+    (round 2) § Legacy Predicate And Guard Rails: "acceptable as a
+    documented residual only if downstream gates agree".
+  - `planning/age-54-state-db-corruption-rca/risk/age-54-phase-7-process-tree-audit.report.md`
+    (PASS).

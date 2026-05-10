@@ -40,6 +40,12 @@ fn report_without_generated_at(report: &TraceReport) -> Value {
     value
 }
 
+fn invocation_count(db: &StateDb) -> i64 {
+    db.connection()
+        .query_row("SELECT COUNT(*) FROM invocations", [], |row| row.get(0))
+        .unwrap()
+}
+
 #[test]
 fn trace_service_matches_trace_invocation_with_sessions_for_report() {
     let (db, sessions_cfg) = seeded_trace_fixture();
@@ -68,6 +74,25 @@ fn trace_service_matches_trace_invocation_with_sessions_for_report() {
         report_without_generated_at(&service_report),
         report_without_generated_at(&direct_report)
     );
+}
+
+#[test]
+fn trace_service_preserves_invocation_rows_given_open_db() {
+    let (db, sessions_cfg) = seeded_trace_fixture();
+    let before = invocation_count(&db);
+    let service = ProductionTraceService::default();
+
+    let result = service
+        .trace(TraceServiceRequest {
+            state: &db,
+            sessions_cfg: &sessions_cfg,
+            invocation_uuid: ROOT_UUID,
+            options: trace_options(Some(64)),
+        })
+        .unwrap();
+
+    assert!(result.result.is_ok());
+    assert_eq!(invocation_count(&db), before);
 }
 
 #[test]

@@ -481,15 +481,82 @@ fn parse_session_json(stderr: &str, invocation_uuid: &str) -> Value {
     );
     let raw = lines[0].strip_prefix("OULIPOLY_SESSION=").unwrap();
     let value: Value = serde_json::from_str(raw).unwrap();
-    let keys: Vec<&str> = value
-        .as_object()
-        .unwrap()
-        .keys()
-        .map(String::as_str)
-        .collect();
-    assert_eq!(keys, vec!["id", "session_id"]);
+    let object = value.as_object().unwrap();
     assert_eq!(value["id"].as_str(), Some(invocation_uuid));
+    assert_eq!(
+        value["agent_runner_invocation_id"].as_str(),
+        Some(invocation_uuid)
+    );
+    assert!(object.contains_key("session_id"), "{value}");
+    assert!(object.contains_key("provider_session_id"), "{value}");
+    assert!(object.contains_key("provider_name"), "{value}");
+    if !value["session_id"].is_null() {
+        assert_eq!(value["provider_session_id"], value["session_id"]);
+    }
     value
+}
+
+fn invocation_dual_id_columns(
+    fixture: &Fixture,
+    invocation_uuid: &str,
+) -> (Option<String>, Option<String>, Option<String>) {
+    fixture
+        .conn()
+        .query_row(
+            "SELECT provider_session_id, resume_input_id, provider_session_capture_method
+             FROM invocations
+             WHERE invocation_uuid = ?1",
+            params![invocation_uuid],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap()
+}
+
+fn invocation_row_count(fixture: &Fixture) -> i64 {
+    fixture
+        .conn()
+        .query_row("SELECT COUNT(*) FROM invocations", [], |row| row.get(0))
+        .unwrap()
+}
+
+fn assert_trace_dual_id_state(
+    trace: &Value,
+    invocation_uuid: &str,
+    provider_session_id: &str,
+    resume_input_id: Option<&str>,
+    chain_id: Option<&str>,
+) {
+    assert_eq!(trace["root"]["invocation"]["id"], invocation_uuid);
+    assert_eq!(
+        trace["root"]["invocation"]["agent_runner_invocation_id"],
+        invocation_uuid
+    );
+    assert_eq!(trace["root"]["session"]["id"], provider_session_id);
+    assert_eq!(
+        trace["root"]["session"]["provider_session_id"],
+        provider_session_id
+    );
+    assert_eq!(
+        trace["root"]["session"]["resume_input_id"].as_str(),
+        resume_input_id
+    );
+    assert_eq!(
+        trace["root"]["session"]["agent_runner_chain_id"].as_str(),
+        chain_id
+    );
+}
+
+fn assert_resume_dual_id_row(
+    fixture: &Fixture,
+    invocation_uuid: &str,
+    provider_session_id: &str,
+    resume_input_id: &str,
+) {
+    let (provider, resume_input, capture_method) =
+        invocation_dual_id_columns(fixture, invocation_uuid);
+    assert_eq!(provider.as_deref(), Some(provider_session_id));
+    assert_eq!(resume_input.as_deref(), Some(resume_input_id));
+    assert_eq!(capture_method.as_deref(), Some("resumed"));
 }
 
 fn write_resume_provider_emitting_different_session_id(fixture: &Fixture, fresh_session_id: &str) {
@@ -2205,10 +2272,92 @@ flag = "--resume"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     let invocation = parse_invocation(&stderr);
-    assert_eq!(parse_session_line(&stderr, &invocation.id), chain_id);
-    assert_invocation_session(&fixture, &invocation.id, chain_id);
+    assert_eq!(
+        parse_session_line(&stderr, &invocation.id),
+        active_session_id
+    );
+    assert_invocation_session(&fixture, &invocation.id, active_session_id);
+    assert_resume_dual_id_row(&fixture, &invocation.id, active_session_id, chain_id);
     let trace = run_trace_json(&fixture, &invocation.id);
-    assert_eq!(trace["root"]["session"]["id"], chain_id);
+    assert_trace_dual_id_state(
+        &trace,
+        &invocation.id,
+        active_session_id,
+        Some(chain_id),
+        Some(chain_id),
+    );
+}
+
+#[test]
+fn resume_rows_bind_active_provider_session() {
+    let fixture = Fixture::new();
+    let chain_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let active_session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+    let script = fixture.write_script("bind-active-provider.sh", "printf 'chain resume answer\\n'");
+    fixture.write_single_provider_model(
+        "claude-opus",
+        "claude2",
+        &script,
+        r#"
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+"#,
+    );
+    fixture.seed_active_chain(chain_id, "claude2", active_session_id, "claude-opus");
+    let before_count = invocation_row_count(&fixture);
+
+    let output = fixture
+        .base_top_level_resume_command("claude-opus", chain_id)
+        .arg("continue")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let invocation = parse_invocation(&stderr);
+    let (provider_session_id, resume_input_id, capture_method) =
+        invocation_dual_id_columns(&fixture, &invocation.id);
+
+    assert_eq!(invocation_row_count(&fixture), before_count + 1);
+    assert_eq!(provider_session_id.as_deref(), Some(active_session_id));
+    assert_eq!(resume_input_id.as_deref(), Some(chain_id));
+    assert_eq!(capture_method.as_deref(), Some("resumed"));
+}
+
+#[test]
+fn resume_rows_record_attempted_id() {
+    let fixture = Fixture::new();
+    let chain_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let active_session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+    let script = fixture.write_script("record-attempted-id.sh", "printf 'chain resume answer\\n'");
+    fixture.write_single_provider_model(
+        "claude-opus",
+        "claude2",
+        &script,
+        r#"
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+"#,
+    );
+    fixture.seed_active_chain(chain_id, "claude2", active_session_id, "claude-opus");
+    let before_count = invocation_row_count(&fixture);
+
+    let output = fixture
+        .base_resume_command("claude-opus", chain_id)
+        .arg("--prompt")
+        .arg("continue")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let invocation = parse_invocation(&stderr);
+    let (_, resume_input_id, _) = invocation_dual_id_columns(&fixture, &invocation.id);
+
+    assert_eq!(invocation_row_count(&fixture), before_count + 1);
+    assert_eq!(resume_input_id.as_deref(), Some(chain_id));
 }
 
 #[test]

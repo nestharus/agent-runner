@@ -294,6 +294,14 @@ pub enum ResumeError {
     NoChainFound {
         input: String,
     },
+    WrongIdKind {
+        input: String,
+        input_kind: WrongIdKindInput,
+        provider_session_id: Option<String>,
+        agent_runner_invocation_id: String,
+        chain_id: Option<String>,
+        provider_name: Option<String>,
+    },
     Ambiguous {
         input: String,
         previews: Vec<ChainPreview>,
@@ -318,6 +326,11 @@ pub enum ResumeError {
     Db {
         message: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WrongIdKindInput {
+    AgentRunnerInvocationId,
 }
 
 #[derive(Debug, Clone)]
@@ -367,6 +380,9 @@ pub struct InvocationRecord {
     pub terminal_reason: Option<String>,
     pub session_id: Option<String>,
     pub session_capture_method: Option<String>,
+    pub provider_session_id: Option<String>,
+    pub resume_input_id: Option<String>,
+    pub provider_session_capture_method: Option<String>,
     pub resume_acceptance_status: Option<String>,
     pub resume_acceptance_evidence: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -456,10 +472,8 @@ impl CompositeInvocationId {
         let inner = s.trim().strip_prefix('{')?.strip_suffix('}')?;
         let mut source = None;
         let mut id = None;
-        let mut fields = 0;
         for part in inner.split(',') {
             let (key, value) = part.split_once(':')?;
-            fields += 1;
             let value = value
                 .trim()
                 .trim_matches('"')
@@ -468,17 +482,54 @@ impl CompositeInvocationId {
             match key.trim() {
                 "source" => source = Some(value),
                 "id" => id = Some(value),
-                _ => return None,
+                _ => {}
             }
-        }
-        if fields != 2 {
-            return None;
         }
         Some(Self {
             source: source?,
             id: id?,
         })
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionMarkerPayload {
+    pub agent_runner_invocation_id: String,
+    pub provider_session_id: Option<String>,
+    pub provider_name: Option<String>,
+    pub agent_runner_chain_id: Option<String>,
+    pub resume_input_id: Option<String>,
+    pub legacy_id: String,
+    pub legacy_session_id: Option<String>,
+}
+
+impl SessionMarkerPayload {
+    pub fn stderr_line(&self) -> String {
+        let payload = serde_json::json!({
+            "id": self.legacy_id,
+            "session_id": self.legacy_session_id,
+            "agent_runner_invocation_id": self.agent_runner_invocation_id,
+            "provider_session_id": self.provider_session_id,
+            "provider_name": self.provider_name,
+            "agent_runner_chain_id": self.agent_runner_chain_id,
+            "resume_input_id": self.resume_input_id,
+        });
+        format!("OULIPOLY_SESSION={payload}\n")
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderSessionBinding {
+    pub provider_session_id: String,
+    pub capture_method: &'static str,
+    pub resume_input_id: Option<String>,
+}
+
+struct WrongIdKindInvocationMatch {
+    invocation_uuid: String,
+    provider_name: Option<String>,
+    provider_session_id: Option<String>,
+    chain_id: Option<String>,
 }
 
 // --- Model discovery entities ---
@@ -617,6 +668,12 @@ impl StateDb {
             Connection::open(path).map_err(|e| format!("Failed to open state DB: {e}"))?;
 
         let compatibility = migrations::classify(&conn)?;
+        let ran_open_migrations = matches!(
+            compatibility,
+            SchemaCompatibility::Fresh
+                | SchemaCompatibility::Migratable { .. }
+                | SchemaCompatibility::LegacyVersionless
+        );
         match compatibility {
             SchemaCompatibility::Fresh => {
                 Self::set_wal_mode(&conn)?;
@@ -629,6 +686,7 @@ impl StateDb {
             }
             SchemaCompatibility::Migratable { stored } => {
                 Self::set_wal_mode(&conn)?;
+                let stored = Self::promote_existing_dual_id_schema5_if_present(&mut conn, stored)?;
                 let plan = migrations::current_plan_from(stored).map_err(|e| e.to_string())?;
                 migrations::run_with_db_path(&mut conn, &plan, path.to_path_buf())
                     .map_err(|e| e.to_string())?;
@@ -675,6 +733,10 @@ impl StateDb {
         Self::ensure_provider_quotas_topology_schema(&conn)?;
         Self::ensure_provider_quota_windows_schema(&conn)?;
         Self::ensure_session_turns_schema(&conn)?;
+        if ran_open_migrations {
+            conn.execute_batch(invocation_returned_artifacts_schema_sql!())
+                .map_err(|e| format!("Failed to ensure returned-artifacts schema: {e}"))?;
+        }
         let db = StateDb { conn };
         db.backfill_session_chains()
             .map_err(|e| format!("{e}; run `agents migrate-db` first"))?;
@@ -830,7 +892,28 @@ impl StateDb {
             return Ok(());
         }
 
-        Self::migrate_legacy_invocations(conn)
+        if Self::legacy_invocations_shape_is_pre_uuid(&columns) {
+            return Self::migrate_legacy_invocations(conn);
+        }
+
+        Err(format!(
+            "Refusing to rebuild populated invocations table with unrecognized pre-UUID shape: {columns:?}"
+        ))
+    }
+
+    fn legacy_invocations_shape_is_pre_uuid(columns: &[String]) -> bool {
+        let mut names = columns.to_vec();
+        names.sort();
+        names
+            == [
+                "created_at",
+                "error_category",
+                "exit_code",
+                "id",
+                "model_name",
+                "provider_index",
+                "success",
+            ]
     }
 
     fn invocations_columns(conn: &Connection) -> Result<Vec<String>, String> {
@@ -846,6 +929,96 @@ impl StateDb {
             columns.push(row.map_err(|e| format!("Failed to read invocations column: {e}"))?);
         }
         Ok(columns)
+    }
+
+    fn invocations_have_dual_id_columns(conn: &Connection) -> Result<bool, String> {
+        let columns = Self::invocations_columns(conn)?;
+        Ok(Self::columns_have_dual_id_columns(&columns))
+    }
+
+    fn columns_have_dual_id_columns(columns: &[String]) -> bool {
+        columns.iter().any(|column| column == "provider_session_id")
+            && columns.iter().any(|column| column == "resume_input_id")
+            && columns
+                .iter()
+                .any(|column| column == "provider_session_capture_method")
+    }
+
+    fn promote_existing_dual_id_schema5_if_present(
+        conn: &mut Connection,
+        stored: i32,
+    ) -> Result<i32, String> {
+        if stored >= 5 {
+            return Ok(stored);
+        }
+        let columns = Self::invocations_columns(conn)?;
+        if !Self::columns_have_dual_id_columns(&columns) {
+            return Ok(stored);
+        }
+
+        conn.execute_batch(
+            "BEGIN IMMEDIATE;
+             UPDATE invocations
+             SET provider_session_id = COALESCE(provider_session_id, session_id),
+                 provider_session_capture_method = COALESCE(provider_session_capture_method, session_capture_method)
+             WHERE session_id IS NOT NULL
+               AND (session_capture_method IS NULL OR session_capture_method <> 'resumed');
+
+             UPDATE invocations
+             SET resume_input_id = COALESCE(resume_input_id, session_id)
+             WHERE session_id IS NOT NULL
+               AND session_capture_method = 'resumed';
+
+             CREATE INDEX IF NOT EXISTS idx_invocations_provider_provider_session
+               ON invocations(provider_name, provider_index, provider_session_id)
+               WHERE provider_session_id IS NOT NULL;
+
+             PRAGMA user_version = 5;
+             COMMIT;",
+        )
+        .map_err(|e| {
+            let _ = conn.execute_batch("ROLLBACK;");
+            format!("Failed to promote existing dual-id invocation schema to version 5: {e}")
+        })?;
+        Ok(5)
+    }
+
+    fn provider_session_expr(conn: &Connection, alias: Option<&str>) -> Result<String, String> {
+        let prefix = alias.unwrap_or_default();
+        if Self::invocations_have_dual_id_columns(conn)? {
+            Ok(format!(
+                "COALESCE({prefix}provider_session_id, {prefix}session_id)"
+            ))
+        } else {
+            Ok(format!("{prefix}session_id"))
+        }
+    }
+
+    fn invocation_record_select_sql(conn: &Connection, tail_sql: &str) -> Result<String, String> {
+        let (provider_session_id, resume_input_id, provider_session_capture_method) =
+            if Self::invocations_have_dual_id_columns(conn)? {
+                (
+                    "provider_session_id",
+                    "resume_input_id",
+                    "provider_session_capture_method",
+                )
+            } else {
+                (
+                    "NULL AS provider_session_id",
+                    "NULL AS resume_input_id",
+                    "NULL AS provider_session_capture_method",
+                )
+            };
+        Ok(format!(
+            "SELECT id, invocation_uuid, model_name, provider_name, provider_index,
+                    parent_invocation_id, status, success, exit_code, error_category,
+                    terminal_reason, session_id, session_capture_method,
+                    {provider_session_id}, {resume_input_id}, {provider_session_capture_method},
+                    resume_acceptance_status, resume_acceptance_evidence,
+                    created_at, finished_at
+             FROM invocations
+             {tail_sql}"
+        ))
     }
 
     fn ensure_providers_schema(conn: &mut Connection) -> Result<(), String> {
@@ -1269,6 +1442,9 @@ impl StateDb {
             terminal_reason TEXT,
             session_id TEXT,
             session_capture_method TEXT,
+            provider_session_id TEXT,
+            resume_input_id TEXT,
+            provider_session_capture_method TEXT,
             resume_acceptance_status TEXT,
             resume_acceptance_evidence TEXT,
             created_at TEXT NOT NULL,
@@ -1283,14 +1459,16 @@ impl StateDb {
             ON invocations (provider_name, created_at);
         CREATE INDEX IF NOT EXISTS idx_invocations_provider_session
             ON invocations (provider_name, session_id)
-            WHERE session_id IS NOT NULL;",
+            WHERE session_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_invocations_provider_provider_session
+            ON invocations (provider_name, provider_index, provider_session_id)
+            WHERE provider_session_id IS NOT NULL;",
             invocation_returned_artifacts_schema_sql!()
         )
     }
 
     fn invocations_index_sql() -> &'static str {
-        concat!(
-            "CREATE INDEX IF NOT EXISTS idx_invocations_uuid
+        "CREATE INDEX IF NOT EXISTS idx_invocations_uuid
             ON invocations (invocation_uuid);
         CREATE INDEX IF NOT EXISTS idx_invocations_parent
             ON invocations (parent_invocation_id, created_at);
@@ -1298,9 +1476,7 @@ impl StateDb {
             ON invocations (provider_name, created_at);
         CREATE INDEX IF NOT EXISTS idx_invocations_provider_session
             ON invocations (provider_name, session_id)
-            WHERE session_id IS NOT NULL;",
-            invocation_returned_artifacts_schema_sql!()
-        )
+            WHERE session_id IS NOT NULL;"
     }
 
     fn session_turns_index_sql() -> &'static str {
@@ -1330,6 +1506,9 @@ impl StateDb {
             .unchecked_transaction()
             .map_err(|e| format!("Failed to begin invocation migration: {e}"))?;
         Self::validate_providers_schema(&tx)?;
+        let old_count: i64 = tx
+            .query_row("SELECT COUNT(*) FROM invocations", [], |row| row.get(0))
+            .map_err(|e| format!("Failed to count legacy invocations before rebuild: {e}"))?;
 
         let mut old_rows = Vec::new();
         {
@@ -1356,6 +1535,12 @@ impl StateDb {
                 old_rows.push(row.map_err(|e| format!("Failed to parse legacy invocation: {e}"))?);
             }
         }
+        if old_rows.len() as i64 != old_count {
+            return Err(format!(
+                "Legacy invocation rebuild aborted before replacement: scanned {} rows but table count was {old_count}",
+                old_rows.len()
+            ));
+        }
 
         tx.execute_batch(
             "CREATE TABLE invocations_new (
@@ -1372,6 +1557,9 @@ impl StateDb {
                 terminal_reason TEXT,
                 session_id TEXT,
                 session_capture_method TEXT,
+                provider_session_id TEXT,
+                resume_input_id TEXT,
+                provider_session_capture_method TEXT,
                 resume_acceptance_status TEXT,
                 resume_acceptance_evidence TEXT,
                 created_at TEXT NOT NULL,
@@ -1396,11 +1584,14 @@ impl StateDb {
                         terminal_reason,
                         session_id,
                         session_capture_method,
+                        provider_session_id,
+                        resume_input_id,
+                        provider_session_capture_method,
                         resume_acceptance_status,
                         resume_acceptance_evidence,
                         created_at,
                         finished_at
-                     ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, NULL, NULL, NULL, NULL, NULL, ?9, ?9)",
+                     ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?9, ?9)",
                 )
                 .map_err(|e| format!("Failed to prepare migrated invocation insert: {e}"))?;
 
@@ -1428,6 +1619,15 @@ impl StateDb {
                     ])
                     .map_err(|e| format!("Failed to copy legacy invocation: {e}"))?;
             }
+        }
+
+        let new_count: i64 = tx
+            .query_row("SELECT COUNT(*) FROM invocations_new", [], |row| row.get(0))
+            .map_err(|e| format!("Failed to count migrated invocations before replacement: {e}"))?;
+        if new_count != old_count {
+            return Err(format!(
+                "Legacy invocation rebuild aborted before replacement: migrated {new_count} rows from {old_count}"
+            ));
         }
 
         tx.execute_batch(
@@ -1612,6 +1812,9 @@ impl StateDb {
         invocation_row_id: i64,
         refs: &[ReturnedArtifactRef],
     ) -> Result<(), DbError> {
+        self.conn
+            .execute_batch(invocation_returned_artifacts_schema_sql!())
+            .map_err(|e| format!("Failed to ensure returned-artifacts schema: {e}"))?;
         let invocation_uuid_text: String = self
             .conn
             .query_row(
@@ -1734,6 +1937,17 @@ impl StateDb {
                 ));
             }
         }
+        let columns = self
+            .conn
+            .prepare("PRAGMA table_info(invocation_returned_artifacts)")
+            .map_err(|e| format!("Failed to inspect returned-artifacts schema: {e}"))?
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| format!("Failed to query returned-artifacts columns: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read returned-artifacts column: {e}"))?;
+        if !columns.iter().any(|column| column == "version_id") {
+            return Ok(Vec::new());
+        }
 
         let mut stmt = self
             .conn
@@ -1836,15 +2050,113 @@ impl StateDb {
         session_id: Option<&str>,
         method: &str,
     ) -> Result<(), String> {
+        let (provider_session_id, resume_input_id, provider_session_capture_method) =
+            if method == "resumed" {
+                (None, session_id, None)
+            } else {
+                (session_id, None, session_id.map(|_| method))
+            };
         self.conn
             .execute(
                 "UPDATE invocations
-                 SET session_id = ?1,
-                     session_capture_method = ?2
-                 WHERE id = ?3",
-                params![session_id, method, id],
+                 SET session_id = CASE
+                         WHEN ?2 = 'resumed' THEN COALESCE(session_id, ?1)
+                         ELSE ?1
+                     END,
+                     session_capture_method = ?2,
+                     provider_session_id = COALESCE(provider_session_id, ?3),
+                     resume_input_id = COALESCE(resume_input_id, ?4),
+                     provider_session_capture_method = COALESCE(provider_session_capture_method, ?5)
+                 WHERE id = ?6",
+                params![
+                    session_id,
+                    method,
+                    provider_session_id,
+                    resume_input_id,
+                    provider_session_capture_method,
+                    id
+                ],
             )
             .map_err(|e| format!("Failed to update session capture for invocation {id}: {e}"))?;
+        Ok(())
+    }
+
+    pub fn bind_invocation_provider_session_start(
+        &self,
+        invocation_row_id: i64,
+        binding: &ProviderSessionBinding,
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("Failed to begin provider session binding tx: {e}"))?;
+
+        let existing = tx
+            .query_row(
+                "SELECT provider_session_id FROM invocations WHERE id = ?1",
+                params![invocation_row_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to read invocation {invocation_row_id}: {e}"))?
+            .ok_or_else(|| format!("Invocation {invocation_row_id} not found"))?;
+
+        if let Some(existing) = existing
+            && existing != binding.provider_session_id
+        {
+            return Err(format!(
+                "Invocation {invocation_row_id} is already bound to provider session {existing}; refusing to bind {}",
+                binding.provider_session_id
+            ));
+        }
+
+        tx.execute(
+            "UPDATE invocations
+             SET provider_session_id = ?1,
+                 provider_session_capture_method = ?2,
+                 resume_input_id = COALESCE(?3, resume_input_id),
+                 session_id = CASE
+                     WHEN session_capture_method = 'resumed'
+                          AND resume_input_id IS NOT NULL
+                          AND session_id = resume_input_id
+                     THEN session_id
+                     ELSE ?1
+                 END,
+                 session_capture_method = ?2
+             WHERE id = ?4",
+            params![
+                &binding.provider_session_id,
+                binding.capture_method,
+                binding.resume_input_id.as_deref(),
+                invocation_row_id
+            ],
+        )
+        .map_err(|e| {
+            format!("Failed to bind provider session for invocation {invocation_row_id}: {e}")
+        })?;
+
+        if binding.resume_input_id.as_deref() != Some(binding.provider_session_id.as_str()) {
+            Self::mint_chain_for_invocation_session_on(&tx, invocation_row_id)?;
+        }
+        tx.commit()
+            .map_err(|e| format!("Failed to commit provider session binding tx: {e}"))
+    }
+
+    pub fn record_legacy_resume_input_session_id(
+        &self,
+        id: i64,
+        resume_input_id: &str,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE invocations
+                 SET session_id = ?1
+                 WHERE id = ?2 AND session_capture_method = 'resumed'",
+                params![resume_input_id, id],
+            )
+            .map_err(|e| {
+                format!("Failed to update legacy resume session_id for invocation {id}: {e}")
+            })?;
         Ok(())
     }
 
@@ -1867,24 +2179,30 @@ impl StateDb {
     }
 
     pub fn mint_chain_for_invocation_session(&self, invocation_row_id: i64) -> Result<(), DbError> {
-        let row = self
-            .conn
-            .query_row(
-                "SELECT model_name, provider_name, session_id, COALESCE(finished_at, created_at)
-                 FROM invocations
-                 WHERE id = ?1
-                   AND provider_name IS NOT NULL
-                   AND session_id IS NOT NULL",
-                params![invocation_row_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                    ))
-                },
-            )
+        Self::mint_chain_for_invocation_session_on(&self.conn, invocation_row_id)
+    }
+
+    fn mint_chain_for_invocation_session_on(
+        conn: &Connection,
+        invocation_row_id: i64,
+    ) -> Result<(), DbError> {
+        let provider_session_expr = Self::provider_session_expr(conn, None)?;
+        let sql = format!(
+            "SELECT model_name, provider_name, {provider_session_expr}, COALESCE(finished_at, created_at)
+             FROM invocations
+             WHERE id = ?1
+               AND provider_name IS NOT NULL
+               AND {provider_session_expr} IS NOT NULL"
+        );
+        let row = conn
+            .query_row(&sql, params![invocation_row_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
             .optional()
             .map_err(|e| format!("Failed to read invocation for chain mint: {e}"))?;
         let Some((model_name, provider_name, session_id, raw_ts)) = row else {
@@ -1893,8 +2211,7 @@ impl StateDb {
         let ts = DateTime::parse_from_rfc3339(&raw_ts)
             .map(|dt| dt.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now());
-        let exists = self
-            .conn
+        let exists = conn
             .query_row(
                 "SELECT chain_id FROM session_chain_segments
                  WHERE provider_name = ?1 AND session_id = ?2
@@ -1905,62 +2222,47 @@ impl StateDb {
             .optional()
             .map_err(|e| format!("Failed to check existing invocation chain: {e}"))?;
         if let Some(chain_id) = exists {
-            self.conn
-                .execute(
-                    "UPDATE session_chains
+            conn.execute(
+                "UPDATE session_chains
                      SET model_name = ?2
                      WHERE chain_id = ?1 AND model_name = '<unknown>'",
-                    params![chain_id, model_name],
-                )
-                .map_err(|e| format!("Failed to update invocation session chain model: {e}"))?;
-            self.conn
-                .execute(
-                    "UPDATE session_chain_segments
+                params![chain_id, model_name],
+            )
+            .map_err(|e| format!("Failed to update invocation session chain model: {e}"))?;
+            conn.execute(
+                "UPDATE session_chain_segments
                      SET transition_reason = 'initial'
                      WHERE chain_id = ?1
                        AND provider_name = ?2
                        AND session_id = ?3
                        AND transition_reason = 'imported'",
-                    params![chain_id, provider_name, session_id],
-                )
-                .map_err(|e| format!("Failed to promote imported session chain segment: {e}"))?;
+                params![chain_id, provider_name, session_id],
+            )
+            .map_err(|e| format!("Failed to promote imported session chain segment: {e}"))?;
             return Ok(());
         }
         let chain_id = Uuid::new_v4().to_string();
-        let tx = self
-            .conn
-            .unchecked_transaction()
-            .map_err(|e| format!("Failed to begin invocation chain mint: {e}"))?;
-        tx.execute(
+        conn.execute(
             "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
              VALUES (?1, ?2, ?2, ?3)",
             params![chain_id, ts.to_rfc3339(), model_name],
         )
         .map_err(|e| format!("Failed to mint invocation session chain: {e}"))?;
-        tx.execute(
+        conn.execute(
             "INSERT INTO session_chain_segments
                 (chain_id, provider_name, session_id, started_at, transition_reason)
              VALUES (?1, ?2, ?3, ?4, 'initial')",
             params![chain_id, provider_name, session_id, ts.to_rfc3339()],
         )
         .map_err(|e| format!("Failed to mint invocation session segment: {e}"))?;
-        tx.commit()
-            .map_err(|e| format!("Failed to commit invocation chain mint: {e}"))?;
         Ok(())
     }
 
     pub fn get_invocation_by_uuid(&self, uuid: &str) -> Result<Option<InvocationRecord>, String> {
+        let sql = Self::invocation_record_select_sql(&self.conn, "WHERE invocation_uuid = ?1")?;
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT id, invocation_uuid, model_name, provider_name, provider_index,
-                        parent_invocation_id, status, success, exit_code, error_category,
-                        terminal_reason, session_id, session_capture_method,
-                        resume_acceptance_status, resume_acceptance_evidence,
-                        created_at, finished_at
-                 FROM invocations
-                 WHERE invocation_uuid = ?1",
-            )
+            .prepare(&sql)
             .map_err(|e| format!("Failed to prepare invocation lookup: {e}"))?;
 
         let result = stmt.query_row(params![uuid], Self::map_invocation_row);
@@ -1975,18 +2277,14 @@ impl StateDb {
         &self,
         parent_id: i64,
     ) -> Result<Vec<InvocationRecord>, String> {
+        let sql = Self::invocation_record_select_sql(
+            &self.conn,
+            "WHERE parent_invocation_id = ?1
+             ORDER BY created_at, id",
+        )?;
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT id, invocation_uuid, model_name, provider_name, provider_index,
-                        parent_invocation_id, status, success, exit_code, error_category,
-                        terminal_reason, session_id, session_capture_method,
-                        resume_acceptance_status, resume_acceptance_evidence,
-                        created_at, finished_at
-                 FROM invocations
-                 WHERE parent_invocation_id = ?1
-                 ORDER BY created_at, id",
-            )
+            .prepare(&sql)
             .map_err(|e| format!("Failed to prepare invocation child lookup: {e}"))?;
 
         let rows = stmt
@@ -1998,14 +2296,14 @@ impl StateDb {
     }
 
     fn map_invocation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<InvocationRecord> {
-        let created_at_raw: String = row.get(15)?;
-        let finished_at_raw: Option<String> = row.get(16)?;
+        let created_at_raw: String = row.get(18)?;
+        let finished_at_raw: Option<String> = row.get(19)?;
         let status_raw: String = row.get(6)?;
         let created_at = DateTime::parse_from_rfc3339(&created_at_raw)
             .map(|dt| dt.with_timezone(&Utc))
             .map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    15,
+                    18,
                     rusqlite::types::Type::Text,
                     Box::new(e),
                 )
@@ -2016,7 +2314,7 @@ impl StateDb {
                     .map(|dt| dt.with_timezone(&Utc))
                     .map_err(|e| {
                         rusqlite::Error::FromSqlConversionFailure(
-                            16,
+                            19,
                             rusqlite::types::Type::Text,
                             Box::new(e),
                         )
@@ -2045,8 +2343,11 @@ impl StateDb {
             terminal_reason: row.get(10)?,
             session_id: row.get(11)?,
             session_capture_method: row.get(12)?,
-            resume_acceptance_status: row.get(13)?,
-            resume_acceptance_evidence: row.get(14)?,
+            provider_session_id: row.get(13)?,
+            resume_input_id: row.get(14)?,
+            provider_session_capture_method: row.get(15)?,
+            resume_acceptance_status: row.get(16)?,
+            resume_acceptance_evidence: row.get(17)?,
             created_at,
             finished_at,
         })
@@ -3023,19 +3324,19 @@ impl StateDb {
             .conn
             .unchecked_transaction()
             .map_err(|e| format!("Failed to begin session chain backfill: {e}"))?;
+        let provider_session_expr = Self::provider_session_expr(&tx, None)?;
         let mut chains_inserted = 0;
         let mut segments_inserted = 0;
         for row in rows {
+            let model_sql = format!(
+                "SELECT model_name
+                 FROM invocations
+                 WHERE {provider_session_expr} = ?1
+                 ORDER BY COALESCE(finished_at, created_at) DESC, id DESC
+                 LIMIT 1"
+            );
             let model_name = tx
-                .query_row(
-                    "SELECT model_name
-                     FROM invocations
-                     WHERE session_id = ?1
-                     ORDER BY COALESCE(finished_at, created_at) DESC, id DESC
-                     LIMIT 1",
-                    params![row.session],
-                    |r| r.get::<_, String>(0),
-                )
+                .query_row(&model_sql, params![row.session], |r| r.get::<_, String>(0))
                 .optional()
                 .map_err(|e| format!("Failed to infer model during backfill: {e}"))?
                 .unwrap_or_else(|| "<unknown>".to_string());
@@ -3289,6 +3590,20 @@ impl StateDb {
             input: input.to_string(),
         })?;
 
+        if let Some(wrong_id) = self
+            .wrong_id_kind_invocation_match(input)
+            .map_err(|message| ResumeError::Db { message })?
+        {
+            return Err(ResumeError::WrongIdKind {
+                input: input.to_string(),
+                input_kind: WrongIdKindInput::AgentRunnerInvocationId,
+                provider_session_id: wrong_id.provider_session_id,
+                agent_runner_invocation_id: wrong_id.invocation_uuid,
+                chain_id: wrong_id.chain_id,
+                provider_name: wrong_id.provider_name,
+            });
+        }
+
         let chain_ids = self
             .candidate_chain_ids(input)
             .map_err(|message| ResumeError::Db { message })?;
@@ -3415,6 +3730,49 @@ impl StateDb {
             .map_err(|e| format!("Failed to read resume chain lookup: {e}"))
     }
 
+    fn wrong_id_kind_invocation_match(
+        &self,
+        input: &str,
+    ) -> Result<Option<WrongIdKindInvocationMatch>, String> {
+        let provider_session_select = if Self::invocations_have_dual_id_columns(&self.conn)? {
+            "provider_session_id"
+        } else {
+            "NULL AS provider_session_id"
+        };
+        let sql = format!(
+            "SELECT invocation_uuid, provider_name, {provider_session_select}
+             FROM invocations
+             WHERE invocation_uuid = ?1"
+        );
+        let row = self
+            .conn
+            .query_row(&sql, params![input], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .optional()
+            .map_err(|e| format!("Failed to query invocation id-kind match: {e}"))?;
+
+        let Some((invocation_uuid, provider_name, provider_session_id)) = row else {
+            return Ok(None);
+        };
+        let chain_id = match (provider_name.as_deref(), provider_session_id.as_deref()) {
+            (Some(provider_name), Some(provider_session_id)) => self
+                .chain_id_for_segment(provider_name, provider_session_id)
+                .map_err(|e| format!("Failed to resolve chain for wrong-id-kind match: {e}"))?,
+            _ => None,
+        };
+        Ok(Some(WrongIdKindInvocationMatch {
+            invocation_uuid,
+            provider_name,
+            provider_session_id,
+            chain_id,
+        }))
+    }
+
     fn choose_resume_chain(
         &self,
         _input: &str,
@@ -3503,18 +3861,18 @@ impl StateDb {
     }
 
     fn latest_invocation_model_for_chain(&self, chain_id: &str) -> Result<Option<String>, String> {
+        let provider_session_expr = Self::provider_session_expr(&self.conn, Some("i."))?;
+        let sql = format!(
+            "SELECT i.model_name
+             FROM invocations i
+             WHERE {provider_session_expr} IN (
+                SELECT session_id FROM session_chain_segments WHERE chain_id = ?1
+             )
+             ORDER BY COALESCE(i.finished_at, i.created_at) DESC, i.id DESC
+             LIMIT 1"
+        );
         self.conn
-            .query_row(
-                "SELECT i.model_name
-                 FROM invocations i
-                 WHERE i.session_id IN (
-                    SELECT session_id FROM session_chain_segments WHERE chain_id = ?1
-                 )
-                 ORDER BY COALESCE(i.finished_at, i.created_at) DESC, i.id DESC
-                 LIMIT 1",
-                params![chain_id],
-                |row| row.get(0),
-            )
+            .query_row(&sql, params![chain_id], |row| row.get(0))
             .optional()
             .map_err(|e| format!("Failed to infer session chain model from invocations: {e}"))
     }
@@ -3949,6 +4307,17 @@ mod tests {
             )
             .unwrap();
         id
+    }
+
+    fn seed_running_invocation(db: &StateDb) -> i64 {
+        db.start_invocation(&InvocationStart {
+            invocation_uuid: Uuid::new_v4().to_string(),
+            model_name: "test-model".to_string(),
+            provider_name: "fixture-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        })
+        .unwrap()
     }
 
     fn record_provider_invocation(
@@ -4952,6 +5321,7 @@ mod tests {
             vec![
                 "idx_invocations_parent".to_string(),
                 "idx_invocations_provider_created".to_string(),
+                "idx_invocations_provider_provider_session".to_string(),
                 "idx_invocations_provider_session".to_string(),
                 "idx_invocations_uuid".to_string(),
                 "sqlite_autoindex_invocations_1".to_string(),
@@ -6060,6 +6430,198 @@ name = "fixture-provider"
     }
 
     #[test]
+    fn running_invocation_provider_session_id() {
+        let db = test_db();
+        let start = InvocationStart {
+            invocation_uuid: Uuid::new_v4().to_string(),
+            model_name: "test-model".to_string(),
+            provider_name: "fixture-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        };
+        let id = db.start_invocation(&start).unwrap();
+        let provider_session_id = Uuid::new_v4().to_string();
+
+        db.bind_invocation_provider_session_start(
+            id,
+            &ProviderSessionBinding {
+                provider_session_id: provider_session_id.clone(),
+                capture_method: "forced_flag_verified",
+                resume_input_id: None,
+            },
+        )
+        .unwrap();
+
+        let row = db
+            .get_invocation_by_uuid(&start.invocation_uuid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, InvocationStatus::Running);
+        assert_eq!(row.finished_at, None);
+        assert_eq!(
+            row.provider_session_id.as_deref(),
+            Some(provider_session_id.as_str())
+        );
+        assert_eq!(
+            row.provider_session_capture_method.as_deref(),
+            Some("forced_flag_verified")
+        );
+    }
+
+    #[test]
+    fn running_invocation_chain_minted() {
+        let db = test_db();
+        let id = seed_running_invocation(&db);
+        let provider_session_id = Uuid::new_v4().to_string();
+
+        db.bind_invocation_provider_session_start(
+            id,
+            &ProviderSessionBinding {
+                provider_session_id: provider_session_id.clone(),
+                capture_method: "forced_flag_verified",
+                resume_input_id: None,
+            },
+        )
+        .unwrap();
+
+        let chain_id = db
+            .chain_id_for_segment("fixture-provider", &provider_session_id)
+            .unwrap()
+            .expect("chain segment must be minted");
+        assert!(Uuid::parse_str(&chain_id).is_ok());
+    }
+
+    #[test]
+    fn bind_invocation_provider_session_start_same_id_is_idempotent() {
+        let db = test_db();
+        let id = seed_running_invocation(&db);
+        let provider_session_id = Uuid::new_v4().to_string();
+        let binding = ProviderSessionBinding {
+            provider_session_id: provider_session_id.clone(),
+            capture_method: "forced_flag_verified",
+            resume_input_id: None,
+        };
+
+        db.bind_invocation_provider_session_start(id, &binding)
+            .unwrap();
+        db.bind_invocation_provider_session_start(id, &binding)
+            .unwrap();
+
+        assert_eq!(segment_count(&db), 1);
+        assert!(
+            db.chain_id_for_segment("fixture-provider", &provider_session_id)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn bind_invocation_provider_session_start_conflicting_rebind_rejects_without_mutation() {
+        let db = test_db();
+        let id = seed_running_invocation(&db);
+        let provider_session_id = Uuid::new_v4().to_string();
+        db.bind_invocation_provider_session_start(
+            id,
+            &ProviderSessionBinding {
+                provider_session_id: provider_session_id.clone(),
+                capture_method: "forced_flag_verified",
+                resume_input_id: None,
+            },
+        )
+        .unwrap();
+        let before_segments = segment_count(&db);
+
+        let err = db
+            .bind_invocation_provider_session_start(
+                id,
+                &ProviderSessionBinding {
+                    provider_session_id: Uuid::new_v4().to_string(),
+                    capture_method: "forced_flag_verified",
+                    resume_input_id: None,
+                },
+            )
+            .unwrap_err();
+
+        assert!(
+            err.contains("already bound") || err.contains("refusing"),
+            "{err}"
+        );
+        assert_eq!(segment_count(&db), before_segments);
+        let stored: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT provider_session_id FROM invocations WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some(provider_session_id.as_str()));
+    }
+
+    #[test]
+    fn bind_invocation_provider_session_start_matching_resume_input_does_not_mint_duplicate_chain()
+    {
+        let db = test_db();
+        let id = seed_running_invocation(&db);
+        let provider_session_id = Uuid::new_v4().to_string();
+
+        db.bind_invocation_provider_session_start(
+            id,
+            &ProviderSessionBinding {
+                provider_session_id: provider_session_id.clone(),
+                capture_method: "resumed",
+                resume_input_id: Some(provider_session_id.clone()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(segment_count(&db), 0);
+        let row: (Option<String>, Option<String>) = db
+            .conn
+            .query_row(
+                "SELECT provider_session_id, resume_input_id FROM invocations WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0.as_deref(), Some(provider_session_id.as_str()));
+        assert_eq!(row.1.as_deref(), Some(provider_session_id.as_str()));
+    }
+
+    #[test]
+    fn bind_then_record_legacy_then_rebind_preserves_legacy_resume_session_id() {
+        let db = test_db();
+        let id = seed_running_invocation(&db);
+        let provider_session_id = Uuid::new_v4().to_string();
+        let legacy_resume_input = Uuid::new_v4().to_string();
+        let binding = ProviderSessionBinding {
+            provider_session_id: provider_session_id.clone(),
+            capture_method: "resumed",
+            resume_input_id: Some(legacy_resume_input.clone()),
+        };
+
+        db.bind_invocation_provider_session_start(id, &binding)
+            .unwrap();
+        db.record_legacy_resume_input_session_id(id, &legacy_resume_input)
+            .unwrap();
+        db.bind_invocation_provider_session_start(id, &binding)
+            .unwrap();
+
+        let row: (Option<String>, Option<String>, Option<String>) = db
+            .conn
+            .query_row(
+                "SELECT session_id, provider_session_id, resume_input_id
+                 FROM invocations WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0.as_deref(), Some(legacy_resume_input.as_str()));
+        assert_eq!(row.1.as_deref(), Some(provider_session_id.as_str()));
+        assert_eq!(row.2.as_deref(), Some(legacy_resume_input.as_str()));
+    }
+
+    #[test]
     fn start_invocation_rejects_duplicate_uuid() {
         let db = test_db();
         let start = InvocationStart {
@@ -6392,6 +6954,90 @@ name = "fixture-provider"
         assert_eq!(after.provider_index, before.provider_index);
         assert_eq!(after.status, before.status);
         assert_eq!(after.created_at, before.created_at);
+    }
+
+    #[test]
+    fn update_session_capture_dual_id_semantics_for_non_resumed_and_resumed_rows() {
+        let db = test_db();
+        let non_resumed = seed_running_invocation(&db);
+        let resumed = seed_running_invocation(&db);
+        db.conn
+            .execute(
+                "UPDATE invocations
+                 SET provider_session_id = 'active-provider-session'
+                 WHERE id = ?1",
+                params![resumed],
+            )
+            .unwrap();
+
+        db.update_session_capture(non_resumed, Some("new-provider-session"), "stdout")
+            .unwrap();
+        db.update_session_capture(resumed, Some("attempted-resume-id"), "resumed")
+            .unwrap();
+
+        let non_resumed_row: (Option<String>, Option<String>, Option<String>) = db
+            .conn
+            .query_row(
+                "SELECT provider_session_id, resume_input_id, provider_session_capture_method
+                 FROM invocations WHERE id = ?1",
+                params![non_resumed],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(non_resumed_row.0.as_deref(), Some("new-provider-session"));
+        assert_eq!(non_resumed_row.1, None);
+        assert_eq!(non_resumed_row.2.as_deref(), Some("stdout"));
+
+        let resumed_row: (Option<String>, Option<String>, Option<String>) = db
+            .conn
+            .query_row(
+                "SELECT provider_session_id, resume_input_id, provider_session_capture_method
+                 FROM invocations WHERE id = ?1",
+                params![resumed],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(resumed_row.0.as_deref(), Some("active-provider-session"));
+        assert_eq!(resumed_row.1.as_deref(), Some("attempted-resume-id"));
+        assert_eq!(resumed_row.2, None);
+        assert_eq!(invocation_count(&db), 2);
+    }
+
+    #[test]
+    fn record_legacy_resume_input_session_id_updates_only_resumed_row() {
+        let db = test_db();
+        let resumed = seed_running_invocation(&db);
+        let non_resumed = seed_running_invocation(&db);
+        db.update_session_capture(resumed, Some("active-session"), "resumed")
+            .unwrap();
+        db.update_session_capture(non_resumed, Some("provider-session"), "stdout")
+            .unwrap();
+
+        db.record_legacy_resume_input_session_id(resumed, "attempted-resume")
+            .unwrap();
+        db.record_legacy_resume_input_session_id(non_resumed, "must-not-apply")
+            .unwrap();
+
+        let resumed_session: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT session_id FROM invocations WHERE id = ?1",
+                params![resumed],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let non_resumed_session: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT session_id FROM invocations WHERE id = ?1",
+                params![non_resumed],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(resumed_session.as_deref(), Some("attempted-resume"));
+        assert_eq!(non_resumed_session.as_deref(), Some("provider-session"));
+        assert_eq!(invocation_count(&db), 2);
     }
 
     #[test]
@@ -7395,6 +8041,35 @@ interactive_args = ["launch"]
             .unwrap()
     }
 
+    fn invocation_count(db: &StateDb) -> i64 {
+        db.conn
+            .query_row("SELECT COUNT(*) FROM invocations", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn invocation_checksum(db: &StateDb) -> String {
+        let dual_id_cols = StateDb::invocations_have_dual_id_columns(&db.conn).unwrap();
+        let extra_cols = if dual_id_cols {
+            " || '|' || COALESCE(session_capture_method, '') \
+             || '|' || COALESCE(provider_session_id, '') \
+             || '|' || COALESCE(resume_input_id, '') \
+             || '|' || COALESCE(provider_session_capture_method, '')"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT COALESCE(group_concat(line, char(10)), '')
+             FROM (
+                 SELECT id || '|' || invocation_uuid || '|' || status || '|' ||
+                        COALESCE(session_id, ''){extra_cols} || '|' ||
+                        COALESCE(finished_at, '') AS line
+                 FROM invocations
+                 ORDER BY id
+             )"
+        );
+        db.conn.query_row(&sql, [], |row| row.get(0)).unwrap()
+    }
+
     // risk: Schema migration and backfill; level: particular-integration; source: proposal §11.1 Schema migration and backfill / A5.
     #[test]
     fn backfill_creates_one_chain_per_provider_session_pair() {
@@ -7451,11 +8126,182 @@ interactive_args = ["launch"]
 
         let first = StateDb::open(&path).unwrap();
         let first_count = chain_count(&first);
+        let first_invocation_checksum = invocation_checksum(&first);
         drop(first);
         let second = StateDb::open(&path).unwrap();
 
         assert_eq!(chain_count(&second), first_count);
         assert_eq!(segment_count(&second), 1);
+        assert_eq!(invocation_checksum(&second), first_invocation_checksum);
+    }
+
+    fn legacy_v4_invocation_dual_id_fixture(
+        invocation_uuid: &str,
+        session_id: Option<&str>,
+        session_capture_method: Option<&str>,
+        status: &str,
+        terminal_reason: Option<&str>,
+        error_category: Option<&str>,
+    ) -> TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("state.db");
+        let conn = Connection::open(&db_path).unwrap();
+        seed_current_drift_required_tables(&conn);
+        conn.execute(
+            "INSERT INTO invocations
+                (invocation_uuid, model_name, provider_name, provider_index, status, success,
+                 exit_code, error_category, terminal_reason, session_id, session_capture_method,
+                 created_at, finished_at)
+             VALUES (?1, 'claude-opus', 'claude', 0, ?2, NULL, NULL, ?3, ?4, ?5, ?6,
+                     '2026-04-17T08:00:00Z', NULL)",
+            params![
+                invocation_uuid,
+                status,
+                error_category,
+                terminal_reason,
+                session_id,
+                session_capture_method
+            ],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 4).unwrap();
+        drop(conn);
+        dir
+    }
+
+    #[test]
+    fn migration_backfill_null_null_preserves_running_rows() {
+        let invocation_uuid = "11111111-1111-4111-8111-111111111111";
+        let dir = legacy_v4_invocation_dual_id_fixture(
+            invocation_uuid,
+            None,
+            None,
+            "running",
+            Some("still_running"),
+            Some("unknown"),
+        );
+        let db = StateDb::open(&dir.path().join("state.db")).unwrap();
+
+        type MigrationBackfillRow = (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+            Option<String>,
+        );
+
+        let row: MigrationBackfillRow = db
+            .conn
+            .query_row(
+                "SELECT session_id, provider_session_id, resume_input_id,
+                        provider_session_capture_method, terminal_reason, status, error_category
+                 FROM invocations
+                 WHERE invocation_uuid = ?1",
+                params![invocation_uuid],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(row.0, None);
+        assert_eq!(row.1, None);
+        assert_eq!(row.2, None);
+        assert_eq!(row.3, None);
+        assert_eq!(row.4.as_deref(), Some("still_running"));
+        assert_eq!(row.5, "running");
+        assert_eq!(row.6.as_deref(), Some("unknown"));
+    }
+
+    #[test]
+    fn migration_backfill_resumed_chain_id_safe() {
+        let invocation_uuid = "22222222-2222-4222-8222-222222222222";
+        let dir = legacy_v4_invocation_dual_id_fixture(
+            invocation_uuid,
+            Some(CHAIN_A),
+            Some("resumed"),
+            "succeeded",
+            None,
+            None,
+        );
+        {
+            let conn = Connection::open(dir.path().join("state.db")).unwrap();
+            conn.execute(
+                "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
+                 VALUES (?1, '2026-04-17T08:00:00Z', '2026-04-17T08:00:00Z', 'claude-opus')",
+                params![CHAIN_A],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session_chain_segments
+                    (chain_id, provider_name, session_id, started_at, transition_reason)
+                 VALUES (?1, 'claude', ?2, '2026-04-17T08:00:00Z', 'initial')",
+                params![CHAIN_A, SESSION_A],
+            )
+            .unwrap();
+        }
+        let db = StateDb::open(&dir.path().join("state.db")).unwrap();
+
+        let row: (String, Option<String>, Option<String>, Option<String>) = db
+            .conn
+            .query_row(
+                "SELECT session_id, provider_session_id, resume_input_id,
+                        provider_session_capture_method
+                 FROM invocations
+                 WHERE invocation_uuid = ?1",
+                params![invocation_uuid],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        let models = resolver_model_store();
+        let resolved = db.resolve_resume(&models, CHAIN_A, None).unwrap();
+
+        assert_eq!(row.0, CHAIN_A);
+        assert_eq!(row.1, None);
+        assert_eq!(row.2.as_deref(), Some(CHAIN_A));
+        assert_eq!(row.3, None);
+        assert_eq!(resolved.active_session_id, SESSION_A);
+    }
+
+    #[test]
+    fn migration_backfill_non_resumed_with_session_id() {
+        let invocation_uuid = "33333333-3333-4333-8333-333333333333";
+        let dir = legacy_v4_invocation_dual_id_fixture(
+            invocation_uuid,
+            Some(SESSION_A),
+            Some("forced_flag_verified"),
+            "succeeded",
+            None,
+            None,
+        );
+        let db = StateDb::open(&dir.path().join("state.db")).unwrap();
+
+        let row: (String, Option<String>, Option<String>, Option<String>) = db
+            .conn
+            .query_row(
+                "SELECT session_id, provider_session_id, resume_input_id,
+                        provider_session_capture_method
+                 FROM invocations
+                 WHERE invocation_uuid = ?1",
+                params![invocation_uuid],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+
+        assert_eq!(row.0, SESSION_A);
+        assert_eq!(row.1.as_deref(), Some(SESSION_A));
+        assert_eq!(row.2, None);
+        assert_eq!(row.3.as_deref(), Some("forced_flag_verified"));
     }
 
     // risk: Chain identity write paths; level: particular-integration; source: proposal §11.1 Chain identity write paths / A3, A8.

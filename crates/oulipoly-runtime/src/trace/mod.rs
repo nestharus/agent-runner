@@ -50,6 +50,7 @@ pub struct TraceNode {
 pub struct TraceInvocation {
     pub row_id: i64,
     pub id: String,
+    pub agent_runner_invocation_id: String,
     pub source: Option<String>,
     pub model_name: String,
     pub parent_id: Option<String>,
@@ -76,6 +77,9 @@ pub struct StaleRunning {
 pub struct TraceSession {
     pub id: Option<String>,
     pub chain_id: Option<String>,
+    pub provider_session_id: Option<String>,
+    pub agent_runner_chain_id: Option<String>,
+    pub resume_input_id: Option<String>,
     pub capture_method: Option<String>,
     pub transcript_path: Option<String>,
     pub transcript_state: TranscriptState,
@@ -224,6 +228,7 @@ fn build_trace_node(
         invocation: TraceInvocation {
             row_id: record.id,
             id: record.invocation_uuid.clone(),
+            agent_runner_invocation_id: record.invocation_uuid.clone(),
             source: record.provider_name.clone(),
             model_name: record.model_name,
             parent_id: parent_uuid,
@@ -351,11 +356,18 @@ fn build_trace_session(
                 .to_string(),
         );
     }
-    let Some(session_id) = record.session_id.clone() else {
+    let provider_session_id = record
+        .provider_session_id
+        .clone()
+        .or_else(|| record.session_id.clone());
+    let Some(session_id) = provider_session_id.clone() else {
         return Ok((
             TraceSession {
                 id: None,
                 chain_id: None,
+                provider_session_id: None,
+                agent_runner_chain_id: None,
+                resume_input_id: record.resume_input_id.clone(),
                 capture_method: record.session_capture_method.clone(),
                 transcript_path: None,
                 transcript_state: TranscriptState::Unresolved,
@@ -368,6 +380,10 @@ fn build_trace_session(
             warnings,
         ));
     };
+    let explicit_resume_input_id = record.resume_input_id.clone();
+    let resume_input_id = explicit_resume_input_id.clone().or_else(|| {
+        (record.session_capture_method.as_deref() == Some("resumed")).then(|| session_id.clone())
+    });
 
     let Some(provider_name) = record.provider_name.as_deref() else {
         warnings.push("session_id is present but provider_name is missing".to_string());
@@ -375,6 +391,9 @@ fn build_trace_session(
             TraceSession {
                 id: Some(session_id),
                 chain_id: None,
+                provider_session_id,
+                agent_runner_chain_id: None,
+                resume_input_id,
                 capture_method: record.session_capture_method.clone(),
                 transcript_path: None,
                 transcript_state: TranscriptState::Unresolved,
@@ -408,12 +427,23 @@ fn build_trace_session(
     let chain_id = db
         .chain_id_for_segment(provider_name, &session_id)
         .unwrap_or(None);
+    let agent_runner_chain_id = if record.provider_session_capture_method.as_deref()
+        == Some("resumed")
+        && explicit_resume_input_id.as_deref() == provider_session_id.as_deref()
+    {
+        None
+    } else {
+        chain_id.clone()
+    };
 
     let Some(sessions_cfg) = sessions_cfg else {
         return Ok((
             TraceSession {
                 id: Some(session_id),
                 chain_id: chain_id.clone(),
+                provider_session_id: provider_session_id.clone(),
+                agent_runner_chain_id: agent_runner_chain_id.clone(),
+                resume_input_id: resume_input_id.clone(),
                 capture_method: record.session_capture_method.clone(),
                 transcript_path: None,
                 transcript_state: TranscriptState::NoLocator,
@@ -432,6 +462,9 @@ fn build_trace_session(
             TraceSession {
                 id: Some(session_id),
                 chain_id: chain_id.clone(),
+                provider_session_id: provider_session_id.clone(),
+                agent_runner_chain_id: agent_runner_chain_id.clone(),
+                resume_input_id: resume_input_id.clone(),
                 capture_method: record.session_capture_method.clone(),
                 transcript_path: None,
                 transcript_state: TranscriptState::NoLocator,
@@ -447,6 +480,9 @@ fn build_trace_session(
             TraceSession {
                 id: Some(session_id),
                 chain_id: chain_id.clone(),
+                provider_session_id: provider_session_id.clone(),
+                agent_runner_chain_id: agent_runner_chain_id.clone(),
+                resume_input_id: resume_input_id.clone(),
                 capture_method: record.session_capture_method.clone(),
                 transcript_path: Some(path.display().to_string()),
                 transcript_state: TranscriptState::Available,
@@ -462,6 +498,9 @@ fn build_trace_session(
             TraceSession {
                 id: Some(session_id),
                 chain_id: chain_id.clone(),
+                provider_session_id: provider_session_id.clone(),
+                agent_runner_chain_id: agent_runner_chain_id.clone(),
+                resume_input_id: resume_input_id.clone(),
                 capture_method: record.session_capture_method.clone(),
                 transcript_path: None,
                 transcript_state: TranscriptState::Missing,
@@ -478,7 +517,10 @@ fn build_trace_session(
             Ok((
                 TraceSession {
                     id: Some(session_id),
-                    chain_id,
+                    chain_id: chain_id.clone(),
+                    provider_session_id,
+                    agent_runner_chain_id,
+                    resume_input_id,
                     capture_method: record.session_capture_method.clone(),
                     transcript_path: None,
                     transcript_state: TranscriptState::Missing,
@@ -528,14 +570,30 @@ fn render_ascii_node(node: &TraceNode, depth: usize, output: &mut String) {
 }
 
 fn format_ascii_node(node: &TraceNode) -> String {
-    let session_field = if node.session.capture_method.as_deref() == Some("resumed") {
-        format!(
-            "Resume target: {}",
-            node.session.id.as_deref().unwrap_or("—")
-        )
-    } else {
-        format!("session={}", node.session.id.as_deref().unwrap_or("—"))
-    };
+    let has_dual_id_context = node.session.provider_session_id.is_some()
+        || node.session.agent_runner_chain_id.is_some()
+        || node.session.resume_input_id.is_some();
+    let mut role_fields = Vec::new();
+    if has_dual_id_context {
+        role_fields.push(format!(
+            "agent_runner_invocation={}",
+            node.invocation.agent_runner_invocation_id
+        ));
+    }
+    if let Some(provider_session_id) = node.session.provider_session_id.as_deref() {
+        role_fields.push(format!("provider_session={provider_session_id}"));
+    }
+    if let Some(chain_id) = node.session.agent_runner_chain_id.as_deref() {
+        role_fields.push(format!("chain={chain_id}"));
+    }
+    if let Some(resume_input_id) = node.session.resume_input_id.as_deref() {
+        role_fields.push(format!("resume_input={resume_input_id}"));
+    }
+    role_fields.push(format!(
+        "session={}",
+        node.session.id.as_deref().unwrap_or("—")
+    ));
+    let session_field = role_fields.join(" ");
     let resume_acceptance = node
         .session
         .resume_acceptance
@@ -1400,7 +1458,18 @@ transcript_locator = "{}"
         let json = serde_json::to_value(&report).unwrap();
         let session = &json["root"]["session"];
 
+        assert!(
+            json["root"]["invocation"]
+                .get("agent_runner_invocation_id")
+                .is_some()
+        );
         assert!(session["id"].is_null());
+        assert!(session.get("provider_session_id").is_some());
+        assert!(session["provider_session_id"].is_null());
+        assert!(session.get("resume_input_id").is_some());
+        assert!(session["resume_input_id"].is_null());
+        assert!(session.get("agent_runner_chain_id").is_some());
+        assert!(session["agent_runner_chain_id"].is_null());
         assert!(session["capture_method"].is_null());
         assert!(session["transcript_path"].is_null());
         assert_eq!(session["transcript_state"], "unresolved");
@@ -1808,9 +1877,14 @@ transcript_locator = "{}"
         let ascii = render_ascii_trace(&report);
 
         assert!(
-            ascii.contains("Resume target: 5169694d-de0f-40d1-890c-6e28e55bab27"),
+            ascii.contains("provider_session=5169694d-de0f-40d1-890c-6e28e55bab27"),
             "{ascii}"
         );
+        assert!(
+            ascii.contains("resume_input=5169694d-de0f-40d1-890c-6e28e55bab27"),
+            "{ascii}"
+        );
+        assert!(ascii.contains("agent_runner_invocation="), "{ascii}");
         assert!(ascii.contains(" resume=accepted"), "{ascii}");
     }
 
@@ -1881,12 +1955,24 @@ transcript_locator = "{}"
 
         let ascii = render_ascii_trace(&report);
         assert!(
-            ascii.contains("Resume target: 5169694d-de0f-40d1-890c-6e28e55bab27"),
+            ascii.contains("provider_session=5169694d-de0f-40d1-890c-6e28e55bab27"),
+            "{ascii}"
+        );
+        assert!(
+            ascii.contains("resume_input=5169694d-de0f-40d1-890c-6e28e55bab27"),
             "{ascii}"
         );
 
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["root"]["session"]["capture_method"], "resumed");
+        assert_eq!(
+            json["root"]["session"]["provider_session_id"],
+            "5169694d-de0f-40d1-890c-6e28e55bab27"
+        );
+        assert_eq!(
+            json["root"]["session"]["resume_input_id"],
+            "5169694d-de0f-40d1-890c-6e28e55bab27"
+        );
     }
 
     #[test]
@@ -1956,6 +2042,71 @@ transcript_locator = "{}"
 
         assert_eq!(json["root"]["session"]["id"], session_id);
         assert_eq!(json["root"]["session"]["chain_id"], chain_id);
+        assert_eq!(
+            json["root"]["invocation"]["agent_runner_invocation_id"],
+            json["root"]["invocation"]["id"]
+        );
+        assert_eq!(json["root"]["session"]["provider_session_id"], session_id);
+        assert_eq!(json["root"]["session"]["agent_runner_chain_id"], chain_id);
         assert!(json["root"]["session"].get("transcript_state").is_some());
+    }
+
+    #[test]
+    fn trace_json_dual_id_fields() {
+        let chain_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+        let fixture = TraceFixture::new(&base_rows());
+        fixture.set_session_capture(1, Some(session_id), Some("resumed"));
+        fixture.seed_chain_segment(chain_id, "fixture-provider", session_id);
+
+        let report = trace_invocation(
+            &fixture.db(),
+            ROOT_UUID,
+            TraceOptions {
+                max_depth: 64,
+                json: true,
+                inline_transcript: false,
+                transcript: false,
+            },
+        )
+        .unwrap();
+        let json = serde_json::to_value(&report).unwrap();
+
+        assert_eq!(json["root"]["invocation"]["id"], ROOT_UUID);
+        assert_eq!(
+            json["root"]["invocation"]["agent_runner_invocation_id"],
+            ROOT_UUID
+        );
+        assert_eq!(json["root"]["session"]["id"], session_id);
+        assert_eq!(json["root"]["session"]["provider_session_id"], session_id);
+        assert_eq!(json["root"]["session"]["resume_input_id"], session_id);
+        assert_eq!(json["root"]["session"]["chain_id"], chain_id);
+        assert_eq!(json["root"]["session"]["agent_runner_chain_id"], chain_id);
+    }
+
+    #[test]
+    fn trace_ascii_role_labels() {
+        let chain_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+        let fixture = TraceFixture::new(&base_rows());
+        fixture.set_session_capture(1, Some(session_id), Some("resumed"));
+        fixture.seed_chain_segment(chain_id, "fixture-provider", session_id);
+
+        let report = trace_invocation(&fixture.db(), ROOT_UUID, trace_options(64)).unwrap();
+        let ascii = render_ascii_trace(&report);
+
+        assert!(
+            ascii.contains(&format!("agent_runner_invocation={ROOT_UUID}")),
+            "{ascii}"
+        );
+        assert!(
+            ascii.contains(&format!("provider_session={session_id}")),
+            "{ascii}"
+        );
+        assert!(
+            ascii.contains(&format!("resume_input={session_id}")),
+            "{ascii}"
+        );
+        assert!(ascii.contains(&format!("chain={chain_id}")), "{ascii}");
     }
 }
