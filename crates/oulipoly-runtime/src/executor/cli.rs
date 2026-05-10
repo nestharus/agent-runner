@@ -1,6 +1,6 @@
 use oulipoly_config::{
     InputType, ModelConfig, PromptMode, ProviderConfig, ResumeKind, ResumeStrategy, SessionCapture,
-    SessionCaptureKind,
+    SessionCaptureKind, ToolRestrictionKind,
 };
 use oulipoly_state::CompositeInvocationId;
 use serde_json::Value;
@@ -499,10 +499,42 @@ fn execute_provider_with_args(
     parent_invocation_env: Option<&str>,
     start_known_provider_session_id: Option<&str>,
 ) -> Result<(RawResult, Vec<PathBuf>), String> {
-    let return_channel = prepare_return_channel(parent_invocation_env)?;
-    let mut cmd = build_command(
+    execute_provider_with_arg_parts(
         provider,
         provider_args,
+        &[],
+        prompt_mode,
+        prompt,
+        working_dir,
+        input_args,
+        parent_invocation_env,
+        start_known_provider_session_id,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "executor call shape keeps base args, lifecycle tail args, prompt mode, cwd, input flags, parent marker, and optional start-bound session explicit"
+)]
+fn execute_provider_with_arg_parts(
+    provider: &ProviderConfig,
+    provider_args: &[String],
+    tail_args: &[String],
+    prompt_mode: PromptMode,
+    prompt: &str,
+    working_dir: Option<&Path>,
+    input_args: &[String],
+    parent_invocation_env: Option<&str>,
+    start_known_provider_session_id: Option<&str>,
+) -> Result<(RawResult, Vec<PathBuf>), String> {
+    let return_channel = prepare_return_channel(parent_invocation_env)?;
+    let mut base_args = provider_args.to_vec();
+    let mut policy_prompt = Some(prompt.to_string());
+    apply_provider_policy(provider, &mut base_args, &mut policy_prompt)?;
+    let rendered_prompt = policy_prompt.unwrap_or_else(|| prompt.to_string());
+    let mut cmd = build_command(
+        provider,
+        &base_args,
         working_dir,
         parent_invocation_env,
         return_channel
@@ -522,21 +554,24 @@ fn execute_provider_with_args(
     for arg in capture_args {
         cmd.arg(arg);
     }
+    for arg in tail_args {
+        cmd.arg(arg);
+    }
 
     let mut temp_files = capture_files;
 
     match prompt_mode {
         PromptMode::Arg => {
-            if prompt.len() > LARGE_PROMPT_THRESHOLD {
+            if rendered_prompt.len() > LARGE_PROMPT_THRESHOLD {
                 let dir = working_dir.unwrap_or(Path::new("."));
                 let filename = format!("_agent_prompt_{}.md", uuid::Uuid::new_v4());
                 let path = dir.join(&filename);
-                std::fs::write(&path, prompt)
+                std::fs::write(&path, &rendered_prompt)
                     .map_err(|e| format!("Failed to write temp prompt file: {e}"))?;
                 cmd.arg(format!("Follow the instructions in {filename}"));
                 temp_files.push(path);
             } else {
-                cmd.arg(prompt);
+                cmd.arg(&rendered_prompt);
             }
             cmd.stdin(Stdio::null());
         }
@@ -556,7 +591,7 @@ fn execute_provider_with_args(
         && let Some(mut stdin) = child.stdin.take()
     {
         stdin
-            .write_all(prompt.as_bytes())
+            .write_all(rendered_prompt.as_bytes())
             .map_err(|e| format!("Failed to write to stdin: {e}"))?;
     }
 
@@ -589,6 +624,159 @@ fn execute_provider_with_args(
     Ok((result, temp_files))
 }
 
+fn apply_provider_policy(
+    provider: &ProviderConfig,
+    base_args: &mut Vec<String>,
+    prompt: &mut Option<String>,
+) -> Result<(), String> {
+    if provider.system_prompt_override.is_none() && provider.tool_restrictions.is_none() {
+        return Ok(());
+    }
+
+    let kind = provider_policy_kind(provider);
+    let restrictions = provider.tool_restrictions.as_ref();
+    if let Some(restrictions) = restrictions {
+        let claude_non_empty = !restrictions.claude.is_empty();
+        let codex_non_empty = !restrictions.codex.is_empty();
+        if claude_non_empty && codex_non_empty {
+            return Err(format!(
+                "provider {} has both Claude and Codex tool restrictions populated",
+                provider.name
+            ));
+        }
+        match restrictions.kind {
+            ToolRestrictionKind::Claude if codex_non_empty => {
+                return Err(format!(
+                    "provider {} declares Claude restrictions but populated Codex settings",
+                    provider.name
+                ));
+            }
+            ToolRestrictionKind::Codex if claude_non_empty => {
+                return Err(format!(
+                    "provider {} declares Codex restrictions but populated Claude settings",
+                    provider.name
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    match kind {
+        Some(ToolRestrictionKind::Claude) => {
+            if let Some(override_text) = &provider.system_prompt_override {
+                base_args.push("--append-system-prompt".to_string());
+                base_args.push(override_text.clone());
+            }
+            if let Some(restrictions) = restrictions {
+                if !restrictions.claude.disallowed_tools.is_empty() {
+                    base_args.push("--disallowed-tools".to_string());
+                    base_args.push(restrictions.claude.disallowed_tools.join(","));
+                }
+                if !restrictions.claude.allowed_tools.is_empty() {
+                    base_args.push("--allowed-tools".to_string());
+                    base_args.push(restrictions.claude.allowed_tools.join(","));
+                }
+                if restrictions.claude.disable_slash_commands {
+                    base_args.push("--disable-slash-commands".to_string());
+                }
+            }
+        }
+        Some(ToolRestrictionKind::Codex) => {
+            if let Some(override_text) = &provider.system_prompt_override {
+                let Some(existing_prompt) = prompt.take() else {
+                    return Err(format!(
+                        "provider {} has Codex system_prompt_override but this execution path has no prompt to prepend it to",
+                        provider.name
+                    ));
+                };
+                // Delimiter chosen to keep Codex fallback policy visibly separate from user prompt text.
+                *prompt = Some(format!(
+                    "<<<NESTHARUS-POLICY>>>\n{override_text}\n<<<END-POLICY>>>\n\n{existing_prompt}"
+                ));
+            }
+            if let Some(restrictions) = restrictions {
+                for pair in &restrictions.codex.config_pairs {
+                    base_args.push("-c".to_string());
+                    base_args.push(pair.clone());
+                }
+                for feature in &restrictions.codex.disabled_features {
+                    base_args.push("--disable".to_string());
+                    base_args.push(feature.clone());
+                }
+            }
+        }
+        None => {
+            return Err(format!(
+                "provider {} defines policy but its ecosystem could not be inferred",
+                provider.name
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn provider_policy_kind(provider: &ProviderConfig) -> Option<ToolRestrictionKind> {
+    if let Some(restrictions) = &provider.tool_restrictions {
+        return Some(restrictions.kind);
+    }
+    let command_provider = provider_executable_name(provider)
+        .unwrap_or_else(|| command_provider_basename(provider_name(&provider.command)));
+    if provider.name.starts_with("claude") || command_provider.starts_with("claude") {
+        Some(ToolRestrictionKind::Claude)
+    } else if provider.name.starts_with("codex") || command_provider.starts_with("codex") {
+        Some(ToolRestrictionKind::Codex)
+    } else {
+        None
+    }
+}
+
+fn command_provider_basename(provider: String) -> String {
+    std::path::Path::new(&provider)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(provider.as_str())
+        .to_string()
+}
+
+fn provider_executable_name(provider: &ProviderConfig) -> Option<String> {
+    let mut tokens = shell_split(&provider.command);
+    tokens.extend(provider.args.iter().cloned());
+
+    let mut i = 0;
+    while i < tokens.len() {
+        let token = tokens[i].as_str();
+        if token == "env" || token.ends_with("/env") {
+            i += 1;
+            continue;
+        }
+        if let Some(rest) = token.strip_prefix("--") {
+            if rest.is_empty() {
+                i += 1;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if let Some(rest) = token.strip_prefix('-') {
+            if matches!(rest, "u" | "e" | "S") {
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if token.contains('=') && token.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+            i += 1;
+            continue;
+        }
+
+        return Some(command_provider_basename(token.to_string()));
+    }
+
+    None
+}
+
 pub fn execute_resume(
     provider: &ProviderConfig,
     provider_index: usize,
@@ -599,12 +787,13 @@ pub fn execute_resume(
     resume: ResumePayload<'_>,
 ) -> Result<ExecutionResult, String> {
     let session_id = resume.session_id.to_string();
-    let provider_args = compose_resume_provider_args(provider.args.clone(), resume)?;
+    let resume_args = compose_resume_args(resume.strategy, resume.session_id)?;
     let mut provider_without_capture = provider.clone();
     provider_without_capture.session_capture = None;
-    let (result, temp_files) = execute_provider_with_args(
+    let (result, temp_files) = execute_provider_with_arg_parts(
         &provider_without_capture,
-        &provider_args,
+        &provider.args,
+        &resume_args,
         prompt_mode,
         prompt,
         working_dir,
@@ -747,6 +936,8 @@ pub fn execute_interactive_with_result(
     })?;
 
     let mut provider_args = interactive_args.clone();
+    let mut no_prompt = None;
+    apply_provider_policy(provider, &mut provider_args, &mut no_prompt)?;
     if let Some(resume) = resume {
         provider_args = compose_resume_provider_args(provider_args, resume)?;
     }
@@ -1178,8 +1369,8 @@ mod tests {
     use super::*;
     use crate::executor::{SessionCaptureMethod, SessionCaptureResult};
     use oulipoly_config::{
-        InputDef, InputType, ProviderConfig, ResumeKind, ResumeStrategy, SessionCapture,
-        SessionCaptureKind,
+        ClaudeRestrictions, CodexRestrictions, InputDef, InputType, ProviderConfig, ResumeKind,
+        ResumeStrategy, SessionCapture, SessionCaptureKind, ToolRestrictionKind, ToolRestrictions,
     };
     use oulipoly_state::CompositeInvocationId;
     #[cfg(unix)]
@@ -1202,6 +1393,75 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).unwrap();
         FixtureScript { _dir: dir, path }
+    }
+
+    fn read_argv_dump(path: &Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn age28_claude_provider(script_path: &Path, args: Vec<String>) -> ProviderConfig {
+        ProviderConfig {
+            name: "claude".to_string(),
+            command: script_path.to_string_lossy().into_owned(),
+            args,
+            interactive_args: Some(vec![
+                "--interactive-root".to_string(),
+                "--model".to_string(),
+                "opus".to_string(),
+            ]),
+            resume: None,
+            session_capture: Some(SessionCapture {
+                kind: SessionCaptureKind::ForcedFlagVerified,
+                flag: Some("--session-id".to_string()),
+                readback_args: None,
+                event_type: None,
+                event_id_path: None,
+                json_flag: None,
+                last_message_flag: None,
+            }),
+            resume_acceptance: None,
+            session_storage: None,
+            system_prompt_override: Some("AGE-28 Claude override".to_string()),
+            tool_restrictions: Some(ToolRestrictions {
+                kind: ToolRestrictionKind::Claude,
+                claude: ClaudeRestrictions {
+                    disallowed_tools: vec!["Task".to_string(), "Task tool".to_string()],
+                    allowed_tools: Vec::new(),
+                    disable_slash_commands: false,
+                },
+                codex: CodexRestrictions::default(),
+            }),
+        }
+    }
+
+    fn age28_codex_provider(script_path: &Path, args: Vec<String>) -> ProviderConfig {
+        ProviderConfig {
+            name: "codex".to_string(),
+            command: script_path.to_string_lossy().into_owned(),
+            args,
+            interactive_args: Some(vec![
+                "exec".to_string(),
+                "-m".to_string(),
+                "gpt-5.5".to_string(),
+            ]),
+            resume: None,
+            session_capture: None,
+            resume_acceptance: None,
+            session_storage: None,
+            system_prompt_override: Some("AGE-28 Codex override".to_string()),
+            tool_restrictions: Some(ToolRestrictions {
+                kind: ToolRestrictionKind::Codex,
+                claude: ClaudeRestrictions::default(),
+                codex: CodexRestrictions {
+                    config_pairs: vec!["sandbox=workspace-write".to_string()],
+                    disabled_features: vec!["web_search".to_string()],
+                },
+            }),
+        }
     }
 
     #[cfg(unix)]
@@ -1269,6 +1529,8 @@ printf 'effective stdout\n'
             session_capture: None,
             resume_acceptance: None,
             session_storage: None,
+            system_prompt_override: None,
+            tool_restrictions: None,
         };
         let mut extra_inputs = HashMap::new();
         extra_inputs.insert("size".to_string(), vec!["large".to_string()]);
@@ -1301,6 +1563,510 @@ printf 'effective stdout\n'
         assert!(argv.contains("--size\nlarge\n"), "{argv}");
         assert!(argv.contains("--quality\nstandard\n"), "{argv}");
         assert!(argv.ends_with("prompt routed as argv\n"), "{argv}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_oneshot_renders_append_system_prompt_once_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let argv_dump = dir.path().join("argv.txt");
+        let stdin_dump = dir.path().join("stdin.txt");
+        let script = fixture_script(&format!(
+            r#"requested=""
+printf '%s\n' "$@" > "{argv_dump}"
+cat > "{stdin_dump}"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --session-id)
+      requested="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+printf '{{"type":"system","subtype":"init","session_id":"%s"}}\n' "$requested""#,
+            argv_dump = argv_dump.display(),
+            stdin_dump = stdin_dump.display()
+        ));
+        let provider = age28_claude_provider(
+            &script.path,
+            vec!["-p".to_string(), "--model".to_string(), "opus".to_string()],
+        );
+        let model = ModelConfig {
+            name: "claude-opus".to_string(),
+            prompt_mode: PromptMode::Stdin,
+            providers: vec![ProviderConfig::model_provider("claude", Vec::new())],
+            inputs: vec![InputDef {
+                name: "tone".to_string(),
+                input_type: InputType::String,
+                required: false,
+                default_input: false,
+                default: None,
+                description: None,
+                flag: Some("--tone".to_string()),
+            }],
+        };
+        let mut extra_inputs = HashMap::new();
+        extra_inputs.insert("tone".to_string(), vec!["terse".to_string()]);
+        let request = EffectiveExecuteRequest {
+            model: &model,
+            provider: &provider,
+            provider_index: 0,
+            prompt_mode: PromptMode::Stdin,
+            prompt: "user prompt",
+            working_dir: Some(dir.path()),
+            extra_inputs: &extra_inputs,
+            parent_invocation_env: None,
+        };
+
+        execute_effective_with_start_known_provider_session_id(
+            request,
+            Some("11111111-2222-4333-8444-555555555555"),
+        )
+        .unwrap();
+
+        let argv = read_argv_dump(&argv_dump);
+        assert_eq!(
+            argv,
+            vec![
+                "-p",
+                "--model",
+                "opus",
+                "--append-system-prompt",
+                "AGE-28 Claude override",
+                "--disallowed-tools",
+                "Task,Task tool",
+                "--tone",
+                "terse",
+                "--session-id",
+                "11111111-2222-4333-8444-555555555555",
+            ]
+        );
+        assert_eq!(
+            argv.iter()
+                .filter(|arg| arg.as_str() == "--append-system-prompt")
+                .count(),
+            1
+        );
+        assert_eq!(std::fs::read_to_string(stdin_dump).unwrap(), "user prompt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_oneshot_renders_disallowed_tools_comma_joined() {
+        let argv_dump = tempfile::NamedTempFile::new().unwrap();
+        let argv_dump_path = argv_dump.path().to_path_buf();
+        let script = fixture_script(&format!(
+            r#"printf '%s\n' "$@" > "{dump}""#,
+            dump = argv_dump_path.display()
+        ));
+        let mut provider = age28_claude_provider(&script.path, vec!["-p".to_string()]);
+        provider.session_capture = None;
+        let model = ModelConfig {
+            name: "claude-opus".to_string(),
+            prompt_mode: PromptMode::Arg,
+            providers: vec![ProviderConfig::model_provider("claude", Vec::new())],
+            inputs: vec![],
+        };
+
+        execute_effective(EffectiveExecuteRequest {
+            model: &model,
+            provider: &provider,
+            provider_index: 0,
+            prompt_mode: PromptMode::Arg,
+            prompt: "hello",
+            working_dir: None,
+            extra_inputs: &HashMap::new(),
+            parent_invocation_env: None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            read_argv_dump(&argv_dump_path),
+            vec![
+                "-p",
+                "--append-system-prompt",
+                "AGE-28 Claude override",
+                "--disallowed-tools",
+                "Task,Task tool",
+                "hello",
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_resume_renders_policy_before_resume_tail() {
+        let argv_dump = tempfile::NamedTempFile::new().unwrap();
+        let argv_dump_path = argv_dump.path().to_path_buf();
+        let script = fixture_script(&format!(
+            r#"printf '%s\n' "$@" > "{dump}""#,
+            dump = argv_dump_path.display()
+        ));
+        let provider = age28_claude_provider(
+            &script.path,
+            vec!["-p".to_string(), "--model".to_string(), "opus".to_string()],
+        );
+        let strategy = ResumeStrategy {
+            kind: ResumeKind::Flag,
+            flag: Some("--resume".to_string()),
+            subcommand: None,
+        };
+
+        execute_resume(
+            &provider,
+            0,
+            PromptMode::Arg,
+            "continue work",
+            None,
+            None,
+            ResumePayload {
+                session_id: "5169694d-de0f-40d1-890c-6e28e55bab27",
+                strategy: &strategy,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_argv_dump(&argv_dump_path),
+            vec![
+                "-p",
+                "--model",
+                "opus",
+                "--append-system-prompt",
+                "AGE-28 Claude override",
+                "--disallowed-tools",
+                "Task,Task tool",
+                "--resume",
+                "5169694d-de0f-40d1-890c-6e28e55bab27",
+                "continue work",
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_interactive_renders_policy_before_resume_tail() {
+        let argv_dump = tempfile::NamedTempFile::new().unwrap();
+        let argv_dump_path = argv_dump.path().to_path_buf();
+        let script = fixture_script(&format!(
+            r#"printf '%s\n' "$@" > "{dump}""#,
+            dump = argv_dump_path.display()
+        ));
+        let provider = age28_claude_provider(&script.path, vec!["one-shot-only".to_string()]);
+        let strategy = ResumeStrategy {
+            kind: ResumeKind::Flag,
+            flag: Some("--resume".to_string()),
+            subcommand: None,
+        };
+
+        execute_interactive(
+            &provider,
+            None,
+            None,
+            Some(ResumePayload {
+                session_id: "5169694d-de0f-40d1-890c-6e28e55bab27",
+                strategy: &strategy,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_argv_dump(&argv_dump_path),
+            vec![
+                "--interactive-root",
+                "--model",
+                "opus",
+                "--append-system-prompt",
+                "AGE-28 Claude override",
+                "--disallowed-tools",
+                "Task,Task tool",
+                "--resume",
+                "5169694d-de0f-40d1-890c-6e28e55bab27",
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_oneshot_prepends_policy_block_to_arg_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let argv_dump = dir.path().join("argv.txt");
+        let prompt_dump = dir.path().join("prompt.txt");
+        let script = fixture_script(&format!(
+            r#"printf '%s\n' "$@" > "{argv_dump}"
+last="${{@: -1}}"
+printf '%s' "$last" > "{prompt_dump}""#,
+            argv_dump = argv_dump.display(),
+            prompt_dump = prompt_dump.display()
+        ));
+        let provider = age28_codex_provider(
+            &script.path,
+            vec!["exec".to_string(), "-m".to_string(), "gpt-5.5".to_string()],
+        );
+        let model = ModelConfig {
+            name: "gpt-high".to_string(),
+            prompt_mode: PromptMode::Arg,
+            providers: vec![ProviderConfig::model_provider("codex", Vec::new())],
+            inputs: vec![],
+        };
+
+        execute_effective(EffectiveExecuteRequest {
+            model: &model,
+            provider: &provider,
+            provider_index: 0,
+            prompt_mode: PromptMode::Arg,
+            prompt: "user codex prompt",
+            working_dir: Some(dir.path()),
+            extra_inputs: &HashMap::new(),
+            parent_invocation_env: None,
+        })
+        .unwrap();
+
+        let argv = read_argv_dump(&argv_dump);
+        assert!(!argv.iter().any(|arg| arg == "--append-system-prompt"));
+        assert!(!argv.iter().any(|arg| arg == "--disallowed-tools"));
+        let prompt = std::fs::read_to_string(prompt_dump).unwrap();
+        let policy_index = prompt.find("AGE-28 Codex override").unwrap();
+        let user_index = prompt.find("user codex prompt").unwrap();
+        assert!(policy_index < user_index, "{prompt}");
+        assert!(!prompt.starts_with("user codex prompt"), "{prompt}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_promptless_interactive_with_override_fails_closed() {
+        let script = fixture_script("exit 99");
+        let provider = age28_codex_provider(
+            &script.path,
+            vec!["exec".to_string(), "-m".to_string(), "gpt-5.5".to_string()],
+        );
+
+        let err = execute_interactive(&provider, None, None, None).unwrap_err();
+
+        assert!(
+            err.contains("Codex system_prompt_override")
+                && err.contains("no prompt to prepend it to"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn policy_with_command_path_basename_still_infers_provider_kind() {
+        let provider = ProviderConfig {
+            name: "primary".to_string(),
+            command: "/opt/bin/claude".to_string(),
+            args: Vec::new(),
+            interactive_args: None,
+            resume: None,
+            session_capture: None,
+            resume_acceptance: None,
+            session_storage: None,
+            system_prompt_override: Some("AGE-28 override".to_string()),
+            tool_restrictions: None,
+        };
+        let mut args = Vec::new();
+        let mut prompt = Some("user prompt".to_string());
+
+        apply_provider_policy(&provider, &mut args, &mut prompt).unwrap();
+
+        assert_eq!(
+            args,
+            vec![
+                "--append-system-prompt".to_string(),
+                "AGE-28 override".to_string()
+            ]
+        );
+        assert_eq!(prompt.as_deref(), Some("user prompt"));
+    }
+
+    #[test]
+    fn policy_with_split_env_command_args_still_infers_provider_kind() {
+        let provider = ProviderConfig {
+            name: "primary".to_string(),
+            command: "env".to_string(),
+            args: vec![
+                "-u".to_string(),
+                "CLAUDECODE".to_string(),
+                "claude".to_string(),
+                "-p".to_string(),
+            ],
+            interactive_args: None,
+            resume: None,
+            session_capture: None,
+            resume_acceptance: None,
+            session_storage: None,
+            system_prompt_override: Some("AGE-28 override".to_string()),
+            tool_restrictions: None,
+        };
+        let mut args = provider.args.clone();
+        let mut prompt = Some("user prompt".to_string());
+
+        apply_provider_policy(&provider, &mut args, &mut prompt).unwrap();
+
+        assert!(
+            args.contains(&"--append-system-prompt".to_string()),
+            "{args:?}"
+        );
+        assert!(args.contains(&"AGE-28 override".to_string()), "{args:?}");
+    }
+
+    #[test]
+    fn policy_with_unknown_provider_kind_fails_closed() {
+        let provider = ProviderConfig {
+            name: "primary".to_string(),
+            command: "custom-ai".to_string(),
+            args: Vec::new(),
+            interactive_args: None,
+            resume: None,
+            session_capture: None,
+            resume_acceptance: None,
+            session_storage: None,
+            system_prompt_override: Some("AGE-28 override".to_string()),
+            tool_restrictions: None,
+        };
+        let mut args = Vec::new();
+        let mut prompt = Some("user prompt".to_string());
+
+        let err = apply_provider_policy(&provider, &mut args, &mut prompt).unwrap_err();
+
+        assert!(err.contains("ecosystem could not be inferred"), "{err}");
+    }
+
+    #[test]
+    fn policy_with_kind_payload_mismatch_fails_closed() {
+        let provider = ProviderConfig {
+            name: "claude".to_string(),
+            command: "claude".to_string(),
+            args: Vec::new(),
+            interactive_args: None,
+            resume: None,
+            session_capture: None,
+            resume_acceptance: None,
+            session_storage: None,
+            system_prompt_override: None,
+            tool_restrictions: Some(ToolRestrictions {
+                kind: ToolRestrictionKind::Claude,
+                claude: ClaudeRestrictions::default(),
+                codex: CodexRestrictions {
+                    config_pairs: Vec::new(),
+                    disabled_features: vec!["web_search".to_string()],
+                },
+            }),
+        };
+        let mut args = Vec::new();
+        let mut prompt = Some("user prompt".to_string());
+
+        let err = apply_provider_policy(&provider, &mut args, &mut prompt).unwrap_err();
+
+        assert!(err.contains("declares Claude restrictions"), "{err}");
+        assert!(err.contains("populated Codex settings"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_largeprompt_tempfile_prepends_policy_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let argv_dump = dir.path().join("argv.txt");
+        let prompt_dump = dir.path().join("prompt.txt");
+        let script = fixture_script(&format!(
+            r#"printf '%s\n' "$@" > "{argv_dump}"
+last="${{@: -1}}"
+file="${{last#Follow the instructions in }}"
+cat "$file" > "{prompt_dump}""#,
+            argv_dump = argv_dump.display(),
+            prompt_dump = prompt_dump.display()
+        ));
+        let provider = age28_codex_provider(
+            &script.path,
+            vec!["exec".to_string(), "-m".to_string(), "gpt-5.5".to_string()],
+        );
+        let model = ModelConfig {
+            name: "gpt-high".to_string(),
+            prompt_mode: PromptMode::Arg,
+            providers: vec![ProviderConfig::model_provider("codex", Vec::new())],
+            inputs: vec![],
+        };
+        let prompt = format!(
+            "user codex prompt\n{}",
+            "x".repeat(LARGE_PROMPT_THRESHOLD + 1)
+        );
+
+        execute_effective(EffectiveExecuteRequest {
+            model: &model,
+            provider: &provider,
+            provider_index: 0,
+            prompt_mode: PromptMode::Arg,
+            prompt: &prompt,
+            working_dir: Some(dir.path()),
+            extra_inputs: &HashMap::new(),
+            parent_invocation_env: None,
+        })
+        .unwrap();
+
+        let argv = read_argv_dump(&argv_dump);
+        assert!(
+            argv.last()
+                .unwrap()
+                .starts_with("Follow the instructions in ")
+        );
+        let captured_prompt = std::fs::read_to_string(prompt_dump).unwrap();
+        let policy_index = captured_prompt.find("AGE-28 Codex override").unwrap();
+        let user_index = captured_prompt.find("user codex prompt").unwrap();
+        assert!(policy_index < user_index, "{captured_prompt}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_oneshot_renders_typed_config_pairs_only() {
+        let argv_dump = tempfile::NamedTempFile::new().unwrap();
+        let argv_dump_path = argv_dump.path().to_path_buf();
+        let script = fixture_script(&format!(
+            r#"printf '%s\n' "$@" > "{dump}"
+cat > /dev/null"#,
+            dump = argv_dump_path.display()
+        ));
+        let provider = age28_codex_provider(
+            &script.path,
+            vec!["exec".to_string(), "-m".to_string(), "gpt-5.5".to_string()],
+        );
+        let model = ModelConfig {
+            name: "gpt-high".to_string(),
+            prompt_mode: PromptMode::Stdin,
+            providers: vec![ProviderConfig::model_provider("codex", Vec::new())],
+            inputs: vec![],
+        };
+
+        execute_effective(EffectiveExecuteRequest {
+            model: &model,
+            provider: &provider,
+            provider_index: 0,
+            prompt_mode: PromptMode::Stdin,
+            prompt: "stdin prompt",
+            working_dir: None,
+            extra_inputs: &HashMap::new(),
+            parent_invocation_env: None,
+        })
+        .unwrap();
+
+        let argv = read_argv_dump(&argv_dump_path);
+        assert_eq!(
+            argv,
+            vec![
+                "exec",
+                "-m",
+                "gpt-5.5",
+                "-c",
+                "sandbox=workspace-write",
+                "--disable",
+                "web_search",
+            ]
+        );
+        assert!(!argv.iter().any(|arg| arg == "--append-system-prompt"));
+        assert!(!argv.iter().any(|arg| arg == "--allowed-tools"));
+        assert!(!argv.iter().any(|arg| arg == "--disallowed-tools"));
     }
 
     #[test]
@@ -1414,6 +2180,8 @@ printf 'effective stdout\n'
             session_capture: None,
             resume_acceptance: None,
             session_storage: None,
+            system_prompt_override: None,
+            tool_restrictions: None,
         };
 
         let err = execute_interactive(&provider, None, None, None).unwrap_err();
@@ -1441,6 +2209,8 @@ printf 'effective stdout\n'
             session_capture: None,
             resume_acceptance: None,
             session_storage: None,
+            system_prompt_override: None,
+            tool_restrictions: None,
         };
 
         let exit_code = execute_interactive(&provider, None, None, None).unwrap();
@@ -1467,6 +2237,8 @@ printf 'effective stdout\n'
             session_capture: None,
             resume_acceptance: None,
             session_storage: None,
+            system_prompt_override: None,
+            tool_restrictions: None,
         };
 
         let exit_code = execute_interactive(&provider, Some(tempdir.path()), None, None).unwrap();
@@ -1496,6 +2268,8 @@ printf 'effective stdout\n'
             session_capture: None,
             resume_acceptance: None,
             session_storage: None,
+            system_prompt_override: None,
+            tool_restrictions: None,
         };
         let parent_env =
             r#"{"source":"fixture-provider","id":"11111111-1111-1111-1111-111111111111"}"#;
@@ -1525,6 +2299,8 @@ printf 'effective stdout\n'
             session_capture: None,
             resume_acceptance: None,
             session_storage: None,
+            system_prompt_override: None,
+            tool_restrictions: None,
         };
         let strategy = ResumeStrategy {
             kind: ResumeKind::Flag,
@@ -1570,6 +2346,8 @@ printf 'effective stdout\n'
             session_capture: None,
             resume_acceptance: None,
             session_storage: None,
+            system_prompt_override: None,
+            tool_restrictions: None,
         };
         let strategy = ResumeStrategy {
             kind: ResumeKind::Flag,
@@ -1629,6 +2407,8 @@ printf '{{"type":"system","subtype":"init","session_id":"8f0a6a1f-9cd2-4c91-b6c6
             }),
             resume_acceptance: None,
             session_storage: None,
+            system_prompt_override: None,
+            tool_restrictions: None,
         };
         let strategy = ResumeStrategy {
             kind: ResumeKind::Flag,
@@ -1685,6 +2465,8 @@ printf '{{"type":"system","subtype":"init","session_id":"8f0a6a1f-9cd2-4c91-b6c6
             session_capture: None,
             resume_acceptance: None,
             session_storage: None,
+            system_prompt_override: None,
+            tool_restrictions: None,
         };
         let strategy = ResumeStrategy {
             kind: ResumeKind::Subcommand,
@@ -1736,6 +2518,8 @@ printf '{{"type":"system","subtype":"init","session_id":"8f0a6a1f-9cd2-4c91-b6c6
             session_capture: None,
             resume_acceptance: None,
             session_storage: None,
+            system_prompt_override: None,
+            tool_restrictions: None,
         };
         let strategy = ResumeStrategy {
             kind: ResumeKind::Subcommand,
@@ -1780,6 +2564,8 @@ printf '{{"type":"system","subtype":"init","session_id":"8f0a6a1f-9cd2-4c91-b6c6
             session_capture: None,
             resume_acceptance: None,
             session_storage: None,
+            system_prompt_override: None,
+            tool_restrictions: None,
         };
 
         let exit_code = execute_interactive(&provider, None, None, None).unwrap();
@@ -2070,6 +2856,8 @@ printf '{{"type":"system","subtype":"init","session_id":"%s"}}\n' "$requested""#
                 }),
                 resume_acceptance: None,
                 session_storage: None,
+                system_prompt_override: None,
+                tool_restrictions: None,
             }],
             inputs: vec![],
         };
@@ -2160,6 +2948,8 @@ printf '{{"type":"system","subtype":"init","session_id":"%s"}}\n' "$requested""#
                 }),
                 resume_acceptance: None,
                 session_storage: None,
+                system_prompt_override: None,
+                tool_restrictions: None,
             }],
             inputs: vec![],
         };
@@ -2216,6 +3006,8 @@ printf '{{"type":"system","subtype":"init","session_id":"%s"}}\n' "$requested""#
             }),
             resume_acceptance: None,
             session_storage: None,
+            system_prompt_override: None,
+            tool_restrictions: None,
         };
         let model = ModelConfig {
             name: "claude-test".to_string(),
@@ -2294,6 +3086,8 @@ printf '{"type":"system","subtype":"init","session_id":"11111111-1111-1111-1111-
                 }),
                 resume_acceptance: None,
                 session_storage: None,
+                system_prompt_override: None,
+                tool_restrictions: None,
             }],
             inputs: vec![],
         };
@@ -2354,6 +3148,8 @@ printf 'assistant text from tmpfile\n' > "$output_file""#,
                 }),
                 resume_acceptance: None,
                 session_storage: None,
+                system_prompt_override: None,
+                tool_restrictions: None,
             }],
             inputs: vec![],
         };
@@ -2413,6 +3209,8 @@ printf 'assistant text from tmpfile\n' > "$output_file""#,
                 }),
                 resume_acceptance: None,
                 session_storage: None,
+                system_prompt_override: None,
+                tool_restrictions: None,
             }],
             inputs: vec![],
         };

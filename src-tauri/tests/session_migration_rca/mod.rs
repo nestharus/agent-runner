@@ -153,6 +153,8 @@ fn claude_provider(name: &str, command: &Path, projects_dir: &Path) -> ProviderC
         session_storage: Some(SessionStorage::ClaudeCode {
             projects_dir: projects_dir.to_path_buf(),
         }),
+        system_prompt_override: None,
+        tool_restrictions: None,
     }
 }
 

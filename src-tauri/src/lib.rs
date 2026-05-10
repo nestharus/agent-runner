@@ -1069,7 +1069,10 @@ mod tests {
     use super::*;
     use config::{ModelConfig, PromptMode, ProviderConfig};
     use oulipoly_config::repositories::ProvidersConfigRepository;
-    use oulipoly_config::{ProviderEntry, ProvidersConfig};
+    use oulipoly_config::{
+        ClaudeRestrictions, CodexRestrictions, ProviderEntry, ProvidersConfig, ToolRestrictionKind,
+        ToolRestrictions,
+    };
     use oulipoly_runtime::executor::{
         CapturedChildInvocation, ExecutionResult, ResumeAcceptanceResult, SessionCaptureMethod,
         SessionCaptureResult,
@@ -1082,7 +1085,6 @@ mod tests {
     use oulipoly_state::repositories::{SetupRepository, StateDbOpener};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::Arc;
 
     #[cfg(unix)]
     fn write_executable(path: &std::path::Path, body: &str) {
@@ -1509,6 +1511,54 @@ mod tests {
                     .unwrap()
                     .take()
                     .expect("stub executor output should be consumed once"),
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct PolicyRecordingExecutorService {
+        providers: Mutex<Vec<ProviderConfig>>,
+    }
+
+    impl PolicyRecordingExecutorService {
+        fn providers(&self) -> Vec<ProviderConfig> {
+            self.providers.lock().unwrap().clone()
+        }
+    }
+
+    impl ExecutorServicePort for PolicyRecordingExecutorService {
+        fn execute(
+            &self,
+            request: ExecutorServiceRequest,
+        ) -> Result<ExecutorServiceOutput, ServiceError> {
+            let provider = match request {
+                ExecutorServiceRequest::Effective { provider, .. }
+                | ExecutorServiceRequest::EffectiveWithStartKnownProviderSessionId {
+                    provider,
+                    ..
+                } => provider,
+                ExecutorServiceRequest::Facade { .. } => {
+                    return Err(ServiceError::Dependency {
+                        message: "test_model must use effective provider requests".to_string(),
+                    });
+                }
+            };
+            self.providers.lock().unwrap().push(provider);
+            Ok(ExecutorServiceOutput {
+                result: ExecutionResult {
+                    stdout: b"ok".to_vec(),
+                    stderr: String::new(),
+                    exit_code: 0,
+                    provider_index: 0,
+                    session_capture: SessionCaptureResult {
+                        session_id: None,
+                        method: SessionCaptureMethod::None,
+                    },
+                    resume_acceptance: None::<ResumeAcceptanceResult>,
+                    terminal_reason: None,
+                    captured_child_invocations: Vec::<CapturedChildInvocation>::new(),
+                    returned_artifacts: Vec::new(),
+                },
             })
         }
     }
@@ -2051,6 +2101,76 @@ mod tests {
             vec!["effective:age38-provider:0:true:true"]
         );
         assert!(diagnostics.calls().is_empty());
+    }
+
+    #[test]
+    fn tauri_test_model_injects_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let db_path = dir.path().join("state.db");
+        let model = model_with_provider_args("age28-model", "claude", &["--model", "opus"]);
+        let mut entries = HashMap::new();
+        entries.insert(
+            "claude".to_string(),
+            ProviderEntry {
+                command: Some("claude".to_string()),
+                args: vec!["-p".to_string()],
+                system_prompt_override: Some("AGE-28 test_model policy".to_string()),
+                tool_restrictions: Some(ToolRestrictions {
+                    kind: ToolRestrictionKind::Claude,
+                    claude: ClaudeRestrictions {
+                        disallowed_tools: vec!["Task".to_string()],
+                        allowed_tools: Vec::new(),
+                        disable_slash_commands: false,
+                    },
+                    codex: CodexRestrictions::default(),
+                }),
+                ..ProviderEntry::default()
+            },
+        );
+        let opener = StubStateDbOpener::opening(db_path.clone());
+        let providers = StubProvidersConfigRepository::returning(Ok(ProvidersConfig { entries }));
+        let routing = StubRoutingService::selecting(0);
+        let executor = PolicyRecordingExecutorService::default();
+        let diagnostics = StubDiagnosticsService::returning(false);
+        let services = TestModelServices {
+            state_db_opener: &opener,
+            providers_repository: &providers,
+            routing_service: &routing,
+            executor_service: &executor,
+            diagnostics_service: &diagnostics,
+        };
+
+        let result = super::test_model_with_db_path(
+            services,
+            model,
+            models_dir,
+            db_path,
+            "Say hello in one sentence.",
+        )
+        .expect("test_model should execute through effective provider path");
+
+        assert!(result.success);
+        let captured = executor.providers();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].args, ["-p", "--model", "opus"]);
+        assert_eq!(
+            captured[0].system_prompt_override.as_deref(),
+            Some("AGE-28 test_model policy")
+        );
+        assert_eq!(
+            captured[0].tool_restrictions,
+            Some(ToolRestrictions {
+                kind: ToolRestrictionKind::Claude,
+                claude: ClaudeRestrictions {
+                    disallowed_tools: vec!["Task".to_string()],
+                    allowed_tools: Vec::new(),
+                    disable_slash_commands: false,
+                },
+                codex: CodexRestrictions::default(),
+            })
+        );
     }
 
     #[test]

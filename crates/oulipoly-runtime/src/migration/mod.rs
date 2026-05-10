@@ -333,6 +333,8 @@ mod tests {
             session_capture: None,
             resume_acceptance: None,
             session_storage: Some(SessionStorage::ClaudeCode { projects_dir }),
+            system_prompt_override: None,
+            tool_restrictions: None,
         };
         ModelConfig {
             name: "claude-opus".to_string(),

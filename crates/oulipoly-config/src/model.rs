@@ -22,6 +22,10 @@ pub struct ProviderConfig {
     pub resume_acceptance: Option<ResumeAcceptanceRules>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_storage: Option<SessionStorage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt_override: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_restrictions: Option<ToolRestrictions>,
 }
 
 impl ProviderConfig {
@@ -38,6 +42,8 @@ impl ProviderConfig {
             session_capture: None,
             resume_acceptance: None,
             session_storage: None,
+            system_prompt_override: None,
+            tool_restrictions: None,
         }
     }
 
@@ -71,8 +77,73 @@ impl ProviderConfig {
             session_capture: None,
             resume_acceptance: None,
             session_storage: None,
+            system_prompt_override: None,
+            tool_restrictions: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct ToolRestrictions {
+    pub kind: ToolRestrictionKind,
+    #[serde(default, skip_serializing_if = "ClaudeRestrictions::is_empty")]
+    pub claude: ClaudeRestrictions,
+    #[serde(default, skip_serializing_if = "CodexRestrictions::is_empty")]
+    pub codex: CodexRestrictions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolRestrictionKind {
+    #[default]
+    Claude,
+    Codex,
+}
+
+impl std::fmt::Display for ToolRestrictionKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Claude => f.write_str("claude"),
+            Self::Codex => f.write_str("codex"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClaudeRestrictions {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disallowed_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub disable_slash_commands: bool,
+}
+
+impl ClaudeRestrictions {
+    pub fn is_empty(&self) -> bool {
+        self.disallowed_tools.is_empty()
+            && self.allowed_tools.is_empty()
+            && !self.disable_slash_commands
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CodexRestrictions {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub config_pairs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_features: Vec<String>,
+}
+
+impl CodexRestrictions {
+    pub fn is_empty(&self) -> bool {
+        self.config_pairs.is_empty() && self.disabled_features.is_empty()
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -284,8 +355,13 @@ fn expand_leading_tilde(path: PathBuf) -> PathBuf {
 /// and env-var assignments of the form `FOO=bar`. Returns the command string
 /// itself as a last-resort fallback.
 pub fn derive_provider_name(command: &str, args: &[String]) -> String {
-    let mut all: Vec<&str> = Vec::with_capacity(1 + args.len());
-    all.push(command);
+    let command_tokens = crate::providers::shell_split(command);
+    let mut all: Vec<&str> = Vec::with_capacity(command_tokens.len() + args.len());
+    if command_tokens.is_empty() {
+        all.push(command);
+    } else {
+        all.extend(command_tokens.iter().map(String::as_str));
+    }
     for a in args {
         all.push(a.as_str());
     }
@@ -424,6 +500,8 @@ struct RawProvider {
     session_capture: Option<SessionCapture>,
     resume_acceptance: Option<ResumeAcceptanceRules>,
     session_storage: Option<SessionStorage>,
+    system_prompt_override: Option<String>,
+    tool_restrictions: Option<ToolRestrictions>,
 }
 
 #[derive(Deserialize)]
@@ -641,6 +719,18 @@ impl ModelConfig {
             providers
                 .into_iter()
                 .map(|p| {
+                    if p.system_prompt_override.is_some() {
+                        let provider_name = p.name.as_deref().unwrap_or("<unnamed>");
+                        return Err(format!(
+                            "model {name} provider {provider_name}: system_prompt_override is root-only; move to providers.toml"
+                        ));
+                    }
+                    if p.tool_restrictions.is_some() {
+                        let provider_name = p.name.as_deref().unwrap_or("<unnamed>");
+                        return Err(format!(
+                            "model {name} provider {provider_name}: tool_restrictions is root-only; move to providers.toml"
+                        ));
+                    }
                     if p.command.is_some()
                         || p.resume.is_some()
                         || p.session_capture.is_some()
@@ -665,6 +755,8 @@ impl ModelConfig {
                         session_capture: None,
                         resume_acceptance: None,
                         session_storage: None,
+                        system_prompt_override: None,
+                        tool_restrictions: None,
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?
@@ -820,23 +912,74 @@ fn codex_arg_overlap(root_args: &[String], model_args: &[String]) -> Option<Stri
         .map(|part| part.display())
 }
 
+fn codex_config_pair_key(value: &str) -> &str {
+    value.split_once('=').map(|(key, _)| key).unwrap_or(value)
+}
+
+fn codex_model_config_pair_keys(args: &[String]) -> HashSet<String> {
+    split_codex_arg_parts(args)
+        .into_iter()
+        .filter_map(|part| match part {
+            CodexArgPart::Pair { value, .. } => Some(codex_config_pair_key(&value).to_string()),
+            CodexArgPart::Standalone(_) => None,
+        })
+        .collect()
+}
+
+fn codex_typed_policy_overlap(
+    root: &crate::providers::ProviderEntry,
+    model_args: &[String],
+) -> Option<String> {
+    let policy_pairs = root
+        .tool_restrictions
+        .as_ref()
+        .filter(|restrictions| restrictions.kind == ToolRestrictionKind::Codex)?
+        .codex
+        .config_pairs
+        .iter()
+        .collect::<Vec<_>>();
+    if policy_pairs.is_empty() {
+        return None;
+    }
+
+    let model_keys = codex_model_config_pair_keys(model_args);
+    policy_pairs
+        .into_iter()
+        .find(|pair| model_keys.contains(codex_config_pair_key(pair)))
+        .map(|pair| pair.to_string())
+}
+
 pub(crate) fn validate_codex_model_arg_overlap(
     model_name: &str,
     model: &ModelConfig,
     providers: &crate::providers::ProvidersConfig,
 ) -> Result<(), String> {
-    let Some(root_codex) = providers.get("codex") else {
-        return Ok(());
-    };
+    for model_provider in model.providers.iter() {
+        let Some(root_codex) = providers.get(&model_provider.name) else {
+            continue;
+        };
+        let root_family = derive_provider_name(
+            root_codex
+                .command
+                .as_deref()
+                .unwrap_or(&model_provider.name),
+            &root_codex.args,
+        );
+        if !root_family.starts_with("codex") && !model_provider.name.starts_with("codex") {
+            continue;
+        }
 
-    for model_provider in model
-        .providers
-        .iter()
-        .filter(|provider| provider.name == "codex")
-    {
         if let Some(display) = codex_arg_overlap(&root_codex.args, &model_provider.args) {
             return Err(format!(
-                "Model {model_name} provider codex: args token \"{display}\" duplicates root [codex].args; leave provider-level Codex flags in providers.toml and keep only model-specific flags in model TOML; run `agents migrate-config` to repair existing files."
+                "Model {model_name} provider {}: args token \"{display}\" duplicates root [{}].args; leave provider-level Codex flags in providers.toml and keep only model-specific flags in model TOML; run `agents migrate-config` to repair existing files.",
+                model_provider.name, model_provider.name
+            ));
+        }
+
+        if let Some(display) = codex_typed_policy_overlap(root_codex, &model_provider.args) {
+            return Err(format!(
+                "Model {model_name} provider {}: typed-policy config pair \"{display}\" duplicates model args; leave provider-level Codex policy in providers.toml and keep only model-specific flags in model TOML.",
+                model_provider.name
             ));
         }
 
@@ -848,7 +991,8 @@ pub(crate) fn validate_codex_model_arg_overlap(
             && let Some(display) = codex_arg_overlap(root_interactive_args, model_interactive_args)
         {
             return Err(format!(
-                "Model {model_name} provider codex: interactive_args token \"{display}\" duplicates root [codex].interactive_args; leave provider-level Codex flags in providers.toml and keep only model-specific flags in model TOML; run `agents migrate-config` to repair existing files."
+                "Model {model_name} provider {}: interactive_args token \"{display}\" duplicates root [{}].interactive_args; leave provider-level Codex flags in providers.toml and keep only model-specific flags in model TOML; run `agents migrate-config` to repair existing files.",
+                model_provider.name, model_provider.name
             ));
         }
     }
@@ -968,6 +1112,30 @@ mod tests {
         ProvidersConfig { entries }
     }
 
+    fn codex_providers_with_typed_policy(config_pairs: &[&str]) -> ProvidersConfig {
+        let mut entries = HashMap::new();
+        entries.insert(
+            "codex".to_string(),
+            ProviderEntry {
+                command: Some("codex".to_string()),
+                args: vec!["exec".to_string()],
+                tool_restrictions: Some(ToolRestrictions {
+                    kind: ToolRestrictionKind::Codex,
+                    claude: ClaudeRestrictions::default(),
+                    codex: CodexRestrictions {
+                        config_pairs: config_pairs
+                            .iter()
+                            .map(|pair| (*pair).to_string())
+                            .collect(),
+                        disabled_features: Vec::new(),
+                    },
+                }),
+                ..ProviderEntry::default()
+            },
+        );
+        ProvidersConfig { entries }
+    }
+
     #[test]
     fn derive_provider_name_simple() {
         assert_eq!(derive_provider_name("claude", &[]), "claude");
@@ -984,6 +1152,14 @@ mod tests {
             "opus".to_string(),
         ];
         assert_eq!(derive_provider_name("env", &args), "claude2");
+    }
+
+    #[test]
+    fn derive_provider_name_prefixed_command_string() {
+        assert_eq!(
+            derive_provider_name("env -u CODEX_ENV codex", &["exec".to_string()]),
+            "codex"
+        );
     }
 
     #[test]
@@ -1124,6 +1300,29 @@ flag = "--resume"
         let err = ModelConfig::from_toml("claude-opus", toml).unwrap_err();
         assert!(err.contains("Old per-provider config detected in claude-opus.toml"));
         assert!(err.contains("agents migrate-config"));
+    }
+
+    #[test]
+    fn model_toml_rejects_age28_provider_fields() {
+        let toml = r#"
+[[providers]]
+name = "claude"
+args = ["--model", "opus"]
+system_prompt_override = "root-only policy must not live in model TOML"
+
+[providers.tool_restrictions]
+kind = "claude"
+
+[providers.tool_restrictions.claude]
+disallowed_tools = ["Task"]
+"#;
+
+        let err = ModelConfig::from_toml("claude-opus", toml).unwrap_err();
+
+        assert!(err.contains("model claude-opus provider claude"), "{err}");
+        assert!(err.contains("system_prompt_override"), "{err}");
+        assert!(err.contains("root-only"), "{err}");
+        assert!(err.contains("providers.toml"), "{err}");
     }
 
     #[test]
@@ -1270,6 +1469,125 @@ args = ["-c", "sandbox=workspace-write"]
 
         assert!(err.contains("(-c, sandbox=workspace-write)"));
         assert!(err.contains("[codex].args"));
+    }
+
+    #[test]
+    fn codex_overlap_guard_blocks_typed_policy_vs_model_arg_collision() {
+        let providers = codex_providers_with_typed_policy(&["model_reasoning_effort=high"]);
+        let model = test_model(
+            "codex",
+            &["-m", "gpt-5.5", "-c", "model_reasoning_effort=high"],
+        );
+
+        let err = validate_codex_model_arg_overlap("gpt-high", &model, &providers).unwrap_err();
+
+        assert!(err.contains("gpt-high"), "{err}");
+        assert!(err.contains("codex"), "{err}");
+        assert!(err.contains("typed-policy"), "{err}");
+        assert!(err.contains("model_reasoning_effort=high"), "{err}");
+    }
+
+    #[test]
+    fn codex_overlap_guard_blocks_typed_policy_key_override() {
+        let providers = codex_providers_with_typed_policy(&["sandbox=read-only"]);
+        let model = test_model("codex", &["-m", "gpt-5.5", "-c", "sandbox=workspace-write"]);
+
+        let err = validate_codex_model_arg_overlap("gpt-high", &model, &providers).unwrap_err();
+
+        assert!(err.contains("typed-policy"), "{err}");
+        assert!(err.contains("sandbox=read-only"), "{err}");
+    }
+
+    #[test]
+    fn codex_overlap_guard_does_not_regress_model_reasoning_effort() {
+        let empty_policy = codex_providers_with_typed_policy(&[]);
+        let model = test_model(
+            "codex",
+            &["-m", "gpt-5.5", "-c", "model_reasoning_effort=high"],
+        );
+        validate_codex_model_arg_overlap("gpt-high", &model, &empty_policy).unwrap();
+
+        let unrelated_policy = codex_providers_with_typed_policy(&["other_key=val"]);
+        validate_codex_model_arg_overlap("gpt-high", &model, &unrelated_policy).unwrap();
+
+        load_temp_models(
+            r#"
+[codex]
+command = "codex"
+args = ["exec", "-c", "sandbox=workspace-write"]
+"#,
+            "gpt-high",
+            r#"
+[[providers]]
+name = "codex"
+args = ["-c", "model_reasoning_effort=high"]
+"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn codex_overlap_guard_characterizes_sibling_alias_policy() {
+        let mut entries = HashMap::new();
+        entries.insert(
+            "codex2".to_string(),
+            ProviderEntry {
+                command: Some("codex2".to_string()),
+                args: vec!["exec".to_string()],
+                tool_restrictions: Some(ToolRestrictions {
+                    kind: ToolRestrictionKind::Codex,
+                    claude: ClaudeRestrictions::default(),
+                    codex: CodexRestrictions {
+                        config_pairs: vec!["model_reasoning_effort=high".to_string()],
+                        disabled_features: Vec::new(),
+                    },
+                }),
+                ..ProviderEntry::default()
+            },
+        );
+        let providers = ProvidersConfig { entries };
+        let model = test_model(
+            "codex2",
+            &["-m", "gpt-5.5", "-c", "model_reasoning_effort=high"],
+        );
+
+        let err = validate_codex_model_arg_overlap("gpt-high", &model, &providers).unwrap_err();
+
+        assert!(err.contains("codex2"), "{err}");
+        assert!(err.contains("typed-policy"), "{err}");
+        assert!(err.contains("model_reasoning_effort=high"), "{err}");
+    }
+
+    #[test]
+    fn codex_overlap_guard_uses_prefixed_root_command_string() {
+        let mut entries = HashMap::new();
+        entries.insert(
+            "primary".to_string(),
+            ProviderEntry {
+                command: Some("env -u CODEX_ENV codex".to_string()),
+                args: vec!["exec".to_string()],
+                tool_restrictions: Some(ToolRestrictions {
+                    kind: ToolRestrictionKind::Codex,
+                    claude: ClaudeRestrictions::default(),
+                    codex: CodexRestrictions {
+                        config_pairs: vec!["model_reasoning_effort=high".to_string()],
+                        disabled_features: Vec::new(),
+                    },
+                }),
+                ..ProviderEntry::default()
+            },
+        );
+        let providers = ProvidersConfig { entries };
+        let model = test_model(
+            "primary",
+            &["-m", "gpt-5.5", "-c", "model_reasoning_effort=high"],
+        );
+
+        let err = validate_codex_model_arg_overlap("gpt-high", &model, &providers).unwrap_err();
+
+        assert!(err.contains("primary"), "{err}");
+        assert!(err.contains("typed-policy"), "{err}");
+        assert!(err.contains("model_reasoning_effort=high"), "{err}");
     }
 
     #[test]

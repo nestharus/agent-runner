@@ -1,0 +1,212 @@
+[claude]
+command = "env -u CLAUDECODE claude"
+args = ["-p", "--dangerously-skip-permissions", "--output-format", "json"]
+interactive_args = ["--dangerously-skip-permissions"]
+prompt_mode = "stdin"
+system_prompt_override = """
+Do not use the host CLI built-in sub-agent or Task tool to spawn child invocations.
+Use agents -m <model> -f <prompt-file> for child work instead.
+Never call bare agents with no arguments because it launches an interactive UI on the user's machine.
+A valid child dispatch is: agents -m <model> -f <prompt-file>
+"""
+
+[claude.resume]
+kind = "flag"
+flag = "--resume"
+
+[claude.session_capture]
+kind = "forced_flag_verified"
+flag = "--session-id"
+
+[claude.tool_restrictions]
+kind = "claude"
+
+[claude.tool_restrictions.claude]
+disallowed_tools = ["Task"]
+
+[claude2]
+command = "env -u CLAUDECODE claude2"
+args = ["-p", "--dangerously-skip-permissions", "--output-format", "json"]
+interactive_args = ["--dangerously-skip-permissions"]
+prompt_mode = "stdin"
+system_prompt_override = """
+Do not use the host CLI built-in sub-agent or Task tool to spawn child invocations.
+Use agents -m <model> -f <prompt-file> for child work instead.
+Never call bare agents with no arguments because it launches an interactive UI on the user's machine.
+A valid child dispatch is: agents -m <model> -f <prompt-file>
+"""
+
+[claude2.resume]
+kind = "flag"
+flag = "--resume"
+
+[claude2.session_capture]
+kind = "forced_flag_verified"
+flag = "--session-id"
+
+[claude2.tool_restrictions]
+kind = "claude"
+
+[claude2.tool_restrictions.claude]
+disallowed_tools = ["Task"]
+
+[claude3]
+command = "env -u CLAUDECODE claude3"
+args = ["-p", "--dangerously-skip-permissions", "--output-format", "json"]
+interactive_args = ["--dangerously-skip-permissions"]
+prompt_mode = "stdin"
+system_prompt_override = """
+Do not use the host CLI built-in sub-agent or Task tool to spawn child invocations.
+Use agents -m <model> -f <prompt-file> for child work instead.
+Never call bare agents with no arguments because it launches an interactive UI on the user's machine.
+A valid child dispatch is: agents -m <model> -f <prompt-file>
+"""
+
+[claude3.resume]
+kind = "flag"
+flag = "--resume"
+
+[claude3.session_capture]
+kind = "forced_flag_verified"
+flag = "--session-id"
+
+[claude3.tool_restrictions]
+kind = "claude"
+
+[claude3.tool_restrictions.claude]
+disallowed_tools = ["Task"]
+
+[claude4]
+command = "env -u CLAUDECODE claude4"
+args = ["-p", "--dangerously-skip-permissions", "--output-format", "json"]
+interactive_args = ["--dangerously-skip-permissions"]
+prompt_mode = "stdin"
+system_prompt_override = """
+Do not use the host CLI built-in sub-agent or Task tool to spawn child invocations.
+Use agents -m <model> -f <prompt-file> for child work instead.
+Never call bare agents with no arguments because it launches an interactive UI on the user's machine.
+A valid child dispatch is: agents -m <model> -f <prompt-file>
+"""
+
+[claude4.resume]
+kind = "flag"
+flag = "--resume"
+
+[claude4.session_capture]
+kind = "forced_flag_verified"
+flag = "--session-id"
+
+[claude4.tool_restrictions]
+kind = "claude"
+
+[claude4.tool_restrictions.claude]
+disallowed_tools = ["Task"]
+
+[claude5]
+command = "env -u CLAUDECODE claude5"
+args = ["-p", "--dangerously-skip-permissions", "--output-format", "json"]
+interactive_args = ["--dangerously-skip-permissions"]
+prompt_mode = "stdin"
+system_prompt_override = """
+Do not use the host CLI built-in sub-agent or Task tool to spawn child invocations.
+Use agents -m <model> -f <prompt-file> for child work instead.
+Never call bare agents with no arguments because it launches an interactive UI on the user's machine.
+A valid child dispatch is: agents -m <model> -f <prompt-file>
+"""
+
+[claude5.resume]
+kind = "flag"
+flag = "--resume"
+
+[claude5.session_capture]
+kind = "forced_flag_verified"
+flag = "--session-id"
+
+[claude5.tool_restrictions]
+kind = "claude"
+
+[claude5.tool_restrictions.claude]
+disallowed_tools = ["Task"]
+
+[claude6]
+command = "env -u CLAUDECODE claude6"
+args = ["-p", "--dangerously-skip-permissions", "--output-format", "json"]
+interactive_args = ["--dangerously-skip-permissions"]
+prompt_mode = "stdin"
+system_prompt_override = """
+Do not use the host CLI built-in sub-agent or Task tool to spawn child invocations.
+Use agents -m <model> -f <prompt-file> for child work instead.
+Never call bare agents with no arguments because it launches an interactive UI on the user's machine.
+A valid child dispatch is: agents -m <model> -f <prompt-file>
+"""
+
+[claude6.resume]
+kind = "flag"
+flag = "--resume"
+
+[claude6.session_capture]
+kind = "forced_flag_verified"
+flag = "--session-id"
+
+[claude6.tool_restrictions]
+kind = "claude"
+
+[claude6.tool_restrictions.claude]
+disallowed_tools = ["Task"]
+
+[codex]
+command = "codex"
+args = ["exec", "--dangerously-bypass-approvals-and-sandbox"]
+interactive_args = ["--dangerously-bypass-approvals-and-sandbox"]
+prompt_mode = "arg"
+system_prompt_override = """
+Do not use the host CLI built-in sub-agent or Task tool to spawn child invocations.
+Use agents -m <model> -f <prompt-file> for child work instead.
+Never call bare agents with no arguments because it launches an interactive UI on the user's machine.
+A valid child dispatch is: agents -m <model> -f <prompt-file>
+"""
+
+[codex.resume]
+kind = "subcommand"
+subcommand = ["resume"]
+
+[codex.tool_restrictions]
+kind = "codex"
+
+[codex2]
+command = "codex2"
+args = ["exec", "--dangerously-bypass-approvals-and-sandbox"]
+interactive_args = ["--dangerously-bypass-approvals-and-sandbox"]
+prompt_mode = "arg"
+system_prompt_override = """
+Do not use the host CLI built-in sub-agent or Task tool to spawn child invocations.
+Use agents -m <model> -f <prompt-file> for child work instead.
+Never call bare agents with no arguments because it launches an interactive UI on the user's machine.
+A valid child dispatch is: agents -m <model> -f <prompt-file>
+"""
+
+[codex2.resume]
+kind = "subcommand"
+subcommand = ["resume"]
+
+[codex2.tool_restrictions]
+kind = "codex"
+
+[codex3]
+command = "codex3"
+args = ["exec", "--dangerously-bypass-approvals-and-sandbox"]
+interactive_args = ["--dangerously-bypass-approvals-and-sandbox"]
+prompt_mode = "arg"
+system_prompt_override = """
+Do not use the host CLI built-in sub-agent or Task tool to spawn child invocations.
+Use agents -m <model> -f <prompt-file> for child work instead.
+Never call bare agents with no arguments because it launches an interactive UI on the user's machine.
+A valid child dispatch is: agents -m <model> -f <prompt-file>
+"""
+
+[codex3.resume]
+kind = "subcommand"
+subcommand = ["resume"]
+
+[codex3.tool_restrictions]
+kind = "codex"
