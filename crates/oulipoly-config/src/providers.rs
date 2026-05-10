@@ -1,6 +1,6 @@
 use super::model::{
     PromptMode, ProviderConfig, ResumeAcceptanceRules, ResumeStrategy, SessionCapture,
-    SessionStorage,
+    SessionStorage, ToolRestrictionKind, ToolRestrictions,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -30,6 +30,8 @@ pub struct ProviderEntry {
     pub session_capture: Option<SessionCapture>,
     pub resume_acceptance: Option<ResumeAcceptanceRules>,
     pub session_storage: Option<SessionStorage>,
+    pub system_prompt_override: Option<String>,
+    pub tool_restrictions: Option<ToolRestrictions>,
 }
 
 impl Default for ProviderEntry {
@@ -45,6 +47,8 @@ impl Default for ProviderEntry {
             session_capture: None,
             resume_acceptance: None,
             session_storage: None,
+            system_prompt_override: None,
+            tool_restrictions: None,
         }
     }
 }
@@ -76,6 +80,10 @@ struct RawEntry {
     resume_acceptance: Option<ResumeAcceptanceRules>,
     #[serde(default)]
     session_storage: Option<SessionStorage>,
+    #[serde(default)]
+    system_prompt_override: Option<String>,
+    #[serde(default)]
+    tool_restrictions: Option<ToolRestrictions>,
 }
 
 impl ProvidersConfig {
@@ -102,6 +110,8 @@ impl ProvidersConfig {
                     session_capture: v.session_capture,
                     resume_acceptance: v.resume_acceptance,
                     session_storage: v.session_storage.map(SessionStorage::expand_tilde),
+                    system_prompt_override: v.system_prompt_override,
+                    tool_restrictions: v.tool_restrictions,
                 };
                 entry.validate(&k).map(|()| (k, entry))
             })
@@ -231,6 +241,92 @@ impl ProviderEntry {
                 .validate()
                 .map_err(|e| format!("providers.toml provider {name}: {e}"))?;
         }
+        self.validate_tool_restrictions(name)?;
+        Ok(())
+    }
+
+    fn validate_tool_restrictions(&self, name: &str) -> Result<(), String> {
+        let Some(restrictions) = &self.tool_restrictions else {
+            return Ok(());
+        };
+
+        if let Some(family) = provider_family(
+            name,
+            self.command.as_deref(),
+            &self.args,
+            self.interactive_args.as_deref(),
+        ) && restrictions.kind != family
+        {
+            return Err(format!(
+                "providers.toml provider {name}: tool_restrictions.kind mismatch: discovered provider family {family}, configured kind {}",
+                restrictions.kind
+            ));
+        }
+
+        if restrictions.kind == ToolRestrictionKind::Claude {
+            if !restrictions.codex.is_empty() {
+                return Err(format!(
+                    "providers.toml provider {name}: tool_restrictions.codex must be empty when kind = \"claude\""
+                ));
+            }
+            if !restrictions.claude.allowed_tools.is_empty()
+                && !restrictions.claude.disallowed_tools.is_empty()
+            {
+                return Err(format!(
+                    "providers.toml provider {name}: tool_restrictions.claude.allowed_tools and tool_restrictions.claude.disallowed_tools are mutually exclusive"
+                ));
+            }
+            if let Some(command) = self.command.as_deref() {
+                let command_tokens = shell_split(command);
+                validate_claude_duplicates(name, &command_tokens, "command", restrictions)?;
+            }
+            validate_claude_duplicates(name, &self.args, "args", restrictions)?;
+            if let Some(interactive_args) = self.interactive_args.as_deref() {
+                validate_claude_duplicates(
+                    name,
+                    interactive_args,
+                    "interactive_args",
+                    restrictions,
+                )?;
+            }
+        }
+
+        if restrictions.kind == ToolRestrictionKind::Codex {
+            if !restrictions.claude.is_empty() {
+                return Err(format!(
+                    "providers.toml provider {name}: tool_restrictions.claude must be empty when kind = \"codex\""
+                ));
+            }
+            if let Some(command) = self.command.as_deref() {
+                let command_tokens = shell_split(command);
+                validate_codex_duplicates(name, &command_tokens, "command", restrictions)?;
+            }
+            validate_codex_duplicates(name, &self.args, "args", restrictions)?;
+            if let Some(interactive_args) = self.interactive_args.as_deref() {
+                validate_codex_duplicates(
+                    name,
+                    interactive_args,
+                    "interactive_args",
+                    restrictions,
+                )?;
+            }
+            for pair in &restrictions.codex.config_pairs {
+                let key = pair.split_once('=').map(|(key, _)| key).unwrap_or(pair);
+                if !CODEX_CONFIG_PAIR_ALLOWLIST.contains(&key) {
+                    return Err(format!(
+                        "providers.toml provider {name}: tool_restrictions.codex.config_pairs key {key:?} has no allowlisted Codex config pair"
+                    ));
+                }
+            }
+            for feature in &restrictions.codex.disabled_features {
+                if !CODEX_DISABLED_FEATURE_ALLOWLIST.contains(&feature.as_str()) {
+                    return Err(format!(
+                        "providers.toml provider {name}: tool_restrictions.codex.disabled_features feature {feature:?} is not allowlisted"
+                    ));
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -266,10 +362,247 @@ impl ProviderEntry {
                 session_capture: self.session_capture.clone(),
                 resume_acceptance: self.resume_acceptance.clone(),
                 session_storage: self.session_storage.clone(),
+                system_prompt_override: self.system_prompt_override.clone(),
+                tool_restrictions: self.tool_restrictions.clone(),
             },
             self.prompt_mode,
         ))
     }
+}
+
+const CODEX_CONFIG_PAIR_ALLOWLIST: &[&str] = &[];
+const CODEX_DISABLED_FEATURE_ALLOWLIST: &[&str] = &["web_search"];
+
+fn provider_family(
+    name: &str,
+    command: Option<&str>,
+    args: &[String],
+    interactive_args: Option<&[String]>,
+) -> Option<ToolRestrictionKind> {
+    let mut tokens = Vec::new();
+    if let Some(command) = command {
+        tokens.extend(shell_split(command));
+    }
+    tokens.extend(args.iter().cloned());
+    if let Some(interactive_args) = interactive_args {
+        tokens.extend(interactive_args.iter().cloned());
+    }
+
+    executable_token(tokens.iter().map(String::as_str))
+        .or(Some(name))
+        .and_then(|token| {
+            let basename = token.rsplit('/').next().unwrap_or(token);
+            if basename.starts_with("claude") {
+                Some(ToolRestrictionKind::Claude)
+            } else if basename.starts_with("codex") {
+                Some(ToolRestrictionKind::Codex)
+            } else {
+                None
+            }
+        })
+}
+
+fn executable_token<'a>(tokens: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    let mut tokens = tokens.peekable();
+    while let Some(token) = tokens.next() {
+        if token == "env" || token.ends_with("/env") {
+            continue;
+        }
+        if let Some(rest) = token.strip_prefix("--") {
+            if rest.is_empty() {
+                continue;
+            }
+            continue;
+        }
+        if let Some(rest) = token.strip_prefix('-') {
+            if matches!(rest, "u" | "e" | "S") {
+                let _ = tokens.next();
+            }
+            continue;
+        }
+        if token.contains('=') && token.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+            continue;
+        }
+        return Some(token);
+    }
+    None
+}
+
+pub(crate) fn shell_split(s: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+
+    for ch in s.chars() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            c if c.is_whitespace() && !in_quotes => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            c => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn validate_claude_duplicates(
+    name: &str,
+    args: &[String],
+    field: &str,
+    restrictions: &ToolRestrictions,
+) -> Result<(), String> {
+    validate_claude_tool_duplicates(
+        name,
+        args,
+        field,
+        "tool_restrictions.claude.allowed_tools",
+        &["--allowedTools", "--allowed-tools"],
+        &restrictions.claude.allowed_tools,
+    )?;
+    validate_claude_tool_duplicates(
+        name,
+        args,
+        field,
+        "tool_restrictions.claude.disallowed_tools",
+        &["--disallowedTools", "--disallowed-tools"],
+        &restrictions.claude.disallowed_tools,
+    )
+}
+
+fn validate_claude_tool_duplicates(
+    name: &str,
+    args: &[String],
+    arg_field: &str,
+    policy_field: &str,
+    flags: &[&str],
+    policy_tools: &[String],
+) -> Result<(), String> {
+    for (flag, raw_value) in claude_flag_values(args, flags) {
+        for raw_tool in raw_value
+            .split(',')
+            .map(str::trim)
+            .filter(|tool| !tool.is_empty())
+        {
+            if policy_tools.iter().any(|tool| tool == raw_tool) {
+                return Err(format!(
+                    "providers.toml provider {name}: {policy_field} contains duplicate tool {raw_tool:?} already present in {arg_field} flag {flag}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn claude_flag_values<'a>(args: &'a [String], flags: &[&str]) -> Vec<(String, &'a str)> {
+    let mut values = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if let Some(flag) = flags.iter().find(|flag| arg == **flag)
+            && let Some(value) = args.get(i + 1)
+        {
+            values.push(((*flag).to_string(), value.as_str()));
+            i += 2;
+            continue;
+        }
+        if let Some((flag, value)) = arg.split_once('=')
+            && flags.contains(&flag)
+        {
+            values.push((flag.to_string(), value));
+        }
+        i += 1;
+    }
+    values
+}
+
+fn validate_codex_duplicates(
+    name: &str,
+    args: &[String],
+    field: &str,
+    restrictions: &ToolRestrictions,
+) -> Result<(), String> {
+    validate_codex_config_duplicates(name, args, field, &restrictions.codex.config_pairs)?;
+    validate_codex_disabled_feature_duplicates(
+        name,
+        args,
+        field,
+        &restrictions.codex.disabled_features,
+    )
+}
+
+fn validate_codex_config_duplicates(
+    name: &str,
+    args: &[String],
+    field: &str,
+    policy_pairs: &[String],
+) -> Result<(), String> {
+    for (flag, raw_value) in codex_flag_values(args, &["-c", "--config"]) {
+        let raw_key = raw_value
+            .split_once('=')
+            .map(|(key, _)| key)
+            .unwrap_or(raw_value);
+        for policy_pair in policy_pairs {
+            let policy_key = policy_pair
+                .split_once('=')
+                .map(|(key, _)| key)
+                .unwrap_or(policy_pair);
+            if policy_key == raw_key {
+                return Err(format!(
+                    "providers.toml provider {name}: tool_restrictions.codex.config_pairs contains duplicate key {raw_key:?} already present in {field} flag {flag}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_codex_disabled_feature_duplicates(
+    name: &str,
+    args: &[String],
+    field: &str,
+    policy_features: &[String],
+) -> Result<(), String> {
+    for (flag, raw_value) in codex_flag_values(args, &["--disable"]) {
+        for raw_feature in raw_value
+            .split(',')
+            .map(str::trim)
+            .filter(|feature| !feature.is_empty())
+        {
+            if policy_features.iter().any(|feature| feature == raw_feature) {
+                return Err(format!(
+                    "providers.toml provider {name}: tool_restrictions.codex.disabled_features contains duplicate feature {raw_feature:?} already present in {field} flag {flag}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn codex_flag_values<'a>(args: &'a [String], flags: &[&str]) -> Vec<(String, &'a str)> {
+    let mut values = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if let Some(flag) = flags.iter().find(|flag| arg == **flag)
+            && let Some(value) = args.get(i + 1)
+        {
+            values.push(((*flag).to_string(), value.as_str()));
+            i += 2;
+            continue;
+        }
+        if let Some((flag, value)) = arg.split_once('=')
+            && flags.contains(&flag)
+        {
+            values.push((flag.to_string(), value));
+        }
+        i += 1;
+    }
+    values
 }
 
 pub fn parse_prompt_mode(s: &str) -> PromptMode {
@@ -282,6 +615,9 @@ pub fn parse_prompt_mode(s: &str) -> PromptMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{
+        ClaudeRestrictions, CodexRestrictions, ToolRestrictionKind, ToolRestrictions,
+    };
     use std::io::Write;
 
     #[test]
@@ -365,6 +701,8 @@ projects_dir = "/tmp/claude2/projects"
             session_capture: None,
             resume_acceptance: None,
             session_storage: None,
+            system_prompt_override: None,
+            tool_restrictions: None,
         };
         let (provider, prompt_mode) = cfg.effective_provider(&model_provider).unwrap();
         assert_eq!(prompt_mode, PromptMode::Stdin);
@@ -387,6 +725,71 @@ projects_dir = "/tmp/claude2/projects"
         );
         assert!(provider.resume.is_some());
         assert!(provider.session_storage.is_some());
+    }
+
+    #[test]
+    fn providers_toml_parses_age28_policy_fields() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            r#"
+[claude]
+command = "env -u CLAUDECODE claude"
+args = ["-p"]
+system_prompt_override = """
+Do not use the Task tool.
+Use agents -m <model> -f <prompt-file>.
+"""
+
+[claude.tool_restrictions]
+kind = "claude"
+
+[claude.tool_restrictions.claude]
+disallowed_tools = ["Task", "Task tool"]
+disable_slash_commands = true
+"#
+        )
+        .unwrap();
+
+        let cfg = ProvidersConfig::load(f.path()).unwrap();
+        let entry = cfg.get("claude").unwrap();
+
+        assert_eq!(
+            entry.system_prompt_override.as_deref(),
+            Some("Do not use the Task tool.\nUse agents -m <model> -f <prompt-file>.\n")
+        );
+        assert_eq!(
+            entry.tool_restrictions,
+            Some(ToolRestrictions {
+                kind: ToolRestrictionKind::Claude,
+                claude: ClaudeRestrictions {
+                    disallowed_tools: vec!["Task".to_string(), "Task tool".to_string()],
+                    allowed_tools: Vec::new(),
+                    disable_slash_commands: true,
+                },
+                codex: CodexRestrictions::default(),
+            })
+        );
+    }
+
+    #[test]
+    fn providers_toml_age28_fields_default_to_none() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            r#"
+[claude]
+command = "claude"
+args = ["-p"]
+"#
+        )
+        .unwrap();
+
+        let cfg = ProvidersConfig::load(f.path()).unwrap();
+        let entry = cfg.get("claude").unwrap();
+
+        assert!(entry.system_prompt_override.is_none());
+        assert!(entry.tool_restrictions.is_none());
     }
 
     #[test]
@@ -442,8 +845,8 @@ accepted_output_patterns = ["accepted"]
 rejected_output_patterns = ["rejected"]
 
 [provider.session_storage]
-kind = "codex"
-sessions_dir = "/tmp/codex-sessions"
+kind = "script"
+cwd_script = "codex-cwd /tmp/codex-sessions"
 "#
         )
         .unwrap();
@@ -457,6 +860,8 @@ sessions_dir = "/tmp/codex-sessions"
             session_capture: None,
             resume_acceptance: None,
             session_storage: None,
+            system_prompt_override: None,
+            tool_restrictions: None,
         };
 
         let (provider, prompt_mode) = cfg.effective_provider(&model_provider).unwrap();
@@ -554,5 +959,335 @@ projects_dir = "/tmp/provider/projects"
             migrated_content.contains("cwd_script = \"claude-code-cwd /tmp/provider/projects\"")
         );
         assert!(!migrated_content.contains("projects_dir"));
+    }
+
+    #[test]
+    fn effective_provider_carries_age28_policy_fields() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            r#"
+[claude]
+command = "env -u CLAUDECODE claude"
+args = ["-p", "--provider-root"]
+interactive_args = ["--provider-interactive"]
+system_prompt_override = "root override"
+
+[claude.tool_restrictions]
+kind = "claude"
+
+[claude.tool_restrictions.claude]
+disallowed_tools = ["Task"]
+"#
+        )
+        .unwrap();
+        let cfg = ProvidersConfig::load(f.path()).unwrap();
+        let model_provider = ProviderConfig::model_provider(
+            "claude",
+            vec!["--model".to_string(), "opus".to_string()],
+        );
+
+        let (provider, prompt_mode) = cfg.effective_provider(&model_provider).unwrap();
+
+        assert_eq!(prompt_mode, PromptMode::Stdin);
+        assert_eq!(provider.args, ["-p", "--provider-root", "--model", "opus"]);
+        assert_eq!(
+            provider.system_prompt_override.as_deref(),
+            Some("root override")
+        );
+        assert_eq!(
+            provider.tool_restrictions,
+            Some(ToolRestrictions {
+                kind: ToolRestrictionKind::Claude,
+                claude: ClaudeRestrictions {
+                    disallowed_tools: vec!["Task".to_string()],
+                    allowed_tools: Vec::new(),
+                    disable_slash_commands: false,
+                },
+                codex: CodexRestrictions::default(),
+            })
+        );
+    }
+
+    #[test]
+    fn provider_validate_rejects_kind_mismatch() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            r#"
+[claude]
+command = "env -u CLAUDECODE claude"
+args = ["-p"]
+
+[claude.tool_restrictions]
+kind = "codex"
+"#
+        )
+        .unwrap();
+
+        let err = ProvidersConfig::load(f.path()).unwrap_err();
+
+        assert!(err.contains("providers.toml provider claude"), "{err}");
+        assert!(err.contains("kind"), "{err}");
+        assert!(err.contains("claude"), "{err}");
+        assert!(err.contains("codex"), "{err}");
+    }
+
+    #[test]
+    fn provider_validate_rejects_interactive_only_kind_mismatch() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            r#"
+[primary]
+command = "env"
+interactive_args = ["-u", "FOO", "codex", "exec"]
+
+[primary.tool_restrictions]
+kind = "claude"
+"#
+        )
+        .unwrap();
+
+        let err = ProvidersConfig::load(f.path()).unwrap_err();
+
+        assert!(err.contains("providers.toml provider primary"), "{err}");
+        assert!(err.contains("kind"), "{err}");
+        assert!(err.contains("claude"), "{err}");
+        assert!(err.contains("codex"), "{err}");
+    }
+
+    #[test]
+    fn provider_validate_rejects_duplicate_claude_tool_flag() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            r#"
+[claude]
+command = "claude"
+args = ["-p", "--allowedTools=Bash"]
+
+[claude.tool_restrictions]
+kind = "claude"
+
+[claude.tool_restrictions.claude]
+allowed_tools = ["Bash"]
+"#
+        )
+        .unwrap();
+
+        let err = ProvidersConfig::load(f.path()).unwrap_err();
+
+        assert!(err.contains("providers.toml provider claude"), "{err}");
+        assert!(
+            err.contains("tool_restrictions.claude.allowed_tools"),
+            "{err}"
+        );
+        assert!(err.contains("Bash"), "{err}");
+        assert!(err.contains("--allowedTools"), "{err}");
+    }
+
+    #[test]
+    fn provider_validate_rejects_duplicate_claude_tool_flag_in_command() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            r#"
+[claude]
+command = "claude --allowed-tools Bash"
+args = ["-p"]
+
+[claude.tool_restrictions]
+kind = "claude"
+
+[claude.tool_restrictions.claude]
+allowed_tools = ["Bash"]
+"#
+        )
+        .unwrap();
+
+        let err = ProvidersConfig::load(f.path()).unwrap_err();
+
+        assert!(err.contains("providers.toml provider claude"), "{err}");
+        assert!(
+            err.contains("tool_restrictions.claude.allowed_tools"),
+            "{err}"
+        );
+        assert!(err.contains("command"), "{err}");
+        assert!(err.contains("Bash"), "{err}");
+        assert!(err.contains("--allowed-tools"), "{err}");
+    }
+
+    #[test]
+    fn provider_validate_rejects_mutually_exclusive_claude_tool_lists() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            r#"
+[claude]
+command = "claude"
+
+[claude.tool_restrictions]
+kind = "claude"
+
+[claude.tool_restrictions.claude]
+allowed_tools = ["Bash"]
+disallowed_tools = ["Task"]
+"#
+        )
+        .unwrap();
+
+        let err = ProvidersConfig::load(f.path()).unwrap_err();
+
+        assert!(err.contains("providers.toml provider claude"), "{err}");
+        assert!(err.contains("mutually exclusive"), "{err}");
+        assert!(
+            err.contains("tool_restrictions.claude.allowed_tools"),
+            "{err}"
+        );
+        assert!(
+            err.contains("tool_restrictions.claude.disallowed_tools"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn provider_validate_rejects_inactive_restriction_branch() {
+        let mut claude_file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            claude_file,
+            r#"
+[claude]
+command = "claude"
+
+[claude.tool_restrictions]
+kind = "claude"
+
+[claude.tool_restrictions.codex]
+disabled_features = ["web_search"]
+"#
+        )
+        .unwrap();
+
+        let err = ProvidersConfig::load(claude_file.path()).unwrap_err();
+
+        assert!(err.contains("providers.toml provider claude"), "{err}");
+        assert!(
+            err.contains("tool_restrictions.codex must be empty"),
+            "{err}"
+        );
+
+        let mut codex_file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            codex_file,
+            r#"
+[codex]
+command = "codex"
+
+[codex.tool_restrictions]
+kind = "codex"
+
+[codex.tool_restrictions.claude]
+disallowed_tools = ["Task"]
+"#
+        )
+        .unwrap();
+
+        let err = ProvidersConfig::load(codex_file.path()).unwrap_err();
+
+        assert!(err.contains("providers.toml provider codex"), "{err}");
+        assert!(
+            err.contains("tool_restrictions.claude must be empty"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn provider_validate_rejects_non_allowlisted_codex_config_key() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            r#"
+[codex]
+command = "codex"
+args = ["exec"]
+prompt_mode = "arg"
+
+[codex.tool_restrictions]
+kind = "codex"
+
+[codex.tool_restrictions.codex]
+config_pairs = ["model_reasoning_effort=high"]
+"#
+        )
+        .unwrap();
+
+        let err = ProvidersConfig::load(f.path()).unwrap_err();
+
+        assert!(err.contains("providers.toml provider codex"), "{err}");
+        assert!(
+            err.contains("tool_restrictions.codex.config_pairs"),
+            "{err}"
+        );
+        assert!(err.contains("model_reasoning_effort"), "{err}");
+        assert!(err.contains("no allowlisted Codex config pair"), "{err}");
+    }
+
+    #[test]
+    fn provider_validate_rejects_duplicate_codex_policy_flags() {
+        let mut config_file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            config_file,
+            r#"
+[codex]
+command = "codex -c sandbox=workspace-write"
+
+[codex.tool_restrictions]
+kind = "codex"
+
+[codex.tool_restrictions.codex]
+config_pairs = ["sandbox=read-only"]
+"#
+        )
+        .unwrap();
+
+        let err = ProvidersConfig::load(config_file.path()).unwrap_err();
+
+        assert!(err.contains("providers.toml provider codex"), "{err}");
+        assert!(
+            err.contains("tool_restrictions.codex.config_pairs"),
+            "{err}"
+        );
+        assert!(err.contains("sandbox"), "{err}");
+        assert!(err.contains("command"), "{err}");
+        assert!(err.contains("-c"), "{err}");
+
+        let mut feature_file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            feature_file,
+            r#"
+[codex]
+command = "codex"
+args = ["--disable", "web_search"]
+
+[codex.tool_restrictions]
+kind = "codex"
+
+[codex.tool_restrictions.codex]
+disabled_features = ["web_search"]
+"#
+        )
+        .unwrap();
+
+        let err = ProvidersConfig::load(feature_file.path()).unwrap_err();
+
+        assert!(err.contains("providers.toml provider codex"), "{err}");
+        assert!(
+            err.contains("tool_restrictions.codex.disabled_features"),
+            "{err}"
+        );
+        assert!(err.contains("web_search"), "{err}");
+        assert!(err.contains("args"), "{err}");
+        assert!(err.contains("--disable"), "{err}");
     }
 }

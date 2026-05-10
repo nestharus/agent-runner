@@ -37,6 +37,8 @@ fn effective_diagnostic_provider(script_path: PathBuf) -> ProviderConfig {
         session_capture: None,
         resume_acceptance: None,
         session_storage: None,
+        system_prompt_override: None,
+        tool_restrictions: None,
     }
 }
 

@@ -6,7 +6,8 @@ use oulipoly_config::repositories::{
     ProvidersConfigRepository, SessionsConfigRepository,
 };
 use oulipoly_config::{
-    ModelConfig, PromptMode, ProviderConfig, ProvidersConfig, SessionsConfig, load_agent_file,
+    ClaudeRestrictions, CodexRestrictions, ModelConfig, PromptMode, ProviderConfig,
+    ProvidersConfig, SessionsConfig, ToolRestrictionKind, ToolRestrictions, load_agent_file,
     load_agents, load_models,
 };
 use std::fs;
@@ -230,6 +231,170 @@ prompt_mode = "arg"
     assert_eq!(trait_runtime.command, direct_runtime.command);
     assert_eq!(trait_runtime.args, direct_runtime.args);
     assert_eq!(trait_runtime_mode, direct_runtime_mode);
+}
+
+#[test]
+fn repository_effective_provider_preserves_age28_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("providers.toml");
+    write(
+        &path,
+        r#"
+[claude]
+command = "env -u CLAUDECODE claude"
+args = ["-p", "--root"]
+interactive_args = ["--interactive-root"]
+prompt_mode = "stdin"
+system_prompt_override = "repository effective override"
+
+[claude.tool_restrictions]
+kind = "claude"
+
+[claude.tool_restrictions.claude]
+disallowed_tools = ["Task"]
+disable_slash_commands = true
+"#,
+    );
+    let repo = FilesystemProvidersConfigRepository;
+    let direct = ProvidersConfig::load(&path).unwrap();
+    let via_trait =
+        <FilesystemProvidersConfigRepository as ProvidersConfigRepository>::load_providers(
+            &repo, &path,
+        )
+        .unwrap();
+    let model_provider =
+        ProviderConfig::model_provider("claude", vec!["--model".to_string(), "opus".to_string()]);
+
+    let (direct_effective, direct_mode) = direct.effective_provider(&model_provider).unwrap();
+    let (trait_effective, trait_mode) =
+        <FilesystemProvidersConfigRepository as ProvidersConfigRepository>::effective_provider(
+            &repo,
+            &via_trait,
+            &model_provider,
+        )
+        .unwrap();
+
+    assert_eq!(trait_mode, direct_mode);
+    assert_eq!(trait_effective.args, direct_effective.args);
+    assert_eq!(
+        trait_effective.system_prompt_override,
+        direct_effective.system_prompt_override
+    );
+    assert_eq!(
+        trait_effective.tool_restrictions,
+        Some(ToolRestrictions {
+            kind: ToolRestrictionKind::Claude,
+            claude: ClaudeRestrictions {
+                disallowed_tools: vec!["Task".to_string()],
+                allowed_tools: Vec::new(),
+                disable_slash_commands: true,
+            },
+            codex: CodexRestrictions::default(),
+        })
+    );
+    assert_eq!(
+        trait_effective.tool_restrictions,
+        direct_effective.tool_restrictions
+    );
+}
+
+#[test]
+fn repository_runtime_provider_preserves_age28_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("providers.toml");
+    write(
+        &path,
+        r#"
+[codex]
+command = "codex"
+args = ["exec"]
+interactive_args = ["exec"]
+prompt_mode = "arg"
+system_prompt_override = "repository runtime override"
+
+[codex.tool_restrictions]
+kind = "codex"
+
+[codex.tool_restrictions.codex]
+disabled_features = []
+"#,
+    );
+    let repo = FilesystemProvidersConfigRepository;
+    let direct = ProvidersConfig::load(&path).unwrap();
+    let via_trait =
+        <FilesystemProvidersConfigRepository as ProvidersConfigRepository>::load_providers(
+            &repo, &path,
+        )
+        .unwrap();
+
+    let (direct_runtime, direct_mode) = direct.runtime_provider("codex").unwrap();
+    let (trait_runtime, trait_mode) =
+        <FilesystemProvidersConfigRepository as ProvidersConfigRepository>::runtime_provider(
+            &repo, &via_trait, "codex",
+        )
+        .unwrap();
+
+    assert_eq!(trait_mode, direct_mode);
+    assert_eq!(
+        trait_runtime.system_prompt_override.as_deref(),
+        Some("repository runtime override")
+    );
+    assert_eq!(
+        trait_runtime.system_prompt_override,
+        direct_runtime.system_prompt_override
+    );
+    assert_eq!(
+        trait_runtime.tool_restrictions,
+        direct_runtime.tool_restrictions
+    );
+}
+
+#[test]
+fn default_nestharus_policy_fixture_covers_bug1_and_bug2() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let fixture = workspace
+        .join("tests")
+        .join("fixtures")
+        .join("age28-default-policy.providers.toml");
+    let content = fs::read_to_string(&fixture).unwrap();
+
+    let config = ProvidersConfig::load(&fixture).unwrap();
+    for alias in [
+        "claude", "claude2", "claude3", "claude4", "claude5", "claude6", "codex", "codex2",
+        "codex3",
+    ] {
+        assert!(content.contains(&format!("[{alias}]")), "missing {alias}");
+        let entry = config
+            .get(alias)
+            .unwrap_or_else(|| panic!("missing parsed provider {alias}"));
+        assert!(
+            entry
+                .system_prompt_override
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty()),
+            "missing system_prompt_override for {alias}"
+        );
+        let restrictions = entry
+            .tool_restrictions
+            .as_ref()
+            .unwrap_or_else(|| panic!("missing tool_restrictions for {alias}"));
+        let expected_kind = if alias.starts_with("claude") {
+            ToolRestrictionKind::Claude
+        } else {
+            ToolRestrictionKind::Codex
+        };
+        assert_eq!(restrictions.kind, expected_kind, "wrong kind for {alias}");
+    }
+
+    let lower = content.to_ascii_lowercase();
+    assert!(lower.contains("task tool"), "{content}");
+    assert!(lower.contains("bare agents"), "{content}");
+    assert!(lower.contains("agents -m"), "{content}");
+    assert!(lower.contains("-f <prompt-file>"), "{content}");
 }
 
 #[test]

@@ -171,5 +171,7 @@ fn claude_provider(name: &str, projects_dir: &Path) -> ProviderConfig {
         session_storage: Some(SessionStorage::ClaudeCode {
             projects_dir: projects_dir.to_path_buf(),
         }),
+        system_prompt_override: None,
+        tool_restrictions: None,
     }
 }

@@ -321,6 +321,8 @@ interactive_args = ["ok"]
             session_capture: None,
             resume_acceptance: None,
             session_storage: None,
+            system_prompt_override: None,
+            tool_restrictions: None,
         }
     }
 
