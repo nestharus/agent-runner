@@ -232,14 +232,17 @@ fn ti_10_age_54_schema4_plan_contains_only_schema5_step() {
         plan.iter()
             .map(|migration| migration.target_version)
             .collect::<Vec<_>>(),
-        vec![5],
-        "schema-4 DBs must take exactly the AGE-54 schema-5 migration"
+        vec![5, CURRENT_SCHEMA_VERSION],
+        "schema-4 DBs must take the AGE-54 schema-5 migration and current schema migration"
     );
     assert_eq!(
         plan.iter()
             .map(|migration| migration.id)
             .collect::<Vec<_>>(),
-        vec!["0005_invocation_dual_session_ids"]
+        vec![
+            "0005_invocation_dual_session_ids",
+            "0006_age_58_dual_write_row_versions"
+        ]
     );
 }
 
@@ -254,7 +257,7 @@ fn ti_23_age_54_schema4_invocation_fixture_migrates_without_row_loss() {
 
     let db = StateDb::open(&db_path).unwrap();
 
-    assert_eq!(user_version(db.connection()), 5);
+    assert_eq!(user_version(db.connection()), CURRENT_SCHEMA_VERSION);
     assert_eq!(
         fixtures::count_rows(db.connection(), "invocations"),
         before_count

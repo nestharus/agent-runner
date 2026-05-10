@@ -227,7 +227,7 @@ fn ti_14_age_54_read_like_cli_paths_preserve_invocation_count() {
         );
         assert_eq!(invocation_count(&fixture.db_path()), before);
         let conn = Connection::open(fixture.db_path()).unwrap();
-        assert_eq!(user_version(&conn), 5);
+        assert_eq!(user_version(&conn), CURRENT_SCHEMA_VERSION);
     }
 }
 

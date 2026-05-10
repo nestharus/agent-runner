@@ -1112,3 +1112,126 @@ The four discoveries are listed here so a later consolidation WU can pick them u
     documented residual only if downstream gates agree".
   - `planning/age-54-state-db-corruption-rca/risk/age-54-phase-7-process-tree-audit.report.md`
     (PASS).
+
+## 2026-05-10 — AGE-61 branch-base vs local-trunk-main divergence (residual)
+
+- **Phase**: Phase 0 bootstrap (orchestrator).
+- **Decision**: ACCEPT the divergence between the AGE-61 branch base and the
+  local trunk's `main` ref as a workspace-only artifact and treat the AGE-61
+  branch base (`1bb1a922e5d23619e6e7984f6cd3334a4a4edd0a`) as the source-of-truth
+  main for this WU's work. No rebase performed.
+- **Rationale**: At AGE-61 dispatch time, `origin/main` is at
+  `1bb1a922e5d23619e6e7984f6cd3334a4a4edd0a` ("remove(runtime): drop no-progress
+  watchdog ... (#73)") and that base contains the AGE-54 0005 dual-id migration
+  (PR #72). Local trunk's `main` ref is at `32727a8 (PR #70 AGE-48 resume
+  migration)` which does NOT include the 0005 migration on its parent chain;
+  local trunk has been rewound vs. origin/main. The AGE-58 proposal that AGE-61
+  inherits explicitly bumps `CURRENT_SCHEMA_VERSION` from 5 to 6 on top of the
+  0005 migration — that precondition is satisfied on origin/main and on the
+  AGE-61 branch base, but not on local trunk's main. Rebasing the AGE-61
+  branch onto local trunk's stale main would erase the 0005 substrate the
+  proposal builds on. The pipeline runs entirely in the worktree which is
+  anchored at the correct base.
+- **Residual**: Local trunk's `main` ref (`32727a8`) is divergent from
+  `origin/main` (`1bb1a92`). Operational concern, not a pipeline concern.
+  Consumers should fetch + reset local main before any future trunk-side work.
+- **Evidence**:
+  - `git -C /home/nes/projects/agent-runner/trunk log --oneline --all --decorate -15`
+    showing `1bb1a92 (origin/main, age-61-row-version-migration) ...`
+    versus `32727a8 (HEAD -> main) ...`.
+  - `crates/oulipoly-state/migrations/` on the AGE-61 worktree contains
+    `0004_state_db_schema_boundary.sql` AND
+    `0005_invocation_dual_session_ids.sql`.
+  - `planning/age-61-row-version-migration/session.json`
+    `branch_out_ref_note`.
+
+## 2026-05-10 — AGE-61 sub-scope Phase 2.5 inheritance from AGE-58
+
+- **Phase**: Phase 0 / 2.5 (orchestrator).
+- **Decision**: AGE-61 inherits AGE-58's Phase 0-5 artifacts unmodified per the
+  dispatch contract's "Inherited Phase 0-5 artifacts (DO NOT REGENERATE)"
+  clause. AGE-61 records a thin sub-scope problem map at
+  `planning/age-61-row-version-migration/research/age-61-sub-scope-problem-map.md`
+  enumerating in-scope (the row_version substrate, `0006` migration,
+  `deployment/row_version/*` modules, TI-03/04/17/18) and anti-scope (queue,
+  dual-write writer, importer, cutover, reverse routing — those go to
+  AGE-63/64/65/66/67).
+- **Rationale**: AGE-58 halted at Phase 5 boundary by design (Phase 6 was
+  judged multi-day-scale and split into AGE-61..67). AGE-61's narrow scope
+  (durable schema + comparison primitives) is bounded enough that
+  regenerating Phase 2.5 sub-steps would duplicate the parent's already-LOW
+  Phase 4 risk gates and the parent's PASS process-tree audit. Pre-resolved
+  Phase 2.5 gates per the dispatch are honored: narrow-vs-exhaustive=A;
+  defer-to-prototype=A; mid-pipeline-drift=A+DECISIONS-residual;
+  stable-MEDIUM intrinsic-blast-radius=accept-and-continue.
+  `skip_problem_map_gate=true` is honored because the in-scope surface is
+  pre-defined by the parent proposal's row_version section.
+- **Evidence**:
+  - `planning/age-58-ab-deploy-dual-write/session.json` (parent halted at
+    Phase 5 boundary).
+  - `planning/age-58-ab-deploy-dual-write/risk/phase-4-join-manifest.json`.
+  - `planning/age-58-ab-deploy-dual-write/risk/age-58-phase-4-process-tree.report.md` (PASS).
+  - `planning/age-61-row-version-migration/research/age-61-sub-scope-problem-map.md`.
+  - Original dispatch prompt at
+    `planning/age-61-row-version-migration/.scratch/dispatch-prompt.md`.
+
+## D-AGE-61-Phase-6 — accept residual HIGH on intrinsic A1 surfaces (approved residual)
+
+- **Phase**: Phase 6 (per-component code-quality fanout, round 2 verdict).
+- **Source**: NEEDS_INPUT question
+  `planning/age-61-row-version-migration/.scratch/questions/q-a06f1b50-8a48-4d51-9e6d-c3a4ef891f02.question.json`
+  (root-owned value/scope/trade-off question on how strictly to apply A1 cohesion + function-classification).
+  Answered with option B at
+  `.../q-a06f1b50-8a48-4d51-9e6d-c3a4ef891f02.answer.json`
+  on 2026-05-10 by `user-via-root-orchestrator`.
+- **Decision**: ACCEPT the 20 remaining round-2 HIGH findings as **approved residuals**, scoped to
+  the four intrinsic surface classes named below. Advance to Phase 7 CodeRabbit. Update the active
+  WU risk disposition to extend the prior stable-MEDIUM acceptance (intrinsic blast radius) to
+  **stable-HIGH-on-A1-when-intrinsic** for these four surface classes only.
+- **Scope of acceptance** (residuals limited to these surface classes; not a global override):
+  1. **Migration orchestration surfaces** (`migration-0006`, post-SQL hooks at
+     `crates/oulipoly-state/src/deployment/row_version/migrate_v6.rs`): a conditional ALTER step
+     intrinsically combines orchestration with a column-existence predicate. Splitting predicate +
+     orchestrator into two siblings was already attempted; the migration runner contract pairs them
+     by domain.
+  2. **Row-version comparison primitives** (`row_version-compare/{decide,predicate}.rs`):
+     `decide_apply` (mapper) and `same_or_higher` (predicate) are co-located under
+     `compare/` because they together ARE the comparison decision; A1 scores them as 2
+     classifications, but the conceptual head is one.
+  3. **Test-pattern function-classification** on arrange-act-assert tests
+     (`tests/age_61_*`, `tests/age_32_*`, `tests/age_54_*`, `src-tauri/tests/age_*` —
+     16 findings, mostly per-test): every unit test inherently combines setup, execution,
+     and assertion (>=2 A1 classifications per function). Extracting per-test setup/assert helpers
+     is rejected (~5x test-code volume in helpers vs. linear arrange-act-assert clarity).
+  4. **Namespace re-export modules** (`row_version/mod.rs` 10 re-exports): the auditor itself
+     records "this is namespace glue, not a behavior pair." Required for Rust visibility.
+- **Outside scope of acceptance**: any future HIGH finding on non-intrinsic product code
+  (e.g. a mapper that grew an unrelated predicate, or a function that should be split because the
+  classifications are accidental, not intrinsic). Future revise loops still apply.
+- **Rationale**:
+  - Round 1 product-code revise was substantive and reduced HIGH findings 39 → 20. The remaining
+    HIGHs are intrinsic to migration orchestration patterns, comparison primitives, arrange-act-assert
+    tests, and Rust namespace glue. Further mechanical decomposition increases code volume without
+    clarity gain.
+  - Phase 7 CodeRabbit and Phase 8 PR-review gates (multi-concern, justification, scope, shortcut,
+    supported-surface, test-audit, process-tree-audit) provide independent third-party review surfaces
+    for any genuine code-quality issue the rigid A1 rule misses.
+  - Same precedent applied in `D-AGE-58-Phase-4` (AGE-54 Phase 4 code-quality MEDIUM accepted as
+    residual via orchestrator-judge call).
+- **Deviation acknowledged**: `~/ai/conventions/code-quality.md` § Disposition policy says HIGH is
+  never accepted as a residual and must be remediated. This decision is a scoped exception driven
+  by a root-owned value/scope/trade-off question; it is not a re-interpretation of the convention,
+  and it does not generalize to other WUs.
+- **Revisit when**: any of (a) a non-intrinsic A1-cohesion HIGH appears on AGE-61's surfaces in a
+  later round, (b) Phase 7 CodeRabbit flags one of the accepted residuals as a real code-quality
+  issue, (c) a sibling WU lands a refactor that genuinely separates one of the listed pairs into
+  truly independent classifications.
+- **Evidence**:
+  - `planning/age-61-row-version-migration/risk/age-61-coupling.md` (round 2 HIGH).
+  - `planning/age-61-row-version-migration/risk/age-61-cohesion.md` (round 2 HIGH).
+  - `planning/age-61-row-version-migration/code-quality/age-61-row-version-substrate/aggregate-code-quality.md`
+    (round 2 HIGH, 20 findings).
+  - `planning/age-61-row-version-migration/code-quality/age-61-row-version-substrate.r1/aggregate-code-quality.md`
+    (round 1 HIGH, 39 findings — preserved).
+  - `planning/age-61-row-version-migration/audit-history.md` (round-1/round-2 entries).
+  - NEEDS_INPUT question + answer artifacts cited above.

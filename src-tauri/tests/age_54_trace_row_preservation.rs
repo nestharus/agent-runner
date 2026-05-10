@@ -3,6 +3,7 @@
 #[path = "../../crates/oulipoly-state/tests/fixtures/mod.rs"]
 mod state_fixtures;
 
+use oulipoly_state::schema::CURRENT_SCHEMA_VERSION;
 use rusqlite::Connection;
 use serde_json::Value;
 use state_fixtures::schema4_invocations::{
@@ -96,7 +97,7 @@ fn trace_json_preserves_schema4_invocation_rows_across_two_calls() {
     assert_eq!(invocation_count(&fixture.db_path()), before_count);
 
     let conn = Connection::open(fixture.db_path()).unwrap();
-    assert_eq!(user_version(&conn), 5);
+    assert_eq!(user_version(&conn), CURRENT_SCHEMA_VERSION);
     assert_root_uuid_resolves(&fixture.db_path());
 }
 
@@ -257,6 +258,7 @@ fn table_checksum(conn: &Connection, table: &str) -> String {
         .unwrap();
     let expr = columns
         .iter()
+        .filter(|column| column.as_str() != "row_version")
         .map(|column| format!("quote({column})"))
         .collect::<Vec<_>>()
         .join(" || '|' || ");

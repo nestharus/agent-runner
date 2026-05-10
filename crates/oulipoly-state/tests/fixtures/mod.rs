@@ -231,6 +231,57 @@ pub fn create_full_state_schema(conn: &Connection, user_version: i32) {
 pub fn seed_representative_state_rows(conn: &Connection) {
     conn.execute_batch(&format!(
         "
+        CREATE TABLE IF NOT EXISTS cli_providers (
+            cli_name TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            installed INTEGER NOT NULL DEFAULT 0,
+            version TEXT,
+            config_dir TEXT,
+            last_synced TEXT
+        );
+        CREATE TABLE IF NOT EXISTS accounts (
+            id TEXT NOT NULL,
+            provider TEXT NOT NULL REFERENCES cli_providers(cli_name),
+            profile_name TEXT NOT NULL,
+            auth_method TEXT NOT NULL,
+            auth_status TEXT NOT NULL DEFAULT 'unknown',
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (id, provider)
+        );
+        CREATE TABLE IF NOT EXISTS discovered_models (
+            canonical_name TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            discovered_at TEXT NOT NULL,
+            cli_version TEXT NOT NULL,
+            PRIMARY KEY (canonical_name, provider)
+        );
+        CREATE TABLE IF NOT EXISTS model_parameters (
+            model_name TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            name TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            param_type TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            cli_mapping TEXT NOT NULL,
+            PRIMARY KEY (model_name, provider, name)
+        );
+
+        DELETE FROM model_parameters;
+        DELETE FROM discovered_models;
+        DELETE FROM accounts;
+        DELETE FROM cli_providers;
+        DELETE FROM session_chain_segments;
+        DELETE FROM session_chains;
+        DELETE FROM session_turns;
+        DELETE FROM setup_turns;
+        DELETE FROM setup_sessions;
+        DELETE FROM memory_edges;
+        DELETE FROM memory_nodes;
+        DELETE FROM provider_quota_windows;
+        DELETE FROM provider_quotas;
+        DELETE FROM providers;
+        DELETE FROM invocations;
+
         INSERT INTO invocations
             (id, invocation_uuid, model_name, provider_name, provider_index, parent_invocation_id,
              status, success, exit_code, terminal_reason, session_id, session_capture_method,

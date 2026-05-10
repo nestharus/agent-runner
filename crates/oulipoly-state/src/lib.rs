@@ -1,4 +1,5 @@
 mod db;
+pub mod deployment;
 pub mod migrations;
 pub mod repositories;
 pub mod schema;
