@@ -266,6 +266,10 @@ fn stderr_json(output: &Output) -> Value {
     serde_json::from_slice(&output.stderr).unwrap()
 }
 
+fn stdout_json(output: &Output) -> Value {
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
 fn source_slice<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     let start_idx = source
         .find(start)
@@ -362,7 +366,7 @@ fn age_33_trace_strictly_rejects_malformed_sessions_config() {
 }
 
 #[test]
-fn age_33_locate_defaults_malformed_sessions_config_before_no_locator_resolution() {
+fn age_33_locate_defaults_malformed_sessions_config_and_uses_storage_scan() {
     let fixture = CliFixture::new();
     let projects_dir = fixture.root().join("claude-projects");
     let transcript = fixture.stage_claude_transcript(&projects_dir, SESSION_A);
@@ -376,17 +380,11 @@ fn age_33_locate_defaults_malformed_sessions_config_before_no_locator_resolution
     cmd.arg("session").arg("locate").arg(SESSION_A);
     let output = cmd.output().unwrap();
 
-    assert_eq!(output.status.code(), Some(12), "{output:?}");
-    assert!(output.stdout.is_empty(), "{output:?}");
-    let json = stderr_json(&output);
-    assert_eq!(json["error"]["code"], "unsupported-storage");
-    assert!(
-        json["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("no_locator"),
-        "{json}"
-    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let json = stdout_json(&output);
+    assert_eq!(json["session_id"], SESSION_A);
+    assert_eq!(json["transcript_state"], "available");
     assert!(
         !stderr(&output).contains("TOML parse error"),
         "locate currently defaults malformed sessions.toml"

@@ -148,16 +148,17 @@ fn locate_mutable_ignores_provider_quota_exhaustion() {
 /// Risk: T5 — D3 transcript availability failure is not partial success.
 /// Level: component.
 /// Source: contract §6 row T5; A8.
-/// Observable: missing locator returns UnsupportedStorage before mutable output.
+/// Observable: missing locator plus missing transcript returns UnsupportedStorage before mutable output.
 /// Residual: condition 4 failure has no partial success JSON.
 #[test]
 fn locate_mutable_matrix_missing_transcript_returns_unsupported_storage() {
     let prepared = component_claude_success_fixture(CLAUDE_PROVIDER, true);
+    std::fs::remove_file(&prepared.jsonl_path).unwrap();
     prepared
         .fixture
         .write_sessions_without_locator(CLAUDE_PROVIDER);
 
-    assert_unsupported(locate(&prepared), &["no_locator"]);
+    assert_unsupported(locate(&prepared), &["claude_storage_scan_not_found"]);
 }
 
 /// Risk: T5 — D3 workspace-root failure is not partial success.
@@ -208,19 +209,22 @@ fn locate_segmentless_session_turn_is_session_not_found() {
     assert_session_not_found(locate(&prepared), &prepared.session_id);
 }
 
-/// Risk: T10 — D6 no locator maps to unsupported storage.
+/// Risk: T10 — D6 missing locator falls back to provider storage scan.
 /// Level: component.
 /// Source: contract §6 row T10; A3.
-/// Observable: no partial success; UnsupportedStorage reason includes no_locator.
+/// Observable: direct storage scan resolves the transcript and workspace.
 /// Residual: locator timeout behavior is covered by existing locate_transcript tests.
 #[test]
-fn locate_rejects_no_locator_transcript_state() {
+fn locate_without_locator_uses_provider_storage_scan() {
     let prepared = component_claude_success_fixture(CLAUDE_PROVIDER, true);
     prepared
         .fixture
         .write_sessions_without_locator(CLAUDE_PROVIDER);
 
-    assert_unsupported(locate(&prepared), &["no_locator"]);
+    let metadata = locate(&prepared).unwrap();
+
+    assert_canonical_eq(&metadata.workspace_root, &prepared.workspace_root);
+    assert_canonical_eq(&metadata.jsonl_path, &prepared.jsonl_path);
 }
 
 /// Risk: T10 — D6 missing JSONL maps to unsupported storage.
