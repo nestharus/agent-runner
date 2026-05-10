@@ -242,3 +242,54 @@ Reference: see `anthropic-usage` (5h + 7d windows from
 `/api/oauth/usage`), `chatgpt-usage ~/.codex/auth.json` (weekly + 5h
 windows from `/backend-api/wham/usage`), and `zai-usage` (GLM via z.ai).
 Same adapter pattern as turn scripts.
+
+## Cwd scripts (`providers.toml`)
+
+A **cwd script** resolves a resumable `session_id` to the original working
+directory where that upstream CLI session was created. The runner uses this
+when composing `agents --resume <session_id>` so resume starts in the same
+project directory without embedding any provider-specific transcript layout
+knowledge.
+
+### Contract
+
+- May take any positional args declared in `cwd_script`.
+- Receives the `session_id` as the final positional argument.
+- Emits exactly one JSON object line on stdout:
+  ```json
+  {"cwd":"/path/to/original/cwd","found":true}
+  ```
+- If the session cannot be found, emit:
+  ```json
+  {"found":false}
+  ```
+- If extraction fails, emit:
+  ```json
+  {"found":false,"error":"<message>"}
+  ```
+- Returns 0 when it emitted a contract response. Non-zero exit is treated as
+  adapter failure and the runner falls back to the caller cwd.
+
+### Wiring
+
+In `~/.config/oulipoly-agent-runner/providers.toml`:
+
+```toml
+[claude.session_storage]
+kind = "script"
+cwd_script = "claude-code-cwd ~/.claude/projects"
+
+[codex.session_storage]
+kind = "script"
+cwd_script = "codex-cwd ~/.codex/sessions"
+```
+
+Legacy storage blocks such as `kind = "claude_code"` with `projects_dir` are
+migrated to `kind = "script"` with a synthetic `cwd_script` on load.
+
+### Bundled reference scripts
+
+| Script | Resolution strategy |
+|---|---|
+| `claude-code-cwd BASE` | Finds `<session_id>.jsonl` under `BASE` project dirs and decodes the project directory name by replacing `-` with `/` |
+| `codex-cwd BASE` | Finds `rollout-*-<session_id>.jsonl` and reads `payload.cwd` from the first JSONL line |

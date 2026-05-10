@@ -195,6 +195,7 @@ impl SessionCapture {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionStorage {
+    Script { cwd_script: String },
     ClaudeCode { projects_dir: PathBuf },
     Codex { sessions_dir: PathBuf },
 }
@@ -202,6 +203,7 @@ pub enum SessionStorage {
 impl SessionStorage {
     pub fn expand_tilde(self) -> Self {
         match self {
+            SessionStorage::Script { cwd_script } => SessionStorage::Script { cwd_script },
             SessionStorage::ClaudeCode { projects_dir } => SessionStorage::ClaudeCode {
                 projects_dir: expand_leading_tilde(projects_dir),
             },
@@ -213,6 +215,11 @@ impl SessionStorage {
 
     pub fn validate(&self) -> Result<(), String> {
         match self {
+            SessionStorage::Script { cwd_script } => {
+                if cwd_script.trim().is_empty() {
+                    return Err("session_storage.kind = script requires `cwd_script`".into());
+                }
+            }
             SessionStorage::ClaudeCode { projects_dir } => {
                 if projects_dir.as_os_str().is_empty() {
                     return Err("session_storage.kind = claude_code requires `projects_dir`".into());
@@ -226,6 +233,34 @@ impl SessionStorage {
         }
         Ok(())
     }
+
+    pub fn cwd_script(&self) -> String {
+        match self {
+            SessionStorage::Script { cwd_script } => cwd_script.clone(),
+            SessionStorage::ClaudeCode { projects_dir } => {
+                format!(
+                    "claude-code-cwd {}",
+                    shell_word(&projects_dir.display().to_string())
+                )
+            }
+            SessionStorage::Codex { sessions_dir } => {
+                format!(
+                    "codex-cwd {}",
+                    shell_word(&sessions_dir.display().to_string())
+                )
+            }
+        }
+    }
+}
+
+fn shell_word(input: &str) -> String {
+    if input
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | '~'))
+    {
+        return input.to_string();
+    }
+    format!("'{}'", input.replace('\'', r#"'\''"#))
 }
 
 fn expand_leading_tilde(path: PathBuf) -> PathBuf {

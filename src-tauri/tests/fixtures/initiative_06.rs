@@ -379,10 +379,20 @@ prompt_mode = "arg"
 
     pub fn run_locate(&self, session_id: &str, extra_args: &[&str]) -> Output {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+        let scripts_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("scripts");
+        let existing_path = std::env::var_os("PATH").unwrap_or_default();
+        let path = std::env::join_paths(
+            std::iter::once(scripts_dir).chain(std::env::split_paths(&existing_path)),
+        )
+        .unwrap();
         cmd.arg("session").arg("locate").arg(session_id);
         cmd.args(extra_args);
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
+        cmd.env("PATH", path);
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
         cmd.output().unwrap()
     }
@@ -691,7 +701,7 @@ pub fn component_codex_success_fixture(provider_name: &str) -> PreparedLocate {
     fs::create_dir_all(&workspace_root).unwrap();
     let jsonl_path = fixture.stage_codex_rollout(
         &sessions_dir,
-        "rollout.jsonl",
+        &format!("rollout-2026-04-17-{SESSION_A}.jsonl"),
         &format!(
             "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{SESSION_A}\",\"cwd\":\"{}\"}}}}\n",
             workspace_root.display()
@@ -729,7 +739,11 @@ pub fn component_codex_failure_fixture(body: &str) -> PreparedLocate {
     let sessions_dir = fixture.root().join("codex-sessions");
     let workspace_root = fixture.root().join("codex-workspace");
     fs::create_dir_all(&workspace_root).unwrap();
-    let jsonl_path = fixture.stage_codex_rollout(&sessions_dir, "rollout.jsonl", body);
+    let jsonl_path = fixture.stage_codex_rollout(
+        &sessions_dir,
+        &format!("rollout-2026-04-17-{SESSION_A}.jsonl"),
+        body,
+    );
     fixture.write_model(MODEL, &[CODEX_PROVIDER]);
     fixture.write_provider(
         CODEX_PROVIDER,
@@ -763,7 +777,7 @@ pub fn component_codex_non_utf8_cwd_fixture() -> PreparedLocate {
     let cwd_link = fixture.create_non_utf8_dir_and_utf8_symlink();
     let jsonl_path = fixture.stage_codex_rollout(
         &sessions_dir,
-        "rollout.jsonl",
+        &format!("rollout-2026-04-17-{SESSION_A}.jsonl"),
         &format!(
             "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{SESSION_A}\",\"cwd\":\"{}\"}}}}\n",
             cwd_link.display()

@@ -338,8 +338,10 @@ fn release_yml_restores_windows_and_target_suffixed_bare_binaries() {
             "artifacts/*".to_string(),
             "scripts/anthropic-usage".to_string(),
             "scripts/chatgpt-usage".to_string(),
+            "scripts/claude-code-cwd".to_string(),
             "scripts/claude-code-locate-transcript".to_string(),
             "scripts/claude-code-turns".to_string(),
+            "scripts/codex-cwd".to_string(),
             "scripts/codex-locate-transcript".to_string(),
             "scripts/codex-turns".to_string(),
             "scripts/zai-usage".to_string()

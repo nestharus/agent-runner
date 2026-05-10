@@ -358,3 +358,5 @@ jobs:
             scripts/zai-usage
             scripts/claude-code-locate-transcript
             scripts/codex-locate-transcript
+            scripts/claude-code-cwd
+            scripts/codex-cwd

@@ -11,5 +11,7 @@ pub use model::{
     ResumeKind, ResumeStrategy, SessionCapture, SessionCaptureKind, SessionStorage,
     derive_provider_name, load_models, render_validated_model_toml,
 };
-pub use providers::{ProviderEntry, ProvidersConfig, parse_prompt_mode};
+pub use providers::{
+    ProviderEntry, ProvidersConfig, migrate_legacy_session_storage_file, parse_prompt_mode,
+};
 pub use sessions::{SessionSourceEntry, SessionsConfig};

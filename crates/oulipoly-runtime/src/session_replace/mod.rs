@@ -1142,9 +1142,22 @@ mod tests {
         let _guard = env_lock().lock().unwrap();
         let old_config = std::env::var_os("XDG_CONFIG_HOME");
         let old_data = std::env::var_os("XDG_DATA_HOME");
+        let old_path = std::env::var_os("PATH");
+        let scripts_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("scripts");
+        let path = std::env::join_paths(
+            std::iter::once(scripts_dir)
+                .chain(std::env::split_paths(&old_path.clone().unwrap_or_default())),
+        )
+        .unwrap();
         unsafe {
             std::env::set_var("XDG_CONFIG_HOME", config_home);
             std::env::set_var("XDG_DATA_HOME", data_home);
+            std::env::set_var("PATH", path);
         }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(test));
         match old_config {
@@ -1161,6 +1174,14 @@ mod tests {
             },
             None => unsafe {
                 std::env::remove_var("XDG_DATA_HOME");
+            },
+        }
+        match old_path {
+            Some(value) => unsafe {
+                std::env::set_var("PATH", value);
+            },
+            None => unsafe {
+                std::env::remove_var("PATH");
             },
         }
         match result {

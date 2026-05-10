@@ -311,8 +311,8 @@ kind = "forced_flag_verified"
 flag = "--session-id"
 
 [claude2.session_storage]
-kind = "claude_code"
-projects_dir = "~/.claude2/projects"
+kind = "script"
+cwd_script = "claude-code-cwd ~/.claude2/projects"
 
 [claude2.resume_acceptance]
 accepted_output_patterns = ["\"session_id\":\"{session_id}\""]
@@ -329,6 +329,10 @@ prompt_mode          = "arg"
 [codex.resume]
 kind = "subcommand"
 subcommand = ["resume"]
+
+[codex.session_storage]
+kind = "script"
+cwd_script = "codex-cwd ~/.codex/sessions"
 
 [opencode]
 quota_script = "zai-usage ~/.config/opencode/auth.json"
@@ -374,6 +378,8 @@ install -m 755 \
   scripts/zai-usage \
   scripts/claude-code-turns \
   scripts/codex-turns \
+  scripts/claude-code-cwd \
+  scripts/codex-cwd \
   ~/.local/bin/
 ```
 
@@ -386,8 +392,10 @@ gh release download v0.1.X --repo nestharus/agent-runner \
   --pattern "zai-usage" \
   --pattern "claude-code-locate-transcript" \
   --pattern "codex-locate-transcript" \
+  --pattern "claude-code-cwd" \
+  --pattern "codex-cwd" \
   --dir ~/.local/bin/
-chmod +x ~/.local/bin/{claude-code-turns,codex-turns,anthropic-usage,chatgpt-usage,zai-usage,claude-code-locate-transcript,codex-locate-transcript}
+chmod +x ~/.local/bin/{claude-code-turns,codex-turns,anthropic-usage,chatgpt-usage,zai-usage,claude-code-locate-transcript,codex-locate-transcript,claude-code-cwd,codex-cwd}
 ```
 
 ## Session Ingestion
