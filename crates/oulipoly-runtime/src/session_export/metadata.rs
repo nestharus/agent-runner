@@ -16,6 +16,24 @@ pub fn resolve_export_session_metadata(
         .map_err(|message| ExportError::Operational { message })?;
     let sessions_cfg = SessionsConfig::load(&sessions_path).unwrap_or_default();
 
+    uuid::Uuid::parse_str(session_id).map_err(|_| ExportError::InvalidSessionId {
+        input: session_id.to_string(),
+    })?;
+
+    let previews = state
+        .resume_previews(session_id)
+        .map_err(|message| ExportError::Operational { message })?;
+    let cutoff = chrono::Utc::now() - chrono::Duration::hours(24);
+    let recent_count = previews
+        .iter()
+        .filter(|preview| preview.last_used_at >= cutoff)
+        .count();
+    if recent_count > 1 {
+        return Err(ExportError::AmbiguousSession {
+            input: session_id.to_string(),
+        });
+    }
+
     let resolved = state
         .resolve_resume(&models, session_id, None)
         .map_err(resume_error_to_export_error)?;

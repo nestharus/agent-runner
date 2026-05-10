@@ -4,7 +4,8 @@ mod fixtures;
 
 use fixtures::initiative_06::*;
 use oulipoly_runtime::session_metadata::{
-    MetadataError, SessionMetadata, SessionStorageType, locate_session_metadata,
+    MetadataError, SessionMetadata, SessionStorageType, locate_resume_session_metadata,
+    locate_session_metadata,
 };
 use serde_json::Value;
 use std::path::Path;
@@ -12,6 +13,17 @@ use std::path::Path;
 fn locate(prepared: &PreparedLocate) -> Result<SessionMetadata, MetadataError> {
     let db = prepared.fixture.open_db();
     locate_session_metadata(
+        &db,
+        &prepared.fixture.models(),
+        &prepared.fixture.providers_config(),
+        &prepared.fixture.sessions_config(),
+        &prepared.session_id,
+    )
+}
+
+fn locate_for_resume(prepared: &PreparedLocate) -> Result<SessionMetadata, MetadataError> {
+    let db = prepared.fixture.open_db();
+    locate_resume_session_metadata(
         &db,
         &prepared.fixture.models(),
         &prepared.fixture.providers_config(),
@@ -45,10 +57,10 @@ fn assert_canonical_eq(actual: &Path, expected: &Path) {
     assert_eq!(actual, expected.canonicalize().unwrap());
 }
 
-/// Risk: T2 — D1 ambiguity mirrors resolver.
+/// Risk: T2 — D1 ambiguity mirrors non-resume metadata resolver.
 /// Level: component.
 /// Source: contract §6 row T2; A2.
-/// Observable: AmbiguousSession only for resolver ambiguity.
+/// Observable: AmbiguousSession only for non-resume resolver ambiguity.
 /// Residual: time-window edges bounded by deterministic fixture timestamps.
 #[test]
 fn locate_ambiguous_recent_multi_chain_returns_ambiguous_session() {
@@ -60,6 +72,21 @@ fn locate_ambiguous_recent_multi_chain_returns_ambiguous_session() {
         }
         other => panic!("expected AmbiguousSession, got {other:?}"),
     }
+}
+
+/// Risk: T2 — D1 strict recency mirrors resume resolver.
+/// Level: component.
+/// Source: contract §6 row T2; A2.
+/// Observable: resume metadata lookup selects the most recent matching chain.
+/// Residual: time-window edges bounded by deterministic fixture timestamps.
+#[test]
+fn locate_resume_recent_multi_chain_selects_most_recent_chain() {
+    let prepared = component_ambiguous_session_fixture();
+
+    let metadata = locate_for_resume(&prepared).unwrap();
+
+    assert_eq!(metadata.chain_id, prepared.chain_id);
+    assert_eq!(metadata.session_id, prepared.session_id);
 }
 
 /// Risk: T2 — D1 recency collapse does not become synthetic ambiguity.

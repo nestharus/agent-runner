@@ -87,9 +87,66 @@ pub fn locate_session_metadata(
     sessions_cfg: &SessionsConfig,
     input: &str,
 ) -> Result<SessionMetadata, MetadataError> {
+    locate_session_metadata_with_policy(
+        state,
+        models,
+        providers_cfg,
+        sessions_cfg,
+        input,
+        AmbiguityPolicy::Reject,
+    )
+}
+
+pub fn locate_resume_session_metadata(
+    state: &StateDb,
+    models: &ModelStore,
+    providers_cfg: &ProvidersConfig,
+    sessions_cfg: &SessionsConfig,
+    input: &str,
+) -> Result<SessionMetadata, MetadataError> {
+    locate_session_metadata_with_policy(
+        state,
+        models,
+        providers_cfg,
+        sessions_cfg,
+        input,
+        AmbiguityPolicy::UseStrictRecency,
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AmbiguityPolicy {
+    Reject,
+    UseStrictRecency,
+}
+
+fn locate_session_metadata_with_policy(
+    state: &StateDb,
+    models: &ModelStore,
+    providers_cfg: &ProvidersConfig,
+    sessions_cfg: &SessionsConfig,
+    input: &str,
+    ambiguity_policy: AmbiguityPolicy,
+) -> Result<SessionMetadata, MetadataError> {
     let parsed_input = Uuid::parse_str(input).map_err(|_| MetadataError::InvalidSessionId {
         input: input.to_string(),
     })?;
+
+    if matches!(ambiguity_policy, AmbiguityPolicy::Reject) {
+        let previews = state
+            .resume_previews(input)
+            .map_err(|message| MetadataError::Operational { message })?;
+        let cutoff = chrono::Utc::now() - chrono::Duration::hours(24);
+        let recent_count = previews
+            .iter()
+            .filter(|preview| preview.last_used_at >= cutoff)
+            .count();
+        if recent_count > 1 {
+            return Err(MetadataError::AmbiguousSession {
+                input: input.to_string(),
+            });
+        }
+    }
 
     let resolved = state
         .resolve_resume(models, input, None)
