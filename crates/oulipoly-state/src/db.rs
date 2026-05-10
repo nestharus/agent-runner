@@ -3867,7 +3867,13 @@ impl StateDb {
         if chain_ids.len() == 1 {
             return Ok(chain_ids.pop());
         }
-        let cutoff = Utc::now() - chrono::Duration::hours(24);
+
+        struct ResumeChainCandidate {
+            chain_id: String,
+            last_used_at: DateTime<Utc>,
+            latest_segment_started_at: DateTime<Utc>,
+        }
+
         let mut rows = Vec::new();
         for chain_id in chain_ids {
             let raw: String = self
@@ -3881,20 +3887,40 @@ impl StateDb {
             let last_used = DateTime::parse_from_rfc3339(&raw)
                 .map(|dt| dt.with_timezone(&Utc))
                 .map_err(|e| format!("Bad chain last_used_at {raw}: {e}"))?;
-            rows.push((chain_id, last_used));
+
+            let raw_started: String = self
+                .conn
+                .query_row(
+                    "SELECT started_at
+                     FROM session_chain_segments
+                     WHERE chain_id = ?1
+                     ORDER BY started_at DESC, id DESC
+                     LIMIT 1",
+                    params![chain_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("Failed to read chain latest segment started_at: {e}"))?;
+            let latest_segment_started_at = DateTime::parse_from_rfc3339(&raw_started)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|e| format!("Bad chain segment started_at {raw_started}: {e}"))?;
+
+            rows.push(ResumeChainCandidate {
+                chain_id,
+                last_used_at: last_used,
+                latest_segment_started_at,
+            });
         }
-        let recent = rows
-            .iter()
-            .filter(|(_, last_used)| *last_used >= cutoff)
-            .collect::<Vec<_>>();
-        if recent.len() == 1 {
-            return Ok(Some(recent[0].0.clone()));
-        }
-        if recent.is_empty() {
-            rows.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-            return Ok(rows.pop().map(|(chain_id, _)| chain_id));
-        }
-        Ok(None)
+
+        rows.sort_by(|a, b| {
+            b.last_used_at
+                .cmp(&a.last_used_at)
+                .then_with(|| {
+                    b.latest_segment_started_at
+                        .cmp(&a.latest_segment_started_at)
+                })
+                .then_with(|| a.chain_id.cmp(&b.chain_id))
+        });
+        Ok(rows.into_iter().next().map(|row| row.chain_id))
     }
 
     pub fn active_segment_id_for_chain_provider_session(
@@ -7943,6 +7969,7 @@ name = "fixture-provider"
     const SESSION_B: &str = "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22";
     const CHAIN_A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     const CHAIN_B: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const CHAIN_C: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 
     fn model_store_from_toml(
         fixtures: &[(&str, &str)],
@@ -8653,59 +8680,91 @@ interactive_args = ["launch"]
 
     // risk: Resolver disambiguation and model inference; level: particular-integration; source: proposal §11.1 Resolver disambiguation and model inference.
     #[test]
-    fn resolve_resume_filters_by_24h_when_two_chains_share_session_id() {
+    fn resolve_resume_chooses_most_recent_chain_when_two_chains_share_session_id() {
         let db = test_db();
-        let now = Utc::now();
-        let recent = (now - chrono::Duration::hours(1)).to_rfc3339();
-        let stale = (now - chrono::Duration::hours(48)).to_rfc3339();
-        seed_test_chain(&db, CHAIN_A, "claude", SESSION_A, "claude-opus", &recent);
-        seed_test_chain(&db, CHAIN_B, "claude", SESSION_A, "claude-opus", &stale);
+        seed_test_chain(
+            &db,
+            CHAIN_A,
+            "claude",
+            SESSION_A,
+            "claude-opus",
+            "2026-04-17T08:00:00Z",
+        );
+        seed_test_chain(
+            &db,
+            CHAIN_B,
+            "claude",
+            SESSION_A,
+            "claude-opus",
+            "2026-04-17T09:00:00Z",
+        );
         let models = resolver_model_store();
 
         let resolved = db.resolve_resume(&models, SESSION_A, None).unwrap();
 
-        assert_eq!(resolved.chain_id, CHAIN_A);
+        assert_eq!(resolved.chain_id, CHAIN_B);
     }
 
     // risk: Resolver disambiguation and model inference; level: particular-integration; source: proposal §11.1 Resolver disambiguation and model inference.
     #[test]
-    fn resolve_resume_errors_ambiguous_when_both_recent() {
+    fn resolve_resume_chooses_most_recent_chain_without_ambiguous_halt() {
         let db = test_db();
-        let recent_a = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
-        let recent_b = (Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
-        seed_test_chain(&db, CHAIN_A, "claude", SESSION_A, "claude-opus", &recent_a);
-        seed_test_chain(&db, CHAIN_B, "claude2", SESSION_A, "claude-opus", &recent_b);
+        seed_test_chain(
+            &db,
+            CHAIN_A,
+            "claude",
+            SESSION_A,
+            "claude-opus",
+            "2026-04-17T08:00:00Z",
+        );
+        seed_test_chain(
+            &db,
+            CHAIN_B,
+            "claude2",
+            SESSION_A,
+            "claude-opus",
+            "2026-04-17T09:00:00Z",
+        );
+        seed_test_chain(
+            &db,
+            CHAIN_C,
+            "claude",
+            SESSION_A,
+            "claude-opus",
+            "2026-04-17T10:00:00Z",
+        );
         let models = resolver_model_store();
 
-        let err = db.resolve_resume(&models, SESSION_A, None).unwrap_err();
+        let resolved = db.resolve_resume(&models, SESSION_A, None).unwrap();
 
-        match err {
-            ResumeError::Ambiguous { input, previews } => {
-                assert_eq!(input, SESSION_A);
-                let ids: Vec<_> = previews
-                    .iter()
-                    .map(|preview| preview.chain_id.as_str())
-                    .collect();
-                assert!(ids.contains(&CHAIN_A));
-                assert!(ids.contains(&CHAIN_B));
-                assert!(
-                    previews
-                        .iter()
-                        .all(|preview| preview.recent_turns.len() <= 3)
-                );
-            }
-            other => panic!("expected ambiguous resume error, got {other:?}"),
-        }
+        assert_eq!(resolved.chain_id, CHAIN_C);
     }
 
     // risk: Resolver disambiguation and model inference; level: particular-integration; source: proposal §11.1 Resolver disambiguation and model inference.
     #[test]
-    fn resolve_resume_falls_back_to_max_last_used_when_none_within_24h() {
+    fn resolve_resume_breaks_equal_last_used_tie_by_latest_segment_start() {
         let db = test_db();
-        let older = (Utc::now() - chrono::Duration::hours(72)).to_rfc3339();
-        let less_old = (Utc::now() - chrono::Duration::hours(48)).to_rfc3339();
-        seed_test_chain(&db, CHAIN_A, "claude", SESSION_A, "claude-opus", &older);
-        seed_test_chain(&db, CHAIN_B, "claude2", SESSION_A, "claude-opus", &less_old);
+        let last_used_at = "2026-04-17T10:00:00Z";
+        seed_chain_row(&db, CHAIN_A, "claude-opus", last_used_at);
+        seed_segment_row(
+            &db,
+            CHAIN_A,
+            "claude",
+            SESSION_A,
+            "2026-04-17T08:00:00Z",
+            None,
+            "initial",
+        );
+        seed_chain_row(&db, CHAIN_B, "claude-opus", last_used_at);
+        seed_segment_row(
+            &db,
+            CHAIN_B,
+            "claude2",
+            SESSION_A,
+            "2026-04-17T09:00:00Z",
+            None,
+            "initial",
+        );
         let models = resolver_model_store();
 
         let resolved = db.resolve_resume(&models, SESSION_A, None).unwrap();

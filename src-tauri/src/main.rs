@@ -18,7 +18,9 @@ use oulipoly_runtime::services::{
 };
 use oulipoly_runtime::session_export::ExportError;
 use oulipoly_runtime::session_lock::LockError;
-use oulipoly_runtime::session_metadata::{MetadataError, locate_session_metadata};
+use oulipoly_runtime::session_metadata::{
+    MetadataError, locate_resume_session_metadata, locate_session_metadata,
+};
 use oulipoly_runtime::session_replace::{self, ReplaceError, ReplaceSource};
 use oulipoly_runtime::trace::{TraceOptions, render_ascii_trace};
 use oulipoly_state::repositories::{ProductionStateDbOpener, StateDbOpener};
@@ -1028,7 +1030,7 @@ fn effective_resume_spawn_cwd(
     working_dir: Option<&Path>,
 ) -> Result<PathBuf, String> {
     let fallback = effective_spawn_cwd(working_dir)?;
-    match locate_session_metadata(state, models, providers_cfg, sessions_cfg, resume_input) {
+    match locate_resume_session_metadata(state, models, providers_cfg, sessions_cfg, resume_input) {
         Ok(metadata) => Ok(metadata.workspace_root),
         Err(err) => {
             eprintln!(

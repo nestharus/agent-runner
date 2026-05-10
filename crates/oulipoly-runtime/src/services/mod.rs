@@ -858,6 +858,7 @@ fn acquire_session_lock(
         ProvidersConfig::load(&default_config_root().join("providers.toml")).unwrap_or_default();
     let models = load_models(&default_models_dir(), Some(&providers_cfg))
         .map_err(|message| SessionLockFailure::Lock(LockError::Operational { message }))?;
+    reject_recent_ambiguous_resume(&state, session_id).map_err(SessionLockFailure::Resume)?;
     let resolved = <StateDb as ResumeRepository>::resolve_resume(&state, &models, session_id, None)
         .map_err(SessionLockFailure::Resume)?;
     let lock_dir = default_lock_dir().map_err(SessionLockFailure::Lock)?;
@@ -879,6 +880,24 @@ fn acquire_session_lock(
         provider_name: resolved.active_provider,
         lease,
     })
+}
+
+fn reject_recent_ambiguous_resume(state: &StateDb, session_id: &str) -> Result<(), ResumeError> {
+    let previews = state
+        .resume_previews(session_id)
+        .map_err(|message| ResumeError::Db { message })?;
+    let cutoff = chrono::Utc::now() - chrono::Duration::hours(24);
+    let recent_count = previews
+        .iter()
+        .filter(|preview| preview.last_used_at >= cutoff)
+        .count();
+    if recent_count > 1 {
+        return Err(ResumeError::Ambiguous {
+            input: session_id.to_string(),
+            previews,
+        });
+    }
+    Ok(())
 }
 
 fn release_session_lock(
