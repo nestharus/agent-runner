@@ -284,6 +284,22 @@ Published artifacts are the platform app bundles and raw
 `agent-scratchpad`, and `agent-messenger`, plus the adapter scripts already
 listed in `.github/workflows/release.yml`.
 
+## Testing
+
+Rust workspace tests cover backend/runtime crates; Vitest covers frontend unit
+tests; Playwright covers browser/E2E flows and screenshot catalog generation.
+
+### Routing matrix tests
+
+`crates/oulipoly-runtime/tests/routing_matrix.rs` is the AGE-59 service-level
+account-routing matrix. It exercises `ProductionRoutingService::select_route`
+with in-memory `StateDb` fixtures over account count, 5h and 7d quota
+remaining buckets, turn accumulation, refresh proximity, last-used recency, and
+the named bug-discovery suspect rows. The suite uses a hybrid strategy:
+exhaustive coverage for small single axes, smart samples for cross-window
+binding pressure, and residual documentation for omitted cartesian cells in
+`planning/age-59-routing-test-expansion/routing-test-existing-coverage.md`.
+
 ## Rust Workspace Structure
 
 ```

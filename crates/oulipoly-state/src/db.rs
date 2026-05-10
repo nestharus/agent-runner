@@ -2787,6 +2787,32 @@ impl StateDb {
         Ok(())
     }
 
+    /// Test-only: backdate a provider's `last_invoked_at` so tests can seed
+    /// last-used recency buckets.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_last_invoked_at_for_test(
+        &self,
+        model_name: &str,
+        provider_name: &str,
+        last_invoked_at: &DateTime<Utc>,
+    ) -> Result<(), String> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE providers
+                 SET last_invoked_at = ?1
+                 WHERE model_name = ?2 AND provider_name = ?3",
+                params![last_invoked_at.to_rfc3339(), model_name, provider_name],
+            )
+            .map_err(|e| format!("Failed to set last_invoked_at: {e}"))?;
+        if updated != 1 {
+            return Err(format!(
+                "Expected exactly one providers row for model_name={model_name}, provider_name={provider_name}, updated {updated}"
+            ));
+        }
+        Ok(())
+    }
+
     /// Test-only: seed the PR 3 per-window burn-rate learning columns without
     /// adding a migration here. This intentionally fails at runtime until the
     /// production schema owns these columns.

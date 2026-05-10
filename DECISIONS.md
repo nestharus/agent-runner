@@ -1373,3 +1373,42 @@ The four discoveries are listed here so a later consolidation WU can pick them u
   - `planning/age-30-release-yml-fix/code-quality/age-30-phase-4/reports/cohesion-auditor.md`
   - `planning/age-30-release-yml-fix/code-quality/age-30-phase-4/reports/coupling-auditor.md`
   - `planning/age-30-release-yml-fix/audit-history.md` Round 3 entry.
+
+## D-019 — AGE-59 Phase 4 code-quality HIGH accepted as pre-resolved residual
+
+- **Source**: Implementation-pipeline-orchestrator AGE-59, Phase 4 code-quality
+  gate aggregate verdict (`planning/age-59-routing-test-expansion/code-quality/age-59-phase-4/aggregate-code-quality.md`,
+  invocation `c6f96bce-358c-4d12-9f45-0cf6aa0ee27a`). Findings CQ-F01..F05 all
+  HIGH cohesion / coupling on the proposed runtime routing matrix test
+  component, fixture reuse, and the conditional product-code contingency path.
+- **Decision**: Accepted as residual + advance. The Phase 4 code-quality
+  auditor predicted Phase 6 A1 outcomes from proposal text; revising the
+  proposal to claim a different test architecture would either defeat the
+  matrix purpose (matrix tests intrinsically need to couple to balancer
+  internals to assert routing decisions) or be a fictional revision that
+  doesn't change structural reality.
+- **Rationale**: The dispatch's pre-resolved acceptance covers exactly this
+  pattern: "Phase 6 code-quality A1-HIGH residual on intrinsic surfaces:
+  pre-resolved per AGE-54 / AGE-61 / AGE-62 precedent. Test arrange-act-assert
+  patterns + matrix-fixture helpers will trigger A1 cohesion HIGH; accept as
+  residual + advance."
+- **Default-policy override note**: `~/ai/conventions/code-quality.md`
+  Disposition policy says HIGH is never accepted as residual. The dispatch
+  authorizes a documented exception scoped to test-fixture intrinsic A1
+  patterns (the AGE-54 / AGE-61 / AGE-62 precedent). The Phase 6 per-component
+  code-quality fanout will re-evaluate against actual code; this acceptance
+  applies only to the Phase 4 gate's predictive verdict on proposal text.
+- **Conditions for revisit**: Phase 6 per-component code-quality on actual
+  matrix tests returns a substantively different finding pattern (e.g.
+  HIGH-coupling-to-non-routing-internals not anticipated by the dispatch's
+  matrix-fixture rationale). In that case, escalate as a NEEDS_INPUT new-value
+  question rather than a silent residual extension.
+- **Evidence**:
+  - Phase 4 code-quality aggregate:
+    `planning/age-59-routing-test-expansion/code-quality/age-59-phase-4/aggregate-code-quality.md`.
+  - Findings JSON / Markdown:
+    `planning/age-59-routing-test-expansion/code-quality/age-59-phase-4/findings.{json,md}`.
+  - Audit history Round 2:
+    `planning/age-59-routing-test-expansion/audit-history.md`.
+  - Join manifest:
+    `planning/age-59-routing-test-expansion/risk/phase-4-join-manifest.json`.
