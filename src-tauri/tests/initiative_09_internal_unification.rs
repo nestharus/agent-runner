@@ -7,6 +7,8 @@ use oulipoly_config::{ProvidersConfig, SessionsConfig, load_models};
 use oulipoly_runtime::session_lock::{self, LockError, SessionLock};
 use oulipoly_runtime::session_metadata::locate_session_metadata;
 use rusqlite::params;
+use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -132,6 +134,21 @@ fn t_error_path_release() {
 /// Residual: focuses on the selected active segment and does not cover ambiguous multi-chain resolution.
 #[test]
 fn t_active_segment_id_flows() {
+    let _path_guard = scripts_path_lock().lock().unwrap();
+    let old_path = std::env::var_os("PATH");
+    let scripts_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("scripts");
+    let path = std::env::join_paths(
+        std::iter::once(scripts_dir)
+            .chain(std::env::split_paths(&old_path.clone().unwrap_or_default())),
+    )
+    .unwrap();
+    unsafe {
+        std::env::set_var("PATH", path);
+    }
+
     let prepared = prepared_claude_replace_fixture();
     let state = prepared.fixture.open_db();
     let models = load_models(prepared.fixture.models_dir(), None).unwrap();
@@ -196,6 +213,20 @@ fn t_active_segment_id_flows() {
     let after_last_used = prepared.fixture.chain_last_used_at(&chain_id);
     assert_ne!(after_last_used, before_last_used);
     assert_eq!(after_last_used, "2026-04-17T09:00:01Z");
+
+    match old_path {
+        Some(path) => unsafe {
+            std::env::set_var("PATH", path);
+        },
+        None => unsafe {
+            std::env::remove_var("PATH");
+        },
+    }
+}
+
+fn scripts_path_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 /// Risk: T-any-active-for-session-public — recovery may lack a public way to detect active session leases after internal lock deletion.

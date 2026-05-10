@@ -19,7 +19,7 @@ use oulipoly_runtime::services::{
 use oulipoly_runtime::session_export::ExportError;
 use oulipoly_runtime::session_lock::LockError;
 use oulipoly_runtime::session_metadata::{
-    MetadataError, locate_resume_session_metadata, locate_session_metadata,
+    MetadataError, locate_session_metadata, resolve_resume_workspace_root,
 };
 use oulipoly_runtime::session_replace::{self, ReplaceError, ReplaceSource};
 use oulipoly_runtime::trace::{TraceOptions, render_ascii_trace};
@@ -1025,13 +1025,13 @@ fn effective_resume_spawn_cwd(
     state: &StateDb,
     models: &oulipoly_state::ModelStore,
     providers_cfg: &ProvidersConfig,
-    sessions_cfg: &oulipoly_config::SessionsConfig,
+    _sessions_cfg: &oulipoly_config::SessionsConfig,
     resume_input: &str,
     working_dir: Option<&Path>,
 ) -> Result<PathBuf, String> {
     let fallback = effective_spawn_cwd(working_dir)?;
-    match locate_resume_session_metadata(state, models, providers_cfg, sessions_cfg, resume_input) {
-        Ok(metadata) => Ok(metadata.workspace_root),
+    match resolve_resume_workspace_root(state, models, providers_cfg, resume_input) {
+        Ok(workspace_root) => Ok(workspace_root),
         Err(err) => {
             eprintln!(
                 "[resume] warning: could not resolve original cwd for {resume_input}: {}; using {}",
@@ -2731,6 +2731,7 @@ fn migrate_config_files(
         std::fs::write(providers_path, providers_text)
             .map_err(|e| format!("Failed to write {}: {e}", providers_path.display()))?;
     }
+    oulipoly_config::migrate_legacy_session_storage_file(providers_path)?;
 
     Ok(ConfigMigrationReport {
         providers_touched,
@@ -3313,17 +3314,17 @@ mod tests {
         cfg
     }
 
-    fn providers_cfg_with_claude_projects(
+    fn providers_cfg_with_cwd_script(
         provider_name: &str,
-        projects_dir: &Path,
+        cwd_script: impl Into<String>,
     ) -> ProvidersConfig {
         let mut cfg = ProvidersConfig::default();
         cfg.entries.insert(
             provider_name.to_string(),
             oulipoly_config::ProviderEntry {
                 command: Some(provider_name.to_string()),
-                session_storage: Some(oulipoly_config::SessionStorage::ClaudeCode {
-                    projects_dir: projects_dir.to_path_buf(),
+                session_storage: Some(oulipoly_config::SessionStorage::Script {
+                    cwd_script: cwd_script.into(),
                 }),
                 resume: Some(oulipoly_config::ResumeStrategy {
                     kind: oulipoly_config::ResumeKind::Flag,
@@ -3334,10 +3335,6 @@ mod tests {
             },
         );
         cfg
-    }
-
-    fn sh_single_quote(input: &Path) -> String {
-        format!("'{}'", input.to_string_lossy().replace('\'', r#"'\''"#))
     }
 
     fn imported_chain_state(db_path: &Path, provider_name: &str, session_id: &str) -> StateDb {
@@ -3468,37 +3465,25 @@ mod tests {
     }
 
     #[test]
-    fn effective_resume_spawn_cwd_prefers_workspace_from_claude_transcript_path() {
+    fn effective_resume_spawn_cwd_prefers_workspace_from_cwd_script() {
         let dir = tempfile::tempdir().unwrap();
-        let provider_name = "claude6";
+        let provider_name = "provider6";
         let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
         let workspace = dir.path().join("workspace");
         let caller_cwd = dir.path().join("caller");
-        let projects_dir = dir.path().join("claude6").join("projects");
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::create_dir_all(&caller_cwd).unwrap();
 
-        let encoded_workspace = workspace.to_string_lossy().replace('/', "-");
-        let transcript_dir = projects_dir.join(encoded_workspace);
-        std::fs::create_dir_all(&transcript_dir).unwrap();
-        let jsonl_path = transcript_dir.join(format!("{session_id}.jsonl"));
-        std::fs::write(&jsonl_path, "{}\n").unwrap();
-
         let state = imported_chain_state(&dir.path().join("state.db"), provider_name, session_id);
         let models = oulipoly_state::ModelStore::new();
-        let providers_cfg = providers_cfg_with_claude_projects(provider_name, &projects_dir);
-        let mut sessions_cfg = oulipoly_config::SessionsConfig::default();
-        sessions_cfg.entries.insert(
-            provider_name.to_string(),
-            oulipoly_config::SessionSourceEntry {
-                turn_script: "true".to_string(),
-                transcript_locator: Some(format!(
-                    "printf '%s\\n' {}",
-                    sh_single_quote(&jsonl_path)
-                )),
-                state_dir: Some(dir.path().join("locator-state")),
-            },
+        let providers_cfg = providers_cfg_with_cwd_script(
+            provider_name,
+            format!(
+                "printf '{{\"found\":true,\"cwd\":\"{}\"}}\\n'",
+                workspace.display()
+            ),
         );
+        let sessions_cfg = oulipoly_config::SessionsConfig::default();
 
         let cwd = effective_resume_spawn_cwd(
             &state,
@@ -3510,22 +3495,47 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(cwd, workspace.canonicalize().unwrap());
+        assert_eq!(cwd, workspace);
     }
 
     #[test]
-    fn effective_resume_spawn_cwd_falls_back_when_metadata_is_unavailable() {
+    fn effective_resume_spawn_cwd_falls_back_when_cwd_script_reports_not_found() {
         let dir = tempfile::tempdir().unwrap();
-        let provider_name = "claude6";
+        let provider_name = "provider6";
         let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
         let fallback = dir.path().join("caller");
-        let projects_dir = dir.path().join("claude6").join("projects");
         std::fs::create_dir_all(&fallback).unwrap();
-        std::fs::create_dir_all(&projects_dir).unwrap();
 
         let state = imported_chain_state(&dir.path().join("state.db"), provider_name, session_id);
         let models = oulipoly_state::ModelStore::new();
-        let providers_cfg = providers_cfg_with_claude_projects(provider_name, &projects_dir);
+        let providers_cfg =
+            providers_cfg_with_cwd_script(provider_name, "printf '{\"found\":false}\\n'");
+        let sessions_cfg = oulipoly_config::SessionsConfig::default();
+
+        let cwd = effective_resume_spawn_cwd(
+            &state,
+            &models,
+            &providers_cfg,
+            &sessions_cfg,
+            session_id,
+            Some(&fallback),
+        )
+        .unwrap();
+
+        assert_eq!(cwd, fallback);
+    }
+
+    #[test]
+    fn effective_resume_spawn_cwd_falls_back_when_cwd_script_returns_malformed_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider_name = "provider6";
+        let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+        let fallback = dir.path().join("caller");
+        std::fs::create_dir_all(&fallback).unwrap();
+
+        let state = imported_chain_state(&dir.path().join("state.db"), provider_name, session_id);
+        let models = oulipoly_state::ModelStore::new();
+        let providers_cfg = providers_cfg_with_cwd_script(provider_name, "printf 'not-json\\n'");
         let sessions_cfg = oulipoly_config::SessionsConfig::default();
 
         let cwd = effective_resume_spawn_cwd(

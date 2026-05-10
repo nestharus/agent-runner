@@ -9,8 +9,10 @@ use oulipoly_runtime::session_metadata::{
 };
 use serde_json::Value;
 use std::path::Path;
+use std::sync::OnceLock;
 
 fn locate(prepared: &PreparedLocate) -> Result<SessionMetadata, MetadataError> {
+    ensure_scripts_on_path();
     let db = prepared.fixture.open_db();
     locate_session_metadata(
         &db,
@@ -22,6 +24,7 @@ fn locate(prepared: &PreparedLocate) -> Result<SessionMetadata, MetadataError> {
 }
 
 fn locate_for_resume(prepared: &PreparedLocate) -> Result<SessionMetadata, MetadataError> {
+    ensure_scripts_on_path();
     let db = prepared.fixture.open_db();
     locate_resume_session_metadata(
         &db,
@@ -30,6 +33,24 @@ fn locate_for_resume(prepared: &PreparedLocate) -> Result<SessionMetadata, Metad
         &prepared.fixture.sessions_config(),
         &prepared.session_id,
     )
+}
+
+fn ensure_scripts_on_path() {
+    static SCRIPTS_PATH: OnceLock<()> = OnceLock::new();
+    SCRIPTS_PATH.get_or_init(|| {
+        let scripts_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("scripts");
+        let existing_path = std::env::var_os("PATH").unwrap_or_default();
+        let path = std::env::join_paths(
+            std::iter::once(scripts_dir).chain(std::env::split_paths(&existing_path)),
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var("PATH", path);
+        }
+    });
 }
 
 fn assert_session_not_found(result: Result<SessionMetadata, MetadataError>, input: &str) {

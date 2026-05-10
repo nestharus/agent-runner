@@ -554,15 +554,17 @@ pub fn prepared_codex_replace_fixture() -> PreparedReplace {
     fs::create_dir_all(&sessions_dir).unwrap();
     let workspace_root = fixture.root().join("workspace");
     fs::create_dir_all(&workspace_root).unwrap();
-    let jsonl_path = fixture.stage_jsonl(
-        "rollout-2026-04-17.jsonl",
-        &format!(
+    let jsonl_path = sessions_dir.join(format!("rollout-2026-04-17-{SESSION_A}.jsonl"));
+    fs::write(
+        &jsonl_path,
+        format!(
             "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{SESSION_A}\",\"cwd\":\"{}\"}}}}\n\
-             {{\"type\":\"response_item\",\"timestamp\":\"2026-04-17T08:00:00Z\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"old codex user\"}}]}}}}\n\
-             {{\"type\":\"response_item\",\"timestamp\":\"2026-04-17T08:00:01Z\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"old codex assistant\"}}]}}}}\n",
+         {{\"type\":\"response_item\",\"timestamp\":\"2026-04-17T08:00:00Z\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"old codex user\"}}]}}}}\n\
+         {{\"type\":\"response_item\",\"timestamp\":\"2026-04-17T08:00:01Z\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"old codex assistant\"}}]}}}}\n",
             workspace_root.display()
         ),
-    );
+    )
+    .unwrap();
     fixture.write_model(MODEL, &[CODEX_PROVIDER]);
     fixture.write_provider(
         CODEX_PROVIDER,
@@ -954,9 +956,19 @@ fn claude_native_line(
 
 fn base_command(config_home: &Path, data_home: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+    let scripts_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("scripts");
+    let existing_path = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        std::iter::once(scripts_dir).chain(std::env::split_paths(&existing_path)),
+    )
+    .unwrap();
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_DATA_HOME", data_home);
     cmd.env("HOME", data_home);
+    cmd.env("PATH", path);
     cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
     cmd
 }

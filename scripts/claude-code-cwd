@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""Resolve a Claude Code session id to its original cwd."""
+
+import json
+import sys
+from pathlib import Path
+
+
+def emit(value: dict) -> int:
+    print(json.dumps(value, separators=(",", ":")))
+    return 0
+
+
+def main() -> int:
+    if len(sys.argv) != 3:
+        return emit({"found": False, "error": "usage: claude-code-cwd PROJECTS_DIR SESSION_ID"})
+
+    base = Path(sys.argv[1]).expanduser()
+    session_id = sys.argv[2]
+    target = f"{session_id}.jsonl"
+
+    try:
+        for project_dir in sorted(base.iterdir()):
+            if not project_dir.is_dir():
+                continue
+            if (project_dir / target).is_file():
+                return emit_workspace(project_dir.name)
+    except OSError as exc:
+        return emit({"found": False, "error": str(exc)})
+
+    return emit({"found": False})
+
+
+def emit_workspace(encoded: str) -> int:
+    candidates = decode_candidates(encoded)
+    existing = []
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        try:
+            existing.append(candidate.resolve(strict=True))
+        except OSError as exc:
+            return emit({"found": False, "error": f"claude_workspace_canonicalize_failed: {candidate}: {exc}"})
+
+    if len(existing) == 1:
+        return emit({"found": True, "cwd": str(existing[0])})
+    if len(existing) == 0:
+        return emit({"found": False, "error": "no_existing_path_hash_decomposition"})
+    return emit({"found": False, "error": "ambiguous_path_hash"})
+
+
+def decode_candidates(encoded: str) -> list[Path]:
+    if not encoded.startswith("-"):
+        return []
+    rest = encoded[1:]
+    if rest == "":
+        return [Path("/")]
+    candidates: list[Path] = []
+    decode_rest(rest, [], "", candidates)
+    return candidates
+
+
+def decode_rest(remaining: str, components: list[str], current: str, candidates: list[Path]) -> None:
+    if remaining == "":
+        if current == "":
+            return
+        path = Path("/")
+        for component in [*components, current]:
+            path = path / component
+        candidates.append(path)
+        return
+
+    ch = remaining[0]
+    tail = remaining[1:]
+    if ch == "-":
+        if current:
+            decode_rest(tail, [*components, current], "", candidates)
+        decode_rest(tail, components, current + "-", candidates)
+    else:
+        decode_rest(tail, components, current + ch, candidates)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

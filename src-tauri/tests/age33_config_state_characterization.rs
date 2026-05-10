@@ -69,9 +69,19 @@ impl CliFixture {
 
     fn command(&self) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+        let scripts_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("scripts");
+        let existing_path = std::env::var_os("PATH").unwrap_or_default();
+        let path = std::env::join_paths(
+            std::iter::once(scripts_dir).chain(std::env::split_paths(&existing_path)),
+        )
+        .unwrap();
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
         cmd.env("HOME", &self.data_home);
+        cmd.env("PATH", path);
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
         cmd
     }

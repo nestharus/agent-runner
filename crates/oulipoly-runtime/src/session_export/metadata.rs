@@ -47,6 +47,13 @@ pub fn resolve_export_session_metadata(
     let storage_type = match provider_entry.session_storage.as_ref() {
         Some(SessionStorage::ClaudeCode { .. }) => SessionStorageType::ClaudeCode,
         Some(SessionStorage::Codex { .. }) => SessionStorageType::CodexSession,
+        Some(SessionStorage::Script { .. }) => {
+            return Err(ExportError::UnsupportedStorage {
+                provider_name: resolved.active_provider,
+                reason: "script session_storage does not declare a canonical export format"
+                    .to_string(),
+            });
+        }
         None => {
             return Err(ExportError::UnsupportedStorage {
                 provider_name: resolved.active_provider,

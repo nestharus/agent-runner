@@ -22,6 +22,7 @@ struct EnvGuard {
     old_config: Option<OsString>,
     old_data: Option<OsString>,
     old_home: Option<OsString>,
+    old_path: Option<OsString>,
 }
 
 impl EnvGuard {
@@ -30,11 +31,23 @@ impl EnvGuard {
             old_config: std::env::var_os("XDG_CONFIG_HOME"),
             old_data: std::env::var_os("XDG_DATA_HOME"),
             old_home: std::env::var_os("HOME"),
+            old_path: std::env::var_os("PATH"),
         };
+        let scripts_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("scripts");
+        let path = std::env::join_paths(std::iter::once(scripts_dir).chain(std::env::split_paths(
+            &guard.old_path.clone().unwrap_or_default(),
+        )))
+        .unwrap();
         unsafe {
             std::env::set_var("XDG_CONFIG_HOME", config_home);
             std::env::set_var("XDG_DATA_HOME", data_home);
             std::env::set_var("HOME", data_home);
+            std::env::set_var("PATH", path);
         }
         guard
     }
@@ -46,6 +59,7 @@ impl Drop for EnvGuard {
             restore_env("XDG_CONFIG_HOME", self.old_config.take());
             restore_env("XDG_DATA_HOME", self.old_data.take());
             restore_env("HOME", self.old_home.take());
+            restore_env("PATH", self.old_path.take());
         }
     }
 }
@@ -83,7 +97,7 @@ impl ReplaceFixture {
         fs::create_dir_all(&workspace_root).unwrap();
         let transcript_path = projects_dir
             .join(claude_project_dir_name(&workspace_root))
-            .join("old-claude.jsonl");
+            .join(format!("{SESSION_A}.jsonl"));
         let input_path = data_root.join("replacement-canonical.jsonl");
         let fixture = Self {
             _dir: dir,

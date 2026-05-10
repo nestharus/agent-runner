@@ -23,9 +23,9 @@ Execute a shell command. Only these commands are allowed: which, type, claude, c
 ### write_config
 Write a configuration file. Only paths under ~/.config/oulipoly-agent-runner/ or ~/.local/bin/ are allowed.
 ```json
-{{"type": "write_config", "path": "~/.config/oulipoly-agent-runner/providers.toml", "content": "[claude]\ncommand = \"claude\"\nargs = [\"-p\"]\ninteractive_args = []\nprompt_mode = \"stdin\"", "description": "Creating Claude provider runtime config"}}
+{{"type": "write_config", "path": "~/.config/oulipoly-agent-runner/providers.toml", "content": "[claude]\ncommand = \"claude\"\nargs = [\"-p\"]\ninteractive_args = []\nprompt_mode = \"stdin\"\n\n[claude.session_storage]\nkind = \"script\"\ncwd_script = \"claude-code-cwd ~/.claude/projects\"", "description": "Creating Claude provider runtime config"}}
 {{"type": "write_config", "path": "~/.config/oulipoly-agent-runner/models/claude-sonnet.toml", "content": "[[providers]]\nname = \"claude\"\nargs = [\"--model\", \"sonnet\"]", "description": "Creating Claude Sonnet model config"}}
-{{"type": "write_config", "path": "~/.config/oulipoly-agent-runner/providers.toml", "content": "[codex]\ncommand = \"codex\"\nargs = [\"exec\", \"-c\", \"sandbox=workspace-write\"]\ninteractive_args = [\"exec\", \"--dangerously-bypass-approvals-and-sandbox\"]\nprompt_mode = \"stdin\"", "description": "Creating Codex provider runtime config"}}
+{{"type": "write_config", "path": "~/.config/oulipoly-agent-runner/providers.toml", "content": "[codex]\ncommand = \"codex\"\nargs = [\"exec\", \"-c\", \"sandbox=workspace-write\"]\ninteractive_args = [\"exec\", \"--dangerously-bypass-approvals-and-sandbox\"]\nprompt_mode = \"stdin\"\n\n[codex.session_storage]\nkind = \"script\"\ncwd_script = \"codex-cwd ~/.codex/sessions\"", "description": "Creating Codex provider runtime config"}}
 {{"type": "write_config", "path": "~/.config/oulipoly-agent-runner/models/gpt-5.5.toml", "content": "[[providers]]\nname = \"codex\"\nargs = [\"-m\", \"gpt-5.5\", \"-c\", \"model_reasoning_effort=high\"]", "description": "Creating Codex GPT model config with model-specific flags only"}}
 ```
 

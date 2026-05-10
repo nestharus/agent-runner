@@ -1,11 +1,10 @@
 use crate::sessions::locate_transcript;
 use oulipoly_config::{ProviderConfig, ProvidersConfig, SessionStorage, SessionsConfig};
 use oulipoly_state::{ModelStore, ResumeError, StateDb};
-use serde::Serialize;
-use serde_json::Value;
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use serde::{Deserialize, Serialize};
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize)]
@@ -33,6 +32,7 @@ pub enum SessionStorageType {
 impl From<&Option<SessionStorage>> for SessionStorageType {
     fn from(storage: &Option<SessionStorage>) -> Self {
         match storage {
+            Some(SessionStorage::Script { .. }) => Self::Other,
             Some(SessionStorage::ClaudeCode { .. }) => Self::ClaudeCode,
             Some(SessionStorage::Codex { .. }) => Self::CodexSession,
             None => Self::Other,
@@ -171,20 +171,11 @@ fn locate_session_metadata_with_policy(
         &provider_name,
         &resolved.active_session_id,
     )?;
-    let workspace_root = match &provider.session_storage {
-        Some(SessionStorage::ClaudeCode { projects_dir }) => {
-            derive_claude_workspace_root(projects_dir, &jsonl_path, &provider_name)?
-        }
-        Some(SessionStorage::Codex { .. }) => {
-            derive_codex_workspace_root(&jsonl_path, &provider_name)?
-        }
-        None => {
-            return Err(MetadataError::UnsupportedStorage {
-                provider_name,
-                reason: "no_workspace_root_for_other_storage: storage_type other".to_string(),
-            });
-        }
-    };
+    let workspace_root = resolve_cwd_from_session_storage(
+        provider.session_storage.as_ref(),
+        &provider_name,
+        &resolved.active_session_id,
+    )?;
 
     let mutable = storage_type != SessionStorageType::Other
         && provider.resume.is_some()
@@ -203,6 +194,26 @@ fn locate_session_metadata_with_policy(
         transcript_state: TranscriptState::Available,
         mutable,
     })
+}
+
+pub fn resolve_resume_workspace_root(
+    state: &StateDb,
+    models: &ModelStore,
+    providers_cfg: &ProvidersConfig,
+    input: &str,
+) -> Result<PathBuf, MetadataError> {
+    Uuid::parse_str(input).map_err(|_| MetadataError::InvalidSessionId {
+        input: input.to_string(),
+    })?;
+    let resolved = state
+        .resolve_resume(models, input, None)
+        .map_err(map_resume_error)?;
+    let provider = effective_provider_for_resolved(&resolved, providers_cfg)?;
+    resolve_cwd_from_session_storage(
+        provider.session_storage.as_ref(),
+        &resolved.active_provider,
+        &resolved.active_session_id,
+    )
 }
 
 fn map_resume_error(err: ResumeError) -> MetadataError {
@@ -322,6 +333,10 @@ fn locate_jsonl_path_from_storage(
     session_id: &str,
 ) -> Result<PathBuf, MetadataError> {
     match session_storage {
+        Some(SessionStorage::Script { .. }) => Err(MetadataError::UnsupportedStorage {
+            provider_name: provider_name.to_string(),
+            reason: "no_transcript_locator_for_script_storage".to_string(),
+        }),
         Some(SessionStorage::ClaudeCode { projects_dir }) => {
             locate_claude_jsonl_path_from_storage(projects_dir, provider_name, session_id)
         }
@@ -460,207 +475,209 @@ fn single_jsonl_match(
     }
 }
 
-fn derive_claude_workspace_root(
-    projects_dir: &Path,
-    jsonl_path: &Path,
+#[derive(Debug, Deserialize)]
+struct CwdScriptResponse {
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    found: bool,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+fn resolve_cwd_from_session_storage(
+    session_storage: Option<&SessionStorage>,
     provider_name: &str,
+    session_id: &str,
 ) -> Result<PathBuf, MetadataError> {
-    let projects_dir =
-        projects_dir
-            .canonicalize()
-            .map_err(|e| MetadataError::UnsupportedStorage {
-                provider_name: provider_name.to_string(),
-                reason: format!(
-                    "claude_projects_dir_unavailable: {}: {e}",
-                    projects_dir.display()
-                ),
-            })?;
-    let transcript_dir = jsonl_path
-        .parent()
-        .ok_or_else(|| MetadataError::UnsupportedStorage {
-            provider_name: provider_name.to_string(),
-            reason: format!("claude_jsonl_path_malformed: {}", jsonl_path.display()),
-        })?;
-    let transcript_parent =
-        transcript_dir
-            .parent()
-            .ok_or_else(|| MetadataError::UnsupportedStorage {
-                provider_name: provider_name.to_string(),
-                reason: format!("claude_jsonl_path_malformed: {}", jsonl_path.display()),
-            })?;
-    if transcript_parent != projects_dir {
+    let Some(session_storage) = session_storage else {
         return Err(MetadataError::UnsupportedStorage {
             provider_name: provider_name.to_string(),
-            reason: format!(
-                "claude_jsonl_outside_projects_dir: {}",
-                jsonl_path.display()
-            ),
+            reason: "no_workspace_root_for_other_storage: storage_type other".to_string(),
+        });
+    };
+
+    let script = session_storage.cwd_script();
+    let stdout = run_cwd_script(&script, session_id).map_err(|reason| {
+        MetadataError::UnsupportedStorage {
+            provider_name: provider_name.to_string(),
+            reason,
+        }
+    })?;
+    let lines = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let [line] = lines.as_slice() else {
+        let reason = if lines.is_empty() {
+            "cwd_script_empty_stdout"
+        } else {
+            "cwd_script_stdout_not_single_line"
+        };
+        return Err(MetadataError::UnsupportedStorage {
+            provider_name: provider_name.to_string(),
+            reason: reason.to_string(),
+        });
+    };
+    let response: CwdScriptResponse =
+        serde_json::from_str(line).map_err(|e| MetadataError::UnsupportedStorage {
+            provider_name: provider_name.to_string(),
+            reason: format!("cwd_script_malformed_json: {e}"),
+        })?;
+    if let Some(error) = response.error.as_deref()
+        && !error.trim().is_empty()
+    {
+        return Err(MetadataError::UnsupportedStorage {
+            provider_name: provider_name.to_string(),
+            reason: format!("cwd_script_error: {error}"),
         });
     }
-    let encoded = transcript_dir
-        .file_name()
-        .and_then(|name| name.to_str())
+    if !response.found {
+        return Err(MetadataError::UnsupportedStorage {
+            provider_name: provider_name.to_string(),
+            reason: "cwd_script_not_found".to_string(),
+        });
+    }
+    let cwd = response
+        .cwd
+        .as_deref()
         .ok_or_else(|| MetadataError::UnsupportedStorage {
             provider_name: provider_name.to_string(),
-            reason: "claude_non_utf8_project_dir".to_string(),
+            reason: "cwd_script_missing_cwd".to_string(),
         })?;
-    let candidates = decode_claude_project_dir_candidates(encoded);
-    let mut existing = Vec::new();
-    for candidate in candidates {
-        if !candidate.exists() {
-            continue;
-        }
-        let canonical =
-            candidate
-                .canonicalize()
-                .map_err(|e| MetadataError::UnsupportedStorage {
-                    provider_name: provider_name.to_string(),
-                    reason: format!(
-                        "claude_workspace_canonicalize_failed: {}: {e}",
-                        candidate.display()
-                    ),
-                })?;
-        if canonical.to_str().is_none() {
-            return Err(MetadataError::UnsupportedStorage {
-                provider_name: provider_name.to_string(),
-                reason: "claude_non_utf8_workspace_root".to_string(),
-            });
-        }
-        existing.push(canonical);
-    }
-    match existing.len() {
-        1 => Ok(existing.remove(0)),
-        0 => Err(MetadataError::UnsupportedStorage {
+    let cwd = PathBuf::from(cwd);
+    if !cwd.is_absolute() {
+        return Err(MetadataError::UnsupportedStorage {
             provider_name: provider_name.to_string(),
-            reason: "no_existing_path_hash_decomposition".to_string(),
-        }),
-        _ => Err(MetadataError::UnsupportedStorage {
-            provider_name: provider_name.to_string(),
-            reason: "ambiguous_path_hash".to_string(),
-        }),
+            reason: format!("cwd_script_cwd_not_absolute: {}", cwd.display()),
+        });
     }
+    Ok(cwd)
 }
 
-fn decode_claude_project_dir_candidates(encoded: &str) -> Vec<PathBuf> {
-    let Some(rest) = encoded.strip_prefix('-') else {
-        return Vec::new();
-    };
-    if rest.is_empty() {
-        return vec![PathBuf::from("/")];
+fn run_cwd_script(script: &str, session_id: &str) -> Result<String, String> {
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(format!("{script} \"$1\""))
+        .arg("oulipoly-cwd-script")
+        .arg(session_id)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("cwd_script_spawn_failed: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "cwd_script_exit_{}: {}",
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
-
-    let mut candidates = Vec::new();
-    let mut components = Vec::new();
-    let mut current = String::new();
-    decode_claude_rest(rest, &mut components, &mut current, &mut candidates);
-    candidates
-}
-
-fn decode_claude_rest(
-    remaining: &str,
-    components: &mut Vec<String>,
-    current: &mut String,
-    candidates: &mut Vec<PathBuf>,
-) {
-    let Some(ch) = remaining.chars().next() else {
-        if current.is_empty() {
-            return;
-        }
-        components.push(current.clone());
-        let mut path = PathBuf::from("/");
-        for component in components.iter() {
-            path.push(component);
-        }
-        candidates.push(path);
-        components.pop();
-        return;
-    };
-    let next = &remaining[ch.len_utf8()..];
-    if ch == '-' {
-        if !current.is_empty() {
-            components.push(current.clone());
-            current.clear();
-            decode_claude_rest(next, components, current, candidates);
-            *current = components.pop().unwrap();
-        }
-        current.push('-');
-        decode_claude_rest(next, components, current, candidates);
-        current.pop();
-    } else {
-        current.push(ch);
-        decode_claude_rest(next, components, current, candidates);
-        current.pop();
-    }
-}
-
-fn derive_codex_workspace_root(
-    jsonl_path: &Path,
-    provider_name: &str,
-) -> Result<PathBuf, MetadataError> {
-    let file = File::open(jsonl_path).map_err(|e| MetadataError::UnsupportedStorage {
-        provider_name: provider_name.to_string(),
-        reason: format!("codex_read_error: {}: {e}", jsonl_path.display()),
-    })?;
-    let reader = BufReader::new(file);
-    for line in reader.lines() {
-        let line = line.map_err(|e| MetadataError::UnsupportedStorage {
-            provider_name: provider_name.to_string(),
-            reason: format!("codex_read_error: {}: {e}", jsonl_path.display()),
-        })?;
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let value: Value =
-            serde_json::from_str(line).map_err(|e| MetadataError::UnsupportedStorage {
-                provider_name: provider_name.to_string(),
-                reason: format!("codex_malformed_json: {e}"),
-            })?;
-        if value.get("type").and_then(Value::as_str) != Some("session_meta") {
-            continue;
-        }
-        let cwd = value
-            .get("payload")
-            .and_then(|payload| payload.get("cwd"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| MetadataError::UnsupportedStorage {
-                provider_name: provider_name.to_string(),
-                reason: "codex_missing_cwd".to_string(),
-            })?;
-        let path = PathBuf::from(cwd);
-        if !path.is_absolute() {
-            return Err(MetadataError::UnsupportedStorage {
-                provider_name: provider_name.to_string(),
-                reason: format!("codex_cwd_not_absolute: {cwd}"),
-            });
-        }
-        if !path.exists() {
-            return Err(MetadataError::UnsupportedStorage {
-                provider_name: provider_name.to_string(),
-                reason: format!("codex_cwd_missing: {cwd}"),
-            });
-        }
-        let canonical = path
-            .canonicalize()
-            .map_err(|e| MetadataError::UnsupportedStorage {
-                provider_name: provider_name.to_string(),
-                reason: format!("codex_cwd_missing: {cwd}: {e}"),
-            })?;
-        if canonical.to_str().is_none() {
-            return Err(MetadataError::UnsupportedStorage {
-                provider_name: provider_name.to_string(),
-                reason: "codex_cwd_non_utf8".to_string(),
-            });
-        }
-        return Ok(canonical);
-    }
-
-    Err(MetadataError::UnsupportedStorage {
-        provider_name: provider_name.to_string(),
-        reason: "codex_missing_session_meta".to_string(),
-    })
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn normalize_uuid(input: &str) -> Option<String> {
     Uuid::parse_str(input).ok().map(|uuid| uuid.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use oulipoly_config::{ProviderEntry, ResumeKind, ResumeStrategy};
+    use std::os::unix::fs::PermissionsExt;
+
+    struct FixtureScript {
+        _dir: tempfile::TempDir,
+        path: PathBuf,
+    }
+
+    fn fixture_script(body: &str) -> FixtureScript {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cwd-script.sh");
+        std::fs::write(&path, format!("#!/usr/bin/env bash\n{body}\n")).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        FixtureScript { _dir: dir, path }
+    }
+
+    fn state_with_session(provider_name: &str, session_id: &str) -> StateDb {
+        let db = StateDb::open(std::path::Path::new(":memory:")).unwrap();
+        db.mint_imported_chain_if_absent(provider_name, session_id, &Utc::now(), "<unknown>")
+            .unwrap();
+        db
+    }
+
+    fn providers_cfg(provider_name: &str, cwd_script: String) -> ProvidersConfig {
+        let mut cfg = ProvidersConfig::default();
+        cfg.entries.insert(
+            provider_name.to_string(),
+            ProviderEntry {
+                command: Some("provider-fixture".to_string()),
+                resume: Some(ResumeStrategy {
+                    kind: ResumeKind::Flag,
+                    flag: Some("--resume".to_string()),
+                    subcommand: None,
+                }),
+                session_storage: Some(SessionStorage::Script { cwd_script }),
+                ..ProviderEntry::default()
+            },
+        );
+        cfg
+    }
+
+    #[test]
+    fn resolve_resume_workspace_root_uses_cwd_script_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let script = fixture_script(&format!(
+            "printf '{{\"found\":true,\"cwd\":\"{}\"}}\\n'",
+            workspace.display()
+        ));
+        let provider_name = "provider";
+        let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+        let db = state_with_session(provider_name, session_id);
+        let cfg = providers_cfg(provider_name, script.path.display().to_string());
+
+        let resolved =
+            resolve_resume_workspace_root(&db, &ModelStore::new(), &cfg, session_id).unwrap();
+
+        assert_eq!(resolved, workspace);
+    }
+
+    #[test]
+    fn resolve_resume_workspace_root_reports_cwd_script_not_found() {
+        let script = fixture_script("printf '{\"found\":false}\\n'");
+        let provider_name = "provider";
+        let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+        let db = state_with_session(provider_name, session_id);
+        let cfg = providers_cfg(provider_name, script.path.display().to_string());
+
+        let err =
+            resolve_resume_workspace_root(&db, &ModelStore::new(), &cfg, session_id).unwrap_err();
+
+        assert!(metadata_error_reason(&err).contains("cwd_script_not_found"));
+    }
+
+    #[test]
+    fn resolve_resume_workspace_root_reports_malformed_cwd_script_json() {
+        let script = fixture_script("printf 'not-json\\n'");
+        let provider_name = "provider";
+        let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+        let db = state_with_session(provider_name, session_id);
+        let cfg = providers_cfg(provider_name, script.path.display().to_string());
+
+        let err =
+            resolve_resume_workspace_root(&db, &ModelStore::new(), &cfg, session_id).unwrap_err();
+
+        assert!(metadata_error_reason(&err).contains("cwd_script_malformed_json"));
+    }
+
+    fn metadata_error_reason(err: &MetadataError) -> &str {
+        match err {
+            MetadataError::UnsupportedStorage { reason, .. } => reason,
+            other => panic!("expected unsupported storage, got {other:?}"),
+        }
+    }
 }

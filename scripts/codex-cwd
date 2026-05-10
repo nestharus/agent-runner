@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""Resolve a Codex rollout session id to its original cwd."""
+
+import json
+import os
+import sys
+from pathlib import Path
+
+
+def emit(value: dict) -> int:
+    print(json.dumps(value, separators=(",", ":")))
+    return 0
+
+
+def main() -> int:
+    if len(sys.argv) != 3:
+        return emit({"found": False, "error": "usage: codex-cwd SESSIONS_DIR SESSION_ID"})
+
+    base = Path(sys.argv[1]).expanduser()
+    session_id = sys.argv[2]
+    suffix = f"-{session_id}.jsonl"
+
+    try:
+        matches = sorted(
+            path
+            for path in base.rglob("rollout-*.jsonl")
+            if path.name.endswith(suffix)
+        )
+    except OSError as exc:
+        return emit({"found": False, "error": str(exc)})
+
+    if not matches:
+        try:
+            matches = sorted(
+                path
+                for path in base.rglob("rollout-*.jsonl")
+                if first_line_session_id(path) == session_id
+            )
+        except OSError as exc:
+            return emit({"found": False, "error": str(exc)})
+    if not matches:
+        return emit({"found": False})
+
+    try:
+        first_line = matches[0].read_text(encoding="utf-8").splitlines()[0]
+        value = json.loads(first_line)
+        if value.get("type") != "session_meta":
+            return emit({"found": False, "error": "codex_missing_session_meta"})
+        payload = value.get("payload") or {}
+        cwd = payload.get("cwd")
+        if not isinstance(cwd, str) or not cwd:
+            return emit({"found": False, "error": "codex_missing_cwd"})
+        path = Path(cwd)
+        if not path.is_absolute():
+            return emit({"found": False, "error": f"codex_cwd_not_absolute: {cwd}"})
+        if not path.exists():
+            return emit({"found": False, "error": f"codex_cwd_missing: {cwd}"})
+        resolved = path.resolve(strict=True)
+        resolved_text = str(resolved)
+        try:
+            os.fsencode(resolved_text).decode("utf-8")
+        except UnicodeError:
+            return emit({"found": False, "error": "codex_cwd_non_utf8"})
+        return emit({"found": True, "cwd": resolved_text})
+    except (OSError, IndexError, json.JSONDecodeError) as exc:
+        return emit({"found": False, "error": str(exc)})
+
+
+def first_line_session_id(path: Path):
+    try:
+        first_line = path.read_text(encoding="utf-8").splitlines()[0]
+        payload = json.loads(first_line).get("payload") or {}
+        return payload.get("id")
+    except (OSError, IndexError, json.JSONDecodeError):
+        return None
+
+
+if __name__ == "__main__":
+    sys.exit(main())

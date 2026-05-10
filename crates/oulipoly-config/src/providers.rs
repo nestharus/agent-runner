@@ -134,6 +134,86 @@ impl ProvidersConfig {
     }
 }
 
+pub fn migrate_legacy_session_storage_file(path: &Path) -> Result<bool, String> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let content =
+        fs::read_to_string(path).map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    migrate_legacy_session_storage_content(path, &content)
+}
+
+fn migrate_legacy_session_storage_content(path: &Path, content: &str) -> Result<bool, String> {
+    let mut value: toml::Value = toml::from_str(content)
+        .map_err(|e| format!("TOML parse error in {}: {e}", path.display()))?;
+    let Some(root) = value.as_table_mut() else {
+        return Ok(false);
+    };
+
+    let mut migrated = Vec::new();
+    for (provider_name, provider_value) in root.iter_mut() {
+        let Some(provider_table) = provider_value.as_table_mut() else {
+            continue;
+        };
+        let Some(storage) = provider_table
+            .get_mut("session_storage")
+            .and_then(toml::Value::as_table_mut)
+        else {
+            continue;
+        };
+        let Some(kind) = storage.get("kind").and_then(toml::Value::as_str) else {
+            continue;
+        };
+        let cwd_script = match kind {
+            "claude_code" => storage
+                .get("projects_dir")
+                .and_then(toml::Value::as_str)
+                .map(|projects_dir| format!("claude-code-cwd {}", shell_word(projects_dir))),
+            "codex" => storage
+                .get("sessions_dir")
+                .and_then(toml::Value::as_str)
+                .map(|sessions_dir| format!("codex-cwd {}", shell_word(sessions_dir))),
+            _ => None,
+        };
+        let Some(cwd_script) = cwd_script else {
+            continue;
+        };
+        storage.insert(
+            "kind".to_string(),
+            toml::Value::String("script".to_string()),
+        );
+        storage.insert("cwd_script".to_string(), toml::Value::String(cwd_script));
+        storage.remove("projects_dir");
+        storage.remove("sessions_dir");
+        migrated.push(provider_name.clone());
+    }
+
+    if migrated.is_empty() {
+        return Ok(false);
+    }
+
+    let new_content = toml::to_string_pretty(&value)
+        .map_err(|e| format!("Failed to serialize migrated {}: {e}", path.display()))?;
+    fs::write(path, &new_content)
+        .map_err(|e| format!("Failed to write migrated {}: {e}", path.display()))?;
+    tracing::warn!(
+        "[config] warning: migrated legacy session_storage for providers {} to kind = \"script\" + cwd_script in {}",
+        migrated.join(", "),
+        path.display()
+    );
+    Ok(true)
+}
+
+fn shell_word(input: &str) -> String {
+    if input
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | '~'))
+    {
+        return input.to_string();
+    }
+    format!("'{}'", input.replace('\'', r#"'\''"#))
+}
+
 impl ProviderEntry {
     fn validate(&self, name: &str) -> Result<(), String> {
         if let Some(resume) = &self.resume {
@@ -407,5 +487,72 @@ sessions_dir = "/tmp/codex-sessions"
             Some(&["accepted".to_string()][..])
         );
         assert!(provider.session_storage.is_some());
+    }
+
+    #[test]
+    fn parses_script_session_storage() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            r#"
+[provider]
+command = "/bin/echo"
+
+[provider.session_storage]
+kind = "script"
+cwd_script = "fixture-cwd ~/.fixture/sessions"
+"#
+        )
+        .unwrap();
+
+        let migrated = migrate_legacy_session_storage_file(f.path()).unwrap();
+        assert!(!migrated);
+        let cfg = ProvidersConfig::load(f.path()).unwrap();
+
+        let storage = cfg
+            .get("provider")
+            .unwrap()
+            .session_storage
+            .as_ref()
+            .unwrap();
+        assert_eq!(storage.cwd_script(), "fixture-cwd ~/.fixture/sessions");
+    }
+
+    #[test]
+    fn migrates_legacy_claude_code_storage_to_script_storage() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            r#"
+[provider]
+command = "/bin/echo"
+
+[provider.session_storage]
+kind = "claude_code"
+projects_dir = "/tmp/provider/projects"
+"#
+        )
+        .unwrap();
+
+        let migrated = migrate_legacy_session_storage_file(f.path()).unwrap();
+        let cfg = ProvidersConfig::load(f.path()).unwrap();
+
+        let storage = cfg
+            .get("provider")
+            .unwrap()
+            .session_storage
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            storage.cwd_script(),
+            "claude-code-cwd /tmp/provider/projects"
+        );
+        assert!(migrated);
+        let migrated_content = std::fs::read_to_string(f.path()).unwrap();
+        assert!(migrated_content.contains("kind = \"script\""));
+        assert!(
+            migrated_content.contains("cwd_script = \"claude-code-cwd /tmp/provider/projects\"")
+        );
+        assert!(!migrated_content.contains("projects_dir"));
     }
 }
