@@ -160,6 +160,14 @@ fn seed_running_child_for_first_parent(fixture: &Fixture, child_uuid: &str) -> i
     conn.last_insert_rowid()
 }
 
+fn invocation_count(fixture: &Fixture) -> i64 {
+    fixture
+        .open_db()
+        .connection()
+        .query_row("SELECT COUNT(*) FROM invocations", [], |row| row.get(0))
+        .unwrap()
+}
+
 #[test]
 fn emits_single_invocation_line_and_finalizes_succeeded_row() {
     let fixture = Fixture::new();
@@ -179,6 +187,34 @@ fn emits_single_invocation_line_and_finalizes_succeeded_row() {
     assert_eq!(
         fs::read_to_string(&fixture.env_dump_path).unwrap(),
         serde_json::to_string(&invocation).unwrap()
+    );
+}
+
+#[test]
+fn direct_run_preserves_existing_history_with_invocation_count_sentinel() {
+    let fixture = Fixture::new();
+    seed_running_child_for_first_parent(&fixture, "aaaaaaaa-0000-4000-8000-000000000001");
+    let before = invocation_count(&fixture);
+
+    let output = fixture.run(None);
+
+    assert!(output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let invocation = parse_invocation(&stderr);
+    assert_eq!(invocation_count(&fixture), before + 1);
+    assert!(
+        fixture
+            .open_db()
+            .get_invocation_by_uuid("aaaaaaaa-0000-4000-8000-000000000001")
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        fixture
+            .open_db()
+            .get_invocation_by_uuid(&invocation.id)
+            .unwrap()
+            .is_some()
     );
 }
 

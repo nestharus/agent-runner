@@ -1459,6 +1459,7 @@ mod tests {
                     },
                     resume_acceptance: None::<ResumeAcceptanceResult>,
                     terminal_reason: None,
+                    watchdog_terminated: false,
                     captured_child_invocations: Vec::<CapturedChildInvocation>::new(),
                     returned_artifacts: Vec::new(),
                 })),
@@ -1477,6 +1478,13 @@ mod tests {
         ) -> Result<ExecutorServiceOutput, ServiceError> {
             match request {
                 ExecutorServiceRequest::Effective {
+                    provider,
+                    extra_inputs,
+                    working_dir,
+                    parent_invocation_env,
+                    ..
+                }
+                | ExecutorServiceRequest::EffectiveWithStartKnownProviderSessionId {
                     provider,
                     extra_inputs,
                     working_dir,

@@ -21,6 +21,8 @@ pub enum ErrorCategory {
     AuthExpired,
     CliVersionMismatch,
     NetworkError,
+    HungSubprocess,
+    ResumeSessionMismatch,
     Unknown,
 }
 
@@ -32,6 +34,8 @@ impl ErrorCategory {
             ErrorCategory::AuthExpired => "auth_expired",
             ErrorCategory::CliVersionMismatch => "cli_version_mismatch",
             ErrorCategory::NetworkError => "network_error",
+            ErrorCategory::HungSubprocess => "hung_subprocess",
+            ErrorCategory::ResumeSessionMismatch => "resume_session_mismatch",
             ErrorCategory::Unknown => "unknown",
         }
     }
@@ -144,6 +148,8 @@ fn parse_diagnosis(output: &str, stderr: &str, exit_code: i32) -> Result<Diagnos
         "auth_expired" => ErrorCategory::AuthExpired,
         "cli_version_mismatch" => ErrorCategory::CliVersionMismatch,
         "network_error" => ErrorCategory::NetworkError,
+        "hung_subprocess" => ErrorCategory::HungSubprocess,
+        "resume_session_mismatch" => ErrorCategory::ResumeSessionMismatch,
         _ => ErrorCategory::Unknown,
     };
 
@@ -171,6 +177,8 @@ fn heuristic_diagnosis(stderr: &str, _exit_code: i32) -> Diagnosis {
         || lower.contains("token expired")
     {
         ErrorCategory::AuthExpired
+    } else if lower.contains("no conversation found") || lower.contains("no session found") {
+        ErrorCategory::ResumeSessionMismatch
     } else if lower.contains("not found")
         || lower.contains("unknown flag")
         || lower.contains("unrecognized")

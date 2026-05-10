@@ -12,11 +12,18 @@ pub struct Migration {
     pub sql: &'static str,
 }
 
-static MIGRATIONS: &[Migration] = &[Migration {
-    target_version: 4,
-    id: "0004_state_db_schema_boundary",
-    sql: include_str!("../migrations/0004_state_db_schema_boundary.sql"),
-}];
+static MIGRATIONS: &[Migration] = &[
+    Migration {
+        target_version: 4,
+        id: "0004_state_db_schema_boundary",
+        sql: include_str!("../migrations/0004_state_db_schema_boundary.sql"),
+    },
+    Migration {
+        target_version: 5,
+        id: "0005_invocation_dual_session_ids",
+        sql: include_str!("../migrations/0005_invocation_dual_session_ids.sql"),
+    },
+];
 
 pub fn manifest() -> &'static [Migration] {
     MIGRATIONS

@@ -61,6 +61,7 @@ fn resume_error_to_export_error(err: ResumeError) -> ExportError {
     match err {
         ResumeError::InvalidUuid { input } => ExportError::InvalidSessionId { input },
         ResumeError::NoChainFound { input } => ExportError::SessionNotFound { input },
+        ResumeError::WrongIdKind { input, .. } => ExportError::SessionNotFound { input },
         ResumeError::Ambiguous { input, .. } => ExportError::AmbiguousSession { input },
         ResumeError::ProviderModelMismatch {
             active_provider, ..

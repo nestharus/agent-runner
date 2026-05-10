@@ -9,6 +9,7 @@ use oulipoly_state::{StateDb, schema_probe};
 use rusqlite::Connection;
 use serde_json::Value;
 use state_fixtures::future_db::build_future_db;
+use state_fixtures::schema4_invocations::{SCHEMA4_ROOT_UUID, build_schema4_invocation_fixture};
 use state_fixtures::v3_full_state_db::build_v3_full_state_db;
 use state_fixtures::versionless_drifted_setup::build_versionless_drifted_setup_db;
 use state_fixtures::versionless_unrecognized::build_versionless_unrecognized_db;
@@ -203,6 +204,31 @@ fn ti_14_representative_state_touching_cli_paths_migrate_before_use() {
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let conn = Connection::open(fixture.db_path()).unwrap();
     assert_eq!(user_version(&conn), CURRENT_SCHEMA_VERSION);
+}
+
+#[test]
+fn ti_14_age_54_read_like_cli_paths_preserve_invocation_count() {
+    for (name, args) in [
+        ("trace", vec!["trace", SCHEMA4_ROOT_UUID, "--json"]),
+        ("migrate-db", vec!["migrate-db"]),
+    ] {
+        let fixture = CliFixture::new();
+        build_schema4_invocation_fixture(&fixture.db_path());
+        let before = invocation_count(&fixture.db_path());
+
+        let mut cmd = fixture.command();
+        cmd.args(args);
+        let output = cmd.output().unwrap();
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{name} should preserve populated invocations: {output:?}"
+        );
+        assert_eq!(invocation_count(&fixture.db_path()), before);
+        let conn = Connection::open(fixture.db_path()).unwrap();
+        assert_eq!(user_version(&conn), 5);
+    }
 }
 
 #[test]
@@ -539,6 +565,12 @@ fn memory_edges_has_foreign_keys(conn: &Connection) -> bool {
         .unwrap();
     rows.contains(&("memory_nodes".to_string(), "source_id".to_string()))
         && rows.contains(&("memory_nodes".to_string(), "target_id".to_string()))
+}
+
+fn invocation_count(path: &Path) -> i64 {
+    let conn = Connection::open(path).unwrap();
+    conn.query_row("SELECT COUNT(*) FROM invocations", [], |row| row.get(0))
+        .unwrap()
 }
 
 fn shell_quote(path: &Path) -> String {

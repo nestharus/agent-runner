@@ -160,6 +160,12 @@ fn parse_invocation(stderr: &str) -> String {
         .to_string()
 }
 
+fn invocation_count(db: &StateDb) -> i64 {
+    db.connection()
+        .query_row("SELECT COUNT(*) FROM invocations", [], |row| row.get(0))
+        .unwrap()
+}
+
 fn receipt_json(invocation_uuid: Uuid, name: &str, version: u64) -> String {
     let reference = returned_ref(invocation_uuid, name, version);
     serde_json::to_string(&reference).expect("receipt JSON")
@@ -462,6 +468,7 @@ fn state_db_fresh_and_incremental_open_create_returned_artifacts_table_without_l
 fn state_db_records_multiple_returns_with_ordinals_without_changing_final_status() {
     let fixture = Fixture::new();
     let db = fixture.open_db();
+    let before_invocation_count = invocation_count(&db);
     let invocation_uuid = Uuid::new_v4();
     let row_id = db
         .start_invocation(&InvocationStart {
@@ -576,6 +583,7 @@ fn state_db_records_multiple_returns_with_ordinals_without_changing_final_status
         .unwrap();
     assert_eq!(invocation.status, InvocationStatus::Failed);
     assert_eq!(invocation.exit_code, Some(7));
+    assert_eq!(invocation_count(&db), before_invocation_count + 2);
 }
 
 // proposal § Test-Intent Track row: trace JSON returned_artifacts projection
@@ -586,6 +594,7 @@ fn state_db_records_multiple_returns_with_ordinals_without_changing_final_status
 fn trace_json_includes_returned_artifacts_and_legacy_missing_defaults_to_empty() {
     let fixture = Fixture::new();
     let db = fixture.open_db();
+    let before_invocation_count = invocation_count(&db);
     let invocation_uuid = "22222222-2222-2222-2222-222222222222";
     let row_id = db
         .start_invocation(&InvocationStart {
@@ -618,6 +627,8 @@ fn trace_json_includes_returned_artifacts_and_legacy_missing_defaults_to_empty()
         .expect("returned_artifacts array");
     assert_eq!(returned.len(), 1);
     assert_eq!(returned[0]["name"], "proposal.md");
+    let after = fixture.open_db();
+    assert_eq!(invocation_count(&after), before_invocation_count + 1);
     assert_eq!(returned[0]["verdict_line"], "APPROVED: ready");
 
     #[derive(serde::Deserialize)]

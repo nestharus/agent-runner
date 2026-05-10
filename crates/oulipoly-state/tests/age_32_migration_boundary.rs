@@ -1,5 +1,6 @@
 mod fixtures;
 
+use fixtures::schema4_invocations::build_schema4_invocation_fixture;
 use fixtures::v3_full_state_db::{
     assert_representative_state_rows_preserved, build_current_full_state_db,
     build_v3_full_state_db, fixture_schema_version,
@@ -220,6 +221,43 @@ fn ti_10_migration_plan_applies_only_missing_forward_steps() {
     assert!(
         current_plan.is_empty(),
         "current-version DB must not replay older migration steps"
+    );
+}
+
+#[test]
+fn ti_10_age_54_schema4_plan_contains_only_schema5_step() {
+    let plan = migrations::plan(4, CURRENT_SCHEMA_VERSION).unwrap();
+
+    assert_eq!(
+        plan.iter()
+            .map(|migration| migration.target_version)
+            .collect::<Vec<_>>(),
+        vec![5],
+        "schema-4 DBs must take exactly the AGE-54 schema-5 migration"
+    );
+    assert_eq!(
+        plan.iter()
+            .map(|migration| migration.id)
+            .collect::<Vec<_>>(),
+        vec!["0005_invocation_dual_session_ids"]
+    );
+}
+
+#[test]
+fn ti_23_age_54_schema4_invocation_fixture_migrates_without_row_loss() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("state.db");
+    build_schema4_invocation_fixture(&db_path);
+    let before_conn = Connection::open(&db_path).unwrap();
+    let before_count = fixtures::count_rows(&before_conn, "invocations");
+    drop(before_conn);
+
+    let db = StateDb::open(&db_path).unwrap();
+
+    assert_eq!(user_version(db.connection()), 5);
+    assert_eq!(
+        fixtures::count_rows(db.connection(), "invocations"),
+        before_count
     );
 }
 

@@ -148,6 +148,7 @@ fn map_resume_error(err: ResumeError) -> MetadataError {
     match err {
         ResumeError::InvalidUuid { input } => MetadataError::InvalidSessionId { input },
         ResumeError::NoChainFound { input } => MetadataError::SessionNotFound { input },
+        ResumeError::WrongIdKind { input, .. } => MetadataError::SessionNotFound { input },
         ResumeError::Ambiguous { input, .. } => MetadataError::AmbiguousSession { input },
         ResumeError::UnknownModel { model_name } => MetadataError::Operational {
             message: format!("unknown model {model_name}"),

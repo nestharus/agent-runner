@@ -5,6 +5,10 @@ use std::path::{Path, PathBuf};
 
 pub mod failing_migration;
 pub mod future_db;
+pub mod invocation_shapes;
+pub mod schema4_invocations;
+pub mod schema5_drift;
+pub mod schema5_invocations;
 pub mod v3_full_state_db;
 pub mod v3_setup_only_db;
 pub mod versionless_drifted_setup;

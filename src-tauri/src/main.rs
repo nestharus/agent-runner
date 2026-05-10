@@ -1076,14 +1076,40 @@ fn emit_known_session_id(
         eprintln!("Warning: Failed to update invocation session_id: {err}");
         return false;
     }
-    if let Err(err) = state.mint_chain_for_invocation_session(invocation_row_id) {
+    let record = state.get_invocation_by_uuid(invocation_uuid).ok().flatten();
+    let should_mint_chain = record
+        .as_ref()
+        .is_none_or(|row| row.resume_input_id.as_deref() != row.provider_session_id.as_deref());
+    if should_mint_chain
+        && let Err(err) = state.mint_chain_for_invocation_session(invocation_row_id)
+    {
         eprintln!("Warning: Failed to mint session chain: {err}");
     }
-    let payload = serde_json::json!({
-        "id": invocation_uuid,
-        "session_id": session_id,
+    let provider_name = record.as_ref().and_then(|row| row.provider_name.clone());
+    let provider_session_id = record
+        .as_ref()
+        .and_then(|row| row.provider_session_id.clone())
+        .or_else(|| Some(session_id.to_string()));
+    let agent_runner_chain_id = provider_name.as_deref().and_then(|provider_name| {
+        provider_session_id
+            .as_deref()
+            .and_then(|provider_session_id| {
+                state
+                    .chain_id_for_segment(provider_name, provider_session_id)
+                    .ok()
+                    .flatten()
+            })
     });
-    eprintln!("OULIPOLY_SESSION={payload}");
+    let payload = oulipoly_state::SessionMarkerPayload {
+        agent_runner_invocation_id: invocation_uuid.to_string(),
+        provider_session_id: provider_session_id.clone(),
+        provider_name,
+        agent_runner_chain_id,
+        resume_input_id: record.as_ref().and_then(|row| row.resume_input_id.clone()),
+        legacy_id: invocation_uuid.to_string(),
+        legacy_session_id: Some(session_id.to_string()),
+    };
+    eprint!("{}", payload.stderr_line());
     true
 }
 
@@ -1134,6 +1160,31 @@ fn format_resume_error(err: oulipoly_state::ResumeError) -> String {
         ResumeError::NoChainFound { input } => format!(
             "No session found matching {input}. Check that session ingestion is configured and that the provider still has resumable local state."
         ),
+        ResumeError::WrongIdKind {
+            input,
+            provider_session_id,
+            agent_runner_invocation_id,
+            chain_id,
+            provider_name,
+            ..
+        } => {
+            let provider_hint = provider_name
+                .as_deref()
+                .map(|name| format!(" for provider {name}"))
+                .unwrap_or_default();
+            let chain_hint = chain_id
+                .as_deref()
+                .map(|id| format!(" chain={id}."))
+                .unwrap_or_default();
+            match provider_session_id {
+                Some(provider_session_id) => format!(
+                    "wrong id kind: {input} is an agent-runner invocation id{provider_hint}, not a provider session id. Use `agents --resume {provider_session_id}` to resume. Use `agents trace --json {agent_runner_invocation_id}` to inspect the runner trace.{chain_hint}"
+                ),
+                None => format!(
+                    "wrong id kind: {input} is an agent-runner invocation id{provider_hint}, but no provider_session_id is bound yet. Use `agents trace --json {agent_runner_invocation_id}` to inspect the runner trace.{chain_hint}"
+                ),
+            }
+        }
         ResumeError::Ambiguous { input, previews } => {
             let mut out = format!(
                 "[resume] session {input} matches {} chains:\n",
@@ -1336,6 +1387,28 @@ fn emit_resume_resolution_error(err: oulipoly_state::ResumeError) -> i32 {
             "session-not-found",
             format!("no session found matching {input}"),
         ),
+        ResumeError::WrongIdKind {
+            input,
+            provider_session_id,
+            agent_runner_invocation_id,
+            chain_id,
+            provider_name,
+            ..
+        } => {
+            let payload = serde_json::json!({
+                "error": {
+                    "code": "wrong-id-kind",
+                    "message": format!("wrong id kind: {input} is an agent-runner invocation id"),
+                    "input": input,
+                    "agent_runner_invocation_id": agent_runner_invocation_id,
+                    "provider_session_id": provider_session_id,
+                    "agent_runner_chain_id": chain_id,
+                    "provider_name": provider_name,
+                }
+            });
+            eprintln!("{payload}");
+            10
+        }
         ResumeError::Ambiguous { input, .. } => emit_json_error(
             11,
             "ambiguous-session",
@@ -1614,9 +1687,10 @@ fn run_repl(
         ));
     }
 
+    let invocation_id = Uuid::new_v4().to_string();
     let invocation = CompositeInvocationId {
         source: provider.name.clone(),
-        id: Uuid::new_v4().to_string(),
+        id: invocation_id,
     };
     let invocation_model_name = resolved_resume
         .as_ref()
@@ -1647,8 +1721,20 @@ fn run_repl(
     let invocation_env = serde_json::to_string(&invocation)
         .map_err(|e| format!("Failed to serialize invocation id: {e}"))?;
 
-    if let Some(session_id) = resume {
-        state.update_session_capture(invocation_row_id, Some(session_id), "resumed")?;
+    if let Some(active_session_id) = resume_session_id.as_deref() {
+        state.bind_invocation_provider_session_start(
+            invocation_row_id,
+            &oulipoly_state::ProviderSessionBinding {
+                provider_session_id: active_session_id.to_string(),
+                capture_method: "resumed",
+                resume_input_id: resume.map(str::to_string),
+            },
+        )?;
+        if let Some(session_id) = resume
+            && manual_migrate.is_some()
+        {
+            state.record_legacy_resume_input_session_id(invocation_row_id, session_id)?;
+        }
     }
 
     if should_emit_invocation_line(stderr_is_terminal) {
@@ -1699,7 +1785,11 @@ fn run_repl(
                     &invocation.id,
                     match resume {
                         Some(session_id) => ResumeIngestMode::Pinned {
-                            resume_target: session_id,
+                            resume_target: if manual_migrate.is_some() {
+                                session_id
+                            } else {
+                                resume_session_id.as_deref().unwrap_or(session_id)
+                            },
                         },
                         None => ResumeIngestMode::Unpinned {
                             capture_method: "turn_script",
@@ -1854,9 +1944,10 @@ fn run_resume(
     };
 
     let parent_invocation_id = resolve_parent_invocation_id(&state);
+    let invocation_id = Uuid::new_v4().to_string();
     let invocation = CompositeInvocationId {
         source: provider.name.clone(),
-        id: Uuid::new_v4().to_string(),
+        id: invocation_id,
     };
     let invocation_model_name = resolved
         .model_name
@@ -1878,7 +1969,17 @@ fn run_resume(
         .map_err(|err| err.to_string())?
         .invocation_row_id;
     let mut guard = FinalizerGuard::new(&state, invocation_row_id);
-    state.update_session_capture(invocation_row_id, Some(session_id), "resumed")?;
+    state.bind_invocation_provider_session_start(
+        invocation_row_id,
+        &oulipoly_state::ProviderSessionBinding {
+            provider_session_id: resolved.active_session_id.clone(),
+            capture_method: "resumed",
+            resume_input_id: Some(session_id.to_string()),
+        },
+    )?;
+    if manual_migrate.is_some() {
+        state.record_legacy_resume_input_session_id(invocation_row_id, session_id)?;
+    }
 
     let invocation_env = serde_json::to_string(&invocation)
         .map_err(|e| format!("Failed to serialize invocation id: {e}"))?;
@@ -1927,7 +2028,25 @@ fn run_resume(
     }
 
     let success = result.exit_code == 0;
-    let error_category = if !success {
+    let error_category = if result.watchdog_terminated {
+        Some(
+            diagnostics::ErrorCategory::HungSubprocess
+                .as_str()
+                .to_string(),
+        )
+    } else if !success
+        && result.resume_acceptance.as_ref().is_some_and(|acceptance| {
+            acceptance.evidence.as_deref().is_some_and(|evidence| {
+                evidence.contains(diagnostics::ErrorCategory::ResumeSessionMismatch.as_str())
+            })
+        })
+    {
+        Some(
+            diagnostics::ErrorCategory::ResumeSessionMismatch
+                .as_str()
+                .to_string(),
+        )
+    } else if !success {
         run_diagnostics(
             agent_runtime_services,
             &result.stderr,
@@ -1978,7 +2097,11 @@ fn run_resume(
             invocation_row_id,
             &invocation.id,
             ResumeIngestMode::Pinned {
-                resume_target: session_id,
+                resume_target: if manual_migrate.is_some() {
+                    session_id
+                } else {
+                    &resolved.active_session_id
+                },
             },
         );
         let _ = std::io::stdout().write_all(&result.stdout);
@@ -2033,9 +2156,10 @@ fn run_with_balancing(
     let (provider, prompt_mode) =
         effective_model_for_execution(model, provider_index, &providers_cfg)?;
     let provider_name = &provider.name;
+    let invocation_id = Uuid::new_v4().to_string();
     let invocation = CompositeInvocationId {
         source: provider_name.clone(),
-        id: Uuid::new_v4().to_string(),
+        id: invocation_id,
     };
     let invocation_start = InvocationStart {
         invocation_uuid: invocation.id.clone(),
@@ -2052,14 +2176,27 @@ fn run_with_balancing(
         })
         .map_err(|err| err.to_string())?
         .invocation_row_id;
+    let start_known_provider_session_id =
+        executor::cli::start_known_provider_session_id(&provider)?;
+    if let Some(provider_session_id) = start_known_provider_session_id.as_deref() {
+        state
+            .bind_invocation_provider_session_start(
+                invocation_row_id,
+                &oulipoly_state::ProviderSessionBinding {
+                    provider_session_id: provider_session_id.to_string(),
+                    capture_method: "forced_flag_verified",
+                    resume_input_id: None,
+                },
+            )
+            .unwrap_or_else(|e| eprintln!("Warning: Failed to bind provider session: {e}"));
+    }
     let invocation_env = serde_json::to_string(&invocation)
         .map_err(|e| format!("Failed to serialize invocation id: {e}"))?;
     eprintln!("{}", invocation.stderr_line());
 
-    let result =
-        match agent_runtime_services
-            .executor_service
-            .execute(ExecutorServiceRequest::Effective {
+    let executor_request =
+        if let Some(start_known_provider_session_id) = start_known_provider_session_id.clone() {
+            ExecutorServiceRequest::EffectiveWithStartKnownProviderSessionId {
                 model: model.clone(),
                 provider: provider.clone(),
                 provider_index,
@@ -2068,26 +2205,44 @@ fn run_with_balancing(
                 working_dir: working_dir.map(Path::to_path_buf),
                 extra_inputs: extra_inputs.clone(),
                 parent_invocation_env: Some(invocation_env.clone()),
-            }) {
-            Ok(output) => output.result,
-            Err(err) => {
-                agent_runtime_services
-                    .invocation_lifecycle_service
-                    .finalize_invocation(InvocationLifecycleFinalizeRequest {
-                        state: &state,
-                        invocation_row_id,
-                        success: false,
-                        exit_code: -1,
-                        error_category: Some("spawn_error"),
-                        terminal_reason: Some("spawn_error"),
-                    })
-                    .map(|_| ())
-                    .unwrap_or_else(|finalize_err| {
-                        eprintln!("Warning: Failed to finalize invocation: {finalize_err}")
-                    });
-                return Err(err.to_string());
+                start_known_provider_session_id,
+            }
+        } else {
+            ExecutorServiceRequest::Effective {
+                model: model.clone(),
+                provider: provider.clone(),
+                provider_index,
+                prompt_mode,
+                prompt: prompt.to_string(),
+                working_dir: working_dir.map(Path::to_path_buf),
+                extra_inputs: extra_inputs.clone(),
+                parent_invocation_env: Some(invocation_env.clone()),
             }
         };
+
+    let result = match agent_runtime_services
+        .executor_service
+        .execute(executor_request)
+    {
+        Ok(output) => output.result,
+        Err(err) => {
+            agent_runtime_services
+                .invocation_lifecycle_service
+                .finalize_invocation(InvocationLifecycleFinalizeRequest {
+                    state: &state,
+                    invocation_row_id,
+                    success: false,
+                    exit_code: -1,
+                    error_category: Some("spawn_error"),
+                    terminal_reason: Some("spawn_error"),
+                })
+                .map(|_| ())
+                .unwrap_or_else(|finalize_err| {
+                    eprintln!("Warning: Failed to finalize invocation: {finalize_err}")
+                });
+            return Err(err.to_string());
+        }
+    };
 
     supervise_captured_child_invocations(
         &state,
@@ -2110,7 +2265,13 @@ fn run_with_balancing(
 
     let success = result.exit_code == 0;
 
-    let error_category = if !success {
+    let error_category = if result.watchdog_terminated {
+        Some(
+            diagnostics::ErrorCategory::HungSubprocess
+                .as_str()
+                .to_string(),
+        )
+    } else if !success {
         run_diagnostics(
             agent_runtime_services,
             &result.stderr,
