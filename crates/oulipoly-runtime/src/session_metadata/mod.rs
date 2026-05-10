@@ -3,7 +3,7 @@ use oulipoly_config::{ProviderConfig, ProvidersConfig, SessionStorage, SessionsC
 use oulipoly_state::{ModelStore, ResumeError, StateDb};
 use serde::Serialize;
 use serde_json::Value;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -108,8 +108,12 @@ pub fn locate_session_metadata(
             input: resolved.chain_id.clone(),
         })?;
 
-    let jsonl_path =
-        available_jsonl_path(sessions_cfg, &provider_name, &resolved.active_session_id)?;
+    let jsonl_path = available_jsonl_path(
+        sessions_cfg,
+        provider.session_storage.as_ref(),
+        &provider_name,
+        &resolved.active_session_id,
+    )?;
     let workspace_root = match &provider.session_storage {
         Some(SessionStorage::ClaudeCode { projects_dir }) => {
             derive_claude_workspace_root(projects_dir, &jsonl_path, &provider_name)?
@@ -213,21 +217,21 @@ fn effective_provider_for_resolved(
 
 fn available_jsonl_path(
     sessions_cfg: &SessionsConfig,
+    session_storage: Option<&SessionStorage>,
     provider_name: &str,
     session_id: &str,
 ) -> Result<PathBuf, MetadataError> {
-    let path = locate_transcript(sessions_cfg, provider_name, session_id).map_err(|message| {
-        MetadataError::UnsupportedStorage {
+    match locate_transcript(sessions_cfg, provider_name, session_id) {
+        Ok(Some(path)) => validate_jsonl_path(provider_name, path),
+        Ok(None) => locate_jsonl_path_from_storage(session_storage, provider_name, session_id),
+        Err(message) => Err(MetadataError::UnsupportedStorage {
             provider_name: provider_name.to_string(),
             reason: format!("locator_error: {message}"),
-        }
-    })?;
-    let Some(path) = path else {
-        return Err(MetadataError::UnsupportedStorage {
-            provider_name: provider_name.to_string(),
-            reason: "no_locator".to_string(),
-        });
-    };
+        }),
+    }
+}
+
+fn validate_jsonl_path(provider_name: &str, path: PathBuf) -> Result<PathBuf, MetadataError> {
     if !path.is_absolute() {
         return Err(MetadataError::UnsupportedStorage {
             provider_name: provider_name.to_string(),
@@ -253,6 +257,150 @@ fn available_jsonl_path(
         });
     }
     Ok(canonical)
+}
+
+fn locate_jsonl_path_from_storage(
+    session_storage: Option<&SessionStorage>,
+    provider_name: &str,
+    session_id: &str,
+) -> Result<PathBuf, MetadataError> {
+    match session_storage {
+        Some(SessionStorage::ClaudeCode { projects_dir }) => {
+            locate_claude_jsonl_path_from_storage(projects_dir, provider_name, session_id)
+        }
+        Some(SessionStorage::Codex { sessions_dir }) => {
+            locate_codex_jsonl_path_from_storage(sessions_dir, provider_name, session_id)
+        }
+        None => Err(MetadataError::UnsupportedStorage {
+            provider_name: provider_name.to_string(),
+            reason: "no_locator".to_string(),
+        }),
+    }
+}
+
+fn locate_claude_jsonl_path_from_storage(
+    projects_dir: &Path,
+    provider_name: &str,
+    session_id: &str,
+) -> Result<PathBuf, MetadataError> {
+    let projects_dir =
+        projects_dir
+            .canonicalize()
+            .map_err(|e| MetadataError::UnsupportedStorage {
+                provider_name: provider_name.to_string(),
+                reason: format!(
+                    "claude_projects_dir_unavailable: {}: {e}",
+                    projects_dir.display()
+                ),
+            })?;
+    let filename = format!("{session_id}.jsonl");
+    let mut matches = Vec::new();
+    let entries = fs::read_dir(&projects_dir).map_err(|e| MetadataError::UnsupportedStorage {
+        provider_name: provider_name.to_string(),
+        reason: format!(
+            "claude_projects_dir_unavailable: {}: {e}",
+            projects_dir.display()
+        ),
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|e| MetadataError::UnsupportedStorage {
+            provider_name: provider_name.to_string(),
+            reason: format!(
+                "claude_projects_dir_read_error: {}: {e}",
+                projects_dir.display()
+            ),
+        })?;
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let candidate = entry.path().join(&filename);
+        if candidate.is_file() {
+            matches.push(validate_jsonl_path(provider_name, candidate)?);
+        }
+    }
+    single_jsonl_match(provider_name, "claude_storage_scan", matches)
+}
+
+fn locate_codex_jsonl_path_from_storage(
+    sessions_dir: &Path,
+    provider_name: &str,
+    session_id: &str,
+) -> Result<PathBuf, MetadataError> {
+    let sessions_dir =
+        sessions_dir
+            .canonicalize()
+            .map_err(|e| MetadataError::UnsupportedStorage {
+                provider_name: provider_name.to_string(),
+                reason: format!(
+                    "codex_sessions_dir_unavailable: {}: {e}",
+                    sessions_dir.display()
+                ),
+            })?;
+    let mut matches = Vec::new();
+    collect_codex_rollout_matches(&sessions_dir, provider_name, session_id, 0, &mut matches)?;
+    single_jsonl_match(provider_name, "codex_storage_scan", matches)
+}
+
+fn collect_codex_rollout_matches(
+    dir: &Path,
+    provider_name: &str,
+    session_id: &str,
+    depth: usize,
+    matches: &mut Vec<PathBuf>,
+) -> Result<(), MetadataError> {
+    if depth > 4 {
+        return Ok(());
+    }
+    let entries = fs::read_dir(dir).map_err(|e| MetadataError::UnsupportedStorage {
+        provider_name: provider_name.to_string(),
+        reason: format!("codex_sessions_dir_read_error: {}: {e}", dir.display()),
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|e| MetadataError::UnsupportedStorage {
+            provider_name: provider_name.to_string(),
+            reason: format!("codex_sessions_dir_read_error: {}: {e}", dir.display()),
+        })?;
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            collect_codex_rollout_matches(&path, provider_name, session_id, depth + 1, matches)?;
+        } else if file_type.is_file()
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("rollout-")
+                        && name.ends_with(".jsonl")
+                        && name.contains(session_id)
+                })
+        {
+            matches.push(validate_jsonl_path(provider_name, path)?);
+        }
+    }
+    Ok(())
+}
+
+fn single_jsonl_match(
+    provider_name: &str,
+    source: &str,
+    mut matches: Vec<PathBuf>,
+) -> Result<PathBuf, MetadataError> {
+    match matches.len() {
+        1 => Ok(matches.remove(0)),
+        0 => Err(MetadataError::UnsupportedStorage {
+            provider_name: provider_name.to_string(),
+            reason: format!("{source}_not_found"),
+        }),
+        _ => Err(MetadataError::UnsupportedStorage {
+            provider_name: provider_name.to_string(),
+            reason: format!("{source}_ambiguous"),
+        }),
+    }
 }
 
 fn derive_claude_workspace_root(
