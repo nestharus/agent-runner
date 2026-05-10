@@ -23,6 +23,10 @@ pub use db::{
 pub use db::{CliMapping, DiscoveredModel, ModelParameter, ParamType};
 pub use db::{CompositeInvocationId, InvocationRecord, InvocationStart, InvocationStatus};
 pub use db::{QuotaRecord, QuotaWindow, QuotaWindowInput};
+pub use deployment::{
+    DbRole, DeploymentAwareOpener, DeploymentMetadataStore, DeploymentRoutingDecision,
+    DeploymentRoutingPort, ResolveError, ResolvedStateDb, StoreBackedRoutingPort,
+};
 
 #[cfg(doctest)]
 pub mod age_32_connection_boundary_doctest {

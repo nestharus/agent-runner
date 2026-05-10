@@ -1,3 +1,4 @@
+use crate::deployment::DeploymentAwareOpener;
 use crate::schema_probe::{self, SchemaProbeReport};
 use crate::{
     AccountRecord, ChainPreview, CliProviderRecord, DbError, DiscoveredModel, InvocationRecord,
@@ -7,7 +8,29 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use oulipoly_core::TransitionReason;
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+
+static NEXT_DEPLOYMENT_AWARE_OPENER_TOKEN: AtomicUsize = AtomicUsize::new(1);
+
+#[derive(Clone)]
+struct DeploymentAwareOpenerSlot {
+    token: usize,
+    opener: DeploymentAwareOpener,
+}
+
+#[derive(Debug)]
+struct DeploymentAwareOpenerRegistration {
+    token: usize,
+}
+
+thread_local! {
+    static DEPLOYMENT_AWARE_OPENER: RefCell<Option<DeploymentAwareOpenerSlot>> = const { RefCell::new(None) };
+}
 
 /// Repository slice over invocation lifecycle rows.
 ///
@@ -572,12 +595,69 @@ pub trait StateDbOpener {
     fn open_in_memory(&self) -> StateDb;
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ProductionStateDbOpener;
+#[derive(Debug, Clone, Default)]
+pub struct ProductionStateDbOpenerState {
+    registration: Option<Arc<DeploymentAwareOpenerRegistration>>,
+}
 
-impl StateDbOpener for ProductionStateDbOpener {
+pub type ProductionStateDbOpener = ProductionStateDbOpenerState;
+
+/// Default production opener value, preserving the previous unit-struct construction syntax.
+#[allow(non_upper_case_globals)]
+pub const ProductionStateDbOpener: ProductionStateDbOpenerState =
+    ProductionStateDbOpenerState::new();
+
+impl ProductionStateDbOpenerState {
+    pub const fn new() -> Self {
+        Self { registration: None }
+    }
+
+    pub fn with_deployment_aware_opener(opener: DeploymentAwareOpener) -> Self {
+        let token = NEXT_DEPLOYMENT_AWARE_OPENER_TOKEN
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .expect("deployment-aware opener token counter exhausted");
+        DEPLOYMENT_AWARE_OPENER.with(|slot| {
+            *slot.borrow_mut() = Some(DeploymentAwareOpenerSlot { token, opener });
+        });
+        Self {
+            registration: Some(Arc::new(DeploymentAwareOpenerRegistration { token })),
+        }
+    }
+}
+
+impl Drop for ProductionStateDbOpenerState {
+    fn drop(&mut self) {
+        let Some(registration) = self.registration.as_ref() else {
+            return;
+        };
+
+        if Arc::strong_count(registration) > 1 {
+            return;
+        }
+
+        DEPLOYMENT_AWARE_OPENER.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot
+                .as_ref()
+                .is_some_and(|current| current.token == registration.token)
+            {
+                *slot = None;
+            }
+        });
+    }
+}
+
+impl StateDbOpener for ProductionStateDbOpenerState {
     fn open_default(&self) -> Result<StateDb, String> {
-        StateDb::open_default()
+        if let Some(opener) = DEPLOYMENT_AWARE_OPENER
+            .with(|slot| slot.borrow().as_ref().map(|slot| slot.opener.clone()))
+        {
+            opener.open_default().map_err(String::from)
+        } else {
+            StateDb::open_default()
+        }
     }
 
     fn open_at(&self, path: &Path) -> Result<StateDb, String> {

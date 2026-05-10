@@ -1,3 +1,4 @@
+use crate::deployment::{DeploymentRoutingPort, ResolveError};
 use crate::schema::{CURRENT_SCHEMA_VERSION, MINIMUM_SUPPORTED_SCHEMA_VERSION};
 use crate::{ReadOnlyOpenError, StateDb};
 use rusqlite::Connection;
@@ -45,6 +46,14 @@ pub enum ProbeError {
     Inspect { message: String },
 }
 
+impl From<ResolveError> for ProbeError {
+    fn from(err: ResolveError) -> Self {
+        ProbeError::StatePath {
+            message: format!("Failed to resolve deployment primary: {err:?}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct RequiredIndex {
     name: &'static str,
@@ -58,7 +67,16 @@ struct IndexDefinition {
 }
 
 pub fn run_schema_probe() -> Result<SchemaProbeReport, ProbeError> {
-    let path = StateDb::default_path().map_err(|message| ProbeError::StatePath { message })?;
+    run_schema_probe_with_routing_port(None)
+}
+
+pub fn run_schema_probe_with_routing_port(
+    routing: Option<&dyn DeploymentRoutingPort>,
+) -> Result<SchemaProbeReport, ProbeError> {
+    let path = match routing {
+        Some(routing) => routing.resolve_read_only()?.path,
+        None => StateDb::default_path().map_err(|message| ProbeError::StatePath { message })?,
+    };
     if !path.exists() {
         return Ok(missing_report(path));
     }
