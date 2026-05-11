@@ -8,8 +8,8 @@ pub mod sessions;
 pub use agent::{AgentConfig, load_agent_file, load_agents};
 pub use model::{
     ClaudeRestrictions, CodexRestrictions, InputDef, InputType, ModelConfig, PromptMode,
-    ProviderConfig, ResumeAcceptanceRules, ResumeKind, ResumeStrategy, SessionCapture,
-    SessionCaptureKind, SessionStorage, ToolRestrictionKind, ToolRestrictions,
+    ProviderConfig, ResumeAcceptanceRules, ResumeKind, ResumeStrategy, ScriptSessionStorageType,
+    SessionCapture, SessionCaptureKind, SessionStorage, ToolRestrictionKind, ToolRestrictions,
     derive_provider_name, load_models, render_validated_model_toml,
 };
 pub use providers::{

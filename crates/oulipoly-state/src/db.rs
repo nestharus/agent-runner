@@ -4059,6 +4059,18 @@ impl StateDb {
         started_at: &DateTime<Utc>,
         finished_at: &DateTime<Utc>,
     ) -> Result<Option<String>, String> {
+        Ok(self
+            .find_sessions_for_invocation_window(provider_name, started_at, finished_at)?
+            .into_iter()
+            .next())
+    }
+
+    pub fn find_sessions_for_invocation_window(
+        &self,
+        provider_name: &str,
+        started_at: &DateTime<Utc>,
+        finished_at: &DateTime<Utc>,
+    ) -> Result<Vec<String>, String> {
         let mut stmt = self
             .conn
             .prepare(
@@ -4105,7 +4117,10 @@ impl StateDb {
                     .then_with(|| session_a.cmp(session_b))
             },
         );
-        Ok(ranked.into_iter().next().map(|(session_id, _)| session_id))
+        Ok(ranked
+            .into_iter()
+            .map(|(session_id, _)| session_id)
+            .collect())
     }
 
     /// Count assistant turns ingested for a provider since `since` (exclusive).

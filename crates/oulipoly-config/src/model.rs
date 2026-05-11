@@ -266,15 +266,40 @@ impl SessionCapture {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionStorage {
-    Script { cwd_script: String },
-    ClaudeCode { projects_dir: PathBuf },
-    Codex { sessions_dir: PathBuf },
+    Script {
+        cwd_script: String,
+        #[serde(default)]
+        transcript_script: Option<String>,
+        #[serde(default)]
+        storage_type: Option<ScriptSessionStorageType>,
+    },
+    ClaudeCode {
+        projects_dir: PathBuf,
+    },
+    Codex {
+        sessions_dir: PathBuf,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScriptSessionStorageType {
+    ClaudeCode,
+    CodexSession,
 }
 
 impl SessionStorage {
     pub fn expand_tilde(self) -> Self {
         match self {
-            SessionStorage::Script { cwd_script } => SessionStorage::Script { cwd_script },
+            SessionStorage::Script {
+                cwd_script,
+                transcript_script,
+                storage_type,
+            } => SessionStorage::Script {
+                cwd_script,
+                transcript_script,
+                storage_type,
+            },
             SessionStorage::ClaudeCode { projects_dir } => SessionStorage::ClaudeCode {
                 projects_dir: expand_leading_tilde(projects_dir),
             },
@@ -286,9 +311,28 @@ impl SessionStorage {
 
     pub fn validate(&self) -> Result<(), String> {
         match self {
-            SessionStorage::Script { cwd_script } => {
+            SessionStorage::Script {
+                cwd_script,
+                transcript_script,
+                storage_type,
+            } => {
                 if cwd_script.trim().is_empty() {
                     return Err("session_storage.kind = script requires `cwd_script`".into());
+                }
+                if transcript_script
+                    .as_ref()
+                    .is_some_and(|script| script.trim().is_empty())
+                {
+                    return Err(
+                        "session_storage.kind = script requires non-empty `transcript_script`"
+                            .into(),
+                    );
+                }
+                if transcript_script.is_some() != storage_type.is_some() {
+                    return Err(
+                        "session_storage.kind = script requires `transcript_script` and `storage_type` together"
+                            .into(),
+                    );
                 }
             }
             SessionStorage::ClaudeCode { projects_dir } => {
@@ -307,7 +351,7 @@ impl SessionStorage {
 
     pub fn cwd_script(&self) -> String {
         match self {
-            SessionStorage::Script { cwd_script } => cwd_script.clone(),
+            SessionStorage::Script { cwd_script, .. } => cwd_script.clone(),
             SessionStorage::ClaudeCode { projects_dir } => {
                 format!(
                     "claude-code-cwd {}",
@@ -320,6 +364,23 @@ impl SessionStorage {
                     shell_word(&sessions_dir.display().to_string())
                 )
             }
+        }
+    }
+
+    pub fn transcript_script(&self) -> Option<&str> {
+        match self {
+            SessionStorage::Script {
+                transcript_script, ..
+            } => transcript_script.as_deref(),
+            _ => None,
+        }
+    }
+
+    pub fn script_storage_type(&self) -> Option<ScriptSessionStorageType> {
+        match self {
+            SessionStorage::Script { storage_type, .. } => *storage_type,
+            SessionStorage::ClaudeCode { .. } => Some(ScriptSessionStorageType::ClaudeCode),
+            SessionStorage::Codex { .. } => Some(ScriptSessionStorageType::CodexSession),
         }
     }
 }

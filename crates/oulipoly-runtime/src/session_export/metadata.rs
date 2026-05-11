@@ -1,5 +1,7 @@
 use super::{ExportError, ExportSessionMetadata, SessionStorageType};
-use oulipoly_config::{ProvidersConfig, SessionStorage, SessionsConfig, load_models};
+use oulipoly_config::{
+    ProvidersConfig, ScriptSessionStorageType, SessionStorage, SessionsConfig, load_models,
+};
 use oulipoly_state::{ResumeError, StateDb};
 use std::path::PathBuf;
 
@@ -47,6 +49,14 @@ pub fn resolve_export_session_metadata(
     let storage_type = match provider_entry.session_storage.as_ref() {
         Some(SessionStorage::ClaudeCode { .. }) => SessionStorageType::ClaudeCode,
         Some(SessionStorage::Codex { .. }) => SessionStorageType::CodexSession,
+        Some(SessionStorage::Script {
+            storage_type: Some(ScriptSessionStorageType::ClaudeCode),
+            ..
+        }) => SessionStorageType::ClaudeCode,
+        Some(SessionStorage::Script {
+            storage_type: Some(ScriptSessionStorageType::CodexSession),
+            ..
+        }) => SessionStorageType::CodexSession,
         Some(SessionStorage::Script { .. }) => {
             return Err(ExportError::UnsupportedStorage {
                 provider_name: resolved.active_provider,
@@ -62,16 +72,13 @@ pub fn resolve_export_session_metadata(
         }
     };
 
-    let jsonl_path = crate::sessions::locate_transcript(
+    let jsonl_path = crate::session_metadata::resolve_jsonl_path_for_provider_allow_missing(
         &sessions_cfg,
+        provider_entry.session_storage.as_ref(),
         &resolved.active_provider,
         &resolved.active_session_id,
     )
-    .map_err(|message| ExportError::Operational { message })?
-    .ok_or_else(|| ExportError::UnsupportedStorage {
-        provider_name: resolved.active_provider.clone(),
-        reason: "provider has no transcript_locator configuration".to_string(),
-    })?;
+    .map_err(metadata_error_to_export_error)?;
 
     Ok(ExportSessionMetadata {
         session_id: resolved.active_session_id,
@@ -109,6 +116,30 @@ fn resume_error_to_export_error(err: ResumeError) -> ExportError {
             reason: "session owner provider has no resume configuration".to_string(),
         },
         ResumeError::Db { message } => ExportError::Operational { message },
+    }
+}
+
+fn metadata_error_to_export_error(err: crate::session_metadata::MetadataError) -> ExportError {
+    match err {
+        crate::session_metadata::MetadataError::InvalidSessionId { input } => {
+            ExportError::InvalidSessionId { input }
+        }
+        crate::session_metadata::MetadataError::SessionNotFound { input } => {
+            ExportError::SessionNotFound { input }
+        }
+        crate::session_metadata::MetadataError::AmbiguousSession { input } => {
+            ExportError::AmbiguousSession { input }
+        }
+        crate::session_metadata::MetadataError::UnsupportedStorage {
+            provider_name,
+            reason,
+        } => ExportError::UnsupportedStorage {
+            provider_name,
+            reason,
+        },
+        crate::session_metadata::MetadataError::Operational { message } => {
+            ExportError::Operational { message }
+        }
     }
 }
 

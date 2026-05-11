@@ -313,6 +313,8 @@ flag = "--session-id"
 [claude2.session_storage]
 kind = "script"
 cwd_script = "claude-code-cwd ~/.claude2/projects"
+transcript_script = "claude-code-locate-transcript ~/.claude2/projects"
+storage_type = "claude_code"
 
 [claude2.resume_acceptance]
 accepted_output_patterns = ["\"session_id\":\"{session_id}\""]
@@ -333,6 +335,8 @@ subcommand = ["resume"]
 [codex.session_storage]
 kind = "script"
 cwd_script = "codex-cwd ~/.codex/sessions"
+transcript_script = "codex-locate-transcript ~/.codex/sessions"
+storage_type = "codex_session"
 
 [opencode]
 quota_script = "zai-usage ~/.config/opencode/auth.json"
@@ -340,7 +344,9 @@ quota_script = "zai-usage ~/.config/opencode/auth.json"
 
 `args` and `interactive_args` are provider/account defaults only. Do not put model flags there; model flags live in model TOMLs and are appended at spawn time.
 
-If you already ran `migrate-config` from `98e692c` and it left provider `args` or `interactive_args` empty, re-run the fixed `migrate-config`. It will repair the provider runtime command shape without duplicating existing resume/session blocks.
+`cwd_script` resolves the workspace for provider-native resume. `transcript_script` resolves the raw transcript path for locate/export/import-replace, and `storage_type` declares the canonical provider transcript format used by those features.
+
+If you already ran `migrate-config` from `98e692c` or the script-storage migration and it left provider `args`, `interactive_args`, or `session_storage` incomplete, re-run the fixed `migrate-config`. It will repair the provider runtime command shape and backfill script storage from `sessions.toml` turn adapters without duplicating existing resume/session blocks.
 
 **Script output (multi-window)**:
 

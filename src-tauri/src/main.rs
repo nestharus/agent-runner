@@ -1048,16 +1048,32 @@ enum ResumeIngestMode<'a> {
     Pinned { resume_target: &'a str },
 }
 
+struct SessionIngestRequest<'a> {
+    state: &'a StateDb,
+    sessions_cfg: &'a oulipoly_config::SessionsConfig,
+    providers_cfg: Option<&'a ProvidersConfig>,
+    provider_name: &'a str,
+    invocation_row_id: i64,
+    invocation_uuid: &'a str,
+    effective_cwd: Option<&'a Path>,
+    mode: ResumeIngestMode<'a>,
+}
+
 fn ingest_and_emit_session_id_resume_aware(
     agent_runtime_services: &wiring::AgentRuntimeServices,
-    state: &StateDb,
-    sessions_cfg: &oulipoly_config::SessionsConfig,
-    provider_name: &str,
-    invocation_row_id: i64,
-    invocation_uuid: &str,
-    mode: ResumeIngestMode<'_>,
+    request: SessionIngestRequest<'_>,
 ) -> bool {
     let mut stderr = std::io::stderr();
+    let SessionIngestRequest {
+        state,
+        sessions_cfg,
+        providers_cfg,
+        provider_name,
+        invocation_row_id,
+        invocation_uuid,
+        effective_cwd,
+        mode,
+    } = request;
     let mode = match mode {
         ResumeIngestMode::Unpinned { capture_method } => SessionLifecycleIngestMode::Unpinned {
             capture_method: capture_method.to_string(),
@@ -1071,9 +1087,11 @@ fn ingest_and_emit_session_id_resume_aware(
         .ingest_session(SessionLifecycleRequest {
             state,
             sessions_cfg,
+            providers_cfg,
             provider_name,
             invocation_row_id,
             invocation_uuid,
+            effective_cwd,
             mode,
             stderr: &mut stderr,
         }) {
@@ -1144,6 +1162,18 @@ fn emit_known_session_id(
 /// `should_emit_invocation_line`.
 fn should_emit_resume_short_line(_is_terminal: bool) -> bool {
     true
+}
+
+fn diagnostic_input(stderr: &str, stdout: &[u8]) -> String {
+    let stdout = String::from_utf8_lossy(stdout);
+    let stdout = stdout.trim();
+    let stderr = stderr.trim();
+    match (stderr.is_empty(), stdout.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => stderr.to_string(),
+        (true, false) => stdout.to_string(),
+        (false, false) => format!("{stderr}\n{stdout}"),
+    }
 }
 
 fn resume_model_pool_mismatch_message(
@@ -1794,6 +1824,10 @@ fn run_repl(
         }
     });
 
+    let interactive_effective_cwd = resume_spawn_cwd
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| effective_spawn_cwd(working_dir))?;
     match executor::cli::execute_interactive_with_result(
         &provider,
         resume_spawn_cwd.as_deref().or(working_dir),
@@ -1820,21 +1854,25 @@ fn run_repl(
             if exit_code == 0 {
                 ingest_and_emit_session_id_resume_aware(
                     agent_runtime_services,
-                    &state,
-                    &sessions_cfg,
-                    &provider.name,
-                    invocation_row_id,
-                    &invocation.id,
-                    match resume {
-                        Some(session_id) => ResumeIngestMode::Pinned {
-                            resume_target: if manual_migrate.is_some() {
-                                session_id
-                            } else {
-                                resume_session_id.as_deref().unwrap_or(session_id)
+                    SessionIngestRequest {
+                        state: &state,
+                        sessions_cfg: &sessions_cfg,
+                        providers_cfg: Some(&providers_cfg),
+                        provider_name: &provider.name,
+                        invocation_row_id,
+                        invocation_uuid: &invocation.id,
+                        effective_cwd: Some(&interactive_effective_cwd),
+                        mode: match resume {
+                            Some(session_id) => ResumeIngestMode::Pinned {
+                                resume_target: if manual_migrate.is_some() {
+                                    session_id
+                                } else {
+                                    resume_session_id.as_deref().unwrap_or(session_id)
+                                },
                             },
-                        },
-                        None => ResumeIngestMode::Unpinned {
-                            capture_method: "turn_script",
+                            None => ResumeIngestMode::Unpinned {
+                                capture_method: "turn_script",
+                            },
                         },
                     },
                 );
@@ -2093,9 +2131,10 @@ fn run_resume(
                 .to_string(),
         )
     } else if !success {
+        let diagnostic_input = diagnostic_input(&result.stderr, &result.stdout);
         run_diagnostics(
             agent_runtime_services,
-            &result.stderr,
+            &diagnostic_input,
             result.exit_code,
             &models,
             working_dir,
@@ -2103,6 +2142,11 @@ fn run_resume(
     } else {
         None
     };
+    if error_category.as_deref() == Some(diagnostics::ErrorCategory::QuotaExhausted.as_str()) {
+        state
+            .mark_exhausted(&provider.name)
+            .unwrap_or_else(|e| eprintln!("Warning: Failed to mark provider exhausted: {e}"));
+    }
     if let Err(err) = state.record_returned_artifacts(invocation_row_id, &result.returned_artifacts)
     {
         eprintln!("Error: Failed to record returned artifacts: {err}");
@@ -2137,16 +2181,20 @@ fn run_resume(
     if success {
         ingest_and_emit_session_id_resume_aware(
             agent_runtime_services,
-            &state,
-            &sessions_cfg,
-            &provider.name,
-            invocation_row_id,
-            &invocation.id,
-            ResumeIngestMode::Pinned {
-                resume_target: if manual_migrate.is_some() {
-                    session_id
-                } else {
-                    &resolved.active_session_id
+            SessionIngestRequest {
+                state: &state,
+                sessions_cfg: &sessions_cfg,
+                providers_cfg: Some(&providers_cfg),
+                provider_name: &provider.name,
+                invocation_row_id,
+                invocation_uuid: &invocation.id,
+                effective_cwd: Some(&effective_spawn_cwd),
+                mode: ResumeIngestMode::Pinned {
+                    resume_target: if manual_migrate.is_some() {
+                        session_id
+                    } else {
+                        &resolved.active_session_id
+                    },
                 },
             },
         );
@@ -2312,9 +2360,10 @@ fn run_with_balancing(
     let success = result.exit_code == 0;
 
     let error_category = if !success {
+        let diagnostic_input = diagnostic_input(&result.stderr, &result.stdout);
         run_diagnostics(
             agent_runtime_services,
-            &result.stderr,
+            &diagnostic_input,
             result.exit_code,
             all_models,
             working_dir,
@@ -2360,15 +2409,20 @@ fn run_with_balancing(
         .unwrap_or_else(|e| eprintln!("Warning: Failed to finalize invocation: {e}"));
 
     if success {
+        let ingest_effective_cwd = effective_spawn_cwd(working_dir)?;
         let emitted = ingest_and_emit_session_id_resume_aware(
             agent_runtime_services,
-            &state,
-            &sessions_cfg,
-            provider_name,
-            invocation_row_id,
-            &invocation.id,
-            ResumeIngestMode::Unpinned {
-                capture_method: "turn_script",
+            SessionIngestRequest {
+                state: &state,
+                sessions_cfg: &sessions_cfg,
+                providers_cfg: Some(&providers_cfg),
+                provider_name,
+                invocation_row_id,
+                invocation_uuid: &invocation.id,
+                effective_cwd: Some(&ingest_effective_cwd),
+                mode: ResumeIngestMode::Unpinned {
+                    capture_method: "turn_script",
+                },
             },
         );
         if !emitted && let Some(session_id) = result.session_capture.session_id.as_deref() {
@@ -2451,7 +2505,7 @@ fn resolve_parent_invocation_id(state: &StateDb) -> Option<i64> {
 
 fn run_diagnostics(
     agent_runtime_services: &wiring::AgentRuntimeServices,
-    stderr: &str,
+    provider_output: &str,
     exit_code: i32,
     models: &HashMap<String, ModelConfig>,
     working_dir: Option<&Path>,
@@ -2475,7 +2529,7 @@ fn run_diagnostics(
                     provider_index: 0,
                     prompt_mode,
                     exit_code,
-                    stderr: stderr.to_string(),
+                    stderr: provider_output.to_string(),
                     working_dir: working_dir.map(Path::to_path_buf),
                 })
                 .map_err(|err| err.to_string())
@@ -2707,6 +2761,14 @@ fn migrate_config_files(
         }
     }
 
+    if let Some(config_root) = providers_path.parent() {
+        backfill_session_storage_from_sessions(
+            &mut providers_root,
+            &config_root.join("sessions.toml"),
+            &mut moved_blocks,
+        )?;
+    }
+
     let providers_text = toml::to_string_pretty(&providers_root)
         .map_err(|e| format!("Failed to serialize {}: {e}", providers_path.display()))?;
     let current = if providers_path.exists() {
@@ -2828,7 +2890,6 @@ fn migrate_provider_table(
     });
     let command_runtime_args = command_parts.iter().skip(1).cloned().collect::<Vec<_>>();
     let (mut runtime_args, model_args) = partition_model_specific_args(model_args);
-    let had_interactive_args = model_interactive_args.is_some();
     let (runtime_interactive_args, model_interactive_args) = model_interactive_args
         .map(partition_model_specific_args)
         .map(|(runtime, model)| (Some(runtime), Some(model)))
@@ -2872,7 +2933,7 @@ fn migrate_provider_table(
             path,
         )?;
     }
-    if had_interactive_args
+    if has_runtime_blocks
         || runtime_interactive_args
             .as_ref()
             .is_some_and(|args| !args.is_empty())
@@ -2918,6 +2979,93 @@ fn migrate_provider_table(
         );
     }
     Ok(toml::Value::Table(reduced))
+}
+
+fn backfill_session_storage_from_sessions(
+    providers_root: &mut toml::Table,
+    sessions_path: &Path,
+    moved_blocks: &mut Vec<String>,
+) -> Result<(), String> {
+    if !sessions_path.exists() {
+        return Ok(());
+    }
+    let sessions = std::fs::read_to_string(sessions_path)
+        .map_err(|e| format!("Failed to read {}: {e}", sessions_path.display()))?
+        .parse::<toml::Table>()
+        .map_err(|e| format!("TOML parse error in {}: {e}", sessions_path.display()))?;
+
+    for (provider_name, entry) in sessions {
+        let Some(turn_script) = entry
+            .as_table()
+            .and_then(|table| table.get("turn_script"))
+            .and_then(toml::Value::as_str)
+        else {
+            continue;
+        };
+        let Some(storage) = storage_from_turn_script(turn_script) else {
+            continue;
+        };
+        let Some(provider) = providers_root
+            .get_mut(&provider_name)
+            .and_then(toml::Value::as_table_mut)
+        else {
+            continue;
+        };
+        if provider.contains_key("session_storage") {
+            continue;
+        }
+        provider.insert("session_storage".to_string(), toml::Value::Table(storage));
+        moved_blocks.push(format!(
+            "{}[{provider_name}].turn_script -> providers.toml[{provider_name}].session_storage",
+            sessions_path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn storage_from_turn_script(turn_script: &str) -> Option<toml::Table> {
+    let parts = executor::cli::shell_split(turn_script);
+    let adapter = parts.first()?;
+    let storage_root = parts.get(1)?;
+    let adapter_name = Path::new(adapter).file_name()?.to_str()?;
+    let (cwd_adapter, transcript_adapter, storage_type) = match adapter_name {
+        "claude-code-turns" => (
+            "claude-code-cwd",
+            "claude-code-locate-transcript",
+            "claude_code",
+        ),
+        "codex-turns" => ("codex-cwd", "codex-locate-transcript", "codex_session"),
+        _ => return None,
+    };
+    let storage_root = shell_word_arg(storage_root);
+    let mut storage = toml::Table::new();
+    storage.insert(
+        "kind".to_string(),
+        toml::Value::String("script".to_string()),
+    );
+    storage.insert(
+        "cwd_script".to_string(),
+        toml::Value::String(format!("{cwd_adapter} {storage_root}")),
+    );
+    storage.insert(
+        "transcript_script".to_string(),
+        toml::Value::String(format!("{transcript_adapter} {storage_root}")),
+    );
+    storage.insert(
+        "storage_type".to_string(),
+        toml::Value::String(storage_type.to_string()),
+    );
+    Some(storage)
+}
+
+fn shell_word_arg(input: &str) -> String {
+    if input
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | '~'))
+    {
+        return input.to_string();
+    }
+    format!("'{}'", input.replace('\'', r#"'\''"#))
 }
 
 fn set_or_conflict(
@@ -3325,6 +3473,8 @@ mod tests {
                 command: Some(provider_name.to_string()),
                 session_storage: Some(oulipoly_config::SessionStorage::Script {
                     cwd_script: cwd_script.into(),
+                    transcript_script: None,
+                    storage_type: None,
                 }),
                 resume: Some(oulipoly_config::ResumeStrategy {
                     kind: oulipoly_config::ResumeKind::Flag,
@@ -4091,6 +4241,20 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_input_includes_stdout_when_provider_reports_errors_there() {
+        let stdout = br#"{"api_error_status":429,"result":"You've hit your limit"}"#;
+
+        assert_eq!(
+            diagnostic_input("", stdout),
+            r#"{"api_error_status":429,"result":"You've hit your limit"}"#
+        );
+        assert_eq!(
+            diagnostic_input("stderr line", stdout),
+            "stderr line\n{\"api_error_status\":429,\"result\":\"You've hit your limit\"}"
+        );
+    }
+
+    #[test]
     fn finalizer_guard_mark_finalized_makes_drop_a_no_op() {
         let db = test_db();
         let start = InvocationStart {
@@ -4370,6 +4534,119 @@ accepted_output_patterns = ["\"session_id\":\"{session_id}\""]
             "{providers}"
         );
         assert!(providers.contains("\"--output-format\""), "{providers}");
+    }
+
+    #[test]
+    fn migrate_config_backfills_session_storage_from_turn_scripts() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let providers_path = dir.path().join("providers.toml");
+        let sessions_path = dir.path().join("sessions.toml");
+        std::fs::write(
+            models_dir.join("claude-opus.toml"),
+            r#"
+[[providers]]
+name = "claude"
+args = ["--model", "opus"]
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &providers_path,
+            r#"
+[claude]
+command = "claude"
+args = ["-p"]
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &sessions_path,
+            r#"
+[claude]
+turn_script = "claude-code-turns ~/.claude/projects"
+"#,
+        )
+        .unwrap();
+
+        let report = migrate_config_files(&models_dir, &providers_path).unwrap();
+
+        assert_eq!(report.model_files_rewritten, 0);
+        assert!(
+            report
+                .moved_blocks
+                .iter()
+                .any(|block| block.contains("sessions.toml[claude].turn_script")),
+            "{:?}",
+            report.moved_blocks
+        );
+        let runtime = migrated_runtime_provider(&providers_path, "claude");
+        let storage = runtime
+            .get("session_storage")
+            .and_then(toml::Value::as_table)
+            .unwrap();
+        assert_eq!(
+            storage.get("kind").and_then(toml::Value::as_str),
+            Some("script")
+        );
+        assert_eq!(
+            storage.get("cwd_script").and_then(toml::Value::as_str),
+            Some("claude-code-cwd ~/.claude/projects")
+        );
+        assert_eq!(
+            storage
+                .get("transcript_script")
+                .and_then(toml::Value::as_str),
+            Some("claude-code-locate-transcript ~/.claude/projects")
+        );
+        assert_eq!(
+            storage.get("storage_type").and_then(toml::Value::as_str),
+            Some("claude_code")
+        );
+    }
+
+    #[test]
+    fn migrate_config_keeps_model_only_interactive_args_out_of_provider_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let providers_path = dir.path().join("providers.toml");
+        let model_path = models_dir.join("claude-haiku.toml");
+        std::fs::write(
+            &providers_path,
+            r#"
+[claude]
+command = "claude"
+args = ["-p", "--output-format", "json"]
+interactive_args = ["--dangerously-skip-permissions"]
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &model_path,
+            r#"
+[[providers]]
+name = "claude"
+args = ["--model", "haiku"]
+interactive_args = ["--model", "haiku"]
+"#,
+        )
+        .unwrap();
+
+        let report = migrate_config_files(&models_dir, &providers_path).unwrap();
+
+        assert_eq!(report.model_files_rewritten, 0);
+        let runtime = migrated_runtime_provider(&providers_path, "claude");
+        assert_eq!(
+            toml_array_strings(&runtime, "interactive_args"),
+            ["--dangerously-skip-permissions"]
+        );
+        let model = migrated_model_provider(&model_path);
+        assert_eq!(
+            toml_array_strings(&model, "interactive_args"),
+            ["--model", "haiku"]
+        );
     }
 
     #[test]
