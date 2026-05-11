@@ -1750,3 +1750,21 @@ The four discoveries are listed here so a later consolidation WU can pick them u
   - Focused tests: `crates/oulipoly-runtime/src/balancer/mod.rs` inline tests cover 0%, 99%, 100%, and 150% used states across 5h and 7d windows, single-provider exhaustion, and all-provider exhaustion.
   - Service test: `crates/oulipoly-runtime/tests/routing_matrix.rs::production_service_reports_all_quota_exhausted_pool`.
   - Live diagnostic example before fix showed all configured providers returning `NO_SCRIPT` for refresh while cached windows included a 100% Claude account; this confirms routing must respect cached `provider_quota_windows` independently of fresh script availability.
+
+## D-AGE-Routing-Retry-And-Staleness — quota failures retry within the pool and routing uses fresh quota adapters
+
+- **Phase**: direct repair for AGE-80 and AGE-81 after PR #84.
+- **Finding**:
+  - `run_with_balancing` selected a provider once, executed once, marked `exhausted_at` after `quota_exhausted`, then returned the failed provider exit code. The fresh exhaustion write only helped later dispatches.
+  - Routing freshness depended on `providers.toml` `quota_script`. The live config had only `session_storage` blocks in `providers.toml` and `turn_script` entries in `sessions.toml`; those turn scripts ingest assistant turns but do not update `provider_quota_windows`.
+  - Live verification for `claude3`: `anthropic-usage /home/nes/.claude3/.credentials.json` reports 100% usage, while the routing refresh path could not discover that script from the current migrated config shape.
+- **Decision**: Treat quota-exhausted provider exits as retryable only inside the same model pool. Each attempt is a normal invocation lifecycle row; after a quota-exhausted attempt, mark that provider exhausted, finalize the attempt, and re-enter routing until a provider succeeds or the pool returns the existing all-exhausted routing error. For routing freshness, use a 30-second routing TTL and derive standard quota adapters from Claude/Codex provider session storage or `sessions.toml` roots when an explicit `quota_script` is absent.
+- **Rationale**:
+  - The state DB remains the coordination point: retry does not need a separate in-memory exclusion list because each failed account is written to `provider_quotas.exhausted_at` before the next routing decision.
+  - A 30-second routing TTL is short enough to repair stale availability before dispatch but still prevents bursts of local retries from repeatedly hitting upstream quota APIs.
+  - Deriving `anthropic-usage` / `chatgpt-usage` from existing Claude/Codex storage roots repairs legacy migrated configs without changing the public quota script contract; explicit `quota_script` still wins.
+- **Reverse**: Reverse the adapter derivation only if migrations or setup reliably write explicit `quota_script` entries for every provider account and live routing no longer needs compatibility with storage-only configs.
+- **Evidence**:
+  - One-shot retry integration tests cover first-pick exhaustion, N-1 exhausted then success, all-exhausted pool error, and non-quota no-retry behavior.
+  - Balancer tests cover 30-second routing freshness, TTL cache suppression, refresh failure fallback, and derived Claude/Codex quota adapter commands.
+  - Live config evidence: `/home/nes/.config/oulipoly-agent-runner/providers.toml` lacks `quota_script`; `/home/nes/.config/oulipoly-agent-runner/sessions.toml` contains `claude-code-turns ~/.claude3/projects`; direct `anthropic-usage` for that account reports 100%.

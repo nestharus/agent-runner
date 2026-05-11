@@ -1,5 +1,8 @@
 use crate::migration::MigrationError;
-use crate::quota::{InFlight, RefreshOutcome, is_stale, is_topology_probe_due, refresh_provider};
+use crate::quota::{
+    InFlight, RefreshOutcome, has_refresh_source, is_routing_stale, is_stale,
+    is_topology_probe_due, refresh_provider, refresh_provider_for_routing,
+};
 use crate::sessions::scan_provider;
 use chrono::Utc;
 use oulipoly_config::{
@@ -118,11 +121,16 @@ pub fn select_provider(
     //    activity (agent-runner invocations + direct user UI prompts).
     if let Some(ctx) = ctx {
         for p in &model.providers {
-            if is_stale(state, &p.name) {
+            if is_routing_stale(state, &p.name) {
                 // Swallow the result — a failed refresh just leaves stale
                 // (or missing) data, which the fallback logic below handles.
-                let _: RefreshOutcome =
-                    refresh_provider(&p.name, ctx.providers_cfg, ctx.in_flight, state);
+                let _: RefreshOutcome = refresh_provider_for_routing(
+                    &p.name,
+                    ctx.providers_cfg,
+                    ctx.sessions_cfg,
+                    ctx.in_flight,
+                    state,
+                );
             }
             // Session scan errors don't abort the pick — we just project with
             // a stale turn count instead of an up-to-date one.
@@ -169,12 +177,7 @@ pub fn select_provider(
             .unwrap_or(0);
 
         for (i, provider) in model.providers.iter().enumerate() {
-            let has_quota_script = ctx
-                .providers_cfg
-                .get(&provider.name)
-                .and_then(|entry| entry.quota_script.as_ref())
-                .is_some();
-            if !has_quota_script {
+            if !has_refresh_source(&provider.name, ctx.providers_cfg, ctx.sessions_cfg) {
                 continue;
             }
 
@@ -193,8 +196,13 @@ pub fn select_provider(
                     topology_peak_live_window_count = topology_peak_counts[i],
                     "topology probe fired"
                 );
-                let _: RefreshOutcome =
-                    refresh_provider(&provider.name, ctx.providers_cfg, ctx.in_flight, state);
+                let _: RefreshOutcome = refresh_provider_for_routing(
+                    &provider.name,
+                    ctx.providers_cfg,
+                    ctx.sessions_cfg,
+                    ctx.in_flight,
+                    state,
+                );
                 quotas[i] = state.get_quota(&provider.name).ok().flatten();
                 windows[i] = state.get_windows(&provider.name).unwrap_or_default();
             }
@@ -1678,6 +1686,115 @@ mod tests {
         assert_eq!(
             selected, 0,
             "cooldown preserves cached routing rather than repeatedly running quota scripts"
+        );
+    }
+
+    #[test]
+    fn routing_refreshes_stale_quota_after_thirty_seconds_before_scoring() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = two_provider_model();
+
+        seed_windows_with_deltas(&db, "a", &[(0.02, 48, 0.01, 40)]);
+        seed_windows_with_deltas(&db, "b", &[(0.40, 48, 0.01, 40)]);
+        db.set_refreshed_at_for_test("a", &(Utc::now() - Duration::seconds(31)))
+            .unwrap();
+
+        let resets = (Utc::now() + Duration::hours(48)).to_rfc3339_opts(SecondsFormat::Secs, true);
+        let exhausted_a_script = format!(
+            r#"printf '%s' '{{"windows":[{{"used_percent":100,"resets_at":"{resets}"}}]}}'"#
+        );
+        let providers_cfg = providers_config_with_scripts(&[("a", exhausted_a_script.as_str())]);
+        let sessions_cfg = SessionsConfig::default();
+        let in_flight = InFlight::new();
+        let ctx = BalanceContext {
+            providers_cfg: &providers_cfg,
+            sessions_cfg: &sessions_cfg,
+            in_flight: &in_flight,
+        };
+
+        let selected = select_provider(&model, &db, Some(&ctx)).unwrap();
+
+        assert_eq!(selected, 1);
+        assert!(
+            db.get_windows("a")
+                .unwrap()
+                .iter()
+                .any(|window| window.used_percent >= 1.0),
+            "stale provider a should be refreshed to exhausted before routing"
+        );
+    }
+
+    #[test]
+    fn routing_uses_cached_quota_inside_thirty_second_ttl() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = two_provider_model();
+
+        seed_windows_with_deltas(&db, "a", &[(0.02, 48, 0.01, 40)]);
+        seed_windows_with_deltas(&db, "b", &[(0.40, 48, 0.01, 40)]);
+        db.set_refreshed_at_for_test("a", &(Utc::now() - Duration::seconds(10)))
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("quota-ran");
+        let script = dir.path().join("quota.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ntouch {}\nprintf '%s' '{{\"windows\":[{{\"used_percent\":100,\"resets_at\":\"2099-01-01T00:00:00Z\"}}]}}'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        let script_cmd = format!("sh {}", script.display());
+        let providers_cfg = providers_config_with_scripts(&[("a", script_cmd.as_str())]);
+        let sessions_cfg = SessionsConfig::default();
+        let in_flight = InFlight::new();
+        let ctx = BalanceContext {
+            providers_cfg: &providers_cfg,
+            sessions_cfg: &sessions_cfg,
+            in_flight: &in_flight,
+        };
+
+        let selected = select_provider(&model, &db, Some(&ctx)).unwrap();
+
+        assert_eq!(selected, 0);
+        assert!(
+            !marker.exists(),
+            "fresh cached quota should suppress the quota script inside the routing TTL"
+        );
+    }
+
+    #[test]
+    fn routing_refresh_failure_falls_back_to_cached_quota() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = two_provider_model();
+
+        seed_windows_with_deltas(&db, "a", &[(0.02, 48, 0.01, 40)]);
+        seed_windows_with_deltas(&db, "b", &[(0.40, 48, 0.01, 40)]);
+        db.set_refreshed_at_for_test("a", &(Utc::now() - Duration::seconds(31)))
+            .unwrap();
+
+        let providers_cfg = providers_config_with_scripts(&[("a", "exit 1")]);
+        let sessions_cfg = SessionsConfig::default();
+        let in_flight = InFlight::new();
+        let ctx = BalanceContext {
+            providers_cfg: &providers_cfg,
+            sessions_cfg: &sessions_cfg,
+            in_flight: &in_flight,
+        };
+
+        let selected = select_provider(&model, &db, Some(&ctx)).unwrap();
+
+        assert_eq!(
+            selected, 0,
+            "refresh failures should leave cached state usable instead of aborting routing"
+        );
+        assert!(
+            db.get_windows("a")
+                .unwrap()
+                .iter()
+                .all(|window| window.used_percent < 1.0),
+            "failed refresh must preserve prior cached windows"
         );
     }
 

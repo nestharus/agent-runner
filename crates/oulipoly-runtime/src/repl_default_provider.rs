@@ -592,6 +592,8 @@ interactive_args = ["ok"]
     #[test]
     fn does_not_call_diagnostics() {
         let temp = tempfile::tempdir().unwrap();
+        let state_path = temp.path().join("state.db");
+        StateDb::open(&state_path).unwrap();
         write_config(
             temp.path(),
             r#"
@@ -603,7 +605,7 @@ default_provider = "claude"
         let launcher = RecordingLauncher::default();
 
         let code = run_repl_with_default_provider_with_launcher(
-            runtime_services(temp.path().to_path_buf()),
+            runtime_services_with_state(temp.path().to_path_buf(), state_path),
             &launcher,
         )
         .expect("diagnostics_model must not be consulted by the default-provider REPL");

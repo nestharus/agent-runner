@@ -4,10 +4,11 @@
 
 use crate::services::{QuotaServiceOutput, QuotaServicePort, QuotaServiceRequest, ServiceError};
 use chrono::{DateTime, Utc};
-use oulipoly_config::ProvidersConfig;
+use oulipoly_config::{ProviderEntry, ProvidersConfig, SessionStorage, SessionsConfig};
 use oulipoly_state::{QuotaWindowInput, StateDb};
 use serde::Deserialize;
 use std::collections::HashSet;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 
@@ -26,6 +27,10 @@ const SCRIPT_TIMEOUT_SECS: u64 = 30;
 /// Auth-refresh command timeout. Should be quick (the CLI hits its own auth
 /// endpoint and exits); kept tight to avoid hanging the quota path.
 const REFRESH_TIMEOUT_SECS: u64 = 15;
+/// Routing needs fresher data than the long-lived dashboard/projection cache.
+/// This keeps a single burst of dispatches from hammering provider APIs while
+/// still correcting stale account availability before each routing decision.
+const ROUTING_REFRESH_TTL_SECS: i64 = 30;
 
 /// Tracks in-flight refreshes so two callers for the same provider collapse
 /// into one run. The set holds provider names currently being refreshed.
@@ -106,6 +111,11 @@ pub enum RefreshOutcome {
 
 pub struct RuntimeQuotaService;
 
+struct RefreshSource {
+    script: String,
+    auth_refresh_command: Option<String>,
+}
+
 impl QuotaServicePort for RuntimeQuotaService {
     fn refresh_quota(
         &self,
@@ -143,14 +153,59 @@ pub fn refresh_provider(
     let Some(script) = entry.quota_script.as_deref() else {
         return RefreshOutcome::NoScript;
     };
+    refresh_provider_from_script(
+        provider_name,
+        script,
+        entry.auth_refresh_command.as_deref(),
+        in_flight,
+        state,
+    )
+}
 
+/// Refresh a provider for routing. Prefer the explicit providers.toml
+/// `quota_script`; when legacy migrated configs only have provider/session
+/// storage adapters, derive the standard quota adapter from those roots.
+pub fn refresh_provider_for_routing(
+    provider_name: &str,
+    providers_cfg: &ProvidersConfig,
+    sessions_cfg: &SessionsConfig,
+    in_flight: &InFlight,
+    state: &StateDb,
+) -> RefreshOutcome {
+    let Some(source) = refresh_source(provider_name, providers_cfg, sessions_cfg) else {
+        return RefreshOutcome::NoScript;
+    };
+    refresh_provider_from_script(
+        provider_name,
+        &source.script,
+        source.auth_refresh_command.as_deref(),
+        in_flight,
+        state,
+    )
+}
+
+pub fn has_refresh_source(
+    provider_name: &str,
+    providers_cfg: &ProvidersConfig,
+    sessions_cfg: &SessionsConfig,
+) -> bool {
+    refresh_source(provider_name, providers_cfg, sessions_cfg).is_some()
+}
+
+fn refresh_provider_from_script(
+    provider_name: &str,
+    script: &str,
+    auth_refresh_command: Option<&str>,
+    in_flight: &InFlight,
+    state: &StateDb,
+) -> RefreshOutcome {
     let Some(_guard) = in_flight.try_claim(provider_name) else {
         return RefreshOutcome::AlreadyInFlight;
     };
 
     let first = run_script(script);
     if should_attempt_auth_refresh(provider_name, &first, state)
-        && let Some(refresh_cmd) = entry.auth_refresh_command.as_deref()
+        && let Some(refresh_cmd) = auth_refresh_command
     {
         let refresh_err = run_refresh_command(refresh_cmd).err();
         match run_script(script) {
@@ -179,6 +234,86 @@ pub fn refresh_provider(
         }
         Err(e) => RefreshOutcome::Failed(e),
     }
+}
+
+fn refresh_source(
+    provider_name: &str,
+    providers_cfg: &ProvidersConfig,
+    sessions_cfg: &SessionsConfig,
+) -> Option<RefreshSource> {
+    if let Some(entry) = providers_cfg.get(provider_name) {
+        if let Some(script) = entry
+            .quota_script
+            .as_ref()
+            .filter(|script| !script.trim().is_empty())
+        {
+            return Some(RefreshSource {
+                script: script.clone(),
+                auth_refresh_command: entry.auth_refresh_command.clone(),
+            });
+        }
+        if let Some(script) = derived_quota_script_from_provider_entry(entry) {
+            return Some(RefreshSource {
+                script,
+                auth_refresh_command: entry.auth_refresh_command.clone(),
+            });
+        }
+    }
+
+    sessions_cfg
+        .get(provider_name)
+        .and_then(|entry| derived_quota_script_from_adapter_command(&entry.turn_script))
+        .map(|script| RefreshSource {
+            script,
+            auth_refresh_command: providers_cfg
+                .get(provider_name)
+                .and_then(|entry| entry.auth_refresh_command.clone()),
+        })
+}
+
+fn derived_quota_script_from_provider_entry(entry: &ProviderEntry) -> Option<String> {
+    let storage = entry.session_storage.as_ref()?;
+    let script = match storage {
+        SessionStorage::Script { cwd_script, .. } => cwd_script.clone(),
+        _ => storage.cwd_script(),
+    };
+    derived_quota_script_from_adapter_command(&script)
+}
+
+fn derived_quota_script_from_adapter_command(command: &str) -> Option<String> {
+    let parts = crate::executor::cli::shell_split(command);
+    let adapter = parts.first()?;
+    let storage_root = parts.get(1)?;
+    let adapter_name = Path::new(adapter).file_name()?.to_str()?;
+    match adapter_name {
+        "claude-code-turns" | "claude-code-cwd" => {
+            let account_root = Path::new(storage_root).parent()?;
+            let credentials = account_root.join(".credentials.json");
+            Some(format!(
+                "anthropic-usage {}",
+                shell_word_arg(&credentials.to_string_lossy())
+            ))
+        }
+        "codex-turns" | "codex-cwd" => {
+            let account_root = Path::new(storage_root).parent()?;
+            let auth_json = account_root.join("auth.json");
+            Some(format!(
+                "chatgpt-usage {}",
+                shell_word_arg(&auth_json.to_string_lossy())
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn shell_word_arg(input: &str) -> String {
+    if input
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | '~'))
+    {
+        return input.to_string();
+    }
+    format!("'{}'", input.replace('\'', r#"'\''"#))
 }
 
 /// Decide whether to invoke `auth_refresh_command` after a quota script run.
@@ -218,6 +353,25 @@ pub fn is_stale(state: &StateDb, provider_name: &str) -> bool {
     let ttl_secs = dynamic_ttl_secs(&windows);
     let age_secs = (Utc::now() - refreshed_at).num_seconds();
     age_secs >= ttl_secs
+}
+
+/// True when the quota cache is too old for a routing decision. This is
+/// intentionally shorter than `is_stale`'s projection/dashboard TTL.
+pub fn is_routing_stale(state: &StateDb, provider_name: &str) -> bool {
+    let Ok(Some(q)) = state.get_quota(provider_name) else {
+        return true;
+    };
+    let Some(refreshed_at) = q.refreshed_at else {
+        return true;
+    };
+    if state
+        .get_windows(provider_name)
+        .map(|windows| windows.is_empty())
+        .unwrap_or(true)
+    {
+        return true;
+    }
+    (Utc::now() - refreshed_at).num_seconds() >= ROUTING_REFRESH_TTL_SECS
 }
 
 pub fn is_topology_probe_due(
@@ -506,6 +660,72 @@ mod tests {
         let state = StateDb::open(std::path::Path::new(":memory:")).unwrap();
 
         assert!(is_stale(&state, "p"));
+    }
+
+    #[test]
+    fn routing_stale_uses_short_thirty_second_ttl() {
+        let state = StateDb::open(std::path::Path::new(":memory:")).unwrap();
+        state
+            .upsert_quota_refresh(
+                "p",
+                &[QuotaWindowInput {
+                    used_percent: 0.10,
+                    resets_at: hours_from_now(48),
+                }],
+            )
+            .unwrap();
+
+        state
+            .set_refreshed_at_for_test("p", &(Utc::now() - chrono::Duration::seconds(29)))
+            .unwrap();
+        assert!(!is_routing_stale(&state, "p"));
+
+        state
+            .set_refreshed_at_for_test("p", &(Utc::now() - chrono::Duration::seconds(31)))
+            .unwrap();
+        assert!(is_routing_stale(&state, "p"));
+        assert!(
+            !is_stale(&state, "p"),
+            "dynamic projection TTL should remain longer than routing freshness TTL"
+        );
+    }
+
+    #[test]
+    fn routing_stale_forces_missing_or_empty_quota_refresh() {
+        let state = StateDb::open(std::path::Path::new(":memory:")).unwrap();
+        assert!(is_routing_stale(&state, "missing"));
+
+        state
+            .insert_quota_row_without_windows_for_test("p", &Utc::now())
+            .unwrap();
+        assert!(is_routing_stale(&state, "p"));
+    }
+
+    #[test]
+    fn derives_anthropic_quota_script_from_claude_storage_adapters() {
+        assert_eq!(
+            derived_quota_script_from_adapter_command("claude-code-turns ~/.claude3/projects")
+                .as_deref(),
+            Some("anthropic-usage ~/.claude3/.credentials.json")
+        );
+        assert_eq!(
+            derived_quota_script_from_adapter_command("claude-code-cwd /home/nes/.claude/projects")
+                .as_deref(),
+            Some("anthropic-usage /home/nes/.claude/.credentials.json")
+        );
+    }
+
+    #[test]
+    fn derives_chatgpt_quota_script_from_codex_storage_adapters() {
+        assert_eq!(
+            derived_quota_script_from_adapter_command("codex-turns ~/.codex2/sessions").as_deref(),
+            Some("chatgpt-usage ~/.codex2/auth.json")
+        );
+        assert_eq!(
+            derived_quota_script_from_adapter_command("codex-cwd /home/nes/.codex/sessions")
+                .as_deref(),
+            Some("chatgpt-usage /home/nes/.codex/auth.json")
+        );
     }
 
     #[test]

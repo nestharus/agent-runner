@@ -363,7 +363,7 @@ If you already ran `migrate-config` from `98e692c` or the script-storage migrati
 
 **Backwards compatibility**: the legacy single-window shape `{"used_percent": X, "resets_at": "..."}` is still parsed and treated as one window.
 
-Scripts have a 30-second timeout and run via `sh -c`, so `~` expansion and pipelines work. Providers without a `quota_script` entry fall back to invocation-count scoring.
+Scripts have a 30-second timeout and run via `sh -c`, so `~` expansion and pipelines work. During CLI routing, an explicit `quota_script` is refreshed with a 30-second routing TTL; if it is absent but Claude/Codex `session_storage` or `sessions.toml` roots are present, the runner derives the standard bundled `anthropic-usage` / `chatgpt-usage` adapter from those roots. Providers without an explicit or derived quota adapter fall back to invocation-count scoring.
 
 **Auth refresh.** Provider OAuth tokens (Claude, Codex) expire and the upstream APIs return errors, which the bundled scripts surface as a non-zero exit. When that happens — or when a script returns an empty `windows: []` on a provider that previously had non-empty windows — the runner shells out to the optional `auth_refresh_command`, lets the CLI's own auth code refresh the token, then retries `quota_script` once. The runner does not implement OAuth itself; it delegates to whichever command the CLI exposes (`claude auth status`, `codex login status`, etc.). The refresh command runs with closed stdin, a 15-second timeout, and stdout discarded; only its exit code matters. If both the refresh and the retry fail, the failure is recorded in the resulting `RefreshOutcome` so it surfaces in diagnostics.
 
