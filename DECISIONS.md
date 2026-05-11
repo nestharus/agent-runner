@@ -1709,3 +1709,33 @@ The four discoveries are listed here so a later consolidation WU can pick them u
   - Live config after revert: 8055 bytes, 0 `system_prompt_override` occurrences.
   - Failure observed: `Error: provider claude5 is missing from providers.toml` from `agents -m claude-opus` and any other claude model dispatch.
   - Fixture (test dependency, unchanged): `tests/fixtures/age28-default-policy.providers.toml`.
+
+## D-ACR-162-Counter-Preamble — Unauthorized residual-acceptance precedent root
+
+- **Context**: ACR-162 records counter-decisions for the residual-acceptance precedent family rooted in `D-AGE-54-Phase-4-CodeQuality-Residual` / AGE-54. No exact trunk heading named `D-AGE-54-Phase-4-CodeQuality-Residual` exists; AGE-54 related headings live at lines 1034, 1056, and 1088. This preamble applies the same unauthorized ticket-root precedent framing to every ACR-162 counter-decision below.
+- **Decision**: Residual-acceptance entries and by-reference citations in this block are retracted as policy authority and are not policy for Phase 4 code-quality, supported-surface, model, prototype-risk, or implementation-pipeline advancement.
+- **Reason**: ACR-156, ACR-158, ACR-159, and ACR-160 codified the rule reversal: LOW-only gates pass; MEDIUM and HIGH require remediation or decomposition from current evidence and are not accepted residual advance states.
+- **Cross-link**: ACR-156 family on Linear.
+
+## D-ACR-162-Counter-AGE58 — D-AGE-58 Phase 4 precedent retracted by reference
+
+- **Context**: `D-AGE-58-Phase-4` is not a local heading, but it is cited as precedent at line 1219, line 1248, line 1528, line 1564, line 1639, and line 1669. Those references extended the residual-acceptance pattern rooted in `D-AGE-54-Phase-4-CodeQuality-Residual` / AGE-54.
+- **Decision**: The `D-AGE-58-Phase-4` by-reference precedent is retracted and not policy for accepting MEDIUM or HIGH implementation-pipeline residuals.
+- **Reason**: ACR-156, ACR-158, ACR-159, and ACR-160 replaced the old residual-acceptance reading with LOW-only advancement and decomposition on unresolved MEDIUM/HIGH evidence.
+- **Cross-link**: ACR-156 family on Linear.
+
+## D-ACR-162-Counter-Phase6 — AGE-61, AGE-62, AGE-59, and D-019 residual precedents retracted
+
+- **Context**: `D-AGE-61-Phase-6`, `D-AGE-62-Phase-6`, and `D-019` / AGE-59 recorded or extended Phase 6 and Phase 4 residual-acceptance decisions under the same unauthorized ticket-root precedent, `D-AGE-54-Phase-4-CodeQuality-Residual` / AGE-54.
+- **Decision**: `D-AGE-61-Phase-6`, `D-AGE-62-Phase-6`, and `D-019` / AGE-59 are retracted as policy authority and are not policy for future gate advancement on stable MEDIUM or HIGH residuals.
+- **Reason**: ACR-156, ACR-158, ACR-159, and ACR-160 now require LOW-only pass evidence or decomposition/remediation from current evidence.
+- **Cross-link**: ACR-156 family on Linear.
+
+## D-ACR-162-Counter-AGE28-AGE30 — AGE-28 and AGE-30 residual precedents retracted
+
+- **Context**: `D-AGE-28-Phase-4-CodeQuality-MEDIUM-residual` is the ticket-required literal for the AGE-28 residual family; no exact trunk heading exists, while related AGE-28 headings live at lines 1416 and 1479. AGE-30 Phase 4 supported-surface MEDIUM and AGE-30 Phase 4 code-quality HIGH are direct residual-acceptance surfaces. All are tied back to `D-AGE-54-Phase-4-CodeQuality-Residual` / AGE-54 as the unauthorized ticket-root precedent.
+- **Decision**: `D-AGE-28-Phase-4-CodeQuality-MEDIUM-residual`, AGE-30 Phase 4 supported-surface MEDIUM, and AGE-30 Phase 4 code-quality HIGH are retracted as policy authority and are not policy for future supported-surface or code-quality gate advancement.
+- **Reason**: ACR-156, ACR-158, ACR-159, and ACR-160 codify that MEDIUM/HIGH verdicts block until remediated, decomposed, or otherwise re-evaluated from current evidence to LOW.
+- **Planning-artifact residuals**: The `D-AGE-15` and `D-AGE-4` planning-artifact residuals, for which no trunk heading exists to retract directly, are downgraded to non-policy by the surrounding ACR-156 retractions.
+- **Fixed-string framing**: The escaped literal forms \`D-AGE-15\` and \`D-AGE-4\` are included for block-local fixed-string verification of the same planning-artifact residuals.
+- **Cross-link**: ACR-156 family on Linear.
