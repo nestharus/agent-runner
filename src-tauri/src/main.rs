@@ -2238,58 +2238,80 @@ fn run_with_balancing(
     // selection itself can be attributed to a parent context if needed
     // (matches contract `tmp/01-pr-a-contract.md` lifecycle ordering).
     let parent_invocation_id = resolve_parent_invocation_id(&state);
-    let provider_index = agent_runtime_services
-        .routing_service
-        .select_route(RoutingServiceRequest {
-            model,
-            state: &state,
-            ctx: Some(&ctx),
-        })
-        .map_err(|err| err.to_string())?
-        .provider_index;
-    let (provider, prompt_mode) =
-        effective_model_for_execution(model, provider_index, &providers_cfg)?;
-    let provider_name = &provider.name;
-    let invocation_id = Uuid::new_v4().to_string();
-    let invocation = CompositeInvocationId {
-        source: provider_name.clone(),
-        id: invocation_id,
-    };
-    let invocation_start = InvocationStart {
-        invocation_uuid: invocation.id.clone(),
-        model_name: model.name.clone(),
-        provider_name: provider_name.clone(),
-        provider_index,
-        parent_invocation_id,
-    };
-    let invocation_row_id = agent_runtime_services
-        .invocation_lifecycle_service
-        .start_invocation(InvocationLifecycleStartRequest {
-            state: &state,
-            start: &invocation_start,
-        })
-        .map_err(|err| err.to_string())?
-        .invocation_row_id;
-    let start_known_provider_session_id =
-        executor::cli::start_known_provider_session_id(&provider)?;
-    if let Some(provider_session_id) = start_known_provider_session_id.as_deref() {
-        state
-            .bind_invocation_provider_session_start(
-                invocation_row_id,
-                &oulipoly_state::ProviderSessionBinding {
-                    provider_session_id: provider_session_id.to_string(),
-                    capture_method: "forced_flag_verified",
-                    resume_input_id: None,
-                },
-            )
-            .unwrap_or_else(|e| eprintln!("Warning: Failed to bind provider session: {e}"));
-    }
-    let invocation_env = serde_json::to_string(&invocation)
-        .map_err(|e| format!("Failed to serialize invocation id: {e}"))?;
-    eprintln!("{}", invocation.stderr_line());
+    let max_attempts = model.providers.len().max(1);
+    let mut attempts = 0usize;
 
-    let executor_request =
-        if let Some(start_known_provider_session_id) = start_known_provider_session_id.clone() {
+    loop {
+        if attempts >= max_attempts {
+            return match agent_runtime_services.routing_service.select_route(
+                RoutingServiceRequest {
+                    model,
+                    state: &state,
+                    ctx: Some(&ctx),
+                },
+            ) {
+                Err(err) => Err(err.to_string()),
+                Ok(_) => Err(format!(
+                    "quota-exhausted retry budget exhausted for pool {} after {max_attempts} attempts",
+                    model.name
+                )),
+            };
+        }
+        attempts += 1;
+
+        let provider_index = agent_runtime_services
+            .routing_service
+            .select_route(RoutingServiceRequest {
+                model,
+                state: &state,
+                ctx: Some(&ctx),
+            })
+            .map_err(|err| err.to_string())?
+            .provider_index;
+        let (provider, prompt_mode) =
+            effective_model_for_execution(model, provider_index, &providers_cfg)?;
+        let provider_name = &provider.name;
+        let invocation_id = Uuid::new_v4().to_string();
+        let invocation = CompositeInvocationId {
+            source: provider_name.clone(),
+            id: invocation_id,
+        };
+        let invocation_start = InvocationStart {
+            invocation_uuid: invocation.id.clone(),
+            model_name: model.name.clone(),
+            provider_name: provider_name.clone(),
+            provider_index,
+            parent_invocation_id,
+        };
+        let invocation_row_id = agent_runtime_services
+            .invocation_lifecycle_service
+            .start_invocation(InvocationLifecycleStartRequest {
+                state: &state,
+                start: &invocation_start,
+            })
+            .map_err(|err| err.to_string())?
+            .invocation_row_id;
+        let start_known_provider_session_id =
+            executor::cli::start_known_provider_session_id(&provider)?;
+        if let Some(provider_session_id) = start_known_provider_session_id.as_deref() {
+            state
+                .bind_invocation_provider_session_start(
+                    invocation_row_id,
+                    &oulipoly_state::ProviderSessionBinding {
+                        provider_session_id: provider_session_id.to_string(),
+                        capture_method: "forced_flag_verified",
+                        resume_input_id: None,
+                    },
+                )
+                .unwrap_or_else(|e| eprintln!("Warning: Failed to bind provider session: {e}"));
+        }
+        let invocation_env = serde_json::to_string(&invocation)
+            .map_err(|e| format!("Failed to serialize invocation id: {e}"))?;
+        eprintln!("{}", invocation.stderr_line());
+
+        let executor_request = if let Some(start_known_provider_session_id) =
+            start_known_provider_session_id.clone()
+        {
             ExecutorServiceRequest::EffectiveWithStartKnownProviderSessionId {
                 model: model.clone(),
                 provider: provider.clone(),
@@ -2314,144 +2336,164 @@ fn run_with_balancing(
             }
         };
 
-    let result = match agent_runtime_services
-        .executor_service
-        .execute(executor_request)
-    {
-        Ok(output) => output.result,
-        Err(err) => {
+        let result = match agent_runtime_services
+            .executor_service
+            .execute(executor_request)
+        {
+            Ok(output) => output.result,
+            Err(err) => {
+                agent_runtime_services
+                    .invocation_lifecycle_service
+                    .finalize_invocation(InvocationLifecycleFinalizeRequest {
+                        state: &state,
+                        invocation_row_id,
+                        success: false,
+                        exit_code: -1,
+                        error_category: Some("spawn_error"),
+                        terminal_reason: Some("spawn_error"),
+                    })
+                    .map(|_| ())
+                    .unwrap_or_else(|finalize_err| {
+                        eprintln!("Warning: Failed to finalize invocation: {finalize_err}")
+                    });
+                return Err(err.to_string());
+            }
+        };
+
+        supervise_captured_child_invocations(
+            &state,
+            invocation_row_id,
+            &result.captured_child_invocations,
+            result.terminal_reason.as_deref(),
+        );
+
+        if let executor::SessionCaptureMethod::Failed(reason) = &result.session_capture.method {
+            eprintln!("[session-capture] {reason}");
+        }
+
+        state
+            .update_session_capture(
+                invocation_row_id,
+                result.session_capture.session_id.as_deref(),
+                result.session_capture.method.db_value(),
+            )
+            .unwrap_or_else(|e| eprintln!("Warning: Failed to update session capture: {e}"));
+
+        let success = result.exit_code == 0;
+
+        let error_category = if !success {
+            let diagnostic_input = diagnostic_input(&result.stderr, &result.stdout);
+            if diagnostics::classify_exhaustion(&diagnostic_input) {
+                Some(
+                    diagnostics::ErrorCategory::QuotaExhausted
+                        .as_str()
+                        .to_string(),
+                )
+            } else {
+                run_diagnostics(
+                    agent_runtime_services,
+                    &diagnostic_input,
+                    result.exit_code,
+                    all_models,
+                    working_dir,
+                )
+            }
+        } else {
+            None
+        };
+        let quota_exhausted =
+            error_category.as_deref() == Some(diagnostics::ErrorCategory::QuotaExhausted.as_str());
+        if quota_exhausted {
+            state
+                .mark_exhausted(provider_name)
+                .unwrap_or_else(|e| eprintln!("Warning: Failed to mark provider exhausted: {e}"));
+        }
+
+        if let Err(err) =
+            state.record_returned_artifacts(invocation_row_id, &result.returned_artifacts)
+        {
+            eprintln!("Error: Failed to record returned artifacts: {err}");
             agent_runtime_services
                 .invocation_lifecycle_service
                 .finalize_invocation(InvocationLifecycleFinalizeRequest {
                     state: &state,
                     invocation_row_id,
                     success: false,
-                    exit_code: -1,
-                    error_category: Some("spawn_error"),
-                    terminal_reason: Some("spawn_error"),
+                    exit_code: 1,
+                    error_category: Some("returned_artifacts"),
+                    terminal_reason: Some("returned_artifacts_persist_failed"),
                 })
                 .map(|_| ())
-                .unwrap_or_else(|finalize_err| {
-                    eprintln!("Warning: Failed to finalize invocation: {finalize_err}")
-                });
-            return Err(err.to_string());
+                .unwrap_or_else(|e| eprintln!("Warning: Failed to finalize invocation: {e}"));
+            return Ok(1);
         }
-    };
 
-    supervise_captured_child_invocations(
-        &state,
-        invocation_row_id,
-        &result.captured_child_invocations,
-        result.terminal_reason.as_deref(),
-    );
-
-    if let executor::SessionCaptureMethod::Failed(reason) = &result.session_capture.method {
-        eprintln!("[session-capture] {reason}");
-    }
-
-    state
-        .update_session_capture(
-            invocation_row_id,
-            result.session_capture.session_id.as_deref(),
-            result.session_capture.method.db_value(),
-        )
-        .unwrap_or_else(|e| eprintln!("Warning: Failed to update session capture: {e}"));
-
-    let success = result.exit_code == 0;
-
-    let error_category = if !success {
-        let diagnostic_input = diagnostic_input(&result.stderr, &result.stdout);
-        run_diagnostics(
-            agent_runtime_services,
-            &diagnostic_input,
-            result.exit_code,
-            all_models,
-            working_dir,
-        )
-    } else {
-        None
-    };
-    if error_category.as_deref() == Some(diagnostics::ErrorCategory::QuotaExhausted.as_str()) {
-        state
-            .mark_exhausted(provider_name)
-            .unwrap_or_else(|e| eprintln!("Warning: Failed to mark provider exhausted: {e}"));
-    }
-
-    if let Err(err) = state.record_returned_artifacts(invocation_row_id, &result.returned_artifacts)
-    {
-        eprintln!("Error: Failed to record returned artifacts: {err}");
         agent_runtime_services
             .invocation_lifecycle_service
             .finalize_invocation(InvocationLifecycleFinalizeRequest {
                 state: &state,
                 invocation_row_id,
-                success: false,
-                exit_code: 1,
-                error_category: Some("returned_artifacts"),
-                terminal_reason: Some("returned_artifacts_persist_failed"),
+                success,
+                exit_code: result.exit_code,
+                error_category: error_category.as_deref(),
+                terminal_reason: result.terminal_reason.as_deref(),
             })
             .map(|_| ())
             .unwrap_or_else(|e| eprintln!("Warning: Failed to finalize invocation: {e}"));
-        return Ok(1);
-    }
 
-    agent_runtime_services
-        .invocation_lifecycle_service
-        .finalize_invocation(InvocationLifecycleFinalizeRequest {
-            state: &state,
-            invocation_row_id,
-            success,
-            exit_code: result.exit_code,
-            error_category: error_category.as_deref(),
-            terminal_reason: result.terminal_reason.as_deref(),
-        })
-        .map(|_| ())
-        .unwrap_or_else(|e| eprintln!("Warning: Failed to finalize invocation: {e}"));
-
-    if success {
-        let ingest_effective_cwd = effective_spawn_cwd(working_dir)?;
-        let emitted = ingest_and_emit_session_id_resume_aware(
-            agent_runtime_services,
-            SessionIngestRequest {
-                state: &state,
-                sessions_cfg: &sessions_cfg,
-                providers_cfg: Some(&providers_cfg),
-                provider_name,
-                invocation_row_id,
-                invocation_uuid: &invocation.id,
-                effective_cwd: Some(&ingest_effective_cwd),
-                mode: ResumeIngestMode::Unpinned {
-                    capture_method: "turn_script",
+        if success {
+            let ingest_effective_cwd = effective_spawn_cwd(working_dir)?;
+            let emitted = ingest_and_emit_session_id_resume_aware(
+                agent_runtime_services,
+                SessionIngestRequest {
+                    state: &state,
+                    sessions_cfg: &sessions_cfg,
+                    providers_cfg: Some(&providers_cfg),
+                    provider_name,
+                    invocation_row_id,
+                    invocation_uuid: &invocation.id,
+                    effective_cwd: Some(&ingest_effective_cwd),
+                    mode: ResumeIngestMode::Unpinned {
+                        capture_method: "turn_script",
+                    },
                 },
-            },
-        );
-        if !emitted && let Some(session_id) = result.session_capture.session_id.as_deref() {
-            emit_known_session_id(
-                &state,
-                invocation_row_id,
-                &invocation.id,
-                session_id,
-                result.session_capture.method.db_value(),
             );
+            if !emitted && let Some(session_id) = result.session_capture.session_id.as_deref() {
+                emit_known_session_id(
+                    &state,
+                    invocation_row_id,
+                    &invocation.id,
+                    session_id,
+                    result.session_capture.method.db_value(),
+                );
+            }
         }
-    }
 
-    // Bump calls_since_refresh for this provider (account). Errors here are
-    // non-fatal — missing a tick just slightly skews the next projection.
-    state
-        .increment_calls_since_refresh(provider_name)
-        .unwrap_or_else(|e| eprintln!("Warning: Failed to bump quota tick: {e}"));
+        // Bump calls_since_refresh for this provider (account). Errors here are
+        // non-fatal — missing a tick just slightly skews the next projection.
+        state
+            .increment_calls_since_refresh(provider_name)
+            .unwrap_or_else(|e| eprintln!("Warning: Failed to bump quota tick: {e}"));
 
-    if success {
-        let _ = std::io::stdout().write_all(&result.stdout);
-    } else {
+        if success {
+            let _ = std::io::stdout().write_all(&result.stdout);
+            return Ok(result.exit_code);
+        }
+        if quota_exhausted {
+            if attempts < max_attempts {
+                eprintln!(
+                    "[routing] provider {provider_name} returned quota_exhausted; retrying another provider"
+                );
+            }
+            continue;
+        }
+
         eprintln!("{}", result.stderr);
         if let Some(ref cat) = error_category {
             eprintln!("[diagnostics: {cat}]");
         }
+        return Ok(result.exit_code);
     }
-
-    Ok(result.exit_code)
 }
 
 fn supervise_captured_child_invocations(

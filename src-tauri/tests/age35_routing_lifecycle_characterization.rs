@@ -136,6 +136,24 @@ prompt_mode = "arg"
         fs::write(self.app_config_dir.join("providers.toml"), body).unwrap();
     }
 
+    fn write_providers_with_command_bodies(&self, providers: &[(&str, &str)]) {
+        let mut body = String::new();
+        for (provider, command_body) in providers {
+            let command = self.write_script(&format!("{provider}-command.sh"), command_body);
+            body.push_str(&format!(
+                r#"[{provider}]
+command = {}
+args = []
+interactive_args = ["provider-interactive"]
+prompt_mode = "arg"
+
+"#,
+                toml_string(&command.display().to_string())
+            ));
+        }
+        fs::write(self.app_config_dir.join("providers.toml"), body).unwrap();
+    }
+
     fn write_sessions(&self, providers: &[&str]) {
         let mut body = String::new();
         for provider in providers {
@@ -235,6 +253,152 @@ fn age_35_one_shot_run_with_balancing_uses_balance_context_to_refresh_and_scan_a
             "one-shot routing should scan sessions before selecting {provider}"
         );
     }
+}
+
+#[test]
+fn age_81_one_shot_retries_first_quota_exhausted_provider_then_succeeds() {
+    let fixture = CliFixture::new();
+    fixture.write_model("age81", &["age81-a", "age81-b"]);
+    fixture.write_providers_with_command_bodies(&[
+        (
+            "age81-a",
+            "printf '%s\\n' 'quota exhausted for fixture provider' >&2\nexit 42",
+        ),
+        ("age81-b", "printf '%s\\n' 'age81-b executed'"),
+    ]);
+
+    let output = fixture.run_one_shot("age81");
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "age81-b executed\n"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("age81-a") && stderr.contains("retrying another provider"),
+        "{stderr}"
+    );
+    let db = fixture.open_db();
+    assert!(
+        db.get_quota("age81-a")
+            .unwrap()
+            .and_then(|quota| quota.exhausted_at)
+            .is_some(),
+        "first provider should be marked exhausted before retry"
+    );
+    assert!(
+        db.get_quota("age81-b")
+            .unwrap()
+            .and_then(|quota| quota.exhausted_at)
+            .is_none(),
+        "successful retry provider should not be marked exhausted"
+    );
+}
+
+#[test]
+fn age_81_one_shot_retries_n_minus_one_quota_exhausted_providers_then_succeeds() {
+    let fixture = CliFixture::new();
+    fixture.write_model("age81", &["age81-a", "age81-b", "age81-c"]);
+    fixture.write_providers_with_command_bodies(&[
+        (
+            "age81-a",
+            "printf '%s\\n' 'quota exhausted for fixture provider a' >&2\nexit 42",
+        ),
+        (
+            "age81-b",
+            "printf '%s\\n' 'quota exhausted for fixture provider b' >&2\nexit 42",
+        ),
+        ("age81-c", "printf '%s\\n' 'age81-c executed'"),
+    ]);
+
+    let output = fixture.run_one_shot("age81");
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "age81-c executed\n"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.matches("retrying another provider").count(),
+        2,
+        "{stderr}"
+    );
+    let db = fixture.open_db();
+    for provider in ["age81-a", "age81-b"] {
+        assert!(
+            db.get_quota(provider)
+                .unwrap()
+                .and_then(|quota| quota.exhausted_at)
+                .is_some(),
+            "{provider} should be marked exhausted"
+        );
+    }
+}
+
+#[test]
+fn age_81_one_shot_all_quota_exhausted_returns_pool_error() {
+    let fixture = CliFixture::new();
+    fixture.write_model("age81", &["age81-a", "age81-b"]);
+    fixture.write_providers_with_command_bodies(&[
+        (
+            "age81-a",
+            "printf '%s\\n' 'quota exhausted for fixture provider a' >&2\nexit 42",
+        ),
+        (
+            "age81-b",
+            "printf '%s\\n' 'quota exhausted for fixture provider b' >&2\nexit 42",
+        ),
+    ]);
+
+    let output = fixture.run_one_shot("age81");
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("all providers in pool age81 are quota-exhausted"),
+        "{stderr}"
+    );
+    let db = fixture.open_db();
+    for provider in ["age81-a", "age81-b"] {
+        assert!(
+            db.get_quota(provider)
+                .unwrap()
+                .and_then(|quota| quota.exhausted_at)
+                .is_some(),
+            "{provider} should be marked exhausted"
+        );
+    }
+}
+
+#[test]
+fn age_81_one_shot_non_quota_failure_does_not_retry() {
+    let fixture = CliFixture::new();
+    fixture.write_model("age81", &["age81-a", "age81-b"]);
+    fixture.write_providers_with_command_bodies(&[
+        (
+            "age81-a",
+            "printf '%s\\n' 'network failure for fixture provider' >&2\nexit 42",
+        ),
+        ("age81-b", "printf '%s\\n' 'age81-b executed'"),
+    ]);
+
+    let output = fixture.run_one_shot("age81");
+
+    assert_eq!(output.status.code(), Some(42), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("retrying another provider"), "{stderr}");
+    assert!(!stderr.contains("age81-b executed"), "{stderr}");
+    let db = fixture.open_db();
+    assert!(
+        db.get_quota("age81-a")
+            .unwrap()
+            .and_then(|quota| quota.exhausted_at)
+            .is_none(),
+        "non-quota failure should not mark provider exhausted"
+    );
 }
 
 #[test]

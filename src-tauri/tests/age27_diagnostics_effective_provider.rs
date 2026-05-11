@@ -265,14 +265,14 @@ prompt_mode = "stdin"
         .output()
         .unwrap();
 
-    assert_eq!(output.status.code(), Some(7), "{output:?}");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("[diagnostics] quota_exhausted: Diagnostic model saw exhausted quota"),
         "{stderr}"
     );
     assert!(
-        stderr.contains("[diagnostics: quota_exhausted]"),
+        stderr.contains("all providers in pool failing are quota-exhausted"),
         "{stderr}"
     );
     assert!(!stderr.contains("Empty command"), "{stderr}");
@@ -283,6 +283,13 @@ prompt_mode = "stdin"
     let db = fixture.open_db();
     let quota = db.get_quota("failure-provider").unwrap().unwrap();
     assert!(quota.exhausted_at.is_some());
+    let invocation = parse_invocation(&stderr);
+    let row = db
+        .get_invocation_by_uuid(&invocation.id)
+        .unwrap()
+        .expect("failed quota attempt should be recorded");
+    assert_eq!(row.exit_code, Some(7));
+    assert_eq!(row.error_category.as_deref(), Some("quota_exhausted"));
 }
 
 #[test]
