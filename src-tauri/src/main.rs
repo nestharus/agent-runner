@@ -1575,6 +1575,21 @@ fn resume_migration_pool(
     }
 }
 
+fn refresh_migration_routing_state(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    migration_model: &ModelConfig,
+    state: &StateDb,
+    ctx: &balancer::BalanceContext<'_>,
+) {
+    let _ = agent_runtime_services
+        .routing_service
+        .select_route(RoutingServiceRequest {
+            model: migration_model,
+            state,
+            ctx: Some(ctx),
+        });
+}
+
 fn run_repl(
     agent_runtime_services: &wiring::AgentRuntimeServices,
     model_name: Option<&str>,
@@ -1682,6 +1697,7 @@ fn run_repl(
             return Ok(1);
         }
         let migration_model = resume_migration_pool(resolved, &providers_cfg);
+        refresh_migration_routing_state(agent_runtime_services, &migration_model, &state, &ctx);
         let effective_spawn_cwd = effective_resume_spawn_cwd(
             &state,
             &models,
@@ -1981,6 +1997,13 @@ fn run_resume(
         return Ok(1);
     }
     let migration_model = resume_migration_pool(&resolved, &providers_cfg);
+    let in_flight = oulipoly_runtime::quota::InFlight::new();
+    let ctx = balancer::BalanceContext {
+        providers_cfg: &providers_cfg,
+        sessions_cfg: &sessions_cfg,
+        in_flight: &in_flight,
+    };
+    refresh_migration_routing_state(agent_runtime_services, &migration_model, &state, &ctx);
     let effective_spawn_cwd = effective_resume_spawn_cwd(
         &state,
         &models,

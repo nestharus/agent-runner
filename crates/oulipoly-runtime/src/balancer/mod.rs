@@ -10,6 +10,7 @@ use oulipoly_config::{
 };
 pub use oulipoly_core::TransitionReason;
 use oulipoly_state::{QuotaRecord, QuotaWindow, ResolvedResume, StateDb};
+use std::collections::HashSet;
 use std::fmt;
 
 const ERROR_WINDOW_MINUTES: i64 = 30;
@@ -455,17 +456,18 @@ pub fn decide_migration(
         return Ok(MigrationDecision::Stay);
     }
 
-    let active_exhausted = state
-        .get_quota(&active.name)
-        .map_err(|message| MigrationError::Db { message })?
-        .and_then(|quota| quota.exhausted_at)
-        .is_some();
+    let exhausted_provider_indices = exhausted_provider_indices(state, model)?;
+    let active_exhausted = exhausted_provider_indices.contains(&active_provider_index);
     let projections = compute_projections(model, state, None);
 
     if active_exhausted {
-        if let Some(target) =
-            lowest_load_migration_target(model, &projections, active, Some(active_provider_index))
-        {
+        if let Some(target) = lowest_load_migration_target(
+            model,
+            &projections,
+            active,
+            Some(active_provider_index),
+            &exhausted_provider_indices,
+        ) {
             return Ok(MigrationDecision::Migrate {
                 target_provider_index: target.provider_index,
                 reason: TransitionReason::Exhausted,
@@ -474,7 +476,13 @@ pub fn decide_migration(
         return Ok(MigrationDecision::Stay);
     }
 
-    let Some(best) = lowest_load_migration_target(model, &projections, active, None) else {
+    let Some(best) = lowest_load_migration_target(
+        model,
+        &projections,
+        active,
+        None,
+        &exhausted_provider_indices,
+    ) else {
         return Ok(MigrationDecision::Stay);
     };
     if best.provider_index == active_provider_index {
@@ -497,6 +505,26 @@ fn is_resume_migratable_pair(source: &ProviderConfig, target: &ProviderConfig) -
     )
 }
 
+fn exhausted_provider_indices(
+    state: &StateDb,
+    model: &ModelConfig,
+) -> Result<HashSet<usize>, MigrationError> {
+    let now = Utc::now();
+    let mut exhausted = HashSet::new();
+    for (index, provider) in model.providers.iter().enumerate() {
+        let quota = state
+            .get_quota(&provider.name)
+            .map_err(|message| MigrationError::Db { message })?;
+        let windows = state
+            .get_windows(&provider.name)
+            .map_err(|message| MigrationError::Db { message })?;
+        if provider_is_quota_exhausted(quota.as_ref(), &windows, now) {
+            exhausted.insert(index);
+        }
+    }
+    Ok(exhausted)
+}
+
 fn provider_load(projection: &ProviderProjection) -> f64 {
     let max_projected_used = projection
         .projections_per_window
@@ -515,10 +543,12 @@ fn lowest_load_migration_target<'a>(
     projections: &'a [ProviderProjection],
     source_provider: &ProviderConfig,
     exclude_provider_index: Option<usize>,
+    exhausted_provider_indices: &HashSet<usize>,
 ) -> Option<&'a ProviderProjection> {
     projections
         .iter()
         .filter(|projection| Some(projection.provider_index) != exclude_provider_index)
+        .filter(|projection| !exhausted_provider_indices.contains(&projection.provider_index))
         .filter(|projection| {
             model
                 .providers
@@ -2073,6 +2103,55 @@ mod tests {
                 target_provider_index: 1,
                 reason: TransitionReason::Exhausted
             }
+        );
+    }
+
+    #[test]
+    fn decide_migration_treats_full_live_window_as_exhausted_without_flag() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = migratable_model(&[("claude2", "claude_code"), ("claude6", "claude_code")]);
+        db.upsert_quota_refresh("claude2", &one_window(1.0, 5))
+            .unwrap();
+        db.upsert_quota_refresh("claude6", &one_window(0.20, 5))
+            .unwrap();
+
+        let decision = decide_migration(&db, &model, &resolved_for(&model, 0), None).unwrap();
+
+        assert_eq!(
+            decision,
+            MigrationDecision::Migrate {
+                target_provider_index: 1,
+                reason: TransitionReason::Exhausted
+            },
+            "resume migration must honor the same live-window exhaustion rule as select_provider"
+        );
+    }
+
+    #[test]
+    fn decide_migration_skips_exhausted_sibling_targets() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = migratable_model(&[
+            ("claude", "claude_code"),
+            ("claude2", "claude_code"),
+            ("claude6", "claude_code"),
+        ]);
+        db.upsert_quota_refresh("claude", &one_window(0.95, 5))
+            .unwrap();
+        db.mark_exhausted("claude").unwrap();
+        db.upsert_quota_refresh("claude2", &one_window(1.0, 5))
+            .unwrap();
+        db.upsert_quota_refresh("claude6", &one_window(0.20, 5))
+            .unwrap();
+
+        let decision = decide_migration(&db, &model, &resolved_for(&model, 0), None).unwrap();
+
+        assert_eq!(
+            decision,
+            MigrationDecision::Migrate {
+                target_provider_index: 2,
+                reason: TransitionReason::Exhausted
+            },
+            "resume migration must not leave an exhausted active segment for another exhausted account"
         );
     }
 

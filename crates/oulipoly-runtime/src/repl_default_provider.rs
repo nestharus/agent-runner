@@ -1,5 +1,7 @@
+use crate::balancer::BalanceContext;
+use crate::quota::InFlight;
 use crate::services::{ProductionRoutingService, RoutingServicePort, RoutingServiceRequest};
-use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig, ProvidersConfig};
+use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig, ProvidersConfig, SessionsConfig};
 use oulipoly_state::repositories::{ProductionStateDbOpener, StateDbOpener};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -93,6 +95,8 @@ pub(crate) fn run_repl_with_default_provider_with_launcher<O: StateDbOpener>(
 
     let providers_path = services.config_root.join("providers.toml");
     let providers = ProvidersConfig::load(&providers_path)?;
+    let sessions_path = services.config_root.join("sessions.toml");
+    let sessions = SessionsConfig::load(&sessions_path).unwrap_or_default();
     let members = resolve_family_keys(&providers, &family);
     if members.is_empty() {
         return Err(format!(
@@ -115,13 +119,19 @@ pub(crate) fn run_repl_with_default_provider_with_launcher<O: StateDbOpener>(
         Some(path) => services.state_db_opener.open_at(path),
         None => services.state_db_opener.open_default(),
     }?;
+    let in_flight = InFlight::new();
+    let ctx = BalanceContext {
+        providers_cfg: &providers,
+        sessions_cfg: &sessions,
+        in_flight: &in_flight,
+    };
 
     let provider_index = services
         .routing_service
         .select_route(RoutingServiceRequest {
             model: &carrier_model,
             state: &state,
-            ctx: None,
+            ctx: Some(&ctx),
         })
         .map_err(|error| error.to_string())?
         .provider_index;
@@ -273,7 +283,7 @@ interactive_args = ["ok"]
 
     #[derive(Default)]
     struct RecordingLauncher {
-        calls: RefCell<Vec<(String, Option<PathBuf>)>>,
+        calls: RefCell<Vec<(String, String, Option<PathBuf>)>>,
     }
 
     impl InteractiveLauncher for RecordingLauncher {
@@ -282,9 +292,11 @@ interactive_args = ["ok"]
             provider: &ProviderConfig,
             working_dir: Option<&Path>,
         ) -> Result<i32, String> {
-            self.calls
-                .borrow_mut()
-                .push((provider.name.clone(), working_dir.map(Path::to_path_buf)));
+            self.calls.borrow_mut().push((
+                provider.name.clone(),
+                provider.command.clone(),
+                working_dir.map(Path::to_path_buf),
+            ));
             Ok(0)
         }
     }
@@ -587,6 +599,73 @@ interactive_args = ["ok"]
         assert_eq!(code, 0);
         assert_eq!(table_count(&state_path, "provider_quotas"), 0);
         assert_eq!(table_count(&state_path, "provider_quota_windows"), 0);
+    }
+
+    #[test]
+    fn default_provider_family_refreshes_stale_quota_before_launch() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_path = temp.path().join("state.db");
+        let db = StateDb::open(&state_path).unwrap();
+        write_config(temp.path(), r#"default_provider = "claude""#);
+        let fresh_reset = (chrono::Utc::now() + chrono::Duration::hours(48)).to_rfc3339();
+        write_providers(
+            temp.path(),
+            &format!(
+                r#"[claude]
+command = "claude-good"
+interactive_args = ["claude"]
+quota_script = "printf '%s' '{{\"windows\":[{{\"used_percent\":20,\"resets_at\":\"{fresh_reset}\"}}]}}'"
+
+[claude2]
+command = "claude-bad"
+interactive_args = ["claude2"]
+quota_script = "printf '%s' '{{\"windows\":[{{\"used_percent\":100,\"resets_at\":\"{fresh_reset}\"}}]}}'"
+"#
+            ),
+        );
+        db.upsert_quota_refresh(
+            "claude",
+            &[oulipoly_state::QuotaWindowInput {
+                used_percent: 0.90,
+                resets_at: chrono::Utc::now() + chrono::Duration::hours(48),
+            }],
+        )
+        .unwrap();
+        db.upsert_quota_refresh(
+            "claude2",
+            &[oulipoly_state::QuotaWindowInput {
+                used_percent: 0.10,
+                resets_at: chrono::Utc::now() + chrono::Duration::hours(48),
+            }],
+        )
+        .unwrap();
+        let stale_at = chrono::Utc::now() - chrono::Duration::seconds(31);
+        db.set_refreshed_at_for_test("claude", &stale_at).unwrap();
+        db.set_refreshed_at_for_test("claude2", &stale_at).unwrap();
+        drop(db);
+
+        let launcher = RecordingLauncher::default();
+        let code = run_repl_with_default_provider_with_launcher(
+            runtime_services_with_state(temp.path().to_path_buf(), state_path.clone()),
+            &launcher,
+        )
+        .expect("default-provider REPL should route after refreshing stale cached quotas");
+
+        assert_eq!(code, 0);
+        assert_eq!(launcher.calls.borrow().len(), 1);
+        assert_eq!(
+            launcher.calls.borrow()[0].1,
+            "claude-good",
+            "the refreshed route should launch the non-exhausted claude member"
+        );
+        let db = StateDb::open(&state_path).unwrap();
+        let claude2_windows = db.get_windows("claude2").unwrap();
+        assert!(
+            claude2_windows
+                .iter()
+                .any(|window| window.used_percent >= 1.0),
+            "the stale claude2 cache should be refreshed to the exhausted quota value before routing"
+        );
     }
 
     #[test]
