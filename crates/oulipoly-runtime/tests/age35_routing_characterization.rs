@@ -193,7 +193,7 @@ fn age_35_select_provider_with_balance_context_refreshes_stale_quotas_and_scans_
         in_flight: &in_flight,
     };
 
-    let selected = select_provider(&model, &db, Some(&ctx));
+    let selected = select_provider(&model, &db, Some(&ctx)).unwrap();
 
     assert!(selected < model.providers.len());
     for provider in ["age35-a", "age35-b"] {
@@ -244,7 +244,7 @@ fn age_35_production_routing_service_matches_direct_select_provider_with_live_co
         in_flight: &service_in_flight,
     };
 
-    let direct_index = select_provider(&model, &direct_db, Some(&direct_ctx));
+    let direct_index = select_provider(&model, &direct_db, Some(&direct_ctx)).unwrap();
     let service_index = ProductionRoutingService
         .select_route(RoutingServiceRequest {
             model: &model,
@@ -268,7 +268,7 @@ fn age_35_production_routing_service_matches_direct_select_provider_cached_only(
     let service_db = StateDb::open(Path::new(":memory:")).unwrap();
     let model = two_provider_model();
 
-    let direct_index = select_provider(&model, &direct_db, None);
+    let direct_index = select_provider(&model, &direct_db, None).unwrap();
     let service_index = ProductionRoutingService
         .select_route(RoutingServiceRequest {
             model: &model,

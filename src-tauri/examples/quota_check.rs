@@ -114,11 +114,21 @@ fn main() {
             continue;
         }
         let pick = select_provider(m, &db, Some(&ctx));
-        let pick_name = &m.providers[pick].name;
-        println!("  model {name:<18} -> provider[{pick}] = {pick_name}");
+        if let Err(err) = &pick {
+            println!("  model {name:<18} -> ERROR: {err}");
+        }
+        let pick = pick.ok();
+        let pick_name = pick
+            .map(|index| m.providers[index].name.as_str())
+            .unwrap_or("-");
+        println!(
+            "  model {name:<18} -> {}",
+            pick.map(|index| format!("provider[{index}] = {pick_name}"))
+                .unwrap_or_else(|| "no route".to_string())
+        );
         for (i, p) in m.providers.iter().enumerate() {
             let ws = db.get_windows(&p.name).unwrap_or_default();
-            let marker = if i == pick { ">>" } else { "  " };
+            let marker = if Some(i) == pick { ">>" } else { "  " };
             if ws.is_empty() {
                 let rec = db.get_provider(name, &p.name).unwrap();
                 let count = rec.map(|r| r.invocation_count).unwrap_or(0);

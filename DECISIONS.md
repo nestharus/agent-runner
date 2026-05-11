@@ -1731,3 +1731,22 @@ The four discoveries are listed here so a later consolidation WU can pick them u
   - Live ingestion reproduction: `agents repl claude-haiku` in `/home/nes/projects/rfq` printed Claude's resume id `72554404-16c8-46bf-b284-447f23e3f777`, while the runner emitted an older `OULIPOLY_SESSION` id `f65768e2-bfad-45b8-8185-797394d18dff` from another workspace before workspace-constrained inference.
   - Live config: `/home/nes/.config/oulipoly-agent-runner/providers.toml` lacked all `session_storage` blocks; `/home/nes/.config/oulipoly-agent-runner/sessions.toml` had `claude-code-turns` / `codex-turns` roots for every account.
   - Tests added/updated: script-storage parsing/migration, `migrate-config` session-storage backfill, script transcript metadata locate, stdout-backed diagnostics, Claude limit classification, Codex missing-rollout classification, unknown-diagnostics heuristic fallback, and workspace-constrained session lifecycle inference.
+
+## D-AGE-Routing-Respects-Quota — exhausted quota windows are hard route exclusions
+
+- **Phase**: direct repair for quota-aware routing after PR #83.
+- **Finding**:
+  - PR #83 fixed diagnostics so Claude stdout quota JSON is classified as `quota_exhausted`, and the CLI path marks `provider_quotas.exhausted_at` after that classification.
+  - The balancer still filtered candidates only by `provider_quotas.exhausted_at`. Cached live quota windows in `provider_quota_windows` with `used_percent >= 1.0` were merely scored, and could still win through fallback paths, missing learned burn rates, or invocation-count round-robin.
+  - When every provider was flagged exhausted, `select_provider` intentionally returned the oldest exhausted provider, causing downstream CLI attempts against a known-exhausted pool instead of a routing-time error.
+  - The live `providers.toml` currently has no `quota_script` entries, so `select_provider(Some(ctx))` scans `sessions.toml` turn adapters but cannot refresh usage API quota windows until those scripts are restored. Cached state still has quota windows and must be respected.
+- **Decision**: Treat either `exhausted_at` or any live stored quota window at or above 100% as hard provider exhaustion. Exclude those providers before density scoring or fallback selection. If exclusion empties the pool, return `all providers in pool <model> are quota-exhausted` before spawning a provider CLI.
+- **Rationale**:
+  - Stored provider windows are the provider-agnostic quota state for both 5h and 7d limits. A live window at 100% has no usable headroom regardless of learned burn-rate availability.
+  - Fallback routing exists for incomplete learning data, not for bypassing known quota exhaustion.
+  - A clean routing error gives the caller a deterministic failure when no account can run, instead of spending time and API calls reproducing a known provider error.
+- **Reverse**: Reverse only if provider quota adapters begin emitting a separate explicit availability state that distinguishes "100% visible usage but still routable" from hard exhaustion. Until then, live `used_percent >= 1.0` is the portability boundary.
+- **Evidence**:
+  - Focused tests: `crates/oulipoly-runtime/src/balancer/mod.rs` inline tests cover 0%, 99%, 100%, and 150% used states across 5h and 7d windows, single-provider exhaustion, and all-provider exhaustion.
+  - Service test: `crates/oulipoly-runtime/tests/routing_matrix.rs::production_service_reports_all_quota_exhausted_pool`.
+  - Live diagnostic example before fix showed all configured providers returning `NO_SCRIPT` for refresh while cached windows included a 100% Claude account; this confirms routing must respect cached `provider_quota_windows` independently of fresh script availability.

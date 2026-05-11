@@ -512,7 +512,10 @@ impl RoutingServicePort for ProductionRoutingService {
                 request.model,
                 request.state,
                 request.ctx,
-            ),
+            )
+            .map_err(|error| ServiceError::Unavailable {
+                message: error.to_string(),
+            })?,
         })
     }
 }

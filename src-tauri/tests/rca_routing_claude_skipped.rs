@@ -44,7 +44,7 @@ fn fallback_count_routing_uses_current_provider_identity_not_stale_index_history
         record_invocation(&db, &model.name, "claude3", 1);
     }
 
-    let selected_index = select_provider(&model, &db, None);
+    let selected_index = select_provider(&model, &db, None).unwrap();
     let selected_name = &model.providers[selected_index].name;
 
     assert_eq!(
