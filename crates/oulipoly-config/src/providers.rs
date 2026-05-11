@@ -174,18 +174,30 @@ fn migrate_legacy_session_storage_content(path: &Path, content: &str) -> Result<
         let Some(kind) = storage.get("kind").and_then(toml::Value::as_str) else {
             continue;
         };
-        let cwd_script = match kind {
+        let migrated_scripts = match kind {
             "claude_code" => storage
                 .get("projects_dir")
                 .and_then(toml::Value::as_str)
-                .map(|projects_dir| format!("claude-code-cwd {}", shell_word(projects_dir))),
+                .map(|projects_dir| {
+                    (
+                        format!("claude-code-cwd {}", shell_word(projects_dir)),
+                        format!("claude-code-locate-transcript {}", shell_word(projects_dir)),
+                        "claude_code",
+                    )
+                }),
             "codex" => storage
                 .get("sessions_dir")
                 .and_then(toml::Value::as_str)
-                .map(|sessions_dir| format!("codex-cwd {}", shell_word(sessions_dir))),
+                .map(|sessions_dir| {
+                    (
+                        format!("codex-cwd {}", shell_word(sessions_dir)),
+                        format!("codex-locate-transcript {}", shell_word(sessions_dir)),
+                        "codex_session",
+                    )
+                }),
             _ => None,
         };
-        let Some(cwd_script) = cwd_script else {
+        let Some((cwd_script, transcript_script, storage_type)) = migrated_scripts else {
             continue;
         };
         storage.insert(
@@ -193,6 +205,14 @@ fn migrate_legacy_session_storage_content(path: &Path, content: &str) -> Result<
             toml::Value::String("script".to_string()),
         );
         storage.insert("cwd_script".to_string(), toml::Value::String(cwd_script));
+        storage.insert(
+            "transcript_script".to_string(),
+            toml::Value::String(transcript_script),
+        );
+        storage.insert(
+            "storage_type".to_string(),
+            toml::Value::String(storage_type.to_string()),
+        );
         storage.remove("projects_dir");
         storage.remove("sessions_dir");
         migrated.push(provider_name.clone());
@@ -921,6 +941,8 @@ cwd_script = "fixture-cwd ~/.fixture/sessions"
             .as_ref()
             .unwrap();
         assert_eq!(storage.cwd_script(), "fixture-cwd ~/.fixture/sessions");
+        assert_eq!(storage.transcript_script(), None);
+        assert_eq!(storage.script_storage_type(), None);
     }
 
     #[test]
@@ -952,12 +974,24 @@ projects_dir = "/tmp/provider/projects"
             storage.cwd_script(),
             "claude-code-cwd /tmp/provider/projects"
         );
+        assert_eq!(
+            storage.transcript_script(),
+            Some("claude-code-locate-transcript /tmp/provider/projects")
+        );
+        assert_eq!(
+            storage.script_storage_type(),
+            Some(crate::ScriptSessionStorageType::ClaudeCode)
+        );
         assert!(migrated);
         let migrated_content = std::fs::read_to_string(f.path()).unwrap();
         assert!(migrated_content.contains("kind = \"script\""));
         assert!(
             migrated_content.contains("cwd_script = \"claude-code-cwd /tmp/provider/projects\"")
         );
+        assert!(migrated_content.contains(
+            "transcript_script = \"claude-code-locate-transcript /tmp/provider/projects\""
+        ));
+        assert!(migrated_content.contains("storage_type = \"claude_code\""));
         assert!(!migrated_content.contains("projects_dir"));
     }
 

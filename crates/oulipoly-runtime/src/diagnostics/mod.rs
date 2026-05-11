@@ -79,7 +79,13 @@ impl DiagnosticsServicePort for RuntimeDiagnosticsService {
 
 pub fn classify_exhaustion(stderr: &str) -> bool {
     let lower = stderr.to_lowercase();
-    lower.contains("quota") || lower.contains("billing") || lower.contains("usage limit")
+    lower.contains("quota")
+        || lower.contains("billing")
+        || lower.contains("usage limit")
+        || lower.contains("usage cap")
+        || lower.contains("hit your limit")
+        || lower.contains("you've hit your limit")
+        || lower.contains("limit resets")
 }
 
 pub fn diagnose_error(
@@ -98,7 +104,7 @@ pub fn diagnose_error(
         "Analyze this CLI error and classify it into exactly one category.\n\
          \n\
          Exit code: {exit_code}\n\
-         Stderr:\n```\n{truncated}\n```\n\
+         Provider output:\n```\n{truncated}\n```\n\
          \n\
          Categories:\n\
          - rate_limit: HTTP 429, too many requests, rate limited\n\
@@ -153,6 +159,13 @@ fn parse_diagnosis(output: &str, stderr: &str, exit_code: i32) -> Result<Diagnos
         _ => ErrorCategory::Unknown,
     };
 
+    if category == ErrorCategory::Unknown {
+        let heuristic = heuristic_diagnosis(stderr, exit_code);
+        if heuristic.category != ErrorCategory::Unknown {
+            return Ok(heuristic);
+        }
+    }
+
     let summary = if lines.len() > 1 {
         lines[1..].join("\n")
     } else {
@@ -165,19 +178,23 @@ fn parse_diagnosis(output: &str, stderr: &str, exit_code: i32) -> Result<Diagnos
 fn heuristic_diagnosis(stderr: &str, _exit_code: i32) -> Diagnosis {
     let lower = stderr.to_lowercase();
 
-    let category = if lower.contains("429")
+    let category = if classify_exhaustion(stderr) {
+        ErrorCategory::QuotaExhausted
+    } else if lower.contains("429")
         || lower.contains("rate limit")
         || lower.contains("too many requests")
     {
         ErrorCategory::RateLimit
-    } else if classify_exhaustion(stderr) {
-        ErrorCategory::QuotaExhausted
     } else if lower.contains("unauthorized")
         || lower.contains("auth")
         || lower.contains("token expired")
     {
         ErrorCategory::AuthExpired
-    } else if lower.contains("no conversation found") || lower.contains("no session found") {
+    } else if lower.contains("no conversation found")
+        || lower.contains("no session found")
+        || lower.contains("no rollout found")
+        || lower.contains("thread/resume failed")
+    {
         ErrorCategory::ResumeSessionMismatch
     } else if lower.contains("not found")
         || lower.contains("unknown flag")
@@ -249,6 +266,8 @@ mod tests {
             "error: QUOTA exceeded for this account",
             "Billing limit reached for the workspace",
             "USAGE LIMIT has been hit; try again later",
+            "You've hit your limit · resets 9:50pm (America/Los_Angeles)",
+            r#"{"api_error_status":429,"result":"You've hit your limit · resets 9:50pm"}"#,
         ] {
             assert!(
                 classify_exhaustion(stderr),
@@ -280,6 +299,24 @@ mod tests {
     }
 
     #[test]
+    fn heuristic_claude_limit_json_is_quota_exhausted_not_generic_rate_limit() {
+        let d = heuristic_diagnosis(
+            r#"{"type":"result","is_error":true,"api_error_status":429,"result":"You've hit your limit · resets 9:50pm"}"#,
+            1,
+        );
+        assert_eq!(d.category, ErrorCategory::QuotaExhausted);
+    }
+
+    #[test]
+    fn heuristic_codex_missing_rollout_is_resume_session_mismatch() {
+        let d = heuristic_diagnosis(
+            "Error: thread/resume: thread/resume failed: no rollout found for thread id 019e14d4 (code -32600)",
+            1,
+        );
+        assert_eq!(d.category, ErrorCategory::ResumeSessionMismatch);
+    }
+
+    #[test]
     fn heuristic_auth() {
         let d = heuristic_diagnosis("Error: Unauthorized - token expired", 1);
         assert_eq!(d.category, ErrorCategory::AuthExpired);
@@ -303,6 +340,17 @@ mod tests {
     fn parse_empty_output_falls_back() {
         let d = parse_diagnosis("", "429 error", 1).unwrap();
         assert_eq!(d.category, ErrorCategory::RateLimit);
+    }
+
+    #[test]
+    fn parse_unknown_model_output_falls_back_to_heuristic_signal() {
+        let d = parse_diagnosis(
+            "unknown\nnot enough context",
+            "You've hit your limit · resets 9:50pm",
+            1,
+        )
+        .unwrap();
+        assert_eq!(d.category, ErrorCategory::QuotaExhausted);
     }
 
     #[cfg(unix)]

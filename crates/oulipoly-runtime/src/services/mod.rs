@@ -65,9 +65,11 @@ pub struct ResumeAcceptanceOutput;
 pub struct SessionLifecycleRequest<'a> {
     pub state: &'a oulipoly_state::StateDb,
     pub sessions_cfg: &'a oulipoly_config::SessionsConfig,
+    pub providers_cfg: Option<&'a oulipoly_config::ProvidersConfig>,
     pub provider_name: &'a str,
     pub invocation_row_id: i64,
     pub invocation_uuid: &'a str,
+    pub effective_cwd: Option<&'a Path>,
     pub mode: SessionLifecycleIngestMode,
     pub stderr: &'a mut dyn Write,
 }
@@ -581,9 +583,11 @@ impl SessionLifecycleServicePort for ProductionSessionLifecycleService {
         let SessionLifecycleRequest {
             state,
             sessions_cfg,
+            providers_cfg,
             provider_name,
             invocation_row_id,
             invocation_uuid,
+            effective_cwd,
             mode,
             stderr,
         } = request;
@@ -658,10 +662,14 @@ impl SessionLifecycleServicePort for ProductionSessionLifecycleService {
             })?;
         }
 
-        let matched_session_id = match state.find_session_for_invocation_window(
+        let matched_session_id = match find_session_for_invocation_window(
+            state,
+            providers_cfg,
             provider_name,
             &invocation.created_at,
             &finished_at,
+            effective_cwd,
+            stderr,
         ) {
             Ok(session_id) => session_id,
             Err(err) => {
@@ -960,6 +968,66 @@ fn emit_pinned_session_id_for_service(
             "resumed",
         ),
     }
+}
+
+fn find_session_for_invocation_window(
+    state: &StateDb,
+    providers_cfg: Option<&ProvidersConfig>,
+    provider_name: &str,
+    started_at: &chrono::DateTime<chrono::Utc>,
+    finished_at: &chrono::DateTime<chrono::Utc>,
+    effective_cwd: Option<&Path>,
+    stderr: &mut dyn Write,
+) -> Result<Option<String>, String> {
+    let candidates =
+        state.find_sessions_for_invocation_window(provider_name, started_at, finished_at)?;
+    if candidates.len() <= 1 {
+        return Ok(candidates.into_iter().next());
+    }
+
+    let Some(effective_cwd) = effective_cwd else {
+        return Ok(candidates.into_iter().next());
+    };
+    let Some(session_storage) = providers_cfg
+        .and_then(|providers| providers.get(provider_name))
+        .and_then(|entry| entry.session_storage.as_ref())
+    else {
+        return Ok(candidates.into_iter().next());
+    };
+
+    let expected_cwd = comparable_workspace_path(effective_cwd);
+    let mut resolved_any = false;
+    for session_id in &candidates {
+        let Ok(workspace_root) =
+            crate::session_metadata::resolve_workspace_root_for_provider_session(
+                Some(session_storage),
+                provider_name,
+                session_id,
+            )
+        else {
+            continue;
+        };
+        resolved_any = true;
+        if comparable_workspace_path(&workspace_root) == expected_cwd {
+            return Ok(Some(session_id.clone()));
+        }
+    }
+
+    if resolved_any {
+        writeln!(
+            stderr,
+            "Warning: no in-window session for provider {provider_name} matched cwd {}; not emitting inferred session id",
+            effective_cwd.display()
+        )
+        .map_err(|err| format!("Failed to write session ingest warning: {err}"))?;
+        Ok(None)
+    } else {
+        Ok(candidates.into_iter().next())
+    }
+}
+
+fn comparable_workspace_path(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn emit_known_session_id_for_service(

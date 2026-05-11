@@ -1709,3 +1709,25 @@ The four discoveries are listed here so a later consolidation WU can pick them u
   - Live config after revert: 8055 bytes, 0 `system_prompt_override` occurrences.
   - Failure observed: `Error: provider claude5 is missing from providers.toml` from `agents -m claude-opus` and any other claude model dispatch.
   - Fixture (test dependency, unchanged): `tests/fixtures/age28-default-policy.providers.toml`.
+
+## D-AGE-Resume-Root-Cause-Repair — script storage must declare transcript format and diagnostics must inspect provider stdout
+
+- **Phase**: direct repair for resume/dispatch regressions after PR #78/#79/#80/#81.
+- **Finding**:
+  - The live provider config had no `[provider.session_storage]` blocks, while `sessions.toml` still held per-account turn roots. PR #81's script-storage migration preserved only `cwd_script`, so provider-storage transcript lookup and canonical locate/export/import-replace lost the provider format needed to read the transcript without a `sessions.toml` `transcript_locator`.
+  - Claude failures from exhausted accounts can be emitted as JSON on stdout with empty stderr. The runner passed only stderr to diagnostics, so `claude6` quota exhaustion became `[diagnostics] unknown` and was not marked exhausted for routing.
+  - The reference transcript locator scripts take `SESSION_ID` from the environment; script-storage transcript execution must preserve that adapter contract even when it also appends the session id as `$1` for cwd-script compatibility.
+  - Post-run session inference ranked only by provider and invocation time window. A fresh interactive Claude smoke in `/home/nes/projects/rfq` was inferred as an older concurrent Claude session from a different workspace because both had turns in the same window.
+  - Codex reports missing local rollout state as `thread/resume failed: no rollout found for thread id ...`; this is a resume-session mismatch, not an unknown CLI failure.
+- **Decision**: Keep the PR #81 script-adapter direction, but make script storage complete for canonical transcript operations: `cwd_script`, `transcript_script`, and `storage_type`. Backfill missing provider `session_storage` from existing `sessions.toml` `turn_script` declarations during `migrate-config`. Feed diagnostics the combined provider stderr/stdout, classify Claude "You've hit your limit" payloads as `quota_exhausted`, classify missing provider resume state as `resume_session_mismatch`, and mark the provider exhausted on resume failures too. For unpinned post-run ingestion, rank all in-window candidates but constrain them by the effective spawn cwd via the provider's cwd adapter when storage metadata is available.
+- **Rationale**:
+  - `cwd_script` alone is enough to choose a resume spawn directory, but not enough to export, replace, or locate a canonical provider transcript. The explicit `storage_type` avoids reintroducing provider-name heuristics while still letting canonical readers choose the correct parser/renderer.
+  - Deriving storage from `turn_script` is a conservative migration repair: existing deployments already trust those adapter declarations for ingestion, and it avoids hand-editing each provider account.
+  - Diagnostics must look at the actual provider error channel. Claude's `--output-format json` may report API errors on stdout even when the process exits non-zero.
+  - Time-window inference is only safe when one provider session can plausibly be active. Workspace filtering preserves the existing recency/count ranking but prevents unrelated sessions from stealing the marker in normal multi-worktree use.
+- **Reverse**: Reverse only if future provider adapters expose transcript format through a richer adapter protocol that makes `storage_type` redundant. Until then, `transcript_script` and `storage_type` are the compatibility boundary for script storage.
+- **Evidence**:
+  - Live reproduction: `claude6 -p --output-format json --session-id ...` exited non-zero with empty stderr and stdout JSON containing `api_error_status: 429` plus "You've hit your limit".
+  - Live ingestion reproduction: `agents repl claude-haiku` in `/home/nes/projects/rfq` printed Claude's resume id `72554404-16c8-46bf-b284-447f23e3f777`, while the runner emitted an older `OULIPOLY_SESSION` id `f65768e2-bfad-45b8-8185-797394d18dff` from another workspace before workspace-constrained inference.
+  - Live config: `/home/nes/.config/oulipoly-agent-runner/providers.toml` lacked all `session_storage` blocks; `/home/nes/.config/oulipoly-agent-runner/sessions.toml` had `claude-code-turns` / `codex-turns` roots for every account.
+  - Tests added/updated: script-storage parsing/migration, `migrate-config` session-storage backfill, script transcript metadata locate, stdout-backed diagnostics, Claude limit classification, Codex missing-rollout classification, unknown-diagnostics heuristic fallback, and workspace-constrained session lifecycle inference.
