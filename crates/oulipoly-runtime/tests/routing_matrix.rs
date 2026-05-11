@@ -1,7 +1,7 @@
 use chrono::{DateTime, Duration, Utc};
 use oulipoly_config::{ModelConfig, ProviderConfig, model::PromptMode};
 use oulipoly_runtime::services::{
-    ProductionRoutingService, RoutingServicePort, RoutingServiceRequest,
+    ProductionRoutingService, RoutingServicePort, RoutingServiceRequest, ServiceError,
 };
 use oulipoly_state::{InvocationStart, QuotaWindowInput, SessionTurnIngest, StateDb};
 use std::path::Path;
@@ -761,3 +761,30 @@ route_test!(
     "service_spot=last_used_axis",
     |case_label| seed_last_used_case(Duration::minutes(5), case_label)
 );
+
+#[tokio::test]
+async fn production_service_reports_all_quota_exhausted_pool() {
+    let case_label = "service_error=all_quota_exhausted";
+    let model = account_pool(2);
+    let db = in_memory_state(case_label);
+    seed_two_window_provider(&db, "claude1", 0, 50, case_label);
+    seed_two_window_provider(&db, "claude2", 50, 0, case_label);
+
+    let err = ProductionRoutingService::new()
+        .select_route(RoutingServiceRequest {
+            model: &model,
+            state: &db,
+            ctx: None,
+        })
+        .unwrap_err();
+
+    assert!(
+        matches!(err, ServiceError::Unavailable { .. }),
+        "expected unavailable route error, got {err:?}"
+    );
+    assert!(
+        err.to_string()
+            .contains("all providers in pool age59-routing-matrix are quota-exhausted"),
+        "{err}"
+    );
+}

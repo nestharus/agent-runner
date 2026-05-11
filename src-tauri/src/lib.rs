@@ -693,10 +693,11 @@ fn test_model_with_db_path(
         .map_err(|error| error.to_string())?
         .result;
     if result.exit_code != 0 {
+        let diagnostic_input = diagnostic_input(&result.stderr, &result.stdout);
         let DiagnosticsServiceOutput::ExhaustionClassification { is_exhausted } = services
             .diagnostics_service
             .diagnose(DiagnosticsServiceRequest::ClassifyExhaustion {
-                stderr: result.stderr.clone(),
+                stderr: diagnostic_input,
             })
             .map_err(|error| error.to_string())?
         else {
@@ -712,6 +713,18 @@ fn test_model_with_db_path(
         stderr: result.stderr,
         exit_code: result.exit_code,
     })
+}
+
+fn diagnostic_input(stderr: &str, stdout: &[u8]) -> String {
+    let stdout = String::from_utf8_lossy(stdout);
+    let stdout = stdout.trim();
+    let stderr = stderr.trim();
+    match (stderr.is_empty(), stdout.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => stderr.to_string(),
+        (true, false) => stdout.to_string(),
+        (false, false) => format!("{stderr}\n{stdout}"),
+    }
 }
 
 #[cfg(test)]
@@ -2238,6 +2251,47 @@ mod tests {
         assert!(!result.success);
         assert_eq!(result.exit_code, 7);
         assert_eq!(diagnostics.calls(), vec!["classify:quota exhausted"]);
+        let quota = StateDb::open(&db_path)
+            .unwrap()
+            .get_quota("age38-provider")
+            .unwrap()
+            .expect("exhaustion marking should create a quota row");
+        assert!(quota.exhausted_at.is_some());
+    }
+
+    #[test]
+    fn test_model_nonzero_stdout_exhausted_classifies_and_marks_quota() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let db_path = dir.path().join("state.db");
+        let model = make_model("age38-model", &["age38-provider"]);
+        let opener = StubStateDbOpener::opening(db_path.clone());
+        let providers = StubProvidersConfigRepository::default();
+        let routing = StubRoutingService::selecting(0);
+        let executor = StubExecutorService::with_exit(
+            7,
+            br#"{"api_error_status":429,"result":"You've hit your limit"}"#,
+            "",
+        );
+        let diagnostics = StubDiagnosticsService::returning(true);
+        let services = TestModelServices {
+            state_db_opener: &opener,
+            providers_repository: &providers,
+            routing_service: &routing,
+            executor_service: &executor,
+            diagnostics_service: &diagnostics,
+        };
+
+        let result =
+            super::test_model_with_db_path(services, model, models_dir, db_path.clone(), "hello")
+                .expect("stdout-exhausted nonzero model test should return a result");
+
+        assert!(!result.success);
+        assert_eq!(
+            diagnostics.calls(),
+            vec![r#"classify:{"api_error_status":429,"result":"You've hit your limit"}"#]
+        );
         let quota = StateDb::open(&db_path)
             .unwrap()
             .get_quota("age38-provider")

@@ -7,10 +7,12 @@ use oulipoly_config::{
 };
 pub use oulipoly_core::TransitionReason;
 use oulipoly_state::{QuotaRecord, QuotaWindow, ResolvedResume, StateDb};
+use std::fmt;
 
 const ERROR_WINDOW_MINUTES: i64 = 30;
 const ERROR_THRESHOLD: u64 = 3;
 const EPS_HOURS: f64 = 1.0 / 60.0;
+const EXHAUSTED_USED_PERCENT: f64 = 1.0;
 /// Visible-usage threshold for the missing-window penalty. Anthropic's
 /// usage API hides the 5h window when an account is near weekly cap
 /// (observed live at 91% weekly). ChatGPT's API hides the 5h window
@@ -61,6 +63,37 @@ pub enum MigrationDecision {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoutingError {
+    AllProvidersQuotaExhausted {
+        model_name: String,
+        provider_names: Vec<String>,
+    },
+}
+
+impl fmt::Display for RoutingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RoutingError::AllProvidersQuotaExhausted {
+                model_name,
+                provider_names,
+            } => {
+                let providers = if provider_names.is_empty() {
+                    "<empty>".to_string()
+                } else {
+                    provider_names.join(", ")
+                };
+                write!(
+                    f,
+                    "all providers in pool {model_name} are quota-exhausted: {providers}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for RoutingError {}
+
 /// Contextual dependencies for quota-aware balancing. When present,
 /// `select_provider` will trigger a synchronous refresh for any provider
 /// whose cached quota is stale (older than `REFRESH_TTL_HOURS`) AND scan
@@ -77,14 +110,10 @@ pub fn select_provider(
     model: &ModelConfig,
     state: &StateDb,
     ctx: Option<&BalanceContext<'_>>,
-) -> usize {
+) -> Result<usize, RoutingError> {
     let n = model.providers.len();
-    if n <= 1 {
-        return 0;
-    }
 
     // 1) Opportunistic refresh of any stale provider whose quota we can fetch.
-    //    Only worthwhile when we're actually load-balancing (n > 1).
     //    Also scan CLI session logs so calls_since_refresh reflects ALL
     //    activity (agent-runner invocations + direct user UI prompts).
     if let Some(ctx) = ctx {
@@ -172,46 +201,34 @@ pub fn select_provider(
         }
     }
     let all_indices: Vec<usize> = (0..n).collect();
+    let now = Utc::now();
     let filtered_indices: Vec<usize> = all_indices
         .iter()
         .copied()
-        .filter(|i| {
-            quotas
-                .get(*i)
-                .and_then(|quota| quota.as_ref())
-                .and_then(|quota| quota.exhausted_at.as_ref())
-                .is_none()
-        })
+        .filter(|i| !provider_is_quota_exhausted(quotas[*i].as_ref(), &windows[*i], now))
         .collect();
-    // If every provider is flagged exhausted, DO NOT restore all_indices and
-    // route back into the known-bad pool via normal scoring — that spams
-    // already-exhausted accounts on every invocation and contradicts the
-    // user-locked "wait until refresh" invariant. Short-circuit and return
-    // the oldest-exhausted index directly (most likely to have recovered
-    // on its next successful refresh). Callers see this choice as
-    // best-guess routing; the subprocess will report quota_exhausted
-    // stderr as ground truth either way.
     if filtered_indices.is_empty() {
-        return all_indices
-            .into_iter()
-            .min_by(|&a, &b| {
-                let ta = quotas[a].as_ref().and_then(|q| q.exhausted_at.as_ref());
-                let tb = quotas[b].as_ref().and_then(|q| q.exhausted_at.as_ref());
-                // Oldest exhausted_at first; ties break on provider index.
-                ta.cmp(&tb).then_with(|| a.cmp(&b))
-            })
-            .unwrap_or(0);
+        return Err(RoutingError::AllProvidersQuotaExhausted {
+            model_name: model.name.clone(),
+            provider_names: model
+                .providers
+                .iter()
+                .map(|provider| provider.name.clone())
+                .collect(),
+        });
     }
     let candidates: &[usize] = filtered_indices.as_slice();
 
     // 3) If every provider has at least one window, use density scoring.
     let all_have_windows = candidates.iter().all(|i| !windows[*i].is_empty());
     if all_have_windows {
-        return score_by_density(model, state, &quotas, &windows, candidates);
+        return Ok(score_by_density(
+            model, state, &quotas, &windows, candidates,
+        ));
     }
 
     // 4) Otherwise, fall back to lifetime invocation-count scoring.
-    score_by_invocation_count(model, state, candidates)
+    Ok(score_by_invocation_count(model, state, candidates))
 }
 
 fn score_by_density(
@@ -274,6 +291,19 @@ pub fn compute_projections(
         .collect();
     let candidates: Vec<usize> = (0..model.providers.len()).collect();
     compute_projections_from_records(model, state, &quotas, &windows, &candidates, Utc::now())
+}
+
+fn provider_is_quota_exhausted(
+    quota: Option<&QuotaRecord>,
+    windows: &[QuotaWindow],
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    quota
+        .and_then(|quota| quota.exhausted_at.as_ref())
+        .is_some()
+        || windows
+            .iter()
+            .any(|window| window.resets_at > now && window.used_percent >= EXHAUSTED_USED_PERCENT)
 }
 
 fn compute_projections_from_records(
@@ -928,7 +958,7 @@ mod tests {
             providers: vec![ProviderConfig::new("x", vec![])],
             inputs: vec![],
         };
-        assert_eq!(select_provider(&model, &db, None), 0);
+        assert_eq!(select_provider(&model, &db, None).unwrap(), 0);
     }
 
     #[test]
@@ -936,12 +966,12 @@ mod tests {
         let db = StateDb::open(Path::new(":memory:")).unwrap();
         let model = two_provider_model();
 
-        let first = select_provider(&model, &db, None);
+        let first = select_provider(&model, &db, None).unwrap();
         assert_eq!(first, 0);
 
         record_invocation_for_test(&db, "test", "a", 0, true);
 
-        let second = select_provider(&model, &db, None);
+        let second = select_provider(&model, &db, None).unwrap();
         assert_eq!(second, 1);
     }
 
@@ -954,7 +984,7 @@ mod tests {
             record_invocation_for_test(&db, "test", "a", 0, false);
         }
 
-        assert_eq!(select_provider(&model, &db, None), 1);
+        assert_eq!(select_provider(&model, &db, None).unwrap(), 1);
     }
 
     // Risk: Balancer recent-error call-site | level: unit
@@ -968,7 +998,7 @@ mod tests {
             record_invocation_for_test(&db, "test", "old-a", 0, false);
         }
 
-        let selected = select_provider(&model, &db, None);
+        let selected = select_provider(&model, &db, None).unwrap();
         assert_eq!(
             model.providers[selected].name, "a",
             "stale failures for old-a at index 0 must not suppress current provider a"
@@ -1031,7 +1061,38 @@ mod tests {
     }
 
     fn selected_provider_index(model: &ModelConfig, db: &StateDb) -> usize {
-        select_provider(model, db, None)
+        select_provider(model, db, None).unwrap()
+    }
+
+    fn single_provider_model() -> ModelConfig {
+        ModelConfig {
+            name: "single".to_string(),
+            prompt_mode: PromptMode::Arg,
+            providers: vec![ProviderConfig::new("a", vec![])],
+            inputs: vec![],
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum TestWindow {
+        SevenDay,
+        FiveHour,
+    }
+
+    fn seed_two_window_used(
+        db: &StateDb,
+        provider_name: &str,
+        seven_day_used: f64,
+        five_hour_used: f64,
+    ) {
+        seed_windows_with_deltas(
+            db,
+            provider_name,
+            &[
+                (seven_day_used, 24 * 7, 0.01, 22),
+                (five_hour_used, 5, 0.30, 22),
+            ],
+        );
     }
 
     fn assert_approx(actual: f64, expected: f64, tolerance: f64) {
@@ -1054,30 +1115,108 @@ mod tests {
     }
 
     #[test]
-    fn all_providers_exhausted_picks_oldest_exhausted() {
-        // CodeRabbit pass 1 finding: when every provider is flagged
-        // exhausted, the prior "fall back to round-robin on invocation
-        // count" behavior routed right back into the known-bad pool,
-        // effectively retrying exhausted accounts on every invocation —
-        // contradicting the user-locked "wait until refresh" invariant.
-        // The new behavior picks whichever exhausted provider has the
-        // oldest `exhausted_at` (most likely to have recovered on its
-        // next refresh). Ties break by first-seen index via stable sort.
+    fn select_provider_hard_excludes_accounts_at_or_over_live_window_quota() {
+        for target_window in [TestWindow::SevenDay, TestWindow::FiveHour] {
+            for used in [0.0, 0.99] {
+                let db = StateDb::open(Path::new(":memory:")).unwrap();
+                let model = two_provider_model();
+                let (seven_day_used, five_hour_used) = match target_window {
+                    TestWindow::SevenDay => (used, 0.20),
+                    TestWindow::FiveHour => (0.20, used),
+                };
+                seed_two_window_used(&db, "a", seven_day_used, five_hour_used);
+                seed_two_window_used(&db, "b", 0.995, 0.995);
+
+                assert_eq!(
+                    selected_provider_index(&model, &db),
+                    0,
+                    "used={used} should stay eligible below 100%"
+                );
+            }
+
+            for used in [1.0, 1.5] {
+                let db = StateDb::open(Path::new(":memory:")).unwrap();
+                let model = two_provider_model();
+                let (seven_day_used, five_hour_used) = match target_window {
+                    TestWindow::SevenDay => (used, 0.20),
+                    TestWindow::FiveHour => (0.20, used),
+                };
+                seed_two_window_used(&db, "a", seven_day_used, five_hour_used);
+                seed_two_window_used(&db, "b", 0.50, 0.50);
+
+                assert_eq!(
+                    selected_provider_index(&model, &db),
+                    1,
+                    "used={used} must be excluded at or over 100%"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn select_provider_errors_when_single_account_is_at_or_over_quota() {
+        for target_window in [TestWindow::SevenDay, TestWindow::FiveHour] {
+            for used in [1.0, 1.5] {
+                let db = StateDb::open(Path::new(":memory:")).unwrap();
+                let model = single_provider_model();
+                let (seven_day_used, five_hour_used) = match target_window {
+                    TestWindow::SevenDay => (used, 0.20),
+                    TestWindow::FiveHour => (0.20, used),
+                };
+                seed_two_window_used(&db, "a", seven_day_used, five_hour_used);
+
+                let err = select_provider(&model, &db, None).unwrap_err();
+                assert_eq!(
+                    err,
+                    RoutingError::AllProvidersQuotaExhausted {
+                        model_name: "single".to_string(),
+                        provider_names: vec!["a".to_string()],
+                    }
+                );
+                assert!(
+                    err.to_string()
+                        .contains("all providers in pool single are quota-exhausted"),
+                    "{err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn all_providers_exhausted_returns_clean_error() {
         let db = StateDb::open(Path::new(":memory:")).unwrap();
         let model = two_provider_model();
 
         db.upsert_quota_refresh("a", &[]).unwrap();
         db.upsert_quota_refresh("b", &[]).unwrap();
 
-        // Mark `b` exhausted FIRST (older timestamp), `a` second.
         db.mark_exhausted("b").unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(10));
         db.mark_exhausted("a").unwrap();
 
-        // Even though invocation count would prefer `b`, the older
-        // exhausted flag makes `b` the better bet on next refresh.
-        // Expected: `b` (index 1) wins.
-        assert_eq!(selected_provider_index(&model, &db), 1);
+        let err = select_provider(&model, &db, None).unwrap_err();
+        assert_eq!(
+            err,
+            RoutingError::AllProvidersQuotaExhausted {
+                model_name: "test".to_string(),
+                provider_names: vec!["a".to_string(), "b".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn all_provider_windows_at_or_over_quota_returns_clean_error() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = two_provider_model();
+
+        seed_two_window_used(&db, "a", 1.0, 0.20);
+        seed_two_window_used(&db, "b", 0.20, 1.5);
+
+        let err = select_provider(&model, &db, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("all providers in pool test are quota-exhausted"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1491,7 +1630,7 @@ mod tests {
             in_flight: &in_flight,
         };
 
-        let selected = select_provider(&model, &db, Some(&ctx));
+        let selected = select_provider(&model, &db, Some(&ctx)).unwrap();
 
         assert_eq!(
             db.get_windows("a").unwrap().len(),
@@ -1529,7 +1668,7 @@ mod tests {
             in_flight: &in_flight,
         };
 
-        let selected = select_provider(&model, &db, Some(&ctx));
+        let selected = select_provider(&model, &db, Some(&ctx)).unwrap();
 
         assert_eq!(
             db.get_windows("a").unwrap().len(),

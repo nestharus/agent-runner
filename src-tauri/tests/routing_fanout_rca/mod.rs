@@ -108,7 +108,7 @@ pub fn select_provider_name_with_ctx(
         sessions_cfg,
         in_flight,
     };
-    let index = select_provider(model, db, Some(&ctx));
+    let index = select_provider(model, db, Some(&ctx)).unwrap();
     model.providers[index].name.clone()
 }
 

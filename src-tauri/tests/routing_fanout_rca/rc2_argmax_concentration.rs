@@ -20,7 +20,7 @@ fn rc2_learned_quota_selection_follows_projected_usage_not_local_counts() {
     }
 
     for _ in 0..8 {
-        let selected_index = select_provider(&model, &db, None);
+        let selected_index = select_provider(&model, &db, None).unwrap();
         let selected_name = model.providers[selected_index].name.clone();
 
         assert_eq!(
