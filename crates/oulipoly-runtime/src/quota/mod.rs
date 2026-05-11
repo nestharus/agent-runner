@@ -87,12 +87,40 @@ struct QuotaScriptOutput {
 }
 
 #[derive(Debug, Deserialize)]
-struct QuotaScriptWindow {
+pub struct QuotaScriptWindow {
+    #[serde(default)]
+    pub window_id: u32,
     /// Percent on a 0..100 scale. Values outside that range are rejected.
     /// Scripts wrapping APIs that report a 0..1 fraction must multiply by 100
     /// before emitting.
-    used_percent: f64,
-    resets_at: String,
+    pub used_percent: f64,
+    pub resets_at: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u64>,
+    #[serde(default)]
+    pub remaining: Option<u64>,
+    #[serde(default)]
+    pub unit: Option<String>,
+}
+
+impl QuotaScriptWindow {
+    /// Converts to `QuotaWindowInput` for routing.
+    ///
+    /// # Panics
+    /// Panics if `resets_at` is not a valid RFC3339 timestamp. Callers must
+    /// ensure this struct was produced by `parse_output`, which validates the
+    /// field; constructing a `QuotaScriptWindow` directly bypasses that check.
+    pub fn to_quota_window_input(&self) -> QuotaWindowInput {
+        let resets_at = DateTime::parse_from_rfc3339(&self.resets_at)
+            .expect("QuotaScriptWindow is validated by parse_output")
+            .with_timezone(&Utc);
+        QuotaWindowInput {
+            used_percent: self.used_percent / 100.0,
+            resets_at,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -203,17 +231,23 @@ fn refresh_provider_from_script(
         return RefreshOutcome::AlreadyInFlight;
     };
 
-    let first = run_script(script);
+    let first = run_script(script).and_then(|raw| parse_output(&raw));
     if should_attempt_auth_refresh(provider_name, &first, state)
         && let Some(refresh_cmd) = auth_refresh_command
     {
         let refresh_err = run_refresh_command(refresh_cmd).err();
-        match run_script(script) {
+        match run_script(script).and_then(|raw| parse_output(&raw)) {
             Ok(windows) => {
-                if let Err(e) = state.upsert_quota_refresh(provider_name, &windows) {
+                let routing_windows: Vec<QuotaWindowInput> = windows
+                    .iter()
+                    .map(QuotaScriptWindow::to_quota_window_input)
+                    .collect();
+                if let Err(e) = state.upsert_quota_refresh(provider_name, &routing_windows) {
                     return RefreshOutcome::Failed(e);
                 }
-                return RefreshOutcome::Updated { windows };
+                return RefreshOutcome::Updated {
+                    windows: routing_windows,
+                };
             }
             Err(retry_err) => {
                 let msg = match refresh_err {
@@ -227,10 +261,16 @@ fn refresh_provider_from_script(
 
     match first {
         Ok(windows) => {
-            if let Err(e) = state.upsert_quota_refresh(provider_name, &windows) {
+            let routing_windows: Vec<QuotaWindowInput> = windows
+                .iter()
+                .map(QuotaScriptWindow::to_quota_window_input)
+                .collect();
+            if let Err(e) = state.upsert_quota_refresh(provider_name, &routing_windows) {
                 return RefreshOutcome::Failed(e);
             }
-            RefreshOutcome::Updated { windows }
+            RefreshOutcome::Updated {
+                windows: routing_windows,
+            }
         }
         Err(e) => RefreshOutcome::Failed(e),
     }
@@ -322,7 +362,7 @@ fn shell_word_arg(input: &str) -> String {
 /// a refresh signal — there's no stale token to repair).
 fn should_attempt_auth_refresh(
     provider_name: &str,
-    result: &Result<Vec<QuotaWindowInput>, String>,
+    result: &Result<Vec<QuotaScriptWindow>, String>,
     state: &StateDb,
 ) -> bool {
     match result {
@@ -410,7 +450,7 @@ pub fn dynamic_ttl_secs(windows: &[oulipoly_state::QuotaWindow]) -> i64 {
     (min_hours / REFRESH_WINDOW_DIVISOR).clamp(MIN_TTL_SECS, MAX_TTL_SECS)
 }
 
-fn run_refresh_command(cmd_str: &str) -> Result<(), String> {
+pub fn run_refresh_command(cmd_str: &str) -> Result<(), String> {
     use std::io::Read;
 
     let mut cmd = Command::new("sh");
@@ -459,7 +499,7 @@ fn run_refresh_command(cmd_str: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn run_script(script: &str) -> Result<Vec<QuotaWindowInput>, String> {
+pub fn run_script(script: &str) -> Result<String, String> {
     use std::io::Read;
 
     let mut cmd = Command::new("sh");
@@ -517,10 +557,10 @@ fn run_script(script: &str) -> Result<Vec<QuotaWindowInput>, String> {
         ));
     }
 
-    parse_output(&stdout_text)
+    Ok(stdout_text)
 }
 
-fn parse_output(stdout: &str) -> Result<Vec<QuotaWindowInput>, String> {
+pub fn parse_output(stdout: &str) -> Result<Vec<QuotaScriptWindow>, String> {
     let trimmed = stdout.trim();
     let parsed: QuotaScriptOutput = serde_json::from_str(trimmed)
         .map_err(|e| format!("Invalid JSON from quota script: {e} (got: {stdout})"))?;
@@ -540,28 +580,29 @@ fn parse_output(stdout: &str) -> Result<Vec<QuotaWindowInput>, String> {
                 ));
             };
             vec![QuotaScriptWindow {
+                window_id: 0,
                 used_percent: pct,
                 resets_at,
+                label: None,
+                limit: None,
+                remaining: None,
+                unit: None,
             }]
         }
     };
 
     let mut out = Vec::with_capacity(raw_windows.len());
-    for w in raw_windows {
-        let resets_at = DateTime::parse_from_rfc3339(&w.resets_at)
-            .map_err(|e| format!("Bad resets_at {}: {e}", w.resets_at))?
-            .with_timezone(&Utc);
+    for (index, mut w) in raw_windows.into_iter().enumerate() {
+        DateTime::parse_from_rfc3339(&w.resets_at)
+            .map_err(|e| format!("Bad resets_at {}: {e}", w.resets_at))?;
         if !(0.0..=100.0).contains(&w.used_percent) || w.used_percent.is_nan() {
             return Err(format!(
                 "quota script emitted used_percent={} outside 0..100 (got: {stdout})",
                 w.used_percent
             ));
         }
-        let used = w.used_percent / 100.0;
-        out.push(QuotaWindowInput {
-            used_percent: used,
-            resets_at,
-        });
+        w.window_id = index as u32;
+        out.push(w);
     }
     Ok(out)
 }
@@ -601,8 +642,8 @@ mod tests {
         ]}"#;
         let windows = parse_output(json).unwrap();
         assert_eq!(windows.len(), 2);
-        assert!((windows[0].used_percent - 0.01).abs() < 1e-6);
-        assert!((windows[1].used_percent - 0.86).abs() < 1e-6);
+        assert!((windows[0].used_percent - 1.0).abs() < 1e-6);
+        assert!((windows[1].used_percent - 86.0).abs() < 1e-6);
     }
 
     #[test]
@@ -610,7 +651,7 @@ mod tests {
         let json = r#"{"used_percent":12, "resets_at":"2026-04-23T19:00:00Z"}"#;
         let windows = parse_output(json).unwrap();
         assert_eq!(windows.len(), 1);
-        assert!((windows[0].used_percent - 0.12).abs() < 1e-6);
+        assert!((windows[0].used_percent - 12.0).abs() < 1e-6);
     }
 
     #[test]

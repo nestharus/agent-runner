@@ -9,8 +9,8 @@
 # window and a 7-day rolling window:
 #
 #   {"windows": [
-#      {"used_percent": 23, "resets_at": "2026-04-23T19:00:00Z"},
-#      {"used_percent": 45, "resets_at": "2026-04-17T15:00:00Z"}
+#      {"label": "weekly", "used_percent": 45, "resets_at": "2026-04-17T15:00:00Z"},
+#      {"label": "5h-burst", "used_percent": 23, "resets_at": "2026-04-23T19:00:00Z"}
 #   ]}
 #
 # Window order doesn't matter — the runner identifies windows by position
@@ -64,10 +64,10 @@ fi
 echo "$RESP" | jq '{
   windows: [
     (if .seven_day.resets_at then
-       {used_percent: (.seven_day.utilization // 0), resets_at: .seven_day.resets_at}
+       {label: "weekly", used_percent: (.seven_day.utilization // 0), resets_at: .seven_day.resets_at}
      else empty end),
     (if .five_hour.resets_at then
-       {used_percent: (.five_hour.utilization // 0), resets_at: .five_hour.resets_at}
+       {label: "5h-burst", used_percent: (.five_hour.utilization // 0), resets_at: .five_hour.resets_at}
      else empty end)
   ]
 }'

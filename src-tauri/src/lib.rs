@@ -1,4 +1,5 @@
 pub mod setup;
+pub mod usage;
 mod wiring;
 
 use oulipoly_config as config;
