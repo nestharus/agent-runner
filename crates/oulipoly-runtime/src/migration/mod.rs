@@ -1,6 +1,6 @@
 use crate::balancer::TransitionReason;
-use crate::sessions::locate_transcript;
-use oulipoly_config::{ModelConfig, SessionStorage, SessionsConfig};
+use crate::session_metadata::resolve_jsonl_path_for_provider_allow_missing;
+use oulipoly_config::{ModelConfig, ScriptSessionStorageType, SessionStorage, SessionsConfig};
 use oulipoly_state::{ResolvedResume, StateDb};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -115,23 +115,26 @@ pub fn migrate_chain_segment(
             provider: target.name.clone(),
         });
     }
-    if matches!(source.session_storage, Some(SessionStorage::Codex { .. }))
-        || matches!(target.session_storage, Some(SessionStorage::Codex { .. }))
+    if session_storage_type(source.session_storage.as_ref())
+        == Some(ScriptSessionStorageType::CodexSession)
+        || session_storage_type(target.session_storage.as_ref())
+            == Some(ScriptSessionStorageType::CodexSession)
     {
         return Err(MigrationError::CodexMigrationDeferred {
             provider: source.name.clone(),
         });
     }
 
-    let source_path = locate_transcript(sessions_cfg, &source.name, &resolved.active_session_id)
-        .map_err(|message| MigrationError::TranscriptLocatorFailed {
-            provider: source.name.clone(),
-            message,
-        })?
-        .or_else(|| find_claude_source_from_storage(source, &resolved.active_session_id))
-        .ok_or_else(|| MigrationError::SourceMissingStorage {
-            provider: source.name.clone(),
-        })?;
+    let source_path = resolve_jsonl_path_for_provider_allow_missing(
+        sessions_cfg,
+        source.session_storage.as_ref(),
+        &source.name,
+        &resolved.active_session_id,
+    )
+    .map_err(|err| MigrationError::TranscriptLocatorFailed {
+        provider: source.name.clone(),
+        message: metadata_error_message(&err),
+    })?;
     if !source_path.is_absolute() {
         return Err(MigrationError::SourcePathMalformed {
             provider: source.name.clone(),
@@ -146,18 +149,10 @@ pub fn migrate_chain_segment(
     }
 
     let target_session_id = resolved.active_session_id.clone();
-    let SessionStorage::ClaudeCode { projects_dir } =
-        target
-            .session_storage
-            .as_ref()
-            .ok_or_else(|| MigrationError::TargetMissingStorage {
-                provider: target.name.clone(),
-            })?
-    else {
-        return Err(MigrationError::CodexMigrationDeferred {
+    let projects_dir = claude_projects_dir_from_storage(target.session_storage.as_ref())
+        .ok_or_else(|| MigrationError::TargetMissingStorage {
             provider: target.name.clone(),
-        });
-    };
+        })?;
     let cwd_project_dir = claude_project_dir_for(&target.name, resume_working_dir, stderr)?;
     let bytes = std::fs::read(&source_path).map_err(|e| MigrationError::Io {
         path: source_path.display().to_string(),
@@ -253,6 +248,66 @@ pub fn migrate_chain_segment(
     })
 }
 
+fn session_storage_type(storage: Option<&SessionStorage>) -> Option<ScriptSessionStorageType> {
+    storage.and_then(SessionStorage::script_storage_type)
+}
+
+fn metadata_error_message(err: &crate::session_metadata::MetadataError) -> String {
+    match err {
+        crate::session_metadata::MetadataError::InvalidSessionId { input } => {
+            format!("invalid session id: {input}")
+        }
+        crate::session_metadata::MetadataError::SessionNotFound { input } => {
+            format!("session not found: {input}")
+        }
+        crate::session_metadata::MetadataError::AmbiguousSession { input } => {
+            format!("ambiguous session: {input}")
+        }
+        crate::session_metadata::MetadataError::UnsupportedStorage {
+            provider_name,
+            reason,
+        } => {
+            format!("unsupported storage for provider {provider_name}: {reason}")
+        }
+        crate::session_metadata::MetadataError::Operational { message } => message.clone(),
+    }
+}
+
+fn claude_projects_dir_from_storage(storage: Option<&SessionStorage>) -> Option<PathBuf> {
+    match storage? {
+        SessionStorage::ClaudeCode { projects_dir } => Some(projects_dir.clone()),
+        SessionStorage::Script {
+            cwd_script,
+            storage_type: Some(ScriptSessionStorageType::ClaudeCode),
+            ..
+        } => claude_projects_dir_from_cwd_script(cwd_script),
+        _ => None,
+    }
+}
+
+fn claude_projects_dir_from_cwd_script(script: &str) -> Option<PathBuf> {
+    let parts = crate::executor::cli::shell_split(script);
+    let adapter = parts.first()?;
+    let projects_dir = parts.get(1)?;
+    let adapter_name = Path::new(adapter).file_name()?.to_str()?;
+    if adapter_name != "claude-code-cwd" {
+        return None;
+    }
+    Some(expand_leading_tilde(projects_dir))
+}
+
+fn expand_leading_tilde(input: &str) -> PathBuf {
+    if input == "~" {
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from(input));
+    }
+    if let Some(rest) = input.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest);
+    }
+    PathBuf::from(input)
+}
+
 pub(crate) fn claude_project_dir_for(
     provider: &str,
     cwd: &Path,
@@ -295,9 +350,7 @@ pub fn find_claude_source_from_storage(
     provider: &oulipoly_config::ProviderConfig,
     session_id: &str,
 ) -> Option<PathBuf> {
-    let SessionStorage::ClaudeCode { projects_dir } = provider.session_storage.as_ref()? else {
-        return None;
-    };
+    let projects_dir = claude_projects_dir_from_storage(provider.session_storage.as_ref())?;
     let entries = std::fs::read_dir(projects_dir).ok()?;
     for entry in entries.flatten() {
         let candidate = entry.path().join(format!("{session_id}.jsonl"));
@@ -312,7 +365,8 @@ pub fn find_claude_source_from_storage(
 mod tests {
     use super::*;
     use oulipoly_config::{
-        ModelConfig, ProviderConfig, ResumeKind, ResumeStrategy, SessionsConfig,
+        ModelConfig, ProviderConfig, ResumeKind, ResumeStrategy, ScriptSessionStorageType,
+        SessionsConfig,
     };
     use oulipoly_state::{InvocationStart, ResolvedResume, StateDb};
 
@@ -347,6 +401,55 @@ mod tests {
         }
     }
 
+    fn model_with_script_storage(
+        source_transcript_script: String,
+        source_projects: &std::path::Path,
+        target_projects: &std::path::Path,
+    ) -> ModelConfig {
+        let provider = |name: &str, session_storage: SessionStorage| ProviderConfig {
+            name: name.to_string(),
+            command: name.to_string(),
+            args: Vec::new(),
+            interactive_args: Some(vec!["launch".to_string()]),
+            resume: Some(ResumeStrategy {
+                kind: ResumeKind::Flag,
+                flag: Some("--resume".to_string()),
+                subcommand: None,
+            }),
+            session_capture: None,
+            resume_acceptance: None,
+            session_storage: Some(session_storage),
+            system_prompt_override: None,
+            tool_restrictions: None,
+        };
+        ModelConfig {
+            name: "claude-opus".to_string(),
+            prompt_mode: oulipoly_config::PromptMode::Arg,
+            providers: vec![
+                provider(
+                    "claude",
+                    SessionStorage::Script {
+                        cwd_script: format!("claude-code-cwd {}", source_projects.display()),
+                        transcript_script: Some(source_transcript_script),
+                        storage_type: Some(ScriptSessionStorageType::ClaudeCode),
+                    },
+                ),
+                provider(
+                    "claude2",
+                    SessionStorage::Script {
+                        cwd_script: format!("claude-code-cwd {}", target_projects.display()),
+                        transcript_script: Some(format!(
+                            "claude-code-locate-transcript {}",
+                            target_projects.display()
+                        )),
+                        storage_type: Some(ScriptSessionStorageType::ClaudeCode),
+                    },
+                ),
+            ],
+            inputs: Vec::new(),
+        }
+    }
+
     fn claude_project_dir_name(path: &std::path::Path) -> String {
         path.to_string_lossy()
             .chars()
@@ -374,6 +477,17 @@ mod tests {
         )
         .unwrap();
         source_path
+    }
+
+    fn write_locator_script(path: &std::path::Path, target: &std::path::Path) {
+        std::fs::write(
+            path,
+            format!(
+                "#!/usr/bin/env sh\nset -eu\nprintf '%s\\n' '{}'\n",
+                target.display()
+            ),
+        )
+        .unwrap();
     }
 
     fn seed_resolved(
@@ -439,6 +553,50 @@ mod tests {
         .unwrap();
 
         assert_eq!(migrated.target_session_id, session_id);
+        assert_eq!(
+            migrated.target_jsonl_path,
+            target_projects
+                .join(claude_project_dir_name(&source_workspace))
+                .join(format!("{session_id}.jsonl"))
+        );
+        assert!(migrated.target_jsonl_path.exists());
+        assert_eq!(
+            state.chain_id_for_segment("claude2", session_id).unwrap(),
+            Some(chain_id)
+        );
+    }
+
+    #[test]
+    fn migration_copies_between_script_claude_storage_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_projects = dir.path().join("source-projects");
+        let target_projects = dir.path().join("target-projects");
+        let source_workspace = dir.path().join("worktrees").join("same-workspace");
+        let session_id = "dd116a3c-6819-42b1-b3d2-f512331eb5ec";
+        let source_path = seed_source_jsonl(&source_projects, &source_workspace, session_id);
+        let locator = dir.path().join("locate-source.sh");
+        write_locator_script(&locator, &source_path);
+        let state = StateDb::open(&dir.path().join("state.db")).unwrap();
+        let model = model_with_script_storage(
+            format!("sh {}", locator.display()),
+            &source_projects,
+            &target_projects,
+        );
+        let (resolved, chain_id) = seed_resolved(&state, &model, session_id);
+        let mut stderr = Vec::new();
+
+        let migrated = migrate_chain_segment(
+            &state,
+            &SessionsConfig::default(),
+            &model,
+            &resolved,
+            &source_workspace,
+            1,
+            TransitionReason::Manual,
+            &mut stderr,
+        )
+        .unwrap();
+
         assert_eq!(
             migrated.target_jsonl_path,
             target_projects

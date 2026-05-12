@@ -6,7 +6,8 @@ use crate::quota::{
 use crate::sessions::scan_provider;
 use chrono::Utc;
 use oulipoly_config::{
-    ModelConfig, ProviderConfig, ProvidersConfig, SessionStorage, SessionsConfig,
+    ModelConfig, ProviderConfig, ProvidersConfig, ScriptSessionStorageType, SessionStorage,
+    SessionsConfig,
 };
 pub use oulipoly_core::TransitionReason;
 use oulipoly_state::{QuotaRecord, QuotaWindow, ResolvedResume, StateDb};
@@ -496,13 +497,14 @@ pub fn decide_migration(
 }
 
 fn is_resume_migratable_pair(source: &ProviderConfig, target: &ProviderConfig) -> bool {
-    matches!(
-        (&source.session_storage, &target.session_storage),
-        (
-            Some(SessionStorage::ClaudeCode { .. }),
-            Some(SessionStorage::ClaudeCode { .. })
-        )
-    )
+    session_storage_type(source.session_storage.as_ref())
+        == Some(ScriptSessionStorageType::ClaudeCode)
+        && session_storage_type(target.session_storage.as_ref())
+            == Some(ScriptSessionStorageType::ClaudeCode)
+}
+
+fn session_storage_type(storage: Option<&SessionStorage>) -> Option<ScriptSessionStorageType> {
+    storage.and_then(SessionStorage::script_storage_type)
 }
 
 fn exhausted_provider_indices(
@@ -545,7 +547,7 @@ fn lowest_load_migration_target<'a>(
     exclude_provider_index: Option<usize>,
     exhausted_provider_indices: &HashSet<usize>,
 ) -> Option<&'a ProviderProjection> {
-    projections
+    let candidates = projections
         .iter()
         .filter(|projection| Some(projection.provider_index) != exclude_provider_index)
         .filter(|projection| !exhausted_provider_indices.contains(&projection.provider_index))
@@ -555,6 +557,13 @@ fn lowest_load_migration_target<'a>(
                 .get(projection.provider_index)
                 .is_some_and(|candidate| is_resume_migratable_pair(source_provider, candidate))
         })
+        .collect::<Vec<_>>();
+    let has_scored_candidate = candidates
+        .iter()
+        .any(|projection| projection.binding_score.is_some());
+    candidates
+        .into_iter()
+        .filter(|projection| !has_scored_candidate || projection.binding_score.is_some())
         .min_by(|a, b| {
             let load_order = provider_load(a)
                 .partial_cmp(&provider_load(b))
@@ -1956,6 +1965,13 @@ mod tests {
                     "claude_code" => Some(oulipoly_config::SessionStorage::ClaudeCode {
                         projects_dir: PathBuf::from(format!("/tmp/{name}/projects")),
                     }),
+                    "script_claude_code" => Some(oulipoly_config::SessionStorage::Script {
+                        cwd_script: format!("claude-code-cwd /tmp/{name}/projects"),
+                        transcript_script: Some(format!(
+                            "claude-code-locate-transcript /tmp/{name}/projects"
+                        )),
+                        storage_type: Some(oulipoly_config::ScriptSessionStorageType::ClaudeCode),
+                    }),
                     "codex" => Some(oulipoly_config::SessionStorage::Codex {
                         sessions_dir: PathBuf::from(format!("/tmp/{name}/sessions")),
                     }),
@@ -2124,6 +2140,56 @@ mod tests {
                 reason: TransitionReason::Exhausted
             },
             "resume migration must honor the same live-window exhaustion rule as select_provider"
+        );
+    }
+
+    #[test]
+    fn decide_migration_treats_script_claude_storage_as_migratable() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = migratable_model(&[
+            ("claude", "script_claude_code"),
+            ("claude6", "script_claude_code"),
+        ]);
+        db.upsert_quota_refresh("claude", &one_window(1.0, 5))
+            .unwrap();
+        db.upsert_quota_refresh("claude6", &one_window(0.20, 5))
+            .unwrap();
+
+        let decision = decide_migration(&db, &model, &resolved_for(&model, 0), None).unwrap();
+
+        assert_eq!(
+            decision,
+            MigrationDecision::Migrate {
+                target_provider_index: 1,
+                reason: TransitionReason::Exhausted
+            },
+            "resume migration must treat provider session_storage script adapters with storage_type=claude_code as migratable Claude storage"
+        );
+    }
+
+    #[test]
+    fn decide_migration_does_not_treat_past_reset_unscored_target_as_lowest_load() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = migratable_model(&[
+            ("claude", "claude_code"),
+            ("claude4", "claude_code"),
+            ("claude6", "claude_code"),
+        ]);
+        db.upsert_quota_refresh("claude", &one_window(1.0, 5))
+            .unwrap();
+        db.upsert_quota_refresh("claude4", &one_window(0.92, -1))
+            .unwrap();
+        seed_windows_with_deltas(&db, "claude6", &[(0.40, 24 * 5, 0.01, 22)]);
+
+        let decision = decide_migration(&db, &model, &resolved_for(&model, 0), None).unwrap();
+
+        assert_eq!(
+            decision,
+            MigrationDecision::Migrate {
+                target_provider_index: 2,
+                reason: TransitionReason::Exhausted
+            },
+            "resume migration must not rank a stale past-reset row ahead of a provider with live scored headroom"
         );
     }
 

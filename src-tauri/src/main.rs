@@ -2871,6 +2871,8 @@ fn old_top_level_provider_table(table: &mut toml::Table) -> Result<toml::Value, 
     let mut provider = toml::Table::new();
     for key in [
         "command",
+        "quota_script",
+        "auth_refresh_command",
         "args",
         "interactive_args",
         "resume",
@@ -2901,6 +2903,8 @@ fn migrate_provider_table(
         .ok_or_else(|| format!("provider entry in {} is not a table", path.display()))?;
     let original_provider = provider.clone();
     let has_runtime_blocks = provider.contains_key("command")
+        || provider.contains_key("quota_script")
+        || provider.contains_key("auth_refresh_command")
         || provider.contains_key("resume")
         || provider.contains_key("session_capture")
         || provider.contains_key("session_storage")
@@ -2973,6 +2977,8 @@ fn migrate_provider_table(
     let session_capture = provider.remove("session_capture");
     let session_storage = provider.remove("session_storage");
     let resume_acceptance = provider.remove("resume_acceptance");
+    let quota_script = provider.remove("quota_script");
+    let auth_refresh_command = provider.remove("auth_refresh_command");
 
     let runtime = providers_root
         .entry(provider_name.clone())
@@ -3019,6 +3025,8 @@ fn migrate_provider_table(
         set_or_conflict(runtime, "prompt_mode", prompt_mode, &provider_name, path)?;
     }
     for (key, value) in [
+        ("quota_script", quota_script),
+        ("auth_refresh_command", auth_refresh_command),
         ("resume", resume),
         ("session_capture", session_capture),
         ("session_storage", session_storage),
@@ -4555,6 +4563,8 @@ prompt_mode = "stdin"
 [[providers]]
 name = "claude2"
 command = "env -u CLAUDECODE claude2"
+quota_script = "anthropic-usage ~/.claude2/.credentials.json"
+auth_refresh_command = "claude auth status"
 args = ["-p", "--model", "opus", "--output-format", "json"]
 interactive_args = ["--model", "opus"]
 
@@ -4585,11 +4595,21 @@ accepted_output_patterns = ["\"session_id\":\"{session_id}\""]
         assert!(model.contains("\"opus\""), "{model}");
         assert!(!model.contains("\"--output-format\""), "{model}");
         assert!(!model.contains("command ="), "{model}");
+        assert!(!model.contains("quota_script ="), "{model}");
+        assert!(!model.contains("auth_refresh_command ="), "{model}");
         assert!(!model.contains("session_storage"), "{model}");
 
         let providers = std::fs::read_to_string(&providers_path).unwrap();
         assert!(providers.contains("[claude2]"), "{providers}");
         assert!(providers.contains("command = \"env\""), "{providers}");
+        assert!(
+            providers.contains("quota_script = \"anthropic-usage ~/.claude2/.credentials.json\""),
+            "{providers}"
+        );
+        assert!(
+            providers.contains("auth_refresh_command = \"claude auth status\""),
+            "{providers}"
+        );
         assert!(providers.contains("\"-u\""), "{providers}");
         assert!(providers.contains("\"CLAUDECODE\""), "{providers}");
         assert!(providers.contains("\"claude2\""), "{providers}");
