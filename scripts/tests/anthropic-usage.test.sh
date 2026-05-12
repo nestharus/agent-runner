@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 #
 # Run from the repo root:
-#   cd <repo-root> && scripts/tests/chatgpt-usage.test.sh
+#   cd <repo-root> && scripts/tests/anthropic-usage.test.sh
 
 set -euo pipefail
 
-ROOT="$PWD"
-SCRIPT="$PWD/scripts/chatgpt-usage"
-FIXTURE_DIR="$PWD/scripts/tests/fixtures/chatgpt-usage"
+SCRIPT="$PWD/scripts/anthropic-usage"
+FIXTURE_DIR="$PWD/scripts/tests/fixtures/anthropic-usage"
 
 fail() {
   echo "$*" >&2
@@ -76,8 +75,8 @@ write_mock_curl() {
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ -z "${CHATGPT_USAGE_MOCK_RESPONSE_FILE:-}" ]]; then
-  echo "CHATGPT_USAGE_MOCK_RESPONSE_FILE is not set" >&2
+if [[ -z "${ANTHROPIC_USAGE_MOCK_RESPONSE_FILE:-}" ]]; then
+  echo "ANTHROPIC_USAGE_MOCK_RESPONSE_FILE is not set" >&2
   exit 64
 fi
 
@@ -91,6 +90,12 @@ while [[ "$#" -gt 0 ]]; do
     -w)
       shift 2
       ;;
+    --max-time)
+      shift 2
+      ;;
+    -H)
+      shift 2
+      ;;
     *)
       shift
       ;;
@@ -102,29 +107,28 @@ if [[ -z "$out_file" ]]; then
   exit 65
 fi
 
-cat "$CHATGPT_USAGE_MOCK_RESPONSE_FILE" >"$out_file"
-printf '%s' "${CHATGPT_USAGE_MOCK_HTTP_CODE:-200}"
+cat "$ANTHROPIC_USAGE_MOCK_RESPONSE_FILE" >"$out_file"
+printf '%s' "${ANTHROPIC_USAGE_MOCK_HTTP_CODE:-200}"
 MOCK_CURL
 
   chmod +x "$path"
 }
 
-write_valid_auth_file() {
+write_valid_credentials_file() {
   local path="$1"
 
   cat >"$path" <<'JSON'
 {
-  "tokens": {
-    "access_token": "test-access-token",
-    "account_id": "test-account-id"
+  "claudeAiOauth": {
+    "accessToken": "test-access-token"
   }
 }
 JSON
 }
 
-run_chatgpt_usage() {
+run_anthropic_usage() {
   local response_fixture="$1"
-  local auth_file="$2"
+  local creds_file="$2"
   local tmpdir="$3"
   local mock_bin="$tmpdir/mock-bin"
 
@@ -136,9 +140,9 @@ run_chatgpt_usage() {
 
   set +e
   PATH="$mock_bin:$PATH" \
-    CHATGPT_USAGE_MOCK_RESPONSE_FILE="$response_fixture" \
-    CHATGPT_USAGE_MOCK_HTTP_CODE="${CHATGPT_USAGE_MOCK_HTTP_CODE:-200}" \
-    "$SCRIPT" "$auth_file" >"$RUN_STDOUT" 2>"$RUN_STDERR"
+    ANTHROPIC_USAGE_MOCK_RESPONSE_FILE="$response_fixture" \
+    ANTHROPIC_USAGE_MOCK_HTTP_CODE="${ANTHROPIC_USAGE_MOCK_HTTP_CODE:-200}" \
+    bash "$SCRIPT" "$creds_file" >"$RUN_STDOUT" 2>"$RUN_STDERR"
   RUN_STATUS=$?
   set -e
 }
@@ -169,81 +173,50 @@ assert_five_hour_window() {
   assert_jq_eq ".windows[$index] | has(\"remaining\")" "false" "$label remaining omitted"
 }
 
-test_chatgpt_usage_emits_two_windows_on_normal_response() {
+test_anthropic_usage_emits_labeled_percent_windows_on_normal_response() {
   local tmpdir
   tmpdir="$(mktemp -d)"
   trap "rm -rf '$tmpdir'" EXIT
 
-  local auth_file="$tmpdir/auth.json"
-  write_valid_auth_file "$auth_file"
+  local creds_file="$tmpdir/credentials.json"
+  write_valid_credentials_file "$creds_file"
 
-  run_chatgpt_usage "$FIXTURE_DIR/normal-response.json" "$auth_file" "$tmpdir"
+  run_anthropic_usage "$FIXTURE_DIR/normal-response.json" "$creds_file" "$tmpdir"
 
   assert_status_zero "$RUN_STATUS" "$FUNCNAME"
   assert_jq_eq '.windows | length' "2" "$FUNCNAME window count"
-  # Fixture uses unix `reset_at`; script converts via jq `todate` to RFC3339.
-  assert_weekly_window 0 "42" "2026-04-27T14:26:40Z" "$FUNCNAME weekly window"
-  assert_five_hour_window 1 "17" "2026-04-21T22:20:00Z" "$FUNCNAME five-hour window"
+  assert_weekly_window 0 "46" "2026-04-28T18:13:20Z" "$FUNCNAME weekly window"
+  assert_five_hour_window 1 "13" "2026-04-22T01:06:40Z" "$FUNCNAME five-hour window"
 }
 
-test_chatgpt_usage_emits_one_window_when_only_weekly_present() {
+test_anthropic_usage_emits_empty_windows_on_empty_response() {
   local tmpdir
   tmpdir="$(mktemp -d)"
   trap "rm -rf '$tmpdir'" EXIT
 
-  local auth_file="$tmpdir/auth.json"
-  write_valid_auth_file "$auth_file"
+  local creds_file="$tmpdir/credentials.json"
+  write_valid_credentials_file "$creds_file"
 
-  run_chatgpt_usage "$FIXTURE_DIR/only-weekly.json" "$auth_file" "$tmpdir"
+  run_anthropic_usage "$FIXTURE_DIR/empty-response.json" "$creds_file" "$tmpdir"
 
   assert_status_zero "$RUN_STATUS" "$FUNCNAME"
-  assert_jq_eq '.windows | length' "1" "$FUNCNAME window count"
-  assert_weekly_window 0 "64" "2026-04-28T18:13:20Z" "$FUNCNAME weekly window"
+  assert_jq_eq '.windows | length' "0" "$FUNCNAME window count"
 }
 
-test_chatgpt_usage_emits_one_window_when_only_five_hour_present() {
+test_anthropic_usage_error_response_exits_nonzero() {
   local tmpdir
   tmpdir="$(mktemp -d)"
   trap "rm -rf '$tmpdir'" EXIT
 
-  local auth_file="$tmpdir/auth.json"
-  write_valid_auth_file "$auth_file"
+  local creds_file="$tmpdir/credentials.json"
+  write_valid_credentials_file "$creds_file"
 
-  run_chatgpt_usage "$FIXTURE_DIR/only-five-hour.json" "$auth_file" "$tmpdir"
+  ANTHROPIC_USAGE_MOCK_HTTP_CODE=401 \
+    run_anthropic_usage "$FIXTURE_DIR/error-401.json" "$creds_file" "$tmpdir"
 
-  assert_status_zero "$RUN_STATUS" "$FUNCNAME"
-  assert_jq_eq '.windows | length' "1" "$FUNCNAME window count"
-  assert_five_hour_window 0 "23" "2026-04-22T01:06:40Z" "$FUNCNAME five-hour window"
-}
-
-assert_credential_failure() {
-  local auth_file="$1"
-  local stderr_pattern="$2"
-  local label="$3"
-  local tmpdir="$4"
-
-  mkdir -p "$tmpdir"
-  run_chatgpt_usage "$FIXTURE_DIR/normal-response.json" "$auth_file" "$tmpdir"
-
-  assert_status_nonzero "$RUN_STATUS" "$label"
-  assert_stdout_empty "$label"
-  assert_stderr_matches "$stderr_pattern" "$label"
-}
-
-test_chatgpt_usage_credential_failure_exits_nonzero() {
-  local tmpdir
-  tmpdir="$(mktemp -d)"
-  trap "rm -rf '$tmpdir'" EXIT
-
-  assert_credential_failure "/tmp/nonexistent-chatgpt-usage-$$-$RANDOM" \
-    '(credential|auth|readable)' \
-    "$FUNCNAME unreadable auth file" \
-    "$tmpdir/unreadable"
-
-  assert_credential_failure "$FIXTURE_DIR/empty-tokens.json" \
-    '(token|account|credential|auth|missing)' \
-    "$FUNCNAME missing token fields" \
-    "$tmpdir/missing-tokens"
+  assert_status_nonzero "$RUN_STATUS" "$FUNCNAME"
+  assert_stdout_empty "$FUNCNAME"
+  assert_stderr_matches '(401|auth|invalid|token)' "$FUNCNAME"
 }
 
 main() {
@@ -260,12 +233,12 @@ main() {
   done < <(compgen -A function | grep -E '^test_' | LC_ALL=C sort)
 
   if [[ "${#failed[@]}" -eq 0 ]]; then
-    echo "All chatgpt-usage tests passed."
+    echo "All anthropic-usage tests passed."
     return 0
   fi
 
   echo
-  echo "${#failed[@]} chatgpt-usage test(s) failed:"
+  echo "${#failed[@]} anthropic-usage test(s) failed:"
   printf ' - %s\n' "${failed[@]}"
   return 1
 }

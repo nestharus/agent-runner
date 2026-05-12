@@ -11,8 +11,8 @@
 # window and a weekly rolling window:
 #
 #   {"windows": [
-#      {"used_percent": 45, "resets_at": "2026-04-27T23:26:11Z"},
-#      {"used_percent": 23, "resets_at": "2026-04-21T14:27:00Z"}
+#      {"label": "weekly", "used_percent": 45, "resets_at": "2026-04-27T23:26:11Z"},
+#      {"label": "5h-burst", "used_percent": 23, "resets_at": "2026-04-21T14:27:00Z"}
 #   ]}
 #
 # Exits 0 on success, non-zero (with diagnostic on stderr) on failure.
@@ -56,11 +56,13 @@ fi
 echo "$RESP" | jq '{
   windows: [
     (if .rate_limit.secondary_window.reset_at then
-       {used_percent: (.rate_limit.secondary_window.used_percent // 0),
+       {label: "weekly",
+        used_percent: (.rate_limit.secondary_window.used_percent // 0),
         resets_at: (.rate_limit.secondary_window.reset_at | todate)}
      else empty end),
     (if .rate_limit.primary_window.reset_at then
-       {used_percent: (.rate_limit.primary_window.used_percent // 0),
+       {label: "5h-burst",
+        used_percent: (.rate_limit.primary_window.used_percent // 0),
         resets_at: (.rate_limit.primary_window.reset_at | todate)}
      else empty end)
   ]
