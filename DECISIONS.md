@@ -1983,3 +1983,61 @@ Implementation changes (folded into the squashed AGE-15 feature commit via `git 
 - Process-tree audit #3 report: `planning/age-15-usage-flag/risk/phase-8-process-tree-audit.md`.
 - Phase 8 join manifest: `planning/age-15-usage-flag/risk/phase-8-join-manifest.json`.
 - Precedents: `D-AGE-8-Phase-8` (this DECISIONS file, ~line 614), `AGE-34 — Phase 4 process-tree-audit substitution` (~line 819), `D-AGE-33` (project audit-history record).
+
+## AGE-93 — D1 — Phase 2.5.4 migration-target drift accepted as residual; tracker AGE-95 filed
+
+Phase 2.5 duplicate-systems inventory surfaced two drift items on the touched surface:
+
+1. `decide_migration` is a second direct `exhausted_at` reader that does not re-run the reset derivation AGE-93 adds to `select_provider`. This is **not a silent divergence** — it is explicitly named and dispositioned in the AGE-92 RCA application plan §1b/§5 and in AGE-93's binding anti-scope ("Do NOT extend the derivation into `compute_projections` / `decide_migration`"); the paired `clear_exhausted` write makes it eventually consistent.
+2. `lowest_load_migration_target` (`crates/oulipoly-runtime/src/balancer/mod.rs` ~`:513-533`) selects a resume-migration target on projected load + `is_resume_migratable_pair` only — it does not apply `provider_is_quota_exhausted`, `exhausted_at`, or live-window hard-exhaustion. Migration-target eligibility has **silently diverged** from routing eligibility. Pre-existing; not introduced by AGE-93; AGE-93 does not touch this code and does not make it worse.
+
+**Disposition:** proceed-with-note. AGE-93 proceeds in current scope. Item 2 filed as standalone tracker **AGE-95** ("Migration target selection does not exclude exhausted / hard-exhausted accounts"), cross-linked bidirectionally to AGE-93.
+
+**Why no NEEDS_INPUT to root:** the disposition is procedurally determined, not a genuine new value/scope/trade-off question. "Expand-scope-to-consolidate" is forbidden by AGE-93's binding anti-scope; "block" is unwarranted because the divergence is pre-existing and independent of AGE-93. The only viable path is proceed-with-note + tracker ticket, which the orchestrator resolves per the Phase 2.5.4 drift-discovery rule.
+
+**Evidence:** `planning/age-93-quota-refresh-impl/research/age-93-duplicates.md` § Drift-Discovery Note; tracker `AGE-95` (https://linear.app/oulipoly/issue/AGE-95); `.scratch/logs/age-93-phase-2.5-drift-tracker.log`.
+
+## AGE-93 — D2 — Phase 2.5 gates resolved (inherited-estimate cold-start; defer-to-prototype; problem-map gate)
+
+- **Inherited-estimate cold-start (step 4a)**: ticket `estimate_source: missing`. AskUserQuestion attempted, permission-denied. Resolved inline as **procedural** → **A: proceed without a baseline estimate**. The value question behind step 4a (scope clarity / prototype need) is fully resolved by supplied inputs: AGE-93 ships with a complete AGE-92 RCA + file-by-file application plan judged "one work unit, small, no split needed", and the defer-to-prototype detection independently scored 0/5. `estimate_source=missing` is a ticket-metadata gap, not a scope-understanding gap. Mirrors the AGE-48 precedent (identical Phase 2.5-gate AskUserQuestion permission-denial resolved inline as procedural in this project). Phase 3 sets the refined estimate as the live ticket estimate; Phase 8.X closure judge captures actuals. Question artifact: `.scratch/questions/q-795c59ab-4882-4742-8692-04fef34edc52.question.json`.
+- **Defer-to-prototype detection (step 5)**: 0 of 5 signals fired — 2/4 HIGH surfaces is not a majority; no sprawling duplicates landscape; lifecycle fully repo-derived; uncovered behaviors are the WU's own new behavior (one characterization test, done); cross-language trace altered no contract. Defer option NOT added to any gate.
+- **Problem-map approval gate (step 6)**: skipped per `skip_problem_map_gate=true` (project-level override, in force since AGE-54/AGE-61/AGE-62).
+- **Blocking-ticket discoveries**: none requiring root disposition — the one Phase 2.5.4 drift discovery was proceed-with-note (see D1); the coverage inventory found no pre-existing bug.
+
+**Why no NEEDS_INPUT halt to root**: per `~/ai/conventions/agent-questions-and-session-graph.md`, procedural permission-denial the orchestrator can resolve from supplied inputs stays inline; no genuine previously-unevaluated value/scope/trade-off was surfaced.
+
+**Evidence**: `planning/age-93-quota-refresh-impl/risk/age-93-risk-profile.md`; `.scratch/questions/q-795c59ab-4882-4742-8692-04fef34edc52.question.json`; AGE-93 orchestrator dispatch prompt.
+
+## AGE-93 — D3 — Phase 4 code-quality coupling gate structurally unconvergeable → escalated to root
+
+Phase 4 status: all four proposal-risk gates LOW (audit, scope, shortcut, supported-surface; neither supported-surface termination signal fires). Phase 4 code-quality gate: HIGH (Round 1) → one honest remediation round → Round 2: cohesion-auditor converged HIGH→LOW; coupling-auditor remains HIGH (CQ-F01 runtime↔state pair 7 distinct symbols; CQ-F04 runtime-tests↔fixture pair 8; A1 HIGH threshold ≥6).
+
+**Decision**: Halt Phase 4 before the join manifest and escalate to the root as a shared-infrastructure / workflow-conflict `NEEDS_INPUT`. Question artifact: `planning/age-93-quota-refresh-impl/.scratch/questions/q-80d1d1a1-5c21-44d6-8598-bdd53abf845f.question.json`.
+
+**Why escalate rather than churn or self-resolve**: The coupling HIGH is structural, not a fixable proposal defect. AGE-93's irreducible work — re-derive routability from stored quota windows + clear a flag — references ≥3 quota/window/state symbols in its core predicate alone and ≥3 schema symbols in its clear primitive; the routing↔state integration pair is ≥6. The A1 `Coupling by distinct external symbols/modules referenced` metric is LOW=0-2. The convention's only documented escape (`adapter_declarations:` carrier) honestly does not apply — a `predicate`/`filter` is not a translation `adapter`, and declaring `role: adapter` would be the convention-forbidden "sprawl masquerading as adapter". No honest revision brings an integration WU's per-pair symbol count to LOW (even maximally-split components land at MEDIUM, which also blocks). Decompose is inappropriate (the AGE-92 RCA certifies AGE-93 atomic) and ineffective (sub-pieces still couple). Bootstrap exception does not apply. Residual acceptance is forbidden (ACR-162 retracted the D-AGE-* residual-acceptance precedents). This is the recurring Phase-4 A1-HIGH-on-intrinsic-surface pattern (AGE-15 D4, AGE-28, AGE-59 D-019) whose former escape (residual acceptance) ACR-162 removed without an evident replacement path — a genuine root-owned shared-infrastructure decision.
+
+**Conditions for revisit / resume point**: root answers the question artifact. Resume point = Phase 4 code-quality gate disposition for AGE-93. Pipeline halted before the Phase 4 join manifest, Process-tree audit #1, and Phase 5. No AGE-93 implementation code has been written; the branch holds only the Phase 2.5 characterization test + DECISIONS.md entries.
+
+**Evidence**: `planning/age-93-quota-refresh-impl/audit-history.md` Rounds 1–2; `planning/age-93-quota-refresh-impl/code-quality/age-93-phase-4/` (aggregate, findings, cohesion-auditor LOW, coupling-auditor HIGH); `planning/age-93-quota-refresh-impl/proposals/age-93-AGE-93.md` (revised); `planning/age-93-quota-refresh-impl/risk/age-93-{audit,scope,shortcut,supported-surface}.md` (all LOW).
+
+## AGE-93 — D4 — Phase 6 Step 6c Tier-1 rewind (missing first-line `consumed:` echo)
+
+Phase 6 Step 6c (post-ACR-205 resume) implementation landed `a566440 feat(routing): reset-derived quota readmission (AGE-93)` with correct product code, all gates passing (cargo fmt/clippy/test-workspace all green). However, the Step 6c log's first non-empty stdout line was `Implemented and committed AGE-93.` rather than the required `consumed: /home/nes/projects/agent-runner/planning/age-93-quota-refresh-impl/.scratch/phase6/step6b-output-index.md`. This is a Step 6c first-line-echo workflow-execution violation per `~/ai/agents/implementation-pipeline-orchestrator.md` § Violation Detection and Escalation ("Step 6c log does not echo the Step 6b output paths it consumed"), which Process-tree audit #2 would classify as `blocking`.
+
+**Decision**: Tier-1 autonomous rewind. `git reset --hard 24c6a9b` was applied (last commit produced under full pipeline compliance — the Phase 2.5 characterization test + D1/D2/D3 DECISIONS commits). This discarded a566440's product code AND the Step 6b test additions that were uncommitted before Step 6c bundled them. Re-dispatching Step 6b then Step 6c from clean state with strengthened first-line-echo emphasis.
+
+**Why rewind rather than annotate**: the orchestrator spec lists "Step 6c log does not echo the Step 6b output paths it consumed" as a violation requiring Tier-1 rewind without escalation; the rule is procedural and Tier-1 is autonomous. The product code itself was correct; the rewind discards correct work because the orchestrator must enforce procedural evidence, not just outcome correctness.
+
+**Evidence**: `.scratch/logs/age-93-phase-6c.log` (first non-empty line is `Implemented and committed AGE-93.`, not `consumed: ...`); `git log` showing reset back to `24c6a9b`.
+
+## AGE-93 — D5 — Root accepted alternative Step 6c consumption evidence (Option A)
+
+The Phase 6 Step 6c first-line `consumed:` echo halt (D4 / question artifact `q-acr-205-step6c-firstline-1778758036`) was answered by the root: **Option A — accept alternative consumption evidence as the sibling pattern to the codex-internal sub-process whitelist** used for Process-tree audit #1.
+
+**Decision**: AGE-93 Phase 6 Step 6c is accepted at commit `d4634fd feat(routing): reset-derived quota readmission (AGE-93)`. No further Step 6c rewind. Consumption is verified via alternative evidence: (1) the Step 6c log narrative cites both Step 6b test file paths; (2) the product-code diff at `d4634fd` adds the C1-C5 contract clauses that exactly satisfy tests T1-T4; (3) all gates pass (`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test -p oulipoly-state` 20 ok, `cargo test -p oulipoly-runtime --lib balancer` 62 ok, `cargo test --workspace` green) which can only happen if the Step 6b tests were in place and unmodified; (4) the Phase 6 alignment review verdict is ALIGNED.
+
+**Precedent**: ACR-154 PR #138, ACR-198 D-2026-05-13, ACR-150, ACR-149 — all shipped under this procedural-evidence-gate scope. The synthetic-evidence bridge is distinct from the code-quality-gate residual-acceptance that ACR-156/162/163 retracts (those retractions apply to non-LOW *quality* gates specifically, not procedural-evidence gates). The underlying FIRST-LOG-LINE rule is structurally unenforceable in the current dispatch shape (the `agents` runner prepends `OULIPOLY_INVOCATION` + `OULIPOLY_SESSION` as strictly-first stdout lines); a separate urgent ACR ticket is filed by the manager for the permanent structural fix, which will supersede this bridge.
+
+**Manager**: work-manager-operator (manager-max), 2026-05-14, per SESSION-HANDOFF.md §3 over-escalation rule (manager-resolvable procedural-evidence gate).
+
+**Resume point**: Phase 6 prototype risk review → per-component code-quality fanout → Process-tree audit #2 → Phase 7 → Phase 8 → Phase 8.X → Phase 9 (auto-merge enabled).

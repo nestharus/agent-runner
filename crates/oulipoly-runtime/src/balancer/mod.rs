@@ -210,10 +210,18 @@ pub fn select_provider(
     }
     let all_indices: Vec<usize> = (0..n).collect();
     let now = Utc::now();
+    let reset_implied: Vec<bool> = all_indices
+        .iter()
+        .map(|i| reset_implied(quotas[*i].as_ref(), &windows[*i], now))
+        .collect();
+    clear_reset_implied_flags(state, model, &reset_implied);
     let filtered_indices: Vec<usize> = all_indices
         .iter()
         .copied()
-        .filter(|i| !provider_is_quota_exhausted(quotas[*i].as_ref(), &windows[*i], now))
+        .filter(|i| {
+            !provider_is_quota_exhausted(quotas[*i].as_ref(), &windows[*i], now)
+                || reset_implied[*i]
+        })
         .collect();
     if filtered_indices.is_empty() {
         return Err(RoutingError::AllProvidersQuotaExhausted {
@@ -312,6 +320,34 @@ fn provider_is_quota_exhausted(
         || windows
             .iter()
             .any(|window| window.resets_at > now && window.used_percent >= EXHAUSTED_USED_PERCENT)
+}
+
+fn reset_implied(
+    quota: Option<&QuotaRecord>,
+    windows: &[QuotaWindow],
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    quota
+        .and_then(|quota| quota.exhausted_at.as_ref())
+        .is_some()
+        && !windows.is_empty()
+        && windows.iter().all(|window| window.resets_at <= now)
+}
+
+fn clear_reset_implied_flags(state: &StateDb, model: &ModelConfig, reset_implied: &[bool]) {
+    for (provider, is_reset_implied) in model.providers.iter().zip(reset_implied.iter()) {
+        if !*is_reset_implied {
+            continue;
+        }
+
+        if let Err(error) = state.clear_exhausted(&provider.name) {
+            tracing::warn!(
+                provider_name = provider.name.as_str(),
+                error = error.as_str(),
+                "failed to clear reset-implied quota exhaustion flag"
+            );
+        }
+    }
 }
 
 fn compute_projections_from_records(
@@ -1123,6 +1159,51 @@ mod tests {
     }
 
     #[test]
+    fn select_provider_readmits_exhausted_account_when_all_windows_elapsed() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = two_provider_model();
+
+        seed_windows_with_deltas(&db, "a", &[(1.0, -1, 0.01, 22), (0.80, -2, 0.30, 22)]);
+        db.mark_exhausted("a").unwrap();
+
+        assert_eq!(selected_provider_index(&model, &db), 0);
+        assert_eq!(db.get_quota("a").unwrap().unwrap().exhausted_at, None);
+    }
+
+    #[test]
+    fn select_provider_keeps_exhausted_account_excluded_while_a_window_is_live() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = two_provider_model();
+
+        seed_windows_with_deltas(&db, "a", &[(0.20, -1, 0.01, 22), (1.0, 5, 0.30, 22)]);
+        db.mark_exhausted("a").unwrap();
+
+        assert_eq!(selected_provider_index(&model, &db), 1);
+        assert!(db.get_quota("a").unwrap().unwrap().exhausted_at.is_some());
+    }
+
+    #[test]
+    fn select_provider_keeps_zero_window_exhausted_account_excluded() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = two_provider_model();
+
+        db.upsert_quota_refresh("a", &[]).unwrap();
+        db.mark_exhausted("a").unwrap();
+
+        assert_eq!(selected_provider_index(&model, &db), 1);
+        let err = select_provider(&single_provider_model(), &db, None).unwrap_err();
+        assert_eq!(
+            err,
+            RoutingError::AllProvidersQuotaExhausted {
+                model_name: "single".to_string(),
+                provider_names: vec!["a".to_string()],
+            },
+            "zero-window exhausted provider must be excluded from the eligible set"
+        );
+        assert!(db.get_quota("a").unwrap().unwrap().exhausted_at.is_some());
+    }
+
+    #[test]
     fn select_provider_hard_excludes_accounts_at_or_over_live_window_quota() {
         for target_window in [TestWindow::SevenDay, TestWindow::FiveHour] {
             for used in [0.0, 0.99] {
@@ -1159,6 +1240,16 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn select_provider_past_reset_window_at_quota_does_not_hard_exclude() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = single_provider_model();
+
+        seed_windows_with_deltas(&db, "a", &[(1.0, -1, 0.01, 22)]);
+
+        assert_eq!(selected_provider_index(&model, &db), 0);
     }
 
     #[test]
