@@ -2019,3 +2019,13 @@ Phase 4 status: all four proposal-risk gates LOW (audit, scope, shortcut, suppor
 **Conditions for revisit / resume point**: root answers the question artifact. Resume point = Phase 4 code-quality gate disposition for AGE-93. Pipeline halted before the Phase 4 join manifest, Process-tree audit #1, and Phase 5. No AGE-93 implementation code has been written; the branch holds only the Phase 2.5 characterization test + DECISIONS.md entries.
 
 **Evidence**: `planning/age-93-quota-refresh-impl/audit-history.md` Rounds 1–2; `planning/age-93-quota-refresh-impl/code-quality/age-93-phase-4/` (aggregate, findings, cohesion-auditor LOW, coupling-auditor HIGH); `planning/age-93-quota-refresh-impl/proposals/age-93-AGE-93.md` (revised); `planning/age-93-quota-refresh-impl/risk/age-93-{audit,scope,shortcut,supported-surface}.md` (all LOW).
+
+## AGE-93 — D4 — Phase 6 Step 6c Tier-1 rewind (missing first-line `consumed:` echo)
+
+Phase 6 Step 6c (post-ACR-205 resume) implementation landed `a566440 feat(routing): reset-derived quota readmission (AGE-93)` with correct product code, all gates passing (cargo fmt/clippy/test-workspace all green). However, the Step 6c log's first non-empty stdout line was `Implemented and committed AGE-93.` rather than the required `consumed: /home/nes/projects/agent-runner/planning/age-93-quota-refresh-impl/.scratch/phase6/step6b-output-index.md`. This is a Step 6c first-line-echo workflow-execution violation per `~/ai/agents/implementation-pipeline-orchestrator.md` § Violation Detection and Escalation ("Step 6c log does not echo the Step 6b output paths it consumed"), which Process-tree audit #2 would classify as `blocking`.
+
+**Decision**: Tier-1 autonomous rewind. `git reset --hard 24c6a9b` was applied (last commit produced under full pipeline compliance — the Phase 2.5 characterization test + D1/D2/D3 DECISIONS commits). This discarded a566440's product code AND the Step 6b test additions that were uncommitted before Step 6c bundled them. Re-dispatching Step 6b then Step 6c from clean state with strengthened first-line-echo emphasis.
+
+**Why rewind rather than annotate**: the orchestrator spec lists "Step 6c log does not echo the Step 6b output paths it consumed" as a violation requiring Tier-1 rewind without escalation; the rule is procedural and Tier-1 is autonomous. The product code itself was correct; the rewind discards correct work because the orchestrator must enforce procedural evidence, not just outcome correctness.
+
+**Evidence**: `.scratch/logs/age-93-phase-6c.log` (first non-empty line is `Implemented and committed AGE-93.`, not `consumed: ...`); `git log` showing reset back to `24c6a9b`.
