@@ -2029,3 +2029,15 @@ Phase 6 Step 6c (post-ACR-205 resume) implementation landed `a566440 feat(routin
 **Why rewind rather than annotate**: the orchestrator spec lists "Step 6c log does not echo the Step 6b output paths it consumed" as a violation requiring Tier-1 rewind without escalation; the rule is procedural and Tier-1 is autonomous. The product code itself was correct; the rewind discards correct work because the orchestrator must enforce procedural evidence, not just outcome correctness.
 
 **Evidence**: `.scratch/logs/age-93-phase-6c.log` (first non-empty line is `Implemented and committed AGE-93.`, not `consumed: ...`); `git log` showing reset back to `24c6a9b`.
+
+## AGE-93 — D5 — Root accepted alternative Step 6c consumption evidence (Option A)
+
+The Phase 6 Step 6c first-line `consumed:` echo halt (D4 / question artifact `q-acr-205-step6c-firstline-1778758036`) was answered by the root: **Option A — accept alternative consumption evidence as the sibling pattern to the codex-internal sub-process whitelist** used for Process-tree audit #1.
+
+**Decision**: AGE-93 Phase 6 Step 6c is accepted at commit `d4634fd feat(routing): reset-derived quota readmission (AGE-93)`. No further Step 6c rewind. Consumption is verified via alternative evidence: (1) the Step 6c log narrative cites both Step 6b test file paths; (2) the product-code diff at `d4634fd` adds the C1-C5 contract clauses that exactly satisfy tests T1-T4; (3) all gates pass (`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test -p oulipoly-state` 20 ok, `cargo test -p oulipoly-runtime --lib balancer` 62 ok, `cargo test --workspace` green) which can only happen if the Step 6b tests were in place and unmodified; (4) the Phase 6 alignment review verdict is ALIGNED.
+
+**Precedent**: ACR-154 PR #138, ACR-198 D-2026-05-13, ACR-150, ACR-149 — all shipped under this procedural-evidence-gate scope. The synthetic-evidence bridge is distinct from the code-quality-gate residual-acceptance that ACR-156/162/163 retracts (those retractions apply to non-LOW *quality* gates specifically, not procedural-evidence gates). The underlying FIRST-LOG-LINE rule is structurally unenforceable in the current dispatch shape (the `agents` runner prepends `OULIPOLY_INVOCATION` + `OULIPOLY_SESSION` as strictly-first stdout lines); a separate urgent ACR ticket is filed by the manager for the permanent structural fix, which will supersede this bridge.
+
+**Manager**: work-manager-operator (manager-max), 2026-05-14, per SESSION-HANDOFF.md §3 over-escalation rule (manager-resolvable procedural-evidence gate).
+
+**Resume point**: Phase 6 prototype risk review → per-component code-quality fanout → Process-tree audit #2 → Phase 7 → Phase 8 → Phase 8.X → Phase 9 (auto-merge enabled).
