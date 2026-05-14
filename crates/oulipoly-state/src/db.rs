@@ -2539,6 +2539,16 @@ impl StateDb {
         Ok(())
     }
 
+    pub fn clear_exhausted(&self, provider_name: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE provider_quotas SET exhausted_at = NULL WHERE provider_name = ?1",
+                params![provider_name],
+            )
+            .map_err(|e| format!("Failed to clear provider exhausted flag: {e}"))?;
+        Ok(())
+    }
+
     /// Fetch every rolling-quota window a provider has reported, ordered by
     /// `window_id`. Empty vec if the provider has never been refreshed.
     pub fn get_windows(&self, provider_name: &str) -> Result<Vec<QuotaWindow>, String> {
@@ -5017,6 +5027,23 @@ mod tests {
             exhausted >= before - chrono::Duration::seconds(1)
                 && exhausted <= after + chrono::Duration::seconds(1)
         );
+    }
+
+    #[test]
+    fn clear_exhausted_nulls_the_flag() {
+        let db = test_db();
+        let provider = "a";
+
+        db.mark_exhausted(provider).unwrap();
+        assert!(exhausted_at_raw(&db, provider).is_some());
+
+        db.clear_exhausted(provider).unwrap();
+        assert_eq!(exhausted_at_raw(&db, provider), None);
+
+        db.clear_exhausted(provider).unwrap();
+        assert_eq!(exhausted_at_raw(&db, provider), None);
+
+        db.clear_exhausted("nonexistent-provider").unwrap();
     }
 
     #[test]
