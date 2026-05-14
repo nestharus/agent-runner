@@ -1983,3 +1983,16 @@ Implementation changes (folded into the squashed AGE-15 feature commit via `git 
 - Process-tree audit #3 report: `planning/age-15-usage-flag/risk/phase-8-process-tree-audit.md`.
 - Phase 8 join manifest: `planning/age-15-usage-flag/risk/phase-8-join-manifest.json`.
 - Precedents: `D-AGE-8-Phase-8` (this DECISIONS file, ~line 614), `AGE-34 — Phase 4 process-tree-audit substitution` (~line 819), `D-AGE-33` (project audit-history record).
+
+## AGE-93 — D1 — Phase 2.5.4 migration-target drift accepted as residual; tracker AGE-95 filed
+
+Phase 2.5 duplicate-systems inventory surfaced two drift items on the touched surface:
+
+1. `decide_migration` is a second direct `exhausted_at` reader that does not re-run the reset derivation AGE-93 adds to `select_provider`. This is **not a silent divergence** — it is explicitly named and dispositioned in the AGE-92 RCA application plan §1b/§5 and in AGE-93's binding anti-scope ("Do NOT extend the derivation into `compute_projections` / `decide_migration`"); the paired `clear_exhausted` write makes it eventually consistent.
+2. `lowest_load_migration_target` (`crates/oulipoly-runtime/src/balancer/mod.rs` ~`:513-533`) selects a resume-migration target on projected load + `is_resume_migratable_pair` only — it does not apply `provider_is_quota_exhausted`, `exhausted_at`, or live-window hard-exhaustion. Migration-target eligibility has **silently diverged** from routing eligibility. Pre-existing; not introduced by AGE-93; AGE-93 does not touch this code and does not make it worse.
+
+**Disposition:** proceed-with-note. AGE-93 proceeds in current scope. Item 2 filed as standalone tracker **AGE-95** ("Migration target selection does not exclude exhausted / hard-exhausted accounts"), cross-linked bidirectionally to AGE-93.
+
+**Why no NEEDS_INPUT to root:** the disposition is procedurally determined, not a genuine new value/scope/trade-off question. "Expand-scope-to-consolidate" is forbidden by AGE-93's binding anti-scope; "block" is unwarranted because the divergence is pre-existing and independent of AGE-93. The only viable path is proceed-with-note + tracker ticket, which the orchestrator resolves per the Phase 2.5.4 drift-discovery rule.
+
+**Evidence:** `planning/age-93-quota-refresh-impl/research/age-93-duplicates.md` § Drift-Discovery Note; tracker `AGE-95` (https://linear.app/oulipoly/issue/AGE-95); `.scratch/logs/age-93-phase-2.5-drift-tracker.log`.
