@@ -212,25 +212,9 @@ pub fn select_provider(
     let now = Utc::now();
     let reset_implied: Vec<bool> = all_indices
         .iter()
-        .map(|i| {
-            let has_exhausted_flag = quotas[*i]
-                .as_ref()
-                .and_then(|quota| quota.exhausted_at.as_ref())
-                .is_some();
-            has_exhausted_flag
-                && !windows[*i].is_empty()
-                && windows[*i].iter().all(|window| window.resets_at <= now)
-        })
+        .map(|i| reset_implied(quotas[*i].as_ref(), &windows[*i], now))
         .collect();
-    for i in all_indices.iter().copied().filter(|i| reset_implied[*i]) {
-        if let Err(error) = state.clear_exhausted(&model.providers[i].name) {
-            tracing::warn!(
-                provider_name = model.providers[i].name.as_str(),
-                error = error.as_str(),
-                "failed to clear reset-implied quota exhaustion flag"
-            );
-        }
-    }
+    clear_reset_implied_flags(state, model, &reset_implied);
     let filtered_indices: Vec<usize> = all_indices
         .iter()
         .copied()
@@ -336,6 +320,34 @@ fn provider_is_quota_exhausted(
         || windows
             .iter()
             .any(|window| window.resets_at > now && window.used_percent >= EXHAUSTED_USED_PERCENT)
+}
+
+fn reset_implied(
+    quota: Option<&QuotaRecord>,
+    windows: &[QuotaWindow],
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    quota
+        .and_then(|quota| quota.exhausted_at.as_ref())
+        .is_some()
+        && !windows.is_empty()
+        && windows.iter().all(|window| window.resets_at <= now)
+}
+
+fn clear_reset_implied_flags(state: &StateDb, model: &ModelConfig, reset_implied: &[bool]) {
+    for (provider, is_reset_implied) in model.providers.iter().zip(reset_implied.iter()) {
+        if !*is_reset_implied {
+            continue;
+        }
+
+        if let Err(error) = state.clear_exhausted(&provider.name) {
+            tracing::warn!(
+                provider_name = provider.name.as_str(),
+                error = error.as_str(),
+                "failed to clear reset-implied quota exhaustion flag"
+            );
+        }
+    }
 }
 
 fn compute_projections_from_records(
