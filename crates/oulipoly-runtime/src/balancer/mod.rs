@@ -1162,6 +1162,16 @@ mod tests {
     }
 
     #[test]
+    fn select_provider_past_reset_window_at_quota_does_not_hard_exclude() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = single_provider_model();
+
+        seed_windows_with_deltas(&db, "a", &[(1.0, -1, 0.01, 22)]);
+
+        assert_eq!(selected_provider_index(&model, &db), 0);
+    }
+
+    #[test]
     fn select_provider_errors_when_single_account_is_at_or_over_quota() {
         for target_window in [TestWindow::SevenDay, TestWindow::FiveHour] {
             for used in [1.0, 1.5] {
