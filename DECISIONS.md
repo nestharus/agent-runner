@@ -1996,3 +1996,14 @@ Phase 2.5 duplicate-systems inventory surfaced two drift items on the touched su
 **Why no NEEDS_INPUT to root:** the disposition is procedurally determined, not a genuine new value/scope/trade-off question. "Expand-scope-to-consolidate" is forbidden by AGE-93's binding anti-scope; "block" is unwarranted because the divergence is pre-existing and independent of AGE-93. The only viable path is proceed-with-note + tracker ticket, which the orchestrator resolves per the Phase 2.5.4 drift-discovery rule.
 
 **Evidence:** `planning/age-93-quota-refresh-impl/research/age-93-duplicates.md` § Drift-Discovery Note; tracker `AGE-95` (https://linear.app/oulipoly/issue/AGE-95); `.scratch/logs/age-93-phase-2.5-drift-tracker.log`.
+
+## AGE-93 — D2 — Phase 2.5 gates resolved (inherited-estimate cold-start; defer-to-prototype; problem-map gate)
+
+- **Inherited-estimate cold-start (step 4a)**: ticket `estimate_source: missing`. AskUserQuestion attempted, permission-denied. Resolved inline as **procedural** → **A: proceed without a baseline estimate**. The value question behind step 4a (scope clarity / prototype need) is fully resolved by supplied inputs: AGE-93 ships with a complete AGE-92 RCA + file-by-file application plan judged "one work unit, small, no split needed", and the defer-to-prototype detection independently scored 0/5. `estimate_source=missing` is a ticket-metadata gap, not a scope-understanding gap. Mirrors the AGE-48 precedent (identical Phase 2.5-gate AskUserQuestion permission-denial resolved inline as procedural in this project). Phase 3 sets the refined estimate as the live ticket estimate; Phase 8.X closure judge captures actuals. Question artifact: `.scratch/questions/q-795c59ab-4882-4742-8692-04fef34edc52.question.json`.
+- **Defer-to-prototype detection (step 5)**: 0 of 5 signals fired — 2/4 HIGH surfaces is not a majority; no sprawling duplicates landscape; lifecycle fully repo-derived; uncovered behaviors are the WU's own new behavior (one characterization test, done); cross-language trace altered no contract. Defer option NOT added to any gate.
+- **Problem-map approval gate (step 6)**: skipped per `skip_problem_map_gate=true` (project-level override, in force since AGE-54/AGE-61/AGE-62).
+- **Blocking-ticket discoveries**: none requiring root disposition — the one Phase 2.5.4 drift discovery was proceed-with-note (see D1); the coverage inventory found no pre-existing bug.
+
+**Why no NEEDS_INPUT halt to root**: per `~/ai/conventions/agent-questions-and-session-graph.md`, procedural permission-denial the orchestrator can resolve from supplied inputs stays inline; no genuine previously-unevaluated value/scope/trade-off was surfaced.
+
+**Evidence**: `planning/age-93-quota-refresh-impl/risk/age-93-risk-profile.md`; `.scratch/questions/q-795c59ab-4882-4742-8692-04fef34edc52.question.json`; AGE-93 orchestrator dispatch prompt.
