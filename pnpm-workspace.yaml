@@ -1,0 +1,19 @@
+# Supply-chain hardening: refuse to install package versions published less
+# than 7 days ago, so a malicious publish has time to be detected and yanked
+# before it reaches our build. Value is in minutes (7 d × 24 h × 60 min).
+#
+# History: this control was added in response to the 2025-09 / 2026 npm
+# supply-chain wave (Shai-Hulud, chalk/debug crypto-theft, etc.) and is
+# applied symmetrically across rfq/frontend (PR #764) and rfq/backend uv
+# (PR #765). agent-runner uses the same model on the JS side.
+#
+# Note on Rust deps: there is no native equivalent for crates.io. cargo-vet
+# and cargo-deny are the closest analogs (advisory + license/source gating)
+# but neither is a publish-age gate. Track separately if a Rust-side
+# control becomes necessary.
+minimumReleaseAge: 10080
+
+# Per-package overrides: these names bypass the cooldown. Keep this list as
+# small as possible; only add entries when a legitimate update is genuinely
+# blocked by the cooldown AND the publisher is trusted enough to override.
+minimumReleaseAgeExclude: []

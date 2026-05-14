@@ -21,7 +21,6 @@ Thumbs.db
 # Secrets & auth
 .env
 .env.*
-.npmrc
 *.key
 *.pem
 *.secret
