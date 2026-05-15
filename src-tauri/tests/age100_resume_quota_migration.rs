@@ -1,0 +1,600 @@
+#![cfg(unix)]
+
+use oulipoly_state::{InvocationStatus, StateDb};
+use rusqlite::{Connection, params};
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+const SESSION_ID: &str = "5169694d-de0f-40d1-890c-6e28e55bab27";
+const CHAIN_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+struct ResumeProviderFixture<'a> {
+    name: &'a str,
+    body: &'a str,
+}
+
+struct Fixture {
+    dir: tempfile::TempDir,
+    config_home: PathBuf,
+    data_home: PathBuf,
+    app_config_dir: PathBuf,
+    models_dir: PathBuf,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let config_home = dir.path().join("config");
+        let data_home = dir.path().join("data");
+        let app_config_dir = config_home.join("oulipoly-agent-runner");
+        let models_dir = app_config_dir.join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+
+        Self {
+            dir,
+            config_home,
+            data_home,
+            app_config_dir,
+            models_dir,
+        }
+    }
+
+    fn db_path(&self) -> PathBuf {
+        self.data_home
+            .join("oulipoly-agent-runner")
+            .join("state.db")
+    }
+
+    fn open_db(&self) -> StateDb {
+        StateDb::open(&self.db_path()).unwrap()
+    }
+
+    fn conn(&self) -> Connection {
+        let _ = self.open_db();
+        Connection::open(self.db_path()).unwrap()
+    }
+
+    fn write_script(&self, name: &str, body: &str) -> PathBuf {
+        let path = self.dir.path().join(name);
+        fs::write(
+            &path,
+            format!("#!/usr/bin/env bash\nset -euo pipefail\n{body}\n"),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    fn write_resume_pool(
+        &self,
+        model_name: &str,
+        providers: &[ResumeProviderFixture<'_>],
+        use_heuristic_diagnostics: bool,
+    ) {
+        let mut model = String::new();
+        for provider in providers {
+            model.push_str(&format!(
+                r#"[[providers]]
+name = "{}"
+args = ["exec-{}"]
+
+"#,
+                provider.name, provider.name
+            ));
+        }
+        fs::write(self.models_dir.join(format!("{model_name}.toml")), model).unwrap();
+
+        fs::write(
+            self.models_dir.join("diagnostic.toml"),
+            r#"[[providers]]
+name = "diagnostic-provider"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            self.app_config_dir.join("config.toml"),
+            r#"diagnostics_model = "diagnostic"
+"#,
+        )
+        .unwrap();
+
+        let mut providers_toml = String::new();
+        for provider in providers {
+            let command = self.write_script(&format!("{}-resume.sh", provider.name), provider.body);
+            let projects_dir = self.provider_projects_dir(provider.name);
+            providers_toml.push_str(&format!(
+                r#"[{}]
+command = {}
+args = []
+interactive_args = ["launch-{}"]
+prompt_mode = "arg"
+
+[{}.resume]
+kind = "flag"
+flag = "--resume"
+
+[{}.session_storage]
+kind = "claude_code"
+projects_dir = {}
+
+"#,
+                provider.name,
+                toml_string(&command.display().to_string()),
+                provider.name,
+                provider.name,
+                provider.name,
+                toml_string(&projects_dir.display().to_string())
+            ));
+        }
+
+        let diagnostic_body = if use_heuristic_diagnostics {
+            "cat >/dev/null\nexit 9"
+        } else {
+            "cat >/dev/null\nprintf '%s\\n' 'quota_exhausted' 'Diagnostic model saw exhausted quota'"
+        };
+        let diagnostic_command = self.write_script("diagnostic-provider.sh", diagnostic_body);
+        providers_toml.push_str(&format!(
+            r#"[diagnostic-provider]
+command = {}
+args = []
+prompt_mode = "stdin"
+"#,
+            toml_string(&diagnostic_command.display().to_string())
+        ));
+        fs::write(self.app_config_dir.join("providers.toml"), providers_toml).unwrap();
+    }
+
+    fn provider_projects_dir(&self, provider: &str) -> PathBuf {
+        self.dir.path().join(format!("{provider}-projects"))
+    }
+
+    fn stage_active_claude_jsonl(&self, provider: &str) {
+        let source_dir = self.provider_projects_dir(provider).join("source-project");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::write(
+            source_dir.join(format!("{SESSION_ID}.jsonl")),
+            format!(
+                r#"{{"sessionId":"{SESSION_ID}","turnId":"turn-1","timestamp":"2026-04-17T08:00:00Z","type":"assistant"}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fn seed_active_chain(&self, provider: &str, model: &str) {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
+             VALUES (?1, '2026-04-17T08:00:00Z', '2026-04-17T08:00:00Z', ?2)",
+            params![CHAIN_ID, model],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_chain_segments
+                (chain_id, provider_name, session_id, started_at, transition_reason)
+             VALUES (?1, ?2, ?3, '2026-04-17T08:00:00Z', 'initial')",
+            params![CHAIN_ID, provider, SESSION_ID],
+        )
+        .unwrap();
+    }
+
+    fn run_resume(&self, model_name: &str) -> Output {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+        cmd.arg("-m")
+            .arg(model_name)
+            .arg("--resume")
+            .arg(SESSION_ID)
+            .arg("--models-dir")
+            .arg(&self.models_dir)
+            .arg("continue after quota");
+        cmd.current_dir(self.dir.path());
+        cmd.env("XDG_CONFIG_HOME", &self.config_home);
+        cmd.env("XDG_DATA_HOME", &self.data_home);
+        cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+        cmd.output().unwrap()
+    }
+
+    fn active_segment_provider(&self) -> String {
+        self.conn()
+            .query_row(
+                "SELECT provider_name
+                 FROM session_chain_segments
+                 WHERE chain_id = ?1 AND ended_at IS NULL",
+                params![CHAIN_ID],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn exhausted_row_count(&self, provider: &str) -> i64 {
+        self.conn()
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM provider_quotas
+                 WHERE provider_name = ?1 AND exhausted_at IS NOT NULL",
+                params![provider],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn failed_quota_invocation_count(&self, provider: &str) -> i64 {
+        self.conn()
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM invocations
+                 WHERE provider_name = ?1
+                    AND status = ?2
+                    AND success = 0
+                    AND error_category = 'quota_exhausted'
+                    AND finished_at IS NOT NULL",
+                params![provider, InvocationStatus::Failed.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn exhausted_provider_count(&self) -> i64 {
+        self.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM provider_quotas WHERE exhausted_at IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+}
+
+fn toml_string(value: &str) -> String {
+    format!("{value:?}")
+}
+
+fn provider_body(marker: &Path, shell: &str) -> String {
+    format!(
+        "printf '%s\\n' ran >> {}\n{shell}",
+        toml_string(&marker.display().to_string())
+    )
+}
+
+fn line_count(path: &Path) -> usize {
+    fs::read_to_string(path)
+        .map(|content| content.lines().count())
+        .unwrap_or(0)
+}
+
+fn assert_ordered(stderr: &str, first: &str, second: &str) {
+    let first_index = stderr
+        .find(first)
+        .unwrap_or_else(|| panic!("missing first marker {first:?} in stderr:\n{stderr}"));
+    let second_index = stderr
+        .find(second)
+        .unwrap_or_else(|| panic!("missing second marker {second:?} in stderr:\n{stderr}"));
+    assert!(
+        first_index < second_index,
+        "expected {first:?} before {second:?} in stderr:\n{stderr}"
+    );
+}
+
+fn seed_base_resume_fixture(
+    providers: &[(&str, &Path, String)],
+    use_heuristic_diagnostics: bool,
+) -> Fixture {
+    let fixture = Fixture::new();
+    let resume_providers: Vec<_> = providers
+        .iter()
+        .map(|(name, _marker, body)| ResumeProviderFixture {
+            name,
+            body: body.as_str(),
+        })
+        .collect();
+    fixture.write_resume_pool(
+        "age100-resume",
+        &resume_providers,
+        use_heuristic_diagnostics,
+    );
+    fixture.stage_active_claude_jsonl(providers[0].0);
+    fixture.seed_active_chain(providers[0].0, "age100-resume");
+    fixture
+}
+
+#[test]
+fn resume_quota_exhausted_marks_provider_and_migrates_to_next_pool_member() {
+    let first_marker = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+    let sibling_marker = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+    let first_marker = first_marker.to_path_buf();
+    let sibling_marker = sibling_marker.to_path_buf();
+    let _ = fs::remove_file(&first_marker);
+    let _ = fs::remove_file(&sibling_marker);
+    let first_body = provider_body(
+        &first_marker,
+        "printf '%s\\n' 'quota exhausted for active resume provider' >&2\nexit 42",
+    );
+    let sibling_body = provider_body(
+        &sibling_marker,
+        "printf '%s\\n' 'sibling resume stdout'\nexit 0",
+    );
+    let fixture = seed_base_resume_fixture(
+        &[
+            ("claude-a", &first_marker, first_body),
+            ("claude-b", &sibling_marker, sibling_body),
+        ],
+        true,
+    );
+
+    let output = fixture.run_resume("age100-resume");
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "sibling resume stdout\n"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "[routing] provider claude-a returned quota_exhausted; retrying another provider"
+        ),
+        "{stderr}"
+    );
+    assert_eq!(fixture.exhausted_row_count("claude-a"), 1);
+    assert_eq!(fixture.exhausted_row_count("claude-b"), 0);
+    assert_eq!(line_count(&first_marker), 1);
+    assert_eq!(line_count(&sibling_marker), 1);
+    assert_eq!(fixture.failed_quota_invocation_count("claude-a"), 1);
+    assert_eq!(fixture.active_segment_provider(), "claude-b");
+}
+
+#[test]
+fn resume_retries_n_minus_one_quota_exhausted_providers_then_succeeds() {
+    let markers: Vec<PathBuf> = (0..3)
+        .map(|index| {
+            let path = std::env::temp_dir().join(format!(
+                "age100-resume-n-minus-one-{index}-{}.txt",
+                uuid::Uuid::new_v4()
+            ));
+            let _ = fs::remove_file(&path);
+            path
+        })
+        .collect();
+    let first_body = provider_body(
+        &markers[0],
+        "printf '%s\\n' 'quota exhausted for provider a' >&2\nexit 42",
+    );
+    let second_body = provider_body(
+        &markers[1],
+        "printf '%s\\n' 'quota exhausted for provider b' >&2\nexit 43",
+    );
+    let third_body = provider_body(&markers[2], "printf '%s\\n' 'third resume stdout'\nexit 0");
+    let fixture = seed_base_resume_fixture(
+        &[
+            ("claude-a", &markers[0], first_body),
+            ("claude-b", &markers[1], second_body),
+            ("claude-c", &markers[2], third_body),
+        ],
+        true,
+    );
+
+    let output = fixture.run_resume("age100-resume");
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "third resume stdout\n"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr
+            .matches("returned quota_exhausted; retrying another provider")
+            .count(),
+        2,
+        "{stderr}"
+    );
+    assert_eq!(fixture.exhausted_row_count("claude-a"), 1);
+    assert_eq!(fixture.exhausted_row_count("claude-b"), 1);
+    assert_eq!(fixture.exhausted_row_count("claude-c"), 0);
+    assert_eq!(fixture.exhausted_provider_count(), 2);
+    assert_eq!(line_count(&markers[0]), 1);
+    assert_eq!(line_count(&markers[1]), 1);
+    assert_eq!(line_count(&markers[2]), 1);
+    assert_eq!(fixture.failed_quota_invocation_count("claude-a"), 1);
+    assert_eq!(fixture.failed_quota_invocation_count("claude-b"), 1);
+    assert_eq!(fixture.active_segment_provider(), "claude-c");
+}
+
+#[test]
+fn resume_all_pool_members_quota_exhausted_returns_all_providers_exhausted() {
+    let markers: Vec<PathBuf> = (0..2)
+        .map(|index| {
+            let path = std::env::temp_dir().join(format!(
+                "age100-resume-all-exhausted-{index}-{}.txt",
+                uuid::Uuid::new_v4()
+            ));
+            let _ = fs::remove_file(&path);
+            path
+        })
+        .collect();
+    let first_body = provider_body(
+        &markers[0],
+        "printf '%s\\n' 'quota exhausted for provider a' >&2\nexit 42",
+    );
+    let second_body = provider_body(
+        &markers[1],
+        "printf '%s\\n' 'quota exhausted for provider b' >&2\nexit 43",
+    );
+    let fixture = seed_base_resume_fixture(
+        &[
+            ("claude-a", &markers[0], first_body),
+            ("claude-b", &markers[1], second_body),
+        ],
+        true,
+    );
+
+    let output = fixture.run_resume("age100-resume");
+
+    assert_ne!(output.status.code(), Some(0), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("BLOCKED:all-providers-exhausted"),
+        "{stderr}"
+    );
+    assert_eq!(line_count(&markers[0]), 1);
+    assert_eq!(line_count(&markers[1]), 1);
+    assert_eq!(fixture.exhausted_row_count("claude-a"), 1);
+    assert_eq!(fixture.exhausted_row_count("claude-b"), 1);
+    assert_eq!(fixture.exhausted_provider_count(), 2);
+    assert_eq!(fixture.failed_quota_invocation_count("claude-a"), 1);
+    assert_eq!(fixture.failed_quota_invocation_count("claude-b"), 1);
+}
+
+#[test]
+fn resume_non_quota_failure_does_not_migrate_or_mark_exhausted() {
+    let first_marker = std::env::temp_dir().join(format!(
+        "age100-resume-non-quota-a-{}.txt",
+        uuid::Uuid::new_v4()
+    ));
+    let sibling_marker = std::env::temp_dir().join(format!(
+        "age100-resume-non-quota-b-{}.txt",
+        uuid::Uuid::new_v4()
+    ));
+    let _ = fs::remove_file(&first_marker);
+    let _ = fs::remove_file(&sibling_marker);
+    let first_body = provider_body(
+        &first_marker,
+        "printf '%s\\n' 'connection refused for active resume provider' >&2\nexit 17",
+    );
+    let sibling_body = provider_body(
+        &sibling_marker,
+        "printf '%s\\n' 'sibling should not execute'\nexit 0",
+    );
+    let fixture = seed_base_resume_fixture(
+        &[
+            ("claude-a", &first_marker, first_body),
+            ("claude-b", &sibling_marker, sibling_body),
+        ],
+        true,
+    );
+
+    let output = fixture.run_resume("age100-resume");
+
+    assert_eq!(output.status.code(), Some(17), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("connection refused for active resume provider"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("[diagnostics: network_error]"), "{stderr}");
+    assert!(!stderr.contains("retrying another provider"), "{stderr}");
+    assert_eq!(line_count(&first_marker), 1);
+    assert_eq!(line_count(&sibling_marker), 0);
+    assert_eq!(fixture.exhausted_provider_count(), 0);
+    assert_eq!(fixture.active_segment_provider(), "claude-a");
+}
+
+#[test]
+fn resume_heuristic_stderr_quota_uses_same_path_as_diagnostic_model_quota() {
+    let heuristic_first_marker = std::env::temp_dir().join(format!(
+        "age100-resume-heuristic-a-{}.txt",
+        uuid::Uuid::new_v4()
+    ));
+    let heuristic_sibling_marker = std::env::temp_dir().join(format!(
+        "age100-resume-heuristic-b-{}.txt",
+        uuid::Uuid::new_v4()
+    ));
+    let _ = fs::remove_file(&heuristic_first_marker);
+    let _ = fs::remove_file(&heuristic_sibling_marker);
+    let heuristic_first_body = provider_body(
+        &heuristic_first_marker,
+        "printf '%s\\n' 'quota exhausted in heuristic stderr shape' >&2\nexit 42",
+    );
+    let heuristic_sibling_body = provider_body(
+        &heuristic_sibling_marker,
+        "printf '%s\\n' 'heuristic sibling stdout'\nexit 0",
+    );
+    let heuristic = seed_base_resume_fixture(
+        &[
+            ("claude-a", &heuristic_first_marker, heuristic_first_body),
+            (
+                "claude-b",
+                &heuristic_sibling_marker,
+                heuristic_sibling_body,
+            ),
+        ],
+        true,
+    );
+
+    let heuristic_output = heuristic.run_resume("age100-resume");
+
+    assert_eq!(
+        heuristic_output.status.code(),
+        Some(0),
+        "{heuristic_output:?}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&heuristic_output.stdout),
+        "heuristic sibling stdout\n"
+    );
+    let heuristic_stderr = String::from_utf8_lossy(&heuristic_output.stderr);
+    assert_ordered(
+        &heuristic_stderr,
+        "[diagnostics] quota_exhausted: Heuristic classification based on stderr content",
+        "[routing] provider claude-a returned quota_exhausted; retrying another provider",
+    );
+    assert_eq!(heuristic.exhausted_row_count("claude-a"), 1);
+    assert_eq!(heuristic.exhausted_row_count("claude-b"), 0);
+    assert_eq!(heuristic.failed_quota_invocation_count("claude-a"), 1);
+
+    let model_first_marker = std::env::temp_dir().join(format!(
+        "age100-resume-model-a-{}.txt",
+        uuid::Uuid::new_v4()
+    ));
+    let model_sibling_marker = std::env::temp_dir().join(format!(
+        "age100-resume-model-b-{}.txt",
+        uuid::Uuid::new_v4()
+    ));
+    let _ = fs::remove_file(&model_first_marker);
+    let _ = fs::remove_file(&model_sibling_marker);
+    let model_first_body = provider_body(
+        &model_first_marker,
+        "printf '%s\\n' 'opaque child failure requiring diagnostic model' >&2\nexit 44",
+    );
+    let model_sibling_body = provider_body(
+        &model_sibling_marker,
+        "printf '%s\\n' 'diagnostic sibling stdout'\nexit 0",
+    );
+    let model_backed = seed_base_resume_fixture(
+        &[
+            ("claude-a", &model_first_marker, model_first_body),
+            ("claude-b", &model_sibling_marker, model_sibling_body),
+        ],
+        false,
+    );
+
+    let model_output = model_backed.run_resume("age100-resume");
+
+    assert_eq!(model_output.status.code(), Some(0), "{model_output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&model_output.stdout),
+        "diagnostic sibling stdout\n"
+    );
+    let model_stderr = String::from_utf8_lossy(&model_output.stderr);
+    assert!(
+        model_stderr
+            .contains("[diagnostics] quota_exhausted: Diagnostic model saw exhausted quota"),
+        "{model_stderr}"
+    );
+    assert!(
+        model_stderr.contains(
+            "[routing] provider claude-a returned quota_exhausted; retrying another provider"
+        ),
+        "{model_stderr}"
+    );
+    assert_eq!(model_backed.exhausted_row_count("claude-a"), 1);
+    assert_eq!(model_backed.exhausted_row_count("claude-b"), 0);
+    assert_eq!(model_backed.failed_quota_invocation_count("claude-a"), 1);
+    assert_eq!(line_count(&model_first_marker), 1);
+    assert_eq!(line_count(&model_sibling_marker), 1);
+}

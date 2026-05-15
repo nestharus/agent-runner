@@ -1772,7 +1772,7 @@ fn run_resume(
                 return Ok(1);
             }
         };
-    let mut target = match resume_execution_target(&resolved, &providers_cfg) {
+    let initial_target = match resume_execution_target(&resolved, &providers_cfg) {
         Ok(target) => target,
         Err(err) => {
             eprintln!("{}", format_resume_error(err));
@@ -1783,11 +1783,10 @@ fn run_resume(
     if should_emit_resume_short_line(stderr_is_terminal) {
         eprintln!("[resume] -> {selected_provider}");
     }
-    if target.provider.resume.is_none() {
+    if initial_target.provider.resume.is_none() {
         eprintln!("provider {selected_provider} has no [providers.resume] block; cannot resume");
         return Ok(1);
     }
-    let migration_model = resume_migration_pool(&resolved, &providers_cfg);
     let effective_spawn_cwd = effective_resume_spawn_cwd(
         &state,
         &models,
@@ -1796,107 +1795,220 @@ fn run_resume(
         session_id,
         working_dir,
     )?;
-    let mut migration_stderr = std::io::stderr();
-    match agent_runtime_services
-        .migration_service
-        .migrate(MigrationServiceRequest {
-            state: &state,
-            sessions_cfg: &sessions_cfg,
-            resolved: &resolved,
-            manual_target: manual_migrate,
-            active_exhausted: false,
-            migration_model: &migration_model,
-            effective_cwd: &effective_spawn_cwd,
-            stderr: &mut migration_stderr,
-        }) {
-        Ok(MigrationServiceOutput::Migrated { segment: migrated }) => {
-            resolved.active_provider = migrated.target_provider.clone();
-            resolved.active_session_id = migrated.target_session_id.clone();
-            target = match resume_execution_target(&resolved, &providers_cfg) {
-                Ok(target) => target,
-                Err(err) => {
-                    eprintln!("{}", format_resume_error(err));
-                    return Ok(1);
-                }
-            };
-        }
-        Ok(MigrationServiceOutput::Stay) | Ok(MigrationServiceOutput::DecisionFailed { .. }) => {}
-        Err(ServiceError::Dependency { message }) => {
-            eprintln!("migration failed: {message}");
-            return Ok(1);
-        }
-        Err(err) => {
-            eprintln!("migration service failed: {err}");
-            return Ok(1);
-        }
-    }
-
-    let provider_index = target.provider_index;
-    let provider = target.provider;
-    let Some(strategy) = provider.resume.as_ref() else {
-        eprintln!(
-            "provider {} has no [providers.resume] block; cannot resume",
-            provider.name
-        );
-        return Ok(1);
-    };
-
     let parent_invocation_id = resolve_parent_invocation_id(&state);
-    let invocation_id = Uuid::new_v4().to_string();
-    let invocation = CompositeInvocationId {
-        source: provider.name.clone(),
-        id: invocation_id,
-    };
-    let invocation_model_name = resolved
-        .model_name
-        .clone()
-        .unwrap_or_else(|| "<unknown>".to_string());
-    let invocation_start = InvocationStart {
-        invocation_uuid: invocation.id.clone(),
-        model_name: invocation_model_name,
-        provider_name: provider.name.clone(),
-        provider_index,
-        parent_invocation_id,
-    };
-    let invocation_row_id = agent_runtime_services
-        .invocation_lifecycle_service
-        .start_invocation(InvocationLifecycleStartRequest {
-            state: &state,
-            start: &invocation_start,
-        })
-        .map_err(|err| err.to_string())?
-        .invocation_row_id;
-    let mut guard = FinalizerGuard::new(&state, invocation_row_id);
-    state.bind_invocation_provider_session_start(
-        invocation_row_id,
-        &oulipoly_state::ProviderSessionBinding {
-            provider_session_id: resolved.active_session_id.clone(),
-            capture_method: "resumed",
-            resume_input_id: Some(session_id.to_string()),
-        },
-    )?;
-    if manual_migrate.is_some() {
-        state.record_legacy_resume_input_session_id(invocation_row_id, session_id)?;
-    }
+    let max_attempts = resolved
+        .model
+        .as_ref()
+        .map(|model| model.providers.len())
+        .unwrap_or(1)
+        .max(1);
+    let mut attempts = 0usize;
+    let mut last_exit_code = 1;
 
-    let invocation_env = serde_json::to_string(&invocation)
-        .map_err(|e| format!("Failed to serialize invocation id: {e}"))?;
-    eprintln!("{}", invocation.stderr_line());
+    loop {
+        if attempts >= max_attempts {
+            eprintln!("BLOCKED:all-providers-exhausted");
+            return Ok(if last_exit_code == 0 {
+                1
+            } else {
+                last_exit_code
+            });
+        }
+        attempts += 1;
 
-    let result = match executor::cli::execute_resume(
-        &provider,
-        provider_index,
-        target.prompt_mode,
-        &answer,
-        Some(&effective_spawn_cwd),
-        Some(&invocation_env),
-        executor::cli::ResumePayload {
-            session_id: &resolved.active_session_id,
-            strategy,
-        },
-    ) {
-        Ok(result) => result,
-        Err(_spawn_err) => {
+        let mut target = match resume_execution_target(&resolved, &providers_cfg) {
+            Ok(target) => target,
+            Err(err) => {
+                eprintln!("{}", format_resume_error(err));
+                return Ok(1);
+            }
+        };
+        let mut migration_model = resume_migration_pool(&resolved, &providers_cfg);
+        if manual_migrate.is_none() || attempts > 1 {
+            migration_model.providers.retain(|provider| {
+                if provider.name == resolved.active_provider {
+                    return true;
+                }
+                state
+                    .get_quota(&provider.name)
+                    .map(|quota| {
+                        quota
+                            .and_then(|provider_quota| provider_quota.exhausted_at)
+                            .is_none()
+                    })
+                    .unwrap_or_else(|err| {
+                        eprintln!(
+                            "Warning: Failed to inspect quota state for {}: {err}",
+                            provider.name
+                        );
+                        true
+                    })
+            });
+        }
+        let mut migration_stderr = std::io::stderr();
+        match agent_runtime_services
+            .migration_service
+            .migrate(MigrationServiceRequest {
+                state: &state,
+                sessions_cfg: &sessions_cfg,
+                resolved: &resolved,
+                manual_target: if attempts == 1 { manual_migrate } else { None },
+                active_exhausted: false,
+                migration_model: &migration_model,
+                effective_cwd: &effective_spawn_cwd,
+                stderr: &mut migration_stderr,
+            }) {
+            Ok(MigrationServiceOutput::Migrated { segment: migrated }) => {
+                resolved.active_provider = migrated.target_provider.clone();
+                resolved.active_session_id = migrated.target_session_id.clone();
+                target = match resume_execution_target(&resolved, &providers_cfg) {
+                    Ok(target) => target,
+                    Err(err) => {
+                        eprintln!("{}", format_resume_error(err));
+                        return Ok(1);
+                    }
+                };
+            }
+            Ok(MigrationServiceOutput::Stay)
+            | Ok(MigrationServiceOutput::DecisionFailed { .. }) => {}
+            Err(ServiceError::Dependency { message }) => {
+                eprintln!("migration failed: {message}");
+                return Ok(1);
+            }
+            Err(err) => {
+                eprintln!("migration service failed: {err}");
+                return Ok(1);
+            }
+        }
+
+        let provider_index = target.provider_index;
+        let provider = target.provider;
+        let Some(strategy) = provider.resume.as_ref() else {
+            eprintln!(
+                "provider {} has no [providers.resume] block; cannot resume",
+                provider.name
+            );
+            return Ok(1);
+        };
+
+        let invocation_id = Uuid::new_v4().to_string();
+        let invocation = CompositeInvocationId {
+            source: provider.name.clone(),
+            id: invocation_id,
+        };
+        let invocation_model_name = resolved
+            .model_name
+            .clone()
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let invocation_start = InvocationStart {
+            invocation_uuid: invocation.id.clone(),
+            model_name: invocation_model_name,
+            provider_name: provider.name.clone(),
+            provider_index,
+            parent_invocation_id,
+        };
+        let invocation_row_id = agent_runtime_services
+            .invocation_lifecycle_service
+            .start_invocation(InvocationLifecycleStartRequest {
+                state: &state,
+                start: &invocation_start,
+            })
+            .map_err(|err| err.to_string())?
+            .invocation_row_id;
+        let mut guard = FinalizerGuard::new(&state, invocation_row_id);
+        state.bind_invocation_provider_session_start(
+            invocation_row_id,
+            &oulipoly_state::ProviderSessionBinding {
+                provider_session_id: resolved.active_session_id.clone(),
+                capture_method: "resumed",
+                resume_input_id: Some(session_id.to_string()),
+            },
+        )?;
+        if manual_migrate.is_some() {
+            state.record_legacy_resume_input_session_id(invocation_row_id, session_id)?;
+        }
+
+        let invocation_env = serde_json::to_string(&invocation)
+            .map_err(|e| format!("Failed to serialize invocation id: {e}"))?;
+        eprintln!("{}", invocation.stderr_line());
+
+        let result = match executor::cli::execute_resume(
+            &provider,
+            provider_index,
+            target.prompt_mode,
+            &answer,
+            Some(&effective_spawn_cwd),
+            Some(&invocation_env),
+            executor::cli::ResumePayload {
+                session_id: &resolved.active_session_id,
+                strategy,
+            },
+        ) {
+            Ok(result) => result,
+            Err(_spawn_err) => {
+                agent_runtime_services
+                    .invocation_lifecycle_service
+                    .finalize_invocation(InvocationLifecycleFinalizeRequest {
+                        state: &state,
+                        invocation_row_id,
+                        success: false,
+                        exit_code: 1,
+                        error_category: Some("spawn_error"),
+                        terminal_reason: Some("spawn_error"),
+                    })
+                    .map_err(|err| err.to_string())?;
+                guard.mark_finalized();
+                return Ok(1);
+            }
+        };
+
+        if let Some(acceptance) = &result.resume_acceptance {
+            agent_runtime_services
+                .resume_service
+                .record_acceptance(ResumeAcceptanceRequest {
+                    state: &state,
+                    invocation_row_id,
+                    status: acceptance.status.db_value(),
+                    evidence: acceptance.evidence.as_deref(),
+                })
+                .map_err(|err| format!("resume acceptance service failed: {err}"))?;
+        }
+
+        let success = result.exit_code == 0;
+        let error_category = if !success
+            && result.resume_acceptance.as_ref().is_some_and(|acceptance| {
+                acceptance.evidence.as_deref().is_some_and(|evidence| {
+                    evidence.contains(diagnostics::ErrorCategory::ResumeSessionMismatch.as_str())
+                })
+            }) {
+            Some(
+                diagnostics::ErrorCategory::ResumeSessionMismatch
+                    .as_str()
+                    .to_string(),
+            )
+        } else if !success {
+            let diagnostic_input = diagnostic_input(&result.stderr, &result.stdout);
+            run_diagnostics(
+                agent_runtime_services,
+                &diagnostic_input,
+                result.exit_code,
+                &models,
+                working_dir,
+            )
+        } else {
+            None
+        };
+        let quota_exhausted =
+            error_category.as_deref() == Some(diagnostics::ErrorCategory::QuotaExhausted.as_str());
+        if quota_exhausted {
+            state
+                .mark_exhausted(&provider.name)
+                .unwrap_or_else(|e| eprintln!("Warning: Failed to mark provider exhausted: {e}"));
+        }
+        if let Err(err) =
+            state.record_returned_artifacts(invocation_row_id, &result.returned_artifacts)
+        {
+            eprintln!("Error: Failed to record returned artifacts: {err}");
             agent_runtime_services
                 .invocation_lifecycle_service
                 .finalize_invocation(InvocationLifecycleFinalizeRequest {
@@ -1904,115 +2016,68 @@ fn run_resume(
                     invocation_row_id,
                     success: false,
                     exit_code: 1,
-                    error_category: Some("spawn_error"),
-                    terminal_reason: Some("spawn_error"),
+                    error_category: Some("returned_artifacts"),
+                    terminal_reason: Some("returned_artifacts_persist_failed"),
                 })
-                .map_err(|err| err.to_string())?;
+                .map(|_| ())
+                .unwrap_or_else(|e| eprintln!("Warning: Failed to finalize invocation: {e}"));
             guard.mark_finalized();
             return Ok(1);
         }
-    };
-
-    if let Some(acceptance) = &result.resume_acceptance {
-        agent_runtime_services
-            .resume_service
-            .record_acceptance(ResumeAcceptanceRequest {
-                state: &state,
-                invocation_row_id,
-                status: acceptance.status.db_value(),
-                evidence: acceptance.evidence.as_deref(),
-            })
-            .map_err(|err| format!("resume acceptance service failed: {err}"))?;
-    }
-
-    let success = result.exit_code == 0;
-    let error_category = if !success
-        && result.resume_acceptance.as_ref().is_some_and(|acceptance| {
-            acceptance.evidence.as_deref().is_some_and(|evidence| {
-                evidence.contains(diagnostics::ErrorCategory::ResumeSessionMismatch.as_str())
-            })
-        }) {
-        Some(
-            diagnostics::ErrorCategory::ResumeSessionMismatch
-                .as_str()
-                .to_string(),
-        )
-    } else if !success {
-        let diagnostic_input = diagnostic_input(&result.stderr, &result.stdout);
-        run_diagnostics(
-            agent_runtime_services,
-            &diagnostic_input,
-            result.exit_code,
-            &models,
-            working_dir,
-        )
-    } else {
-        None
-    };
-    if error_category.as_deref() == Some(diagnostics::ErrorCategory::QuotaExhausted.as_str()) {
-        state
-            .mark_exhausted(&provider.name)
-            .unwrap_or_else(|e| eprintln!("Warning: Failed to mark provider exhausted: {e}"));
-    }
-    if let Err(err) = state.record_returned_artifacts(invocation_row_id, &result.returned_artifacts)
-    {
-        eprintln!("Error: Failed to record returned artifacts: {err}");
         agent_runtime_services
             .invocation_lifecycle_service
             .finalize_invocation(InvocationLifecycleFinalizeRequest {
                 state: &state,
                 invocation_row_id,
-                success: false,
-                exit_code: 1,
-                error_category: Some("returned_artifacts"),
-                terminal_reason: Some("returned_artifacts_persist_failed"),
+                success,
+                exit_code: result.exit_code,
+                error_category: error_category.as_deref(),
+                terminal_reason: result.terminal_reason.as_deref(),
             })
-            .map(|_| ())
-            .unwrap_or_else(|e| eprintln!("Warning: Failed to finalize invocation: {e}"));
+            .map_err(|err| err.to_string())?;
         guard.mark_finalized();
-        return Ok(1);
-    }
-    agent_runtime_services
-        .invocation_lifecycle_service
-        .finalize_invocation(InvocationLifecycleFinalizeRequest {
-            state: &state,
-            invocation_row_id,
-            success,
-            exit_code: result.exit_code,
-            error_category: error_category.as_deref(),
-            terminal_reason: result.terminal_reason.as_deref(),
-        })
-        .map_err(|err| err.to_string())?;
-    guard.mark_finalized();
+        last_exit_code = result.exit_code;
 
-    if success {
-        ingest_and_emit_session_id_resume_aware(
-            agent_runtime_services,
-            SessionIngestRequest {
-                state: &state,
-                sessions_cfg: &sessions_cfg,
-                providers_cfg: Some(&providers_cfg),
-                provider_name: &provider.name,
-                invocation_row_id,
-                invocation_uuid: &invocation.id,
-                effective_cwd: Some(&effective_spawn_cwd),
-                mode: ResumeIngestMode::Pinned {
-                    resume_target: if manual_migrate.is_some() {
-                        session_id
-                    } else {
-                        &resolved.active_session_id
+        if success {
+            ingest_and_emit_session_id_resume_aware(
+                agent_runtime_services,
+                SessionIngestRequest {
+                    state: &state,
+                    sessions_cfg: &sessions_cfg,
+                    providers_cfg: Some(&providers_cfg),
+                    provider_name: &provider.name,
+                    invocation_row_id,
+                    invocation_uuid: &invocation.id,
+                    effective_cwd: Some(&effective_spawn_cwd),
+                    mode: ResumeIngestMode::Pinned {
+                        resume_target: if manual_migrate.is_some() {
+                            session_id
+                        } else {
+                            &resolved.active_session_id
+                        },
                     },
                 },
-            },
-        );
-        let _ = std::io::stdout().write_all(&result.stdout);
-    } else {
+            );
+            let _ = std::io::stdout().write_all(&result.stdout);
+            return Ok(result.exit_code);
+        }
+
+        if quota_exhausted {
+            if attempts < max_attempts {
+                eprintln!(
+                    "[routing] provider {} returned quota_exhausted; retrying another provider",
+                    provider.name
+                );
+            }
+            continue;
+        }
+
         eprintln!("{}", result.stderr);
         if let Some(ref cat) = error_category {
             eprintln!("[diagnostics: {cat}]");
         }
+        return Ok(result.exit_code);
     }
-    Ok(result.exit_code)
 }
 
 fn run_with_balancing(
@@ -2050,6 +2115,7 @@ fn run_with_balancing(
 
     loop {
         if attempts >= max_attempts {
+            eprintln!("BLOCKED:all-providers-exhausted");
             return match agent_runtime_services.routing_service.select_route(
                 RoutingServiceRequest {
                     model,
