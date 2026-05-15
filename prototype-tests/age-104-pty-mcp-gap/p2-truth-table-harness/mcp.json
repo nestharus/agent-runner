@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "age104p2": {
+      "type": "stdio",
+      "command": "bash",
+      "args": [
+        "-lc",
+        "exec python3 \"$AGE104P2_HARNESS/server.py\" --log \"$AGE104P2_RUN_DIR/server.jsonl\" --sentinel-dir \"$AGE104P2_RUN_DIR\""
+      ]
+    }
+  }
+}

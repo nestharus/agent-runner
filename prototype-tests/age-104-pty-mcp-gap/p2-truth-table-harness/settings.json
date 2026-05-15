@@ -1,0 +1,57 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -lc 'event=SessionStart; dir=${AGE104P2_RUN_DIR:-/tmp/age104p2-missing}; mkdir -p \"$dir\"; printf \"{\\\"event\\\":\\\"%s\\\",\\\"time\\\":\\\"%s\\\"}\\n\" \"$event\" \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" >> \"$dir/hooks.jsonl\"; : > \"$dir/hook-$event.sentinel\"'"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -lc 'event=PreToolUse; dir=${AGE104P2_RUN_DIR:-/tmp/age104p2-missing}; mkdir -p \"$dir\"; printf \"{\\\"event\\\":\\\"%s\\\",\\\"time\\\":\\\"%s\\\"}\\n\" \"$event\" \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" >> \"$dir/hooks.jsonl\"; : > \"$dir/hook-$event.sentinel\"'"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -lc 'event=PostToolUse; dir=${AGE104P2_RUN_DIR:-/tmp/age104p2-missing}; mkdir -p \"$dir\"; printf \"{\\\"event\\\":\\\"%s\\\",\\\"time\\\":\\\"%s\\\"}\\n\" \"$event\" \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" >> \"$dir/hooks.jsonl\"; : > \"$dir/hook-$event.sentinel\"'"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -lc 'event=Stop; dir=${AGE104P2_RUN_DIR:-/tmp/age104p2-missing}; mkdir -p \"$dir\"; printf \"{\\\"event\\\":\\\"%s\\\",\\\"time\\\":\\\"%s\\\"}\\n\" \"$event\" \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" >> \"$dir/hooks.jsonl\"; : > \"$dir/hook-$event.sentinel\"'"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -lc 'event=SessionEnd; dir=${AGE104P2_RUN_DIR:-/tmp/age104p2-missing}; mkdir -p \"$dir\"; printf \"{\\\"event\\\":\\\"%s\\\",\\\"time\\\":\\\"%s\\\"}\\n\" \"$event\" \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" >> \"$dir/hooks.jsonl\"; : > \"$dir/hook-$event.sentinel\"'"
+          }
+        ]
+      }
+    ]
+  }
+}
