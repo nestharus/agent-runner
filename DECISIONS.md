@@ -2137,3 +2137,28 @@ This is the same structural class as the precedents recorded above:
 **Disposition**: Per the Violation Detection and Escalation Tier-1 policy ("Rewind and retry. Identify the last commit on the affected branch produced under full pipeline compliance. Delete and recreate the affected worktree. Re-dispatch the failed phase from clean state.") this rewind is scoped to product files only — Step 6b tests remain because they pass the Step 6b consumption-evidence rule (tests + Step 6b output index were authored correctly). The re-dispatched Step 6c prompt makes the `consumed:` requirement non-negotiable by instructing the agent to print the literal `consumed:` lines on stdout BEFORE any tool call.
 
 **Actor**: implementation-pipeline-orchestrator (claude-opus).
+
+---
+
+## AGE-114 — D1 — Inherited-estimate cold-start disposition (proceed without baseline)
+
+- **Source**: Phase 2.5 step 4a inherited-estimate check; `${scratch_dir}/ticket.md` reports `estimate_source: missing`.
+- **Decision**: proceed without a baseline estimate; the AGE-104 prototype dossier is the prototype-first satisfaction for AGE-114, and the manager directive "P4 should leave the Linear estimate field blank per `estimate_source: missing`" carries forward from the AGE-104 spawned-ticket dossier (`/home/nes/projects/agent-runner/planning/prototype-age-104-pty-mcp-gap/dossier/spawned-tickets.md` line 7 frontmatter, line 38 manager directive).
+- **Rationale**: AGE-114 was already filed by the AGE-104 prototype with `estimate_source: missing`. The user's dispatch instructions for this WU explicitly authorize "proceed in exhaustive mode with AGE-104 dossier as prototype-first satisfaction" when Phase 2.5 rolls up HIGH (it did roll up HIGH). The cold-start question is therefore pre-answered.
+- **Revisit when**: any future re-estimation cycle decides to backfill story points on docs-only tickets that inherited `missing` source from a prototype.
+
+## AGE-114 — D2 — Problem-map human gate skipped (`skip_problem_map_gate=true`)
+
+- **Source**: dispatch input `skip_problem_map_gate=true`.
+- **Decision**: Phase 2.5 step 6 routine problem-map approval gate is skipped per project-level override. The defer-to-prototype detection in step 5 still ran (no signals fired). The new-value question path remains armed for any genuinely root-owned value/scope/trade-off question; none surfaced.
+- **Rationale**: the dispatch instructions opt out of the routine gate for this WU per the orchestrator spec's project-level override.
+
+## AGE-114 — D3 — Phase 2.5 verdict HIGH accepted; exhaustive mode for runbook + provider-accounts-redesign.md
+
+- **Source**: Phase 2.5.6 risk profile at `/home/nes/projects/agent-runner/planning/age-114-claude-launch-shape-doc/risk/age-114-risk-profile.md`.
+- **Decision**: per-surface modes:
+  - `docs/architecture/claude-proxy-mcp-launch-shape.md` — HIGH → **exhaustive**.
+  - `docs/architecture/provider-accounts-redesign.md` — HIGH → **exhaustive**.
+  - `README.md` — MEDIUM → **lean** (with MEDIUM-axis callouts in Phase 3).
+  - `AGENTS.md` — MEDIUM → **lean** (with MEDIUM-axis callout).
+- **Rationale**: per `~/ai/conventions/risk-profile.md` § Per-surface verdict and § Pipeline mode. The HIGH verdict on the new runbook is driven by Language-fragmentation HIGH and Change-path-entropy HIGH (rule crosses Markdown ↔ TOML ↔ Rust ↔ external CLI ↔ Bash/Python proof harness; ≥4 entrypoints route to the runbook). Defer-to-prototype check: NO signals fired (already pre-prototyped by AGE-104).

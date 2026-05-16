@@ -150,6 +150,8 @@ Parsing is handled by `shell_split()` and `provider_name()` in
 `crates/oulipoly-runtime/src/executor/cli.rs`; config-side provider
 derivation remains in `crates/oulipoly-config/src/model.rs`.
 
+When a repo-local agent constructs or modifies Claude launch argv (especially proxy MCP launches), see [`docs/architecture/claude-proxy-mcp-launch-shape.md`](docs/architecture/claude-proxy-mcp-launch-shape.md) before adding any `--tools` or `--allowedTools` flags — interactive PTY MCP replacement requires `--allowedTools mcp__<server>__<tool>,...` (or no filter) and not `--tools mcp__<server>__<tool>,...`.
+
 ## Design Workflow
 
 ### External Design Directory

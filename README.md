@@ -252,6 +252,8 @@ oulipoly-agent-runner repl codex-high --resume 5169694d-de0f-40d1-890c-6e28e55ba
 
 Each `repl` invocation requires the resolved provider to declare `interactive_args` in `providers.toml` (the argv shape used for interactive launch — distinct from `args`, which encodes one-shot mode like Claude `-p` or Codex `exec`). With `--resume`, the provider must additionally declare a `[<provider>.resume]` block; see [Resuming a session](#resuming-a-session) below.
 
+For Claude provider entries, see [`docs/architecture/claude-proxy-mcp-launch-shape.md`](docs/architecture/claude-proxy-mcp-launch-shape.md) before adding MCP-related tool filters to `interactive_args` — interactive PTY MCP replacement launches require `--allowedTools mcp__<server>__<tool>,...` (or no filter) and not `--tools mcp__<server>__<tool>,...`.
+
 On Unix, signal handling forwards `SIGTERM` once and lets `SIGINT` / `SIGHUP` reach the child through the foreground process group. Windows console-control handling is not implemented yet.
 
 ## Load Balancing
@@ -344,6 +346,8 @@ quota_script = "zai-usage ~/.config/opencode/auth.json"
 ```
 
 `args` and `interactive_args` are provider/account defaults only. Do not put model flags there; model flags live in model TOMLs and are appended at spawn time.
+
+Required reading before adding `--tools` or `--allowedTools` flags to a Claude provider entry: [`docs/architecture/claude-proxy-mcp-launch-shape.md`](docs/architecture/claude-proxy-mcp-launch-shape.md). Interactive PTY MCP replacement launches must use `--allowedTools mcp__<server>__<tool>,...` or no filter, never `--tools mcp__<server>__<tool>,...`.
 
 `cwd_script` resolves the workspace for provider-native resume. `transcript_script` resolves the raw transcript path for locate/export/import-replace, and `storage_type` declares the canonical provider transcript format used by those features.
 
@@ -819,6 +823,8 @@ All user config lives in `~/.config/oulipoly-agent-runner/`:
 ### Adding a Model
 
 Create or update the account entry in `providers.toml`, then create a `.toml` file in the models directory. The filename becomes the model name.
+
+When adding a new Claude provider entry, see [`docs/architecture/claude-proxy-mcp-launch-shape.md`](docs/architecture/claude-proxy-mcp-launch-shape.md) before configuring any MCP-related tool filters in `args` or `interactive_args` for the Claude provider.
 
 **Runtime provider entry:**
 ```toml
