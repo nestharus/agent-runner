@@ -1,0 +1,30 @@
+{
+  "case_id": "bad-typed",
+  "argv_source": "typed_claude_tool_restrictions",
+  "provider": {
+    "command": "claude",
+    "interactive_args": [],
+    "tool_restrictions": {
+      "kind": "claude",
+      "claude": {
+        "allowed_tools": [
+          "mcp__age104p2__Task",
+          "mcp__age104p2__Echo"
+        ],
+        "disallowed_tools": []
+      }
+    }
+  },
+  "rendered_argv": [
+    "claude",
+    "--model",
+    "sonnet",
+    "--tools",
+    "mcp__age104p2__Task,mcp__age104p2__Echo"
+  ],
+  "expected": {
+    "verdict": "fail",
+    "severity": "HIGH",
+    "reason": "Claude proxy PTY argv must not pair --tools with any mcp__ value."
+  }
+}

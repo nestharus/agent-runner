@@ -1,0 +1,34 @@
+{
+  "case_id": "bad-raw-interactive-args",
+  "argv_source": "raw_interactive_args",
+  "provider": {
+    "command": "claude",
+    "interactive_args": [
+      "--tools",
+      "mcp__age104p2__Task,mcp__age104p2__Echo"
+    ],
+    "tool_restrictions": null
+  },
+  "equivalent_cases": [
+    {
+      "name": "split-token",
+      "rendered_argv": [
+        "claude",
+        "--tools",
+        "mcp__age104p2__Task,mcp__age104p2__Echo"
+      ]
+    },
+    {
+      "name": "joined-equals",
+      "rendered_argv": [
+        "claude",
+        "--tools=mcp__age104p2__Task,mcp__age104p2__Echo"
+      ]
+    }
+  ],
+  "expected": {
+    "verdict": "fail",
+    "severity": "HIGH",
+    "reason": "Raw interactive_args cannot hide --tools mcp__ launch shapes."
+  }
+}

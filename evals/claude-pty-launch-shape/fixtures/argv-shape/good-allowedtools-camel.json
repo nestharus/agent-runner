@@ -1,0 +1,26 @@
+{
+  "case_id": "good-allowedtools-camel",
+  "argv_source": "typed_claude_tool_restrictions",
+  "provider": {
+    "command": "claude",
+    "interactive_args": [],
+    "tool_restrictions": {
+      "kind": "claude",
+      "claude": {
+        "allowed_tools": [
+          "mcp__age104p2__Task"
+        ],
+        "disallowed_tools": []
+      }
+    }
+  },
+  "rendered_argv": [
+    "claude",
+    "--allowedTools",
+    "mcp__age104p2__Task"
+  ],
+  "expected": {
+    "verdict": "pass",
+    "reason": "Camel-case --allowedTools is the AGE-104 live-proven positive PTY spelling."
+  }
+}

@@ -1,0 +1,57 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$AGE113_CLAUDE_PTY_FIXTURES/hook-log.py\" SessionStart"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$AGE113_CLAUDE_PTY_FIXTURES/hook-log.py\" PreToolUse"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$AGE113_CLAUDE_PTY_FIXTURES/hook-log.py\" PostToolUse"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$AGE113_CLAUDE_PTY_FIXTURES/hook-log.py\" Stop"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$AGE113_CLAUDE_PTY_FIXTURES/hook-log.py\" SessionEnd"
+          }
+        ]
+      }
+    ]
+  }
+}

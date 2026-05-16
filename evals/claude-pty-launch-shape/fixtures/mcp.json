@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "age104p2": {
+      "type": "stdio",
+      "command": "bash",
+      "args": [
+        "-lc",
+        "exec python3 \"$AGE113_CLAUDE_PTY_FIXTURES/server.py\" --log \"$AGE113_CLAUDE_PTY_RUN_DIR/server.jsonl\" --sentinel-dir \"$AGE113_CLAUDE_PTY_RUN_DIR\""
+      ]
+    }
+  }
+}
