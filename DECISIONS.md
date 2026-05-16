@@ -2294,3 +2294,40 @@ The AGE-113 finding is even cleaner than AGE-93 D4/D5 because (a) the alignment 
 **Evidence**: `.scratch/logs/age-113-phase-6c.log` (gate-pass record); `df8eab7` commit (product code matches Step 6b tests); `alignment/age-113-tests-contracts.md` Round 2 verdict ALIGNED; AGE-93 D5 precedent in this DECISIONS file.
 
 **Resume point**: Phase 6 prototype risk review → Step 6c post-prototype derivation check (expected no-trigger for single-component WU) → multi-layer acceptance check → per-component code-quality fanout → halt-state gate → Process-tree audit #2.
+
+## AGE-115 — D1 — Phase 2.5 inherited-estimate cold-start resolved inline as procedural
+
+- **Source**: implementation-pipeline-orchestrator Phase 2.5 step 4a. `planning/age-115-upstream-bug-report-decision/.scratch/ticket.md` frontmatter has `story_point_estimate: null`, `estimate_source: missing`, per the AGE-89-clarify manager directive carried forward through the AGE-104 prototype dossier (`planning/prototype-age-104-pty-mcp-gap/dossier/spawned-tickets.md` → "P4 should leave the Linear estimate field blank per `estimate_source: missing`").
+- **Posture**: **procedural — proceed without a baseline estimate**. Phase 3 sets `refined_story_point_estimate`; Phase 8.X closure judge captures `actual_story_points`. Pre-Phase-4 `task=update-estimate` writes the refined estimate to Linear.
+- **Rationale**: the value question behind step 4a (prototype-first need + scope clarity) is fully resolved by supplied dispatch inputs:
+  - The dispatch states verbatim: "Predecessor prototype (AGE-104) satisfies prototype-first." That is the explicit prior user disposition for step 4a's prototype-first option.
+  - The dispatch fully scopes the WU: file-or-decline upstream bug report with the deliverable as a markdown decision document; optional `gh api` submission only behind an explicit Phase 6 sub-step.
+  - Phase 2.5 sub-steps confirm scope independently: problem map enumerates one docs target path and no production code/test changes; duplicates inventory found no existing convention; risk profile rolls up MEDIUM (not HIGH) for the docs-only base path.
+  - Defer-to-prototype signals do not fire (0/5: not majority HIGH; no sprawling parallel landscape; lifecycle is derivable; coverage is "no test surface expected"; cross-language is Markdown-only).
+  - `estimate_source: missing` here is a ticket-metadata gap (Linear `estimate` field unset by P4 directive), not a scope-understanding gap.
+- **Precedents**: AGE-93 D2 (this DECISIONS file), AGE-100 (`estimate_source: missing` resolved by task framing), AGE-114 D1 (sibling WU from same AGE-104 prototype lineage).
+- **AskUserQuestion**: not attempted. Inline procedural resolution applied because the value question is fully resolved by supplied inputs (sibling pattern to AGE-93 D2 and AGE-100).
+- **Evidence**:
+  - `planning/age-115-upstream-bug-report-decision/.scratch/ticket.md`
+  - `planning/age-115-upstream-bug-report-decision/research/age-115-problem-map.md`
+  - `planning/age-115-upstream-bug-report-decision/risk/age-115-risk-profile.md`
+  - `planning/prototype-age-104-pty-mcp-gap/dossier/spawned-tickets.md`
+
+## AGE-115 — D2 — Problem-map human gate skipped (`skip_problem_map_gate=true`)
+
+- **Source**: dispatch input `skip_problem_map_gate=true`.
+- **Posture**: Phase 2.5 step 6 (routine problem-map approval) skipped. Defer-to-prototype detection in step 5 still ran and surfaced no defer-signals (0/5).
+- **Rationale**: the dispatch explicitly opts out for this WU. The override removes routine approval, not a genuine new-value question; no such new-value question arose at Phase 2.5.
+
+## AGE-115 — D3 — Phase 5 base-update from stale main to origin/main
+
+- **Source**: Phase 5 hookpoint research found A4 (AGE-114 runbook coexistence) was conditional in the proposal. The AGE-115 worktree was created from `d4727ee` before AGE-114's runbook merged at `9066a10`; current `origin/main` is `4d0d168`.
+- **Posture**: procedural — update worktree base to current `origin/main` before Phase 6. Branch had zero commits (only uncommitted `DECISIONS.md` modification with the D1/D2 entries above); base update is therefore a `git reset --hard main` after fast-forwarding local `main` to `origin/main`, with DECISIONS.md stashed/re-applied.
+- **Rationale**: the proposal's A4 was explicitly conditional ("if the file is present, AGE-115 may reference it as the local workaround; if absent, AGE-115's external-issue document stands alone"). Updating to current main resolves A4 in the file-exists direction, lets AGE-115 reference the AGE-114 runbook as the local workaround anchor, and avoids a stale-base PR. The dispatch's auto-merge override implies a smooth fast path is desired.
+- **AskUserQuestion**: attempted, permission-denied. Per `~/ai/conventions/agent-questions-and-session-graph.md` § `AskUserQuestion Permission-Denial`, procedural permission-denial the orchestrator can resolve from supplied inputs stays inline. The proposal's A4 explicitly authorizes either path; the dispatch's "auto-merge" and "skip problem-map gate" overrides signal preference for a smooth path; no genuine new value/scope/trade-off question is surfaced.
+- **Rebase Verification Gate**: not run — branch had zero commits at base-update time, so there is no "rebase" of commits to verify. The Step 6b output index does not yet exist (Phase 6 has not started); the Phase 2.5 / Phase 3 / Phase 4 planning artifacts in `planning/age-115-upstream-bug-report-decision/` (which live outside the worktree) are unaffected by the base update. The DECISIONS.md merge-conflict from the stash pop was resolved by accepting main's content and re-appending the AGE-115 entries; no other tracked file required resolution.
+- **Evidence**:
+  - Old worktree HEAD: `d4727ee feat(cli): add --usage flag for per-account quota visibility (AGE-15) (#87)`
+  - New worktree HEAD: `4d0d168 feat(evals): add Claude proxy PTY launch-shape regression eval (#92)`
+  - AGE-114 runbook now present: `docs/architecture/claude-proxy-mcp-launch-shape.md`
+  - `planning/age-115-upstream-bug-report-decision/research/age-115-hookpoints.md` (the hookpoint research that triggered the update)
