@@ -1,0 +1,101 @@
+{
+  "claude_code_baseline": "2.1.143",
+  "matrix": [
+    {
+      "mode": "M1",
+      "column": "C1",
+      "tool_flag_shape": "--tools mcp__age104p2__Task,mcp__age104p2__Echo",
+      "mcp_server_initialized": true,
+      "tools_call_reached_server": true,
+      "tool_returned_to_claude": true
+    },
+    {
+      "mode": "M1",
+      "column": "C2",
+      "tool_flag_shape": "--allowedTools mcp__age104p2__Task,mcp__age104p2__Echo",
+      "mcp_server_initialized": true,
+      "tools_call_reached_server": true,
+      "tool_returned_to_claude": true
+    },
+    {
+      "mode": "M1",
+      "column": "C3",
+      "tool_flag_shape": "no tool filter",
+      "mcp_server_initialized": true,
+      "tools_call_reached_server": true,
+      "tool_returned_to_claude": true
+    },
+    {
+      "mode": "M2",
+      "column": "C1",
+      "tool_flag_shape": "--tools mcp__age104p2__Task,mcp__age104p2__Echo",
+      "mcp_server_initialized": true,
+      "tools_call_reached_server": true,
+      "tool_returned_to_claude": true
+    },
+    {
+      "mode": "M2",
+      "column": "C2",
+      "tool_flag_shape": "--allowedTools mcp__age104p2__Task,mcp__age104p2__Echo",
+      "mcp_server_initialized": true,
+      "tools_call_reached_server": true,
+      "tool_returned_to_claude": true
+    },
+    {
+      "mode": "M2",
+      "column": "C3",
+      "tool_flag_shape": "no tool filter",
+      "mcp_server_initialized": true,
+      "tools_call_reached_server": true,
+      "tool_returned_to_claude": true
+    },
+    {
+      "mode": "M3",
+      "column": "C1",
+      "tool_flag_shape": "--tools mcp__age104p2__Task,mcp__age104p2__Echo",
+      "mcp_server_initialized": true,
+      "tools_call_reached_server": false,
+      "tool_returned_to_claude": false
+    },
+    {
+      "mode": "M3",
+      "column": "C2",
+      "tool_flag_shape": "--allowedTools mcp__age104p2__Task,mcp__age104p2__Echo",
+      "mcp_server_initialized": true,
+      "tools_call_reached_server": true,
+      "tool_returned_to_claude": true
+    },
+    {
+      "mode": "M3",
+      "column": "C3",
+      "tool_flag_shape": "no tool filter",
+      "mcp_server_initialized": true,
+      "tools_call_reached_server": true,
+      "tool_returned_to_claude": true
+    },
+    {
+      "mode": "M4",
+      "column": "C1",
+      "tool_flag_shape": "--tools mcp__age104p2__Task,mcp__age104p2__Echo",
+      "mcp_server_initialized": true,
+      "tools_call_reached_server": false,
+      "tool_returned_to_claude": false
+    },
+    {
+      "mode": "M4",
+      "column": "C2",
+      "tool_flag_shape": "--allowedTools mcp__age104p2__Task,mcp__age104p2__Echo",
+      "mcp_server_initialized": true,
+      "tools_call_reached_server": true,
+      "tool_returned_to_claude": true
+    },
+    {
+      "mode": "M4",
+      "column": "C3",
+      "tool_flag_shape": "no tool filter",
+      "mcp_server_initialized": true,
+      "tools_call_reached_server": true,
+      "tool_returned_to_claude": true
+    }
+  ]
+}

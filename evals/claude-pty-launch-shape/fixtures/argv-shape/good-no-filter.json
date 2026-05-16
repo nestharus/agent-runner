@@ -1,0 +1,18 @@
+{
+  "case_id": "good-no-filter",
+  "argv_source": "no_tool_filter",
+  "provider": {
+    "command": "claude",
+    "interactive_args": [],
+    "tool_restrictions": null
+  },
+  "rendered_argv": [
+    "claude",
+    "--model",
+    "sonnet"
+  ],
+  "expected": {
+    "verdict": "pass",
+    "reason": "No tool filter is an AGE-104 live-proven positive PTY shape."
+  }
+}

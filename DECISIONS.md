@@ -2183,3 +2183,114 @@ This is the same structural class as the precedents recorded above:
 - **Decision**: Accept as residual with disposition `recipe-weakness-no-content-gap`. The MEDIUM is solely about an acceptance-checklist recipe pattern (AC-016) that searches for `no filter` literally but the runbook uses `no tool filter`. The product-docs content is correct: M3-C3 is documented as succeeding with no tool filter, and AC-046 separately verifies the same allowance against `## Rule`. There is no content coverage gap. Per `~/ai/workflows/pr-review.md` § "Supported-Surface Verification" disposition rules, MEDIUM with no value-collapse and no missing assertion is acceptable as a fix-pass residual recorded through Decision Recording rather than blocking the PR.
 - **Rationale**: ACR-156/162/163 LOW-only rule applies to CODE-QUALITY gates (Phase 4 code-quality + per-component code-quality fanout), not to PR-review gates. The dispatch instructions' "NO quality-gate residual acceptance" rule references ACR-156/162/163 quality-gate scope, which is satisfied for AGE-114 (Phase 4 code-quality is LOW; per-component is non-applicable). Phase 8 test-audit's MEDIUM is a separate gate with its own disposition policy in pr-review.md, and the recipe-weakness disposition is the appropriate fix-pass record.
 - **Revisit when**: a future Step 6b refresh tightens the AC-016 recipe pattern from `no filter` to `no tool filter`; this would be a non-blocking checklist clean-up and not a re-run of Phase 8 by itself.
+
+## AGE-113 — D1 — Phase 2.5 step 4a cold-start estimate disposition (pre-recorded)
+
+**Phase**: Phase 2.5 step 4a (Inherited-estimate cold-start check).
+
+**Decision**: **Proceed without a baseline estimate.** Skip the routine Phase 2.5 step 4a NEEDS_INPUT. Use the AGE-104 dossier at `/home/nes/projects/agent-runner/planning/prototype-age-104-pty-mcp-gap/dossier/` as the prototype-satisfaction evidence (sibling pattern to ACR-217 / ACR-225 / AGE-89 spawned tickets).
+
+**Why no NEEDS_INPUT to root**: the user's disposition was pre-recorded in the orchestrator dispatch prompt under "Cold-start estimate disposition (Phase 2.5 step 4a)". The orchestrator does not re-ask a question that is already answered. The prototype-first option does not apply because the AGE-104 dossier already exists at the cited path and is load-bearing for this ticket (per `${scratch_dir}/ticket.md` § Prototype context).
+
+**Linear ticket state**: `${scratch_dir}/ticket.md` declares `estimate_source: missing`; the prototype dossier carries a coarse recommendation (3) but the official Linear `estimate` field is intentionally left blank per the manager-side P4 directive carried from the AGE-89-clarify prototype. Phase 3 sets the refined estimate as the live ticket estimate via the `linear-operator task=update-estimate` dispatch; Phase 8.X closure judge captures actuals into `${planning_dir}/audit-history.md` § Final state.
+
+**Evidence**: `/home/nes/projects/agent-runner/planning/age-113-launch-shape-regression/.scratch/ticket.md` (frontmatter `estimate_source: missing`); `/home/nes/projects/agent-runner/planning/age-113-launch-shape-regression/.scratch/ticket-prototype-evidence.md`; `/home/nes/projects/agent-runner/planning/age-113-launch-shape-regression/.scratch/predecessor-prototype-evidence.md`; orchestrator dispatch prompt § "Cold-start estimate disposition (Phase 2.5 step 4a)".
+
+## AGE-113 — D2 — Phase 2.5 step 2.5.4 drift disposition (proceed-with-note; no tracker filed)
+
+**Phase**: Phase 2.5 step 2.5.4 (Duplicate-systems inventory).
+
+**Finding**: The duplicates inventory at `planning/age-113-launch-shape-regression/research/age-113-duplicates.md` § 6 named two findings:
+
+1. **Spelling difference** between production rendering (`--allowed-tools` lowercase/hyphenated at `crates/oulipoly-runtime/src/executor/cli.rs:675-676`) and the AGE-104 proof positive control (`--allowedTools` camelCase per `dossier/answer.md:32`, `dossier/evidence/p2-truth-table.md:14`, `predecessor-prototype-evidence.md:13`). The AGE-104 dossier did not test lowercase in PTY mode.
+2. **Raw arg pass-through bypass risk**: `interactive_args` raw channel can inject `--tools mcp__...` past the typed restriction validator (`crates/oulipoly-config/src/providers.rs:362,366,484`).
+
+**Decision**: **Proceed-with-note. No Linear tracker filed.**
+
+**Why no NEEDS_INPUT to root**:
+
+- Finding 1 is **not** a silent divergence per `~/ai/conventions/risk-profile.md` § Drift. The config validator at `validate_claude_tool_duplicates` (`crates/oulipoly-config/src/providers.rs:478-498`) explicitly knows about both spellings and treats them as equivalent allowed-tools flags. The codebase is internally consistent; only the PTY-mode behavioral check against Claude 2.1.143 is untested for lowercase. This is a Phase 3/Phase 5 question (does the eval assert camelCase only per ticket text, both spellings, or do a quick check?), not a silent drift requiring tracker filing.
+- Finding 2 is **precisely what AGE-113's eval/source guard is designed to detect**. The acceptance criterion in `${scratch_dir}/ticket.md` line 56 says "Add an agent-runner regression test or source guard asserting Claude proxy-mode PTY never emits `--tools mcp__...`." The `interactive_args` raw channel is one of the injection paths the eval must defend against. This is in-scope for the WU's primary work, not a separate ticket.
+- Per AGE-93 D1 precedent, drift disposition is procedurally determined when (a) anti-scope forbids the consolidation path and (b) the divergence is either explicitly modeled in code or in-scope for the WU's own purpose. Both conditions hold here.
+
+**Forward**:
+- Phase 3 input: the proposer must decide whether the eval asserts only `--allowedTools` camelCase (per ticket text) OR both spellings (per validator-level equivalence). Either is defensible; this is a value/scope question the Phase 3 proposer resolves through anti-scope analysis.
+- Phase 6 input: the eval/source guard MUST detect `--tools mcp__...` regardless of injection path (typed `ToolRestrictions`, `interactive_args` raw, or any other). This is the WU's primary contract.
+
+**Evidence**: `planning/age-113-launch-shape-regression/research/age-113-duplicates.md` § 6; `crates/oulipoly-config/src/providers.rs:478-498` (validate_claude_tool_duplicates); `crates/oulipoly-runtime/src/executor/cli.rs:675-676` (production lowercase render); `dossier/answer.md:32` (AGE-104 camelCase positive control).
+
+## AGE-113 — D3 — Phase 2.5 gate resolved (defer-to-prototype evaluated; proceed in exhaustive mode)
+
+**Phase**: Phase 2.5 step 5 (defer-to-prototype detection) + step 6 (human gate) + step 7 (branch on outcome).
+
+**Sub-step outcomes**:
+
+- **Step 2.5.0 (Problem map)** — `planning/age-113-launch-shape-regression/research/age-113-problem-map.md` (17,655 bytes). Touched surface enumerated; anti-scope confirmed.
+- **Step 2.5.1 (Coverage inventory)** — `planning/age-113-launch-shape-regression/research/age-113-coverage-inventory.md` (21,804 bytes). 5 uncovered behaviors named. Characterization-test verdict: not applicable (new eval surface is greenfield; inherited PR #90 proof tests serve as predecessor characterization). Bug-discovery rule: did not fire.
+- **Step 2.5.2 (Lifecycle map)** — `planning/age-113-launch-shape-regression/research/age-113-lifecycle-map.md` (24,908 bytes).
+- **Step 2.5.3 (Entrypoints)** — `planning/age-113-launch-shape-regression/research/age-113-entrypoints.md` (34,410 bytes).
+- **Step 2.5.4 (Duplicates)** — `planning/age-113-launch-shape-regression/research/age-113-duplicates.md` (37,084 bytes). Two findings (spelling drift, raw arg pass-through) — drift disposition recorded in `## AGE-113 — D2` (proceed-with-note; no tracker filed).
+- **Step 2.5.5 (Cross-language trace)** — `planning/age-113-launch-shape-regression/research/age-113-cross-language-trace.md` (29,811 bytes). Implicit contracts across Rust/Bash/JSON/Python/Markdown/external Claude CLI.
+- **Step 2.5.6 (Risk profile)** — `planning/age-113-launch-shape-regression/risk/age-113-risk-profile.md`. **WU-level verdict: HIGH**. 5 of 5 included scored surfaces HIGH. Pipeline mode: exhaustive for every touched surface.
+
+**Defer-to-prototype signal scoring** (Phase 2.5 step 5):
+
+- Signal 1 (HIGH on majority of touched surfaces): **fires** (5 of 5 HIGH).
+- Signal 2 (sprawling parallel-systems landscape): does not fire.
+- Signal 3 (lifecycle largely operational/non-repo-derivable): does not fire.
+- Signal 4 (uncovered behaviors are multi-WU work): does not fire.
+- Signal 5 (cross-language implicit-contracts HIGH change-path entropy): **fires**.
+
+Two signals fired → the human-gate question would normally include the defer-to-prototype option.
+
+**Decision**: **Proceed in exhaustive mode.** Use the AGE-104 dossier at `/home/nes/projects/agent-runner/planning/prototype-age-104-pty-mcp-gap/dossier/` as the prototype-satisfaction evidence; no new prototype is dispatched.
+
+**Why no NEEDS_INPUT to root**:
+
+The user's disposition is pre-recorded in the orchestrator dispatch prompt under "Phase 2.5 disposition expectations (informational, not pre-decided)": *"Expected outcome (informational only): proceed in exhaustive mode with AGE-104 dossier as the prototype satisfaction. If the actual evidence diverges, surface the NEEDS_INPUT."*
+
+The actual Phase 2.5 evidence does NOT diverge from the expected scenario:
+
+1. The WU IS hard — it's spawned from a prototype dossier on a HIGH-risk PTY behavior contract. The HIGH verdict is consistent with the user's expectation that this WU runs in exhaustive mode.
+2. The two firing signals (1 and 5) confirm what the user already named as the appropriate response: exhaustive mode with the existing AGE-104 dossier as the prototype satisfaction.
+3. Spawning a new prototype is not the appropriate action: the AGE-104 prototype already happened, its dossier exists at the cited path, the dossier's mechanism finding is load-bearing for AGE-113, and the user has explicitly named it as the prototype satisfaction. Spawning a fresh `prototype-orchestrator` workflow when the satisfying dossier already exists is double-work.
+4. The defer-signals scoring is honest: 2/5 fired, not 5/5. The lifecycle is repo-derivable; duplicates are bounded; coverage gaps are focused on the WU's own new behavior (not multi-WU sprawl). The two firing signals are exactly the signals the user anticipated when they pre-recorded exhaustive mode as the answer.
+
+Per the recurring AGE-93 D2 / AGE-100 / AGE-48 precedent: procedural permission-denial or NEEDS_INPUT that the orchestrator can resolve from supplied inputs stays inline; no genuine previously-unevaluated value/scope/trade-off is surfaced.
+
+**Problem-map human gate (step 6)**: skipped per `skip_problem_map_gate=true` (project-level override declared in the orchestrator dispatch prompt; in force for agent-runner per AGE-54/AGE-61/AGE-62/AGE-93 precedent). The override suppresses the routine problem-map approval step but not genuine value-question escalation. No value-question escalation arose because the user pre-recorded the defer-vs-proceed disposition.
+
+**Step 8 (mode propagation)**:
+
+Per the Phase 2.5 step 8 contract, the orchestrator passes `risk_profile_path` and the per-surface mode map into Phase 3's prompt. All five included scored surfaces are HIGH → exhaustive mode for all of Phase 3+. The CI/local-runner integration surface is `not touched` at Phase 2.5; Phase 3 must rescore if it elects to touch it.
+
+**Evidence**: `planning/age-113-launch-shape-regression/risk/age-113-risk-profile.md` § Defer-to-prototype signal scoring + WU-level verdict; `.scratch/ticket.md`; this DECISIONS file § AGE-113 D1 (cold-start) + D2 (drift).
+
+**Resume point**: Phase 3 (proposal) with exhaustive mode for all five included surfaces.
+
+## AGE-113 — D4 — Phase 6 Step 6c alternative consumption evidence (AGE-93 D5 precedent)
+
+**Phase**: Phase 6 Step 6c (Write code).
+
+**Finding**: The Step 6c agent at commit `df8eab7 feat(evals): AGE-113 Claude PTY launch-shape eval` produced correct product code that makes all Step 6b emitted tests pass, but its captured log at `.scratch/logs/age-113-phase-6c.log` consolidated the response into the `WROTE_PRODUCT_CODE` / `GATES` / `COMMITTED` summary shape and did NOT emit the literal `consumed:` echo lines required by `~/ai/agents/implementation-pipeline-orchestrator.md` § Phase 6 Step 6c relaxed-position consumption-evidence rule.
+
+**Decision**: **Accept alternative consumption evidence.** No Step 6c rewind. AGE-113 Phase 6 Step 6c is accepted at commit `df8eab7`.
+
+**Why no Tier-1 rewind**:
+
+Per the AGE-93 D5 precedent on this project (and the sibling pattern in ACR-154 PR #138, ACR-198 D-2026-05-13, ACR-150, ACR-149), the root-approved option for procedural-evidence gates where the structural rule is unenforceable in the current dispatch shape is to verify consumption via alternative evidence:
+
+1. **Step 6c log narrative cites Step 6b artifacts** — the captured log's `WROTE_PRODUCT_CODE` list names the four product files (`eval.md`, `eval.sh`, `assert-argv-shape.py`, `fixtures/run-mode.sh`), each of which exactly matches the Step 6b output index's "Step 6c must populate" rows. The narrative could not have produced this targeting without reading the index.
+2. **Product-code diff at `df8eab7` exactly satisfies Step 6b tests** — every Step 6b test in `contract_tests.py` (T1–T10 + T-CF-1/2/3) passes per the `run-tests.sh` gate result captured in the log. Tests passing on a fresh, separate invocation prove the product code was written against the existing Step 6b tests.
+3. **All other gates pass** — `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `bash evals/claude-pty-launch-shape/run-tests.sh`, `bash evals/claude-pty-launch-shape/eval.sh --dry-run --json --mode M3-{C1,C2,C3,matrix}`, and `python3 evals/claude-pty-launch-shape/assert-argv-shape.py --fixture …` all pass. `bun run lint/typecheck/test` skipped per the established NES-251 D2 precedent (FontAwesome Pro token unavailable in dev env; verified-unaffected since no JS/TS changed).
+4. **Phase 6 alignment review verdict is ALIGNED** — after the narrow Step 6b remediation (T-CF-1 row fix + `python3 -m unittest contract_tests` invocation form), the alignment reviewer verified that the Step 6b tests are consistent with the Step 6a contract.
+
+Per AGE-93 D5: *"The synthetic-evidence bridge is distinct from the code-quality-gate residual-acceptance that ACR-156/162/163 retracts (those retractions apply to non-LOW *quality* gates specifically, not procedural-evidence gates). The underlying FIRST-LOG-LINE rule is structurally unenforceable in the current dispatch shape (the `agents` runner prepends `OULIPOLY_INVOCATION` + `OULIPOLY_SESSION` as strictly-first stdout lines); a separate urgent ACR ticket is filed by the manager for the permanent structural fix, which will supersede this bridge."*
+
+The AGE-113 finding is even cleaner than AGE-93 D4/D5 because (a) the alignment review explicitly verified the Step 6b tests are aligned with the contract BEFORE Step 6c dispatched, and (b) Step 6c's product code is greenfield eval code with no production-runtime overlap — the tests COULDN'T have been written against pre-existing product code because none existed.
+
+**Manager-owned escalation pending**: per AGE-93 D5, a separate ACR ticket is filed for the permanent structural fix of the `consumed:` echo rule (so that the agents-runner injects a wrapper script around Step 6c that emits the echoes automatically, or the orchestrator parses the agent's own response narrative for path mentions and uses those as the consumption-evidence). This DECISIONS entry is a procedural-evidence bridge, not a permanent escape hatch.
+
+**Evidence**: `.scratch/logs/age-113-phase-6c.log` (gate-pass record); `df8eab7` commit (product code matches Step 6b tests); `alignment/age-113-tests-contracts.md` Round 2 verdict ALIGNED; AGE-93 D5 precedent in this DECISIONS file.
+
+**Resume point**: Phase 6 prototype risk review → Step 6c post-prototype derivation check (expected no-trigger for single-component WU) → multi-layer acceptance check → per-component code-quality fanout → halt-state gate → Process-tree audit #2.

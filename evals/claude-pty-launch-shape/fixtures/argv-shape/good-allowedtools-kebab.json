@@ -1,0 +1,26 @@
+{
+  "case_id": "good-allowedtools-kebab",
+  "argv_source": "production_allowed_tools_family",
+  "provider": {
+    "command": "claude",
+    "interactive_args": [],
+    "tool_restrictions": {
+      "kind": "claude",
+      "claude": {
+        "allowed_tools": [
+          "mcp__age104p2__Task"
+        ],
+        "disallowed_tools": []
+      }
+    }
+  },
+  "rendered_argv": [
+    "claude",
+    "--allowed-tools",
+    "mcp__age104p2__Task"
+  ],
+  "expected": {
+    "verdict": "pass",
+    "reason": "Kebab-case --allowed-tools is accepted as the codebase allowed-tools family, with live PTY equivalence tracked as A4 residual unless separately proven."
+  }
+}
