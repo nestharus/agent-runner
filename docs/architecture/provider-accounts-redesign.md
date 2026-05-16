@@ -387,6 +387,8 @@ execute:
   claude --profile {profile} --model {model} {param_flags} {prompt}
 ```
 
+For interactive PTY MCP replacement launches against Claude Code, the `execute` step above is illustrative only — the load-bearing constraint on tool-filter flags lives in [`docs/architecture/claude-proxy-mcp-launch-shape.md`](./claude-proxy-mcp-launch-shape.md), which mandates `--allowedTools mcp__<server>__<tool>,...` (or no filter) and forbids `--tools mcp__<server>__<tool>,...` for that mode. Read that runbook before changing how this integration constructs Claude launch argv.
+
 ### Version-Aware Integration
 
 Integration scripts are tagged with the CLI version they were written for:
@@ -404,6 +406,8 @@ When a version change is detected:
 3. Opus updates parameter mappings and integration scripts
 4. Sonnet regenerates specialized agents
 5. Haiku's knowledge is refreshed
+
+For Claude Code specifically, the version-bump procedure is anchored in [`docs/architecture/claude-proxy-mcp-launch-shape.md`](./claude-proxy-mcp-launch-shape.md) — see that runbook's `Version-Bump Runbook` and `Affected Claude Code Versions` sections before marking a Claude integration as re-verified.
 
 ---
 
