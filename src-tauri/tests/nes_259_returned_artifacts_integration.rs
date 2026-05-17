@@ -234,7 +234,19 @@ printf 'provider stdout'"#,
     let output = fixture.run_one_shot();
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
-    assert_eq!(output.stdout, b"provider stdout".to_vec());
+    // run_with_balancing now appends a single-line `OULIPOLY_RESULT={...}` envelope
+    // after the provider stdout; the spirit of "preserves stdout" is now "preserves
+    // the provider-stdout PREFIX."
+    assert!(
+        output.stdout.starts_with(b"provider stdout"),
+        "{:?}",
+        output.stdout
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("OULIPOLY_RESULT="),
+        "{:?}",
+        output.stdout
+    );
     let invocation_id = parse_invocation(&String::from_utf8_lossy(&output.stderr));
     let db = fixture.open_db();
     let row = db.get_invocation_by_uuid(&invocation_id).unwrap().unwrap();

@@ -2331,3 +2331,30 @@ The AGE-113 finding is even cleaner than AGE-93 D4/D5 because (a) the alignment 
   - New worktree HEAD: `4d0d168 feat(evals): add Claude proxy PTY launch-shape regression eval (#92)`
   - AGE-114 runbook now present: `docs/architecture/claude-proxy-mcp-launch-shape.md`
   - `planning/age-115-upstream-bug-report-decision/research/age-115-hookpoints.md` (the hookpoint research that triggered the update)
+
+---
+
+### AGE-121 — Phase 0 (resume-at-Phase-8 adoption of rca-output-pre-applied)
+
+**Decision**: Adopt the rca-orchestrator's verified-green Phase 5 + Phase 6 output for AGE-121 (WU-1: pipeline-status propagation, F1 fix, A+C+E+G hybrid design). The implementation-pipeline-orchestrator session resumes at Phase 8 per the caller dispatch (`pipeline_entry_mode=rca-output-pre-applied`, `auto_merge_after_phase_9=true`). Do NOT re-author Phase 0/1/2/3/4/5/6 work.
+
+**Predecessor**: rca-orchestrator session `c556ceb6-c548-4d0e-9f3d-3e104c5bc369`; dossier at `/home/nes/projects/ai/planning/rca-agent-runner-crashes-2026-05-16/`.
+
+**Worktree state at adoption**: branch `rca-agent-runner-crashes-2026-05-16` at tip `4d0d168` (= main), 5 modified + 3 new test files uncommitted. Diff stat: `5 files changed, 203 insertions(+), 23 deletions(-)` plus three new test files in `src-tauri/tests/pipeline_status_propagation_rca/`.
+
+**Why no inline estimate-question gate**: `${scratch_dir}/ticket.md` has `story_point_estimate=null, estimate_source=missing`, which would normally trigger Phase 2.5 step 4a's cold-start NEEDS_INPUT. The caller-prompt explicitly directs resume-at-Phase-8 adoption of the rca-orchestrator's verified design; the rca's Phase 3 evaluated four named design options against the failing-test contract, and Phase 4 produced an exhaustive application plan with resolved open questions and explicit regression analysis. That evidence dispositions the prototype-vs-no-baseline-vs-terminate gate at the WU level. Per `~/ai/conventions/agent-questions-and-session-graph.md` (caller-prompt precedence), the orchestrator does not re-issue a question that the caller has already answered with evidence-bearing context.
+
+**Why no Phase 6 re-dispatch**: per the caller anti-scope ("DO NOT re-author Phase 0/1/2/3/4/5/6 work"), the implementation-pipeline-orchestrator validates that the rca outputs satisfy the Phase 6 contract via the adoption-evidence document at `${planning_dir}/.scratch/rca-adoption-evidence.md`. That document maps the five caller-named contract elements (Step 6a + Step 6b + Step 6c + alignment review + process-tree audit #2) to their rca equivalents, and explicitly declares Phase 6 sub-elements that are non-applicable to this WU (no prototype, no recursive component decomposition, no current-layer component-pair integration).
+
+**This is NOT a quality-gate residual acceptance**: per the caller anti-scope ("NO quality-gate residual acceptance (ACR-156/162/163 + ACR-242 enforcement)"), no Phase 4 / Phase 6 / Phase 8 gate verdict is being accepted at MEDIUM or HIGH. The adoption pattern is: a sibling workflow (rca-orchestrator) produced verified-green evidence (10/10 cargo PASS commands, target test independently re-run PASS) for the Phase 6 surface; the implementation-pipeline-orchestrator adopts that evidence rather than re-dispatching equivalent work. Phase 8 PR-review gates run normally against the diff and must clear LOW; any MEDIUM/HIGH verdict from Phase 8 halts the pipeline (the consume-rule precedent in this DECISIONS file applies to procedural-evidence gates only, not quality gates).
+
+**This is NOT a consume-rule waiver**: the AGE-105 disposition (`BLOCKED:consumed-rule-unenforceable`) and the AGE-93 D5 precedent in this DECISIONS file both address the `consumed:` echo rule in Step 6c dispatches WITHIN this orchestrator's tree. AGE-121 has no Step 6c dispatch in this orchestrator's tree — the implementation was authored by rca-orchestrator Phase 5, which has its own procedural-evidence chain (the apply step's diff-summary and verification table in `${rca_dossier}/rca/agent-runner-crashes-2026-05-16-applied.md`).
+
+**Risk hedges per caller anti-scope**:
+
+- If auditor oscillation fires on the rca-applied diff during Phase 8 (ACR-246 territory), halt as `BLOCKED:auditor-strictness` per the AGE-116 disposition. Do NOT churn the rca's work to chase findings.
+- If a Phase 8 gate hits the `consumed:` rule wall (ACR-247 territory) — which it should not because Phase 8 is PR-review, not Step 6c — halt as `BLOCKED:consumed-rule-unenforceable` per the AGE-105 disposition.
+
+**Evidence**: `${planning_dir}/.scratch/rca-adoption-evidence.md` (Phase 6 contract mapping); `${planning_dir}/session.json` (records `pipeline_entry_mode=rca-output-pre-applied` + `predecessor_workflow.session_id`); rca dossier `applied.md`, `fix-decision.md`, `application-plan.md`; worktree diff at tip `4d0d168`.
+
+**Resume point**: commit the worktree diff (one squash-eligible commit per `~/ai/conventions/commit-hygiene.md`) → Phase 8 PR-review gates → Phase 8.X closure-judge → Phase 9 auto-merge.

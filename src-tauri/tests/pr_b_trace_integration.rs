@@ -334,10 +334,9 @@ fn default_cli_flow_still_runs_without_subcommand() {
     let output = fixture.run_default_execution();
 
     assert!(output.status.success(), "{output:?}");
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
-        "fixture-response\n"
-    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("fixture-response\n"), "{stdout}");
+    assert!(stdout.contains("OULIPOLY_RESULT="), "{stdout}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("OULIPOLY_INVOCATION="), "{stderr}");
 }

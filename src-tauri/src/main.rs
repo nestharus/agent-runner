@@ -816,6 +816,32 @@ fn should_emit_invocation_line(is_terminal: bool) -> bool {
     !is_terminal
 }
 
+fn emit_result_envelope(
+    uuid: &str,
+    success: bool,
+    exit_code: i32,
+    error_category: Option<&str>,
+    terminal_reason: Option<&str>,
+) {
+    let payload = serde_json::json!({
+        "id": uuid,
+        "status": if success { "succeeded" } else { "failed" },
+        "success": success,
+        "exit_code": exit_code,
+        "terminal_reason": terminal_reason,
+        "error_category": error_category,
+        "finished_at": chrono::Utc::now().to_rfc3339(),
+    });
+    let json = match serde_json::to_string(&payload) {
+        Ok(s) => s,
+        Err(err) => {
+            eprintln!("Warning: Failed to serialize result envelope for {uuid}: {err}");
+            return;
+        }
+    };
+    println!("OULIPOLY_RESULT={json}");
+}
+
 fn effective_spawn_cwd(working_dir: Option<&Path>) -> Result<PathBuf, String> {
     match working_dir {
         Some(dir) if dir.is_absolute() => Ok(dir.to_path_buf()),
@@ -2164,6 +2190,7 @@ fn run_with_balancing(
             })
             .map_err(|err| err.to_string())?
             .invocation_row_id;
+        let mut guard = FinalizerGuard::new(&state, invocation_row_id);
         let start_known_provider_session_id =
             executor::cli::start_known_provider_session_id(&provider)?;
         if let Some(provider_session_id) = start_known_provider_session_id.as_deref() {
@@ -2229,6 +2256,14 @@ fn run_with_balancing(
                     .unwrap_or_else(|finalize_err| {
                         eprintln!("Warning: Failed to finalize invocation: {finalize_err}")
                     });
+                emit_result_envelope(
+                    &invocation.id,
+                    false,
+                    -1,
+                    Some("spawn_error"),
+                    Some("spawn_error"),
+                );
+                guard.mark_finalized();
                 return Err(err.to_string());
             }
         };
@@ -2298,6 +2333,14 @@ fn run_with_balancing(
                 })
                 .map(|_| ())
                 .unwrap_or_else(|e| eprintln!("Warning: Failed to finalize invocation: {e}"));
+            emit_result_envelope(
+                &invocation.id,
+                false,
+                1,
+                Some("returned_artifacts"),
+                Some("returned_artifacts_persist_failed"),
+            );
+            guard.mark_finalized();
             return Ok(1);
         }
 
@@ -2313,6 +2356,7 @@ fn run_with_balancing(
             })
             .map(|_| ())
             .unwrap_or_else(|e| eprintln!("Warning: Failed to finalize invocation: {e}"));
+        guard.mark_finalized();
 
         if success {
             let ingest_effective_cwd = effective_spawn_cwd(working_dir)?;
@@ -2350,6 +2394,13 @@ fn run_with_balancing(
 
         if success {
             let _ = std::io::stdout().write_all(&result.stdout);
+            emit_result_envelope(
+                &invocation.id,
+                success,
+                result.exit_code,
+                error_category.as_deref(),
+                result.terminal_reason.as_deref(),
+            );
             return Ok(result.exit_code);
         }
         if quota_exhausted {
@@ -2361,6 +2412,13 @@ fn run_with_balancing(
             continue;
         }
 
+        emit_result_envelope(
+            &invocation.id,
+            success,
+            result.exit_code,
+            error_category.as_deref(),
+            result.terminal_reason.as_deref(),
+        );
         eprintln!("{}", result.stderr);
         if let Some(ref cat) = error_category {
             eprintln!("[diagnostics: {cat}]");
