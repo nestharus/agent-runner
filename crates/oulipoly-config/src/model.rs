@@ -1,7 +1,16 @@
+use crate::claude_tool_filter::{ClaudeToolFilterShape, validate_proxy_claude_filter_shape};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::fmt;
 use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum InvocationMode {
+    #[default]
+    Headless,
+    Proxy,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
@@ -26,6 +35,8 @@ pub struct ProviderConfig {
     pub system_prompt_override: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_restrictions: Option<ToolRestrictions>,
+    #[serde(default)]
+    pub invocation_mode: InvocationMode,
 }
 
 impl ProviderConfig {
@@ -44,9 +55,11 @@ impl ProviderConfig {
             session_storage: None,
             system_prompt_override: None,
             tool_restrictions: None,
+            invocation_mode: InvocationMode::Headless,
         }
     }
 
+    #[allow(dead_code)]
     fn validate_interactive_args(&self) -> Result<(), String> {
         if matches!(self.interactive_args.as_ref(), Some(args) if args.is_empty()) {
             return Err("interactive_args must not be empty when provided".into());
@@ -54,6 +67,7 @@ impl ProviderConfig {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn validate_resume_interactive_args(&self) -> Result<(), String> {
         if matches!(
             self.resume.as_ref().map(|resume| resume.kind),
@@ -79,6 +93,7 @@ impl ProviderConfig {
             session_storage: None,
             system_prompt_override: None,
             tool_restrictions: None,
+            invocation_mode: InvocationMode::Headless,
         }
     }
 }
@@ -535,7 +550,8 @@ impl ModelConfig {
 
 // --- Raw TOML structures for deserialization ---
 
-#[derive(Deserialize)]
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
 struct RawModelToml {
     command: Option<String>,
     args: Option<Vec<String>>,
@@ -549,7 +565,8 @@ struct RawModelToml {
     inputs: Option<Vec<RawInput>>,
 }
 
-#[derive(Deserialize)]
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
 struct RawProvider {
     #[serde(default)]
     name: Option<String>,
@@ -563,9 +580,13 @@ struct RawProvider {
     session_storage: Option<SessionStorage>,
     system_prompt_override: Option<String>,
     tool_restrictions: Option<ToolRestrictions>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    invocation_mode: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
 struct RawInput {
     name: String,
     #[serde(rename = "type")]
@@ -586,6 +607,413 @@ struct RawInput {
     max_items: Option<usize>,
 }
 
+#[derive(Debug)]
+pub enum ModelError {
+    Io(std::io::Error),
+    Toml(String, String),
+    InvocationModeIsRootOnly { model: String, provider: String },
+    Other(String, String),
+}
+
+impl ModelError {
+    fn with_model_name(self, name: &str) -> Self {
+        match self {
+            Self::Toml(model, err) if model == "<unknown>" => Self::Toml(name.to_string(), err),
+            Self::InvocationModeIsRootOnly { model, provider } if model == "<unknown>" => {
+                Self::InvocationModeIsRootOnly {
+                    model: name.to_string(),
+                    provider,
+                }
+            }
+            Self::Other(model, err) if model == "<unknown>" => {
+                Self::Other(name.to_string(), err.replace("<unknown>", name))
+            }
+            other => other,
+        }
+    }
+
+    pub fn contains(&self, needle: &str) -> bool {
+        self.to_string().contains(needle)
+    }
+}
+
+impl fmt::Display for ModelError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(err) => write!(f, "io error reading model TOML: {err}"),
+            Self::Toml(model, err) => write!(f, "toml parse error in model {model}: {err}"),
+            Self::InvocationModeIsRootOnly { model, provider } => write!(
+                f,
+                "model {model}: provider {provider}: invocation_mode is root-only and must move to providers.toml"
+            ),
+            Self::Other(model, err) => write!(f, "model {model} {err}"),
+        }
+    }
+}
+
+impl std::error::Error for ModelError {}
+
+impl From<std::io::Error> for ModelError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+impl From<ModelError> for String {
+    fn from(value: ModelError) -> Self {
+        value.to_string()
+    }
+}
+
+impl PartialEq for ModelError {
+    fn eq(&self, other: &Self) -> bool {
+        use ModelError::*;
+        match (self, other) {
+            (Io(left), Io(right)) => left.to_string() == right.to_string(),
+            (Toml(left_model, left_err), Toml(right_model, right_err)) => {
+                left_model == right_model && left_err == right_err
+            }
+            (
+                InvocationModeIsRootOnly {
+                    model: left_model,
+                    provider: left_provider,
+                },
+                InvocationModeIsRootOnly {
+                    model: right_model,
+                    provider: right_provider,
+                },
+            ) => left_model == right_model && left_provider == right_provider,
+            (Other(left_model, left_err), Other(right_model, right_err)) => {
+                left_model == right_model && left_err == right_err
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ModelError {}
+
+#[allow(dead_code)]
+fn parse_model_toml(text: &str) -> Result<RawModelToml, ModelError> {
+    toml::from_str(text).map_err(|err| ModelError::Toml("<unknown>".to_string(), err.to_string()))
+}
+
+#[allow(dead_code)]
+fn validate_model_toml_against_providers(
+    raw: &RawModelToml,
+    providers: Option<&crate::providers::ProvidersConfig>,
+) -> Result<(), ModelError> {
+    validate_raw_model_provider_fields(raw)?;
+    let model = apply_model_construction(raw);
+    validate_provider_aware_shape("<unknown>", &model, providers)
+}
+
+fn validate_raw_model_provider_fields(raw: &RawModelToml) -> Result<(), ModelError> {
+    validate_legacy_model_fields(raw)?;
+    validate_raw_model_providers(raw)?;
+    if let Some(inputs) = raw.inputs.clone() {
+        parse_inputs(inputs).map_err(|err| ModelError::Other("<unknown>".to_string(), err))?;
+    }
+    Ok(())
+}
+
+fn apply_model_construction(raw: &RawModelToml) -> ModelConfig {
+    construct_model_config_from_raw(raw.clone())
+}
+
+fn validate_provider_aware_shape(
+    model_name: &str,
+    model: &ModelConfig,
+    providers: Option<&crate::providers::ProvidersConfig>,
+) -> Result<(), ModelError> {
+    if let Some(providers) = providers {
+        validate_codex_model_arg_overlap(model_name, model, providers)
+            .map_err(|err| ModelError::Other(model_name.to_string(), err))?;
+        validate_proxy_claude_model_shape(model_name, model, providers)?;
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn construct_model_config_from_raw(raw: RawModelToml) -> ModelConfig {
+    let providers = raw
+        .providers
+        .unwrap_or_default()
+        .into_iter()
+        .map(raw_provider_to_config)
+        .collect();
+    let inputs = raw
+        .inputs
+        .map(parse_inputs)
+        .transpose()
+        .expect("validated model inputs")
+        .unwrap_or_default();
+    ModelConfig {
+        name: String::new(),
+        prompt_mode: raw
+            .prompt_mode
+            .as_deref()
+            .map(crate::providers::parse_prompt_mode)
+            .unwrap_or(PromptMode::Stdin),
+        providers,
+        inputs,
+    }
+}
+
+#[allow(dead_code)]
+fn emit_model_toml(model: &ModelConfig) -> String {
+    model.to_toml()
+}
+
+#[allow(dead_code)]
+fn read_model_files(dir: &Path) -> Result<Vec<(PathBuf, String)>, ModelError> {
+    list_model_toml_paths(dir)?
+        .into_iter()
+        .map(|path| {
+            let text = read_file_contents(&path)?;
+            Ok(pair_path_and_text(path, text))
+        })
+        .collect()
+}
+
+fn read_model_dir_paths(dir: &Path) -> Result<Vec<PathBuf>, ModelError> {
+    let mut paths = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(paths),
+        Err(err) => return Err(ModelError::Io(err)),
+    };
+    for entry in entries {
+        let entry = entry?;
+        paths.push(entry.path());
+    }
+    Ok(paths)
+}
+
+fn select_toml_paths(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    paths.retain(|path| path.extension().and_then(|ext| ext.to_str()) == Some("toml"));
+    paths.sort();
+    paths
+}
+
+fn list_model_toml_paths(dir: &Path) -> Result<Vec<PathBuf>, ModelError> {
+    Ok(select_toml_paths(read_model_dir_paths(dir)?))
+}
+
+fn read_file_contents(path: &Path) -> Result<String, ModelError> {
+    std::fs::read_to_string(path).map_err(ModelError::Io)
+}
+
+fn pair_path_and_text(path: PathBuf, text: String) -> (PathBuf, String) {
+    (path, text)
+}
+
+#[allow(dead_code)]
+fn parse_model_files(
+    files: Vec<(PathBuf, String)>,
+) -> Result<Vec<(PathBuf, RawModelToml)>, ModelError> {
+    files
+        .into_iter()
+        .map(|(path, text)| {
+            let raw = parse_model_toml(&text).map_err(|err| match model_name_from_path(&path) {
+                Ok(name) => err.with_model_name(&name),
+                Err(_) => err,
+            })?;
+            Ok((path, raw))
+        })
+        .collect()
+}
+
+#[allow(dead_code)]
+fn validate_models_against_providers(
+    raws: &[(PathBuf, RawModelToml)],
+    providers: Option<&crate::providers::ProvidersConfig>,
+) -> Result<(), ModelError> {
+    for (path, raw) in raws {
+        let name = model_name_from_path(path)?;
+        validate_model_toml_against_providers(raw, providers)
+            .map_err(|err| err.with_model_name(&name))?;
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn model_name_from_path(path: &Path) -> Result<String, ModelError> {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| {
+            ModelError::Other(
+                "<unknown>".to_string(),
+                format!("invalid model filename {}", path.display()),
+            )
+        })
+}
+
+fn validate_legacy_model_fields(raw: &RawModelToml) -> Result<(), ModelError> {
+    if raw.command.is_some()
+        || raw.args.is_some()
+        || raw.interactive_args.is_some()
+        || raw.resume.is_some()
+        || raw.prompt_mode.is_some()
+        || raw.session_capture.is_some()
+        || raw.resume_acceptance.is_some()
+        || raw.session_storage.is_some()
+    {
+        return Err(ModelError::Other(
+            "<unknown>".to_string(),
+            "Old per-provider config detected in <unknown>.toml; keep runtime provider fields in providers.toml and run `agents migrate-config` to repair existing files."
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_raw_model_providers(raw: &RawModelToml) -> Result<(), ModelError> {
+    let providers = raw
+        .providers
+        .as_ref()
+        .filter(|providers| !providers.is_empty())
+        .ok_or_else(|| {
+            ModelError::Other(
+                "<unknown>".to_string(),
+                "model must declare at least one [[providers]]".to_string(),
+            )
+        })?;
+
+    for provider in providers {
+        let provider_name = raw_provider_name(provider);
+        if provider.command.is_some()
+            || provider.resume.is_some()
+            || provider.prompt_mode.is_some()
+            || provider.session_capture.is_some()
+            || provider.resume_acceptance.is_some()
+            || provider.session_storage.is_some()
+        {
+            return Err(ModelError::Other(
+                "<unknown>".to_string(),
+                format!(
+                    "Old per-provider config detected in <unknown>.toml provider {provider_name}; keep runtime provider fields in providers.toml and run `agents migrate-config` to repair existing files."
+                ),
+            ));
+        }
+        if provider.system_prompt_override.is_some() || provider.tool_restrictions.is_some() {
+            return Err(ModelError::Other(
+                "<unknown>".to_string(),
+                format!(
+                    "provider {provider_name}: system_prompt_override and tool_restrictions are root-only provider settings; move them to providers.toml"
+                ),
+            ));
+        }
+        if provider.invocation_mode.is_some() {
+            return Err(ModelError::InvocationModeIsRootOnly {
+                model: "<unknown>".to_string(),
+                provider: provider_name,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn raw_provider_name(provider: &RawProvider) -> String {
+    provider.name.clone().unwrap_or_else(|| {
+        provider
+            .command
+            .as_deref()
+            .map(|command| derive_provider_name(command, provider.args.as_deref().unwrap_or(&[])))
+            .unwrap_or_else(|| "<unknown>".to_string())
+    })
+}
+
+fn raw_provider_to_config(raw: RawProvider) -> ProviderConfig {
+    let args = raw.args.unwrap_or_default();
+    let name = raw.name.unwrap_or_else(|| {
+        raw.command
+            .as_deref()
+            .map(|command| derive_provider_name(command, &args))
+            .unwrap_or_default()
+    });
+    ProviderConfig {
+        name,
+        command: String::new(),
+        args,
+        interactive_args: raw.interactive_args,
+        resume: None,
+        session_capture: None,
+        resume_acceptance: None,
+        session_storage: None,
+        system_prompt_override: None,
+        tool_restrictions: None,
+        invocation_mode: InvocationMode::Headless,
+    }
+}
+
+fn validate_proxy_claude_model_shape(
+    model_name: &str,
+    model: &ModelConfig,
+    providers: &crate::providers::ProvidersConfig,
+) -> Result<(), ModelError> {
+    for model_provider in &model.providers {
+        if !is_claude_provider(model_provider, providers) {
+            continue;
+        }
+        let Some(effective) = resolve_effective_provider_for_model(model_provider, providers)
+        else {
+            continue;
+        };
+        let argv = build_provider_argv_tokens(&effective);
+        let shape =
+            ClaudeToolFilterShape::detect_in_argv(&argv).unwrap_or(ClaudeToolFilterShape::NoFilter);
+        validate_proxy_claude_filter_shape(effective.invocation_mode, shape).map_err(|err| {
+            ModelError::Other(
+                model_name.to_string(),
+                format!("provider {}: {err}", model_provider.name),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn is_claude_provider(
+    model_provider: &ProviderConfig,
+    providers: &crate::providers::ProvidersConfig,
+) -> bool {
+    let Some(root) = providers.get(&model_provider.name) else {
+        return false;
+    };
+    let root_family = derive_provider_name(
+        root.command.as_deref().unwrap_or(&model_provider.name),
+        &root.args,
+    );
+    root_family
+        .rsplit('/')
+        .next()
+        .unwrap_or(&root_family)
+        .starts_with("claude")
+        || model_provider.name.starts_with("claude")
+}
+
+fn resolve_effective_provider_for_model(
+    model_provider: &ProviderConfig,
+    providers: &crate::providers::ProvidersConfig,
+) -> Option<ProviderConfig> {
+    providers
+        .effective_provider(model_provider)
+        .ok()
+        .map(|(effective, _)| effective)
+}
+
+fn build_provider_argv_tokens(provider: &ProviderConfig) -> Vec<String> {
+    let mut argv = crate::providers::shell_split(&provider.command);
+    argv.extend(provider.args.iter().cloned());
+    if let Some(interactive_args) = provider.interactive_args.as_ref() {
+        argv.extend(interactive_args.iter().cloned());
+    }
+    argv
+}
+
+#[allow(dead_code)]
 fn parse_input_type(raw: &RawInput) -> Result<InputType, String> {
     match raw.type_name.as_str() {
         "string" => Ok(InputType::String),
@@ -620,6 +1048,7 @@ fn parse_input_type(raw: &RawInput) -> Result<InputType, String> {
     }
 }
 
+#[allow(dead_code)]
 fn parse_inputs(raw_inputs: Vec<RawInput>) -> Result<Vec<InputDef>, String> {
     let mut inputs = Vec::new();
     let mut has_default_input = false;
@@ -750,131 +1179,39 @@ impl ModelConfig {
         out
     }
 
-    pub fn from_toml(name: &str, content: &str) -> Result<Self, String> {
-        let raw: RawModelToml =
-            toml::from_str(content).map_err(|e| format!("TOML parse error for {name}: {e}"))?;
-
-        if raw.command.is_some()
-            || raw.args.is_some()
-            || raw.interactive_args.is_some()
-            || raw.resume.is_some()
-            || raw.session_capture.is_some()
-            || raw.session_storage.is_some()
-            || raw.resume_acceptance.is_some()
-            || raw.prompt_mode.is_some()
-        {
-            return Err(format!(
-                "Old per-provider config detected in {name}.toml; run `agents migrate-config` to migrate."
-            ));
-        }
-
-        let prompt_mode = PromptMode::Stdin;
-
-        let inputs = if let Some(raw_inputs) = raw.inputs {
-            parse_inputs(raw_inputs)?
-        } else {
-            vec![]
-        };
-
-        let providers = if let Some(providers) = raw.providers {
-            providers
-                .into_iter()
-                .map(|p| {
-                    if p.system_prompt_override.is_some() {
-                        let provider_name = p.name.as_deref().unwrap_or("<unnamed>");
-                        return Err(format!(
-                            "model {name} provider {provider_name}: system_prompt_override is root-only; move to providers.toml"
-                        ));
-                    }
-                    if p.tool_restrictions.is_some() {
-                        let provider_name = p.name.as_deref().unwrap_or("<unnamed>");
-                        return Err(format!(
-                            "model {name} provider {provider_name}: tool_restrictions is root-only; move to providers.toml"
-                        ));
-                    }
-                    if p.command.is_some()
-                        || p.resume.is_some()
-                        || p.session_capture.is_some()
-                        || p.session_storage.is_some()
-                        || p.resume_acceptance.is_some()
-                        || p.prompt_mode.is_some()
-                    {
-                        return Err(format!(
-                            "Old per-provider config detected in {name}.toml; run `agents migrate-config` to migrate."
-                        ));
-                    }
-                    let args = p.args.unwrap_or_default();
-                    let name = p
-                        .name
-                        .ok_or_else(|| format!("Model {name}: provider entry missing `name`"))?;
-                    Ok(ProviderConfig {
-                        name,
-                        command: String::new(),
-                        args,
-                        interactive_args: p.interactive_args,
-                        resume: None,
-                        session_capture: None,
-                        resume_acceptance: None,
-                        session_storage: None,
-                        system_prompt_override: None,
-                        tool_restrictions: None,
-                    })
-                })
-                .collect::<Result<Vec<_>, String>>()?
-        } else {
-            return Err(format!(
-                "Model {name}: must define at least one [[providers]] entry"
-            ));
-        };
-
-        // Validate per-kind required fields on session_capture before
-        // returning. Catching malformed configs at load time means the
-        // executor never sees a kind=ForcedFlagVerified missing `flag`
-        // (silent capture failure → silent transcript_state=missing).
-        for p in &providers {
-            p.validate_interactive_args()
-                .map_err(|e| format!("Model {name} provider {}: {e}", p.name))?;
-            if let Some(resume) = &p.resume {
-                resume
-                    .validate()
-                    .map_err(|e| format!("Model {name} provider {}: {e}", p.name))?;
-                p.validate_resume_interactive_args()
-                    .map_err(|e| format!("Model {name} provider {}: {e}", p.name))?;
-            }
-            if let Some(capture) = &p.session_capture {
-                capture
-                    .validate()
-                    .map_err(|e| format!("Model {name} provider {}: {e}", p.name))?;
-            }
-            if let Some(storage) = &p.session_storage {
-                storage
-                    .validate()
-                    .map_err(|e| format!("Model {name} provider {}: {e}", p.name))?;
-            }
-        }
-
-        if providers.is_empty() {
-            return Err(format!("Model {name}: no providers defined"));
-        }
-
-        Ok(ModelConfig {
-            name: name.to_string(),
-            prompt_mode,
-            providers,
-            inputs,
-        })
+    pub fn from_toml(
+        text: &str,
+        providers: Option<&crate::providers::ProvidersConfig>,
+    ) -> Result<Self, ModelError> {
+        let raw = parse_model_toml(text)?;
+        validate_model_toml_against_providers(&raw, providers)?;
+        Ok(construct_model_config_from_raw(raw))
     }
+
+    pub fn from_toml_with_name(
+        name: &str,
+        text: &str,
+        providers: Option<&crate::providers::ProvidersConfig>,
+    ) -> Result<Self, ModelError> {
+        let model = Self::from_toml(text, providers).map_err(|err| err.with_model_name(name))?;
+        Ok(apply_name_to_model(model, name))
+    }
+}
+
+fn apply_name_to_model(mut model: ModelConfig, name: &str) -> ModelConfig {
+    if model.name.is_empty() {
+        model.name = name.to_string();
+    }
+    model
 }
 
 pub fn render_validated_model_toml(
     model: &ModelConfig,
     providers: Option<&crate::providers::ProvidersConfig>,
-) -> Result<String, String> {
-    let rendered = model.to_toml();
-    let reparsed = ModelConfig::from_toml(&model.name, &rendered)?;
-    if let Some(providers) = providers {
-        validate_codex_model_arg_overlap(&model.name, &reparsed, providers)?;
-    }
+) -> Result<String, ModelError> {
+    let rendered = emit_model_toml(model);
+    let raw = parse_model_toml(&rendered)?;
+    validate_model_toml_against_providers(&raw, providers)?;
     Ok(rendered)
 }
 
@@ -921,6 +1258,7 @@ fn format_toml_value(v: &toml::Value) -> String {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum CodexArgPart {
     Standalone(String),
@@ -928,6 +1266,7 @@ enum CodexArgPart {
 }
 
 impl CodexArgPart {
+    #[allow(dead_code)]
     fn display(&self) -> String {
         match self {
             Self::Standalone(token) => token.clone(),
@@ -936,6 +1275,7 @@ impl CodexArgPart {
     }
 }
 
+#[allow(dead_code)]
 fn split_codex_arg_parts(args: &[String]) -> Vec<CodexArgPart> {
     let mut parts = Vec::new();
     let mut i = 0;
@@ -962,6 +1302,7 @@ fn split_codex_arg_parts(args: &[String]) -> Vec<CodexArgPart> {
     parts
 }
 
+#[allow(dead_code)]
 fn codex_arg_overlap(root_args: &[String], model_args: &[String]) -> Option<String> {
     let root_parts = split_codex_arg_parts(root_args)
         .into_iter()
@@ -973,10 +1314,12 @@ fn codex_arg_overlap(root_args: &[String], model_args: &[String]) -> Option<Stri
         .map(|part| part.display())
 }
 
+#[allow(dead_code)]
 fn codex_config_pair_key(value: &str) -> &str {
     value.split_once('=').map(|(key, _)| key).unwrap_or(value)
 }
 
+#[allow(dead_code)]
 fn codex_model_config_pair_keys(args: &[String]) -> HashSet<String> {
     split_codex_arg_parts(args)
         .into_iter()
@@ -987,6 +1330,7 @@ fn codex_model_config_pair_keys(args: &[String]) -> HashSet<String> {
         .collect()
 }
 
+#[allow(dead_code)]
 fn codex_typed_policy_overlap(
     root: &crate::providers::ProviderEntry,
     model_args: &[String],
@@ -1010,6 +1354,7 @@ fn codex_typed_policy_overlap(
         .map(|pair| pair.to_string())
 }
 
+#[allow(dead_code)]
 pub(crate) fn validate_codex_model_arg_overlap(
     model_name: &str,
     model: &ModelConfig,
@@ -1064,41 +1409,24 @@ pub(crate) fn validate_codex_model_arg_overlap(
 pub fn load_models(
     models_dir: &Path,
     providers: Option<&crate::providers::ProvidersConfig>,
-) -> Result<HashMap<String, ModelConfig>, String> {
-    let mut models = HashMap::new();
+) -> Result<HashMap<String, ModelConfig>, ModelError> {
+    let files = read_model_files(models_dir)?;
+    let raws = parse_model_files(files)?;
+    validate_models_against_providers(&raws, providers)?;
+    build_named_model_map(raws)
+}
 
-    if !models_dir.is_dir() {
-        return Ok(models);
-    }
-
-    let entries =
-        fs::read_dir(models_dir).map_err(|e| format!("Failed to read models directory: {e}"))?;
-
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("Failed to read directory entry: {e}"))?;
-        let path = entry.path();
-
-        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
-            continue;
-        }
-
-        let name = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| format!("Invalid filename: {}", path.display()))?
-            .to_string();
-
-        let content = fs::read_to_string(&path)
-            .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
-
-        let config = ModelConfig::from_toml(&name, &content)?;
-        if let Some(providers) = providers {
-            validate_codex_model_arg_overlap(&name, &config, providers)?;
-        }
-        models.insert(name, config);
-    }
-
-    Ok(models)
+fn build_named_model_map(
+    raws: Vec<(PathBuf, RawModelToml)>,
+) -> Result<HashMap<String, ModelConfig>, ModelError> {
+    raws.into_iter()
+        .map(|(path, raw)| {
+            let name = model_name_from_path(&path)?;
+            let mut model = construct_model_config_from_raw(raw);
+            model.name = name.clone();
+            Ok((name, model))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1107,8 +1435,46 @@ mod tests {
 
     use super::*;
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
+
+    fn function_body<'a>(source: &'a str, needle: &str) -> &'a str {
+        let start = source.find(needle).expect("function signature exists");
+        let brace_start = source[start..].find('{').expect("function body starts") + start;
+        let mut depth = 0usize;
+        for (offset, ch) in source[brace_start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[brace_start + 1..brace_start + offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("function body ends");
+    }
+
+    fn assert_contains_in_order(body: &str, expected: &[&str]) {
+        let mut cursor = 0usize;
+        for token in expected {
+            let found = body[cursor..]
+                .find(token)
+                .unwrap_or_else(|| panic!("missing orchestration call {token} in {body}"));
+            cursor += found + token.len();
+        }
+    }
+
+    fn assert_forbidden_absent(body: &str, forbidden: &[&str]) {
+        for token in forbidden {
+            assert!(
+                !body.contains(token),
+                "orchestration shell must not contain inline logic token {token}: {body}"
+            );
+        }
+    }
 
     fn write_providers_toml(root: &Path, body: &str) {
         fs::write(root.join("providers.toml"), body).unwrap();
@@ -1132,7 +1498,7 @@ mod tests {
 
         let providers = ProvidersConfig::load(&root.join("providers.toml")).unwrap();
         // AGE-40 Step 6c adds the `load_models(&Path, Option<&ProvidersConfig>)` signature.
-        load_models(&models_dir, Some(&providers))
+        Ok(load_models(&models_dir, Some(&providers))?)
     }
 
     fn test_model(provider_name: &str, args: &[&str]) -> ModelConfig {
@@ -1198,6 +1564,84 @@ mod tests {
     }
 
     #[test]
+    fn model_config_from_toml_orchestrates_parse_validate_construct() {
+        let body = function_body(
+            include_str!("model.rs"),
+            "pub fn from_toml(\n        text: &str,\n        providers: Option<&crate::providers::ProvidersConfig>,\n    ) -> Result<Self, ModelError>",
+        );
+
+        assert_contains_in_order(
+            body,
+            &[
+                "parse_model_toml",
+                "validate_model_toml_against_providers",
+                "construct_model_config_from_raw",
+            ],
+        );
+        assert_forbidden_absent(
+            body,
+            &[
+                "toml::from_str",
+                "parse_inputs",
+                "ProviderConfig {",
+                "validate_interactive_args",
+                "validate_resume_interactive_args",
+            ],
+        );
+    }
+
+    #[test]
+    fn render_validated_model_toml_orchestrates_emit_parse_validate() {
+        let body = function_body(
+            include_str!("model.rs"),
+            "pub fn render_validated_model_toml(",
+        );
+
+        assert_contains_in_order(
+            body,
+            &[
+                "emit_model_toml",
+                "parse_model_toml",
+                "validate_model_toml_against_providers",
+            ],
+        );
+        assert_forbidden_absent(
+            body,
+            &[
+                ".to_toml",
+                "ModelConfig::from_toml",
+                "validate_codex_model_arg_overlap",
+                "toml::from_str",
+            ],
+        );
+    }
+
+    #[test]
+    fn load_models_orchestrates_read_parse_validate_construct() {
+        let body = function_body(include_str!("model.rs"), "pub fn load_models(");
+
+        assert_contains_in_order(
+            body,
+            &[
+                "read_model_files",
+                "parse_model_files",
+                "validate_models_against_providers",
+                "build_named_model_map",
+            ],
+        );
+        assert_forbidden_absent(
+            body,
+            &[
+                "fs::read_dir",
+                "fs::read_to_string",
+                "ModelConfig::from_toml",
+                "validate_codex_model_arg_overlap",
+                "models.insert",
+            ],
+        );
+    }
+
+    #[test]
     fn derive_provider_name_simple() {
         assert_eq!(derive_provider_name("claude", &[]), "claude");
     }
@@ -1251,7 +1695,7 @@ name = "claude2"
 args = ["-p", "--model", "opus", "--output-format", "json"]
 interactive_args = ["--model", "opus"]
 "#;
-        let config = ModelConfig::from_toml("claude-opus", toml).unwrap();
+        let config = ModelConfig::from_toml_with_name("claude-opus", toml, None).unwrap();
         let provider = &config.providers[0];
 
         assert_eq!(provider.name, "claude2");
@@ -1286,13 +1730,13 @@ name = "prompt"
 type = "string"
 default_input = true
 "#;
-        let c1 = ModelConfig::from_toml("claude-opus", original).unwrap();
+        let c1 = ModelConfig::from_toml_with_name("claude-opus", original, None).unwrap();
         let rendered = c1.to_toml();
         assert!(!rendered.contains("command ="));
         assert!(!rendered.contains("prompt_mode"));
         assert!(!rendered.contains("session_storage"));
 
-        let c2 = ModelConfig::from_toml("claude-opus", &rendered).unwrap();
+        let c2 = ModelConfig::from_toml_with_name("claude-opus", &rendered, None).unwrap();
         assert_eq!(c1.providers.len(), c2.providers.len());
         assert_eq!(
             c1.providers[1].interactive_args,
@@ -1308,7 +1752,7 @@ default_input = true
 name = "prompt"
 type = "string"
 "#;
-        assert!(ModelConfig::from_toml("test", toml).is_err());
+        assert!(ModelConfig::from_toml_with_name("test", toml, None).is_err());
     }
 
     #[test]
@@ -1327,7 +1771,7 @@ name = "b"
 type = "string"
 default_input = true
 "#;
-        let result = ModelConfig::from_toml("test", toml);
+        let result = ModelConfig::from_toml_with_name("test", toml, None);
         assert!(result.unwrap_err().contains("only one input"));
     }
 
@@ -1341,7 +1785,7 @@ name = "test"
 name = "format"
 type = "enum"
 "#;
-        let result = ModelConfig::from_toml("test", toml);
+        let result = ModelConfig::from_toml_with_name("test", toml, None);
         assert!(result.unwrap_err().contains("requires 'options'"));
     }
 
@@ -1358,7 +1802,7 @@ prompt_mode = "stdin"
 kind = "flag"
 flag = "--resume"
 "#;
-        let err = ModelConfig::from_toml("claude-opus", toml).unwrap_err();
+        let err = ModelConfig::from_toml_with_name("claude-opus", toml, None).unwrap_err();
         assert!(err.contains("Old per-provider config detected in claude-opus.toml"));
         assert!(err.contains("agents migrate-config"));
     }
@@ -1378,7 +1822,7 @@ kind = "claude"
 disallowed_tools = ["Task"]
 "#;
 
-        let err = ModelConfig::from_toml("claude-opus", toml).unwrap_err();
+        let err = ModelConfig::from_toml_with_name("claude-opus", toml, None).unwrap_err();
 
         assert!(err.contains("model claude-opus provider claude"), "{err}");
         assert!(err.contains("system_prompt_override"), "{err}");
@@ -1393,7 +1837,7 @@ command = "claude"
 args = ["-p", "--model", "opus"]
 prompt_mode = "stdin"
 "#;
-        let err = ModelConfig::from_toml("claude-opus", toml).unwrap_err();
+        let err = ModelConfig::from_toml_with_name("claude-opus", toml, None).unwrap_err();
         assert!(err.contains("agents migrate-config"));
     }
 
@@ -1446,7 +1890,7 @@ args = ["-m", "gpt-5.5"]
         let model = test_model("codex", &["-m", "gpt-5.5"]);
 
         let rendered = super::render_validated_model_toml(&model, Some(&providers)).unwrap();
-        let reparsed = ModelConfig::from_toml("gpt-high", &rendered).unwrap();
+        let reparsed = ModelConfig::from_toml_with_name("gpt-high", &rendered, None).unwrap();
 
         assert_eq!(
             reparsed.providers[0].args,
@@ -1488,7 +1932,7 @@ args = ["-m", "gpt-5.5"]
         let model = test_model("codex", &["exec", "-m", "gpt-5.5"]);
 
         let rendered = super::render_validated_model_toml(&model, None).unwrap();
-        let reparsed = ModelConfig::from_toml("gpt-high", &rendered).unwrap();
+        let reparsed = ModelConfig::from_toml_with_name("gpt-high", &rendered, None).unwrap();
 
         assert_eq!(reparsed.providers[0].args[0], "exec");
     }
@@ -1862,5 +2306,260 @@ interactive_args = ["--dangerously-bypass-approvals-and-sandbox"]
                 "{name}: expected ok={expect_ok}, got {result:?}"
             );
         }
+    }
+
+    #[test]
+    fn provider_config_constructors_default_invocation_mode_to_headless() {
+        let direct = ProviderConfig::new("claude", vec!["-p".to_string()]);
+        let model = ProviderConfig::model_provider("claude", vec!["--model".to_string()]);
+
+        assert_eq!(direct.invocation_mode, InvocationMode::Headless);
+        assert_eq!(model.invocation_mode, InvocationMode::Headless);
+    }
+
+    #[test]
+    fn model_provider_rejects_invocation_mode_as_root_only() {
+        let err = ModelConfig::from_toml_with_name(
+            "claude-opus",
+            r#"
+[[providers]]
+name = "claude"
+args = ["--model", "opus"]
+invocation_mode = "proxy"
+"#,
+            None,
+        )
+        .unwrap_err();
+
+        match err {
+            ModelError::InvocationModeIsRootOnly { model, provider } => {
+                assert_eq!(model, "claude-opus");
+                assert_eq!(provider, "claude");
+            }
+            other => panic!("expected ModelError::InvocationModeIsRootOnly, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_models_rejects_proxy_claude_tools_mcp_filter_from_model_args_when_effective() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let models_dir = root.join("models");
+        write_providers_toml(
+            root,
+            r#"
+[claude]
+command = "claude"
+invocation_mode = "proxy"
+"#,
+        );
+        write_model_toml(
+            &models_dir,
+            "claude-opus",
+            r#"
+[[providers]]
+name = "claude"
+args = ["--tools", "mcp__age104p2__Task"]
+"#,
+        );
+        let providers = ProvidersConfig::load(&root.join("providers.toml")).unwrap();
+
+        let err = load_models(&models_dir, Some(&providers)).unwrap_err();
+
+        assert!(err.contains("claude-opus"), "{err}");
+        assert!(err.contains("proxy-mode Claude"), "{err}");
+        assert!(err.contains("--tools mcp__"), "{err}");
+    }
+
+    #[test]
+    fn render_validated_model_toml_omits_root_only_invocation_mode() {
+        let mut model = test_model("claude", &["--model", "opus"]);
+        model.providers[0].invocation_mode = InvocationMode::Proxy;
+
+        let rendered = render_validated_model_toml(&model, None).unwrap();
+
+        assert!(!rendered.contains("invocation_mode"), "{rendered}");
+        let reparsed = ModelConfig::from_toml_with_name("claude-opus", &rendered, None).unwrap();
+        assert_eq!(
+            reparsed.providers[0].invocation_mode,
+            InvocationMode::Headless
+        );
+    }
+
+    #[test]
+    fn model_roundtrip_rejects_provider_invocation_mode_as_root_only() {
+        let rendered = r#"
+[[providers]]
+name = "claude"
+args = ["--model", "opus"]
+invocation_mode = "proxy"
+"#;
+
+        let err = ModelConfig::from_toml_with_name("claude-opus", rendered, None).unwrap_err();
+
+        match err {
+            ModelError::InvocationModeIsRootOnly { model, provider } => {
+                assert_eq!(model, "claude-opus");
+                assert_eq!(provider, "claude");
+            }
+            other => panic!("expected ModelError::InvocationModeIsRootOnly, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_model_toml_returns_raw_struct_for_valid_text() {
+        let raw = parse_model_toml(
+            r#"
+[[providers]]
+name = "claude"
+args = ["--model", "opus"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(raw.providers.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn parse_model_toml_returns_err_for_malformed_text() {
+        let err = parse_model_toml("not = [").unwrap_err();
+
+        match err {
+            ModelError::Toml(model, message) => {
+                assert_eq!(model, "<unknown>");
+                assert!(!message.is_empty());
+            }
+            other => panic!("expected ModelError::Toml, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_model_toml_against_providers_rejects_root_only_mode() {
+        let raw = parse_model_toml(
+            r#"
+[[providers]]
+name = "claude"
+invocation_mode = "proxy"
+"#,
+        )
+        .unwrap();
+
+        let err = validate_model_toml_against_providers(&raw, None).unwrap_err();
+
+        match err {
+            ModelError::InvocationModeIsRootOnly { model, provider } => {
+                assert_eq!(model, "<unknown>");
+                assert_eq!(provider, "claude");
+            }
+            other => panic!("expected ModelError::InvocationModeIsRootOnly, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_model_toml_against_providers_passes_for_legal_model() {
+        let raw = parse_model_toml(
+            r#"
+[[providers]]
+name = "claude"
+args = ["--model", "opus"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(validate_model_toml_against_providers(&raw, None), Ok(()));
+    }
+
+    #[test]
+    fn construct_model_config_from_raw_preserves_legal_fields() {
+        let raw = parse_model_toml(
+            r#"
+[[providers]]
+name = "claude"
+args = ["--model", "opus"]
+"#,
+        )
+        .unwrap();
+
+        let model = construct_model_config_from_raw(raw);
+
+        assert_eq!(model.providers[0].name, "claude");
+        assert_eq!(model.providers[0].args, ["--model", "opus"]);
+        assert_eq!(model.providers[0].invocation_mode, InvocationMode::Headless);
+    }
+
+    #[test]
+    fn emit_model_toml_omits_invocation_mode_per_providers_block() {
+        let mut model = test_model("claude", &["--model", "opus"]);
+        model.providers[0].invocation_mode = InvocationMode::Proxy;
+
+        let rendered = emit_model_toml(&model);
+
+        assert!(rendered.contains("[[providers]]"), "{rendered}");
+        assert!(!rendered.contains("invocation_mode"), "{rendered}");
+    }
+
+    #[test]
+    fn read_model_files_returns_paths_and_text_pairs() {
+        let temp = TempDir::new().unwrap();
+        let models_dir = temp.path().join("models");
+        write_model_toml(
+            &models_dir,
+            "claude-opus",
+            r#"
+[[providers]]
+name = "claude"
+"#,
+        );
+
+        let files = read_model_files(&models_dir).unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert!(files[0].0.ends_with("claude-opus.toml"));
+        assert!(files[0].1.contains("[[providers]]"));
+    }
+
+    #[test]
+    fn parse_model_files_returns_paths_and_raw_pairs() {
+        let path = PathBuf::from("claude-opus.toml");
+        let parsed = parse_model_files(vec![(
+            path.clone(),
+            r#"
+[[providers]]
+name = "claude"
+"#
+            .to_string(),
+        )])
+        .unwrap();
+
+        assert_eq!(parsed[0].0, path);
+        assert_eq!(parsed[0].1.providers.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn validate_models_against_providers_rejects_unsafe_proxy_claude_shape_via_effective_merge() {
+        let temp = TempDir::new().unwrap();
+        write_providers_toml(
+            temp.path(),
+            r#"
+[claude]
+command = "claude"
+invocation_mode = "proxy"
+"#,
+        );
+        let providers = ProvidersConfig::load(&temp.path().join("providers.toml")).unwrap();
+        let raw = parse_model_toml(
+            r#"
+[[providers]]
+name = "claude"
+args = ["--tools", "mcp__age104p2__Task"]
+"#,
+        )
+        .unwrap();
+        let raws = vec![(PathBuf::from("claude-opus.toml"), raw)];
+
+        let err = validate_models_against_providers(&raws, Some(&providers)).unwrap_err();
+
+        assert!(err.contains("proxy-mode Claude"), "{err}");
+        assert!(err.contains("--tools mcp__"), "{err}");
     }
 }

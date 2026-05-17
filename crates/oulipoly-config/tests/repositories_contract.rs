@@ -6,7 +6,7 @@ use oulipoly_config::repositories::{
     ProvidersConfigRepository, SessionsConfigRepository,
 };
 use oulipoly_config::{
-    ClaudeRestrictions, CodexRestrictions, ModelConfig, PromptMode, ProviderConfig,
+    ClaudeRestrictions, CodexRestrictions, InvocationMode, ModelConfig, PromptMode, ProviderConfig,
     ProvidersConfig, SessionsConfig, ToolRestrictionKind, ToolRestrictions, load_agent_file,
     load_agents, load_models,
 };
@@ -347,6 +347,65 @@ disabled_features = []
         trait_runtime.tool_restrictions,
         direct_runtime.tool_restrictions
     );
+}
+
+#[test]
+fn repository_effective_provider_preserves_invocation_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("providers.toml");
+    write(
+        &path,
+        r#"
+[claude]
+command = "claude"
+invocation_mode = "proxy"
+"#,
+    );
+    let repo = FilesystemProvidersConfigRepository;
+    let providers =
+        <FilesystemProvidersConfigRepository as ProvidersConfigRepository>::load_providers(
+            &repo, &path,
+        )
+        .unwrap();
+    let model_provider = ProviderConfig::model_provider("claude", vec!["--model".to_string()]);
+
+    let (effective, _) =
+        <FilesystemProvidersConfigRepository as ProvidersConfigRepository>::effective_provider(
+            &repo,
+            &providers,
+            &model_provider,
+        )
+        .unwrap();
+
+    assert_eq!(effective.invocation_mode, InvocationMode::Proxy);
+}
+
+#[test]
+fn repository_runtime_provider_preserves_invocation_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("providers.toml");
+    write(
+        &path,
+        r#"
+[claude]
+command = "claude"
+invocation_mode = "proxy"
+"#,
+    );
+    let repo = FilesystemProvidersConfigRepository;
+    let providers =
+        <FilesystemProvidersConfigRepository as ProvidersConfigRepository>::load_providers(
+            &repo, &path,
+        )
+        .unwrap();
+
+    let (runtime, _) =
+        <FilesystemProvidersConfigRepository as ProvidersConfigRepository>::runtime_provider(
+            &repo, &providers, "claude",
+        )
+        .unwrap();
+
+    assert_eq!(runtime.invocation_mode, InvocationMode::Proxy);
 }
 
 #[test]

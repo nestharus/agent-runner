@@ -414,3 +414,19 @@ prompt_mode = "arg"
         "explicit state_db_path should avoid StateDb::open_default path discovery"
     );
 }
+
+#[test]
+fn default_provider_launch_preserves_runtime_invocation_mode_when_rewriting_name() {
+    let source = include_str!("../src/repl_default_provider.rs");
+    let run = source_from(source, "fn run_repl_with_default_provider_with_launcher");
+
+    assert!(
+        run.contains("runtime_provider(member_name)"),
+        "default-provider launch must resolve the runtime provider before rewriting carrier name"
+    );
+    assert!(
+        run.contains("..provider")
+            || (run.contains("invocation_mode:") && run.contains(".invocation_mode")),
+        "default-provider carrier-name rewrite must preserve ProviderConfig.invocation_mode"
+    );
+}

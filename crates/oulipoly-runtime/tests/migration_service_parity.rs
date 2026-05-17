@@ -72,6 +72,7 @@ fn provider(name: &str, projects_dir: PathBuf) -> ProviderConfig {
         session_storage: Some(SessionStorage::ClaudeCode { projects_dir }),
         system_prompt_override: None,
         tool_restrictions: None,
+        invocation_mode: Default::default(),
     }
 }
 

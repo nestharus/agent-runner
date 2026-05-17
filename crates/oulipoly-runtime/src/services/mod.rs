@@ -867,8 +867,11 @@ fn acquire_session_lock(
         .map_err(|message| SessionLockFailure::Lock(LockError::Operational { message }))?;
     let providers_cfg =
         ProvidersConfig::load(&default_config_root().join("providers.toml")).unwrap_or_default();
-    let models = load_models(&default_models_dir(), Some(&providers_cfg))
-        .map_err(|message| SessionLockFailure::Lock(LockError::Operational { message }))?;
+    let models = load_models(&default_models_dir(), Some(&providers_cfg)).map_err(|message| {
+        SessionLockFailure::Lock(LockError::Operational {
+            message: message.to_string(),
+        })
+    })?;
     reject_recent_ambiguous_resume(&state, session_id).map_err(SessionLockFailure::Resume)?;
     let resolved = <StateDb as ResumeRepository>::resolve_resume(&state, &models, session_id, None)
         .map_err(SessionLockFailure::Resume)?;

@@ -1,9 +1,11 @@
+use super::claude_tool_filter::{ClaudeToolFilterShape, validate_proxy_claude_filter_shape};
 use super::model::{
-    PromptMode, ProviderConfig, ResumeAcceptanceRules, ResumeStrategy, SessionCapture,
-    SessionStorage, ToolRestrictionKind, ToolRestrictions,
+    InvocationMode, PromptMode, ProviderConfig, ResumeAcceptanceRules, ResumeStrategy,
+    SessionCapture, SessionStorage, ToolRestrictionKind, ToolRestrictions,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
 use std::fs;
 use std::path::Path;
 
@@ -32,6 +34,7 @@ pub struct ProviderEntry {
     pub session_storage: Option<SessionStorage>,
     pub system_prompt_override: Option<String>,
     pub tool_restrictions: Option<ToolRestrictions>,
+    pub invocation_mode: InvocationMode,
 }
 
 impl Default for ProviderEntry {
@@ -49,16 +52,94 @@ impl Default for ProviderEntry {
             session_storage: None,
             system_prompt_override: None,
             tool_restrictions: None,
+            invocation_mode: InvocationMode::Headless,
         }
     }
 }
+
+type RawProvidersToml = HashMap<String, RawEntry>;
+
+#[derive(Debug)]
+pub enum LoadError {
+    Io(std::io::Error),
+    Toml(String),
+    InvocationMode { provider: String, value: String },
+    UnsafeProxyClaudeToolsRestrict { provider: String },
+    Other(String),
+}
+
+impl LoadError {
+    pub fn contains(&self, needle: &str) -> bool {
+        self.to_string().contains(needle)
+    }
+}
+
+impl fmt::Display for LoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(err) => write!(f, "io error reading providers.toml: {err}"),
+            Self::Toml(err) => write!(f, "toml parse error in providers.toml: {err}"),
+            Self::InvocationMode { provider, value } => write!(
+                f,
+                "provider {provider}: invalid invocation_mode `{value}`; valid modes are: `headless`, `proxy`"
+            ),
+            Self::UnsafeProxyClaudeToolsRestrict { provider } => write!(
+                f,
+                "provider {provider}: proxy-mode Claude must not use `--tools mcp__...`; use `--allowedTools` or omit the filter (AGE-104)"
+            ),
+            Self::Other(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for LoadError {}
+
+impl From<std::io::Error> for LoadError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+impl From<LoadError> for String {
+    fn from(value: LoadError) -> Self {
+        value.to_string()
+    }
+}
+
+impl PartialEq for LoadError {
+    fn eq(&self, other: &Self) -> bool {
+        use LoadError::*;
+        match (self, other) {
+            (Io(left), Io(right)) => left.to_string() == right.to_string(),
+            (Toml(left), Toml(right)) => left == right,
+            (
+                InvocationMode {
+                    provider: left_provider,
+                    value: left_value,
+                },
+                InvocationMode {
+                    provider: right_provider,
+                    value: right_value,
+                },
+            ) => left_provider == right_provider && left_value == right_value,
+            (
+                UnsafeProxyClaudeToolsRestrict { provider: left },
+                UnsafeProxyClaudeToolsRestrict { provider: right },
+            ) => left == right,
+            (Other(left), Other(right)) => left == right,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for LoadError {}
 
 #[derive(Debug, Clone, Default)]
 pub struct ProvidersConfig {
     pub entries: HashMap<String, ProviderEntry>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct RawEntry {
     #[serde(default)]
     quota_script: Option<String>,
@@ -84,39 +165,158 @@ struct RawEntry {
     system_prompt_override: Option<String>,
     #[serde(default)]
     tool_restrictions: Option<ToolRestrictions>,
+    #[serde(default)]
+    invocation_mode: Option<String>,
+}
+
+#[allow(dead_code)]
+fn parse_providers_toml(text: &str) -> Result<RawProvidersToml, LoadError> {
+    toml::from_str(text).map_err(|err| LoadError::Toml(err.to_string()))
+}
+
+#[allow(dead_code)]
+fn apply_defaults_to_raw_providers(mut raw: RawProvidersToml) -> RawProvidersToml {
+    for entry in raw.values_mut() {
+        entry
+            .invocation_mode
+            .get_or_insert_with(|| "headless".to_string());
+    }
+    raw
+}
+
+#[allow(dead_code)]
+fn validate_providers_config(raw: &RawProvidersToml) -> Result<(), LoadError> {
+    for (name, raw_entry) in raw {
+        let invocation_mode = validate_provider_invocation_mode_values(name, raw_entry)?;
+        validate_provider_argv_shapes(name, raw_entry, invocation_mode)?;
+        let entry = raw_entry_to_entry(raw_entry, invocation_mode);
+        validate_provider_entry_shape(name, &entry)?;
+    }
+    Ok(())
+}
+
+fn validate_provider_invocation_mode_values(
+    name: &str,
+    raw: &RawEntry,
+) -> Result<InvocationMode, LoadError> {
+    parse_invocation_mode(name, raw.invocation_mode.as_deref())
+}
+
+fn parse_invocation_mode(name: &str, raw_mode: Option<&str>) -> Result<InvocationMode, LoadError> {
+    match raw_mode.unwrap_or("headless") {
+        "headless" => Ok(InvocationMode::Headless),
+        "proxy" => Ok(InvocationMode::Proxy),
+        value => Err(LoadError::InvocationMode {
+            provider: name.to_string(),
+            value: value.to_string(),
+        }),
+    }
+}
+
+fn raw_entry_to_entry(raw: &RawEntry, invocation_mode: InvocationMode) -> ProviderEntry {
+    ProviderEntry {
+        quota_script: raw.quota_script.clone(),
+        auth_refresh_command: raw.auth_refresh_command.clone(),
+        command: raw.command.clone(),
+        args: raw.args.clone(),
+        interactive_args: raw.interactive_args.clone(),
+        prompt_mode: raw
+            .prompt_mode
+            .as_deref()
+            .map(parse_prompt_mode)
+            .unwrap_or(PromptMode::Stdin),
+        resume: raw.resume.clone(),
+        session_capture: raw.session_capture.clone(),
+        resume_acceptance: raw.resume_acceptance.clone(),
+        session_storage: raw.session_storage.clone(),
+        system_prompt_override: raw.system_prompt_override.clone(),
+        tool_restrictions: raw.tool_restrictions.clone(),
+        invocation_mode,
+    }
+}
+
+fn validate_provider_entry_shape(name: &str, entry: &ProviderEntry) -> Result<(), LoadError> {
+    entry.validate(name).map_err(LoadError::Other)
+}
+
+fn validate_provider_argv_shapes(
+    name: &str,
+    raw: &RawEntry,
+    mode: InvocationMode,
+) -> Result<(), LoadError> {
+    validate_proxy_claude_argv_shape(name, raw, mode)
+}
+
+fn validate_proxy_claude_argv_shape(
+    name: &str,
+    raw: &RawEntry,
+    mode: InvocationMode,
+) -> Result<(), LoadError> {
+    if !is_claude_proxy_provider(name, raw) {
+        return Ok(());
+    }
+
+    let argv = build_provider_argv_tokens(raw);
+    let shape =
+        ClaudeToolFilterShape::detect_in_argv(&argv).unwrap_or(ClaudeToolFilterShape::NoFilter);
+    validate_proxy_claude_filter_shape(mode, shape).map_err(|_| {
+        LoadError::UnsafeProxyClaudeToolsRestrict {
+            provider: name.to_string(),
+        }
+    })
+}
+
+fn is_claude_proxy_provider(name: &str, raw: &RawEntry) -> bool {
+    matches!(
+        provider_family(
+            name,
+            raw.command.as_deref(),
+            &raw.args,
+            raw.interactive_args.as_deref(),
+        ),
+        Some(ToolRestrictionKind::Claude)
+    )
+}
+
+fn build_provider_argv_tokens(raw: &RawEntry) -> Vec<String> {
+    let mut argv = Vec::new();
+    if let Some(command) = raw.command.as_deref() {
+        argv.extend(shell_split(command));
+    }
+    argv.extend(raw.args.iter().cloned());
+    if let Some(interactive_args) = raw.interactive_args.as_ref() {
+        argv.extend(interactive_args.iter().cloned());
+    }
+    argv
 }
 
 impl ProvidersConfig {
     /// Parse a providers.toml, returning an empty config if the file doesn't exist.
-    pub fn load(path: &Path) -> Result<Self, String> {
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let content = fs::read_to_string(path)
-            .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
-        let raw: HashMap<String, RawEntry> = toml::from_str(&content)
-            .map_err(|e| format!("TOML parse error in {}: {e}", path.display()))?;
+    pub fn load(path: &Path) -> Result<Self, LoadError> {
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(err) => return Err(LoadError::Io(err)),
+        };
+        let raw = parse_providers_toml(&text)?;
+        let raw = apply_defaults_to_raw_providers(raw);
+        validate_providers_config(&raw)?;
+        Ok(Self::from_validated_raw(raw))
+    }
+
+    fn from_validated_raw(raw: RawProvidersToml) -> Self {
         let entries = raw
             .into_iter()
-            .map(|(k, v)| {
-                let entry = ProviderEntry {
-                    quota_script: v.quota_script,
-                    auth_refresh_command: v.auth_refresh_command,
-                    command: v.command,
-                    args: v.args,
-                    interactive_args: v.interactive_args,
-                    prompt_mode: parse_prompt_mode(v.prompt_mode.as_deref().unwrap_or("stdin")),
-                    resume: v.resume,
-                    session_capture: v.session_capture,
-                    resume_acceptance: v.resume_acceptance,
-                    session_storage: v.session_storage.map(SessionStorage::expand_tilde),
-                    system_prompt_override: v.system_prompt_override,
-                    tool_restrictions: v.tool_restrictions,
-                };
-                entry.validate(&k).map(|()| (k, entry))
+            .map(|(name, raw_entry)| {
+                let invocation_mode =
+                    parse_invocation_mode(&name, raw_entry.invocation_mode.as_deref())
+                        .expect("validated provider invocation_mode");
+                (name, raw_entry_to_entry(&raw_entry, invocation_mode))
             })
-            .collect::<Result<HashMap<_, _>, String>>()?;
-        Ok(Self { entries })
+            .collect();
+        Self { entries }
     }
 
     pub fn get(&self, name: &str) -> Option<&ProviderEntry> {
@@ -244,6 +444,7 @@ fn shell_word(input: &str) -> String {
     format!("'{}'", input.replace('\'', r#"'\''"#))
 }
 
+#[allow(dead_code)]
 impl ProviderEntry {
     fn validate(&self, name: &str) -> Result<(), String> {
         if let Some(resume) = &self.resume {
@@ -384,15 +585,19 @@ impl ProviderEntry {
                 session_storage: self.session_storage.clone(),
                 system_prompt_override: self.system_prompt_override.clone(),
                 tool_restrictions: self.tool_restrictions.clone(),
+                invocation_mode: self.invocation_mode,
             },
             self.prompt_mode,
         ))
     }
 }
 
+#[allow(dead_code)]
 const CODEX_CONFIG_PAIR_ALLOWLIST: &[&str] = &[];
+#[allow(dead_code)]
 const CODEX_DISABLED_FEATURE_ALLOWLIST: &[&str] = &["web_search"];
 
+#[allow(dead_code)]
 fn provider_family(
     name: &str,
     command: Option<&str>,
@@ -422,6 +627,7 @@ fn provider_family(
         })
 }
 
+#[allow(dead_code)]
 fn executable_token<'a>(tokens: impl Iterator<Item = &'a str>) -> Option<&'a str> {
     let mut tokens = tokens.peekable();
     while let Some(token) = tokens.next() {
@@ -470,6 +676,7 @@ pub(crate) fn shell_split(s: &str) -> Vec<String> {
     tokens
 }
 
+#[allow(dead_code)]
 fn validate_claude_duplicates(
     name: &str,
     args: &[String],
@@ -494,6 +701,7 @@ fn validate_claude_duplicates(
     )
 }
 
+#[allow(dead_code)]
 fn validate_claude_tool_duplicates(
     name: &str,
     args: &[String],
@@ -518,6 +726,7 @@ fn validate_claude_tool_duplicates(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn claude_flag_values<'a>(args: &'a [String], flags: &[&str]) -> Vec<(String, &'a str)> {
     let mut values = Vec::new();
     let mut i = 0;
@@ -540,6 +749,7 @@ fn claude_flag_values<'a>(args: &'a [String], flags: &[&str]) -> Vec<(String, &'
     values
 }
 
+#[allow(dead_code)]
 fn validate_codex_duplicates(
     name: &str,
     args: &[String],
@@ -555,6 +765,7 @@ fn validate_codex_duplicates(
     )
 }
 
+#[allow(dead_code)]
 fn validate_codex_config_duplicates(
     name: &str,
     args: &[String],
@@ -581,6 +792,7 @@ fn validate_codex_config_duplicates(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn validate_codex_disabled_feature_duplicates(
     name: &str,
     args: &[String],
@@ -603,6 +815,7 @@ fn validate_codex_disabled_feature_duplicates(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn codex_flag_values<'a>(args: &'a [String], flags: &[&str]) -> Vec<(String, &'a str)> {
     let mut values = Vec::new();
     let mut i = 0;
@@ -637,8 +850,76 @@ mod tests {
     use super::*;
     use crate::model::{
         ClaudeRestrictions, CodexRestrictions, ToolRestrictionKind, ToolRestrictions,
+        derive_provider_name,
     };
     use std::io::Write;
+
+    fn function_body<'a>(source: &'a str, needle: &str) -> &'a str {
+        let start = source.find(needle).expect("function signature exists");
+        let brace_start = source[start..].find('{').expect("function body starts") + start;
+        let mut depth = 0usize;
+        for (offset, ch) in source[brace_start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[brace_start + 1..brace_start + offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("function body ends");
+    }
+
+    fn assert_contains_in_order(body: &str, expected: &[&str]) {
+        let mut cursor = 0usize;
+        for token in expected {
+            let found = body[cursor..]
+                .find(token)
+                .unwrap_or_else(|| panic!("missing orchestration call {token} in {body}"));
+            cursor += found + token.len();
+        }
+    }
+
+    fn assert_forbidden_absent(body: &str, forbidden: &[&str]) {
+        for token in forbidden {
+            assert!(
+                !body.contains(token),
+                "orchestration shell must not contain inline logic token {token}: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn providers_config_load_orchestrates_parse_default_validate_construct() {
+        let body = function_body(
+            include_str!("providers.rs"),
+            "pub fn load(path: &Path) -> Result<Self, LoadError>",
+        );
+
+        assert_contains_in_order(
+            body,
+            &[
+                "fs::read_to_string",
+                "parse_providers_toml",
+                "apply_defaults_to_raw_providers",
+                "validate_providers_config",
+                "Self::from_validated_raw",
+            ],
+        );
+        assert_forbidden_absent(
+            body,
+            &[
+                "toml::from_str",
+                "ProviderEntry {",
+                "parse_prompt_mode",
+                "InvocationMode::",
+                "entry.validate",
+            ],
+        );
+    }
 
     #[test]
     fn parses_quota_scripts() {
@@ -723,6 +1004,7 @@ projects_dir = "/tmp/claude2/projects"
             session_storage: None,
             system_prompt_override: None,
             tool_restrictions: None,
+            invocation_mode: Default::default(),
         };
         let (provider, prompt_mode) = cfg.effective_provider(&model_provider).unwrap();
         assert_eq!(prompt_mode, PromptMode::Stdin);
@@ -882,6 +1164,7 @@ cwd_script = "codex-cwd /tmp/codex-sessions"
             session_storage: None,
             system_prompt_override: None,
             tool_restrictions: None,
+            invocation_mode: Default::default(),
         };
 
         let (provider, prompt_mode) = cfg.effective_provider(&model_provider).unwrap();
@@ -1323,5 +1606,330 @@ disabled_features = ["web_search"]
         assert!(err.contains("web_search"), "{err}");
         assert!(err.contains("args"), "{err}");
         assert!(err.contains("--disable"), "{err}");
+    }
+
+    fn load_inline_providers(text: &str) -> Result<ProvidersConfig, LoadError> {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(file, "{text}").unwrap();
+        ProvidersConfig::load(file.path())
+    }
+
+    #[test]
+    fn providers_toml_defaults_invocation_mode_to_headless() {
+        let cfg = load_inline_providers(
+            r#"
+[claude]
+command = "claude"
+"#,
+        )
+        .unwrap();
+
+        let entry = cfg.get("claude").unwrap();
+        assert_eq!(entry.invocation_mode, InvocationMode::Headless);
+        let (runtime, _) = cfg.runtime_provider("claude").unwrap();
+        assert_eq!(runtime.invocation_mode, InvocationMode::Headless);
+    }
+
+    #[test]
+    fn providers_toml_parses_explicit_proxy_invocation_mode() {
+        let cfg = load_inline_providers(
+            r#"
+[claude]
+command = "claude"
+invocation_mode = "proxy"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.get("claude").unwrap().invocation_mode,
+            InvocationMode::Proxy
+        );
+    }
+
+    #[test]
+    fn providers_toml_rejects_unknown_invocation_mode_with_actionable_error() {
+        let err = load_inline_providers(
+            r#"
+[claude]
+command = "claude"
+invocation_mode = "bogus"
+"#,
+        )
+        .unwrap_err();
+
+        match err {
+            LoadError::InvocationMode { provider, value } => {
+                assert_eq!(provider, "claude");
+                assert_eq!(value, "bogus");
+            }
+            other => panic!("expected LoadError::InvocationMode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proxy_claude_rejects_tools_mcp_filter_in_args() {
+        let err = load_inline_providers(
+            r#"
+[claude]
+command = "claude"
+invocation_mode = "proxy"
+args = ["--tools", "mcp__age104p2__Task"]
+"#,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("proxy-mode Claude"), "{err}");
+        assert!(err.contains("--tools mcp__"), "{err}");
+    }
+
+    #[test]
+    fn proxy_claude_rejects_tools_mcp_filter_in_interactive_args() {
+        let err = load_inline_providers(
+            r#"
+[claude]
+command = "claude"
+invocation_mode = "proxy"
+interactive_args = ["--tools", "mcp__age104p2__Task"]
+"#,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("proxy-mode Claude"), "{err}");
+        assert!(err.contains("--tools mcp__"), "{err}");
+    }
+
+    #[test]
+    fn proxy_claude_rejects_tools_mcp_filter_in_command() {
+        let err = load_inline_providers(
+            r#"
+[claude]
+command = "env -u CLAUDECODE claude --tools mcp__age104p2__Task"
+invocation_mode = "proxy"
+"#,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("proxy-mode Claude"), "{err}");
+        assert!(err.contains("--tools mcp__"), "{err}");
+    }
+
+    #[test]
+    fn proxy_claude_accepts_allowed_tools_mcp_filter() {
+        let cfg = load_inline_providers(
+            r#"
+[claude]
+command = "claude"
+invocation_mode = "proxy"
+args = ["--allowedTools", "mcp__age104p2__Task"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.get("claude").unwrap().invocation_mode,
+            InvocationMode::Proxy
+        );
+    }
+
+    #[test]
+    fn proxy_claude_accepts_allowed_tools_kebab_mcp_filter() {
+        let cfg = load_inline_providers(
+            r#"
+[claude]
+command = "claude"
+invocation_mode = "proxy"
+args = ["--allowed-tools", "mcp__age104p2__Task"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.get("claude").unwrap().invocation_mode,
+            InvocationMode::Proxy
+        );
+    }
+
+    #[test]
+    fn proxy_claude_accepts_no_tool_filter() {
+        let cfg = load_inline_providers(
+            r#"
+[claude]
+command = "claude"
+invocation_mode = "proxy"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.get("claude").unwrap().invocation_mode,
+            InvocationMode::Proxy
+        );
+    }
+
+    #[test]
+    fn effective_provider_carries_invocation_mode() {
+        let cfg = load_inline_providers(
+            r#"
+[claude]
+command = "claude"
+invocation_mode = "proxy"
+"#,
+        )
+        .unwrap();
+        let model_provider = ProviderConfig::model_provider("claude", vec!["--model".into()]);
+
+        let (provider, _) = cfg.effective_provider(&model_provider).unwrap();
+
+        assert_eq!(provider.invocation_mode, InvocationMode::Proxy);
+    }
+
+    #[test]
+    fn runtime_provider_carries_invocation_mode() {
+        let cfg = load_inline_providers(
+            r#"
+[claude]
+command = "claude"
+invocation_mode = "proxy"
+"#,
+        )
+        .unwrap();
+
+        let (provider, _) = cfg.runtime_provider("claude").unwrap();
+
+        assert_eq!(provider.invocation_mode, InvocationMode::Proxy);
+    }
+
+    #[test]
+    fn providers_toml_prefixed_command_proxy_mode_preserves_provider_family_and_name() {
+        let cfg = load_inline_providers(
+            r#"
+[claude]
+command = "env -u CLAUDECODE claude"
+invocation_mode = "proxy"
+args = ["--allowedTools", "mcp__age104p2__Task"]
+"#,
+        )
+        .unwrap();
+
+        let (provider, _) = cfg.runtime_provider("claude").unwrap();
+
+        assert_eq!(provider.name, "claude");
+        assert_eq!(
+            derive_provider_name(&provider.command, &provider.args),
+            "claude"
+        );
+        assert_eq!(provider.invocation_mode, InvocationMode::Proxy);
+    }
+
+    #[test]
+    fn parse_providers_toml_returns_raw_struct_for_valid_text() {
+        let raw = parse_providers_toml(
+            r#"
+[claude]
+command = "claude"
+"#,
+        )
+        .unwrap();
+
+        assert!(raw.contains_key("claude"));
+    }
+
+    #[test]
+    fn parse_providers_toml_returns_err_for_malformed_text() {
+        let err = parse_providers_toml("not = [").unwrap_err();
+
+        match err {
+            LoadError::Toml(message) => assert!(!message.is_empty()),
+            other => panic!("expected LoadError::Toml, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_defaults_to_raw_providers_sets_headless_for_absent_mode() {
+        let mut raw = RawProvidersToml::new();
+        raw.insert(
+            "claude".to_string(),
+            RawEntry {
+                quota_script: None,
+                auth_refresh_command: None,
+                command: Some("claude".to_string()),
+                args: vec![],
+                interactive_args: None,
+                prompt_mode: None,
+                resume: None,
+                session_capture: None,
+                resume_acceptance: None,
+                session_storage: None,
+                system_prompt_override: None,
+                tool_restrictions: None,
+                invocation_mode: None,
+            },
+        );
+
+        let defaulted = apply_defaults_to_raw_providers(raw);
+
+        assert_eq!(
+            defaulted.get("claude").unwrap().invocation_mode.as_deref(),
+            Some("headless")
+        );
+    }
+
+    #[test]
+    fn apply_defaults_to_raw_providers_preserves_explicit_mode() {
+        let raw = parse_providers_toml(
+            r#"
+[claude]
+command = "claude"
+invocation_mode = "proxy"
+"#,
+        )
+        .unwrap();
+
+        let defaulted = apply_defaults_to_raw_providers(raw);
+
+        assert_eq!(
+            defaulted.get("claude").unwrap().invocation_mode.as_deref(),
+            Some("proxy")
+        );
+    }
+
+    #[test]
+    fn validate_providers_config_passes_for_valid_input() {
+        let raw = apply_defaults_to_raw_providers(
+            parse_providers_toml(
+                r#"
+[claude]
+command = "claude"
+invocation_mode = "proxy"
+args = ["--allowedTools", "mcp__age104p2__Task"]
+"#,
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(validate_providers_config(&raw), Ok(()));
+    }
+
+    #[test]
+    fn validate_providers_config_rejects_bad_invocation_mode() {
+        let raw = parse_providers_toml(
+            r#"
+[claude]
+command = "claude"
+invocation_mode = "bogus"
+"#,
+        )
+        .unwrap();
+
+        let err = validate_providers_config(&raw).unwrap_err();
+
+        match err {
+            LoadError::InvocationMode { provider, value } => {
+                assert_eq!(provider, "claude");
+                assert_eq!(value, "bogus");
+            }
+            other => panic!("expected LoadError::InvocationMode, got {other:?}"),
+        }
     }
 }

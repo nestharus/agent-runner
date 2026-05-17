@@ -2038,6 +2038,7 @@ mod tests {
                     session_storage,
                     system_prompt_override: None,
                     tool_restrictions: None,
+                    invocation_mode: Default::default(),
                 }
             })
             .collect();

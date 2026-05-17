@@ -385,6 +385,7 @@ fn runtime_provider(name: &str, session_storage: SessionStorage) -> ProviderConf
         session_storage: Some(session_storage),
         system_prompt_override: None,
         tool_restrictions: None,
+        invocation_mode: Default::default(),
     }
 }
 

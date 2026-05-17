@@ -14,8 +14,11 @@ pub fn resolve_export_session_metadata(
     let sessions_path = config_root.join("sessions.toml");
     let providers_cfg = ProvidersConfig::load(&providers_path).unwrap_or_default();
     let models_dir = default_models_dir();
-    let models = load_models(&models_dir, Some(&providers_cfg))
-        .map_err(|message| ExportError::Operational { message })?;
+    let models = load_models(&models_dir, Some(&providers_cfg)).map_err(|message| {
+        ExportError::Operational {
+            message: message.to_string(),
+        }
+    })?;
     let sessions_cfg = SessionsConfig::load(&sessions_path).unwrap_or_default();
 
     uuid::Uuid::parse_str(session_id).map_err(|_| ExportError::InvalidSessionId {

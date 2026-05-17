@@ -54,7 +54,7 @@ pub struct FilesystemModelConfigRepository;
 
 impl ModelConfigRepository for FilesystemModelConfigRepository {
     fn load_models(&self, dir: &Path) -> Result<HashMap<String, ModelConfig>, String> {
-        load_models(dir, None)
+        Ok(load_models(dir, None)?)
     }
 
     fn save_model(&self, dir: &Path, model: &ModelConfig) -> Result<(), String> {
@@ -117,7 +117,7 @@ pub struct FilesystemProvidersConfigRepository;
 
 impl ProvidersConfigRepository for FilesystemProvidersConfigRepository {
     fn load_providers(&self, path: &Path) -> Result<ProvidersConfig, String> {
-        ProvidersConfig::load(path)
+        Ok(ProvidersConfig::load(path)?)
     }
 
     fn get<'a>(&self, config: &'a ProvidersConfig, name: &str) -> Option<&'a ProviderEntry> {

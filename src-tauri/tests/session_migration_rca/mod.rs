@@ -155,6 +155,7 @@ fn claude_provider(name: &str, command: &Path, projects_dir: &Path) -> ProviderC
         }),
         system_prompt_override: None,
         tool_restrictions: None,
+        invocation_mode: Default::default(),
     }
 }
 

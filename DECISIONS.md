@@ -6,6 +6,27 @@ indicated version. Each entry names the originating finding, the chosen
 posture, the rationale, and the conditions under which the decision could be
 revisited.
 
+## D-AGE-116-R2-Tier-1-Rewind — cherry-pick provenance + ACR-246/ACR-247 resume
+
+- **Source**: implementation-pipeline-orchestrator resume disposition. Root answered question `q-b4955534-d681-4e6a-a92b-5d7118fa3d2c` selecting Tier-1 rewind. Prior round (R1) halted as `BLOCKED:auditor-strictness` pending ACR-246; ACR-246 landed on 2026-05-16T23:01Z (commit `c09368f`) tightening auditor scope to WU-owned-diff and adding convergence-proof contract. ACR-247 landed on 2026-05-16T23:45Z (commit `60f6655`) introducing orchestrator-authored Step 6c side-channel evidence.
+- **Decision**: Tier-1 rewind: `git reset --hard d4727ee` on the AGE-116 worktree discarded the prior R1 uncommitted diff (+1884/-216 across 27 files). Then cherry-picked 27 files verbatim from `worktrees/age-103-invocation-mode-schema` (AGE-103's preserved R3 Step 6c) into the AGE-116 worktree. Excluded `crates/oulipoly-setup/src/context.rs` (AGE-120 scope).
+- **Rationale**:
+  - ACR-246's bootstrap exception is narrowly scoped to its own WU. Generalizing to AGE-116 would re-establish the precedent-acceptance anti-pattern ACR-242 was filed to prevent.
+  - The convention-blessed Step 6c side-channel path (`workflows/step6c-consumption-side-file.md` + projection helper) now exists; using it on the cherry-picked work is the correct ACR-247-conformant resumption.
+  - The cherry-picked work itself is verified: `cargo fmt --check` clean, `cargo clippy --workspace --tests -- -D warnings` clean, `cargo test --workspace --no-fail-fast` reports 1331 passed / 0 failed / 2 ignored.
+  - AGE-116's 4 audited components (providers.rs, model.rs, claude_tool_filter.rs, config-public-api-and-repositories) re-evaluate under ACR-246-tightened auditor (WU-owned-diff scope + convergence-proof contract). The 5th `runtime-effective-provider-consumers` component declaration is informational-only (AGE-119 audit ownership) per root direction.
+- **Cherry-pick provenance**:
+  - Source: `worktrees/age-103-invocation-mode-schema` uncommitted state on branch `age-103-invocation-mode-schema` (HEAD `289ce6c`).
+  - Original Step 6c invocation that produced the source: `287f6bc1-cf7e-40c7-af09-943d11b446d6` (AGE-103 R3 per AGE-103 session.json).
+  - 27 files copied via `cp` (not `git apply`): 8 config-crate files + 19 runtime/state/src-tauri compile-fallout files.
+  - Excluded: `crates/oulipoly-setup/src/context.rs` (AGE-120 scope per audit-history § AGE-119-scope tests).
+- **AGE-119-named carry-forward tests included as compile-fallout** (these tests don't depend on AGE-119 feature code; they verify AGE-116's schema change propagates through existing service types):
+  - `runtime_executor_service_effective_request_preserves_invocation_mode` in `age34_runtime_executor_service_routing.rs`
+  - `runtime_diagnostics_service_preserves_invocation_mode` in `age34_runtime_diagnostics_service_routing.rs`
+  - `runtime_launcher_service_preserves_invocation_mode` in `age34_runtime_launcher_service_routing.rs`
+  - `default_provider_launch_preserves_runtime_invocation_mode_when_rewriting_name` in `age33_default_provider_characterization.rs`
+- **Revisit when**: AGE-119 lands and authors its own per-component audit scope for `runtime-effective-provider-consumers`. Until then, the runtime files in AGE-116's diff are explicitly out-of-scope for AGE-116's per-component code-quality fanout.
+
 ## D-001 — `SessionLock` lease renewal: out of scope for v1
 
 - **Source**: Initiative 06 (`agents session pause-handshake` + import-replace
