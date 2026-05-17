@@ -1,0 +1,23 @@
+{
+  "consumer_id": "age-127-completion-signal-eval",
+  "manifest_ref": "evals/_provenance/age-89-dossier-manifest.json",
+  "information_only": true,
+  "cited_entries": [
+    {
+      "stable_id": "age-89-p1-a-truth-table-v1",
+      "purpose": "Completion predicate truth-table provenance for the eval scenarios."
+    },
+    {
+      "stable_id": "age-89-p1-a-five-background-stress-v1",
+      "purpose": "Five-background-subagent stress provenance for the background-counter scenario."
+    },
+    {
+      "stable_id": "age-89-p1-a-scheduled-wakeup-v1",
+      "purpose": "Scheduled-wakeup provenance for wakeup-counter completion behavior."
+    },
+    {
+      "stable_id": "age-89-answer-v1",
+      "purpose": "AGE-89 answer summary provenance for the completion-signal interpretation."
+    }
+  ]
+}

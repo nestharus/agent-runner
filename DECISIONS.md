@@ -6,6 +6,14 @@ indicated version. Each entry names the originating finding, the chosen
 posture, the rationale, and the conditions under which the decision could be
 revisited.
 
+## D-AGE-127-cold-start-estimate — proceed without baseline estimate
+
+- **Source**: Phase 2.5 step 4a inherited-estimate cold-start gate on AGE-127. Ticket read returned `estimate_source: missing` (Linear `estimate` field unset on AGE-127).
+- **Decision**: Proceed without a baseline estimate. The Phase 3 proposer will produce a refined estimate from concrete scope. No separate prototype is required.
+- **Rationale**: The root dispatch framed AGE-127 as a narrow cherry-pick of AGE-105 R4 Step 6b/6c product code with one file substitution (`CARRY_FORWARD.md` -> `provenance.json`). All scope, code boundary, anti-scope, and acceptance criteria are pre-declared on the ticket. The work is concrete enough to estimate at Phase 3 from the proposal rather than requiring a prototype-first estimate.
+- **Evidence**: AGE-127 ticket scope/anti-scope/acceptance sections; parent AGE-105 R4 product code in `worktrees/age-105-completion-signal-hardening/evals/claude-completion-signal/`; AGE-105 R4 audit-history (Rounds 1-12) at `planning/age-105-completion-signal-hardening/audit-history.md`.
+- **Revisit when**: never — refined estimate captured at Phase 3, actual measured at Phase 8.X closure judge.
+
 ## D-AGE-116-R2-Tier-1-Rewind — cherry-pick provenance + ACR-246/ACR-247 resume
 
 - **Source**: implementation-pipeline-orchestrator resume disposition. Root answered question `q-b4955534-d681-4e6a-a92b-5d7118fa3d2c` selecting Tier-1 rewind. Prior round (R1) halted as `BLOCKED:auditor-strictness` pending ACR-246; ACR-246 landed on 2026-05-16T23:01Z (commit `c09368f`) tightening auditor scope to WU-owned-diff and adding convergence-proof contract. ACR-247 landed on 2026-05-16T23:45Z (commit `60f6655`) introducing orchestrator-authored Step 6c side-channel evidence.

@@ -1,0 +1,184 @@
+{
+  "scenario_id": "five_background",
+  "description": "Five background subagents keep completion pending through partial drains until all SubagentStop events have fired.",
+  "events": [
+    {
+      "seq": 0,
+      "event": "SessionStart",
+      "timestamp": "2026-05-15T18:32:30Z"
+    },
+    {
+      "seq": 1,
+      "event": "PreToolUse",
+      "tool": "Agent",
+      "tool_kind": "agent",
+      "subagent_id": "worker-1",
+      "timestamp": "2026-05-15T18:32:35Z"
+    },
+    {
+      "seq": 2,
+      "event": "PreToolUse",
+      "tool": "Agent",
+      "tool_kind": "agent",
+      "subagent_id": "worker-2",
+      "timestamp": "2026-05-15T18:32:36Z"
+    },
+    {
+      "seq": 3,
+      "event": "PreToolUse",
+      "tool": "Agent",
+      "tool_kind": "agent",
+      "subagent_id": "worker-3",
+      "timestamp": "2026-05-15T18:32:37Z"
+    },
+    {
+      "seq": 4,
+      "event": "PreToolUse",
+      "tool": "Agent",
+      "tool_kind": "agent",
+      "subagent_id": "worker-4",
+      "timestamp": "2026-05-15T18:32:38Z"
+    },
+    {
+      "seq": 5,
+      "event": "PreToolUse",
+      "tool": "Agent",
+      "tool_kind": "agent",
+      "subagent_id": "worker-5",
+      "timestamp": "2026-05-15T18:32:39Z"
+    },
+    {
+      "seq": 6,
+      "event": "Stop",
+      "timestamp": "2026-05-15T18:32:41Z"
+    },
+    {
+      "seq": 7,
+      "event": "SubagentStop",
+      "subagent_id": "worker-1",
+      "timestamp": "2026-05-15T18:32:49Z"
+    },
+    {
+      "seq": 8,
+      "event": "Stop",
+      "timestamp": "2026-05-15T18:32:51Z"
+    },
+    {
+      "seq": 9,
+      "event": "SubagentStop",
+      "subagent_id": "worker-2",
+      "timestamp": "2026-05-15T18:32:52Z"
+    },
+    {
+      "seq": 10,
+      "event": "Stop",
+      "timestamp": "2026-05-15T18:32:54Z"
+    },
+    {
+      "seq": 11,
+      "event": "SubagentStop",
+      "subagent_id": "worker-3",
+      "timestamp": "2026-05-15T18:32:56Z"
+    },
+    {
+      "seq": 12,
+      "event": "Stop",
+      "timestamp": "2026-05-15T18:32:58Z"
+    },
+    {
+      "seq": 13,
+      "event": "SubagentStop",
+      "subagent_id": "worker-4",
+      "timestamp": "2026-05-15T18:33:02Z"
+    },
+    {
+      "seq": 14,
+      "event": "Stop",
+      "timestamp": "2026-05-15T18:33:03Z"
+    },
+    {
+      "seq": 15,
+      "event": "SubagentStop",
+      "subagent_id": "worker-5",
+      "timestamp": "2026-05-15T18:33:04Z"
+    },
+    {
+      "seq": 16,
+      "event": "Stop",
+      "timestamp": "2026-05-15T18:33:06Z"
+    }
+  ],
+  "expected_counter_trajectory": {
+    "active_tool": [
+      0,
+      0
+    ],
+    "pending_background_agent": [
+      0,
+      5,
+      4,
+      3,
+      2,
+      1,
+      0
+    ],
+    "pending_scheduled_wakeup": [
+      0,
+      0
+    ]
+  },
+  "expected_stop_snapshots": [
+    {
+      "after_seq": 6,
+      "stop_for": "foreground",
+      "active_tool_at_stop": 0,
+      "pending_background_agent_at_stop": 5,
+      "pending_scheduled_wakeup_at_stop": 0,
+      "predicate": false
+    },
+    {
+      "after_seq": 8,
+      "stop_for": "subagent",
+      "active_tool_at_stop": 0,
+      "pending_background_agent_at_stop": 4,
+      "pending_scheduled_wakeup_at_stop": 0,
+      "predicate": false
+    },
+    {
+      "after_seq": 10,
+      "stop_for": "subagent",
+      "active_tool_at_stop": 0,
+      "pending_background_agent_at_stop": 3,
+      "pending_scheduled_wakeup_at_stop": 0,
+      "predicate": false
+    },
+    {
+      "after_seq": 12,
+      "stop_for": "subagent",
+      "active_tool_at_stop": 0,
+      "pending_background_agent_at_stop": 2,
+      "pending_scheduled_wakeup_at_stop": 0,
+      "predicate": false
+    },
+    {
+      "after_seq": 14,
+      "stop_for": "subagent",
+      "active_tool_at_stop": 0,
+      "pending_background_agent_at_stop": 1,
+      "pending_scheduled_wakeup_at_stop": 0,
+      "predicate": false
+    },
+    {
+      "after_seq": 16,
+      "stop_for": "subagent",
+      "active_tool_at_stop": 0,
+      "pending_background_agent_at_stop": 0,
+      "pending_scheduled_wakeup_at_stop": 0,
+      "predicate": true
+    }
+  ],
+  "expected_finalization": {
+    "reason": "completion_predicate_satisfied",
+    "stop_count": 6
+  }
+}
