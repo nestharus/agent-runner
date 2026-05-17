@@ -2421,7 +2421,7 @@ The AGE-113 finding is even cleaner than AGE-93 D4/D5 because (a) the alignment 
 
 - **Source**: AGE-119 Phase 4 close; orchestrator runtime topology constraint.
 - **Decision**: Skip the `process-tree-auditor` dispatch at Phase 4 and substitute Phase 4 join manifest sha256/size/mtime/verdict_line integrity verification per "Canonical Join Manifest Re-Verification."
-- **Rationale**: This orchestrator (Claude Code) is NOT itself wrapped in an `agents` invocation — each `agents -m <model>` and `agents -a <agent>.md` dispatch is a top-level root in the trace store with `parent_id: null`, so there is no enclosing aggregate root the auditor's strict topology check can traverse. The orchestrator's non-negotiables require "every phase dispatch is a fresh `agents` invocation" (satisfied) and join-manifest canonical-path / sha256 / verdict_line integrity (satisfied by `risk/phase-4-join-manifest.json`).
+- **Rationale**: This orchestrator (Claude Code) is NOT itself wrapped in an `agents` invocation — each `agents -m <model>` and `agents -a <agent>.md` dispatch is a top-level root in the trace store with `parent_id: null`, so there is no enclosing aggregate root the auditor's strict topology check can traverse. The orchestrator's non-negotiables require "every phase dispatch is a fresh `agents` invocation" (satisfied) and join-manifest canonical-path / sha256 / verdict_line integrity (satisfied by `planning/age-119-runtime-carry-through/risk/phase-4-join-manifest.json`).
 - **Local-project precedent**: AGE-103 (parent decomposition WU; preserved record) did not run process-tree audit at Phase 4; AGE-116 (sibling decomposition WU) explicitly skipped it citing AGE-103 precedent (`planning/age-116-providers-schema-splits/audit-history.md` § "Phase 4 — Process-tree audit #1 disposition"). AGE-15 established the broader pattern at Phase 8 (`D-AGE-15-Phase-8` in this DECISIONS file).
 - **Conditions for revisit**: when the orchestrator is reachable as a child of an enclosing `agents` invocation (e.g., dispatched via `agents -a ~/ai/agents/implementation-pipeline-orchestrator.md`), the process-tree auditor's strict topology check becomes producible. Until then, join-manifest integrity verification stands as the substitute.
 - **Evidence**:
@@ -2450,7 +2450,7 @@ The AGE-113 finding is even cleaner than AGE-93 D4/D5 because (a) the alignment 
   - Phase 0 Bootstrap: complete (session.json, sessions.index.json, ticket.md).
   - Phase 2.5: 7 artifacts complete; WU verdict HIGH; per-surface modes propagated.
   - Phase 3: proposal R2 complete (8 story points; sibling-seam Option b; A1-vocabulary aligned).
-  - Phase 4: all 5 gates LOW (R2); code-quality LOW; join manifest at `risk/phase-4-join-manifest.json`.
+  - Phase 4: all 5 gates LOW (R2); code-quality LOW; join manifest at `planning/age-119-runtime-carry-through/risk/phase-4-join-manifest.json`.
   - Phase 5: hookpoint research complete; AGE-116 readiness=NO.
 - **Unblock conditions**:
   1. AGE-116 ships (after ACR-246 lands and AGE-116 resumes successfully), OR
@@ -2477,7 +2477,7 @@ The AGE-113 finding is even cleaner than AGE-93 D4/D5 because (a) the alignment 
   - Phase 6 halt-record: **non-applicable** (no recursive level entered).
   - Phase 6 prototype-swap-record: **non-applicable** (no prototype-to-implementation swap).
   - Per-component code-quality fanout for `age-119-test-additions` (`gpt-high` codex2, invocation `6c11ab0d-f91c-4a1c-a186-9fa44b781474`): aggregate **LOW**; all 3 child auditors (cohesion, function-classification, push-pull) LOW; no blocking/residual findings.
-  - Phase 6 join manifest written at `risk/phase-6-join-manifest.json` (records all 9 Phase 6 artifacts with sha256/size; Phase 4 manifest re-verified at this phase join).
+  - Phase 6 join manifest written at `planning/age-119-runtime-carry-through/risk/phase-6-join-manifest.json` (records all 9 Phase 6 artifacts with sha256/size; Phase 4 manifest re-verified at this phase join).
 - **AGE-119 final deliverable** (actual diff against `origin/main`):
   - `crates/oulipoly-runtime/src/executor/cli.rs` (+131 lines: T7 + T8 unit tests inside existing `mod tests`)
   - `crates/oulipoly-runtime/tests/age34_runtime_diagnostics_service_routing.rs` (+26 lines: T9 source-guard test)
@@ -2496,10 +2496,21 @@ The AGE-113 finding is even cleaner than AGE-93 D4/D5 because (a) the alignment 
   - Step 6c side-file `.scratch/phase6/step6c-consumed-evidence.txt` byte-stable from projection helper.
   - Phase 6 alignment artifact at `alignment/age-119-tests-contracts.md` verdict ALIGNED (invocation `f6f25f1e-...`).
   - Phase 6 per-component code-quality aggregate at `code-quality/age-119-test-additions/aggregate-code-quality.md` verdict LOW (invocation `6c11ab0d-...`).
-  - Phase 6 join manifest at `risk/phase-6-join-manifest.json` records all 9 Phase 6 artifacts with sha256/size/mtime/verdict_line + producing invocation UUIDs.
+  - Phase 6 join manifest at `planning/age-119-runtime-carry-through/risk/phase-6-join-manifest.json` records all 9 Phase 6 artifacts with sha256/size/mtime/verdict_line + producing invocation UUIDs.
 - **Anti-scope compliance**: this substitution is structural (no aggregate root to traverse), NOT precedent-based. The user's anti-scope rule ("NO precedent-citation as a residual-acceptance basis (ACR-242 anti-pattern)") forbids using precedent to accept residual MEDIUM/HIGH verdicts; here every gate returned LOW and the substitution is for a topology audit that cannot run meaningfully in this runtime, not for a verdict acceptance. The same structural workaround was applied at Phase 4 (D-AGE-119-Phase-4-Process-tree-audit-substitution).
 - **Conditions for revisit**: when the implementation-pipeline orchestrator is itself dispatched as `agents -a ~/ai/agents/implementation-pipeline-orchestrator.md`, all per-phase child invocations will be descendants of a shared aggregate root and the process-tree-auditor's strict topology check becomes producible. Until that runtime topology is in place, join-manifest integrity verification stands as the substitute.
 - **Evidence**:
   - Phase 6 join manifest: `planning/age-119-runtime-carry-through/risk/phase-6-join-manifest.json`
   - Step 6b trace evidence: `agents trace --json b1e49e88-6901-4846-ad91-dd59fcd4230c` returns root with `children: []`
   - Side-channel evidence bundle: `.scratch/phase6/process-tree-expected.md`
+
+---
+
+## AGE-124 — pre-Phase-2.5 inherited-estimate cold-start disposition (state-DB busy_timeout)
+
+**WU**: AGE-124
+**Phase**: Phase 0 / pre-Phase-2.5
+**Decision**: Proceed without a baseline estimate (estimate_source=missing on the ticket).
+**Rationale**: User caller dispatch explicitly framed this as a one-line product change + one test with the RCA dossier at `/home/nes/projects/ai/planning/rca-agent-runner-crashes-2026-05-16/rca/` acting as prototype-first evidence (call site, magnitude, and reproduction shape are all already evidenced). No separate prototype is needed.
+**Evidence**: caller task framing; `/home/nes/projects/ai/planning/rca-agent-runner-crashes-2026-05-16/rca/agent-runner-crashes-2026-05-16.md` § F4 / F5 (state-DB busy_timeout cross-reference); `crates/oulipoly-agent-store/src/lib.rs:467` (precedent — 5000ms busy_timeout on the agent-store connection).
+**Effect**: Phase 2.5 step 4a does not halt; Phase 3 proposal records `estimate_source: missing` verbatim and refines on the basis of the ticket's named "~1 line of code + 1 unit test" scope.

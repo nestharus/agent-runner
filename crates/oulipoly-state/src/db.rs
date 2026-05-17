@@ -4312,6 +4312,23 @@ mod tests {
         StateDb::open(Path::new(":memory:")).unwrap()
     }
 
+    #[test]
+    fn state_db_open_sets_busy_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+
+        let db = StateDb::open(&path).unwrap();
+        let busy_timeout = db
+            .connection()
+            .query_row("PRAGMA busy_timeout", [], |row| row.get::<_, i64>(0))
+            .unwrap();
+
+        assert!(
+            busy_timeout >= 5000,
+            "StateDb::open should configure busy_timeout >= 5000ms, got {busy_timeout}ms"
+        );
+    }
+
     fn mark_current_schema_version(conn: &Connection) {
         seed_current_drift_required_tables(conn);
         conn.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)
