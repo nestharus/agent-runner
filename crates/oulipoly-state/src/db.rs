@@ -8132,7 +8132,7 @@ name = "fixture-provider"
             .map(|(name, body)| {
                 (
                     (*name).to_string(),
-                    oulipoly_config::ModelConfig::from_toml(name, body).unwrap(),
+                    oulipoly_config::ModelConfig::from_toml_with_name(name, body, None).unwrap(),
                 )
             })
             .collect()

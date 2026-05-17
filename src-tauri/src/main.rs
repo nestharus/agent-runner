@@ -565,7 +565,9 @@ fn run_session_locate(session_id: &str, _json: bool) -> Result<i32, String> {
     let models = match load_models(&models_dir, Some(&providers_cfg)) {
         Ok(models) => models,
         Err(message) => {
-            emit_metadata_error(&MetadataError::Operational { message });
+            emit_metadata_error(&MetadataError::Operational {
+                message: message.to_string(),
+            });
             return Ok(1);
         }
     };
@@ -4417,7 +4419,7 @@ mod tests {
 
     #[test]
     fn migration_target_pool_when_model_set_is_model_pool() {
-        let model = ModelConfig::from_toml(
+        let model = ModelConfig::from_toml_with_name(
             "claude-opus",
             r#"
 [[providers]]
@@ -4428,6 +4430,7 @@ args = ["--model", "opus"]
 name = "claude2"
 args = ["--model", "opus"]
 "#,
+            None,
         )
         .unwrap();
         let resolved = oulipoly_state::ResolvedResume {

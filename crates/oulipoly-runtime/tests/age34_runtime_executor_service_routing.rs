@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig};
+use oulipoly_config::{InvocationMode, ModelConfig, PromptMode, ProviderConfig};
 use oulipoly_runtime::executor;
 use oulipoly_runtime::executor::cli::{self, EffectiveExecuteRequest};
 use oulipoly_runtime::services::{
@@ -9,6 +9,7 @@ use oulipoly_runtime::services::{
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 struct FixtureScript {
     _dir: tempfile::TempDir,
@@ -44,6 +45,7 @@ fn model_for(script: &FixtureScript) -> ModelConfig {
             session_storage: None,
             system_prompt_override: None,
             tool_restrictions: None,
+            invocation_mode: Default::default(),
         }],
         inputs: Vec::new(),
     }
@@ -61,6 +63,7 @@ fn effective_provider(script: &FixtureScript) -> ProviderConfig {
         session_storage: None,
         system_prompt_override: None,
         tool_restrictions: None,
+        invocation_mode: Default::default(),
     }
 }
 
@@ -81,6 +84,39 @@ fn assert_execution_equivalent(
         service.captured_child_invocations.len(),
         direct.captured_child_invocations.len()
     );
+}
+
+struct RecordingExecutorService {
+    received_effective_provider: Arc<Mutex<Option<ProviderConfig>>>,
+}
+
+fn capture_request_provider(request: &ExecutorServiceRequest) -> Option<ProviderConfig> {
+    match request {
+        ExecutorServiceRequest::Effective { provider, .. }
+        | ExecutorServiceRequest::EffectiveWithStartKnownProviderSessionId { provider, .. } => {
+            Some(provider.clone())
+        }
+        ExecutorServiceRequest::Facade { .. } => None,
+    }
+}
+
+fn store_captured_provider(
+    received_effective_provider: &Arc<Mutex<Option<ProviderConfig>>>,
+    provider: ProviderConfig,
+) {
+    *received_effective_provider.lock().unwrap() = Some(provider);
+}
+
+impl ExecutorServicePort for RecordingExecutorService {
+    fn execute(
+        &self,
+        request: ExecutorServiceRequest,
+    ) -> Result<ExecutorServiceOutput, oulipoly_runtime::services::ServiceError> {
+        if let Some(provider) = capture_request_provider(&request) {
+            store_captured_provider(&self.received_effective_provider, provider);
+        }
+        executor::RuntimeExecutorService.execute(request)
+    }
 }
 
 // Risk: R-A3 / proposal T10 - executor adapter routing must delegate to the
@@ -164,5 +200,55 @@ fn runtime_executor_service_raw_request_matches_direct_executor_call() {
         })
         .expect("service raw execute");
 
+    assert_execution_equivalent(&result, &direct);
+}
+
+#[test]
+fn runtime_executor_service_effective_request_preserves_invocation_mode() {
+    let model_script = fixture_script("printf 'wrong-model-provider\\n'");
+    let effective_script = fixture_script("printf 'effective:%s\\n' \"$1\"");
+    let model = model_for(&model_script);
+    let mut provider = effective_provider(&effective_script);
+    provider.invocation_mode = InvocationMode::Proxy;
+    let extra_inputs: HashMap<String, Vec<String>> = HashMap::new();
+
+    let direct = cli::execute_effective(EffectiveExecuteRequest {
+        model: &model,
+        provider: &provider,
+        provider_index: 2,
+        prompt_mode: PromptMode::Arg,
+        prompt: "prompt-value",
+        working_dir: None,
+        extra_inputs: &extra_inputs,
+        parent_invocation_env: None,
+    })
+    .expect("direct execute");
+
+    let received_effective_provider = Arc::new(Mutex::new(None));
+    let recording_service = RecordingExecutorService {
+        received_effective_provider: Arc::clone(&received_effective_provider),
+    };
+    let service: &dyn ExecutorServicePort = &recording_service;
+    let ExecutorServiceOutput { result } = service
+        .execute(ExecutorServiceRequest::Effective {
+            model,
+            provider: provider.clone(),
+            provider_index: 2,
+            prompt_mode: PromptMode::Arg,
+            prompt: "prompt-value".to_string(),
+            working_dir: None,
+            extra_inputs,
+            parent_invocation_env: None,
+        })
+        .expect("service execute");
+
+    assert_eq!(
+        received_effective_provider
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|provider| provider.invocation_mode),
+        Some(InvocationMode::Proxy)
+    );
     assert_execution_equivalent(&result, &direct);
 }

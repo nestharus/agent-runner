@@ -1,4 +1,4 @@
-use oulipoly_config::{ProvidersConfig, load_models};
+use oulipoly_config::{InvocationMode, ProvidersConfig, load_models};
 use std::fs;
 
 #[test]
@@ -38,4 +38,25 @@ interactive_args = ["exec", "--dangerously-bypass-approvals-and-sandbox"]
     assert_eq!(model.name, "codex-resume");
     assert_eq!(model.providers.len(), 1);
     assert_eq!(model.providers[0].name, "codex");
+}
+
+#[test]
+fn proxy_claude_provider_example_loads() {
+    let temp = tempfile::tempdir().unwrap();
+    let providers_path = temp.path().join("providers.toml");
+    fs::write(
+        &providers_path,
+        r#"
+[claude-proxy]
+command = "claude"
+invocation_mode = "proxy"
+args = ["--allowedTools", "mcp__age104p2__Task"]
+"#,
+    )
+    .unwrap();
+
+    let providers = ProvidersConfig::load(&providers_path).unwrap();
+    let entry = providers.get("claude-proxy").unwrap();
+
+    assert_eq!(entry.invocation_mode, InvocationMode::Proxy);
 }

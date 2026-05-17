@@ -1369,8 +1369,9 @@ mod tests {
     use super::*;
     use crate::executor::{SessionCaptureMethod, SessionCaptureResult};
     use oulipoly_config::{
-        ClaudeRestrictions, CodexRestrictions, InputDef, InputType, ProviderConfig, ResumeKind,
-        ResumeStrategy, SessionCapture, SessionCaptureKind, ToolRestrictionKind, ToolRestrictions,
+        ClaudeRestrictions, CodexRestrictions, InputDef, InputType, InvocationMode, ProviderConfig,
+        ResumeKind, ResumeStrategy, SessionCapture, SessionCaptureKind, ToolRestrictionKind,
+        ToolRestrictions,
     };
     use oulipoly_state::CompositeInvocationId;
     #[cfg(unix)]
@@ -1435,6 +1436,7 @@ mod tests {
                 },
                 codex: CodexRestrictions::default(),
             }),
+            invocation_mode: Default::default(),
         }
     }
 
@@ -1461,6 +1463,7 @@ mod tests {
                     disabled_features: vec!["web_search".to_string()],
                 },
             }),
+            invocation_mode: Default::default(),
         }
     }
 
@@ -1531,6 +1534,7 @@ printf 'effective stdout\n'
             session_storage: None,
             system_prompt_override: None,
             tool_restrictions: None,
+            invocation_mode: Default::default(),
         };
         let mut extra_inputs = HashMap::new();
         extra_inputs.insert("size".to_string(), vec!["large".to_string()]);
@@ -1866,6 +1870,7 @@ printf '%s' "$last" > "{prompt_dump}""#,
             session_storage: None,
             system_prompt_override: Some("AGE-28 override".to_string()),
             tool_restrictions: None,
+            invocation_mode: Default::default(),
         };
         let mut args = Vec::new();
         let mut prompt = Some("user prompt".to_string());
@@ -1900,6 +1905,7 @@ printf '%s' "$last" > "{prompt_dump}""#,
             session_storage: None,
             system_prompt_override: Some("AGE-28 override".to_string()),
             tool_restrictions: None,
+            invocation_mode: Default::default(),
         };
         let mut args = provider.args.clone();
         let mut prompt = Some("user prompt".to_string());
@@ -1926,6 +1932,7 @@ printf '%s' "$last" > "{prompt_dump}""#,
             session_storage: None,
             system_prompt_override: Some("AGE-28 override".to_string()),
             tool_restrictions: None,
+            invocation_mode: Default::default(),
         };
         let mut args = Vec::new();
         let mut prompt = Some("user prompt".to_string());
@@ -1955,6 +1962,7 @@ printf '%s' "$last" > "{prompt_dump}""#,
                     disabled_features: vec!["web_search".to_string()],
                 },
             }),
+            invocation_mode: Default::default(),
         };
         let mut args = Vec::new();
         let mut prompt = Some("user prompt".to_string());
@@ -2182,6 +2190,7 @@ cat > /dev/null"#,
             session_storage: None,
             system_prompt_override: None,
             tool_restrictions: None,
+            invocation_mode: Default::default(),
         };
 
         let err = execute_interactive(&provider, None, None, None).unwrap_err();
@@ -2211,6 +2220,7 @@ cat > /dev/null"#,
             session_storage: None,
             system_prompt_override: None,
             tool_restrictions: None,
+            invocation_mode: Default::default(),
         };
 
         let exit_code = execute_interactive(&provider, None, None, None).unwrap();
@@ -2239,6 +2249,7 @@ cat > /dev/null"#,
             session_storage: None,
             system_prompt_override: None,
             tool_restrictions: None,
+            invocation_mode: Default::default(),
         };
 
         let exit_code = execute_interactive(&provider, Some(tempdir.path()), None, None).unwrap();
@@ -2270,6 +2281,7 @@ cat > /dev/null"#,
             session_storage: None,
             system_prompt_override: None,
             tool_restrictions: None,
+            invocation_mode: Default::default(),
         };
         let parent_env =
             r#"{"source":"fixture-provider","id":"11111111-1111-1111-1111-111111111111"}"#;
@@ -2301,6 +2313,7 @@ cat > /dev/null"#,
             session_storage: None,
             system_prompt_override: None,
             tool_restrictions: None,
+            invocation_mode: Default::default(),
         };
         let strategy = ResumeStrategy {
             kind: ResumeKind::Flag,
@@ -2348,6 +2361,7 @@ cat > /dev/null"#,
             session_storage: None,
             system_prompt_override: None,
             tool_restrictions: None,
+            invocation_mode: Default::default(),
         };
         let strategy = ResumeStrategy {
             kind: ResumeKind::Flag,
@@ -2409,6 +2423,7 @@ printf '{{"type":"system","subtype":"init","session_id":"8f0a6a1f-9cd2-4c91-b6c6
             session_storage: None,
             system_prompt_override: None,
             tool_restrictions: None,
+            invocation_mode: Default::default(),
         };
         let strategy = ResumeStrategy {
             kind: ResumeKind::Flag,
@@ -2467,6 +2482,7 @@ printf '{{"type":"system","subtype":"init","session_id":"8f0a6a1f-9cd2-4c91-b6c6
             session_storage: None,
             system_prompt_override: None,
             tool_restrictions: None,
+            invocation_mode: Default::default(),
         };
         let strategy = ResumeStrategy {
             kind: ResumeKind::Subcommand,
@@ -2520,6 +2536,7 @@ printf '{{"type":"system","subtype":"init","session_id":"8f0a6a1f-9cd2-4c91-b6c6
             session_storage: None,
             system_prompt_override: None,
             tool_restrictions: None,
+            invocation_mode: Default::default(),
         };
         let strategy = ResumeStrategy {
             kind: ResumeKind::Subcommand,
@@ -2566,6 +2583,7 @@ printf '{{"type":"system","subtype":"init","session_id":"8f0a6a1f-9cd2-4c91-b6c6
             session_storage: None,
             system_prompt_override: None,
             tool_restrictions: None,
+            invocation_mode: Default::default(),
         };
 
         let exit_code = execute_interactive(&provider, None, None, None).unwrap();
@@ -2858,6 +2876,7 @@ printf '{{"type":"system","subtype":"init","session_id":"%s"}}\n' "$requested""#
                 session_storage: None,
                 system_prompt_override: None,
                 tool_restrictions: None,
+                invocation_mode: Default::default(),
             }],
             inputs: vec![],
         };
@@ -2950,6 +2969,7 @@ printf '{{"type":"system","subtype":"init","session_id":"%s"}}\n' "$requested""#
                 session_storage: None,
                 system_prompt_override: None,
                 tool_restrictions: None,
+                invocation_mode: Default::default(),
             }],
             inputs: vec![],
         };
@@ -3008,6 +3028,7 @@ printf '{{"type":"system","subtype":"init","session_id":"%s"}}\n' "$requested""#
             session_storage: None,
             system_prompt_override: None,
             tool_restrictions: None,
+            invocation_mode: Default::default(),
         };
         let model = ModelConfig {
             name: "claude-test".to_string(),
@@ -3088,6 +3109,7 @@ printf '{"type":"system","subtype":"init","session_id":"11111111-1111-1111-1111-
                 session_storage: None,
                 system_prompt_override: None,
                 tool_restrictions: None,
+                invocation_mode: Default::default(),
             }],
             inputs: vec![],
         };
@@ -3150,6 +3172,7 @@ printf 'assistant text from tmpfile\n' > "$output_file""#,
                 session_storage: None,
                 system_prompt_override: None,
                 tool_restrictions: None,
+                invocation_mode: Default::default(),
             }],
             inputs: vec![],
         };
@@ -3211,6 +3234,7 @@ printf 'assistant text from tmpfile\n' > "$output_file""#,
                 session_storage: None,
                 system_prompt_override: None,
                 tool_restrictions: None,
+                invocation_mode: Default::default(),
             }],
             inputs: vec![],
         };
@@ -3233,5 +3257,56 @@ printf 'assistant text from tmpfile\n' > "$output_file""#,
             }
             other => panic!("expected Failed(_), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn execute_effective_headless_mode_preserves_current_argv_shape() {
+        let argv_dump = tempfile::NamedTempFile::new().unwrap();
+        let script = fixture_script(&format!(
+            r#"for arg in "$@"; do
+  printf '%s\n' "$arg" >> "{}"
+done"#,
+            argv_dump.path().display()
+        ));
+        let model = ModelConfig {
+            name: "claude-opus".to_string(),
+            prompt_mode: PromptMode::Arg,
+            providers: vec![ProviderConfig::model_provider(
+                "claude",
+                vec!["--model".to_string(), "opus".to_string()],
+            )],
+            inputs: vec![],
+        };
+        let provider = ProviderConfig {
+            name: "claude".to_string(),
+            command: script.path.to_string_lossy().into_owned(),
+            args: vec!["-p".to_string(), "--model".to_string(), "opus".to_string()],
+            interactive_args: None,
+            resume: None,
+            session_capture: None,
+            resume_acceptance: None,
+            session_storage: None,
+            system_prompt_override: None,
+            tool_restrictions: None,
+            invocation_mode: InvocationMode::Headless,
+        };
+
+        let result = execute_effective(EffectiveExecuteRequest {
+            model: &model,
+            provider: &provider,
+            provider_index: 0,
+            prompt_mode: PromptMode::Arg,
+            prompt: "hello",
+            working_dir: None,
+            extra_inputs: &HashMap::new(),
+            parent_invocation_env: None,
+        })
+        .unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(
+            read_argv_dump(argv_dump.path()),
+            vec!["-p", "--model", "opus", "hello"]
+        );
     }
 }

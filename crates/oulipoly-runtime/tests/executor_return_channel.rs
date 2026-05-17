@@ -51,6 +51,7 @@ fn model_for(script: &FixtureScript) -> ModelConfig {
             session_storage: None,
             system_prompt_override: None,
             tool_restrictions: None,
+            invocation_mode: Default::default(),
         }],
         inputs: Vec::new(),
     }

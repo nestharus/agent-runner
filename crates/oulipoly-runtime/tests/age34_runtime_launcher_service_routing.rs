@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use oulipoly_config::ProviderConfig;
+use oulipoly_config::{InvocationMode, ProviderConfig};
 use oulipoly_runtime::executor::cli;
 use oulipoly_runtime::repl_default_provider;
 use oulipoly_runtime::services::{
@@ -8,6 +8,7 @@ use oulipoly_runtime::services::{
 };
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 struct FixtureScript {
     _dir: tempfile::TempDir,
@@ -40,6 +41,33 @@ fn interactive_provider(script: &FixtureScript) -> ProviderConfig {
         session_storage: None,
         system_prompt_override: None,
         tool_restrictions: None,
+        invocation_mode: Default::default(),
+    }
+}
+
+struct RecordingLauncherService {
+    received_provider: Arc<Mutex<Option<ProviderConfig>>>,
+}
+
+fn capture_request_provider(request: &LauncherServiceRequest) -> ProviderConfig {
+    request.provider.clone()
+}
+
+fn store_captured_provider(
+    received_provider: &Arc<Mutex<Option<ProviderConfig>>>,
+    provider: ProviderConfig,
+) {
+    *received_provider.lock().unwrap() = Some(provider);
+}
+
+impl LauncherServicePort for RecordingLauncherService {
+    fn launch(
+        &self,
+        request: LauncherServiceRequest,
+    ) -> Result<LauncherServiceOutput, oulipoly_runtime::services::ServiceError> {
+        let provider = capture_request_provider(&request);
+        store_captured_provider(&self.received_provider, provider);
+        repl_default_provider::RuntimeLauncherService.launch(request)
     }
 }
 
@@ -82,4 +110,36 @@ exit 23"#,
         std::fs::read_to_string(marker.path()).unwrap(),
         direct_marker
     );
+}
+
+#[test]
+fn runtime_launcher_service_preserves_invocation_mode() {
+    let script = fixture_script(
+        r#"test "$1" = "launch"
+printf launched"#,
+    );
+    let mut provider = interactive_provider(&script);
+    provider.invocation_mode = InvocationMode::Proxy;
+
+    let received_provider = Arc::new(Mutex::new(None));
+    let recording_service = RecordingLauncherService {
+        received_provider: Arc::clone(&received_provider),
+    };
+    let service: &dyn LauncherServicePort = &recording_service;
+    let LauncherServiceOutput { exit_code } = service
+        .launch(LauncherServiceRequest {
+            provider: provider.clone(),
+            working_dir: None,
+        })
+        .expect("service launch");
+
+    assert_eq!(
+        received_provider
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|provider| provider.invocation_mode),
+        Some(InvocationMode::Proxy)
+    );
+    assert_eq!(exit_code, 0);
 }

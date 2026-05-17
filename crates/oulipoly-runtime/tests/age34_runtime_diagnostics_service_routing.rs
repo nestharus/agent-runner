@@ -1,12 +1,13 @@
 #![cfg(unix)]
 
-use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig};
+use oulipoly_config::{InvocationMode, ModelConfig, PromptMode, ProviderConfig};
 use oulipoly_runtime::diagnostics::{self, ErrorCategory};
 use oulipoly_runtime::services::{
     DiagnosticsServiceOutput, DiagnosticsServicePort, DiagnosticsServiceRequest,
 };
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 fn write_executable(path: &Path, body: &str) {
     std::fs::write(path, body).expect("write script");
@@ -39,6 +40,39 @@ fn effective_diagnostic_provider(script_path: PathBuf) -> ProviderConfig {
         session_storage: None,
         system_prompt_override: None,
         tool_restrictions: None,
+        invocation_mode: Default::default(),
+    }
+}
+
+struct RecordingDiagnosticsService {
+    received_effective_provider: Arc<Mutex<Option<ProviderConfig>>>,
+}
+
+fn capture_request_provider(request: &DiagnosticsServiceRequest) -> Option<ProviderConfig> {
+    match request {
+        DiagnosticsServiceRequest::DiagnoseError {
+            effective_provider, ..
+        } => Some(effective_provider.clone()),
+        _ => None,
+    }
+}
+
+fn store_captured_provider(
+    received_effective_provider: &Arc<Mutex<Option<ProviderConfig>>>,
+    provider: ProviderConfig,
+) {
+    *received_effective_provider.lock().unwrap() = Some(provider);
+}
+
+impl DiagnosticsServicePort for RecordingDiagnosticsService {
+    fn diagnose(
+        &self,
+        request: DiagnosticsServiceRequest,
+    ) -> Result<DiagnosticsServiceOutput, oulipoly_runtime::services::ServiceError> {
+        if let Some(provider) = capture_request_provider(&request) {
+            store_captured_provider(&self.received_effective_provider, provider);
+        }
+        diagnostics::RuntimeDiagnosticsService.diagnose(request)
     }
 }
 
@@ -133,4 +167,48 @@ printf 'network_error\nDiagnostic model saw network trouble\n'
         !prompt.contains("Empty command"),
         "service must use the already-effective provider supplied by the caller"
     );
+}
+
+#[test]
+fn runtime_diagnostics_service_preserves_invocation_mode() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script = dir.path().join("diagnostic-provider.sh");
+    write_executable(
+        &script,
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+cat >/dev/null
+printf 'network_error\nDiagnostic model saw network trouble\n'
+"#,
+    );
+    let model = migrated_diagnostic_model();
+    let mut provider = effective_diagnostic_provider(script);
+    provider.invocation_mode = InvocationMode::Proxy;
+
+    let received_effective_provider = Arc::new(Mutex::new(None));
+    let recording_service = RecordingDiagnosticsService {
+        received_effective_provider: Arc::clone(&received_effective_provider),
+    };
+    let service: &dyn DiagnosticsServicePort = &recording_service;
+    let output = service
+        .diagnose(DiagnosticsServiceRequest::DiagnoseError {
+            diagnostics_model: model,
+            effective_provider: provider.clone(),
+            provider_index: 0,
+            prompt_mode: PromptMode::Stdin,
+            exit_code: 7,
+            stderr: "opaque child failure from primary provider".to_string(),
+            working_dir: Some(dir.path().to_path_buf()),
+        })
+        .expect("service diagnose");
+
+    assert_eq!(
+        received_effective_provider
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|provider| provider.invocation_mode),
+        Some(InvocationMode::Proxy)
+    );
+    assert!(matches!(output, DiagnosticsServiceOutput::Diagnosis { .. }));
 }

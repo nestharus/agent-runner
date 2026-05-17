@@ -173,5 +173,6 @@ fn claude_provider(name: &str, projects_dir: &Path) -> ProviderConfig {
         }),
         system_prompt_override: None,
         tool_restrictions: None,
+        invocation_mode: Default::default(),
     }
 }
