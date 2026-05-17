@@ -2331,3 +2331,60 @@ The AGE-113 finding is even cleaner than AGE-93 D4/D5 because (a) the alignment 
   - New worktree HEAD: `4d0d168 feat(evals): add Claude proxy PTY launch-shape regression eval (#92)`
   - AGE-114 runbook now present: `docs/architecture/claude-proxy-mcp-launch-shape.md`
   - `planning/age-115-upstream-bug-report-decision/research/age-115-hookpoints.md` (the hookpoint research that triggered the update)
+
+---
+
+### AGE-121 — Phase 0 (resume-at-Phase-8 adoption of rca-output-pre-applied)
+
+**Decision**: Adopt the rca-orchestrator's verified-green Phase 5 + Phase 6 output for AGE-121 (WU-1: pipeline-status propagation, F1 fix, A+C+E+G hybrid design). The implementation-pipeline-orchestrator session resumes at Phase 8 per the caller dispatch (`pipeline_entry_mode=rca-output-pre-applied`, `auto_merge_after_phase_9=true`). Do NOT re-author Phase 0/1/2/3/4/5/6 work.
+
+**Predecessor**: rca-orchestrator session `c556ceb6-c548-4d0e-9f3d-3e104c5bc369`; dossier at `/home/nes/projects/ai/planning/rca-agent-runner-crashes-2026-05-16/`.
+
+**Worktree state at adoption**: branch `rca-agent-runner-crashes-2026-05-16` at tip `4d0d168` (= main), 5 modified + 3 new test files uncommitted. Diff stat: `5 files changed, 203 insertions(+), 23 deletions(-)` plus three new test files in `src-tauri/tests/pipeline_status_propagation_rca/`.
+
+**Why no inline estimate-question gate**: `${scratch_dir}/ticket.md` has `story_point_estimate=null, estimate_source=missing`, which would normally trigger Phase 2.5 step 4a's cold-start NEEDS_INPUT. The caller-prompt explicitly directs resume-at-Phase-8 adoption of the rca-orchestrator's verified design; the rca's Phase 3 evaluated four named design options against the failing-test contract, and Phase 4 produced an exhaustive application plan with resolved open questions and explicit regression analysis. That evidence dispositions the prototype-vs-no-baseline-vs-terminate gate at the WU level. Per `~/ai/conventions/agent-questions-and-session-graph.md` (caller-prompt precedence), the orchestrator does not re-issue a question that the caller has already answered with evidence-bearing context.
+
+**Why no Phase 6 re-dispatch**: per the caller anti-scope ("DO NOT re-author Phase 0/1/2/3/4/5/6 work"), the implementation-pipeline-orchestrator validates that the rca outputs satisfy the Phase 6 contract via the adoption-evidence document at `${planning_dir}/.scratch/rca-adoption-evidence.md`. That document maps the five caller-named contract elements (Step 6a + Step 6b + Step 6c + alignment review + process-tree audit #2) to their rca equivalents, and explicitly declares Phase 6 sub-elements that are non-applicable to this WU (no prototype, no recursive component decomposition, no current-layer component-pair integration).
+
+**This is NOT a quality-gate residual acceptance**: per the caller anti-scope ("NO quality-gate residual acceptance (ACR-156/162/163 + ACR-242 enforcement)"), no Phase 4 / Phase 6 / Phase 8 gate verdict is being accepted at MEDIUM or HIGH. The adoption pattern is: a sibling workflow (rca-orchestrator) produced verified-green evidence (10/10 cargo PASS commands, target test independently re-run PASS) for the Phase 6 surface; the implementation-pipeline-orchestrator adopts that evidence rather than re-dispatching equivalent work. Phase 8 PR-review gates run normally against the diff and must clear LOW; any MEDIUM/HIGH verdict from Phase 8 halts the pipeline (the consume-rule precedent in this DECISIONS file applies to procedural-evidence gates only, not quality gates).
+
+**This is NOT a consume-rule waiver**: the AGE-105 disposition (`BLOCKED:consumed-rule-unenforceable`) and the AGE-93 D5 precedent in this DECISIONS file both address the `consumed:` echo rule in Step 6c dispatches WITHIN this orchestrator's tree. AGE-121 has no Step 6c dispatch in this orchestrator's tree — the implementation was authored by rca-orchestrator Phase 5, which has its own procedural-evidence chain (the apply step's diff-summary and verification table in `${rca_dossier}/rca/agent-runner-crashes-2026-05-16-applied.md`).
+
+**Risk hedges per caller anti-scope**:
+
+- If auditor oscillation fires on the rca-applied diff during Phase 8 (ACR-246 territory), halt as `BLOCKED:auditor-strictness` per the AGE-116 disposition. Do NOT churn the rca's work to chase findings.
+- If a Phase 8 gate hits the `consumed:` rule wall (ACR-247 territory) — which it should not because Phase 8 is PR-review, not Step 6c — halt as `BLOCKED:consumed-rule-unenforceable` per the AGE-105 disposition.
+
+**Evidence**: `${planning_dir}/.scratch/rca-adoption-evidence.md` (Phase 6 contract mapping); `${planning_dir}/session.json` (records `pipeline_entry_mode=rca-output-pre-applied` + `predecessor_workflow.session_id`); rca dossier `applied.md`, `fix-decision.md`, `application-plan.md`; worktree diff at tip `4d0d168`.
+
+**Resume point**: commit the worktree diff (one squash-eligible commit per `~/ai/conventions/commit-hygiene.md`) → Phase 8 PR-review gates → Phase 8.X closure-judge → Phase 9 auto-merge.
+
+---
+
+### AGE-121 — Phase 8 test-audit PARTIAL recorded (impl-mode coverage-delta always-PARTIAL)
+
+**Decision**: Record the test-audit gate's `PARTIAL` verdict in the Phase 8 join manifest under its documented allow-advance basis. Proceed to Phase 8.X closure-judge and Phase 9.
+
+**Evidence**:
+
+- `~/ai/agents/test-audit-gate.md` § Non-Negotiables: "In implementation mode, coverage-delta is always `PARTIAL`."
+- Same § Non-Negotiables: "The implementation workflow may separately acknowledge the implementation-mode coverage-delta `PARTIAL`, but this gate still records the raw verdict."
+- `${planning_dir}/risk/age-121-test-audit.md` shows Spec Alignment = PASS, Test Quality = PASS, Coverage Delta = PARTIAL with the explicit cause: "Implementation-mode gate has no CI coverage baseline; rerun in PR-review mode with CI artifacts for a coverage-delta decision."
+- `${planning_dir}/risk/phase-8-join-manifest.json` records the raw verdict + the gate-contract-derived advance-basis.
+
+**Why this is NOT a quality-gate residual acceptance** (per the caller anti-scope "NO quality-gate residual acceptance (ACR-156/162/163 + ACR-242 enforcement)" and "NO precedent-citation as residual-acceptance basis"):
+
+- ACR-156/162/163/242 retracts residual acceptance for non-LOW *quality* gates (code-quality, prototype-risk, per-component code-quality, etc.) verdicts at MEDIUM/HIGH. The test-audit-gate is not a quality gate in that taxonomy — it is a tooling/CI-evidence gate that has a documented impl-mode constraint built into its own contract.
+- The advance-basis cited in the join manifest is the gate's own design clause ("In implementation mode, coverage-delta is always `PARTIAL`"), not a precedent from prior WUs. The fact that prior WUs (AGE-93) also hit this is coincidental — the basis is the gate-contract itself, present and explicit at `~/ai/agents/test-audit-gate.md` since gate authorship.
+- Spec Alignment = PASS and Test Quality = PASS — the actual substantive checks both clear. Coverage Delta = PARTIAL is a tooling availability gap (no CI artifacts pre-merge), not a substantive coverage finding against the implementation.
+
+**What this is NOT**:
+
+- NOT acceptance of MEDIUM/HIGH on a code-quality, prototype-risk, or per-component quality gate.
+- NOT acceptance of a multi-concern split recommendation.
+- NOT acceptance of a justification HIGH_CONCERN.
+- NOT bypass of process-tree review.
+
+**Post-merge follow-up**: when the PR merges and CI runs on `main`, coverage baselines for the touched product files (`crates/oulipoly-state/src/db.rs`, `src-tauri/src/main.rs`) will be available. Any later PR-review-mode rerun of test-audit-gate against the post-merge artifacts can resolve the coverage-delta PARTIAL into PASS or, if the CI evidence shows a coverage regression, file a follow-up ticket. This deferred-evidence path is acceptable for the AGE project's `auto_merge_after_phase_9=true` mode because the rca's Phase 5/6 verification (10/10 PASS including `cargo test -p oulipoly-agent-runner` full-suite, `cargo fmt --check`, `cargo clippy -- -D warnings`) already proved local quality.
+
+**Resume point**: Phase 8.X closure-judge → Phase 9 auto-merge.

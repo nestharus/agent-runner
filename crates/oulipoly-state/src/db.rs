@@ -52,6 +52,7 @@ const NEAR_EXHAUSTED_USED_PERCENT: f64 = 0.99;
 
 pub struct StateDb {
     conn: Connection,
+    db_path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -737,7 +738,10 @@ impl StateDb {
             conn.execute_batch(invocation_returned_artifacts_schema_sql!())
                 .map_err(|e| format!("Failed to ensure returned-artifacts schema: {e}"))?;
         }
-        let db = StateDb { conn };
+        let db = StateDb {
+            conn,
+            db_path: path.to_path_buf(),
+        };
         db.backfill_session_chains()
             .map_err(|e| format!("{e}; run `agents migrate-db` first"))?;
 
@@ -773,7 +777,10 @@ impl StateDb {
         conn.query_row("SELECT count(*) FROM sqlite_schema", [], |_row| Ok(()))
             .map_err(|err| classify_read_only_open_error(path, err))?;
 
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            db_path: path.to_path_buf(),
+        })
     }
 
     pub fn open_default() -> Result<Self, String> {
@@ -1733,6 +1740,91 @@ impl StateDb {
         Ok(lookup)
     }
 
+    fn invocations_dir(&self) -> Option<PathBuf> {
+        if self.db_path == Path::new(":memory:") {
+            return None;
+        }
+        let parent = self
+            .db_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        Some(parent.join("invocations"))
+    }
+
+    fn write_invocation_artifact(
+        &self,
+        start: &InvocationStart,
+        started_at: &str,
+    ) -> Result<(), String> {
+        let Some(dir) = self.invocations_dir() else {
+            return Ok(());
+        };
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("create_dir_all({}): {e}", dir.display()))?;
+        let payload = serde_json::json!({
+            "id": start.invocation_uuid,
+            "status": "running",
+            "pid": std::process::id(),
+            "started_at": started_at,
+            "model_name": start.model_name,
+            "provider_name": start.provider_name,
+        });
+        let bytes = serde_json::to_vec(&payload)
+            .map_err(|e| format!("serialize invocation artifact: {e}"))?;
+        let tmp_path = dir.join(format!("{}.invocation.tmp", start.invocation_uuid));
+        let final_path = dir.join(format!("{}.invocation", start.invocation_uuid));
+        std::fs::write(&tmp_path, &bytes)
+            .map_err(|e| format!("write({}): {e}", tmp_path.display()))?;
+        std::fs::rename(&tmp_path, &final_path).map_err(|e| {
+            format!(
+                "rename({} -> {}): {e}",
+                tmp_path.display(),
+                final_path.display()
+            )
+        })?;
+        Ok(())
+    }
+
+    fn write_result_artifact(
+        &self,
+        uuid: &str,
+        success: bool,
+        exit_code: i32,
+        error_category: Option<&str>,
+        terminal_reason: Option<&str>,
+        finished_at: &str,
+    ) -> Result<(), String> {
+        let Some(dir) = self.invocations_dir() else {
+            return Ok(());
+        };
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("create_dir_all({}): {e}", dir.display()))?;
+        let payload = serde_json::json!({
+            "id": uuid,
+            "status": if success { "succeeded" } else { "failed" },
+            "success": success,
+            "exit_code": exit_code,
+            "terminal_reason": terminal_reason,
+            "error_category": error_category,
+            "finished_at": finished_at,
+        });
+        let bytes =
+            serde_json::to_vec(&payload).map_err(|e| format!("serialize result artifact: {e}"))?;
+        let tmp_path = dir.join(format!("{uuid}.result.tmp"));
+        let final_path = dir.join(format!("{uuid}.result"));
+        std::fs::write(&tmp_path, &bytes)
+            .map_err(|e| format!("write({}): {e}", tmp_path.display()))?;
+        std::fs::rename(&tmp_path, &final_path).map_err(|e| {
+            format!(
+                "rename({} -> {}): {e}",
+                tmp_path.display(),
+                final_path.display()
+            )
+        })?;
+        Ok(())
+    }
+
     pub fn start_invocation(&self, start: &InvocationStart) -> Result<i64, String> {
         let now = Utc::now().to_rfc3339();
         self.conn
@@ -1762,7 +1854,14 @@ impl StateDb {
                 ],
             )
             .map_err(|e| format!("Failed to insert invocation: {e}"))?;
-        Ok(self.conn.last_insert_rowid())
+        let row_id = self.conn.last_insert_rowid();
+        if let Err(err) = self.write_invocation_artifact(start, &now) {
+            eprintln!(
+                "Warning: Failed to write invocation artifact for {}: {err}",
+                start.invocation_uuid
+            );
+        }
+        Ok(row_id)
     }
 
     pub fn finalize_invocation(
@@ -1779,17 +1878,18 @@ impl StateDb {
             .unchecked_transaction()
             .map_err(|e| format!("Failed to begin invocation finalize tx: {e}"))?;
 
-        let (model_name, provider_name, _provider_index, status) = tx
+        let (invocation_uuid, model_name, provider_name, _provider_index, status) = tx
             .query_row(
-                "SELECT model_name, provider_name, provider_index, status
+                "SELECT invocation_uuid, model_name, provider_name, provider_index, status
                  FROM invocations WHERE id = ?1",
                 params![id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
                     ))
                 },
             )
@@ -1864,7 +1964,18 @@ impl StateDb {
         }
 
         tx.commit()
-            .map_err(|e| format!("Failed to commit invocation finalize tx: {e}"))
+            .map_err(|e| format!("Failed to commit invocation finalize tx: {e}"))?;
+        if let Err(err) = self.write_result_artifact(
+            &invocation_uuid,
+            success,
+            exit_code,
+            error_category,
+            terminal_reason,
+            &now,
+        ) {
+            eprintln!("Warning: Failed to write result artifact for {invocation_uuid}: {err}");
+        }
+        Ok(())
     }
 
     pub fn record_returned_artifacts(

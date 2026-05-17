@@ -270,10 +270,9 @@ fn age_81_one_shot_retries_first_quota_exhausted_provider_then_succeeds() {
     let output = fixture.run_one_shot("age81");
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
-        "age81-b executed\n"
-    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("age81-b executed\n"), "{stdout}");
+    assert!(stdout.contains("OULIPOLY_RESULT="), "{stdout}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("age81-a") && stderr.contains("retrying another provider"),
@@ -315,10 +314,9 @@ fn age_81_one_shot_retries_n_minus_one_quota_exhausted_providers_then_succeeds()
     let output = fixture.run_one_shot("age81");
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
-        "age81-c executed\n"
-    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("age81-c executed\n"), "{stdout}");
+    assert!(stdout.contains("OULIPOLY_RESULT="), "{stdout}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
         stderr.matches("retrying another provider").count(),
@@ -387,7 +385,9 @@ fn age_81_one_shot_non_quota_failure_does_not_retry() {
     let output = fixture.run_one_shot("age81");
 
     assert_eq!(output.status.code(), Some(42), "{output:?}");
-    assert!(output.stdout.is_empty(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("OULIPOLY_RESULT="), "{stdout}");
+    assert!(!stdout.contains("age81-b executed"), "{stdout}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains("retrying another provider"), "{stderr}");
     assert!(!stderr.contains("age81-b executed"), "{stderr}");
