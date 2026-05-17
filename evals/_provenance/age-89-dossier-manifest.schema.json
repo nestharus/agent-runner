@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema",
+  "title": "AGE-89 Dossier Provenance Manifest",
+  "description": "Information-only manifest for stable AGE-89 dossier evidence citations.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "manifest_id",
+    "manifest_version",
+    "purpose",
+    "information_only",
+    "owner",
+    "source",
+    "citation_syntax",
+    "entries"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "const": "https://json-schema.org/draft-07/schema"
+    },
+    "manifest_id": {
+      "type": "string",
+      "const": "age-89-dossier-manifest"
+    },
+    "manifest_version": {
+      "type": "string",
+      "pattern": "^[0-9]+$"
+    },
+    "purpose": {
+      "type": "string",
+      "minLength": 1
+    },
+    "information_only": {
+      "type": "boolean",
+      "const": true
+    },
+    "owner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "chain",
+        "declaration"
+      ],
+      "properties": {
+        "chain": {
+          "type": "string",
+          "const": "age-89"
+        },
+        "declaration": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repo_relative_root",
+        "absolute_root_default",
+        "branch_tag"
+      ],
+      "properties": {
+        "repo_relative_root": {
+          "type": "string",
+          "const": "planning/prototype-age-89-clarify/dossier"
+        },
+        "absolute_root_default": {
+          "type": "string",
+          "const": "/home/nes/projects/agent-runner/planning/prototype-age-89-clarify/dossier"
+        },
+        "branch_tag": {
+          "type": "string",
+          "const": "prototype-age-89-clarify-p2-stable"
+        }
+      }
+    },
+    "citation_syntax": {
+      "type": "string",
+      "const": "evals/_provenance/age-89-dossier-manifest.json#<stable_id>"
+    },
+    "entries": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "stable_id",
+          "source_path",
+          "description",
+          "sha256",
+          "owner_chain",
+          "branch_tag",
+          "supersedes"
+        ],
+        "properties": {
+          "stable_id": {
+            "type": "string",
+            "pattern": "^age-89-[a-z0-9-]+-v[0-9]+$"
+          },
+          "source_path": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "owner_chain": {
+            "type": "string",
+            "const": "age-89"
+          },
+          "branch_tag": {
+            "type": "string",
+            "const": "prototype-age-89-clarify-p2-stable"
+          },
+          "supersedes": {
+            "anyOf": [
+              {
+                "type": "null"
+              },
+              {
+                "type": "string",
+                "pattern": "^age-89-[a-z0-9-]+-v[0-9]+$"
+              }
+            ]
+          }
+        }
+      }
+    }
+  }
+}
