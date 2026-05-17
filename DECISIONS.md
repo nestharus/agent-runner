@@ -2539,8 +2539,8 @@ The AGE-113 finding is even cleaner than AGE-93 D4/D5 because (a) the alignment 
   - Step 6c side-file `.scratch/phase6/step6c-consumed-evidence.txt` byte-stable from projection helper.
   - Phase 6 alignment artifact at `alignment/age-126-tests-contracts.md` verdict ALIGNED (invocation `f38f3621-...`).
   - Phase 6 per-component code-quality aggregate at `code-quality/age-126-provenance/aggregate-code-quality.md` verdict LOW (invocation `e15ab6d8-5a69-4394-8dc5-e034fad7c5f6`; round-4 after cohesion declared-roles expansion + comprehensive single-classifier helper splits).
-  - Phase 6 join manifest at `risk/phase-6-join-manifest.json` records all 17 Phase 6 canonical artifacts with sha256/size/mtime/verdict_line + producing invocation UUIDs.
-  - Non-applicability artifacts at canonical paths: `risk/age-126-prototype-risk.md`, `risk/age-126-prototype-swap-record.md`, `risk/age-126-halt-record.md`, `.scratch/phase6/post-prototype-derivation-status.md`, `.scratch/phase6/step6c-multi-layer-derivation-check.md`, plus CouplingDecision non-applicability statement in `contracts/age-126-provenance-manifest.md`.
+  - Phase 6 join manifest at `planning/age-126-age-89-provenance-manifest/risk/phase-6-join-manifest.json` records all 17 Phase 6 canonical artifacts with sha256/size/mtime/verdict_line + producing invocation UUIDs.
+  - Non-applicability artifacts at canonical paths: `planning/age-126-age-89-provenance-manifest/risk/age-126-prototype-risk.md`, `planning/age-126-age-89-provenance-manifest/risk/age-126-prototype-swap-record.md`, `planning/age-126-age-89-provenance-manifest/risk/age-126-halt-record.md`, `planning/age-126-age-89-provenance-manifest/.scratch/phase6/post-prototype-derivation-status.md`, `planning/age-126-age-89-provenance-manifest/.scratch/phase6/step6c-multi-layer-derivation-check.md`, plus CouplingDecision non-applicability statement in `planning/age-126-age-89-provenance-manifest/contracts/age-126-provenance-manifest.md`.
 - **Anti-scope compliance**: this substitution is structural (no aggregate root to traverse), NOT precedent-based. The user's anti-scope rule ("NO precedent-citation as a residual-acceptance basis") forbids using precedent to accept residual MEDIUM/HIGH verdicts; here every gate returned LOW (per-component CQ aggregate LOW, push-pull LOW closing PP-007, cohesion LOW under expanded declared roles, function-classification LOW after comprehensive helper splits) and the substitution is for a topology audit that cannot run meaningfully in this runtime, not for a verdict acceptance. The same structural workaround was applied at Phase 4 for AGE-126 (process-tree audit #1 was per-UUID artifact-integrity verification rather than trace-tree traversal) and at AGE-119 Phase 4 + Phase 6.
 - **Conditions for revisit**: when the implementation-pipeline orchestrator is itself dispatched as `agents -a ~/ai/agents/implementation-pipeline-orchestrator.md`, all per-phase child invocations will be descendants of a shared aggregate root and the process-tree-auditor's strict topology check becomes producible. Until that runtime topology is in place, join-manifest integrity verification stands as the substitute.
 - **Evidence**:
@@ -2548,3 +2548,19 @@ The AGE-113 finding is even cleaner than AGE-93 D4/D5 because (a) the alignment 
   - Step 6b/6c trace evidence: each `agents trace --json <uuid>` returns a root with `children: []` (the dispatches were parent-visible siblings, not nested).
   - Side-channel evidence bundle: `.scratch/phase6/phase-6-expected-process.md`
   - Round-4 CQ aggregate LOW: `code-quality/age-126-provenance/aggregate-code-quality.md`
+
+## D-AGE-126-Phase-8-Process-tree-audit-substitution
+
+- **Source**: AGE-126 Phase 8 close on 2026-05-17; orchestrator runtime topology constraint (mirrors D-AGE-126-Phase-6-Process-tree-audit-substitution and D-AGE-119-Phase-6-Process-tree-audit-substitution).
+- **Decision**: Skip the `process-tree-auditor` dispatch at Phase 8 (`Process-tree audit #3`) and substitute Phase 8 join-manifest integrity verification per "Canonical Join Manifest Re-Verification."
+- **Rationale (structural, not precedent-based)**: This orchestrator (Claude Code) is NOT itself wrapped in an `agents` invocation. Each Phase 8 PR-review gate dispatch is a top-level root in the trace store with `parent_id: null` (test-audit `fea9974e-1096-40be-8445-75df2d079aa0`, multi-concern `f870df35-696f-4d8b-8ddb-5dce3f932ab4`, justification `b2502244-928d-42b2-8695-3fdbbd55e231`, commit-hygiene `1d69358b-faa3-4351-b5e2-6366c41b4c37`). The process-tree-auditor's strict topology check expects an aggregate root that names the 4 gates as parent → children, which is impossible to produce in this runtime topology.
+- **Substitution evidence** (NES-254-style join-manifest integrity):
+  - Phase 8 join manifest at `planning/age-126-age-89-provenance-manifest/risk/phase-8-join-manifest.json` records all 4 PR-review gate canonical artifacts with sha256/size/mtime/verdict_line + producing invocation UUIDs.
+  - Phase 4 + Phase 6 join manifests re-verified at Phase 8 join per the Canonical Join Manifest Re-Verification rule — 0 mismatches.
+  - All 4 PR-review verdicts: `test-audit: LOW`, `multi-concern: LOW`, `justification: LOW`, `commit-hygiene: LOW`.
+- **Anti-scope compliance**: structural substitution; no residual MEDIUM/HIGH verdict accepted. Same workaround was applied at AGE-126 Phase 4 + Phase 6 and at AGE-119 Phase 4 + Phase 6.
+- **Conditions for revisit**: when the orchestrator is dispatched as `agents -a ~/ai/agents/implementation-pipeline-orchestrator.md`, all per-phase child invocations form a shared aggregate root and the topology check becomes producible. Until then, join-manifest integrity verification stands.
+- **Evidence**:
+  - Phase 8 join manifest: `planning/age-126-age-89-provenance-manifest/risk/phase-8-join-manifest.json`
+  - All 4 PR-review reports at `planning/age-126-age-89-provenance-manifest/risk/age-126-{test-audit,multi-concern,justification,commit-hygiene}.md`
+  - Re-verification result: Phase 4 (5 rows) + Phase 6 (17 rows) both 0 mismatches.
