@@ -64,6 +64,13 @@ fn store_captured_provider(
     *received_effective_provider.lock().unwrap() = Some(provider);
 }
 
+fn source_from<'a>(source: &'a str, start: &str) -> &'a str {
+    let start_idx = source
+        .find(start)
+        .unwrap_or_else(|| panic!("missing {start}"));
+    &source[start_idx..]
+}
+
 impl DiagnosticsServicePort for RecordingDiagnosticsService {
     fn diagnose(
         &self,
@@ -211,4 +218,23 @@ printf 'network_error\nDiagnostic model saw network trouble\n'
         Some(InvocationMode::Proxy)
     );
     assert!(matches!(output, DiagnosticsServiceOutput::Diagnosis { .. }));
+}
+
+#[test]
+fn diagnose_error_preserves_invocation_mode_into_executor_reentry() {
+    let source = include_str!("../src/diagnostics/mod.rs");
+    let body = source_from(source, "pub fn diagnose_error");
+    let reentry_idx = body
+        .find("executor::execute_effective_with_inputs_and_env")
+        .expect("diagnose_error must re-enter the executor");
+    let before_reentry = &body[..reentry_idx];
+
+    assert!(
+        body.contains("provider: effective_provider"),
+        "diagnose_error must thread the caller-supplied effective provider into executor re-entry"
+    );
+    assert!(
+        !before_reentry.contains("ProviderConfig {"),
+        "diagnose_error must not rebuild ProviderConfig before executor re-entry"
+    );
 }
