@@ -2358,3 +2358,33 @@ The AGE-113 finding is even cleaner than AGE-93 D4/D5 because (a) the alignment 
 **Evidence**: `${planning_dir}/.scratch/rca-adoption-evidence.md` (Phase 6 contract mapping); `${planning_dir}/session.json` (records `pipeline_entry_mode=rca-output-pre-applied` + `predecessor_workflow.session_id`); rca dossier `applied.md`, `fix-decision.md`, `application-plan.md`; worktree diff at tip `4d0d168`.
 
 **Resume point**: commit the worktree diff (one squash-eligible commit per `~/ai/conventions/commit-hygiene.md`) → Phase 8 PR-review gates → Phase 8.X closure-judge → Phase 9 auto-merge.
+
+---
+
+### AGE-121 — Phase 8 test-audit PARTIAL recorded (impl-mode coverage-delta always-PARTIAL)
+
+**Decision**: Record the test-audit gate's `PARTIAL` verdict in the Phase 8 join manifest under its documented allow-advance basis. Proceed to Phase 8.X closure-judge and Phase 9.
+
+**Evidence**:
+
+- `~/ai/agents/test-audit-gate.md` § Non-Negotiables: "In implementation mode, coverage-delta is always `PARTIAL`."
+- Same § Non-Negotiables: "The implementation workflow may separately acknowledge the implementation-mode coverage-delta `PARTIAL`, but this gate still records the raw verdict."
+- `${planning_dir}/risk/age-121-test-audit.md` shows Spec Alignment = PASS, Test Quality = PASS, Coverage Delta = PARTIAL with the explicit cause: "Implementation-mode gate has no CI coverage baseline; rerun in PR-review mode with CI artifacts for a coverage-delta decision."
+- `${planning_dir}/risk/phase-8-join-manifest.json` records the raw verdict + the gate-contract-derived advance-basis.
+
+**Why this is NOT a quality-gate residual acceptance** (per the caller anti-scope "NO quality-gate residual acceptance (ACR-156/162/163 + ACR-242 enforcement)" and "NO precedent-citation as residual-acceptance basis"):
+
+- ACR-156/162/163/242 retracts residual acceptance for non-LOW *quality* gates (code-quality, prototype-risk, per-component code-quality, etc.) verdicts at MEDIUM/HIGH. The test-audit-gate is not a quality gate in that taxonomy — it is a tooling/CI-evidence gate that has a documented impl-mode constraint built into its own contract.
+- The advance-basis cited in the join manifest is the gate's own design clause ("In implementation mode, coverage-delta is always `PARTIAL`"), not a precedent from prior WUs. The fact that prior WUs (AGE-93) also hit this is coincidental — the basis is the gate-contract itself, present and explicit at `~/ai/agents/test-audit-gate.md` since gate authorship.
+- Spec Alignment = PASS and Test Quality = PASS — the actual substantive checks both clear. Coverage Delta = PARTIAL is a tooling availability gap (no CI artifacts pre-merge), not a substantive coverage finding against the implementation.
+
+**What this is NOT**:
+
+- NOT acceptance of MEDIUM/HIGH on a code-quality, prototype-risk, or per-component quality gate.
+- NOT acceptance of a multi-concern split recommendation.
+- NOT acceptance of a justification HIGH_CONCERN.
+- NOT bypass of process-tree review.
+
+**Post-merge follow-up**: when the PR merges and CI runs on `main`, coverage baselines for the touched product files (`crates/oulipoly-state/src/db.rs`, `src-tauri/src/main.rs`) will be available. Any later PR-review-mode rerun of test-audit-gate against the post-merge artifacts can resolve the coverage-delta PARTIAL into PASS or, if the CI evidence shows a coverage regression, file a follow-up ticket. This deferred-evidence path is acceptable for the AGE project's `auto_merge_after_phase_9=true` mode because the rca's Phase 5/6 verification (10/10 PASS including `cargo test -p oulipoly-agent-runner` full-suite, `cargo fmt --check`, `cargo clippy -- -D warnings`) already proved local quality.
+
+**Resume point**: Phase 8.X closure-judge → Phase 9 auto-merge.
