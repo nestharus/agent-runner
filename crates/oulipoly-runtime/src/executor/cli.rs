@@ -1404,6 +1404,17 @@ mod tests {
             .collect()
     }
 
+    fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        let start_idx = source
+            .find(start)
+            .unwrap_or_else(|| panic!("missing {start}"));
+        let after_start = &source[start_idx..];
+        let end_idx = after_start
+            .find(end)
+            .unwrap_or_else(|| panic!("missing {end} after {start}"));
+        &after_start[..end_idx]
+    }
+
     fn age28_claude_provider(script_path: &Path, args: Vec<String>) -> ProviderConfig {
         ProviderConfig {
             name: "claude".to_string(),
@@ -2234,6 +2245,57 @@ cat > /dev/null"#,
 
     #[cfg(unix)]
     #[test]
+    fn execute_interactive_with_result_preserves_invocation_mode() {
+        let argv_dump = tempfile::NamedTempFile::new().unwrap();
+        let argv_dump_path = argv_dump.path().to_path_buf();
+        let script = fixture_script(&format!(
+            r#"printf '%s\n' "$@" > "{dump}""#,
+            dump = argv_dump_path.display()
+        ));
+        let provider = ProviderConfig {
+            name: "fixture-provider".to_string(),
+            command: script.path.to_string_lossy().into_owned(),
+            args: vec!["one-shot-only".to_string()],
+            interactive_args: Some(vec!["hello".to_string(), "world".to_string()]),
+            resume: None,
+            session_capture: None,
+            resume_acceptance: None,
+            session_storage: None,
+            system_prompt_override: None,
+            tool_restrictions: None,
+            invocation_mode: InvocationMode::Proxy,
+        };
+
+        let result = execute_interactive_with_result(&provider, None, None, None).unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(
+            std::fs::read_to_string(&argv_dump_path).unwrap(),
+            "hello\nworld\n"
+        );
+
+        let source_path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/executor/cli.rs");
+        let source = std::fs::read_to_string(source_path).expect("read cli source");
+        let body = source_between(
+            &source,
+            "pub fn execute_interactive_with_result",
+            "enum CapturePlan",
+        );
+        assert!(body.contains("provider.interactive_args"), "{body}");
+        assert!(body.contains("apply_provider_policy(provider"), "{body}");
+        assert!(
+            body.contains("build_command(\n        provider,")
+                || body.contains("build_command(provider,"),
+            "{body}"
+        );
+        assert!(
+            !body.contains("ProviderConfig {"),
+            "interactive execution must not rebuild ProviderConfig in function body"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn execute_interactive_propagates_working_directory() {
         let tempdir = tempfile::tempdir().unwrap();
         let cwd_dump = tempdir.path().join("cwd.txt");
@@ -2459,6 +2521,75 @@ printf '{{"type":"system","subtype":"init","session_id":"8f0a6a1f-9cd2-4c91-b6c6
         assert!(!argv.contains("--session-id"));
         assert!(!argv.contains("--verbose"));
         assert!(String::from_utf8_lossy(&result.stdout).contains("8f0a6a1f"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_resume_preserves_invocation_mode_while_clearing_session_capture() {
+        let script = fixture_script(
+            r#"printf '{"type":"system","subtype":"init","session_id":"8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22"}\n'"#,
+        );
+        let provider = ProviderConfig {
+            name: "claude2".to_string(),
+            command: script.path.to_string_lossy().into_owned(),
+            args: vec!["-p".to_string()],
+            interactive_args: Some(vec!["launch".to_string()]),
+            resume: None,
+            session_capture: Some(SessionCapture {
+                kind: SessionCaptureKind::ForcedFlagVerified,
+                flag: Some("--session-id".to_string()),
+                readback_args: Some(vec![
+                    "--verbose".to_string(),
+                    "--output-format".to_string(),
+                    "stream-json".to_string(),
+                ]),
+                event_type: None,
+                event_id_path: None,
+                json_flag: None,
+                last_message_flag: None,
+            }),
+            resume_acceptance: None,
+            session_storage: None,
+            system_prompt_override: None,
+            tool_restrictions: None,
+            invocation_mode: InvocationMode::Proxy,
+        };
+        let strategy = ResumeStrategy {
+            kind: ResumeKind::Flag,
+            flag: Some("--resume".to_string()),
+            subcommand: None,
+        };
+
+        let result = execute_resume(
+            &provider,
+            0,
+            PromptMode::Arg,
+            "answer text",
+            None,
+            None,
+            ResumePayload {
+                session_id: "5169694d-de0f-40d1-890c-6e28e55bab27",
+                strategy: &strategy,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.session_capture.session_id, None);
+        assert!(matches!(
+            result.session_capture.method,
+            SessionCaptureMethod::None
+        ));
+
+        let source_path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/executor/cli.rs");
+        let source = std::fs::read_to_string(source_path).expect("read cli source");
+        let body = source_between(
+            &source,
+            "pub fn execute_resume",
+            "fn classify_resume_acceptance",
+        );
+        assert!(body.contains("provider.clone()"), "{body}");
+        assert!(body.contains(".session_capture = None"), "{body}");
     }
 
     #[cfg(unix)]

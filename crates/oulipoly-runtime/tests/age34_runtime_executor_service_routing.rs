@@ -252,3 +252,89 @@ fn runtime_executor_service_effective_request_preserves_invocation_mode() {
     );
     assert_execution_equivalent(&result, &direct);
 }
+
+#[test]
+fn runtime_executor_service_effective_with_start_known_request_preserves_invocation_mode() {
+    let model_script = fixture_script("printf 'wrong-model-provider\\n'");
+    let effective_script = fixture_script(
+        r#"requested=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --session-id)
+      requested="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+printf 'effective:%s\n' "$requested"
+printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$requested""#,
+    );
+    let model = model_for(&model_script);
+    let mut provider = effective_provider(&effective_script);
+    provider.args = vec!["-p".to_string()];
+    provider.session_capture = Some(oulipoly_config::SessionCapture {
+        kind: oulipoly_config::SessionCaptureKind::ForcedFlagVerified,
+        flag: Some("--session-id".to_string()),
+        readback_args: Some(vec!["--verbose".to_string()]),
+        event_type: None,
+        event_id_path: None,
+        json_flag: None,
+        last_message_flag: None,
+    });
+    provider.invocation_mode = InvocationMode::Proxy;
+    let extra_inputs: HashMap<String, Vec<String>> = HashMap::new();
+    let pinned_id = "11111111-2222-4333-8444-555555555555";
+
+    let direct = cli::execute_effective_with_start_known_provider_session_id(
+        EffectiveExecuteRequest {
+            model: &model,
+            provider: &provider,
+            provider_index: 2,
+            prompt_mode: PromptMode::Arg,
+            prompt: "prompt-value",
+            working_dir: None,
+            extra_inputs: &extra_inputs,
+            parent_invocation_env: None,
+        },
+        Some(pinned_id),
+    )
+    .expect("direct execute");
+
+    let received_effective_provider = Arc::new(Mutex::new(None));
+    let recording_service = RecordingExecutorService {
+        received_effective_provider: Arc::clone(&received_effective_provider),
+    };
+    let service: &dyn ExecutorServicePort = &recording_service;
+    let ExecutorServiceOutput { result } = service
+        .execute(
+            ExecutorServiceRequest::EffectiveWithStartKnownProviderSessionId {
+                model,
+                provider: provider.clone(),
+                provider_index: 2,
+                prompt_mode: PromptMode::Arg,
+                prompt: "prompt-value".to_string(),
+                working_dir: None,
+                extra_inputs,
+                parent_invocation_env: None,
+                start_known_provider_session_id: pinned_id.to_string(),
+            },
+        )
+        .expect("service execute");
+
+    assert_eq!(
+        received_effective_provider
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|provider| provider.invocation_mode),
+        Some(InvocationMode::Proxy)
+    );
+    assert_eq!(
+        result.session_capture.session_id.as_deref(),
+        Some(pinned_id)
+    );
+    assert_execution_equivalent(&result, &direct);
+}
