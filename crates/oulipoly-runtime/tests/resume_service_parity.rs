@@ -81,6 +81,32 @@ fn assert_resolved_same(actual: &ResolvedResume, expected: &ResolvedResume) {
     );
 }
 
+fn assert_resolved_expected_segment_only_shape(
+    actual: &ResolvedResume,
+    expected_chain_id: &str,
+    expected_model_name: Option<&str>,
+    expected_model: Option<&str>,
+    expected_provider: &str,
+    expected_session_id: &str,
+) {
+    let ResolvedResume {
+        chain_id,
+        model_name,
+        model,
+        active_provider,
+        active_session_id,
+    } = actual;
+
+    assert_eq!(chain_id, expected_chain_id);
+    assert_eq!(model_name.as_deref(), expected_model_name);
+    assert_eq!(
+        model.as_ref().map(|model| model.name.as_str()),
+        expected_model
+    );
+    assert_eq!(active_provider, expected_provider);
+    assert_eq!(active_session_id, expected_session_id);
+}
+
 fn start_invocation(db: &StateDb, uuid: &str) -> i64 {
     db.start_invocation(&InvocationStart {
         invocation_uuid: uuid.to_string(),
@@ -151,6 +177,54 @@ fn resume_service_resolve_resume_matches_repository_resolve_resume() {
     match output {
         ResumeServiceOutput::ResumeResolved { resolved } => {
             assert_resolved_same(&resolved, &expected);
+        }
+        other => panic!("expected resolved resume, got {other:?}"),
+    }
+}
+
+#[test]
+fn resume_service_resolve_resume_remains_expected_segment_only() {
+    let fixture = Fixture::new();
+    fixture.seed_active_chain(CHAIN_A, "claude-a", SESSION_A, "claude-opus");
+    let db = fixture.open_db();
+    let models = model_store(vec![model("claude-opus", &["claude-a"])]);
+
+    let direct = StateDb::resolve_resume(&db, &models, SESSION_A, Some("claude-opus")).unwrap();
+    let repository =
+        <StateDb as ResumeRepository>::resolve_resume(&db, &models, SESSION_A, Some("claude-opus"))
+            .unwrap();
+    assert_resolved_expected_segment_only_shape(
+        &direct,
+        CHAIN_A,
+        Some("claude-opus"),
+        Some("claude-opus"),
+        "claude-a",
+        SESSION_A,
+    );
+    assert_resolved_same(&repository, &direct);
+
+    let service = ProductionResumeService::new();
+    let output = service
+        .resolve_resume(ResumeServiceRequest {
+            state: &db,
+            models: &models,
+            input: SESSION_A,
+            model_override: Some("claude-opus"),
+        })
+        .expect("service resolution succeeds");
+
+    match output {
+        ResumeServiceOutput::ResumeResolved { resolved } => {
+            assert_resolved_expected_segment_only_shape(
+                &resolved,
+                CHAIN_A,
+                Some("claude-opus"),
+                Some("claude-opus"),
+                "claude-a",
+                SESSION_A,
+            );
+            assert_resolved_same(&resolved, &direct);
+            assert_resolved_same(&resolved, &repository);
         }
         other => panic!("expected resolved resume, got {other:?}"),
     }
