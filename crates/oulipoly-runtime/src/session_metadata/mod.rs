@@ -616,7 +616,7 @@ fn resolve_cwd_from_session_storage(
         .map_err(|reason| unsupported_storage_error(provider_name, reason))
 }
 
-pub(crate) fn resolve_workspace_root_for_provider_session(
+pub fn resolve_workspace_root_for_provider_session(
     session_storage: Option<&SessionStorage>,
     provider_name: &str,
     session_id: &str,

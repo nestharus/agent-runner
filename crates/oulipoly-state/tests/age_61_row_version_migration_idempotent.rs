@@ -48,20 +48,23 @@ fn ti_04_loader_level_idempotence_preserves_representative_rows() {
         plan.iter()
             .map(|migration| migration.id)
             .collect::<Vec<_>>(),
-        vec!["0006_age_58_dual_write_row_versions"]
+        vec![
+            "0006_age_58_dual_write_row_versions",
+            "0007_age_123_resume_provider_identity"
+        ]
     );
 
     migrations::run_with_db_path(&mut conn, &plan, db_path.clone()).unwrap();
-    assert_eq!(user_version(&conn), 6);
+    assert_eq!(user_version(&conn), 7);
     let after_first = capture_representative_seed(&conn);
 
-    let empty_plan = migrations::current_plan_from(6).unwrap();
+    let empty_plan = migrations::current_plan_from(7).unwrap();
     assert!(
         empty_plan.is_empty(),
-        "schema-6 DBs must not replay 0006 through the migration loader"
+        "schema-7 DBs must not replay migrations through the migration loader"
     );
     migrations::run_with_db_path(&mut conn, &empty_plan, db_path.clone()).unwrap();
-    assert_eq!(user_version(&conn), 6);
+    assert_eq!(user_version(&conn), 7);
     let after_second = capture_representative_seed(&conn);
 
     assert_eq!(after_second, after_first);

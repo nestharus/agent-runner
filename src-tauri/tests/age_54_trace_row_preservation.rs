@@ -169,6 +169,7 @@ fn seed_schema4_trace_db(path: &Path) {
 
 fn seed_current_trace_db_with_prepopulated_chains(path: &Path) {
     build_schema5_invocation_fixture(path);
+    let _ = oulipoly_state::StateDb::open(path).unwrap();
     let conn = Connection::open(path).unwrap();
     seed_trace_read_tables(&conn);
 }

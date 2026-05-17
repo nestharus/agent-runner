@@ -64,6 +64,7 @@ fn bound_invocation(db: &StateDb) -> (String, String) {
             provider_session_id: provider_session_id.clone(),
             capture_method: "forced_flag_verified",
             resume_input_id: None,
+            provider_session_resolved_account: None,
         },
     )
     .unwrap();

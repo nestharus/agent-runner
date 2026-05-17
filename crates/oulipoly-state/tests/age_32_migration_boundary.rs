@@ -253,7 +253,7 @@ fn ti_10_age_54_schema4_plan_contains_only_schema5_step() {
         plan.iter()
             .map(|migration| migration.target_version)
             .collect::<Vec<_>>(),
-        vec![5, CURRENT_SCHEMA_VERSION],
+        vec![5, 6, CURRENT_SCHEMA_VERSION],
         "schema-4 DBs must take the AGE-54 schema-5 migration and current schema migration"
     );
     assert_eq!(
@@ -262,7 +262,8 @@ fn ti_10_age_54_schema4_plan_contains_only_schema5_step() {
             .collect::<Vec<_>>(),
         vec![
             "0005_invocation_dual_session_ids",
-            "0006_age_58_dual_write_row_versions"
+            "0006_age_58_dual_write_row_versions",
+            "0007_age_123_resume_provider_identity"
         ]
     );
 }

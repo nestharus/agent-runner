@@ -1,0 +1,4 @@
+-- AGE-123 adds invocations.provider_session_resolved_account via the
+-- migration post-hook so legacy repair paths where invocations is absent can
+-- still advance to the current schema and let the open-time repair allow-list
+-- recreate the table.
