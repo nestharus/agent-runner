@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema",
+  "manifest_id": "age-89-dossier-manifest",
+  "manifest_version": "1",
+  "purpose": "Repo-owned provenance interface for stable AGE-89 dossier evidence citations.",
+  "information_only": true,
+  "owner": {
+    "chain": "age-89",
+    "declaration": "AGE-89 owns the source evidence and its interpretation; consumers cite stable manifest IDs only."
+  },
+  "source": {
+    "repo_relative_root": "planning/prototype-age-89-clarify/dossier",
+    "absolute_root_default": "/home/nes/projects/agent-runner/planning/prototype-age-89-clarify/dossier",
+    "branch_tag": "prototype-age-89-clarify-p2-stable"
+  },
+  "citation_syntax": "evals/_provenance/age-89-dossier-manifest.json#<stable_id>",
+  "entries": [
+    {
+      "stable_id": "age-89-p1-a-truth-table-v1",
+      "source_path": "evidence/p1-A-truth-table.md",
+      "description": "Truth table evidence for AGE-89 P1 Vector A completion behavior.",
+      "sha256": "8fabfae4762d613606b882fdf2c718b3a38623440b567ea68061f19f8f87416d",
+      "owner_chain": "age-89",
+      "branch_tag": "prototype-age-89-clarify-p2-stable",
+      "supersedes": null
+    },
+    {
+      "stable_id": "age-89-p1-a-five-background-stress-v1",
+      "source_path": "evidence/p1-A-five-background-stress.md",
+      "description": "Five-background-subagent stress evidence for AGE-89 P1 Vector A.",
+      "sha256": "cd28498f4744a635c9bbfada4f2d5251167a4fdf2442442dbf09e8ea6f5cc1c0",
+      "owner_chain": "age-89",
+      "branch_tag": "prototype-age-89-clarify-p2-stable",
+      "supersedes": null
+    },
+    {
+      "stable_id": "age-89-p1-a-scheduled-wakeup-v1",
+      "source_path": "evidence/p1-A-scheduled-wakeup.md",
+      "description": "Scheduled-wakeup evidence for AGE-89 P1 Vector A print-mode and PTY behavior.",
+      "sha256": "0504f27b2828aa098876fd37140749587417ed969da5356c6a46aa3795560654",
+      "owner_chain": "age-89",
+      "branch_tag": "prototype-age-89-clarify-p2-stable",
+      "supersedes": null
+    },
+    {
+      "stable_id": "age-89-answer-v1",
+      "source_path": "answer.md",
+      "description": "AGE-89 prototype answer summarizing conclusions, limits, and remaining edge cases.",
+      "sha256": "6b5552b25ab456826307452fb1db71e9a0759f0b8b616397645fcca54e147032",
+      "owner_chain": "age-89",
+      "branch_tag": "prototype-age-89-clarify-p2-stable",
+      "supersedes": null
+    }
+  ]
+}
