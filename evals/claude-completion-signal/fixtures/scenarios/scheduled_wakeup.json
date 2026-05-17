@@ -1,0 +1,71 @@
+{
+  "scenario_id": "scheduled_wakeup",
+  "description": "A scheduled wakeup keeps the first Stop pending until the wakeup notification turn runs and reaches its own Stop.",
+  "events": [
+    {
+      "seq": 0,
+      "event": "SessionStart",
+      "timestamp": "2026-05-15T18:37:08Z"
+    },
+    {
+      "seq": 1,
+      "event": "ScheduleWakeup",
+      "tool": "ScheduleWakeup",
+      "wakeup_id": "wake-1",
+      "timestamp": "2026-05-15T18:37:10Z"
+    },
+    {
+      "seq": 2,
+      "event": "Stop",
+      "timestamp": "2026-05-15T18:37:13Z"
+    },
+    {
+      "seq": 3,
+      "event": "Notification",
+      "wakeup_id": "wake-1",
+      "timestamp": "2026-05-15T18:39:02Z"
+    },
+    {
+      "seq": 4,
+      "event": "Stop",
+      "timestamp": "2026-05-15T18:39:04Z"
+    }
+  ],
+  "expected_counter_trajectory": {
+    "active_tool": [
+      0,
+      0
+    ],
+    "pending_background_agent": [
+      0,
+      0
+    ],
+    "pending_scheduled_wakeup": [
+      0,
+      1,
+      0
+    ]
+  },
+  "expected_stop_snapshots": [
+    {
+      "after_seq": 2,
+      "stop_for": "foreground",
+      "active_tool_at_stop": 0,
+      "pending_background_agent_at_stop": 0,
+      "pending_scheduled_wakeup_at_stop": 1,
+      "predicate": false
+    },
+    {
+      "after_seq": 4,
+      "stop_for": "wakeup",
+      "active_tool_at_stop": 0,
+      "pending_background_agent_at_stop": 0,
+      "pending_scheduled_wakeup_at_stop": 0,
+      "predicate": true
+    }
+  ],
+  "expected_finalization": {
+    "reason": "completion_predicate_satisfied",
+    "stop_count": 2
+  }
+}

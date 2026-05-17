@@ -1,0 +1,37 @@
+{
+  "clean_foreground": {
+    "stop_count": 1,
+    "final_active_tool": 0,
+    "final_pending_background_agent": 0,
+    "final_pending_scheduled_wakeup": 0,
+    "final_reason": "completion_predicate_satisfied"
+  },
+  "foreground_tool": {
+    "stop_count": 1,
+    "final_active_tool": 0,
+    "final_pending_background_agent": 0,
+    "final_pending_scheduled_wakeup": 0,
+    "final_reason": "completion_predicate_satisfied"
+  },
+  "one_background": {
+    "stop_count": 2,
+    "final_active_tool": 0,
+    "final_pending_background_agent": 0,
+    "final_pending_scheduled_wakeup": 0,
+    "final_reason": "completion_predicate_satisfied"
+  },
+  "five_background": {
+    "stop_count": 6,
+    "final_active_tool": 0,
+    "final_pending_background_agent": 0,
+    "final_pending_scheduled_wakeup": 0,
+    "final_reason": "completion_predicate_satisfied"
+  },
+  "scheduled_wakeup": {
+    "stop_count": 2,
+    "final_active_tool": 0,
+    "final_pending_background_agent": 0,
+    "final_pending_scheduled_wakeup": 0,
+    "final_reason": "completion_predicate_satisfied"
+  }
+}

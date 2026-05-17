@@ -1,0 +1,44 @@
+{
+  "scenario_id": "clean_foreground",
+  "description": "A foreground-only turn reaches Stop with no active tool, background agent, or scheduled wakeup pending.",
+  "events": [
+    {
+      "seq": 0,
+      "event": "SessionStart",
+      "timestamp": "2026-05-15T18:30:42Z"
+    },
+    {
+      "seq": 1,
+      "event": "Stop",
+      "timestamp": "2026-05-15T18:30:44Z"
+    }
+  ],
+  "expected_counter_trajectory": {
+    "active_tool": [
+      0,
+      0
+    ],
+    "pending_background_agent": [
+      0,
+      0
+    ],
+    "pending_scheduled_wakeup": [
+      0,
+      0
+    ]
+  },
+  "expected_stop_snapshots": [
+    {
+      "after_seq": 1,
+      "stop_for": "foreground",
+      "active_tool_at_stop": 0,
+      "pending_background_agent_at_stop": 0,
+      "pending_scheduled_wakeup_at_stop": 0,
+      "predicate": true
+    }
+  ],
+  "expected_finalization": {
+    "reason": "completion_predicate_satisfied",
+    "stop_count": 1
+  }
+}
