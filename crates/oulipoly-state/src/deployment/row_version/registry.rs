@@ -1,3 +1,20 @@
+//! ## Declared roles
+//! accessor, mapper
+//!
+//! ## Intrinsic-surface declarations
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/deployment/row_version/registry.rs::row_version_registry
+//!     role: intrinsic-surface
+//!     Domain: state-db-row-version-registration
+//!     Owns:
+//!       - REGISTRY tracked-table list
+//!       - TableRegistration table field
+//!       - TableRegistration primary_key_columns field
+//!       - TableRegistration payload_columns field
+//!       - RowKind::Mutable
+//!       - lookup table-name selection
+//!       - iter registration iteration
+
 pub struct TableRegistration {
     pub table: &'static str,
     pub primary_key_columns: &'static [&'static str],

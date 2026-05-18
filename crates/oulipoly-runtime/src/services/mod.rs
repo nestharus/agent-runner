@@ -1,3 +1,44 @@
+//! ## Declared roles
+//! orchestration, accessor, mapper, formatter, validator, filter, predicate
+//!
+//! ## Adapter declarations
+//! adapter_declarations:
+//!   - component: crates/oulipoly-runtime/src/services/mod.rs::runtime_service_config_adapter
+//!     role: adapter
+//!     Translates:
+//!       - oulipoly_config.model_contract
+//!       - oulipoly_config.provider_contract
+//!       - oulipoly_config.sessions_contract
+//!       - oulipoly_runtime.service_dto_contract
+//!   - component: crates/oulipoly-runtime/src/services/mod.rs::session_lock_service_adapter
+//!     role: adapter
+//!     Translates:
+//!       - oulipoly_state.resume_resolution_contract
+//!       - oulipoly_config.default_runtime_config_contract
+//!       - oulipoly_runtime.session_lock_contract
+//!       - host.filesystem_lock_directory_contract
+//!
+//! ## Intrinsic-surface declarations
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-runtime/src/services/mod.rs::session_window_selection
+//!     role: intrinsic-surface
+//!     Domain: invocation-window-session-selection
+//!     Owns:
+//!       - invocation finished-at window
+//!       - provider-session candidate enumeration
+//!       - effective-cwd comparison
+//!       - workspace-root normalization
+//!       - no-match warning
+//!       - first-candidate fallback policy
+//!   - component: crates/oulipoly-runtime/src/services/mod.rs::trace_failure_classification
+//!     role: intrinsic-surface
+//!     Domain: trace-service-failure-classification
+//!     Owns:
+//!       - invalid-invocation-id classification
+//!       - invocation-not-found classification
+//!       - operational fallback classification
+//!       - TraceServiceFailure mapping
+
 pub mod error;
 
 use crate::balancer::MigrationDecision;
@@ -13,7 +54,7 @@ use oulipoly_config::{
     ModelConfig, PromptMode, ProviderConfig, ProvidersConfig, SessionsConfig, load_models,
 };
 use oulipoly_state::repositories::ResumeRepository;
-use oulipoly_state::{ResumeError, StateDb};
+use oulipoly_state::{InvocationRecord, ResumeError, StateDb};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -595,16 +636,13 @@ impl SessionLifecycleServicePort for ProductionSessionLifecycleService {
             stderr,
         } = request;
 
-        let invocation = match state.get_invocation_by_uuid(invocation_uuid) {
+        let invocation = match load_invocation_for_session_ingest(state, invocation_uuid) {
             Ok(Some(row)) => row,
             Ok(None) => {
-                writeln!(
+                write_session_ingest_warning(
                     stderr,
-                    "Warning: Could not resolve invocation {invocation_uuid} for session ingest"
-                )
-                .map_err(|err| ServiceError::Dependency {
-                    message: format!("Failed to write session ingest warning: {err}"),
-                })?;
+                    &format!("Could not resolve invocation {invocation_uuid} for session ingest"),
+                )?;
                 return emit_pinned_session_id_for_service(
                     state,
                     stderr,
@@ -614,13 +652,12 @@ impl SessionLifecycleServicePort for ProductionSessionLifecycleService {
                 );
             }
             Err(err) => {
-                writeln!(
+                write_session_ingest_warning(
                     stderr,
-                    "Warning: Failed to load invocation {invocation_uuid} for session ingest: {err}"
-                )
-                .map_err(|err| ServiceError::Dependency {
-                    message: format!("Failed to write session ingest warning: {err}"),
-                })?;
+                    &format!(
+                        "Failed to load invocation {invocation_uuid} for session ingest: {err}"
+                    ),
+                )?;
                 return emit_pinned_session_id_for_service(
                     state,
                     stderr,
@@ -630,21 +667,12 @@ impl SessionLifecycleServicePort for ProductionSessionLifecycleService {
                 );
             }
         };
-        if invocation.id != invocation_row_id {
-            return Err(ServiceError::InvalidRequest {
-                message: format!(
-                    "session ingest request mismatched invocation identifiers: row_id={invocation_row_id} uuid={invocation_uuid}"
-                ),
-            });
-        }
-        let Some(finished_at) = invocation.finished_at else {
-            writeln!(
+        validate_session_ingest_invocation(&invocation, invocation_row_id, invocation_uuid)?;
+        let Some(finished_at) = invocation_finished_at(&invocation) else {
+            write_session_ingest_warning(
                 stderr,
-                "Warning: Invocation {invocation_uuid} was not finalized before session ingest"
-            )
-            .map_err(|err| ServiceError::Dependency {
-                message: format!("Failed to write session ingest warning: {err}"),
-            })?;
+                &format!("Invocation {invocation_uuid} was not finalized before session ingest"),
+            )?;
             return emit_pinned_session_id_for_service(
                 state,
                 stderr,
@@ -655,15 +683,7 @@ impl SessionLifecycleServicePort for ProductionSessionLifecycleService {
         };
 
         let report = crate::sessions::scan_provider(provider_name, sessions_cfg, state);
-        for err in report.errors {
-            writeln!(
-                stderr,
-                "Warning: Session ingest failed for {provider_name}: {err}"
-            )
-            .map_err(|err| ServiceError::Dependency {
-                message: format!("Failed to write session ingest warning: {err}"),
-            })?;
-        }
+        emit_session_scan_errors(stderr, provider_name, report.errors)?;
 
         let matched_session_id = match find_session_for_invocation_window(
             state,
@@ -676,71 +696,23 @@ impl SessionLifecycleServicePort for ProductionSessionLifecycleService {
         ) {
             Ok(session_id) => session_id,
             Err(err) => {
-                writeln!(
+                write_session_ingest_warning(
                     stderr,
-                    "Warning: Failed to resolve session for invocation {invocation_uuid}: {err}"
-                )
-                .map_err(|err| ServiceError::Dependency {
-                    message: format!("Failed to write session ingest warning: {err}"),
-                })?;
+                    &format!("Failed to resolve session for invocation {invocation_uuid}: {err}"),
+                )?;
                 None
             }
         };
 
-        match mode {
-            SessionLifecycleIngestMode::Unpinned { capture_method } => {
-                if let Some(session_id) = invocation.provider_session_id.as_deref() {
-                    if matched_session_id
-                        .as_deref()
-                        .is_some_and(|matched| matched != session_id)
-                    {
-                        writeln!(
-                            stderr,
-                            "Warning: post-run session inference found {matched:?}, preserving start-bound provider_session_id {session_id}",
-                            matched = matched_session_id.as_deref()
-                        )
-                        .map_err(|err| ServiceError::Dependency {
-                            message: format!("Failed to write session ingest warning: {err}"),
-                        })?;
-                    }
-                    emit_known_session_id_for_service(
-                        state,
-                        stderr,
-                        invocation_row_id,
-                        invocation_uuid,
-                        session_id,
-                        invocation
-                            .provider_session_capture_method
-                            .as_deref()
-                            .unwrap_or(&capture_method),
-                    )
-                } else if let Some(session_id) = matched_session_id {
-                    emit_known_session_id_for_service(
-                        state,
-                        stderr,
-                        invocation_row_id,
-                        invocation_uuid,
-                        &session_id,
-                        &capture_method,
-                    )
-                } else {
-                    Ok(SessionLifecycleOutput {
-                        emitted: false,
-                        session_id: None,
-                    })
-                }
-            }
-            SessionLifecycleIngestMode::Pinned { resume_target } => {
-                emit_known_session_id_for_service(
-                    state,
-                    stderr,
-                    invocation_row_id,
-                    invocation_uuid,
-                    &resume_target,
-                    "resumed",
-                )
-            }
-        }
+        emit_session_lifecycle_output(
+            state,
+            stderr,
+            invocation_row_id,
+            invocation_uuid,
+            &invocation,
+            matched_session_id,
+            mode,
+        )
     }
 }
 
@@ -749,35 +721,55 @@ impl MigrationServicePort for ProductionMigrationService {
         &self,
         request: MigrationServiceRequest<'_>,
     ) -> Result<MigrationServiceOutput, ServiceError> {
-        match crate::balancer::decide_migration(
-            request.state,
-            request.migration_model,
-            request.resolved,
-            request.manual_target,
-        ) {
+        match decide_service_migration(&request) {
             Ok(MigrationDecision::Stay) => Ok(MigrationServiceOutput::Stay),
-            Err(err) => Ok(MigrationServiceOutput::DecisionFailed {
-                warning: format!("{err:?}"),
-            }),
+            Err(err) => Ok(migration_decision_failed_output(err)),
             Ok(MigrationDecision::Migrate {
                 target_provider_index,
                 reason,
-            }) => crate::migration::migrate_chain_segment(
-                request.state,
-                request.sessions_cfg,
-                request.migration_model,
-                request.resolved,
-                request.effective_cwd,
-                target_provider_index,
-                reason,
-                request.stderr,
-            )
-            .map(|segment| MigrationServiceOutput::Migrated { segment })
-            .map_err(|err| ServiceError::Dependency {
-                message: format!("{err:?}"),
-            }),
+            }) => run_service_migration(request, target_provider_index, reason),
         }
     }
+}
+
+fn decide_service_migration(
+    request: &MigrationServiceRequest<'_>,
+) -> Result<MigrationDecision, crate::migration::MigrationError> {
+    crate::balancer::decide_migration(
+        request.state,
+        request.migration_model,
+        request.resolved,
+        request.manual_target,
+    )
+}
+
+fn migration_decision_failed_output(
+    err: crate::migration::MigrationError,
+) -> MigrationServiceOutput {
+    MigrationServiceOutput::DecisionFailed {
+        warning: format!("{err:?}"),
+    }
+}
+
+fn run_service_migration(
+    request: MigrationServiceRequest<'_>,
+    target_provider_index: usize,
+    reason: crate::balancer::TransitionReason,
+) -> Result<MigrationServiceOutput, ServiceError> {
+    crate::migration::migrate_chain_segment(
+        request.state,
+        request.sessions_cfg,
+        request.migration_model,
+        request.resolved,
+        request.effective_cwd,
+        target_provider_index,
+        reason,
+        request.stderr,
+    )
+    .map(|segment| MigrationServiceOutput::Migrated { segment })
+    .map_err(|err| ServiceError::Dependency {
+        message: format!("{err:?}"),
+    })
 }
 
 impl TraceServicePort for ProductionTraceService {
@@ -842,58 +834,240 @@ impl SessionLockServicePort for ProductionSessionLockService {
     }
 }
 
+fn load_invocation_for_session_ingest(
+    state: &StateDb,
+    invocation_uuid: &str,
+) -> Result<Option<InvocationRecord>, String> {
+    state.get_invocation_by_uuid(invocation_uuid)
+}
+
+fn validate_session_ingest_invocation(
+    invocation: &InvocationRecord,
+    invocation_row_id: i64,
+    invocation_uuid: &str,
+) -> Result<(), ServiceError> {
+    if invocation.id != invocation_row_id {
+        return Err(ServiceError::InvalidRequest {
+            message: format!(
+                "session ingest request mismatched invocation identifiers: row_id={invocation_row_id} uuid={invocation_uuid}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn invocation_finished_at(invocation: &InvocationRecord) -> Option<chrono::DateTime<chrono::Utc>> {
+    invocation.finished_at
+}
+
+fn emit_session_scan_errors(
+    stderr: &mut dyn Write,
+    provider_name: &str,
+    errors: Vec<String>,
+) -> Result<(), ServiceError> {
+    for err in errors {
+        write_session_ingest_warning(
+            stderr,
+            &format!("Session ingest failed for {provider_name}: {err}"),
+        )?;
+    }
+    Ok(())
+}
+
+fn emit_session_lifecycle_output(
+    state: &StateDb,
+    stderr: &mut dyn Write,
+    invocation_row_id: i64,
+    invocation_uuid: &str,
+    invocation: &InvocationRecord,
+    matched_session_id: Option<String>,
+    mode: SessionLifecycleIngestMode,
+) -> Result<SessionLifecycleOutput, ServiceError> {
+    match mode {
+        SessionLifecycleIngestMode::Unpinned { capture_method } => emit_unpinned_session_output(
+            state,
+            stderr,
+            invocation_row_id,
+            invocation_uuid,
+            invocation,
+            matched_session_id,
+            &capture_method,
+        ),
+        SessionLifecycleIngestMode::Pinned { resume_target } => emit_known_session_id_for_service(
+            state,
+            stderr,
+            invocation_row_id,
+            invocation_uuid,
+            &resume_target,
+            "resumed",
+        ),
+    }
+}
+
+fn emit_unpinned_session_output(
+    state: &StateDb,
+    stderr: &mut dyn Write,
+    invocation_row_id: i64,
+    invocation_uuid: &str,
+    invocation: &InvocationRecord,
+    matched_session_id: Option<String>,
+    capture_method: &str,
+) -> Result<SessionLifecycleOutput, ServiceError> {
+    if let Some(session_id) = invocation.provider_session_id.as_deref() {
+        warn_if_preserving_start_bound_session(stderr, &matched_session_id, session_id)?;
+        return emit_known_session_id_for_service(
+            state,
+            stderr,
+            invocation_row_id,
+            invocation_uuid,
+            session_id,
+            invocation
+                .provider_session_capture_method
+                .as_deref()
+                .unwrap_or(capture_method),
+        );
+    }
+
+    if let Some(session_id) = matched_session_id {
+        return emit_known_session_id_for_service(
+            state,
+            stderr,
+            invocation_row_id,
+            invocation_uuid,
+            &session_id,
+            capture_method,
+        );
+    }
+
+    Ok(SessionLifecycleOutput {
+        emitted: false,
+        session_id: None,
+    })
+}
+
+fn warn_if_preserving_start_bound_session(
+    stderr: &mut dyn Write,
+    matched_session_id: &Option<String>,
+    session_id: &str,
+) -> Result<(), ServiceError> {
+    if matched_session_id
+        .as_deref()
+        .is_some_and(|matched| matched != session_id)
+    {
+        write_session_ingest_warning(
+            stderr,
+            &format!(
+                "post-run session inference found {matched:?}, preserving start-bound provider_session_id {session_id}",
+                matched = matched_session_id.as_deref()
+            ),
+        )?;
+    }
+    Ok(())
+}
+
+fn write_session_ingest_warning(stderr: &mut dyn Write, message: &str) -> Result<(), ServiceError> {
+    writeln!(stderr, "Warning: {message}").map_err(|err| ServiceError::Dependency {
+        message: format!("Failed to write session ingest warning: {err}"),
+    })
+}
+
 fn classify_trace_failure(input: &str, message: String) -> TraceServiceFailure {
     let lower = message.to_ascii_lowercase();
-    if lower.contains("invalid invocation uuid") {
-        TraceServiceFailure::InvalidInvocationId {
-            input: input.to_string(),
-            message,
-        }
-    } else if lower.contains("unknown invocation") || lower.contains("invocation not found") {
-        TraceServiceFailure::InvocationNotFound {
-            input: input.to_string(),
-            message,
-        }
-    } else {
-        TraceServiceFailure::Operational { message }
+    if is_invalid_invocation_id_trace_failure(&lower) {
+        return invalid_invocation_id_trace_failure(input, message);
     }
+    if is_invocation_not_found_trace_failure(&lower) {
+        return invocation_not_found_trace_failure(input, message);
+    }
+    operational_trace_failure(message)
+}
+
+fn is_invalid_invocation_id_trace_failure(lowercase_message: &str) -> bool {
+    lowercase_message.contains("invalid invocation uuid")
+}
+
+fn invalid_invocation_id_trace_failure(input: &str, message: String) -> TraceServiceFailure {
+    TraceServiceFailure::InvalidInvocationId {
+        input: input.to_string(),
+        message,
+    }
+}
+
+fn is_invocation_not_found_trace_failure(lowercase_message: &str) -> bool {
+    lowercase_message.contains("unknown invocation")
+        || lowercase_message.contains("invocation not found")
+}
+
+fn invocation_not_found_trace_failure(input: &str, message: String) -> TraceServiceFailure {
+    TraceServiceFailure::InvocationNotFound {
+        input: input.to_string(),
+        message,
+    }
+}
+
+fn operational_trace_failure(message: String) -> TraceServiceFailure {
+    TraceServiceFailure::Operational { message }
 }
 
 fn acquire_session_lock(
     session_id: &str,
     ttl_ms: u64,
 ) -> Result<SessionLockSuccess, SessionLockFailure> {
-    let state = StateDb::open_default()
-        .map_err(|message| SessionLockFailure::Lock(LockError::Operational { message }))?;
-    let providers_cfg =
-        ProvidersConfig::load(&default_config_root().join("providers.toml")).unwrap_or_default();
-    let models = load_models(&default_models_dir(), Some(&providers_cfg)).map_err(|message| {
-        SessionLockFailure::Lock(LockError::Operational {
-            message: message.to_string(),
-        })
-    })?;
+    let state = open_default_state_for_lock()?;
+    let providers_cfg = load_default_providers_config();
+    let models = load_default_models_for_lock(&providers_cfg)?;
     reject_recent_ambiguous_resume(&state, session_id).map_err(SessionLockFailure::Resume)?;
     let resolved = <StateDb as ResumeRepository>::resolve_resume(&state, &models, session_id, None)
         .map_err(SessionLockFailure::Resume)?;
-    let lock_dir = default_lock_dir().map_err(SessionLockFailure::Lock)?;
-    let lock = SessionLock::new(&lock_dir).map_err(|err| {
-        SessionLockFailure::Lock(LockError::Operational {
-            message: format!("failed to open locks: {err}"),
-        })
-    })?;
-    let lease = lock
-        .acquire(
-            &resolved.active_session_id,
-            &resolved.active_provider,
-            Duration::from_millis(ttl_ms),
-        )
-        .map_err(SessionLockFailure::Lock)?;
+    let lock = open_default_session_lock()?;
+    let lease = acquire_resolved_session_lease(&lock, &resolved, ttl_ms)?;
     Ok(SessionLockSuccess::Acquired {
         session_id: resolved.active_session_id,
         chain_id: resolved.chain_id,
         provider_name: resolved.active_provider,
         lease,
     })
+}
+
+fn open_default_state_for_lock() -> Result<StateDb, SessionLockFailure> {
+    StateDb::open_default()
+        .map_err(|message| SessionLockFailure::Lock(LockError::Operational { message }))
+}
+
+fn load_default_providers_config() -> ProvidersConfig {
+    ProvidersConfig::load(&default_config_root().join("providers.toml")).unwrap_or_default()
+}
+
+fn load_default_models_for_lock(
+    providers_cfg: &ProvidersConfig,
+) -> Result<oulipoly_state::ModelStore, SessionLockFailure> {
+    load_models(&default_models_dir(), Some(providers_cfg)).map_err(|message| {
+        SessionLockFailure::Lock(LockError::Operational {
+            message: message.to_string(),
+        })
+    })
+}
+
+fn open_default_session_lock() -> Result<SessionLock, SessionLockFailure> {
+    let lock_dir = default_lock_dir().map_err(SessionLockFailure::Lock)?;
+    SessionLock::new(&lock_dir).map_err(|err| {
+        SessionLockFailure::Lock(LockError::Operational {
+            message: format!("failed to open locks: {err}"),
+        })
+    })
+}
+
+fn acquire_resolved_session_lease(
+    lock: &SessionLock,
+    resolved: &oulipoly_state::ResolvedResume,
+    ttl_ms: u64,
+) -> Result<Lease, SessionLockFailure> {
+    lock.acquire(
+        &resolved.active_session_id,
+        &resolved.active_provider,
+        Duration::from_millis(ttl_ms),
+    )
+    .map_err(SessionLockFailure::Lock)
 }
 
 fn reject_recent_ambiguous_resume(state: &StateDb, session_id: &str) -> Result<(), ResumeError> {
@@ -919,18 +1093,19 @@ fn release_session_lock(
     token: &str,
 ) -> Result<SessionLockSuccess, SessionLockFailure> {
     // Preserve resume-handshake's state-open gate; release itself does not resolve providers.
-    StateDb::open_default()
-        .map_err(|message| SessionLockFailure::Lock(LockError::Operational { message }))?;
-    let lock_dir = default_lock_dir().map_err(SessionLockFailure::Lock)?;
-    let lock = SessionLock::new(&lock_dir).map_err(|err| {
-        SessionLockFailure::Lock(LockError::Operational {
-            message: format!("failed to open locks: {err}"),
-        })
-    })?;
-    let receipt = lock
-        .release(session_id, token)
-        .map_err(SessionLockFailure::Lock)?;
+    open_default_state_for_lock()?;
+    let lock = open_default_session_lock()?;
+    let receipt = release_session_lease(&lock, session_id, token)?;
     Ok(SessionLockSuccess::Released { receipt })
+}
+
+fn release_session_lease(
+    lock: &SessionLock,
+    session_id: &str,
+    token: &str,
+) -> Result<ReleaseReceipt, SessionLockFailure> {
+    lock.release(session_id, token)
+        .map_err(SessionLockFailure::Lock)
 }
 
 fn default_config_root() -> PathBuf {
@@ -985,8 +1160,7 @@ fn find_session_for_invocation_window(
     effective_cwd: Option<&Path>,
     stderr: &mut dyn Write,
 ) -> Result<Option<String>, String> {
-    let candidates =
-        state.find_sessions_for_invocation_window(provider_name, started_at, finished_at)?;
+    let candidates = session_window_candidates(state, provider_name, started_at, finished_at)?;
     if candidates.len() <= 1 {
         return Ok(candidates.into_iter().next());
     }
@@ -994,10 +1168,7 @@ fn find_session_for_invocation_window(
     let Some(effective_cwd) = effective_cwd else {
         return Ok(candidates.into_iter().next());
     };
-    let Some(session_storage) = providers_cfg
-        .and_then(|providers| providers.get(provider_name))
-        .and_then(|entry| entry.session_storage.as_ref())
-    else {
+    let Some(session_storage) = session_storage_for_provider(providers_cfg, provider_name) else {
         return Ok(candidates.into_iter().next());
     };
 
@@ -1005,31 +1176,69 @@ fn find_session_for_invocation_window(
     let mut resolved_any = false;
     for session_id in &candidates {
         let Ok(workspace_root) =
-            crate::session_metadata::resolve_workspace_root_for_provider_session(
-                Some(session_storage),
-                provider_name,
-                session_id,
-            )
+            resolve_candidate_workspace_root(session_storage, provider_name, session_id)
         else {
             continue;
         };
         resolved_any = true;
-        if comparable_workspace_path(&workspace_root) == expected_cwd {
+        if workspace_matches_expected_cwd(&workspace_root, &expected_cwd) {
             return Ok(Some(session_id.clone()));
         }
     }
 
     if resolved_any {
-        writeln!(
-            stderr,
-            "Warning: no in-window session for provider {provider_name} matched cwd {}; not emitting inferred session id",
-            effective_cwd.display()
-        )
-        .map_err(|err| format!("Failed to write session ingest warning: {err}"))?;
+        write_session_window_no_match_warning(stderr, provider_name, effective_cwd)?;
         Ok(None)
     } else {
         Ok(candidates.into_iter().next())
     }
+}
+
+fn session_window_candidates(
+    state: &StateDb,
+    provider_name: &str,
+    started_at: &chrono::DateTime<chrono::Utc>,
+    finished_at: &chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<String>, String> {
+    state.find_sessions_for_invocation_window(provider_name, started_at, finished_at)
+}
+
+fn session_storage_for_provider<'a>(
+    providers_cfg: Option<&'a ProvidersConfig>,
+    provider_name: &str,
+) -> Option<&'a oulipoly_config::SessionStorage> {
+    providers_cfg
+        .and_then(|providers| providers.get(provider_name))
+        .and_then(|entry| entry.session_storage.as_ref())
+}
+
+fn resolve_candidate_workspace_root(
+    session_storage: &oulipoly_config::SessionStorage,
+    provider_name: &str,
+    session_id: &str,
+) -> Result<PathBuf, crate::session_metadata::MetadataError> {
+    crate::session_metadata::resolve_workspace_root_for_provider_session(
+        Some(session_storage),
+        provider_name,
+        session_id,
+    )
+}
+
+fn workspace_matches_expected_cwd(workspace_root: &Path, expected_cwd: &Path) -> bool {
+    comparable_workspace_path(workspace_root) == expected_cwd
+}
+
+fn write_session_window_no_match_warning(
+    stderr: &mut dyn Write,
+    provider_name: &str,
+    effective_cwd: &Path,
+) -> Result<(), String> {
+    writeln!(
+        stderr,
+        "Warning: no in-window session for provider {provider_name} matched cwd {}; not emitting inferred session id",
+        effective_cwd.display()
+    )
+    .map_err(|err| format!("Failed to write session ingest warning: {err}"))
 }
 
 fn comparable_workspace_path(path: &Path) -> PathBuf {
@@ -1047,66 +1256,118 @@ fn emit_known_session_id_for_service(
     if let Err(err) =
         state.update_session_capture(invocation_row_id, Some(session_id), capture_method)
     {
-        writeln!(
+        write_session_ingest_warning(
             stderr,
-            "Warning: Failed to update invocation session_id: {err}"
-        )
-        .map_err(|err| ServiceError::Dependency {
-            message: format!("Failed to write session ingest warning: {err}"),
-        })?;
+            &format!("Failed to update invocation session_id: {err}"),
+        )?;
         return Ok(SessionLifecycleOutput {
             emitted: false,
             session_id: None,
         });
     }
     let record = state.get_invocation_by_uuid(invocation_uuid).ok().flatten();
-    let should_mint_chain = record
-        .as_ref()
-        .is_none_or(|row| row.resume_input_id.as_deref() != row.provider_session_id.as_deref());
-    if should_mint_chain
-        && let Err(err) = state.mint_chain_for_invocation_session(invocation_row_id)
-    {
-        writeln!(stderr, "Warning: Failed to mint session chain: {err}").map_err(|err| {
-            ServiceError::Dependency {
-                message: format!("Failed to write session ingest warning: {err}"),
-            }
-        })?;
+    mint_chain_for_marker_if_needed(state, stderr, invocation_row_id, record.as_ref())?;
+    let payload = session_marker_payload(
+        state,
+        invocation_uuid,
+        session_id,
+        capture_method,
+        record.as_ref(),
+    );
+    write_session_marker(stderr, &payload)?;
+    Ok(SessionLifecycleOutput {
+        emitted: true,
+        session_id: Some(session_id.to_string()),
+    })
+}
+
+fn mint_chain_for_marker_if_needed(
+    state: &StateDb,
+    stderr: &mut dyn Write,
+    invocation_row_id: i64,
+    record: Option<&InvocationRecord>,
+) -> Result<(), ServiceError> {
+    if !should_mint_chain_for_marker(record) {
+        return Ok(());
     }
-    let provider_name = record.as_ref().and_then(|row| row.provider_name.clone());
-    let provider_session_id = record
-        .as_ref()
-        .and_then(|row| row.provider_session_id.clone())
-        .or_else(|| {
-            if capture_method == "resumed" {
-                None
-            } else {
-                Some(session_id.to_string())
-            }
-        });
-    let agent_runner_chain_id = provider_name.as_deref().and_then(|provider_name| {
-        provider_session_id
-            .as_deref()
-            .and_then(|provider_session_id| {
-                state
-                    .chain_id_for_segment(provider_name, provider_session_id)
-                    .ok()
-                    .flatten()
-            })
-    });
-    let payload = oulipoly_state::SessionMarkerPayload {
+    if let Err(err) = state.mint_chain_for_invocation_session(invocation_row_id) {
+        write_session_ingest_warning(stderr, &format!("Failed to mint session chain: {err}"))?;
+    }
+    Ok(())
+}
+
+fn should_mint_chain_for_marker(record: Option<&InvocationRecord>) -> bool {
+    record.is_none_or(|row| row.resume_input_id.as_deref() != row.provider_session_id.as_deref())
+}
+
+fn session_marker_payload(
+    state: &StateDb,
+    invocation_uuid: &str,
+    session_id: &str,
+    capture_method: &str,
+    record: Option<&InvocationRecord>,
+) -> oulipoly_state::SessionMarkerPayload {
+    let provider_name = marker_provider_name(record);
+    let provider_session_id = marker_provider_session_id(record, capture_method, session_id);
+    let agent_runner_chain_id = marker_agent_runner_chain_id(
+        state,
+        provider_name.as_deref(),
+        provider_session_id.as_deref(),
+    );
+
+    oulipoly_state::SessionMarkerPayload {
         agent_runner_invocation_id: invocation_uuid.to_string(),
         provider_session_id: provider_session_id.clone(),
         provider_name,
         agent_runner_chain_id,
-        resume_input_id: record.as_ref().and_then(|row| row.resume_input_id.clone()),
+        resume_input_id: record.and_then(|row| row.resume_input_id.clone()),
         legacy_id: invocation_uuid.to_string(),
         legacy_session_id: Some(session_id.to_string()),
-    };
+    }
+}
+
+fn marker_provider_name(record: Option<&InvocationRecord>) -> Option<String> {
+    record.and_then(|row| row.provider_name.clone())
+}
+
+fn marker_provider_session_id(
+    record: Option<&InvocationRecord>,
+    capture_method: &str,
+    session_id: &str,
+) -> Option<String> {
+    record
+        .and_then(|row| row.provider_session_id.clone())
+        .or_else(|| fallback_marker_provider_session_id(capture_method, session_id))
+}
+
+fn fallback_marker_provider_session_id(capture_method: &str, session_id: &str) -> Option<String> {
+    if capture_method == "resumed" {
+        None
+    } else {
+        Some(session_id.to_string())
+    }
+}
+
+fn marker_agent_runner_chain_id(
+    state: &StateDb,
+    provider_name: Option<&str>,
+    provider_session_id: Option<&str>,
+) -> Option<String> {
+    provider_name.and_then(|provider_name| {
+        provider_session_id.and_then(|provider_session_id| {
+            state
+                .chain_id_for_segment(provider_name, provider_session_id)
+                .ok()
+                .flatten()
+        })
+    })
+}
+
+fn write_session_marker(
+    stderr: &mut dyn Write,
+    payload: &oulipoly_state::SessionMarkerPayload,
+) -> Result<(), ServiceError> {
     write!(stderr, "{}", payload.stderr_line()).map_err(|err| ServiceError::Dependency {
         message: format!("Failed to write session marker: {err}"),
-    })?;
-    Ok(SessionLifecycleOutput {
-        emitted: true,
-        session_id: Some(session_id.to_string()),
     })
 }
