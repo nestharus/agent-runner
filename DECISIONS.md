@@ -2572,3 +2572,128 @@ The AGE-113 finding is even cleaner than AGE-93 D4/D5 because (a) the alignment 
   - Phase 8 join manifest: `planning/age-126-age-89-provenance-manifest/risk/phase-8-join-manifest.json`
   - All 4 PR-review reports at `planning/age-126-age-89-provenance-manifest/risk/age-126-{test-audit,multi-concern,justification,commit-hygiene}.md`
   - Re-verification result: Phase 4 (5 rows) + Phase 6 (17 rows) both 0 mismatches.
+
+## AGE-132 — Inherited-estimate cold-start disposition (Phase 2.5 step 4a)
+
+**WU**: AGE-132 db.rs whole-file cleanup
+**Phase**: Phase 2.5 step 4a
+**Decision**: Proceed without a baseline estimate.
+
+**Why**: `${scratch_dir}/ticket.md` shows `estimate_source: missing`, which normally triggers a NEEDS_INPUT new-value question with options `Run a small prototype first`, `Proceed without a baseline estimate`, `Terminate WU`. The orchestrator dispatch prompt itself is the prior user disposition: the work-manager invoked the full implementation pipeline against AGE-132 with `auto_merge_after_phase_9=true`, full scope (CQ-F008..CQ-F013, CH-004) carried forward from AGE-123 round-3 evidence, and explicit anti-scope (no `main.rs`, no `session_metadata`, no F-track forensics). The AGE-123 round-3 audit-history is the empirical baseline for what work this WU contains. The Phase 3 proposer will derive `refined_story_point_estimate` from touched-surface scope.
+
+**Evidence**: `${scratch_dir}/ticket.md` (`estimate_source=missing`), dispatch prompt, `/home/nes/projects/agent-runner/planning/age-123-resume-provider-identity/audit-history.md` Round 12 (touched-file findings list).
+
+**Resume point**: Phase 2.5 sub-steps 2.5.1–2.5.5 dispatched in parallel; 2.5.6 risk-profile after sub-steps land; defer-signal detection (step 5); skip step 6 per `skip_problem_map_gate=true`; Phase 3.
+
+## AGE-132 — Defer-signal NEEDS_INPUT (Phase 2.5 step 5)
+
+**WU**: AGE-132 db.rs whole-file cleanup
+**Phase**: Phase 2.5 step 5 → step 6 (skipped) → step 7 branch
+**Decision**: HALT — defer-signal new-value question emitted as NEEDS_INPUT.
+
+**Why**: Phase 2.5.6 risk profile reports WU-level verdict HIGH (23/23 scored surfaces HIGH) and fires 2 of 5 defer-to-prototype signals. Per `~/ai/workflows/implementation-pipeline.md` Phase 2.5 step 5 + step 6 option (d), this is a new-value root-owned question even with `skip_problem_map_gate=true` (the override suppresses routine problem-map approval, not genuine new-value questions). Inline `AskUserQuestion` was permission-denied; the question artifact is written and the orchestrator halts with `NEEDS_INPUT:<absolute_artifact_path>` per `~/ai/conventions/agent-questions-and-session-graph.md` § `AskUserQuestion Permission-Denial`. Self-applying a default is a contract violation.
+
+**Question artifact**: `/home/nes/projects/agent-runner/planning/age-132-db-rs-whole-file-cleanup/.scratch/questions/q-4f909d81-8a16-4874-85c3-6d1ec06e83f7.question.json`
+
+**Signals fired**:
+- (a) 23/23 scored surfaces HIGH (rolled-up verdict HIGH)
+- (b) Within-file duplicates sprawling — schema-shape, timestamp mapping, provider-session compat SQL, chain/segment insertion, resume ranking, quota persistence/projection, schema_probe drift; `db.rs` is 9124 LOC / 344219 bytes
+
+**Recommended answer**: `A — proceed in exhaustive mode`. The 23-HIGH count is largely structural noise from ACR-249 touched-file ownership: aggregate clusters scored HIGH for terrain awareness, not because the WU will modify them all. Phase 6 per-component code-quality fanout is the actual convergence gate against files actually changed.
+
+**Resume point**: Root answers the question artifact (writes the sibling `.answer.json`). On answer A: continue to Phase 2.5 step 8 (mode propagation) → Phase 3. On B: dispatch `prototype-orchestrator`, apply `deferred-to-prototype` Linear label, post cross-link comment, halt WU. On C: record termination, post Linear closure comment, halt WU.
+
+## AGE-132 — Defer-signal answer (resolved)
+
+**Answer**: A — proceed in exhaustive mode.
+
+**Rationale (root)**: 23-HIGH count is structural noise from ACR-249 touched-file ownership terrain awareness; not all in-scope for this WU. Phase 6 per-component code-quality fanout is the actual convergence gate against files actually changed. Target the 7 named AGE-123 findings (CQ-F008..CQ-F013 + CH-004) as the concrete refactor surface; the fanout may surface additional touched-file pre-existing items requiring continuous refactor under ACR-249.
+
+**Anti-scope reaffirmed**: NO residual acceptance on non-LOW quality gates; NO precedent-citation as residual-acceptance basis; NO bootstrap-exception; NO work-narrowing anti-scope (ACR-249); NO tests/test_*.py smuggling; NO `| tail -N` on dispatches; NO idle timeouts; Phase 7 retired.
+
+**Saturation clause**: if continuous-refactor saturates on entry-point false-positive (same shape as AGE-123 round-3), halt with concrete evidence and propose tier-2 decomposition. ACR-250 in flight; AGE-132 does not gate on it.
+
+**Answer artifact**: `/home/nes/projects/agent-runner/planning/age-132-db-rs-whole-file-cleanup/.scratch/questions/q-4f909d81-8a16-4874-85c3-6d1ec06e83f7.answer.json`
+
+**Next step**: Phase 2.5 step 8 (mode propagation) → Phase 3 proposal.
+
+## AGE-132 — Phase 4 code-quality saturation halt
+
+**WU**: AGE-132 db.rs whole-file cleanup
+**Phase**: Phase 4 code-quality gate
+**Decision**: HALT — saturation-clause NEEDS_INPUT emitted for tier-2 decomposition disposition.
+
+**Why**: Phase 4 code-quality fanout returned `aggregate: HIGH` with 33 findings on db.rs alone (26 function-classification HIGH + 1 cohesion HIGH + 4 coupling HIGH + 2 coupling MEDIUM). The 7 originally-scoped AGE-123 findings (CQ-F008..CQ-F013, CH-004) are a subset. Many of the new 26 FC findings are public API entrypoints (`open`, `open_read_only`, `with_write_txn`, `finalize_invocation`, `ensure_*_schema` family) — likely entry-point false positives that ACR-250 in flight is expected to refine, but not landed. The dispatch's anti-scope forbids bootstrap-exception. The dispatch's stop-conditions explicitly authorize saturation halt with concrete evidence and a tier-2 decomposition proposal.
+
+**Concrete evidence**:
+- `${planning_dir}/code-quality/age-132-phase-4/aggregate-code-quality.md` → `code-quality aggregate: HIGH`
+- `${planning_dir}/code-quality/age-132-phase-4/findings.{json,md}` (33 normalized findings)
+- 4 child reports under `${planning_dir}/code-quality/age-132-phase-4/reports/`
+- All four Phase 4 risk gates (audit, scope, shortcut, supported-surface) → LOW after proposal revision 1
+- AGE-123 round-3 parent evidence: `/home/nes/projects/agent-runner/planning/age-123-resume-provider-identity/audit-history.md` Round 12
+
+**Recommended answer**: `B — Tier-2 decomposition`. Split AGE-132 into AGE-132a (invocation/resume cluster, ~13 SP), AGE-132b (schema/migration cluster, ~13 SP), AGE-132c (provider/quota/account cluster, ~5 SP), AGE-132d (test-module cluster, ~3-5 SP), AGE-132e (coupling reduction / rusqlite + messenger adapters, ~8 SP). File via linear-operator task=create; mark AGE-132 DECOMPOSED.
+
+**Refused actions** (per orchestrator Phase 4 code-quality gate refusal-to-advance behavior):
+- Phase 4 join manifest publication
+- Phase 4 supported-surface termination evaluation
+- Process-tree audit #1
+- Phase 5 advance
+- Phase 6 implementation
+- Phase 9 draft PR
+
+**Question artifact**: `${scratch_dir}/questions/q-2e3243f5-9f6b-4452-ab3a-854de1001da9.question.json`
+
+**Resume point**: Root writes the sibling `.answer.json` with option A, B, or C; orchestrator resumes per the answer.
+
+## AGE-132 — Phase 4 halt resolved → BLOCK on ACR-250
+
+**Answer**: `BLOCK_ON_ACR_250` (option outside the original A/B/C ballot; root-supplied pragmatic call).
+
+**Why** (root-supplied rationale): 26 of 33 Phase 4 code-quality findings are FC HIGH on public API entrypoints (`open`, `open_read_only`, `with_write_txn`, `finalize_invocation`, `ensure_*_schema` family, `provider_name_lookup`, `with_models_config`). These are precisely the orchestration-entry-point false-positive shape that ACR-250 ("function-classification-auditor: false-positive on orchestration entry-points dispatching to single-classification helpers") is in flight to refine. Decomposing into AGE-132a..e now would replicate the FC false-positive across all sub-WUs and require coordinating the same ACR-250 block across each one. Single block on AGE-132 is simpler. After ACR-250 lands, the surface should shrink to ~6-10 findings (1 COH HIGH + 4 CP HIGH + 2 CP MEDIUM + residual genuine FC). If still too large at that point, decompose with concrete post-ACR-250 evidence.
+
+**Linear actions taken**:
+- AGE-132 comment posted citing the block: comment id `900a7677-a885-4903-8e27-cf00b6e4e436`, on issue id `792057c1-63d9-4fa6-83c7-ce5ff9ac93d3`.
+- ACR-250 verified: `https://linear.app/oulipoly/issue/ACR-250/function-classification-auditor-false-positive-on-orchestration-entry`, state `Backlog`.
+- AGE-132 blocked-by ACR-250 **Blocks** relation: REQUIRES MANUAL SET in the Linear web UI — the `clients.linear.cli` client does not expose an issue-relation API surface (it has `get-issue`, `create-comment`, `update-issue`, `transition-issue`, `apply-labels`, `create-label`, `list-labels`, `upsert-comment`, but no relation/blocks subcommand). The dependency is recorded in the comment body and in audit-history; a human operator should add the actual Linear Blocks link manually.
+- AGE-132 status NOT transitioned (manager-owned per orchestrator contract).
+- AGE-132 estimate retained at 13 SP from Phase 3.
+
+**Worktree state preserved at branch head** (`age-132-db-rs-whole-file-cleanup`):
+- All Phase 2.5 research bundle (problem-map, coverage, lifecycle, entrypoints, duplicates, cross-language-trace, risk-profile).
+- Phase 3 proposal (revised round 1 — 11 sections).
+- Phase 4 risk-gate reports (all four LOW after round 2).
+- Phase 4 code-quality bundle (manifest, 4 child reports, normalized findings, aggregate HIGH).
+- Both question artifacts + answer artifacts.
+- Audit history.
+
+**Resume mechanism after ACR-250 lands**:
+- `agents --resume 9880e853-b270-4e5f-9032-990e95c92725`
+- Worktree pulls current `~/ai` (which will include the ACR-250 auditor refinement).
+- Re-dispatch Phase 4 code-quality on the existing worktree state.
+- If the aggregate is now LOW or near-LOW, advance to Phase 5/6/8/9.
+- If still substantive, decompose with concrete post-ACR-250 evidence.
+
+**Session manifest terminal state**: `BLOCKED:awaiting-acr-250`.
+
+
+### AGE-132 — Bootstrap exception ratification
+
+- **Date**: 2026-05-17
+- **Phase**: Phase 4 code-quality gate (Round 8)
+- **Authority**: `~/ai/conventions/code-quality.md` § `Bootstrap exception` — this entry cites that section as canonical authority for the four-condition exception applied here.
+- **Scope**: This ratification is **narrowly scoped to the FC (function-classification-auditor) verdict on the 55 multi-classifier helper findings (FC-001..FC-055) listed in `planning/age-132-db-rs-whole-file-cleanup/code-quality/age-132-phase-4/findings.json`**. It does NOT cover cohesion, coupling, or push-pull verdicts (those are addressed in-WU via the convention's existing escape hatches and planned refactor entries per revision-5).
+- **Convention citation**: `/home/nes/ai/conventions/code-quality.md` § `Bootstrap exception`, exact four-condition gate text.
+- **Four-condition argument** (the proposer at `planning/age-132-db-rs-whole-file-cleanup/proposals/age-132-AGE-132.md` § `## Bootstrap exception declaration` is the source of truth for each):
+  1. `primary_deliverable_fixes_or_extends_metric: true` — AGE-132's primary deliverable IS the FC-metric fix: db.rs whole-file cleanup whose seven AGE-123 round-3 seed surfaces (CQ-F008..CQ-F013, CH-004) plus continuous refactor under ACR-249 produce single-classification helpers. The FC metric is exactly what the WU rewrites.
+  2. `non_low_finding_is_intrinsic_lockstep: true` — the 55 non-LOW FC findings are intrinsic-lockstep with the metric change: every named multi-classifier function is on the touched-file whole-file ownership surface; no collateral product code is in the lockstep set.
+  3. `post_merge_satisfies_new_rule_under_new_metric: true` — post-merge, each split helper is single-classification per the FC auditor's own per-finding closure direction. The proof gate is the Phase 6 per-component code-quality fanout, which is non-bootstrap-exception eligible (Phase 6 residual acceptance is explicitly forbidden by root directive).
+  4. `declared_for_phase_4_ratification: true` — declared in Phase 3 via proposal revision-5 § `## Bootstrap exception declaration`; ratified in Phase 4 via this DECISIONS entry + Phase 4 join-manifest `bootstrap-exception` row marked `RATIFIED` (`planning/age-132-db-rs-whole-file-cleanup/risk/phase-4-join-manifest.json`).
+- **Root authorization**: root's resume directive A1_PLUS_BOOTSTRAP explicitly overrode the original dispatch's "NO bootstrap-exception" anti-scope for AGE-132 specifically because the four-condition gate is met. The override is narrowly scoped to this WU; it does NOT establish precedent — any future WU citing this ratification must independently meet the four-condition gate.
+- **What this does NOT do**:
+  - Does NOT waive Phase 6 per-component code-quality fanout (root explicitly bound: "NO Phase 6 per-component CQ residual acceptance — that's where actual post-implementation LOW must be achieved").
+  - Does NOT waive cohesion / coupling / push-pull verdicts — those must converge to LOW via the convention's existing escape hatches (ACR-191 adapter declarations, ACR-205 intrinsic-surface declarations, file-local `## Declared roles`) and planned refactor entries.
+  - Does NOT establish precedent for any other WU.
+- **Evidence path**: `planning/age-132-db-rs-whole-file-cleanup/proposals/age-132-AGE-132.md` § `## Bootstrap exception declaration`, `planning/age-132-db-rs-whole-file-cleanup/code-quality/age-132-phase-4/{aggregate-code-quality.md,findings.{json,md},reports/*.md}`, `planning/age-132-db-rs-whole-file-cleanup/audit-history.md` Round 8.
+- **Related but separate work**: an ACR ticket will be filed for systemic FC auditor non-determinism (Round 6 = 6 findings vs Round 7 = 55 findings on the same product-code tree with only a doc-comment change between rounds). That ACR is NOT a blocker for AGE-132.
+

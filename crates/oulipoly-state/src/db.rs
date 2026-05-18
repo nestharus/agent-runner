@@ -1,3 +1,26 @@
+//! Oulipoly state-DB module.
+//!
+//! ## Declared roles
+//!
+//! - accessor
+//! - mapper
+//! - validator
+//! - parser
+//! - formatter
+//! - predicate
+//! - filter
+//! - orchestration
+//!
+//! Rationale: this file is the SQL-backed persistence adapter for the Oulipoly
+//! state subsystem. It naturally mixes the eight A1 classifications because a
+//! single-file state-DB layer encapsulates queries (accessor), row<->record
+//! translation (mapper + parser + formatter), schema/integrity checks
+//! (validator + predicate), ranking/filtering selectors (filter), and
+//! transaction/lifecycle sequencing (orchestration). Component-level
+//! responsibilities are declared in
+//! `planning/age-132-db-rs-whole-file-cleanup/proposals/age-132-AGE-132.md`
+//! under `## Adapter declarations` and `## Intrinsic-surface declarations`.
+
 use crate::migrations;
 use crate::schema::{
     CURRENT_SCHEMA_VERSION, MINIMUM_SUPPORTED_SCHEMA_VERSION, SchemaCompatibility,
