@@ -250,6 +250,29 @@ fn replace_service_preserves_replace_error_invalid_input_transcript() {
     }
 }
 
+#[test]
+fn session_replace_active_segment_parity_under_contract() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let fixture = ReplaceFixture::new();
+    let service = ProductionSessionReplaceService::default();
+
+    let output = service
+        .replace_session(SessionReplaceServiceRequest {
+            session_id: SESSION_A.to_string(),
+            source: ReplaceSource::File(fixture.input_path.clone()),
+            preimage_sha256: None,
+        })
+        .unwrap();
+    let receipt = output.result.unwrap();
+
+    assert_eq!(receipt.session_id, SESSION_A);
+    assert_eq!(receipt.provider_name, CLAUDE_PROVIDER);
+    assert_eq!(receipt.operation, "import-replace");
+    assert!(receipt.state_updated);
+    assert_eq!(receipt.preimage_sha256.len(), 64);
+    assert_eq!(receipt.postimage_sha256.len(), 64);
+}
+
 fn assert_receipts_match_except_environment(actual: ReplaceReceipt, expected: ReplaceReceipt) {
     assert_eq!(actual.session_id, expected.session_id);
     assert_eq!(actual.provider_name, expected.provider_name);

@@ -3,7 +3,7 @@ use oulipoly_runtime::services::{
 };
 use oulipoly_runtime::session_export::{
     ExportError, ExportSessionMetadata, SessionStorageType, canonical_jsonl_bytes,
-    read_canonical_transcript,
+    read_canonical_transcript, resolve_export_session_metadata,
 };
 use oulipoly_state::StateDb;
 use rusqlite::params;
@@ -176,6 +176,24 @@ flag = "--resume"
             .unwrap();
     }
 
+    fn seed_db_turn(&self, provider_name: &str, session_id: &str, turn_id: &str, text: &str) {
+        let db = self.db();
+        db.connection()
+            .execute(
+                "INSERT INTO session_turns
+                    (provider_name, session_id, turn_id, timestamp, role,
+                     parent_turn_id, is_sidechain, is_compaction_boundary, source_file, ingested_at, body)
+                 VALUES (?1, ?2, ?3, '2026-04-17T08:00:00Z', 'assistant', NULL, 0, 0, '', '2026-04-17T08:00:00Z', ?4)",
+                params![
+                    provider_name,
+                    session_id,
+                    turn_id,
+                    format!(r#"[{{"type":"text","text":"{text}"}}]"#)
+                ],
+            )
+            .unwrap();
+    }
+
     fn stage_claude_jsonl(&self, session_id: &str) -> PathBuf {
         let path = self.data_root.join(format!("{session_id}.jsonl"));
         fs::write(
@@ -256,6 +274,49 @@ fn export_service_preserves_export_error_variants() {
     assert_unsupported_storage();
     assert_malformed_transcript();
     assert_operational();
+}
+
+#[test]
+fn locator_contract_allow_missing_export_metadata_uses_db_fallback() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let fixture = ExportFixture::new();
+    fixture.write_model(MODEL, &[CLAUDE_PROVIDER]);
+    fixture.write_provider(CLAUDE_PROVIDER, "claude_code", true);
+    fixture.seed_active_chain(CHAIN_A, CLAUDE_PROVIDER, SESSION_A);
+    fixture.seed_db_turn(CLAUDE_PROVIDER, SESSION_A, "db-turn", "fallback body");
+    let missing = fixture.data_root.join("missing-provider-transcript.jsonl");
+    fixture.write_sessions_locator(CLAUDE_PROVIDER, &missing);
+
+    let metadata = resolve_export_session_metadata(SESSION_A).unwrap();
+    let records = read_canonical_transcript(&metadata).unwrap();
+
+    assert_eq!(metadata.jsonl_path, missing);
+    assert!(!metadata.jsonl_path.exists());
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].turn_id, "db-turn");
+    assert_eq!(records[0].content[0].text.as_deref(), Some("fallback body"));
+    assert_eq!(records[0].source.storage_type, "state_db");
+}
+
+#[test]
+fn session_export_parity_unchanged_under_contract() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let (_fixture, transcript) = prepared_export();
+    let service = ProductionSessionExportService::default();
+
+    let output = service
+        .export_session(SessionExportServiceRequest {
+            session_id: SESSION_A.to_string(),
+        })
+        .unwrap();
+
+    assert!(output.result.is_ok());
+    assert_eq!(
+        transcript,
+        resolve_export_session_metadata(SESSION_A)
+            .unwrap()
+            .jsonl_path
+    );
 }
 
 fn export_error_for(fixture: ExportFixture, session_id: &str) -> ExportError {

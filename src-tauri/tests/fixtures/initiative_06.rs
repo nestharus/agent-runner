@@ -193,6 +193,54 @@ prompt_mode = "arg"
         fs::write(providers_path, body).unwrap();
     }
 
+    pub fn write_script_provider(
+        &self,
+        provider_name: &str,
+        cwd_script: &str,
+        transcript_script: Option<&str>,
+        storage_type: Option<&str>,
+        resume: bool,
+    ) {
+        let resume_block = if resume {
+            format!(
+                r#"
+[{provider_name}.resume]
+kind = "flag"
+flag = "--resume"
+"#
+            )
+        } else {
+            String::new()
+        };
+        let transcript_line = transcript_script
+            .map(|script| format!("transcript_script = {script:?}\n"))
+            .unwrap_or_default();
+        let storage_type_line = storage_type
+            .map(|kind| format!("storage_type = {kind:?}\n"))
+            .unwrap_or_default();
+        fs::create_dir_all(&self.app_config_dir).unwrap();
+        let providers_path = self.app_config_dir.join("providers.toml");
+        let mut body = if providers_path.exists() {
+            fs::read_to_string(&providers_path).unwrap()
+        } else {
+            String::new()
+        };
+        body.push_str(&format!(
+            r#"[{provider_name}]
+command = "provider-command-that-must-not-run"
+args = []
+interactive_args = ["launch"]
+prompt_mode = "arg"
+{resume_block}
+[{provider_name}.session_storage]
+kind = "script"
+cwd_script = {cwd_script:?}
+{transcript_line}{storage_type_line}
+"#
+        ));
+        fs::write(providers_path, body).unwrap();
+    }
+
     pub fn write_sessions_with_locator_path(&self, provider_name: &str, transcript_path: &Path) {
         let locator = self.write_script(
             &format!("{provider_name}-locator.sh"),
