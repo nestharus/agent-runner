@@ -1,0 +1,555 @@
+schema_id: agent-runner-provider-termination-fixture-manifest-v1
+schema_owner: evals/agent-runner-provider-termination/eval.md
+adapter_surface:
+  raw_fixture_files: "provider bytes only"
+  sentinel_metadata_files: "minimal structured metadata only"
+  expected_rows: "machine-readable contract for W5"
+rows:
+  - id: claude-quota-acr186
+    provider_name: claude
+    provider_family: claude
+    recognizer_module_path: crates/oulipoly-runtime/src/executor/providers/claude.rs
+    fixture_bytes_path: claude-quota-acr186.txt
+    fixture_bytes_role: stderr
+    sentinel_metadata_path: null
+    terminal_status:
+      kind: unknown
+      code: null
+      signal: null
+      reason: null
+    observed_at: "2026-05-18T00:00:00Z"
+    expected_terminal_signal_kind: QuotaExhaustedInband
+    expected_marker_kind_label: quota_exhausted_inband
+    evidence_excerpt_policy: &bounded_opaque_policy
+      max_chars: 160
+      opaque: true
+      parsed_fields: TerminalSignalEvidence-only
+    provenance:
+      source: ACR-186 minimized opaque Claude quota incident excerpt
+      privacy_reviewed: true
+      notes: Canonical Claude quota vocabulary only; private transcript fields redacted.
+
+  - id: claude-quota-generic
+    provider_name: claude
+    provider_family: claude
+    recognizer_module_path: crates/oulipoly-runtime/src/executor/providers/claude.rs
+    fixture_bytes_path: claude-quota-generic.txt
+    fixture_bytes_role: stderr
+    sentinel_metadata_path: null
+    terminal_status:
+      kind: unknown
+      code: null
+      signal: null
+      reason: null
+    observed_at: "2026-05-18T00:00:00Z"
+    expected_terminal_signal_kind: QuotaExhaustedInband
+    expected_marker_kind_label: quota_exhausted_inband
+    evidence_excerpt_policy: *bounded_opaque_policy
+    provenance:
+      source: AGE-139 Claude recognizer vocabulary
+      privacy_reviewed: true
+      notes: Generic bounded provider-byte excerpt with no transcript fields.
+
+  - id: claude-signal
+    provider_name: claude
+    provider_family: claude
+    recognizer_module_path: crates/oulipoly-runtime/src/executor/providers/claude.rs
+    fixture_bytes_path: null
+    fixture_bytes_role: none
+    sentinel_metadata_path: claude-signal.metadata.yaml
+    terminal_status:
+      kind: signal_terminated
+      code: null
+      signal: 15
+      reason: null
+    observed_at: "2026-05-18T00:00:00Z"
+    expected_terminal_signal_kind: SignalExit
+    expected_marker_kind_label: signal_exit
+    evidence_excerpt_policy: *bounded_opaque_policy
+    provenance:
+      source: AGE-139 structured terminal status precedence
+      privacy_reviewed: true
+      notes: Sentinel metadata represents process termination by SIGTERM.
+
+  - id: claude-spawn-error
+    provider_name: claude
+    provider_family: claude
+    recognizer_module_path: crates/oulipoly-runtime/src/executor/providers/claude.rs
+    fixture_bytes_path: null
+    fixture_bytes_role: none
+    sentinel_metadata_path: claude-spawn-error.metadata.yaml
+    terminal_status:
+      kind: spawn_error
+      code: null
+      signal: null
+      reason: claude executable not found
+    observed_at: "2026-05-18T00:00:00Z"
+    expected_terminal_signal_kind: SpawnError
+    expected_marker_kind_label: spawn_error
+    evidence_excerpt_policy: *bounded_opaque_policy
+    provenance:
+      source: AGE-139 structured terminal status precedence
+      privacy_reviewed: true
+      notes: Sentinel metadata only; no provider bytes exist for failed spawn.
+
+  - id: claude-prolonged-silence
+    provider_name: claude
+    provider_family: claude
+    recognizer_module_path: crates/oulipoly-runtime/src/executor/providers/claude.rs
+    fixture_bytes_path: null
+    fixture_bytes_role: none
+    sentinel_metadata_path: claude-prolonged-silence.metadata.yaml
+    terminal_status:
+      kind: prolonged_silence
+      code: null
+      signal: null
+      reason: no stdout/stderr for 600s
+    observed_at: "2026-05-18T00:00:00Z"
+    expected_terminal_signal_kind: ProlongedSilence
+    expected_marker_kind_label: prolonged_silence
+    evidence_excerpt_policy: *bounded_opaque_policy
+    provenance:
+      source: AGE-139 structured terminal status precedence
+      privacy_reviewed: true
+      notes: Sentinel metadata only; no sleep or live provider replay.
+
+  - id: claude-clean-exit
+    provider_name: claude
+    provider_family: claude
+    recognizer_module_path: crates/oulipoly-runtime/src/executor/providers/claude.rs
+    fixture_bytes_path: claude-clean-exit.txt
+    fixture_bytes_role: stdout
+    sentinel_metadata_path: null
+    terminal_status:
+      kind: exited
+      code: 0
+      signal: null
+      reason: null
+    observed_at: "2026-05-18T00:00:00Z"
+    expected_terminal_signal_kind: CleanExit
+    expected_marker_kind_label: clean_exit
+    evidence_excerpt_policy: *bounded_opaque_policy
+    provenance:
+      source: AGE-139 post-quota clean exit precedence
+      privacy_reviewed: true
+      notes: Benign provider bytes contain no quota vocabulary.
+
+  - id: claude-nonzero
+    provider_name: claude
+    provider_family: claude
+    recognizer_module_path: crates/oulipoly-runtime/src/executor/providers/claude.rs
+    fixture_bytes_path: claude-nonzero.txt
+    fixture_bytes_role: stderr
+    sentinel_metadata_path: null
+    terminal_status:
+      kind: exited
+      code: 42
+      signal: null
+      reason: null
+    observed_at: "2026-05-18T00:00:00Z"
+    expected_terminal_signal_kind: NonzeroExit
+    expected_marker_kind_label: nonzero_exit
+    evidence_excerpt_policy: *bounded_opaque_policy
+    provenance:
+      source: AGE-139 post-quota nonzero exit precedence
+      privacy_reviewed: true
+      notes: Nonzero status with no quota vocabulary.
+
+  - id: claude-unknown
+    provider_name: claude
+    provider_family: claude
+    recognizer_module_path: crates/oulipoly-runtime/src/executor/providers/claude.rs
+    fixture_bytes_path: claude-unknown.txt
+    fixture_bytes_role: stdout
+    sentinel_metadata_path: null
+    terminal_status:
+      kind: unknown
+      code: null
+      signal: null
+      reason: null
+    observed_at: "2026-05-18T00:00:00Z"
+    expected_terminal_signal_kind: Unknown
+    expected_marker_kind_label: unknown
+    evidence_excerpt_policy: *bounded_opaque_policy
+    provenance:
+      source: AGE-139 Claude recognizer non-match behavior
+      privacy_reviewed: true
+      notes: Opaque output that does not match quota vocabulary.
+
+  - id: claude-network-boundary
+    provider_name: claude
+    provider_family: claude
+    recognizer_module_path: crates/oulipoly-runtime/src/executor/providers/claude.rs
+    fixture_bytes_path: claude-network-boundary.txt
+    fixture_bytes_role: stderr
+    sentinel_metadata_path: null
+    terminal_status:
+      kind: exited
+      code: 1
+      signal: null
+      reason: null
+    observed_at: "2026-05-18T00:00:00Z"
+    expected_terminal_signal_kind: NonzeroExit
+    expected_marker_kind_label: nonzero_exit
+    evidence_excerpt_policy: *bounded_opaque_policy
+    provenance:
+      source: AGE-142 network boundary fixture
+      privacy_reviewed: true
+      notes: network_error diagnostics remain adjacent; terminal status is nonzero.
+
+  - id: codex-quota
+    provider_name: codex
+    provider_family: codex
+    recognizer_module_path: crates/oulipoly-runtime/src/executor/providers/codex.rs
+    fixture_bytes_path: codex-quota.txt
+    fixture_bytes_role: stderr
+    sentinel_metadata_path: null
+    terminal_status:
+      kind: unknown
+      code: null
+      signal: null
+      reason: null
+    observed_at: "2026-05-18T00:00:00Z"
+    expected_terminal_signal_kind: QuotaExhaustedInband
+    expected_marker_kind_label: quota_exhausted_inband
+    evidence_excerpt_policy: *bounded_opaque_policy
+    provenance:
+      source: AGE-139 Codex recognizer vocabulary
+      privacy_reviewed: true
+      notes: Bounded provider-byte excerpt with canonical Codex quota vocabulary.
+
+  - id: codex-signal
+    provider_name: codex
+    provider_family: codex
+    recognizer_module_path: crates/oulipoly-runtime/src/executor/providers/codex.rs
+    fixture_bytes_path: null
+    fixture_bytes_role: none
+    sentinel_metadata_path: codex-signal.metadata.yaml
+    terminal_status:
+      kind: signal_terminated
+      code: null
+      signal: 15
+      reason: null
+    observed_at: "2026-05-18T00:00:00Z"
+    expected_terminal_signal_kind: SignalExit
+    expected_marker_kind_label: signal_exit
+    evidence_excerpt_policy: *bounded_opaque_policy
+    provenance:
+      source: AGE-139 structured terminal status precedence
+      privacy_reviewed: true
+      notes: Sentinel metadata represents process termination by SIGTERM.
+
+  - id: codex-spawn-error
+    provider_name: codex
+    provider_family: codex
+    recognizer_module_path: crates/oulipoly-runtime/src/executor/providers/codex.rs
+    fixture_bytes_path: null
+    fixture_bytes_role: none
+    sentinel_metadata_path: codex-spawn-error.metadata.yaml
+    terminal_status:
+      kind: spawn_error
+      code: null
+      signal: null
+      reason: codex executable not found
+    observed_at: "2026-05-18T00:00:00Z"
+    expected_terminal_signal_kind: SpawnError
+    expected_marker_kind_label: spawn_error
+    evidence_excerpt_policy: *bounded_opaque_policy
+    provenance:
+      source: AGE-139 structured terminal status precedence
+      privacy_reviewed: true
+      notes: Sentinel metadata only; no provider bytes exist for failed spawn.
+
+  - id: codex-prolonged-silence
+    provider_name: codex
+    provider_family: codex
+    recognizer_module_path: crates/oulipoly-runtime/src/executor/providers/codex.rs
+    fixture_bytes_path: null
+    fixture_bytes_role: none
+    sentinel_metadata_path: codex-prolonged-silence.metadata.yaml
+    terminal_status:
+      kind: prolonged_silence
+      code: null
+      signal: null
+      reason: no stdout/stderr for 600s
+    observed_at: "2026-05-18T00:00:00Z"
+    expected_terminal_signal_kind: ProlongedSilence
+    expected_marker_kind_label: prolonged_silence
+    evidence_excerpt_policy: *bounded_opaque_policy
+    provenance:
+      source: AGE-139 structured terminal status precedence
+      privacy_reviewed: true
+      notes: Sentinel metadata only; no sleep or live provider replay.
+
+  - id: codex-clean-exit
+    provider_name: codex
+    provider_family: codex
+    recognizer_module_path: crates/oulipoly-runtime/src/executor/providers/codex.rs
+    fixture_bytes_path: codex-clean-exit.txt
+    fixture_bytes_role: stdout
+    sentinel_metadata_path: null
+    terminal_status:
+      kind: exited
+      code: 0
+      signal: null
+      reason: null
+    observed_at: "2026-05-18T00:00:00Z"
+    expected_terminal_signal_kind: CleanExit
+    expected_marker_kind_label: clean_exit
+    evidence_excerpt_policy: *bounded_opaque_policy
+    provenance:
+      source: AGE-139 post-quota clean exit precedence
+      privacy_reviewed: true
+      notes: Benign provider bytes contain no quota vocabulary.
+
+  - id: codex-nonzero
+    provider_name: codex
+    provider_family: codex
+    recognizer_module_path: crates/oulipoly-runtime/src/executor/providers/codex.rs
+    fixture_bytes_path: codex-nonzero.txt
+    fixture_bytes_role: stderr
+    sentinel_metadata_path: null
+    terminal_status:
+      kind: exited
+      code: 42
+      signal: null
+      reason: null
+    observed_at: "2026-05-18T00:00:00Z"
+    expected_terminal_signal_kind: NonzeroExit
+    expected_marker_kind_label: nonzero_exit
+    evidence_excerpt_policy: *bounded_opaque_policy
+    provenance:
+      source: AGE-139 post-quota nonzero exit precedence
+      privacy_reviewed: true
+      notes: Nonzero status with no quota vocabulary.
+
+  - id: codex-unknown
+    provider_name: codex
+    provider_family: codex
+    recognizer_module_path: crates/oulipoly-runtime/src/executor/providers/codex.rs
+    fixture_bytes_path: codex-unknown.txt
+    fixture_bytes_role: stdout
+    sentinel_metadata_path: null
+    terminal_status:
+      kind: unknown
+      code: null
+      signal: null
+      reason: null
+    observed_at: "2026-05-18T00:00:00Z"
+    expected_terminal_signal_kind: Unknown
+    expected_marker_kind_label: unknown
+    evidence_excerpt_policy: *bounded_opaque_policy
+    provenance:
+      source: AGE-139 Codex recognizer non-match behavior
+      privacy_reviewed: true
+      notes: Opaque output that does not match quota vocabulary.
+
+  - id: codex-network-boundary
+    provider_name: codex
+    provider_family: codex
+    recognizer_module_path: crates/oulipoly-runtime/src/executor/providers/codex.rs
+    fixture_bytes_path: codex-network-boundary.txt
+    fixture_bytes_role: stderr
+    sentinel_metadata_path: null
+    terminal_status:
+      kind: exited
+      code: 1
+      signal: null
+      reason: null
+    observed_at: "2026-05-18T00:00:00Z"
+    expected_terminal_signal_kind: NonzeroExit
+    expected_marker_kind_label: nonzero_exit
+    evidence_excerpt_policy: *bounded_opaque_policy
+    provenance:
+      source: AGE-142 network boundary fixture
+      privacy_reviewed: true
+      notes: network_error diagnostics remain adjacent; terminal status is nonzero.
+
+  - id: openai-compat-quota-gemini
+    provider_name: gemini
+    provider_family: openai_compat
+    recognizer_module_path: crates/oulipoly-runtime/src/executor/providers/openai_compat.rs
+    fixture_bytes_path: openai-compat-quota-gemini.txt
+    fixture_bytes_role: stdout
+    sentinel_metadata_path: null
+    terminal_status:
+      kind: unknown
+      code: null
+      signal: null
+      reason: null
+    observed_at: "2026-05-18T00:00:00Z"
+    expected_terminal_signal_kind: QuotaExhaustedInband
+    expected_marker_kind_label: quota_exhausted_inband
+    evidence_excerpt_policy: *bounded_opaque_policy
+    provenance:
+      source: AGE-139 OpenAI-compatible recognizer vocabulary
+      privacy_reviewed: true
+      notes: Gemini-style bounded provider-byte quota excerpt.
+
+  - id: openai-compat-quota-opencode
+    provider_name: opencode
+    provider_family: openai_compat
+    recognizer_module_path: crates/oulipoly-runtime/src/executor/providers/openai_compat.rs
+    fixture_bytes_path: openai-compat-quota-opencode.txt
+    fixture_bytes_role: stderr
+    sentinel_metadata_path: null
+    terminal_status:
+      kind: unknown
+      code: null
+      signal: null
+      reason: null
+    observed_at: "2026-05-18T00:00:00Z"
+    expected_terminal_signal_kind: QuotaExhaustedInband
+    expected_marker_kind_label: quota_exhausted_inband
+    evidence_excerpt_policy: *bounded_opaque_policy
+    provenance:
+      source: AGE-139 OpenAI-compatible recognizer vocabulary
+      privacy_reviewed: true
+      notes: OpenCode-style bounded provider-byte quota excerpt.
+
+  - id: openai-compat-signal
+    provider_name: gemini
+    provider_family: openai_compat
+    recognizer_module_path: crates/oulipoly-runtime/src/executor/providers/openai_compat.rs
+    fixture_bytes_path: null
+    fixture_bytes_role: none
+    sentinel_metadata_path: openai-compat-signal.metadata.yaml
+    terminal_status:
+      kind: signal_terminated
+      code: null
+      signal: 15
+      reason: null
+    observed_at: "2026-05-18T00:00:00Z"
+    expected_terminal_signal_kind: SignalExit
+    expected_marker_kind_label: signal_exit
+    evidence_excerpt_policy: *bounded_opaque_policy
+    provenance:
+      source: AGE-139 structured terminal status precedence
+      privacy_reviewed: true
+      notes: Sentinel metadata represents process termination by SIGTERM.
+
+  - id: openai-compat-spawn-error
+    provider_name: gemini
+    provider_family: openai_compat
+    recognizer_module_path: crates/oulipoly-runtime/src/executor/providers/openai_compat.rs
+    fixture_bytes_path: null
+    fixture_bytes_role: none
+    sentinel_metadata_path: openai-compat-spawn-error.metadata.yaml
+    terminal_status:
+      kind: spawn_error
+      code: null
+      signal: null
+      reason: provider executable not found
+    observed_at: "2026-05-18T00:00:00Z"
+    expected_terminal_signal_kind: SpawnError
+    expected_marker_kind_label: spawn_error
+    evidence_excerpt_policy: *bounded_opaque_policy
+    provenance:
+      source: AGE-139 structured terminal status precedence
+      privacy_reviewed: true
+      notes: Sentinel metadata only; no provider bytes exist for failed spawn.
+
+  - id: openai-compat-prolonged-silence
+    provider_name: gemini
+    provider_family: openai_compat
+    recognizer_module_path: crates/oulipoly-runtime/src/executor/providers/openai_compat.rs
+    fixture_bytes_path: null
+    fixture_bytes_role: none
+    sentinel_metadata_path: openai-compat-prolonged-silence.metadata.yaml
+    terminal_status:
+      kind: prolonged_silence
+      code: null
+      signal: null
+      reason: no stdout/stderr for 600s
+    observed_at: "2026-05-18T00:00:00Z"
+    expected_terminal_signal_kind: ProlongedSilence
+    expected_marker_kind_label: prolonged_silence
+    evidence_excerpt_policy: *bounded_opaque_policy
+    provenance:
+      source: AGE-139 structured terminal status precedence
+      privacy_reviewed: true
+      notes: Sentinel metadata only; no sleep or live provider replay.
+
+  - id: openai-compat-clean-exit
+    provider_name: gemini
+    provider_family: openai_compat
+    recognizer_module_path: crates/oulipoly-runtime/src/executor/providers/openai_compat.rs
+    fixture_bytes_path: openai-compat-clean-exit.txt
+    fixture_bytes_role: stdout
+    sentinel_metadata_path: null
+    terminal_status:
+      kind: exited
+      code: 0
+      signal: null
+      reason: null
+    observed_at: "2026-05-18T00:00:00Z"
+    expected_terminal_signal_kind: CleanExit
+    expected_marker_kind_label: clean_exit
+    evidence_excerpt_policy: *bounded_opaque_policy
+    provenance:
+      source: AGE-139 post-quota clean exit precedence
+      privacy_reviewed: true
+      notes: Benign provider bytes contain no quota vocabulary.
+
+  - id: openai-compat-nonzero
+    provider_name: gemini
+    provider_family: openai_compat
+    recognizer_module_path: crates/oulipoly-runtime/src/executor/providers/openai_compat.rs
+    fixture_bytes_path: openai-compat-nonzero.txt
+    fixture_bytes_role: stderr
+    sentinel_metadata_path: null
+    terminal_status:
+      kind: exited
+      code: 42
+      signal: null
+      reason: null
+    observed_at: "2026-05-18T00:00:00Z"
+    expected_terminal_signal_kind: NonzeroExit
+    expected_marker_kind_label: nonzero_exit
+    evidence_excerpt_policy: *bounded_opaque_policy
+    provenance:
+      source: AGE-139 post-quota nonzero exit precedence
+      privacy_reviewed: true
+      notes: Nonzero status with no quota vocabulary.
+
+  - id: openai-compat-unknown
+    provider_name: gemini
+    provider_family: openai_compat
+    recognizer_module_path: crates/oulipoly-runtime/src/executor/providers/openai_compat.rs
+    fixture_bytes_path: openai-compat-unknown.txt
+    fixture_bytes_role: stdout
+    sentinel_metadata_path: null
+    terminal_status:
+      kind: unknown
+      code: null
+      signal: null
+      reason: null
+    observed_at: "2026-05-18T00:00:00Z"
+    expected_terminal_signal_kind: Unknown
+    expected_marker_kind_label: unknown
+    evidence_excerpt_policy: *bounded_opaque_policy
+    provenance:
+      source: AGE-139 OpenAI-compatible recognizer non-match behavior
+      privacy_reviewed: true
+      notes: Opaque output that does not match quota vocabulary.
+
+  - id: openai-compat-network-boundary
+    provider_name: gemini
+    provider_family: openai_compat
+    recognizer_module_path: crates/oulipoly-runtime/src/executor/providers/openai_compat.rs
+    fixture_bytes_path: openai-compat-network-boundary.txt
+    fixture_bytes_role: stderr
+    sentinel_metadata_path: null
+    terminal_status:
+      kind: exited
+      code: 1
+      signal: null
+      reason: null
+    observed_at: "2026-05-18T00:00:00Z"
+    expected_terminal_signal_kind: NonzeroExit
+    expected_marker_kind_label: nonzero_exit
+    evidence_excerpt_policy: *bounded_opaque_policy
+    provenance:
+      source: AGE-142 network boundary fixture
+      privacy_reviewed: true
+      notes: network_error diagnostics remain adjacent; terminal status is nonzero.

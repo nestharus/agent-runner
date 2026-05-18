@@ -1,0 +1,9 @@
+id: codex-spawn-error
+schema_id: agent-runner-provider-termination-fixture-manifest-v1
+terminal_status:
+  kind: spawn_error
+  code: null
+  signal: null
+  reason: codex executable not found
+stream_role: none
+manifest_row_id: codex-spawn-error
