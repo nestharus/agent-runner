@@ -1,51 +1,14 @@
 //! Terminal-signal DTOs and shared recognizer helpers.
 //!
-//! ## Schema
+//! ## Schema (pointer)
 //!
-//! AGE-139 declares the per-provider canonical quota-token vocabulary as the
-//! AGE-139 contract's parsed-artifact shape for `TerminalSignalEvidence.stdout`
-//! / `stderr` recognition. Both the producer side (provider CLIs whose outputs
-//! AGE-139 normalizes) and the consumer side (per-provider recognizers) treat
-//! this vocabulary as the stable agreement, with fixture-string-drift recorded
-//! as the only sanctioned residual in
-//! `planning/age-139-terminal-signal-core/risk/age-139-test-residuals.md`.
-//!
-//! Required-token sets:
-//!
-//! - Claude / Anthropic provider stdout/stderr:
-//!   - `claude usage limit reached`
-//!   - `usage limit reached`
-//!   - `monthly limit`
-//!   - `billing limit`
-//!   - `rate_limit_error`
-//!   - `rate limit`
-//!   - `too many requests`
-//!   - `resets at`
-//!   - `reset_at`
-//!
-//! - Codex / OpenAI CLI provider stdout/stderr:
-//!   - `http 429`
-//!   - `status: 429`
-//!   - `status 429`
-//!   - `rate limit`
-//!   - `rate_limit_exceeded`
-//!   - `usage cap`
-//!   - `billing limit`
-//!   - `quota exceeded`
-//!   - `reset_at`
-//!   - `resets at`
-//!
-//! - OpenAI-compatible provider stdout/stderr (Gemini, OpenCode, ...):
-//!   - `rate_limit_exceeded`
-//!   - `429`
-//!   - `too many requests`
-//!   - `quota exhausted`
-//!   - `quota exceeded`
-//!   - `rate limit exceeded`
-//!
-//! Recognizers in `executor::providers::*` MUST match exactly this token set
-//! and only this token set; any deviation is a contract violation and goes
-//! through Phase 2.5 re-research before merge.
+//! The per-provider canonical quota-token vocabulary is declared in the
+//! repo-local convention doc
+//! [`conventions/terminal-signal-provider-vocabulary.md`](../../../../conventions/terminal-signal-provider-vocabulary.md).
+//! That document is the schema owner for push-pull purposes; this module
+//! defines the typed DTOs (`TerminalSignal`, `TerminalSignalKind`,
+//! `TerminalSignalEvidence`, `TerminalStatusEvidence`) and the
+//! `TerminalSignalRecognizer` trait that consumers use.
 
 use std::time::SystemTime;
 
@@ -95,8 +58,8 @@ pub trait TerminalSignalRecognizer: Send + Sync {
 
 pub(crate) const TERMINAL_SIGNAL_EVIDENCE_MAX_LEN: usize = 160;
 
-pub(crate) fn bounded_excerpt(bytes: &[u8], max_len: usize) -> String {
-    bounded_text(&String::from_utf8_lossy(bytes), max_len)
+pub(crate) fn bounded_excerpt(text: &str, max_len: usize) -> String {
+    bounded_text(text, max_len)
 }
 
 pub(crate) fn bounded_text(text: &str, max_len: usize) -> String {
@@ -214,13 +177,21 @@ mod tests {
         assert_eq!(dynamic.observed_at, observed_at());
     }
 
+    fn evidence_text_for_kind(kind: TerminalSignalKind) -> String {
+        format!("evidence for {kind:?}")
+    }
+
     fn terminal_signal_for_kind(kind: TerminalSignalKind) -> TerminalSignal {
         TerminalSignal {
             kind,
             provider_name: "provider".to_string(),
-            evidence: format!("evidence for {kind:?}"),
+            evidence: evidence_text_for_kind(kind),
             observed_at: observed_at(),
         }
+    }
+
+    fn debug_repr<T: std::fmt::Debug>(value: &T) -> String {
+        format!("{value:?}")
     }
 
     fn assert_terminal_signal_round_trip(kind: TerminalSignalKind) {
@@ -228,12 +199,12 @@ mod tests {
         let cloned = signal.clone();
 
         assert_eq!(cloned, signal);
-        assert!(format!("{cloned:?}").contains("provider"));
+        assert!(debug_repr(&cloned).contains("provider"));
         assert_eq!(cloned.kind, kind);
         assert_eq!(cloned.observed_at, observed_at());
     }
 
-    fn terminal_signal_kind_label(kind: TerminalSignalKind) -> &'static str {
+    fn label_for_kind(kind: TerminalSignalKind) -> &'static str {
         match kind {
             TerminalSignalKind::CleanExit => "clean_exit",
             TerminalSignalKind::NonzeroExit => "nonzero_exit",
@@ -275,7 +246,7 @@ mod tests {
 
         assert_eq!(cloned, evidence);
         assert_eq!(cloned.terminal_status, status);
-        assert!(format!("{cloned:?}").contains("provider"));
+        assert!(debug_repr(&cloned).contains("provider"));
     }
 
     #[test]
@@ -287,23 +258,22 @@ mod tests {
 
     #[test]
     fn enum_vocabulary_coverage_has_all_terminal_signal_kinds() {
-        let labels = all_kinds()
-            .into_iter()
-            .map(terminal_signal_kind_label)
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            labels,
-            vec![
-                "clean_exit",
-                "nonzero_exit",
-                "signal_exit",
-                "spawn_error",
+        let expected = [
+            (TerminalSignalKind::CleanExit, "clean_exit"),
+            (TerminalSignalKind::NonzeroExit, "nonzero_exit"),
+            (TerminalSignalKind::SignalExit, "signal_exit"),
+            (TerminalSignalKind::SpawnError, "spawn_error"),
+            (
+                TerminalSignalKind::QuotaExhaustedInband,
                 "quota_exhausted_inband",
-                "prolonged_silence",
-                "unknown",
-            ]
-        );
+            ),
+            (TerminalSignalKind::ProlongedSilence, "prolonged_silence"),
+            (TerminalSignalKind::Unknown, "unknown"),
+        ];
+
+        for (kind, expected_label) in expected {
+            assert_eq!(label_for_kind(kind), expected_label);
+        }
     }
 
     #[test]

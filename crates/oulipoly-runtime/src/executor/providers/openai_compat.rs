@@ -1,3 +1,11 @@
+//! Per-provider terminal-signal recognizer.
+//!
+//! Canonical token vocabulary for `QuotaExhaustedInband` recognition is
+//! declared in
+//! [`conventions/terminal-signal-provider-vocabulary.md`](../../../../../conventions/terminal-signal-provider-vocabulary.md)
+//! (project-local schema owner; AGE-125 PP-001 precedent under
+//! `~/ai/agents/push-pull-auditor.md` canonical-doc-as-schema proof).
+
 use crate::executor::terminal_signal::{
     TERMINAL_SIGNAL_EVIDENCE_MAX_LEN, TerminalSignal, TerminalSignalEvidence, TerminalSignalKind,
     TerminalSignalRecognizer, bounded_excerpt, post_quota_terminal_signal_kind,
@@ -18,8 +26,8 @@ impl TerminalSignalRecognizer for Recognizer {
             return terminal_signal(evidence, kind, signal_evidence);
         }
 
-        let stdout_text = lowercase_lossy(evidence.stdout);
-        let stderr_text = lowercase_lossy(evidence.stderr);
+        let stdout_text = lowercase(&decode_lossy(evidence.stdout));
+        let stderr_text = lowercase(&decode_lossy(evidence.stderr));
         let quota_stream = find_quota_matching_stream(
             evidence.stdout,
             contains_quota_token(&stdout_text),
@@ -64,15 +72,22 @@ fn find_quota_matching_stream<'a>(
 }
 
 fn quota_evidence_excerpt(bytes: &[u8]) -> String {
-    bounded_excerpt(bytes, TERMINAL_SIGNAL_EVIDENCE_MAX_LEN)
+    bounded_excerpt(&decode_lossy(bytes), TERMINAL_SIGNAL_EVIDENCE_MAX_LEN)
 }
 
-fn lowercase_lossy(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).to_lowercase()
+fn decode_lossy(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
 }
 
-/// See the `## Schema` section in [`crate::executor::terminal_signal`] for the
-/// canonical token vocabulary.
+fn lowercase(text: &str) -> String {
+    text.to_lowercase()
+}
+
+/// See the `## Schema` section in
+/// [`conventions/terminal-signal-provider-vocabulary.md`](../../../../../conventions/terminal-signal-provider-vocabulary.md)
+/// for the per-provider canonical token vocabulary (project-local schema
+/// owner per the AGE-125 PP-001 precedent; canonical-doc-as-schema proof
+/// per `~/ai/agents/push-pull-auditor.md`).
 fn contains_quota_token(text: &str) -> bool {
     text.contains("rate_limit_exceeded")
         || text.contains("429")
