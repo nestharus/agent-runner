@@ -7,6 +7,14 @@ rust-version.workspace = true
 [lib]
 name = "oulipoly_setup"
 
+[features]
+__test_fixtures = []
+
+[[bin]]
+name = "claude_stub"
+path = "tests/fixtures/claude_stub_main.rs"
+required-features = ["__test_fixtures"]
+
 [dependencies]
 chrono.workspace = true
 dirs.workspace = true
