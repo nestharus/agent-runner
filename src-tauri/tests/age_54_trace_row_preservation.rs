@@ -1,4 +1,25 @@
 #![cfg(unix)]
+//! ## Declared roles
+//! orchestration, accessor, mapper, filter, predicate, validator, formatter
+//!
+//! ## Intrinsic-surface declarations
+//! intrinsic_surface_declarations:
+//!   - component: src-tauri/tests/age_54_trace_row_preservation.rs
+//!     role: intrinsic-surface
+//!     Domain: trace-row-preservation-integration-test-domain
+//!     Owns:
+//!       - trace-related SQLite table invocations
+//!       - trace-related SQLite table session_turns
+//!       - trace-related SQLite table session_chains
+//!       - trace-related SQLite table session_chain_segments
+//!       - trace-related SQLite table invocation_returned_artifacts
+//!       - trace-related SQLite table provider_quotas
+//!       - trace-related SQLite table provider_quota_windows
+//!       - state_fixtures::schema4_invocations trace fixture constants and builder
+//!       - state_fixtures::schema5_invocations current-state fixture builder
+//!       - state_fixtures count_rows, default_state_path, user_version helpers
+//!       - oulipoly_state::schema::CURRENT_SCHEMA_VERSION
+//!       - oulipoly-agent-runner trace --json command harness
 
 #[path = "../../crates/oulipoly-state/tests/fixtures/mod.rs"]
 mod state_fixtures;
@@ -218,13 +239,20 @@ fn invocation_count(path: &Path) -> i64 {
 
 fn assert_root_uuid_resolves(path: &Path) {
     let conn = Connection::open(path).unwrap();
-    let count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM invocations WHERE invocation_uuid = ?1",
-            [SCHEMA4_ROOT_UUID],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let count = root_uuid_match_count(&conn);
+    assert_root_uuid_count(count);
+}
+
+fn root_uuid_match_count(conn: &Connection) -> i64 {
+    conn.query_row(root_uuid_count_sql(), [SCHEMA4_ROOT_UUID], |row| row.get(0))
+        .unwrap()
+}
+
+fn root_uuid_count_sql() -> &'static str {
+    "SELECT COUNT(*) FROM invocations WHERE invocation_uuid = ?1"
+}
+
+fn assert_root_uuid_count(count: i64) {
     assert_eq!(count, 1);
 }
 
@@ -249,22 +277,49 @@ fn trace_table_snapshot(path: &Path) -> BTreeMap<String, (i64, String)> {
 }
 
 fn table_checksum(conn: &Connection, table: &str) -> String {
-    let columns: Vec<String> = conn
-        .prepare(&format!("PRAGMA table_info({table})"))
+    let columns = checksum_columns(conn, table);
+    let sql = checksum_sql(table, &columns);
+    conn.query_row(&sql, [], |row| row.get(0)).unwrap()
+}
+
+fn checksum_columns(conn: &Connection, table: &str) -> Vec<String> {
+    query_checksum_columns(conn, &table_info_sql(table))
+}
+
+fn table_info_sql(table: &str) -> String {
+    format!("PRAGMA table_info({table})")
+}
+
+fn query_checksum_columns(conn: &Connection, sql: &str) -> Vec<String> {
+    conn.prepare(sql)
         .unwrap()
         .query_map([], |row| row.get::<_, String>(1))
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    let expr = columns
-        .iter()
-        .filter(|column| column.as_str() != "row_version")
-        .map(|column| format!("quote({column})"))
-        .collect::<Vec<_>>()
-        .join(" || '|' || ");
-    let sql = format!(
+        .unwrap()
+}
+
+fn checksum_sql(table: &str, columns: &[String]) -> String {
+    let payload_columns = checksum_payload_columns(columns);
+    let expr = checksum_row_expression(&payload_columns);
+    format!(
         "SELECT COALESCE(group_concat(row_data, char(10)), '') \
          FROM (SELECT {expr} AS row_data FROM {table} ORDER BY row_data)"
-    );
-    conn.query_row(&sql, [], |row| row.get(0)).unwrap()
+    )
+}
+
+fn checksum_payload_columns(columns: &[String]) -> Vec<&str> {
+    columns
+        .iter()
+        .map(String::as_str)
+        .filter(|column| *column != "row_version")
+        .collect()
+}
+
+fn checksum_row_expression(columns: &[&str]) -> String {
+    columns
+        .iter()
+        .map(|column| format!("quote({column})"))
+        .collect::<Vec<_>>()
+        .join(" || '|' || ")
 }

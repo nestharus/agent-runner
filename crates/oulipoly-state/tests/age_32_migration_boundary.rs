@@ -1,3 +1,23 @@
+//! ## Declared roles
+//! orchestration, accessor, mapper, parser, filter, predicate, validator, formatter
+//!
+//! ## Intrinsic-surface declarations
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/tests/age_32_migration_boundary.rs
+//!     role: intrinsic-surface
+//!     Domain: state-db-migration-boundary-test-domain
+//!     Owns:
+//!       - fixtures::schema4_invocations schema-4 invocation fixture
+//!       - fixtures::v3_full_state_db representative state fixture and snapshot helpers
+//!       - fixtures::v3_setup_only_db versionless setup fixture
+//!       - fixtures::versionless_unrecognized unrecognized-state fixture
+//!       - fixtures schema_fingerprint, table_names, user_version, count_rows helpers
+//!       - oulipoly_state::migrations manifest and plan APIs
+//!       - oulipoly_state::schema compatibility constants and classifier APIs
+//!       - oulipoly_state::schema_probe inspect_schema API
+//!       - oulipoly_state::StateDb open and connection APIs
+//!       - crates/oulipoly-state/src/db.rs legacy ensure_schema helper names and schema-mutating SQL source shape
+
 mod fixtures;
 
 use fixtures::schema4_invocations::build_schema4_invocation_fixture;
@@ -15,6 +35,7 @@ use oulipoly_state::schema::{
 use oulipoly_state::{StateDb, schema_probe};
 use rusqlite::Connection;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 use std::sync::{Mutex, OnceLock};
 
 #[test]
@@ -295,7 +316,8 @@ fn ti_30_versionless_setup_only_db_migrates_to_current_and_preserves_setup_rows(
     assert_eq!(fixtures::count_rows(conn, "memory_edges"), 1);
     assert_eq!(fixtures::count_rows(conn, "setup_sessions"), 1);
     assert_eq!(fixtures::count_rows(conn, "setup_turns"), 1);
-    assert!(memory_edges_has_foreign_keys(conn));
+    let foreign_keys = memory_edge_foreign_keys(conn);
+    assert!(has_required_memory_edge_foreign_keys(&foreign_keys));
 }
 
 #[test]
@@ -407,6 +429,20 @@ fn ti_40_legacy_repair_helpers_are_allow_listed_and_migration_represented() {
 }
 
 fn normalized_schema(conn: &Connection) -> BTreeMap<String, String> {
+    schema_rows(conn)
+        .into_iter()
+        .map(normalized_schema_entry)
+        .collect()
+}
+
+struct SchemaRow {
+    object_type: String,
+    name: String,
+    table_name: String,
+    sql: String,
+}
+
+fn schema_rows(conn: &Connection) -> Vec<SchemaRow> {
     let mut stmt = conn
         .prepare(
             "SELECT type, name, tbl_name, COALESCE(sql, '') FROM sqlite_schema
@@ -415,58 +451,108 @@ fn normalized_schema(conn: &Connection) -> BTreeMap<String, String> {
         )
         .unwrap();
     stmt.query_map([], |row| {
-        Ok((
-            format!(
-                "{}:{}:{}",
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?
-            ),
-            normalize_sql(&row.get::<_, String>(3)?),
-        ))
+        Ok(SchemaRow {
+            object_type: row.get(0)?,
+            name: row.get(1)?,
+            table_name: row.get(2)?,
+            sql: row.get(3)?,
+        })
     })
     .unwrap()
-    .collect::<Result<BTreeMap<_, _>, _>>()
+    .collect::<Result<Vec<_>, _>>()
     .unwrap()
 }
 
-fn memory_edges_has_foreign_keys(conn: &Connection) -> bool {
+fn normalized_schema_entry(row: SchemaRow) -> (String, String) {
+    (schema_key(&row), normalize_sql(&row.sql))
+}
+
+fn schema_key(row: &SchemaRow) -> String {
+    format!("{}:{}:{}", row.object_type, row.name, row.table_name)
+}
+
+type ForeignKeyEdge = (String, String);
+
+fn memory_edge_foreign_keys(conn: &Connection) -> Vec<ForeignKeyEdge> {
     let mut stmt = conn
         .prepare("PRAGMA foreign_key_list(memory_edges)")
         .unwrap();
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(2)?, row.get::<_, String>(3)?))
-        })
+    stmt.query_map([], foreign_key_edge)
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    rows.contains(&("memory_nodes".to_string(), "source_id".to_string()))
-        && rows.contains(&("memory_nodes".to_string(), "target_id".to_string()))
+        .unwrap()
 }
 
-#[allow(clippy::collapsible_if)]
+fn foreign_key_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<ForeignKeyEdge> {
+    Ok((row.get(2)?, row.get(3)?))
+}
+
+fn has_required_memory_edge_foreign_keys(rows: &[ForeignKeyEdge]) -> bool {
+    rows.contains(&memory_node_source_edge()) && rows.contains(&memory_node_target_edge())
+}
+
+fn memory_node_source_edge() -> ForeignKeyEdge {
+    ("memory_nodes".to_string(), "source_id".to_string())
+}
+
+fn memory_node_target_edge() -> ForeignKeyEdge {
+    ("memory_nodes".to_string(), "target_id".to_string())
+}
+
 fn find_ensure_schema_helpers(source: &str) -> Vec<String> {
-    let mut helpers = Vec::new();
-    for line in source.lines() {
-        let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("fn ensure_") {
-            if let Some((name_tail, _)) = rest.split_once('(') {
-                let name = format!("ensure_{name_tail}");
-                if name.ends_with("_schema") {
-                    helpers.push(name);
-                }
-            }
-        }
-    }
-    helpers
+    source
+        .lines()
+        .filter_map(parse_ensure_schema_helper_name)
+        .collect()
+}
+
+fn parse_ensure_schema_helper_name(line: &str) -> Option<String> {
+    let rest = ensure_schema_function_tail(line)?;
+    let name_tail = function_name_tail(rest)?;
+    let name = ensure_schema_name(name_tail);
+    is_schema_helper_name(&name).then_some(name)
+}
+
+fn ensure_schema_function_tail(line: &str) -> Option<&str> {
+    line.trim_start().strip_prefix("fn ensure_")
+}
+
+fn function_name_tail(rest: &str) -> Option<&str> {
+    let (name_tail, _) = rest.split_once('(')?;
+    Some(name_tail)
+}
+
+fn ensure_schema_name(name_tail: &str) -> String {
+    format!("ensure_{name_tail}")
+}
+
+fn is_schema_helper_name(name: &str) -> bool {
+    name.ends_with("_schema")
 }
 
 fn extract_function_body(source: &str, function_name: &str) -> String {
-    let start = source
+    let body_range = function_body_range(source, function_name);
+    source[body_range].to_string()
+}
+
+fn function_body_range(source: &str, function_name: &str) -> Range<usize> {
+    let start = function_start(source, function_name);
+    let brace_start = opening_brace(source, start);
+    let end = closing_brace(source, brace_start);
+    brace_start..end
+}
+
+fn function_start(source: &str, function_name: &str) -> usize {
+    source
         .find(&format!("fn {function_name}"))
-        .unwrap_or_else(|| panic!("missing function {function_name}"));
-    let brace_start = source[start..].find('{').unwrap() + start;
+        .unwrap_or_else(|| panic!("missing function {function_name}"))
+}
+
+fn opening_brace(source: &str, start: usize) -> usize {
+    source[start..].find('{').unwrap() + start
+}
+
+fn closing_brace(source: &str, brace_start: usize) -> usize {
     let mut depth = 0usize;
     let mut end = brace_start;
     for (offset, ch) in source[brace_start..].char_indices() {
@@ -482,20 +568,22 @@ fn extract_function_body(source: &str, function_name: &str) -> String {
             _ => {}
         }
     }
-    source[brace_start..end].to_string()
+    end
 }
 
 fn mutating_sql_statements(rust_body: &str) -> Vec<String> {
     extract_rust_string_literals(rust_body)
         .into_iter()
-        .flat_map(|literal| {
-            strip_sql_comments(&literal)
-                .split(';')
-                .map(str::trim)
-                .filter(|statement| is_schema_mutation(statement))
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
+        .flat_map(sql_statements_from_literal)
+        .filter(|statement| is_schema_mutation(statement))
+        .collect()
+}
+
+fn sql_statements_from_literal(literal: String) -> Vec<String> {
+    strip_sql_comments(&literal)
+        .split(';')
+        .map(str::trim)
+        .map(str::to_string)
         .collect()
 }
 

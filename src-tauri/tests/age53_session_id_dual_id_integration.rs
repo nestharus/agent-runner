@@ -1,4 +1,25 @@
 #![cfg(unix)]
+//! ## Declared roles
+//! orchestration, accessor, mapper, filter, predicate, validator
+//!
+//! ## Intrinsic-surface declarations
+//! intrinsic_surface_declarations:
+//!   - component: src-tauri/tests/age53_session_id_dual_id_integration.rs
+//!     role: intrinsic-surface
+//!     Domain: state-db-dual-id-resume-integration-test-domain
+//!     Owns:
+//!       - oulipoly_state::InvocationStart dual-id invocation-start contract
+//!       - oulipoly_state::ModelStore model lookup contract
+//!       - oulipoly_state::ProviderSessionBinding provider-session binding contract
+//!       - oulipoly_state::ResumeError wrong-id error envelope
+//!       - oulipoly_state::StateDb dual-id persistence and resume methods
+//!       - oulipoly_state::WrongIdKindInput wrong-id classification contract
+//!       - StateDb::start_invocation
+//!       - StateDb::bind_invocation_provider_session_start
+//!       - StateDb::get_invocation_by_uuid
+//!       - StateDb::update_session_capture
+//!       - StateDb::resolve_resume
+//!       - oulipoly_config ModelConfig, PromptMode, and ProviderConfig fixture surface
 
 use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig};
 use oulipoly_state::{
@@ -15,32 +36,27 @@ fn state_db() -> (StateDb, tempfile::TempDir) {
 
 fn model_store() -> ModelStore {
     let mut models = ModelStore::new();
-    models.insert(
-        "test-model".to_string(),
-        ModelConfig {
-            name: "test-model".to_string(),
-            prompt_mode: PromptMode::Arg,
-            providers: vec![ProviderConfig::model_provider(
-                "fixture-provider",
-                Vec::new(),
-            )],
-            inputs: Vec::new(),
-        },
-    );
+    models.insert("test-model".to_string(), test_model_config());
     models
+}
+
+fn test_model_config() -> ModelConfig {
+    ModelConfig {
+        name: "test-model".to_string(),
+        prompt_mode: PromptMode::Arg,
+        providers: vec![ProviderConfig::model_provider(
+            "fixture-provider",
+            Vec::new(),
+        )],
+        inputs: Vec::new(),
+    }
 }
 
 fn bound_invocation(db: &StateDb) -> (String, String) {
     let invocation_uuid = Uuid::new_v4().to_string();
     let provider_session_id = Uuid::new_v4().to_string();
     let row_id = db
-        .start_invocation(&InvocationStart {
-            invocation_uuid: invocation_uuid.clone(),
-            model_name: "test-model".to_string(),
-            provider_name: "fixture-provider".to_string(),
-            provider_index: 0,
-            parent_invocation_id: None,
-        })
+        .start_invocation(&invocation_start(&invocation_uuid))
         .unwrap();
     db.bind_invocation_provider_session_start(
         row_id,
@@ -52,6 +68,16 @@ fn bound_invocation(db: &StateDb) -> (String, String) {
     )
     .unwrap();
     (invocation_uuid, provider_session_id)
+}
+
+fn invocation_start(invocation_uuid: &str) -> InvocationStart {
+    InvocationStart {
+        invocation_uuid: invocation_uuid.to_string(),
+        model_name: "test-model".to_string(),
+        provider_name: "fixture-provider".to_string(),
+        provider_index: 0,
+        parent_invocation_id: None,
+    }
 }
 
 // Risk: anti-scope regression / start-bound provider ID clobber
