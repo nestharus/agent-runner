@@ -1,0 +1,9 @@
+id: codex-prolonged-silence
+schema_id: agent-runner-provider-termination-fixture-manifest-v1
+terminal_status:
+  kind: prolonged_silence
+  code: null
+  signal: null
+  reason: no stdout/stderr for 600s
+stream_role: none
+manifest_row_id: codex-prolonged-silence

@@ -1,0 +1,9 @@
+id: codex-signal
+schema_id: agent-runner-provider-termination-fixture-manifest-v1
+terminal_status:
+  kind: signal_terminated
+  code: null
+  signal: 15
+  reason: null
+stream_role: none
+manifest_row_id: codex-signal
