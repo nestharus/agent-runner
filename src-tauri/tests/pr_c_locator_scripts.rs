@@ -28,6 +28,18 @@ fn run_locator(script_name: &str, base_dir: &Path, session_id: &str) -> std::pro
 }
 
 #[test]
+fn pr_c_locator_scripts_unchanged() {
+    for script_name in ["claude-code-locate-transcript", "codex-locate-transcript"] {
+        let path = scripts_dir().join(script_name);
+        let metadata = fs::metadata(&path).unwrap();
+        assert!(metadata.is_file(), "{path:?} should be a file");
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(body.starts_with("#!/usr/bin/env bash"), "{path:?}");
+        assert!(body.contains("SESSION_ID"), "{path:?}");
+    }
+}
+
+#[test]
 fn claude_locator_script_prints_matching_transcript_path() {
     let dir = tempfile::tempdir().unwrap();
     let transcript = dir.path().join("project-a").join("session.jsonl");

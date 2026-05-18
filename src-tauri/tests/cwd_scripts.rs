@@ -2,6 +2,7 @@
 
 use serde_json::Value;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -10,6 +11,20 @@ fn scripts_dir() -> PathBuf {
         .parent()
         .unwrap()
         .join("scripts")
+}
+
+#[test]
+fn cwd_scripts_unchanged() {
+    for script_name in ["claude-code-cwd", "codex-cwd"] {
+        let path = scripts_dir().join(script_name);
+        let metadata = fs::metadata(&path).unwrap();
+        assert!(metadata.is_file(), "{path:?} should be a file");
+        assert_ne!(
+            metadata.permissions().mode() & 0o111,
+            0,
+            "{path:?} should be executable"
+        );
+    }
 }
 
 #[test]

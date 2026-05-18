@@ -1,4 +1,5 @@
 use super::{ExportError, ExportSessionMetadata, SessionStorageType};
+use crate::session_metadata::TranscriptLookupMode;
 use oulipoly_config::{
     ProvidersConfig, ScriptSessionStorageType, SessionStorage, SessionsConfig, load_models,
 };
@@ -75,11 +76,12 @@ pub fn resolve_export_session_metadata(
         }
     };
 
-    let jsonl_path = crate::session_metadata::resolve_jsonl_path_for_provider_allow_missing(
+    let jsonl_path = crate::session_metadata::resolve_jsonl_path_for_provider_with_mode(
         &sessions_cfg,
         provider_entry.session_storage.as_ref(),
         &resolved.active_provider,
         &resolved.active_session_id,
+        TranscriptLookupMode::AllowMissing,
     )
     .map_err(metadata_error_to_export_error)?;
 
