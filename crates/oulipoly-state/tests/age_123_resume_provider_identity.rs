@@ -1,3 +1,24 @@
+//! ## Declared roles
+//! orchestration, accessor, mapper, validator, filter, formatter
+//!
+//! ## Intrinsic-surface declarations
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/tests/age_123_resume_provider_identity.rs
+//!     role: intrinsic-surface
+//!     Domain: state-db-resume-provider-identity-test-domain
+//!     Owns:
+//!       - fresh_schema_has_provider_session_resolved_account_on_invocations orchestration and validation body
+//!       - migration_0007_adds_identity_column_and_preserves_rows orchestration and validation body
+//!       - bind_invocation_provider_session_start_persists_resolved_account_identity orchestration and validation body
+//!       - row_version_payload_includes_provider_session_resolved_account orchestration and validation body
+//!       - build_schema6_invocation_fixture migration fixture builder
+//!       - invocation_columns and historical_identity_values accessors
+//!       - invocation_payload_snapshot and payload_values row mappers
+//!       - registration row-version registry filter lookup
+//!       - oulipoly_state::deployment::row_version checksum and registry APIs
+//!       - oulipoly_state migrations, InvocationStart, ProviderSessionBinding, StateDb
+//!       - rusqlite::Connection and rusqlite::types::Value helper surface
+
 mod fixtures;
 
 use fixtures::schema5_invocations::build_schema5_invocation_fixture;

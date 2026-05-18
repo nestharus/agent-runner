@@ -1,3 +1,22 @@
+//! ## Declared roles
+//! orchestration, mapper, validator, accessor
+//!
+//! ## Intrinsic-surface declarations
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-runtime/tests/resume_service_parity.rs
+//!     role: intrinsic-surface
+//!     Domain: resume-service-parity-test-domain
+//!     Owns:
+//!       - oulipoly_runtime::services::ProductionResumeService
+//!       - oulipoly_runtime::services ResumeAcceptanceOutput, ResumeAcceptanceRequest, ResumeServiceOutput, ResumeServicePort, ResumeServiceRequest
+//!       - oulipoly_state::repositories::ResumeRepository
+//!       - oulipoly_state InvocationStart, ModelStore, ResolvedResume, ResumeError, StateDb
+//!       - Fixture fixture surface
+//!       - assert_resolved_same assertion validator
+//!       - assert_resolved_expected_segment_only_shape assertion validator
+//!       - model and model_store mappers
+//!       - start_invocation accessor
+
 use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig};
 use oulipoly_runtime::services::{
     ProductionResumeService, ResumeAcceptanceOutput, ResumeAcceptanceRequest, ResumeServiceOutput,

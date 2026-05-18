@@ -1,3 +1,26 @@
+//! ## Declared roles
+//! orchestration, accessor, mapper, formatter, validator
+//!
+//! ## Intrinsic-surface declarations
+//! intrinsic_surface_declarations:
+//!   - component: src-tauri/tests/age123_resume_provider_identity.rs
+//!     role: intrinsic-surface
+//!     Domain: tauri-resume-provider-identity-integration-test-domain
+//!     Owns:
+//!       - ProviderFixture provider-script fixture surface
+//!       - Fixture impl integration harness surface
+//!       - InvocationIdentityRow captured invocation identity DTO
+//!       - map_identity_row rusqlite row mapper
+//!       - toml_string TOML literal formatter
+//!       - identity_for provider resolved-account formatter/accessor
+//!       - resume_session_mismatch_records_expected_segment_and_resolved_provider_identity validation body
+//!       - successful_resume_records_resolved_provider_identity validation body
+//!       - quota_retry_records_resolved_provider_identity_per_attempt validation body
+//!       - manual_migration_records_target_resolved_provider_identity validation body
+//!       - oulipoly_state InvocationStatus and StateDb harness APIs
+//!       - rusqlite Connection, params, Row, and Result helper surface
+//!       - oulipoly_config and oulipoly_runtime contracts exercised through the configured runner binary
+
 #![cfg(unix)]
 
 use oulipoly_state::{InvocationStatus, StateDb};

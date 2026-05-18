@@ -1,3 +1,33 @@
+//! Session metadata adapter and resolver subsystem.
+//!
+//! ## Declared roles
+//!
+//! - orchestration
+//! - parser
+//! - formatter
+//! - accessor
+//! - validator
+//! - predicate
+//! - mapper
+//!
+//! Rationale: this module is the session-metadata adapter/resolver subsystem.
+//! It naturally mixes the seven A1 classifications because resume-time metadata
+//! reconstruction requires UUID parsing, formatting, lifecycle predicates,
+//! validation, mapping, and orchestration across cwd, locator, and test submodules.
+//!
+//! ## Intrinsic-surface declarations
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-runtime/src/session_metadata/mod.rs::session_metadata_resolution
+//!     role: intrinsic-surface
+//!     Domain: session-metadata-resolution-domain
+//!     Owns:
+//!       - SessionMetadata, SessionStorageType, TranscriptState, and MetadataError contracts
+//!       - locate_session_metadata and locate_resume_session_metadata orchestration APIs
+//!       - resolve_resume_workspace_root, resolve_workspace_root_for_provider_session, and resolve_jsonl_path_for_provider APIs
+//!       - UUID parser and formatter helpers
+//!       - ambiguity, recency, mutability, and provider-selection predicates
+//!       - ResumeError and LocatorError to MetadataError mapping
+
 mod cwd;
 mod locator;
 #[cfg(test)]
