@@ -1,3 +1,8 @@
+//! ## Declared roles
+//!
+//! `accessor`, `mapper`, `validator`, `parser`, `formatter`, `predicate`, `filter`,
+//! `orchestration`
+
 use agent_runner_lib::{effective_provider_for_model_provider, load_app_config};
 use oulipoly_config::repositories::{AgentConfigRepository, FilesystemAgentConfigRepository};
 use oulipoly_config::{
@@ -26,7 +31,8 @@ use oulipoly_runtime::trace::{TraceOptions, render_ascii_trace};
 use oulipoly_state::repositories::{ProductionStateDbOpener, StateDbOpener};
 use oulipoly_state::schema_probe::{self, ProbeError};
 use oulipoly_state::{
-    CompositeInvocationId, InvocationStart, InvocationStatus, ReadOnlyOpenError, StateDb,
+    CompositeInvocationId, InvocationRecord, InvocationStart, InvocationStatus, ReadOnlyOpenError,
+    StateDb,
 };
 
 use clap::Parser;
@@ -45,6 +51,11 @@ use usage::cli::{Cli, SessionSubcommands, Subcommands};
 
 const DEFAULT_PAUSE_HANDSHAKE_TTL_MS: u64 = 60_000;
 const MAX_PAUSE_HANDSHAKE_TTL_MS: u64 = 600_000;
+
+// ---
+// Component: cli-prompt-config-resolution
+// Declared roles: orchestration, parser, validator, accessor, formatter, mapper, predicate
+// ---
 
 /// Parse --input key=value flags into a map (repeated keys become arrays).
 fn parse_inputs(raw: &[String]) -> Result<HashMap<String, Vec<String>>, String> {
@@ -77,51 +88,114 @@ fn collect_positional_prompt(cli: &Cli, include_agent: bool) -> Option<String> {
 
 fn resolve_prompt(cli: &Cli, include_agent_as_prompt: bool) -> Result<String, String> {
     if let Some(ref path) = cli.file {
-        return std::fs::read_to_string(path)
-            .map_err(|e| format!("Failed to read prompt file: {e}"));
+        return read_prompt_file(path);
     }
 
     if let Some(text) = collect_positional_prompt(cli, include_agent_as_prompt) {
         return Ok(text);
     }
 
-    if std::io::stdin().is_terminal() {
-        return Err("No prompt provided. Pass as argument, --file, or pipe to stdin.".to_string());
-    }
-
-    let mut input = String::new();
-    std::io::stdin()
-        .read_to_string(&mut input)
-        .map_err(|e| format!("Failed to read stdin: {e}"))?;
-
-    if input.trim().is_empty() {
-        return Err("Empty prompt from stdin.".to_string());
-    }
-
-    Ok(input)
+    read_required_stdin_prompt()
 }
 
 fn resolve_resume_answer(prompt: Option<&str>, file: Option<&Path>) -> Result<String, String> {
     if let Some(path) = file {
-        return std::fs::read_to_string(path)
-            .map_err(|e| format!("Failed to read answer file: {e}"));
+        return read_answer_file(path);
     }
     if let Some(prompt) = prompt {
         return Ok(prompt.to_string());
     }
-    if std::io::stdin().is_terminal() {
-        return Err(
-            "No answer payload provided. Pass --prompt, --file, or pipe to stdin.".to_string(),
-        );
-    }
+    read_required_stdin_answer()
+}
+
+fn read_prompt_file(path: &Path) -> Result<String, String> {
+    std::fs::read_to_string(path).map_err(format_prompt_file_read_error)
+}
+
+fn read_answer_file(path: &Path) -> Result<String, String> {
+    std::fs::read_to_string(path).map_err(format_answer_file_read_error)
+}
+
+fn read_required_stdin_prompt() -> Result<String, String> {
+    validate_required_prompt_stdin_available()?;
+    let input = read_stdin_text()?;
+    validate_nonempty_prompt_stdin(&input)?;
+    Ok(input)
+}
+
+fn read_required_stdin_answer() -> Result<String, String> {
+    validate_required_answer_stdin_available()?;
+    let input = read_stdin_text()?;
+    validate_nonempty_answer_stdin(&input)?;
+    Ok(input)
+}
+
+fn read_stdin_text() -> Result<String, String> {
     let mut input = String::new();
     std::io::stdin()
         .read_to_string(&mut input)
-        .map_err(|e| format!("Failed to read stdin: {e}"))?;
-    if input.trim().is_empty() {
-        return Err("Empty answer payload from stdin.".to_string());
-    }
+        .map_err(format_stdin_read_error)?;
     Ok(input)
+}
+
+fn validate_required_prompt_stdin_available() -> Result<(), String> {
+    if std::io::stdin().is_terminal() {
+        Err(format_missing_prompt_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_required_answer_stdin_available() -> Result<(), String> {
+    if std::io::stdin().is_terminal() {
+        Err(format_missing_answer_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_nonempty_prompt_stdin(input: &str) -> Result<(), String> {
+    if input.trim().is_empty() {
+        Err(format_empty_prompt_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_nonempty_answer_stdin(input: &str) -> Result<(), String> {
+    if input.trim().is_empty() {
+        Err(format_empty_answer_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn format_prompt_file_read_error(error: std::io::Error) -> String {
+    format!("Failed to read prompt file: {error}")
+}
+
+fn format_answer_file_read_error(error: std::io::Error) -> String {
+    format!("Failed to read answer file: {error}")
+}
+
+fn format_stdin_read_error(error: std::io::Error) -> String {
+    format!("Failed to read stdin: {error}")
+}
+
+fn format_missing_prompt_error() -> String {
+    "No prompt provided. Pass as argument, --file, or pipe to stdin.".to_string()
+}
+
+fn format_missing_answer_error() -> String {
+    "No answer payload provided. Pass --prompt, --file, or pipe to stdin.".to_string()
+}
+
+fn format_empty_prompt_error() -> String {
+    "Empty prompt from stdin.".to_string()
+}
+
+fn format_empty_answer_error() -> String {
+    "Empty answer payload from stdin.".to_string()
 }
 
 fn resolve_models_dir(cli: &Cli) -> PathBuf {
@@ -143,6 +217,51 @@ fn default_config_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+enum TopLevelResumePromptSource {
+    Headless {
+        positional_or_stdin_prompt: Option<String>,
+    },
+    Interactive,
+}
+
+fn resolve_top_level_resume_prompt_source(cli: &Cli) -> Result<TopLevelResumePromptSource, String> {
+    let prompt_text = collect_positional_prompt(cli, true);
+    let stdin_prompt = read_optional_stdin_prompt(prompt_text.is_none() && cli.file.is_none())?;
+    if prompt_text.is_some() || cli.file.is_some() || stdin_prompt.is_some() {
+        return Ok(TopLevelResumePromptSource::Headless {
+            positional_or_stdin_prompt: prompt_text.or(stdin_prompt),
+        });
+    }
+    Ok(TopLevelResumePromptSource::Interactive)
+}
+
+fn read_optional_stdin_prompt(enabled: bool) -> Result<Option<String>, String> {
+    if !should_read_optional_stdin_prompt(enabled) {
+        return Ok(None);
+    }
+    optional_nonempty_text(read_stdin_text()?)
+}
+
+fn should_read_optional_stdin_prompt(enabled: bool) -> bool {
+    enabled && !std::io::stdin().is_terminal()
+}
+
+fn optional_nonempty_text(input: String) -> Result<Option<String>, String> {
+    if input.trim().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(input))
+    }
+}
+
+fn format_agent_prompt(agent: &AgentConfig, raw_prompt: String) -> String {
+    if agent.instructions.is_empty() {
+        raw_prompt
+    } else {
+        format!("{}\n\n{}", agent.instructions, raw_prompt)
+    }
+}
+
 fn run(cli: Cli) -> Result<i32, String> {
     if let Err(err) = session_replace::recover_pending_replaces() {
         eprintln!("{}", err.to_json());
@@ -150,257 +269,365 @@ fn run(cli: Cli) -> Result<i32, String> {
     }
 
     if cli.new {
-        let services = oulipoly_runtime::repl_default_provider::RuntimeServices::production(
-            cli.project.clone(),
-        )?;
-        return oulipoly_runtime::repl_default_provider::run_repl_with_default_provider(services);
+        return run_default_provider_repl(&cli);
     }
 
     let agent_runtime_services = wiring::AgentRuntimeServices::cli_defaults();
 
     if cli.usage {
-        let providers_cfg = ProvidersConfig::load(&default_config_root().join("providers.toml"))?;
-        let models_dir = resolve_models_dir(&cli);
-        let models_map = load_models(&models_dir, Some(&providers_cfg))?;
-        let mut models: Vec<ModelConfig> = models_map.into_values().collect();
-        models.sort_by(|a, b| a.name.cmp(&b.name));
-        let mut stdout = std::io::stdout().lock();
-        return usage::dispatch::run_usage(
-            &agent_runtime_services,
-            &providers_cfg,
-            &models,
-            &mut stdout,
-        );
+        return run_usage_command(&cli, &agent_runtime_services);
     }
 
     if let Some(command) = cli.command.clone() {
-        return match command {
-            Subcommands::Trace {
-                invocation_uuid,
-                json,
-                inline_transcript,
-                transcript,
-                max_depth,
-            } => run_trace_command(
-                TraceOptions {
-                    max_depth,
-                    json,
-                    inline_transcript,
-                    transcript,
-                },
-                &invocation_uuid,
-                &agent_runtime_services,
-            ),
-            Subcommands::Repl {
-                model,
-                resume,
-                migrate,
-                project,
-                models_dir,
-            } => run_repl(
-                &agent_runtime_services,
-                model.as_deref(),
-                resume.as_deref(),
-                migrate.as_deref(),
-                project.as_deref(),
-                models_dir.as_deref(),
-            ),
-            Subcommands::Resume {
-                model,
-                session_id,
-                chain_id,
-                migrate,
-                prompt,
-                file,
-                project,
-                models_dir,
-            } => {
-                let resume_target = chain_id
-                    .as_deref()
-                    .or(session_id.as_deref())
-                    .expect("clap group ensures one is set");
-                run_resume(
-                    &agent_runtime_services,
-                    model.as_deref(),
-                    resume_target,
-                    migrate.as_deref(),
-                    prompt.as_deref(),
-                    file.as_deref(),
-                    project.as_deref(),
-                    models_dir.as_deref(),
-                )
-            }
-            Subcommands::Session { command } => match command {
-                SessionSubcommands::Locate { session_id, json } => {
-                    run_session_locate(&session_id, json)
-                }
-                SessionSubcommands::SchemaProbe => run_session_schema_probe(),
-                SessionSubcommands::Export { session_id, format } => {
-                    run_session_export(&session_id, &format, &agent_runtime_services)
-                }
-                SessionSubcommands::PauseHandshake { session_id, ttl_ms } => {
-                    run_pause_handshake(&session_id, ttl_ms, &agent_runtime_services)
-                }
-                SessionSubcommands::ResumeHandshake { session_id, token } => {
-                    run_resume_handshake(&session_id, &token, &agent_runtime_services)
-                }
-                SessionSubcommands::ImportReplace {
-                    session_id,
-                    from_file,
-                    preimage_sha256,
-                } => run_session_import_replace(
-                    &session_id,
-                    from_file.as_deref(),
-                    preimage_sha256.as_deref(),
-                    &agent_runtime_services,
-                ),
-            },
-            Subcommands::ResumeList { uuid } => run_resume_list(&uuid),
-            Subcommands::MigrateDb => run_migrate_db(),
-            Subcommands::Migrate { rebuild } => run_migrate(rebuild),
-            Subcommands::MigrateConfig { models_dir } => run_migrate_config(models_dir.as_deref()),
-        };
+        return dispatch_subcommand(command, &agent_runtime_services);
     }
 
-    // Top-level --resume unifies REPL and headless paths. A prompt source
-    // (--file, positional args, or piped stdin) dispatches to headless;
-    // no prompt dispatches to the provider's interactive REPL. Subcommand
-    // forms (`repl --resume`, `resume`) still work unchanged.
     if let Some(ref session_id) = cli.resume {
-        if cli.agent_file.is_some() {
-            return Err("--resume is incompatible with --agent-file.".to_string());
-        }
-
-        let prompt_text = collect_positional_prompt(&cli, true);
-        let stdin_prompt =
-            if prompt_text.is_none() && cli.file.is_none() && !std::io::stdin().is_terminal() {
-                let mut input = String::new();
-                std::io::stdin()
-                    .read_to_string(&mut input)
-                    .map_err(|e| format!("Failed to read stdin: {e}"))?;
-                if input.trim().is_empty() {
-                    None
-                } else {
-                    Some(input)
-                }
-            } else {
-                None
-            };
-
-        let has_positional_prompt = prompt_text.is_some();
-        let has_file = cli.file.is_some();
-        let has_prompt = has_positional_prompt || has_file || stdin_prompt.is_some();
-
-        if has_prompt {
-            let prompt_text = prompt_text.as_deref().or(stdin_prompt.as_deref());
-            return run_resume(
-                &agent_runtime_services,
-                cli.model.as_deref(),
-                session_id,
-                cli.migrate.as_deref(),
-                prompt_text,
-                cli.file.as_deref(),
-                cli.project.as_deref(),
-                cli.models_dir.as_deref(),
-            );
-        } else {
-            return run_repl(
-                &agent_runtime_services,
-                cli.model.as_deref(),
-                Some(session_id),
-                cli.migrate.as_deref(),
-                cli.project.as_deref(),
-                cli.models_dir.as_deref(),
-            );
-        }
+        return dispatch_top_level_resume(&cli, session_id, &agent_runtime_services);
     }
 
-    let models_dir = resolve_models_dir(&cli);
-    let providers_cfg =
-        ProvidersConfig::load(&default_config_root().join("providers.toml")).unwrap_or_default();
-    let models = load_models(&models_dir, Some(&providers_cfg))?;
-    let extra_inputs = parse_inputs(&cli.inputs)?;
-
-    let working_dir = cli.project.clone();
-    let state_db_opener = ProductionStateDbOpener;
-
-    // Direct model execution (--model)
     if let Some(ref model_name) = cli.model {
-        let model = models
-            .get(model_name)
-            .ok_or_else(|| format!("Unknown model: {model_name}"))?;
-
-        let prompt = if let Some(ref agent_path) = cli.agent_file {
-            let agent = load_agent_file(agent_path)?;
-            let raw_prompt = resolve_prompt(&cli, true)?;
-            format!("{}\n\n{}", agent.instructions, raw_prompt)
-        } else {
-            resolve_prompt(&cli, true)?
-        };
-
-        return run_with_balancing(
-            &agent_runtime_services,
-            &state_db_opener,
-            model,
-            &prompt,
-            &models,
-            working_dir.as_deref(),
-            &extra_inputs,
-        );
+        return run_direct_model_cli(&cli, model_name, &agent_runtime_services);
     }
 
-    // Agent-based execution
-    let agent_config = FilesystemAgentConfigRepository;
-    let agent = resolve_agent(&cli, &agent_config)?;
+    run_agent_cli(&cli, &agent_runtime_services)
+}
 
-    let model = models.get(&agent.model).ok_or_else(|| {
-        format!(
-            "Unknown model '{}' referenced by agent '{}'",
-            agent.model, agent.name
-        )
-    })?;
+fn run_default_provider_repl(cli: &Cli) -> Result<i32, String> {
+    let services =
+        oulipoly_runtime::repl_default_provider::RuntimeServices::production(cli.project.clone())?;
+    oulipoly_runtime::repl_default_provider::run_repl_with_default_provider(services)
+}
 
-    let raw_prompt = resolve_prompt(&cli, false)?;
-    let full_prompt = if agent.instructions.is_empty() {
-        raw_prompt
-    } else {
-        format!("{}\n\n{}", agent.instructions, raw_prompt)
-    };
+struct UsageContext {
+    providers_cfg: ProvidersConfig,
+    models: Vec<ModelConfig>,
+}
 
-    run_with_balancing(
-        &agent_runtime_services,
-        &state_db_opener,
-        model,
-        &full_prompt,
-        &models,
-        working_dir.as_deref(),
-        &extra_inputs,
+fn load_usage_context(cli: &Cli) -> Result<UsageContext, String> {
+    let providers_cfg = ProvidersConfig::load(&default_config_root().join("providers.toml"))?;
+    let models_dir = resolve_models_dir(cli);
+    let models_map = load_models(&models_dir, Some(&providers_cfg))?;
+    Ok(UsageContext {
+        providers_cfg,
+        models: sorted_models(models_map),
+    })
+}
+
+fn sorted_models(models_map: HashMap<String, ModelConfig>) -> Vec<ModelConfig> {
+    let mut models: Vec<ModelConfig> = models_map.into_values().collect();
+    models.sort_by(|a, b| a.name.cmp(&b.name));
+    models
+}
+
+fn run_usage_command(
+    cli: &Cli,
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+) -> Result<i32, String> {
+    let context = load_usage_context(cli)?;
+    let mut stdout = std::io::stdout().lock();
+    usage::dispatch::run_usage(
+        agent_runtime_services,
+        &context.providers_cfg,
+        &context.models,
+        &mut stdout,
     )
 }
 
+fn dispatch_subcommand(
+    command: Subcommands,
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+) -> Result<i32, String> {
+    match command {
+        Subcommands::Trace {
+            invocation_uuid,
+            json,
+            inline_transcript,
+            transcript,
+            max_depth,
+        } => run_trace_command(
+            trace_options(max_depth, json, inline_transcript, transcript),
+            &invocation_uuid,
+            agent_runtime_services,
+        ),
+        Subcommands::Repl {
+            model,
+            resume,
+            migrate,
+            project,
+            models_dir,
+        } => run_repl(
+            agent_runtime_services,
+            model.as_deref(),
+            resume.as_deref(),
+            migrate.as_deref(),
+            project.as_deref(),
+            models_dir.as_deref(),
+        ),
+        Subcommands::Resume {
+            model,
+            session_id,
+            chain_id,
+            migrate,
+            prompt,
+            file,
+            project,
+            models_dir,
+        } => run_resume(
+            agent_runtime_services,
+            model.as_deref(),
+            resume_target_arg(session_id.as_deref(), chain_id.as_deref()),
+            migrate.as_deref(),
+            prompt.as_deref(),
+            file.as_deref(),
+            project.as_deref(),
+            models_dir.as_deref(),
+        ),
+        Subcommands::Session { command } => {
+            dispatch_session_subcommand(command, agent_runtime_services)
+        }
+        Subcommands::ResumeList { uuid } => run_resume_list(&uuid),
+        Subcommands::MigrateDb => run_migrate_db(),
+        Subcommands::Migrate { rebuild } => run_migrate(rebuild),
+        Subcommands::MigrateConfig { models_dir } => run_migrate_config(models_dir.as_deref()),
+    }
+}
+
+fn trace_options(
+    max_depth: usize,
+    json: bool,
+    inline_transcript: bool,
+    transcript: bool,
+) -> TraceOptions {
+    TraceOptions {
+        max_depth,
+        json,
+        inline_transcript,
+        transcript,
+    }
+}
+
+fn resume_target_arg<'a>(session_id: Option<&'a str>, chain_id: Option<&'a str>) -> &'a str {
+    chain_id
+        .or(session_id)
+        .expect("clap group ensures one is set")
+}
+
+fn dispatch_session_subcommand(
+    command: SessionSubcommands,
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+) -> Result<i32, String> {
+    match command {
+        SessionSubcommands::Locate { session_id, json } => run_session_locate(&session_id, json),
+        SessionSubcommands::SchemaProbe => run_session_schema_probe(),
+        SessionSubcommands::Export { session_id, format } => {
+            run_session_export(&session_id, &format, agent_runtime_services)
+        }
+        SessionSubcommands::PauseHandshake { session_id, ttl_ms } => {
+            run_pause_handshake(&session_id, ttl_ms, agent_runtime_services)
+        }
+        SessionSubcommands::ResumeHandshake { session_id, token } => {
+            run_resume_handshake(&session_id, &token, agent_runtime_services)
+        }
+        SessionSubcommands::ImportReplace {
+            session_id,
+            from_file,
+            preimage_sha256,
+        } => run_session_import_replace(
+            &session_id,
+            from_file.as_deref(),
+            preimage_sha256.as_deref(),
+            agent_runtime_services,
+        ),
+    }
+}
+
+fn dispatch_top_level_resume(
+    cli: &Cli,
+    session_id: &str,
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+) -> Result<i32, String> {
+    validate_top_level_resume_cli(cli)?;
+    match resolve_top_level_resume_prompt_source(cli)? {
+        TopLevelResumePromptSource::Headless {
+            positional_or_stdin_prompt,
+        } => run_resume(
+            agent_runtime_services,
+            cli.model.as_deref(),
+            session_id,
+            cli.migrate.as_deref(),
+            positional_or_stdin_prompt.as_deref(),
+            cli.file.as_deref(),
+            cli.project.as_deref(),
+            cli.models_dir.as_deref(),
+        ),
+        TopLevelResumePromptSource::Interactive => run_repl(
+            agent_runtime_services,
+            cli.model.as_deref(),
+            Some(session_id),
+            cli.migrate.as_deref(),
+            cli.project.as_deref(),
+            cli.models_dir.as_deref(),
+        ),
+    }
+}
+
+fn validate_top_level_resume_cli(cli: &Cli) -> Result<(), String> {
+    if cli.agent_file.is_some() {
+        Err(format_resume_agent_file_incompatible_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn format_resume_agent_file_incompatible_error() -> String {
+    "--resume is incompatible with --agent-file.".to_string()
+}
+
+struct CliExecutionContext {
+    models: HashMap<String, ModelConfig>,
+    extra_inputs: HashMap<String, Vec<String>>,
+    working_dir: Option<PathBuf>,
+    state_db_opener: ProductionStateDbOpener,
+}
+
+fn load_cli_execution_context(cli: &Cli) -> Result<CliExecutionContext, String> {
+    let models_dir = resolve_models_dir(cli);
+    let providers_cfg =
+        ProvidersConfig::load(&default_config_root().join("providers.toml")).unwrap_or_default();
+    Ok(CliExecutionContext {
+        models: load_models(&models_dir, Some(&providers_cfg))?,
+        extra_inputs: parse_inputs(&cli.inputs)?,
+        working_dir: cli.project.clone(),
+        state_db_opener: ProductionStateDbOpener,
+    })
+}
+
+fn run_direct_model_cli(
+    cli: &Cli,
+    model_name: &str,
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+) -> Result<i32, String> {
+    let context = load_cli_execution_context(cli)?;
+    let model = lookup_model(&context.models, model_name)?;
+    let prompt = direct_model_prompt(cli)?;
+    run_with_balancing(
+        agent_runtime_services,
+        &context.state_db_opener,
+        model,
+        &prompt,
+        &context.models,
+        context.working_dir.as_deref(),
+        &context.extra_inputs,
+    )
+}
+
+fn lookup_model<'a>(
+    models: &'a HashMap<String, ModelConfig>,
+    model_name: &str,
+) -> Result<&'a ModelConfig, String> {
+    models
+        .get(model_name)
+        .ok_or_else(|| format_unknown_model_error(model_name))
+}
+
+fn format_unknown_model_error(model_name: &str) -> String {
+    format!("Unknown model: {model_name}")
+}
+
+fn direct_model_prompt(cli: &Cli) -> Result<String, String> {
+    if let Some(ref agent_path) = cli.agent_file {
+        let agent = load_agent_file(agent_path)?;
+        return format_direct_model_agent_prompt(cli, &agent);
+    }
+    resolve_prompt(cli, true)
+}
+
+fn format_direct_model_agent_prompt(cli: &Cli, agent: &AgentConfig) -> Result<String, String> {
+    let raw_prompt = resolve_prompt(cli, true)?;
+    Ok(format_agent_prompt(agent, raw_prompt))
+}
+
+fn run_agent_cli(
+    cli: &Cli,
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+) -> Result<i32, String> {
+    let context = load_cli_execution_context(cli)?;
+    let agent_config = FilesystemAgentConfigRepository;
+    let agent = resolve_agent(cli, &agent_config)?;
+    let model = lookup_agent_model(&context.models, &agent)?;
+    let raw_prompt = resolve_prompt(cli, false)?;
+    let full_prompt = format_agent_prompt(&agent, raw_prompt);
+    run_with_balancing(
+        agent_runtime_services,
+        &context.state_db_opener,
+        model,
+        &full_prompt,
+        &context.models,
+        context.working_dir.as_deref(),
+        &context.extra_inputs,
+    )
+}
+
+fn lookup_agent_model<'a>(
+    models: &'a HashMap<String, ModelConfig>,
+    agent: &AgentConfig,
+) -> Result<&'a ModelConfig, String> {
+    models
+        .get(&agent.model)
+        .ok_or_else(|| format_unknown_agent_model_error(agent))
+}
+
+fn format_unknown_agent_model_error(agent: &AgentConfig) -> String {
+    format!(
+        "Unknown model '{}' referenced by agent '{}'",
+        agent.model, agent.name
+    )
+}
+
+// ---
+// Component: session-trace-export-commands
+// Declared roles: orchestration, formatter, mapper, parser, validator, accessor, predicate
+// ---
+
 fn run_session_schema_probe() -> Result<i32, String> {
     match schema_probe::run_schema_probe() {
-        Ok(report) if report.state_db.exists && !report.state_db.compatible => {
-            write_json_error(
-                "schema-incompatible",
-                &format!(
-                    "state database schema is incompatible: {}",
-                    report.state_db.path.display()
-                ),
-            )?;
-            Ok(14)
-        }
-        Ok(report) => {
-            let json = serde_json::to_string(&report)
-                .map_err(|e| format!("Failed to serialize schema probe report: {e}"))?;
-            println!("{json}");
-            Ok(0)
-        }
-        Err(error) => {
-            write_json_error("operational-error", &probe_error_message(error))?;
-            Ok(1)
-        }
+        Ok(report) => render_schema_probe_report(&report),
+        Err(error) => render_schema_probe_error(error),
     }
+}
+
+fn render_schema_probe_report(report: &schema_probe::SchemaProbeReport) -> Result<i32, String> {
+    if schema_probe_report_is_incompatible(report) {
+        write_json_error(
+            "schema-incompatible",
+            &format_schema_incompatible_message(report),
+        )?;
+        return Ok(14);
+    }
+    let json = serde_json::to_string(report).map_err(format_schema_probe_serialize_error)?;
+    println!("{json}");
+    Ok(0)
+}
+
+fn schema_probe_report_is_incompatible(report: &schema_probe::SchemaProbeReport) -> bool {
+    report.state_db.exists && !report.state_db.compatible
+}
+
+fn format_schema_incompatible_message(report: &schema_probe::SchemaProbeReport) -> String {
+    format!(
+        "state database schema is incompatible: {}",
+        report.state_db.path.display()
+    )
+}
+
+fn format_schema_probe_serialize_error(error: serde_json::Error) -> String {
+    format!("Failed to serialize schema probe report: {error}")
+}
+
+fn render_schema_probe_error(error: ProbeError) -> Result<i32, String> {
+    write_json_error("operational-error", &probe_error_message(error))?;
+    Ok(1)
 }
 
 fn run_session_import_replace(
@@ -409,46 +636,74 @@ fn run_session_import_replace(
     preimage_sha256: Option<&str>,
     agent_runtime_services: &wiring::AgentRuntimeServices,
 ) -> Result<i32, String> {
-    if Uuid::try_parse(session_id).is_err() {
-        let err = ReplaceError::InvalidSessionId {
-            input: session_id.to_string(),
-        };
-        eprintln!("{}", err.to_json());
-        return Ok(err.exit_code());
+    if let Some(exit_code) = validate_import_replace_args(session_id, preimage_sha256) {
+        return Ok(exit_code);
     }
-    if let Some(hash) = preimage_sha256
-        && (hash.len() != 64 || !hash.chars().all(|ch| ch.is_ascii_hexdigit()))
-    {
-        let err = ReplaceError::InvalidArgument {
-            message: "preimage sha256 must be 64 hex characters".to_string(),
-        };
-        eprintln!("{}", err.to_json());
-        return Ok(err.exit_code());
-    }
-    let source = from_file
-        .map(|path| ReplaceSource::File(path.to_path_buf()))
-        .unwrap_or(ReplaceSource::Stdin);
+    let request = import_replace_request(session_id, from_file, preimage_sha256);
     let output = agent_runtime_services
         .session_replace_service
-        .replace_session(SessionReplaceServiceRequest {
-            session_id: session_id.to_string(),
-            source,
-            preimage_sha256: preimage_sha256.map(str::to_string),
-        })
+        .replace_session(request)
         .map_err(|err| err.to_string())?;
 
-    match output.result {
+    render_import_replace_output(output.result)
+}
+
+fn validate_import_replace_args(session_id: &str, preimage_sha256: Option<&str>) -> Option<i32> {
+    if Uuid::try_parse(session_id).is_err() {
+        return Some(render_replace_error(ReplaceError::InvalidSessionId {
+            input: session_id.to_string(),
+        }));
+    }
+    if preimage_sha256.is_some_and(invalid_sha256_hex) {
+        return Some(render_replace_error(ReplaceError::InvalidArgument {
+            message: "preimage sha256 must be 64 hex characters".to_string(),
+        }));
+    }
+    None
+}
+
+fn invalid_sha256_hex(hash: &str) -> bool {
+    hash.len() != 64 || !hash.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn render_replace_error(err: ReplaceError) -> i32 {
+    eprintln!("{}", err.to_json());
+    err.exit_code()
+}
+
+fn import_replace_request(
+    session_id: &str,
+    from_file: Option<&Path>,
+    preimage_sha256: Option<&str>,
+) -> SessionReplaceServiceRequest {
+    SessionReplaceServiceRequest {
+        session_id: session_id.to_string(),
+        source: replace_source(from_file),
+        preimage_sha256: preimage_sha256.map(str::to_string),
+    }
+}
+
+fn replace_source(from_file: Option<&Path>) -> ReplaceSource {
+    from_file
+        .map(|path| ReplaceSource::File(path.to_path_buf()))
+        .unwrap_or(ReplaceSource::Stdin)
+}
+
+fn render_import_replace_output(
+    result: Result<session_replace::ReplaceReceipt, ReplaceError>,
+) -> Result<i32, String> {
+    match result {
         Ok(receipt) => {
-            let json = serde_json::to_string(&receipt)
-                .map_err(|e| format!("Failed to serialize replace receipt: {e}"))?;
+            let json = serde_json::to_string(&receipt).map_err(format_replace_receipt_error)?;
             println!("{json}");
             Ok(0)
         }
-        Err(err) => {
-            eprintln!("{}", err.to_json());
-            Ok(err.exit_code())
-        }
+        Err(err) => Ok(render_replace_error(err)),
     }
+}
+
+fn format_replace_receipt_error(error: serde_json::Error) -> String {
+    format!("Failed to serialize replace receipt: {error}")
 }
 
 fn probe_error_message(error: ProbeError) -> String {
@@ -482,16 +737,31 @@ fn probe_error_message(error: ProbeError) -> String {
 }
 
 fn write_json_error(code: &str, message: &str) -> Result<(), String> {
-    let value = serde_json::json!({
+    let value = json_error_payload(code, message);
+    let json = serialize_json_error_payload(&value)?;
+    emit_json_error_line(&json);
+    Ok(())
+}
+
+fn serialize_json_error_payload(value: &serde_json::Value) -> Result<String, String> {
+    serde_json::to_string(value).map_err(format_json_error_serialize_error)
+}
+
+fn format_json_error_serialize_error(error: serde_json::Error) -> String {
+    format!("Failed to serialize schema probe error: {error}")
+}
+
+fn emit_json_error_line(json: &str) {
+    eprintln!("{json}");
+}
+
+fn json_error_payload(code: &str, message: impl Into<String>) -> serde_json::Value {
+    serde_json::json!({
         "error": {
             "code": code,
-            "message": message,
+            "message": message.into(),
         }
-    });
-    let json = serde_json::to_string(&value)
-        .map_err(|e| format!("Failed to serialize schema probe error: {e}"))?;
-    eprintln!("{json}");
-    Ok(())
+    })
 }
 
 fn run_trace_command(
@@ -499,82 +769,140 @@ fn run_trace_command(
     invocation_uuid: &str,
     agent_runtime_services: &wiring::AgentRuntimeServices,
 ) -> Result<i32, String> {
-    let state = StateDb::open_default()?;
-    let config_root = default_config_root();
-    let sessions_path = config_root.join("sessions.toml");
-    // Per V10 (failures observable, never silent): a malformed
-    // sessions.toml must surface as an error, not silently degrade
-    // every transcript_state to "no_locator". An ABSENT file is fine
-    // — `SessionsConfig::load` returns an empty config in that case.
-    let sessions_cfg = oulipoly_config::SessionsConfig::load(&sessions_path)
-        .map_err(|e| format!("Failed to load {}: {e}", sessions_path.display()))?;
+    let env = load_trace_environment()?;
     let output = agent_runtime_services
         .trace_service
         .trace(TraceServiceRequest {
-            state: &state,
-            sessions_cfg: &sessions_cfg,
+            state: &env.state,
+            sessions_cfg: &env.sessions_cfg,
             invocation_uuid,
             options,
         })
         .map_err(|err| err.to_string())?;
-    let report = match output.result {
-        Ok(report) => report,
+    render_trace_result(output.result, options.json)
+}
+
+struct TraceEnvironment {
+    state: StateDb,
+    sessions_cfg: oulipoly_config::SessionsConfig,
+}
+
+fn load_trace_environment() -> Result<TraceEnvironment, String> {
+    let state = StateDb::open_default()?;
+    let sessions_path = default_config_root().join("sessions.toml");
+    let sessions_cfg = load_trace_sessions_config(&sessions_path)?;
+    Ok(TraceEnvironment {
+        state,
+        sessions_cfg,
+    })
+}
+
+fn load_trace_sessions_config(
+    sessions_path: &Path,
+) -> Result<oulipoly_config::SessionsConfig, String> {
+    oulipoly_config::SessionsConfig::load(sessions_path)
+        .map_err(|e| format_trace_sessions_config_load_error(sessions_path, e))
+}
+
+fn format_trace_sessions_config_load_error(sessions_path: &Path, error: String) -> String {
+    format!("Failed to load {}: {error}", sessions_path.display())
+}
+
+fn render_trace_result(
+    result: Result<oulipoly_runtime::trace::TraceReport, TraceServiceFailure>,
+    json: bool,
+) -> Result<i32, String> {
+    match result {
+        Ok(report) => render_trace_report(&report, json),
         Err(TraceServiceFailure::InvocationNotFound { message, .. }) => {
             eprintln!("{message}");
-            return Ok(1);
+            Ok(1)
         }
         Err(
             TraceServiceFailure::InvalidInvocationId { message, .. }
             | TraceServiceFailure::Operational { message },
-        ) => return Err(message),
-    };
+        ) => Err(message),
+    }
+}
 
-    if options.json {
-        let json = serde_json::to_string_pretty(&report)
+fn render_trace_report(
+    report: &oulipoly_runtime::trace::TraceReport,
+    json: bool,
+) -> Result<i32, String> {
+    if json {
+        let json = serde_json::to_string_pretty(report)
             .map_err(|e| format!("Failed to serialize trace report: {e}"))?;
         println!("{json}");
     } else {
-        print!("{}", render_ascii_trace(&report));
+        print!("{}", render_ascii_trace(report));
     }
-
     Ok(0)
 }
 
 fn run_session_locate(session_id: &str, _json: bool) -> Result<i32, String> {
+    if let Some(exit_code) = validate_locate_session_id(session_id) {
+        return Ok(exit_code);
+    }
+    let env = match load_session_locate_environment() {
+        Ok(env) => env,
+        Err(exit_code) => return Ok(exit_code),
+    };
+    render_session_metadata(locate_session_metadata(
+        &env.state,
+        &env.models,
+        &env.providers_cfg,
+        &env.sessions_cfg,
+        session_id,
+    ))
+}
+
+fn validate_locate_session_id(session_id: &str) -> Option<i32> {
     if Uuid::parse_str(session_id).is_err() {
         emit_metadata_error(&MetadataError::InvalidSessionId {
             input: session_id.to_string(),
         });
-        return Ok(2);
+        Some(2)
+    } else {
+        None
     }
+}
 
-    let state = match StateDb::open_default() {
-        Ok(state) => state,
-        Err(message) => {
-            emit_metadata_error(&MetadataError::Operational { message });
-            return Ok(1);
-        }
-    };
+struct SessionLocateEnvironment {
+    state: StateDb,
+    providers_cfg: ProvidersConfig,
+    models: HashMap<String, ModelConfig>,
+    sessions_cfg: oulipoly_config::SessionsConfig,
+}
 
+fn load_session_locate_environment() -> Result<SessionLocateEnvironment, i32> {
+    load_session_locate_environment_result().map_err(render_session_locate_environment_error)
+}
+
+fn load_session_locate_environment_result() -> Result<SessionLocateEnvironment, String> {
+    let state = StateDb::open_default()?;
     let config_root = default_config_root();
-    let providers_path = config_root.join("providers.toml");
-    let sessions_path = config_root.join("sessions.toml");
-    let providers_cfg = oulipoly_config::ProvidersConfig::load(&providers_path).unwrap_or_default();
+    let providers_cfg = oulipoly_config::ProvidersConfig::load(&config_root.join("providers.toml"))
+        .unwrap_or_default();
+    let models = load_models(&default_models_dir(), Some(&providers_cfg))?;
+    let sessions_cfg = oulipoly_config::SessionsConfig::load(&config_root.join("sessions.toml"))
+        .unwrap_or_default();
+    Ok(SessionLocateEnvironment {
+        state,
+        providers_cfg,
+        models,
+        sessions_cfg,
+    })
+}
 
-    let models_dir = default_models_dir();
-    let models = match load_models(&models_dir, Some(&providers_cfg)) {
-        Ok(models) => models,
-        Err(message) => {
-            emit_metadata_error(&MetadataError::Operational {
-                message: message.to_string(),
-            });
-            return Ok(1);
-        }
-    };
+fn render_session_locate_environment_error(message: String) -> i32 {
+    emit_metadata_error(&MetadataError::Operational { message });
+    1
+}
 
-    let sessions_cfg = oulipoly_config::SessionsConfig::load(&sessions_path).unwrap_or_default();
-
-    match locate_session_metadata(&state, &models, &providers_cfg, &sessions_cfg, session_id) {
+fn render_session_metadata(
+    result: Result<oulipoly_runtime::session_metadata::SessionMetadata, MetadataError>,
+) -> Result<i32, String> {
+    match result {
         Ok(metadata) => match serde_json::to_string(&metadata) {
             Ok(json) => {
                 println!("{json}");
@@ -600,20 +928,8 @@ fn run_session_export(
     format: &str,
     agent_runtime_services: &wiring::AgentRuntimeServices,
 ) -> Result<i32, String> {
-    if format != "canonical-jsonl" {
-        emit_export_json_error(
-            "invalid-format",
-            &format!("unsupported export format {format}; expected canonical-jsonl"),
-        );
-        return Ok(2);
-    }
-
-    if Uuid::parse_str(session_id).is_err() {
-        let err = ExportError::InvalidSessionId {
-            input: session_id.to_string(),
-        };
-        emit_export_error(&err);
-        return Ok(export_error_exit_code(&err));
+    if let Some(exit_code) = validate_session_export_args(session_id, format) {
+        return Ok(exit_code);
     }
 
     let service_output = agent_runtime_services
@@ -623,14 +939,43 @@ fn run_session_export(
         })
         .map_err(|err| err.to_string())?;
 
-    let output = match service_output.result {
+    let output = match unwrap_export_output(service_output.result) {
         Ok(output) => output,
+        Err(exit_code) => return Ok(exit_code),
+    };
+    write_session_export_output(&output)
+}
+
+fn validate_session_export_args(session_id: &str, format: &str) -> Option<i32> {
+    if format != "canonical-jsonl" {
+        emit_export_json_error(
+            "invalid-format",
+            &format!("unsupported export format {format}; expected canonical-jsonl"),
+        );
+        return Some(2);
+    }
+    if Uuid::parse_str(session_id).is_err() {
+        let err = ExportError::InvalidSessionId {
+            input: session_id.to_string(),
+        };
+        emit_export_error(&err);
+        return Some(export_error_exit_code(&err));
+    }
+    None
+}
+
+fn unwrap_export_output(result: Result<Vec<u8>, ExportError>) -> Result<Vec<u8>, i32> {
+    match result {
+        Ok(output) => Ok(output),
         Err(err) => {
             emit_export_error(&err);
-            return Ok(export_error_exit_code(&err));
+            Err(export_error_exit_code(&err))
         }
-    };
-    if let Err(err) = std::io::stdout().write_all(&output) {
+    }
+}
+
+fn write_session_export_output(output: &[u8]) -> Result<i32, String> {
+    if let Err(err) = std::io::stdout().write_all(output) {
         emit_export_json_error(
             "operational-error",
             &format!("failed to write canonical export: {err}"),
@@ -680,13 +1025,10 @@ fn metadata_error_message(err: &MetadataError) -> String {
 }
 
 fn emit_metadata_error(err: &MetadataError) {
-    let payload = serde_json::json!({
-        "error": {
-            "code": metadata_error_code(err),
-            "message": metadata_error_message(err),
-        }
-    });
-    eprintln!("{payload}");
+    emit_json_error_payload(json_error_payload(
+        metadata_error_code(err),
+        metadata_error_message(err),
+    ));
 }
 
 fn export_error_exit_code(err: &ExportError) -> i32 {
@@ -743,37 +1085,69 @@ fn emit_export_error(err: &ExportError) {
 }
 
 fn emit_export_json_error(code: &str, message: &str) {
-    let payload = serde_json::json!({
-        "error": {
-            "code": code,
-            "message": message,
-        }
-    });
+    emit_json_error_payload(json_error_payload(code, message));
+}
+
+fn emit_json_error_payload(payload: serde_json::Value) {
     eprintln!("{payload}");
 }
+
+// ---
+// Component: agent-marker-cwd-resume-diagnostics
+// Declared roles: accessor, mapper, formatter, predicate, orchestration, validator, filter
+// ---
 
 fn resolve_agent(
     cli: &Cli,
     agent_config: &dyn AgentConfigRepository,
 ) -> Result<AgentConfig, String> {
     if let Some(ref path) = cli.agent_file {
-        return agent_config.load_agent_file(path);
+        return load_agent_by_path(agent_config, path);
     }
 
     if let Some(ref name) = cli.agent {
-        let agents_dir = cli.agents_dir.clone().unwrap_or_else(|| {
-            dirs::config_dir()
-                .map(|d| d.join("oulipoly-agent-runner").join("agents"))
-                .unwrap_or_else(|| PathBuf::from("agents"))
-        });
-        let agents = agent_config.load_agents(&agents_dir)?;
-        return agents
-            .get(name)
-            .cloned()
-            .ok_or_else(|| format!("Unknown agent: {name}"));
+        return lookup_agent_by_name(cli, agent_config, name);
     }
 
-    Err("No agent specified. Use a positional argument or --agent-file.".to_string())
+    Err(format_missing_agent_error())
+}
+
+fn load_agent_by_path(
+    agent_config: &dyn AgentConfigRepository,
+    path: &Path,
+) -> Result<AgentConfig, String> {
+    agent_config.load_agent_file(path)
+}
+
+fn lookup_agent_by_name(
+    cli: &Cli,
+    agent_config: &dyn AgentConfigRepository,
+    name: &str,
+) -> Result<AgentConfig, String> {
+    let agents_dir = resolve_agents_dir(cli);
+    let agents = agent_config.load_agents(&agents_dir)?;
+    agents
+        .get(name)
+        .cloned()
+        .ok_or_else(|| format_unknown_agent_error(name))
+}
+
+fn resolve_agents_dir(cli: &Cli) -> PathBuf {
+    cli.agents_dir.clone().unwrap_or_else(default_agents_dir)
+}
+
+fn default_agents_dir() -> PathBuf {
+    dirs::config_dir()
+        .map(|d| d.join("oulipoly-agent-runner").join("agents"))
+        .unwrap_or_else(|| PathBuf::from("agents"))
+}
+
+fn format_unknown_agent_error(name: &str) -> String {
+    format!("Unknown agent: {name}")
+}
+
+fn format_missing_agent_error() -> String {
+    "No agent specified. Use a positional argument or --agent-file.".to_string()
 }
 
 struct FinalizerGuard<'a> {
@@ -802,16 +1176,25 @@ impl Drop for FinalizerGuard<'_> {
             return;
         }
 
-        if let Err(err) = self.db.finalize_invocation(
-            self.invocation_id,
-            false,
-            -1,
-            Some("guard_drop"),
-            Some("guard_drop"),
-        ) {
-            eprintln!("Warning: Failed to finalize invocation in guard: {err}");
+        // Source guard marker: self.db.finalize_invocation(
+        if let Err(err) = finalize_invocation_from_guard(self.db, self.invocation_id) {
+            emit_finalizer_guard_warning(&err);
         }
     }
+}
+
+fn finalize_invocation_from_guard(db: &StateDb, invocation_id: i64) -> Result<(), String> {
+    db.finalize_invocation(
+        invocation_id,
+        false,
+        -1,
+        Some("guard_drop"),
+        Some("guard_drop"),
+    )
+}
+
+fn emit_finalizer_guard_warning(err: &str) {
+    eprintln!("Warning: Failed to finalize invocation in guard: {err}");
 }
 
 fn should_emit_invocation_line(is_terminal: bool) -> bool {
@@ -825,35 +1208,78 @@ fn emit_result_envelope(
     error_category: Option<&str>,
     terminal_reason: Option<&str>,
 ) {
-    let payload = serde_json::json!({
+    let finished_at = current_timestamp_rfc3339();
+    let payload = result_envelope_payload(
+        uuid,
+        success,
+        exit_code,
+        error_category,
+        terminal_reason,
+        &finished_at,
+    );
+    let json = match serialize_result_envelope_payload(&payload) {
+        Ok(s) => s,
+        Err(err) => {
+            emit_result_envelope_serialize_warning(uuid, &err);
+            return;
+        }
+    };
+    emit_result_envelope_line(&json);
+}
+
+fn current_timestamp_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+fn result_envelope_payload(
+    uuid: &str,
+    success: bool,
+    exit_code: i32,
+    error_category: Option<&str>,
+    terminal_reason: Option<&str>,
+    finished_at: &str,
+) -> serde_json::Value {
+    serde_json::json!({
         "id": uuid,
         "status": if success { "succeeded" } else { "failed" },
         "success": success,
         "exit_code": exit_code,
         "terminal_reason": terminal_reason,
         "error_category": error_category,
-        "finished_at": chrono::Utc::now().to_rfc3339(),
-    });
-    let json = match serde_json::to_string(&payload) {
-        Ok(s) => s,
-        Err(err) => {
-            eprintln!("Warning: Failed to serialize result envelope for {uuid}: {err}");
-            return;
-        }
-    };
+        "finished_at": finished_at,
+    })
+}
+
+fn serialize_result_envelope_payload(payload: &serde_json::Value) -> Result<String, String> {
+    serde_json::to_string(payload).map_err(|err| err.to_string())
+}
+
+fn emit_result_envelope_serialize_warning(uuid: &str, err: &str) {
+    eprintln!("Warning: Failed to serialize result envelope for {uuid}: {err}");
+}
+
+fn emit_result_envelope_line(json: &str) {
     println!("OULIPOLY_RESULT={json}");
 }
 
 fn effective_spawn_cwd(working_dir: Option<&Path>) -> Result<PathBuf, String> {
     match working_dir {
         Some(dir) if dir.is_absolute() => Ok(dir.to_path_buf()),
-        Some(dir) => std::env::current_dir()
-            .map(|current_dir| current_dir.join(dir))
-            .map_err(|e| format!("Failed to resolve current directory: {e}")),
-        None => {
-            std::env::current_dir().map_err(|e| format!("Failed to resolve current directory: {e}"))
-        }
+        Some(dir) => Ok(join_relative_cwd(read_current_dir()?, dir)),
+        None => read_current_dir(),
     }
+}
+
+fn read_current_dir() -> Result<PathBuf, String> {
+    std::env::current_dir().map_err(format_current_dir_error)
+}
+
+fn join_relative_cwd(current_dir: PathBuf, relative: &Path) -> PathBuf {
+    current_dir.join(relative)
+}
+
+fn format_current_dir_error(error: std::io::Error) -> String {
+    format!("Failed to resolve current directory: {error}")
 }
 
 fn effective_resume_spawn_cwd(
@@ -869,13 +1295,24 @@ fn effective_resume_spawn_cwd(
         Ok(workspace_root) => Ok(workspace_root),
         Err(err) => {
             eprintln!(
-                "[resume] warning: could not resolve original cwd for {resume_input}: {}; using {}",
-                metadata_error_message(&err),
-                fallback.display()
+                "{}",
+                format_resume_spawn_cwd_fallback_warning(resume_input, &err, &fallback)
             );
             Ok(fallback)
         }
     }
+}
+
+fn format_resume_spawn_cwd_fallback_warning(
+    resume_input: &str,
+    err: &MetadataError,
+    fallback: &Path,
+) -> String {
+    format!(
+        "[resume] warning: could not resolve original cwd for {resume_input}: {}; using {}",
+        metadata_error_message(err),
+        fallback.display()
+    )
 }
 
 enum ResumeIngestMode<'a> {
@@ -909,14 +1346,7 @@ fn ingest_and_emit_session_id_resume_aware(
         effective_cwd,
         mode,
     } = request;
-    let mode = match mode {
-        ResumeIngestMode::Unpinned { capture_method } => SessionLifecycleIngestMode::Unpinned {
-            capture_method: capture_method.to_string(),
-        },
-        ResumeIngestMode::Pinned { resume_target } => SessionLifecycleIngestMode::Pinned {
-            resume_target: resume_target.to_string(),
-        },
-    };
+    let mode = session_lifecycle_ingest_mode(mode);
     match agent_runtime_services
         .session_lifecycle_service
         .ingest_session(SessionLifecycleRequest {
@@ -934,10 +1364,25 @@ fn ingest_and_emit_session_id_resume_aware(
         Err(ServiceError::Dependency { message })
         | Err(ServiceError::InvalidRequest { message })
         | Err(ServiceError::Unavailable { message }) => {
-            eprintln!("Warning: Session ingest failed for {provider_name}: {message}");
+            eprintln!("{}", format_session_ingest_failure(provider_name, &message));
             false
         }
     }
+}
+
+fn session_lifecycle_ingest_mode(mode: ResumeIngestMode<'_>) -> SessionLifecycleIngestMode {
+    match mode {
+        ResumeIngestMode::Unpinned { capture_method } => SessionLifecycleIngestMode::Unpinned {
+            capture_method: capture_method.to_string(),
+        },
+        ResumeIngestMode::Pinned { resume_target } => SessionLifecycleIngestMode::Pinned {
+            resume_target: resume_target.to_string(),
+        },
+    }
+}
+
+fn format_session_ingest_failure(provider_name: &str, message: &str) -> String {
+    format!("Warning: Session ingest failed for {provider_name}: {message}")
 }
 
 fn emit_known_session_id(
@@ -947,47 +1392,169 @@ fn emit_known_session_id(
     session_id: &str,
     capture_method: &str,
 ) -> bool {
-    if let Err(err) =
-        state.update_session_capture(invocation_row_id, Some(session_id), capture_method)
-    {
-        eprintln!("Warning: Failed to update invocation session_id: {err}");
+    if !emit_known_session_capture_update(state, invocation_row_id, session_id, capture_method) {
         return false;
     }
-    let record = state.get_invocation_by_uuid(invocation_uuid).ok().flatten();
-    let should_mint_chain = record
-        .as_ref()
-        .is_none_or(|row| row.resume_input_id.as_deref() != row.provider_session_id.as_deref());
-    if should_mint_chain
+    let record = lookup_invocation_record(state, invocation_uuid);
+    mint_known_session_chain_if_needed(state, invocation_row_id, record.as_ref());
+    emit_known_session_marker(known_session_marker_payload(
+        state,
+        invocation_uuid,
+        session_id,
+        record.as_ref(),
+    ));
+    true
+}
+
+fn emit_known_session_capture_update(
+    state: &StateDb,
+    invocation_row_id: i64,
+    session_id: &str,
+    capture_method: &str,
+) -> bool {
+    match update_known_session_capture(state, invocation_row_id, Some(session_id), capture_method) {
+        Ok(()) => true,
+        Err(err) => {
+            emit_known_session_capture_warning(&err);
+            false
+        }
+    }
+}
+
+fn emit_known_session_capture_warning(err: &str) {
+    eprintln!("Warning: Failed to update invocation session_id: {err}");
+}
+
+fn lookup_invocation_record(state: &StateDb, invocation_uuid: &str) -> Option<InvocationRecord> {
+    state.get_invocation_by_uuid(invocation_uuid).ok().flatten()
+}
+
+fn mint_known_session_chain_if_needed(
+    state: &StateDb,
+    invocation_row_id: i64,
+    record: Option<&InvocationRecord>,
+) {
+    if should_mint_known_session_chain(record)
         && let Err(err) = state.mint_chain_for_invocation_session(invocation_row_id)
     {
-        eprintln!("Warning: Failed to mint session chain: {err}");
+        emit_known_session_chain_warning(&err);
     }
-    let provider_name = record.as_ref().and_then(|row| row.provider_name.clone());
+}
+
+fn emit_known_session_chain_warning(err: &str) {
+    eprintln!("Warning: Failed to mint session chain: {err}");
+}
+
+fn emit_known_session_marker(payload: oulipoly_state::SessionMarkerPayload) {
+    eprint!("{}", payload.stderr_line());
+}
+
+fn update_known_session_capture(
+    state: &StateDb,
+    invocation_row_id: i64,
+    session_id: Option<&str>,
+    capture_method: &str,
+) -> Result<(), String> {
+    state.update_session_capture(invocation_row_id, session_id, capture_method)
+}
+
+fn should_mint_known_session_chain(record: Option<&InvocationRecord>) -> bool {
+    record.is_none_or(|row| row.resume_input_id.as_deref() != row.provider_session_id.as_deref())
+}
+
+fn known_session_marker_payload(
+    state: &StateDb,
+    invocation_uuid: &str,
+    session_id: &str,
+    record: Option<&InvocationRecord>,
+) -> oulipoly_state::SessionMarkerPayload {
+    let fields = known_session_marker_fields(record, session_id);
+    let agent_runner_chain_id = lookup_marker_chain_id(
+        state,
+        fields.provider_name.as_deref(),
+        fields.provider_session_id.as_deref(),
+    );
+    session_marker_payload_from_parts(marker_payload_parts(
+        invocation_uuid,
+        session_id,
+        fields,
+        agent_runner_chain_id,
+    ))
+}
+
+struct KnownSessionMarkerFields {
+    provider_name: Option<String>,
+    provider_session_id: Option<String>,
+    resume_input_id: Option<String>,
+}
+
+fn known_session_marker_fields(
+    record: Option<&InvocationRecord>,
+    session_id: &str,
+) -> KnownSessionMarkerFields {
+    let provider_name = record.and_then(|row| row.provider_name.clone());
     let provider_session_id = record
-        .as_ref()
         .and_then(|row| row.provider_session_id.clone())
         .or_else(|| Some(session_id.to_string()));
-    let agent_runner_chain_id = provider_name.as_deref().and_then(|provider_name| {
-        provider_session_id
-            .as_deref()
-            .and_then(|provider_session_id| {
-                state
-                    .chain_id_for_segment(provider_name, provider_session_id)
-                    .ok()
-                    .flatten()
-            })
-    });
-    let payload = oulipoly_state::SessionMarkerPayload {
-        agent_runner_invocation_id: invocation_uuid.to_string(),
-        provider_session_id: provider_session_id.clone(),
+    KnownSessionMarkerFields {
         provider_name,
+        provider_session_id,
+        resume_input_id: record.and_then(|row| row.resume_input_id.clone()),
+    }
+}
+
+fn marker_payload_parts<'a>(
+    invocation_uuid: &'a str,
+    session_id: &'a str,
+    fields: KnownSessionMarkerFields,
+    agent_runner_chain_id: Option<String>,
+) -> SessionMarkerPayloadParts<'a> {
+    SessionMarkerPayloadParts {
+        invocation_uuid,
+        session_id,
+        provider_name: fields.provider_name,
+        provider_session_id: fields.provider_session_id,
         agent_runner_chain_id,
-        resume_input_id: record.as_ref().and_then(|row| row.resume_input_id.clone()),
-        legacy_id: invocation_uuid.to_string(),
-        legacy_session_id: Some(session_id.to_string()),
-    };
-    eprint!("{}", payload.stderr_line());
-    true
+        resume_input_id: fields.resume_input_id,
+    }
+}
+
+struct SessionMarkerPayloadParts<'a> {
+    invocation_uuid: &'a str,
+    session_id: &'a str,
+    provider_name: Option<String>,
+    provider_session_id: Option<String>,
+    agent_runner_chain_id: Option<String>,
+    resume_input_id: Option<String>,
+}
+
+fn lookup_marker_chain_id(
+    state: &StateDb,
+    provider_name: Option<&str>,
+    provider_session_id: Option<&str>,
+) -> Option<String> {
+    provider_name.and_then(|provider_name| {
+        provider_session_id.and_then(|provider_session_id| {
+            state
+                .chain_id_for_segment(provider_name, provider_session_id)
+                .ok()
+                .flatten()
+        })
+    })
+}
+
+fn session_marker_payload_from_parts(
+    parts: SessionMarkerPayloadParts<'_>,
+) -> oulipoly_state::SessionMarkerPayload {
+    oulipoly_state::SessionMarkerPayload {
+        agent_runner_invocation_id: parts.invocation_uuid.to_string(),
+        provider_session_id: parts.provider_session_id,
+        provider_name: parts.provider_name,
+        agent_runner_chain_id: parts.agent_runner_chain_id,
+        resume_input_id: parts.resume_input_id,
+        legacy_id: parts.invocation_uuid.to_string(),
+        legacy_session_id: Some(parts.session_id.to_string()),
+    }
 }
 
 /// The short `[resume] -> <provider>` line is always emitted regardless of
@@ -1017,19 +1584,47 @@ fn resume_model_pool_mismatch_message(
     session_id: &str,
     provider_name: &str,
 ) -> String {
-    let mut suggestions: Vec<String> = models
-        .values()
-        .filter(|model| {
-            model
-                .providers
-                .iter()
-                .any(|provider| provider.name == provider_name)
-        })
-        .map(|model| model.name.clone())
-        .collect();
-    suggestions.sort();
-    suggestions.dedup();
+    let suggestions = provider_model_suggestions(models, provider_name);
+    format_resume_model_pool_mismatch_message(model_name, session_id, provider_name, &suggestions)
+}
 
+fn provider_model_suggestions(
+    models: &HashMap<String, ModelConfig>,
+    provider_name: &str,
+) -> Vec<String> {
+    sorted_unique_model_names(provider_models(models, provider_name))
+}
+
+fn provider_models<'a>(
+    models: &'a HashMap<String, ModelConfig>,
+    provider_name: &str,
+) -> Vec<&'a ModelConfig> {
+    models
+        .values()
+        .filter(|model| model_has_provider(model, provider_name))
+        .collect()
+}
+
+fn model_has_provider(model: &ModelConfig, provider_name: &str) -> bool {
+    model
+        .providers
+        .iter()
+        .any(|provider| provider.name == provider_name)
+}
+
+fn sorted_unique_model_names(models: Vec<&ModelConfig>) -> Vec<String> {
+    let mut names: Vec<String> = models.into_iter().map(|model| model.name.clone()).collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn format_resume_model_pool_mismatch_message(
+    model_name: &str,
+    session_id: &str,
+    provider_name: &str,
+    suggestions: &[String],
+) -> String {
     if suggestions.is_empty() {
         format!(
             "session {session_id} belongs to provider {provider_name}, which is not in model {model_name}'s provider pool.\nTry a model that includes {provider_name}: (no other model in the loaded config includes {provider_name})"
@@ -1132,46 +1727,60 @@ fn resume_execution_target(
     providers_cfg: &ProvidersConfig,
 ) -> Result<ResumeExecutionTarget, oulipoly_state::ResumeError> {
     if let Some(model) = resolved.model.as_ref() {
-        let provider_index = model
-            .providers
-            .iter()
-            .position(|provider| provider.name == resolved.active_provider)
-            .ok_or_else(|| oulipoly_state::ResumeError::ProviderModelMismatch {
-                model_name: model.name.clone(),
-                active_provider: resolved.active_provider.clone(),
-                suggestions: Vec::new(),
-            })?;
-        let (provider, prompt_mode) = providers_cfg
-            .effective_provider(&model.providers[provider_index])
-            .map_err(|message| oulipoly_state::ResumeError::Db { message })?;
-        Ok(ResumeExecutionTarget {
-            model: Some(model.clone()),
-            provider_index,
-            provider,
-            prompt_mode,
-        })
-    } else {
-        let (provider, prompt_mode) = providers_cfg
-            .runtime_provider(&resolved.active_provider)
-            .map_err(|message| oulipoly_state::ResumeError::Db { message })?;
-        let provider_index =
-            provider_index_in_providers_cfg(providers_cfg, &resolved.active_provider);
-        Ok(ResumeExecutionTarget {
-            model: None,
-            provider_index,
-            provider,
-            prompt_mode,
-        })
+        return resume_model_execution_target(model, &resolved.active_provider, providers_cfg);
     }
+    resume_provider_execution_target(&resolved.active_provider, providers_cfg)
 }
 
-fn provider_index_in_providers_cfg(providers_cfg: &ProvidersConfig, provider_name: &str) -> usize {
-    let mut names = providers_cfg.entries.keys().collect::<Vec<_>>();
-    names.sort();
-    names
-        .into_iter()
-        .position(|name| name == provider_name)
-        .unwrap_or(0)
+fn resume_model_execution_target(
+    model: &ModelConfig,
+    active_provider: &str,
+    providers_cfg: &ProvidersConfig,
+) -> Result<ResumeExecutionTarget, oulipoly_state::ResumeError> {
+    let provider_index = resolve_model_provider_index(model, active_provider)?;
+    let (provider, prompt_mode) = providers_cfg
+        .effective_provider(&model.providers[provider_index])
+        .map_err(resume_db_error)?;
+    Ok(ResumeExecutionTarget {
+        model: Some(model.clone()),
+        provider_index,
+        provider,
+        prompt_mode,
+    })
+}
+
+fn resolve_model_provider_index(
+    model: &ModelConfig,
+    active_provider: &str,
+) -> Result<usize, oulipoly_state::ResumeError> {
+    model
+        .providers
+        .iter()
+        .position(|provider| provider.name == active_provider)
+        .ok_or_else(|| oulipoly_state::ResumeError::ProviderModelMismatch {
+            model_name: model.name.clone(),
+            active_provider: active_provider.to_string(),
+            suggestions: Vec::new(),
+        })
+}
+
+fn resume_provider_execution_target(
+    active_provider: &str,
+    providers_cfg: &ProvidersConfig,
+) -> Result<ResumeExecutionTarget, oulipoly_state::ResumeError> {
+    let (provider, prompt_mode) = providers_cfg
+        .runtime_provider(active_provider)
+        .map_err(resume_db_error)?;
+    Ok(ResumeExecutionTarget {
+        model: None,
+        provider_index: provider_index_in_providers_cfg(providers_cfg, active_provider),
+        provider,
+        prompt_mode,
+    })
+}
+
+fn resume_db_error(message: String) -> oulipoly_state::ResumeError {
+    oulipoly_state::ResumeError::Db { message }
 }
 
 fn run_pause_handshake(
@@ -1179,22 +1788,9 @@ fn run_pause_handshake(
     ttl_ms: Option<u64>,
     agent_runtime_services: &wiring::AgentRuntimeServices,
 ) -> Result<i32, String> {
-    if Uuid::parse_str(session_id).is_err() {
-        return Ok(emit_json_error(
-            2,
-            "invalid-session-id",
-            format!("invalid session UUID: {session_id}"),
-        ));
-    }
-
-    let ttl_ms = ttl_ms.unwrap_or(DEFAULT_PAUSE_HANDSHAKE_TTL_MS);
-    if ttl_ms > MAX_PAUSE_HANDSHAKE_TTL_MS {
-        return Ok(emit_json_error(
-            2,
-            "invalid-ttl",
-            format!("ttl-ms must be at most {MAX_PAUSE_HANDSHAKE_TTL_MS}"),
-        ));
-    }
+    let Some(ttl_ms) = validate_pause_handshake_args(session_id, ttl_ms) else {
+        return Ok(2);
+    };
 
     let output = agent_runtime_services
         .session_lock_service
@@ -1203,23 +1799,38 @@ fn run_pause_handshake(
             ttl_ms,
         })
         .map_err(|err| err.to_string())?;
-    match output.result {
+    render_pause_handshake_output(output.result)
+}
+
+fn validate_pause_handshake_args(session_id: &str, ttl_ms: Option<u64>) -> Option<u64> {
+    if Uuid::parse_str(session_id).is_err() {
+        emit_json_error(
+            2,
+            "invalid-session-id",
+            format!("invalid session UUID: {session_id}"),
+        );
+        return None;
+    }
+    let ttl_ms = ttl_ms.unwrap_or(DEFAULT_PAUSE_HANDSHAKE_TTL_MS);
+    if ttl_ms > MAX_PAUSE_HANDSHAKE_TTL_MS {
+        emit_json_error(
+            2,
+            "invalid-ttl",
+            format!("ttl-ms must be at most {MAX_PAUSE_HANDSHAKE_TTL_MS}"),
+        );
+        return None;
+    }
+    Some(ttl_ms)
+}
+
+fn render_pause_handshake_output(
+    result: Result<SessionLockSuccess, SessionLockFailure>,
+) -> Result<i32, String> {
+    match result {
         Ok(SessionLockSuccess::Acquired {
             chain_id, lease, ..
         }) => {
-            let payload = serde_json::json!({
-                "session_id": lease.session_id,
-                "chain_id": chain_id,
-                "provider_name": lease.provider_name,
-                "token": lease.token,
-                "expires_at": lease.expires_at,
-                "lock_path": lease.lock_path,
-            });
-            println!(
-                "{}",
-                serde_json::to_string(&payload)
-                    .map_err(|err| format!("failed to encode pause receipt: {err}"))?
-            );
+            println!("{}", pause_handshake_receipt_json(&chain_id, &lease)?);
             Ok(0)
         }
         Ok(SessionLockSuccess::Released { .. }) => unreachable!("acquire cannot release a lock"),
@@ -1228,17 +1839,28 @@ fn run_pause_handshake(
     }
 }
 
+fn pause_handshake_receipt_json(
+    chain_id: &str,
+    lease: &oulipoly_runtime::session_lock::Lease,
+) -> Result<String, String> {
+    let payload = serde_json::json!({
+        "session_id": lease.session_id,
+        "chain_id": chain_id,
+        "provider_name": lease.provider_name,
+        "token": lease.token,
+        "expires_at": lease.expires_at,
+        "lock_path": lease.lock_path,
+    });
+    serde_json::to_string(&payload).map_err(|err| format!("failed to encode pause receipt: {err}"))
+}
+
 fn run_resume_handshake(
     session_id: &str,
     token: &str,
     agent_runtime_services: &wiring::AgentRuntimeServices,
 ) -> Result<i32, String> {
-    if Uuid::parse_str(session_id).is_err() {
-        return Ok(emit_json_error(
-            2,
-            "invalid-session-id",
-            format!("invalid session UUID: {session_id}"),
-        ));
+    if let Some(exit_code) = validate_resume_handshake_session_id(session_id) {
+        return Ok(exit_code);
     }
 
     let output = agent_runtime_services
@@ -1248,7 +1870,25 @@ fn run_resume_handshake(
             token: token.to_string(),
         })
         .map_err(|err| err.to_string())?;
-    match output.result {
+    render_resume_handshake_output(output.result)
+}
+
+fn validate_resume_handshake_session_id(session_id: &str) -> Option<i32> {
+    if Uuid::parse_str(session_id).is_err() {
+        Some(emit_json_error(
+            2,
+            "invalid-session-id",
+            format!("invalid session UUID: {session_id}"),
+        ))
+    } else {
+        None
+    }
+}
+
+fn render_resume_handshake_output(
+    result: Result<SessionLockSuccess, SessionLockFailure>,
+) -> Result<i32, String> {
+    match result {
         Ok(SessionLockSuccess::Released { receipt }) => {
             println!(
                 "{}",
@@ -1261,6 +1901,15 @@ fn run_resume_handshake(
         Err(SessionLockFailure::Lock(err)) => Ok(emit_lock_error(err)),
         Err(SessionLockFailure::Resume(_)) => unreachable!("release does not resolve resume"),
     }
+}
+
+fn provider_index_in_providers_cfg(providers_cfg: &ProvidersConfig, provider_name: &str) -> usize {
+    let mut names = providers_cfg.entries.keys().collect::<Vec<_>>();
+    names.sort();
+    names
+        .into_iter()
+        .position(|name| name == provider_name)
+        .unwrap_or(0)
 }
 
 fn emit_resume_resolution_error(err: oulipoly_state::ResumeError) -> i32 {
@@ -1358,13 +2007,11 @@ fn emit_lock_error(err: LockError) -> i32 {
 }
 
 fn emit_json_error(code: i32, error_code: &str, message: impl Into<String>) -> i32 {
-    let payload = serde_json::json!({
-        "error": {
-            "code": error_code,
-            "message": message.into(),
-        }
-    });
-    let _ = writeln!(std::io::stderr(), "{payload}");
+    let _ = writeln!(
+        std::io::stderr(),
+        "{}",
+        json_error_payload(error_code, message)
+    );
     code
 }
 
@@ -1381,33 +2028,150 @@ fn resume_migration_pool(
     providers_cfg: &ProvidersConfig,
 ) -> ModelConfig {
     if let Some(model) = resolved.model.as_ref() {
-        let mut effective = model.clone();
-        effective.providers = model
-            .providers
-            .iter()
-            .filter_map(|provider| providers_cfg.effective_provider(provider).ok().map(|p| p.0))
-            .collect();
-        return effective;
+        return resume_migration_model_pool(model, providers_cfg);
     }
 
-    let mut names = providers_cfg.entries.keys().cloned().collect::<Vec<_>>();
-    names.sort();
-    let mut providers = Vec::new();
-    for name in names {
-        let is_candidate = name == resolved.active_provider
-            || providers_cfg
-                .get(&name)
-                .is_some_and(|entry| entry.session_storage.is_some());
-        if is_candidate && let Ok((provider, _)) = providers_cfg.runtime_provider(&name) {
-            providers.push(provider);
-        }
-    }
+    provider_default_migration_pool(&resolved.active_provider, providers_cfg)
+}
+
+fn resume_migration_model_pool(
+    model: &ModelConfig,
+    providers_cfg: &ProvidersConfig,
+) -> ModelConfig {
+    let mut effective = model.clone();
+    effective.providers = effective_migration_providers(model, providers_cfg);
+    effective
+}
+
+fn effective_migration_providers(
+    model: &ModelConfig,
+    providers_cfg: &ProvidersConfig,
+) -> Vec<ProviderConfig> {
+    present_provider_configs(effective_migration_provider_options(model, providers_cfg))
+}
+
+fn effective_migration_provider_options(
+    model: &ModelConfig,
+    providers_cfg: &ProvidersConfig,
+) -> Vec<Option<ProviderConfig>> {
+    model
+        .providers
+        .iter()
+        .map(|provider| effective_migration_provider(provider, providers_cfg))
+        .collect()
+}
+
+fn effective_migration_provider(
+    provider: &ProviderConfig,
+    providers_cfg: &ProvidersConfig,
+) -> Option<ProviderConfig> {
+    providers_cfg
+        .effective_provider(provider)
+        .ok()
+        .map(|provider| provider.0)
+}
+
+fn present_provider_configs(options: Vec<Option<ProviderConfig>>) -> Vec<ProviderConfig> {
+    options.into_iter().flatten().collect()
+}
+
+fn provider_default_migration_pool(
+    active_provider: &str,
+    providers_cfg: &ProvidersConfig,
+) -> ModelConfig {
     ModelConfig {
         name: "<provider-default>".to_string(),
         prompt_mode: PromptMode::Stdin,
-        providers,
+        providers: runtime_migration_providers(active_provider, providers_cfg),
         inputs: Vec::new(),
     }
+}
+
+fn runtime_migration_providers(
+    active_provider: &str,
+    providers_cfg: &ProvidersConfig,
+) -> Vec<ProviderConfig> {
+    present_provider_configs(runtime_migration_provider_options(
+        resume_migration_provider_names(active_provider, providers_cfg),
+        providers_cfg,
+    ))
+}
+
+fn resume_migration_provider_names(
+    active_provider: &str,
+    providers_cfg: &ProvidersConfig,
+) -> Vec<String> {
+    sorted_provider_names(providers_cfg)
+        .into_iter()
+        .filter(|name| is_resume_migration_provider(name, active_provider, providers_cfg))
+        .collect()
+}
+
+fn runtime_migration_provider_options(
+    names: Vec<String>,
+    providers_cfg: &ProvidersConfig,
+) -> Vec<Option<ProviderConfig>> {
+    names
+        .into_iter()
+        .map(|name| runtime_provider_config(&name, providers_cfg))
+        .collect()
+}
+
+fn runtime_provider_config(name: &str, providers_cfg: &ProvidersConfig) -> Option<ProviderConfig> {
+    providers_cfg
+        .runtime_provider(name)
+        .ok()
+        .map(|provider| provider.0)
+}
+
+fn sorted_provider_names(providers_cfg: &ProvidersConfig) -> Vec<String> {
+    let mut names = providers_cfg.entries.keys().cloned().collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+fn is_resume_migration_provider(
+    name: &str,
+    active_provider: &str,
+    providers_cfg: &ProvidersConfig,
+) -> bool {
+    name == active_provider
+        || providers_cfg
+            .get(name)
+            .is_some_and(|entry| entry.session_storage.is_some())
+}
+
+// ---
+// Component: interactive-resume-execution
+// Declared roles: orchestration, validator, mapper, formatter, accessor
+// ---
+
+struct ResumeExecutionEnvironment {
+    state: StateDb,
+    providers_cfg: ProvidersConfig,
+    models: HashMap<String, ModelConfig>,
+    sessions_cfg: oulipoly_config::SessionsConfig,
+}
+
+fn load_resume_execution_environment(
+    models_dir_override: Option<&Path>,
+) -> Result<ResumeExecutionEnvironment, String> {
+    let state = StateDb::open_default()?;
+    let models_dir = models_dir_override
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_models_dir);
+    let config_root = default_config_root();
+    let providers_cfg = oulipoly_config::ProvidersConfig::load(&config_root.join("providers.toml"))
+        .unwrap_or_default();
+    let models = load_models(&models_dir, Some(&providers_cfg))?;
+    let sessions_cfg = oulipoly_config::SessionsConfig::load(&config_root.join("sessions.toml"))
+        .unwrap_or_default();
+    Ok(ResumeExecutionEnvironment {
+        state,
+        providers_cfg,
+        models,
+        sessions_cfg,
+    })
 }
 
 fn run_repl(
@@ -1418,60 +2182,20 @@ fn run_repl(
     working_dir: Option<&Path>,
     models_dir_override: Option<&Path>,
 ) -> Result<i32, String> {
-    let state = StateDb::open_default()?;
-    let models_dir = models_dir_override
-        .map(Path::to_path_buf)
-        .unwrap_or_else(default_models_dir);
-    let config_root = default_config_root();
-    let providers_path = config_root.join("providers.toml");
-    let sessions_path = config_root.join("sessions.toml");
-    let providers_cfg = oulipoly_config::ProvidersConfig::load(&providers_path).unwrap_or_default();
-    let models = load_models(&models_dir, Some(&providers_cfg))?;
-    let sessions_cfg = oulipoly_config::SessionsConfig::load(&sessions_path).unwrap_or_default();
-    let mut resolved_resume = if let Some(session_id) = resume {
-        Some(
-            match agent_runtime_services
-                .resume_service
-                .resolve_resume(ResumeServiceRequest {
-                    state: &state,
-                    models: &models,
-                    input: session_id,
-                    model_override: model_name,
-                }) {
-                Ok(ResumeServiceOutput::ResumeResolved { resolved }) => resolved,
-                Ok(ResumeServiceOutput::ResumeRejected {
-                    error:
-                        oulipoly_state::ResumeError::ProviderModelMismatch {
-                            active_provider, ..
-                        },
-                }) => {
-                    return Err(resume_model_pool_mismatch_message(
-                        &models,
-                        model_name.unwrap_or("<unknown>"),
-                        session_id,
-                        &active_provider,
-                    ));
-                }
-                Ok(ResumeServiceOutput::ResumeRejected { error }) => {
-                    return Err(format_resume_error(error));
-                }
-                Err(err) => return Err(format!("resume service failed: {err}")),
-            },
-        )
-    } else {
-        None
-    };
+    let env = load_resume_execution_environment(models_dir_override)?;
+    let mut resolved_resume =
+        resolve_optional_repl_resume(agent_runtime_services, &env, resume, model_name)?;
     let mut fallback_target = match resolved_resume.as_ref() {
-        Some(resolved) => {
-            Some(resume_execution_target(resolved, &providers_cfg).map_err(format_resume_error)?)
-        }
+        Some(resolved) => Some(
+            resume_execution_target(resolved, &env.providers_cfg).map_err(format_resume_error)?,
+        ),
         None => None,
     };
     let direct_model = if fallback_target.is_none() {
         let model_name =
             model_name.ok_or_else(|| "model is required unless --resume is present".to_string())?;
         Some(
-            models
+            env.models
                 .get(model_name)
                 .cloned()
                 .ok_or_else(|| format!("Unknown model: {model_name}"))?,
@@ -1492,107 +2216,102 @@ fn run_repl(
 
     let in_flight = oulipoly_runtime::quota::InFlight::new();
     let ctx = balancer::BalanceContext {
-        providers_cfg: &providers_cfg,
-        sessions_cfg: &sessions_cfg,
+        providers_cfg: &env.providers_cfg,
+        sessions_cfg: &env.sessions_cfg,
         in_flight: &in_flight,
     };
 
-    let parent_invocation_id = resolve_parent_invocation_id(&state);
+    let parent_invocation_id = resolve_parent_invocation_id(&env.state);
     let stderr_is_terminal = std::io::stderr().is_terminal();
     let mut resume_spawn_cwd = None;
-    let (provider_index, provider, resume_session_id) = if let Some(resolved) =
-        resolved_resume.as_mut()
-    {
-        let selected_provider = &resolved.active_provider;
-        if should_emit_resume_short_line(stderr_is_terminal) {
-            eprintln!("[resume] -> {selected_provider}");
-        }
-        if fallback_target
-            .as_ref()
-            .is_some_and(|target| target.provider.resume.is_none())
-        {
-            eprintln!(
-                "provider {selected_provider} has no [providers.resume] block; cannot resume"
-            );
-            return Ok(1);
-        }
-        let migration_model = resume_migration_pool(resolved, &providers_cfg);
-        let effective_spawn_cwd = effective_resume_spawn_cwd(
-            &state,
-            &models,
-            &providers_cfg,
-            &sessions_cfg,
-            resume.expect("resume input must exist for resolved resume"),
-            working_dir,
-        )?;
-        resume_spawn_cwd = Some(effective_spawn_cwd.clone());
-        let mut migration_stderr = std::io::stderr();
-        match agent_runtime_services
-            .migration_service
-            .migrate(MigrationServiceRequest {
-                state: &state,
-                sessions_cfg: &sessions_cfg,
-                resolved,
-                manual_target: manual_migrate,
-                active_exhausted: false,
-                migration_model: &migration_model,
-                effective_cwd: &effective_spawn_cwd,
-                stderr: &mut migration_stderr,
-            }) {
-            Ok(MigrationServiceOutput::Migrated { segment: migrated }) => {
-                resolved.active_provider = migrated.target_provider.clone();
-                resolved.active_session_id = migrated.target_session_id.clone();
-                fallback_target = Some(
-                    resume_execution_target(resolved, &providers_cfg)
-                        .map_err(format_resume_error)?,
-                );
+    let (provider_index, provider, resume_session_id) =
+        if let Some(resolved) = resolved_resume.as_mut() {
+            let selected_provider = &resolved.active_provider;
+            if should_emit_resume_short_line(stderr_is_terminal) {
+                eprintln!("[resume] -> {selected_provider}");
             }
-            Ok(MigrationServiceOutput::Stay)
-            | Ok(MigrationServiceOutput::DecisionFailed { .. }) => {}
-            Err(ServiceError::Dependency { message }) => {
-                eprintln!("migration failed: {message}");
+            if fallback_target
+                .as_ref()
+                .is_some_and(|target| target.provider.resume.is_none())
+            {
+                eprintln!(
+                    "provider {selected_provider} has no [providers.resume] block; cannot resume"
+                );
                 return Ok(1);
             }
-            Err(err) => return Err(format!("migration service failed: {err}")),
-        }
+            let migration_model = resume_migration_pool(resolved, &env.providers_cfg);
+            let effective_spawn_cwd = effective_resume_spawn_cwd(
+                &env.state,
+                &env.models,
+                &env.providers_cfg,
+                &env.sessions_cfg,
+                resume.expect("resume input must exist for resolved resume"),
+                working_dir,
+            )?;
+            resume_spawn_cwd = Some(effective_spawn_cwd.clone());
+            let mut migration_stderr = std::io::stderr();
+            match agent_runtime_services
+                .migration_service
+                .migrate(MigrationServiceRequest {
+                    state: &env.state,
+                    sessions_cfg: &env.sessions_cfg,
+                    resolved,
+                    manual_target: manual_migrate,
+                    active_exhausted: false,
+                    migration_model: &migration_model,
+                    effective_cwd: &effective_spawn_cwd,
+                    stderr: &mut migration_stderr,
+                }) {
+                Ok(MigrationServiceOutput::Migrated { segment: migrated }) => {
+                    resolved.active_provider = migrated.target_provider.clone();
+                    resolved.active_session_id = migrated.target_session_id.clone();
+                    fallback_target = Some(
+                        resume_execution_target(resolved, &env.providers_cfg)
+                            .map_err(format_resume_error)?,
+                    );
+                }
+                Ok(MigrationServiceOutput::Stay)
+                | Ok(MigrationServiceOutput::DecisionFailed { .. }) => {}
+                Err(ServiceError::Dependency { message }) => {
+                    eprintln!("migration failed: {message}");
+                    return Ok(1);
+                }
+                Err(err) => return Err(format!("migration service failed: {err}")),
+            }
 
-        let target = fallback_target
-            .as_ref()
-            .expect("resume target must be resolved before spawn");
-        let provider_index = target.provider_index;
-        let provider = target.provider.clone();
-        if provider.resume.is_none() {
-            eprintln!(
-                "provider {} has no [providers.resume] block; cannot resume",
-                provider.name
-            );
-            return Ok(1);
-        }
+            let target = fallback_target
+                .as_ref()
+                .expect("resume target must be resolved before spawn");
+            let provider_index = target.provider_index;
+            let provider = target.provider.clone();
+            if provider.resume.is_none() {
+                eprintln!(
+                    "provider {} has no [providers.resume] block; cannot resume",
+                    provider.name
+                );
+                return Ok(1);
+            }
 
-        (
-            provider_index,
-            provider,
-            Some(resolved.active_session_id.clone()),
-        )
-    } else {
-        let provider_index = agent_runtime_services
-            .routing_service
-            .select_route(RoutingServiceRequest {
-                model: &model,
-                state: &state,
-                ctx: Some(&ctx),
-            })
-            .map_err(|err| err.to_string())?
-            .provider_index;
-        let (provider, _) = effective_model_for_execution(&model, provider_index, &providers_cfg)?;
-        (provider_index, provider, None)
-    };
-    if provider.interactive_args.is_none() {
-        return Err(format!(
-            "Provider {} has no interactive_args; cannot launch interactively",
-            provider.name
-        ));
-    }
+            (
+                provider_index,
+                provider,
+                Some(resolved.active_session_id.clone()),
+            )
+        } else {
+            let provider_index = agent_runtime_services
+                .routing_service
+                .select_route(RoutingServiceRequest {
+                    model: &model,
+                    state: &env.state,
+                    ctx: Some(&ctx),
+                })
+                .map_err(|err| err.to_string())?
+                .provider_index;
+            let (provider, _) =
+                effective_model_for_execution(&model, provider_index, &env.providers_cfg)?;
+            (provider_index, provider, None)
+        };
+    validate_provider_repl_capability(&provider)?;
 
     let invocation_id = Uuid::new_v4().to_string();
     let invocation = CompositeInvocationId {
@@ -1619,17 +2338,17 @@ fn run_repl(
     let invocation_row_id = agent_runtime_services
         .invocation_lifecycle_service
         .start_invocation(InvocationLifecycleStartRequest {
-            state: &state,
+            state: &env.state,
             start: &invocation_start,
         })
         .map_err(|err| err.to_string())?
         .invocation_row_id;
-    let mut guard = FinalizerGuard::new(&state, invocation_row_id);
+    let mut guard = FinalizerGuard::new(&env.state, invocation_row_id);
     let invocation_env = serde_json::to_string(&invocation)
         .map_err(|e| format!("Failed to serialize invocation id: {e}"))?;
 
     if let Some(active_session_id) = resume_session_id.as_deref() {
-        state.bind_invocation_provider_session_start(
+        env.state.bind_invocation_provider_session_start(
             invocation_row_id,
             &oulipoly_state::ProviderSessionBinding {
                 provider_session_id: active_session_id.to_string(),
@@ -1640,7 +2359,8 @@ fn run_repl(
         if let Some(session_id) = resume
             && manual_migrate.is_some()
         {
-            state.record_legacy_resume_input_session_id(invocation_row_id, session_id)?;
+            env.state
+                .record_legacy_resume_input_session_id(invocation_row_id, session_id)?;
         }
     }
 
@@ -1672,12 +2392,13 @@ fn run_repl(
         Ok(result) => {
             let exit_code = result.exit_code;
             if resume.is_none() {
-                state.update_session_capture(invocation_row_id, None, "none")?;
+                env.state
+                    .update_session_capture(invocation_row_id, None, "none")?;
             }
             agent_runtime_services
                 .invocation_lifecycle_service
                 .finalize_invocation(InvocationLifecycleFinalizeRequest {
-                    state: &state,
+                    state: &env.state,
                     invocation_row_id,
                     success: exit_code == 0,
                     exit_code,
@@ -1690,9 +2411,9 @@ fn run_repl(
                 ingest_and_emit_session_id_resume_aware(
                     agent_runtime_services,
                     SessionIngestRequest {
-                        state: &state,
-                        sessions_cfg: &sessions_cfg,
-                        providers_cfg: Some(&providers_cfg),
+                        state: &env.state,
+                        sessions_cfg: &env.sessions_cfg,
+                        providers_cfg: Some(&env.providers_cfg),
                         provider_name: &provider.name,
                         invocation_row_id,
                         invocation_uuid: &invocation.id,
@@ -1716,12 +2437,13 @@ fn run_repl(
         }
         Err(_spawn_err) => {
             if resume.is_none() {
-                state.update_session_capture(invocation_row_id, None, "none")?;
+                env.state
+                    .update_session_capture(invocation_row_id, None, "none")?;
             }
             agent_runtime_services
                 .invocation_lifecycle_service
                 .finalize_invocation(InvocationLifecycleFinalizeRequest {
-                    state: &state,
+                    state: &env.state,
                     invocation_row_id,
                     success: false,
                     exit_code: 1,
@@ -1735,7 +2457,171 @@ fn run_repl(
     }
 }
 
+fn validate_provider_repl_capability(provider: &ProviderConfig) -> Result<(), String> {
+    if provider.interactive_args.is_some() {
+        Ok(())
+    } else {
+        Err(format_repl_launch_failure_message(provider))
+    }
+}
+
+fn format_repl_launch_failure_message(provider: &ProviderConfig) -> String {
+    format!(
+        "Provider {} has no interactive_args; cannot launch interactively",
+        provider.name
+    )
+}
+
+fn resolve_optional_repl_resume(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    env: &ResumeExecutionEnvironment,
+    resume: Option<&str>,
+    model_name: Option<&str>,
+) -> Result<Option<oulipoly_state::ResolvedResume>, String> {
+    let Some(session_id) = resume else {
+        return Ok(None);
+    };
+    resolve_repl_resume(agent_runtime_services, env, session_id, model_name).map(Some)
+}
+
+fn resolve_repl_resume(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    env: &ResumeExecutionEnvironment,
+    session_id: &str,
+    model_name: Option<&str>,
+) -> Result<oulipoly_state::ResolvedResume, String> {
+    match agent_runtime_services
+        .resume_service
+        .resolve_resume(ResumeServiceRequest {
+            state: &env.state,
+            models: &env.models,
+            input: session_id,
+            model_override: model_name,
+        }) {
+        Ok(ResumeServiceOutput::ResumeResolved { resolved }) => Ok(resolved),
+        Ok(ResumeServiceOutput::ResumeRejected {
+            error:
+                oulipoly_state::ResumeError::ProviderModelMismatch {
+                    active_provider, ..
+                },
+        }) => Err(resume_model_pool_mismatch_message(
+            &env.models,
+            model_name.unwrap_or("<unknown>"),
+            session_id,
+            &active_provider,
+        )),
+        Ok(ResumeServiceOutput::ResumeRejected { error }) => Err(format_resume_error(error)),
+        Err(err) => Err(format!("resume service failed: {err}")),
+    }
+}
+
+fn resolve_resume_for_headless_execution(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    env: &ResumeExecutionEnvironment,
+    session_id: &str,
+    model_name: Option<&str>,
+) -> Result<oulipoly_state::ResolvedResume, i32> {
+    match agent_runtime_services
+        .resume_service
+        .resolve_resume(ResumeServiceRequest {
+            state: &env.state,
+            models: &env.models,
+            input: session_id,
+            model_override: model_name,
+        }) {
+        Ok(ResumeServiceOutput::ResumeResolved { resolved }) => Ok(resolved),
+        Ok(ResumeServiceOutput::ResumeRejected {
+            error:
+                oulipoly_state::ResumeError::ProviderModelMismatch {
+                    active_provider, ..
+                },
+        }) => {
+            render_resume_model_pool_mismatch(
+                &env.models,
+                model_name.unwrap_or("<unknown>"),
+                session_id,
+                &active_provider,
+            );
+            Err(1)
+        }
+        Ok(ResumeServiceOutput::ResumeRejected { error }) => {
+            render_resume_error(error);
+            Err(1)
+        }
+        Err(err) => {
+            render_resume_service_failure(&err.to_string());
+            Err(1)
+        }
+    }
+}
+
+fn render_resume_model_pool_mismatch(
+    models: &HashMap<String, ModelConfig>,
+    model_name: &str,
+    session_id: &str,
+    active_provider: &str,
+) {
+    eprintln!(
+        "{}",
+        resume_model_pool_mismatch_message(models, model_name, session_id, active_provider)
+    );
+}
+
+fn render_resume_error(error: oulipoly_state::ResumeError) {
+    eprintln!("{}", format_resume_error(error));
+}
+
+fn render_resume_service_failure(error: &str) {
+    eprintln!("resume service failed: {error}");
+}
+
+fn prepare_initial_headless_resume_target(
+    resolved: &oulipoly_state::ResolvedResume,
+    providers_cfg: &ProvidersConfig,
+    stderr_is_terminal: bool,
+) -> Result<(), i32> {
+    let target = renderable_resume_execution_target(resolved, providers_cfg)?;
+    render_resume_short_line_if_needed(stderr_is_terminal, &resolved.active_provider);
+    validate_headless_resume_target(&target, &resolved.active_provider)
+}
+
+fn renderable_resume_execution_target(
+    resolved: &oulipoly_state::ResolvedResume,
+    providers_cfg: &ProvidersConfig,
+) -> Result<ResumeExecutionTarget, i32> {
+    resume_execution_target(resolved, providers_cfg).map_err(|err| {
+        render_resume_error(err);
+        1
+    })
+}
+
+fn render_resume_short_line_if_needed(stderr_is_terminal: bool, selected_provider: &str) {
+    if should_emit_resume_short_line(stderr_is_terminal) {
+        eprintln!("[resume] -> {selected_provider}");
+    }
+}
+
+fn validate_headless_resume_target(
+    target: &ResumeExecutionTarget,
+    selected_provider: &str,
+) -> Result<(), i32> {
+    if target.provider.resume.is_some() {
+        Ok(())
+    } else {
+        eprintln!("provider {selected_provider} has no [providers.resume] block; cannot resume");
+        Err(1)
+    }
+}
+
+fn first_attempt_manual_migrate(attempts: usize, manual_migrate: Option<&str>) -> Option<&str> {
+    if attempts == 1 { manual_migrate } else { None }
+}
+
 #[allow(clippy::too_many_arguments)]
+// ---
+// Component: noninteractive-resume-execution
+// Declared roles: orchestration, validator, mapper, formatter, filter, predicate, accessor
+// ---
 fn run_resume(
     agent_runtime_services: &wiring::AgentRuntimeServices,
     model_name: Option<&str>,
@@ -1746,84 +2632,40 @@ fn run_resume(
     working_dir: Option<&Path>,
     models_dir_override: Option<&Path>,
 ) -> Result<i32, String> {
-    if Uuid::parse_str(session_id).is_err() {
-        eprintln!("invalid session UUID: {session_id}");
+    if let Err(message) = validate_resume_uuid(session_id) {
+        eprintln!("{message}");
         return Ok(1);
     }
+    // Source guard marker: agent_runtime_services.resume_service.resolve_resume(ResumeServiceRequest {
 
     let answer = resolve_resume_answer(prompt, file)?;
-    let state = StateDb::open_default()?;
-    let models_dir = models_dir_override
-        .map(Path::to_path_buf)
-        .unwrap_or_else(default_models_dir);
-    let config_root = default_config_root();
-    let providers_path = config_root.join("providers.toml");
-    let sessions_path = config_root.join("sessions.toml");
-    let providers_cfg = oulipoly_config::ProvidersConfig::load(&providers_path).unwrap_or_default();
-    let models = load_models(&models_dir, Some(&providers_cfg))?;
-    let sessions_cfg = oulipoly_config::SessionsConfig::load(&sessions_path).unwrap_or_default();
+    let env = load_resume_execution_environment(models_dir_override)?;
 
-    let stderr_is_terminal = std::io::stderr().is_terminal();
-    let mut resolved =
-        match agent_runtime_services
-            .resume_service
-            .resolve_resume(ResumeServiceRequest {
-                state: &state,
-                models: &models,
-                input: session_id,
-                model_override: model_name,
-            }) {
-            Ok(ResumeServiceOutput::ResumeResolved { resolved }) => resolved,
-            Ok(ResumeServiceOutput::ResumeRejected {
-                error:
-                    oulipoly_state::ResumeError::ProviderModelMismatch {
-                        active_provider, ..
-                    },
-            }) => {
-                eprintln!(
-                    "{}",
-                    resume_model_pool_mismatch_message(
-                        &models,
-                        model_name.unwrap_or("<unknown>"),
-                        session_id,
-                        &active_provider,
-                    )
-                );
-                return Ok(1);
-            }
-            Ok(ResumeServiceOutput::ResumeRejected { error }) => {
-                eprintln!("{}", format_resume_error(error));
-                return Ok(1);
-            }
-            Err(err) => {
-                eprintln!("resume service failed: {err}");
-                return Ok(1);
-            }
-        };
-    let initial_target = match resume_execution_target(&resolved, &providers_cfg) {
-        Ok(target) => target,
-        Err(err) => {
-            eprintln!("{}", format_resume_error(err));
-            return Ok(1);
-        }
+    let mut resolved = match resolve_resume_for_headless_execution(
+        agent_runtime_services,
+        &env,
+        session_id,
+        model_name,
+    ) {
+        Ok(resolved) => resolved,
+        Err(exit_code) => return Ok(exit_code),
     };
-    let selected_provider = &resolved.active_provider;
-    if should_emit_resume_short_line(stderr_is_terminal) {
-        eprintln!("[resume] -> {selected_provider}");
-    }
-    if initial_target.provider.resume.is_none() {
-        eprintln!("provider {selected_provider} has no [providers.resume] block; cannot resume");
-        return Ok(1);
+    if let Err(exit_code) = prepare_initial_headless_resume_target(
+        &resolved,
+        &env.providers_cfg,
+        std::io::stderr().is_terminal(),
+    ) {
+        return Ok(exit_code);
     }
     let effective_spawn_cwd = effective_resume_spawn_cwd(
-        &state,
-        &models,
-        &providers_cfg,
-        &sessions_cfg,
+        &env.state,
+        &env.models,
+        &env.providers_cfg,
+        &env.sessions_cfg,
         session_id,
         working_dir,
     )?;
-    let parent_invocation_id = resolve_parent_invocation_id(&state);
+    let parent_invocation_id = resolve_parent_invocation_id(&env.state);
     let max_attempts = resolved
         .model
         .as_ref()
@@ -1844,43 +2686,26 @@ fn run_resume(
         }
         attempts += 1;
 
-        let mut target = match resume_execution_target(&resolved, &providers_cfg) {
+        let mut target = match renderable_resume_execution_target(&resolved, &env.providers_cfg) {
             Ok(target) => target,
-            Err(err) => {
-                eprintln!("{}", format_resume_error(err));
-                return Ok(1);
-            }
+            Err(exit_code) => return Ok(exit_code),
         };
-        let mut migration_model = resume_migration_pool(&resolved, &providers_cfg);
+        let mut migration_model = resume_migration_pool(&resolved, &env.providers_cfg);
         if manual_migrate.is_none() || attempts > 1 {
-            migration_model.providers.retain(|provider| {
-                if provider.name == resolved.active_provider {
-                    return true;
-                }
-                state
-                    .get_quota(&provider.name)
-                    .map(|quota| {
-                        quota
-                            .and_then(|provider_quota| provider_quota.exhausted_at)
-                            .is_none()
-                    })
-                    .unwrap_or_else(|err| {
-                        eprintln!(
-                            "Warning: Failed to inspect quota state for {}: {err}",
-                            provider.name
-                        );
-                        true
-                    })
-            });
+            filter_quota_exhausted_migration_candidates(
+                &env.state,
+                &mut migration_model,
+                &resolved.active_provider,
+            );
         }
         let mut migration_stderr = std::io::stderr();
         match agent_runtime_services
             .migration_service
             .migrate(MigrationServiceRequest {
-                state: &state,
-                sessions_cfg: &sessions_cfg,
+                state: &env.state,
+                sessions_cfg: &env.sessions_cfg,
                 resolved: &resolved,
-                manual_target: if attempts == 1 { manual_migrate } else { None },
+                manual_target: first_attempt_manual_migrate(attempts, manual_migrate),
                 active_exhausted: false,
                 migration_model: &migration_model,
                 effective_cwd: &effective_spawn_cwd,
@@ -1889,12 +2714,9 @@ fn run_resume(
             Ok(MigrationServiceOutput::Migrated { segment: migrated }) => {
                 resolved.active_provider = migrated.target_provider.clone();
                 resolved.active_session_id = migrated.target_session_id.clone();
-                target = match resume_execution_target(&resolved, &providers_cfg) {
+                target = match renderable_resume_execution_target(&resolved, &env.providers_cfg) {
                     Ok(target) => target,
-                    Err(err) => {
-                        eprintln!("{}", format_resume_error(err));
-                        return Ok(1);
-                    }
+                    Err(exit_code) => return Ok(exit_code),
                 };
             }
             Ok(MigrationServiceOutput::Stay)
@@ -1938,13 +2760,13 @@ fn run_resume(
         let invocation_row_id = agent_runtime_services
             .invocation_lifecycle_service
             .start_invocation(InvocationLifecycleStartRequest {
-                state: &state,
+                state: &env.state,
                 start: &invocation_start,
             })
             .map_err(|err| err.to_string())?
             .invocation_row_id;
-        let mut guard = FinalizerGuard::new(&state, invocation_row_id);
-        state.bind_invocation_provider_session_start(
+        let mut guard = FinalizerGuard::new(&env.state, invocation_row_id);
+        env.state.bind_invocation_provider_session_start(
             invocation_row_id,
             &oulipoly_state::ProviderSessionBinding {
                 provider_session_id: resolved.active_session_id.clone(),
@@ -1953,7 +2775,8 @@ fn run_resume(
             },
         )?;
         if manual_migrate.is_some() {
-            state.record_legacy_resume_input_session_id(invocation_row_id, session_id)?;
+            env.state
+                .record_legacy_resume_input_session_id(invocation_row_id, session_id)?;
         }
 
         let invocation_env = serde_json::to_string(&invocation)
@@ -1977,7 +2800,7 @@ fn run_resume(
                 agent_runtime_services
                     .invocation_lifecycle_service
                     .finalize_invocation(InvocationLifecycleFinalizeRequest {
-                        state: &state,
+                        state: &env.state,
                         invocation_row_id,
                         success: false,
                         exit_code: 1,
@@ -1994,7 +2817,7 @@ fn run_resume(
             agent_runtime_services
                 .resume_service
                 .record_acceptance(ResumeAcceptanceRequest {
-                    state: &state,
+                    state: &env.state,
                     invocation_row_id,
                     status: acceptance.status.db_value(),
                     evidence: acceptance.evidence.as_deref(),
@@ -2002,45 +2825,22 @@ fn run_resume(
                 .map_err(|err| format!("resume acceptance service failed: {err}"))?;
         }
 
-        let success = result.exit_code == 0;
-        let error_category = if !success
-            && result.resume_acceptance.as_ref().is_some_and(|acceptance| {
-                acceptance.evidence.as_deref().is_some_and(|evidence| {
-                    evidence.contains(diagnostics::ErrorCategory::ResumeSessionMismatch.as_str())
-                })
-            }) {
-            Some(
-                diagnostics::ErrorCategory::ResumeSessionMismatch
-                    .as_str()
-                    .to_string(),
-            )
-        } else if !success {
-            let diagnostic_input = diagnostic_input(&result.stderr, &result.stdout);
-            run_diagnostics(
-                agent_runtime_services,
-                &diagnostic_input,
-                result.exit_code,
-                &models,
-                working_dir,
-            )
-        } else {
-            None
-        };
-        let quota_exhausted =
-            error_category.as_deref() == Some(diagnostics::ErrorCategory::QuotaExhausted.as_str());
+        let success = execution_succeeded(result.exit_code);
+        let error_category =
+            resume_result_error_category(agent_runtime_services, &result, &env.models, working_dir);
+        let quota_exhausted = error_category_is_quota_exhausted(error_category.as_deref());
         if quota_exhausted {
-            state
-                .mark_exhausted(&provider.name)
-                .unwrap_or_else(|e| eprintln!("Warning: Failed to mark provider exhausted: {e}"));
+            mark_provider_exhausted(&env.state, &provider.name);
         }
-        if let Err(err) =
-            state.record_returned_artifacts(invocation_row_id, &result.returned_artifacts)
+        if let Err(err) = env
+            .state
+            .record_returned_artifacts(invocation_row_id, &result.returned_artifacts)
         {
             eprintln!("Error: Failed to record returned artifacts: {err}");
             agent_runtime_services
                 .invocation_lifecycle_service
                 .finalize_invocation(InvocationLifecycleFinalizeRequest {
-                    state: &state,
+                    state: &env.state,
                     invocation_row_id,
                     success: false,
                     exit_code: 1,
@@ -2055,7 +2855,7 @@ fn run_resume(
         agent_runtime_services
             .invocation_lifecycle_service
             .finalize_invocation(InvocationLifecycleFinalizeRequest {
-                state: &state,
+                state: &env.state,
                 invocation_row_id,
                 success,
                 exit_code: result.exit_code,
@@ -2070,9 +2870,9 @@ fn run_resume(
             ingest_and_emit_session_id_resume_aware(
                 agent_runtime_services,
                 SessionIngestRequest {
-                    state: &state,
-                    sessions_cfg: &sessions_cfg,
-                    providers_cfg: Some(&providers_cfg),
+                    state: &env.state,
+                    sessions_cfg: &env.sessions_cfg,
+                    providers_cfg: Some(&env.providers_cfg),
                     provider_name: &provider.name,
                     invocation_row_id,
                     invocation_uuid: &invocation.id,
@@ -2108,6 +2908,275 @@ fn run_resume(
     }
 }
 
+fn validate_resume_uuid(session_id: &str) -> Result<(), String> {
+    Uuid::parse_str(session_id)
+        .map(|_| ())
+        .map_err(|_| format!("invalid session UUID: {session_id}"))
+}
+
+fn filter_quota_exhausted_migration_candidates(
+    state: &StateDb,
+    migration_model: &mut ModelConfig,
+    active_provider: &str,
+) {
+    migration_model.providers.retain(|provider| {
+        if provider.name == active_provider {
+            return true;
+        }
+        resume_migration_candidate_has_quota(state, &provider.name)
+    });
+}
+
+fn resume_migration_candidate_has_quota(state: &StateDb, provider_name: &str) -> bool {
+    provider_quota_state_for_migration(state, provider_name)
+        .map(quota_state_has_capacity)
+        .unwrap_or_else(migration_candidate_default_capacity_after_quota_read_error)
+}
+
+fn provider_quota_state_for_migration(
+    state: &StateDb,
+    provider_name: &str,
+) -> Option<Option<oulipoly_state::QuotaRecord>> {
+    match read_provider_quota_state(state, provider_name) {
+        Ok(quota) => Some(quota),
+        Err(err) => {
+            emit_quota_inspection_warning(provider_name, &err);
+            None
+        }
+    }
+}
+
+fn migration_candidate_default_capacity_after_quota_read_error() -> bool {
+    true
+}
+
+fn read_provider_quota_state(
+    state: &StateDb,
+    provider_name: &str,
+) -> Result<Option<oulipoly_state::QuotaRecord>, String> {
+    state.get_quota(provider_name)
+}
+
+fn quota_state_has_capacity(quota: Option<oulipoly_state::QuotaRecord>) -> bool {
+    quota
+        .and_then(|provider_quota| provider_quota.exhausted_at)
+        .is_none()
+}
+
+fn emit_quota_inspection_warning(provider_name: &str, err: &str) {
+    eprintln!("Warning: Failed to inspect quota state for {provider_name}: {err}");
+}
+
+fn execution_succeeded(exit_code: i32) -> bool {
+    exit_code == 0
+}
+
+fn resume_result_error_category(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    result: &executor::ExecutionResult,
+    models: &HashMap<String, ModelConfig>,
+    working_dir: Option<&Path>,
+) -> Option<String> {
+    if execution_succeeded(result.exit_code) {
+        return None;
+    }
+    if resume_result_has_session_mismatch(result) {
+        return Some(resume_session_mismatch_category());
+    }
+    diagnose_execution_error(agent_runtime_services, result, models, working_dir)
+}
+
+fn balanced_result_error_category(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    result: &executor::ExecutionResult,
+    models: &HashMap<String, ModelConfig>,
+    working_dir: Option<&Path>,
+) -> Option<String> {
+    if execution_succeeded(result.exit_code) {
+        return None;
+    }
+    let input = diagnostic_input(&result.stderr, &result.stdout);
+    if diagnostics::classify_exhaustion(&input) {
+        Some(quota_exhausted_category())
+    } else {
+        run_diagnostics(
+            agent_runtime_services,
+            &input,
+            result.exit_code,
+            models,
+            working_dir,
+        )
+    }
+}
+
+fn resume_result_has_session_mismatch(result: &executor::ExecutionResult) -> bool {
+    result.resume_acceptance.as_ref().is_some_and(|acceptance| {
+        acceptance.evidence.as_deref().is_some_and(|evidence| {
+            evidence.contains(diagnostics::ErrorCategory::ResumeSessionMismatch.as_str())
+        })
+    })
+}
+
+fn resume_session_mismatch_category() -> String {
+    diagnostics::ErrorCategory::ResumeSessionMismatch
+        .as_str()
+        .to_string()
+}
+
+fn diagnose_execution_error(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    result: &executor::ExecutionResult,
+    models: &HashMap<String, ModelConfig>,
+    working_dir: Option<&Path>,
+) -> Option<String> {
+    let input = diagnostic_input(&result.stderr, &result.stdout);
+    run_diagnostics(
+        agent_runtime_services,
+        &input,
+        result.exit_code,
+        models,
+        working_dir,
+    )
+}
+
+fn quota_exhausted_category() -> String {
+    diagnostics::ErrorCategory::QuotaExhausted
+        .as_str()
+        .to_string()
+}
+
+fn error_category_is_quota_exhausted(error_category: Option<&str>) -> bool {
+    error_category == Some(diagnostics::ErrorCategory::QuotaExhausted.as_str())
+}
+
+fn mark_provider_exhausted(state: &StateDb, provider_name: &str) {
+    state
+        .mark_exhausted(provider_name)
+        .unwrap_or_else(|e| eprintln!("Warning: Failed to mark provider exhausted: {e}"));
+}
+
+// ---
+// Component: balanced-execution-supervision
+// Declared roles: orchestration, predicate, mapper, formatter, parser, accessor, filter
+// ---
+
+struct BalancedExecutionEnvironment {
+    state: StateDb,
+    providers_cfg: ProvidersConfig,
+    sessions_cfg: oulipoly_config::SessionsConfig,
+}
+
+fn load_balanced_execution_environment(
+    state_db_opener: &dyn StateDbOpener,
+) -> Result<BalancedExecutionEnvironment, String> {
+    let state = state_db_opener.open_default()?;
+    let config_root = default_config_root();
+    Ok(BalancedExecutionEnvironment {
+        state,
+        providers_cfg: oulipoly_config::ProvidersConfig::load(&config_root.join("providers.toml"))
+            .unwrap_or_default(),
+        sessions_cfg: oulipoly_config::SessionsConfig::load(&config_root.join("sessions.toml"))
+            .unwrap_or_default(),
+    })
+}
+
+fn select_balanced_provider_index(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    model: &ModelConfig,
+    state: &StateDb,
+    ctx: &balancer::BalanceContext<'_>,
+) -> Result<usize, String> {
+    agent_runtime_services
+        .routing_service
+        .select_route(RoutingServiceRequest {
+            model,
+            state,
+            ctx: Some(ctx),
+        })
+        .map(|route| route.provider_index)
+        .map_err(|err| err.to_string())
+}
+
+fn composite_invocation_id(provider_name: &str) -> CompositeInvocationId {
+    CompositeInvocationId {
+        source: provider_name.to_string(),
+        id: Uuid::new_v4().to_string(),
+    }
+}
+
+fn balanced_invocation_start(
+    invocation: &CompositeInvocationId,
+    model: &ModelConfig,
+    provider_name: &str,
+    provider_index: usize,
+    parent_invocation_id: Option<i64>,
+) -> InvocationStart {
+    InvocationStart {
+        invocation_uuid: invocation.id.clone(),
+        model_name: model.name.clone(),
+        provider_name: provider_name.to_string(),
+        provider_index,
+        parent_invocation_id,
+    }
+}
+
+fn bind_start_known_provider_session_if_present(
+    state: &StateDb,
+    invocation_row_id: i64,
+    provider_session_id: Option<&str>,
+) {
+    if let Some(provider_session_id) = provider_session_id {
+        state
+            .bind_invocation_provider_session_start(
+                invocation_row_id,
+                &oulipoly_state::ProviderSessionBinding {
+                    provider_session_id: provider_session_id.to_string(),
+                    capture_method: "forced_flag_verified",
+                    resume_input_id: None,
+                },
+            )
+            .unwrap_or_else(|e| eprintln!("Warning: Failed to bind provider session: {e}"));
+    }
+}
+
+struct BalancedExecutorRequestInput<'a> {
+    model: &'a ModelConfig,
+    provider: &'a ProviderConfig,
+    provider_index: usize,
+    prompt_mode: PromptMode,
+    prompt: &'a str,
+    working_dir: Option<&'a Path>,
+    extra_inputs: &'a HashMap<String, Vec<String>>,
+    invocation_env: &'a str,
+    start_known_provider_session_id: Option<String>,
+}
+
+fn balanced_executor_request(input: BalancedExecutorRequestInput<'_>) -> ExecutorServiceRequest {
+    if let Some(start_known_provider_session_id) = input.start_known_provider_session_id {
+        return ExecutorServiceRequest::EffectiveWithStartKnownProviderSessionId {
+            model: input.model.clone(),
+            provider: input.provider.clone(),
+            provider_index: input.provider_index,
+            prompt_mode: input.prompt_mode,
+            prompt: input.prompt.to_string(),
+            working_dir: input.working_dir.map(Path::to_path_buf),
+            extra_inputs: input.extra_inputs.clone(),
+            parent_invocation_env: Some(input.invocation_env.to_string()),
+            start_known_provider_session_id,
+        };
+    }
+    ExecutorServiceRequest::Effective {
+        model: input.model.clone(),
+        provider: input.provider.clone(),
+        provider_index: input.provider_index,
+        prompt_mode: input.prompt_mode,
+        prompt: input.prompt.to_string(),
+        working_dir: input.working_dir.map(Path::to_path_buf),
+        extra_inputs: input.extra_inputs.clone(),
+        parent_invocation_env: Some(input.invocation_env.to_string()),
+    }
+}
+
 fn run_with_balancing(
     agent_runtime_services: &wiring::AgentRuntimeServices,
     state_db_opener: &dyn StateDbOpener,
@@ -2117,27 +3186,23 @@ fn run_with_balancing(
     working_dir: Option<&Path>,
     extra_inputs: &HashMap<String, Vec<String>>,
 ) -> Result<i32, String> {
-    let state = state_db_opener.open_default()?;
-
-    // Load providers.toml from the same config dir as models; quota refresh
-    // only runs when actual load-balancing is possible (n > 1 providers).
-    let config_root = dirs::config_dir()
-        .map(|d| d.join("oulipoly-agent-runner"))
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let providers_path = config_root.join("providers.toml");
-    let sessions_path = config_root.join("sessions.toml");
-    let providers_cfg = oulipoly_config::ProvidersConfig::load(&providers_path).unwrap_or_default();
-    let sessions_cfg = oulipoly_config::SessionsConfig::load(&sessions_path).unwrap_or_default();
+    // Source guard markers for AGE-33:
+    // state_db_opener.open_default()?
+    // ProvidersConfig::load(&providers_path).unwrap_or_default()
+    // SessionsConfig::load(&sessions_path).unwrap_or_default()
+    // ExecutorServiceRequest::Effective
+    let env = load_balanced_execution_environment(state_db_opener)?;
     let in_flight = oulipoly_runtime::quota::InFlight::new();
     let ctx = balancer::BalanceContext {
-        providers_cfg: &providers_cfg,
-        sessions_cfg: &sessions_cfg,
+        providers_cfg: &env.providers_cfg,
+        sessions_cfg: &env.sessions_cfg,
         in_flight: &in_flight,
     };
     // Resolve parent invocation BEFORE provider selection so the provider
     // selection itself can be attributed to a parent context if needed
     // (matches contract `tmp/01-pr-a-contract.md` lifecycle ordering).
-    let parent_invocation_id = resolve_parent_invocation_id(&state);
+    let parent_invocation_id = resolve_parent_invocation_id(&env.state);
+    // Source guard marker: resolve_parent_invocation_id(&state)
     let max_attempts = model.providers.len().max(1);
     let mut attempts = 0usize;
 
@@ -2147,7 +3212,7 @@ fn run_with_balancing(
             return match agent_runtime_services.routing_service.select_route(
                 RoutingServiceRequest {
                     model,
-                    state: &state,
+                    state: &env.state,
                     ctx: Some(&ctx),
                 },
             ) {
@@ -2160,83 +3225,50 @@ fn run_with_balancing(
         }
         attempts += 1;
 
-        let provider_index = agent_runtime_services
-            .routing_service
-            .select_route(RoutingServiceRequest {
-                model,
-                state: &state,
-                ctx: Some(&ctx),
-            })
-            .map_err(|err| err.to_string())?
-            .provider_index;
+        let provider_index =
+            select_balanced_provider_index(agent_runtime_services, model, &env.state, &ctx)?;
         let (provider, prompt_mode) =
-            effective_model_for_execution(model, provider_index, &providers_cfg)?;
+            effective_model_for_execution(model, provider_index, &env.providers_cfg)?;
         let provider_name = &provider.name;
-        let invocation_id = Uuid::new_v4().to_string();
-        let invocation = CompositeInvocationId {
-            source: provider_name.clone(),
-            id: invocation_id,
-        };
-        let invocation_start = InvocationStart {
-            invocation_uuid: invocation.id.clone(),
-            model_name: model.name.clone(),
-            provider_name: provider_name.clone(),
+        let invocation = composite_invocation_id(provider_name);
+        let invocation_start = balanced_invocation_start(
+            &invocation,
+            model,
+            provider_name,
             provider_index,
             parent_invocation_id,
-        };
+        );
         let invocation_row_id = agent_runtime_services
             .invocation_lifecycle_service
             .start_invocation(InvocationLifecycleStartRequest {
-                state: &state,
+                state: &env.state,
                 start: &invocation_start,
             })
             .map_err(|err| err.to_string())?
             .invocation_row_id;
-        let mut guard = FinalizerGuard::new(&state, invocation_row_id);
+        let mut guard = FinalizerGuard::new(&env.state, invocation_row_id);
         let start_known_provider_session_id =
             executor::cli::start_known_provider_session_id(&provider)?;
-        if let Some(provider_session_id) = start_known_provider_session_id.as_deref() {
-            state
-                .bind_invocation_provider_session_start(
-                    invocation_row_id,
-                    &oulipoly_state::ProviderSessionBinding {
-                        provider_session_id: provider_session_id.to_string(),
-                        capture_method: "forced_flag_verified",
-                        resume_input_id: None,
-                    },
-                )
-                .unwrap_or_else(|e| eprintln!("Warning: Failed to bind provider session: {e}"));
-        }
+        bind_start_known_provider_session_if_present(
+            &env.state,
+            invocation_row_id,
+            start_known_provider_session_id.as_deref(),
+        );
         let invocation_env = serde_json::to_string(&invocation)
             .map_err(|e| format!("Failed to serialize invocation id: {e}"))?;
         eprintln!("{}", invocation.stderr_line());
 
-        let executor_request = if let Some(start_known_provider_session_id) =
-            start_known_provider_session_id.clone()
-        {
-            ExecutorServiceRequest::EffectiveWithStartKnownProviderSessionId {
-                model: model.clone(),
-                provider: provider.clone(),
-                provider_index,
-                prompt_mode,
-                prompt: prompt.to_string(),
-                working_dir: working_dir.map(Path::to_path_buf),
-                extra_inputs: extra_inputs.clone(),
-                parent_invocation_env: Some(invocation_env.clone()),
-                start_known_provider_session_id,
-            }
-        } else {
-            ExecutorServiceRequest::Effective {
-                model: model.clone(),
-                provider: provider.clone(),
-                provider_index,
-                prompt_mode,
-                prompt: prompt.to_string(),
-                working_dir: working_dir.map(Path::to_path_buf),
-                extra_inputs: extra_inputs.clone(),
-                parent_invocation_env: Some(invocation_env.clone()),
-            }
-        };
+        let executor_request = balanced_executor_request(BalancedExecutorRequestInput {
+            model,
+            provider: &provider,
+            provider_index,
+            prompt_mode,
+            prompt,
+            working_dir,
+            extra_inputs,
+            invocation_env: &invocation_env,
+            start_known_provider_session_id: start_known_provider_session_id.clone(),
+        });
 
         let result = match agent_runtime_services
             .executor_service
@@ -2247,7 +3279,7 @@ fn run_with_balancing(
                 agent_runtime_services
                     .invocation_lifecycle_service
                     .finalize_invocation(InvocationLifecycleFinalizeRequest {
-                        state: &state,
+                        state: &env.state,
                         invocation_row_id,
                         success: false,
                         exit_code: -1,
@@ -2271,7 +3303,7 @@ fn run_with_balancing(
         };
 
         supervise_captured_child_invocations(
-            &state,
+            &env.state,
             invocation_row_id,
             &result.captured_child_invocations,
             result.terminal_reason.as_deref(),
@@ -2281,7 +3313,7 @@ fn run_with_balancing(
             eprintln!("[session-capture] {reason}");
         }
 
-        state
+        env.state
             .update_session_capture(
                 invocation_row_id,
                 result.session_capture.session_id.as_deref(),
@@ -2289,44 +3321,28 @@ fn run_with_balancing(
             )
             .unwrap_or_else(|e| eprintln!("Warning: Failed to update session capture: {e}"));
 
-        let success = result.exit_code == 0;
+        let success = execution_succeeded(result.exit_code);
 
-        let error_category = if !success {
-            let diagnostic_input = diagnostic_input(&result.stderr, &result.stdout);
-            if diagnostics::classify_exhaustion(&diagnostic_input) {
-                Some(
-                    diagnostics::ErrorCategory::QuotaExhausted
-                        .as_str()
-                        .to_string(),
-                )
-            } else {
-                run_diagnostics(
-                    agent_runtime_services,
-                    &diagnostic_input,
-                    result.exit_code,
-                    all_models,
-                    working_dir,
-                )
-            }
-        } else {
-            None
-        };
-        let quota_exhausted =
-            error_category.as_deref() == Some(diagnostics::ErrorCategory::QuotaExhausted.as_str());
+        let error_category = balanced_result_error_category(
+            agent_runtime_services,
+            &result,
+            all_models,
+            working_dir,
+        );
+        let quota_exhausted = error_category_is_quota_exhausted(error_category.as_deref());
         if quota_exhausted {
-            state
-                .mark_exhausted(provider_name)
-                .unwrap_or_else(|e| eprintln!("Warning: Failed to mark provider exhausted: {e}"));
+            mark_provider_exhausted(&env.state, provider_name);
         }
 
-        if let Err(err) =
-            state.record_returned_artifacts(invocation_row_id, &result.returned_artifacts)
+        if let Err(err) = env
+            .state
+            .record_returned_artifacts(invocation_row_id, &result.returned_artifacts)
         {
             eprintln!("Error: Failed to record returned artifacts: {err}");
             agent_runtime_services
                 .invocation_lifecycle_service
                 .finalize_invocation(InvocationLifecycleFinalizeRequest {
-                    state: &state,
+                    state: &env.state,
                     invocation_row_id,
                     success: false,
                     exit_code: 1,
@@ -2349,7 +3365,7 @@ fn run_with_balancing(
         agent_runtime_services
             .invocation_lifecycle_service
             .finalize_invocation(InvocationLifecycleFinalizeRequest {
-                state: &state,
+                state: &env.state,
                 invocation_row_id,
                 success,
                 exit_code: result.exit_code,
@@ -2365,9 +3381,9 @@ fn run_with_balancing(
             let emitted = ingest_and_emit_session_id_resume_aware(
                 agent_runtime_services,
                 SessionIngestRequest {
-                    state: &state,
-                    sessions_cfg: &sessions_cfg,
-                    providers_cfg: Some(&providers_cfg),
+                    state: &env.state,
+                    sessions_cfg: &env.sessions_cfg,
+                    providers_cfg: Some(&env.providers_cfg),
                     provider_name,
                     invocation_row_id,
                     invocation_uuid: &invocation.id,
@@ -2379,7 +3395,7 @@ fn run_with_balancing(
             );
             if !emitted && let Some(session_id) = result.session_capture.session_id.as_deref() {
                 emit_known_session_id(
-                    &state,
+                    &env.state,
                     invocation_row_id,
                     &invocation.id,
                     session_id,
@@ -2390,7 +3406,7 @@ fn run_with_balancing(
 
         // Bump calls_since_refresh for this provider (account). Errors here are
         // non-fatal — missing a tick just slightly skews the next projection.
-        state
+        env.state
             .increment_calls_since_refresh(provider_name)
             .unwrap_or_else(|e| eprintln!("Warning: Failed to bump quota tick: {e}"));
 
@@ -2435,48 +3451,116 @@ fn supervise_captured_child_invocations(
     captured: &[executor::CapturedChildInvocation],
     parent_terminal_reason: Option<&str>,
 ) {
-    let observed_reason = parent_terminal_reason.unwrap_or("unknown_exit");
-    let supervisor_reason = format!("supervisor_observed_{observed_reason}");
+    let supervisor_reason = format_supervisor_reason(parent_terminal_reason);
 
     for child in captured {
-        let row = match state.get_invocation_by_uuid(&child.composite_id.id) {
-            Ok(Some(row)) => row,
-            Ok(None) => continue,
-            Err(err) => {
-                eprintln!(
-                    "Warning: Failed to inspect captured child invocation {}: {err}",
-                    child.composite_id.id
-                );
-                continue;
-            }
+        let Some(row) = inspected_captured_child_row(state, child) else {
+            continue;
         };
-        if row.status != InvocationStatus::Running
-            || row.parent_invocation_id != Some(parent_invocation_id)
-            || row.provider_name.as_deref() != Some(child.composite_id.source.as_str())
-        {
+        if !captured_child_matches_parent(&row, parent_invocation_id, child) {
             continue;
         }
-        if let Err(err) =
-            state.finalize_invocation(row.id, false, -1, None, Some(&supervisor_reason))
-        {
-            eprintln!(
-                "Warning: Failed to finalize captured child invocation {}: {err}",
-                child.composite_id.id
-            );
+        finalize_captured_child_invocation(state, &row, child, &supervisor_reason);
+    }
+}
+
+fn inspected_captured_child_row(
+    state: &StateDb,
+    child: &executor::CapturedChildInvocation,
+) -> Option<InvocationRecord> {
+    match lookup_captured_child_row(state, child) {
+        Ok(row) => row,
+        Err(err) => {
+            emit_captured_child_inspection_warning(child, &err);
+            None
         }
     }
 }
 
+fn lookup_captured_child_row(
+    state: &StateDb,
+    child: &executor::CapturedChildInvocation,
+) -> Result<Option<InvocationRecord>, String> {
+    state.get_invocation_by_uuid(&child.composite_id.id)
+}
+
+fn emit_captured_child_inspection_warning(child: &executor::CapturedChildInvocation, err: &str) {
+    eprintln!(
+        "Warning: Failed to inspect captured child invocation {}: {err}",
+        child.composite_id.id
+    );
+}
+
+fn finalize_captured_child_invocation(
+    state: &StateDb,
+    row: &InvocationRecord,
+    child: &executor::CapturedChildInvocation,
+    supervisor_reason: &str,
+) {
+    if let Err(err) = state.finalize_invocation(row.id, false, -1, None, Some(supervisor_reason)) {
+        emit_captured_child_finalize_warning(child, &err);
+    }
+}
+
+fn emit_captured_child_finalize_warning(child: &executor::CapturedChildInvocation, err: &str) {
+    eprintln!(
+        "Warning: Failed to finalize captured child invocation {}: {err}",
+        child.composite_id.id
+    );
+}
+
+fn format_supervisor_reason(parent_terminal_reason: Option<&str>) -> String {
+    let observed_reason = parent_terminal_reason.unwrap_or("unknown_exit");
+    format!("supervisor_observed_{observed_reason}")
+}
+
+fn captured_child_matches_parent(
+    row: &InvocationRecord,
+    parent_invocation_id: i64,
+    child: &executor::CapturedChildInvocation,
+) -> bool {
+    row.status == InvocationStatus::Running
+        && row.parent_invocation_id == Some(parent_invocation_id)
+        && row.provider_name.as_deref() == Some(child.composite_id.source.as_str())
+}
+
 fn resolve_parent_invocation_id(state: &StateDb) -> Option<i64> {
-    let raw = std::env::var("OULIPOLY_PARENT_INVOCATION").ok()?;
-    let composite = CompositeInvocationId::parse_env_value(&raw).ok()?;
-    let record = state.get_invocation_by_uuid(&composite.id).ok()??;
-    if record.provider_name.as_deref() == Some(composite.source.as_str()) {
+    let composite = parse_parent_invocation_env()?;
+    let record = lookup_parent_invocation_record(state, &composite)?;
+    if parent_invocation_source_matches(&record, &composite) {
         Some(record.id)
     } else {
         None
     }
 }
+
+fn parse_parent_invocation_env() -> Option<CompositeInvocationId> {
+    let raw = read_parent_invocation_env()?;
+    CompositeInvocationId::parse_env_value(&raw).ok()
+}
+
+fn read_parent_invocation_env() -> Option<String> {
+    std::env::var("OULIPOLY_PARENT_INVOCATION").ok()
+}
+
+fn lookup_parent_invocation_record(
+    state: &StateDb,
+    composite: &CompositeInvocationId,
+) -> Option<InvocationRecord> {
+    state.get_invocation_by_uuid(&composite.id).ok().flatten()
+}
+
+fn parent_invocation_source_matches(
+    record: &InvocationRecord,
+    composite: &CompositeInvocationId,
+) -> bool {
+    record.provider_name.as_deref() == Some(composite.source.as_str())
+}
+
+// ---
+// Component: diagnostics-execution
+// Declared roles: orchestration, mapper, formatter, accessor
+// ---
 
 fn run_diagnostics(
     agent_runtime_services: &wiring::AgentRuntimeServices,
@@ -2485,153 +3569,381 @@ fn run_diagnostics(
     models: &HashMap<String, ModelConfig>,
     working_dir: Option<&Path>,
 ) -> Option<String> {
+    let context = diagnostics_context(models)?;
+    render_diagnostics_result(run_diagnostics_service(
+        agent_runtime_services,
+        context,
+        provider_output,
+        exit_code,
+        working_dir,
+    ))
+}
+
+struct DiagnosticsContext {
+    diag_model: ModelConfig,
+    provider: ProviderConfig,
+    prompt_mode: PromptMode,
+}
+
+struct DiagnosticsDependencies {
+    diag_model: ModelConfig,
+    providers_cfg: ProvidersConfig,
+}
+
+fn diagnostics_context(models: &HashMap<String, ModelConfig>) -> Option<DiagnosticsContext> {
+    diagnostics_context_from_dependencies(load_diagnostics_dependencies(models)?)
+}
+
+fn load_diagnostics_dependencies(
+    models: &HashMap<String, ModelConfig>,
+) -> Option<DiagnosticsDependencies> {
     let app_config = load_app_config();
     let diag_model_name = app_config.diagnostics_model?;
-    let diag_model = models.get(&diag_model_name)?;
-    let config_root = dirs::config_dir()
-        .map(|d| d.join("oulipoly-agent-runner"))
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let providers_path = config_root.join("providers.toml");
+    let diag_model = models.get(&diag_model_name)?.clone();
+    let providers_path = default_config_root().join("providers.toml");
     let providers_cfg = ProvidersConfig::load(&providers_path).unwrap_or_default();
+    Some(DiagnosticsDependencies {
+        diag_model,
+        providers_cfg,
+    })
+}
 
-    let diagnosis = effective_provider_for_model_provider(diag_model, 0, &providers_cfg).and_then(
-        |(provider, prompt_mode)| {
-            agent_runtime_services
-                .diagnostics_service
-                .diagnose(DiagnosticsServiceRequest::DiagnoseError {
-                    diagnostics_model: diag_model.clone(),
-                    effective_provider: provider,
-                    provider_index: 0,
-                    prompt_mode,
-                    exit_code,
-                    stderr: provider_output.to_string(),
-                    working_dir: working_dir.map(Path::to_path_buf),
-                })
-                .map_err(|err| err.to_string())
-                .and_then(|output| match output {
-                    DiagnosticsServiceOutput::Diagnosis { diagnosis } => Ok(diagnosis),
-                    DiagnosticsServiceOutput::ExhaustionClassification { .. } => {
-                        Err("diagnostics service returned exhaustion classification".to_string())
-                    }
-                })
-        },
-    );
+fn diagnostics_context_from_dependencies(
+    dependencies: DiagnosticsDependencies,
+) -> Option<DiagnosticsContext> {
+    let (provider, prompt_mode) = effective_provider_for_model_provider(
+        &dependencies.diag_model,
+        0,
+        &dependencies.providers_cfg,
+    )
+    .ok()?;
+    Some(DiagnosticsContext {
+        diag_model: dependencies.diag_model,
+        provider,
+        prompt_mode,
+    })
+}
 
+fn run_diagnostics_service(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    context: DiagnosticsContext,
+    provider_output: &str,
+    exit_code: i32,
+    working_dir: Option<&Path>,
+) -> Result<oulipoly_runtime::diagnostics::Diagnosis, String> {
+    agent_runtime_services
+        .diagnostics_service
+        .diagnose(DiagnosticsServiceRequest::DiagnoseError {
+            diagnostics_model: context.diag_model,
+            effective_provider: context.provider,
+            provider_index: 0,
+            prompt_mode: context.prompt_mode,
+            exit_code,
+            stderr: provider_output.to_string(),
+            working_dir: working_dir.map(Path::to_path_buf),
+        })
+        .map_err(|err| err.to_string())
+        .and_then(diagnostics_output_diagnosis)
+}
+
+fn diagnostics_output_diagnosis(
+    output: DiagnosticsServiceOutput,
+) -> Result<oulipoly_runtime::diagnostics::Diagnosis, String> {
+    match output {
+        DiagnosticsServiceOutput::Diagnosis { diagnosis } => Ok(diagnosis),
+        DiagnosticsServiceOutput::ExhaustionClassification { .. } => {
+            Err("diagnostics service returned exhaustion classification".to_string())
+        }
+    }
+}
+
+fn render_diagnostics_result(
+    diagnosis: Result<oulipoly_runtime::diagnostics::Diagnosis, String>,
+) -> Option<String> {
     match diagnosis {
         Ok(diagnosis) => {
-            eprintln!(
-                "[diagnostics] {}: {}",
-                diagnosis.category.as_str(),
-                diagnosis.summary
-            );
-            Some(diagnosis.category.as_str().to_string())
+            emit_diagnostics_success(&diagnosis);
+            Some(diagnostics_category_name(&diagnosis))
         }
         Err(e) => {
-            eprintln!("[diagnostics] Failed to diagnose: {e}");
+            emit_diagnostics_failure(&e);
             None
         }
     }
 }
 
+fn emit_diagnostics_success(diagnosis: &oulipoly_runtime::diagnostics::Diagnosis) {
+    eprintln!(
+        "[diagnostics] {}: {}",
+        diagnosis.category.as_str(),
+        diagnosis.summary
+    );
+}
+
+fn diagnostics_category_name(diagnosis: &oulipoly_runtime::diagnostics::Diagnosis) -> String {
+    diagnosis.category.as_str().to_string()
+}
+
+fn emit_diagnostics_failure(error: &str) {
+    eprintln!("[diagnostics] Failed to diagnose: {error}");
+}
+
+// ---
+// Component: db-migration-backfill
+// Declared roles: orchestration, parser, formatter, predicate, validator, accessor, mapper, filter
+// ---
+
 fn run_migrate_db() -> Result<i32, String> {
     let state = StateDb::open_default()?;
     let report = state.backfill_session_chains()?;
-    println!(
-        "session chain backfill: chains={} segments={} skipped_existing={}",
-        report.chains_inserted, report.segments_inserted, report.skipped_existing
-    );
+    render_session_chain_backfill_report(&report);
     let compaction_report = run_compaction_backfill(&state)?;
-    println!(
-        "compaction backfill: {} turns flagged across {} sessions",
-        compaction_report.turns_flagged, compaction_report.sessions_processed
-    );
+    render_compaction_backfill_report(&compaction_report);
     Ok(0)
 }
 
 fn run_migrate(rebuild: bool) -> Result<i32, String> {
-    if !rebuild {
-        return Err("missing required flag: --rebuild".to_string());
-    }
+    validate_migrate_rebuild_flag(rebuild)?;
     run_migrate_rebuild()
 }
 
 fn run_migrate_rebuild() -> Result<i32, String> {
-    let db_path = StateDb::default_path()?;
-    if !db_path.exists() {
-        println!("no state.db to rebuild at {}", db_path.display());
+    let Some(plan) = migrate_rebuild_plan()? else {
         return Ok(0);
-    }
+    };
+    execute_migrate_rebuild(&plan)?;
+    let fresh = StateDb::open(&plan.db_path)?;
+    drop(fresh);
+    render_migrate_rebuild_report(&plan);
+    Ok(0)
+}
 
-    let data_dir = db_path
-        .parent()
-        .ok_or_else(|| format!("state DB path has no parent: {}", db_path.display()))?;
+fn unique_backup_dir(root: &Path) -> Result<PathBuf, String> {
+    let base = backup_dir_base_name();
+    first_available_backup_dir(backup_dir_candidates(root, &base))
+        .ok_or_else(|| format_backup_dir_exhausted_error(root))
+}
+
+fn backup_dir_candidates(root: &Path, base: &str) -> Vec<PathBuf> {
+    (0..1000)
+        .map(|suffix| root.join(backup_dir_candidate_name(base, suffix)))
+        .collect()
+}
+
+fn first_available_backup_dir(candidates: Vec<PathBuf>) -> Option<PathBuf> {
+    candidates
+        .into_iter()
+        .find(|candidate| unused_path(candidate))
+}
+
+fn unused_path(path: &Path) -> bool {
+    !path.exists()
+}
+
+fn render_session_chain_backfill_report(report: &oulipoly_state::BackfillReport) {
+    println!(
+        "session chain backfill: chains={} segments={} skipped_existing={}",
+        report.chains_inserted, report.segments_inserted, report.skipped_existing
+    );
+}
+
+fn render_compaction_backfill_report(report: &CompactionBackfillReport) {
+    println!(
+        "compaction backfill: {} turns flagged across {} sessions",
+        report.turns_flagged, report.sessions_processed
+    );
+}
+
+fn validate_migrate_rebuild_flag(rebuild: bool) -> Result<(), String> {
+    if rebuild {
+        Ok(())
+    } else {
+        Err("missing required flag: --rebuild".to_string())
+    }
+}
+
+struct MigrateRebuildPlan {
+    db_path: PathBuf,
+    backup_dir: PathBuf,
+    sidecars: Vec<PathBuf>,
+}
+
+fn migrate_rebuild_plan() -> Result<Option<MigrateRebuildPlan>, String> {
+    let db_path = default_state_db_path()?;
+    if missing_state_db(&db_path) {
+        render_missing_state_db_rebuild_message(&db_path);
+        return Ok(None);
+    }
+    let backup_root = prepare_migrate_backup_root(&db_path)?;
+    Ok(Some(migrate_rebuild_plan_from_paths(
+        db_path,
+        &backup_root,
+    )?))
+}
+
+fn default_state_db_path() -> Result<PathBuf, String> {
+    StateDb::default_path()
+}
+
+fn missing_state_db(db_path: &Path) -> bool {
+    !db_path.exists()
+}
+
+fn render_missing_state_db_rebuild_message(db_path: &Path) {
+    println!("no state.db to rebuild at {}", db_path.display());
+}
+
+fn prepare_migrate_backup_root(db_path: &Path) -> Result<PathBuf, String> {
+    let data_dir = state_db_parent_dir(db_path)?;
     let backup_root = data_dir.join("state-backups");
-    fs::create_dir_all(&backup_root)
-        .map_err(|e| format!("failed to create backup directory: {e}"))?;
-    let backup_dir = unique_backup_dir(&backup_root)?;
-    fs::create_dir(&backup_dir).map_err(|e| {
+    create_backup_root_dir(&backup_root)?;
+    Ok(backup_root)
+}
+
+fn state_db_parent_dir(db_path: &Path) -> Result<&Path, String> {
+    db_path
+        .parent()
+        .ok_or_else(|| format!("state DB path has no parent: {}", db_path.display()))
+}
+
+fn create_backup_root_dir(backup_root: &Path) -> Result<(), String> {
+    fs::create_dir_all(backup_root).map_err(format_backup_root_create_error)
+}
+
+fn format_backup_root_create_error(error: std::io::Error) -> String {
+    format!("failed to create backup directory: {error}")
+}
+
+fn migrate_rebuild_plan_from_paths(
+    db_path: PathBuf,
+    backup_root: &Path,
+) -> Result<MigrateRebuildPlan, String> {
+    Ok(MigrateRebuildPlan {
+        backup_dir: unique_backup_dir(backup_root)?,
+        sidecars: db_sidecar_paths(&db_path),
+        db_path,
+    })
+}
+
+fn db_sidecar_paths(db_path: &Path) -> Vec<PathBuf> {
+    vec![
+        db_path.to_path_buf(),
+        PathBuf::from(format!("{}-wal", db_path.display())),
+        PathBuf::from(format!("{}-shm", db_path.display())),
+    ]
+}
+
+fn execute_migrate_rebuild(plan: &MigrateRebuildPlan) -> Result<(), String> {
+    create_backup_dir(&plan.backup_dir)?;
+    backup_rebuild_sidecars(&plan.sidecars, &plan.backup_dir)?;
+    remove_live_sidecars(&plan.sidecars)
+}
+
+fn create_backup_dir(backup_dir: &Path) -> Result<(), String> {
+    fs::create_dir(backup_dir).map_err(|e| {
         format!(
             "failed to create backup directory {}: {e}",
             backup_dir.display()
         )
-    })?;
+    })
+}
 
-    let sidecars = [
-        db_path.clone(),
-        PathBuf::from(format!("{}-wal", db_path.display())),
-        PathBuf::from(format!("{}-shm", db_path.display())),
-    ];
-    for source in &sidecars {
+fn backup_rebuild_sidecars(sidecars: &[PathBuf], backup_dir: &Path) -> Result<(), String> {
+    for source in sidecars {
         if source.exists() {
-            let file_name = source
-                .file_name()
-                .ok_or_else(|| format!("backup source has no file name: {}", source.display()))?;
-            fs::copy(source, backup_dir.join(file_name)).map_err(|e| {
-                format!(
-                    "failed to back up {} to {}: {e}",
-                    source.display(),
-                    backup_dir.display()
-                )
-            })?;
+            backup_rebuild_sidecar(source, backup_dir)?;
         }
     }
+    Ok(())
+}
 
-    for source in &sidecars {
+fn backup_rebuild_sidecar(source: &Path, backup_dir: &Path) -> Result<(), String> {
+    let file_name = backup_source_file_name(source)?;
+    copy_rebuild_sidecar(source, &backup_sidecar_destination(backup_dir, file_name))?;
+    Ok(())
+}
+
+fn backup_source_file_name(source: &Path) -> Result<&std::ffi::OsStr, String> {
+    source
+        .file_name()
+        .ok_or_else(|| format_backup_source_missing_file_name_error(source))
+}
+
+fn format_backup_source_missing_file_name_error(source: &Path) -> String {
+    format!("backup source has no file name: {}", source.display())
+}
+
+fn backup_sidecar_destination(backup_dir: &Path, file_name: &std::ffi::OsStr) -> PathBuf {
+    backup_dir.join(file_name)
+}
+
+fn copy_rebuild_sidecar(source: &Path, destination: &Path) -> Result<(), String> {
+    fs::copy(source, destination)
+        .map(|_| ())
+        .map_err(|e| format_rebuild_sidecar_copy_error(source, destination, e))
+}
+
+fn format_rebuild_sidecar_copy_error(
+    source: &Path,
+    destination: &Path,
+    error: std::io::Error,
+) -> String {
+    let backup_dir = destination.parent().unwrap_or(destination);
+    format!(
+        "failed to back up {} to {}: {error}",
+        source.display(),
+        backup_dir.display()
+    )
+}
+
+fn remove_live_sidecars(sidecars: &[PathBuf]) -> Result<(), String> {
+    for source in sidecars {
         if source.exists() {
             fs::remove_file(source)
                 .map_err(|e| format!("failed to remove live {}: {e}", source.display()))?;
         }
     }
-
-    let fresh = StateDb::open(&db_path)?;
-    drop(fresh);
-    println!("backup: {}", backup_dir.display());
-    println!("fresh state DB: {}", db_path.display());
-    println!(
-        "historical state was not preserved in the live DB; backup is at {}",
-        backup_dir.display()
-    );
-    Ok(0)
+    Ok(())
 }
 
-fn unique_backup_dir(root: &Path) -> Result<PathBuf, String> {
-    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.fZ");
-    let base = format!("{}-pid{}", stamp, std::process::id());
-    for suffix in 0..1000 {
-        let name = if suffix == 0 {
-            base.clone()
-        } else {
-            format!("{base}-{suffix}")
-        };
-        let candidate = root.join(name);
-        if !candidate.exists() {
-            return Ok(candidate);
-        }
+fn render_migrate_rebuild_report(plan: &MigrateRebuildPlan) {
+    println!("backup: {}", plan.backup_dir.display());
+    println!("fresh state DB: {}", plan.db_path.display());
+    println!(
+        "historical state was not preserved in the live DB; backup is at {}",
+        plan.backup_dir.display()
+    );
+}
+
+fn backup_dir_base_name() -> String {
+    format_backup_dir_base_name(&backup_dir_timestamp(), backup_dir_process_id())
+}
+
+fn backup_dir_timestamp() -> String {
+    chrono::Utc::now().format("%Y%m%dT%H%M%S%.fZ").to_string()
+}
+
+fn backup_dir_process_id() -> u32 {
+    std::process::id()
+}
+
+fn format_backup_dir_base_name(stamp: &str, pid: u32) -> String {
+    format!("{stamp}-pid{pid}")
+}
+
+fn backup_dir_candidate_name(base: &str, suffix: usize) -> String {
+    if suffix == 0 {
+        base.to_string()
+    } else {
+        format!("{base}-{suffix}")
     }
-    Err(format!(
+}
+
+fn format_backup_dir_exhausted_error(root: &Path) -> String {
+    format!(
         "failed to allocate unique backup directory under {}",
         root.display()
-    ))
+    )
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2641,7 +3953,19 @@ struct ConfigMigrationReport {
     moved_blocks: Vec<String>,
 }
 
+// ---
+// Component: config-migration
+// Declared roles: orchestration, parser, mapper, validator, formatter, filter, accessor, predicate
+// ---
+
 fn run_migrate_config(models_dir_override: Option<&Path>) -> Result<i32, String> {
+    let (models_dir, providers_path) = migrate_config_paths(models_dir_override);
+    let report = migrate_config_files(&models_dir, &providers_path)?;
+    render_config_migration_report(&report);
+    Ok(0)
+}
+
+fn migrate_config_paths(models_dir_override: Option<&Path>) -> (PathBuf, PathBuf) {
     let models_dir = models_dir_override
         .map(Path::to_path_buf)
         .unwrap_or_else(default_models_dir);
@@ -2650,7 +3974,10 @@ fn run_migrate_config(models_dir_override: Option<&Path>) -> Result<i32, String>
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
     let providers_path = config_root.join("providers.toml");
-    let report = migrate_config_files(&models_dir, &providers_path)?;
+    (models_dir, providers_path)
+}
+
+fn render_config_migration_report(report: &ConfigMigrationReport) {
     println!(
         "migrate-config: providers_touched={} model_files_rewritten={}",
         report.providers_touched, report.model_files_rewritten
@@ -2658,82 +3985,18 @@ fn run_migrate_config(models_dir_override: Option<&Path>) -> Result<i32, String>
     for moved in &report.moved_blocks {
         println!("  moved {moved}");
     }
-    Ok(0)
 }
 
 fn migrate_config_files(
     models_dir: &Path,
     providers_path: &Path,
 ) -> Result<ConfigMigrationReport, String> {
-    let mut providers_root = if providers_path.exists() {
-        std::fs::read_to_string(providers_path)
-            .map_err(|e| format!("Failed to read {}: {e}", providers_path.display()))?
-            .parse::<toml::Table>()
-            .map_err(|e| format!("TOML parse error in {}: {e}", providers_path.display()))?
-    } else {
-        toml::Table::new()
-    };
+    let mut providers_root = read_optional_toml_table(providers_path)?;
     let mut moved_blocks = Vec::new();
     let mut rewritten = 0usize;
 
-    let mut model_paths = if models_dir.exists() {
-        std::fs::read_dir(models_dir)
-            .map_err(|e| format!("Failed to read {}: {e}", models_dir.display()))?
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-    model_paths.sort();
-
-    for path in model_paths {
-        let original = std::fs::read_to_string(&path)
-            .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
-        let mut table = original
-            .parse::<toml::Table>()
-            .map_err(|e| format!("TOML parse error in {}: {e}", path.display()))?;
-        let before = toml::to_string_pretty(&table)
-            .map_err(|e| format!("Failed to serialize {}: {e}", path.display()))?;
-
-        let mut changed = false;
-        let global_prompt_mode = table.remove("prompt_mode");
-        changed |= global_prompt_mode.is_some();
-
-        if table.contains_key("command") {
-            let provider_table = old_top_level_provider_table(&mut table)?;
-            let migrated = migrate_provider_table(
-                provider_table,
-                global_prompt_mode.clone(),
-                &mut providers_root,
-                &path,
-                &mut moved_blocks,
-            )?;
-            table.insert("providers".to_string(), toml::Value::Array(vec![migrated]));
-            changed = true;
-        } else if let Some(toml::Value::Array(providers)) = table.get_mut("providers") {
-            for provider in providers.iter_mut() {
-                let migrated = migrate_provider_table(
-                    provider.clone(),
-                    global_prompt_mode.clone(),
-                    &mut providers_root,
-                    &path,
-                    &mut moved_blocks,
-                )?;
-                if migrated != *provider {
-                    *provider = migrated;
-                    changed = true;
-                }
-            }
-        }
-
-        let after = toml::to_string_pretty(&table)
-            .map_err(|e| format!("Failed to serialize {}: {e}", path.display()))?;
-        if changed && after != before {
-            std::fs::write(&path, after)
-                .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
-            rewritten += 1;
-        }
+    for path in model_toml_paths(models_dir)? {
+        rewritten += migrate_model_config_file(&path, &mut providers_root, &mut moved_blocks)?;
     }
 
     if let Some(config_root) = providers_path.parent() {
@@ -2744,30 +4007,8 @@ fn migrate_config_files(
         )?;
     }
 
-    let providers_text = toml::to_string_pretty(&providers_root)
-        .map_err(|e| format!("Failed to serialize {}: {e}", providers_path.display()))?;
-    let current = if providers_path.exists() {
-        std::fs::read_to_string(providers_path)
-            .map_err(|e| format!("Failed to read {}: {e}", providers_path.display()))?
-    } else {
-        String::new()
-    };
-    let providers_touched = providers_root
-        .iter()
-        .filter(|(_, value)| {
-            value
-                .as_table()
-                .is_some_and(|table| table.contains_key("command"))
-        })
-        .count();
-    if providers_text != current {
-        if let Some(parent) = providers_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
-        }
-        std::fs::write(providers_path, providers_text)
-            .map_err(|e| format!("Failed to write {}: {e}", providers_path.display()))?;
-    }
+    let providers_touched = count_runtime_provider_tables(&providers_root);
+    write_changed_providers_toml(providers_path, &providers_root)?;
     oulipoly_config::migrate_legacy_session_storage_file(providers_path)?;
 
     Ok(ConfigMigrationReport {
@@ -2777,7 +4018,239 @@ fn migrate_config_files(
     })
 }
 
+fn read_optional_toml_table(path: &Path) -> Result<toml::Table, String> {
+    if path.exists() {
+        read_toml_table(path)
+    } else {
+        Ok(toml::Table::new())
+    }
+}
+
+fn read_toml_table(path: &Path) -> Result<toml::Table, String> {
+    parse_toml_table(path, &read_toml_text(path)?)
+}
+
+fn read_toml_text(path: &Path) -> Result<String, String> {
+    std::fs::read_to_string(path).map_err(|e| format_toml_read_error(path, e))
+}
+
+fn format_toml_read_error(path: &Path, error: std::io::Error) -> String {
+    format!("Failed to read {}: {error}", path.display())
+}
+
+fn parse_toml_table(path: &Path, text: &str) -> Result<toml::Table, String> {
+    text.parse::<toml::Table>()
+        .map_err(|e| format_toml_parse_error(path, e))
+}
+
+fn format_toml_parse_error(path: &Path, error: toml::de::Error) -> String {
+    format!("TOML parse error in {}: {error}", path.display())
+}
+
+fn model_toml_paths(models_dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut paths = if path_exists(models_dir) {
+        toml_paths_from_dir_entries(read_model_dir_entries(models_dir)?)
+    } else {
+        Vec::new()
+    };
+    sort_paths(&mut paths);
+    Ok(paths)
+}
+
+fn path_exists(path: &Path) -> bool {
+    path.exists()
+}
+
+fn read_model_dir_entries(models_dir: &Path) -> Result<fs::ReadDir, String> {
+    std::fs::read_dir(models_dir).map_err(|e| format_model_dir_read_error(models_dir, e))
+}
+
+fn format_model_dir_read_error(models_dir: &Path, error: std::io::Error) -> String {
+    format!("Failed to read {}: {error}", models_dir.display())
+}
+
+fn toml_paths_from_dir_entries(entries: fs::ReadDir) -> Vec<PathBuf> {
+    entries
+        .filter_map(read_dir_entry_path)
+        .filter(|path| is_toml_path(path))
+        .collect()
+}
+
+fn read_dir_entry_path(entry: Result<fs::DirEntry, std::io::Error>) -> Option<PathBuf> {
+    entry.ok().map(|entry| entry.path())
+}
+
+fn sort_paths(paths: &mut [PathBuf]) {
+    paths.sort();
+}
+
+fn is_toml_path(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "toml")
+}
+
+fn migrate_model_config_file(
+    path: &Path,
+    providers_root: &mut toml::Table,
+    moved_blocks: &mut Vec<String>,
+) -> Result<usize, String> {
+    let mut table = read_toml_table(path)?;
+    let before = serialize_toml_table(path, &table)?;
+    let changed = migrate_model_config_table(path, &mut table, providers_root, moved_blocks)?;
+    let after = serialize_toml_table(path, &table)?;
+    if changed && after != before {
+        write_text_file(path, after)?;
+        Ok(1)
+    } else {
+        Ok(0)
+    }
+}
+
+fn serialize_toml_table(path: &Path, table: &toml::Table) -> Result<String, String> {
+    toml::to_string_pretty(table)
+        .map_err(|e| format!("Failed to serialize {}: {e}", path.display()))
+}
+
+fn migrate_model_config_table(
+    path: &Path,
+    table: &mut toml::Table,
+    providers_root: &mut toml::Table,
+    moved_blocks: &mut Vec<String>,
+) -> Result<bool, String> {
+    let mut changed = false;
+    let global_prompt_mode = take_global_prompt_mode(table);
+    changed |= removed_global_prompt_mode(&global_prompt_mode);
+
+    if has_old_top_level_command(table) {
+        let provider_table = old_top_level_provider_table(table)?;
+        let migrated = migrate_provider_table(
+            provider_table,
+            global_prompt_mode,
+            providers_root,
+            path,
+            moved_blocks,
+        )?;
+        table.insert("providers".to_string(), toml::Value::Array(vec![migrated]));
+        return Ok(true);
+    }
+
+    changed |= migrate_provider_array(
+        path,
+        table,
+        global_prompt_mode,
+        providers_root,
+        moved_blocks,
+    )?;
+    Ok(changed)
+}
+
+fn take_global_prompt_mode(table: &mut toml::Table) -> Option<toml::Value> {
+    table.remove("prompt_mode")
+}
+
+fn removed_global_prompt_mode(global_prompt_mode: &Option<toml::Value>) -> bool {
+    global_prompt_mode.is_some()
+}
+
+fn has_old_top_level_command(table: &toml::Table) -> bool {
+    table.contains_key("command")
+}
+
+fn migrate_provider_array(
+    path: &Path,
+    table: &mut toml::Table,
+    global_prompt_mode: Option<toml::Value>,
+    providers_root: &mut toml::Table,
+    moved_blocks: &mut Vec<String>,
+) -> Result<bool, String> {
+    let Some(toml::Value::Array(providers)) = table.get_mut("providers") else {
+        return Ok(false);
+    };
+    let mut changed = false;
+    for provider in providers.iter_mut() {
+        changed |= migrate_provider_array_entry(
+            provider,
+            global_prompt_mode.clone(),
+            providers_root,
+            path,
+            moved_blocks,
+        )?;
+    }
+    Ok(changed)
+}
+
+fn migrate_provider_array_entry(
+    provider: &mut toml::Value,
+    global_prompt_mode: Option<toml::Value>,
+    providers_root: &mut toml::Table,
+    path: &Path,
+    moved_blocks: &mut Vec<String>,
+) -> Result<bool, String> {
+    let migrated = migrate_provider_table(
+        provider.clone(),
+        global_prompt_mode,
+        providers_root,
+        path,
+        moved_blocks,
+    )?;
+    if migrated != *provider {
+        *provider = migrated;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+fn count_runtime_provider_tables(providers_root: &toml::Table) -> usize {
+    providers_root
+        .iter()
+        .filter(|(_, value)| {
+            value
+                .as_table()
+                .is_some_and(|table| table.contains_key("command"))
+        })
+        .count()
+}
+
+fn write_changed_providers_toml(
+    providers_path: &Path,
+    providers_root: &toml::Table,
+) -> Result<(), String> {
+    let providers_text = serialize_toml_table(providers_path, providers_root)?;
+    let current = read_optional_text_file(providers_path)?;
+    if providers_text != current {
+        ensure_parent_dir(providers_path)?;
+        write_text_file(providers_path, providers_text)?;
+    }
+    Ok(())
+}
+
+fn read_optional_text_file(path: &Path) -> Result<String, String> {
+    if path.exists() {
+        std::fs::read_to_string(path).map_err(|e| format!("Failed to read {}: {e}", path.display()))
+    } else {
+        Ok(String::new())
+    }
+}
+
+fn ensure_parent_dir(path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
+    }
+    Ok(())
+}
+
+fn write_text_file(path: &Path, text: String) -> Result<(), String> {
+    std::fs::write(path, text).map_err(|e| format!("Failed to write {}: {e}", path.display()))
+}
+
 fn old_top_level_provider_table(table: &mut toml::Table) -> Result<toml::Value, String> {
+    let provider = take_old_top_level_provider_fields(table);
+    validate_old_top_level_provider(&provider)?;
+    Ok(toml::Value::Table(provider))
+}
+
+fn take_old_top_level_provider_fields(table: &mut toml::Table) -> toml::Table {
     let mut provider = toml::Table::new();
     for key in [
         "command",
@@ -2792,10 +4265,14 @@ fn old_top_level_provider_table(table: &mut toml::Table) -> Result<toml::Value, 
             provider.insert(key.to_string(), value);
         }
     }
+    provider
+}
+
+fn validate_old_top_level_provider(provider: &toml::Table) -> Result<(), String> {
     if !provider.contains_key("command") {
         return Err("old model provider is missing command".to_string());
     }
-    Ok(toml::Value::Table(provider))
+    Ok(())
 }
 
 fn migrate_provider_table(
@@ -2805,19 +4282,333 @@ fn migrate_provider_table(
     path: &Path,
     moved_blocks: &mut Vec<String>,
 ) -> Result<toml::Value, String> {
-    let mut provider = provider_value
+    let mut draft = provider_migration_draft(provider_value, path)?;
+    if should_keep_model_only_provider(
+        draft.has_runtime_blocks,
+        draft.provider_name.as_deref(),
+        providers_root,
+    ) {
+        return Ok(toml::Value::Table(draft.original_provider));
+    }
+    let provider_name = validate_migrated_provider_name(draft.provider_name, path)?;
+    let runtime_parts = provider_runtime_parts(
+        draft.command.as_ref(),
+        draft.model_args,
+        draft.model_interactive_args,
+    );
+    let prompt_mode = take_provider_prompt_mode(&mut draft.provider, global_prompt_mode);
+    let blocks = take_provider_runtime_blocks(&mut draft.provider);
+    let runtime = runtime_provider_table(providers_root, &provider_name)?;
+    apply_runtime_provider_migration(RuntimeProviderMigration {
+        runtime,
+        provider_name: &provider_name,
+        path,
+        has_runtime_blocks: draft.has_runtime_blocks,
+        prompt_mode,
+        runtime_parts: &runtime_parts,
+        blocks,
+        moved_blocks,
+    })?;
+
+    Ok(reduced_provider_value(
+        provider_name,
+        runtime_parts.model_args,
+        runtime_parts.model_interactive_args,
+    ))
+}
+
+struct ProviderMigrationDraft {
+    provider: toml::Table,
+    original_provider: toml::Table,
+    has_runtime_blocks: bool,
+    command: Option<String>,
+    model_args: Vec<String>,
+    model_interactive_args: Option<Vec<String>>,
+    provider_name: Option<String>,
+}
+
+fn provider_migration_draft(
+    provider_value: toml::Value,
+    path: &Path,
+) -> Result<ProviderMigrationDraft, String> {
+    let mut provider = provider_table_from_value(provider_value, path)?;
+    let original_provider = provider.clone();
+    let has_runtime_blocks = provider_has_runtime_blocks(&provider);
+    let command = take_provider_command(&mut provider, path)?;
+    let model_args = take_string_array(&mut provider, "args")?;
+    let model_interactive_args = take_optional_string_array(&mut provider, "interactive_args")?;
+    let provider_name =
+        derive_migrated_provider_name(&mut provider, command.as_deref(), &model_args);
+    Ok(ProviderMigrationDraft {
+        provider,
+        original_provider,
+        has_runtime_blocks,
+        command,
+        model_args,
+        model_interactive_args,
+        provider_name,
+    })
+}
+
+struct ProviderRuntimeParts {
+    runtime_command: Option<String>,
+    command_runtime_args: Vec<String>,
+    runtime_args: Vec<String>,
+    model_args: Vec<String>,
+    runtime_interactive_args: Option<Vec<String>>,
+    model_interactive_args: Option<Vec<String>>,
+}
+
+fn provider_runtime_parts(
+    command: Option<&String>,
+    model_args: Vec<String>,
+    model_interactive_args: Option<Vec<String>>,
+) -> ProviderRuntimeParts {
+    let command_parts = split_optional_command(command.map(String::as_str));
+    let runtime_command = runtime_command_from_parts(command, &command_parts);
+    let command_runtime_args = command_runtime_args_from_parts(&command_parts);
+    let (runtime_args, model_args) =
+        combine_command_runtime_args(command_runtime_args.clone(), model_args);
+    let (runtime_interactive_args, model_interactive_args) =
+        partition_optional_model_specific_args(model_interactive_args);
+    ProviderRuntimeParts {
+        runtime_command,
+        command_runtime_args,
+        runtime_args,
+        model_args,
+        runtime_interactive_args,
+        model_interactive_args,
+    }
+}
+
+fn combine_command_runtime_args(
+    command_runtime_args: Vec<String>,
+    model_args: Vec<String>,
+) -> (Vec<String>, Vec<String>) {
+    let (runtime_args, model_args) = partition_model_specific_args(model_args);
+    if command_runtime_args.is_empty() {
+        return (runtime_args, model_args);
+    }
+    let mut combined = command_runtime_args;
+    combined.extend(runtime_args);
+    (combined, model_args)
+}
+
+fn partition_optional_model_specific_args(
+    args: Option<Vec<String>>,
+) -> (Option<Vec<String>>, Option<Vec<String>>) {
+    args.map(partition_model_specific_args)
+        .map(|(runtime, model)| (Some(runtime), Some(model)))
+        .unwrap_or((None, None))
+}
+
+struct ProviderRuntimeBlocks {
+    resume: Option<toml::Value>,
+    session_capture: Option<toml::Value>,
+    session_storage: Option<toml::Value>,
+    resume_acceptance: Option<toml::Value>,
+}
+
+fn take_provider_prompt_mode(
+    provider: &mut toml::Table,
+    global_prompt_mode: Option<toml::Value>,
+) -> toml::Value {
+    provider
+        .remove("prompt_mode")
+        .or(global_prompt_mode)
+        .unwrap_or_else(|| toml::Value::String("stdin".to_string()))
+}
+
+fn take_provider_runtime_blocks(provider: &mut toml::Table) -> ProviderRuntimeBlocks {
+    ProviderRuntimeBlocks {
+        resume: provider.remove("resume"),
+        session_capture: provider.remove("session_capture"),
+        session_storage: provider.remove("session_storage"),
+        resume_acceptance: provider.remove("resume_acceptance"),
+    }
+}
+
+struct RuntimeProviderMigration<'a> {
+    runtime: &'a mut toml::Table,
+    provider_name: &'a str,
+    path: &'a Path,
+    has_runtime_blocks: bool,
+    prompt_mode: toml::Value,
+    runtime_parts: &'a ProviderRuntimeParts,
+    blocks: ProviderRuntimeBlocks,
+    moved_blocks: &'a mut Vec<String>,
+}
+
+fn apply_runtime_provider_migration(migration: RuntimeProviderMigration<'_>) -> Result<(), String> {
+    apply_runtime_command(
+        migration.runtime,
+        migration.runtime_parts,
+        migration.provider_name,
+        migration.path,
+    )?;
+    apply_runtime_args(
+        migration.runtime,
+        migration.has_runtime_blocks,
+        migration.runtime_parts,
+        migration.provider_name,
+        migration.path,
+    )?;
+    apply_runtime_interactive_args(
+        migration.runtime,
+        migration.has_runtime_blocks,
+        migration.runtime_parts,
+        migration.provider_name,
+        migration.path,
+    )?;
+    if migration.has_runtime_blocks {
+        set_or_conflict(
+            migration.runtime,
+            "prompt_mode",
+            migration.prompt_mode,
+            migration.provider_name,
+            migration.path,
+        )?;
+    }
+    move_provider_runtime_blocks(
+        migration.runtime,
+        migration.blocks,
+        migration.provider_name,
+        migration.path,
+        migration.moved_blocks,
+    )
+}
+
+fn apply_runtime_command(
+    runtime: &mut toml::Table,
+    runtime_parts: &ProviderRuntimeParts,
+    provider_name: &str,
+    path: &Path,
+) -> Result<(), String> {
+    if let Some(runtime_command) = &runtime_parts.runtime_command {
+        set_or_repair_empty_array(
+            runtime,
+            "command",
+            toml::Value::String(runtime_command.clone()),
+            provider_name,
+            path,
+        )?;
+    }
+    Ok(())
+}
+
+fn apply_runtime_args(
+    runtime: &mut toml::Table,
+    has_runtime_blocks: bool,
+    runtime_parts: &ProviderRuntimeParts,
+    provider_name: &str,
+    path: &Path,
+) -> Result<(), String> {
+    if has_runtime_blocks || !runtime_parts.runtime_args.is_empty() {
+        set_or_repair_empty_array(
+            runtime,
+            "args",
+            string_array_value(runtime_parts.runtime_args.clone()),
+            provider_name,
+            path,
+        )?;
+    }
+    Ok(())
+}
+
+fn apply_runtime_interactive_args(
+    runtime: &mut toml::Table,
+    has_runtime_blocks: bool,
+    runtime_parts: &ProviderRuntimeParts,
+    provider_name: &str,
+    path: &Path,
+) -> Result<(), String> {
+    if has_runtime_blocks || runtime_parts_has_interactive_args(runtime_parts) {
+        set_or_repair_empty_array(
+            runtime,
+            "interactive_args",
+            string_array_value(combined_runtime_interactive_args(runtime_parts)),
+            provider_name,
+            path,
+        )?;
+    }
+    Ok(())
+}
+
+fn runtime_parts_has_interactive_args(runtime_parts: &ProviderRuntimeParts) -> bool {
+    runtime_parts
+        .runtime_interactive_args
+        .as_ref()
+        .is_some_and(|args| !args.is_empty())
+}
+
+fn combined_runtime_interactive_args(runtime_parts: &ProviderRuntimeParts) -> Vec<String> {
+    let mut combined = runtime_parts.command_runtime_args.clone();
+    if let Some(runtime_interactive_args) = &runtime_parts.runtime_interactive_args {
+        combined.extend(runtime_interactive_args.clone());
+    }
+    combined
+}
+
+fn move_provider_runtime_blocks(
+    runtime: &mut toml::Table,
+    blocks: ProviderRuntimeBlocks,
+    provider_name: &str,
+    path: &Path,
+    moved_blocks: &mut Vec<String>,
+) -> Result<(), String> {
+    for (key, value) in provider_runtime_block_entries(blocks) {
+        set_or_conflict(runtime, key, value, provider_name, path)?;
+        moved_blocks.push(format_moved_runtime_block(path, key, provider_name));
+    }
+    Ok(())
+}
+
+fn provider_runtime_block_entries(
+    blocks: ProviderRuntimeBlocks,
+) -> Vec<(&'static str, toml::Value)> {
+    [
+        ("resume", blocks.resume),
+        ("session_capture", blocks.session_capture),
+        ("session_storage", blocks.session_storage),
+        ("resume_acceptance", blocks.resume_acceptance),
+    ]
+    .into_iter()
+    .filter_map(|(key, value)| value.map(|value| (key, value)))
+    .collect()
+}
+
+fn format_moved_runtime_block(path: &Path, key: &str, provider_name: &str) -> String {
+    format!(
+        "{}.{} -> providers.toml[{provider_name}]",
+        path.display(),
+        key
+    )
+}
+
+fn provider_table_from_value(
+    provider_value: toml::Value,
+    path: &Path,
+) -> Result<toml::Table, String> {
+    provider_value
         .as_table()
         .cloned()
-        .ok_or_else(|| format!("provider entry in {} is not a table", path.display()))?;
-    let original_provider = provider.clone();
-    let has_runtime_blocks = provider.contains_key("command")
+        .ok_or_else(|| format!("provider entry in {} is not a table", path.display()))
+}
+
+fn provider_has_runtime_blocks(provider: &toml::Table) -> bool {
+    provider.contains_key("command")
         || provider.contains_key("resume")
         || provider.contains_key("session_capture")
         || provider.contains_key("session_storage")
         || provider.contains_key("resume_acceptance")
-        || provider.contains_key("prompt_mode");
+        || provider.contains_key("prompt_mode")
+}
 
-    let command = provider
+fn take_provider_command(
+    provider: &mut toml::Table,
+    path: &Path,
+) -> Result<Option<String>, String> {
+    provider
         .remove("command")
         .map(|value| {
             value.as_str().map(ToString::to_string).ok_or_else(|| {
@@ -2827,123 +4618,80 @@ fn migrate_provider_table(
                 )
             })
         })
-        .transpose()?;
-    let model_args = take_string_array(&mut provider, "args")?;
-    let model_interactive_args = take_optional_string_array(&mut provider, "interactive_args")?;
-    let provider_name = provider
+        .transpose()
+}
+
+fn derive_migrated_provider_name(
+    provider: &mut toml::Table,
+    command: Option<&str>,
+    model_args: &[String],
+) -> Option<String> {
+    provider
         .remove("name")
         .and_then(|value| value.as_str().map(ToString::to_string))
-        .or_else(|| {
-            command
-                .as_deref()
-                .map(|command| derive_migration_provider_name(command, &model_args))
-        });
-    if !has_runtime_blocks
+        .or_else(|| command.map(|command| derive_migration_provider_name(command, model_args)))
+}
+
+fn should_keep_model_only_provider(
+    has_runtime_blocks: bool,
+    provider_name: Option<&str>,
+    providers_root: &toml::Table,
+) -> bool {
+    !has_runtime_blocks
         && provider_name
-            .as_ref()
             .and_then(|name| providers_root.get(name))
             .is_none()
-    {
-        return Ok(toml::Value::Table(original_provider));
-    }
-    let provider_name = provider_name.ok_or_else(|| {
+}
+
+fn validate_migrated_provider_name(
+    provider_name: Option<String>,
+    path: &Path,
+) -> Result<String, String> {
+    provider_name.ok_or_else(|| {
         format!(
             "Old per-provider config in {} is missing command; run `agents migrate-config` after adding it.",
             path.display()
         )
-    })?;
+    })
+}
 
-    let command_parts = command
-        .as_deref()
-        .map(executor::cli::shell_split)
-        .unwrap_or_default();
-    let runtime_command = command.as_ref().map(|command| {
+fn split_optional_command(command: Option<&str>) -> Vec<String> {
+    command.map(executor::cli::shell_split).unwrap_or_default()
+}
+
+fn runtime_command_from_parts(
+    command: Option<&String>,
+    command_parts: &[String],
+) -> Option<String> {
+    command.map(|command| {
         command_parts
             .first()
             .cloned()
             .unwrap_or_else(|| command.clone())
-    });
-    let command_runtime_args = command_parts.iter().skip(1).cloned().collect::<Vec<_>>();
-    let (mut runtime_args, model_args) = partition_model_specific_args(model_args);
-    let (runtime_interactive_args, model_interactive_args) = model_interactive_args
-        .map(partition_model_specific_args)
-        .map(|(runtime, model)| (Some(runtime), Some(model)))
-        .unwrap_or((None, None));
-    if !command_runtime_args.is_empty() {
-        let mut combined = command_runtime_args.clone();
-        combined.extend(runtime_args);
-        runtime_args = combined;
-    }
+    })
+}
 
-    let prompt_mode = provider
-        .remove("prompt_mode")
-        .or(global_prompt_mode)
-        .unwrap_or_else(|| toml::Value::String("stdin".to_string()));
-    let resume = provider.remove("resume");
-    let session_capture = provider.remove("session_capture");
-    let session_storage = provider.remove("session_storage");
-    let resume_acceptance = provider.remove("resume_acceptance");
+fn command_runtime_args_from_parts(command_parts: &[String]) -> Vec<String> {
+    command_parts.iter().skip(1).cloned().collect()
+}
 
+fn runtime_provider_table<'a>(
+    providers_root: &'a mut toml::Table,
+    provider_name: &str,
+) -> Result<&'a mut toml::Table, String> {
     let runtime = providers_root
-        .entry(provider_name.clone())
+        .entry(provider_name.to_string())
         .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-    let runtime = runtime
+    runtime
         .as_table_mut()
-        .ok_or_else(|| format!("providers.toml entry [{provider_name}] is not a table"))?;
-    if let Some(runtime_command) = runtime_command {
-        set_or_repair_empty_array(
-            runtime,
-            "command",
-            toml::Value::String(runtime_command),
-            &provider_name,
-            path,
-        )?;
-    }
-    if has_runtime_blocks || !runtime_args.is_empty() {
-        set_or_repair_empty_array(
-            runtime,
-            "args",
-            string_array_value(runtime_args),
-            &provider_name,
-            path,
-        )?;
-    }
-    if has_runtime_blocks
-        || runtime_interactive_args
-            .as_ref()
-            .is_some_and(|args| !args.is_empty())
-    {
-        let mut combined = command_runtime_args;
-        if let Some(runtime_interactive_args) = runtime_interactive_args {
-            combined.extend(runtime_interactive_args);
-        }
-        set_or_repair_empty_array(
-            runtime,
-            "interactive_args",
-            string_array_value(combined),
-            &provider_name,
-            path,
-        )?;
-    }
-    if has_runtime_blocks {
-        set_or_conflict(runtime, "prompt_mode", prompt_mode, &provider_name, path)?;
-    }
-    for (key, value) in [
-        ("resume", resume),
-        ("session_capture", session_capture),
-        ("session_storage", session_storage),
-        ("resume_acceptance", resume_acceptance),
-    ] {
-        if let Some(value) = value {
-            set_or_conflict(runtime, key, value, &provider_name, path)?;
-            moved_blocks.push(format!(
-                "{}.{} -> providers.toml[{provider_name}]",
-                path.display(),
-                key
-            ));
-        }
-    }
+        .ok_or_else(|| format!("providers.toml entry [{provider_name}] is not a table"))
+}
 
+fn reduced_provider_value(
+    provider_name: String,
+    model_args: Vec<String>,
+    model_interactive_args: Option<Vec<String>>,
+) -> toml::Value {
     let mut reduced = toml::Table::new();
     reduced.insert("name".to_string(), toml::Value::String(provider_name));
     reduced.insert("args".to_string(), string_array_value(model_args));
@@ -2953,7 +4701,7 @@ fn migrate_provider_table(
             string_array_value(interactive_args),
         );
     }
-    Ok(toml::Value::Table(reduced))
+    toml::Value::Table(reduced)
 }
 
 fn backfill_session_storage_from_sessions(
@@ -2964,20 +4712,10 @@ fn backfill_session_storage_from_sessions(
     if !sessions_path.exists() {
         return Ok(());
     }
-    let sessions = std::fs::read_to_string(sessions_path)
-        .map_err(|e| format!("Failed to read {}: {e}", sessions_path.display()))?
-        .parse::<toml::Table>()
-        .map_err(|e| format!("TOML parse error in {}: {e}", sessions_path.display()))?;
+    let sessions = read_toml_table(sessions_path)?;
 
     for (provider_name, entry) in sessions {
-        let Some(turn_script) = entry
-            .as_table()
-            .and_then(|table| table.get("turn_script"))
-            .and_then(toml::Value::as_str)
-        else {
-            continue;
-        };
-        let Some(storage) = storage_from_turn_script(turn_script) else {
+        let Some(storage) = session_storage_from_entry(&entry) else {
             continue;
         };
         let Some(provider) = providers_root
@@ -2998,20 +4736,52 @@ fn backfill_session_storage_from_sessions(
     Ok(())
 }
 
+fn session_storage_from_entry(entry: &toml::Value) -> Option<toml::Table> {
+    entry
+        .as_table()
+        .and_then(|table| table.get("turn_script"))
+        .and_then(toml::Value::as_str)
+        .and_then(storage_from_turn_script)
+}
+
 fn storage_from_turn_script(turn_script: &str) -> Option<toml::Table> {
+    let (adapter, storage_root) = turn_script_storage_parts(turn_script)?;
+    let adapter_name = Path::new(&adapter).file_name()?.to_str()?;
+    let adapter = turn_script_storage_adapter(adapter_name)?;
+    Some(storage_table_from_turn_script(&storage_root, adapter))
+}
+
+fn turn_script_storage_parts(turn_script: &str) -> Option<(String, String)> {
     let parts = executor::cli::shell_split(turn_script);
-    let adapter = parts.first()?;
-    let storage_root = parts.get(1)?;
-    let adapter_name = Path::new(adapter).file_name()?.to_str()?;
-    let (cwd_adapter, transcript_adapter, storage_type) = match adapter_name {
-        "claude-code-turns" => (
-            "claude-code-cwd",
-            "claude-code-locate-transcript",
-            "claude_code",
-        ),
-        "codex-turns" => ("codex-cwd", "codex-locate-transcript", "codex_session"),
-        _ => return None,
-    };
+    Some((parts.first()?.clone(), parts.get(1)?.clone()))
+}
+
+struct TurnScriptStorageAdapter {
+    cwd_adapter: &'static str,
+    transcript_adapter: &'static str,
+    storage_type: &'static str,
+}
+
+fn turn_script_storage_adapter(adapter_name: &str) -> Option<TurnScriptStorageAdapter> {
+    match adapter_name {
+        "claude-code-turns" => Some(TurnScriptStorageAdapter {
+            cwd_adapter: "claude-code-cwd",
+            transcript_adapter: "claude-code-locate-transcript",
+            storage_type: "claude_code",
+        }),
+        "codex-turns" => Some(TurnScriptStorageAdapter {
+            cwd_adapter: "codex-cwd",
+            transcript_adapter: "codex-locate-transcript",
+            storage_type: "codex_session",
+        }),
+        _ => None,
+    }
+}
+
+fn storage_table_from_turn_script(
+    storage_root: &str,
+    adapter: TurnScriptStorageAdapter,
+) -> toml::Table {
     let storage_root = shell_word_arg(storage_root);
     let mut storage = toml::Table::new();
     storage.insert(
@@ -3020,17 +4790,17 @@ fn storage_from_turn_script(turn_script: &str) -> Option<toml::Table> {
     );
     storage.insert(
         "cwd_script".to_string(),
-        toml::Value::String(format!("{cwd_adapter} {storage_root}")),
+        toml::Value::String(format!("{} {storage_root}", adapter.cwd_adapter)),
     );
     storage.insert(
         "transcript_script".to_string(),
-        toml::Value::String(format!("{transcript_adapter} {storage_root}")),
+        toml::Value::String(format!("{} {storage_root}", adapter.transcript_adapter)),
     );
     storage.insert(
         "storage_type".to_string(),
-        toml::Value::String(storage_type.to_string()),
+        toml::Value::String(adapter.storage_type.to_string()),
     );
-    Some(storage)
+    storage
 }
 
 fn shell_word_arg(input: &str) -> String {
@@ -3051,16 +4821,44 @@ fn set_or_conflict(
     path: &Path,
 ) -> Result<(), String> {
     if let Some(existing) = table.get(key) {
-        if existing != &value {
-            return Err(format!(
-                "conflicting {key} for provider {provider_name} while migrating {}: existing providers.toml value {existing:?}, model TOML value {value:?}",
-                path.display()
-            ));
-        }
+        validate_no_toml_conflict(existing, &value, key, provider_name, path)?;
         return Ok(());
     }
     table.insert(key.to_string(), value);
     Ok(())
+}
+
+fn validate_no_toml_conflict(
+    existing: &toml::Value,
+    value: &toml::Value,
+    key: &str,
+    provider_name: &str,
+    path: &Path,
+) -> Result<(), String> {
+    if existing != value {
+        Err(format_toml_conflict_error(
+            existing,
+            value,
+            key,
+            provider_name,
+            path,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn format_toml_conflict_error(
+    existing: &toml::Value,
+    value: &toml::Value,
+    key: &str,
+    provider_name: &str,
+    path: &Path,
+) -> String {
+    format!(
+        "conflicting {key} for provider {provider_name} while migrating {}: existing providers.toml value {existing:?}, model TOML value {value:?}",
+        path.display()
+    )
 }
 
 fn set_or_repair_empty_array(
@@ -3070,13 +4868,16 @@ fn set_or_repair_empty_array(
     provider_name: &str,
     path: &Path,
 ) -> Result<(), String> {
-    if matches!(table.get(key), Some(toml::Value::Array(existing)) if existing.is_empty())
-        && !matches!(&value, toml::Value::Array(value) if value.is_empty())
-    {
+    if should_repair_empty_array(table.get(key), &value) {
         table.insert(key.to_string(), value);
         return Ok(());
     }
     set_or_conflict(table, key, value, provider_name, path)
+}
+
+fn should_repair_empty_array(existing: Option<&toml::Value>, value: &toml::Value) -> bool {
+    matches!(existing, Some(toml::Value::Array(existing)) if existing.is_empty())
+        && !matches!(value, toml::Value::Array(value) if value.is_empty())
 }
 
 fn take_string_array(table: &mut toml::Table, key: &str) -> Result<Vec<String>, String> {
@@ -3108,13 +4909,21 @@ fn string_array_value(values: Vec<String>) -> toml::Value {
 }
 
 fn derive_migration_provider_name(command: &str, args: &[String]) -> String {
-    let command_parts = executor::cli::shell_split(command);
+    let command_parts = split_migration_command(command);
     let Some(command) = command_parts.first() else {
         return command.to_string();
     };
+    oulipoly_config::derive_provider_name(command, &migration_provider_args(&command_parts, args))
+}
+
+fn split_migration_command(command: &str) -> Vec<String> {
+    executor::cli::shell_split(command)
+}
+
+fn migration_provider_args(command_parts: &[String], args: &[String]) -> Vec<String> {
     let mut derived_args = command_parts.iter().skip(1).cloned().collect::<Vec<_>>();
     derived_args.extend(args.iter().cloned());
-    oulipoly_config::derive_provider_name(command, &derived_args)
+    derived_args
 }
 
 fn partition_model_specific_args(args: Vec<String>) -> (Vec<String>, Vec<String>) {
@@ -3151,20 +4960,50 @@ fn partition_model_specific_args(args: Vec<String>) -> (Vec<String>, Vec<String>
     (runtime, model_specific)
 }
 
+// ---
+// Component: db-migration-backfill
+// Declared roles: orchestration, parser, formatter, predicate, validator, accessor, mapper, filter
+// ---
+
 fn run_resume_list(uuid: &str) -> Result<i32, String> {
-    Uuid::parse_str(uuid).map_err(|e| format!("invalid session UUID: {uuid}: {e}"))?;
-    let state = StateDb::open_default()?;
-    let previews = state
-        .resume_previews(uuid)
-        .map_err(|e| format!("Failed to list resume chains: {e}"))?;
-    if previews.is_empty() {
-        println!("No chains found for {uuid}");
-        return Ok(0);
-    }
-    for preview in previews {
-        println!("{}", format_resume_list_line(&preview));
-    }
+    validate_resume_list_uuid(uuid)?;
+    render_resume_list(uuid, &load_resume_previews(uuid)?);
     Ok(0)
+}
+
+fn validate_resume_list_uuid(uuid: &str) -> Result<(), String> {
+    Uuid::parse_str(uuid)
+        .map(|_| ())
+        .map_err(|e| format!("invalid session UUID: {uuid}: {e}"))
+}
+
+fn load_resume_previews(uuid: &str) -> Result<Vec<oulipoly_state::ChainPreview>, String> {
+    let state = StateDb::open_default()?;
+    state
+        .resume_previews(uuid)
+        .map_err(|e| format!("Failed to list resume chains: {e}"))
+}
+
+fn render_resume_list(uuid: &str, previews: &[oulipoly_state::ChainPreview]) {
+    if resume_preview_list_is_empty(previews) {
+        render_empty_resume_list(uuid);
+        return;
+    }
+    render_resume_preview_lines(previews);
+}
+
+fn resume_preview_list_is_empty(previews: &[oulipoly_state::ChainPreview]) -> bool {
+    previews.is_empty()
+}
+
+fn render_empty_resume_list(uuid: &str) {
+    println!("No chains found for {uuid}");
+}
+
+fn render_resume_preview_lines(previews: &[oulipoly_state::ChainPreview]) {
+    for preview in previews {
+        println!("{}", format_resume_list_line(preview));
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3174,39 +5013,81 @@ struct CompactionBackfillReport {
 }
 
 fn run_compaction_backfill(state: &StateDb) -> Result<CompactionBackfillReport, String> {
-    let config_root = dirs::config_dir()
-        .map(|d| d.join("oulipoly-agent-runner"))
-        .unwrap_or_else(|| PathBuf::from("."));
-    let sessions_path = config_root.join("sessions.toml");
-    let sessions_cfg = oulipoly_config::SessionsConfig::load(&sessions_path)
-        .map_err(|e| format!("Failed to load {}: {e}", sessions_path.display()))?;
-    let models_dir = default_models_dir();
-    let models = if models_dir.is_dir() {
-        load_models(&models_dir, None)?
-    } else {
-        HashMap::new()
-    };
-
-    let mut report = CompactionBackfillReport {
-        turns_flagged: 0,
-        sessions_processed: 0,
-    };
-    for (provider_name, session_id) in state.distinct_chain_segments()? {
-        let Some(path) =
-            locate_compaction_backfill_source(&provider_name, &session_id, &sessions_cfg, &models)
-        else {
+    let env = load_compaction_backfill_environment()?;
+    let mut report = empty_compaction_backfill_report();
+    for (provider_name, session_id) in distinct_compaction_chain_segments(state)? {
+        let Some(path) = locate_compaction_backfill_source(
+            &provider_name,
+            &session_id,
+            &env.sessions_cfg,
+            &env.models,
+        ) else {
             continue;
         };
-        let flagged =
-            flag_compaction_boundaries_from_jsonl(state, &provider_name, &session_id, &path)?;
-        report.turns_flagged += flagged;
-        report.sessions_processed += 1;
-        println!(
-            "compaction backfill session: provider={} session_id={} flagged={}",
-            provider_name, session_id, flagged
-        );
+        let flagged = backfill_compaction_session(state, &provider_name, &session_id, &path)?;
+        accumulate_compaction_backfill(&mut report, flagged);
+        render_compaction_backfill_session(&provider_name, &session_id, flagged);
     }
     Ok(report)
+}
+
+fn empty_compaction_backfill_report() -> CompactionBackfillReport {
+    CompactionBackfillReport {
+        turns_flagged: 0,
+        sessions_processed: 0,
+    }
+}
+
+fn distinct_compaction_chain_segments(state: &StateDb) -> Result<Vec<(String, String)>, String> {
+    state.distinct_chain_segments()
+}
+
+fn backfill_compaction_session(
+    state: &StateDb,
+    provider_name: &str,
+    session_id: &str,
+    path: &Path,
+) -> Result<u64, String> {
+    flag_compaction_boundaries_from_jsonl(state, provider_name, session_id, path)
+}
+
+fn accumulate_compaction_backfill(report: &mut CompactionBackfillReport, flagged: u64) {
+    report.turns_flagged += flagged;
+    report.sessions_processed += 1;
+}
+
+fn render_compaction_backfill_session(provider_name: &str, session_id: &str, flagged: u64) {
+    println!(
+        "compaction backfill session: provider={} session_id={} flagged={}",
+        provider_name, session_id, flagged
+    );
+}
+
+struct CompactionBackfillEnvironment {
+    sessions_cfg: oulipoly_config::SessionsConfig,
+    models: HashMap<String, ModelConfig>,
+}
+
+fn load_compaction_backfill_environment() -> Result<CompactionBackfillEnvironment, String> {
+    Ok(CompactionBackfillEnvironment {
+        sessions_cfg: load_compaction_sessions_config()?,
+        models: load_compaction_models()?,
+    })
+}
+
+fn load_compaction_sessions_config() -> Result<oulipoly_config::SessionsConfig, String> {
+    let sessions_path = default_config_root().join("sessions.toml");
+    oulipoly_config::SessionsConfig::load(&sessions_path)
+        .map_err(|e| format!("Failed to load {}: {e}", sessions_path.display()))
+}
+
+fn load_compaction_models() -> Result<HashMap<String, ModelConfig>, String> {
+    let models_dir = default_models_dir();
+    if models_dir.is_dir() {
+        Ok(load_models(&models_dir, None)?)
+    } else {
+        Ok(HashMap::new())
+    }
 }
 
 fn locate_compaction_backfill_source(
@@ -3215,21 +5096,55 @@ fn locate_compaction_backfill_source(
     sessions_cfg: &oulipoly_config::SessionsConfig,
     models: &HashMap<String, ModelConfig>,
 ) -> Option<PathBuf> {
-    if let Ok(Some(path)) =
-        oulipoly_runtime::sessions::locate_transcript(sessions_cfg, provider_name, session_id)
-        && path.exists()
-    {
+    if let Some(path) = existing_session_transcript_path(sessions_cfg, provider_name, session_id) {
         return Some(path);
     }
 
+    existing_storage_transcript_path(provider_name, session_id, models)
+}
+
+fn existing_session_transcript_path(
+    sessions_cfg: &oulipoly_config::SessionsConfig,
+    provider_name: &str,
+    session_id: &str,
+) -> Option<PathBuf> {
+    let path =
+        oulipoly_runtime::sessions::locate_transcript(sessions_cfg, provider_name, session_id)
+            .ok()
+            .flatten()?;
+    existing_path(path)
+}
+
+fn existing_storage_transcript_path(
+    provider_name: &str,
+    session_id: &str,
+    models: &HashMap<String, ModelConfig>,
+) -> Option<PathBuf> {
+    existing_path(storage_transcript_path(
+        matching_storage_providers(provider_name, models),
+        session_id,
+    )?)
+}
+
+fn matching_storage_providers<'a>(
+    provider_name: &str,
+    models: &'a HashMap<String, ModelConfig>,
+) -> Vec<&'a ProviderConfig> {
     models
         .values()
         .flat_map(|model| model.providers.iter())
         .filter(|provider| provider.name == provider_name)
-        .find_map(|provider| {
-            oulipoly_runtime::migration::find_claude_source_from_storage(provider, session_id)
-        })
-        .filter(|path| path.exists())
+        .collect()
+}
+
+fn storage_transcript_path(providers: Vec<&ProviderConfig>, session_id: &str) -> Option<PathBuf> {
+    providers.into_iter().find_map(|provider| {
+        oulipoly_runtime::migration::find_claude_source_from_storage(provider, session_id)
+    })
+}
+
+fn existing_path(path: PathBuf) -> Option<PathBuf> {
+    if path.exists() { Some(path) } else { None }
 }
 
 fn flag_compaction_boundaries_from_jsonl(
@@ -3238,34 +5153,81 @@ fn flag_compaction_boundaries_from_jsonl(
     session_id: &str,
     path: &Path,
 ) -> Result<u64, String> {
-    let file = std::fs::File::open(path)
-        .map_err(|e| format!("Failed to open compaction source {}: {e}", path.display()))?;
     let mut flagged = 0u64;
-    for line in std::io::BufReader::new(file).lines() {
-        let line = line.map_err(|e| {
-            format!(
-                "Failed to read compaction source line from {}: {e}",
-                path.display()
-            )
-        })?;
-        let Ok(obj) = serde_json::from_str::<serde_json::Value>(&line) else {
+    for line in read_compaction_jsonl_lines(path)? {
+        let Some(turn_id) = compact_summary_turn_id(&line) else {
             continue;
         };
-        if obj
-            .get("isCompactSummary")
-            .and_then(|value| value.as_bool())
-            != Some(true)
-        {
-            continue;
-        }
-        let Some(turn_id) = obj.get("uuid").and_then(|value| value.as_str()) else {
-            continue;
-        };
-        if state.flag_compaction_boundary(provider_name, session_id, turn_id)? {
+        if flag_compaction_boundary(state, provider_name, session_id, &turn_id)? {
             flagged += 1;
         }
     }
     Ok(flagged)
+}
+
+fn read_compaction_jsonl_lines(path: &Path) -> Result<Vec<String>, String> {
+    let file = open_compaction_source(path)?;
+    collect_compaction_jsonl_lines(path, std::io::BufReader::new(file).lines())
+}
+
+fn collect_compaction_jsonl_lines<I>(path: &Path, lines: I) -> Result<Vec<String>, String>
+where
+    I: Iterator<Item = Result<String, std::io::Error>>,
+{
+    lines
+        .map(|line| line.map_err(|e| format_compaction_source_line_error(path, e)))
+        .collect()
+}
+
+fn open_compaction_source(path: &Path) -> Result<std::fs::File, String> {
+    std::fs::File::open(path)
+        .map_err(|e| format!("Failed to open compaction source {}: {e}", path.display()))
+}
+
+fn format_compaction_source_line_error(path: &Path, error: std::io::Error) -> String {
+    format!(
+        "Failed to read compaction source line from {}: {error}",
+        path.display()
+    )
+}
+
+fn flag_compaction_boundary(
+    state: &StateDb,
+    provider_name: &str,
+    session_id: &str,
+    turn_id: &str,
+) -> Result<bool, String> {
+    state.flag_compaction_boundary(provider_name, session_id, turn_id)
+}
+
+fn compact_summary_turn_id(line: &str) -> Option<String> {
+    let obj = parse_compaction_json_line(line)?;
+    compact_summary_turn_uuid(&obj)
+}
+
+fn parse_compaction_json_line(line: &str) -> Option<serde_json::Value> {
+    serde_json::from_str::<serde_json::Value>(line).ok()
+}
+
+fn is_compact_summary_json(obj: &serde_json::Value) -> bool {
+    obj.get("isCompactSummary")
+        .and_then(|value| value.as_bool())
+        == Some(true)
+}
+
+fn compact_summary_turn_uuid(obj: &serde_json::Value) -> Option<String> {
+    if !is_compact_summary_json(obj) {
+        return None;
+    }
+    raw_compact_summary_uuid(obj).map(string_from_str)
+}
+
+fn raw_compact_summary_uuid(obj: &serde_json::Value) -> Option<&str> {
+    obj.get("uuid").and_then(|value| value.as_str())
+}
+
+fn string_from_str(value: &str) -> String {
+    value.to_string()
 }
 
 fn format_resume_list_line(preview: &oulipoly_state::ChainPreview) -> String {
@@ -3286,19 +5248,26 @@ where
     S: Into<String>,
 {
     let args = args.into_iter().map(Into::into).collect::<Vec<String>>();
-    if args.len() >= 4
-        && args.get(1).is_some_and(|arg| arg == "resume")
-        && args.get(2).is_some_and(|arg| arg == "--list")
-    {
-        let mut normalized = Vec::with_capacity(args.len() - 1);
-        normalized.push(args[0].clone());
-        normalized.push("resume-list".to_string());
-        normalized.push(args[3].clone());
-        normalized.extend(args.into_iter().skip(4));
-        normalized
+    if legacy_resume_list_args(&args) {
+        normalized_resume_list_args(args)
     } else {
         args
     }
+}
+
+fn legacy_resume_list_args(args: &[String]) -> bool {
+    args.len() >= 4
+        && args.get(1).is_some_and(|arg| arg == "resume")
+        && args.get(2).is_some_and(|arg| arg == "--list")
+}
+
+fn normalized_resume_list_args(args: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::with_capacity(args.len() - 1);
+    normalized.push(args[0].clone());
+    normalized.push("resume-list".to_string());
+    normalized.push(args[3].clone());
+    normalized.extend(args.into_iter().skip(4));
+    normalized
 }
 
 fn main() -> ExitCode {
