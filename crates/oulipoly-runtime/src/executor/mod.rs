@@ -1,4 +1,6 @@
 pub mod cli;
+pub mod providers;
+pub mod terminal_signal;
 
 use crate::services::{
     ExecutorServiceOutput, ExecutorServicePort, ExecutorServiceRequest, ServiceError,
@@ -8,6 +10,27 @@ use oulipoly_config::ModelConfig;
 use oulipoly_state::CompositeInvocationId;
 use std::collections::HashMap;
 use std::path::Path;
+
+pub use self::providers::claude::Recognizer as ClaudeRecognizer;
+pub use self::providers::codex::Recognizer as CodexRecognizer;
+pub use self::providers::openai_compat::Recognizer as OpenAiCompatRecognizer;
+/// Executor facade terminal-signal DTO re-export.
+///
+/// Negative guard: `oulipoly_runtime::executor::TerminalSignalKind` must not
+/// be a re-export at the executor facade level. Consumers reach the kind via
+/// `oulipoly_runtime::executor::terminal_signal::TerminalSignalKind`.
+///
+/// ```compile_fail
+/// use oulipoly_runtime::executor::TerminalSignalKind;
+/// fn compile_fail_kind_not_in_facade() {
+///     let _ = std::mem::size_of::<TerminalSignalKind>();
+/// }
+/// ```
+pub use self::terminal_signal::TerminalSignal;
+pub use self::terminal_signal::TerminalSignalRecognizer;
+
+// ## Declared roles
+// accessor, formatter, orchestration, mapper
 
 #[allow(dead_code)]
 pub struct ExecutionResult {
@@ -393,5 +416,30 @@ printf 'ok\n'"#,
             String::from_utf8_lossy(&result.stdout),
             "effective=chosen\n"
         );
+    }
+
+    #[test]
+    fn executor_facade_re_exports_terminal_signal_contract_without_kind_alias() {
+        use crate as oulipoly_runtime;
+        use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind;
+        use oulipoly_runtime::executor::{
+            ClaudeRecognizer, CodexRecognizer, OpenAiCompatRecognizer, TerminalSignal,
+            TerminalSignalRecognizer,
+        };
+
+        fn assert_recognizer<T: TerminalSignalRecognizer>() {}
+
+        assert_recognizer::<ClaudeRecognizer>();
+        assert_recognizer::<CodexRecognizer>();
+        assert_recognizer::<OpenAiCompatRecognizer>();
+
+        let signal = TerminalSignal {
+            kind: TerminalSignalKind::Unknown,
+            provider_name: "provider".to_string(),
+            evidence: "unknown".to_string(),
+            observed_at: std::time::UNIX_EPOCH,
+        };
+
+        assert_eq!(signal.kind, TerminalSignalKind::Unknown);
     }
 }
