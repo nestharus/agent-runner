@@ -585,8 +585,18 @@ fn binary_workspace_members() -> Vec<String> {
                 .as_str()
                 .unwrap_or_else(|| panic!("workspace member must be a string, got {member:?}"));
             let manifest = parse_toml(&format!("../../{member_path}/Cargo.toml"));
-            let has_bin = toml_table(&manifest, member_path).contains_key("bin");
-            if has_bin {
+            let has_release_bin = toml_table(&manifest, member_path)
+                .get("bin")
+                .and_then(toml::Value::as_array)
+                .is_some_and(|bins| {
+                    bins.iter().any(|bin| {
+                        bin.as_table()
+                            .and_then(|bin| bin.get("required-features"))
+                            .and_then(toml::Value::as_array)
+                            .is_none_or(Vec::is_empty)
+                    })
+                });
+            if has_release_bin {
                 let package_name = toml_value_at(&manifest, "package.name", &["package", "name"])
                     .as_str()
                     .unwrap_or_else(|| panic!("{member_path} package.name must be a string"));

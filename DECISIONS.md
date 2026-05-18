@@ -2572,3 +2572,38 @@ The AGE-113 finding is even cleaner than AGE-93 D4/D5 because (a) the alignment 
   - Phase 8 join manifest: `planning/age-126-age-89-provenance-manifest/risk/phase-8-join-manifest.json`
   - All 4 PR-review reports at `planning/age-126-age-89-provenance-manifest/risk/age-126-{test-audit,multi-concern,justification,commit-hygiene}.md`
   - Re-verification result: Phase 4 (5 rows) + Phase 6 (17 rows) both 0 mismatches.
+
+## AGE-125 — D1 — Phase 2.5 step 4a: proceed without baseline estimate
+
+- **Source**: AGE-125 `${scratch_dir}/ticket.md` records `estimate_source: missing` (Linear estimate field empty; Sizing hint records P3 default, no numeric story-point value supplied). Phase 2.5 step 4a inherited-estimate cold-start check fires as new-value root-owned question.
+- **Posture**: A — proceed without baseline estimate. Phase 3 produces `refined_story_point_estimate` from the proposal. `estimate_source: missing` is recorded with rationale "AGE-122 duplicates inventory + the two in-tree concurrent-drain precedents (`run_session_script`, `run_script`) are the de-risking step; the fix is a surgical one-function mirror." Phase 4 `estimate_delta_flag.over_2x` is `unknown` (no inherited baseline). Phase 8.X closure judge captures `actual_story_points`.
+- **Rationale (root)**: standard A-pattern matching AGE-122 D3 for the same `estimate_source: missing` condition on a sibling WU spawned from the same RCA cluster. Single surgical function with two in-tree concurrent-drain precedents; no novel design question for a prototype to resolve.
+- **AskUserQuestion**: attempted, permission-denied; question artifact written and `NEEDS_INPUT` halt per `~/ai/conventions/agent-questions-and-session-graph.md` § `AskUserQuestion Permission-Denial`. Root answered A.
+- **Evidence**:
+  - Question artifact: `planning/age-125-setup-agent-pipe-deadlock/.scratch/questions/q-29b03067-e027-4c62-9c2b-b2b377fce67c.question.json`
+  - Answer artifact: `planning/age-125-setup-agent-pipe-deadlock/.scratch/questions/q-29b03067-e027-4c62-9c2b-b2b377fce67c.answer.json`
+  - Audit history: `planning/age-125-setup-agent-pipe-deadlock/audit-history.md` § Round 1
+  - Risk profile (verdict HIGH, 0/5 defer signals): `planning/age-125-setup-agent-pipe-deadlock/risk/age-125-risk-profile.md`
+  - Sibling-WU precedent: `worktrees/age-122-invocation-lifecycle-forensics/DECISIONS.md` § "AGE-122 — D3"
+
+## AGE-125 — D2 — Phase 6 PP-001: project-local schema-owner doc (Option A)
+
+- **Phase**: Phase 6 per-component CQ fanout — round 2 returned HIGH on PP-001 (inherited push-pull coupling on `extract_session_id` parsing Claude CLI stderr session-token vocabulary, in scope under whole-touched-file ownership).
+- **Question**: `planning/age-125-setup-agent-pipe-deadlock/.scratch/questions/q-4a25397d-015a-4411-ae0e-06f3abb9c3cd.question.json`
+- **Answer**: `planning/age-125-setup-agent-pipe-deadlock/.scratch/questions/q-4a25397d-015a-4411-ae0e-06f3abb9c3cd.answer.json` — root selected option A.
+- **Posture**: A — declare the Claude CLI stderr session-token vocabulary (`Session: <id>` and `session_id: <id>` forms with parse semantics) in a project-local canonical schema-owner Markdown file. The pull site cites the schema owner as declared interface; under `~/ai/agents/push-pull-auditor.md` § Metric Binding "LOW canonical-doc-as-schema proof", a `## Schema` declaration in a canonical-by-role project Markdown file qualifies as schema owner.
+- **Schema-owner doc**: `conventions/claude-cli-output-format.md` (new file, repo-owned, project-local). Declares both forms, parse semantics, stability contract, consumers table, out-of-scope statement, source attribution, and audit binding.
+- **Callsite docs**: `crates/oulipoly-setup/src/agent.rs` adapter declaration + `## External-schema pulls` module-doc section + function-level docs on `extract_session_id` and `SetupAgent::update_session_id`, all citing the schema-owner doc. Contract artifact (`planning/age-125-setup-agent-pipe-deadlock/contracts/age-125-setup-agent-pipe-deadlock.md`) adapter declaration updated to match.
+- **Bonus splits resolved alongside**:
+  - FC-001 (fixture `main` mixed orchestration + formatter): extracted `fn report_write_failure(err: io::Error)` formatter helper; `main` is now single-classification orchestration.
+  - FC-002 (`usage_and_exit` mixed orchestration + formatter): renamed to `fn emit_usage(message: &str)` (formatter only); five call sites now sequence `emit_usage(...)` + `process::exit(2)` at the call site, each single-classification orchestration.
+- **Outcome**: Round 15 — Phase 6 per-component CQ R3 ALL LOW. cohesion=LOW, function-classification=LOW, push-pull=LOW. Aggregate=LOW. PP-001/FC-001/FC-002 all cleared. Phase 6 join manifest written; Process-tree audit #2 PASS after PT-001 (stale side-channel manifest from orphan-session interruption) was repaired by updating `step6c_invocation_uuid`, `step6c_prompt_path`, `step6c_log_path` to actual values per ACR-247.
+- **Bonus inherited touched-file fix**: `src-tauri/tests/workflow_yml_contract.rs::binary_workspace_members` (helper) refined to exclude `[[bin]]` entries with `required-features` (test-only bins) from the binary-clients release-path check. This is required because AGE-125's touched `crates/oulipoly-setup/Cargo.toml` added a feature-gated `[[bin]] claude_stub` for integration tests; without the refinement, `assertion_a08_binary_clients_have_release_path` fails because there is no `build-oulipoly-setup` release job (correctly — the bin is test-only). The grandfathered `oulipoly-agent-cli` exclusion is preserved. This is touched-file overlay scope, not feature scope expansion.
+- **Anti-scope honored**: NO residual acceptance (PP-001 cleared on the merits via canonical-doc-as-schema proof, not residual); NO precedent-citation as residual basis; NO bootstrap-exception; NO splitting AGE-125 because Option A converged; NO `tests/test_*.py` smuggling.
+- **Evidence**:
+  - Audit history: `planning/age-125-setup-agent-pipe-deadlock/audit-history.md` § "Resume — root answer A" and § "Round 15".
+  - R3 dispatch log: `planning/age-125-setup-agent-pipe-deadlock/.scratch/logs/age-125-setup-agent-pipe-deadlock-code-quality-r3.log` (invocation `ea1d7023`).
+  - R3 aggregate report: `planning/age-125-setup-agent-pipe-deadlock/code-quality/age-125-setup-agent-pipe-deadlock/aggregate-code-quality.md` (verdict LOW).
+  - R3 normalized findings: `planning/age-125-setup-agent-pipe-deadlock/code-quality/age-125-setup-agent-pipe-deadlock/findings.json` (empty `findings`, `cleared_round2_findings` lists PP-001/FC-001/FC-002).
+  - Phase 6 join manifest: `planning/age-125-setup-agent-pipe-deadlock/risk/phase-6-join-manifest.json`.
+  - Phase 6 process-tree audit #2: `planning/age-125-setup-agent-pipe-deadlock/risk/age-125-phase-6-process-tree-audit.md` (verdict PASS after Round 2 with composite launch-shape evidence).
