@@ -1,3 +1,37 @@
+//! ## Declared roles
+//!
+//! Roles: orchestration, mapper, parser, validator, formatter, filter,
+//! accessor.
+//!
+//! - orchestration: top-level execute / execute_effective / execute_resume /
+//!   execute_interactive entrypoints.
+//! - mapper: translating ExecutionResult / InteractiveExecutionResult /
+//!   TerminalSignal between internal carriers and external consumers;
+//!   exit-status to terminal-reason mapping.
+//! - parser: shell_split, provider_name classification, child-marker parsing
+//!   from stderr, and in-band recognizer wiring.
+//! - validator: InputType / ResumeKind / ResumeStrategy validation and spawn
+//!   precondition checks.
+//! - formatter: compose_resume_args and command construction for Command.
+//! - filter: selecting matching output patterns and non-empty stream chunks.
+//! - accessor: return-channel and nested JSON path retrieval helpers.
+//!
+//! ## Declared coupling carriers
+//!
+//! InputType, ModelConfig, PromptMode, ProviderConfig, ResumeKind,
+//! ResumeStrategy, SessionCapture, SessionCaptureKind, ToolRestrictionKind,
+//! oulipoly_config::InputDef, oulipoly_config::ResumeAcceptanceRules,
+//! std::process::Child, std::process::Command, std::process::ExitStatus,
+//! std::process::Stdio, std::io::Write, std::path::Path, std::path::PathBuf,
+//! std::sync::Arc, std::sync::atomic::AtomicBool,
+//! std::sync::atomic::Ordering, std::thread,
+//! signal_hook::consts::signal::SIGHUP, signal_hook::consts::signal::SIGINT,
+//! signal_hook::consts::signal::SIGTERM,
+//! signal_hook::iterator::SignalsHandle, signal_hook::iterator::Signals,
+//! libc.
+//!
+//! Subordinate carrier: std::os::unix::process::ExitStatusExt.
+
 use oulipoly_config::{
     InputType, ModelConfig, PromptMode, ProviderConfig, ResumeKind, ResumeStrategy, SessionCapture,
     SessionCaptureKind, ToolRestrictionKind,
@@ -5,18 +39,18 @@ use oulipoly_config::{
 use oulipoly_state::CompositeInvocationId;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
 use std::process::Child;
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::mpsc;
 #[cfg(unix)]
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-#[cfg(unix)]
 use std::thread;
+use std::time::{Duration, Instant, SystemTime};
 
 #[cfg(unix)]
 use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
@@ -25,10 +59,16 @@ use signal_hook::iterator::{Handle as SignalsHandle, Signals};
 
 use super::{
     CapturedChildInvocation, ExecutionResult, ResumeAcceptanceResult, ResumeAcceptanceStatus,
-    ReturnedArtifactRef, SessionCaptureMethod, SessionCaptureResult,
+    ReturnedArtifactRef, SessionCaptureMethod, SessionCaptureResult, TerminalSignal,
+};
+use crate::executor::terminal_signal::{
+    TerminalSignalEvidence, TerminalSignalKind, TerminalSignalRecognizer, TerminalStatusEvidence,
 };
 
 const LARGE_PROMPT_THRESHOLD: usize = 100 * 1024; // 100KB
+const BOUNDED_SILENCE_DEFAULT: Duration = Duration::from_secs(90);
+const BOUNDED_SILENCE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const TERMINATE_GRACE_PERIOD: Duration = Duration::from_millis(250);
 
 pub fn execute(
     model: &ModelConfig,
@@ -38,16 +78,8 @@ pub fn execute(
     extra_inputs: &HashMap<String, Vec<String>>,
     parent_invocation_env: Option<&str>,
 ) -> Result<ExecutionResult, String> {
-    let provider = model.providers.get(provider_index).ok_or_else(|| {
-        format!(
-            "Provider index {} out of range for model {}",
-            provider_index, model.name
-        )
-    })?;
-
-    // Resolve inputs to flag args
+    let provider = provider_for_index(model, provider_index)?;
     let input_args = resolve_input_flags(model, extra_inputs)?;
-
     let (result, temp_files) = execute_provider(
         provider,
         model.prompt_mode,
@@ -57,21 +89,31 @@ pub fn execute(
         parent_invocation_env,
         None,
     )?;
-    for path in temp_files {
-        let _ = std::fs::remove_file(path);
-    }
+    cleanup_temp_files(temp_files);
 
-    Ok(ExecutionResult {
-        stdout: result.stdout,
-        stderr: result.stderr,
-        exit_code: result.exit_code,
+    Ok(execution_result_from_raw(
+        result,
         provider_index,
-        session_capture: result.session_capture,
-        resume_acceptance: None,
-        terminal_reason: result.terminal_reason,
-        captured_child_invocations: result.captured_child_invocations,
-        returned_artifacts: result.returned_artifacts,
-    })
+        None,
+        None,
+    ))
+}
+
+fn provider_for_index(
+    model: &ModelConfig,
+    provider_index: usize,
+) -> Result<&ProviderConfig, String> {
+    model
+        .providers
+        .get(provider_index)
+        .ok_or_else(|| provider_index_out_of_range_message(model, provider_index))
+}
+
+fn provider_index_out_of_range_message(model: &ModelConfig, provider_index: usize) -> String {
+    format!(
+        "Provider index {} out of range for model {}",
+        provider_index, model.name
+    )
 }
 
 pub struct EffectiveExecuteRequest<'a> {
@@ -93,31 +135,78 @@ pub fn execute_effective_with_start_known_provider_session_id(
     request: EffectiveExecuteRequest<'_>,
     start_known_provider_session_id: Option<&str>,
 ) -> Result<ExecutionResult, String> {
+    execute_effective_with_optional_bounded_silence_config(
+        request,
+        start_known_provider_session_id,
+        None,
+    )
+}
+
+#[cfg(test)]
+fn execute_effective_with_bounded_silence_config(
+    request: EffectiveExecuteRequest<'_>,
+    start_known_provider_session_id: Option<&str>,
+    bounded_silence_config: BoundedSilenceConfig,
+) -> Result<ExecutionResult, String> {
+    execute_effective_with_optional_bounded_silence_config(
+        request,
+        start_known_provider_session_id,
+        Some(bounded_silence_config),
+    )
+}
+
+fn execute_effective_with_optional_bounded_silence_config(
+    request: EffectiveExecuteRequest<'_>,
+    start_known_provider_session_id: Option<&str>,
+    bounded_silence_config: Option<BoundedSilenceConfig>,
+) -> Result<ExecutionResult, String> {
     let input_args = resolve_input_flags(request.model, request.extra_inputs)?;
-    let (result, temp_files) = execute_provider(
+    let (result, temp_files) = execute_provider_with_arg_parts_and_bounded_silence_config(
         request.provider,
+        &request.provider.args,
+        &[],
         request.prompt_mode,
         request.prompt,
         request.working_dir,
         &input_args,
         request.parent_invocation_env,
         start_known_provider_session_id,
+        bounded_silence_config,
     )?;
+    cleanup_temp_files(temp_files);
+
+    Ok(execution_result_from_raw(
+        result,
+        request.provider_index,
+        None,
+        None,
+    ))
+}
+
+fn cleanup_temp_files(temp_files: Vec<PathBuf>) {
     for path in temp_files {
         let _ = std::fs::remove_file(path);
     }
+}
 
-    Ok(ExecutionResult {
+fn execution_result_from_raw(
+    result: RawResult,
+    provider_index: usize,
+    resume_acceptance: Option<ResumeAcceptanceResult>,
+    session_capture_override: Option<SessionCaptureResult>,
+) -> ExecutionResult {
+    ExecutionResult {
         stdout: result.stdout,
         stderr: result.stderr,
         exit_code: result.exit_code,
-        provider_index: request.provider_index,
-        session_capture: result.session_capture,
-        resume_acceptance: None,
+        provider_index,
+        session_capture: session_capture_override.unwrap_or(result.session_capture),
+        resume_acceptance,
         terminal_reason: result.terminal_reason,
+        terminal_signal: result.terminal_signal,
         captured_child_invocations: result.captured_child_invocations,
         returned_artifacts: result.returned_artifacts,
-    })
+    }
 }
 
 /// Map user-provided inputs to CLI flag arguments based on the model's input schema.
@@ -125,52 +214,104 @@ fn resolve_input_flags(
     model: &ModelConfig,
     extra_inputs: &HashMap<String, Vec<String>>,
 ) -> Result<Vec<String>, String> {
-    let mut args = Vec::new();
+    validate_extra_inputs(model, extra_inputs)?;
+    validate_required_inputs(model, extra_inputs)?;
+    Ok(format_input_flags(model, extra_inputs))
+}
 
+fn validate_extra_inputs(
+    model: &ModelConfig,
+    extra_inputs: &HashMap<String, Vec<String>>,
+) -> Result<(), String> {
     for (key, values) in extra_inputs {
-        // Find the matching input definition
-        let input_def = model.inputs.iter().find(|i| i.name == *key);
-
-        let flag = match input_def {
-            Some(def) => {
-                // Validate the value(s) against the schema
-                validate_input_values(values, def)?;
-                // Use declared flag, or fall back to --name
-                def.flag.clone().unwrap_or_else(|| format!("--{}", key))
-            }
-            None => {
-                // Unknown input — pass through as --name (user knows what they're doing)
-                format!("--{}", key)
-            }
-        };
-
-        // For array types or repeated values, emit the flag once per value
-        for val in values {
-            args.push(flag.clone());
-            args.push(val.clone());
+        if let Some(input_def) = input_def_by_name(model, key) {
+            validate_input_values(values, input_def)?;
         }
     }
+    Ok(())
+}
 
-    // Apply defaults for inputs not provided by the user
+fn validate_required_inputs(
+    model: &ModelConfig,
+    extra_inputs: &HashMap<String, Vec<String>>,
+) -> Result<(), String> {
     for input_def in &model.inputs {
-        if input_def.default_input {
-            continue; // Default input is the prompt, handled separately
-        }
-        if extra_inputs.contains_key(&input_def.name) {
-            continue; // Already provided
-        }
-        if let Some(ref default) = input_def.default {
-            if let Some(ref flag) = input_def.flag {
-                let val = toml_value_to_string(default);
-                args.push(flag.clone());
-                args.push(val);
-            }
-        } else if input_def.required {
-            return Err(format!("Required input '{}' not provided", input_def.name));
+        if input_requires_user_value(input_def, extra_inputs) {
+            return Err(required_input_message(&input_def.name));
         }
     }
+    Ok(())
+}
 
-    Ok(args)
+fn input_requires_user_value(
+    input_def: &oulipoly_config::InputDef,
+    extra_inputs: &HashMap<String, Vec<String>>,
+) -> bool {
+    !input_def.default_input
+        && !extra_inputs.contains_key(&input_def.name)
+        && input_def.default.is_none()
+        && input_def.required
+}
+
+fn required_input_message(name: &str) -> String {
+    format!("Required input '{name}' not provided")
+}
+
+fn format_input_flags(
+    model: &ModelConfig,
+    extra_inputs: &HashMap<String, Vec<String>>,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    append_extra_input_flags(&mut args, model, extra_inputs);
+    append_default_input_flags(&mut args, model, extra_inputs);
+    args
+}
+
+fn append_extra_input_flags(
+    args: &mut Vec<String>,
+    model: &ModelConfig,
+    extra_inputs: &HashMap<String, Vec<String>>,
+) {
+    for (key, values) in extra_inputs {
+        let flag = input_def_by_name(model, key)
+            .and_then(|def| def.flag.clone())
+            .unwrap_or_else(|| fallback_input_flag(key));
+        append_repeated_flag_values(args, &flag, values);
+    }
+}
+
+fn append_default_input_flags(
+    args: &mut Vec<String>,
+    model: &ModelConfig,
+    extra_inputs: &HashMap<String, Vec<String>>,
+) {
+    for input_def in &model.inputs {
+        if input_def.default_input || extra_inputs.contains_key(&input_def.name) {
+            continue;
+        }
+        if let (Some(default), Some(flag)) = (&input_def.default, &input_def.flag) {
+            args.push(flag.clone());
+            args.push(toml_value_to_string(default));
+        }
+    }
+}
+
+fn input_def_by_name<'a>(
+    model: &'a ModelConfig,
+    name: &str,
+) -> Option<&'a oulipoly_config::InputDef> {
+    model.inputs.iter().find(|input| input.name == name)
+}
+
+fn fallback_input_flag(name: &str) -> String {
+    format!("--{name}")
+}
+
+fn append_repeated_flag_values(args: &mut Vec<String>, flag: &str, values: &[String]) {
+    for val in values {
+        args.push(flag.to_string());
+        args.push(val.clone());
+    }
 }
 
 fn validate_input_values(
@@ -289,6 +430,7 @@ struct RawResult {
     exit_code: i32,
     session_capture: SessionCaptureResult,
     terminal_reason: Option<String>,
+    terminal_signal: Option<TerminalSignal>,
     captured_child_invocations: Vec<CapturedChildInvocation>,
     returned_artifacts: Vec<ReturnedArtifactRef>,
 }
@@ -298,24 +440,108 @@ struct ReturnChannel {
     dir: PathBuf,
 }
 
-impl ReturnChannel {
-    fn cleanup(&self) {
-        if let Err(err) = std::fs::remove_file(&self.path) {
-            eprintln!(
-                "Warning: failed to delete return channel {}: {err}",
-                self.path.display()
-            );
-        }
-        if let Err(err) = std::fs::remove_dir(&self.dir)
-            && err.kind() != std::io::ErrorKind::NotFound
-            && err.kind() != std::io::ErrorKind::DirectoryNotEmpty
-        {
-            eprintln!(
-                "Warning: failed to delete return channel directory {}: {err}",
-                self.dir.display()
-            );
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderRecognizer {
+    Claude,
+    Codex,
+    OpenAiCompat,
+}
+
+impl ProviderRecognizer {
+    fn for_provider(provider: &ProviderConfig) -> Self {
+        let command_provider = provider_executable_name(provider)
+            .unwrap_or_else(|| command_provider_basename(provider_name(&provider.command)));
+        if provider.name.starts_with("claude") || command_provider.starts_with("claude") {
+            Self::Claude
+        } else if provider.name.starts_with("codex") || command_provider.starts_with("codex") {
+            Self::Codex
+        } else {
+            Self::OpenAiCompat
         }
     }
+
+    fn recognize(&self, evidence: &TerminalSignalEvidence<'_>) -> TerminalSignal {
+        match self {
+            Self::Claude => crate::executor::providers::claude::Recognizer.recognize(evidence),
+            Self::Codex => crate::executor::providers::codex::Recognizer.recognize(evidence),
+            Self::OpenAiCompat => {
+                crate::executor::providers::openai_compat::Recognizer.recognize(evidence)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BoundedSilenceConfig {
+    silence_ceiling: Duration,
+    prompt_mode: PromptMode,
+    prompt_payload: Option<Vec<u8>>,
+    recognizer: ProviderRecognizer,
+}
+
+impl BoundedSilenceConfig {
+    fn production(
+        provider: &ProviderConfig,
+        prompt_mode: PromptMode,
+        prompt_payload: Vec<u8>,
+    ) -> Self {
+        Self {
+            silence_ceiling: BOUNDED_SILENCE_DEFAULT,
+            prompt_mode,
+            prompt_payload: (prompt_mode == PromptMode::Stdin).then_some(prompt_payload),
+            recognizer: ProviderRecognizer::for_provider(provider),
+        }
+    }
+
+    fn with_prompt_contract(
+        mut self,
+        prompt_mode: PromptMode,
+        prompt_payload: Option<Vec<u8>>,
+    ) -> Self {
+        self.prompt_mode = prompt_mode;
+        self.prompt_payload = prompt_payload;
+        self
+    }
+}
+
+impl ReturnChannel {
+    fn cleanup(&self) {
+        cleanup_return_channel_file(&self.path);
+        cleanup_return_channel_dir(&self.dir);
+    }
+}
+
+fn cleanup_return_channel_file(path: &Path) {
+    if let Err(err) = std::fs::remove_file(path) {
+        eprintln!("{}", delete_return_channel_warning(path, &err));
+    }
+}
+
+fn cleanup_return_channel_dir(dir: &Path) {
+    if let Err(err) = std::fs::remove_dir(dir)
+        && return_channel_dir_cleanup_should_warn(&err)
+    {
+        eprintln!("{}", delete_return_channel_dir_warning(dir, &err));
+    }
+}
+
+fn return_channel_dir_cleanup_should_warn(err: &std::io::Error) -> bool {
+    err.kind() != std::io::ErrorKind::NotFound
+        && err.kind() != std::io::ErrorKind::DirectoryNotEmpty
+}
+
+fn delete_return_channel_warning(path: &Path, err: &std::io::Error) -> String {
+    format!(
+        "Warning: failed to delete return channel {}: {err}",
+        path.display()
+    )
+}
+
+fn delete_return_channel_dir_warning(dir: &Path, err: &std::io::Error) -> String {
+    format!(
+        "Warning: failed to delete return channel directory {}: {err}",
+        dir.display()
+    )
 }
 
 fn prepare_return_channel(
@@ -324,58 +550,123 @@ fn prepare_return_channel(
     let Some(parent_invocation_env) = parent_invocation_env else {
         return Ok(None);
     };
-    let invocation = CompositeInvocationId::parse_env_value(parent_invocation_env)
-        .map_err(|err| format!("Failed to parse parent invocation for return channel: {err}"))?;
-    let dir = std::env::temp_dir()
+    let invocation = parse_return_channel_parent_invocation(parent_invocation_env)?;
+    let dir = return_channel_dir(&invocation);
+    create_return_channel_dir(&dir)?;
+    let path = return_channel_path(&dir);
+    create_return_channel_file(&path)?;
+    Ok(Some(return_channel(path, dir)))
+}
+
+fn parse_return_channel_parent_invocation(
+    parent_invocation_env: &str,
+) -> Result<CompositeInvocationId, String> {
+    CompositeInvocationId::parse_env_value(parent_invocation_env)
+        .map_err(|err| format!("Failed to parse parent invocation for return channel: {err}"))
+}
+
+fn return_channel_dir(invocation: &CompositeInvocationId) -> PathBuf {
+    std::env::temp_dir()
         .join("oulipoly-return-channels")
-        .join(&invocation.id);
-    std::fs::create_dir_all(&dir).map_err(|err| {
-        format!(
-            "Failed to create return channel directory {}: {err}",
-            dir.display()
-        )
-    })?;
-    let path = dir.join(format!("returns-{}.jsonl", uuid::Uuid::new_v4()));
+        .join(&invocation.id)
+}
+
+fn create_return_channel_dir(dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|err| create_return_channel_dir_error(dir, &err))
+}
+
+fn create_return_channel_dir_error(dir: &Path, err: &std::io::Error) -> String {
+    format!(
+        "Failed to create return channel directory {}: {err}",
+        dir.display()
+    )
+}
+
+fn return_channel_path(dir: &Path) -> PathBuf {
+    dir.join(format!("returns-{}.jsonl", uuid::Uuid::new_v4()))
+}
+
+fn create_return_channel_file(path: &Path) -> Result<(), String> {
     std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
-        .open(&path)
-        .map_err(|err| format!("Failed to create return channel {}: {err}", path.display()))?;
-    Ok(Some(ReturnChannel { path, dir }))
+        .open(path)
+        .map(|_| ())
+        .map_err(|err| create_return_channel_file_error(path, &err))
+}
+
+fn create_return_channel_file_error(path: &Path, err: &std::io::Error) -> String {
+    format!("Failed to create return channel {}: {err}", path.display())
+}
+
+fn return_channel(path: PathBuf, dir: PathBuf) -> ReturnChannel {
+    ReturnChannel { path, dir }
 }
 
 fn read_return_channel(channel: &ReturnChannel) -> Vec<ReturnedArtifactRef> {
-    let body = match std::fs::read_to_string(&channel.path) {
-        Ok(body) => body,
-        Err(err) => {
-            eprintln!(
-                "Warning: failed to read return channel {}: {err}",
-                channel.path.display()
-            );
-            return Vec::new();
-        }
+    let body = match read_return_channel_body(&channel.path) {
+        Some(body) => body,
+        None => return Vec::new(),
     };
+    parse_return_channel_body(&body, &channel.path)
+}
+
+fn read_return_channel_body(path: &Path) -> Option<String> {
+    match std::fs::read_to_string(path) {
+        Ok(body) => Some(body),
+        Err(err) => {
+            eprintln!("{}", read_return_channel_warning(path, &err));
+            None
+        }
+    }
+}
+
+fn read_return_channel_warning(path: &Path, err: &std::io::Error) -> String {
+    format!(
+        "Warning: failed to read return channel {}: {err}",
+        path.display()
+    )
+}
+
+fn parse_return_channel_body(body: &str, path: &Path) -> Vec<ReturnedArtifactRef> {
     body.lines()
         .enumerate()
-        .filter_map(|(index, line)| {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                return None;
-            }
-            match serde_json::from_str::<ReturnedArtifactRef>(trimmed) {
-                Ok(reference) => Some(reference),
-                Err(err) => {
-                    eprintln!(
-                        "Warning: failed to parse return channel line {} in {}: {err}",
-                        index + 1,
-                        channel.path.display()
-                    );
-                    None
-                }
-            }
-        })
+        .filter_map(|(index, line)| parse_return_channel_line(index, line, path))
         .collect()
+}
+
+fn parse_return_channel_line(index: usize, line: &str, path: &Path) -> Option<ReturnedArtifactRef> {
+    let trimmed = line.trim();
+    if return_channel_line_is_empty(trimmed) {
+        return None;
+    }
+    match serde_json::from_str::<ReturnedArtifactRef>(trimmed) {
+        Ok(reference) => Some(reference),
+        Err(err) => {
+            eprintln!(
+                "{}",
+                parse_return_channel_line_warning(index + 1, path, &err)
+            );
+            None
+        }
+    }
+}
+
+fn return_channel_line_is_empty(line: &str) -> bool {
+    line.is_empty()
+}
+
+fn parse_return_channel_line_warning(
+    line_number: usize,
+    path: &Path,
+    err: &serde_json::Error,
+) -> String {
+    format!(
+        "Warning: failed to parse return channel line {} in {}: {err}",
+        line_number,
+        path.display()
+    )
 }
 
 pub struct ResumePayload<'a> {
@@ -405,14 +696,24 @@ fn append_resume_args(
     strategy: &ResumeStrategy,
     session_id: &str,
 ) -> Result<(), String> {
+    let args = validate_resume_strategy(strategy)?;
+    append_validated_resume_args(provider_args, args, session_id);
+    Ok(())
+}
+
+enum ValidatedResumeArgs<'a> {
+    Flag(&'a str),
+    Subcommand(&'a [String]),
+}
+
+fn validate_resume_strategy(strategy: &ResumeStrategy) -> Result<ValidatedResumeArgs<'_>, String> {
     match strategy.kind {
         ResumeKind::Flag => {
             let flag = strategy
                 .flag
                 .as_ref()
                 .ok_or_else(|| "resume.flag is required".to_string())?;
-            provider_args.push(flag.clone());
-            provider_args.push(session_id.to_string());
+            Ok(ValidatedResumeArgs::Flag(flag))
         }
         ResumeKind::Subcommand => {
             let subcommand = strategy
@@ -422,11 +723,26 @@ fn append_resume_args(
             if subcommand.is_empty() {
                 return Err("resume.subcommand is required".to_string());
             }
+            Ok(ValidatedResumeArgs::Subcommand(subcommand))
+        }
+    }
+}
+
+fn append_validated_resume_args(
+    provider_args: &mut Vec<String>,
+    args: ValidatedResumeArgs<'_>,
+    session_id: &str,
+) {
+    match args {
+        ValidatedResumeArgs::Flag(flag) => {
+            provider_args.push(flag.to_string());
+            provider_args.push(session_id.to_string());
+        }
+        ValidatedResumeArgs::Subcommand(subcommand) => {
             provider_args.extend(subcommand.iter().cloned());
             provider_args.push(session_id.to_string());
         }
     }
-    Ok(())
 }
 
 fn build_command(
@@ -436,11 +752,35 @@ fn build_command(
     parent_invocation_env: Option<&str>,
     return_channel: Option<&Path>,
 ) -> Result<Command, String> {
-    let parts = shell_split(&provider.command);
+    let parts = parse_command_parts(&provider.command);
+    validate_command_parts(&parts)?;
+    Ok(command_from_parts(
+        &parts,
+        provider_args,
+        working_dir,
+        parent_invocation_env,
+        return_channel,
+    ))
+}
+
+fn parse_command_parts(command: &str) -> Vec<String> {
+    shell_split(command)
+}
+
+fn validate_command_parts(parts: &[String]) -> Result<(), String> {
     if parts.is_empty() {
         return Err("Empty command".to_string());
     }
+    Ok(())
+}
 
+fn command_from_parts(
+    parts: &[String],
+    provider_args: &[String],
+    working_dir: Option<&Path>,
+    parent_invocation_env: Option<&str>,
+    return_channel: Option<&Path>,
+) -> Command {
     let mut cmd = Command::new(&parts[0]);
     for part in &parts[1..] {
         cmd.arg(part);
@@ -461,7 +801,7 @@ fn build_command(
         cmd.env_remove("OULIPOLY_RETURN_CHANNEL");
     }
 
-    Ok(cmd)
+    cmd
 }
 
 fn execute_provider(
@@ -527,101 +867,788 @@ fn execute_provider_with_arg_parts(
     parent_invocation_env: Option<&str>,
     start_known_provider_session_id: Option<&str>,
 ) -> Result<(RawResult, Vec<PathBuf>), String> {
-    let return_channel = prepare_return_channel(parent_invocation_env)?;
-    let mut base_args = provider_args.to_vec();
-    let mut policy_prompt = Some(prompt.to_string());
-    apply_provider_policy(provider, &mut base_args, &mut policy_prompt)?;
-    let rendered_prompt = policy_prompt.unwrap_or_else(|| prompt.to_string());
-    let mut cmd = build_command(
+    execute_provider_with_arg_parts_and_bounded_silence_config(
         provider,
-        &base_args,
+        provider_args,
+        tail_args,
+        prompt_mode,
+        prompt,
         working_dir,
+        input_args,
         parent_invocation_env,
+        start_known_provider_session_id,
+        None,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "executor call shape keeps base args, lifecycle tail args, prompt mode, cwd, input flags, parent marker, optional start-bound session, and optional bounded-silence test injection explicit"
+)]
+fn execute_provider_with_arg_parts_and_bounded_silence_config(
+    provider: &ProviderConfig,
+    provider_args: &[String],
+    tail_args: &[String],
+    prompt_mode: PromptMode,
+    prompt: &str,
+    working_dir: Option<&Path>,
+    input_args: &[String],
+    parent_invocation_env: Option<&str>,
+    start_known_provider_session_id: Option<&str>,
+    bounded_silence_config: Option<BoundedSilenceConfig>,
+) -> Result<(RawResult, Vec<PathBuf>), String> {
+    let launch = assemble_provider_launch(
+        ProviderLaunchRequest {
+            provider,
+            provider_args,
+            tail_args,
+            prompt_mode,
+            prompt,
+            working_dir,
+            input_args,
+            parent_invocation_env,
+            start_known_provider_session_id,
+        },
+        bounded_silence_config,
+    )?;
+    let output = run_provider_supervisor(launch.cmd, provider, launch.supervisor_config)?;
+    let returned_artifacts = read_and_cleanup_return_channel(&launch.return_channel);
+    let result =
+        raw_result_from_supervised_output(&launch.capture_plan, output, returned_artifacts);
+
+    Ok((result, launch.temp_files))
+}
+
+struct ProviderLaunchRequest<'a> {
+    provider: &'a ProviderConfig,
+    provider_args: &'a [String],
+    tail_args: &'a [String],
+    prompt_mode: PromptMode,
+    prompt: &'a str,
+    working_dir: Option<&'a Path>,
+    input_args: &'a [String],
+    parent_invocation_env: Option<&'a str>,
+    start_known_provider_session_id: Option<&'a str>,
+}
+
+struct ProviderLaunch {
+    cmd: Command,
+    supervisor_config: BoundedSilenceConfig,
+    capture_plan: CapturePlan,
+    return_channel: Option<ReturnChannel>,
+    temp_files: Vec<PathBuf>,
+}
+
+fn assemble_provider_launch(
+    request: ProviderLaunchRequest<'_>,
+    bounded_silence_config: Option<BoundedSilenceConfig>,
+) -> Result<ProviderLaunch, String> {
+    let return_channel = prepare_return_channel(request.parent_invocation_env)?;
+    let (base_args, rendered_prompt) =
+        provider_policy_launch_parts(request.provider, request.provider_args, request.prompt)?;
+    let mut cmd = build_command(
+        request.provider,
+        &base_args,
+        request.working_dir,
+        request.parent_invocation_env,
         return_channel
             .as_ref()
             .map(|channel| channel.path.as_path()),
     )?;
-
-    // Append input flags
-    for arg in input_args {
-        cmd.arg(arg);
-    }
-
-    let (capture_plan, capture_args, capture_files) = build_capture_plan(
-        provider.session_capture.as_ref(),
-        start_known_provider_session_id,
+    append_command_args(&mut cmd, request.input_args);
+    let (capture_plan, capture_args, mut temp_files) = build_capture_plan(
+        request.provider.session_capture.as_ref(),
+        request.start_known_provider_session_id,
     )?;
-    for arg in capture_args {
+    append_command_args(&mut cmd, &capture_args);
+    append_command_args(&mut cmd, request.tail_args);
+    render_prompt_for_command(
+        &mut cmd,
+        request.prompt_mode,
+        &rendered_prompt,
+        request.working_dir,
+        &mut temp_files,
+    )?;
+    let supervisor_config = supervisor_config_for_launch(
+        request.provider,
+        request.prompt_mode,
+        rendered_prompt,
+        bounded_silence_config,
+    );
+
+    Ok(ProviderLaunch {
+        cmd,
+        supervisor_config,
+        capture_plan,
+        return_channel,
+        temp_files,
+    })
+}
+
+fn provider_policy_launch_parts(
+    provider: &ProviderConfig,
+    provider_args: &[String],
+    prompt: &str,
+) -> Result<(Vec<String>, String), String> {
+    let mut base_args = provider_args.to_vec();
+    let mut policy_prompt = Some(prompt.to_string());
+    apply_provider_policy(provider, &mut base_args, &mut policy_prompt)?;
+    Ok((
+        base_args,
+        policy_prompt.unwrap_or_else(|| prompt.to_string()),
+    ))
+}
+
+fn append_command_args(cmd: &mut Command, args: &[String]) {
+    for arg in args {
         cmd.arg(arg);
     }
-    for arg in tail_args {
-        cmd.arg(arg);
+}
+
+fn render_prompt_for_command(
+    cmd: &mut Command,
+    prompt_mode: PromptMode,
+    rendered_prompt: &str,
+    working_dir: Option<&Path>,
+    temp_files: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    match prompt_mode {
+        PromptMode::Arg => render_arg_prompt(cmd, rendered_prompt, working_dir, temp_files),
+        PromptMode::Stdin => {
+            cmd.stdin(Stdio::piped());
+            Ok(())
+        }
     }
+}
 
-    let mut temp_files = capture_files;
+fn render_arg_prompt(
+    cmd: &mut Command,
+    rendered_prompt: &str,
+    working_dir: Option<&Path>,
+    temp_files: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    if rendered_prompt.len() > LARGE_PROMPT_THRESHOLD {
+        let (path, instruction) = write_large_prompt_file(rendered_prompt, working_dir)?;
+        cmd.arg(instruction);
+        temp_files.push(path);
+    } else {
+        cmd.arg(rendered_prompt);
+    }
+    cmd.stdin(Stdio::null());
+    Ok(())
+}
 
+fn write_large_prompt_file(
+    rendered_prompt: &str,
+    working_dir: Option<&Path>,
+) -> Result<(PathBuf, String), String> {
+    let dir = working_dir.unwrap_or(Path::new("."));
+    let filename = format!("_agent_prompt_{}.md", uuid::Uuid::new_v4());
+    let path = dir.join(&filename);
+    std::fs::write(&path, rendered_prompt)
+        .map_err(|e| format!("Failed to write temp prompt file: {e}"))?;
+    Ok((path, format!("Follow the instructions in {filename}")))
+}
+
+fn supervisor_config_for_launch(
+    provider: &ProviderConfig,
+    prompt_mode: PromptMode,
+    rendered_prompt: String,
+    bounded_silence_config: Option<BoundedSilenceConfig>,
+) -> BoundedSilenceConfig {
+    let prompt_payload = (prompt_mode == PromptMode::Stdin).then(|| rendered_prompt.into_bytes());
+    bounded_silence_config
+        .unwrap_or_else(|| {
+            BoundedSilenceConfig::production(
+                provider,
+                prompt_mode,
+                prompt_payload.clone().unwrap_or_default(),
+            )
+        })
+        .with_prompt_contract(prompt_mode, prompt_payload)
+}
+
+fn run_provider_supervisor(
+    cmd: Command,
+    provider: &ProviderConfig,
+    supervisor_config: BoundedSilenceConfig,
+) -> Result<SupervisedOutput, String> {
+    execute_with_bounded_silence(cmd, &provider.name, supervisor_config).map_err(|err| {
+        if err.starts_with("Failed to spawn") {
+            err
+        } else {
+            format!("Failed to wait for process: {err}")
+        }
+    })
+}
+
+fn read_and_cleanup_return_channel(
+    return_channel: &Option<ReturnChannel>,
+) -> Vec<ReturnedArtifactRef> {
+    let returned_artifacts = return_channel
+        .as_ref()
+        .map(read_return_channel)
+        .unwrap_or_default();
+    if let Some(channel) = return_channel {
+        channel.cleanup();
+    }
+    returned_artifacts
+}
+
+fn raw_result_from_supervised_output(
+    capture_plan: &CapturePlan,
+    output: SupervisedOutput,
+    returned_artifacts: Vec<ReturnedArtifactRef>,
+) -> RawResult {
+    let capture_outcome = finalize_capture(capture_plan, &output.stdout);
+    let stdout = maybe_restore_plain_stdout(capture_plan, &capture_outcome, &output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    RawResult {
+        stdout,
+        telemetry_stdout: output.stdout.clone(),
+        captured_child_invocations: captured_child_invocations_from_stderr(&stderr),
+        stderr,
+        exit_code: output.exit_code,
+        terminal_reason: output.terminal_reason,
+        terminal_signal: Some(output.terminal_signal),
+        session_capture: capture_outcome,
+        returned_artifacts,
+    }
+}
+
+struct SupervisedOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    exit_code: i32,
+    terminal_reason: Option<String>,
+    terminal_signal: TerminalSignal,
+}
+
+#[derive(Clone, Copy)]
+enum DrainStream {
+    Stdout,
+    Stderr,
+}
+
+fn execute_with_bounded_silence(
+    mut cmd: Command,
+    provider_name: &str,
+    config: BoundedSilenceConfig,
+) -> Result<SupervisedOutput, String> {
+    configure_supervised_command(&mut cmd, config.prompt_mode);
+    configure_supervised_process_group(&mut cmd);
+    let mut child = spawn_supervised_child(cmd, provider_name)?;
+    write_prompt_to_child(&mut child, &config)?;
+    let drains = start_child_drains(&mut child)?;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut last_output_seen = Instant::now();
+
+    let (terminal_status, terminal_signal, real_status) = loop {
+        drain_output_events(&drains.rx, &mut stdout, &mut stderr, &mut last_output_seen);
+
+        if let Some(status) = poll_child_status(&mut child)? {
+            break terminal_outcome_from_status(status);
+        }
+
+        let live_signal =
+            recognize_live_terminal_signal(provider_name, config.recognizer, &stdout, &stderr);
+        if live_signal.kind == TerminalSignalKind::QuotaExhaustedInband {
+            break terminate_for_live_quota(
+                &mut child,
+                provider_name,
+                config.recognizer,
+                &stdout,
+                &stderr,
+                live_signal,
+            )?;
+        }
+
+        if last_output_seen.elapsed() >= config.silence_ceiling {
+            let terminal_status = prolonged_silence_status();
+            let terminal_signal = recognize_terminal_signal(
+                provider_name,
+                config.recognizer,
+                &stdout,
+                &stderr,
+                terminal_status.clone(),
+            );
+            break (
+                terminal_status,
+                Some(terminal_signal),
+                terminate_child(&mut child)?,
+            );
+        }
+
+        match drains.rx.recv_timeout(BOUNDED_SILENCE_POLL_INTERVAL) {
+            Ok((stream, chunk)) => append_output_chunk(
+                stream,
+                chunk,
+                &mut stdout,
+                &mut stderr,
+                &mut last_output_seen,
+            ),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {}
+        }
+    };
+
+    finish_child_drains(drains, &mut stdout, &mut stderr, &mut last_output_seen);
+    Ok(supervised_output_from_terminal(
+        provider_name,
+        config.recognizer,
+        stdout,
+        stderr,
+        terminal_status,
+        terminal_signal,
+        real_status,
+    ))
+}
+
+struct ChildDrains {
+    rx: mpsc::Receiver<(DrainStream, Vec<u8>)>,
+    stdout_handle: thread::JoinHandle<()>,
+    stderr_handle: thread::JoinHandle<()>,
+}
+
+fn configure_supervised_command(cmd: &mut Command, prompt_mode: PromptMode) {
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
     match prompt_mode {
         PromptMode::Arg => {
-            if rendered_prompt.len() > LARGE_PROMPT_THRESHOLD {
-                let dir = working_dir.unwrap_or(Path::new("."));
-                let filename = format!("_agent_prompt_{}.md", uuid::Uuid::new_v4());
-                let path = dir.join(&filename);
-                std::fs::write(&path, &rendered_prompt)
-                    .map_err(|e| format!("Failed to write temp prompt file: {e}"))?;
-                cmd.arg(format!("Follow the instructions in {filename}"));
-                temp_files.push(path);
-            } else {
-                cmd.arg(&rendered_prompt);
-            }
             cmd.stdin(Stdio::null());
         }
         PromptMode::Stdin => {
             cmd.stdin(Stdio::piped());
         }
     }
+}
 
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+#[cfg(unix)]
+fn configure_supervised_process_group(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed to spawn '{}': {e}", provider.command))?;
+    cmd.process_group(0);
+}
 
-    if prompt_mode == PromptMode::Stdin
+#[cfg(not(unix))]
+fn configure_supervised_process_group(_cmd: &mut Command) {}
+
+fn spawn_supervised_child(mut cmd: Command, provider_name: &str) -> Result<Child, String> {
+    cmd.spawn()
+        .map_err(|err| format!("Failed to spawn '{provider_name}': {err}"))
+}
+
+fn write_prompt_to_child(child: &mut Child, config: &BoundedSilenceConfig) -> Result<(), String> {
+    if supervised_stdin_write_needed(config)
         && let Some(mut stdin) = child.stdin.take()
+        && let Some(payload) = &config.prompt_payload
+        && let Err(err) = stdin.write_all(payload)
     {
-        stdin
-            .write_all(rendered_prompt.as_bytes())
-            .map_err(|e| format!("Failed to write to stdin: {e}"))?;
+        let _ = terminate_child(child);
+        return Err(write_stdin_error(&err));
     }
+    Ok(())
+}
 
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("Failed to wait for process: {e}"))?;
+fn supervised_stdin_write_needed(config: &BoundedSilenceConfig) -> bool {
+    config.prompt_mode == PromptMode::Stdin
+}
 
-    let returned_artifacts = return_channel
-        .as_ref()
-        .map(read_return_channel)
-        .unwrap_or_default();
-    if let Some(channel) = &return_channel {
-        channel.cleanup();
-    }
+fn write_stdin_error(err: &std::io::Error) -> String {
+    format!("Failed to write to stdin: {err}")
+}
 
-    let capture_outcome = finalize_capture(&capture_plan, &output.stdout);
-    let stdout = maybe_restore_plain_stdout(&capture_plan, &capture_outcome, &output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    let result = RawResult {
+fn start_child_drains(child: &mut Child) -> Result<ChildDrains, String> {
+    let stdout = take_child_stdout(child)?;
+    let stderr = take_child_stderr(child)?;
+    let (tx, rx) = mpsc::channel();
+    let stdout_handle = spawn_drain_thread(stdout, DrainStream::Stdout, tx.clone());
+    let stderr_handle = spawn_drain_thread(stderr, DrainStream::Stderr, tx.clone());
+    drop(tx);
+    Ok(ChildDrains {
+        rx,
+        stdout_handle,
+        stderr_handle,
+    })
+}
+
+fn take_child_stdout(child: &mut Child) -> Result<impl Read + Send + 'static, String> {
+    child
+        .stdout
+        .take()
+        .ok_or_else(|| "Child stdout was not piped".to_string())
+}
+
+fn take_child_stderr(child: &mut Child) -> Result<impl Read + Send + 'static, String> {
+    child
+        .stderr
+        .take()
+        .ok_or_else(|| "Child stderr was not piped".to_string())
+}
+
+fn poll_child_status(child: &mut Child) -> Result<Option<ExitStatus>, String> {
+    child
+        .try_wait()
+        .map_err(|err| format!("try_wait failed: {err}"))
+}
+
+fn terminal_outcome_from_status(
+    status: ExitStatus,
+) -> (
+    TerminalStatusEvidence,
+    Option<TerminalSignal>,
+    Option<ExitStatus>,
+) {
+    (
+        terminal_status_from_exit_status(&status),
+        None,
+        Some(status),
+    )
+}
+
+fn recognize_live_terminal_signal(
+    provider_name: &str,
+    recognizer: ProviderRecognizer,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> TerminalSignal {
+    recognize_terminal_signal(
+        provider_name,
+        recognizer,
         stdout,
-        telemetry_stdout: output.stdout.clone(),
-        captured_child_invocations: captured_child_invocations_from_stderr(&stderr),
         stderr,
-        exit_code: exit_code_from_status(&output.status),
-        terminal_reason: classify_terminal_reason(&output.status),
-        session_capture: capture_outcome,
-        returned_artifacts,
-    };
+        TerminalStatusEvidence::Unknown,
+    )
+}
 
-    Ok((result, temp_files))
+fn terminate_for_live_quota(
+    child: &mut Child,
+    provider_name: &str,
+    recognizer: ProviderRecognizer,
+    stdout: &[u8],
+    stderr: &[u8],
+    live_signal: TerminalSignal,
+) -> Result<
+    (
+        TerminalStatusEvidence,
+        Option<TerminalSignal>,
+        Option<ExitStatus>,
+    ),
+    String,
+> {
+    if let Some(status) = child
+        .try_wait()
+        .map_err(|err| format!("try_wait before quota terminate failed: {err}"))?
+    {
+        let terminal_status = terminal_status_from_exit_status(&status);
+        let terminal_signal = recognize_terminal_signal(
+            provider_name,
+            recognizer,
+            stdout,
+            stderr,
+            terminal_status.clone(),
+        );
+        Ok((terminal_status, Some(terminal_signal), Some(status)))
+    } else {
+        Ok((
+            TerminalStatusEvidence::Unknown,
+            Some(live_signal),
+            terminate_child(child)?,
+        ))
+    }
+}
+
+fn prolonged_silence_status() -> TerminalStatusEvidence {
+    TerminalStatusEvidence::ProlongedSilence {
+        reason: "bounded_silence".to_string(),
+    }
+}
+
+fn finish_child_drains(
+    drains: ChildDrains,
+    stdout: &mut Vec<u8>,
+    stderr: &mut Vec<u8>,
+    last_output_seen: &mut Instant,
+) {
+    let _ = drains.stdout_handle.join();
+    let _ = drains.stderr_handle.join();
+    drain_output_events(&drains.rx, stdout, stderr, last_output_seen);
+}
+
+fn supervised_output_from_terminal(
+    provider_name: &str,
+    recognizer: ProviderRecognizer,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    terminal_status: TerminalStatusEvidence,
+    terminal_signal: Option<TerminalSignal>,
+    real_status: Option<ExitStatus>,
+) -> SupervisedOutput {
+    let terminal_signal = terminal_signal.unwrap_or_else(|| {
+        recognize_terminal_signal(
+            provider_name,
+            recognizer,
+            &stdout,
+            &stderr,
+            terminal_status.clone(),
+        )
+    });
+    let exit_code = real_status
+        .as_ref()
+        .map(exit_code_from_status)
+        .unwrap_or_else(|| synthetic_exit_code(&terminal_signal));
+    let terminal_reason = terminal_reason_from_signal(&terminal_signal, real_status.as_ref());
+
+    SupervisedOutput {
+        stdout,
+        stderr,
+        exit_code,
+        terminal_reason,
+        terminal_signal,
+    }
+}
+
+fn spawn_drain_thread<R>(
+    mut reader: R,
+    stream: DrainStream,
+    sender: mpsc::Sender<(DrainStream, Vec<u8>)>,
+) -> thread::JoinHandle<()>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut buffer = [0_u8; 8192];
+        while let Some(chunk) = read_drain_chunk(&mut reader, &mut buffer) {
+            if send_drain_chunk(&sender, stream, chunk).is_err() {
+                break;
+            }
+        }
+    })
+}
+
+fn read_drain_chunk<R: Read>(reader: &mut R, buffer: &mut [u8]) -> Option<Vec<u8>> {
+    match reader.read(buffer) {
+        Ok(0) | Err(_) => None,
+        Ok(n) => Some(buffer[..n].to_vec()),
+    }
+}
+
+fn send_drain_chunk(
+    sender: &mpsc::Sender<(DrainStream, Vec<u8>)>,
+    stream: DrainStream,
+    chunk: Vec<u8>,
+) -> Result<(), mpsc::SendError<(DrainStream, Vec<u8>)>> {
+    sender.send((stream, chunk))
+}
+
+fn drain_output_events(
+    rx: &mpsc::Receiver<(DrainStream, Vec<u8>)>,
+    stdout: &mut Vec<u8>,
+    stderr: &mut Vec<u8>,
+    last_output_seen: &mut Instant,
+) {
+    while let Ok((stream, chunk)) = rx.try_recv() {
+        append_output_chunk(stream, chunk, stdout, stderr, last_output_seen);
+    }
+}
+
+fn append_output_chunk(
+    stream: DrainStream,
+    chunk: Vec<u8>,
+    stdout: &mut Vec<u8>,
+    stderr: &mut Vec<u8>,
+    last_output_seen: &mut Instant,
+) {
+    if output_chunk_is_empty(&chunk) {
+        return;
+    }
+    append_non_empty_output_chunk(stream, &chunk, stdout, stderr);
+    *last_output_seen = Instant::now();
+}
+
+fn output_chunk_is_empty(chunk: &[u8]) -> bool {
+    chunk.is_empty()
+}
+
+fn append_non_empty_output_chunk(
+    stream: DrainStream,
+    chunk: &[u8],
+    stdout: &mut Vec<u8>,
+    stderr: &mut Vec<u8>,
+) {
+    match stream {
+        DrainStream::Stdout => stdout.extend_from_slice(chunk),
+        DrainStream::Stderr => stderr.extend_from_slice(chunk),
+    }
+}
+
+fn terminate_child(child: &mut Child) -> Result<Option<ExitStatus>, String> {
+    if let Some(status) = try_wait_before_terminate(child)? {
+        return Ok(mapped_child_status(status));
+    }
+
+    send_child_sigterm(child);
+    if let Some(status) = wait_for_child_after_sigterm(child)? {
+        return Ok(mapped_child_status(status));
+    }
+
+    send_child_sigkill(child)?;
+    reap_child_after_kill(child)
+}
+
+fn try_wait_before_terminate(child: &mut Child) -> Result<Option<ExitStatus>, String> {
+    child
+        .try_wait()
+        .map_err(|err| format!("try_wait before terminate failed: {err}"))
+}
+
+fn wait_for_child_after_sigterm(child: &mut Child) -> Result<Option<ExitStatus>, String> {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|err| format!("try_wait after terminate failed: {err}"))?
+        {
+            return Ok(Some(status));
+        }
+        if terminate_grace_period_elapsed(started) {
+            return Ok(None);
+        }
+        thread::sleep(BOUNDED_SILENCE_POLL_INTERVAL);
+    }
+}
+
+fn terminate_grace_period_elapsed(started: Instant) -> bool {
+    started.elapsed() >= TERMINATE_GRACE_PERIOD
+}
+
+fn mapped_child_status(status: ExitStatus) -> Option<ExitStatus> {
+    Some(status)
+}
+
+#[cfg(unix)]
+fn send_child_sigkill(child: &mut Child) -> Result<(), String> {
+    let pid = child_process_group_id(child);
+    let rc = unsafe { libc::killpg(pid, libc::SIGKILL) };
+    if rc == -1 {
+        child
+            .kill()
+            .map_err(|err| format!("Failed to kill child process: {err}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn send_child_sigkill(child: &mut Child) -> Result<(), String> {
+    child
+        .kill()
+        .map_err(|err| format!("Failed to kill child process: {err}"))
+}
+
+fn reap_child_after_kill(child: &mut Child) -> Result<Option<ExitStatus>, String> {
+    child
+        .wait()
+        .map(Some)
+        .map_err(|err| format!("Failed to reap child process: {err}"))
+}
+
+#[cfg(unix)]
+fn send_child_sigterm(child: &Child) {
+    let _ = unsafe { libc::killpg(child_process_group_id(child), SIGTERM) };
+}
+
+#[cfg(unix)]
+fn child_process_group_id(child: &Child) -> libc::pid_t {
+    child.id() as libc::pid_t
+}
+
+#[cfg(not(unix))]
+fn send_child_sigterm(child: &mut Child) {
+    let _ = child.kill();
+}
+
+fn recognize_terminal_signal(
+    provider_name: &str,
+    recognizer: ProviderRecognizer,
+    stdout: &[u8],
+    stderr: &[u8],
+    terminal_status: TerminalStatusEvidence,
+) -> TerminalSignal {
+    let evidence = terminal_signal_evidence(provider_name, stdout, stderr, terminal_status);
+    recognizer.recognize(&evidence)
+}
+
+fn terminal_signal_evidence<'a>(
+    provider_name: &'a str,
+    stdout: &'a [u8],
+    stderr: &'a [u8],
+    terminal_status: TerminalStatusEvidence,
+) -> TerminalSignalEvidence<'a> {
+    TerminalSignalEvidence {
+        provider_name,
+        stdout,
+        stderr,
+        terminal_status,
+        observed_at: SystemTime::now(),
+    }
+}
+
+#[cfg(test)]
+fn terminal_signal_for_spawn_error(provider_name: &str, reason: &str) -> TerminalSignal {
+    recognize_terminal_signal(
+        provider_name,
+        ProviderRecognizer::OpenAiCompat,
+        &[],
+        &[],
+        TerminalStatusEvidence::SpawnError {
+            reason: reason.to_string(),
+        },
+    )
+}
+
+fn terminal_status_from_exit_status(status: &ExitStatus) -> TerminalStatusEvidence {
+    if let Some(code) = status.code() {
+        return TerminalStatusEvidence::Exited { code };
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+
+        if let Some(signal) = status.signal() {
+            return TerminalStatusEvidence::SignalTerminated { signal };
+        }
+    }
+
+    TerminalStatusEvidence::Unknown
+}
+
+fn terminal_reason_from_signal(
+    signal: &TerminalSignal,
+    status: Option<&ExitStatus>,
+) -> Option<String> {
+    match signal.kind {
+        TerminalSignalKind::ProlongedSilence => Some("bounded_silence".to_string()),
+        TerminalSignalKind::QuotaExhaustedInband => Some("quota_exhausted_inband".to_string()),
+        TerminalSignalKind::CleanExit
+        | TerminalSignalKind::NonzeroExit
+        | TerminalSignalKind::SignalExit => status.and_then(classify_terminal_reason),
+        TerminalSignalKind::SpawnError => Some("spawn_error".to_string()),
+        TerminalSignalKind::Unknown => Some("unknown_exit".to_string()),
+    }
+}
+
+fn synthetic_exit_code(signal: &TerminalSignal) -> i32 {
+    match signal.kind {
+        TerminalSignalKind::CleanExit => 0,
+        TerminalSignalKind::ProlongedSilence
+        | TerminalSignalKind::QuotaExhaustedInband
+        | TerminalSignalKind::NonzeroExit
+        | TerminalSignalKind::SignalExit
+        | TerminalSignalKind::SpawnError
+        | TerminalSignalKind::Unknown => -1,
+    }
 }
 
 fn apply_provider_policy(
@@ -635,85 +1662,137 @@ fn apply_provider_policy(
 
     let kind = provider_policy_kind(provider);
     let restrictions = provider.tool_restrictions.as_ref();
-    if let Some(restrictions) = restrictions {
-        let claude_non_empty = !restrictions.claude.is_empty();
-        let codex_non_empty = !restrictions.codex.is_empty();
-        if claude_non_empty && codex_non_empty {
-            return Err(format!(
-                "provider {} has both Claude and Codex tool restrictions populated",
-                provider.name
-            ));
-        }
-        match restrictions.kind {
-            ToolRestrictionKind::Claude if codex_non_empty => {
-                return Err(format!(
-                    "provider {} declares Claude restrictions but populated Codex settings",
-                    provider.name
-                ));
-            }
-            ToolRestrictionKind::Codex if claude_non_empty => {
-                return Err(format!(
-                    "provider {} declares Codex restrictions but populated Claude settings",
-                    provider.name
-                ));
-            }
-            _ => {}
-        }
-    }
+    validate_provider_tool_restrictions(provider, restrictions)?;
 
     match kind {
         Some(ToolRestrictionKind::Claude) => {
-            if let Some(override_text) = &provider.system_prompt_override {
-                base_args.push("--append-system-prompt".to_string());
-                base_args.push(override_text.clone());
-            }
-            if let Some(restrictions) = restrictions {
-                if !restrictions.claude.disallowed_tools.is_empty() {
-                    base_args.push("--disallowed-tools".to_string());
-                    base_args.push(restrictions.claude.disallowed_tools.join(","));
-                }
-                if !restrictions.claude.allowed_tools.is_empty() {
-                    base_args.push("--allowed-tools".to_string());
-                    base_args.push(restrictions.claude.allowed_tools.join(","));
-                }
-                if restrictions.claude.disable_slash_commands {
-                    base_args.push("--disable-slash-commands".to_string());
-                }
-            }
+            append_claude_provider_policy(provider, restrictions, base_args)
         }
         Some(ToolRestrictionKind::Codex) => {
-            if let Some(override_text) = &provider.system_prompt_override {
-                let Some(existing_prompt) = prompt.take() else {
-                    return Err(format!(
-                        "provider {} has Codex system_prompt_override but this execution path has no prompt to prepend it to",
-                        provider.name
-                    ));
-                };
-                // Delimiter chosen to keep Codex fallback policy visibly separate from user prompt text.
-                *prompt = Some(format!(
-                    "<<<NESTHARUS-POLICY>>>\n{override_text}\n<<<END-POLICY>>>\n\n{existing_prompt}"
-                ));
-            }
-            if let Some(restrictions) = restrictions {
-                for pair in &restrictions.codex.config_pairs {
-                    base_args.push("-c".to_string());
-                    base_args.push(pair.clone());
-                }
-                for feature in &restrictions.codex.disabled_features {
-                    base_args.push("--disable".to_string());
-                    base_args.push(feature.clone());
-                }
-            }
+            append_codex_provider_policy(provider, restrictions, base_args, prompt)?
         }
-        None => {
-            return Err(format!(
-                "provider {} defines policy but its ecosystem could not be inferred",
-                provider.name
-            ));
-        }
+        None => return Err(provider_policy_kind_error(provider)),
     }
 
     Ok(())
+}
+
+fn validate_provider_tool_restrictions(
+    provider: &ProviderConfig,
+    restrictions: Option<&oulipoly_config::ToolRestrictions>,
+) -> Result<(), String> {
+    if let Some(restrictions) = restrictions {
+        validate_provider_restriction_shape(provider, restrictions)?;
+        validate_provider_restriction_kind(provider, restrictions)?;
+    }
+    Ok(())
+}
+
+fn validate_provider_restriction_shape(
+    provider: &ProviderConfig,
+    restrictions: &oulipoly_config::ToolRestrictions,
+) -> Result<(), String> {
+    if !restrictions.claude.is_empty() && !restrictions.codex.is_empty() {
+        return Err(format!(
+            "provider {} has both Claude and Codex tool restrictions populated",
+            provider.name
+        ));
+    }
+    Ok(())
+}
+
+fn validate_provider_restriction_kind(
+    provider: &ProviderConfig,
+    restrictions: &oulipoly_config::ToolRestrictions,
+) -> Result<(), String> {
+    let claude_non_empty = !restrictions.claude.is_empty();
+    let codex_non_empty = !restrictions.codex.is_empty();
+    match restrictions.kind {
+        ToolRestrictionKind::Claude if codex_non_empty => Err(format!(
+            "provider {} declares Claude restrictions but populated Codex settings",
+            provider.name
+        )),
+        ToolRestrictionKind::Codex if claude_non_empty => Err(format!(
+            "provider {} declares Codex restrictions but populated Claude settings",
+            provider.name
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn append_claude_provider_policy(
+    provider: &ProviderConfig,
+    restrictions: Option<&oulipoly_config::ToolRestrictions>,
+    base_args: &mut Vec<String>,
+) {
+    if let Some(override_text) = &provider.system_prompt_override {
+        base_args.push("--append-system-prompt".to_string());
+        base_args.push(override_text.clone());
+    }
+    if let Some(restrictions) = restrictions {
+        if !restrictions.claude.disallowed_tools.is_empty() {
+            base_args.push("--disallowed-tools".to_string());
+            base_args.push(restrictions.claude.disallowed_tools.join(","));
+        }
+        if !restrictions.claude.allowed_tools.is_empty() {
+            base_args.push("--allowed-tools".to_string());
+            base_args.push(restrictions.claude.allowed_tools.join(","));
+        }
+        if restrictions.claude.disable_slash_commands {
+            base_args.push("--disable-slash-commands".to_string());
+        }
+    }
+}
+
+fn append_codex_provider_policy(
+    provider: &ProviderConfig,
+    restrictions: Option<&oulipoly_config::ToolRestrictions>,
+    base_args: &mut Vec<String>,
+    prompt: &mut Option<String>,
+) -> Result<(), String> {
+    if let Some(override_text) = &provider.system_prompt_override {
+        let Some(existing_prompt) = prompt.take() else {
+            return Err(codex_policy_missing_prompt_error(provider));
+        };
+        *prompt = Some(codex_policy_prompt(override_text, &existing_prompt));
+    }
+    if let Some(restrictions) = restrictions {
+        append_codex_config_pairs(base_args, &restrictions.codex.config_pairs);
+        append_codex_disabled_features(base_args, &restrictions.codex.disabled_features);
+    }
+    Ok(())
+}
+
+fn codex_policy_missing_prompt_error(provider: &ProviderConfig) -> String {
+    format!(
+        "provider {} has Codex system_prompt_override but this execution path has no prompt to prepend it to",
+        provider.name
+    )
+}
+
+fn codex_policy_prompt(override_text: &str, existing_prompt: &str) -> String {
+    format!("<<<NESTHARUS-POLICY>>>\n{override_text}\n<<<END-POLICY>>>\n\n{existing_prompt}")
+}
+
+fn append_codex_config_pairs(base_args: &mut Vec<String>, config_pairs: &[String]) {
+    for pair in config_pairs {
+        base_args.push("-c".to_string());
+        base_args.push(pair.clone());
+    }
+}
+
+fn append_codex_disabled_features(base_args: &mut Vec<String>, disabled_features: &[String]) {
+    for feature in disabled_features {
+        base_args.push("--disable".to_string());
+        base_args.push(feature.clone());
+    }
+}
+
+fn provider_policy_kind_error(provider: &ProviderConfig) -> String {
+    format!(
+        "provider {} defines policy but its ecosystem could not be inferred",
+        provider.name
+    )
 }
 
 fn provider_policy_kind(provider: &ProviderConfig) -> Option<ToolRestrictionKind> {
@@ -786,11 +1865,64 @@ pub fn execute_resume(
     parent_invocation_env: Option<&str>,
     resume: ResumePayload<'_>,
 ) -> Result<ExecutionResult, String> {
+    execute_resume_with_optional_bounded_silence_config(
+        provider,
+        provider_index,
+        prompt_mode,
+        prompt,
+        working_dir,
+        parent_invocation_env,
+        resume,
+        None,
+    )
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "test injection mirrors the public resume execution contract plus bounded-silence config"
+)]
+fn execute_resume_with_bounded_silence_config(
+    provider: &ProviderConfig,
+    provider_index: usize,
+    prompt_mode: PromptMode,
+    prompt: &str,
+    working_dir: Option<&Path>,
+    parent_invocation_env: Option<&str>,
+    resume: ResumePayload<'_>,
+    bounded_silence_config: BoundedSilenceConfig,
+) -> Result<ExecutionResult, String> {
+    execute_resume_with_optional_bounded_silence_config(
+        provider,
+        provider_index,
+        prompt_mode,
+        prompt,
+        working_dir,
+        parent_invocation_env,
+        resume,
+        Some(bounded_silence_config),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "resume execution keeps provider, prompt, cwd, parent marker, resume payload, and optional bounded-silence test injection explicit"
+)]
+fn execute_resume_with_optional_bounded_silence_config(
+    provider: &ProviderConfig,
+    provider_index: usize,
+    prompt_mode: PromptMode,
+    prompt: &str,
+    working_dir: Option<&Path>,
+    parent_invocation_env: Option<&str>,
+    resume: ResumePayload<'_>,
+    bounded_silence_config: Option<BoundedSilenceConfig>,
+) -> Result<ExecutionResult, String> {
     let session_id = resume.session_id.to_string();
     let resume_args = compose_resume_args(resume.strategy, resume.session_id)?;
     let mut provider_without_capture = provider.clone();
     provider_without_capture.session_capture = None;
-    let (result, temp_files) = execute_provider_with_arg_parts(
+    let (result, temp_files) = execute_provider_with_arg_parts_and_bounded_silence_config(
         &provider_without_capture,
         &provider.args,
         &resume_args,
@@ -800,10 +1932,9 @@ pub fn execute_resume(
         &[],
         parent_invocation_env,
         None,
+        bounded_silence_config,
     )?;
-    for path in temp_files {
-        let _ = std::fs::remove_file(path);
-    }
+    cleanup_temp_files(temp_files);
     let resume_acceptance = classify_resume_acceptance(
         provider.resume_acceptance.as_ref(),
         result.exit_code,
@@ -811,20 +1942,15 @@ pub fn execute_resume(
         result.stderr.as_bytes(),
         &session_id,
     );
-    Ok(ExecutionResult {
-        stdout: result.stdout,
-        stderr: result.stderr,
-        exit_code: result.exit_code,
+    Ok(execution_result_from_raw(
+        result,
         provider_index,
-        session_capture: SessionCaptureResult {
+        Some(resume_acceptance),
+        Some(SessionCaptureResult {
             session_id: None,
             method: SessionCaptureMethod::None,
-        },
-        resume_acceptance: Some(resume_acceptance),
-        terminal_reason: result.terminal_reason,
-        captured_child_invocations: result.captured_child_invocations,
-        returned_artifacts: result.returned_artifacts,
-    })
+        }),
+    ))
 }
 
 fn classify_resume_acceptance(
@@ -834,63 +1960,111 @@ fn classify_resume_acceptance(
     stderr: &[u8],
     session_id: &str,
 ) -> ResumeAcceptanceResult {
-    let output = format!(
+    let output = resume_acceptance_output(stdout, stderr);
+    if let Some(rules) = rules {
+        if let Some(pattern) = rejected_resume_pattern(rules, &output, session_id) {
+            return rejected_resume_pattern_result(&pattern);
+        }
+        if exit_code == 0
+            && let Some(pattern) = accepted_resume_pattern(rules, &output, session_id)
+        {
+            return accepted_resume_pattern_result(&pattern);
+        }
+    }
+
+    if output_reports_missing_session(&output) {
+        return missing_session_resume_result();
+    }
+
+    if resume_child_exited_successfully(exit_code) {
+        unconfirmed_resume_result(rules)
+    } else {
+        rejected_resume_exit_result(exit_code)
+    }
+}
+
+fn resume_acceptance_output(stdout: &[u8], stderr: &[u8]) -> String {
+    format!(
         "{}\n{}",
         String::from_utf8_lossy(stdout),
         String::from_utf8_lossy(stderr)
-    );
-    if let Some(rules) = rules {
-        if let Some(pattern) = first_matching_pattern(
-            rules.rejected_output_patterns.as_deref(),
-            &output,
-            session_id,
-        ) {
-            return ResumeAcceptanceResult {
-                status: ResumeAcceptanceStatus::Rejected,
-                evidence: Some(format!("matched reject pattern: {pattern}")),
-            };
-        }
-        if exit_code == 0
-            && let Some(pattern) = first_matching_pattern(
-                rules.accepted_output_patterns.as_deref(),
-                &output,
-                session_id,
-            )
-        {
-            return ResumeAcceptanceResult {
-                status: ResumeAcceptanceStatus::Accepted,
-                evidence: Some(format!("matched accept pattern: {pattern}")),
-            };
-        }
-    }
+    )
+}
 
+fn rejected_resume_pattern(
+    rules: &oulipoly_config::ResumeAcceptanceRules,
+    output: &str,
+    session_id: &str,
+) -> Option<String> {
+    first_matching_pattern(
+        rules.rejected_output_patterns.as_deref(),
+        output,
+        session_id,
+    )
+}
+
+fn accepted_resume_pattern(
+    rules: &oulipoly_config::ResumeAcceptanceRules,
+    output: &str,
+    session_id: &str,
+) -> Option<String> {
+    first_matching_pattern(
+        rules.accepted_output_patterns.as_deref(),
+        output,
+        session_id,
+    )
+}
+
+fn rejected_resume_pattern_result(pattern: &str) -> ResumeAcceptanceResult {
+    ResumeAcceptanceResult {
+        status: ResumeAcceptanceStatus::Rejected,
+        evidence: Some(format!("matched reject pattern: {pattern}")),
+    }
+}
+
+fn accepted_resume_pattern_result(pattern: &str) -> ResumeAcceptanceResult {
+    ResumeAcceptanceResult {
+        status: ResumeAcceptanceStatus::Accepted,
+        evidence: Some(format!("matched accept pattern: {pattern}")),
+    }
+}
+
+fn output_reports_missing_session(output: &str) -> bool {
     let lower = output.to_lowercase();
-    if lower.contains("no conversation found") || lower.contains("no session found") {
-        return ResumeAcceptanceResult {
-            status: ResumeAcceptanceStatus::Rejected,
-            evidence: Some(
-                "resume_session_mismatch: provider reported missing session".to_string(),
-            ),
-        };
-    }
+    lower.contains("no conversation found") || lower.contains("no session found")
+}
 
-    if exit_code == 0 {
-        let evidence = if rules.is_none() {
-            "child exited 0 but provider has no resume_acceptance rules configured"
-        } else {
-            "child exited 0 but no accepted resume pattern matched"
-        };
-        ResumeAcceptanceResult {
-            status: ResumeAcceptanceStatus::Unconfirmed,
-            evidence: Some(evidence.to_string()),
-        }
+fn missing_session_resume_result() -> ResumeAcceptanceResult {
+    ResumeAcceptanceResult {
+        status: ResumeAcceptanceStatus::Rejected,
+        evidence: Some("resume_session_mismatch: provider reported missing session".to_string()),
+    }
+}
+
+fn resume_child_exited_successfully(exit_code: i32) -> bool {
+    exit_code == 0
+}
+
+fn unconfirmed_resume_result(
+    rules: Option<&oulipoly_config::ResumeAcceptanceRules>,
+) -> ResumeAcceptanceResult {
+    let evidence = if rules.is_none() {
+        "child exited 0 but provider has no resume_acceptance rules configured"
     } else {
-        ResumeAcceptanceResult {
-            status: ResumeAcceptanceStatus::Rejected,
-            evidence: Some(format!(
-                "child exited {exit_code}; no rejection patterns matched"
-            )),
-        }
+        "child exited 0 but no accepted resume pattern matched"
+    };
+    ResumeAcceptanceResult {
+        status: ResumeAcceptanceStatus::Unconfirmed,
+        evidence: Some(evidence.to_string()),
+    }
+}
+
+fn rejected_resume_exit_result(exit_code: i32) -> ResumeAcceptanceResult {
+    ResumeAcceptanceResult {
+        status: ResumeAcceptanceStatus::Rejected,
+        evidence: Some(format!(
+            "child exited {exit_code}; no rejection patterns matched"
+        )),
     }
 }
 
@@ -899,10 +2073,18 @@ fn first_matching_pattern(
     output: &str,
     session_id: &str,
 ) -> Option<String> {
-    patterns?.iter().find_map(|pattern| {
-        let expanded = pattern.replace("{session_id}", session_id);
-        output.contains(&expanded).then(|| pattern.clone())
-    })
+    patterns?
+        .iter()
+        .find(|pattern| pattern_matches_output(pattern, output, session_id))
+        .cloned()
+}
+
+fn pattern_matches_output(pattern: &str, output: &str, session_id: &str) -> bool {
+    output.contains(&expand_resume_pattern(pattern, session_id))
+}
+
+fn expand_resume_pattern(pattern: &str, session_id: &str) -> String {
+    pattern.replace("{session_id}", session_id)
 }
 
 pub fn execute_interactive(
@@ -915,11 +2097,12 @@ pub fn execute_interactive(
         .map(|result| result.exit_code)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct InteractiveExecutionResult {
     /// Numeric child-process exit code per `exit_code_from_status` (interactive/REPL path).
     pub exit_code: i32,
     pub terminal_reason: Option<String>,
+    pub terminal_signal: Option<TerminalSignal>,
 }
 
 pub fn execute_interactive_with_result(
@@ -928,14 +2111,8 @@ pub fn execute_interactive_with_result(
     parent_invocation_env: Option<&str>,
     resume: Option<ResumePayload<'_>>,
 ) -> Result<InteractiveExecutionResult, String> {
-    let interactive_args = provider.interactive_args.as_ref().ok_or_else(|| {
-        format!(
-            "provider {} has no interactive_args; cannot launch interactively",
-            provider.name
-        )
-    })?;
-
-    let mut provider_args = interactive_args.clone();
+    // Keep provider.interactive_args as the interactive argv source.
+    let mut provider_args = validated_interactive_args(provider)?;
     let mut no_prompt = None;
     apply_provider_policy(provider, &mut provider_args, &mut no_prompt)?;
     if let Some(resume) = resume {
@@ -967,11 +2144,7 @@ pub fn execute_interactive_with_result(
     #[cfg(unix)]
     drop(signal_guard);
 
-    let terminal_reason = classify_terminal_reason(&status);
-    Ok(InteractiveExecutionResult {
-        exit_code: exit_code_from_status(&status),
-        terminal_reason,
-    })
+    Ok(interactive_result_from_status(provider, &status))
 }
 
 enum CapturePlan {
@@ -986,20 +2159,65 @@ enum CapturePlan {
     },
 }
 
+fn validated_interactive_args(provider: &ProviderConfig) -> Result<Vec<String>, String> {
+    provider
+        .interactive_args
+        .clone()
+        .ok_or_else(|| interactive_args_missing_error(provider))
+}
+
+fn interactive_args_missing_error(provider: &ProviderConfig) -> String {
+    format!(
+        "provider {} has no interactive_args; cannot launch interactively",
+        provider.name
+    )
+}
+
+fn interactive_result_from_status(
+    provider: &ProviderConfig,
+    status: &ExitStatus,
+) -> InteractiveExecutionResult {
+    let terminal_reason = classify_terminal_reason(status);
+    let terminal_signal = recognize_terminal_signal(
+        &provider.name,
+        ProviderRecognizer::for_provider(provider),
+        &[],
+        &[],
+        terminal_status_from_exit_status(status),
+    );
+    InteractiveExecutionResult {
+        exit_code: exit_code_from_status(status),
+        terminal_reason,
+        terminal_signal: Some(terminal_signal),
+    }
+}
+
 pub fn start_known_provider_session_id(
     provider: &ProviderConfig,
 ) -> Result<Option<String>, String> {
     let Some(capture) = provider.session_capture.as_ref() else {
         return Ok(None);
     };
+    validate_start_known_capture(capture)?;
+    Ok(start_known_session_id_for_capture(capture))
+}
+
+fn validate_start_known_capture(capture: &SessionCapture) -> Result<(), String> {
     match capture.kind {
         SessionCaptureKind::ForcedFlagVerified => {
             if capture.flag.is_none() {
                 return Err("session_capture.flag is required".to_string());
             }
-            Ok(Some(uuid::Uuid::new_v4().to_string()))
+            Ok(())
         }
-        SessionCaptureKind::None | SessionCaptureKind::StdoutJsonEvent => Ok(None),
+        SessionCaptureKind::None | SessionCaptureKind::StdoutJsonEvent => Ok(()),
+    }
+}
+
+fn start_known_session_id_for_capture(capture: &SessionCapture) -> Option<String> {
+    match capture.kind {
+        SessionCaptureKind::ForcedFlagVerified => Some(uuid::Uuid::new_v4().to_string()),
+        SessionCaptureKind::None | SessionCaptureKind::StdoutJsonEvent => None,
     }
 }
 
@@ -1012,61 +2230,93 @@ fn build_capture_plan(
     };
 
     match capture.kind {
-        SessionCaptureKind::None => Ok((CapturePlan::None, Vec::new(), Vec::new())),
+        SessionCaptureKind::None => Ok(empty_capture_plan()),
         SessionCaptureKind::ForcedFlagVerified => {
-            let flag = capture
-                .flag
-                .clone()
-                .ok_or_else(|| "session_capture.flag is required".to_string())?;
-            let requested_session_id = start_known_provider_session_id
-                .map(str::to_string)
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            let mut args = vec![flag, requested_session_id.clone()];
-            if let Some(readback_args) = &capture.readback_args {
-                args.extend(readback_args.clone());
-            }
-            Ok((
-                CapturePlan::ForcedFlagVerified {
-                    requested_session_id,
-                },
-                args,
-                Vec::new(),
-            ))
+            build_forced_flag_capture_plan(capture, start_known_provider_session_id)
         }
-        SessionCaptureKind::StdoutJsonEvent => {
-            let json_flag = capture
-                .json_flag
-                .clone()
-                .ok_or_else(|| "session_capture.json_flag is required".to_string())?;
-            let last_message_flag = capture
-                .last_message_flag
-                .clone()
-                .ok_or_else(|| "session_capture.last_message_flag is required".to_string())?;
-            let event_type = capture
-                .event_type
-                .clone()
-                .ok_or_else(|| "session_capture.event_type is required".to_string())?;
-            let event_id_path = capture
-                .event_id_path
-                .clone()
-                .ok_or_else(|| "session_capture.event_id_path is required".to_string())?;
-            let last_message_path = std::env::temp_dir()
-                .join(format!("oulipoly-last-message-{}", uuid::Uuid::new_v4()));
-            Ok((
-                CapturePlan::StdoutJsonEvent {
-                    event_type,
-                    event_id_path,
-                    last_message_path: last_message_path.clone(),
-                },
-                vec![
-                    json_flag,
-                    last_message_flag,
-                    last_message_path.to_string_lossy().into_owned(),
-                ],
-                vec![last_message_path],
-            ))
-        }
+        SessionCaptureKind::StdoutJsonEvent => build_stdout_json_event_capture_plan(capture),
     }
+}
+
+fn empty_capture_plan() -> (CapturePlan, Vec<String>, Vec<PathBuf>) {
+    (CapturePlan::None, Vec::new(), Vec::new())
+}
+
+fn build_forced_flag_capture_plan(
+    capture: &SessionCapture,
+    start_known_provider_session_id: Option<&str>,
+) -> Result<(CapturePlan, Vec<String>, Vec<PathBuf>), String> {
+    let flag = required_capture_field(&capture.flag, "session_capture.flag")?;
+    let requested_session_id = capture_requested_session_id(start_known_provider_session_id);
+    let args = forced_flag_capture_args(flag, &requested_session_id, capture);
+    Ok((
+        CapturePlan::ForcedFlagVerified {
+            requested_session_id,
+        },
+        args,
+        Vec::new(),
+    ))
+}
+
+fn build_stdout_json_event_capture_plan(
+    capture: &SessionCapture,
+) -> Result<(CapturePlan, Vec<String>, Vec<PathBuf>), String> {
+    let json_flag = required_capture_field(&capture.json_flag, "session_capture.json_flag")?;
+    let last_message_flag = required_capture_field(
+        &capture.last_message_flag,
+        "session_capture.last_message_flag",
+    )?;
+    let event_type = required_capture_field(&capture.event_type, "session_capture.event_type")?;
+    let event_id_path =
+        required_capture_field(&capture.event_id_path, "session_capture.event_id_path")?;
+    let last_message_path = last_message_capture_path();
+    Ok((
+        CapturePlan::StdoutJsonEvent {
+            event_type,
+            event_id_path,
+            last_message_path: last_message_path.clone(),
+        },
+        stdout_json_event_capture_args(json_flag, last_message_flag, &last_message_path),
+        vec![last_message_path],
+    ))
+}
+
+fn required_capture_field(field: &Option<String>, name: &str) -> Result<String, String> {
+    field.clone().ok_or_else(|| format!("{name} is required"))
+}
+
+fn capture_requested_session_id(start_known_provider_session_id: Option<&str>) -> String {
+    start_known_provider_session_id
+        .map(str::to_string)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+}
+
+fn forced_flag_capture_args(
+    flag: String,
+    requested_session_id: &str,
+    capture: &SessionCapture,
+) -> Vec<String> {
+    let mut args = vec![flag, requested_session_id.to_string()];
+    if let Some(readback_args) = &capture.readback_args {
+        args.extend(readback_args.clone());
+    }
+    args
+}
+
+fn last_message_capture_path() -> PathBuf {
+    std::env::temp_dir().join(format!("oulipoly-last-message-{}", uuid::Uuid::new_v4()))
+}
+
+fn stdout_json_event_capture_args(
+    json_flag: String,
+    last_message_flag: String,
+    last_message_path: &Path,
+) -> Vec<String> {
+    vec![
+        json_flag,
+        last_message_flag,
+        last_message_path.to_string_lossy().into_owned(),
+    ]
 }
 
 fn finalize_capture(plan: &CapturePlan, stdout: &[u8]) -> SessionCaptureResult {
@@ -1118,20 +2368,44 @@ fn maybe_restore_plain_stdout(
     match plan {
         CapturePlan::StdoutJsonEvent {
             last_message_path, ..
-        } => match std::fs::read(last_message_path) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                if matches!(capture.method, SessionCaptureMethod::StdoutJsonEvent) {
-                    eprintln!(
-                        "Warning: failed to read reconstructed last-message output {}: {err}",
-                        last_message_path.display()
-                    );
-                }
-                stdout.to_vec()
-            }
-        },
-        _ => stdout.to_vec(),
+        } => restore_plain_stdout_from_file(last_message_path, capture, stdout),
+        _ => fallback_plain_stdout(stdout),
     }
+}
+
+fn restore_plain_stdout_from_file(
+    last_message_path: &Path,
+    capture: &SessionCaptureResult,
+    stdout: &[u8],
+) -> Vec<u8> {
+    match std::fs::read(last_message_path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            warn_restore_plain_stdout(last_message_path, capture, &err);
+            fallback_plain_stdout(stdout)
+        }
+    }
+}
+
+fn warn_restore_plain_stdout(
+    last_message_path: &Path,
+    capture: &SessionCaptureResult,
+    err: &std::io::Error,
+) {
+    if matches!(capture.method, SessionCaptureMethod::StdoutJsonEvent) {
+        eprintln!("{}", restore_plain_stdout_warning(last_message_path, err));
+    }
+}
+
+fn restore_plain_stdout_warning(last_message_path: &Path, err: &std::io::Error) -> String {
+    format!(
+        "Warning: failed to read reconstructed last-message output {}: {err}",
+        last_message_path.display()
+    )
+}
+
+fn fallback_plain_stdout(stdout: &[u8]) -> Vec<u8> {
+    stdout.to_vec()
 }
 
 fn parse_forced_flag_verified_session_id(stdout: &[u8]) -> Result<String, String> {
@@ -1296,21 +2570,34 @@ fn captured_child_invocations_from_stderr(stderr: &str) -> Vec<CapturedChildInvo
     let mut seen = std::collections::HashSet::new();
 
     for line in stderr.lines() {
-        let Some(raw) = line.strip_prefix("OULIPOLY_INVOCATION=") else {
-            continue;
-        };
-        let Ok(composite_id) = CompositeInvocationId::parse_env_value(raw) else {
-            continue;
-        };
-        if seen.insert((composite_id.source.clone(), composite_id.id.clone())) {
-            captured.push(CapturedChildInvocation {
-                composite_id,
-                raw_marker_line: line.to_string(),
-            });
+        if let Some(invocation) = captured_child_invocation_from_line(line)
+            && mark_captured_child_seen(&mut seen, &invocation.composite_id)
+        {
+            captured.push(invocation);
         }
     }
 
     captured
+}
+
+fn captured_child_invocation_from_line(line: &str) -> Option<CapturedChildInvocation> {
+    let composite_id = captured_child_composite_id(line)?;
+    Some(CapturedChildInvocation {
+        composite_id,
+        raw_marker_line: line.to_string(),
+    })
+}
+
+fn captured_child_composite_id(line: &str) -> Option<CompositeInvocationId> {
+    let raw = line.strip_prefix("OULIPOLY_INVOCATION=")?;
+    CompositeInvocationId::parse_env_value(raw).ok()
+}
+
+fn mark_captured_child_seen(
+    seen: &mut std::collections::HashSet<(String, String)>,
+    composite_id: &CompositeInvocationId,
+) -> bool {
+    seen.insert((composite_id.source.clone(), composite_id.id.clone()))
 }
 
 #[cfg(unix)]
@@ -1331,7 +2618,7 @@ impl InteractiveSignalGuard {
 
         let thread = thread::spawn(move || {
             for signal in signals.forever() {
-                if signal == SIGTERM && !thread_forwarded_sigterm.swap(true, Ordering::SeqCst) {
+                if should_forward_interactive_sigterm(signal, &thread_forwarded_sigterm) {
                     send_sigterm(child_pid);
                 }
             }
@@ -1342,6 +2629,11 @@ impl InteractiveSignalGuard {
             thread: Some(thread),
         })
     }
+}
+
+#[cfg(unix)]
+fn should_forward_interactive_sigterm(signal: i32, forwarded_sigterm: &AtomicBool) -> bool {
+    signal == SIGTERM && !forwarded_sigterm.swap(true, Ordering::SeqCst)
 }
 
 #[cfg(unix)]
@@ -1367,7 +2659,12 @@ fn send_sigterm(pid: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::executor::terminal_signal::{
+        TerminalSignal, TerminalSignalEvidence, TerminalSignalKind, TerminalSignalRecognizer,
+        TerminalStatusEvidence,
+    };
     use crate::executor::{SessionCaptureMethod, SessionCaptureResult};
+    use oulipoly_agent_messenger::{ReturnedArtifactRef, ReturnedArtifactSource, StoreAddress};
     use oulipoly_config::{
         ClaudeRestrictions, CodexRestrictions, InputDef, InputType, InvocationMode, ProviderConfig,
         ResumeKind, ResumeStrategy, SessionCapture, SessionCaptureKind, ToolRestrictionKind,
@@ -1376,6 +2673,8 @@ mod tests {
     use oulipoly_state::CompositeInvocationId;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant, SystemTime};
+    use uuid::Uuid;
 
     struct FixtureScript {
         _dir: tempfile::TempDir,
@@ -1413,6 +2712,759 @@ mod tests {
             .find(end)
             .unwrap_or_else(|| panic!("missing {end} after {start}"));
         &after_start[..end_idx]
+    }
+
+    fn age141_source() -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/executor/cli.rs");
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()))
+    }
+
+    fn age141_bounded_silence_config(silence_ceiling: Duration) -> BoundedSilenceConfig {
+        BoundedSilenceConfig {
+            silence_ceiling,
+            prompt_mode: PromptMode::Arg,
+            prompt_payload: None,
+            recognizer: ProviderRecognizer::Claude,
+        }
+    }
+
+    fn age141_model_for_provider(provider: ProviderConfig, prompt_mode: PromptMode) -> ModelConfig {
+        ModelConfig {
+            name: "age-141-fixture-model".to_string(),
+            prompt_mode,
+            providers: vec![provider],
+            inputs: Vec::new(),
+        }
+    }
+
+    fn age141_provider(script: &FixtureScript) -> ProviderConfig {
+        ProviderConfig {
+            name: "claude".to_string(),
+            command: script.path.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            interactive_args: Some(Vec::new()),
+            resume: None,
+            session_capture: None,
+            resume_acceptance: None,
+            session_storage: None,
+            system_prompt_override: None,
+            tool_restrictions: None,
+            invocation_mode: Default::default(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn age141_execute_script_with_config(
+        script: &FixtureScript,
+        config: BoundedSilenceConfig,
+    ) -> ExecutionResult {
+        let provider = age141_provider(script);
+        let model = age141_model_for_provider(provider.clone(), PromptMode::Arg);
+        let extra_inputs = HashMap::new();
+
+        execute_effective_with_bounded_silence_config(
+            EffectiveExecuteRequest {
+                model: &model,
+                provider: &provider,
+                provider_index: 0,
+                prompt_mode: PromptMode::Arg,
+                prompt: "age-141 prompt",
+                working_dir: None,
+                extra_inputs: &extra_inputs,
+                parent_invocation_env: None,
+            },
+            None,
+            config,
+        )
+        .unwrap()
+    }
+
+    fn age141_signal(
+        signal: &Option<TerminalSignal>,
+        expected_kind: TerminalSignalKind,
+    ) -> &TerminalSignal {
+        let signal = signal
+            .as_ref()
+            .expect("AGE-141 paths must carry TerminalSignal evidence");
+        assert_eq!(signal.kind, expected_kind);
+        signal
+    }
+
+    fn age141_receipt_json(invocation_uuid: Uuid, name: &str, version: u64) -> String {
+        let reference = ReturnedArtifactRef {
+            version_id: format!("store://return/{invocation_uuid}/{name}/{version}"),
+            name: name.to_string(),
+            store_address: StoreAddress {
+                workflow_run_id: format!("return:{invocation_uuid}"),
+                artifact_name: name.to_string(),
+                version,
+            },
+            sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            content_len: 3,
+            format_hint: Some("text/plain".to_string()),
+            verdict_line: Some("APPROVED: age-141 fixture".to_string()),
+            source: ReturnedArtifactSource::InlineBytes,
+            producer_invocation_uuid: invocation_uuid,
+            returned_at: chrono::Utc::now(),
+        };
+        serde_json::to_string(&reference).expect("receipt json")
+    }
+
+    fn age141_parent_env(invocation_uuid: Uuid) -> String {
+        format!(r#"{{"source":"age-141-test","id":"{invocation_uuid}"}}"#)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn t01_bounded_silence_headless_kill_reap() {
+        let script = fixture_script("sleep 9999");
+        let started = Instant::now();
+
+        let result = age141_execute_script_with_config(
+            &script,
+            age141_bounded_silence_config(Duration::from_millis(120)),
+        );
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "test ceiling must be injectable; elapsed={:?}",
+            started.elapsed()
+        );
+        assert_ne!(result.exit_code, 0);
+        assert_eq!(result.terminal_reason.as_deref(), Some("bounded_silence"));
+        let signal = age141_signal(
+            &result.terminal_signal,
+            TerminalSignalKind::ProlongedSilence,
+        );
+        assert!(
+            signal.evidence.contains("silence") || signal.evidence.contains("bounded"),
+            "{signal:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn t02_bounded_silence_stdout_heartbeat_resets_clock() {
+        let script = fixture_script(
+            r#"printf 'ping-1\n'
+sleep 0.08
+printf 'ping-2\n'
+sleep 9999"#,
+        );
+        let started = Instant::now();
+
+        let result = age141_execute_script_with_config(
+            &script,
+            age141_bounded_silence_config(Duration::from_millis(120)),
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(170),
+            "silence fired from spawn time instead of after stdout heartbeat; elapsed={elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "bounded-silence fixture should not wait for production ceiling; elapsed={elapsed:?}"
+        );
+        assert_eq!(result.stdout, b"ping-1\nping-2\n".to_vec());
+        age141_signal(
+            &result.terminal_signal,
+            TerminalSignalKind::ProlongedSilence,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn t03_bounded_silence_stderr_heartbeat_resets_clock() {
+        let script = fixture_script(
+            r#"printf 'warn-1\n' >&2
+sleep 0.08
+printf 'warn-2\n' >&2
+sleep 9999"#,
+        );
+        let started = Instant::now();
+
+        let result = age141_execute_script_with_config(
+            &script,
+            age141_bounded_silence_config(Duration::from_millis(120)),
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(170),
+            "silence fired from spawn time instead of after stderr heartbeat; elapsed={elapsed:?}"
+        );
+        assert!(elapsed < Duration::from_secs(1), "elapsed={elapsed:?}");
+        assert_eq!(result.stderr, "warn-1\nwarn-2\n");
+        age141_signal(
+            &result.terminal_signal,
+            TerminalSignalKind::ProlongedSilence,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn t04_bounded_silence_resume_inherits_headless_supervisor() {
+        let script = fixture_script("sleep 9999");
+        let provider = age141_provider(&script);
+        let strategy = ResumeStrategy {
+            kind: ResumeKind::Flag,
+            flag: Some("--resume".to_string()),
+            subcommand: None,
+        };
+
+        let result = execute_resume_with_bounded_silence_config(
+            &provider,
+            0,
+            PromptMode::Arg,
+            "resume prompt",
+            None,
+            None,
+            ResumePayload {
+                session_id: "5169694d-de0f-40d1-890c-6e28e55bab27",
+                strategy: &strategy,
+            },
+            age141_bounded_silence_config(Duration::from_millis(120)),
+        )
+        .unwrap();
+
+        assert_ne!(result.exit_code, 0);
+        assert_eq!(result.terminal_reason.as_deref(), Some("bounded_silence"));
+        age141_signal(
+            &result.terminal_signal,
+            TerminalSignalKind::ProlongedSilence,
+        );
+        let acceptance = result
+            .resume_acceptance
+            .expect("resume path must still classify acceptance after silence");
+        assert!(matches!(
+            acceptance.status,
+            ResumeAcceptanceStatus::Rejected
+        ));
+        assert!(
+            acceptance
+                .evidence
+                .as_deref()
+                .unwrap_or_default()
+                .contains("child exited"),
+            "{acceptance:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn t05_interactive_silent_child_does_not_use_headless_helper() {
+        let source = age141_source();
+        let interactive_start = source
+            .find("pub fn execute_interactive_with_result")
+            .expect("interactive function exists");
+        let after_start = &source[interactive_start..];
+        let interactive_end = after_start
+            .find("\npub fn start_known_provider_session_id")
+            .expect("next public function after interactive exists");
+        let interactive_body = &after_start[..interactive_end];
+        assert!(interactive_body.contains("Stdio::inherit()"));
+        assert!(interactive_body.contains(".wait()"));
+        assert!(!interactive_body.contains("execute_with_bounded_silence"));
+        assert!(!interactive_body.contains("BoundedSilenceConfig"));
+        assert!(!interactive_body.contains("try_wait"));
+
+        let script = fixture_script("exit 0");
+        let provider = age141_provider(&script);
+        let result = execute_interactive_with_result(&provider, None, None, None).unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.terminal_reason, None);
+        age141_signal(&result.terminal_signal, TerminalSignalKind::CleanExit);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn t06_repl_interactive_posture_has_no_idle_timeout() {
+        let script = fixture_script("sleep 0.2\nexit 0");
+        let provider = age141_provider(&script);
+        let started = Instant::now();
+
+        let exit_code = execute_interactive(&provider, None, None, None).unwrap();
+
+        assert_eq!(exit_code, 0);
+        assert!(
+            started.elapsed() >= Duration::from_millis(180),
+            "interactive path must preserve child wait posture rather than applying headless idle timeout"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn t07_terminal_signal_clean_exit() {
+        let script = fixture_script("exit 0");
+
+        let result = age141_execute_script_with_config(
+            &script,
+            age141_bounded_silence_config(Duration::from_millis(120)),
+        );
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.terminal_reason, None);
+        age141_signal(&result.terminal_signal, TerminalSignalKind::CleanExit);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn t08_terminal_signal_nonzero_exit() {
+        let script = fixture_script("exit 42");
+
+        let result = age141_execute_script_with_config(
+            &script,
+            age141_bounded_silence_config(Duration::from_millis(120)),
+        );
+
+        assert_eq!(result.exit_code, 42);
+        assert_eq!(result.terminal_reason.as_deref(), Some("exit_nonzero"));
+        age141_signal(&result.terminal_signal, TerminalSignalKind::NonzeroExit);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn t09_terminal_signal_unix_signal_exit() {
+        let script = fixture_script("kill -TERM $$");
+
+        let result = age141_execute_script_with_config(
+            &script,
+            age141_bounded_silence_config(Duration::from_millis(500)),
+        );
+
+        assert_eq!(result.exit_code, 143);
+        assert_eq!(result.terminal_reason.as_deref(), Some("signal:SIGTERM"));
+        age141_signal(&result.terminal_signal, TerminalSignalKind::SignalExit);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn t10_terminal_signal_spawn_error_preserves_public_error() {
+        let provider = ProviderConfig {
+            name: "claude".to_string(),
+            command: "/definitely/not/a/real/age-141-command".to_string(),
+            args: Vec::new(),
+            interactive_args: None,
+            resume: None,
+            session_capture: None,
+            resume_acceptance: None,
+            session_storage: None,
+            system_prompt_override: None,
+            tool_restrictions: None,
+            invocation_mode: Default::default(),
+        };
+        let model = age141_model_for_provider(provider.clone(), PromptMode::Arg);
+        let extra_inputs = HashMap::new();
+
+        let err = execute_effective_with_bounded_silence_config(
+            EffectiveExecuteRequest {
+                model: &model,
+                provider: &provider,
+                provider_index: 0,
+                prompt_mode: PromptMode::Arg,
+                prompt: "prompt",
+                working_dir: None,
+                extra_inputs: &extra_inputs,
+                parent_invocation_env: None,
+            },
+            None,
+            age141_bounded_silence_config(Duration::from_millis(120)),
+        )
+        .unwrap_err();
+
+        assert!(err.contains("Failed to spawn"), "{err}");
+        let signal = terminal_signal_for_spawn_error("claude", &err);
+        assert_eq!(signal.kind, TerminalSignalKind::SpawnError);
+        assert_eq!(signal.provider_name, "claude");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn t11_inband_quota_recognized_live_before_silence() {
+        let script = fixture_script(
+            r#"printf 'Claude usage limit reached; resets at 2026-05-18T10:00:00Z\n' >&2
+sleep 9999"#,
+        );
+        let ceiling = Duration::from_millis(900);
+        let started = Instant::now();
+
+        let result =
+            age141_execute_script_with_config(&script, age141_bounded_silence_config(ceiling));
+
+        assert!(
+            started.elapsed() < ceiling,
+            "live quota recognition must terminate before silence ceiling; elapsed={:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            result.terminal_reason.as_deref(),
+            Some("quota_exhausted_inband")
+        );
+        age141_signal(
+            &result.terminal_signal,
+            TerminalSignalKind::QuotaExhaustedInband,
+        );
+        let source = age141_source();
+        let production_source = source.split("#[cfg(test)]").next().unwrap_or(&source);
+        assert!(
+            !production_source.contains("Claude usage limit reached"),
+            "cli.rs must not add provider quota string vocabulary; AGE-139 recognizers own it"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn t12_quota_precedence_over_clean_and_nonzero_exit() {
+        for (exit_code, body) in [
+            (
+                0,
+                "printf 'Claude usage limit reached; resets at 2026-05-18T10:00:00Z\\n'\nexit 0",
+            ),
+            (
+                1,
+                "printf 'Claude usage limit reached; resets at 2026-05-18T10:00:00Z\\n' >&2\nexit 1",
+            ),
+        ] {
+            let script = fixture_script(body);
+
+            let result = age141_execute_script_with_config(
+                &script,
+                age141_bounded_silence_config(Duration::from_millis(500)),
+            );
+
+            assert_eq!(
+                result.exit_code, exit_code,
+                "fixture should still expose the natural exit code"
+            );
+            assert_eq!(
+                result.terminal_reason.as_deref(),
+                Some("quota_exhausted_inband")
+            );
+            age141_signal(
+                &result.terminal_signal,
+                TerminalSignalKind::QuotaExhaustedInband,
+            );
+        }
+    }
+
+    #[test]
+    fn t13_silence_precedence_over_quota_looking_output() {
+        let evidence = TerminalSignalEvidence {
+            provider_name: "claude",
+            stdout: b"",
+            stderr: b"Claude usage limit reached; resets at 2026-05-18T10:00:00Z",
+            terminal_status: TerminalStatusEvidence::ProlongedSilence {
+                reason: "bounded_silence".to_string(),
+            },
+            observed_at: SystemTime::now(),
+        };
+
+        let signal = crate::executor::providers::claude::Recognizer.recognize(&evidence);
+
+        assert_eq!(signal.kind, TerminalSignalKind::ProlongedSilence);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn t14_binary_stdout_preserved_under_bounded_supervisor() {
+        let script = fixture_script("printf 'raw\\000\\377Z'");
+
+        let result = age141_execute_script_with_config(
+            &script,
+            age141_bounded_silence_config(Duration::from_millis(120)),
+        );
+
+        assert_eq!(result.stdout, b"raw\0\xffZ".to_vec());
+        age141_signal(&result.terminal_signal, TerminalSignalKind::CleanExit);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn t15_return_channel_cleanup_after_silence() {
+        let invocation = Uuid::new_v4();
+        let receipt = age141_receipt_json(invocation, "silence.md", 1).replace('\'', r#"'\''"#);
+        let dir = tempfile::tempdir().unwrap();
+        let observed_channel = dir.path().join("observed-channel.txt");
+        let script = fixture_script(&format!(
+            r#"test -n "${{OULIPOLY_RETURN_CHANNEL:-}}"
+printf '%s' "$OULIPOLY_RETURN_CHANNEL" > "{observed_channel}"
+printf '%s\n' '{receipt}' >> "$OULIPOLY_RETURN_CHANNEL"
+sleep 9999"#,
+            observed_channel = observed_channel.display()
+        ));
+        let provider = age141_provider(&script);
+        let model = age141_model_for_provider(provider.clone(), PromptMode::Arg);
+        let extra_inputs = HashMap::new();
+
+        let result = execute_effective_with_bounded_silence_config(
+            EffectiveExecuteRequest {
+                model: &model,
+                provider: &provider,
+                provider_index: 0,
+                prompt_mode: PromptMode::Arg,
+                prompt: "prompt",
+                working_dir: None,
+                extra_inputs: &extra_inputs,
+                parent_invocation_env: Some(&age141_parent_env(invocation)),
+            },
+            None,
+            age141_bounded_silence_config(Duration::from_millis(120)),
+        )
+        .unwrap();
+
+        age141_signal(
+            &result.terminal_signal,
+            TerminalSignalKind::ProlongedSilence,
+        );
+        assert_eq!(result.returned_artifacts.len(), 1);
+        assert_eq!(result.returned_artifacts[0].name, "silence.md");
+        let channel_path = PathBuf::from(std::fs::read_to_string(observed_channel).unwrap());
+        assert!(
+            !channel_path.exists(),
+            "return-channel sidecar must be cleaned after silence kill+reap"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn t16_child_marker_parsing_after_silence() {
+        let marker = CompositeInvocationId {
+            source: "age-141-child".to_string(),
+            id: "11111111-1111-4111-8111-111111111111".to_string(),
+        };
+        let marker_line = marker.stderr_line();
+        let script = fixture_script(&format!(
+            r#"printf '%s\n' '{marker_line}' >&2
+sleep 9999"#
+        ));
+
+        let result = age141_execute_script_with_config(
+            &script,
+            age141_bounded_silence_config(Duration::from_millis(120)),
+        );
+
+        age141_signal(
+            &result.terminal_signal,
+            TerminalSignalKind::ProlongedSilence,
+        );
+        assert_eq!(result.captured_child_invocations.len(), 1);
+        assert_eq!(result.captured_child_invocations[0].composite_id, marker);
+        assert_eq!(
+            result.captured_child_invocations[0].raw_marker_line,
+            marker_line
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn t17_session_capture_normal_drain_carries_clean_signal() {
+        let script = fixture_script(
+            r#"requested=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --session-id)
+      requested="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$requested""#,
+        );
+        let mut provider = age141_provider(&script);
+        provider.args = vec!["-p".to_string()];
+        provider.session_capture = Some(SessionCapture {
+            kind: SessionCaptureKind::ForcedFlagVerified,
+            flag: Some("--session-id".to_string()),
+            readback_args: Some(vec!["--verbose".to_string()]),
+            event_type: None,
+            event_id_path: None,
+            json_flag: None,
+            last_message_flag: None,
+        });
+        let model = age141_model_for_provider(provider.clone(), PromptMode::Arg);
+        let extra_inputs = HashMap::new();
+
+        let result = execute_effective_with_bounded_silence_config(
+            EffectiveExecuteRequest {
+                model: &model,
+                provider: &provider,
+                provider_index: 0,
+                prompt_mode: PromptMode::Arg,
+                prompt: "prompt",
+                working_dir: None,
+                extra_inputs: &extra_inputs,
+                parent_invocation_env: None,
+            },
+            None,
+            age141_bounded_silence_config(Duration::from_millis(500)),
+        )
+        .unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        assert!(matches!(
+            result.session_capture.method,
+            SessionCaptureMethod::ForcedFlagVerified
+        ));
+        assert!(result.session_capture.session_id.is_some());
+        age141_signal(&result.terminal_signal, TerminalSignalKind::CleanExit);
+    }
+
+    #[test]
+    fn t18_declared_roles_header_source_guard() {
+        let source = age141_source();
+        let header = source
+            .find("## Declared roles")
+            .map(|idx| &source[..idx + 512])
+            .expect("cli.rs must declare a top-of-file ## Declared roles module doc header");
+
+        for role in [
+            "orchestration",
+            "mapper",
+            "parser",
+            "validator",
+            "formatter",
+        ] {
+            assert!(
+                header.contains(role),
+                "declared roles header must contain role token {role:?}; header was:\n{header}"
+            );
+        }
+        assert!(
+            source[..source.find("use ").unwrap_or(source.len())].contains("## Declared roles"),
+            "declared roles must be in the module doc-comment header before imports"
+        );
+    }
+
+    #[test]
+    fn t19_declared_coupling_carriers_source_guard() {
+        let source = age141_source();
+        let start = source
+            .find("## Declared coupling carriers")
+            .expect("cli.rs must declare a top-of-file ## Declared coupling carriers block");
+        let header_end = source.find("use ").unwrap_or(source.len());
+        assert!(
+            start < header_end,
+            "declared coupling carriers must live in the module doc-comment header before imports"
+        );
+        let block = &source[start..header_end];
+        for carrier in [
+            "InputType",
+            "ModelConfig",
+            "PromptMode",
+            "ProviderConfig",
+            "ResumeKind",
+            "ResumeStrategy",
+            "SessionCapture",
+            "SessionCaptureKind",
+            "ToolRestrictionKind",
+            "oulipoly_config::InputDef",
+            "oulipoly_config::ResumeAcceptanceRules",
+            "std::process::Child",
+            "std::process::Command",
+            "std::process::ExitStatus",
+            "std::process::Stdio",
+            "std::io::Write",
+            "std::path::Path",
+            "std::path::PathBuf",
+            "std::sync::Arc",
+            "std::sync::atomic::AtomicBool",
+            "std::sync::atomic::Ordering",
+            "std::thread",
+            "signal_hook::consts::signal::SIGHUP",
+            "signal_hook::consts::signal::SIGINT",
+            "signal_hook::consts::signal::SIGTERM",
+            "signal_hook::iterator::SignalsHandle",
+            "signal_hook::iterator::Signals",
+            "libc",
+            "std::os::unix::process::ExitStatusExt",
+        ] {
+            assert!(
+                block.contains(carrier),
+                "declared coupling-carrier block must contain literal token {carrier:?}; block was:\n{block}"
+            );
+        }
+    }
+
+    #[test]
+    fn t20_existing_inline_regression_suite_contract_sentinel() {
+        assert_eq!(
+            shell_split(r#"env -u FOO "my provider""#),
+            vec!["env", "-u", "FOO", "my provider"]
+        );
+        assert_eq!(provider_name("env -u CLAUDECODE claude"), "claude");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+
+            let success = std::process::ExitStatus::from_raw(0);
+            let nonzero = std::process::ExitStatus::from_raw(42 << 8);
+            let sigterm = std::process::ExitStatus::from_raw(15);
+
+            assert_eq!(classify_terminal_reason(&success), None);
+            assert_eq!(
+                classify_terminal_reason(&nonzero).as_deref(),
+                Some("exit_nonzero")
+            );
+            assert_eq!(
+                classify_terminal_reason(&sigterm).as_deref(),
+                Some("signal:SIGTERM")
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn t21_bounded_silence_killpg_handles_stubborn_grandchild() {
+        let script = fixture_script(
+            r#"trap '' SIGTERM
+(
+  trap '' SIGTERM
+  printf 't21-grandchild-stdout\n'
+  printf 't21-grandchild-stderr\n' >&2
+  sleep 9999
+) &
+sleep 9999"#,
+        );
+        let silence_ceiling = Duration::from_millis(120);
+        let started = Instant::now();
+
+        let result = age141_execute_script_with_config(
+            &script,
+            age141_bounded_silence_config(silence_ceiling),
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < silence_ceiling + TERMINATE_GRACE_PERIOD + Duration::from_millis(700),
+            "stubborn descendant kept inherited pipes open after hard-kill fallback; elapsed={elapsed:?}"
+        );
+        assert_ne!(result.exit_code, 0);
+        assert_eq!(result.terminal_reason.as_deref(), Some("bounded_silence"));
+        age141_signal(
+            &result.terminal_signal,
+            TerminalSignalKind::ProlongedSilence,
+        );
+        assert!(
+            result
+                .stdout
+                .windows(b"t21-grandchild-stdout\n".len())
+                .any(|chunk| chunk == b"t21-grandchild-stdout\n"),
+            "stdout drain did not preserve the stubborn descendant output: {:?}",
+            result.stdout
+        );
+        assert!(
+            result.stderr.contains("t21-grandchild-stderr\n"),
+            "stderr drain did not preserve the stubborn descendant output: {:?}",
+            result.stderr
+        );
     }
 
     fn age28_claude_provider(script_path: &Path, args: Vec<String>) -> ProviderConfig {
