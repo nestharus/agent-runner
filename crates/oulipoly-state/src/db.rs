@@ -9202,6 +9202,901 @@ interactive_args = ["launch"]
         assert_eq!(active, 0);
     }
 
+    #[test]
+    fn age132_invocation_projection_maps_full_row_and_rejects_bad_values() {
+        let db = test_db();
+        let invocation_uuid = "44444444-4444-4444-8444-444444444444";
+        let id = db
+            .start_invocation(&InvocationStart {
+                invocation_uuid: invocation_uuid.to_string(),
+                model_name: "claude-opus".to_string(),
+                provider_name: "claude".to_string(),
+                provider_index: 7,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        db.update_session_capture(id, Some(SESSION_A), "verified")
+            .unwrap();
+        db.update_resume_acceptance(id, "accepted", Some("matched"))
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE invocations
+                 SET status = 'succeeded',
+                     success = 1,
+                     exit_code = 0,
+                     terminal_reason = 'exit_zero',
+                     created_at = '2026-04-17T08:00:00Z',
+                     finished_at = '2026-04-17T08:00:02Z'
+                 WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+
+        let record = db
+            .get_invocation_by_uuid(invocation_uuid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.id, id);
+        assert_eq!(record.invocation_uuid, invocation_uuid);
+        assert_eq!(record.model_name, "claude-opus");
+        assert_eq!(record.provider_name.as_deref(), Some("claude"));
+        assert_eq!(record.provider_index, 7);
+        assert_eq!(record.parent_invocation_id, None);
+        assert_eq!(record.status, InvocationStatus::Succeeded);
+        assert_eq!(record.success, Some(true));
+        assert_eq!(record.exit_code, Some(0));
+        assert_eq!(record.terminal_reason.as_deref(), Some("exit_zero"));
+        assert_eq!(record.session_id.as_deref(), Some(SESSION_A));
+        assert_eq!(record.provider_session_id.as_deref(), Some(SESSION_A));
+        assert_eq!(
+            record.provider_session_capture_method.as_deref(),
+            Some("verified")
+        );
+        assert_eq!(record.resume_acceptance_status.as_deref(), Some("accepted"));
+        assert_eq!(
+            record.resume_acceptance_evidence.as_deref(),
+            Some("matched")
+        );
+        assert_eq!(record.created_at, ts("2026-04-17T08:00:00Z"));
+        assert_eq!(record.finished_at, Some(ts("2026-04-17T08:00:02Z")));
+
+        let child_uuid = "55555555-5555-5555-8555-555555555555";
+        let child_id =
+            insert_invocation_fixture(&db, child_uuid, Some(id), "2026-04-17T08:00:01Z");
+        let children = db.list_invocation_children(id).unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].id, child_id);
+        assert_eq!(children[0].invocation_uuid, child_uuid);
+        assert_eq!(children[0].parent_invocation_id, Some(id));
+        assert_eq!(children[0].created_at, ts("2026-04-17T08:00:01Z"));
+
+        db.conn
+            .pragma_update(None, "ignore_check_constraints", true)
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE invocations SET status = 'paused' WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+        let err = db.get_invocation_by_uuid(invocation_uuid).unwrap_err();
+        assert!(err.contains("Unknown invocation status: paused"), "{err}");
+        db.conn
+            .execute(
+                "UPDATE invocations SET status = 'running', created_at = 'not-a-timestamp' WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+        let err = db.get_invocation_by_uuid(invocation_uuid).unwrap_err();
+        assert!(err.contains("Conversion error"), "{err}");
+    }
+
+    #[test]
+    fn age132_backfill_infers_model_from_latest_matching_invocation() {
+        let db = test_db();
+        db.ingest_session_turns_batch(
+            "claude",
+            &[
+                SessionTurnIngest {
+                    session_id: SESSION_A.to_string(),
+                    turn_id: "turn-a1".to_string(),
+                    timestamp: ts("2026-04-17T08:00:00Z"),
+                    role: "user".to_string(),
+                    parent_turn_id: None,
+                    is_sidechain: false,
+                    is_compaction_boundary: false,
+                    body: None,
+                },
+                SessionTurnIngest {
+                    session_id: SESSION_A.to_string(),
+                    turn_id: "turn-a2".to_string(),
+                    timestamp: ts("2026-04-17T08:01:00Z"),
+                    role: "assistant".to_string(),
+                    parent_turn_id: None,
+                    is_sidechain: false,
+                    is_compaction_boundary: false,
+                    body: None,
+                },
+            ],
+        )
+        .unwrap();
+        seed_invocation_for_session(
+            &db,
+            "claude-haiku",
+            "claude",
+            SESSION_A,
+            "2026-04-17T08:00:30Z",
+        );
+        seed_invocation_for_session(
+            &db,
+            "claude-opus",
+            "claude",
+            SESSION_A,
+            "2026-04-17T08:01:30Z",
+        );
+
+        let report = db.backfill_session_chains().unwrap();
+        assert_eq!(
+            report,
+            BackfillReport {
+                skipped_existing: false,
+                chains_inserted: 1,
+                segments_inserted: 1
+            }
+        );
+        let model_name: String = db
+            .conn
+            .query_row("SELECT model_name FROM session_chains", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(model_name, "claude-opus");
+    }
+
+    #[test]
+    fn age132_resolve_resume_rejections_and_wrong_id_context_are_typed() {
+        let models = resolver_model_store();
+        assert!(matches!(
+            test_db()
+                .resolve_resume(&models, "not-a-uuid", None)
+                .unwrap_err(),
+            ResumeError::InvalidUuid { .. }
+        ));
+        assert!(matches!(
+            test_db()
+                .resolve_resume(&models, "77777777-7777-4777-8777-777777777777", None)
+                .unwrap_err(),
+            ResumeError::NoChainFound { .. }
+        ));
+
+        let unknown_model_db = test_db();
+        seed_test_chain(
+            &unknown_model_db,
+            CHAIN_A,
+            "claude",
+            SESSION_A,
+            "missing-model",
+            "2026-04-17T08:00:00Z",
+        );
+        assert!(matches!(
+            unknown_model_db.resolve_resume(&models, SESSION_A, None).unwrap_err(),
+            ResumeError::UnknownModel { ref model_name } if model_name == "missing-model"
+        ));
+
+        let missing_segment_db = test_db();
+        seed_chain_row(
+            &missing_segment_db,
+            CHAIN_A,
+            "claude-opus",
+            "2026-04-17T08:00:00Z",
+        );
+        seed_segment_row(
+            &missing_segment_db,
+            CHAIN_A,
+            "claude",
+            SESSION_A,
+            "2026-04-17T08:00:00Z",
+            Some("2026-04-17T08:30:00Z"),
+            "initial",
+        );
+        assert!(matches!(
+            missing_segment_db.resolve_resume(&models, SESSION_A, None).unwrap_err(),
+            ResumeError::ActiveSegmentMissing { ref chain_id } if chain_id == CHAIN_A
+        ));
+
+        let wrong_id_db = test_db();
+        let invocation_uuid = "88888888-8888-4888-8888-888888888888";
+        let id = wrong_id_db
+            .start_invocation(&InvocationStart {
+                invocation_uuid: invocation_uuid.to_string(),
+                model_name: "claude-opus".to_string(),
+                provider_name: "claude".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        wrong_id_db
+            .bind_invocation_provider_session_start(
+                id,
+                &ProviderSessionBinding {
+                    provider_session_id: SESSION_A.to_string(),
+                    capture_method: "verified",
+                    resume_input_id: None,
+                },
+            )
+            .unwrap();
+        match wrong_id_db
+            .resolve_resume(&models, invocation_uuid, None)
+            .unwrap_err()
+        {
+            ResumeError::WrongIdKind {
+                provider_session_id,
+                chain_id,
+                provider_name,
+                agent_runner_invocation_id,
+                ..
+            } => {
+                assert_eq!(provider_session_id.as_deref(), Some(SESSION_A));
+                assert!(chain_id.is_some());
+                assert_eq!(provider_name.as_deref(), Some("claude"));
+                assert_eq!(agent_runner_invocation_id, invocation_uuid);
+            }
+            other => panic!("expected wrong-id-kind rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn age132_timestamp_policies_preserve_strict_forgiving_and_fallback_callers() {
+        let db = test_db();
+        db.upsert_quota_refresh("claude", &[quota_input(0.40, "2026-04-22T00:00:00Z")])
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE provider_quotas
+                 SET refreshed_at = 'bad-refreshed',
+                     exhausted_at = 'bad-exhausted',
+                     last_topology_probe_at = 'bad-probe'
+                 WHERE provider_name = 'claude'",
+                [],
+            )
+            .unwrap();
+        let quota = db.get_quota("claude").unwrap().unwrap();
+        assert_eq!(quota.refreshed_at, None);
+        assert_eq!(quota.exhausted_at, None);
+        assert_eq!(quota.last_topology_probe_at, None);
+        db.conn
+            .execute(
+                "UPDATE provider_quota_windows SET resets_at = 'bad-window' WHERE provider_name = 'claude'",
+                [],
+            )
+            .unwrap();
+        assert!(db.get_windows("claude").is_err());
+
+        let id = db
+            .start_invocation(&InvocationStart {
+                invocation_uuid: Uuid::new_v4().to_string(),
+                model_name: "claude-opus".to_string(),
+                provider_name: "claude".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        db.update_session_capture(id, Some(SESSION_A), "verified")
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE invocations SET created_at = 'not-a-timestamp' WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+        let before = Utc::now();
+        db.mint_chain_for_invocation_session(id).unwrap();
+        let after = Utc::now();
+        let raw_started: String = db
+            .conn
+            .query_row(
+                "SELECT started_at FROM session_chain_segments WHERE provider_name = 'claude' AND session_id = ?1",
+                params![SESSION_A],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let started_at = DateTime::parse_from_rfc3339(&raw_started)
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(started_at >= before - chrono::Duration::seconds(1));
+        assert!(started_at <= after + chrono::Duration::seconds(1));
+    }
+
+    #[test]
+    fn age132_invocation_artifact_contract_and_warning_only_failure_paths() {
+        let memory = StateDb::open(Path::new(":memory:")).unwrap();
+        let memory_id = memory
+            .start_invocation(&InvocationStart {
+                invocation_uuid: Uuid::new_v4().to_string(),
+                model_name: "claude-opus".to_string(),
+                provider_name: "claude".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        memory
+            .finalize_invocation(memory_id, true, 0, None, None)
+            .unwrap();
+        let memory_status: String = memory
+            .connection()
+            .query_row(
+                "SELECT status FROM invocations WHERE id = ?1",
+                params![memory_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(memory_status, "succeeded");
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(&dir.path().join("state.db")).unwrap();
+        let invocation_uuid = "99999999-9999-4999-8999-999999999999";
+        let id = db
+            .start_invocation(&InvocationStart {
+                invocation_uuid: invocation_uuid.to_string(),
+                model_name: "claude-opus".to_string(),
+                provider_name: "claude".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        let invocation_path = dir
+            .path()
+            .join("invocations")
+            .join(format!("{invocation_uuid}.invocation"));
+        assert!(invocation_path.exists());
+        assert!(!invocation_path.with_extension("invocation.tmp").exists());
+        let payload: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&invocation_path).unwrap()).unwrap();
+        assert_eq!(payload["id"], invocation_uuid);
+        assert_eq!(payload["status"], "running");
+        assert_eq!(payload["model_name"], "claude-opus");
+        assert_eq!(payload["provider_name"], "claude");
+        assert!(payload["pid"].as_u64().is_some());
+        assert!(DateTime::parse_from_rfc3339(payload["started_at"].as_str().unwrap()).is_ok());
+
+        db.finalize_invocation(id, false, 42, Some("rate_limit"), Some("limited"))
+            .unwrap();
+        let result_path = dir
+            .path()
+            .join("invocations")
+            .join(format!("{invocation_uuid}.result"));
+        assert!(result_path.exists());
+        assert!(!result_path.with_extension("result.tmp").exists());
+        let payload: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&result_path).unwrap()).unwrap();
+        assert_eq!(payload["id"], invocation_uuid);
+        assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["success"], false);
+        assert_eq!(payload["exit_code"], 42);
+        assert_eq!(payload["error_category"], "rate_limit");
+        assert_eq!(payload["terminal_reason"], "limited");
+        assert!(DateTime::parse_from_rfc3339(payload["finished_at"].as_str().unwrap()).is_ok());
+
+        let failing_dir = tempfile::tempdir().unwrap();
+        let failing = StateDb::open(&failing_dir.path().join("state.db")).unwrap();
+        std::fs::write(failing_dir.path().join("invocations"), b"not a directory").unwrap();
+        let id = failing
+            .start_invocation(&InvocationStart {
+                invocation_uuid: Uuid::new_v4().to_string(),
+                model_name: "claude-opus".to_string(),
+                provider_name: "claude".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        failing
+            .finalize_invocation(id, true, 0, None, None)
+            .unwrap();
+        let status: String = failing
+            .conn
+            .query_row(
+                "SELECT status FROM invocations WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "succeeded");
+    }
+
+    fn returned_artifact_ref(
+        invocation_uuid: Uuid,
+        artifact_name: &str,
+        version: u64,
+    ) -> ReturnedArtifactRef {
+        let workflow_run_id = format!("return:{invocation_uuid}");
+        let version_id = format!("store://return/{invocation_uuid}/{artifact_name}/{version}");
+        ReturnedArtifactRef {
+            version_id,
+            name: artifact_name.to_string(),
+            store_address: oulipoly_agent_messenger::StoreAddress {
+                workflow_run_id,
+                artifact_name: artifact_name.to_string(),
+                version,
+            },
+            sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+            content_len: 123,
+            format_hint: Some("text/plain".to_string()),
+            verdict_line: Some("ok".to_string()),
+            source: oulipoly_agent_messenger::ReturnedArtifactSource::Scratchpad {
+                name: "notes".to_string(),
+                version: 1,
+            },
+            producer_invocation_uuid: invocation_uuid,
+            returned_at: ts("2026-04-17T08:00:00Z"),
+        }
+    }
+
+    #[test]
+    fn age132_returned_artifacts_validate_identity_bounds_and_rollback_failed_retry() {
+        let db = test_db();
+        let invocation_uuid = Uuid::new_v4();
+        let id = db
+            .start_invocation(&InvocationStart {
+                invocation_uuid: invocation_uuid.to_string(),
+                model_name: "claude-opus".to_string(),
+                provider_name: "claude".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        let good = returned_artifact_ref(invocation_uuid, "alpha.txt", 1);
+        db.record_returned_artifacts(id, std::slice::from_ref(&good))
+            .unwrap();
+
+        let mut bad_workflow = returned_artifact_ref(invocation_uuid, "bad-workflow.txt", 1);
+        bad_workflow.store_address.workflow_run_id = "not-return-namespace".to_string();
+        assert!(
+            db.record_returned_artifacts(id, &[bad_workflow])
+                .unwrap_err()
+                .contains("workflow_run_id")
+        );
+
+        let mut bad_version = returned_artifact_ref(invocation_uuid, "bad-version.txt", 1);
+        bad_version.version_id = "store://wrong-version".to_string();
+        assert!(
+            db.record_returned_artifacts(id, &[bad_version])
+                .unwrap_err()
+                .contains("version_id mismatch")
+        );
+
+        let mut overflow = returned_artifact_ref(invocation_uuid, "overflow.txt", 1);
+        overflow.content_len = u64::MAX;
+        assert!(
+            db.record_returned_artifacts(id, &[overflow])
+                .unwrap_err()
+                .contains("content_len exceeds SQLite INTEGER range")
+        );
+        assert_eq!(db.list_returned_artifacts(id).unwrap(), vec![good]);
+    }
+
+    #[test]
+    fn age132_session_turn_ingest_batch_and_single_paths_preserve_mapping_and_atomicity() {
+        let db = test_db();
+        let timestamp = ts("2026-04-17T08:00:00Z");
+        assert!(
+            db.ingest_session_turn(
+                "claude",
+                SESSION_A,
+                "single-turn",
+                &timestamp,
+                "assistant",
+                "/tmp/session.jsonl",
+            )
+            .unwrap()
+        );
+        assert!(
+            !db.ingest_session_turn(
+                "claude",
+                SESSION_A,
+                "single-turn",
+                &timestamp,
+                "assistant",
+                "/tmp/session.jsonl",
+            )
+            .unwrap()
+        );
+        let source_file: String = db
+            .conn
+            .query_row(
+                "SELECT source_file FROM session_turns WHERE turn_id = 'single-turn'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_file, "/tmp/session.jsonl");
+
+        let turns = vec![
+            SessionTurnIngest {
+                session_id: SESSION_A.to_string(),
+                turn_id: "turn-1".to_string(),
+                timestamp,
+                role: "user".to_string(),
+                parent_turn_id: None,
+                is_sidechain: false,
+                is_compaction_boundary: false,
+                body: Some("hello".to_string()),
+            },
+            SessionTurnIngest {
+                session_id: SESSION_A.to_string(),
+                turn_id: "turn-2".to_string(),
+                timestamp: timestamp + chrono::Duration::seconds(1),
+                role: "assistant".to_string(),
+                parent_turn_id: Some("turn-1".to_string()),
+                is_sidechain: true,
+                is_compaction_boundary: true,
+                body: Some("world".to_string()),
+            },
+        ];
+        assert_eq!(db.ingest_session_turns_batch("claude", &turns).unwrap(), 2);
+        assert_eq!(db.ingest_session_turns_batch("claude", &turns).unwrap(), 0);
+        let row: (Option<String>, i64, i64, Option<String>) = db
+            .conn
+            .query_row(
+                "SELECT parent_turn_id, is_sidechain, is_compaction_boundary, body
+                 FROM session_turns WHERE turn_id = 'turn-2'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (Some("turn-1".to_string()), 1, 1, Some("world".to_string()))
+        );
+
+        let failing = test_db();
+        failing
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER fail_bad_turn
+                 BEFORE INSERT ON session_turns
+                 WHEN NEW.turn_id = 'bad'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'bad turn');
+                 END;",
+            )
+            .unwrap();
+        assert!(
+            failing
+                .ingest_session_turns_batch(
+                    "claude",
+                    &[
+                        SessionTurnIngest {
+                            session_id: SESSION_A.to_string(),
+                            turn_id: "good-before-error".to_string(),
+                            timestamp,
+                            role: "assistant".to_string(),
+                            parent_turn_id: None,
+                            is_sidechain: false,
+                            is_compaction_boundary: false,
+                            body: None,
+                        },
+                        SessionTurnIngest {
+                            session_id: SESSION_A.to_string(),
+                            turn_id: "bad".to_string(),
+                            timestamp: timestamp + chrono::Duration::seconds(1),
+                            role: "assistant".to_string(),
+                            parent_turn_id: None,
+                            is_sidechain: false,
+                            is_compaction_boundary: false,
+                            body: None,
+                        },
+                    ],
+                )
+                .unwrap_err()
+                .contains("bad turn")
+        );
+        let persisted: i64 = failing
+            .conn
+            .query_row("SELECT COUNT(*) FROM session_turns", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(persisted, 0);
+    }
+
+    #[test]
+    fn age132_resume_previews_and_compaction_boundaries_preserve_ordering_contracts() {
+        let db = test_db();
+        seed_test_chain(
+            &db,
+            CHAIN_A,
+            "claude",
+            SESSION_A,
+            "claude-opus",
+            "2026-04-17T08:00:00Z",
+        );
+        seed_test_chain(
+            &db,
+            CHAIN_B,
+            "claude2",
+            SESSION_A,
+            "claude-opus",
+            "2026-04-17T09:00:00Z",
+        );
+        let turns: Vec<_> = (0..4)
+            .map(|i| SessionTurnIngest {
+                session_id: SESSION_A.to_string(),
+                turn_id: format!("turn-{i}"),
+                timestamp: ts(&format!("2026-04-17T08:00:0{i}Z")),
+                role: if i % 2 == 0 { "user" } else { "assistant" }.to_string(),
+                parent_turn_id: None,
+                is_sidechain: false,
+                is_compaction_boundary: false,
+                body: Some(format!("body-{i}")),
+            })
+            .collect();
+        db.ingest_session_turns_batch("claude2", &turns).unwrap();
+
+        let previews = db.resume_previews(SESSION_A).unwrap();
+        assert_eq!(previews.len(), 2);
+        assert_eq!(previews[0].chain_id, CHAIN_B);
+        assert_eq!(previews[0].active_provider, "claude2");
+        assert_eq!(previews[0].turn_count, 4);
+        assert_eq!(previews[0].recent_turns.len(), 3);
+        assert_eq!(
+            previews[0].recent_turns[0].timestamp,
+            ts("2026-04-17T08:00:01Z")
+        );
+        assert_eq!(
+            previews[0].recent_turns[1].timestamp,
+            ts("2026-04-17T08:00:02Z")
+        );
+        assert_eq!(
+            previews[0].recent_turns[2].timestamp,
+            ts("2026-04-17T08:00:03Z")
+        );
+        assert_eq!(previews[0].recent_turns[0].snippet, None);
+        assert_eq!(previews[1].chain_id, CHAIN_A);
+
+        let boundary_db = test_db();
+        boundary_db
+            .ingest_session_turns_batch(
+                "claude",
+                &[
+                    SessionTurnIngest {
+                        session_id: SESSION_A.to_string(),
+                        turn_id: "old-boundary".to_string(),
+                        timestamp: ts("2026-04-17T08:00:00Z"),
+                        role: "assistant".to_string(),
+                        parent_turn_id: None,
+                        is_sidechain: false,
+                        is_compaction_boundary: true,
+                        body: None,
+                    },
+                    SessionTurnIngest {
+                        session_id: SESSION_A.to_string(),
+                        turn_id: "tie-first".to_string(),
+                        timestamp: ts("2026-04-17T08:01:00Z"),
+                        role: "assistant".to_string(),
+                        parent_turn_id: None,
+                        is_sidechain: false,
+                        is_compaction_boundary: true,
+                        body: None,
+                    },
+                    SessionTurnIngest {
+                        session_id: SESSION_A.to_string(),
+                        turn_id: "tie-second".to_string(),
+                        timestamp: ts("2026-04-17T08:01:00Z"),
+                        role: "assistant".to_string(),
+                        parent_turn_id: None,
+                        is_sidechain: false,
+                        is_compaction_boundary: true,
+                        body: None,
+                    },
+                    SessionTurnIngest {
+                        session_id: SESSION_A.to_string(),
+                        turn_id: "not-yet-boundary".to_string(),
+                        timestamp: ts("2026-04-17T08:02:00Z"),
+                        role: "assistant".to_string(),
+                        parent_turn_id: None,
+                        is_sidechain: false,
+                        is_compaction_boundary: false,
+                        body: None,
+                    },
+                ],
+            )
+            .unwrap();
+        let latest = boundary_db
+            .latest_compaction_boundary("claude", SESSION_A)
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.0, "tie-second");
+        assert_eq!(latest.1, ts("2026-04-17T08:01:00Z"));
+        assert!(
+            boundary_db
+                .flag_compaction_boundary("claude", SESSION_A, "not-yet-boundary")
+                .unwrap()
+        );
+        assert!(
+            !boundary_db
+                .flag_compaction_boundary("claude", SESSION_A, "not-yet-boundary")
+                .unwrap()
+        );
+        assert!(
+            !boundary_db
+                .flag_compaction_boundary("claude", SESSION_A, "missing-turn")
+                .unwrap()
+        );
+        let latest = boundary_db
+            .latest_compaction_boundary("claude", SESSION_A)
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.0, "not-yet-boundary");
+        assert_eq!(latest.1, ts("2026-04-17T08:02:00Z"));
+        assert_eq!(
+            test_db()
+                .latest_compaction_boundary("claude", SESSION_A)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn age132_read_only_error_classifier_and_sidecar_paths_map_documented_variants() {
+        let missing_dir = tempfile::tempdir().unwrap();
+        let missing_path = missing_dir.path().join("missing-state.db");
+        match StateDb::open_read_only(&missing_path) {
+            Err(ReadOnlyOpenError::Missing { path }) => assert_eq!(path, missing_path),
+            Ok(_) => panic!("expected Missing, got successful read-only open"),
+            Err(other) => panic!("expected Missing, got {other:?}"),
+        }
+
+        let malformed_dir = tempfile::tempdir().unwrap();
+        let malformed_path = malformed_dir.path().join("state.db");
+        std::fs::write(&malformed_path, b"not sqlite").unwrap();
+        match StateDb::open_read_only(&malformed_path) {
+            Err(ReadOnlyOpenError::NotADatabase { path: p, message }) => {
+                assert_eq!(p, malformed_path);
+                assert!(
+                    message.contains("file is not a database")
+                        || message.contains("database disk image is malformed"),
+                    "{message}"
+                );
+            }
+            Ok(_) => panic!("expected NotADatabase, got successful read-only open"),
+            Err(other) => panic!("expected NotADatabase, got {other:?}"),
+        }
+
+        let valid_dir = tempfile::tempdir().unwrap();
+        let valid_path = valid_dir.path().join("state.db");
+        drop(StateDb::open(&valid_path).unwrap());
+        drop(StateDb::open_read_only(&valid_path).unwrap());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let denied_dir = tempfile::tempdir().unwrap();
+            let denied_path = denied_dir.path().join("state.db");
+            drop(StateDb::open(&denied_path).unwrap());
+            let mut denied_permissions = std::fs::metadata(&denied_path).unwrap().permissions();
+            denied_permissions.set_mode(0o000);
+            std::fs::set_permissions(&denied_path, denied_permissions).unwrap();
+            match StateDb::open_read_only(&denied_path) {
+                Err(ReadOnlyOpenError::PermissionDenied { path }) => assert_eq!(path, denied_path),
+                Ok(_) => panic!("expected PermissionDenied, got successful read-only open"),
+                Err(other) => panic!("expected PermissionDenied, got {other:?}"),
+            }
+
+            let sidecar_dir = tempfile::tempdir().unwrap();
+            let sidecar_path = sidecar_dir.path().join("state.db");
+            let sidecar_conn = Connection::open(&sidecar_path).unwrap();
+            sidecar_conn
+                .execute_batch(
+                    "PRAGMA journal_mode = WAL;
+                     CREATE TABLE sidecar_probe (value TEXT);
+                     INSERT INTO sidecar_probe (value) VALUES ('kept open');",
+                )
+                .unwrap();
+            let sidecar_file = std::fs::read_dir(sidecar_dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| path != &sidecar_path && path.is_file())
+                .expect("WAL mode should create at least one SQLite sidecar file");
+            let mut sidecar_permissions =
+                std::fs::metadata(&sidecar_file).unwrap().permissions();
+            sidecar_permissions.set_mode(0o000);
+            std::fs::set_permissions(&sidecar_file, sidecar_permissions).unwrap();
+            match StateDb::open_read_only(&sidecar_path) {
+                Err(ReadOnlyOpenError::WalSidecarError { path, message }) => {
+                    assert_eq!(path, sidecar_path);
+                    assert!(message.contains("sidecar"), "{message}");
+                }
+                Ok(_) => panic!("expected WalSidecarError, got successful read-only open"),
+                Err(other) => panic!("expected WalSidecarError, got {other:?}"),
+            }
+            drop(sidecar_conn);
+        }
+
+        match StateDb::open_read_only(valid_dir.path()) {
+            Err(ReadOnlyOpenError::Operational { message }) => {
+                assert!(!message.is_empty());
+            }
+            Ok(_) => panic!("expected Operational, got successful read-only open"),
+            Err(other) => panic!("expected operational mapping, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn age132_setup_crud_count_and_call_counter_edge_contracts() {
+        let db = test_db();
+        db.upsert_cli_provider(&sample_provider()).unwrap();
+        let expired = AccountRecord {
+            id: "expired".to_string(),
+            provider: "claude".to_string(),
+            profile_name: "expired-profile".to_string(),
+            auth_method: AuthMethod::OAuth,
+            auth_status: AuthStatus::Expired,
+            created_at: "2026-02-19T00:00:00Z".to_string(),
+        };
+        db.insert_account(&expired).unwrap();
+        db.conn
+            .execute(
+                "UPDATE accounts SET auth_status = 'surprise' WHERE id = 'expired'",
+                [],
+            )
+            .unwrap();
+        let accounts = db.list_accounts(Some("claude")).unwrap();
+        assert_eq!(accounts[0].auth_status, AuthStatus::Unknown);
+        assert!(!db.delete_account("missing", "claude").unwrap());
+        assert_eq!(
+            db.delete_stale_models("claude", "missing-version").unwrap(),
+            0
+        );
+
+        let since = ts("2026-04-17T08:00:00Z");
+        db.ingest_session_turns_batch(
+            "claude",
+            &[
+                SessionTurnIngest {
+                    session_id: SESSION_A.to_string(),
+                    turn_id: "at-boundary".to_string(),
+                    timestamp: since,
+                    role: "assistant".to_string(),
+                    parent_turn_id: None,
+                    is_sidechain: false,
+                    is_compaction_boundary: false,
+                    body: None,
+                },
+                SessionTurnIngest {
+                    session_id: SESSION_A.to_string(),
+                    turn_id: "after-boundary".to_string(),
+                    timestamp: since + chrono::Duration::seconds(1),
+                    role: "assistant".to_string(),
+                    parent_turn_id: None,
+                    is_sidechain: false,
+                    is_compaction_boundary: false,
+                    body: None,
+                },
+                SessionTurnIngest {
+                    session_id: SESSION_A.to_string(),
+                    turn_id: "user-after-boundary".to_string(),
+                    timestamp: since + chrono::Duration::seconds(2),
+                    role: "user".to_string(),
+                    parent_turn_id: None,
+                    is_sidechain: false,
+                    is_compaction_boundary: false,
+                    body: None,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(db.count_assistant_turns_since("claude", None).unwrap(), 2);
+        assert_eq!(
+            db.count_assistant_turns_since("claude", Some(&since))
+                .unwrap(),
+            1
+        );
+        assert_eq!(db.count_assistant_turns_since("codex", None).unwrap(), 0);
+        db.increment_calls_since_refresh("claude").unwrap();
+        db.increment_calls_since_refresh("claude").unwrap();
+        assert_eq!(calls_since_refresh(&db, "claude"), 2);
+    }
+
     // TI-04, TI-12, TI-24: ordered migration steps must fail with actionable
     // rebuild guidance and roll back both schema effects and user_version.
     #[test]
