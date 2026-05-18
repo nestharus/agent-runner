@@ -34,6 +34,7 @@ pub use self::terminal_signal::TerminalSignalRecognizer;
 // ## Declared roles
 // accessor, formatter, orchestration, mapper
 
+#[derive(Debug)]
 #[allow(dead_code)]
 pub struct ExecutionResult {
     pub stdout: Vec<u8>,
@@ -44,6 +45,7 @@ pub struct ExecutionResult {
     pub session_capture: SessionCaptureResult,
     pub resume_acceptance: Option<ResumeAcceptanceResult>,
     pub terminal_reason: Option<String>,
+    pub terminal_signal: Option<TerminalSignal>,
     pub captured_child_invocations: Vec<CapturedChildInvocation>,
     pub returned_artifacts: Vec<ReturnedArtifactRef>,
 }

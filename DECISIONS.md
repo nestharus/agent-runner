@@ -2714,3 +2714,69 @@ V3 (the R4 dispatches for shortcut and supported-surface verified the existing R
 - **What this does NOT do**:
   - Does NOT waive any other push-pull finding (PP-002 and PP-003 from Round 1 were closed by the Step 6c repair).
   - Does NOT establish precedent for residual acceptance on push-pull findings that are NOT structurally blocked at the rusqlite API surface.
+
+## AGE-141 — cli.rs bounded-silence handler + declared roles
+
+### Phase 2.5 disposition
+
+- **Defer-signal scan**: 1 of 5 fires (risk-profile HIGH-majority). Threshold for defer-to-prototype is 2. Defer-option not surfaced.
+- **Problem-map gate**: skipped (`skip_problem_map_gate=true` per caller).
+- **Step 4a (inherited-estimate cold-start)**: `PROCEED_WITHOUT_BASELINE` per caller directive (ticket has `estimate_source: missing`).
+- **Mode**: `PROCEED_EXHAUSTIVE` for all 7 touched surfaces (WU-level HIGH).
+- **In-scope `current-bug` / `drift` findings**: the coverage `current-bug` flags (open-ended headless wait, open-ended interactive wait, no live in-band quota consumption) and the duplicates `drift` flags (quota::run_script has bounded supervision; cli.rs does not) ARE this WU's declared scope. No separate tracker filed.
+
+### Bootstrap-exception policy at dispatch
+
+- Ticket anti-scope says "NO bootstrap-exception".
+- Work manager's runtime dispatch directive conditionally authorizes the bootstrap-exception ONLY if cli.rs whole-file ownership surfaces FC/cohesion HIGHs that ARE the cleanup target (per `~/ai/conventions/code-quality.md § Bootstrap exception` four-condition argument; NOT precedent citation).
+- Proposal authors the four-condition section; Phase 4 sub-gate parses + checks DECISIONS ratification adjacency.
+- Recording the conditional authorization here so Process-tree audit #1 can verify the DECISIONS adjacency if the sub-gate fires.
+
+### AGE-141 — Bootstrap exception ratification
+
+Canonical authority: `~/ai/conventions/code-quality.md` § `Bootstrap exception`.
+
+The Phase 3 proposal at `/home/nes/projects/agent-runner/planning/age-141-cli-bounded-silence/proposals/age-141-AGE-141.md` § `Bootstrap exception declaration` records the four-condition argument with these named fields:
+
+- `declared: true`
+- `code_quality_gate: phase_4_code_quality`
+- `measured_metric: declared-roles + raw-symbol-coupling carriers + function-classification helper-extraction`
+- `expected_non_low_verdict: HIGH`
+- `finding_ids: [AGE-91-CQ-F05, AGE-91-CQ-F14, AGE-91-CQ-F15]`
+- `intrinsic_lockstep_paths: [crates/oulipoly-runtime/src/executor/cli.rs, …::execute_provider_with_arg_parts, …::RawResult, …::InteractiveExecutionResult]`
+- `metric_change_refs: [convention §Declared roles, convention §Bootstrap exception, DECISIONS.md §AGE-141, AGE-91 Phase 4 CQ findings]`
+- `primary_deliverable_fixes_or_extends_metric: true`
+- `non_low_finding_is_intrinsic_lockstep: true`
+- `post_merge_satisfies_new_rule_under_new_metric: true`
+- `declared_for_phase_4_ratification: true`
+
+Ratification basis: the cli.rs whole-file ACR-249 cleanup (Declared roles header + raw-symbol coupling carriers + helper extraction) IS the metric-fix target. The non-LOW Phase 4 code-quality aggregate, if it occurs, is expected to derive entirely from the same intrinsic-lockstep paths the proposal already fixes; the post-merge state satisfies the new declared-roles + coupling-carrier rule under the new metric set.
+
+Work-manager pre-authorization: caller's runtime dispatch directive of 2026-05-17 conditionally authorized the four-condition Bootstrap exception for AGE-141 when the named conditions hold. The proposal asserts they hold; this ratification entry records the orchestrator's acknowledgement so the Phase 4 bootstrap-exception sub-gate's DECISIONS parser succeeds.
+
+This is NOT residual acceptance, NOT precedent citation, and does NOT authorize advance on residual Phase 4 findings outside the named lockstep paths.
+
+### AGE-146 — Bootstrap exception ratification
+
+Canonical authority: `~/ai/conventions/code-quality.md` § `Bootstrap exception`.
+
+The Phase 3 R2 proposal at `/home/nes/projects/agent-runner/planning/age-146-bounded-silence-ship/proposals/age-146-AGE-146.md` § `Bootstrap exception declaration` records the four-condition argument with these named fields:
+
+- `declared: true`
+- `code_quality_gate: phase-4`
+- `measured_metric: headless-provider-bounded-silence-termination`
+- `expected_non_low_verdict: HIGH`
+- `finding_ids: [CQ-F01, CQ-F02, CQ-F03, CQ-F04, CQ-F05, CQ-F06, CQ-F07, CQ-F08, CQ-F09, CQ-F10, CQ-F11, CQ-F12, CQ-F13]`
+- `intrinsic_lockstep_paths: [crates/oulipoly-runtime/src/executor/cli.rs, crates/oulipoly-runtime/src/executor/mod.rs, src-tauri/src/lib.rs, DECISIONS.md]`
+- `metric_change_refs: [c475c6d4981dd3ea328b48aeb95187136a6f097b, f8a7aca41d584942926661cfc9de178b69c30e3e]`
+- `post_merge_new_rule_evidence: cli.rs:1-31 seven-role header and 28+1 raw-symbol carrier block; cli.rs:3320 T18 declared-roles source guard; cli.rs:3346 T19 carrier source guard`
+- `primary_deliverable_fixes_or_extends_metric: true`
+- `non_low_finding_is_intrinsic_lockstep: true`
+- `post_merge_satisfies_new_rule_under_new_metric: true`
+- `declared_for_phase_4_ratification: true`
+
+Ratification basis: the inherited bounded-silence supervisor + F1 process-group SIGKILL fix on `c510b9218c9a4ee7fc701582cc595c1abd924809` IS the metric-fix target for the new "headless-provider-bounded-silence-termination" metric. The non-LOW Phase 4 code-quality aggregate (HIGH) derives entirely from the same intrinsic-lockstep paths the proposal ships — 5 FC multi-classifier findings on the supervisor functions themselves (orchestration + predicate + mapper + formatter intrinsic to a process supervisor), 1 cohesion `predicate` role gap (anti-scoped to AGE-145 per user directive), 4 HIGH coupling rows reflecting the supervisor's necessary interaction with config / process-control / terminal-signal / result carriers (already declared via 28+1 raw-symbol carrier block), 2 MEDIUM coupling rows on additive `terminal_signal: Option<TerminalSignal>` carrier edges, and 1 HIGH coupling row in this DECISIONS.md record (the audit trail itself). The post-merge state satisfies the new declared-roles + carrier-block + bounded-silence-termination rule under the new metric set.
+
+Work-manager pre-authorization: caller's AGE-146 dispatch directive of 2026-05-18 authorized "Phase 4 risk gates LOW + bootstrap-exception ratification (narrow scope: bounded-silence + F1)" with anti-scope "NO residual acceptance on non-LOW gates (with bootstrap-exception still available for genuine intrinsic-lockstep findings)" and "NO precedent-citation as residual-acceptance basis". The R2 proposal asserts the four conditions hold on standalone evidence (not by citing AGE-141 R2 precedent); this ratification entry records the orchestrator's acknowledgement so the Phase 4 bootstrap-exception sub-gate's DECISIONS parser succeeds.
+
+This is NOT residual acceptance, NOT precedent citation, and does NOT authorize advance on residual Phase 4 findings outside the named lockstep paths. It does NOT extend authority into Phase 6 per-component code-quality, Phase 7 readiness, Phase 8 PR-review, or AGE-145's whole-file cleanup territory (23 FC findings, 3 oulipoly-config push-pull findings, cohesion `predicate` role-set expansion).
