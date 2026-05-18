@@ -157,10 +157,23 @@ def is_table_row_line(line: str) -> bool:
     return stripped.startswith("|") and stripped.endswith("|")
 
 
-def is_acr186_claude_row(row: dict[str, Any]) -> bool:
+def row_provenance_text(row: dict[str, Any]) -> str:
     provenance = row["provenance"]
-    source_text = f"{provenance.get('source', '')} {provenance.get('notes', '')}"
-    return row["provider_family"] == "claude" and "acr-186" in source_text.lower()
+    return f"{provenance.get('source', '')} {provenance.get('notes', '')}"
+
+
+def is_claude_provider_family(provider_family: str) -> bool:
+    return provider_family == "claude"
+
+
+def is_acr186_provenance_text(text: str) -> bool:
+    return "acr-186" in text.lower()
+
+
+def is_acr186_claude_row(row: dict[str, Any]) -> bool:
+    return is_claude_provider_family(row["provider_family"]) and is_acr186_provenance_text(
+        row_provenance_text(row)
+    )
 
 
 def validate_path_exists(path: Path, label: str) -> None:
@@ -368,16 +381,21 @@ def validate_quota_rows(rows: list[dict[str, Any]], provider_family: str) -> Non
             fail(f"row {row['id']} must expect QuotaExhaustedInband")
 
 
+def validate_acr186_provenance_text(text: str) -> None:
+    if not is_acr186_provenance_text(text):
+        fail("claude-quota-acr186 provenance must cite ACR-186")
+
+
+def validate_acr186_privacy_reviewed(privacy_reviewed: Any) -> None:
+    if privacy_reviewed is not True:
+        fail("claude-quota-acr186 provenance must set privacy_reviewed true")
+
+
 def validate_acr186_quota_rows(rows: list[dict[str, Any]]) -> None:
     for row in rows:
-        if row["id"] != "claude-quota-acr186":
-            continue
         provenance = row["provenance"]
-        source_text = f"{provenance.get('source', '')} {provenance.get('notes', '')}"
-        if "ACR-186" not in source_text and "acr-186" not in source_text.lower():
-            fail("claude-quota-acr186 provenance must cite ACR-186")
-        if provenance.get("privacy_reviewed") is not True:
-            fail("claude-quota-acr186 provenance must set privacy_reviewed true")
+        validate_acr186_provenance_text(row_provenance_text(row))
+        validate_acr186_privacy_reviewed(provenance.get("privacy_reviewed"))
 
 
 def validate_status_rows(
@@ -467,11 +485,21 @@ def validate_marker_literal(text: str) -> None:
         fail("eval.md must declare OULIPOLY_TERMINAL_SIGNAL <json-payload>")
 
 
-def validate_schema_kind_labels(schema: dict[str, Any]) -> None:
-    kind = str(schema.get("kind", ""))
-    missing = [label for label in sorted(SEVEN_MARKER_LABELS) if label not in kind]
+def marker_schema_kind(schema: dict[str, Any]) -> str:
+    return str(schema.get("kind", ""))
+
+
+def filter_missing_marker_labels(kind: str) -> list[str]:
+    return [label for label in sorted(SEVEN_MARKER_LABELS) if label not in kind]
+
+
+def validate_no_missing_marker_labels(missing: list[str]) -> None:
     if missing:
         fail(f"marker payload kind omits labels: {', '.join(missing)}")
+
+
+def validate_schema_kind_labels(schema: dict[str, Any]) -> None:
+    validate_no_missing_marker_labels(filter_missing_marker_labels(marker_schema_kind(schema)))
 
 
 def validate_marker_schema(schema: dict[str, Any]) -> None:
@@ -621,8 +649,8 @@ def parse_table_line(line: str) -> list[str]:
     return [normalize_cell(cell) for cell in line.strip().strip("|").split("|")]
 
 
-def parse_markdown_table_candidates(section: str) -> list[list[str]]:
-    return [parse_table_line(line) for line in section.splitlines() if is_table_row_line(line)]
+def parse_markdown_table_candidates(lines: list[str]) -> list[list[str]]:
+    return [parse_table_line(line) for line in lines]
 
 
 def parse_network_boundary_claims(text: str) -> dict[str, bool]:
@@ -682,6 +710,22 @@ def filter_acr186_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [row for row in rows if is_acr186_claude_row(row)]
 
 
+def filter_acr186_quota_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [row for row in rows if row["id"] == "claude-quota-acr186"]
+
+
+def filter_markdown_table_lines(section: str) -> list[str]:
+    return [line for line in section.splitlines() if is_table_row_line(line)]
+
+
+def filter_rows_with_fixture_bytes_path(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [row for row in rows if row["fixture_bytes_path"] is not None]
+
+
+def filter_rows_with_sentinel_metadata_path(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [row for row in rows if row["sentinel_metadata_path"] is not None]
+
+
 def filter_yaml_list_item_lines(block: str) -> list[str]:
     return [line for line in block.splitlines() if re.match(r"\s*-\s*(.+?)\s*$", line)]
 
@@ -719,17 +763,16 @@ def map_dispatch_rows(data_rows: list[list[str]]) -> list[tuple[str, str, str]]:
     return [(cells[0], map_dispatch_path(cells[1]), cells[2]) for cells in data_rows]
 
 
-def map_fixture_ref_counts(rows: list[dict[str, Any]]) -> tuple[int, int]:
-    bytes_count = len([row for row in rows if row["fixture_bytes_path"] is not None])
-    metadata_count = len([row for row in rows if row["sentinel_metadata_path"] is not None])
-    return bytes_count, metadata_count
+def map_fixture_ref_counts(
+    rows_with_bytes: list[dict[str, Any]], rows_with_metadata: list[dict[str, Any]]
+) -> tuple[int, int]:
+    return len(rows_with_bytes), len(rows_with_metadata)
 
 
 def map_fixture_text_paths(rows: list[dict[str, Any]]) -> dict[str, Path]:
     return {
         row["id"]: fixture_path(row["fixture_bytes_path"], row["id"], "fixture_bytes_path")
         for row in rows
-        if row["fixture_bytes_path"] is not None
     }
 
 
@@ -778,6 +821,18 @@ def format_privacy_result(row_count: int) -> str:
 
 def format_coupling_result() -> str:
     return "coupling declarations carry 5 Translates entries and 8 Owns entries"
+
+
+def format_contract_failure(exc: ContractFailure) -> str:
+    return str(exc)
+
+
+def format_missing_test_id() -> str:
+    return "missing contract test id"
+
+
+def format_unexpected_error(exc: Exception) -> str:
+    return f"unexpected verifier error: {type(exc).__name__}: {exc}"
 
 
 def load_manifest(require_rows: bool = True) -> dict[str, Any]:
@@ -868,7 +923,8 @@ def fenced_yaml_in_section(heading: str) -> dict[str, Any]:
 
 
 def markdown_table_rows(section: str) -> list[list[str]]:
-    candidates = parse_markdown_table_candidates(section)
+    table_lines = filter_markdown_table_lines(section)
+    candidates = parse_markdown_table_candidates(table_lines)
     rows = filter_non_separator_rows(candidates)
     validate_table_minimum(rows)
     return rows
@@ -893,7 +949,7 @@ def fixture_texts_by_row(paths_by_id: dict[str, Path]) -> dict[str, str]:
 def test_quota(provider_family: str) -> None:
     rows = require_rows(EXPECTED_QUOTA_ROWS[provider_family])
     validate_quota_rows(rows, provider_family)
-    validate_acr186_quota_rows(rows)
+    validate_acr186_quota_rows(filter_acr186_quota_rows(rows))
     resolved = resolve_refs_for_rows(rows, require_bytes=True)
     print(format_quota_result(provider_family, len(rows), len(resolved)))
 
@@ -942,7 +998,9 @@ def test_fixture_roundtrip() -> None:
     rows = manifest_rows()
     refs_by_row = resolve_refs_by_row(rows)
     validate_roundtrip_refs(rows, refs_by_row)
-    bytes_count, metadata_count = map_fixture_ref_counts(rows)
+    rows_with_bytes = filter_rows_with_fixture_bytes_path(rows)
+    rows_with_metadata = filter_rows_with_sentinel_metadata_path(rows)
+    bytes_count, metadata_count = map_fixture_ref_counts(rows_with_bytes, rows_with_metadata)
     print(format_roundtrip_result(len(rows), bytes_count, metadata_count))
 
 
@@ -958,7 +1016,7 @@ def test_privacy_bounds() -> None:
     acr_rows = filter_acr186_rows(manifest_rows())
     validate_acr186_rows_present(acr_rows)
     validate_acr186_privacy_rows(acr_rows)
-    paths_by_id = map_fixture_text_paths(acr_rows)
+    paths_by_id = map_fixture_text_paths(filter_rows_with_fixture_bytes_path(acr_rows))
     texts_by_id = fixture_texts_by_row(paths_by_id)
     validate_acr186_excerpt_bounds(acr_rows, texts_by_id)
     print(format_privacy_result(len(acr_rows)))
@@ -1013,13 +1071,13 @@ def main(argv: list[str]) -> int:
         test_from_id(test_id)()
         return 0
     except ContractFailure as exc:
-        print(str(exc))
+        print(format_contract_failure(exc))
         return 1
     except IndexError:
-        print("missing contract test id")
+        print(format_missing_test_id())
         return 2
     except Exception as exc:
-        print(f"unexpected verifier error: {type(exc).__name__}: {exc}")
+        print(format_unexpected_error(exc))
         return 1
 
 
