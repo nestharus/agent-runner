@@ -207,6 +207,35 @@ fn migration_service_stay_matches_decide_migration() {
 }
 
 #[test]
+fn migration_service_parity_unchanged() {
+    let fixture = Fixture::new();
+    let model = ModelConfig {
+        name: "claude-opus".to_string(),
+        prompt_mode: PromptMode::Arg,
+        providers: vec![provider("claude", fixture.source_projects.clone())],
+        inputs: Vec::new(),
+    };
+    let resolved = fixture.seed_resolved(&model, SESSION_A);
+    let mut stderr = Vec::new();
+
+    let output = ProductionMigrationService::new()
+        .migrate(MigrationServiceRequest {
+            state: &fixture.state,
+            sessions_cfg: &SessionsConfig::default(),
+            resolved: &resolved,
+            manual_target: None,
+            active_exhausted: false,
+            migration_model: &model,
+            effective_cwd: &fixture.workspace,
+            stderr: &mut stderr,
+        })
+        .expect("stay migration remains a non-error service output");
+
+    assert!(matches!(output, MigrationServiceOutput::Stay));
+    assert!(stderr.is_empty());
+}
+
+#[test]
 fn migration_service_decision_failure_is_nonfatal_output() {
     let fixture = Fixture::new();
     let model = fixture.model_with_storage();

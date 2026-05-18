@@ -224,6 +224,11 @@ fn t_active_segment_id_flows() {
     }
 }
 
+#[test]
+fn session_replace_active_segment_unchanged_under_contract() {
+    t_active_segment_id_flows();
+}
+
 fn scripts_path_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))

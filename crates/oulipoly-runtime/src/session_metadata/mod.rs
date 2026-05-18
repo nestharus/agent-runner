@@ -1,12 +1,22 @@
-use crate::sessions::locate_transcript;
+mod cwd;
+mod locator;
+#[cfg(test)]
+mod tests;
+
+pub use locator::{
+    ClaudeStorageLocator, CodexStorageLocator, IoErrorKind, LocatedTranscript, LocatorError,
+    LocatorSource, ProviderName, ScriptKind, SessionId, SessionsConfigLocator, TranscriptLocator,
+    TranscriptLookupMode, TranscriptRequest, TranscriptScriptLocator, UnsupportedStorageReason,
+    locator_error_to_stem, unsupported_storage_reason_to_stem,
+};
+
 use oulipoly_config::{
-    ProviderConfig, ProvidersConfig, ScriptSessionStorageType, SessionStorage, SessionsConfig,
+    ModelConfig, ProviderConfig, ProvidersConfig, ScriptSessionStorageType, SessionStorage,
+    SessionsConfig,
 };
 use oulipoly_state::{ModelStore, ResumeError, StateDb};
-use serde::{Deserialize, Serialize};
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use serde::Serialize;
+use std::path::PathBuf;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize)]
@@ -134,24 +144,12 @@ fn locate_session_metadata_with_policy(
     input: &str,
     ambiguity_policy: AmbiguityPolicy,
 ) -> Result<SessionMetadata, MetadataError> {
-    let parsed_input = Uuid::parse_str(input).map_err(|_| MetadataError::InvalidSessionId {
-        input: input.to_string(),
-    })?;
+    let parsed_input = parse_session_uuid(input)?;
 
-    if matches!(ambiguity_policy, AmbiguityPolicy::Reject) {
-        let previews = state
-            .resume_previews(input)
-            .map_err(|message| MetadataError::Operational { message })?;
-        let cutoff = chrono::Utc::now() - chrono::Duration::hours(24);
-        let recent_count = previews
-            .iter()
-            .filter(|preview| preview.last_used_at >= cutoff)
-            .count();
-        if recent_count > 1 {
-            return Err(MetadataError::AmbiguousSession {
-                input: input.to_string(),
-            });
-        }
+    if rejects_recent_ambiguity(ambiguity_policy) {
+        let previews = metadata_db_result(fetch_resume_previews(state, input))?;
+        let cutoff = recency_cutoff_for_resume_previews();
+        reject_ambiguous_recent_matches(input, count_recent_previews(&previews, cutoff))?;
     }
 
     let resolved = state
@@ -159,48 +157,167 @@ fn locate_session_metadata_with_policy(
         .map_err(map_resume_error)?;
     let provider = effective_provider_for_resolved(&resolved, providers_cfg)?;
     let provider_name = resolved.active_provider.clone();
-    let storage_type = SessionStorageType::from(&provider.session_storage);
-    let active_segment_id = state
-        .active_segment_id_for_chain_provider_session(
-            &resolved.chain_id,
-            &resolved.active_provider,
-            &resolved.active_session_id,
-        )
-        .map_err(|message| MetadataError::Operational { message })?
-        .ok_or_else(|| MetadataError::SessionNotFound {
-            input: resolved.chain_id.clone(),
-        })?;
+    let active_segment_id = active_segment_id_to_metadata_error_or_value(
+        metadata_db_result(fetch_active_segment_id(state, &resolved))?,
+        &resolved.chain_id,
+    )?;
 
-    let jsonl_path = available_jsonl_path(
+    let located_transcript = available_jsonl_path(
         sessions_cfg,
         provider.session_storage.as_ref(),
         &provider_name,
         &resolved.active_session_id,
-        true,
     )?;
+    let storage_type = located_transcript.storage_classification;
+    let jsonl_path = located_transcript.path;
     let workspace_root = resolve_cwd_from_session_storage(
         provider.session_storage.as_ref(),
         &provider_name,
         &resolved.active_session_id,
     )?;
 
-    let mutable = storage_type != SessionStorageType::Other
-        && provider.resume.is_some()
-        && jsonl_path.is_absolute()
-        && workspace_root.is_absolute();
+    let active_session_uuid =
+        parse_optional_uuid(&resolved.active_session_id).unwrap_or(parsed_input);
+    let chain_uuid = parse_optional_uuid(&resolved.chain_id);
+    let mutable = is_metadata_mutable(storage_type, &provider, &jsonl_path, &workspace_root);
 
-    Ok(SessionMetadata {
-        session_id: normalize_uuid(&resolved.active_session_id)
-            .unwrap_or_else(|| parsed_input.to_string()),
-        chain_id: normalize_uuid(&resolved.chain_id).unwrap_or_else(|| resolved.chain_id.clone()),
+    Ok(session_metadata_from_parts(SessionMetadataParts {
+        session_id: format_uuid(active_session_uuid),
+        chain_id: format_optional_uuid(&resolved.chain_id, chain_uuid),
         active_segment_id,
         provider_name,
         storage_type,
         jsonl_path,
         workspace_root,
-        transcript_state: TranscriptState::Available,
         mutable,
-    })
+    }))
+}
+
+fn parse_session_uuid(input: &str) -> Result<Uuid, MetadataError> {
+    parse_uuid(input).map_err(|_| invalid_session_id_error(input))
+}
+
+fn parse_uuid(input: &str) -> Result<Uuid, uuid::Error> {
+    Uuid::parse_str(input)
+}
+
+fn parse_optional_uuid(input: &str) -> Option<Uuid> {
+    parse_uuid(input).ok()
+}
+
+fn format_uuid(uuid: Uuid) -> String {
+    uuid.to_string()
+}
+
+fn format_optional_uuid(fallback: &str, parsed: Option<Uuid>) -> String {
+    parsed
+        .map(format_uuid)
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn invalid_session_id_error(input: &str) -> MetadataError {
+    MetadataError::InvalidSessionId {
+        input: input.to_string(),
+    }
+}
+
+fn metadata_db_result<T>(result: Result<T, String>) -> Result<T, MetadataError> {
+    result.map_err(operational_error)
+}
+
+fn fetch_resume_previews(
+    state: &StateDb,
+    input: &str,
+) -> Result<Vec<oulipoly_state::ChainPreview>, String> {
+    state.resume_previews(input)
+}
+
+fn fetch_active_segment_id(
+    state: &StateDb,
+    resolved: &oulipoly_state::ResolvedResume,
+) -> Result<Option<i64>, String> {
+    state.active_segment_id_for_chain_provider_session(
+        &resolved.chain_id,
+        &resolved.active_provider,
+        &resolved.active_session_id,
+    )
+}
+
+fn active_segment_id_to_metadata_error_or_value(
+    active_segment_id: Option<i64>,
+    chain_id: &str,
+) -> Result<i64, MetadataError> {
+    active_segment_id.ok_or_else(|| session_not_found_error(chain_id))
+}
+
+fn session_not_found_error(input: &str) -> MetadataError {
+    MetadataError::SessionNotFound {
+        input: input.to_string(),
+    }
+}
+
+fn rejects_recent_ambiguity(policy: AmbiguityPolicy) -> bool {
+    matches!(policy, AmbiguityPolicy::Reject)
+}
+
+fn recency_cutoff_for_resume_previews() -> chrono::DateTime<chrono::Utc> {
+    chrono::Utc::now() - chrono::Duration::hours(24)
+}
+
+fn count_recent_previews(
+    previews: &[oulipoly_state::ChainPreview],
+    cutoff: chrono::DateTime<chrono::Utc>,
+) -> usize {
+    previews
+        .iter()
+        .filter(|preview| preview.last_used_at >= cutoff)
+        .count()
+}
+
+fn reject_ambiguous_recent_matches(input: &str, recent_count: usize) -> Result<(), MetadataError> {
+    if recent_count > 1 {
+        return Err(MetadataError::AmbiguousSession {
+            input: input.to_string(),
+        });
+    }
+    Ok(())
+}
+
+struct SessionMetadataParts {
+    session_id: String,
+    chain_id: String,
+    active_segment_id: i64,
+    provider_name: String,
+    storage_type: SessionStorageType,
+    jsonl_path: PathBuf,
+    workspace_root: PathBuf,
+    mutable: bool,
+}
+
+fn is_metadata_mutable(
+    storage_type: SessionStorageType,
+    provider: &ProviderConfig,
+    jsonl_path: &std::path::Path,
+    workspace_root: &std::path::Path,
+) -> bool {
+    storage_type != SessionStorageType::Other
+        && provider.resume.is_some()
+        && jsonl_path.is_absolute()
+        && workspace_root.is_absolute()
+}
+
+fn session_metadata_from_parts(parts: SessionMetadataParts) -> SessionMetadata {
+    SessionMetadata {
+        session_id: parts.session_id,
+        chain_id: parts.chain_id,
+        active_segment_id: parts.active_segment_id,
+        provider_name: parts.provider_name,
+        storage_type: parts.storage_type,
+        jsonl_path: parts.jsonl_path,
+        workspace_root: parts.workspace_root,
+        transcript_state: TranscriptState::Available,
+        mutable: parts.mutable,
+    }
 }
 
 pub fn resolve_resume_workspace_root(
@@ -209,9 +326,7 @@ pub fn resolve_resume_workspace_root(
     providers_cfg: &ProvidersConfig,
     input: &str,
 ) -> Result<PathBuf, MetadataError> {
-    Uuid::parse_str(input).map_err(|_| MetadataError::InvalidSessionId {
-        input: input.to_string(),
-    })?;
+    parse_session_uuid(input)?;
     let resolved = state
         .resolve_resume(models, input, None)
         .map_err(map_resume_error)?;
@@ -229,31 +344,50 @@ fn map_resume_error(err: ResumeError) -> MetadataError {
         ResumeError::NoChainFound { input } => MetadataError::SessionNotFound { input },
         ResumeError::WrongIdKind { input, .. } => MetadataError::SessionNotFound { input },
         ResumeError::Ambiguous { input, .. } => MetadataError::AmbiguousSession { input },
-        ResumeError::UnknownModel { model_name } => MetadataError::Operational {
-            message: format!("unknown model {model_name}"),
-        },
+        ResumeError::UnknownModel { model_name } => {
+            operational_error(unknown_model_message(&model_name))
+        }
         ResumeError::ProviderModelMismatch {
             model_name,
             active_provider,
             ..
-        } => MetadataError::Operational {
-            message: format!(
-                "model {model_name} does not include active provider {active_provider}"
-            ),
-        },
+        } => operational_error(provider_model_mismatch_message(
+            &model_name,
+            &active_provider,
+        )),
         ResumeError::ProviderNotConfigured { provider } => MetadataError::UnsupportedStorage {
             provider_name: provider.clone(),
-            reason: format!("provider {provider} is not configured"),
+            reason: provider_not_configured_reason(&provider),
         },
         ResumeError::ActiveSegmentMissing { chain_id } => {
             MetadataError::SessionNotFound { input: chain_id }
         }
         ResumeError::ProviderMissingResume { provider_name } => MetadataError::UnsupportedStorage {
             provider_name: provider_name.clone(),
-            reason: format!("provider {provider_name} has no resume strategy"),
+            reason: provider_missing_resume_reason(&provider_name),
         },
         ResumeError::Db { message } => MetadataError::Operational { message },
     }
+}
+
+fn operational_error(message: String) -> MetadataError {
+    MetadataError::Operational { message }
+}
+
+fn unknown_model_message(model_name: &str) -> String {
+    format!("unknown model {model_name}")
+}
+
+fn provider_model_mismatch_message(model_name: &str, active_provider: &str) -> String {
+    format!("model {model_name} does not include active provider {active_provider}")
+}
+
+fn provider_not_configured_reason(provider: &str) -> String {
+    format!("provider {provider} is not configured")
+}
+
+fn provider_missing_resume_reason(provider_name: &str) -> String {
+    format!("provider {provider_name} has no resume strategy")
 }
 
 fn effective_provider_for_resolved(
@@ -261,32 +395,56 @@ fn effective_provider_for_resolved(
     providers_cfg: &ProvidersConfig,
 ) -> Result<ProviderConfig, MetadataError> {
     if let Some(model) = resolved.model.as_ref() {
-        let model_provider = model
-            .providers
-            .iter()
-            .find(|provider| provider.name == resolved.active_provider)
-            .ok_or_else(|| MetadataError::Operational {
-                message: format!(
-                    "model {} does not include active provider {}",
-                    model.name, resolved.active_provider
-                ),
-            })?;
-        let (provider, _) =
-            providers_cfg
-                .effective_provider(model_provider)
-                .map_err(|message| MetadataError::UnsupportedStorage {
-                    provider_name: resolved.active_provider.clone(),
-                    reason: message,
-                })?;
-        Ok(provider)
+        let model_provider = active_model_provider(model, &resolved.active_provider)
+            .ok_or_else(|| provider_mismatch_error(model, &resolved.active_provider))?;
+        effective_model_provider(providers_cfg, model_provider, &resolved.active_provider)
     } else {
-        let (provider, _) = providers_cfg
-            .runtime_provider(&resolved.active_provider)
-            .map_err(|message| MetadataError::UnsupportedStorage {
-                provider_name: resolved.active_provider.clone(),
-                reason: message,
-            })?;
-        Ok(provider)
+        runtime_provider(providers_cfg, &resolved.active_provider)
+    }
+}
+
+fn active_model_provider<'a>(
+    model: &'a ModelConfig,
+    active_provider: &str,
+) -> Option<&'a ProviderConfig> {
+    model
+        .providers
+        .iter()
+        .find(|provider| provider.name == active_provider)
+}
+
+fn provider_mismatch_error(model: &ModelConfig, active_provider: &str) -> MetadataError {
+    operational_error(provider_model_mismatch_message(
+        &model.name,
+        active_provider,
+    ))
+}
+
+fn effective_model_provider(
+    providers_cfg: &ProvidersConfig,
+    model_provider: &ProviderConfig,
+    active_provider: &str,
+) -> Result<ProviderConfig, MetadataError> {
+    let (provider, _) = providers_cfg
+        .effective_provider(model_provider)
+        .map_err(|message| provider_resolution_error(active_provider, message))?;
+    Ok(provider)
+}
+
+fn runtime_provider(
+    providers_cfg: &ProvidersConfig,
+    active_provider: &str,
+) -> Result<ProviderConfig, MetadataError> {
+    let (provider, _) = providers_cfg
+        .runtime_provider(active_provider)
+        .map_err(|message| provider_resolution_error(active_provider, message))?;
+    Ok(provider)
+}
+
+fn provider_resolution_error(provider_name: &str, reason: String) -> MetadataError {
+    MetadataError::UnsupportedStorage {
+        provider_name: provider_name.to_string(),
+        reason,
     }
 }
 
@@ -295,276 +453,158 @@ fn available_jsonl_path(
     session_storage: Option<&SessionStorage>,
     provider_name: &str,
     session_id: &str,
-    require_existing_file: bool,
-) -> Result<PathBuf, MetadataError> {
-    match locate_transcript(sessions_cfg, provider_name, session_id) {
-        Ok(Some(path)) => validate_jsonl_path(provider_name, path, require_existing_file),
-        Ok(None) => locate_jsonl_path_from_storage(
-            session_storage,
-            provider_name,
-            session_id,
-            require_existing_file,
-        ),
-        Err(message) => Err(MetadataError::UnsupportedStorage {
-            provider_name: provider_name.to_string(),
-            reason: format!("locator_error: {message}"),
-        }),
+) -> Result<LocatedTranscript, MetadataError> {
+    let mode = TranscriptLookupMode::RequireExisting;
+    locate_jsonl_path_with_mode(
+        sessions_cfg,
+        session_storage,
+        provider_name,
+        session_id,
+        mode,
+    )
+}
+
+fn locate_jsonl_path_with_mode(
+    sessions_cfg: &SessionsConfig,
+    session_storage: Option<&SessionStorage>,
+    provider_name: &str,
+    session_id: &str,
+    mode: TranscriptLookupMode,
+) -> Result<LocatedTranscript, MetadataError> {
+    let sessions_entry = sessions_cfg.get(provider_name);
+    let request = transcript_request(
+        provider_name,
+        session_id,
+        session_storage,
+        sessions_entry,
+        mode,
+    );
+
+    if has_sessions_transcript_locator(sessions_entry) {
+        return SessionsConfigLocator
+            .locate_jsonl(&request)
+            .map_err(|error| locator_error_to_metadata_error(provider_name, error));
+    }
+
+    locate_jsonl_path_from_storage_request(&request)
+        .map_err(|error| locator_error_to_metadata_error(provider_name, error))
+}
+
+fn transcript_request<'a>(
+    provider_name: &'a str,
+    session_id: &str,
+    session_storage: Option<&'a SessionStorage>,
+    sessions_entry: Option<&'a oulipoly_config::SessionSourceEntry>,
+    mode: TranscriptLookupMode,
+) -> TranscriptRequest<'a> {
+    TranscriptRequest {
+        provider: provider_name,
+        session_id: session_id.to_string(),
+        storage: session_storage,
+        sessions_config_locator: sessions_entry,
+        mode,
     }
 }
 
-pub(crate) fn resolve_jsonl_path_for_provider_allow_missing(
+fn has_sessions_transcript_locator(
+    sessions_entry: Option<&oulipoly_config::SessionSourceEntry>,
+) -> bool {
+    sessions_entry
+        .and_then(|entry| entry.transcript_locator.as_ref())
+        .is_some()
+}
+
+pub fn resolve_jsonl_path_for_provider_allow_missing(
     sessions_cfg: &SessionsConfig,
     session_storage: Option<&SessionStorage>,
     provider_name: &str,
     session_id: &str,
 ) -> Result<PathBuf, MetadataError> {
-    available_jsonl_path(
+    resolve_jsonl_path_for_provider_with_mode(
         sessions_cfg,
         session_storage,
         provider_name,
         session_id,
-        false,
+        TranscriptLookupMode::AllowMissing,
     )
 }
 
-fn validate_jsonl_path(
+pub(crate) fn resolve_jsonl_path_for_provider_with_mode(
+    sessions_cfg: &SessionsConfig,
+    session_storage: Option<&SessionStorage>,
     provider_name: &str,
-    path: PathBuf,
-    require_existing_file: bool,
+    session_id: &str,
+    mode: TranscriptLookupMode,
 ) -> Result<PathBuf, MetadataError> {
-    if !path.is_absolute() {
-        return Err(MetadataError::UnsupportedStorage {
-            provider_name: provider_name.to_string(),
-            reason: format!("relative_jsonl_path: {}", path.display()),
-        });
-    }
-    if !path.exists() {
-        if !require_existing_file {
-            if path.to_str().is_none() {
-                return Err(MetadataError::UnsupportedStorage {
-                    provider_name: provider_name.to_string(),
-                    reason: "non_utf8_jsonl_path".to_string(),
-                });
-            }
-            return Ok(path);
-        }
-        return Err(MetadataError::UnsupportedStorage {
-            provider_name: provider_name.to_string(),
-            reason: format!("missing_jsonl_path: {}", path.display()),
-        });
-    }
-    let canonical = path
-        .canonicalize()
-        .map_err(|e| MetadataError::UnsupportedStorage {
-            provider_name: provider_name.to_string(),
-            reason: format!("missing_jsonl_path: {}: {e}", path.display()),
-        })?;
-    if canonical.to_str().is_none() {
-        return Err(MetadataError::UnsupportedStorage {
-            provider_name: provider_name.to_string(),
-            reason: "non_utf8_jsonl_path".to_string(),
-        });
-    }
-    Ok(canonical)
+    locate_jsonl_path_with_mode(
+        sessions_cfg,
+        session_storage,
+        provider_name,
+        session_id,
+        mode,
+    )
+    .map(|located| located.path)
 }
 
+fn locator_error_to_metadata_error(provider_name: &str, error: LocatorError) -> MetadataError {
+    MetadataError::UnsupportedStorage {
+        provider_name: provider_name.to_string(),
+        reason: locator_error_to_stem(error),
+    }
+}
+
+fn locate_jsonl_path_from_storage_request(
+    request: &TranscriptRequest,
+) -> Result<LocatedTranscript, LocatorError> {
+    match request.storage {
+        Some(SessionStorage::Script { .. }) => TranscriptScriptLocator.locate_jsonl(request),
+        Some(SessionStorage::ClaudeCode { .. }) => ClaudeStorageLocator.locate_jsonl(request),
+        Some(SessionStorage::Codex { .. }) => CodexStorageLocator.locate_jsonl(request),
+        None => Err(no_locator_for_unknown_storage_error()),
+    }
+}
+
+fn no_locator_for_unknown_storage_error() -> LocatorError {
+    LocatorError::UnsupportedStorage {
+        reason: UnsupportedStorageReason::NoLocatorForUnknownStorage,
+    }
+}
+
+#[cfg(test)]
 fn locate_jsonl_path_from_storage(
     session_storage: Option<&SessionStorage>,
     provider_name: &str,
     session_id: &str,
     require_existing_file: bool,
 ) -> Result<PathBuf, MetadataError> {
-    match session_storage {
-        Some(SessionStorage::Script {
-            transcript_script: Some(script),
-            ..
-        }) => locate_jsonl_path_from_transcript_script(
-            script,
-            provider_name,
-            session_id,
-            require_existing_file,
-        ),
-        Some(SessionStorage::Script { .. }) => Err(MetadataError::UnsupportedStorage {
-            provider_name: provider_name.to_string(),
-            reason: "no_transcript_script_for_script_storage".to_string(),
-        }),
-        Some(SessionStorage::ClaudeCode { projects_dir }) => {
-            locate_claude_jsonl_path_from_storage(projects_dir, provider_name, session_id)
-        }
-        Some(SessionStorage::Codex { sessions_dir }) => {
-            locate_codex_jsonl_path_from_storage(sessions_dir, provider_name, session_id)
-        }
-        None => Err(MetadataError::UnsupportedStorage {
-            provider_name: provider_name.to_string(),
-            reason: "no_locator".to_string(),
-        }),
+    let request = transcript_request_from_storage(
+        session_storage,
+        provider_name,
+        session_id,
+        mode_from_require_existing(require_existing_file),
+    );
+    locate_jsonl_path_from_storage_request(&request)
+        .map(|located| located.path)
+        .map_err(|error| locator_error_to_metadata_error(provider_name, error))
+}
+
+#[cfg(test)]
+fn mode_from_require_existing(require_existing_file: bool) -> TranscriptLookupMode {
+    if require_existing_file {
+        TranscriptLookupMode::RequireExisting
+    } else {
+        TranscriptLookupMode::AllowMissing
     }
 }
 
-fn locate_jsonl_path_from_transcript_script(
-    script: &str,
-    provider_name: &str,
+#[cfg(test)]
+fn transcript_request_from_storage<'a>(
+    session_storage: Option<&'a SessionStorage>,
+    provider_name: &'a str,
     session_id: &str,
-    require_existing_file: bool,
-) -> Result<PathBuf, MetadataError> {
-    let stdout =
-        run_session_id_script(script, session_id, "transcript_script").map_err(|reason| {
-            MetadataError::UnsupportedStorage {
-                provider_name: provider_name.to_string(),
-                reason,
-            }
-        })?;
-    let lines = stdout
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>();
-    match lines.as_slice() {
-        [] => Err(MetadataError::UnsupportedStorage {
-            provider_name: provider_name.to_string(),
-            reason: "transcript_script_empty_stdout".to_string(),
-        }),
-        [line] => validate_jsonl_path(provider_name, PathBuf::from(line), require_existing_file),
-        _ => Err(MetadataError::UnsupportedStorage {
-            provider_name: provider_name.to_string(),
-            reason: "transcript_script_stdout_not_single_line".to_string(),
-        }),
-    }
-}
-
-fn locate_claude_jsonl_path_from_storage(
-    projects_dir: &Path,
-    provider_name: &str,
-    session_id: &str,
-) -> Result<PathBuf, MetadataError> {
-    let projects_dir =
-        projects_dir
-            .canonicalize()
-            .map_err(|e| MetadataError::UnsupportedStorage {
-                provider_name: provider_name.to_string(),
-                reason: format!(
-                    "claude_projects_dir_unavailable: {}: {e}",
-                    projects_dir.display()
-                ),
-            })?;
-    let filename = format!("{session_id}.jsonl");
-    let mut matches = Vec::new();
-    let entries = fs::read_dir(&projects_dir).map_err(|e| MetadataError::UnsupportedStorage {
-        provider_name: provider_name.to_string(),
-        reason: format!(
-            "claude_projects_dir_unavailable: {}: {e}",
-            projects_dir.display()
-        ),
-    })?;
-    for entry in entries {
-        let entry = entry.map_err(|e| MetadataError::UnsupportedStorage {
-            provider_name: provider_name.to_string(),
-            reason: format!(
-                "claude_projects_dir_read_error: {}: {e}",
-                projects_dir.display()
-            ),
-        })?;
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if !file_type.is_dir() {
-            continue;
-        }
-        let candidate = entry.path().join(&filename);
-        if candidate.is_file() {
-            matches.push(validate_jsonl_path(provider_name, candidate, true)?);
-        }
-    }
-    single_jsonl_match(provider_name, "claude_storage_scan", matches)
-}
-
-fn locate_codex_jsonl_path_from_storage(
-    sessions_dir: &Path,
-    provider_name: &str,
-    session_id: &str,
-) -> Result<PathBuf, MetadataError> {
-    let sessions_dir =
-        sessions_dir
-            .canonicalize()
-            .map_err(|e| MetadataError::UnsupportedStorage {
-                provider_name: provider_name.to_string(),
-                reason: format!(
-                    "codex_sessions_dir_unavailable: {}: {e}",
-                    sessions_dir.display()
-                ),
-            })?;
-    let mut matches = Vec::new();
-    collect_codex_rollout_matches(&sessions_dir, provider_name, session_id, 0, &mut matches)?;
-    single_jsonl_match(provider_name, "codex_storage_scan", matches)
-}
-
-fn collect_codex_rollout_matches(
-    dir: &Path,
-    provider_name: &str,
-    session_id: &str,
-    depth: usize,
-    matches: &mut Vec<PathBuf>,
-) -> Result<(), MetadataError> {
-    if depth > 4 {
-        return Ok(());
-    }
-    let entries = fs::read_dir(dir).map_err(|e| MetadataError::UnsupportedStorage {
-        provider_name: provider_name.to_string(),
-        reason: format!("codex_sessions_dir_read_error: {}: {e}", dir.display()),
-    })?;
-    for entry in entries {
-        let entry = entry.map_err(|e| MetadataError::UnsupportedStorage {
-            provider_name: provider_name.to_string(),
-            reason: format!("codex_sessions_dir_read_error: {}: {e}", dir.display()),
-        })?;
-        let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if file_type.is_dir() {
-            collect_codex_rollout_matches(&path, provider_name, session_id, depth + 1, matches)?;
-        } else if file_type.is_file()
-            && path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    name.starts_with("rollout-")
-                        && name.ends_with(".jsonl")
-                        && name.contains(session_id)
-                })
-        {
-            matches.push(validate_jsonl_path(provider_name, path, true)?);
-        }
-    }
-    Ok(())
-}
-
-fn single_jsonl_match(
-    provider_name: &str,
-    source: &str,
-    mut matches: Vec<PathBuf>,
-) -> Result<PathBuf, MetadataError> {
-    match matches.len() {
-        1 => Ok(matches.remove(0)),
-        0 => Err(MetadataError::UnsupportedStorage {
-            provider_name: provider_name.to_string(),
-            reason: format!("{source}_not_found"),
-        }),
-        _ => Err(MetadataError::UnsupportedStorage {
-            provider_name: provider_name.to_string(),
-            reason: format!("{source}_ambiguous"),
-        }),
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct CwdScriptResponse {
-    #[serde(default)]
-    cwd: Option<String>,
-    #[serde(default)]
-    found: bool,
-    #[serde(default)]
-    error: Option<String>,
+    mode: TranscriptLookupMode,
+) -> TranscriptRequest<'a> {
+    transcript_request(provider_name, session_id, session_storage, None, mode)
 }
 
 fn resolve_cwd_from_session_storage(
@@ -572,70 +612,8 @@ fn resolve_cwd_from_session_storage(
     provider_name: &str,
     session_id: &str,
 ) -> Result<PathBuf, MetadataError> {
-    let Some(session_storage) = session_storage else {
-        return Err(MetadataError::UnsupportedStorage {
-            provider_name: provider_name.to_string(),
-            reason: "no_workspace_root_for_other_storage: storage_type other".to_string(),
-        });
-    };
-
-    let script = session_storage.cwd_script();
-    let stdout = run_cwd_script(&script, session_id).map_err(|reason| {
-        MetadataError::UnsupportedStorage {
-            provider_name: provider_name.to_string(),
-            reason,
-        }
-    })?;
-    let lines = stdout
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>();
-    let [line] = lines.as_slice() else {
-        let reason = if lines.is_empty() {
-            "cwd_script_empty_stdout"
-        } else {
-            "cwd_script_stdout_not_single_line"
-        };
-        return Err(MetadataError::UnsupportedStorage {
-            provider_name: provider_name.to_string(),
-            reason: reason.to_string(),
-        });
-    };
-    let response: CwdScriptResponse =
-        serde_json::from_str(line).map_err(|e| MetadataError::UnsupportedStorage {
-            provider_name: provider_name.to_string(),
-            reason: format!("cwd_script_malformed_json: {e}"),
-        })?;
-    if let Some(error) = response.error.as_deref()
-        && !error.trim().is_empty()
-    {
-        return Err(MetadataError::UnsupportedStorage {
-            provider_name: provider_name.to_string(),
-            reason: format!("cwd_script_error: {error}"),
-        });
-    }
-    if !response.found {
-        return Err(MetadataError::UnsupportedStorage {
-            provider_name: provider_name.to_string(),
-            reason: "cwd_script_not_found".to_string(),
-        });
-    }
-    let cwd = response
-        .cwd
-        .as_deref()
-        .ok_or_else(|| MetadataError::UnsupportedStorage {
-            provider_name: provider_name.to_string(),
-            reason: "cwd_script_missing_cwd".to_string(),
-        })?;
-    let cwd = PathBuf::from(cwd);
-    if !cwd.is_absolute() {
-        return Err(MetadataError::UnsupportedStorage {
-            provider_name: provider_name.to_string(),
-            reason: format!("cwd_script_cwd_not_absolute: {}", cwd.display()),
-        });
-    }
-    Ok(cwd)
+    cwd::resolve_workspace_root(session_storage, session_id)
+        .map_err(|reason| unsupported_storage_error(provider_name, reason))
 }
 
 pub(crate) fn resolve_workspace_root_for_provider_session(
@@ -646,209 +624,9 @@ pub(crate) fn resolve_workspace_root_for_provider_session(
     resolve_cwd_from_session_storage(session_storage, provider_name, session_id)
 }
 
-fn run_cwd_script(script: &str, session_id: &str) -> Result<String, String> {
-    run_session_id_script(script, session_id, "cwd_script")
-}
-
-fn run_session_id_script(
-    script: &str,
-    session_id: &str,
-    script_kind: &str,
-) -> Result<String, String> {
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg(format!("{script} \"$1\""))
-        .arg("oulipoly-session-script")
-        .arg(session_id)
-        .env("SESSION_ID", session_id)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("{script_kind}_spawn_failed: {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "{script_kind}_exit_{}: {}",
-            output.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-fn normalize_uuid(input: &str) -> Option<String> {
-    Uuid::parse_str(input).ok().map(|uuid| uuid.to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use chrono::Utc;
-    use oulipoly_config::{ProviderEntry, ResumeKind, ResumeStrategy};
-    use std::os::unix::fs::PermissionsExt;
-
-    struct FixtureScript {
-        _dir: tempfile::TempDir,
-        path: PathBuf,
-    }
-
-    fn fixture_script(body: &str) -> FixtureScript {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cwd-script.sh");
-        std::fs::write(&path, format!("#!/usr/bin/env bash\n{body}\n")).unwrap();
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).unwrap();
-        FixtureScript { _dir: dir, path }
-    }
-
-    fn state_with_session(provider_name: &str, session_id: &str) -> StateDb {
-        let db = StateDb::open(std::path::Path::new(":memory:")).unwrap();
-        db.mint_imported_chain_if_absent(provider_name, session_id, &Utc::now(), "<unknown>")
-            .unwrap();
-        db
-    }
-
-    fn providers_cfg(provider_name: &str, cwd_script: String) -> ProvidersConfig {
-        let mut cfg = ProvidersConfig::default();
-        cfg.entries.insert(
-            provider_name.to_string(),
-            ProviderEntry {
-                command: Some("provider-fixture".to_string()),
-                resume: Some(ResumeStrategy {
-                    kind: ResumeKind::Flag,
-                    flag: Some("--resume".to_string()),
-                    subcommand: None,
-                }),
-                session_storage: Some(SessionStorage::Script {
-                    cwd_script,
-                    transcript_script: None,
-                    storage_type: None,
-                }),
-                ..ProviderEntry::default()
-            },
-        );
-        cfg
-    }
-
-    fn providers_cfg_with_storage(
-        provider_name: &str,
-        cwd_script: String,
-        transcript_script: String,
-        storage_type: ScriptSessionStorageType,
-    ) -> ProvidersConfig {
-        let mut cfg = ProvidersConfig::default();
-        cfg.entries.insert(
-            provider_name.to_string(),
-            ProviderEntry {
-                command: Some("provider-fixture".to_string()),
-                resume: Some(ResumeStrategy {
-                    kind: ResumeKind::Flag,
-                    flag: Some("--resume".to_string()),
-                    subcommand: None,
-                }),
-                session_storage: Some(SessionStorage::Script {
-                    cwd_script,
-                    transcript_script: Some(transcript_script),
-                    storage_type: Some(storage_type),
-                }),
-                ..ProviderEntry::default()
-            },
-        );
-        cfg
-    }
-
-    #[test]
-    fn resolve_resume_workspace_root_uses_cwd_script_response() {
-        let dir = tempfile::tempdir().unwrap();
-        let workspace = dir.path().join("workspace");
-        std::fs::create_dir_all(&workspace).unwrap();
-        let script = fixture_script(&format!(
-            "printf '{{\"found\":true,\"cwd\":\"{}\"}}\\n'",
-            workspace.display()
-        ));
-        let provider_name = "provider";
-        let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
-        let db = state_with_session(provider_name, session_id);
-        let cfg = providers_cfg(provider_name, script.path.display().to_string());
-
-        let resolved =
-            resolve_resume_workspace_root(&db, &ModelStore::new(), &cfg, session_id).unwrap();
-
-        assert_eq!(resolved, workspace);
-    }
-
-    #[test]
-    fn resolve_resume_workspace_root_reports_cwd_script_not_found() {
-        let script = fixture_script("printf '{\"found\":false}\\n'");
-        let provider_name = "provider";
-        let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
-        let db = state_with_session(provider_name, session_id);
-        let cfg = providers_cfg(provider_name, script.path.display().to_string());
-
-        let err =
-            resolve_resume_workspace_root(&db, &ModelStore::new(), &cfg, session_id).unwrap_err();
-
-        assert!(metadata_error_reason(&err).contains("cwd_script_not_found"));
-    }
-
-    #[test]
-    fn resolve_resume_workspace_root_reports_malformed_cwd_script_json() {
-        let script = fixture_script("printf 'not-json\\n'");
-        let provider_name = "provider";
-        let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
-        let db = state_with_session(provider_name, session_id);
-        let cfg = providers_cfg(provider_name, script.path.display().to_string());
-
-        let err =
-            resolve_resume_workspace_root(&db, &ModelStore::new(), &cfg, session_id).unwrap_err();
-
-        assert!(metadata_error_reason(&err).contains("cwd_script_malformed_json"));
-    }
-
-    #[test]
-    fn locate_session_metadata_uses_script_storage_transcript_and_format() {
-        let dir = tempfile::tempdir().unwrap();
-        let workspace = dir.path().join("workspace");
-        std::fs::create_dir_all(&workspace).unwrap();
-        let jsonl_path = dir.path().join("session.jsonl");
-        std::fs::write(&jsonl_path, "{}\n").unwrap();
-        let provider_name = "provider";
-        let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
-        let cwd_script = fixture_script(&format!(
-            "printf '{{\"found\":true,\"cwd\":\"{}\"}}\\n'",
-            workspace.display()
-        ));
-        let transcript_script = fixture_script(&format!(
-            "test \"$SESSION_ID\" = '{}' || exit 7\nprintf '{}\\n'",
-            session_id,
-            jsonl_path.display()
-        ));
-        let db = state_with_session(provider_name, session_id);
-        let cfg = providers_cfg_with_storage(
-            provider_name,
-            cwd_script.path.display().to_string(),
-            transcript_script.path.display().to_string(),
-            ScriptSessionStorageType::ClaudeCode,
-        );
-
-        let metadata = locate_session_metadata(
-            &db,
-            &ModelStore::new(),
-            &cfg,
-            &SessionsConfig::default(),
-            session_id,
-        )
-        .unwrap();
-
-        assert_eq!(metadata.storage_type, SessionStorageType::ClaudeCode);
-        assert_eq!(metadata.jsonl_path, jsonl_path.canonicalize().unwrap());
-        assert_eq!(metadata.workspace_root, workspace);
-        assert!(metadata.mutable);
-    }
-
-    fn metadata_error_reason(err: &MetadataError) -> &str {
-        match err {
-            MetadataError::UnsupportedStorage { reason, .. } => reason,
-            other => panic!("expected unsupported storage, got {other:?}"),
-        }
+fn unsupported_storage_error(provider_name: &str, reason: String) -> MetadataError {
+    MetadataError::UnsupportedStorage {
+        provider_name: provider_name.to_string(),
+        reason,
     }
 }

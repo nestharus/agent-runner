@@ -8,6 +8,7 @@ use oulipoly_runtime::session_metadata::{
     locate_session_metadata,
 };
 use serde_json::Value;
+use std::fs;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -74,8 +75,63 @@ fn assert_unsupported(result: Result<SessionMetadata, MetadataError>, expected: 
     }
 }
 
+fn unsupported_reason(result: Result<SessionMetadata, MetadataError>) -> String {
+    match result {
+        Err(MetadataError::UnsupportedStorage { reason, .. }) => reason,
+        other => panic!("expected UnsupportedStorage, got {other:?}"),
+    }
+}
+
 fn assert_canonical_eq(actual: &Path, expected: &Path) {
     assert_eq!(actual, expected.canonicalize().unwrap());
+}
+
+fn valid_cwd_script(workspace_root: &Path) -> String {
+    format!(
+        "printf '{{\"found\":true,\"cwd\":\"{}\"}}\\n'",
+        workspace_root.display()
+    )
+}
+
+fn component_script_storage_fixture(
+    transcript_script: Option<&str>,
+    cwd_script: &str,
+) -> PreparedLocate {
+    let fixture = LocateFixture::new();
+    let workspace_root = fixture.root().join("script-workspace");
+    fs::create_dir_all(&workspace_root).unwrap();
+    let jsonl_path = fixture.root().join("script-session.jsonl");
+    fs::write(
+        &jsonl_path,
+        format!(
+            "{{\"sessionId\":\"{SESSION_A}\",\"type\":\"assistant\",\"message\":\"fixture\"}}\n"
+        ),
+    )
+    .unwrap();
+    fixture.write_model(MODEL, &[CLAUDE_PROVIDER]);
+    fixture.write_script_provider(
+        CLAUDE_PROVIDER,
+        cwd_script,
+        transcript_script,
+        transcript_script.map(|_| "claude_code"),
+        true,
+    );
+    fixture.write_sessions_without_locator(CLAUDE_PROVIDER);
+    fixture.seed_active_chain(
+        CHAIN_A,
+        CLAUDE_PROVIDER,
+        SESSION_A,
+        MODEL,
+        "2026-04-17T08:00:00Z",
+    );
+    PreparedLocate {
+        fixture,
+        session_id: SESSION_A.to_string(),
+        chain_id: CHAIN_A.to_string(),
+        provider_name: CLAUDE_PROVIDER.to_string(),
+        workspace_root,
+        jsonl_path,
+    }
 }
 
 /// Risk: T2 — D1 ambiguity mirrors non-resume metadata resolver.
@@ -490,4 +546,508 @@ fn locate_json_shape_round_trips_unicode_paths_and_provider_punctuation() {
             .to_str()
             .unwrap()
     );
+}
+
+/// Risk: AGE-137/B016 — transcript script process failures must stay controlled.
+/// Level: component.
+/// Source: Step 6a §5 row B016.
+/// Observable: missing executable maps to an UnsupportedStorage reason with the transcript script failure stem.
+/// Residual: POSIX shell reports a missing command as exit 127 rather than spawn failure.
+#[test]
+fn transcript_script_missing_executable_maps_to_unsupported_storage() {
+    let cwd_script = valid_cwd_script(&tempfile::tempdir().unwrap().path().join("unused"));
+    let prepared = component_script_storage_fixture(
+        Some("/definitely/missing/oulipoly-transcript-script"),
+        &cwd_script,
+    );
+
+    let reason = unsupported_reason(locate(&prepared));
+
+    assert!(
+        reason.contains("transcript_script_spawn_failed")
+            || reason.contains("transcript_script_exit_127"),
+        "unexpected reason {reason:?}"
+    );
+}
+
+/// Risk: AGE-137/B017 — transcript script non-zero exits must retain useful stderr.
+/// Level: component.
+/// Source: Step 6a §5 row B017.
+/// Observable: reason includes `transcript_script_exit_<code>` and stderr.
+/// Residual: exact shell quoting around stderr is platform-owned.
+#[test]
+fn transcript_script_nonzero_exit_includes_kind_code_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    let cwd_script = valid_cwd_script(&workspace);
+    let fixture = LocateFixture::new();
+    let script = fixture.write_script(
+        "transcript-nonzero.sh",
+        "printf 'transcript exploded\\n' >&2\nexit 42",
+    );
+    let prepared =
+        component_script_storage_fixture(Some(&script.display().to_string()), &cwd_script);
+
+    let reason = unsupported_reason(locate(&prepared));
+
+    assert!(reason.contains("transcript_script_exit_42"), "{reason}");
+    assert!(reason.contains("transcript exploded"), "{reason}");
+}
+
+/// Risk: AGE-137/B018 — transcript script stdout cardinality is part of the contract.
+/// Level: component.
+/// Source: Step 6a §5 row B018.
+/// Observable: empty stdout and multi-line stdout receive distinct reason stems.
+/// Residual: whitespace-only stdout is represented by the empty-stdout case.
+#[test]
+fn transcript_script_empty_or_multiline_stdout_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd_script = valid_cwd_script(&dir.path().join("workspace"));
+    let empty_fixture = LocateFixture::new();
+    let empty_script = empty_fixture.write_script("transcript-empty.sh", "true");
+    let empty =
+        component_script_storage_fixture(Some(&empty_script.display().to_string()), &cwd_script);
+
+    assert_eq!(
+        unsupported_reason(locate(&empty)),
+        "transcript_script_empty_stdout"
+    );
+
+    let multiline_fixture = LocateFixture::new();
+    let multiline_script = multiline_fixture.write_script(
+        "transcript-multiline.sh",
+        "printf '/tmp/one.jsonl\\n/tmp/two.jsonl\\n'",
+    );
+    let multiline = component_script_storage_fixture(
+        Some(&multiline_script.display().to_string()),
+        &cwd_script,
+    );
+
+    assert_eq!(
+        unsupported_reason(locate(&multiline)),
+        "transcript_script_stdout_not_single_line"
+    );
+}
+
+/// Risk: AGE-137/B019 — normal locate mode still requires an existing transcript file.
+/// Level: component.
+/// Source: Step 6a §5 row B019.
+/// Observable: absolute missing JSONL from transcript_script maps to `missing_jsonl_path`.
+/// Residual: export allow-missing is covered separately by CT-001.
+#[test]
+fn transcript_script_missing_jsonl_path_rejected_in_require_existing() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing.jsonl");
+    let cwd_script = valid_cwd_script(&dir.path().join("workspace"));
+    let fixture = LocateFixture::new();
+    let script = fixture.write_script(
+        "transcript-missing-jsonl.sh",
+        &format!("printf '{}\\n'", missing.display()),
+    );
+    let prepared =
+        component_script_storage_fixture(Some(&script.display().to_string()), &cwd_script);
+
+    let reason = unsupported_reason(locate(&prepared));
+
+    assert!(reason.starts_with("missing_jsonl_path:"), "{reason}");
+    assert!(reason.contains(&missing.display().to_string()), "{reason}");
+}
+
+/// Risk: AGE-137/B020 — script storage without a transcript script must fail closed.
+/// Level: component.
+/// Source: Step 6a §5 row B020.
+/// Observable: reason equals `no_transcript_script_for_script_storage`.
+/// Residual: provider config validation for malformed script storage is covered elsewhere.
+#[test]
+fn script_storage_without_transcript_script_returns_no_transcript_script() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd_script = valid_cwd_script(&dir.path().join("workspace"));
+    let prepared = component_script_storage_fixture(None, &cwd_script);
+
+    assert_eq!(
+        unsupported_reason(locate(&prepared)),
+        "no_transcript_script_for_script_storage"
+    );
+}
+
+/// Risk: AGE-137/B022 — Claude storage root failures are a user-visible fallback reason.
+/// Level: component.
+/// Source: Step 6a §5 row B022.
+/// Observable: reason starts with `claude_projects_dir_unavailable`.
+/// Residual: exact OS error text is platform-owned.
+#[test]
+fn claude_missing_projects_dir_reports_projects_dir_unavailable() {
+    let fixture = LocateFixture::new();
+    let projects_dir = fixture.root().join("missing-claude-projects");
+    fixture.write_model(MODEL, &[CLAUDE_PROVIDER]);
+    fixture.write_provider(
+        CLAUDE_PROVIDER,
+        StorageKind::ClaudeCode {
+            projects_dir: &projects_dir,
+        },
+        true,
+        None,
+    );
+    fixture.write_sessions_without_locator(CLAUDE_PROVIDER);
+    fixture.seed_active_chain(
+        CHAIN_A,
+        CLAUDE_PROVIDER,
+        SESSION_A,
+        MODEL,
+        "2026-04-17T08:00:00Z",
+    );
+    let prepared = PreparedLocate {
+        fixture,
+        session_id: SESSION_A.to_string(),
+        chain_id: CHAIN_A.to_string(),
+        provider_name: CLAUDE_PROVIDER.to_string(),
+        workspace_root: Path::new("/unused").to_path_buf(),
+        jsonl_path: Path::new("/unused").to_path_buf(),
+    };
+
+    let reason = unsupported_reason(locate(&prepared));
+
+    assert!(
+        reason.starts_with("claude_projects_dir_unavailable:"),
+        "{reason}"
+    );
+}
+
+/// Risk: AGE-137/B024 — Claude fallback ambiguity must not silently pick a transcript.
+/// Level: component.
+/// Source: Step 6a §5 row B024.
+/// Observable: reason equals `claude_storage_scan_ambiguous`.
+/// Residual: candidates are not asserted because the public facade exposes only the reason string.
+#[test]
+fn claude_two_matching_transcripts_report_ambiguity() {
+    let fixture = LocateFixture::new();
+    let projects_dir = fixture.root().join("claude-projects");
+    let workspace_a = fixture.root().join("workspace-a");
+    let workspace_b = fixture.root().join("workspace-b");
+    fixture.stage_claude_transcript_for_encoded_path(&projects_dir, &workspace_a, SESSION_A);
+    fixture.stage_claude_transcript_for_encoded_path(&projects_dir, &workspace_b, SESSION_A);
+    fixture.write_model(MODEL, &[CLAUDE_PROVIDER]);
+    fixture.write_provider(
+        CLAUDE_PROVIDER,
+        StorageKind::ClaudeCode {
+            projects_dir: &projects_dir,
+        },
+        true,
+        None,
+    );
+    fixture.write_sessions_without_locator(CLAUDE_PROVIDER);
+    fixture.seed_active_chain(
+        CHAIN_A,
+        CLAUDE_PROVIDER,
+        SESSION_A,
+        MODEL,
+        "2026-04-17T08:00:00Z",
+    );
+    let prepared = PreparedLocate {
+        fixture,
+        session_id: SESSION_A.to_string(),
+        chain_id: CHAIN_A.to_string(),
+        provider_name: CLAUDE_PROVIDER.to_string(),
+        workspace_root: workspace_a,
+        jsonl_path: Path::new("/unused").to_path_buf(),
+    };
+
+    assert_eq!(
+        unsupported_reason(locate(&prepared)),
+        "claude_storage_scan_ambiguous"
+    );
+}
+
+/// Risk: AGE-137/B027 — Codex fallback direct rollout lookup remains available.
+/// Level: component.
+/// Source: Step 6a §5 row B027.
+/// Observable: direct rollout resolves to the canonical located path.
+/// Residual: nested traversal is covered by B028.
+#[test]
+fn codex_direct_rollout_resolves_through_contract() {
+    let prepared = component_codex_success_fixture(CODEX_PROVIDER);
+    prepared
+        .fixture
+        .write_sessions_without_locator(CODEX_PROVIDER);
+
+    let metadata = locate(&prepared).unwrap();
+
+    assert_canonical_eq(&metadata.jsonl_path, &prepared.jsonl_path);
+    assert_eq!(metadata.storage_type, SessionStorageType::CodexSession);
+}
+
+/// Risk: AGE-137/B028 — Codex fallback recurses nested session directories.
+/// Level: component.
+/// Source: Step 6a §5 row B028.
+/// Observable: nested rollout resolves to the canonical located path.
+/// Residual: recursion depth boundary is covered by B029.
+#[test]
+fn codex_nested_rollout_resolves_through_contract() {
+    let fixture = LocateFixture::new();
+    let sessions_dir = fixture.root().join("codex-sessions");
+    let nested_dir = sessions_dir.join("2026").join("05").join("10");
+    let workspace_root = fixture.root().join("codex-workspace");
+    fs::create_dir_all(&workspace_root).unwrap();
+    let jsonl_path = fixture.stage_codex_rollout(
+        &nested_dir,
+        &format!("rollout-2026-05-10T00-00-00-{SESSION_A}.jsonl"),
+        &format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{SESSION_A}\",\"cwd\":\"{}\"}}}}\n",
+            workspace_root.display()
+        ),
+    );
+    fixture.write_model(MODEL, &[CODEX_PROVIDER]);
+    fixture.write_provider(
+        CODEX_PROVIDER,
+        StorageKind::Codex {
+            sessions_dir: &sessions_dir,
+        },
+        true,
+        None,
+    );
+    fixture.write_sessions_without_locator(CODEX_PROVIDER);
+    fixture.seed_active_chain(
+        CHAIN_A,
+        CODEX_PROVIDER,
+        SESSION_A,
+        MODEL,
+        "2026-04-17T08:00:00Z",
+    );
+    let prepared = PreparedLocate {
+        fixture,
+        session_id: SESSION_A.to_string(),
+        chain_id: CHAIN_A.to_string(),
+        provider_name: CODEX_PROVIDER.to_string(),
+        workspace_root,
+        jsonl_path,
+    };
+
+    let metadata = locate(&prepared).unwrap();
+
+    assert_canonical_eq(&metadata.jsonl_path, &prepared.jsonl_path);
+}
+
+/// Risk: AGE-137/B029 — Codex fallback recursion depth is intentionally bounded.
+/// Level: component.
+/// Source: Step 6a §5 row B029.
+/// Observable: depth-4 rollout wins while depth-5 rollout is ignored.
+/// Residual: performance on wider trees is not measured here.
+#[test]
+fn codex_depth_4_eligible_depth_5_ignored() {
+    let fixture = LocateFixture::new();
+    let sessions_dir = fixture.root().join("codex-sessions");
+    let depth_4 = sessions_dir.join("d1").join("d2").join("d3").join("d4");
+    let depth_5 = depth_4.join("d5");
+    let workspace_root = fixture.root().join("codex-workspace");
+    fs::create_dir_all(&workspace_root).unwrap();
+    let body = format!(
+        "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{SESSION_A}\",\"cwd\":\"{}\"}}}}\n",
+        workspace_root.display()
+    );
+    let expected = fixture.stage_codex_rollout(
+        &depth_4,
+        &format!("rollout-depth4-{SESSION_A}.jsonl"),
+        &body,
+    );
+    fixture.stage_codex_rollout(
+        &depth_5,
+        &format!("rollout-depth5-{SESSION_A}.jsonl"),
+        &body,
+    );
+    fixture.write_model(MODEL, &[CODEX_PROVIDER]);
+    fixture.write_provider(
+        CODEX_PROVIDER,
+        StorageKind::Codex {
+            sessions_dir: &sessions_dir,
+        },
+        true,
+        None,
+    );
+    fixture.write_sessions_without_locator(CODEX_PROVIDER);
+    fixture.seed_active_chain(
+        CHAIN_A,
+        CODEX_PROVIDER,
+        SESSION_A,
+        MODEL,
+        "2026-04-17T08:00:00Z",
+    );
+    let prepared = PreparedLocate {
+        fixture,
+        session_id: SESSION_A.to_string(),
+        chain_id: CHAIN_A.to_string(),
+        provider_name: CODEX_PROVIDER.to_string(),
+        workspace_root,
+        jsonl_path: expected,
+    };
+
+    let metadata = locate(&prepared).unwrap();
+
+    assert_canonical_eq(&metadata.jsonl_path, &prepared.jsonl_path);
+}
+
+/// Risk: AGE-137/B030 — Codex storage root failures are a user-visible fallback reason.
+/// Level: component.
+/// Source: Step 6a §5 row B030.
+/// Observable: reason starts with `codex_sessions_dir_unavailable`.
+/// Residual: exact OS error text is platform-owned.
+#[test]
+fn codex_missing_sessions_dir_reports_unavailable() {
+    let fixture = LocateFixture::new();
+    let sessions_dir = fixture.root().join("missing-codex-sessions");
+    fixture.write_model(MODEL, &[CODEX_PROVIDER]);
+    fixture.write_provider(
+        CODEX_PROVIDER,
+        StorageKind::Codex {
+            sessions_dir: &sessions_dir,
+        },
+        true,
+        None,
+    );
+    fixture.write_sessions_without_locator(CODEX_PROVIDER);
+    fixture.seed_active_chain(
+        CHAIN_A,
+        CODEX_PROVIDER,
+        SESSION_A,
+        MODEL,
+        "2026-04-17T08:00:00Z",
+    );
+    let prepared = PreparedLocate {
+        fixture,
+        session_id: SESSION_A.to_string(),
+        chain_id: CHAIN_A.to_string(),
+        provider_name: CODEX_PROVIDER.to_string(),
+        workspace_root: Path::new("/unused").to_path_buf(),
+        jsonl_path: Path::new("/unused").to_path_buf(),
+    };
+
+    let reason = unsupported_reason(locate(&prepared));
+
+    assert!(
+        reason.starts_with("codex_sessions_dir_unavailable:"),
+        "{reason}"
+    );
+}
+
+/// Risk: AGE-137/B031 — Codex no-match behavior remains explicit.
+/// Level: component.
+/// Source: Step 6a §5 row B031.
+/// Observable: reason equals `codex_storage_scan_not_found`.
+/// Residual: content fallback is not part of the Rust storage scan contract.
+#[test]
+fn codex_no_match_reports_not_found() {
+    let fixture = LocateFixture::new();
+    let sessions_dir = fixture.root().join("codex-sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    fixture.write_model(MODEL, &[CODEX_PROVIDER]);
+    fixture.write_provider(
+        CODEX_PROVIDER,
+        StorageKind::Codex {
+            sessions_dir: &sessions_dir,
+        },
+        true,
+        None,
+    );
+    fixture.write_sessions_without_locator(CODEX_PROVIDER);
+    fixture.seed_active_chain(
+        CHAIN_A,
+        CODEX_PROVIDER,
+        SESSION_A,
+        MODEL,
+        "2026-04-17T08:00:00Z",
+    );
+    let prepared = PreparedLocate {
+        fixture,
+        session_id: SESSION_A.to_string(),
+        chain_id: CHAIN_A.to_string(),
+        provider_name: CODEX_PROVIDER.to_string(),
+        workspace_root: Path::new("/unused").to_path_buf(),
+        jsonl_path: Path::new("/unused").to_path_buf(),
+    };
+
+    assert_eq!(
+        unsupported_reason(locate(&prepared)),
+        "codex_storage_scan_not_found"
+    );
+}
+
+/// Risk: AGE-137/B032 — Codex fallback ambiguity must not silently pick a rollout.
+/// Level: component.
+/// Source: Step 6a §5 row B032.
+/// Observable: reason equals `codex_storage_scan_ambiguous`.
+/// Residual: candidates are not asserted because the public facade exposes only the reason string.
+#[test]
+fn codex_two_rollout_matches_report_ambiguity() {
+    let fixture = LocateFixture::new();
+    let sessions_dir = fixture.root().join("codex-sessions");
+    let workspace_root = fixture.root().join("codex-workspace");
+    fs::create_dir_all(&workspace_root).unwrap();
+    let body = format!(
+        "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{SESSION_A}\",\"cwd\":\"{}\"}}}}\n",
+        workspace_root.display()
+    );
+    fixture.stage_codex_rollout(
+        &sessions_dir,
+        &format!("rollout-a-{SESSION_A}.jsonl"),
+        &body,
+    );
+    fixture.stage_codex_rollout(
+        &sessions_dir,
+        &format!("rollout-b-{SESSION_A}.jsonl"),
+        &body,
+    );
+    fixture.write_model(MODEL, &[CODEX_PROVIDER]);
+    fixture.write_provider(
+        CODEX_PROVIDER,
+        StorageKind::Codex {
+            sessions_dir: &sessions_dir,
+        },
+        true,
+        None,
+    );
+    fixture.write_sessions_without_locator(CODEX_PROVIDER);
+    fixture.seed_active_chain(
+        CHAIN_A,
+        CODEX_PROVIDER,
+        SESSION_A,
+        MODEL,
+        "2026-04-17T08:00:00Z",
+    );
+    let prepared = PreparedLocate {
+        fixture,
+        session_id: SESSION_A.to_string(),
+        chain_id: CHAIN_A.to_string(),
+        provider_name: CODEX_PROVIDER.to_string(),
+        workspace_root,
+        jsonl_path: Path::new("/unused").to_path_buf(),
+    };
+
+    assert_eq!(
+        unsupported_reason(locate(&prepared)),
+        "codex_storage_scan_ambiguous"
+    );
+}
+
+/// Risk: AGE-137/CT-002 — public facade preservation under the locator contract.
+/// Level: component.
+/// Source: Step 6a §5 row CT-002.
+/// Observable: success metadata still carries facade fields and a representative error variant.
+/// Residual: the surrounding component matrix covers the exhaustive edge rows.
+#[test]
+fn session_metadata_public_facade_preservation_under_locator_contract() {
+    let prepared = component_claude_success_fixture(CLAUDE_PROVIDER, true);
+    let metadata = locate(&prepared).unwrap();
+
+    assert_eq!(metadata.session_id, prepared.session_id);
+    assert_eq!(metadata.chain_id, prepared.chain_id);
+    assert_eq!(metadata.provider_name, prepared.provider_name);
+    assert_eq!(metadata.storage_type, SessionStorageType::ClaudeCode);
+    assert_eq!(
+        serde_json::to_value(metadata.transcript_state).unwrap(),
+        "available"
+    );
+    assert!(metadata.active_segment_id > 0);
+    assert!(metadata.mutable);
+
+    let missing = component_no_storage_fixture(false);
+    assert_eq!(unsupported_reason(locate(&missing)), "no_locator");
 }
