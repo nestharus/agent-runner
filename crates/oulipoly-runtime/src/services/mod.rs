@@ -756,7 +756,7 @@ fn run_service_migration(
     target_provider_index: usize,
     reason: crate::balancer::TransitionReason,
 ) -> Result<MigrationServiceOutput, ServiceError> {
-    crate::migration::migrate_chain_segment(
+    let result = crate::migration::migrate_chain_segment(
         request.state,
         request.sessions_cfg,
         request.migration_model,
@@ -765,11 +765,23 @@ fn run_service_migration(
         target_provider_index,
         reason,
         request.stderr,
-    )
-    .map(|segment| MigrationServiceOutput::Migrated { segment })
-    .map_err(|err| ServiceError::Dependency {
-        message: format!("{err:?}"),
-    })
+    );
+    match result {
+        Ok(segment) => Ok(MigrationServiceOutput::Migrated { segment }),
+        Err(
+            err @ (crate::migration::MigrationError::SourceMissingStorage { .. }
+            | crate::migration::MigrationError::SourceMissing { .. }),
+        ) if request.manual_target.is_none()
+            && reason == crate::balancer::TransitionReason::QuotaThreshold =>
+        {
+            Ok(MigrationServiceOutput::DecisionFailed {
+                warning: format!("{err:?}"),
+            })
+        }
+        Err(err) => Err(ServiceError::Dependency {
+            message: format!("{err:?}"),
+        }),
+    }
 }
 
 impl TraceServicePort for ProductionTraceService {

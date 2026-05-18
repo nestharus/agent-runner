@@ -37,6 +37,12 @@ static MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0006_age_58_dual_write_row_versions.sql"),
         post_sql_hook: Some(crate::deployment::row_version::migrate_v6::apply_v6_row_version),
     },
+    Migration {
+        target_version: 7,
+        id: "0007_age_123_resume_provider_identity",
+        sql: include_str!("../migrations/0007_age_123_resume_provider_identity.sql"),
+        post_sql_hook: Some(apply_v7_resume_provider_identity),
+    },
 ];
 
 pub fn manifest() -> &'static [Migration] {
@@ -162,6 +168,38 @@ fn commit_migration(conn: &mut Connection) -> Result<(), rusqlite::Error> {
 
 fn rollback_migration(conn: &mut Connection) {
     let _ = conn.execute_batch("ROLLBACK;");
+}
+
+fn apply_v7_resume_provider_identity(conn: &Connection) -> Result<(), rusqlite::Error> {
+    if !table_exists(conn, "invocations")?
+        || column_exists(conn, "invocations", "provider_session_resolved_account")?
+    {
+        return Ok(());
+    }
+
+    conn.execute_batch("ALTER TABLE invocations ADD COLUMN provider_session_resolved_account TEXT;")
+}
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool, rusqlite::Error> {
+    conn.query_row(
+        "SELECT EXISTS (
+             SELECT 1 FROM sqlite_schema
+              WHERE type = 'table' AND name = ?1
+         )",
+        [table],
+        |row| row.get::<_, bool>(0),
+    )
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, rusqlite::Error> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for name in columns {
+        if name? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub(crate) fn classify_versionless(

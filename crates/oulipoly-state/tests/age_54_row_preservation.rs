@@ -321,7 +321,14 @@ fn unknown_populated_invocations_shape_fails_closed_before_rebuild() {
     let after_columns = table_columns(&db_path, "invocations");
     let mut before_columns_with_row_version = before_columns.clone();
     before_columns_with_row_version.push("row_version".to_string());
-    assert!(after_columns == before_columns || after_columns == before_columns_with_row_version);
+    let mut before_columns_with_row_version_and_identity = before_columns_with_row_version.clone();
+    before_columns_with_row_version_and_identity
+        .push("provider_session_resolved_account".to_string());
+    assert!(
+        after_columns == before_columns
+            || after_columns == before_columns_with_row_version
+            || after_columns == before_columns_with_row_version_and_identity
+    );
     let conn = Connection::open(&db_path).unwrap();
     let marker: String = conn
         .query_row("SELECT unexpected_hand_edit FROM invocations", [], |row| {

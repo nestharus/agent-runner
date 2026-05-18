@@ -147,7 +147,7 @@ fn registry_payload_columns_match_migrated_table_info_for_every_entry() {
     let db_path = dir.path().join("state.db");
     build_schema5_db(&db_path);
 
-    let conn = migrate_schema5_to_schema6(&db_path);
+    let conn = migrate_schema5_to_current(&db_path);
 
     for registration in REGISTRY {
         assert_registration_matches_table_info(&conn, registration);
@@ -251,6 +251,13 @@ fn migrate_schema5_to_schema6(path: &Path) -> Connection {
             .collect::<Vec<_>>(),
         vec!["0006_age_58_dual_write_row_versions"]
     );
+    migrations::run_with_db_path(&mut conn, &plan, path.to_path_buf()).unwrap();
+    conn
+}
+
+fn migrate_schema5_to_current(path: &Path) -> Connection {
+    let mut conn = Connection::open(path).unwrap();
+    let plan = migrations::current_plan_from(5).unwrap();
     migrations::run_with_db_path(&mut conn, &plan, path.to_path_buf()).unwrap();
     conn
 }

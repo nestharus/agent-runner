@@ -476,6 +476,7 @@ pub struct InvocationRecord {
     pub provider_session_id: Option<String>,
     pub resume_input_id: Option<String>,
     pub provider_session_capture_method: Option<String>,
+    pub provider_session_resolved_account: Option<String>,
     pub resume_acceptance_status: Option<String>,
     pub resume_acceptance_evidence: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -624,6 +625,7 @@ pub struct ProviderSessionBinding {
     pub provider_session_id: String,
     pub capture_method: &'static str,
     pub resume_input_id: Option<String>,
+    pub provider_session_resolved_account: Option<String>,
 }
 
 struct WrongIdKindInvocationMatch {
@@ -648,21 +650,30 @@ enum ProviderSessionProjection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InvocationDualIdProjection {
     Current,
+    CurrentWithoutResolvedAccount,
     Legacy,
 }
 
 impl InvocationDualIdProjection {
-    fn select_columns(&self) -> (&'static str, &'static str, &'static str) {
+    fn select_columns(&self) -> (&'static str, &'static str, &'static str, &'static str) {
         match self {
             InvocationDualIdProjection::Current => (
                 "provider_session_id",
                 "resume_input_id",
                 "provider_session_capture_method",
+                "provider_session_resolved_account",
+            ),
+            InvocationDualIdProjection::CurrentWithoutResolvedAccount => (
+                "provider_session_id",
+                "resume_input_id",
+                "provider_session_capture_method",
+                "NULL AS provider_session_resolved_account",
             ),
             InvocationDualIdProjection::Legacy => (
                 "NULL AS provider_session_id",
                 "NULL AS resume_input_id",
                 "NULL AS provider_session_capture_method",
+                "NULL AS provider_session_resolved_account",
             ),
         }
     }
@@ -1308,7 +1319,12 @@ impl StateDb {
     fn invocation_columns_without_maintenance(columns: &[String]) -> Vec<String> {
         columns
             .iter()
-            .filter(|column| column.as_str() != "row_version")
+            .filter(|column| {
+                !matches!(
+                    column.as_str(),
+                    "row_version" | "provider_session_resolved_account"
+                )
+            })
             .cloned()
             .collect()
     }
@@ -1380,6 +1396,13 @@ impl StateDb {
     fn invocations_have_dual_id_columns(conn: &Connection) -> Result<bool, String> {
         let columns = Self::invocations_columns(conn)?;
         Ok(Self::columns_have_dual_id_columns(&columns))
+    }
+
+    fn invocations_have_resolved_account_column(conn: &Connection) -> Result<bool, String> {
+        let columns = Self::invocations_columns(conn)?;
+        Ok(columns
+            .iter()
+            .any(|column| column == "provider_session_resolved_account"))
     }
 
     fn columns_have_dual_id_columns(columns: &[String]) -> bool {
@@ -1463,7 +1486,11 @@ impl StateDb {
         conn: &Connection,
     ) -> Result<InvocationDualIdProjection, String> {
         if Self::invocations_have_dual_id_columns(conn)? {
-            Ok(InvocationDualIdProjection::Current)
+            if Self::invocations_have_resolved_account_column(conn)? {
+                Ok(InvocationDualIdProjection::Current)
+            } else {
+                Ok(InvocationDualIdProjection::CurrentWithoutResolvedAccount)
+            }
         } else {
             Ok(InvocationDualIdProjection::Legacy)
         }
@@ -1473,13 +1500,18 @@ impl StateDb {
         projection: InvocationDualIdProjection,
         tail_sql: &str,
     ) -> String {
-        let (provider_session_id, resume_input_id, provider_session_capture_method) =
-            projection.select_columns();
+        let (
+            provider_session_id,
+            resume_input_id,
+            provider_session_capture_method,
+            provider_session_resolved_account,
+        ) = projection.select_columns();
         format!(
             "SELECT id, invocation_uuid, model_name, provider_name, provider_index,
                     parent_invocation_id, status, success, exit_code, error_category,
                     terminal_reason, session_id, session_capture_method,
                     {provider_session_id}, {resume_input_id}, {provider_session_capture_method},
+                    {provider_session_resolved_account},
                     resume_acceptance_status, resume_acceptance_evidence,
                     created_at, finished_at
              FROM invocations
@@ -2024,6 +2056,7 @@ impl StateDb {
             provider_session_id TEXT,
             resume_input_id TEXT,
             provider_session_capture_method TEXT,
+            provider_session_resolved_account TEXT,
             resume_acceptance_status TEXT,
             resume_acceptance_evidence TEXT,
             created_at TEXT NOT NULL,
@@ -2158,6 +2191,7 @@ impl StateDb {
                 provider_session_id TEXT,
                 resume_input_id TEXT,
                 provider_session_capture_method TEXT,
+                provider_session_resolved_account TEXT,
                 resume_acceptance_status TEXT,
                 resume_acceptance_evidence TEXT,
                 created_at TEXT NOT NULL,
@@ -2212,11 +2246,12 @@ impl StateDb {
             provider_session_id,
             resume_input_id,
             provider_session_capture_method,
+            provider_session_resolved_account,
             resume_acceptance_status,
             resume_acceptance_evidence,
             created_at,
             finished_at
-         ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?9, ?9)"
+         ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?9, ?9)"
     }
 
     fn map_legacy_invocation_insert(
@@ -3191,7 +3226,8 @@ impl StateDb {
             "UPDATE invocations
              SET provider_session_id = ?1,
                  provider_session_capture_method = ?2,
-                 resume_input_id = COALESCE(?3, resume_input_id),
+                 provider_session_resolved_account = COALESCE(?3, provider_session_resolved_account),
+                 resume_input_id = COALESCE(?4, resume_input_id),
                  session_id = CASE
                      WHEN session_capture_method = 'resumed'
                           AND resume_input_id IS NOT NULL
@@ -3200,10 +3236,11 @@ impl StateDb {
                      ELSE ?1
                  END,
                  session_capture_method = ?2
-             WHERE id = ?4",
+             WHERE id = ?5",
             params![
                 &binding.provider_session_id,
                 binding.capture_method,
+                binding.provider_session_resolved_account.as_deref(),
                 binding.resume_input_id.as_deref(),
                 invocation_row_id
             ],
@@ -3408,8 +3445,8 @@ impl StateDb {
     }
 
     fn map_invocation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<InvocationRecord> {
-        let created_at_raw: String = row.get(18)?;
-        let finished_at_raw: Option<String> = row.get(19)?;
+        let created_at_raw: String = row.get(19)?;
+        let finished_at_raw: Option<String> = row.get(20)?;
         let status_raw: String = row.get(6)?;
         let created_at = Self::strict_rfc3339_at(&created_at_raw, 18)?;
         let finished_at = Self::optional_strict_rfc3339_at(finished_at_raw, 19)?;
@@ -3432,8 +3469,9 @@ impl StateDb {
             provider_session_id: row.get(13)?,
             resume_input_id: row.get(14)?,
             provider_session_capture_method: row.get(15)?,
-            resume_acceptance_status: row.get(16)?,
-            resume_acceptance_evidence: row.get(17)?,
+            provider_session_resolved_account: row.get(16)?,
+            resume_acceptance_status: row.get(17)?,
+            resume_acceptance_evidence: row.get(18)?,
             created_at,
             finished_at,
         })
@@ -5882,6 +5920,10 @@ mod tests {
                 terminal_reason TEXT,
                 session_id TEXT,
                 session_capture_method TEXT,
+                provider_session_id TEXT,
+                resume_input_id TEXT,
+                provider_session_capture_method TEXT,
+                provider_session_resolved_account TEXT,
                 resume_acceptance_status TEXT,
                 resume_acceptance_evidence TEXT,
                 created_at TEXT NOT NULL,
@@ -8262,6 +8304,7 @@ name = "fixture-provider"
                 provider_session_id: provider_session_id.clone(),
                 capture_method: "forced_flag_verified",
                 resume_input_id: None,
+                provider_session_resolved_account: None,
             },
         )
         .unwrap();
@@ -8294,6 +8337,7 @@ name = "fixture-provider"
                 provider_session_id: provider_session_id.clone(),
                 capture_method: "forced_flag_verified",
                 resume_input_id: None,
+                provider_session_resolved_account: None,
             },
         )
         .unwrap();
@@ -8314,6 +8358,7 @@ name = "fixture-provider"
             provider_session_id: provider_session_id.clone(),
             capture_method: "forced_flag_verified",
             resume_input_id: None,
+            provider_session_resolved_account: None,
         };
 
         db.bind_invocation_provider_session_start(id, &binding)
@@ -8340,6 +8385,7 @@ name = "fixture-provider"
                 provider_session_id: provider_session_id.clone(),
                 capture_method: "forced_flag_verified",
                 resume_input_id: None,
+                provider_session_resolved_account: None,
             },
         )
         .unwrap();
@@ -8352,6 +8398,7 @@ name = "fixture-provider"
                     provider_session_id: Uuid::new_v4().to_string(),
                     capture_method: "forced_flag_verified",
                     resume_input_id: None,
+                    provider_session_resolved_account: None,
                 },
             )
             .unwrap_err();
@@ -8385,6 +8432,7 @@ name = "fixture-provider"
                 provider_session_id: provider_session_id.clone(),
                 capture_method: "resumed",
                 resume_input_id: Some(provider_session_id.clone()),
+                provider_session_resolved_account: None,
             },
         )
         .unwrap();
@@ -8412,6 +8460,7 @@ name = "fixture-provider"
             provider_session_id: provider_session_id.clone(),
             capture_method: "resumed",
             resume_input_id: Some(legacy_resume_input.clone()),
+            provider_session_resolved_account: None,
         };
 
         db.bind_invocation_provider_session_start(id, &binding)
@@ -9963,6 +10012,11 @@ interactive_args = ["launch"]
         let conn = Connection::open(&db_path).unwrap();
         seed_current_drift_required_tables(&conn);
         conn.execute(
+            "ALTER TABLE invocations DROP COLUMN provider_session_resolved_account",
+            [],
+        )
+        .unwrap();
+        conn.execute(
             "INSERT INTO invocations
                 (invocation_uuid, model_name, provider_name, provider_index, status, success,
                  exit_code, error_category, terminal_reason, session_id, session_capture_method,
@@ -10927,6 +10981,7 @@ interactive_args = ["launch"]
                     provider_session_id: SESSION_A.to_string(),
                     capture_method: "verified",
                     resume_input_id: None,
+                    provider_session_resolved_account: None,
                 },
             )
             .unwrap();

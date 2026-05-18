@@ -6,8 +6,8 @@
 use agent_runner_lib::{effective_provider_for_model_provider, load_app_config};
 use oulipoly_config::repositories::{AgentConfigRepository, FilesystemAgentConfigRepository};
 use oulipoly_config::{
-    AgentConfig, ModelConfig, PromptMode, ProviderConfig, ProvidersConfig, load_agent_file,
-    load_models,
+    AgentConfig, ModelConfig, PromptMode, ProviderConfig, ProvidersConfig, SessionStorage,
+    load_agent_file, load_models,
 };
 use oulipoly_runtime::balancer;
 use oulipoly_runtime::diagnostics;
@@ -25,6 +25,7 @@ use oulipoly_runtime::session_export::ExportError;
 use oulipoly_runtime::session_lock::LockError;
 use oulipoly_runtime::session_metadata::{
     MetadataError, locate_session_metadata, resolve_resume_workspace_root,
+    resolve_workspace_root_for_provider_session,
 };
 use oulipoly_runtime::session_replace::{self, ReplaceError, ReplaceSource};
 use oulipoly_runtime::trace::{TraceOptions, render_ascii_trace};
@@ -1783,6 +1784,24 @@ fn resume_db_error(message: String) -> oulipoly_state::ResumeError {
     oulipoly_state::ResumeError::Db { message }
 }
 
+fn provider_session_resolved_account(
+    provider: &ProviderConfig,
+    provider_session_id: &str,
+) -> Option<String> {
+    let session_storage = provider.session_storage.as_ref()?;
+    match session_storage {
+        SessionStorage::ClaudeCode { projects_dir } => Some(projects_dir.display().to_string()),
+        SessionStorage::Codex { sessions_dir } => Some(sessions_dir.display().to_string()),
+        SessionStorage::Script { .. } => resolve_workspace_root_for_provider_session(
+            Some(session_storage),
+            &provider.name,
+            provider_session_id,
+        )
+        .ok()
+        .map(|path| path.display().to_string()),
+    }
+}
+
 fn run_pause_handshake(
     session_id: &str,
     ttl_ms: Option<u64>,
@@ -2354,6 +2373,7 @@ fn run_repl(
                 provider_session_id: active_session_id.to_string(),
                 capture_method: "resumed",
                 resume_input_id: resume.map(str::to_string),
+                provider_session_resolved_account: None,
             },
         )?;
         if let Some(session_id) = resume
@@ -2772,6 +2792,10 @@ fn run_resume(
                 provider_session_id: resolved.active_session_id.clone(),
                 capture_method: "resumed",
                 resume_input_id: Some(session_id.to_string()),
+                provider_session_resolved_account: provider_session_resolved_account(
+                    &provider,
+                    &resolved.active_session_id,
+                ),
             },
         )?;
         if manual_migrate.is_some() {
@@ -3133,6 +3157,7 @@ fn bind_start_known_provider_session_if_present(
                     provider_session_id: provider_session_id.to_string(),
                     capture_method: "forced_flag_verified",
                     resume_input_id: None,
+                    provider_session_resolved_account: None,
                 },
             )
             .unwrap_or_else(|e| eprintln!("Warning: Failed to bind provider session: {e}"));

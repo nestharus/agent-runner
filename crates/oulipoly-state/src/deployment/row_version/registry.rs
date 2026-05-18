@@ -1,5 +1,5 @@
 //! ## Declared roles
-//! accessor, mapper
+//! accessor, mapper, filter
 //!
 //! ## Intrinsic-surface declarations
 //! intrinsic_surface_declarations:
@@ -78,6 +78,7 @@ const INVOCATIONS_PAYLOAD: &[&str] = &[
     "provider_session_id",
     "resume_input_id",
     "provider_session_capture_method",
+    "provider_session_resolved_account",
 ];
 /// Payload columns from PRAGMA order: data, created_at.
 const MEMORY_EDGES_PAYLOAD: &[&str] = &["data", "created_at"];

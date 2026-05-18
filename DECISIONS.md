@@ -2948,3 +2948,32 @@ This is NOT residual acceptance, NOT precedent citation, and does NOT authorize 
   - Parent AGE-135 Phase 4 inherited evidence: `/home/nes/projects/agent-runner/planning/age-135-resume-identity-final/code-quality/age-135-phase-4/findings.md`
   - Audit-history bootstrap: `/home/nes/projects/agent-runner/planning/age-147-declared-roles-cleanup/audit-history.md`
 - **Revisit when**: never for AGE-147 specifically (this is the WU's bootstrap moment). The metric will return to LOW post-refactor via Phase 6 per-component fanout; AGE-148 inherits the LOW baseline.
+
+### AGE-148 — Bootstrap exception ratification
+
+- **Source**: implementation-pipeline-orchestrator Phase 4 code-quality gate, round 2. Aggregate verdict HIGH (slug `age-148-phase-4-r2`); 890 findings (879 HIGH function-classification + 2 HIGH cohesion + 2 HIGH push-pull + 6 HIGH coupling + 1 HIGH validation-integrity + 1 MEDIUM validation-integrity). Root chose Option C (hybrid: narrow bootstrap-exception now + tracker meta-ticket for follow-up).
+- **Decision**: ratify the AGE-148 `## Bootstrap exception declaration` filed in the Phase 3 proposal at `/home/nes/projects/agent-runner/planning/age-148-feature-integration/proposals/age-148-AGE-148.md`. The four-condition argument is the proposer's responsibility; this DECISIONS entry confirms the orchestrator's procedural check passed and emits the `bootstrap-exception` RATIFIED row in the Phase 4 join manifest.
+- **Canonical authority**: `~/ai/conventions/code-quality.md` § `Bootstrap exception` is the canonical rule reference. The four conditions are evaluated by the proposer; the orchestrator's Phase 4 sub-gate verifies field presence + this DECISIONS heading + this convention citation.
+- **Scope of this ratification**:
+  - Phase 4 code-quality aggregate HIGH is ratified for AGE-148 ONLY.
+  - The 879 multi-classifier function findings are AGE-147-baseline-inherited intrinsic-lockstep with AGE-147's prior `### AGE-147 — Bootstrap exception ratification` entry above. AGE-148 inherits them via touched-file ownership.
+  - The 2 push-pull findings (PP-001 session_metadata transcript fallback, PP-002 main.rs compaction backfill) are pre-existing AGE-147 baseline.
+  - The 6 product-code coupling findings are pre-existing AGE-147 baseline.
+  - VI-006 schema relaxation is the AGE-123 feature's expected schema adjustment.
+  - VI-007 runtime-artifact-evidence gap is ratified separately via the runtime-evidence bundle at `/home/nes/projects/agent-runner/planning/age-148-feature-integration/runtime-evidence/` (46 tests pass; schema v7 confirmed; resolved_account column verified present). The VI-007 ratification cites the runtime-evidence-manifest as the `runtime_artifact_evidence_path`.
+- **Companion residual disposition**:
+  - AGE-148 will spawn a tracker meta-ticket (target: AGE team) titled "Refactor multi-classifier functions in db.rs / main.rs / services / session_metadata (post-AGE-147 inherited debt)" to capture the follow-up cleanup work that this bootstrap-exception does NOT discharge.
+  - The tracker meta-ticket is the durable record of the inherited cleanup-debt; this DECISIONS entry is the procedural ratification for AGE-148 ship.
+- **Forbidden behaviors reaffirmed**:
+  - This ratification is bounded to AGE-148. NO precedent-citation of this AGE-148 bootstrap-exception for OTHER WUs unless they independently meet the four conditions per `~/ai/conventions/code-quality.md` § `Bootstrap exception`.
+  - NO residual acceptance on later Phase 6 per-component code-quality fanout. The bootstrap-exception releases Phase 4 only.
+  - NO use of this declaration to suppress the cleanup tracker meta-ticket.
+- **Evidence**:
+  - Proposal: `/home/nes/projects/agent-runner/planning/age-148-feature-integration/proposals/age-148-AGE-148.md` § `Bootstrap exception declaration`
+  - Phase 4 CQ R1 (pre-annotation): `/home/nes/projects/agent-runner/planning/age-148-feature-integration/code-quality/age-148-phase-4-r1/aggregate-code-quality.md` (HIGH 28+8)
+  - Phase 4 CQ R2 (post-annotation): `/home/nes/projects/agent-runner/planning/age-148-feature-integration/code-quality/age-148-phase-4-r2/aggregate-code-quality.md` (HIGH 879 multi-classifier + 2 cohesion + 2 push-pull + 6 coupling + 1 VI-007 HIGH + 1 VI-006 MEDIUM)
+  - Annotation-pass commits: `678ede3`, `65f9022`, `d8c7fa7` (header-only declared-roles annotations on session_metadata/mod.rs, row_version/registry.rs, and the 3 new test files cherry-picked from AGE-123)
+  - Runtime-evidence bundle (VI-007 ratification): `/home/nes/projects/agent-runner/planning/age-148-feature-integration/runtime-evidence/runtime-evidence-manifest.md`
+  - Audit-history: `/home/nes/projects/agent-runner/planning/age-148-feature-integration/audit-history.md`
+  - Parent AGE-147 ratification: this DECISIONS.md § `### AGE-147 — Bootstrap exception ratification` above
+- **Revisit when**: never for AGE-148 specifically (this is the WU's bootstrap moment, narrowly scoped to ship the AGE-123 r3 feature on the post-AGE-147 baseline). The inherited multi-classifier debt is tracked by the spawned cleanup meta-ticket; resolution there will lower the post-merge baseline for future WUs.
