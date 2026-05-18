@@ -650,14 +650,18 @@ def parse_fenced_yaml_blocks(body: str) -> list[str]:
     return re.findall(r"```(?:yaml|yml)\s*\n([\s\S]*?)\n```", body)
 
 
-def parse_yaml_block_values(blocks: list[str]) -> tuple[list[Any], list[str]]:
+def parse_yaml_block_value(block: str) -> Any:
+    return yaml.safe_load(block)
+
+
+def parse_yaml_block_values(blocks: list[str]) -> tuple[list[Any], list[Exception]]:
     values: list[Any] = []
-    errors: list[str] = []
+    errors: list[Exception] = []
     for block in blocks:
         try:
-            values.append(yaml.safe_load(block))
+            values.append(parse_yaml_block_value(block))
         except Exception as exc:
-            errors.append(str(exc))
+            errors.append(exc)
     return values, errors
 
 
@@ -774,6 +778,24 @@ def map_ref_values_to_specs(values: dict[str, str]) -> list[FixtureRef]:
     return [FixtureRef(field=field, value=value, kind=kinds[field]) for field, value in values.items()]
 
 
+def classify_fixture_kind(ref: FixtureRef) -> str:
+    kinds = {"fixture_bytes_path": "bytes", "sentinel_metadata_path": "metadata"}
+    expected = kinds.get(ref.field)
+    if expected is None:
+        fail(f"unknown fixture ref field: {ref.field}")
+    if ref.kind != expected:
+        fail(f"fixture ref {ref.field} must use kind {expected}")
+    return expected
+
+
+def is_fixture_bytes_ref(kind: str) -> bool:
+    return kind == "bytes"
+
+
+def is_fixture_metadata_ref(kind: str) -> bool:
+    return kind == "metadata"
+
+
 def map_status_kinds(rows: list[dict[str, Any]], expected: dict[str, str]) -> set[str]:
     return {expected[row["id"]] for row in rows}
 
@@ -854,6 +876,12 @@ def format_fixture_ref_result(path: Path) -> str:
     return str(path.relative_to(FIXTURE_ROOT))
 
 
+def format_yaml_parse_error(err: Exception, context: str) -> str:
+    if not context:
+        return str(err)
+    return f"{context}: {err}"
+
+
 def format_coupling_result() -> str:
     return "coupling declarations carry 5 Translates entries and 8 Owns entries"
 
@@ -907,13 +935,14 @@ def verify_metadata_ref(row: dict[str, Any], path: Path) -> None:
 
 
 def resolve_fixture_ref(row: dict[str, Any], ref: FixtureRef) -> str:
+    kind = classify_fixture_kind(ref)
     relative_path = parse_relative_path(ref.value)
     validate_relative_fixture_path(relative_path, row["id"], ref.field)
     path = resolve_fixture_path(ref, FIXTURE_ROOT)
     validate_fixture_path(path, format_missing_fixture_path(row, ref))
-    if ref.kind == "bytes":
+    if is_fixture_bytes_ref(kind):
         read_bytes(path)
-    if ref.kind == "metadata":
+    if is_fixture_metadata_ref(kind):
         verify_metadata_ref(row, path)
     return format_fixture_ref_result(path)
 
@@ -953,7 +982,8 @@ def fenced_yaml_in_section(heading: str) -> dict[str, Any]:
     body = section_text(heading)
     blocks = parse_fenced_yaml_blocks(body)
     validate_yaml_blocks_present(blocks, heading)
-    values, errors = parse_yaml_block_values(blocks)
+    values, parse_errors = parse_yaml_block_values(blocks)
+    errors = [format_yaml_parse_error(error, "") for error in parse_errors]
     candidates = filter_mapping_values(values)
     validate_mapping_yaml_candidate(candidates, errors, heading)
     return first_mapping_candidate(candidates)

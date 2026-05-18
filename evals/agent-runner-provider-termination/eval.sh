@@ -26,12 +26,21 @@ validate_test_script() {
   [[ -x "$script" ]]
 }
 
+parse_colon_entry() {
+  local entry="$1"
+
+  printf '%s\n' "${entry%%:*}"
+  printf '%s\n' "${entry#*:}"
+}
+
 validate_environment() {
   local overall=0
   local entry script
+  local -a parsed_entry
 
   for entry in "${tests[@]}"; do
-    script="${entry#*:}"
+    readarray -t parsed_entry < <(parse_colon_entry "$entry")
+    script="${parsed_entry[1]}"
     validate_test_script "$script" || overall=1
   done
 
@@ -59,10 +68,12 @@ run_contract_test() {
 run_all_contract_tests() {
   local overall=0
   local entry test_id script
+  local -a parsed_entry
 
   for entry in "${tests[@]}"; do
-    test_id="${entry%%:*}"
-    script="${entry#*:}"
+    readarray -t parsed_entry < <(parse_colon_entry "$entry")
+    test_id="${parsed_entry[0]}"
+    script="${parsed_entry[1]}"
     run_contract_test "$test_id" "$script" || overall=1
   done
 
