@@ -554,8 +554,9 @@ impl CompositeInvocationId {
 
     /// Parse from a raw env-var value and validate the UUID payload.
     pub fn parse_env_value(s: &str) -> Result<Self, String> {
-        let parsed = Self::parse_marker_payload(s).map_err(invalid_invocation_json_message)?;
-        validate_marker_uuid(&parsed.id).map_err(invalid_invocation_uuid_message)?;
+        let parsed =
+            Self::parse_marker_payload(s).map_err(|e| format!("Invalid invocation JSON: {e}"))?;
+        validate_marker_uuid(&parsed.id).map_err(|e| format!("Invalid invocation UUID: {e}"))?;
         Ok(parsed)
     }
 
@@ -590,14 +591,6 @@ impl CompositeInvocationId {
 
 fn validate_marker_uuid(id: &str) -> Result<(), uuid::Error> {
     Uuid::parse_str(id).map(|_| ())
-}
-
-fn invalid_invocation_json_message(e: serde_json::Error) -> String {
-    format!("Invalid invocation JSON: {e}")
-}
-
-fn invalid_invocation_uuid_message(e: uuid::Error) -> String {
-    format!("Invalid invocation UUID: {e}")
 }
 
 #[derive(Debug, Clone)]
@@ -1226,7 +1219,9 @@ impl StateDb {
         let columns = Self::invocations_columns(conn)?;
         match Self::classify_invocations_schema(&columns) {
             InvocationsSchemaShape::Empty => Self::initialize_invocations_schema(conn),
-            InvocationsSchemaShape::Current => Self::repair_current_invocations_schema(conn),
+            InvocationsSchemaShape::Current => {
+                Self::repair_current_invocations_schema(conn, &columns)
+            }
             InvocationsSchemaShape::LegacyPreUuid => Self::migrate_legacy_invocations(conn),
             InvocationsSchemaShape::UnrecognizedPreUuid(columns) => {
                 Err(Self::unrecognized_invocations_shape_error(&columns))
@@ -1252,18 +1247,17 @@ impl StateDb {
         Self::ensure_invocations_row_version_support(conn)
     }
 
-    fn repair_current_invocations_schema(conn: &Connection) -> Result<(), String> {
-        for repair in Self::invocations_column_repairs() {
-            Self::add_invocations_column_if_absent(conn, repair)?;
-        }
-        Self::drop_invocations_column_if_present(
-            conn,
-            DropColumnRepair {
-                column_name: "quota_tight_routing",
-                sql: "ALTER TABLE invocations DROP COLUMN quota_tight_routing",
-                error_context: "Failed to drop invocations.quota_tight_routing",
-            },
-        )?;
+    fn repair_current_invocations_schema(
+        conn: &Connection,
+        columns: &[String],
+    ) -> Result<(), String> {
+        Self::execute_column_repairs(conn, columns, Self::invocations_column_repairs().as_slice())?;
+        let drop_repairs = [DropColumnRepair {
+            column_name: "quota_tight_routing",
+            sql: "ALTER TABLE invocations DROP COLUMN quota_tight_routing",
+            error_context: "Failed to drop invocations.quota_tight_routing",
+        }];
+        Self::execute_drop_column_repairs(conn, columns, drop_repairs.as_slice())?;
         conn.execute_batch(Self::invocations_index_sql())
             .map_err(|e| format!("Failed to ensure invocation indexes: {e}"))?;
         Self::ensure_invocations_row_version_support(conn)
@@ -1299,35 +1293,6 @@ impl StateDb {
         ]
     }
 
-    fn add_invocations_column_if_absent(
-        conn: &Connection,
-        repair: ColumnRepair,
-    ) -> Result<(), String> {
-        if Self::invocations_column_exists(conn, repair.column_name)? {
-            return Ok(());
-        }
-        conn.execute(repair.sql, [])
-            .map_err(|e| format!("{}: {e}", repair.error_context))?;
-        Ok(())
-    }
-
-    fn drop_invocations_column_if_present(
-        conn: &Connection,
-        repair: DropColumnRepair,
-    ) -> Result<(), String> {
-        if !Self::invocations_column_exists(conn, repair.column_name)? {
-            return Ok(());
-        }
-        conn.execute(repair.sql, [])
-            .map_err(|e| format!("{}: {e}", repair.error_context))?;
-        Ok(())
-    }
-
-    fn invocations_column_exists(conn: &Connection, column_name: &str) -> Result<bool, String> {
-        let columns = Self::invocations_columns(conn)?;
-        Ok(Self::has_column(&columns, column_name))
-    }
-
     fn unrecognized_invocations_shape_error(columns: &[String]) -> String {
         format!(
             "Refusing to rebuild populated invocations table with unrecognized pre-UUID shape: {columns:?}"
@@ -1336,24 +1301,16 @@ impl StateDb {
 
     fn normalize_invocations_columns_excluding_maintenance(columns: &[String]) -> Vec<String> {
         let mut names = Self::invocation_columns_without_maintenance(columns);
-        Self::sort_column_names(&mut names);
+        names.sort();
         names
     }
 
     fn invocation_columns_without_maintenance(columns: &[String]) -> Vec<String> {
         columns
             .iter()
-            .filter(|column| Self::is_invocation_data_column(column))
+            .filter(|column| column.as_str() != "row_version")
             .cloned()
             .collect()
-    }
-
-    fn is_invocation_data_column(column: &str) -> bool {
-        column != "row_version"
-    }
-
-    fn sort_column_names(names: &mut [String]) {
-        names.sort();
     }
 
     fn legacy_invocations_shape_is_pre_uuid(columns: &[String]) -> bool {
@@ -1426,18 +1383,16 @@ impl StateDb {
     }
 
     fn columns_have_dual_id_columns(columns: &[String]) -> bool {
-        columns.iter().any(|column| column == "provider_session_id")
-            && columns.iter().any(|column| column == "resume_input_id")
-            && columns
-                .iter()
-                .any(|column| column == "provider_session_capture_method")
+        Self::has_column(columns, "provider_session_id")
+            && Self::has_column(columns, "resume_input_id")
+            && Self::has_column(columns, "provider_session_capture_method")
     }
 
     fn promote_existing_dual_id_schema5_if_present(
         conn: &mut Connection,
         stored: i32,
     ) -> Result<i32, String> {
-        if Self::stored_schema_is_at_least_dual_id(stored) {
+        if stored >= 5 {
             return Ok(stored);
         }
         let columns = Self::invocations_columns(conn)?;
@@ -1446,10 +1401,6 @@ impl StateDb {
         }
         Self::promote_existing_dual_id_schema5(conn)?;
         Ok(5)
-    }
-
-    fn stored_schema_is_at_least_dual_id(stored: i32) -> bool {
-        stored >= 5
     }
 
     fn promote_existing_dual_id_schema5(conn: &mut Connection) -> Result<(), String> {
@@ -3092,9 +3043,7 @@ impl StateDb {
     }
 
     fn parse_returned_artifact_returned_at(raw: &str) -> Result<DateTime<Utc>, DbError> {
-        DateTime::parse_from_rfc3339(raw)
-            .map(|dt| dt.with_timezone(&Utc))
-            .map_err(|e| format!("Failed to parse returned artifact returned_at: {e}"))
+        Self::strict_rfc3339_message(raw, "returned artifact returned_at")
     }
 
     fn parse_returned_artifact_u64(value: i64, field: &str) -> Result<u64, DbError> {
