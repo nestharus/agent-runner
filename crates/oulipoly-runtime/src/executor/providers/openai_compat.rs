@@ -1,20 +1,34 @@
 use crate::executor::terminal_signal::{
     TERMINAL_SIGNAL_EVIDENCE_MAX_LEN, TerminalSignal, TerminalSignalEvidence, TerminalSignalKind,
-    TerminalSignalRecognizer, bounded_excerpt, post_quota_terminal_status,
-    pre_quota_terminal_status, terminal_signal,
+    TerminalSignalRecognizer, bounded_excerpt, post_quota_terminal_signal_kind,
+    pre_quota_terminal_signal_kind, terminal_signal, terminal_status_evidence,
 };
+
+// ## Declared roles
+// accessor, filter, formatter, mapper, orchestration, parser, predicate, validator
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Recognizer;
 
 impl TerminalSignalRecognizer for Recognizer {
     fn recognize(&self, evidence: &TerminalSignalEvidence<'_>) -> TerminalSignal {
-        if let Some((kind, signal_evidence)) = pre_quota_terminal_status(&evidence.terminal_status)
-        {
+        if let Some(kind) = pre_quota_terminal_signal_kind(&evidence.terminal_status) {
+            let signal_evidence = terminal_status_evidence(&evidence.terminal_status)
+                .unwrap_or_else(|| "unknown".to_string());
             return terminal_signal(evidence, kind, signal_evidence);
         }
 
-        if let Some(signal_evidence) = quota_exhaustion_excerpt(evidence) {
+        let stdout_text = lowercase_lossy(evidence.stdout);
+        let stderr_text = lowercase_lossy(evidence.stderr);
+        let quota_stream = find_quota_matching_stream(
+            evidence.stdout,
+            contains_quota_token(&stdout_text),
+            evidence.stderr,
+            contains_quota_token(&stderr_text),
+        );
+
+        if let Some(bytes) = quota_stream {
+            let signal_evidence = quota_evidence_excerpt(bytes);
             return terminal_signal(
                 evidence,
                 TerminalSignalKind::QuotaExhaustedInband,
@@ -22,8 +36,9 @@ impl TerminalSignalRecognizer for Recognizer {
             );
         }
 
-        if let Some((kind, signal_evidence)) = post_quota_terminal_status(&evidence.terminal_status)
-        {
+        if let Some(kind) = post_quota_terminal_signal_kind(&evidence.terminal_status) {
+            let signal_evidence = terminal_status_evidence(&evidence.terminal_status)
+                .unwrap_or_else(|| "unknown".to_string());
             return terminal_signal(evidence, kind, signal_evidence);
         }
 
@@ -31,16 +46,34 @@ impl TerminalSignalRecognizer for Recognizer {
     }
 }
 
-fn quota_exhaustion_excerpt(evidence: &TerminalSignalEvidence<'_>) -> Option<String> {
-    [evidence.stdout, evidence.stderr]
-        .into_iter()
-        .find(|bytes| matches_quota_fixture(bytes))
-        .map(|bytes| bounded_excerpt(bytes, TERMINAL_SIGNAL_EVIDENCE_MAX_LEN))
+fn find_quota_matching_stream<'a>(
+    stdout: &'a [u8],
+    stdout_matches: bool,
+    stderr: &'a [u8],
+    stderr_matches: bool,
+) -> Option<&'a [u8]> {
+    if stdout_matches {
+        return Some(stdout);
+    }
+
+    if stderr_matches {
+        return Some(stderr);
+    }
+
+    None
 }
 
-fn matches_quota_fixture(bytes: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(bytes).to_lowercase();
+fn quota_evidence_excerpt(bytes: &[u8]) -> String {
+    bounded_excerpt(bytes, TERMINAL_SIGNAL_EVIDENCE_MAX_LEN)
+}
 
+fn lowercase_lossy(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).to_lowercase()
+}
+
+/// See the `## Schema` section in [`crate::executor::terminal_signal`] for the
+/// canonical token vocabulary.
+fn contains_quota_token(text: &str) -> bool {
     text.contains("rate_limit_exceeded")
         || text.contains("429")
         || text.contains("too many requests")
