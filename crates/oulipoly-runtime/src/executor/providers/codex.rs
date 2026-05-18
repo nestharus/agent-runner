@@ -149,6 +149,7 @@ mod tests {
         b"OpenAI API returned HTTP 429: rate_limit_exceeded; reset_at=10:00"
     }
 
+    // T8 (per Step 6b output index AGE-139-T8)
     #[test]
     fn generic_clean_exit_maps_to_clean_exit_for_codex() {
         let signal = assert_kind(
@@ -158,6 +159,7 @@ mod tests {
         assert_eq!(signal.evidence, "exit_code=0");
     }
 
+    // T11 (per Step 6b output index AGE-139-T11)
     #[test]
     fn generic_nonzero_exit_maps_to_nonzero_exit_for_codex() {
         let signal = assert_kind(
@@ -167,6 +169,7 @@ mod tests {
         assert_eq!(signal.evidence, "exit_code=42");
     }
 
+    // T14 (per Step 6b output index AGE-139-T14)
     #[test]
     fn generic_signal_exit_maps_to_signal_exit_for_codex() {
         let signal = assert_kind(
@@ -180,6 +183,7 @@ mod tests {
         assert!(signal.evidence.contains("15"));
     }
 
+    // T17 (per Step 6b output index AGE-139-T17)
     #[test]
     fn generic_spawn_error_maps_to_spawn_error_for_codex() {
         let signal = assert_kind(
@@ -195,6 +199,7 @@ mod tests {
         assert!(signal.evidence.contains("codex executable not found"));
     }
 
+    // T20 (per Step 6b output index AGE-139-T20)
     #[test]
     fn generic_prolonged_silence_maps_to_prolonged_silence_for_codex() {
         let signal = assert_kind(
@@ -210,6 +215,7 @@ mod tests {
         assert!(signal.evidence.contains("no stdout/stderr for 600s"));
     }
 
+    // T23 (per Step 6b output index AGE-139-T23)
     #[test]
     fn codex_quota_fixtures_map_to_quota_exhausted_inband() {
         for (name, stdout, stderr) in [
@@ -245,6 +251,7 @@ mod tests {
         }
     }
 
+    // T26 (per Step 6b output index AGE-139-T26)
     #[test]
     fn codex_non_match_maps_to_unknown_without_panic() {
         for (name, stdout, stderr) in [
@@ -263,6 +270,7 @@ mod tests {
         }
     }
 
+    // T29 (per Step 6b output index AGE-139-T29)
     #[test]
     fn precedence_spawn_error_wins_over_quota_for_codex() {
         assert_kind(
@@ -277,6 +285,7 @@ mod tests {
         );
     }
 
+    // T32 (per Step 6b output index AGE-139-T32)
     #[test]
     fn precedence_prolonged_silence_wins_over_quota_for_codex() {
         assert_kind(
@@ -291,6 +300,7 @@ mod tests {
         );
     }
 
+    // T35 (per Step 6b output index AGE-139-T35)
     #[test]
     fn precedence_signal_exit_wins_over_quota_for_codex() {
         assert_kind(
@@ -303,6 +313,7 @@ mod tests {
         );
     }
 
+    // T38 (per Step 6b output index AGE-139-T38)
     #[test]
     fn precedence_quota_wins_over_clean_exit_for_codex() {
         assert_kind(
@@ -315,6 +326,7 @@ mod tests {
         );
     }
 
+    // T41 (per Step 6b output index AGE-139-T41)
     #[test]
     fn precedence_quota_wins_over_nonzero_exit_for_codex() {
         assert_kind(
@@ -327,6 +339,7 @@ mod tests {
         );
     }
 
+    // T44 (per Step 6b output index AGE-139-T44)
     #[test]
     fn malformed_non_utf8_stdout_does_not_panic_for_codex() {
         for (name, stdout, stderr) in [

@@ -145,6 +145,7 @@ mod tests {
         br#"{"error":{"type":"rate_limit_exceeded","message":"too many requests"}}"#
     }
 
+    // T9 (per Step 6b output index AGE-139-T9)
     #[test]
     fn generic_clean_exit_maps_to_clean_exit_for_openai_compat() {
         let signal = assert_kind(
@@ -154,6 +155,7 @@ mod tests {
         assert_eq!(signal.evidence, "exit_code=0");
     }
 
+    // T12 (per Step 6b output index AGE-139-T12)
     #[test]
     fn generic_nonzero_exit_maps_to_nonzero_exit_for_openai_compat() {
         let signal = assert_kind(
@@ -163,6 +165,7 @@ mod tests {
         assert_eq!(signal.evidence, "exit_code=42");
     }
 
+    // T15 (per Step 6b output index AGE-139-T15)
     #[test]
     fn generic_signal_exit_maps_to_signal_exit_for_openai_compat() {
         let signal = assert_kind(
@@ -176,6 +179,7 @@ mod tests {
         assert!(signal.evidence.contains("15"));
     }
 
+    // T18 (per Step 6b output index AGE-139-T18)
     #[test]
     fn generic_spawn_error_maps_to_spawn_error_for_openai_compat() {
         let signal = assert_kind(
@@ -191,6 +195,7 @@ mod tests {
         assert!(signal.evidence.contains("provider executable not found"));
     }
 
+    // T21 (per Step 6b output index AGE-139-T21)
     #[test]
     fn generic_prolonged_silence_maps_to_prolonged_silence_for_openai_compat() {
         let signal = assert_kind(
@@ -206,6 +211,7 @@ mod tests {
         assert!(signal.evidence.contains("no stdout/stderr for 600s"));
     }
 
+    // T24 (per Step 6b output index AGE-139-T24)
     #[test]
     fn openai_compat_quota_fixtures_map_to_quota_exhausted_inband() {
         for (name, stdout, stderr) in [
@@ -242,6 +248,7 @@ mod tests {
         }
     }
 
+    // T27 (per Step 6b output index AGE-139-T27)
     #[test]
     fn openai_compat_non_match_maps_to_unknown_without_panic() {
         for (name, stdout, stderr) in [
@@ -260,6 +267,7 @@ mod tests {
         }
     }
 
+    // T30 (per Step 6b output index AGE-139-T30)
     #[test]
     fn precedence_spawn_error_wins_over_quota_for_openai_compat() {
         assert_kind(
@@ -274,6 +282,7 @@ mod tests {
         );
     }
 
+    // T33 (per Step 6b output index AGE-139-T33)
     #[test]
     fn precedence_prolonged_silence_wins_over_quota_for_openai_compat() {
         assert_kind(
@@ -288,6 +297,7 @@ mod tests {
         );
     }
 
+    // T36 (per Step 6b output index AGE-139-T36)
     #[test]
     fn precedence_signal_exit_wins_over_quota_for_openai_compat() {
         assert_kind(
@@ -300,6 +310,7 @@ mod tests {
         );
     }
 
+    // T39 (per Step 6b output index AGE-139-T39)
     #[test]
     fn precedence_quota_wins_over_clean_exit_for_openai_compat() {
         assert_kind(
@@ -312,6 +323,7 @@ mod tests {
         );
     }
 
+    // T42 (per Step 6b output index AGE-139-T42)
     #[test]
     fn precedence_quota_wins_over_nonzero_exit_for_openai_compat() {
         assert_kind(
@@ -324,6 +336,7 @@ mod tests {
         );
     }
 
+    // T45 (per Step 6b output index AGE-139-T45)
     #[test]
     fn malformed_non_utf8_stdout_does_not_panic_for_openai_compat() {
         for (name, stdout, stderr) in [

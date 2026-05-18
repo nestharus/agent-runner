@@ -20,6 +20,8 @@ pub use self::providers::openai_compat::Recognizer as OpenAiCompatRecognizer;
 /// be a re-export at the executor facade level. Consumers reach the kind via
 /// `oulipoly_runtime::executor::terminal_signal::TerminalSignalKind`.
 ///
+/// T46-doctest cross-reference for Step 6b output index AGE-139 row 47.
+///
 /// ```compile_fail
 /// use oulipoly_runtime::executor::TerminalSignalKind;
 /// fn compile_fail_kind_not_in_facade() {
@@ -418,6 +420,7 @@ printf 'ok\n'"#,
         );
     }
 
+    // T46
     #[test]
     fn executor_facade_re_exports_terminal_signal_contract_without_kind_alias() {
         use crate as oulipoly_runtime;

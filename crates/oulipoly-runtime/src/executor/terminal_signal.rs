@@ -249,6 +249,7 @@ mod tests {
         assert!(debug_repr(&cloned).contains("provider"));
     }
 
+    // T1 (per Step 6b output index AGE-139-T1)
     #[test]
     fn dto_construction_round_trip_supports_derives_for_each_kind() {
         for kind in all_kinds() {
@@ -256,6 +257,7 @@ mod tests {
         }
     }
 
+    // T2 (per Step 6b output index AGE-139-T2)
     #[test]
     fn enum_vocabulary_coverage_has_all_terminal_signal_kinds() {
         let expected = [
@@ -276,6 +278,7 @@ mod tests {
         }
     }
 
+    // T3 (per Step 6b output index AGE-139-T3)
     #[test]
     fn evidence_dto_round_trip_supports_derives_for_all_status_variants() {
         assert_status_evidence_is_eq::<TerminalStatusEvidence>();
@@ -285,16 +288,19 @@ mod tests {
         }
     }
 
+    // T4 (per Step 6b output index AGE-139-T4)
     #[test]
     fn trait_object_polymorphism_matches_static_call_for_claude() {
         assert_dyn_matches_static("claude", providers::claude::Recognizer);
     }
 
+    // T5 (per Step 6b output index AGE-139-T5)
     #[test]
     fn trait_object_polymorphism_matches_static_call_for_codex() {
         assert_dyn_matches_static("codex", providers::codex::Recognizer);
     }
 
+    // T6 (per Step 6b output index AGE-139-T6)
     #[test]
     fn trait_object_polymorphism_matches_static_call_for_openai_compat() {
         assert_dyn_matches_static("gemini", providers::openai_compat::Recognizer);
