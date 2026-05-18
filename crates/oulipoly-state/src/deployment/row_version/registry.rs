@@ -1,5 +1,5 @@
 //! ## Declared roles
-//! accessor, mapper
+//! accessor, mapper, filter
 //!
 //! ## Intrinsic-surface declarations
 //! intrinsic_surface_declarations:
