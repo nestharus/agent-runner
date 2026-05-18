@@ -9,11 +9,13 @@
 //! - validator
 //! - predicate
 //! - mapper
+//! - filter
 //!
 //! Rationale: this module is the session-metadata adapter/resolver subsystem.
-//! It naturally mixes the seven A1 classifications because resume-time metadata
+//! It naturally mixes the eight A1 classifications because resume-time metadata
 //! reconstruction requires UUID parsing, formatting, lifecycle predicates,
-//! validation, mapping, and orchestration across cwd, locator, and test submodules.
+//! validation, mapping, recency filtering (`count_recent_previews`), and
+//! orchestration across cwd, locator, and test submodules.
 //!
 //! ## Intrinsic-surface declarations
 //! intrinsic_surface_declarations:
