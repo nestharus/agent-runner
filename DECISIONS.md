@@ -2780,3 +2780,23 @@ Ratification basis: the inherited bounded-silence supervisor + F1 process-group 
 Work-manager pre-authorization: caller's AGE-146 dispatch directive of 2026-05-18 authorized "Phase 4 risk gates LOW + bootstrap-exception ratification (narrow scope: bounded-silence + F1)" with anti-scope "NO residual acceptance on non-LOW gates (with bootstrap-exception still available for genuine intrinsic-lockstep findings)" and "NO precedent-citation as residual-acceptance basis". The R2 proposal asserts the four conditions hold on standalone evidence (not by citing AGE-141 R2 precedent); this ratification entry records the orchestrator's acknowledgement so the Phase 4 bootstrap-exception sub-gate's DECISIONS parser succeeds.
 
 This is NOT residual acceptance, NOT precedent citation, and does NOT authorize advance on residual Phase 4 findings outside the named lockstep paths. It does NOT extend authority into Phase 6 per-component code-quality, Phase 7 readiness, Phase 8 PR-review, or AGE-145's whole-file cleanup territory (23 FC findings, 3 oulipoly-config push-pull findings, cohesion `predicate` role-set expansion).
+
+## AGE-142 — D1 — Phase 2.5.4 drift disposition: adjacent README diagnostics drift, proceed with current scope
+
+**Phase**: Phase 2.5 step 2.5.4 (Duplicates inventory).
+
+**Finding**: The duplicates researcher recorded a drift signal — `crates/oulipoly-runtime/README.md` diagnostics section is stale relative to current code/DECISIONS. The researcher's own adjacency assessment notes: "The divergence is adjacent to AGE-142 because AGE-142 will discuss stdout/stderr provider-output evidence and network-error boundaries; it does not appear to invalidate the AGE-139 `TerminalSignalKind` set itself." No drift was found between the AGE-139 `TerminalSignal` DTO and `conventions/terminal-signal-provider-vocabulary.md` (the two canonical surfaces this eval references).
+
+**Decision**: **Proceed with current scope. Note in DECISIONS.md (this entry). Do NOT expand AGE-142 scope to consolidate the README drift, do NOT file a new tracker ticket from inside this WU.**
+
+**Why this disposition rather than block-on-consolidation or expand-scope**:
+
+1. The dispatch brief's anti-scope explicitly forbids source-code / non-eval modifications: "NO source code modifications (Rust files)" and the touched-file footprint is enumerated as NEW: `evals/agent-runner-provider-termination/eval.md` + (if needed) `evals/agent-runner-provider-termination/fixtures/`. The runtime README is not in the touched surface.
+2. The drift is documentation-on-runtime, not duplicate eval/contract that AGE-142 would re-author. The AGE-139 canonical surfaces (`TerminalSignal` DTO + `conventions/terminal-signal-provider-vocabulary.md`) are current and the eval references them directly, so this WU is not propagating drift forward.
+3. The dispatch brief's autopilot signals (`auto_merge_after_phase_9=true`, `skip_problem_map_gate=true`, `PROCEED_WITHOUT_BASELINE`, `PROCEED_EXHAUSTIVE`) indicate the user intends terminal-state-on-success without further consolidation gates for this WU.
+
+**Conditions to revisit**: if the AGE-142 eval as authored ends up needing to cite the runtime README as a source of truth, this DECISIONS entry must be re-evaluated and the README drift must be resolved as part of the consolidation — that would be a Tier-2 split, not a residual.
+
+**Evidence**: `/home/nes/projects/agent-runner/planning/age-142-provider-termination-eval/research/age-142-duplicates.md` § Drift Discovery (line 118+); `/home/nes/projects/agent-runner/planning/age-142-provider-termination-eval/research/age-142-problem-map.md` (touched-surface enumeration); `/home/nes/projects/agent-runner/planning/age-142-provider-termination-eval/.scratch/ticket.md` (anti-scope).
+
+**Resume point**: Phase 2.5 step 2.5.6 (risk profile).

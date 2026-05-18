@@ -1,0 +1,1 @@
+OpenAI API returned HTTP 429: rate_limit_exceeded; reset_at=10:00
