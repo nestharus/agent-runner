@@ -1,3 +1,31 @@
+//! ## Declared roles
+//! orchestration, accessor, mapper, filter, predicate, validator
+//!
+//! ## Intrinsic-surface declarations
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/tests/age_61_row_version_migration_idempotent.rs
+//!     role: intrinsic-surface
+//!     Domain: state-db-row-version-idempotence-test-domain
+//!     Owns:
+//!       - representative seed query pair for invocations
+//!       - representative seed query pair for providers
+//!       - representative seed query pair for provider_quotas
+//!       - representative seed query pair for provider_quota_windows
+//!       - representative seed query pair for memory_nodes
+//!       - representative seed query pair for memory_edges
+//!       - representative seed query pair for setup_sessions
+//!       - representative seed query pair for setup_turns
+//!       - representative seed query pair for cli_providers
+//!       - representative seed query pair for accounts
+//!       - representative seed query pair for discovered_models
+//!       - representative seed query pair for model_parameters
+//!       - representative seed query pair for session_turns
+//!       - representative seed query pair for session_chains
+//!       - representative seed query pair for session_chain_segments
+//!       - representative seed query pair for invocation_returned_artifacts
+//!       - oulipoly_state row-version payload_hash_for_columns API
+//!       - oulipoly_state migrations plan and run_with_db_path APIs
+
 mod fixtures;
 
 use fixtures::schema5_invocations::build_schema5_invocation_fixture;
@@ -114,6 +142,25 @@ struct TableSeedSnapshot {
 }
 
 fn capture_representative_seed(conn: &Connection) -> Vec<TableSeedSnapshot> {
+    representative_seed_queries()
+        .into_iter()
+        .map(|(table, sql)| table_seed_snapshot(conn, table, sql))
+        .collect()
+}
+
+fn table_seed_snapshot(
+    conn: &Connection,
+    table: &'static str,
+    sql: &'static str,
+) -> TableSeedSnapshot {
+    TableSeedSnapshot {
+        table,
+        row_count: count_rows(conn, table),
+        payload_hash: payload_hash_for_values(&payload_values_for_query(conn, sql)),
+    }
+}
+
+fn representative_seed_queries() -> [(&'static str, &'static str); 16] {
     [
         (
             "invocations",
@@ -208,22 +255,19 @@ fn capture_representative_seed(conn: &Connection) -> Vec<TableSeedSnapshot> {
              FROM invocation_returned_artifacts WHERE version_id = 'artifact-version-1'",
         ),
     ]
-    .into_iter()
-    .map(|(table, sql)| TableSeedSnapshot {
-        table,
-        row_count: count_rows(conn, table),
-        payload_hash: payload_hash_for_query(conn, sql),
-    })
-    .collect()
 }
 
-fn payload_hash_for_query(conn: &Connection, sql: &str) -> [u8; 32] {
+fn payload_values_for_query(conn: &Connection, sql: &str) -> Vec<Option<Value>> {
     let mut stmt = conn.prepare(sql).unwrap();
-    stmt.query_row([], |row| {
-        let values = (0..row.as_ref().column_count())
-            .map(|idx| row.get::<_, Value>(idx).map(Some))
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(payload_hash_for_columns(&values))
-    })
-    .unwrap()
+    stmt.query_row([], query_row_values).unwrap()
+}
+
+fn query_row_values(row: &rusqlite::Row<'_>) -> rusqlite::Result<Vec<Option<Value>>> {
+    (0..row.as_ref().column_count())
+        .map(|idx| row.get::<_, Value>(idx).map(Some))
+        .collect()
+}
+
+fn payload_hash_for_values(values: &[Option<Value>]) -> [u8; 32] {
+    payload_hash_for_columns(values)
 }

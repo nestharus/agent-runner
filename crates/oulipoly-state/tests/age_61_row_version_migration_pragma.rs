@@ -1,3 +1,32 @@
+//! ## Declared roles
+//! orchestration, accessor, mapper, filter, predicate, validator, formatter
+//!
+//! ## Intrinsic-surface declarations
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/tests/age_61_row_version_migration_pragma.rs
+//!     role: intrinsic-surface
+//!     Domain: state-db-row-version-pragma-test-domain
+//!     Owns:
+//!       - TRACKED_TABLES invocations table name
+//!       - TRACKED_TABLES providers table name
+//!       - TRACKED_TABLES provider_quotas table name
+//!       - TRACKED_TABLES provider_quota_windows table name
+//!       - TRACKED_TABLES memory_nodes table name
+//!       - TRACKED_TABLES memory_edges table name
+//!       - TRACKED_TABLES setup_sessions table name
+//!       - TRACKED_TABLES setup_turns table name
+//!       - TRACKED_TABLES cli_providers table name
+//!       - TRACKED_TABLES accounts table name
+//!       - TRACKED_TABLES discovered_models table name
+//!       - TRACKED_TABLES model_parameters table name
+//!       - TRACKED_TABLES session_turns table name
+//!       - TRACKED_TABLES session_chains table name
+//!       - TRACKED_TABLES session_chain_segments table name
+//!       - TRACKED_TABLES invocation_returned_artifacts table name
+//!       - oulipoly_state row-version REGISTRY symbol and registry::lookup API
+//!       - TableRegistration table, primary_key_columns, payload_columns, and kind fields
+//!       - RowKind::Mutable registry row-kind contract
+
 mod fixtures;
 
 use fixtures::{table_names, user_version};
@@ -121,63 +150,87 @@ fn registry_payload_columns_match_migrated_table_info_for_every_entry() {
     let conn = migrate_schema5_to_schema6(&db_path);
 
     for registration in REGISTRY {
-        let columns = table_info(&conn, registration.table);
-        let column_names = columns
-            .iter()
-            .map(|column| column.name.as_str())
-            .collect::<BTreeSet<_>>();
-        let primary_keys = columns
-            .iter()
-            .filter(|column| column.pk > 0)
-            .map(|column| column.name.as_str())
-            .collect::<BTreeSet<_>>();
-        let payload_columns = columns
-            .iter()
-            .filter(|column| {
-                column.name != "row_version"
-                    && !registration
-                        .primary_key_columns
-                        .contains(&column.name.as_str())
-            })
-            .map(|column| column.name.as_str())
-            .collect::<BTreeSet<_>>();
-        let registered_pk = registration
-            .primary_key_columns
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>();
-        let registered_payload = registration
-            .payload_columns
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>();
+        assert_registration_matches_table_info(&conn, registration);
+    }
+}
 
-        assert_eq!(
-            primary_keys, registered_pk,
-            "registry primary keys disagree with PRAGMA table_info for {}",
-            registration.table
-        );
-        assert_eq!(
-            payload_columns, registered_payload,
-            "registry payload columns disagree with PRAGMA table_info for {}",
-            registration.table
-        );
-        assert!(
-            !registered_payload.contains("row_version"),
-            "registry payload_columns must exclude row_version for {}",
-            registration.table
-        );
-        for column in registration
+fn assert_registration_matches_table_info(conn: &Connection, registration: &TableRegistration) {
+    let columns = table_info(conn, registration.table);
+    let column_names = column_name_set(&columns);
+    let primary_keys = column_ref_name_set(&primary_key_columns(&columns));
+    let payload_columns = column_ref_name_set(&payload_columns(&columns, registration));
+    let registered_pk = registered_primary_key_set(registration);
+    let registered_payload = registered_payload_set(registration);
+
+    assert_eq!(
+        primary_keys, registered_pk,
+        "registry primary keys disagree with PRAGMA table_info for {}",
+        registration.table
+    );
+    assert_eq!(
+        payload_columns, registered_payload,
+        "registry payload columns disagree with PRAGMA table_info for {}",
+        registration.table
+    );
+    assert!(
+        !registered_payload.contains("row_version"),
+        "registry payload_columns must exclude row_version for {}",
+        registration.table
+    );
+    assert_registered_columns_exist(registration, &column_names);
+}
+
+fn column_name_set(columns: &[ColumnInfo]) -> BTreeSet<&str> {
+    columns.iter().map(|column| column.name.as_str()).collect()
+}
+
+fn column_ref_name_set<'a>(columns: &[&'a ColumnInfo]) -> BTreeSet<&'a str> {
+    columns.iter().map(|column| column.name.as_str()).collect()
+}
+
+fn primary_key_columns(columns: &[ColumnInfo]) -> Vec<&ColumnInfo> {
+    columns.iter().filter(|column| column.pk > 0).collect()
+}
+
+fn payload_columns<'a>(
+    columns: &'a [ColumnInfo],
+    registration: &TableRegistration,
+) -> Vec<&'a ColumnInfo> {
+    columns
+        .iter()
+        .filter(|column| is_payload_column(column, registration))
+        .collect()
+}
+
+fn is_payload_column(column: &ColumnInfo, registration: &TableRegistration) -> bool {
+    column.name != "row_version"
+        && !registration
             .primary_key_columns
-            .iter()
-            .chain(registration.payload_columns.iter())
-        {
-            assert!(
-                column_names.contains(column),
-                "registry column {column} missing from migrated table {}",
-                registration.table
-            );
-        }
+            .contains(&column.name.as_str())
+}
+
+fn registered_primary_key_set(registration: &TableRegistration) -> BTreeSet<&str> {
+    registration.primary_key_columns.iter().copied().collect()
+}
+
+fn registered_payload_set(registration: &TableRegistration) -> BTreeSet<&str> {
+    registration.payload_columns.iter().copied().collect()
+}
+
+fn assert_registered_columns_exist(
+    registration: &TableRegistration,
+    column_names: &BTreeSet<&str>,
+) {
+    for column in registration
+        .primary_key_columns
+        .iter()
+        .chain(registration.payload_columns.iter())
+    {
+        assert!(
+            column_names.contains(column),
+            "registry column {column} missing from migrated table {}",
+            registration.table
+        );
     }
 }
 
@@ -234,20 +287,30 @@ struct ColumnInfo {
 }
 
 fn table_info(conn: &Connection, table: &str) -> Vec<ColumnInfo> {
-    conn.prepare(&format!("PRAGMA table_info({table})"))
+    query_table_info(conn, &table_info_sql(table))
+}
+
+fn table_info_sql(table: &str) -> String {
+    format!("PRAGMA table_info({table})")
+}
+
+fn query_table_info(conn: &Connection, sql: &str) -> Vec<ColumnInfo> {
+    conn.prepare(sql)
         .unwrap()
-        .query_map([], |row| {
-            Ok(ColumnInfo {
-                name: row.get(1)?,
-                ty: row.get(2)?,
-                notnull: row.get(3)?,
-                dflt_value: row.get(4)?,
-                pk: row.get(5)?,
-            })
-        })
+        .query_map([], column_info)
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap()
+}
+
+fn column_info(row: &rusqlite::Row<'_>) -> rusqlite::Result<ColumnInfo> {
+    Ok(ColumnInfo {
+        name: row.get(1)?,
+        ty: row.get(2)?,
+        notnull: row.get(3)?,
+        dflt_value: row.get(4)?,
+        pk: row.get(5)?,
+    })
 }
 
 fn index_names(conn: &Connection) -> BTreeSet<String> {

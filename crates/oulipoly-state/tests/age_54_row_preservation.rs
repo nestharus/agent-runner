@@ -1,3 +1,20 @@
+//! ## Declared roles
+//! orchestration, accessor, mapper, parser, filter, predicate, validator, formatter
+//!
+//! ## Intrinsic-surface declarations
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/tests/age_54_row_preservation.rs
+//!     role: intrinsic-surface
+//!     Domain: state-db-invocation-row-preservation-test-domain
+//!     Owns:
+//!       - fixtures::schema4_invocations schema-4 invocation constants and fixture builder
+//!       - fixtures::schema5_invocations schema-5 invocation fixture builder
+//!       - fixtures::invocation_shapes modern, partial-modern, and unknown-shape fixtures
+//!       - fixtures::schema5_drift schema-5 drift fixture builders
+//!       - fixtures count_rows, schema_fingerprint, user_version helpers
+//!       - oulipoly_state::StateDb open and connection APIs
+//!       - oulipoly_state::CURRENT_SCHEMA_VERSION
+
 mod fixtures;
 
 use fixtures::invocation_shapes::{
@@ -361,9 +378,13 @@ struct InvocationSnapshot {
 
 fn invocation_snapshot(path: &Path) -> InvocationSnapshot {
     let conn = Connection::open(path).unwrap();
+    invocation_snapshot_from_conn(path, &conn)
+}
+
+fn invocation_snapshot_from_conn(path: &Path, conn: &Connection) -> InvocationSnapshot {
     InvocationSnapshot {
-        user_version: user_version(&conn),
-        row_count: count_rows(&conn, "invocations"),
+        user_version: user_version(conn),
+        row_count: count_rows(conn, "invocations"),
         uuids: invocation_uuids(path),
         parent_links: parent_links(path),
     }
@@ -375,10 +396,23 @@ fn raw_invocation_count(path: &Path) -> i64 {
 }
 
 fn invocation_uuids(path: &Path) -> Vec<String> {
-    let conn = Connection::open(path).unwrap();
-    if !table_columns(path, "invocations").contains(&"invocation_uuid".to_string()) {
+    let columns = table_columns(path, "invocations");
+    invocation_uuids_for_columns(path, &columns)
+}
+
+fn invocation_uuids_for_columns(path: &Path, columns: &[String]) -> Vec<String> {
+    if !has_invocation_uuid_column(columns) {
         return Vec::new();
     }
+    select_invocation_uuids(path)
+}
+
+fn has_invocation_uuid_column(columns: &[String]) -> bool {
+    columns.iter().any(|column| column == "invocation_uuid")
+}
+
+fn select_invocation_uuids(path: &Path) -> Vec<String> {
+    let conn = Connection::open(path).unwrap();
     conn.prepare("SELECT invocation_uuid FROM invocations ORDER BY id")
         .unwrap()
         .query_map([], |row| row.get::<_, String>(0))
@@ -389,24 +423,32 @@ fn invocation_uuids(path: &Path) -> Vec<String> {
 
 fn parent_links(path: &Path) -> Vec<(String, Option<String>)> {
     let conn = Connection::open(path).unwrap();
-    conn.prepare(
-        "SELECT child.invocation_uuid, parent.invocation_uuid
+    conn.prepare(parent_links_sql())
+        .unwrap()
+        .query_map([], parent_link_row)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+fn parent_links_sql() -> &'static str {
+    "SELECT child.invocation_uuid, parent.invocation_uuid
          FROM invocations child
          LEFT JOIN invocations parent ON parent.id = child.parent_invocation_id
-         ORDER BY child.id",
-    )
-    .unwrap()
-    .query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-    })
-    .unwrap()
-    .collect::<Result<Vec<_>, _>>()
-    .unwrap()
+         ORDER BY child.id"
+}
+
+fn parent_link_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(String, Option<String>)> {
+    Ok((row.get(0)?, row.get(1)?))
 }
 
 fn table_columns(path: &Path, table: &str) -> Vec<String> {
     let conn = Connection::open(path).unwrap();
-    conn.prepare(&format!("PRAGMA table_info({table})"))
+    query_table_columns(&conn, &table_info_sql(table))
+}
+
+fn query_table_columns(conn: &Connection, sql: &str) -> Vec<String> {
+    conn.prepare(sql)
         .unwrap()
         .query_map([], |row| row.get::<_, String>(1))
         .unwrap()
@@ -414,19 +456,32 @@ fn table_columns(path: &Path, table: &str) -> Vec<String> {
         .unwrap()
 }
 
+fn table_info_sql(table: &str) -> String {
+    format!("PRAGMA table_info({table})")
+}
+
 fn assert_provider_session_index_exists(path: &Path) {
+    let indexes = invocation_index_names(path);
+    assert_contains_provider_session_index(&indexes);
+}
+
+fn invocation_index_names(path: &Path) -> Vec<String> {
     let conn = Connection::open(path).unwrap();
-    let indexes: Vec<String> = conn
-        .prepare(
-            "SELECT name FROM sqlite_schema
-             WHERE type = 'index' AND tbl_name = 'invocations'
-             ORDER BY name",
-        )
+    conn.prepare(invocation_index_names_sql())
         .unwrap()
         .query_map([], |row| row.get::<_, String>(0))
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
-        .unwrap();
+        .unwrap()
+}
+
+fn invocation_index_names_sql() -> &'static str {
+    "SELECT name FROM sqlite_schema
+             WHERE type = 'index' AND tbl_name = 'invocations'
+             ORDER BY name"
+}
+
+fn assert_contains_provider_session_index(indexes: &[String]) {
     assert!(
         indexes.contains(&"idx_invocations_provider_provider_session".to_string()),
         "provider-session index missing: {indexes:?}"
@@ -434,36 +489,46 @@ fn assert_provider_session_index_exists(path: &Path) {
 }
 
 fn assert_dual_id_backfill_matrix(path: &Path) {
-    type DualIdBackfillRow = (
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
+    assert_eq!(
+        actual_dual_id_backfill_rows(path),
+        expected_dual_id_backfill_rows()
     );
+}
 
+type DualIdBackfillRow = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+fn actual_dual_id_backfill_rows(path: &Path) -> Vec<DualIdBackfillRow> {
     let conn = Connection::open(path).unwrap();
-    let actual: Vec<DualIdBackfillRow> = conn
-        .prepare(
-            "SELECT invocation_uuid, session_id, provider_session_id, resume_input_id,
+    conn.prepare(
+        "SELECT invocation_uuid, session_id, provider_session_id, resume_input_id,
                     provider_session_capture_method
              FROM invocations ORDER BY id",
-        )
-        .unwrap()
-        .query_map([], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-            ))
-        })
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
+    )
+    .unwrap()
+    .query_map([], dual_id_backfill_row)
+    .unwrap()
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap()
+}
 
-    let expected = vec![
+fn dual_id_backfill_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DualIdBackfillRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+    ))
+}
+
+fn expected_dual_id_backfill_rows() -> Vec<DualIdBackfillRow> {
+    vec![
         (
             SCHEMA4_ROOT_UUID.to_string(),
             Some(PROVIDER_SESSION_A.to_string()),
@@ -520,21 +585,33 @@ fn assert_dual_id_backfill_matrix(path: &Path) {
             None,
             Some("stdout".to_string()),
         ),
-    ];
-    assert_eq!(actual, expected);
+    ]
 }
 
 fn extract_function_body<'a>(source: &'a str, name: &str) -> &'a str {
+    let span = function_source_span(source, name);
+    &source[span]
+}
+
+fn function_source_span(source: &str, name: &str) -> std::ops::Range<usize> {
+    let start = function_start(source, name);
+    let end = function_end(source, start, name);
+    start..end
+}
+
+fn function_start(source: &str, name: &str) -> usize {
     let signature = format!("fn {name}");
-    let start = source.find(&signature).unwrap_or_else(|| {
+    source.find(&signature).unwrap_or_else(|| {
         panic!("missing function {name}");
-    });
+    })
+}
+
+fn function_end(source: &str, start: usize, name: &str) -> usize {
     let end_marker = "\n    /// Resolve `(model_name, provider_index) -> provider_name`";
-    let end = source[start..]
+    source[start..]
         .find(end_marker)
         .map(|offset| start + offset)
-        .unwrap_or_else(|| panic!("missing end marker after function {name}"));
-    &source[start..end]
+        .unwrap_or_else(|| panic!("missing end marker after function {name}"))
 }
 
 fn build_exact_legacy_pre_uuid_shape(path: &Path) {
