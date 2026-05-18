@@ -1,3 +1,26 @@
+//! Oulipoly state-DB module.
+//!
+//! ## Declared roles
+//!
+//! - accessor
+//! - mapper
+//! - validator
+//! - parser
+//! - formatter
+//! - predicate
+//! - filter
+//! - orchestration
+//!
+//! Rationale: this file is the SQL-backed persistence adapter for the Oulipoly
+//! state subsystem. It naturally mixes the eight A1 classifications because a
+//! single-file state-DB layer encapsulates queries (accessor), row<->record
+//! translation (mapper + parser + formatter), schema/integrity checks
+//! (validator + predicate), ranking/filtering selectors (filter), and
+//! transaction/lifecycle sequencing (orchestration). Component-level
+//! responsibilities are declared in
+//! `planning/age-132-db-rs-whole-file-cleanup/proposals/age-132-AGE-132.md`
+//! under `## Adapter declarations` and `## Intrinsic-surface declarations`.
+
 use crate::migrations;
 use crate::schema::{
     CURRENT_SCHEMA_VERSION, MINIMUM_SUPPORTED_SCHEMA_VERSION, SchemaCompatibility,
@@ -64,33 +87,74 @@ pub enum ReadOnlyOpenError {
     Operational { message: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidecarKind {
+    Wal,
+    Shm,
+    Unknown,
+}
+
 fn classify_read_only_open_error(path: &Path, err: rusqlite::Error) -> ReadOnlyOpenError {
     let message = err.to_string();
-    match &err {
-        rusqlite::Error::SqliteFailure(error, _) => match error.code {
-            ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt => {
-                ReadOnlyOpenError::NotADatabase {
-                    path: path.to_path_buf(),
-                    message,
-                }
-            }
-            ErrorCode::PermissionDenied => ReadOnlyOpenError::PermissionDenied {
-                path: path.to_path_buf(),
-            },
-            ErrorCode::SystemIoFailure
-                if message.contains("-wal")
-                    || message.contains("-shm")
-                    || message.to_ascii_lowercase().contains("wal")
-                    || message.to_ascii_lowercase().contains("shared memory") =>
-            {
-                ReadOnlyOpenError::WalSidecarError {
-                    path: path.to_path_buf(),
-                    message,
-                }
-            }
-            _ => ReadOnlyOpenError::Operational { message },
-        },
-        _ => ReadOnlyOpenError::Operational { message },
+    if let Some(classified) = sqlite_failure_read_only_error(path, &err, &message) {
+        return classified;
+    }
+    ReadOnlyOpenError::Operational { message }
+}
+
+fn sqlite_failure_read_only_error(
+    path: &Path,
+    err: &rusqlite::Error,
+    message: &str,
+) -> Option<ReadOnlyOpenError> {
+    let rusqlite::Error::SqliteFailure(error, _) = err else {
+        return None;
+    };
+    match error.code {
+        ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt => Some(read_only_not_database(
+            path.to_path_buf(),
+            message.to_string(),
+        )),
+        ErrorCode::PermissionDenied => Some(read_only_permission_denied(path.to_path_buf())),
+        ErrorCode::SystemIoFailure if classify_sidecar_io_failure(message).is_known_sidecar() => {
+            Some(read_only_wal_sidecar_error(
+                path.to_path_buf(),
+                message.to_string(),
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn read_only_not_database(path: PathBuf, message: String) -> ReadOnlyOpenError {
+    ReadOnlyOpenError::NotADatabase { path, message }
+}
+
+fn read_only_permission_denied(path: PathBuf) -> ReadOnlyOpenError {
+    ReadOnlyOpenError::PermissionDenied { path }
+}
+
+fn read_only_wal_sidecar_error(path: PathBuf, message: String) -> ReadOnlyOpenError {
+    ReadOnlyOpenError::WalSidecarError { path, message }
+}
+
+impl SidecarKind {
+    fn is_known_sidecar(self) -> bool {
+        matches!(self, SidecarKind::Wal | SidecarKind::Shm)
+    }
+}
+
+/// Classifies the owned SQLite sidecar diagnostic grammar used by the
+/// read-only opener adapter. The accepted tokens are the sidecar layout
+/// vocabulary: `-wal`, `wal`, `-shm`, and `shared memory`.
+fn classify_sidecar_io_failure(message: &str) -> SidecarKind {
+    let lowercase = message.to_ascii_lowercase();
+    if message.contains("-wal") || lowercase.contains("wal") {
+        SidecarKind::Wal
+    } else if message.contains("-shm") || lowercase.contains("shared memory") {
+        SidecarKind::Shm
+    } else {
+        SidecarKind::Unknown
     }
 }
 
@@ -242,16 +306,28 @@ fn returned_source_kind(source: &oulipoly_agent_messenger::ReturnedArtifactSourc
 }
 
 fn returned_artifact_producer_uuid(workflow_run_id: &str) -> rusqlite::Result<Uuid> {
-    let uuid_text = workflow_run_id.strip_prefix("return:").ok_or_else(|| {
-        rusqlite::Error::FromSqlConversionFailure(
-            2,
-            rusqlite::types::Type::Text,
-            Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "returned artifact workflow_run_id is not in return namespace",
-            )),
-        )
-    })?;
+    let uuid_text = returned_artifact_workflow_uuid_text(workflow_run_id)?;
+    parse_returned_artifact_uuid(uuid_text)
+}
+
+fn returned_artifact_workflow_uuid_text(workflow_run_id: &str) -> rusqlite::Result<&str> {
+    workflow_run_id
+        .strip_prefix("return:")
+        .ok_or_else(returned_artifact_workflow_namespace_error)
+}
+
+fn returned_artifact_workflow_namespace_error() -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        2,
+        rusqlite::types::Type::Text,
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "returned artifact workflow_run_id is not in return namespace",
+        )),
+    )
+}
+
+fn parse_returned_artifact_uuid(uuid_text: &str) -> rusqlite::Result<Uuid> {
     Uuid::parse_str(uuid_text).map_err(|err| {
         rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(err))
     })
@@ -274,8 +350,24 @@ fn returned_artifact_version_id(
 }
 
 fn returned_artifact_sql_integer(value: u64, field: &str) -> Result<i64, DbError> {
-    i64::try_from(value)
-        .map_err(|_| format!("Returned artifact {field} exceeds SQLite INTEGER range: {value}"))
+    validate_returned_artifact_sql_integer(value, field)?;
+    Ok(map_returned_artifact_sql_integer(value))
+}
+
+fn validate_returned_artifact_sql_integer(value: u64, field: &str) -> Result<(), DbError> {
+    if value > i64::MAX as u64 {
+        Err(returned_artifact_sql_integer_overflow(field, value))
+    } else {
+        Ok(())
+    }
+}
+
+fn map_returned_artifact_sql_integer(value: u64) -> i64 {
+    value as i64
+}
+
+fn returned_artifact_sql_integer_overflow(field: &str, value: u64) -> DbError {
+    format!("Returned artifact {field} exceeds SQLite INTEGER range: {value}")
 }
 
 #[derive(Debug, Clone)]
@@ -462,11 +554,15 @@ impl CompositeInvocationId {
 
     /// Parse from a raw env-var value and validate the UUID payload.
     pub fn parse_env_value(s: &str) -> Result<Self, String> {
-        let parsed: CompositeInvocationId = serde_json::from_str(s)
-            .or_else(|json_err| Self::parse_shell_mangled_env_value(s).ok_or(json_err))
-            .map_err(|e| format!("Invalid invocation JSON: {e}"))?;
-        Uuid::parse_str(&parsed.id).map_err(|e| format!("Invalid invocation UUID: {e}"))?;
+        let parsed =
+            Self::parse_marker_payload(s).map_err(|e| format!("Invalid invocation JSON: {e}"))?;
+        validate_marker_uuid(&parsed.id).map_err(|e| format!("Invalid invocation UUID: {e}"))?;
         Ok(parsed)
+    }
+
+    fn parse_marker_payload(s: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(s)
+            .or_else(|json_err| Self::parse_shell_mangled_env_value(s).ok_or(json_err))
     }
 
     fn parse_shell_mangled_env_value(s: &str) -> Option<Self> {
@@ -491,6 +587,10 @@ impl CompositeInvocationId {
             id: id?,
         })
     }
+}
+
+fn validate_marker_uuid(id: &str) -> Result<(), uuid::Error> {
+    Uuid::parse_str(id).map(|_| ())
 }
 
 #[derive(Debug, Clone)]
@@ -531,6 +631,182 @@ struct WrongIdKindInvocationMatch {
     provider_name: Option<String>,
     provider_session_id: Option<String>,
     chain_id: Option<String>,
+}
+
+struct WrongIdKindInvocationRow {
+    invocation_uuid: String,
+    provider_name: Option<String>,
+    provider_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderSessionProjection {
+    DualId,
+    LegacySessionId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvocationDualIdProjection {
+    Current,
+    Legacy,
+}
+
+impl InvocationDualIdProjection {
+    fn select_columns(&self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            InvocationDualIdProjection::Current => (
+                "provider_session_id",
+                "resume_input_id",
+                "provider_session_capture_method",
+            ),
+            InvocationDualIdProjection::Legacy => (
+                "NULL AS provider_session_id",
+                "NULL AS resume_input_id",
+                "NULL AS provider_session_capture_method",
+            ),
+        }
+    }
+}
+
+struct FinalizeInvocationRow {
+    invocation_uuid: String,
+    model_name: String,
+    provider_name: Option<String>,
+    status: String,
+}
+
+enum InvocationsSchemaShape {
+    Empty,
+    Current,
+    LegacyPreUuid,
+    UnrecognizedPreUuid(Vec<String>),
+}
+
+enum ProvidersSchemaShape {
+    Empty,
+    Current,
+    LegacyIndexKeyed,
+    Unexpected(String),
+}
+
+struct ColumnRepair {
+    column_name: &'static str,
+    sql: &'static str,
+    error_context: &'static str,
+}
+
+struct DropColumnRepair {
+    column_name: &'static str,
+    sql: &'static str,
+    error_context: &'static str,
+}
+
+struct LegacyInvocationRow {
+    model_name: String,
+    provider_index: i64,
+    success: i64,
+    exit_code: i64,
+    error_category: Option<String>,
+    created_at: String,
+}
+
+struct LegacyInvocationInsert {
+    invocation_uuid: String,
+    model_name: String,
+    provider_name: Option<String>,
+    provider_index: i64,
+    status: InvocationStatus,
+    success: i64,
+    exit_code: i64,
+    error_category: Option<String>,
+    created_at: String,
+}
+
+struct InvocationIdentity {
+    row_id: i64,
+    uuid: Uuid,
+}
+
+struct ReturnedArtifactRawRow {
+    version_id: String,
+    name: String,
+    workflow_run_id: String,
+    artifact_name: String,
+    version: i64,
+    sha256: String,
+    content_len: i64,
+    format_hint: Option<String>,
+    verdict_line: Option<String>,
+    source_json: String,
+    returned_at_text: String,
+}
+
+struct SessionCaptureProjection<'a> {
+    provider_session_id: Option<&'a str>,
+    resume_input_id: Option<&'a str>,
+    provider_session_capture_method: Option<&'a str>,
+}
+
+struct QuotaAggregateProjection {
+    legacy_used: f64,
+    legacy_resets: Option<String>,
+    topology_peak_live_window_count: i64,
+}
+
+struct QuotaWindowDelta {
+    last_delta_percent: Option<f64>,
+    last_delta_calls: Option<u64>,
+}
+
+struct ModelParameterJson {
+    param_type_json: String,
+    cli_mapping_json: String,
+}
+
+struct SessionTurnBindValues<'a> {
+    session_id: &'a str,
+    turn_id: &'a str,
+    timestamp: String,
+    role: &'a str,
+    parent_turn_id: Option<&'a str>,
+    is_sidechain: i64,
+    is_compaction_boundary: i64,
+    body: Option<&'a str>,
+}
+
+struct InvocationChainMintRow {
+    model_name: String,
+    provider_name: String,
+    session_id: String,
+    raw_ts: String,
+}
+
+struct ModelParameterRawRow {
+    name: String,
+    display_name: String,
+    param_type: String,
+    description: String,
+    cli_mapping: String,
+}
+
+#[derive(Debug)]
+struct SessionChainBackfillRow {
+    provider: String,
+    session: String,
+    started_at: String,
+    last_used_at: String,
+    last_turn_id: String,
+}
+
+struct ResumeChainCandidate {
+    chain_id: String,
+    last_used_at: DateTime<Utc>,
+    latest_segment_started_at: DateTime<Utc>,
+}
+
+struct InvocationWindowTurnRow {
+    session_id: String,
+    timestamp_raw: String,
 }
 
 // --- Model discovery entities ---
@@ -660,84 +936,12 @@ pub struct AccountRecord {
 
 impl StateDb {
     pub fn open(path: &Path) -> Result<Self, String> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create state directory: {e}"))?;
-        }
-
+        Self::ensure_state_parent_dir(path)?;
         let mut conn =
             Connection::open(path).map_err(|e| format!("Failed to open state DB: {e}"))?;
 
-        let compatibility = migrations::classify(&conn)?;
-        let ran_open_migrations = matches!(
-            compatibility,
-            SchemaCompatibility::Fresh
-                | SchemaCompatibility::Migratable { .. }
-                | SchemaCompatibility::LegacyVersionless
-        );
-        match compatibility {
-            SchemaCompatibility::Fresh => {
-                Self::set_wal_mode(&conn)?;
-                let plan = migrations::current_plan_from(0).map_err(|e| e.to_string())?;
-                migrations::run_with_db_path(&mut conn, &plan, path.to_path_buf())
-                    .map_err(|e| e.to_string())?;
-            }
-            SchemaCompatibility::Current { .. } => {
-                Self::set_wal_mode(&conn)?;
-            }
-            SchemaCompatibility::Migratable { stored } => {
-                Self::set_wal_mode(&conn)?;
-                let stored = Self::promote_existing_dual_id_schema5_if_present(&mut conn, stored)?;
-                let plan = migrations::current_plan_from(stored).map_err(|e| e.to_string())?;
-                migrations::run_with_db_path(&mut conn, &plan, path.to_path_buf())
-                    .map_err(|e| e.to_string())?;
-            }
-            SchemaCompatibility::LegacyVersionless => {
-                if migrations::classify_versionless(&conn)?.is_none() {
-                    return Err(migrations::MigrationError::UnrecognizedShape {
-                        db_path: path.to_path_buf(),
-                    }
-                    .to_string());
-                }
-                Self::set_wal_mode(&conn)?;
-                let plan = migrations::current_plan_from(MINIMUM_SUPPORTED_SCHEMA_VERSION)
-                    .map_err(|e| e.to_string())?;
-                migrations::run_with_db_path(&mut conn, &plan, path.to_path_buf())
-                    .map_err(|e| e.to_string())?;
-            }
-            SchemaCompatibility::Future { stored } => {
-                return Err(migrations::MigrationError::Incompatible {
-                    db_path: path.to_path_buf(),
-                    stored,
-                    current: CURRENT_SCHEMA_VERSION,
-                }
-                .to_string());
-            }
-            SchemaCompatibility::UnrecognizedVersionless => {
-                return Err(migrations::MigrationError::UnrecognizedShape {
-                    db_path: path.to_path_buf(),
-                }
-                .to_string());
-            }
-            SchemaCompatibility::Corrupt { reason } => {
-                return Err(format!(
-                    "Corrupt schema ({reason}); run `agents migrate --rebuild`. db={}",
-                    path.display()
-                ));
-            }
-        }
-
-        Self::validate_providers_schema(&conn)?;
-        Self::ensure_invocations_schema(&conn)?;
-        Self::ensure_providers_schema(&mut conn)?;
-        Self::ensure_provider_quotas_schema(&conn)?;
-        Self::ensure_provider_quotas_topology_schema(&conn)?;
-        Self::ensure_provider_quota_windows_schema(&conn)?;
-        Self::ensure_session_turns_schema(&conn)?;
-        if ran_open_migrations {
-            conn.execute_batch(invocation_returned_artifacts_schema_sql!())
-                .map_err(|e| format!("Failed to ensure returned-artifacts schema: {e}"))?;
-        }
+        let ran_open_migrations = Self::run_open_migrations(path, &mut conn)?;
+        Self::apply_current_schema_repairs(&mut conn, ran_open_migrations)?;
         let db = StateDb {
             conn,
             db_path: path.to_path_buf(),
@@ -748,19 +952,149 @@ impl StateDb {
         Ok(db)
     }
 
+    fn ensure_state_parent_dir(path: &Path) -> Result<(), String> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create state directory: {e}"))?;
+        }
+        Ok(())
+    }
+
+    fn run_open_migrations(path: &Path, conn: &mut Connection) -> Result<bool, String> {
+        let compatibility = migrations::classify(conn)?;
+        let ran_open_migrations = Self::compatibility_runs_open_migrations(&compatibility);
+        Self::dispatch_open_migration_plan(path, conn, compatibility)?;
+        Ok(ran_open_migrations)
+    }
+
+    fn compatibility_runs_open_migrations(compatibility: &SchemaCompatibility) -> bool {
+        matches!(
+            compatibility,
+            SchemaCompatibility::Fresh
+                | SchemaCompatibility::Migratable { .. }
+                | SchemaCompatibility::LegacyVersionless
+        )
+    }
+
+    fn dispatch_open_migration_plan(
+        path: &Path,
+        conn: &mut Connection,
+        compatibility: SchemaCompatibility,
+    ) -> Result<(), String> {
+        match compatibility {
+            SchemaCompatibility::Fresh => {
+                Self::set_wal_mode(conn)?;
+                Self::run_current_plan_from(path, conn, 0)
+            }
+            SchemaCompatibility::Current { .. } => Self::set_wal_mode(conn),
+            SchemaCompatibility::Migratable { stored } => {
+                Self::set_wal_mode(conn)?;
+                let stored = Self::promote_existing_dual_id_schema5_if_present(conn, stored)?;
+                Self::run_current_plan_from(path, conn, stored)
+            }
+            SchemaCompatibility::LegacyVersionless => {
+                Self::validate_versionless_shape(path, conn)?;
+                Self::set_wal_mode(conn)?;
+                Self::run_current_plan_from(path, conn, MINIMUM_SUPPORTED_SCHEMA_VERSION)
+            }
+            SchemaCompatibility::Future { stored } => Err(Self::future_schema_error(path, stored)),
+            SchemaCompatibility::UnrecognizedVersionless => {
+                Err(Self::unrecognized_versionless_error(path))
+            }
+            SchemaCompatibility::Corrupt { reason } => {
+                Err(Self::corrupt_schema_error(path, reason))
+            }
+        }
+    }
+
+    fn run_current_plan_from(
+        path: &Path,
+        conn: &mut Connection,
+        stored: i32,
+    ) -> Result<(), String> {
+        let plan = migrations::current_plan_from(stored).map_err(|e| e.to_string())?;
+        migrations::run_with_db_path(conn, &plan, path.to_path_buf()).map_err(|e| e.to_string())
+    }
+
+    fn validate_versionless_shape(path: &Path, conn: &Connection) -> Result<(), String> {
+        if migrations::classify_versionless(conn)?.is_some() {
+            Ok(())
+        } else {
+            Err(Self::unrecognized_versionless_error(path))
+        }
+    }
+
+    fn future_schema_error(path: &Path, stored: i32) -> String {
+        migrations::MigrationError::Incompatible {
+            db_path: path.to_path_buf(),
+            stored,
+            current: CURRENT_SCHEMA_VERSION,
+        }
+        .to_string()
+    }
+
+    fn unrecognized_versionless_error(path: &Path) -> String {
+        migrations::MigrationError::UnrecognizedShape {
+            db_path: path.to_path_buf(),
+        }
+        .to_string()
+    }
+
+    fn corrupt_schema_error(path: &Path, reason: String) -> String {
+        format!(
+            "Corrupt schema ({reason}); run `agents migrate --rebuild`. db={}",
+            path.display()
+        )
+    }
+
+    fn apply_current_schema_repairs(
+        conn: &mut Connection,
+        ran_open_migrations: bool,
+    ) -> Result<(), String> {
+        Self::validate_providers_schema(conn)?;
+        Self::ensure_invocations_schema(conn)?;
+        Self::ensure_providers_schema(conn)?;
+        Self::ensure_provider_quotas_schema(conn)?;
+        Self::ensure_provider_quotas_topology_schema(conn)?;
+        Self::ensure_provider_quota_windows_schema(conn)?;
+        Self::ensure_session_turns_schema(conn)?;
+        if ran_open_migrations {
+            Self::apply_returned_artifacts_schema(conn)?;
+        }
+        Ok(())
+    }
+
+    fn apply_returned_artifacts_schema(conn: &Connection) -> Result<(), String> {
+        conn.execute_batch(invocation_returned_artifacts_schema_sql!())
+            .map_err(|e| format!("Failed to ensure returned-artifacts schema: {e}"))
+    }
+
     pub fn open_read_only(path: &Path) -> Result<Self, ReadOnlyOpenError> {
+        Self::validate_read_only_paths(path)?;
+        let conn = Self::open_read_only_connection(path)?;
+        Self::probe_read_only_schema(path, &conn)?;
+
+        Ok(Self {
+            conn,
+            db_path: path.to_path_buf(),
+        })
+    }
+
+    fn validate_read_only_paths(path: &Path) -> Result<(), ReadOnlyOpenError> {
         if !path.exists() {
             return Err(ReadOnlyOpenError::Missing {
                 path: path.to_path_buf(),
             });
         }
-
         if path_is_unreadable(path) {
             return Err(ReadOnlyOpenError::PermissionDenied {
                 path: path.to_path_buf(),
             });
         }
+        Self::validate_read_only_sidecars(path)
+    }
 
+    fn validate_read_only_sidecars(path: &Path) -> Result<(), ReadOnlyOpenError> {
         for sidecar in [wal_path(path), shm_path(path)] {
             if sidecar.exists() && path_is_unreadable(&sidecar) {
                 return Err(ReadOnlyOpenError::WalSidecarError {
@@ -769,18 +1103,17 @@ impl StateDb {
                 });
             }
         }
+        Ok(())
+    }
 
-        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY;
-        let conn = Connection::open_with_flags(path, flags)
-            .map_err(|err| classify_read_only_open_error(path, err))?;
+    fn open_read_only_connection(path: &Path) -> Result<Connection, ReadOnlyOpenError> {
+        Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|err| classify_read_only_open_error(path, err))
+    }
 
+    fn probe_read_only_schema(path: &Path, conn: &Connection) -> Result<(), ReadOnlyOpenError> {
         conn.query_row("SELECT count(*) FROM sqlite_schema", [], |_row| Ok(()))
-            .map_err(|err| classify_read_only_open_error(path, err))?;
-
-        Ok(Self {
-            conn,
-            db_path: path.to_path_buf(),
-        })
+            .map_err(|err| classify_read_only_open_error(path, err))
     }
 
     pub fn open_default() -> Result<Self, String> {
@@ -825,99 +1158,159 @@ impl StateDb {
         }
     }
 
+    fn strict_rfc3339_at(raw: &str, column_index: usize) -> rusqlite::Result<DateTime<Utc>> {
+        DateTime::parse_from_rfc3339(raw)
+            .map(|dt| dt.with_timezone(&Utc))
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    column_index,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })
+    }
+
+    fn strict_rfc3339_message(raw: &str, field_name: &str) -> Result<DateTime<Utc>, String> {
+        DateTime::parse_from_rfc3339(raw)
+            .map(|dt| dt.with_timezone(&Utc))
+            .map_err(|e| format!("Bad {field_name} {raw}: {e}"))
+    }
+
+    fn optional_forgiving_rfc3339(raw: Option<String>) -> Option<DateTime<Utc>> {
+        raw.and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+            .map(|dt| dt.with_timezone(&Utc))
+    }
+
+    fn fallback_now_rfc3339(raw: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(raw)
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now())
+    }
+
+    fn table_column_names(
+        conn: &Connection,
+        table_name: &str,
+        inspect_context: &str,
+        query_context: &str,
+        read_context: &str,
+    ) -> Result<Vec<String>, String> {
+        let pragma = format!("PRAGMA table_info({table_name})");
+        let mut stmt = conn
+            .prepare(&pragma)
+            .map_err(|e| format!("{inspect_context}: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| format!("{query_context}: {e}"))?;
+
+        let mut columns = Vec::new();
+        for row in rows {
+            columns.push(row.map_err(|e| format!("{read_context}: {e}"))?);
+        }
+        Ok(columns)
+    }
+
+    fn has_column(columns: &[String], name: &str) -> bool {
+        columns.iter().any(|column| column == name)
+    }
+
     // Legacy repair allow-list only. Durable schema changes belong in
     // crates/oulipoly-state/migrations/ and schema.rs owns the version.
     fn ensure_invocations_schema(conn: &Connection) -> Result<(), String> {
         let columns = Self::invocations_columns(conn)?;
+        match Self::classify_invocations_schema(&columns) {
+            InvocationsSchemaShape::Empty => Self::initialize_invocations_schema(conn),
+            InvocationsSchemaShape::Current => {
+                Self::repair_current_invocations_schema(conn, &columns)
+            }
+            InvocationsSchemaShape::LegacyPreUuid => Self::migrate_legacy_invocations(conn),
+            InvocationsSchemaShape::UnrecognizedPreUuid(columns) => {
+                Err(Self::unrecognized_invocations_shape_error(&columns))
+            }
+        }
+    }
+
+    fn classify_invocations_schema(columns: &[String]) -> InvocationsSchemaShape {
         if columns.is_empty() {
-            conn.execute_batch(Self::invocations_schema_sql())
-                .map_err(|e| format!("Failed to initialize invocations schema: {e}"))?;
-            Self::ensure_invocations_row_version_support(conn)?;
-            return Ok(());
+            InvocationsSchemaShape::Empty
+        } else if Self::has_column(columns, "invocation_uuid") {
+            InvocationsSchemaShape::Current
+        } else if Self::legacy_invocations_shape_is_pre_uuid(columns) {
+            InvocationsSchemaShape::LegacyPreUuid
+        } else {
+            InvocationsSchemaShape::UnrecognizedPreUuid(columns.to_vec())
         }
+    }
 
-        if columns.iter().any(|column| column == "invocation_uuid") {
-            if !columns.iter().any(|column| column == "session_id") {
-                conn.execute("ALTER TABLE invocations ADD COLUMN session_id TEXT", [])
-                    .map_err(|e| format!("Failed to add invocations.session_id: {e}"))?;
-            }
-            if !columns
-                .iter()
-                .any(|column| column == "session_capture_method")
-            {
-                conn.execute(
-                    "ALTER TABLE invocations ADD COLUMN session_capture_method TEXT",
-                    [],
-                )
-                .map_err(|e| format!("Failed to add invocations.session_capture_method: {e}"))?;
-            }
-            if !columns
-                .iter()
-                .any(|column| column == "resume_acceptance_status")
-            {
-                conn.execute(
-                    "ALTER TABLE invocations ADD COLUMN resume_acceptance_status TEXT",
-                    [],
-                )
-                .map_err(|e| format!("Failed to add invocations.resume_acceptance_status: {e}"))?;
-            }
-            if !columns
-                .iter()
-                .any(|column| column == "resume_acceptance_evidence")
-            {
-                conn.execute(
-                    "ALTER TABLE invocations ADD COLUMN resume_acceptance_evidence TEXT",
-                    [],
-                )
-                .map_err(|e| {
-                    format!("Failed to add invocations.resume_acceptance_evidence: {e}")
-                })?;
-            }
-            if !columns.iter().any(|column| column == "terminal_reason") {
-                match conn.execute(
-                    "ALTER TABLE invocations ADD COLUMN terminal_reason TEXT",
-                    [],
-                ) {
-                    Ok(_) => {}
-                    Err(rusqlite::Error::SqliteFailure(_, message))
-                        if message
-                            .as_deref()
-                            .is_some_and(|value| value.contains("duplicate column name")) => {}
-                    Err(e) => {
-                        return Err(format!("Failed to add invocations.terminal_reason: {e}"));
-                    }
-                }
-            }
-            if columns.iter().any(|column| column == "quota_tight_routing") {
-                conn.execute(
-                    "ALTER TABLE invocations DROP COLUMN quota_tight_routing",
-                    [],
-                )
-                .map_err(|e| format!("Failed to drop invocations.quota_tight_routing: {e}"))?;
-            }
-            conn.execute_batch(Self::invocations_index_sql())
-                .map_err(|e| format!("Failed to ensure invocation indexes: {e}"))?;
-            Self::ensure_invocations_row_version_support(conn)?;
-            return Ok(());
-        }
+    fn initialize_invocations_schema(conn: &Connection) -> Result<(), String> {
+        conn.execute_batch(Self::invocations_schema_sql())
+            .map_err(|e| format!("Failed to initialize invocations schema: {e}"))?;
+        Self::ensure_invocations_row_version_support(conn)
+    }
 
-        if Self::legacy_invocations_shape_is_pre_uuid(&columns) {
-            return Self::migrate_legacy_invocations(conn);
-        }
+    fn repair_current_invocations_schema(
+        conn: &Connection,
+        columns: &[String],
+    ) -> Result<(), String> {
+        Self::execute_column_repairs(conn, columns, Self::invocations_column_repairs().as_slice())?;
+        let drop_repairs = [DropColumnRepair {
+            column_name: "quota_tight_routing",
+            sql: "ALTER TABLE invocations DROP COLUMN quota_tight_routing",
+            error_context: "Failed to drop invocations.quota_tight_routing",
+        }];
+        Self::execute_drop_column_repairs(conn, columns, drop_repairs.as_slice())?;
+        conn.execute_batch(Self::invocations_index_sql())
+            .map_err(|e| format!("Failed to ensure invocation indexes: {e}"))?;
+        Self::ensure_invocations_row_version_support(conn)
+    }
 
-        Err(format!(
+    fn invocations_column_repairs() -> [ColumnRepair; 5] {
+        [
+            ColumnRepair {
+                column_name: "session_id",
+                sql: "ALTER TABLE invocations ADD COLUMN session_id TEXT",
+                error_context: "Failed to add invocations.session_id",
+            },
+            ColumnRepair {
+                column_name: "session_capture_method",
+                sql: "ALTER TABLE invocations ADD COLUMN session_capture_method TEXT",
+                error_context: "Failed to add invocations.session_capture_method",
+            },
+            ColumnRepair {
+                column_name: "resume_acceptance_status",
+                sql: "ALTER TABLE invocations ADD COLUMN resume_acceptance_status TEXT",
+                error_context: "Failed to add invocations.resume_acceptance_status",
+            },
+            ColumnRepair {
+                column_name: "resume_acceptance_evidence",
+                sql: "ALTER TABLE invocations ADD COLUMN resume_acceptance_evidence TEXT",
+                error_context: "Failed to add invocations.resume_acceptance_evidence",
+            },
+            ColumnRepair {
+                column_name: "terminal_reason",
+                sql: "ALTER TABLE invocations ADD COLUMN terminal_reason TEXT",
+                error_context: "Failed to add invocations.terminal_reason",
+            },
+        ]
+    }
+
+    fn unrecognized_invocations_shape_error(columns: &[String]) -> String {
+        format!(
             "Refusing to rebuild populated invocations table with unrecognized pre-UUID shape: {columns:?}"
-        ))
+        )
     }
 
     fn normalize_invocations_columns_excluding_maintenance(columns: &[String]) -> Vec<String> {
-        let mut names = columns
+        let mut names = Self::invocation_columns_without_maintenance(columns);
+        names.sort();
+        names
+    }
+
+    fn invocation_columns_without_maintenance(columns: &[String]) -> Vec<String> {
+        columns
             .iter()
             .filter(|column| column.as_str() != "row_version")
             .cloned()
-            .collect::<Vec<_>>();
-        names.sort();
-        names
+            .collect()
     }
 
     fn legacy_invocations_shape_is_pre_uuid(columns: &[String]) -> bool {
@@ -935,38 +1328,53 @@ impl StateDb {
 
     fn ensure_invocations_row_version_support(conn: &Connection) -> Result<(), String> {
         let columns = Self::invocations_columns(conn)?;
-        if !columns.iter().any(|column| column == "row_version") {
-            conn.execute(
-                "ALTER TABLE invocations ADD COLUMN row_version INTEGER NOT NULL DEFAULT 0",
-                [],
-            )
-            .map_err(|e| format!("Failed to add invocations.row_version during repair: {e}"))?;
+        Self::repair_invocations_row_version_column(conn, &columns)?;
+        Self::install_invocations_row_version_triggers(conn)
+    }
+
+    fn repair_invocations_row_version_column(
+        conn: &Connection,
+        columns: &[String],
+    ) -> Result<(), String> {
+        if Self::has_column(columns, "row_version") {
+            return Ok(());
         }
-        let registration = crate::deployment::row_version::registry::lookup("invocations")
-            .ok_or_else(|| {
-                "Missing row-version registry entry for invocations during repair".to_string()
-            })?;
-        conn.execute_batch(
-            &crate::deployment::row_version::triggers_sql::generate_triggers_for_table(
-                registration,
-            ),
+        conn.execute(
+            "ALTER TABLE invocations ADD COLUMN row_version INTEGER NOT NULL DEFAULT 0",
+            [],
         )
-        .map_err(|e| format!("Failed to install invocation row-version triggers: {e}"))
+        .map_err(|e| format!("Failed to add invocations.row_version during repair: {e}"))?;
+        Ok(())
+    }
+
+    fn install_invocations_row_version_triggers(conn: &Connection) -> Result<(), String> {
+        let registration = Self::invocations_row_version_registration()?;
+        let trigger_sql = Self::row_version_trigger_sql(registration);
+        conn.execute_batch(&trigger_sql)
+            .map_err(|e| format!("Failed to install invocation row-version triggers: {e}"))
+    }
+
+    fn invocations_row_version_registration()
+    -> Result<&'static crate::deployment::row_version::registry::TableRegistration, String> {
+        crate::deployment::row_version::registry::lookup("invocations").ok_or_else(|| {
+            "Missing row-version registry entry for invocations during repair".to_string()
+        })
+    }
+
+    fn row_version_trigger_sql(
+        registration: &crate::deployment::row_version::registry::TableRegistration,
+    ) -> String {
+        crate::deployment::row_version::triggers_sql::generate_triggers_for_table(registration)
     }
 
     fn invocations_columns(conn: &Connection) -> Result<Vec<String>, String> {
-        let mut stmt = conn
-            .prepare("PRAGMA table_info(invocations)")
-            .map_err(|e| format!("Failed to inspect invocations schema: {e}"))?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(1))
-            .map_err(|e| format!("Failed to inspect invocations columns: {e}"))?;
-
-        let mut columns = Vec::new();
-        for row in rows {
-            columns.push(row.map_err(|e| format!("Failed to read invocations column: {e}"))?);
-        }
-        Ok(columns)
+        Self::table_column_names(
+            conn,
+            "invocations",
+            "Failed to inspect invocations schema",
+            "Failed to inspect invocations columns",
+            "Failed to read invocations column",
+        )
     }
 
     fn invocations_have_dual_id_columns(conn: &Connection) -> Result<bool, String> {
@@ -975,11 +1383,9 @@ impl StateDb {
     }
 
     fn columns_have_dual_id_columns(columns: &[String]) -> bool {
-        columns.iter().any(|column| column == "provider_session_id")
-            && columns.iter().any(|column| column == "resume_input_id")
-            && columns
-                .iter()
-                .any(|column| column == "provider_session_capture_method")
+        Self::has_column(columns, "provider_session_id")
+            && Self::has_column(columns, "resume_input_id")
+            && Self::has_column(columns, "provider_session_capture_method")
     }
 
     fn promote_existing_dual_id_schema5_if_present(
@@ -993,7 +1399,11 @@ impl StateDb {
         if !Self::columns_have_dual_id_columns(&columns) {
             return Ok(stored);
         }
+        Self::promote_existing_dual_id_schema5(conn)?;
+        Ok(5)
+    }
 
+    fn promote_existing_dual_id_schema5(conn: &mut Connection) -> Result<(), String> {
         conn.execute_batch(
             "BEGIN IMMEDIATE;
              UPDATE invocations
@@ -1017,37 +1427,55 @@ impl StateDb {
         .map_err(|e| {
             let _ = conn.execute_batch("ROLLBACK;");
             format!("Failed to promote existing dual-id invocation schema to version 5: {e}")
-        })?;
-        Ok(5)
+        })
     }
 
     fn provider_session_expr(conn: &Connection, alias: Option<&str>) -> Result<String, String> {
-        let prefix = alias.unwrap_or_default();
-        if Self::invocations_have_dual_id_columns(conn)? {
-            Ok(format!(
-                "COALESCE({prefix}provider_session_id, {prefix}session_id)"
-            ))
+        let projection = if Self::invocations_have_dual_id_columns(conn)? {
+            ProviderSessionProjection::DualId
         } else {
-            Ok(format!("{prefix}session_id"))
+            ProviderSessionProjection::LegacySessionId
+        };
+        Ok(Self::format_provider_session_expr(projection, alias))
+    }
+
+    fn format_provider_session_expr(
+        projection: ProviderSessionProjection,
+        alias: Option<&str>,
+    ) -> String {
+        let prefix = alias.unwrap_or_default();
+        match projection {
+            ProviderSessionProjection::DualId => {
+                format!("COALESCE({prefix}provider_session_id, {prefix}session_id)")
+            }
+            ProviderSessionProjection::LegacySessionId => format!("{prefix}session_id"),
         }
     }
 
     fn invocation_record_select_sql(conn: &Connection, tail_sql: &str) -> Result<String, String> {
+        let projection = Self::invocation_dual_id_projection(conn)?;
+        Ok(Self::format_invocation_record_select_sql(
+            projection, tail_sql,
+        ))
+    }
+
+    fn invocation_dual_id_projection(
+        conn: &Connection,
+    ) -> Result<InvocationDualIdProjection, String> {
+        if Self::invocations_have_dual_id_columns(conn)? {
+            Ok(InvocationDualIdProjection::Current)
+        } else {
+            Ok(InvocationDualIdProjection::Legacy)
+        }
+    }
+
+    fn format_invocation_record_select_sql(
+        projection: InvocationDualIdProjection,
+        tail_sql: &str,
+    ) -> String {
         let (provider_session_id, resume_input_id, provider_session_capture_method) =
-            if Self::invocations_have_dual_id_columns(conn)? {
-                (
-                    "provider_session_id",
-                    "resume_input_id",
-                    "provider_session_capture_method",
-                )
-            } else {
-                (
-                    "NULL AS provider_session_id",
-                    "NULL AS resume_input_id",
-                    "NULL AS provider_session_capture_method",
-                )
-            };
-        Ok(format!(
+            projection.select_columns();
+        format!(
             "SELECT id, invocation_uuid, model_name, provider_name, provider_index,
                     parent_invocation_id, status, success, exit_code, error_category,
                     terminal_reason, session_id, session_capture_method,
@@ -1056,90 +1484,124 @@ impl StateDb {
                     created_at, finished_at
              FROM invocations
              {tail_sql}"
-        ))
+        )
     }
 
     fn ensure_providers_schema(conn: &mut Connection) -> Result<(), String> {
         let columns = Self::providers_columns(conn)?;
+        match Self::classify_providers_schema(&columns) {
+            ProvidersSchemaShape::Empty => Self::initialize_providers_schema(conn),
+            ProvidersSchemaShape::Current => Ok(()),
+            ProvidersSchemaShape::LegacyIndexKeyed => Self::migrate_legacy_providers_schema(conn),
+            ProvidersSchemaShape::Unexpected(description) => {
+                Err(Self::unexpected_providers_schema_error(&description))
+            }
+        }
+    }
+
+    fn classify_providers_schema(columns: &[ProviderColumn]) -> ProvidersSchemaShape {
         if columns.is_empty() {
-            conn.execute_batch(Self::providers_schema_sql())
-                .map_err(|e| format!("Failed to initialize providers schema: {e}"))?;
-            return Ok(());
+            ProvidersSchemaShape::Empty
+        } else if Self::providers_shape_is_post_fix(columns) {
+            ProvidersSchemaShape::Current
+        } else if Self::providers_shape_is_pre_fix(columns) {
+            ProvidersSchemaShape::LegacyIndexKeyed
+        } else {
+            ProvidersSchemaShape::Unexpected(Self::describe_columns(columns))
         }
+    }
 
-        if Self::providers_shape_is_post_fix(&columns) {
-            return Ok(());
-        }
+    fn initialize_providers_schema(conn: &Connection) -> Result<(), String> {
+        conn.execute_batch(Self::providers_schema_sql())
+            .map_err(|e| format!("Failed to initialize providers schema: {e}"))
+    }
 
-        if Self::providers_shape_is_pre_fix(&columns) {
-            let tx = conn
-                .transaction()
-                .map_err(|e| format!("Failed to begin providers migration: {e}"))?;
-            tx.execute_batch("ALTER TABLE providers RENAME TO providers_legacy_index_keyed;")
-                .map_err(|e| format!("Failed to rename legacy providers table: {e}"))?;
-            tx.execute_batch(Self::providers_schema_sql())
-                .map_err(|e| format!("Failed to create migrated providers table: {e}"))?;
-            tx.execute_batch(
-                "INSERT INTO providers (
-                    model_name, provider_name,
-                    invocation_count, error_count,
-                    last_error, last_error_at, last_invoked_at
-                )
-                SELECT
-                    model_name,
-                    provider_name,
-                    COUNT(*) AS invocation_count,
-                    SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS error_count,
-                    NULL AS last_error,
-                    NULL AS last_error_at,
-                    MAX(finished_at) AS last_invoked_at
-                FROM invocations
-                WHERE provider_name IS NOT NULL
-                  AND status IN ('succeeded', 'failed')
-                  AND success IS NOT NULL
-                GROUP BY model_name, provider_name;",
+    fn migrate_legacy_providers_schema(conn: &mut Connection) -> Result<(), String> {
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Failed to begin providers migration: {e}"))?;
+        Self::rename_legacy_providers_table(&tx)?;
+        Self::create_migrated_providers_table(&tx)?;
+        Self::rebuild_providers_aggregate(&tx)?;
+        Self::rebuild_provider_error_metadata(&tx)?;
+        Self::drop_legacy_providers_table(&tx)?;
+        tx.commit()
+            .map_err(|e| format!("Failed to commit providers migration: {e}"))
+    }
+
+    fn rename_legacy_providers_table(conn: &Connection) -> Result<(), String> {
+        conn.execute_batch("ALTER TABLE providers RENAME TO providers_legacy_index_keyed;")
+            .map_err(|e| format!("Failed to rename legacy providers table: {e}"))
+    }
+
+    fn create_migrated_providers_table(conn: &Connection) -> Result<(), String> {
+        conn.execute_batch(Self::providers_schema_sql())
+            .map_err(|e| format!("Failed to create migrated providers table: {e}"))
+    }
+
+    fn rebuild_providers_aggregate(conn: &Connection) -> Result<(), String> {
+        conn.execute_batch(
+            "INSERT INTO providers (
+                model_name, provider_name,
+                invocation_count, error_count,
+                last_error, last_error_at, last_invoked_at
             )
-            .map_err(|e| format!("Failed to rebuild providers aggregate: {e}"))?;
-            tx.execute_batch(
-                "UPDATE providers
-                    SET last_error_at = (
-                            SELECT i.finished_at
-                              FROM invocations i
-                             WHERE i.model_name = providers.model_name
-                               AND i.provider_name = providers.provider_name
-                               AND i.success = 0
-                             ORDER BY i.finished_at DESC, i.id DESC
-                             LIMIT 1
-                        ),
-                        last_error = (
-                            SELECT i.error_category
-                              FROM invocations i
-                             WHERE i.model_name = providers.model_name
-                               AND i.provider_name = providers.provider_name
-                               AND i.success = 0
-                             ORDER BY i.finished_at DESC, i.id DESC
-                             LIMIT 1
-                        )
-                  WHERE EXISTS (
-                            SELECT 1
-                              FROM invocations i
-                             WHERE i.model_name = providers.model_name
-                               AND i.provider_name = providers.provider_name
-                               AND i.success = 0
-                        );",
-            )
-            .map_err(|e| format!("Failed to rebuild provider error metadata: {e}"))?;
-            tx.execute_batch("DROP TABLE providers_legacy_index_keyed;")
-                .map_err(|e| format!("Failed to drop legacy providers table: {e}"))?;
-            tx.commit()
-                .map_err(|e| format!("Failed to commit providers migration: {e}"))?;
-            return Ok(());
-        }
+            SELECT
+                model_name,
+                provider_name,
+                COUNT(*) AS invocation_count,
+                SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS error_count,
+                NULL AS last_error,
+                NULL AS last_error_at,
+                MAX(finished_at) AS last_invoked_at
+            FROM invocations
+            WHERE provider_name IS NOT NULL
+              AND status IN ('succeeded', 'failed')
+              AND success IS NOT NULL
+            GROUP BY model_name, provider_name;",
+        )
+        .map_err(|e| format!("Failed to rebuild providers aggregate: {e}"))
+    }
 
-        Err(format!(
-            "Unexpected providers schema shape: {}",
-            Self::describe_columns(&columns)
-        ))
+    fn rebuild_provider_error_metadata(conn: &Connection) -> Result<(), String> {
+        conn.execute_batch(
+            "UPDATE providers
+                SET last_error_at = (
+                        SELECT i.finished_at
+                          FROM invocations i
+                         WHERE i.model_name = providers.model_name
+                           AND i.provider_name = providers.provider_name
+                           AND i.success = 0
+                         ORDER BY i.finished_at DESC, i.id DESC
+                         LIMIT 1
+                    ),
+                    last_error = (
+                        SELECT i.error_category
+                          FROM invocations i
+                         WHERE i.model_name = providers.model_name
+                           AND i.provider_name = providers.provider_name
+                           AND i.success = 0
+                         ORDER BY i.finished_at DESC, i.id DESC
+                         LIMIT 1
+                    )
+              WHERE EXISTS (
+                        SELECT 1
+                          FROM invocations i
+                         WHERE i.model_name = providers.model_name
+                           AND i.provider_name = providers.provider_name
+                           AND i.success = 0
+                    );",
+        )
+        .map_err(|e| format!("Failed to rebuild provider error metadata: {e}"))
+    }
+
+    fn drop_legacy_providers_table(conn: &Connection) -> Result<(), String> {
+        conn.execute_batch("DROP TABLE providers_legacy_index_keyed;")
+            .map_err(|e| format!("Failed to drop legacy providers table: {e}"))
+    }
+
+    fn unexpected_providers_schema_error(description: &str) -> String {
+        format!("Unexpected providers schema shape: {description}")
     }
 
     fn validate_providers_schema(conn: &Connection) -> Result<(), String> {
@@ -1287,194 +1749,247 @@ impl StateDb {
     }
 
     fn describe_columns(columns: &[ProviderColumn]) -> String {
+        Self::provider_column_descriptions(columns).join(", ")
+    }
+
+    fn provider_column_descriptions(columns: &[ProviderColumn]) -> Vec<String> {
         columns
             .iter()
-            .map(|column| {
-                format!(
-                    "{}(type={}, notnull={}, pk={})",
-                    column.name, column.data_type, column.notnull, column.pk
-                )
-            })
+            .map(Self::provider_column_description)
             .collect::<Vec<_>>()
-            .join(", ")
+    }
+
+    fn provider_column_description(column: &ProviderColumn) -> String {
+        format!(
+            "{}(type={}, notnull={}, pk={})",
+            column.name, column.data_type, column.notnull, column.pk
+        )
     }
 
     fn ensure_session_turns_schema(conn: &Connection) -> Result<(), String> {
         let columns = Self::session_turns_columns(conn)?;
-        if !columns.iter().any(|column| column == "parent_turn_id") {
-            conn.execute(
-                "ALTER TABLE session_turns ADD COLUMN parent_turn_id TEXT",
-                [],
-            )
-            .map_err(|e| format!("Failed to add session_turns.parent_turn_id: {e}"))?;
-        }
-        if !columns.iter().any(|column| column == "is_sidechain") {
-            conn.execute(
-                "ALTER TABLE session_turns ADD COLUMN is_sidechain INTEGER NOT NULL DEFAULT 0",
-                [],
-            )
-            .map_err(|e| format!("Failed to add session_turns.is_sidechain: {e}"))?;
-        }
-        if !columns
-            .iter()
-            .any(|column| column == "is_compaction_boundary")
-        {
-            conn.execute(
-                "ALTER TABLE session_turns ADD COLUMN is_compaction_boundary INTEGER NOT NULL DEFAULT 0",
-                [],
-            )
-            .map_err(|e| format!("Failed to add session_turns.is_compaction_boundary: {e}"))?;
-        }
-        if !columns.iter().any(|column| column == "body") {
-            conn.execute("ALTER TABLE session_turns ADD COLUMN body TEXT", [])
-                .map_err(|e| format!("Failed to add session_turns.body: {e}"))?;
-        }
+        Self::execute_column_repairs(
+            conn,
+            &columns,
+            Self::session_turns_column_repairs().as_slice(),
+        )?;
         conn.execute_batch(Self::session_turns_index_sql())
             .map_err(|e| format!("Failed to ensure session_turns indexes: {e}"))?;
         Ok(())
     }
 
-    fn session_turns_columns(conn: &Connection) -> Result<Vec<String>, String> {
-        let mut stmt = conn
-            .prepare("PRAGMA table_info(session_turns)")
-            .map_err(|e| format!("Failed to inspect session_turns schema: {e}"))?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(1))
-            .map_err(|e| format!("Failed to inspect session_turns columns: {e}"))?;
+    fn session_turns_column_repairs() -> [ColumnRepair; 4] {
+        [
+            ColumnRepair {
+                column_name: "parent_turn_id",
+                sql: "ALTER TABLE session_turns ADD COLUMN parent_turn_id TEXT",
+                error_context: "Failed to add session_turns.parent_turn_id",
+            },
+            ColumnRepair {
+                column_name: "is_sidechain",
+                sql: "ALTER TABLE session_turns ADD COLUMN is_sidechain INTEGER NOT NULL DEFAULT 0",
+                error_context: "Failed to add session_turns.is_sidechain",
+            },
+            ColumnRepair {
+                column_name: "is_compaction_boundary",
+                sql: "ALTER TABLE session_turns ADD COLUMN is_compaction_boundary INTEGER NOT NULL DEFAULT 0",
+                error_context: "Failed to add session_turns.is_compaction_boundary",
+            },
+            ColumnRepair {
+                column_name: "body",
+                sql: "ALTER TABLE session_turns ADD COLUMN body TEXT",
+                error_context: "Failed to add session_turns.body",
+            },
+        ]
+    }
 
-        let mut columns = Vec::new();
-        for row in rows {
-            columns.push(row.map_err(|e| format!("Failed to read session_turns column: {e}"))?);
-        }
-        Ok(columns)
+    fn session_turns_columns(conn: &Connection) -> Result<Vec<String>, String> {
+        Self::table_column_names(
+            conn,
+            "session_turns",
+            "Failed to inspect session_turns schema",
+            "Failed to inspect session_turns columns",
+            "Failed to read session_turns column",
+        )
     }
 
     fn ensure_provider_quotas_schema(conn: &Connection) -> Result<(), String> {
         let columns = Self::provider_quotas_columns(conn)?;
-        if !columns
-            .iter()
-            .any(|column| column == "last_empty_refresh_at")
-        {
-            conn.execute(
-                "ALTER TABLE provider_quotas ADD COLUMN last_empty_refresh_at TEXT",
-                [],
-            )
-            .map_err(|e| format!("Failed to add provider_quotas.last_empty_refresh_at: {e}"))?;
-        }
-        if !columns.iter().any(|column| column == "exhausted_at") {
-            conn.execute(
-                "ALTER TABLE provider_quotas ADD COLUMN exhausted_at TEXT NULL",
-                [],
-            )
-            .map_err(|e| format!("Failed to add provider_quotas.exhausted_at: {e}"))?;
-        }
-        if columns.iter().any(|column| column == "last_delta_percent") {
-            conn.execute(
-                "ALTER TABLE provider_quotas DROP COLUMN last_delta_percent",
-                [],
-            )
-            .map_err(|e| format!("Failed to drop provider_quotas.last_delta_percent: {e}"))?;
-        }
-        if columns.iter().any(|column| column == "last_delta_calls") {
-            conn.execute(
-                "ALTER TABLE provider_quotas DROP COLUMN last_delta_calls",
-                [],
-            )
-            .map_err(|e| format!("Failed to drop provider_quotas.last_delta_calls: {e}"))?;
-        }
-        Ok(())
+        Self::execute_column_repairs(
+            conn,
+            &columns,
+            Self::provider_quotas_column_repairs().as_slice(),
+        )?;
+        Self::execute_drop_column_repairs(
+            conn,
+            &columns,
+            Self::provider_quotas_drop_column_repairs().as_slice(),
+        )
+    }
+
+    fn provider_quotas_column_repairs() -> [ColumnRepair; 2] {
+        [
+            ColumnRepair {
+                column_name: "last_empty_refresh_at",
+                sql: "ALTER TABLE provider_quotas ADD COLUMN last_empty_refresh_at TEXT",
+                error_context: "Failed to add provider_quotas.last_empty_refresh_at",
+            },
+            ColumnRepair {
+                column_name: "exhausted_at",
+                sql: "ALTER TABLE provider_quotas ADD COLUMN exhausted_at TEXT NULL",
+                error_context: "Failed to add provider_quotas.exhausted_at",
+            },
+        ]
+    }
+
+    fn provider_quotas_drop_column_repairs() -> [DropColumnRepair; 2] {
+        [
+            DropColumnRepair {
+                column_name: "last_delta_percent",
+                sql: "ALTER TABLE provider_quotas DROP COLUMN last_delta_percent",
+                error_context: "Failed to drop provider_quotas.last_delta_percent",
+            },
+            DropColumnRepair {
+                column_name: "last_delta_calls",
+                sql: "ALTER TABLE provider_quotas DROP COLUMN last_delta_calls",
+                error_context: "Failed to drop provider_quotas.last_delta_calls",
+            },
+        ]
     }
 
     fn ensure_provider_quotas_topology_schema(conn: &Connection) -> Result<(), String> {
         let columns = Self::provider_quotas_columns(conn)?;
-        let added_peak = !columns
-            .iter()
-            .any(|column| column == "topology_peak_live_window_count");
-        if added_peak {
-            conn.execute(
-                "ALTER TABLE provider_quotas
-                 ADD COLUMN topology_peak_live_window_count INTEGER NOT NULL DEFAULT 0",
-                [],
-            )
-            .map_err(|e| {
-                format!("Failed to add provider_quotas.topology_peak_live_window_count: {e}")
-            })?;
-        }
-        if !columns
-            .iter()
-            .any(|column| column == "last_topology_probe_at")
-        {
-            conn.execute(
-                "ALTER TABLE provider_quotas ADD COLUMN last_topology_probe_at TEXT",
-                [],
-            )
-            .map_err(|e| format!("Failed to add provider_quotas.last_topology_probe_at: {e}"))?;
-        }
-        conn.execute(
-            "UPDATE provider_quotas
-             SET topology_peak_live_window_count = MAX(
-                topology_peak_live_window_count,
-                (
-                    SELECT COUNT(*)
-                    FROM provider_quota_windows
-                    WHERE provider_quota_windows.provider_name = provider_quotas.provider_name
-                )
-             )",
-            [],
-        )
-        .map_err(|e| format!("Failed to backfill provider_quotas topology peak counts: {e}"))?;
+        Self::execute_column_repairs(
+            conn,
+            &columns,
+            Self::provider_quotas_topology_column_repairs().as_slice(),
+        )?;
+        Self::backfill_provider_quotas_topology_peak_counts(conn)
+    }
+
+    fn provider_quotas_topology_column_repairs() -> [ColumnRepair; 2] {
+        [
+            ColumnRepair {
+                column_name: "topology_peak_live_window_count",
+                sql: "ALTER TABLE provider_quotas ADD COLUMN topology_peak_live_window_count INTEGER NOT NULL DEFAULT 0",
+                error_context: "Failed to add provider_quotas.topology_peak_live_window_count",
+            },
+            ColumnRepair {
+                column_name: "last_topology_probe_at",
+                sql: "ALTER TABLE provider_quotas ADD COLUMN last_topology_probe_at TEXT",
+                error_context: "Failed to add provider_quotas.last_topology_probe_at",
+            },
+        ]
+    }
+
+    fn backfill_provider_quotas_topology_peak_counts(conn: &Connection) -> Result<(), String> {
+        conn.execute(Self::provider_quotas_topology_backfill_sql(), [])
+            .map_err(|e| format!("Failed to backfill provider_quotas topology peak counts: {e}"))?;
         Ok(())
+    }
+
+    fn provider_quotas_topology_backfill_sql() -> &'static str {
+        "UPDATE provider_quotas
+         SET topology_peak_live_window_count = MAX(
+            topology_peak_live_window_count,
+            (
+                SELECT COUNT(*)
+                FROM provider_quota_windows
+                WHERE provider_quota_windows.provider_name = provider_quotas.provider_name
+            )
+         )"
     }
 
     fn ensure_provider_quota_windows_schema(conn: &Connection) -> Result<(), String> {
         let columns = Self::provider_quota_windows_columns(conn)?;
-        if !columns.iter().any(|column| column == "last_delta_percent") {
-            conn.execute(
-                "ALTER TABLE provider_quota_windows ADD COLUMN last_delta_percent REAL NULL",
-                [],
-            )
-            .map_err(|e| format!("Failed to add provider_quota_windows.last_delta_percent: {e}"))?;
-        }
-        if !columns.iter().any(|column| column == "last_delta_calls") {
-            conn.execute(
-                "ALTER TABLE provider_quota_windows ADD COLUMN last_delta_calls INTEGER NULL",
-                [],
-            )
-            .map_err(|e| format!("Failed to add provider_quota_windows.last_delta_calls: {e}"))?;
+        Self::execute_column_repairs(
+            conn,
+            &columns,
+            Self::provider_quota_windows_column_repairs().as_slice(),
+        )
+    }
+
+    fn provider_quota_windows_column_repairs() -> [ColumnRepair; 2] {
+        [
+            ColumnRepair {
+                column_name: "last_delta_percent",
+                sql: "ALTER TABLE provider_quota_windows ADD COLUMN last_delta_percent REAL NULL",
+                error_context: "Failed to add provider_quota_windows.last_delta_percent",
+            },
+            ColumnRepair {
+                column_name: "last_delta_calls",
+                sql: "ALTER TABLE provider_quota_windows ADD COLUMN last_delta_calls INTEGER NULL",
+                error_context: "Failed to add provider_quota_windows.last_delta_calls",
+            },
+        ]
+    }
+
+    fn execute_column_repairs(
+        conn: &Connection,
+        columns: &[String],
+        repairs: &[ColumnRepair],
+    ) -> Result<(), String> {
+        for repair in repairs {
+            Self::execute_column_repair_if_absent(conn, columns, repair)?;
         }
         Ok(())
     }
 
-    fn provider_quotas_columns(conn: &Connection) -> Result<Vec<String>, String> {
-        let mut stmt = conn
-            .prepare("PRAGMA table_info(provider_quotas)")
-            .map_err(|e| format!("Failed to inspect provider_quotas schema: {e}"))?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(1))
-            .map_err(|e| format!("Failed to inspect provider_quotas columns: {e}"))?;
-
-        let mut columns = Vec::new();
-        for row in rows {
-            columns.push(row.map_err(|e| format!("Failed to read provider_quotas column: {e}"))?);
+    fn execute_column_repair_if_absent(
+        conn: &Connection,
+        columns: &[String],
+        repair: &ColumnRepair,
+    ) -> Result<(), String> {
+        if Self::has_column(columns, repair.column_name) {
+            return Ok(());
         }
-        Ok(columns)
+        conn.execute(repair.sql, [])
+            .map_err(|e| format!("{}: {e}", repair.error_context))?;
+        Ok(())
+    }
+
+    fn execute_drop_column_repairs(
+        conn: &Connection,
+        columns: &[String],
+        repairs: &[DropColumnRepair],
+    ) -> Result<(), String> {
+        for repair in repairs {
+            Self::execute_drop_column_repair_if_present(conn, columns, repair)?;
+        }
+        Ok(())
+    }
+
+    fn execute_drop_column_repair_if_present(
+        conn: &Connection,
+        columns: &[String],
+        repair: &DropColumnRepair,
+    ) -> Result<(), String> {
+        if !Self::has_column(columns, repair.column_name) {
+            return Ok(());
+        }
+        conn.execute(repair.sql, [])
+            .map_err(|e| format!("{}: {e}", repair.error_context))?;
+        Ok(())
+    }
+
+    fn provider_quotas_columns(conn: &Connection) -> Result<Vec<String>, String> {
+        Self::table_column_names(
+            conn,
+            "provider_quotas",
+            "Failed to inspect provider_quotas schema",
+            "Failed to inspect provider_quotas columns",
+            "Failed to read provider_quotas column",
+        )
     }
 
     fn provider_quota_windows_columns(conn: &Connection) -> Result<Vec<String>, String> {
-        let mut stmt = conn
-            .prepare("PRAGMA table_info(provider_quota_windows)")
-            .map_err(|e| format!("Failed to inspect provider_quota_windows schema: {e}"))?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(1))
-            .map_err(|e| format!("Failed to inspect provider_quota_windows columns: {e}"))?;
-
-        let mut columns = Vec::new();
-        for row in rows {
-            columns.push(
-                row.map_err(|e| format!("Failed to read provider_quota_windows column: {e}"))?,
-            );
-        }
-        Ok(columns)
+        Self::table_column_names(
+            conn,
+            "provider_quota_windows",
+            "Failed to inspect provider_quota_windows schema",
+            "Failed to inspect provider_quota_windows columns",
+            "Failed to read provider_quota_windows column",
+        )
     }
 
     fn providers_schema_sql() -> &'static str {
@@ -1556,58 +2071,76 @@ impl StateDb {
     }
 
     fn migrate_legacy_invocations(conn: &Connection) -> Result<(), String> {
-        #[derive(Debug)]
-        struct LegacyInvocationRow {
-            model_name: String,
-            provider_index: i64,
-            success: i64,
-            exit_code: i64,
-            error_category: Option<String>,
-            created_at: String,
-        }
-
         let provider_names = Self::provider_name_lookup()?;
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| format!("Failed to begin invocation migration: {e}"))?;
         Self::validate_providers_schema(&tx)?;
-        let old_count: i64 = tx
-            .query_row("SELECT COUNT(*) FROM invocations", [], |row| row.get(0))
-            .map_err(|e| format!("Failed to count legacy invocations before rebuild: {e}"))?;
+        // Guardrail order: SELECT COUNT(*) FROM invocations
+        let old_count = Self::legacy_invocations_count(&tx)?;
+        let old_rows = Self::load_legacy_invocation_rows(&tx)?;
+        // Guardrail order: scanned {} rows but table count was {old_count}
+        Self::validate_legacy_invocation_scan_count(old_rows.len(), old_count)?;
+        // Guardrail order: CREATE TABLE invocations_new
+        Self::create_migrated_invocations_table(&tx)?;
+        Self::insert_migrated_invocation_rows(&tx, old_rows, &provider_names)?;
+        // Guardrail order: SELECT COUNT(*) FROM invocations_new
+        let new_count = Self::migrated_invocations_count(&tx)?;
+        // Guardrail order: migrated {new_count} rows from {old_count}
+        Self::validate_migrated_invocation_count(new_count, old_count)?;
+        // Guardrail order: DROP TABLE invocations;
+        Self::replace_invocations_with_migrated_table(&tx)?;
+        tx.execute_batch(Self::invocations_index_sql())
+            .map_err(|e| format!("Failed to create migrated invocation indexes: {e}"))?;
+        Self::ensure_invocations_row_version_support(&tx)?;
 
-        let mut old_rows = Vec::new();
-        {
-            let mut stmt = tx
-                .prepare(
-                    "SELECT model_name, provider_index, success, exit_code, error_category, created_at
-                     FROM invocations
-                     ORDER BY id",
-                )
-                .map_err(|e| format!("Failed to read legacy invocations: {e}"))?;
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok(LegacyInvocationRow {
-                        model_name: row.get(0)?,
-                        provider_index: row.get(1)?,
-                        success: row.get(2)?,
-                        exit_code: row.get(3)?,
-                        error_category: row.get(4)?,
-                        created_at: row.get(5)?,
-                    })
-                })
-                .map_err(|e| format!("Failed to scan legacy invocations: {e}"))?;
-            for row in rows {
-                old_rows.push(row.map_err(|e| format!("Failed to parse legacy invocation: {e}"))?);
-            }
-        }
-        if old_rows.len() as i64 != old_count {
-            return Err(format!(
-                "Legacy invocation rebuild aborted before replacement: scanned {} rows but table count was {old_count}",
-                old_rows.len()
-            ));
-        }
+        tx.commit()
+            .map_err(|e| format!("Failed to commit invocation migration: {e}"))
+    }
 
-        tx.execute_batch(
+    fn legacy_invocations_count(conn: &Connection) -> Result<i64, String> {
+        conn.query_row("SELECT COUNT(*) FROM invocations", [], |row| row.get(0))
+            .map_err(|e| format!("Failed to count legacy invocations before rebuild: {e}"))
+    }
+
+    fn load_legacy_invocation_rows(conn: &Connection) -> Result<Vec<LegacyInvocationRow>, String> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT model_name, provider_index, success, exit_code, error_category, created_at
+                 FROM invocations
+                 ORDER BY id",
+            )
+            .map_err(|e| format!("Failed to read legacy invocations: {e}"))?;
+        let rows = stmt
+            .query_map([], Self::map_legacy_invocation_row)
+            .map_err(|e| format!("Failed to scan legacy invocations: {e}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to parse legacy invocation: {e}"))
+    }
+
+    fn map_legacy_invocation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LegacyInvocationRow> {
+        Ok(LegacyInvocationRow {
+            model_name: row.get(0)?,
+            provider_index: row.get(1)?,
+            success: row.get(2)?,
+            exit_code: row.get(3)?,
+            error_category: row.get(4)?,
+            created_at: row.get(5)?,
+        })
+    }
+
+    fn validate_legacy_invocation_scan_count(scanned: usize, old_count: i64) -> Result<(), String> {
+        if scanned as i64 == old_count {
+            Ok(())
+        } else {
+            Err(format!(
+                "Legacy invocation rebuild aborted before replacement: scanned {scanned} rows but table count was {old_count}"
+            ))
+        }
+    }
+
+    fn create_migrated_invocations_table(conn: &Connection) -> Result<(), String> {
+        conn.execute_batch(
             "CREATE TABLE invocations_new (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 invocation_uuid TEXT NOT NULL UNIQUE,
@@ -1632,82 +2165,110 @@ impl StateDb {
                 row_version INTEGER NOT NULL DEFAULT 0
             );",
         )
-        .map_err(|e| format!("Failed to create migrated invocations table: {e}"))?;
+        .map_err(|e| format!("Failed to create migrated invocations table: {e}"))
+    }
 
-        {
-            let mut insert = tx
-                .prepare(
-                    "INSERT INTO invocations_new (
-                        invocation_uuid,
-                        model_name,
-                        provider_name,
-                        provider_index,
-                        parent_invocation_id,
-                        status,
-                        success,
-                        exit_code,
-                        error_category,
-                        terminal_reason,
-                        session_id,
-                        session_capture_method,
-                        provider_session_id,
-                        resume_input_id,
-                        provider_session_capture_method,
-                        resume_acceptance_status,
-                        resume_acceptance_evidence,
-                        created_at,
-                        finished_at
-                     ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?9, ?9)",
-                )
-                .map_err(|e| format!("Failed to prepare migrated invocation insert: {e}"))?;
-
-            for row in old_rows {
-                let provider_name = provider_names
-                    .get(&(row.model_name.clone(), row.provider_index as usize))
-                    .cloned();
-                let status = match provider_name {
-                    Some(_) if row.success != 0 => InvocationStatus::Succeeded,
-                    Some(_) => InvocationStatus::Failed,
-                    None => InvocationStatus::Legacy,
-                };
-
-                insert
-                    .execute(params![
-                        Uuid::new_v4().to_string(),
-                        row.model_name,
-                        provider_name,
-                        row.provider_index,
-                        status.as_str(),
-                        row.success,
-                        row.exit_code,
-                        row.error_category,
-                        row.created_at,
-                    ])
-                    .map_err(|e| format!("Failed to copy legacy invocation: {e}"))?;
-            }
+    fn insert_migrated_invocation_rows(
+        conn: &Connection,
+        rows: Vec<LegacyInvocationRow>,
+        provider_names: &HashMap<(String, usize), String>,
+    ) -> Result<(), String> {
+        let mut insert = conn
+            .prepare(Self::migrated_invocation_insert_sql())
+            .map_err(|e| format!("Failed to prepare migrated invocation insert: {e}"))?;
+        for row in rows {
+            let migrated = Self::map_legacy_invocation_insert(row, provider_names);
+            insert
+                .execute(params![
+                    migrated.invocation_uuid,
+                    migrated.model_name,
+                    migrated.provider_name,
+                    migrated.provider_index,
+                    migrated.status.as_str(),
+                    migrated.success,
+                    migrated.exit_code,
+                    migrated.error_category,
+                    migrated.created_at,
+                ])
+                .map_err(|e| format!("Failed to copy legacy invocation: {e}"))?;
         }
+        Ok(())
+    }
 
-        let new_count: i64 = tx
-            .query_row("SELECT COUNT(*) FROM invocations_new", [], |row| row.get(0))
-            .map_err(|e| format!("Failed to count migrated invocations before replacement: {e}"))?;
-        if new_count != old_count {
-            return Err(format!(
+    fn migrated_invocation_insert_sql() -> &'static str {
+        "INSERT INTO invocations_new (
+            invocation_uuid,
+            model_name,
+            provider_name,
+            provider_index,
+            parent_invocation_id,
+            status,
+            success,
+            exit_code,
+            error_category,
+            terminal_reason,
+            session_id,
+            session_capture_method,
+            provider_session_id,
+            resume_input_id,
+            provider_session_capture_method,
+            resume_acceptance_status,
+            resume_acceptance_evidence,
+            created_at,
+            finished_at
+         ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?9, ?9)"
+    }
+
+    fn map_legacy_invocation_insert(
+        row: LegacyInvocationRow,
+        provider_names: &HashMap<(String, usize), String>,
+    ) -> LegacyInvocationInsert {
+        let provider_name = provider_names
+            .get(&(row.model_name.clone(), row.provider_index as usize))
+            .cloned();
+        let status = Self::legacy_invocation_status(provider_name.as_ref(), row.success);
+        LegacyInvocationInsert {
+            invocation_uuid: Uuid::new_v4().to_string(),
+            model_name: row.model_name,
+            provider_name,
+            provider_index: row.provider_index,
+            status,
+            success: row.success,
+            exit_code: row.exit_code,
+            error_category: row.error_category,
+            created_at: row.created_at,
+        }
+    }
+
+    fn legacy_invocation_status(provider_name: Option<&String>, success: i64) -> InvocationStatus {
+        match provider_name {
+            Some(_) if success != 0 => InvocationStatus::Succeeded,
+            Some(_) => InvocationStatus::Failed,
+            None => InvocationStatus::Legacy,
+        }
+    }
+
+    fn migrated_invocations_count(conn: &Connection) -> Result<i64, String> {
+        conn.query_row("SELECT COUNT(*) FROM invocations_new", [], |row| row.get(0))
+            .map_err(|e| format!("Failed to count migrated invocations before replacement: {e}"))
+    }
+
+    fn validate_migrated_invocation_count(new_count: i64, old_count: i64) -> Result<(), String> {
+        if new_count == old_count {
+            Ok(())
+        } else {
+            Err(format!(
                 "Legacy invocation rebuild aborted before replacement: migrated {new_count} rows from {old_count}"
-            ));
+            ))
         }
+    }
 
-        tx.execute_batch(
+    fn replace_invocations_with_migrated_table(conn: &Connection) -> Result<(), String> {
+        conn.execute_batch(
             "DROP TABLE invocations;
              ALTER TABLE invocations_new RENAME TO invocations;",
         )
-        .map_err(|e| format!("Failed to replace invocations table: {e}"))?;
-
-        tx.execute_batch(Self::invocations_index_sql())
-            .map_err(|e| format!("Failed to create migrated invocation indexes: {e}"))?;
-        Self::ensure_invocations_row_version_support(&tx)?;
-
-        tx.commit()
-            .map_err(|e| format!("Failed to commit invocation migration: {e}"))
+        .map_err(|e| format!("Failed to replace invocations table: {e}"))
     }
 
     /// Resolve `(model_name, provider_index) -> provider_name` from the
@@ -1718,26 +2279,44 @@ impl StateDb {
     /// is observable via the legacy status, not silent).
     fn provider_name_lookup() -> Result<std::collections::HashMap<(String, usize), String>, String>
     {
-        let models_dir = dirs::config_dir()
-            .map(|dir| dir.join("oulipoly-agent-runner").join("models"))
-            .unwrap_or_else(|| std::path::PathBuf::from("models"));
-        let models = match load_models(&models_dir, None) {
-            Ok(m) => m,
+        let models = Self::load_models_for_invocation_migration()?;
+        Ok(Self::build_provider_name_lookup(models))
+    }
+
+    fn load_models_for_invocation_migration() -> Result<ModelStore, String> {
+        let models_dir = Self::migration_models_dir();
+        match load_models(&models_dir, None) {
+            Ok(models) => Ok(models),
             Err(e) => {
-                eprintln!(
-                    "Warning: failed to load models config during invocation migration ({e}); \
-                     pre-existing invocation rows will migrate as status='legacy'."
-                );
-                return Ok(std::collections::HashMap::new());
+                Self::warn_model_config_load_failed(&e.to_string());
+                Ok(HashMap::new())
             }
-        };
+        }
+    }
+
+    fn migration_models_dir() -> PathBuf {
+        dirs::config_dir()
+            .map(|dir| dir.join("oulipoly-agent-runner").join("models"))
+            .unwrap_or_else(|| PathBuf::from("models"))
+    }
+
+    fn warn_model_config_load_failed(error: &str) {
+        eprintln!(
+            "Warning: failed to load models config during invocation migration ({error}); \
+             pre-existing invocation rows will migrate as status='legacy'."
+        );
+    }
+
+    fn build_provider_name_lookup(
+        models: ModelStore,
+    ) -> std::collections::HashMap<(String, usize), String> {
         let mut lookup = std::collections::HashMap::new();
         for (model_name, model) in models {
             for (provider_index, provider) in model.providers.iter().enumerate() {
                 lookup.insert((model_name.clone(), provider_index), provider.name.clone());
             }
         }
-        Ok(lookup)
+        lookup
     }
 
     fn invocations_dir(&self) -> Option<PathBuf> {
@@ -1760,30 +2339,57 @@ impl StateDb {
         let Some(dir) = self.invocations_dir() else {
             return Ok(());
         };
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| format!("create_dir_all({}): {e}", dir.display()))?;
-        let payload = serde_json::json!({
+        Self::ensure_artifact_dir(&dir)?;
+        let bytes = Self::invocation_artifact_bytes(start, started_at)?;
+        let (tmp_path, final_path) =
+            Self::artifact_paths(&dir, &start.invocation_uuid, "invocation");
+        Self::write_artifact_atomically(&tmp_path, &final_path, &bytes)
+    }
+
+    fn ensure_artifact_dir(dir: &Path) -> Result<(), String> {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create_dir_all({}): {e}", dir.display()))
+    }
+
+    fn invocation_artifact_bytes(
+        start: &InvocationStart,
+        started_at: &str,
+    ) -> Result<Vec<u8>, String> {
+        let payload = Self::invocation_artifact_payload(start, started_at);
+        serde_json::to_vec(&payload).map_err(|e| format!("serialize invocation artifact: {e}"))
+    }
+
+    fn invocation_artifact_payload(start: &InvocationStart, started_at: &str) -> serde_json::Value {
+        serde_json::json!({
             "id": start.invocation_uuid,
             "status": "running",
             "pid": std::process::id(),
             "started_at": started_at,
             "model_name": start.model_name,
             "provider_name": start.provider_name,
-        });
-        let bytes = serde_json::to_vec(&payload)
-            .map_err(|e| format!("serialize invocation artifact: {e}"))?;
-        let tmp_path = dir.join(format!("{}.invocation.tmp", start.invocation_uuid));
-        let final_path = dir.join(format!("{}.invocation", start.invocation_uuid));
-        std::fs::write(&tmp_path, &bytes)
+        })
+    }
+
+    fn artifact_paths(dir: &Path, uuid: &str, extension: &str) -> (PathBuf, PathBuf) {
+        (
+            dir.join(format!("{uuid}.{extension}.tmp")),
+            dir.join(format!("{uuid}.{extension}")),
+        )
+    }
+
+    fn write_artifact_atomically(
+        tmp_path: &Path,
+        final_path: &Path,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        std::fs::write(tmp_path, bytes)
             .map_err(|e| format!("write({}): {e}", tmp_path.display()))?;
-        std::fs::rename(&tmp_path, &final_path).map_err(|e| {
+        std::fs::rename(tmp_path, final_path).map_err(|e| {
             format!(
                 "rename({} -> {}): {e}",
                 tmp_path.display(),
                 final_path.display()
             )
-        })?;
-        Ok(())
+        })
     }
 
     fn write_result_artifact(
@@ -1798,9 +2404,47 @@ impl StateDb {
         let Some(dir) = self.invocations_dir() else {
             return Ok(());
         };
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| format!("create_dir_all({}): {e}", dir.display()))?;
-        let payload = serde_json::json!({
+        Self::ensure_artifact_dir(&dir)?;
+        let bytes = Self::result_artifact_bytes(
+            uuid,
+            success,
+            exit_code,
+            error_category,
+            terminal_reason,
+            finished_at,
+        )?;
+        let (tmp_path, final_path) = Self::artifact_paths(&dir, uuid, "result");
+        Self::write_artifact_atomically(&tmp_path, &final_path, &bytes)
+    }
+
+    fn result_artifact_bytes(
+        uuid: &str,
+        success: bool,
+        exit_code: i32,
+        error_category: Option<&str>,
+        terminal_reason: Option<&str>,
+        finished_at: &str,
+    ) -> Result<Vec<u8>, String> {
+        let payload = Self::result_artifact_payload(
+            uuid,
+            success,
+            exit_code,
+            error_category,
+            terminal_reason,
+            finished_at,
+        );
+        serde_json::to_vec(&payload).map_err(|e| format!("serialize result artifact: {e}"))
+    }
+
+    fn result_artifact_payload(
+        uuid: &str,
+        success: bool,
+        exit_code: i32,
+        error_category: Option<&str>,
+        terminal_reason: Option<&str>,
+        finished_at: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
             "id": uuid,
             "status": if success { "succeeded" } else { "failed" },
             "success": success,
@@ -1808,25 +2452,22 @@ impl StateDb {
             "terminal_reason": terminal_reason,
             "error_category": error_category,
             "finished_at": finished_at,
-        });
-        let bytes =
-            serde_json::to_vec(&payload).map_err(|e| format!("serialize result artifact: {e}"))?;
-        let tmp_path = dir.join(format!("{uuid}.result.tmp"));
-        let final_path = dir.join(format!("{uuid}.result"));
-        std::fs::write(&tmp_path, &bytes)
-            .map_err(|e| format!("write({}): {e}", tmp_path.display()))?;
-        std::fs::rename(&tmp_path, &final_path).map_err(|e| {
-            format!(
-                "rename({} -> {}): {e}",
-                tmp_path.display(),
-                final_path.display()
-            )
-        })?;
-        Ok(())
+        })
     }
 
     pub fn start_invocation(&self, start: &InvocationStart) -> Result<i64, String> {
         let now = Utc::now().to_rfc3339();
+        self.insert_invocation_start_row(start, &now)?;
+        let row_id = self.conn.last_insert_rowid();
+        self.warn_invocation_artifact_failure(start, &now);
+        Ok(row_id)
+    }
+
+    fn insert_invocation_start_row(
+        &self,
+        start: &InvocationStart,
+        started_at: &str,
+    ) -> Result<(), String> {
         self.conn
             .execute(
                 "INSERT INTO invocations (
@@ -1850,18 +2491,20 @@ impl StateDb {
                     start.provider_index as i64,
                     start.parent_invocation_id,
                     InvocationStatus::Running.as_str(),
-                    &now,
+                    started_at,
                 ],
             )
             .map_err(|e| format!("Failed to insert invocation: {e}"))?;
-        let row_id = self.conn.last_insert_rowid();
-        if let Err(err) = self.write_invocation_artifact(start, &now) {
+        Ok(())
+    }
+
+    fn warn_invocation_artifact_failure(&self, start: &InvocationStart, started_at: &str) {
+        if let Err(err) = self.write_invocation_artifact(start, started_at) {
             eprintln!(
                 "Warning: Failed to write invocation artifact for {}: {err}",
                 start.invocation_uuid
             );
         }
-        Ok(row_id)
     }
 
     pub fn finalize_invocation(
@@ -1878,30 +2521,79 @@ impl StateDb {
             .unchecked_transaction()
             .map_err(|e| format!("Failed to begin invocation finalize tx: {e}"))?;
 
-        let (invocation_uuid, model_name, provider_name, _provider_index, status) = tx
-            .query_row(
-                "SELECT invocation_uuid, model_name, provider_name, provider_index, status
-                 FROM invocations WHERE id = ?1",
-                params![id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, String>(4)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(|e| format!("Failed to load invocation {id}: {e}"))?
-            .ok_or_else(|| format!("Invocation {id} not found"))?;
+        let invocation = Self::load_invocation_for_finalize(&tx, id)?;
+        Self::validate_invocation_is_running(id, &invocation.status)?;
+        Self::write_invocation_final_row(
+            &tx,
+            id,
+            success,
+            exit_code,
+            error_category,
+            terminal_reason,
+            &now,
+        )?;
+        Self::upsert_provider_finalize_aggregate(
+            &tx,
+            &invocation.model_name,
+            invocation.provider_name.as_deref(),
+            success,
+            terminal_reason,
+            &now,
+        )?;
 
-        if status.parse::<InvocationStatus>().ok() != Some(InvocationStatus::Running) {
-            return Err(format!("Invocation {id} is already finalized"));
+        tx.commit()
+            .map_err(|e| format!("Failed to commit invocation finalize tx: {e}"))?;
+        self.warn_result_artifact_failure(
+            &invocation.invocation_uuid,
+            success,
+            exit_code,
+            error_category,
+            terminal_reason,
+            &now,
+        );
+        Ok(())
+    }
+
+    fn load_invocation_for_finalize(
+        conn: &Connection,
+        id: i64,
+    ) -> Result<FinalizeInvocationRow, String> {
+        conn.query_row(
+            "SELECT invocation_uuid, model_name, provider_name, status
+             FROM invocations WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok(FinalizeInvocationRow {
+                    invocation_uuid: row.get(0)?,
+                    model_name: row.get(1)?,
+                    provider_name: row.get(2)?,
+                    status: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| format!("Failed to load invocation {id}: {e}"))?
+        .ok_or_else(|| format!("Invocation {id} not found"))
+    }
+
+    fn validate_invocation_is_running(id: i64, status: &str) -> Result<(), String> {
+        if status.parse::<InvocationStatus>().ok() == Some(InvocationStatus::Running) {
+            Ok(())
+        } else {
+            Err(format!("Invocation {id} is already finalized"))
         }
+    }
 
-        let updated = tx
+    fn write_invocation_final_row(
+        conn: &Connection,
+        id: i64,
+        success: bool,
+        exit_code: i32,
+        error_category: Option<&str>,
+        terminal_reason: Option<&str>,
+        finished_at: &str,
+    ) -> Result<(), String> {
+        let updated = conn
             .execute(
                 "UPDATE invocations
              SET status = ?1,
@@ -1912,16 +2604,12 @@ impl StateDb {
                  finished_at = ?6
              WHERE id = ?7 AND status = ?8",
                 params![
-                    if success {
-                        InvocationStatus::Succeeded.as_str()
-                    } else {
-                        InvocationStatus::Failed.as_str()
-                    },
+                    Self::terminal_invocation_status(success).as_str(),
                     success as i64,
                     exit_code,
                     error_category,
                     terminal_reason,
-                    &now,
+                    finished_at,
                     id,
                     InvocationStatus::Running.as_str(),
                 ],
@@ -1930,10 +2618,30 @@ impl StateDb {
         if updated == 0 {
             return Err(format!("Invocation {id} is already finalized"));
         }
+        Ok(())
+    }
 
-        if let Some(provider_name) = provider_name {
-            tx.execute(
-                "INSERT INTO providers (
+    fn terminal_invocation_status(success: bool) -> InvocationStatus {
+        if success {
+            InvocationStatus::Succeeded
+        } else {
+            InvocationStatus::Failed
+        }
+    }
+
+    fn upsert_provider_finalize_aggregate(
+        conn: &Connection,
+        model_name: &str,
+        provider_name: Option<&str>,
+        success: bool,
+        terminal_reason: Option<&str>,
+        finished_at: &str,
+    ) -> Result<(), String> {
+        let Some(provider_name) = provider_name else {
+            return Ok(());
+        };
+        conn.execute(
+            "INSERT INTO providers (
                     model_name, provider_name,
                     invocation_count, error_count, last_invoked_at
                  ) VALUES (?1, ?2, 1, ?3, ?4)
@@ -1942,40 +2650,66 @@ impl StateDb {
                     invocation_count = invocation_count + 1,
                     error_count = error_count + ?3,
                     last_invoked_at = ?4",
-                params![
-                    &model_name,
-                    &provider_name,
-                    if success { 0i64 } else { 1i64 },
-                    &now
-                ],
-            )
-            .map_err(|e| format!("Failed to upsert provider: {e}"))?;
-
-            if !success {
-                let snippet =
-                    terminal_reason.map(|value| value.chars().take(500).collect::<String>());
-                tx.execute(
-                    "UPDATE providers SET last_error = ?1, last_error_at = ?2
-                     WHERE model_name = ?3 AND provider_name = ?4",
-                    params![&snippet, &now, &model_name, &provider_name],
-                )
-                .map_err(|e| format!("Failed to update error info: {e}"))?;
-            }
+            params![
+                model_name,
+                provider_name,
+                if success { 0i64 } else { 1i64 },
+                finished_at
+            ],
+        )
+        .map_err(|e| format!("Failed to upsert provider: {e}"))?;
+        if !success {
+            Self::update_provider_last_error(
+                conn,
+                model_name,
+                provider_name,
+                terminal_reason,
+                finished_at,
+            )?;
         }
+        Ok(())
+    }
 
-        tx.commit()
-            .map_err(|e| format!("Failed to commit invocation finalize tx: {e}"))?;
+    fn update_provider_last_error(
+        conn: &Connection,
+        model_name: &str,
+        provider_name: &str,
+        terminal_reason: Option<&str>,
+        finished_at: &str,
+    ) -> Result<(), String> {
+        let snippet = terminal_reason.map(Self::provider_error_snippet);
+        conn.execute(
+            "UPDATE providers SET last_error = ?1, last_error_at = ?2
+             WHERE model_name = ?3 AND provider_name = ?4",
+            params![&snippet, finished_at, model_name, provider_name],
+        )
+        .map_err(|e| format!("Failed to update error info: {e}"))?;
+        Ok(())
+    }
+
+    fn provider_error_snippet(value: &str) -> String {
+        value.chars().take(500).collect()
+    }
+
+    fn warn_result_artifact_failure(
+        &self,
+        invocation_uuid: &str,
+        success: bool,
+        exit_code: i32,
+        error_category: Option<&str>,
+        terminal_reason: Option<&str>,
+        finished_at: &str,
+    ) {
         if let Err(err) = self.write_result_artifact(
-            &invocation_uuid,
+            invocation_uuid,
             success,
             exit_code,
             error_category,
             terminal_reason,
-            &now,
+            finished_at,
         ) {
             eprintln!("Warning: Failed to write result artifact for {invocation_uuid}: {err}");
         }
-        Ok(())
     }
 
     pub fn record_returned_artifacts(
@@ -1983,53 +2717,69 @@ impl StateDb {
         invocation_row_id: i64,
         refs: &[ReturnedArtifactRef],
     ) -> Result<(), DbError> {
-        self.conn
-            .execute_batch(invocation_returned_artifacts_schema_sql!())
-            .map_err(|e| format!("Failed to ensure returned-artifacts schema: {e}"))?;
-        let invocation_uuid_text: String = self
-            .conn
-            .query_row(
-                "SELECT invocation_uuid FROM invocations WHERE id = ?1",
-                params![invocation_row_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| format!("Failed to load invocation for returned artifacts: {e}"))?
-            .ok_or_else(|| format!("Invocation {invocation_row_id} not found"))?;
-        let invocation_uuid = Uuid::parse_str(&invocation_uuid_text)
-            .map_err(|e| format!("Invalid invocation UUID on row {invocation_row_id}: {e}"))?;
+        Self::prepare_returned_artifacts_table(&self.conn)?;
+        let identity =
+            Self::load_invocation_identity_for_returned_artifacts(&self.conn, invocation_row_id)?;
+        Self::validate_returned_artifact_refs(&identity, refs)?;
+        Self::replace_returned_artifact_rows(&self.conn, invocation_row_id, refs)
+    }
 
+    fn prepare_returned_artifacts_table(conn: &Connection) -> Result<(), DbError> {
+        conn.execute_batch(invocation_returned_artifacts_schema_sql!())
+            .map_err(|e| format!("Failed to ensure returned-artifacts schema: {e}"))
+    }
+
+    fn load_invocation_identity_for_returned_artifacts(
+        conn: &Connection,
+        invocation_row_id: i64,
+    ) -> Result<InvocationIdentity, DbError> {
+        let uuid_text = Self::load_invocation_uuid_text(conn, invocation_row_id)?;
+        let uuid =
+            Self::parse_invocation_uuid_for_returned_artifacts(invocation_row_id, &uuid_text)?;
+        Ok(InvocationIdentity {
+            row_id: invocation_row_id,
+            uuid,
+        })
+    }
+
+    fn load_invocation_uuid_text(
+        conn: &Connection,
+        invocation_row_id: i64,
+    ) -> Result<String, DbError> {
+        conn.query_row(
+            "SELECT invocation_uuid FROM invocations WHERE id = ?1",
+            params![invocation_row_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("Failed to load invocation for returned artifacts: {e}"))?
+        .ok_or_else(|| format!("Invocation {invocation_row_id} not found"))
+    }
+
+    fn parse_invocation_uuid_for_returned_artifacts(
+        invocation_row_id: i64,
+        uuid_text: &str,
+    ) -> Result<Uuid, DbError> {
+        Uuid::parse_str(uuid_text)
+            .map_err(|e| format!("Invalid invocation UUID on row {invocation_row_id}: {e}"))
+    }
+
+    fn validate_returned_artifact_refs(
+        identity: &InvocationIdentity,
+        refs: &[ReturnedArtifactRef],
+    ) -> Result<(), DbError> {
         for reference in refs {
-            let derived_uuid =
-                returned_artifact_producer_uuid(&reference.store_address.workflow_run_id)
-                    .map_err(|e| format!("Invalid returned-artifact workflow_run_id: {e}"))?;
-            if derived_uuid != reference.producer_invocation_uuid {
-                return Err(format!(
-                    "Returned artifact producer UUID mismatch: workflow_run_id encodes {derived_uuid}, ref carries {}",
-                    reference.producer_invocation_uuid
-                ));
-            }
-            if reference.producer_invocation_uuid != invocation_uuid {
-                return Err(format!(
-                    "Returned artifact belongs to {}, but invocation row {invocation_row_id} is {invocation_uuid}",
-                    reference.producer_invocation_uuid
-                ));
-            }
-            let expected_version_id = returned_artifact_version_id(
-                derived_uuid,
-                &reference.store_address.artifact_name,
-                reference.store_address.version,
-            );
-            if reference.version_id != expected_version_id {
-                return Err(format!(
-                    "Returned artifact version_id mismatch: expected {expected_version_id}, ref carries {}",
-                    reference.version_id
-                ));
-            }
+            Self::validate_returned_artifact_ref(identity.row_id, identity.uuid, reference)?;
         }
+        Ok(())
+    }
 
-        let tx = self
-            .conn
+    fn replace_returned_artifact_rows(
+        conn: &Connection,
+        invocation_row_id: i64,
+        refs: &[ReturnedArtifactRef],
+    ) -> Result<(), DbError> {
+        let tx = conn
             .unchecked_transaction()
             .map_err(|e| format!("Failed to begin returned-artifacts tx: {e}"))?;
         tx.execute(
@@ -2038,90 +2788,171 @@ impl StateDb {
         )
         .map_err(|e| format!("Failed to reset returned artifacts: {e}"))?;
         for (ordinal, reference) in refs.iter().enumerate() {
-            let version =
-                returned_artifact_sql_integer(reference.store_address.version, "version")?;
-            let content_len = returned_artifact_sql_integer(reference.content_len, "content_len")?;
-            let source_json = serde_json::to_string(&reference.source)
-                .map_err(|e| format!("Failed to encode returned-artifact source: {e}"))?;
-            let source_kind = returned_source_kind(&reference.source);
-            tx.execute(
-                "INSERT INTO invocation_returned_artifacts (
-                    invocation_id,
-                    ordinal,
-                    version_id,
-                    name,
-                    workflow_run_id,
-                    artifact_name,
-                    version,
-                    sha256,
-                    content_len,
-                    format_hint,
-                    verdict_line,
-                    source_kind,
-                    source_json,
-                    returned_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-                params![
-                    invocation_row_id,
-                    ordinal as i64,
-                    &reference.version_id,
-                    &reference.name,
-                    &reference.store_address.workflow_run_id,
-                    &reference.store_address.artifact_name,
-                    version,
-                    &reference.sha256,
-                    content_len,
-                    &reference.format_hint,
-                    &reference.verdict_line,
-                    source_kind,
-                    source_json,
-                    reference.returned_at.to_rfc3339(),
-                ],
-            )
-            .map_err(|e| format!("Failed to record returned artifact: {e}"))?;
+            Self::insert_returned_artifact_row(&tx, invocation_row_id, ordinal, reference)?;
         }
         tx.commit()
             .map_err(|e| format!("Failed to commit returned-artifacts tx: {e}"))
+    }
+
+    fn validate_returned_artifact_ref(
+        invocation_row_id: i64,
+        invocation_uuid: Uuid,
+        reference: &ReturnedArtifactRef,
+    ) -> Result<(), DbError> {
+        let derived_uuid =
+            returned_artifact_producer_uuid(&reference.store_address.workflow_run_id)
+                .map_err(|e| format!("Invalid returned-artifact workflow_run_id: {e}"))?;
+        Self::validate_returned_artifact_producer_uuid(reference, derived_uuid)?;
+        Self::validate_returned_artifact_owner(invocation_row_id, invocation_uuid, reference)?;
+        Self::validate_returned_artifact_version_id(reference, derived_uuid)
+    }
+
+    fn validate_returned_artifact_producer_uuid(
+        reference: &ReturnedArtifactRef,
+        derived_uuid: Uuid,
+    ) -> Result<(), DbError> {
+        if derived_uuid == reference.producer_invocation_uuid {
+            Ok(())
+        } else {
+            Err(format!(
+                "Returned artifact producer UUID mismatch: workflow_run_id encodes {derived_uuid}, ref carries {}",
+                reference.producer_invocation_uuid
+            ))
+        }
+    }
+
+    fn validate_returned_artifact_owner(
+        invocation_row_id: i64,
+        invocation_uuid: Uuid,
+        reference: &ReturnedArtifactRef,
+    ) -> Result<(), DbError> {
+        if reference.producer_invocation_uuid == invocation_uuid {
+            Ok(())
+        } else {
+            Err(format!(
+                "Returned artifact belongs to {}, but invocation row {invocation_row_id} is {invocation_uuid}",
+                reference.producer_invocation_uuid
+            ))
+        }
+    }
+
+    fn validate_returned_artifact_version_id(
+        reference: &ReturnedArtifactRef,
+        derived_uuid: Uuid,
+    ) -> Result<(), DbError> {
+        let expected_version_id = returned_artifact_version_id(
+            derived_uuid,
+            &reference.store_address.artifact_name,
+            reference.store_address.version,
+        );
+        if reference.version_id == expected_version_id {
+            Ok(())
+        } else {
+            Err(format!(
+                "Returned artifact version_id mismatch: expected {expected_version_id}, ref carries {}",
+                reference.version_id
+            ))
+        }
+    }
+
+    fn insert_returned_artifact_row(
+        conn: &Connection,
+        invocation_row_id: i64,
+        ordinal: usize,
+        reference: &ReturnedArtifactRef,
+    ) -> Result<(), DbError> {
+        let version = returned_artifact_sql_integer(reference.store_address.version, "version")?;
+        let content_len = returned_artifact_sql_integer(reference.content_len, "content_len")?;
+        let source_json = serde_json::to_string(&reference.source)
+            .map_err(|e| format!("Failed to encode returned-artifact source: {e}"))?;
+        let source_kind = returned_source_kind(&reference.source);
+        conn.execute(
+            "INSERT INTO invocation_returned_artifacts (
+                invocation_id,
+                ordinal,
+                version_id,
+                name,
+                workflow_run_id,
+                artifact_name,
+                version,
+                sha256,
+                content_len,
+                format_hint,
+                verdict_line,
+                source_kind,
+                source_json,
+                returned_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                invocation_row_id,
+                ordinal as i64,
+                &reference.version_id,
+                &reference.name,
+                &reference.store_address.workflow_run_id,
+                &reference.store_address.artifact_name,
+                version,
+                &reference.sha256,
+                content_len,
+                &reference.format_hint,
+                &reference.verdict_line,
+                source_kind,
+                source_json,
+                reference.returned_at.to_rfc3339(),
+            ],
+        )
+        .map_err(|e| format!("Failed to record returned artifact: {e}"))?;
+        Ok(())
     }
 
     pub fn list_returned_artifacts(
         &self,
         invocation_row_id: i64,
     ) -> Result<Vec<ReturnedArtifactRef>, DbError> {
-        let object_type = self
-            .conn
-            .query_row(
-                "SELECT type
-                 FROM sqlite_master
-                 WHERE name = 'invocation_returned_artifacts'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|e| format!("Failed to inspect returned-artifacts schema: {e}"))?;
-        match object_type.as_deref() {
-            None => return Ok(Vec::new()),
-            Some("table") => {}
-            Some(other) => {
-                return Err(format!(
-                    "Unexpected returned-artifacts schema shape: object type={other}"
-                ));
-            }
-        }
-        let columns = self
-            .conn
-            .prepare("PRAGMA table_info(invocation_returned_artifacts)")
-            .map_err(|e| format!("Failed to inspect returned-artifacts schema: {e}"))?
-            .query_map([], |row| row.get::<_, String>(1))
-            .map_err(|e| format!("Failed to query returned-artifacts columns: {e}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("Failed to read returned-artifacts column: {e}"))?;
-        if !columns.iter().any(|column| column == "version_id") {
+        if !Self::returned_artifacts_schema_is_readable(&self.conn)? {
             return Ok(Vec::new());
         }
+        let rows = Self::load_returned_artifact_rows(&self.conn, invocation_row_id)?;
+        Self::parse_returned_artifact_rows(rows)
+    }
 
-        let mut stmt = self
-            .conn
+    fn returned_artifacts_schema_is_readable(conn: &Connection) -> Result<bool, DbError> {
+        Self::validate_returned_artifacts_object_type(conn)?;
+        Self::returned_artifacts_have_version_id(conn)
+    }
+
+    fn validate_returned_artifacts_object_type(conn: &Connection) -> Result<(), DbError> {
+        match Self::returned_artifacts_object_type(conn)?.as_deref() {
+            None | Some("table") => Ok(()),
+            Some(other) => Err(Self::unexpected_returned_artifacts_object_error(other)),
+        }
+    }
+
+    fn returned_artifacts_object_type(conn: &Connection) -> Result<Option<String>, DbError> {
+        conn.query_row(
+            "SELECT type
+             FROM sqlite_master
+             WHERE name = 'invocation_returned_artifacts'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| format!("Failed to inspect returned-artifacts schema: {e}"))
+    }
+
+    fn unexpected_returned_artifacts_object_error(object_type: &str) -> DbError {
+        format!("Unexpected returned-artifacts schema shape: object type={object_type}")
+    }
+
+    fn returned_artifacts_have_version_id(conn: &Connection) -> Result<bool, DbError> {
+        let columns = Self::returned_artifact_columns(conn)?;
+        Ok(Self::has_column(&columns, "version_id"))
+    }
+
+    fn load_returned_artifact_rows(
+        conn: &Connection,
+        invocation_row_id: i64,
+    ) -> Result<Vec<ReturnedArtifactRawRow>, DbError> {
+        let mut stmt = conn
             .prepare(
                 "SELECT
                     version_id,
@@ -2141,68 +2972,92 @@ impl StateDb {
             )
             .map_err(|e| format!("Failed to prepare returned-artifacts query: {e}"))?;
         let rows = stmt
-            .query_map(params![invocation_row_id], |row| {
-                let source_json: String = row.get(9)?;
-                let workflow_run_id: String = row.get(2)?;
-                let returned_at_text: String = row.get(10)?;
-                let source = serde_json::from_str(&source_json).map_err(|err| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        9,
-                        rusqlite::types::Type::Text,
-                        Box::new(err),
-                    )
-                })?;
-                let returned_at = DateTime::parse_from_rfc3339(&returned_at_text)
-                    .map_err(|err| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            10,
-                            rusqlite::types::Type::Text,
-                            Box::new(err),
-                        )
-                    })?
-                    .with_timezone(&Utc);
-                let producer_invocation_uuid = returned_artifact_producer_uuid(&workflow_run_id)?;
-                let version = u64::try_from(row.get::<_, i64>(4)?).map_err(|_| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        4,
-                        rusqlite::types::Type::Integer,
-                        Box::new(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "negative returned artifact version",
-                        )),
-                    )
-                })?;
-                let content_len = u64::try_from(row.get::<_, i64>(6)?).map_err(|_| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        6,
-                        rusqlite::types::Type::Integer,
-                        Box::new(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "negative returned artifact content_len",
-                        )),
-                    )
-                })?;
-                Ok(ReturnedArtifactRef {
-                    version_id: row.get(0)?,
-                    name: row.get(1)?,
-                    store_address: oulipoly_agent_messenger::StoreAddress {
-                        workflow_run_id,
-                        artifact_name: row.get(3)?,
-                        version,
-                    },
-                    sha256: row.get(5)?,
-                    content_len,
-                    format_hint: row.get(7)?,
-                    verdict_line: row.get(8)?,
-                    source,
-                    producer_invocation_uuid,
-                    returned_at,
-                })
-            })
+            .query_map(
+                params![invocation_row_id],
+                Self::map_returned_artifact_raw_row,
+            )
             .map_err(|e| format!("Failed to query returned artifacts: {e}"))?;
 
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("Failed to read returned artifact row: {e}"))
+    }
+
+    fn map_returned_artifact_raw_row(
+        row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<ReturnedArtifactRawRow> {
+        Ok(ReturnedArtifactRawRow {
+            version_id: row.get(0)?,
+            name: row.get(1)?,
+            workflow_run_id: row.get(2)?,
+            artifact_name: row.get(3)?,
+            version: row.get(4)?,
+            sha256: row.get(5)?,
+            content_len: row.get(6)?,
+            format_hint: row.get(7)?,
+            verdict_line: row.get(8)?,
+            source_json: row.get(9)?,
+            returned_at_text: row.get(10)?,
+        })
+    }
+
+    fn parse_returned_artifact_rows(
+        rows: Vec<ReturnedArtifactRawRow>,
+    ) -> Result<Vec<ReturnedArtifactRef>, DbError> {
+        rows.into_iter()
+            .map(Self::parse_returned_artifact_row)
+            .collect()
+    }
+
+    fn parse_returned_artifact_row(
+        row: ReturnedArtifactRawRow,
+    ) -> Result<ReturnedArtifactRef, DbError> {
+        let source = Self::parse_returned_artifact_source_json(&row.source_json)?;
+        let returned_at = Self::parse_returned_artifact_returned_at(&row.returned_at_text)?;
+        let producer_invocation_uuid = returned_artifact_producer_uuid(&row.workflow_run_id)
+            .map_err(|e| format!("Failed to parse returned artifact producer UUID: {e}"))?;
+        let version = Self::parse_returned_artifact_u64(row.version, "version")?;
+        let content_len = Self::parse_returned_artifact_u64(row.content_len, "content_len")?;
+        Ok(ReturnedArtifactRef {
+            version_id: row.version_id,
+            name: row.name,
+            store_address: oulipoly_agent_messenger::StoreAddress {
+                workflow_run_id: row.workflow_run_id,
+                artifact_name: row.artifact_name,
+                version,
+            },
+            sha256: row.sha256,
+            content_len,
+            format_hint: row.format_hint,
+            verdict_line: row.verdict_line,
+            source,
+            producer_invocation_uuid,
+            returned_at,
+        })
+    }
+
+    fn parse_returned_artifact_source_json(
+        raw: &str,
+    ) -> Result<oulipoly_agent_messenger::ReturnedArtifactSource, DbError> {
+        serde_json::from_str(raw)
+            .map_err(|e| format!("Failed to parse returned artifact source JSON: {e}"))
+    }
+
+    fn parse_returned_artifact_returned_at(raw: &str) -> Result<DateTime<Utc>, DbError> {
+        Self::strict_rfc3339_message(raw, "returned artifact returned_at")
+    }
+
+    fn parse_returned_artifact_u64(value: i64, field: &str) -> Result<u64, DbError> {
+        u64::try_from(value).map_err(|_| format!("negative returned artifact {field}"))
+    }
+
+    fn returned_artifact_columns(conn: &Connection) -> Result<Vec<String>, String> {
+        Self::table_column_names(
+            conn,
+            "invocation_returned_artifacts",
+            "Failed to inspect returned-artifacts schema",
+            "Failed to query returned-artifacts columns",
+            "Failed to read returned-artifacts column",
+        )
     }
 
     /// Update an invocation row's session correlation columns. Per
@@ -2221,12 +3076,36 @@ impl StateDb {
         session_id: Option<&str>,
         method: &str,
     ) -> Result<(), String> {
-        let (provider_session_id, resume_input_id, provider_session_capture_method) =
-            if method == "resumed" {
-                (None, session_id, None)
-            } else {
-                (session_id, None, session_id.map(|_| method))
-            };
+        let projection = Self::session_capture_projection(session_id, method);
+        self.persist_session_capture(id, session_id, method, projection)
+    }
+
+    fn session_capture_projection<'a>(
+        session_id: Option<&'a str>,
+        method: &'a str,
+    ) -> SessionCaptureProjection<'a> {
+        if method == "resumed" {
+            SessionCaptureProjection {
+                provider_session_id: None,
+                resume_input_id: session_id,
+                provider_session_capture_method: None,
+            }
+        } else {
+            SessionCaptureProjection {
+                provider_session_id: session_id,
+                resume_input_id: None,
+                provider_session_capture_method: session_id.map(|_| method),
+            }
+        }
+    }
+
+    fn persist_session_capture(
+        &self,
+        id: i64,
+        session_id: Option<&str>,
+        method: &str,
+        projection: SessionCaptureProjection<'_>,
+    ) -> Result<(), String> {
         self.conn
             .execute(
                 "UPDATE invocations
@@ -2242,9 +3121,9 @@ impl StateDb {
                 params![
                     session_id,
                     method,
-                    provider_session_id,
-                    resume_input_id,
-                    provider_session_capture_method,
+                    projection.provider_session_id,
+                    projection.resume_input_id,
+                    projection.provider_session_capture_method,
                     id
                 ],
             )
@@ -2262,16 +3141,36 @@ impl StateDb {
             .unchecked_transaction()
             .map_err(|e| format!("Failed to begin provider session binding tx: {e}"))?;
 
-        let existing = tx
-            .query_row(
-                "SELECT provider_session_id FROM invocations WHERE id = ?1",
-                params![invocation_row_id],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .optional()
-            .map_err(|e| format!("Failed to read invocation {invocation_row_id}: {e}"))?
-            .ok_or_else(|| format!("Invocation {invocation_row_id} not found"))?;
+        let existing = Self::load_existing_provider_session_binding(&tx, invocation_row_id)?;
+        Self::validate_provider_session_rebind(invocation_row_id, binding, existing.as_deref())?;
+        Self::write_provider_session_binding(&tx, invocation_row_id, binding)?;
 
+        if Self::provider_session_binding_should_mint_chain(binding) {
+            Self::mint_chain_for_invocation_session_on(&tx, invocation_row_id)?;
+        }
+        tx.commit()
+            .map_err(|e| format!("Failed to commit provider session binding tx: {e}"))
+    }
+
+    fn load_existing_provider_session_binding(
+        conn: &Connection,
+        invocation_row_id: i64,
+    ) -> Result<Option<String>, String> {
+        conn.query_row(
+            "SELECT provider_session_id FROM invocations WHERE id = ?1",
+            params![invocation_row_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(|e| format!("Failed to read invocation {invocation_row_id}: {e}"))?
+        .ok_or_else(|| format!("Invocation {invocation_row_id} not found"))
+    }
+
+    fn validate_provider_session_rebind(
+        invocation_row_id: i64,
+        binding: &ProviderSessionBinding,
+        existing: Option<&str>,
+    ) -> Result<(), String> {
         if let Some(existing) = existing
             && existing != binding.provider_session_id
         {
@@ -2280,8 +3179,15 @@ impl StateDb {
                 binding.provider_session_id
             ));
         }
+        Ok(())
+    }
 
-        tx.execute(
+    fn write_provider_session_binding(
+        conn: &Connection,
+        invocation_row_id: i64,
+        binding: &ProviderSessionBinding,
+    ) -> Result<(), String> {
+        conn.execute(
             "UPDATE invocations
              SET provider_session_id = ?1,
                  provider_session_capture_method = ?2,
@@ -2305,12 +3211,11 @@ impl StateDb {
         .map_err(|e| {
             format!("Failed to bind provider session for invocation {invocation_row_id}: {e}")
         })?;
+        Ok(())
+    }
 
-        if binding.resume_input_id.as_deref() != Some(binding.provider_session_id.as_str()) {
-            Self::mint_chain_for_invocation_session_on(&tx, invocation_row_id)?;
-        }
-        tx.commit()
-            .map_err(|e| format!("Failed to commit provider session binding tx: {e}"))
+    fn provider_session_binding_should_mint_chain(binding: &ProviderSessionBinding) -> bool {
+        binding.resume_input_id.as_deref() != Some(binding.provider_session_id.as_str())
     }
 
     pub fn record_legacy_resume_input_session_id(
@@ -2357,6 +3262,29 @@ impl StateDb {
         conn: &Connection,
         invocation_row_id: i64,
     ) -> Result<(), DbError> {
+        let Some(row) = Self::load_invocation_chain_mint_row(conn, invocation_row_id)? else {
+            return Ok(());
+        };
+        let ts = Self::fallback_now_rfc3339(&row.raw_ts);
+        if let Some(chain_id) =
+            Self::existing_chain_for_provider_session(conn, &row.provider_name, &row.session_id)?
+        {
+            Self::promote_existing_invocation_chain(
+                conn,
+                &chain_id,
+                &row.model_name,
+                &row.provider_name,
+                &row.session_id,
+            )?;
+            return Ok(());
+        }
+        Self::insert_invocation_chain(conn, &row, &ts)
+    }
+
+    fn load_invocation_chain_mint_row(
+        conn: &Connection,
+        invocation_row_id: i64,
+    ) -> Result<Option<InvocationChainMintRow>, DbError> {
         let provider_session_expr = Self::provider_session_expr(conn, None)?;
         let sql = format!(
             "SELECT model_name, provider_name, {provider_session_expr}, COALESCE(finished_at, created_at)
@@ -2365,65 +3293,78 @@ impl StateDb {
                AND provider_name IS NOT NULL
                AND {provider_session_expr} IS NOT NULL"
         );
-        let row = conn
-            .query_row(&sql, params![invocation_row_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
+        conn.query_row(&sql, params![invocation_row_id], |row| {
+            Ok(InvocationChainMintRow {
+                model_name: row.get(0)?,
+                provider_name: row.get(1)?,
+                session_id: row.get(2)?,
+                raw_ts: row.get(3)?,
             })
-            .optional()
-            .map_err(|e| format!("Failed to read invocation for chain mint: {e}"))?;
-        let Some((model_name, provider_name, session_id, raw_ts)) = row else {
-            return Ok(());
-        };
-        let ts = DateTime::parse_from_rfc3339(&raw_ts)
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now());
-        let exists = conn
-            .query_row(
-                "SELECT chain_id FROM session_chain_segments
+        })
+        .optional()
+        .map_err(|e| format!("Failed to read invocation for chain mint: {e}"))
+    }
+
+    fn existing_chain_for_provider_session(
+        conn: &Connection,
+        provider_name: &str,
+        session_id: &str,
+    ) -> Result<Option<String>, DbError> {
+        conn.query_row(
+            "SELECT chain_id FROM session_chain_segments
                  WHERE provider_name = ?1 AND session_id = ?2
                  LIMIT 1",
-                params![provider_name, session_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|e| format!("Failed to check existing invocation chain: {e}"))?;
-        if let Some(chain_id) = exists {
-            conn.execute(
-                "UPDATE session_chains
-                     SET model_name = ?2
-                     WHERE chain_id = ?1 AND model_name = '<unknown>'",
-                params![chain_id, model_name],
-            )
-            .map_err(|e| format!("Failed to update invocation session chain model: {e}"))?;
-            conn.execute(
-                "UPDATE session_chain_segments
-                     SET transition_reason = 'initial'
-                     WHERE chain_id = ?1
-                       AND provider_name = ?2
-                       AND session_id = ?3
-                       AND transition_reason = 'imported'",
-                params![chain_id, provider_name, session_id],
-            )
-            .map_err(|e| format!("Failed to promote imported session chain segment: {e}"))?;
-            return Ok(());
-        }
+            params![provider_name, session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| format!("Failed to check existing invocation chain: {e}"))
+    }
+
+    fn promote_existing_invocation_chain(
+        conn: &Connection,
+        chain_id: &str,
+        model_name: &str,
+        provider_name: &str,
+        session_id: &str,
+    ) -> Result<(), DbError> {
+        conn.execute(
+            "UPDATE session_chains
+                 SET model_name = ?2
+                 WHERE chain_id = ?1 AND model_name = '<unknown>'",
+            params![chain_id, model_name],
+        )
+        .map_err(|e| format!("Failed to update invocation session chain model: {e}"))?;
+        conn.execute(
+            "UPDATE session_chain_segments
+                 SET transition_reason = 'initial'
+                 WHERE chain_id = ?1
+                   AND provider_name = ?2
+                   AND session_id = ?3
+                   AND transition_reason = 'imported'",
+            params![chain_id, provider_name, session_id],
+        )
+        .map_err(|e| format!("Failed to promote imported session chain segment: {e}"))?;
+        Ok(())
+    }
+
+    fn insert_invocation_chain(
+        conn: &Connection,
+        row: &InvocationChainMintRow,
+        ts: &DateTime<Utc>,
+    ) -> Result<(), DbError> {
         let chain_id = Uuid::new_v4().to_string();
         conn.execute(
             "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
              VALUES (?1, ?2, ?2, ?3)",
-            params![chain_id, ts.to_rfc3339(), model_name],
+            params![chain_id, ts.to_rfc3339(), row.model_name],
         )
         .map_err(|e| format!("Failed to mint invocation session chain: {e}"))?;
         conn.execute(
             "INSERT INTO session_chain_segments
                 (chain_id, provider_name, session_id, started_at, transition_reason)
              VALUES (?1, ?2, ?3, ?4, 'initial')",
-            params![chain_id, provider_name, session_id, ts.to_rfc3339()],
+            params![chain_id, row.provider_name, row.session_id, ts.to_rfc3339()],
         )
         .map_err(|e| format!("Failed to mint invocation session segment: {e}"))?;
         Ok(())
@@ -2470,35 +3411,9 @@ impl StateDb {
         let created_at_raw: String = row.get(18)?;
         let finished_at_raw: Option<String> = row.get(19)?;
         let status_raw: String = row.get(6)?;
-        let created_at = DateTime::parse_from_rfc3339(&created_at_raw)
-            .map(|dt| dt.with_timezone(&Utc))
-            .map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    18,
-                    rusqlite::types::Type::Text,
-                    Box::new(e),
-                )
-            })?;
-        let finished_at = finished_at_raw
-            .map(|s| {
-                DateTime::parse_from_rfc3339(&s)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .map_err(|e| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            19,
-                            rusqlite::types::Type::Text,
-                            Box::new(e),
-                        )
-                    })
-            })
-            .transpose()?;
-        let status = status_raw.parse::<InvocationStatus>().map_err(|_| {
-            rusqlite::Error::FromSqlConversionFailure(
-                6,
-                rusqlite::types::Type::Text,
-                format!("Unknown invocation status: {status_raw}").into(),
-            )
-        })?;
+        let created_at = Self::strict_rfc3339_at(&created_at_raw, 18)?;
+        let finished_at = Self::optional_strict_rfc3339_at(finished_at_raw, 19)?;
+        let status = Self::parse_invocation_status_at(&status_raw, 6)?;
 
         Ok(InvocationRecord {
             id: row.get(0)?,
@@ -2521,6 +3436,27 @@ impl StateDb {
             resume_acceptance_evidence: row.get(17)?,
             created_at,
             finished_at,
+        })
+    }
+
+    fn optional_strict_rfc3339_at(
+        raw: Option<String>,
+        column_index: usize,
+    ) -> rusqlite::Result<Option<DateTime<Utc>>> {
+        raw.map(|s| Self::strict_rfc3339_at(&s, column_index))
+            .transpose()
+    }
+
+    fn parse_invocation_status_at(
+        raw: &str,
+        column_index: usize,
+    ) -> rusqlite::Result<InvocationStatus> {
+        raw.parse::<InvocationStatus>().map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                column_index,
+                rusqlite::types::Type::Text,
+                format!("Unknown invocation status: {raw}").into(),
+            )
         })
     }
 
@@ -2598,14 +3534,8 @@ impl StateDb {
             Ok(QuotaRecord {
                 provider_name: provider_name.to_string(),
                 calls_since_refresh: row.get::<_, i64>(0)? as u64,
-                refreshed_at: row
-                    .get::<_, Option<String>>(1)?
-                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
-                exhausted_at: row
-                    .get::<_, Option<String>>(2)?
-                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
+                refreshed_at: Self::optional_forgiving_rfc3339(row.get(1)?),
+                exhausted_at: Self::optional_forgiving_rfc3339(row.get(2)?),
                 topology_peak_live_window_count: usize::try_from(row.get::<_, i64>(3)?).map_err(
                     |_| {
                         rusqlite::Error::FromSqlConversionFailure(
@@ -2615,10 +3545,7 @@ impl StateDb {
                         )
                     },
                 )?,
-                last_topology_probe_at: row
-                    .get::<_, Option<String>>(4)?
-                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
+                last_topology_probe_at: Self::optional_forgiving_rfc3339(row.get(4)?),
             })
         });
 
@@ -2675,15 +3602,7 @@ impl StateDb {
         let rows = stmt
             .query_map(params![provider_name], |row| {
                 let resets_at_str: String = row.get(2)?;
-                let resets_at = DateTime::parse_from_rfc3339(&resets_at_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .map_err(|e| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            2,
-                            rusqlite::types::Type::Text,
-                            Box::new(e),
-                        )
-                    })?;
+                let resets_at = Self::strict_rfc3339_at(&resets_at_str, 2)?;
                 Ok(QuotaWindow {
                     provider_name: provider_name.to_string(),
                     window_id: row.get::<_, i64>(0)? as u32,
@@ -2723,78 +3642,138 @@ impl StateDb {
             .map_err(|e| format!("Failed to begin tx: {e}"))?;
 
         if windows.is_empty() {
-            // Empty input: preserve any prior windows (the DELETE below only
-            // runs on the non-empty branch) and do not reset calls_since_refresh.
-            //
-            // When prior windows exist we must ALSO preserve prior.refreshed_at,
-            // because the per-window delta learner (PR 3) computes
-            //   delta_percent = new.used_percent - prior.used_percent
-            //   delta_calls   = count_assistant_turns_since(prior.refreshed_at)
-            // on the next successful refresh. Advancing refreshed_at here
-            // would count only the turns since the empty refresh while still
-            // measuring delta against the older preserved window sample,
-            // inflating the learned burn rate. Only last_empty_refresh_at
-            // advances — that is the audit timestamp the empty refresh is
-            // observed through.
-            //
-            // When no prior windows exist, we need refreshed_at populated so
-            // is_stale returns the expected values — but the §5.1 empty-
-            // windows guard already forces stale on this shape, so whatever
-            // we write is diagnostic only.
-            if prior_windows.is_empty() {
-                tx.execute(
-                    "INSERT INTO provider_quotas
-                        (provider_name, refreshed_at, last_empty_refresh_at)
-                     VALUES (?1, ?2, ?2)
-                     ON CONFLICT (provider_name) DO UPDATE SET
-                        refreshed_at = ?2,
-                        last_empty_refresh_at = ?2",
-                    params![provider_name, &now],
-                )
-                .map_err(|e| format!("Failed to record empty quota refresh: {e}"))?;
-            } else {
-                tx.execute(
-                    "INSERT INTO provider_quotas
-                        (provider_name, refreshed_at, last_empty_refresh_at)
-                     VALUES (?1, ?2, ?2)
-                     ON CONFLICT (provider_name) DO UPDATE SET
-                        last_empty_refresh_at = ?2",
-                    params![provider_name, &now],
-                )
-                .map_err(|e| format!("Failed to record empty quota refresh: {e}"))?;
-            }
-
-            tx.commit()
-                .map_err(|e| format!("Failed to commit refresh: {e}"))?;
-            return Ok(());
+            return Self::record_empty_quota_refresh(tx, provider_name, &now, &prior_windows);
         }
 
-        let longest_new = windows.iter().max_by_key(|w| w.resets_at);
-        let turns_between_refreshes = prior
-            .as_ref()
+        let turns_between_refreshes =
+            self.turns_between_quota_refreshes(provider_name, prior.as_ref());
+        let prior_windows_by_id = Self::quota_windows_by_id(&prior_windows);
+        let projection = Self::quota_aggregate_projection(prior.as_ref(), windows);
+        Self::write_quota_aggregate(&tx, provider_name, &now, projection)?;
+        Self::replace_quota_window_rows(
+            &tx,
+            provider_name,
+            windows,
+            &prior_windows_by_id,
+            turns_between_refreshes,
+        )?;
+        tx.commit()
+            .map_err(|e| format!("Failed to commit refresh: {e}"))?;
+        Ok(())
+    }
+
+    fn record_empty_quota_refresh(
+        tx: Transaction<'_>,
+        provider_name: &str,
+        now: &str,
+        prior_windows: &[QuotaWindow],
+    ) -> Result<(), String> {
+        Self::write_empty_quota_refresh(&tx, provider_name, now, prior_windows)?;
+        tx.commit()
+            .map_err(|e| format!("Failed to commit refresh: {e}"))
+    }
+
+    fn write_empty_quota_refresh(
+        conn: &Connection,
+        provider_name: &str,
+        now: &str,
+        prior_windows: &[QuotaWindow],
+    ) -> Result<(), String> {
+        if prior_windows.is_empty() {
+            Self::write_initial_empty_quota_refresh(conn, provider_name, now)
+        } else {
+            Self::write_preserving_empty_quota_refresh(conn, provider_name, now)
+        }
+    }
+
+    fn write_initial_empty_quota_refresh(
+        conn: &Connection,
+        provider_name: &str,
+        now: &str,
+    ) -> Result<(), String> {
+        conn.execute(
+            "INSERT INTO provider_quotas
+                (provider_name, refreshed_at, last_empty_refresh_at)
+             VALUES (?1, ?2, ?2)
+             ON CONFLICT (provider_name) DO UPDATE SET
+                refreshed_at = ?2,
+                last_empty_refresh_at = ?2",
+            params![provider_name, now],
+        )
+        .map_err(|e| format!("Failed to record empty quota refresh: {e}"))?;
+        Ok(())
+    }
+
+    fn write_preserving_empty_quota_refresh(
+        conn: &Connection,
+        provider_name: &str,
+        now: &str,
+    ) -> Result<(), String> {
+        conn.execute(
+            "INSERT INTO provider_quotas
+                (provider_name, refreshed_at, last_empty_refresh_at)
+             VALUES (?1, ?2, ?2)
+             ON CONFLICT (provider_name) DO UPDATE SET
+                last_empty_refresh_at = ?2",
+            params![provider_name, now],
+        )
+        .map_err(|e| format!("Failed to record empty quota refresh: {e}"))?;
+        Ok(())
+    }
+
+    fn turns_between_quota_refreshes(
+        &self,
+        provider_name: &str,
+        prior: Option<&QuotaRecord>,
+    ) -> u64 {
+        prior
             .map(|p| {
                 self.count_assistant_turns_since(provider_name, p.refreshed_at.as_ref())
                     .unwrap_or(p.calls_since_refresh)
             })
-            .unwrap_or(0);
-        let prior_windows_by_id: std::collections::HashMap<u32, &QuotaWindow> = prior_windows
+            .unwrap_or(0)
+    }
+
+    fn quota_windows_by_id(windows: &[QuotaWindow]) -> HashMap<u32, &QuotaWindow> {
+        windows
             .iter()
             .map(|window| (window.window_id, window))
-            .collect();
+            .collect()
+    }
 
-        // Backwards-compat: keep used_percent/resets_at on provider_quotas in sync
-        // with the longest window so legacy readers see something sensible.
-        let (legacy_used, legacy_resets) = match longest_new {
-            Some(w) => (w.used_percent, Some(w.resets_at.to_rfc3339())),
+    fn quota_aggregate_projection(
+        prior: Option<&QuotaRecord>,
+        windows: &[QuotaWindowInput],
+    ) -> QuotaAggregateProjection {
+        let (legacy_used, legacy_resets) = Self::legacy_quota_projection(windows);
+        QuotaAggregateProjection {
+            legacy_used,
+            legacy_resets,
+            topology_peak_live_window_count: Self::quota_topology_peak(prior, windows),
+        }
+    }
+
+    fn legacy_quota_projection(windows: &[QuotaWindowInput]) -> (f64, Option<String>) {
+        match windows.iter().max_by_key(|window| window.resets_at) {
+            Some(window) => (window.used_percent, Some(window.resets_at.to_rfc3339())),
             None => (0.0, None),
-        };
-        let topology_peak_live_window_count = prior
-            .as_ref()
+        }
+    }
+
+    fn quota_topology_peak(prior: Option<&QuotaRecord>, windows: &[QuotaWindowInput]) -> i64 {
+        prior
             .map(|quota| quota.topology_peak_live_window_count)
             .unwrap_or(0)
-            .max(windows.len()) as i64;
+            .max(windows.len()) as i64
+    }
 
-        tx.execute(
+    fn write_quota_aggregate(
+        conn: &Connection,
+        provider_name: &str,
+        now: &str,
+        projection: QuotaAggregateProjection,
+    ) -> Result<(), String> {
+        conn.execute(
             "INSERT INTO provider_quotas
                 (provider_name, used_percent, resets_at, calls_since_refresh, refreshed_at,
                  topology_peak_live_window_count)
@@ -2808,72 +3787,148 @@ impl StateDb {
                 topology_peak_live_window_count = MAX(topology_peak_live_window_count, ?5)",
             params![
                 provider_name,
-                legacy_used,
-                legacy_resets,
-                &now,
-                topology_peak_live_window_count
+                projection.legacy_used,
+                projection.legacy_resets,
+                now,
+                projection.topology_peak_live_window_count
             ],
         )
         .map_err(|e| format!("Failed to upsert quota: {e}"))?;
+        Ok(())
+    }
 
-        tx.execute(
+    fn replace_quota_window_rows(
+        conn: &Connection,
+        provider_name: &str,
+        windows: &[QuotaWindowInput],
+        prior_windows_by_id: &HashMap<u32, &QuotaWindow>,
+        turns_between_refreshes: u64,
+    ) -> Result<(), String> {
+        Self::delete_quota_window_rows(conn, provider_name)?;
+        Self::insert_quota_window_rows(
+            conn,
+            provider_name,
+            windows,
+            prior_windows_by_id,
+            turns_between_refreshes,
+        )
+    }
+
+    fn delete_quota_window_rows(conn: &Connection, provider_name: &str) -> Result<(), String> {
+        conn.execute(
             "DELETE FROM provider_quota_windows WHERE provider_name = ?1",
             params![provider_name],
         )
         .map_err(|e| format!("Failed to clear windows: {e}"))?;
+        Ok(())
+    }
 
-        for (i, w) in windows.iter().enumerate() {
-            let prior_window = prior_windows_by_id.get(&(i as u32)).copied();
-            let (delta_percent, delta_calls) = match prior_window {
-                Some(prior_w) => {
-                    let dp = (w.used_percent - prior_w.used_percent).max(0.0);
-                    // Three guards on what we trust from a single refresh-to-
-                    // refresh sample. Any failure → carry the prior learn
-                    // forward (same path as dp == 0 / window reset).
-                    //  1. `turns_between_refreshes >= MIN_LEARN_SAMPLE_CALLS`
-                    //     — small samples are noise-dominated.
-                    //  2. `w.used_percent < NEAR_EXHAUSTED_USED_PERCENT`
-                    //     — a window pinned at 100% did not fill at a
-                    //     natural rate; its dp is a cap-hit artifact.
-                    //  3. `new_rate <= MAX_LEARNABLE_BURN_RATE` —
-                    //     belt-and-suspenders absolute rate ceiling for
-                    //     samples that passed (1) and (2) but still
-                    //     imply an implausibly fast consumption.
-                    let small_sample = turns_between_refreshes < MIN_LEARN_SAMPLE_CALLS;
-                    let near_rail = w.used_percent >= NEAR_EXHAUSTED_USED_PERCENT;
-                    let new_rate = if turns_between_refreshes > 0 {
-                        dp / (turns_between_refreshes as f64)
-                    } else {
-                        f64::INFINITY
-                    };
-                    let rate_too_high = new_rate > MAX_LEARNABLE_BURN_RATE;
-                    if dp > 0.0 && !small_sample && !near_rail && !rate_too_high {
-                        (Some(dp), Some(turns_between_refreshes))
-                    } else {
-                        (prior_w.last_delta_percent, prior_w.last_delta_calls)
-                    }
-                }
-                None => (None, None),
-            };
-            tx.execute(
-                "INSERT INTO provider_quota_windows
-                    (provider_name, window_id, used_percent, resets_at,
-                     last_delta_percent, last_delta_calls)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    provider_name,
-                    i as i64,
-                    w.used_percent,
-                    w.resets_at.to_rfc3339(),
-                    delta_percent,
-                    delta_calls.map(|v| v as i64),
-                ],
-            )
-            .map_err(|e| format!("Failed to insert window: {e}"))?;
+    fn insert_quota_window_rows(
+        conn: &Connection,
+        provider_name: &str,
+        windows: &[QuotaWindowInput],
+        prior_windows_by_id: &HashMap<u32, &QuotaWindow>,
+        turns_between_refreshes: u64,
+    ) -> Result<(), String> {
+        for (index, window) in windows.iter().enumerate() {
+            let delta = Self::quota_window_delta(
+                window,
+                prior_windows_by_id.get(&(index as u32)).copied(),
+                turns_between_refreshes,
+            );
+            Self::insert_quota_window_row(conn, provider_name, index, window, delta)?;
         }
+        Ok(())
+    }
 
-        tx.commit()
-            .map_err(|e| format!("Failed to commit refresh: {e}"))?;
+    fn quota_window_delta(
+        window: &QuotaWindowInput,
+        prior_window: Option<&QuotaWindow>,
+        turns_between_refreshes: u64,
+    ) -> QuotaWindowDelta {
+        match prior_window {
+            Some(prior) => {
+                Self::classify_quota_window_delta(window, prior, turns_between_refreshes)
+            }
+            None => QuotaWindowDelta {
+                last_delta_percent: None,
+                last_delta_calls: None,
+            },
+        }
+    }
+
+    fn classify_quota_window_delta(
+        window: &QuotaWindowInput,
+        prior_window: &QuotaWindow,
+        turns_between_refreshes: u64,
+    ) -> QuotaWindowDelta {
+        let delta_percent = (window.used_percent - prior_window.used_percent).max(0.0);
+        if Self::quota_delta_sample_is_learnable(delta_percent, window, turns_between_refreshes) {
+            QuotaWindowDelta {
+                last_delta_percent: Some(delta_percent),
+                last_delta_calls: Some(turns_between_refreshes),
+            }
+        } else {
+            QuotaWindowDelta {
+                last_delta_percent: prior_window.last_delta_percent,
+                last_delta_calls: prior_window.last_delta_calls,
+            }
+        }
+    }
+
+    fn quota_delta_sample_is_learnable(
+        delta_percent: f64,
+        window: &QuotaWindowInput,
+        turns_between_refreshes: u64,
+    ) -> bool {
+        delta_percent > 0.0
+            && !Self::quota_delta_sample_is_small(turns_between_refreshes)
+            && !Self::quota_window_is_near_rail(window)
+            && !Self::quota_delta_rate_too_high(delta_percent, turns_between_refreshes)
+    }
+
+    fn quota_delta_sample_is_small(turns_between_refreshes: u64) -> bool {
+        turns_between_refreshes < MIN_LEARN_SAMPLE_CALLS
+    }
+
+    fn quota_window_is_near_rail(window: &QuotaWindowInput) -> bool {
+        window.used_percent >= NEAR_EXHAUSTED_USED_PERCENT
+    }
+
+    fn quota_delta_rate_too_high(delta_percent: f64, turns_between_refreshes: u64) -> bool {
+        Self::quota_delta_rate(delta_percent, turns_between_refreshes) > MAX_LEARNABLE_BURN_RATE
+    }
+
+    fn quota_delta_rate(delta_percent: f64, turns_between_refreshes: u64) -> f64 {
+        if turns_between_refreshes > 0 {
+            delta_percent / (turns_between_refreshes as f64)
+        } else {
+            f64::INFINITY
+        }
+    }
+
+    fn insert_quota_window_row(
+        conn: &Connection,
+        provider_name: &str,
+        index: usize,
+        window: &QuotaWindowInput,
+        delta: QuotaWindowDelta,
+    ) -> Result<(), String> {
+        conn.execute(
+            "INSERT INTO provider_quota_windows
+                (provider_name, window_id, used_percent, resets_at,
+                 last_delta_percent, last_delta_calls)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                provider_name,
+                index as i64,
+                window.used_percent,
+                window.resets_at.to_rfc3339(),
+                delta.last_delta_percent,
+                delta.last_delta_calls.map(|value| value as i64),
+            ],
+        )
+        .map_err(|e| format!("Failed to insert window: {e}"))?;
         Ok(())
     }
 
@@ -2917,21 +3972,41 @@ impl StateDb {
         provider_name: &str,
         last_invoked_at: &DateTime<Utc>,
     ) -> Result<(), String> {
-        let updated = self
-            .conn
+        let updated =
+            self.write_last_invoked_at_for_test(model_name, provider_name, last_invoked_at)?;
+        Self::validate_last_invoked_at_test_update(model_name, provider_name, updated)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn write_last_invoked_at_for_test(
+        &self,
+        model_name: &str,
+        provider_name: &str,
+        last_invoked_at: &DateTime<Utc>,
+    ) -> Result<usize, String> {
+        self.conn
             .execute(
                 "UPDATE providers
                  SET last_invoked_at = ?1
                  WHERE model_name = ?2 AND provider_name = ?3",
                 params![last_invoked_at.to_rfc3339(), model_name, provider_name],
             )
-            .map_err(|e| format!("Failed to set last_invoked_at: {e}"))?;
-        if updated != 1 {
-            return Err(format!(
+            .map_err(|e| format!("Failed to set last_invoked_at: {e}"))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn validate_last_invoked_at_test_update(
+        model_name: &str,
+        provider_name: &str,
+        updated: usize,
+    ) -> Result<(), String> {
+        if updated == 1 {
+            Ok(())
+        } else {
+            Err(format!(
                 "Expected exactly one providers row for model_name={model_name}, provider_name={provider_name}, updated {updated}"
-            ));
+            ))
         }
-        Ok(())
     }
 
     /// Test-only: seed the PR 3 per-window burn-rate learning columns without
@@ -3045,16 +4120,7 @@ impl StateDb {
             .map_err(|e| format!("Failed to prepare query: {e}"))?;
 
         let rows = stmt
-            .query_map([], |row| {
-                Ok(CliProviderRecord {
-                    cli_name: row.get(0)?,
-                    display_name: row.get(1)?,
-                    installed: row.get::<_, i64>(2)? != 0,
-                    version: row.get(3)?,
-                    config_dir: row.get(4)?,
-                    last_synced: row.get(5)?,
-                })
-            })
+            .query_map([], Self::map_cli_provider_row)
             .map_err(|e| format!("Failed to query CLI providers: {e}"))?;
 
         let mut result = Vec::new();
@@ -3074,22 +4140,24 @@ impl StateDb {
             )
             .map_err(|e| format!("Failed to prepare query: {e}"))?;
 
-        let result = stmt.query_row(params![cli_name], |row| {
-            Ok(CliProviderRecord {
-                cli_name: row.get(0)?,
-                display_name: row.get(1)?,
-                installed: row.get::<_, i64>(2)? != 0,
-                version: row.get(3)?,
-                config_dir: row.get(4)?,
-                last_synced: row.get(5)?,
-            })
-        });
+        let result = stmt.query_row(params![cli_name], Self::map_cli_provider_row);
 
         match result {
             Ok(record) => Ok(Some(record)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(format!("Failed to query CLI provider: {e}")),
         }
+    }
+
+    fn map_cli_provider_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CliProviderRecord> {
+        Ok(CliProviderRecord {
+            cli_name: row.get(0)?,
+            display_name: row.get(1)?,
+            installed: row.get::<_, i64>(2)? != 0,
+            version: row.get(3)?,
+            config_dir: row.get(4)?,
+            last_synced: row.get(5)?,
+        })
     }
 
     // --- Account operations ---
@@ -3115,27 +4183,36 @@ impl StateDb {
 
     /// List all accounts, optionally filtered by provider.
     pub fn list_accounts(&self, provider: Option<&str>) -> Result<Vec<AccountRecord>, String> {
-        let (sql, bind_provider);
-        match provider {
-            Some(p) => {
-                sql = "SELECT id, provider, profile_name, auth_method, auth_status, created_at
-                       FROM accounts WHERE provider = ?1 ORDER BY id";
-                bind_provider = Some(p.to_string());
-            }
-            None => {
-                sql = "SELECT id, provider, profile_name, auth_method, auth_status, created_at
-                       FROM accounts ORDER BY provider, id";
-                bind_provider = None;
-            }
-        }
+        self.load_account_rows(Self::account_query(provider))
+    }
 
+    fn account_query(provider: Option<&str>) -> (&'static str, Option<&str>) {
+        match provider {
+            Some(provider) => (
+                "SELECT id, provider, profile_name, auth_method, auth_status, created_at
+                 FROM accounts WHERE provider = ?1 ORDER BY id",
+                Some(provider),
+            ),
+            None => (
+                "SELECT id, provider, profile_name, auth_method, auth_status, created_at
+                 FROM accounts ORDER BY provider, id",
+                None,
+            ),
+        }
+    }
+
+    fn load_account_rows(
+        &self,
+        query: (&'static str, Option<&str>),
+    ) -> Result<Vec<AccountRecord>, String> {
+        let (sql, bind_provider) = query;
         let mut stmt = self
             .conn
             .prepare(sql)
             .map_err(|e| format!("Failed to prepare query: {e}"))?;
 
-        let rows = if let Some(ref p) = bind_provider {
-            stmt.query_map(params![p], Self::map_account_row)
+        let rows = if let Some(provider) = bind_provider {
+            stmt.query_map(params![provider], Self::map_account_row)
                 .map_err(|e| format!("Failed to query accounts: {e}"))?
         } else {
             stmt.query_map([], Self::map_account_row)
@@ -3189,29 +4266,38 @@ impl StateDb {
         &self,
         provider: Option<&str>,
     ) -> Result<Vec<DiscoveredModel>, String> {
-        let (sql, bind_provider);
-        match provider {
-            Some(p) => {
-                sql = "SELECT canonical_name, provider, discovered_at, cli_version
-                       FROM discovered_models WHERE provider = ?1
-                       ORDER BY canonical_name";
-                bind_provider = Some(p.to_string());
-            }
-            None => {
-                sql = "SELECT canonical_name, provider, discovered_at, cli_version
-                       FROM discovered_models
-                       ORDER BY provider, canonical_name";
-                bind_provider = None;
-            }
-        }
+        self.load_discovered_model_rows(Self::discovered_model_query(provider))
+    }
 
+    fn discovered_model_query(provider: Option<&str>) -> (&'static str, Option<&str>) {
+        match provider {
+            Some(provider) => (
+                "SELECT canonical_name, provider, discovered_at, cli_version
+                 FROM discovered_models WHERE provider = ?1
+                 ORDER BY canonical_name",
+                Some(provider),
+            ),
+            None => (
+                "SELECT canonical_name, provider, discovered_at, cli_version
+                 FROM discovered_models
+                 ORDER BY provider, canonical_name",
+                None,
+            ),
+        }
+    }
+
+    fn load_discovered_model_rows(
+        &self,
+        query: (&'static str, Option<&str>),
+    ) -> Result<Vec<DiscoveredModel>, String> {
+        let (sql, bind_provider) = query;
         let mut stmt = self
             .conn
             .prepare(sql)
             .map_err(|e| format!("Failed to prepare query: {e}"))?;
 
-        let rows = if let Some(ref p) = bind_provider {
-            stmt.query_map(params![p], Self::map_discovered_model_row)
+        let rows = if let Some(provider) = bind_provider {
+            stmt.query_map(params![provider], Self::map_discovered_model_row)
                 .map_err(|e| format!("Failed to query discovered models: {e}"))?
         } else {
             stmt.query_map([], Self::map_discovered_model_row)
@@ -3249,11 +4335,24 @@ impl StateDb {
         provider: &str,
         param: &ModelParameter,
     ) -> Result<(), String> {
-        let param_type_json = serde_json::to_string(&param.param_type)
-            .map_err(|e| format!("Failed to serialize param_type: {e}"))?;
-        let cli_mapping_json = serde_json::to_string(&param.cli_mapping)
-            .map_err(|e| format!("Failed to serialize cli_mapping: {e}"))?;
+        let json = Self::format_model_parameter_json(param)?;
+        self.write_model_parameter(model_name, provider, param, &json)
+    }
 
+    fn format_model_parameter_json(param: &ModelParameter) -> Result<ModelParameterJson, String> {
+        Ok(ModelParameterJson {
+            param_type_json: Self::serialize_param_type(&param.param_type)?,
+            cli_mapping_json: Self::serialize_cli_mapping(&param.cli_mapping)?,
+        })
+    }
+
+    fn write_model_parameter(
+        &self,
+        model_name: &str,
+        provider: &str,
+        param: &ModelParameter,
+        json: &ModelParameterJson,
+    ) -> Result<(), String> {
         self.conn
             .execute(
                 "INSERT INTO model_parameters (model_name, provider, name, display_name, param_type, description, cli_mapping)
@@ -3269,13 +4368,23 @@ impl StateDb {
                     provider,
                     &param.name,
                     &param.display_name,
-                    &param_type_json,
+                    &json.param_type_json,
                     &param.description,
-                    &cli_mapping_json,
+                    &json.cli_mapping_json,
                 ],
             )
             .map_err(|e| format!("Failed to upsert model parameter: {e}"))?;
         Ok(())
+    }
+
+    fn serialize_param_type(param_type: &ParamType) -> Result<String, String> {
+        serde_json::to_string(param_type)
+            .map_err(|e| format!("Failed to serialize param_type: {e}"))
+    }
+
+    fn serialize_cli_mapping(cli_mapping: &CliMapping) -> Result<String, String> {
+        serde_json::to_string(cli_mapping)
+            .map_err(|e| format!("Failed to serialize cli_mapping: {e}"))
     }
 
     /// List all parameters for a given model and provider.
@@ -3295,38 +4404,48 @@ impl StateDb {
             .map_err(|e| format!("Failed to prepare query: {e}"))?;
 
         let rows = stmt
-            .query_map(params![model_name, provider], |row| {
-                let param_type_str: String = row.get(2)?;
-                let cli_mapping_str: String = row.get(4)?;
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    param_type_str,
-                    row.get::<_, String>(3)?,
-                    cli_mapping_str,
-                ))
-            })
+            .query_map(
+                params![model_name, provider],
+                Self::map_model_parameter_raw_row,
+            )
             .map_err(|e| format!("Failed to query model parameters: {e}"))?;
 
         let mut result = Vec::new();
         for row in rows {
-            let (name, display_name, param_type_str, description, cli_mapping_str) =
-                row.map_err(|e| format!("Failed to read parameter row: {e}"))?;
-
-            let param_type: ParamType = serde_json::from_str(&param_type_str)
-                .map_err(|e| format!("Failed to deserialize param_type: {e}"))?;
-            let cli_mapping: CliMapping = serde_json::from_str(&cli_mapping_str)
-                .map_err(|e| format!("Failed to deserialize cli_mapping: {e}"))?;
-
-            result.push(ModelParameter {
-                name,
-                display_name,
-                param_type,
-                description,
-                cli_mapping,
-            });
+            let raw = row.map_err(|e| format!("Failed to read parameter row: {e}"))?;
+            result.push(Self::parse_model_parameter_raw_row(raw)?);
         }
         Ok(result)
+    }
+
+    fn map_model_parameter_raw_row(
+        row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<ModelParameterRawRow> {
+        Ok(ModelParameterRawRow {
+            name: row.get(0)?,
+            display_name: row.get(1)?,
+            param_type: row.get(2)?,
+            description: row.get(3)?,
+            cli_mapping: row.get(4)?,
+        })
+    }
+
+    fn parse_model_parameter_raw_row(raw: ModelParameterRawRow) -> Result<ModelParameter, String> {
+        Ok(ModelParameter {
+            name: raw.name,
+            display_name: raw.display_name,
+            param_type: Self::parse_param_type_json(&raw.param_type)?,
+            description: raw.description,
+            cli_mapping: Self::parse_cli_mapping_json(&raw.cli_mapping)?,
+        })
+    }
+
+    fn parse_param_type_json(raw: &str) -> Result<ParamType, String> {
+        serde_json::from_str(raw).map_err(|e| format!("Failed to deserialize param_type: {e}"))
+    }
+
+    fn parse_cli_mapping_json(raw: &str) -> Result<CliMapping, String> {
+        serde_json::from_str(raw).map_err(|e| format!("Failed to deserialize cli_mapping: {e}"))
     }
 
     /// Helper: map a rusqlite row to a DiscoveredModel.
@@ -3384,7 +4503,7 @@ impl StateDb {
         provider_name: &str,
         turns: &[SessionTurnIngest],
     ) -> Result<u64, String> {
-        if turns.is_empty() {
+        if Self::session_turn_batch_is_empty(turns) {
             return Ok(0);
         }
         let now = Utc::now().to_rfc3339();
@@ -3392,52 +4511,93 @@ impl StateDb {
             .conn
             .unchecked_transaction()
             .map_err(|e| format!("Failed to begin transaction: {e}"))?;
-        let mut new_count: u64 = 0;
-        {
-            let mut stmt = tx
-                .prepare(
-                    "INSERT OR IGNORE INTO session_turns
-                        (
-                            provider_name,
-                            session_id,
-                            turn_id,
-                            timestamp,
-                            role,
-                            parent_turn_id,
-                            is_sidechain,
-                            is_compaction_boundary,
-                            source_file,
-                            ingested_at,
-                            body
-                        )
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '', ?9, ?10)",
-                )
-                .map_err(|e| format!("Failed to prepare batch insert: {e}"))?;
-            for turn in turns {
-                let n = stmt
-                    .execute(params![
-                        provider_name,
-                        turn.session_id,
-                        turn.turn_id,
-                        turn.timestamp.to_rfc3339(),
-                        turn.role,
-                        turn.parent_turn_id,
-                        if turn.is_sidechain { 1i64 } else { 0i64 },
-                        if turn.is_compaction_boundary {
-                            1i64
-                        } else {
-                            0i64
-                        },
-                        &now,
-                        turn.body.as_deref(),
-                    ])
-                    .map_err(|e| format!("Batch insert row failed: {e}"))?;
-                new_count += n as u64;
-            }
-        }
+        let new_count = Self::insert_session_turn_batch_rows(&tx, provider_name, turns, &now)?;
         tx.commit()
             .map_err(|e| format!("Failed to commit batch: {e}"))?;
         Ok(new_count)
+    }
+
+    fn session_turn_batch_is_empty(turns: &[SessionTurnIngest]) -> bool {
+        turns.is_empty()
+    }
+
+    fn insert_session_turn_batch_rows(
+        conn: &Connection,
+        provider_name: &str,
+        turns: &[SessionTurnIngest],
+        ingested_at: &str,
+    ) -> Result<u64, String> {
+        let mut stmt = conn
+            .prepare(Self::session_turn_batch_insert_sql())
+            .map_err(|e| format!("Failed to prepare batch insert: {e}"))?;
+        let mut new_count: u64 = 0;
+        for turn in turns {
+            let binds = Self::session_turn_bind_values(turn);
+            let n = Self::execute_session_turn_batch_insert(
+                &mut stmt,
+                provider_name,
+                &binds,
+                ingested_at,
+            )?;
+            new_count += n as u64;
+        }
+        Ok(new_count)
+    }
+
+    fn session_turn_batch_insert_sql() -> &'static str {
+        "INSERT OR IGNORE INTO session_turns
+            (
+                provider_name,
+                session_id,
+                turn_id,
+                timestamp,
+                role,
+                parent_turn_id,
+                is_sidechain,
+                is_compaction_boundary,
+                source_file,
+                ingested_at,
+                body
+            )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '', ?9, ?10)"
+    }
+
+    fn session_turn_bind_values(turn: &SessionTurnIngest) -> SessionTurnBindValues<'_> {
+        SessionTurnBindValues {
+            session_id: &turn.session_id,
+            turn_id: &turn.turn_id,
+            timestamp: turn.timestamp.to_rfc3339(),
+            role: &turn.role,
+            parent_turn_id: turn.parent_turn_id.as_deref(),
+            is_sidechain: Self::sqlite_bool(turn.is_sidechain),
+            is_compaction_boundary: Self::sqlite_bool(turn.is_compaction_boundary),
+            body: turn.body.as_deref(),
+        }
+    }
+
+    fn sqlite_bool(value: bool) -> i64 {
+        if value { 1 } else { 0 }
+    }
+
+    fn execute_session_turn_batch_insert(
+        stmt: &mut rusqlite::Statement<'_>,
+        provider_name: &str,
+        binds: &SessionTurnBindValues<'_>,
+        ingested_at: &str,
+    ) -> Result<usize, String> {
+        stmt.execute(params![
+            provider_name,
+            binds.session_id,
+            binds.turn_id,
+            &binds.timestamp,
+            binds.role,
+            binds.parent_turn_id,
+            binds.is_sidechain,
+            binds.is_compaction_boundary,
+            ingested_at,
+            binds.body,
+        ])
+        .map_err(|e| format!("Batch insert row failed: {e}"))
     }
 
     pub fn count_session_turns(
@@ -3467,15 +4627,7 @@ impl StateDb {
     }
 
     pub fn backfill_session_chains(&self) -> Result<BackfillReport, DbError> {
-        let exists: i64 = self
-            .conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM session_chains LIMIT 1)",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|e| format!("Failed to check session chain backfill state: {e}"))?;
-        if exists != 0 {
+        if Self::session_chains_backfill_exists(&self.conn)? {
             return Ok(BackfillReport {
                 skipped_existing: true,
                 chains_inserted: 0,
@@ -3483,49 +4635,7 @@ impl StateDb {
             });
         }
 
-        #[derive(Debug)]
-        struct Row {
-            provider: String,
-            session: String,
-            started_at: String,
-            last_used_at: String,
-            last_turn_id: String,
-        }
-
-        let rows = {
-            let mut stmt = self
-                .conn
-                .prepare(
-                    "SELECT st.provider_name,
-                            st.session_id,
-                            MIN(st.timestamp) AS started_at,
-                            MAX(st.timestamp) AS last_used_at,
-                            (
-                                SELECT st2.turn_id
-                                FROM session_turns st2
-                                WHERE st2.provider_name = st.provider_name
-                                  AND st2.session_id = st.session_id
-                                ORDER BY st2.timestamp DESC, st2.id DESC
-                                LIMIT 1
-                            ) AS last_turn_id
-                     FROM session_turns st
-                     GROUP BY st.provider_name, st.session_id",
-                )
-                .map_err(|e| format!("Failed to prepare session chain backfill: {e}"))?;
-            let iter = stmt
-                .query_map([], |row| {
-                    Ok(Row {
-                        provider: row.get(0)?,
-                        session: row.get(1)?,
-                        started_at: row.get(2)?,
-                        last_used_at: row.get(3)?,
-                        last_turn_id: row.get(4)?,
-                    })
-                })
-                .map_err(|e| format!("Failed to query session chain backfill rows: {e}"))?;
-            iter.collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("Failed to read session chain backfill rows: {e}"))?
-        };
+        let rows = Self::load_session_chain_backfill_rows(&self.conn)?;
 
         let tx = self
             .conn
@@ -3535,36 +4645,10 @@ impl StateDb {
         let mut chains_inserted = 0;
         let mut segments_inserted = 0;
         for row in rows {
-            let model_sql = format!(
-                "SELECT model_name
-                 FROM invocations
-                 WHERE {provider_session_expr} = ?1
-                 ORDER BY COALESCE(finished_at, created_at) DESC, id DESC
-                 LIMIT 1"
-            );
-            let model_name = tx
-                .query_row(&model_sql, params![row.session], |r| r.get::<_, String>(0))
-                .optional()
-                .map_err(|e| format!("Failed to infer model during backfill: {e}"))?
-                .unwrap_or_else(|| "<unknown>".to_string());
+            let model_name = Self::infer_model_for_backfill_row(&tx, &provider_session_expr, &row)?;
             let chain_id = Uuid::new_v4().to_string();
-            chains_inserted += tx
-                .execute(
-                    "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![chain_id, row.started_at, row.last_used_at, model_name],
-                )
-                .map_err(|e| format!("Failed to insert session chain during backfill: {e}"))?
-                as u64;
-            segments_inserted += tx
-                .execute(
-                    "INSERT INTO session_chain_segments
-                        (chain_id, provider_name, session_id, started_at, ended_at, last_turn_id, transition_reason)
-                     VALUES (?1, ?2, ?3, ?4, NULL, ?5, 'imported')",
-                    params![chain_id, row.provider, row.session, row.started_at, row.last_turn_id],
-                )
-                .map_err(|e| format!("Failed to insert session chain segment during backfill: {e}"))?
-                as u64;
+            chains_inserted += Self::insert_backfill_chain(&tx, &chain_id, &row, &model_name)?;
+            segments_inserted += Self::insert_backfill_segment(&tx, &chain_id, &row)?;
         }
         tx.commit()
             .map_err(|e| format!("Failed to commit session chain backfill: {e}"))?;
@@ -3575,6 +4659,121 @@ impl StateDb {
         })
     }
 
+    fn session_chains_backfill_exists(conn: &Connection) -> Result<bool, DbError> {
+        let exists: i64 = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM session_chains LIMIT 1)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to check session chain backfill state: {e}"))?;
+        Ok(exists != 0)
+    }
+
+    fn load_session_chain_backfill_rows(
+        conn: &Connection,
+    ) -> Result<Vec<SessionChainBackfillRow>, DbError> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT st.provider_name,
+                        st.session_id,
+                        MIN(st.timestamp) AS started_at,
+                        MAX(st.timestamp) AS last_used_at,
+                        (
+                            SELECT st2.turn_id
+                            FROM session_turns st2
+                            WHERE st2.provider_name = st.provider_name
+                              AND st2.session_id = st.session_id
+                            ORDER BY st2.timestamp DESC, st2.id DESC
+                            LIMIT 1
+                        ) AS last_turn_id
+                 FROM session_turns st
+                 GROUP BY st.provider_name, st.session_id",
+            )
+            .map_err(|e| format!("Failed to prepare session chain backfill: {e}"))?;
+        let iter = stmt
+            .query_map([], Self::map_session_chain_backfill_row)
+            .map_err(|e| format!("Failed to query session chain backfill rows: {e}"))?;
+        iter.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read session chain backfill rows: {e}"))
+    }
+
+    fn map_session_chain_backfill_row(
+        row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<SessionChainBackfillRow> {
+        Ok(SessionChainBackfillRow {
+            provider: row.get(0)?,
+            session: row.get(1)?,
+            started_at: row.get(2)?,
+            last_used_at: row.get(3)?,
+            last_turn_id: row.get(4)?,
+        })
+    }
+
+    fn infer_model_for_backfill_row(
+        conn: &Connection,
+        provider_session_expr: &str,
+        row: &SessionChainBackfillRow,
+    ) -> Result<String, DbError> {
+        let model_sql = Self::backfill_model_lookup_sql(provider_session_expr);
+        let model_name = Self::lookup_model_for_backfill_row(conn, &model_sql, row)?;
+        Ok(Self::default_backfill_model_name(model_name))
+    }
+
+    fn backfill_model_lookup_sql(provider_session_expr: &str) -> String {
+        format!(
+            "SELECT model_name
+             FROM invocations
+             WHERE {provider_session_expr} = ?1
+             ORDER BY COALESCE(finished_at, created_at) DESC, id DESC
+             LIMIT 1"
+        )
+    }
+
+    fn lookup_model_for_backfill_row(
+        conn: &Connection,
+        model_sql: &str,
+        row: &SessionChainBackfillRow,
+    ) -> Result<Option<String>, DbError> {
+        conn.query_row(model_sql, params![row.session], |r| r.get::<_, String>(0))
+            .optional()
+            .map_err(|e| format!("Failed to infer model during backfill: {e}"))
+    }
+
+    fn default_backfill_model_name(model_name: Option<String>) -> String {
+        model_name.unwrap_or_else(|| "<unknown>".to_string())
+    }
+
+    fn insert_backfill_chain(
+        conn: &Connection,
+        chain_id: &str,
+        row: &SessionChainBackfillRow,
+        model_name: &str,
+    ) -> Result<u64, DbError> {
+        conn.execute(
+            "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![chain_id, row.started_at, row.last_used_at, model_name],
+        )
+        .map(|changed| changed as u64)
+        .map_err(|e| format!("Failed to insert session chain during backfill: {e}"))
+    }
+
+    fn insert_backfill_segment(
+        conn: &Connection,
+        chain_id: &str,
+        row: &SessionChainBackfillRow,
+    ) -> Result<u64, DbError> {
+        conn.execute(
+            "INSERT INTO session_chain_segments
+                (chain_id, provider_name, session_id, started_at, ended_at, last_turn_id, transition_reason)
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5, 'imported')",
+            params![chain_id, row.provider, row.session, row.started_at, row.last_turn_id],
+        )
+        .map(|changed| changed as u64)
+        .map_err(|e| format!("Failed to insert session chain segment during backfill: {e}"))
+    }
+
     pub fn open_chain_segment(
         &self,
         chain_id: &str,
@@ -3583,35 +4782,61 @@ impl StateDb {
         started_at: &DateTime<Utc>,
         reason: TransitionReason,
     ) -> Result<i64, DbError> {
-        self.conn
-            .execute(
-                "INSERT INTO session_chain_segments
-                    (chain_id, provider_name, session_id, started_at, transition_reason)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT (chain_id, provider_name, session_id)
-                 DO UPDATE SET
-                    started_at = excluded.started_at,
-                    ended_at = NULL,
-                    last_turn_id = NULL,
-                    transition_reason = excluded.transition_reason",
-                params![
-                    chain_id,
-                    provider_name,
-                    session_id,
-                    started_at.to_rfc3339(),
-                    reason.as_str()
-                ],
-            )
-            .map_err(|e| format!("Failed to open session chain segment: {e}"))?;
-        self.conn
-            .query_row(
-                "SELECT id FROM session_chain_segments
+        Self::upsert_open_chain_segment(
+            &self.conn,
+            chain_id,
+            provider_name,
+            session_id,
+            &started_at.to_rfc3339(),
+            reason,
+        )?;
+        Self::read_open_chain_segment_id(&self.conn, chain_id, provider_name, session_id)
+    }
+
+    fn upsert_open_chain_segment(
+        conn: &Connection,
+        chain_id: &str,
+        provider_name: &str,
+        session_id: &str,
+        started_at: &str,
+        reason: TransitionReason,
+    ) -> Result<(), DbError> {
+        conn.execute(
+            "INSERT INTO session_chain_segments
+                (chain_id, provider_name, session_id, started_at, transition_reason)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (chain_id, provider_name, session_id)
+             DO UPDATE SET
+                started_at = excluded.started_at,
+                ended_at = NULL,
+                last_turn_id = NULL,
+                transition_reason = excluded.transition_reason",
+            params![
+                chain_id,
+                provider_name,
+                session_id,
+                started_at,
+                reason.as_str()
+            ],
+        )
+        .map_err(|e| format!("Failed to open session chain segment: {e}"))?;
+        Ok(())
+    }
+
+    fn read_open_chain_segment_id(
+        conn: &Connection,
+        chain_id: &str,
+        provider_name: &str,
+        session_id: &str,
+    ) -> Result<i64, DbError> {
+        conn.query_row(
+            "SELECT id FROM session_chain_segments
                  WHERE chain_id = ?1 AND provider_name = ?2 AND session_id = ?3
                  ORDER BY id DESC LIMIT 1",
-                params![chain_id, provider_name, session_id],
-                |row| row.get(0),
-            )
-            .map_err(|e| format!("Failed to read session chain segment id: {e}"))
+            params![chain_id, provider_name, session_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("Failed to read session chain segment id: {e}"))
     }
 
     pub fn find_conflicting_active_segment(
@@ -3644,8 +4869,28 @@ impl StateDb {
         started_at: &DateTime<Utc>,
         model_name: &str,
     ) -> Result<(), DbError> {
-        let exists: Option<i64> = self
+        if Self::session_chain_segment_exists(&self.conn, provider_name, session_id)? {
+            return Ok(());
+        }
+        let chain_id = Uuid::new_v4().to_string();
+        let ts = started_at.to_rfc3339();
+        let tx = self
             .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("Failed to begin imported chain mint: {e}"))?;
+        Self::insert_imported_chain(&tx, &chain_id, &ts, model_name)?;
+        Self::insert_imported_segment(&tx, &chain_id, provider_name, session_id, &ts)?;
+        tx.commit()
+            .map_err(|e| format!("Failed to commit imported chain mint: {e}"))?;
+        Ok(())
+    }
+
+    fn session_chain_segment_exists(
+        conn: &Connection,
+        provider_name: &str,
+        session_id: &str,
+    ) -> Result<bool, DbError> {
+        let exists: Option<i64> = conn
             .query_row(
                 "SELECT 1 FROM session_chain_segments
                  WHERE provider_name = ?1 AND session_id = ?2
@@ -3655,32 +4900,40 @@ impl StateDb {
             )
             .optional()
             .map_err(|e| format!("Failed to check existing session chain segment: {e}"))?;
-        if exists.is_some() {
-            return Ok(());
-        }
-        let chain_id = Uuid::new_v4().to_string();
-        let ts = started_at.to_rfc3339();
-        let tx = self
-            .conn
-            .unchecked_transaction()
-            .map_err(|e| format!("Failed to begin imported chain mint: {e}"))?;
-        tx.execute(
+        Ok(exists.is_some())
+    }
+
+    fn insert_imported_chain(
+        conn: &Connection,
+        chain_id: &str,
+        started_at: &str,
+        model_name: &str,
+    ) -> Result<(), DbError> {
+        conn.execute(
             "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
              VALUES (?1, ?2, ?2, ?3)
              ON CONFLICT DO NOTHING",
-            params![chain_id, ts, model_name],
+            params![chain_id, started_at, model_name],
         )
         .map_err(|e| format!("Failed to mint imported session chain: {e}"))?;
-        tx.execute(
+        Ok(())
+    }
+
+    fn insert_imported_segment(
+        conn: &Connection,
+        chain_id: &str,
+        provider_name: &str,
+        session_id: &str,
+        started_at: &str,
+    ) -> Result<(), DbError> {
+        conn.execute(
             "INSERT INTO session_chain_segments
                 (chain_id, provider_name, session_id, started_at, transition_reason)
              VALUES (?1, ?2, ?3, ?4, 'imported')
              ON CONFLICT DO NOTHING",
-            params![chain_id, provider_name, session_id, ts],
+            params![chain_id, provider_name, session_id, started_at],
         )
         .map_err(|e| format!("Failed to mint imported session chain segment: {e}"))?;
-        tx.commit()
-            .map_err(|e| format!("Failed to commit imported chain mint: {e}"))?;
         Ok(())
     }
 
@@ -3741,9 +4994,8 @@ impl StateDb {
             .optional()
             .map_err(|e| format!("Failed to query latest compaction boundary: {e}"))?;
         row.map(|(turn_id, raw_ts)| {
-            DateTime::parse_from_rfc3339(&raw_ts)
-                .map(|dt| (turn_id, dt.with_timezone(&Utc)))
-                .map_err(|e| format!("Bad compaction boundary timestamp {raw_ts}: {e}"))
+            Self::strict_rfc3339_message(&raw_ts, "compaction boundary timestamp")
+                .map(|timestamp| (turn_id, timestamp))
         })
         .transpose()
     }
@@ -3793,107 +5045,216 @@ impl StateDb {
         input: &str,
         model_override: Option<&str>,
     ) -> Result<ResolvedResume, ResumeError> {
-        Uuid::try_parse(input).map_err(|_| ResumeError::InvalidUuid {
-            input: input.to_string(),
-        })?;
-
-        if let Some(wrong_id) = self
-            .wrong_id_kind_invocation_match(input)
-            .map_err(|message| ResumeError::Db { message })?
-        {
-            return Err(ResumeError::WrongIdKind {
-                input: input.to_string(),
-                input_kind: WrongIdKindInput::AgentRunnerInvocationId,
-                provider_session_id: wrong_id.provider_session_id,
-                agent_runner_invocation_id: wrong_id.invocation_uuid,
-                chain_id: wrong_id.chain_id,
-                provider_name: wrong_id.provider_name,
-            });
-        }
-
-        let chain_ids = self
-            .candidate_chain_ids(input)
-            .map_err(|message| ResumeError::Db { message })?;
-        if chain_ids.is_empty() {
-            return Err(ResumeError::NoChainFound {
-                input: input.to_string(),
-            });
-        }
-        let chain_id = self
-            .choose_resume_chain(input, chain_ids)
-            .map_err(|message| ResumeError::Db { message })?;
-
-        let Some(chain_id) = chain_id else {
-            let previews = self
-                .chain_previews(input)
-                .map_err(|message| ResumeError::Db { message })?;
-            return Err(ResumeError::Ambiguous {
-                input: input.to_string(),
-                previews,
-            });
-        };
-
-        let (active_provider, active_session_id) = self
-            .active_segment_for_chain(&chain_id)
-            .map_err(|message| ResumeError::Db { message })?
-            .ok_or_else(|| ResumeError::ActiveSegmentMissing {
-                chain_id: chain_id.clone(),
-            })?;
-
-        let model_name = if let Some(model_override) = model_override {
-            Some(model_override.to_string())
-        } else {
-            self.latest_invocation_model_for_chain(&chain_id)
-                .map_err(|message| ResumeError::Db { message })?
-                .filter(|name| name != "<unknown>")
-                .or(self
-                    .chain_model_name(&chain_id)
-                    .map_err(|message| ResumeError::Db { message })?
-                    .filter(|name| name != "<unknown>"))
-        };
-
-        let model = if let Some(model_name) = model_name.as_ref() {
-            let model =
-                models
-                    .get(model_name)
-                    .cloned()
-                    .ok_or_else(|| ResumeError::UnknownModel {
-                        model_name: model_name.clone(),
-                    })?;
-            let Some(_active_provider_index) = model
-                .providers
-                .iter()
-                .position(|provider| provider.name == active_provider)
-            else {
-                let mut suggestions = models
-                    .iter()
-                    .filter(|(_, model)| {
-                        model
-                            .providers
-                            .iter()
-                            .any(|provider| provider.name == active_provider)
-                    })
-                    .map(|(name, _)| name.clone())
-                    .collect::<Vec<_>>();
-                suggestions.sort();
-                return Err(ResumeError::ProviderModelMismatch {
-                    model_name: model_name.clone(),
-                    active_provider,
-                    suggestions,
-                });
-            };
-            Some(model)
-        } else {
-            None
-        };
-
-        Ok(ResolvedResume {
+        Self::validate_resume_input_uuid(input)?;
+        self.reject_wrong_resume_id_kind(input)?;
+        let chain_id = self.resolve_resume_chain_id(input)?;
+        let (active_provider, active_session_id) = self.require_active_segment(&chain_id)?;
+        let model_name = self.resolve_resume_model_name(&chain_id, model_override)?;
+        let model =
+            Self::resolve_resume_model_config(models, model_name.as_ref(), &active_provider)?;
+        Ok(Self::assemble_resolved_resume(
             chain_id,
             model_name,
             model,
             active_provider,
             active_session_id,
+        ))
+    }
+
+    fn validate_resume_input_uuid(input: &str) -> Result<(), ResumeError> {
+        Uuid::try_parse(input)
+            .map(|_| ())
+            .map_err(|_| ResumeError::InvalidUuid {
+                input: input.to_string(),
+            })
+    }
+
+    fn reject_wrong_resume_id_kind(&self, input: &str) -> Result<(), ResumeError> {
+        match self
+            .wrong_id_kind_invocation_match(input)
+            .map_err(|message| ResumeError::Db { message })?
+        {
+            Some(wrong_id) => Err(Self::wrong_id_kind_resume_error(input, wrong_id)),
+            None => Ok(()),
+        }
+    }
+
+    fn wrong_id_kind_resume_error(
+        input: &str,
+        wrong_id: WrongIdKindInvocationMatch,
+    ) -> ResumeError {
+        ResumeError::WrongIdKind {
+            input: input.to_string(),
+            input_kind: WrongIdKindInput::AgentRunnerInvocationId,
+            provider_session_id: wrong_id.provider_session_id,
+            agent_runner_invocation_id: wrong_id.invocation_uuid,
+            chain_id: wrong_id.chain_id,
+            provider_name: wrong_id.provider_name,
+        }
+    }
+
+    fn resolve_resume_chain_id(&self, input: &str) -> Result<String, ResumeError> {
+        let chain_ids = self
+            .candidate_chain_ids(input)
+            .map_err(|message| ResumeError::Db { message })?;
+        Self::validate_resume_chain_candidates(input, &chain_ids)?;
+        match self
+            .choose_resume_chain(input, chain_ids)
+            .map_err(|message| ResumeError::Db { message })?
+        {
+            Some(chain_id) => Ok(chain_id),
+            None => Err(self.ambiguous_resume_error(input)?),
+        }
+    }
+
+    fn validate_resume_chain_candidates(
+        input: &str,
+        chain_ids: &[String],
+    ) -> Result<(), ResumeError> {
+        if chain_ids.is_empty() {
+            Err(ResumeError::NoChainFound {
+                input: input.to_string(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn ambiguous_resume_error(&self, input: &str) -> Result<ResumeError, ResumeError> {
+        let previews = self
+            .chain_previews(input)
+            .map_err(|message| ResumeError::Db { message })?;
+        Ok(ResumeError::Ambiguous {
+            input: input.to_string(),
+            previews,
         })
+    }
+
+    fn require_active_segment(&self, chain_id: &str) -> Result<(String, String), ResumeError> {
+        self.active_segment_for_chain(chain_id)
+            .map_err(|message| ResumeError::Db { message })?
+            .ok_or_else(|| ResumeError::ActiveSegmentMissing {
+                chain_id: chain_id.to_string(),
+            })
+    }
+
+    fn resolve_resume_model_name(
+        &self,
+        chain_id: &str,
+        model_override: Option<&str>,
+    ) -> Result<Option<String>, ResumeError> {
+        match model_override {
+            Some(model_name) => Ok(Some(model_name.to_string())),
+            None => self.infer_resume_model_name(chain_id),
+        }
+    }
+
+    fn infer_resume_model_name(&self, chain_id: &str) -> Result<Option<String>, ResumeError> {
+        let latest_invocation = self
+            .latest_invocation_model_for_chain(chain_id)
+            .map_err(|message| ResumeError::Db { message })?;
+        let chain_model = self
+            .chain_model_name(chain_id)
+            .map_err(|message| ResumeError::Db { message })?;
+        Ok(Self::first_known_resume_model_name(
+            latest_invocation,
+            chain_model,
+        ))
+    }
+
+    fn first_known_resume_model_name(
+        latest_invocation: Option<String>,
+        chain_model: Option<String>,
+    ) -> Option<String> {
+        latest_invocation
+            .filter(|name| Self::resume_model_name_is_known(name))
+            .or(chain_model.filter(|name| Self::resume_model_name_is_known(name)))
+    }
+
+    fn resume_model_name_is_known(model_name: &str) -> bool {
+        model_name != "<unknown>"
+    }
+
+    fn resolve_resume_model_config(
+        models: &ModelStore,
+        model_name: Option<&String>,
+        active_provider: &str,
+    ) -> Result<Option<ModelConfig>, ResumeError> {
+        match model_name {
+            Some(model_name) => {
+                let model = Self::require_resume_model(models, model_name)?;
+                Self::validate_resume_provider_for_model(
+                    models,
+                    model_name,
+                    &model,
+                    active_provider,
+                )?;
+                Ok(Some(model))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn require_resume_model(
+        models: &ModelStore,
+        model_name: &str,
+    ) -> Result<ModelConfig, ResumeError> {
+        models
+            .get(model_name)
+            .cloned()
+            .ok_or_else(|| ResumeError::UnknownModel {
+                model_name: model_name.to_string(),
+            })
+    }
+
+    fn validate_resume_provider_for_model(
+        models: &ModelStore,
+        model_name: &str,
+        model: &ModelConfig,
+        active_provider: &str,
+    ) -> Result<(), ResumeError> {
+        if Self::model_has_provider(model, active_provider) {
+            Ok(())
+        } else {
+            Err(ResumeError::ProviderModelMismatch {
+                model_name: model_name.to_string(),
+                active_provider: active_provider.to_string(),
+                suggestions: Self::model_names_for_provider(models, active_provider),
+            })
+        }
+    }
+
+    fn model_has_provider(model: &ModelConfig, active_provider: &str) -> bool {
+        model
+            .providers
+            .iter()
+            .any(|provider| provider.name == active_provider)
+    }
+
+    fn model_names_for_provider(models: &ModelStore, active_provider: &str) -> Vec<String> {
+        let mut suggestions = models
+            .iter()
+            .filter(|(_, model)| Self::model_has_provider(model, active_provider))
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        suggestions.sort();
+        suggestions
+    }
+
+    fn assemble_resolved_resume(
+        chain_id: String,
+        model_name: Option<String>,
+        model: Option<ModelConfig>,
+        active_provider: String,
+        active_session_id: String,
+    ) -> ResolvedResume {
+        ResolvedResume {
+            chain_id,
+            model_name,
+            model,
+            active_provider,
+            active_session_id,
+        }
     }
 
     pub fn resume_previews(&self, input: &str) -> Result<Vec<ChainPreview>, DbError> {
@@ -3941,43 +5302,68 @@ impl StateDb {
         &self,
         input: &str,
     ) -> Result<Option<WrongIdKindInvocationMatch>, String> {
-        let provider_session_select = if Self::invocations_have_dual_id_columns(&self.conn)? {
-            "provider_session_id"
-        } else {
-            "NULL AS provider_session_id"
+        let sql = Self::wrong_id_invocation_match_sql(&self.conn)?;
+        let row = Self::load_wrong_id_invocation_match_row(&self.conn, &sql, input)?;
+
+        let Some(row) = row else {
+            return Ok(None);
         };
-        let sql = format!(
+        let chain_id = self.chain_id_for_wrong_id_match(
+            row.provider_name.as_deref(),
+            row.provider_session_id.as_deref(),
+        )?;
+        Ok(Some(WrongIdKindInvocationMatch {
+            invocation_uuid: row.invocation_uuid,
+            provider_name: row.provider_name,
+            provider_session_id: row.provider_session_id,
+            chain_id,
+        }))
+    }
+
+    fn wrong_id_invocation_match_sql(conn: &Connection) -> Result<String, String> {
+        let provider_session_select = Self::wrong_id_provider_session_select(conn)?;
+        Ok(format!(
             "SELECT invocation_uuid, provider_name, {provider_session_select}
              FROM invocations
              WHERE invocation_uuid = ?1"
-        );
-        let row = self
-            .conn
-            .query_row(&sql, params![input], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            })
-            .optional()
-            .map_err(|e| format!("Failed to query invocation id-kind match: {e}"))?;
+        ))
+    }
 
-        let Some((invocation_uuid, provider_name, provider_session_id)) = row else {
-            return Ok(None);
-        };
-        let chain_id = match (provider_name.as_deref(), provider_session_id.as_deref()) {
+    fn wrong_id_provider_session_select(conn: &Connection) -> Result<&'static str, String> {
+        if Self::invocations_have_dual_id_columns(conn)? {
+            Ok("provider_session_id")
+        } else {
+            Ok("NULL AS provider_session_id")
+        }
+    }
+
+    fn load_wrong_id_invocation_match_row(
+        conn: &Connection,
+        sql: &str,
+        input: &str,
+    ) -> Result<Option<WrongIdKindInvocationRow>, String> {
+        conn.query_row(sql, params![input], |row| {
+            Ok(WrongIdKindInvocationRow {
+                invocation_uuid: row.get(0)?,
+                provider_name: row.get(1)?,
+                provider_session_id: row.get(2)?,
+            })
+        })
+        .optional()
+        .map_err(|e| format!("Failed to query invocation id-kind match: {e}"))
+    }
+
+    fn chain_id_for_wrong_id_match(
+        &self,
+        provider_name: Option<&str>,
+        provider_session_id: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        match (provider_name, provider_session_id) {
             (Some(provider_name), Some(provider_session_id)) => self
                 .chain_id_for_segment(provider_name, provider_session_id)
-                .map_err(|e| format!("Failed to resolve chain for wrong-id-kind match: {e}"))?,
-            _ => None,
-        };
-        Ok(Some(WrongIdKindInvocationMatch {
-            invocation_uuid,
-            provider_name,
-            provider_session_id,
-            chain_id,
-        }))
+                .map_err(|e| format!("Failed to resolve chain for wrong-id-kind match: {e}")),
+            _ => Ok(None),
+        }
     }
 
     fn choose_resume_chain(
@@ -3988,50 +5374,56 @@ impl StateDb {
         if chain_ids.len() == 1 {
             return Ok(chain_ids.pop());
         }
-
-        struct ResumeChainCandidate {
-            chain_id: String,
-            last_used_at: DateTime<Utc>,
-            latest_segment_started_at: DateTime<Utc>,
-        }
-
         let mut rows = Vec::new();
         for chain_id in chain_ids {
-            let raw: String = self
-                .conn
-                .query_row(
-                    "SELECT last_used_at FROM session_chains WHERE chain_id = ?1",
-                    params![chain_id],
-                    |row| row.get(0),
-                )
-                .map_err(|e| format!("Failed to read chain last_used_at: {e}"))?;
-            let last_used = DateTime::parse_from_rfc3339(&raw)
-                .map(|dt| dt.with_timezone(&Utc))
-                .map_err(|e| format!("Bad chain last_used_at {raw}: {e}"))?;
-
-            let raw_started: String = self
-                .conn
-                .query_row(
-                    "SELECT started_at
-                     FROM session_chain_segments
-                     WHERE chain_id = ?1
-                     ORDER BY started_at DESC, id DESC
-                     LIMIT 1",
-                    params![chain_id],
-                    |row| row.get(0),
-                )
-                .map_err(|e| format!("Failed to read chain latest segment started_at: {e}"))?;
-            let latest_segment_started_at = DateTime::parse_from_rfc3339(&raw_started)
-                .map(|dt| dt.with_timezone(&Utc))
-                .map_err(|e| format!("Bad chain segment started_at {raw_started}: {e}"))?;
-
-            rows.push(ResumeChainCandidate {
-                chain_id,
-                last_used_at: last_used,
-                latest_segment_started_at,
-            });
+            rows.push(self.load_resume_chain_candidate(chain_id)?);
         }
+        Self::sort_resume_chain_candidates(&mut rows);
+        Ok(rows.into_iter().next().map(|row| row.chain_id))
+    }
 
+    fn load_resume_chain_candidate(
+        &self,
+        chain_id: String,
+    ) -> Result<ResumeChainCandidate, String> {
+        let last_used_at = self.read_chain_last_used_at(&chain_id)?;
+        let latest_segment_started_at = self.read_latest_segment_started_at(&chain_id)?;
+        Ok(ResumeChainCandidate {
+            chain_id,
+            last_used_at,
+            latest_segment_started_at,
+        })
+    }
+
+    fn read_chain_last_used_at(&self, chain_id: &str) -> Result<DateTime<Utc>, String> {
+        let raw: String = self
+            .conn
+            .query_row(
+                "SELECT last_used_at FROM session_chains WHERE chain_id = ?1",
+                params![chain_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to read chain last_used_at: {e}"))?;
+        Self::strict_rfc3339_message(&raw, "chain last_used_at")
+    }
+
+    fn read_latest_segment_started_at(&self, chain_id: &str) -> Result<DateTime<Utc>, String> {
+        let raw_started: String = self
+            .conn
+            .query_row(
+                "SELECT started_at
+                 FROM session_chain_segments
+                 WHERE chain_id = ?1
+                 ORDER BY started_at DESC, id DESC
+                 LIMIT 1",
+                params![chain_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to read chain latest segment started_at: {e}"))?;
+        Self::strict_rfc3339_message(&raw_started, "chain segment started_at")
+    }
+
+    fn sort_resume_chain_candidates(rows: &mut [ResumeChainCandidate]) {
         rows.sort_by(|a, b| {
             b.last_used_at
                 .cmp(&a.last_used_at)
@@ -4041,7 +5433,6 @@ impl StateDb {
                 })
                 .then_with(|| a.chain_id.cmp(&b.chain_id))
         });
-        Ok(rows.into_iter().next().map(|row| row.chain_id))
     }
 
     pub fn active_segment_id_for_chain_provider_session(
@@ -4095,7 +5486,15 @@ impl StateDb {
 
     fn latest_invocation_model_for_chain(&self, chain_id: &str) -> Result<Option<String>, String> {
         let provider_session_expr = Self::provider_session_expr(&self.conn, Some("i."))?;
-        let sql = format!(
+        let sql = Self::latest_invocation_model_sql(&provider_session_expr);
+        self.conn
+            .query_row(&sql, params![chain_id], |row| row.get(0))
+            .optional()
+            .map_err(|e| format!("Failed to infer session chain model from invocations: {e}"))
+    }
+
+    fn latest_invocation_model_sql(provider_session_expr: &str) -> String {
+        format!(
             "SELECT i.model_name
              FROM invocations i
              WHERE {provider_session_expr} IN (
@@ -4103,75 +5502,101 @@ impl StateDb {
              )
              ORDER BY COALESCE(i.finished_at, i.created_at) DESC, i.id DESC
              LIMIT 1"
-        );
-        self.conn
-            .query_row(&sql, params![chain_id], |row| row.get(0))
-            .optional()
-            .map_err(|e| format!("Failed to infer session chain model from invocations: {e}"))
+        )
     }
 
     fn chain_previews(&self, input: &str) -> Result<Vec<ChainPreview>, String> {
         let chain_ids = self.candidate_chain_ids(input)?;
         let mut out = Vec::new();
         for chain_id in chain_ids {
-            let raw_last: String = self
-                .conn
-                .query_row(
-                    "SELECT last_used_at FROM session_chains WHERE chain_id = ?1",
-                    params![chain_id],
-                    |row| row.get(0),
-                )
-                .map_err(|e| format!("Failed to read chain preview: {e}"))?;
-            let last_used_at = DateTime::parse_from_rfc3339(&raw_last)
-                .map(|dt| dt.with_timezone(&Utc))
-                .map_err(|e| format!("Bad chain preview timestamp {raw_last}: {e}"))?;
-            let (active_provider, active_session_id) = self
-                .active_segment_for_chain(&chain_id)?
-                .unwrap_or_else(|| ("<none>".to_string(), "<none>".to_string()));
-            let turn_count: i64 = self.conn.query_row(
+            out.push(self.build_chain_preview(chain_id)?);
+        }
+        Self::sort_chain_previews(&mut out);
+        Ok(out)
+    }
+
+    fn build_chain_preview(&self, chain_id: String) -> Result<ChainPreview, String> {
+        let last_used_at = self.read_chain_preview_last_used_at(&chain_id)?;
+        let (active_provider, active_session_id) = self
+            .active_segment_for_chain(&chain_id)?
+            .unwrap_or_else(|| ("<none>".to_string(), "<none>".to_string()));
+        let turn_count = self.preview_turn_count(&active_provider, &active_session_id);
+        let recent_turns = self.recent_turn_previews(&active_provider, &active_session_id)?;
+        Ok(ChainPreview {
+            chain_id,
+            last_used_at,
+            active_provider,
+            active_session_id,
+            turn_count,
+            recent_turns,
+        })
+    }
+
+    fn read_chain_preview_last_used_at(&self, chain_id: &str) -> Result<DateTime<Utc>, String> {
+        let raw_last: String = self
+            .conn
+            .query_row(
+                "SELECT last_used_at FROM session_chains WHERE chain_id = ?1",
+                params![chain_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to read chain preview: {e}"))?;
+        Self::strict_rfc3339_message(&raw_last, "chain preview timestamp")
+    }
+
+    fn preview_turn_count(&self, active_provider: &str, active_session_id: &str) -> usize {
+        let turn_count: i64 = self
+            .conn
+            .query_row(
                 "SELECT COUNT(*) FROM session_turns WHERE provider_name = ?1 AND session_id = ?2",
                 params![active_provider, active_session_id],
                 |row| row.get(0),
-            ).unwrap_or(0);
-            let mut stmt = self
-                .conn
-                .prepare(
-                    "SELECT role, timestamp
+            )
+            .unwrap_or(0);
+        turn_count.max(0) as usize
+    }
+
+    fn recent_turn_previews(
+        &self,
+        active_provider: &str,
+        active_session_id: &str,
+    ) -> Result<Vec<TurnPreview>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT role, timestamp
                  FROM session_turns
                  WHERE provider_name = ?1 AND session_id = ?2
                  ORDER BY timestamp DESC, id DESC
                  LIMIT 3",
-                )
-                .map_err(|e| format!("Failed to prepare recent turns preview: {e}"))?;
-            let rows = stmt
-                .query_map(params![active_provider, active_session_id], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })
-                .map_err(|e| format!("Failed to query recent turns preview: {e}"))?;
-            let mut recent_turns = Vec::new();
-            for row in rows {
-                let (role, raw_ts) = row.map_err(|e| format!("Failed to read recent turn: {e}"))?;
-                let timestamp = DateTime::parse_from_rfc3339(&raw_ts)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .map_err(|e| format!("Bad recent turn timestamp {raw_ts}: {e}"))?;
-                recent_turns.push(TurnPreview {
-                    role,
-                    timestamp,
-                    snippet: None,
-                });
-            }
-            recent_turns.reverse();
-            out.push(ChainPreview {
-                chain_id,
-                last_used_at,
-                active_provider,
-                active_session_id,
-                turn_count: turn_count.max(0) as usize,
-                recent_turns,
-            });
+            )
+            .map_err(|e| format!("Failed to prepare recent turns preview: {e}"))?;
+        let rows = stmt
+            .query_map(params![active_provider, active_session_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| format!("Failed to query recent turns preview: {e}"))?;
+        let mut recent_turns = Vec::new();
+        for row in rows {
+            let row = row.map_err(|e| format!("Failed to read recent turn: {e}"))?;
+            recent_turns.push(Self::map_turn_preview(row)?);
         }
+        recent_turns.reverse();
+        Ok(recent_turns)
+    }
+
+    fn map_turn_preview(row: (String, String)) -> Result<TurnPreview, String> {
+        let (role, raw_ts) = row;
+        let timestamp = Self::strict_rfc3339_message(&raw_ts, "recent turn timestamp")?;
+        Ok(TurnPreview {
+            role,
+            timestamp,
+            snippet: None,
+        })
+    }
+
+    fn sort_chain_previews(out: &mut [ChainPreview]) {
         out.sort_by_key(|preview| std::cmp::Reverse(preview.last_used_at));
-        Ok(out)
     }
 
     pub fn find_session_for_invocation_window(
@@ -4192,6 +5617,23 @@ impl StateDb {
         started_at: &DateTime<Utc>,
         finished_at: &DateTime<Utc>,
     ) -> Result<Vec<String>, String> {
+        let rows = self.load_invocation_window_turn_rows(provider_name)?;
+        let mut candidates: HashMap<String, (DateTime<Utc>, u64)> = HashMap::new();
+        for row in rows {
+            Self::accumulate_invocation_window_candidate(
+                &mut candidates,
+                row,
+                started_at,
+                finished_at,
+            )?;
+        }
+        Ok(Self::rank_invocation_window_sessions(candidates))
+    }
+
+    fn load_invocation_window_turn_rows(
+        &self,
+        provider_name: &str,
+    ) -> Result<Vec<InvocationWindowTurnRow>, String> {
         let mut stmt = self
             .conn
             .prepare(
@@ -4200,35 +5642,88 @@ impl StateDb {
                  WHERE provider_name = ?1",
             )
             .map_err(|e| format!("Failed to prepare invocation session lookup: {e}"))?;
-
         let rows = stmt
             .query_map(params![provider_name], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok(InvocationWindowTurnRow {
+                    session_id: row.get(0)?,
+                    timestamp_raw: row.get(1)?,
+                })
             })
             .map_err(|e| format!("Failed to query invocation session lookup: {e}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read invocation session lookup row: {e}"))
+    }
 
-        let mut candidates: HashMap<String, (DateTime<Utc>, u64)> = HashMap::new();
-        for row in rows {
-            let (session_id, timestamp_raw) =
-                row.map_err(|e| format!("Failed to read invocation session lookup row: {e}"))?;
-            let timestamp = DateTime::parse_from_rfc3339(&timestamp_raw)
-                .map(|dt| dt.with_timezone(&Utc))
-                .map_err(|e| format!("Bad session turn timestamp {timestamp_raw}: {e}"))?;
-            if timestamp <= *started_at || timestamp > *finished_at {
-                continue;
-            }
-
-            candidates
-                .entry(session_id)
-                .and_modify(|(earliest, in_window)| {
-                    if timestamp < *earliest {
-                        *earliest = timestamp;
-                    }
-                    *in_window += 1;
-                })
-                .or_insert((timestamp, 1));
+    fn accumulate_invocation_window_candidate(
+        candidates: &mut HashMap<String, (DateTime<Utc>, u64)>,
+        row: InvocationWindowTurnRow,
+        started_at: &DateTime<Utc>,
+        finished_at: &DateTime<Utc>,
+    ) -> Result<(), String> {
+        let timestamp = Self::parse_invocation_window_turn_timestamp(&row)?;
+        if !Self::invocation_window_turn_is_candidate(&timestamp, started_at, finished_at) {
+            return Ok(());
         }
+        Self::aggregate_invocation_window_candidate(candidates, row.session_id, timestamp);
+        Ok(())
+    }
 
+    fn parse_invocation_window_turn_timestamp(
+        row: &InvocationWindowTurnRow,
+    ) -> Result<DateTime<Utc>, String> {
+        Self::strict_rfc3339_message(&row.timestamp_raw, "session turn timestamp")
+    }
+
+    fn invocation_window_turn_is_candidate(
+        timestamp: &DateTime<Utc>,
+        started_at: &DateTime<Utc>,
+        finished_at: &DateTime<Utc>,
+    ) -> bool {
+        Self::timestamp_is_inside_invocation_window(timestamp, started_at, finished_at)
+    }
+
+    fn aggregate_invocation_window_candidate(
+        candidates: &mut HashMap<String, (DateTime<Utc>, u64)>,
+        session_id: String,
+        timestamp: DateTime<Utc>,
+    ) {
+        candidates
+            .entry(session_id)
+            .and_modify(|(earliest, in_window)| {
+                Self::update_invocation_window_candidate(earliest, in_window, timestamp);
+            })
+            .or_insert((timestamp, 1));
+    }
+
+    fn update_invocation_window_candidate(
+        earliest: &mut DateTime<Utc>,
+        in_window: &mut u64,
+        timestamp: DateTime<Utc>,
+    ) {
+        if timestamp < *earliest {
+            *earliest = timestamp;
+        }
+        *in_window += 1;
+    }
+
+    fn timestamp_is_inside_invocation_window(
+        timestamp: &DateTime<Utc>,
+        started_at: &DateTime<Utc>,
+        finished_at: &DateTime<Utc>,
+    ) -> bool {
+        timestamp > started_at && timestamp <= finished_at
+    }
+
+    fn rank_invocation_window_sessions(
+        candidates: HashMap<String, (DateTime<Utc>, u64)>,
+    ) -> Vec<String> {
+        let ranked = Self::rank_invocation_window_candidate_pairs(candidates);
+        Self::project_invocation_window_session_ids(ranked)
+    }
+
+    fn rank_invocation_window_candidate_pairs(
+        candidates: HashMap<String, (DateTime<Utc>, u64)>,
+    ) -> Vec<(String, (DateTime<Utc>, u64))> {
         let mut ranked = candidates.into_iter().collect::<Vec<_>>();
         ranked.sort_by(
             |(session_a, (earliest_a, count_a)), (session_b, (earliest_b, count_b))| {
@@ -4238,10 +5733,16 @@ impl StateDb {
                     .then_with(|| session_a.cmp(session_b))
             },
         );
-        Ok(ranked
+        ranked
+    }
+
+    fn project_invocation_window_session_ids(
+        ranked: Vec<(String, (DateTime<Utc>, u64))>,
+    ) -> Vec<String> {
+        ranked
             .into_iter()
             .map(|(session_id, _)| session_id)
-            .collect())
+            .collect()
     }
 
     /// Count assistant turns ingested for a provider since `since` (exclusive).
@@ -4251,27 +5752,49 @@ impl StateDb {
         provider_name: &str,
         since: Option<&DateTime<Utc>>,
     ) -> Result<u64, String> {
-        let count: i64 = match since {
-            Some(ts) => self
-                .conn
-                .query_row(
-                    "SELECT COUNT(*) FROM session_turns
-                     WHERE provider_name = ?1 AND role = 'assistant' AND timestamp > ?2",
-                    params![provider_name, ts.to_rfc3339()],
-                    |row| row.get(0),
-                )
-                .map_err(|e| format!("Failed to count session turns: {e}"))?,
-            None => self
-                .conn
-                .query_row(
-                    "SELECT COUNT(*) FROM session_turns
-                     WHERE provider_name = ?1 AND role = 'assistant'",
-                    params![provider_name],
-                    |row| row.get(0),
-                )
-                .map_err(|e| format!("Failed to count session turns: {e}"))?,
-        };
+        let count = self.query_assistant_turn_count(provider_name, since)?;
         Ok(count.max(0) as u64)
+    }
+
+    fn query_assistant_turn_count(
+        &self,
+        provider_name: &str,
+        since: Option<&DateTime<Utc>>,
+    ) -> Result<i64, String> {
+        match since {
+            Some(ts) => self.query_assistant_turn_count_after(provider_name, ts),
+            None => self.query_all_assistant_turn_count(provider_name),
+        }
+    }
+
+    fn query_assistant_turn_count_after(
+        &self,
+        provider_name: &str,
+        since: &DateTime<Utc>,
+    ) -> Result<i64, String> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_turns
+                 WHERE provider_name = ?1 AND role = 'assistant' AND timestamp > ?2",
+                params![provider_name, since.to_rfc3339()],
+                |row| row.get(0),
+            )
+            .map_err(Self::session_turn_count_error)
+    }
+
+    fn query_all_assistant_turn_count(&self, provider_name: &str) -> Result<i64, String> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_turns
+                 WHERE provider_name = ?1 AND role = 'assistant'",
+                params![provider_name],
+                |row| row.get(0),
+            )
+            .map_err(Self::session_turn_count_error)
+    }
+
+    fn session_turn_count_error(e: rusqlite::Error) -> String {
+        format!("Failed to count session turns: {e}")
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -4283,16 +5806,24 @@ impl StateDb {
 
     /// Helper: map a rusqlite row to an AccountRecord.
     fn map_account_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AccountRecord> {
-        let auth_method_str: String = row.get(3)?;
-        let auth_status_str: String = row.get(4)?;
+        let auth_method = Self::account_auth_method(row.get(3)?);
+        let auth_status = Self::account_auth_status(row.get(4)?);
         Ok(AccountRecord {
             id: row.get(0)?,
             provider: row.get(1)?,
             profile_name: row.get(2)?,
-            auth_method: AuthMethod::from_db_string(&auth_method_str),
-            auth_status: AuthStatus::from_str(&auth_status_str),
+            auth_method,
+            auth_status,
             created_at: row.get(5)?,
         })
+    }
+
+    fn account_auth_method(raw: String) -> AuthMethod {
+        AuthMethod::from_db_string(&raw)
+    }
+
+    fn account_auth_status(raw: String) -> AuthStatus {
+        AuthStatus::from_str(&raw)
     }
 }
 
@@ -9177,6 +10708,891 @@ interactive_args = ["launch"]
             )
             .unwrap();
         assert_eq!(active, 0);
+    }
+
+    #[test]
+    fn age132_invocation_projection_maps_full_row_and_rejects_bad_values() {
+        let db = test_db();
+        let invocation_uuid = "44444444-4444-4444-8444-444444444444";
+        let id = db
+            .start_invocation(&InvocationStart {
+                invocation_uuid: invocation_uuid.to_string(),
+                model_name: "claude-opus".to_string(),
+                provider_name: "claude".to_string(),
+                provider_index: 7,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        db.update_session_capture(id, Some(SESSION_A), "verified")
+            .unwrap();
+        db.update_resume_acceptance(id, "accepted", Some("matched"))
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE invocations
+                 SET status = 'succeeded',
+                     success = 1,
+                     exit_code = 0,
+                     terminal_reason = 'exit_zero',
+                     created_at = '2026-04-17T08:00:00Z',
+                     finished_at = '2026-04-17T08:00:02Z'
+                 WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+
+        let record = db.get_invocation_by_uuid(invocation_uuid).unwrap().unwrap();
+        assert_eq!(record.id, id);
+        assert_eq!(record.invocation_uuid, invocation_uuid);
+        assert_eq!(record.model_name, "claude-opus");
+        assert_eq!(record.provider_name.as_deref(), Some("claude"));
+        assert_eq!(record.provider_index, 7);
+        assert_eq!(record.parent_invocation_id, None);
+        assert_eq!(record.status, InvocationStatus::Succeeded);
+        assert_eq!(record.success, Some(true));
+        assert_eq!(record.exit_code, Some(0));
+        assert_eq!(record.terminal_reason.as_deref(), Some("exit_zero"));
+        assert_eq!(record.session_id.as_deref(), Some(SESSION_A));
+        assert_eq!(record.provider_session_id.as_deref(), Some(SESSION_A));
+        assert_eq!(
+            record.provider_session_capture_method.as_deref(),
+            Some("verified")
+        );
+        assert_eq!(record.resume_acceptance_status.as_deref(), Some("accepted"));
+        assert_eq!(
+            record.resume_acceptance_evidence.as_deref(),
+            Some("matched")
+        );
+        assert_eq!(record.created_at, ts("2026-04-17T08:00:00Z"));
+        assert_eq!(record.finished_at, Some(ts("2026-04-17T08:00:02Z")));
+
+        let child_uuid = "55555555-5555-5555-8555-555555555555";
+        let child_id = insert_invocation_fixture(&db, child_uuid, Some(id), "2026-04-17T08:00:01Z");
+        let children = db.list_invocation_children(id).unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].id, child_id);
+        assert_eq!(children[0].invocation_uuid, child_uuid);
+        assert_eq!(children[0].parent_invocation_id, Some(id));
+        assert_eq!(children[0].created_at, ts("2026-04-17T08:00:01Z"));
+
+        db.conn
+            .pragma_update(None, "ignore_check_constraints", true)
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE invocations SET status = 'paused' WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+        let err = db.get_invocation_by_uuid(invocation_uuid).unwrap_err();
+        assert!(err.contains("Unknown invocation status: paused"), "{err}");
+        db.conn
+            .execute(
+                "UPDATE invocations SET status = 'running', created_at = 'not-a-timestamp' WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+        let err = db.get_invocation_by_uuid(invocation_uuid).unwrap_err();
+        assert!(err.contains("Conversion error"), "{err}");
+    }
+
+    #[test]
+    fn age132_backfill_infers_model_from_latest_matching_invocation() {
+        let db = test_db();
+        db.ingest_session_turns_batch(
+            "claude",
+            &[
+                SessionTurnIngest {
+                    session_id: SESSION_A.to_string(),
+                    turn_id: "turn-a1".to_string(),
+                    timestamp: ts("2026-04-17T08:00:00Z"),
+                    role: "user".to_string(),
+                    parent_turn_id: None,
+                    is_sidechain: false,
+                    is_compaction_boundary: false,
+                    body: None,
+                },
+                SessionTurnIngest {
+                    session_id: SESSION_A.to_string(),
+                    turn_id: "turn-a2".to_string(),
+                    timestamp: ts("2026-04-17T08:01:00Z"),
+                    role: "assistant".to_string(),
+                    parent_turn_id: None,
+                    is_sidechain: false,
+                    is_compaction_boundary: false,
+                    body: None,
+                },
+            ],
+        )
+        .unwrap();
+        seed_invocation_for_session(
+            &db,
+            "claude-haiku",
+            "claude",
+            SESSION_A,
+            "2026-04-17T08:00:30Z",
+        );
+        seed_invocation_for_session(
+            &db,
+            "claude-opus",
+            "claude",
+            SESSION_A,
+            "2026-04-17T08:01:30Z",
+        );
+
+        let report = db.backfill_session_chains().unwrap();
+        assert_eq!(
+            report,
+            BackfillReport {
+                skipped_existing: false,
+                chains_inserted: 1,
+                segments_inserted: 1
+            }
+        );
+        let model_name: String = db
+            .conn
+            .query_row("SELECT model_name FROM session_chains", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(model_name, "claude-opus");
+    }
+
+    #[test]
+    fn age132_resolve_resume_rejections_and_wrong_id_context_are_typed() {
+        let models = resolver_model_store();
+        assert!(matches!(
+            test_db()
+                .resolve_resume(&models, "not-a-uuid", None)
+                .unwrap_err(),
+            ResumeError::InvalidUuid { .. }
+        ));
+        assert!(matches!(
+            test_db()
+                .resolve_resume(&models, "77777777-7777-4777-8777-777777777777", None)
+                .unwrap_err(),
+            ResumeError::NoChainFound { .. }
+        ));
+
+        let unknown_model_db = test_db();
+        seed_test_chain(
+            &unknown_model_db,
+            CHAIN_A,
+            "claude",
+            SESSION_A,
+            "missing-model",
+            "2026-04-17T08:00:00Z",
+        );
+        assert!(matches!(
+            unknown_model_db.resolve_resume(&models, SESSION_A, None).unwrap_err(),
+            ResumeError::UnknownModel { ref model_name } if model_name == "missing-model"
+        ));
+
+        let missing_segment_db = test_db();
+        seed_chain_row(
+            &missing_segment_db,
+            CHAIN_A,
+            "claude-opus",
+            "2026-04-17T08:00:00Z",
+        );
+        seed_segment_row(
+            &missing_segment_db,
+            CHAIN_A,
+            "claude",
+            SESSION_A,
+            "2026-04-17T08:00:00Z",
+            Some("2026-04-17T08:30:00Z"),
+            "initial",
+        );
+        assert!(matches!(
+            missing_segment_db.resolve_resume(&models, SESSION_A, None).unwrap_err(),
+            ResumeError::ActiveSegmentMissing { ref chain_id } if chain_id == CHAIN_A
+        ));
+
+        let wrong_id_db = test_db();
+        let invocation_uuid = "88888888-8888-4888-8888-888888888888";
+        let id = wrong_id_db
+            .start_invocation(&InvocationStart {
+                invocation_uuid: invocation_uuid.to_string(),
+                model_name: "claude-opus".to_string(),
+                provider_name: "claude".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        wrong_id_db
+            .bind_invocation_provider_session_start(
+                id,
+                &ProviderSessionBinding {
+                    provider_session_id: SESSION_A.to_string(),
+                    capture_method: "verified",
+                    resume_input_id: None,
+                },
+            )
+            .unwrap();
+        match wrong_id_db
+            .resolve_resume(&models, invocation_uuid, None)
+            .unwrap_err()
+        {
+            ResumeError::WrongIdKind {
+                provider_session_id,
+                chain_id,
+                provider_name,
+                agent_runner_invocation_id,
+                ..
+            } => {
+                assert_eq!(provider_session_id.as_deref(), Some(SESSION_A));
+                assert!(chain_id.is_some());
+                assert_eq!(provider_name.as_deref(), Some("claude"));
+                assert_eq!(agent_runner_invocation_id, invocation_uuid);
+            }
+            other => panic!("expected wrong-id-kind rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn age132_timestamp_policies_preserve_strict_forgiving_and_fallback_callers() {
+        let db = test_db();
+        db.upsert_quota_refresh("claude", &[quota_input(0.40, "2026-04-22T00:00:00Z")])
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE provider_quotas
+                 SET refreshed_at = 'bad-refreshed',
+                     exhausted_at = 'bad-exhausted',
+                     last_topology_probe_at = 'bad-probe'
+                 WHERE provider_name = 'claude'",
+                [],
+            )
+            .unwrap();
+        let quota = db.get_quota("claude").unwrap().unwrap();
+        assert_eq!(quota.refreshed_at, None);
+        assert_eq!(quota.exhausted_at, None);
+        assert_eq!(quota.last_topology_probe_at, None);
+        db.conn
+            .execute(
+                "UPDATE provider_quota_windows SET resets_at = 'bad-window' WHERE provider_name = 'claude'",
+                [],
+            )
+            .unwrap();
+        assert!(db.get_windows("claude").is_err());
+
+        let id = db
+            .start_invocation(&InvocationStart {
+                invocation_uuid: Uuid::new_v4().to_string(),
+                model_name: "claude-opus".to_string(),
+                provider_name: "claude".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        db.update_session_capture(id, Some(SESSION_A), "verified")
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE invocations SET created_at = 'not-a-timestamp' WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+        let before = Utc::now();
+        db.mint_chain_for_invocation_session(id).unwrap();
+        let after = Utc::now();
+        let raw_started: String = db
+            .conn
+            .query_row(
+                "SELECT started_at FROM session_chain_segments WHERE provider_name = 'claude' AND session_id = ?1",
+                params![SESSION_A],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let started_at = DateTime::parse_from_rfc3339(&raw_started)
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(started_at >= before - chrono::Duration::seconds(1));
+        assert!(started_at <= after + chrono::Duration::seconds(1));
+    }
+
+    #[test]
+    fn age132_invocation_artifact_contract_and_warning_only_failure_paths() {
+        let memory = StateDb::open(Path::new(":memory:")).unwrap();
+        let memory_id = memory
+            .start_invocation(&InvocationStart {
+                invocation_uuid: Uuid::new_v4().to_string(),
+                model_name: "claude-opus".to_string(),
+                provider_name: "claude".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        memory
+            .finalize_invocation(memory_id, true, 0, None, None)
+            .unwrap();
+        let memory_status: String = memory
+            .connection()
+            .query_row(
+                "SELECT status FROM invocations WHERE id = ?1",
+                params![memory_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(memory_status, "succeeded");
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(&dir.path().join("state.db")).unwrap();
+        let invocation_uuid = "99999999-9999-4999-8999-999999999999";
+        let id = db
+            .start_invocation(&InvocationStart {
+                invocation_uuid: invocation_uuid.to_string(),
+                model_name: "claude-opus".to_string(),
+                provider_name: "claude".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        let invocation_path = dir
+            .path()
+            .join("invocations")
+            .join(format!("{invocation_uuid}.invocation"));
+        assert!(invocation_path.exists());
+        assert!(!invocation_path.with_extension("invocation.tmp").exists());
+        let payload: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&invocation_path).unwrap()).unwrap();
+        assert_eq!(payload["id"], invocation_uuid);
+        assert_eq!(payload["status"], "running");
+        assert_eq!(payload["model_name"], "claude-opus");
+        assert_eq!(payload["provider_name"], "claude");
+        assert!(payload["pid"].as_u64().is_some());
+        assert!(DateTime::parse_from_rfc3339(payload["started_at"].as_str().unwrap()).is_ok());
+
+        db.finalize_invocation(id, false, 42, Some("rate_limit"), Some("limited"))
+            .unwrap();
+        let result_path = dir
+            .path()
+            .join("invocations")
+            .join(format!("{invocation_uuid}.result"));
+        assert!(result_path.exists());
+        assert!(!result_path.with_extension("result.tmp").exists());
+        let payload: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&result_path).unwrap()).unwrap();
+        assert_eq!(payload["id"], invocation_uuid);
+        assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["success"], false);
+        assert_eq!(payload["exit_code"], 42);
+        assert_eq!(payload["error_category"], "rate_limit");
+        assert_eq!(payload["terminal_reason"], "limited");
+        assert!(DateTime::parse_from_rfc3339(payload["finished_at"].as_str().unwrap()).is_ok());
+
+        let failing_dir = tempfile::tempdir().unwrap();
+        let failing = StateDb::open(&failing_dir.path().join("state.db")).unwrap();
+        std::fs::write(failing_dir.path().join("invocations"), b"not a directory").unwrap();
+        let id = failing
+            .start_invocation(&InvocationStart {
+                invocation_uuid: Uuid::new_v4().to_string(),
+                model_name: "claude-opus".to_string(),
+                provider_name: "claude".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        failing
+            .finalize_invocation(id, true, 0, None, None)
+            .unwrap();
+        let status: String = failing
+            .conn
+            .query_row(
+                "SELECT status FROM invocations WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "succeeded");
+    }
+
+    fn returned_artifact_ref(
+        invocation_uuid: Uuid,
+        artifact_name: &str,
+        version: u64,
+    ) -> ReturnedArtifactRef {
+        let workflow_run_id = format!("return:{invocation_uuid}");
+        let version_id = format!("store://return/{invocation_uuid}/{artifact_name}/{version}");
+        ReturnedArtifactRef {
+            version_id,
+            name: artifact_name.to_string(),
+            store_address: oulipoly_agent_messenger::StoreAddress {
+                workflow_run_id,
+                artifact_name: artifact_name.to_string(),
+                version,
+            },
+            sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+            content_len: 123,
+            format_hint: Some("text/plain".to_string()),
+            verdict_line: Some("ok".to_string()),
+            source: oulipoly_agent_messenger::ReturnedArtifactSource::Scratchpad {
+                name: "notes".to_string(),
+                version: 1,
+            },
+            producer_invocation_uuid: invocation_uuid,
+            returned_at: ts("2026-04-17T08:00:00Z"),
+        }
+    }
+
+    #[test]
+    fn age132_returned_artifacts_validate_identity_bounds_and_rollback_failed_retry() {
+        let db = test_db();
+        let invocation_uuid = Uuid::new_v4();
+        let id = db
+            .start_invocation(&InvocationStart {
+                invocation_uuid: invocation_uuid.to_string(),
+                model_name: "claude-opus".to_string(),
+                provider_name: "claude".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        let good = returned_artifact_ref(invocation_uuid, "alpha.txt", 1);
+        db.record_returned_artifacts(id, std::slice::from_ref(&good))
+            .unwrap();
+
+        let mut bad_workflow = returned_artifact_ref(invocation_uuid, "bad-workflow.txt", 1);
+        bad_workflow.store_address.workflow_run_id = "not-return-namespace".to_string();
+        assert!(
+            db.record_returned_artifacts(id, &[bad_workflow])
+                .unwrap_err()
+                .contains("workflow_run_id")
+        );
+
+        let mut bad_version = returned_artifact_ref(invocation_uuid, "bad-version.txt", 1);
+        bad_version.version_id = "store://wrong-version".to_string();
+        assert!(
+            db.record_returned_artifacts(id, &[bad_version])
+                .unwrap_err()
+                .contains("version_id mismatch")
+        );
+
+        let mut overflow = returned_artifact_ref(invocation_uuid, "overflow.txt", 1);
+        overflow.content_len = u64::MAX;
+        assert!(
+            db.record_returned_artifacts(id, &[overflow])
+                .unwrap_err()
+                .contains("content_len exceeds SQLite INTEGER range")
+        );
+        assert_eq!(db.list_returned_artifacts(id).unwrap(), vec![good]);
+    }
+
+    #[test]
+    fn age132_session_turn_ingest_batch_and_single_paths_preserve_mapping_and_atomicity() {
+        let db = test_db();
+        let timestamp = ts("2026-04-17T08:00:00Z");
+        assert!(
+            db.ingest_session_turn(
+                "claude",
+                SESSION_A,
+                "single-turn",
+                &timestamp,
+                "assistant",
+                "/tmp/session.jsonl",
+            )
+            .unwrap()
+        );
+        assert!(
+            !db.ingest_session_turn(
+                "claude",
+                SESSION_A,
+                "single-turn",
+                &timestamp,
+                "assistant",
+                "/tmp/session.jsonl",
+            )
+            .unwrap()
+        );
+        let source_file: String = db
+            .conn
+            .query_row(
+                "SELECT source_file FROM session_turns WHERE turn_id = 'single-turn'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_file, "/tmp/session.jsonl");
+
+        let turns = vec![
+            SessionTurnIngest {
+                session_id: SESSION_A.to_string(),
+                turn_id: "turn-1".to_string(),
+                timestamp,
+                role: "user".to_string(),
+                parent_turn_id: None,
+                is_sidechain: false,
+                is_compaction_boundary: false,
+                body: Some("hello".to_string()),
+            },
+            SessionTurnIngest {
+                session_id: SESSION_A.to_string(),
+                turn_id: "turn-2".to_string(),
+                timestamp: timestamp + chrono::Duration::seconds(1),
+                role: "assistant".to_string(),
+                parent_turn_id: Some("turn-1".to_string()),
+                is_sidechain: true,
+                is_compaction_boundary: true,
+                body: Some("world".to_string()),
+            },
+        ];
+        assert_eq!(db.ingest_session_turns_batch("claude", &turns).unwrap(), 2);
+        assert_eq!(db.ingest_session_turns_batch("claude", &turns).unwrap(), 0);
+        let row: (Option<String>, i64, i64, Option<String>) = db
+            .conn
+            .query_row(
+                "SELECT parent_turn_id, is_sidechain, is_compaction_boundary, body
+                 FROM session_turns WHERE turn_id = 'turn-2'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (Some("turn-1".to_string()), 1, 1, Some("world".to_string()))
+        );
+
+        let failing = test_db();
+        failing
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER fail_bad_turn
+                 BEFORE INSERT ON session_turns
+                 WHEN NEW.turn_id = 'bad'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'bad turn');
+                 END;",
+            )
+            .unwrap();
+        assert!(
+            failing
+                .ingest_session_turns_batch(
+                    "claude",
+                    &[
+                        SessionTurnIngest {
+                            session_id: SESSION_A.to_string(),
+                            turn_id: "good-before-error".to_string(),
+                            timestamp,
+                            role: "assistant".to_string(),
+                            parent_turn_id: None,
+                            is_sidechain: false,
+                            is_compaction_boundary: false,
+                            body: None,
+                        },
+                        SessionTurnIngest {
+                            session_id: SESSION_A.to_string(),
+                            turn_id: "bad".to_string(),
+                            timestamp: timestamp + chrono::Duration::seconds(1),
+                            role: "assistant".to_string(),
+                            parent_turn_id: None,
+                            is_sidechain: false,
+                            is_compaction_boundary: false,
+                            body: None,
+                        },
+                    ],
+                )
+                .unwrap_err()
+                .contains("bad turn")
+        );
+        let persisted: i64 = failing
+            .conn
+            .query_row("SELECT COUNT(*) FROM session_turns", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(persisted, 0);
+    }
+
+    #[test]
+    fn age132_resume_previews_and_compaction_boundaries_preserve_ordering_contracts() {
+        let db = test_db();
+        seed_test_chain(
+            &db,
+            CHAIN_A,
+            "claude",
+            SESSION_A,
+            "claude-opus",
+            "2026-04-17T08:00:00Z",
+        );
+        seed_test_chain(
+            &db,
+            CHAIN_B,
+            "claude2",
+            SESSION_A,
+            "claude-opus",
+            "2026-04-17T09:00:00Z",
+        );
+        let turns: Vec<_> = (0..4)
+            .map(|i| SessionTurnIngest {
+                session_id: SESSION_A.to_string(),
+                turn_id: format!("turn-{i}"),
+                timestamp: ts(&format!("2026-04-17T08:00:0{i}Z")),
+                role: if i % 2 == 0 { "user" } else { "assistant" }.to_string(),
+                parent_turn_id: None,
+                is_sidechain: false,
+                is_compaction_boundary: false,
+                body: Some(format!("body-{i}")),
+            })
+            .collect();
+        db.ingest_session_turns_batch("claude2", &turns).unwrap();
+
+        let previews = db.resume_previews(SESSION_A).unwrap();
+        assert_eq!(previews.len(), 2);
+        assert_eq!(previews[0].chain_id, CHAIN_B);
+        assert_eq!(previews[0].active_provider, "claude2");
+        assert_eq!(previews[0].turn_count, 4);
+        assert_eq!(previews[0].recent_turns.len(), 3);
+        assert_eq!(
+            previews[0].recent_turns[0].timestamp,
+            ts("2026-04-17T08:00:01Z")
+        );
+        assert_eq!(
+            previews[0].recent_turns[1].timestamp,
+            ts("2026-04-17T08:00:02Z")
+        );
+        assert_eq!(
+            previews[0].recent_turns[2].timestamp,
+            ts("2026-04-17T08:00:03Z")
+        );
+        assert_eq!(previews[0].recent_turns[0].snippet, None);
+        assert_eq!(previews[1].chain_id, CHAIN_A);
+
+        let boundary_db = test_db();
+        boundary_db
+            .ingest_session_turns_batch(
+                "claude",
+                &[
+                    SessionTurnIngest {
+                        session_id: SESSION_A.to_string(),
+                        turn_id: "old-boundary".to_string(),
+                        timestamp: ts("2026-04-17T08:00:00Z"),
+                        role: "assistant".to_string(),
+                        parent_turn_id: None,
+                        is_sidechain: false,
+                        is_compaction_boundary: true,
+                        body: None,
+                    },
+                    SessionTurnIngest {
+                        session_id: SESSION_A.to_string(),
+                        turn_id: "tie-first".to_string(),
+                        timestamp: ts("2026-04-17T08:01:00Z"),
+                        role: "assistant".to_string(),
+                        parent_turn_id: None,
+                        is_sidechain: false,
+                        is_compaction_boundary: true,
+                        body: None,
+                    },
+                    SessionTurnIngest {
+                        session_id: SESSION_A.to_string(),
+                        turn_id: "tie-second".to_string(),
+                        timestamp: ts("2026-04-17T08:01:00Z"),
+                        role: "assistant".to_string(),
+                        parent_turn_id: None,
+                        is_sidechain: false,
+                        is_compaction_boundary: true,
+                        body: None,
+                    },
+                    SessionTurnIngest {
+                        session_id: SESSION_A.to_string(),
+                        turn_id: "not-yet-boundary".to_string(),
+                        timestamp: ts("2026-04-17T08:02:00Z"),
+                        role: "assistant".to_string(),
+                        parent_turn_id: None,
+                        is_sidechain: false,
+                        is_compaction_boundary: false,
+                        body: None,
+                    },
+                ],
+            )
+            .unwrap();
+        let latest = boundary_db
+            .latest_compaction_boundary("claude", SESSION_A)
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.0, "tie-second");
+        assert_eq!(latest.1, ts("2026-04-17T08:01:00Z"));
+        assert!(
+            boundary_db
+                .flag_compaction_boundary("claude", SESSION_A, "not-yet-boundary")
+                .unwrap()
+        );
+        assert!(
+            !boundary_db
+                .flag_compaction_boundary("claude", SESSION_A, "not-yet-boundary")
+                .unwrap()
+        );
+        assert!(
+            !boundary_db
+                .flag_compaction_boundary("claude", SESSION_A, "missing-turn")
+                .unwrap()
+        );
+        let latest = boundary_db
+            .latest_compaction_boundary("claude", SESSION_A)
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.0, "not-yet-boundary");
+        assert_eq!(latest.1, ts("2026-04-17T08:02:00Z"));
+        assert_eq!(
+            test_db()
+                .latest_compaction_boundary("claude", SESSION_A)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn age132_read_only_error_classifier_and_sidecar_paths_map_documented_variants() {
+        let missing_dir = tempfile::tempdir().unwrap();
+        let missing_path = missing_dir.path().join("missing-state.db");
+        match StateDb::open_read_only(&missing_path) {
+            Err(ReadOnlyOpenError::Missing { path }) => assert_eq!(path, missing_path),
+            Ok(_) => panic!("expected Missing, got successful read-only open"),
+            Err(other) => panic!("expected Missing, got {other:?}"),
+        }
+
+        let malformed_dir = tempfile::tempdir().unwrap();
+        let malformed_path = malformed_dir.path().join("state.db");
+        std::fs::write(&malformed_path, b"not sqlite").unwrap();
+        match StateDb::open_read_only(&malformed_path) {
+            Err(ReadOnlyOpenError::NotADatabase { path: p, .. }) => {
+                assert_eq!(p, malformed_path);
+            }
+            Ok(_) => panic!("expected NotADatabase, got successful read-only open"),
+            Err(other) => panic!("expected NotADatabase, got {other:?}"),
+        }
+
+        let valid_dir = tempfile::tempdir().unwrap();
+        let valid_path = valid_dir.path().join("state.db");
+        drop(StateDb::open(&valid_path).unwrap());
+        drop(StateDb::open_read_only(&valid_path).unwrap());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let denied_dir = tempfile::tempdir().unwrap();
+            let denied_path = denied_dir.path().join("state.db");
+            drop(StateDb::open(&denied_path).unwrap());
+            let mut denied_permissions = std::fs::metadata(&denied_path).unwrap().permissions();
+            denied_permissions.set_mode(0o000);
+            std::fs::set_permissions(&denied_path, denied_permissions).unwrap();
+            match StateDb::open_read_only(&denied_path) {
+                Err(ReadOnlyOpenError::PermissionDenied { path }) => assert_eq!(path, denied_path),
+                Ok(_) => panic!("expected PermissionDenied, got successful read-only open"),
+                Err(other) => panic!("expected PermissionDenied, got {other:?}"),
+            }
+
+            let sidecar_dir = tempfile::tempdir().unwrap();
+            let sidecar_path = sidecar_dir.path().join("state.db");
+            let sidecar_conn = Connection::open(&sidecar_path).unwrap();
+            sidecar_conn
+                .execute_batch(
+                    "PRAGMA journal_mode = WAL;
+                     CREATE TABLE sidecar_probe (value TEXT);
+                     INSERT INTO sidecar_probe (value) VALUES ('kept open');",
+                )
+                .unwrap();
+            let sidecar_file = std::fs::read_dir(sidecar_dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| path != &sidecar_path && path.is_file())
+                .expect("WAL mode should create at least one SQLite sidecar file");
+            let mut sidecar_permissions = std::fs::metadata(&sidecar_file).unwrap().permissions();
+            sidecar_permissions.set_mode(0o000);
+            std::fs::set_permissions(&sidecar_file, sidecar_permissions).unwrap();
+            match StateDb::open_read_only(&sidecar_path) {
+                Err(ReadOnlyOpenError::WalSidecarError { path, message }) => {
+                    assert_eq!(path, sidecar_path);
+                    assert!(message.contains("sidecar"), "{message}");
+                }
+                Ok(_) => panic!("expected WalSidecarError, got successful read-only open"),
+                Err(other) => panic!("expected WalSidecarError, got {other:?}"),
+            }
+            drop(sidecar_conn);
+        }
+
+        match StateDb::open_read_only(valid_dir.path()) {
+            Err(ReadOnlyOpenError::Operational { message }) => {
+                assert!(!message.is_empty());
+            }
+            Ok(_) => panic!("expected Operational, got successful read-only open"),
+            Err(other) => panic!("expected operational mapping, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn age132_setup_crud_count_and_call_counter_edge_contracts() {
+        let db = test_db();
+        db.upsert_cli_provider(&sample_provider()).unwrap();
+        let expired = AccountRecord {
+            id: "expired".to_string(),
+            provider: "claude".to_string(),
+            profile_name: "expired-profile".to_string(),
+            auth_method: AuthMethod::OAuth,
+            auth_status: AuthStatus::Expired,
+            created_at: "2026-02-19T00:00:00Z".to_string(),
+        };
+        db.insert_account(&expired).unwrap();
+        db.conn
+            .execute(
+                "UPDATE accounts SET auth_status = 'surprise' WHERE id = 'expired'",
+                [],
+            )
+            .unwrap();
+        let accounts = db.list_accounts(Some("claude")).unwrap();
+        assert_eq!(accounts[0].auth_status, AuthStatus::Unknown);
+        assert!(!db.delete_account("missing", "claude").unwrap());
+        assert_eq!(
+            db.delete_stale_models("claude", "missing-version").unwrap(),
+            0
+        );
+
+        let since = ts("2026-04-17T08:00:00Z");
+        db.ingest_session_turns_batch(
+            "claude",
+            &[
+                SessionTurnIngest {
+                    session_id: SESSION_A.to_string(),
+                    turn_id: "at-boundary".to_string(),
+                    timestamp: since,
+                    role: "assistant".to_string(),
+                    parent_turn_id: None,
+                    is_sidechain: false,
+                    is_compaction_boundary: false,
+                    body: None,
+                },
+                SessionTurnIngest {
+                    session_id: SESSION_A.to_string(),
+                    turn_id: "after-boundary".to_string(),
+                    timestamp: since + chrono::Duration::seconds(1),
+                    role: "assistant".to_string(),
+                    parent_turn_id: None,
+                    is_sidechain: false,
+                    is_compaction_boundary: false,
+                    body: None,
+                },
+                SessionTurnIngest {
+                    session_id: SESSION_A.to_string(),
+                    turn_id: "user-after-boundary".to_string(),
+                    timestamp: since + chrono::Duration::seconds(2),
+                    role: "user".to_string(),
+                    parent_turn_id: None,
+                    is_sidechain: false,
+                    is_compaction_boundary: false,
+                    body: None,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(db.count_assistant_turns_since("claude", None).unwrap(), 2);
+        assert_eq!(
+            db.count_assistant_turns_since("claude", Some(&since))
+                .unwrap(),
+            1
+        );
+        assert_eq!(db.count_assistant_turns_since("codex", None).unwrap(), 0);
+        db.increment_calls_since_refresh("claude").unwrap();
+        db.increment_calls_since_refresh("claude").unwrap();
+        assert_eq!(calls_since_refresh(&db, "claude"), 2);
     }
 
     // TI-04, TI-12, TI-24: ordered migration steps must fail with actionable
