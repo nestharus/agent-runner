@@ -20,29 +20,87 @@ tests=(
   "T13:$contract_tests_dir/t13_coupling_declarations.sh"
 )
 
-overall=0
+validate_test_script() {
+  local script="$1"
 
-for entry in "${tests[@]}"; do
-  test_id="${entry%%:*}"
-  script="${entry#*:}"
-  if [[ ! -x "$script" ]]; then
-    printf '%s: FAIL — missing or non-executable helper: %s\n' "$test_id" "$script"
-    overall=1
-    continue
+  [[ -x "$script" ]]
+}
+
+validate_environment() {
+  local overall=0
+  local entry script
+
+  for entry in "${tests[@]}"; do
+    script="${entry#*:}"
+    validate_test_script "$script" || overall=1
+  done
+
+  return "$overall"
+}
+
+run_contract_test() {
+  local test_id="$1"
+  local script="$2"
+  local evidence
+
+  if ! validate_test_script "$script"; then
+    format_missing_helper "$test_id" "$script"
+    return 1
   fi
 
   if evidence="$("$script" 2>&1)"; then
-    printf '%s: PASS — %s\n' "$test_id" "$evidence"
+    format_test_result "$test_id" "PASS" "$evidence"
   else
-    printf '%s: FAIL — %s\n' "$test_id" "$evidence"
-    overall=1
+    format_test_result "$test_id" "FAIL" "$evidence"
+    return 1
   fi
-done
+}
 
-if [[ "$overall" -eq 0 ]]; then
-  printf 'EVAL_RESULT: PASS\n'
-else
-  printf 'EVAL_RESULT: FAIL\n'
-fi
+run_all_contract_tests() {
+  local overall=0
+  local entry test_id script
 
-exit "$overall"
+  for entry in "${tests[@]}"; do
+    test_id="${entry%%:*}"
+    script="${entry#*:}"
+    run_contract_test "$test_id" "$script" || overall=1
+  done
+
+  return "$overall"
+}
+
+format_missing_helper() {
+  local test_id="$1"
+  local script="$2"
+
+  printf '%s: FAIL — missing or non-executable helper: %s\n' "$test_id" "$script"
+}
+
+format_test_result() {
+  local test_id="$1"
+  local status="$2"
+  local evidence="$3"
+
+  printf '%s: %s — %s\n' "$test_id" "$status" "$evidence"
+}
+
+format_result() {
+  local overall="$1"
+
+  if [[ "$overall" -eq 0 ]]; then
+    printf 'EVAL_RESULT: PASS\n'
+  else
+    printf 'EVAL_RESULT: FAIL\n'
+  fi
+}
+
+main() {
+  local overall=0
+
+  validate_environment || overall=1
+  run_all_contract_tests || overall=1
+  format_result "$overall"
+  return "$overall"
+}
+
+main

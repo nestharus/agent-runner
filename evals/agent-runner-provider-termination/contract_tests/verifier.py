@@ -1,3 +1,22 @@
+"""verifier.py — provider-termination eval contract verifier.
+
+## Adapter declarations
+
+```yaml
+adapter_declarations:
+  - component: evals/agent-runner-provider-termination/contract_tests/verifier.py
+    role: adapter
+    Translates:
+      - age-139-terminal-signal-dto-contract
+      - age-139-provider-vocabulary
+      - oulipoly-terminal-signal-marker-contract
+      - age-143-w5-reader-interface-contract
+      - provider-termination-fixture-manifest-schema
+```
+
+(5 contracts under the N=5 threshold.)
+"""
+
 from __future__ import annotations
 
 import json
@@ -340,6 +359,10 @@ def validate_relative_fixture_path(path: Path, row_id: str, field: str) -> None:
 def validate_required_fixture_bytes(row: dict[str, Any], require_bytes: bool) -> None:
     if require_bytes and row["fixture_bytes_path"] is None:
         fail(f"row {row['id']} must name fixture_bytes_path")
+
+
+def validate_fixture_path(path: Path, message: str) -> None:
+    validate_regular_file(path, message)
 
 
 def validate_metadata(metadata: Any, row: dict[str, Any]) -> None:
@@ -742,6 +765,10 @@ def map_fixture_path(relative_path: Path) -> Path:
     return FIXTURE_ROOT / relative_path
 
 
+def resolve_fixture_path(ref: FixtureRef, fixture_root: Path) -> Path:
+    return fixture_root / Path(ref.value)
+
+
 def map_ref_values_to_specs(values: dict[str, str]) -> list[FixtureRef]:
     kinds = {"fixture_bytes_path": "bytes", "sentinel_metadata_path": "metadata"}
     return [FixtureRef(field=field, value=value, kind=kinds[field]) for field, value in values.items()]
@@ -819,6 +846,14 @@ def format_privacy_result(row_count: int) -> str:
     return f"ACR-186 Claude rows privacy-reviewed and <=160 chars: {row_count}"
 
 
+def format_missing_fixture_path(row: dict[str, Any], ref: FixtureRef) -> str:
+    return f"row {row['id']} {ref.kind} file is missing: {ref.value}"
+
+
+def format_fixture_ref_result(path: Path) -> str:
+    return str(path.relative_to(FIXTURE_ROOT))
+
+
 def format_coupling_result() -> str:
     return "coupling declarations carry 5 Translates entries and 8 Owns entries"
 
@@ -872,13 +907,15 @@ def verify_metadata_ref(row: dict[str, Any], path: Path) -> None:
 
 
 def resolve_fixture_ref(row: dict[str, Any], ref: FixtureRef) -> str:
-    path = fixture_path(ref.value, row["id"], ref.field)
-    validate_regular_file(path, f"row {row['id']} {ref.kind} file is missing: {ref.value}")
+    relative_path = parse_relative_path(ref.value)
+    validate_relative_fixture_path(relative_path, row["id"], ref.field)
+    path = resolve_fixture_path(ref, FIXTURE_ROOT)
+    validate_fixture_path(path, format_missing_fixture_path(row, ref))
     if ref.kind == "bytes":
         read_bytes(path)
     if ref.kind == "metadata":
         verify_metadata_ref(row, path)
-    return ref.value
+    return format_fixture_ref_result(path)
 
 
 def resolve_fixture_refs(row: dict[str, Any], require_bytes: bool = False) -> list[str]:
