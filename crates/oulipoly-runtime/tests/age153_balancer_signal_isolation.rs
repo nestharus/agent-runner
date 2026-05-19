@@ -1,0 +1,160 @@
+use chrono::{Duration, Utc};
+use oulipoly_config::{ModelConfig, ProviderConfig, model::PromptMode};
+use oulipoly_runtime::services::{
+    ProductionRoutingService, RoutingServicePort, RoutingServiceRequest,
+};
+use oulipoly_state::{QuotaWindowInput, StateDb};
+use std::path::Path;
+
+fn model_with(names: &[&str]) -> ModelConfig {
+    ModelConfig {
+        name: "age153-balancer".to_string(),
+        prompt_mode: PromptMode::Arg,
+        providers: names
+            .iter()
+            .map(|name| ProviderConfig::new(*name, vec![]))
+            .collect(),
+        inputs: vec![],
+    }
+}
+
+fn in_memory_state() -> StateDb {
+    StateDb::open(Path::new(":memory:")).unwrap()
+}
+
+fn seed_live_window(db: &StateDb, provider_name: &str) {
+    db.upsert_quota_refresh(
+        provider_name,
+        &[QuotaWindowInput {
+            used_percent: 0.20,
+            resets_at: Utc::now() + Duration::hours(5),
+        }],
+    )
+    .unwrap();
+}
+
+#[test]
+fn balancer_mod_has_no_terminal_signal_or_provider_output_parser_references() {
+    let source = include_str!("../src/balancer/mod.rs");
+    let production_source = source
+        .split("mod tests")
+        .next()
+        .expect("production balancer source before tests");
+    let code = source_without_comments(production_source);
+    for forbidden in ["TerminalSignal", "TerminalSignalKind", "terminal_signal"] {
+        assert!(
+            !contains_identifier_token(&code, forbidden),
+            "balancer must not reference terminal-signal identifier token {forbidden:?}"
+        );
+    }
+    assert!(
+        !contains_terminal_signal_use_import(&code),
+        "balancer must not import terminal_signal modules or TerminalSignal types"
+    );
+    assert!(
+        !contains_provider_output_parser_identifier(&code),
+        "balancer must not call provider-output parser functions as routing authority"
+    );
+}
+
+fn contains_identifier_token(source: &str, token: &str) -> bool {
+    identifier_tokens(source).any(|identifier| identifier == token)
+}
+
+fn contains_terminal_signal_use_import(source: &str) -> bool {
+    source.lines().any(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with("use ")
+            && (trimmed.contains("terminal_signal") || trimmed.contains("TerminalSignal"))
+    })
+}
+
+fn contains_provider_output_parser_identifier(source: &str) -> bool {
+    identifier_tokens(source).any(is_provider_output_parser_identifier)
+}
+
+fn is_provider_output_parser_identifier(identifier: &str) -> bool {
+    identifier == "parse_provider_output"
+        || identifier.starts_with("parse_terminal_status_from_")
+        || identifier.starts_with("provider_recognizer_for_")
+        || ((identifier.starts_with("parse_") || identifier.starts_with("recognize_"))
+            && ["stdout", "stderr", "stream", "output"]
+                .iter()
+                .any(|needle| identifier.contains(needle)))
+}
+
+fn identifier_tokens(source: &str) -> impl Iterator<Item = &str> {
+    source
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .filter(|token| !token.is_empty())
+}
+
+fn source_without_comments(source: &str) -> String {
+    let mut output = String::with_capacity(source.len());
+    let mut chars = source.chars().peekable();
+    let mut in_block_comment = false;
+    while let Some(ch) = chars.next() {
+        if in_block_comment {
+            if ch == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                in_block_comment = false;
+            }
+            continue;
+        }
+        if ch == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            in_block_comment = true;
+            continue;
+        }
+        if ch == '/' && chars.peek() == Some(&'/') {
+            for next in chars.by_ref() {
+                if next == '\n' {
+                    output.push('\n');
+                    break;
+                }
+            }
+            continue;
+        }
+        output.push(ch);
+    }
+    output
+}
+
+#[test]
+fn production_routing_service_skips_provider_after_existing_exhausted_write_path() {
+    let db = in_memory_state();
+    let model = model_with(&["claude-age153-a", "claude-age153-b"]);
+    seed_live_window(&db, "claude-age153-a");
+    seed_live_window(&db, "claude-age153-b");
+    db.mark_exhausted("claude-age153-a").unwrap();
+
+    let route = ProductionRoutingService
+        .select_route(RoutingServiceRequest {
+            model: &model,
+            state: &db,
+            ctx: None,
+        })
+        .unwrap();
+
+    assert_eq!(route.provider_index, 1);
+}
+
+#[test]
+fn production_routing_service_reports_all_exhausted_after_existing_exhausted_writes() {
+    let db = in_memory_state();
+    let model = model_with(&["claude-age153-a", "claude-age153-b"]);
+    for provider in ["claude-age153-a", "claude-age153-b"] {
+        seed_live_window(&db, provider);
+        db.mark_exhausted(provider).unwrap();
+    }
+
+    let err = ProductionRoutingService
+        .select_route(RoutingServiceRequest {
+            model: &model,
+            state: &db,
+            ctx: None,
+        })
+        .unwrap_err();
+
+    assert!(err.to_string().contains("quota-exhausted"), "{err}");
+}

@@ -234,11 +234,26 @@ prompt_mode = "stdin"
 #[test]
 fn diagnostic_quota_exhausted_marks_active_provider_exhausted() {
     let fixture = Fixture::new();
-    write_one_shot_models(&fixture);
+    fixture.write_model(
+        "failing",
+        r#"[[providers]]
+name = "claude-failure-provider"
+"#,
+    );
+    fixture.write_model(
+        "diagnostic",
+        r#"[[providers]]
+name = "diagnostic-provider"
+"#,
+    );
+    fixture.write_config(
+        r#"diagnostics_model = "diagnostic"
+"#,
+    );
     let prompt_dump = fixture._dir.path().join("diagnostic-quota-prompt.txt");
     fixture.write_providers(&format!(
-        r#"[failure-provider]
-command = {}
+        r#"[claude-failure-provider]
+command = 'bash -c "echo Claude usage limit reached for active provider >&2; exit 7"'
 args = []
 prompt_mode = "arg"
 
@@ -247,7 +262,6 @@ command = {}
 args = []
 prompt_mode = "stdin"
 "#,
-        toml_command(&fixture_script("failure-provider.sh").display().to_string()),
         diagnostic_command(
             &prompt_dump,
             "quota_exhausted",
@@ -267,21 +281,19 @@ prompt_mode = "stdin"
 
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("[diagnostics] quota_exhausted: Diagnostic model saw exhausted quota"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("OULIPOLY_TERMINAL_SIGNAL="), "{stderr}");
     assert!(
         stderr.contains("all providers in pool failing are quota-exhausted"),
         "{stderr}"
     );
     assert!(!stderr.contains("Empty command"), "{stderr}");
-    let prompt = fs::read_to_string(prompt_dump).unwrap();
-    assert!(prompt.contains("Exit code: 7"), "{prompt}");
-    assert!(prompt.contains("opaque child failure"), "{prompt}");
+    assert!(
+        !prompt_dump.exists(),
+        "typed quota should not run diagnostics"
+    );
 
     let db = fixture.open_db();
-    let quota = db.get_quota("failure-provider").unwrap().unwrap();
+    let quota = db.get_quota("claude-failure-provider").unwrap().unwrap();
     assert!(quota.exhausted_at.is_some());
     let invocation = parse_invocation(&stderr);
     let row = db

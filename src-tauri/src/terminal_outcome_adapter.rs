@@ -18,8 +18,11 @@
 //! ```
 
 use oulipoly_runtime::diagnostics::ErrorCategory;
-use oulipoly_runtime::executor::ExecutionResult;
 use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind;
+use oulipoly_runtime::executor::{ExecutionResult, TerminalSignal};
+use oulipoly_state::StateDb;
+use std::io;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TerminalOutcomeCategory {
@@ -72,6 +75,239 @@ fn category_for_signal_kind(kind: TerminalSignalKind) -> Option<TerminalOutcomeC
     }
 }
 
+pub(crate) enum TerminalSignalDisposition {
+    QuotaExhaustedRetry,
+    ProlongedSilenceFail,
+    InteractiveFail,
+    InteractiveClean,
+    NotApplicable,
+}
+
+pub(crate) struct TerminalSignalContext<'a, W: io::Write> {
+    pub(crate) invocation_id: &'a Uuid,
+    pub(crate) session_id: Option<&'a Uuid>,
+    pub(crate) provider: &'a str,
+    pub(crate) state_db: &'a StateDb,
+    pub(crate) stderr: &'a mut W,
+}
+
+pub(crate) fn emit_terminal_signal_marker(
+    signal: &TerminalSignal,
+    invocation_id: &Uuid,
+    session_id: Option<&Uuid>,
+    stderr: &mut impl io::Write,
+) -> io::Result<()> {
+    let payload = serde_json::json!({
+        "kind": format!("{:?}", signal.kind),
+        "evidence": {
+            "excerpt": signal.evidence.as_str(),
+        },
+        "invocation_id": invocation_id.to_string(),
+        "session_id": session_id.map(Uuid::to_string),
+    });
+    writeln!(
+        stderr,
+        "OULIPOLY_TERMINAL_SIGNAL={}",
+        serde_json::to_string(&payload).map_err(io::Error::other)?
+    )
+}
+
+pub(crate) fn apply_terminal_signal_outcome(
+    signal: &Option<TerminalSignal>,
+    ctx: &mut TerminalSignalContext<'_, impl io::Write>,
+) -> TerminalSignalDisposition {
+    let Some(signal) = signal else {
+        return TerminalSignalDisposition::NotApplicable;
+    };
+
+    let disposition = terminal_signal_disposition(signal);
+    match disposition {
+        TerminalSignalDisposition::QuotaExhaustedRetry => {
+            // AGE-153 marker authority: emit_terminal_signal_marker.
+            emit_terminal_signal_marker_or_warn(signal, ctx);
+            super::balanced_cli::mark_provider_exhausted(ctx.state_db, ctx.provider);
+        }
+        TerminalSignalDisposition::ProlongedSilenceFail
+        | TerminalSignalDisposition::InteractiveFail => {
+            emit_terminal_signal_marker_or_warn(signal, ctx)
+        }
+        TerminalSignalDisposition::InteractiveClean | TerminalSignalDisposition::NotApplicable => {}
+    }
+    disposition
+}
+
+fn terminal_signal_disposition(signal: &TerminalSignal) -> TerminalSignalDisposition {
+    match signal.kind {
+        TerminalSignalKind::CleanExit => TerminalSignalDisposition::InteractiveClean,
+        TerminalSignalKind::QuotaExhaustedInband => TerminalSignalDisposition::QuotaExhaustedRetry,
+        TerminalSignalKind::ProlongedSilence => TerminalSignalDisposition::ProlongedSilenceFail,
+        TerminalSignalKind::NonzeroExit
+        | TerminalSignalKind::SignalExit
+        | TerminalSignalKind::SpawnError
+        | TerminalSignalKind::Unknown => TerminalSignalDisposition::InteractiveFail,
+    }
+}
+
+fn emit_terminal_signal_marker_or_warn<W: io::Write>(
+    signal: &TerminalSignal,
+    ctx: &mut TerminalSignalContext<'_, W>,
+) {
+    if let Err(err) =
+        emit_terminal_signal_marker(signal, ctx.invocation_id, ctx.session_id, ctx.stderr)
+    {
+        eprintln!("Warning: Failed to emit terminal signal marker: {err}");
+    }
+}
+
+pub(crate) fn typed_terminal_reason_fallback(signal: &TerminalSignal) -> Option<&'static str> {
+    match signal.kind {
+        TerminalSignalKind::CleanExit => None,
+        TerminalSignalKind::QuotaExhaustedInband => Some("quota_exhausted_inband"),
+        TerminalSignalKind::ProlongedSilence => Some("bounded_silence"),
+        TerminalSignalKind::NonzeroExit => Some("exit_nonzero"),
+        TerminalSignalKind::SignalExit => Some("signal_exit"),
+        TerminalSignalKind::SpawnError => Some("spawn_error"),
+        TerminalSignalKind::Unknown => Some("unknown_exit"),
+    }
+}
+
+pub(crate) fn terminal_signal_reason<'a>(
+    signal: &'a Option<TerminalSignal>,
+    executor_terminal_reason: Option<&'a str>,
+) -> Option<&'a str> {
+    signal.as_ref()?;
+    executor_terminal_reason.or_else(|| signal.as_ref().and_then(typed_terminal_reason_fallback))
+}
+
+pub(crate) fn terminal_signal_error_category<'a>(
+    signal: &Option<TerminalSignal>,
+    terminal_reason: &'a str,
+) -> Option<&'a str> {
+    match signal.as_ref().map(|signal| signal.kind) {
+        Some(TerminalSignalKind::NonzeroExit | TerminalSignalKind::SignalExit) => None,
+        _ => Some(terminal_reason),
+    }
+}
+
+pub(crate) fn resume_terminal_signal_for_outcome(
+    signal: &Option<TerminalSignal>,
+) -> Option<TerminalSignal> {
+    signal
+        .as_ref()
+        .filter(|signal| {
+            !matches!(
+                signal.kind,
+                TerminalSignalKind::NonzeroExit | TerminalSignalKind::SignalExit
+            )
+        })
+        .cloned()
+}
+
+pub(crate) fn balanced_terminal_signal_for_outcome(
+    result: &ExecutionResult,
+    should_defer_generic_exit: bool,
+) -> Option<TerminalSignal> {
+    result
+        .terminal_signal
+        .as_ref()
+        .filter(|signal| {
+            !matches!(
+                signal.kind,
+                TerminalSignalKind::NonzeroExit | TerminalSignalKind::SignalExit
+            ) || !should_defer_generic_exit
+        })
+        .cloned()
+}
+
+pub(crate) fn spawn_error_terminal_signal(
+    provider_name: &str,
+    evidence: impl Into<String>,
+) -> TerminalSignal {
+    TerminalSignal {
+        kind: TerminalSignalKind::SpawnError,
+        provider_name: provider_name.to_string(),
+        evidence: evidence.into(),
+        observed_at: std::time::SystemTime::now(),
+    }
+}
+
+enum Age153TerminalSignalFixtureOverride {
+    Clear,
+    Force(TerminalSignalKind),
+    Unset,
+}
+
+pub(crate) fn apply_age153_terminal_signal_fixture_override(result: &mut ExecutionResult) {
+    match age153_terminal_signal_fixture_override() {
+        Age153TerminalSignalFixtureOverride::Clear => {
+            clear_terminal_signal_fixture_override(result)
+        }
+        Age153TerminalSignalFixtureOverride::Force(kind) => {
+            force_terminal_signal_fixture_override(result, kind)
+        }
+        Age153TerminalSignalFixtureOverride::Unset => {}
+    }
+}
+
+fn age153_terminal_signal_fixture_override() -> Age153TerminalSignalFixtureOverride {
+    if age153_force_terminal_signal_none_requested() {
+        return Age153TerminalSignalFixtureOverride::Clear;
+    }
+    age153_forced_terminal_signal_kind()
+        .map(Age153TerminalSignalFixtureOverride::Force)
+        .unwrap_or(Age153TerminalSignalFixtureOverride::Unset)
+}
+
+fn age153_force_terminal_signal_none_requested() -> bool {
+    std::env::var_os("OULIPOLY_AGE153_FORCE_TERMINAL_SIGNAL_NONE").is_some()
+}
+
+fn age153_forced_terminal_signal_kind() -> Option<TerminalSignalKind> {
+    age153_forced_terminal_signal_kind_value()
+        .as_deref()
+        .and_then(terminal_signal_kind_from_env)
+}
+
+fn age153_forced_terminal_signal_kind_value() -> Option<String> {
+    std::env::var("OULIPOLY_AGE153_FORCE_TERMINAL_SIGNAL_KIND").ok()
+}
+
+fn clear_terminal_signal_fixture_override(result: &mut ExecutionResult) {
+    result.terminal_signal = None;
+    result.terminal_reason = None;
+}
+
+fn force_terminal_signal_fixture_override(result: &mut ExecutionResult, kind: TerminalSignalKind) {
+    let existing = result.terminal_signal.take();
+    let signal = match existing {
+        Some(mut signal) => {
+            signal.kind = kind;
+            signal
+        }
+        None => TerminalSignal {
+            kind,
+            provider_name: String::new(),
+            evidence: "age153 fixture override".to_string(),
+            observed_at: std::time::SystemTime::now(),
+        },
+    };
+    result.terminal_reason = typed_terminal_reason_fallback(&signal).map(str::to_string);
+    result.terminal_signal = Some(signal);
+}
+
+fn terminal_signal_kind_from_env(value: &str) -> Option<TerminalSignalKind> {
+    match value {
+        "CleanExit" => Some(TerminalSignalKind::CleanExit),
+        "NonzeroExit" => Some(TerminalSignalKind::NonzeroExit),
+        "SignalExit" => Some(TerminalSignalKind::SignalExit),
+        "SpawnError" => Some(TerminalSignalKind::SpawnError),
+        "QuotaExhaustedInband" => Some(TerminalSignalKind::QuotaExhaustedInband),
+        "ProlongedSilence" => Some(TerminalSignalKind::ProlongedSilence),
+        "Unknown" => Some(TerminalSignalKind::Unknown),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,6 +337,51 @@ mod tests {
             captured_child_invocations: Vec::<CapturedChildInvocation>::new(),
             returned_artifacts: Vec::new(),
         }
+    }
+
+    fn production_source() -> &'static str {
+        include_str!("terminal_outcome_adapter.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source precedes tests")
+    }
+
+    fn production_block_after(start: &str) -> &'static str {
+        let source = production_source();
+        let start_idx = source
+            .find(start)
+            .unwrap_or_else(|| panic!("missing {start}"));
+        let open_idx = source[start_idx..]
+            .find('{')
+            .map(|idx| start_idx + idx)
+            .unwrap_or_else(|| panic!("missing opening brace after {start}"));
+        let mut depth = 1usize;
+        let mut idx = open_idx + 1;
+        let bytes = source.as_bytes();
+
+        while idx < bytes.len() {
+            match bytes[idx] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[open_idx + 1..idx];
+                    }
+                }
+                _ => {}
+            }
+            idx += 1;
+        }
+
+        panic!("missing closing brace after {start}");
+    }
+
+    fn assert_production_contains(fragment_parts: &[&str]) {
+        let fragment = fragment_parts.concat();
+        assert!(
+            production_source().contains(&fragment),
+            "production terminal_outcome_adapter.rs must contain {fragment:?} per /home/nes/projects/agent-runner/planning/age-153-terminal-signal-wiring/contracts/age-153-terminal-signal-wiring.md"
+        );
     }
 
     #[test]
@@ -172,5 +453,87 @@ mod tests {
             Some("quota_exhausted_inband")
         );
         assert_eq!(category, None);
+    }
+
+    #[test]
+    fn age153_apply_terminal_signal_outcome_unit_contract_declares_five_dispositions() {
+        assert_production_contains(&["fn ", "apply_terminal_signal_outcome", "("]);
+        assert_production_contains(&["enum ", "TerminalSignalDisposition"]);
+        for variant in [
+            "QuotaExhaustedRetry",
+            "ProlongedSilenceFail",
+            "InteractiveFail",
+            "InteractiveClean",
+            "NotApplicable",
+        ] {
+            assert_production_contains(&["TerminalSignalDisposition::", variant]);
+        }
+    }
+
+    #[test]
+    fn age153_apply_terminal_signal_outcome_maps_quota_only_to_exhausted_write() {
+        let source = production_source();
+        let outcome = production_block_after("fn apply_terminal_signal_outcome(");
+        let disposition = production_block_after("fn terminal_signal_disposition(");
+        assert!(
+            outcome.contains("terminal_signal_disposition(signal)")
+                && outcome.contains("TerminalSignalDisposition::QuotaExhaustedRetry")
+                && outcome.contains("mark_provider_exhausted")
+                && disposition.contains("TerminalSignalKind::QuotaExhaustedInband")
+                && disposition.contains("TerminalSignalDisposition::QuotaExhaustedRetry"),
+            "quota typed signal must be the only typed exhausted-write branch"
+        );
+        let quota_retry_arm = outcome
+            .find("TerminalSignalDisposition::QuotaExhaustedRetry")
+            .expect("quota retry arm must exist in apply_terminal_signal_outcome");
+        let after_quota_retry = &outcome[quota_retry_arm..];
+        let quota_write = after_quota_retry
+            .find("mark_provider_exhausted")
+            .expect("quota retry arm must write exhausted_at");
+        let next_arm = after_quota_retry
+            .find("TerminalSignalDisposition::ProlongedSilenceFail")
+            .expect("next terminal-signal arm must exist");
+        assert!(
+            quota_write < next_arm,
+            "exhausted write must stay in the quota retry arm"
+        );
+        for non_quota in [
+            "TerminalSignalKind::ProlongedSilence",
+            "TerminalSignalKind::NonzeroExit",
+            "TerminalSignalKind::SignalExit",
+            "TerminalSignalKind::SpawnError",
+            "TerminalSignalKind::Unknown",
+        ] {
+            let branch_start = disposition
+                .find(non_quota)
+                .unwrap_or_else(|| panic!("missing {non_quota} branch"));
+            let remaining = &disposition[branch_start..];
+            let next_quota_write = remaining.find("mark_provider_exhausted");
+            let next_disposition = remaining.find("TerminalSignalDisposition::");
+            assert!(
+                next_quota_write.is_none() || next_disposition < next_quota_write,
+                "{non_quota} must not write exhausted_at"
+            );
+        }
+        assert!(
+            source.contains("terminal_signal") && source.contains("classify_error_category"),
+            "typed-signal precedence must coexist with legacy fallback helpers"
+        );
+    }
+
+    #[test]
+    fn age153_emit_terminal_signal_marker_unit_contract_is_key_json_stderr_line() {
+        assert_production_contains(&["fn ", "emit_terminal_signal_marker", "("]);
+        let helper = production_block_after("fn emit_terminal_signal_marker(");
+        assert!(helper.contains("OULIPOLY_TERMINAL_SIGNAL="), "{helper}");
+        assert!(helper.contains("serde_json"), "{helper}");
+        assert!(helper.contains("kind"), "{helper}");
+        assert!(helper.contains("evidence"), "{helper}");
+        assert!(helper.contains("invocation_id"), "{helper}");
+        assert!(helper.contains("session_id"), "{helper}");
+        assert!(
+            helper.contains("writeln!") || helper.contains("write_all"),
+            "marker helper must write exactly one newline-terminated stderr record"
+        );
     }
 }

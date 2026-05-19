@@ -39,6 +39,7 @@ REPO_ROOT = Path(os.environ["REPO_ROOT"])
 FIXTURE_ROOT = EVAL_DIR / "fixtures"
 MANIFEST = FIXTURE_ROOT / "MANIFEST.yaml"
 EVAL_MD = EVAL_DIR / "eval.md"
+RUNTIME_MARKER_PREFIX = "OULIPOLY_TERMINAL_SIGNAL="
 
 SEVEN_DTO_KINDS = {
     "CleanExit",
@@ -504,8 +505,59 @@ def validate_network_prose(claims: dict[str, bool]) -> None:
 
 
 def validate_marker_literal(text: str) -> None:
-    if "OULIPOLY_TERMINAL_SIGNAL <json-payload>" not in text:
-        fail("eval.md must declare OULIPOLY_TERMINAL_SIGNAL <json-payload>")
+    if "OULIPOLY_TERMINAL_SIGNAL <json-payload>" in text:
+        fail("eval.md must not declare the obsolete space-separated terminal-signal marker")
+    if "OULIPOLY_TERMINAL_SIGNAL=<json>" not in text:
+        fail("eval.md must declare OULIPOLY_TERMINAL_SIGNAL=<json>")
+
+
+def consume_marker_line(line: str) -> dict[str, Any]:
+    validate_runtime_marker_prefix(line)
+    payload = parse_runtime_marker_payload(marker_payload_text(line))
+    validate_runtime_marker_payload(payload)
+    return payload
+
+
+def validate_runtime_marker_prefix(line: str) -> None:
+    if not line.startswith(RUNTIME_MARKER_PREFIX):
+        fail("runtime marker line must use OULIPOLY_TERMINAL_SIGNAL=<json>")
+
+
+def marker_payload_text(line: str) -> str:
+    return line[len(RUNTIME_MARKER_PREFIX) :]
+
+
+def parse_runtime_marker_payload(payload_text: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(payload_text)
+    except json.JSONDecodeError as exc:
+        fail(f"runtime marker payload must be JSON: {exc}")
+    return payload
+
+
+def validate_runtime_marker_payload(payload: Any) -> None:
+    if not isinstance(payload, dict):
+        fail("runtime marker payload must be a mapping")
+    expected_keys = {"kind", "evidence", "invocation_id", "session_id"}
+    if set(payload) != expected_keys:
+        fail("runtime marker payload must contain exactly kind, evidence, invocation_id, session_id")
+    if payload["kind"] not in SEVEN_DTO_KINDS:
+        fail("runtime marker kind must use TerminalSignalKind serde labels")
+    if not isinstance(payload["evidence"], dict):
+        fail("runtime marker evidence must be a mapping")
+    validate_uuid_like(payload["invocation_id"], "runtime marker invocation_id")
+    if payload["session_id"] is not None:
+        validate_uuid_like(payload["session_id"], "runtime marker session_id")
+
+
+def validate_uuid_like(value: Any, label: str) -> None:
+    if not isinstance(value, str):
+        fail(f"{label} must be a string")
+    if not re.fullmatch(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+        value,
+    ):
+        fail(f"{label} must be UUID-shaped")
 
 
 def marker_schema_kind(schema: dict[str, Any]) -> str:
@@ -853,7 +905,7 @@ def format_network_result() -> str:
 
 
 def format_marker_result() -> str:
-    return "marker schema parses with seven labels and excerpt_max_chars=160"
+    return "runtime marker literal consumes 4-key payload; eval internal schema remains enriched"
 
 
 def format_roundtrip_result(row_count: int, bytes_count: int, metadata_count: int) -> str:
@@ -1056,6 +1108,10 @@ def test_network_boundary() -> None:
 def test_marker_payload_schema() -> None:
     text = eval_text()
     validate_marker_literal(text)
+    consume_marker_line(
+        'OULIPOLY_TERMINAL_SIGNAL={"kind":"SignalExit","evidence":{},'
+        '"invocation_id":"11111111-1111-4111-8111-111111111111","session_id":null}'
+    )
     schema = fenced_yaml_in_section("Marker payload schema")
     validate_marker_schema(schema)
     print(format_marker_result())

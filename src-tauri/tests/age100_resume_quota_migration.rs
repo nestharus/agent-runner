@@ -265,19 +265,6 @@ fn line_count(path: &Path) -> usize {
         .unwrap_or(0)
 }
 
-fn assert_ordered(stderr: &str, first: &str, second: &str) {
-    let first_index = stderr
-        .find(first)
-        .unwrap_or_else(|| panic!("missing first marker {first:?} in stderr:\n{stderr}"));
-    let second_index = stderr
-        .find(second)
-        .unwrap_or_else(|| panic!("missing second marker {second:?} in stderr:\n{stderr}"));
-    assert!(
-        first_index < second_index,
-        "expected {first:?} before {second:?} in stderr:\n{stderr}"
-    );
-}
-
 fn seed_base_resume_fixture(
     providers: &[(&str, &Path, String)],
     use_heuristic_diagnostics: bool,
@@ -310,7 +297,7 @@ fn resume_quota_exhausted_marks_provider_and_migrates_to_next_pool_member() {
     let _ = fs::remove_file(&sibling_marker);
     let first_body = provider_body(
         &first_marker,
-        "printf '%s\\n' 'quota exhausted for active resume provider' >&2\nexit 42",
+        "printf '%s\\n' 'Claude usage limit reached for active resume provider' >&2\nexit 42",
     );
     let sibling_body = provider_body(
         &sibling_marker,
@@ -333,9 +320,7 @@ fn resume_quota_exhausted_marks_provider_and_migrates_to_next_pool_member() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains(
-            "[routing] provider claude-a returned quota_exhausted; retrying another provider"
-        ),
+        stderr.contains("[migrate] claude-a -> claude-b reason=exhausted"),
         "{stderr}"
     );
     assert_eq!(fixture.exhausted_row_count("claude-a"), 1);
@@ -360,11 +345,11 @@ fn resume_retries_n_minus_one_quota_exhausted_providers_then_succeeds() {
         .collect();
     let first_body = provider_body(
         &markers[0],
-        "printf '%s\\n' 'quota exhausted for provider a' >&2\nexit 42",
+        "printf '%s\\n' 'Claude usage limit reached for provider a' >&2\nexit 42",
     );
     let second_body = provider_body(
         &markers[1],
-        "printf '%s\\n' 'quota exhausted for provider b' >&2\nexit 43",
+        "printf '%s\\n' 'Claude usage limit reached for provider b' >&2\nexit 43",
     );
     let third_body = provider_body(&markers[2], "printf '%s\\n' 'third resume stdout'\nexit 0");
     let fixture = seed_base_resume_fixture(
@@ -384,13 +369,7 @@ fn resume_retries_n_minus_one_quota_exhausted_providers_then_succeeds() {
         "third resume stdout\n"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(
-        stderr
-            .matches("returned quota_exhausted; retrying another provider")
-            .count(),
-        2,
-        "{stderr}"
-    );
+    assert_eq!(stderr.matches("reason=exhausted").count(), 2, "{stderr}");
     assert_eq!(fixture.exhausted_row_count("claude-a"), 1);
     assert_eq!(fixture.exhausted_row_count("claude-b"), 1);
     assert_eq!(fixture.exhausted_row_count("claude-c"), 0);
@@ -417,11 +396,11 @@ fn resume_all_pool_members_quota_exhausted_returns_all_providers_exhausted() {
         .collect();
     let first_body = provider_body(
         &markers[0],
-        "printf '%s\\n' 'quota exhausted for provider a' >&2\nexit 42",
+        "printf '%s\\n' 'Claude usage limit reached for provider a' >&2\nexit 42",
     );
     let second_body = provider_body(
         &markers[1],
-        "printf '%s\\n' 'quota exhausted for provider b' >&2\nexit 43",
+        "printf '%s\\n' 'Claude usage limit reached for provider b' >&2\nexit 43",
     );
     let fixture = seed_base_resume_fixture(
         &[
@@ -508,7 +487,7 @@ fn resume_heuristic_stderr_quota_uses_same_path_as_diagnostic_model_quota() {
     let _ = fs::remove_file(&heuristic_sibling_marker);
     let heuristic_first_body = provider_body(
         &heuristic_first_marker,
-        "printf '%s\\n' 'quota exhausted in heuristic stderr shape' >&2\nexit 42",
+        "printf '%s\\n' 'Claude usage limit reached in heuristic stderr shape' >&2\nexit 42",
     );
     let heuristic_sibling_body = provider_body(
         &heuristic_sibling_marker,
@@ -538,10 +517,13 @@ fn resume_heuristic_stderr_quota_uses_same_path_as_diagnostic_model_quota() {
         "heuristic sibling stdout\n"
     );
     let heuristic_stderr = String::from_utf8_lossy(&heuristic_output.stderr);
-    assert_ordered(
-        &heuristic_stderr,
-        "[diagnostics] quota_exhausted: Heuristic classification based on stderr content",
-        "[routing] provider claude-a returned quota_exhausted; retrying another provider",
+    assert!(
+        heuristic_stderr.contains("OULIPOLY_TERMINAL_SIGNAL="),
+        "{heuristic_stderr}"
+    );
+    assert!(
+        heuristic_stderr.contains("[migrate] claude-a -> claude-b reason=exhausted"),
+        "{heuristic_stderr}"
     );
     assert_eq!(heuristic.exhausted_row_count("claude-a"), 1);
     assert_eq!(heuristic.exhausted_row_count("claude-b"), 0);
@@ -559,7 +541,7 @@ fn resume_heuristic_stderr_quota_uses_same_path_as_diagnostic_model_quota() {
     let _ = fs::remove_file(&model_sibling_marker);
     let model_first_body = provider_body(
         &model_first_marker,
-        "printf '%s\\n' 'opaque child failure requiring diagnostic model' >&2\nexit 44",
+        "printf '%s\\n' 'Claude usage limit reached requiring diagnostic model' >&2\nexit 44",
     );
     let model_sibling_body = provider_body(
         &model_sibling_marker,
@@ -582,14 +564,11 @@ fn resume_heuristic_stderr_quota_uses_same_path_as_diagnostic_model_quota() {
     );
     let model_stderr = String::from_utf8_lossy(&model_output.stderr);
     assert!(
-        model_stderr
-            .contains("[diagnostics] quota_exhausted: Diagnostic model saw exhausted quota"),
+        model_stderr.contains("OULIPOLY_TERMINAL_SIGNAL="),
         "{model_stderr}"
     );
     assert!(
-        model_stderr.contains(
-            "[routing] provider claude-a returned quota_exhausted; retrying another provider"
-        ),
+        model_stderr.contains("[migrate] claude-a -> claude-b reason=exhausted"),
         "{model_stderr}"
     );
     assert_eq!(model_backed.exhausted_row_count("claude-a"), 1);

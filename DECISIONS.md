@@ -3108,3 +3108,50 @@ This is NOT residual acceptance, NOT precedent citation, and does NOT authorize 
   - Question artifact: `/home/nes/projects/agent-runner/planning/age-129-lifecycle-log-schema/.scratch/questions/q-1e49ef6d-5e08-4180-a5f9-0498c0d0585c.question.json`
   - Phase 6 join manifest: `/home/nes/projects/agent-runner/planning/age-129-lifecycle-log-schema/risk/phase-6-join-manifest.json`
 - **Revisit when**: never for AGE-129 specifically (this is the WU's bootstrap moment). The residual db.rs metric will return to LOW post-AGE-149 refactor.
+
+## D-AGE-153-lib-rs-drift-residual — proceed-with-note + file follow-up
+
+- **Source**: AGE-153 Phase 2.5 step 2.5.4 duplicates inventory candidate 3 at `/home/nes/projects/agent-runner/planning/age-153-terminal-signal-wiring/risk/age-153-duplicates-drift-candidates.md` and the duplicates artifact at `/home/nes/projects/agent-runner/planning/age-153-terminal-signal-wiring/research/age-153-duplicates.md`. `src-tauri/src/lib.rs:696` (Tauri model-test command) calls `diagnostics::classify_exhaustion` on combined stdout+stderr then writes `StateDb::mark_exhausted` at `src-tauri/src/lib.rs:707` — same broad-string-match anti-pattern AGE-153 is decoupling on the `main.rs` lifecycle modes.
+- **Decision**: Proceed-with-note. AGE-153 keeps narrow `main.rs` + `balancer/mod.rs` touched-file scope per the root dispatch brief. `src-tauri/src/lib.rs:696-707` is NOT modified in this WU. File a Linear follow-up tracker under the AGE-91 umbrella to consolidate the Tauri model-test command's exhaustion classification onto typed `TerminalSignal` authority.
+- **Rationale**: The root dispatch brief states "Touched files now clean (AGE-151/AGE-152). This WU is the feature wiring on the cleaned baseline" and names `main.rs` + `balancer/mod.rs` as the touched-file footprint. `lib.rs` is not in scope, anti-scope, or acceptance criteria. The drift candidate itself notes "outside the primary src-tauri/src/main.rs AGE-153 lifecycle surfaces, so it may be a follow-up rather than this WU's required cascade." Expanding to `lib.rs` would violate the narrow-scope framing and inflate risk. Root answered option A on the disposition question.
+- **Forbidden behaviors reaffirmed**:
+  - NO scope expansion to `lib.rs` in AGE-153 (follow-up tracker handles).
+  - The follow-up tracker MUST NOT inherit AGE-153's bootstrap-exception authorization (none was granted and none was needed). The follow-up is a separate consolidation WU with its own Phase 4 gate evaluation.
+- **Evidence**:
+  - Duplicates artifact: `/home/nes/projects/agent-runner/planning/age-153-terminal-signal-wiring/research/age-153-duplicates.md`
+  - Drift candidates: `/home/nes/projects/agent-runner/planning/age-153-terminal-signal-wiring/risk/age-153-duplicates-drift-candidates.md`
+  - Root disposition: AskUserQuestion answered Option A (proceed-with-note + file follow-up) during Phase 2.5
+- **Revisit when**: the filed Linear follow-up tracker reaches Phase 3; that WU evaluates whether to fold `lib.rs` consolidation into a larger umbrella or ship as its own slice. AGE-153 closes independently.
+
+### AGE-153 — Bootstrap exception ratification
+
+- **Source**: implementation-pipeline-orchestrator Phase 4 code-quality gate on AGE-153. Phase 3 proposal at `/home/nes/projects/agent-runner/planning/age-153-terminal-signal-wiring/proposals/age-153-AGE-153.md` § `Bootstrap exception declaration` carries all 12 parser-required fields (`declared`, `code_quality_gate`, `measured_metric`, `expected_non_low_verdict`, `finding_ids`, `intrinsic_lockstep_paths`, `metric_change_refs`, `post_merge_new_rule_evidence`, `primary_deliverable_fixes_or_extends_metric`, `non_low_finding_is_intrinsic_lockstep`, `post_merge_satisfies_new_rule_under_new_metric`, `declared_for_phase_4_ratification`). The orchestrator's Phase 4 sub-gate parses this entry plus the proposal declaration and emits a `bootstrap-exception` join-manifest row when both match.
+- **Decision**: Apply Phase 4 bootstrap-exception per `~/ai/conventions/code-quality.md` § `Bootstrap exception`. AGE-153 is the AGE-148-style **hybrid extension** ratification: the WU's primary deliverable extends typed-`TerminalSignal` precedence onto the same touched-file ownership set (`src-tauri/src/main.rs` + `crates/oulipoly-runtime/src/balancer/mod.rs`) that AGE-151 and AGE-152 ratified non-LOW at ship time via bootstrap-exception. AGE-153 cannot reduce the inherited 14 CQ findings (CQ-F01..CQ-F14) without scope expansion forbidden by both the AGE-153 ticket anti-scope and the root dispatch brief.
+- **Canonical authority**: `~/ai/conventions/code-quality.md` § `Bootstrap exception`. The four conditions are argued by the Phase 3 proposer; this DECISIONS entry is the ratification record the Phase 4 sub-gate's parser cites.
+- **Four-condition check** (ratified here):
+  1. **Primary deliverable fixes or extends the metric**: TRUE under hybrid extension. AGE-153 extends typed-`TerminalSignal` precedence onto the same intrinsic-lockstep touched-file ownership set (main.rs + balancer/mod.rs) that AGE-151/AGE-152 carried at ship time. The WU's primary deliverable is the typed-signal consumer wiring on the inherited cleaned-baseline; this is the AGE-148-style hybrid pattern where the metric-fix extension applies to a previously-ratified intrinsic surface rather than introducing new metric-fix scope.
+  2. **Non-LOW finding is intrinsic-lockstep with the refactor**: TRUE. Every finding in the 14-item `finding_ids` list (CQ-F01..CQ-F14) is rooted in the AGE-151/AGE-152 baseline non-LOW state that those WUs ratified as intrinsic at their own ship. AGE-153 introduces no new low-cohesion classifiers, no new multi-classifier helpers, no new declared-roles fragmentation, and no new push-pull violations; the AGE-153-net-new edits (typed-signal consumer call sites, marker emitter, captured-child propagation helper) sit inside the inherited intrinsic surface.
+  3. **Post-merge satisfies the new rule under the new metric**: TRUE. Phase 6 per-component code-quality fanout will run on AGE-153's actually-touched components (NOT on whole-file inherited debt) with a Phase 6a contract that declares the per-component role set. Each emitted component must close LOW under that contract before that component closes into the aggregate diff consumed by Phase 8. Bootstrap-exception releases Phase 4 PRE-implementation only; the actual ship gate is the post-refactor per-component LOW.
+  4. **Declared for Phase 4 ratification**: TRUE. Proposal § `Bootstrap exception declaration` carries `declared_for_phase_4_ratification: true` and all 11 sibling fields. This DECISIONS entry is the ratification record.
+- **AGE-148-style hybrid pattern + tracker citations**:
+  - This ratification follows the AGE-148-style hybrid pattern: ratify intrinsic-lockstep inherited debt + cite separate tracker(s) for genuinely-out-of-scope adjacent cleanup.
+  - **AGE-156** (filed by AGE-153 Phase 2.5 drift discovery): tracks `src-tauri/src/lib.rs:696-707` Tauri model-test command consolidation onto typed `TerminalSignal` authority. OUT OF SCOPE for AGE-153 per `DECISIONS.md § D-AGE-153-lib-rs-drift-residual`.
+  - **AGE-149** (per root brief): tracks the broader db.rs / main.rs / services adjacent cleanup umbrella.
+- **Forbidden behaviors reaffirmed**:
+  - This ratification is bounded to AGE-153. NO precedent-citation of this AGE-153 bootstrap-exception for OTHER WUs unless they independently meet the four conditions per `~/ai/conventions/code-quality.md` § `Bootstrap exception`.
+  - NO residual acceptance on Phase 6 per-component code-quality fanout. The bootstrap-exception releases Phase 4 only; Phase 6 per-component fanout must return LOW on the actually-refactored per-component AGE-153-emitted surface.
+  - NO bootstrap-exception use without verifiable four-condition check + tracker citation for genuinely-out-of-scope cleanup.
+  - NO scope expansion into `src-tauri/src/lib.rs` (AGE-156 owns), `crates/oulipoly-runtime/src/executor/cli.rs` (AGE-141/AGE-146 owns), `crates/oulipoly-runtime/src/executor/terminal_signal.rs` and provider-recognition modules (AGE-139 owns), schema/migration, or `agents --resume` semantics.
+- **Evidence**:
+  - Proposal: `/home/nes/projects/agent-runner/planning/age-153-terminal-signal-wiring/proposals/age-153-AGE-153.md` § `Bootstrap exception declaration`
+  - Phase 4 CQ aggregate (Round 1): `/home/nes/projects/agent-runner/planning/age-153-terminal-signal-wiring/code-quality/age-153-phase-4/aggregate-code-quality.md`
+  - Phase 4 CQ findings (Round 1): `/home/nes/projects/agent-runner/planning/age-153-terminal-signal-wiring/code-quality/age-153-phase-4/findings.md`
+  - Parent AGE-151 + AGE-152 Phase 4/Phase 6 aggregate evidence (inheritance proof):
+    - AGE-151 Phase 4: `/home/nes/projects/agent-runner/planning/age-151-main-rs-cleanup/code-quality/age-151-phase-4/aggregate-code-quality.md`
+    - AGE-151 Phase 6: `/home/nes/projects/agent-runner/planning/age-151-main-rs-cleanup/code-quality/age-151-main-rs-component/aggregate-code-quality.md`
+    - AGE-152 Phase 4: `/home/nes/projects/agent-runner/planning/age-152-balancer-cleanup/code-quality/age-152-phase-4/aggregate-code-quality.md`
+    - AGE-152 Phase 6: `/home/nes/projects/agent-runner/planning/age-152-balancer-cleanup/code-quality/age-152-c1-balancer/aggregate-code-quality.md`
+  - Tracker citations: AGE-156 (filed by AGE-153 drift), AGE-149 (per root brief)
+  - Risk profile: `/home/nes/projects/agent-runner/planning/age-153-terminal-signal-wiring/risk/age-153-risk-profile.md`
+  - Audit-history: `/home/nes/projects/agent-runner/planning/age-153-terminal-signal-wiring/audit-history.md`
+- **Revisit when**: never for AGE-153 specifically. The Phase 6 per-component fanout on AGE-153-emitted components must return LOW under a Phase 6a contract; AGE-154 inherits the same touched-file baseline + AGE-153's new typed-signal consumer surface.
