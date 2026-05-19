@@ -115,7 +115,7 @@ pub(crate) fn build_start_record(ctx: &StartContext, outcome: &StartOutcome) -> 
     record
 }
 
-pub(crate) fn build_start_error_record(ctx: &StartContext, err: &dyn Error) -> Value {
+pub(crate) fn build_start_error_record(ctx: &StartContext, error_chain: String) -> Value {
     let mut record = common_record(CommonRecordInput {
         event_name: "invocation.start_failed",
         invocation_uuid: ctx.invocation_uuid.as_str(),
@@ -124,7 +124,7 @@ pub(crate) fn build_start_error_record(ctx: &StartContext, err: &dyn Error) -> V
         session_id: ctx.session_id.as_deref(),
         latency_us: ctx.latency_us,
         operation_result: RESULT_SQLITE_ERROR,
-        error_chain: Some(error_chain(err)),
+        error_chain: Some(error_chain),
     });
     insert(&mut record, "model", json!(ctx.model));
     insert(&mut record, "provider", json!(ctx.provider));
@@ -158,7 +158,7 @@ pub(crate) fn build_session_record(ctx: &SessionContext, _outcome: &SessionOutco
     record
 }
 
-pub(crate) fn build_session_error_record(ctx: &SessionContext, err: &dyn Error) -> Value {
+pub(crate) fn build_session_error_record(ctx: &SessionContext, error_chain: String) -> Value {
     let mut record = common_record(CommonRecordInput {
         event_name: "invocation.session_capture_failed",
         invocation_uuid: ctx.invocation_uuid.as_str(),
@@ -167,7 +167,7 @@ pub(crate) fn build_session_error_record(ctx: &SessionContext, err: &dyn Error) 
         session_id: ctx.session_id.as_deref(),
         latency_us: ctx.latency_us,
         operation_result: RESULT_SQLITE_ERROR,
-        error_chain: Some(error_chain(err)),
+        error_chain: Some(error_chain),
     });
     insert(
         &mut record,
@@ -212,7 +212,7 @@ pub(crate) fn build_finalize_record(ctx: &FinalizeContext, outcome: &FinalizeOut
     record
 }
 
-pub(crate) fn build_finalize_error_record(ctx: &FinalizeContext, err: &dyn Error) -> Value {
+pub(crate) fn build_finalize_error_record(ctx: &FinalizeContext, error_chain: String) -> Value {
     let mut record = common_record(CommonRecordInput {
         event_name: "invocation.finalize_failed",
         invocation_uuid: ctx.invocation_uuid.as_str(),
@@ -221,7 +221,7 @@ pub(crate) fn build_finalize_error_record(ctx: &FinalizeContext, err: &dyn Error
         session_id: ctx.session_id.as_deref(),
         latency_us: ctx.latency_us,
         operation_result: ctx.operation_result,
-        error_chain: Some(error_chain(err)),
+        error_chain: Some(error_chain),
     });
     insert(
         &mut record,
@@ -265,6 +265,16 @@ pub(crate) fn sqlite_error_result() -> &'static str {
     RESULT_SQLITE_ERROR
 }
 
+pub(crate) fn format_error_chain(err: &dyn Error) -> String {
+    let mut chain = vec![err.to_string()];
+    let mut source = err.source();
+    while let Some(err) = source {
+        chain.push(err.to_string());
+        source = err.source();
+    }
+    chain.join("\n")
+}
+
 fn common_record(input: CommonRecordInput<'_>) -> Value {
     json!({
         "event_name": input.event_name,
@@ -282,16 +292,6 @@ fn insert(record: &mut Value, key: &str, value: Value) {
     if let Some(object) = record.as_object_mut() {
         object.insert(key.to_string(), value);
     }
-}
-
-fn error_chain(err: &dyn Error) -> String {
-    let mut chain = vec![err.to_string()];
-    let mut source = err.source();
-    while let Some(err) = source {
-        chain.push(err.to_string());
-        source = err.source();
-    }
-    chain.join("\n")
 }
 
 fn raw_artifact_paths_json(paths: Option<&RawArtifactPaths>) -> Value {

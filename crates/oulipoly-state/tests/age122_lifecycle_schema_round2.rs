@@ -65,21 +65,39 @@ where
     S: Subscriber,
 {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
-        if event.metadata().target() != TARGET {
+        if !is_lifecycle_target(event) {
             return;
         }
 
-        let mut visitor = LifecycleRecordVisitor::default();
-        event.record(&mut visitor);
-        let Some(raw_record) = visitor.lifecycle_record else {
+        let Some(record) = parse_lifecycle_record_from_event(event) else {
             return;
         };
 
-        self.capture.records.lock().unwrap().push(CapturedTrace {
-            target: event.metadata().target().to_string(),
-            level: event.metadata().level().to_string().to_ascii_lowercase(),
-            lifecycle_record: parse_lifecycle_record(&raw_record),
-        });
+        self.capture
+            .records
+            .lock()
+            .unwrap()
+            .push(build_trace_event(event, record));
+    }
+}
+
+fn is_lifecycle_target(event: &Event<'_>) -> bool {
+    event.metadata().target() == TARGET
+}
+
+fn parse_lifecycle_record_from_event(event: &Event<'_>) -> Option<Value> {
+    let mut visitor = LifecycleRecordVisitor::default();
+    event.record(&mut visitor);
+    visitor
+        .lifecycle_record
+        .map(|raw_record| parse_lifecycle_record(&raw_record))
+}
+
+fn build_trace_event(event: &Event<'_>, lifecycle_record: Value) -> CapturedTrace {
+    CapturedTrace {
+        target: event.metadata().target().to_string(),
+        level: event.metadata().level().to_string().to_ascii_lowercase(),
+        lifecycle_record,
     }
 }
 
