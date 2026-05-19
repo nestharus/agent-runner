@@ -3080,3 +3080,31 @@ This is NOT residual acceptance, NOT precedent citation, and does NOT authorize 
   - Findings R5: `${planning_dir}/code-quality/age-129-lifecycle-log-statedb-instrumentation/findings.md`
 - **Revisit when**: root answers q-1e49ef6d. If option C is chosen, orchestrator resumes from Phase 6 component CQ closure (treating R4/R5 as residual) and advances. If option A (decompose), orchestrator follows AGE-122 R11 precedent (file AGE-150/AGE-151, mark AGE-129 DECOMPOSED, preserve branch as cherry-pick reference). If option B (continue revising) or D (shrink), orchestrator dispatches the corresponding action.
 
+
+### AGE-129 — Phase 6 Bootstrap exception ratification (hybrid pattern per AGE-148 precedent)
+
+- **Source**: implementation-pipeline-orchestrator Phase 6 per-component code-quality fanout on AGE-129. Root answered q-1e49ef6d (`option C: ship with documented residual`) and explicitly extended the AGE-148 hybrid bootstrap-exception precedent to Phase 6 for AGE-129.
+- **Decision**: Apply Phase 6 bootstrap-exception per `~/ai/conventions/code-quality.md` § `Bootstrap exception`, extending the Phase-4-only precedent to Phase 6 under the same four-condition framework. AGE-129 is the lifecycle-log primary deliverable; the residual db.rs FC + cohesion + push-pull findings inherited via ACR-249 whole-file ownership route to AGE-149 (`Refactor multi-classifier functions in db.rs / main.rs / services / session_metadata (post-AGE-147 + AGE-148 inherited debt)`).
+- **Canonical authority**: `~/ai/conventions/code-quality.md` § `Bootstrap exception`. The four conditions are interpreted with the user-authorized Phase 6 extension in scope:
+  1. **Primary deliverable fixes or extends the metric**: TRUE for the cleanup-target portions. AGE-129's R3/R4 helper splits (`lifecycle_context_and_raw_paths` → accessor+mapper; `start_invocation` SQL → execute+formatter; `warn_*_artifact_failure`, `upsert_provider_finalize_aggregate`, `update_provider_last_error` cleanup; build_*_record_for_result outcome splits; finalize_invocation_transaction begin/commit error formatter splits; load/write_invocation_final_row splits) ARE the cleanup-target metric-fix work that pushed cohesion + function-classification on those touched neighborhoods toward LOW.
+  2. **Non-LOW finding is intrinsic-lockstep with the refactor**: TRUE for the residual findings. Each Step 6c R1-R4 helper split surfaced new multi-classifier helpers, integration-test functions, and `StateDb::open_with_sink` constructors that the strict A1 interpretation flags. These are intrinsically linked to the lifecycle-log instrumentation (the helpers exist because the lifecycle methods needed them); they cannot pre-exist as LOW because the refactor produces them.
+  3. **Post-merge satisfies the new rule under the new metric**: TRUE. The post-merge state has lifecycle_log primary-deliverable LOW, cargo gates all pass, all 16 Step 6b tests pass; AGE-149 inherits the residual cleanup obligation. AGE-130 (raw I/O writer) can consume the lifecycle log API directly.
+  4. **Declared for Phase 6 ratification**: TRUE. The Phase 3 proposal's `## Component declared roles` + `## Adapter declarations` + `## Intrinsic-surface declarations` + `## Proof plan` sections carry the parser-required structure (extended R2/R3/R5 to widen declared role sets); this DECISIONS entry is the ratification record the Phase 6 join manifest cites.
+- **Hybrid pattern per AGE-148 precedent**: AGE-148's Phase 4 bootstrap-exception used the same hybrid (narrow bootstrap-exception now + tracker meta-ticket AGE-149 for follow-up cleanup). AGE-129 extends to Phase 6: narrow Phase 6 bootstrap-exception for the convergence-cap residual + same AGE-149 tracker absorbs the AGE-129 inherited db.rs FC + cohesion + push-pull cleanup obligation alongside the AGE-147/AGE-148 inherited debt.
+- **Forbidden behaviors reaffirmed**:
+  - This ratification is bounded to AGE-129. NO precedent-citation of this AGE-129 Phase 6 bootstrap-exception for OTHER WUs unless they independently meet the four conditions per `~/ai/conventions/code-quality.md` § `Bootstrap exception` with their own DECISIONS ratification entry.
+  - NO bootstrap-exception use without verifiable four-condition check.
+  - NO `tests/test_*.py` smuggling (none in AGE-129 diff).
+  - NO `| tail -N` truncating filters on `agents` dispatches.
+  - NO idle timeouts.
+  - Phase 7 retired — only the three pre-Phase-8 readiness gates run.
+- **AGE-149 cross-reference**: AGE-129's inherited db.rs FC + cohesion + push-pull cleanup routes to AGE-149 (spawned during AGE-148 lineage). AGE-149 scope expansion to include AGE-129-surfaced residuals is recorded via a comment on the AGE-149 issue after Phase 9 close.
+- **Evidence**:
+  - Aggregate R5: `/home/nes/projects/agent-runner/planning/age-129-lifecycle-log-schema/code-quality/age-129-lifecycle-log-statedb-instrumentation/aggregate-code-quality.md`
+  - Findings R5: `/home/nes/projects/agent-runner/planning/age-129-lifecycle-log-schema/code-quality/age-129-lifecycle-log-statedb-instrumentation/findings.md`
+  - Trajectory R0→R5: `/home/nes/projects/agent-runner/planning/age-129-lifecycle-log-schema/audit-history.md` Round 5
+  - AGE-148 precedent: `/home/nes/projects/agent-runner/planning/age-148-feature-integration/audit-history.md` § "Round 2 — Root disposition: hybrid"
+  - AGE-148 DECISIONS: `### AGE-148 — Bootstrap exception ratification`
+  - Question artifact: `/home/nes/projects/agent-runner/planning/age-129-lifecycle-log-schema/.scratch/questions/q-1e49ef6d-5e08-4180-a5f9-0498c0d0585c.question.json`
+  - Phase 6 join manifest: `/home/nes/projects/agent-runner/planning/age-129-lifecycle-log-schema/risk/phase-6-join-manifest.json`
+- **Revisit when**: never for AGE-129 specifically (this is the WU's bootstrap moment). The residual db.rs metric will return to LOW post-AGE-149 refactor.
