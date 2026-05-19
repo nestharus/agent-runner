@@ -1,7 +1,24 @@
 //! ## Declared roles
 //!
-//! `accessor`, `mapper`, `validator`, `parser`, `formatter`, `predicate`, `filter`,
-//! `orchestration`
+//! `orchestration`, `cli-dispatch`
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: src-tauri/src/main.rs::main_to_runtime_services
+//!     role: adapter
+//!     Translates:
+//!       - oulipoly_runtime::services ports and DTOs consumed by CLI dispatch
+//!   - component: src-tauri/src/main.rs::main_to_state
+//!     role: adapter
+//!     Translates:
+//!       - oulipoly_state DB, schema, quota, invocation row, session row, acceptance row
+//!   - component: src-tauri/src/main.rs::main_to_runtime_modules
+//!     role: adapter
+//!     Translates:
+//!       - oulipoly_runtime modules outside services consumed by CLI dispatch
+//! ```
 
 use agent_runner_lib::{effective_provider_for_model_provider, load_app_config};
 use oulipoly_config::repositories::{AgentConfigRepository, FilesystemAgentConfigRepository};
@@ -45,6 +62,17 @@ use std::process::ExitCode;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
+mod balanced_cli;
+mod cli_inputs;
+mod config_migration_cli;
+mod repl_cli;
+mod resume_acceptance_adapter;
+mod resume_cli;
+mod session_import_replace_cli;
+mod session_ingest_cli;
+mod session_metadata_cli;
+mod terminal_outcome_adapter;
+mod trace_cli;
 mod usage;
 mod wiring;
 
@@ -60,16 +88,7 @@ const MAX_PAUSE_HANDSHAKE_TTL_MS: u64 = 600_000;
 
 /// Parse --input key=value flags into a map (repeated keys become arrays).
 fn parse_inputs(raw: &[String]) -> Result<HashMap<String, Vec<String>>, String> {
-    let mut map: HashMap<String, Vec<String>> = HashMap::new();
-    for entry in raw {
-        let (key, value) = entry
-            .split_once('=')
-            .ok_or_else(|| format!("Invalid input format '{}': expected KEY=VALUE", entry))?;
-        map.entry(key.to_string())
-            .or_default()
-            .push(value.to_string());
-    }
-    Ok(map)
+    cli_inputs::parse_inputs(raw)
 }
 
 fn collect_positional_prompt(cli: &Cli, include_agent: bool) -> Option<String> {
@@ -650,26 +669,7 @@ fn run_session_import_replace(
 }
 
 fn validate_import_replace_args(session_id: &str, preimage_sha256: Option<&str>) -> Option<i32> {
-    if Uuid::try_parse(session_id).is_err() {
-        return Some(render_replace_error(ReplaceError::InvalidSessionId {
-            input: session_id.to_string(),
-        }));
-    }
-    if preimage_sha256.is_some_and(invalid_sha256_hex) {
-        return Some(render_replace_error(ReplaceError::InvalidArgument {
-            message: "preimage sha256 must be 64 hex characters".to_string(),
-        }));
-    }
-    None
-}
-
-fn invalid_sha256_hex(hash: &str) -> bool {
-    hash.len() != 64 || !hash.chars().all(|ch| ch.is_ascii_hexdigit())
-}
-
-fn render_replace_error(err: ReplaceError) -> i32 {
-    eprintln!("{}", err.to_json());
-    err.exit_code()
+    session_import_replace_cli::validate_import_replace_args(session_id, preimage_sha256)
 }
 
 fn import_replace_request(
@@ -693,18 +693,7 @@ fn replace_source(from_file: Option<&Path>) -> ReplaceSource {
 fn render_import_replace_output(
     result: Result<session_replace::ReplaceReceipt, ReplaceError>,
 ) -> Result<i32, String> {
-    match result {
-        Ok(receipt) => {
-            let json = serde_json::to_string(&receipt).map_err(format_replace_receipt_error)?;
-            println!("{json}");
-            Ok(0)
-        }
-        Err(err) => Ok(render_replace_error(err)),
-    }
-}
-
-fn format_replace_receipt_error(error: serde_json::Error) -> String {
-    format!("Failed to serialize replace receipt: {error}")
+    session_import_replace_cli::render_import_replace_output(result)
 }
 
 fn probe_error_message(error: ProbeError) -> String {
@@ -813,17 +802,7 @@ fn render_trace_result(
     result: Result<oulipoly_runtime::trace::TraceReport, TraceServiceFailure>,
     json: bool,
 ) -> Result<i32, String> {
-    match result {
-        Ok(report) => render_trace_report(&report, json),
-        Err(TraceServiceFailure::InvocationNotFound { message, .. }) => {
-            eprintln!("{message}");
-            Ok(1)
-        }
-        Err(
-            TraceServiceFailure::InvalidInvocationId { message, .. }
-            | TraceServiceFailure::Operational { message },
-        ) => Err(message),
-    }
+    trace_cli::render_trace_result(result, json)
 }
 
 fn render_trace_report(
@@ -903,25 +882,7 @@ fn render_session_locate_environment_error(message: String) -> i32 {
 fn render_session_metadata(
     result: Result<oulipoly_runtime::session_metadata::SessionMetadata, MetadataError>,
 ) -> Result<i32, String> {
-    match result {
-        Ok(metadata) => match serde_json::to_string(&metadata) {
-            Ok(json) => {
-                println!("{json}");
-                Ok(0)
-            }
-            Err(err) => {
-                emit_metadata_error(&MetadataError::Operational {
-                    message: format!("failed to serialize session metadata: {err}"),
-                });
-                Ok(1)
-            }
-        },
-        Err(err) => {
-            let code = metadata_error_exit_code(&err);
-            emit_metadata_error(&err);
-            Ok(code)
-        }
-    }
+    session_metadata_cli::render_session_metadata(result)
 }
 
 fn run_session_export(
@@ -3001,13 +2962,7 @@ fn resume_result_error_category(
     models: &HashMap<String, ModelConfig>,
     working_dir: Option<&Path>,
 ) -> Option<String> {
-    if execution_succeeded(result.exit_code) {
-        return None;
-    }
-    if resume_result_has_session_mismatch(result) {
-        return Some(resume_session_mismatch_category());
-    }
-    diagnose_execution_error(agent_runtime_services, result, models, working_dir)
+    resume_cli::resume_result_error_category(agent_runtime_services, result, models, working_dir)
 }
 
 fn balanced_result_error_category(
@@ -3016,29 +2971,12 @@ fn balanced_result_error_category(
     models: &HashMap<String, ModelConfig>,
     working_dir: Option<&Path>,
 ) -> Option<String> {
-    if execution_succeeded(result.exit_code) {
-        return None;
-    }
-    let input = diagnostic_input(&result.stderr, &result.stdout);
-    if diagnostics::classify_exhaustion(&input) {
-        Some(quota_exhausted_category())
-    } else {
-        run_diagnostics(
-            agent_runtime_services,
-            &input,
-            result.exit_code,
-            models,
-            working_dir,
-        )
-    }
-}
-
-fn resume_result_has_session_mismatch(result: &executor::ExecutionResult) -> bool {
-    result.resume_acceptance.as_ref().is_some_and(|acceptance| {
-        acceptance.evidence.as_deref().is_some_and(|evidence| {
-            evidence.contains(diagnostics::ErrorCategory::ResumeSessionMismatch.as_str())
-        })
-    })
+    balanced_cli::balanced_result_error_category(
+        agent_runtime_services,
+        result,
+        models,
+        working_dir,
+    )
 }
 
 fn resume_session_mismatch_category() -> String {
@@ -3074,9 +3012,7 @@ fn error_category_is_quota_exhausted(error_category: Option<&str>) -> bool {
 }
 
 fn mark_provider_exhausted(state: &StateDb, provider_name: &str) {
-    state
-        .mark_exhausted(provider_name)
-        .unwrap_or_else(|e| eprintln!("Warning: Failed to mark provider exhausted: {e}"));
+    balanced_cli::mark_provider_exhausted(state, provider_name);
 }
 
 // ---
