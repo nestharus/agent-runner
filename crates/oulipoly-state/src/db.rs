@@ -2720,11 +2720,21 @@ impl StateDb {
 
     fn warn_invocation_artifact_failure(&self, start: &InvocationStart, started_at: &str) {
         if let Err(err) = self.write_invocation_artifact(start, started_at) {
-            eprintln!(
-                "Warning: Failed to write invocation artifact for {}: {err}",
-                start.invocation_uuid
-            );
+            let message =
+                Self::format_invocation_artifact_warning_message(&start.invocation_uuid, &err);
+            Self::emit_artifact_warning(&message);
         }
+    }
+
+    fn format_invocation_artifact_warning_message(
+        invocation_uuid: &str,
+        err: &dyn std::fmt::Display,
+    ) -> String {
+        format!("Warning: Failed to write invocation artifact for {invocation_uuid}: {err}")
+    }
+
+    fn emit_artifact_warning(message: &str) {
+        eprintln!("{message}");
     }
 
     pub fn finalize_invocation(
@@ -3053,9 +3063,44 @@ impl StateDb {
         terminal_reason: Option<&str>,
         finished_at: &str,
     ) -> Result<(), String> {
-        let Some(provider_name) = provider_name else {
+        let Some(provider_name) = Self::eligible_provider_name(provider_name) else {
             return Ok(());
         };
+        Self::execute_provider_finalize_aggregate_sql(
+            conn,
+            model_name,
+            provider_name,
+            success,
+            finished_at,
+        )
+        .map_err(Self::format_provider_finalize_aggregate_sql_error)?;
+        if Self::is_finalize_failure(success) {
+            Self::update_provider_last_error(
+                conn,
+                model_name,
+                provider_name,
+                terminal_reason,
+                finished_at,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn eligible_provider_name(provider_name: Option<&str>) -> Option<&str> {
+        provider_name
+    }
+
+    fn is_finalize_failure(success: bool) -> bool {
+        !success
+    }
+
+    fn execute_provider_finalize_aggregate_sql(
+        conn: &Connection,
+        model_name: &str,
+        provider_name: &str,
+        success: bool,
+        finished_at: &str,
+    ) -> rusqlite::Result<()> {
         conn.execute(
             "INSERT INTO providers (
                     model_name, provider_name,
@@ -3069,21 +3114,19 @@ impl StateDb {
             params![
                 model_name,
                 provider_name,
-                if success { 0i64 } else { 1i64 },
+                Self::provider_error_count_increment(success),
                 finished_at
             ],
-        )
-        .map_err(|e| format!("Failed to upsert provider: {e}"))?;
-        if !success {
-            Self::update_provider_last_error(
-                conn,
-                model_name,
-                provider_name,
-                terminal_reason,
-                finished_at,
-            )?;
-        }
+        )?;
         Ok(())
+    }
+
+    fn provider_error_count_increment(success: bool) -> i64 {
+        if success { 0 } else { 1 }
+    }
+
+    fn format_provider_finalize_aggregate_sql_error(err: rusqlite::Error) -> String {
+        format!("Failed to upsert provider: {err}")
     }
 
     fn update_provider_last_error(
@@ -3093,14 +3136,39 @@ impl StateDb {
         terminal_reason: Option<&str>,
         finished_at: &str,
     ) -> Result<(), String> {
-        let snippet = terminal_reason.map(Self::provider_error_snippet);
+        let snippet = Self::map_provider_error_snippet(terminal_reason);
+        Self::execute_update_provider_last_error_sql(
+            conn,
+            model_name,
+            provider_name,
+            snippet.as_deref(),
+            finished_at,
+        )
+        .map_err(Self::format_update_provider_last_error_sql_error)?;
+        Ok(())
+    }
+
+    fn map_provider_error_snippet(terminal_reason: Option<&str>) -> Option<String> {
+        terminal_reason.map(Self::provider_error_snippet)
+    }
+
+    fn execute_update_provider_last_error_sql(
+        conn: &Connection,
+        model_name: &str,
+        provider_name: &str,
+        snippet: Option<&str>,
+        finished_at: &str,
+    ) -> rusqlite::Result<()> {
         conn.execute(
             "UPDATE providers SET last_error = ?1, last_error_at = ?2
              WHERE model_name = ?3 AND provider_name = ?4",
-            params![&snippet, finished_at, model_name, provider_name],
-        )
-        .map_err(|e| format!("Failed to update error info: {e}"))?;
+            params![snippet, finished_at, model_name, provider_name],
+        )?;
         Ok(())
+    }
+
+    fn format_update_provider_last_error_sql_error(err: rusqlite::Error) -> String {
+        format!("Failed to update error info: {err}")
     }
 
     fn provider_error_snippet(value: &str) -> String {
@@ -3124,8 +3192,16 @@ impl StateDb {
             terminal_reason,
             finished_at,
         ) {
-            eprintln!("Warning: Failed to write result artifact for {invocation_uuid}: {err}");
+            let message = Self::format_result_artifact_warning_message(invocation_uuid, &err);
+            Self::emit_artifact_warning(&message);
         }
+    }
+
+    fn format_result_artifact_warning_message(
+        invocation_uuid: &str,
+        err: &dyn std::fmt::Display,
+    ) -> String {
+        format!("Warning: Failed to write result artifact for {invocation_uuid}: {err}")
     }
 
     pub fn record_returned_artifacts(
@@ -3628,6 +3704,14 @@ impl StateDb {
         &self,
         row_id: i64,
     ) -> Result<Option<LifecycleInvocationRow>, String> {
+        self.query_lifecycle_context_for_row(row_id)
+            .map_err(|err| Self::format_lifecycle_context_lookup_error(row_id, err))
+    }
+
+    fn query_lifecycle_context_for_row(
+        &self,
+        row_id: i64,
+    ) -> rusqlite::Result<Option<LifecycleInvocationRow>> {
         self.conn
             .query_row(
                 "SELECT i.invocation_uuid,
@@ -3641,7 +3725,10 @@ impl StateDb {
                 Self::map_lifecycle_invocation_row,
             )
             .optional()
-            .map_err(|e| format!("Failed to load invocation lifecycle context {row_id}: {e}"))
+    }
+
+    fn format_lifecycle_context_lookup_error(row_id: i64, err: rusqlite::Error) -> String {
+        format!("Failed to load invocation lifecycle context {row_id}: {err}")
     }
 
     fn map_lifecycle_invocation_row(
