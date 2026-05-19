@@ -1,7 +1,24 @@
 //! ## Declared roles
 //!
-//! `accessor`, `mapper`, `validator`, `parser`, `formatter`, `predicate`, `filter`,
-//! `orchestration`
+//! `orchestration`, `cli-dispatch`
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: src-tauri/src/main.rs::main_to_runtime_services
+//!     role: adapter
+//!     Translates:
+//!       - oulipoly_runtime::services ports and DTOs consumed by CLI dispatch
+//!   - component: src-tauri/src/main.rs::main_to_state
+//!     role: adapter
+//!     Translates:
+//!       - oulipoly_state DB, schema, quota, invocation row, session row, acceptance row
+//!   - component: src-tauri/src/main.rs::main_to_runtime_modules
+//!     role: adapter
+//!     Translates:
+//!       - oulipoly_runtime modules outside services consumed by CLI dispatch
+//! ```
 
 use agent_runner_lib::{effective_provider_for_model_provider, load_app_config};
 use oulipoly_config::repositories::{AgentConfigRepository, FilesystemAgentConfigRepository};
@@ -45,6 +62,17 @@ use std::process::ExitCode;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
+mod balanced_cli;
+mod cli_inputs;
+mod config_migration_cli;
+mod repl_cli;
+mod resume_acceptance_adapter;
+mod resume_cli;
+mod session_import_replace_cli;
+mod session_ingest_cli;
+mod session_metadata_cli;
+mod terminal_outcome_adapter;
+mod trace_cli;
 mod usage;
 mod wiring;
 
@@ -60,16 +88,7 @@ const MAX_PAUSE_HANDSHAKE_TTL_MS: u64 = 600_000;
 
 /// Parse --input key=value flags into a map (repeated keys become arrays).
 fn parse_inputs(raw: &[String]) -> Result<HashMap<String, Vec<String>>, String> {
-    let mut map: HashMap<String, Vec<String>> = HashMap::new();
-    for entry in raw {
-        let (key, value) = entry
-            .split_once('=')
-            .ok_or_else(|| format!("Invalid input format '{}': expected KEY=VALUE", entry))?;
-        map.entry(key.to_string())
-            .or_default()
-            .push(value.to_string());
-    }
-    Ok(map)
+    cli_inputs::parse_inputs(raw)
 }
 
 fn collect_positional_prompt(cli: &Cli, include_agent: bool) -> Option<String> {
@@ -3004,7 +3023,9 @@ fn resume_result_error_category(
     if execution_succeeded(result.exit_code) {
         return None;
     }
-    if resume_result_has_session_mismatch(result) {
+    if resume_acceptance_adapter::classify(result.resume_acceptance.as_ref())
+        == resume_acceptance_adapter::ResumeAcceptanceCategory::SessionMismatch
+    {
         return Some(resume_session_mismatch_category());
     }
     diagnose_execution_error(agent_runtime_services, result, models, working_dir)
@@ -3016,28 +3037,19 @@ fn balanced_result_error_category(
     models: &HashMap<String, ModelConfig>,
     working_dir: Option<&Path>,
 ) -> Option<String> {
-    if execution_succeeded(result.exit_code) {
-        return None;
-    }
-    let input = diagnostic_input(&result.stderr, &result.stdout);
-    if diagnostics::classify_exhaustion(&input) {
-        Some(quota_exhausted_category())
-    } else {
-        run_diagnostics(
-            agent_runtime_services,
-            &input,
-            result.exit_code,
-            models,
-            working_dir,
-        )
-    }
-}
-
-fn resume_result_has_session_mismatch(result: &executor::ExecutionResult) -> bool {
-    result.resume_acceptance.as_ref().is_some_and(|acceptance| {
-        acceptance.evidence.as_deref().is_some_and(|evidence| {
-            evidence.contains(diagnostics::ErrorCategory::ResumeSessionMismatch.as_str())
-        })
+    terminal_outcome_adapter::classify_error_category_with_fallback(result, || {
+        let input = diagnostic_input(&result.stderr, &result.stdout);
+        if diagnostics::classify_exhaustion(&input) {
+            Some(quota_exhausted_category())
+        } else {
+            run_diagnostics(
+                agent_runtime_services,
+                &input,
+                result.exit_code,
+                models,
+                working_dir,
+            )
+        }
     })
 }
 
@@ -3074,9 +3086,7 @@ fn error_category_is_quota_exhausted(error_category: Option<&str>) -> bool {
 }
 
 fn mark_provider_exhausted(state: &StateDb, provider_name: &str) {
-    state
-        .mark_exhausted(provider_name)
-        .unwrap_or_else(|e| eprintln!("Warning: Failed to mark provider exhausted: {e}"));
+    balanced_cli::mark_provider_exhausted(state, provider_name);
 }
 
 // ---
