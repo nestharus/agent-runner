@@ -44,7 +44,7 @@ fn fresh_schema_has_provider_session_resolved_account_on_invocations() {
     let db_path = dir.path().join("state.db");
     let db = StateDb::open(&db_path).unwrap();
 
-    assert_eq!(user_version(db.connection()), 7);
+    assert_eq!(user_version(db.connection()), 8);
     let columns = invocation_columns(db.connection());
     let column = columns
         .iter()
@@ -67,7 +67,7 @@ fn migration_0007_adds_identity_column_and_preserves_rows() {
     drop(before_conn);
 
     let db = StateDb::open(&db_path).unwrap();
-    assert_eq!(user_version(db.connection()), 7);
+    assert_eq!(user_version(db.connection()), 8);
     let after_rows = invocation_payload_snapshot(db.connection());
     assert_eq!(after_rows, before_rows);
 

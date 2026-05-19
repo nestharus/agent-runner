@@ -1,3 +1,6 @@
+//! ## Declared roles
+//! orchestration, accessor, mapper, parser, filter, predicate, validator, formatter
+//!
 use oulipoly_state::deployment::row_version::checksum::{
     payload_hash_for_columns, payload_hash_for_row,
 };
@@ -190,6 +193,7 @@ fn payload_hash_for_row_preserves_sqlite_null_distinct_from_absent_value() {
     assert_ne!(row_hash, payload_hash_for_columns(&[None]));
 }
 
+// Declared role: mapper
 fn snapshot(version: i64, payload_hash: [u8; 32]) -> RowSnapshot {
     RowSnapshot {
         version: RowVersion(version),

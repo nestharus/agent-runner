@@ -1,3 +1,6 @@
+//! ## Declared roles
+//! orchestration, accessor, mapper, parser, filter, predicate, validator, formatter
+//!
 use chrono::{Duration, TimeZone, Utc};
 use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig};
 use oulipoly_core::TransitionReason;
@@ -13,10 +16,12 @@ use oulipoly_state::{
 };
 use std::path::{Path, PathBuf};
 
+// Declared role: accessor
 fn memory_db() -> StateDb {
     StateDb::open(Path::new(":memory:")).unwrap()
 }
 
+// Declared role: mapper
 fn start_fixture(provider: &str) -> InvocationStart {
     InvocationStart {
         invocation_uuid: uuid::Uuid::new_v4().to_string(),
@@ -27,6 +32,7 @@ fn start_fixture(provider: &str) -> InvocationStart {
     }
 }
 
+// Declared role: mapper
 fn model_with_provider(model_name: &str, provider_name: &str) -> ModelConfig {
     ModelConfig {
         name: model_name.to_string(),
@@ -36,10 +42,12 @@ fn model_with_provider(model_name: &str, provider_name: &str) -> ModelConfig {
     }
 }
 
+// Declared role: mapper
 fn fixed_time(offset_secs: i64) -> chrono::DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap() + Duration::seconds(offset_secs)
 }
 
+// Declared role: accessor
 fn seed_chain(db: &StateDb, chain_id: &str, model_name: &str, ts: chrono::DateTime<Utc>) {
     db.connection()
         .execute(

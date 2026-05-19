@@ -1,3 +1,8 @@
+//! ## Declared roles
+//! accessor, filter, formatter, mapper, predicate, validator
+//!
+//! AGE-137 Codex storage locator contract for rollout transcript lookup.
+
 use super::{
     LocatedTranscript, LocatorError, LocatorSource, SessionStorageType, TranscriptLocator,
     TranscriptLookupMode, TranscriptRequest, UnsupportedStorageReason, located, no_locator,

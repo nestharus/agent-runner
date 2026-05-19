@@ -35,8 +35,8 @@ fn invocations_schema_sql_unchanged_no_raw_io_columns_and_no_migration_surface()
         "AGE-129 must keep invocations_schema_sql unchanged and sidecar-based"
     );
     assert!(
-        schema_rs.contains("pub const CURRENT_SCHEMA_VERSION: i32 = 7;"),
-        "AGE-129 must not bump the StateDb schema version (post-rebase baseline = 7 from AGE-148)"
+        schema_rs.contains("pub const CURRENT_SCHEMA_VERSION: i32 = 8;"),
+        "AGE-129 must not bump the StateDb schema version (post-rebase baseline = 8 from AGE-148+AGE-149)"
     );
     assert!(
         !lib_rs.contains("pub mod lifecycle_log"),
@@ -77,7 +77,8 @@ fn invocations_schema_sql_unchanged_no_raw_io_columns_and_no_migration_surface()
             "0005_invocation_dual_session_ids.sql",
             "0006_age_58_dual_write_row_versions.sql",
             "0007_age_123_resume_provider_identity.sql",
+            "0008_owned_turn_events.sql",
         ],
-        "AGE-129 must not add lifecycle/raw-io/event migrations (post-rebase baseline includes AGE-148's 0007 resume-provider-identity migration)"
+        "AGE-129 must not add lifecycle/raw-io/event migrations (post-rebase baseline includes AGE-148's 0007 resume-provider-identity migration + AGE-149's 0008 owned turn events migration)"
     );
 }

@@ -3155,3 +3155,59 @@ This is NOT residual acceptance, NOT precedent citation, and does NOT authorize 
   - Risk profile: `/home/nes/projects/agent-runner/planning/age-153-terminal-signal-wiring/risk/age-153-risk-profile.md`
   - Audit-history: `/home/nes/projects/agent-runner/planning/age-153-terminal-signal-wiring/audit-history.md`
 - **Revisit when**: never for AGE-153 specifically. The Phase 6 per-component fanout on AGE-153-emitted components must return LOW under a Phase 6a contract; AGE-154 inherits the same touched-file baseline + AGE-153's new typed-signal consumer surface.
+
+### AGE-149 — Phase 2.5 disposition
+
+- **Source**: implementation-pipeline-orchestrator Phase 2.5 on AGE-149 (`/home/nes/projects/agent-runner/planning/age-149-inherited-debt-cleanup/`). The user supplied three pre-commitments at root dispatch:
+  1. `Phase 2.5 step 4a: PROCEED_WITHOUT_BASELINE` — the Linear estimate is unset on AGE-149 (`estimate_source: missing`); the user accepts proceeding without an inherited estimate baseline. The Phase 3 proposer derives a refined estimate from its chosen decomposition.
+  2. `Defer-signals: PROCEED_EXHAUSTIVE` — the Phase 2.5 risk profile rolls up to WU-level `HIGH` (every product surface scores `HIGH` on at least one axis; cross-language trace is `HIGH` on three axes). Per the orchestrator's Phase 2.5 step 5, two-or-more defer-signals fire, which normally surfaces a `defer to prototype` option at the human gate. The user pre-committed `PROCEED_EXHAUSTIVE` so the WU advances to Phase 3 with exhaustive mode and bootstrap-exception authorization for Phase 4 code-quality.
+  3. `skip_problem_map_gate=true` — the routine Phase 2.5 problem-map approval gate is skipped. The defer-signals option is also preempted by `PROCEED_EXHAUSTIVE`.
+- **Decision**: Apply Phase 2.5 mode propagation: per-surface mode for downstream phases is `exhaustive`. Pass `risk_profile_path` and the per-surface mode map into Phase 3's prompt; the proposer decides decomposition shape (the ticket suggests 4-6 child tracks but the proposer is free to argue otherwise inside the touched-file ownership set).
+- **Canonical authority**: `~/ai/workflows/implementation-pipeline.md` Phase 2.5 § Mode propagation; `~/ai/conventions/risk-profile.md` (per-surface scoring + WU rollup).
+- **Forbidden behaviors reaffirmed**:
+  - NO scope expansion beyond the inherited-debt files named in the ticket body (db.rs, main.rs, services/mod.rs, session_metadata/mod.rs, migrations.rs, schema.rs, state-crate test files).
+  - NO `tests/test_*.py` smuggling; this is a Rust codebase and any structural-verification flow that wants to author Python tests is out of scope.
+  - NO `| tail -N` truncation on `agents` dispatch lines; the orchestrator preserves full `2>&1 | tee` capture.
+  - NO idle timeouts; the orchestrator surfaces a stall question if a sub-agent shows no activity for >15 minutes.
+- **Evidence**:
+  - Problem map: `/home/nes/projects/agent-runner/planning/age-149-inherited-debt-cleanup/research/age-149-problem-map.md`
+  - Coverage inventory: `/home/nes/projects/agent-runner/planning/age-149-inherited-debt-cleanup/research/age-149-coverage-inventory.md`
+  - Lifecycle map: `/home/nes/projects/agent-runner/planning/age-149-inherited-debt-cleanup/research/age-149-lifecycle-map.md`
+  - Entrypoints: `/home/nes/projects/agent-runner/planning/age-149-inherited-debt-cleanup/research/age-149-entrypoints.md`
+  - Duplicates: `/home/nes/projects/agent-runner/planning/age-149-inherited-debt-cleanup/research/age-149-duplicates.md`
+  - Cross-language trace: `/home/nes/projects/agent-runner/planning/age-149-inherited-debt-cleanup/research/age-149-cross-language-trace.md`
+  - Risk profile: `/home/nes/projects/agent-runner/planning/age-149-inherited-debt-cleanup/risk/age-149-risk-profile.md`
+  - Audit-history: `/home/nes/projects/agent-runner/planning/age-149-inherited-debt-cleanup/audit-history.md`
+  - User pre-commitments: AGE-149 implementation invocation directive (2026-05-19).
+- **Revisit when**: never for AGE-149 specifically; the per-surface mode is bound to this WU's Phase 3 proposal.
+
+### AGE-149 — Drift discovery disposition (transcript-locator-parity → AGE-157)
+
+- **Source**: implementation-pipeline-orchestrator Phase 2.5 step 2.5.4 (duplicates inventory). The Rust resume-transcript locators (`crates/oulipoly-runtime/src/session_metadata/locator/claude.rs` and `crates/oulipoly-runtime/src/session_metadata/locator/codex.rs`) diverge silently from `scripts/claude-code-locate-transcript` and `scripts/codex-locate-transcript`: the scripts implement a `sessionId` / `payload.id` content fallback parsing JSONL line-by-line; the Rust locators use filename-only / depth-limited filename containment.
+- **Decision**: `proceed-with-note`. AGE-149's user-supplied anti-scope ("NO scope expansion beyond the inherited-debt files named in the ticket body") and the ticket's Out of Scope ("No semantic behavior changes — pure refactoring") both preempt the `expand-scope-to-consolidate` option. Tracker ticket **AGE-157** filed via `linear-operator` (`task=create`, parent AGE-149, labels `technical-debt, drift-discovery, transcript-locator-parity, age-149-spawned`) for follow-up; the drift is best addressed in tandem with the PP-001 push-based registry.
+- **Canonical authority**: `~/ai/conventions/risk-profile.md` § Discoveries during Phase 2.5; `~/ai/workflows/implementation-pipeline.md` Phase 2.5 step 2.5.4 drift discovery rule.
+- **Evidence**:
+  - Duplicates inventory: `/home/nes/projects/agent-runner/planning/age-149-inherited-debt-cleanup/research/age-149-duplicates.md` § "Resume-Metadata Transcript Fallback Duplicates (PP-001)"
+  - Tracker ticket: AGE-157 (Linear, parent AGE-149, labels above)
+- **Revisit when**: AGE-157 progresses; OR if the PP-001 push-based registry ships and displaces both the Rust private-layout fallback AND the scripts (drift collapses).
+
+### AGE-149 — Bootstrap exception ratification
+
+- **Source**: implementation-pipeline-orchestrator Phase 4 code-quality gate on AGE-149. Phase 3 proposal at `/home/nes/projects/agent-runner/planning/age-149-inherited-debt-cleanup/proposals/age-149-AGE-149.md` § `Bootstrap exception declaration` carries all 12 parser-required fields (`declared`, `code_quality_gate`, `measured_metric`, `expected_non_low_verdict`, `finding_ids`, `intrinsic_lockstep_paths`, `metric_change_refs`, `post_merge_new_rule_evidence`, `primary_deliverable_fixes_or_extends_metric`, `non_low_finding_is_intrinsic_lockstep`, `post_merge_satisfies_new_rule_under_new_metric`, `declared_for_phase_4_ratification`). The orchestrator's Phase 4 sub-gate parses this entry plus the proposal declaration and emits a `bootstrap-exception` join-manifest row when both match.
+- **Decision**: Apply Phase 4 bootstrap-exception per `~/ai/conventions/code-quality.md` § `Bootstrap exception`. AGE-149 is the cleanup-target WU for the post-AGE-147 + post-AGE-148 inherited multi-classifier debt on the touched-file ownership set (`crates/oulipoly-state/src/db.rs`, `src-tauri/src/main.rs`, `crates/oulipoly-runtime/src/services/mod.rs`, `crates/oulipoly-runtime/src/session_metadata/mod.rs`, `crates/oulipoly-state/src/migrations.rs`, `crates/oulipoly-state/src/schema.rs`, and the named state-crate test files).
+- **Canonical authority**: `~/ai/conventions/code-quality.md` § `Bootstrap exception`. The four conditions are argued by the Phase 3 proposer; this DECISIONS entry is the ratification record the Phase 4 sub-gate's parser cites.
+- **Four-condition check** (ratified here):
+  1. **Primary deliverable fixes or extends the metric**: TRUE. AGE-149's primary deliverable IS the inherited multi-classifier function / cohesion / coupling / push-pull debt cleanup on the touched-file ownership set. The pre-implementation findings ARE the exact metric state the WU's refactor fixes. AGE-149 is the cleanup-target WU; debt ratification + repair IS the metric fix.
+  2. **Non-LOW finding is intrinsic-lockstep with the refactor**: TRUE. The multi-classifier functions, missing declared-role cohesion fingerprints, raw-coupling external-symbol thresholds, and inferred-from-diagnostic push-pull substrings cannot pre-exist as LOW because the refactor itself produces them as LOW; the pre-implementation files ARE the audit target and ARE the surface being refactored under ACR-249 whole-file ownership.
+  3. **Post-merge satisfies the new rule under the new metric**: TRUE. Phase 6 per-component code-quality fanout requires LOW on each required A1/A6 auditor for every emitted component before that component closes into the aggregate diff consumed by Phase 8. Bootstrap-exception releases Phase 4 PRE-implementation only; the post-implementation per-component LOW is the actual ship gate.
+  4. **Declared for Phase 4 ratification**: TRUE. Proposal § `Bootstrap exception declaration` carries `declared_for_phase_4_ratification: true` and all 11 sibling fields. This DECISIONS entry is the ratification record.
+- **Forbidden behaviors reaffirmed**:
+  - This ratification is bounded to AGE-149. NO precedent-citation of this AGE-149 bootstrap-exception for OTHER WUs unless they independently meet the four conditions per `~/ai/conventions/code-quality.md` § `Bootstrap exception`.
+  - NO residual acceptance on Phase 6 per-component code-quality fanout. The bootstrap-exception releases Phase 4 only; Phase 6 per-component fanout must return LOW on the actually-refactored post-implementation surface for every emitted component.
+  - NO bootstrap-exception use without verifiable four-condition check.
+- **Evidence**:
+  - Proposal: `/home/nes/projects/agent-runner/planning/age-149-inherited-debt-cleanup/proposals/age-149-AGE-149.md` § `Bootstrap exception declaration`
+  - Phase 2.5 risk profile (HIGH WU-level): `/home/nes/projects/agent-runner/planning/age-149-inherited-debt-cleanup/risk/age-149-risk-profile.md`
+  - Parent inherited evidence (AGE-147 r1 final + AGE-148 r4 informational): `/home/nes/projects/agent-runner/planning/age-147-declared-roles-cleanup/code-quality/age-147-phase-4/findings.md` and `/home/nes/projects/agent-runner/planning/age-148-feature-integration/code-quality/age-148-phase-4-r4/findings.md`
+  - Audit-history bootstrap: `/home/nes/projects/agent-runner/planning/age-149-inherited-debt-cleanup/audit-history.md`
+- **Revisit when**: never for AGE-149 specifically (this is the WU's bootstrap moment). The metric will return to LOW post-refactor via Phase 6 per-component fanout; subsequent feature WUs touching the same ownership set inherit the LOW baseline.

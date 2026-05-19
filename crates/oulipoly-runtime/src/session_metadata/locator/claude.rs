@@ -1,3 +1,8 @@
+//! ## Declared roles
+//! accessor, filter, formatter, mapper, validator
+//!
+//! AGE-137 Claude storage locator contract for transcript lookup.
+
 use super::{
     LocatedTranscript, LocatorError, LocatorSource, SessionStorageType, TranscriptLocator,
     TranscriptLookupMode, TranscriptRequest, UnsupportedStorageReason, located, no_locator,

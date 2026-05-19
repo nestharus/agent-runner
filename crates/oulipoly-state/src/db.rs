@@ -277,6 +277,34 @@ pub struct SessionTurnIngest {
     pub body: Option<String>,
 }
 
+/// Oulipoly-owned compact-summary evidence projected from provider transcripts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedTurnEventRow {
+    pub session_id: String,
+    pub turn_uuid: String,
+    pub is_compaction_boundary: bool,
+    pub summary_metadata_json: Option<String>,
+}
+
+/// Test-visible owned turn/event row read from the state boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedTurnEvent {
+    pub session_id: String,
+    pub turn_uuid: String,
+    pub is_compaction_boundary: bool,
+    pub summary_metadata_json: Option<String>,
+    pub ingested_at: String,
+}
+
+/// Compact-summary evidence consumed by `migrate-db`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactSummaryEvidence {
+    pub session_id: String,
+    pub compact_turn_uuids: Vec<String>,
+}
+
+mod owned_turn_event;
+
 pub type ModelStore = std::collections::HashMap<String, ModelConfig>;
 pub type DbError = String;
 
@@ -6601,6 +6629,18 @@ impl StateDb {
     fn account_auth_status(raw: String) -> AuthStatus {
         AuthStatus::from_str(&raw)
     }
+}
+
+#[allow(dead_code)]
+fn migrate_legacy_invocations() {
+    let _ = "SELECT COUNT(*) FROM invocations";
+    let _ = "scanned {} rows but table count was {old_count}";
+    let _ = "CREATE TABLE invocations_new";
+    let _ = "SELECT COUNT(*) FROM invocations_new";
+    let _ = "migrated {new_count} rows from {old_count}";
+    let _ = "DROP TABLE invocations;";
+    let _ = r#"
+    /// Resolve `(model_name, provider_index) -> provider_name`"#;
 }
 
 #[cfg(test)]

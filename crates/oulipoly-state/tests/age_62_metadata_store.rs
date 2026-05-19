@@ -1,3 +1,6 @@
+//! ## Declared roles
+//! orchestration, accessor, mapper, parser, filter, predicate, validator, formatter
+//!
 mod fixtures;
 
 use fixtures::age_62_deployment_fixtures::{
@@ -129,6 +132,7 @@ fn deployment_fixture_schema_declares_all_metadata_families_without_queue_rows()
     assert!(!coordinator_tables_sql().contains("write_queue"));
 }
 
+// Declared role: accessor
 fn coordinator_table_names(conn: &Connection) -> Vec<String> {
     let mut tables = conn
         .prepare(
@@ -144,6 +148,7 @@ fn coordinator_table_names(conn: &Connection) -> Vec<String> {
         .unwrap()
 }
 
+// Declared role: accessor
 fn sorted_coordinator_table_names(conn: &Connection) -> Vec<String> {
     let mut tables = conn
         .prepare(

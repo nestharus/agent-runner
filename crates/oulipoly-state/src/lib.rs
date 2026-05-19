@@ -22,6 +22,7 @@ pub use db::{
     SessionMarkerPayload, TurnPreview, WrongIdKindInput,
 };
 pub use db::{CliMapping, DiscoveredModel, ModelParameter, ParamType};
+pub use db::{CompactSummaryEvidence, OwnedTurnEvent, OwnedTurnEventRow};
 pub use db::{CompositeInvocationId, InvocationRecord, InvocationStart, InvocationStatus};
 pub use db::{QuotaRecord, QuotaWindow, QuotaWindowInput};
 pub use deployment::{

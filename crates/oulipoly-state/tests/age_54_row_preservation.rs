@@ -383,11 +383,13 @@ struct InvocationSnapshot {
     parent_links: Vec<(String, Option<String>)>,
 }
 
+// Declared role: accessor
 fn invocation_snapshot(path: &Path) -> InvocationSnapshot {
     let conn = Connection::open(path).unwrap();
     invocation_snapshot_from_conn(path, &conn)
 }
 
+// Declared role: mapper
 fn invocation_snapshot_from_conn(path: &Path, conn: &Connection) -> InvocationSnapshot {
     InvocationSnapshot {
         user_version: user_version(conn),
@@ -397,16 +399,19 @@ fn invocation_snapshot_from_conn(path: &Path, conn: &Connection) -> InvocationSn
     }
 }
 
+// Declared role: accessor
 fn raw_invocation_count(path: &Path) -> i64 {
     let conn = Connection::open(path).unwrap();
     count_rows(&conn, "invocations")
 }
 
+// Declared role: orchestration
 fn invocation_uuids(path: &Path) -> Vec<String> {
     let columns = table_columns(path, "invocations");
     invocation_uuids_for_columns(path, &columns)
 }
 
+// Declared role: orchestration
 fn invocation_uuids_for_columns(path: &Path, columns: &[String]) -> Vec<String> {
     if !has_invocation_uuid_column(columns) {
         return Vec::new();
@@ -414,10 +419,12 @@ fn invocation_uuids_for_columns(path: &Path, columns: &[String]) -> Vec<String> 
     select_invocation_uuids(path)
 }
 
+// Declared role: predicate
 fn has_invocation_uuid_column(columns: &[String]) -> bool {
     columns.iter().any(|column| column == "invocation_uuid")
 }
 
+// Declared role: accessor
 fn select_invocation_uuids(path: &Path) -> Vec<String> {
     let conn = Connection::open(path).unwrap();
     conn.prepare("SELECT invocation_uuid FROM invocations ORDER BY id")
@@ -428,6 +435,7 @@ fn select_invocation_uuids(path: &Path) -> Vec<String> {
         .unwrap()
 }
 
+// Declared role: accessor
 fn parent_links(path: &Path) -> Vec<(String, Option<String>)> {
     let conn = Connection::open(path).unwrap();
     conn.prepare(parent_links_sql())
@@ -438,6 +446,7 @@ fn parent_links(path: &Path) -> Vec<(String, Option<String>)> {
         .unwrap()
 }
 
+// Declared role: accessor
 fn parent_links_sql() -> &'static str {
     "SELECT child.invocation_uuid, parent.invocation_uuid
          FROM invocations child
@@ -445,15 +454,18 @@ fn parent_links_sql() -> &'static str {
          ORDER BY child.id"
 }
 
+// Declared role: mapper
 fn parent_link_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(String, Option<String>)> {
     Ok((row.get(0)?, row.get(1)?))
 }
 
+// Declared role: accessor
 fn table_columns(path: &Path, table: &str) -> Vec<String> {
     let conn = Connection::open(path).unwrap();
     query_table_columns(&conn, &table_info_sql(table))
 }
 
+// Declared role: accessor
 fn query_table_columns(conn: &Connection, sql: &str) -> Vec<String> {
     conn.prepare(sql)
         .unwrap()
@@ -463,15 +475,18 @@ fn query_table_columns(conn: &Connection, sql: &str) -> Vec<String> {
         .unwrap()
 }
 
+// Declared role: formatter
 fn table_info_sql(table: &str) -> String {
     format!("PRAGMA table_info({table})")
 }
 
+// Declared role: validator
 fn assert_provider_session_index_exists(path: &Path) {
     let indexes = invocation_index_names(path);
     assert_contains_provider_session_index(&indexes);
 }
 
+// Declared role: accessor
 fn invocation_index_names(path: &Path) -> Vec<String> {
     let conn = Connection::open(path).unwrap();
     conn.prepare(invocation_index_names_sql())
@@ -482,12 +497,14 @@ fn invocation_index_names(path: &Path) -> Vec<String> {
         .unwrap()
 }
 
+// Declared role: accessor
 fn invocation_index_names_sql() -> &'static str {
     "SELECT name FROM sqlite_schema
              WHERE type = 'index' AND tbl_name = 'invocations'
              ORDER BY name"
 }
 
+// Declared role: validator
 fn assert_contains_provider_session_index(indexes: &[String]) {
     assert!(
         indexes.contains(&"idx_invocations_provider_provider_session".to_string()),
@@ -495,6 +512,7 @@ fn assert_contains_provider_session_index(indexes: &[String]) {
     );
 }
 
+// Declared role: validator
 fn assert_dual_id_backfill_matrix(path: &Path) {
     assert_eq!(
         actual_dual_id_backfill_rows(path),
@@ -510,6 +528,7 @@ type DualIdBackfillRow = (
     Option<String>,
 );
 
+// Declared role: accessor
 fn actual_dual_id_backfill_rows(path: &Path) -> Vec<DualIdBackfillRow> {
     let conn = Connection::open(path).unwrap();
     conn.prepare(
@@ -524,6 +543,7 @@ fn actual_dual_id_backfill_rows(path: &Path) -> Vec<DualIdBackfillRow> {
     .unwrap()
 }
 
+// Declared role: mapper
 fn dual_id_backfill_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DualIdBackfillRow> {
     Ok((
         row.get(0)?,
@@ -534,6 +554,7 @@ fn dual_id_backfill_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DualIdBackf
     ))
 }
 
+// Declared role: accessor
 fn expected_dual_id_backfill_rows() -> Vec<DualIdBackfillRow> {
     vec![
         (
@@ -595,17 +616,20 @@ fn expected_dual_id_backfill_rows() -> Vec<DualIdBackfillRow> {
     ]
 }
 
+// Declared role: parser
 fn extract_function_body<'a>(source: &'a str, name: &str) -> &'a str {
     let span = function_source_span(source, name);
     &source[span]
 }
 
+// Declared role: parser
 fn function_source_span(source: &str, name: &str) -> std::ops::Range<usize> {
     let start = function_start(source, name);
     let end = function_end(source, start, name);
     start..end
 }
 
+// Declared role: parser
 fn function_start(source: &str, name: &str) -> usize {
     let signature = format!("fn {name}");
     source.find(&signature).unwrap_or_else(|| {
@@ -613,6 +637,7 @@ fn function_start(source: &str, name: &str) -> usize {
     })
 }
 
+// Declared role: parser
 fn function_end(source: &str, start: usize, name: &str) -> usize {
     let end_marker = "\n    /// Resolve `(model_name, provider_index) -> provider_name`";
     source[start..]
@@ -621,8 +646,15 @@ fn function_end(source: &str, start: usize, name: &str) -> usize {
         .unwrap_or_else(|| panic!("missing end marker after function {name}"))
 }
 
+// Declared role: orchestration
 fn build_exact_legacy_pre_uuid_shape(path: &Path) {
     let conn = Connection::open(path).unwrap();
+    create_exact_legacy_pre_uuid_schema(&conn);
+    seed_exact_legacy_pre_uuid_rows(&conn);
+}
+
+// Declared role: accessor
+fn create_exact_legacy_pre_uuid_schema(conn: &Connection) {
     conn.execute_batch(
         "
         PRAGMA user_version = 5;
@@ -699,16 +731,36 @@ fn build_exact_legacy_pre_uuid_shape(path: &Path) {
         ",
     )
     .unwrap();
-    for (model, success, exit_code, created_at) in [
+}
+
+// Declared role: accessor
+fn seed_exact_legacy_pre_uuid_rows(conn: &Connection) {
+    for (model, success, exit_code, created_at) in legacy_pre_uuid_rows() {
+        insert_exact_legacy_pre_uuid_row(conn, model, success, exit_code, created_at);
+    }
+}
+
+// Declared role: accessor
+fn legacy_pre_uuid_rows() -> [(&'static str, i64, i64, &'static str); 2] {
+    [
         ("fixture-model", 1, 0, "2026-05-04T00:00:00Z"),
         ("missing-model", 0, 7, "2026-05-04T00:01:00Z"),
-    ] {
-        conn.execute(
-            "INSERT INTO invocations
+    ]
+}
+
+// Declared role: accessor
+fn insert_exact_legacy_pre_uuid_row(
+    conn: &Connection,
+    model: &str,
+    success: i64,
+    exit_code: i64,
+    created_at: &str,
+) {
+    conn.execute(
+        "INSERT INTO invocations
                 (model_name, provider_index, success, exit_code, error_category, created_at)
              VALUES (?1, 0, ?2, ?3, NULL, ?4)",
-            params![model, success, exit_code, created_at],
-        )
-        .unwrap();
-    }
+        params![model, success, exit_code, created_at],
+    )
+    .unwrap();
 }

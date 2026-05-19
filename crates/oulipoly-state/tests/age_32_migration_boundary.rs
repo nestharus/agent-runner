@@ -253,8 +253,8 @@ fn ti_10_age_54_schema4_plan_contains_only_schema5_step() {
         plan.iter()
             .map(|migration| migration.target_version)
             .collect::<Vec<_>>(),
-        vec![5, 6, CURRENT_SCHEMA_VERSION],
-        "schema-4 DBs must take the AGE-54 schema-5 migration and current schema migration"
+        vec![5, 6, 7, CURRENT_SCHEMA_VERSION],
+        "schema-4 DBs must take the AGE-54 schema-5, AGE-58 schema-6, AGE-123 schema-7, and PP-002 schema-8 migrations"
     );
     assert_eq!(
         plan.iter()
@@ -263,7 +263,8 @@ fn ti_10_age_54_schema4_plan_contains_only_schema5_step() {
         vec![
             "0005_invocation_dual_session_ids",
             "0006_age_58_dual_write_row_versions",
-            "0007_age_123_resume_provider_identity"
+            "0007_age_123_resume_provider_identity",
+            "0008_owned_turn_events",
         ]
     );
 }
@@ -382,8 +383,9 @@ fn ti_38_versionless_unrecognized_shape_fails_closed_without_mutation() {
 
 #[test]
 fn ti_40_legacy_repair_helpers_are_allow_listed_and_migration_represented() {
-    let db_source = include_str!("../src/db.rs");
-    let helper_names = find_ensure_schema_helpers(db_source);
+    let db_source = legacy_repair_source();
+    assert_legacy_repair_source_uses_runtime_helper_bodies(&db_source);
+    let helper_names = find_ensure_schema_helpers(&db_source);
     let allowed: BTreeSet<&str> = [
         "ensure_invocations_schema",
         "ensure_providers_schema",
@@ -418,7 +420,7 @@ fn ti_40_legacy_repair_helpers_are_allow_listed_and_migration_represented() {
         "ensure_provider_quota_windows_schema",
         "backfill_session_chains",
     ] {
-        let body = extract_function_body(db_source, helper);
+        let body = extract_function_body(&db_source, helper);
         for statement in mutating_sql_statements(&body) {
             let normalized = normalize_sql(&statement);
             assert!(
@@ -429,6 +431,24 @@ fn ti_40_legacy_repair_helpers_are_allow_listed_and_migration_represented() {
     }
 }
 
+// Declared role: accessor
+fn legacy_repair_source() -> String {
+    include_str!("../src/db.rs").to_string()
+}
+
+// Declared role: validator
+fn assert_legacy_repair_source_uses_runtime_helper_bodies(source: &str) {
+    assert!(
+        source.contains("fn apply_current_schema_repairs"),
+        "legacy repair validation must inspect the StateDb::open helper bodies"
+    );
+    assert!(
+        source.contains("pub fn backfill_session_chains"),
+        "legacy repair validation must inspect the backfill helper body"
+    );
+}
+
+// Declared role: mapper
 fn normalized_schema(conn: &Connection) -> BTreeMap<String, String> {
     schema_rows(conn)
         .into_iter()
@@ -443,6 +463,7 @@ struct SchemaRow {
     sql: String,
 }
 
+// Declared role: accessor
 fn schema_rows(conn: &Connection) -> Vec<SchemaRow> {
     let mut stmt = conn
         .prepare(
@@ -464,16 +485,19 @@ fn schema_rows(conn: &Connection) -> Vec<SchemaRow> {
     .unwrap()
 }
 
+// Declared role: mapper
 fn normalized_schema_entry(row: SchemaRow) -> (String, String) {
     (schema_key(&row), normalize_sql(&row.sql))
 }
 
+// Declared role: formatter
 fn schema_key(row: &SchemaRow) -> String {
     format!("{}:{}:{}", row.object_type, row.name, row.table_name)
 }
 
 type ForeignKeyEdge = (String, String);
 
+// Declared role: accessor
 fn memory_edge_foreign_keys(conn: &Connection) -> Vec<ForeignKeyEdge> {
     let mut stmt = conn
         .prepare("PRAGMA foreign_key_list(memory_edges)")
@@ -484,22 +508,27 @@ fn memory_edge_foreign_keys(conn: &Connection) -> Vec<ForeignKeyEdge> {
         .unwrap()
 }
 
+// Declared role: mapper
 fn foreign_key_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<ForeignKeyEdge> {
     Ok((row.get(2)?, row.get(3)?))
 }
 
+// Declared role: predicate
 fn has_required_memory_edge_foreign_keys(rows: &[ForeignKeyEdge]) -> bool {
     rows.contains(&memory_node_source_edge()) && rows.contains(&memory_node_target_edge())
 }
 
+// Declared role: accessor
 fn memory_node_source_edge() -> ForeignKeyEdge {
     ("memory_nodes".to_string(), "source_id".to_string())
 }
 
+// Declared role: accessor
 fn memory_node_target_edge() -> ForeignKeyEdge {
     ("memory_nodes".to_string(), "target_id".to_string())
 }
 
+// Declared role: parser
 fn find_ensure_schema_helpers(source: &str) -> Vec<String> {
     source
         .lines()
@@ -507,6 +536,7 @@ fn find_ensure_schema_helpers(source: &str) -> Vec<String> {
         .collect()
 }
 
+// Declared role: parser
 fn parse_ensure_schema_helper_name(line: &str) -> Option<String> {
     let rest = ensure_schema_function_tail(line)?;
     let name_tail = function_name_tail(rest)?;
@@ -514,28 +544,36 @@ fn parse_ensure_schema_helper_name(line: &str) -> Option<String> {
     is_schema_helper_name(&name).then_some(name)
 }
 
+// Declared role: parser
 fn ensure_schema_function_tail(line: &str) -> Option<&str> {
-    line.trim_start().strip_prefix("fn ensure_")
+    line.trim_start()
+        .split_once("fn ensure_")
+        .map(|(_, rest)| rest)
 }
 
+// Declared role: parser
 fn function_name_tail(rest: &str) -> Option<&str> {
     let (name_tail, _) = rest.split_once('(')?;
     Some(name_tail)
 }
 
+// Declared role: formatter
 fn ensure_schema_name(name_tail: &str) -> String {
     format!("ensure_{name_tail}")
 }
 
+// Declared role: predicate
 fn is_schema_helper_name(name: &str) -> bool {
     name.ends_with("_schema")
 }
 
+// Declared role: parser
 fn extract_function_body(source: &str, function_name: &str) -> String {
     let body_range = function_body_range(source, function_name);
     source[body_range].to_string()
 }
 
+// Declared role: parser
 fn function_body_range(source: &str, function_name: &str) -> Range<usize> {
     let start = function_start(source, function_name);
     let brace_start = opening_brace(source, start);
@@ -543,16 +581,19 @@ fn function_body_range(source: &str, function_name: &str) -> Range<usize> {
     brace_start..end
 }
 
+// Declared role: parser
 fn function_start(source: &str, function_name: &str) -> usize {
     source
-        .find(&format!("fn {function_name}"))
+        .find(&format!("{function_name}("))
         .unwrap_or_else(|| panic!("missing function {function_name}"))
 }
 
+// Declared role: parser
 fn opening_brace(source: &str, start: usize) -> usize {
     source[start..].find('{').unwrap() + start
 }
 
+// Declared role: parser
 fn closing_brace(source: &str, brace_start: usize) -> usize {
     let mut depth = 0usize;
     let mut end = brace_start;
@@ -572,6 +613,7 @@ fn closing_brace(source: &str, brace_start: usize) -> usize {
     end
 }
 
+// Declared role: filter
 fn mutating_sql_statements(rust_body: &str) -> Vec<String> {
     extract_rust_string_literals(rust_body)
         .into_iter()
@@ -580,6 +622,7 @@ fn mutating_sql_statements(rust_body: &str) -> Vec<String> {
         .collect()
 }
 
+// Declared role: parser
 fn sql_statements_from_literal(literal: String) -> Vec<String> {
     strip_sql_comments(&literal)
         .split(';')
@@ -588,6 +631,7 @@ fn sql_statements_from_literal(literal: String) -> Vec<String> {
         .collect()
 }
 
+// Declared role: parser
 fn extract_rust_string_literals(source: &str) -> Vec<String> {
     let bytes = source.as_bytes();
     let mut literals = Vec::new();
@@ -618,6 +662,7 @@ fn extract_rust_string_literals(source: &str) -> Vec<String> {
     literals
 }
 
+// Declared role: parser
 fn strip_sql_comments(sql: &str) -> String {
     sql.lines()
         .map(|line| line.split_once("--").map_or(line, |(prefix, _)| prefix))
@@ -625,8 +670,13 @@ fn strip_sql_comments(sql: &str) -> String {
         .join("\n")
 }
 
+// Declared role: predicate
 fn is_schema_mutation(statement: &str) -> bool {
-    let normalized = normalize_sql(statement);
+    is_normalized_schema_mutation(&normalize_sql(statement))
+}
+
+// Declared role: predicate
+fn is_normalized_schema_mutation(normalized: &str) -> bool {
     [
         "alter table",
         "create table",
@@ -639,6 +689,7 @@ fn is_schema_mutation(statement: &str) -> bool {
         || (normalized.contains("alter table") && normalized.contains(" rename "))
 }
 
+// Declared role: formatter
 fn normalize_sql(sql: &str) -> String {
     sql.split_whitespace()
         .collect::<Vec<_>>()
@@ -646,6 +697,7 @@ fn normalize_sql(sql: &str) -> String {
         .to_ascii_lowercase()
 }
 
+// Declared role: accessor
 fn cwd_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))

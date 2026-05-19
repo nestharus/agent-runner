@@ -30,6 +30,7 @@ mod fixtures;
 
 use fixtures::schema5_invocations::build_schema5_invocation_fixture;
 use fixtures::{count_rows, seed_representative_state_rows, user_version};
+use oulipoly_state::CURRENT_SCHEMA_VERSION;
 use oulipoly_state::deployment::row_version::checksum::payload_hash_for_columns;
 use oulipoly_state::migrations;
 use rusqlite::Connection;
@@ -50,26 +51,28 @@ fn ti_04_loader_level_idempotence_preserves_representative_rows() {
             .collect::<Vec<_>>(),
         vec![
             "0006_age_58_dual_write_row_versions",
-            "0007_age_123_resume_provider_identity"
+            "0007_age_123_resume_provider_identity",
+            "0008_owned_turn_events",
         ]
     );
 
     migrations::run_with_db_path(&mut conn, &plan, db_path.clone()).unwrap();
-    assert_eq!(user_version(&conn), 7);
+    assert_eq!(user_version(&conn), CURRENT_SCHEMA_VERSION);
     let after_first = capture_representative_seed(&conn);
 
-    let empty_plan = migrations::current_plan_from(7).unwrap();
+    let empty_plan = migrations::current_plan_from(CURRENT_SCHEMA_VERSION).unwrap();
     assert!(
         empty_plan.is_empty(),
-        "schema-7 DBs must not replay migrations through the migration loader"
+        "current-schema DBs must not replay completed migrations through the migration loader"
     );
     migrations::run_with_db_path(&mut conn, &empty_plan, db_path.clone()).unwrap();
-    assert_eq!(user_version(&conn), 7);
+    assert_eq!(user_version(&conn), CURRENT_SCHEMA_VERSION);
     let after_second = capture_representative_seed(&conn);
 
     assert_eq!(after_second, after_first);
 }
 
+// Declared role: orchestration
 fn build_representative_schema5_fixture(path: &Path) {
     build_schema5_invocation_fixture(path);
     let conn = Connection::open(path).unwrap();
@@ -77,6 +80,7 @@ fn build_representative_schema5_fixture(path: &Path) {
     seed_schema5_age61_tables(&conn);
 }
 
+// Declared role: accessor
 fn seed_schema5_age61_tables(conn: &Connection) {
     // This fixture covers the v5 path where the returned-artifacts table
     // already exists; the pragma test covers 0006 creating it when absent.
@@ -144,6 +148,7 @@ struct TableSeedSnapshot {
     payload_hash: [u8; 32],
 }
 
+// Declared role: accessor
 fn capture_representative_seed(conn: &Connection) -> Vec<TableSeedSnapshot> {
     representative_seed_queries()
         .into_iter()
@@ -151,6 +156,7 @@ fn capture_representative_seed(conn: &Connection) -> Vec<TableSeedSnapshot> {
         .collect()
 }
 
+// Declared role: mapper
 fn table_seed_snapshot(
     conn: &Connection,
     table: &'static str,
@@ -158,11 +164,22 @@ fn table_seed_snapshot(
 ) -> TableSeedSnapshot {
     TableSeedSnapshot {
         table,
-        row_count: count_rows(conn, table),
-        payload_hash: payload_hash_for_values(&payload_values_for_query(conn, sql)),
+        row_count: table_row_count(conn, table),
+        payload_hash: payload_hash_for_query(conn, sql),
     }
 }
 
+// Declared role: accessor
+fn table_row_count(conn: &Connection, table: &str) -> i64 {
+    count_rows(conn, table)
+}
+
+// Declared role: mapper
+fn payload_hash_for_query(conn: &Connection, sql: &str) -> [u8; 32] {
+    payload_hash_for_values(&payload_values_for_query(conn, sql))
+}
+
+// Declared role: accessor
 fn representative_seed_queries() -> [(&'static str, &'static str); 16] {
     [
         (
@@ -260,17 +277,20 @@ fn representative_seed_queries() -> [(&'static str, &'static str); 16] {
     ]
 }
 
+// Declared role: accessor
 fn payload_values_for_query(conn: &Connection, sql: &str) -> Vec<Option<Value>> {
     let mut stmt = conn.prepare(sql).unwrap();
     stmt.query_row([], query_row_values).unwrap()
 }
 
+// Declared role: mapper
 fn query_row_values(row: &rusqlite::Row<'_>) -> rusqlite::Result<Vec<Option<Value>>> {
     (0..row.as_ref().column_count())
         .map(|idx| row.get::<_, Value>(idx).map(Some))
         .collect()
 }
 
+// Declared role: mapper
 fn payload_hash_for_values(values: &[Option<Value>]) -> [u8; 32] {
     payload_hash_for_columns(values)
 }

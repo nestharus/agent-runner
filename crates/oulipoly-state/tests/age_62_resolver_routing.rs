@@ -1,3 +1,6 @@
+//! ## Declared roles
+//! orchestration, accessor, mapper, parser, filter, predicate, validator, formatter
+//!
 mod fixtures;
 
 use fixtures::age_62_deployment_fixtures::{
@@ -194,6 +197,7 @@ fn resolver_never_names_a_queue_read_target_and_missing_pointer_is_no_primary() 
     );
 }
 
+// Declared role: mapper
 fn resolver_for(data_root: &Path) -> StateDbDeploymentResolver {
     let mut paths = DeploymentPaths::new_from_data_root(data_root.to_path_buf());
     paths.add_versioned(5, data_root.join("state.db.v5"));
@@ -202,11 +206,18 @@ fn resolver_for(data_root: &Path) -> StateDbDeploymentResolver {
 }
 
 #[allow(dead_code)]
+// Declared role: mapper
 fn _assert_pathbuf_signal(path: PathBuf) -> PathBuf {
     path
 }
 
+// Declared role: accessor
 fn recorded_open_default_path(resolved: ResolvedStateDb, _data_root: &Path) -> PathBuf {
+    single_recorded_open_default_path(&recorded_open_default_calls(resolved))
+}
+
+// Declared role: accessor
+fn recorded_open_default_calls(resolved: ResolvedStateDb) -> Vec<PathBuf> {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let snapshot = deployment_snapshot(resolved.schema_version, resolved.role);
     let opener = DeploymentAwareOpener::new(
@@ -219,11 +230,16 @@ fn recorded_open_default_path(resolved: ResolvedStateDb, _data_root: &Path) -> P
     let db = opener.open_default().unwrap();
     drop(db);
 
-    let calls = calls.lock().unwrap().clone();
-    assert_eq!(calls.len(), 1);
-    calls.into_iter().next().unwrap()
+    calls.lock().unwrap().clone()
 }
 
+// Declared role: validator
+fn single_recorded_open_default_path(calls: &[PathBuf]) -> PathBuf {
+    assert_eq!(calls.len(), 1);
+    calls.first().unwrap().clone()
+}
+
+// Declared role: orchestration
 fn assert_read_only_default_noop_selects_from_versioned_primary(
     data_root: &Path,
     current_schema_version: u32,
@@ -245,6 +261,7 @@ fn assert_read_only_default_noop_selects_from_versioned_primary(
     assert_read_only_db_can_noop_select(&opener, current_schema_version);
 }
 
+// Declared role: accessor
 fn routing_port_for(data_root: &Path, current_schema_version: u32) -> Arc<StoreBackedRoutingPort> {
     let store = SqliteDeploymentMetadataStore::open(data_root).unwrap();
     Arc::new(StoreBackedRoutingPort::new(
@@ -254,12 +271,14 @@ fn routing_port_for(data_root: &Path, current_schema_version: u32) -> Arc<StoreB
     ))
 }
 
+// Declared role: accessor
 fn resolve_seeded_primary(routing_port: &dyn DeploymentRoutingPort) -> ResolvedStateDb {
     routing_port
         .resolve_for_current_binary()
         .expect("seeded primary should resolve before opening")
 }
 
+// Declared role: validator
 fn assert_resolved_primary(
     resolved: &ResolvedStateDb,
     expected_path: &Path,
@@ -271,6 +290,7 @@ fn assert_resolved_primary(
     assert_eq!(resolved.role, expected_role);
 }
 
+// Declared role: validator
 fn assert_read_only_db_can_noop_select(
     opener: &DeploymentAwareOpener,
     current_schema_version: u32,
@@ -280,18 +300,21 @@ fn assert_read_only_db_can_noop_select(
     assert_eq!(read_select_one(&db), 1);
 }
 
+// Declared role: accessor
 fn read_user_version(db: &StateDb) -> i64 {
     db.connection()
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap()
 }
 
+// Declared role: accessor
 fn read_select_one(db: &StateDb) -> i64 {
     db.connection()
         .query_row("SELECT 1", [], |row| row.get(0))
         .unwrap()
 }
 
+// Declared role: validator
 fn assert_versioned_read_target(path: &Path, seeded_versioned_paths: &[PathBuf]) {
     assert!(
         !path.ends_with("state-deploy.db"),
@@ -315,15 +338,18 @@ struct RecordingStateDbOpener {
 }
 
 impl StateDbOpener for RecordingStateDbOpener {
+    // Declared role: validator
     fn open_default(&self) -> Result<StateDb, String> {
         panic!("deployment-aware opener must resolve and call open_at")
     }
 
+    // Declared role: accessor
     fn open_at(&self, path: &Path) -> Result<StateDb, String> {
         self.calls.lock().unwrap().push(path.to_path_buf());
         StateDb::open(Path::new(":memory:"))
     }
 
+    // Declared role: accessor
     fn open_in_memory(&self) -> StateDb {
         StateDb::open(Path::new(":memory:")).unwrap()
     }
@@ -336,20 +362,24 @@ struct StaticRoutingPort {
 }
 
 impl StaticRoutingPort {
+    // Declared role: mapper
     fn new(resolved: ResolvedStateDb, snapshot: DeploymentSnapshot) -> Self {
         Self { resolved, snapshot }
     }
 }
 
 impl DeploymentRoutingPort for StaticRoutingPort {
+    // Declared role: accessor
     fn resolve_for_current_binary(&self) -> Result<ResolvedStateDb, ResolveError> {
         Ok(self.resolved.clone())
     }
 
+    // Declared role: accessor
     fn resolve_read_only(&self) -> Result<ResolvedStateDb, ResolveError> {
         Ok(self.resolved.clone())
     }
 
+    // Declared role: accessor
     fn deployment_snapshot(&self) -> Result<DeploymentSnapshot, MetadataError> {
         Ok(self.snapshot.clone())
     }

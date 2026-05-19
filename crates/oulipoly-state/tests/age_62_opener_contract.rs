@@ -1,3 +1,6 @@
+//! ## Declared roles
+//! orchestration, accessor, mapper, parser, filter, predicate, validator, formatter
+//!
 mod fixtures;
 
 use fixtures::age_62_deployment_fixtures::{deployment_snapshot, pre_cutover_fixture};
@@ -104,20 +107,34 @@ fn deployment_aware_opener_consults_routing_port_before_opening_default() {
     assert_eq!(*calls.lock().unwrap(), vec![expected_path]);
 }
 
+// Declared role: mapper
 fn production_opener_for_path(
     expected_path: &Path,
     calls: Arc<Mutex<Vec<PathBuf>>>,
 ) -> ProductionStateDbOpener {
-    let resolved = ResolvedStateDb {
+    let resolved = resolved_pre_cutover_primary_for_path(expected_path);
+    let opener = deployment_aware_recording_opener(resolved, calls);
+    ProductionStateDbOpener::with_deployment_aware_opener(opener)
+}
+
+// Declared role: mapper
+fn resolved_pre_cutover_primary_for_path(expected_path: &Path) -> ResolvedStateDb {
+    ResolvedStateDb {
         path: expected_path.to_path_buf(),
         schema_version: 5,
         role: DbRole::PreCutoverPrimary,
-    };
-    let opener = DeploymentAwareOpener::new(
+    }
+}
+
+// Declared role: mapper
+fn deployment_aware_recording_opener(
+    resolved: ResolvedStateDb,
+    calls: Arc<Mutex<Vec<PathBuf>>>,
+) -> DeploymentAwareOpener {
+    DeploymentAwareOpener::new(
         Arc::new(RecordingStateDbOpener { calls }),
         Arc::new(StaticRoutingPort::new(resolved)),
-    );
-    ProductionStateDbOpener::with_deployment_aware_opener(opener)
+    )
 }
 
 struct RecordingStateDbOpener {
@@ -125,15 +142,18 @@ struct RecordingStateDbOpener {
 }
 
 impl StateDbOpener for RecordingStateDbOpener {
+    // Declared role: validator
     fn open_default(&self) -> Result<StateDb, String> {
         panic!("deployment-aware opener must resolve and call open_at")
     }
 
+    // Declared role: accessor
     fn open_at(&self, path: &Path) -> Result<StateDb, String> {
         self.calls.lock().unwrap().push(path.to_path_buf());
         StateDb::open(Path::new(":memory:"))
     }
 
+    // Declared role: accessor
     fn open_in_memory(&self) -> StateDb {
         StateDb::open(Path::new(":memory:")).unwrap()
     }
@@ -145,20 +165,24 @@ struct StaticRoutingPort {
 }
 
 impl StaticRoutingPort {
+    // Declared role: mapper
     fn new(resolved: ResolvedStateDb) -> Self {
         Self { resolved }
     }
 }
 
 impl DeploymentRoutingPort for StaticRoutingPort {
+    // Declared role: accessor
     fn resolve_for_current_binary(&self) -> Result<ResolvedStateDb, ResolveError> {
         Ok(self.resolved.clone())
     }
 
+    // Declared role: accessor
     fn resolve_read_only(&self) -> Result<ResolvedStateDb, ResolveError> {
         Ok(self.resolved.clone())
     }
 
+    // Declared role: accessor
     fn deployment_snapshot(&self) -> Result<DeploymentSnapshot, MetadataError> {
         Ok(deployment_snapshot(
             self.resolved.schema_version,

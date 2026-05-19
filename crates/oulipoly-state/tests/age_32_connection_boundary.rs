@@ -1,3 +1,6 @@
+//! ## Declared roles
+//! orchestration, accessor, mapper, parser, filter, predicate, validator, formatter
+//!
 #[test]
 fn ti_39_state_db_public_api_has_no_raw_mutable_connection_escape() {
     let db_source = include_str!("../src/db.rs");
