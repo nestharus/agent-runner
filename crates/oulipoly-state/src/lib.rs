@@ -1,5 +1,6 @@
 mod db;
 pub mod deployment;
+mod lifecycle_log;
 pub mod migrations;
 pub mod repositories;
 pub mod schema;
@@ -27,6 +28,7 @@ pub use deployment::{
     DbRole, DeploymentAwareOpener, DeploymentMetadataStore, DeploymentRoutingDecision,
     DeploymentRoutingPort, ResolveError, ResolvedStateDb, StoreBackedRoutingPort,
 };
+pub use lifecycle_log::{LifecycleEventSink, NoopLifecycleEventSink};
 
 #[cfg(doctest)]
 pub mod age_32_connection_boundary_doctest {

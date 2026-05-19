@@ -605,3 +605,65 @@ fn state_db_opener_delegates_open_at_and_in_memory_policies() {
         <StateDb as InvocationRepository>::start_invocation(&memory, memory_start.clone()).unwrap();
     assert_eq!(memory_record.invocation_uuid, memory_start.invocation_uuid);
 }
+
+#[test]
+fn lifecycle_emission_does_not_break_existing_rows() {
+    let db = memory_db();
+    let parent_start = start_fixture("claude");
+    let parent =
+        <StateDb as InvocationRepository>::start_invocation(&db, parent_start.clone()).unwrap();
+
+    assert_eq!(parent.invocation_uuid, parent_start.invocation_uuid);
+    assert_eq!(parent.model_name, parent_start.model_name);
+    assert_eq!(parent.provider_name.as_deref(), Some("claude"));
+    assert_eq!(parent.status, InvocationStatus::Running);
+
+    <StateDb as InvocationRepository>::update_session_capture(
+        &db,
+        &parent.invocation_uuid,
+        Some("lifecycle-preserved-session"),
+        "forced_flag_verified",
+    )
+    .unwrap();
+    <StateDb as InvocationRepository>::finalize_invocation(
+        &db,
+        &parent.invocation_uuid,
+        InvocationStatus::Succeeded,
+        0,
+        None,
+        Some("done"),
+    )
+    .unwrap();
+
+    let finalized =
+        <StateDb as InvocationRepository>::get_invocation_by_uuid(&db, &parent.invocation_uuid)
+            .unwrap()
+            .unwrap();
+    assert_eq!(finalized.status, InvocationStatus::Succeeded);
+    assert_eq!(finalized.success, Some(true));
+    assert_eq!(finalized.exit_code, Some(0));
+    assert_eq!(
+        finalized.session_id.as_deref(),
+        Some("lifecycle-preserved-session")
+    );
+    assert_eq!(
+        finalized.session_capture_method.as_deref(),
+        Some("forced_flag_verified")
+    );
+
+    let child_uuid = uuid::Uuid::new_v4().to_string();
+    <StateDb as InvocationRepository>::start_invocation(
+        &db,
+        InvocationStart {
+            invocation_uuid: child_uuid.clone(),
+            parent_invocation_id: Some(parent.id),
+            ..start_fixture("claude")
+        },
+    )
+    .unwrap();
+    let children =
+        <StateDb as InvocationRepository>::list_invocation_children(&db, &parent.invocation_uuid)
+            .unwrap();
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].invocation_uuid, child_uuid);
+}

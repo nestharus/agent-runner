@@ -3045,3 +3045,18 @@ This is NOT residual acceptance, NOT precedent citation, and does NOT authorize 
   - Audit history (AGE-151 Round 0): `/home/nes/projects/agent-runner/planning/age-151-main-rs-cleanup/audit-history.md`
   - Sibling-shape precedents (per dispatch): AGE-132, AGE-137, ACR-209, AGE-147 ratifications (above in this DECISIONS.md and prior worktrees)
 - **Revisit when**: never for AGE-151 specifically (this is the WU's bootstrap moment, narrowly scoped to the AGE-140A `main.rs` whole-file cleanup decomposed from AGE-140). The post-merge LOW baseline becomes the working surface for AGE-140C signal-consumer wiring; if AGE-151's post-cleanup Phase 6 per-component CQ rerun cannot reach LOW, AGE-151 must decompose further per the dispatch's oscillation rule, not extend this ratification.
+
+### AGE-129 — Phase 2.5 duplicates drift handling
+
+- **Source**: implementation-pipeline-orchestrator Phase 2.5 step 2.5.4 duplicates inventory at `/home/nes/projects/agent-runner/planning/age-129-lifecycle-log-schema/research/age-129-duplicates.md` § 2 (Drift Discoveries).
+- **Drift items observed (silent divergence)**:
+  1. Result timestamp drift between `db.rs::finalize_invocation` and `src-tauri/src/main.rs` `OULIPOLY_RESULT` minting.
+  2. Session marker payload drift between CLI fallback in `src-tauri/src/main.rs:1491` and service path in `crates/oulipoly-runtime/src/services/mod.rs:1333` for `capture_method == "resumed"`.
+  3. Timestamp precision drift across adjacent JSON systems (`Utc::now().to_rfc3339()` vs `SecondsFormat::Secs` vs default RFC3339 in lock/replace paths).
+  4. JSONL durability drift between preserved AGE-122 `LifecycleLog::append_jsonl_record`, preserved AGE-122 `RawIoWriter`, returned-artifact channels, and session-lock atomic-write+fsync.
+- **Decision**: Proceed-with-note. AGE-129 is the narrowed AGE-122-B child (lifecycle_log + schema + db.rs callsites); these drift items are adjacent but out of AGE-129's anti-scope. The duplicates author flagged them as "the orchestrator should consider a tracker"; the caller brief specifies `PROCEED_EXHAUSTIVE` on defer-signals and selects narrow scope.
+- **Forbidden behaviors reaffirmed**:
+  - AGE-129 does NOT consolidate timestamp/marker/precision/JSONL durability across the workspace.
+  - AGE-129 only addresses the lifecycle event records emitted by the three named StateDb methods + the events.jsonl forward (delegated to AGE-130's sink).
+- **Evidence**: `/home/nes/projects/agent-runner/planning/age-129-lifecycle-log-schema/research/age-129-duplicates.md` § 2.
+- **Revisit when**: follow-up tracker may be filed manually if the user prefers; the drift items will surface again as consolidation candidates when AGE-130 (raw I/O writer) lands its events.jsonl sink and the lifecycle/raw-I/O pair is reviewed end-to-end.

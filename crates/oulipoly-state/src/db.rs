@@ -21,6 +21,10 @@
 //! `planning/age-132-db-rs-whole-file-cleanup/proposals/age-132-AGE-132.md`
 //! under `## Adapter declarations` and `## Intrinsic-surface declarations`.
 
+use crate::lifecycle_log::{
+    FinalizeContext, FinalizeOutcome, LifecycleEventSink, NoopLifecycleEventSink, RawArtifactPaths,
+    SessionContext, SessionOutcome, StartContext, StartOutcome,
+};
 use crate::migrations;
 use crate::schema::{
     CURRENT_SCHEMA_VERSION, MINIMUM_SUPPORTED_SCHEMA_VERSION, SchemaCompatibility,
@@ -33,6 +37,8 @@ use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction,
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::Instant;
 use uuid::Uuid;
 
 /// Ceiling on the per-turn burn rate that `upsert_quota_refresh` is willing
@@ -76,6 +82,7 @@ const NEAR_EXHAUSTED_USED_PERCENT: f64 = 0.99;
 pub struct StateDb {
     conn: Connection,
     db_path: PathBuf,
+    lifecycle_sink: Mutex<Box<dyn LifecycleEventSink + Send>>,
 }
 
 #[derive(Debug, Clone)]
@@ -738,6 +745,22 @@ struct InvocationIdentity {
     uuid: Uuid,
 }
 
+struct LifecycleInvocationRow {
+    invocation_uuid: String,
+    provider_name: Option<String>,
+    session_id: Option<String>,
+    provider_session_id: Option<String>,
+    resume_input_id: Option<String>,
+}
+
+struct FinalizeLifecycleInput<'a> {
+    success: bool,
+    exit_code: i32,
+    error_category: Option<&'a str>,
+    terminal_reason: Option<&'a str>,
+    operation_result: &'static str,
+}
+
 struct ReturnedArtifactRawRow {
     version_id: String,
     name: String,
@@ -818,6 +841,16 @@ struct ResumeChainCandidate {
 struct InvocationWindowTurnRow {
     session_id: String,
     timestamp_raw: String,
+}
+
+fn lifecycle_terminal_status(success: bool) -> &'static str {
+    if success { "success" } else { "failed" }
+}
+
+fn active_lifecycle_session_id(row: &LifecycleInvocationRow) -> Option<String> {
+    row.provider_session_id
+        .clone()
+        .or_else(|| row.session_id.clone())
 }
 
 // --- Model discovery entities ---
@@ -947,6 +980,13 @@ pub struct AccountRecord {
 
 impl StateDb {
     pub fn open(path: &Path) -> Result<Self, String> {
+        Self::open_with_sink(path, Box::new(NoopLifecycleEventSink))
+    }
+
+    pub fn open_with_sink(
+        path: &Path,
+        sink: Box<dyn LifecycleEventSink + Send>,
+    ) -> Result<Self, String> {
         Self::ensure_state_parent_dir(path)?;
         let mut conn =
             Connection::open(path).map_err(|e| format!("Failed to open state DB: {e}"))?;
@@ -956,6 +996,7 @@ impl StateDb {
         let db = StateDb {
             conn,
             db_path: path.to_path_buf(),
+            lifecycle_sink: Mutex::new(sink),
         };
         db.backfill_session_chains()
             .map_err(|e| format!("{e}; run `agents migrate-db` first"))?;
@@ -1088,6 +1129,7 @@ impl StateDb {
         Ok(Self {
             conn,
             db_path: path.to_path_buf(),
+            lifecycle_sink: Mutex::new(Box::new(NoopLifecycleEventSink)),
         })
     }
 
@@ -2490,22 +2532,92 @@ impl StateDb {
         })
     }
 
-    pub fn start_invocation(&self, start: &InvocationStart) -> Result<i64, String> {
-        let now = Utc::now().to_rfc3339();
-        self.insert_invocation_start_row(start, &now)?;
-        let row_id = self.conn.last_insert_rowid();
-        self.warn_invocation_artifact_failure(start, &now);
-        Ok(row_id)
+    fn lifecycle_context(&self, start: &InvocationStart) -> StartContext {
+        StartContext {
+            invocation_uuid: start.invocation_uuid.clone(),
+            provider_source: Some(start.provider_name.clone()),
+            chain_id: None,
+            session_id: None,
+            latency_us: 0,
+            model: Some(start.model_name.clone()),
+            provider: Some(start.provider_name.clone()),
+            parent_invocation_uuid: self.parent_invocation_uuid(start.parent_invocation_id),
+        }
     }
 
-    fn insert_invocation_start_row(
+    fn parent_invocation_uuid(&self, parent_id: Option<i64>) -> Option<String> {
+        let parent_id = parent_id?;
+        self.conn
+            .query_row(
+                "SELECT invocation_uuid FROM invocations WHERE id = ?1",
+                params![parent_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    fn raw_paths_for(&self, invocation_uuid: &str) -> Option<RawArtifactPaths> {
+        if self.db_path == Path::new(":memory:") {
+            return None;
+        }
+        let state_dir = self.db_path.parent()?;
+        let raw_io_dir = state_dir.join("invocations").join("raw-io");
+        Some(RawArtifactPaths {
+            stdout_path: raw_io_dir.join(format!("{invocation_uuid}.stdout")),
+            stderr_path: raw_io_dir.join(format!("{invocation_uuid}.stderr")),
+            result_path: raw_io_dir.join(format!("{invocation_uuid}.result")),
+            events_jsonl_path: raw_io_dir.join(format!("{invocation_uuid}.events.jsonl")),
+        })
+    }
+
+    fn emit_lifecycle_record(&self, record: serde_json::Value) {
+        let mut sink = self
+            .lifecycle_sink
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::lifecycle_log::emit_and_forward(sink.as_mut(), record);
+    }
+
+    pub fn start_invocation(&self, start: &InvocationStart) -> Result<i64, String> {
+        let mut context = self.lifecycle_context(start);
+        let entered_at = Instant::now();
+        let now = Utc::now().to_rfc3339();
+        match self.insert_invocation_start_row_raw(start, &now) {
+            Ok(row_id) => {
+                self.warn_invocation_artifact_failure(start, &now);
+                context.latency_us =
+                    crate::lifecycle_log::elapsed_micros_saturated(entered_at.elapsed());
+                let record = crate::lifecycle_log::build_start_record(
+                    &context,
+                    &StartOutcome {
+                        invocation_row_id: row_id,
+                    },
+                );
+                self.emit_lifecycle_record(record);
+                Ok(row_id)
+            }
+            Err(err) => {
+                let message = Self::format_insert_invocation_error(err);
+                context.latency_us =
+                    crate::lifecycle_log::elapsed_micros_saturated(entered_at.elapsed());
+                let lifecycle_error = std::io::Error::other(message.clone());
+                let record =
+                    crate::lifecycle_log::build_start_error_record(&context, &lifecycle_error);
+                self.emit_lifecycle_record(record);
+                Err(message)
+            }
+        }
+    }
+
+    fn insert_invocation_start_row_raw(
         &self,
         start: &InvocationStart,
         started_at: &str,
-    ) -> Result<(), String> {
-        self.conn
-            .execute(
-                "INSERT INTO invocations (
+    ) -> Result<i64, rusqlite::Error> {
+        self.conn.execute(
+            "INSERT INTO invocations (
                     invocation_uuid,
                     model_name,
                     provider_name,
@@ -2519,18 +2631,21 @@ impl StateDb {
                     created_at,
                     finished_at
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, NULL, ?7, NULL)",
-                params![
-                    &start.invocation_uuid,
-                    &start.model_name,
-                    &start.provider_name,
-                    start.provider_index as i64,
-                    start.parent_invocation_id,
-                    InvocationStatus::Running.as_str(),
-                    started_at,
-                ],
-            )
-            .map_err(|e| format!("Failed to insert invocation: {e}"))?;
-        Ok(())
+            params![
+                &start.invocation_uuid,
+                &start.model_name,
+                &start.provider_name,
+                start.provider_index as i64,
+                start.parent_invocation_id,
+                InvocationStatus::Running.as_str(),
+                started_at,
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    fn format_insert_invocation_error(err: rusqlite::Error) -> String {
+        format!("Failed to insert invocation: {err}")
     }
 
     fn warn_invocation_artifact_failure(&self, start: &InvocationStart, started_at: &str) {
@@ -2550,43 +2665,99 @@ impl StateDb {
         error_category: Option<&str>,
         terminal_reason: Option<&str>,
     ) -> Result<(), String> {
+        let lifecycle_row = self.lifecycle_context_for_row(id).ok().flatten();
+        let entered_at = Instant::now();
         let now = Utc::now().to_rfc3339();
-        let tx = self
-            .conn
-            .unchecked_transaction()
-            .map_err(|e| format!("Failed to begin invocation finalize tx: {e}"))?;
+        let result: Result<FinalizeInvocationRow, String> = (|| {
+            let tx = self
+                .conn
+                .unchecked_transaction()
+                .map_err(|e| format!("Failed to begin invocation finalize tx: {e}"))?;
 
-        let invocation = Self::load_invocation_for_finalize(&tx, id)?;
-        Self::validate_invocation_is_running(id, &invocation.status)?;
-        Self::write_invocation_final_row(
-            &tx,
-            id,
-            success,
-            exit_code,
-            error_category,
-            terminal_reason,
-            &now,
-        )?;
-        Self::upsert_provider_finalize_aggregate(
-            &tx,
-            &invocation.model_name,
-            invocation.provider_name.as_deref(),
-            success,
-            terminal_reason,
-            &now,
-        )?;
+            let invocation = Self::load_invocation_for_finalize(&tx, id)?;
+            Self::validate_invocation_is_running(id, &invocation.status)?;
+            Self::write_invocation_final_row(
+                &tx,
+                id,
+                success,
+                exit_code,
+                error_category,
+                terminal_reason,
+                &now,
+            )?;
+            Self::upsert_provider_finalize_aggregate(
+                &tx,
+                &invocation.model_name,
+                invocation.provider_name.as_deref(),
+                success,
+                terminal_reason,
+                &now,
+            )?;
 
-        tx.commit()
-            .map_err(|e| format!("Failed to commit invocation finalize tx: {e}"))?;
-        self.warn_result_artifact_failure(
-            &invocation.invocation_uuid,
-            success,
-            exit_code,
-            error_category,
-            terminal_reason,
-            &now,
-        );
-        Ok(())
+            tx.commit()
+                .map_err(|e| format!("Failed to commit invocation finalize tx: {e}"))?;
+            Ok(invocation)
+        })();
+
+        match result {
+            Ok(invocation) => {
+                self.warn_result_artifact_failure(
+                    &invocation.invocation_uuid,
+                    success,
+                    exit_code,
+                    error_category,
+                    terminal_reason,
+                    &now,
+                );
+                let mut context = self.finalize_context(
+                    id,
+                    lifecycle_row.as_ref(),
+                    FinalizeLifecycleInput {
+                        success,
+                        exit_code,
+                        error_category,
+                        terminal_reason,
+                        operation_result: crate::lifecycle_log::sqlite_error_result(),
+                    },
+                );
+                context.latency_us =
+                    crate::lifecycle_log::elapsed_micros_saturated(entered_at.elapsed());
+                let record = crate::lifecycle_log::build_finalize_record(
+                    &context,
+                    &FinalizeOutcome {
+                        terminal_status: lifecycle_terminal_status(success).to_string(),
+                    },
+                );
+                self.emit_lifecycle_record(record);
+                Ok(())
+            }
+            Err(message) => {
+                let operation_result =
+                    if lifecycle_row.is_none() && message == format!("Invocation {id} not found") {
+                        crate::lifecycle_log::context_resolution_error_result()
+                    } else {
+                        crate::lifecycle_log::sqlite_error_result()
+                    };
+                let mut context = self.finalize_context(
+                    id,
+                    lifecycle_row.as_ref(),
+                    FinalizeLifecycleInput {
+                        success,
+                        exit_code,
+                        error_category,
+                        terminal_reason,
+                        operation_result,
+                    },
+                );
+                context.latency_us =
+                    crate::lifecycle_log::elapsed_micros_saturated(entered_at.elapsed());
+                let lifecycle_error = std::io::Error::other(message.clone());
+                let record =
+                    crate::lifecycle_log::build_finalize_error_record(&context, &lifecycle_error);
+                self.emit_lifecycle_record(record);
+                Err(message)
+            }
+        }
     }
 
     fn load_invocation_for_finalize(
@@ -3111,8 +3282,24 @@ impl StateDb {
         session_id: Option<&str>,
         method: &str,
     ) -> Result<(), String> {
+        let lifecycle_row = self.lifecycle_context_for_row(id).ok().flatten();
+        let entered_at = Instant::now();
         let projection = Self::session_capture_projection(session_id, method);
-        self.persist_session_capture(id, session_id, method, projection)
+        let result = self.persist_session_capture(id, session_id, method, projection);
+        if let Some(row) = lifecycle_row.as_ref() {
+            let mut context = self.session_context(id, row, session_id, method);
+            context.latency_us =
+                crate::lifecycle_log::elapsed_micros_saturated(entered_at.elapsed());
+            let record = match &result {
+                Ok(()) => crate::lifecycle_log::build_session_record(&context, &SessionOutcome),
+                Err(message) => {
+                    let lifecycle_error = std::io::Error::other(message.clone());
+                    crate::lifecycle_log::build_session_error_record(&context, &lifecycle_error)
+                }
+            };
+            self.emit_lifecycle_record(record);
+        }
+        result
     }
 
     fn session_capture_projection<'a>(
@@ -3164,6 +3351,117 @@ impl StateDb {
             )
             .map_err(|e| format!("Failed to update session capture for invocation {id}: {e}"))?;
         Ok(())
+    }
+
+    fn lifecycle_context_for_row(
+        &self,
+        row_id: i64,
+    ) -> Result<Option<LifecycleInvocationRow>, String> {
+        self.conn
+            .query_row(
+                "SELECT i.invocation_uuid,
+                        i.provider_name,
+                        i.session_id,
+                        i.provider_session_id,
+                        i.resume_input_id
+                 FROM invocations i
+                 WHERE i.id = ?1",
+                params![row_id],
+                Self::map_lifecycle_invocation_row,
+            )
+            .optional()
+            .map_err(|e| format!("Failed to load invocation lifecycle context {row_id}: {e}"))
+    }
+
+    fn map_lifecycle_invocation_row(
+        row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<LifecycleInvocationRow> {
+        Ok(LifecycleInvocationRow {
+            invocation_uuid: row.get(0)?,
+            provider_name: row.get(1)?,
+            session_id: row.get(2)?,
+            provider_session_id: row.get(3)?,
+            resume_input_id: row.get(4)?,
+        })
+    }
+
+    fn session_context(
+        &self,
+        id: i64,
+        row: &LifecycleInvocationRow,
+        session_id: Option<&str>,
+        method: &str,
+    ) -> SessionContext {
+        let event_session_id = if method == "resumed" {
+            None
+        } else {
+            session_id.map(str::to_string)
+        };
+        SessionContext {
+            invocation_uuid: row.invocation_uuid.clone(),
+            provider_source: row.provider_name.clone(),
+            chain_id: self.chain_id_for(row.provider_name.as_deref(), event_session_id.as_deref()),
+            session_id: event_session_id,
+            latency_us: 0,
+            invocation_row_id: id,
+            capture_method: method.to_string(),
+            marker_emitted: true,
+            resume_input_id: if method == "resumed" {
+                session_id.map(str::to_string)
+            } else {
+                row.resume_input_id.clone()
+            },
+        }
+    }
+
+    fn finalize_context(
+        &self,
+        id: i64,
+        row: Option<&LifecycleInvocationRow>,
+        input: FinalizeLifecycleInput<'_>,
+    ) -> FinalizeContext {
+        let invocation_uuid = row
+            .map(|row| row.invocation_uuid.clone())
+            .unwrap_or_else(|| format!("unresolved-invocation-row-{id}"));
+        let session_id = row.and_then(active_lifecycle_session_id);
+        FinalizeContext {
+            invocation_uuid: invocation_uuid.clone(),
+            provider_source: row.and_then(|row| row.provider_name.clone()),
+            chain_id: self.chain_id_for(
+                row.and_then(|row| row.provider_name.as_deref()),
+                session_id.as_deref(),
+            ),
+            session_id,
+            latency_us: 0,
+            invocation_row_id: row.map(|_| id),
+            terminal_status_attempt: lifecycle_terminal_status(input.success).to_string(),
+            exit_code: input.exit_code,
+            error_category: input.error_category.map(str::to_string),
+            terminal_reason: input.terminal_reason.map(str::to_string),
+            raw_artifact_paths: self.raw_paths_for(&invocation_uuid),
+            operation_result: input.operation_result,
+        }
+    }
+
+    fn chain_id_for(
+        &self,
+        provider_name: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Option<String> {
+        let provider_name = provider_name?;
+        let session_id = session_id?;
+        self.conn
+            .query_row(
+                "SELECT chain_id
+                 FROM session_chain_segments
+                 WHERE provider_name = ?1 AND session_id = ?2
+                 LIMIT 1",
+                params![provider_name, session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
     }
 
     pub fn bind_invocation_provider_session_start(
