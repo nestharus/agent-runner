@@ -65,6 +65,8 @@ use uuid::Uuid;
 mod balanced_cli;
 mod cli_inputs;
 mod config_migration_cli;
+#[path = "main/owned_turn_event_ingest.rs"]
+mod owned_turn_event_ingest;
 mod repl_cli;
 mod resume_acceptance_adapter;
 mod resume_cli;
@@ -5270,7 +5272,9 @@ fn backfill_compaction_session(
     session_id: &str,
     path: &Path,
 ) -> Result<u64, String> {
-    flag_compaction_boundaries_from_jsonl(state, provider_name, session_id, path)
+    owned_turn_event_ingest::ingest_owned_turn_event_rows(state, provider_name, session_id, path)?;
+    let evidence = state.compact_summary_evidence(session_id).map_err(|e| e.to_string())?;
+    owned_turn_event_ingest::flag_compaction_boundaries_from_evidence(state, provider_name, &evidence)
 }
 
 fn accumulate_compaction_backfill(report: &mut CompactionBackfillReport, flagged: u64) {

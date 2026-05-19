@@ -1,3 +1,10 @@
+//! ## Declared roles
+//! accessor, formatter, mapper, parser, validator
+//!
+//! Configured transcript locator and AGE-137 provider-locator contract types.
+//! Provider-private storage scans are exposed through this stable trait while
+//! metadata lookup hydrates the registry boundary before pulling paths.
+
 use super::SessionStorageType;
 use oulipoly_config::{ScriptSessionStorageType, SessionSourceEntry, SessionStorage};
 use std::io::ErrorKind as StdIoErrorKind;

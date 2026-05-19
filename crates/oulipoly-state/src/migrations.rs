@@ -1,5 +1,5 @@
 //! ## Declared roles
-//! accessor, filter, validator, predicate, orchestration, formatter, mapper
+//! accessor, filter, formatter, mapper, orchestration, predicate, validator
 
 use crate::schema::{self, CURRENT_SCHEMA_VERSION};
 use rusqlite::Connection;
@@ -43,6 +43,12 @@ static MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0007_age_123_resume_provider_identity.sql"),
         post_sql_hook: Some(apply_v7_resume_provider_identity),
     },
+    Migration {
+        target_version: 8,
+        id: "0008_owned_turn_events",
+        sql: include_str!("../migrations/0008_owned_turn_events.sql"),
+        post_sql_hook: None,
+    },
 ];
 
 pub fn manifest() -> &'static [Migration] {
@@ -50,14 +56,14 @@ pub fn manifest() -> &'static [Migration] {
 }
 
 pub fn plan(stored: i32, current: i32) -> Result<Vec<&'static Migration>, MigrationError> {
-    validate_version_range(stored, current)?;
+    validate_plan_version_window(stored, current)?;
 
-    Ok(migrations_between(stored, current))
+    Ok(filter_manifest_by_version_window(stored, current))
 }
 
-fn validate_version_range(stored: i32, current: i32) -> Result<(), MigrationError> {
-    if stored > current {
-        return Err(incompatible_version_error(
+fn validate_plan_version_window(stored: i32, current: i32) -> Result<(), MigrationError> {
+    if stored_version_is_newer_than_current(stored, current) {
+        return Err(map_incompatible_version_error(
             PathBuf::from("<unknown>"),
             stored,
             current,
@@ -66,7 +72,11 @@ fn validate_version_range(stored: i32, current: i32) -> Result<(), MigrationErro
     Ok(())
 }
 
-fn incompatible_version_error(db_path: PathBuf, stored: i32, current: i32) -> MigrationError {
+fn stored_version_is_newer_than_current(stored: i32, current: i32) -> bool {
+    stored > current
+}
+
+fn map_incompatible_version_error(db_path: PathBuf, stored: i32, current: i32) -> MigrationError {
     MigrationError::Incompatible {
         db_path,
         stored,
@@ -74,14 +84,14 @@ fn incompatible_version_error(db_path: PathBuf, stored: i32, current: i32) -> Mi
     }
 }
 
-fn migrations_between(stored: i32, current: i32) -> Vec<&'static Migration> {
+fn filter_manifest_by_version_window(stored: i32, current: i32) -> Vec<&'static Migration> {
     manifest()
         .iter()
-        .filter(|migration| migration_is_in_range(migration, stored, current))
+        .filter(|migration| migration_is_missing_forward_step(migration, stored, current))
         .collect()
 }
 
-fn migration_is_in_range(migration: &Migration, stored: i32, current: i32) -> bool {
+fn migration_is_missing_forward_step(migration: &Migration, stored: i32, current: i32) -> bool {
     migration.target_version > stored && migration.target_version <= current
 }
 
@@ -96,20 +106,21 @@ pub fn run_with_db_path(
     db_path: PathBuf,
 ) -> Result<(), MigrationError> {
     for migration in plan {
-        run_planned_step(conn, migration, db_path.clone())?;
+        run_planned_step_with_path(conn, migration, db_path.clone())?;
     }
     Ok(())
 }
 
-fn run_planned_step(
+fn run_planned_step_with_path(
     conn: &mut Connection,
     migration: &Migration,
     db_path: PathBuf,
 ) -> Result<(), MigrationError> {
-    run_step(conn, migration).map_err(|source| step_failed_error(db_path, migration, source))
+    run_step_transaction(conn, migration)
+        .map_err(|source| map_step_failed_error(db_path, migration, source))
 }
 
-fn step_failed_error(
+fn map_step_failed_error(
     db_path: PathBuf,
     migration: &Migration,
     source: rusqlite::Error,
@@ -122,37 +133,48 @@ fn step_failed_error(
     }
 }
 
-fn run_step(conn: &mut Connection, migration: &Migration) -> Result<(), rusqlite::Error> {
-    begin_migration_transaction(conn)?;
-    let result = apply_migration_step(conn, migration).and_then(|_| commit_migration(conn));
-    if migration_step_failed(&result) {
-        rollback_migration(conn);
-    }
-    result
-}
-
-fn migration_step_failed(result: &Result<(), rusqlite::Error>) -> bool {
-    result.is_err()
-}
-
-fn begin_migration_transaction(conn: &mut Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch("BEGIN IMMEDIATE;")
-}
-
-fn apply_migration_step(
+fn run_step_transaction(
     conn: &mut Connection,
     migration: &Migration,
 ) -> Result<(), rusqlite::Error> {
-    conn.execute_batch(migration.sql)?;
-    update_user_version(conn, migration.target_version)?;
-    run_post_sql_hook(conn, migration.post_sql_hook)
+    begin_migration_transaction(conn)?;
+    let result = complete_migration_step(conn, migration);
+    finalize_migration_transaction(conn, result)
 }
 
-fn update_user_version(conn: &mut Connection, target_version: i32) -> Result<(), rusqlite::Error> {
+fn begin_migration_transaction(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    execute_migration_transaction_sql(conn, "BEGIN IMMEDIATE;")
+}
+
+fn complete_migration_step(
+    conn: &mut Connection,
+    migration: &Migration,
+) -> Result<(), rusqlite::Error> {
+    apply_migration_step_body(conn, migration)?;
+    commit_migration_transaction(conn)
+}
+
+fn apply_migration_step_body(
+    conn: &mut Connection,
+    migration: &Migration,
+) -> Result<(), rusqlite::Error> {
+    apply_migration_sql(conn, migration.sql)?;
+    record_migration_target_version(conn, migration.target_version)?;
+    dispatch_post_sql_hook(conn, migration.post_sql_hook)
+}
+
+fn apply_migration_sql(conn: &mut Connection, sql: &str) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(sql)
+}
+
+fn record_migration_target_version(
+    conn: &mut Connection,
+    target_version: i32,
+) -> Result<(), rusqlite::Error> {
     conn.pragma_update(None, "user_version", target_version)
 }
 
-fn run_post_sql_hook(
+fn dispatch_post_sql_hook(
     conn: &Connection,
     post_sql_hook: Option<PostSqlHook>,
 ) -> Result<(), rusqlite::Error> {
@@ -162,12 +184,34 @@ fn run_post_sql_hook(
     Ok(())
 }
 
-fn commit_migration(conn: &mut Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch("COMMIT;")
+fn commit_migration_transaction(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    execute_migration_transaction_sql(conn, "COMMIT;")
 }
 
-fn rollback_migration(conn: &mut Connection) {
-    let _ = conn.execute_batch("ROLLBACK;");
+fn finalize_migration_transaction(
+    conn: &mut Connection,
+    result: Result<(), rusqlite::Error>,
+) -> Result<(), rusqlite::Error> {
+    if migration_step_failed(&result) {
+        rollback_migration_transaction(conn);
+    }
+
+    result
+}
+
+fn migration_step_failed(result: &Result<(), rusqlite::Error>) -> bool {
+    result.is_err()
+}
+
+fn rollback_migration_transaction(conn: &mut Connection) {
+    let _ = execute_migration_transaction_sql(conn, "ROLLBACK;");
+}
+
+fn execute_migration_transaction_sql(
+    conn: &mut Connection,
+    sql: &str,
+) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(sql)
 }
 
 fn apply_v7_resume_provider_identity(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -228,27 +272,24 @@ pub enum MigrationError {
 
 impl fmt::Display for MigrationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            MigrationError::Incompatible {
-                db_path,
-                stored,
-                current,
-            } => f.write_str(&format_incompatible_error(db_path, *stored, *current)),
-            MigrationError::StepFailed {
-                db_path,
-                id,
-                target_version,
-                source,
-            } => f.write_str(&format_step_failed_error(
-                db_path,
-                id,
-                *target_version,
-                source,
-            )),
-            MigrationError::UnrecognizedShape { db_path } => {
-                f.write_str(&format_unrecognized_shape_error(db_path))
-            }
-        }
+        f.write_str(&format_migration_error(self))
+    }
+}
+
+fn format_migration_error(error: &MigrationError) -> String {
+    match error {
+        MigrationError::Incompatible {
+            db_path,
+            stored,
+            current,
+        } => format_incompatible_error(db_path, *stored, *current),
+        MigrationError::StepFailed {
+            db_path,
+            id,
+            target_version,
+            source,
+        } => format_step_failed_error(db_path, id, *target_version, source),
+        MigrationError::UnrecognizedShape { db_path } => format_unrecognized_shape_error(db_path),
     }
 }
 
@@ -280,10 +321,16 @@ fn format_unrecognized_shape_error(db_path: &Path) -> String {
 
 impl std::error::Error for MigrationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            MigrationError::StepFailed { source, .. } => Some(source),
-            _ => None,
-        }
+        map_migration_error_source(self)
+    }
+}
+
+fn map_migration_error_source(
+    error: &MigrationError,
+) -> Option<&(dyn std::error::Error + 'static)> {
+    match error {
+        MigrationError::StepFailed { source, .. } => Some(source),
+        _ => None,
     }
 }
 

@@ -1,3 +1,8 @@
+//! ## Declared roles
+//! accessor, formatter, mapper, parser, validator
+//!
+//! Workspace-root resolution from the configured session storage cwd script.
+
 use oulipoly_config::SessionStorage;
 use serde::Deserialize;
 use std::path::PathBuf;

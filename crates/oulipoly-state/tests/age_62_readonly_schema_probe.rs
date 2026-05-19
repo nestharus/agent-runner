@@ -1,3 +1,6 @@
+//! ## Declared roles
+//! orchestration, accessor, mapper, parser, filter, predicate, validator, formatter
+//!
 mod fixtures;
 
 use fixtures::age_62_deployment_fixtures::{
@@ -67,20 +70,24 @@ struct StaticRoutingPort {
 }
 
 impl StaticRoutingPort {
+    // Declared role: mapper
     fn new(resolved: ResolvedStateDb) -> Self {
         Self { resolved }
     }
 }
 
 impl DeploymentRoutingPort for StaticRoutingPort {
+    // Declared role: accessor
     fn resolve_for_current_binary(&self) -> Result<ResolvedStateDb, ResolveError> {
         Ok(self.resolved.clone())
     }
 
+    // Declared role: accessor
     fn resolve_read_only(&self) -> Result<ResolvedStateDb, ResolveError> {
         Ok(self.resolved.clone())
     }
 
+    // Declared role: accessor
     fn deployment_snapshot(&self) -> Result<DeploymentSnapshot, MetadataError> {
         Ok(deployment_snapshot(
             self.resolved.schema_version,
@@ -92,14 +99,17 @@ impl DeploymentRoutingPort for StaticRoutingPort {
 struct PanicIfUsedOpener;
 
 impl StateDbOpener for PanicIfUsedOpener {
+    // Declared role: validator
     fn open_default(&self) -> Result<StateDb, String> {
         panic!("read-only deployment open must not call open_default")
     }
 
+    // Declared role: accessor
     fn open_at(&self, path: &Path) -> Result<StateDb, String> {
         StateDb::open(path)
     }
 
+    // Declared role: accessor
     fn open_in_memory(&self) -> StateDb {
         StateDb::open(Path::new(":memory:")).unwrap()
     }

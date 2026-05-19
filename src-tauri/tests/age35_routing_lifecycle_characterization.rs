@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use oulipoly_state::{CompositeInvocationId, InvocationStatus, StateDb};
+use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -200,6 +201,64 @@ fn parse_invocation(stderr: &str) -> CompositeInvocationId {
     CompositeInvocationId::parse_env_value(raw).unwrap()
 }
 
+fn result_envelope(stdout: &str) -> serde_json::Value {
+    let lines: Vec<&str> = stdout
+        .lines()
+        .filter(|line| line.starts_with("OULIPOLY_RESULT="))
+        .collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "stdout should contain exactly one result envelope line: {stdout}"
+    );
+    serde_json::from_str(lines[0].strip_prefix("OULIPOLY_RESULT=").unwrap()).unwrap()
+}
+
+fn assert_result_envelope_contract(
+    output: &Output,
+    expected_exit_code: i32,
+    expected_status: &str,
+    expected_success: bool,
+) {
+    assert_eq!(output.status.code(), Some(expected_exit_code), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let envelope = result_envelope(&stdout);
+    let keys: BTreeSet<&str> = envelope
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        BTreeSet::from([
+            "error_category",
+            "exit_code",
+            "finished_at",
+            "id",
+            "status",
+            "success",
+            "terminal_reason",
+        ])
+    );
+    assert_eq!(envelope["status"], expected_status);
+    assert_eq!(envelope["success"], expected_success);
+    assert_eq!(envelope["exit_code"], expected_exit_code);
+    assert!(envelope["finished_at"].as_str().is_some());
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let invocation = parse_invocation(&stderr);
+    assert_eq!(envelope["id"], invocation.id);
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|line| line.starts_with("OULIPOLY_PARENT_INVOCATION="))
+            .count(),
+        0,
+        "no parent marker should be emitted when no parent env is supplied: {stderr}"
+    );
+}
+
 fn source_block_after<'a>(source: &'a str, start: &str) -> &'a str {
     let start_idx = source
         .find(start)
@@ -227,6 +286,34 @@ fn source_block_after<'a>(source: &'a str, start: &str) -> &'a str {
     }
 
     panic!("missing closing brace after {start}");
+}
+
+#[test]
+fn idx_main_02_one_shot_emits_single_result_envelope_and_invocation_marker() {
+    let fixture = CliFixture::new();
+    fixture.write_model("idx-main-02-ok", &["idx-main-02-ok-provider"]);
+    fixture.write_model("idx-main-02-fail", &["idx-main-02-fail-provider"]);
+    fixture.write_providers_with_command_bodies(&[
+        (
+            "idx-main-02-ok-provider",
+            "printf '%s\\n' 'idx-main-02 provider stdout'",
+        ),
+        (
+            "idx-main-02-fail-provider",
+            "printf '%s\\n' 'idx-main-02 provider stderr' >&2\nexit 23",
+        ),
+    ]);
+
+    let success = fixture.run_one_shot("idx-main-02-ok");
+    let success_stdout = String::from_utf8_lossy(&success.stdout);
+    assert!(
+        success_stdout.starts_with("idx-main-02 provider stdout\n"),
+        "{success_stdout}"
+    );
+    assert_result_envelope_contract(&success, 0, "succeeded", true);
+
+    let failure = fixture.run_one_shot("idx-main-02-fail");
+    assert_result_envelope_contract(&failure, 23, "failed", false);
 }
 
 #[test]

@@ -30,6 +30,7 @@
 mod fixtures;
 
 use fixtures::{table_names, user_version};
+use oulipoly_state::CURRENT_SCHEMA_VERSION;
 use oulipoly_state::deployment::row_version::registry::{
     self, REGISTRY, RowKind, TableRegistration,
 };
@@ -65,7 +66,7 @@ fn ti_03_schema5_to_schema6_adds_row_version_to_every_tracked_table() {
 
     let conn = migrate_schema5_to_schema6(&db_path);
 
-    assert_eq!(user_version(&conn), 6);
+    assert_eq!(user_version(&conn), CURRENT_SCHEMA_VERSION);
     for table in TRACKED_TABLES {
         assert_row_version_column(&conn, table);
     }
@@ -154,19 +155,35 @@ fn registry_payload_columns_match_migrated_table_info_for_every_entry() {
     }
 }
 
+// Declared role: validator
 fn assert_registration_matches_table_info(conn: &Connection, registration: &TableRegistration) {
     let columns = table_info(conn, registration.table);
-    let column_names = column_name_set(&columns);
-    let primary_keys = column_ref_name_set(&primary_key_columns(&columns));
-    let payload_columns = column_ref_name_set(&payload_columns(&columns, registration));
-    let registered_pk = registered_primary_key_set(registration);
-    let registered_payload = registered_payload_set(registration);
+    assert_registration_keys_match_table_info(&columns, registration);
+    assert_registered_payload_matches_table_info(&columns, registration);
+    assert_registered_columns_exist(registration, &column_name_set(&columns));
+}
 
+// Declared role: validator
+fn assert_registration_keys_match_table_info(
+    columns: &[ColumnInfo],
+    registration: &TableRegistration,
+) {
+    let primary_keys = column_ref_name_set(&primary_key_columns(columns));
+    let registered_pk = registered_primary_key_set(registration);
     assert_eq!(
         primary_keys, registered_pk,
         "registry primary keys disagree with PRAGMA table_info for {}",
         registration.table
     );
+}
+
+// Declared role: validator
+fn assert_registered_payload_matches_table_info(
+    columns: &[ColumnInfo],
+    registration: &TableRegistration,
+) {
+    let payload_columns = column_ref_name_set(&payload_columns(columns, registration));
+    let registered_payload = registered_payload_set(registration);
     assert_eq!(
         payload_columns, registered_payload,
         "registry payload columns disagree with PRAGMA table_info for {}",
@@ -177,21 +194,24 @@ fn assert_registration_matches_table_info(conn: &Connection, registration: &Tabl
         "registry payload_columns must exclude row_version for {}",
         registration.table
     );
-    assert_registered_columns_exist(registration, &column_names);
 }
 
+// Declared role: mapper
 fn column_name_set(columns: &[ColumnInfo]) -> BTreeSet<&str> {
     columns.iter().map(|column| column.name.as_str()).collect()
 }
 
+// Declared role: mapper
 fn column_ref_name_set<'a>(columns: &[&'a ColumnInfo]) -> BTreeSet<&'a str> {
     columns.iter().map(|column| column.name.as_str()).collect()
 }
 
+// Declared role: filter
 fn primary_key_columns(columns: &[ColumnInfo]) -> Vec<&ColumnInfo> {
     columns.iter().filter(|column| column.pk > 0).collect()
 }
 
+// Declared role: filter
 fn payload_columns<'a>(
     columns: &'a [ColumnInfo],
     registration: &TableRegistration,
@@ -202,6 +222,7 @@ fn payload_columns<'a>(
         .collect()
 }
 
+// Declared role: predicate
 fn is_payload_column(column: &ColumnInfo, registration: &TableRegistration) -> bool {
     column.name != "row_version"
         && !registration
@@ -209,14 +230,17 @@ fn is_payload_column(column: &ColumnInfo, registration: &TableRegistration) -> b
             .contains(&column.name.as_str())
 }
 
+// Declared role: mapper
 fn registered_primary_key_set(registration: &TableRegistration) -> BTreeSet<&str> {
     registration.primary_key_columns.iter().copied().collect()
 }
 
+// Declared role: mapper
 fn registered_payload_set(registration: &TableRegistration) -> BTreeSet<&str> {
     registration.payload_columns.iter().copied().collect()
 }
 
+// Declared role: validator
 fn assert_registered_columns_exist(
     registration: &TableRegistration,
     column_names: &BTreeSet<&str>,
@@ -234,23 +258,25 @@ fn assert_registered_columns_exist(
     }
 }
 
+// Declared role: orchestration
 fn build_schema5_db(path: &Path) {
     let mut conn = Connection::open(path).unwrap();
     conn.pragma_update(None, "user_version", 0).unwrap();
     let plan = migrations::plan(0, 5).unwrap();
     migrations::run_with_db_path(&mut conn, &plan, path.to_path_buf()).unwrap();
+    assert_schema5_user_version(conn);
+}
+
+// Declared role: validator
+fn assert_schema5_user_version(conn: Connection) {
     assert_eq!(user_version(&conn), 5);
 }
 
+// Declared role: orchestration
 fn migrate_schema5_to_schema6(path: &Path) -> Connection {
     let mut conn = Connection::open(path).unwrap();
-    let plan = migrations::plan(5, 6).unwrap();
-    assert_eq!(
-        plan.iter()
-            .map(|migration| migration.id)
-            .collect::<Vec<_>>(),
-        vec!["0006_age_58_dual_write_row_versions"]
-    );
+    let plan = migrations::current_plan_from(5).unwrap();
+    assert_schema5_current_plan(&plan);
     migrations::run_with_db_path(&mut conn, &plan, path.to_path_buf()).unwrap();
     conn
 }
@@ -262,12 +288,36 @@ fn migrate_schema5_to_current(path: &Path) -> Connection {
     conn
 }
 
+// Declared role: validator
+fn assert_schema5_current_plan(plan: &[&migrations::Migration]) {
+    assert_eq!(
+        plan.iter()
+            .map(|migration| migration.id)
+            .collect::<Vec<_>>(),
+        vec![
+            "0006_age_58_dual_write_row_versions",
+            "0007_age_123_resume_provider_identity",
+            "0008_owned_turn_events",
+        ]
+    );
+}
+
+// Declared role: validator
 fn assert_row_version_column(conn: &Connection, table: &str) {
-    let row_version = table_info(conn, table)
+    let row_version = row_version_column(conn, table);
+    assert_row_version_column_info(table, &row_version);
+}
+
+// Declared role: accessor
+fn row_version_column(conn: &Connection, table: &str) -> ColumnInfo {
+    table_info(conn, table)
         .into_iter()
         .find(|column| column.name == "row_version")
-        .unwrap_or_else(|| panic!("{table} is missing row_version"));
+        .unwrap_or_else(|| panic!("{table} is missing row_version"))
+}
 
+// Declared role: validator
+fn assert_row_version_column_info(table: &str, row_version: &ColumnInfo) {
     assert_eq!(
         row_version.ty.to_uppercase(),
         "INTEGER",
@@ -293,14 +343,17 @@ struct ColumnInfo {
     pk: i64,
 }
 
+// Declared role: accessor
 fn table_info(conn: &Connection, table: &str) -> Vec<ColumnInfo> {
     query_table_info(conn, &table_info_sql(table))
 }
 
+// Declared role: formatter
 fn table_info_sql(table: &str) -> String {
     format!("PRAGMA table_info({table})")
 }
 
+// Declared role: accessor
 fn query_table_info(conn: &Connection, sql: &str) -> Vec<ColumnInfo> {
     conn.prepare(sql)
         .unwrap()
@@ -310,6 +363,7 @@ fn query_table_info(conn: &Connection, sql: &str) -> Vec<ColumnInfo> {
         .unwrap()
 }
 
+// Declared role: mapper
 fn column_info(row: &rusqlite::Row<'_>) -> rusqlite::Result<ColumnInfo> {
     Ok(ColumnInfo {
         name: row.get(1)?,
@@ -320,6 +374,7 @@ fn column_info(row: &rusqlite::Row<'_>) -> rusqlite::Result<ColumnInfo> {
     })
 }
 
+// Declared role: accessor
 fn index_names(conn: &Connection) -> BTreeSet<String> {
     conn.prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
         .unwrap()

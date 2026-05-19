@@ -1,0 +1,102 @@
+use oulipoly_config::SessionsConfig;
+use oulipoly_runtime::services::{
+    ProductionTraceService, TraceServiceFailure, TraceServicePort, TraceServiceRequest,
+};
+use oulipoly_runtime::trace::{TraceOptions, TraceReport, trace_invocation_with_sessions};
+use oulipoly_state::{InvocationStart, StateDb};
+use serde_json::Value;
+use std::path::Path;
+
+const ROOT_UUID: &str = "11111111-1111-4111-8111-111111111111";
+const MISSING_UUID: &str = "22222222-2222-4222-8222-222222222222";
+
+fn seeded_trace_fixture() -> (StateDb, SessionsConfig) {
+    let db = StateDb::open(Path::new(":memory:")).unwrap();
+    db.start_invocation(&InvocationStart {
+        invocation_uuid: ROOT_UUID.to_string(),
+        model_name: "claude~high".to_string(),
+        provider_name: "claude".to_string(),
+        provider_index: 0,
+        parent_invocation_id: None,
+    })
+    .unwrap();
+    (db, SessionsConfig::default())
+}
+
+fn trace_options() -> TraceOptions {
+    TraceOptions {
+        max_depth: 64,
+        json: true,
+        inline_transcript: false,
+        transcript: false,
+    }
+}
+
+fn report_without_generated_at(report: &TraceReport) -> Value {
+    let mut value = serde_json::to_value(report).unwrap();
+    value.as_object_mut().unwrap().remove("generated_at");
+    value
+}
+
+fn trace_failure_for(invocation_uuid: &str) -> TraceServiceFailure {
+    let (db, sessions_cfg) = seeded_trace_fixture();
+    let service = ProductionTraceService::default();
+
+    service
+        .trace(TraceServiceRequest {
+            state: &db,
+            sessions_cfg: &sessions_cfg,
+            invocation_uuid,
+            options: trace_options(),
+        })
+        .unwrap()
+        .result
+        .unwrap_err()
+}
+
+#[test]
+fn idx_svc_01_missing_invocation_returns_invocation_not_found_variant() {
+    match trace_failure_for(MISSING_UUID) {
+        TraceServiceFailure::InvocationNotFound { input, .. } => {
+            assert_eq!(input, MISSING_UUID);
+        }
+        other => panic!("expected InvocationNotFound, got {other:?}"),
+    }
+}
+
+#[test]
+fn idx_svc_01_malformed_invocation_returns_invalid_invocation_id_variant() {
+    let input = "not-a-uuid";
+
+    match trace_failure_for(input) {
+        TraceServiceFailure::InvalidInvocationId { input: got, .. } => {
+            assert_eq!(got, input);
+        }
+        other => panic!("expected InvalidInvocationId, got {other:?}"),
+    }
+}
+
+#[test]
+fn idx_svc_01_trace_report_matches_direct_trace_without_generated_at() {
+    let (db, sessions_cfg) = seeded_trace_fixture();
+    let service = ProductionTraceService::default();
+
+    let service_report = service
+        .trace(TraceServiceRequest {
+            state: &db,
+            sessions_cfg: &sessions_cfg,
+            invocation_uuid: ROOT_UUID,
+            options: trace_options(),
+        })
+        .unwrap()
+        .result
+        .unwrap();
+    let direct_report =
+        trace_invocation_with_sessions(&db, ROOT_UUID, trace_options(), Some(&sessions_cfg))
+            .unwrap();
+
+    assert_eq!(
+        report_without_generated_at(&service_report),
+        report_without_generated_at(&direct_report)
+    );
+}

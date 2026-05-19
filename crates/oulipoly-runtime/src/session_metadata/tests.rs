@@ -1,7 +1,9 @@
 use super::*;
 use chrono::Utc;
-use oulipoly_config::{ProviderEntry, ResumeKind, ResumeStrategy};
+use oulipoly_config::{ProviderEntry, ResumeKind, ResumeStrategy, SessionSourceEntry};
+use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
+use std::sync::OnceLock;
 
 struct FixtureScript {
     _dir: tempfile::TempDir,
@@ -80,6 +82,64 @@ fn providers_cfg_with_storage(
         },
     );
     cfg
+}
+
+fn providers_cfg_with_claude_storage(
+    provider_name: &str,
+    projects_dir: PathBuf,
+) -> ProvidersConfig {
+    let mut cfg = ProvidersConfig::default();
+    cfg.entries.insert(
+        provider_name.to_string(),
+        ProviderEntry {
+            command: Some("provider-fixture".to_string()),
+            resume: Some(ResumeStrategy {
+                kind: ResumeKind::Flag,
+                flag: Some("--resume".to_string()),
+                subcommand: None,
+            }),
+            session_storage: Some(SessionStorage::ClaudeCode { projects_dir }),
+            ..ProviderEntry::default()
+        },
+    );
+    cfg
+}
+
+fn sessions_cfg_with_locator(
+    provider_name: &str,
+    transcript_locator: String,
+    state_dir: PathBuf,
+) -> SessionsConfig {
+    SessionsConfig {
+        entries: HashMap::from([(
+            provider_name.to_string(),
+            SessionSourceEntry {
+                turn_script: "true".to_string(),
+                transcript_locator: Some(transcript_locator),
+                state_dir: Some(state_dir),
+            },
+        )]),
+    }
+}
+
+fn ensure_repo_scripts_on_path() {
+    static SCRIPTS_PATH: OnceLock<()> = OnceLock::new();
+    SCRIPTS_PATH.get_or_init(|| {
+        let scripts_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("scripts");
+        let existing_path = std::env::var_os("PATH").unwrap_or_default();
+        let path = std::env::join_paths(
+            std::iter::once(scripts_dir).chain(std::env::split_paths(&existing_path)),
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var("PATH", path);
+        }
+    });
 }
 
 #[test]
@@ -257,12 +317,354 @@ fn locate_session_metadata_uses_script_storage_transcript_and_format() {
     assert_script_storage_metadata(&metadata, &jsonl_path, &workspace);
 }
 
+#[test]
+fn configured_locator_is_supported_transcript_source_for_metadata_lookup() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let registry_jsonl_path = dir.path().join("registry-session.jsonl");
+    std::fs::write(&registry_jsonl_path, "{}\n").unwrap();
+    let fallback_marker = dir.path().join("script-storage-transcript-consulted");
+    let provider_name = "provider";
+    let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+    let cwd_script = fixture_script(&cwd_found_script(&workspace));
+    let transcript_script = fixture_script(&poison_marker_script(&fallback_marker));
+    let configured_locator = fixture_script(&session_checked_transcript_script(
+        session_id,
+        &registry_jsonl_path,
+    ));
+    let db = state_with_session(provider_name, session_id);
+    let cfg = providers_cfg_with_storage(
+        provider_name,
+        cwd_script.path.display().to_string(),
+        transcript_script.path.display().to_string(),
+        ScriptSessionStorageType::ClaudeCode,
+    );
+    let sessions_cfg = sessions_cfg_with_locator(
+        provider_name,
+        configured_locator.path.display().to_string(),
+        dir.path().join("registry-state"),
+    );
+
+    let metadata =
+        locate_session_metadata(&db, &ModelStore::new(), &cfg, &sessions_cfg, session_id).unwrap();
+
+    assert_script_storage_metadata(&metadata, &registry_jsonl_path, &workspace);
+    assert!(
+        !fallback_marker.exists(),
+        "configured locator must be the supported transcript source; script-storage fallback was consulted"
+    );
+}
+
+#[test]
+fn configured_locator_takes_jsonl_precedence_over_conflicting_claude_storage_scan() {
+    ensure_repo_scripts_on_path();
+    let dir = tempfile::tempdir().unwrap();
+    let provider_name = "claude";
+    let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+    let projects_dir = dir.path().join("claude-projects");
+    let workspace = dir.path().join("workspace");
+    let private_layout_jsonl =
+        stage_claude_transcript(&projects_dir, &workspace, session_id, "private-layout");
+    let registry_jsonl_path = dir.path().join("registry-session.jsonl");
+    std::fs::write(&registry_jsonl_path, "{}\n").unwrap();
+    let configured_locator = fixture_script(&session_checked_transcript_script(
+        session_id,
+        &registry_jsonl_path,
+    ));
+    let db = state_with_session(provider_name, session_id);
+    let cfg = providers_cfg_with_claude_storage(provider_name, projects_dir);
+    let sessions_cfg = sessions_cfg_with_locator(
+        provider_name,
+        configured_locator.path.display().to_string(),
+        dir.path().join("registry-state"),
+    );
+
+    let metadata =
+        locate_session_metadata(&db, &ModelStore::new(), &cfg, &sessions_cfg, session_id).unwrap();
+
+    assert_eq!(
+        metadata.jsonl_path,
+        registry_jsonl_path.canonicalize().unwrap()
+    );
+    assert_ne!(
+        metadata.jsonl_path,
+        private_layout_jsonl.canonicalize().unwrap()
+    );
+    assert_eq!(metadata.storage_type, SessionStorageType::ClaudeCode);
+}
+
+#[test]
+fn private_layout_back_population_pull_preserves_today_fallback_jsonl_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider_name = "claude";
+    let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+    let projects_dir = dir.path().join("claude-projects");
+    let workspace = dir.path().join("workspace");
+    stage_claude_transcript(&projects_dir, &workspace, session_id, "private-layout");
+    let storage = SessionStorage::ClaudeCode { projects_dir };
+
+    let pre_refactor_fallback = resolve_jsonl_path_for_provider_with_mode(
+        &SessionsConfig::default(),
+        Some(&storage),
+        provider_name,
+        session_id,
+        TranscriptLookupMode::RequireExisting,
+    )
+    .unwrap();
+    let configured_locator = fixture_script(&session_checked_transcript_script(
+        session_id,
+        &pre_refactor_fallback,
+    ));
+    let sessions_cfg = sessions_cfg_with_locator(
+        provider_name,
+        configured_locator.path.display().to_string(),
+        dir.path().join("registry-state"),
+    );
+
+    let registry_pull = resolve_jsonl_path_for_provider_with_mode(
+        &sessions_cfg,
+        Some(&storage),
+        provider_name,
+        session_id,
+        TranscriptLookupMode::RequireExisting,
+    )
+    .unwrap();
+
+    assert_eq!(registry_pull, pre_refactor_fallback);
+}
+
+#[test]
+fn discovery_back_population_count_covers_private_layout_resolvable_fixture_set() {
+    let cases = private_layout_resolvable_fixture_set();
+
+    let pre_refactor_private_layout_resolvable_count = cases
+        .iter()
+        .filter(|case| resolve_case_from_private_layout(case).is_ok())
+        .count();
+    let registry_pull_resolvable_count = cases
+        .iter()
+        .filter(|case| resolve_case_from_configured_locator(case).is_ok())
+        .count();
+
+    assert_eq!(
+        pre_refactor_private_layout_resolvable_count,
+        cases.len(),
+        "fixture setup should represent only private-layout transcripts today's fallback resolves"
+    );
+    assert!(
+        registry_pull_resolvable_count >= pre_refactor_private_layout_resolvable_count,
+        "post-refactor registry back-population must never expose fewer entries than today's private-layout fallback"
+    );
+}
+
+#[test]
+fn discovery_back_population_registry_entry_count_meets_private_layout_resolvable_count_claude() {
+    let cases = private_layout_resolvable_fixture_set();
+
+    assert_registry_back_population_entry_count_for_provider(&cases, "claude", "Claude");
+}
+
+#[test]
+fn discovery_back_population_registry_entry_count_meets_private_layout_resolvable_count_codex() {
+    let cases = private_layout_resolvable_fixture_set();
+
+    assert_registry_back_population_entry_count_for_provider(&cases, "codex", "Codex");
+}
+
 fn session_checked_transcript_script(session_id: &str, jsonl_path: &std::path::Path) -> String {
     format!(
         "test \"$SESSION_ID\" = '{}' || exit 7\nprintf '{}\\n'",
         session_id,
         jsonl_path.display()
     )
+}
+
+fn poison_marker_script(marker: &std::path::Path) -> String {
+    format!("printf consulted > '{}'\nexit 23", marker.display())
+}
+
+struct PrivateLayoutCase {
+    _dir: tempfile::TempDir,
+    _locator_script: FixtureScript,
+    provider_name: String,
+    session_id: String,
+    storage: SessionStorage,
+    sessions_cfg: SessionsConfig,
+}
+
+fn private_layout_resolvable_fixture_set() -> Vec<PrivateLayoutCase> {
+    vec![
+        claude_private_layout_case(
+            "claude-projects-case",
+            "5169694d-de0f-40d1-890c-6e28e55bab27",
+        ),
+        codex_private_layout_case(
+            "codex-direct-case",
+            "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22",
+            &[],
+        ),
+        codex_private_layout_case(
+            "codex-nested-case",
+            "99999999-9999-4999-8999-999999999999",
+            &["2026", "05", "19"],
+        ),
+    ]
+}
+
+fn claude_private_layout_case(case_name: &str, session_id: &str) -> PrivateLayoutCase {
+    let dir = tempfile::tempdir().unwrap();
+    let provider_name = "claude".to_string();
+    let projects_dir = dir.path().join(case_name);
+    let workspace = dir.path().join(format!("{case_name}-workspace"));
+    let jsonl_path = stage_claude_transcript(&projects_dir, &workspace, session_id, case_name);
+    let locator_script =
+        fixture_script(&session_checked_transcript_script(session_id, &jsonl_path));
+    let sessions_cfg = sessions_cfg_with_locator(
+        &provider_name,
+        locator_script.path.display().to_string(),
+        dir.path().join("registry-state"),
+    );
+
+    PrivateLayoutCase {
+        _dir: dir,
+        _locator_script: locator_script,
+        provider_name,
+        session_id: session_id.to_string(),
+        storage: SessionStorage::ClaudeCode { projects_dir },
+        sessions_cfg,
+    }
+}
+
+fn codex_private_layout_case(
+    case_name: &str,
+    session_id: &str,
+    nested_components: &[&str],
+) -> PrivateLayoutCase {
+    let dir = tempfile::tempdir().unwrap();
+    let provider_name = "codex".to_string();
+    let sessions_dir = dir.path().join(case_name);
+    let rollout_dir = nested_components
+        .iter()
+        .fold(sessions_dir.clone(), |path, component| path.join(component));
+    let workspace = dir.path().join(format!("{case_name}-workspace"));
+    std::fs::create_dir_all(&workspace).unwrap();
+    let jsonl_path = stage_codex_rollout(&rollout_dir, &workspace, session_id, case_name);
+    let locator_script =
+        fixture_script(&session_checked_transcript_script(session_id, &jsonl_path));
+    let sessions_cfg = sessions_cfg_with_locator(
+        &provider_name,
+        locator_script.path.display().to_string(),
+        dir.path().join("registry-state"),
+    );
+
+    PrivateLayoutCase {
+        _dir: dir,
+        _locator_script: locator_script,
+        provider_name,
+        session_id: session_id.to_string(),
+        storage: SessionStorage::Codex { sessions_dir },
+        sessions_cfg,
+    }
+}
+
+fn resolve_case_from_private_layout(case: &PrivateLayoutCase) -> Result<PathBuf, MetadataError> {
+    resolve_jsonl_path_for_provider_with_mode(
+        &SessionsConfig::default(),
+        Some(&case.storage),
+        &case.provider_name,
+        &case.session_id,
+        TranscriptLookupMode::RequireExisting,
+    )
+}
+
+fn resolve_case_from_configured_locator(
+    case: &PrivateLayoutCase,
+) -> Result<PathBuf, MetadataError> {
+    resolve_jsonl_path_for_provider_with_mode(
+        &case.sessions_cfg,
+        Some(&case.storage),
+        &case.provider_name,
+        &case.session_id,
+        TranscriptLookupMode::RequireExisting,
+    )
+}
+
+fn assert_registry_back_population_entry_count_for_provider(
+    cases: &[PrivateLayoutCase],
+    provider_name: &str,
+    fixture_label: &str,
+) {
+    let provider_cases = cases
+        .iter()
+        .filter(|case| case.provider_name == provider_name)
+        .collect::<Vec<_>>();
+    let pre_refactor_private_layout_resolvable_count = provider_cases
+        .iter()
+        .filter(|case| resolve_case_from_private_layout(case).is_ok())
+        .count();
+    let registry_entry_count = provider_cases
+        .iter()
+        .map(|case| {
+            let registry =
+                discover_transcript_locator_registry(&case.provider_name, Some(&case.storage))
+                    .unwrap();
+            assert_eq!(
+                registry.entry_count(),
+                registry.iter().count(),
+                "{fixture_label} back-population registry inspection APIs should agree"
+            );
+            registry.entry_count()
+        })
+        .sum::<usize>();
+
+    assert_eq!(
+        pre_refactor_private_layout_resolvable_count,
+        provider_cases.len(),
+        "{fixture_label} fixture setup should represent only private-layout transcripts today's fallback resolves"
+    );
+    assert!(
+        registry_entry_count >= pre_refactor_private_layout_resolvable_count,
+        "{fixture_label} back-population: registry has {registry_entry_count} entries, expected >= {pre_refactor_private_layout_resolvable_count}",
+    );
+}
+
+fn stage_claude_transcript(
+    projects_dir: &std::path::Path,
+    workspace: &std::path::Path,
+    session_id: &str,
+    body: &str,
+) -> PathBuf {
+    std::fs::create_dir_all(workspace).unwrap();
+    let transcript_dir = projects_dir.join(claude_project_dir_name(workspace));
+    std::fs::create_dir_all(&transcript_dir).unwrap();
+    let jsonl_path = transcript_dir.join(format!("{session_id}.jsonl"));
+    std::fs::write(&jsonl_path, format!("{{\"source\":\"{body}\"}}\n")).unwrap();
+    jsonl_path
+}
+
+fn stage_codex_rollout(
+    rollout_dir: &std::path::Path,
+    workspace: &std::path::Path,
+    session_id: &str,
+    case_name: &str,
+) -> PathBuf {
+    std::fs::create_dir_all(rollout_dir).unwrap();
+    let jsonl_path = rollout_dir.join(format!("rollout-{case_name}-{session_id}.jsonl"));
+    std::fs::write(
+        &jsonl_path,
+        format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session_id}\",\"cwd\":\"{}\"}}}}\n",
+            workspace.display()
+        ),
+    )
+    .unwrap();
+    jsonl_path
+}
+
+fn claude_project_dir_name(path: &std::path::Path) -> String {
+    let raw = path.to_string_lossy();
+    format!("-{}", raw.trim_start_matches('/').replace('/', "-"))
 }
 
 fn assert_script_storage_metadata(

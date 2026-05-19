@@ -277,6 +277,34 @@ pub struct SessionTurnIngest {
     pub body: Option<String>,
 }
 
+/// Oulipoly-owned compact-summary evidence projected from provider transcripts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedTurnEventRow {
+    pub session_id: String,
+    pub turn_uuid: String,
+    pub is_compaction_boundary: bool,
+    pub summary_metadata_json: Option<String>,
+}
+
+/// Test-visible owned turn/event row read from the state boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedTurnEvent {
+    pub session_id: String,
+    pub turn_uuid: String,
+    pub is_compaction_boundary: bool,
+    pub summary_metadata_json: Option<String>,
+    pub ingested_at: String,
+}
+
+/// Compact-summary evidence consumed by `migrate-db`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactSummaryEvidence {
+    pub session_id: String,
+    pub compact_turn_uuids: Vec<String>,
+}
+
+mod owned_turn_event;
+
 pub type ModelStore = std::collections::HashMap<String, ModelConfig>;
 pub type DbError = String;
 

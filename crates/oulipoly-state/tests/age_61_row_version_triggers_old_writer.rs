@@ -1,3 +1,6 @@
+//! ## Declared roles
+//! orchestration, accessor, mapper, parser, filter, predicate, validator, formatter
+//!
 mod fixtures;
 
 use fixtures::user_version;
@@ -206,19 +209,32 @@ fn trigger_generator_names_match_the_migration_trigger_shape() {
     }
 }
 
+// Declared role: orchestration
 fn migrated_schema6_db(path: &Path) -> Connection {
     let mut conn = Connection::open(path).unwrap();
     conn.pragma_update(None, "user_version", 0).unwrap();
     let schema5_plan = migrations::plan(0, 5).unwrap();
     migrations::run_with_db_path(&mut conn, &schema5_plan, path.to_path_buf()).unwrap();
-    assert_eq!(user_version(&conn), 5);
+    let mut conn = assert_schema5_user_version(conn);
 
     let schema6_plan = migrations::plan(5, 6).unwrap();
     migrations::run_with_db_path(&mut conn, &schema6_plan, path.to_path_buf()).unwrap();
+    assert_schema6_user_version(conn)
+}
+
+// Declared role: validator
+fn assert_schema5_user_version(conn: Connection) -> Connection {
+    assert_eq!(user_version(&conn), 5);
+    conn
+}
+
+// Declared role: validator
+fn assert_schema6_user_version(conn: Connection) -> Connection {
     assert_eq!(user_version(&conn), 6);
     conn
 }
 
+// Declared role: validator
 fn assert_row_version_lifecycle(
     conn: &Connection,
     table: &str,
@@ -250,6 +266,7 @@ fn assert_row_version_lifecycle(
     );
 }
 
+// Declared role: accessor
 fn row_version(conn: &Connection, sql: &str) -> i64 {
     conn.query_row(sql, [], |row| row.get(0)).unwrap()
 }
