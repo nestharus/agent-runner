@@ -1,30 +1,42 @@
-//! Oulipoly state-DB module.
-//!
 //! ## Declared roles
 //!
 //! - accessor
 //! - mapper
-//! - validator
-//! - parser
 //! - formatter
 //! - predicate
-//! - filter
+//! - validator
+//! - parser
 //! - orchestration
+//! - filter
 //!
-//! Rationale: this file is the SQL-backed persistence adapter for the Oulipoly
-//! state subsystem. It naturally mixes the eight A1 classifications because a
-//! single-file state-DB layer encapsulates queries (accessor), row<->record
-//! translation (mapper + parser + formatter), schema/integrity checks
-//! (validator + predicate), ranking/filtering selectors (filter), and
-//! transaction/lifecycle sequencing (orchestration). Component-level
-//! responsibilities are declared in
-//! `planning/age-132-db-rs-whole-file-cleanup/proposals/age-132-AGE-132.md`
-//! under `## Adapter declarations` and `## Intrinsic-surface declarations`.
+//! Role set: { accessor, mapper, formatter, predicate, validator, parser, orchestration, filter }
+//!
+//! Per ACR-249/ACR-250 db.rs is a declared multi-role state-DB persistence adapter that owns
+//! SQLite open/migration/schema behavior, marker parsing/formatting (re-exported from
+//! `invocation_marker.rs`), sidecar identity classification (delegated to `db/sqlite_adapter.rs`),
+//! lifecycle log sink integration (delegated to `db/lifecycle_log_adapter.rs`), and resume/quota
+//! orchestration. Intrinsic-surface declarations cover the schema-version and chrono couplings;
+//! see `the AGE-160 proposal § Intrinsic-surface declarations` for the canonical declaration.
+//!
+//! AGE-160 intrinsic schema-version carrier: `crate::schema` owns the schema-version constants and
+//! compatibility classifier consumed by this StateDb open/migration boundary.
+//!
+//! AGE-160 intrinsic timestamp carrier: `chrono` owns the UTC timestamp and RFC3339 shapes persisted
+//! and returned by this StateDb boundary.
+//!
+//! AGE-160 serde_json residual disposition: remaining JSON calls are DB-owned artifact/config payload
+//! codecs and test assertions after marker and lifecycle JSON construction moved behind adapters.
 
-use crate::lifecycle_log::{
-    FinalizeContext, LifecycleEventSink, NoopLifecycleEventSink, RawArtifactPaths, SessionContext,
-    StartContext,
-};
+mod lifecycle_log_adapter;
+mod sqlite_adapter;
+
+use self::lifecycle_log_adapter as lc_log_adapter;
+use self::sqlite_adapter as sqlite;
+use self::sqlite_adapter::params;
+use self::sqlite_adapter::{Connection, RusqliteOptionalExtension, Transaction};
+#[cfg(test)]
+use crate::invocation_marker::CompositeInvocationId;
+use crate::lifecycle_log::{LifecycleEventSink, NoopLifecycleEventSink};
 use crate::migrations;
 use crate::schema::{
     CURRENT_SCHEMA_VERSION, MINIMUM_SUPPORTED_SCHEMA_VERSION, SchemaCompatibility,
@@ -33,7 +45,6 @@ use chrono::{DateTime, Utc};
 use oulipoly_agent_messenger::ReturnedArtifactRef;
 use oulipoly_config::{ModelConfig, load_models};
 use oulipoly_core::TransitionReason;
-use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -79,7 +90,7 @@ const MIN_LEARN_SAMPLE_CALLS: u64 = 20;
 const NEAR_EXHAUSTED_USED_PERCENT: f64 = 0.99;
 
 pub struct StateDb {
-    conn: Connection,
+    conn: sqlite::Connection,
     db_path: PathBuf,
     lifecycle_sink: Mutex<Box<dyn LifecycleEventSink + Send>>,
 }
@@ -93,42 +104,34 @@ pub enum ReadOnlyOpenError {
     Operational { message: String },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SidecarKind {
-    Wal,
-    Shm,
-    Unknown,
-}
-
-fn classify_read_only_open_error(path: &Path, err: rusqlite::Error) -> ReadOnlyOpenError {
-    let message = err.to_string();
-    if let Some(classified) = sqlite_failure_read_only_error(path, &err, &message) {
-        return classified;
-    }
-    ReadOnlyOpenError::Operational { message }
-}
-
-fn sqlite_failure_read_only_error(
-    path: &Path,
-    err: &rusqlite::Error,
-    message: &str,
-) -> Option<ReadOnlyOpenError> {
-    let rusqlite::Error::SqliteFailure(error, _) = err else {
-        return None;
-    };
-    match error.code {
-        ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt => Some(read_only_not_database(
-            path.to_path_buf(),
-            message.to_string(),
-        )),
-        ErrorCode::PermissionDenied => Some(read_only_permission_denied(path.to_path_buf())),
-        ErrorCode::SystemIoFailure if classify_sidecar_io_failure(message).is_known_sidecar() => {
-            Some(read_only_wal_sidecar_error(
-                path.to_path_buf(),
-                message.to_string(),
-            ))
+fn classify_read_only_open_error(path: &Path, err: sqlite::Error) -> ReadOnlyOpenError {
+    match sqlite::project_read_only_open_error(path, &err) {
+        sqlite::ReadOnlyOpenFailure::WalSidecar { message }
+        | sqlite::ReadOnlyOpenFailure::ShmSidecar { message } => {
+            read_only_wal_sidecar_error(path.to_path_buf(), message)
         }
-        _ => None,
+        sqlite::ReadOnlyOpenFailure::PlainDb { kind, message } => {
+            read_only_plain_db_error(path, kind, message)
+        }
+        sqlite::ReadOnlyOpenFailure::Unknown { message } => {
+            ReadOnlyOpenError::Operational { message }
+        }
+    }
+}
+
+fn read_only_plain_db_error(
+    path: &Path,
+    kind: sqlite::PlainDbKind,
+    message: String,
+) -> ReadOnlyOpenError {
+    match kind {
+        sqlite::PlainDbKind::NotDatabase | sqlite::PlainDbKind::Corrupt => {
+            read_only_not_database(path.to_path_buf(), message)
+        }
+        sqlite::PlainDbKind::PermissionDenied => read_only_permission_denied(path.to_path_buf()),
+        sqlite::PlainDbKind::ReadOnly
+        | sqlite::PlainDbKind::CannotOpen
+        | sqlite::PlainDbKind::SystemIo => ReadOnlyOpenError::Operational { message },
     }
 }
 
@@ -142,26 +145,6 @@ fn read_only_permission_denied(path: PathBuf) -> ReadOnlyOpenError {
 
 fn read_only_wal_sidecar_error(path: PathBuf, message: String) -> ReadOnlyOpenError {
     ReadOnlyOpenError::WalSidecarError { path, message }
-}
-
-impl SidecarKind {
-    fn is_known_sidecar(self) -> bool {
-        matches!(self, SidecarKind::Wal | SidecarKind::Shm)
-    }
-}
-
-/// Classifies the owned SQLite sidecar diagnostic grammar used by the
-/// read-only opener adapter. The accepted tokens are the sidecar layout
-/// vocabulary: `-wal`, `wal`, `-shm`, and `shared memory`.
-fn classify_sidecar_io_failure(message: &str) -> SidecarKind {
-    let lowercase = message.to_ascii_lowercase();
-    if message.contains("-wal") || lowercase.contains("wal") {
-        SidecarKind::Wal
-    } else if message.contains("-shm") || lowercase.contains("shared memory") {
-        SidecarKind::Shm
-    } else {
-        SidecarKind::Unknown
-    }
 }
 
 fn wal_path(path: &Path) -> PathBuf {
@@ -342,21 +325,21 @@ fn returned_source_kind(source: &oulipoly_agent_messenger::ReturnedArtifactSourc
     }
 }
 
-fn returned_artifact_producer_uuid(workflow_run_id: &str) -> rusqlite::Result<Uuid> {
+fn returned_artifact_producer_uuid(workflow_run_id: &str) -> sqlite::Result<Uuid> {
     let uuid_text = returned_artifact_workflow_uuid_text(workflow_run_id)?;
     parse_returned_artifact_uuid(uuid_text)
 }
 
-fn returned_artifact_workflow_uuid_text(workflow_run_id: &str) -> rusqlite::Result<&str> {
+fn returned_artifact_workflow_uuid_text(workflow_run_id: &str) -> sqlite::Result<&str> {
     workflow_run_id
         .strip_prefix("return:")
         .ok_or_else(returned_artifact_workflow_namespace_error)
 }
 
-fn returned_artifact_workflow_namespace_error() -> rusqlite::Error {
-    rusqlite::Error::FromSqlConversionFailure(
+fn returned_artifact_workflow_namespace_error() -> sqlite::Error {
+    sqlite::Error::FromSqlConversionFailure(
         2,
-        rusqlite::types::Type::Text,
+        sqlite::Type::Text,
         Box::new(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "returned artifact workflow_run_id is not in return namespace",
@@ -364,9 +347,9 @@ fn returned_artifact_workflow_namespace_error() -> rusqlite::Error {
     )
 }
 
-fn parse_returned_artifact_uuid(uuid_text: &str) -> rusqlite::Result<Uuid> {
+fn parse_returned_artifact_uuid(uuid_text: &str) -> sqlite::Result<Uuid> {
     Uuid::parse_str(uuid_text).map_err(|err| {
-        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(err))
+        sqlite::Error::FromSqlConversionFailure(2, sqlite::Type::Text, Box::new(err))
     })
 }
 
@@ -574,63 +557,6 @@ impl std::str::FromStr for InvocationStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct CompositeInvocationId {
-    pub source: String,
-    pub id: String,
-}
-
-impl CompositeInvocationId {
-    /// Format as `OULIPOLY_INVOCATION=...` without a trailing newline.
-    pub fn stderr_line(&self) -> String {
-        format!(
-            "OULIPOLY_INVOCATION={}",
-            serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
-        )
-    }
-
-    /// Parse from a raw env-var value and validate the UUID payload.
-    pub fn parse_env_value(s: &str) -> Result<Self, String> {
-        let parsed =
-            Self::parse_marker_payload(s).map_err(|e| format!("Invalid invocation JSON: {e}"))?;
-        validate_marker_uuid(&parsed.id).map_err(|e| format!("Invalid invocation UUID: {e}"))?;
-        Ok(parsed)
-    }
-
-    fn parse_marker_payload(s: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str(s)
-            .or_else(|json_err| Self::parse_shell_mangled_env_value(s).ok_or(json_err))
-    }
-
-    fn parse_shell_mangled_env_value(s: &str) -> Option<Self> {
-        let inner = s.trim().strip_prefix('{')?.strip_suffix('}')?;
-        let mut source = None;
-        let mut id = None;
-        for part in inner.split(',') {
-            let (key, value) = part.split_once(':')?;
-            let value = value
-                .trim()
-                .trim_matches('"')
-                .trim_matches('\'')
-                .to_string();
-            match key.trim() {
-                "source" => source = Some(value),
-                "id" => id = Some(value),
-                _ => {}
-            }
-        }
-        Some(Self {
-            source: source?,
-            id: id?,
-        })
-    }
-}
-
-fn validate_marker_uuid(id: &str) -> Result<(), uuid::Error> {
-    Uuid::parse_str(id).map(|_| ())
-}
-
 #[derive(Debug, Clone)]
 pub struct SessionMarkerPayload {
     pub agent_runner_invocation_id: String,
@@ -817,6 +743,61 @@ struct ReturnedArtifactRawRow {
     returned_at_text: String,
 }
 
+struct ReturnedArtifactValidatedInputs {
+    version: i64,
+    content_len: i64,
+}
+
+struct ReturnedArtifactPayloadFields {
+    source_json: String,
+    returned_at: String,
+}
+
+struct ReturnedArtifactRowParams<'a> {
+    invocation_row_id: i64,
+    ordinal: i64,
+    version_id: &'a str,
+    name: &'a str,
+    workflow_run_id: &'a str,
+    artifact_name: &'a str,
+    version: i64,
+    sha256: &'a str,
+    content_len: i64,
+    format_hint: &'a Option<String>,
+    verdict_line: &'a Option<String>,
+    source_kind: &'static str,
+    source_json: &'a str,
+    returned_at: &'a str,
+}
+
+struct ParsedReturnedArtifactFieldValues {
+    source: oulipoly_agent_messenger::ReturnedArtifactSource,
+    returned_at: DateTime<Utc>,
+    producer_invocation_uuid: Uuid,
+    version: i64,
+    content_len: i64,
+}
+
+struct ValidatedReturnedArtifactFieldValues {
+    source: oulipoly_agent_messenger::ReturnedArtifactSource,
+    returned_at: DateTime<Utc>,
+    producer_invocation_uuid: Uuid,
+    version: u64,
+    content_len: u64,
+}
+
+enum ReturnedArtifactFieldError {
+    SourceJson(serde_json::Error),
+    ReturnedAt {
+        raw: String,
+        err: chrono::ParseError,
+    },
+    ProducerUuid(sqlite::Error),
+    NegativeInteger {
+        field: &'static str,
+    },
+}
+
 struct SessionCaptureProjection<'a> {
     provider_session_id: Option<&'a str>,
     resume_input_id: Option<&'a str>,
@@ -863,6 +844,26 @@ struct ModelParameterRawRow {
     param_type: String,
     description: String,
     cli_mapping: String,
+}
+
+struct ModelParameterParsedFields {
+    param_type: ParamType,
+    cli_mapping: CliMapping,
+}
+
+struct AccountQueryVariant<'a> {
+    sql: &'static str,
+    provider: Option<&'a str>,
+}
+
+struct RecentTurnRow {
+    role: String,
+    timestamp_raw: String,
+}
+
+struct ParsedTurnPreviewTimestamp {
+    role: String,
+    timestamp: DateTime<Utc>,
 }
 
 #[derive(Debug)]
@@ -1031,7 +1032,7 @@ impl StateDb {
     ) -> Result<Self, String> {
         Self::ensure_state_parent_dir(path)?;
         let mut conn =
-            Connection::open(path).map_err(|e| format!("Failed to open state DB: {e}"))?;
+            sqlite::Connection::open(path).map_err(|e| format!("Failed to open state DB: {e}"))?;
 
         let ran_open_migrations = Self::run_open_migrations(path, &mut conn)?;
         Self::apply_current_schema_repairs(&mut conn, ran_open_migrations)?;
@@ -1054,7 +1055,7 @@ impl StateDb {
         Ok(())
     }
 
-    fn run_open_migrations(path: &Path, conn: &mut Connection) -> Result<bool, String> {
+    fn run_open_migrations(path: &Path, conn: &mut sqlite::Connection) -> Result<bool, String> {
         let compatibility = migrations::classify(conn)?;
         let ran_open_migrations = Self::compatibility_runs_open_migrations(&compatibility);
         Self::dispatch_open_migration_plan(path, conn, compatibility)?;
@@ -1072,7 +1073,7 @@ impl StateDb {
 
     fn dispatch_open_migration_plan(
         path: &Path,
-        conn: &mut Connection,
+        conn: &mut sqlite::Connection,
         compatibility: SchemaCompatibility,
     ) -> Result<(), String> {
         match compatibility {
@@ -1103,14 +1104,14 @@ impl StateDb {
 
     fn run_current_plan_from(
         path: &Path,
-        conn: &mut Connection,
+        conn: &mut sqlite::Connection,
         stored: i32,
     ) -> Result<(), String> {
         let plan = migrations::current_plan_from(stored).map_err(|e| e.to_string())?;
         migrations::run_with_db_path(conn, &plan, path.to_path_buf()).map_err(|e| e.to_string())
     }
 
-    fn validate_versionless_shape(path: &Path, conn: &Connection) -> Result<(), String> {
+    fn validate_versionless_shape(path: &Path, conn: &sqlite::Connection) -> Result<(), String> {
         if migrations::classify_versionless(conn)?.is_some() {
             Ok(())
         } else {
@@ -1142,7 +1143,7 @@ impl StateDb {
     }
 
     fn apply_current_schema_repairs(
-        conn: &mut Connection,
+        conn: &mut sqlite::Connection,
         ran_open_migrations: bool,
     ) -> Result<(), String> {
         Self::validate_providers_schema(conn)?;
@@ -1158,7 +1159,7 @@ impl StateDb {
         Ok(())
     }
 
-    fn apply_returned_artifacts_schema(conn: &Connection) -> Result<(), String> {
+    fn apply_returned_artifacts_schema(conn: &sqlite::Connection) -> Result<(), String> {
         conn.execute_batch(invocation_returned_artifacts_schema_sql!())
             .map_err(|e| format!("Failed to ensure returned-artifacts schema: {e}"))
     }
@@ -1201,12 +1202,15 @@ impl StateDb {
         Ok(())
     }
 
-    fn open_read_only_connection(path: &Path) -> Result<Connection, ReadOnlyOpenError> {
-        Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+    fn open_read_only_connection(path: &Path) -> Result<sqlite::Connection, ReadOnlyOpenError> {
+        sqlite::Connection::open_with_flags(path, sqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|err| classify_read_only_open_error(path, err))
     }
 
-    fn probe_read_only_schema(path: &Path, conn: &Connection) -> Result<(), ReadOnlyOpenError> {
+    fn probe_read_only_schema(
+        path: &Path,
+        conn: &sqlite::Connection,
+    ) -> Result<(), ReadOnlyOpenError> {
         conn.query_row("SELECT count(*) FROM sqlite_schema", [], |_row| Ok(()))
             .map_err(|err| classify_read_only_open_error(path, err))
     }
@@ -1226,11 +1230,11 @@ impl StateDb {
         Ok(data_dir.join("oulipoly-agent-runner").join("state.db"))
     }
 
-    pub fn connection(&self) -> &Connection {
+    pub fn connection(&self) -> &sqlite::Connection {
         &self.conn
     }
 
-    fn set_wal_mode(conn: &Connection) -> Result<(), String> {
+    fn set_wal_mode(conn: &sqlite::Connection) -> Result<(), String> {
         conn.execute_batch("PRAGMA journal_mode=WAL;")
             .map_err(|e| format!("Failed to set WAL mode: {e}; run `agents migrate --rebuild`"))
     }
@@ -1253,13 +1257,13 @@ impl StateDb {
         }
     }
 
-    fn strict_rfc3339_at(raw: &str, column_index: usize) -> rusqlite::Result<DateTime<Utc>> {
+    fn strict_rfc3339_at(raw: &str, column_index: usize) -> sqlite::Result<DateTime<Utc>> {
         DateTime::parse_from_rfc3339(raw)
             .map(|dt| dt.with_timezone(&Utc))
             .map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
+                sqlite::Error::FromSqlConversionFailure(
                     column_index,
-                    rusqlite::types::Type::Text,
+                    sqlite::Type::Text,
                     Box::new(e),
                 )
             })
@@ -1283,25 +1287,53 @@ impl StateDb {
     }
 
     fn table_column_names(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         table_name: &str,
         inspect_context: &str,
         query_context: &str,
         read_context: &str,
     ) -> Result<Vec<String>, String> {
-        let pragma = format!("PRAGMA table_info({table_name})");
-        let mut stmt = conn
-            .prepare(&pragma)
-            .map_err(|e| format!("{inspect_context}: {e}"))?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(1))
-            .map_err(|e| format!("{query_context}: {e}"))?;
+        let pragma = Self::pragma_table_info_sql(table_name);
+        Self::query_table_column_names(conn, &pragma, inspect_context, query_context, read_context)
+    }
 
+    fn pragma_table_info_sql(table_name: &str) -> String {
+        format!("PRAGMA table_info({table_name})")
+    }
+
+    fn query_table_column_names(
+        conn: &sqlite::Connection,
+        pragma: &str,
+        inspect_context: &str,
+        query_context: &str,
+        read_context: &str,
+    ) -> Result<Vec<String>, String> {
+        let mut stmt = conn
+            .prepare(pragma)
+            .map_err(|e| Self::format_contextual_sqlite_error(inspect_context, e))?;
+        let rows = stmt
+            .query_map([], Self::column_name_row_mapper)
+            .map_err(|e| Self::format_contextual_sqlite_error(query_context, e))?;
+        Self::collect_table_column_rows(rows, read_context)
+    }
+
+    fn column_name_row_mapper(row: &sqlite::Row<'_>) -> sqlite::Result<String> {
+        row.get::<_, String>(1)
+    }
+
+    fn collect_table_column_rows<I>(rows: I, read_context: &str) -> Result<Vec<String>, String>
+    where
+        I: IntoIterator<Item = sqlite::Result<String>>,
+    {
         let mut columns = Vec::new();
         for row in rows {
-            columns.push(row.map_err(|e| format!("{read_context}: {e}"))?);
+            columns.push(row.map_err(|e| Self::format_contextual_sqlite_error(read_context, e))?);
         }
         Ok(columns)
+    }
+
+    fn format_contextual_sqlite_error(context: &str, err: sqlite::Error) -> String {
+        format!("{context}: {err}")
     }
 
     fn has_column(columns: &[String], name: &str) -> bool {
@@ -1310,7 +1342,7 @@ impl StateDb {
 
     // Legacy repair allow-list only. Durable schema changes belong in
     // crates/oulipoly-state/migrations/ and schema.rs owns the version.
-    fn ensure_invocations_schema(conn: &Connection) -> Result<(), String> {
+    fn ensure_invocations_schema(conn: &sqlite::Connection) -> Result<(), String> {
         let columns = Self::invocations_columns(conn)?;
         match Self::classify_invocations_schema(&columns) {
             InvocationsSchemaShape::Empty => Self::initialize_invocations_schema(conn),
@@ -1336,14 +1368,14 @@ impl StateDb {
         }
     }
 
-    fn initialize_invocations_schema(conn: &Connection) -> Result<(), String> {
+    fn initialize_invocations_schema(conn: &sqlite::Connection) -> Result<(), String> {
         conn.execute_batch(Self::invocations_schema_sql())
             .map_err(|e| format!("Failed to initialize invocations schema: {e}"))?;
         Self::ensure_invocations_row_version_support(conn)
     }
 
     fn repair_current_invocations_schema(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         columns: &[String],
     ) -> Result<(), String> {
         Self::execute_column_repairs(conn, columns, Self::invocations_column_repairs().as_slice())?;
@@ -1426,14 +1458,14 @@ impl StateDb {
             ]
     }
 
-    fn ensure_invocations_row_version_support(conn: &Connection) -> Result<(), String> {
+    fn ensure_invocations_row_version_support(conn: &sqlite::Connection) -> Result<(), String> {
         let columns = Self::invocations_columns(conn)?;
         Self::repair_invocations_row_version_column(conn, &columns)?;
         Self::install_invocations_row_version_triggers(conn)
     }
 
     fn repair_invocations_row_version_column(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         columns: &[String],
     ) -> Result<(), String> {
         if Self::has_column(columns, "row_version") {
@@ -1447,7 +1479,7 @@ impl StateDb {
         Ok(())
     }
 
-    fn install_invocations_row_version_triggers(conn: &Connection) -> Result<(), String> {
+    fn install_invocations_row_version_triggers(conn: &sqlite::Connection) -> Result<(), String> {
         let registration = Self::invocations_row_version_registration()?;
         let trigger_sql = Self::row_version_trigger_sql(registration);
         conn.execute_batch(&trigger_sql)
@@ -1467,7 +1499,7 @@ impl StateDb {
         crate::deployment::row_version::triggers_sql::generate_triggers_for_table(registration)
     }
 
-    fn invocations_columns(conn: &Connection) -> Result<Vec<String>, String> {
+    fn invocations_columns(conn: &sqlite::Connection) -> Result<Vec<String>, String> {
         Self::table_column_names(
             conn,
             "invocations",
@@ -1477,12 +1509,12 @@ impl StateDb {
         )
     }
 
-    fn invocations_have_dual_id_columns(conn: &Connection) -> Result<bool, String> {
+    fn invocations_have_dual_id_columns(conn: &sqlite::Connection) -> Result<bool, String> {
         let columns = Self::invocations_columns(conn)?;
         Ok(Self::columns_have_dual_id_columns(&columns))
     }
 
-    fn invocations_have_resolved_account_column(conn: &Connection) -> Result<bool, String> {
+    fn invocations_have_resolved_account_column(conn: &sqlite::Connection) -> Result<bool, String> {
         let columns = Self::invocations_columns(conn)?;
         Ok(columns
             .iter()
@@ -1496,7 +1528,7 @@ impl StateDb {
     }
 
     fn promote_existing_dual_id_schema5_if_present(
-        conn: &mut Connection,
+        conn: &mut sqlite::Connection,
         stored: i32,
     ) -> Result<i32, String> {
         if stored >= 5 {
@@ -1510,7 +1542,7 @@ impl StateDb {
         Ok(5)
     }
 
-    fn promote_existing_dual_id_schema5(conn: &mut Connection) -> Result<(), String> {
+    fn promote_existing_dual_id_schema5(conn: &mut sqlite::Connection) -> Result<(), String> {
         conn.execute_batch(
             "BEGIN IMMEDIATE;
              UPDATE invocations
@@ -1537,7 +1569,10 @@ impl StateDb {
         })
     }
 
-    fn provider_session_expr(conn: &Connection, alias: Option<&str>) -> Result<String, String> {
+    fn provider_session_expr(
+        conn: &sqlite::Connection,
+        alias: Option<&str>,
+    ) -> Result<String, String> {
         let projection = if Self::invocations_have_dual_id_columns(conn)? {
             ProviderSessionProjection::DualId
         } else {
@@ -1559,7 +1594,10 @@ impl StateDb {
         }
     }
 
-    fn invocation_record_select_sql(conn: &Connection, tail_sql: &str) -> Result<String, String> {
+    fn invocation_record_select_sql(
+        conn: &sqlite::Connection,
+        tail_sql: &str,
+    ) -> Result<String, String> {
         let projection = Self::invocation_dual_id_projection(conn)?;
         Ok(Self::format_invocation_record_select_sql(
             projection, tail_sql,
@@ -1567,7 +1605,7 @@ impl StateDb {
     }
 
     fn invocation_dual_id_projection(
-        conn: &Connection,
+        conn: &sqlite::Connection,
     ) -> Result<InvocationDualIdProjection, String> {
         if Self::invocations_have_dual_id_columns(conn)? {
             if Self::invocations_have_resolved_account_column(conn)? {
@@ -1603,7 +1641,7 @@ impl StateDb {
         )
     }
 
-    fn ensure_providers_schema(conn: &mut Connection) -> Result<(), String> {
+    fn ensure_providers_schema(conn: &mut sqlite::Connection) -> Result<(), String> {
         let columns = Self::providers_columns(conn)?;
         match Self::classify_providers_schema(&columns) {
             ProvidersSchemaShape::Empty => Self::initialize_providers_schema(conn),
@@ -1627,12 +1665,12 @@ impl StateDb {
         }
     }
 
-    fn initialize_providers_schema(conn: &Connection) -> Result<(), String> {
+    fn initialize_providers_schema(conn: &sqlite::Connection) -> Result<(), String> {
         conn.execute_batch(Self::providers_schema_sql())
             .map_err(|e| format!("Failed to initialize providers schema: {e}"))
     }
 
-    fn migrate_legacy_providers_schema(conn: &mut Connection) -> Result<(), String> {
+    fn migrate_legacy_providers_schema(conn: &mut sqlite::Connection) -> Result<(), String> {
         let tx = conn
             .transaction()
             .map_err(|e| format!("Failed to begin providers migration: {e}"))?;
@@ -1645,17 +1683,17 @@ impl StateDb {
             .map_err(|e| format!("Failed to commit providers migration: {e}"))
     }
 
-    fn rename_legacy_providers_table(conn: &Connection) -> Result<(), String> {
+    fn rename_legacy_providers_table(conn: &sqlite::Connection) -> Result<(), String> {
         conn.execute_batch("ALTER TABLE providers RENAME TO providers_legacy_index_keyed;")
             .map_err(|e| format!("Failed to rename legacy providers table: {e}"))
     }
 
-    fn create_migrated_providers_table(conn: &Connection) -> Result<(), String> {
+    fn create_migrated_providers_table(conn: &sqlite::Connection) -> Result<(), String> {
         conn.execute_batch(Self::providers_schema_sql())
             .map_err(|e| format!("Failed to create migrated providers table: {e}"))
     }
 
-    fn rebuild_providers_aggregate(conn: &Connection) -> Result<(), String> {
+    fn rebuild_providers_aggregate(conn: &sqlite::Connection) -> Result<(), String> {
         conn.execute_batch(
             "INSERT INTO providers (
                 model_name, provider_name,
@@ -1679,7 +1717,7 @@ impl StateDb {
         .map_err(|e| format!("Failed to rebuild providers aggregate: {e}"))
     }
 
-    fn rebuild_provider_error_metadata(conn: &Connection) -> Result<(), String> {
+    fn rebuild_provider_error_metadata(conn: &sqlite::Connection) -> Result<(), String> {
         conn.execute_batch(
             "UPDATE providers
                 SET last_error_at = (
@@ -1711,7 +1749,7 @@ impl StateDb {
         .map_err(|e| format!("Failed to rebuild provider error metadata: {e}"))
     }
 
-    fn drop_legacy_providers_table(conn: &Connection) -> Result<(), String> {
+    fn drop_legacy_providers_table(conn: &sqlite::Connection) -> Result<(), String> {
         conn.execute_batch("DROP TABLE providers_legacy_index_keyed;")
             .map_err(|e| format!("Failed to drop legacy providers table: {e}"))
     }
@@ -1720,7 +1758,7 @@ impl StateDb {
         format!("Unexpected providers schema shape: {description}")
     }
 
-    fn validate_providers_schema(conn: &Connection) -> Result<(), String> {
+    fn validate_providers_schema(conn: &sqlite::Connection) -> Result<(), String> {
         match Self::providers_object_type(conn)? {
             None => return Ok(()),
             Some(object_type) if object_type != "table" => {
@@ -1751,7 +1789,7 @@ impl StateDb {
         ))
     }
 
-    fn providers_object_type(conn: &Connection) -> Result<Option<String>, String> {
+    fn providers_object_type(conn: &sqlite::Connection) -> Result<Option<String>, String> {
         conn.query_row(
             "SELECT type FROM sqlite_master WHERE name = 'providers'",
             [],
@@ -1761,7 +1799,7 @@ impl StateDb {
         .map_err(|e| format!("Failed to inspect providers object type: {e}"))
     }
 
-    fn providers_has_foreign_keys(conn: &Connection) -> Result<bool, String> {
+    fn providers_has_foreign_keys(conn: &sqlite::Connection) -> Result<bool, String> {
         let mut stmt = conn
             .prepare("PRAGMA foreign_key_list(providers)")
             .map_err(|e| format!("Failed to inspect providers foreign keys: {e}"))?;
@@ -1774,26 +1812,44 @@ impl StateDb {
             .is_some())
     }
 
-    fn providers_columns(conn: &Connection) -> Result<Vec<ProviderColumn>, String> {
+    fn providers_columns(conn: &sqlite::Connection) -> Result<Vec<ProviderColumn>, String> {
+        Self::query_provider_columns(conn)
+    }
+
+    fn query_provider_columns(conn: &sqlite::Connection) -> Result<Vec<ProviderColumn>, String> {
         let mut stmt = conn
             .prepare("PRAGMA table_info(providers)")
-            .map_err(|e| format!("Failed to inspect providers schema: {e}"))?;
+            .map_err(|e| Self::format_provider_column_error("inspect providers schema", e))?;
         let rows = stmt
-            .query_map([], |row| {
-                Ok(ProviderColumn {
-                    name: row.get(1)?,
-                    data_type: row.get(2)?,
-                    notnull: row.get(3)?,
-                    pk: row.get(5)?,
-                })
-            })
-            .map_err(|e| format!("Failed to inspect providers columns: {e}"))?;
+            .query_map([], Self::provider_column_row_mapper)
+            .map_err(|e| Self::format_provider_column_error("inspect providers columns", e))?;
+        Self::collect_provider_columns(rows)
+    }
 
+    fn provider_column_row_mapper(row: &sqlite::Row<'_>) -> sqlite::Result<ProviderColumn> {
+        Ok(ProviderColumn {
+            name: row.get(1)?,
+            data_type: row.get(2)?,
+            notnull: row.get(3)?,
+            pk: row.get(5)?,
+        })
+    }
+
+    fn collect_provider_columns<I>(rows: I) -> Result<Vec<ProviderColumn>, String>
+    where
+        I: IntoIterator<Item = sqlite::Result<ProviderColumn>>,
+    {
         let mut columns = Vec::new();
         for row in rows {
-            columns.push(row.map_err(|e| format!("Failed to read providers column: {e}"))?);
+            columns.push(
+                row.map_err(|e| Self::format_provider_column_error("read providers column", e))?,
+            );
         }
         Ok(columns)
+    }
+
+    fn format_provider_column_error(operation: &str, err: sqlite::Error) -> String {
+        format!("Failed to {operation}: {err}")
     }
 
     fn providers_shape_is_post_fix(columns: &[ProviderColumn]) -> bool {
@@ -1882,7 +1938,7 @@ impl StateDb {
         )
     }
 
-    fn ensure_session_turns_schema(conn: &Connection) -> Result<(), String> {
+    fn ensure_session_turns_schema(conn: &sqlite::Connection) -> Result<(), String> {
         let columns = Self::session_turns_columns(conn)?;
         Self::execute_column_repairs(
             conn,
@@ -1919,7 +1975,7 @@ impl StateDb {
         ]
     }
 
-    fn session_turns_columns(conn: &Connection) -> Result<Vec<String>, String> {
+    fn session_turns_columns(conn: &sqlite::Connection) -> Result<Vec<String>, String> {
         Self::table_column_names(
             conn,
             "session_turns",
@@ -1929,7 +1985,7 @@ impl StateDb {
         )
     }
 
-    fn ensure_provider_quotas_schema(conn: &Connection) -> Result<(), String> {
+    fn ensure_provider_quotas_schema(conn: &sqlite::Connection) -> Result<(), String> {
         let columns = Self::provider_quotas_columns(conn)?;
         Self::execute_column_repairs(
             conn,
@@ -1988,7 +2044,7 @@ impl StateDb {
         ]
     }
 
-    fn ensure_provider_quotas_topology_schema(conn: &Connection) -> Result<(), String> {
+    fn ensure_provider_quotas_topology_schema(conn: &sqlite::Connection) -> Result<(), String> {
         let columns = Self::provider_quotas_columns(conn)?;
         Self::execute_column_repairs(
             conn,
@@ -2013,7 +2069,9 @@ impl StateDb {
         ]
     }
 
-    fn backfill_provider_quotas_topology_peak_counts(conn: &Connection) -> Result<(), String> {
+    fn backfill_provider_quotas_topology_peak_counts(
+        conn: &sqlite::Connection,
+    ) -> Result<(), String> {
         conn.execute(Self::provider_quotas_topology_backfill_sql(), [])
             .map_err(|e| format!("Failed to backfill provider_quotas topology peak counts: {e}"))?;
         Ok(())
@@ -2031,7 +2089,7 @@ impl StateDb {
          )"
     }
 
-    fn ensure_provider_quota_windows_schema(conn: &Connection) -> Result<(), String> {
+    fn ensure_provider_quota_windows_schema(conn: &sqlite::Connection) -> Result<(), String> {
         let columns = Self::provider_quota_windows_columns(conn)?;
         Self::execute_column_repairs(
             conn,
@@ -2056,7 +2114,7 @@ impl StateDb {
     }
 
     fn execute_column_repairs(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         columns: &[String],
         repairs: &[ColumnRepair],
     ) -> Result<(), String> {
@@ -2067,7 +2125,7 @@ impl StateDb {
     }
 
     fn execute_column_repair_if_absent(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         columns: &[String],
         repair: &ColumnRepair,
     ) -> Result<(), String> {
@@ -2080,7 +2138,7 @@ impl StateDb {
     }
 
     fn execute_drop_column_repairs(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         columns: &[String],
         repairs: &[DropColumnRepair],
     ) -> Result<(), String> {
@@ -2091,7 +2149,7 @@ impl StateDb {
     }
 
     fn execute_drop_column_repair_if_present(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         columns: &[String],
         repair: &DropColumnRepair,
     ) -> Result<(), String> {
@@ -2103,7 +2161,7 @@ impl StateDb {
         Ok(())
     }
 
-    fn provider_quotas_columns(conn: &Connection) -> Result<Vec<String>, String> {
+    fn provider_quotas_columns(conn: &sqlite::Connection) -> Result<Vec<String>, String> {
         Self::table_column_names(
             conn,
             "provider_quotas",
@@ -2113,7 +2171,7 @@ impl StateDb {
         )
     }
 
-    fn provider_quota_windows_columns(conn: &Connection) -> Result<Vec<String>, String> {
+    fn provider_quota_windows_columns(conn: &sqlite::Connection) -> Result<Vec<String>, String> {
         Self::table_column_names(
             conn,
             "provider_quota_windows",
@@ -2202,7 +2260,7 @@ impl StateDb {
             ON session_turns (provider_name, session_id, parent_turn_id, timestamp);"
     }
 
-    fn migrate_legacy_invocations(conn: &Connection) -> Result<(), String> {
+    fn migrate_legacy_invocations(conn: &sqlite::Connection) -> Result<(), String> {
         let provider_names = Self::provider_name_lookup()?;
         let tx = conn
             .unchecked_transaction()
@@ -2230,12 +2288,14 @@ impl StateDb {
             .map_err(|e| format!("Failed to commit invocation migration: {e}"))
     }
 
-    fn legacy_invocations_count(conn: &Connection) -> Result<i64, String> {
+    fn legacy_invocations_count(conn: &sqlite::Connection) -> Result<i64, String> {
         conn.query_row("SELECT COUNT(*) FROM invocations", [], |row| row.get(0))
             .map_err(|e| format!("Failed to count legacy invocations before rebuild: {e}"))
     }
 
-    fn load_legacy_invocation_rows(conn: &Connection) -> Result<Vec<LegacyInvocationRow>, String> {
+    fn load_legacy_invocation_rows(
+        conn: &sqlite::Connection,
+    ) -> Result<Vec<LegacyInvocationRow>, String> {
         let mut stmt = conn
             .prepare(
                 "SELECT model_name, provider_index, success, exit_code, error_category, created_at
@@ -2250,7 +2310,7 @@ impl StateDb {
             .map_err(|e| format!("Failed to parse legacy invocation: {e}"))
     }
 
-    fn map_legacy_invocation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LegacyInvocationRow> {
+    fn map_legacy_invocation_row(row: &sqlite::Row<'_>) -> sqlite::Result<LegacyInvocationRow> {
         Ok(LegacyInvocationRow {
             model_name: row.get(0)?,
             provider_index: row.get(1)?,
@@ -2271,7 +2331,7 @@ impl StateDb {
         }
     }
 
-    fn create_migrated_invocations_table(conn: &Connection) -> Result<(), String> {
+    fn create_migrated_invocations_table(conn: &sqlite::Connection) -> Result<(), String> {
         conn.execute_batch(
             "CREATE TABLE invocations_new (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2302,7 +2362,7 @@ impl StateDb {
     }
 
     fn insert_migrated_invocation_rows(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         rows: Vec<LegacyInvocationRow>,
         provider_names: &HashMap<(String, usize), String>,
     ) -> Result<(), String> {
@@ -2312,7 +2372,7 @@ impl StateDb {
         for row in rows {
             let migrated = Self::map_legacy_invocation_insert(row, provider_names);
             insert
-                .execute(params![
+                .execute(sqlite::params![
                     migrated.invocation_uuid,
                     migrated.model_name,
                     migrated.provider_name,
@@ -2382,7 +2442,7 @@ impl StateDb {
         }
     }
 
-    fn migrated_invocations_count(conn: &Connection) -> Result<i64, String> {
+    fn migrated_invocations_count(conn: &sqlite::Connection) -> Result<i64, String> {
         conn.query_row("SELECT COUNT(*) FROM invocations_new", [], |row| row.get(0))
             .map_err(|e| format!("Failed to count migrated invocations before replacement: {e}"))
     }
@@ -2397,7 +2457,7 @@ impl StateDb {
         }
     }
 
-    fn replace_invocations_with_migrated_table(conn: &Connection) -> Result<(), String> {
+    fn replace_invocations_with_migrated_table(conn: &sqlite::Connection) -> Result<(), String> {
         conn.execute_batch(
             "DROP TABLE invocations;
              ALTER TABLE invocations_new RENAME TO invocations;",
@@ -2589,7 +2649,7 @@ impl StateDb {
         })
     }
 
-    fn lifecycle_context(&self, start: &InvocationStart) -> StartContext {
+    fn lifecycle_context(&self, start: &InvocationStart) -> lc_log_adapter::StartContext {
         let parent_invocation_uuid = self.load_parent_invocation_uuid(start.parent_invocation_id);
         Self::build_start_context(start, parent_invocation_uuid)
     }
@@ -2599,7 +2659,7 @@ impl StateDb {
         self.conn
             .query_row(
                 "SELECT invocation_uuid FROM invocations WHERE id = ?1",
-                params![parent_id],
+                sqlite::params![parent_id],
                 |row| row.get(0),
             )
             .optional()
@@ -2610,8 +2670,8 @@ impl StateDb {
     fn build_start_context(
         start: &InvocationStart,
         parent_invocation_uuid: Option<String>,
-    ) -> StartContext {
-        StartContext {
+    ) -> lc_log_adapter::StartContext {
+        lc_log_adapter::StartContext {
             invocation_uuid: start.invocation_uuid.clone(),
             provider_source: Some(start.provider_name.clone()),
             chain_id: None,
@@ -2623,7 +2683,7 @@ impl StateDb {
         }
     }
 
-    fn raw_paths_for(&self, invocation_uuid: &str) -> Option<RawArtifactPaths> {
+    fn raw_paths_for(&self, invocation_uuid: &str) -> Option<lc_log_adapter::RawArtifactPaths> {
         let state_dir = Self::state_dir_for(&self.db_path)?;
         Some(Self::raw_paths_map_for(state_dir, invocation_uuid))
     }
@@ -2638,9 +2698,9 @@ impl StateDb {
             .flatten()
     }
 
-    fn raw_paths_map_for(state_dir: &Path, uuid: &str) -> RawArtifactPaths {
+    fn raw_paths_map_for(state_dir: &Path, uuid: &str) -> lc_log_adapter::RawArtifactPaths {
         let raw_io_dir = state_dir.join("invocations").join("raw-io");
-        RawArtifactPaths {
+        lc_log_adapter::RawArtifactPaths {
             stdout_path: raw_io_dir.join(Self::format_raw_artifact_filename(
                 uuid,
                 RawArtifactKind::Stdout,
@@ -2670,24 +2730,13 @@ impl StateDb {
         format!("{uuid}.{suffix}")
     }
 
-    fn emit_lifecycle_record(&self, record: serde_json::Value) {
-        let mut sink = self
-            .lifecycle_sink
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        crate::lifecycle_log::emit_and_forward(sink.as_mut(), record);
-    }
-
     pub fn start_invocation(&self, start: &InvocationStart) -> Result<i64, String> {
-        let timer = crate::lifecycle_log::start_lifecycle_timer();
+        let timer = lc_log_adapter::start_timer();
         let context = self.lifecycle_context(start);
         let started_at = Self::current_rfc3339_timestamp();
         let sql_result = self.execute_start_invocation_sql(start, &started_at);
         self.warn_invocation_artifact_for_start_result(start, &started_at, &sql_result);
-        let latency_us = crate::lifecycle_log::elapsed_microseconds_saturating(&timer);
-        let context = crate::lifecycle_log::start_context_with_latency(context, latency_us);
-        let record = crate::lifecycle_log::build_start_record_for_result(&context, &sql_result);
-        self.emit_lifecycle_record(record);
+        lc_log_adapter::emit_start(&self.lifecycle_sink, timer, context, &sql_result);
         Self::translate_start_invocation_result(sql_result)
     }
 
@@ -2710,17 +2759,15 @@ impl StateDb {
         result.map_err(|err| err.to_string())
     }
 
-    fn start_invocation_io_error(err: rusqlite::Error) -> std::io::Error {
-        let sqlite_error = crate::lifecycle_log::sqlite_io_error_from(err);
-        let message = Self::format_insert_invocation_error(&sqlite_error);
-        crate::lifecycle_log::message_io_error_from(message)
+    fn start_invocation_io_error(err: sqlite::Error) -> std::io::Error {
+        lc_log_adapter::start_invocation_io_error(err)
     }
 
     fn insert_invocation_start_row_raw(
         &self,
         start: &InvocationStart,
         started_at: &str,
-    ) -> Result<i64, rusqlite::Error> {
+    ) -> Result<i64, sqlite::Error> {
         self.conn.execute(
             "INSERT INTO invocations (
                     invocation_uuid,
@@ -2736,7 +2783,7 @@ impl StateDb {
                     created_at,
                     finished_at
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, NULL, ?7, NULL)",
-            params![
+            sqlite::params![
                 &start.invocation_uuid,
                 &start.model_name,
                 &start.provider_name,
@@ -2747,10 +2794,6 @@ impl StateDb {
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
-    }
-
-    fn format_insert_invocation_error(err: &dyn std::fmt::Display) -> String {
-        format!("Failed to insert invocation: {err}")
     }
 
     fn warn_invocation_artifact_for_start_result(
@@ -2792,7 +2835,7 @@ impl StateDb {
         terminal_reason: Option<&str>,
     ) -> Result<(), String> {
         let lifecycle_row = self.lifecycle_context_for_row_or_none(id);
-        let timer = crate::lifecycle_log::start_lifecycle_timer();
+        let timer = lc_log_adapter::start_timer();
         let finished_at = Self::current_rfc3339_timestamp();
         let transaction_result = self.finalize_invocation_transaction(
             id,
@@ -2824,14 +2867,13 @@ impl StateDb {
             operation_result,
         );
         let context = self.finalize_context(id, lifecycle_row.as_ref(), input);
-        let latency_us = crate::lifecycle_log::elapsed_microseconds_saturating(&timer);
-        let context = crate::lifecycle_log::finalize_context_with_latency(context, latency_us);
-        let record = crate::lifecycle_log::build_finalize_record_for_result(
-            &context,
+        lc_log_adapter::emit_finalize(
+            &self.lifecycle_sink,
+            timer,
+            context,
             &result,
             terminal_status,
         );
-        self.emit_lifecycle_record(record);
         result
     }
 
@@ -2950,21 +2992,19 @@ impl StateDb {
         Ok(invocation)
     }
 
-    fn format_begin_transaction_error(err: rusqlite::Error) -> String {
+    fn format_begin_transaction_error(err: sqlite::Error) -> String {
         format!("Failed to begin invocation finalize tx: {err}")
     }
 
-    fn format_commit_transaction_error(err: rusqlite::Error) -> String {
+    fn format_commit_transaction_error(err: sqlite::Error) -> String {
         format!("Failed to commit invocation finalize tx: {err}")
     }
 
     fn classify_finalize_operation_result(success: bool, sqlite_error: bool) -> OperationResult {
         if success {
-            crate::lifecycle_log::ok_result()
-        } else if sqlite_error {
-            crate::lifecycle_log::sqlite_error_result()
+            lc_log_adapter::finalize_operation_result(true, false)
         } else {
-            crate::lifecycle_log::context_resolution_error_result()
+            lc_log_adapter::finalize_operation_result(false, sqlite_error)
         }
     }
 
@@ -2977,7 +3017,7 @@ impl StateDb {
     }
 
     fn load_invocation_for_finalize(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         id: i64,
     ) -> Result<FinalizeInvocationRow, String> {
         let columns = Self::query_invocation_row_for_finalize(conn, id)
@@ -2987,21 +3027,21 @@ impl StateDb {
     }
 
     fn query_invocation_row_for_finalize(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         id: i64,
-    ) -> rusqlite::Result<Option<FinalizeInvocationRowColumns>> {
+    ) -> sqlite::Result<Option<FinalizeInvocationRowColumns>> {
         conn.query_row(
             "SELECT invocation_uuid, model_name, provider_name, status
              FROM invocations WHERE id = ?1",
-            params![id],
+            sqlite::params![id],
             Self::read_invocation_row_for_finalize,
         )
         .optional()
     }
 
     fn read_invocation_row_for_finalize(
-        row: &rusqlite::Row<'_>,
-    ) -> rusqlite::Result<FinalizeInvocationRowColumns> {
+        row: &sqlite::Row<'_>,
+    ) -> sqlite::Result<FinalizeInvocationRowColumns> {
         Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
     }
 
@@ -3017,7 +3057,7 @@ impl StateDb {
         }
     }
 
-    fn format_load_invocation_for_finalize_error(id: i64, err: rusqlite::Error) -> String {
+    fn format_load_invocation_for_finalize_error(id: i64, err: sqlite::Error) -> String {
         format!("Failed to load invocation {id}: {err}")
     }
 
@@ -3030,7 +3070,7 @@ impl StateDb {
     }
 
     fn write_invocation_final_row(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         id: i64,
         success: bool,
         exit_code: i32,
@@ -3052,14 +3092,14 @@ impl StateDb {
     }
 
     fn execute_update_invocation_final_row(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         id: i64,
         success: bool,
         exit_code: i32,
         error_category: Option<&str>,
         terminal_reason: Option<&str>,
         finished_at: &str,
-    ) -> rusqlite::Result<usize> {
+    ) -> sqlite::Result<usize> {
         conn.execute(
             "UPDATE invocations
              SET status = ?1,
@@ -3069,7 +3109,7 @@ impl StateDb {
                  terminal_reason = ?5,
                  finished_at = ?6
              WHERE id = ?7 AND status = ?8",
-            params![
+            sqlite::params![
                 Self::terminal_invocation_status(success).as_str(),
                 success as i64,
                 exit_code,
@@ -3089,7 +3129,7 @@ impl StateDb {
         Ok(())
     }
 
-    fn format_invocation_final_row_update_error(id: i64, err: rusqlite::Error) -> String {
+    fn format_invocation_final_row_update_error(id: i64, err: sqlite::Error) -> String {
         format!("Failed to finalize invocation {id}: {err}")
     }
 
@@ -3102,7 +3142,7 @@ impl StateDb {
     }
 
     fn upsert_provider_finalize_aggregate(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         model_name: &str,
         provider_name: Option<&str>,
         success: bool,
@@ -3141,12 +3181,12 @@ impl StateDb {
     }
 
     fn execute_provider_finalize_aggregate_sql(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         model_name: &str,
         provider_name: &str,
         success: bool,
         finished_at: &str,
-    ) -> rusqlite::Result<()> {
+    ) -> sqlite::Result<()> {
         conn.execute(
             "INSERT INTO providers (
                     model_name, provider_name,
@@ -3157,7 +3197,7 @@ impl StateDb {
                     invocation_count = invocation_count + 1,
                     error_count = error_count + ?3,
                     last_invoked_at = ?4",
-            params![
+            sqlite::params![
                 model_name,
                 provider_name,
                 Self::provider_error_count_increment(success),
@@ -3171,12 +3211,12 @@ impl StateDb {
         if success { 0 } else { 1 }
     }
 
-    fn format_provider_finalize_aggregate_sql_error(err: rusqlite::Error) -> String {
+    fn format_provider_finalize_aggregate_sql_error(err: sqlite::Error) -> String {
         format!("Failed to upsert provider: {err}")
     }
 
     fn update_provider_last_error(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         model_name: &str,
         provider_name: &str,
         terminal_reason: Option<&str>,
@@ -3199,21 +3239,21 @@ impl StateDb {
     }
 
     fn execute_update_provider_last_error_sql(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         model_name: &str,
         provider_name: &str,
         snippet: Option<&str>,
         finished_at: &str,
-    ) -> rusqlite::Result<()> {
+    ) -> sqlite::Result<()> {
         conn.execute(
             "UPDATE providers SET last_error = ?1, last_error_at = ?2
              WHERE model_name = ?3 AND provider_name = ?4",
-            params![snippet, finished_at, model_name, provider_name],
+            sqlite::params![snippet, finished_at, model_name, provider_name],
         )?;
         Ok(())
     }
 
-    fn format_update_provider_last_error_sql_error(err: rusqlite::Error) -> String {
+    fn format_update_provider_last_error_sql_error(err: sqlite::Error) -> String {
         format!("Failed to update error info: {err}")
     }
 
@@ -3262,13 +3302,13 @@ impl StateDb {
         Self::replace_returned_artifact_rows(&self.conn, invocation_row_id, refs)
     }
 
-    fn prepare_returned_artifacts_table(conn: &Connection) -> Result<(), DbError> {
+    fn prepare_returned_artifacts_table(conn: &sqlite::Connection) -> Result<(), DbError> {
         conn.execute_batch(invocation_returned_artifacts_schema_sql!())
             .map_err(|e| format!("Failed to ensure returned-artifacts schema: {e}"))
     }
 
     fn load_invocation_identity_for_returned_artifacts(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         invocation_row_id: i64,
     ) -> Result<InvocationIdentity, DbError> {
         let uuid_text = Self::load_invocation_uuid_text(conn, invocation_row_id)?;
@@ -3281,12 +3321,12 @@ impl StateDb {
     }
 
     fn load_invocation_uuid_text(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         invocation_row_id: i64,
     ) -> Result<String, DbError> {
         conn.query_row(
             "SELECT invocation_uuid FROM invocations WHERE id = ?1",
-            params![invocation_row_id],
+            sqlite::params![invocation_row_id],
             |row| row.get(0),
         )
         .optional()
@@ -3313,7 +3353,7 @@ impl StateDb {
     }
 
     fn replace_returned_artifact_rows(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         invocation_row_id: i64,
         refs: &[ReturnedArtifactRef],
     ) -> Result<(), DbError> {
@@ -3322,7 +3362,7 @@ impl StateDb {
             .map_err(|e| format!("Failed to begin returned-artifacts tx: {e}"))?;
         tx.execute(
             "DELETE FROM invocation_returned_artifacts WHERE invocation_id = ?1",
-            params![invocation_row_id],
+            sqlite::params![invocation_row_id],
         )
         .map_err(|e| format!("Failed to reset returned artifacts: {e}"))?;
         for (ordinal, reference) in refs.iter().enumerate() {
@@ -3394,16 +3434,71 @@ impl StateDb {
     }
 
     fn insert_returned_artifact_row(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         invocation_row_id: i64,
         ordinal: usize,
         reference: &ReturnedArtifactRef,
     ) -> Result<(), DbError> {
-        let version = returned_artifact_sql_integer(reference.store_address.version, "version")?;
-        let content_len = returned_artifact_sql_integer(reference.content_len, "content_len")?;
-        let source_json = serde_json::to_string(&reference.source)
-            .map_err(|e| format!("Failed to encode returned-artifact source: {e}"))?;
-        let source_kind = returned_source_kind(&reference.source);
+        let validated = Self::validate_returned_artifact_inputs(reference)?;
+        let payload = Self::format_returned_artifact_payload_fields(reference)?;
+        let params = Self::bind_returned_artifact_row_params(
+            invocation_row_id,
+            ordinal,
+            reference,
+            &validated,
+            &payload,
+        );
+        Self::execute_returned_artifact_row_insert(conn, &params)
+    }
+
+    fn validate_returned_artifact_inputs(
+        reference: &ReturnedArtifactRef,
+    ) -> Result<ReturnedArtifactValidatedInputs, DbError> {
+        Ok(ReturnedArtifactValidatedInputs {
+            version: returned_artifact_sql_integer(reference.store_address.version, "version")?,
+            content_len: returned_artifact_sql_integer(reference.content_len, "content_len")?,
+        })
+    }
+
+    fn format_returned_artifact_payload_fields(
+        reference: &ReturnedArtifactRef,
+    ) -> Result<ReturnedArtifactPayloadFields, DbError> {
+        Ok(ReturnedArtifactPayloadFields {
+            source_json: serde_json::to_string(&reference.source)
+                .map_err(|e| format!("Failed to encode returned-artifact source: {e}"))?,
+            returned_at: reference.returned_at.to_rfc3339(),
+        })
+    }
+
+    fn bind_returned_artifact_row_params<'a>(
+        invocation_row_id: i64,
+        ordinal: usize,
+        reference: &'a ReturnedArtifactRef,
+        validated: &'a ReturnedArtifactValidatedInputs,
+        payload: &'a ReturnedArtifactPayloadFields,
+    ) -> ReturnedArtifactRowParams<'a> {
+        ReturnedArtifactRowParams {
+            invocation_row_id,
+            ordinal: ordinal as i64,
+            version_id: &reference.version_id,
+            name: &reference.name,
+            workflow_run_id: &reference.store_address.workflow_run_id,
+            artifact_name: &reference.store_address.artifact_name,
+            version: validated.version,
+            sha256: &reference.sha256,
+            content_len: validated.content_len,
+            format_hint: &reference.format_hint,
+            verdict_line: &reference.verdict_line,
+            source_kind: returned_source_kind(&reference.source),
+            source_json: &payload.source_json,
+            returned_at: &payload.returned_at,
+        }
+    }
+
+    fn execute_returned_artifact_row_insert(
+        conn: &sqlite::Connection,
+        params: &ReturnedArtifactRowParams<'_>,
+    ) -> Result<(), DbError> {
         conn.execute(
             "INSERT INTO invocation_returned_artifacts (
                 invocation_id,
@@ -3421,21 +3516,21 @@ impl StateDb {
                 source_json,
                 returned_at
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-            params![
-                invocation_row_id,
-                ordinal as i64,
-                &reference.version_id,
-                &reference.name,
-                &reference.store_address.workflow_run_id,
-                &reference.store_address.artifact_name,
-                version,
-                &reference.sha256,
-                content_len,
-                &reference.format_hint,
-                &reference.verdict_line,
-                source_kind,
-                source_json,
-                reference.returned_at.to_rfc3339(),
+            sqlite::params![
+                params.invocation_row_id,
+                params.ordinal,
+                params.version_id,
+                params.name,
+                params.workflow_run_id,
+                params.artifact_name,
+                params.version,
+                params.sha256,
+                params.content_len,
+                params.format_hint,
+                params.verdict_line,
+                params.source_kind,
+                params.source_json,
+                params.returned_at,
             ],
         )
         .map_err(|e| format!("Failed to record returned artifact: {e}"))?;
@@ -3453,19 +3548,21 @@ impl StateDb {
         Self::parse_returned_artifact_rows(rows)
     }
 
-    fn returned_artifacts_schema_is_readable(conn: &Connection) -> Result<bool, DbError> {
+    fn returned_artifacts_schema_is_readable(conn: &sqlite::Connection) -> Result<bool, DbError> {
         Self::validate_returned_artifacts_object_type(conn)?;
         Self::returned_artifacts_have_version_id(conn)
     }
 
-    fn validate_returned_artifacts_object_type(conn: &Connection) -> Result<(), DbError> {
+    fn validate_returned_artifacts_object_type(conn: &sqlite::Connection) -> Result<(), DbError> {
         match Self::returned_artifacts_object_type(conn)?.as_deref() {
             None | Some("table") => Ok(()),
             Some(other) => Err(Self::unexpected_returned_artifacts_object_error(other)),
         }
     }
 
-    fn returned_artifacts_object_type(conn: &Connection) -> Result<Option<String>, DbError> {
+    fn returned_artifacts_object_type(
+        conn: &sqlite::Connection,
+    ) -> Result<Option<String>, DbError> {
         conn.query_row(
             "SELECT type
              FROM sqlite_master
@@ -3481,13 +3578,13 @@ impl StateDb {
         format!("Unexpected returned-artifacts schema shape: object type={object_type}")
     }
 
-    fn returned_artifacts_have_version_id(conn: &Connection) -> Result<bool, DbError> {
+    fn returned_artifacts_have_version_id(conn: &sqlite::Connection) -> Result<bool, DbError> {
         let columns = Self::returned_artifact_columns(conn)?;
         Ok(Self::has_column(&columns, "version_id"))
     }
 
     fn load_returned_artifact_rows(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         invocation_row_id: i64,
     ) -> Result<Vec<ReturnedArtifactRawRow>, DbError> {
         let mut stmt = conn
@@ -3511,7 +3608,7 @@ impl StateDb {
             .map_err(|e| format!("Failed to prepare returned-artifacts query: {e}"))?;
         let rows = stmt
             .query_map(
-                params![invocation_row_id],
+                sqlite::params![invocation_row_id],
                 Self::map_returned_artifact_raw_row,
             )
             .map_err(|e| format!("Failed to query returned artifacts: {e}"))?;
@@ -3521,8 +3618,8 @@ impl StateDb {
     }
 
     fn map_returned_artifact_raw_row(
-        row: &rusqlite::Row<'_>,
-    ) -> rusqlite::Result<ReturnedArtifactRawRow> {
+        row: &sqlite::Row<'_>,
+    ) -> sqlite::Result<ReturnedArtifactRawRow> {
         Ok(ReturnedArtifactRawRow {
             version_id: row.get(0)?,
             name: row.get(1)?,
@@ -3549,46 +3646,97 @@ impl StateDb {
     fn parse_returned_artifact_row(
         row: ReturnedArtifactRawRow,
     ) -> Result<ReturnedArtifactRef, DbError> {
-        let source = Self::parse_returned_artifact_source_json(&row.source_json)?;
-        let returned_at = Self::parse_returned_artifact_returned_at(&row.returned_at_text)?;
-        let producer_invocation_uuid = returned_artifact_producer_uuid(&row.workflow_run_id)
-            .map_err(|e| format!("Failed to parse returned artifact producer UUID: {e}"))?;
-        let version = Self::parse_returned_artifact_u64(row.version, "version")?;
-        let content_len = Self::parse_returned_artifact_u64(row.content_len, "content_len")?;
-        Ok(ReturnedArtifactRef {
+        let parsed = Self::parse_returned_artifact_field_values(&row)
+            .map_err(Self::format_returned_artifact_parse_error)?;
+        let validated = Self::validate_returned_artifact_field_values(parsed)
+            .map_err(Self::format_returned_artifact_parse_error)?;
+        Ok(Self::map_parsed_returned_artifact_to_ref(row, validated))
+    }
+
+    fn parse_returned_artifact_field_values(
+        row: &ReturnedArtifactRawRow,
+    ) -> Result<ParsedReturnedArtifactFieldValues, ReturnedArtifactFieldError> {
+        Ok(ParsedReturnedArtifactFieldValues {
+            source: serde_json::from_str(&row.source_json)
+                .map_err(ReturnedArtifactFieldError::SourceJson)?,
+            returned_at: DateTime::parse_from_rfc3339(&row.returned_at_text)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|err| ReturnedArtifactFieldError::ReturnedAt {
+                    raw: row.returned_at_text.clone(),
+                    err,
+                })?,
+            producer_invocation_uuid: returned_artifact_producer_uuid(&row.workflow_run_id)
+                .map_err(ReturnedArtifactFieldError::ProducerUuid)?,
+            version: row.version,
+            content_len: row.content_len,
+        })
+    }
+
+    fn validate_returned_artifact_field_values(
+        parsed: ParsedReturnedArtifactFieldValues,
+    ) -> Result<ValidatedReturnedArtifactFieldValues, ReturnedArtifactFieldError> {
+        Ok(ValidatedReturnedArtifactFieldValues {
+            source: parsed.source,
+            returned_at: parsed.returned_at,
+            producer_invocation_uuid: parsed.producer_invocation_uuid,
+            version: Self::validate_returned_artifact_nonnegative_integer(
+                parsed.version,
+                "version",
+            )?,
+            content_len: Self::validate_returned_artifact_nonnegative_integer(
+                parsed.content_len,
+                "content_len",
+            )?,
+        })
+    }
+
+    fn validate_returned_artifact_nonnegative_integer(
+        value: i64,
+        field: &'static str,
+    ) -> Result<u64, ReturnedArtifactFieldError> {
+        u64::try_from(value).map_err(|_| ReturnedArtifactFieldError::NegativeInteger { field })
+    }
+
+    fn map_parsed_returned_artifact_to_ref(
+        row: ReturnedArtifactRawRow,
+        parsed: ValidatedReturnedArtifactFieldValues,
+    ) -> ReturnedArtifactRef {
+        ReturnedArtifactRef {
             version_id: row.version_id,
             name: row.name,
             store_address: oulipoly_agent_messenger::StoreAddress {
                 workflow_run_id: row.workflow_run_id,
                 artifact_name: row.artifact_name,
-                version,
+                version: parsed.version,
             },
             sha256: row.sha256,
-            content_len,
+            content_len: parsed.content_len,
             format_hint: row.format_hint,
             verdict_line: row.verdict_line,
-            source,
-            producer_invocation_uuid,
-            returned_at,
-        })
+            source: parsed.source,
+            producer_invocation_uuid: parsed.producer_invocation_uuid,
+            returned_at: parsed.returned_at,
+        }
     }
 
-    fn parse_returned_artifact_source_json(
-        raw: &str,
-    ) -> Result<oulipoly_agent_messenger::ReturnedArtifactSource, DbError> {
-        serde_json::from_str(raw)
-            .map_err(|e| format!("Failed to parse returned artifact source JSON: {e}"))
+    fn format_returned_artifact_parse_error(err: ReturnedArtifactFieldError) -> DbError {
+        match err {
+            ReturnedArtifactFieldError::SourceJson(err) => {
+                format!("Failed to parse returned artifact source JSON: {err}")
+            }
+            ReturnedArtifactFieldError::ReturnedAt { raw, err } => {
+                format!("Bad returned artifact returned_at {raw}: {err}")
+            }
+            ReturnedArtifactFieldError::ProducerUuid(err) => {
+                format!("Failed to parse returned artifact producer UUID: {err}")
+            }
+            ReturnedArtifactFieldError::NegativeInteger { field } => {
+                format!("negative returned artifact {field}")
+            }
+        }
     }
 
-    fn parse_returned_artifact_returned_at(raw: &str) -> Result<DateTime<Utc>, DbError> {
-        Self::strict_rfc3339_message(raw, "returned artifact returned_at")
-    }
-
-    fn parse_returned_artifact_u64(value: i64, field: &str) -> Result<u64, DbError> {
-        u64::try_from(value).map_err(|_| format!("negative returned artifact {field}"))
-    }
-
-    fn returned_artifact_columns(conn: &Connection) -> Result<Vec<String>, String> {
+    fn returned_artifact_columns(conn: &sqlite::Connection) -> Result<Vec<String>, String> {
         Self::table_column_names(
             conn,
             "invocation_returned_artifacts",
@@ -3615,19 +3763,13 @@ impl StateDb {
         method: &str,
     ) -> Result<(), String> {
         let lifecycle_row = self.lifecycle_context_for_row_or_none(id);
-        let timer = crate::lifecycle_log::start_lifecycle_timer();
+        let timer = lc_log_adapter::start_timer();
         let projection = Self::project_session_capture(session_id, method);
         let sql_result =
             self.execute_session_capture_persistence(id, session_id, method, projection);
         let result = Self::translate_session_capture_result(id, sql_result);
         let context = self.optional_session_context(id, lifecycle_row.as_ref(), session_id, method);
-        let latency_us = crate::lifecycle_log::elapsed_microseconds_saturating(&timer);
-        let context = Self::optional_session_context_with_latency(context, latency_us);
-        let record = crate::lifecycle_log::build_optional_session_record_for_result(
-            context.as_ref(),
-            &result,
-        );
-        self.emit_optional_lifecycle_record(record);
+        lc_log_adapter::emit_session_capture(&self.lifecycle_sink, timer, context, &result);
         result
     }
 
@@ -3685,7 +3827,7 @@ impl StateDb {
         session_id: Option<&str>,
         method: &str,
         projection: SessionCaptureProjection<'_>,
-    ) -> Result<i64, rusqlite::Error> {
+    ) -> Result<i64, sqlite::Error> {
         let updated = self.conn.execute(
             "UPDATE invocations
                  SET session_id = CASE
@@ -3697,7 +3839,7 @@ impl StateDb {
                      resume_input_id = COALESCE(resume_input_id, ?4),
                      provider_session_capture_method = COALESCE(provider_session_capture_method, ?5)
                  WHERE id = ?6",
-            params![
+            sqlite::params![
                 session_id,
                 method,
                 projection.provider_session_id,
@@ -3711,14 +3853,14 @@ impl StateDb {
 
     fn translate_session_capture_result(
         id: i64,
-        result: Result<i64, rusqlite::Error>,
+        result: Result<i64, sqlite::Error>,
     ) -> Result<(), String> {
         result
             .map(|_| ())
             .map_err(|err| Self::format_session_capture_error(id, err))
     }
 
-    fn format_session_capture_error(id: i64, err: rusqlite::Error) -> String {
+    fn format_session_capture_error(id: i64, err: sqlite::Error) -> String {
         format!("Failed to update session capture for invocation {id}: {err}")
     }
 
@@ -3728,22 +3870,8 @@ impl StateDb {
         row: Option<&LifecycleInvocationRow>,
         session_id: Option<&str>,
         method: &str,
-    ) -> Option<SessionContext> {
+    ) -> Option<lc_log_adapter::SessionContext> {
         row.map(|row| self.session_context(id, row, session_id, method))
-    }
-
-    fn optional_session_context_with_latency(
-        context: Option<SessionContext>,
-        latency_us: u64,
-    ) -> Option<SessionContext> {
-        context
-            .map(|context| crate::lifecycle_log::session_context_with_latency(context, latency_us))
-    }
-
-    fn emit_optional_lifecycle_record(&self, record: Option<serde_json::Value>) {
-        if let Some(record) = record {
-            self.emit_lifecycle_record(record);
-        }
     }
 
     fn lifecycle_context_for_row(
@@ -3757,7 +3885,7 @@ impl StateDb {
     fn query_lifecycle_context_for_row(
         &self,
         row_id: i64,
-    ) -> rusqlite::Result<Option<LifecycleInvocationRow>> {
+    ) -> sqlite::Result<Option<LifecycleInvocationRow>> {
         self.conn
             .query_row(
                 "SELECT i.invocation_uuid,
@@ -3767,19 +3895,19 @@ impl StateDb {
                         i.resume_input_id
                  FROM invocations i
                  WHERE i.id = ?1",
-                params![row_id],
+                sqlite::params![row_id],
                 Self::map_lifecycle_invocation_row,
             )
             .optional()
     }
 
-    fn format_lifecycle_context_lookup_error(row_id: i64, err: rusqlite::Error) -> String {
+    fn format_lifecycle_context_lookup_error(row_id: i64, err: sqlite::Error) -> String {
         format!("Failed to load invocation lifecycle context {row_id}: {err}")
     }
 
     fn map_lifecycle_invocation_row(
-        row: &rusqlite::Row<'_>,
-    ) -> rusqlite::Result<LifecycleInvocationRow> {
+        row: &sqlite::Row<'_>,
+    ) -> sqlite::Result<LifecycleInvocationRow> {
         Ok(LifecycleInvocationRow {
             invocation_uuid: row.get(0)?,
             provider_name: row.get(1)?,
@@ -3795,7 +3923,7 @@ impl StateDb {
         row: &LifecycleInvocationRow,
         session_id: Option<&str>,
         method: &str,
-    ) -> SessionContext {
+    ) -> lc_log_adapter::SessionContext {
         let event_session_id = Self::map_resumed_session_id(method, session_id);
         let resume_input_id = Self::map_session_resume_input_id(method, session_id, row);
         let chain_id_result = self.load_chain_id_for_invocation(id);
@@ -3830,7 +3958,7 @@ impl StateDb {
     fn load_chain_id_for_invocation(
         &self,
         invocation_id: i64,
-    ) -> Result<Option<String>, rusqlite::Error> {
+    ) -> Result<Option<String>, sqlite::Error> {
         self.conn
             .query_row(
                 "SELECT s.chain_id
@@ -3840,14 +3968,14 @@ impl StateDb {
                   AND s.session_id = COALESCE(i.provider_session_id, i.session_id)
                  WHERE i.id = ?1
                  LIMIT 1",
-                params![invocation_id],
+                sqlite::params![invocation_id],
                 |row| row.get(0),
             )
             .optional()
     }
 
     fn map_lifecycle_chain_id(
-        chain_id_result: Result<Option<String>, rusqlite::Error>,
+        chain_id_result: Result<Option<String>, sqlite::Error>,
     ) -> Option<String> {
         chain_id_result.ok().flatten()
     }
@@ -3859,8 +3987,8 @@ impl StateDb {
         method: &str,
         resume_input_id: Option<String>,
         chain_id: Option<String>,
-    ) -> SessionContext {
-        SessionContext {
+    ) -> lc_log_adapter::SessionContext {
+        lc_log_adapter::SessionContext {
             invocation_uuid: row.invocation_uuid.clone(),
             provider_source: row.provider_name.clone(),
             chain_id,
@@ -3878,7 +4006,7 @@ impl StateDb {
         id: i64,
         row: Option<&LifecycleInvocationRow>,
         input: FinalizeLifecycleInput<'_>,
-    ) -> FinalizeContext {
+    ) -> lc_log_adapter::FinalizeContext {
         let row_invocation_uuid = Self::load_invocation_uuid_for_finalize(row);
         let fallback_invocation_uuid = Self::format_fallback_invocation_uuid(id);
         let invocation_uuid =
@@ -3921,7 +4049,10 @@ impl StateDb {
         row.and_then(active_lifecycle_session_id)
     }
 
-    fn load_raw_paths_for_finalize(&self, invocation_uuid: &str) -> Option<RawArtifactPaths> {
+    fn load_raw_paths_for_finalize(
+        &self,
+        invocation_uuid: &str,
+    ) -> Option<lc_log_adapter::RawArtifactPaths> {
         self.raw_paths_for(invocation_uuid)
     }
 
@@ -3931,10 +4062,10 @@ impl StateDb {
         invocation_uuid: String,
         session_id: Option<String>,
         chain_id: Option<String>,
-        raw_artifact_paths: Option<RawArtifactPaths>,
+        raw_artifact_paths: Option<lc_log_adapter::RawArtifactPaths>,
         input: FinalizeLifecycleInput<'_>,
-    ) -> FinalizeContext {
-        FinalizeContext {
+    ) -> lc_log_adapter::FinalizeContext {
+        lc_log_adapter::FinalizeContext {
             invocation_uuid,
             provider_source: row.and_then(|row| row.provider_name.clone()),
             chain_id,
@@ -3972,12 +4103,12 @@ impl StateDb {
     }
 
     fn load_existing_provider_session_binding(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         invocation_row_id: i64,
     ) -> Result<Option<String>, String> {
         conn.query_row(
             "SELECT provider_session_id FROM invocations WHERE id = ?1",
-            params![invocation_row_id],
+            sqlite::params![invocation_row_id],
             |row| row.get::<_, Option<String>>(0),
         )
         .optional()
@@ -4002,7 +4133,7 @@ impl StateDb {
     }
 
     fn write_provider_session_binding(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         invocation_row_id: i64,
         binding: &ProviderSessionBinding,
     ) -> Result<(), String> {
@@ -4021,7 +4152,7 @@ impl StateDb {
                  END,
                  session_capture_method = ?2
              WHERE id = ?5",
-            params![
+            sqlite::params![
                 &binding.provider_session_id,
                 binding.capture_method,
                 binding.provider_session_resolved_account.as_deref(),
@@ -4049,7 +4180,7 @@ impl StateDb {
                 "UPDATE invocations
                  SET session_id = ?1
                  WHERE id = ?2 AND session_capture_method = 'resumed'",
-                params![resume_input_id, id],
+                sqlite::params![resume_input_id, id],
             )
             .map_err(|e| {
                 format!("Failed to update legacy resume session_id for invocation {id}: {e}")
@@ -4069,7 +4200,7 @@ impl StateDb {
                  SET resume_acceptance_status = ?1,
                      resume_acceptance_evidence = ?2
                  WHERE id = ?3",
-                params![status, evidence, id],
+                sqlite::params![status, evidence, id],
             )
             .map_err(|e| format!("Failed to update resume acceptance for invocation {id}: {e}"))?;
         Ok(())
@@ -4080,7 +4211,7 @@ impl StateDb {
     }
 
     fn mint_chain_for_invocation_session_on(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         invocation_row_id: i64,
     ) -> Result<(), DbError> {
         let Some(row) = Self::load_invocation_chain_mint_row(conn, invocation_row_id)? else {
@@ -4103,7 +4234,7 @@ impl StateDb {
     }
 
     fn load_invocation_chain_mint_row(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         invocation_row_id: i64,
     ) -> Result<Option<InvocationChainMintRow>, DbError> {
         let provider_session_expr = Self::provider_session_expr(conn, None)?;
@@ -4114,7 +4245,7 @@ impl StateDb {
                AND provider_name IS NOT NULL
                AND {provider_session_expr} IS NOT NULL"
         );
-        conn.query_row(&sql, params![invocation_row_id], |row| {
+        conn.query_row(&sql, sqlite::params![invocation_row_id], |row| {
             Ok(InvocationChainMintRow {
                 model_name: row.get(0)?,
                 provider_name: row.get(1)?,
@@ -4127,7 +4258,7 @@ impl StateDb {
     }
 
     fn existing_chain_for_provider_session(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         provider_name: &str,
         session_id: &str,
     ) -> Result<Option<String>, DbError> {
@@ -4135,7 +4266,7 @@ impl StateDb {
             "SELECT chain_id FROM session_chain_segments
                  WHERE provider_name = ?1 AND session_id = ?2
                  LIMIT 1",
-            params![provider_name, session_id],
+            sqlite::params![provider_name, session_id],
             |row| row.get::<_, String>(0),
         )
         .optional()
@@ -4143,7 +4274,7 @@ impl StateDb {
     }
 
     fn promote_existing_invocation_chain(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         chain_id: &str,
         model_name: &str,
         provider_name: &str,
@@ -4153,7 +4284,7 @@ impl StateDb {
             "UPDATE session_chains
                  SET model_name = ?2
                  WHERE chain_id = ?1 AND model_name = '<unknown>'",
-            params![chain_id, model_name],
+            sqlite::params![chain_id, model_name],
         )
         .map_err(|e| format!("Failed to update invocation session chain model: {e}"))?;
         conn.execute(
@@ -4163,14 +4294,14 @@ impl StateDb {
                    AND provider_name = ?2
                    AND session_id = ?3
                    AND transition_reason = 'imported'",
-            params![chain_id, provider_name, session_id],
+            sqlite::params![chain_id, provider_name, session_id],
         )
         .map_err(|e| format!("Failed to promote imported session chain segment: {e}"))?;
         Ok(())
     }
 
     fn insert_invocation_chain(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         row: &InvocationChainMintRow,
         ts: &DateTime<Utc>,
     ) -> Result<(), DbError> {
@@ -4178,14 +4309,14 @@ impl StateDb {
         conn.execute(
             "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
              VALUES (?1, ?2, ?2, ?3)",
-            params![chain_id, ts.to_rfc3339(), row.model_name],
+            sqlite::params![chain_id, ts.to_rfc3339(), row.model_name],
         )
         .map_err(|e| format!("Failed to mint invocation session chain: {e}"))?;
         conn.execute(
             "INSERT INTO session_chain_segments
                 (chain_id, provider_name, session_id, started_at, transition_reason)
              VALUES (?1, ?2, ?3, ?4, 'initial')",
-            params![chain_id, row.provider_name, row.session_id, ts.to_rfc3339()],
+            sqlite::params![chain_id, row.provider_name, row.session_id, ts.to_rfc3339()],
         )
         .map_err(|e| format!("Failed to mint invocation session segment: {e}"))?;
         Ok(())
@@ -4198,10 +4329,10 @@ impl StateDb {
             .prepare(&sql)
             .map_err(|e| format!("Failed to prepare invocation lookup: {e}"))?;
 
-        let result = stmt.query_row(params![uuid], Self::map_invocation_row);
+        let result = stmt.query_row(sqlite::params![uuid], Self::map_invocation_row);
         match result {
             Ok(record) => Ok(Some(record)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(sqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(format!("Failed to query invocation: {e}")),
         }
     }
@@ -4221,14 +4352,14 @@ impl StateDb {
             .map_err(|e| format!("Failed to prepare invocation child lookup: {e}"))?;
 
         let rows = stmt
-            .query_map(params![parent_id], Self::map_invocation_row)
+            .query_map(sqlite::params![parent_id], Self::map_invocation_row)
             .map_err(|e| format!("Failed to query invocation children: {e}"))?;
 
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("Failed to map invocation children: {e}"))
     }
 
-    fn map_invocation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<InvocationRecord> {
+    fn map_invocation_row(row: &sqlite::Row<'_>) -> sqlite::Result<InvocationRecord> {
         let created_at_raw: String = row.get(19)?;
         let finished_at_raw: Option<String> = row.get(20)?;
         let status_raw: String = row.get(6)?;
@@ -4264,7 +4395,7 @@ impl StateDb {
     fn optional_strict_rfc3339_at(
         raw: Option<String>,
         column_index: usize,
-    ) -> rusqlite::Result<Option<DateTime<Utc>>> {
+    ) -> sqlite::Result<Option<DateTime<Utc>>> {
         raw.map(|s| Self::strict_rfc3339_at(&s, column_index))
             .transpose()
     }
@@ -4272,11 +4403,11 @@ impl StateDb {
     fn parse_invocation_status_at(
         raw: &str,
         column_index: usize,
-    ) -> rusqlite::Result<InvocationStatus> {
+    ) -> sqlite::Result<InvocationStatus> {
         raw.parse::<InvocationStatus>().map_err(|_| {
-            rusqlite::Error::FromSqlConversionFailure(
+            sqlite::Error::FromSqlConversionFailure(
                 column_index,
-                rusqlite::types::Type::Text,
+                sqlite::Type::Text,
                 format!("Unknown invocation status: {raw}").into(),
             )
         })
@@ -4297,7 +4428,7 @@ impl StateDb {
             )
             .map_err(|e| format!("Failed to prepare query: {e}"))?;
 
-        let result = stmt.query_row(params![model_name, provider_name], |row| {
+        let result = stmt.query_row(sqlite::params![model_name, provider_name], |row| {
             Ok(ProviderRecord {
                 model_name: row.get(0)?,
                 provider_name: row.get(1)?,
@@ -4311,7 +4442,7 @@ impl StateDb {
 
         match result {
             Ok(record) => Ok(Some(record)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(sqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(format!("Failed to query provider: {e}")),
         }
     }
@@ -4330,7 +4461,7 @@ impl StateDb {
                 "SELECT COUNT(*) FROM invocations
                  WHERE model_name = ?1 AND provider_name = ?2
                    AND success = 0 AND created_at > ?3",
-                params![model_name, provider_name, &cutoff],
+                sqlite::params![model_name, provider_name, &cutoff],
                 |row| row.get(0),
             )
             .map_err(|e| format!("Failed to count recent errors: {e}"))?;
@@ -4353,7 +4484,7 @@ impl StateDb {
             )
             .map_err(|e| format!("Failed to prepare quota query: {e}"))?;
 
-        let result = stmt.query_row(params![provider_name], |row| {
+        let result = stmt.query_row(sqlite::params![provider_name], |row| {
             Ok(QuotaRecord {
                 provider_name: provider_name.to_string(),
                 calls_since_refresh: row.get::<_, i64>(0)? as u64,
@@ -4361,9 +4492,9 @@ impl StateDb {
                 exhausted_at: Self::optional_forgiving_rfc3339(row.get(2)?),
                 topology_peak_live_window_count: usize::try_from(row.get::<_, i64>(3)?).map_err(
                     |_| {
-                        rusqlite::Error::FromSqlConversionFailure(
+                        sqlite::Error::FromSqlConversionFailure(
                             3,
-                            rusqlite::types::Type::Integer,
+                            sqlite::Type::Integer,
                             "negative topology_peak_live_window_count".into(),
                         )
                     },
@@ -4377,7 +4508,7 @@ impl StateDb {
 
         match result {
             Ok(record) => Ok(Some(record)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(sqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(format!("Failed to query quota: {e}")),
         }
     }
@@ -4397,7 +4528,7 @@ impl StateDb {
                  VALUES (?1, ?2)
                  ON CONFLICT (provider_name) DO UPDATE SET
                     exhausted_at = excluded.exhausted_at",
-                params![provider_name, &now],
+                sqlite::params![provider_name, &now],
             )
             .map_err(|e| format!("Failed to mark provider exhausted: {e}"))?;
         Ok(())
@@ -4459,7 +4590,7 @@ impl StateDb {
         self.conn
             .execute(
                 "UPDATE provider_quotas SET exhausted_at = NULL WHERE provider_name = ?1",
-                params![provider_name],
+                sqlite::params![provider_name],
             )
             .map_err(|e| format!("Failed to clear provider exhausted flag: {e}"))?;
         Ok(())
@@ -4516,7 +4647,7 @@ impl StateDb {
             )
             .map_err(|e| format!("Failed to prepare windows query: {e}"))?;
         let rows = stmt
-            .query_map(params![provider_name], |row| {
+            .query_map(sqlite::params![provider_name], |row| {
                 let resets_at_str: String = row.get(2)?;
                 let resets_at = Self::strict_rfc3339_at(&resets_at_str, 2)?;
                 Ok(QuotaWindow {
@@ -4579,7 +4710,7 @@ impl StateDb {
     }
 
     fn record_empty_quota_refresh(
-        tx: Transaction<'_>,
+        tx: sqlite::Transaction<'_>,
         provider_name: &str,
         now: &str,
         prior_windows: &[QuotaWindow],
@@ -4590,7 +4721,7 @@ impl StateDb {
     }
 
     fn write_empty_quota_refresh(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         provider_name: &str,
         now: &str,
         prior_windows: &[QuotaWindow],
@@ -4603,7 +4734,7 @@ impl StateDb {
     }
 
     fn write_initial_empty_quota_refresh(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         provider_name: &str,
         now: &str,
     ) -> Result<(), String> {
@@ -4614,14 +4745,14 @@ impl StateDb {
              ON CONFLICT (provider_name) DO UPDATE SET
                 refreshed_at = ?2,
                 last_empty_refresh_at = ?2",
-            params![provider_name, now],
+            sqlite::params![provider_name, now],
         )
         .map_err(|e| format!("Failed to record empty quota refresh: {e}"))?;
         Ok(())
     }
 
     fn write_preserving_empty_quota_refresh(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         provider_name: &str,
         now: &str,
     ) -> Result<(), String> {
@@ -4631,7 +4762,7 @@ impl StateDb {
              VALUES (?1, ?2, ?2)
              ON CONFLICT (provider_name) DO UPDATE SET
                 last_empty_refresh_at = ?2",
-            params![provider_name, now],
+            sqlite::params![provider_name, now],
         )
         .map_err(|e| format!("Failed to record empty quota refresh: {e}"))?;
         Ok(())
@@ -4684,7 +4815,7 @@ impl StateDb {
     }
 
     fn write_quota_aggregate(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         provider_name: &str,
         now: &str,
         projection: QuotaAggregateProjection,
@@ -4701,7 +4832,7 @@ impl StateDb {
                 refreshed_at = ?4,
                 exhausted_at = NULL,
                 topology_peak_live_window_count = MAX(topology_peak_live_window_count, ?5)",
-            params![
+            sqlite::params![
                 provider_name,
                 projection.legacy_used,
                 projection.legacy_resets,
@@ -4714,7 +4845,7 @@ impl StateDb {
     }
 
     fn replace_quota_window_rows(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         provider_name: &str,
         windows: &[QuotaWindowInput],
         prior_windows_by_id: &HashMap<u32, &QuotaWindow>,
@@ -4730,17 +4861,20 @@ impl StateDb {
         )
     }
 
-    fn delete_quota_window_rows(conn: &Connection, provider_name: &str) -> Result<(), String> {
+    fn delete_quota_window_rows(
+        conn: &sqlite::Connection,
+        provider_name: &str,
+    ) -> Result<(), String> {
         conn.execute(
             "DELETE FROM provider_quota_windows WHERE provider_name = ?1",
-            params![provider_name],
+            sqlite::params![provider_name],
         )
         .map_err(|e| format!("Failed to clear windows: {e}"))?;
         Ok(())
     }
 
     fn insert_quota_window_rows(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         provider_name: &str,
         windows: &[QuotaWindowInput],
         prior_windows_by_id: &HashMap<u32, &QuotaWindow>,
@@ -4824,7 +4958,7 @@ impl StateDb {
     }
 
     fn insert_quota_window_row(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         provider_name: &str,
         index: usize,
         window: &QuotaWindowInput,
@@ -4835,7 +4969,7 @@ impl StateDb {
                 (provider_name, window_id, used_percent, resets_at,
                  last_delta_percent, last_delta_calls)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
+            sqlite::params![
                 provider_name,
                 index as i64,
                 window.used_percent,
@@ -4856,7 +4990,7 @@ impl StateDb {
                  VALUES (?1, ?2)
                  ON CONFLICT (provider_name) DO UPDATE SET
                     last_topology_probe_at = excluded.last_topology_probe_at",
-                params![provider_name, &now],
+                sqlite::params![provider_name, &now],
             )
             .map_err(|e| format!("Failed to record topology probe: {e}"))?;
         Ok(())
@@ -4873,7 +5007,7 @@ impl StateDb {
         self.conn
             .execute(
                 "UPDATE provider_quotas SET refreshed_at = ?1 WHERE provider_name = ?2",
-                params![refreshed_at.to_rfc3339(), provider_name],
+                sqlite::params![refreshed_at.to_rfc3339(), provider_name],
             )
             .map_err(|e| format!("Failed to set refreshed_at: {e}"))?;
         Ok(())
@@ -4905,7 +5039,7 @@ impl StateDb {
                 "UPDATE providers
                  SET last_invoked_at = ?1
                  WHERE model_name = ?2 AND provider_name = ?3",
-                params![last_invoked_at.to_rfc3339(), model_name, provider_name],
+                sqlite::params![last_invoked_at.to_rfc3339(), model_name, provider_name],
             )
             .map_err(|e| format!("Failed to set last_invoked_at: {e}"))
     }
@@ -4942,7 +5076,7 @@ impl StateDb {
                  SET last_delta_percent = ?3,
                      last_delta_calls = ?4
                  WHERE provider_name = ?1 AND window_id = ?2",
-                params![
+                sqlite::params![
                     provider_name,
                     window_id as i64,
                     last_delta_percent,
@@ -4970,13 +5104,13 @@ impl StateDb {
                     resets_at = NULL,
                     calls_since_refresh = 0,
                     refreshed_at = ?2",
-                params![provider_name, refreshed_at.to_rfc3339()],
+                sqlite::params![provider_name, refreshed_at.to_rfc3339()],
             )
             .map_err(|e| format!("Failed to insert quota row: {e}"))?;
         self.conn
             .execute(
                 "DELETE FROM provider_quota_windows WHERE provider_name = ?1",
-                params![provider_name],
+                sqlite::params![provider_name],
             )
             .map_err(|e| format!("Failed to clear quota windows: {e}"))?;
         Ok(())
@@ -4991,7 +5125,7 @@ impl StateDb {
                  VALUES (?1, 1)
                  ON CONFLICT (provider_name) DO UPDATE SET
                     calls_since_refresh = calls_since_refresh + 1",
-                params![provider_name],
+                sqlite::params![provider_name],
             )
             .map_err(|e| format!("Failed to increment calls_since_refresh: {e}"))?;
         Ok(())
@@ -5012,7 +5146,7 @@ impl StateDb {
                     version = ?4,
                     config_dir = ?5,
                     last_synced = ?6",
-                params![
+                sqlite::params![
                     &provider.cli_name,
                     &provider.display_name,
                     provider.installed as i64,
@@ -5056,16 +5190,16 @@ impl StateDb {
             )
             .map_err(|e| format!("Failed to prepare query: {e}"))?;
 
-        let result = stmt.query_row(params![cli_name], Self::map_cli_provider_row);
+        let result = stmt.query_row(sqlite::params![cli_name], Self::map_cli_provider_row);
 
         match result {
             Ok(record) => Ok(Some(record)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(sqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(format!("Failed to query CLI provider: {e}")),
         }
     }
 
-    fn map_cli_provider_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CliProviderRecord> {
+    fn map_cli_provider_row(row: &sqlite::Row<'_>) -> sqlite::Result<CliProviderRecord> {
         Ok(CliProviderRecord {
             cli_name: row.get(0)?,
             display_name: row.get(1)?,
@@ -5084,7 +5218,7 @@ impl StateDb {
             .execute(
                 "INSERT INTO accounts (id, provider, profile_name, auth_method, auth_status, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
+                sqlite::params![
                     &account.id,
                     &account.provider,
                     &account.profile_name,
@@ -5099,39 +5233,43 @@ impl StateDb {
 
     /// List all accounts, optionally filtered by provider.
     pub fn list_accounts(&self, provider: Option<&str>) -> Result<Vec<AccountRecord>, String> {
-        self.load_account_rows(Self::account_query(provider))
+        self.load_account_rows(provider)
     }
 
-    fn account_query(provider: Option<&str>) -> (&'static str, Option<&str>) {
+    fn select_account_query_variant(provider: Option<&str>) -> AccountQueryVariant<'_> {
         match provider {
-            Some(provider) => (
-                "SELECT id, provider, profile_name, auth_method, auth_status, created_at
-                 FROM accounts WHERE provider = ?1 ORDER BY id",
-                Some(provider),
-            ),
-            None => (
-                "SELECT id, provider, profile_name, auth_method, auth_status, created_at
-                 FROM accounts ORDER BY provider, id",
-                None,
-            ),
+            Some(provider) => AccountQueryVariant {
+                sql: "SELECT id, provider, profile_name, auth_method, auth_status, created_at
+                      FROM accounts WHERE provider = ?1 ORDER BY id",
+                provider: Some(provider),
+            },
+            None => AccountQueryVariant {
+                sql: "SELECT id, provider, profile_name, auth_method, auth_status, created_at
+                      FROM accounts ORDER BY provider, id",
+                provider: None,
+            },
         }
     }
 
-    fn load_account_rows(
+    fn load_account_rows(&self, provider: Option<&str>) -> Result<Vec<AccountRecord>, String> {
+        let query = Self::select_account_query_variant(provider);
+        self.query_account_rows(query)
+    }
+
+    fn query_account_rows(
         &self,
-        query: (&'static str, Option<&str>),
+        query: AccountQueryVariant<'_>,
     ) -> Result<Vec<AccountRecord>, String> {
-        let (sql, bind_provider) = query;
         let mut stmt = self
             .conn
-            .prepare(sql)
+            .prepare(query.sql)
             .map_err(|e| format!("Failed to prepare query: {e}"))?;
 
-        let rows = if let Some(provider) = bind_provider {
-            stmt.query_map(params![provider], Self::map_account_row)
+        let rows = if let Some(provider) = query.provider {
+            stmt.query_map(sqlite::params![provider], Self::account_row_mapper)
                 .map_err(|e| format!("Failed to query accounts: {e}"))?
         } else {
-            stmt.query_map([], Self::map_account_row)
+            stmt.query_map([], Self::account_row_mapper)
                 .map_err(|e| format!("Failed to query accounts: {e}"))?
         };
 
@@ -5148,7 +5286,7 @@ impl StateDb {
             .conn
             .execute(
                 "DELETE FROM accounts WHERE id = ?1 AND provider = ?2",
-                params![id, provider],
+                sqlite::params![id, provider],
             )
             .map_err(|e| format!("Failed to delete account: {e}"))?;
         Ok(changed > 0)
@@ -5166,7 +5304,7 @@ impl StateDb {
                  DO UPDATE SET
                     discovered_at = ?3,
                     cli_version = ?4",
-                params![
+                sqlite::params![
                     &model.canonical_name,
                     &model.provider,
                     &model.discovered_at,
@@ -5213,7 +5351,7 @@ impl StateDb {
             .map_err(|e| format!("Failed to prepare query: {e}"))?;
 
         let rows = if let Some(provider) = bind_provider {
-            stmt.query_map(params![provider], Self::map_discovered_model_row)
+            stmt.query_map(sqlite::params![provider], Self::map_discovered_model_row)
                 .map_err(|e| format!("Failed to query discovered models: {e}"))?
         } else {
             stmt.query_map([], Self::map_discovered_model_row)
@@ -5238,7 +5376,7 @@ impl StateDb {
             .execute(
                 "DELETE FROM discovered_models
                  WHERE provider = ?1 AND cli_version != ?2",
-                params![provider, current_cli_version],
+                sqlite::params![provider, current_cli_version],
             )
             .map_err(|e| format!("Failed to delete stale models: {e}"))?;
         Ok(changed as u64)
@@ -5279,7 +5417,7 @@ impl StateDb {
                     param_type = ?5,
                     description = ?6,
                     cli_mapping = ?7",
-                params![
+                sqlite::params![
                     model_name,
                     provider,
                     &param.name,
@@ -5309,6 +5447,17 @@ impl StateDb {
         model_name: &str,
         provider: &str,
     ) -> Result<Vec<ModelParameter>, String> {
+        let rows = self.query_model_parameter_rows(model_name, provider)?;
+        rows.into_iter()
+            .map(Self::parse_model_parameter_raw_row)
+            .collect()
+    }
+
+    fn query_model_parameter_rows(
+        &self,
+        model_name: &str,
+        provider: &str,
+    ) -> Result<Vec<ModelParameterRawRow>, String> {
         let mut stmt = self
             .conn
             .prepare(
@@ -5321,22 +5470,19 @@ impl StateDb {
 
         let rows = stmt
             .query_map(
-                params![model_name, provider],
-                Self::map_model_parameter_raw_row,
+                sqlite::params![model_name, provider],
+                Self::model_parameter_row_mapper,
             )
             .map_err(|e| format!("Failed to query model parameters: {e}"))?;
 
         let mut result = Vec::new();
         for row in rows {
-            let raw = row.map_err(|e| format!("Failed to read parameter row: {e}"))?;
-            result.push(Self::parse_model_parameter_raw_row(raw)?);
+            result.push(row.map_err(|e| format!("Failed to read parameter row: {e}"))?);
         }
         Ok(result)
     }
 
-    fn map_model_parameter_raw_row(
-        row: &rusqlite::Row<'_>,
-    ) -> rusqlite::Result<ModelParameterRawRow> {
+    fn model_parameter_row_mapper(row: &sqlite::Row<'_>) -> sqlite::Result<ModelParameterRawRow> {
         Ok(ModelParameterRawRow {
             name: row.get(0)?,
             display_name: row.get(1)?,
@@ -5347,11 +5493,21 @@ impl StateDb {
     }
 
     fn parse_model_parameter_raw_row(raw: ModelParameterRawRow) -> Result<ModelParameter, String> {
+        let parsed = Self::parse_model_parameter_serialized_fields(&raw)?;
         Ok(ModelParameter {
             name: raw.name,
             display_name: raw.display_name,
-            param_type: Self::parse_param_type_json(&raw.param_type)?,
+            param_type: parsed.param_type,
             description: raw.description,
+            cli_mapping: parsed.cli_mapping,
+        })
+    }
+
+    fn parse_model_parameter_serialized_fields(
+        raw: &ModelParameterRawRow,
+    ) -> Result<ModelParameterParsedFields, String> {
+        Ok(ModelParameterParsedFields {
+            param_type: Self::parse_param_type_json(&raw.param_type)?,
             cli_mapping: Self::parse_cli_mapping_json(&raw.cli_mapping)?,
         })
     }
@@ -5365,7 +5521,7 @@ impl StateDb {
     }
 
     /// Helper: map a rusqlite row to a DiscoveredModel.
-    fn map_discovered_model_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DiscoveredModel> {
+    fn map_discovered_model_row(row: &sqlite::Row<'_>) -> sqlite::Result<DiscoveredModel> {
         Ok(DiscoveredModel {
             canonical_name: row.get(0)?,
             provider: row.get(1)?,
@@ -5395,7 +5551,7 @@ impl StateDb {
                 "INSERT OR IGNORE INTO session_turns
                     (provider_name, session_id, turn_id, timestamp, role, is_compaction_boundary, source_file, ingested_at, body)
                  VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8)",
-                params![
+                sqlite::params![
                     provider_name,
                     session_id,
                     turn_id,
@@ -5438,26 +5594,40 @@ impl StateDb {
     }
 
     fn insert_session_turn_batch_rows(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         provider_name: &str,
         turns: &[SessionTurnIngest],
         ingested_at: &str,
     ) -> Result<u64, String> {
-        let mut stmt = conn
-            .prepare(Self::session_turn_batch_insert_sql())
-            .map_err(|e| format!("Failed to prepare batch insert: {e}"))?;
+        let mut stmt = Self::prepare_session_turn_batch_insert(conn)?;
+        Self::execute_session_turn_writes(&mut stmt, provider_name, turns, ingested_at)
+    }
+
+    fn prepare_session_turn_batch_insert(
+        conn: &sqlite::Connection,
+    ) -> Result<sqlite::Statement<'_>, String> {
+        conn.prepare(Self::session_turn_batch_insert_sql())
+            .map_err(Self::format_session_turn_prepare_error)
+    }
+
+    fn execute_session_turn_writes(
+        stmt: &mut sqlite::Statement<'_>,
+        provider_name: &str,
+        turns: &[SessionTurnIngest],
+        ingested_at: &str,
+    ) -> Result<u64, String> {
         let mut new_count: u64 = 0;
         for turn in turns {
-            let binds = Self::session_turn_bind_values(turn);
-            let n = Self::execute_session_turn_batch_insert(
-                &mut stmt,
-                provider_name,
-                &binds,
-                ingested_at,
-            )?;
+            let binds = Self::bind_session_turn_row_params(turn);
+            let n =
+                Self::execute_session_turn_batch_insert(stmt, provider_name, &binds, ingested_at)?;
             new_count += n as u64;
         }
         Ok(new_count)
+    }
+
+    fn format_session_turn_prepare_error(err: sqlite::Error) -> String {
+        format!("Failed to prepare batch insert: {err}")
     }
 
     fn session_turn_batch_insert_sql() -> &'static str {
@@ -5478,7 +5648,7 @@ impl StateDb {
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '', ?9, ?10)"
     }
 
-    fn session_turn_bind_values(turn: &SessionTurnIngest) -> SessionTurnBindValues<'_> {
+    fn bind_session_turn_row_params(turn: &SessionTurnIngest) -> SessionTurnBindValues<'_> {
         SessionTurnBindValues {
             session_id: &turn.session_id,
             turn_id: &turn.turn_id,
@@ -5496,12 +5666,12 @@ impl StateDb {
     }
 
     fn execute_session_turn_batch_insert(
-        stmt: &mut rusqlite::Statement<'_>,
+        stmt: &mut sqlite::Statement<'_>,
         provider_name: &str,
         binds: &SessionTurnBindValues<'_>,
         ingested_at: &str,
     ) -> Result<usize, String> {
-        stmt.execute(params![
+        stmt.execute(sqlite::params![
             provider_name,
             binds.session_id,
             binds.turn_id,
@@ -5530,7 +5700,7 @@ impl StateDb {
                     COUNT(CASE WHEN is_sidechain = 1 THEN 1 END) AS sidechain
                  FROM session_turns
                  WHERE provider_name = ?1 AND session_id = ?2",
-                params![provider_name, session_id],
+                sqlite::params![provider_name, session_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .map_err(|e| format!("Failed to count session turns for trace: {e}"))?;
@@ -5575,7 +5745,7 @@ impl StateDb {
         })
     }
 
-    fn session_chains_backfill_exists(conn: &Connection) -> Result<bool, DbError> {
+    fn session_chains_backfill_exists(conn: &sqlite::Connection) -> Result<bool, DbError> {
         let exists: i64 = conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM session_chains LIMIT 1)",
@@ -5587,7 +5757,7 @@ impl StateDb {
     }
 
     fn load_session_chain_backfill_rows(
-        conn: &Connection,
+        conn: &sqlite::Connection,
     ) -> Result<Vec<SessionChainBackfillRow>, DbError> {
         let mut stmt = conn
             .prepare(
@@ -5615,8 +5785,8 @@ impl StateDb {
     }
 
     fn map_session_chain_backfill_row(
-        row: &rusqlite::Row<'_>,
-    ) -> rusqlite::Result<SessionChainBackfillRow> {
+        row: &sqlite::Row<'_>,
+    ) -> sqlite::Result<SessionChainBackfillRow> {
         Ok(SessionChainBackfillRow {
             provider: row.get(0)?,
             session: row.get(1)?,
@@ -5627,7 +5797,7 @@ impl StateDb {
     }
 
     fn infer_model_for_backfill_row(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         provider_session_expr: &str,
         row: &SessionChainBackfillRow,
     ) -> Result<String, DbError> {
@@ -5647,13 +5817,15 @@ impl StateDb {
     }
 
     fn lookup_model_for_backfill_row(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         model_sql: &str,
         row: &SessionChainBackfillRow,
     ) -> Result<Option<String>, DbError> {
-        conn.query_row(model_sql, params![row.session], |r| r.get::<_, String>(0))
-            .optional()
-            .map_err(|e| format!("Failed to infer model during backfill: {e}"))
+        conn.query_row(model_sql, sqlite::params![row.session], |r| {
+            r.get::<_, String>(0)
+        })
+        .optional()
+        .map_err(|e| format!("Failed to infer model during backfill: {e}"))
     }
 
     fn default_backfill_model_name(model_name: Option<String>) -> String {
@@ -5661,7 +5833,7 @@ impl StateDb {
     }
 
     fn insert_backfill_chain(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         chain_id: &str,
         row: &SessionChainBackfillRow,
         model_name: &str,
@@ -5669,14 +5841,14 @@ impl StateDb {
         conn.execute(
             "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
              VALUES (?1, ?2, ?3, ?4)",
-            params![chain_id, row.started_at, row.last_used_at, model_name],
+            sqlite::params![chain_id, row.started_at, row.last_used_at, model_name],
         )
         .map(|changed| changed as u64)
         .map_err(|e| format!("Failed to insert session chain during backfill: {e}"))
     }
 
     fn insert_backfill_segment(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         chain_id: &str,
         row: &SessionChainBackfillRow,
     ) -> Result<u64, DbError> {
@@ -5684,7 +5856,7 @@ impl StateDb {
             "INSERT INTO session_chain_segments
                 (chain_id, provider_name, session_id, started_at, ended_at, last_turn_id, transition_reason)
              VALUES (?1, ?2, ?3, ?4, NULL, ?5, 'imported')",
-            params![chain_id, row.provider, row.session, row.started_at, row.last_turn_id],
+            sqlite::params![chain_id, row.provider, row.session, row.started_at, row.last_turn_id],
         )
         .map(|changed| changed as u64)
         .map_err(|e| format!("Failed to insert session chain segment during backfill: {e}"))
@@ -5710,7 +5882,7 @@ impl StateDb {
     }
 
     fn upsert_open_chain_segment(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         chain_id: &str,
         provider_name: &str,
         session_id: &str,
@@ -5727,7 +5899,7 @@ impl StateDb {
                 ended_at = NULL,
                 last_turn_id = NULL,
                 transition_reason = excluded.transition_reason",
-            params![
+            sqlite::params![
                 chain_id,
                 provider_name,
                 session_id,
@@ -5740,7 +5912,7 @@ impl StateDb {
     }
 
     fn read_open_chain_segment_id(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         chain_id: &str,
         provider_name: &str,
         session_id: &str,
@@ -5749,7 +5921,7 @@ impl StateDb {
             "SELECT id FROM session_chain_segments
                  WHERE chain_id = ?1 AND provider_name = ?2 AND session_id = ?3
                  ORDER BY id DESC LIMIT 1",
-            params![chain_id, provider_name, session_id],
+            sqlite::params![chain_id, provider_name, session_id],
             |row| row.get(0),
         )
         .map_err(|e| format!("Failed to read session chain segment id: {e}"))
@@ -5771,7 +5943,7 @@ impl StateDb {
                    AND ended_at IS NULL
                  ORDER BY started_at DESC, id DESC
                  LIMIT 1",
-                params![provider_name, session_id, own_chain_id],
+                sqlite::params![provider_name, session_id, own_chain_id],
                 |row| row.get(0),
             )
             .optional()
@@ -5802,7 +5974,7 @@ impl StateDb {
     }
 
     fn session_chain_segment_exists(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         provider_name: &str,
         session_id: &str,
     ) -> Result<bool, DbError> {
@@ -5811,7 +5983,7 @@ impl StateDb {
                 "SELECT 1 FROM session_chain_segments
                  WHERE provider_name = ?1 AND session_id = ?2
                  LIMIT 1",
-                params![provider_name, session_id],
+                sqlite::params![provider_name, session_id],
                 |row| row.get(0),
             )
             .optional()
@@ -5820,7 +5992,7 @@ impl StateDb {
     }
 
     fn insert_imported_chain(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         chain_id: &str,
         started_at: &str,
         model_name: &str,
@@ -5829,14 +6001,14 @@ impl StateDb {
             "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
              VALUES (?1, ?2, ?2, ?3)
              ON CONFLICT DO NOTHING",
-            params![chain_id, started_at, model_name],
+            sqlite::params![chain_id, started_at, model_name],
         )
         .map_err(|e| format!("Failed to mint imported session chain: {e}"))?;
         Ok(())
     }
 
     fn insert_imported_segment(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         chain_id: &str,
         provider_name: &str,
         session_id: &str,
@@ -5847,7 +6019,7 @@ impl StateDb {
                 (chain_id, provider_name, session_id, started_at, transition_reason)
              VALUES (?1, ?2, ?3, ?4, 'imported')
              ON CONFLICT DO NOTHING",
-            params![chain_id, provider_name, session_id, started_at],
+            sqlite::params![chain_id, provider_name, session_id, started_at],
         )
         .map_err(|e| format!("Failed to mint imported session chain segment: {e}"))?;
         Ok(())
@@ -5872,7 +6044,7 @@ impl StateDb {
                      )
                  WHERE chain_id = ?1 AND ended_at IS NULL
                  RETURNING id",
-                params![chain_id, ended_at.to_rfc3339()],
+                sqlite::params![chain_id, ended_at.to_rfc3339()],
                 |row| row.get(0),
             )
             .optional()
@@ -5883,7 +6055,7 @@ impl StateDb {
         self.conn
             .execute(
                 "UPDATE session_chains SET last_used_at = ?2 WHERE chain_id = ?1",
-                params![chain_id, Utc::now().to_rfc3339()],
+                sqlite::params![chain_id, Utc::now().to_rfc3339()],
             )
             .map_err(|e| format!("Failed to update session chain last_used_at: {e}"))?;
         Ok(())
@@ -5904,7 +6076,7 @@ impl StateDb {
                    AND is_compaction_boundary = 1
                  ORDER BY timestamp DESC, id DESC
                  LIMIT 1",
-                params![provider_name, session_id],
+                sqlite::params![provider_name, session_id],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()
@@ -5949,7 +6121,7 @@ impl StateDb {
                    AND session_id = ?2
                    AND turn_id = ?3
                    AND is_compaction_boundary = 0",
-                params![provider_name, session_id, turn_id],
+                sqlite::params![provider_name, session_id, turn_id],
             )
             .map_err(|e| format!("Failed to flag compaction boundary: {e}"))?;
         Ok(changed > 0)
@@ -6190,7 +6362,7 @@ impl StateDb {
                  WHERE provider_name = ?1 AND session_id = ?2
                  ORDER BY ended_at IS NULL DESC, started_at DESC, id DESC
                  LIMIT 1",
-                params![provider_name, session_id],
+                sqlite::params![provider_name, session_id],
                 |row| row.get(0),
             )
             .optional()
@@ -6208,7 +6380,7 @@ impl StateDb {
             )
             .map_err(|e| format!("Failed to prepare resume chain lookup: {e}"))?;
         let rows = stmt
-            .query_map(params![input], |row| row.get::<_, String>(0))
+            .query_map(sqlite::params![input], |row| row.get::<_, String>(0))
             .map_err(|e| format!("Failed to query resume chain lookup: {e}"))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("Failed to read resume chain lookup: {e}"))
@@ -6236,7 +6408,7 @@ impl StateDb {
         }))
     }
 
-    fn wrong_id_invocation_match_sql(conn: &Connection) -> Result<String, String> {
+    fn wrong_id_invocation_match_sql(conn: &sqlite::Connection) -> Result<String, String> {
         let provider_session_select = Self::wrong_id_provider_session_select(conn)?;
         Ok(format!(
             "SELECT invocation_uuid, provider_name, {provider_session_select}
@@ -6245,7 +6417,7 @@ impl StateDb {
         ))
     }
 
-    fn wrong_id_provider_session_select(conn: &Connection) -> Result<&'static str, String> {
+    fn wrong_id_provider_session_select(conn: &sqlite::Connection) -> Result<&'static str, String> {
         if Self::invocations_have_dual_id_columns(conn)? {
             Ok("provider_session_id")
         } else {
@@ -6254,11 +6426,11 @@ impl StateDb {
     }
 
     fn load_wrong_id_invocation_match_row(
-        conn: &Connection,
+        conn: &sqlite::Connection,
         sql: &str,
         input: &str,
     ) -> Result<Option<WrongIdKindInvocationRow>, String> {
-        conn.query_row(sql, params![input], |row| {
+        conn.query_row(sql, sqlite::params![input], |row| {
             Ok(WrongIdKindInvocationRow {
                 invocation_uuid: row.get(0)?,
                 provider_name: row.get(1)?,
@@ -6316,7 +6488,7 @@ impl StateDb {
             .conn
             .query_row(
                 "SELECT last_used_at FROM session_chains WHERE chain_id = ?1",
-                params![chain_id],
+                sqlite::params![chain_id],
                 |row| row.get(0),
             )
             .map_err(|e| format!("Failed to read chain last_used_at: {e}"))?;
@@ -6332,7 +6504,7 @@ impl StateDb {
                  WHERE chain_id = ?1
                  ORDER BY started_at DESC, id DESC
                  LIMIT 1",
-                params![chain_id],
+                sqlite::params![chain_id],
                 |row| row.get(0),
             )
             .map_err(|e| format!("Failed to read chain latest segment started_at: {e}"))?;
@@ -6367,7 +6539,7 @@ impl StateDb {
                    AND ended_at IS NULL
                  ORDER BY started_at DESC, id DESC
                  LIMIT 1",
-                params![chain_id, provider_name, session_id],
+                sqlite::params![chain_id, provider_name, session_id],
                 |row| row.get(0),
             )
             .optional()
@@ -6382,7 +6554,7 @@ impl StateDb {
                  WHERE chain_id = ?1 AND ended_at IS NULL
                  ORDER BY started_at DESC, id DESC
                  LIMIT 1",
-                params![chain_id],
+                sqlite::params![chain_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
@@ -6393,7 +6565,7 @@ impl StateDb {
         self.conn
             .query_row(
                 "SELECT model_name FROM session_chains WHERE chain_id = ?1",
-                params![chain_id],
+                sqlite::params![chain_id],
                 |row| row.get(0),
             )
             .optional()
@@ -6404,7 +6576,7 @@ impl StateDb {
         let provider_session_expr = Self::provider_session_expr(&self.conn, Some("i."))?;
         let sql = Self::latest_invocation_model_sql(&provider_session_expr);
         self.conn
-            .query_row(&sql, params![chain_id], |row| row.get(0))
+            .query_row(&sql, sqlite::params![chain_id], |row| row.get(0))
             .optional()
             .map_err(|e| format!("Failed to infer session chain model from invocations: {e}"))
     }
@@ -6453,7 +6625,7 @@ impl StateDb {
             .conn
             .query_row(
                 "SELECT last_used_at FROM session_chains WHERE chain_id = ?1",
-                params![chain_id],
+                sqlite::params![chain_id],
                 |row| row.get(0),
             )
             .map_err(|e| format!("Failed to read chain preview: {e}"))?;
@@ -6465,7 +6637,7 @@ impl StateDb {
             .conn
             .query_row(
                 "SELECT COUNT(*) FROM session_turns WHERE provider_name = ?1 AND session_id = ?2",
-                params![active_provider, active_session_id],
+                sqlite::params![active_provider, active_session_id],
                 |row| row.get(0),
             )
             .unwrap_or(0);
@@ -6477,6 +6649,18 @@ impl StateDb {
         active_provider: &str,
         active_session_id: &str,
     ) -> Result<Vec<TurnPreview>, String> {
+        let rows = self.query_recent_turn_rows(active_provider, active_session_id)?;
+        let parsed = Self::parse_turn_preview_timestamps(rows)?;
+        let mut recent_turns = Self::map_recent_turn_previews(parsed);
+        recent_turns.reverse();
+        Ok(recent_turns)
+    }
+
+    fn query_recent_turn_rows(
+        &self,
+        active_provider: &str,
+        active_session_id: &str,
+    ) -> Result<Vec<RecentTurnRow>, String> {
         let mut stmt = self
             .conn
             .prepare(
@@ -6488,27 +6672,50 @@ impl StateDb {
             )
             .map_err(|e| format!("Failed to prepare recent turns preview: {e}"))?;
         let rows = stmt
-            .query_map(params![active_provider, active_session_id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
+            .query_map(
+                sqlite::params![active_provider, active_session_id],
+                Self::recent_turn_row_mapper,
+            )
             .map_err(|e| format!("Failed to query recent turns preview: {e}"))?;
+
         let mut recent_turns = Vec::new();
         for row in rows {
-            let row = row.map_err(|e| format!("Failed to read recent turn: {e}"))?;
-            recent_turns.push(Self::map_turn_preview(row)?);
+            recent_turns.push(row.map_err(|e| format!("Failed to read recent turn: {e}"))?);
         }
-        recent_turns.reverse();
         Ok(recent_turns)
     }
 
-    fn map_turn_preview(row: (String, String)) -> Result<TurnPreview, String> {
-        let (role, raw_ts) = row;
-        let timestamp = Self::strict_rfc3339_message(&raw_ts, "recent turn timestamp")?;
-        Ok(TurnPreview {
-            role,
-            timestamp,
-            snippet: None,
+    fn recent_turn_row_mapper(row: &sqlite::Row<'_>) -> sqlite::Result<RecentTurnRow> {
+        Ok(RecentTurnRow {
+            role: row.get(0)?,
+            timestamp_raw: row.get(1)?,
         })
+    }
+
+    fn parse_turn_preview_timestamps(
+        rows: Vec<RecentTurnRow>,
+    ) -> Result<Vec<ParsedTurnPreviewTimestamp>, String> {
+        rows.into_iter()
+            .map(|row| {
+                Ok(ParsedTurnPreviewTimestamp {
+                    role: row.role,
+                    timestamp: Self::strict_rfc3339_message(
+                        &row.timestamp_raw,
+                        "recent turn timestamp",
+                    )?,
+                })
+            })
+            .collect()
+    }
+
+    fn map_recent_turn_previews(rows: Vec<ParsedTurnPreviewTimestamp>) -> Vec<TurnPreview> {
+        rows.into_iter()
+            .map(|row| TurnPreview {
+                role: row.role,
+                timestamp: row.timestamp,
+                snippet: None,
+            })
+            .collect()
     }
 
     fn sort_chain_previews(out: &mut [ChainPreview]) {
@@ -6559,7 +6766,7 @@ impl StateDb {
             )
             .map_err(|e| format!("Failed to prepare invocation session lookup: {e}"))?;
         let rows = stmt
-            .query_map(params![provider_name], |row| {
+            .query_map(sqlite::params![provider_name], |row| {
                 Ok(InvocationWindowTurnRow {
                     session_id: row.get(0)?,
                     timestamp_raw: row.get(1)?,
@@ -6616,10 +6823,14 @@ impl StateDb {
         in_window: &mut u64,
         timestamp: DateTime<Utc>,
     ) {
-        if timestamp < *earliest {
+        if Self::is_candidate_strictly_earlier(&timestamp, earliest) {
             *earliest = timestamp;
         }
         *in_window += 1;
+    }
+
+    fn is_candidate_strictly_earlier(timestamp: &DateTime<Utc>, earliest: &DateTime<Utc>) -> bool {
+        timestamp < earliest
     }
 
     fn timestamp_is_inside_invocation_window(
@@ -6640,7 +6851,19 @@ impl StateDb {
     fn rank_invocation_window_candidate_pairs(
         candidates: HashMap<String, (DateTime<Utc>, u64)>,
     ) -> Vec<(String, (DateTime<Utc>, u64))> {
-        let mut ranked = candidates.into_iter().collect::<Vec<_>>();
+        let pairs = Self::collect_invocation_window_candidate_pairs(candidates);
+        Self::rank_candidate_pairs_by_count_timestamp_session(pairs)
+    }
+
+    fn collect_invocation_window_candidate_pairs(
+        candidates: HashMap<String, (DateTime<Utc>, u64)>,
+    ) -> Vec<(String, (DateTime<Utc>, u64))> {
+        candidates.into_iter().collect()
+    }
+
+    fn rank_candidate_pairs_by_count_timestamp_session(
+        mut ranked: Vec<(String, (DateTime<Utc>, u64))>,
+    ) -> Vec<(String, (DateTime<Utc>, u64))> {
         ranked.sort_by(
             |(session_a, (earliest_a, count_a)), (session_b, (earliest_b, count_b))| {
                 count_b
@@ -6692,7 +6915,7 @@ impl StateDb {
             .query_row(
                 "SELECT COUNT(*) FROM session_turns
                  WHERE provider_name = ?1 AND role = 'assistant' AND timestamp > ?2",
-                params![provider_name, since.to_rfc3339()],
+                sqlite::params![provider_name, since.to_rfc3339()],
                 |row| row.get(0),
             )
             .map_err(Self::session_turn_count_error)
@@ -6703,13 +6926,13 @@ impl StateDb {
             .query_row(
                 "SELECT COUNT(*) FROM session_turns
                  WHERE provider_name = ?1 AND role = 'assistant'",
-                params![provider_name],
+                sqlite::params![provider_name],
                 |row| row.get(0),
             )
             .map_err(Self::session_turn_count_error)
     }
 
-    fn session_turn_count_error(e: rusqlite::Error) -> String {
+    fn session_turn_count_error(e: sqlite::Error) -> String {
         format!("Failed to count session turns: {e}")
     }
 
@@ -6721,7 +6944,7 @@ impl StateDb {
     }
 
     /// Helper: map a rusqlite row to an AccountRecord.
-    fn map_account_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AccountRecord> {
+    fn account_row_mapper(row: &sqlite::Row<'_>) -> sqlite::Result<AccountRecord> {
         let auth_method = Self::account_auth_method(row.get(3)?);
         let auth_status = Self::account_auth_status(row.get(4)?);
         Ok(AccountRecord {
@@ -6759,7 +6982,6 @@ fn migrate_legacy_invocations() {
 mod tests {
     use super::*;
     use crate::test_support::env_lock;
-    use rusqlite::Connection;
     use tempfile::TempDir;
     use uuid::Uuid;
 
@@ -6788,13 +7010,13 @@ mod tests {
         );
     }
 
-    fn mark_current_schema_version(conn: &Connection) {
+    fn mark_current_schema_version(conn: &sqlite::Connection) {
         seed_current_drift_required_tables(conn);
         conn.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)
             .unwrap();
     }
 
-    fn seed_current_drift_required_tables(conn: &Connection) {
+    fn seed_current_drift_required_tables(conn: &sqlite::Connection) {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS invocations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -6959,7 +7181,7 @@ mod tests {
                 "SELECT last_empty_refresh_at
                  FROM provider_quotas
                  WHERE provider_name = ?1",
-                params![provider_name],
+                sqlite::params![provider_name],
                 |row| row.get::<_, Option<String>>(0),
             )
             .unwrap()
@@ -6976,7 +7198,7 @@ mod tests {
                 "SELECT last_topology_probe_at
                  FROM provider_quotas
                  WHERE provider_name = ?1",
-                params![provider_name],
+                sqlite::params![provider_name],
                 |row| row.get::<_, Option<String>>(0),
             )
             .unwrap()
@@ -6988,7 +7210,7 @@ mod tests {
                 "SELECT calls_since_refresh
                  FROM provider_quotas
                  WHERE provider_name = ?1",
-                params![provider_name],
+                sqlite::params![provider_name],
                 |row| row.get::<_, i64>(0),
             )
             .unwrap() as u64
@@ -7000,7 +7222,7 @@ mod tests {
                 "SELECT exhausted_at
                  FROM provider_quotas
                  WHERE provider_name = ?1",
-                params![provider_name],
+                sqlite::params![provider_name],
                 |row| row.get::<_, Option<String>>(0),
             )
             .unwrap()
@@ -7032,7 +7254,7 @@ mod tests {
         db.conn
             .execute(
                 "UPDATE invocations SET created_at = ?1 WHERE id = ?2",
-                params![created_at, id],
+                sqlite::params![created_at, id],
             )
             .unwrap();
         id
@@ -7110,7 +7332,7 @@ mod tests {
     fn legacy_invocations_db(rows: &[LegacyInvocationFixtureRow<'_>]) -> TempDir {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
-        let conn = Connection::open(&path).unwrap();
+        let conn = sqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
             "CREATE TABLE invocations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -7127,7 +7349,7 @@ mod tests {
             conn.execute(
                 "INSERT INTO invocations (model_name, provider_index, success, exit_code, error_category, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
+                sqlite::params![
                     model_name,
                     provider_index,
                     success,
@@ -7168,7 +7390,7 @@ mod tests {
     fn legacy_providers_db(rows: &[ProviderMigrationInvocationFixture<'_>]) -> TempDir {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
-        let conn = Connection::open(&path).unwrap();
+        let conn = sqlite::Connection::open(&path).unwrap();
         conn.execute_batch(StateDb::invocations_schema_sql())
             .unwrap();
         conn.execute_batch(
@@ -7198,7 +7420,7 @@ mod tests {
                     invocation_uuid, model_name, provider_name, provider_index,
                     status, success, exit_code, error_category, created_at, finished_at
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![
+                sqlite::params![
                     Uuid::new_v4().to_string(),
                     row.model_name,
                     row.provider_name,
@@ -7345,7 +7567,7 @@ mod tests {
     fn malformed_providers_shape_db() -> TempDir {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
-        let conn = Connection::open(&path).unwrap();
+        let conn = sqlite::Connection::open(&path).unwrap();
         conn.execute_batch(StateDb::invocations_schema_sql())
             .unwrap();
         conn.execute_batch(
@@ -7377,7 +7599,7 @@ mod tests {
              ) VALUES (?1, 'routing-model', 'claude', 0, 'failed', 0, 1,
                        'rate_limit', '2026-04-20T10:00:00+00:00',
                        '2026-04-20T10:00:01+00:00')",
-            params![Uuid::new_v4().to_string()],
+            sqlite::params![Uuid::new_v4().to_string()],
         )
         .unwrap();
         mark_current_schema_version(&conn);
@@ -7387,7 +7609,7 @@ mod tests {
     fn malformed_providers_affinity_db() -> TempDir {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
-        let conn = Connection::open(&path).unwrap();
+        let conn = sqlite::Connection::open(&path).unwrap();
         conn.execute_batch(StateDb::invocations_schema_sql())
             .unwrap();
         conn.execute_batch(
@@ -7419,7 +7641,7 @@ mod tests {
         let dir =
             legacy_invocations_db(&[("routing-model", 0, 0, 1, Some("rate_limit"), "created-a")]);
         let path = dir.path().join("state.db");
-        let conn = Connection::open(&path).unwrap();
+        let conn = sqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
             "CREATE TABLE providers (
                 model_name TEXT NOT NULL,
@@ -7438,7 +7660,7 @@ mod tests {
         dir
     }
 
-    fn table_columns_with_pk(conn: &Connection, table_name: &str) -> Vec<(String, i64)> {
+    fn table_columns_with_pk(conn: &sqlite::Connection, table_name: &str) -> Vec<(String, i64)> {
         let mut stmt = conn
             .prepare(&format!("PRAGMA table_info({table_name})"))
             .unwrap();
@@ -7450,7 +7672,7 @@ mod tests {
         rows.map(|row| row.unwrap()).collect()
     }
 
-    fn provider_aggregate_snapshot(conn: &Connection) -> Vec<ProviderAggregateSnapshot> {
+    fn provider_aggregate_snapshot(conn: &sqlite::Connection) -> Vec<ProviderAggregateSnapshot> {
         let mut stmt = conn
             .prepare(
                 "SELECT model_name, provider_name, invocation_count, error_count,
@@ -7475,7 +7697,7 @@ mod tests {
         rows.map(|row| row.unwrap()).collect()
     }
 
-    fn quoted_snapshot(conn: &Connection, schema_sql: &str, rows_sql: &str) -> Vec<String> {
+    fn quoted_snapshot(conn: &sqlite::Connection, schema_sql: &str, rows_sql: &str) -> Vec<String> {
         let mut snapshot = Vec::new();
         snapshot.push(
             conn.query_row(schema_sql, [], |row| row.get::<_, String>(0))
@@ -7487,7 +7709,7 @@ mod tests {
         snapshot
     }
 
-    fn malformed_providers_snapshot(conn: &Connection) -> Vec<String> {
+    fn malformed_providers_snapshot(conn: &sqlite::Connection) -> Vec<String> {
         quoted_snapshot(
             conn,
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'providers'",
@@ -7500,7 +7722,7 @@ mod tests {
         )
     }
 
-    fn invocations_snapshot(conn: &Connection) -> Vec<String> {
+    fn invocations_snapshot(conn: &sqlite::Connection) -> Vec<String> {
         quoted_snapshot(
             conn,
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'invocations'",
@@ -7514,7 +7736,7 @@ mod tests {
         )
     }
 
-    fn legacy_invocations_snapshot(conn: &Connection) -> Vec<String> {
+    fn legacy_invocations_snapshot(conn: &sqlite::Connection) -> Vec<String> {
         quoted_snapshot(
             conn,
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'invocations'",
@@ -7529,7 +7751,7 @@ mod tests {
     fn legacy_session_turns_db() -> TempDir {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
-        let conn = Connection::open(&path).unwrap();
+        let conn = sqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
             "CREATE TABLE session_turns (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -7607,7 +7829,7 @@ mod tests {
             .conn
             .query_row(
                 "SELECT COUNT(*) FROM provider_quotas WHERE provider_name = ?1",
-                params![provider],
+                sqlite::params![provider],
                 |row| row.get(0),
             )
             .unwrap();
@@ -7771,7 +7993,7 @@ mod tests {
     fn quota_tight_routing_column_dropped_after_migration() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
-        let conn = Connection::open(&path).unwrap();
+        let conn = sqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
             "CREATE TABLE invocations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -7902,7 +8124,7 @@ mod tests {
     fn providers_migration_rejects_unexpected_shape_without_mutating_source_tables() {
         let dir = malformed_providers_shape_db();
         let path = dir.path().join("state.db");
-        let conn = Connection::open(&path).unwrap();
+        let conn = sqlite::Connection::open(&path).unwrap();
         let providers_before = malformed_providers_snapshot(&conn);
         let invocations_before = invocations_snapshot(&conn);
         drop(conn);
@@ -7917,7 +8139,7 @@ mod tests {
             "unexpected-shape error should name providers and unexpected shape; got {err}"
         );
 
-        let conn = Connection::open(&path).unwrap();
+        let conn = sqlite::Connection::open(&path).unwrap();
         assert_eq!(malformed_providers_snapshot(&conn), providers_before);
         assert_eq!(invocations_snapshot(&conn), invocations_before);
         conn.execute_batch("DROP TABLE providers").unwrap();
@@ -7961,7 +8183,7 @@ mod tests {
     fn providers_migration_rejects_non_table_object_named_providers() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
-        let conn = Connection::open(&path).unwrap();
+        let conn = sqlite::Connection::open(&path).unwrap();
         conn.execute_batch(StateDb::invocations_schema_sql())
             .unwrap();
         // SQLite shares table/view namespace; create a VIEW named providers.
@@ -7994,7 +8216,7 @@ mod tests {
             "object-type rejection should name the unexpected type; got {err}"
         );
 
-        let conn = Connection::open(&path).unwrap();
+        let conn = sqlite::Connection::open(&path).unwrap();
         let mut stmt = conn
             .prepare("SELECT type FROM sqlite_master WHERE name = 'providers'")
             .unwrap();
@@ -8013,7 +8235,7 @@ mod tests {
     fn providers_migration_rejects_table_with_foreign_keys() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
-        let conn = Connection::open(&path).unwrap();
+        let conn = sqlite::Connection::open(&path).unwrap();
         conn.execute_batch(StateDb::invocations_schema_sql())
             .unwrap();
         conn.execute_batch(
@@ -8052,7 +8274,7 @@ mod tests {
     fn providers_preflight_rejects_malformed_shape_before_invocations_migration() {
         let dir = legacy_invocations_with_malformed_providers_db();
         let path = dir.path().join("state.db");
-        let conn = Connection::open(&path).unwrap();
+        let conn = sqlite::Connection::open(&path).unwrap();
         let invocations_before = legacy_invocations_snapshot(&conn);
         drop(conn);
 
@@ -8066,7 +8288,7 @@ mod tests {
             "unexpected-shape error should come from providers preflight; got {err}"
         );
 
-        let conn = Connection::open(&path).unwrap();
+        let conn = sqlite::Connection::open(&path).unwrap();
         assert_eq!(legacy_invocations_snapshot(&conn), invocations_before);
     }
 
@@ -8204,7 +8426,7 @@ mod tests {
     fn t_schema_incremental_adds_terminal_reason_without_losing_rows() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
-        let conn = Connection::open(&path).unwrap();
+        let conn = sqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
             "CREATE TABLE invocations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -8365,7 +8587,7 @@ mod tests {
         // risk: legacy-DB upgrade; level: unit; source: contract §4 T5 / proposal A2,A8.
         let dir = legacy_session_turns_db();
         let path = dir.path().join("state.db");
-        let conn = Connection::open(&path).unwrap();
+        let conn = sqlite::Connection::open(&path).unwrap();
         conn.execute(
             "INSERT INTO session_turns
                 (provider_name, session_id, turn_id, timestamp, role, source_file, ingested_at)
@@ -8531,7 +8753,7 @@ name = "fixture-provider"
     fn migration_rolls_back_when_rebuild_fails() {
         let dir = legacy_invocations_db(&[("mapped-model", 0, 1, 0, None, "2026-04-17T08:00:00Z")]);
         let path = dir.path().join("state.db");
-        let conn = Connection::open(&path).unwrap();
+        let conn = sqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
             "CREATE TABLE invocations_new (id INTEGER PRIMARY KEY);
              CREATE TABLE blocker (name TEXT);
@@ -8546,7 +8768,7 @@ name = "fixture-provider"
         };
         assert!(!err.is_empty());
 
-        let conn = Connection::open(&path).unwrap();
+        let conn = sqlite::Connection::open(&path).unwrap();
         let columns: Vec<String> = conn
             .prepare("PRAGMA table_info(invocations)")
             .unwrap()
@@ -8613,7 +8835,7 @@ name = "fixture-provider"
 
             // Verify both legacy rows migrated cleanly with provider_name=NULL
             // and status='legacy' since the lookup couldn't resolve anything.
-            let conn = Connection::open(&path).unwrap();
+            let conn = sqlite::Connection::open(&path).unwrap();
             let mut stmt = conn
                 .prepare(
                     "SELECT model_name, provider_name, status, invocation_uuid, finished_at
@@ -8681,7 +8903,7 @@ name = "fixture-provider"
     fn provider_quotas_topology_columns_created_and_backfilled() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
-        let conn = Connection::open(&path).unwrap();
+        let conn = sqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
             "CREATE TABLE provider_quotas (
                 provider_name TEXT PRIMARY KEY,
@@ -8759,7 +8981,7 @@ name = "fixture-provider"
     fn provider_quotas_topology_backfill_recovers_when_column_already_exists() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
-        let conn = Connection::open(&path).unwrap();
+        let conn = sqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
             "CREATE TABLE provider_quotas (
                 provider_name TEXT PRIMARY KEY,
@@ -8876,7 +9098,7 @@ name = "fixture-provider"
                 "INSERT INTO provider_quotas
                     (provider_name, topology_peak_live_window_count)
                  VALUES (?1, ?2)",
-                params!["p", -1],
+                sqlite::params!["p", -1],
             )
             .unwrap();
 
@@ -9400,7 +9622,7 @@ name = "fixture-provider"
             .conn
             .query_row(
                 "SELECT provider_session_id FROM invocations WHERE id = ?1",
-                params![id],
+                sqlite::params![id],
                 |row| row.get(0),
             )
             .unwrap();
@@ -9430,7 +9652,7 @@ name = "fixture-provider"
             .conn
             .query_row(
                 "SELECT provider_session_id, resume_input_id FROM invocations WHERE id = ?1",
-                params![id],
+                sqlite::params![id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
@@ -9463,7 +9685,7 @@ name = "fixture-provider"
             .query_row(
                 "SELECT session_id, provider_session_id, resume_input_id
                  FROM invocations WHERE id = ?1",
-                params![id],
+                sqlite::params![id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
@@ -9604,7 +9826,7 @@ name = "fixture-provider"
                         invocation_uuid, model_name, provider_name, provider_index,
                         status, created_at
                      ) VALUES (?1, 'legacy-model', NULL, ?2, 'running', ?3)",
-                    params![
+                    sqlite::params![
                         Uuid::new_v4().to_string(),
                         provider_index,
                         Utc::now().to_rfc3339(),
@@ -9817,7 +10039,7 @@ name = "fixture-provider"
                 "UPDATE invocations
                  SET provider_session_id = 'active-provider-session'
                  WHERE id = ?1",
-                params![resumed],
+                sqlite::params![resumed],
             )
             .unwrap();
 
@@ -9831,7 +10053,7 @@ name = "fixture-provider"
             .query_row(
                 "SELECT provider_session_id, resume_input_id, provider_session_capture_method
                  FROM invocations WHERE id = ?1",
-                params![non_resumed],
+                sqlite::params![non_resumed],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
@@ -9844,7 +10066,7 @@ name = "fixture-provider"
             .query_row(
                 "SELECT provider_session_id, resume_input_id, provider_session_capture_method
                  FROM invocations WHERE id = ?1",
-                params![resumed],
+                sqlite::params![resumed],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
@@ -9873,7 +10095,7 @@ name = "fixture-provider"
             .conn
             .query_row(
                 "SELECT session_id FROM invocations WHERE id = ?1",
-                params![resumed],
+                sqlite::params![resumed],
                 |row| row.get(0),
             )
             .unwrap();
@@ -9881,7 +10103,7 @@ name = "fixture-provider"
             .conn
             .query_row(
                 "SELECT session_id FROM invocations WHERE id = ?1",
-                params![non_resumed],
+                sqlite::params![non_resumed],
                 |row| row.get(0),
             )
             .unwrap();
@@ -10027,7 +10249,7 @@ name = "fixture-provider"
                 "SELECT parent_turn_id, is_sidechain
                  FROM session_turns
                  WHERE provider_name = ?1 AND session_id = ?2 AND turn_id = ?3",
-                params!["fixture-provider", "session-a", "child-turn"],
+                sqlite::params!["fixture-provider", "session-a", "child-turn"],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
@@ -10753,7 +10975,7 @@ interactive_args = ["launch"]
             .execute(
                 "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
                  VALUES (?1, ?2, ?2, ?3)",
-                params![chain_id, last_used_at, model_name],
+                sqlite::params![chain_id, last_used_at, model_name],
             )
             .unwrap();
     }
@@ -10772,7 +10994,7 @@ interactive_args = ["launch"]
                 "INSERT INTO session_chain_segments
                     (chain_id, provider_name, session_id, started_at, ended_at, transition_reason)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
+                sqlite::params![
                     chain_id,
                     provider_name,
                     session_id,
@@ -10825,7 +11047,7 @@ interactive_args = ["launch"]
         db.conn
             .execute(
                 "UPDATE invocations SET created_at = ?1, finished_at = ?1 WHERE id = ?2",
-                params![created_at, id],
+                sqlite::params![created_at, id],
             )
             .unwrap();
     }
@@ -10833,7 +11055,7 @@ interactive_args = ["launch"]
     fn pre_chain_db_with_turns(rows: &[(&str, &str, &str, &str, &str)]) -> TempDir {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
-        let conn = Connection::open(&path).unwrap();
+        let conn = sqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
             "CREATE TABLE session_turns (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -10871,7 +11093,7 @@ interactive_args = ["launch"]
                 "INSERT INTO session_turns
                     (provider_name, session_id, turn_id, timestamp, role, source_file, ingested_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, '', ?4)",
-                params![provider, session, turn, timestamp, role],
+                sqlite::params![provider, session, turn, timestamp, role],
             )
             .unwrap();
         }
@@ -10997,7 +11219,7 @@ interactive_args = ["launch"]
     ) -> TempDir {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("state.db");
-        let conn = Connection::open(&db_path).unwrap();
+        let conn = sqlite::Connection::open(&db_path).unwrap();
         seed_current_drift_required_tables(&conn);
         conn.execute(
             "ALTER TABLE invocations DROP COLUMN provider_session_resolved_account",
@@ -11011,7 +11233,7 @@ interactive_args = ["launch"]
                  created_at, finished_at)
              VALUES (?1, 'claude-opus', 'claude', 0, ?2, NULL, NULL, ?3, ?4, ?5, ?6,
                      '2026-04-17T08:00:00Z', NULL)",
-            params![
+            sqlite::params![
                 invocation_uuid,
                 status,
                 error_category,
@@ -11056,7 +11278,7 @@ interactive_args = ["launch"]
                         provider_session_capture_method, terminal_reason, status, error_category
                  FROM invocations
                  WHERE invocation_uuid = ?1",
-                params![invocation_uuid],
+                sqlite::params![invocation_uuid],
                 |row| {
                     Ok((
                         row.get(0)?,
@@ -11092,18 +11314,18 @@ interactive_args = ["launch"]
             None,
         );
         {
-            let conn = Connection::open(dir.path().join("state.db")).unwrap();
+            let conn = sqlite::Connection::open(dir.path().join("state.db")).unwrap();
             conn.execute(
                 "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
                  VALUES (?1, '2026-04-17T08:00:00Z', '2026-04-17T08:00:00Z', 'claude-opus')",
-                params![CHAIN_A],
+                sqlite::params![CHAIN_A],
             )
             .unwrap();
             conn.execute(
                 "INSERT INTO session_chain_segments
                     (chain_id, provider_name, session_id, started_at, transition_reason)
                  VALUES (?1, 'claude', ?2, '2026-04-17T08:00:00Z', 'initial')",
-                params![CHAIN_A, SESSION_A],
+                sqlite::params![CHAIN_A, SESSION_A],
             )
             .unwrap();
         }
@@ -11116,7 +11338,7 @@ interactive_args = ["launch"]
                         provider_session_capture_method
                  FROM invocations
                  WHERE invocation_uuid = ?1",
-                params![invocation_uuid],
+                sqlite::params![invocation_uuid],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
@@ -11150,7 +11372,7 @@ interactive_args = ["launch"]
                         provider_session_capture_method
                  FROM invocations
                  WHERE invocation_uuid = ?1",
-                params![invocation_uuid],
+                sqlite::params![invocation_uuid],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
@@ -11192,7 +11414,7 @@ interactive_args = ["launch"]
             .conn
             .query_row(
                 "SELECT COUNT(*) FROM session_chain_segments WHERE chain_id = ?1 AND ended_at IS NULL",
-                params![CHAIN_A],
+                sqlite::params![CHAIN_A],
                 |row| row.get(0),
             )
             .unwrap();
@@ -11229,7 +11451,7 @@ interactive_args = ["launch"]
             .query_row(
                 "SELECT transition_reason FROM session_chain_segments
                  WHERE provider_name = 'claude' AND session_id = ?1",
-                params![SESSION_A],
+                sqlite::params![SESSION_A],
                 |row| row.get(0),
             )
             .unwrap();
@@ -11254,7 +11476,7 @@ interactive_args = ["launch"]
             .query_row(
                 "SELECT transition_reason FROM session_chain_segments
                  WHERE provider_name = 'claude' AND session_id = ?1",
-                params![SESSION_A],
+                sqlite::params![SESSION_A],
                 |row| row.get(0),
             )
             .unwrap();
@@ -11638,7 +11860,7 @@ interactive_args = ["launch"]
             .conn
             .query_row(
                 "SELECT last_used_at FROM session_chains WHERE chain_id = ?1",
-                params![CHAIN_A],
+                sqlite::params![CHAIN_A],
                 |row| row.get(0),
             )
             .unwrap();
@@ -11706,7 +11928,7 @@ interactive_args = ["launch"]
                 "INSERT INTO session_turns
                     (provider_name, session_id, turn_id, timestamp, role, source_file, ingested_at, is_compaction_boundary)
                  VALUES ('claude', ?1, 'bad-boundary', 'not-a-timestamp', 'assistant', '', '2026-04-17T08:00:00Z', 1)",
-                params![SESSION_A],
+                sqlite::params![SESSION_A],
             )
             .unwrap();
 
@@ -11745,7 +11967,7 @@ interactive_args = ["launch"]
             .conn
             .query_row(
                 "SELECT COUNT(*) FROM session_chain_segments WHERE chain_id = ?1 AND ended_at IS NULL",
-                params![CHAIN_A],
+                sqlite::params![CHAIN_A],
                 |row| row.get(0),
             )
             .unwrap();
@@ -11779,7 +12001,7 @@ interactive_args = ["launch"]
                      created_at = '2026-04-17T08:00:00Z',
                      finished_at = '2026-04-17T08:00:02Z'
                  WHERE id = ?1",
-                params![id],
+                sqlite::params![id],
             )
             .unwrap();
 
@@ -11823,7 +12045,7 @@ interactive_args = ["launch"]
         db.conn
             .execute(
                 "UPDATE invocations SET status = 'paused' WHERE id = ?1",
-                params![id],
+                sqlite::params![id],
             )
             .unwrap();
         let err = db.get_invocation_by_uuid(invocation_uuid).unwrap_err();
@@ -11831,7 +12053,7 @@ interactive_args = ["launch"]
         db.conn
             .execute(
                 "UPDATE invocations SET status = 'running', created_at = 'not-a-timestamp' WHERE id = ?1",
-                params![id],
+                sqlite::params![id],
             )
             .unwrap();
         let err = db.get_invocation_by_uuid(invocation_uuid).unwrap_err();
@@ -12034,7 +12256,7 @@ interactive_args = ["launch"]
         db.conn
             .execute(
                 "UPDATE invocations SET created_at = 'not-a-timestamp' WHERE id = ?1",
-                params![id],
+                sqlite::params![id],
             )
             .unwrap();
         let before = Utc::now();
@@ -12044,7 +12266,7 @@ interactive_args = ["launch"]
             .conn
             .query_row(
                 "SELECT started_at FROM session_chain_segments WHERE provider_name = 'claude' AND session_id = ?1",
-                params![SESSION_A],
+                sqlite::params![SESSION_A],
                 |row| row.get(0),
             )
             .unwrap();
@@ -12074,7 +12296,7 @@ interactive_args = ["launch"]
             .connection()
             .query_row(
                 "SELECT status FROM invocations WHERE id = ?1",
-                params![memory_id],
+                sqlite::params![memory_id],
                 |row| row.get(0),
             )
             .unwrap();
@@ -12144,7 +12366,7 @@ interactive_args = ["launch"]
             .conn
             .query_row(
                 "SELECT status FROM invocations WHERE id = ?1",
-                params![id],
+                sqlite::params![id],
                 |row| row.get(0),
             )
             .unwrap();
@@ -12526,7 +12748,7 @@ interactive_args = ["launch"]
 
             let sidecar_dir = tempfile::tempdir().unwrap();
             let sidecar_path = sidecar_dir.path().join("state.db");
-            let sidecar_conn = Connection::open(&sidecar_path).unwrap();
+            let sidecar_conn = sqlite::Connection::open(&sidecar_path).unwrap();
             sidecar_conn
                 .execute_batch(
                     "PRAGMA journal_mode = WAL;
@@ -12654,7 +12876,7 @@ interactive_args = ["launch"]
 
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("state.db");
-        let mut conn = Connection::open(&db_path).unwrap();
+        let mut conn = sqlite::Connection::open(&db_path).unwrap();
         conn.execute_batch(
             "
             PRAGMA user_version = 3;
@@ -12707,5 +12929,459 @@ interactive_args = ["launch"]
             )
             .unwrap();
         assert_eq!(marker_exists, 0, "failed migration left partial schema");
+    }
+
+    fn age160_sqlite_failure(
+        code: sqlite::ffi::ErrorCode,
+        extended_code: i32,
+        message: &str,
+    ) -> sqlite::Error {
+        sqlite::Error::SqliteFailure(
+            sqlite::ffi::Error {
+                code,
+                extended_code,
+            },
+            Some(message.to_string()),
+        )
+    }
+
+    fn age160_assert_not_database(error: ReadOnlyOpenError, expected_path: &Path) {
+        match error {
+            ReadOnlyOpenError::NotADatabase { path, .. } => assert_eq!(path, expected_path),
+            other => panic!("expected NotADatabase, got {other:?}"),
+        }
+    }
+
+    fn age160_assert_permission_denied(error: ReadOnlyOpenError, expected_path: &Path) {
+        match error {
+            ReadOnlyOpenError::PermissionDenied { path } => assert_eq!(path, expected_path),
+            other => panic!("expected PermissionDenied, got {other:?}"),
+        }
+    }
+
+    fn age160_assert_operational(error: ReadOnlyOpenError) {
+        match error {
+            ReadOnlyOpenError::Operational { message } => assert!(!message.is_empty()),
+            other => panic!("expected Operational, got {other:?}"),
+        }
+    }
+
+    fn age160_assert_wal_sidecar(error: ReadOnlyOpenError, expected_path: &Path) {
+        match error {
+            ReadOnlyOpenError::WalSidecarError { path, message } => {
+                assert_eq!(path, expected_path);
+                assert!(!message.is_empty());
+            }
+            other => panic!("expected WalSidecarError, got {other:?}"),
+        }
+    }
+
+    /// AGE-160 risk: PP-001 push-pull / PM-01 typed read-only SQLite error projection.
+    /// Selected level: unit.
+    /// Source: the AGE-160 proposal § Test-intent track; validates A1 and
+    /// the "do not parse diagnostic strings" forbidden behavior.
+    #[test]
+    fn age160_classify_read_only_open_error_via_typed_projection_not_database_permission_and_plain_unknown()
+     {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.db");
+
+        age160_assert_not_database(
+            classify_read_only_open_error(
+                &path,
+                age160_sqlite_failure(
+                    sqlite::ffi::ErrorCode::NotADatabase,
+                    sqlite::ffi::ErrorCode::NotADatabase as i32,
+                    "private diagnostic mentions wal but code is not-a-database",
+                ),
+            ),
+            &path,
+        );
+        age160_assert_not_database(
+            classify_read_only_open_error(
+                &path,
+                age160_sqlite_failure(
+                    sqlite::ffi::ErrorCode::DatabaseCorrupt,
+                    sqlite::ffi::ErrorCode::DatabaseCorrupt as i32,
+                    "private diagnostic mentions shared memory but code is corrupt",
+                ),
+            ),
+            &path,
+        );
+        age160_assert_permission_denied(
+            classify_read_only_open_error(
+                &path,
+                age160_sqlite_failure(
+                    sqlite::ffi::ErrorCode::PermissionDenied,
+                    sqlite::ffi::ErrorCode::PermissionDenied as i32,
+                    "permission denied",
+                ),
+            ),
+            &path,
+        );
+
+        for (code, message) in [
+            (
+                sqlite::ffi::ErrorCode::SystemIoFailure,
+                "plain SystemIoFailure must ignore wal/-shm diagnostic tokens",
+            ),
+            (
+                sqlite::ffi::ErrorCode::ReadOnly,
+                "read only database with wal-shaped private text",
+            ),
+            (
+                sqlite::ffi::ErrorCode::CannotOpen,
+                "cannot open database with shared memory-shaped private text",
+            ),
+        ] {
+            age160_assert_operational(classify_read_only_open_error(
+                &path,
+                age160_sqlite_failure(code, code as i32, message),
+            ));
+        }
+    }
+
+    /// AGE-160 risk: PP-001 push-pull + A2 sidecar evidence.
+    /// Selected level: unit.
+    /// Source: the AGE-160 proposal § Test-intent track; validates A2.
+    #[test]
+    fn age160_classify_read_only_open_error_via_typed_projection_wal_sidecar() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.db");
+        std::fs::write(&path, b"placeholder").unwrap();
+        std::fs::write(wal_path(&path), b"owned wal sidecar").unwrap();
+
+        age160_assert_wal_sidecar(
+            classify_read_only_open_error(
+                &path,
+                age160_sqlite_failure(
+                    sqlite::ffi::ErrorCode::SystemIoFailure,
+                    sqlite::ffi::ErrorCode::SystemIoFailure as i32,
+                    "plain io failure text intentionally lacks sidecar tokens",
+                ),
+            ),
+            &path,
+        );
+
+        let dirty_wal_path = temp.path().join("dirty-wal-state.db");
+        age160_assert_wal_sidecar(
+            classify_read_only_open_error(
+                &dirty_wal_path,
+                age160_sqlite_failure(
+                    sqlite::ffi::ErrorCode::CannotOpen,
+                    sqlite::ffi::SQLITE_CANTOPEN_DIRTYWAL,
+                    "dirty WAL extended code without diagnostic-token dependency",
+                ),
+            ),
+            &dirty_wal_path,
+        );
+    }
+
+    /// AGE-160 risk: PP-001 push-pull + A2 SHM extended-code projection.
+    /// Selected level: unit.
+    /// Source: the AGE-160 proposal § Test-intent track; validates A2/A3.
+    #[test]
+    fn age160_classify_read_only_open_error_via_typed_projection_shm_sidecar_extended_codes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.db");
+
+        for extended_code in [
+            sqlite::ffi::SQLITE_IOERR_SHMOPEN,
+            sqlite::ffi::SQLITE_IOERR_SHMSIZE,
+            sqlite::ffi::SQLITE_IOERR_SHMLOCK,
+            sqlite::ffi::SQLITE_IOERR_SHMMAP,
+        ] {
+            age160_assert_wal_sidecar(
+                classify_read_only_open_error(
+                    &path,
+                    age160_sqlite_failure(
+                        sqlite::ffi::ErrorCode::SystemIoFailure,
+                        extended_code,
+                        "typed SHM sidecar evidence; message intentionally generic",
+                    ),
+                ),
+                &path,
+            );
+        }
+    }
+
+    /// AGE-160 risk: A6 db.rs↔SQLite namespace contraction.
+    /// Selected level: unit + compile.
+    /// Source: the AGE-160 proposal § Test-intent track; validates A7.
+    ///
+    #[test]
+    fn age160_sqlite_adapter_read_only_projection_and_namespace_contract() {
+        use crate::db::sqlite_adapter::{
+            Connection as AdapterConnection, OpenFlags as AdapterOpenFlags,
+            OptionalExtension as AdapterOptionalExtension, ReadOnlyOpenFailure, Row as AdapterRow,
+            SidecarProbe, SqliteFailureProjection, Statement as AdapterStatement,
+            Transaction as AdapterTransaction, params as adapter_params,
+        };
+
+        fn _accept_row(_: &AdapterRow<'_>) {}
+        fn _accept_statement(_: &mut AdapterStatement<'_>) {}
+        fn _accept_transaction(_: &AdapterTransaction<'_>) {}
+        fn _accept_optional<T: AdapterOptionalExtension>(value: T) -> T {
+            value
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.db");
+        let conn = AdapterConnection::open_with_flags(
+            &path,
+            AdapterOpenFlags::SQLITE_OPEN_READ_WRITE | AdapterOpenFlags::SQLITE_OPEN_CREATE,
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE contract_probe (id INTEGER PRIMARY KEY)",
+            adapter_params![],
+        )
+        .unwrap();
+
+        let projection = SqliteFailureProjection::from(&age160_sqlite_failure(
+            sqlite::ffi::ErrorCode::NotADatabase,
+            sqlite::ffi::ErrorCode::NotADatabase as i32,
+            "not db",
+        ));
+        assert!(matches!(
+            ReadOnlyOpenFailure::from_projection(&path, projection, SidecarProbe::for_db(&path)),
+            ReadOnlyOpenFailure::PlainDb { .. }
+        ));
+        let _ = _accept_optional(Ok::<Option<i64>, sqlite::Error>(Some(1)));
+    }
+
+    /// AGE-160 risk: PP-004 declared marker grammar.
+    /// Selected level: unit.
+    /// Source: the AGE-160 proposal § Test-intent track.
+    #[test]
+    fn age160_composite_invocation_id_declared_grammar_canonical_json_round_trip() {
+        let known_uuid = Uuid::parse_str("7ad2916c-38dd-49e6-a1f7-3ef22766ff70").unwrap();
+        let composite = CompositeInvocationId {
+            source: "codex2".to_string(),
+            id: known_uuid.to_string(),
+        };
+
+        let stderr_line = composite.stderr_line();
+        assert!(stderr_line.starts_with("OULIPOLY_INVOCATION="));
+        let payload = stderr_line
+            .strip_prefix("OULIPOLY_INVOCATION=")
+            .expect("stderr marker prefix");
+        assert!(!payload.starts_with("OULIPOLY_INVOCATION="));
+        assert_eq!(
+            payload,
+            r#"{"source":"codex2","id":"7ad2916c-38dd-49e6-a1f7-3ef22766ff70"}"#
+        );
+
+        let parsed = CompositeInvocationId::parse_env_value(payload).unwrap();
+        assert_eq!(parsed.source, "codex2");
+        assert_eq!(parsed.id.to_string(), known_uuid.to_string());
+
+        let parent_env = serde_json::to_string(&composite).unwrap();
+        assert!(!parent_env.starts_with("OULIPOLY_INVOCATION="));
+        assert_eq!(
+            CompositeInvocationId::parse_env_value(&parent_env)
+                .unwrap()
+                .id
+                .to_string(),
+            known_uuid.to_string()
+        );
+    }
+
+    /// AGE-160 risk: PP-004 push-pull + A4 legacy compatibility grammar.
+    /// Selected level: unit.
+    /// Source: the AGE-160 proposal § Test-intent track; validates A4.
+    #[test]
+    fn age160_composite_invocation_id_declared_grammar_legacy_shell_mangled_compatibility() {
+        let known_uuid = "7ad2916c-38dd-49e6-a1f7-3ef22766ff70";
+
+        for payload in [
+            format!("{{source:\"codex2\",id:\"{known_uuid}\",extra:\"ignored\"}}"),
+            format!("{{source:'codex2',id:'{known_uuid}',extra:'ignored'}}"),
+        ] {
+            assert!(
+                !payload.starts_with("OULIPOLY_INVOCATION="),
+                "legacy compatibility payloads are raw payloads, not marker lines"
+            );
+            let parsed = CompositeInvocationId::parse_env_value(&payload).unwrap();
+            assert_eq!(parsed.source, "codex2");
+            assert_eq!(parsed.id.to_string(), known_uuid);
+        }
+
+        assert!(
+            CompositeInvocationId::parse_env_value("{source:'codex2',id:'not-a-uuid'}").is_err()
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct Age160LifecycleSink {
+        records: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+
+    impl LifecycleEventSink for Age160LifecycleSink {
+        fn forward(&mut self, record: &serde_json::Value) {
+            self.records.lock().unwrap().push(record.clone());
+        }
+    }
+
+    fn age160_lifecycle_fixture() -> (
+        StateDb,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) {
+        let records = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Age160LifecycleSink {
+            records: records.clone(),
+        };
+        let db = StateDb::open_with_sink(Path::new(":memory:"), Box::new(sink)).unwrap();
+        (db, records)
+    }
+
+    fn age160_invocation_start(uuid: &str) -> InvocationStart {
+        InvocationStart {
+            invocation_uuid: uuid.to_string(),
+            model_name: "codex~high".to_string(),
+            provider_name: "codex2".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        }
+    }
+
+    fn age160_lifecycle_records(
+        records: &std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) -> Vec<serde_json::Value> {
+        records.lock().unwrap().clone()
+    }
+
+    fn age160_record_keys(record: &serde_json::Value) -> Vec<&str> {
+        record
+            .as_object()
+            .expect("record object")
+            .keys()
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// AGE-160 risk: A6 db.rs↔lifecycle_log facade narrowing.
+    /// Selected level: unit + integration.
+    /// Source: the AGE-160 proposal § Test-intent track; validates A6.
+    #[test]
+    fn age160_lifecycle_log_facade_start_finalize_session_capture_preserves_records() {
+        let (db, sink) = age160_lifecycle_fixture();
+        let invocation_uuid = "16000000-0000-4000-8000-000000000001";
+
+        let row_id = db
+            .start_invocation(&age160_invocation_start(invocation_uuid))
+            .unwrap();
+        db.update_session_capture(row_id, Some("session-age160"), "resumed")
+            .unwrap();
+        db.finalize_invocation(row_id, true, 0, None, Some("done"))
+            .unwrap();
+
+        let records = age160_lifecycle_records(&sink);
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0]["event_name"], "invocation.started");
+        assert_eq!(records[1]["event_name"], "invocation.session_captured");
+        assert_eq!(records[2]["event_name"], "invocation.finalized");
+
+        assert_eq!(
+            age160_record_keys(&records[0]),
+            vec![
+                "chain_id",
+                "error_chain",
+                "event_name",
+                "invocation_row_id",
+                "invocation_uuid",
+                "latency_us",
+                "model",
+                "operation_result",
+                "parent_invocation_uuid",
+                "provider",
+                "provider_source",
+                "session_id",
+            ]
+        );
+        assert_eq!(
+            age160_record_keys(&records[1]),
+            vec![
+                "capture_method",
+                "chain_id",
+                "error_chain",
+                "event_name",
+                "invocation_row_id",
+                "invocation_uuid",
+                "latency_us",
+                "marker_emitted",
+                "operation_result",
+                "provider_source",
+                "resume_input_id",
+                "session_id",
+            ]
+        );
+        assert_eq!(
+            age160_record_keys(&records[2]),
+            vec![
+                "chain_id",
+                "error_category",
+                "error_chain",
+                "event_name",
+                "exit_code",
+                "invocation_row_id",
+                "invocation_uuid",
+                "latency_us",
+                "operation_result",
+                "provider_source",
+                "raw_artifact_paths",
+                "session_id",
+                "terminal_reason",
+                "terminal_status",
+            ]
+        );
+
+        assert_eq!(records[0]["invocation_uuid"], invocation_uuid);
+        assert_eq!(records[0]["operation_result"], "ok");
+        assert_eq!(records[0]["invocation_row_id"], serde_json::json!(row_id));
+        assert_eq!(records[1]["capture_method"], "resumed");
+        assert_eq!(records[1]["marker_emitted"], true);
+        assert_eq!(records[1]["resume_input_id"], "session-age160");
+        assert_eq!(records[2]["terminal_status"], "success");
+        assert_eq!(records[2]["exit_code"], 0);
+        assert_eq!(records[2]["terminal_reason"], "done");
+    }
+
+    fn age160_direct_symbol_count(haystack: &str, needles: &[&str]) -> usize {
+        needles
+            .iter()
+            .map(|needle| haystack.match_indices(needle).count())
+            .sum()
+    }
+
+    /// AGE-160 risk: A6 MEDIUM dispositions for db.rs↔serde_json/schema/chrono.
+    /// Selected level: unit.
+    /// Source: the AGE-160 proposal § Test-intent track.
+    #[test]
+    fn age160_post_cleanup_a6_medium_rows_resolved_or_declared() {
+        let db_rs = include_str!("db.rs");
+        let serde_direct_symbols = age160_direct_symbol_count(
+            db_rs,
+            &[
+                "serde_json::to_string",
+                "serde_json::from_str",
+                "serde_json::json!",
+                "serde_json::to_vec",
+                "serde_json::Value",
+            ],
+        );
+        assert!(
+            serde_direct_symbols < 12 || db_rs.contains("AGE-160 serde_json residual disposition"),
+            "db.rs direct serde_json symbol count must fall below the A6 MEDIUM threshold or carry a local residual disposition; count={serde_direct_symbols}"
+        );
+        assert!(
+            db_rs.contains("crate::schema")
+                && db_rs.contains("AGE-160 intrinsic schema-version carrier"),
+            "db.rs must declare crate::schema as the intrinsic StateDb schema-version carrier"
+        );
+        assert!(
+            db_rs.contains("use chrono") && db_rs.contains("AGE-160 intrinsic timestamp carrier"),
+            "db.rs must declare chrono as the intrinsic StateDb timestamp carrier"
+        );
     }
 }

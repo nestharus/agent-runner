@@ -1,8 +1,9 @@
 #![cfg(unix)]
 #![allow(dead_code)]
 
+use oulipoly_state::StateDb;
 use oulipoly_state::schema;
-use oulipoly_state::{BinaryInfo, FeatureMap, SchemaProbeReport, StateDb, StateDbReport};
+use oulipoly_state::schema_probe::{BinaryInfo, FeatureMap, SchemaProbeReport, StateDbReport};
 use rusqlite::Connection;
 use serde_json::Value;
 use std::collections::BTreeMap;

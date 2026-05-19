@@ -5319,7 +5319,9 @@ fn backfill_compaction_session(
     provider_name: &str,
     session_id: &str,
 ) -> Result<u64, String> {
-    let evidence = state.compact_summary_evidence(session_id).map_err(|e| e.to_string())?;
+    let evidence = state
+        .compact_summary_evidence(session_id)
+        .map_err(|e| e.to_string())?;
     flag_compaction_boundaries_from_evidence(state, provider_name, &evidence)
 }
 
@@ -5347,6 +5349,195 @@ fn render_compaction_backfill_session(provider_name: &str, session_id: &str, fla
         "compaction backfill session: provider={} session_id={} flagged={}",
         provider_name, session_id, flagged
     );
+}
+
+#[allow(dead_code)]
+struct CompactionBackfillEnvironment {
+    sessions_cfg: oulipoly_config::SessionsConfig,
+    models: HashMap<String, ModelConfig>,
+}
+
+#[allow(dead_code)]
+fn load_compaction_backfill_environment() -> Result<CompactionBackfillEnvironment, String> {
+    Ok(CompactionBackfillEnvironment {
+        sessions_cfg: load_compaction_sessions_config()?,
+        models: load_compaction_models()?,
+    })
+}
+
+#[allow(dead_code)]
+fn load_compaction_sessions_config() -> Result<oulipoly_config::SessionsConfig, String> {
+    let sessions_path = default_config_root().join("sessions.toml");
+    oulipoly_config::SessionsConfig::load(&sessions_path)
+        .map_err(|e| format!("Failed to load {}: {e}", sessions_path.display()))
+}
+
+#[allow(dead_code)]
+fn load_compaction_models() -> Result<HashMap<String, ModelConfig>, String> {
+    let models_dir = default_models_dir();
+    if models_dir.is_dir() {
+        Ok(load_models(&models_dir, None)?)
+    } else {
+        Ok(HashMap::new())
+    }
+}
+
+#[allow(dead_code)]
+fn locate_compaction_backfill_source(
+    provider_name: &str,
+    session_id: &str,
+    sessions_cfg: &oulipoly_config::SessionsConfig,
+    models: &HashMap<String, ModelConfig>,
+) -> Option<PathBuf> {
+    if let Some(path) = existing_session_transcript_path(sessions_cfg, provider_name, session_id) {
+        return Some(path);
+    }
+
+    existing_storage_transcript_path(provider_name, session_id, models)
+}
+
+#[allow(dead_code)]
+fn existing_session_transcript_path(
+    sessions_cfg: &oulipoly_config::SessionsConfig,
+    provider_name: &str,
+    session_id: &str,
+) -> Option<PathBuf> {
+    let path =
+        oulipoly_runtime::sessions::locate_transcript(sessions_cfg, provider_name, session_id)
+            .ok()
+            .flatten()?;
+    existing_path(path)
+}
+
+#[allow(dead_code)]
+fn existing_storage_transcript_path(
+    provider_name: &str,
+    session_id: &str,
+    models: &HashMap<String, ModelConfig>,
+) -> Option<PathBuf> {
+    existing_path(storage_transcript_path(
+        matching_storage_providers(provider_name, models),
+        session_id,
+    )?)
+}
+
+#[allow(dead_code)]
+fn matching_storage_providers<'a>(
+    provider_name: &str,
+    models: &'a HashMap<String, ModelConfig>,
+) -> Vec<&'a ProviderConfig> {
+    models
+        .values()
+        .flat_map(|model| model.providers.iter())
+        .filter(|provider| provider.name == provider_name)
+        .collect()
+}
+
+#[allow(dead_code)]
+fn storage_transcript_path(providers: Vec<&ProviderConfig>, session_id: &str) -> Option<PathBuf> {
+    providers.into_iter().find_map(|provider| {
+        oulipoly_runtime::migration::find_claude_source_from_storage(provider, session_id)
+    })
+}
+
+#[allow(dead_code)]
+fn existing_path(path: PathBuf) -> Option<PathBuf> {
+    if path.exists() { Some(path) } else { None }
+}
+
+#[allow(dead_code)]
+fn flag_compaction_boundaries_from_jsonl(
+    state: &StateDb,
+    provider_name: &str,
+    session_id: &str,
+    path: &Path,
+) -> Result<u64, String> {
+    let mut flagged = 0u64;
+    for line in read_compaction_jsonl_lines(path)? {
+        let Some(turn_id) = compact_summary_turn_id(&line) else {
+            continue;
+        };
+        if flag_compaction_boundary(state, provider_name, session_id, &turn_id)? {
+            flagged += 1;
+        }
+    }
+    Ok(flagged)
+}
+
+#[allow(dead_code)]
+fn read_compaction_jsonl_lines(path: &Path) -> Result<Vec<String>, String> {
+    let file = open_compaction_source(path)?;
+    collect_compaction_jsonl_lines(path, std::io::BufReader::new(file).lines())
+}
+
+#[allow(dead_code)]
+fn collect_compaction_jsonl_lines<I>(path: &Path, lines: I) -> Result<Vec<String>, String>
+where
+    I: Iterator<Item = Result<String, std::io::Error>>,
+{
+    lines
+        .map(|line| line.map_err(|e| format_compaction_source_line_error(path, e)))
+        .collect()
+}
+
+#[allow(dead_code)]
+fn open_compaction_source(path: &Path) -> Result<std::fs::File, String> {
+    std::fs::File::open(path)
+        .map_err(|e| format!("Failed to open compaction source {}: {e}", path.display()))
+}
+
+#[allow(dead_code)]
+fn format_compaction_source_line_error(path: &Path, error: std::io::Error) -> String {
+    format!(
+        "Failed to read compaction source line from {}: {error}",
+        path.display()
+    )
+}
+
+#[allow(dead_code)]
+fn flag_compaction_boundary(
+    state: &StateDb,
+    provider_name: &str,
+    session_id: &str,
+    turn_id: &str,
+) -> Result<bool, String> {
+    state.flag_compaction_boundary(provider_name, session_id, turn_id)
+}
+
+#[allow(dead_code)]
+fn compact_summary_turn_id(line: &str) -> Option<String> {
+    let obj = parse_compaction_json_line(line)?;
+    compact_summary_turn_uuid(&obj)
+}
+
+#[allow(dead_code)]
+fn parse_compaction_json_line(line: &str) -> Option<serde_json::Value> {
+    serde_json::from_str::<serde_json::Value>(line).ok()
+}
+
+#[allow(dead_code)]
+fn is_compact_summary_json(obj: &serde_json::Value) -> bool {
+    obj.get("isCompactSummary")
+        .and_then(|value| value.as_bool())
+        == Some(true)
+}
+
+#[allow(dead_code)]
+fn compact_summary_turn_uuid(obj: &serde_json::Value) -> Option<String> {
+    if !is_compact_summary_json(obj) {
+        return None;
+    }
+    raw_compact_summary_uuid(obj).map(string_from_str)
+}
+
+#[allow(dead_code)]
+fn raw_compact_summary_uuid(obj: &serde_json::Value) -> Option<&str> {
+    obj.get("uuid").and_then(|value| value.as_str())
+}
+
+#[allow(dead_code)]
+fn string_from_str(value: &str) -> String {
+    value.to_string()
 }
 
 fn format_resume_list_line(preview: &oulipoly_state::ChainPreview) -> String {
