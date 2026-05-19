@@ -65,7 +65,7 @@ use uuid::Uuid;
 mod balanced_cli;
 mod cli_inputs;
 mod config_migration_cli;
-#[cfg(test)]
+#[allow(dead_code)]
 #[path = "main/owned_turn_event_ingest.rs"]
 mod owned_turn_event_ingest;
 mod repl_cli;

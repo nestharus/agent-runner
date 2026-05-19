@@ -433,22 +433,18 @@ fn ti_40_legacy_repair_helpers_are_allow_listed_and_migration_represented() {
 
 // Declared role: accessor
 fn legacy_repair_source() -> String {
-    [
-        include_str!("../src/db/open.rs"),
-        include_str!("../src/db/chains.rs"),
-    ]
-    .join("\n")
+    include_str!("../src/db.rs").to_string()
 }
 
 // Declared role: validator
 fn assert_legacy_repair_source_uses_runtime_helper_bodies(source: &str) {
     assert!(
-        source.contains("pub(super) fn apply_current_schema_repairs"),
-        "legacy repair validation must inspect the moved StateDb::open helper bodies"
+        source.contains("fn apply_current_schema_repairs"),
+        "legacy repair validation must inspect the StateDb::open helper bodies"
     );
     assert!(
         source.contains("pub fn backfill_session_chains"),
-        "legacy repair validation must inspect the moved backfill helper body"
+        "legacy repair validation must inspect the backfill helper body"
     );
 }
 
