@@ -669,26 +669,7 @@ fn run_session_import_replace(
 }
 
 fn validate_import_replace_args(session_id: &str, preimage_sha256: Option<&str>) -> Option<i32> {
-    if Uuid::try_parse(session_id).is_err() {
-        return Some(render_replace_error(ReplaceError::InvalidSessionId {
-            input: session_id.to_string(),
-        }));
-    }
-    if preimage_sha256.is_some_and(invalid_sha256_hex) {
-        return Some(render_replace_error(ReplaceError::InvalidArgument {
-            message: "preimage sha256 must be 64 hex characters".to_string(),
-        }));
-    }
-    None
-}
-
-fn invalid_sha256_hex(hash: &str) -> bool {
-    hash.len() != 64 || !hash.chars().all(|ch| ch.is_ascii_hexdigit())
-}
-
-fn render_replace_error(err: ReplaceError) -> i32 {
-    eprintln!("{}", err.to_json());
-    err.exit_code()
+    session_import_replace_cli::validate_import_replace_args(session_id, preimage_sha256)
 }
 
 fn import_replace_request(
@@ -712,18 +693,7 @@ fn replace_source(from_file: Option<&Path>) -> ReplaceSource {
 fn render_import_replace_output(
     result: Result<session_replace::ReplaceReceipt, ReplaceError>,
 ) -> Result<i32, String> {
-    match result {
-        Ok(receipt) => {
-            let json = serde_json::to_string(&receipt).map_err(format_replace_receipt_error)?;
-            println!("{json}");
-            Ok(0)
-        }
-        Err(err) => Ok(render_replace_error(err)),
-    }
-}
-
-fn format_replace_receipt_error(error: serde_json::Error) -> String {
-    format!("Failed to serialize replace receipt: {error}")
+    session_import_replace_cli::render_import_replace_output(result)
 }
 
 fn probe_error_message(error: ProbeError) -> String {
@@ -832,17 +802,7 @@ fn render_trace_result(
     result: Result<oulipoly_runtime::trace::TraceReport, TraceServiceFailure>,
     json: bool,
 ) -> Result<i32, String> {
-    match result {
-        Ok(report) => render_trace_report(&report, json),
-        Err(TraceServiceFailure::InvocationNotFound { message, .. }) => {
-            eprintln!("{message}");
-            Ok(1)
-        }
-        Err(
-            TraceServiceFailure::InvalidInvocationId { message, .. }
-            | TraceServiceFailure::Operational { message },
-        ) => Err(message),
-    }
+    trace_cli::render_trace_result(result, json)
 }
 
 fn render_trace_report(
@@ -922,25 +882,7 @@ fn render_session_locate_environment_error(message: String) -> i32 {
 fn render_session_metadata(
     result: Result<oulipoly_runtime::session_metadata::SessionMetadata, MetadataError>,
 ) -> Result<i32, String> {
-    match result {
-        Ok(metadata) => match serde_json::to_string(&metadata) {
-            Ok(json) => {
-                println!("{json}");
-                Ok(0)
-            }
-            Err(err) => {
-                emit_metadata_error(&MetadataError::Operational {
-                    message: format!("failed to serialize session metadata: {err}"),
-                });
-                Ok(1)
-            }
-        },
-        Err(err) => {
-            let code = metadata_error_exit_code(&err);
-            emit_metadata_error(&err);
-            Ok(code)
-        }
-    }
+    session_metadata_cli::render_session_metadata(result)
 }
 
 fn run_session_export(
@@ -3020,15 +2962,7 @@ fn resume_result_error_category(
     models: &HashMap<String, ModelConfig>,
     working_dir: Option<&Path>,
 ) -> Option<String> {
-    if execution_succeeded(result.exit_code) {
-        return None;
-    }
-    if resume_acceptance_adapter::classify(result.resume_acceptance.as_ref())
-        == resume_acceptance_adapter::ResumeAcceptanceCategory::SessionMismatch
-    {
-        return Some(resume_session_mismatch_category());
-    }
-    diagnose_execution_error(agent_runtime_services, result, models, working_dir)
+    resume_cli::resume_result_error_category(agent_runtime_services, result, models, working_dir)
 }
 
 fn balanced_result_error_category(
@@ -3037,20 +2971,12 @@ fn balanced_result_error_category(
     models: &HashMap<String, ModelConfig>,
     working_dir: Option<&Path>,
 ) -> Option<String> {
-    terminal_outcome_adapter::classify_error_category_with_fallback(result, || {
-        let input = diagnostic_input(&result.stderr, &result.stdout);
-        if diagnostics::classify_exhaustion(&input) {
-            Some(quota_exhausted_category())
-        } else {
-            run_diagnostics(
-                agent_runtime_services,
-                &input,
-                result.exit_code,
-                models,
-                working_dir,
-            )
-        }
-    })
+    balanced_cli::balanced_result_error_category(
+        agent_runtime_services,
+        result,
+        models,
+        working_dir,
+    )
 }
 
 fn resume_session_mismatch_category() -> String {
