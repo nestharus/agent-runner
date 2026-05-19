@@ -394,6 +394,7 @@ fn trace_events_by_name(records: &[CapturedTrace], event_name: &str) -> Vec<Capt
         .collect()
 }
 
+#[allow(clippy::type_complexity)]
 fn query_session_columns(
     db: &StateDb,
     row_id: i64,
