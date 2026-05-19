@@ -42,12 +42,15 @@ fn age151_main_does_not_derive_typed_terminal_signals_from_terminal_reason_strin
         );
     }
 
-    let terminal_reason_idx = main.find("terminal_reason");
-    if let Some(idx) = terminal_reason_idx {
-        let rest = &main[idx..];
-        assert!(
-            !rest.contains("QuotaExhaustedInband") && !rest.contains("ProlongedSilence"),
-            "main.rs must not map terminal_reason strings into TerminalSignalKind variants"
+    for forbidden in [
+        "terminal_reason=>TerminalSignalKind",
+        "terminal_reason.as_deref()=>TerminalSignalKind",
+        "typed_terminal_reason_fallback(result.terminal_reason",
+    ] {
+        assert_not_contains(
+            &main,
+            forbidden,
+            "terminal_reason must not be mapped into TerminalSignalKind variants",
         );
     }
 }

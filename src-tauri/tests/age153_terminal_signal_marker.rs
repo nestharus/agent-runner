@@ -5,7 +5,7 @@ mod age153_support;
 use age153_support::{
     Age153Fixture, assert_no_terminal_marker_on_stdout, assert_ordered,
     assert_single_terminal_signal, line_count, main_rs_source, prolonged_silence_body, quota_body,
-    source_block_after, success_body, terminal_signal_lines,
+    source_block_after, success_body, terminal_outcome_adapter_source, terminal_signal_lines,
 };
 
 #[test]
@@ -70,13 +70,17 @@ fn typed_signal_handled_path_finalizes_explicitly_not_guard_drop() {
 }
 
 fn assert_marker_emission_is_adjacent_to_typed_signal_finalization() {
-    let source = main_rs_source();
-    let helper = source_block_after(&source, "fn apply_terminal_signal_outcome(");
+    let terminal_outcome_adapter = terminal_outcome_adapter_source();
+    let helper = source_block_after(
+        &terminal_outcome_adapter,
+        "fn apply_terminal_signal_outcome(",
+    );
     assert!(
         helper.contains("emit_terminal_signal_marker"),
         "typed-signal outcome handling must be the marker emission authority"
     );
 
+    let source = main_rs_source();
     let balanced = source_block_after(&source, "fn run_with_balancing(");
     let signal_idx = balanced
         .find("apply_terminal_signal_outcome")

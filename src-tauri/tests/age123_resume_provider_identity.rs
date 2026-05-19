@@ -424,7 +424,7 @@ fn quota_retry_records_resolved_provider_identity_per_attempt() {
         &[
             ProviderFixture {
                 name: "claude-a",
-                body: "printf '%s\\n' 'quota exhausted for active resume provider' >&2\nexit 42",
+                body: "printf '%s\\n' 'Claude usage limit reached for active resume provider' >&2\nexit 42",
             },
             ProviderFixture {
                 name: "claude-b",

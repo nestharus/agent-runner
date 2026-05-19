@@ -526,6 +526,11 @@ pub fn main_rs_source() -> String {
     fs::read_to_string(&path).unwrap_or_else(|err| panic!("failed to read {path:?}: {err}"))
 }
 
+pub fn terminal_outcome_adapter_source() -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/terminal_outcome_adapter.rs");
+    fs::read_to_string(&path).unwrap_or_else(|err| panic!("failed to read {path:?}: {err}"))
+}
+
 pub fn source_block_after<'a>(source: &'a str, start: &str) -> &'a str {
     let start_idx = source
         .find(start)
