@@ -1,0 +1,166 @@
+//! ## Declared roles
+//! accessor, mapper, validator
+//!
+//! Function role map:
+//! - `workspace_root`, `carried_regressions`, `target_path`: accessor
+//! - `row_ids`: mapper
+//! - `age154_*` tests: validator
+
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+
+struct CarriedRegression {
+    row_id: &'static str,
+    source: &'static str,
+    command_or_node_id: &'static str,
+    durable_target: &'static str,
+}
+
+const CARRIED_REGRESSIONS: &[CarriedRegression] = &[
+    CarriedRegression {
+        row_id: "AGE-154-CARRIED-01-age151-source-guard",
+        source: "AGE-151",
+        command_or_node_id: "cargo test -p oulipoly-agent-runner --test age151_source_guard",
+        durable_target: "src-tauri/tests/age151_source_guard.rs",
+    },
+    CarriedRegression {
+        row_id: "AGE-154-CARRIED-02-terminal-outcome-adapter-inline",
+        source: "AGE-151 / AGE-153",
+        command_or_node_id: "cargo test -p oulipoly-agent-runner terminal_outcome_adapter::tests::",
+        durable_target: "src-tauri/src/terminal_outcome_adapter.rs",
+    },
+    CarriedRegression {
+        row_id: "AGE-154-CARRIED-03-age153-terminal-signal-marker",
+        source: "AGE-153",
+        command_or_node_id: "cargo test -p oulipoly-agent-runner --test age153_terminal_signal_marker",
+        durable_target: "src-tauri/tests/age153_terminal_signal_marker.rs",
+    },
+    CarriedRegression {
+        row_id: "AGE-154-CARRIED-04-age153-result-envelope-compat",
+        source: "AGE-153",
+        command_or_node_id: "cargo test -p oulipoly-agent-runner --test age153_result_envelope_compat",
+        durable_target: "src-tauri/tests/age153_result_envelope_compat.rs",
+    },
+    CarriedRegression {
+        row_id: "AGE-154-CARRIED-05-age153-one-shot-terminal-signal",
+        source: "AGE-153",
+        command_or_node_id: "cargo test -p oulipoly-agent-runner --test age153_one_shot_terminal_signal",
+        durable_target: "src-tauri/tests/age153_one_shot_terminal_signal.rs",
+    },
+    CarriedRegression {
+        row_id: "AGE-154-CARRIED-06-age153-resume-terminal-signal",
+        source: "AGE-153",
+        command_or_node_id: "cargo test -p oulipoly-agent-runner --test age153_resume_terminal_signal",
+        durable_target: "src-tauri/tests/age153_resume_terminal_signal.rs",
+    },
+    CarriedRegression {
+        row_id: "AGE-154-CARRIED-07-age153-repl-terminal-signal",
+        source: "AGE-153",
+        command_or_node_id: "cargo test -p oulipoly-agent-runner --test age153_repl_terminal_signal",
+        durable_target: "src-tauri/tests/age153_repl_terminal_signal.rs",
+    },
+    CarriedRegression {
+        row_id: "AGE-154-CARRIED-08-age153-captured-child-supervision",
+        source: "AGE-153",
+        command_or_node_id: "cargo test -p oulipoly-agent-runner --test age153_captured_child_supervision",
+        durable_target: "src-tauri/tests/age153_captured_child_supervision.rs",
+    },
+    CarriedRegression {
+        row_id: "AGE-154-CARRIED-09-age153-balancer-signal-isolation",
+        source: "AGE-153",
+        command_or_node_id: "cargo test -p oulipoly-runtime --test age153_balancer_signal_isolation",
+        durable_target: "crates/oulipoly-runtime/tests/age153_balancer_signal_isolation.rs",
+    },
+    CarriedRegression {
+        row_id: "AGE-154-CARRIED-10-balancer-inline-regressions",
+        source: "AGE-140 / AGE-153",
+        command_or_node_id: "cargo test -p oulipoly-runtime balancer::tests::",
+        durable_target: "crates/oulipoly-runtime/src/balancer/mod.rs",
+    },
+    CarriedRegression {
+        row_id: "AGE-154-CARRIED-11-routing-matrix",
+        source: "AGE-59 retained by AGE-140",
+        command_or_node_id: "cargo test -p oulipoly-runtime --test routing_matrix",
+        durable_target: "crates/oulipoly-runtime/tests/routing_matrix.rs",
+    },
+    CarriedRegression {
+        row_id: "AGE-154-CARRIED-12-age35-routing-lifecycle",
+        source: "AGE-35",
+        command_or_node_id: "cargo test -p oulipoly-agent-runner --test age35_routing_lifecycle_characterization",
+        durable_target: "src-tauri/tests/age35_routing_lifecycle_characterization.rs",
+    },
+    CarriedRegression {
+        row_id: "AGE-154-CARRIED-13-age27-diagnostics-effective-provider",
+        source: "AGE-27 / AGE-153",
+        command_or_node_id: "cargo test -p oulipoly-agent-runner --test age27_diagnostics_effective_provider",
+        durable_target: "src-tauri/tests/age27_diagnostics_effective_provider.rs",
+    },
+    CarriedRegression {
+        row_id: "AGE-154-CARRIED-14-provider-termination-eval-observation",
+        source: "AGE-91 W5 / AGE-143",
+        command_or_node_id: "evals/agent-runner-provider-termination/eval.sh",
+        durable_target: "evals/agent-runner-provider-termination/eval.sh",
+    },
+];
+
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("src-tauri parent workspace root")
+        .to_path_buf()
+}
+
+fn carried_regressions() -> &'static [CarriedRegression] {
+    CARRIED_REGRESSIONS
+}
+
+fn target_path(entry: &CarriedRegression) -> PathBuf {
+    workspace_root().join(entry.durable_target)
+}
+
+fn row_ids() -> BTreeSet<&'static str> {
+    carried_regressions()
+        .iter()
+        .map(|entry| entry.row_id)
+        .collect()
+}
+
+#[test]
+fn age154_age140_carried_regression_mapping_documents_every_required_rerun() {
+    assert_eq!(
+        carried_regressions().len(),
+        14,
+        "proposal item 6 structured carried-regression mapping must stay complete"
+    );
+    assert_eq!(
+        row_ids().len(),
+        carried_regressions().len(),
+        "Step 6b output-index row IDs must be unique"
+    );
+    for entry in carried_regressions() {
+        assert!(
+            entry.row_id.starts_with("AGE-154-CARRIED-"),
+            "unexpected row id {} from {}",
+            entry.row_id,
+            entry.source
+        );
+        assert!(
+            !entry.command_or_node_id.is_empty(),
+            "{} must name the Step 6c rerun command",
+            entry.row_id
+        );
+    }
+}
+
+#[test]
+fn age154_age140_carried_regression_targets_exist_for_step6c_consumption() {
+    for entry in carried_regressions() {
+        let path = target_path(entry);
+        assert!(
+            path.exists(),
+            "{} target must exist for Step 6c rerun/documented mapping: {}",
+            entry.row_id,
+            path.display()
+        );
+    }
+}
