@@ -25,7 +25,6 @@ use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind;
 pub(crate) enum TerminalOutcomeCategory {
     QuotaExhausted,
     HungSubprocess,
-    Unknown,
 }
 
 impl TerminalOutcomeCategory {
@@ -37,7 +36,6 @@ impl TerminalOutcomeCategory {
             TerminalOutcomeCategory::HungSubprocess => {
                 Some(ErrorCategory::HungSubprocess.as_str().to_string())
             }
-            TerminalOutcomeCategory::Unknown => Some(ErrorCategory::Unknown.as_str().to_string()),
         }
     }
 }
@@ -53,22 +51,24 @@ where
         return None;
     }
 
-    if let Some(signal) = result.terminal_signal.as_ref() {
-        return category_for_signal_kind(signal.kind).as_error_category();
+    if let Some(signal) = result.terminal_signal.as_ref()
+        && let Some(category) = category_for_signal_kind(signal.kind)
+    {
+        return category.as_error_category();
     }
 
     diagnostics_fallback()
 }
 
-fn category_for_signal_kind(kind: TerminalSignalKind) -> TerminalOutcomeCategory {
+fn category_for_signal_kind(kind: TerminalSignalKind) -> Option<TerminalOutcomeCategory> {
     match kind {
-        TerminalSignalKind::QuotaExhaustedInband => TerminalOutcomeCategory::QuotaExhausted,
-        TerminalSignalKind::ProlongedSilence => TerminalOutcomeCategory::HungSubprocess,
+        TerminalSignalKind::QuotaExhaustedInband => Some(TerminalOutcomeCategory::QuotaExhausted),
+        TerminalSignalKind::ProlongedSilence => Some(TerminalOutcomeCategory::HungSubprocess),
         TerminalSignalKind::CleanExit
         | TerminalSignalKind::NonzeroExit
         | TerminalSignalKind::SignalExit
         | TerminalSignalKind::SpawnError
-        | TerminalSignalKind::Unknown => TerminalOutcomeCategory::Unknown,
+        | TerminalSignalKind::Unknown => None,
     }
 }
 
