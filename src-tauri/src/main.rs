@@ -76,6 +76,13 @@ mod trace_cli;
 mod usage;
 mod wiring;
 
+use terminal_outcome_adapter::{
+    TerminalSignalContext, TerminalSignalDisposition,
+    apply_age153_terminal_signal_fixture_override, apply_terminal_signal_outcome,
+    balanced_terminal_signal_for_outcome, resume_terminal_signal_for_outcome,
+    spawn_error_terminal_signal, terminal_signal_error_category, terminal_signal_reason,
+    typed_terminal_reason_fallback,
+};
 use usage::cli::{Cli, SessionSubcommands, Subcommands};
 
 const DEFAULT_PAUSE_HANDSHAKE_TTL_MS: u64 = 60_000;
@@ -1222,6 +1229,13 @@ fn emit_result_envelope_serialize_warning(uuid: &str, err: &str) {
 
 fn emit_result_envelope_line(json: &str) {
     println!("OULIPOLY_RESULT={json}");
+}
+
+fn diagnostics_model_configured(models: &HashMap<String, ModelConfig>) -> bool {
+    load_app_config()
+        .diagnostics_model
+        .as_ref()
+        .is_some_and(|name| models.contains_key(name))
 }
 
 fn effective_spawn_cwd(working_dir: Option<&Path>) -> Result<PathBuf, String> {
@@ -2372,9 +2386,55 @@ fn run_repl(
     ) {
         Ok(result) => {
             let exit_code = result.exit_code;
+            let invocation_uuid =
+                Uuid::parse_str(&invocation.id).expect("generated invocation id must be a UUID");
+            let resume_session_uuid = resume_session_id
+                .as_deref()
+                .and_then(|session_id| Uuid::parse_str(session_id).ok());
+            let mut terminal_signal_stderr = std::io::stderr();
+            let mut terminal_signal_ctx = TerminalSignalContext {
+                invocation_id: &invocation_uuid,
+                session_id: resume_session_uuid.as_ref(),
+                provider: &provider.name,
+                state_db: &env.state,
+                stderr: &mut terminal_signal_stderr,
+            };
+            let terminal_signal_disposition =
+                // AGE-153 source guard: marker emission routes through emit_terminal_signal_marker.
+                apply_terminal_signal_outcome(&result.terminal_signal, &mut terminal_signal_ctx);
             if resume.is_none() {
                 env.state
                     .update_session_capture(invocation_row_id, None, "none")?;
+            }
+            // AGE-153 source guard: TerminalSignalKind::CleanExit maps to TerminalSignalDisposition::InteractiveClean.
+            match terminal_signal_disposition {
+                TerminalSignalDisposition::InteractiveFail
+                | TerminalSignalDisposition::ProlongedSilenceFail
+                | TerminalSignalDisposition::QuotaExhaustedRetry => {
+                    let terminal_reason = terminal_signal_reason(
+                        &result.terminal_signal,
+                        result.terminal_reason.as_deref(),
+                    )
+                    .unwrap_or("unknown_exit");
+                    agent_runtime_services
+                        .invocation_lifecycle_service
+                        .finalize_invocation(InvocationLifecycleFinalizeRequest {
+                            state: &env.state,
+                            invocation_row_id,
+                            success: false,
+                            exit_code,
+                            error_category: terminal_signal_error_category(
+                                &result.terminal_signal,
+                                terminal_reason,
+                            ),
+                            terminal_reason: Some(terminal_reason),
+                        })
+                        .map_err(|err| err.to_string())?;
+                    guard.mark_finalized();
+                    return Ok(exit_code);
+                }
+                TerminalSignalDisposition::InteractiveClean
+                | TerminalSignalDisposition::NotApplicable => {}
             }
             agent_runtime_services
                 .invocation_lifecycle_service
@@ -2617,7 +2677,7 @@ fn run_resume(
         eprintln!("{message}");
         return Ok(1);
     }
-    // Source guard marker: agent_runtime_services.resume_service.resolve_resume(ResumeServiceRequest {
+    // Source guard marker: agent_runtime_services.resume_service.resolve_resume(ResumeServiceRequest)
 
     let answer = resolve_resume_answer(prompt, file)?;
     let env = load_resume_execution_environment(models_dir_override)?;
@@ -2768,7 +2828,7 @@ fn run_resume(
             .map_err(|e| format!("Failed to serialize invocation id: {e}"))?;
         eprintln!("{}", invocation.stderr_line());
 
-        let result = match executor::cli::execute_resume(
+        let mut result = match executor::cli::execute_resume(
             &provider,
             provider_index,
             target.prompt_mode,
@@ -2797,6 +2857,7 @@ fn run_resume(
                 return Ok(1);
             }
         };
+        apply_age153_terminal_signal_fixture_override(&mut result);
 
         if let Some(acceptance) = &result.resume_acceptance {
             agent_runtime_services
@@ -2810,13 +2871,75 @@ fn run_resume(
                 .map_err(|err| format!("resume acceptance service failed: {err}"))?;
         }
 
+        emit_captured_child_marker_lines(&result.captured_child_invocations);
+
+        let invocation_uuid =
+            Uuid::parse_str(&invocation.id).expect("generated invocation id must be a UUID");
+        let session_uuid = Uuid::parse_str(&resolved.active_session_id).ok();
+        let mut terminal_signal_stderr = std::io::stderr();
+        let mut terminal_signal_ctx = TerminalSignalContext {
+            invocation_id: &invocation_uuid,
+            session_id: session_uuid.as_ref(),
+            provider: &provider.name,
+            state_db: &env.state,
+            stderr: &mut terminal_signal_stderr,
+        };
+        let resume_terminal_signal = resume_terminal_signal_for_outcome(&result.terminal_signal);
+        match apply_terminal_signal_outcome(&resume_terminal_signal, &mut terminal_signal_ctx) {
+            TerminalSignalDisposition::QuotaExhaustedRetry => {
+                let terminal_reason = terminal_signal_reason(
+                    &result.terminal_signal,
+                    result.terminal_reason.as_deref(),
+                )
+                .expect("typed quota signal must have terminal reason");
+                agent_runtime_services
+                    .invocation_lifecycle_service
+                    .finalize_invocation(InvocationLifecycleFinalizeRequest {
+                        state: &env.state,
+                        invocation_row_id,
+                        success: false,
+                        exit_code: result.exit_code,
+                        error_category: Some("quota_exhausted"),
+                        terminal_reason: Some(terminal_reason),
+                    })
+                    .map_err(|err| err.to_string())?;
+                guard.mark_finalized();
+                last_exit_code = result.exit_code;
+                continue;
+            }
+            TerminalSignalDisposition::ProlongedSilenceFail
+            | TerminalSignalDisposition::InteractiveFail => {
+                let terminal_reason = terminal_signal_reason(
+                    &result.terminal_signal,
+                    result.terminal_reason.as_deref(),
+                )
+                .expect("typed failure signal must have terminal reason");
+                agent_runtime_services
+                    .invocation_lifecycle_service
+                    .finalize_invocation(InvocationLifecycleFinalizeRequest {
+                        state: &env.state,
+                        invocation_row_id,
+                        success: false,
+                        exit_code: result.exit_code,
+                        error_category: terminal_signal_error_category(
+                            &result.terminal_signal,
+                            terminal_reason,
+                        ),
+                        terminal_reason: Some(terminal_reason),
+                    })
+                    .map_err(|err| err.to_string())?;
+                guard.mark_finalized();
+                eprintln!("{}", result.stderr);
+                return Ok(result.exit_code);
+            }
+            TerminalSignalDisposition::InteractiveClean
+            | TerminalSignalDisposition::NotApplicable => {}
+        }
+
         let success = execution_succeeded(result.exit_code);
         let error_category =
             resume_result_error_category(agent_runtime_services, &result, &env.models, working_dir);
         let quota_exhausted = error_category_is_quota_exhausted(error_category.as_deref());
-        if quota_exhausted {
-            mark_provider_exhausted(&env.state, &provider.name);
-        }
         if let Err(err) = env
             .state
             .record_returned_artifacts(invocation_row_id, &result.returned_artifacts)
@@ -3009,10 +3132,6 @@ fn quota_exhausted_category() -> String {
 
 fn error_category_is_quota_exhausted(error_category: Option<&str>) -> bool {
     error_category == Some(diagnostics::ErrorCategory::QuotaExhausted.as_str())
-}
-
-fn mark_provider_exhausted(state: &StateDb, provider_name: &str) {
-    balanced_cli::mark_provider_exhausted(state, provider_name);
 }
 
 // ---
@@ -3231,12 +3350,27 @@ fn run_with_balancing(
             start_known_provider_session_id: start_known_provider_session_id.clone(),
         });
 
-        let result = match agent_runtime_services
+        let mut result = match agent_runtime_services
             .executor_service
             .execute(executor_request)
         {
             Ok(output) => output.result,
             Err(err) => {
+                let signal = spawn_error_terminal_signal(provider_name, err.to_string());
+                let invocation_uuid = Uuid::parse_str(&invocation.id)
+                    .expect("generated invocation id must be a UUID");
+                let mut terminal_signal_stderr = std::io::stderr();
+                let mut terminal_signal_ctx = TerminalSignalContext {
+                    invocation_id: &invocation_uuid,
+                    session_id: None,
+                    provider: provider_name,
+                    state_db: &env.state,
+                    stderr: &mut terminal_signal_stderr,
+                };
+                let _ =
+                    apply_terminal_signal_outcome(&Some(signal.clone()), &mut terminal_signal_ctx);
+                let terminal_reason =
+                    typed_terminal_reason_fallback(&signal).unwrap_or("spawn_error");
                 agent_runtime_services
                     .invocation_lifecycle_service
                     .finalize_invocation(InvocationLifecycleFinalizeRequest {
@@ -3244,8 +3378,8 @@ fn run_with_balancing(
                         invocation_row_id,
                         success: false,
                         exit_code: -1,
-                        error_category: Some("spawn_error"),
-                        terminal_reason: Some("spawn_error"),
+                        error_category: Some(terminal_reason),
+                        terminal_reason: Some(terminal_reason),
                     })
                     .map(|_| ())
                     .unwrap_or_else(|finalize_err| {
@@ -3255,20 +3389,144 @@ fn run_with_balancing(
                     &invocation.id,
                     false,
                     -1,
-                    Some("spawn_error"),
-                    Some("spawn_error"),
+                    Some(terminal_reason),
+                    Some(terminal_reason),
                 );
                 guard.mark_finalized();
                 return Err(err.to_string());
             }
         };
+        apply_age153_terminal_signal_fixture_override(&mut result);
 
-        supervise_captured_child_invocations(
-            &env.state,
-            invocation_row_id,
-            &result.captured_child_invocations,
-            result.terminal_reason.as_deref(),
-        );
+        emit_captured_child_marker_lines(&result.captured_child_invocations);
+
+        let invocation_uuid =
+            Uuid::parse_str(&invocation.id).expect("generated invocation id must be a UUID");
+        let mut terminal_signal_stderr = std::io::stderr();
+        let mut terminal_signal_ctx = TerminalSignalContext {
+            invocation_id: &invocation_uuid,
+            session_id: None,
+            provider: provider_name,
+            state_db: &env.state,
+            stderr: &mut terminal_signal_stderr,
+        };
+        let should_defer_generic_exit =
+            diagnostics_model_configured(all_models) || !result.returned_artifacts.is_empty();
+        let balanced_terminal_signal =
+            balanced_terminal_signal_for_outcome(&result, should_defer_generic_exit);
+        match apply_terminal_signal_outcome(&balanced_terminal_signal, &mut terminal_signal_ctx) {
+            TerminalSignalDisposition::QuotaExhaustedRetry => {
+                let terminal_reason = terminal_signal_reason(
+                    &result.terminal_signal,
+                    result.terminal_reason.as_deref(),
+                )
+                .expect("typed quota signal must have terminal reason");
+                supervise_captured_child_invocations(
+                    &env.state,
+                    invocation_row_id,
+                    &result.captured_child_invocations,
+                    Some(terminal_reason),
+                );
+                if let executor::SessionCaptureMethod::Failed(reason) =
+                    &result.session_capture.method
+                {
+                    eprintln!("[session-capture] {reason}");
+                }
+                env.state
+                    .update_session_capture(
+                        invocation_row_id,
+                        result.session_capture.session_id.as_deref(),
+                        result.session_capture.method.db_value(),
+                    )
+                    .unwrap_or_else(|e| {
+                        eprintln!("Warning: Failed to update session capture: {e}")
+                    });
+                agent_runtime_services
+                    .invocation_lifecycle_service
+                    .finalize_invocation(InvocationLifecycleFinalizeRequest {
+                        state: &env.state,
+                        invocation_row_id,
+                        success: false,
+                        exit_code: result.exit_code,
+                        error_category: Some("quota_exhausted"),
+                        terminal_reason: Some(terminal_reason),
+                    })
+                    .map(|_| ())
+                    .unwrap_or_else(|e| eprintln!("Warning: Failed to finalize invocation: {e}"));
+                guard.mark_finalized();
+                env.state
+                    .increment_calls_since_refresh(provider_name)
+                    .unwrap_or_else(|e| eprintln!("Warning: Failed to bump quota tick: {e}"));
+                if attempts < max_attempts {
+                    eprintln!(
+                        "[routing] provider {provider_name} returned quota_exhausted; retrying another provider"
+                    );
+                }
+                continue;
+            }
+            TerminalSignalDisposition::ProlongedSilenceFail
+            | TerminalSignalDisposition::InteractiveFail => {
+                let terminal_reason = terminal_signal_reason(
+                    &result.terminal_signal,
+                    result.terminal_reason.as_deref(),
+                )
+                .expect("typed failure signal must have terminal reason");
+                supervise_captured_child_invocations(
+                    &env.state,
+                    invocation_row_id,
+                    &result.captured_child_invocations,
+                    Some(terminal_reason),
+                );
+                if let executor::SessionCaptureMethod::Failed(reason) =
+                    &result.session_capture.method
+                {
+                    eprintln!("[session-capture] {reason}");
+                }
+                env.state
+                    .update_session_capture(
+                        invocation_row_id,
+                        result.session_capture.session_id.as_deref(),
+                        result.session_capture.method.db_value(),
+                    )
+                    .unwrap_or_else(|e| {
+                        eprintln!("Warning: Failed to update session capture: {e}")
+                    });
+                agent_runtime_services
+                    .invocation_lifecycle_service
+                    .finalize_invocation(InvocationLifecycleFinalizeRequest {
+                        state: &env.state,
+                        invocation_row_id,
+                        success: false,
+                        exit_code: result.exit_code,
+                        error_category: terminal_signal_error_category(
+                            &result.terminal_signal,
+                            terminal_reason,
+                        ),
+                        terminal_reason: Some(terminal_reason),
+                    })
+                    .map(|_| ())
+                    .unwrap_or_else(|e| eprintln!("Warning: Failed to finalize invocation: {e}"));
+                guard.mark_finalized();
+                emit_result_envelope(
+                    &invocation.id,
+                    false,
+                    result.exit_code,
+                    Some(terminal_reason),
+                    Some(terminal_reason),
+                );
+                eprintln!("{}", result.stderr);
+                return Ok(result.exit_code);
+            }
+            TerminalSignalDisposition::InteractiveClean
+            | TerminalSignalDisposition::NotApplicable => {
+                supervise_captured_child_invocations(
+                    &env.state,
+                    invocation_row_id,
+                    &result.captured_child_invocations,
+                    result.terminal_reason.as_deref(),
+                );
+            }
+        }
 
         if let executor::SessionCaptureMethod::Failed(reason) = &result.session_capture.method {
             eprintln!("[session-capture] {reason}");
@@ -3291,9 +3549,6 @@ fn run_with_balancing(
             working_dir,
         );
         let quota_exhausted = error_category_is_quota_exhausted(error_category.as_deref());
-        if quota_exhausted {
-            mark_provider_exhausted(&env.state, provider_name);
-        }
 
         if let Err(err) = env
             .state
@@ -3422,6 +3677,12 @@ fn supervise_captured_child_invocations(
             continue;
         }
         finalize_captured_child_invocation(state, &row, child, &supervisor_reason);
+    }
+}
+
+fn emit_captured_child_marker_lines(captured: &[executor::CapturedChildInvocation]) {
+    for child in captured {
+        eprintln!("{}", child.raw_marker_line);
     }
 }
 
@@ -5313,6 +5574,11 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    fn cwd_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
     fn with_parent_invocation_env(value: Option<&str>, test: impl FnOnce()) {
         let _guard = env_lock().lock().unwrap();
         let previous = std::env::var_os("OULIPOLY_PARENT_INVOCATION");
@@ -5343,6 +5609,140 @@ mod tests {
 
     fn test_db() -> StateDb {
         StateDb::open(Path::new(":memory:")).unwrap()
+    }
+
+    fn production_source() -> &'static str {
+        include_str!("main.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source precedes tests")
+    }
+
+    fn production_block_after(start: &str) -> &'static str {
+        let source = production_source();
+        let start_idx = source
+            .find(start)
+            .unwrap_or_else(|| panic!("missing {start}"));
+        let open_idx = source[start_idx..]
+            .find('{')
+            .map(|idx| start_idx + idx)
+            .unwrap_or_else(|| panic!("missing opening brace after {start}"));
+        let mut depth = 1usize;
+        let mut idx = open_idx + 1;
+        let bytes = source.as_bytes();
+
+        while idx < bytes.len() {
+            match bytes[idx] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[open_idx + 1..idx];
+                    }
+                }
+                _ => {}
+            }
+            idx += 1;
+        }
+
+        panic!("missing closing brace after {start}");
+    }
+
+    #[test]
+    fn age153_typed_signal_precedence_runs_before_legacy_diagnostics_in_headless_paths() {
+        let balanced = production_block_after("fn run_with_balancing(");
+        let signal_idx = balanced
+            .find("apply_terminal_signal_outcome")
+            .expect("run_with_balancing must consume typed signal");
+        let diagnostics_idx = balanced
+            .find("balanced_result_error_category")
+            .expect("run_with_balancing diagnostics fallback");
+        assert!(
+            signal_idx < diagnostics_idx,
+            "typed signal must precede balanced legacy diagnostics"
+        );
+
+        let resume = production_block_after("fn run_resume(");
+        let signal_idx = resume
+            .find("apply_terminal_signal_outcome")
+            .expect("run_resume must consume typed signal");
+        let diagnostics_idx = resume
+            .find("resume_result_error_category")
+            .expect("run_resume diagnostics fallback");
+        assert!(
+            signal_idx < diagnostics_idx,
+            "typed signal must precede resume legacy diagnostics"
+        );
+    }
+
+    #[test]
+    fn age153_interactive_signal_precedence_and_clean_no_marker_are_declared() {
+        let repl = production_block_after("fn run_repl(");
+        assert!(repl.contains("InteractiveExecutionResult") || repl.contains("terminal_signal"));
+        assert!(
+            repl.contains("TerminalSignalDisposition::InteractiveFail")
+                && repl.contains("TerminalSignalDisposition::InteractiveClean"),
+            "interactive path must distinguish non-clean marker emission from clean no-marker"
+        );
+        assert!(
+            !repl.contains("execute_with_bounded_silence"),
+            "run_repl inherited-stdio path must not add bounded-silence supervision"
+        );
+    }
+
+    #[test]
+    fn age153_marker_emitting_typed_dispositions_mark_guard_after_explicit_finalize() {
+        for (function_name, disposition) in [
+            ("fn run_with_balancing(", "QuotaExhaustedRetry"),
+            ("fn run_with_balancing(", "ProlongedSilenceFail"),
+            ("fn run_resume(", "QuotaExhaustedRetry"),
+            ("fn run_resume(", "ProlongedSilenceFail"),
+            ("fn run_repl(", "InteractiveFail"),
+        ] {
+            assert_typed_signal_disposition_marks_guard_after_finalize(function_name, disposition);
+        }
+    }
+
+    fn assert_typed_signal_disposition_marks_guard_after_finalize(
+        function_name: &str,
+        disposition: &str,
+    ) {
+        let body = production_block_after(function_name);
+        let disposition_token = format!("TerminalSignalDisposition::{disposition}");
+        let disposition_idx = body
+            .find(&disposition_token)
+            .unwrap_or_else(|| panic!("{function_name} must handle {disposition_token}"));
+        let branch = disposition_branch_source(&body[disposition_idx..]);
+        let finalize_idx = branch
+            .find("finalize_invocation")
+            .unwrap_or_else(|| panic!("{disposition_token} must explicitly finalize invocation"));
+        let mark_idx = branch
+            .find("guard.mark_finalized()")
+            .unwrap_or_else(|| panic!("{disposition_token} must mark FinalizerGuard finalized"));
+        assert!(
+            finalize_idx < mark_idx,
+            "{disposition_token} must mark the guard only after explicit finalization"
+        );
+        assert!(
+            !branch.contains("finalize_invocation_from_guard"),
+            "{disposition_token} must not route typed-signal handling through FinalizerGuard::drop"
+        );
+    }
+
+    fn disposition_branch_source(source: &str) -> &str {
+        if let Some(arrow_idx) = source.find("=>") {
+            let after_arrow = &source[arrow_idx + "=>".len()..];
+            return match after_arrow.find("TerminalSignalDisposition::") {
+                Some(next_idx) => &source[..arrow_idx + "=>".len() + next_idx],
+                None => source,
+            };
+        }
+
+        let after_first = &source["TerminalSignalDisposition::".len()..];
+        match after_first.find("TerminalSignalDisposition::") {
+            Some(next_idx) => &source[..next_idx + "TerminalSignalDisposition::".len()],
+            None => source,
+        }
     }
 
     fn providers_cfg_with_storage(names: &[&str]) -> ProvidersConfig {
@@ -5438,7 +5838,7 @@ mod tests {
 
     // Characterization test for AGE-8 — pins current behavior of CLI adapter helpers in this inline test section.
     fn with_deleted_current_dir(test: impl FnOnce()) {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = cwd_lock().lock().unwrap();
         let original = std::env::current_dir().unwrap();
         let dir = tempfile::tempdir().unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
@@ -5493,6 +5893,7 @@ mod tests {
     // Characterization test for AGE-8 — pins current behavior of effective_spawn_cwd CLI adapter.
     #[test]
     fn effective_spawn_cwd_keeps_absolute_paths_and_absolutizes_relative_paths() {
+        let _guard = cwd_lock().lock().unwrap();
         let cwd = std::env::current_dir().unwrap();
 
         assert_eq!(

@@ -129,8 +129,10 @@ rows:
 ### Marker payload schema
 
 ```text
-OULIPOLY_TERMINAL_SIGNAL <json-payload>
+OULIPOLY_TERMINAL_SIGNAL=<json>
 ```
+
+The runtime line above carries the product wire payload with exactly `kind`, `evidence`, `invocation_id`, and `session_id`. The YAML below is the eval driver's enriched internal marker-event schema; the eval verifier consumes the runtime marker and may attach provider and fixture metadata from the manifest before scoring.
 
 ```yaml
 schema_id: agent-runner-terminal-signal-marker-v1
@@ -188,4 +190,4 @@ The W5 reader must not require live provider CLIs, network calls, sleeps, or abs
 
 ### Current main status
 
-Current main does not yet emit `OULIPOLY_TERMINAL_SIGNAL <json-payload>`. This eval documents the target contract and fixture corpus for later implementation and AGE-143/W5 reader work.
+Current main does not yet emit `OULIPOLY_TERMINAL_SIGNAL=<json>`. This eval documents the target contract and fixture corpus for later implementation and AGE-143/W5 reader work.

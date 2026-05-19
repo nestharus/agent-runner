@@ -1978,6 +1978,117 @@ mod tests {
         }
     }
 
+    fn production_source() -> &'static str {
+        include_str!("mod.rs")
+            .split("mod tests")
+            .next()
+            .expect("production source precedes tests")
+    }
+
+    #[test]
+    fn age153_source_guard_balancer_has_no_terminal_signal_or_provider_output_authority() {
+        let source = source_without_comments(production_source());
+        for forbidden in ["TerminalSignal", "TerminalSignalKind", "terminal_signal"] {
+            assert!(
+                !contains_identifier_token(&source, forbidden),
+                "balancer must not reference terminal-signal identifier token {forbidden:?}; AGE-153 routing authority is provider_quotas.exhausted_at"
+            );
+        }
+        assert!(
+            !contains_terminal_signal_use_import(&source),
+            "balancer must not import terminal_signal modules or TerminalSignal types"
+        );
+        assert!(
+            !contains_provider_output_parser_identifier(&source),
+            "balancer must not call provider-output parser functions as routing authority"
+        );
+    }
+
+    fn contains_identifier_token(source: &str, token: &str) -> bool {
+        identifier_tokens(source).any(|identifier| identifier == token)
+    }
+
+    fn contains_terminal_signal_use_import(source: &str) -> bool {
+        source.lines().any(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("use ")
+                && (trimmed.contains("terminal_signal") || trimmed.contains("TerminalSignal"))
+        })
+    }
+
+    fn contains_provider_output_parser_identifier(source: &str) -> bool {
+        identifier_tokens(source).any(is_provider_output_parser_identifier)
+    }
+
+    fn is_provider_output_parser_identifier(identifier: &str) -> bool {
+        identifier == "parse_provider_output"
+            || identifier.starts_with("parse_terminal_status_from_")
+            || identifier.starts_with("provider_recognizer_for_")
+            || ((identifier.starts_with("parse_") || identifier.starts_with("recognize_"))
+                && ["stdout", "stderr", "stream", "output"]
+                    .iter()
+                    .any(|needle| identifier.contains(needle)))
+    }
+
+    fn identifier_tokens(source: &str) -> impl Iterator<Item = &str> {
+        source
+            .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+            .filter(|token| !token.is_empty())
+    }
+
+    fn source_without_comments(source: &str) -> String {
+        let mut output = String::with_capacity(source.len());
+        let mut chars = source.chars().peekable();
+        let mut in_block_comment = false;
+        while let Some(ch) = chars.next() {
+            if in_block_comment {
+                if ch == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    in_block_comment = false;
+                }
+                continue;
+            }
+            if ch == '/' && chars.peek() == Some(&'*') {
+                chars.next();
+                in_block_comment = true;
+                continue;
+            }
+            if ch == '/' && chars.peek() == Some(&'/') {
+                for next in chars.by_ref() {
+                    if next == '\n' {
+                        output.push('\n');
+                        break;
+                    }
+                }
+                continue;
+            }
+            output.push(ch);
+        }
+        output
+    }
+
+    #[test]
+    fn age153_decide_migration_observes_exhausted_at_without_terminal_signal_dependency() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = migratable_model(&[
+            ("claude-age153-a", "claude_code"),
+            ("claude-age153-b", "claude_code"),
+        ]);
+        seed_windows_with_deltas(&db, "claude-age153-a", &[(0.20, 5, 0.01, 22)]);
+        seed_windows_with_deltas(&db, "claude-age153-b", &[(0.30, 5, 0.01, 22)]);
+        db.mark_exhausted("claude-age153-a").unwrap();
+
+        let decision = decide_migration(&db, &model, &resolved_for(&model, 0), None).unwrap();
+
+        assert_eq!(
+            decision,
+            MigrationDecision::Migrate {
+                target_provider_index: 1,
+                reason: TransitionReason::Exhausted,
+            }
+        );
+    }
+
     fn selected_provider_index(model: &ModelConfig, db: &StateDb) -> usize {
         select_provider(model, db, None).unwrap()
     }
