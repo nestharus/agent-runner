@@ -692,6 +692,8 @@ struct FinalizeInvocationRow {
     status: String,
 }
 
+type FinalizeInvocationRowColumns = (String, String, Option<String>, String);
+
 enum InvocationsSchemaShape {
     Empty,
     Current,
@@ -2866,7 +2868,7 @@ impl StateDb {
         let tx = self
             .conn
             .unchecked_transaction()
-            .map_err(|e| format!("Failed to begin invocation finalize tx: {e}"))?;
+            .map_err(Self::format_begin_transaction_error)?;
 
         let invocation = Self::load_invocation_for_finalize(&tx, id)?;
         Self::validate_invocation_is_running(id, &invocation.status)?;
@@ -2888,9 +2890,16 @@ impl StateDb {
             finished_at,
         )?;
 
-        tx.commit()
-            .map_err(|e| format!("Failed to commit invocation finalize tx: {e}"))?;
+        tx.commit().map_err(Self::format_commit_transaction_error)?;
         Ok(invocation)
+    }
+
+    fn format_begin_transaction_error(err: rusqlite::Error) -> String {
+        format!("Failed to begin invocation finalize tx: {err}")
+    }
+
+    fn format_commit_transaction_error(err: rusqlite::Error) -> String {
+        format!("Failed to commit invocation finalize tx: {err}")
     }
 
     fn classify_finalize_operation_result(success: bool, sqlite_error: bool) -> OperationResult {
@@ -2915,22 +2924,45 @@ impl StateDb {
         conn: &Connection,
         id: i64,
     ) -> Result<FinalizeInvocationRow, String> {
+        let columns = Self::query_invocation_row_for_finalize(conn, id)
+            .map_err(|err| Self::format_load_invocation_for_finalize_error(id, err))?
+            .ok_or_else(|| Self::format_invocation_not_found_error(id))?;
+        Ok(Self::map_invocation_row_for_finalize(columns))
+    }
+
+    fn query_invocation_row_for_finalize(
+        conn: &Connection,
+        id: i64,
+    ) -> rusqlite::Result<Option<FinalizeInvocationRowColumns>> {
         conn.query_row(
             "SELECT invocation_uuid, model_name, provider_name, status
              FROM invocations WHERE id = ?1",
             params![id],
-            |row| {
-                Ok(FinalizeInvocationRow {
-                    invocation_uuid: row.get(0)?,
-                    model_name: row.get(1)?,
-                    provider_name: row.get(2)?,
-                    status: row.get(3)?,
-                })
-            },
+            Self::read_invocation_row_for_finalize,
         )
         .optional()
-        .map_err(|e| format!("Failed to load invocation {id}: {e}"))?
-        .ok_or_else(|| Self::format_invocation_not_found_error(id))
+    }
+
+    fn read_invocation_row_for_finalize(
+        row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<FinalizeInvocationRowColumns> {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+    }
+
+    fn map_invocation_row_for_finalize(
+        columns: FinalizeInvocationRowColumns,
+    ) -> FinalizeInvocationRow {
+        let (invocation_uuid, model_name, provider_name, status) = columns;
+        FinalizeInvocationRow {
+            invocation_uuid,
+            model_name,
+            provider_name,
+            status,
+        }
+    }
+
+    fn format_load_invocation_for_finalize_error(id: i64, err: rusqlite::Error) -> String {
+        format!("Failed to load invocation {id}: {err}")
     }
 
     fn validate_invocation_is_running(id: i64, status: &str) -> Result<(), String> {
@@ -2950,9 +2982,30 @@ impl StateDb {
         terminal_reason: Option<&str>,
         finished_at: &str,
     ) -> Result<(), String> {
-        let updated = conn
-            .execute(
-                "UPDATE invocations
+        let updated = Self::execute_update_invocation_final_row(
+            conn,
+            id,
+            success,
+            exit_code,
+            error_category,
+            terminal_reason,
+            finished_at,
+        )
+        .map_err(|err| Self::format_invocation_final_row_update_error(id, err))?;
+        Self::validate_invocation_final_row_updated(id, updated)
+    }
+
+    fn execute_update_invocation_final_row(
+        conn: &Connection,
+        id: i64,
+        success: bool,
+        exit_code: i32,
+        error_category: Option<&str>,
+        terminal_reason: Option<&str>,
+        finished_at: &str,
+    ) -> rusqlite::Result<usize> {
+        conn.execute(
+            "UPDATE invocations
              SET status = ?1,
                  success = ?2,
                  exit_code = ?3,
@@ -2960,22 +3013,28 @@ impl StateDb {
                  terminal_reason = ?5,
                  finished_at = ?6
              WHERE id = ?7 AND status = ?8",
-                params![
-                    Self::terminal_invocation_status(success).as_str(),
-                    success as i64,
-                    exit_code,
-                    error_category,
-                    terminal_reason,
-                    finished_at,
-                    id,
-                    InvocationStatus::Running.as_str(),
-                ],
-            )
-            .map_err(|e| format!("Failed to finalize invocation {id}: {e}"))?;
+            params![
+                Self::terminal_invocation_status(success).as_str(),
+                success as i64,
+                exit_code,
+                error_category,
+                terminal_reason,
+                finished_at,
+                id,
+                InvocationStatus::Running.as_str(),
+            ],
+        )
+    }
+
+    fn validate_invocation_final_row_updated(id: i64, updated: usize) -> Result<(), String> {
         if updated == 0 {
             return Err(format!("Invocation {id} is already finalized"));
         }
         Ok(())
+    }
+
+    fn format_invocation_final_row_update_error(id: i64, err: rusqlite::Error) -> String {
+        format!("Failed to finalize invocation {id}: {err}")
     }
 
     fn terminal_invocation_status(success: bool) -> InvocationStatus {

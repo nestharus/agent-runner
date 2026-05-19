@@ -302,14 +302,19 @@ pub(crate) fn build_start_record_for_result(
     result: &Result<i64, io::Error>,
 ) -> Value {
     match result {
-        Ok(invocation_row_id) => build_start_record(
-            context,
-            &StartOutcome {
-                invocation_row_id: *invocation_row_id,
-            },
-        ),
-        Err(err) => build_start_error_record(context, format_error_chain(err)),
+        Ok(invocation_row_id) => build_start_record(context, &start_outcome_ok(invocation_row_id)),
+        Err(err) => build_start_error_record(context, start_outcome_err(err)),
     }
+}
+
+pub(crate) fn start_outcome_ok(invocation_row_id: &i64) -> StartOutcome {
+    StartOutcome {
+        invocation_row_id: *invocation_row_id,
+    }
+}
+
+pub(crate) fn start_outcome_err(err: &io::Error) -> String {
+    format_error_chain(err)
 }
 
 pub(crate) fn build_optional_session_record_for_result(
@@ -335,9 +340,17 @@ pub(crate) fn build_finalize_record_for_result(
     terminal_status: String,
 ) -> Value {
     match result {
-        Ok(()) => build_finalize_record(context, &FinalizeOutcome { terminal_status }),
-        Err(message) => build_finalize_error_record(context, error_chain_from_message(message)),
+        Ok(()) => build_finalize_record(context, &finalize_outcome_ok(terminal_status)),
+        Err(message) => build_finalize_error_record(context, finalize_outcome_err(message)),
     }
+}
+
+pub(crate) fn finalize_outcome_ok(terminal_status: String) -> FinalizeOutcome {
+    FinalizeOutcome { terminal_status }
+}
+
+pub(crate) fn finalize_outcome_err(message: &str) -> String {
+    error_chain_from_message(message)
 }
 
 fn elapsed_duration_microseconds_saturating(elapsed: Duration) -> u64 {
