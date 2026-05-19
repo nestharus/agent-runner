@@ -1,5 +1,8 @@
 #![cfg(unix)]
 
+//! ## Declared roles
+//! orchestration, accessor, mapper, parser, filter, predicate, validator, formatter
+
 use rusqlite::{Connection, params};
 use serde_json::Value;
 use std::collections::BTreeMap;
