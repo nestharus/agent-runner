@@ -1,10 +1,14 @@
 use serde_json::{Value, json};
 use std::error::Error;
+use std::io;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 const TARGET: &str = "oulipoly.invocation_lifecycle";
 const RESULT_OK: &str = "ok";
 const RESULT_SQLITE_ERROR: &str = "sqlite_error";
+
+pub(crate) type LifecycleTimer = Instant;
 
 pub trait LifecycleEventSink: Send {
     fn forward(&mut self, record: &serde_json::Value);
@@ -253,12 +257,99 @@ pub(crate) fn emit_and_forward<S: LifecycleEventSink + ?Sized>(sink: &mut S, rec
     sink.forward(&record);
 }
 
-pub(crate) fn elapsed_micros_saturated(elapsed: std::time::Duration) -> u64 {
+pub(crate) fn start_lifecycle_timer() -> LifecycleTimer {
+    Instant::now()
+}
+
+pub(crate) fn elapsed_microseconds_saturating(timer: &LifecycleTimer) -> u64 {
+    elapsed_duration_microseconds_saturating(timer.elapsed())
+}
+
+pub(crate) fn sqlite_io_error_from(err: rusqlite::Error) -> io::Error {
+    io::Error::other(err)
+}
+
+pub(crate) fn message_io_error_from(message: String) -> io::Error {
+    io::Error::other(message)
+}
+
+pub(crate) fn start_context_with_latency(
+    mut context: StartContext,
+    latency_us: u64,
+) -> StartContext {
+    context.latency_us = latency_us;
+    context
+}
+
+pub(crate) fn session_context_with_latency(
+    mut context: SessionContext,
+    latency_us: u64,
+) -> SessionContext {
+    context.latency_us = latency_us;
+    context
+}
+
+pub(crate) fn finalize_context_with_latency(
+    mut context: FinalizeContext,
+    latency_us: u64,
+) -> FinalizeContext {
+    context.latency_us = latency_us;
+    context
+}
+
+pub(crate) fn build_start_record_for_result(
+    context: &StartContext,
+    result: &Result<i64, io::Error>,
+) -> Value {
+    match result {
+        Ok(invocation_row_id) => build_start_record(
+            context,
+            &StartOutcome {
+                invocation_row_id: *invocation_row_id,
+            },
+        ),
+        Err(err) => build_start_error_record(context, format_error_chain(err)),
+    }
+}
+
+pub(crate) fn build_optional_session_record_for_result(
+    context: Option<&SessionContext>,
+    result: &Result<(), String>,
+) -> Option<Value> {
+    context.map(|context| build_session_record_for_result(context, result))
+}
+
+pub(crate) fn build_session_record_for_result(
+    context: &SessionContext,
+    result: &Result<(), String>,
+) -> Value {
+    match result {
+        Ok(()) => build_session_record(context, &SessionOutcome),
+        Err(message) => build_session_error_record(context, error_chain_from_message(message)),
+    }
+}
+
+pub(crate) fn build_finalize_record_for_result(
+    context: &FinalizeContext,
+    result: &Result<(), String>,
+    terminal_status: String,
+) -> Value {
+    match result {
+        Ok(()) => build_finalize_record(context, &FinalizeOutcome { terminal_status }),
+        Err(message) => build_finalize_error_record(context, error_chain_from_message(message)),
+    }
+}
+
+fn elapsed_duration_microseconds_saturating(elapsed: Duration) -> u64 {
     u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
 }
 
 pub(crate) fn context_resolution_error_result() -> &'static str {
     "context_resolution_error"
+}
+
+pub(crate) fn ok_result() -> &'static str {
+    RESULT_OK
 }
 
 pub(crate) fn sqlite_error_result() -> &'static str {
@@ -273,6 +364,14 @@ pub(crate) fn format_error_chain(err: &dyn Error) -> String {
         source = err.source();
     }
     chain.join("\n")
+}
+
+fn error_chain_from_message(message: &str) -> String {
+    format_error_chain(&io_error_from_message(message))
+}
+
+fn io_error_from_message(message: &str) -> io::Error {
+    io::Error::other(message.to_string())
 }
 
 fn common_record(input: CommonRecordInput<'_>) -> Value {
