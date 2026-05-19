@@ -6,6 +6,46 @@ indicated version. Each entry names the originating finding, the chosen
 posture, the rationale, and the conditions under which the decision could be
 revisited.
 
+## D-AGE-152-cold-start-estimate — proceed without baseline estimate
+
+- **Source**: Phase 2.5 step 4a inherited-estimate cold-start gate on AGE-152. Ticket read returned `estimate_source: missing` (Linear `estimate=21` is set but unsourced per `~/ai/conventions/code-quality.md` § Inherited estimate provenance).
+- **Decision**: Proceed without a baseline estimate. The Phase 3 proposer will produce a refined estimate from concrete scope. No separate prototype is required.
+- **Rationale**: Root dispatch directive explicitly authorized `PROCEED_WITHOUT_BASELINE` for Phase 2.5 step 4a. AGE-152 is a structured whole-file CQ cleanup with concrete required closures (CQ-F03, CQ-F07-F09 coupling, CQ-F27-F36 function-classification) enumerated on the ticket. The work is concrete enough to estimate at Phase 3 from the proposal.
+- **Evidence**: AGE-152 ticket `## Required CQ closures` section; root dispatch directive `## Task` and `Phase 2.5 step 4a: PROCEED_WITHOUT_BASELINE`.
+- **Revisit when**: never — refined estimate captured at Phase 3, actual measured at Phase 8.X closure judge.
+
+### AGE-152 — Bootstrap exception ratification
+
+The Phase 3 proposal at `${planning_dir}/proposals/age-152-AGE-152.md` § `Bootstrap exception declaration` carries the four-condition argument for AGE-152 with all 12 named fields present. Per `~/ai/conventions/code-quality.md` § `Bootstrap exception`, this WU is a metric-fixing bootstrap case:
+
+1. **Primary deliverable fixes or extends the metric scoring non-LOW.** AGE-152 applies existing metric mechanisms to product code rather than changing the convention/verifier/auditor surface — but the WU's primary deliverable IS still the NEW metric-fix carrier artifacts that make the owned file score LOW under those mechanisms: the file-local declared-roles header (cohesion carrier), the explicit `## Intrinsic-surface declarations` sections or balancer-local helper modules (coupling carriers), and the single-classification helper extractions (FC carriers). Those carriers are new artifacts introduced by AGE-152 for the code-quality closure, not pre-existing product behavior being excused. Function-classification findings CQ-F27..CQ-F36 are addressed via decomposition and target LOW closure directly — they are NOT in the residual-ratification scope.
+2. **Non-LOW finding is intrinsic lockstep, not collateral product code.** Ratifiable residual findings are narrowed to CQ-F03 (cohesion declared-roles), CQ-F07/CQ-F08/CQ-F09 (coupling intrinsic-surface declarations) only. Intrinsic-lockstep paths are narrowed to specific carrier-element sections (declared-roles header, intrinsic-surface declarations sections, helper-module boundary lines), NOT the whole file. Any ratified residual must be on the carrier artifacts themselves (e.g., a declared-roles header that pairs with an unavoidable cohesion conflict between two classification helpers, or an intrinsic-surface declaration that retains some raw-symbol coupling because the surface IS a real shared contract). Product-behavior code of the ten CQ-F27..CQ-F36 functions is NOT intrinsic lockstep and must reach LOW via decomposition.
+3. **Post-merge satisfies the new rule under the new metric.** The post-refactor `balancer/mod.rs` carries: (a) file-local `## Declared roles` header covering `orchestration`, `filter`, `predicate`, `mapper`, `accessor`; (b) `## Intrinsic-surface declarations` or local helper modules for the quota-routing / config-topology / state-carrier coupling groups; (c) single-classification helpers extracted for the 10 CQ-F27..CQ-F36 functions.
+4. **Phase 3 declaration plus Phase 4/DECISIONS ratification.** Phase 3 declaration: ✅ written at `${planning_dir}/proposals/age-152-AGE-152.md` § `Bootstrap exception declaration` with all 12 required fields. Phase 4 ratification: this DECISIONS entry plus the Phase 4 BS-exception sub-gate manifest row. Canonical authority: `~/ai/conventions/code-quality.md` § `Bootstrap exception`.
+
+Per `D-AGE-152-bs-exception-authorization` above: the root dispatch directive supersedes the ticket body's literal `NO bootstrap-exception` anti-scope. This ratification is bounded to AGE-152 specifically; per `~/ai/conventions/code-quality.md` and the forbidden behaviors throughout, NO precedent-citation may be used as residual-acceptance basis for other WUs. Each future WU touching balancer code must independently meet the four-condition gate against the post-AGE-152 baseline.
+
+## D-AGE-152-drift-discovery-proceed-with-note — AGE-155 filed; balancer/main.rs resume-retry filter consolidation deferred
+
+- **Source**: Phase 2.5 step 2.5.4 duplicates inventory at `${planning_dir}/research/age-152-duplicates.md` § `Consolidate resume retry quota filtering with balancer exhausted/reset-implied eligibility`.
+- **Discovery**: `src-tauri/src/main.rs:2941-2988` resume-retry quota prefilter has silently diverged from `crates/oulipoly-runtime/src/balancer/mod.rs:312-337` selection-time filter. Tauri prefilter checks only `exhausted_at` while balancer also excludes live windows at `used_percent >= 1.0` and readmits on past-reset.
+- **Decision**: Proceed-with-note. Filed AGE-155 as follow-up tracker. Do NOT consolidate inside AGE-152.
+- **Rationale**: AGE-152 anti-scope explicitly excludes `src-tauri/src/main.rs` (`NO scope expansion to main.rs (AGE-151 owns)`). AGE-151 owns the main.rs cleanup; consolidation should land after AGE-151 ships so the consolidated filter can be authored against a stable main.rs baseline. The drift may also be by-design layered filtering (quick-skip prefilter + canonical balancer filter); AGE-155 records the question for explicit confirmation.
+- **Disposition options**:
+  - `block AGE-152` → would violate dispatch directive `AGE-152 ships`.
+  - `proceed-with-note` → selected. AGE-155 filed; this decision recorded; AGE-152 proceeds.
+  - `expand-scope-to-consolidate` → would violate explicit `NO scope expansion to main.rs` anti-scope.
+- **Evidence**: AGE-155 (https://linear.app/oulipoly/issue/AGE-155/agent-runner-consolidate-resume-retry-quota-filtering-with-balancer); `${planning_dir}/research/age-152-duplicates.md`; dispatch directive § `## Anti-scope`.
+- **Revisit when**: AGE-151 ships (the main.rs cleanup), then AGE-155 unblocks for proper consolidation against the post-AGE-151 baseline.
+
+## D-AGE-152-bs-exception-authorization — ticket anti-scope overridden by dispatch directive
+
+- **Source**: Phase 0 ticket validation. The AGE-152 ticket body says `## Anti-scope: NO bootstrap-exception. NO residual acceptance on non-LOW CQ. NO precedent-citation.` and `## Acceptance: Phase 4 code-quality returns LOW`. Root dispatch directive says `## Bootstrap-exception authorization: Four-condition gate applies cleanly. Same shape as AGE-132/AGE-137/ACR-209/AGE-147/AGE-151.`
+- **Decision**: The Phase 3 proposer may include a `## Bootstrap exception declaration` section if the four conditions per `~/ai/conventions/code-quality.md` § `Bootstrap exception` apply to AGE-152, and the Phase 4 BS-exception sub-gate may ratify a non-LOW code-quality aggregate based on that declaration plus a `### AGE-152 — Bootstrap exception ratification` DECISIONS.md entry that cites the convention. The orchestrator first preference remains to land the work properly so Phase 4 CQ returns LOW on its own; the BS-exception path is the authorized fallback for intrinsic lockstep findings.
+- **Rationale**: The dispatch directive is the actor's current, explicit authorization for this WU and supersedes the ticket body's prior anti-scope. Per `~/ai/conventions/agent-questions-and-session-graph.md` § AskUserQuestion Permission-Denial: the orchestrator asked for clarification via AskUserQuestion; the user denied the question. Per convention, orchestrator-resolvable inputs (the supplied dispatch directive) stay inline. The dispatch directive resolves the conflict in favor of authorizing the BS-exception fallback.
+- **Evidence**: `${scratch_dir}/ticket.md` § `## Anti-scope`; root dispatch directive § `## Bootstrap-exception authorization`; AGE-132/AGE-137/ACR-209/AGE-147/AGE-151 audit-history precedents (cited for shape comparison only, not as residual-acceptance basis — each WU evaluated the four conditions independently).
+- **Revisit when**: a future audit demands updating the AGE-152 ticket body to remove the conflicting anti-scope; the durable artifact of authorization is this DECISIONS entry plus (if the path is taken) the Phase 4 BS-exception sub-gate manifest row.
+
 ## D-AGE-127-cold-start-estimate — proceed without baseline estimate
 
 - **Source**: Phase 2.5 step 4a inherited-estimate cold-start gate on AGE-127. Ticket read returned `estimate_source: missing` (Linear `estimate` field unset on AGE-127).
