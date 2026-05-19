@@ -76,14 +76,23 @@
 //! - This test does not exercise the orphaned provider child after the
 //!   runner dies (F2/F3 raw-artifact preservation, structured lifecycle
 //!   logs) — those are separate Work Units under this RCA.
+//!
+//! Declared roles: orchestration, formatter, validator, accessor, predicate,
+//! mapper.
 
-use std::process::{Command, Stdio};
+use std::io::Read;
+use std::process::{Child, ExitStatus, Output, Stdio};
+use std::thread;
+use std::thread::JoinHandle;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use oulipoly_state::InvocationStatus;
+use oulipoly_state::{InvocationRecord, InvocationStatus};
 
-use super::*;
+use super::{
+    PipelineFixture, filesystem_artifact_recovers_terminal, find_runner_pid_for_fixture,
+    list_files_recursive, poll_first_running_uuid, sigkill_pid, text_contains_terminal_envelope,
+};
 
 /// Slow enough to give us a wide kill window even on a loaded CI runner; the
 /// test is bounded by the kill timing, not the sleep duration.
@@ -117,95 +126,127 @@ struct KillRunOutcome {
 /// the pipeline's stdout (which is `tail -3`'s output of merged
 /// stdout+stderr) and exit status.
 fn run_pipeline_then_kill_runner(fixture: &PipelineFixture) -> KillRunOutcome {
-    let runner = env!("CARGO_BIN_EXE_oulipoly-agent-runner");
-    // Inner agents command, single-quoted so the outer bash receives it as
-    // a single argv element. The argv contains the fixture tempdir which
-    // doubles as our pgrep marker.
-    let inner = format!(
-        "{runner} --models-dir {models_dir} --model fixture ping 2>&1 | tail -3",
-        models_dir = fixture.models_dir.display(),
+    let child = spawn_tail_pipeline(fixture);
+    let invocation_uuid = wait_for_pipeline_invocation_uuid(fixture);
+    pause_before_killing_runner();
+    let runner_pid = locate_pipeline_runner_pid(fixture);
+    kill_pipeline_runner_or_panic(runner_pid);
+    let output = wait_for_killed_child_output(
+        child,
+        Duration::from_secs(30),
+        "bash pipeline did not exit within 30s of SIGKILL to runner",
     );
-
-    let mut cmd = Command::new("bash");
-    cmd.arg("-c").arg(&inner);
-    cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-    fixture.apply_env(&mut cmd);
-
-    let child = cmd.spawn().expect("failed to spawn bash pipeline");
-
-    let invocation_uuid = poll_first_running_uuid(fixture, Duration::from_secs(15))
-        .expect("invocation row never appeared in state.db within 15s");
-
-    // Tiny grace period so the runner is actually inside `wait()` on the
-    // provider child rather than mid-startup when we kill it.
-    sleep(Duration::from_millis(150));
-
-    let runner_pid = find_runner_pid_for_fixture(fixture).unwrap_or_else(|| {
-        panic!(
-            "could not locate runner PID via /proc/*/cmdline using fixture marker {:?}",
-            fixture.fixture_marker
-        )
-    });
-
-    // SIGKILL is the realistic harness-kill signal (incident transcript
-    // recorded `status=killed` with no signal trace, consistent with
-    // SIGKILL from a background-task supervisor). The runner is a child of
-    // the bash wrapper, not of this test process, so we cannot wait on it
-    // directly; instead we wait on the bash pipeline (`child.wait_with_output`)
-    // which reaps the runner zombie as part of its own shutdown.
-    assert!(
-        sigkill_pid(runner_pid),
-        "kill -KILL {runner_pid} failed; runner may have already exited"
-    );
-
-    // Tail will see EOF on stdin once the runner's stdout fd closes; bash
-    // then reaps tail and the runner and exits. Bound the wait so a hung
-    // pipeline produces a useful failure rather than the test deadlining.
-    let output = wait_with_timeout(child, Duration::from_secs(30))
-        .expect("bash pipeline did not exit within 30s of SIGKILL to runner");
-
-    KillRunOutcome {
-        invocation_uuid,
-        pipeline_stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        pipeline_stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        pipeline_exit_code: output.status.code(),
-        runner_pid,
-    }
+    outcome_from_process_output(invocation_uuid, output, runner_pid)
 }
 
 /// Spawn the runner directly (no bash, no `2>&1 | tail -3`) so stderr is
 /// captured raw. Used to evaluate Channel B (raw-stderr bypass) of the
 /// recovery assertion.
 fn run_direct_then_kill_runner(fixture: &PipelineFixture) -> KillRunOutcome {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+    let child = spawn_direct_runner(fixture);
+    let invocation_uuid = wait_for_direct_invocation_uuid(fixture);
+    pause_before_killing_runner();
+    let runner_pid = child.id() as i32;
+    kill_direct_runner_or_panic(runner_pid);
+    let output = wait_for_killed_child_output(
+        child,
+        Duration::from_secs(30),
+        "direct runner did not exit within 30s of SIGKILL",
+    );
+    outcome_from_process_output(invocation_uuid, output, runner_pid)
+}
+
+fn format_tail_pipeline_command(fixture: &PipelineFixture) -> String {
+    let runner = env!("CARGO_BIN_EXE_oulipoly-agent-runner");
+    format!(
+        "{runner} --models-dir {models_dir} --model fixture ping 2>&1 | tail -3",
+        models_dir = fixture.models_dir.display(),
+    )
+}
+
+fn spawn_tail_pipeline(fixture: &PipelineFixture) -> Child {
+    let mut cmd = std::process::Command::new("bash");
+    cmd.arg("-c").arg(format_tail_pipeline_command(fixture));
+    configure_capture_command(&mut cmd);
+    fixture.apply_env(&mut cmd);
+    cmd.spawn().expect("failed to spawn bash pipeline")
+}
+
+fn spawn_direct_runner(fixture: &PipelineFixture) -> Child {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
     cmd.arg("--models-dir")
         .arg(&fixture.models_dir)
         .arg("--model")
         .arg("fixture")
         .arg("ping");
+    configure_capture_command(&mut cmd);
+    fixture.apply_env(&mut cmd);
+    cmd.spawn().expect("failed to spawn agent-runner directly")
+}
+
+fn configure_capture_command(cmd: &mut std::process::Command) {
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    fixture.apply_env(&mut cmd);
+}
 
-    let child = cmd.spawn().expect("failed to spawn agent-runner directly");
+fn wait_for_pipeline_invocation_uuid(fixture: &PipelineFixture) -> String {
+    poll_first_running_uuid(fixture, Duration::from_secs(15))
+        .expect("invocation row never appeared in state.db within 15s")
+}
 
-    let invocation_uuid = poll_first_running_uuid(fixture, Duration::from_secs(15))
-        .expect("invocation row never appeared in state.db within 15s (direct run)");
+fn wait_for_direct_invocation_uuid(fixture: &PipelineFixture) -> String {
+    poll_first_running_uuid(fixture, Duration::from_secs(15))
+        .expect("invocation row never appeared in state.db within 15s (direct run)")
+}
 
+fn pause_before_killing_runner() {
+    // Tiny grace period so the runner is actually inside `wait()` on the
+    // provider child rather than mid-startup when we kill it.
     sleep(Duration::from_millis(150));
+}
 
-    let runner_pid = child.id() as i32;
+fn locate_pipeline_runner_pid(fixture: &PipelineFixture) -> i32 {
+    find_runner_pid_for_fixture(fixture).unwrap_or_else(|| {
+        panic!(
+            "could not locate runner PID via /proc/*/cmdline using fixture marker {:?}",
+            fixture.fixture_marker
+        )
+    })
+}
+
+fn kill_pipeline_runner_or_panic(runner_pid: i32) {
+    // SIGKILL is the realistic harness-kill signal (incident transcript
+    // recorded `status=killed` with no signal trace, consistent with
+    // SIGKILL from a background-task supervisor). The runner is a child of
+    // the bash wrapper, not of this test process, so we cannot wait on it
+    // directly; instead we wait on the bash pipeline which reaps the runner
+    // zombie as part of its own shutdown.
+    assert!(
+        sigkill_pid(runner_pid),
+        "kill -KILL {runner_pid} failed; runner may have already exited"
+    );
+}
+
+fn kill_direct_runner_or_panic(runner_pid: i32) {
     assert!(
         sigkill_pid(runner_pid),
         "kill -KILL {runner_pid} failed (direct run)"
     );
+}
 
-    let output = wait_with_timeout(child, Duration::from_secs(30))
-        .expect("direct runner did not exit within 30s of SIGKILL");
+fn wait_for_killed_child_output(child: Child, timeout: Duration, failure_message: &str) -> Output {
+    // Tail will see EOF on stdin once the runner's stdout fd closes; bash
+    // then reaps tail and the runner and exits. Bound the wait so a hung
+    // pipeline produces a useful failure rather than the test deadlining.
+    wait_with_timeout(child, timeout).expect(failure_message)
+}
 
+fn outcome_from_process_output(
+    invocation_uuid: String,
+    output: Output,
+    runner_pid: i32,
+) -> KillRunOutcome {
     KillRunOutcome {
         invocation_uuid,
         pipeline_stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -226,17 +267,93 @@ fn terminal_status_recoverable_after_external_kill_under_tail_pipeline() {
     // ---- Stale-running half. This documents the F1 lifecycle gap and is
     // expected to PASS on current main. It is included so Phase 2 / Phase 3
     // can use the same test as a regression fixture after the fix lands.
-    let db = fixture_pipeline.open_db();
-    let row = db
-        .get_invocation_by_uuid(&pipeline.invocation_uuid)
-        .expect("state.db query failed")
-        .unwrap_or_else(|| {
-            panic!(
-                "no invocation row found for UUID {} after pipeline shape; \
-                 pipeline_stdout={:?} pipeline_stderr={:?}",
-                pipeline.invocation_uuid, pipeline.pipeline_stdout, pipeline.pipeline_stderr
-            )
-        });
+    let row = assert_stale_running_after_sigkill(&fixture_pipeline, &pipeline);
+
+    // Scenario 2: the same scenario WITHOUT the `2>&1 | tail -3` wrapper.
+    // A fresh fixture is used so state.db rows do not collide between the
+    // two scenarios — each fixture has its own data_home / state_home, so a
+    // recovery channel that writes a per-invocation artifact in one
+    // scenario will not satisfy the OR for the other scenario.
+    let fixture_direct = PipelineFixture::with_script_body(&hanging_provider_script());
+    let direct = run_direct_then_kill_runner(&fixture_direct);
+
+    assert_recovery_predicate(compute_recovery_predicate(
+        &fixture_pipeline,
+        &pipeline,
+        &fixture_direct,
+        &direct,
+        &row,
+    ));
+}
+
+struct RecoveryPredicateResult {
+    recovered: bool,
+    diagnostics: String,
+}
+
+fn compute_recovery_predicate(
+    fixture_pipeline: &PipelineFixture,
+    pipeline: &KillRunOutcome,
+    fixture_direct: &PipelineFixture,
+    direct: &KillRunOutcome,
+    row: &InvocationRecord,
+) -> RecoveryPredicateResult {
+    // Demonstrate the masking shape: the bash pipeline almost certainly
+    // exited 0 (because tail succeeded) even though the upstream runner was
+    // killed. This is informational, not load-bearing for the OR below.
+    let pipeline_masking = format_pipeline_masking(pipeline);
+
+    // Channel A: did the pipeline's post-tail stdout surface a terminal
+    // envelope for the killed invocation?
+    let channels = evaluate_recovery_channels_current_behavior(
+        fixture_pipeline,
+        pipeline,
+        fixture_direct,
+        direct,
+    );
+
+    // Snapshot the filesystem-artifact candidate trees for the failure
+    // message — Phase 2 reads these to confirm no artifact exists.
+    let listing_pipeline = collect_fixture_file_listings(fixture_pipeline);
+    let listing_direct = collect_fixture_file_listings(fixture_direct);
+
+    RecoveryPredicateResult {
+        recovered: channels.recovered(),
+        diagnostics: format_recovery_failure_diagnostics(
+            pipeline,
+            direct,
+            &pipeline_masking,
+            &channels,
+            &listing_pipeline,
+            &listing_direct,
+            row,
+        ),
+    }
+}
+
+fn assert_recovery_predicate(predicate_result: RecoveryPredicateResult) {
+    assert!(
+        predicate_result.recovered,
+        "{}",
+        predicate_result.diagnostics
+    );
+}
+
+fn format_pipeline_masking(pipeline: &KillRunOutcome) -> String {
+    format!(
+        "pipeline exit_code={:?} (tail-3 output is {} bytes; bash pipeline succeeded \
+         despite SIGKILL of upstream runner pid={})",
+        pipeline.pipeline_exit_code,
+        pipeline.pipeline_stdout.len(),
+        pipeline.runner_pid
+    )
+}
+
+fn assert_stale_running_after_sigkill(
+    fixture_pipeline: &PipelineFixture,
+    pipeline: &KillRunOutcome,
+) -> InvocationRecord {
+    let row = read_invocation_row_after_pipeline(fixture_pipeline, pipeline);
 
     assert_eq!(
         row.status,
@@ -261,60 +378,85 @@ fn terminal_status_recoverable_after_external_kill_under_tail_pipeline() {
         "stale-running half: finished_at should be NULL on abnormal kill (row={row:?})"
     );
 
-    // Demonstrate the masking shape: the bash pipeline almost certainly
-    // exited 0 (because tail succeeded) even though the upstream runner was
-    // killed. This is informational, not load-bearing for the OR below.
-    let pipeline_masking = format!(
-        "pipeline exit_code={:?} (tail-3 output is {} bytes; bash pipeline succeeded \
-         despite SIGKILL of upstream runner pid={})",
-        pipeline.pipeline_exit_code,
-        pipeline.pipeline_stdout.len(),
-        pipeline.runner_pid
-    );
+    row
+}
 
-    // Scenario 2: the same scenario WITHOUT the `2>&1 | tail -3` wrapper.
-    // A fresh fixture is used so state.db rows do not collide between the
-    // two scenarios — each fixture has its own data_home / state_home, so a
-    // recovery channel that writes a per-invocation artifact in one
-    // scenario will not satisfy the OR for the other scenario.
-    let fixture_direct = PipelineFixture::with_script_body(&hanging_provider_script());
-    let direct = run_direct_then_kill_runner(&fixture_direct);
+fn read_invocation_row_after_pipeline(
+    fixture_pipeline: &PipelineFixture,
+    pipeline: &KillRunOutcome,
+) -> InvocationRecord {
+    let db = fixture_pipeline.open_db();
+    db.get_invocation_by_uuid(&pipeline.invocation_uuid)
+        .expect("state.db query failed")
+        .unwrap_or_else(|| {
+            panic!(
+                "no invocation row found for UUID {} after pipeline shape; \
+                 pipeline_stdout={:?} pipeline_stderr={:?}",
+                pipeline.invocation_uuid, pipeline.pipeline_stdout, pipeline.pipeline_stderr
+            )
+        })
+}
 
-    // Channel A: did the pipeline's post-tail stdout surface a terminal
-    // envelope for the killed invocation?
-    let channel_a =
-        text_contains_terminal_envelope(&pipeline.pipeline_stdout, &pipeline.invocation_uuid);
+struct RecoveryChannels {
+    channel_a: bool,
+    channel_b: bool,
+    channel_c_pipeline: bool,
+    channel_c_direct: bool,
+}
 
-    // Channel B: did the raw, un-piped stderr surface a terminal envelope
-    // for the directly-killed invocation?
-    let channel_b =
-        text_contains_terminal_envelope(&direct.pipeline_stderr, &direct.invocation_uuid);
+impl RecoveryChannels {
+    fn channel_c(&self) -> bool {
+        self.channel_c_pipeline || self.channel_c_direct
+    }
 
-    // Channel C: did the runtime write any filesystem artifact under
-    // XDG_STATE_HOME or XDG_DATA_HOME that records the terminal status?
-    // Evaluated against either fixture — a fix that writes the artifact in
-    // either scenario is sufficient to satisfy the OR.
-    let channel_c_pipeline = filesystem_artifact_recovers_terminal(
-        fixture_pipeline.dir.path(),
-        &pipeline.invocation_uuid,
-    );
-    let channel_c_direct =
-        filesystem_artifact_recovers_terminal(fixture_direct.dir.path(), &direct.invocation_uuid);
-    let channel_c = channel_c_pipeline || channel_c_direct;
+    fn recovered(&self) -> bool {
+        self.channel_a || self.channel_b || self.channel_c()
+    }
+}
 
-    // Snapshot the filesystem-artifact candidate trees for the failure
-    // message — Phase 2 reads these to confirm no artifact exists.
-    let listing_pipeline: Vec<String> = list_files_recursive(fixture_pipeline.dir.path())
+fn evaluate_recovery_channels_current_behavior(
+    fixture_pipeline: &PipelineFixture,
+    pipeline: &KillRunOutcome,
+    fixture_direct: &PipelineFixture,
+    direct: &KillRunOutcome,
+) -> RecoveryChannels {
+    RecoveryChannels {
+        channel_a: pipeline_stdout_has_terminal_envelope(pipeline),
+        channel_b: direct_stderr_has_terminal_envelope(direct),
+        channel_c_pipeline: fixture_artifact_recovers_terminal(fixture_pipeline, pipeline),
+        channel_c_direct: fixture_artifact_recovers_terminal(fixture_direct, direct),
+    }
+}
+
+fn pipeline_stdout_has_terminal_envelope(pipeline: &KillRunOutcome) -> bool {
+    text_contains_terminal_envelope(&pipeline.pipeline_stdout, &pipeline.invocation_uuid)
+}
+
+fn direct_stderr_has_terminal_envelope(direct: &KillRunOutcome) -> bool {
+    text_contains_terminal_envelope(&direct.pipeline_stderr, &direct.invocation_uuid)
+}
+
+fn fixture_artifact_recovers_terminal(fixture: &PipelineFixture, outcome: &KillRunOutcome) -> bool {
+    filesystem_artifact_recovers_terminal(fixture.dir.path(), &outcome.invocation_uuid)
+}
+
+fn collect_fixture_file_listings(fixture: &PipelineFixture) -> Vec<String> {
+    list_files_recursive(fixture.dir.path())
         .into_iter()
         .map(|p| p.display().to_string())
-        .collect();
-    let listing_direct: Vec<String> = list_files_recursive(fixture_direct.dir.path())
-        .into_iter()
-        .map(|p| p.display().to_string())
-        .collect();
+        .collect()
+}
 
-    assert!(
-        channel_a || channel_b || channel_c,
+fn format_recovery_failure_diagnostics(
+    pipeline: &KillRunOutcome,
+    direct: &KillRunOutcome,
+    pipeline_masking: &str,
+    channels: &RecoveryChannels,
+    listing_pipeline: &[String],
+    listing_direct: &[String],
+    row: &InvocationRecord,
+) -> String {
+    format!(
         "F1 recovery half: none of channels A/B/C recovered terminal status for the killed \
          invocations.\n\
          \n\
@@ -341,13 +483,18 @@ fn terminal_status_recoverable_after_external_kill_under_tail_pipeline() {
         pipeline.invocation_uuid,
         direct.invocation_uuid,
         direct.pipeline_exit_code,
+        channel_a = channels.channel_a,
+        channel_b = channels.channel_b,
+        channel_c = channels.channel_c(),
+        channel_c_pipeline = channels.channel_c_pipeline,
+        channel_c_direct = channels.channel_c_direct,
         pipeline_stdout_trunc = truncate(&pipeline.pipeline_stdout, 4096),
         pipeline_stderr_trunc = truncate(&pipeline.pipeline_stderr, 4096),
         direct_stderr_trunc = truncate(&direct.pipeline_stderr, 4096),
         direct_stdout_trunc = truncate(&direct.pipeline_stdout, 4096),
         n_pipeline = listing_pipeline.len(),
         n_direct = listing_direct.len(),
-    );
+    )
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -362,57 +509,85 @@ fn truncate(s: &str, max: usize) -> String {
 /// `None`) instead of blocking forever if the child never exits. Reads
 /// stdout/stderr in background threads so a blocked pipe cannot deadlock
 /// the wait.
-fn wait_with_timeout(
-    mut child: std::process::Child,
-    timeout: Duration,
-) -> Option<std::process::Output> {
-    use std::io::Read;
-    use std::thread;
+fn wait_with_timeout(mut child: Child, timeout: Duration) -> Option<Output> {
+    let readers = spawn_child_pipe_readers(&mut child);
+    let status = wait_child_until_deadline(&mut child, timeout);
+    let stdout_bytes = join_pipe_reader_bytes(readers.stdout);
+    let stderr_bytes = join_pipe_reader_bytes(readers.stderr);
 
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let stdout_handle = stdout.map(|mut s| {
+    status.map(|status| assemble_process_output(status, stdout_bytes, stderr_bytes))
+}
+
+struct PipeReaders {
+    stdout: Option<JoinHandle<Vec<u8>>>,
+    stderr: Option<JoinHandle<Vec<u8>>>,
+}
+
+fn spawn_child_pipe_readers(child: &mut Child) -> PipeReaders {
+    PipeReaders {
+        stdout: spawn_pipe_reader(child.stdout.take()),
+        stderr: spawn_pipe_reader(child.stderr.take()),
+    }
+}
+
+fn spawn_pipe_reader<R>(pipe: Option<R>) -> Option<JoinHandle<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    pipe.map(|mut stream| {
         thread::spawn(move || {
             let mut buf = Vec::new();
-            let _ = s.read_to_end(&mut buf);
+            let _ = stream.read_to_end(&mut buf);
             buf
         })
-    });
-    let stderr_handle = stderr.map(|mut s| {
-        thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = s.read_to_end(&mut buf);
-            buf
-        })
-    });
+    })
+}
 
+fn wait_child_until_deadline(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
     let deadline = Instant::now() + timeout;
-    let status = loop {
+    loop {
         match child.try_wait() {
             Ok(Some(s)) => break Some(s),
             Ok(None) => {}
             Err(_) => break None,
         }
-        if Instant::now() >= deadline {
-            // Best-effort: SIGKILL the wrapper before giving up so we do not
-            // leak the bash process.
-            let _ = child.kill();
-            let _ = child.wait();
+        if child_wait_deadline_expired(deadline) {
+            kill_timed_out_child(child);
             break None;
         }
         sleep(Duration::from_millis(50));
-    };
+    }
+}
 
-    let stdout_bytes = stdout_handle
-        .map(|h| h.join().unwrap_or_default())
-        .unwrap_or_default();
-    let stderr_bytes = stderr_handle
-        .map(|h| h.join().unwrap_or_default())
-        .unwrap_or_default();
+fn child_wait_deadline_expired(deadline: Instant) -> bool {
+    Instant::now() >= deadline
+}
 
-    status.map(|status| std::process::Output {
+fn kill_timed_out_child(child: &mut Child) {
+    // Best-effort: SIGKILL the wrapper before giving up so we do not leak the
+    // bash process.
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn join_pipe_reader_bytes(handle: Option<JoinHandle<Vec<u8>>>) -> Vec<u8> {
+    handle
+        .map(|h| h.join().unwrap_or_default())
+        .unwrap_or_default()
+}
+
+fn assemble_process_output(
+    status: ExitStatus,
+    stdout_bytes: Vec<u8>,
+    stderr_bytes: Vec<u8>,
+) -> Output {
+    Output {
         status,
         stdout: stdout_bytes,
         stderr: stderr_bytes,
-    })
+    }
 }
+
+#[cfg(test)]
+#[path = "age158_rc1_characterization.rs"]
+mod age158_rc1_characterization;
