@@ -1,5 +1,8 @@
 #![cfg(unix)]
 
+//! ## Declared roles
+//! orchestration, accessor, mapper, parser, filter, predicate, validator, formatter
+
 use oulipoly_state::{CompositeInvocationId, InvocationStatus, StateDb};
 use std::collections::BTreeSet;
 use std::fs;
@@ -75,108 +78,262 @@ impl CliFixture {
 
     fn write_script(&self, name: &str, body: &str) -> PathBuf {
         let path = self.dir.path().join(name);
-        fs::write(
-            &path,
-            format!("#!/usr/bin/env bash\nset -euo pipefail\n{body}\n"),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&path, perms).unwrap();
+        write_executable_script(&path, &script_content(body));
         path
     }
 
     fn write_model(&self, model_name: &str, providers: &[&str]) {
-        let mut body = String::new();
-        for provider in providers {
-            body.push_str(&format!(
-                r#"[[providers]]
+        fs::write(
+            self.models_dir.join(format!("{model_name}.toml")),
+            model_toml(providers),
+        )
+        .unwrap();
+    }
+
+    fn write_providers(&self, providers: &[&str], include_quota_scripts: bool) {
+        let entries = self.provider_entries(providers, include_quota_scripts);
+        fs::write(
+            self.app_config_dir.join("providers.toml"),
+            provider_entries_toml(&entries),
+        )
+        .unwrap();
+    }
+
+    fn provider_entries(
+        &self,
+        providers: &[&str],
+        include_quota_scripts: bool,
+    ) -> Vec<ProviderTomlEntry> {
+        providers
+            .iter()
+            .enumerate()
+            .map(|(index, provider)| self.provider_entry(provider, index, include_quota_scripts))
+            .collect()
+    }
+
+    fn provider_entry(
+        &self,
+        provider: &str,
+        index: usize,
+        include_quota_scripts: bool,
+    ) -> ProviderTomlEntry {
+        let command = self.write_provider_command_script(provider);
+        let quota_script = self.provider_quota_script(provider, index, include_quota_scripts);
+        provider_toml_entry(provider, command, quota_script)
+    }
+
+    fn write_provider_command_script(&self, provider: &str) -> PathBuf {
+        self.write_script(
+            &provider_command_script_name(provider),
+            &provider_command_body(provider),
+        )
+    }
+
+    fn provider_quota_script(
+        &self,
+        provider: &str,
+        index: usize,
+        include_quota_scripts: bool,
+    ) -> Option<PathBuf> {
+        include_quota_scripts.then(|| self.write_provider_quota_script(provider, index))
+    }
+
+    fn write_provider_quota_script(&self, provider: &str, index: usize) -> PathBuf {
+        self.write_script(
+            &provider_quota_script_name(provider),
+            &quota_script_body(index),
+        )
+    }
+
+    fn write_providers_with_command_bodies(&self, providers: &[(&str, &str)]) {
+        let entries = self.command_body_provider_entries(providers);
+        fs::write(
+            self.app_config_dir.join("providers.toml"),
+            provider_entries_toml(&entries),
+        )
+        .unwrap();
+    }
+
+    fn command_body_provider_entries(&self, providers: &[(&str, &str)]) -> Vec<ProviderTomlEntry> {
+        providers
+            .iter()
+            .map(|(provider, command_body)| {
+                self.command_body_provider_entry(provider, command_body)
+            })
+            .collect()
+    }
+
+    fn command_body_provider_entry(&self, provider: &str, command_body: &str) -> ProviderTomlEntry {
+        let command = self.write_script(&provider_command_script_name(provider), command_body);
+        provider_toml_entry(provider, command, None)
+    }
+
+    fn write_sessions(&self, providers: &[&str]) {
+        let entries = self.session_entries(providers);
+        fs::write(
+            self.app_config_dir.join("sessions.toml"),
+            session_entries_toml(&entries),
+        )
+        .unwrap();
+    }
+
+    fn session_entries(&self, providers: &[&str]) -> Vec<SessionTomlEntry> {
+        providers
+            .iter()
+            .map(|provider| self.session_entry(provider))
+            .collect()
+    }
+
+    fn session_entry(&self, provider: &str) -> SessionTomlEntry {
+        let script = self.write_session_script(provider);
+        session_toml_entry(provider, script, self.session_state_dir(provider))
+    }
+
+    fn write_session_script(&self, provider: &str) -> PathBuf {
+        self.write_script(
+            &session_script_name(provider),
+            &session_script_body(provider),
+        )
+    }
+
+    fn session_state_dir(&self, provider: &str) -> PathBuf {
+        self.dir.path().join(format!("{provider}-sessions-state"))
+    }
+}
+
+struct ProviderTomlEntry {
+    provider: String,
+    command: PathBuf,
+    quota_script: Option<PathBuf>,
+}
+
+struct SessionTomlEntry {
+    provider: String,
+    script: PathBuf,
+    state_dir: PathBuf,
+}
+
+fn provider_toml_entry(
+    provider: &str,
+    command: PathBuf,
+    quota_script: Option<PathBuf>,
+) -> ProviderTomlEntry {
+    ProviderTomlEntry {
+        provider: provider.to_string(),
+        command,
+        quota_script,
+    }
+}
+
+fn session_toml_entry(provider: &str, script: PathBuf, state_dir: PathBuf) -> SessionTomlEntry {
+    SessionTomlEntry {
+        provider: provider.to_string(),
+        script,
+        state_dir,
+    }
+}
+
+fn provider_command_script_name(provider: &str) -> String {
+    format!("{provider}-command.sh")
+}
+
+fn provider_command_body(provider: &str) -> String {
+    format!("printf '%s\\n' '{provider} executed'")
+}
+
+fn provider_quota_script_name(provider: &str) -> String {
+    format!("{provider}-quota.sh")
+}
+
+fn quota_script_body(index: usize) -> String {
+    format!(
+        "printf '%s\\n' '{{\"windows\":[{{\"used_percent\":{},\"resets_at\":\"2099-01-01T00:00:00Z\"}}]}}'",
+        10 + index
+    )
+}
+
+fn session_script_name(provider: &str) -> String {
+    format!("{provider}-sessions.sh")
+}
+
+fn session_script_body(provider: &str) -> String {
+    format!(
+        "printf '%s\\n' '{{\"session_id\":\"{provider}-session\",\"turn_id\":\"turn-1\",\"timestamp\":\"2026-04-17T08:00:00Z\",\"role\":\"assistant\"}}'"
+    )
+}
+
+fn write_executable_script(path: &Path, content: &str) {
+    fs::write(path, content).unwrap();
+    set_executable(path);
+}
+
+fn set_executable(path: &Path) {
+    let mut perms = fs::metadata(path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).unwrap();
+}
+
+fn script_content(body: &str) -> String {
+    format!("#!/usr/bin/env bash\nset -euo pipefail\n{body}\n")
+}
+
+fn model_toml(providers: &[&str]) -> String {
+    providers
+        .iter()
+        .map(|provider| model_entry(provider))
+        .collect()
+}
+
+fn model_entry(provider: &str) -> String {
+    format!(
+        r#"[[providers]]
 name = "{provider}"
 args = []
 interactive_args = ["model-interactive"]
 
 "#
-            ));
-        }
-        fs::write(self.models_dir.join(format!("{model_name}.toml")), body).unwrap();
-    }
+    )
+}
 
-    fn write_providers(&self, providers: &[&str], include_quota_scripts: bool) {
-        let mut body = String::new();
-        for (index, provider) in providers.iter().enumerate() {
-            let command = self.write_script(
-                &format!("{provider}-command.sh"),
-                &format!("printf '%s\\n' '{provider} executed'"),
-            );
-            let quota = if include_quota_scripts {
-                let quota_script = self.write_script(
-                    &format!("{provider}-quota.sh"),
-                    &format!(
-                        "printf '%s\\n' '{{\"windows\":[{{\"used_percent\":{},\"resets_at\":\"2099-01-01T00:00:00Z\"}}]}}'",
-                        10 + index
-                    ),
-                );
-                format!(
-                    "quota_script = {}\n",
-                    toml_string(&shell_path(&quota_script))
-                )
-            } else {
-                String::new()
-            };
-            body.push_str(&format!(
-                r#"[{provider}]
+fn provider_entries_toml(entries: &[ProviderTomlEntry]) -> String {
+    entries.iter().map(provider_entry_toml).collect()
+}
+
+fn provider_entry_toml(entry: &ProviderTomlEntry) -> String {
+    format!(
+        r#"[{}]
 command = {}
 args = []
 interactive_args = ["provider-interactive"]
 prompt_mode = "arg"
-{quota}
-"#,
-                toml_string(&command.display().to_string())
-            ));
-        }
-        fs::write(self.app_config_dir.join("providers.toml"), body).unwrap();
-    }
+{}"#,
+        entry.provider,
+        toml_string(&entry.command.display().to_string()),
+        quota_script_toml(&entry.quota_script)
+    )
+}
 
-    fn write_providers_with_command_bodies(&self, providers: &[(&str, &str)]) {
-        let mut body = String::new();
-        for (provider, command_body) in providers {
-            let command = self.write_script(&format!("{provider}-command.sh"), command_body);
-            body.push_str(&format!(
-                r#"[{provider}]
-command = {}
-args = []
-interactive_args = ["provider-interactive"]
-prompt_mode = "arg"
+fn quota_script_toml(path: &Option<PathBuf>) -> String {
+    path.as_ref()
+        .map(|path| format!("quota_script = {}\n", toml_string(&shell_path(path))))
+        .unwrap_or_default()
+}
 
-"#,
-                toml_string(&command.display().to_string())
-            ));
-        }
-        fs::write(self.app_config_dir.join("providers.toml"), body).unwrap();
-    }
+fn session_entries_toml(entries: &[SessionTomlEntry]) -> String {
+    entries.iter().map(session_entry_toml).collect()
+}
 
-    fn write_sessions(&self, providers: &[&str]) {
-        let mut body = String::new();
-        for provider in providers {
-            let script = self.write_script(
-                &format!("{provider}-sessions.sh"),
-                &format!(
-                    "printf '%s\\n' '{{\"session_id\":\"{provider}-session\",\"turn_id\":\"turn-1\",\"timestamp\":\"2026-04-17T08:00:00Z\",\"role\":\"assistant\"}}'"
-                ),
-            );
-            let state_dir = self.dir.path().join(format!("{provider}-sessions-state"));
-            body.push_str(&format!(
-                r#"[{provider}]
+fn session_entry_toml(entry: &SessionTomlEntry) -> String {
+    format!(
+        r#"[{}]
 turn_script = {}
 state_dir = {}
 
 "#,
-                toml_string(&shell_path(&script)),
-                toml_string(&state_dir.display().to_string())
-            ));
-        }
-        fs::write(self.app_config_dir.join("sessions.toml"), body).unwrap();
-    }
+        entry.provider,
+        toml_string(&shell_path(&entry.script)),
+        toml_string(&entry.state_dir.display().to_string())
+    )
 }
 
 fn shell_path(path: &Path) -> String {
@@ -188,30 +345,58 @@ fn toml_string(value: &str) -> String {
 }
 
 fn parse_invocation(stderr: &str) -> CompositeInvocationId {
-    let lines: Vec<&str> = stderr
+    let lines = invocation_lines(stderr);
+    assert_single_invocation_line(&lines, stderr);
+    let raw = invocation_marker_payload(lines[0]);
+    CompositeInvocationId::parse_env_value(raw).unwrap()
+}
+
+fn result_envelope(stdout: &str) -> serde_json::Value {
+    let lines = result_envelope_lines(stdout);
+    assert_single_result_envelope_line(&lines, stdout);
+    parse_result_envelope_payload(result_envelope_payload(lines[0]))
+}
+
+fn invocation_lines(stderr: &str) -> Vec<&str> {
+    stderr
         .lines()
         .filter(|line| line.starts_with("OULIPOLY_INVOCATION="))
-        .collect();
+        .collect()
+}
+
+fn result_envelope_lines(stdout: &str) -> Vec<&str> {
+    stdout
+        .lines()
+        .filter(|line| line.starts_with("OULIPOLY_RESULT="))
+        .collect()
+}
+
+fn assert_single_invocation_line(lines: &[&str], stderr: &str) {
     assert_eq!(
         lines.len(),
         1,
         "stderr should contain exactly one invocation line: {stderr}"
     );
-    let raw = lines[0].strip_prefix("OULIPOLY_INVOCATION=").unwrap();
-    CompositeInvocationId::parse_env_value(raw).unwrap()
 }
 
-fn result_envelope(stdout: &str) -> serde_json::Value {
-    let lines: Vec<&str> = stdout
-        .lines()
-        .filter(|line| line.starts_with("OULIPOLY_RESULT="))
-        .collect();
+fn assert_single_result_envelope_line(lines: &[&str], stdout: &str) {
     assert_eq!(
         lines.len(),
         1,
         "stdout should contain exactly one result envelope line: {stdout}"
     );
-    serde_json::from_str(lines[0].strip_prefix("OULIPOLY_RESULT=").unwrap()).unwrap()
+}
+
+fn invocation_marker_payload(line: &str) -> &str {
+    line.strip_prefix("OULIPOLY_INVOCATION=").unwrap()
+}
+
+fn result_envelope_payload(line: &str) -> &str {
+    line.strip_prefix("OULIPOLY_RESULT=").unwrap()
+}
+
+fn parse_result_envelope_payload(payload: &str) -> serde_json::Value {
+    serde_json::from_str(payload).unwrap()
 }
 
 fn assert_result_envelope_contract(

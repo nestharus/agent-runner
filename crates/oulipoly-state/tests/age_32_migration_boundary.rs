@@ -383,8 +383,9 @@ fn ti_38_versionless_unrecognized_shape_fails_closed_without_mutation() {
 
 #[test]
 fn ti_40_legacy_repair_helpers_are_allow_listed_and_migration_represented() {
-    let db_source = include_str!("../src/db.rs");
-    let helper_names = find_ensure_schema_helpers(db_source);
+    let db_source = legacy_repair_source();
+    assert_legacy_repair_source_uses_runtime_helper_bodies(&db_source);
+    let helper_names = find_ensure_schema_helpers(&db_source);
     let allowed: BTreeSet<&str> = [
         "ensure_invocations_schema",
         "ensure_providers_schema",
@@ -419,7 +420,7 @@ fn ti_40_legacy_repair_helpers_are_allow_listed_and_migration_represented() {
         "ensure_provider_quota_windows_schema",
         "backfill_session_chains",
     ] {
-        let body = extract_function_body(db_source, helper);
+        let body = extract_function_body(&db_source, helper);
         for statement in mutating_sql_statements(&body) {
             let normalized = normalize_sql(&statement);
             assert!(
@@ -428,6 +429,27 @@ fn ti_40_legacy_repair_helpers_are_allow_listed_and_migration_represented() {
             );
         }
     }
+}
+
+// Declared role: accessor
+fn legacy_repair_source() -> String {
+    [
+        include_str!("../src/db/open.rs"),
+        include_str!("../src/db/chains.rs"),
+    ]
+    .join("\n")
+}
+
+// Declared role: validator
+fn assert_legacy_repair_source_uses_runtime_helper_bodies(source: &str) {
+    assert!(
+        source.contains("pub(super) fn apply_current_schema_repairs"),
+        "legacy repair validation must inspect the moved StateDb::open helper bodies"
+    );
+    assert!(
+        source.contains("pub fn backfill_session_chains"),
+        "legacy repair validation must inspect the moved backfill helper body"
+    );
 }
 
 // Declared role: mapper
@@ -528,7 +550,9 @@ fn parse_ensure_schema_helper_name(line: &str) -> Option<String> {
 
 // Declared role: parser
 fn ensure_schema_function_tail(line: &str) -> Option<&str> {
-    line.trim_start().strip_prefix("fn ensure_")
+    line.trim_start()
+        .split_once("fn ensure_")
+        .map(|(_, rest)| rest)
 }
 
 // Declared role: parser
@@ -564,7 +588,7 @@ fn function_body_range(source: &str, function_name: &str) -> Range<usize> {
 // Declared role: parser
 fn function_start(source: &str, function_name: &str) -> usize {
     source
-        .find(&format!("fn {function_name}"))
+        .find(&format!("{function_name}("))
         .unwrap_or_else(|| panic!("missing function {function_name}"))
 }
 

@@ -356,6 +356,7 @@ state_dir = "{}"
     let _ = oulipoly_state::StateDb::open(&fixture.db_path()).unwrap();
     let conn = Connection::open(fixture.db_path()).unwrap();
     seed_chain_and_turns(&conn);
+    seed_owned_compaction_evidence(&fixture.db_path(), "fixture-session", "compact-turn");
 
     let output = fixture.command().arg("migrate-db").output().unwrap();
 
@@ -426,6 +427,7 @@ state_dir = "{}"
             params![COMPACT_UUID],
         )
         .unwrap();
+        seed_owned_compaction_evidence(&fixture.db_path(), "fixture-session", COMPACT_UUID);
         let before_counts = table_counts_if_db_exists(&fixture.db_path());
 
         let output = fixture.command().arg("migrate-db").output().unwrap();
@@ -515,7 +517,7 @@ fn age134_compaction_backfill_skips_segments_without_existing_source() {
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert!(
-        stdout(&output).contains("compaction backfill: 0 turns flagged across 0 sessions"),
+        stdout(&output).contains("compaction backfill: 0 turns flagged across 1 sessions"),
         "{output:?}"
     );
     assert_eq!(table_counts_if_db_exists(&fixture.db_path()), before);
@@ -544,6 +546,18 @@ fn seed_chain_and_turns(conn: &Connection) {
         )
         .unwrap();
     }
+}
+
+fn seed_owned_compaction_evidence(path: &Path, session_id: &str, turn_uuid: &str) {
+    let state = oulipoly_state::StateDb::open(path).unwrap();
+    state
+        .insert_owned_turn_event_rows(&[oulipoly_state::OwnedTurnEventRow {
+            session_id: session_id.to_string(),
+            turn_uuid: turn_uuid.to_string(),
+            is_compaction_boundary: true,
+            summary_metadata_json: None,
+        }])
+        .unwrap();
 }
 
 fn compaction_flag(conn: &Connection, turn_id: &str) -> i64 {

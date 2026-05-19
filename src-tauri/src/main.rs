@@ -65,6 +65,7 @@ use uuid::Uuid;
 mod balanced_cli;
 mod cli_inputs;
 mod config_migration_cli;
+#[cfg(test)]
 #[path = "main/owned_turn_event_ingest.rs"]
 mod owned_turn_event_ingest;
 mod repl_cli;
@@ -85,6 +86,7 @@ use terminal_outcome_adapter::{
     spawn_error_terminal_signal, terminal_signal_error_category, terminal_signal_reason,
     typed_terminal_reason_fallback,
 };
+
 use usage::cli::{Cli, SessionSubcommands, Subcommands};
 
 const DEFAULT_PAUSE_HANDSHAKE_TTL_MS: u64 = 60_000;
@@ -5237,18 +5239,9 @@ struct CompactionBackfillReport {
 }
 
 fn run_compaction_backfill(state: &StateDb) -> Result<CompactionBackfillReport, String> {
-    let env = load_compaction_backfill_environment()?;
     let mut report = empty_compaction_backfill_report();
     for (provider_name, session_id) in distinct_compaction_chain_segments(state)? {
-        let Some(path) = locate_compaction_backfill_source(
-            &provider_name,
-            &session_id,
-            &env.sessions_cfg,
-            &env.models,
-        ) else {
-            continue;
-        };
-        let flagged = backfill_compaction_session(state, &provider_name, &session_id, &path)?;
+        let flagged = backfill_compaction_session(state, &provider_name, &session_id)?;
         accumulate_compaction_backfill(&mut report, flagged);
         render_compaction_backfill_session(&provider_name, &session_id, flagged);
     }
@@ -5270,11 +5263,23 @@ fn backfill_compaction_session(
     state: &StateDb,
     provider_name: &str,
     session_id: &str,
-    path: &Path,
 ) -> Result<u64, String> {
-    owned_turn_event_ingest::ingest_owned_turn_event_rows(state, provider_name, session_id, path)?;
     let evidence = state.compact_summary_evidence(session_id).map_err(|e| e.to_string())?;
-    owned_turn_event_ingest::flag_compaction_boundaries_from_evidence(state, provider_name, &evidence)
+    flag_compaction_boundaries_from_evidence(state, provider_name, &evidence)
+}
+
+fn flag_compaction_boundaries_from_evidence(
+    state: &StateDb,
+    provider_name: &str,
+    evidence: &oulipoly_state::CompactSummaryEvidence,
+) -> Result<u64, String> {
+    let mut flagged = 0u64;
+    for turn_uuid in &evidence.compact_turn_uuids {
+        if state.flag_compaction_boundary(provider_name, &evidence.session_id, turn_uuid)? {
+            flagged += 1;
+        }
+    }
+    Ok(flagged)
 }
 
 fn accumulate_compaction_backfill(report: &mut CompactionBackfillReport, flagged: u64) {

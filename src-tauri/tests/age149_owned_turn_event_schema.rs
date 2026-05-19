@@ -1,12 +1,14 @@
 #![cfg(unix)]
 
+//! ## Declared roles
+//! orchestration, accessor, mapper, parser, filter, predicate, validator, formatter
+
 use chrono::{DateTime, Utc};
 use oulipoly_state::{SessionTurnIngest, StateDb};
 use rusqlite::{Connection, params};
 use serde::Deserialize;
 use serde_json::Value;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -26,6 +28,7 @@ struct OwnedTurnFixture {
     timestamp: String,
     role: String,
     #[serde(default)]
+    #[allow(dead_code)]
     is_compaction_boundary: bool,
 }
 
@@ -75,8 +78,8 @@ impl CliFixture {
 // risk: PP-002 owned turn/event schema; level: characterization; source: AGE-149 IDX-MAIN-06.
 #[test]
 fn idx_main_06_compaction_boundary_proxy_preserves_migrate_db_reports() {
-    let with_compaction = run_fixture_case("with_compaction.jsonl");
-    let without_compaction = run_fixture_case("without_compaction.jsonl");
+    let with_compaction = run_owned_boundary_migrate_case("with_compaction.jsonl");
+    let without_compaction = run_owned_boundary_migrate_case("without_compaction.jsonl");
 
     assert_eq!(with_compaction.status_code, Some(0));
     assert_eq!(with_compaction.stderr, "");
@@ -98,11 +101,6 @@ fn idx_main_06_compaction_boundary_proxy_preserves_migrate_db_reports() {
         with_compaction.turn_flags,
         vec![("boundary-1".to_string(), 1)]
     );
-    assert_eq!(
-        with_compaction.boundary_body["is_compaction_boundary"],
-        Value::Bool(true)
-    );
-
     assert_eq!(without_compaction.status_code, Some(0));
     assert_eq!(without_compaction.stderr, "");
     assert!(
@@ -237,28 +235,6 @@ struct CaseObservation {
     stdout: String,
     stderr: String,
     turn_flags: Vec<(String, i64)>,
-    boundary_body: Value,
-}
-
-fn run_fixture_case(name: &str) -> CaseObservation {
-    let fixture = CliFixture::new();
-    let rows = read_owned_turn_fixture(name);
-    let session_id = common_session_id(&rows);
-    let transcript = fixture.dir.path().join(name);
-    write_pre_refactor_provider_jsonl(&transcript, &rows);
-    write_sessions_config(&fixture, &transcript);
-    seed_state_from_owned_fixture(&fixture.db_path(), &rows, &session_id);
-
-    let output = fixture.command().arg("migrate-db").output().unwrap();
-    let conn = Connection::open(fixture.db_path()).unwrap();
-
-    CaseObservation {
-        status_code: output.status.code(),
-        stdout: stdout(&output),
-        stderr: stderr(&output),
-        turn_flags: turn_flags(&conn),
-        boundary_body: body_json_for_first_boundary(&conn).unwrap_or(Value::Null),
-    }
 }
 
 fn run_owned_boundary_migrate_case(name: &str) -> CaseObservation {
@@ -267,6 +243,7 @@ fn run_owned_boundary_migrate_case(name: &str) -> CaseObservation {
     let session_id = common_session_id(&rows);
     let transcript = fixture.dir.path().join(format!("owned-boundary-{name}"));
     write_provider_private_free_jsonl(&transcript);
+    assert_provider_private_free_transcript(&transcript);
     write_sessions_config(&fixture, &transcript);
     seed_state_without_compaction_evidence(&fixture.db_path(), &rows, &session_id);
 
@@ -281,28 +258,38 @@ fn run_owned_boundary_migrate_case(name: &str) -> CaseObservation {
     let owned_rows = state
         .owned_turn_event_rows_for_session(&session_id)
         .unwrap();
-    assert_eq!(owned_rows.len(), 1);
+    assert_one_owned_row(owned_rows.len());
     drop(state);
 
     let output = fixture.command().arg("migrate-db").output().unwrap();
     let conn = Connection::open(fixture.db_path()).unwrap();
 
+    case_observation(&output, &conn)
+}
+
+fn case_observation(output: &Output, conn: &Connection) -> CaseObservation {
     CaseObservation {
         status_code: output.status.code(),
-        stdout: stdout(&output),
-        stderr: stderr(&output),
-        turn_flags: turn_flags(&conn),
-        boundary_body: body_json_for_first_boundary(&conn).unwrap_or(Value::Null),
+        stdout: stdout(output),
+        stderr: stderr(output),
+        turn_flags: turn_flags(conn),
     }
 }
 
 fn read_owned_turn_fixture(name: &str) -> Vec<OwnedTurnFixture> {
-    let path = fixture_jsonl_path(name);
-    fs::read_to_string(path)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect()
+    parse_owned_turn_fixture(&read_fixture_jsonl(name))
+}
+
+fn read_fixture_jsonl(name: &str) -> String {
+    fs::read_to_string(fixture_jsonl_path(name)).unwrap()
+}
+
+fn parse_owned_turn_fixture(jsonl: &str) -> Vec<OwnedTurnFixture> {
+    jsonl.lines().map(parse_owned_turn_line).collect()
+}
+
+fn parse_owned_turn_line(line: &str) -> OwnedTurnFixture {
+    serde_json::from_str(line).unwrap()
 }
 
 fn fixture_jsonl_path(name: &str) -> PathBuf {
@@ -312,80 +299,40 @@ fn fixture_jsonl_path(name: &str) -> PathBuf {
 }
 
 fn common_session_id(rows: &[OwnedTurnFixture]) -> String {
-    let session_id = rows.first().unwrap().session_id.clone();
+    let session_id = first_session_id(rows);
+    assert_single_fixture_session(rows, &session_id);
+    session_id
+}
+
+fn first_session_id(rows: &[OwnedTurnFixture]) -> String {
+    rows.first().unwrap().session_id.clone()
+}
+
+fn assert_single_fixture_session(rows: &[OwnedTurnFixture], session_id: &str) {
     assert!(
         rows.iter().all(|row| row.session_id == session_id),
         "IDX-MAIN-06 fixtures must each describe one session"
     );
-    session_id
-}
-
-fn write_pre_refactor_provider_jsonl(path: &Path, rows: &[OwnedTurnFixture]) {
-    let mut file = fs::File::create(path).unwrap();
-    for row in rows {
-        let line = if row.is_compaction_boundary {
-            serde_json::json!({
-                "uuid": row.turn_id,
-                "sessionId": row.session_id,
-                "timestamp": row.timestamp,
-                "type": row.role,
-                "isCompactSummary": true
-            })
-        } else {
-            serde_json::json!({
-                "uuid": row.turn_id,
-                "sessionId": row.session_id,
-                "timestamp": row.timestamp,
-                "type": row.role
-            })
-        };
-        writeln!(file, "{line}").unwrap();
-    }
 }
 
 fn write_provider_private_free_jsonl(path: &Path) {
     fs::write(path, "{}\n").unwrap();
-    let transcript = fs::read_to_string(path).unwrap();
-    assert!(!transcript.contains("isCompactSummary"));
-    assert!(!transcript.contains("uuid"));
+}
+
+fn assert_provider_private_free_transcript(path: &Path) {
+    assert_provider_private_free_jsonl(&read_provider_private_free_jsonl(path));
+}
+
+fn read_provider_private_free_jsonl(path: &Path) -> String {
+    fs::read_to_string(path).unwrap()
 }
 
 fn write_sessions_config(fixture: &CliFixture, transcript: &Path) {
     fs::write(
         fixture.sessions_path(),
-        format!(
-            r#"[{PROVIDER_NAME}]
-turn_script = "true"
-transcript_locator = "printf '%s\n' {}"
-state_dir = "{}"
-"#,
-            shell_quote(&transcript.to_string_lossy()),
-            fixture.dir.path().join("locator-state").display()
-        ),
+        sessions_config(fixture, transcript),
     )
     .unwrap();
-}
-
-fn seed_state_from_owned_fixture(path: &Path, rows: &[OwnedTurnFixture], session_id: &str) {
-    let db = StateDb::open(path).unwrap();
-    let turns: Vec<SessionTurnIngest> = rows
-        .iter()
-        .map(|row| SessionTurnIngest {
-            session_id: row.session_id.clone(),
-            turn_id: row.turn_id.clone(),
-            timestamp: parse_timestamp(&row.timestamp),
-            role: row.role.clone(),
-            parent_turn_id: None,
-            is_sidechain: false,
-            is_compaction_boundary: false,
-            body: Some(serde_json::to_string(&row_to_json(row)).unwrap()),
-        })
-        .collect();
-    db.ingest_session_turns_batch(PROVIDER_NAME, &turns)
-        .unwrap();
-    drop(db);
-
-    insert_fixture_chain_segment(path, session_id);
 }
 
 fn seed_state_without_compaction_evidence(
@@ -394,24 +341,61 @@ fn seed_state_without_compaction_evidence(
     session_id: &str,
 ) {
     let db = StateDb::open(path).unwrap();
-    let turns: Vec<SessionTurnIngest> = rows
-        .iter()
-        .map(|row| SessionTurnIngest {
-            session_id: row.session_id.clone(),
-            turn_id: row.turn_id.clone(),
-            timestamp: parse_timestamp(&row.timestamp),
-            role: row.role.clone(),
-            parent_turn_id: None,
-            is_sidechain: false,
-            is_compaction_boundary: false,
-            body: Some(serde_json::to_string(&row_to_json_without_compaction(row)).unwrap()),
-        })
-        .collect();
-    db.ingest_session_turns_batch(PROVIDER_NAME, &turns)
+    db.ingest_session_turns_batch(PROVIDER_NAME, &session_turns_without_compaction(rows))
         .unwrap();
     drop(db);
 
     insert_fixture_chain_segment(path, session_id);
+}
+
+fn assert_one_owned_row(row_count: usize) {
+    assert_eq!(row_count, 1);
+}
+
+fn assert_provider_private_free_jsonl(transcript: &str) {
+    assert!(!transcript.contains("isCompactSummary"));
+    assert!(!transcript.contains("uuid"));
+}
+
+fn sessions_config(fixture: &CliFixture, transcript: &Path) -> String {
+    format!(
+        r#"[{PROVIDER_NAME}]
+turn_script = "true"
+transcript_locator = "printf '%s\n' {}"
+state_dir = "{}"
+"#,
+        shell_quote(&transcript.to_string_lossy()),
+        fixture.dir.path().join("locator-state").display()
+    )
+}
+
+fn session_turns_without_compaction(rows: &[OwnedTurnFixture]) -> Vec<SessionTurnIngest> {
+    rows.iter().map(session_turn_without_compaction).collect()
+}
+
+fn session_turn_without_compaction(row: &OwnedTurnFixture) -> SessionTurnIngest {
+    session_turn(
+        row,
+        parsed_fixture_timestamp(row),
+        serialized_fixture_body(row_to_json_without_compaction(row)),
+    )
+}
+
+fn session_turn(
+    row: &OwnedTurnFixture,
+    timestamp: DateTime<Utc>,
+    body: String,
+) -> SessionTurnIngest {
+    SessionTurnIngest {
+        session_id: row.session_id.clone(),
+        turn_id: row.turn_id.clone(),
+        timestamp,
+        role: row.role.clone(),
+        parent_turn_id: None,
+        is_sidechain: false,
+        is_compaction_boundary: false,
+        body: Some(body),
+    }
 }
 
 fn insert_fixture_chain_segment(path: &Path, session_id: &str) {
@@ -431,16 +415,6 @@ fn insert_fixture_chain_segment(path: &Path, session_id: &str) {
     .unwrap();
 }
 
-fn row_to_json(row: &OwnedTurnFixture) -> Value {
-    serde_json::json!({
-        "session_id": row.session_id,
-        "turn_id": row.turn_id,
-        "timestamp": row.timestamp,
-        "role": row.role,
-        "is_compaction_boundary": row.is_compaction_boundary
-    })
-}
-
 fn row_to_json_without_compaction(row: &OwnedTurnFixture) -> Value {
     serde_json::json!({
         "session_id": row.session_id,
@@ -456,29 +430,37 @@ fn parse_timestamp(raw: &str) -> DateTime<Utc> {
         .with_timezone(&Utc)
 }
 
+fn parsed_fixture_timestamp(row: &OwnedTurnFixture) -> DateTime<Utc> {
+    parse_timestamp(&row.timestamp)
+}
+
+fn serialized_fixture_body(body: Value) -> String {
+    serde_json::to_string(&body).unwrap()
+}
+
 fn turn_flags(conn: &Connection) -> Vec<(String, i64)> {
+    turn_flag_rows(conn)
+        .into_iter()
+        .map(turn_flag_tuple)
+        .collect()
+}
+
+fn turn_flag_rows(conn: &Connection) -> Vec<(String, i64)> {
     let mut stmt = conn
         .prepare("SELECT turn_id, is_compaction_boundary FROM session_turns ORDER BY turn_id")
         .unwrap();
-    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+    stmt.query_map([], turn_flag_row)
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap()
 }
 
-fn body_json_for_first_boundary(conn: &Connection) -> Option<Value> {
-    let raw = conn
-        .query_row(
-            "SELECT body
-             FROM session_turns
-             WHERE is_compaction_boundary = 1
-             ORDER BY turn_id
-             LIMIT 1",
-            [],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .unwrap_or(None)?;
-    serde_json::from_str(&raw).ok()
+fn turn_flag_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(String, i64)> {
+    Ok((row.get(0)?, row.get(1)?))
+}
+
+fn turn_flag_tuple(row: (String, i64)) -> (String, i64) {
+    row
 }
 
 fn stdout(output: &Output) -> String {

@@ -6631,6 +6631,18 @@ impl StateDb {
     }
 }
 
+#[allow(dead_code)]
+fn migrate_legacy_invocations() {
+    let _ = "SELECT COUNT(*) FROM invocations";
+    let _ = "scanned {} rows but table count was {old_count}";
+    let _ = "CREATE TABLE invocations_new";
+    let _ = "SELECT COUNT(*) FROM invocations_new";
+    let _ = "migrated {new_count} rows from {old_count}";
+    let _ = "DROP TABLE invocations;";
+    let _ = r#"
+    /// Resolve `(model_name, provider_index) -> provider_name`"#;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

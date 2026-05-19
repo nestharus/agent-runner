@@ -13,12 +13,10 @@
 //!       - oulipoly_state::OwnedTurnEventRow
 //!       - oulipoly_state::StateDb owned turn/event facade
 
-use oulipoly_config::{ModelConfig, ProviderConfig};
 use oulipoly_state::{CompactSummaryEvidence, OwnedTurnEventRow, StateDb};
 use serde_json::Value;
-use std::collections::HashMap;
 use std::io::BufRead;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub(crate) type IoError = String;
 
@@ -92,17 +90,6 @@ pub(crate) fn flag_compaction_boundaries_from_evidence(
     Ok(flagged)
 }
 
-pub(crate) fn existing_storage_compaction_source_path(
-    provider_name: &str,
-    session_id: &str,
-    models: &HashMap<String, ModelConfig>,
-) -> Option<PathBuf> {
-    existing_owned_turn_event_source_path(storage_transcript_path(
-        matching_storage_providers(provider_name, models),
-        session_id,
-    )?)
-}
-
 pub(crate) fn compact_summary_turn_uuid(obj: &Value) -> Option<String> {
     if !is_compact_summary_json(obj) {
         return None;
@@ -133,27 +120,6 @@ fn map_provider_json_parts_to_compact_record(
 
 fn provider_turn_uuid(obj: &Value, compact_turn_id: Option<String>) -> Option<String> {
     compact_turn_id.or_else(|| raw_provider_turn_uuid(obj).map(string_from_str))
-}
-
-fn matching_storage_providers<'a>(
-    provider_name: &str,
-    models: &'a HashMap<String, ModelConfig>,
-) -> Vec<&'a ProviderConfig> {
-    models
-        .values()
-        .flat_map(|model| model.providers.iter())
-        .filter(|provider| provider.name == provider_name)
-        .collect()
-}
-
-fn storage_transcript_path(providers: Vec<&ProviderConfig>, session_id: &str) -> Option<PathBuf> {
-    providers.into_iter().find_map(|provider| {
-        oulipoly_runtime::migration::find_claude_source_from_storage(provider, session_id)
-    })
-}
-
-fn existing_owned_turn_event_source_path(path: PathBuf) -> Option<PathBuf> {
-    if path.exists() { Some(path) } else { None }
 }
 
 fn compact_summary_metadata_json(obj: &Value) -> Option<String> {

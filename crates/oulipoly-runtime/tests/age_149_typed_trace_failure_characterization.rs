@@ -1,3 +1,6 @@
+//! ## Declared roles
+//! orchestration, accessor, mapper, parser, filter, predicate, validator, formatter
+
 use oulipoly_config::SessionsConfig;
 use oulipoly_runtime::services::{
     ProductionTraceService, TraceServiceFailure, TraceServicePort, TraceServiceRequest,
@@ -12,15 +15,18 @@ const MISSING_UUID: &str = "22222222-2222-4222-8222-222222222222";
 
 fn seeded_trace_fixture() -> (StateDb, SessionsConfig) {
     let db = StateDb::open(Path::new(":memory:")).unwrap();
-    db.start_invocation(&InvocationStart {
+    db.start_invocation(&root_invocation_start()).unwrap();
+    (db, SessionsConfig::default())
+}
+
+fn root_invocation_start() -> InvocationStart {
+    InvocationStart {
         invocation_uuid: ROOT_UUID.to_string(),
         model_name: "claude~high".to_string(),
         provider_name: "claude".to_string(),
         provider_index: 0,
         parent_invocation_id: None,
-    })
-    .unwrap();
-    (db, SessionsConfig::default())
+    }
 }
 
 fn trace_options() -> TraceOptions {
@@ -33,7 +39,14 @@ fn trace_options() -> TraceOptions {
 }
 
 fn report_without_generated_at(report: &TraceReport) -> Value {
-    let mut value = serde_json::to_value(report).unwrap();
+    remove_generated_at(report_json_value(report))
+}
+
+fn report_json_value(report: &TraceReport) -> Value {
+    serde_json::to_value(report).unwrap()
+}
+
+fn remove_generated_at(mut value: Value) -> Value {
     value.as_object_mut().unwrap().remove("generated_at");
     value
 }
@@ -43,15 +56,23 @@ fn trace_failure_for(invocation_uuid: &str) -> TraceServiceFailure {
     let service = ProductionTraceService::default();
 
     service
-        .trace(TraceServiceRequest {
-            state: &db,
-            sessions_cfg: &sessions_cfg,
-            invocation_uuid,
-            options: trace_options(),
-        })
+        .trace(trace_service_request(&db, &sessions_cfg, invocation_uuid))
         .unwrap()
         .result
         .unwrap_err()
+}
+
+fn trace_service_request<'a>(
+    state: &'a StateDb,
+    sessions_cfg: &'a SessionsConfig,
+    invocation_uuid: &'a str,
+) -> TraceServiceRequest<'a> {
+    TraceServiceRequest {
+        state,
+        sessions_cfg,
+        invocation_uuid,
+        options: trace_options(),
+    }
 }
 
 #[test]
@@ -82,12 +103,7 @@ fn idx_svc_01_trace_report_matches_direct_trace_without_generated_at() {
     let service = ProductionTraceService::default();
 
     let service_report = service
-        .trace(TraceServiceRequest {
-            state: &db,
-            sessions_cfg: &sessions_cfg,
-            invocation_uuid: ROOT_UUID,
-            options: trace_options(),
-        })
+        .trace(trace_service_request(&db, &sessions_cfg, ROOT_UUID))
         .unwrap()
         .result
         .unwrap();
