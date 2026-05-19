@@ -3060,3 +3060,23 @@ This is NOT residual acceptance, NOT precedent citation, and does NOT authorize 
   - AGE-129 only addresses the lifecycle event records emitted by the three named StateDb methods + the events.jsonl forward (delegated to AGE-130's sink).
 - **Evidence**: `/home/nes/projects/agent-runner/planning/age-129-lifecycle-log-schema/research/age-129-duplicates.md` § 2.
 - **Revisit when**: follow-up tracker may be filed manually if the user prefers; the drift items will surface again as consolidation candidates when AGE-130 (raw I/O writer) lands its events.jsonl sink and the lifecycle/raw-I/O pair is reviewed end-to-end.
+
+### AGE-129 — Phase 6 per-component code-quality convergence-cap halt
+
+- **Source**: implementation-pipeline-orchestrator Phase 6 per-component code-quality fanout at `${planning_dir}/code-quality/age-129-lifecycle-log-statedb-instrumentation/aggregate-code-quality.md`.
+- **Trajectory**: R0=10 → R1=5 → R2=5 → R3=5 → R4=4 → R5=14 findings (trajectory inverted; same split-shifts-the-problem pattern as AGE-122 R3 → R11 DECOMPOSED).
+- **What's LOW**: primary deliverable code (`lifecycle_log.rs`); cargo fmt + clippy -D warnings + full workspace `cargo test` all PASS; all 16 Step 6b tests pass; Step 6a contract satisfied; Phase 4 all-gates LOW; Phase 5 INTACT; Phase 6 prototype-risk LOW; Phase 6 cohesion LOW on lifecycle_log + state module + sqlite-negative-control + repositories-preservation components (post R5 declared-role widening).
+- **What's blocking**: ACR-249 whole-file ownership on db.rs surfaces inherited multi-classifier debt (`classify_sidecar_io_failure` PP-013 push-pull HIGH; `warn_*_artifact_failure`, `upsert_provider_finalize_aggregate`, `update_provider_last_error` FC HIGH initially cleaned in R4 but R5 found new FC findings on R4's emitted helpers + test functions). Strict A1 interpretation moves findings between rounds without convergence.
+- **Decision**: HALT before Phase 6 component CQ closure / Process-tree audit #2 / Phase 7 readiness gates / Phase 8 PR review / Phase 9 PR open. Question artifact written at `${scratch_dir}/questions/q-1e49ef6d-5e08-4180-a5f9-0498c0d0585c.question.json` requesting root disposition.
+- **Forbidden behaviors reaffirmed**:
+  - Orchestrator MUST NOT self-apply defaults on root-owned value/scope/trade-off questions after `AskUserQuestion` permission-denied.
+  - Orchestrator MUST NOT silently advance to Phase 7+ with a HIGH per-component CQ aggregate.
+  - Orchestrator MUST NOT cite AGE-147 or AGE-122 R11 bootstrap-exception as precedent without independent four-condition verification (user brief: "NOT precedent-citation").
+- **Recommended root disposition**: Option C (ship R4 + documented residual override). Rationale: code is correct; PR review (Phase 8) is the next checkpoint anyway; AGE-122 precedent shows the convergence cap is genuine; AGE-129's primary deliverable matters for AGE-130 unblock.
+- **Evidence**:
+  - Audit-history Round 5 trajectory table: `${planning_dir}/audit-history.md`
+  - Question artifact: `${scratch_dir}/questions/q-1e49ef6d-5e08-4180-a5f9-0498c0d0585c.question.json`
+  - Aggregate R5: `${planning_dir}/code-quality/age-129-lifecycle-log-statedb-instrumentation/aggregate-code-quality.md`
+  - Findings R5: `${planning_dir}/code-quality/age-129-lifecycle-log-statedb-instrumentation/findings.md`
+- **Revisit when**: root answers q-1e49ef6d. If option C is chosen, orchestrator resumes from Phase 6 component CQ closure (treating R4/R5 as residual) and advances. If option A (decompose), orchestrator follows AGE-122 R11 precedent (file AGE-150/AGE-151, mark AGE-129 DECOMPOSED, preserve branch as cherry-pick reference). If option B (continue revising) or D (shrink), orchestrator dispatches the corresponding action.
+
