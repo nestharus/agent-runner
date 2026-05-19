@@ -1,12 +1,14 @@
 //! ## Declared roles
-//! accessor, mapper, validator
+//! accessor, mapper, parser, validator
 //!
 //! Function role map:
-//! - `workspace_root`, `carried_regressions`, `target_path`: accessor
-//! - `row_ids`: mapper
+//! - `workspace_root`, `carried_regressions`, `target_path`, `step6c_command_log_path`: accessor
+//! - `row_ids`, `step6c_command_log_section`: mapper
+//! - `read_step6c_command_log`: parser
 //! - `age154_*` tests: validator
 
 use std::collections::BTreeSet;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 struct CarriedRegression {
@@ -118,6 +120,45 @@ fn target_path(entry: &CarriedRegression) -> PathBuf {
     workspace_root().join(entry.durable_target)
 }
 
+fn step6c_command_log_path() -> PathBuf {
+    let relative_path = Path::new("planning")
+        .join("age-154-compat-disposition")
+        .join(".scratch")
+        .join("phase6")
+        .join("age-140-carried-regression-command-log.md");
+
+    let mut cursor = Path::new(env!("CARGO_MANIFEST_DIR"));
+    loop {
+        let candidate = cursor.join(&relative_path);
+        if candidate.exists() {
+            return candidate;
+        }
+        cursor = cursor
+            .parent()
+            .unwrap_or_else(|| panic!("could not find {}", relative_path.display()));
+    }
+}
+
+fn read_step6c_command_log() -> String {
+    let path = step6c_command_log_path();
+    fs::read_to_string(&path).unwrap_or_else(|err| {
+        panic!(
+            "failed to read Step 6c command log {}: {err}",
+            path.display()
+        )
+    })
+}
+
+fn step6c_command_log_section<'a>(command_log: &'a str, entry: &CarriedRegression) -> &'a str {
+    let header = format!("## {}", entry.row_id);
+    let start = command_log
+        .find(&header)
+        .unwrap_or_else(|| panic!("Step 6c command log missing row header {}", entry.row_id));
+    let section = &command_log[start..];
+    let end = section.find("\n## ").unwrap_or(section.len());
+    &section[..end]
+}
+
 fn row_ids() -> BTreeSet<&'static str> {
     carried_regressions()
         .iter()
@@ -161,6 +202,31 @@ fn age154_age140_carried_regression_targets_exist_for_step6c_consumption() {
             "{} target must exist for Step 6c rerun/documented mapping: {}",
             entry.row_id,
             path.display()
+        );
+    }
+}
+
+#[test]
+fn age154_age140_carried_regression_step6c_evidence_records_per_row_exit_code_zero() {
+    let command_log = read_step6c_command_log();
+
+    for entry in carried_regressions() {
+        let section = step6c_command_log_section(&command_log, entry);
+        assert!(
+            section.contains(entry.row_id),
+            "Step 6c evidence section must preserve row id {}",
+            entry.row_id
+        );
+        assert!(
+            section.contains(&format!("Command: {}", entry.command_or_node_id)),
+            "{} Step 6c evidence must preserve command_or_node_id `{}`",
+            entry.row_id,
+            entry.command_or_node_id
+        );
+        assert!(
+            section.contains("Exit code: 0"),
+            "{} Step 6c durable evidence must record the contract-named observable: command_or_node_id returned exit code 0 against HEAD",
+            entry.row_id
         );
     }
 }
