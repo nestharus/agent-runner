@@ -7,13 +7,20 @@
 use super::dtos::{MigrationServiceOutput, MigrationServiceRequest, RotationFailedReason};
 use super::error::ServiceError;
 use crate::balancer::{
-    FailureClass, MigrationDecision, TransitionReason, apply_post_failure_forensics,
-    select_next_working_candidate,
+    FailureClass, ManualMigrationRejection, MigrationDecision, TransitionReason,
+    apply_post_failure_forensics, decide_manual_migration, select_next_working_candidate,
 };
 
 pub(super) fn migrate(
     request: MigrationServiceRequest<'_>,
 ) -> Result<MigrationServiceOutput, ServiceError> {
+    // AGE-163 WU-A.5: explicit manual-target requests route through the
+    // typed `decide_manual_migration`. Rejections surface as the typed
+    // `RotationFailed { ManualTarget* }` variants the caller renders as
+    // operator-visible diagnostics.
+    if let Some(target) = request.manual_target {
+        return migrate_manual(request, target);
+    }
     match decide_service_migration(&request) {
         Ok(MigrationDecision::Stay) => Ok(MigrationServiceOutput::Stay),
         Err(err) => Err(ServiceError::Dependency {
@@ -23,6 +30,44 @@ pub(super) fn migrate(
             target_provider_index,
             reason,
         }) => run_service_migration(request, target_provider_index, reason),
+    }
+}
+
+fn migrate_manual(
+    mut request: MigrationServiceRequest<'_>,
+    target: &str,
+) -> Result<MigrationServiceOutput, ServiceError> {
+    match decide_manual_migration(request.migration_model, request.resolved, target) {
+        Ok(MigrationDecision::Stay) => Ok(MigrationServiceOutput::Stay),
+        Ok(MigrationDecision::Migrate {
+            target_provider_index,
+            reason,
+        }) => match attempt_migration(&mut request, target_provider_index, reason) {
+            Ok(segment) => Ok(MigrationServiceOutput::Migrated { segment }),
+            Err(err) => Err(ServiceError::Dependency {
+                message: format!("{err:?}"),
+            }),
+        },
+        Err(rejection) => Ok(MigrationServiceOutput::RotationFailed {
+            reason: rejection_to_rotation_failed(rejection),
+        }),
+    }
+}
+
+fn rejection_to_rotation_failed(rejection: ManualMigrationRejection) -> RotationFailedReason {
+    match rejection {
+        ManualMigrationRejection::SingleProviderPool { provider } => {
+            RotationFailedReason::ManualTargetIsSingleProviderPool { provider }
+        }
+        ManualMigrationRejection::ActiveProviderNotInPool { active } => {
+            RotationFailedReason::ManualTargetActiveNotInPool { active }
+        }
+        ManualMigrationRejection::TargetNotInPool { target, pool } => {
+            RotationFailedReason::ManualTargetNotInPool { target, pool }
+        }
+        ManualMigrationRejection::NotMigratablePair { source, target } => {
+            RotationFailedReason::ManualTargetNotMigratable { source, target }
+        }
     }
 }
 

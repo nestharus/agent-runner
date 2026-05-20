@@ -3082,6 +3082,16 @@ fn read_provider_quota_state(
     state.get_quota(provider_name)
 }
 
+/// AGE-163 WU-A.5: a dispatch is "headless" when stdin is not a TTY. The
+/// runtime treats headless `--resume` sessions as eligible for autonomous
+/// auto-rotation when the bound provider hits a terminal failure (per the
+/// design contract). Interactive sessions surface failures to the operator
+/// instead.
+fn is_dispatch_headless() -> bool {
+    use std::io::IsTerminal;
+    !std::io::stdin().is_terminal()
+}
+
 fn format_rotation_failed_reason(reason: &RotationFailedReason) -> String {
     match reason {
         RotationFailedReason::WorkingSetExhausted { candidates_tried } => format!(

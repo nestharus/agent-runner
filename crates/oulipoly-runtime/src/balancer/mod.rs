@@ -892,6 +892,13 @@ pub fn decide_migration(
     resolved: &ResolvedResume,
     manual_target: Option<&str>,
 ) -> Result<MigrationDecision, MigrationError> {
+    // AGE-163 WU-A.5: the seam's manual-rotate path now consults
+    // `decide_manual_migration` directly (see
+    // `services::migration::migrate`); when this function is invoked with
+    // `manual_target.is_some()`, it falls back to the legacy
+    // `manual_migration_decision` so non-seam callers (e.g. existing tests)
+    // retain pre-WU-A.5 behavior. The seam path is the one that surfaces
+    // typed `ManualMigrationRejection` to the operator.
     if !model_has_migration_alternative(model) {
         return Ok(MigrationDecision::Stay);
     }
@@ -928,6 +935,70 @@ pub fn decide_migration(
         active_provider_index,
     ))
 }
+
+/// AGE-163 WU-A.5 typed manual-rotate decision. Translates the three
+/// pre-existing silent-`Stay` fall-throughs into named rejection variants
+/// the caller can render to the operator instead of silently dispatching
+/// the original bound provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManualMigrationRejection {
+    SingleProviderPool {
+        provider: String,
+    },
+    ActiveProviderNotInPool {
+        active: String,
+    },
+    TargetNotInPool {
+        target: String,
+        pool: Vec<String>,
+    },
+    NotMigratablePair {
+        source: String,
+        target: String,
+    },
+}
+
+pub fn decide_manual_migration(
+    model: &ModelConfig,
+    resolved: &ResolvedResume,
+    manual_target: &str,
+) -> Result<MigrationDecision, ManualMigrationRejection> {
+    if !model_has_migration_alternative(model) {
+        let provider = model
+            .providers
+            .first()
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| resolved.active_provider.clone());
+        return Err(ManualMigrationRejection::SingleProviderPool { provider });
+    }
+    let Some(active_index) = active_provider_index(model, resolved) else {
+        return Err(ManualMigrationRejection::ActiveProviderNotInPool {
+            active: resolved.active_provider.clone(),
+        });
+    };
+    let active = &model.providers[active_index];
+    let Some(target_index) = model
+        .providers
+        .iter()
+        .position(|provider| provider.name == manual_target)
+    else {
+        return Err(ManualMigrationRejection::TargetNotInPool {
+            target: manual_target.to_string(),
+            pool: model.providers.iter().map(|p| p.name.clone()).collect(),
+        });
+    };
+    if !is_resume_migratable_pair(active, &model.providers[target_index]) {
+        return Err(ManualMigrationRejection::NotMigratablePair {
+            source: active.name.clone(),
+            target: manual_target.to_string(),
+        });
+    }
+    Ok(MigrationDecision::Migrate {
+        target_provider_index: target_index,
+        reason: TransitionReason::Manual,
+    })
+}
+
 
 fn model_has_migration_alternative(model: &ModelConfig) -> bool {
     model.providers.len() > 1
@@ -1825,6 +1896,59 @@ mod tests {
         let now = Utc::now();
         let q = quota_record_with_next_available_at(Some(now + Duration::hours(1)));
         assert!(!working_set_member(Some(&q), now));
+    }
+
+    #[test]
+    fn decide_manual_migration_emits_target_not_in_pool_rejection() {
+        let model = migratable_model(&[("claude", "claude_code"), ("claude2", "claude_code")]);
+        let resolved = resolved_for(&model, 0);
+        let result = decide_manual_migration(&model, &resolved, "claude-missing");
+        match result {
+            Err(ManualMigrationRejection::TargetNotInPool { target, pool }) => {
+                assert_eq!(target, "claude-missing");
+                assert_eq!(pool, vec!["claude".to_string(), "claude2".to_string()]);
+            }
+            other => panic!("expected TargetNotInPool, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decide_manual_migration_emits_single_provider_pool_rejection() {
+        let model = migratable_model(&[("claude", "claude_code")]);
+        let resolved = resolved_for(&model, 0);
+        let result = decide_manual_migration(&model, &resolved, "claude");
+        assert!(matches!(
+            result,
+            Err(ManualMigrationRejection::SingleProviderPool { ref provider })
+                if provider == "claude"
+        ));
+    }
+
+    #[test]
+    fn decide_manual_migration_emits_active_not_in_pool_rejection() {
+        let model = migratable_model(&[("claude", "claude_code"), ("claude2", "claude_code")]);
+        let mut resolved = resolved_for(&model, 0);
+        resolved.active_provider = "archived".to_string();
+        let result = decide_manual_migration(&model, &resolved, "claude2");
+        assert!(matches!(
+            result,
+            Err(ManualMigrationRejection::ActiveProviderNotInPool { ref active })
+                if active == "archived"
+        ));
+    }
+
+    #[test]
+    fn decide_manual_migration_emits_not_migratable_pair_rejection() {
+        let model = migratable_model(&[("claude", "claude_code"), ("claude2", "none")]);
+        let resolved = resolved_for(&model, 0);
+        let result = decide_manual_migration(&model, &resolved, "claude2");
+        match result {
+            Err(ManualMigrationRejection::NotMigratablePair { source, target }) => {
+                assert_eq!(source, "claude");
+                assert_eq!(target, "claude2");
+            }
+            other => panic!("expected NotMigratablePair, got {other:?}"),
+        }
     }
 
     fn working_set_model(provider_names: &[&str]) -> ModelConfig {
