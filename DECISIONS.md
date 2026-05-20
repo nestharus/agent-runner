@@ -3354,6 +3354,29 @@ This is NOT residual acceptance, NOT precedent citation, and does NOT authorize 
 
 - **Source**: Phase 8 multi-concern + justification gate MEDIUMs flagged the `#[allow(dead_code)]` cluster in `src-tauri/src/main.rs` compaction-backfill helpers.
 - **Discovery**: Pre-existing dead code in `main.rs` since commit `8922b652` (pre-AGE-160 baseline). AGE-160's marker cascade did not introduce the dead-code state; it exposed it because an unrelated change shifted clippy's view of these helpers.
-- **Decision**: proceed-with-note. Keep the dead helpers and the necessary `#[allow(dead_code)]` annotations for this PR. Follow-up Linear ticket: `linear_followup_ticket: TBD`, title "Tauri compaction-backfill dead-code cleanup", labels `technical-debt, drift-discovery, age-160-spawned, src-tauri`. Restore the caller or remove the dead helpers in the follow-up, not inside AGE-160.
+- **Decision**: proceed-with-note. Keep the dead helpers and the necessary `#[allow(dead_code)]` annotations for this PR. Follow-up Linear ticket: **AGE-161** (https://linear.app/oulipoly/issue/AGE-161/tauri-compaction-backfill-dead-code-cleanup), title "Tauri compaction-backfill dead-code cleanup", parent AGE-160, labels `technical-debt, drift-discovery, age-160-spawned, src-tauri`. Restore the caller or remove the dead helpers in AGE-161, not inside AGE-160.
 - **Rationale**: AGE-160 anti-scope is "NO scope expansion beyond the 5 scope elements". Either deleting these helpers or restoring their callers is substantive Tauri-side work unrelated to state-crate residual cleanup. Per AGE-149 precedent (drift-discovery -> tracker ticket), the appropriate action is file-and-proceed.
 - **Revisit when**: The follow-up Linear ticket progresses.
+
+### AGE-160 — Phase 8 multi-concern MEDIUM ratification
+
+- **Source**: Phase 8 PR-review gate (multi-concern auditor R2). Verdict `MEDIUM` with explicit `Split Recommendation: No split recommended`.
+- **Decision**: Ratify the multi-concern R2 MEDIUM as a documented residual; advance to Phase 8.X closure judge per AGE-149 precedent. The auditor confirmed:
+  > "The R1 diluted-concern finding is not fully removed. `src-tauri/src/main.rs` still contains non-call-site edits: `#[allow(dead_code)]` annotations and drift-discovery comments... R2 adds a `DECISIONS.md` drift-discovery disposition that explains why this Tauri dead-code cleanup is deferred rather than absorbed. That reduces decomposition risk because the patch does not introduce new behavior and the drift is explicitly filed/proceed-with-note, but it does not make the `src-tauri/src/main.rs` hunk part of the AGE-160 component ownership boundary."
+- **Mitigation evidence**: `### AGE-160 — Drift-discovery disposition (Tauri compaction-backfill dead-code cluster)` (this DECISIONS.md, prior entry) plus the follow-up Linear ticket filed under labels `technical-debt, drift-discovery, age-160-spawned, src-tauri`.
+- **Canonical authority**: `~/ai/workflows/pr-review.md` § multi-concern (auditor explicitly does not require split when "no split recommended"); `~/ai/conventions/agent-questions-and-session-graph.md` § AskUserQuestion Permission-Denial (orchestrator-resolvable inputs stay inline); AGE-149 precedent for procedural MEDIUM ratification via DECISIONS.md.
+- **Four-condition equivalence check** (not the Phase-4 bootstrap-exception four conditions; these are the procedural-MEDIUM ratification fingerprint):
+  1. Auditor finding is procedural (annotation outside ownership boundary), not behavioral: TRUE.
+  2. No split recommended by the multi-concern auditor itself: TRUE.
+  3. Mitigation evidence exists (DECISIONS drift entry + follow-up Linear ticket): TRUE.
+  4. Resolution path is bounded (follow-up ticket restores caller or removes helpers; will not be re-absorbed into AGE-160): TRUE.
+- **Forbidden behaviors reaffirmed**:
+  - This ratification is bounded to the AGE-160 multi-concern MEDIUM specifically. NO precedent-citation of this ratification for other PR-review MEDIUMs without their own DECISIONS entry.
+  - NO scope expansion to absorb the dead-code cluster (the entire reason for the MEDIUM is that absorbing would violate the dispatch-brief anti-scope).
+  - NO silent re-add of `#[allow(dead_code)]` annotations in the follow-up ticket; the follow-up MUST restore callers or remove helpers.
+- **Evidence**:
+  - Multi-concern R2 report: `/home/nes/projects/agent-runner/planning/age-160-state-crate-residual-cleanup/risk/age-160-multi-concern.r2.md`
+  - Drift-discovery entry: this DECISIONS.md § `### AGE-160 — Drift-discovery disposition (Tauri compaction-backfill dead-code cluster)`
+  - Bootstrap-exception ratification: this DECISIONS.md § `### AGE-160 — Bootstrap exception ratification`
+  - AGE-149 precedent: this DECISIONS.md § `### AGE-149 — Drift discovery disposition (transcript-locator-parity -> AGE-157)` (file-and-proceed pattern for drift discovered during the WU)
+- **Revisit when**: never for AGE-160 specifically. The follow-up Linear ticket carries the cleanup obligation forward.
