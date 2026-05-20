@@ -33,6 +33,7 @@ use oulipoly_runtime::services::{
     DiagnosticsServiceOutput, DiagnosticsServiceRequest, ExecutorServiceRequest,
     InvocationLifecycleFinalizeRequest, InvocationLifecycleServicePort,
     InvocationLifecycleStartRequest, MigrationServiceOutput, MigrationServiceRequest,
+    RotationFailedReason,
     ResumeAcceptanceRequest, ResumeServiceOutput, ResumeServiceRequest, RoutingServicePort,
     RoutingServiceRequest, ServiceError, SessionExportServiceRequest, SessionLifecycleIngestMode,
     SessionLifecycleRequest, SessionLockFailure, SessionLockServiceRequest, SessionLockSuccess,
@@ -2260,7 +2261,10 @@ fn run_repl(
                     effective_cwd: &effective_spawn_cwd,
                     stderr: &mut migration_stderr,
                 }) {
-                Ok(MigrationServiceOutput::Migrated { segment: migrated }) => {
+                Ok(MigrationServiceOutput::Migrated { segment: migrated })
+                | Ok(MigrationServiceOutput::AutoRotated {
+                    segment: migrated, ..
+                }) => {
                     resolved.active_provider = migrated.target_provider.clone();
                     resolved.active_session_id = migrated.target_session_id.clone();
                     fallback_target = Some(
@@ -2268,8 +2272,11 @@ fn run_repl(
                             .map_err(format_resume_error)?,
                     );
                 }
-                Ok(MigrationServiceOutput::Stay)
-                | Ok(MigrationServiceOutput::DecisionFailed { .. }) => {}
+                Ok(MigrationServiceOutput::Stay) => {}
+                Ok(MigrationServiceOutput::RotationFailed { reason }) => {
+                    eprintln!("{}", format_rotation_failed_reason(&reason));
+                    return Ok(1);
+                }
                 Err(ServiceError::Dependency { message }) => {
                     eprintln!("migration failed: {message}");
                     return Ok(1);
@@ -2756,7 +2763,10 @@ fn run_resume(
                 effective_cwd: &effective_spawn_cwd,
                 stderr: &mut migration_stderr,
             }) {
-            Ok(MigrationServiceOutput::Migrated { segment: migrated }) => {
+            Ok(MigrationServiceOutput::Migrated { segment: migrated })
+            | Ok(MigrationServiceOutput::AutoRotated {
+                segment: migrated, ..
+            }) => {
                 resolved.active_provider = migrated.target_provider.clone();
                 resolved.active_session_id = migrated.target_session_id.clone();
                 target = match renderable_resume_execution_target(&resolved, &env.providers_cfg) {
@@ -2764,8 +2774,11 @@ fn run_resume(
                     Err(exit_code) => return Ok(exit_code),
                 };
             }
-            Ok(MigrationServiceOutput::Stay)
-            | Ok(MigrationServiceOutput::DecisionFailed { .. }) => {}
+            Ok(MigrationServiceOutput::Stay) => {}
+            Ok(MigrationServiceOutput::RotationFailed { reason }) => {
+                eprintln!("{}", format_rotation_failed_reason(&reason));
+                return Ok(1);
+            }
             Err(ServiceError::Dependency { message }) => {
                 eprintln!("migration failed: {message}");
                 return Ok(1);
@@ -3067,6 +3080,28 @@ fn read_provider_quota_state(
     provider_name: &str,
 ) -> Result<Option<oulipoly_state::QuotaRecord>, String> {
     state.get_quota(provider_name)
+}
+
+fn format_rotation_failed_reason(reason: &RotationFailedReason) -> String {
+    match reason {
+        RotationFailedReason::WorkingSetExhausted { candidates_tried } => format!(
+            "migration failed: working set exhausted after trying providers [{}]",
+            candidates_tried.join(", ")
+        ),
+        RotationFailedReason::ManualTargetNotInPool { target, pool } => format!(
+            "cannot rotate: provider \"{target}\" is not in model pool [{}]",
+            pool.join(", ")
+        ),
+        RotationFailedReason::ManualTargetNotMigratable { source, target } => format!(
+            "cannot rotate: {source} -> {target} is not a migratable storage-class pair"
+        ),
+        RotationFailedReason::ManualTargetIsSingleProviderPool { provider } => format!(
+            "cannot rotate: model pool has only one provider ({provider})"
+        ),
+        RotationFailedReason::ManualTargetActiveNotInPool { active } => format!(
+            "cannot rotate: session-active provider \"{active}\" is not in the model pool"
+        ),
+    }
 }
 
 fn quota_state_has_capacity(quota: Option<oulipoly_state::QuotaRecord>) -> bool {

@@ -98,12 +98,29 @@ pub struct MigrationServiceRequest<'a> {
 #[derive(Debug)]
 pub enum MigrationServiceOutput {
     Stay,
-    DecisionFailed {
-        warning: String,
-    },
     Migrated {
         segment: crate::migration::MigratedSegment,
     },
+    /// AGE-163 WU-A.2: the auto-rotate-on-quota-threshold path tried one or
+    /// more candidates that failed with `SourceMissing*`, advanced through
+    /// the working set, and succeeded against `segment.target_provider`.
+    AutoRotated {
+        segment: crate::migration::MigratedSegment,
+        candidates_tried: Vec<String>,
+    },
+    /// AGE-163 WU-A.2: the rotation request could not be honored.
+    RotationFailed {
+        reason: RotationFailedReason,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RotationFailedReason {
+    WorkingSetExhausted { candidates_tried: Vec<String> },
+    ManualTargetNotInPool { target: String, pool: Vec<String> },
+    ManualTargetNotMigratable { source: String, target: String },
+    ManualTargetIsSingleProviderPool { provider: String },
+    ManualTargetActiveNotInPool { active: String },
 }
 
 pub struct TraceServiceRequest<'a> {

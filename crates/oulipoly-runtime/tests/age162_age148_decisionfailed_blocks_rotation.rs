@@ -246,26 +246,42 @@ fn age162_decision_failed_does_not_block_quota_threshold_rotation() {
                  SourceMissingStorage+QuotaThreshold path under AGE-148");
 
     match &output {
-        MigrationServiceOutput::DecisionFailed { warning } => panic!(
-            "AGE-162 Symptoms 1+4: services::migration::migrate returned \
-             DecisionFailed on the auto-migrate-on-quota-threshold path with \
-             a SourceMissingStorage inner error. The src-tauri caller \
-             (`main.rs` lines 2271-2272 + 2767-2768) treats DecisionFailed \
-             as a Stay no-op, so this return value silently disables \
-             routing — root-attested as the AGE-148 regression of AGE-100's \
-             auto-rotate intent. Warning was: {warning:?}"
-        ),
         MigrationServiceOutput::Stay => panic!(
             "AGE-162 Symptoms 1+4: migration service returned Stay despite \
              decide_migration surfacing Migrate{{1, QuotaThreshold}}. AGE-100's \
              intent is to rotate when a healthier sibling exists; the caller \
-             needs a signal it can act on, not Stay."
+             needs a signal it can act on, not Stay (the silent-absorption \
+             failure mode AGE-148's DecisionFailed arm produced)."
         ),
         MigrationServiceOutput::Migrated { segment } => {
             // Acceptable: real migration succeeded by some other path.
-            // The contract this test pins is "NOT DecisionFailed"; an actual
+            // The contract this test pins is "NOT silent-Stay"; an actual
             // Migrated output would mean the bug is gone.
             assert_eq!(segment.target_provider, SIBLING);
+        }
+        MigrationServiceOutput::AutoRotated {
+            segment,
+            candidates_tried: _,
+        } => {
+            // AGE-163 WU-A.2: the seam now advances through the working set
+            // when the first chosen target fails with SourceMissing*. The
+            // sibling becomes the AutoRotated target.
+            assert_eq!(segment.target_provider, SIBLING);
+        }
+        MigrationServiceOutput::RotationFailed { reason } => {
+            // AGE-163 WU-A.2: when every working-set candidate also fails
+            // with SourceMissing* (as in this fixture — source JSONL is
+            // intentionally not staged for either provider), the seam emits
+            // a typed RotationFailed signal. This is the design-contract
+            // non-silent termination — the operator (or caller) sees a
+            // named diagnostic instead of the AGE-148 silent absorption.
+            // Either the seam succeeded (Migrated/AutoRotated above) or it
+            // explicitly reports working-set exhaustion here; the silent-Stay
+            // / silent-DecisionFailed regression is gone either way.
+            assert!(matches!(
+                reason,
+                oulipoly_runtime::services::RotationFailedReason::WorkingSetExhausted { .. }
+            ));
         }
     }
 }

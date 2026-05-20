@@ -1035,6 +1035,22 @@ fn quota_threshold_migration_decision(
     if best.provider_index == active_provider_index {
         return MigrationDecision::Stay;
     }
+    // AGE-163 WU-A.2: only rotate when the best sibling's projected load is
+    // strictly lower than the active provider's. The prior tie-break (lowest
+    // provider_index) forced a migration when both candidates were unlearned
+    // (load=0), which the new seam now surfaces as a working-set-exhaustion
+    // RotationFailed if the chosen sibling's source JSONL is missing. The
+    // design contract's "no rotation without reason" intent is preserved by
+    // requiring strict-better evidence.
+    let active_load = projections
+        .iter()
+        .find(|projection| projection.provider_index == active_provider_index)
+        .map(provider_load);
+    if let Some(active_load) = active_load
+        && provider_load(best) >= active_load
+    {
+        return MigrationDecision::Stay;
+    }
 
     migration_to(best.provider_index, TransitionReason::QuotaThreshold)
 }
