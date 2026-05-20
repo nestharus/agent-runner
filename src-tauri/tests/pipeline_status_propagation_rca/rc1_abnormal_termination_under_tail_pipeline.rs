@@ -55,10 +55,9 @@
 //! The recovery assertion deliberately ORs three independent channels so any
 //! of the four design options the rca-orchestrator considers downstream
 //! (terminal-envelope-last on stdout, mirrored stderr signal, filesystem
-//! `.result` artifact, or a hybrid) will turn the test green. The recognizer
-//! in `text_contains_terminal_envelope` accepts a wide range of marker
-//! shapes (`OULIPOLY_RESULT=`/`OULIPOLY_TERMINAL=`/`OULIPOLY_FINAL=`/raw
-//! `terminal_reason`/`exit_code`/etc.) so Phase 3 is not constrained.
+//! `.result` artifact, or a hybrid) will turn the test green when it emits
+//! exact `OULIPOLY_RESULT=`, exact `OULIPOLY_TERMINAL_SIGNAL=`, or strict
+//! filesystem result-artifact evidence for the killed invocation.
 //!
 //! ## Caveats / known gaps
 //!
@@ -83,15 +82,15 @@
 use std::io::Read;
 use std::process::{Child, ExitStatus, Output, Stdio};
 use std::thread;
-use std::thread::JoinHandle;
 use std::thread::sleep;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use oulipoly_state::{InvocationRecord, InvocationStatus};
 
 use super::{
-    PipelineFixture, filesystem_artifact_recovers_terminal, find_runner_pid_for_fixture,
-    list_files_recursive, poll_first_running_uuid, sigkill_pid, text_contains_terminal_envelope,
+    filesystem_artifact_recovers_terminal, find_runner_pid_for_fixture, list_files_recursive,
+    poll_first_running_uuid, sigkill_pid, text_contains_terminal_envelope, PipelineFixture,
 };
 
 /// Slow enough to give us a wide kill window even on a loaded CI runner; the
@@ -305,12 +304,7 @@ fn compute_recovery_predicate(
 
     // Channel A: did the pipeline's post-tail stdout surface a terminal
     // envelope for the killed invocation?
-    let channels = evaluate_recovery_channels_current_behavior(
-        fixture_pipeline,
-        pipeline,
-        fixture_direct,
-        direct,
-    );
+    let channels = evaluate_recovery_channels(fixture_pipeline, pipeline, fixture_direct, direct);
 
     // Snapshot the filesystem-artifact candidate trees for the failure
     // message — Phase 2 reads these to confirm no artifact exists.
@@ -414,7 +408,7 @@ impl RecoveryChannels {
     }
 }
 
-fn evaluate_recovery_channels_current_behavior(
+fn evaluate_recovery_channels(
     fixture_pipeline: &PipelineFixture,
     pipeline: &KillRunOutcome,
     fixture_direct: &PipelineFixture,

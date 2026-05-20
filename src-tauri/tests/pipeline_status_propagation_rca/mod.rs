@@ -12,6 +12,8 @@
 //! orchestration, validator.
 
 use oulipoly_state::StateDb;
+use serde_json::Value;
+use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -23,6 +25,12 @@ pub mod rc1_abnormal_termination_under_tail_pipeline;
 
 #[cfg(test)]
 pub mod age158_characterization;
+
+#[cfg(test)]
+pub mod recognizer_tightening_tests;
+
+#[path = "../age153_support/mod.rs"]
+mod age153_support;
 
 /// Tempdir-isolated fixture mirroring the shape used by
 /// `pr_a_invocation_integration.rs::Fixture`, with three additions for this
@@ -548,71 +556,149 @@ fn classify_fs_entry(metadata: &fs::Metadata) -> FsEntryKind {
     FsEntryKind::Other
 }
 
-/// A terminal-status "envelope" is any text artifact that names the
-/// invocation UUID AND surfaces a terminal-status signal (one of
-/// `terminal_reason`, `status=`, `success`, `exit_code`, or a marker that
-/// looks like `OULIPOLY_RESULT=`/`OULIPOLY_TERMINAL=`/`OULIPOLY_FINAL=`).
-///
-/// This deliberately accepts a wide range of envelope shapes so that any of
-/// the four Phase-3 fix-decision designs (envelope-last stdout marker,
-/// mirrored stderr signal, `.result` filesystem artifact, hybrid) will turn
-/// the test green without re-litigating the assertion.
+/// Recognize only shipped terminal evidence for the invocation: exact
+/// `OULIPOLY_TERMINAL_SIGNAL=` marker JSON, exact `OULIPOLY_RESULT=` marker
+/// JSON, or one-line raw result-envelope JSON with the strict AGE-153/154 key
+/// shape.
 pub fn text_contains_terminal_envelope(text: &str, invocation_uuid: &str) -> bool {
     text.lines().any(|line| {
-        line.contains(invocation_uuid)
-            && (line.contains("terminal_reason")
-                || line.contains("\"status\"")
-                || line.contains("status=")
-                || line.contains("exit_code")
-                || line.contains("\"success\"")
-                || line.contains("OULIPOLY_RESULT")
-                || line.contains("OULIPOLY_TERMINAL")
-                || line.contains("OULIPOLY_FINAL")
-                || line.contains("OULIPOLY_ENVELOPE"))
+        strict_marker_line_recovers_terminal(line, invocation_uuid)
+            || strict_raw_result_json_recovers_terminal(line, invocation_uuid)
     })
 }
 
-/// Returns true if any file under `root` either (a) contains the invocation
-/// UUID and a terminal-status keyword, or (b) has a name like
-/// `<uuid>.result` / `<uuid>.terminal` / `<uuid>.final.json`.
+/// Returns true if any file under `root` carries strict terminal evidence:
+/// a `.result` file containing raw result-envelope JSON, or any file
+/// containing an exact terminal-signal/result marker line.
 pub fn filesystem_artifact_recovers_terminal(root: &Path, invocation_uuid: &str) -> bool {
     list_files_recursive(root)
         .into_iter()
-        .any(|path| artifact_recovers_terminal_current_behavior(&path, invocation_uuid))
+        .any(|path| artifact_recovers_terminal(&path, invocation_uuid))
 }
 
-fn artifact_recovers_terminal_current_behavior(path: &Path, invocation_uuid: &str) -> bool {
-    artifact_filename_recovers_terminal_current_behavior(path, invocation_uuid)
-        || read_artifact_text(path)
-            .map(|contents| {
-                artifact_contents_recover_terminal_current_behavior(&contents, invocation_uuid)
-            })
-            .unwrap_or(false)
+fn artifact_recovers_terminal(path: &Path, invocation_uuid: &str) -> bool {
+    let role = classify_artifact_role(path);
+    read_artifact_text(path)
+        .map(|contents| artifact_contents_recover_terminal(role, &contents, invocation_uuid))
+        .unwrap_or(false)
 }
 
-fn artifact_filename_recovers_terminal_current_behavior(
-    path: &Path,
-    invocation_uuid: &str,
-) -> bool {
+enum ArtifactRole {
+    TerminalResultFile,
+    OtherArtifact,
+}
+
+fn classify_artifact_role(path: &Path) -> ArtifactRole {
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or_default();
-    name.contains(invocation_uuid)
-        && (name.ends_with(".result")
-            || name.ends_with(".terminal")
-            || name.ends_with(".final")
-            || name.ends_with(".final.json")
-            || name.ends_with(".envelope.json"))
+    if name.ends_with(".result") {
+        ArtifactRole::TerminalResultFile
+    } else {
+        ArtifactRole::OtherArtifact
+    }
 }
 
 fn read_artifact_text(path: &Path) -> std::io::Result<String> {
     fs::read_to_string(path)
 }
 
-fn artifact_contents_recover_terminal_current_behavior(
+fn artifact_contents_recover_terminal(
+    role: ArtifactRole,
     contents: &str,
     invocation_uuid: &str,
 ) -> bool {
-    text_contains_terminal_envelope(contents, invocation_uuid)
+    let raw_result_matches = matches!(role, ArtifactRole::TerminalResultFile)
+        && (strict_raw_result_json_recovers_terminal(contents, invocation_uuid)
+            || contents
+                .lines()
+                .any(|line| strict_raw_result_json_recovers_terminal(line, invocation_uuid)));
+
+    raw_result_matches
+        || contents
+            .lines()
+            .any(|line| strict_marker_line_recovers_terminal(line, invocation_uuid))
+}
+
+fn strict_marker_line_recovers_terminal(line: &str, invocation_uuid: &str) -> bool {
+    strict_terminal_signal_marker_recovers_terminal(line, invocation_uuid)
+        || strict_result_marker_recovers_terminal(line, invocation_uuid)
+}
+
+fn strict_terminal_signal_marker_recovers_terminal(line: &str, invocation_uuid: &str) -> bool {
+    let terminal_signal_lines = age153_support::terminal_signal_lines(line);
+    if terminal_signal_lines.len() != 1 || terminal_signal_lines[0] != line {
+        return false;
+    }
+
+    let Some(raw) = line.strip_prefix("OULIPOLY_TERMINAL_SIGNAL=") else {
+        return false;
+    };
+    serde_json::from_str(raw)
+        .ok()
+        .is_some_and(|value| is_terminal_signal_envelope_for_invocation(&value, invocation_uuid))
+}
+
+fn strict_result_marker_recovers_terminal(line: &str, invocation_uuid: &str) -> bool {
+    let Some(raw) = line.strip_prefix("OULIPOLY_RESULT=") else {
+        return false;
+    };
+    serde_json::from_str(raw)
+        .ok()
+        .is_some_and(|value| is_result_envelope_for_invocation(&value, invocation_uuid))
+}
+
+fn strict_raw_result_json_recovers_terminal(text: &str, invocation_uuid: &str) -> bool {
+    serde_json::from_str(text)
+        .ok()
+        .is_some_and(|value| is_result_envelope_for_invocation(&value, invocation_uuid))
+}
+
+fn is_terminal_signal_envelope_for_invocation(value: &Value, invocation_uuid: &str) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    if object_key_set(object) != BTreeSet::from(["evidence", "invocation_id", "kind", "session_id"])
+    {
+        return false;
+    }
+
+    value["invocation_id"].as_str() == Some(invocation_uuid)
+        && uuid::Uuid::parse_str(invocation_uuid).is_ok()
+        && value["evidence"].is_object()
+        && value["kind"].is_string()
+        && session_id_is_null_or_uuid(&value["session_id"])
+}
+
+fn is_result_envelope_for_invocation(value: &Value, invocation_uuid: &str) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    if object_key_set(object)
+        != BTreeSet::from([
+            "error_category",
+            "exit_code",
+            "finished_at",
+            "id",
+            "status",
+            "success",
+            "terminal_reason",
+        ])
+    {
+        return false;
+    }
+
+    value["id"].as_str() == Some(invocation_uuid)
+}
+
+fn object_key_set(object: &serde_json::Map<String, Value>) -> BTreeSet<&str> {
+    object.keys().map(String::as_str).collect()
+}
+
+fn session_id_is_null_or_uuid(value: &Value) -> bool {
+    value.is_null()
+        || value
+            .as_str()
+            .is_some_and(|session_id| uuid::Uuid::parse_str(session_id).is_ok())
 }
