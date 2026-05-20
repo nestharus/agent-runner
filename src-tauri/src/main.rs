@@ -5319,6 +5319,7 @@ fn backfill_compaction_session(
     provider_name: &str,
     session_id: &str,
 ) -> Result<u64, String> {
+    // AGE-160 Phase 8: rustfmt requires wrapping the pre-AGE-160 single-line chain.
     let evidence = state
         .compact_summary_evidence(session_id)
         .map_err(|e| e.to_string())?;
@@ -5351,12 +5352,18 @@ fn render_compaction_backfill_session(provider_name: &str, session_id: &str, fla
     );
 }
 
+// AGE-160 drift discovery: compaction-backfill helper has been dead since pre-AGE-160
+// baseline (commit 8922b652). Follow-up cleanup tracked in DECISIONS.md § AGE-160 -
+// Drift-discovery disposition.
 #[allow(dead_code)]
 struct CompactionBackfillEnvironment {
     sessions_cfg: oulipoly_config::SessionsConfig,
     models: HashMap<String, ModelConfig>,
 }
 
+// AGE-160 drift discovery: compaction-backfill helper has been dead since pre-AGE-160
+// baseline (commit 8922b652). Follow-up cleanup tracked in DECISIONS.md § AGE-160 -
+// Drift-discovery disposition.
 #[allow(dead_code)]
 fn load_compaction_backfill_environment() -> Result<CompactionBackfillEnvironment, String> {
     Ok(CompactionBackfillEnvironment {
@@ -5365,14 +5372,12 @@ fn load_compaction_backfill_environment() -> Result<CompactionBackfillEnvironmen
     })
 }
 
-#[allow(dead_code)]
 fn load_compaction_sessions_config() -> Result<oulipoly_config::SessionsConfig, String> {
     let sessions_path = default_config_root().join("sessions.toml");
     oulipoly_config::SessionsConfig::load(&sessions_path)
         .map_err(|e| format!("Failed to load {}: {e}", sessions_path.display()))
 }
 
-#[allow(dead_code)]
 fn load_compaction_models() -> Result<HashMap<String, ModelConfig>, String> {
     let models_dir = default_models_dir();
     if models_dir.is_dir() {
@@ -5382,6 +5387,9 @@ fn load_compaction_models() -> Result<HashMap<String, ModelConfig>, String> {
     }
 }
 
+// AGE-160 drift discovery: compaction-backfill helper has been dead since pre-AGE-160
+// baseline (commit 8922b652). Follow-up cleanup tracked in DECISIONS.md § AGE-160 -
+// Drift-discovery disposition.
 #[allow(dead_code)]
 fn locate_compaction_backfill_source(
     provider_name: &str,
@@ -5396,7 +5404,6 @@ fn locate_compaction_backfill_source(
     existing_storage_transcript_path(provider_name, session_id, models)
 }
 
-#[allow(dead_code)]
 fn existing_session_transcript_path(
     sessions_cfg: &oulipoly_config::SessionsConfig,
     provider_name: &str,
@@ -5409,7 +5416,6 @@ fn existing_session_transcript_path(
     existing_path(path)
 }
 
-#[allow(dead_code)]
 fn existing_storage_transcript_path(
     provider_name: &str,
     session_id: &str,
@@ -5421,7 +5427,6 @@ fn existing_storage_transcript_path(
     )?)
 }
 
-#[allow(dead_code)]
 fn matching_storage_providers<'a>(
     provider_name: &str,
     models: &'a HashMap<String, ModelConfig>,
@@ -5433,18 +5438,19 @@ fn matching_storage_providers<'a>(
         .collect()
 }
 
-#[allow(dead_code)]
 fn storage_transcript_path(providers: Vec<&ProviderConfig>, session_id: &str) -> Option<PathBuf> {
     providers.into_iter().find_map(|provider| {
         oulipoly_runtime::migration::find_claude_source_from_storage(provider, session_id)
     })
 }
 
-#[allow(dead_code)]
 fn existing_path(path: PathBuf) -> Option<PathBuf> {
     if path.exists() { Some(path) } else { None }
 }
 
+// AGE-160 drift discovery: compaction-backfill helper has been dead since pre-AGE-160
+// baseline (commit 8922b652). Follow-up cleanup tracked in DECISIONS.md § AGE-160 -
+// Drift-discovery disposition.
 #[allow(dead_code)]
 fn flag_compaction_boundaries_from_jsonl(
     state: &StateDb,
@@ -5464,13 +5470,11 @@ fn flag_compaction_boundaries_from_jsonl(
     Ok(flagged)
 }
 
-#[allow(dead_code)]
 fn read_compaction_jsonl_lines(path: &Path) -> Result<Vec<String>, String> {
     let file = open_compaction_source(path)?;
     collect_compaction_jsonl_lines(path, std::io::BufReader::new(file).lines())
 }
 
-#[allow(dead_code)]
 fn collect_compaction_jsonl_lines<I>(path: &Path, lines: I) -> Result<Vec<String>, String>
 where
     I: Iterator<Item = Result<String, std::io::Error>>,
@@ -5480,13 +5484,11 @@ where
         .collect()
 }
 
-#[allow(dead_code)]
 fn open_compaction_source(path: &Path) -> Result<std::fs::File, String> {
     std::fs::File::open(path)
         .map_err(|e| format!("Failed to open compaction source {}: {e}", path.display()))
 }
 
-#[allow(dead_code)]
 fn format_compaction_source_line_error(path: &Path, error: std::io::Error) -> String {
     format!(
         "Failed to read compaction source line from {}: {error}",
@@ -5494,7 +5496,6 @@ fn format_compaction_source_line_error(path: &Path, error: std::io::Error) -> St
     )
 }
 
-#[allow(dead_code)]
 fn flag_compaction_boundary(
     state: &StateDb,
     provider_name: &str,
@@ -5504,25 +5505,21 @@ fn flag_compaction_boundary(
     state.flag_compaction_boundary(provider_name, session_id, turn_id)
 }
 
-#[allow(dead_code)]
 fn compact_summary_turn_id(line: &str) -> Option<String> {
     let obj = parse_compaction_json_line(line)?;
     compact_summary_turn_uuid(&obj)
 }
 
-#[allow(dead_code)]
 fn parse_compaction_json_line(line: &str) -> Option<serde_json::Value> {
     serde_json::from_str::<serde_json::Value>(line).ok()
 }
 
-#[allow(dead_code)]
 fn is_compact_summary_json(obj: &serde_json::Value) -> bool {
     obj.get("isCompactSummary")
         .and_then(|value| value.as_bool())
         == Some(true)
 }
 
-#[allow(dead_code)]
 fn compact_summary_turn_uuid(obj: &serde_json::Value) -> Option<String> {
     if !is_compact_summary_json(obj) {
         return None;
@@ -5530,12 +5527,10 @@ fn compact_summary_turn_uuid(obj: &serde_json::Value) -> Option<String> {
     raw_compact_summary_uuid(obj).map(string_from_str)
 }
 
-#[allow(dead_code)]
 fn raw_compact_summary_uuid(obj: &serde_json::Value) -> Option<&str> {
     obj.get("uuid").and_then(|value| value.as_str())
 }
 
-#[allow(dead_code)]
 fn string_from_str(value: &str) -> String {
     value.to_string()
 }

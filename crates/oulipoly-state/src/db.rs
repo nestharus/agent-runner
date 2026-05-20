@@ -13077,6 +13077,75 @@ interactive_args = ["launch"]
         );
     }
 
+    /// AGE-160 risk: PP-001 push-pull + A2 READONLY_CANTLOCK projection.
+    /// Selected level: unit.
+    /// Source: Phase 8 PR-review remediation; covers the typed extended-code branch.
+    #[test]
+    fn age160_classify_read_only_open_error_via_typed_projection_readonly_cantlock() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.db");
+
+        age160_assert_wal_sidecar(
+            classify_read_only_open_error(
+                &path,
+                age160_sqlite_failure(
+                    sqlite::ffi::ErrorCode::ReadOnly,
+                    sqlite::ffi::SQLITE_READONLY_CANTLOCK,
+                    "readonly cantlock extended code without diagnostic-token dependency",
+                ),
+            ),
+            &path,
+        );
+    }
+
+    /// AGE-160 risk: PP-001 push-pull + A2 READONLY_RECOVERY projection.
+    /// Selected level: unit.
+    /// Source: Phase 8 PR-review remediation; covers the typed extended-code branch.
+    #[test]
+    fn age160_classify_read_only_open_error_via_typed_projection_readonly_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.db");
+
+        age160_assert_wal_sidecar(
+            classify_read_only_open_error(
+                &path,
+                age160_sqlite_failure(
+                    sqlite::ffi::ErrorCode::ReadOnly,
+                    sqlite::ffi::SQLITE_READONLY_RECOVERY,
+                    "readonly recovery extended code without diagnostic-token dependency",
+                ),
+            ),
+            &path,
+        );
+    }
+
+    /// AGE-160 risk: PP-001 push-pull + A2 owned SHM sidecar probe evidence.
+    /// Selected level: unit.
+    /// Source: Phase 8 PR-review remediation; validates the `shm_exists` probe path.
+    #[test]
+    fn age160_classify_read_only_open_error_via_typed_projection_shm_sidecar_probe_path_branch() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.db");
+        std::fs::write(&path, b"placeholder").unwrap();
+        std::fs::write(shm_path(&path), b"owned shm sidecar").unwrap();
+
+        assert!(
+            !wal_path(&path).exists(),
+            "fixture should exercise only the shm sidecar probe branch"
+        );
+        age160_assert_wal_sidecar(
+            classify_read_only_open_error(
+                &path,
+                age160_sqlite_failure(
+                    sqlite::ffi::ErrorCode::SystemIoFailure,
+                    sqlite::ffi::ErrorCode::SystemIoFailure as i32,
+                    "plain io failure text intentionally lacks sidecar tokens",
+                ),
+            ),
+            &path,
+        );
+    }
+
     /// AGE-160 risk: PP-001 push-pull + A2 SHM extended-code projection.
     /// Selected level: unit.
     /// Source: the AGE-160 proposal § Test-intent track; validates A2/A3.
