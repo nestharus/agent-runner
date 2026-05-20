@@ -4465,6 +4465,44 @@ impl StateDb {
         Ok(())
     }
 
+    pub fn next_round_robin_index_for_model(
+        &self,
+        model_name: &str,
+    ) -> Result<Option<usize>, String> {
+        let result = self.conn.query_row(
+            "SELECT last_index FROM model_round_robin_cursor WHERE model_name = ?1",
+            params![model_name],
+            |row| row.get::<_, i64>(0),
+        );
+        match result {
+            Ok(value) => usize::try_from(value)
+                .map(Some)
+                .map_err(|_| format!("Negative round-robin cursor for {model_name}")),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(format!("Failed to query round-robin cursor: {e}")),
+        }
+    }
+
+    pub fn advance_round_robin_index(
+        &self,
+        model_name: &str,
+        new_index: usize,
+        now: DateTime<Utc>,
+    ) -> Result<(), String> {
+        let ts = now.to_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO model_round_robin_cursor (model_name, last_index, updated_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT (model_name) DO UPDATE SET
+                    last_index = excluded.last_index,
+                    updated_at = excluded.updated_at",
+                params![model_name, new_index as i64, ts],
+            )
+            .map_err(|e| format!("Failed to advance round-robin cursor: {e}"))?;
+        Ok(())
+    }
+
     /// Fetch every rolling-quota window a provider has reported, ordered by
     /// `window_id`. Empty vec if the provider has never been refreshed.
     pub fn get_windows(&self, provider_name: &str) -> Result<Vec<QuotaWindow>, String> {
@@ -7650,6 +7688,34 @@ mod tests {
         assert_eq!(quota.last_refresh_at, Some(now));
         assert_eq!(quota.next_available_at, None);
         assert_eq!(quota.failure_class, None);
+    }
+
+    #[test]
+    fn next_round_robin_index_for_model_returns_none_on_unknown_model() {
+        let db = test_db();
+        assert_eq!(db.next_round_robin_index_for_model("nope").unwrap(), None);
+    }
+
+    #[test]
+    fn advance_round_robin_index_persists_across_db_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let now = Utc::now();
+        {
+            let db = StateDb::open(&path).unwrap();
+            db.advance_round_robin_index("claude-opus", 2, now).unwrap();
+        }
+        let db = StateDb::open(&path).unwrap();
+        assert_eq!(
+            db.next_round_robin_index_for_model("claude-opus").unwrap(),
+            Some(2)
+        );
+
+        db.advance_round_robin_index("claude-opus", 5, now).unwrap();
+        assert_eq!(
+            db.next_round_robin_index_for_model("claude-opus").unwrap(),
+            Some(5)
+        );
     }
 
     #[test]
