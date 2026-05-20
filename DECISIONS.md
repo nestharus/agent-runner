@@ -3297,3 +3297,25 @@ This is NOT residual acceptance, NOT precedent citation, and does NOT authorize 
   - No truncating filters / Python heredoc / shell-fanout in any Step 6c dispatch line.
 - **Rationale**: AGE-158 is a multi-round inherited-debt cleanup. The Phase 6 audit's strict single-pass mtime-ordering rule is designed for single-round Step 6c, not for the iterative refactor required to drive a 6-file inherited-debt aggregate from HIGH to LOW. The multi-round iteration is itself authorized by the bootstrap-exception's "post-merge satisfies new rule under new metric" condition; the supplemental Step 6c rounds 2-4 are the in-WU work that the post-merge condition referred to.
 - **Revisit when**: never. The topology-exception precedent is the documented disposition for multi-round Step 6c in inherited-debt cleanup WUs.
+# DECISIONS — AGE-159 (W5 RCA recognizer tightening)
+
+## AGE-159 — Phase 2.5 inheritance + mode propagation (2026-05-19)
+
+- **Inheritance**: AGE-159 inherits AGE-143's Phase 0-3 work via `predecessor_session_manifest_path`.
+- **Drift class**: content-refresh on harness surfaces (AGE-158 PR #116 merge 506bec44 reshaped helper layout/declared-roles); function signatures + scenario name unchanged at `text_contains_terminal_envelope`, `filesystem_artifact_recovers_terminal`, `terminal_status_recoverable_after_external_kill_under_tail_pipeline`.
+- **Risk-profile rollup**: HIGH (unchanged from AGE-143). HIGH carries on the two recognizer functions and adjacent production marker/artifact-emitter surfaces. AGE-158 LOWERED harness-helper risk by characterization + helper extraction but did not tighten the recognizers.
+- **skip_problem_map_gate=true**: routine problem-map approval step suppressed per user dispatch.
+- **Defer-to-prototype gate evaluation**: AGE-143's Phase 2.5 gate already fired four defer-signals; the user disposition there was "Proceed in exhaustive mode (test-only)". AGE-159's scope is the decomposed recognizer sliver (~4 findings, 3 SP); AGE-158 already absorbed the harness debt. The inherited disposition carries forward; no new value/scope question to surface.
+- **Mode propagation to Phase 3+**: exhaustive on the two recognizer functions in `mod.rs` + scenario thread-through in `rc1_*.rs`; AGE-153/154 ABI helpers + production code are anti-scope (inherited from AGE-143).
+
+## AGE-159 — Phase 4 R2 ACR-280 strategy selection (2026-05-19)
+
+- **Phase 4 R2 result**: BLOCKED — coupling LOW (intrinsic-surface rule applied), but push-pull HIGH (CQ-F01) + function-classification HIGH (CQ-F02) remain.
+- **Strategy selected**: `STRATEGY_PHASE4_CODE_QUALITY_INWU` for CQ-F01 + CQ-F02.
+- **Rationale**: CQ-F01 (broad recognizer pull in `text_contains_terminal_envelope` + `filesystem_artifact_recovers_terminal`) and CQ-F02 (multi-classifier function in `artifact_filename_recovers_terminal_current_behavior`) are EXACTLY AGE-159's in-scope deliverables (proposal § Test-intent track; ticket § Scope closure expectations). The pre-implementation Phase 4 gate cannot return PASS for a WU whose deliverable IS the metric fix. Phase 8 PR-review will gate the actual diff and verify both findings closed.
+- **Anti-options considered**:
+  - Bootstrap-exception: REJECTED — proposal explicitly forbids; dispatch prompt says "Unlikely needed".
+  - Follow-up tickets: REJECTED — AGE-159's purpose IS closing these two findings; filing follow-ups would defeat the WU.
+  - File-decomposition / move-and-import / helper-extraction: REJECTED — anti-scope per ticket (no harness refactor; AGE-158 owns).
+  - DECOMPOSED: REJECTED — would defeat AGE-159's terminal purpose (closing AGE-91 chain) and contradict the AGE-143 → AGE-158 + AGE-159 split rationale.
+- **Bridge for Phase 5 advance**: the strategy record is the orchestrator's recorded acknowledgment that the pre-implementation Phase 4 BLOCKED state is by design for this WU; Phase 6 implementation closes both findings; Phase 8 PR-review verifies post-implementation LOW.
