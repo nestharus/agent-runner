@@ -385,14 +385,14 @@ fn dispatch_subcommand(
         Subcommands::Repl {
             model,
             resume,
-            migrate,
+            rotate_provider,
             project,
             models_dir,
         } => run_repl(
             agent_runtime_services,
             model.as_deref(),
             resume.as_deref(),
-            migrate.as_deref(),
+            rotate_provider.as_deref(),
             project.as_deref(),
             models_dir.as_deref(),
         ),
@@ -400,7 +400,7 @@ fn dispatch_subcommand(
             model,
             session_id,
             chain_id,
-            migrate,
+            rotate_provider,
             prompt,
             file,
             project,
@@ -409,7 +409,7 @@ fn dispatch_subcommand(
             agent_runtime_services,
             model.as_deref(),
             resume_target_arg(session_id.as_deref(), chain_id.as_deref()),
-            migrate.as_deref(),
+            rotate_provider.as_deref(),
             prompt.as_deref(),
             file.as_deref(),
             project.as_deref(),
@@ -487,7 +487,7 @@ fn dispatch_top_level_resume(
             agent_runtime_services,
             cli.model.as_deref(),
             session_id,
-            cli.migrate.as_deref(),
+            cli.rotate_provider.as_deref(),
             positional_or_stdin_prompt.as_deref(),
             cli.file.as_deref(),
             cli.project.as_deref(),
@@ -497,7 +497,7 @@ fn dispatch_top_level_resume(
             agent_runtime_services,
             cli.model.as_deref(),
             Some(session_id),
-            cli.migrate.as_deref(),
+            cli.rotate_provider.as_deref(),
             cli.project.as_deref(),
             cli.models_dir.as_deref(),
         ),
@@ -6062,7 +6062,7 @@ mod tests {
             Some(Subcommands::Repl {
                 model,
                 resume,
-                migrate: _,
+                rotate_provider: _,
                 project,
                 models_dir,
             }) => {
@@ -6215,7 +6215,7 @@ mod tests {
             Some(Subcommands::Resume {
                 model,
                 session_id: parsed_session,
-                migrate: _,
+                rotate_provider: _,
                 prompt,
                 file,
                 project,
@@ -6545,12 +6545,12 @@ mod tests {
 
     // risk: CLI surface; level: unit; source: proposal §11.1 CLI surface / A8.
     #[test]
-    fn top_level_resume_parse_allows_missing_model_and_migrate_flag() {
+    fn top_level_resume_parse_allows_missing_model_and_rotate_provider_flag() {
         let cli = Cli::try_parse_from([
             "oulipoly-agent-runner",
             "--resume",
             "5169694d-de0f-40d1-890c-6e28e55bab27",
-            "--migrate",
+            "--rotate-provider",
             "claude2",
             "continue",
         ])
@@ -6562,7 +6562,7 @@ mod tests {
             cli.resume.as_deref(),
             Some("5169694d-de0f-40d1-890c-6e28e55bab27")
         );
-        assert_eq!(cli.migrate.as_deref(), Some("claude2"));
+        assert_eq!(cli.rotate_provider.as_deref(), Some("claude2"));
     }
 
     // risk: CLI surface; level: unit; source: proposal §11.1 CLI surface / A5, A8.

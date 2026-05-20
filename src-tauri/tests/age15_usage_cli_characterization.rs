@@ -337,8 +337,13 @@ fn usage_rejected_with_top_level_resume() {
 }
 
 #[test]
-fn usage_rejected_with_top_level_migrate_flag() {
-    clap_rejects(&["oulipoly-agent-runner", "--usage", "--migrate", "claude2"]);
+fn usage_rejected_with_top_level_rotate_provider_flag() {
+    clap_rejects(&[
+        "oulipoly-agent-runner",
+        "--usage",
+        "--rotate-provider",
+        "claude2",
+    ]);
 }
 
 #[test]

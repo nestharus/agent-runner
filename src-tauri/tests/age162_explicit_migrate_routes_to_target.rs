@@ -216,16 +216,19 @@ prompt_mode = "stdin"
     }
 
     fn run_resume_with_migrate(&self, target_provider: &str) -> Output {
+        // AGE-163 WU-A.6: the per-dispatch rotation flag was renamed from
+        // `--migrate` to `--rotate-provider` in lockstep with this driver
+        // update; the assertion bodies below are preserved verbatim.
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
         cmd.arg("-m")
             .arg(MODEL_NAME)
             .arg("--resume")
             .arg(SESSION_ID)
-            .arg("--migrate")
+            .arg("--rotate-provider")
             .arg(target_provider)
             .arg("--models-dir")
             .arg(&self.models_dir)
-            .arg("manual rotate via --migrate flag");
+            .arg("manual rotate via --rotate-provider flag");
         cmd.current_dir(self.dir.path());
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
