@@ -8,10 +8,11 @@ use super::errors::locator_error_to_metadata_error;
 use super::locator::{
     LocatedTranscript, LocatorError, LocatorSource, SessionsConfigLocator, TranscriptLocator,
     TranscriptLookupMode, TranscriptRequest, TranscriptScriptLocator, UnsupportedStorageReason,
+    locate_claude_by_content, locate_codex_by_content, located, single_jsonl_match,
 };
 use super::{MetadataError, SessionStorageType, registry};
 use oulipoly_config::{SessionSourceEntry, SessionStorage, SessionsConfig};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub(super) fn available_jsonl_path(
     sessions_cfg: &SessionsConfig,
@@ -118,13 +119,69 @@ fn locate_jsonl_path_from_registry(
     source: LocatorSource,
 ) -> Result<LocatedTranscript, LocatorError> {
     let registry = registry::registry_for_provider_storage(request.provider, request.storage)?;
-    registry.locate(
+    let registry_result = registry.locate(
         request.provider,
         &request.session_id,
         storage_type,
         source,
         request.mode,
+    );
+    if !is_registry_not_found(&registry_result, source) {
+        return registry_result;
+    }
+    locate_via_content_fallback(request, storage_type, source)
+}
+
+fn is_registry_not_found(
+    result: &Result<LocatedTranscript, LocatorError>,
+    source: LocatorSource,
+) -> bool {
+    matches!(
+        result,
+        Err(LocatorError::NotFound { source: error_source, .. }) if *error_source == source
     )
+}
+
+// AGE-157: parity with `scripts/claude-code-locate-transcript` and
+// `scripts/codex-locate-transcript`, which fall back to scanning JSONL
+// content for the session id when filename-derived lookup misses.
+fn locate_via_content_fallback(
+    request: &TranscriptRequest,
+    storage_type: SessionStorageType,
+    source: LocatorSource,
+) -> Result<LocatedTranscript, LocatorError> {
+    let matches = content_fallback_matches(request.storage, &request.session_id, source)?;
+    let path = single_jsonl_match(source, &request.session_id, matches)?;
+    Ok(located(path, storage_type, request.mode))
+}
+
+fn content_fallback_matches(
+    storage: Option<&SessionStorage>,
+    session_id: &str,
+    source: LocatorSource,
+) -> Result<Vec<PathBuf>, LocatorError> {
+    match (storage, source) {
+        (Some(SessionStorage::ClaudeCode { projects_dir }), LocatorSource::Claude) => {
+            content_fallback_dir(projects_dir)
+                .and_then(|dir| locate_claude_by_content(&dir, session_id))
+        }
+        (Some(SessionStorage::Codex { sessions_dir }), LocatorSource::Codex) => {
+            content_fallback_dir(sessions_dir)
+                .and_then(|dir| locate_codex_by_content(&dir, session_id))
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn content_fallback_dir(dir: &Path) -> Result<PathBuf, LocatorError> {
+    dir.canonicalize().map_err(|error| LocatorError::Io {
+        kind: error.kind(),
+        path: dir.to_path_buf(),
+        message: format!(
+            "transcript_content_fallback_dir_unavailable: {}: {error}",
+            dir.display()
+        ),
+    })
 }
 
 fn no_locator_for_unknown_storage_error() -> LocatorError {

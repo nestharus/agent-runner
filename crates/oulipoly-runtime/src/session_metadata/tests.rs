@@ -818,3 +818,186 @@ fn metadata_error_reason(err: &MetadataError) -> &str {
         other => panic!("expected unsupported storage, got {other:?}"),
     }
 }
+
+// AGE-157: content-fallback parity with the shell locators
+// (`scripts/claude-code-locate-transcript`, `scripts/codex-locate-transcript`).
+// When the filename-derived lookup misses, the Rust locator must scan JSONL
+// content for a session_id record — matching the scripts' defensive fallback.
+
+#[test]
+fn claude_content_fallback_locates_transcript_when_filename_misses() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+    let projects_dir = dir.path().join("claude-projects");
+    let project_subdir = projects_dir.join("-home-nes-projects-renamed");
+    std::fs::create_dir_all(&project_subdir).unwrap();
+    let jsonl_path = project_subdir.join("unrelated-filename.jsonl");
+    std::fs::write(&jsonl_path, claude_content_fallback_body(session_id)).unwrap();
+    let storage = SessionStorage::ClaudeCode { projects_dir };
+
+    let located =
+        locate_jsonl_path_from_storage(Some(&storage), "claude", session_id, true).unwrap();
+
+    assert_eq!(located, jsonl_path.canonicalize().unwrap());
+}
+
+#[test]
+fn claude_content_fallback_reports_not_found_when_no_session_id_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+    let projects_dir = dir.path().join("claude-projects");
+    let project_subdir = projects_dir.join("-some-project");
+    std::fs::create_dir_all(&project_subdir).unwrap();
+    std::fs::write(
+        project_subdir.join("other-session.jsonl"),
+        claude_content_fallback_body("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"),
+    )
+    .unwrap();
+    let storage = SessionStorage::ClaudeCode { projects_dir };
+
+    let err =
+        locate_jsonl_path_from_storage(Some(&storage), "claude", session_id, true).unwrap_err();
+
+    assert_reason_eq(&err, "claude_storage_scan_not_found");
+}
+
+#[test]
+fn claude_filename_match_takes_precedence_over_content_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+    let projects_dir = dir.path().join("claude-projects");
+    let project_subdir = projects_dir.join("-some-project");
+    std::fs::create_dir_all(&project_subdir).unwrap();
+    let filename_match = project_subdir.join(format!("{session_id}.jsonl"));
+    std::fs::write(&filename_match, "{}\n").unwrap();
+    std::fs::write(
+        project_subdir.join("other-recorded.jsonl"),
+        claude_content_fallback_body(session_id),
+    )
+    .unwrap();
+    let storage = SessionStorage::ClaudeCode { projects_dir };
+
+    let located =
+        locate_jsonl_path_from_storage(Some(&storage), "claude", session_id, true).unwrap();
+
+    assert_eq!(located, filename_match.canonicalize().unwrap());
+}
+
+#[test]
+fn codex_content_fallback_locates_rollout_when_filename_misses() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_id = "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22";
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let sessions_dir = dir.path().join("codex-sessions");
+    let rollout_dir = sessions_dir.join("2026").join("05").join("20");
+    std::fs::create_dir_all(&rollout_dir).unwrap();
+    let jsonl_path = rollout_dir.join("rollout-2026-05-20-no-uuid.jsonl");
+    std::fs::write(&jsonl_path, codex_rollout_body(&workspace, session_id)).unwrap();
+    let storage = SessionStorage::Codex { sessions_dir };
+
+    let located =
+        locate_jsonl_path_from_storage(Some(&storage), "codex", session_id, true).unwrap();
+
+    assert_eq!(located, jsonl_path.canonicalize().unwrap());
+}
+
+#[test]
+fn codex_content_fallback_skips_records_with_mismatched_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_id = "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22";
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let sessions_dir = dir.path().join("codex-sessions");
+    let rollout_dir = sessions_dir.join("2026").join("05").join("20");
+    std::fs::create_dir_all(&rollout_dir).unwrap();
+    let jsonl_path = rollout_dir.join("rollout-2026-05-20-no-uuid.jsonl");
+    std::fs::write(
+        &jsonl_path,
+        format!("{{\"type\":\"turn\",\"payload\":{{\"id\":\"{session_id}\"}}}}\n"),
+    )
+    .unwrap();
+    let storage = SessionStorage::Codex { sessions_dir };
+
+    let err =
+        locate_jsonl_path_from_storage(Some(&storage), "codex", session_id, true).unwrap_err();
+
+    assert_reason_eq(&err, "codex_storage_scan_not_found");
+}
+
+#[test]
+fn codex_content_fallback_ignores_non_rollout_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_id = "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22";
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let sessions_dir = dir.path().join("codex-sessions");
+    let nested = sessions_dir.join("nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    let non_rollout = nested.join("other-2026-05-20.jsonl");
+    std::fs::write(&non_rollout, codex_rollout_body(&workspace, session_id)).unwrap();
+    let storage = SessionStorage::Codex { sessions_dir };
+
+    let err =
+        locate_jsonl_path_from_storage(Some(&storage), "codex", session_id, true).unwrap_err();
+
+    assert_reason_eq(&err, "codex_storage_scan_not_found");
+}
+
+#[test]
+fn claude_storage_locator_trait_impl_uses_content_fallback() {
+    use super::locator::{
+        ClaudeStorageLocator, TranscriptLocator, TranscriptLookupMode, TranscriptRequest,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+    let projects_dir = dir.path().join("claude-projects");
+    let project_subdir = projects_dir.join("-renamed-after-resume");
+    std::fs::create_dir_all(&project_subdir).unwrap();
+    let jsonl_path = project_subdir.join("renamed.jsonl");
+    std::fs::write(&jsonl_path, claude_content_fallback_body(session_id)).unwrap();
+    let storage = SessionStorage::ClaudeCode { projects_dir };
+    let request = TranscriptRequest {
+        provider: "claude",
+        session_id: session_id.to_string(),
+        storage: Some(&storage),
+        sessions_config_locator: None,
+        mode: TranscriptLookupMode::RequireExisting,
+    };
+
+    let located = ClaudeStorageLocator.locate_jsonl(&request).unwrap();
+
+    assert_eq!(located.path, jsonl_path.canonicalize().unwrap());
+}
+
+#[test]
+fn codex_storage_locator_trait_impl_uses_content_fallback() {
+    use super::locator::{
+        CodexStorageLocator, TranscriptLocator, TranscriptLookupMode, TranscriptRequest,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let session_id = "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22";
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let sessions_dir = dir.path().join("codex-sessions");
+    let rollout_dir = sessions_dir.join("2026").join("05");
+    std::fs::create_dir_all(&rollout_dir).unwrap();
+    let jsonl_path = rollout_dir.join("rollout-no-uuid-in-name.jsonl");
+    std::fs::write(&jsonl_path, codex_rollout_body(&workspace, session_id)).unwrap();
+    let storage = SessionStorage::Codex { sessions_dir };
+    let request = TranscriptRequest {
+        provider: "codex",
+        session_id: session_id.to_string(),
+        storage: Some(&storage),
+        sessions_config_locator: None,
+        mode: TranscriptLookupMode::RequireExisting,
+    };
+
+    let located = CodexStorageLocator.locate_jsonl(&request).unwrap();
+
+    assert_eq!(located.path, jsonl_path.canonicalize().unwrap());
+}
+
+fn claude_content_fallback_body(session_id: &str) -> String {
+    format!("{{\"type\":\"summary\"}}\n{{\"sessionId\":\"{session_id}\",\"role\":\"assistant\"}}\n")
+}

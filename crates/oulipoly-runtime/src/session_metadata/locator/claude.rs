@@ -5,8 +5,8 @@
 
 use super::{
     LocatedTranscript, LocatorError, LocatorSource, SessionStorageType, TranscriptLocator,
-    TranscriptLookupMode, TranscriptRequest, UnsupportedStorageReason, located, no_locator,
-    single_jsonl_match, validate_jsonl_path,
+    TranscriptLookupMode, TranscriptRequest, UnsupportedStorageReason, locate_claude_by_content,
+    located, no_locator, single_jsonl_match, validate_jsonl_path,
 };
 use oulipoly_config::SessionStorage;
 use std::fs::{DirEntry, ReadDir};
@@ -19,10 +19,21 @@ impl TranscriptLocator for ClaudeStorageLocator {
     fn locate_jsonl(&self, request: &TranscriptRequest) -> Result<LocatedTranscript, LocatorError> {
         let projects_dir = require_claude_projects_dir(request.storage)?;
         let projects_dir = canonical_claude_projects_dir(projects_dir)?;
-        let matches = collect_claude_transcript_matches(&projects_dir, &request.session_id)?;
+        let matches = claude_filename_or_content_matches(&projects_dir, &request.session_id)?;
         let path = single_jsonl_match(LocatorSource::Claude, &request.session_id, matches)?;
         Ok(located(path, SessionStorageType::ClaudeCode, request.mode))
     }
+}
+
+fn claude_filename_or_content_matches(
+    projects_dir: &Path,
+    session_id: &str,
+) -> Result<Vec<PathBuf>, LocatorError> {
+    let filename_matches = collect_claude_transcript_matches(projects_dir, session_id)?;
+    if !filename_matches.is_empty() {
+        return Ok(filename_matches);
+    }
+    locate_claude_by_content(projects_dir, session_id)
 }
 
 fn require_claude_projects_dir(storage: Option<&SessionStorage>) -> Result<&PathBuf, LocatorError> {

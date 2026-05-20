@@ -5,8 +5,8 @@
 
 use super::{
     LocatedTranscript, LocatorError, LocatorSource, SessionStorageType, TranscriptLocator,
-    TranscriptLookupMode, TranscriptRequest, UnsupportedStorageReason, located, no_locator,
-    single_jsonl_match, validate_jsonl_path,
+    TranscriptLookupMode, TranscriptRequest, UnsupportedStorageReason, locate_codex_by_content,
+    located, no_locator, single_jsonl_match, validate_jsonl_path,
 };
 use oulipoly_config::SessionStorage;
 use std::fs::{DirEntry, ReadDir};
@@ -19,7 +19,7 @@ impl TranscriptLocator for CodexStorageLocator {
     fn locate_jsonl(&self, request: &TranscriptRequest) -> Result<LocatedTranscript, LocatorError> {
         let sessions_dir = require_codex_sessions_dir(request.storage)?;
         let sessions_dir = canonical_codex_sessions_dir(sessions_dir)?;
-        let matches = collect_codex_rollout_matches(&sessions_dir, &request.session_id)?;
+        let matches = codex_filename_or_content_matches(&sessions_dir, &request.session_id)?;
         let path = single_jsonl_match(LocatorSource::Codex, &request.session_id, matches)?;
         Ok(located(
             path,
@@ -27,6 +27,17 @@ impl TranscriptLocator for CodexStorageLocator {
             request.mode,
         ))
     }
+}
+
+fn codex_filename_or_content_matches(
+    sessions_dir: &Path,
+    session_id: &str,
+) -> Result<Vec<PathBuf>, LocatorError> {
+    let filename_matches = collect_codex_rollout_matches(sessions_dir, session_id)?;
+    if !filename_matches.is_empty() {
+        return Ok(filename_matches);
+    }
+    locate_codex_by_content(sessions_dir, session_id)
 }
 
 fn require_codex_sessions_dir(storage: Option<&SessionStorage>) -> Result<&PathBuf, LocatorError> {
