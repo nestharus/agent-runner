@@ -302,6 +302,21 @@ exhaustive coverage for small single axes, smart samples for cross-window
 binding pressure, and residual documentation for omitted cartesian cells in
 `planning/age-59-routing-test-expansion/routing-test-existing-coverage.md`.
 
+## Test-audit infrastructure
+
+`planning/coverage/spec-*.md` is the project's behavior-spec schema consumed by
+`~/ai/agents/test-audit-gate.md` § 4 ("Discover Candidate Specs"). Each spec
+lists the source files for one Rust surface under `## Source files`; the
+auditor's `rg --fixed-strings` discovery matches changed paths against those
+sections. See `planning/coverage/README.md` for the index, schema, and the
+authoring procedure for adding a new spec when a new surface is introduced.
+
+CI coverage baseline is produced by `.github/workflows/coverage.yml`
+(`cargo-llvm-cov --workspace`, lcov + cobertura + JSON summary in the
+`rust-coverage` artifact). The audit gate consumes the artifact via
+`gh api ... workflow_runs?head_sha=...` (PR) and `branch=main&event=push`
+(baseline). Frontend coverage is intentionally not wired here.
+
 ## Rust Workspace Structure
 
 ```
