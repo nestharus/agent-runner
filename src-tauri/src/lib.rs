@@ -7,6 +7,7 @@ use oulipoly_config::repositories::{
     FilesystemProvidersConfigRepository, ProvidersConfigRepository,
 };
 use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig, ProvidersConfig};
+use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind;
 use oulipoly_runtime::services::{
     DiagnosticsServiceOutput, DiagnosticsServicePort, DiagnosticsServiceRequest,
     ExecutorServicePort, ExecutorServiceRequest, QuotaServicePort, QuotaServiceRequest,
@@ -694,17 +695,30 @@ fn test_model_with_db_path(
         .map_err(|error| error.to_string())?
         .result;
     if result.exit_code != 0 {
-        let diagnostic_input = diagnostic_input(&result.stderr, &result.stdout);
-        let DiagnosticsServiceOutput::ExhaustionClassification { is_exhausted } = services
-            .diagnostics_service
-            .diagnose(DiagnosticsServiceRequest::ClassifyExhaustion {
-                stderr: diagnostic_input,
-            })
-            .map_err(|error| error.to_string())?
-        else {
-            return Err("Diagnostics service returned unexpected output".to_string());
+        // AGE-156: typed-signal precedence consolidation. The AGE-162 WU-B
+        // partitioned recognizer in claude/codex/openai_compat emits
+        // `QuotaExhaustedInband` for persistent quota signatures and
+        // `RateLimited` for transient HTTP 429 / rate-limit signatures. Only
+        // the persistent-quota kind is authoritative for the durable
+        // `provider_quotas.exhausted_at` write here. When the typed signal is
+        // absent (degraded mode), fall back to the legacy broad-string
+        // classifier.
+        let should_mark_exhausted = if let Some(signal) = result.terminal_signal.as_ref() {
+            matches!(signal.kind, TerminalSignalKind::QuotaExhaustedInband)
+        } else {
+            let diagnostic_input = diagnostic_input(&result.stderr, &result.stdout);
+            let DiagnosticsServiceOutput::ExhaustionClassification { is_exhausted } = services
+                .diagnostics_service
+                .diagnose(DiagnosticsServiceRequest::ClassifyExhaustion {
+                    stderr: diagnostic_input,
+                })
+                .map_err(|error| error.to_string())?
+            else {
+                return Err("Diagnostics service returned unexpected output".to_string());
+            };
+            is_exhausted
         };
-        if is_exhausted {
+        if should_mark_exhausted {
             <StateDb as ProviderQuotaRepository>::mark_exhausted(&db, &provider.name)?;
         }
     }
@@ -1089,8 +1103,9 @@ mod tests {
     };
     use oulipoly_runtime::executor::{
         CapturedChildInvocation, ExecutionResult, ResumeAcceptanceResult, SessionCaptureMethod,
-        SessionCaptureResult,
+        SessionCaptureResult, TerminalSignal,
     };
+    use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind as TestTerminalSignalKind;
     use oulipoly_runtime::services::{
         DiagnosticsServiceOutput, DiagnosticsServicePort, DiagnosticsServiceRequest,
         ExecutorServiceOutput, ExecutorServicePort, ExecutorServiceRequest, QuotaServiceOutput,
@@ -1462,6 +1477,35 @@ mod tests {
 
     impl StubExecutorService {
         fn with_exit(exit_code: i32, stdout: &[u8], stderr: &str) -> Self {
+            Self::with_optional_signal(exit_code, stdout, stderr, None)
+        }
+
+        fn with_signal(
+            exit_code: i32,
+            stdout: &[u8],
+            stderr: &str,
+            kind: TestTerminalSignalKind,
+            provider_name: &str,
+        ) -> Self {
+            Self::with_optional_signal(
+                exit_code,
+                stdout,
+                stderr,
+                Some(TerminalSignal {
+                    kind,
+                    provider_name: provider_name.to_string(),
+                    evidence: format!("age156 stub {:?}", kind),
+                    observed_at: std::time::SystemTime::UNIX_EPOCH,
+                }),
+            )
+        }
+
+        fn with_optional_signal(
+            exit_code: i32,
+            stdout: &[u8],
+            stderr: &str,
+            terminal_signal: Option<TerminalSignal>,
+        ) -> Self {
             Self {
                 calls: Mutex::new(Vec::new()),
                 output: Mutex::new(Some(ExecutionResult {
@@ -1475,7 +1519,7 @@ mod tests {
                     },
                     resume_acceptance: None::<ResumeAcceptanceResult>,
                     terminal_reason: None,
-                    terminal_signal: None,
+                    terminal_signal,
                     captured_child_invocations: Vec::<CapturedChildInvocation>::new(),
                     returned_artifacts: Vec::new(),
                 })),
@@ -2260,6 +2304,131 @@ mod tests {
             .unwrap()
             .expect("exhaustion marking should create a quota row");
         assert!(quota.exhausted_at.is_some());
+    }
+
+    #[test]
+    fn age156_test_model_typed_rate_limited_signal_does_not_mark_exhausted_even_when_legacy_classifier_would()
+     {
+        // AGE-156: typed-signal precedence over legacy broad-string classifier.
+        //
+        // Scenario: the partitioned recognizer (AGE-162 WU-B) emits
+        // `TerminalSignalKind::RateLimited` for a transient HTTP 429 / rate-limit
+        // signature. The legacy `classify_exhaustion` classifier — left as the
+        // degraded-mode fallback — still returns true for this stderr (it
+        // matches the broad `"rate limit"` / `"too many requests"` patterns
+        // historically). Under the AGE-156 consolidation, the typed signal is
+        // AUTHORITATIVE, so the durable `exhausted_at` write MUST NOT happen
+        // and the legacy classifier MUST NOT be consulted at all.
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let db_path = dir.path().join("state.db");
+        let db = StateDb::open(&db_path).unwrap();
+        db.upsert_quota_refresh("age156-provider", &[]).unwrap();
+        drop(db);
+        let model = make_model("age156-model", &["age156-provider"]);
+        let opener = StubStateDbOpener::opening(db_path.clone());
+        let providers = StubProvidersConfigRepository::default();
+        let routing = StubRoutingService::selecting(0);
+        let executor = StubExecutorService::with_signal(
+            7,
+            b"",
+            "HTTP 429: too many requests. rate_limit_error encountered.",
+            TestTerminalSignalKind::RateLimited,
+            "age156-provider",
+        );
+        // Stub returns `true` to prove the typed signal wins even when the
+        // legacy classifier would write `exhausted_at`. With the typed-signal
+        // precedence in place, this stub must never be called.
+        let diagnostics = StubDiagnosticsService::returning(true);
+        let services = TestModelServices {
+            state_db_opener: &opener,
+            providers_repository: &providers,
+            routing_service: &routing,
+            executor_service: &executor,
+            diagnostics_service: &diagnostics,
+        };
+
+        let result =
+            super::test_model_with_db_path(services, model, models_dir, db_path.clone(), "hello")
+                .expect("rate-limited typed signal should still return a result");
+
+        assert!(!result.success);
+        assert_eq!(result.exit_code, 7);
+        assert!(
+            diagnostics.calls().is_empty(),
+            "typed terminal signal must short-circuit the legacy classifier; \
+             diagnostics calls observed: {:?}",
+            diagnostics.calls()
+        );
+        let quota = StateDb::open(&db_path)
+            .unwrap()
+            .get_quota("age156-provider")
+            .unwrap()
+            .expect("quota row should remain present");
+        assert!(
+            quota.exhausted_at.is_none(),
+            "transient RateLimited typed signal must NOT flip exhausted_at — \
+             the AGE-156 consolidation gates the durable write behind the \
+             persistent-quota typed kind only"
+        );
+    }
+
+    #[test]
+    fn age156_test_model_typed_quota_exhausted_inband_signal_marks_exhausted_even_when_legacy_classifier_would_not()
+     {
+        // AGE-156 branch-coverage companion to the rate-limit case above.
+        //
+        // Scenario: the partitioned recognizer emits
+        // `TerminalSignalKind::QuotaExhaustedInband` for a canonical persistent
+        // quota signature. The legacy classifier stub is rigged to return
+        // `false` (i.e., would have refused to mark exhausted). The typed
+        // signal MUST still drive the durable `exhausted_at` write, and the
+        // legacy classifier MUST NOT be consulted.
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let db_path = dir.path().join("state.db");
+        let model = make_model("age156-model", &["age156-provider"]);
+        let opener = StubStateDbOpener::opening(db_path.clone());
+        let providers = StubProvidersConfigRepository::default();
+        let routing = StubRoutingService::selecting(0);
+        let executor = StubExecutorService::with_signal(
+            7,
+            b"",
+            "Claude usage limit reached for your account.",
+            TestTerminalSignalKind::QuotaExhaustedInband,
+            "age156-provider",
+        );
+        let diagnostics = StubDiagnosticsService::returning(false);
+        let services = TestModelServices {
+            state_db_opener: &opener,
+            providers_repository: &providers,
+            routing_service: &routing,
+            executor_service: &executor,
+            diagnostics_service: &diagnostics,
+        };
+
+        let result =
+            super::test_model_with_db_path(services, model, models_dir, db_path.clone(), "hello")
+                .expect("quota-exhausted typed signal should return a result");
+
+        assert!(!result.success);
+        assert!(
+            diagnostics.calls().is_empty(),
+            "typed terminal signal must short-circuit the legacy classifier; \
+             diagnostics calls observed: {:?}",
+            diagnostics.calls()
+        );
+        let quota = StateDb::open(&db_path)
+            .unwrap()
+            .get_quota("age156-provider")
+            .unwrap()
+            .expect("exhaustion marking should create a quota row");
+        assert!(
+            quota.exhausted_at.is_some(),
+            "persistent QuotaExhaustedInband typed signal must flip exhausted_at"
+        );
     }
 
     #[test]
