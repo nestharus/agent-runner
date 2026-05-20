@@ -1631,6 +1631,7 @@ fn terminal_reason_from_signal(
     match signal.kind {
         TerminalSignalKind::ProlongedSilence => Some("bounded_silence".to_string()),
         TerminalSignalKind::QuotaExhaustedInband => Some("quota_exhausted_inband".to_string()),
+        TerminalSignalKind::RateLimited => Some("rate_limited".to_string()),
         TerminalSignalKind::CleanExit
         | TerminalSignalKind::NonzeroExit
         | TerminalSignalKind::SignalExit => status.and_then(classify_terminal_reason),
@@ -1644,6 +1645,7 @@ fn synthetic_exit_code(signal: &TerminalSignal) -> i32 {
         TerminalSignalKind::CleanExit => 0,
         TerminalSignalKind::ProlongedSilence
         | TerminalSignalKind::QuotaExhaustedInband
+        | TerminalSignalKind::RateLimited
         | TerminalSignalKind::NonzeroExit
         | TerminalSignalKind::SignalExit
         | TerminalSignalKind::SpawnError
