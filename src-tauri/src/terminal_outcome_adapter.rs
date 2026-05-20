@@ -71,6 +71,7 @@ fn category_for_signal_kind(kind: TerminalSignalKind) -> Option<TerminalOutcomeC
         | TerminalSignalKind::NonzeroExit
         | TerminalSignalKind::SignalExit
         | TerminalSignalKind::SpawnError
+        | TerminalSignalKind::RateLimited
         | TerminalSignalKind::Unknown => None,
     }
 }
@@ -144,6 +145,7 @@ fn terminal_signal_disposition(signal: &TerminalSignal) -> TerminalSignalDisposi
         TerminalSignalKind::NonzeroExit
         | TerminalSignalKind::SignalExit
         | TerminalSignalKind::SpawnError
+        | TerminalSignalKind::RateLimited
         | TerminalSignalKind::Unknown => TerminalSignalDisposition::InteractiveFail,
     }
 }
@@ -163,6 +165,7 @@ pub(crate) fn typed_terminal_reason_fallback(signal: &TerminalSignal) -> Option<
     match signal.kind {
         TerminalSignalKind::CleanExit => None,
         TerminalSignalKind::QuotaExhaustedInband => Some("quota_exhausted_inband"),
+        TerminalSignalKind::RateLimited => Some("rate_limited"),
         TerminalSignalKind::ProlongedSilence => Some("bounded_silence"),
         TerminalSignalKind::NonzeroExit => Some("exit_nonzero"),
         TerminalSignalKind::SignalExit => Some("signal_exit"),
@@ -302,6 +305,7 @@ fn terminal_signal_kind_from_env(value: &str) -> Option<TerminalSignalKind> {
         "SignalExit" => Some(TerminalSignalKind::SignalExit),
         "SpawnError" => Some(TerminalSignalKind::SpawnError),
         "QuotaExhaustedInband" => Some(TerminalSignalKind::QuotaExhaustedInband),
+        "RateLimited" => Some(TerminalSignalKind::RateLimited),
         "ProlongedSilence" => Some(TerminalSignalKind::ProlongedSilence),
         "Unknown" => Some(TerminalSignalKind::Unknown),
         _ => None,
@@ -498,6 +502,7 @@ mod tests {
             "exhausted write must stay in the quota retry arm"
         );
         for non_quota in [
+            "TerminalSignalKind::RateLimited",
             "TerminalSignalKind::ProlongedSilence",
             "TerminalSignalKind::NonzeroExit",
             "TerminalSignalKind::SignalExit",
