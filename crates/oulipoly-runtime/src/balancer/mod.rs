@@ -43,7 +43,7 @@ use crate::quota::{
     is_topology_probe_due, refresh_provider, refresh_provider_for_routing,
 };
 use crate::sessions::scan_provider;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use oulipoly_config::{
     ModelConfig, ProviderConfig, ProvidersConfig, SessionStorage, SessionsConfig,
 };
@@ -1035,6 +1035,16 @@ fn is_resume_migratable_pair(source: &ProviderConfig, target: &ProviderConfig) -
     )
 }
 
+/// AGE-163 WU-A.1 working-set membership predicate. A provider is in the
+/// working set iff its `next_available_at` is null or has elapsed: the
+/// post-failure forensics writer sets this column to push a provider out of
+/// rotation for a typed cooldown window.
+pub fn working_set_member(quota: Option<&QuotaRecord>, now: DateTime<Utc>) -> bool {
+    quota
+        .and_then(|q| q.next_available_at)
+        .map_or(true, |ts| ts <= now)
+}
+
 fn provider_load(projection: &ProviderProjection) -> f64 {
     let max_projected_used = projection
         .projections_per_window
@@ -1698,6 +1708,44 @@ mod tests {
             .unwrap();
     }
 
+    fn quota_record_with_next_available_at(
+        next_available_at: Option<DateTime<Utc>>,
+    ) -> QuotaRecord {
+        QuotaRecord {
+            provider_name: "p".to_string(),
+            calls_since_refresh: 0,
+            refreshed_at: None,
+            exhausted_at: None,
+            topology_peak_live_window_count: 0,
+            last_topology_probe_at: None,
+            next_available_at,
+            last_refresh_at: None,
+            failure_class: None,
+        }
+    }
+
+    #[test]
+    fn working_set_member_true_when_next_available_at_null() {
+        let now = Utc::now();
+        let q = quota_record_with_next_available_at(None);
+        assert!(working_set_member(Some(&q), now));
+        assert!(working_set_member(None, now));
+    }
+
+    #[test]
+    fn working_set_member_true_when_next_available_at_past() {
+        let now = Utc::now();
+        let q = quota_record_with_next_available_at(Some(now - Duration::hours(1)));
+        assert!(working_set_member(Some(&q), now));
+    }
+
+    #[test]
+    fn working_set_member_false_when_next_available_at_future() {
+        let now = Utc::now();
+        let q = quota_record_with_next_available_at(Some(now + Duration::hours(1)));
+        assert!(!working_set_member(Some(&q), now));
+    }
+
     fn invocation_start_for_test(
         model_name: &str,
         provider_name: &str,
@@ -1917,6 +1965,9 @@ mod tests {
             exhausted_at: None,
             topology_peak_live_window_count: 0,
             last_topology_probe_at: None,
+            next_available_at: None,
+            last_refresh_at: None,
+            failure_class: None,
         }
     }
 
