@@ -1136,26 +1136,36 @@ fn usage_malformed_providers_toml_exits_nonzero() {
 }
 
 #[test]
-fn usage_exits_nonzero_when_model_references_provider_missing_from_providers_toml() {
+fn usage_warn_and_skips_when_model_references_provider_missing_from_providers_toml() {
     let fixture = Fixture::new();
-    fixture.write_model("fixture", &["claude-missing"]);
+    fixture.write_model("fixture", &["claude-present", "claude-missing"]);
     fixture.write_providers(&[ProviderFixture::no_usage("claude-present", "claude")]);
 
     let output = fixture.usage_command().output().unwrap();
     let code = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr_lower = stderr.to_lowercase();
 
-    assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
-    assert_eq!(stdout, "");
-    assert_contains_all(
-        &stderr,
-        &[
-            "providers.toml",
-            "claude-missing",
-            "fixture",
-            "provider claude-missing is missing",
-        ],
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains("claude-present"),
+        "present provider must render in stdout:\nstdout:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("claude-missing"),
+        "dangling provider reference must be surfaced on stderr:\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("fixture"),
+        "stderr warning must name the referencing model:\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr_lower.contains("warn")
+            || stderr_lower.contains("skip")
+            || stderr_lower.contains("missing"),
+        "missing-provider notice must be surfaced as a non-fatal warning \
+         (matching `warn` / `skip` / `missing`):\nstderr:\n{stderr}"
     );
 }
 

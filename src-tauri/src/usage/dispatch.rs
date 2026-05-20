@@ -14,7 +14,11 @@ pub(crate) fn run_usage(
         .state_db_opener
         .open_default()
         .map_err(|err| format!("failed to open state db: {err}"))?;
-    let accounts = accessor::collect_accounts(providers, models)?;
+    let accessor::CollectAccountsOutput { accounts, warnings } =
+        accessor::collect_accounts(providers, models);
+    for warning in &warnings {
+        eprintln!("{warning}");
+    }
     let filtered = filter::filter_routing_pool(accounts);
     let outcomes = fetcher::fetch_all(&state, &filtered);
     let rows = mapper::map_rows(outcomes, &filtered);
