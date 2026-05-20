@@ -1208,7 +1208,27 @@ fn configure_supervised_command(cmd: &mut Command, prompt_mode: PromptMode) {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
+fn configure_supervised_process_group(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    cmd.process_group(0);
+    // Safety net: if the wrapper dies for any reason (including SIGKILL or
+    // panic — anything that prevents send_child_sigkill from running), the
+    // kernel sends SIGKILL to the immediate child. Combined with the
+    // process_group(0) above, this prevents orphaned children from
+    // accumulating across failed dispatches.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
 fn configure_supervised_process_group(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
 
