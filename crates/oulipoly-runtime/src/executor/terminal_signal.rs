@@ -22,6 +22,7 @@ pub enum TerminalSignalKind {
     SignalExit,
     SpawnError,
     QuotaExhaustedInband,
+    RateLimited,
     ProlongedSilence,
     Unknown,
 }
@@ -127,13 +128,14 @@ mod tests {
         UNIX_EPOCH + Duration::from_secs(139)
     }
 
-    fn all_kinds() -> [TerminalSignalKind; 7] {
+    fn all_kinds() -> [TerminalSignalKind; 8] {
         [
             TerminalSignalKind::CleanExit,
             TerminalSignalKind::NonzeroExit,
             TerminalSignalKind::SignalExit,
             TerminalSignalKind::SpawnError,
             TerminalSignalKind::QuotaExhaustedInband,
+            TerminalSignalKind::RateLimited,
             TerminalSignalKind::ProlongedSilence,
             TerminalSignalKind::Unknown,
         ]
@@ -211,6 +213,7 @@ mod tests {
             TerminalSignalKind::SignalExit => "signal_exit",
             TerminalSignalKind::SpawnError => "spawn_error",
             TerminalSignalKind::QuotaExhaustedInband => "quota_exhausted_inband",
+            TerminalSignalKind::RateLimited => "rate_limited",
             TerminalSignalKind::ProlongedSilence => "prolonged_silence",
             TerminalSignalKind::Unknown => "unknown",
         }
@@ -269,6 +272,7 @@ mod tests {
                 TerminalSignalKind::QuotaExhaustedInband,
                 "quota_exhausted_inband",
             ),
+            (TerminalSignalKind::RateLimited, "rate_limited"),
             (TerminalSignalKind::ProlongedSilence, "prolonged_silence"),
             (TerminalSignalKind::Unknown, "unknown"),
         ];

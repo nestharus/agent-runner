@@ -28,20 +28,32 @@ impl TerminalSignalRecognizer for Recognizer {
 
         let stdout_text = lowercase(&decode_lossy(evidence.stdout));
         let stderr_text = lowercase(&decode_lossy(evidence.stderr));
-        let quota_stream = find_quota_matching_stream(
+        let persistent_stream = find_matching_stream(
             evidence.stdout,
-            contains_quota_token(&stdout_text),
+            contains_persistent_quota_token(&stdout_text),
             evidence.stderr,
-            contains_quota_token(&stderr_text),
+            contains_persistent_quota_token(&stderr_text),
         );
 
-        if let Some(bytes) = quota_stream {
+        if let Some(bytes) = persistent_stream {
             let signal_evidence = quota_evidence_excerpt(bytes);
             return terminal_signal(
                 evidence,
                 TerminalSignalKind::QuotaExhaustedInband,
                 signal_evidence,
             );
+        }
+
+        let transient_stream = find_matching_stream(
+            evidence.stdout,
+            contains_transient_rate_limit_token(&stdout_text),
+            evidence.stderr,
+            contains_transient_rate_limit_token(&stderr_text),
+        );
+
+        if let Some(bytes) = transient_stream {
+            let signal_evidence = quota_evidence_excerpt(bytes);
+            return terminal_signal(evidence, TerminalSignalKind::RateLimited, signal_evidence);
         }
 
         if let Some(kind) = post_quota_terminal_signal_kind(&evidence.terminal_status) {
@@ -54,7 +66,7 @@ impl TerminalSignalRecognizer for Recognizer {
     }
 }
 
-fn find_quota_matching_stream<'a>(
+fn find_matching_stream<'a>(
     stdout: &'a [u8],
     stdout_matches: bool,
     stderr: &'a [u8],
@@ -88,12 +100,14 @@ fn lowercase(text: &str) -> String {
 /// for the per-provider canonical token vocabulary (project-local schema
 /// owner per the AGE-125 PP-001 precedent; canonical-doc-as-schema proof
 /// per `~/ai/agents/push-pull-auditor.md`).
-fn contains_quota_token(text: &str) -> bool {
+fn contains_persistent_quota_token(text: &str) -> bool {
+    text.contains("quota exhausted") || text.contains("quota exceeded")
+}
+
+fn contains_transient_rate_limit_token(text: &str) -> bool {
     text.contains("rate_limit_exceeded")
         || text.contains("429")
         || text.contains("too many requests")
-        || text.contains("quota exhausted")
-        || text.contains("quota exceeded")
         || text.contains("rate limit exceeded")
 }
 
@@ -142,7 +156,7 @@ mod tests {
     }
 
     fn quota_text() -> &'static [u8] {
-        br#"{"error":{"type":"rate_limit_exceeded","message":"too many requests"}}"#
+        br#"{"error":{"type":"quota_exceeded","message":"quota exhausted for this project"}}"#
     }
 
     // T9 (per Step 6b output index AGE-139-T9)
@@ -213,7 +227,32 @@ mod tests {
 
     // T24 (per Step 6b output index AGE-139-T24)
     #[test]
-    fn openai_compat_quota_fixtures_map_to_quota_exhausted_inband() {
+    fn openai_compat_persistent_quota_fixtures_map_to_quota_exhausted_inband() {
+        for (name, stdout, stderr) in [
+            (
+                "gemini-quota",
+                b"Gemini API quota exhausted for this project".as_slice(),
+                b"".as_slice(),
+            ),
+            (
+                "quota-exceeded",
+                b"".as_slice(),
+                b"project quota exceeded".as_slice(),
+            ),
+        ] {
+            let signal = assert_kind(
+                evidence(stdout, stderr, TerminalStatusEvidence::Unknown),
+                TerminalSignalKind::QuotaExhaustedInband,
+            );
+            assert!(
+                !signal.evidence.is_empty(),
+                "fixture {name} should preserve an evidence excerpt"
+            );
+        }
+    }
+
+    #[test]
+    fn openai_compat_transient_rate_limit_fixtures_map_to_rate_limited() {
         for (name, stdout, stderr) in [
             (
                 "json-rate-limit",
@@ -227,11 +266,6 @@ mod tests {
                 b"too many requests".as_slice(),
             ),
             (
-                "gemini-quota",
-                b"Gemini API quota exhausted for this project".as_slice(),
-                b"".as_slice(),
-            ),
-            (
                 "opencode-rate-limit",
                 b"".as_slice(),
                 b"OpenCode provider rate limit exceeded".as_slice(),
@@ -239,13 +273,26 @@ mod tests {
         ] {
             let signal = assert_kind(
                 evidence(stdout, stderr, TerminalStatusEvidence::Unknown),
-                TerminalSignalKind::QuotaExhaustedInband,
+                TerminalSignalKind::RateLimited,
             );
             assert!(
                 !signal.evidence.is_empty(),
                 "fixture {name} should preserve an evidence excerpt"
             );
         }
+    }
+
+    #[test]
+    fn openai_compat_persistent_quota_wins_over_transient_rate_limit_when_both_present() {
+        let signal = assert_kind(
+            evidence(
+                br#"{"error":{"type":"quota_exceeded","message":"429 too many requests; quota exhausted"}}"#.as_slice(),
+                b"",
+                TerminalStatusEvidence::Unknown,
+            ),
+            TerminalSignalKind::QuotaExhaustedInband,
+        );
+        assert!(!signal.evidence.is_empty());
     }
 
     // T27 (per Step 6b output index AGE-139-T27)

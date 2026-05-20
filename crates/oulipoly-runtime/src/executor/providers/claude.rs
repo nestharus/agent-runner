@@ -28,20 +28,32 @@ impl TerminalSignalRecognizer for Recognizer {
 
         let stdout_text = lowercase(&decode_lossy(evidence.stdout));
         let stderr_text = lowercase(&decode_lossy(evidence.stderr));
-        let quota_stream = find_quota_matching_stream(
+        let persistent_stream = find_matching_stream(
             evidence.stdout,
-            contains_quota_token(&stdout_text),
+            contains_persistent_quota_token(&stdout_text),
             evidence.stderr,
-            contains_quota_token(&stderr_text),
+            contains_persistent_quota_token(&stderr_text),
         );
 
-        if let Some(bytes) = quota_stream {
+        if let Some(bytes) = persistent_stream {
             let signal_evidence = quota_evidence_excerpt(bytes);
             return terminal_signal(
                 evidence,
                 TerminalSignalKind::QuotaExhaustedInband,
                 signal_evidence,
             );
+        }
+
+        let transient_stream = find_matching_stream(
+            evidence.stdout,
+            contains_transient_rate_limit_token(&stdout_text),
+            evidence.stderr,
+            contains_transient_rate_limit_token(&stderr_text),
+        );
+
+        if let Some(bytes) = transient_stream {
+            let signal_evidence = quota_evidence_excerpt(bytes);
+            return terminal_signal(evidence, TerminalSignalKind::RateLimited, signal_evidence);
         }
 
         if let Some(kind) = post_quota_terminal_signal_kind(&evidence.terminal_status) {
@@ -54,7 +66,7 @@ impl TerminalSignalRecognizer for Recognizer {
     }
 }
 
-fn find_quota_matching_stream<'a>(
+fn find_matching_stream<'a>(
     stdout: &'a [u8],
     stdout_matches: bool,
     stderr: &'a [u8],
@@ -88,16 +100,19 @@ fn lowercase(text: &str) -> String {
 /// for the per-provider canonical token vocabulary (project-local schema
 /// owner per the AGE-125 PP-001 precedent; canonical-doc-as-schema proof
 /// per `~/ai/agents/push-pull-auditor.md`).
-fn contains_quota_token(text: &str) -> bool {
+fn contains_persistent_quota_token(text: &str) -> bool {
     text.contains("claude usage limit reached")
         || text.contains("usage limit reached")
         || text.contains("monthly limit")
         || text.contains("billing limit")
-        || text.contains("rate_limit_error")
-        || text.contains("rate limit")
-        || text.contains("too many requests")
         || text.contains("resets at")
         || text.contains("reset_at")
+}
+
+fn contains_transient_rate_limit_token(text: &str) -> bool {
+    text.contains("rate_limit_error")
+        || text.contains("rate limit")
+        || text.contains("too many requests")
 }
 
 #[cfg(test)]
@@ -216,7 +231,7 @@ mod tests {
 
     // T22 (per Step 6b output index AGE-139-T22)
     #[test]
-    fn claude_quota_fixtures_map_to_quota_exhausted_inband() {
+    fn claude_persistent_quota_fixtures_map_to_quota_exhausted_inband() {
         for (name, stdout, stderr) in [
             (
                 "usage-limit",
@@ -227,16 +242,6 @@ mod tests {
                 "monthly-limit",
                 b"".as_slice(),
                 b"You've reached your monthly limit".as_slice(),
-            ),
-            (
-                "rate-limit-code",
-                b"rate_limit_error".as_slice(),
-                b"".as_slice(),
-            ),
-            (
-                "too-many-requests",
-                b"".as_slice(),
-                b"Too many requests".as_slice(),
             ),
             (
                 "reset-window-text",
@@ -258,6 +263,49 @@ mod tests {
                 "fixture {name} should preserve an evidence excerpt"
             );
         }
+    }
+
+    #[test]
+    fn claude_transient_rate_limit_fixtures_map_to_rate_limited() {
+        for (name, stdout, stderr) in [
+            (
+                "rate-limit-code",
+                b"rate_limit_error".as_slice(),
+                b"".as_slice(),
+            ),
+            (
+                "too-many-requests",
+                b"".as_slice(),
+                b"Too many requests".as_slice(),
+            ),
+            (
+                "rate-limit-text",
+                b"rate limit reached".as_slice(),
+                b"".as_slice(),
+            ),
+        ] {
+            let signal = assert_kind(
+                evidence(stdout, stderr, TerminalStatusEvidence::Unknown),
+                TerminalSignalKind::RateLimited,
+            );
+            assert!(
+                !signal.evidence.is_empty(),
+                "fixture {name} should preserve an evidence excerpt"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_persistent_quota_wins_over_transient_rate_limit_when_both_present() {
+        let signal = assert_kind(
+            evidence(
+                b"Claude usage limit reached; rate_limit_error encountered",
+                b"",
+                TerminalStatusEvidence::Unknown,
+            ),
+            TerminalSignalKind::QuotaExhaustedInband,
+        );
+        assert!(!signal.evidence.is_empty());
     }
 
     // T25 (per Step 6b output index AGE-139-T25)

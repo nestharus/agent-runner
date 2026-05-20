@@ -1,6 +1,8 @@
 # Terminal-signal provider vocabulary — repo-owned schema declaration
 
-This document is the **canonical schema owner** for the per-provider quota-exhausted token vocabulary that the AGE-139 W1 foundation slice (`crates/oulipoly-runtime/src/executor/providers/*`) reads. Any in-repo consumer that recognizes a `TerminalSignalKind::QuotaExhaustedInband` signal from a provider CLI's stdout or stderr MUST pull from the token sets declared here, not from the provider CLI's internal output layout.
+This document is the **canonical schema owner** for the per-provider quota-exhausted and rate-limit token vocabularies that the AGE-139 W1 foundation slice (`crates/oulipoly-runtime/src/executor/providers/*`) reads. Any in-repo consumer that recognizes a `TerminalSignalKind::QuotaExhaustedInband` or `TerminalSignalKind::RateLimited` signal from a provider CLI's stdout or stderr MUST pull from the token sets declared here, not from the provider CLI's internal output layout.
+
+AGE-162 partitioned the previously-merged token vocabulary into two disjoint sub-vocabularies per provider: **persistent quota** (upstream account-level exhaustion that warrants `mark_provider_exhausted`) and **transient rate-limit** (transport-layer throttling that must not flip routing state). Recognizers evaluate the persistent-quota set first; a stream that matches both sets is classified as persistent (it is the stronger claim).
 
 The Claude, Codex/OpenAI, and OpenAI-compatible (Gemini/OpenCode/...) CLIs are external upstream-owned processes. This declaration does not change their behavior; it declares which subset of their output shape this repo treats as a stable contract for the purpose of A1 push-vs-pull system coupling (`~/ai/conventions/code-quality.md` § Push-vs-pull system coupling).
 
@@ -13,57 +15,66 @@ Per `~/ai/agents/push-pull-auditor.md` § Metric Binding "LOW canonical-doc-as-s
 1. The recognizer reads `TerminalSignalEvidence.stdout` and `TerminalSignalEvidence.stderr` as `&[u8]` slices that may contain invalid UTF-8.
 2. Each slice is decoded with `String::from_utf8_lossy(...)` (lossy UTF-8 decode; replacement characters allowed).
 3. The decoded text is then converted to lowercase via `str::to_lowercase()` so token matching is case-insensitive.
-4. The per-provider `contains_quota_token(text: &str) -> bool` predicate applies a substring match: `text.contains(<canonical_token>)` returns `true` for any one canonical token from the provider's declared set below.
-5. If any one canonical token matches in either stdout or stderr, the evidence carries the `QuotaExhaustedInband` token shape; precedence rules in the Step 6a contract decide whether the final `TerminalSignalKind` is `QuotaExhaustedInband` (no stronger structured terminal-status evidence) or one of the stronger signals (`SpawnError`, `ProlongedSilence`, `SignalExit`).
-6. The first matching stream (stdout, then stderr) selected by `find_quota_matching_stream` is used as the evidence excerpt; `bounded_excerpt(<bytes>, max_len)` formats the bounded human-readable representation that lands in `TerminalSignal.evidence`.
-7. Tokens are matched in lowercase form. Producers and consumers below name the lowercase canonical form. The `contains_quota_token` implementation MUST construct its substring checks from exactly the canonical lowercase forms declared here.
+4. The per-provider `contains_persistent_quota_token(text: &str) -> bool` predicate applies a substring match for the persistent-quota set; `contains_transient_rate_limit_token(text: &str) -> bool` applies the same shape for the transient-rate-limit set. `text.contains(<canonical_token>)` returns `true` for any one canonical token from the provider's declared sub-set below.
+5. The persistent set is evaluated first. If any one persistent-quota token matches in either stdout or stderr, the evidence carries the `QuotaExhaustedInband` token shape and the transient set is NOT consulted (persistent wins because it is the stronger claim). If no persistent token matches but any transient token matches, the evidence carries the `RateLimited` shape. Precedence rules in the Step 6a contract decide whether the final `TerminalSignalKind` is `QuotaExhaustedInband` / `RateLimited` (no stronger structured terminal-status evidence) or one of the stronger signals (`SpawnError`, `ProlongedSilence`, `SignalExit`).
+6. The first matching stream (stdout, then stderr) selected by `find_matching_stream` is used as the evidence excerpt; `bounded_excerpt(<bytes>, max_len)` formats the bounded human-readable representation that lands in `TerminalSignal.evidence`.
+7. Tokens are matched in lowercase form. Producers and consumers below name the lowercase canonical form. The `contains_persistent_quota_token` and `contains_transient_rate_limit_token` implementations MUST construct their substring checks from exactly the canonical lowercase forms declared here.
 
 ### Required-token sets
 
-The following per-provider token sets are the **only** quota-exhausted vocabulary this repo's terminal-signal recognizers pull from. Each token is a lowercase substring. A recognizer's `contains_quota_token` MUST match exactly this set and only this set; adding or removing tokens requires updating this document and the recognizer in the same change.
+The following per-provider token sets are the **only** quota-exhausted and rate-limit vocabulary this repo's terminal-signal recognizers pull from. Each token is a lowercase substring. Each provider declares two disjoint sub-sets: a **persistent-quota** set (matches map to `TerminalSignalKind::QuotaExhaustedInband`, which downstream triggers `mark_provider_exhausted`) and a **transient-rate-limit** set (matches map to `TerminalSignalKind::RateLimited`, which is routing-state-neutral). A recognizer's predicates MUST match exactly these sets and only these sets; adding or removing tokens requires updating this document and the recognizer in the same change.
 
 #### Claude / Anthropic (`crates/oulipoly-runtime/src/executor/providers/claude.rs`)
 
-Required tokens (lowercase substrings):
+Persistent-quota tokens (lowercase substrings; evaluated first):
 
 - `claude usage limit reached`
 - `usage limit reached`
 - `monthly limit`
 - `billing limit`
-- `rate_limit_error`
-- `rate limit`
-- `too many requests`
 - `resets at`
 - `reset_at`
 
-Source ownership: Anthropic Claude CLI (`https://docs.anthropic.com/claude/`). This document declares the **repo-side contract** for parsing a stable subset of Claude CLI quota-exhausted output; the upstream tool is not bound by this declaration. Fixture-string drift is recorded as a documented residual in `planning/age-139-terminal-signal-core/risk/age-139-test-residuals.md`.
+Transient-rate-limit tokens (lowercase substrings):
+
+- `rate_limit_error`
+- `rate limit`
+- `too many requests`
+
+Source ownership: Anthropic Claude CLI (`https://docs.anthropic.com/claude/`). This document declares the **repo-side contract** for parsing a stable subset of Claude CLI quota-exhausted and rate-limit output; the upstream tool is not bound by this declaration. Fixture-string drift is recorded as a documented residual in `planning/age-139-terminal-signal-core/risk/age-139-test-residuals.md`.
 
 #### Codex / OpenAI CLI (`crates/oulipoly-runtime/src/executor/providers/codex.rs`)
 
-Required tokens (lowercase substrings):
+Persistent-quota tokens (lowercase substrings; evaluated first):
 
-- `http 429`
-- `status: 429`
-- `status 429`
-- `rate limit`
-- `rate_limit_exceeded`
 - `usage cap`
 - `billing limit`
 - `quota exceeded`
 - `reset_at`
 - `resets at`
 
+Transient-rate-limit tokens (lowercase substrings):
+
+- `http 429`
+- `status: 429`
+- `status 429`
+- `rate limit`
+- `rate_limit_exceeded`
+
 Source ownership: OpenAI Codex / `gpt`-CLI (`https://platform.openai.com/docs/`). Same upstream-not-bound disclaimer as Claude.
 
 #### OpenAI-compatible (`crates/oulipoly-runtime/src/executor/providers/openai_compat.rs`)
 
-Required tokens (lowercase substrings):
+Persistent-quota tokens (lowercase substrings; evaluated first):
+
+- `quota exhausted`
+- `quota exceeded`
+
+Transient-rate-limit tokens (lowercase substrings):
 
 - `rate_limit_exceeded`
 - `429`
 - `too many requests`
-- `quota exhausted`
-- `quota exceeded`
 - `rate limit exceeded`
 
 Source ownership: generic OpenAI-compatible providers (Gemini, OpenCode, and other wrappers exposing an OpenAI-compatible API). The token set is intentionally narrower than Claude/Codex because OpenAI-compatible wrappers vary; the residual class `non-canonical-provider-drift` covers per-provider deviations.
@@ -76,11 +87,11 @@ The terminal-signal recognizers do not read provider output from files; they rea
 
 | Consumer | Pull site | Tokens pulled |
 |---|---|---|
-| `crates/oulipoly-runtime/src/executor/providers/claude.rs::contains_quota_token` (via `Recognizer::recognize` -> `quota_exhaustion_excerpt`) | Reads lowercase-lossy stdout / stderr supplied through `TerminalSignalEvidence` | Claude/Anthropic required-token set above |
-| `crates/oulipoly-runtime/src/executor/providers/codex.rs::contains_quota_token` (same shape) | Same | Codex/OpenAI required-token set above |
-| `crates/oulipoly-runtime/src/executor/providers/openai_compat.rs::contains_quota_token` (same shape) | Same | OpenAI-compatible required-token set above |
+| `crates/oulipoly-runtime/src/executor/providers/claude.rs::contains_persistent_quota_token` and `::contains_transient_rate_limit_token` (via `Recognizer::recognize`) | Reads lowercase-lossy stdout / stderr supplied through `TerminalSignalEvidence` | Claude/Anthropic persistent + transient sets above |
+| `crates/oulipoly-runtime/src/executor/providers/codex.rs::contains_persistent_quota_token` and `::contains_transient_rate_limit_token` (same shape) | Same | Codex/OpenAI persistent + transient sets above |
+| `crates/oulipoly-runtime/src/executor/providers/openai_compat.rs::contains_persistent_quota_token` and `::contains_transient_rate_limit_token` (same shape) | Same | OpenAI-compatible persistent + transient sets above |
 
-Any new consumer that pulls from provider quota-exhausted vocabulary within this repo MUST be added to this table and MUST pull only from the per-provider sets declared above.
+Any new consumer that pulls from provider quota-exhausted or rate-limit vocabulary within this repo MUST be added to this table and MUST pull only from the per-provider sets declared above.
 
 ## Source
 
