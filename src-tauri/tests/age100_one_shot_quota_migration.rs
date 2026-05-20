@@ -154,9 +154,12 @@ fn one_shot_all_pool_members_quota_exhausted_returns_blocked_all_providers_exhau
         assert!(
             db.get_quota(provider)
                 .unwrap()
-                .and_then(|quota| quota.exhausted_at)
+                .and_then(|quota| quota.next_available_at)
                 .is_some(),
-            "{provider} should be marked exhausted"
+            "{provider} should have next_available_at set after a quota \
+             exhaustion (AGE-163 WU-A.4 moved the durable working-set write \
+             from exhausted_at to next_available_at via \
+             apply_post_failure_forensics)"
         );
     }
 }

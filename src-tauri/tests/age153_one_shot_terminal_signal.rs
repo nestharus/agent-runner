@@ -29,8 +29,12 @@ fn one_shot_quota_signal_marks_exhausted_retries_sibling_and_emits_marker() {
     assert_no_terminal_marker_on_stdout(&output);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_single_terminal_signal(&stderr, "QuotaExhaustedInband", false);
-    assert_eq!(fixture.exhausted_row_count("claude-age153-a"), 1);
-    assert_eq!(fixture.exhausted_row_count("claude-age153-b"), 0);
+    // AGE-163 WU-A.4: the typed forensics writer lands durable
+    // unavailability on `next_available_at` (RollingWindow5h class) in
+    // place of the legacy `exhausted_at` write. The "provider was marked
+    // exhausted" contract is preserved; the observed column changes.
+    assert_eq!(fixture.next_available_at_row_count("claude-age153-a"), 1);
+    assert_eq!(fixture.next_available_at_row_count("claude-age153-b"), 0);
     assert_eq!(
         fixture.failed_invocation_count("claude-age153-a", "quota_exhausted_inband"),
         1
@@ -189,8 +193,10 @@ fn one_shot_all_providers_exhausted_by_typed_quota_returns_nonzero_with_one_mark
         stderr.contains("BLOCKED:all-providers-exhausted"),
         "{stderr}"
     );
-    assert_eq!(fixture.exhausted_row_count("claude-age153-a"), 1);
-    assert_eq!(fixture.exhausted_row_count("claude-age153-b"), 1);
+    // AGE-163 WU-A.4: typed forensics writes `next_available_at`
+    // (RollingWindow5h class) in place of legacy `exhausted_at`.
+    assert_eq!(fixture.next_available_at_row_count("claude-age153-a"), 1);
+    assert_eq!(fixture.next_available_at_row_count("claude-age153-b"), 1);
     assert_eq!(line_count(&first_marker), 1);
     assert_eq!(line_count(&second_marker), 1);
 }

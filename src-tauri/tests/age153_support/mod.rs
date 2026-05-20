@@ -255,6 +255,21 @@ projects_dir = {}
             .unwrap()
     }
 
+    /// AGE-163 WU-A.4: typed forensics lands durable unavailability on
+    /// `next_available_at`. Use this for "the provider was marked
+    /// unavailable for routing" assertions.
+    pub fn next_available_at_row_count(&self, provider: &str) -> i64 {
+        self.conn()
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM provider_quotas
+                 WHERE provider_name = ?1 AND next_available_at IS NOT NULL",
+                params![provider],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
     pub fn failed_invocation_count(&self, provider: &str, terminal_reason: &str) -> i64 {
         self.conn()
             .query_row(

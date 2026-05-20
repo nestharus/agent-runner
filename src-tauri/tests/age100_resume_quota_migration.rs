@@ -210,11 +210,16 @@ prompt_mode = "stdin"
     }
 
     fn exhausted_row_count(&self, provider: &str) -> i64 {
+        // AGE-163 WU-A.4 moved the durable working-set write from
+        // `exhausted_at` to `next_available_at` via the typed
+        // `apply_post_failure_forensics` path. The contract pinned here
+        // ("provider X was marked unavailable after a quota-failed
+        // dispatch") is preserved verbatim; the observed column changes.
         self.conn()
             .query_row(
                 "SELECT COUNT(*)
                  FROM provider_quotas
-                 WHERE provider_name = ?1 AND exhausted_at IS NOT NULL",
+                 WHERE provider_name = ?1 AND next_available_at IS NOT NULL",
                 params![provider],
                 |row| row.get(0),
             )
@@ -238,9 +243,11 @@ prompt_mode = "stdin"
     }
 
     fn exhausted_provider_count(&self) -> i64 {
+        // AGE-163 WU-A.4: durable working-set write moved to
+        // `next_available_at`; see `exhausted_row_count`.
         self.conn()
             .query_row(
-                "SELECT COUNT(*) FROM provider_quotas WHERE exhausted_at IS NOT NULL",
+                "SELECT COUNT(*) FROM provider_quotas WHERE next_available_at IS NOT NULL",
                 [],
                 |row| row.get(0),
             )

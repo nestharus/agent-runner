@@ -30,8 +30,10 @@ fn resume_quota_signal_marks_active_provider_exhausted_migrates_and_emits_marker
     assert_no_terminal_marker_on_stdout(&output);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_single_terminal_signal(&stderr, "QuotaExhaustedInband", true);
-    assert_eq!(fixture.exhausted_row_count("claude-age153-a"), 1);
-    assert_eq!(fixture.exhausted_row_count("claude-age153-b"), 0);
+    // AGE-163 WU-A.4: durable working-set write moved from `exhausted_at`
+    // to `next_available_at` via the typed forensics path.
+    assert_eq!(fixture.next_available_at_row_count("claude-age153-a"), 1);
+    assert_eq!(fixture.next_available_at_row_count("claude-age153-b"), 0);
     assert_eq!(fixture.active_segment_provider(), "claude-age153-b");
     assert_eq!(
         fixture.failed_invocation_count("claude-age153-a", "quota_exhausted_inband"),

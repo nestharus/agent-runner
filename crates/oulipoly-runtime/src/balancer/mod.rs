@@ -37,6 +37,10 @@
 //!       - QuotaWindow usage/reset/delta fields
 //!       - ResolvedResume active-provider contract
 
+pub mod forensics;
+
+pub use forensics::{FailureClass, apply_post_failure_forensics};
+
 use crate::migration::MigrationError;
 use crate::quota::{
     InFlight, RefreshOutcome, has_refresh_source, is_routing_stale, is_stale,
@@ -553,6 +557,9 @@ fn provider_is_quota_exhausted(
     quota
         .and_then(|quota| quota.exhausted_at.as_ref())
         .is_some()
+        || quota
+            .and_then(|quota| quota.next_available_at)
+            .is_some_and(|ts| ts > now)
         || windows
             .iter()
             .any(|window| window.resets_at > now && window.used_percent >= EXHAUSTED_USED_PERCENT)
@@ -988,7 +995,21 @@ fn active_provider_quota(
 }
 
 fn quota_is_exhausted(quota: Option<&QuotaRecord>) -> bool {
-    quota.and_then(|quota| quota.exhausted_at).is_some()
+    // AGE-163 WU-A.4: the typed forensics writer lands durable
+    // unavailability on `next_available_at` (and the failure class). The
+    // legacy `exhausted_at` column is preserved for back-compat read sites
+    // and for the legacy reset-implied clear path. A provider is treated
+    // as currently exhausted if either signal is active for the current
+    // wall-clock — this aligns `quota_is_exhausted` with
+    // `working_set_member` so the existing migration-decision path
+    // honors the new typed state.
+    let Some(quota) = quota else {
+        return false;
+    };
+    quota.exhausted_at.is_some()
+        || quota
+            .next_available_at
+            .is_some_and(|ts| ts > Utc::now())
 }
 
 fn exhausted_migration_decision(

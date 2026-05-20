@@ -3070,9 +3070,19 @@ fn read_provider_quota_state(
 }
 
 fn quota_state_has_capacity(quota: Option<oulipoly_state::QuotaRecord>) -> bool {
-    quota
-        .and_then(|provider_quota| provider_quota.exhausted_at)
-        .is_none()
+    // AGE-163 WU-A.4: the typed forensics writer lands durable
+    // unavailability on `next_available_at`. A provider has capacity iff
+    // neither the legacy `exhausted_at` flag nor an unelapsed
+    // `next_available_at` cooldown is set.
+    let Some(record) = quota else {
+        return true;
+    };
+    if record.exhausted_at.is_some() {
+        return false;
+    }
+    !record
+        .next_available_at
+        .is_some_and(|ts| ts > chrono::Utc::now())
 }
 
 fn emit_quota_inspection_warning(provider_name: &str, err: &str) {

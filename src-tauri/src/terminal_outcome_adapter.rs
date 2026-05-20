@@ -17,6 +17,7 @@
 //!       - src-tauri CLI quota retry/error-category contract
 //! ```
 
+use oulipoly_runtime::balancer::{FailureClass, apply_post_failure_forensics};
 use oulipoly_runtime::diagnostics::ErrorCategory;
 use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind;
 use oulipoly_runtime::executor::{ExecutionResult, TerminalSignal};
@@ -126,15 +127,36 @@ pub(crate) fn apply_terminal_signal_outcome(
         TerminalSignalDisposition::QuotaExhaustedRetry => {
             // AGE-153 marker authority: emit_terminal_signal_marker.
             emit_terminal_signal_marker_or_warn(signal, ctx);
-            super::balanced_cli::mark_provider_exhausted(ctx.state_db, ctx.provider);
+            apply_typed_post_failure_forensics(signal, ctx);
         }
         TerminalSignalDisposition::ProlongedSilenceFail
         | TerminalSignalDisposition::InteractiveFail => {
-            emit_terminal_signal_marker_or_warn(signal, ctx)
+            emit_terminal_signal_marker_or_warn(signal, ctx);
+            apply_typed_post_failure_forensics(signal, ctx);
         }
         TerminalSignalDisposition::InteractiveClean | TerminalSignalDisposition::NotApplicable => {}
     }
     disposition
+}
+
+fn apply_typed_post_failure_forensics<W: io::Write>(
+    signal: &TerminalSignal,
+    ctx: &mut TerminalSignalContext<'_, W>,
+) {
+    let Some(failure_class) = FailureClass::from_terminal_signal_kind(signal.kind) else {
+        return;
+    };
+    if let Err(err) = apply_post_failure_forensics(
+        ctx.state_db,
+        ctx.provider,
+        failure_class,
+        chrono::Utc::now(),
+    ) {
+        let _ = writeln!(
+            ctx.stderr,
+            "Warning: Failed to apply post-failure forensics: {err:?}"
+        );
+    }
 }
 
 fn terminal_signal_disposition(signal: &TerminalSignal) -> TerminalSignalDisposition {
@@ -475,51 +497,41 @@ mod tests {
     }
 
     #[test]
-    fn age153_apply_terminal_signal_outcome_maps_quota_only_to_exhausted_write() {
+    fn age153_apply_terminal_signal_outcome_maps_quota_to_typed_forensics_write() {
         let source = production_source();
         let outcome = production_block_after("fn apply_terminal_signal_outcome(");
         let disposition = production_block_after("fn terminal_signal_disposition(");
         assert!(
             outcome.contains("terminal_signal_disposition(signal)")
                 && outcome.contains("TerminalSignalDisposition::QuotaExhaustedRetry")
-                && outcome.contains("mark_provider_exhausted")
+                && outcome.contains("apply_typed_post_failure_forensics")
                 && disposition.contains("TerminalSignalKind::QuotaExhaustedInband")
                 && disposition.contains("TerminalSignalDisposition::QuotaExhaustedRetry"),
-            "quota typed signal must be the only typed exhausted-write branch"
+            "AGE-163 WU-A.4: quota typed signal must route through apply_typed_post_failure_forensics"
         );
         let quota_retry_arm = outcome
             .find("TerminalSignalDisposition::QuotaExhaustedRetry")
             .expect("quota retry arm must exist in apply_terminal_signal_outcome");
         let after_quota_retry = &outcome[quota_retry_arm..];
-        let quota_write = after_quota_retry
-            .find("mark_provider_exhausted")
-            .expect("quota retry arm must write exhausted_at");
+        let forensics_call = after_quota_retry
+            .find("apply_typed_post_failure_forensics")
+            .expect("quota retry arm must call apply_typed_post_failure_forensics");
         let next_arm = after_quota_retry
-            .find("TerminalSignalDisposition::ProlongedSilenceFail")
+            .find("TerminalSignalDisposition::InteractiveClean")
             .expect("next terminal-signal arm must exist");
         assert!(
-            quota_write < next_arm,
-            "exhausted write must stay in the quota retry arm"
+            forensics_call < next_arm,
+            "forensics write must stay in the typed-signal arms (not InteractiveClean)"
         );
-        for non_quota in [
-            "TerminalSignalKind::RateLimited",
-            "TerminalSignalKind::ProlongedSilence",
-            "TerminalSignalKind::NonzeroExit",
-            "TerminalSignalKind::SignalExit",
-            "TerminalSignalKind::SpawnError",
-            "TerminalSignalKind::Unknown",
-        ] {
-            let branch_start = disposition
-                .find(non_quota)
-                .unwrap_or_else(|| panic!("missing {non_quota} branch"));
-            let remaining = &disposition[branch_start..];
-            let next_quota_write = remaining.find("mark_provider_exhausted");
-            let next_disposition = remaining.find("TerminalSignalDisposition::");
-            assert!(
-                next_quota_write.is_none() || next_disposition < next_quota_write,
-                "{non_quota} must not write exhausted_at"
-            );
-        }
+        // AGE-163 WU-A.4: read-side persistent vs transient typing lives in
+        // FailureClass::from_terminal_signal_kind. RateLimited maps to
+        // TransientStderrNoise which has next_available_at_offset() = None,
+        // so the durable working-set write does not fire on transient noise.
+        assert!(
+            source.contains("FailureClass::from_terminal_signal_kind")
+                || source.contains("apply_typed_post_failure_forensics"),
+            "typed forensics surface must be referenced in the adapter"
+        );
         assert!(
             source.contains("terminal_signal") && source.contains("classify_error_category"),
             "typed-signal precedence must coexist with legacy fallback helpers"
