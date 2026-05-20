@@ -96,7 +96,18 @@ fn age154_test_model_and_db_path_do_not_enter_lifecycle_modes_or_emit_markers() 
 
 #[test]
 fn age154_test_model_keeps_accepted_service_boundary_disposition() {
-    // assumption-register: `DiagnosticsServiceRequest::ClassifyExhaustion` remains legacy fallback/GUI diagnostics.
+    // assumption-register (AGE-156 consolidation):
+    //
+    // - `TerminalSignalKind::QuotaExhaustedInband` is the authoritative driver
+    //   for the durable `provider_quotas.exhausted_at` write here. The
+    //   per-provider partitioned recognizers (AGE-162 WU-B in claude.rs /
+    //   codex.rs / openai_compat.rs) emit `QuotaExhaustedInband` ONLY for
+    //   persistent quota signatures; transient rate-limit signatures emit
+    //   `TerminalSignalKind::RateLimited` and must not write `exhausted_at`.
+    // - `DiagnosticsServiceRequest::ClassifyExhaustion` remains the
+    //   degraded-mode fallback that runs only when the typed terminal-signal
+    //   is absent (e.g., pre-typed-signal provider in a degraded execution
+    //   path).
     let body = test_model_with_db_path_body();
     for required in [
         "select_route(RoutingServiceRequest",
@@ -104,9 +115,11 @@ fn age154_test_model_keeps_accepted_service_boundary_disposition() {
         "ExecutorServiceRequest::Effective",
         "working_dir: None",
         "parent_invocation_env: None",
-        "DiagnosticsServiceRequest::ClassifyExhaustion",
         "result.exit_code != 0",
-        "if is_exhausted",
+        "result.terminal_signal",
+        "TerminalSignalKind::QuotaExhaustedInband",
+        "DiagnosticsServiceRequest::ClassifyExhaustion",
+        "if should_mark_exhausted",
         "<StateDb as ProviderQuotaRepository>::mark_exhausted",
     ] {
         assert_contains(
@@ -128,4 +141,35 @@ fn age154_test_model_keeps_accepted_service_boundary_disposition() {
             "test_model_with_db_path must stay outside lifecycle mutation paths",
         );
     }
+}
+
+#[test]
+fn age156_test_model_with_db_path_gates_legacy_classifier_behind_typed_signal_absence() {
+    // AGE-156 acceptance: typed-signal precedence — the legacy broad-string
+    // classifier (`DiagnosticsServiceRequest::ClassifyExhaustion`) may only
+    // run on the degraded-mode `None` branch of `result.terminal_signal`.
+    // The persistent-quota typed kind `QuotaExhaustedInband` must be the
+    // authority on the `Some(signal)` branch.
+    let body = test_model_with_db_path_body();
+
+    let signal_idx = body
+        .find("result.terminal_signal")
+        .expect("typed-signal precedence: `result.terminal_signal` access must appear");
+    let typed_idx = body
+        .find("TerminalSignalKind::QuotaExhaustedInband")
+        .expect("typed-signal precedence: `QuotaExhaustedInband` match must appear");
+    let legacy_idx = body
+        .find("DiagnosticsServiceRequest::ClassifyExhaustion")
+        .expect("degraded-mode fallback: legacy classifier must remain reachable");
+
+    assert!(
+        signal_idx < typed_idx,
+        "typed-signal precedence: signal access must precede the kind match"
+    );
+    assert!(
+        typed_idx < legacy_idx,
+        "typed-signal precedence: the `QuotaExhaustedInband` typed kind must \
+         be checked before the legacy classifier is consulted (legacy is the \
+         degraded-mode fallback only)"
+    );
 }
