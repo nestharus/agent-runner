@@ -1,0 +1,69 @@
+# Coverage baseline for the Rust workspace.
+#
+# Consumed by ~/ai/agents/test-audit-gate.md § 6 "Fetch Coverage Artifacts".
+# The auditor queries this workflow's runs via `gh api .../workflow_runs`
+# with `head_sha` (PR baseline) and `branch=main&event=push` (main baseline)
+# to compute coverage deltas.
+#
+# Scope:
+#   - Rust workspace (`--workspace`, all crates + src-tauri).
+#   - Frontend coverage is intentionally NOT wired here — out of AGE-165
+#     scope; tracked as a separate future enumeration.
+#
+# Why cargo-llvm-cov:
+#   - Source-based instrumentation gives accurate async-await coverage
+#     (the runtime crate is async-heavy).
+#   - Emits lcov, cobertura, and JSON summary from one run.
+
+name: Coverage
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage-v1
+
+      - name: Install system deps (Linux)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Generate coverage (lcov, cobertura, JSON summary)
+        run: |
+          mkdir -p coverage
+          cargo llvm-cov --workspace --no-report
+          cargo llvm-cov report --lcov --output-path coverage/lcov.info
+          cargo llvm-cov report --cobertura --output-path coverage/coverage.xml
+          cargo llvm-cov report --json --summary-only --output-path coverage/coverage-summary.json
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-coverage
+          path: coverage/
+          retention-days: 30
