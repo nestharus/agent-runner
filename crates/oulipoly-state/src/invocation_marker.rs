@@ -48,15 +48,19 @@ impl CompositeInvocationId {
 
     pub fn parse_marker_payload(s: &str) -> Result<Self, ParseMarkerError> {
         reject_empty_payload(s)?;
-        parse_canonical_json(s).or_else(|json_err| {
-            legacy_shell_mangled::parse(s).map_err(|legacy_err| {
-                if legacy_err.is_legacy_shape_error() {
-                    json_err
-                } else {
-                    legacy_err
-                }
-            })
-        })
+        match parse_canonical_json(s) {
+            Ok(parsed) => Ok(parsed),
+            Err(ParseMarkerError::InvalidJson) => {
+                legacy_shell_mangled::parse(s).map_err(|legacy_err| {
+                    if legacy_err.is_legacy_shape_error() {
+                        ParseMarkerError::InvalidJson
+                    } else {
+                        legacy_err
+                    }
+                })
+            }
+            Err(err) => Err(err),
+        }
     }
 }
 
@@ -191,5 +195,20 @@ pub(crate) mod legacy_shell_mangled {
             .trim_matches('"')
             .trim_matches('\'')
             .to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CompositeInvocationId, ParseMarkerError};
+
+    #[test]
+    fn canonical_json_invalid_uuid_preserves_canonical_error() {
+        assert_eq!(
+            CompositeInvocationId::parse_env_value(
+                r#"{"source":"fixture-provider","id":"not-a-uuid"}"#
+            ),
+            Err(ParseMarkerError::InvalidUuid)
+        );
     }
 }
