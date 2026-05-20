@@ -13,9 +13,11 @@ use std::process::{Command, Output, Stdio};
 
 mod claude;
 mod codex;
+mod content_fallback;
 
 pub use claude::ClaudeStorageLocator;
 pub use codex::CodexStorageLocator;
+pub(super) use content_fallback::{locate_claude_by_content, locate_codex_by_content};
 
 pub type ProviderName<'a> = &'a str;
 pub type SessionId = String;
