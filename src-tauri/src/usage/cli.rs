@@ -22,7 +22,7 @@ pub struct Cli {
             "agent_file",
             "new",
             "resume",
-            "migrate",
+            "rotate_provider",
             "input"
         ]
     )]
@@ -52,9 +52,16 @@ pub struct Cli {
     #[arg(short = 'n', long = "new", conflicts_with = "resume")]
     pub(crate) new: bool,
 
-    /// Manually migrate the active chain segment to the named provider.
-    #[arg(long = "migrate")]
-    pub(crate) migrate: Option<String>,
+    /// Rotate the active chain segment's provider. With a value, reroute to
+    /// the named provider; without a value, auto-rotate to the next working
+    /// candidate. Omit to honor the bound provider.
+    #[arg(
+        long = "rotate-provider",
+        value_name = "TARGET",
+        num_args = 0..=1,
+        default_missing_value = "",
+    )]
+    pub(crate) rotate_provider: Option<String>,
 
     /// Path to an agent .md file
     #[arg(short = 'a', long = "agent-file")]
@@ -117,9 +124,16 @@ pub(crate) enum Subcommands {
         #[arg(long = "resume")]
         resume: Option<String>,
 
-        /// Manually migrate the active chain segment to the named provider.
-        #[arg(long = "migrate")]
-        migrate: Option<String>,
+        /// Rotate the active chain segment's provider. With a value, reroute
+        /// to the named provider; without a value, auto-rotate to the next
+        /// working candidate. Omit to honor the bound provider.
+        #[arg(
+            long = "rotate-provider",
+            value_name = "TARGET",
+            num_args = 0..=1,
+            default_missing_value = "",
+        )]
+        rotate_provider: Option<String>,
 
         /// Working directory for the wrapped CLI
         #[arg(short = 'p', long = "project")]
@@ -144,9 +158,16 @@ pub(crate) enum Subcommands {
         #[arg(value_name = "CHAIN_ID")]
         chain_id: Option<String>,
 
-        /// Manually migrate the active chain segment to the named provider.
-        #[arg(long = "migrate")]
-        migrate: Option<String>,
+        /// Rotate the active chain segment's provider. With a value, reroute
+        /// to the named provider; without a value, auto-rotate to the next
+        /// working candidate. Omit to honor the bound provider.
+        #[arg(
+            long = "rotate-provider",
+            value_name = "TARGET",
+            num_args = 0..=1,
+            default_missing_value = "",
+        )]
+        rotate_provider: Option<String>,
 
         /// Inline answer payload. Use --file for larger payloads.
         #[arg(long = "prompt", conflicts_with = "file")]

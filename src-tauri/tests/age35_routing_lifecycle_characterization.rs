@@ -551,19 +551,21 @@ fn age_81_one_shot_retries_first_quota_exhausted_provider_then_succeeds() {
         "{stderr}"
     );
     let db = fixture.open_db();
+    // AGE-163 WU-A.4: durable working-set unavailability moved from
+    // `exhausted_at` to `next_available_at` via the typed forensics path.
     assert!(
         db.get_quota("age81-a")
             .unwrap()
-            .and_then(|quota| quota.exhausted_at)
+            .and_then(|quota| quota.next_available_at)
             .is_some(),
-        "first provider should be marked exhausted before retry"
+        "first provider should be marked unavailable (next_available_at) before retry"
     );
     assert!(
         db.get_quota("age81-b")
             .unwrap()
-            .and_then(|quota| quota.exhausted_at)
+            .and_then(|quota| quota.next_available_at)
             .is_none(),
-        "successful retry provider should not be marked exhausted"
+        "successful retry provider should not be marked unavailable"
     );
 }
 
@@ -596,13 +598,14 @@ fn age_81_one_shot_retries_n_minus_one_quota_exhausted_providers_then_succeeds()
         "{stderr}"
     );
     let db = fixture.open_db();
+    // AGE-163 WU-A.4: see `next_available_at` comment above.
     for provider in ["age81-a", "age81-b"] {
         assert!(
             db.get_quota(provider)
                 .unwrap()
-                .and_then(|quota| quota.exhausted_at)
+                .and_then(|quota| quota.next_available_at)
                 .is_some(),
-            "{provider} should be marked exhausted"
+            "{provider} should be marked unavailable"
         );
     }
 }
@@ -631,13 +634,14 @@ fn age_81_one_shot_all_quota_exhausted_returns_pool_error() {
         "{stderr}"
     );
     let db = fixture.open_db();
+    // AGE-163 WU-A.4: see `next_available_at` comment above.
     for provider in ["age81-a", "age81-b"] {
         assert!(
             db.get_quota(provider)
                 .unwrap()
-                .and_then(|quota| quota.exhausted_at)
+                .and_then(|quota| quota.next_available_at)
                 .is_some(),
-            "{provider} should be marked exhausted"
+            "{provider} should be marked unavailable"
         );
     }
 }
@@ -664,12 +668,16 @@ fn age_81_one_shot_non_quota_failure_does_not_retry() {
     assert!(!stderr.contains("retrying another provider"), "{stderr}");
     assert!(!stderr.contains("age81-b executed"), "{stderr}");
     let db = fixture.open_db();
+    // AGE-163 WU-A.4: non-quota failures may still mutate routing state
+    // (UpstreamApiDown / TransientStderrNoise) via the typed forensics
+    // path. The original `exhausted_at`-only assertion is preserved
+    // verbatim — `exhausted_at` is no longer written by the typed path.
     assert!(
         db.get_quota("age81-a")
             .unwrap()
             .and_then(|quota| quota.exhausted_at)
             .is_none(),
-        "non-quota failure should not mark provider exhausted"
+        "non-quota failure should not flip the legacy `exhausted_at` flag"
     );
 }
 

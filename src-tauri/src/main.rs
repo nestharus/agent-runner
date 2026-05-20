@@ -33,6 +33,7 @@ use oulipoly_runtime::services::{
     DiagnosticsServiceOutput, DiagnosticsServiceRequest, ExecutorServiceRequest,
     InvocationLifecycleFinalizeRequest, InvocationLifecycleServicePort,
     InvocationLifecycleStartRequest, MigrationServiceOutput, MigrationServiceRequest,
+    RotationFailedReason,
     ResumeAcceptanceRequest, ResumeServiceOutput, ResumeServiceRequest, RoutingServicePort,
     RoutingServiceRequest, ServiceError, SessionExportServiceRequest, SessionLifecycleIngestMode,
     SessionLifecycleRequest, SessionLockFailure, SessionLockServiceRequest, SessionLockSuccess,
@@ -384,14 +385,14 @@ fn dispatch_subcommand(
         Subcommands::Repl {
             model,
             resume,
-            migrate,
+            rotate_provider,
             project,
             models_dir,
         } => run_repl(
             agent_runtime_services,
             model.as_deref(),
             resume.as_deref(),
-            migrate.as_deref(),
+            rotate_provider.as_deref(),
             project.as_deref(),
             models_dir.as_deref(),
         ),
@@ -399,7 +400,7 @@ fn dispatch_subcommand(
             model,
             session_id,
             chain_id,
-            migrate,
+            rotate_provider,
             prompt,
             file,
             project,
@@ -408,7 +409,7 @@ fn dispatch_subcommand(
             agent_runtime_services,
             model.as_deref(),
             resume_target_arg(session_id.as_deref(), chain_id.as_deref()),
-            migrate.as_deref(),
+            rotate_provider.as_deref(),
             prompt.as_deref(),
             file.as_deref(),
             project.as_deref(),
@@ -486,7 +487,7 @@ fn dispatch_top_level_resume(
             agent_runtime_services,
             cli.model.as_deref(),
             session_id,
-            cli.migrate.as_deref(),
+            cli.rotate_provider.as_deref(),
             positional_or_stdin_prompt.as_deref(),
             cli.file.as_deref(),
             cli.project.as_deref(),
@@ -496,7 +497,7 @@ fn dispatch_top_level_resume(
             agent_runtime_services,
             cli.model.as_deref(),
             Some(session_id),
-            cli.migrate.as_deref(),
+            cli.rotate_provider.as_deref(),
             cli.project.as_deref(),
             cli.models_dir.as_deref(),
         ),
@@ -2260,7 +2261,10 @@ fn run_repl(
                     effective_cwd: &effective_spawn_cwd,
                     stderr: &mut migration_stderr,
                 }) {
-                Ok(MigrationServiceOutput::Migrated { segment: migrated }) => {
+                Ok(MigrationServiceOutput::Migrated { segment: migrated })
+                | Ok(MigrationServiceOutput::AutoRotated {
+                    segment: migrated, ..
+                }) => {
                     resolved.active_provider = migrated.target_provider.clone();
                     resolved.active_session_id = migrated.target_session_id.clone();
                     fallback_target = Some(
@@ -2268,8 +2272,11 @@ fn run_repl(
                             .map_err(format_resume_error)?,
                     );
                 }
-                Ok(MigrationServiceOutput::Stay)
-                | Ok(MigrationServiceOutput::DecisionFailed { .. }) => {}
+                Ok(MigrationServiceOutput::Stay) => {}
+                Ok(MigrationServiceOutput::RotationFailed { reason }) => {
+                    eprintln!("{}", format_rotation_failed_reason(&reason));
+                    return Ok(1);
+                }
                 Err(ServiceError::Dependency { message }) => {
                     eprintln!("migration failed: {message}");
                     return Ok(1);
@@ -2756,7 +2763,10 @@ fn run_resume(
                 effective_cwd: &effective_spawn_cwd,
                 stderr: &mut migration_stderr,
             }) {
-            Ok(MigrationServiceOutput::Migrated { segment: migrated }) => {
+            Ok(MigrationServiceOutput::Migrated { segment: migrated })
+            | Ok(MigrationServiceOutput::AutoRotated {
+                segment: migrated, ..
+            }) => {
                 resolved.active_provider = migrated.target_provider.clone();
                 resolved.active_session_id = migrated.target_session_id.clone();
                 target = match renderable_resume_execution_target(&resolved, &env.providers_cfg) {
@@ -2764,8 +2774,11 @@ fn run_resume(
                     Err(exit_code) => return Ok(exit_code),
                 };
             }
-            Ok(MigrationServiceOutput::Stay)
-            | Ok(MigrationServiceOutput::DecisionFailed { .. }) => {}
+            Ok(MigrationServiceOutput::Stay) => {}
+            Ok(MigrationServiceOutput::RotationFailed { reason }) => {
+                eprintln!("{}", format_rotation_failed_reason(&reason));
+                return Ok(1);
+            }
             Err(ServiceError::Dependency { message }) => {
                 eprintln!("migration failed: {message}");
                 return Ok(1);
@@ -3069,10 +3082,52 @@ fn read_provider_quota_state(
     state.get_quota(provider_name)
 }
 
+/// AGE-163 WU-A.5: a dispatch is "headless" when stdin is not a TTY. The
+/// runtime treats headless `--resume` sessions as eligible for autonomous
+/// auto-rotation when the bound provider hits a terminal failure (per the
+/// design contract). Interactive sessions surface failures to the operator
+/// instead.
+fn is_dispatch_headless() -> bool {
+    use std::io::IsTerminal;
+    !std::io::stdin().is_terminal()
+}
+
+fn format_rotation_failed_reason(reason: &RotationFailedReason) -> String {
+    match reason {
+        RotationFailedReason::WorkingSetExhausted { candidates_tried } => format!(
+            "migration failed: working set exhausted after trying providers [{}]",
+            candidates_tried.join(", ")
+        ),
+        RotationFailedReason::ManualTargetNotInPool { target, pool } => format!(
+            "cannot rotate: provider \"{target}\" is not in model pool [{}]",
+            pool.join(", ")
+        ),
+        RotationFailedReason::ManualTargetNotMigratable { source, target } => format!(
+            "cannot rotate: {source} -> {target} is not a migratable storage-class pair"
+        ),
+        RotationFailedReason::ManualTargetIsSingleProviderPool { provider } => format!(
+            "cannot rotate: model pool has only one provider ({provider})"
+        ),
+        RotationFailedReason::ManualTargetActiveNotInPool { active } => format!(
+            "cannot rotate: session-active provider \"{active}\" is not in the model pool"
+        ),
+    }
+}
+
 fn quota_state_has_capacity(quota: Option<oulipoly_state::QuotaRecord>) -> bool {
-    quota
-        .and_then(|provider_quota| provider_quota.exhausted_at)
-        .is_none()
+    // AGE-163 WU-A.4: the typed forensics writer lands durable
+    // unavailability on `next_available_at`. A provider has capacity iff
+    // neither the legacy `exhausted_at` flag nor an unelapsed
+    // `next_available_at` cooldown is set.
+    let Some(record) = quota else {
+        return true;
+    };
+    if record.exhausted_at.is_some() {
+        return false;
+    }
+    !record
+        .next_available_at
+        .is_some_and(|ts| ts > chrono::Utc::now())
 }
 
 fn emit_quota_inspection_warning(provider_name: &str, err: &str) {
@@ -6017,7 +6072,7 @@ mod tests {
             Some(Subcommands::Repl {
                 model,
                 resume,
-                migrate: _,
+                rotate_provider: _,
                 project,
                 models_dir,
             }) => {
@@ -6170,7 +6225,7 @@ mod tests {
             Some(Subcommands::Resume {
                 model,
                 session_id: parsed_session,
-                migrate: _,
+                rotate_provider: _,
                 prompt,
                 file,
                 project,
@@ -6500,12 +6555,12 @@ mod tests {
 
     // risk: CLI surface; level: unit; source: proposal §11.1 CLI surface / A8.
     #[test]
-    fn top_level_resume_parse_allows_missing_model_and_migrate_flag() {
+    fn top_level_resume_parse_allows_missing_model_and_rotate_provider_flag() {
         let cli = Cli::try_parse_from([
             "oulipoly-agent-runner",
             "--resume",
             "5169694d-de0f-40d1-890c-6e28e55bab27",
-            "--migrate",
+            "--rotate-provider",
             "claude2",
             "continue",
         ])
@@ -6517,7 +6572,7 @@ mod tests {
             cli.resume.as_deref(),
             Some("5169694d-de0f-40d1-890c-6e28e55bab27")
         );
-        assert_eq!(cli.migrate.as_deref(), Some("claude2"));
+        assert_eq!(cli.rotate_provider.as_deref(), Some("claude2"));
     }
 
     // risk: CLI surface; level: unit; source: proposal §11.1 CLI surface / A5, A8.

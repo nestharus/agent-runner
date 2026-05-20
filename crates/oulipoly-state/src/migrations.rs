@@ -49,6 +49,12 @@ static MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0008_owned_turn_events.sql"),
         post_sql_hook: None,
     },
+    Migration {
+        target_version: 9,
+        id: "0009_age163_working_set_and_round_robin",
+        sql: include_str!("../migrations/0009_age163_working_set_and_round_robin.sql"),
+        post_sql_hook: Some(apply_v9_working_set_columns),
+    },
 ];
 
 pub fn manifest() -> &'static [Migration] {
@@ -222,6 +228,43 @@ fn apply_v7_resume_provider_identity(conn: &Connection) -> Result<(), rusqlite::
     }
 
     conn.execute_batch("ALTER TABLE invocations ADD COLUMN provider_session_resolved_account TEXT;")
+}
+
+fn apply_v9_working_set_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
+    if !table_exists(conn, "provider_quotas")? {
+        return Ok(());
+    }
+    add_column_if_missing(
+        conn,
+        "provider_quotas",
+        "next_available_at",
+        "ALTER TABLE provider_quotas ADD COLUMN next_available_at TEXT NULL",
+    )?;
+    add_column_if_missing(
+        conn,
+        "provider_quotas",
+        "last_refresh_at",
+        "ALTER TABLE provider_quotas ADD COLUMN last_refresh_at TEXT NULL",
+    )?;
+    add_column_if_missing(
+        conn,
+        "provider_quotas",
+        "failure_class",
+        "ALTER TABLE provider_quotas ADD COLUMN failure_class TEXT NULL",
+    )?;
+    Ok(())
+}
+
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    sql: &str,
+) -> Result<(), rusqlite::Error> {
+    if column_exists(conn, table, column)? {
+        return Ok(());
+    }
+    conn.execute_batch(sql)
 }
 
 fn table_exists(conn: &Connection, table: &str) -> Result<bool, rusqlite::Error> {

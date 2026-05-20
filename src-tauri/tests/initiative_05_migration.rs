@@ -1341,7 +1341,7 @@ projects_dir = "{}"
         .command()
         .arg("--resume")
         .arg(CHAIN_A)
-        .arg("--migrate")
+        .arg("--rotate-provider")
         .arg("claude2")
         .args(["--models-dir"])
         .arg(&fixture.models_dir)
@@ -1524,7 +1524,7 @@ projects_dir = "{}"
             "resume",
             "--session-id",
             SESSION_A,
-            "--migrate",
+            "--rotate-provider",
             "claude2",
             "--prompt",
             "continue",

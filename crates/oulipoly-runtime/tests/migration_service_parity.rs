@@ -236,7 +236,7 @@ fn migration_service_parity_unchanged() {
 }
 
 #[test]
-fn migration_service_decision_failure_is_nonfatal_output() {
+fn migration_service_decision_failure_is_dependency_error() {
     let fixture = Fixture::new();
     let model = fixture.model_with_storage();
     let resolved = fixture.seed_resolved(&model, SESSION_A);
@@ -260,19 +260,21 @@ fn migration_service_decision_failure_is_nonfatal_output() {
         stderr: &mut stderr,
     });
 
+    // AGE-163 WU-A.2: the silent `DecisionFailed` nonfatal-output arm has
+    // been removed. A `decide_migration` failure now bubbles up as a typed
+    // `ServiceError::Dependency` so the caller can render an
+    // operator-visible diagnostic.
+    let err = output
+        .err()
+        .expect("expected ServiceError::Dependency, got Ok");
+    let message = match err {
+        oulipoly_runtime::services::ServiceError::Dependency { message } => message,
+        other => panic!("expected ServiceError::Dependency, got {other:?}"),
+    };
     assert!(
-        matches!(
-            &output,
-            Ok(MigrationServiceOutput::DecisionFailed { warning }) if !warning.is_empty()
-        ),
-        "expected nonfatal decision failure with a warning, got {output:?}"
+        message.contains("provider_quotas"),
+        "dependency error should mention the missing table: {message}"
     );
-    if let Ok(MigrationServiceOutput::DecisionFailed { warning }) = &output {
-        assert!(
-            warning.contains("provider_quotas"),
-            "warning should mention the missing table: {warning}"
-        );
-    }
     assert!(stderr.is_empty());
 }
 

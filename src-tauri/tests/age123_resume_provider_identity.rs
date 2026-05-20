@@ -259,7 +259,7 @@ prompt_mode = "stdin"
             .arg("age123-resume")
             .arg("--resume")
             .arg(resume_input)
-            .arg("--migrate")
+            .arg("--rotate-provider")
             .arg(target_provider)
             .arg("--models-dir")
             .arg(&self.models_dir)

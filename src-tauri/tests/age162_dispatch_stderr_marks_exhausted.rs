@@ -174,6 +174,16 @@ fn provider_exhausted_at_is_set(db: &StateDb, provider: &str) -> bool {
         .is_some()
 }
 
+/// AGE-163 WU-A.4 replaces `mark_provider_exhausted`'s `exhausted_at`
+/// write with the typed forensics writer that lands `next_available_at`.
+/// The canonical-quota branch-coverage assertions check this column instead.
+fn provider_next_available_at_is_set(db: &StateDb, provider: &str) -> bool {
+    db.get_quota(provider)
+        .unwrap()
+        .and_then(|quota| quota.next_available_at)
+        .is_some()
+}
+
 /// (a) Pin the Symptom 2 contract against the AGE-159 signature.
 ///
 /// stderr matches the empirical AGE-159 trace signature: a transient HTTP 429
@@ -269,15 +279,18 @@ fn age162_canonical_quota_signature_still_flips_exhausted_at_under_claude_recogn
     let _output = fixture.run_one_shot("age162-quota-repro");
 
     let db = fixture.open_db();
-    let owner_exhausted = provider_exhausted_at_is_set(&db, SESSION_OWNER);
+    let owner_unavailable = provider_next_available_at_is_set(&db, SESSION_OWNER);
     assert!(
-        owner_exhausted,
+        owner_unavailable,
         "AGE-162 Symptom 2 branch coverage: provider {SESSION_OWNER} did NOT \
-         have `exhausted_at` set after a dispatch whose stderr contained \
+         have `next_available_at` set after a dispatch whose stderr contained \
          the canonical 'Claude usage limit reached' quota signature. The \
-         legitimate quota-exhausted path must remain functional — the \
-         Symptom 2 fix is to narrow the rate-limit branch, not to remove \
-         the quota-exhaustion classifier entirely."
+         legitimate quota-exhausted path must remain functional — AGE-163 \
+         WU-A.4 routed the durable working-set write from `mark_exhausted` \
+         into `apply_post_failure_forensics` (which writes \
+         `next_available_at`); the Symptom 2 fix is to narrow the \
+         rate-limit branch, not to remove the quota-exhaustion classifier \
+         entirely."
     );
 }
 
@@ -339,15 +352,16 @@ fn age162_canonical_quota_signature_still_flips_exhausted_at_under_codex_recogni
     let _output = fixture.run_one_shot("age162-codex-quota-repro");
 
     let db = fixture.open_db();
-    let owner_exhausted = provider_exhausted_at_is_set(&db, CODEX_OWNER);
+    let owner_unavailable = provider_next_available_at_is_set(&db, CODEX_OWNER);
     assert!(
-        owner_exhausted,
+        owner_unavailable,
         "AGE-162 Symptom 2 branch coverage (Codex recognizer): provider \
-         {CODEX_OWNER} did NOT have `exhausted_at` set after a dispatch \
+         {CODEX_OWNER} did NOT have `next_available_at` set after a dispatch \
          whose stderr contained the canonical Codex persistent-quota \
-         signature (`usage cap` / `quota exceeded`). The legitimate \
-         quota-exhausted path must remain functional for the Codex \
-         recognizer."
+         signature (`usage cap` / `quota exceeded`). AGE-163 WU-A.4 routed \
+         the durable working-set write into `apply_post_failure_forensics`; \
+         the legitimate quota-exhausted path must remain functional for the \
+         Codex recognizer."
     );
 }
 
@@ -418,14 +432,15 @@ fn age162_canonical_quota_signature_still_flips_exhausted_at_under_openai_compat
     let _output = fixture.run_one_shot("age162-gemini-quota-repro");
 
     let db = fixture.open_db();
-    let owner_exhausted = provider_exhausted_at_is_set(&db, OPENAI_COMPAT_OWNER);
+    let owner_unavailable = provider_next_available_at_is_set(&db, OPENAI_COMPAT_OWNER);
     assert!(
-        owner_exhausted,
+        owner_unavailable,
         "AGE-162 Symptom 2 branch coverage (OpenAI-compatible recognizer): \
-         provider {OPENAI_COMPAT_OWNER} did NOT have `exhausted_at` set \
+         provider {OPENAI_COMPAT_OWNER} did NOT have `next_available_at` set \
          after a dispatch whose stderr contained the canonical \
-         persistent-quota signature (`quota exhausted`). The legitimate \
-         quota-exhausted path must remain functional for the OpenAI-\
-         compatible recognizer."
+         persistent-quota signature (`quota exhausted`). AGE-163 WU-A.4 \
+         routed the durable working-set write into \
+         `apply_post_failure_forensics`; the legitimate quota-exhausted \
+         path must remain functional for the OpenAI-compatible recognizer."
     );
 }

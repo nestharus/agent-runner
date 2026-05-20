@@ -294,7 +294,9 @@ prompt_mode = "stdin"
 
     let db = fixture.open_db();
     let quota = db.get_quota("claude-failure-provider").unwrap().unwrap();
-    assert!(quota.exhausted_at.is_some());
+    // AGE-163 WU-A.4: durable working-set write moved from `exhausted_at`
+    // to `next_available_at` via the typed forensics path.
+    assert!(quota.next_available_at.is_some());
     let invocation = parse_invocation(&stderr);
     let row = db
         .get_invocation_by_uuid(&invocation.id)

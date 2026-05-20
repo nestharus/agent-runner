@@ -223,6 +223,9 @@ pub struct QuotaRecord {
     pub exhausted_at: Option<DateTime<Utc>>,
     pub topology_peak_live_window_count: usize,
     pub last_topology_probe_at: Option<DateTime<Utc>>,
+    pub next_available_at: Option<DateTime<Utc>>,
+    pub last_refresh_at: Option<DateTime<Utc>>,
+    pub failure_class: Option<String>,
 }
 
 /// One rolling-quota window reported by a provider's quota script.
@@ -1940,7 +1943,7 @@ impl StateDb {
         )
     }
 
-    fn provider_quotas_column_repairs() -> [ColumnRepair; 2] {
+    fn provider_quotas_column_repairs() -> [ColumnRepair; 5] {
         [
             ColumnRepair {
                 column_name: "last_empty_refresh_at",
@@ -1951,6 +1954,21 @@ impl StateDb {
                 column_name: "exhausted_at",
                 sql: "ALTER TABLE provider_quotas ADD COLUMN exhausted_at TEXT NULL",
                 error_context: "Failed to add provider_quotas.exhausted_at",
+            },
+            ColumnRepair {
+                column_name: "next_available_at",
+                sql: "ALTER TABLE provider_quotas ADD COLUMN next_available_at TEXT NULL",
+                error_context: "Failed to add provider_quotas.next_available_at",
+            },
+            ColumnRepair {
+                column_name: "last_refresh_at",
+                sql: "ALTER TABLE provider_quotas ADD COLUMN last_refresh_at TEXT NULL",
+                error_context: "Failed to add provider_quotas.last_refresh_at",
+            },
+            ColumnRepair {
+                column_name: "failure_class",
+                sql: "ALTER TABLE provider_quotas ADD COLUMN failure_class TEXT NULL",
+                error_context: "Failed to add provider_quotas.failure_class",
             },
         ]
     }
@@ -4329,7 +4347,8 @@ impl StateDb {
             .conn
             .prepare(
                 "SELECT calls_since_refresh, refreshed_at, exhausted_at,
-                        topology_peak_live_window_count, last_topology_probe_at
+                        topology_peak_live_window_count, last_topology_probe_at,
+                        next_available_at, last_refresh_at, failure_class
                  FROM provider_quotas WHERE provider_name = ?1",
             )
             .map_err(|e| format!("Failed to prepare quota query: {e}"))?;
@@ -4350,6 +4369,9 @@ impl StateDb {
                     },
                 )?,
                 last_topology_probe_at: Self::optional_forgiving_rfc3339(row.get(4)?),
+                next_available_at: Self::optional_forgiving_rfc3339(row.get(5)?),
+                last_refresh_at: Self::optional_forgiving_rfc3339(row.get(6)?),
+                failure_class: row.get::<_, Option<String>>(7)?,
             })
         });
 
@@ -4381,6 +4403,58 @@ impl StateDb {
         Ok(())
     }
 
+    pub fn record_provider_unavailable(
+        &self,
+        provider_name: &str,
+        next_available_at: Option<DateTime<Utc>>,
+        failure_class: &str,
+    ) -> Result<(), String> {
+        let next_at = next_available_at.map(|ts| ts.to_rfc3339());
+        self.conn
+            .execute(
+                "INSERT INTO provider_quotas
+                    (provider_name, next_available_at, failure_class)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT (provider_name) DO UPDATE SET
+                    next_available_at = excluded.next_available_at,
+                    failure_class = excluded.failure_class",
+                params![provider_name, next_at, failure_class],
+            )
+            .map_err(|e| format!("Failed to record provider unavailable: {e}"))?;
+        Ok(())
+    }
+
+    pub fn clear_provider_unavailable(&self, provider_name: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE provider_quotas
+                 SET next_available_at = NULL,
+                     failure_class = NULL
+                 WHERE provider_name = ?1",
+                params![provider_name],
+            )
+            .map_err(|e| format!("Failed to clear provider unavailable: {e}"))?;
+        Ok(())
+    }
+
+    pub fn touch_provider_refresh(
+        &self,
+        provider_name: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), String> {
+        let ts = now.to_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO provider_quotas (provider_name, last_refresh_at)
+                 VALUES (?1, ?2)
+                 ON CONFLICT (provider_name) DO UPDATE SET
+                    last_refresh_at = excluded.last_refresh_at",
+                params![provider_name, ts],
+            )
+            .map_err(|e| format!("Failed to touch provider refresh: {e}"))?;
+        Ok(())
+    }
+
     pub fn clear_exhausted(&self, provider_name: &str) -> Result<(), String> {
         self.conn
             .execute(
@@ -4388,6 +4462,44 @@ impl StateDb {
                 params![provider_name],
             )
             .map_err(|e| format!("Failed to clear provider exhausted flag: {e}"))?;
+        Ok(())
+    }
+
+    pub fn next_round_robin_index_for_model(
+        &self,
+        model_name: &str,
+    ) -> Result<Option<usize>, String> {
+        let result = self.conn.query_row(
+            "SELECT last_index FROM model_round_robin_cursor WHERE model_name = ?1",
+            params![model_name],
+            |row| row.get::<_, i64>(0),
+        );
+        match result {
+            Ok(value) => usize::try_from(value)
+                .map(Some)
+                .map_err(|_| format!("Negative round-robin cursor for {model_name}")),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(format!("Failed to query round-robin cursor: {e}")),
+        }
+    }
+
+    pub fn advance_round_robin_index(
+        &self,
+        model_name: &str,
+        new_index: usize,
+        now: DateTime<Utc>,
+    ) -> Result<(), String> {
+        let ts = now.to_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO model_round_robin_cursor (model_name, last_index, updated_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT (model_name) DO UPDATE SET
+                    last_index = excluded.last_index,
+                    updated_at = excluded.updated_at",
+                params![model_name, new_index as i64, ts],
+            )
+            .map_err(|e| format!("Failed to advance round-robin cursor: {e}"))?;
         Ok(())
     }
 
@@ -7523,6 +7635,104 @@ mod tests {
         assert_eq!(exhausted_at_raw(&db, provider), None);
 
         db.clear_exhausted("nonexistent-provider").unwrap();
+    }
+
+    #[test]
+    fn record_provider_unavailable_writes_and_round_trips_next_available_at() {
+        let db = test_db();
+        let provider = "wu-a1-record";
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-05-21T01:23:45Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        db.record_provider_unavailable(provider, Some(ts), "RollingWindow5h")
+            .unwrap();
+
+        let quota = db.get_quota(provider).unwrap().expect("row written");
+        assert_eq!(quota.next_available_at, Some(ts));
+        assert_eq!(quota.failure_class.as_deref(), Some("RollingWindow5h"));
+    }
+
+    #[test]
+    fn record_provider_unavailable_idempotent_under_repeat_calls() {
+        let db = test_db();
+        let provider = "wu-a1-repeat";
+        let ts1 = chrono::DateTime::parse_from_rfc3339("2026-05-21T01:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let ts2 = chrono::DateTime::parse_from_rfc3339("2026-05-21T02:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        db.record_provider_unavailable(provider, Some(ts1), "RollingWindow5h")
+            .unwrap();
+        db.record_provider_unavailable(provider, Some(ts2), "WeeklyOrLonger")
+            .unwrap();
+
+        let quota = db.get_quota(provider).unwrap().expect("row written");
+        assert_eq!(quota.next_available_at, Some(ts2));
+        assert_eq!(quota.failure_class.as_deref(), Some("WeeklyOrLonger"));
+    }
+
+    #[test]
+    fn touch_provider_refresh_updates_last_refresh_at_only() {
+        let db = test_db();
+        let provider = "wu-a1-touch";
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-21T03:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        db.touch_provider_refresh(provider, now).unwrap();
+
+        let quota = db.get_quota(provider).unwrap().expect("row written");
+        assert_eq!(quota.last_refresh_at, Some(now));
+        assert_eq!(quota.next_available_at, None);
+        assert_eq!(quota.failure_class, None);
+    }
+
+    #[test]
+    fn next_round_robin_index_for_model_returns_none_on_unknown_model() {
+        let db = test_db();
+        assert_eq!(db.next_round_robin_index_for_model("nope").unwrap(), None);
+    }
+
+    #[test]
+    fn advance_round_robin_index_persists_across_db_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let now = Utc::now();
+        {
+            let db = StateDb::open(&path).unwrap();
+            db.advance_round_robin_index("claude-opus", 2, now).unwrap();
+        }
+        let db = StateDb::open(&path).unwrap();
+        assert_eq!(
+            db.next_round_robin_index_for_model("claude-opus").unwrap(),
+            Some(2)
+        );
+
+        db.advance_round_robin_index("claude-opus", 5, now).unwrap();
+        assert_eq!(
+            db.next_round_robin_index_for_model("claude-opus").unwrap(),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn clear_provider_unavailable_nulls_next_available_at_and_failure_class() {
+        let db = test_db();
+        let provider = "wu-a1-clear";
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-05-21T04:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        db.record_provider_unavailable(provider, Some(ts), "UpstreamApiDown")
+            .unwrap();
+        db.clear_provider_unavailable(provider).unwrap();
+
+        let quota = db.get_quota(provider).unwrap().expect("row exists");
+        assert_eq!(quota.next_available_at, None);
+        assert_eq!(quota.failure_class, None);
     }
 
     #[test]
