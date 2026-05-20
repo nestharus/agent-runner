@@ -1164,22 +1164,6 @@ fn execute_with_bounded_silence(
             )?;
         }
 
-        if last_output_seen.elapsed() >= config.silence_ceiling {
-            let terminal_status = prolonged_silence_status();
-            let terminal_signal = recognize_terminal_signal(
-                provider_name,
-                config.recognizer,
-                &stdout,
-                &stderr,
-                terminal_status.clone(),
-            );
-            break (
-                terminal_status,
-                Some(terminal_signal),
-                terminate_child(&mut child)?,
-            );
-        }
-
         match drains.rx.recv_timeout(BOUNDED_SILENCE_POLL_INTERVAL) {
             Ok((stream, chunk)) => append_output_chunk(
                 stream,
