@@ -77,15 +77,13 @@ impl DiagnosticsServicePort for RuntimeDiagnosticsService {
     }
 }
 
-pub fn classify_exhaustion(stderr: &str) -> bool {
-    let lower = stderr.to_lowercase();
-    lower.contains("quota")
-        || lower.contains("billing")
-        || lower.contains("usage limit")
-        || lower.contains("usage cap")
-        || lower.contains("hit your limit")
-        || lower.contains("you've hit your limit")
-        || lower.contains("limit resets")
+pub fn classify_exhaustion(_stderr: &str) -> bool {
+    // Provider-coupled substring matching removed. Quota detection moves
+    // to turn-counting at the session-completion layer (see follow-up WU).
+    // Always returns false: nothing gets classified as quota-exhausted
+    // from stderr content. Caller fall-through paths must not rely on
+    // this signal.
+    false
 }
 
 pub fn diagnose_error(
@@ -178,14 +176,7 @@ fn parse_diagnosis(output: &str, stderr: &str, exit_code: i32) -> Result<Diagnos
 fn heuristic_diagnosis(stderr: &str, _exit_code: i32) -> Diagnosis {
     let lower = stderr.to_lowercase();
 
-    let category = if classify_exhaustion(stderr) {
-        ErrorCategory::QuotaExhausted
-    } else if lower.contains("429")
-        || lower.contains("rate limit")
-        || lower.contains("too many requests")
-    {
-        ErrorCategory::RateLimit
-    } else if lower.contains("unauthorized")
+    let category = if lower.contains("unauthorized")
         || lower.contains("auth")
         || lower.contains("token expired")
     {
