@@ -66,8 +66,7 @@ use crate::executor::terminal_signal::{
 };
 
 const LARGE_PROMPT_THRESHOLD: usize = 100 * 1024; // 100KB
-const BOUNDED_SILENCE_DEFAULT: Duration = Duration::from_secs(90);
-const BOUNDED_SILENCE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const TERMINATE_GRACE_PERIOD: Duration = Duration::from_millis(250);
 
 pub fn execute(
@@ -135,7 +134,7 @@ pub fn execute_effective_with_start_known_provider_session_id(
     request: EffectiveExecuteRequest<'_>,
     start_known_provider_session_id: Option<&str>,
 ) -> Result<ExecutionResult, String> {
-    execute_effective_with_optional_bounded_silence_config(
+    execute_effective_with_optional_supervisor_config(
         request,
         start_known_provider_session_id,
         None,
@@ -143,25 +142,25 @@ pub fn execute_effective_with_start_known_provider_session_id(
 }
 
 #[cfg(test)]
-fn execute_effective_with_bounded_silence_config(
+fn execute_effective_with_supervisor_config(
     request: EffectiveExecuteRequest<'_>,
     start_known_provider_session_id: Option<&str>,
-    bounded_silence_config: BoundedSilenceConfig,
+    supervisor_config: SupervisorConfig,
 ) -> Result<ExecutionResult, String> {
-    execute_effective_with_optional_bounded_silence_config(
+    execute_effective_with_optional_supervisor_config(
         request,
         start_known_provider_session_id,
-        Some(bounded_silence_config),
+        Some(supervisor_config),
     )
 }
 
-fn execute_effective_with_optional_bounded_silence_config(
+fn execute_effective_with_optional_supervisor_config(
     request: EffectiveExecuteRequest<'_>,
     start_known_provider_session_id: Option<&str>,
-    bounded_silence_config: Option<BoundedSilenceConfig>,
+    supervisor_config: Option<SupervisorConfig>,
 ) -> Result<ExecutionResult, String> {
     let input_args = resolve_input_flags(request.model, request.extra_inputs)?;
-    let (result, temp_files) = execute_provider_with_arg_parts_and_bounded_silence_config(
+    let (result, temp_files) = execute_provider_with_arg_parts_and_supervisor_config(
         request.provider,
         &request.provider.args,
         &[],
@@ -171,7 +170,7 @@ fn execute_effective_with_optional_bounded_silence_config(
         &input_args,
         request.parent_invocation_env,
         start_known_provider_session_id,
-        bounded_silence_config,
+        supervisor_config,
     )?;
     cleanup_temp_files(temp_files);
 
@@ -472,21 +471,19 @@ impl ProviderRecognizer {
 }
 
 #[derive(Clone, Debug)]
-struct BoundedSilenceConfig {
-    silence_ceiling: Duration,
+struct SupervisorConfig {
     prompt_mode: PromptMode,
     prompt_payload: Option<Vec<u8>>,
     recognizer: ProviderRecognizer,
 }
 
-impl BoundedSilenceConfig {
+impl SupervisorConfig {
     fn production(
         provider: &ProviderConfig,
         prompt_mode: PromptMode,
         prompt_payload: Vec<u8>,
     ) -> Self {
         Self {
-            silence_ceiling: BOUNDED_SILENCE_DEFAULT,
             prompt_mode,
             prompt_payload: (prompt_mode == PromptMode::Stdin).then_some(prompt_payload),
             recognizer: ProviderRecognizer::for_provider(provider),
@@ -867,7 +864,7 @@ fn execute_provider_with_arg_parts(
     parent_invocation_env: Option<&str>,
     start_known_provider_session_id: Option<&str>,
 ) -> Result<(RawResult, Vec<PathBuf>), String> {
-    execute_provider_with_arg_parts_and_bounded_silence_config(
+    execute_provider_with_arg_parts_and_supervisor_config(
         provider,
         provider_args,
         tail_args,
@@ -883,9 +880,9 @@ fn execute_provider_with_arg_parts(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "executor call shape keeps base args, lifecycle tail args, prompt mode, cwd, input flags, parent marker, optional start-bound session, and optional bounded-silence test injection explicit"
+    reason = "executor call shape keeps base args, lifecycle tail args, prompt mode, cwd, input flags, parent marker, optional start-bound session, and optional supervisor test injection explicit"
 )]
-fn execute_provider_with_arg_parts_and_bounded_silence_config(
+fn execute_provider_with_arg_parts_and_supervisor_config(
     provider: &ProviderConfig,
     provider_args: &[String],
     tail_args: &[String],
@@ -895,7 +892,7 @@ fn execute_provider_with_arg_parts_and_bounded_silence_config(
     input_args: &[String],
     parent_invocation_env: Option<&str>,
     start_known_provider_session_id: Option<&str>,
-    bounded_silence_config: Option<BoundedSilenceConfig>,
+    supervisor_config: Option<SupervisorConfig>,
 ) -> Result<(RawResult, Vec<PathBuf>), String> {
     let launch = assemble_provider_launch(
         ProviderLaunchRequest {
@@ -909,7 +906,7 @@ fn execute_provider_with_arg_parts_and_bounded_silence_config(
             parent_invocation_env,
             start_known_provider_session_id,
         },
-        bounded_silence_config,
+        supervisor_config,
     )?;
     let output = run_provider_supervisor(launch.cmd, provider, launch.supervisor_config)?;
     let returned_artifacts = read_and_cleanup_return_channel(&launch.return_channel);
@@ -933,7 +930,7 @@ struct ProviderLaunchRequest<'a> {
 
 struct ProviderLaunch {
     cmd: Command,
-    supervisor_config: BoundedSilenceConfig,
+    supervisor_config: SupervisorConfig,
     capture_plan: CapturePlan,
     return_channel: Option<ReturnChannel>,
     temp_files: Vec<PathBuf>,
@@ -941,7 +938,7 @@ struct ProviderLaunch {
 
 fn assemble_provider_launch(
     request: ProviderLaunchRequest<'_>,
-    bounded_silence_config: Option<BoundedSilenceConfig>,
+    supervisor_config: Option<SupervisorConfig>,
 ) -> Result<ProviderLaunch, String> {
     let return_channel = prepare_return_channel(request.parent_invocation_env)?;
     let (base_args, rendered_prompt) =
@@ -973,7 +970,7 @@ fn assemble_provider_launch(
         request.provider,
         request.prompt_mode,
         rendered_prompt,
-        bounded_silence_config,
+        supervisor_config,
     );
 
     Ok(ProviderLaunch {
@@ -1054,12 +1051,12 @@ fn supervisor_config_for_launch(
     provider: &ProviderConfig,
     prompt_mode: PromptMode,
     rendered_prompt: String,
-    bounded_silence_config: Option<BoundedSilenceConfig>,
-) -> BoundedSilenceConfig {
+    supervisor_config: Option<SupervisorConfig>,
+) -> SupervisorConfig {
     let prompt_payload = (prompt_mode == PromptMode::Stdin).then(|| rendered_prompt.into_bytes());
-    bounded_silence_config
+    supervisor_config
         .unwrap_or_else(|| {
-            BoundedSilenceConfig::production(
+            SupervisorConfig::production(
                 provider,
                 prompt_mode,
                 prompt_payload.clone().unwrap_or_default(),
@@ -1071,9 +1068,9 @@ fn supervisor_config_for_launch(
 fn run_provider_supervisor(
     cmd: Command,
     provider: &ProviderConfig,
-    supervisor_config: BoundedSilenceConfig,
+    supervisor_config: SupervisorConfig,
 ) -> Result<SupervisedOutput, String> {
-    execute_with_bounded_silence(cmd, &provider.name, supervisor_config).map_err(|err| {
+    execute_with_supervisor(cmd, &provider.name, supervisor_config).map_err(|err| {
         if err.starts_with("Failed to spawn") {
             err
         } else {
@@ -1130,10 +1127,10 @@ enum DrainStream {
     Stderr,
 }
 
-fn execute_with_bounded_silence(
+fn execute_with_supervisor(
     mut cmd: Command,
     provider_name: &str,
-    config: BoundedSilenceConfig,
+    config: SupervisorConfig,
 ) -> Result<SupervisedOutput, String> {
     configure_supervised_command(&mut cmd, config.prompt_mode);
     configure_supervised_process_group(&mut cmd);
@@ -1164,23 +1161,7 @@ fn execute_with_bounded_silence(
             )?;
         }
 
-        if last_output_seen.elapsed() >= config.silence_ceiling {
-            let terminal_status = prolonged_silence_status();
-            let terminal_signal = recognize_terminal_signal(
-                provider_name,
-                config.recognizer,
-                &stdout,
-                &stderr,
-                terminal_status.clone(),
-            );
-            break (
-                terminal_status,
-                Some(terminal_signal),
-                terminate_child(&mut child)?,
-            );
-        }
-
-        match drains.rx.recv_timeout(BOUNDED_SILENCE_POLL_INTERVAL) {
+        match drains.rx.recv_timeout(SUPERVISOR_POLL_INTERVAL) {
             Ok((stream, chunk)) => append_output_chunk(
                 stream,
                 chunk,
@@ -1224,7 +1205,32 @@ fn configure_supervised_command(cmd: &mut Command, prompt_mode: PromptMode) {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
+fn configure_supervised_process_group(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    let parent_pid = unsafe { libc::getpid() };
+    cmd.process_group(0);
+    // Safety net: if the wrapper dies for any reason (including SIGKILL or
+    // panic — anything that prevents send_child_sigkill from running), the
+    // kernel sends SIGKILL to the immediate child. Combined with the
+    // process_group(0) above, this prevents orphaned children from accumulating
+    // across failed dispatches. The parent PID check closes the fork/pre_exec
+    // race where the parent can die before PR_SET_PDEATHSIG is installed.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() != parent_pid {
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
 fn configure_supervised_process_group(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
 
@@ -1239,7 +1245,7 @@ fn spawn_supervised_child(mut cmd: Command, provider_name: &str) -> Result<Child
         .map_err(|err| format!("Failed to spawn '{provider_name}': {err}"))
 }
 
-fn write_prompt_to_child(child: &mut Child, config: &BoundedSilenceConfig) -> Result<(), String> {
+fn write_prompt_to_child(child: &mut Child, config: &SupervisorConfig) -> Result<(), String> {
     if supervised_stdin_write_needed(config)
         && let Some(mut stdin) = child.stdin.take()
         && let Some(payload) = &config.prompt_payload
@@ -1251,7 +1257,7 @@ fn write_prompt_to_child(child: &mut Child, config: &BoundedSilenceConfig) -> Re
     Ok(())
 }
 
-fn supervised_stdin_write_needed(config: &BoundedSilenceConfig) -> bool {
+fn supervised_stdin_write_needed(config: &SupervisorConfig) -> bool {
     config.prompt_mode == PromptMode::Stdin
 }
 
@@ -1356,12 +1362,6 @@ fn terminate_for_live_quota(
             Some(live_signal),
             terminate_child(child)?,
         ))
-    }
-}
-
-fn prolonged_silence_status() -> TerminalStatusEvidence {
-    TerminalStatusEvidence::ProlongedSilence {
-        reason: "bounded_silence".to_string(),
     }
 }
 
@@ -1515,7 +1515,7 @@ fn wait_for_child_after_sigterm(child: &mut Child) -> Result<Option<ExitStatus>,
         if terminate_grace_period_elapsed(started) {
             return Ok(None);
         }
-        thread::sleep(BOUNDED_SILENCE_POLL_INTERVAL);
+        thread::sleep(SUPERVISOR_POLL_INTERVAL);
     }
 }
 
@@ -1867,7 +1867,7 @@ pub fn execute_resume(
     parent_invocation_env: Option<&str>,
     resume: ResumePayload<'_>,
 ) -> Result<ExecutionResult, String> {
-    execute_resume_with_optional_bounded_silence_config(
+    execute_resume_with_optional_supervisor_config(
         provider,
         provider_index,
         prompt_mode,
@@ -1879,12 +1879,11 @@ pub fn execute_resume(
     )
 }
 
-#[cfg(test)]
 #[expect(
     clippy::too_many_arguments,
-    reason = "test injection mirrors the public resume execution contract plus bounded-silence config"
+    reason = "resume execution keeps provider, prompt, cwd, parent marker, resume payload, and optional supervisor test injection explicit"
 )]
-fn execute_resume_with_bounded_silence_config(
+fn execute_resume_with_optional_supervisor_config(
     provider: &ProviderConfig,
     provider_index: usize,
     prompt_mode: PromptMode,
@@ -1892,39 +1891,13 @@ fn execute_resume_with_bounded_silence_config(
     working_dir: Option<&Path>,
     parent_invocation_env: Option<&str>,
     resume: ResumePayload<'_>,
-    bounded_silence_config: BoundedSilenceConfig,
-) -> Result<ExecutionResult, String> {
-    execute_resume_with_optional_bounded_silence_config(
-        provider,
-        provider_index,
-        prompt_mode,
-        prompt,
-        working_dir,
-        parent_invocation_env,
-        resume,
-        Some(bounded_silence_config),
-    )
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "resume execution keeps provider, prompt, cwd, parent marker, resume payload, and optional bounded-silence test injection explicit"
-)]
-fn execute_resume_with_optional_bounded_silence_config(
-    provider: &ProviderConfig,
-    provider_index: usize,
-    prompt_mode: PromptMode,
-    prompt: &str,
-    working_dir: Option<&Path>,
-    parent_invocation_env: Option<&str>,
-    resume: ResumePayload<'_>,
-    bounded_silence_config: Option<BoundedSilenceConfig>,
+    supervisor_config: Option<SupervisorConfig>,
 ) -> Result<ExecutionResult, String> {
     let session_id = resume.session_id.to_string();
     let resume_args = compose_resume_args(resume.strategy, resume.session_id)?;
     let mut provider_without_capture = provider.clone();
     provider_without_capture.session_capture = None;
-    let (result, temp_files) = execute_provider_with_arg_parts_and_bounded_silence_config(
+    let (result, temp_files) = execute_provider_with_arg_parts_and_supervisor_config(
         &provider_without_capture,
         &provider.args,
         &resume_args,
@@ -1934,7 +1907,7 @@ fn execute_resume_with_optional_bounded_silence_config(
         &[],
         parent_invocation_env,
         None,
-        bounded_silence_config,
+        supervisor_config,
     )?;
     cleanup_temp_files(temp_files);
     let resume_acceptance = classify_resume_acceptance(
@@ -2661,12 +2634,8 @@ fn send_sigterm(pid: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::executor::terminal_signal::{
-        TerminalSignal, TerminalSignalEvidence, TerminalSignalKind, TerminalSignalRecognizer,
-        TerminalStatusEvidence,
-    };
+    use crate::executor::terminal_signal::{TerminalSignal, TerminalSignalKind};
     use crate::executor::{SessionCaptureMethod, SessionCaptureResult};
-    use oulipoly_agent_messenger::{ReturnedArtifactRef, ReturnedArtifactSource, StoreAddress};
     use oulipoly_config::{
         ClaudeRestrictions, CodexRestrictions, InputDef, InputType, InvocationMode, ProviderConfig,
         ResumeKind, ResumeStrategy, SessionCapture, SessionCaptureKind, ToolRestrictionKind,
@@ -2675,8 +2644,7 @@ mod tests {
     use oulipoly_state::CompositeInvocationId;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use std::time::{Duration, Instant, SystemTime};
-    use uuid::Uuid;
+    use std::time::{Duration, Instant};
 
     struct FixtureScript {
         _dir: tempfile::TempDir,
@@ -2722,9 +2690,8 @@ mod tests {
             .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()))
     }
 
-    fn age141_bounded_silence_config(silence_ceiling: Duration) -> BoundedSilenceConfig {
-        BoundedSilenceConfig {
-            silence_ceiling,
+    fn age141_supervisor_config() -> SupervisorConfig {
+        SupervisorConfig {
             prompt_mode: PromptMode::Arg,
             prompt_payload: None,
             recognizer: ProviderRecognizer::Claude,
@@ -2759,13 +2726,13 @@ mod tests {
     #[cfg(unix)]
     fn age141_execute_script_with_config(
         script: &FixtureScript,
-        config: BoundedSilenceConfig,
+        config: SupervisorConfig,
     ) -> ExecutionResult {
         let provider = age141_provider(script);
         let model = age141_model_for_provider(provider.clone(), PromptMode::Arg);
         let extra_inputs = HashMap::new();
 
-        execute_effective_with_bounded_silence_config(
+        execute_effective_with_supervisor_config(
             EffectiveExecuteRequest {
                 model: &model,
                 provider: &provider,
@@ -2793,168 +2760,6 @@ mod tests {
         signal
     }
 
-    fn age141_receipt_json(invocation_uuid: Uuid, name: &str, version: u64) -> String {
-        let reference = ReturnedArtifactRef {
-            version_id: format!("store://return/{invocation_uuid}/{name}/{version}"),
-            name: name.to_string(),
-            store_address: StoreAddress {
-                workflow_run_id: format!("return:{invocation_uuid}"),
-                artifact_name: name.to_string(),
-                version,
-            },
-            sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            content_len: 3,
-            format_hint: Some("text/plain".to_string()),
-            verdict_line: Some("APPROVED: age-141 fixture".to_string()),
-            source: ReturnedArtifactSource::InlineBytes,
-            producer_invocation_uuid: invocation_uuid,
-            returned_at: chrono::Utc::now(),
-        };
-        serde_json::to_string(&reference).expect("receipt json")
-    }
-
-    fn age141_parent_env(invocation_uuid: Uuid) -> String {
-        format!(r#"{{"source":"age-141-test","id":"{invocation_uuid}"}}"#)
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn t01_bounded_silence_headless_kill_reap() {
-        let script = fixture_script("sleep 9999");
-        let started = Instant::now();
-
-        let result = age141_execute_script_with_config(
-            &script,
-            age141_bounded_silence_config(Duration::from_millis(120)),
-        );
-
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "test ceiling must be injectable; elapsed={:?}",
-            started.elapsed()
-        );
-        assert_ne!(result.exit_code, 0);
-        assert_eq!(result.terminal_reason.as_deref(), Some("bounded_silence"));
-        let signal = age141_signal(
-            &result.terminal_signal,
-            TerminalSignalKind::ProlongedSilence,
-        );
-        assert!(
-            signal.evidence.contains("silence") || signal.evidence.contains("bounded"),
-            "{signal:?}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn t02_bounded_silence_stdout_heartbeat_resets_clock() {
-        let script = fixture_script(
-            r#"printf 'ping-1\n'
-sleep 0.08
-printf 'ping-2\n'
-sleep 9999"#,
-        );
-        let started = Instant::now();
-
-        let result = age141_execute_script_with_config(
-            &script,
-            age141_bounded_silence_config(Duration::from_millis(120)),
-        );
-        let elapsed = started.elapsed();
-
-        assert!(
-            elapsed >= Duration::from_millis(170),
-            "silence fired from spawn time instead of after stdout heartbeat; elapsed={elapsed:?}"
-        );
-        assert!(
-            elapsed < Duration::from_secs(1),
-            "bounded-silence fixture should not wait for production ceiling; elapsed={elapsed:?}"
-        );
-        assert_eq!(result.stdout, b"ping-1\nping-2\n".to_vec());
-        age141_signal(
-            &result.terminal_signal,
-            TerminalSignalKind::ProlongedSilence,
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn t03_bounded_silence_stderr_heartbeat_resets_clock() {
-        let script = fixture_script(
-            r#"printf 'warn-1\n' >&2
-sleep 0.08
-printf 'warn-2\n' >&2
-sleep 9999"#,
-        );
-        let started = Instant::now();
-
-        let result = age141_execute_script_with_config(
-            &script,
-            age141_bounded_silence_config(Duration::from_millis(120)),
-        );
-        let elapsed = started.elapsed();
-
-        assert!(
-            elapsed >= Duration::from_millis(170),
-            "silence fired from spawn time instead of after stderr heartbeat; elapsed={elapsed:?}"
-        );
-        assert!(elapsed < Duration::from_secs(1), "elapsed={elapsed:?}");
-        assert_eq!(result.stderr, "warn-1\nwarn-2\n");
-        age141_signal(
-            &result.terminal_signal,
-            TerminalSignalKind::ProlongedSilence,
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn t04_bounded_silence_resume_inherits_headless_supervisor() {
-        let script = fixture_script("sleep 9999");
-        let provider = age141_provider(&script);
-        let strategy = ResumeStrategy {
-            kind: ResumeKind::Flag,
-            flag: Some("--resume".to_string()),
-            subcommand: None,
-        };
-
-        let result = execute_resume_with_bounded_silence_config(
-            &provider,
-            0,
-            PromptMode::Arg,
-            "resume prompt",
-            None,
-            None,
-            ResumePayload {
-                session_id: "5169694d-de0f-40d1-890c-6e28e55bab27",
-                strategy: &strategy,
-            },
-            age141_bounded_silence_config(Duration::from_millis(120)),
-        )
-        .unwrap();
-
-        assert_ne!(result.exit_code, 0);
-        assert_eq!(result.terminal_reason.as_deref(), Some("bounded_silence"));
-        age141_signal(
-            &result.terminal_signal,
-            TerminalSignalKind::ProlongedSilence,
-        );
-        let acceptance = result
-            .resume_acceptance
-            .expect("resume path must still classify acceptance after silence");
-        assert!(matches!(
-            acceptance.status,
-            ResumeAcceptanceStatus::Rejected
-        ));
-        assert!(
-            acceptance
-                .evidence
-                .as_deref()
-                .unwrap_or_default()
-                .contains("child exited"),
-            "{acceptance:?}"
-        );
-    }
-
     #[cfg(unix)]
     #[test]
     fn t05_interactive_silent_child_does_not_use_headless_helper() {
@@ -2969,8 +2774,8 @@ sleep 9999"#,
         let interactive_body = &after_start[..interactive_end];
         assert!(interactive_body.contains("Stdio::inherit()"));
         assert!(interactive_body.contains(".wait()"));
-        assert!(!interactive_body.contains("execute_with_bounded_silence"));
-        assert!(!interactive_body.contains("BoundedSilenceConfig"));
+        assert!(!interactive_body.contains("execute_with_supervisor"));
+        assert!(!interactive_body.contains("SupervisorConfig"));
         assert!(!interactive_body.contains("try_wait"));
 
         let script = fixture_script("exit 0");
@@ -3003,10 +2808,7 @@ sleep 9999"#,
     fn t07_terminal_signal_clean_exit() {
         let script = fixture_script("exit 0");
 
-        let result = age141_execute_script_with_config(
-            &script,
-            age141_bounded_silence_config(Duration::from_millis(120)),
-        );
+        let result = age141_execute_script_with_config(&script, age141_supervisor_config());
 
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.terminal_reason, None);
@@ -3018,10 +2820,7 @@ sleep 9999"#,
     fn t08_terminal_signal_nonzero_exit() {
         let script = fixture_script("exit 42");
 
-        let result = age141_execute_script_with_config(
-            &script,
-            age141_bounded_silence_config(Duration::from_millis(120)),
-        );
+        let result = age141_execute_script_with_config(&script, age141_supervisor_config());
 
         assert_eq!(result.exit_code, 42);
         assert_eq!(result.terminal_reason.as_deref(), Some("exit_nonzero"));
@@ -3033,10 +2832,7 @@ sleep 9999"#,
     fn t09_terminal_signal_unix_signal_exit() {
         let script = fixture_script("kill -TERM $$");
 
-        let result = age141_execute_script_with_config(
-            &script,
-            age141_bounded_silence_config(Duration::from_millis(500)),
-        );
+        let result = age141_execute_script_with_config(&script, age141_supervisor_config());
 
         assert_eq!(result.exit_code, 143);
         assert_eq!(result.terminal_reason.as_deref(), Some("signal:SIGTERM"));
@@ -3062,7 +2858,7 @@ sleep 9999"#,
         let model = age141_model_for_provider(provider.clone(), PromptMode::Arg);
         let extra_inputs = HashMap::new();
 
-        let err = execute_effective_with_bounded_silence_config(
+        let err = execute_effective_with_supervisor_config(
             EffectiveExecuteRequest {
                 model: &model,
                 provider: &provider,
@@ -3074,7 +2870,7 @@ sleep 9999"#,
                 parent_invocation_env: None,
             },
             None,
-            age141_bounded_silence_config(Duration::from_millis(120)),
+            age141_supervisor_config(),
         )
         .unwrap_err();
 
@@ -3086,7 +2882,7 @@ sleep 9999"#,
 
     #[cfg(unix)]
     #[test]
-    fn t11_inband_quota_recognized_live_before_silence() {
+    fn t11_inband_quota_recognized_live_terminates_long_running_child() {
         let script = fixture_script(
             r#"printf 'Claude usage limit reached; resets at 2026-05-18T10:00:00Z\n' >&2
 sleep 9999"#,
@@ -3094,12 +2890,11 @@ sleep 9999"#,
         let ceiling = Duration::from_millis(900);
         let started = Instant::now();
 
-        let result =
-            age141_execute_script_with_config(&script, age141_bounded_silence_config(ceiling));
+        let result = age141_execute_script_with_config(&script, age141_supervisor_config());
 
         assert!(
             started.elapsed() < ceiling,
-            "live quota recognition must terminate before silence ceiling; elapsed={:?}",
+            "live quota recognition must terminate the long-running child; elapsed={:?}",
             started.elapsed()
         );
         assert_eq!(
@@ -3133,10 +2928,7 @@ sleep 9999"#,
         ] {
             let script = fixture_script(body);
 
-            let result = age141_execute_script_with_config(
-                &script,
-                age141_bounded_silence_config(Duration::from_millis(500)),
-            );
+            let result = age141_execute_script_with_config(&script, age141_supervisor_config());
 
             assert_eq!(
                 result.exit_code, exit_code,
@@ -3153,112 +2945,15 @@ sleep 9999"#,
         }
     }
 
-    #[test]
-    fn t13_silence_precedence_over_quota_looking_output() {
-        let evidence = TerminalSignalEvidence {
-            provider_name: "claude",
-            stdout: b"",
-            stderr: b"Claude usage limit reached; resets at 2026-05-18T10:00:00Z",
-            terminal_status: TerminalStatusEvidence::ProlongedSilence {
-                reason: "bounded_silence".to_string(),
-            },
-            observed_at: SystemTime::now(),
-        };
-
-        let signal = crate::executor::providers::claude::Recognizer.recognize(&evidence);
-
-        assert_eq!(signal.kind, TerminalSignalKind::ProlongedSilence);
-    }
-
     #[cfg(unix)]
     #[test]
-    fn t14_binary_stdout_preserved_under_bounded_supervisor() {
+    fn t14_binary_stdout_preserved_under_supervisor() {
         let script = fixture_script("printf 'raw\\000\\377Z'");
 
-        let result = age141_execute_script_with_config(
-            &script,
-            age141_bounded_silence_config(Duration::from_millis(120)),
-        );
+        let result = age141_execute_script_with_config(&script, age141_supervisor_config());
 
         assert_eq!(result.stdout, b"raw\0\xffZ".to_vec());
         age141_signal(&result.terminal_signal, TerminalSignalKind::CleanExit);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn t15_return_channel_cleanup_after_silence() {
-        let invocation = Uuid::new_v4();
-        let receipt = age141_receipt_json(invocation, "silence.md", 1).replace('\'', r#"'\''"#);
-        let dir = tempfile::tempdir().unwrap();
-        let observed_channel = dir.path().join("observed-channel.txt");
-        let script = fixture_script(&format!(
-            r#"test -n "${{OULIPOLY_RETURN_CHANNEL:-}}"
-printf '%s' "$OULIPOLY_RETURN_CHANNEL" > "{observed_channel}"
-printf '%s\n' '{receipt}' >> "$OULIPOLY_RETURN_CHANNEL"
-sleep 9999"#,
-            observed_channel = observed_channel.display()
-        ));
-        let provider = age141_provider(&script);
-        let model = age141_model_for_provider(provider.clone(), PromptMode::Arg);
-        let extra_inputs = HashMap::new();
-
-        let result = execute_effective_with_bounded_silence_config(
-            EffectiveExecuteRequest {
-                model: &model,
-                provider: &provider,
-                provider_index: 0,
-                prompt_mode: PromptMode::Arg,
-                prompt: "prompt",
-                working_dir: None,
-                extra_inputs: &extra_inputs,
-                parent_invocation_env: Some(&age141_parent_env(invocation)),
-            },
-            None,
-            age141_bounded_silence_config(Duration::from_millis(120)),
-        )
-        .unwrap();
-
-        age141_signal(
-            &result.terminal_signal,
-            TerminalSignalKind::ProlongedSilence,
-        );
-        assert_eq!(result.returned_artifacts.len(), 1);
-        assert_eq!(result.returned_artifacts[0].name, "silence.md");
-        let channel_path = PathBuf::from(std::fs::read_to_string(observed_channel).unwrap());
-        assert!(
-            !channel_path.exists(),
-            "return-channel sidecar must be cleaned after silence kill+reap"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn t16_child_marker_parsing_after_silence() {
-        let marker = CompositeInvocationId {
-            source: "age-141-child".to_string(),
-            id: "11111111-1111-4111-8111-111111111111".to_string(),
-        };
-        let marker_line = marker.stderr_line();
-        let script = fixture_script(&format!(
-            r#"printf '%s\n' '{marker_line}' >&2
-sleep 9999"#
-        ));
-
-        let result = age141_execute_script_with_config(
-            &script,
-            age141_bounded_silence_config(Duration::from_millis(120)),
-        );
-
-        age141_signal(
-            &result.terminal_signal,
-            TerminalSignalKind::ProlongedSilence,
-        );
-        assert_eq!(result.captured_child_invocations.len(), 1);
-        assert_eq!(result.captured_child_invocations[0].composite_id, marker);
-        assert_eq!(
-            result.captured_child_invocations[0].raw_marker_line,
-            marker_line
-        );
     }
 
     #[cfg(unix)]
@@ -3293,7 +2988,7 @@ printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$requested""#,
         let model = age141_model_for_provider(provider.clone(), PromptMode::Arg);
         let extra_inputs = HashMap::new();
 
-        let result = execute_effective_with_bounded_silence_config(
+        let result = execute_effective_with_supervisor_config(
             EffectiveExecuteRequest {
                 model: &model,
                 provider: &provider,
@@ -3305,7 +3000,7 @@ printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$requested""#,
                 parent_invocation_env: None,
             },
             None,
-            age141_bounded_silence_config(Duration::from_millis(500)),
+            age141_supervisor_config(),
         )
         .unwrap();
 
@@ -3420,53 +3115,6 @@ printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$requested""#,
                 Some("signal:SIGTERM")
             );
         }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn t21_bounded_silence_killpg_handles_stubborn_grandchild() {
-        let script = fixture_script(
-            r#"trap '' SIGTERM
-(
-  trap '' SIGTERM
-  printf 't21-grandchild-stdout\n'
-  printf 't21-grandchild-stderr\n' >&2
-  sleep 9999
-) &
-sleep 9999"#,
-        );
-        let silence_ceiling = Duration::from_millis(120);
-        let started = Instant::now();
-
-        let result = age141_execute_script_with_config(
-            &script,
-            age141_bounded_silence_config(silence_ceiling),
-        );
-        let elapsed = started.elapsed();
-
-        assert!(
-            elapsed < silence_ceiling + TERMINATE_GRACE_PERIOD + Duration::from_millis(700),
-            "stubborn descendant kept inherited pipes open after hard-kill fallback; elapsed={elapsed:?}"
-        );
-        assert_ne!(result.exit_code, 0);
-        assert_eq!(result.terminal_reason.as_deref(), Some("bounded_silence"));
-        age141_signal(
-            &result.terminal_signal,
-            TerminalSignalKind::ProlongedSilence,
-        );
-        assert!(
-            result
-                .stdout
-                .windows(b"t21-grandchild-stdout\n".len())
-                .any(|chunk| chunk == b"t21-grandchild-stdout\n"),
-            "stdout drain did not preserve the stubborn descendant output: {:?}",
-            result.stdout
-        );
-        assert!(
-            result.stderr.contains("t21-grandchild-stderr\n"),
-            "stderr drain did not preserve the stubborn descendant output: {:?}",
-            result.stderr
-        );
     }
 
     fn age28_claude_provider(script_path: &Path, args: Vec<String>) -> ProviderConfig {
