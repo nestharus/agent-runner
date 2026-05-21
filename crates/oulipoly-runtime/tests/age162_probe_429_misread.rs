@@ -26,8 +26,7 @@
 
 use chrono::{Duration, Utc};
 use oulipoly_config::{
-    ModelConfig, ProviderConfig, ProviderEntry, ProvidersConfig, SessionsConfig,
-    model::PromptMode,
+    ModelConfig, ProviderConfig, ProviderEntry, ProvidersConfig, SessionsConfig, model::PromptMode,
 };
 use oulipoly_runtime::balancer::{BalanceContext, select_provider};
 use oulipoly_runtime::quota::InFlight;
@@ -137,9 +136,10 @@ fn age162_transient_probe_429_does_not_exclude_provider_with_healthy_prior_cache
         in_flight: &in_flight,
     };
 
-    let _ = select_provider(&model, &db, Some(&ctx))
-        .expect("with one provider's probe failing and a healthy sibling, select_provider must \
-                 still return a provider, not AllProvidersQuotaExhausted");
+    let _ = select_provider(&model, &db, Some(&ctx)).expect(
+        "with one provider's probe failing and a healthy sibling, select_provider must \
+                 still return a provider, not AllProvidersQuotaExhausted",
+    );
 
     let claude4_quota = db
         .get_quota(CLAUDE4_PROBED)

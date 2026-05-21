@@ -476,6 +476,7 @@ struct SupervisorConfig {
     prompt_mode: PromptMode,
     prompt_payload: Option<Vec<u8>>,
     recognizer: ProviderRecognizer,
+    bounded_silence: Option<Duration>,
 }
 
 impl SupervisorConfig {
@@ -488,6 +489,7 @@ impl SupervisorConfig {
             prompt_mode,
             prompt_payload: (prompt_mode == PromptMode::Stdin).then_some(prompt_payload),
             recognizer: ProviderRecognizer::for_provider(provider),
+            bounded_silence: bounded_silence_from_env(),
         }
     }
 
@@ -1100,6 +1102,7 @@ fn raw_result_from_supervised_output(
 ) -> RawResult {
     let capture_outcome = finalize_capture(capture_plan, &output.stdout);
     let stdout = maybe_restore_plain_stdout(capture_plan, &capture_outcome, &output.stdout);
+    let stdout = remove_unsanctioned_money_fields(stdout);
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     RawResult {
         stdout,
@@ -1128,6 +1131,12 @@ enum DrainStream {
     Stderr,
 }
 
+type SupervisedTerminalOutcome = (
+    TerminalStatusEvidence,
+    Option<TerminalSignal>,
+    Option<ExitStatus>,
+);
+
 fn execute_with_supervisor(
     mut cmd: Command,
     provider_name: &str,
@@ -1147,6 +1156,18 @@ fn execute_with_supervisor(
 
         if let Some(status) = poll_child_status(&mut child)? {
             break terminal_outcome_from_status(status);
+        }
+
+        if let Some(outcome) = terminate_for_bounded_silence_if_elapsed(
+            &mut child,
+            provider_name,
+            config.recognizer,
+            &stdout,
+            &stderr,
+            last_output_seen,
+            config.bounded_silence,
+        )? {
+            break outcome;
         }
 
         let live_signal =
@@ -1339,18 +1360,51 @@ fn poll_child_status(child: &mut Child) -> Result<Option<ExitStatus>, String> {
         .map_err(|err| format!("try_wait failed: {err}"))
 }
 
-fn terminal_outcome_from_status(
-    status: ExitStatus,
-) -> (
-    TerminalStatusEvidence,
-    Option<TerminalSignal>,
-    Option<ExitStatus>,
-) {
+fn terminal_outcome_from_status(status: ExitStatus) -> SupervisedTerminalOutcome {
     (
         terminal_status_from_exit_status(&status),
         None,
         Some(status),
     )
+}
+
+fn bounded_silence_from_env() -> Option<Duration> {
+    let raw = std::env::var("OULIPOLY_TEST_BOUNDED_SILENCE_MS").ok()?;
+    let millis = raw.parse::<u64>().ok()?;
+    (millis > 0).then(|| Duration::from_millis(millis))
+}
+
+fn terminate_for_bounded_silence_if_elapsed(
+    child: &mut Child,
+    provider_name: &str,
+    recognizer: ProviderRecognizer,
+    stdout: &[u8],
+    stderr: &[u8],
+    last_output_seen: Instant,
+    bounded_silence: Option<Duration>,
+) -> Result<Option<SupervisedTerminalOutcome>, String> {
+    let Some(limit) = bounded_silence else {
+        return Ok(None);
+    };
+    if last_output_seen.elapsed() < limit {
+        return Ok(None);
+    }
+
+    let terminal_status = TerminalStatusEvidence::ProlongedSilence {
+        reason: format!("no stdout/stderr for {}ms", limit.as_millis()),
+    };
+    let terminal_signal = recognize_terminal_signal(
+        provider_name,
+        recognizer,
+        stdout,
+        stderr,
+        terminal_status.clone(),
+    );
+    Ok(Some((
+        terminal_status,
+        Some(terminal_signal),
+        terminate_child(child)?,
+    )))
 }
 
 fn recognize_live_terminal_signal(
@@ -1375,14 +1429,7 @@ fn terminate_for_live_quota(
     stdout: &[u8],
     stderr: &[u8],
     live_signal: TerminalSignal,
-) -> Result<
-    (
-        TerminalStatusEvidence,
-        Option<TerminalSignal>,
-        Option<ExitStatus>,
-    ),
-    String,
-> {
+) -> Result<SupervisedTerminalOutcome, String> {
     if let Some(status) = child
         .try_wait()
         .map_err(|err| format!("try_wait before quota terminate failed: {err}"))?
@@ -2423,6 +2470,98 @@ fn fallback_plain_stdout(stdout: &[u8]) -> Vec<u8> {
     stdout.to_vec()
 }
 
+fn remove_unsanctioned_money_fields(stdout: Vec<u8>) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(&stdout) else {
+        return stdout;
+    };
+    let mut scrubbed = String::with_capacity(text.len());
+    let mut changed = false;
+
+    for line in text.split_inclusive('\n') {
+        match scrub_provider_json_line(line) {
+            Some(line) => {
+                changed = true;
+                scrubbed.push_str(&line);
+            }
+            None => scrubbed.push_str(line),
+        }
+    }
+
+    if changed {
+        scrubbed.into_bytes()
+    } else {
+        stdout
+    }
+}
+
+fn scrub_provider_json_line(line: &str) -> Option<String> {
+    let (content, line_ending) = split_line_ending(line);
+    let mut value: Value = serde_json::from_str(content).ok()?;
+    if !looks_like_provider_telemetry(&value) {
+        return None;
+    }
+    if !strip_money_fields(&mut value) {
+        return None;
+    }
+
+    let mut rendered = serde_json::to_string(&value).ok()?;
+    rendered.push_str(line_ending);
+    Some(rendered)
+}
+
+fn split_line_ending(line: &str) -> (&str, &str) {
+    let Some(without_lf) = line.strip_suffix('\n') else {
+        return (line, "");
+    };
+    if let Some(without_crlf) = without_lf.strip_suffix('\r') {
+        (without_crlf, "\r\n")
+    } else {
+        (without_lf, "\n")
+    }
+}
+
+fn looks_like_provider_telemetry(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    object.get("type").and_then(Value::as_str) == Some("result")
+        || object.contains_key("modelUsage")
+        || object.keys().any(|key| is_money_field_name(key))
+}
+
+fn strip_money_fields(value: &mut Value) -> bool {
+    match value {
+        Value::Object(object) => {
+            let keys_to_remove: Vec<String> = object
+                .keys()
+                .filter(|key| is_money_field_name(key))
+                .cloned()
+                .collect();
+            let mut changed = !keys_to_remove.is_empty();
+            for key in keys_to_remove {
+                object.remove(&key);
+            }
+            for child in object.values_mut() {
+                changed |= strip_money_fields(child);
+            }
+            changed
+        }
+        Value::Array(items) => {
+            let mut changed = false;
+            for item in items {
+                changed |= strip_money_fields(item);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+fn is_money_field_name(key: &str) -> bool {
+    let normalized = key.to_ascii_lowercase();
+    normalized.contains("cost") || normalized.contains("usd") || normalized.contains("price")
+}
+
 fn parse_forced_flag_verified_session_id(stdout: &[u8]) -> Result<String, String> {
     for line in String::from_utf8_lossy(stdout).lines() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
@@ -2774,6 +2913,7 @@ mod tests {
             prompt_mode: PromptMode::Arg,
             prompt_payload: None,
             recognizer: ProviderRecognizer::Claude,
+            bounded_silence: None,
         }
     }
 
@@ -4673,6 +4813,63 @@ printf '{{"type":"system","subtype":"init","session_id":"8f0a6a1f-9cd2-4c91-b6c6
             String::from_utf8_lossy(&result.stdout).trim(),
             "hello world"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_strips_provider_money_fields_from_result_json_stdout() {
+        let script = fixture_script(
+            r#"cat <<'JSON'
+{"type":"result","result":"ok","total_cost_usd":1.25,"total_cost":2.5,"usage":{"input_tokens":1},"modelUsage":{"claude-opus":{"inputTokens":1,"outputTokens":2,"costUSD":1.25,"costUsd":2.5,"cost_usd":3.5,"contextWindow":1000000}}}
+JSON"#,
+        );
+        let model = ModelConfig {
+            name: "test".to_string(),
+            prompt_mode: PromptMode::Arg,
+            providers: vec![ProviderConfig::new(
+                script.path.to_string_lossy().into_owned(),
+                vec![],
+            )],
+            inputs: vec![],
+        };
+
+        let result = execute(&model, 0, "hello", None, &HashMap::new(), None).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+
+        assert_eq!(value["type"], "result");
+        assert_eq!(value["result"], "ok");
+        assert!(value.get("total_cost_usd").is_none());
+        assert!(value.get("total_cost").is_none());
+        assert_eq!(value["usage"]["input_tokens"].as_i64(), Some(1));
+        let model_usage = value["modelUsage"]["claude-opus"].as_object().unwrap();
+        assert_eq!(
+            model_usage
+                .get("inputTokens")
+                .and_then(serde_json::Value::as_i64),
+            Some(1)
+        );
+        assert_eq!(
+            model_usage
+                .get("outputTokens")
+                .and_then(serde_json::Value::as_i64),
+            Some(2)
+        );
+        assert_eq!(
+            model_usage
+                .get("contextWindow")
+                .and_then(serde_json::Value::as_i64),
+            Some(1000000)
+        );
+        assert!(!model_usage.contains_key("costUSD"));
+        assert!(!model_usage.contains_key("costUsd"));
+        assert!(!model_usage.contains_key("cost_usd"));
+    }
+
+    #[test]
+    fn non_utf8_stdout_bypasses_provider_money_field_scrubber() {
+        let stdout = b"raw\0\xffZ".to_vec();
+
+        assert_eq!(remove_unsanctioned_money_fields(stdout.clone()), stdout);
     }
 
     /// Per contract: when a provider has no `session_capture` config,

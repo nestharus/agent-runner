@@ -28,7 +28,7 @@ def main() -> int:
     # files), the first pass typically returns on the first hit
     # without walking the whole tree. Materializing into a cached
     # list would force a complete walk before any match, regressing
-    # the common case. The double-iteration cost only applies in the
+    # the common case. The double iteration overhead only applies in the
     # rare fallback case where filename match misses.
     target_filename = f"{session_id}.jsonl"
     for path in base.rglob("*.jsonl"):

@@ -77,13 +77,8 @@ impl DiagnosticsServicePort for RuntimeDiagnosticsService {
     }
 }
 
-pub fn classify_exhaustion(_stderr: &str) -> bool {
-    // Provider-coupled substring matching removed. Quota detection moves
-    // to turn-counting at the session-completion layer (see follow-up WU).
-    // Always returns false: nothing gets classified as quota-exhausted
-    // from stderr content. Caller fall-through paths must not rely on
-    // this signal.
-    false
+pub fn classify_exhaustion(stderr: &str) -> bool {
+    quota_exhaustion_text(&stderr.to_lowercase())
 }
 
 pub fn diagnose_error(
@@ -176,7 +171,11 @@ fn parse_diagnosis(output: &str, stderr: &str, exit_code: i32) -> Result<Diagnos
 fn heuristic_diagnosis(stderr: &str, _exit_code: i32) -> Diagnosis {
     let lower = stderr.to_lowercase();
 
-    let category = if lower.contains("unauthorized")
+    let category = if quota_exhaustion_text(&lower) {
+        ErrorCategory::QuotaExhausted
+    } else if rate_limit_text(&lower) {
+        ErrorCategory::RateLimit
+    } else if lower.contains("unauthorized")
         || lower.contains("auth")
         || lower.contains("token expired")
     {
@@ -202,6 +201,29 @@ fn heuristic_diagnosis(stderr: &str, _exit_code: i32) -> Diagnosis {
         category,
         summary: "Heuristic classification based on stderr content".to_string(),
     }
+}
+
+fn quota_exhaustion_text(lower: &str) -> bool {
+    lower.contains("quota exceeded")
+        || lower.contains("quota exhausted")
+        || lower.contains("billing limit")
+        || lower.contains("usage limit")
+        || lower.contains("usage cap")
+        || lower.contains("hit your limit")
+        || lower.contains("you've hit your limit")
+}
+
+fn rate_limit_text(lower: &str) -> bool {
+    lower.contains("429")
+        || lower.contains("http 429")
+        || lower.contains("status 429")
+        || lower.contains("status: 429")
+        || lower.contains("429 too many requests")
+        || lower.contains("too many requests")
+        || lower.contains("rate limit")
+        || lower.contains("rate_limit")
+        || lower.contains("rate-limited")
+        || lower.contains("rate limited")
 }
 
 // Characterization test for AGE-8 — pins current behavior of diagnostics model-backed subprocess execution in this inline test module.

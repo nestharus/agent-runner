@@ -19,8 +19,7 @@
 
 use chrono::{Duration, Utc};
 use oulipoly_config::{
-    ModelConfig, ProviderConfig, ProviderEntry, ProvidersConfig, SessionsConfig,
-    model::PromptMode,
+    ModelConfig, ProviderConfig, ProviderEntry, ProvidersConfig, SessionsConfig, model::PromptMode,
 };
 use oulipoly_runtime::balancer::{BalanceContext, select_provider};
 use oulipoly_runtime::quota::InFlight;

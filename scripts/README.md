@@ -114,7 +114,7 @@ A **transcript locator** resolves a known `session_id` back to the absolute
 path of its raw transcript file. Used by `oulipoly-agent-runner trace
 <uuid> --json` to populate `transcript_path` / `transcript_state` per node.
 The lookup runs **lazily at trace time** — never at invocation time — so
-unused providers cost nothing.
+unused providers add no work.
 
 ### Contract
 

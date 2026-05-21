@@ -269,11 +269,7 @@ fn age162_canonical_quota_signature_still_flips_exhausted_at_under_claude_recogn
             // message that the heuristic exists to catch.
             "Claude usage limit reached for your account.",
         ),
-        (
-            SIBLING,
-            &sibling_marker,
-            "connection refused",
-        ),
+        (SIBLING, &sibling_marker, "connection refused"),
     ]);
 
     let _output = fixture.run_one_shot("age162-quota-repro");
