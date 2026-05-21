@@ -157,7 +157,9 @@ pub(crate) enum Subcommands {
         #[arg(long = "models-dir")]
         models_dir: Option<PathBuf>,
     },
-    /// Resume a provider session non-interactively with an answer payload.
+    /// Resume a provider session non-interactively. If no answer payload is
+    /// supplied, the provider receives native resume args without a prompt so
+    /// deferred resume markers can continue.
     #[command(group = clap::ArgGroup::new("resume_target").args(["session_id", "chain_id"]).required(true).multiple(false))]
     Resume {
         /// Model id whose provider pool must include the session owner.
