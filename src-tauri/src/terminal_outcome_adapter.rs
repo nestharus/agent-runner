@@ -191,10 +191,14 @@ pub fn confirm_maybe_quota_exhausted<W: io::Write>(
     ErrorCategory::QuotaExhausted.as_str()
 }
 
+fn warn_mark_provider_exhausted_failed(e: impl std::fmt::Display) {
+    eprintln!("Warning: Failed to mark provider exhausted: {e}");
+}
+
 fn mark_provider_exhausted(state: &StateDb, provider_name: &str) {
     state
         .mark_exhausted(provider_name)
-        .unwrap_or_else(|e| eprintln!("Warning: Failed to mark provider exhausted: {e}"));
+        .unwrap_or_else(warn_mark_provider_exhausted_failed);
 }
 
 fn terminal_signal_disposition(signal: &TerminalSignal) -> TerminalSignalDisposition {
@@ -339,35 +343,52 @@ fn age153_force_terminal_signal_none_requested() -> bool {
     std::env::var_os("OULIPOLY_AGE153_FORCE_TERMINAL_SIGNAL_NONE").is_some()
 }
 
+fn is_clear_or_none_fixture_token(token: &str) -> bool {
+    matches!(token, "None" | "Clear")
+}
+
+fn age153_fixture_override_from_kind(
+    kind: Option<TerminalSignalKind>,
+) -> Age153TerminalSignalFixtureOverride {
+    kind.map(Age153TerminalSignalFixtureOverride::Force)
+        .unwrap_or(Age153TerminalSignalFixtureOverride::Unset)
+}
+
 fn age153_forced_terminal_signal_override() -> Age153TerminalSignalFixtureOverride {
     let Some(value) = age153_forced_terminal_signal_kind_value() else {
         return Age153TerminalSignalFixtureOverride::Unset;
     };
     let token = age153_forced_terminal_signal_token(&value);
-    if matches!(token, "None" | "Clear") {
+    if is_clear_or_none_fixture_token(token) {
         return Age153TerminalSignalFixtureOverride::Clear;
     }
-    terminal_signal_kind_from_env(token)
-        .map(Age153TerminalSignalFixtureOverride::Force)
-        .unwrap_or(Age153TerminalSignalFixtureOverride::Unset)
+    age153_fixture_override_from_kind(terminal_signal_kind_from_env(token))
 }
 
 fn age153_forced_terminal_signal_kind_value() -> Option<String> {
     std::env::var("OULIPOLY_AGE153_FORCE_TERMINAL_SIGNAL_KIND").ok()
 }
 
-fn age153_forced_terminal_signal_token(value: &str) -> &str {
-    let mut tokens = value
+fn parse_fixture_tokens(value: &str) -> Vec<&str> {
+    value
         .split(',')
         .map(str::trim)
-        .filter(|token| !token.is_empty());
-    let Some(first) = tokens.next() else {
-        return value;
-    };
-    let all_tokens: Vec<_> = std::iter::once(first).chain(tokens).collect();
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn select_token_by_sequence_index<'a>(all_tokens: &[&'a str], fallback: &'a str) -> &'a str {
+    if all_tokens.is_empty() {
+        return fallback;
+    }
     let index = AGE153_FORCE_TERMINAL_SIGNAL_SEQUENCE_INDEX.fetch_add(1, Ordering::Relaxed);
     let len = all_tokens.len();
-    all_tokens.get(index % len).copied().unwrap_or(value)
+    all_tokens.get(index % len).copied().unwrap_or(fallback)
+}
+
+fn age153_forced_terminal_signal_token(value: &str) -> &str {
+    let all_tokens = parse_fixture_tokens(value);
+    select_token_by_sequence_index(&all_tokens, value)
 }
 
 fn clear_terminal_signal_fixture_override(
@@ -387,13 +408,11 @@ fn force_terminal_signal_fixture_override(result: &mut ExecutionResult, kind: Te
     );
 }
 
-fn force_terminal_signal_fixture_override_fields(
-    terminal_signal: &mut Option<TerminalSignal>,
-    terminal_reason: &mut Option<String>,
+fn build_forced_terminal_signal(
+    existing: Option<TerminalSignal>,
     kind: TerminalSignalKind,
-) {
-    let existing = terminal_signal.take();
-    let signal = match existing {
+) -> TerminalSignal {
+    match existing {
         Some(mut signal) => {
             signal.kind = kind;
             signal
@@ -404,7 +423,15 @@ fn force_terminal_signal_fixture_override_fields(
             evidence: "age153 fixture override".to_string(),
             observed_at: std::time::SystemTime::now(),
         },
-    };
+    }
+}
+
+fn force_terminal_signal_fixture_override_fields(
+    terminal_signal: &mut Option<TerminalSignal>,
+    terminal_reason: &mut Option<String>,
+    kind: TerminalSignalKind,
+) {
+    let signal = build_forced_terminal_signal(terminal_signal.take(), kind);
     *terminal_reason = typed_terminal_reason_fallback(&signal).map(str::to_string);
     *terminal_signal = Some(signal);
 }

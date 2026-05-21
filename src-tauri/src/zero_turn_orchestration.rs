@@ -85,6 +85,10 @@ pub enum ZeroTurnAction {
     Unclassified,
 }
 
+fn is_baseline_count_eligible(provider_session_id: Option<&str>, scan_failed: bool) -> bool {
+    provider_session_id.is_some() && !scan_failed
+}
+
 pub fn record_baseline(
     provider_name: &str,
     provider_session_id: Option<&str>,
@@ -94,12 +98,38 @@ pub fn record_baseline(
     ZeroTurnBaseline {
         provider_name: provider_name.to_string(),
         provider_session_id: provider_session_id.map(str::to_string),
-        baseline_assistant_turns: if provider_session_id.is_some() && !scan_failed {
+        baseline_assistant_turns: if is_baseline_count_eligible(provider_session_id, scan_failed) {
             baseline_count.map(|counts| counts.assistant)
         } else {
             None
         },
         scan_failed,
+    }
+}
+
+fn no_new_turns_produced(new_assistant_turns: u64) -> bool {
+    new_assistant_turns == 0
+}
+
+fn build_maybe_quota_exhausted_evidence(
+    baseline: &ZeroTurnBaseline,
+    provider_session_id: &str,
+    baseline_assistant_turns: u64,
+    current_assistant_turns: u64,
+    new_assistant_turns: u64,
+) -> ZeroTurnEvidence {
+    ZeroTurnEvidence {
+        provider_name: baseline.provider_name.clone(),
+        provider_session_id: provider_session_id.to_string(),
+        baseline_assistant_turns,
+        current_assistant_turns,
+        new_assistant_turns,
+        evidence: build_zero_turn_evidence(
+            provider_session_id,
+            baseline_assistant_turns,
+            current_assistant_turns,
+            new_assistant_turns,
+        ),
     }
 }
 
@@ -122,25 +152,33 @@ pub fn classify_completion_delta(
     else {
         return ZeroTurnClassification::UnclassifiedScanFailed;
     };
-    if new_assistant_turns == 0 {
+    if no_new_turns_produced(new_assistant_turns) {
         return ZeroTurnClassification::MaybeQuotaExhausted {
-            evidence: ZeroTurnEvidence {
-                provider_name: baseline.provider_name.clone(),
-                provider_session_id: provider_session_id.clone(),
+            evidence: build_maybe_quota_exhausted_evidence(
+                baseline,
+                provider_session_id,
                 baseline_assistant_turns,
                 current_assistant_turns,
                 new_assistant_turns,
-                evidence: build_zero_turn_evidence(
-                    provider_session_id,
-                    baseline_assistant_turns,
-                    current_assistant_turns,
-                    new_assistant_turns,
-                ),
-            },
+            ),
         };
     }
 
     ZeroTurnClassification::Productive
+}
+
+fn confirmation_key_from_evidence(evidence: ZeroTurnEvidence) -> ZeroTurnConfirmationKey {
+    ZeroTurnConfirmationKey {
+        provider_name: evidence.provider_name,
+        provider_session_id: evidence.provider_session_id,
+    }
+}
+
+fn is_same_provider_confirmed(
+    state: &ZeroTurnConfirmationState,
+    key: &ZeroTurnConfirmationKey,
+) -> bool {
+    state.active_key.as_ref() == Some(key) && state.verification_attempted
 }
 
 pub fn next_action(
@@ -153,11 +191,8 @@ pub fn next_action(
             ZeroTurnAction::Continue
         }
         ZeroTurnClassification::MaybeQuotaExhausted { evidence } => {
-            let key = ZeroTurnConfirmationKey {
-                provider_name: evidence.provider_name,
-                provider_session_id: evidence.provider_session_id,
-            };
-            if state.active_key.as_ref() == Some(&key) && state.verification_attempted {
+            let key = confirmation_key_from_evidence(evidence);
+            if is_same_provider_confirmed(state, &key) {
                 ZeroTurnAction::ConfirmedExhaustion
             } else {
                 state.record_maybe(key);

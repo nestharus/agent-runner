@@ -707,39 +707,31 @@ fn test_model_with_db_path(
         .unwrap_or_default();
     let (provider, prompt_mode) =
         effective_provider_for_model_provider(&model, provider_index, &providers_cfg)?;
-    let extra_inputs = HashMap::new();
     let result = services
         .executor_service
         .execute(ExecutorServiceRequest::Effective {
-            model: model.clone(),
+            model,
             provider: provider.clone(),
             provider_index,
             prompt_mode,
             prompt: prompt.to_string(),
             working_dir: None,
-            extra_inputs,
+            extra_inputs: HashMap::new(),
             parent_invocation_env: None,
         })
         .map_err(|error| error.to_string())?
         .result;
+    // AGE-156: typed-signal precedence consolidation. QuotaExhaustedInband is
+    // authoritative for durable exhausted_at writes; absent a typed signal, fall
+    // back to the LLM diagnostics classifier.
     if result.exit_code != 0 {
-        // AGE-156: typed-signal precedence consolidation. The AGE-162 WU-B
-        // partitioned recognizer in claude/codex/openai_compat emits
-        // `QuotaExhaustedInband` for persistent quota signatures and
-        // `RateLimited` for transient HTTP 429 / rate-limit signatures. Only
-        // the persistent-quota kind is authoritative for the durable
-        // `provider_quotas.exhausted_at` write here. When the typed signal is
-        // absent (degraded mode), fall back to the legacy broad-string
-        // classifier.
         let should_mark_exhausted = if let Some(signal) = result.terminal_signal.as_ref() {
             matches!(signal.kind, TerminalSignalKind::QuotaExhaustedInband)
         } else {
-            let diagnostic_input = diagnostic_input(&result.stderr, &result.stdout);
+            let input = diagnostic_input(&result.stderr, &result.stdout);
             let DiagnosticsServiceOutput::ExhaustionClassification { is_exhausted } = services
                 .diagnostics_service
-                .diagnose(DiagnosticsServiceRequest::ClassifyExhaustion {
-                    stderr: diagnostic_input,
-                })
+                .diagnose(DiagnosticsServiceRequest::ClassifyExhaustion { stderr: input })
                 .map_err(|error| error.to_string())?
             else {
                 return Err("Diagnostics service returned unexpected output".to_string());
@@ -750,12 +742,16 @@ fn test_model_with_db_path(
             <StateDb as ProviderQuotaRepository>::mark_exhausted(&db, &provider.name)?;
         }
     }
-    Ok(TestModelResult {
+    Ok(map_test_model_result(&result))
+}
+
+fn map_test_model_result(result: &oulipoly_runtime::executor::ExecutionResult) -> TestModelResult {
+    TestModelResult {
         success: result.exit_code == 0,
         stdout: String::from_utf8_lossy(&result.stdout).into_owned(),
-        stderr: result.stderr,
+        stderr: result.stderr.clone(),
         exit_code: result.exit_code,
-    })
+    }
 }
 
 fn diagnostic_input(stderr: &str, stdout: &[u8]) -> String {

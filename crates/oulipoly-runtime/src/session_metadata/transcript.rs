@@ -173,15 +173,24 @@ fn content_fallback_matches(
     }
 }
 
-fn content_fallback_dir(dir: &Path) -> Result<PathBuf, LocatorError> {
-    dir.canonicalize().map_err(|error| LocatorError::Io {
+fn content_fallback_dir_unavailable_message(dir: &Path, error: &std::io::Error) -> String {
+    format!(
+        "transcript_content_fallback_dir_unavailable: {}: {error}",
+        dir.display()
+    )
+}
+
+fn content_fallback_dir_io_error(dir: &Path, error: std::io::Error) -> LocatorError {
+    LocatorError::Io {
         kind: error.kind(),
         path: dir.to_path_buf(),
-        message: format!(
-            "transcript_content_fallback_dir_unavailable: {}: {error}",
-            dir.display()
-        ),
-    })
+        message: content_fallback_dir_unavailable_message(dir, &error),
+    }
+}
+
+fn content_fallback_dir(dir: &Path) -> Result<PathBuf, LocatorError> {
+    dir.canonicalize()
+        .map_err(|error| content_fallback_dir_io_error(dir, error))
 }
 
 fn no_locator_for_unknown_storage_error() -> LocatorError {

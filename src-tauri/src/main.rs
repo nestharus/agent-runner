@@ -110,7 +110,7 @@ use terminal_outcome_adapter::{
 };
 use zero_turn_orchestration::{
     ZeroTurnAction, ZeroTurnBaseline, ZeroTurnClassification, ZeroTurnConfirmationState,
-    classify_completion_delta, next_action, record_baseline,
+    ZeroTurnEvidence, classify_completion_delta, next_action, record_baseline,
 };
 
 use usage::cli::{Cli, SessionSubcommands, Subcommands};
@@ -3310,6 +3310,40 @@ fn zero_turn_zero_counts() -> oulipoly_state::SessionTurnCounts {
     }
 }
 
+fn provider_has_no_session_source(
+    sessions_cfg: &oulipoly_config::SessionsConfig,
+    provider_name: &str,
+) -> bool {
+    sessions_cfg.get(provider_name).is_none()
+}
+
+fn scan_report_has_errors(report: &oulipoly_runtime::sessions::ScanReport) -> bool {
+    !report.errors.is_empty()
+}
+
+fn baseline_turn_count_from_scan(
+    state: &StateDb,
+    provider_name: &str,
+    session_id: &str,
+    scan_failed: bool,
+) -> Option<oulipoly_state::SessionTurnCounts> {
+    if scan_failed {
+        None
+    } else {
+        state.count_session_turns(provider_name, session_id).ok()
+    }
+}
+
+fn classify_from_turn_count_result<E>(
+    baseline: &ZeroTurnBaseline,
+    count_result: Result<oulipoly_state::SessionTurnCounts, E>,
+) -> ZeroTurnClassification {
+    match count_result {
+        Ok(counts) => classify_completion_delta(baseline, counts),
+        Err(_) => ZeroTurnClassification::UnclassifiedScanFailed,
+    }
+}
+
 fn zero_turn_record_baseline(
     state: &StateDb,
     sessions_cfg: &oulipoly_config::SessionsConfig,
@@ -3319,16 +3353,13 @@ fn zero_turn_record_baseline(
     let Some(session_id) = provider_session_id else {
         return record_baseline(provider_name, None, None, false);
     };
-    if sessions_cfg.get(provider_name).is_none() {
+    if provider_has_no_session_source(sessions_cfg, provider_name) {
         return record_baseline(provider_name, Some(session_id), None, true);
     }
     let report = oulipoly_runtime::sessions::scan_provider(provider_name, sessions_cfg, state);
-    let scan_failed = !report.errors.is_empty();
-    let baseline_count = if scan_failed {
-        None
-    } else {
-        state.count_session_turns(provider_name, session_id).ok()
-    };
+    let scan_failed = scan_report_has_errors(&report);
+    let baseline_count =
+        baseline_turn_count_from_scan(state, provider_name, session_id, scan_failed);
     record_baseline(provider_name, Some(session_id), baseline_count, scan_failed)
 }
 
@@ -3345,13 +3376,22 @@ fn zero_turn_classify_after_completion(
     }
     let report =
         oulipoly_runtime::sessions::scan_provider(&baseline.provider_name, sessions_cfg, state);
-    if !report.errors.is_empty() {
+    if scan_report_has_errors(&report) {
         return ZeroTurnClassification::UnclassifiedScanFailed;
     }
-    match state.count_session_turns(&baseline.provider_name, session_id) {
-        Ok(counts) => classify_completion_delta(baseline, counts),
-        Err(_) => ZeroTurnClassification::UnclassifiedScanFailed,
-    }
+    classify_from_turn_count_result(
+        baseline,
+        state.count_session_turns(&baseline.provider_name, session_id),
+    )
+}
+
+fn zero_turn_classification_is_non_productive(c: &ZeroTurnClassification) -> bool {
+    matches!(
+        c,
+        ZeroTurnClassification::MaybeQuotaExhausted { .. }
+            | ZeroTurnClassification::UnclassifiedNoSessionId
+            | ZeroTurnClassification::UnclassifiedScanFailed
+    )
 }
 
 fn zero_turn_classification_for_action(
@@ -3360,23 +3400,10 @@ fn zero_turn_classification_for_action(
     provider_name: &str,
     provider_session_id: Option<&str>,
 ) -> ZeroTurnClassification {
-    if matches!(
-        classification,
-        ZeroTurnClassification::MaybeQuotaExhausted { .. }
-    ) {
+    if zero_turn_classification_is_non_productive(&classification) {
         return classification;
     }
-    if matches!(
-        classification,
-        ZeroTurnClassification::UnclassifiedNoSessionId
-            | ZeroTurnClassification::UnclassifiedScanFailed
-    ) {
-        return classification;
-    }
-    if result
-        .terminal_signal
-        .as_ref()
-        .is_some_and(|signal| signal.kind == TerminalSignalKind::MaybeQuotaExhausted)
+    if zero_turn_completion_can_replace_signal(&result.terminal_signal)
         && let Some(session_id) = provider_session_id
     {
         let baseline = record_baseline(
@@ -3396,6 +3423,18 @@ fn zero_turn_completion_can_replace_signal(signal: &Option<executor::TerminalSig
         .is_some_and(|signal| signal.kind == TerminalSignalKind::MaybeQuotaExhausted)
 }
 
+fn build_maybe_quota_exhausted_signal(
+    provider_name: &str,
+    evidence: &ZeroTurnEvidence,
+) -> executor::TerminalSignal {
+    executor::TerminalSignal {
+        kind: TerminalSignalKind::MaybeQuotaExhausted,
+        provider_name: provider_name.to_string(),
+        evidence: evidence.evidence.clone(),
+        observed_at: std::time::SystemTime::now(),
+    }
+}
+
 fn apply_zero_turn_classification_to_signal_fields(
     terminal_signal: &mut Option<executor::TerminalSignal>,
     terminal_reason: &mut Option<String>,
@@ -3404,10 +3443,7 @@ fn apply_zero_turn_classification_to_signal_fields(
 ) {
     match classification {
         ZeroTurnClassification::Productive => {
-            if terminal_signal
-                .as_ref()
-                .is_some_and(|signal| signal.kind == TerminalSignalKind::MaybeQuotaExhausted)
-            {
+            if zero_turn_completion_can_replace_signal(terminal_signal) {
                 *terminal_signal = None;
                 *terminal_reason = None;
             }
@@ -3416,12 +3452,7 @@ fn apply_zero_turn_classification_to_signal_fields(
             if !zero_turn_completion_can_replace_signal(terminal_signal) {
                 return;
             }
-            *terminal_signal = Some(executor::TerminalSignal {
-                kind: TerminalSignalKind::MaybeQuotaExhausted,
-                provider_name: provider_name.to_string(),
-                evidence: evidence.evidence.clone(),
-                observed_at: std::time::SystemTime::now(),
-            });
+            *terminal_signal = Some(build_maybe_quota_exhausted_signal(provider_name, evidence));
             *terminal_reason = Some("maybe_quota_exhausted".to_string());
         }
         ZeroTurnClassification::UnclassifiedNoSessionId
@@ -3624,6 +3655,20 @@ fn balanced_executor_request(input: BalancedExecutorRequestInput<'_>) -> Executo
     }
 }
 
+fn is_confirmed_zero_turn_exhaustion(
+    action: ZeroTurnAction,
+    signal: &Option<executor::TerminalSignal>,
+) -> bool {
+    matches!(action, ZeroTurnAction::ConfirmedExhaustion)
+        && zero_turn_completion_can_replace_signal(signal)
+}
+
+fn format_quota_retry_budget_exhausted(model_name: &str, max_attempts: usize) -> String {
+    format!(
+        "quota-exhausted retry budget exhausted for pool {model_name} after {max_attempts} attempts"
+    )
+}
+
 fn run_with_balancing(
     agent_runtime_services: &wiring::AgentRuntimeServices,
     state_db_opener: &dyn StateDbOpener,
@@ -3666,9 +3711,9 @@ fn run_with_balancing(
                 },
             ) {
                 Err(err) => Err(err.to_string()),
-                Ok(_) => Err(format!(
-                    "quota-exhausted retry budget exhausted for pool {} after {max_attempts} attempts",
-                    model.name
+                Ok(_) => Err(format_quota_retry_budget_exhausted(
+                    &model.name,
+                    max_attempts,
                 )),
             };
         }
@@ -3829,11 +3874,7 @@ fn run_with_balancing(
         let balanced_terminal_signal =
             balanced_terminal_signal_for_outcome(&result, should_defer_generic_exit);
         let terminal_signal_disposition =
-            if matches!(zero_turn_action, ZeroTurnAction::ConfirmedExhaustion)
-                && balanced_terminal_signal
-                    .as_ref()
-                    .is_some_and(|signal| signal.kind == TerminalSignalKind::MaybeQuotaExhausted)
-            {
+            if is_confirmed_zero_turn_exhaustion(zero_turn_action, &balanced_terminal_signal) {
                 let signal = balanced_terminal_signal
                     .as_ref()
                     .expect("confirmed zero-turn action requires a maybe signal");
