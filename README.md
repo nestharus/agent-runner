@@ -464,7 +464,7 @@ For other CLIs (SQLite history, remote API, etc.), write your own script — see
 
 ### Optional: `transcript_locator`
 
-`sessions.toml` entries may also declare a `transcript_locator` script that resolves a `session_id` to the absolute path of its raw transcript file. Used by `trace --json` to fill `transcript_path` and `transcript_state` per node. The lookup is **lazy at trace time** — never at invocation time — so unused providers cost nothing.
+`sessions.toml` entries may also declare a `transcript_locator` script that resolves a `session_id` to the absolute path of its raw transcript file. Used by `trace --json` to fill `transcript_path` and `transcript_state` per node. The lookup is **lazy at trace time** — never at invocation time — so unused providers add no work.
 
 ```toml
 [claude]

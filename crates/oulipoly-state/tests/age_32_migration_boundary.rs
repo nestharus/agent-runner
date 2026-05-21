@@ -253,8 +253,8 @@ fn ti_10_age_54_schema4_plan_contains_only_schema5_step() {
         plan.iter()
             .map(|migration| migration.target_version)
             .collect::<Vec<_>>(),
-        vec![5, 6, 7, CURRENT_SCHEMA_VERSION],
-        "schema-4 DBs must take the AGE-54 schema-5, AGE-58 schema-6, AGE-123 schema-7, and PP-002 schema-8 migrations"
+        vec![5, 6, 7, 8, CURRENT_SCHEMA_VERSION],
+        "schema-4 DBs must take the AGE-54 schema-5, AGE-58 schema-6, AGE-123 schema-7, PP-002 schema-8, and AGE-163 schema-9 migrations"
     );
     assert_eq!(
         plan.iter()
@@ -265,6 +265,7 @@ fn ti_10_age_54_schema4_plan_contains_only_schema5_step() {
             "0006_age_58_dual_write_row_versions",
             "0007_age_123_resume_provider_identity",
             "0008_owned_turn_events",
+            "0009_age163_working_set_and_round_robin",
         ]
     );
 }

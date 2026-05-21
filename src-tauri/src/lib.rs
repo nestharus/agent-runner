@@ -1101,11 +1101,11 @@ mod tests {
         ClaudeRestrictions, CodexRestrictions, ProviderEntry, ProvidersConfig, ToolRestrictionKind,
         ToolRestrictions,
     };
+    use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind as TestTerminalSignalKind;
     use oulipoly_runtime::executor::{
         CapturedChildInvocation, ExecutionResult, ResumeAcceptanceResult, SessionCaptureMethod,
         SessionCaptureResult, TerminalSignal,
     };
-    use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind as TestTerminalSignalKind;
     use oulipoly_runtime::services::{
         DiagnosticsServiceOutput, DiagnosticsServicePort, DiagnosticsServiceRequest,
         ExecutorServiceOutput, ExecutorServicePort, ExecutorServiceRequest, QuotaServiceOutput,

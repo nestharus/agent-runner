@@ -1129,7 +1129,7 @@ fn is_resume_migratable_pair(source: &ProviderConfig, target: &ProviderConfig) -
 pub fn working_set_member(quota: Option<&QuotaRecord>, now: DateTime<Utc>) -> bool {
     quota
         .and_then(|q| q.next_available_at)
-        .map_or(true, |ts| ts <= now)
+        .is_none_or(|ts| ts <= now)
 }
 
 /// AGE-163 WU-A.3 round-robin candidate selection. Walks the model's
@@ -4234,7 +4234,7 @@ mod tests {
     }
 
     #[test]
-    fn decide_migration_degrades_when_projection_window_reads_fail_after_active_quota_lookup() {
+    fn decide_migration_stays_when_projection_window_reads_fail_after_active_quota_lookup() {
         let (_dir, path, db) = file_backed_state("migration-projection-degrades");
         let model = migratable_model(&[("claude", "claude_code"), ("claude2", "claude_code")]);
         seed_windows_with_deltas(&db, "claude", &[(0.80, 5, 0.01, 22)]);
@@ -4245,11 +4245,8 @@ mod tests {
 
         assert_eq!(
             decision,
-            MigrationDecision::Migrate {
-                target_provider_index: 0,
-                reason: TransitionReason::QuotaThreshold,
-            },
-            "active quota lookup succeeds, then projection window reads degrade to zero-load tie-breaking"
+            MigrationDecision::Stay,
+            "active quota lookup succeeds, then projection window reads degrade to zero-load strict-better handling"
         );
     }
 

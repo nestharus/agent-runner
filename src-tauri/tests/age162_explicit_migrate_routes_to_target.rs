@@ -132,10 +132,8 @@ name = "diagnostic-provider"
         let target_cmd = self.write_script(&format!("{MIGRATE_TARGET}-resume.sh"), target_body);
         let owner_projects = self.provider_projects_dir(SESSION_OWNER);
         let target_projects = self.provider_projects_dir(MIGRATE_TARGET);
-        let diagnostic_command = self.write_script(
-            "diagnostic-provider.sh",
-            "cat >/dev/null\nexit 9",
-        );
+        let diagnostic_command =
+            self.write_script("diagnostic-provider.sh", "cat >/dev/null\nexit 9");
 
         let providers_toml = format!(
             r#"[{SESSION_OWNER}]
@@ -274,14 +272,8 @@ fn provider_body(marker: &Path, shell: &str) -> String {
 #[test]
 fn age162_resume_with_explicit_migrate_dispatches_target_binary_not_session_owner() {
     let fixture = Fixture::new();
-    let owner_marker = fixture
-        .dir
-        .path()
-        .join("age162-migrate-owner-marker.txt");
-    let target_marker = fixture
-        .dir
-        .path()
-        .join("age162-migrate-target-marker.txt");
+    let owner_marker = fixture.dir.path().join("age162-migrate-owner-marker.txt");
+    let target_marker = fixture.dir.path().join("age162-migrate-target-marker.txt");
     let _ = fs::remove_file(&owner_marker);
     let _ = fs::remove_file(&target_marker);
 
@@ -337,10 +329,7 @@ fn age162_resume_with_explicit_migrate_dispatches_target_binary_not_session_owne
 #[test]
 fn age162_resume_with_explicit_migrate_records_target_as_active_chain_segment_provider() {
     let fixture = Fixture::new();
-    let owner_marker = fixture
-        .dir
-        .path()
-        .join("age162-migrate-owner-marker-b.txt");
+    let owner_marker = fixture.dir.path().join("age162-migrate-owner-marker-b.txt");
     let target_marker = fixture
         .dir
         .path()
@@ -349,14 +338,8 @@ fn age162_resume_with_explicit_migrate_records_target_as_active_chain_segment_pr
     let _ = fs::remove_file(&target_marker);
 
     fixture.write_resume_pool(
-        &provider_body(
-            &owner_marker,
-            "printf '%s\\n' 'owner stdout'\nexit 0",
-        ),
-        &provider_body(
-            &target_marker,
-            "printf '%s\\n' 'target stdout'\nexit 0",
-        ),
+        &provider_body(&owner_marker, "printf '%s\\n' 'owner stdout'\nexit 0"),
+        &provider_body(&target_marker, "printf '%s\\n' 'target stdout'\nexit 0"),
     );
     fixture.stage_active_claude_jsonl();
     fixture.seed_active_chain();

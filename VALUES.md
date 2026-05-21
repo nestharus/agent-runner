@@ -130,7 +130,7 @@ per-invocation.
 This means: no service to install, no port to manage, no PID file, no
 "the daemon is down" failure mode. The tradeoff is that work that
 benefits from being persistent (caches, watches, scheduling) has to
-be designed around per-invocation cost.
+be designed around per-invocation work.
 
 ### V8 — Lazy on use, not eager
 

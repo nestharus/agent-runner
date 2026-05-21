@@ -242,8 +242,10 @@ fn age162_decision_failed_does_not_block_quota_threshold_rotation() {
             effective_cwd: &fixture.workspace,
             stderr: &mut stderr,
         })
-        .expect("migration service must not return ServiceError on the \
-                 SourceMissingStorage+QuotaThreshold path under AGE-148");
+        .expect(
+            "migration service must not return ServiceError on the \
+                 SourceMissingStorage+QuotaThreshold path under AGE-148",
+        );
 
     match &output {
         MigrationServiceOutput::Stay => panic!(

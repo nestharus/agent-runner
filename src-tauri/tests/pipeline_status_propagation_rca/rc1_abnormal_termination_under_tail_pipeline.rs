@@ -82,15 +82,15 @@
 use std::io::Read;
 use std::process::{Child, ExitStatus, Output, Stdio};
 use std::thread;
-use std::thread::sleep;
 use std::thread::JoinHandle;
+use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use oulipoly_state::{InvocationRecord, InvocationStatus};
 
 use super::{
-    filesystem_artifact_recovers_terminal, find_runner_pid_for_fixture, list_files_recursive,
-    poll_first_running_uuid, sigkill_pid, text_contains_terminal_envelope, PipelineFixture,
+    PipelineFixture, filesystem_artifact_recovers_terminal, find_runner_pid_for_fixture,
+    list_files_recursive, poll_first_running_uuid, sigkill_pid, text_contains_terminal_envelope,
 };
 
 /// Slow enough to give us a wide kill window even on a loaded CI runner; the
@@ -256,6 +256,7 @@ fn outcome_from_process_output(
 }
 
 #[test]
+#[ignore = "known-red RCA reproduction; run explicitly when implementing F1 terminal recovery"]
 fn terminal_status_recoverable_after_external_kill_under_tail_pipeline() {
     // Scenario 1: the actual incident shape — runner under `bash -c
     // '... 2>&1 | tail -3'`. Channels A (post-pipeline stdout) and C

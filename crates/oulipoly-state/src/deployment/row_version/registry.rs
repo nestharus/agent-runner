@@ -102,6 +102,9 @@ const PROVIDER_QUOTAS_PAYLOAD: &[&str] = &[
     "refreshed_at",
     "last_empty_refresh_at",
     "exhausted_at",
+    "next_available_at",
+    "last_refresh_at",
+    "failure_class",
     "topology_peak_live_window_count",
     "last_topology_probe_at",
 ];

@@ -49,7 +49,7 @@ fn typed_signal_handled_path_finalizes_explicitly_not_guard_drop() {
 
     let output = fixture.run_one_shot_with_env(
         "age153-guard-path",
-        &[("OULIPOLY_TEST_BOUNDED_SILENCE_MS", "120")],
+        &[("OULIPOLY_BOUNDED_SILENCE_MS", "120")],
     );
 
     assert_ne!(output.status.code(), Some(0), "{output:?}");

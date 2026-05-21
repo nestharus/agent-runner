@@ -298,6 +298,7 @@ fn assert_schema5_current_plan(plan: &[&migrations::Migration]) {
             "0006_age_58_dual_write_row_versions",
             "0007_age_123_resume_provider_identity",
             "0008_owned_turn_events",
+            "0009_age163_working_set_and_round_robin",
         ]
     );
 }
