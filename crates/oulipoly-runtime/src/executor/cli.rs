@@ -1369,7 +1369,7 @@ fn terminal_outcome_from_status(status: ExitStatus) -> SupervisedTerminalOutcome
 }
 
 fn bounded_silence_from_env() -> Option<Duration> {
-    let raw = std::env::var("OULIPOLY_TEST_BOUNDED_SILENCE_MS").ok()?;
+    let raw = std::env::var("OULIPOLY_BOUNDED_SILENCE_MS").ok()?;
     let millis = raw.parse::<u64>().ok()?;
     (millis > 0).then(|| Duration::from_millis(millis))
 }

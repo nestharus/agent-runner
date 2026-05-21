@@ -55,7 +55,7 @@ fn one_shot_prolonged_silence_signal_fails_without_exhausted_write() {
 
     let output = fixture.run_one_shot_with_env(
         "age153-one-shot-silence",
-        &[("OULIPOLY_TEST_BOUNDED_SILENCE_MS", "120")],
+        &[("OULIPOLY_BOUNDED_SILENCE_MS", "120")],
     );
 
     assert_ne!(output.status.code(), Some(0), "{output:?}");

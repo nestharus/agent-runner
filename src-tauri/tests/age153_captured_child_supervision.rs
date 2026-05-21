@@ -77,7 +77,7 @@ fn captured_child_supervision_uses_typed_signal_reason_for_prolonged_silence() {
 
     let output = fixture.run_one_shot_with_env(
         "age153-captured-silence",
-        &[("OULIPOLY_TEST_BOUNDED_SILENCE_MS", "120")],
+        &[("OULIPOLY_BOUNDED_SILENCE_MS", "120")],
     );
 
     assert_ne!(output.status.code(), Some(0), "{output:?}");

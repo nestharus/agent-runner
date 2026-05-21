@@ -188,7 +188,7 @@ fn typed_terminal_failure_output() -> Output {
     )]);
     fixture.run_one_shot_with_env(
         "age154-result-typed-terminal",
-        &[("OULIPOLY_TEST_BOUNDED_SILENCE_MS", "120")],
+        &[("OULIPOLY_BOUNDED_SILENCE_MS", "120")],
     )
 }
 
