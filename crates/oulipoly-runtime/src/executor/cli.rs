@@ -1443,12 +1443,38 @@ fn terminate_for_live_quota(
             terminal_status.clone(),
         );
         Ok((terminal_status, Some(terminal_signal), Some(status)))
+    } else if let Some(status) = wait_for_child_after_live_quota(child)? {
+        let terminal_status = terminal_status_from_exit_status(&status);
+        let terminal_signal = recognize_terminal_signal(
+            provider_name,
+            recognizer,
+            stdout,
+            stderr,
+            terminal_status.clone(),
+        );
+        Ok((terminal_status, Some(terminal_signal), Some(status)))
     } else {
         Ok((
             TerminalStatusEvidence::Unknown,
             Some(live_signal),
             terminate_child(child)?,
         ))
+    }
+}
+
+fn wait_for_child_after_live_quota(child: &mut Child) -> Result<Option<ExitStatus>, String> {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|err| format!("try_wait after live quota failed: {err}"))?
+        {
+            return Ok(Some(status));
+        }
+        if terminate_grace_period_elapsed(started) {
+            return Ok(None);
+        }
+        thread::sleep(SUPERVISOR_POLL_INTERVAL);
     }
 }
 
