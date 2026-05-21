@@ -1,3 +1,16 @@
+//! ## Declared roles
+//!
+//! `accessor`, `mapper`, `validator`, `orchestration`
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/repositories/mod.rs
+//!     role: intrinsic-surface
+//!     Domain: state_repository_facade
+//! ```
+
 use crate::deployment::DeploymentAwareOpener;
 use crate::schema_probe::{self, SchemaProbeReport};
 use crate::{

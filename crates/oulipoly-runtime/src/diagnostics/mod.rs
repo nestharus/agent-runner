@@ -1,3 +1,16 @@
+//! ## Declared roles
+//!
+//! `accessor`, `mapper`, `parser`, `formatter`, `predicate`, `orchestration`
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-runtime/src/diagnostics/mod.rs
+//!     role: intrinsic-surface
+//!     Domain: diagnostic_classification
+//! ```
+
 use crate::executor;
 use crate::services::{
     DiagnosticsServiceOutput, DiagnosticsServicePort, DiagnosticsServiceRequest, ServiceError,
@@ -275,17 +288,27 @@ mod tests {
     }
 
     #[test]
-    fn classify_exhaustion_matches_quota_billing_usage_limit_stderr() {
+    fn diagnostics_classify_exhaustion_remains_non_authoritative() {
         for stderr in [
             "error: QUOTA exceeded for this account",
             "Billing limit reached for the workspace",
             "USAGE LIMIT has been hit; try again later",
             "You've hit your limit · resets 9:50pm (America/Los_Angeles)",
             r#"{"api_error_status":429,"result":"You've hit your limit · resets 9:50pm"}"#,
+            "Error: 429 Too Many Requests",
+            "rate limit reached",
         ] {
             assert!(
-                classify_exhaustion(stderr),
-                "expected quota exhaustion classification for {stderr:?}"
+                !classify_exhaustion(stderr),
+                "quota/rate-looking stderr must not be authoritative: {stderr:?}"
+            );
+            let d = heuristic_diagnosis(stderr, 1);
+            assert!(
+                !matches!(
+                    d.category,
+                    ErrorCategory::QuotaExhausted | ErrorCategory::RateLimit
+                ),
+                "heuristic fallback must not classify quota/rate text for {stderr:?}"
             );
         }
     }
@@ -309,16 +332,16 @@ mod tests {
     #[test]
     fn heuristic_rate_limit() {
         let d = heuristic_diagnosis("Error: 429 Too Many Requests", 1);
-        assert_eq!(d.category, ErrorCategory::RateLimit);
+        assert_eq!(d.category, ErrorCategory::Unknown);
     }
 
     #[test]
-    fn heuristic_claude_limit_json_is_quota_exhausted_not_generic_rate_limit() {
+    fn heuristic_claude_limit_json_is_not_quota_exhausted() {
         let d = heuristic_diagnosis(
             r#"{"type":"result","is_error":true,"api_error_status":429,"result":"You've hit your limit · resets 9:50pm"}"#,
             1,
         );
-        assert_eq!(d.category, ErrorCategory::QuotaExhausted);
+        assert_eq!(d.category, ErrorCategory::Unknown);
     }
 
     #[test]
@@ -353,18 +376,18 @@ mod tests {
     #[test]
     fn parse_empty_output_falls_back() {
         let d = parse_diagnosis("", "429 error", 1).unwrap();
-        assert_eq!(d.category, ErrorCategory::RateLimit);
+        assert_eq!(d.category, ErrorCategory::Unknown);
     }
 
     #[test]
-    fn parse_unknown_model_output_falls_back_to_heuristic_signal() {
+    fn parse_unknown_model_output_falls_back_without_quota_heuristic() {
         let d = parse_diagnosis(
             "unknown\nnot enough context",
             "You've hit your limit · resets 9:50pm",
             1,
         )
         .unwrap();
-        assert_eq!(d.category, ErrorCategory::QuotaExhausted);
+        assert_eq!(d.category, ErrorCategory::Unknown);
     }
 
     #[cfg(unix)]

@@ -9,6 +9,7 @@ use std::process::{Command, Output};
 
 const SESSION_ID: &str = "5169694d-de0f-40d1-890c-6e28e55bab27";
 const CHAIN_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const FORCE_KIND: &str = "OULIPOLY_AGE153_FORCE_TERMINAL_SIGNAL_KIND";
 
 struct ResumeProviderFixture<'a> {
     name: &'a str,
@@ -182,6 +183,18 @@ prompt_mode = "stdin"
     }
 
     fn run_resume(&self, model_name: &str) -> Output {
+        self.base_resume_command(model_name).output().unwrap()
+    }
+
+    fn run_resume_with_env(&self, model_name: &str, env: &[(&str, &str)]) -> Output {
+        let mut cmd = self.base_resume_command(model_name);
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+        cmd.output().unwrap()
+    }
+
+    fn base_resume_command(&self, model_name: &str) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
         cmd.arg("-m")
             .arg(model_name)
@@ -194,7 +207,7 @@ prompt_mode = "stdin"
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
-        cmd.output().unwrap()
+        cmd
     }
 
     fn active_segment_provider(&self) -> String {
@@ -318,7 +331,10 @@ fn resume_quota_exhausted_marks_provider_and_migrates_to_next_pool_member() {
         true,
     );
 
-    let output = fixture.run_resume("age100-resume");
+    let output = fixture.run_resume_with_env(
+        "age100-resume",
+        &[(FORCE_KIND, "QuotaExhaustedInband,None")],
+    );
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert_eq!(
@@ -368,7 +384,10 @@ fn resume_retries_n_minus_one_quota_exhausted_providers_then_succeeds() {
         true,
     );
 
-    let output = fixture.run_resume("age100-resume");
+    let output = fixture.run_resume_with_env(
+        "age100-resume",
+        &[(FORCE_KIND, "QuotaExhaustedInband,QuotaExhaustedInband,None")],
+    );
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert_eq!(
@@ -417,7 +436,8 @@ fn resume_all_pool_members_quota_exhausted_returns_all_providers_exhausted() {
         true,
     );
 
-    let output = fixture.run_resume("age100-resume");
+    let output =
+        fixture.run_resume_with_env("age100-resume", &[(FORCE_KIND, "QuotaExhaustedInband")]);
 
     assert_ne!(output.status.code(), Some(0), "{output:?}");
     assert!(output.stdout.is_empty(), "{output:?}");
@@ -427,12 +447,12 @@ fn resume_all_pool_members_quota_exhausted_returns_all_providers_exhausted() {
         "{stderr}"
     );
     assert_eq!(line_count(&markers[0]), 1);
-    assert_eq!(line_count(&markers[1]), 1);
+    assert_eq!(line_count(&markers[1]), 2);
     assert_eq!(fixture.exhausted_row_count("claude-a"), 1);
     assert_eq!(fixture.exhausted_row_count("claude-b"), 1);
     assert_eq!(fixture.exhausted_provider_count(), 2);
     assert_eq!(fixture.failed_quota_invocation_count("claude-a"), 1);
-    assert_eq!(fixture.failed_quota_invocation_count("claude-b"), 1);
+    assert_eq!(fixture.failed_quota_invocation_count("claude-b"), 2);
 }
 
 #[test]
@@ -512,7 +532,10 @@ fn resume_heuristic_stderr_quota_uses_same_path_as_diagnostic_model_quota() {
         true,
     );
 
-    let heuristic_output = heuristic.run_resume("age100-resume");
+    let heuristic_output = heuristic.run_resume_with_env(
+        "age100-resume",
+        &[(FORCE_KIND, "QuotaExhaustedInband,None")],
+    );
 
     assert_eq!(
         heuristic_output.status.code(),
@@ -562,7 +585,10 @@ fn resume_heuristic_stderr_quota_uses_same_path_as_diagnostic_model_quota() {
         false,
     );
 
-    let model_output = model_backed.run_resume("age100-resume");
+    let model_output = model_backed.run_resume_with_env(
+        "age100-resume",
+        &[(FORCE_KIND, "QuotaExhaustedInband,None")],
+    );
 
     assert_eq!(model_output.status.code(), Some(0), "{model_output:?}");
     assert_eq!(

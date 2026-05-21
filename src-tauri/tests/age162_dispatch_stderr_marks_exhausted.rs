@@ -254,6 +254,7 @@ fn age162_transient_rate_limit_stderr_does_not_mark_exhausted_under_claude_recog
 /// failing test above is not asking for the heuristic to be removed
 /// wholesale — only for the rate-limit branch to be gated.
 #[test]
+#[ignore = "AGE-166: substring quota detection removed in PR #126; this recognizer scenario no longer applies."]
 fn age162_canonical_quota_signature_still_flips_exhausted_at_under_claude_recognizer() {
     let fixture = Fixture::new();
     let owner_marker = fixture.dir.path().join("age162-quota-owner.txt");
@@ -330,6 +331,7 @@ fn age162_transient_rate_limit_stderr_does_not_mark_exhausted_under_codex_recogn
 /// `exhausted_at`. This pins that the Codex recognizer fix narrows the
 /// rate-limit branch without disabling the legitimate quota path.
 #[test]
+#[ignore = "AGE-166: substring quota detection removed in PR #126; this recognizer scenario no longer applies."]
 fn age162_canonical_quota_signature_still_flips_exhausted_at_under_codex_recognizer() {
     let fixture = Fixture::new();
     let owner_marker = fixture.dir.path().join("age162-codex-quota-owner.txt");
@@ -407,6 +409,7 @@ fn age162_transient_rate_limit_stderr_does_not_mark_exhausted_under_openai_compa
 /// narrows the rate-limit branch without disabling the legitimate quota
 /// path.
 #[test]
+#[ignore = "AGE-166: substring quota detection removed in PR #126; this recognizer scenario no longer applies."]
 fn age162_canonical_quota_signature_still_flips_exhausted_at_under_openai_compat_recognizer() {
     let fixture = Fixture::new();
     let owner_marker = fixture.dir.path().join("age162-gemini-quota-owner.txt");

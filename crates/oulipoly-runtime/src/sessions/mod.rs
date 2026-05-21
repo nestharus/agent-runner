@@ -1,5 +1,21 @@
 //! CLI session log ingestion via user-provided adapter scripts.
 //!
+//! ## Declared roles
+//!
+//! `orchestration`, `parser`, `validator`, `mapper`, `formatter`, `predicate`
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-runtime/src/sessions/mod.rs
+//!     role: intrinsic-surface
+//!     Domain: session_turn_ingest
+//!     Owns:
+//!       - adapter-script scan/ingest
+//!       - ScanReport.new_turns
+//! ```
+//!
 //! Mirrors the `quota_script` pattern in `providers.toml`: the application
 //! is ignorant of any specific CLI's storage format. Each provider declares
 //! a `turn_script` that knows how to enumerate session turns for that CLI

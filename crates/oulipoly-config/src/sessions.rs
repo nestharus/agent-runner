@@ -1,3 +1,16 @@
+//! ## Declared roles
+//!
+//! `parser`, `mapper`, `accessor`, `formatter`, `predicate`
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-config/src/sessions.rs
+//!     role: intrinsic-surface
+//!     Domain: sessions_config_contract
+//! ```
+
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;

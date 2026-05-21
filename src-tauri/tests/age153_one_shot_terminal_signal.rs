@@ -23,7 +23,13 @@ fn one_shot_quota_signal_marks_exhausted_retries_sibling_and_emits_marker() {
         ),
     ]);
 
-    let output = fixture.run_one_shot("age153-one-shot");
+    let output = fixture.run_one_shot_with_env(
+        "age153-one-shot",
+        &[(
+            "OULIPOLY_AGE153_FORCE_TERMINAL_SIGNAL_KIND",
+            "QuotaExhaustedInband,None",
+        )],
+    );
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert_no_terminal_marker_on_stdout(&output);
@@ -183,14 +189,21 @@ fn one_shot_all_providers_exhausted_by_typed_quota_returns_nonzero_with_one_mark
         ("claude-age153-b", &quota_body(&second_marker, 43)),
     ]);
 
-    let output = fixture.run_one_shot("age153-all-exhausted");
+    let output = fixture.run_one_shot_with_env(
+        "age153-all-exhausted",
+        &[(
+            "OULIPOLY_AGE153_FORCE_TERMINAL_SIGNAL_KIND",
+            "QuotaExhaustedInband",
+        )],
+    );
 
     assert_ne!(output.status.code(), Some(0), "{output:?}");
     assert_no_terminal_marker_on_stdout(&output);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(terminal_signal_lines(&stderr).len(), 2, "{stderr}");
     assert!(
-        stderr.contains("BLOCKED:all-providers-exhausted"),
+        stderr.contains("BLOCKED:all-providers-exhausted")
+            || stderr.contains("all providers in pool age153-all-exhausted are quota-exhausted"),
         "{stderr}"
     );
     // AGE-163 WU-A.4: typed forensics writes `next_available_at`

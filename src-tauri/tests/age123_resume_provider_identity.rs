@@ -33,6 +33,7 @@ use std::process::{Command, Output};
 const CHAIN_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const SESSION_A: &str = "5169694d-de0f-40d1-890c-6e28e55bab27";
 const SESSION_B: &str = "6169694d-de0f-40d1-890c-6e28e55bab28";
+const FORCE_KIND: &str = "OULIPOLY_AGE153_FORCE_TERMINAL_SIGNAL_KIND";
 
 struct ProviderFixture<'a> {
     name: &'a str,
@@ -253,6 +254,21 @@ prompt_mode = "stdin"
         self.run(cmd)
     }
 
+    fn run_resume_with_env(&self, resume_input: &str, env: &[(&str, &str)]) -> Output {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+        cmd.arg("-m")
+            .arg("age123-resume")
+            .arg("--resume")
+            .arg(resume_input)
+            .arg("--models-dir")
+            .arg(&self.models_dir)
+            .arg("continue after rotation");
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+        self.run(cmd)
+    }
+
     fn run_resume_with_migration(&self, resume_input: &str, target_provider: &str) -> Output {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
         cmd.arg("-m")
@@ -435,7 +451,8 @@ fn quota_retry_records_resolved_provider_identity_per_attempt() {
     fixture.stage_claude_jsonl("claude-a", SESSION_A);
     fixture.seed_active_chain("claude-a", SESSION_A);
 
-    let output = fixture.run_resume(CHAIN_ID);
+    let output =
+        fixture.run_resume_with_env(CHAIN_ID, &[(FORCE_KIND, "QuotaExhaustedInband,None")]);
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let first = fixture.invocation_for_provider("claude-a");

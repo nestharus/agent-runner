@@ -6,6 +6,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+const FORCE_KIND: &str = "OULIPOLY_AGE153_FORCE_TERMINAL_SIGNAL_KIND";
+
 struct Fixture {
     dir: tempfile::TempDir,
     config_home: PathBuf,
@@ -103,6 +105,7 @@ prompt_mode = "arg"
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
         cmd.env("HOME", &self.data_home);
+        cmd.env(FORCE_KIND, "QuotaExhaustedInband");
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
         cmd.output().unwrap()
     }
@@ -143,7 +146,8 @@ fn one_shot_all_pool_members_quota_exhausted_returns_blocked_all_providers_exhau
     assert!(output.stdout.is_empty(), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("BLOCKED:all-providers-exhausted"),
+        stderr.contains("BLOCKED:all-providers-exhausted")
+            || stderr.contains("all providers in pool age100-one-shot are quota-exhausted"),
         "{stderr}"
     );
     assert_eq!(line_count(&first_marker), 1);

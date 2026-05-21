@@ -1,3 +1,17 @@
+//! ## Declared roles
+//!
+//! `parser`, `validator`, `mapper`
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: src-tauri/src/usage/cli.rs
+//!     role: adapter
+//!     Translates:
+//!       - clap-derive-Parser-Subcommand to public AgentsCli command surface
+//! ```
+
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 

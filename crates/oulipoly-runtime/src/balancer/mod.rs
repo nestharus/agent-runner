@@ -6,7 +6,7 @@
 //! intrinsic_surface_declarations:
 //!   - component: crates/oulipoly-runtime/src/balancer/mod.rs::quota_routing_surface
 //!     role: intrinsic-surface
-//!     Domain: quota-routing-refresh-and-topology
+//!     Domain: quota_routing_orchestration
 //!     Owns:
 //!       - InFlight refresh deduplication carrier
 //!       - RefreshOutcome ignored/degraded routing result

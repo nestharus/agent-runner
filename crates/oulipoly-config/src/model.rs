@@ -1,3 +1,16 @@
+//! ## Declared roles
+//!
+//! `parser`, `validator`, `mapper`, `formatter`, `accessor`, `predicate`
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-config/src/model.rs
+//!     role: intrinsic-surface
+//!     Domain: model_provider_session_config
+//! ```
+
 use crate::claude_tool_filter::{ClaudeToolFilterShape, validate_proxy_claude_filter_shape};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};

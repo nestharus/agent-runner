@@ -39,7 +39,8 @@ impl FailureClass {
             TerminalSignalKind::CleanExit
             | TerminalSignalKind::NonzeroExit
             | TerminalSignalKind::SignalExit
-            | TerminalSignalKind::Unknown => None,
+            | TerminalSignalKind::Unknown
+            | TerminalSignalKind::MaybeQuotaExhausted => None,
         }
     }
 

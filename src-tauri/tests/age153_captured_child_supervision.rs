@@ -28,7 +28,13 @@ exit 42"#
     )]);
     fixture.seed_running_child_for_first_parent(child_uuid);
 
-    let output = fixture.run_one_shot("age153-captured");
+    let output = fixture.run_one_shot_with_env(
+        "age153-captured",
+        &[(
+            "OULIPOLY_AGE153_FORCE_TERMINAL_SIGNAL_KIND",
+            "QuotaExhaustedInband",
+        )],
+    );
 
     assert_ne!(output.status.code(), Some(0), "{output:?}");
     assert_no_terminal_marker_on_stdout(&output);

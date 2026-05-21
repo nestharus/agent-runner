@@ -1,5 +1,5 @@
 //! ## Declared roles
-//! accessor, mapper, predicate
+//! `accessor`, `mapper`, `predicate`, `orchestration`, `filter`
 //!
 //! Transcript path resolution through configured locators, scripts, and the
 //! push-hydrated provider-private registry.

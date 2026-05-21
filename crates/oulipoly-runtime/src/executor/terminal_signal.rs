@@ -22,6 +22,7 @@ pub enum TerminalSignalKind {
     SignalExit,
     SpawnError,
     QuotaExhaustedInband,
+    MaybeQuotaExhausted,
     RateLimited,
     ProlongedSilence,
     Unknown,
@@ -118,6 +119,17 @@ pub(crate) fn terminal_signal(
     }
 }
 
+pub fn build_zero_turn_evidence(
+    provider_session_id: &str,
+    baseline: u64,
+    current: u64,
+    new_turns: u64,
+) -> String {
+    format!(
+        "provider_session_id={provider_session_id};baseline_assistant_turns={baseline};current_assistant_turns={current};new_assistant_turns={new_turns}"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,13 +140,14 @@ mod tests {
         UNIX_EPOCH + Duration::from_secs(139)
     }
 
-    fn all_kinds() -> [TerminalSignalKind; 8] {
+    fn all_kinds() -> [TerminalSignalKind; 9] {
         [
             TerminalSignalKind::CleanExit,
             TerminalSignalKind::NonzeroExit,
             TerminalSignalKind::SignalExit,
             TerminalSignalKind::SpawnError,
             TerminalSignalKind::QuotaExhaustedInband,
+            TerminalSignalKind::MaybeQuotaExhausted,
             TerminalSignalKind::RateLimited,
             TerminalSignalKind::ProlongedSilence,
             TerminalSignalKind::Unknown,
@@ -213,6 +226,7 @@ mod tests {
             TerminalSignalKind::SignalExit => "signal_exit",
             TerminalSignalKind::SpawnError => "spawn_error",
             TerminalSignalKind::QuotaExhaustedInband => "quota_exhausted_inband",
+            TerminalSignalKind::MaybeQuotaExhausted => "maybe_quota_exhausted",
             TerminalSignalKind::RateLimited => "rate_limited",
             TerminalSignalKind::ProlongedSilence => "prolonged_silence",
             TerminalSignalKind::Unknown => "unknown",
@@ -272,6 +286,10 @@ mod tests {
                 TerminalSignalKind::QuotaExhaustedInband,
                 "quota_exhausted_inband",
             ),
+            (
+                TerminalSignalKind::MaybeQuotaExhausted,
+                "maybe_quota_exhausted",
+            ),
             (TerminalSignalKind::RateLimited, "rate_limited"),
             (TerminalSignalKind::ProlongedSilence, "prolonged_silence"),
             (TerminalSignalKind::Unknown, "unknown"),
@@ -308,5 +326,40 @@ mod tests {
     #[test]
     fn trait_object_polymorphism_matches_static_call_for_openai_compat() {
         assert_dyn_matches_static("gemini", providers::openai_compat::Recognizer);
+    }
+
+    #[test]
+    fn terminal_signal_kind_maybe_quota_exhausted_round_trips() {
+        assert_terminal_signal_round_trip(TerminalSignalKind::MaybeQuotaExhausted);
+        assert_eq!(
+            label_for_kind(TerminalSignalKind::MaybeQuotaExhausted),
+            "maybe_quota_exhausted"
+        );
+    }
+
+    #[test]
+    fn zero_turn_evidence_builder_emits_expected_fields() {
+        let evidence = build_zero_turn_evidence("session-1", 2, 2, 0);
+
+        for expected in [
+            "provider_session_id=session-1",
+            "baseline_assistant_turns=2",
+            "current_assistant_turns=2",
+            "new_assistant_turns=0",
+        ] {
+            assert!(
+                evidence.contains(expected),
+                "zero-turn evidence missing {expected:?}: {evidence}"
+            );
+        }
+    }
+
+    #[test]
+    fn quota_exhausted_inband_semantics_regression() {
+        assert_terminal_signal_round_trip(TerminalSignalKind::QuotaExhaustedInband);
+        assert_eq!(
+            label_for_kind(TerminalSignalKind::QuotaExhaustedInband),
+            "quota_exhausted_inband"
+        );
     }
 }

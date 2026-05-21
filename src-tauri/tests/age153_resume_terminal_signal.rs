@@ -24,7 +24,13 @@ fn resume_quota_signal_marks_active_provider_exhausted_migrates_and_emits_marker
     fixture.stage_active_claude_jsonl("claude-age153-a");
     fixture.seed_active_chain("claude-age153-a", "age153-resume");
 
-    let output = fixture.run_resume("age153-resume");
+    let output = fixture.run_resume_with_env(
+        "age153-resume",
+        &[(
+            "OULIPOLY_AGE153_FORCE_TERMINAL_SIGNAL_KIND",
+            "QuotaExhaustedInband,None",
+        )],
+    );
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert_no_terminal_marker_on_stdout(&output);
