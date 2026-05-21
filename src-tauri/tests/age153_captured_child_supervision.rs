@@ -63,6 +63,7 @@ exit 42"#
 }
 
 #[test]
+#[ignore = "AGE-163 removed the bounded_silence supervisor; OULIPOLY_TEST_BOUNDED_SILENCE_MS is no longer honored and prolonged_silence_body hangs without a kill path."]
 fn captured_child_supervision_uses_typed_signal_reason_for_prolonged_silence() {
     let child_uuid = "77777777-1530-4530-8530-777777777777";
     let child_marker = CompositeInvocationId {

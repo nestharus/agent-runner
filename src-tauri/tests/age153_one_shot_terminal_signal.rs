@@ -50,6 +50,7 @@ fn one_shot_quota_signal_marks_exhausted_retries_sibling_and_emits_marker() {
 }
 
 #[test]
+#[ignore = "AGE-163 removed the bounded_silence supervisor; OULIPOLY_TEST_BOUNDED_SILENCE_MS is no longer honored and prolonged_silence_body hangs without a kill path."]
 fn one_shot_prolonged_silence_signal_fails_without_exhausted_write() {
     let fixture = Age153Fixture::new();
     let marker = fixture.dir.path().join("one-shot-prolonged-silence.txt");

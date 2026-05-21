@@ -134,7 +134,12 @@ pub fn apply_terminal_signal_outcome(
         TerminalSignalDisposition::QuotaExhaustedRetry => {
             // AGE-153 marker authority: emit_terminal_signal_marker.
             emit_terminal_signal_marker_or_warn(signal, ctx);
+            // AGE-163 forensics write `next_available_at` for the routing
+            // working-set predicate; the legacy `exhausted_at` column is the
+            // immediate durable mark that AGE-166 tests + the orchestration
+            // loop's confirm path also rely on.
             apply_typed_post_failure_forensics(signal, ctx);
+            mark_provider_exhausted(ctx.state_db, ctx.provider);
         }
         TerminalSignalDisposition::MaybeQuotaVerify => {
             // AGE-166: maybe-quota emits the marker but does NOT mark exhausted.
