@@ -349,7 +349,7 @@ fn e2e_resume_zero_turn_then_turn_clears_false_alarm() {
 }
 
 #[test]
-fn e2e_failed_invocation_completion_scan_before_classification() {
+fn e2e_productive_turn_with_nonzero_exit_not_quota_exhausted() {
     let mut fixture = ZeroTurnFixture::new();
 
     let baseline = fixture.baseline_from_db();
