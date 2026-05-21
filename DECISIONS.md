@@ -3385,6 +3385,8 @@ This is NOT residual acceptance, NOT precedent citation, and does NOT authorize 
 
 ## AGE-166 — Phase 2.5 gate resolution (2026-05-21)
 
+> Superseded on 2026-05-21 by `## AGE-166 — Resume orchestrator disavowal + in-scope corrective work`. Historical record only.
+
 - **Phase**: Phase 2.5 step 6 (problem-map / risk-profile / defer-question).
 - **Risk profile verdict**: HIGH (19/21 surfaces HIGH) per `planning/turn-counting-quota-detection/risk/age-166-risk-profile.md`.
 - **Defer-to-prototype signals fired (5/5)**: HIGH rollup, sprawling duplicates (3 provider recognizer copies + 4 parallel quota representations + split retry/resume loops), operational-knowledge lifecycle gaps, multi-WU characterization surface, multi-site implicit contracts.
@@ -3395,6 +3397,8 @@ This is NOT residual acceptance, NOT precedent citation, and does NOT authorize 
 
 ## AGE-166 — Silent-drift discovery disposition (2026-05-21)
 
+> Superseded on 2026-05-21 by `## AGE-166 — Resume orchestrator disavowal + in-scope corrective work`. Historical record only.
+
 - **Phase**: Phase 2.5 step 6c (disposition of blocking-ticket discoveries).
 - **Discovery 1 — provider recognizer fixture tests describe substring quota/rate behavior while predicates always return false** (DI:34-48, DI:197-205). Disposition: handle in-WU. These tests sit directly on the touched surface; Phase 6b will rewrite them against the new turn-counting contract.
 - **Discovery 2 — `QuotaExhaustedInband` semantics (durable, immediate mark-and-rotate) vs new zero-turn signal (maybe-quota, resume-confirms-or-clears)** (DI:97-104, DI:137-160, DI:206-210). Disposition: handle in-WU. Phase 3 proposer owns the choice of distinct kind vs extended variant; either choice keeps the work on the touched surface.
@@ -3404,10 +3408,14 @@ This is NOT residual acceptance, NOT precedent citation, and does NOT authorize 
 
 ## AGE-166 — Mode propagation for downstream phases (2026-05-21)
 
+> Superseded on 2026-05-21 by `## AGE-166 — Resume orchestrator disavowal + in-scope corrective work`. Historical record only.
+
 - **Per-surface mode for Phase 3 / 4 / 5 / 6b**: exhaustive for every HIGH surface (19 of 21); the two MEDIUM surfaces (`src-tauri/src/usage/cli.rs`, `crates/oulipoly-runtime/src/services/session_window.rs`) inherit exhaustive mode from the WU rollup.
 - **Phase 3 input**: proposer reads `planning/turn-counting-quota-detection/risk/age-166-risk-profile.md` directly. No further mode-map file is generated.
 
 ## AGE-166 — Phase 4 R1 disposition (2026-05-21)
+
+> Superseded on 2026-05-21 by `## AGE-166 — Resume orchestrator disavowal + in-scope corrective work`. Historical record only.
 
 - **Phase 4 R1 verdict**: BLOCKED (5 findings: R1-F01 audit-risk HIGH, R1-F02 code-quality HIGH, R1-F03 scope-risk MEDIUM, R1-F04 supported-surface MEDIUM with F3 needs_value_input, R1-F05 process-tree-audit-1 unsatisfiable).
 - **F3 inline resolution (supported-surface-risk new-value question)**: **Follow-up ticket** per master directive. The OpenAI-compatible one-shot fresh-session quota gap (no provider session id → unclassified per assumption A6) is documented as a residual; AGE-166 will record it in the revised proposal's supported-surface track via `STRATEGY_PHASE4_SUPPORTED_SURFACE_FOLLOWUP`. A follow-up Linear ticket will be filed with this WU's PR cross-link. The gap degrades to status-quo (no detection today), so shipping is not a regression.
@@ -3418,6 +3426,8 @@ This is NOT residual acceptance, NOT precedent citation, and does NOT authorize 
 - **R1-F03 scope-risk MEDIUM disposition**: revised proposal includes a staged-commit plan (commit-hygiene per `~/ai/conventions/pr-review-commit-hygiene.md`) with a logical commit per surface group, and a `main.rs` per-entrypoint review focus.
 
 ## AGE-166 — Phase 4 R1-F05 process-tree-audit-1 structural N/A (2026-05-21)
+
+> Superseded on 2026-05-21 by `## AGE-166 — Resume orchestrator disavowal + in-scope corrective work`. Historical record only.
 
 - **Phase**: Phase 4 R1 finding R1-F05 (process-tree-audit-1 BLOCKING).
 - **Class**: structural-execution-model gap, not evidence gap.
@@ -3432,6 +3442,8 @@ This is NOT residual acceptance, NOT precedent citation, and does NOT authorize 
 - **Convention citation**: `~/ai/agents/apply-gate-set.md` § Active dispatch evidence requirement allows "explicit non-applicability evidence allowed by the caller mode"; this WU's execution model is the cited rationale.
 
 ## AGE-166 — Phase 6 tests-contracts alignment review R1–R5 inline resolution (2026-05-21)
+
+> Superseded on 2026-05-21 by `## AGE-166 — Resume orchestrator disavowal + in-scope corrective work`. Historical record only.
 
 - **Phase**: Phase 6 tests-contracts alignment review.
 - **Rounds**: R1 → R5; verdicts MISALIGNED → MISALIGNED → MISALIGNED → MISALIGNED → MISALIGNED.
@@ -3448,6 +3460,8 @@ This is NOT residual acceptance, NOT precedent citation, and does NOT authorize 
 - **Step 6c handoff**: dispatch with the R5 test set + Step 6b output index + ACR-247 side-channel projection. Phase 6 apply-gate-set (post-Step-6c) will judge the actual code + actual diff, where the alignment gate's pedantry is structurally less relevant (code-quality + cohesion + coupling + function-classification auditors observe the diff directly).
 
 ## AGE-166 — Phase 6 R1 apply-gate-set disposition (2026-05-21)
+
+> Superseded on 2026-05-21 by `## AGE-166 — Resume orchestrator disavowal + in-scope corrective work`. Historical record only.
 
 - **Phase 6 R1 verdict**: BLOCKED with 5 findings: cohesion HIGH, coupling BLOCKED-malformed-decl, function-classification HIGH (26 multi-classifiers), push-pull HIGH (PP-006/PP-007 on AGE-157 locator inherited from rebase atop PR #124), aggregate BLOCKED.
 - **R1 immediate fix (in-WU)**: malformed `## Intrinsic-surface declarations` in 4 touched config/diagnostics/repositories files were missing required `Owns:` lists. Patched in-place with the exact `Owns:` content from the R3 proposal. Build still clean.
