@@ -66,6 +66,7 @@ use crate::executor::terminal_signal::{
 };
 
 const LARGE_PROMPT_THRESHOLD: usize = 100 * 1024; // 100KB
+const STDIN_WRITE_CHUNK_SIZE: usize = 16 * 1024;
 const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const TERMINATE_GRACE_PERIOD: Duration = Duration::from_millis(250);
 
@@ -1130,13 +1131,13 @@ enum DrainStream {
 fn execute_with_supervisor(
     mut cmd: Command,
     provider_name: &str,
-    config: SupervisorConfig,
+    mut config: SupervisorConfig,
 ) -> Result<SupervisedOutput, String> {
     configure_supervised_command(&mut cmd, config.prompt_mode);
     configure_supervised_process_group(&mut cmd);
     let mut child = spawn_supervised_child(cmd, provider_name)?;
-    write_prompt_to_child(&mut child, &config)?;
     let drains = start_child_drains(&mut child)?;
+    let stdin_writer = start_child_stdin_writer(&mut child, &mut config)?;
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let mut last_output_seen = Instant::now();
@@ -1175,7 +1176,8 @@ fn execute_with_supervisor(
     };
 
     finish_child_drains(drains, &mut stdout, &mut stderr, &mut last_output_seen);
-    Ok(supervised_output_from_terminal(
+    let stdin_write_error = finish_stdin_writer(stdin_writer);
+    let output = supervised_output_from_terminal(
         provider_name,
         config.recognizer,
         stdout,
@@ -1183,13 +1185,23 @@ fn execute_with_supervisor(
         terminal_status,
         terminal_signal,
         real_status,
-    ))
+    );
+    if stdin_write_error_is_fatal(stdin_write_error.as_deref(), &output)
+        && let Some(err) = stdin_write_error
+    {
+        return Err(err);
+    }
+    Ok(output)
 }
 
 struct ChildDrains {
     rx: mpsc::Receiver<(DrainStream, Vec<u8>)>,
     stdout_handle: thread::JoinHandle<()>,
     stderr_handle: thread::JoinHandle<()>,
+}
+
+struct StdinWriter {
+    handle: thread::JoinHandle<Result<(), String>>,
 }
 
 fn configure_supervised_command(cmd: &mut Command, prompt_mode: PromptMode) {
@@ -1245,24 +1257,52 @@ fn spawn_supervised_child(mut cmd: Command, provider_name: &str) -> Result<Child
         .map_err(|err| format!("Failed to spawn '{provider_name}': {err}"))
 }
 
-fn write_prompt_to_child(child: &mut Child, config: &SupervisorConfig) -> Result<(), String> {
-    if supervised_stdin_write_needed(config)
-        && let Some(mut stdin) = child.stdin.take()
-        && let Some(payload) = &config.prompt_payload
-        && let Err(err) = stdin.write_all(payload)
-    {
-        let _ = terminate_child(child);
-        return Err(write_stdin_error(&err));
+fn start_child_stdin_writer(
+    child: &mut Child,
+    config: &mut SupervisorConfig,
+) -> Result<Option<StdinWriter>, String> {
+    if !supervised_stdin_write_needed(config) {
+        return Ok(None);
     }
-    Ok(())
+    let Some(payload) = config.prompt_payload.take() else {
+        return Ok(None);
+    };
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "Child stdin was not piped".to_string())?;
+    let handle = thread::spawn(move || {
+        write_prompt_payload(&mut stdin, &payload).map_err(|err| write_stdin_error(&err))
+    });
+    Ok(Some(StdinWriter { handle }))
 }
 
 fn supervised_stdin_write_needed(config: &SupervisorConfig) -> bool {
     config.prompt_mode == PromptMode::Stdin
 }
 
+fn write_prompt_payload<W: Write>(stdin: &mut W, payload: &[u8]) -> std::io::Result<()> {
+    for chunk in payload.chunks(STDIN_WRITE_CHUNK_SIZE) {
+        stdin.write_all(chunk)?;
+    }
+    stdin.flush()
+}
+
 fn write_stdin_error(err: &std::io::Error) -> String {
     format!("Failed to write to stdin: {err}")
+}
+
+fn finish_stdin_writer(stdin_writer: Option<StdinWriter>) -> Option<String> {
+    let writer = stdin_writer?;
+    match writer.handle.join() {
+        Ok(Ok(())) => None,
+        Ok(Err(err)) => Some(err),
+        Err(_) => Some("Failed to write to stdin: writer thread panicked".to_string()),
+    }
+}
+
+fn stdin_write_error_is_fatal(err: Option<&str>, output: &SupervisedOutput) -> bool {
+    err.is_some() && output.terminal_signal.kind == TerminalSignalKind::CleanExit
 }
 
 fn start_child_drains(child: &mut Child) -> Result<ChildDrains, String> {
@@ -2673,6 +2713,45 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn prompt_payload_writer_chunks_large_payload() {
+        struct ChunkLimitWriter {
+            max_chunk: usize,
+            bytes: usize,
+            flushed: bool,
+        }
+
+        impl std::io::Write for ChunkLimitWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                assert!(
+                    buf.len() <= self.max_chunk,
+                    "write chunk exceeded limit: {} > {}",
+                    buf.len(),
+                    self.max_chunk
+                );
+                self.bytes += buf.len();
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.flushed = true;
+                Ok(())
+            }
+        }
+
+        let payload = vec![b'x'; (STDIN_WRITE_CHUNK_SIZE * 2) + 7];
+        let mut writer = ChunkLimitWriter {
+            max_chunk: STDIN_WRITE_CHUNK_SIZE,
+            bytes: 0,
+            flushed: false,
+        };
+
+        write_prompt_payload(&mut writer, &payload).unwrap();
+
+        assert_eq!(writer.bytes, payload.len());
+        assert!(writer.flushed);
+    }
+
     fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
         let start_idx = source
             .find(start)
@@ -2954,6 +3033,42 @@ sleep 9999"#,
 
         assert_eq!(result.stdout, b"raw\0\xffZ".to_vec());
         age141_signal(&result.terminal_signal, TerminalSignalKind::CleanExit);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn t15_large_stdin_early_child_exit_reports_child_status_not_spawn_error() {
+        let script = fixture_script(
+            r#"printf 'provider-started\n'
+printf 'provider-error\n' >&2
+exit 9"#,
+        );
+        let provider = age141_provider(&script);
+        let model = age141_model_for_provider(provider.clone(), PromptMode::Stdin);
+        let extra_inputs = HashMap::new();
+        let prompt = "x".repeat(LARGE_PROMPT_THRESHOLD + STDIN_WRITE_CHUNK_SIZE);
+
+        let result = execute_effective_with_supervisor_config(
+            EffectiveExecuteRequest {
+                model: &model,
+                provider: &provider,
+                provider_index: 0,
+                prompt_mode: PromptMode::Stdin,
+                prompt: &prompt,
+                working_dir: None,
+                extra_inputs: &extra_inputs,
+                parent_invocation_env: None,
+            },
+            None,
+            age141_supervisor_config(),
+        )
+        .unwrap();
+
+        assert_eq!(result.exit_code, 9);
+        assert_eq!(result.terminal_reason.as_deref(), Some("exit_nonzero"));
+        assert_eq!(result.stdout, b"provider-started\n".to_vec());
+        assert_eq!(result.stderr, "provider-error\n");
+        age141_signal(&result.terminal_signal, TerminalSignalKind::NonzeroExit);
     }
 
     #[cfg(unix)]
