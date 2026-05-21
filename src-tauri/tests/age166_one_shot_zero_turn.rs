@@ -1,4 +1,15 @@
 #![cfg(unix)]
+//! AGE-166 one-shot zero-turn quota-detection CLI fixture tests.
+//!
+//! ## Declared roles
+//!
+//! `validator`, `orchestration`, `formatter`
+//!
+//! The tests drive `oulipoly-agent-runner` one-shot CLI invocations through
+//! the `Age153Fixture::run_one_shot_with_env` harness (orchestration), assert
+//! the typed `MaybeQuotaExhausted` marker shape + `provider_quotas` state
+//! transitions (validator), and produce script bodies + capture-pool
+//! provider/sessions TOML (formatter).
 
 mod age153_support;
 
@@ -623,8 +634,14 @@ fn one_shot_openai_compat_first_zero_turn_resumes_same_provider_without_exhauste
 #[test]
 fn one_shot_openai_compat_second_zero_turn_confirms_quota_and_migrates() {
     let fixture = Age153Fixture::new();
-    let first_transcript = fixture.dir.path().join("one-shot-oai-compat-second-a.jsonl");
-    let sibling_transcript = fixture.dir.path().join("one-shot-oai-compat-second-b.jsonl");
+    let first_transcript = fixture
+        .dir
+        .path()
+        .join("one-shot-oai-compat-second-a.jsonl");
+    let sibling_transcript = fixture
+        .dir
+        .path()
+        .join("one-shot-oai-compat-second-b.jsonl");
     fs::write(&first_transcript, "").unwrap();
     fs::write(&sibling_transcript, "").unwrap();
     let first_marker = fixture.dir.path().join("one-shot-oai-compat-second-a.txt");

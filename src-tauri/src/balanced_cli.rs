@@ -2,7 +2,14 @@
 //!
 //! ## Declared roles
 //!
-//! `orchestration`, `mapper`
+//! `orchestration`, `mapper`, `predicate`, `validator`
+//!
+//! AGE-166 added test coverage that exercises both the typed-signal-first
+//! parity for `balanced_terminal_signal_for_outcome` (validator/predicate
+//! over `TerminalSignal.kind`, including `MaybeQuotaExhausted`) and the
+//! diagnostic fallback's error-category mapping (mapper). The file-local
+//! role set widens to reflect the validator/predicate work added by the
+//! AGE-166 typed-signal-first contract.
 
 use oulipoly_config::ModelConfig;
 use oulipoly_runtime::{diagnostics, executor};

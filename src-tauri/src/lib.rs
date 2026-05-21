@@ -1,6 +1,13 @@
 //! ## Declared roles
 //!
-//! `orchestration`, `mapper`, `predicate`, `formatter`
+//! `orchestration`, `mapper`, `predicate`, `formatter`, `accessor`, `validator`
+//!
+//! `accessor` covers state-DB open + providers-config load on the Tauri
+//! `test_model` IPC path. `validator` covers AGE-166 typed-signal
+//! discrimination (the durable `mark_exhausted` write is gated by
+//! `TerminalSignalKind::QuotaExhaustedInband`, `RateLimited` is allowed
+//! through, and `MaybeQuotaExhausted` is non-durable) plus the legacy
+//! diagnostic-input fallback validator when no typed signal is present.
 //!
 //! ## Adapter declarations
 //!
@@ -14,6 +21,7 @@
 //!       - executor service output contract
 //!       - provider quota mutation contract
 //!       - frontend TestModelResult contract
+//!       - AGE-166 typed terminal-signal kind to durable-mark predicate
 //! ```
 
 pub mod setup;

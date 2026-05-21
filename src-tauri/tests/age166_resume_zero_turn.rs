@@ -1,4 +1,16 @@
 #![cfg(unix)]
+//! AGE-166 headless-resume zero-turn quota-detection CLI fixture tests.
+//!
+//! ## Declared roles
+//!
+//! `validator`, `orchestration`, `formatter`
+//!
+//! Drives `oulipoly-agent-runner --resume` flow through the Age153 fixture
+//! harness (orchestration). Asserts the first MaybeQuotaExhausted stays on
+//! the active provider with no exhausted_at write, the second MaybeQuotaExhausted
+//! migrates with mark_exhausted, and a productive retry clears the false-alarm
+//! confirmation state (validator). Provider scripts and capture-pool TOML
+//! produced inline (formatter).
 
 mod age153_support;
 #[path = "pr_f_resume_integration.rs"]

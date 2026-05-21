@@ -2,7 +2,13 @@
 //!
 //! ## Declared roles
 //!
-//! `orchestration`, `mapper`, `predicate`
+//! `orchestration`, `mapper`, `predicate`, `validator`
+//!
+//! AGE-166 added typed-signal-first coverage for the headless-resume
+//! error-category fallback. `validator` covers the
+//! `resume_acceptance_adapter::classify` + `terminal_signal.kind` predicate
+//! discrimination (including the `MaybeQuotaExhausted` no-category path)
+//! that the new tests pin alongside the diagnostics fallback.
 //!
 //! ## Adapter declarations
 //!
@@ -14,6 +20,7 @@
 //!       - resume acceptance result
 //!       - typed terminal outcome category
 //!       - diagnostics fallback category
+//!       - AGE-166 MaybeQuotaExhausted -> no generic ErrorCategory
 //! ```
 
 use oulipoly_config::ModelConfig;

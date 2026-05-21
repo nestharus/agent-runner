@@ -1,3 +1,16 @@
+//! AGE-166 unit-level zero-turn classifier coverage.
+//!
+//! ## Declared roles
+//!
+//! `validator`, `mapper`
+//!
+//! Drives `zero_turn_orchestration::record_baseline` +
+//! `classify_completion_delta` + `next_action` plus the
+//! `terminal_outcome_adapter::apply_terminal_signal_outcome` disposition for
+//! the `MaybeQuotaExhausted` kind (mapper from signal kind to disposition;
+//! validator over the classifier's Unclassified-no-session-id and
+//! Unclassified-scan-failed branches).
+
 use agent_runner_lib::terminal_outcome_adapter::{
     TerminalSignalContext, TerminalSignalDisposition, apply_terminal_signal_outcome,
     classify_error_category_with_fallback,

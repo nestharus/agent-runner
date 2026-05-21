@@ -1,4 +1,16 @@
 #![cfg(unix)]
+//! AGE-166 end-to-end zero-turn orchestration coverage.
+//!
+//! ## Declared roles
+//!
+//! `validator`, `orchestration`, `formatter`
+//!
+//! Sequences `record_baseline` -> classifier -> `next_action` ->
+//! `apply_terminal_signal_outcome` -> `confirm_maybe_quota_exhausted` against
+//! a file-backed `StateDb` (orchestration). Validates the typed marker
+//! shape, the durable `mark_exhausted` write-on-confirm contract, and the
+//! productive-retry false-alarm clearance (validator). Builds in-memory
+//! `ExecutionResult` + JSONL transcript rows (formatter).
 
 use agent_runner_lib::terminal_outcome_adapter::{
     TerminalSignalContext, TerminalSignalDisposition, apply_terminal_signal_outcome,
