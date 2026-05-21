@@ -41,17 +41,14 @@ pub mod forensics;
 
 pub use forensics::{FailureClass, apply_post_failure_forensics};
 
-use crate::migration::MigrationError;
+use crate::migration::{MigrationError, provider_has_derivable_claude_projects_dir};
 use crate::quota::{
     InFlight, RefreshOutcome, has_refresh_source, is_routing_stale, is_stale,
     is_topology_probe_due, refresh_provider, refresh_provider_for_routing,
 };
 use crate::sessions::scan_provider;
 use chrono::{DateTime, Utc};
-use oulipoly_config::{
-    ModelConfig, ProviderConfig, ProvidersConfig, ScriptSessionStorageType, SessionStorage,
-    SessionsConfig,
-};
+use oulipoly_config::{ModelConfig, ProviderConfig, ProvidersConfig, SessionsConfig};
 pub use oulipoly_core::TransitionReason;
 use oulipoly_state::{QuotaRecord, QuotaWindow, ResolvedResume, StateDb};
 use std::fmt;
@@ -1121,15 +1118,8 @@ fn migration_to(target_provider_index: usize, reason: TransitionReason) -> Migra
 }
 
 fn is_resume_migratable_pair(source: &ProviderConfig, target: &ProviderConfig) -> bool {
-    session_storage_class(&source.session_storage) == Some(ScriptSessionStorageType::ClaudeCode)
-        && session_storage_class(&target.session_storage)
-            == Some(ScriptSessionStorageType::ClaudeCode)
-}
-
-fn session_storage_class(storage: &Option<SessionStorage>) -> Option<ScriptSessionStorageType> {
-    storage
-        .as_ref()
-        .and_then(SessionStorage::script_storage_type)
+    provider_has_derivable_claude_projects_dir(source)
+        && provider_has_derivable_claude_projects_dir(target)
 }
 
 /// AGE-163 WU-A.1 working-set membership predicate. A provider is in the
@@ -1829,8 +1819,8 @@ mod tests {
     use super::*;
     use chrono::{Duration, SecondsFormat, Utc};
     use oulipoly_config::{
-        ProviderConfig, ProviderEntry, ProvidersConfig, SessionSourceEntry, SessionsConfig,
-        model::PromptMode,
+        ProviderConfig, ProviderEntry, ProvidersConfig, SessionSourceEntry, SessionStorage,
+        SessionsConfig, model::PromptMode,
     };
     use rusqlite::Connection;
     use std::path::{Path, PathBuf};
@@ -1938,6 +1928,22 @@ mod tests {
             }
             other => panic!("expected NotMigratablePair, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn decide_manual_migration_rejects_unparseable_claude_script_target() {
+        let model = migratable_model(&[
+            ("claude", "claude_code"),
+            ("claude2", "claude_custom_script"),
+        ]);
+        let resolved = resolved_for(&model, 0);
+        let result = decide_manual_migration(&model, &resolved, "claude2");
+
+        assert!(matches!(
+            result,
+            Err(ManualMigrationRejection::NotMigratablePair { ref source, ref target })
+                if source == "claude" && target == "claude2"
+        ));
     }
 
     fn working_set_model(provider_names: &[&str]) -> ModelConfig {
@@ -3857,6 +3863,7 @@ mod tests {
         match storage_kind {
             "claude_code" => Some(claude_code_storage_for_test(name)),
             "claude_script" => Some(claude_script_storage_for_test(name)),
+            "claude_custom_script" => Some(claude_custom_script_storage_for_test()),
             "codex" => Some(codex_storage_for_test(name)),
             "none" => None,
             other => panic!("unknown storage kind fixture {other}"),
@@ -3875,6 +3882,14 @@ mod tests {
             transcript_script: Some(format!(
                 "claude-code-locate-transcript /tmp/{name}/projects"
             )),
+            storage_type: Some(oulipoly_config::ScriptSessionStorageType::ClaudeCode),
+        }
+    }
+
+    fn claude_custom_script_storage_for_test() -> oulipoly_config::SessionStorage {
+        oulipoly_config::SessionStorage::Script {
+            cwd_script: "custom-cwd /tmp/custom/projects".to_string(),
+            transcript_script: Some("custom-locate-transcript /tmp/custom/projects".to_string()),
             storage_type: Some(oulipoly_config::ScriptSessionStorageType::ClaudeCode),
         }
     }
@@ -4078,6 +4093,29 @@ mod tests {
             decision,
             MigrationDecision::Migrate {
                 target_provider_index: 1,
+                reason: TransitionReason::QuotaThreshold
+            }
+        );
+    }
+
+    #[test]
+    fn decide_migration_skips_unparseable_claude_script_sibling_on_resume() {
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = migratable_model(&[
+            ("claude", "claude_code"),
+            ("claude2", "claude_custom_script"),
+            ("claude3", "claude_code"),
+        ]);
+        seed_windows_with_deltas(&db, "claude", &[(0.90, 5, 0.01, 22)]);
+        seed_windows_with_deltas(&db, "claude2", &[(0.10, 5, 0.01, 22)]);
+        seed_windows_with_deltas(&db, "claude3", &[(0.20, 5, 0.01, 22)]);
+
+        let decision = decide_migration(&db, &model, &resolved_for(&model, 0), None).unwrap();
+
+        assert_eq!(
+            decision,
+            MigrationDecision::Migrate {
+                target_provider_index: 2,
                 reason: TransitionReason::QuotaThreshold
             }
         );

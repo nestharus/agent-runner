@@ -308,6 +308,12 @@ fn provider_storage_class(
         .and_then(SessionStorage::script_storage_type)
 }
 
+pub(crate) fn provider_has_derivable_claude_projects_dir(
+    provider: &oulipoly_config::ProviderConfig,
+) -> bool {
+    claude_projects_dir_from_provider_storage(provider).is_some()
+}
+
 fn claude_projects_dir_from_provider_storage(
     provider: &oulipoly_config::ProviderConfig,
 ) -> Option<PathBuf> {
