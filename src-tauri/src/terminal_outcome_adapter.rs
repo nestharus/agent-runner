@@ -366,11 +366,8 @@ fn age153_forced_terminal_signal_token(value: &str) -> &str {
     };
     let all_tokens: Vec<_> = std::iter::once(first).chain(tokens).collect();
     let index = AGE153_FORCE_TERMINAL_SIGNAL_SEQUENCE_INDEX.fetch_add(1, Ordering::Relaxed);
-    all_tokens
-        .get(index)
-        .or_else(|| all_tokens.last())
-        .copied()
-        .unwrap_or(value)
+    let len = all_tokens.len();
+    all_tokens.get(index % len).copied().unwrap_or(value)
 }
 
 fn clear_terminal_signal_fixture_override(
@@ -768,6 +765,29 @@ mod tests {
             terminal_signal_kind_from_env("MaybeQuotaExhausted"),
             Some(TerminalSignalKind::MaybeQuotaExhausted)
         );
+    }
+
+    #[test]
+    fn age153_forced_terminal_signal_token_rotates_sequence() {
+        AGE153_FORCE_TERMINAL_SIGNAL_SEQUENCE_INDEX.store(0, Ordering::Relaxed);
+
+        let first = age153_forced_terminal_signal_token(
+            "MaybeQuotaExhausted,QuotaExhaustedInband,RateLimited",
+        );
+        let second = age153_forced_terminal_signal_token(
+            "MaybeQuotaExhausted,QuotaExhaustedInband,RateLimited",
+        );
+        let third = age153_forced_terminal_signal_token(
+            "MaybeQuotaExhausted,QuotaExhaustedInband,RateLimited",
+        );
+        let fourth = age153_forced_terminal_signal_token(
+            "MaybeQuotaExhausted,QuotaExhaustedInband,RateLimited",
+        );
+
+        assert_eq!(first, "MaybeQuotaExhausted");
+        assert_eq!(second, "QuotaExhaustedInband");
+        assert_eq!(third, "RateLimited");
+        assert_eq!(fourth, "MaybeQuotaExhausted");
     }
 
     #[test]
