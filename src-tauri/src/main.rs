@@ -3317,6 +3317,10 @@ fn provider_has_no_session_source(
     sessions_cfg.get(provider_name).is_none()
 }
 
+fn has_session_source(sessions_cfg: &oulipoly_config::SessionsConfig, provider_name: &str) -> bool {
+    !provider_has_no_session_source(sessions_cfg, provider_name)
+}
+
 fn scan_report_has_errors(report: &oulipoly_runtime::sessions::ScanReport) -> bool {
     !report.errors.is_empty()
 }
@@ -3669,6 +3673,27 @@ fn format_quota_retry_budget_exhausted(model_name: &str, max_attempts: usize) ->
     )
 }
 
+fn zero_turn_late_bind_baseline(
+    sessions_cfg: &oulipoly_config::SessionsConfig,
+    provider_name: &str,
+    session_id: &str,
+) -> ZeroTurnBaseline {
+    let has_source = has_session_source(sessions_cfg, provider_name);
+    record_baseline(
+        provider_name,
+        Some(session_id),
+        has_source.then(zero_turn_zero_counts),
+        !has_source,
+    )
+}
+
+fn should_defer_generic_exit(
+    all_models: &HashMap<String, ModelConfig>,
+    result: &executor::ExecutionResult,
+) -> bool {
+    diagnostics_model_configured(all_models) || !result.returned_artifacts.is_empty()
+}
+
 fn run_with_balancing(
     agent_runtime_services: &wiring::AgentRuntimeServices,
     state_db_opener: &dyn StateDbOpener,
@@ -3830,13 +3855,8 @@ fn run_with_balancing(
         if zero_turn_baseline.provider_session_id.is_none()
             && let Some(session_id) = zero_turn_provider_session_id.as_deref()
         {
-            let has_session_source = env.sessions_cfg.get(provider_name).is_some();
-            zero_turn_baseline = record_baseline(
-                provider_name,
-                Some(session_id),
-                has_session_source.then(zero_turn_zero_counts),
-                !has_session_source,
-            );
+            zero_turn_baseline =
+                zero_turn_late_bind_baseline(&env.sessions_cfg, provider_name, session_id);
         }
         let zero_turn_classification =
             zero_turn_classify_after_completion(&env.state, &env.sessions_cfg, &zero_turn_baseline);
@@ -3869,8 +3889,7 @@ fn run_with_balancing(
             state_db: &env.state,
             stderr: &mut terminal_signal_stderr,
         };
-        let should_defer_generic_exit =
-            diagnostics_model_configured(all_models) || !result.returned_artifacts.is_empty();
+        let should_defer_generic_exit = should_defer_generic_exit(all_models, &result);
         let balanced_terminal_signal =
             balanced_terminal_signal_for_outcome(&result, should_defer_generic_exit);
         let terminal_signal_disposition =
