@@ -1,6 +1,6 @@
 use crate::balancer::TransitionReason;
 use crate::sessions::locate_transcript;
-use oulipoly_config::{ModelConfig, SessionStorage, SessionsConfig};
+use oulipoly_config::{ModelConfig, ScriptSessionStorageType, SessionStorage, SessionsConfig};
 use oulipoly_state::{ResolvedResume, StateDb};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -115,8 +115,8 @@ pub fn migrate_chain_segment(
             provider: target.name.clone(),
         });
     }
-    if matches!(source.session_storage, Some(SessionStorage::Codex { .. }))
-        || matches!(target.session_storage, Some(SessionStorage::Codex { .. }))
+    if provider_storage_class(source) == Some(ScriptSessionStorageType::CodexSession)
+        || provider_storage_class(target) == Some(ScriptSessionStorageType::CodexSession)
     {
         return Err(MigrationError::CodexMigrationDeferred {
             provider: source.name.clone(),
@@ -146,18 +146,11 @@ pub fn migrate_chain_segment(
     }
 
     let target_session_id = resolved.active_session_id.clone();
-    let SessionStorage::ClaudeCode { projects_dir } =
-        target
-            .session_storage
-            .as_ref()
-            .ok_or_else(|| MigrationError::TargetMissingStorage {
-                provider: target.name.clone(),
-            })?
-    else {
-        return Err(MigrationError::CodexMigrationDeferred {
+    let projects_dir = claude_projects_dir_from_provider_storage(target).ok_or_else(|| {
+        MigrationError::TargetMissingStorage {
             provider: target.name.clone(),
-        });
-    };
+        }
+    })?;
     let cwd_project_dir = claude_project_dir_for(&target.name, resume_working_dir, stderr)?;
     let bytes = std::fs::read(&source_path).map_err(|e| MigrationError::Io {
         path: source_path.display().to_string(),
@@ -295,9 +288,7 @@ pub fn find_claude_source_from_storage(
     provider: &oulipoly_config::ProviderConfig,
     session_id: &str,
 ) -> Option<PathBuf> {
-    let SessionStorage::ClaudeCode { projects_dir } = provider.session_storage.as_ref()? else {
-        return None;
-    };
+    let projects_dir = claude_projects_dir_from_provider_storage(provider)?;
     let entries = std::fs::read_dir(projects_dir).ok()?;
     for entry in entries.flatten() {
         let candidate = entry.path().join(format!("{session_id}.jsonl"));
@@ -306,6 +297,63 @@ pub fn find_claude_source_from_storage(
         }
     }
     None
+}
+
+fn provider_storage_class(
+    provider: &oulipoly_config::ProviderConfig,
+) -> Option<ScriptSessionStorageType> {
+    provider
+        .session_storage
+        .as_ref()
+        .and_then(SessionStorage::script_storage_type)
+}
+
+fn claude_projects_dir_from_provider_storage(
+    provider: &oulipoly_config::ProviderConfig,
+) -> Option<PathBuf> {
+    claude_projects_dir_from_storage(provider.session_storage.as_ref()?)
+}
+
+fn claude_projects_dir_from_storage(storage: &SessionStorage) -> Option<PathBuf> {
+    match storage {
+        SessionStorage::ClaudeCode { projects_dir } => Some(projects_dir.clone()),
+        SessionStorage::Script {
+            cwd_script,
+            transcript_script,
+            storage_type: Some(ScriptSessionStorageType::ClaudeCode),
+        } => transcript_script
+            .as_deref()
+            .and_then(claude_projects_dir_from_adapter_command)
+            .or_else(|| claude_projects_dir_from_adapter_command(cwd_script)),
+        _ => None,
+    }
+}
+
+fn claude_projects_dir_from_adapter_command(command: &str) -> Option<PathBuf> {
+    let parts = crate::executor::cli::shell_split(command);
+    let adapter = parts.first()?;
+    let storage_root = parts.get(1)?;
+    let adapter_name = Path::new(adapter).file_name()?.to_str()?;
+    match adapter_name {
+        "claude-code-cwd" | "claude-code-locate-transcript" | "claude-code-turns" => {
+            Some(expand_leading_tilde(PathBuf::from(storage_root)))
+        }
+        _ => None,
+    }
+}
+
+fn expand_leading_tilde(path: PathBuf) -> PathBuf {
+    let raw = path.to_string_lossy();
+    let Some(home) = dirs::home_dir() else {
+        return path;
+    };
+    if raw == "~" {
+        return home;
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        return home.join(rest);
+    }
+    path
 }
 
 #[cfg(test)]
@@ -343,6 +391,45 @@ mod tests {
             providers: vec![
                 provider("claude", source_projects.to_path_buf()),
                 provider("claude2", target_projects.to_path_buf()),
+            ],
+            inputs: Vec::new(),
+        }
+    }
+
+    fn model_with_script_storage(
+        source_projects: &std::path::Path,
+        target_projects: &std::path::Path,
+    ) -> ModelConfig {
+        let provider = |name: &str, projects_dir: &std::path::Path| ProviderConfig {
+            name: name.to_string(),
+            command: name.to_string(),
+            args: Vec::new(),
+            interactive_args: Some(vec!["launch".to_string()]),
+            resume: Some(ResumeStrategy {
+                kind: ResumeKind::Flag,
+                flag: Some("--resume".to_string()),
+                subcommand: None,
+            }),
+            session_capture: None,
+            resume_acceptance: None,
+            session_storage: Some(SessionStorage::Script {
+                cwd_script: format!("claude-code-cwd {}", projects_dir.display()),
+                transcript_script: Some(format!(
+                    "claude-code-locate-transcript {}",
+                    projects_dir.display()
+                )),
+                storage_type: Some(ScriptSessionStorageType::ClaudeCode),
+            }),
+            system_prompt_override: None,
+            tool_restrictions: None,
+            invocation_mode: Default::default(),
+        };
+        ModelConfig {
+            name: "claude-opus".to_string(),
+            prompt_mode: oulipoly_config::PromptMode::Arg,
+            providers: vec![
+                provider("claude", source_projects),
+                provider("claude2", target_projects),
             ],
             inputs: Vec::new(),
         }
@@ -495,6 +582,55 @@ mod tests {
             state.chain_id_for_segment("claude2", session_id).unwrap(),
             Some(chain_id)
         );
+    }
+
+    #[test]
+    fn migration_supports_script_declared_claude_code_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_projects = dir.path().join("source-projects");
+        let target_projects = dir.path().join("target-projects");
+        let source_workspace = dir.path().join("worktrees").join("same-workspace");
+        let session_id = "dd116a3c-6819-42b1-b3d2-f512331eb5ec";
+        seed_source_jsonl(&source_projects, &source_workspace, session_id);
+        let state = StateDb::open(&dir.path().join("state.db")).unwrap();
+        let model = model_with_script_storage(&source_projects, &target_projects);
+        let (resolved, chain_id) = seed_resolved(&state, &model, session_id);
+        let mut stderr = Vec::new();
+
+        let migrated = migrate_chain_segment(
+            &state,
+            &SessionsConfig::default(),
+            &model,
+            &resolved,
+            &source_workspace,
+            1,
+            TransitionReason::Manual,
+            &mut stderr,
+        )
+        .unwrap();
+
+        assert_eq!(
+            migrated.target_jsonl_path,
+            target_projects
+                .join(claude_project_dir_name(&source_workspace))
+                .join(format!("{session_id}.jsonl"))
+        );
+        assert!(migrated.target_jsonl_path.exists());
+        assert_eq!(
+            state.chain_id_for_segment("claude2", session_id).unwrap(),
+            Some(chain_id)
+        );
+    }
+
+    #[test]
+    fn claude_projects_dir_from_adapter_command_expands_home_relative_storage_root() {
+        let expected = dirs::home_dir().unwrap().join(".claude2/projects");
+
+        let actual =
+            claude_projects_dir_from_adapter_command("claude-code-cwd ~/.claude2/projects")
+                .unwrap();
+
+        assert_eq!(actual, expected);
     }
 
     // risk: Cwd-to-project-dir encoding correctness; level: unit; source: proposal §1 helper signature / A2.
