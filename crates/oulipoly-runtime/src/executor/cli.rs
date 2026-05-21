@@ -1463,11 +1463,18 @@ fn terminate_for_live_quota(
 }
 
 fn wait_for_child_after_live_quota(child: &mut Child) -> Result<Option<ExitStatus>, String> {
+    wait_for_child_until_termination_grace(child, "try_wait after live quota failed")
+}
+
+fn wait_for_child_until_termination_grace(
+    child: &mut Child,
+    try_wait_context: &str,
+) -> Result<Option<ExitStatus>, String> {
     let started = Instant::now();
     loop {
         if let Some(status) = child
             .try_wait()
-            .map_err(|err| format!("try_wait after live quota failed: {err}"))?
+            .map_err(|err| format!("{try_wait_context}: {err}"))?
         {
             return Ok(Some(status));
         }
@@ -1617,19 +1624,7 @@ fn try_wait_before_terminate(child: &mut Child) -> Result<Option<ExitStatus>, St
 }
 
 fn wait_for_child_after_sigterm(child: &mut Child) -> Result<Option<ExitStatus>, String> {
-    let started = Instant::now();
-    loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|err| format!("try_wait after terminate failed: {err}"))?
-        {
-            return Ok(Some(status));
-        }
-        if terminate_grace_period_elapsed(started) {
-            return Ok(None);
-        }
-        thread::sleep(SUPERVISOR_POLL_INTERVAL);
-    }
+    wait_for_child_until_termination_grace(child, "try_wait after terminate failed")
 }
 
 fn terminate_grace_period_elapsed(started: Instant) -> bool {
