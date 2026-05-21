@@ -99,6 +99,22 @@ mod tests {
     }
 
     #[test]
+    fn failure_class_from_unknown_maps_to_none() {
+        assert_eq!(
+            FailureClass::from_terminal_signal_kind(TerminalSignalKind::Unknown),
+            None
+        );
+    }
+
+    #[test]
+    fn failure_class_from_maybe_quota_exhausted_maps_to_none() {
+        assert_eq!(
+            FailureClass::from_terminal_signal_kind(TerminalSignalKind::MaybeQuotaExhausted),
+            None
+        );
+    }
+
+    #[test]
     fn apply_post_failure_forensics_writes_next_available_at_for_persistent_classes() {
         let db = open_db();
         let now = Utc::now();
