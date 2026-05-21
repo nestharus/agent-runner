@@ -314,6 +314,52 @@ mod tests {
         }
     }
 
+    /// Regression lock: the Codex CLI startup banner and benign stdin-reading
+    /// notices must NOT be classified as `QuotaExhaustedInband`. The token
+    /// vocabulary in `contains_persistent_quota_token` may grow over time;
+    /// this test pins concrete banner strings so neither a future addition
+    /// nor a re-introduction of a permissive substring (e.g. "openai")
+    /// silently reclassifies normal startup as quota exhaustion. The
+    /// in-band marker triggers `apply_post_failure_forensics`, which writes
+    /// a 5h `next_available_at` and torpedoes the account — false positives
+    /// here have a multi-hour blast radius.
+    #[test]
+    fn codex_startup_banner_does_not_classify_as_quota_exhausted() {
+        for (name, banner) in [
+            (
+                "version-banner",
+                b"OpenAI Codex v0.131.0 / model: gpt-5.5 / provider: openai\n".as_slice(),
+            ),
+            (
+                "stdin-notice",
+                b"Reading additional input from stdin...\n".as_slice(),
+            ),
+            (
+                "combined",
+                b"OpenAI Codex v0.131.0 / model: gpt-5.5 / provider: openai\n\
+                  Reading additional input from stdin...\n"
+                    .as_slice(),
+            ),
+        ] {
+            for (stream_name, stdout, stderr) in [
+                ("stdout", banner, b"".as_slice()),
+                ("stderr", b"".as_slice(), banner),
+            ] {
+                let signal = recognize(evidence(stdout, stderr, TerminalStatusEvidence::Unknown));
+                assert_ne!(
+                    signal.kind,
+                    TerminalSignalKind::QuotaExhaustedInband,
+                    "{name} on {stream_name} must not classify as QuotaExhaustedInband"
+                );
+                assert_ne!(
+                    signal.kind,
+                    TerminalSignalKind::RateLimited,
+                    "{name} on {stream_name} must not classify as RateLimited"
+                );
+            }
+        }
+    }
+
     // T29 (per Step 6b output index AGE-139-T29)
     #[test]
     fn precedence_spawn_error_wins_over_quota_for_codex() {
