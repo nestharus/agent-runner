@@ -9,6 +9,11 @@
 //!   - component: crates/oulipoly-runtime/src/diagnostics/mod.rs
 //!     role: intrinsic-surface
 //!     Domain: diagnostic_classification
+//!     Owns:
+//!       - error category vocabulary
+//!       - non-authoritative quota/rate-limit classification fallback (`classify_exhaustion` always false post-PR #126)
+//!       - diagnostic model port + prompt structure
+//!       - service DTO + request/error shape
 //! ```
 
 use crate::executor;

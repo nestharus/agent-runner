@@ -9,6 +9,11 @@
 //!   - component: crates/oulipoly-config/src/model.rs
 //!     role: intrinsic-surface
 //!     Domain: model_provider_session_config
+//!     Owns:
+//!       - provider resume strategy (resume command shape)
+//!       - session_capture configuration (stdout parse, jsonl tail, none)
+//!       - session_storage configuration (locator routing)
+//!       - prompt mode (positional, file, stdin) and provider derivation
 //! ```
 
 use crate::claude_tool_filter::{ClaudeToolFilterShape, validate_proxy_claude_filter_shape};
