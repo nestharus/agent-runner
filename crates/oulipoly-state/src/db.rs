@@ -27,7 +27,7 @@
 //! AGE-160 serde_json residual disposition: remaining JSON calls are DB-owned artifact/config payload
 //! codecs and test assertions after marker and lifecycle JSON construction moved behind adapters.
 //!
-//! AGE-166 intrinsic-surface declarations:
+//! ## Intrinsic-surface declarations
 //!
 //! ```yaml
 //! intrinsic_surface_declarations:

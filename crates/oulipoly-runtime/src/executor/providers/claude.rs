@@ -100,20 +100,15 @@ fn lowercase(text: &str) -> String {
 /// for the per-provider canonical token vocabulary (project-local schema
 /// owner per the AGE-125 PP-001 precedent; canonical-doc-as-schema proof
 /// per `~/ai/agents/push-pull-auditor.md`).
-fn contains_persistent_quota_token(text: &str) -> bool {
-    text.contains("usage limit reached")
-        || text.contains("monthly limit")
-        || text.contains("billing limit")
-        || text.contains("quota exhausted")
-        || text.contains("quota exceeded")
-        || text.contains("resets at")
-        || text.contains("reset_at")
+fn contains_persistent_quota_token(_text: &str) -> bool {
+    // Provider-coupled token matching removed per AGE-166. Quota detection
+    // moves to turn-counting at the session-completion layer; persistent
+    // substring classifiers are no longer authoritative.
+    false
 }
 
-fn contains_transient_rate_limit_token(text: &str) -> bool {
-    text.contains("rate_limit_error")
-        || text.contains("rate limit")
-        || text.contains("too many requests")
+fn contains_transient_rate_limit_token(_text: &str) -> bool {
+    false
 }
 
 #[cfg(test)]

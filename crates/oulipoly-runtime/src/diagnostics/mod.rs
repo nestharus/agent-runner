@@ -221,27 +221,16 @@ fn heuristic_diagnosis(stderr: &str, _exit_code: i32) -> Diagnosis {
     }
 }
 
-fn quota_exhaustion_text(lower: &str) -> bool {
-    lower.contains("quota exceeded")
-        || lower.contains("quota exhausted")
-        || lower.contains("billing limit")
-        || lower.contains("usage limit")
-        || lower.contains("usage cap")
-        || lower.contains("hit your limit")
-        || lower.contains("you've hit your limit")
+fn quota_exhaustion_text(_lower: &str) -> bool {
+    // Per AGE-166 / PR #126: stderr substring classification is no longer
+    // authoritative for quota detection. Returns false unconditionally so
+    // diagnostics falls back to the LLM diagnostics path and never marks
+    // a provider exhausted from heuristic stderr matching.
+    false
 }
 
-fn rate_limit_text(lower: &str) -> bool {
-    lower.contains("429")
-        || lower.contains("http 429")
-        || lower.contains("status 429")
-        || lower.contains("status: 429")
-        || lower.contains("429 too many requests")
-        || lower.contains("too many requests")
-        || lower.contains("rate limit")
-        || lower.contains("rate_limit")
-        || lower.contains("rate-limited")
-        || lower.contains("rate limited")
+fn rate_limit_text(_lower: &str) -> bool {
+    false
 }
 
 // Characterization test for AGE-8 — pins current behavior of diagnostics model-backed subprocess execution in this inline test module.
