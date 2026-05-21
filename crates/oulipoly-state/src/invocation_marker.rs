@@ -21,6 +21,7 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use std::fmt;
 use uuid::Uuid;
 
@@ -50,7 +51,7 @@ impl CompositeInvocationId {
         reject_empty_payload(s)?;
         match parse_canonical_json(s) {
             Ok(parsed) => Ok(parsed),
-            Err(ParseMarkerError::InvalidJson) => {
+            Err(CanonicalParseError::InvalidSyntax) => {
                 legacy_shell_mangled::parse(s).map_err(|legacy_err| {
                     if legacy_err.is_legacy_shape_error() {
                         ParseMarkerError::InvalidJson
@@ -59,7 +60,7 @@ impl CompositeInvocationId {
                     }
                 })
             }
-            Err(err) => Err(err),
+            Err(CanonicalParseError::InvalidPayload(err)) => Err(err),
         }
     }
 }
@@ -105,13 +106,54 @@ fn reject_empty_payload(s: &str) -> Result<(), ParseMarkerError> {
     }
 }
 
-fn parse_canonical_json(s: &str) -> Result<CompositeInvocationId, ParseMarkerError> {
-    let parsed = decode_canonical_json(s)?;
-    validate_canonical_fields(parsed)
+enum CanonicalParseError {
+    InvalidSyntax,
+    InvalidPayload(ParseMarkerError),
 }
 
-fn decode_canonical_json(s: &str) -> Result<CompositeInvocationId, ParseMarkerError> {
-    serde_json::from_str(s).map_err(|_| ParseMarkerError::InvalidJson)
+fn parse_canonical_json(s: &str) -> Result<CompositeInvocationId, CanonicalParseError> {
+    let parsed = decode_canonical_json(s)?;
+    validate_canonical_fields(parsed).map_err(CanonicalParseError::InvalidPayload)
+}
+
+fn decode_canonical_json(s: &str) -> Result<CompositeInvocationId, CanonicalParseError> {
+    let value: Value = serde_json::from_str(s).map_err(|_| CanonicalParseError::InvalidSyntax)?;
+    decode_canonical_value(value).map_err(CanonicalParseError::InvalidPayload)
+}
+
+fn decode_canonical_value(value: Value) -> Result<CompositeInvocationId, ParseMarkerError> {
+    let Value::Object(fields) = value else {
+        return Err(ParseMarkerError::InvalidJson);
+    };
+
+    decode_canonical_fields(fields)
+}
+
+fn decode_canonical_fields(
+    fields: Map<String, Value>,
+) -> Result<CompositeInvocationId, ParseMarkerError> {
+    let mut source = None;
+    let mut id = None;
+
+    for (key, value) in fields {
+        match key.as_str() {
+            "source" => source = Some(decode_canonical_text(value)?),
+            "id" => id = Some(decode_canonical_text(value)?),
+            _ => return Err(ParseMarkerError::UnknownKey(key)),
+        }
+    }
+
+    Ok(CompositeInvocationId {
+        source: source.ok_or(ParseMarkerError::MissingSource)?,
+        id: id.ok_or(ParseMarkerError::MissingId)?,
+    })
+}
+
+fn decode_canonical_text(value: Value) -> Result<String, ParseMarkerError> {
+    match value {
+        Value::String(value) => Ok(value),
+        _ => Err(ParseMarkerError::InvalidJson),
+    }
 }
 
 fn validate_canonical_fields(
@@ -209,6 +251,24 @@ mod tests {
                 r#"{"source":"fixture-provider","id":"not-a-uuid"}"#
             ),
             Err(ParseMarkerError::InvalidUuid)
+        );
+    }
+
+    #[test]
+    fn canonical_json_missing_id_preserves_canonical_error() {
+        assert_eq!(
+            CompositeInvocationId::parse_env_value(r#"{"source":"fixture-provider"}"#),
+            Err(ParseMarkerError::MissingId)
+        );
+    }
+
+    #[test]
+    fn canonical_json_unknown_field_preserves_canonical_error() {
+        assert_eq!(
+            CompositeInvocationId::parse_env_value(
+                r#"{"source":"fixture-provider","id":"7ad2916c-38dd-49e6-a1f7-3ef22766ff70","extra":true}"#
+            ),
+            Err(ParseMarkerError::UnknownKey("extra".to_string()))
         );
     }
 }
