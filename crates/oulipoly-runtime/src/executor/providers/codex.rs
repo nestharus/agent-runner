@@ -346,6 +346,16 @@ mod tests {
                 ("stderr", b"".as_slice(), banner),
             ] {
                 let signal = recognize(evidence(stdout, stderr, TerminalStatusEvidence::Unknown));
+                // Positive lock first — any classification drift (Unknown ↦
+                // anything else) is a regression even if it doesn't land on
+                // a quota/rate-limit kind. The negative asserts below stay
+                // as belt-and-suspenders against future kinds we haven't
+                // named yet.
+                assert_eq!(
+                    signal.kind,
+                    TerminalSignalKind::Unknown,
+                    "{name} on {stream_name} must classify as Unknown"
+                );
                 assert_ne!(
                     signal.kind,
                     TerminalSignalKind::QuotaExhaustedInband,

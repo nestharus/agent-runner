@@ -585,12 +585,11 @@ fn provider_is_quota_exhausted(
 /// window in the future. Markers inside the slack window are treated as
 /// expired so the next dispatch can probe the provider rather than wait
 /// for the exact release timestamp (clock skew + cooldown bookkeeping).
+/// Reads `OULIPOLY_MARKER_RELEASE_SLACK_SECS` via the shared helper so
+/// cached-only routing (`ctx=None`) matches the verify path's slack.
 fn marker_blocks_routing(next_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
     next_at
-        > now
-            + chrono::Duration::seconds(
-                crate::quota::marker_verification::DEFAULT_MARKER_RELEASE_SLACK_SECS,
-            )
+        > now + chrono::Duration::seconds(crate::quota::marker_verification::release_slack_secs())
 }
 
 fn reset_implied(
@@ -2715,9 +2714,10 @@ mod tests {
     #[test]
     fn select_provider_clears_stale_next_available_at_when_refresh_shows_healthy() {
         let _lock_dir = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("OULIPOLY_DATA_HOME", _lock_dir.path());
-        }
+        let _env_guard = crate::quota::marker_verification::test_support::EnvGuard::set(
+            "OULIPOLY_DATA_HOME",
+            _lock_dir.path(),
+        );
         let db = StateDb::open(Path::new(":memory:")).unwrap();
         let model = two_provider_model();
         // Provider "a" has a stuck UpstreamApiDown marker far in the future;
@@ -2763,9 +2763,10 @@ mod tests {
     #[test]
     fn select_provider_keeps_marker_when_refresh_shows_exhausted_window() {
         let _lock_dir = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("OULIPOLY_DATA_HOME", _lock_dir.path());
-        }
+        let _env_guard = crate::quota::marker_verification::test_support::EnvGuard::set(
+            "OULIPOLY_DATA_HOME",
+            _lock_dir.path(),
+        );
         let db = StateDb::open(Path::new(":memory:")).unwrap();
         let model = two_provider_model();
         let marker_at = Utc::now() + Duration::hours(2);

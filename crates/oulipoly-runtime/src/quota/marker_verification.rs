@@ -61,7 +61,13 @@ fn cooldown_secs() -> i64 {
     parse_env_secs(COOLDOWN_ENV_VAR).unwrap_or(DEFAULT_MARKER_VERIFICATION_COOLDOWN_SECS)
 }
 
-fn release_slack_secs() -> i64 {
+/// Effective release slack — `OULIPOLY_MARKER_RELEASE_SLACK_SECS` if set,
+/// otherwise `DEFAULT_MARKER_RELEASE_SLACK_SECS`. Public so the balancer's
+/// cached-only `provider_is_quota_exhausted` predicate respects the same
+/// env override as the verify path (otherwise a marker near release would
+/// stay honoured under `ctx=None` even though the verifier would clear it
+/// under `ctx=Some(_)`).
+pub fn release_slack_secs() -> i64 {
     parse_env_secs(SLACK_ENV_VAR).unwrap_or(DEFAULT_MARKER_RELEASE_SLACK_SECS)
 }
 
@@ -146,11 +152,27 @@ fn refresh_and_verify_under_lock(
     }
     let outcome =
         refresh_provider_for_routing(provider_name, providers_cfg, sessions_cfg, in_flight, state);
-    if matches!(outcome, RefreshOutcome::Updated { .. })
+    if refresh_outcome_observes_fresh_or_inflight_data(&outcome)
         && provider_is_actually_healthy(state, provider_name, now)
     {
         clear_marker(state, provider_name);
     }
+}
+
+/// True when the refresh either wrote fresh windows (`Updated`) or a peer
+/// in-process refresh is already running (`AlreadyInFlight`). In both
+/// cases the cached windows are an authoritative-enough signal to verify
+/// the marker against: a successful refresh moves them forward, and the
+/// concurrent peer's outstanding write — combined with the per-provider
+/// file lock we already hold against other *processes* — means the cache
+/// either matches reality or will within the same call site's next
+/// dispatch tick. `NoScript`/`Failed` keep the marker because we have no
+/// new signal to overturn it. AGE-167 PR #132 CodeRabbit comment 3283456148.
+fn refresh_outcome_observes_fresh_or_inflight_data(outcome: &RefreshOutcome) -> bool {
+    matches!(
+        outcome,
+        RefreshOutcome::Updated { .. } | RefreshOutcome::AlreadyInFlight
+    )
 }
 
 fn still_needs_refresh_under_lock(
@@ -254,7 +276,69 @@ fn sanitize_lock_name(name: &str) -> String {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    //! Test-only helpers exposed so other in-crate tests
+    //! (`balancer::tests::*`) can borrow the same env-mutation guard.
+    use std::ffi::OsString;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// Cargo runs `#[test]`s in parallel by default. Any test that mutates
+    /// `OULIPOLY_DATA_HOME` (or any other process-wide env var the verifier
+    /// reads) must hold this lock for its full duration — otherwise a
+    /// peer test sees the wrong `usage_lock_dir()`. AGE-167 PR #132
+    /// CodeRabbit comment 3283456152.
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// Scoped guard that sets an env var on construction and restores the
+    /// prior value (or removes it) on drop. Pair with `acquire_env_lock`
+    /// so concurrent tests can't race on the global env table.
+    pub(crate) struct EnvGuard {
+        name: &'static str,
+        prev: Option<OsString>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuard {
+        /// Acquire the global env mutex, snapshot the previous value, and
+        /// set `name` to `value` for the lifetime of the returned guard.
+        pub(crate) fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let lock = env_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let prev = std::env::var_os(name);
+            // Safety: the global env lock serializes set/remove across all
+            // tests that route through this helper, so we have exclusive
+            // mutating access to the variable for the guard's lifetime.
+            unsafe {
+                std::env::set_var(name, value);
+            }
+            Self {
+                name,
+                prev,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // Safety: we still hold `_lock` until after this restore.
+            unsafe {
+                match self.prev.take() {
+                    Some(prev) => std::env::set_var(self.name, prev),
+                    None => std::env::remove_var(self.name),
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use super::test_support::EnvGuard;
     use super::*;
     use oulipoly_config::{ProviderEntry, ProvidersConfig, SessionsConfig};
     use oulipoly_state::QuotaWindowInput;
@@ -268,15 +352,13 @@ mod tests {
         StateDb::open(Path::new(":memory:")).unwrap()
     }
 
-    fn isolated_lock_dir() -> tempfile::TempDir {
+    /// Returns a tempdir AND an env guard that points `OULIPOLY_DATA_HOME`
+    /// at that tempdir for the caller's stack frame. Caller must keep both
+    /// alive — dropping either restores the env / removes the tempdir.
+    fn isolated_lock_dir() -> (tempfile::TempDir, EnvGuard) {
         let dir = tempdir().unwrap();
-        // Safety: tests run in serial-by-default for env mutation; we never
-        // unset DATA_HOME so subsequent tests in the same process still see
-        // an isolated path under the TempDir owned by the caller.
-        unsafe {
-            std::env::set_var("OULIPOLY_DATA_HOME", dir.path());
-        }
-        dir
+        let guard = EnvGuard::set("OULIPOLY_DATA_HOME", dir.path());
+        (dir, guard)
     }
 
     fn seed_marker(db: &StateDb, provider: &str, next_at: DateTime<Utc>) {
@@ -309,7 +391,7 @@ mod tests {
 
     #[test]
     fn marker_within_release_slack_is_cleared_without_refresh() {
-        let _lock_dir = isolated_lock_dir();
+        let (_lock_dir, _env_guard) = isolated_lock_dir();
         let db = open_db();
         let now = Utc::now();
         seed_marker(&db, "p", now + Duration::seconds(5));
@@ -329,7 +411,7 @@ mod tests {
 
     #[test]
     fn marker_with_fresh_cache_and_healthy_windows_is_cleared() {
-        let _lock_dir = isolated_lock_dir();
+        let (_lock_dir, _env_guard) = isolated_lock_dir();
         let db = open_db();
         let now = Utc::now();
         // Healthy windows from a fresh refresh.
@@ -350,7 +432,7 @@ mod tests {
 
     #[test]
     fn marker_with_fresh_cache_and_exhausted_window_is_kept() {
-        let _lock_dir = isolated_lock_dir();
+        let (_lock_dir, _env_guard) = isolated_lock_dir();
         let db = open_db();
         let now = Utc::now();
         // Exhausted live window — verification must NOT clear the marker.
@@ -369,7 +451,7 @@ mod tests {
 
     #[test]
     fn marker_with_stale_cache_runs_refresh_and_clears_when_healthy() {
-        let _lock_dir = isolated_lock_dir();
+        let (_lock_dir, _env_guard) = isolated_lock_dir();
         let db = open_db();
         let now = Utc::now();
         // Marker set; no prior refresh ⇒ refreshed_at is None ⇒ stale.
@@ -394,7 +476,7 @@ mod tests {
 
     #[test]
     fn marker_with_stale_cache_keeps_marker_when_refresh_shows_exhausted() {
-        let _lock_dir = isolated_lock_dir();
+        let (_lock_dir, _env_guard) = isolated_lock_dir();
         let db = open_db();
         let now = Utc::now();
         let marker_at = now + Duration::hours(1);
@@ -419,7 +501,7 @@ mod tests {
 
     #[test]
     fn no_marker_no_action() {
-        let _lock_dir = isolated_lock_dir();
+        let (_lock_dir, _env_guard) = isolated_lock_dir();
         let db = open_db();
         let now = Utc::now();
         // Provider has a refresh row but no marker.
@@ -434,7 +516,7 @@ mod tests {
 
     #[test]
     fn many_threads_collapse_into_one_refresh() {
-        let _lock_dir = isolated_lock_dir();
+        let (_lock_dir, _env_guard) = isolated_lock_dir();
         let dir = tempdir().unwrap();
         let counter_path = dir.path().join("calls");
         std::fs::write(&counter_path, "").unwrap();
