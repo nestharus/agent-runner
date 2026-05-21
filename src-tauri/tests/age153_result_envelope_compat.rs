@@ -57,7 +57,13 @@ fn terminal_signal_marker_never_moves_oulipoly_result_off_stdout() {
         ),
     ]);
 
-    let output = fixture.run_one_shot("age153-result-quota");
+    let output = fixture.run_one_shot_with_env(
+        "age153-result-quota",
+        &[(
+            "OULIPOLY_AGE153_FORCE_TERMINAL_SIGNAL_KIND",
+            "QuotaExhaustedInband,None",
+        )],
+    );
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert_no_terminal_marker_on_stdout(&output);

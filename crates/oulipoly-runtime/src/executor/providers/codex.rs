@@ -100,21 +100,15 @@ fn lowercase(text: &str) -> String {
 /// for the per-provider canonical token vocabulary (project-local schema
 /// owner per the AGE-125 PP-001 precedent; canonical-doc-as-schema proof
 /// per `~/ai/agents/push-pull-auditor.md`).
-fn contains_persistent_quota_token(text: &str) -> bool {
-    text.contains("usage cap reached")
-        || text.contains("billing limit")
-        || text.contains("quota exhausted")
-        || text.contains("quota exceeded")
-        || text.contains("reset_at")
+fn contains_persistent_quota_token(_text: &str) -> bool {
+    // Provider-coupled token matching removed per AGE-166. Quota detection
+    // moves to turn-counting at the session-completion layer; persistent
+    // substring classifiers are no longer authoritative.
+    false
 }
 
-fn contains_transient_rate_limit_token(text: &str) -> bool {
-    text.contains("http 429")
-        || text.contains("status: 429")
-        || text.contains("status 429")
-        || text.contains("rate limit")
-        || text.contains("rate_limit_exceeded")
-        || text.contains("too many requests")
+fn contains_transient_rate_limit_token(_text: &str) -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -231,9 +225,8 @@ mod tests {
         assert!(signal.evidence.contains("no stdout/stderr for 600s"));
     }
 
-    // T23 (per Step 6b output index AGE-139-T23)
     #[test]
-    fn codex_persistent_quota_fixtures_map_to_quota_exhausted_inband() {
+    fn provider_recognizer_substrings_do_not_classify_codex() {
         for (name, stdout, stderr) in [
             ("usage-cap", b"usage cap reached".as_slice(), b"".as_slice()),
             (
@@ -243,21 +236,6 @@ mod tests {
             ),
             ("quota", b"quota exceeded".as_slice(), b"".as_slice()),
             ("reset-window", b"".as_slice(), b"reset_at=10:00".as_slice()),
-        ] {
-            let signal = assert_kind(
-                evidence(stdout, stderr, TerminalStatusEvidence::Unknown),
-                TerminalSignalKind::QuotaExhaustedInband,
-            );
-            assert!(
-                !signal.evidence.is_empty(),
-                "fixture {name} should preserve an evidence excerpt"
-            );
-        }
-    }
-
-    #[test]
-    fn codex_transient_rate_limit_fixtures_map_to_rate_limited() {
-        for (name, stdout, stderr) in [
             ("http-429", b"HTTP 429".as_slice(), b"".as_slice()),
             ("status-429", b"".as_slice(), b"status: 429".as_slice()),
             (
@@ -273,26 +251,34 @@ mod tests {
         ] {
             let signal = assert_kind(
                 evidence(stdout, stderr, TerminalStatusEvidence::Unknown),
-                TerminalSignalKind::RateLimited,
+                TerminalSignalKind::Unknown,
             );
             assert!(
-                !signal.evidence.is_empty(),
-                "fixture {name} should preserve an evidence excerpt"
+                !matches!(
+                    signal.kind,
+                    TerminalSignalKind::QuotaExhaustedInband
+                        | TerminalSignalKind::RateLimited
+                        | TerminalSignalKind::MaybeQuotaExhausted
+                ),
+                "fixture {name} must not classify quota/rate-looking text"
             );
         }
-    }
-
-    #[test]
-    fn codex_persistent_quota_wins_over_transient_rate_limit_when_both_present() {
-        let signal = assert_kind(
+        assert_kind(
             evidence(
-                b"HTTP 429: usage cap reached for this account",
+                quota_text(),
                 b"",
-                TerminalStatusEvidence::Unknown,
+                TerminalStatusEvidence::Exited { code: 0 },
             ),
-            TerminalSignalKind::QuotaExhaustedInband,
+            TerminalSignalKind::CleanExit,
         );
-        assert!(!signal.evidence.is_empty());
+        assert_kind(
+            evidence(
+                b"",
+                quota_text(),
+                TerminalStatusEvidence::Exited { code: 1 },
+            ),
+            TerminalSignalKind::NonzeroExit,
+        );
     }
 
     // T26 (per Step 6b output index AGE-139-T26)
@@ -415,27 +401,27 @@ mod tests {
 
     // T38 (per Step 6b output index AGE-139-T38)
     #[test]
-    fn precedence_quota_wins_over_clean_exit_for_codex() {
+    fn precedence_quota_text_preserves_clean_exit_for_codex() {
         assert_kind(
             evidence(
                 quota_text(),
                 b"",
                 TerminalStatusEvidence::Exited { code: 0 },
             ),
-            TerminalSignalKind::QuotaExhaustedInband,
+            TerminalSignalKind::CleanExit,
         );
     }
 
     // T41 (per Step 6b output index AGE-139-T41)
     #[test]
-    fn precedence_quota_wins_over_nonzero_exit_for_codex() {
+    fn precedence_quota_text_preserves_nonzero_exit_for_codex() {
         assert_kind(
             evidence(
                 b"",
                 quota_text(),
                 TerminalStatusEvidence::Exited { code: 1 },
             ),
-            TerminalSignalKind::QuotaExhaustedInband,
+            TerminalSignalKind::NonzeroExit,
         );
     }
 

@@ -1,6 +1,34 @@
+//! ## Declared roles
+//!
+//! `orchestration`, `mapper`, `predicate`, `formatter`, `accessor`, `validator`
+//!
+//! `accessor` covers state-DB open + providers-config load on the Tauri
+//! `test_model` IPC path. `validator` covers AGE-166 typed-signal
+//! discrimination (the durable `mark_exhausted` write is gated by
+//! `TerminalSignalKind::QuotaExhaustedInband`, `RateLimited` is allowed
+//! through, and `MaybeQuotaExhausted` is non-durable) plus the legacy
+//! diagnostic-input fallback validator when no typed signal is present.
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: src-tauri/src/lib.rs::test_model
+//!     role: adapter
+//!     Translates:
+//!       - Tauri IPC
+//!       - Tauri test_model IPC contract
+//!       - executor service output contract
+//!       - provider quota mutation contract
+//!       - frontend TestModelResult contract
+//!       - AGE-166 typed terminal-signal kind to durable-mark predicate
+//! ```
+
 pub mod setup;
+pub mod terminal_outcome_adapter;
 pub mod usage;
 mod wiring;
+pub mod zero_turn_orchestration;
 
 use oulipoly_config as config;
 use oulipoly_config::repositories::{
@@ -679,39 +707,31 @@ fn test_model_with_db_path(
         .unwrap_or_default();
     let (provider, prompt_mode) =
         effective_provider_for_model_provider(&model, provider_index, &providers_cfg)?;
-    let extra_inputs = HashMap::new();
     let result = services
         .executor_service
         .execute(ExecutorServiceRequest::Effective {
-            model: model.clone(),
+            model,
             provider: provider.clone(),
             provider_index,
             prompt_mode,
             prompt: prompt.to_string(),
             working_dir: None,
-            extra_inputs,
+            extra_inputs: HashMap::new(),
             parent_invocation_env: None,
         })
         .map_err(|error| error.to_string())?
         .result;
+    // AGE-156: typed-signal precedence consolidation. QuotaExhaustedInband is
+    // authoritative for durable exhausted_at writes; absent a typed signal, fall
+    // back to the LLM diagnostics classifier.
     if result.exit_code != 0 {
-        // AGE-156: typed-signal precedence consolidation. The AGE-162 WU-B
-        // partitioned recognizer in claude/codex/openai_compat emits
-        // `QuotaExhaustedInband` for persistent quota signatures and
-        // `RateLimited` for transient HTTP 429 / rate-limit signatures. Only
-        // the persistent-quota kind is authoritative for the durable
-        // `provider_quotas.exhausted_at` write here. When the typed signal is
-        // absent (degraded mode), fall back to the legacy broad-string
-        // classifier.
         let should_mark_exhausted = if let Some(signal) = result.terminal_signal.as_ref() {
             matches!(signal.kind, TerminalSignalKind::QuotaExhaustedInband)
         } else {
-            let diagnostic_input = diagnostic_input(&result.stderr, &result.stdout);
+            let input = diagnostic_input(&result.stderr, &result.stdout);
             let DiagnosticsServiceOutput::ExhaustionClassification { is_exhausted } = services
                 .diagnostics_service
-                .diagnose(DiagnosticsServiceRequest::ClassifyExhaustion {
-                    stderr: diagnostic_input,
-                })
+                .diagnose(DiagnosticsServiceRequest::ClassifyExhaustion { stderr: input })
                 .map_err(|error| error.to_string())?
             else {
                 return Err("Diagnostics service returned unexpected output".to_string());
@@ -722,12 +742,16 @@ fn test_model_with_db_path(
             <StateDb as ProviderQuotaRepository>::mark_exhausted(&db, &provider.name)?;
         }
     }
-    Ok(TestModelResult {
+    Ok(map_test_model_result(&result))
+}
+
+fn map_test_model_result(result: &oulipoly_runtime::executor::ExecutionResult) -> TestModelResult {
+    TestModelResult {
         success: result.exit_code == 0,
         stdout: String::from_utf8_lossy(&result.stdout).into_owned(),
-        stderr: result.stderr,
+        stderr: result.stderr.clone(),
         exit_code: result.exit_code,
-    })
+    }
 }
 
 fn diagnostic_input(stderr: &str, stdout: &[u8]) -> String {
@@ -2375,6 +2399,56 @@ mod tests {
     }
 
     #[test]
+    fn test_model_maybe_signal_is_non_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let db_path = dir.path().join("state.db");
+        let db = StateDb::open(&db_path).unwrap();
+        db.upsert_quota_refresh("age166-provider", &[]).unwrap();
+        drop(db);
+        let model = make_model("age166-model", &["age166-provider"]);
+        let opener = StubStateDbOpener::opening(db_path.clone());
+        let providers = StubProvidersConfigRepository::default();
+        let routing = StubRoutingService::selecting(0);
+        let executor = StubExecutorService::with_signal(
+            7,
+            b"maybe stdout",
+            "quota-looking text must not drive durability",
+            TestTerminalSignalKind::MaybeQuotaExhausted,
+            "age166-provider",
+        );
+        let diagnostics = StubDiagnosticsService::returning(true);
+        let services = TestModelServices {
+            state_db_opener: &opener,
+            providers_repository: &providers,
+            routing_service: &routing,
+            executor_service: &executor,
+            diagnostics_service: &diagnostics,
+        };
+
+        let result =
+            super::test_model_with_db_path(services, model, models_dir, db_path.clone(), "hello")
+                .expect("maybe quota signal should still return a test-model result");
+
+        assert!(!result.success);
+        assert_eq!(result.exit_code, 7);
+        assert!(
+            diagnostics.calls().is_empty(),
+            "MaybeQuotaExhausted must not invoke legacy diagnostics in test_model"
+        );
+        assert_eq!(
+            StateDb::open(&db_path)
+                .unwrap()
+                .get_quota("age166-provider")
+                .unwrap()
+                .unwrap()
+                .exhausted_at,
+            None
+        );
+    }
+
+    #[test]
     fn age156_test_model_typed_quota_exhausted_inband_signal_marks_exhausted_even_when_legacy_classifier_would_not()
      {
         // AGE-156 branch-coverage companion to the rate-limit case above.
@@ -3251,33 +3325,39 @@ quota_script = "{}"
         let dir = tempfile::tempdir().unwrap();
         let models_dir = dir.path().join("models");
         std::fs::create_dir_all(&models_dir).unwrap();
-        let model = ModelConfig {
-            name: "quota-model".to_string(),
-            prompt_mode: PromptMode::Arg,
-            providers: vec![ProviderConfig::new(
-                "sh",
-                vec![
-                    "-c".to_string(),
-                    "echo quota exhausted >&2; exit 7".to_string(),
-                ],
-            )],
-            inputs: vec![],
-        };
-        let mut models = HashMap::new();
-        models.insert(model.name.clone(), model);
-
         let db_path = dir.path().join("state.db");
         let db = StateDb::open(&db_path).unwrap();
-        db.upsert_quota_refresh("sh", &[]).unwrap();
+        db.upsert_quota_refresh("quota-provider", &[]).unwrap();
         drop(db);
+        let model = make_model("quota-model", &["quota-provider"]);
+        let opener = StubStateDbOpener::opening(db_path.clone());
+        let providers = StubProvidersConfigRepository::default();
+        let routing = StubRoutingService::selecting(0);
+        let executor = StubExecutorService::with_signal(
+            7,
+            b"",
+            "typed quota signal",
+            TestTerminalSignalKind::QuotaExhaustedInband,
+            "quota-provider",
+        );
+        let diagnostics = StubDiagnosticsService::returning(false);
+        let services = TestModelServices {
+            state_db_opener: &opener,
+            providers_repository: &providers,
+            routing_service: &routing,
+            executor_service: &executor,
+            diagnostics_service: &diagnostics,
+        };
 
-        let result = test_model_for_test(models, models_dir, "quota-model").unwrap();
+        let result =
+            super::test_model_with_db_path(services, model, models_dir, db_path.clone(), "hello")
+                .unwrap();
 
         assert!(!result.success);
         assert_eq!(result.exit_code, 7);
-        assert!(result.stderr.contains("quota exhausted"));
+        assert!(result.stderr.contains("typed quota signal"));
         let db = StateDb::open(&db_path).unwrap();
-        let quota = db.get_quota("sh").unwrap().unwrap();
+        let quota = db.get_quota("quota-provider").unwrap().unwrap();
         assert!(quota.exhausted_at.is_some());
     }
 
@@ -3390,8 +3470,14 @@ prompt_mode = "arg"
             quota_result.stderr
         );
         let db = StateDb::open(&dir.path().join("state.db")).unwrap();
-        let quota = db.get_quota("quota-effective-provider").unwrap().unwrap();
-        assert!(quota.exhausted_at.is_some());
+        // AGE-166: substring quota detection was removed in PR #126; this
+        // effective-provider subcase still proves the providers.toml command is
+        // used, but quota-looking stderr is no longer durable by itself.
+        let quota = db.get_quota("quota-effective-provider").unwrap();
+        assert!(
+            quota.and_then(|quota| quota.exhausted_at).is_none(),
+            "quota-looking stderr without a typed signal must not mark exhausted"
+        );
     }
 
     // risk: exhaustive surfaces 38-39; level: Rust unit; source: contract § 5.8, A8, A10

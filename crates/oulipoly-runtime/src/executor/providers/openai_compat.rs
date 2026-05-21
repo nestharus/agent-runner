@@ -100,17 +100,15 @@ fn lowercase(text: &str) -> String {
 /// for the per-provider canonical token vocabulary (project-local schema
 /// owner per the AGE-125 PP-001 precedent; canonical-doc-as-schema proof
 /// per `~/ai/agents/push-pull-auditor.md`).
-fn contains_persistent_quota_token(text: &str) -> bool {
-    text.contains("quota exhausted") || text.contains("quota exceeded")
+fn contains_persistent_quota_token(_text: &str) -> bool {
+    // Provider-coupled token matching removed per AGE-166. Quota detection
+    // moves to turn-counting at the session-completion layer; persistent
+    // substring classifiers are no longer authoritative.
+    false
 }
 
-fn contains_transient_rate_limit_token(text: &str) -> bool {
-    text.contains("rate_limit_exceeded")
-        || text.contains("status 429")
-        || text.contains("status: 429")
-        || text.contains("http 429")
-        || text.contains("too many requests")
-        || text.contains("rate limit")
+fn contains_transient_rate_limit_token(_text: &str) -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -227,9 +225,8 @@ mod tests {
         assert!(signal.evidence.contains("no stdout/stderr for 600s"));
     }
 
-    // T24 (per Step 6b output index AGE-139-T24)
     #[test]
-    fn openai_compat_persistent_quota_fixtures_map_to_quota_exhausted_inband() {
+    fn provider_recognizer_substrings_do_not_classify_openai_compat() {
         for (name, stdout, stderr) in [
             (
                 "gemini-quota",
@@ -241,21 +238,6 @@ mod tests {
                 b"".as_slice(),
                 b"project quota exceeded".as_slice(),
             ),
-        ] {
-            let signal = assert_kind(
-                evidence(stdout, stderr, TerminalStatusEvidence::Unknown),
-                TerminalSignalKind::QuotaExhaustedInband,
-            );
-            assert!(
-                !signal.evidence.is_empty(),
-                "fixture {name} should preserve an evidence excerpt"
-            );
-        }
-    }
-
-    #[test]
-    fn openai_compat_transient_rate_limit_fixtures_map_to_rate_limited() {
-        for (name, stdout, stderr) in [
             (
                 "json-rate-limit",
                 br#"{"error":{"type":"rate_limit_exceeded","message":"limit reached"}}"#.as_slice(),
@@ -275,26 +257,34 @@ mod tests {
         ] {
             let signal = assert_kind(
                 evidence(stdout, stderr, TerminalStatusEvidence::Unknown),
-                TerminalSignalKind::RateLimited,
+                TerminalSignalKind::Unknown,
             );
             assert!(
-                !signal.evidence.is_empty(),
-                "fixture {name} should preserve an evidence excerpt"
+                !matches!(
+                    signal.kind,
+                    TerminalSignalKind::QuotaExhaustedInband
+                        | TerminalSignalKind::RateLimited
+                        | TerminalSignalKind::MaybeQuotaExhausted
+                ),
+                "fixture {name} must not classify quota/rate-looking text"
             );
         }
-    }
-
-    #[test]
-    fn openai_compat_persistent_quota_wins_over_transient_rate_limit_when_both_present() {
-        let signal = assert_kind(
+        assert_kind(
             evidence(
-                br#"{"error":{"type":"quota_exceeded","message":"429 too many requests; quota exhausted"}}"#.as_slice(),
+                quota_text(),
                 b"",
-                TerminalStatusEvidence::Unknown,
+                TerminalStatusEvidence::Exited { code: 0 },
             ),
-            TerminalSignalKind::QuotaExhaustedInband,
+            TerminalSignalKind::CleanExit,
         );
-        assert!(!signal.evidence.is_empty());
+        assert_kind(
+            evidence(
+                b"",
+                quota_text(),
+                TerminalStatusEvidence::Exited { code: 1 },
+            ),
+            TerminalSignalKind::NonzeroExit,
+        );
     }
 
     // T27 (per Step 6b output index AGE-139-T27)
@@ -361,27 +351,27 @@ mod tests {
 
     // T39 (per Step 6b output index AGE-139-T39)
     #[test]
-    fn precedence_quota_wins_over_clean_exit_for_openai_compat() {
+    fn precedence_quota_text_preserves_clean_exit_for_openai_compat() {
         assert_kind(
             evidence(
                 quota_text(),
                 b"",
                 TerminalStatusEvidence::Exited { code: 0 },
             ),
-            TerminalSignalKind::QuotaExhaustedInband,
+            TerminalSignalKind::CleanExit,
         );
     }
 
     // T42 (per Step 6b output index AGE-139-T42)
     #[test]
-    fn precedence_quota_wins_over_nonzero_exit_for_openai_compat() {
+    fn precedence_quota_text_preserves_nonzero_exit_for_openai_compat() {
         assert_kind(
             evidence(
                 b"",
                 quota_text(),
                 TerminalStatusEvidence::Exited { code: 1 },
             ),
-            TerminalSignalKind::QuotaExhaustedInband,
+            TerminalSignalKind::NonzeroExit,
         );
     }
 

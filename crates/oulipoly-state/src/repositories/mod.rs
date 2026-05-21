@@ -1,3 +1,21 @@
+//! ## Declared roles
+//!
+//! `accessor`, `mapper`, `validator`, `orchestration`
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/repositories/mod.rs
+//!     role: intrinsic-surface
+//!     Domain: state_repository_facade
+//!     Owns:
+//!       - quota operations facade (mark_exhausted, exhausted_at reads, refresh windows)
+//!       - routing reads facade (provider eligibility queries, session-turn count reads)
+//!       - session-turn reads (assistant counts per provider/session)
+//!       - deployment-aware opener for cross-deployment state.db routing
+//! ```
+
 use crate::deployment::DeploymentAwareOpener;
 use crate::schema_probe::{self, SchemaProbeReport};
 use crate::{

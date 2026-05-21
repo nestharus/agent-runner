@@ -1,3 +1,21 @@
+//! ## Declared roles
+//!
+//! `accessor`, `mapper`, `parser`, `formatter`, `predicate`, `orchestration`
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-runtime/src/diagnostics/mod.rs
+//!     role: intrinsic-surface
+//!     Domain: diagnostic_classification
+//!     Owns:
+//!       - error category vocabulary
+//!       - non-authoritative quota/rate-limit classification fallback (`classify_exhaustion` always false post-PR #126)
+//!       - diagnostic model port + prompt structure
+//!       - service DTO + request/error shape
+//! ```
+
 use crate::executor;
 use crate::services::{
     DiagnosticsServiceOutput, DiagnosticsServicePort, DiagnosticsServiceRequest, ServiceError,
@@ -81,19 +99,12 @@ pub fn classify_exhaustion(stderr: &str) -> bool {
     quota_exhaustion_text(&stderr.to_lowercase())
 }
 
-pub fn diagnose_error(
-    diagnostics_model: &ModelConfig,
-    effective_provider: &ProviderConfig,
-    provider_index: usize,
-    prompt_mode: PromptMode,
-    exit_code: i32,
-    stderr: &str,
-    working_dir: Option<&Path>,
-) -> Result<Diagnosis, String> {
-    // Truncate stderr for the diagnostic prompt
-    let truncated: String = stderr.chars().take(MAX_STDERR_LEN).collect();
+fn truncate_stderr_for_prompt(stderr: &str) -> String {
+    stderr.chars().take(MAX_STDERR_LEN).collect()
+}
 
-    let prompt = format!(
+fn format_diagnosis_prompt(exit_code: i32, truncated: &str) -> String {
+    format!(
         "Analyze this CLI error and classify it into exactly one category.\n\
          \n\
          Exit code: {exit_code}\n\
@@ -111,7 +122,20 @@ pub fn diagnose_error(
          Example:\n\
          rate_limit\n\
          The API returned HTTP 429 indicating too many requests."
-    );
+    )
+}
+
+pub fn diagnose_error(
+    diagnostics_model: &ModelConfig,
+    effective_provider: &ProviderConfig,
+    provider_index: usize,
+    prompt_mode: PromptMode,
+    exit_code: i32,
+    stderr: &str,
+    working_dir: Option<&Path>,
+) -> Result<Diagnosis, String> {
+    let truncated = truncate_stderr_for_prompt(stderr);
+    let prompt = format_diagnosis_prompt(exit_code, &truncated);
 
     let extra_inputs = HashMap::new();
     let result =
@@ -127,7 +151,6 @@ pub fn diagnose_error(
         })?;
 
     if result.exit_code != 0 {
-        // Diagnostics model itself failed — use heuristic fallback
         return Ok(heuristic_diagnosis(stderr, exit_code));
     }
 
@@ -135,13 +158,12 @@ pub fn diagnose_error(
     parse_diagnosis(&stdout_str, stderr, exit_code)
 }
 
-fn parse_diagnosis(output: &str, stderr: &str, exit_code: i32) -> Result<Diagnosis, String> {
-    let lines: Vec<&str> = output.trim().lines().collect();
-    if lines.is_empty() {
-        return Ok(heuristic_diagnosis(stderr, exit_code));
-    }
+fn parse_diagnosis_output_lines(output: &str) -> Vec<&str> {
+    output.trim().lines().collect()
+}
 
-    let category = match lines[0].trim() {
+fn map_error_category_token(token: &str) -> ErrorCategory {
+    match token {
         "rate_limit" => ErrorCategory::RateLimit,
         "quota_exhausted" => ErrorCategory::QuotaExhausted,
         "auth_expired" => ErrorCategory::AuthExpired,
@@ -150,7 +172,24 @@ fn parse_diagnosis(output: &str, stderr: &str, exit_code: i32) -> Result<Diagnos
         "hung_subprocess" => ErrorCategory::HungSubprocess,
         "resume_session_mismatch" => ErrorCategory::ResumeSessionMismatch,
         _ => ErrorCategory::Unknown,
-    };
+    }
+}
+
+fn diagnosis_summary_text(lines: &[&str]) -> String {
+    if lines.len() > 1 {
+        lines[1..].join("\n")
+    } else {
+        String::new()
+    }
+}
+
+fn parse_diagnosis(output: &str, stderr: &str, exit_code: i32) -> Result<Diagnosis, String> {
+    let lines = parse_diagnosis_output_lines(output);
+    if lines.is_empty() {
+        return Ok(heuristic_diagnosis(stderr, exit_code));
+    }
+
+    let category = map_error_category_token(lines[0].trim());
 
     if category == ErrorCategory::Unknown {
         let heuristic = heuristic_diagnosis(stderr, exit_code);
@@ -159,21 +198,18 @@ fn parse_diagnosis(output: &str, stderr: &str, exit_code: i32) -> Result<Diagnos
         }
     }
 
-    let summary = if lines.len() > 1 {
-        lines[1..].join("\n")
-    } else {
-        String::new()
-    };
-
+    let summary = diagnosis_summary_text(&lines);
     Ok(Diagnosis { category, summary })
 }
 
-fn heuristic_diagnosis(stderr: &str, _exit_code: i32) -> Diagnosis {
-    let lower = stderr.to_lowercase();
+fn normalize_stderr_for_heuristic(stderr: &str) -> String {
+    stderr.to_lowercase()
+}
 
-    let category = if quota_exhaustion_text(&lower) {
+fn heuristic_error_category(lower: &str) -> ErrorCategory {
+    if quota_exhaustion_text(lower) {
         ErrorCategory::QuotaExhausted
-    } else if rate_limit_text(&lower) {
+    } else if rate_limit_text(lower) {
         ErrorCategory::RateLimit
     } else if lower.contains("unauthorized")
         || lower.contains("auth")
@@ -195,35 +231,28 @@ fn heuristic_diagnosis(stderr: &str, _exit_code: i32) -> Diagnosis {
         ErrorCategory::NetworkError
     } else {
         ErrorCategory::Unknown
-    };
+    }
+}
 
+fn heuristic_diagnosis(stderr: &str, _exit_code: i32) -> Diagnosis {
+    let lower = normalize_stderr_for_heuristic(stderr);
+    let category = heuristic_error_category(&lower);
     Diagnosis {
         category,
         summary: "Heuristic classification based on stderr content".to_string(),
     }
 }
 
-fn quota_exhaustion_text(lower: &str) -> bool {
-    lower.contains("quota exceeded")
-        || lower.contains("quota exhausted")
-        || lower.contains("billing limit")
-        || lower.contains("usage limit")
-        || lower.contains("usage cap")
-        || lower.contains("hit your limit")
-        || lower.contains("you've hit your limit")
+fn quota_exhaustion_text(_lower: &str) -> bool {
+    // Per AGE-166 / PR #126: stderr substring classification is no longer
+    // authoritative for quota detection. Returns false unconditionally so
+    // diagnostics falls back to the LLM diagnostics path and never marks
+    // a provider exhausted from heuristic stderr matching.
+    false
 }
 
-fn rate_limit_text(lower: &str) -> bool {
-    lower.contains("429")
-        || lower.contains("http 429")
-        || lower.contains("status 429")
-        || lower.contains("status: 429")
-        || lower.contains("429 too many requests")
-        || lower.contains("too many requests")
-        || lower.contains("rate limit")
-        || lower.contains("rate_limit")
-        || lower.contains("rate-limited")
-        || lower.contains("rate limited")
+fn rate_limit_text(_lower: &str) -> bool {
+    false
 }
 
 // Characterization test for AGE-8 — pins current behavior of diagnostics model-backed subprocess execution in this inline test module.
@@ -275,17 +304,27 @@ mod tests {
     }
 
     #[test]
-    fn classify_exhaustion_matches_quota_billing_usage_limit_stderr() {
+    fn diagnostics_classify_exhaustion_remains_non_authoritative() {
         for stderr in [
             "error: QUOTA exceeded for this account",
             "Billing limit reached for the workspace",
             "USAGE LIMIT has been hit; try again later",
             "You've hit your limit · resets 9:50pm (America/Los_Angeles)",
             r#"{"api_error_status":429,"result":"You've hit your limit · resets 9:50pm"}"#,
+            "Error: 429 Too Many Requests",
+            "rate limit reached",
         ] {
             assert!(
-                classify_exhaustion(stderr),
-                "expected quota exhaustion classification for {stderr:?}"
+                !classify_exhaustion(stderr),
+                "quota/rate-looking stderr must not be authoritative: {stderr:?}"
+            );
+            let d = heuristic_diagnosis(stderr, 1);
+            assert!(
+                !matches!(
+                    d.category,
+                    ErrorCategory::QuotaExhausted | ErrorCategory::RateLimit
+                ),
+                "heuristic fallback must not classify quota/rate text for {stderr:?}"
             );
         }
     }
@@ -309,16 +348,16 @@ mod tests {
     #[test]
     fn heuristic_rate_limit() {
         let d = heuristic_diagnosis("Error: 429 Too Many Requests", 1);
-        assert_eq!(d.category, ErrorCategory::RateLimit);
+        assert_eq!(d.category, ErrorCategory::Unknown);
     }
 
     #[test]
-    fn heuristic_claude_limit_json_is_quota_exhausted_not_generic_rate_limit() {
+    fn heuristic_claude_limit_json_is_not_quota_exhausted() {
         let d = heuristic_diagnosis(
             r#"{"type":"result","is_error":true,"api_error_status":429,"result":"You've hit your limit · resets 9:50pm"}"#,
             1,
         );
-        assert_eq!(d.category, ErrorCategory::QuotaExhausted);
+        assert_eq!(d.category, ErrorCategory::Unknown);
     }
 
     #[test]
@@ -353,18 +392,18 @@ mod tests {
     #[test]
     fn parse_empty_output_falls_back() {
         let d = parse_diagnosis("", "429 error", 1).unwrap();
-        assert_eq!(d.category, ErrorCategory::RateLimit);
+        assert_eq!(d.category, ErrorCategory::Unknown);
     }
 
     #[test]
-    fn parse_unknown_model_output_falls_back_to_heuristic_signal() {
+    fn parse_unknown_model_output_falls_back_without_quota_heuristic() {
         let d = parse_diagnosis(
             "unknown\nnot enough context",
             "You've hit your limit · resets 9:50pm",
             1,
         )
         .unwrap();
-        assert_eq!(d.category, ErrorCategory::QuotaExhausted);
+        assert_eq!(d.category, ErrorCategory::Unknown);
     }
 
     #[cfg(unix)]

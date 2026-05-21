@@ -56,8 +56,15 @@ impl CliFixture {
     }
 
     fn run_one_shot(&self, model_name: &str) -> Output {
-        self.command()
-            .arg("--models-dir")
+        self.run_one_shot_with_env(model_name, &[])
+    }
+
+    fn run_one_shot_with_env(&self, model_name: &str, env: &[(&str, &str)]) -> Output {
+        let mut cmd = self.command();
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+        cmd.arg("--models-dir")
             .arg(&self.models_dir)
             .arg("--model")
             .arg(model_name)
@@ -539,7 +546,13 @@ fn age_81_one_shot_retries_first_quota_exhausted_provider_then_succeeds() {
         ("age81-b", "printf '%s\\n' 'age81-b executed'"),
     ]);
 
-    let output = fixture.run_one_shot("age81");
+    let output = fixture.run_one_shot_with_env(
+        "age81",
+        &[(
+            "OULIPOLY_AGE153_FORCE_TERMINAL_SIGNAL_KIND",
+            "QuotaExhaustedInband,None",
+        )],
+    );
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -585,7 +598,13 @@ fn age_81_one_shot_retries_n_minus_one_quota_exhausted_providers_then_succeeds()
         ("age81-c", "printf '%s\\n' 'age81-c executed'"),
     ]);
 
-    let output = fixture.run_one_shot("age81");
+    let output = fixture.run_one_shot_with_env(
+        "age81",
+        &[(
+            "OULIPOLY_AGE153_FORCE_TERMINAL_SIGNAL_KIND",
+            "QuotaExhaustedInband,QuotaExhaustedInband,None",
+        )],
+    );
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -625,7 +644,13 @@ fn age_81_one_shot_all_quota_exhausted_returns_pool_error() {
         ),
     ]);
 
-    let output = fixture.run_one_shot("age81");
+    let output = fixture.run_one_shot_with_env(
+        "age81",
+        &[(
+            "OULIPOLY_AGE153_FORCE_TERMINAL_SIGNAL_KIND",
+            "QuotaExhaustedInband",
+        )],
+    );
 
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);

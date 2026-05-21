@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! `orchestration`, `cli-dispatch`
+//! `orchestration`, `parser`, `validator`, `accessor`, `formatter`, `mapper`, `predicate`, `filter`
 //!
 //! ## Adapter declarations
 //!
@@ -19,6 +19,24 @@
 //!     Translates:
 //!       - oulipoly_runtime modules outside services consumed by CLI dispatch
 //! ```
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: src-tauri/src/main.rs
+//!     role: intrinsic-surface
+//!     Domain: cli_lifecycle_orchestration
+//!     Owns:
+//!       - lifecycle loops
+//!       - run_with_balancing lifecycle loop
+//!       - run_resume lifecycle loop
+//!       - run_repl lifecycle loop
+//!       - top-level --resume dispatch
+//!       - invocation finalization sequencing
+//!       - terminal signal outcome sequencing
+//!       - provider retry and migration sequencing
+//! ```
 
 use agent_runner_lib::{effective_provider_for_model_provider, load_app_config};
 use oulipoly_config::repositories::{AgentConfigRepository, FilesystemAgentConfigRepository};
@@ -29,6 +47,7 @@ use oulipoly_config::{
 use oulipoly_runtime::balancer;
 use oulipoly_runtime::diagnostics;
 use oulipoly_runtime::executor;
+use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind;
 use oulipoly_runtime::services::{
     DiagnosticsServiceOutput, DiagnosticsServiceRequest, ExecutorServiceRequest,
     InvocationLifecycleFinalizeRequest, InvocationLifecycleServicePort,
@@ -79,13 +98,19 @@ mod terminal_outcome_adapter;
 mod trace_cli;
 mod usage;
 mod wiring;
+mod zero_turn_orchestration;
 
 use terminal_outcome_adapter::{
     TerminalSignalContext, TerminalSignalDisposition,
-    apply_age153_terminal_signal_fixture_override, apply_terminal_signal_outcome,
-    balanced_terminal_signal_for_outcome, resume_terminal_signal_for_outcome,
-    spawn_error_terminal_signal, terminal_signal_error_category, terminal_signal_reason,
-    typed_terminal_reason_fallback,
+    apply_age153_terminal_signal_fixture_override,
+    apply_age153_terminal_signal_fixture_override_to_fields, apply_terminal_signal_outcome,
+    balanced_terminal_signal_for_outcome, confirm_maybe_quota_exhausted,
+    resume_terminal_signal_for_outcome, spawn_error_terminal_signal,
+    terminal_signal_error_category, terminal_signal_reason, typed_terminal_reason_fallback,
+};
+use zero_turn_orchestration::{
+    ZeroTurnAction, ZeroTurnBaseline, ZeroTurnClassification, ZeroTurnConfirmationState,
+    ZeroTurnEvidence, classify_completion_delta, next_action, record_baseline,
 };
 
 use usage::cli::{Cli, SessionSubcommands, Subcommands};
@@ -2407,6 +2432,12 @@ fn run_repl(
             strategy,
         }
     });
+    let zero_turn_baseline = zero_turn_record_baseline(
+        &env.state,
+        &env.sessions_cfg,
+        &provider.name,
+        resume_session_id.as_deref(),
+    );
 
     let interactive_effective_cwd = resume_spawn_cwd
         .clone()
@@ -2418,7 +2449,22 @@ fn run_repl(
         Some(&invocation_env),
         resume_payload,
     ) {
-        Ok(result) => {
+        Ok(mut result) => {
+            apply_age153_terminal_signal_fixture_override_to_fields(
+                &mut result.terminal_signal,
+                &mut result.terminal_reason,
+            );
+            let zero_turn_classification = zero_turn_classify_after_completion(
+                &env.state,
+                &env.sessions_cfg,
+                &zero_turn_baseline,
+            );
+            apply_zero_turn_classification_to_signal_fields(
+                &mut result.terminal_signal,
+                &mut result.terminal_reason,
+                &provider.name,
+                &zero_turn_classification,
+            );
             let exit_code = result.exit_code;
             let invocation_uuid =
                 Uuid::parse_str(&invocation.id).expect("generated invocation id must be a UUID");
@@ -2444,7 +2490,8 @@ fn run_repl(
             match terminal_signal_disposition {
                 TerminalSignalDisposition::InteractiveFail
                 | TerminalSignalDisposition::ProlongedSilenceFail
-                | TerminalSignalDisposition::QuotaExhaustedRetry => {
+                | TerminalSignalDisposition::QuotaExhaustedRetry
+                | TerminalSignalDisposition::MaybeQuotaVerify => {
                     let terminal_reason = terminal_signal_reason(
                         &result.terminal_signal,
                         result.terminal_reason.as_deref(),
@@ -2746,9 +2793,11 @@ fn run_resume(
         .as_ref()
         .map(|model| model.providers.len())
         .unwrap_or(1)
-        .max(1);
+        .max(1)
+        + 1;
     let mut attempts = 0usize;
     let mut last_exit_code = 1;
+    let mut zero_turn_confirmation = ZeroTurnConfirmationState::new();
 
     loop {
         if attempts >= max_attempts {
@@ -2863,6 +2912,13 @@ fn run_resume(
             env.state
                 .record_legacy_resume_input_session_id(invocation_row_id, session_id)?;
         }
+        let provider_session_id = resolved.active_session_id.clone();
+        let zero_turn_baseline = zero_turn_record_baseline(
+            &env.state,
+            &env.sessions_cfg,
+            &provider.name,
+            Some(&provider_session_id),
+        );
 
         let invocation_env = serde_json::to_string(&invocation)
             .map_err(|e| format!("Failed to serialize invocation id: {e}"))?;
@@ -2898,6 +2954,22 @@ fn run_resume(
             }
         };
         apply_age153_terminal_signal_fixture_override(&mut result);
+        let zero_turn_classification =
+            zero_turn_classify_after_completion(&env.state, &env.sessions_cfg, &zero_turn_baseline);
+        apply_zero_turn_classification_to_result(
+            &mut result,
+            &provider.name,
+            &zero_turn_classification,
+        );
+        let zero_turn_action = next_action(
+            &mut zero_turn_confirmation,
+            zero_turn_classification_for_action(
+                zero_turn_classification,
+                &result,
+                &provider.name,
+                Some(&provider_session_id),
+            ),
+        );
 
         if let Some(acceptance) = &result.resume_acceptance {
             agent_runtime_services
@@ -2915,7 +2987,7 @@ fn run_resume(
 
         let invocation_uuid =
             Uuid::parse_str(&invocation.id).expect("generated invocation id must be a UUID");
-        let session_uuid = Uuid::parse_str(&resolved.active_session_id).ok();
+        let session_uuid = provider_session_marker_uuid(Some(&provider_session_id));
         let mut terminal_signal_stderr = std::io::stderr();
         let mut terminal_signal_ctx = TerminalSignalContext {
             invocation_id: &invocation_uuid,
@@ -2925,7 +2997,86 @@ fn run_resume(
             stderr: &mut terminal_signal_stderr,
         };
         let resume_terminal_signal = resume_terminal_signal_for_outcome(&result.terminal_signal);
-        match apply_terminal_signal_outcome(&resume_terminal_signal, &mut terminal_signal_ctx) {
+        let terminal_signal_disposition =
+            if matches!(zero_turn_action, ZeroTurnAction::ConfirmedExhaustion)
+                && resume_terminal_signal
+                    .as_ref()
+                    .is_some_and(|signal| signal.kind == TerminalSignalKind::MaybeQuotaExhausted)
+            {
+                let signal = resume_terminal_signal
+                    .as_ref()
+                    .expect("confirmed zero-turn action requires a maybe signal");
+                let _ = confirm_maybe_quota_exhausted(signal, &mut terminal_signal_ctx);
+                TerminalSignalDisposition::MaybeQuotaVerify
+            } else {
+                apply_terminal_signal_outcome(&resume_terminal_signal, &mut terminal_signal_ctx)
+            };
+        match terminal_signal_disposition {
+            TerminalSignalDisposition::MaybeQuotaVerify => match zero_turn_action {
+                ZeroTurnAction::ConfirmedExhaustion => {
+                    let terminal_reason = terminal_signal_reason(
+                        &result.terminal_signal,
+                        result.terminal_reason.as_deref(),
+                    )
+                    .unwrap_or("maybe_quota_exhausted");
+                    agent_runtime_services
+                        .invocation_lifecycle_service
+                        .finalize_invocation(InvocationLifecycleFinalizeRequest {
+                            state: &env.state,
+                            invocation_row_id,
+                            success: false,
+                            exit_code: result.exit_code,
+                            error_category: Some("quota_exhausted"),
+                            terminal_reason: Some(terminal_reason),
+                        })
+                        .map_err(|err| err.to_string())?;
+                    guard.mark_finalized();
+                    last_exit_code = result.exit_code;
+                    continue;
+                }
+                ZeroTurnAction::VerifySameProvider => {
+                    let terminal_reason = terminal_signal_reason(
+                        &result.terminal_signal,
+                        result.terminal_reason.as_deref(),
+                    )
+                    .unwrap_or("maybe_quota_exhausted");
+                    agent_runtime_services
+                        .invocation_lifecycle_service
+                        .finalize_invocation(InvocationLifecycleFinalizeRequest {
+                            state: &env.state,
+                            invocation_row_id,
+                            success: false,
+                            exit_code: result.exit_code,
+                            error_category: None,
+                            terminal_reason: Some(terminal_reason),
+                        })
+                        .map_err(|err| err.to_string())?;
+                    guard.mark_finalized();
+                    last_exit_code = result.exit_code;
+                    continue;
+                }
+                ZeroTurnAction::Continue | ZeroTurnAction::Unclassified => {
+                    let terminal_reason = terminal_signal_reason(
+                        &result.terminal_signal,
+                        result.terminal_reason.as_deref(),
+                    )
+                    .unwrap_or("maybe_quota_exhausted");
+                    agent_runtime_services
+                        .invocation_lifecycle_service
+                        .finalize_invocation(InvocationLifecycleFinalizeRequest {
+                            state: &env.state,
+                            invocation_row_id,
+                            success: false,
+                            exit_code: result.exit_code,
+                            error_category: None,
+                            terminal_reason: Some(terminal_reason),
+                        })
+                        .map_err(|err| err.to_string())?;
+                    guard.mark_finalized();
+                    eprintln!("{}", result.stderr);
+                    return Ok(result.exit_code);
+                }
+            },
             TerminalSignalDisposition::QuotaExhaustedRetry => {
                 let terminal_reason = terminal_signal_reason(
                     &result.terminal_signal,
@@ -3151,6 +3302,185 @@ fn execution_succeeded(exit_code: i32) -> bool {
     exit_code == 0
 }
 
+fn zero_turn_zero_counts() -> oulipoly_state::SessionTurnCounts {
+    oulipoly_state::SessionTurnCounts {
+        total: 0,
+        assistant: 0,
+        sidechain: 0,
+    }
+}
+
+fn provider_has_no_session_source(
+    sessions_cfg: &oulipoly_config::SessionsConfig,
+    provider_name: &str,
+) -> bool {
+    sessions_cfg.get(provider_name).is_none()
+}
+
+fn has_session_source(sessions_cfg: &oulipoly_config::SessionsConfig, provider_name: &str) -> bool {
+    !provider_has_no_session_source(sessions_cfg, provider_name)
+}
+
+fn scan_report_has_errors(report: &oulipoly_runtime::sessions::ScanReport) -> bool {
+    !report.errors.is_empty()
+}
+
+fn baseline_turn_count_from_scan(
+    state: &StateDb,
+    provider_name: &str,
+    session_id: &str,
+    scan_failed: bool,
+) -> Option<oulipoly_state::SessionTurnCounts> {
+    if scan_failed {
+        None
+    } else {
+        state.count_session_turns(provider_name, session_id).ok()
+    }
+}
+
+fn classify_from_turn_count_result<E>(
+    baseline: &ZeroTurnBaseline,
+    count_result: Result<oulipoly_state::SessionTurnCounts, E>,
+) -> ZeroTurnClassification {
+    match count_result {
+        Ok(counts) => classify_completion_delta(baseline, counts),
+        Err(_) => ZeroTurnClassification::UnclassifiedScanFailed,
+    }
+}
+
+fn zero_turn_record_baseline(
+    state: &StateDb,
+    sessions_cfg: &oulipoly_config::SessionsConfig,
+    provider_name: &str,
+    provider_session_id: Option<&str>,
+) -> ZeroTurnBaseline {
+    let Some(session_id) = provider_session_id else {
+        return record_baseline(provider_name, None, None, false);
+    };
+    if provider_has_no_session_source(sessions_cfg, provider_name) {
+        return record_baseline(provider_name, Some(session_id), None, true);
+    }
+    let report = oulipoly_runtime::sessions::scan_provider(provider_name, sessions_cfg, state);
+    let scan_failed = scan_report_has_errors(&report);
+    let baseline_count =
+        baseline_turn_count_from_scan(state, provider_name, session_id, scan_failed);
+    record_baseline(provider_name, Some(session_id), baseline_count, scan_failed)
+}
+
+fn zero_turn_classify_after_completion(
+    state: &StateDb,
+    sessions_cfg: &oulipoly_config::SessionsConfig,
+    baseline: &ZeroTurnBaseline,
+) -> ZeroTurnClassification {
+    let Some(session_id) = baseline.provider_session_id.as_deref() else {
+        return classify_completion_delta(baseline, zero_turn_zero_counts());
+    };
+    if baseline.scan_failed {
+        return classify_completion_delta(baseline, zero_turn_zero_counts());
+    }
+    let report =
+        oulipoly_runtime::sessions::scan_provider(&baseline.provider_name, sessions_cfg, state);
+    if scan_report_has_errors(&report) {
+        return ZeroTurnClassification::UnclassifiedScanFailed;
+    }
+    classify_from_turn_count_result(
+        baseline,
+        state.count_session_turns(&baseline.provider_name, session_id),
+    )
+}
+
+fn zero_turn_classification_is_non_productive(c: &ZeroTurnClassification) -> bool {
+    matches!(
+        c,
+        ZeroTurnClassification::MaybeQuotaExhausted { .. }
+            | ZeroTurnClassification::UnclassifiedNoSessionId
+            | ZeroTurnClassification::UnclassifiedScanFailed
+    )
+}
+
+fn zero_turn_classification_for_action(
+    classification: ZeroTurnClassification,
+    result: &executor::ExecutionResult,
+    provider_name: &str,
+    provider_session_id: Option<&str>,
+) -> ZeroTurnClassification {
+    if zero_turn_classification_is_non_productive(&classification) {
+        return classification;
+    }
+    if zero_turn_completion_can_replace_signal(&result.terminal_signal)
+        && let Some(session_id) = provider_session_id
+    {
+        let baseline = record_baseline(
+            provider_name,
+            Some(session_id),
+            Some(zero_turn_zero_counts()),
+            false,
+        );
+        return classify_completion_delta(&baseline, zero_turn_zero_counts());
+    }
+    classification
+}
+
+fn zero_turn_completion_can_replace_signal(signal: &Option<executor::TerminalSignal>) -> bool {
+    signal
+        .as_ref()
+        .is_some_and(|signal| signal.kind == TerminalSignalKind::MaybeQuotaExhausted)
+}
+
+fn build_maybe_quota_exhausted_signal(
+    provider_name: &str,
+    evidence: &ZeroTurnEvidence,
+) -> executor::TerminalSignal {
+    executor::TerminalSignal {
+        kind: TerminalSignalKind::MaybeQuotaExhausted,
+        provider_name: provider_name.to_string(),
+        evidence: evidence.evidence.clone(),
+        observed_at: std::time::SystemTime::now(),
+    }
+}
+
+fn apply_zero_turn_classification_to_signal_fields(
+    terminal_signal: &mut Option<executor::TerminalSignal>,
+    terminal_reason: &mut Option<String>,
+    provider_name: &str,
+    classification: &ZeroTurnClassification,
+) {
+    match classification {
+        ZeroTurnClassification::Productive => {
+            if zero_turn_completion_can_replace_signal(terminal_signal) {
+                *terminal_signal = None;
+                *terminal_reason = None;
+            }
+        }
+        ZeroTurnClassification::MaybeQuotaExhausted { evidence } => {
+            if !zero_turn_completion_can_replace_signal(terminal_signal) {
+                return;
+            }
+            *terminal_signal = Some(build_maybe_quota_exhausted_signal(provider_name, evidence));
+            *terminal_reason = Some("maybe_quota_exhausted".to_string());
+        }
+        ZeroTurnClassification::UnclassifiedNoSessionId
+        | ZeroTurnClassification::UnclassifiedScanFailed => {}
+    }
+}
+
+fn apply_zero_turn_classification_to_result(
+    result: &mut executor::ExecutionResult,
+    provider_name: &str,
+    classification: &ZeroTurnClassification,
+) {
+    apply_zero_turn_classification_to_signal_fields(
+        &mut result.terminal_signal,
+        &mut result.terminal_reason,
+        provider_name,
+        classification,
+    );
+}
+
+fn provider_session_marker_uuid(provider_session_id: Option<&str>) -> Option<Uuid> {
+    provider_session_id.and_then(|session_id| Uuid::parse_str(session_id).ok())
+}
+
 fn resume_result_error_category(
     agent_runtime_services: &wiring::AgentRuntimeServices,
     result: &executor::ExecutionResult,
@@ -3329,6 +3659,41 @@ fn balanced_executor_request(input: BalancedExecutorRequestInput<'_>) -> Executo
     }
 }
 
+fn is_confirmed_zero_turn_exhaustion(
+    action: ZeroTurnAction,
+    signal: &Option<executor::TerminalSignal>,
+) -> bool {
+    matches!(action, ZeroTurnAction::ConfirmedExhaustion)
+        && zero_turn_completion_can_replace_signal(signal)
+}
+
+fn format_quota_retry_budget_exhausted(model_name: &str, max_attempts: usize) -> String {
+    format!(
+        "quota-exhausted retry budget exhausted for pool {model_name} after {max_attempts} attempts"
+    )
+}
+
+fn zero_turn_late_bind_baseline(
+    sessions_cfg: &oulipoly_config::SessionsConfig,
+    provider_name: &str,
+    session_id: &str,
+) -> ZeroTurnBaseline {
+    let has_source = has_session_source(sessions_cfg, provider_name);
+    record_baseline(
+        provider_name,
+        Some(session_id),
+        has_source.then(zero_turn_zero_counts),
+        !has_source,
+    )
+}
+
+fn should_defer_generic_exit(
+    all_models: &HashMap<String, ModelConfig>,
+    result: &executor::ExecutionResult,
+) -> bool {
+    diagnostics_model_configured(all_models) || !result.returned_artifacts.is_empty()
+}
+
 fn run_with_balancing(
     agent_runtime_services: &wiring::AgentRuntimeServices,
     state_db_opener: &dyn StateDbOpener,
@@ -3355,8 +3720,10 @@ fn run_with_balancing(
     // (matches contract `tmp/01-pr-a-contract.md` lifecycle ordering).
     let parent_invocation_id = resolve_parent_invocation_id(&env.state);
     // Source guard marker: resolve_parent_invocation_id(&state)
-    let max_attempts = model.providers.len().max(1);
+    let max_attempts = model.providers.len().max(1) + 1;
     let mut attempts = 0usize;
+    let mut zero_turn_confirmation = ZeroTurnConfirmationState::new();
+    let mut pending_same_provider_verification: Option<(usize, Option<String>)> = None;
 
     loop {
         if attempts >= max_attempts {
@@ -3369,16 +3736,21 @@ fn run_with_balancing(
                 },
             ) {
                 Err(err) => Err(err.to_string()),
-                Ok(_) => Err(format!(
-                    "quota-exhausted retry budget exhausted for pool {} after {max_attempts} attempts",
-                    model.name
+                Ok(_) => Err(format_quota_retry_budget_exhausted(
+                    &model.name,
+                    max_attempts,
                 )),
             };
         }
         attempts += 1;
 
-        let provider_index =
-            select_balanced_provider_index(agent_runtime_services, model, &env.state, &ctx)?;
+        let pending_verification = pending_same_provider_verification.take();
+        let provider_index = match pending_verification.as_ref() {
+            Some((provider_index, _)) => *provider_index,
+            None => {
+                select_balanced_provider_index(agent_runtime_services, model, &env.state, &ctx)?
+            }
+        };
         let (provider, prompt_mode) =
             effective_model_for_execution(model, provider_index, &env.providers_cfg)?;
         let provider_name = &provider.name;
@@ -3399,11 +3771,19 @@ fn run_with_balancing(
             .map_err(|err| err.to_string())?
             .invocation_row_id;
         let mut guard = FinalizerGuard::new(&env.state, invocation_row_id);
-        let start_known_provider_session_id =
-            executor::cli::start_known_provider_session_id(&provider)?;
+        let start_known_provider_session_id = match pending_verification {
+            Some((_, session_id)) => session_id,
+            None => executor::cli::start_known_provider_session_id(&provider)?,
+        };
         bind_start_known_provider_session_if_present(
             &env.state,
             invocation_row_id,
+            start_known_provider_session_id.as_deref(),
+        );
+        let mut zero_turn_baseline = zero_turn_record_baseline(
+            &env.state,
+            &env.sessions_cfg,
+            provider_name,
             start_known_provider_session_id.as_deref(),
         );
         let invocation_env = serde_json::to_string(&invocation)
@@ -3469,24 +3849,130 @@ fn run_with_balancing(
             }
         };
         apply_age153_terminal_signal_fixture_override(&mut result);
+        let zero_turn_provider_session_id = start_known_provider_session_id
+            .clone()
+            .or_else(|| result.session_capture.session_id.clone());
+        if zero_turn_baseline.provider_session_id.is_none()
+            && let Some(session_id) = zero_turn_provider_session_id.as_deref()
+        {
+            zero_turn_baseline =
+                zero_turn_late_bind_baseline(&env.sessions_cfg, provider_name, session_id);
+        }
+        let zero_turn_classification =
+            zero_turn_classify_after_completion(&env.state, &env.sessions_cfg, &zero_turn_baseline);
+        apply_zero_turn_classification_to_result(
+            &mut result,
+            provider_name,
+            &zero_turn_classification,
+        );
+        let zero_turn_action = next_action(
+            &mut zero_turn_confirmation,
+            zero_turn_classification_for_action(
+                zero_turn_classification,
+                &result,
+                provider_name,
+                zero_turn_provider_session_id.as_deref(),
+            ),
+        );
 
         emit_captured_child_marker_lines(&result.captured_child_invocations);
 
         let invocation_uuid =
             Uuid::parse_str(&invocation.id).expect("generated invocation id must be a UUID");
         let mut terminal_signal_stderr = std::io::stderr();
+        let terminal_session_uuid =
+            provider_session_marker_uuid(zero_turn_provider_session_id.as_deref());
         let mut terminal_signal_ctx = TerminalSignalContext {
             invocation_id: &invocation_uuid,
-            session_id: None,
+            session_id: terminal_session_uuid.as_ref(),
             provider: provider_name,
             state_db: &env.state,
             stderr: &mut terminal_signal_stderr,
         };
-        let should_defer_generic_exit =
-            diagnostics_model_configured(all_models) || !result.returned_artifacts.is_empty();
+        let should_defer_generic_exit = should_defer_generic_exit(all_models, &result);
         let balanced_terminal_signal =
             balanced_terminal_signal_for_outcome(&result, should_defer_generic_exit);
-        match apply_terminal_signal_outcome(&balanced_terminal_signal, &mut terminal_signal_ctx) {
+        let terminal_signal_disposition =
+            if is_confirmed_zero_turn_exhaustion(zero_turn_action, &balanced_terminal_signal) {
+                let signal = balanced_terminal_signal
+                    .as_ref()
+                    .expect("confirmed zero-turn action requires a maybe signal");
+                let _ = confirm_maybe_quota_exhausted(signal, &mut terminal_signal_ctx);
+                TerminalSignalDisposition::MaybeQuotaVerify
+            } else {
+                apply_terminal_signal_outcome(&balanced_terminal_signal, &mut terminal_signal_ctx)
+            };
+        match terminal_signal_disposition {
+            TerminalSignalDisposition::MaybeQuotaVerify => {
+                let terminal_reason = terminal_signal_reason(
+                    &result.terminal_signal,
+                    result.terminal_reason.as_deref(),
+                )
+                .unwrap_or("maybe_quota_exhausted");
+                supervise_captured_child_invocations(
+                    &env.state,
+                    invocation_row_id,
+                    &result.captured_child_invocations,
+                    Some(terminal_reason),
+                );
+                if let executor::SessionCaptureMethod::Failed(reason) =
+                    &result.session_capture.method
+                {
+                    eprintln!("[session-capture] {reason}");
+                }
+                env.state
+                    .update_session_capture(
+                        invocation_row_id,
+                        result.session_capture.session_id.as_deref(),
+                        result.session_capture.method.db_value(),
+                    )
+                    .unwrap_or_else(|e| {
+                        eprintln!("Warning: Failed to update session capture: {e}")
+                    });
+                let confirmed = matches!(zero_turn_action, ZeroTurnAction::ConfirmedExhaustion);
+                agent_runtime_services
+                    .invocation_lifecycle_service
+                    .finalize_invocation(InvocationLifecycleFinalizeRequest {
+                        state: &env.state,
+                        invocation_row_id,
+                        success: false,
+                        exit_code: result.exit_code,
+                        error_category: confirmed.then_some("quota_exhausted"),
+                        terminal_reason: Some(terminal_reason),
+                    })
+                    .map(|_| ())
+                    .unwrap_or_else(|e| eprintln!("Warning: Failed to finalize invocation: {e}"));
+                guard.mark_finalized();
+                env.state
+                    .increment_calls_since_refresh(provider_name)
+                    .unwrap_or_else(|e| eprintln!("Warning: Failed to bump quota tick: {e}"));
+                match zero_turn_action {
+                    ZeroTurnAction::VerifySameProvider => {
+                        pending_same_provider_verification =
+                            Some((provider_index, zero_turn_provider_session_id.clone()));
+                        continue;
+                    }
+                    ZeroTurnAction::ConfirmedExhaustion => {
+                        if confirmed && attempts < max_attempts {
+                            eprintln!(
+                                "[routing] provider {provider_name} returned quota_exhausted; retrying another provider"
+                            );
+                        }
+                        continue;
+                    }
+                    ZeroTurnAction::Continue | ZeroTurnAction::Unclassified => {
+                        emit_result_envelope(
+                            &invocation.id,
+                            false,
+                            result.exit_code,
+                            None,
+                            Some(terminal_reason),
+                        );
+                        eprintln!("{}", result.stderr);
+                        return Ok(result.exit_code);
+                    }
+                }
+            }
             TerminalSignalDisposition::QuotaExhaustedRetry => {
                 let terminal_reason = terminal_signal_reason(
                     &result.terminal_signal,

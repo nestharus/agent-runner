@@ -276,6 +276,10 @@ prompt_mode = "stdin"
         .arg("--model")
         .arg("failing")
         .arg("trigger quota failure")
+        .env(
+            "OULIPOLY_AGE153_FORCE_TERMINAL_SIGNAL_KIND",
+            "QuotaExhaustedInband",
+        )
         .output()
         .unwrap();
 

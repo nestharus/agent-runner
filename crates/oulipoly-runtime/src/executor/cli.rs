@@ -1,7 +1,6 @@
 //! ## Declared roles
 //!
-//! Roles: orchestration, mapper, parser, validator, formatter, filter,
-//! accessor.
+//! `orchestration`, `mapper`, `parser`, `validator`, `formatter`, `filter`, `accessor`, `predicate`
 //!
 //! - orchestration: top-level execute / execute_effective / execute_resume /
 //!   execute_interactive entrypoints.
@@ -1739,6 +1738,7 @@ fn terminal_reason_from_signal(
     match signal.kind {
         TerminalSignalKind::ProlongedSilence => Some("bounded_silence".to_string()),
         TerminalSignalKind::QuotaExhaustedInband => Some("quota_exhausted_inband".to_string()),
+        TerminalSignalKind::MaybeQuotaExhausted => Some("maybe_quota_exhausted".to_string()),
         TerminalSignalKind::RateLimited => Some("rate_limited".to_string()),
         TerminalSignalKind::CleanExit
         | TerminalSignalKind::NonzeroExit
@@ -1753,6 +1753,7 @@ fn synthetic_exit_code(signal: &TerminalSignal) -> i32 {
         TerminalSignalKind::CleanExit => 0,
         TerminalSignalKind::ProlongedSilence
         | TerminalSignalKind::QuotaExhaustedInband
+        | TerminalSignalKind::MaybeQuotaExhausted
         | TerminalSignalKind::RateLimited
         | TerminalSignalKind::NonzeroExit
         | TerminalSignalKind::SignalExit
@@ -3122,6 +3123,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[ignore = "AGE-166: substring quota detection removed in PR #126; live text recognizer scenario no longer applies."]
     fn t11_inband_quota_recognized_live_terminates_long_running_child() {
         let script = fixture_script(
             r#"printf 'Claude usage limit reached; resets at 2026-05-18T10:00:00Z\n' >&2
@@ -3155,6 +3157,7 @@ sleep 9999"#,
 
     #[cfg(unix)]
     #[test]
+    #[ignore = "AGE-166: substring quota detection removed in PR #126; quota-text precedence scenario no longer applies."]
     fn t12_quota_precedence_over_clean_and_nonzero_exit() {
         for (exit_code, body) in [
             (

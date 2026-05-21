@@ -26,6 +26,18 @@
 //!
 //! AGE-160 serde_json residual disposition: remaining JSON calls are DB-owned artifact/config payload
 //! codecs and test assertions after marker and lifecycle JSON construction moved behind adapters.
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db.rs
+//!     role: intrinsic-surface
+//!     Domain: state_db_persistence
+//!     Owns:
+//!       - provider_quotas.exhausted_at
+//!       - count_session_turns
+//! ```
 
 mod lifecycle_log_adapter;
 mod sqlite_adapter;

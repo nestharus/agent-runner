@@ -1,3 +1,9 @@
+-- ## Declared roles
+-- `mapper`, `validator`, `accessor`
+--
+-- ## Intrinsic-surface declarations
+-- Domain: current_state_schema
+
 CREATE TABLE IF NOT EXISTS invocations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     invocation_uuid TEXT NOT NULL UNIQUE,

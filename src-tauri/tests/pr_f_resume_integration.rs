@@ -9,15 +9,15 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-struct Fixture {
-    dir: tempfile::TempDir,
-    config_home: PathBuf,
-    data_home: PathBuf,
-    models_dir: PathBuf,
+pub(crate) struct Fixture {
+    pub(crate) dir: tempfile::TempDir,
+    pub(crate) config_home: PathBuf,
+    pub(crate) data_home: PathBuf,
+    pub(crate) models_dir: PathBuf,
 }
 
 impl Fixture {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let config_home = dir.path().join("config");
         let data_home = dir.path().join("data");
@@ -33,22 +33,22 @@ impl Fixture {
         }
     }
 
-    fn db_path(&self) -> PathBuf {
+    pub(crate) fn db_path(&self) -> PathBuf {
         self.data_home
             .join("oulipoly-agent-runner")
             .join("state.db")
     }
 
-    fn open_db(&self) -> StateDb {
+    pub(crate) fn open_db(&self) -> StateDb {
         StateDb::open(&self.db_path()).unwrap()
     }
 
-    fn conn(&self) -> Connection {
+    pub(crate) fn conn(&self) -> Connection {
         let _ = self.open_db();
         Connection::open(self.db_path()).unwrap()
     }
 
-    fn write_sessions_config(&self, provider_name: &str, transcript_path: &Path) {
+    pub(crate) fn write_sessions_config(&self, provider_name: &str, transcript_path: &Path) {
         let app_config_dir = self.config_home.join("oulipoly-agent-runner");
         fs::create_dir_all(&app_config_dir).unwrap();
         fs::write(
@@ -65,7 +65,7 @@ state_dir = '{}'
         .unwrap();
     }
 
-    fn write_script(&self, name: &str, body: &str) -> PathBuf {
+    pub(crate) fn write_script(&self, name: &str, body: &str) -> PathBuf {
         let path = self.dir.path().join(name);
         fs::write(
             &path,
@@ -88,7 +88,7 @@ state_dir = '{}'
         fs::write(app_config_dir.join("providers.toml"), body).unwrap();
     }
 
-    fn write_single_provider_model(
+    pub(crate) fn write_single_provider_model(
         &self,
         model_name: &str,
         provider_name: &str,
@@ -118,7 +118,7 @@ prompt_mode = "arg"
         ));
     }
 
-    fn write_two_provider_model(
+    pub(crate) fn write_two_provider_model(
         &self,
         model_name: &str,
         provider_a_name: &str,
@@ -165,7 +165,7 @@ flag = "--resume"
         ));
     }
 
-    fn write_migratable_two_provider_model(
+    pub(crate) fn write_migratable_two_provider_model(
         &self,
         model_name: &str,
         provider_a_script: &Path,
@@ -275,7 +275,7 @@ sessions_dir = "{}"
         ));
     }
 
-    fn stage_claude_jsonl(&self, projects_dir: &Path, session_id: &str) -> PathBuf {
+    pub(crate) fn stage_claude_jsonl(&self, projects_dir: &Path, session_id: &str) -> PathBuf {
         let cwd_dir = projects_dir.join("cwd-hash-fixture");
         fs::create_dir_all(&cwd_dir).unwrap();
         let target = cwd_dir.join(format!("{session_id}.jsonl"));
@@ -289,7 +289,13 @@ sessions_dir = "{}"
         target
     }
 
-    fn seed_active_chain(&self, chain_id: &str, provider: &str, session_id: &str, model: &str) {
+    pub(crate) fn seed_active_chain(
+        &self,
+        chain_id: &str,
+        provider: &str,
+        session_id: &str,
+        model: &str,
+    ) {
         let conn = self.conn();
         conn.execute(
             "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
@@ -306,7 +312,7 @@ sessions_dir = "{}"
         .unwrap();
     }
 
-    fn seed_quota_window(&self, provider: &str, used_percent: f64) {
+    pub(crate) fn seed_quota_window(&self, provider: &str, used_percent: f64) {
         let conn = self.conn();
         let refreshed_at = Utc::now().to_rfc3339();
         let resets_at = (Utc::now() + Duration::hours(24)).to_rfc3339();
@@ -337,7 +343,7 @@ sessions_dir = "{}"
         .unwrap();
     }
 
-    fn active_segment(&self, chain_id: &str) -> (String, String) {
+    pub(crate) fn active_segment(&self, chain_id: &str) -> (String, String) {
         self.conn()
             .query_row(
                 "SELECT provider_name, session_id
@@ -361,7 +367,12 @@ sessions_dir = "{}"
         cmd
     }
 
-    fn seed_session_turns(&self, provider_name: &str, session_id: &str, turns: &[(&str, &str)]) {
+    pub(crate) fn seed_session_turns(
+        &self,
+        provider_name: &str,
+        session_id: &str,
+        turns: &[(&str, &str)],
+    ) {
         let db = self.open_db();
         let turns: Vec<SessionTurnIngest> = turns
             .iter()
@@ -400,7 +411,7 @@ sessions_dir = "{}"
         self.base_repl_command(model_name, resume).output().unwrap()
     }
 
-    fn base_resume_command(&self, model_name: &str, session_id: &str) -> Command {
+    pub(crate) fn base_resume_command(&self, model_name: &str, session_id: &str) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
         cmd.arg("resume")
             .arg("-m")
@@ -416,7 +427,11 @@ sessions_dir = "{}"
         cmd
     }
 
-    fn base_top_level_resume_command(&self, model_name: &str, session_id: &str) -> Command {
+    pub(crate) fn base_top_level_resume_command(
+        &self,
+        model_name: &str,
+        session_id: &str,
+    ) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
         cmd.arg("-m")
             .arg(model_name)
@@ -450,7 +465,7 @@ fn ts(value: &str) -> DateTime<Utc> {
         .with_timezone(&Utc)
 }
 
-fn parse_invocation(stderr: &str) -> CompositeInvocationId {
+pub(crate) fn parse_invocation(stderr: &str) -> CompositeInvocationId {
     let lines: Vec<&str> = stderr
         .lines()
         .filter(|line| line.starts_with("OULIPOLY_INVOCATION="))
@@ -496,7 +511,7 @@ fn parse_session_json(stderr: &str, invocation_uuid: &str) -> Value {
     value
 }
 
-fn invocation_dual_id_columns(
+pub(crate) fn invocation_dual_id_columns(
     fixture: &Fixture,
     invocation_uuid: &str,
 ) -> (Option<String>, Option<String>, Option<String>) {
@@ -606,7 +621,7 @@ fn assert_invocation_session(fixture: &Fixture, invocation_uuid: &str, expected_
     assert_eq!(row.session_capture_method.as_deref(), Some("resumed"));
 }
 
-fn session_turn_count(fixture: &Fixture, provider: &str, session_id: &str) -> i64 {
+pub(crate) fn session_turn_count(fixture: &Fixture, provider: &str, session_id: &str) -> i64 {
     fixture
         .conn()
         .query_row(

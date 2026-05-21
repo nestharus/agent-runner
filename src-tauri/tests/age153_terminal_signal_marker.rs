@@ -22,7 +22,13 @@ fn terminal_signal_marker_is_stderr_key_json_with_four_fields_and_once() {
         ),
     ]);
 
-    let output = fixture.run_one_shot("age153-marker");
+    let output = fixture.run_one_shot_with_env(
+        "age153-marker",
+        &[(
+            "OULIPOLY_AGE153_FORCE_TERMINAL_SIGNAL_KIND",
+            "QuotaExhaustedInband,None",
+        )],
+    );
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert_no_terminal_marker_on_stdout(&output);
@@ -40,6 +46,7 @@ fn terminal_signal_marker_is_stderr_key_json_with_four_fields_and_once() {
 }
 
 #[test]
+#[ignore = "AGE-163 removed the bounded_silence supervisor; OULIPOLY_TEST_BOUNDED_SILENCE_MS is no longer honored and prolonged_silence_body hangs without a kill path."]
 fn typed_signal_handled_path_finalizes_explicitly_not_guard_drop() {
     let fixture = Age153Fixture::new();
     let marker = fixture.dir.path().join("guard-path-prolonged-silence.txt");

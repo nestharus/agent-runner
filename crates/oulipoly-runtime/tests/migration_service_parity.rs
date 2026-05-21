@@ -264,9 +264,7 @@ fn migration_service_decision_failure_is_dependency_error() {
     // been removed. A `decide_migration` failure now bubbles up as a typed
     // `ServiceError::Dependency` so the caller can render an
     // operator-visible diagnostic.
-    let err = output
-        .err()
-        .expect("expected ServiceError::Dependency, got Ok");
+    let err = output.expect_err("expected ServiceError::Dependency, got Ok");
     let message = match err {
         oulipoly_runtime::services::ServiceError::Dependency { message } => message,
         other => panic!("expected ServiceError::Dependency, got {other:?}"),

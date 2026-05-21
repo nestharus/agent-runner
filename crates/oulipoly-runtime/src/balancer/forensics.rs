@@ -39,7 +39,8 @@ impl FailureClass {
             TerminalSignalKind::CleanExit
             | TerminalSignalKind::NonzeroExit
             | TerminalSignalKind::SignalExit
-            | TerminalSignalKind::Unknown => None,
+            | TerminalSignalKind::Unknown
+            | TerminalSignalKind::MaybeQuotaExhausted => None,
         }
     }
 
@@ -94,6 +95,22 @@ mod tests {
         assert_eq!(
             FailureClass::from_terminal_signal_kind(TerminalSignalKind::RateLimited),
             Some(FailureClass::TransientStderrNoise)
+        );
+    }
+
+    #[test]
+    fn failure_class_from_unknown_maps_to_none() {
+        assert_eq!(
+            FailureClass::from_terminal_signal_kind(TerminalSignalKind::Unknown),
+            None
+        );
+    }
+
+    #[test]
+    fn failure_class_from_maybe_quota_exhausted_maps_to_none() {
+        assert_eq!(
+            FailureClass::from_terminal_signal_kind(TerminalSignalKind::MaybeQuotaExhausted),
+            None
         );
     }
 
