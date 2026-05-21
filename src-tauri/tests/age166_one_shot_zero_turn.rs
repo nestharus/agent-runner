@@ -561,3 +561,123 @@ fn quota_exhausted_inband_semantics_regression_e2e() {
     );
     assert_eq!(line_count(&sibling_marker), 1);
 }
+
+// AGE-166 F3: when the openai_compat provider IS configured with
+// `session_capture.forced_flag_verified` (so a session id is known
+// at start), zero-turn detection wires through to MaybeQuotaExhausted +
+// VerifySameProvider exactly like the claude path.
+//
+// The provider name does not start with "claude" or "codex" so
+// `ProviderRecognizer::for_provider` routes to OpenAiCompat.
+#[test]
+fn one_shot_openai_compat_first_zero_turn_resumes_same_provider_without_exhausted_write() {
+    let fixture = Age153Fixture::new();
+    let transcript = fixture
+        .dir
+        .path()
+        .join("one-shot-oai-compat-first-zero-turn.jsonl");
+    fs::write(&transcript, "").unwrap();
+    let marker = fixture
+        .dir
+        .path()
+        .join("one-shot-oai-compat-first-zero-turn.txt");
+    let counter = fixture
+        .dir
+        .path()
+        .join("one-shot-oai-compat-first-zero-turn-count.txt");
+    let provider = fixture.write_script(
+        "one-shot-oai-compat-first-zero-turn.sh",
+        &zero_turn_then_assistant_turn_capture_body(&marker, &transcript, &counter),
+    );
+    write_capture_pool(
+        &fixture,
+        "age166-oai-compat-first-zero-turn",
+        &[("openai-compat-age166-zt-a", &provider)],
+        &[("openai-compat-age166-zt-a", &transcript)],
+    );
+
+    let output = fixture.run_one_shot_with_env(
+        "age166-oai-compat-first-zero-turn",
+        &[(FORCE_KIND, "MaybeQuotaExhausted")],
+    );
+
+    assert_no_terminal_marker_on_stdout(&output);
+    let (_, stderr) = output_text(&output);
+    assert_maybe_marker_with_zero_turn_evidence(&stderr);
+    assert_eq!(
+        latest_invocation_terminal_reason(&fixture, "openai-compat-age166-zt-a").as_deref(),
+        None
+    );
+    assert_eq!(fixture.exhausted_row_count("openai-compat-age166-zt-a"), 0);
+    let sessions = provider_invocation_sessions(&fixture, "openai-compat-age166-zt-a");
+    assert_eq!(sessions.len(), 2, "{sessions:?}");
+    assert!(sessions[0].is_some(), "{sessions:?}");
+    assert_eq!(sessions[1], sessions[0], "{sessions:?}");
+    assert_eq!(line_count(&marker), 2);
+}
+
+// AGE-166 F3: second consecutive zero-turn on an openai_compat provider
+// (with session_capture) confirms quota exhaustion and migrates exactly
+// like the claude path. Proves the confirmation key carries the openai_compat
+// provider identity and `mark_provider_exhausted` flips `exhausted_at`.
+#[test]
+fn one_shot_openai_compat_second_zero_turn_confirms_quota_and_migrates() {
+    let fixture = Age153Fixture::new();
+    let first_transcript = fixture.dir.path().join("one-shot-oai-compat-second-a.jsonl");
+    let sibling_transcript = fixture.dir.path().join("one-shot-oai-compat-second-b.jsonl");
+    fs::write(&first_transcript, "").unwrap();
+    fs::write(&sibling_transcript, "").unwrap();
+    let first_marker = fixture.dir.path().join("one-shot-oai-compat-second-a.txt");
+    let sibling_marker = fixture.dir.path().join("one-shot-oai-compat-second-b.txt");
+    let first = fixture.write_script(
+        "one-shot-oai-compat-second-a.sh",
+        &zero_turn_capture_body(&first_marker, 1),
+    );
+    let sibling = fixture.write_script(
+        "one-shot-oai-compat-second-b.sh",
+        &assistant_turn_stdout_capture_body(
+            &sibling_marker,
+            &sibling_transcript,
+            "sibling openai-compat provider ran",
+            23,
+        ),
+    );
+    write_capture_pool(
+        &fixture,
+        "age166-oai-compat-second-zero-turn",
+        &[
+            ("openai-compat-age166-zt-a", &first),
+            ("openai-compat-age166-zt-b", &sibling),
+        ],
+        &[
+            ("openai-compat-age166-zt-a", &first_transcript),
+            ("openai-compat-age166-zt-b", &sibling_transcript),
+        ],
+    );
+
+    let output = fixture.run_one_shot_with_env(
+        "age166-oai-compat-second-zero-turn",
+        &[(FORCE_KIND, "MaybeQuotaExhausted")],
+    );
+
+    assert_no_terminal_marker_on_stdout(&output);
+    let (_, stderr) = output_text(&output);
+    assert_maybe_marker_with_zero_turn_evidence(&stderr);
+    assert_eq!(fixture.exhausted_row_count("openai-compat-age166-zt-a"), 1);
+    assert_eq!(
+        failed_invocation_error_category(
+            &fixture,
+            "openai-compat-age166-zt-a",
+            "maybe_quota_exhausted"
+        )
+        .as_deref(),
+        Some("quota_exhausted")
+    );
+    let sessions = provider_invocation_sessions(&fixture, "openai-compat-age166-zt-a");
+    assert_eq!(sessions.len(), 2, "{sessions:?}");
+    assert!(sessions[0].is_some(), "{sessions:?}");
+    assert_eq!(sessions[1], sessions[0], "{sessions:?}");
+    assert_eq!(line_count(&first_marker), 2);
+    assert_eq!(line_count(&sibling_marker), 1);
+    assert_eq!(output.status.code(), Some(23), "{output:?}");
+}
