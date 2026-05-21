@@ -2,6 +2,10 @@
 //! `providers.toml`) that hits the provider's usage API and prints JSON on
 //! stdout. The parsed reading lands in `provider_quotas` + `provider_quota_windows`.
 
+pub mod marker_verification;
+
+pub use marker_verification::verify_or_clear_marker;
+
 use crate::services::{QuotaServiceOutput, QuotaServicePort, QuotaServiceRequest, ServiceError};
 use chrono::{DateTime, Utc};
 use oulipoly_config::{ProviderEntry, ProvidersConfig, SessionStorage, SessionsConfig};

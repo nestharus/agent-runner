@@ -44,7 +44,7 @@ pub use forensics::{FailureClass, apply_post_failure_forensics};
 use crate::migration::{MigrationError, provider_has_derivable_claude_projects_dir};
 use crate::quota::{
     InFlight, RefreshOutcome, has_refresh_source, is_routing_stale, is_stale,
-    is_topology_probe_due, refresh_provider, refresh_provider_for_routing,
+    is_topology_probe_due, refresh_provider, refresh_provider_for_routing, verify_or_clear_marker,
 };
 use crate::sessions::scan_provider;
 use chrono::{DateTime, Utc};
@@ -188,11 +188,29 @@ pub fn select_provider(
 
 fn refresh_routing_inputs(model: &ModelConfig, state: &StateDb, ctx: Option<&BalanceContext<'_>>) {
     if let Some(ctx) = ctx {
+        let now = Utc::now();
         for provider in &model.providers {
+            verify_provider_marker_before_routing(provider, state, ctx, now);
             refresh_provider_for_stale_routing(provider, state, ctx);
             scan_provider_for_routing(provider, state, ctx);
         }
     }
+}
+
+fn verify_provider_marker_before_routing(
+    provider: &ProviderConfig,
+    state: &StateDb,
+    ctx: &BalanceContext<'_>,
+    now: DateTime<Utc>,
+) {
+    verify_or_clear_marker(
+        state,
+        ctx.providers_cfg,
+        ctx.sessions_cfg,
+        ctx.in_flight,
+        &provider.name,
+        now,
+    );
 }
 
 fn refresh_provider_for_stale_routing(
@@ -557,10 +575,21 @@ fn provider_is_quota_exhausted(
         .is_some()
         || quota
             .and_then(|quota| quota.next_available_at)
-            .is_some_and(|ts| ts > now)
+            .is_some_and(|ts| marker_blocks_routing(ts, now))
         || windows
             .iter()
             .any(|window| window.resets_at > now && window.used_percent >= EXHAUSTED_USED_PERCENT)
+}
+
+/// Honour `next_available_at` only while it's more than the release-slack
+/// window in the future. Markers inside the slack window are treated as
+/// expired so the next dispatch can probe the provider rather than wait
+/// for the exact release timestamp (clock skew + cooldown bookkeeping).
+/// Reads `OULIPOLY_MARKER_RELEASE_SLACK_SECS` via the shared helper so
+/// cached-only routing (`ctx=None`) matches the verify path's slack.
+fn marker_blocks_routing(next_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    next_at
+        > now + chrono::Duration::seconds(crate::quota::marker_verification::release_slack_secs())
 }
 
 fn reset_implied(
@@ -2674,6 +2703,139 @@ mod tests {
             "failed session scans should leave provider a's stale zero-turn projection in place"
         );
         assert_eq!(db.count_assistant_turns_since("a", None).unwrap(), 0);
+    }
+
+    /// Stale `next_available_at` on a provider whose live `--usage` shows
+    /// healthy windows must be cleared by `select_provider` so the provider
+    /// becomes routable. Verifies the verify-before-honour path runs as
+    /// part of `refresh_routing_inputs` and clears markers that survived a
+    /// `write_quota_aggregate` (which clears `exhausted_at` but not
+    /// `next_available_at`).
+    #[test]
+    fn select_provider_clears_stale_next_available_at_when_refresh_shows_healthy() {
+        let _lock_dir = tempfile::tempdir().unwrap();
+        let _env_guard = crate::quota::marker_verification::test_support::EnvGuard::set(
+            "OULIPOLY_DATA_HOME",
+            _lock_dir.path(),
+        );
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = two_provider_model();
+        // Provider "a" has a stuck UpstreamApiDown marker far in the future;
+        // provider "b" is fine. Without verify-before-honour, "a" would be
+        // filtered out and "b" would always win.
+        db.record_provider_unavailable(
+            "a",
+            Some(Utc::now() + Duration::hours(2)),
+            "UpstreamApiDown",
+        )
+        .unwrap();
+        let providers_cfg = providers_config_with_scripts(&[
+            (
+                "a",
+                r#"echo '{"windows":[{"used_percent":3,"resets_at":"2099-01-01T00:00:00Z"}]}'"#,
+            ),
+            (
+                "b",
+                r#"echo '{"windows":[{"used_percent":4,"resets_at":"2099-01-01T00:00:00Z"}]}'"#,
+            ),
+        ]);
+        let sessions_cfg = SessionsConfig::default();
+        let in_flight = InFlight::new();
+        let ctx = BalanceContext {
+            providers_cfg: &providers_cfg,
+            sessions_cfg: &sessions_cfg,
+            in_flight: &in_flight,
+        };
+
+        let _ = select_provider(&model, &db, Some(&ctx)).unwrap();
+
+        let quota = db.get_quota("a").unwrap().expect("row written by refresh");
+        assert!(
+            quota.next_available_at.is_none(),
+            "verify-before-honour must clear stale marker after a healthy refresh"
+        );
+        assert!(quota.failure_class.is_none());
+    }
+
+    /// Stale `next_available_at` on a provider whose refreshed live windows
+    /// show >=100% used must NOT be cleared. The marker still represents
+    /// real exhaustion; clearing it would route into a known-bad provider.
+    #[test]
+    fn select_provider_keeps_marker_when_refresh_shows_exhausted_window() {
+        let _lock_dir = tempfile::tempdir().unwrap();
+        let _env_guard = crate::quota::marker_verification::test_support::EnvGuard::set(
+            "OULIPOLY_DATA_HOME",
+            _lock_dir.path(),
+        );
+        let db = StateDb::open(Path::new(":memory:")).unwrap();
+        let model = two_provider_model();
+        let marker_at = Utc::now() + Duration::hours(2);
+        db.record_provider_unavailable("a", Some(marker_at), "RollingWindow5h")
+            .unwrap();
+        let providers_cfg = providers_config_with_scripts(&[
+            (
+                "a",
+                r#"echo '{"windows":[{"used_percent":100,"resets_at":"2099-01-01T00:00:00Z"}]}'"#,
+            ),
+            (
+                "b",
+                r#"echo '{"windows":[{"used_percent":2,"resets_at":"2099-01-01T00:00:00Z"}]}'"#,
+            ),
+        ]);
+        let sessions_cfg = SessionsConfig::default();
+        let in_flight = InFlight::new();
+        let ctx = BalanceContext {
+            providers_cfg: &providers_cfg,
+            sessions_cfg: &sessions_cfg,
+            in_flight: &in_flight,
+        };
+
+        let selected = select_provider(&model, &db, Some(&ctx)).unwrap();
+
+        assert_eq!(
+            selected, 1,
+            "a still exhausted (refresh confirms 100%) — routing must pick b"
+        );
+        let quota = db.get_quota("a").unwrap().expect("row exists");
+        assert_eq!(
+            quota.next_available_at,
+            Some(marker_at),
+            "marker must survive a refresh that confirms exhaustion"
+        );
+    }
+
+    /// `provider_is_quota_exhausted` must honour the release-time slack —
+    /// markers within `MARKER_RELEASE_SLACK_SECS` of their stated release
+    /// are treated as expired even in cached-only mode. This is the
+    /// speculative-retry behaviour the routing layer relies on when the
+    /// verify path is not taken (e.g. async handlers passing `ctx=None`).
+    #[test]
+    fn provider_is_quota_exhausted_respects_release_slack() {
+        let now = Utc::now();
+        let quota_within_slack = QuotaRecord {
+            provider_name: "a".to_string(),
+            calls_since_refresh: 0,
+            refreshed_at: None,
+            exhausted_at: None,
+            topology_peak_live_window_count: 0,
+            last_topology_probe_at: None,
+            next_available_at: Some(now + Duration::seconds(30)),
+            last_refresh_at: None,
+            failure_class: Some("UpstreamApiDown".to_string()),
+        };
+        assert!(
+            !provider_is_quota_exhausted(Some(&quota_within_slack), &[], now),
+            "marker within slack window must not pin the provider as exhausted"
+        );
+
+        let quota_beyond_slack = QuotaRecord {
+            next_available_at: Some(now + Duration::hours(1)),
+            ..quota_within_slack
+        };
+        assert!(
+            provider_is_quota_exhausted(Some(&quota_beyond_slack), &[], now),
+            "marker well beyond slack window must keep provider exhausted"
+        );
     }
 
     #[test]
