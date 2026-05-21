@@ -36,7 +36,7 @@ use oulipoly_config::{
     InputType, ModelConfig, PromptMode, ProviderConfig, ResumeKind, ResumeStrategy, SessionCapture,
     SessionCaptureKind, ToolRestrictionKind,
 };
-use oulipoly_state::CompositeInvocationId;
+use oulipoly_state::invocation_marker::{CompositeInvocationId, INVOCATION_MARKER_PREFIX};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -2564,7 +2564,7 @@ fn captured_child_invocation_from_line(line: &str) -> Option<CapturedChildInvoca
 }
 
 fn captured_child_composite_id(line: &str) -> Option<CompositeInvocationId> {
-    let raw = line.strip_prefix("OULIPOLY_INVOCATION=")?;
+    let raw = line.strip_prefix(INVOCATION_MARKER_PREFIX)?;
     CompositeInvocationId::parse_env_value(raw).ok()
 }
 
