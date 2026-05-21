@@ -118,7 +118,10 @@ pub fn classify_completion_delta(
     };
 
     let current_assistant_turns = end_count.assistant;
-    let new_assistant_turns = current_assistant_turns.saturating_sub(baseline_assistant_turns);
+    let Some(new_assistant_turns) = current_assistant_turns.checked_sub(baseline_assistant_turns)
+    else {
+        return ZeroTurnClassification::UnclassifiedScanFailed;
+    };
     if new_assistant_turns == 0 {
         return ZeroTurnClassification::MaybeQuotaExhausted {
             evidence: ZeroTurnEvidence {
@@ -248,6 +251,17 @@ mod tests {
             classify_completion_delta(&baseline(Some("session-1"), Some(3)), counts(4));
 
         assert_eq!(classification, ZeroTurnClassification::Productive);
+    }
+
+    #[test]
+    fn classify_completion_delta_turn_count_regression_is_unclassified() {
+        let classification =
+            classify_completion_delta(&baseline(Some("session-1"), Some(3)), counts(2));
+
+        assert_eq!(
+            classification,
+            ZeroTurnClassification::UnclassifiedScanFailed
+        );
     }
 
     #[test]
