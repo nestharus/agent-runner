@@ -55,9 +55,9 @@ use oulipoly_state::{
 };
 
 use clap::Parser;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::io::{IsTerminal, Read, Write as _};
+use std::io::{BufRead, IsTerminal, Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use tracing_subscriber::EnvFilter;
@@ -292,6 +292,28 @@ fn format_agent_prompt(agent: &AgentConfig, raw_prompt: String) -> String {
     } else {
         format!("{}\n\n{}", agent.instructions, raw_prompt)
     }
+}
+
+fn format_agent_prompt_with_inputs(
+    agent: &AgentConfig,
+    raw_prompt: String,
+    inputs: &HashMap<String, Vec<String>>,
+) -> Result<String, String> {
+    let prompt = format_agent_prompt(agent, raw_prompt);
+    if inputs.is_empty() {
+        return Ok(prompt);
+    }
+
+    let input_block = render_agent_inputs(inputs)?;
+    Ok(format!(
+        "{prompt}\n\n## Operator Inputs\n\n```json\n{input_block}\n```"
+    ))
+}
+
+fn render_agent_inputs(inputs: &HashMap<String, Vec<String>>) -> Result<String, String> {
+    let ordered: BTreeMap<_, _> = inputs.iter().collect();
+    serde_json::to_string_pretty(&ordered)
+        .map_err(|e| format!("Failed to render agent inputs: {e}"))
 }
 
 fn run(cli: Cli) -> Result<i32, String> {
@@ -589,7 +611,8 @@ fn run_agent_cli(
     let agent = resolve_agent(cli, &agent_config)?;
     let model = lookup_agent_model(&context.models, &agent)?;
     let raw_prompt = resolve_prompt(cli, false)?;
-    let full_prompt = format_agent_prompt(&agent, raw_prompt);
+    let full_prompt = format_agent_prompt_with_inputs(&agent, raw_prompt, &context.extra_inputs)?;
+    let provider_inputs = HashMap::new();
     run_with_balancing(
         agent_runtime_services,
         &context.state_db_opener,
@@ -597,7 +620,7 @@ fn run_agent_cli(
         &full_prompt,
         &context.models,
         context.working_dir.as_deref(),
-        &context.extra_inputs,
+        &provider_inputs,
     )
 }
 
@@ -5955,6 +5978,36 @@ mod tests {
             err,
             "Invalid input format 'not-key-value': expected KEY=VALUE"
         );
+    }
+
+    #[test]
+    fn format_agent_prompt_with_inputs_appends_sorted_json_contract_block() {
+        let agent = AgentConfig {
+            name: "linear-operator".to_string(),
+            description: String::new(),
+            model: "claude-opus".to_string(),
+            output_format: String::new(),
+            instructions: "# Linear Operator\n\nDo the task.".to_string(),
+        };
+        let mut inputs = HashMap::new();
+        inputs.insert("task".to_string(), vec!["create".to_string()]);
+        inputs.insert(
+            "label".to_string(),
+            vec!["bug".to_string(), "runtime".to_string()],
+        );
+
+        let prompt =
+            format_agent_prompt_with_inputs(&agent, "User prompt".to_string(), &inputs).unwrap();
+
+        assert!(prompt.starts_with("# Linear Operator\n\nDo the task.\n\nUser prompt"));
+        assert!(prompt.contains("## Operator Inputs\n\n```json\n"));
+        assert!(
+            prompt.contains(
+                "\"label\": [\n    \"bug\",\n    \"runtime\"\n  ],\n  \"task\": [\n    \"create\"\n  ]"
+            ),
+            "{prompt}"
+        );
+        assert!(prompt.ends_with("\n```"));
     }
 
     // Characterization test for AGE-8 — pins current behavior of resolve_models_dir CLI adapter.
