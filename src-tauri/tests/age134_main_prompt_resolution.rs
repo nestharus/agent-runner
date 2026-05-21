@@ -363,7 +363,7 @@ fn age134_bare_no_agent_path_errors_without_opening_invocation_lifecycle() {
 }
 
 #[test]
-fn age134_resume_answer_reads_piped_stdin_and_rejects_terminal_or_empty_stdin_payloads() {
+fn age134_resume_answer_reads_piped_stdin_and_allows_terminal_or_empty_stdin_resume() {
     let fixture = CliFixture::new();
     fixture.seed_active_chain();
     fixture.write_resume_provider(&format!(
@@ -402,12 +402,11 @@ printf 'resume-ok\n'
         "--model",
         MODEL,
     ]);
-    assert_eq!(terminal.status_code, Some(1), "{terminal:?}");
-    assert!(
-        terminal
-            .text
-            .contains("No answer payload provided. Pass --prompt, --file, or pipe to stdin."),
-        "{terminal:?}"
+    assert_eq!(terminal.status_code, Some(0), "{terminal:?}");
+    assert!(terminal.text.contains("resume-ok"), "{terminal:?}");
+    assert_eq!(
+        fs::read_to_string(&fixture.answer_dump).unwrap(),
+        SESSION_ID
     );
 
     let empty = fixture.run_with_stdin(
@@ -422,10 +421,10 @@ printf 'resume-ok\n'
         ],
         b"\n \t",
     );
-    assert_eq!(empty.status.code(), Some(1), "{empty:?}");
-    assert!(
-        stderr(&empty).contains("Empty answer payload from stdin."),
-        "{empty:?}"
+    assert_eq!(empty.status.code(), Some(0), "{empty:?}");
+    assert_eq!(
+        fs::read_to_string(&fixture.answer_dump).unwrap(),
+        SESSION_ID
     );
 }
 

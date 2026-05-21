@@ -165,7 +165,7 @@ fn execute_effective_with_optional_supervisor_config(
         &request.provider.args,
         &[],
         request.prompt_mode,
-        request.prompt,
+        Some(request.prompt),
         request.working_dir,
         &input_args,
         request.parent_invocation_env,
@@ -871,7 +871,7 @@ fn execute_provider_with_arg_parts(
         provider_args,
         tail_args,
         prompt_mode,
-        prompt,
+        Some(prompt),
         working_dir,
         input_args,
         parent_invocation_env,
@@ -889,7 +889,7 @@ fn execute_provider_with_arg_parts_and_supervisor_config(
     provider_args: &[String],
     tail_args: &[String],
     prompt_mode: PromptMode,
-    prompt: &str,
+    prompt: Option<&str>,
     working_dir: Option<&Path>,
     input_args: &[String],
     parent_invocation_env: Option<&str>,
@@ -923,7 +923,7 @@ struct ProviderLaunchRequest<'a> {
     provider_args: &'a [String],
     tail_args: &'a [String],
     prompt_mode: PromptMode,
-    prompt: &'a str,
+    prompt: Option<&'a str>,
     working_dir: Option<&'a Path>,
     input_args: &'a [String],
     parent_invocation_env: Option<&'a str>,
@@ -964,7 +964,7 @@ fn assemble_provider_launch(
     render_prompt_for_command(
         &mut cmd,
         request.prompt_mode,
-        &rendered_prompt,
+        rendered_prompt.as_deref(),
         request.working_dir,
         &mut temp_files,
     )?;
@@ -987,15 +987,12 @@ fn assemble_provider_launch(
 fn provider_policy_launch_parts(
     provider: &ProviderConfig,
     provider_args: &[String],
-    prompt: &str,
-) -> Result<(Vec<String>, String), String> {
+    prompt: Option<&str>,
+) -> Result<(Vec<String>, Option<String>), String> {
     let mut base_args = provider_args.to_vec();
-    let mut policy_prompt = Some(prompt.to_string());
+    let mut policy_prompt = prompt.map(str::to_string);
     apply_provider_policy(provider, &mut base_args, &mut policy_prompt)?;
-    Ok((
-        base_args,
-        policy_prompt.unwrap_or_else(|| prompt.to_string()),
-    ))
+    Ok((base_args, policy_prompt))
 }
 
 fn append_command_args(cmd: &mut Command, args: &[String]) {
@@ -1007,10 +1004,14 @@ fn append_command_args(cmd: &mut Command, args: &[String]) {
 fn render_prompt_for_command(
     cmd: &mut Command,
     prompt_mode: PromptMode,
-    rendered_prompt: &str,
+    rendered_prompt: Option<&str>,
     working_dir: Option<&Path>,
     temp_files: &mut Vec<PathBuf>,
 ) -> Result<(), String> {
+    let Some(rendered_prompt) = rendered_prompt else {
+        cmd.stdin(Stdio::null());
+        return Ok(());
+    };
     match prompt_mode {
         PromptMode::Arg => render_arg_prompt(cmd, rendered_prompt, working_dir, temp_files),
         PromptMode::Stdin => {
@@ -1052,10 +1053,11 @@ fn write_large_prompt_file(
 fn supervisor_config_for_launch(
     provider: &ProviderConfig,
     prompt_mode: PromptMode,
-    rendered_prompt: String,
+    rendered_prompt: Option<String>,
     supervisor_config: Option<SupervisorConfig>,
 ) -> SupervisorConfig {
-    let prompt_payload = (prompt_mode == PromptMode::Stdin).then(|| rendered_prompt.into_bytes());
+    let prompt_payload = rendered_prompt
+        .and_then(|prompt| (prompt_mode == PromptMode::Stdin).then(|| prompt.into_bytes()));
     supervisor_config
         .unwrap_or_else(|| {
             SupervisorConfig::production(
@@ -1141,7 +1143,7 @@ fn execute_with_supervisor(
     provider_name: &str,
     mut config: SupervisorConfig,
 ) -> Result<SupervisedOutput, String> {
-    configure_supervised_command(&mut cmd, config.prompt_mode);
+    configure_supervised_command(&mut cmd, &config);
     configure_supervised_process_group(&mut cmd);
     let mut child = spawn_supervised_child(cmd, provider_name)?;
     let drains = start_child_drains(&mut child)?;
@@ -1224,16 +1226,13 @@ struct StdinWriter {
     handle: thread::JoinHandle<Result<(), String>>,
 }
 
-fn configure_supervised_command(cmd: &mut Command, prompt_mode: PromptMode) {
+fn configure_supervised_command(cmd: &mut Command, config: &SupervisorConfig) {
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    match prompt_mode {
-        PromptMode::Arg => {
-            cmd.stdin(Stdio::null());
-        }
-        PromptMode::Stdin => {
-            cmd.stdin(Stdio::piped());
-        }
+    if config.prompt_mode == PromptMode::Stdin && config.prompt_payload.is_some() {
+        cmd.stdin(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
     }
 }
 
@@ -1861,10 +1860,9 @@ fn append_codex_provider_policy(
     base_args: &mut Vec<String>,
     prompt: &mut Option<String>,
 ) -> Result<(), String> {
-    if let Some(override_text) = &provider.system_prompt_override {
-        let Some(existing_prompt) = prompt.take() else {
-            return Err(codex_policy_missing_prompt_error(provider));
-        };
+    if let Some(override_text) = &provider.system_prompt_override
+        && let Some(existing_prompt) = prompt.take()
+    {
         *prompt = Some(codex_policy_prompt(override_text, &existing_prompt));
     }
     if let Some(restrictions) = restrictions {
@@ -1872,13 +1870,6 @@ fn append_codex_provider_policy(
         append_codex_disabled_features(base_args, &restrictions.codex.disabled_features);
     }
     Ok(())
-}
-
-fn codex_policy_missing_prompt_error(provider: &ProviderConfig) -> String {
-    format!(
-        "provider {} has Codex system_prompt_override but this execution path has no prompt to prepend it to",
-        provider.name
-    )
 }
 
 fn codex_policy_prompt(override_text: &str, existing_prompt: &str) -> String {
@@ -1976,6 +1967,26 @@ pub fn execute_resume(
     parent_invocation_env: Option<&str>,
     resume: ResumePayload<'_>,
 ) -> Result<ExecutionResult, String> {
+    execute_resume_optional_prompt(
+        provider,
+        provider_index,
+        prompt_mode,
+        Some(prompt),
+        working_dir,
+        parent_invocation_env,
+        resume,
+    )
+}
+
+pub fn execute_resume_optional_prompt(
+    provider: &ProviderConfig,
+    provider_index: usize,
+    prompt_mode: PromptMode,
+    prompt: Option<&str>,
+    working_dir: Option<&Path>,
+    parent_invocation_env: Option<&str>,
+    resume: ResumePayload<'_>,
+) -> Result<ExecutionResult, String> {
     execute_resume_with_optional_supervisor_config(
         provider,
         provider_index,
@@ -1996,7 +2007,7 @@ fn execute_resume_with_optional_supervisor_config(
     provider: &ProviderConfig,
     provider_index: usize,
     prompt_mode: PromptMode,
-    prompt: &str,
+    prompt: Option<&str>,
     working_dir: Option<&Path>,
     parent_invocation_env: Option<&str>,
     resume: ResumePayload<'_>,
@@ -3833,20 +3844,16 @@ printf '%s' "$last" > "{prompt_dump}""#,
 
     #[cfg(unix)]
     #[test]
-    fn codex_promptless_interactive_with_override_fails_closed() {
+    fn codex_promptless_interactive_with_override_runs_without_prompt_prepend() {
         let script = fixture_script("exit 99");
         let provider = age28_codex_provider(
             &script.path,
             vec!["exec".to_string(), "-m".to_string(), "gpt-5.5".to_string()],
         );
 
-        let err = execute_interactive(&provider, None, None, None).unwrap_err();
+        let exit_code = execute_interactive(&provider, None, None, None).unwrap();
 
-        assert!(
-            err.contains("Codex system_prompt_override")
-                && err.contains("no prompt to prepend it to"),
-            "{err}"
-        );
+        assert_eq!(exit_code, 99);
     }
 
     #[test]
@@ -4624,6 +4631,57 @@ printf '{{"type":"system","subtype":"init","session_id":"8f0a6a1f-9cd2-4c91-b6c6
     }
 
     #[cfg(unix)]
+    // risk: Provider-native deferred resume can require no prompt argument at all; level: unit.
+    #[test]
+    fn execute_resume_can_omit_prompt_for_deferred_provider_resume() {
+        let argv_dump = tempfile::NamedTempFile::new().unwrap();
+        let argv_dump_path = argv_dump.path().to_path_buf();
+        let script = fixture_script(&format!(
+            r#"printf '%s\n' "$@" > "{dump}""#,
+            dump = argv_dump_path.display()
+        ));
+        let provider = ProviderConfig {
+            name: "codex".to_string(),
+            command: script.path.to_string_lossy().into_owned(),
+            args: vec!["exec".to_string(), "-m".to_string(), "gpt-5.4".to_string()],
+            interactive_args: Some(vec!["-m".to_string(), "gpt-5.4".to_string()]),
+            resume: None,
+            session_capture: None,
+            resume_acceptance: None,
+            session_storage: None,
+            system_prompt_override: None,
+            tool_restrictions: None,
+            invocation_mode: Default::default(),
+        };
+        let strategy = ResumeStrategy {
+            kind: ResumeKind::Subcommand,
+            flag: None,
+            subcommand: Some(vec!["resume".to_string()]),
+        };
+        let session_id = "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22";
+
+        let result = execute_resume_optional_prompt(
+            &provider,
+            0,
+            PromptMode::Arg,
+            None,
+            None,
+            None,
+            ResumePayload {
+                session_id,
+                strategy: &strategy,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(
+            std::fs::read_to_string(&argv_dump_path).unwrap(),
+            "exec\n-m\ngpt-5.4\nresume\n8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22\n"
+        );
+    }
+
+    #[cfg(unix)]
     // risk: Executor resume payload/argv without target JSONL path; level: unit; source: proposal §5 / A4.
     #[test]
     fn execute_interactive_appends_subcommand_resume_args_to_child_argv() {
@@ -4672,6 +4730,39 @@ printf '{{"type":"system","subtype":"init","session_id":"8f0a6a1f-9cd2-4c91-b6c6
         assert_eq!(
             std::fs::read_to_string(&argv_dump_path).unwrap(),
             "--dangerously-bypass-approvals-and-sandbox\n-m\ngpt-5.4\nresume\n5169694d-de0f-40d1-890c-6e28e55bab27\n"
+        );
+    }
+
+    #[cfg(unix)]
+    // risk: Promptless provider-native resume must not be blocked by Codex prompt-only policy composition.
+    #[test]
+    fn execute_interactive_allows_codex_system_prompt_override_without_prompt() {
+        let argv_dump = tempfile::NamedTempFile::new().unwrap();
+        let argv_dump_path = argv_dump.path().to_path_buf();
+        let script = fixture_script(&format!(
+            r#"printf '%s\n' "$@" > "{dump}""#,
+            dump = argv_dump_path.display()
+        ));
+        let provider = ProviderConfig {
+            name: "codex".to_string(),
+            command: script.path.to_string_lossy().into_owned(),
+            args: vec!["exec".to_string()],
+            interactive_args: Some(vec!["-m".to_string(), "gpt-5.4".to_string()]),
+            resume: None,
+            session_capture: None,
+            resume_acceptance: None,
+            session_storage: None,
+            system_prompt_override: Some("operator policy".to_string()),
+            tool_restrictions: None,
+            invocation_mode: Default::default(),
+        };
+
+        let exit_code = execute_interactive(&provider, None, None, None).unwrap();
+
+        assert_eq!(exit_code, 0);
+        assert_eq!(
+            std::fs::read_to_string(&argv_dump_path).unwrap(),
+            "-m\ngpt-5.4\n"
         );
     }
 

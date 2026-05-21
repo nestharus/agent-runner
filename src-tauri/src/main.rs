@@ -155,14 +155,17 @@ fn resolve_prompt(cli: &Cli, include_agent_as_prompt: bool) -> Result<String, St
     read_required_stdin_prompt()
 }
 
-fn resolve_resume_answer(prompt: Option<&str>, file: Option<&Path>) -> Result<String, String> {
+fn resolve_resume_answer(
+    prompt: Option<&str>,
+    file: Option<&Path>,
+) -> Result<Option<String>, String> {
     if let Some(path) = file {
-        return read_answer_file(path);
+        return read_answer_file(path).map(Some);
     }
     if let Some(prompt) = prompt {
-        return Ok(prompt.to_string());
+        return Ok(Some(prompt.to_string()));
     }
-    read_required_stdin_answer()
+    read_optional_stdin_answer()
 }
 
 fn read_prompt_file(path: &Path) -> Result<String, String> {
@@ -177,13 +180,6 @@ fn read_required_stdin_prompt() -> Result<String, String> {
     validate_required_prompt_stdin_available()?;
     let input = read_stdin_text()?;
     validate_nonempty_prompt_stdin(&input)?;
-    Ok(input)
-}
-
-fn read_required_stdin_answer() -> Result<String, String> {
-    validate_required_answer_stdin_available()?;
-    let input = read_stdin_text()?;
-    validate_nonempty_answer_stdin(&input)?;
     Ok(input)
 }
 
@@ -203,25 +199,9 @@ fn validate_required_prompt_stdin_available() -> Result<(), String> {
     }
 }
 
-fn validate_required_answer_stdin_available() -> Result<(), String> {
-    if std::io::stdin().is_terminal() {
-        Err(format_missing_answer_error())
-    } else {
-        Ok(())
-    }
-}
-
 fn validate_nonempty_prompt_stdin(input: &str) -> Result<(), String> {
     if input.trim().is_empty() {
         Err(format_empty_prompt_error())
-    } else {
-        Ok(())
-    }
-}
-
-fn validate_nonempty_answer_stdin(input: &str) -> Result<(), String> {
-    if input.trim().is_empty() {
-        Err(format_empty_answer_error())
     } else {
         Ok(())
     }
@@ -243,16 +223,8 @@ fn format_missing_prompt_error() -> String {
     "No prompt provided. Pass as argument, --file, or pipe to stdin.".to_string()
 }
 
-fn format_missing_answer_error() -> String {
-    "No answer payload provided. Pass --prompt, --file, or pipe to stdin.".to_string()
-}
-
 fn format_empty_prompt_error() -> String {
     "Empty prompt from stdin.".to_string()
-}
-
-fn format_empty_answer_error() -> String {
-    "Empty answer payload from stdin.".to_string()
 }
 
 fn resolve_models_dir(cli: &Cli) -> PathBuf {
@@ -294,6 +266,13 @@ fn resolve_top_level_resume_prompt_source(cli: &Cli) -> Result<TopLevelResumePro
 
 fn read_optional_stdin_prompt(enabled: bool) -> Result<Option<String>, String> {
     if !should_read_optional_stdin_prompt(enabled) {
+        return Ok(None);
+    }
+    optional_nonempty_text(read_stdin_text()?)
+}
+
+fn read_optional_stdin_answer() -> Result<Option<String>, String> {
+    if std::io::stdin().is_terminal() {
         return Ok(None);
     }
     optional_nonempty_text(read_stdin_text()?)
@@ -2924,11 +2903,11 @@ fn run_resume(
             .map_err(|e| format!("Failed to serialize invocation id: {e}"))?;
         eprintln!("{}", invocation.stderr_line());
 
-        let mut result = match executor::cli::execute_resume(
+        let mut result = match executor::cli::execute_resume_optional_prompt(
             &provider,
             provider_index,
             target.prompt_mode,
-            &answer,
+            answer.as_deref(),
             Some(&effective_spawn_cwd),
             Some(&invocation_env),
             executor::cli::ResumePayload {

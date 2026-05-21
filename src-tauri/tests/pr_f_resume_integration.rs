@@ -1025,6 +1025,54 @@ fn resume_subcommand_file_prompt_preserves_supplied_session_id_when_provider_emi
 }
 
 #[test]
+fn resume_subcommand_without_prompt_forwards_no_prompt_to_provider_resume() {
+    let fixture = Fixture::new();
+    let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+    let argv_dump = fixture.dir.path().join("resume-no-prompt-argv.txt");
+    let script = fixture.write_script(
+        "resume-no-prompt.sh",
+        &format!(
+            r#"printf 'RESUME_NO_PROMPT_MARKER\n'; printf '%s\n' "$@" > "{}"; exit 0"#,
+            argv_dump.display()
+        ),
+    );
+    fixture.write_single_provider_model(
+        "codex-resume",
+        "codex",
+        &script,
+        r#"
+[providers.resume]
+kind = "subcommand"
+subcommand = ["resume"]
+"#,
+    );
+    fixture.seed_session_turns("codex", session_id, &[("turn-1", "2026-04-17T08:00:00Z")]);
+
+    let output = fixture
+        .base_resume_command("codex-resume", session_id)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("RESUME_NO_PROMPT_MARKER"),
+        "{output:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&argv_dump).unwrap(),
+        "one-shot-only\nresume\n5169694d-de0f-40d1-890c-6e28e55bab27\n"
+    );
+    let invocation = parse_invocation(&String::from_utf8_lossy(&output.stderr));
+    let row = fixture
+        .open_db()
+        .get_invocation_by_uuid(&invocation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.session_id.as_deref(), Some(session_id));
+    assert_eq!(row.session_capture_method.as_deref(), Some("resumed"));
+}
+
+#[test]
 fn repl_resume_preserves_supplied_session_id_when_provider_emits_fresh_id() {
     let fixture = Fixture::new();
     let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
