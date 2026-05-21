@@ -3366,6 +3366,13 @@ fn zero_turn_classification_for_action(
     ) {
         return classification;
     }
+    if matches!(
+        classification,
+        ZeroTurnClassification::UnclassifiedNoSessionId
+            | ZeroTurnClassification::UnclassifiedScanFailed
+    ) {
+        return classification;
+    }
     if result
         .terminal_signal
         .as_ref()
