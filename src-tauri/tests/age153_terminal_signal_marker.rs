@@ -3,9 +3,9 @@
 mod age153_support;
 
 use age153_support::{
-    Age153Fixture, assert_no_terminal_marker_on_stdout, assert_ordered,
-    assert_single_terminal_signal, line_count, main_rs_source, prolonged_silence_body, quota_body,
-    source_block_after, success_body, terminal_outcome_adapter_source, terminal_signal_lines,
+    Age153Fixture, FORCE_TERMINAL_SIGNAL_KIND, assert_no_terminal_marker_on_stdout, assert_ordered,
+    assert_single_terminal_signal, line_count, main_rs_source, quota_body, source_block_after,
+    success_body, terminal_outcome_adapter_source, terminal_signal_lines,
 };
 
 #[test]
@@ -24,10 +24,7 @@ fn terminal_signal_marker_is_stderr_key_json_with_four_fields_and_once() {
 
     let output = fixture.run_one_shot_with_env(
         "age153-marker",
-        &[(
-            "OULIPOLY_AGE153_FORCE_TERMINAL_SIGNAL_KIND",
-            "QuotaExhaustedInband,None",
-        )],
+        &[(FORCE_TERMINAL_SIGNAL_KIND, "QuotaExhaustedInband,None")],
     );
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
@@ -43,37 +40,6 @@ fn terminal_signal_marker_is_stderr_key_json_with_four_fields_and_once() {
     );
     assert_eq!(line_count(&first_marker), 1);
     assert_eq!(line_count(&sibling_marker), 1);
-}
-
-#[test]
-#[ignore = "AGE-163 removed the bounded_silence supervisor; OULIPOLY_TEST_BOUNDED_SILENCE_MS is no longer honored and prolonged_silence_body hangs without a kill path."]
-fn typed_signal_handled_path_finalizes_explicitly_not_guard_drop() {
-    let fixture = Age153Fixture::new();
-    let marker = fixture.dir.path().join("guard-path-prolonged-silence.txt");
-    fixture.write_model("age153-guard-path", &["claude-age153-guard"]);
-    fixture
-        .write_providers_with_bodies(&[("claude-age153-guard", &prolonged_silence_body(&marker))]);
-
-    let output = fixture.run_one_shot_with_env(
-        "age153-guard-path",
-        &[("OULIPOLY_BOUNDED_SILENCE_MS", "120")],
-    );
-
-    assert_ne!(output.status.code(), Some(0), "{output:?}");
-    assert_no_terminal_marker_on_stdout(&output);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_single_terminal_signal(&stderr, "ProlongedSilence", false);
-    assert_eq!(
-        fixture.failed_invocation_count("claude-age153-guard", "bounded_silence"),
-        1,
-        "typed-signal-handled invocation must keep the executor-produced terminal_reason"
-    );
-    assert_eq!(
-        fixture.invocation_count_with_terminal_reason("guard_drop"),
-        0,
-        "FinalizerGuard::drop must not be the finalization path after a typed signal is handled"
-    );
-    assert_eq!(line_count(&marker), 1);
 }
 
 fn assert_marker_emission_is_adjacent_to_typed_signal_finalization() {

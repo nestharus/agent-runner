@@ -13,6 +13,7 @@ use std::process::{Command, Output};
 pub const SESSION_ID: &str = "5169694d-de0f-40d1-890c-6e28e55bab27";
 pub const CHAIN_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 pub const FIRST_PARENT_ROW_ID_IN_FRESH_FIXTURE: i64 = 2;
+pub const FORCE_TERMINAL_SIGNAL_KIND: &str = "OULIPOLY_AGE153_FORCE_TERMINAL_SIGNAL_KIND";
 
 pub struct Age153Fixture {
     pub dir: tempfile::TempDir,
@@ -367,13 +368,6 @@ pub fn success_body(marker: &Path, stdout: &str) -> String {
         "printf '%s\\n' ran >> {}\nprintf '%s\\n' {}",
         toml_string(&marker.display().to_string()),
         toml_string(stdout)
-    )
-}
-
-pub fn prolonged_silence_body(marker: &Path) -> String {
-    format!(
-        "printf '%s\\n' ran >> {}\nwhile true; do sleep 3600; done",
-        toml_string(&marker.display().to_string())
     )
 }
 

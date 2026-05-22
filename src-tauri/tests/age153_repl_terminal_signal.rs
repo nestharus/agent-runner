@@ -4,7 +4,7 @@ mod age153_support;
 
 use age153_support::{
     Age153Fixture, assert_no_terminal_marker_on_stdout, assert_signal_consumer_source_wired,
-    assert_single_terminal_signal, main_rs_source, source_block_after, terminal_signal_lines,
+    assert_single_terminal_signal, terminal_signal_lines,
 };
 
 #[test]
@@ -53,21 +53,5 @@ fn repl_clean_interactive_signal_finalizes_success_without_marker() {
             "TerminalSignalDisposition::InteractiveClean",
             "TerminalSignalKind::CleanExit",
         ],
-    );
-}
-
-#[test]
-fn repl_terminal_signal_wiring_does_not_insert_bounded_silence_into_inherited_stdio_path() {
-    let source = main_rs_source();
-    let body = source_block_after(&source, "fn run_repl(");
-    assert!(
-        !body.contains("execute_with_bounded_silence")
-            && !body.contains("BoundedSilenceConfig")
-            && !body.contains("bounded_silence_config"),
-        "run_repl inherited-stdio path must not gain bounded-silence supervision"
-    );
-    assert_signal_consumer_source_wired(
-        "fn run_repl(",
-        &["terminal_signal", "emit_terminal_signal_marker"],
     );
 }
