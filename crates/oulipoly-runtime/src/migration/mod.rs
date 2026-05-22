@@ -156,26 +156,43 @@ pub fn migrate_chain_segment(
         path: source_path.display().to_string(),
         message: e.to_string(),
     })?;
-    let slice = if let Some((turn_id, _)) = state
+    let find_turn_offset = |buf: &[u8], turn_id: &str| -> Option<usize> {
+        let text = String::from_utf8_lossy(buf);
+        let mut offset = 0usize;
+        for line in text.lines() {
+            if line.contains(turn_id) {
+                return Some(offset);
+            }
+            offset += line.len() + 1;
+        }
+        None
+    };
+    let slice: std::borrow::Cow<'_, [u8]> = if let Some((turn_id, _)) = state
         .latest_compaction_boundary(&source.name, &resolved.active_session_id)
         .map_err(|message| MigrationError::Db { message })?
     {
-        let text = String::from_utf8_lossy(&bytes);
-        let offset = text
-            .lines()
-            .scan(0usize, |offset, line| {
-                let start = *offset;
-                *offset += line.len() + 1;
-                Some((start, line))
-            })
-            .find_map(|(start, line)| line.contains(&turn_id).then_some(start))
-            .ok_or_else(|| MigrationError::CompactionBoundaryNotInJsonl {
-                session_id: resolved.active_session_id.clone(),
-                turn_id,
-            })?;
-        &bytes[offset..]
+        if let Some(offset) = find_turn_offset(&bytes, &turn_id) {
+            std::borrow::Cow::Borrowed(&bytes[offset..])
+        } else if let Some(alternate) = find_alternate_jsonl_with_boundary(
+            source,
+            &resolved.active_session_id,
+            &source_path,
+            &turn_id,
+            &find_turn_offset,
+        ) {
+            std::borrow::Cow::Owned(alternate)
+        } else {
+            let _ = writeln!(
+                stderr,
+                "Warning: recorded compaction boundary turn_id={turn_id} not found in any candidate JSONL for session_id={session} located_path={path}; falling back to full source slice",
+                turn_id = turn_id,
+                session = resolved.active_session_id,
+                path = source_path.display(),
+            );
+            std::borrow::Cow::Borrowed(&bytes[..])
+        }
     } else {
-        &bytes[..]
+        std::borrow::Cow::Borrowed(&bytes[..])
     };
 
     let target_dir = projects_dir.join(&cwd_project_dir);
@@ -360,6 +377,33 @@ fn expand_leading_tilde(path: PathBuf) -> PathBuf {
         return home.join(rest);
     }
     path
+}
+
+fn find_alternate_jsonl_with_boundary(
+    provider: &oulipoly_config::ProviderConfig,
+    session_id: &str,
+    located_path: &Path,
+    turn_id: &str,
+    find_turn_offset: &dyn Fn(&[u8], &str) -> Option<usize>,
+) -> Option<Vec<u8>> {
+    let projects_dir = claude_projects_dir_from_provider_storage(provider)?;
+    let entries = std::fs::read_dir(&projects_dir).ok()?;
+    for entry in entries.flatten() {
+        let candidate = entry.path().join(format!("{session_id}.jsonl"));
+        if !candidate.is_file() {
+            continue;
+        }
+        if candidate == located_path {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&candidate) else {
+            continue;
+        };
+        if let Some(offset) = find_turn_offset(&bytes, turn_id) {
+            return Some(bytes[offset..].to_vec());
+        }
+    }
+    None
 }
 
 #[cfg(test)]
