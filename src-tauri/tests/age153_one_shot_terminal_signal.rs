@@ -3,10 +3,10 @@
 mod age153_support;
 
 use age153_support::{
-    Age153Fixture, assert_no_terminal_marker_on_stdout, assert_single_terminal_signal,
-    legacy_quota_like_non_signal_body, line_count, nonzero_exit_with_non_quota_error_body,
-    prolonged_silence_body, quota_body, signal_exit_with_non_quota_error_body, success_body,
-    terminal_signal_lines, unknown_with_non_quota_error_body,
+    Age153Fixture, FORCE_TERMINAL_SIGNAL_KIND, assert_no_terminal_marker_on_stdout,
+    assert_single_terminal_signal, legacy_quota_like_non_signal_body, line_count,
+    nonzero_exit_with_non_quota_error_body, quota_body, signal_exit_with_non_quota_error_body,
+    success_body, terminal_signal_lines, unknown_with_non_quota_error_body,
 };
 
 #[test]
@@ -25,56 +25,21 @@ fn one_shot_quota_signal_marks_exhausted_retries_sibling_and_emits_marker() {
 
     let output = fixture.run_one_shot_with_env(
         "age153-one-shot",
-        &[(
-            "OULIPOLY_AGE153_FORCE_TERMINAL_SIGNAL_KIND",
-            "QuotaExhaustedInband,None",
-        )],
+        &[(FORCE_TERMINAL_SIGNAL_KIND, "QuotaExhaustedInband,None")],
     );
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert_no_terminal_marker_on_stdout(&output);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_single_terminal_signal(&stderr, "QuotaExhaustedInband", false);
-    // AGE-163 WU-A.4: the typed forensics writer lands durable
-    // unavailability on `next_available_at` (RollingWindow5h class) in
-    // place of the legacy `exhausted_at` write. The "provider was marked
-    // exhausted" contract is preserved; the observed column changes.
-    assert_eq!(fixture.next_available_at_row_count("claude-age153-a"), 1);
-    assert_eq!(fixture.next_available_at_row_count("claude-age153-b"), 0);
+    assert_eq!(fixture.exhausted_row_count("claude-age153-a"), 1);
+    assert_eq!(fixture.exhausted_row_count("claude-age153-b"), 0);
     assert_eq!(
         fixture.failed_invocation_count("claude-age153-a", "quota_exhausted_inband"),
         1
     );
     assert_eq!(line_count(&first_marker), 1);
     assert_eq!(line_count(&sibling_marker), 1);
-}
-
-#[test]
-#[ignore = "AGE-163 removed the bounded_silence supervisor; OULIPOLY_TEST_BOUNDED_SILENCE_MS is no longer honored and prolonged_silence_body hangs without a kill path."]
-fn one_shot_prolonged_silence_signal_fails_without_exhausted_write() {
-    let fixture = Age153Fixture::new();
-    let marker = fixture.dir.path().join("one-shot-prolonged-silence.txt");
-    fixture.write_model("age153-one-shot-silence", &["claude-age153-silence"]);
-    fixture.write_providers_with_bodies(&[(
-        "claude-age153-silence",
-        &prolonged_silence_body(&marker),
-    )]);
-
-    let output = fixture.run_one_shot_with_env(
-        "age153-one-shot-silence",
-        &[("OULIPOLY_BOUNDED_SILENCE_MS", "120")],
-    );
-
-    assert_ne!(output.status.code(), Some(0), "{output:?}");
-    assert_no_terminal_marker_on_stdout(&output);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_single_terminal_signal(&stderr, "ProlongedSilence", false);
-    assert_eq!(fixture.exhausted_row_count("claude-age153-silence"), 0);
-    assert_eq!(
-        fixture.failed_invocation_count("claude-age153-silence", "bounded_silence"),
-        1
-    );
-    assert_eq!(line_count(&marker), 1);
 }
 
 /// Typed `SignalExit` emits a marker, records the SIGTERM terminal reason, and leaves quota state untouched.
@@ -193,8 +158,8 @@ fn one_shot_all_providers_exhausted_by_typed_quota_returns_nonzero_with_one_mark
     let output = fixture.run_one_shot_with_env(
         "age153-all-exhausted",
         &[(
-            "OULIPOLY_AGE153_FORCE_TERMINAL_SIGNAL_KIND",
-            "QuotaExhaustedInband",
+            FORCE_TERMINAL_SIGNAL_KIND,
+            "QuotaExhaustedInband,QuotaExhaustedInband",
         )],
     );
 
@@ -203,14 +168,11 @@ fn one_shot_all_providers_exhausted_by_typed_quota_returns_nonzero_with_one_mark
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(terminal_signal_lines(&stderr).len(), 2, "{stderr}");
     assert!(
-        stderr.contains("BLOCKED:all-providers-exhausted")
-            || stderr.contains("all providers in pool age153-all-exhausted are quota-exhausted"),
+        stderr.contains("Error: all providers in pool age153-all-exhausted are quota-exhausted"),
         "{stderr}"
     );
-    // AGE-163 WU-A.4: typed forensics writes `next_available_at`
-    // (RollingWindow5h class) in place of legacy `exhausted_at`.
-    assert_eq!(fixture.next_available_at_row_count("claude-age153-a"), 1);
-    assert_eq!(fixture.next_available_at_row_count("claude-age153-b"), 1);
+    assert_eq!(fixture.exhausted_row_count("claude-age153-a"), 1);
+    assert_eq!(fixture.exhausted_row_count("claude-age153-b"), 1);
     assert_eq!(line_count(&first_marker), 1);
     assert_eq!(line_count(&second_marker), 1);
 }

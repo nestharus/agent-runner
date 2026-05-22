@@ -3,7 +3,7 @@
 mod age153_support;
 
 use age153_support::{
-    Age153Fixture, assert_no_terminal_marker_on_stdout,
+    Age153Fixture, FORCE_TERMINAL_SIGNAL_KIND, assert_no_terminal_marker_on_stdout,
     assert_normalized_result_stdout_matches_golden, assert_result_envelope_shape,
     assert_signal_consumer_source_wired, quota_body, success_body,
 };
@@ -59,10 +59,7 @@ fn terminal_signal_marker_never_moves_oulipoly_result_off_stdout() {
 
     let output = fixture.run_one_shot_with_env(
         "age153-result-quota",
-        &[(
-            "OULIPOLY_AGE153_FORCE_TERMINAL_SIGNAL_KIND",
-            "QuotaExhaustedInband,None",
-        )],
+        &[(FORCE_TERMINAL_SIGNAL_KIND, "QuotaExhaustedInband,None")],
     );
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");

@@ -17,9 +17,7 @@
 
 mod age153_support;
 
-use age153_support::{
-    Age153Fixture, nonzero_exit_with_non_quota_error_body, prolonged_silence_body, success_body,
-};
+use age153_support::{Age153Fixture, nonzero_exit_with_non_quota_error_body, success_body};
 use oulipoly_state::CompositeInvocationId;
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -178,20 +176,6 @@ fn non_quota_failure_output() -> Output {
     fixture.run_one_shot("age154-result-non-quota")
 }
 
-fn typed_terminal_failure_output() -> Output {
-    let fixture = Age153Fixture::new();
-    let marker = fixture.dir.path().join("age154-result-typed-terminal.txt");
-    fixture.write_model("age154-result-typed-terminal", &["claude-age154-terminal"]);
-    fixture.write_providers_with_bodies(&[(
-        "claude-age154-terminal",
-        &prolonged_silence_body(&marker),
-    )]);
-    fixture.run_one_shot_with_env(
-        "age154-result-typed-terminal",
-        &[("OULIPOLY_BOUNDED_SILENCE_MS", "120")],
-    )
-}
-
 fn balanced_spawn_error_output() -> Output {
     let fixture = Age153Fixture::new();
     let missing_command = fixture.dir.path().join("missing-age154-provider-command");
@@ -236,7 +220,6 @@ fn age154_oulipoly_invocation_stderr_matches_age151_baseline_source_id_payload()
 }
 
 #[test]
-#[ignore = "AGE-163 removed the bounded_silence supervisor; OULIPOLY_TEST_BOUNDED_SILENCE_MS is no longer honored and prolonged_silence_body (typed_terminal_failure_output) hangs without a kill path."]
 fn age154_oulipoly_result_stdout_key_set_matches_every_named_producer_path() {
     // assumption-register: AGE-151 cleaned main.rs is the marker-compatibility baseline.
     // residual-risk-not-verified: this proves structural ABI, not semantic equivalence
@@ -244,10 +227,6 @@ fn age154_oulipoly_result_stdout_key_set_matches_every_named_producer_path() {
     let cases = vec![
         ("existing success path", success_output()),
         ("non-quota failure call site", non_quota_failure_output()),
-        (
-            "typed terminal failure call site",
-            typed_terminal_failure_output(),
-        ),
         (
             "balanced one-shot spawn-error call site",
             balanced_spawn_error_output(),
