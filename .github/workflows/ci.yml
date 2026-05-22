@@ -1,13 +1,7 @@
 name: CI
 
 on:
-  pull_request:
-    branches:
-      - main
-
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
