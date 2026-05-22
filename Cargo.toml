@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "src-tauri",
     "crates/oulipoly-core",
+    "crates/oulipoly-provider",
     "crates/oulipoly-config",
     "crates/oulipoly-state",
     "crates/oulipoly-runtime",
@@ -14,6 +15,7 @@ members = [
 default-members = [
     "src-tauri",
     "crates/oulipoly-core",
+    "crates/oulipoly-provider",
     "crates/oulipoly-config",
     "crates/oulipoly-state",
     "crates/oulipoly-runtime",
