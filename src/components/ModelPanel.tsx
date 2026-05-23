@@ -138,6 +138,17 @@ export default function ModelPanel(props: ModelPanelProps) {
 	}
 
 	async function handleSaveAndTest() {
+		if (props.mode === "edit") {
+			if (existingModels.loading) {
+				setError("Model data is still loading. Please wait before saving.");
+				return;
+			}
+			if (!existingModel()) {
+				setError("Unable to load the existing model configuration.");
+				return;
+			}
+		}
+
 		const name = effectiveName();
 		if (!name) {
 			setError(
@@ -372,7 +383,11 @@ export default function ModelPanel(props: ModelPanelProps) {
 								type="button"
 								class="flex w-full items-center justify-center gap-2 rounded-lg bg-accent py-2.5 text-sm font-medium text-black transition-colors hover:bg-accent-hover disabled:opacity-50"
 								onClick={handleSaveAndTest}
-								disabled={saving() || testing()}
+								disabled={
+									saving() ||
+									testing() ||
+									(props.mode === "edit" && existingModels.loading)
+								}
 							>
 								{saving()
 									? "Saving..."
