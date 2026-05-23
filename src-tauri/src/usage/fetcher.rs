@@ -3,7 +3,10 @@ use oulipoly_runtime::quota::{self, QuotaScriptWindow};
 use oulipoly_state::{QuotaWindowInput, StateDb};
 use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
+
+const USAGE_REFRESH_LOCK_STALE_AFTER: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Debug)]
 pub(crate) enum QuotaScriptOutcome {
@@ -101,9 +104,18 @@ impl RefreshFileLock {
         fs::create_dir_all(&dir)
             .map_err(|err| format!("failed to create {}: {err}", dir.display()))?;
         let path = dir.join(format!("{}.lock", sanitize_lock_name(account_id)));
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => Ok(Some(Self { path, _file: file })),
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(None),
+
+        match create_lock_file(&path) {
+            Ok(Some(file)) => Ok(Some(Self { path, _file: file })),
+            Ok(None) if existing_lock_is_stale(&path)? => {
+                remove_stale_lock(&path)?;
+                match create_lock_file(&path) {
+                    Ok(Some(file)) => Ok(Some(Self { path, _file: file })),
+                    Ok(None) => Ok(None),
+                    Err(err) => Err(format!("failed to create {}: {err}", path.display())),
+                }
+            }
+            Ok(None) => Ok(None),
             Err(err) => Err(format!("failed to create {}: {err}", path.display())),
         }
     }
@@ -132,6 +144,40 @@ fn usage_lock_dir() -> PathBuf {
         .join("usage-refresh-locks")
 }
 
+fn create_lock_file(path: &Path) -> Result<Option<File>, io::Error> {
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+fn existing_lock_is_stale(path: &Path) -> Result<bool, String> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(err) => return Err(format!("failed to inspect {}: {err}", path.display())),
+    };
+    let modified = metadata
+        .modified()
+        .map_err(|err| format!("failed to inspect {} mtime: {err}", path.display()))?;
+    Ok(lock_modified_time_is_stale(modified, SystemTime::now()))
+}
+
+fn lock_modified_time_is_stale(modified: SystemTime, now: SystemTime) -> bool {
+    now.duration_since(modified)
+        .map(|age| age > USAGE_REFRESH_LOCK_STALE_AFTER)
+        .unwrap_or(false)
+}
+
+fn remove_stale_lock(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!("failed to remove stale {}: {err}", path.display())),
+    }
+}
+
 fn sanitize_lock_name(name: &str) -> String {
     name.chars()
         .map(|ch| {
@@ -142,4 +188,32 @@ fn sanitize_lock_name(name: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lock_modified_time_older_than_threshold_is_stale() {
+        let now = SystemTime::UNIX_EPOCH + USAGE_REFRESH_LOCK_STALE_AFTER + Duration::from_secs(1);
+
+        assert!(lock_modified_time_is_stale(SystemTime::UNIX_EPOCH, now));
+    }
+
+    #[test]
+    fn lock_modified_time_within_threshold_is_not_stale() {
+        let now = SystemTime::UNIX_EPOCH + USAGE_REFRESH_LOCK_STALE_AFTER;
+        let modified = now - (USAGE_REFRESH_LOCK_STALE_AFTER - Duration::from_secs(1));
+
+        assert!(!lock_modified_time_is_stale(modified, now));
+    }
+
+    #[test]
+    fn future_lock_modified_time_is_not_stale() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        let modified = now + Duration::from_secs(1);
+
+        assert!(!lock_modified_time_is_stale(modified, now));
+    }
 }
