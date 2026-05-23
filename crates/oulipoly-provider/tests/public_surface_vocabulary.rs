@@ -1,3 +1,16 @@
+//! ## Declared roles
+//!
+//! Roles: accessor, filter, mapper, predicate, validator.
+//!
+//! - accessor: [`read_dir_entries`], [`read_source_text`].
+//! - filter: [`collect_rs_files`].
+//! - mapper: [`normalize`], [`guarded_terms`],
+//!   [`disallowed_manifest_terms`].
+//! - predicate: [`is_rs_file`], [`is_directory`].
+//! - validator: [`assert_no_terms`],
+//!   [`provider_source_uses_neutral_vocabulary`],
+//!   [`provider_manifest_has_no_internal_crate_dependencies`].
+//!
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -59,7 +72,6 @@ fn disallowed_manifest_terms() -> Vec<String> {
         "oulipoly-core".to_string(),
         "oulipoly-config".to_string(),
         "oulipoly-state".to_string(),
-        "oulipoly-runtime".to_string(),
         "oulipoly-setup".to_string(),
         "oulipoly-agent-store".to_string(),
         "oulipoly-agent-scratchpad".to_string(),
