@@ -96,6 +96,7 @@ impl Fixture {
                 provider_config(SIBLING, self.sibling_projects.clone()),
             ],
             inputs: Vec::new(),
+            provider: None,
         }
     }
 

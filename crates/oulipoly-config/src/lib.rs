@@ -2,6 +2,7 @@ pub mod agent;
 pub mod app;
 pub mod claude_tool_filter;
 pub mod model;
+pub mod provider_implementation_ref;
 pub mod providers;
 pub mod repositories;
 pub mod sessions;
@@ -16,6 +17,9 @@ pub use model::{
     ScriptSessionStorageType, SessionCapture, SessionCaptureKind, SessionStorage,
     ToolRestrictionKind, ToolRestrictions, derive_provider_name, load_models,
     render_validated_model_toml,
+};
+pub use provider_implementation_ref::{
+    ProviderImplementationFlavor, ProviderImplementationRef, ProviderImplementationRefError,
 };
 pub use providers::{
     LoadError, ProviderEntry, ProvidersConfig, migrate_legacy_session_storage_file,

@@ -291,6 +291,7 @@ flag = "--resume"
                 ),
             ],
             inputs: Vec::new(),
+            provider: None,
         }
     }
 
@@ -319,6 +320,7 @@ flag = "--resume"
                 ),
             ],
             inputs: Vec::new(),
+            provider: None,
         }
     }
 

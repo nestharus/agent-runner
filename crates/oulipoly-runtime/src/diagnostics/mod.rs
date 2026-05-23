@@ -283,6 +283,7 @@ mod tests {
                 vec!["--raw-model-arg".to_string()],
             )],
             inputs: vec![],
+            provider: None,
         }
     }
 

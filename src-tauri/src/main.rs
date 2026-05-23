@@ -2110,6 +2110,7 @@ fn provider_default_migration_pool(
         prompt_mode: PromptMode::Stdin,
         providers: runtime_migration_providers(active_provider, providers_cfg),
         inputs: Vec::new(),
+        provider: None,
     }
 }
 
@@ -2238,6 +2239,7 @@ fn run_repl(
             prompt_mode: PromptMode::Stdin,
             providers: Vec::new(),
             inputs: Vec::new(),
+            provider: None,
         });
 
     let in_flight = oulipoly_runtime::quota::InFlight::new();

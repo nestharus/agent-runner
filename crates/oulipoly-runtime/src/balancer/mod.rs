@@ -1998,6 +1998,7 @@ mod tests {
                 })
                 .collect(),
             inputs: Vec::new(),
+            provider: None,
         }
     }
 
@@ -2134,6 +2135,7 @@ mod tests {
                 ProviderConfig::new("b", vec![]),
             ],
             inputs: vec![],
+            provider: None,
         }
     }
 
@@ -2147,6 +2149,7 @@ mod tests {
                 ProviderConfig::new("c", vec![]),
             ],
             inputs: vec![],
+            provider: None,
         }
     }
 
@@ -2158,6 +2161,7 @@ mod tests {
             prompt_mode: PromptMode::Arg,
             providers: vec![ProviderConfig::new("x", vec![])],
             inputs: vec![],
+            provider: None,
         };
         assert_eq!(select_provider(&model, &db, None).unwrap(), 0);
     }
@@ -2449,6 +2453,7 @@ mod tests {
             prompt_mode: PromptMode::Arg,
             providers: vec![ProviderConfig::new("a", vec![])],
             inputs: vec![],
+            provider: None,
         }
     }
 
@@ -2661,6 +2666,7 @@ mod tests {
             prompt_mode: PromptMode::Arg,
             providers: vec![],
             inputs: vec![],
+            provider: None,
         };
 
         let err = select_provider(&model, &db, None).unwrap_err();
@@ -3280,6 +3286,7 @@ mod tests {
                 ProviderConfig::new("claude4", vec![]),
             ],
             inputs: vec![],
+            provider: None,
         };
 
         seed_windows_with_deltas(&db, "claude", &[(0.51, 48, 0.01, 22)]);
@@ -3991,6 +3998,7 @@ mod tests {
             prompt_mode: PromptMode::Arg,
             providers,
             inputs: Vec::new(),
+            provider: None,
         }
     }
 

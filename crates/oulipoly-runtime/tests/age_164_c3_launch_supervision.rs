@@ -70,6 +70,7 @@ fn model_for(path: &std::path::Path) -> ModelConfig {
             Vec::new(),
         )],
         inputs: Vec::new(),
+        provider: None,
     }
 }
 
@@ -152,6 +153,7 @@ fn empty_command_rejected_with_canonical_error() {
             invocation_mode: Default::default(),
         }],
         inputs: Vec::new(),
+        provider: None,
     };
     let err = execute(&model, 0, "prompt", None, &HashMap::new(), None).unwrap_err();
     assert_eq!(err, "Empty command");
@@ -174,6 +176,7 @@ fn spawn_failure_error_prefix_is_failed_to_spawn() {
         prompt_mode: PromptMode::Arg,
         providers: vec![provider],
         inputs: Vec::new(),
+        provider: None,
     };
     let err = execute(&model, 0, "prompt", None, &HashMap::new(), None).unwrap_err();
     assert!(

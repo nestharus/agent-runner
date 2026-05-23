@@ -64,6 +64,7 @@ fn account_pool(n: usize) -> ModelConfig {
             .map(|i| ProviderConfig::model_provider(format!("claude{i}"), vec![]))
             .collect(),
         inputs: vec![],
+        provider: None,
     }
 }
 

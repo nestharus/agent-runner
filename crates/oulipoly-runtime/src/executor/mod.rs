@@ -302,6 +302,7 @@ mod tests {
                 vec![],
             )],
             inputs: vec![],
+            provider: None,
         }
     }
 

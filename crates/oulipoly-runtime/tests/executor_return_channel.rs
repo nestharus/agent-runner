@@ -54,6 +54,7 @@ fn model_for(script: &FixtureScript) -> ModelConfig {
             invocation_mode: Default::default(),
         }],
         inputs: Vec::new(),
+        provider: None,
     }
 }
 

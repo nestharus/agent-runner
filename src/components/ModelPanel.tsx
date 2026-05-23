@@ -4,6 +4,7 @@ import { createResource, createSignal, For, Show } from "solid-js";
 import type { ArgAnalysis } from "../lib/args";
 import { analyzeProviderArgs } from "../lib/args";
 import { resolveModelName } from "../lib/grouping";
+import { preserveModelConfig } from "../lib/preserveModelConfig";
 import { isDeniedProviderLevelFlag } from "../lib/providerFlags";
 import { getModel, saveModel, testModel } from "../lib/tauri";
 import type {
@@ -97,6 +98,13 @@ export default function ModelPanel(props: ModelPanelProps) {
 		setProviderForms(forms);
 	}
 
+	function existingModel(): ModelConfig | undefined {
+		if (props.mode !== "edit" || !props.editModelName) return undefined;
+		return existingModels()?.find(
+			(model) => model.name === props.editModelName,
+		);
+	}
+
 	createResource(
 		() => existingModels(),
 		(models) => {
@@ -126,7 +134,7 @@ export default function ModelPanel(props: ModelPanelProps) {
 			providers.push({ name: form.command, args });
 		}
 
-		return { name, prompt_mode: "stdin", providers, inputs: [] };
+		return preserveModelConfig(existingModel(), { name, providers });
 	}
 
 	async function handleSaveAndTest() {

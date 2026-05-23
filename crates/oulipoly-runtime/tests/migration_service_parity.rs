@@ -85,6 +85,7 @@ fn model_with_storage(source_projects: &Path, target_projects: &Path) -> ModelCo
             provider("claude2", target_projects.to_path_buf()),
         ],
         inputs: Vec::new(),
+        provider: None,
     }
 }
 
@@ -182,6 +183,7 @@ fn migration_service_stay_matches_decide_migration() {
         prompt_mode: PromptMode::Arg,
         providers: vec![provider("claude", fixture.source_projects.clone())],
         inputs: Vec::new(),
+        provider: None,
     };
     let resolved = fixture.seed_resolved(&model, SESSION_A);
     let decision = decide_migration(&fixture.state, &model, &resolved, None).unwrap();
@@ -214,6 +216,7 @@ fn migration_service_parity_unchanged() {
         prompt_mode: PromptMode::Arg,
         providers: vec![provider("claude", fixture.source_projects.clone())],
         inputs: Vec::new(),
+        provider: None,
     };
     let resolved = fixture.seed_resolved(&model, SESSION_A);
     let mut stderr = Vec::new();

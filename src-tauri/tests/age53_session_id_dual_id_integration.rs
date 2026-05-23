@@ -49,6 +49,7 @@ fn test_model_config() -> ModelConfig {
             Vec::new(),
         )],
         inputs: Vec::new(),
+        provider: None,
     }
 }
 

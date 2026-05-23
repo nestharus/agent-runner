@@ -325,6 +325,7 @@ printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$requested"
         prompt_mode: PromptMode::Arg,
         providers: vec![provider],
         inputs: Vec::new(),
+        provider: None,
     };
 
     let result = execute(&model, 0, "prompt", None, &HashMap::new(), None).expect("execute");
@@ -366,6 +367,7 @@ printf '{"type":"result","session_id":"%s"}\n' "$requested"
         prompt_mode: PromptMode::Arg,
         providers: vec![provider],
         inputs: Vec::new(),
+        provider: None,
     };
 
     let result = execute(&model, 0, "prompt", None, &HashMap::new(), None).expect("execute");
@@ -395,6 +397,7 @@ fn acr251_pp007_forced_flag_verified_no_event_fails_with_canonical_message() {
         prompt_mode: PromptMode::Arg,
         providers: vec![provider],
         inputs: Vec::new(),
+        provider: None,
     };
 
     let result = execute(&model, 0, "prompt", None, &HashMap::new(), None).expect("execute");
@@ -427,6 +430,7 @@ fn acr251_pp007_forced_flag_verified_system_init_missing_session_id_errors() {
         prompt_mode: PromptMode::Arg,
         providers: vec![provider],
         inputs: Vec::new(),
+        provider: None,
     };
 
     let result = execute(&model, 0, "prompt", None, &HashMap::new(), None).expect("execute");
@@ -472,6 +476,7 @@ printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$requested"
         prompt_mode: PromptMode::Arg,
         providers: vec![provider],
         inputs: Vec::new(),
+        provider: None,
     };
 
     let result = execute(&model, 0, "prompt", None, &HashMap::new(), None).expect("execute");
@@ -517,6 +522,7 @@ printf '{"type":"agent.session_started","data":{"id":"nested-uuid"}}\n'
         prompt_mode: PromptMode::Arg,
         providers: vec![provider],
         inputs: Vec::new(),
+        provider: None,
     };
 
     let result = execute(&model, 0, "prompt", None, &HashMap::new(), None).expect("execute");
@@ -562,6 +568,7 @@ printf 'no events here\n'
         prompt_mode: PromptMode::Arg,
         providers: vec![provider],
         inputs: Vec::new(),
+        provider: None,
     };
 
     let result = execute(&model, 0, "prompt", None, &HashMap::new(), None).expect("execute");
@@ -606,6 +613,7 @@ printf '{"type":"agent.session_started","data":{}}\n'
         prompt_mode: PromptMode::Arg,
         providers: vec![provider],
         inputs: Vec::new(),
+        provider: None,
     };
 
     let result = execute(&model, 0, "prompt", None, &HashMap::new(), None).expect("execute");

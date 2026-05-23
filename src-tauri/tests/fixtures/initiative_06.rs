@@ -111,6 +111,7 @@ impl LocateFixture {
                         .map(|name| ProviderConfig::model_provider(name, Vec::new()))
                         .collect(),
                     inputs: Vec::new(),
+                    provider: None,
                 },
             );
         }

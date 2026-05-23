@@ -17,6 +17,9 @@
 //! ```
 
 use crate::claude_tool_filter::{ClaudeToolFilterShape, validate_proxy_claude_filter_shape};
+use crate::provider_implementation_ref::{
+    ProviderImplementationRef, ProviderImplementationRefError,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -75,28 +78,6 @@ impl ProviderConfig {
             tool_restrictions: None,
             invocation_mode: InvocationMode::Headless,
         }
-    }
-
-    #[allow(dead_code)]
-    fn validate_interactive_args(&self) -> Result<(), String> {
-        if matches!(self.interactive_args.as_ref(), Some(args) if args.is_empty()) {
-            return Err("interactive_args must not be empty when provided".into());
-        }
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    fn validate_resume_interactive_args(&self) -> Result<(), String> {
-        if matches!(
-            self.resume.as_ref().map(|resume| resume.kind),
-            Some(ResumeKind::Flag | ResumeKind::Subcommand)
-        ) && self.interactive_args.is_none()
-        {
-            return Err(
-                "[providers.resume] requires interactive_args for resumable providers".into(),
-            );
-        }
-        Ok(())
     }
 
     pub fn model_provider(name: impl Into<String>, args: Vec<String>) -> Self {
@@ -503,6 +484,8 @@ pub struct ModelConfig {
     pub providers: Vec<ProviderConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<InputDef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ProviderImplementationRef>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -568,7 +551,6 @@ impl ModelConfig {
 
 // --- Raw TOML structures for deserialization ---
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 struct RawModelToml {
     command: Option<String>,
@@ -579,11 +561,12 @@ struct RawModelToml {
     session_capture: Option<SessionCapture>,
     resume_acceptance: Option<ResumeAcceptanceRules>,
     session_storage: Option<SessionStorage>,
+    #[serde(default)]
+    provider: Option<ProviderImplementationRef>,
     providers: Option<Vec<RawProvider>>,
     inputs: Option<Vec<RawInput>>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 struct RawProvider {
     #[serde(default)]
@@ -598,12 +581,10 @@ struct RawProvider {
     session_storage: Option<SessionStorage>,
     system_prompt_override: Option<String>,
     tool_restrictions: Option<ToolRestrictions>,
-    #[allow(dead_code)]
     #[serde(default)]
     invocation_mode: Option<String>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 struct RawInput {
     name: String,
@@ -629,7 +610,14 @@ struct RawInput {
 pub enum ModelError {
     Io(std::io::Error),
     Toml(String, String),
-    InvocationModeIsRootOnly { model: String, provider: String },
+    ProviderImplementationRef {
+        model: String,
+        source: ProviderImplementationRefError,
+    },
+    InvocationModeIsRootOnly {
+        model: String,
+        provider: String,
+    },
     Other(String, String),
 }
 
@@ -637,6 +625,12 @@ impl ModelError {
     fn with_model_name(self, name: &str) -> Self {
         match self {
             Self::Toml(model, err) if model == "<unknown>" => Self::Toml(name.to_string(), err),
+            Self::ProviderImplementationRef { model, source } if model == "<unknown>" => {
+                Self::ProviderImplementationRef {
+                    model: name.to_string(),
+                    source,
+                }
+            }
             Self::InvocationModeIsRootOnly { model, provider } if model == "<unknown>" => {
                 Self::InvocationModeIsRootOnly {
                     model: name.to_string(),
@@ -660,6 +654,9 @@ impl fmt::Display for ModelError {
         match self {
             Self::Io(err) => write!(f, "io error reading model TOML: {err}"),
             Self::Toml(model, err) => write!(f, "toml parse error in model {model}: {err}"),
+            Self::ProviderImplementationRef { model, source } => {
+                write!(f, "model {model}: {source}")
+            }
             Self::InvocationModeIsRootOnly { model, provider } => write!(
                 f,
                 "model {model}: provider {provider}: invocation_mode is root-only and must move to providers.toml"
@@ -692,6 +689,16 @@ impl PartialEq for ModelError {
                 left_model == right_model && left_err == right_err
             }
             (
+                ProviderImplementationRef {
+                    model: left_model,
+                    source: left_source,
+                },
+                ProviderImplementationRef {
+                    model: right_model,
+                    source: right_source,
+                },
+            ) => left_model == right_model && left_source == right_source,
+            (
                 InvocationModeIsRootOnly {
                     model: left_model,
                     provider: left_provider,
@@ -711,12 +718,10 @@ impl PartialEq for ModelError {
 
 impl Eq for ModelError {}
 
-#[allow(dead_code)]
 fn parse_model_toml(text: &str) -> Result<RawModelToml, ModelError> {
     toml::from_str(text).map_err(|err| ModelError::Toml("<unknown>".to_string(), err.to_string()))
 }
 
-#[allow(dead_code)]
 fn validate_model_toml_against_providers(
     raw: &RawModelToml,
     providers: Option<&crate::providers::ProvidersConfig>,
@@ -728,6 +733,14 @@ fn validate_model_toml_against_providers(
 
 fn validate_raw_model_provider_fields(raw: &RawModelToml) -> Result<(), ModelError> {
     validate_legacy_model_fields(raw)?;
+    if let Some(provider) = raw.provider.as_ref() {
+        provider
+            .validate()
+            .map_err(|source| ModelError::ProviderImplementationRef {
+                model: "<unknown>".to_string(),
+                source,
+            })?;
+    }
     validate_raw_model_providers(raw)?;
     if let Some(inputs) = raw.inputs.clone() {
         parse_inputs(inputs).map_err(|err| ModelError::Other("<unknown>".to_string(), err))?;
@@ -752,7 +765,6 @@ fn validate_provider_aware_shape(
     Ok(())
 }
 
-#[allow(dead_code)]
 fn construct_model_config_from_raw(raw: RawModelToml) -> ModelConfig {
     let providers = raw
         .providers
@@ -775,15 +787,14 @@ fn construct_model_config_from_raw(raw: RawModelToml) -> ModelConfig {
             .unwrap_or(PromptMode::Stdin),
         providers,
         inputs,
+        provider: raw.provider,
     }
 }
 
-#[allow(dead_code)]
 fn emit_model_toml(model: &ModelConfig) -> String {
     model.to_toml()
 }
 
-#[allow(dead_code)]
 fn read_model_files(dir: &Path) -> Result<Vec<(PathBuf, String)>, ModelError> {
     list_model_toml_paths(dir)?
         .into_iter()
@@ -826,7 +837,6 @@ fn pair_path_and_text(path: PathBuf, text: String) -> (PathBuf, String) {
     (path, text)
 }
 
-#[allow(dead_code)]
 fn parse_model_files(
     files: Vec<(PathBuf, String)>,
 ) -> Result<Vec<(PathBuf, RawModelToml)>, ModelError> {
@@ -842,7 +852,6 @@ fn parse_model_files(
         .collect()
 }
 
-#[allow(dead_code)]
 fn validate_models_against_providers(
     raws: &[(PathBuf, RawModelToml)],
     providers: Option<&crate::providers::ProvidersConfig>,
@@ -855,7 +864,6 @@ fn validate_models_against_providers(
     Ok(())
 }
 
-#[allow(dead_code)]
 fn model_name_from_path(path: &Path) -> Result<String, ModelError> {
     path.file_stem()
         .and_then(|stem| stem.to_str())
@@ -1031,7 +1039,6 @@ fn build_provider_argv_tokens(provider: &ProviderConfig) -> Vec<String> {
     argv
 }
 
-#[allow(dead_code)]
 fn parse_input_type(raw: &RawInput) -> Result<InputType, String> {
     match raw.type_name.as_str() {
         "string" => Ok(InputType::String),
@@ -1066,7 +1073,6 @@ fn parse_input_type(raw: &RawInput) -> Result<InputType, String> {
     }
 }
 
-#[allow(dead_code)]
 fn parse_inputs(raw_inputs: Vec<RawInput>) -> Result<Vec<InputDef>, String> {
     let mut inputs = Vec::new();
     let mut has_default_input = false;
@@ -1105,6 +1111,10 @@ impl ModelConfig {
             PromptMode::Stdin => "stdin",
             PromptMode::Arg => "arg",
         };
+
+        if let Some(provider) = self.provider.as_ref() {
+            append_provider_implementation_ref(&mut out, provider);
+        }
 
         if self.providers.len() == 1 {
             let p = &self.providers[0];
@@ -1247,6 +1257,26 @@ fn append_optional_string_list(out: &mut String, key: &str, values: Option<&[Str
     }
 }
 
+fn append_provider_implementation_ref(out: &mut String, provider: &ProviderImplementationRef) {
+    let mut fields = Vec::new();
+    if let Some(path) = provider.path.as_deref() {
+        fields.push(format!("path = {}", toml_string_literal(path)));
+    }
+    if let Some(crate_name) = provider.crate_name.as_deref() {
+        fields.push(format!("crate = {}", toml_string_literal(crate_name)));
+    }
+    if let Some(version) = provider.version.as_deref() {
+        fields.push(format!("version = {}", toml_string_literal(version)));
+    }
+    if let Some(binary) = provider.binary.as_deref() {
+        fields.push(format!("binary = {}", toml_string_literal(binary)));
+    }
+    if let Some(script) = provider.script.as_deref() {
+        fields.push(format!("script = {}", toml_string_literal(script)));
+    }
+    out.push_str(&format!("provider = {{ {} }}\n\n", fields.join(", ")));
+}
+
 fn format_string_list(values: &[String]) -> String {
     values
         .iter()
@@ -1276,7 +1306,6 @@ fn format_toml_value(v: &toml::Value) -> String {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum CodexArgPart {
     Standalone(String),
@@ -1284,7 +1313,6 @@ enum CodexArgPart {
 }
 
 impl CodexArgPart {
-    #[allow(dead_code)]
     fn display(&self) -> String {
         match self {
             Self::Standalone(token) => token.clone(),
@@ -1293,7 +1321,6 @@ impl CodexArgPart {
     }
 }
 
-#[allow(dead_code)]
 fn split_codex_arg_parts(args: &[String]) -> Vec<CodexArgPart> {
     let mut parts = Vec::new();
     let mut i = 0;
@@ -1320,7 +1347,6 @@ fn split_codex_arg_parts(args: &[String]) -> Vec<CodexArgPart> {
     parts
 }
 
-#[allow(dead_code)]
 fn codex_arg_overlap(root_args: &[String], model_args: &[String]) -> Option<String> {
     let root_parts = split_codex_arg_parts(root_args)
         .into_iter()
@@ -1332,12 +1358,10 @@ fn codex_arg_overlap(root_args: &[String], model_args: &[String]) -> Option<Stri
         .map(|part| part.display())
 }
 
-#[allow(dead_code)]
 fn codex_config_pair_key(value: &str) -> &str {
     value.split_once('=').map(|(key, _)| key).unwrap_or(value)
 }
 
-#[allow(dead_code)]
 fn codex_model_config_pair_keys(args: &[String]) -> HashSet<String> {
     split_codex_arg_parts(args)
         .into_iter()
@@ -1348,7 +1372,6 @@ fn codex_model_config_pair_keys(args: &[String]) -> HashSet<String> {
         .collect()
 }
 
-#[allow(dead_code)]
 fn codex_typed_policy_overlap(
     root: &crate::providers::ProviderEntry,
     model_args: &[String],
@@ -1372,7 +1395,6 @@ fn codex_typed_policy_overlap(
         .map(|pair| pair.to_string())
 }
 
-#[allow(dead_code)]
 pub(crate) fn validate_codex_model_arg_overlap(
     model_name: &str,
     model: &ModelConfig,
@@ -1528,6 +1550,7 @@ mod tests {
                 args.iter().map(|arg| (*arg).to_string()).collect(),
             )],
             inputs: vec![],
+            provider: None,
         }
     }
 
