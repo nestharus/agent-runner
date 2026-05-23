@@ -3640,3 +3640,97 @@ This is NOT residual acceptance, NOT precedent citation, and does NOT authorize 
 - **Manager-max consistency**: not a residual acceptance of a non-LOW gate the WU produced or could repair; the WU contribution to the failure set is provably zero. The three convention dispositions (repair-on-branch / rewind / re-enter-2.5) are each N/A. Root-owned value-judgment, not orchestrator self-authority.
 - **Soft precedent**: a successor WU's rebase-verification gate may reuse this interpretation when its rebase introduces zero regressions and the target carries pre-existing unrelated failures.
 - **Revisit when**: the rebase-verification convention is amended to add an explicit "baseline-failure-on-target" carveout, or codex5 routing/full-suite baseline is repaired upstream.
+
+## AGE-180 — Phase 6 halt: workspace-green blocked by out-of-scope failure (2026-05-23T21:08Z)
+
+- WU: AGE-180 (stale migration test reconciliation)
+- Phase: 6 (post Step 6c)
+- Decision: HALT with NEEDS_INPUT to root; did not auto-merge, did not expand scope.
+- Scoped deliverable COMPLETE: `migration_degrades_when_compaction_boundary_not_in_jsonl` passes;
+  `initiative_05_migration` 31/0; fmt + clippy clean; zero product-code change.
+- Blocker (out of AGE-180 anti-scope): `workflow_yml_contract::assertion_a05_ci_trigger_preserved`
+  fails on base tree — `ci.yml on:` is `workflow_dispatch:` only (#136/#127) vs test requiring
+  `pull_request`. Distinct root cause; same RCA-cluster class.
+- Justifying evidence: planning/age-180-stale-migration-test/audit-history.md (Round 7),
+  scratch/questions/q-8be014b5-c3b0-4532-ba6e-1ee61be00d54.question.json
+
+## AGE-180 — Phase 6 resume: scope expanded to reconcile second stale test (2026-05-23)
+
+- WU: AGE-180 (stale TEST reconciliation — now TWO tests)
+- Phase: 6 (resume after q-8be014b5 NEEDS_INPUT)
+- Decision: root answered q-8be014b5 with **option 2** — expand AGE-180 scope to also reconcile
+  `workflow_yml_contract::assertion_a05_ci_trigger_preserved` (test-only edit, same class as the
+  migration test) so `cargo test --workspace` goes green now. NOT option 3 (restoring `pull_request`
+  to ci.yml), which would re-introduce the auto-running-workflows regression #136 deliberately fixed.
+- Action: renamed `assertion_a05_ci_trigger_preserved` → `assertion_a05_ci_trigger_is_manual_dispatch`
+  and reconciled it to the `workflow_dispatch`-only contract (asserts single-key `on:` =
+  workflow_dispatch, no pull_request/push). Test-only: NO product code, NO ci.yml changes.
+- Provenance: ci.yml is correctly workflow_dispatch-only per #136 (`9adbc45`), reinforced by #127
+  (`709b551`); the test was last touched before #136 and went stale. Same hotfix-skipped-workspace
+  -suite class as the migration test (#135).
+- Justifying evidence: scratch/questions/q-8be014b5-c3b0-4532-ba6e-1ee61be00d54.answer.json;
+  contracts/age-180-stale-migration-test.md (Surface 2); scratch/phase6/step6b-output-index.md row 2.
+
+## AGE-180 — Phase 6 resume: final expansion to restore-green-main (workspace_layout reconciled, 2026-05-23)
+
+- WU: AGE-180 (stale TEST reconciliation — now THREE surfaces; definitive restore-green-main WU)
+- Phase: 6 resume after q-0de4482e NEEDS_INPUT (third failure cluster), then Phase 7→8→8.X→9.
+- Decision: root answered q-0de4482e with **option 1** — expand AGE-180 a final time (test-only) to
+  reconcile `src-tauri/tests/workspace_layout.rs` (4 failing tests). NOT option 3 (breaking the
+  provider↔runtime dev-dep in product `Cargo.toml`): the dev-dependency is legitimate re-export
+  coverage (#139), the TEST is wrong.
+- Process change honored: ran `cargo test --workspace --no-fail-fast` (202 binaries) FIRST and wrote a
+  complete failure inventory (`planning/age-180-stale-migration-test/research/age-180-full-failure-inventory.md`) before editing — exactly
+  one failing target remained (`workspace_layout`, 4 tests); no other failures; no product defect.
+- Actions (test-only, in `workspace_layout.rs`):
+  - Added `crates/oulipoly-provider` to `WORKSPACE_MEMBERS` (fixes `workspace_members_exact_set`,
+    `workspace_default_members_exact_set`) and `"oulipoly-provider"` to `GRAPH_NODES`.
+  - Added edges `("oulipoly-provider","oulipoly-runtime")` (normal) and
+    `("oulipoly-runtime","oulipoly-provider")` (dev) to `EXPECTED_EDGES` (fixes `dep_graph_exact_match`).
+  - Test-logic fix: `workspace_edge_set(root, include_dev)` now filters `kind == "dev"`; `dep_graph_acyclic`
+    calls it with `include_dev=false` (build-only graph) while `dep_graph_exact_match` keeps the full
+    set. Excludes the permitted dev-dep cycle from the build-acyclicity check (fixes `dep_graph_acyclic`).
+- Provenance: workspace_layout.rs last touched #60 (`d54c1e6`); `oulipoly-provider` scaffolded #137
+  (`44c6107`) and wired #139 (`df5de14`); the dev-dep back-edge is AGE-177's re-export smoke test.
+  All four drifts trace to merges #135/#136/#137/#139 whose CI did not run the full workspace suite.
+- Result: `cargo test --workspace` fully GREEN (0 failing targets; `initiative_05_migration` 31/0,
+  `workflow_yml_contract` 18/0, `workspace_layout` 9/0); `cargo fmt --check` + `cargo clippy
+  --workspace --all-targets -- -D warnings` clean. Diff = the three test files + DECISIONS.md only.
+- Phase 6 r3 apply-gate-set PASS (cycle AGE-180-r3; 12 rows; code-quality LOW; alignment ALIGNED;
+  process-tree-audit-2 PASS child `0aadc849`); join manifest re-keyed (`planning/age-180-stale-migration-test/risk/phase-6-join-manifest.json`).
+- No bootstrap exception claimed; no residual acceptance (manager-max).
+- Justifying evidence: scratch/questions/q-0de4482e-27d5-4b1a-a058-0f4cf2bd3be3.answer.json;
+  planning/age-180-stale-migration-test/research/age-180-full-failure-inventory.md; contracts/age-180-stale-migration-test.md (Surface 3);
+  scratch/phase6/step6b-output-index.md rows 3-6; planning/age-180-stale-migration-test/risk/phase-6-join-manifest.json.
+
+## AGE-180 — Rebase Verification Gate (rebase onto #140): repair-on-branch for doomed-dir-link guard (2026-05-24)
+
+- WU: AGE-180 (stale TEST reconciliation). Phase: Rebase Verification Gate Check #1, after rebasing
+  onto `origin/main` `bac470b` (AGE-179 / PR #140 merged in parallel; root answered q-b566258b option 1).
+- Trigger: post-rebase `cargo test --workspace` FAILED on
+  `oulipoly-agent-runner --test structural_segmentation::no_dangling_doomed_dir_link_in_tracked_files`.
+  The guard (PR #43, "segment local planning dirs out of agent-runner") forbids any tracked file from
+  containing a bare doomed-dir reference matching `(research|risk|proposals|review|initiatives|product-strategy)/<file>.<ext>`.
+  Four AGE-180 DECISIONS.md lines tripped it: bare `research/<...>` and `risk/<...>` references (the
+  full-failure-inventory and the Phase 6 join manifest) in the "final expansion" entry, written without
+  the disambiguating `planning/age-180-stale-migration-test/` prefix.
+- Latency note: this was a pre-existing latent failure on PRE_TIP `14e1f13`, NOT rebase-induced. The
+  blob of `structural_segmentation.rs` is byte-identical across `14043a6`/`14e1f13`/`bac470b`/`2622740`,
+  and the three reconciled test-file blobs are byte-identical pre/post rebase (`git range-diff` shows the
+  only delta is the DECISIONS.md anchor move). The prior "fully green" claim missed this target because
+  the enumerate-all `--no-fail-fast` inventory ran BEFORE the final DECISIONS.md entry (which introduced
+  the bare references) was appended; `cargo test` stops at the first failing target so it surfaced only
+  on the post-rebase full re-run. The Rebase Verification Gate is what caught it.
+- Disposition: **repair on branch** (per `~/ai/conventions/rebase-verification.md` Outcomes). Doc-only:
+  prefixed the four bare `research/`/`risk/` references with `planning/age-180-stale-migration-test/` so
+  they no longer match the doomed-dir regex (the dir token is now preceded by `/`, outside the regex
+  word-boundary) and are unambiguous — the same `planning/<wu>/...` form AGE-179's entries already use.
+  Zero semantic loss; the references still point to the same planning artifacts.
+- Constraints honored: NO product code, NO ci.yml, NO Cargo.toml dependency change. Test files unchanged
+  (blobs identical). Not a residual acceptance and not a bootstrap exception (manager-max): the guard is
+  driven back to GREEN, not accepted at non-LOW.
+- Result: doomed-dir scan across all tracked files now returns zero violations;
+  `cargo test --workspace` GREEN. Evidence: planning/age-180-stale-migration-test/audit-history.md
+  (Rebase Verification Gate section); planning/age-180-stale-migration-test/risk/age-180-rebase-verification.md.
+- Revisit when: never (informational); future WUs appending to DECISIONS.md must reference planning
+  artifacts with the `planning/<wu>/...` prefix, never bare `research/`/`risk/` paths.

@@ -963,7 +963,7 @@ fn assertion_a04_integration_workspace_commands() {
 }
 
 #[test]
-fn assertion_a05_ci_trigger_preserved() {
+fn assertion_a05_ci_trigger_is_manual_dispatch() {
     let workflow = ci_workflow();
     let on = value_at(&workflow, "A5 ci.yml on", &["on"]);
     let on_mapping = match on {
@@ -973,26 +973,19 @@ fn assertion_a05_ci_trigger_preserved() {
     assert_eq!(
         on_mapping.len(),
         1,
-        "A5: ci.yml on block must only contain pull_request, got {on_mapping:?}"
+        "A5: ci.yml on block must only contain workflow_dispatch, got {on_mapping:?}"
     );
-    let pull_request = mapping_get(on, "pull_request")
-        .unwrap_or_else(|| panic!("A5: ci.yml on block must contain pull_request"));
-    assert_eq!(
-        sequence_at(
-            pull_request,
-            "A5 ci.yml on.pull_request.branches",
-            &["branches"]
-        )
-        .iter()
-        .map(|branch| {
-            branch
-                .as_str()
-                .unwrap_or_else(|| panic!("A5: ci.yml pull_request branch must be a string"))
-                .to_string()
-        })
-        .collect::<Vec<_>>(),
-        vec!["main".to_string()],
-        "A5: ci.yml pull_request branches must be exactly [main]"
+    assert!(
+        mapping_get(on, "workflow_dispatch").is_some(),
+        "A5: ci.yml on block must contain workflow_dispatch (manual-only trigger)"
+    );
+    assert!(
+        mapping_get(on, "pull_request").is_none(),
+        "A5: ci.yml on block must not contain the pull_request auto-trigger"
+    );
+    assert!(
+        mapping_get(on, "push").is_none(),
+        "A5: ci.yml on block must not contain the push auto-trigger"
     );
 }
 

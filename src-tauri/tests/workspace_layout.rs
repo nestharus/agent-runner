@@ -10,6 +10,7 @@ const WORKSPACE_MEMBERS: &[&str] = &[
     "crates/oulipoly-state",
     "crates/oulipoly-runtime",
     "crates/oulipoly-setup",
+    "crates/oulipoly-provider",
     "crates/oulipoly-agent-store",
     "crates/oulipoly-agent-scratchpad",
     "crates/oulipoly-agent-messenger",
@@ -34,6 +35,8 @@ const EXPECTED_EDGES: &[(&str, &str)] = &[
     ("oulipoly-runtime", "oulipoly-agent-messenger"),
     ("oulipoly-runtime", "oulipoly-config"),
     ("oulipoly-runtime", "oulipoly-core"),
+    ("oulipoly-runtime", "oulipoly-provider"),
+    ("oulipoly-provider", "oulipoly-runtime"),
     ("oulipoly-setup", "oulipoly-state"),
     ("oulipoly-state", "oulipoly-config"),
     ("oulipoly-state", "oulipoly-agent-messenger"),
@@ -50,6 +53,7 @@ const GRAPH_NODES: &[&str] = &[
     "oulipoly-state",
     "oulipoly-runtime",
     "oulipoly-setup",
+    "oulipoly-provider",
     "oulipoly-agent-store",
     "oulipoly-agent-scratchpad",
     "oulipoly-agent-messenger",
@@ -120,7 +124,7 @@ fn edge_label(package_name: &str) -> String {
     }
 }
 
-fn workspace_edge_set(root: &Path) -> BTreeSet<(String, String)> {
+fn workspace_edge_set(root: &Path, include_dev: bool) -> BTreeSet<(String, String)> {
     let metadata = metadata(root, &["metadata", "--format-version", "1"]);
     let workspace_ids: BTreeSet<&str> = metadata
         .get("workspace_members")
@@ -153,10 +157,10 @@ fn workspace_edge_set(root: &Path) -> BTreeSet<(String, String)> {
             .and_then(Value::as_array)
             .expect("metadata package should include dependencies");
 
-        for dependency in dependencies
-            .iter()
-            .filter(|dependency| dependency.get("path").is_some())
-        {
+        for dependency in dependencies.iter().filter(|dependency| {
+            dependency.get("path").is_some()
+                && (include_dev || dependency.get("kind").and_then(Value::as_str) != Some("dev"))
+        }) {
             let dependency_name = dependency
                 .get("name")
                 .and_then(Value::as_str)
@@ -419,14 +423,14 @@ fn no_binary_name_collision() {
 
 #[test]
 fn dep_graph_exact_match() {
-    let edges = workspace_edge_set(&repo_root());
+    let edges = workspace_edge_set(&repo_root(), true);
 
     assert_eq!(edges, expected_edges());
 }
 
 #[test]
 fn dep_graph_acyclic() {
-    let edges = workspace_edge_set(&repo_root());
+    let edges = workspace_edge_set(&repo_root(), false);
     let mut nodes = graph_nodes();
 
     for (dependent, dependency) in &edges {
