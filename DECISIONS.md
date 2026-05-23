@@ -3595,3 +3595,48 @@ This is NOT residual acceptance, NOT precedent citation, and does NOT authorize 
 - **Rationale**: Bootstrap-exception is forbidden, so the HIGH must be repaired in-WU. The aggregate-code-quality report's note ("remediation of dead-code markers and reconstruction shape is distinct from removing concrete provider implementation code and is permitted") authorizes in-WU repair without violating ticket anti-scope #2 (no extraction/move/delete of concrete provider implementation code). Helper-extraction for `ModelPanel.tsx` is the smallest-blast-radius route that simultaneously closes the A13 silent field-loss falsifier required by shortcut-risk R1-F03 (path-a unconditional preservation falsifier).
 - **Falsifier route for A13 (R1-F03)**: path (a) — unconditional frontend preservation test. The test constructs a `ModelConfig` TS object with `provider` populated (each of three flavors at least once), passes it through `preserveModelConfig` (the new helper) against an unchanged fetched model, and asserts the resulting save payload still contains `provider` deep-equal to the input. The `preserveModelConfig` helper unconditionally satisfies the falsifier even if `ModelPanel.tsx` itself were otherwise untouched.
 - **Revisit when**: never — strategy chosen at Phase 4 round-1; Phase 4 round-2 verifies the revised proposal carries these commitments and that touched-file code-quality returns LOW after Phase 6c implements the strategy.
+
+## D-AGE-179-phase-0-routing-override — gpt-medium → claude-sonnet for Phase 0 ticket-read
+
+- **Source**: AGE-179 Phase 0 step 4 (`linear-operator task=read`); operator file declares `model: gpt-medium`.
+- **Trigger**: Three consecutive default-routed dispatches (`agents -a linear-operator …`) landed on `codex5` and failed with `auth_expired`/`HTTP 401: Your authentication token has been invalidated.`. `--rotate-provider codex4` did not redirect initial routing (the flag rotates an active chain segment, not initial provider selection). `agents --usage` confirmed `codex5` quota-script reports HTTP 401; `claude` account at 0%/3% used, freshest in the pool.
+- **Decision**: Use explicit `-m claude-sonnet` override for `linear-operator` and other `gpt-medium`-declared operators while the codex pool's `codex5` auth is invalidated. Recorded per-dispatch in `planning/age-179-provider-docs/audit-history.md`. The override does not change semantics because the affected `linear-operator` tasks are deterministic CLI shell-outs (`clients.linear.cli get-issue`, `update-issue`, `create-comment`).
+- **Evidence**:
+  - `planning/age-179-provider-docs/scratch/logs/age-179-phase-0-ticket-read.log` (succeeded under `claude-sonnet` in ~56s).
+  - `agents --usage` snapshot capturing codex5 401 + claude headroom at 100%/97%.
+- **Revisit when**: codex5 auth refreshed; orchestrator may revert to default `gpt-medium` routing.
+
+## D-AGE-179-phase-0-estimate-cold-start — manager dispatch satisfies cold-start gate
+
+- **Source**: AGE-179 Phase 2.5 step 4a (inherited-estimate cold-start check); evaluated at Phase 0 close.
+- **Trigger**: `scratch/ticket.md` `estimate_source: missing` (no `Estimate Source:` heading in description); without a prior user disposition this normally writes a `single_choice` NEEDS_INPUT (`Run a small prototype first` / `Proceed without a baseline estimate` / `Terminate WU`).
+- **Disposition (prior to step 4a evaluation)**: the manager dispatch (this WU's invocation prompt § Caller notes) supplies "Phase 3 must refine estimate and write back to AGE-179 via `linear-operator`" — explicit instruction equivalent to `Proceed without a baseline estimate` + refine in Phase 3. The ticket description further states "Estimate at filing: 3 SP" with decomposition rationale carried from AGE-174.
+- **Decision**: Do not emit a NEEDS_INPUT for estimate-cold-start. Phase 3 refines the estimate and dispatches `linear-operator task=update-estimate` before Phase 4 prompt composition, per the standard track.
+- **Revisit when**: a future WU starts with `estimate_source` missing without an explicit manager-context disposition.
+
+## D-AGE-179-phase-0-predecessor-link — loose predecessor link accepted
+
+- **Source**: AGE-179 Phase 0 step 11 (predecessor handoff import).
+- **Trigger**: `predecessor_session_manifest_path = planning/age-176-provider-crate-scaffold/session.json`; predecessor manifest `successor_session_brief: null` (does not name AGE-179 explicitly).
+- **Decision**: Accept the loose link via the carried-context arm of the validation rule. The manager dispatch's caller-context establishes AGE-179 as AGE-174d, the docs-only sibling of AGE-176 (AGE-174a / foundation), AGE-177 (AGE-174b / locator), and AGE-178 (AGE-174c / TOML field). Render `planning/age-179-provider-docs/scratch/predecessor-session.md` to preserve the link for downstream phases. No prototype-pending tests carry forward (foundation WU produced ordinary product-code tests).
+- **Revisit when**: a future WU spawns from an explicit `successor_session_brief`.
+
+## D-AGE-179-phase-0-stale-local-trunk — origin/main used as branch_out_sha
+
+- **Source**: AGE-179 Phase 0 step 10 (session manifest init).
+- **Trigger**: `/home/nes/projects/agent-runner/trunk/main` is at `2608fe8d271ca4d6af97265ea84fd27a2f84e0f9` (behind the AGE-176/AGE-177/AGE-178 merges). `origin/main` (post-fetch) is at `14242c03a0e26127c59daab81b9a4354a01f927d` and matches the worktree HEAD.
+- **Decision**: Record `branch_out_sha = 14242c03a0e26127c59daab81b9a4354a01f927d` (origin/main) in `planning/age-179-provider-docs/session.json`. The age-179 worktree has zero local commits beyond origin/main, so this is the correct branch-out point. Local trunk staleness is unrelated to this WU and can be repaired separately with `git -C trunk pull --ff-only origin main`.
+- **Revisit when**: never (informational).
+
+## D-AGE-179-rebase-check-1-intent-reading — Rebase Verification Check #1 procedural-PASS by convention intent
+
+- **Source**: AGE-179 Rebase Verification Gate Check #1 (test re-run), resume after `NEEDS_INPUT` halt `q-ea2a3022-e430-4522-a1ce-6c75498004a3`; root answered Option A.
+- **Trigger**: Post-rebase `cargo test --workspace --no-fail-fast` exits non-zero on the rebased tip `eb1c232`. The operator file's literal rule requires a `PASS` verdict; the convention `~/ai/conventions/rebase-verification.md` § Check #1 frames the intent as "If anything fails that was passing pre-rebase, the rebase introduced a regression and the WU is not yet re-aligned."
+- **Evidence of zero rebase-induced regression**:
+  - `git range-diff 8f5c034~1..8f5c034 14043a6..eb1c232` → `1: 8f5c034 = 1: eb1c232` (replayed commit byte-identical).
+  - Post-rebase diff scope is docs-only: AGENTS.md / DECISIONS.md / README.md / evals/age-179-provider-docs/eval.md — none reach the Rust workspace.
+  - The failing test(s) pre-exist identically on `PRE_TIP` (8f5c034) and `TARGET` (origin/main 14043a6). Root verified directly that exactly one distinct test fails workspace-wide: `migration_errors_when_compaction_boundary_not_in_jsonl` in `initiative_05_migration` — a stale assertion of removed behavior from hotfix PR #135.
+- **Decision**: Record Check #1 as procedural-PASS by the convention's stated intent. The pre-existing failure is tracked under a separate high-priority bug ticket and is NOT folded into this docs-only WU. Proceed to Checks #3/#4, Phase 8 cycle 2, Phase 8.X, Phase 9, auto-merge.
+- **Manager-max consistency**: not a residual acceptance of a non-LOW gate the WU produced or could repair; the WU contribution to the failure set is provably zero. The three convention dispositions (repair-on-branch / rewind / re-enter-2.5) are each N/A. Root-owned value-judgment, not orchestrator self-authority.
+- **Soft precedent**: a successor WU's rebase-verification gate may reuse this interpretation when its rebase introduces zero regressions and the target carries pre-existing unrelated failures.
+- **Revisit when**: the rebase-verification convention is amended to add an explicit "baseline-failure-on-target" carveout, or codex5 routing/full-suite baseline is repaired upstream.

@@ -359,3 +359,125 @@ builder and `e2e/fixtures/scenarios.ts` for pre-built mock configurations.
 
 Scenarios: `FRESH_USER`, `CONFIGURED_USER`, `SINGLE_CLI`, `ERROR_SETUP`,
 `EMPTY_POOLS`.
+
+## Provider Contract Crate (`oulipoly-provider`)
+
+The `crates/oulipoly-provider/` crate is the runner-owned neutral trait boundary for the workspace. It defines the per-concern capability traits and the `ProviderCapabilities` aggregation type that the runner uses to call provider-implementation capabilities. The canonical source of truth for all trait and type definitions is `crates/oulipoly-provider/src/lib.rs`.
+
+`providers.toml` accounts configure runtime dispatch to CLI binaries; `ProviderCapabilities` trait implementations are a separate Rust interface layer that the runner may call for per-concern operations. The two are currently independent; a `providers.toml` entry does not need a corresponding `ProviderCapabilities` implementation to function.
+
+### Per-Concern Traits
+
+Each per-concern trait governs one operational concern. Implement only the traits relevant to your provider; unused concerns are left as `None` in the `ProviderCapabilities` bundle.
+
+- **`ProviderLaunch`** — prepares a launch plan from an incoming request:
+  ```rust
+  fn prepare_launch(&self, request: LaunchRequest<'_>) -> Result<LaunchPlan, CapabilityError>
+  ```
+
+- **`ProviderPolicy`** — evaluates whether a request meets provider policy constraints:
+  ```rust
+  fn evaluate_policy(&self, request: PolicyRequest<'_>) -> Result<PolicyTransform, CapabilityError>
+  ```
+
+- **`TerminalSignalRecognizer`** — classifies process output as a `TerminalSignal` variant (see [`conventions/terminal-signal-provider-vocabulary.md`](conventions/terminal-signal-provider-vocabulary.md) for the canonical signal vocabulary):
+  ```rust
+  fn recognize(&self, evidence: &TerminalSignalEvidence<'_>) -> TerminalSignal
+  ```
+
+- **`ProviderQuota`** — reports quota availability and refreshes authentication; methods: `has_quota_source`, `probe_quota`, `refresh_auth`.
+
+- **`ProviderSession`** — reads and captures provider session state; methods: `read_session_turns`, `capture_session`.
+
+- **`ProviderRotation`** — assesses and materializes provider rotation; methods: `assess_rotation`, `materialize_rotation`.
+
+- **`ProviderDiscovery`** — discovers available models or accounts:
+  ```rust
+  fn discover(&self, request: DiscoveryRequest<'_>) -> Result<DiscoveryReport, CapabilityError>
+  ```
+
+**Aggregation type** — `ProviderCapabilities<Launch, Policy, Terminal, Quota, Session, Locator, Rotation, Discovery>` bundles all eight optional capability slots; all fields default to `None`:
+
+| Field | Slot |
+|---|---|
+| `launch` | `Option<Launch>` |
+| `policy` | `Option<Policy>` |
+| `terminal` | `Option<Terminal>` |
+| `quota` | `Option<Quota>` |
+| `session` | `Option<Session>` |
+| `transcript_locator` | `Option<Locator>` |
+| `rotation` | `Option<Rotation>` |
+| `discovery` | `Option<Discovery>` |
+
+**Wrapper type** — `LocatorRequiredCapabilities<...>` wraps a `ProviderCapabilities` bundle and enforces that a `TranscriptLocator` is present. Constructor `try_from_capabilities` returns `Err(CapabilityError::LocatorRequiredButMissing)` when `transcript_locator` is `None`. Accessors: `capabilities()`, `into_capabilities()`, `transcript_locator()`.
+
+**Error type** — `CapabilityError` is returned by trait methods to signal why a capability could not be fulfilled:
+
+- `Unsupported` — the capability is not implemented by this provider.
+- `LocatorRequiredButMissing` — a transcript locator is required but was not supplied in the bundle.
+- `Invalid { reason }` — the request was structurally invalid.
+- `Unavailable { reason }` — the capability is temporarily unavailable.
+- `Failed { reason }` — the capability attempted execution but failed.
+
+### Locator Slot and `TranscriptLocator` Re-Export
+
+The `transcript_locator` field on `ProviderCapabilities` is the locator-implementation slot; the runner calls this slot to locate transcript files for a session. See [`Optional: transcript_locator`](README.md#optional-transcript_locator) for the script-level contract used by pre-existing providers.
+
+`crates/oulipoly-provider` re-exports the following eight types from `oulipoly_runtime::session_metadata` so that implementors need only depend on `oulipoly-provider`:
+
+- `LocatedTranscript`
+- `LocatorError`
+- `LocatorSource`
+- `ScriptKind`
+- `TranscriptLocator`
+- `TranscriptLookupMode`
+- `TranscriptRequest`
+- `UnsupportedStorageReason`
+
+Existing concrete providers satisfy the locator slot by being wrapped in a `TranscriptLocator` implementation; no rewrite of pre-existing CLI providers is required.
+
+### TOML `provider` Field (Implementation Reference)
+
+The optional `provider = { ... }` field on a model TOML is parsed as `ProviderImplementationRef` (`crates/oulipoly-config/src/provider_implementation_ref.rs`). Exactly one of the four mutually-exclusive flavors must be supplied:
+
+| TOML key | Meaning |
+|---|---|
+| `path` | Filesystem path to a compiled provider artifact |
+| `crate` | Rust crate name (Rust field: `crate_name`, exposed via `#[serde(rename = "crate")]`); `version` is valid only with this flavor |
+| `binary` | Name or absolute path of an external binary |
+| `script` | Path to a shell script |
+
+> **Parse-only in this release:** Dynamic loading and runtime dispatch are not implemented in this release; the `provider = { ... }` field is recorded by the parser but has no effect on routing or execution.
+
+Of the four flavors, only `script` has a pre-existing precedent (the `transcript_locator` script mechanism). The `path`, `crate`, and `binary` flavors are parse-only with no runtime dispatch in this release; full deployment topology defers to a future dynamic-loading work unit.
+
+**Validation errors:**
+
+- `NoFlavor` — the `provider` table was supplied but none of `path`, `crate`, `binary`, or `script` was set.
+- `MultipleFlavors` — more than one flavor key was set simultaneously.
+- `VersionWithoutCrate` — `version` was supplied without `crate`.
+
+**Examples:**
+
+```toml
+[model.provider]
+crate = "acme-provider"
+version = "0.1.0"
+```
+
+```toml
+[model.provider]
+script = "/usr/local/lib/example-provider/locate.sh"
+```
+
+### Provider Term Glossary
+
+- **account** — a runtime provider account; a named `[<name>]` entry in [`providers.toml`](README.md#providerstoml) that keys per-account quota tracking, error history, and session state.
+
+- **command** — the CLI binary or command string named in a provider account's `command` field; the last token after shell-splitting is used for pool grouping and UI display. See [Model Command Syntax](#model-command-syntax) for the token-extraction mechanics.
+
+- **pool-member** — a `[[providers]]` entry in a model TOML that references a named account by `name` and supplies model-specific arguments; multiple pool members enable load-balanced routing. See [Adding a Model](README.md#adding-a-model).
+
+- **implementation-reference** — the optional `provider = { ... }` field on a model TOML, parsed as `ProviderImplementationRef`, that points to a Rust crate path, external binary, or shell script implementing the `oulipoly-provider` trait contract. Parse-only in this release; no dynamic loading.
+
+> **Forward reference (DD-02):** `docs/architecture/provider-accounts-redesign.md` uses "Provider" in the sense of a planned future CLI-tool entity with sub-entities `Account` and `DiscoveredModel`; this is distinct from the four current runtime meanings documented above.
