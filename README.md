@@ -985,3 +985,25 @@ You are a senior code reviewer. Be concise and actionable.
 ## License
 
 MIT
+
+## Implementing a Provider
+
+To implement a provider, begin with the [`Provider Contract Crate (oulipoly-provider)`](AGENTS.md#provider-contract-crate-oulipoly-provider) reference in `AGENTS.md`, which documents all per-concern traits, the `ProviderCapabilities` aggregation type, and the `CapabilityError` surface.
+
+`providers.toml` accounts configure runtime dispatch to CLI binaries; `ProviderCapabilities` trait implementations are a separate Rust interface layer that the runner may call for per-concern operations. The two are currently independent; a `providers.toml` entry does not need a corresponding `ProviderCapabilities` implementation to function.
+
+**Steps:**
+
+1. Implement the relevant per-concern traits from `crates/oulipoly-provider/`. Each trait governs one operational concern; implement only the traits your provider supports.
+
+2. Populate a `ProviderCapabilities` bundle with only the capabilities your implementation supports. Each field is `Option`-typed and defaults to `None`.
+
+3. Optionally declare the implementation in a model TOML via `provider = { ... }`. The four flavors are `path`, `crate` (plus optional `version`), `binary`, and `script`.
+
+> **Parse-only in this release:** Dynamic loading and runtime dispatch are not implemented in this release; the `provider = { ... }` field is recorded by the parser but has no effect on routing or execution.
+
+**Provider vocabulary précis** (full definitions in [AGENTS.md §Provider Term Glossary](AGENTS.md#provider-term-glossary)):
+
+- **account** — a runtime `providers.toml` entry keying per-account quota and session state.
+- **pool-member** — a `[[providers]]` entry in a model TOML that references an account and supplies model-specific arguments.
+- **implementation-reference** — the `provider = { ... }` TOML field pointing to a `ProviderCapabilities` implementation (parse-only in this release).
