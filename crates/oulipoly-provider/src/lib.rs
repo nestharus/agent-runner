@@ -4,6 +4,11 @@ use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+pub use oulipoly_runtime::session_metadata::{
+    LocatedTranscript, LocatorError, LocatorSource, ScriptKind, TranscriptLocator,
+    TranscriptLookupMode, TranscriptRequest, UnsupportedStorageReason,
+};
+
 pub trait ProviderLaunch {
     fn prepare_launch(&self, request: LaunchRequest<'_>) -> Result<LaunchPlan, CapabilityError>;
 }
@@ -59,6 +64,7 @@ pub trait ProviderDiscovery {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CapabilityError {
     Unsupported,
+    LocatorRequiredButMissing,
     Invalid { reason: String },
     Unavailable { reason: String },
     Failed { reason: String },
@@ -68,6 +74,9 @@ impl fmt::Display for CapabilityError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unsupported => formatter.write_str("capability is unsupported"),
+            Self::LocatorRequiredButMissing => {
+                formatter.write_str("transcript locator capability is required")
+            }
             Self::Invalid { reason } => write!(formatter, "invalid request: {reason}"),
             Self::Unavailable { reason } => {
                 write!(formatter, "capability is unavailable: {reason}")
@@ -281,6 +290,86 @@ impl<Launch, Policy, Terminal, Quota, Session, Locator, Rotation, Discovery> Def
             transcript_locator: None,
             rotation: None,
             discovery: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocatorRequiredCapabilities<
+    Launch,
+    Policy,
+    Terminal,
+    Quota,
+    Session,
+    Locator,
+    Rotation,
+    Discovery,
+> where
+    Locator: TranscriptLocator,
+{
+    inner: ProviderCapabilities<
+        Launch,
+        Policy,
+        Terminal,
+        Quota,
+        Session,
+        Locator,
+        Rotation,
+        Discovery,
+    >,
+}
+
+impl<Launch, Policy, Terminal, Quota, Session, Locator, Rotation, Discovery>
+    LocatorRequiredCapabilities<
+        Launch,
+        Policy,
+        Terminal,
+        Quota,
+        Session,
+        Locator,
+        Rotation,
+        Discovery,
+    >
+where
+    Locator: TranscriptLocator,
+{
+    pub fn try_from_capabilities(
+        inner: ProviderCapabilities<
+            Launch,
+            Policy,
+            Terminal,
+            Quota,
+            Session,
+            Locator,
+            Rotation,
+            Discovery,
+        >,
+    ) -> Result<Self, CapabilityError> {
+        if inner.transcript_locator.is_none() {
+            Err(CapabilityError::LocatorRequiredButMissing)
+        } else {
+            Ok(Self { inner })
+        }
+    }
+
+    pub fn capabilities(
+        &self,
+    ) -> &ProviderCapabilities<Launch, Policy, Terminal, Quota, Session, Locator, Rotation, Discovery>
+    {
+        &self.inner
+    }
+
+    pub fn into_capabilities(
+        self,
+    ) -> ProviderCapabilities<Launch, Policy, Terminal, Quota, Session, Locator, Rotation, Discovery>
+    {
+        self.inner
+    }
+
+    pub fn transcript_locator(&self) -> &Locator {
+        match self.inner.transcript_locator.as_ref() {
+            Some(locator) => locator,
+            None => unreachable!("locator-required capabilities always contain a locator"),
         }
     }
 }

@@ -368,10 +368,10 @@ pub(super) fn parse_forced_flag_verified_session_id(stdout: &[u8]) -> Result<Str
         let Some(value) = parse_stdout_json_line(line) else {
             continue;
         };
-        if value_is_result_event(&value) {
-            if let Some(session_id) = json_session_id(&value) {
-                return Ok(session_id.to_string());
-            }
+        if value_is_result_event(&value)
+            && let Some(session_id) = json_session_id(&value)
+        {
+            return Ok(session_id.to_string());
         }
         if !value_is_system_init_event(&value) {
             continue;

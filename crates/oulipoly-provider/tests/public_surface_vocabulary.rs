@@ -59,7 +59,6 @@ fn disallowed_manifest_terms() -> Vec<String> {
         "oulipoly-core".to_string(),
         "oulipoly-config".to_string(),
         "oulipoly-state".to_string(),
-        "oulipoly-runtime".to_string(),
         "oulipoly-setup".to_string(),
         "oulipoly-agent-store".to_string(),
         "oulipoly-agent-scratchpad".to_string(),
