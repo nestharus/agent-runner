@@ -79,6 +79,7 @@ fn model(name: &str, providers: &[&str]) -> ModelConfig {
             .map(|provider| ProviderConfig::model_provider(*provider, Vec::new()))
             .collect(),
         inputs: Vec::new(),
+        provider: None,
     }
 }
 

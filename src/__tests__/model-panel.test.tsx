@@ -17,11 +17,20 @@ const setHandler = tauriMock.__setHandler as (
 const clearHandlers = tauriMock.__clearHandlers as () => void;
 
 function renderEditPanel() {
+	setHandler("get_model", () =>
+		Promise.resolve({
+			name: "sigterm-model",
+			prompt_mode: "stdin",
+			providers: [],
+			inputs: [],
+		} satisfies ModelConfig),
+	);
+
 	return render(() => (
 		<ModelPanel
 			mode="edit"
 			poolCommands={["sh"]}
-			modelNames={[]}
+			modelNames={["sigterm-model"]}
 			editModelName="sigterm-model"
 			onSave={() => {}}
 			onClose={() => {}}
@@ -73,6 +82,11 @@ describe("ModelPanel", () => {
 		);
 
 		renderEditPanel();
+		await waitFor(() => {
+			expect(
+				(screen.getByText("Save & Test") as HTMLButtonElement).disabled,
+			).toBe(false);
+		});
 		fireEvent.click(screen.getByText("Save & Test"));
 
 		await waitFor(() => {
@@ -85,6 +99,11 @@ describe("ModelPanel", () => {
 		setHandler("test_model", () => Promise.reject(new Error("invoke failed")));
 
 		renderEditPanel();
+		await waitFor(() => {
+			expect(
+				(screen.getByText("Save & Test") as HTMLButtonElement).disabled,
+			).toBe(false);
+		});
 		fireEvent.click(screen.getByText("Save & Test"));
 
 		await waitFor(() => {

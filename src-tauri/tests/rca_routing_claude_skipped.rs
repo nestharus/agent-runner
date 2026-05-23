@@ -14,6 +14,7 @@ fn claude_accounts_model() -> ModelConfig {
             ProviderConfig::model_provider("claude3", vec![]),
         ],
         inputs: vec![],
+        provider: None,
     }
 }
 

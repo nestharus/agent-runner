@@ -560,6 +560,7 @@ mod tests {
             prompt_mode,
             providers: vec![provider],
             inputs: Vec::new(),
+            provider: None,
         }
     }
 

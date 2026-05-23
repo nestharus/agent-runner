@@ -48,6 +48,7 @@ signal-hook = "0.3"
 tauri = { version = "2", features = ["devtools"] }
 tauri-build = { version = "2", features = [] }
 tempfile = "3"
+thiserror = "2"
 tokio = { version = "1", features = ["sync"] }
 toml = "1"
 tracing = "0.1"

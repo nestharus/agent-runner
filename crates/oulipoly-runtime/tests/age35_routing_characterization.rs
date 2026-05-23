@@ -50,6 +50,7 @@ fn two_provider_model() -> ModelConfig {
             ProviderConfig::model_provider("age35-b", vec![]),
         ],
         inputs: vec![],
+        provider: None,
     }
 }
 

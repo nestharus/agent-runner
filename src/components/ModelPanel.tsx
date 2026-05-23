@@ -4,6 +4,7 @@ import { createResource, createSignal, For, Show } from "solid-js";
 import type { ArgAnalysis } from "../lib/args";
 import { analyzeProviderArgs } from "../lib/args";
 import { resolveModelName } from "../lib/grouping";
+import { preserveModelConfig } from "../lib/preserveModelConfig";
 import { isDeniedProviderLevelFlag } from "../lib/providerFlags";
 import { getModel, saveModel, testModel } from "../lib/tauri";
 import type {
@@ -97,6 +98,13 @@ export default function ModelPanel(props: ModelPanelProps) {
 		setProviderForms(forms);
 	}
 
+	function existingModel(): ModelConfig | undefined {
+		if (props.mode !== "edit" || !props.editModelName) return undefined;
+		return existingModels()?.find(
+			(model) => model.name === props.editModelName,
+		);
+	}
+
 	createResource(
 		() => existingModels(),
 		(models) => {
@@ -126,10 +134,21 @@ export default function ModelPanel(props: ModelPanelProps) {
 			providers.push({ name: form.command, args });
 		}
 
-		return { name, prompt_mode: "stdin", providers, inputs: [] };
+		return preserveModelConfig(existingModel(), { name, providers });
 	}
 
 	async function handleSaveAndTest() {
+		if (props.mode === "edit") {
+			if (existingModels.loading) {
+				setError("Model data is still loading. Please wait before saving.");
+				return;
+			}
+			if (!existingModel()) {
+				setError("Unable to load the existing model configuration.");
+				return;
+			}
+		}
+
 		const name = effectiveName();
 		if (!name) {
 			setError(
@@ -364,7 +383,11 @@ export default function ModelPanel(props: ModelPanelProps) {
 								type="button"
 								class="flex w-full items-center justify-center gap-2 rounded-lg bg-accent py-2.5 text-sm font-medium text-black transition-colors hover:bg-accent-hover disabled:opacity-50"
 								onClick={handleSaveAndTest}
-								disabled={saving() || testing()}
+								disabled={
+									saving() ||
+									testing() ||
+									(props.mode === "edit" && existingModels.loading)
+								}
 							>
 								{saving()
 									? "Saving..."

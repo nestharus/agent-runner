@@ -109,6 +109,7 @@ pub(crate) fn run_repl_with_default_provider_with_launcher<O: StateDbOpener>(
             .map(|member| ProviderConfig::model_provider(*member, Vec::new()))
             .collect(),
         inputs: Vec::new(),
+        provider: None,
     };
 
     let state = match services.state_db_path.as_ref() {

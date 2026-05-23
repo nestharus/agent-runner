@@ -145,6 +145,7 @@ fn claude_identity_model(command: String) -> ModelConfig {
         prompt_mode: PromptMode::Arg,
         providers: vec![claude_restricted_provider(command)],
         inputs: Vec::new(),
+        provider: None,
     }
 }
 
@@ -278,6 +279,7 @@ fn intrinsic_surface_claude_identity_drives_claude_policy_emission() {
         prompt_mode: PromptMode::Arg,
         providers: vec![provider],
         inputs: Vec::new(),
+        provider: None,
     };
     let result = execute(&model, 0, "prompt", None, &HashMap::new(), None).expect("execute");
     assert_eq!(result.exit_code, 0);
@@ -319,6 +321,7 @@ fn intrinsic_surface_codex_identity_drives_codex_policy_emission() {
         prompt_mode: PromptMode::Arg,
         providers: vec![provider],
         inputs: Vec::new(),
+        provider: None,
     };
     let result = execute(&model, 0, "prompt", None, &HashMap::new(), None).expect("execute");
     assert_eq!(result.exit_code, 0);
@@ -348,6 +351,7 @@ fn intrinsic_surface_openai_compat_identity_emits_no_policy_when_no_restrictions
         prompt_mode: PromptMode::Arg,
         providers: vec![provider],
         inputs: Vec::new(),
+        provider: None,
     };
     let result = execute(&model, 0, "prompt", None, &HashMap::new(), None).expect("execute");
     assert_eq!(result.exit_code, 0);
@@ -402,6 +406,7 @@ fn intrinsic_surface_identity_from_command_path_basename_claude() {
         prompt_mode: PromptMode::Arg,
         providers: vec![provider],
         inputs: Vec::new(),
+        provider: None,
     };
 
     let result = execute(&model, 0, "prompt", None, &HashMap::new(), None).expect("execute");
@@ -450,6 +455,7 @@ fn intrinsic_surface_identity_via_env_prefix_skips_to_claude() {
         prompt_mode: PromptMode::Arg,
         providers: vec![provider],
         inputs: Vec::new(),
+        provider: None,
     };
 
     let result = execute(&model, 0, "prompt", None, &HashMap::new(), None).expect("execute");
@@ -529,6 +535,7 @@ fn intrinsic_surface_identity_via_env_without_executable_fails_policy_inference(
         prompt_mode: PromptMode::Arg,
         providers: vec![provider],
         inputs: Vec::new(),
+        provider: None,
     };
 
     let err = execute(&model, 0, "prompt", None, &HashMap::new(), None).unwrap_err();
@@ -555,6 +562,7 @@ fn policy_with_unknown_provider_kind_fails_closed() {
         prompt_mode: PromptMode::Arg,
         providers: vec![provider],
         inputs: Vec::new(),
+        provider: None,
     };
 
     let err = execute(&model, 0, "prompt", None, &HashMap::new(), None).unwrap_err();
@@ -582,6 +590,7 @@ fn policy_with_claude_kind_payload_codex_settings_fails_closed() {
         prompt_mode: PromptMode::Arg,
         providers: vec![provider],
         inputs: Vec::new(),
+        provider: None,
     };
 
     let err = execute(&model, 0, "prompt", None, &HashMap::new(), None).unwrap_err();
@@ -610,6 +619,7 @@ fn policy_with_codex_kind_payload_claude_settings_fails_closed() {
         prompt_mode: PromptMode::Arg,
         providers: vec![provider],
         inputs: Vec::new(),
+        provider: None,
     };
 
     let err = execute(&model, 0, "prompt", None, &HashMap::new(), None).unwrap_err();
@@ -641,6 +651,7 @@ fn policy_with_both_claude_and_codex_populated_fails_closed() {
         prompt_mode: PromptMode::Arg,
         providers: vec![provider],
         inputs: Vec::new(),
+        provider: None,
     };
 
     let err = execute(&model, 0, "prompt", None, &HashMap::new(), None).unwrap_err();
@@ -675,6 +686,7 @@ fn claude_policy_renders_append_system_prompt_in_order() {
         prompt_mode: PromptMode::Arg,
         providers: vec![provider],
         inputs: Vec::new(),
+        provider: None,
     };
 
     let result = execute(&model, 0, "prompt", None, &HashMap::new(), None).expect("execute");
@@ -718,6 +730,7 @@ fn codex_policy_without_override_emits_no_policy_block_in_argv_prompt() {
         prompt_mode: PromptMode::Arg,
         providers: vec![provider],
         inputs: Vec::new(),
+        provider: None,
     };
 
     let result = execute(&model, 0, "prompt", None, &HashMap::new(), None).expect("execute");
@@ -754,6 +767,7 @@ fn codex_policy_with_override_prepends_policy_block_to_arg_prompt() {
         prompt_mode: PromptMode::Arg,
         providers: vec![provider],
         inputs: Vec::new(),
+        provider: None,
     };
 
     let result = execute(&model, 0, "user prompt", None, &HashMap::new(), None).expect("execute");

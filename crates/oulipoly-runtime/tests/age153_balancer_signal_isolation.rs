@@ -15,6 +15,7 @@ fn model_with(names: &[&str]) -> ModelConfig {
             .map(|name| ProviderConfig::new(*name, vec![]))
             .collect(),
         inputs: vec![],
+        provider: None,
     }
 }
 

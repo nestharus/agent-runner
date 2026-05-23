@@ -428,6 +428,7 @@ fn t20_execute_facade_still_callable_via_executor_cli_execute() {
         prompt_mode: PromptMode::Arg,
         providers: vec![ProviderConfig::new("echo", Vec::new())],
         inputs: Vec::new(),
+        provider: None,
     };
     let err = execute(&model, 99, "prompt", None, &HashMap::new(), None).unwrap_err();
     assert!(err.contains("out of range"), "{err}");
@@ -468,6 +469,7 @@ fn cluster_7_public_re_exports_remain_at_executor_cli_path() {
         prompt_mode: PromptMode::Arg,
         providers: vec![ProviderConfig::new("echo", Vec::new())],
         inputs: Vec::new(),
+        provider: None,
     };
     let extras = HashMap::new();
     let _request = cli::EffectiveExecuteRequest {

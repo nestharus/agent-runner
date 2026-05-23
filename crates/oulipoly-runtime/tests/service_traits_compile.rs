@@ -204,6 +204,7 @@ fn age_35_routing_and_invocation_lifecycle_services_are_object_safe_with_contrac
         prompt_mode: PromptMode::Arg,
         providers: vec![],
         inputs: vec![],
+        provider: None,
     };
     let start = InvocationStart {
         invocation_uuid: "11111111-1111-4111-8111-111111111111".to_string(),
@@ -259,6 +260,7 @@ fn age_36_resume_session_migration_services_are_object_safe_with_contract_dtos()
         prompt_mode: PromptMode::Arg,
         providers: vec![],
         inputs: vec![],
+        provider: None,
     };
     let mut models = ModelStore::new();
     models.insert(model.name.clone(), model.clone());

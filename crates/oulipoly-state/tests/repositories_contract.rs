@@ -39,6 +39,7 @@ fn model_with_provider(model_name: &str, provider_name: &str) -> ModelConfig {
         prompt_mode: PromptMode::Stdin,
         providers: vec![ProviderConfig::model_provider(provider_name, vec![])],
         inputs: vec![],
+        provider: None,
     }
 }
 

@@ -98,6 +98,7 @@ fn model_with_inputs(script_path: &std::path::Path, inputs: Vec<InputDef>) -> Mo
             Vec::new(),
         )],
         inputs,
+        provider: None,
     }
 }
 
@@ -819,6 +820,7 @@ fn execute_provider_index_out_of_range_returns_canonical_error() {
             Vec::new(),
         )],
         inputs: Vec::new(),
+        provider: None,
     };
 
     let err = execute(&model, 7, "prompt", None, &HashMap::new(), None).unwrap_err();

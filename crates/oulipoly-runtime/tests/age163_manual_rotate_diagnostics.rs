@@ -108,6 +108,7 @@ fn age163_seam_emits_manual_target_not_in_pool_rejection() {
             provider_claude("claude_sibling_age163", sibling_projects.clone()),
         ],
         inputs: Vec::new(),
+        provider: None,
     };
     let resolved = seed_session(&state, &model);
 
@@ -154,6 +155,7 @@ fn age163_seam_emits_manual_target_not_migratable_pair_rejection() {
             provider_no_storage("script_target"),
         ],
         inputs: Vec::new(),
+        provider: None,
     };
     let resolved = seed_session(&state, &model);
 
@@ -197,6 +199,7 @@ fn age163_seam_emits_single_provider_pool_rejection() {
         prompt_mode: PromptMode::Arg,
         providers: vec![provider_claude(SESSION_OWNER, owner_projects.clone())],
         inputs: Vec::new(),
+        provider: None,
     };
     let resolved = seed_session(&state, &model);
 
@@ -244,6 +247,7 @@ fn age163_seam_emits_manual_target_active_not_in_pool_rejection() {
             provider_claude("claude_sibling_age163", sibling_projects.clone()),
         ],
         inputs: Vec::new(),
+        provider: None,
     };
     let mut resolved = seed_session(&state, &model);
     resolved.active_provider = "archived_provider".to_string();

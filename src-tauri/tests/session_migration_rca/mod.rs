@@ -114,6 +114,7 @@ fn assemble_migration_model(
             target_claude_provider(target_command, target_projects),
         ],
         inputs: Vec::new(),
+        provider: None,
     }
 }
 

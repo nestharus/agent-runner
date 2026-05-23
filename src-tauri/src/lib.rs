@@ -1156,6 +1156,7 @@ mod tests {
                 .map(|c| ProviderConfig::new(c.to_string(), vec![]))
                 .collect(),
             inputs: vec![],
+            provider: None,
         }
     }
 
@@ -1168,6 +1169,7 @@ mod tests {
                 args.iter().map(|arg| (*arg).to_string()).collect(),
             )],
             inputs: vec![],
+            provider: None,
         }
     }
 
@@ -2665,6 +2667,7 @@ args = ["exec"]
             prompt_mode: PromptMode::Stdin,
             providers: vec![ProviderConfig::model_provider("missing-provider", vec![])],
             inputs: vec![],
+            provider: None,
         };
 
         let err =
@@ -3134,6 +3137,7 @@ quota_script = "{}"
             prompt_mode: PromptMode::Stdin,
             providers: vec![],
             inputs: vec![],
+            provider: None,
         };
         assert_eq!(
             super::save_model_inner(&state, no_providers).unwrap_err(),
@@ -3289,6 +3293,7 @@ quota_script = "{}"
                     ProviderConfig::new("claude", vec!["-p".to_string()]),
                 ],
                 inputs: vec![],
+                provider: None,
             },
         );
         models.insert("y".into(), make_model("y", &["claude"]));
@@ -3309,6 +3314,7 @@ quota_script = "{}"
                 prompt_mode: PromptMode::Stdin,
                 providers: vec![ProviderConfig::model_provider("claude", vec![])],
                 inputs: vec![],
+                provider: None,
             },
         );
         models.insert("b".into(), make_model("b", &["claude"]));
@@ -3404,6 +3410,7 @@ prompt_mode = "arg"
                 vec!["--model".to_string()],
             )],
             inputs: vec![],
+            provider: None,
         };
         let mut models = HashMap::new();
         models.insert(success_model.name.clone(), success_model);
@@ -3449,6 +3456,7 @@ prompt_mode = "arg"
                 vec![],
             )],
             inputs: vec![],
+            provider: None,
         };
         let mut quota_models = HashMap::new();
         quota_models.insert(quota_model.name.clone(), quota_model);
@@ -3495,6 +3503,7 @@ prompt_mode = "arg"
                 vec!["-c".to_string(), "kill -TERM $$; sleep 1".to_string()],
             )],
             inputs: vec![],
+            provider: None,
         };
         let mut models = HashMap::new();
         models.insert(model.name.clone(), model);

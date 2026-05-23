@@ -24,6 +24,7 @@ fn model_config(name: &str, provider_name: &str) -> ModelConfig {
         prompt_mode: PromptMode::Stdin,
         providers: vec![ProviderConfig::model_provider(provider_name, vec![])],
         inputs: vec![],
+        provider: None,
     }
 }
 
@@ -148,6 +149,7 @@ fn repository_load_models_validates_provider_overlap_by_contract() {
             vec!["exec".to_string(), "-m".to_string(), "gpt-5.5".to_string()],
         )],
         inputs: vec![],
+        provider: None,
     };
     write(
         &dir.path().join("providers.toml"),

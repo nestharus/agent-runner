@@ -443,6 +443,7 @@ mod tests {
                 provider("claude2", target_projects.to_path_buf()),
             ],
             inputs: Vec::new(),
+            provider: None,
         }
     }
 
@@ -482,6 +483,7 @@ mod tests {
                 provider("claude2", target_projects),
             ],
             inputs: Vec::new(),
+            provider: None,
         }
     }
 

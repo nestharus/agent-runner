@@ -124,6 +124,7 @@ fn assemble_claude_path_hash_model(source_projects: &Path, target_projects: &Pat
             claude_provider("claude-target", target_projects),
         ],
         inputs: Vec::new(),
+        provider: None,
     }
 }
 

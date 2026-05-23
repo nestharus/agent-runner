@@ -45,6 +45,7 @@ fn two_provider_model() -> ModelConfig {
             ProviderConfig::model_provider(SIBLING, vec![]),
         ],
         inputs: vec![],
+        provider: None,
     }
 }
 

@@ -141,6 +141,7 @@ fn age163_seam_auto_rotates_to_next_working_candidate_after_source_missing() {
             provider(SIBLING, sibling_projects.clone()),
         ],
         inputs: Vec::new(),
+        provider: None,
     };
     let resolved = seed_session(&state, &model);
     seed_quotas_favoring_sibling(&state);
@@ -195,6 +196,7 @@ fn age163_seam_emits_rotation_failed_when_working_set_exhausted() {
             provider(SIBLING, sibling_projects.clone()),
         ],
         inputs: Vec::new(),
+        provider: None,
     };
     let resolved = seed_session(&state, &model);
     seed_quotas_favoring_sibling(&state);

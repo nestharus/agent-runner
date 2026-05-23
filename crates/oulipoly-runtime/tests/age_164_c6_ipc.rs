@@ -126,6 +126,7 @@ fn parent_invocation_env_var_name_is_exact() {
         prompt_mode: PromptMode::Arg,
         providers: vec![provider],
         inputs: Vec::new(),
+        provider: None,
     };
 
     let result =
@@ -154,6 +155,7 @@ fn return_channel_env_var_name_is_bound_when_parent_env_set() {
         prompt_mode: PromptMode::Arg,
         providers: vec![provider],
         inputs: Vec::new(),
+        provider: None,
     };
 
     let result =
@@ -210,6 +212,7 @@ fn return_channel_jsonl_one_object_per_line_is_accepted() {
         prompt_mode: PromptMode::Arg,
         providers: vec![provider],
         inputs: Vec::new(),
+        provider: None,
     };
     let result =
         execute(&model, 0, "prompt", None, &HashMap::new(), Some(&parent)).expect("execute");
@@ -255,6 +258,7 @@ fn return_channel_jsonl_malformed_line_is_dropped_but_others_kept() {
         prompt_mode: PromptMode::Arg,
         providers: vec![provider],
         inputs: Vec::new(),
+        provider: None,
     };
     let result =
         execute(&model, 0, "prompt", None, &HashMap::new(), Some(&parent)).expect("execute");
@@ -293,6 +297,7 @@ fn return_channel_blank_line_is_skipped_without_artifact() {
         prompt_mode: PromptMode::Arg,
         providers: vec![provider],
         inputs: Vec::new(),
+        provider: None,
     };
     let result =
         execute(&model, 0, "prompt", None, &HashMap::new(), Some(&parent)).expect("execute");
@@ -332,6 +337,7 @@ fn return_channel_sidecar_file_is_deleted_after_read() {
         prompt_mode: PromptMode::Arg,
         providers: vec![provider],
         inputs: Vec::new(),
+        provider: None,
     };
     let result =
         execute(&model, 0, "prompt", None, &HashMap::new(), Some(&parent)).expect("execute");
@@ -371,6 +377,7 @@ fn return_channel_cleanup_tolerates_non_empty_dir() {
         prompt_mode: PromptMode::Arg,
         providers: vec![provider],
         inputs: Vec::new(),
+        provider: None,
     };
     let result =
         execute(&model, 0, "prompt", None, &HashMap::new(), Some(&parent)).expect("execute");
@@ -398,6 +405,7 @@ fn invalid_parent_invocation_env_returns_canonical_error() {
         prompt_mode: PromptMode::Arg,
         providers: vec![provider],
         inputs: Vec::new(),
+        provider: None,
     };
     let err = execute(
         &model,
@@ -455,6 +463,7 @@ fn child_marker_stderr_prefix_is_exact_and_parser_recognizes_canonical_payload()
         prompt_mode: PromptMode::Arg,
         providers: vec![provider],
         inputs: Vec::new(),
+        provider: None,
     };
     let result = execute(&model, 0, "prompt", None, &HashMap::new(), None).expect("execute");
 
@@ -500,6 +509,7 @@ fn child_marker_parser_drops_malformed_lines_and_dedupes_by_composite_id() {
         prompt_mode: PromptMode::Arg,
         providers: vec![provider],
         inputs: Vec::new(),
+        provider: None,
     };
     let result = execute(&model, 0, "prompt", None, &HashMap::new(), None).expect("execute");
 
@@ -524,6 +534,7 @@ fn no_parent_env_removes_return_channel_from_child_env() {
         prompt_mode: PromptMode::Arg,
         providers: vec![provider],
         inputs: Vec::new(),
+        provider: None,
     };
     let result = execute(&model, 0, "prompt", None, &HashMap::new(), None).expect("execute");
 

@@ -120,6 +120,14 @@ export interface ProviderConfig {
 	interactive_args?: string[];
 }
 
+export interface ProviderImplementationRef {
+	path?: string;
+	crate?: string;
+	version?: string;
+	binary?: string;
+	script?: string;
+}
+
 export type PromptMode = "stdin" | "arg";
 
 export type InputType =
@@ -150,6 +158,7 @@ export interface ModelConfig {
 	prompt_mode: PromptMode;
 	providers: ProviderConfig[];
 	inputs: InputDef[];
+	provider?: ProviderImplementationRef;
 }
 
 export interface ModelSummary {

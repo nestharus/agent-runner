@@ -34,6 +34,7 @@ fn assemble_routing_model(name: &str, providers: Vec<ProviderConfig>) -> ModelCo
         prompt_mode: PromptMode::Arg,
         providers,
         inputs: vec![],
+        provider: None,
     }
 }
 
