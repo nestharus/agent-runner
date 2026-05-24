@@ -714,9 +714,12 @@ fn object_key_set(object: &serde_json::Map<String, Value>) -> BTreeSet<&str> {
 }
 
 pub fn parse_pre_invocation_failure_marker(line: &str) -> Option<Value> {
+    decode_pre_invocation_failure_marker(line).filter(pre_invocation_failure_payload_is_strict)
+}
+
+fn decode_pre_invocation_failure_marker(line: &str) -> Option<Value> {
     let raw = line.strip_prefix("OULIPOLY_FAILURE=")?;
-    let value: Value = serde_json::from_str(raw).ok()?;
-    pre_invocation_failure_payload_is_strict(&value).then_some(value)
+    serde_json::from_str(raw).ok()
 }
 
 fn pre_invocation_failure_payload_is_strict(value: &Value) -> bool {

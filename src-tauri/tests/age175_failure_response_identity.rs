@@ -1,5 +1,8 @@
 #![cfg(unix)]
 
+//! Declared roles: accessor, formatter, mapper, parser, filter,
+//! orchestration, validator.
+
 mod age153_support;
 
 use age153_support::{
@@ -332,6 +335,29 @@ fn parse_pre_invocation_failure_payload(
     expected_attempted_providers: &[&str],
     expect_reason: bool,
 ) -> Value {
+    let payload = decode_pre_invocation_failure_payload(output);
+    validate_pre_invocation_failure_transport(output);
+    validate_pre_invocation_failure_envelope(&payload, expected_stage);
+    validate_pre_invocation_failure_detail(
+        &payload,
+        expected_model_name,
+        expected_provider_index,
+        expected_attempted_providers,
+        expect_reason,
+    );
+    payload
+}
+
+fn decode_pre_invocation_failure_payload(output: &Output) -> Value {
+    let stdout = stdout_text(output);
+    let line = failure_lines(&stdout)
+        .into_iter()
+        .next()
+        .expect("OULIPOLY_FAILURE line");
+    serde_json::from_str(line.strip_prefix("OULIPOLY_FAILURE=").unwrap()).unwrap()
+}
+
+fn validate_pre_invocation_failure_transport(output: &Output) {
     assert_ne!(output.status.code(), Some(0), "{output:?}");
     let stdout = stdout_text(output);
     let stderr = stderr_text(output);
@@ -349,10 +375,11 @@ fn parse_pre_invocation_failure_payload(
         1,
         "expected exactly one OULIPOLY_FAILURE line in stdout:\n{stdout}"
     );
-    let payload: Value =
-        serde_json::from_str(lines[0].strip_prefix("OULIPOLY_FAILURE=").unwrap()).unwrap();
+}
+
+fn validate_pre_invocation_failure_envelope(payload: &Value, expected_stage: &str) {
     assert_object_contains_keys(
-        &payload,
+        payload,
         &[
             "failure_kind",
             "stage",
@@ -372,7 +399,7 @@ fn parse_pre_invocation_failure_payload(
         "OULIPOLY_FAILURE payload",
     );
     assert_eq!(
-        key_set(&payload),
+        key_set(payload),
         BTreeSet::from([
             "agent_runner_chain_id",
             "agent_runner_invocation_id",
@@ -403,6 +430,15 @@ fn parse_pre_invocation_failure_payload(
     assert!(payload["agent_runner_chain_id"].is_null());
     assert!(payload["finished_at"].as_str().is_some());
     assert!(payload["message"].as_str().is_some());
+}
+
+fn validate_pre_invocation_failure_detail(
+    payload: &Value,
+    expected_model_name: Option<&str>,
+    expected_provider_index: Option<i64>,
+    expected_attempted_providers: &[&str],
+    expect_reason: bool,
+) {
     let detail = &payload["detail"];
     assert_object_contains_keys(
         detail,
@@ -441,7 +477,6 @@ fn parse_pre_invocation_failure_payload(
             "detail.reason must be null when unavailable: {detail}"
         );
     }
-    payload
 }
 
 fn unknown_diagnostic_lines(stderr: &str) -> Vec<&str> {
