@@ -1121,16 +1121,17 @@ fn migration_picks_latest_of_multiple_compaction_boundaries() {
 
 // risk: Migration mechanic: compaction-aware Claude target build; level: particular-integration; source: proposal §11.1 Migration mechanic: compaction-aware Claude target build / A3, A6.
 #[test]
-fn migration_errors_when_compaction_boundary_not_in_jsonl() {
-    let (fixture, model, sessions, _source_projects, target_projects, _source_jsonl) =
+fn migration_degrades_when_compaction_boundary_not_in_jsonl() {
+    let (fixture, model, sessions, _source_projects, _target_projects, source_jsonl) =
         migration_fixture();
     let resume_working_dir = fixture.dir.path().join("resume-workspace");
+    fs::create_dir_all(&resume_working_dir).unwrap();
     fixture.seed_turns("claude", SESSION_A, &[]);
     fixture.seed_missing_compaction_boundary("claude", SESSION_A);
     let db = fixture.open_db();
     let mut stderr = Vec::new();
 
-    let err = migrate_chain_segment(
+    let migrated = migrate_chain_segment(
         &db,
         &sessions,
         &model,
@@ -1140,12 +1141,22 @@ fn migration_errors_when_compaction_boundary_not_in_jsonl() {
         TransitionReason::Manual,
         &mut stderr,
     )
-    .unwrap_err();
+    .unwrap();
 
-    assert!(
-        matches!(err, MigrationError::CompactionBoundaryNotInJsonl { session_id, turn_id } if session_id == SESSION_A && turn_id == "missing-turn")
+    assert_eq!(migrated.source_provider, "claude");
+    assert_eq!(migrated.target_provider, "claude2");
+    assert_eq!(migrated.source_session_id, SESSION_A);
+    assert_eq!(migrated.target_session_id, SESSION_A);
+    assert!(migrated.target_jsonl_path.exists());
+    assert_eq!(
+        fixture_lines(&migrated.target_jsonl_path),
+        fixture_lines(&source_jsonl)
     );
-    assert!(!target_projects.exists() || fs::read_dir(target_projects).unwrap().next().is_none());
+    let stderr_text = String::from_utf8(stderr).unwrap();
+    assert!(stderr_text.contains("Warning:"));
+    assert!(stderr_text.contains("missing-turn"));
+    assert!(stderr_text.contains(SESSION_A));
+    assert!(stderr_text.contains("falling back to full source slice"));
 }
 
 // risk: Migration mechanic: compaction-aware Claude target build; level: particular-integration; source: proposal §11.1 Migration mechanic: compaction-aware Claude target build / A3, A6.
