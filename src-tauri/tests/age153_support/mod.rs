@@ -481,18 +481,31 @@ pub fn assert_result_envelope_shape(stdout: &str) -> Value {
     let value: Value = serde_json::from_str(raw).unwrap();
     let object = value.as_object().expect("result envelope object");
     let keys: BTreeSet<_> = object.keys().map(String::as_str).collect();
-    assert_eq!(
-        keys,
-        BTreeSet::from([
-            "error_category",
-            "exit_code",
-            "finished_at",
-            "id",
-            "status",
-            "success",
-            "terminal_reason",
-        ])
-    );
+    let base_keys = BTreeSet::from([
+        "error_category",
+        "exit_code",
+        "finished_at",
+        "id",
+        "status",
+        "success",
+        "terminal_reason",
+    ]);
+    if value["success"] == true {
+        assert_eq!(keys, base_keys);
+    } else {
+        let mut expected = base_keys;
+        expected.extend([
+            "agent_runner_invocation_id",
+            "provider_name",
+            "provider_session_id",
+            "agent_runner_chain_id",
+        ]);
+        assert_eq!(keys, expected);
+        assert_eq!(
+            value["agent_runner_invocation_id"], value["id"],
+            "failure result identity must repeat the runner invocation id"
+        );
+    }
     value
 }
 

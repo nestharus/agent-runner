@@ -478,13 +478,27 @@ When unset, `trace` shows `transcript_state = "no_locator"` for that provider �
 
 ## Inspecting a Run
 
-Every invocation emits a stable identifier on **stderr** before spawning the wrapped CLI:
+Every invocation that reaches provider dispatch emits a stable identifier on
+**stderr** before spawning the wrapped CLI:
 
 ```
 OULIPOLY_INVOCATION={"source":"claude2","id":"9e69e8cc-616d-4640-bf1d-96f5391b1a2e"}
 ```
 
-`stdout` stays the model's response (binary-safe for image/video models). The line is always emitted, exactly once per process.
+Provider `stdout` bytes are forwarded unchanged, so image/video model output
+remains binary-safe. After terminal completion the runner appends one structured
+`OULIPOLY_RESULT=<json>` line on stdout. Successful results keep the compact
+terminal shape; failed results also include:
+
+- `agent_runner_invocation_id` — the same UUID as `id`
+- `provider_name` — the selected provider/account, or `null`
+- `provider_session_id` — the captured provider session, or `null`
+- `agent_runner_chain_id` — the existing chain segment for that provider
+  session, or `null`
+
+If dispatch fails before an invocation UUID exists, stdout contains
+`OULIPOLY_FAILURE=<json>` instead of `OULIPOLY_RESULT`. Its identity fields are
+all `null`; pool candidates are reported only in `detail.attempted_providers`.
 
 Capture it from a wrapper:
 
@@ -492,6 +506,14 @@ Capture it from a wrapper:
 oulipoly-agent-runner -m claude-haiku "Refactor X" 2> >(tee /tmp/run.err >&2)
 INV=$(grep '^OULIPOLY_INVOCATION=' /tmp/run.err | cut -d= -f2- | jq -r .id)
 ```
+
+For a first-read failed dispatch, prefer the identity in the failure result
+itself for continuation. If `provider_session_id` is present, resume with that
+provider session id; if `agent_runner_chain_id` is also present, it identifies
+the exact chain segment. A `null` session id means the provider did not establish
+or report a resumable session for that failed attempt. `trace` remains useful
+for inspection and child-invocation context, but it is not the only way to find
+the continuation identity after a failed dispatch.
 
 ### `trace` subcommand
 

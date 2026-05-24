@@ -15,7 +15,10 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use super::{filesystem_artifact_recovers_terminal, text_contains_terminal_envelope};
+use super::{
+    filesystem_artifact_recovers_terminal, parse_pre_invocation_failure_marker,
+    text_contains_terminal_envelope,
+};
 
 const INVOCATION_UUID: &str = "39fa2c60-8ee1-4986-90d3-b081f72936b5";
 const OTHER_INVOCATION_UUID: &str = "8c8e7d7d-83d4-49ac-b4ef-2c0a8655880b";
@@ -26,9 +29,21 @@ fn terminal_signal_json(invocation_uuid: &str) -> String {
     )
 }
 
-fn result_json(invocation_uuid: &str) -> String {
+fn success_result_json(invocation_uuid: &str) -> String {
     format!(
-        r#"{{"error_category":null,"exit_code":137,"finished_at":"2026-05-19T00:00:00Z","id":"{invocation_uuid}","status":"failed","success":false,"terminal_reason":"external_kill"}}"#
+        r#"{{"error_category":null,"exit_code":0,"finished_at":"2026-05-19T00:00:00Z","id":"{invocation_uuid}","status":"succeeded","success":true,"terminal_reason":null}}"#
+    )
+}
+
+fn failure_result_json(invocation_uuid: &str) -> String {
+    format!(
+        r#"{{"agent_runner_chain_id":null,"agent_runner_invocation_id":"{invocation_uuid}","error_category":null,"exit_code":137,"finished_at":"2026-05-19T00:00:00Z","id":"{invocation_uuid}","provider_name":"fixture-provider","provider_session_id":null,"status":"failed","success":false,"terminal_reason":"external_kill"}}"#
+    )
+}
+
+fn pre_invocation_failure_json(stage: &str) -> String {
+    format!(
+        r#"{{"agent_runner_chain_id":null,"agent_runner_invocation_id":null,"detail":{{"attempted_providers":["fixture-provider"],"model_name":"fixture","provider_index":null,"reason":"fixture reason"}},"error_category":null,"exit_code":null,"failure_kind":"pre_invocation","finished_at":"2026-05-19T00:00:00Z","message":"fixture failure","provider_name":null,"provider_session_id":null,"stage":"{stage}","status":"failed","success":false,"terminal_reason":"pre_invocation_failure"}}"#
     )
 }
 
@@ -48,16 +63,62 @@ fn text_terminal_signal_marker_with_matching_uuid_accepts() {
 
 #[test]
 fn text_result_marker_with_matching_uuid_accepts() {
-    let text = format!("OULIPOLY_RESULT={}\n", result_json(INVOCATION_UUID));
+    let text = format!("OULIPOLY_RESULT={}\n", failure_result_json(INVOCATION_UUID));
 
     assert!(text_contains_terminal_envelope(&text, INVOCATION_UUID));
 }
 
 #[test]
 fn text_raw_result_json_line_with_matching_uuid_accepts() {
-    let text = result_json(INVOCATION_UUID);
+    let text = failure_result_json(INVOCATION_UUID);
 
     assert!(text_contains_terminal_envelope(&text, INVOCATION_UUID));
+}
+
+#[test]
+fn text_success_result_marker_with_exact_base_keys_accepts() {
+    let text = format!("OULIPOLY_RESULT={}\n", success_result_json(INVOCATION_UUID));
+
+    assert!(text_contains_terminal_envelope(&text, INVOCATION_UUID));
+}
+
+#[test]
+fn text_success_result_marker_with_identity_extra_rejected() {
+    let text = format!(
+        r#"OULIPOLY_RESULT={{"agent_runner_invocation_id":"{INVOCATION_UUID}","error_category":null,"exit_code":0,"finished_at":"2026-05-19T00:00:00Z","id":"{INVOCATION_UUID}","status":"succeeded","success":true,"terminal_reason":null}}"#
+    );
+
+    assert!(!text_contains_terminal_envelope(&text, INVOCATION_UUID));
+}
+
+#[test]
+fn text_failure_result_marker_missing_identity_key_rejected() {
+    let text = format!(
+        r#"OULIPOLY_RESULT={{"agent_runner_invocation_id":"{INVOCATION_UUID}","error_category":null,"exit_code":137,"finished_at":"2026-05-19T00:00:00Z","id":"{INVOCATION_UUID}","provider_name":"fixture-provider","provider_session_id":null,"status":"failed","success":false,"terminal_reason":"external_kill"}}"#
+    );
+
+    assert!(!text_contains_terminal_envelope(&text, INVOCATION_UUID));
+}
+
+#[test]
+fn text_failure_result_marker_with_unrelated_extra_rejected() {
+    let text = format!(
+        r#"OULIPOLY_RESULT={{"agent_runner_chain_id":null,"agent_runner_invocation_id":"{INVOCATION_UUID}","error_category":null,"exit_code":137,"finished_at":"2026-05-19T00:00:00Z","id":"{INVOCATION_UUID}","provider_name":"fixture-provider","provider_session_id":null,"status":"failed","success":false,"terminal_reason":"external_kill","unexpected":true}}"#
+    );
+
+    assert!(!text_contains_terminal_envelope(&text, INVOCATION_UUID));
+}
+
+#[test]
+fn text_pre_invocation_failure_marker_parses_but_is_not_terminal_result_evidence() {
+    let text = format!(
+        "OULIPOLY_FAILURE={}\n",
+        pre_invocation_failure_json("provider_selection")
+    );
+
+    let parsed = parse_pre_invocation_failure_marker(text.trim()).expect("strict failure marker");
+    assert_eq!(parsed["stage"], "provider_selection");
+    assert!(!text_contains_terminal_envelope(&text, INVOCATION_UUID));
 }
 
 #[test]
@@ -88,7 +149,7 @@ fn text_alias_terminal_marker_rejected() {
         "OULIPOLY_FINAL=",
         "OULIPOLY_ENVELOPE=",
     ] {
-        let text = format!("{marker}{}", result_json(INVOCATION_UUID));
+        let text = format!("{marker}{}", failure_result_json(INVOCATION_UUID));
 
         assert!(
             !text_contains_terminal_envelope(&text, INVOCATION_UUID),
@@ -127,7 +188,10 @@ fn text_terminal_signal_invocation_id_mismatch_rejected() {
 
 #[test]
 fn text_result_marker_id_mismatch_rejected() {
-    let text = format!("OULIPOLY_RESULT={}", result_json(OTHER_INVOCATION_UUID));
+    let text = format!(
+        "OULIPOLY_RESULT={}",
+        failure_result_json(OTHER_INVOCATION_UUID)
+    );
 
     assert!(!text_contains_terminal_envelope(&text, INVOCATION_UUID));
 }
@@ -150,7 +214,7 @@ fn fs_result_artifact_with_raw_result_json_accepts() {
     write_file(
         dir.path(),
         &format!("{INVOCATION_UUID}.result"),
-        &result_json(INVOCATION_UUID),
+        &failure_result_json(INVOCATION_UUID),
     );
 
     assert!(filesystem_artifact_recovers_terminal(
@@ -177,7 +241,7 @@ fn fs_arbitrary_filename_with_terminal_signal_marker_accepts() {
 #[test]
 fn fs_arbitrary_filename_with_result_marker_accepts() {
     let dir = tempfile::tempdir().unwrap();
-    let contents = format!("OULIPOLY_RESULT={}\n", result_json(INVOCATION_UUID));
+    let contents = format!("OULIPOLY_RESULT={}\n", failure_result_json(INVOCATION_UUID));
     write_file(dir.path(), "captured-output.txt", &contents);
 
     assert!(filesystem_artifact_recovers_terminal(
@@ -253,7 +317,22 @@ fn fs_result_artifact_id_mismatch_rejected() {
     write_file(
         dir.path(),
         &format!("{INVOCATION_UUID}.result"),
-        &result_json(OTHER_INVOCATION_UUID),
+        &failure_result_json(OTHER_INVOCATION_UUID),
+    );
+
+    assert!(!filesystem_artifact_recovers_terminal(
+        dir.path(),
+        INVOCATION_UUID
+    ));
+}
+
+#[test]
+fn fs_result_artifact_with_pre_invocation_failure_json_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    write_file(
+        dir.path(),
+        &format!("{INVOCATION_UUID}.result"),
+        &pre_invocation_failure_json("pool_exhausted"),
     );
 
     assert!(!filesystem_artifact_recovers_terminal(

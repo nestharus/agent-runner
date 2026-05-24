@@ -34,6 +34,7 @@ sections. The auditor returns the spec(s) that match.
 | `spec-setup.md` | First-run wizard, detection, sync. |
 | `spec-agent-channels.md` | Sub-agent IPC (store + scratchpad + messenger). |
 | `spec-tauri-client.md` | Top-level Tauri client wiring + CLIs. |
+| `spec-result-envelope.md` | Result markers, failure identity, pre-invocation failures. |
 
 ## Spec schema
 

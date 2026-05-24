@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use oulipoly_state::StateDb;
+use serde_json::Value;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -121,6 +122,97 @@ fn line_count(path: &Path) -> usize {
         .unwrap_or(0)
 }
 
+fn assert_contains_keys(value: &Value, keys: &[&str], context: &str) {
+    let object = value
+        .as_object()
+        .unwrap_or_else(|| panic!("{context} must be an object: {value}"));
+    for key in keys {
+        assert!(
+            object.contains_key(*key),
+            "{context} missing required key {key}: {value}"
+        );
+    }
+}
+
+fn assert_pool_exhausted_failure_stdout(stdout: &str) {
+    assert!(
+        !stdout
+            .lines()
+            .any(|line| line.starts_with("OULIPOLY_RESULT=")),
+        "pre-invocation pool exhaustion must not emit OULIPOLY_RESULT:\n{stdout}"
+    );
+
+    let failure_lines = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("OULIPOLY_FAILURE="))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        failure_lines.len(),
+        1,
+        "expected exactly one OULIPOLY_FAILURE line in stdout:\n{stdout}"
+    );
+
+    let payload = serde_json::from_str::<Value>(failure_lines[0])
+        .unwrap_or_else(|err| panic!("invalid OULIPOLY_FAILURE JSON: {err}\n{stdout}"));
+    assert_contains_keys(
+        &payload,
+        &[
+            "failure_kind",
+            "stage",
+            "status",
+            "success",
+            "exit_code",
+            "terminal_reason",
+            "error_category",
+            "finished_at",
+            "message",
+            "detail",
+            "agent_runner_invocation_id",
+            "provider_name",
+            "provider_session_id",
+            "agent_runner_chain_id",
+        ],
+        "OULIPOLY_FAILURE payload",
+    );
+    assert_eq!(payload["failure_kind"], "pre_invocation");
+    assert_eq!(payload["stage"], "pool_exhausted");
+    assert_eq!(payload["status"], "failed");
+    assert_eq!(payload["success"], false);
+    assert!(payload["exit_code"].is_null(), "{payload}");
+    assert!(payload["error_category"].is_null(), "{payload}");
+    assert_eq!(payload["terminal_reason"], "pre_invocation_failure");
+    for field in [
+        "agent_runner_invocation_id",
+        "provider_name",
+        "provider_session_id",
+        "agent_runner_chain_id",
+    ] {
+        assert!(payload[field].is_null(), "{field} must be null: {payload}");
+    }
+
+    assert_contains_keys(
+        &payload["detail"],
+        &[
+            "attempted_providers",
+            "model_name",
+            "provider_index",
+            "reason",
+        ],
+        "OULIPOLY_FAILURE detail",
+    );
+    let attempted_providers = payload["detail"]["attempted_providers"]
+        .as_array()
+        .unwrap_or_else(|| panic!("detail.attempted_providers must be an array: {payload}"));
+    for provider in ["age100-a", "age100-b"] {
+        assert!(
+            attempted_providers
+                .iter()
+                .any(|attempted| attempted.as_str() == Some(provider)),
+            "detail.attempted_providers must contain {provider}: {payload}"
+        );
+    }
+}
+
 #[test]
 fn one_shot_all_pool_members_quota_exhausted_returns_blocked_all_providers_exhausted() {
     let fixture = Fixture::new();
@@ -143,7 +235,8 @@ fn one_shot_all_pool_members_quota_exhausted_returns_blocked_all_providers_exhau
     let output = fixture.run_one_shot("age100-one-shot");
 
     assert_ne!(output.status.code(), Some(0), "{output:?}");
-    assert!(output.stdout.is_empty(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_pool_exhausted_failure_stdout(&stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("BLOCKED:all-providers-exhausted")

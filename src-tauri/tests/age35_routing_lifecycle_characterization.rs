@@ -421,18 +421,28 @@ fn assert_result_envelope_contract(
         .keys()
         .map(String::as_str)
         .collect();
-    assert_eq!(
-        keys,
-        BTreeSet::from([
-            "error_category",
-            "exit_code",
-            "finished_at",
-            "id",
-            "status",
-            "success",
-            "terminal_reason",
-        ])
-    );
+    let base_keys = BTreeSet::from([
+        "error_category",
+        "exit_code",
+        "finished_at",
+        "id",
+        "status",
+        "success",
+        "terminal_reason",
+    ]);
+    if expected_success {
+        assert_eq!(keys, base_keys);
+    } else {
+        let mut expected = base_keys;
+        expected.extend([
+            "agent_runner_invocation_id",
+            "provider_name",
+            "provider_session_id",
+            "agent_runner_chain_id",
+        ]);
+        assert_eq!(keys, expected);
+        assert_eq!(envelope["agent_runner_invocation_id"], envelope["id"]);
+    }
     assert_eq!(envelope["status"], expected_status);
     assert_eq!(envelope["success"], expected_success);
     assert_eq!(envelope["exit_code"], expected_exit_code);

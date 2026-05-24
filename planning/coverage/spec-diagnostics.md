@@ -38,6 +38,7 @@
 | Session warning is emitted (e.g. window approaching exhaustion). | `services/session_warning.rs` records a structured warning that does not abort the invocation. |
 | Trace failure occurs (e.g. trace sink is unreachable). | `services/trace_failure.rs` emits a typed `TraceFailure` carrying the cause without surfacing through the user-facing return path. |
 | Marker handling (OULIPOLY marker in stream). | `services/marker.rs` parses + buffers; downstream consumers (recognizer) read parsed markers, never raw bytes. |
+| Heuristic category fallback sees generic auth wording. | `diagnostics/mod.rs` classifies only specific auth-expired sentinels such as `unauthorized` and `token expired`; generic `auth` text is left for more-specific classifiers or falls through rather than becoming `AuthExpired`. |
 
 ## Edge cases
 
@@ -49,6 +50,10 @@
 - Service window query overlaps the boundary of a session migration —
   `services/session_window.rs` returns the union of pre- and
   post-migration windows.
+- Unknown or ambiguous failure text that contains the substring `auth`
+  but lacks a specific expired/unauthorized sentinel must not be upgraded
+  to `AuthExpired`; this preserves unknown observability and avoids hiding
+  provider failures behind an overbroad auth bucket.
 
 ## Error conditions
 
@@ -62,6 +67,9 @@
 
 - Diagnostics does NOT decide whether to retry — it records; the
   balancer decides.
+- Diagnostics does NOT create new user-facing categories for AGE-175
+  unknown observability; `unknown` remains the settled category when no
+  narrower classifier applies.
 - Trace does NOT mutate session state — it is a side-channel sink.
 - Services / ports layer is the contract surface for the runtime; it
   does NOT bypass `oulipoly-state` for persistence.
@@ -84,6 +92,7 @@ tests on the ports surface, fixture tests on the trace envelope schema.
 - `src-tauri/tests/pr_b_trace_integration.rs`
 - `src-tauri/tests/pipeline_status_propagation_rca/age158_characterization.rs`
 - `src-tauri/tests/pipeline_status_propagation_rca/age158_rc1_characterization.rs`
+- `src-tauri/tests/age175_failure_response_identity.rs`
 - `src-tauri/tests/pipeline_status_propagation_rca/rc1_abnormal_termination_under_tail_pipeline.rs`
 - `src-tauri/tests/initiative_09_internal_unification.rs`
 
@@ -95,4 +104,6 @@ tests on the ports surface, fixture tests on the trace envelope schema.
   service is a top consumer.
 - `planning/coverage/spec-executor.md` — executor emits diagnostics
   inputs.
+- `planning/coverage/spec-result-envelope.md` — consumes settled
+  `unknown` diagnostics for the AGE-175 structured stderr marker.
 - `AGENTS.md` § Rust Workspace Structure.

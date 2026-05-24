@@ -21,6 +21,7 @@ oulipoly-core = { path = "../crates/oulipoly-core" }
 oulipoly-runtime = { path = "../crates/oulipoly-runtime" }
 oulipoly-setup = { path = "../crates/oulipoly-setup" }
 oulipoly-state = { path = "../crates/oulipoly-state" }
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tauri.workspace = true
@@ -34,7 +35,6 @@ tauri-build.workspace = true
 
 [dev-dependencies]
 oulipoly-agent-messenger = { path = "../crates/oulipoly-agent-messenger" }
-regex.workspace = true
 rusqlite.workspace = true
 serde_yaml_ng.workspace = true
 sha2.workspace = true

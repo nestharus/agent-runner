@@ -211,10 +211,7 @@ fn heuristic_error_category(lower: &str) -> ErrorCategory {
         ErrorCategory::QuotaExhausted
     } else if rate_limit_text(lower) {
         ErrorCategory::RateLimit
-    } else if lower.contains("unauthorized")
-        || lower.contains("auth")
-        || lower.contains("token expired")
-    {
+    } else if lower.contains("unauthorized") || lower.contains("token expired") {
         ErrorCategory::AuthExpired
     } else if lower.contains("no conversation found")
         || lower.contains("no session found")
@@ -372,8 +369,38 @@ mod tests {
 
     #[test]
     fn heuristic_auth() {
-        let d = heuristic_diagnosis("Error: Unauthorized - token expired", 1);
-        assert_eq!(d.category, ErrorCategory::AuthExpired);
+        for stderr in [
+            "Error: Unauthorized",
+            "authentication failed: token expired",
+        ] {
+            let d = heuristic_diagnosis(stderr, 1);
+            assert_eq!(
+                d.category,
+                ErrorCategory::AuthExpired,
+                "expected auth-expired classification for {stderr:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn heuristic_bare_auth_substring_is_unknown_not_auth_expired() {
+        // AGE-175: auth-bearing stderr without unauthorized/token-expired
+        // language must stay unknown so redaction coverage remains reachable.
+        for stderr in ["Authorization: Bearer abc123", "authentication probe"] {
+            let lower = normalize_stderr_for_heuristic(stderr);
+            assert_eq!(
+                heuristic_error_category(&lower),
+                ErrorCategory::Unknown,
+                "bare auth substring should not classify as auth-expired for {stderr:?}"
+            );
+
+            let d = heuristic_diagnosis(stderr, 1);
+            assert_eq!(
+                d.category,
+                ErrorCategory::Unknown,
+                "heuristic diagnosis should keep bare auth substring unknown for {stderr:?}"
+            );
+        }
     }
 
     #[test]
