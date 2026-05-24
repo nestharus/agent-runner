@@ -70,10 +70,11 @@ use oulipoly_state::repositories::{ProductionStateDbOpener, StateDbOpener};
 use oulipoly_state::schema_probe::{self, ProbeError};
 use oulipoly_state::{
     CompositeInvocationId, InvocationRecord, InvocationStart, InvocationStatus, ReadOnlyOpenError,
-    StateDb,
+    ResultEnvelopeFailureIdentity, ResultEnvelopeInput, StateDb, result_envelope_payload,
 };
 
 use clap::Parser;
+use regex::Regex;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{BufRead, IsTerminal, Read, Write as _};
@@ -566,8 +567,32 @@ fn run_direct_model_cli(
     model_name: &str,
     agent_runtime_services: &wiring::AgentRuntimeServices,
 ) -> Result<i32, String> {
-    let context = load_cli_execution_context(cli)?;
-    let model = lookup_model(&context.models, model_name)?;
+    let context = match load_cli_execution_context(cli) {
+        Ok(context) => context,
+        Err(err) => {
+            emit_pre_invocation_failure(
+                "provider_selection",
+                Some(model_name),
+                None,
+                Vec::new(),
+                Some(&err),
+            );
+            return Err(err);
+        }
+    };
+    let model = match lookup_model(&context.models, model_name) {
+        Ok(model) => model,
+        Err(err) => {
+            emit_pre_invocation_failure(
+                "provider_selection",
+                Some(model_name),
+                None,
+                Vec::new(),
+                Some(&err),
+            );
+            return Err(err);
+        }
+    };
     let prompt = direct_model_prompt(cli)?;
     run_with_balancing(
         agent_runtime_services,
@@ -1208,16 +1233,18 @@ fn emit_result_envelope(
     exit_code: i32,
     error_category: Option<&str>,
     terminal_reason: Option<&str>,
+    failure_identity: Option<&ResultEnvelopeFailureIdentity>,
 ) {
     let finished_at = current_timestamp_rfc3339();
-    let payload = result_envelope_payload(
-        uuid,
+    let payload = result_envelope_payload(ResultEnvelopeInput {
+        id: uuid,
         success,
         exit_code,
         error_category,
         terminal_reason,
-        &finished_at,
-    );
+        finished_at: &finished_at,
+        failure_identity,
+    });
     let json = match serialize_result_envelope_payload(&payload) {
         Ok(s) => s,
         Err(err) => {
@@ -1232,25 +1259,6 @@ fn current_timestamp_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
-fn result_envelope_payload(
-    uuid: &str,
-    success: bool,
-    exit_code: i32,
-    error_category: Option<&str>,
-    terminal_reason: Option<&str>,
-    finished_at: &str,
-) -> serde_json::Value {
-    serde_json::json!({
-        "id": uuid,
-        "status": if success { "succeeded" } else { "failed" },
-        "success": success,
-        "exit_code": exit_code,
-        "terminal_reason": terminal_reason,
-        "error_category": error_category,
-        "finished_at": finished_at,
-    })
-}
-
 fn serialize_result_envelope_payload(payload: &serde_json::Value) -> Result<String, String> {
     serde_json::to_string(payload).map_err(|err| err.to_string())
 }
@@ -1260,7 +1268,15 @@ fn emit_result_envelope_serialize_warning(uuid: &str, err: &str) {
 }
 
 fn emit_result_envelope_line(json: &str) {
-    println!("OULIPOLY_RESULT={json}");
+    emit_stdout_marker_line("OULIPOLY_RESULT", json);
+}
+
+fn emit_pre_invocation_failure_line(json: &str) {
+    emit_stdout_marker_line("OULIPOLY_FAILURE", json);
+}
+
+fn emit_stdout_marker_line(marker: &str, json: &str) {
+    println!("{marker}={json}");
 }
 
 fn diagnostics_model_configured(models: &HashMap<String, ModelConfig>) -> bool {
@@ -2047,6 +2063,161 @@ fn effective_model_for_execution(
     providers_cfg: &ProvidersConfig,
 ) -> Result<(ProviderConfig, PromptMode), String> {
     effective_provider_for_model_provider(model, provider_index, providers_cfg)
+}
+
+fn emit_unknown_diagnostic(
+    state: &StateDb,
+    provider_name: &str,
+    provider_index: usize,
+    result: &executor::ExecutionResult,
+    retry_rotation_disposition: &str,
+) {
+    let payload = serde_json::json!({
+        "error_category": "unknown",
+        "provider": provider_name,
+        "provider_index": provider_index,
+        "account_window_state": account_window_state_payload(state, provider_name),
+        "exit_code": result.exit_code,
+        "retry_rotation_disposition": retry_rotation_disposition,
+        "stderr_excerpt": redacted_stderr_excerpt(&result.stderr),
+    });
+    match serde_json::to_string(&payload) {
+        Ok(json) => eprintln!("OULIPOLY_UNKNOWN_DIAGNOSTIC={json}"),
+        Err(err) => eprintln!("Warning: Failed to serialize unknown diagnostic: {err}"),
+    }
+}
+
+fn account_window_state_payload(state: &StateDb, provider_name: &str) -> serde_json::Value {
+    format_account_window_state_payload(read_account_window_state(state, provider_name))
+}
+
+struct AccountWindowStateRead {
+    quota: Result<Option<oulipoly_state::QuotaRecord>, String>,
+    windows: Result<Vec<oulipoly_state::QuotaWindow>, String>,
+}
+
+fn read_account_window_state(state: &StateDb, provider_name: &str) -> AccountWindowStateRead {
+    AccountWindowStateRead {
+        quota: state.get_quota(provider_name),
+        windows: state.get_windows(provider_name),
+    }
+}
+
+fn format_account_window_state_payload(read: AccountWindowStateRead) -> serde_json::Value {
+    let (quota, quota_read_error) = match read.quota {
+        Ok(quota) => (quota.map(quota_record_payload), None),
+        Err(err) => (None, Some(err)),
+    };
+    let (windows, windows_read_error) = match read.windows {
+        Ok(windows) => (
+            windows
+                .into_iter()
+                .map(quota_window_payload)
+                .collect::<Vec<_>>(),
+            None,
+        ),
+        Err(err) => (Vec::new(), Some(err)),
+    };
+    serde_json::json!({
+        "quota": quota,
+        "quota_read_error": quota_read_error,
+        "windows": windows,
+        "windows_read_error": windows_read_error,
+    })
+}
+
+fn quota_record_payload(record: oulipoly_state::QuotaRecord) -> serde_json::Value {
+    serde_json::json!({
+        "calls_since_refresh": record.calls_since_refresh,
+        "refreshed_at": record.refreshed_at.map(|value| value.to_rfc3339()),
+        "exhausted_at": record.exhausted_at.map(|value| value.to_rfc3339()),
+        "topology_peak_live_window_count": record.topology_peak_live_window_count,
+        "last_topology_probe_at": record.last_topology_probe_at.map(|value| value.to_rfc3339()),
+        "next_available_at": record.next_available_at.map(|value| value.to_rfc3339()),
+        "last_refresh_at": record.last_refresh_at.map(|value| value.to_rfc3339()),
+        "failure_class": record.failure_class,
+    })
+}
+
+fn quota_window_payload(window: oulipoly_state::QuotaWindow) -> serde_json::Value {
+    serde_json::json!({
+        "window_id": window.window_id,
+        "used_percent": window.used_percent,
+        "resets_at": window.resets_at.to_rfc3339(),
+        "last_delta_percent": window.last_delta_percent,
+        "last_delta_calls": window.last_delta_calls,
+    })
+}
+
+fn redacted_stderr_excerpt(stderr: &str) -> String {
+    truncate_utf8_bytes(&first_nonempty_lines(&redact_sensitive(stderr), 4), 1024)
+}
+
+fn redact_sensitive(text: &str) -> String {
+    let bearer = Regex::new(r"(?i)\bbearer\s+[^\s]+").expect("bearer redaction regex must compile");
+    let key_value = Regex::new(
+        r#"(?i)(["']?\b(?:token|api_key|apikey|password|secret)\b["']?\s*[:=]\s*)(["']?)[^\s"']+"#,
+    )
+    .expect("key-value redaction regex must compile");
+
+    let text = redact_authorization_headers(text);
+    let text = bearer.replace_all(&text, "Bearer [REDACTED]");
+    key_value.replace_all(&text, "$1$2[REDACTED]").into_owned()
+}
+
+fn redact_authorization_headers(text: &str) -> String {
+    let authorization =
+        Regex::new(r"(?i)\bauthorization\s*:\s*").expect("authorization regex must compile");
+    let mut redacted = String::with_capacity(text.len());
+    for segment in text.split_inclusive('\n') {
+        let (line, newline) = segment
+            .strip_suffix('\n')
+            .map_or((segment, ""), |line| (line, "\n"));
+        let matches = authorization.find_iter(line).collect::<Vec<_>>();
+        if matches.is_empty() {
+            redacted.push_str(line);
+            redacted.push_str(newline);
+            continue;
+        }
+
+        let mut cursor = 0;
+        for (index, header) in matches.iter().enumerate() {
+            redacted.push_str(&line[cursor..header.end()]);
+            let value_start = header.end();
+            let value_end = matches
+                .get(index + 1)
+                .map_or(line.len(), |next| next.start());
+            if line[value_start..value_end]
+                .chars()
+                .any(|character| !character.is_whitespace())
+            {
+                redacted.push_str("[REDACTED]");
+            }
+            cursor = value_end;
+        }
+        redacted.push_str(&line[cursor..]);
+        redacted.push_str(newline);
+    }
+    redacted
+}
+
+fn first_nonempty_lines(text: &str, max_lines: usize) -> String {
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .take(max_lines)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn truncate_utf8_bytes(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
 }
 
 fn resume_migration_pool(
@@ -3559,6 +3730,97 @@ fn select_balanced_provider_index(
         .map_err(|err| err.to_string())
 }
 
+fn model_provider_names(model: &ModelConfig) -> Vec<String> {
+    model
+        .providers
+        .iter()
+        .map(|provider| provider.name.clone())
+        .collect()
+}
+
+fn emit_pre_invocation_failure(
+    stage: &str,
+    model_name: Option<&str>,
+    provider_index: Option<usize>,
+    attempted_providers: Vec<String>,
+    reason: Option<&str>,
+) {
+    let payload = serde_json::json!({
+        "failure_kind": "pre_invocation",
+        "stage": stage,
+        "status": "failed",
+        "success": false,
+        "exit_code": serde_json::Value::Null,
+        "terminal_reason": "pre_invocation_failure",
+        "error_category": serde_json::Value::Null,
+        "finished_at": current_timestamp_rfc3339(),
+        "message": pre_invocation_failure_message(stage, reason),
+        "detail": {
+            "model_name": model_name,
+            "provider_index": provider_index,
+            "attempted_providers": attempted_providers,
+            "reason": reason,
+        },
+        "agent_runner_invocation_id": serde_json::Value::Null,
+        "provider_name": serde_json::Value::Null,
+        "provider_session_id": serde_json::Value::Null,
+        "agent_runner_chain_id": serde_json::Value::Null,
+    });
+    match serde_json::to_string(&payload) {
+        Ok(json) => emit_pre_invocation_failure_line(&json),
+        Err(err) => eprintln!("Warning: Failed to serialize pre-invocation failure: {err}"),
+    }
+}
+
+fn pre_invocation_failure_message(stage: &str, reason: Option<&str>) -> String {
+    match reason {
+        Some(reason) => format!("{stage}: {reason}"),
+        None => stage.to_string(),
+    }
+}
+
+fn emit_pool_exhausted_pre_invocation_failure(model: &ModelConfig, reason: &str) {
+    emit_pre_invocation_failure(
+        "pool_exhausted",
+        Some(&model.name),
+        None,
+        model_provider_names(model),
+        Some(reason),
+    );
+}
+
+fn emit_provider_selection_pre_invocation_failure(
+    model: &ModelConfig,
+    reason: &str,
+    pool_exhausted: bool,
+) {
+    if pool_exhausted {
+        emit_pool_exhausted_pre_invocation_failure(model, reason);
+        return;
+    }
+    emit_pre_invocation_failure(
+        "provider_selection",
+        Some(&model.name),
+        None,
+        Vec::new(),
+        Some(reason),
+    );
+}
+
+fn emit_provider_resolution_pre_invocation_failure(
+    model: &ModelConfig,
+    provider_index: usize,
+    reason: &str,
+) {
+    emit_pre_invocation_failure(
+        "provider_resolution",
+        Some(&model.name),
+        Some(provider_index),
+        vec![model.providers[provider_index].name.clone()],
+        Some(reason),
+    );
+}
+
 fn composite_invocation_id(provider_name: &str) -> CompositeInvocationId {
     CompositeInvocationId {
         source: provider_name.to_string(),
@@ -3579,6 +3841,72 @@ fn balanced_invocation_start(
         provider_name: provider_name.to_string(),
         provider_index,
         parent_invocation_id,
+    }
+}
+
+fn result_failure_identity(
+    state: &StateDb,
+    invocation_id: &str,
+    provider_name: &str,
+    provider_session_id: Option<&str>,
+) -> ResultEnvelopeFailureIdentity {
+    let agent_runner_chain_id = provider_session_id.and_then(|session_id| {
+        state
+            .chain_id_for_segment(provider_name, session_id)
+            .ok()
+            .flatten()
+    });
+    ResultEnvelopeFailureIdentity {
+        agent_runner_invocation_id: invocation_id.to_string(),
+        provider_name: Some(provider_name.to_string()),
+        provider_session_id: provider_session_id.map(str::to_string),
+        agent_runner_chain_id,
+    }
+}
+
+struct FailureResultEnvelopeInput<'a> {
+    state: &'a StateDb,
+    invocation_id: &'a str,
+    provider_name: &'a str,
+    provider_session_id: Option<&'a str>,
+    exit_code: i32,
+    error_category: Option<&'a str>,
+    terminal_reason: Option<&'a str>,
+}
+
+fn emit_failure_result_envelope(input: FailureResultEnvelopeInput<'_>) {
+    let failure_identity = result_failure_identity(
+        input.state,
+        input.invocation_id,
+        input.provider_name,
+        input.provider_session_id,
+    );
+    emit_result_envelope(
+        input.invocation_id,
+        false,
+        input.exit_code,
+        input.error_category,
+        input.terminal_reason,
+        Some(&failure_identity),
+    );
+}
+
+fn emit_unknown_diagnostic_if_settled_unknown(
+    state: &StateDb,
+    provider_name: &str,
+    provider_index: usize,
+    result: &executor::ExecutionResult,
+    error_category: Option<&str>,
+    retry_rotation_disposition: &str,
+) {
+    if error_category == Some(diagnostics::ErrorCategory::Unknown.as_str()) {
+        emit_unknown_diagnostic(
+            state,
+            provider_name,
+            provider_index,
+            result,
+            retry_rotation_disposition,
+        );
     }
 }
 
@@ -3709,19 +4037,19 @@ fn run_with_balancing(
     loop {
         if attempts >= max_attempts {
             eprintln!("BLOCKED:all-providers-exhausted");
-            return match agent_runtime_services.routing_service.select_route(
-                RoutingServiceRequest {
-                    model,
-                    state: &env.state,
-                    ctx: Some(&ctx),
-                },
-            ) {
-                Err(err) => Err(err.to_string()),
-                Ok(_) => Err(format_quota_retry_budget_exhausted(
-                    &model.name,
-                    max_attempts,
-                )),
-            };
+            let reason =
+                match agent_runtime_services
+                    .routing_service
+                    .select_route(RoutingServiceRequest {
+                        model,
+                        state: &env.state,
+                        ctx: Some(&ctx),
+                    }) {
+                    Err(err) => err.to_string(),
+                    Ok(_) => format_quota_retry_budget_exhausted(&model.name, max_attempts),
+                };
+            emit_pool_exhausted_pre_invocation_failure(model, &reason);
+            return Err(reason);
         }
         attempts += 1;
 
@@ -3729,11 +4057,29 @@ fn run_with_balancing(
         let provider_index = match pending_verification.as_ref() {
             Some((provider_index, _)) => *provider_index,
             None => {
-                select_balanced_provider_index(agent_runtime_services, model, &env.state, &ctx)?
+                match select_balanced_provider_index(
+                    agent_runtime_services,
+                    model,
+                    &env.state,
+                    &ctx,
+                ) {
+                    Ok(provider_index) => provider_index,
+                    Err(err) => {
+                        let pool_exhausted = attempts > model.providers.len().max(1);
+                        emit_provider_selection_pre_invocation_failure(model, &err, pool_exhausted);
+                        return Err(err);
+                    }
+                }
             }
         };
         let (provider, prompt_mode) =
-            effective_model_for_execution(model, provider_index, &env.providers_cfg)?;
+            match effective_model_for_execution(model, provider_index, &env.providers_cfg) {
+                Ok(effective) => effective,
+                Err(err) => {
+                    emit_provider_resolution_pre_invocation_failure(model, provider_index, &err);
+                    return Err(err);
+                }
+            };
         let provider_name = &provider.name;
         let invocation = composite_invocation_id(provider_name);
         let invocation_start = balanced_invocation_start(
@@ -3818,13 +4164,15 @@ fn run_with_balancing(
                     .unwrap_or_else(|finalize_err| {
                         eprintln!("Warning: Failed to finalize invocation: {finalize_err}")
                     });
-                emit_result_envelope(
-                    &invocation.id,
-                    false,
-                    -1,
-                    Some(terminal_reason),
-                    Some(terminal_reason),
-                );
+                emit_failure_result_envelope(FailureResultEnvelopeInput {
+                    state: &env.state,
+                    invocation_id: &invocation.id,
+                    provider_name,
+                    provider_session_id: start_known_provider_session_id.as_deref(),
+                    exit_code: -1,
+                    error_category: Some(terminal_reason),
+                    terminal_reason: Some(terminal_reason),
+                });
                 guard.mark_finalized();
                 return Err(err.to_string());
             }
@@ -3942,13 +4290,15 @@ fn run_with_balancing(
                         continue;
                     }
                     ZeroTurnAction::Continue | ZeroTurnAction::Unclassified => {
-                        emit_result_envelope(
-                            &invocation.id,
-                            false,
-                            result.exit_code,
-                            None,
-                            Some(terminal_reason),
-                        );
+                        emit_failure_result_envelope(FailureResultEnvelopeInput {
+                            state: &env.state,
+                            invocation_id: &invocation.id,
+                            provider_name,
+                            provider_session_id: zero_turn_provider_session_id.as_deref(),
+                            exit_code: result.exit_code,
+                            error_category: None,
+                            terminal_reason: Some(terminal_reason),
+                        });
                         eprintln!("{}", result.stderr);
                         return Ok(result.exit_code);
                     }
@@ -4046,13 +4396,15 @@ fn run_with_balancing(
                     .map(|_| ())
                     .unwrap_or_else(|e| eprintln!("Warning: Failed to finalize invocation: {e}"));
                 guard.mark_finalized();
-                emit_result_envelope(
-                    &invocation.id,
-                    false,
-                    result.exit_code,
-                    Some(terminal_reason),
-                    Some(terminal_reason),
-                );
+                emit_failure_result_envelope(FailureResultEnvelopeInput {
+                    state: &env.state,
+                    invocation_id: &invocation.id,
+                    provider_name,
+                    provider_session_id: zero_turn_provider_session_id.as_deref(),
+                    exit_code: result.exit_code,
+                    error_category: Some(terminal_reason),
+                    terminal_reason: Some(terminal_reason),
+                });
                 eprintln!("{}", result.stderr);
                 return Ok(result.exit_code);
             }
@@ -4106,16 +4458,27 @@ fn run_with_balancing(
                 })
                 .map(|_| ())
                 .unwrap_or_else(|e| eprintln!("Warning: Failed to finalize invocation: {e}"));
-            emit_result_envelope(
-                &invocation.id,
-                false,
-                1,
-                Some("returned_artifacts"),
-                Some("returned_artifacts_persist_failed"),
-            );
+            emit_failure_result_envelope(FailureResultEnvelopeInput {
+                state: &env.state,
+                invocation_id: &invocation.id,
+                provider_name,
+                provider_session_id: zero_turn_provider_session_id.as_deref(),
+                exit_code: 1,
+                error_category: Some("returned_artifacts"),
+                terminal_reason: Some("returned_artifacts_persist_failed"),
+            });
             guard.mark_finalized();
             return Ok(1);
         }
+
+        emit_unknown_diagnostic_if_settled_unknown(
+            &env.state,
+            provider_name,
+            provider_index,
+            &result,
+            error_category.as_deref(),
+            "no_retry",
+        );
 
         agent_runtime_services
             .invocation_lifecycle_service
@@ -4173,6 +4536,7 @@ fn run_with_balancing(
                 result.exit_code,
                 error_category.as_deref(),
                 result.terminal_reason.as_deref(),
+                None,
             );
             return Ok(result.exit_code);
         }
@@ -4185,13 +4549,15 @@ fn run_with_balancing(
             continue;
         }
 
-        emit_result_envelope(
-            &invocation.id,
-            success,
-            result.exit_code,
-            error_category.as_deref(),
-            result.terminal_reason.as_deref(),
-        );
+        emit_failure_result_envelope(FailureResultEnvelopeInput {
+            state: &env.state,
+            invocation_id: &invocation.id,
+            provider_name,
+            provider_session_id: zero_turn_provider_session_id.as_deref(),
+            exit_code: result.exit_code,
+            error_category: error_category.as_deref(),
+            terminal_reason: result.terminal_reason.as_deref(),
+        });
         eprintln!("{}", result.stderr);
         if let Some(ref cat) = error_category {
             eprintln!("[diagnostics: {cat}]");

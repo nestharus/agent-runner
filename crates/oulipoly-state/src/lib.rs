@@ -16,6 +16,7 @@ pub mod invocation_marker;
 mod lifecycle_log;
 pub mod migrations;
 pub mod repositories;
+pub mod result_envelope;
 pub mod schema;
 pub mod schema_probe;
 
@@ -39,6 +40,9 @@ pub use db::{InvocationRecord, InvocationStart, InvocationStatus};
 pub use db::{QuotaRecord, QuotaWindow, QuotaWindowInput};
 pub use invocation_marker::CompositeInvocationId;
 pub use lifecycle_log::{LifecycleEventSink, NoopLifecycleEventSink};
+pub use result_envelope::{
+    ResultEnvelopeFailureIdentity, ResultEnvelopeInput, result_envelope_payload,
+};
 
 #[cfg(doctest)]
 pub mod age_32_connection_boundary_doctest {

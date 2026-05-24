@@ -50,6 +50,9 @@ use self::sqlite_adapter::{Connection, RusqliteOptionalExtension, Transaction};
 use crate::invocation_marker::CompositeInvocationId;
 use crate::lifecycle_log::{LifecycleEventSink, NoopLifecycleEventSink};
 use crate::migrations;
+use crate::result_envelope::{
+    ResultEnvelopeFailureIdentity, ResultEnvelopeInput, result_envelope_payload,
+};
 use crate::schema::{
     CURRENT_SCHEMA_VERSION, MINIMUM_SUPPORTED_SCHEMA_VERSION, SchemaCompatibility,
 };
@@ -658,10 +661,11 @@ struct FinalizeInvocationRow {
     invocation_uuid: String,
     model_name: String,
     provider_name: Option<String>,
+    provider_session_id: Option<String>,
     status: String,
 }
 
-type FinalizeInvocationRowColumns = (String, String, Option<String>, String);
+type FinalizeInvocationRowColumns = (String, String, Option<String>, Option<String>, String);
 
 enum InvocationsSchemaShape {
     Empty,
@@ -2598,67 +2602,23 @@ impl StateDb {
         })
     }
 
-    fn write_result_artifact(
-        &self,
-        uuid: &str,
-        success: bool,
-        exit_code: i32,
-        error_category: Option<&str>,
-        terminal_reason: Option<&str>,
-        finished_at: &str,
-    ) -> Result<(), String> {
+    fn write_result_artifact(&self, input: ResultEnvelopeInput<'_>) -> Result<(), String> {
         let Some(dir) = self.invocations_dir() else {
             return Ok(());
         };
         Self::ensure_artifact_dir(&dir)?;
-        let bytes = Self::result_artifact_bytes(
-            uuid,
-            success,
-            exit_code,
-            error_category,
-            terminal_reason,
-            finished_at,
-        )?;
-        let (tmp_path, final_path) = Self::artifact_paths(&dir, uuid, "result");
+        let bytes = Self::result_artifact_bytes(input)?;
+        let (tmp_path, final_path) = Self::artifact_paths(&dir, input.id, "result");
         Self::write_artifact_atomically(&tmp_path, &final_path, &bytes)
     }
 
-    fn result_artifact_bytes(
-        uuid: &str,
-        success: bool,
-        exit_code: i32,
-        error_category: Option<&str>,
-        terminal_reason: Option<&str>,
-        finished_at: &str,
-    ) -> Result<Vec<u8>, String> {
-        let payload = Self::result_artifact_payload(
-            uuid,
-            success,
-            exit_code,
-            error_category,
-            terminal_reason,
-            finished_at,
-        );
+    fn result_artifact_bytes(input: ResultEnvelopeInput<'_>) -> Result<Vec<u8>, String> {
+        let payload = Self::result_artifact_payload(input);
         serde_json::to_vec(&payload).map_err(|e| format!("serialize result artifact: {e}"))
     }
 
-    fn result_artifact_payload(
-        uuid: &str,
-        success: bool,
-        exit_code: i32,
-        error_category: Option<&str>,
-        terminal_reason: Option<&str>,
-        finished_at: &str,
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "id": uuid,
-            "status": if success { "succeeded" } else { "failed" },
-            "success": success,
-            "exit_code": exit_code,
-            "terminal_reason": terminal_reason,
-            "error_category": error_category,
-            "finished_at": finished_at,
-        })
+    fn result_artifact_payload(input: ResultEnvelopeInput<'_>) -> serde_json::Value {
+        result_envelope_payload(input)
     }
 
     fn lifecycle_context(&self, start: &InvocationStart) -> lc_log_adapter::StartContext {
@@ -2903,14 +2863,18 @@ impl StateDb {
         result: &Result<FinalizeInvocationRow, String>,
     ) {
         if let Ok(invocation) = result {
-            self.warn_result_artifact_failure(
-                &invocation.invocation_uuid,
+            let failure_identity =
+                (!success).then(|| self.result_artifact_failure_identity(invocation));
+            let input = ResultEnvelopeInput {
+                id: &invocation.invocation_uuid,
                 success,
                 exit_code,
                 error_category,
                 terminal_reason,
                 finished_at,
-            );
+                failure_identity: failure_identity.as_ref(),
+            };
+            self.warn_result_artifact_failure(input);
         }
     }
 
@@ -3043,7 +3007,7 @@ impl StateDb {
         id: i64,
     ) -> sqlite::Result<Option<FinalizeInvocationRowColumns>> {
         conn.query_row(
-            "SELECT invocation_uuid, model_name, provider_name, status
+            "SELECT invocation_uuid, model_name, provider_name, provider_session_id, status
              FROM invocations WHERE id = ?1",
             sqlite::params![id],
             Self::read_invocation_row_for_finalize,
@@ -3054,17 +3018,24 @@ impl StateDb {
     fn read_invocation_row_for_finalize(
         row: &sqlite::Row<'_>,
     ) -> sqlite::Result<FinalizeInvocationRowColumns> {
-        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+        ))
     }
 
     fn map_invocation_row_for_finalize(
         columns: FinalizeInvocationRowColumns,
     ) -> FinalizeInvocationRow {
-        let (invocation_uuid, model_name, provider_name, status) = columns;
+        let (invocation_uuid, model_name, provider_name, provider_session_id, status) = columns;
         FinalizeInvocationRow {
             invocation_uuid,
             model_name,
             provider_name,
+            provider_session_id,
             status,
         }
     }
@@ -3273,25 +3244,30 @@ impl StateDb {
         value.chars().take(500).collect()
     }
 
-    fn warn_result_artifact_failure(
-        &self,
-        invocation_uuid: &str,
-        success: bool,
-        exit_code: i32,
-        error_category: Option<&str>,
-        terminal_reason: Option<&str>,
-        finished_at: &str,
-    ) {
-        if let Err(err) = self.write_result_artifact(
-            invocation_uuid,
-            success,
-            exit_code,
-            error_category,
-            terminal_reason,
-            finished_at,
-        ) {
-            let message = Self::format_result_artifact_warning_message(invocation_uuid, &err);
+    fn warn_result_artifact_failure(&self, input: ResultEnvelopeInput<'_>) {
+        if let Err(err) = self.write_result_artifact(input) {
+            let message = Self::format_result_artifact_warning_message(input.id, &err);
             Self::emit_artifact_warning(&message);
+        }
+    }
+
+    fn result_artifact_failure_identity(
+        &self,
+        invocation: &FinalizeInvocationRow,
+    ) -> ResultEnvelopeFailureIdentity {
+        let agent_runner_chain_id =
+            match (&invocation.provider_name, &invocation.provider_session_id) {
+                (Some(provider_name), Some(provider_session_id)) => self
+                    .chain_id_for_segment(provider_name, provider_session_id)
+                    .ok()
+                    .flatten(),
+                _ => None,
+            };
+        ResultEnvelopeFailureIdentity {
+            agent_runner_invocation_id: invocation.invocation_uuid.clone(),
+            provider_name: invocation.provider_name.clone(),
+            provider_session_id: invocation.provider_session_id.clone(),
+            agent_runner_chain_id,
         }
     }
 

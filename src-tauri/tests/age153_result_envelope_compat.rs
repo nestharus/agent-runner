@@ -36,8 +36,9 @@ fn result_envelope_stdout_byte_shape_is_preserved_for_non_signal_success() {
     assert_normalized_result_stdout_matches_golden(&stdout, NORMALIZED_NON_SIGNAL_SUCCESS_GOLDEN);
     assert_signal_consumer_source_wired(
         "fn emit_result_envelope_line(",
-        &["OULIPOLY_RESULT={json}"],
+        &["emit_stdout_marker_line(\"OULIPOLY_RESULT\""],
     );
+    assert_signal_consumer_source_wired("fn emit_stdout_marker_line(", &["{marker}={json}"]);
 }
 
 #[test]

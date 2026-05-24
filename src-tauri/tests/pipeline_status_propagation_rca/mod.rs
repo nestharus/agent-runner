@@ -675,25 +675,120 @@ fn is_result_envelope_for_invocation(value: &Value, invocation_uuid: &str) -> bo
     let Some(object) = value.as_object() else {
         return false;
     };
-    if object_key_set(object)
-        != BTreeSet::from([
-            "error_category",
-            "exit_code",
-            "finished_at",
-            "id",
-            "status",
-            "success",
-            "terminal_reason",
-        ])
-    {
+    let Some(success) = value["success"].as_bool() else {
+        return false;
+    };
+
+    let base_keys = BTreeSet::from([
+        "error_category",
+        "exit_code",
+        "finished_at",
+        "id",
+        "status",
+        "success",
+        "terminal_reason",
+    ]);
+    let expected_keys = if success {
+        base_keys
+    } else {
+        let mut expected = base_keys;
+        expected.extend([
+            "agent_runner_invocation_id",
+            "provider_name",
+            "provider_session_id",
+            "agent_runner_chain_id",
+        ]);
+        expected
+    };
+
+    if object_key_set(object) != expected_keys {
         return false;
     }
 
     value["id"].as_str() == Some(invocation_uuid)
+        && (success || value["agent_runner_invocation_id"].as_str() == Some(invocation_uuid))
 }
 
 fn object_key_set(object: &serde_json::Map<String, Value>) -> BTreeSet<&str> {
     object.keys().map(String::as_str).collect()
+}
+
+pub fn parse_pre_invocation_failure_marker(line: &str) -> Option<Value> {
+    let raw = line.strip_prefix("OULIPOLY_FAILURE=")?;
+    let value: Value = serde_json::from_str(raw).ok()?;
+    pre_invocation_failure_payload_is_strict(&value).then_some(value)
+}
+
+fn pre_invocation_failure_payload_is_strict(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    if object_key_set(object)
+        != BTreeSet::from([
+            "agent_runner_invocation_id",
+            "provider_name",
+            "provider_session_id",
+            "agent_runner_chain_id",
+            "failure_kind",
+            "stage",
+            "status",
+            "success",
+            "exit_code",
+            "terminal_reason",
+            "error_category",
+            "finished_at",
+            "message",
+            "detail",
+        ])
+    {
+        return false;
+    }
+    if value["failure_kind"] != "pre_invocation"
+        || value["status"] != "failed"
+        || value["success"] != false
+        || value["terminal_reason"] != "pre_invocation_failure"
+        || !value["exit_code"].is_null()
+        || !value["error_category"].is_null()
+        || !value["agent_runner_invocation_id"].is_null()
+        || !value["provider_name"].is_null()
+        || !value["provider_session_id"].is_null()
+        || !value["agent_runner_chain_id"].is_null()
+        || !value["finished_at"].is_string()
+        || !value["message"].is_string()
+    {
+        return false;
+    }
+    matches!(
+        value["stage"].as_str(),
+        Some("provider_selection" | "provider_resolution" | "pool_exhausted")
+    ) && pre_invocation_failure_detail_is_strict(&value["detail"])
+}
+
+fn pre_invocation_failure_detail_is_strict(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    object_key_set(object)
+        == BTreeSet::from([
+            "model_name",
+            "provider_index",
+            "attempted_providers",
+            "reason",
+        ])
+        && string_or_null(&value["model_name"])
+        && number_or_null(&value["provider_index"])
+        && string_or_null(&value["reason"])
+        && value["attempted_providers"]
+            .as_array()
+            .is_some_and(|providers| providers.iter().all(Value::is_string))
+}
+
+fn string_or_null(value: &Value) -> bool {
+    value.is_string() || value.is_null()
+}
+
+fn number_or_null(value: &Value) -> bool {
+    value.is_number() || value.is_null()
 }
 
 fn session_id_is_null_or_uuid(value: &Value) -> bool {

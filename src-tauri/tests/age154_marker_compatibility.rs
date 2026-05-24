@@ -121,20 +121,39 @@ fn assert_result_stdout_contract(path: &str, output: &Output) -> Value {
         "{path}: expected exactly one OULIPOLY_RESULT line in stdout:\n{stdout}"
     );
     let payload = parse_marker_payload(lines[0], RESULT_PREFIX);
+    let base_keys = BTreeSet::from([
+        "error_category",
+        "exit_code",
+        "finished_at",
+        "id",
+        "status",
+        "success",
+        "terminal_reason",
+    ]);
+    let expected_keys = if payload["success"] == true {
+        base_keys
+    } else {
+        let mut expected = base_keys;
+        expected.extend([
+            "agent_runner_invocation_id",
+            "provider_name",
+            "provider_session_id",
+            "agent_runner_chain_id",
+        ]);
+        expected
+    };
     assert_eq!(
         json_key_set(&payload),
-        BTreeSet::from([
-            "error_category",
-            "exit_code",
-            "finished_at",
-            "id",
-            "status",
-            "success",
-            "terminal_reason",
-        ]),
-        "{path}: expected observable signal from proposal item 2"
+        expected_keys,
+        "{path}: success must stay exact-7 and failure must carry AGE-175 identity keys"
     );
     assert!(payload["id"].is_string(), "{path}: id must be present");
+    if payload["success"] == false {
+        assert_eq!(
+            payload["agent_runner_invocation_id"], payload["id"],
+            "{path}: failure identity must repeat the runner invocation id"
+        );
+    }
     assert!(
         payload["status"].is_string(),
         "{path}: status must be present"
