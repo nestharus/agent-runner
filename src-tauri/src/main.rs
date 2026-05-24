@@ -36,6 +36,20 @@
 //!       - invocation finalization sequencing
 //!       - terminal signal outcome sequencing
 //!       - provider retry and migration sequencing
+//!   - component: src-tauri/src/main.rs::pre_invocation_failure_marker
+//!     role: intrinsic-surface
+//!     Domain: pre_invocation_failure_marker
+//!     Owns:
+//!       - emit_pre_invocation_failure
+//!       - pre_invocation_failure_payload
+//!       - pre_invocation_failure_message
+//!       - emit_pool_exhausted_pre_invocation_failure
+//!       - emit_provider_selection_pre_invocation_failure
+//!       - emit_provider_resolution_pre_invocation_failure
+//!       - emit_pre_invocation_failure_line
+//!       - OULIPOLY_FAILURE marker line
+//!       - OULIPOLY_FAILURE payload field set
+//!       - model_provider_names
 //! ```
 
 use agent_runner_lib::{effective_provider_for_model_provider, load_app_config};
@@ -3738,14 +3752,14 @@ fn model_provider_names(model: &ModelConfig) -> Vec<String> {
         .collect()
 }
 
-fn emit_pre_invocation_failure(
+fn pre_invocation_failure_payload(
     stage: &str,
     model_name: Option<&str>,
     provider_index: Option<usize>,
     attempted_providers: Vec<String>,
     reason: Option<&str>,
-) {
-    let payload = serde_json::json!({
+) -> serde_json::Value {
+    serde_json::json!({
         "failure_kind": "pre_invocation",
         "stage": stage,
         "status": "failed",
@@ -3765,7 +3779,23 @@ fn emit_pre_invocation_failure(
         "provider_name": serde_json::Value::Null,
         "provider_session_id": serde_json::Value::Null,
         "agent_runner_chain_id": serde_json::Value::Null,
-    });
+    })
+}
+
+fn emit_pre_invocation_failure(
+    stage: &str,
+    model_name: Option<&str>,
+    provider_index: Option<usize>,
+    attempted_providers: Vec<String>,
+    reason: Option<&str>,
+) {
+    let payload = pre_invocation_failure_payload(
+        stage,
+        model_name,
+        provider_index,
+        attempted_providers,
+        reason,
+    );
     match serde_json::to_string(&payload) {
         Ok(json) => emit_pre_invocation_failure_line(&json),
         Err(err) => eprintln!("Warning: Failed to serialize pre-invocation failure: {err}"),

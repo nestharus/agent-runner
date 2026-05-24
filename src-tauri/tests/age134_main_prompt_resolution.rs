@@ -1,5 +1,8 @@
 #![cfg(unix)]
 
+//! Declared roles: accessor, formatter, mapper, parser, filter,
+//! orchestration, validator.
+
 use oulipoly_state::{CompositeInvocationId, InvocationStatus, StateDb};
 use rusqlite::Connection;
 use std::fs;
