@@ -3734,3 +3734,45 @@ This is NOT residual acceptance, NOT precedent citation, and does NOT authorize 
   (Rebase Verification Gate section); planning/age-180-stale-migration-test/risk/age-180-rebase-verification.md.
 - Revisit when: never (informational); future WUs appending to DECISIONS.md must reference planning
   artifacts with the `planning/<wu>/...` prefix, never bare `research/`/`risk/` paths.
+
+## D-AGE-180-rebase-check-4-docs-mention — Rebase Verification Gate Check #4 drift accepted as documentation-mention-only (2026-05-23)
+
+- WU: AGE-180 (stale TEST reconciliation). Phase: Rebase Verification Gate Check #4 (rebase-drift-checker,
+  invocation `63fd52a4-c2a9-477a-ae71-967b5a9a8437`), after rebasing onto `origin/main` `bac470b`
+  (AGE-179 / PR #140) — POST_TIP `b581032`.
+- Trigger: Check #4 returned a blocking `drift detected`. The report
+  (`planning/age-180-stale-migration-test/risk/age-180-rebase-drift.md`) flags exactly TWO textual
+  name-mention overlaps inside AGE-179's newly-merged prose: (1) AGE-179's
+  `D-AGE-179-rebase-check-1-intent-reading` DECISIONS.md entry names the same migration test AGE-180
+  reconciled; (2) `evals/age-179-provider-docs/eval.md` names
+  `crates/oulipoly-runtime/src/migration/mod.rs::find_alternate_jsonl_with_boundary`, which AGE-180's
+  problem map lists as a READ-ONLY reference. The merged delta changed ZERO path touching any AGE-180
+  test file or the migration/state source.
+- Disposition: **accept as documentation-mention-only — no behavioral drift** (root-owned interpretive
+  call, answer `q-6197192c-2fff-4797-b44f-ac720e340fa4.answer.json`, option 1; recommended). This is
+  intent-reading (Check #4's purpose is to detect *behavioral* drift on a touched surface), mirroring
+  AGE-179's `D-AGE-179-rebase-check-1-intent-reading`. It is NOT a residual acceptance and NOT a
+  bootstrap exception (manager-max): there is no non-LOW verdict being waived on a touched surface — the
+  flagged overlaps are name-mentions in merged docs, below the rebase-verification convention's
+  "a change that affects a touched surface" bar.
+- Evidence of no behavioral drift: the three reconciled AGE-180 test-file blobs are byte-identical
+  pre/post rebase (`4a7bc7a` / `8f6dbb0` / `5798053`; `git range-diff` shows only the DECISIONS.md
+  anchor move; `residual.patch` empty); `cargo test --workspace --no-fail-fast` GREEN (213 `ok` / 0
+  failed; `initiative_05_migration` 31/0, `workflow_yml_contract` 18/0, `workspace_layout` 9/0); fmt +
+  clippy `--workspace --all-targets` clean. The drift report's own Non-Overlap Rationale confirms the
+  merged delta is docs-only and touches no AGE-180 surface, and the report explicitly disclaims deciding
+  acceptability.
+- Why none of the convention's closed disposition set applies: repair-on-branch has no target (suite
+  already green, blobs unchanged) — it would be a no-op; rewind would abandon merging onto current main
+  (AGE-180 cannot reach green main without rebasing onto `bac470b`); re-enter Phase 2.5 is unwarranted
+  because the merged change is docs-only and did not invalidate AGE-180's intact problem map.
+- Constraints honored: NO product code, NO ci.yml, NO Cargo.toml dependency change; test files unchanged
+  (blobs identical). Test-only + this DECISIONS.md entry.
+- Result: Check #4 dispositioned; Rebase Verification Gate cleared (Checks #1 PASS / #2 NON_APPLICABLE /
+  #3 PASS / #4 accepted-docs-mention-only). Proceeding to Phase 8 currentness refresh on `b581032`,
+  CodeRabbit incremental re-trigger, then squash-merge PR #141 -> green main.
+- Evidence: `planning/age-180-stale-migration-test/risk/age-180-rebase-drift.md`;
+  `planning/age-180-stale-migration-test/risk/age-180-rebase-verification.md`;
+  `planning/age-180-stale-migration-test/scratch/questions/q-6197192c-2fff-4797-b44f-ac720e340fa4.answer.json`;
+  `planning/age-180-stale-migration-test/audit-history.md` (Rebase Verification Gate section).
+- Revisit when: never (informational).
