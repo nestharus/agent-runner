@@ -1,7 +1,6 @@
 //! Declared role: formatter
 
 use super::rebuild::MigrateRebuildPlan;
-use crate::CompactionBackfillReport;
 use oulipoly_state::BackfillReport;
 use std::path::Path;
 
@@ -9,13 +8,6 @@ pub(super) fn render_session_chain_backfill_report(report: &BackfillReport) {
     println!(
         "session chain backfill: chains={} segments={} skipped_existing={}",
         report.chains_inserted, report.segments_inserted, report.skipped_existing
-    );
-}
-
-pub(super) fn render_compaction_backfill_report(report: &CompactionBackfillReport) {
-    println!(
-        "compaction backfill: {} turns flagged across {} sessions",
-        report.turns_flagged, report.sessions_processed
     );
 }
 

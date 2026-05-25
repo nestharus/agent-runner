@@ -1,20 +1,16 @@
 //! Declared role: orchestration
 
-use super::formatter::{
-    render_compaction_backfill_report, render_migrate_rebuild_report,
-    render_session_chain_backfill_report,
-};
+use super::formatter::{render_migrate_rebuild_report, render_session_chain_backfill_report};
 use super::rebuild::{execute_migrate_rebuild, migrate_rebuild_plan};
 use super::validator::validate_migrate_rebuild_flag;
-use crate::run_compaction_backfill;
+use crate::commands::compaction_backfill::run_compaction_backfill;
 use oulipoly_state::StateDb;
 
 pub(crate) fn run_migrate_db() -> Result<i32, String> {
     let state = StateDb::open_default()?;
     let report = state.backfill_session_chains()?;
     render_session_chain_backfill_report(&report);
-    let compaction_report = run_compaction_backfill(&state)?;
-    render_compaction_backfill_report(&compaction_report);
+    run_compaction_backfill(&state)?;
     Ok(0)
 }
 
