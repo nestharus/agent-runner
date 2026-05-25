@@ -90,7 +90,6 @@ use oulipoly_state::{
 use clap::Parser;
 use regex::Regex;
 use std::collections::{BTreeMap, HashMap};
-use std::fs;
 use std::io::{BufRead, IsTerminal, Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -460,8 +459,8 @@ fn dispatch_subcommand(
             dispatch_session_subcommand(command, agent_runtime_services)
         }
         Subcommands::ResumeList { uuid } => run_resume_list(&uuid),
-        Subcommands::MigrateDb => run_migrate_db(),
-        Subcommands::Migrate { rebuild } => run_migrate(rebuild),
+        Subcommands::MigrateDb => commands::migrate::run_migrate_db(),
+        Subcommands::Migrate { rebuild } => commands::migrate::run_migrate(rebuild),
         Subcommands::MigrateConfig { models_dir } => {
             commands::config_migration::run_migrate_config(models_dir.as_deref())
         }
@@ -4847,269 +4846,6 @@ fn emit_diagnostics_failure(error: &str) {
     eprintln!("[diagnostics] Failed to diagnose: {error}");
 }
 
-// ---
-// Component: db-migration-backfill
-// Declared roles: orchestration, parser, formatter, predicate, validator, accessor, mapper, filter
-// ---
-
-fn run_migrate_db() -> Result<i32, String> {
-    let state = StateDb::open_default()?;
-    let report = state.backfill_session_chains()?;
-    render_session_chain_backfill_report(&report);
-    let compaction_report = run_compaction_backfill(&state)?;
-    render_compaction_backfill_report(&compaction_report);
-    Ok(0)
-}
-
-fn run_migrate(rebuild: bool) -> Result<i32, String> {
-    validate_migrate_rebuild_flag(rebuild)?;
-    run_migrate_rebuild()
-}
-
-fn run_migrate_rebuild() -> Result<i32, String> {
-    let Some(plan) = migrate_rebuild_plan()? else {
-        return Ok(0);
-    };
-    execute_migrate_rebuild(&plan)?;
-    let fresh = StateDb::open(&plan.db_path)?;
-    drop(fresh);
-    render_migrate_rebuild_report(&plan);
-    Ok(0)
-}
-
-fn unique_backup_dir(root: &Path) -> Result<PathBuf, String> {
-    let base = backup_dir_base_name();
-    first_available_backup_dir(backup_dir_candidates(root, &base))
-        .ok_or_else(|| format_backup_dir_exhausted_error(root))
-}
-
-fn backup_dir_candidates(root: &Path, base: &str) -> Vec<PathBuf> {
-    (0..1000)
-        .map(|suffix| root.join(backup_dir_candidate_name(base, suffix)))
-        .collect()
-}
-
-fn first_available_backup_dir(candidates: Vec<PathBuf>) -> Option<PathBuf> {
-    candidates
-        .into_iter()
-        .find(|candidate| unused_path(candidate))
-}
-
-fn unused_path(path: &Path) -> bool {
-    !path.exists()
-}
-
-fn render_session_chain_backfill_report(report: &oulipoly_state::BackfillReport) {
-    println!(
-        "session chain backfill: chains={} segments={} skipped_existing={}",
-        report.chains_inserted, report.segments_inserted, report.skipped_existing
-    );
-}
-
-fn render_compaction_backfill_report(report: &CompactionBackfillReport) {
-    println!(
-        "compaction backfill: {} turns flagged across {} sessions",
-        report.turns_flagged, report.sessions_processed
-    );
-}
-
-fn validate_migrate_rebuild_flag(rebuild: bool) -> Result<(), String> {
-    if rebuild {
-        Ok(())
-    } else {
-        Err("missing required flag: --rebuild".to_string())
-    }
-}
-
-struct MigrateRebuildPlan {
-    db_path: PathBuf,
-    backup_dir: PathBuf,
-    sidecars: Vec<PathBuf>,
-}
-
-fn migrate_rebuild_plan() -> Result<Option<MigrateRebuildPlan>, String> {
-    let db_path = default_state_db_path()?;
-    if missing_state_db(&db_path) {
-        render_missing_state_db_rebuild_message(&db_path);
-        return Ok(None);
-    }
-    let backup_root = prepare_migrate_backup_root(&db_path)?;
-    Ok(Some(migrate_rebuild_plan_from_paths(
-        db_path,
-        &backup_root,
-    )?))
-}
-
-fn default_state_db_path() -> Result<PathBuf, String> {
-    StateDb::default_path()
-}
-
-fn missing_state_db(db_path: &Path) -> bool {
-    !db_path.exists()
-}
-
-fn render_missing_state_db_rebuild_message(db_path: &Path) {
-    println!("no state.db to rebuild at {}", db_path.display());
-}
-
-fn prepare_migrate_backup_root(db_path: &Path) -> Result<PathBuf, String> {
-    let data_dir = state_db_parent_dir(db_path)?;
-    let backup_root = data_dir.join("state-backups");
-    create_backup_root_dir(&backup_root)?;
-    Ok(backup_root)
-}
-
-fn state_db_parent_dir(db_path: &Path) -> Result<&Path, String> {
-    db_path
-        .parent()
-        .ok_or_else(|| format!("state DB path has no parent: {}", db_path.display()))
-}
-
-fn create_backup_root_dir(backup_root: &Path) -> Result<(), String> {
-    fs::create_dir_all(backup_root).map_err(format_backup_root_create_error)
-}
-
-fn format_backup_root_create_error(error: std::io::Error) -> String {
-    format!("failed to create backup directory: {error}")
-}
-
-fn migrate_rebuild_plan_from_paths(
-    db_path: PathBuf,
-    backup_root: &Path,
-) -> Result<MigrateRebuildPlan, String> {
-    Ok(MigrateRebuildPlan {
-        backup_dir: unique_backup_dir(backup_root)?,
-        sidecars: db_sidecar_paths(&db_path),
-        db_path,
-    })
-}
-
-fn db_sidecar_paths(db_path: &Path) -> Vec<PathBuf> {
-    vec![
-        db_path.to_path_buf(),
-        PathBuf::from(format!("{}-wal", db_path.display())),
-        PathBuf::from(format!("{}-shm", db_path.display())),
-    ]
-}
-
-fn execute_migrate_rebuild(plan: &MigrateRebuildPlan) -> Result<(), String> {
-    create_backup_dir(&plan.backup_dir)?;
-    backup_rebuild_sidecars(&plan.sidecars, &plan.backup_dir)?;
-    remove_live_sidecars(&plan.sidecars)
-}
-
-fn create_backup_dir(backup_dir: &Path) -> Result<(), String> {
-    fs::create_dir(backup_dir).map_err(|e| {
-        format!(
-            "failed to create backup directory {}: {e}",
-            backup_dir.display()
-        )
-    })
-}
-
-fn backup_rebuild_sidecars(sidecars: &[PathBuf], backup_dir: &Path) -> Result<(), String> {
-    for source in sidecars {
-        if source.exists() {
-            backup_rebuild_sidecar(source, backup_dir)?;
-        }
-    }
-    Ok(())
-}
-
-fn backup_rebuild_sidecar(source: &Path, backup_dir: &Path) -> Result<(), String> {
-    let file_name = backup_source_file_name(source)?;
-    copy_rebuild_sidecar(source, &backup_sidecar_destination(backup_dir, file_name))?;
-    Ok(())
-}
-
-fn backup_source_file_name(source: &Path) -> Result<&std::ffi::OsStr, String> {
-    source
-        .file_name()
-        .ok_or_else(|| format_backup_source_missing_file_name_error(source))
-}
-
-fn format_backup_source_missing_file_name_error(source: &Path) -> String {
-    format!("backup source has no file name: {}", source.display())
-}
-
-fn backup_sidecar_destination(backup_dir: &Path, file_name: &std::ffi::OsStr) -> PathBuf {
-    backup_dir.join(file_name)
-}
-
-fn copy_rebuild_sidecar(source: &Path, destination: &Path) -> Result<(), String> {
-    fs::copy(source, destination)
-        .map(|_| ())
-        .map_err(|e| format_rebuild_sidecar_copy_error(source, destination, e))
-}
-
-fn format_rebuild_sidecar_copy_error(
-    source: &Path,
-    destination: &Path,
-    error: std::io::Error,
-) -> String {
-    let backup_dir = destination.parent().unwrap_or(destination);
-    format!(
-        "failed to back up {} to {}: {error}",
-        source.display(),
-        backup_dir.display()
-    )
-}
-
-fn remove_live_sidecars(sidecars: &[PathBuf]) -> Result<(), String> {
-    for source in sidecars {
-        if source.exists() {
-            fs::remove_file(source)
-                .map_err(|e| format!("failed to remove live {}: {e}", source.display()))?;
-        }
-    }
-    Ok(())
-}
-
-fn render_migrate_rebuild_report(plan: &MigrateRebuildPlan) {
-    println!("backup: {}", plan.backup_dir.display());
-    println!("fresh state DB: {}", plan.db_path.display());
-    println!(
-        "historical state was not preserved in the live DB; backup is at {}",
-        plan.backup_dir.display()
-    );
-}
-
-fn backup_dir_base_name() -> String {
-    format_backup_dir_base_name(&backup_dir_timestamp(), backup_dir_process_id())
-}
-
-fn backup_dir_timestamp() -> String {
-    chrono::Utc::now().format("%Y%m%dT%H%M%S%.fZ").to_string()
-}
-
-fn backup_dir_process_id() -> u32 {
-    std::process::id()
-}
-
-fn format_backup_dir_base_name(stamp: &str, pid: u32) -> String {
-    format!("{stamp}-pid{pid}")
-}
-
-fn backup_dir_candidate_name(base: &str, suffix: usize) -> String {
-    if suffix == 0 {
-        base.to_string()
-    } else {
-        format!("{base}-{suffix}")
-    }
-}
-
-fn format_backup_dir_exhausted_error(root: &Path) -> String {
-    format!(
-        "failed to allocate unique backup directory under {}",
-        root.display()
-    )
-}
-
-// ---
-// Component: db-migration-backfill
-// Declared roles: orchestration, parser, formatter, predicate, validator, accessor, mapper, filter
-// ---
-
 fn run_resume_list(uuid: &str) -> Result<i32, String> {
     validate_resume_list_uuid(uuid)?;
     render_resume_list(uuid, &load_resume_previews(uuid)?);
@@ -5152,12 +4888,12 @@ fn render_resume_preview_lines(previews: &[oulipoly_state::ChainPreview]) {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CompactionBackfillReport {
-    turns_flagged: u64,
-    sessions_processed: u64,
+pub(crate) struct CompactionBackfillReport {
+    pub(crate) turns_flagged: u64,
+    pub(crate) sessions_processed: u64,
 }
 
-fn run_compaction_backfill(state: &StateDb) -> Result<CompactionBackfillReport, String> {
+pub(crate) fn run_compaction_backfill(state: &StateDb) -> Result<CompactionBackfillReport, String> {
     let mut report = empty_compaction_backfill_report();
     for (provider_name, session_id) in distinct_compaction_chain_segments(state)? {
         let flagged = backfill_compaction_session(state, &provider_name, &session_id)?;

@@ -85,7 +85,7 @@ fn one_shot_slice() -> &'static str {
 }
 
 fn diagnostics_slice() -> &'static str {
-    source_slice(main_source(), "fn run_diagnostics(", "fn run_migrate_db(")
+    source_slice(main_source(), "fn run_diagnostics(", "fn run_resume_list(")
 }
 
 fn entrypoint_slice() -> &'static str {
