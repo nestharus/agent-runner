@@ -23,6 +23,24 @@
 - `crates/oulipoly-runtime/src/session_metadata/workspace.rs`
 - `crates/oulipoly-runtime/src/session_replace/mod.rs`
 - `crates/oulipoly-runtime/src/migration/mod.rs`
+- `src-tauri/src/commands/compaction_backfill/mod.rs`
+- `src-tauri/src/commands/compaction_backfill/orchestration.rs`
+- `src-tauri/src/commands/compaction_backfill/accessor.rs`
+- `src-tauri/src/commands/compaction_backfill/formatter.rs`
+- `src-tauri/src/commands/compaction_backfill/report.rs`
+- `src-tauri/src/commands/compaction_backfill/tests.rs`
+- `src-tauri/src/commands/migrate/dispatch.rs`
+- `src-tauri/src/commands/migrate/formatter.rs`
+- `src-tauri/src/commands/mod.rs`
+
+The `src-tauri/src/commands/compaction_backfill/*`, `src-tauri/src/commands/migrate/{dispatch,formatter}.rs`,
+and `src-tauri/src/commands/mod.rs` paths are the `migrate-db` migration command surface (compaction-boundary
+backfill over chain segments), relocated out of `main.rs` by AGE-186 (slice A3 of the AGE-183 decomposition).
+This is a deliberate-union ownership entry: these CLI command files implement the migration/chain-segment
+behavior this spec owns; the behavior is exercised by the `migrate-db` integration oracle
+(`src-tauri/tests/age149_owned_turn_event_schema.rs`, `age134_main_session_and_migrate.rs`,
+`initiative_05_migration.rs`, `age33_config_state_characterization.rs`) plus co-located unit tests in
+`src-tauri/src/commands/compaction_backfill/tests.rs`.
 
 ## Preconditions
 
