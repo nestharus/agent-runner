@@ -2394,165 +2394,386 @@ fn run_repl(
     working_dir: Option<&Path>,
     models_dir_override: Option<&Path>,
 ) -> Result<i32, String> {
+    let (env, run) = match prepare_interactive_repl_run(
+        agent_runtime_services,
+        model_name,
+        resume,
+        manual_migrate,
+        working_dir,
+        models_dir_override,
+    )? {
+        InteractiveReplPreparation::Ready { env, run } => (env, run),
+        InteractiveReplPreparation::Exit(exit_code) => return Ok(exit_code),
+    };
+    validate_provider_repl_capability(&run.provider)?;
+
+    let mut attempt =
+        start_interactive_repl_invocation(agent_runtime_services, &env, &run, manual_migrate)?;
+    let execution = prepare_interactive_repl_execution(&run, working_dir)?;
+    let mut result = match execute_inherited_stdio_repl(
+        agent_runtime_services,
+        &env,
+        &run,
+        &mut attempt,
+        working_dir,
+    )? {
+        InteractiveReplExecution::Completed(result) => result,
+        InteractiveReplExecution::Exit(exit_code) => return Ok(exit_code),
+    };
+
+    prepare_interactive_repl_completion(&env, &run, &attempt, &mut result);
+    match handle_interactive_repl_terminal_signal_disposition(
+        agent_runtime_services,
+        &env,
+        &run,
+        &mut attempt,
+        &result,
+    )? {
+        InteractiveReplControl::Return(exit_code) => return Ok(exit_code),
+        InteractiveReplControl::Proceed => {}
+    }
+
+    finalize_interactive_repl_completion(
+        agent_runtime_services,
+        &env,
+        &run,
+        &mut attempt,
+        &execution,
+        &result,
+        manual_migrate,
+    )
+}
+
+struct InteractiveReplRun {
+    input_resume: Option<String>,
+    resolved_model_name: Option<String>,
+    model: ModelConfig,
+    provider_index: usize,
+    provider: ProviderConfig,
+    resume_session_id: Option<String>,
+    resume_spawn_cwd: Option<PathBuf>,
+    parent_invocation_id: Option<i64>,
+    stderr_is_terminal: bool,
+}
+
+struct InteractiveReplAttempt<'a> {
+    invocation: CompositeInvocationId,
+    invocation_row_id: i64,
+    guard: FinalizerGuard<'a>,
+    invocation_env: String,
+    zero_turn_baseline: ZeroTurnBaseline,
+}
+
+struct InteractiveReplExecutionContext {
+    interactive_effective_cwd: PathBuf,
+}
+
+enum InteractiveReplPreparation {
+    Ready {
+        env: ResumeExecutionEnvironment,
+        run: InteractiveReplRun,
+    },
+    Exit(i32),
+}
+
+enum InteractiveReplProviderSelection {
+    Selected {
+        provider_index: usize,
+        provider: ProviderConfig,
+        resume_session_id: Option<String>,
+        resume_spawn_cwd: Option<PathBuf>,
+    },
+    Exit(i32),
+}
+
+enum InteractiveReplExecution {
+    Completed(executor::cli::InteractiveExecutionResult),
+    Exit(i32),
+}
+
+enum InteractiveReplControl {
+    Proceed,
+    Return(i32),
+}
+
+fn prepare_interactive_repl_run(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    model_name: Option<&str>,
+    resume: Option<&str>,
+    manual_migrate: Option<&str>,
+    working_dir: Option<&Path>,
+    models_dir_override: Option<&Path>,
+) -> Result<InteractiveReplPreparation, String> {
     let env = load_resume_execution_environment(models_dir_override)?;
     let mut resolved_resume =
         resolve_optional_repl_resume(agent_runtime_services, &env, resume, model_name)?;
-    let mut fallback_target = match resolved_resume.as_ref() {
-        Some(resolved) => Some(
-            resume_execution_target(resolved, &env.providers_cfg).map_err(format_resume_error)?,
-        ),
-        None => None,
-    };
-    let direct_model = if fallback_target.is_none() {
-        let model_name =
-            model_name.ok_or_else(|| "model is required unless --resume is present".to_string())?;
-        Some(
-            env.models
-                .get(model_name)
-                .cloned()
-                .ok_or_else(|| format!("Unknown model: {model_name}"))?,
-        )
-    } else {
-        None
-    };
-    let model = fallback_target
-        .as_ref()
-        .and_then(|target| target.model.clone())
-        .or(direct_model)
-        .unwrap_or_else(|| ModelConfig {
-            name: "<provider-default>".to_string(),
-            prompt_mode: PromptMode::Stdin,
-            providers: Vec::new(),
-            inputs: Vec::new(),
-            provider: None,
-        });
-
+    let mut fallback_target =
+        initial_interactive_repl_fallback_target(resolved_resume.as_ref(), &env.providers_cfg)?;
+    let model = interactive_repl_model(&env.models, model_name, fallback_target.as_ref())?;
     let in_flight = oulipoly_runtime::quota::InFlight::new();
     let ctx = balancer::BalanceContext {
         providers_cfg: &env.providers_cfg,
         sessions_cfg: &env.sessions_cfg,
         in_flight: &in_flight,
     };
-
     let parent_invocation_id = resolve_parent_invocation_id(&env.state);
     let stderr_is_terminal = std::io::stderr().is_terminal();
-    let mut resume_spawn_cwd = None;
-    let (provider_index, provider, resume_session_id) =
-        if let Some(resolved) = resolved_resume.as_mut() {
-            let selected_provider = &resolved.active_provider;
-            if should_emit_resume_short_line(stderr_is_terminal) {
-                eprintln!("[resume] -> {selected_provider}");
-            }
-            if fallback_target
-                .as_ref()
-                .is_some_and(|target| target.provider.resume.is_none())
-            {
-                eprintln!(
-                    "provider {selected_provider} has no [providers.resume] block; cannot resume"
-                );
-                return Ok(1);
-            }
-            let migration_model = resume_migration_pool(resolved, &env.providers_cfg);
-            let effective_spawn_cwd = effective_resume_spawn_cwd(
-                &env.state,
-                &env.models,
-                &env.providers_cfg,
-                &env.sessions_cfg,
-                resume.expect("resume input must exist for resolved resume"),
-                working_dir,
-            )?;
-            resume_spawn_cwd = Some(effective_spawn_cwd.clone());
-            let mut migration_stderr = std::io::stderr();
-            match agent_runtime_services
-                .migration_service
-                .migrate(MigrationServiceRequest {
-                    state: &env.state,
-                    sessions_cfg: &env.sessions_cfg,
-                    resolved,
-                    manual_target: manual_migrate,
-                    active_exhausted: false,
-                    migration_model: &migration_model,
-                    effective_cwd: &effective_spawn_cwd,
-                    stderr: &mut migration_stderr,
-                }) {
-                Ok(MigrationServiceOutput::Migrated { segment: migrated })
-                | Ok(MigrationServiceOutput::AutoRotated {
-                    segment: migrated, ..
-                }) => {
-                    resolved.active_provider = migrated.target_provider.clone();
-                    resolved.active_session_id = migrated.target_session_id.clone();
-                    fallback_target = Some(
-                        resume_execution_target(resolved, &env.providers_cfg)
-                            .map_err(format_resume_error)?,
-                    );
-                }
-                Ok(MigrationServiceOutput::Stay) => {}
-                Ok(MigrationServiceOutput::RotationFailed { reason }) => {
-                    eprintln!("{}", format_rotation_failed_reason(&reason));
-                    return Ok(1);
-                }
-                Err(ServiceError::Dependency { message }) => {
-                    eprintln!("migration failed: {message}");
-                    return Ok(1);
-                }
-                Err(err) => return Err(format!("migration service failed: {err}")),
-            }
-
-            let target = fallback_target
-                .as_ref()
-                .expect("resume target must be resolved before spawn");
-            let provider_index = target.provider_index;
-            let provider = target.provider.clone();
-            if provider.resume.is_none() {
-                eprintln!(
-                    "provider {} has no [providers.resume] block; cannot resume",
-                    provider.name
-                );
-                return Ok(1);
-            }
-
-            (
-                provider_index,
-                provider,
-                Some(resolved.active_session_id.clone()),
-            )
-        } else {
-            let provider_index = agent_runtime_services
-                .routing_service
-                .select_route(RoutingServiceRequest {
-                    model: &model,
-                    state: &env.state,
-                    ctx: Some(&ctx),
-                })
-                .map_err(|err| err.to_string())?
-                .provider_index;
-            let (provider, _) =
-                effective_model_for_execution(&model, provider_index, &env.providers_cfg)?;
-            (provider_index, provider, None)
-        };
-    validate_provider_repl_capability(&provider)?;
-
-    let invocation_id = Uuid::new_v4().to_string();
-    let invocation = CompositeInvocationId {
-        source: provider.name.clone(),
-        id: invocation_id,
+    let selection = match select_interactive_repl_provider(
+        agent_runtime_services,
+        &env,
+        &model,
+        &ctx,
+        &mut resolved_resume,
+        &mut fallback_target,
+        resume,
+        manual_migrate,
+        working_dir,
+        stderr_is_terminal,
+    )? {
+        InteractiveReplProviderSelection::Selected {
+            provider_index,
+            provider,
+            resume_session_id,
+            resume_spawn_cwd,
+        } => (
+            provider_index,
+            provider,
+            resume_session_id,
+            resume_spawn_cwd,
+        ),
+        InteractiveReplProviderSelection::Exit(exit_code) => {
+            return Ok(InteractiveReplPreparation::Exit(exit_code));
+        }
     };
-    let invocation_model_name = resolved_resume
+
+    Ok(InteractiveReplPreparation::Ready {
+        env,
+        run: InteractiveReplRun {
+            input_resume: resume.map(str::to_string),
+            resolved_model_name: resolved_resume.and_then(|resolved| resolved.model_name),
+            model,
+            provider_index: selection.0,
+            provider: selection.1,
+            resume_session_id: selection.2,
+            resume_spawn_cwd: selection.3,
+            parent_invocation_id,
+            stderr_is_terminal,
+        },
+    })
+}
+
+fn initial_interactive_repl_fallback_target(
+    resolved_resume: Option<&oulipoly_state::ResolvedResume>,
+    providers_cfg: &ProvidersConfig,
+) -> Result<Option<ResumeExecutionTarget>, String> {
+    resolved_resume
+        .map(|resolved| resume_execution_target(resolved, providers_cfg))
+        .transpose()
+        .map_err(format_resume_error)
+}
+
+fn interactive_repl_model(
+    models: &HashMap<String, ModelConfig>,
+    model_name: Option<&str>,
+    fallback_target: Option<&ResumeExecutionTarget>,
+) -> Result<ModelConfig, String> {
+    if let Some(model) = fallback_target.and_then(|target| target.model.clone()) {
+        return Ok(model);
+    }
+    if fallback_target.is_none() {
+        let model_name =
+            model_name.ok_or_else(|| "model is required unless --resume is present".to_string())?;
+        return models
+            .get(model_name)
+            .cloned()
+            .ok_or_else(|| format!("Unknown model: {model_name}"));
+    }
+    Ok(ModelConfig {
+        name: "<provider-default>".to_string(),
+        prompt_mode: PromptMode::Stdin,
+        providers: Vec::new(),
+        inputs: Vec::new(),
+        provider: None,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn select_interactive_repl_provider(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    env: &ResumeExecutionEnvironment,
+    model: &ModelConfig,
+    ctx: &balancer::BalanceContext<'_>,
+    resolved_resume: &mut Option<oulipoly_state::ResolvedResume>,
+    fallback_target: &mut Option<ResumeExecutionTarget>,
+    resume: Option<&str>,
+    manual_migrate: Option<&str>,
+    working_dir: Option<&Path>,
+    stderr_is_terminal: bool,
+) -> Result<InteractiveReplProviderSelection, String> {
+    match resolved_resume.as_mut() {
+        Some(resolved) => select_interactive_repl_resume_provider(
+            agent_runtime_services,
+            env,
+            resolved,
+            fallback_target,
+            resume,
+            manual_migrate,
+            working_dir,
+            stderr_is_terminal,
+        ),
+        None => {
+            select_interactive_repl_non_resume_provider(agent_runtime_services, env, model, ctx)
+        }
+    }
+}
+
+fn select_interactive_repl_non_resume_provider(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    env: &ResumeExecutionEnvironment,
+    model: &ModelConfig,
+    ctx: &balancer::BalanceContext<'_>,
+) -> Result<InteractiveReplProviderSelection, String> {
+    let provider_index = agent_runtime_services
+        .routing_service
+        .select_route(RoutingServiceRequest {
+            model,
+            state: &env.state,
+            ctx: Some(ctx),
+        })
+        .map_err(|err| err.to_string())?
+        .provider_index;
+    let (provider, _) = effective_model_for_execution(model, provider_index, &env.providers_cfg)?;
+    Ok(InteractiveReplProviderSelection::Selected {
+        provider_index,
+        provider,
+        resume_session_id: None,
+        resume_spawn_cwd: None,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn select_interactive_repl_resume_provider(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    env: &ResumeExecutionEnvironment,
+    resolved: &mut oulipoly_state::ResolvedResume,
+    fallback_target: &mut Option<ResumeExecutionTarget>,
+    resume: Option<&str>,
+    manual_migrate: Option<&str>,
+    working_dir: Option<&Path>,
+    stderr_is_terminal: bool,
+) -> Result<InteractiveReplProviderSelection, String> {
+    let selected_provider = &resolved.active_provider;
+    render_resume_short_line_if_needed(stderr_is_terminal, selected_provider);
+    if fallback_target
         .as_ref()
-        .and_then(|resolved| resolved.model_name.clone())
-        .unwrap_or_else(|| {
-            if resume.is_some() {
-                "<unknown>".to_string()
-            } else {
-                model.name.clone()
-            }
-        });
+        .is_some_and(|target| target.provider.resume.is_none())
+    {
+        eprintln!("provider {selected_provider} has no [providers.resume] block; cannot resume");
+        return Ok(InteractiveReplProviderSelection::Exit(1));
+    }
+
+    let migration_model = resume_migration_pool(resolved, &env.providers_cfg);
+    let effective_spawn_cwd = effective_resume_spawn_cwd(
+        &env.state,
+        &env.models,
+        &env.providers_cfg,
+        &env.sessions_cfg,
+        resume.expect("resume input must exist for resolved resume"),
+        working_dir,
+    )?;
+    if let Some(exit_code) = migrate_interactive_repl_resume(
+        agent_runtime_services,
+        env,
+        resolved,
+        fallback_target,
+        manual_migrate,
+        &migration_model,
+        &effective_spawn_cwd,
+    )? {
+        return Ok(InteractiveReplProviderSelection::Exit(exit_code));
+    }
+
+    let target = fallback_target
+        .as_ref()
+        .expect("resume target must be resolved before spawn");
+    let provider_index = target.provider_index;
+    let provider = target.provider.clone();
+    if provider.resume.is_none() {
+        eprintln!(
+            "provider {} has no [providers.resume] block; cannot resume",
+            provider.name
+        );
+        return Ok(InteractiveReplProviderSelection::Exit(1));
+    }
+
+    Ok(InteractiveReplProviderSelection::Selected {
+        provider_index,
+        provider,
+        resume_session_id: Some(resolved.active_session_id.clone()),
+        resume_spawn_cwd: Some(effective_spawn_cwd),
+    })
+}
+
+fn migrate_interactive_repl_resume(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    env: &ResumeExecutionEnvironment,
+    resolved: &mut oulipoly_state::ResolvedResume,
+    fallback_target: &mut Option<ResumeExecutionTarget>,
+    manual_migrate: Option<&str>,
+    migration_model: &ModelConfig,
+    effective_spawn_cwd: &Path,
+) -> Result<Option<i32>, String> {
+    let mut migration_stderr = std::io::stderr();
+    match agent_runtime_services
+        .migration_service
+        .migrate(MigrationServiceRequest {
+            state: &env.state,
+            sessions_cfg: &env.sessions_cfg,
+            resolved,
+            manual_target: manual_migrate,
+            active_exhausted: false,
+            migration_model,
+            effective_cwd: effective_spawn_cwd,
+            stderr: &mut migration_stderr,
+        }) {
+        Ok(MigrationServiceOutput::Migrated { segment: migrated })
+        | Ok(MigrationServiceOutput::AutoRotated {
+            segment: migrated, ..
+        }) => {
+            resolved.active_provider = migrated.target_provider.clone();
+            resolved.active_session_id = migrated.target_session_id.clone();
+            *fallback_target = Some(
+                resume_execution_target(resolved, &env.providers_cfg)
+                    .map_err(format_resume_error)?,
+            );
+            Ok(None)
+        }
+        Ok(MigrationServiceOutput::Stay) => Ok(None),
+        Ok(MigrationServiceOutput::RotationFailed { reason }) => {
+            eprintln!("{}", format_rotation_failed_reason(&reason));
+            Ok(Some(1))
+        }
+        Err(ServiceError::Dependency { message }) => {
+            eprintln!("migration failed: {message}");
+            Ok(Some(1))
+        }
+        Err(err) => Err(format!("migration service failed: {err}")),
+    }
+}
+
+fn start_interactive_repl_invocation<'a>(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    env: &'a ResumeExecutionEnvironment,
+    run: &InteractiveReplRun,
+    manual_migrate: Option<&str>,
+) -> Result<InteractiveReplAttempt<'a>, String> {
+    let invocation = composite_invocation_id(&run.provider.name);
     let invocation_start = InvocationStart {
         invocation_uuid: invocation.id.clone(),
-        model_name: invocation_model_name,
-        provider_name: provider.name.clone(),
-        provider_index,
-        parent_invocation_id,
+        model_name: interactive_repl_invocation_model_name(run),
+        provider_name: run.provider.name.clone(),
+        provider_index: run.provider_index,
+        parent_invocation_id: run.parent_invocation_id,
     };
     let invocation_row_id = agent_runtime_services
         .invocation_lifecycle_service
@@ -2562,34 +2783,114 @@ fn run_repl(
         })
         .map_err(|err| err.to_string())?
         .invocation_row_id;
-    let mut guard = FinalizerGuard::new(&env.state, invocation_row_id);
+    let guard = FinalizerGuard::new(&env.state, invocation_row_id);
     let invocation_env = serde_json::to_string(&invocation)
         .map_err(|e| format!("Failed to serialize invocation id: {e}"))?;
+    bind_interactive_repl_resume_start(env, run, invocation_row_id, manual_migrate)?;
+    render_interactive_repl_invocation_line_if_needed(run.stderr_is_terminal, &invocation);
+    let zero_turn_baseline = zero_turn_record_baseline(
+        &env.state,
+        &env.sessions_cfg,
+        &run.provider.name,
+        run.resume_session_id.as_deref(),
+    );
 
-    if let Some(active_session_id) = resume_session_id.as_deref() {
+    Ok(InteractiveReplAttempt {
+        invocation,
+        invocation_row_id,
+        guard,
+        invocation_env,
+        zero_turn_baseline,
+    })
+}
+
+fn interactive_repl_invocation_model_name(run: &InteractiveReplRun) -> String {
+    run.resolved_model_name.clone().unwrap_or_else(|| {
+        if run.input_resume.is_some() {
+            "<unknown>".to_string()
+        } else {
+            run.model.name.clone()
+        }
+    })
+}
+
+fn bind_interactive_repl_resume_start(
+    env: &ResumeExecutionEnvironment,
+    run: &InteractiveReplRun,
+    invocation_row_id: i64,
+    manual_migrate: Option<&str>,
+) -> Result<(), String> {
+    if let Some(active_session_id) = run.resume_session_id.as_deref() {
         env.state.bind_invocation_provider_session_start(
             invocation_row_id,
             &oulipoly_state::ProviderSessionBinding {
                 provider_session_id: active_session_id.to_string(),
                 capture_method: "resumed",
-                resume_input_id: resume.map(str::to_string),
+                resume_input_id: run.input_resume.clone(),
                 provider_session_resolved_account: None,
             },
         )?;
-        if let Some(session_id) = resume
+        if let Some(session_id) = run.input_resume.as_deref()
             && manual_migrate.is_some()
         {
             env.state
                 .record_legacy_resume_input_session_id(invocation_row_id, session_id)?;
         }
     }
+    Ok(())
+}
 
+fn render_interactive_repl_invocation_line_if_needed(
+    stderr_is_terminal: bool,
+    invocation: &CompositeInvocationId,
+) {
     if should_emit_invocation_line(stderr_is_terminal) {
         eprintln!("{}", invocation.stderr_line());
     }
+}
 
-    let resume_payload = resume_session_id.as_deref().map(|session_id| {
-        let strategy = provider
+fn prepare_interactive_repl_execution(
+    run: &InteractiveReplRun,
+    working_dir: Option<&Path>,
+) -> Result<InteractiveReplExecutionContext, String> {
+    let interactive_effective_cwd = run
+        .resume_spawn_cwd
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| effective_spawn_cwd(working_dir))?;
+    Ok(InteractiveReplExecutionContext {
+        interactive_effective_cwd,
+    })
+}
+
+fn execute_inherited_stdio_repl(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    env: &ResumeExecutionEnvironment,
+    run: &InteractiveReplRun,
+    attempt: &mut InteractiveReplAttempt<'_>,
+    working_dir: Option<&Path>,
+) -> Result<InteractiveReplExecution, String> {
+    let resume_payload = interactive_repl_resume_payload(run);
+    match executor::cli::execute_interactive_with_result(
+        &run.provider,
+        run.resume_spawn_cwd.as_deref().or(working_dir),
+        Some(&attempt.invocation_env),
+        resume_payload,
+    ) {
+        Ok(result) => Ok(InteractiveReplExecution::Completed(result)),
+        Err(_spawn_err) => {
+            finalize_interactive_repl_spawn_error(agent_runtime_services, env, run, attempt)?;
+            Ok(InteractiveReplExecution::Exit(1))
+        }
+    }
+}
+
+fn interactive_repl_resume_payload(
+    run: &InteractiveReplRun,
+) -> Option<executor::cli::ResumePayload<'_>> {
+    run.resume_session_id.as_deref().map(|session_id| {
+        let strategy = run
+            .provider
             .resume
             .as_ref()
             .expect("resumable provider must have a resume strategy");
@@ -2597,151 +2898,196 @@ fn run_repl(
             session_id,
             strategy,
         }
-    });
-    let zero_turn_baseline = zero_turn_record_baseline(
+    })
+}
+
+fn finalize_interactive_repl_spawn_error(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    env: &ResumeExecutionEnvironment,
+    run: &InteractiveReplRun,
+    attempt: &mut InteractiveReplAttempt<'_>,
+) -> Result<(), String> {
+    update_interactive_repl_no_resume_capture(env, run, attempt.invocation_row_id)?;
+    agent_runtime_services
+        .invocation_lifecycle_service
+        .finalize_invocation(InvocationLifecycleFinalizeRequest {
+            state: &env.state,
+            invocation_row_id: attempt.invocation_row_id,
+            success: false,
+            exit_code: 1,
+            error_category: Some("spawn_error"),
+            terminal_reason: Some("spawn_error"),
+        })
+        .map_err(|err| err.to_string())?;
+    attempt.guard.mark_finalized();
+    Ok(())
+}
+
+fn prepare_interactive_repl_completion(
+    env: &ResumeExecutionEnvironment,
+    run: &InteractiveReplRun,
+    attempt: &InteractiveReplAttempt<'_>,
+    result: &mut executor::cli::InteractiveExecutionResult,
+) {
+    apply_age153_terminal_signal_fixture_override_to_fields(
+        &mut result.terminal_signal,
+        &mut result.terminal_reason,
+    );
+    let zero_turn_classification = zero_turn_classify_after_completion(
         &env.state,
         &env.sessions_cfg,
-        &provider.name,
-        resume_session_id.as_deref(),
+        &attempt.zero_turn_baseline,
     );
+    apply_zero_turn_classification_to_signal_fields(
+        &mut result.terminal_signal,
+        &mut result.terminal_reason,
+        &run.provider.name,
+        &zero_turn_classification,
+    );
+}
 
-    let interactive_effective_cwd = resume_spawn_cwd
-        .clone()
-        .map(Ok)
-        .unwrap_or_else(|| effective_spawn_cwd(working_dir))?;
-    match executor::cli::execute_interactive_with_result(
-        &provider,
-        resume_spawn_cwd.as_deref().or(working_dir),
-        Some(&invocation_env),
-        resume_payload,
-    ) {
-        Ok(mut result) => {
-            apply_age153_terminal_signal_fixture_override_to_fields(
-                &mut result.terminal_signal,
-                &mut result.terminal_reason,
-            );
-            let zero_turn_classification = zero_turn_classify_after_completion(
-                &env.state,
-                &env.sessions_cfg,
-                &zero_turn_baseline,
-            );
-            apply_zero_turn_classification_to_signal_fields(
-                &mut result.terminal_signal,
-                &mut result.terminal_reason,
-                &provider.name,
-                &zero_turn_classification,
-            );
-            let exit_code = result.exit_code;
-            let invocation_uuid =
-                Uuid::parse_str(&invocation.id).expect("generated invocation id must be a UUID");
-            let resume_session_uuid = resume_session_id
-                .as_deref()
-                .and_then(|session_id| Uuid::parse_str(session_id).ok());
-            let mut terminal_signal_stderr = std::io::stderr();
-            let mut terminal_signal_ctx = TerminalSignalContext {
-                invocation_id: &invocation_uuid,
-                session_id: resume_session_uuid.as_ref(),
-                provider: &provider.name,
-                state_db: &env.state,
-                stderr: &mut terminal_signal_stderr,
-            };
-            let terminal_signal_disposition =
-                // AGE-153 source guard: marker emission routes through emit_terminal_signal_marker.
-                apply_terminal_signal_outcome(&result.terminal_signal, &mut terminal_signal_ctx);
-            if resume.is_none() {
-                env.state
-                    .update_session_capture(invocation_row_id, None, "none")?;
-            }
-            // AGE-153 source guard: TerminalSignalKind::CleanExit maps to TerminalSignalDisposition::InteractiveClean.
-            match terminal_signal_disposition {
-                TerminalSignalDisposition::InteractiveFail
-                | TerminalSignalDisposition::ProlongedSilenceFail
-                | TerminalSignalDisposition::QuotaExhaustedRetry
-                | TerminalSignalDisposition::MaybeQuotaVerify => {
-                    let terminal_reason = terminal_signal_reason(
-                        &result.terminal_signal,
-                        result.terminal_reason.as_deref(),
-                    )
+fn handle_interactive_repl_terminal_signal_disposition(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    env: &ResumeExecutionEnvironment,
+    run: &InteractiveReplRun,
+    attempt: &mut InteractiveReplAttempt<'_>,
+    result: &executor::cli::InteractiveExecutionResult,
+) -> Result<InteractiveReplControl, String> {
+    let invocation_uuid =
+        Uuid::parse_str(&attempt.invocation.id).expect("generated invocation id must be a UUID");
+    let resume_session_uuid = run
+        .resume_session_id
+        .as_deref()
+        .and_then(|session_id| Uuid::parse_str(session_id).ok());
+    let mut terminal_signal_stderr = std::io::stderr();
+    let mut terminal_signal_ctx = TerminalSignalContext {
+        invocation_id: &invocation_uuid,
+        session_id: resume_session_uuid.as_ref(),
+        provider: &run.provider.name,
+        state_db: &env.state,
+        stderr: &mut terminal_signal_stderr,
+    };
+    let terminal_signal_disposition =
+        // AGE-153 source guard: marker emission routes through emit_terminal_signal_marker.
+        apply_terminal_signal_outcome(&result.terminal_signal, &mut terminal_signal_ctx);
+    update_interactive_repl_no_resume_capture(env, run, attempt.invocation_row_id)?;
+    // AGE-153 source guard: TerminalSignalKind::CleanExit maps to TerminalSignalDisposition::InteractiveClean.
+    match terminal_signal_disposition {
+        TerminalSignalDisposition::InteractiveFail
+        | TerminalSignalDisposition::ProlongedSilenceFail
+        | TerminalSignalDisposition::QuotaExhaustedRetry
+        | TerminalSignalDisposition::MaybeQuotaVerify => {
+            let terminal_reason =
+                terminal_signal_reason(&result.terminal_signal, result.terminal_reason.as_deref())
                     .unwrap_or("unknown_exit");
-                    agent_runtime_services
-                        .invocation_lifecycle_service
-                        .finalize_invocation(InvocationLifecycleFinalizeRequest {
-                            state: &env.state,
-                            invocation_row_id,
-                            success: false,
-                            exit_code,
-                            error_category: terminal_signal_error_category(
-                                &result.terminal_signal,
-                                terminal_reason,
-                            ),
-                            terminal_reason: Some(terminal_reason),
-                        })
-                        .map_err(|err| err.to_string())?;
-                    guard.mark_finalized();
-                    return Ok(exit_code);
-                }
-                TerminalSignalDisposition::InteractiveClean
-                | TerminalSignalDisposition::NotApplicable => {}
-            }
             agent_runtime_services
                 .invocation_lifecycle_service
                 .finalize_invocation(InvocationLifecycleFinalizeRequest {
                     state: &env.state,
-                    invocation_row_id,
-                    success: exit_code == 0,
-                    exit_code,
-                    error_category: None,
-                    terminal_reason: result.terminal_reason.as_deref(),
-                })
-                .map_err(|err| err.to_string())?;
-            guard.mark_finalized();
-            if exit_code == 0 {
-                ingest_and_emit_session_id_resume_aware(
-                    agent_runtime_services,
-                    SessionIngestRequest {
-                        state: &env.state,
-                        sessions_cfg: &env.sessions_cfg,
-                        providers_cfg: Some(&env.providers_cfg),
-                        provider_name: &provider.name,
-                        invocation_row_id,
-                        invocation_uuid: &invocation.id,
-                        effective_cwd: Some(&interactive_effective_cwd),
-                        mode: match resume {
-                            Some(session_id) => ResumeIngestMode::Pinned {
-                                resume_target: if manual_migrate.is_some() {
-                                    session_id
-                                } else {
-                                    resume_session_id.as_deref().unwrap_or(session_id)
-                                },
-                            },
-                            None => ResumeIngestMode::Unpinned {
-                                capture_method: "turn_script",
-                            },
-                        },
-                    },
-                );
-            }
-            Ok(exit_code)
-        }
-        Err(_spawn_err) => {
-            if resume.is_none() {
-                env.state
-                    .update_session_capture(invocation_row_id, None, "none")?;
-            }
-            agent_runtime_services
-                .invocation_lifecycle_service
-                .finalize_invocation(InvocationLifecycleFinalizeRequest {
-                    state: &env.state,
-                    invocation_row_id,
+                    invocation_row_id: attempt.invocation_row_id,
                     success: false,
-                    exit_code: 1,
-                    error_category: Some("spawn_error"),
-                    terminal_reason: Some("spawn_error"),
+                    exit_code: result.exit_code,
+                    error_category: terminal_signal_error_category(
+                        &result.terminal_signal,
+                        terminal_reason,
+                    ),
+                    terminal_reason: Some(terminal_reason),
                 })
                 .map_err(|err| err.to_string())?;
-            guard.mark_finalized();
-            Ok(1)
+            attempt.guard.mark_finalized();
+            Ok(InteractiveReplControl::Return(result.exit_code))
         }
+        TerminalSignalDisposition::InteractiveClean | TerminalSignalDisposition::NotApplicable => {
+            Ok(InteractiveReplControl::Proceed)
+        }
+    }
+}
+
+fn update_interactive_repl_no_resume_capture(
+    env: &ResumeExecutionEnvironment,
+    run: &InteractiveReplRun,
+    invocation_row_id: i64,
+) -> Result<(), String> {
+    if run.input_resume.is_none() {
+        env.state
+            .update_session_capture(invocation_row_id, None, "none")?;
+    }
+    Ok(())
+}
+
+fn finalize_interactive_repl_completion(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    env: &ResumeExecutionEnvironment,
+    run: &InteractiveReplRun,
+    attempt: &mut InteractiveReplAttempt<'_>,
+    execution: &InteractiveReplExecutionContext,
+    result: &executor::cli::InteractiveExecutionResult,
+    manual_migrate: Option<&str>,
+) -> Result<i32, String> {
+    let exit_code = result.exit_code;
+    agent_runtime_services
+        .invocation_lifecycle_service
+        .finalize_invocation(InvocationLifecycleFinalizeRequest {
+            state: &env.state,
+            invocation_row_id: attempt.invocation_row_id,
+            success: exit_code == 0,
+            exit_code,
+            error_category: None,
+            terminal_reason: result.terminal_reason.as_deref(),
+        })
+        .map_err(|err| err.to_string())?;
+    attempt.guard.mark_finalized();
+    if exit_code == 0 {
+        ingest_interactive_repl_success(
+            agent_runtime_services,
+            env,
+            run,
+            attempt,
+            execution,
+            manual_migrate,
+        );
+    }
+    Ok(exit_code)
+}
+
+fn ingest_interactive_repl_success(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    env: &ResumeExecutionEnvironment,
+    run: &InteractiveReplRun,
+    attempt: &InteractiveReplAttempt<'_>,
+    execution: &InteractiveReplExecutionContext,
+    manual_migrate: Option<&str>,
+) {
+    ingest_and_emit_session_id_resume_aware(
+        agent_runtime_services,
+        SessionIngestRequest {
+            state: &env.state,
+            sessions_cfg: &env.sessions_cfg,
+            providers_cfg: Some(&env.providers_cfg),
+            provider_name: &run.provider.name,
+            invocation_row_id: attempt.invocation_row_id,
+            invocation_uuid: &attempt.invocation.id,
+            effective_cwd: Some(&execution.interactive_effective_cwd),
+            mode: interactive_repl_ingest_mode(run, manual_migrate),
+        },
+    );
+}
+
+fn interactive_repl_ingest_mode<'a>(
+    run: &'a InteractiveReplRun,
+    manual_migrate: Option<&str>,
+) -> ResumeIngestMode<'a> {
+    match run.input_resume.as_deref() {
+        Some(session_id) => ResumeIngestMode::Pinned {
+            resume_target: if manual_migrate.is_some() {
+                session_id
+            } else {
+                run.resume_session_id.as_deref().unwrap_or(session_id)
+            },
+        },
+        None => ResumeIngestMode::Unpinned {
+            capture_method: "turn_script",
+        },
     }
 }
 
@@ -2920,30 +3266,163 @@ fn run_resume(
     working_dir: Option<&Path>,
     models_dir_override: Option<&Path>,
 ) -> Result<i32, String> {
+    let (env, mut run) = match prepare_headless_resume_run(
+        agent_runtime_services,
+        model_name,
+        session_id,
+        prompt,
+        file,
+        working_dir,
+        models_dir_override,
+    )? {
+        HeadlessResumePreparation::Ready { env, run } => (env, run),
+        HeadlessResumePreparation::Exit(exit_code) => return Ok(exit_code),
+    };
+
+    loop {
+        if let Some(exit_code) = headless_resume_retry_budget_exit(&run) {
+            return Ok(exit_code);
+        }
+        run.attempts += 1;
+
+        let mut attempt = match start_headless_resume_attempt(
+            agent_runtime_services,
+            &env,
+            &mut run,
+            manual_migrate,
+        )? {
+            HeadlessResumeAttemptStart::Started(attempt) => attempt,
+            HeadlessResumeAttemptStart::Exit(exit_code) => return Ok(exit_code),
+        };
+        let mut result = match execute_headless_resume_attempt(
+            agent_runtime_services,
+            &env,
+            &run,
+            &mut attempt,
+        )? {
+            HeadlessResumeExecution::Completed(result) => result,
+            HeadlessResumeExecution::Exit(exit_code) => return Ok(exit_code),
+        };
+        let completion = prepare_headless_resume_completion(&env, &mut run, &attempt, &mut result);
+
+        record_headless_resume_acceptance(agent_runtime_services, &env, &attempt, &result)?;
+        emit_captured_child_marker_lines(&result.captured_child_invocations);
+
+        match handle_headless_resume_terminal_signal_disposition(
+            agent_runtime_services,
+            &env,
+            &mut run,
+            &mut attempt,
+            &result,
+            &completion,
+        )? {
+            HeadlessResumeAttemptControl::Continue => continue,
+            HeadlessResumeAttemptControl::Return(exit_code) => return Ok(exit_code),
+            HeadlessResumeAttemptControl::Proceed => {}
+        }
+
+        match finalize_headless_resume_completed_attempt(
+            agent_runtime_services,
+            &env,
+            &mut run,
+            &mut attempt,
+            &result,
+            working_dir,
+            manual_migrate,
+            session_id,
+        )? {
+            HeadlessResumeAttemptControl::Continue => continue,
+            HeadlessResumeAttemptControl::Return(exit_code) => return Ok(exit_code),
+            HeadlessResumeAttemptControl::Proceed => {
+                unreachable!("normal resume completion must decide loop control")
+            }
+        }
+    }
+}
+
+struct HeadlessResumeRun {
+    input_session_id: String,
+    answer: Option<String>,
+    resolved: oulipoly_state::ResolvedResume,
+    effective_spawn_cwd: PathBuf,
+    parent_invocation_id: Option<i64>,
+    max_attempts: usize,
+    attempts: usize,
+    last_exit_code: i32,
+    zero_turn_confirmation: ZeroTurnConfirmationState,
+}
+
+struct HeadlessResumeAttempt<'a> {
+    provider_index: usize,
+    provider: ProviderConfig,
+    prompt_mode: PromptMode,
+    provider_session_id: String,
+    invocation: CompositeInvocationId,
+    invocation_row_id: i64,
+    guard: FinalizerGuard<'a>,
+    zero_turn_baseline: ZeroTurnBaseline,
+}
+
+struct HeadlessResumeCompletion {
+    zero_turn_action: ZeroTurnAction,
+}
+
+enum HeadlessResumePreparation {
+    Ready {
+        env: ResumeExecutionEnvironment,
+        run: HeadlessResumeRun,
+    },
+    Exit(i32),
+}
+
+enum HeadlessResumeAttemptStart<'a> {
+    Started(HeadlessResumeAttempt<'a>),
+    Exit(i32),
+}
+
+enum HeadlessResumeExecution {
+    Completed(executor::ExecutionResult),
+    Exit(i32),
+}
+
+enum HeadlessResumeAttemptControl {
+    Proceed,
+    Continue,
+    Return(i32),
+}
+
+fn prepare_headless_resume_run(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    model_name: Option<&str>,
+    session_id: &str,
+    prompt: Option<&str>,
+    file: Option<&Path>,
+    working_dir: Option<&Path>,
+    models_dir_override: Option<&Path>,
+) -> Result<HeadlessResumePreparation, String> {
     if let Err(message) = validate_resume_uuid(session_id) {
         eprintln!("{message}");
-        return Ok(1);
+        return Ok(HeadlessResumePreparation::Exit(1));
     }
     // Source guard marker: agent_runtime_services.resume_service.resolve_resume(ResumeServiceRequest)
 
     let answer = resolve_resume_answer(prompt, file)?;
     let env = load_resume_execution_environment(models_dir_override)?;
-
-    let mut resolved = match resolve_resume_for_headless_execution(
+    let resolved = match resolve_resume_for_headless_execution(
         agent_runtime_services,
         &env,
         session_id,
         model_name,
     ) {
         Ok(resolved) => resolved,
-        Err(exit_code) => return Ok(exit_code),
+        Err(exit_code) => return Ok(HeadlessResumePreparation::Exit(exit_code)),
     };
     if let Err(exit_code) = prepare_initial_headless_resume_target(
         &resolved,
         &env.providers_cfg,
         std::io::stderr().is_terminal(),
     ) {
-        return Ok(exit_code);
+        return Ok(HeadlessResumePreparation::Exit(exit_code));
     }
     let effective_spawn_cwd = effective_resume_spawn_cwd(
         &env.state,
@@ -2961,416 +3440,515 @@ fn run_resume(
         .unwrap_or(1)
         .max(1)
         + 1;
-    let mut attempts = 0usize;
-    let mut last_exit_code = 1;
-    let mut zero_turn_confirmation = ZeroTurnConfirmationState::new();
 
-    loop {
-        if attempts >= max_attempts {
-            eprintln!("BLOCKED:all-providers-exhausted");
-            return Ok(if last_exit_code == 0 {
-                1
-            } else {
-                last_exit_code
-            });
-        }
-        attempts += 1;
-
-        let mut target = match renderable_resume_execution_target(&resolved, &env.providers_cfg) {
-            Ok(target) => target,
-            Err(exit_code) => return Ok(exit_code),
-        };
-        let mut migration_model = resume_migration_pool(&resolved, &env.providers_cfg);
-        if manual_migrate.is_none() || attempts > 1 {
-            filter_quota_exhausted_migration_candidates(
-                &env.state,
-                &mut migration_model,
-                &resolved.active_provider,
-            );
-        }
-        let mut migration_stderr = std::io::stderr();
-        match agent_runtime_services
-            .migration_service
-            .migrate(MigrationServiceRequest {
-                state: &env.state,
-                sessions_cfg: &env.sessions_cfg,
-                resolved: &resolved,
-                manual_target: first_attempt_manual_migrate(attempts, manual_migrate),
-                active_exhausted: false,
-                migration_model: &migration_model,
-                effective_cwd: &effective_spawn_cwd,
-                stderr: &mut migration_stderr,
-            }) {
-            Ok(MigrationServiceOutput::Migrated { segment: migrated })
-            | Ok(MigrationServiceOutput::AutoRotated {
-                segment: migrated, ..
-            }) => {
-                resolved.active_provider = migrated.target_provider.clone();
-                resolved.active_session_id = migrated.target_session_id.clone();
-                target = match renderable_resume_execution_target(&resolved, &env.providers_cfg) {
-                    Ok(target) => target,
-                    Err(exit_code) => return Ok(exit_code),
-                };
-            }
-            Ok(MigrationServiceOutput::Stay) => {}
-            Ok(MigrationServiceOutput::RotationFailed { reason }) => {
-                eprintln!("{}", format_rotation_failed_reason(&reason));
-                return Ok(1);
-            }
-            Err(ServiceError::Dependency { message }) => {
-                eprintln!("migration failed: {message}");
-                return Ok(1);
-            }
-            Err(err) => {
-                eprintln!("migration service failed: {err}");
-                return Ok(1);
-            }
-        }
-
-        let provider_index = target.provider_index;
-        let provider = target.provider;
-        let Some(strategy) = provider.resume.as_ref() else {
-            eprintln!(
-                "provider {} has no [providers.resume] block; cannot resume",
-                provider.name
-            );
-            return Ok(1);
-        };
-
-        let invocation_id = Uuid::new_v4().to_string();
-        let invocation = CompositeInvocationId {
-            source: provider.name.clone(),
-            id: invocation_id,
-        };
-        let invocation_model_name = resolved
-            .model_name
-            .clone()
-            .unwrap_or_else(|| "<unknown>".to_string());
-        let invocation_start = InvocationStart {
-            invocation_uuid: invocation.id.clone(),
-            model_name: invocation_model_name,
-            provider_name: provider.name.clone(),
-            provider_index,
+    Ok(HeadlessResumePreparation::Ready {
+        env,
+        run: HeadlessResumeRun {
+            input_session_id: session_id.to_string(),
+            answer,
+            resolved,
+            effective_spawn_cwd,
             parent_invocation_id,
-        };
-        let invocation_row_id = agent_runtime_services
-            .invocation_lifecycle_service
-            .start_invocation(InvocationLifecycleStartRequest {
-                state: &env.state,
-                start: &invocation_start,
-            })
-            .map_err(|err| err.to_string())?
-            .invocation_row_id;
-        let mut guard = FinalizerGuard::new(&env.state, invocation_row_id);
-        env.state.bind_invocation_provider_session_start(
-            invocation_row_id,
-            &oulipoly_state::ProviderSessionBinding {
-                provider_session_id: resolved.active_session_id.clone(),
-                capture_method: "resumed",
-                resume_input_id: Some(session_id.to_string()),
-                provider_session_resolved_account: provider_session_resolved_account(
-                    &provider,
-                    &resolved.active_session_id,
-                ),
-            },
-        )?;
-        if manual_migrate.is_some() {
-            env.state
-                .record_legacy_resume_input_session_id(invocation_row_id, session_id)?;
-        }
-        let provider_session_id = resolved.active_session_id.clone();
-        let zero_turn_baseline = zero_turn_record_baseline(
+            max_attempts,
+            attempts: 0,
+            last_exit_code: 1,
+            zero_turn_confirmation: ZeroTurnConfirmationState::new(),
+        },
+    })
+}
+
+fn headless_resume_retry_budget_exit(run: &HeadlessResumeRun) -> Option<i32> {
+    if run.attempts < run.max_attempts {
+        return None;
+    }
+
+    eprintln!("BLOCKED:all-providers-exhausted");
+    Some(if run.last_exit_code == 0 {
+        1
+    } else {
+        run.last_exit_code
+    })
+}
+
+fn start_headless_resume_attempt<'a>(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    env: &'a ResumeExecutionEnvironment,
+    run: &mut HeadlessResumeRun,
+    manual_migrate: Option<&str>,
+) -> Result<HeadlessResumeAttemptStart<'a>, String> {
+    let target = match prepare_headless_resume_attempt_target(
+        agent_runtime_services,
+        env,
+        &mut run.resolved,
+        run.attempts,
+        manual_migrate,
+        &run.effective_spawn_cwd,
+    ) {
+        Ok(target) => target,
+        Err(exit_code) => return Ok(HeadlessResumeAttemptStart::Exit(exit_code)),
+    };
+    if target.provider.resume.is_none() {
+        eprintln!(
+            "provider {} has no [providers.resume] block; cannot resume",
+            target.provider.name
+        );
+        return Ok(HeadlessResumeAttemptStart::Exit(1));
+    }
+
+    let provider_session_id = run.resolved.active_session_id.clone();
+    let invocation = CompositeInvocationId {
+        source: target.provider.name.clone(),
+        id: Uuid::new_v4().to_string(),
+    };
+    let invocation_model_name = run
+        .resolved
+        .model_name
+        .clone()
+        .unwrap_or_else(|| "<unknown>".to_string());
+    let invocation_start = InvocationStart {
+        invocation_uuid: invocation.id.clone(),
+        model_name: invocation_model_name,
+        provider_name: target.provider.name.clone(),
+        provider_index: target.provider_index,
+        parent_invocation_id: run.parent_invocation_id,
+    };
+    let invocation_row_id = agent_runtime_services
+        .invocation_lifecycle_service
+        .start_invocation(InvocationLifecycleStartRequest {
+            state: &env.state,
+            start: &invocation_start,
+        })
+        .map_err(|err| err.to_string())?
+        .invocation_row_id;
+    let guard = FinalizerGuard::new(&env.state, invocation_row_id);
+    bind_headless_resume_provider_session_start(
+        env,
+        run,
+        invocation_row_id,
+        &target.provider,
+        manual_migrate,
+    )?;
+    let zero_turn_baseline = zero_turn_record_baseline(
+        &env.state,
+        &env.sessions_cfg,
+        &target.provider.name,
+        Some(&provider_session_id),
+    );
+
+    Ok(HeadlessResumeAttemptStart::Started(HeadlessResumeAttempt {
+        provider_index: target.provider_index,
+        provider: target.provider,
+        prompt_mode: target.prompt_mode,
+        provider_session_id,
+        invocation,
+        invocation_row_id,
+        guard,
+        zero_turn_baseline,
+    }))
+}
+
+fn prepare_headless_resume_attempt_target(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    env: &ResumeExecutionEnvironment,
+    resolved: &mut oulipoly_state::ResolvedResume,
+    attempts: usize,
+    manual_migrate: Option<&str>,
+    effective_spawn_cwd: &Path,
+) -> Result<ResumeExecutionTarget, i32> {
+    let mut target = renderable_resume_execution_target(resolved, &env.providers_cfg)?;
+    let mut migration_model = resume_migration_pool(resolved, &env.providers_cfg);
+    if manual_migrate.is_none() || attempts > 1 {
+        filter_quota_exhausted_migration_candidates(
             &env.state,
-            &env.sessions_cfg,
-            &provider.name,
-            Some(&provider_session_id),
+            &mut migration_model,
+            &resolved.active_provider,
         );
+    }
 
-        let invocation_env = serde_json::to_string(&invocation)
-            .map_err(|e| format!("Failed to serialize invocation id: {e}"))?;
-        eprintln!("{}", invocation.stderr_line());
+    let mut migration_stderr = std::io::stderr();
+    match agent_runtime_services
+        .migration_service
+        .migrate(MigrationServiceRequest {
+            state: &env.state,
+            sessions_cfg: &env.sessions_cfg,
+            resolved,
+            manual_target: first_attempt_manual_migrate(attempts, manual_migrate),
+            active_exhausted: false,
+            migration_model: &migration_model,
+            effective_cwd: effective_spawn_cwd,
+            stderr: &mut migration_stderr,
+        }) {
+        Ok(MigrationServiceOutput::Migrated { segment: migrated })
+        | Ok(MigrationServiceOutput::AutoRotated {
+            segment: migrated, ..
+        }) => {
+            resolved.active_provider = migrated.target_provider.clone();
+            resolved.active_session_id = migrated.target_session_id.clone();
+            target = renderable_resume_execution_target(resolved, &env.providers_cfg)?;
+        }
+        Ok(MigrationServiceOutput::Stay) => {}
+        Ok(MigrationServiceOutput::RotationFailed { reason }) => {
+            eprintln!("{}", format_rotation_failed_reason(&reason));
+            return Err(1);
+        }
+        Err(ServiceError::Dependency { message }) => {
+            eprintln!("migration failed: {message}");
+            return Err(1);
+        }
+        Err(err) => {
+            eprintln!("migration service failed: {err}");
+            return Err(1);
+        }
+    }
 
-        let mut result = match executor::cli::execute_resume_optional_prompt(
-            &provider,
-            provider_index,
-            target.prompt_mode,
-            answer.as_deref(),
-            Some(&effective_spawn_cwd),
-            Some(&invocation_env),
-            executor::cli::ResumePayload {
-                session_id: &resolved.active_session_id,
-                strategy,
-            },
-        ) {
-            Ok(result) => result,
-            Err(_spawn_err) => {
-                agent_runtime_services
-                    .invocation_lifecycle_service
-                    .finalize_invocation(InvocationLifecycleFinalizeRequest {
-                        state: &env.state,
-                        invocation_row_id,
-                        success: false,
-                        exit_code: 1,
-                        error_category: Some("spawn_error"),
-                        terminal_reason: Some("spawn_error"),
-                    })
-                    .map_err(|err| err.to_string())?;
-                guard.mark_finalized();
-                return Ok(1);
-            }
-        };
-        apply_age153_terminal_signal_fixture_override(&mut result);
-        let zero_turn_classification =
-            zero_turn_classify_after_completion(&env.state, &env.sessions_cfg, &zero_turn_baseline);
-        apply_zero_turn_classification_to_result(
-            &mut result,
-            &provider.name,
-            &zero_turn_classification,
-        );
-        let zero_turn_action = next_action(
-            &mut zero_turn_confirmation,
-            zero_turn_classification_for_action(
-                zero_turn_classification,
-                &result,
-                &provider.name,
-                Some(&provider_session_id),
+    Ok(target)
+}
+
+fn bind_headless_resume_provider_session_start(
+    env: &ResumeExecutionEnvironment,
+    run: &HeadlessResumeRun,
+    invocation_row_id: i64,
+    provider: &ProviderConfig,
+    manual_migrate: Option<&str>,
+) -> Result<(), String> {
+    env.state.bind_invocation_provider_session_start(
+        invocation_row_id,
+        &oulipoly_state::ProviderSessionBinding {
+            provider_session_id: run.resolved.active_session_id.clone(),
+            capture_method: "resumed",
+            resume_input_id: Some(run.input_session_id.clone()),
+            provider_session_resolved_account: provider_session_resolved_account(
+                provider,
+                &run.resolved.active_session_id,
             ),
-        );
+        },
+    )?;
+    if manual_migrate.is_some() {
+        env.state
+            .record_legacy_resume_input_session_id(invocation_row_id, &run.input_session_id)?;
+    }
+    Ok(())
+}
 
-        if let Some(acceptance) = &result.resume_acceptance {
-            agent_runtime_services
-                .resume_service
-                .record_acceptance(ResumeAcceptanceRequest {
-                    state: &env.state,
-                    invocation_row_id,
-                    status: acceptance.status.db_value(),
-                    evidence: acceptance.evidence.as_deref(),
-                })
-                .map_err(|err| format!("resume acceptance service failed: {err}"))?;
-        }
+fn execute_headless_resume_attempt(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    env: &ResumeExecutionEnvironment,
+    run: &HeadlessResumeRun,
+    attempt: &mut HeadlessResumeAttempt<'_>,
+) -> Result<HeadlessResumeExecution, String> {
+    let strategy = attempt
+        .provider
+        .resume
+        .as_ref()
+        .expect("headless resume attempt requires a resume strategy");
+    let invocation = &attempt.invocation;
+    let invocation_env = serde_json::to_string(&invocation)
+        .map_err(|e| format!("Failed to serialize invocation id: {e}"))?;
+    eprintln!("{}", invocation.stderr_line());
 
-        emit_captured_child_marker_lines(&result.captured_child_invocations);
-
-        let invocation_uuid =
-            Uuid::parse_str(&invocation.id).expect("generated invocation id must be a UUID");
-        let session_uuid = provider_session_marker_uuid(Some(&provider_session_id));
-        let mut terminal_signal_stderr = std::io::stderr();
-        let mut terminal_signal_ctx = TerminalSignalContext {
-            invocation_id: &invocation_uuid,
-            session_id: session_uuid.as_ref(),
-            provider: &provider.name,
-            state_db: &env.state,
-            stderr: &mut terminal_signal_stderr,
-        };
-        let resume_terminal_signal = resume_terminal_signal_for_outcome(&result.terminal_signal);
-        let terminal_signal_disposition =
-            if matches!(zero_turn_action, ZeroTurnAction::ConfirmedExhaustion)
-                && resume_terminal_signal
-                    .as_ref()
-                    .is_some_and(|signal| signal.kind == TerminalSignalKind::MaybeQuotaExhausted)
-            {
-                let signal = resume_terminal_signal
-                    .as_ref()
-                    .expect("confirmed zero-turn action requires a maybe signal");
-                let _ = confirm_maybe_quota_exhausted(signal, &mut terminal_signal_ctx);
-                TerminalSignalDisposition::MaybeQuotaVerify
-            } else {
-                apply_terminal_signal_outcome(&resume_terminal_signal, &mut terminal_signal_ctx)
-            };
-        match terminal_signal_disposition {
-            TerminalSignalDisposition::MaybeQuotaVerify => match zero_turn_action {
-                ZeroTurnAction::ConfirmedExhaustion => {
-                    let terminal_reason = terminal_signal_reason(
-                        &result.terminal_signal,
-                        result.terminal_reason.as_deref(),
-                    )
-                    .unwrap_or("maybe_quota_exhausted");
-                    agent_runtime_services
-                        .invocation_lifecycle_service
-                        .finalize_invocation(InvocationLifecycleFinalizeRequest {
-                            state: &env.state,
-                            invocation_row_id,
-                            success: false,
-                            exit_code: result.exit_code,
-                            error_category: Some("quota_exhausted"),
-                            terminal_reason: Some(terminal_reason),
-                        })
-                        .map_err(|err| err.to_string())?;
-                    guard.mark_finalized();
-                    last_exit_code = result.exit_code;
-                    continue;
-                }
-                ZeroTurnAction::VerifySameProvider => {
-                    let terminal_reason = terminal_signal_reason(
-                        &result.terminal_signal,
-                        result.terminal_reason.as_deref(),
-                    )
-                    .unwrap_or("maybe_quota_exhausted");
-                    agent_runtime_services
-                        .invocation_lifecycle_service
-                        .finalize_invocation(InvocationLifecycleFinalizeRequest {
-                            state: &env.state,
-                            invocation_row_id,
-                            success: false,
-                            exit_code: result.exit_code,
-                            error_category: None,
-                            terminal_reason: Some(terminal_reason),
-                        })
-                        .map_err(|err| err.to_string())?;
-                    guard.mark_finalized();
-                    last_exit_code = result.exit_code;
-                    continue;
-                }
-                ZeroTurnAction::Continue | ZeroTurnAction::Unclassified => {
-                    let terminal_reason = terminal_signal_reason(
-                        &result.terminal_signal,
-                        result.terminal_reason.as_deref(),
-                    )
-                    .unwrap_or("maybe_quota_exhausted");
-                    agent_runtime_services
-                        .invocation_lifecycle_service
-                        .finalize_invocation(InvocationLifecycleFinalizeRequest {
-                            state: &env.state,
-                            invocation_row_id,
-                            success: false,
-                            exit_code: result.exit_code,
-                            error_category: None,
-                            terminal_reason: Some(terminal_reason),
-                        })
-                        .map_err(|err| err.to_string())?;
-                    guard.mark_finalized();
-                    eprintln!("{}", result.stderr);
-                    return Ok(result.exit_code);
-                }
-            },
-            TerminalSignalDisposition::QuotaExhaustedRetry => {
-                let terminal_reason = terminal_signal_reason(
-                    &result.terminal_signal,
-                    result.terminal_reason.as_deref(),
-                )
-                .expect("typed quota signal must have terminal reason");
-                agent_runtime_services
-                    .invocation_lifecycle_service
-                    .finalize_invocation(InvocationLifecycleFinalizeRequest {
-                        state: &env.state,
-                        invocation_row_id,
-                        success: false,
-                        exit_code: result.exit_code,
-                        error_category: Some("quota_exhausted"),
-                        terminal_reason: Some(terminal_reason),
-                    })
-                    .map_err(|err| err.to_string())?;
-                guard.mark_finalized();
-                last_exit_code = result.exit_code;
-                continue;
-            }
-            TerminalSignalDisposition::ProlongedSilenceFail
-            | TerminalSignalDisposition::InteractiveFail => {
-                let terminal_reason = terminal_signal_reason(
-                    &result.terminal_signal,
-                    result.terminal_reason.as_deref(),
-                )
-                .expect("typed failure signal must have terminal reason");
-                agent_runtime_services
-                    .invocation_lifecycle_service
-                    .finalize_invocation(InvocationLifecycleFinalizeRequest {
-                        state: &env.state,
-                        invocation_row_id,
-                        success: false,
-                        exit_code: result.exit_code,
-                        error_category: terminal_signal_error_category(
-                            &result.terminal_signal,
-                            terminal_reason,
-                        ),
-                        terminal_reason: Some(terminal_reason),
-                    })
-                    .map_err(|err| err.to_string())?;
-                guard.mark_finalized();
-                eprintln!("{}", result.stderr);
-                return Ok(result.exit_code);
-            }
-            TerminalSignalDisposition::InteractiveClean
-            | TerminalSignalDisposition::NotApplicable => {}
-        }
-
-        let success = execution_succeeded(result.exit_code);
-        let error_category =
-            resume_result_error_category(agent_runtime_services, &result, &env.models, working_dir);
-        let quota_exhausted = error_category_is_quota_exhausted(error_category.as_deref());
-        if let Err(err) = env
-            .state
-            .record_returned_artifacts(invocation_row_id, &result.returned_artifacts)
-        {
-            eprintln!("Error: Failed to record returned artifacts: {err}");
+    match executor::cli::execute_resume_optional_prompt(
+        &attempt.provider,
+        attempt.provider_index,
+        attempt.prompt_mode,
+        run.answer.as_deref(),
+        Some(&run.effective_spawn_cwd),
+        Some(&invocation_env),
+        executor::cli::ResumePayload {
+            session_id: &attempt.provider_session_id,
+            strategy,
+        },
+    ) {
+        Ok(result) => Ok(HeadlessResumeExecution::Completed(result)),
+        Err(_spawn_err) => {
             agent_runtime_services
                 .invocation_lifecycle_service
                 .finalize_invocation(InvocationLifecycleFinalizeRequest {
                     state: &env.state,
-                    invocation_row_id,
+                    invocation_row_id: attempt.invocation_row_id,
                     success: false,
                     exit_code: 1,
-                    error_category: Some("returned_artifacts"),
-                    terminal_reason: Some("returned_artifacts_persist_failed"),
+                    error_category: Some("spawn_error"),
+                    terminal_reason: Some("spawn_error"),
                 })
-                .map(|_| ())
-                .unwrap_or_else(|e| eprintln!("Warning: Failed to finalize invocation: {e}"));
-            guard.mark_finalized();
-            return Ok(1);
+                .map_err(|err| err.to_string())?;
+            attempt.guard.mark_finalized();
+            Ok(HeadlessResumeExecution::Exit(1))
         }
+    }
+}
+
+fn prepare_headless_resume_completion(
+    env: &ResumeExecutionEnvironment,
+    run: &mut HeadlessResumeRun,
+    attempt: &HeadlessResumeAttempt<'_>,
+    result: &mut executor::ExecutionResult,
+) -> HeadlessResumeCompletion {
+    apply_age153_terminal_signal_fixture_override(result);
+    let zero_turn_classification = zero_turn_classify_after_completion(
+        &env.state,
+        &env.sessions_cfg,
+        &attempt.zero_turn_baseline,
+    );
+    apply_zero_turn_classification_to_result(
+        result,
+        &attempt.provider.name,
+        &zero_turn_classification,
+    );
+    let zero_turn_action = next_action(
+        &mut run.zero_turn_confirmation,
+        zero_turn_classification_for_action(
+            zero_turn_classification,
+            result,
+            &attempt.provider.name,
+            Some(&attempt.provider_session_id),
+        ),
+    );
+
+    HeadlessResumeCompletion { zero_turn_action }
+}
+
+fn record_headless_resume_acceptance(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    env: &ResumeExecutionEnvironment,
+    attempt: &HeadlessResumeAttempt<'_>,
+    result: &executor::ExecutionResult,
+) -> Result<(), String> {
+    if let Some(acceptance) = &result.resume_acceptance {
+        agent_runtime_services
+            .resume_service
+            .record_acceptance(ResumeAcceptanceRequest {
+                state: &env.state,
+                invocation_row_id: attempt.invocation_row_id,
+                status: acceptance.status.db_value(),
+                evidence: acceptance.evidence.as_deref(),
+            })
+            .map_err(|err| format!("resume acceptance service failed: {err}"))?;
+    }
+    Ok(())
+}
+
+fn handle_headless_resume_terminal_signal_disposition(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    env: &ResumeExecutionEnvironment,
+    run: &mut HeadlessResumeRun,
+    attempt: &mut HeadlessResumeAttempt<'_>,
+    result: &executor::ExecutionResult,
+    completion: &HeadlessResumeCompletion,
+) -> Result<HeadlessResumeAttemptControl, String> {
+    let invocation_uuid =
+        Uuid::parse_str(&attempt.invocation.id).expect("generated invocation id must be a UUID");
+    let session_uuid = provider_session_marker_uuid(Some(&attempt.provider_session_id));
+    let mut terminal_signal_stderr = std::io::stderr();
+    let mut terminal_signal_ctx = TerminalSignalContext {
+        invocation_id: &invocation_uuid,
+        session_id: session_uuid.as_ref(),
+        provider: &attempt.provider.name,
+        state_db: &env.state,
+        stderr: &mut terminal_signal_stderr,
+    };
+    let resume_terminal_signal = resume_terminal_signal_for_outcome(&result.terminal_signal);
+    let terminal_signal_disposition = if matches!(
+        completion.zero_turn_action,
+        ZeroTurnAction::ConfirmedExhaustion
+    ) && resume_terminal_signal
+        .as_ref()
+        .is_some_and(|signal| signal.kind == TerminalSignalKind::MaybeQuotaExhausted)
+    {
+        let signal = resume_terminal_signal
+            .as_ref()
+            .expect("confirmed zero-turn action requires a maybe signal");
+        let _ = confirm_maybe_quota_exhausted(signal, &mut terminal_signal_ctx);
+        TerminalSignalDisposition::MaybeQuotaVerify
+    } else {
+        apply_terminal_signal_outcome(&resume_terminal_signal, &mut terminal_signal_ctx)
+    };
+
+    match terminal_signal_disposition {
+        TerminalSignalDisposition::MaybeQuotaVerify => handle_headless_resume_maybe_quota_verify(
+            agent_runtime_services,
+            env,
+            run,
+            attempt,
+            result,
+            completion.zero_turn_action,
+        ),
+        TerminalSignalDisposition::QuotaExhaustedRetry => {
+            let terminal_reason =
+                terminal_signal_reason(&result.terminal_signal, result.terminal_reason.as_deref())
+                    .expect("typed quota signal must have terminal reason");
+            agent_runtime_services
+                .invocation_lifecycle_service
+                .finalize_invocation(InvocationLifecycleFinalizeRequest {
+                    state: &env.state,
+                    invocation_row_id: attempt.invocation_row_id,
+                    success: false,
+                    exit_code: result.exit_code,
+                    error_category: Some("quota_exhausted"),
+                    terminal_reason: Some(terminal_reason),
+                })
+                .map_err(|err| err.to_string())?;
+            attempt.guard.mark_finalized();
+            run.last_exit_code = result.exit_code;
+            Ok(HeadlessResumeAttemptControl::Continue)
+        }
+        TerminalSignalDisposition::ProlongedSilenceFail
+        | TerminalSignalDisposition::InteractiveFail => {
+            let terminal_reason =
+                terminal_signal_reason(&result.terminal_signal, result.terminal_reason.as_deref())
+                    .expect("typed failure signal must have terminal reason");
+            agent_runtime_services
+                .invocation_lifecycle_service
+                .finalize_invocation(InvocationLifecycleFinalizeRequest {
+                    state: &env.state,
+                    invocation_row_id: attempt.invocation_row_id,
+                    success: false,
+                    exit_code: result.exit_code,
+                    error_category: terminal_signal_error_category(
+                        &result.terminal_signal,
+                        terminal_reason,
+                    ),
+                    terminal_reason: Some(terminal_reason),
+                })
+                .map_err(|err| err.to_string())?;
+            attempt.guard.mark_finalized();
+            eprintln!("{}", result.stderr);
+            Ok(HeadlessResumeAttemptControl::Return(result.exit_code))
+        }
+        TerminalSignalDisposition::InteractiveClean | TerminalSignalDisposition::NotApplicable => {
+            Ok(HeadlessResumeAttemptControl::Proceed)
+        }
+    }
+}
+
+fn handle_headless_resume_maybe_quota_verify(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    env: &ResumeExecutionEnvironment,
+    run: &mut HeadlessResumeRun,
+    attempt: &mut HeadlessResumeAttempt<'_>,
+    result: &executor::ExecutionResult,
+    zero_turn_action: ZeroTurnAction,
+) -> Result<HeadlessResumeAttemptControl, String> {
+    let terminal_reason =
+        terminal_signal_reason(&result.terminal_signal, result.terminal_reason.as_deref())
+            .unwrap_or("maybe_quota_exhausted");
+    let (error_category, control) = match zero_turn_action {
+        ZeroTurnAction::ConfirmedExhaustion => (
+            Some("quota_exhausted"),
+            HeadlessResumeAttemptControl::Continue,
+        ),
+        ZeroTurnAction::VerifySameProvider => (None, HeadlessResumeAttemptControl::Continue),
+        ZeroTurnAction::Continue | ZeroTurnAction::Unclassified => {
+            (None, HeadlessResumeAttemptControl::Return(result.exit_code))
+        }
+    };
+
+    agent_runtime_services
+        .invocation_lifecycle_service
+        .finalize_invocation(InvocationLifecycleFinalizeRequest {
+            state: &env.state,
+            invocation_row_id: attempt.invocation_row_id,
+            success: false,
+            exit_code: result.exit_code,
+            error_category,
+            terminal_reason: Some(terminal_reason),
+        })
+        .map_err(|err| err.to_string())?;
+    attempt.guard.mark_finalized();
+    run.last_exit_code = result.exit_code;
+
+    if matches!(control, HeadlessResumeAttemptControl::Return(_)) {
+        eprintln!("{}", result.stderr);
+    }
+    Ok(control)
+}
+
+fn finalize_headless_resume_completed_attempt(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    env: &ResumeExecutionEnvironment,
+    run: &mut HeadlessResumeRun,
+    attempt: &mut HeadlessResumeAttempt<'_>,
+    result: &executor::ExecutionResult,
+    working_dir: Option<&Path>,
+    manual_migrate: Option<&str>,
+    session_id: &str,
+) -> Result<HeadlessResumeAttemptControl, String> {
+    let success = execution_succeeded(result.exit_code);
+    let error_category =
+        resume_result_error_category(agent_runtime_services, result, &env.models, working_dir);
+    let quota_exhausted = error_category_is_quota_exhausted(error_category.as_deref());
+    if let Err(err) = env
+        .state
+        .record_returned_artifacts(attempt.invocation_row_id, &result.returned_artifacts)
+    {
+        eprintln!("Error: Failed to record returned artifacts: {err}");
         agent_runtime_services
             .invocation_lifecycle_service
             .finalize_invocation(InvocationLifecycleFinalizeRequest {
                 state: &env.state,
-                invocation_row_id,
-                success,
-                exit_code: result.exit_code,
-                error_category: error_category.as_deref(),
-                terminal_reason: result.terminal_reason.as_deref(),
+                invocation_row_id: attempt.invocation_row_id,
+                success: false,
+                exit_code: 1,
+                error_category: Some("returned_artifacts"),
+                terminal_reason: Some("returned_artifacts_persist_failed"),
             })
-            .map_err(|err| err.to_string())?;
-        guard.mark_finalized();
-        last_exit_code = result.exit_code;
+            .map(|_| ())
+            .unwrap_or_else(|e| eprintln!("Warning: Failed to finalize invocation: {e}"));
+        attempt.guard.mark_finalized();
+        return Ok(HeadlessResumeAttemptControl::Return(1));
+    }
+    agent_runtime_services
+        .invocation_lifecycle_service
+        .finalize_invocation(InvocationLifecycleFinalizeRequest {
+            state: &env.state,
+            invocation_row_id: attempt.invocation_row_id,
+            success,
+            exit_code: result.exit_code,
+            error_category: error_category.as_deref(),
+            terminal_reason: result.terminal_reason.as_deref(),
+        })
+        .map_err(|err| err.to_string())?;
+    attempt.guard.mark_finalized();
+    run.last_exit_code = result.exit_code;
 
-        if success {
-            ingest_and_emit_session_id_resume_aware(
-                agent_runtime_services,
-                SessionIngestRequest {
-                    state: &env.state,
-                    sessions_cfg: &env.sessions_cfg,
-                    providers_cfg: Some(&env.providers_cfg),
-                    provider_name: &provider.name,
-                    invocation_row_id,
-                    invocation_uuid: &invocation.id,
-                    effective_cwd: Some(&effective_spawn_cwd),
-                    mode: ResumeIngestMode::Pinned {
-                        resume_target: if manual_migrate.is_some() {
-                            session_id
-                        } else {
-                            &resolved.active_session_id
-                        },
+    if success {
+        ingest_and_emit_session_id_resume_aware(
+            agent_runtime_services,
+            SessionIngestRequest {
+                state: &env.state,
+                sessions_cfg: &env.sessions_cfg,
+                providers_cfg: Some(&env.providers_cfg),
+                provider_name: &attempt.provider.name,
+                invocation_row_id: attempt.invocation_row_id,
+                invocation_uuid: &attempt.invocation.id,
+                effective_cwd: Some(&run.effective_spawn_cwd),
+                mode: ResumeIngestMode::Pinned {
+                    resume_target: if manual_migrate.is_some() {
+                        session_id
+                    } else {
+                        &run.resolved.active_session_id
                     },
                 },
-            );
-            let _ = std::io::stdout().write_all(&result.stdout);
-            return Ok(result.exit_code);
-        }
-
-        if quota_exhausted {
-            if attempts < max_attempts {
-                eprintln!(
-                    "[routing] provider {} returned quota_exhausted; retrying another provider",
-                    provider.name
-                );
-            }
-            continue;
-        }
-
-        eprintln!("{}", result.stderr);
-        if let Some(ref cat) = error_category {
-            eprintln!("[diagnostics: {cat}]");
-        }
-        return Ok(result.exit_code);
+            },
+        );
+        let _ = std::io::stdout().write_all(&result.stdout);
+        return Ok(HeadlessResumeAttemptControl::Return(result.exit_code));
     }
+
+    if quota_exhausted {
+        if run.attempts < run.max_attempts {
+            eprintln!(
+                "[routing] provider {} returned quota_exhausted; retrying another provider",
+                attempt.provider.name
+            );
+        }
+        return Ok(HeadlessResumeAttemptControl::Continue);
+    }
+
+    eprintln!("{}", result.stderr);
+    if let Some(ref cat) = error_category {
+        eprintln!("[diagnostics: {cat}]");
+    }
+    Ok(HeadlessResumeAttemptControl::Return(result.exit_code))
 }
 
 fn validate_resume_uuid(session_id: &str) -> Result<(), String> {
@@ -4059,541 +4637,686 @@ fn run_with_balancing(
     // (matches contract `tmp/01-pr-a-contract.md` lifecycle ordering).
     let parent_invocation_id = resolve_parent_invocation_id(&env.state);
     // Source guard marker: resolve_parent_invocation_id(&state)
-    let max_attempts = model.providers.len().max(1) + 1;
-    let mut attempts = 0usize;
-    let mut zero_turn_confirmation = ZeroTurnConfirmationState::new();
-    let mut pending_same_provider_verification: Option<(usize, Option<String>)> = None;
+    let mut run_state = BalancedRunState::new(model);
 
     loop {
-        if attempts >= max_attempts {
-            eprintln!("BLOCKED:all-providers-exhausted");
-            let reason =
-                match agent_runtime_services
-                    .routing_service
-                    .select_route(RoutingServiceRequest {
-                        model,
-                        state: &env.state,
-                        ctx: Some(&ctx),
-                    }) {
-                    Err(err) => err.to_string(),
-                    Ok(_) => format_quota_retry_budget_exhausted(&model.name, max_attempts),
-                };
-            emit_pool_exhausted_pre_invocation_failure(model, &reason);
+        if let Some(reason) =
+            balanced_retry_budget_exhausted(agent_runtime_services, &env, &ctx, model, &run_state)
+        {
             return Err(reason);
         }
-        attempts += 1;
+        run_state.attempts += 1;
 
-        let pending_verification = pending_same_provider_verification.take();
-        let provider_index = match pending_verification.as_ref() {
-            Some((provider_index, _)) => *provider_index,
-            None => {
-                match select_balanced_provider_index(
-                    agent_runtime_services,
-                    model,
-                    &env.state,
-                    &ctx,
-                ) {
-                    Ok(provider_index) => provider_index,
-                    Err(err) => {
-                        let pool_exhausted = attempts > model.providers.len().max(1);
-                        emit_provider_selection_pre_invocation_failure(model, &err, pool_exhausted);
-                        return Err(err);
-                    }
-                }
-            }
-        };
-        let (provider, prompt_mode) =
-            match effective_model_for_execution(model, provider_index, &env.providers_cfg) {
-                Ok(effective) => effective,
-                Err(err) => {
-                    emit_provider_resolution_pre_invocation_failure(model, provider_index, &err);
-                    return Err(err);
-                }
-            };
-        let provider_name = &provider.name;
-        let invocation = composite_invocation_id(provider_name);
-        let invocation_start = balanced_invocation_start(
-            &invocation,
+        let mut attempt = start_balanced_attempt(
+            agent_runtime_services,
+            &env,
+            &ctx,
             model,
-            provider_name,
-            provider_index,
             parent_invocation_id,
-        );
-        let invocation_row_id = agent_runtime_services
-            .invocation_lifecycle_service
-            .start_invocation(InvocationLifecycleStartRequest {
-                state: &env.state,
-                start: &invocation_start,
-            })
-            .map_err(|err| err.to_string())?
-            .invocation_row_id;
-        let mut guard = FinalizerGuard::new(&env.state, invocation_row_id);
-        let start_known_provider_session_id = match pending_verification {
-            Some((_, session_id)) => session_id,
-            None => executor::cli::start_known_provider_session_id(&provider)?,
-        };
-        bind_start_known_provider_session_if_present(
-            &env.state,
-            invocation_row_id,
-            start_known_provider_session_id.as_deref(),
-        );
-        let mut zero_turn_baseline = zero_turn_record_baseline(
-            &env.state,
-            &env.sessions_cfg,
-            provider_name,
-            start_known_provider_session_id.as_deref(),
-        );
-        let invocation_env = serde_json::to_string(&invocation)
-            .map_err(|e| format!("Failed to serialize invocation id: {e}"))?;
-        eprintln!("{}", invocation.stderr_line());
-
-        let executor_request = balanced_executor_request(BalancedExecutorRequestInput {
+            &mut run_state,
+        )?;
+        let mut result = execute_balanced_attempt(
+            agent_runtime_services,
             model,
-            provider: &provider,
-            provider_index,
-            prompt_mode,
             prompt,
             working_dir,
             extra_inputs,
-            invocation_env: &invocation_env,
-            start_known_provider_session_id: start_known_provider_session_id.clone(),
-        });
-
-        let mut result = match agent_runtime_services
-            .executor_service
-            .execute(executor_request)
-        {
-            Ok(output) => output.result,
-            Err(err) => {
-                let signal = spawn_error_terminal_signal(provider_name, err.to_string());
-                let invocation_uuid = Uuid::parse_str(&invocation.id)
-                    .expect("generated invocation id must be a UUID");
-                let mut terminal_signal_stderr = std::io::stderr();
-                let mut terminal_signal_ctx = TerminalSignalContext {
-                    invocation_id: &invocation_uuid,
-                    session_id: None,
-                    provider: provider_name,
-                    state_db: &env.state,
-                    stderr: &mut terminal_signal_stderr,
-                };
-                let _ =
-                    apply_terminal_signal_outcome(&Some(signal.clone()), &mut terminal_signal_ctx);
-                let terminal_reason =
-                    typed_terminal_reason_fallback(&signal).unwrap_or("spawn_error");
-                agent_runtime_services
-                    .invocation_lifecycle_service
-                    .finalize_invocation(InvocationLifecycleFinalizeRequest {
-                        state: &env.state,
-                        invocation_row_id,
-                        success: false,
-                        exit_code: -1,
-                        error_category: Some(terminal_reason),
-                        terminal_reason: Some(terminal_reason),
-                    })
-                    .map(|_| ())
-                    .unwrap_or_else(|finalize_err| {
-                        eprintln!("Warning: Failed to finalize invocation: {finalize_err}")
-                    });
-                emit_failure_result_envelope(FailureResultEnvelopeInput {
-                    state: &env.state,
-                    invocation_id: &invocation.id,
-                    provider_name,
-                    provider_session_id: start_known_provider_session_id.as_deref(),
-                    exit_code: -1,
-                    error_category: Some(terminal_reason),
-                    terminal_reason: Some(terminal_reason),
-                });
-                guard.mark_finalized();
-                return Err(err.to_string());
-            }
-        };
-        apply_age153_terminal_signal_fixture_override(&mut result);
-        let zero_turn_provider_session_id = start_known_provider_session_id
-            .clone()
-            .or_else(|| result.session_capture.session_id.clone());
-        if zero_turn_baseline.provider_session_id.is_none()
-            && let Some(session_id) = zero_turn_provider_session_id.as_deref()
-        {
-            zero_turn_baseline =
-                zero_turn_late_bind_baseline(&env.sessions_cfg, provider_name, session_id);
-        }
-        let zero_turn_classification =
-            zero_turn_classify_after_completion(&env.state, &env.sessions_cfg, &zero_turn_baseline);
-        apply_zero_turn_classification_to_result(
-            &mut result,
-            provider_name,
-            &zero_turn_classification,
-        );
-        let zero_turn_action = next_action(
-            &mut zero_turn_confirmation,
-            zero_turn_classification_for_action(
-                zero_turn_classification,
-                &result,
-                provider_name,
-                zero_turn_provider_session_id.as_deref(),
-            ),
-        );
+            &env,
+            &mut attempt,
+        )?;
+        let completion =
+            prepare_balanced_completion(&env, &mut run_state, &mut attempt, &mut result);
 
         emit_captured_child_marker_lines(&result.captured_child_invocations);
 
-        let invocation_uuid =
-            Uuid::parse_str(&invocation.id).expect("generated invocation id must be a UUID");
-        let mut terminal_signal_stderr = std::io::stderr();
-        let terminal_session_uuid =
-            provider_session_marker_uuid(zero_turn_provider_session_id.as_deref());
-        let mut terminal_signal_ctx = TerminalSignalContext {
-            invocation_id: &invocation_uuid,
-            session_id: terminal_session_uuid.as_ref(),
-            provider: provider_name,
-            state_db: &env.state,
-            stderr: &mut terminal_signal_stderr,
-        };
-        let should_defer_generic_exit = should_defer_generic_exit(all_models, &result);
-        let balanced_terminal_signal =
-            balanced_terminal_signal_for_outcome(&result, should_defer_generic_exit);
-        let terminal_signal_disposition =
-            if is_confirmed_zero_turn_exhaustion(zero_turn_action, &balanced_terminal_signal) {
-                let signal = balanced_terminal_signal
-                    .as_ref()
-                    .expect("confirmed zero-turn action requires a maybe signal");
-                let _ = confirm_maybe_quota_exhausted(signal, &mut terminal_signal_ctx);
-                TerminalSignalDisposition::MaybeQuotaVerify
-            } else {
-                apply_terminal_signal_outcome(&balanced_terminal_signal, &mut terminal_signal_ctx)
-            };
-        match terminal_signal_disposition {
-            TerminalSignalDisposition::MaybeQuotaVerify => {
-                let terminal_reason = terminal_signal_reason(
-                    &result.terminal_signal,
-                    result.terminal_reason.as_deref(),
-                )
-                .unwrap_or("maybe_quota_exhausted");
-                supervise_captured_child_invocations(
-                    &env.state,
-                    invocation_row_id,
-                    &result.captured_child_invocations,
-                    Some(terminal_reason),
-                );
-                if let executor::SessionCaptureMethod::Failed(reason) =
-                    &result.session_capture.method
-                {
-                    eprintln!("[session-capture] {reason}");
-                }
-                env.state
-                    .update_session_capture(
-                        invocation_row_id,
-                        result.session_capture.session_id.as_deref(),
-                        result.session_capture.method.db_value(),
-                    )
-                    .unwrap_or_else(|e| {
-                        eprintln!("Warning: Failed to update session capture: {e}")
-                    });
-                let confirmed = matches!(zero_turn_action, ZeroTurnAction::ConfirmedExhaustion);
-                agent_runtime_services
-                    .invocation_lifecycle_service
-                    .finalize_invocation(InvocationLifecycleFinalizeRequest {
-                        state: &env.state,
-                        invocation_row_id,
-                        success: false,
-                        exit_code: result.exit_code,
-                        error_category: confirmed.then_some("quota_exhausted"),
-                        terminal_reason: Some(terminal_reason),
-                    })
-                    .map(|_| ())
-                    .unwrap_or_else(|e| eprintln!("Warning: Failed to finalize invocation: {e}"));
-                guard.mark_finalized();
-                env.state
-                    .increment_calls_since_refresh(provider_name)
-                    .unwrap_or_else(|e| eprintln!("Warning: Failed to bump quota tick: {e}"));
-                match zero_turn_action {
-                    ZeroTurnAction::VerifySameProvider => {
-                        pending_same_provider_verification =
-                            Some((provider_index, zero_turn_provider_session_id.clone()));
-                        continue;
-                    }
-                    ZeroTurnAction::ConfirmedExhaustion => {
-                        if confirmed && attempts < max_attempts {
-                            eprintln!(
-                                "[routing] provider {provider_name} returned quota_exhausted; retrying another provider"
-                            );
-                        }
-                        continue;
-                    }
-                    ZeroTurnAction::Continue | ZeroTurnAction::Unclassified => {
-                        emit_failure_result_envelope(FailureResultEnvelopeInput {
-                            state: &env.state,
-                            invocation_id: &invocation.id,
-                            provider_name,
-                            provider_session_id: zero_turn_provider_session_id.as_deref(),
-                            exit_code: result.exit_code,
-                            error_category: None,
-                            terminal_reason: Some(terminal_reason),
-                        });
-                        eprintln!("{}", result.stderr);
-                        return Ok(result.exit_code);
-                    }
-                }
-            }
-            TerminalSignalDisposition::QuotaExhaustedRetry => {
-                let terminal_reason = terminal_signal_reason(
-                    &result.terminal_signal,
-                    result.terminal_reason.as_deref(),
-                )
-                .expect("typed quota signal must have terminal reason");
-                supervise_captured_child_invocations(
-                    &env.state,
-                    invocation_row_id,
-                    &result.captured_child_invocations,
-                    Some(terminal_reason),
-                );
-                if let executor::SessionCaptureMethod::Failed(reason) =
-                    &result.session_capture.method
-                {
-                    eprintln!("[session-capture] {reason}");
-                }
-                env.state
-                    .update_session_capture(
-                        invocation_row_id,
-                        result.session_capture.session_id.as_deref(),
-                        result.session_capture.method.db_value(),
-                    )
-                    .unwrap_or_else(|e| {
-                        eprintln!("Warning: Failed to update session capture: {e}")
-                    });
-                agent_runtime_services
-                    .invocation_lifecycle_service
-                    .finalize_invocation(InvocationLifecycleFinalizeRequest {
-                        state: &env.state,
-                        invocation_row_id,
-                        success: false,
-                        exit_code: result.exit_code,
-                        error_category: Some("quota_exhausted"),
-                        terminal_reason: Some(terminal_reason),
-                    })
-                    .map(|_| ())
-                    .unwrap_or_else(|e| eprintln!("Warning: Failed to finalize invocation: {e}"));
-                guard.mark_finalized();
-                env.state
-                    .increment_calls_since_refresh(provider_name)
-                    .unwrap_or_else(|e| eprintln!("Warning: Failed to bump quota tick: {e}"));
-                if attempts < max_attempts {
-                    eprintln!(
-                        "[routing] provider {provider_name} returned quota_exhausted; retrying another provider"
-                    );
-                }
-                continue;
-            }
-            TerminalSignalDisposition::ProlongedSilenceFail
-            | TerminalSignalDisposition::InteractiveFail => {
-                let terminal_reason = terminal_signal_reason(
-                    &result.terminal_signal,
-                    result.terminal_reason.as_deref(),
-                )
-                .expect("typed failure signal must have terminal reason");
-                supervise_captured_child_invocations(
-                    &env.state,
-                    invocation_row_id,
-                    &result.captured_child_invocations,
-                    Some(terminal_reason),
-                );
-                if let executor::SessionCaptureMethod::Failed(reason) =
-                    &result.session_capture.method
-                {
-                    eprintln!("[session-capture] {reason}");
-                }
-                env.state
-                    .update_session_capture(
-                        invocation_row_id,
-                        result.session_capture.session_id.as_deref(),
-                        result.session_capture.method.db_value(),
-                    )
-                    .unwrap_or_else(|e| {
-                        eprintln!("Warning: Failed to update session capture: {e}")
-                    });
-                agent_runtime_services
-                    .invocation_lifecycle_service
-                    .finalize_invocation(InvocationLifecycleFinalizeRequest {
-                        state: &env.state,
-                        invocation_row_id,
-                        success: false,
-                        exit_code: result.exit_code,
-                        error_category: terminal_signal_error_category(
-                            &result.terminal_signal,
-                            terminal_reason,
-                        ),
-                        terminal_reason: Some(terminal_reason),
-                    })
-                    .map(|_| ())
-                    .unwrap_or_else(|e| eprintln!("Warning: Failed to finalize invocation: {e}"));
-                guard.mark_finalized();
-                emit_failure_result_envelope(FailureResultEnvelopeInput {
-                    state: &env.state,
-                    invocation_id: &invocation.id,
-                    provider_name,
-                    provider_session_id: zero_turn_provider_session_id.as_deref(),
-                    exit_code: result.exit_code,
-                    error_category: Some(terminal_reason),
-                    terminal_reason: Some(terminal_reason),
-                });
-                eprintln!("{}", result.stderr);
-                return Ok(result.exit_code);
-            }
-            TerminalSignalDisposition::InteractiveClean
-            | TerminalSignalDisposition::NotApplicable => {
-                supervise_captured_child_invocations(
-                    &env.state,
-                    invocation_row_id,
-                    &result.captured_child_invocations,
-                    result.terminal_reason.as_deref(),
-                );
-            }
-        }
-
-        if let executor::SessionCaptureMethod::Failed(reason) = &result.session_capture.method {
-            eprintln!("[session-capture] {reason}");
-        }
-
-        env.state
-            .update_session_capture(
-                invocation_row_id,
-                result.session_capture.session_id.as_deref(),
-                result.session_capture.method.db_value(),
-            )
-            .unwrap_or_else(|e| eprintln!("Warning: Failed to update session capture: {e}"));
-
-        let success = execution_succeeded(result.exit_code);
-
-        let error_category = balanced_result_error_category(
+        match handle_balanced_terminal_signal_disposition(
             agent_runtime_services,
+            all_models,
+            &env,
+            &mut run_state,
+            &mut attempt,
             &result,
+            &completion,
+        ) {
+            BalancedAttemptControl::Continue => continue,
+            BalancedAttemptControl::Return(exit_code) => return Ok(exit_code),
+            BalancedAttemptControl::Proceed => {}
+        }
+
+        match finalize_balanced_completed_attempt(
+            agent_runtime_services,
             all_models,
             working_dir,
-        );
-        let quota_exhausted = error_category_is_quota_exhausted(error_category.as_deref());
+            &env,
+            &run_state,
+            &mut attempt,
+            &result,
+            &completion,
+        )? {
+            BalancedAttemptControl::Continue => continue,
+            BalancedAttemptControl::Return(exit_code) => return Ok(exit_code),
+            BalancedAttemptControl::Proceed => {
+                unreachable!("normal completion must decide loop control")
+            }
+        }
+    }
+}
 
-        if let Err(err) = env
-            .state
-            .record_returned_artifacts(invocation_row_id, &result.returned_artifacts)
-        {
-            eprintln!("Error: Failed to record returned artifacts: {err}");
+struct BalancedRunState {
+    max_attempts: usize,
+    attempts: usize,
+    zero_turn_confirmation: ZeroTurnConfirmationState,
+    pending_same_provider_verification: Option<(usize, Option<String>)>,
+}
+
+impl BalancedRunState {
+    fn new(model: &ModelConfig) -> Self {
+        Self {
+            max_attempts: model.providers.len().max(1) + 1,
+            attempts: 0,
+            zero_turn_confirmation: ZeroTurnConfirmationState::new(),
+            pending_same_provider_verification: None,
+        }
+    }
+}
+
+struct BalancedAttempt<'a> {
+    provider: ProviderConfig,
+    prompt_mode: PromptMode,
+    provider_name: String,
+    provider_index: usize,
+    invocation: CompositeInvocationId,
+    invocation_row_id: i64,
+    guard: FinalizerGuard<'a>,
+    start_known_provider_session_id: Option<String>,
+    zero_turn_baseline: ZeroTurnBaseline,
+}
+
+struct BalancedCompletion {
+    zero_turn_provider_session_id: Option<String>,
+    zero_turn_action: ZeroTurnAction,
+}
+
+enum BalancedAttemptControl {
+    Proceed,
+    Continue,
+    Return(i32),
+}
+
+fn balanced_retry_budget_exhausted(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    env: &BalancedExecutionEnvironment,
+    ctx: &balancer::BalanceContext<'_>,
+    model: &ModelConfig,
+    run_state: &BalancedRunState,
+) -> Option<String> {
+    if run_state.attempts < run_state.max_attempts {
+        return None;
+    }
+
+    eprintln!("BLOCKED:all-providers-exhausted");
+    let reason = match agent_runtime_services
+        .routing_service
+        .select_route(RoutingServiceRequest {
+            model,
+            state: &env.state,
+            ctx: Some(ctx),
+        }) {
+        Err(err) => err.to_string(),
+        Ok(_) => format_quota_retry_budget_exhausted(&model.name, run_state.max_attempts),
+    };
+    emit_pool_exhausted_pre_invocation_failure(model, &reason);
+    Some(reason)
+}
+
+fn start_balanced_attempt<'a>(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    env: &'a BalancedExecutionEnvironment,
+    ctx: &balancer::BalanceContext<'_>,
+    model: &ModelConfig,
+    parent_invocation_id: Option<i64>,
+    run_state: &mut BalancedRunState,
+) -> Result<BalancedAttempt<'a>, String> {
+    let pending_verification = run_state.pending_same_provider_verification.take();
+    let provider_index = match pending_verification.as_ref() {
+        Some((provider_index, _)) => *provider_index,
+        None => {
+            match select_balanced_provider_index(agent_runtime_services, model, &env.state, ctx) {
+                Ok(provider_index) => provider_index,
+                Err(err) => {
+                    let pool_exhausted = run_state.attempts > model.providers.len().max(1);
+                    emit_provider_selection_pre_invocation_failure(model, &err, pool_exhausted);
+                    return Err(err);
+                }
+            }
+        }
+    };
+    let (provider, prompt_mode) =
+        match effective_model_for_execution(model, provider_index, &env.providers_cfg) {
+            Ok(effective) => effective,
+            Err(err) => {
+                emit_provider_resolution_pre_invocation_failure(model, provider_index, &err);
+                return Err(err);
+            }
+        };
+    let provider_name = provider.name.clone();
+    let invocation = composite_invocation_id(&provider_name);
+    let invocation_start = balanced_invocation_start(
+        &invocation,
+        model,
+        &provider_name,
+        provider_index,
+        parent_invocation_id,
+    );
+    let invocation_row_id = agent_runtime_services
+        .invocation_lifecycle_service
+        .start_invocation(InvocationLifecycleStartRequest {
+            state: &env.state,
+            start: &invocation_start,
+        })
+        .map_err(|err| err.to_string())?
+        .invocation_row_id;
+    let guard = FinalizerGuard::new(&env.state, invocation_row_id);
+    let start_known_provider_session_id = match pending_verification {
+        Some((_, session_id)) => session_id,
+        None => executor::cli::start_known_provider_session_id(&provider)?,
+    };
+    bind_start_known_provider_session_if_present(
+        &env.state,
+        invocation_row_id,
+        start_known_provider_session_id.as_deref(),
+    );
+    let zero_turn_baseline = zero_turn_record_baseline(
+        &env.state,
+        &env.sessions_cfg,
+        &provider_name,
+        start_known_provider_session_id.as_deref(),
+    );
+
+    Ok(BalancedAttempt {
+        provider,
+        prompt_mode,
+        provider_name,
+        provider_index,
+        invocation,
+        invocation_row_id,
+        guard,
+        start_known_provider_session_id,
+        zero_turn_baseline,
+    })
+}
+
+fn execute_balanced_attempt(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    model: &ModelConfig,
+    prompt: &str,
+    working_dir: Option<&Path>,
+    extra_inputs: &HashMap<String, Vec<String>>,
+    env: &BalancedExecutionEnvironment,
+    attempt: &mut BalancedAttempt<'_>,
+) -> Result<executor::ExecutionResult, String> {
+    let invocation = &attempt.invocation;
+    let invocation_env = serde_json::to_string(&invocation)
+        .map_err(|e| format!("Failed to serialize invocation id: {e}"))?;
+    eprintln!("{}", invocation.stderr_line());
+
+    let executor_request = balanced_executor_request(BalancedExecutorRequestInput {
+        model,
+        provider: &attempt.provider,
+        provider_index: attempt.provider_index,
+        prompt_mode: attempt.prompt_mode,
+        prompt,
+        working_dir,
+        extra_inputs,
+        invocation_env: &invocation_env,
+        start_known_provider_session_id: attempt.start_known_provider_session_id.clone(),
+    });
+
+    match agent_runtime_services
+        .executor_service
+        .execute(executor_request)
+    {
+        Ok(output) => Ok(output.result),
+        Err(err) => {
+            finalize_balanced_spawn_error(agent_runtime_services, env, attempt, err.to_string());
+            Err(err.to_string())
+        }
+    }
+}
+
+fn finalize_balanced_spawn_error(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    env: &BalancedExecutionEnvironment,
+    attempt: &mut BalancedAttempt<'_>,
+    error: String,
+) {
+    let signal = spawn_error_terminal_signal(&attempt.provider_name, error);
+    let invocation_uuid =
+        Uuid::parse_str(&attempt.invocation.id).expect("generated invocation id must be a UUID");
+    let mut terminal_signal_stderr = std::io::stderr();
+    let mut terminal_signal_ctx = TerminalSignalContext {
+        invocation_id: &invocation_uuid,
+        session_id: None,
+        provider: &attempt.provider_name,
+        state_db: &env.state,
+        stderr: &mut terminal_signal_stderr,
+    };
+    let _ = apply_terminal_signal_outcome(&Some(signal.clone()), &mut terminal_signal_ctx);
+    let terminal_reason = typed_terminal_reason_fallback(&signal).unwrap_or("spawn_error");
+    agent_runtime_services
+        .invocation_lifecycle_service
+        .finalize_invocation(InvocationLifecycleFinalizeRequest {
+            state: &env.state,
+            invocation_row_id: attempt.invocation_row_id,
+            success: false,
+            exit_code: -1,
+            error_category: Some(terminal_reason),
+            terminal_reason: Some(terminal_reason),
+        })
+        .map(|_| ())
+        .unwrap_or_else(|finalize_err| {
+            eprintln!("Warning: Failed to finalize invocation: {finalize_err}")
+        });
+    emit_failure_result_envelope(FailureResultEnvelopeInput {
+        state: &env.state,
+        invocation_id: &attempt.invocation.id,
+        provider_name: &attempt.provider_name,
+        provider_session_id: attempt.start_known_provider_session_id.as_deref(),
+        exit_code: -1,
+        error_category: Some(terminal_reason),
+        terminal_reason: Some(terminal_reason),
+    });
+    attempt.guard.mark_finalized();
+}
+
+fn prepare_balanced_completion(
+    env: &BalancedExecutionEnvironment,
+    run_state: &mut BalancedRunState,
+    attempt: &mut BalancedAttempt<'_>,
+    result: &mut executor::ExecutionResult,
+) -> BalancedCompletion {
+    apply_age153_terminal_signal_fixture_override(result);
+    let zero_turn_provider_session_id = attempt
+        .start_known_provider_session_id
+        .clone()
+        .or_else(|| result.session_capture.session_id.clone());
+    if attempt.zero_turn_baseline.provider_session_id.is_none()
+        && let Some(session_id) = zero_turn_provider_session_id.as_deref()
+    {
+        attempt.zero_turn_baseline =
+            zero_turn_late_bind_baseline(&env.sessions_cfg, &attempt.provider_name, session_id);
+    }
+    let zero_turn_classification = zero_turn_classify_after_completion(
+        &env.state,
+        &env.sessions_cfg,
+        &attempt.zero_turn_baseline,
+    );
+    apply_zero_turn_classification_to_result(
+        result,
+        &attempt.provider_name,
+        &zero_turn_classification,
+    );
+    let zero_turn_action = next_action(
+        &mut run_state.zero_turn_confirmation,
+        zero_turn_classification_for_action(
+            zero_turn_classification,
+            result,
+            &attempt.provider_name,
+            zero_turn_provider_session_id.as_deref(),
+        ),
+    );
+
+    BalancedCompletion {
+        zero_turn_provider_session_id,
+        zero_turn_action,
+    }
+}
+
+fn update_balanced_session_capture(
+    state: &StateDb,
+    invocation_row_id: i64,
+    result: &executor::ExecutionResult,
+) {
+    if let executor::SessionCaptureMethod::Failed(reason) = &result.session_capture.method {
+        eprintln!("[session-capture] {reason}");
+    }
+    state
+        .update_session_capture(
+            invocation_row_id,
+            result.session_capture.session_id.as_deref(),
+            result.session_capture.method.db_value(),
+        )
+        .unwrap_or_else(|e| eprintln!("Warning: Failed to update session capture: {e}"));
+}
+
+fn handle_balanced_terminal_signal_disposition(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    all_models: &HashMap<String, ModelConfig>,
+    env: &BalancedExecutionEnvironment,
+    run_state: &mut BalancedRunState,
+    attempt: &mut BalancedAttempt<'_>,
+    result: &executor::ExecutionResult,
+    completion: &BalancedCompletion,
+) -> BalancedAttemptControl {
+    let invocation_uuid =
+        Uuid::parse_str(&attempt.invocation.id).expect("generated invocation id must be a UUID");
+    let mut terminal_signal_stderr = std::io::stderr();
+    let terminal_session_uuid =
+        provider_session_marker_uuid(completion.zero_turn_provider_session_id.as_deref());
+    let mut terminal_signal_ctx = TerminalSignalContext {
+        invocation_id: &invocation_uuid,
+        session_id: terminal_session_uuid.as_ref(),
+        provider: &attempt.provider_name,
+        state_db: &env.state,
+        stderr: &mut terminal_signal_stderr,
+    };
+    let should_defer_generic_exit = should_defer_generic_exit(all_models, result);
+    let balanced_terminal_signal =
+        balanced_terminal_signal_for_outcome(result, should_defer_generic_exit);
+    let terminal_signal_disposition = if is_confirmed_zero_turn_exhaustion(
+        completion.zero_turn_action,
+        &balanced_terminal_signal,
+    ) {
+        let signal = balanced_terminal_signal
+            .as_ref()
+            .expect("confirmed zero-turn action requires a maybe signal");
+        let _ = confirm_maybe_quota_exhausted(signal, &mut terminal_signal_ctx);
+        TerminalSignalDisposition::MaybeQuotaVerify
+    } else {
+        apply_terminal_signal_outcome(&balanced_terminal_signal, &mut terminal_signal_ctx)
+    };
+    match terminal_signal_disposition {
+        TerminalSignalDisposition::MaybeQuotaVerify => {
+            let terminal_reason =
+                terminal_signal_reason(&result.terminal_signal, result.terminal_reason.as_deref())
+                    .unwrap_or("maybe_quota_exhausted");
+            supervise_captured_child_invocations(
+                &env.state,
+                attempt.invocation_row_id,
+                &result.captured_child_invocations,
+                Some(terminal_reason),
+            );
+            update_balanced_session_capture(&env.state, attempt.invocation_row_id, result);
+            let confirmed = matches!(
+                completion.zero_turn_action,
+                ZeroTurnAction::ConfirmedExhaustion
+            );
             agent_runtime_services
                 .invocation_lifecycle_service
                 .finalize_invocation(InvocationLifecycleFinalizeRequest {
                     state: &env.state,
-                    invocation_row_id,
+                    invocation_row_id: attempt.invocation_row_id,
                     success: false,
-                    exit_code: 1,
-                    error_category: Some("returned_artifacts"),
-                    terminal_reason: Some("returned_artifacts_persist_failed"),
+                    exit_code: result.exit_code,
+                    error_category: confirmed.then_some("quota_exhausted"),
+                    terminal_reason: Some(terminal_reason),
                 })
                 .map(|_| ())
                 .unwrap_or_else(|e| eprintln!("Warning: Failed to finalize invocation: {e}"));
+            attempt.guard.mark_finalized();
+            env.state
+                .increment_calls_since_refresh(&attempt.provider_name)
+                .unwrap_or_else(|e| eprintln!("Warning: Failed to bump quota tick: {e}"));
+            match completion.zero_turn_action {
+                ZeroTurnAction::VerifySameProvider => {
+                    run_state.pending_same_provider_verification = Some((
+                        attempt.provider_index,
+                        completion.zero_turn_provider_session_id.clone(),
+                    ));
+                    BalancedAttemptControl::Continue
+                }
+                ZeroTurnAction::ConfirmedExhaustion => {
+                    if confirmed && run_state.attempts < run_state.max_attempts {
+                        eprintln!(
+                            "[routing] provider {provider_name} returned quota_exhausted; retrying another provider",
+                            provider_name = attempt.provider_name
+                        );
+                    }
+                    BalancedAttemptControl::Continue
+                }
+                ZeroTurnAction::Continue | ZeroTurnAction::Unclassified => {
+                    emit_failure_result_envelope(FailureResultEnvelopeInput {
+                        state: &env.state,
+                        invocation_id: &attempt.invocation.id,
+                        provider_name: &attempt.provider_name,
+                        provider_session_id: completion.zero_turn_provider_session_id.as_deref(),
+                        exit_code: result.exit_code,
+                        error_category: None,
+                        terminal_reason: Some(terminal_reason),
+                    });
+                    eprintln!("{}", result.stderr);
+                    BalancedAttemptControl::Return(result.exit_code)
+                }
+            }
+        }
+        TerminalSignalDisposition::QuotaExhaustedRetry => {
+            let terminal_reason =
+                terminal_signal_reason(&result.terminal_signal, result.terminal_reason.as_deref())
+                    .expect("typed quota signal must have terminal reason");
+            supervise_captured_child_invocations(
+                &env.state,
+                attempt.invocation_row_id,
+                &result.captured_child_invocations,
+                Some(terminal_reason),
+            );
+            update_balanced_session_capture(&env.state, attempt.invocation_row_id, result);
+            agent_runtime_services
+                .invocation_lifecycle_service
+                .finalize_invocation(InvocationLifecycleFinalizeRequest {
+                    state: &env.state,
+                    invocation_row_id: attempt.invocation_row_id,
+                    success: false,
+                    exit_code: result.exit_code,
+                    error_category: Some("quota_exhausted"),
+                    terminal_reason: Some(terminal_reason),
+                })
+                .map(|_| ())
+                .unwrap_or_else(|e| eprintln!("Warning: Failed to finalize invocation: {e}"));
+            attempt.guard.mark_finalized();
+            env.state
+                .increment_calls_since_refresh(&attempt.provider_name)
+                .unwrap_or_else(|e| eprintln!("Warning: Failed to bump quota tick: {e}"));
+            if run_state.attempts < run_state.max_attempts {
+                eprintln!(
+                    "[routing] provider {provider_name} returned quota_exhausted; retrying another provider",
+                    provider_name = attempt.provider_name
+                );
+            }
+            BalancedAttemptControl::Continue
+        }
+        TerminalSignalDisposition::ProlongedSilenceFail
+        | TerminalSignalDisposition::InteractiveFail => {
+            let terminal_reason =
+                terminal_signal_reason(&result.terminal_signal, result.terminal_reason.as_deref())
+                    .expect("typed failure signal must have terminal reason");
+            supervise_captured_child_invocations(
+                &env.state,
+                attempt.invocation_row_id,
+                &result.captured_child_invocations,
+                Some(terminal_reason),
+            );
+            update_balanced_session_capture(&env.state, attempt.invocation_row_id, result);
+            agent_runtime_services
+                .invocation_lifecycle_service
+                .finalize_invocation(InvocationLifecycleFinalizeRequest {
+                    state: &env.state,
+                    invocation_row_id: attempt.invocation_row_id,
+                    success: false,
+                    exit_code: result.exit_code,
+                    error_category: terminal_signal_error_category(
+                        &result.terminal_signal,
+                        terminal_reason,
+                    ),
+                    terminal_reason: Some(terminal_reason),
+                })
+                .map(|_| ())
+                .unwrap_or_else(|e| eprintln!("Warning: Failed to finalize invocation: {e}"));
+            attempt.guard.mark_finalized();
             emit_failure_result_envelope(FailureResultEnvelopeInput {
                 state: &env.state,
-                invocation_id: &invocation.id,
-                provider_name,
-                provider_session_id: zero_turn_provider_session_id.as_deref(),
-                exit_code: 1,
-                error_category: Some("returned_artifacts"),
-                terminal_reason: Some("returned_artifacts_persist_failed"),
+                invocation_id: &attempt.invocation.id,
+                provider_name: &attempt.provider_name,
+                provider_session_id: completion.zero_turn_provider_session_id.as_deref(),
+                exit_code: result.exit_code,
+                error_category: Some(terminal_reason),
+                terminal_reason: Some(terminal_reason),
             });
-            guard.mark_finalized();
-            return Ok(1);
+            eprintln!("{}", result.stderr);
+            BalancedAttemptControl::Return(result.exit_code)
         }
+        TerminalSignalDisposition::InteractiveClean | TerminalSignalDisposition::NotApplicable => {
+            supervise_captured_child_invocations(
+                &env.state,
+                attempt.invocation_row_id,
+                &result.captured_child_invocations,
+                result.terminal_reason.as_deref(),
+            );
+            BalancedAttemptControl::Proceed
+        }
+    }
+}
 
-        emit_unknown_diagnostic_if_settled_unknown(
-            &env.state,
-            provider_name,
-            provider_index,
-            &result,
-            error_category.as_deref(),
-            "no_retry",
-        );
+fn finalize_balanced_completed_attempt(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    all_models: &HashMap<String, ModelConfig>,
+    working_dir: Option<&Path>,
+    env: &BalancedExecutionEnvironment,
+    run_state: &BalancedRunState,
+    attempt: &mut BalancedAttempt<'_>,
+    result: &executor::ExecutionResult,
+    completion: &BalancedCompletion,
+) -> Result<BalancedAttemptControl, String> {
+    update_balanced_session_capture(&env.state, attempt.invocation_row_id, result);
 
+    let success = execution_succeeded(result.exit_code);
+
+    let error_category =
+        balanced_result_error_category(agent_runtime_services, result, all_models, working_dir);
+    let quota_exhausted = error_category_is_quota_exhausted(error_category.as_deref());
+
+    if let Err(err) = env
+        .state
+        .record_returned_artifacts(attempt.invocation_row_id, &result.returned_artifacts)
+    {
+        eprintln!("Error: Failed to record returned artifacts: {err}");
         agent_runtime_services
             .invocation_lifecycle_service
             .finalize_invocation(InvocationLifecycleFinalizeRequest {
                 state: &env.state,
-                invocation_row_id,
-                success,
-                exit_code: result.exit_code,
-                error_category: error_category.as_deref(),
-                terminal_reason: result.terminal_reason.as_deref(),
+                invocation_row_id: attempt.invocation_row_id,
+                success: false,
+                exit_code: 1,
+                error_category: Some("returned_artifacts"),
+                terminal_reason: Some("returned_artifacts_persist_failed"),
             })
             .map(|_| ())
             .unwrap_or_else(|e| eprintln!("Warning: Failed to finalize invocation: {e}"));
-        guard.mark_finalized();
-
-        if success {
-            let ingest_effective_cwd = effective_spawn_cwd(working_dir)?;
-            let emitted = ingest_and_emit_session_id_resume_aware(
-                agent_runtime_services,
-                SessionIngestRequest {
-                    state: &env.state,
-                    sessions_cfg: &env.sessions_cfg,
-                    providers_cfg: Some(&env.providers_cfg),
-                    provider_name,
-                    invocation_row_id,
-                    invocation_uuid: &invocation.id,
-                    effective_cwd: Some(&ingest_effective_cwd),
-                    mode: ResumeIngestMode::Unpinned {
-                        capture_method: "turn_script",
-                    },
-                },
-            );
-            if !emitted && let Some(session_id) = result.session_capture.session_id.as_deref() {
-                emit_known_session_id(
-                    &env.state,
-                    invocation_row_id,
-                    &invocation.id,
-                    session_id,
-                    result.session_capture.method.db_value(),
-                );
-            }
-        }
-
-        // Bump calls_since_refresh for this provider (account). Errors here are
-        // non-fatal — missing a tick just slightly skews the next projection.
-        env.state
-            .increment_calls_since_refresh(provider_name)
-            .unwrap_or_else(|e| eprintln!("Warning: Failed to bump quota tick: {e}"));
-
-        if success {
-            let _ = std::io::stdout().write_all(&result.stdout);
-            emit_result_envelope(
-                &invocation.id,
-                success,
-                result.exit_code,
-                error_category.as_deref(),
-                result.terminal_reason.as_deref(),
-                None,
-            );
-            return Ok(result.exit_code);
-        }
-        if quota_exhausted {
-            if attempts < max_attempts {
-                eprintln!(
-                    "[routing] provider {provider_name} returned quota_exhausted; retrying another provider"
-                );
-            }
-            continue;
-        }
-
         emit_failure_result_envelope(FailureResultEnvelopeInput {
             state: &env.state,
-            invocation_id: &invocation.id,
-            provider_name,
-            provider_session_id: zero_turn_provider_session_id.as_deref(),
+            invocation_id: &attempt.invocation.id,
+            provider_name: &attempt.provider_name,
+            provider_session_id: completion.zero_turn_provider_session_id.as_deref(),
+            exit_code: 1,
+            error_category: Some("returned_artifacts"),
+            terminal_reason: Some("returned_artifacts_persist_failed"),
+        });
+        attempt.guard.mark_finalized();
+        return Ok(BalancedAttemptControl::Return(1));
+    }
+
+    emit_unknown_diagnostic_if_settled_unknown(
+        &env.state,
+        &attempt.provider_name,
+        attempt.provider_index,
+        result,
+        error_category.as_deref(),
+        "no_retry",
+    );
+
+    agent_runtime_services
+        .invocation_lifecycle_service
+        .finalize_invocation(InvocationLifecycleFinalizeRequest {
+            state: &env.state,
+            invocation_row_id: attempt.invocation_row_id,
+            success,
             exit_code: result.exit_code,
             error_category: error_category.as_deref(),
             terminal_reason: result.terminal_reason.as_deref(),
-        });
-        eprintln!("{}", result.stderr);
-        if let Some(ref cat) = error_category {
-            eprintln!("[diagnostics: {cat}]");
+        })
+        .map(|_| ())
+        .unwrap_or_else(|e| eprintln!("Warning: Failed to finalize invocation: {e}"));
+    attempt.guard.mark_finalized();
+
+    if success {
+        let ingest_effective_cwd = effective_spawn_cwd(working_dir)?;
+        let emitted = ingest_and_emit_session_id_resume_aware(
+            agent_runtime_services,
+            SessionIngestRequest {
+                state: &env.state,
+                sessions_cfg: &env.sessions_cfg,
+                providers_cfg: Some(&env.providers_cfg),
+                provider_name: &attempt.provider_name,
+                invocation_row_id: attempt.invocation_row_id,
+                invocation_uuid: &attempt.invocation.id,
+                effective_cwd: Some(&ingest_effective_cwd),
+                mode: ResumeIngestMode::Unpinned {
+                    capture_method: "turn_script",
+                },
+            },
+        );
+        if !emitted && let Some(session_id) = result.session_capture.session_id.as_deref() {
+            emit_known_session_id(
+                &env.state,
+                attempt.invocation_row_id,
+                &attempt.invocation.id,
+                session_id,
+                result.session_capture.method.db_value(),
+            );
         }
-        return Ok(result.exit_code);
     }
+
+    // Bump calls_since_refresh for this provider (account). Errors here are
+    // non-fatal — missing a tick just slightly skews the next projection.
+    env.state
+        .increment_calls_since_refresh(&attempt.provider_name)
+        .unwrap_or_else(|e| eprintln!("Warning: Failed to bump quota tick: {e}"));
+
+    if success {
+        let _ = std::io::stdout().write_all(&result.stdout);
+        emit_result_envelope(
+            &attempt.invocation.id,
+            success,
+            result.exit_code,
+            error_category.as_deref(),
+            result.terminal_reason.as_deref(),
+            None,
+        );
+        return Ok(BalancedAttemptControl::Return(result.exit_code));
+    }
+    if quota_exhausted {
+        if run_state.attempts < run_state.max_attempts {
+            eprintln!(
+                "[routing] provider {provider_name} returned quota_exhausted; retrying another provider",
+                provider_name = attempt.provider_name
+            );
+        }
+        return Ok(BalancedAttemptControl::Continue);
+    }
+
+    emit_failure_result_envelope(FailureResultEnvelopeInput {
+        state: &env.state,
+        invocation_id: &attempt.invocation.id,
+        provider_name: &attempt.provider_name,
+        provider_session_id: completion.zero_turn_provider_session_id.as_deref(),
+        exit_code: result.exit_code,
+        error_category: error_category.as_deref(),
+        terminal_reason: result.terminal_reason.as_deref(),
+    });
+    eprintln!("{}", result.stderr);
+    if let Some(ref cat) = error_category {
+        eprintln!("[diagnostics: {cat}]");
+    }
+    Ok(BalancedAttemptControl::Return(result.exit_code))
 }
 
 fn supervise_captured_child_invocations(
@@ -6611,40 +7334,75 @@ mod tests {
     fn age153_typed_signal_precedence_runs_before_legacy_diagnostics_in_headless_paths() {
         let balanced = production_block_after("fn run_with_balancing(");
         let signal_idx = balanced
-            .find("apply_terminal_signal_outcome")
+            .find("handle_balanced_terminal_signal_disposition")
             .expect("run_with_balancing must consume typed signal");
         let diagnostics_idx = balanced
-            .find("balanced_result_error_category")
+            .find("finalize_balanced_completed_attempt")
             .expect("run_with_balancing diagnostics fallback");
         assert!(
             signal_idx < diagnostics_idx,
             "typed signal must precede balanced legacy diagnostics"
         );
+        assert!(
+            production_block_after("fn handle_balanced_terminal_signal_disposition(")
+                .contains("apply_terminal_signal_outcome"),
+            "balanced typed-signal helper must call apply_terminal_signal_outcome"
+        );
+        assert!(
+            production_block_after("fn finalize_balanced_completed_attempt(")
+                .contains("balanced_result_error_category"),
+            "balanced normal completion helper must call legacy diagnostics fallback"
+        );
 
         let resume = production_block_after("fn run_resume(");
         let signal_idx = resume
-            .find("apply_terminal_signal_outcome")
+            .find("handle_headless_resume_terminal_signal_disposition")
             .expect("run_resume must consume typed signal");
         let diagnostics_idx = resume
-            .find("resume_result_error_category")
+            .find("finalize_headless_resume_completed_attempt")
             .expect("run_resume diagnostics fallback");
         assert!(
             signal_idx < diagnostics_idx,
             "typed signal must precede resume legacy diagnostics"
+        );
+        assert!(
+            production_block_after("fn handle_headless_resume_terminal_signal_disposition(")
+                .contains("apply_terminal_signal_outcome"),
+            "resume typed-signal helper must call apply_terminal_signal_outcome"
+        );
+        assert!(
+            production_block_after("fn finalize_headless_resume_completed_attempt(")
+                .contains("resume_result_error_category"),
+            "resume normal completion helper must call legacy diagnostics fallback"
         );
     }
 
     #[test]
     fn age153_interactive_signal_precedence_and_clean_no_marker_are_declared() {
         let repl = production_block_after("fn run_repl(");
-        assert!(repl.contains("InteractiveExecutionResult") || repl.contains("terminal_signal"));
+        let signal_idx = repl
+            .find("handle_interactive_repl_terminal_signal_disposition")
+            .expect("run_repl must consume typed signal");
+        let finalization_idx = repl
+            .find("finalize_interactive_repl_completion")
+            .expect("run_repl normal finalization fallback");
         assert!(
-            repl.contains("TerminalSignalDisposition::InteractiveFail")
-                && repl.contains("TerminalSignalDisposition::InteractiveClean"),
+            signal_idx < finalization_idx,
+            "interactive typed signal handling must precede normal REPL finalization"
+        );
+        let helper =
+            production_block_after("fn handle_interactive_repl_terminal_signal_disposition(");
+        assert!(
+            helper.contains("InteractiveExecutionResult") || helper.contains("terminal_signal")
+        );
+        assert!(
+            helper.contains("TerminalSignalDisposition::InteractiveFail")
+                && helper.contains("TerminalSignalDisposition::InteractiveClean"),
             "interactive path must distinguish non-clean marker emission from clean no-marker"
         );
         assert!(
-            !repl.contains("execute_with_bounded_silence"),
+            !repl.contains("execute_with_bounded_silence")
+                && !helper.contains("execute_with_bounded_silence"),
             "run_repl inherited-stdio path must not add bounded-silence supervision"
         );
     }
@@ -6652,11 +7410,26 @@ mod tests {
     #[test]
     fn age153_marker_emitting_typed_dispositions_mark_guard_after_explicit_finalize() {
         for (function_name, disposition) in [
-            ("fn run_with_balancing(", "QuotaExhaustedRetry"),
-            ("fn run_with_balancing(", "ProlongedSilenceFail"),
-            ("fn run_resume(", "QuotaExhaustedRetry"),
-            ("fn run_resume(", "ProlongedSilenceFail"),
-            ("fn run_repl(", "InteractiveFail"),
+            (
+                "fn handle_balanced_terminal_signal_disposition(",
+                "QuotaExhaustedRetry",
+            ),
+            (
+                "fn handle_balanced_terminal_signal_disposition(",
+                "ProlongedSilenceFail",
+            ),
+            (
+                "fn handle_headless_resume_terminal_signal_disposition(",
+                "QuotaExhaustedRetry",
+            ),
+            (
+                "fn handle_headless_resume_terminal_signal_disposition(",
+                "ProlongedSilenceFail",
+            ),
+            (
+                "fn handle_interactive_repl_terminal_signal_disposition(",
+                "InteractiveFail",
+            ),
         ] {
             assert_typed_signal_disposition_marks_guard_after_finalize(function_name, disposition);
         }

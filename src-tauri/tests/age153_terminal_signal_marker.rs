@@ -54,10 +54,10 @@ fn assert_marker_emission_is_adjacent_to_typed_signal_finalization() {
     );
 
     let source = main_rs_source();
-    let balanced = source_block_after(&source, "fn run_with_balancing(");
+    let balanced = source_block_after(&source, "fn handle_balanced_terminal_signal_disposition(");
     let signal_idx = balanced
         .find("apply_terminal_signal_outcome")
-        .expect("run_with_balancing must consume typed terminal signals");
+        .expect("balanced terminal-signal helper must consume typed terminal signals");
     let after_signal = &balanced[signal_idx..];
     let finalize_idx = after_signal
         .find(".finalize_invocation(")
