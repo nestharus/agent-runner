@@ -32,6 +32,12 @@
 - `src-tauri/src/commands/migrate/dispatch.rs`
 - `src-tauri/src/commands/migrate/formatter.rs`
 - `src-tauri/src/commands/mod.rs`
+- `src-tauri/src/commands/session_locate_export/mod.rs`
+- `src-tauri/src/commands/session_locate_export/orchestration.rs`
+- `src-tauri/src/commands/session_locate_export/validator.rs`
+- `src-tauri/src/commands/session_locate_export/mapper.rs`
+- `src-tauri/src/commands/session_locate_export/formatter.rs`
+- `src-tauri/src/session_metadata_cli.rs`
 
 The `src-tauri/src/commands/compaction_backfill/*`, `src-tauri/src/commands/migrate/{dispatch,formatter}.rs`,
 and `src-tauri/src/commands/mod.rs` paths are the `migrate-db` migration command surface (compaction-boundary
@@ -41,6 +47,24 @@ behavior this spec owns; the behavior is exercised by the `migrate-db` integrati
 (`src-tauri/tests/age149_owned_turn_event_schema.rs`, `age134_main_session_and_migrate.rs`,
 `initiative_05_migration.rs`, `age33_config_state_characterization.rs`) plus co-located unit tests in
 `src-tauri/src/commands/compaction_backfill/tests.rs`.
+
+The `src-tauri/src/commands/session_locate_export/*` and
+`src-tauri/src/session_metadata_cli.rs` paths are the `session locate` and
+`session export` command surface (session metadata locate, canonical-jsonl
+export, and the shared metadata/export JSON-error mapping/formatter helpers),
+relocated out of `main.rs` by AGE-187 (slice A4 of the AGE-183
+decomposition). This is a deliberate-union ownership entry: these CLI command
+files implement the session locate/export behavior this spec owns; the
+behavior is exercised by the `session locate` / `session export` integration
+oracle (`src-tauri/tests/initiative_06_locate.rs`,
+`src-tauri/tests/initiative_06_export.rs`,
+`src-tauri/tests/age37_session_export_format_validation.rs`,
+`src-tauri/tests/age134_main_session_and_migrate.rs`,
+`src-tauri/tests/age33_config_state_characterization.rs`,
+`src-tauri/tests/empty_bodies_ref_rca/rc3_export_db_source.rs`,
+`src-tauri/tests/initiative_06_import_replace.rs`,
+`src-tauri/tests/initiative_07_canonical_reader_unification.rs`) plus
+co-located unit tests in `src-tauri/src/commands/session_locate_export/{mapper,validator,orchestration,formatter}.rs`.
 
 ## Preconditions
 

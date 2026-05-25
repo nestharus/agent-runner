@@ -6,6 +6,8 @@
 
 use oulipoly_runtime::session_metadata::MetadataError;
 
+use crate::commands::session_locate_export::{emit_metadata_error, metadata_error_exit_code};
+
 pub(super) fn render_session_metadata(
     result: Result<oulipoly_runtime::session_metadata::SessionMetadata, MetadataError>,
 ) -> Result<i32, String> {
@@ -16,15 +18,15 @@ pub(super) fn render_session_metadata(
                 Ok(0)
             }
             Err(err) => {
-                super::emit_metadata_error(&MetadataError::Operational {
+                emit_metadata_error(&MetadataError::Operational {
                     message: format!("failed to serialize session metadata: {err}"),
                 });
                 Ok(1)
             }
         },
         Err(err) => {
-            let code = super::metadata_error_exit_code(&err);
-            super::emit_metadata_error(&err);
+            let code = metadata_error_exit_code(&err);
+            emit_metadata_error(&err);
             Ok(code)
         }
     }
