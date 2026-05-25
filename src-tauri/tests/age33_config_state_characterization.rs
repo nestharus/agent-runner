@@ -524,7 +524,7 @@ fn age_33_run_with_balancing_opens_state_via_opener_before_config_loads() {
 fn age_33_diagnostics_and_balancing_config_fallbacks_remain_direct() {
     let source = include_str!("../src/main.rs");
     let run_with_balancing = source_slice(source, "fn run_with_balancing(", "fn run_diagnostics(");
-    let run_diagnostics = source_slice(source, "fn run_diagnostics(", "fn run_migrate_db(");
+    let run_diagnostics = source_slice(source, "fn run_diagnostics(", "fn run_resume_list(");
 
     assert!(
         run_with_balancing.contains("ProvidersConfig::load(&providers_path).unwrap_or_default()")
