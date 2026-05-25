@@ -67,16 +67,13 @@ use oulipoly_runtime::services::{
     InvocationLifecycleFinalizeRequest, InvocationLifecycleServicePort,
     InvocationLifecycleStartRequest, MigrationServiceOutput, MigrationServiceRequest,
     ResumeAcceptanceRequest, ResumeServiceOutput, ResumeServiceRequest, RotationFailedReason,
-    RoutingServicePort, RoutingServiceRequest, ServiceError, SessionExportServiceRequest,
-    SessionLifecycleIngestMode, SessionLifecycleRequest, SessionLockFailure,
-    SessionLockServiceRequest, SessionLockSuccess, SessionReplaceServiceRequest,
-    TraceServiceFailure, TraceServiceRequest,
+    RoutingServicePort, RoutingServiceRequest, ServiceError, SessionLifecycleIngestMode,
+    SessionLifecycleRequest, SessionLockFailure, SessionLockServiceRequest, SessionLockSuccess,
+    SessionReplaceServiceRequest, TraceServiceFailure, TraceServiceRequest,
 };
-use oulipoly_runtime::session_export::ExportError;
 use oulipoly_runtime::session_lock::LockError;
 use oulipoly_runtime::session_metadata::{
-    MetadataError, locate_session_metadata, resolve_resume_workspace_root,
-    resolve_workspace_root_for_provider_session,
+    MetadataError, resolve_resume_workspace_root, resolve_workspace_root_for_provider_session,
 };
 use oulipoly_runtime::session_replace::{self, ReplaceError, ReplaceSource};
 use oulipoly_runtime::trace::{TraceOptions, render_ascii_trace};
@@ -492,10 +489,16 @@ fn dispatch_session_subcommand(
     agent_runtime_services: &wiring::AgentRuntimeServices,
 ) -> Result<i32, String> {
     match command {
-        SessionSubcommands::Locate { session_id, json } => run_session_locate(&session_id, json),
+        SessionSubcommands::Locate { session_id, json } => {
+            commands::session_locate_export::run_session_locate(&session_id, json)
+        }
         SessionSubcommands::SchemaProbe => run_session_schema_probe(),
         SessionSubcommands::Export { session_id, format } => {
-            run_session_export(&session_id, &format, agent_runtime_services)
+            commands::session_locate_export::run_session_export(
+                &session_id,
+                &format,
+                agent_runtime_services,
+            )
         }
         SessionSubcommands::PauseHandshake { session_id, ttl_ms } => {
             run_pause_handshake(&session_id, ttl_ms, agent_runtime_services)
@@ -898,241 +901,6 @@ fn render_trace_report(
     Ok(0)
 }
 
-fn run_session_locate(session_id: &str, _json: bool) -> Result<i32, String> {
-    if let Some(exit_code) = validate_locate_session_id(session_id) {
-        return Ok(exit_code);
-    }
-    let env = match load_session_locate_environment() {
-        Ok(env) => env,
-        Err(exit_code) => return Ok(exit_code),
-    };
-    render_session_metadata(locate_session_metadata(
-        &env.state,
-        &env.models,
-        &env.providers_cfg,
-        &env.sessions_cfg,
-        session_id,
-    ))
-}
-
-fn validate_locate_session_id(session_id: &str) -> Option<i32> {
-    if Uuid::parse_str(session_id).is_err() {
-        emit_metadata_error(&MetadataError::InvalidSessionId {
-            input: session_id.to_string(),
-        });
-        Some(2)
-    } else {
-        None
-    }
-}
-
-struct SessionLocateEnvironment {
-    state: StateDb,
-    providers_cfg: ProvidersConfig,
-    models: HashMap<String, ModelConfig>,
-    sessions_cfg: oulipoly_config::SessionsConfig,
-}
-
-fn load_session_locate_environment() -> Result<SessionLocateEnvironment, i32> {
-    load_session_locate_environment_result().map_err(render_session_locate_environment_error)
-}
-
-fn load_session_locate_environment_result() -> Result<SessionLocateEnvironment, String> {
-    let state = StateDb::open_default()?;
-    let config_root = default_config_root();
-    let providers_cfg = oulipoly_config::ProvidersConfig::load(&config_root.join("providers.toml"))
-        .unwrap_or_default();
-    let models = load_models(&default_models_dir(), Some(&providers_cfg))?;
-    let sessions_cfg = oulipoly_config::SessionsConfig::load(&config_root.join("sessions.toml"))
-        .unwrap_or_default();
-    Ok(SessionLocateEnvironment {
-        state,
-        providers_cfg,
-        models,
-        sessions_cfg,
-    })
-}
-
-fn render_session_locate_environment_error(message: String) -> i32 {
-    emit_metadata_error(&MetadataError::Operational { message });
-    1
-}
-
-fn render_session_metadata(
-    result: Result<oulipoly_runtime::session_metadata::SessionMetadata, MetadataError>,
-) -> Result<i32, String> {
-    session_metadata_cli::render_session_metadata(result)
-}
-
-fn run_session_export(
-    session_id: &str,
-    format: &str,
-    agent_runtime_services: &wiring::AgentRuntimeServices,
-) -> Result<i32, String> {
-    if let Some(exit_code) = validate_session_export_args(session_id, format) {
-        return Ok(exit_code);
-    }
-
-    let service_output = agent_runtime_services
-        .session_export_service
-        .export_session(SessionExportServiceRequest {
-            session_id: session_id.to_string(),
-        })
-        .map_err(|err| err.to_string())?;
-
-    let output = match unwrap_export_output(service_output.result) {
-        Ok(output) => output,
-        Err(exit_code) => return Ok(exit_code),
-    };
-    write_session_export_output(&output)
-}
-
-fn validate_session_export_args(session_id: &str, format: &str) -> Option<i32> {
-    if format != "canonical-jsonl" {
-        emit_export_json_error(
-            "invalid-format",
-            &format!("unsupported export format {format}; expected canonical-jsonl"),
-        );
-        return Some(2);
-    }
-    if Uuid::parse_str(session_id).is_err() {
-        let err = ExportError::InvalidSessionId {
-            input: session_id.to_string(),
-        };
-        emit_export_error(&err);
-        return Some(export_error_exit_code(&err));
-    }
-    None
-}
-
-fn unwrap_export_output(result: Result<Vec<u8>, ExportError>) -> Result<Vec<u8>, i32> {
-    match result {
-        Ok(output) => Ok(output),
-        Err(err) => {
-            emit_export_error(&err);
-            Err(export_error_exit_code(&err))
-        }
-    }
-}
-
-fn write_session_export_output(output: &[u8]) -> Result<i32, String> {
-    if let Err(err) = std::io::stdout().write_all(output) {
-        emit_export_json_error(
-            "operational-error",
-            &format!("failed to write canonical export: {err}"),
-        );
-        return Ok(1);
-    }
-    Ok(0)
-}
-
-fn metadata_error_exit_code(err: &MetadataError) -> i32 {
-    match err {
-        MetadataError::InvalidSessionId { .. } => 2,
-        MetadataError::SessionNotFound { .. } => 10,
-        MetadataError::AmbiguousSession { .. } => 11,
-        MetadataError::UnsupportedStorage { .. } => 12,
-        MetadataError::Operational { .. } => 1,
-    }
-}
-
-fn metadata_error_code(err: &MetadataError) -> &'static str {
-    match err {
-        MetadataError::InvalidSessionId { .. } => "invalid-session-id",
-        MetadataError::SessionNotFound { .. } => "session-not-found",
-        MetadataError::AmbiguousSession { .. } => "ambiguous-session",
-        MetadataError::UnsupportedStorage { .. } => "unsupported-storage",
-        MetadataError::Operational { .. } => "operational-error",
-    }
-}
-
-fn metadata_error_message(err: &MetadataError) -> String {
-    match err {
-        MetadataError::InvalidSessionId { input } => {
-            format!("invalid session id: {input}")
-        }
-        MetadataError::SessionNotFound { input } => {
-            format!("session not found: {input}")
-        }
-        MetadataError::AmbiguousSession { input } => {
-            format!("ambiguous session: {input}")
-        }
-        MetadataError::UnsupportedStorage {
-            provider_name,
-            reason,
-        } => format!("unsupported storage for provider {provider_name}: {reason}"),
-        MetadataError::Operational { message } => message.clone(),
-    }
-}
-
-fn emit_metadata_error(err: &MetadataError) {
-    emit_json_error_payload(json_error_payload(
-        metadata_error_code(err),
-        metadata_error_message(err),
-    ));
-}
-
-fn export_error_exit_code(err: &ExportError) -> i32 {
-    match err {
-        ExportError::InvalidSessionId { .. } => 2,
-        ExportError::SessionNotFound { .. } => 10,
-        ExportError::AmbiguousSession { .. } => 11,
-        ExportError::UnsupportedStorage { .. } => 12,
-        ExportError::MalformedTranscript { .. } => 15,
-        ExportError::Operational { .. } => 1,
-    }
-}
-
-fn export_error_code(err: &ExportError) -> &'static str {
-    match err {
-        ExportError::InvalidSessionId { .. } => "invalid-session-id",
-        ExportError::SessionNotFound { .. } => "session-not-found",
-        ExportError::AmbiguousSession { .. } => "ambiguous-session",
-        ExportError::UnsupportedStorage { .. } => "unsupported-storage",
-        ExportError::MalformedTranscript { .. } => "malformed-provider-transcript",
-        ExportError::Operational { .. } => "operational-error",
-    }
-}
-
-fn export_error_message(err: &ExportError) -> String {
-    match err {
-        ExportError::InvalidSessionId { input } => format!("invalid session UUID: {input}"),
-        ExportError::SessionNotFound { input } => format!("session not found: {input}"),
-        ExportError::AmbiguousSession { input } => {
-            format!("session id matches multiple recent chains: {input}")
-        }
-        ExportError::UnsupportedStorage {
-            provider_name,
-            reason,
-        } => {
-            format!("unsupported storage for provider {provider_name}: {reason}")
-        }
-        ExportError::MalformedTranscript { path, line, reason } => {
-            if *line == 0 {
-                format!("malformed transcript {}: {reason}", path.display())
-            } else {
-                format!(
-                    "malformed transcript {} line {line}: {reason}",
-                    path.display()
-                )
-            }
-        }
-        ExportError::Operational { message } => message.clone(),
-    }
-}
-
-fn emit_export_error(err: &ExportError) {
-    emit_export_json_error(export_error_code(err), &export_error_message(err));
-}
-
-fn emit_export_json_error(code: &str, message: &str) {
-    emit_json_error_payload(json_error_payload(code, message));
-}
-
-fn emit_json_error_payload(payload: serde_json::Value) {
-    eprintln!("{payload}");
-}
-
 // ---
 // Component: agent-marker-cwd-resume-diagnostics
 // Declared roles: accessor, mapper, formatter, predicate, orchestration, validator, filter
@@ -1349,7 +1117,7 @@ fn format_resume_spawn_cwd_fallback_warning(
 ) -> String {
     format!(
         "[resume] warning: could not resolve original cwd for {resume_input}: {}; using {}",
-        metadata_error_message(err),
+        crate::commands::session_locate_export::metadata_error_message(err),
         fallback.display()
     )
 }
