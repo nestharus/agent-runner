@@ -63,8 +63,7 @@ use oulipoly_runtime::diagnostics;
 use oulipoly_runtime::executor;
 use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind;
 use oulipoly_runtime::services::{
-    DiagnosticsServiceOutput, DiagnosticsServiceRequest, ExecutorServiceRequest,
-    InvocationLifecycleFinalizeRequest, InvocationLifecycleServicePort,
+    ExecutorServiceRequest, InvocationLifecycleFinalizeRequest, InvocationLifecycleServicePort,
     InvocationLifecycleStartRequest, MigrationServiceOutput, MigrationServiceRequest,
     ResumeAcceptanceRequest, ResumeServiceOutput, ResumeServiceRequest, RotationFailedReason,
     RoutingServicePort, RoutingServiceRequest, ServiceError, SessionLifecycleIngestMode,
@@ -3452,7 +3451,7 @@ fn diagnose_execution_error(
     working_dir: Option<&Path>,
 ) -> Option<String> {
     let input = diagnostic_input(&result.stderr, &result.stdout);
-    run_diagnostics(
+    crate::commands::diagnostics::run_diagnostics(
         agent_runtime_services,
         &input,
         result.exit_code,
@@ -4481,137 +4480,6 @@ fn parent_invocation_source_matches(
     composite: &CompositeInvocationId,
 ) -> bool {
     record.provider_name.as_deref() == Some(composite.source.as_str())
-}
-
-// ---
-// Component: diagnostics-execution
-// Declared roles: orchestration, mapper, formatter, accessor
-// ---
-
-fn run_diagnostics(
-    agent_runtime_services: &wiring::AgentRuntimeServices,
-    provider_output: &str,
-    exit_code: i32,
-    models: &HashMap<String, ModelConfig>,
-    working_dir: Option<&Path>,
-) -> Option<String> {
-    let context = diagnostics_context(models)?;
-    render_diagnostics_result(run_diagnostics_service(
-        agent_runtime_services,
-        context,
-        provider_output,
-        exit_code,
-        working_dir,
-    ))
-}
-
-struct DiagnosticsContext {
-    diag_model: ModelConfig,
-    provider: ProviderConfig,
-    prompt_mode: PromptMode,
-}
-
-struct DiagnosticsDependencies {
-    diag_model: ModelConfig,
-    providers_cfg: ProvidersConfig,
-}
-
-fn diagnostics_context(models: &HashMap<String, ModelConfig>) -> Option<DiagnosticsContext> {
-    diagnostics_context_from_dependencies(load_diagnostics_dependencies(models)?)
-}
-
-fn load_diagnostics_dependencies(
-    models: &HashMap<String, ModelConfig>,
-) -> Option<DiagnosticsDependencies> {
-    let app_config = load_app_config();
-    let diag_model_name = app_config.diagnostics_model?;
-    let diag_model = models.get(&diag_model_name)?.clone();
-    let providers_path = default_config_root().join("providers.toml");
-    let providers_cfg = ProvidersConfig::load(&providers_path).unwrap_or_default();
-    Some(DiagnosticsDependencies {
-        diag_model,
-        providers_cfg,
-    })
-}
-
-fn diagnostics_context_from_dependencies(
-    dependencies: DiagnosticsDependencies,
-) -> Option<DiagnosticsContext> {
-    let (provider, prompt_mode) = effective_provider_for_model_provider(
-        &dependencies.diag_model,
-        0,
-        &dependencies.providers_cfg,
-    )
-    .ok()?;
-    Some(DiagnosticsContext {
-        diag_model: dependencies.diag_model,
-        provider,
-        prompt_mode,
-    })
-}
-
-fn run_diagnostics_service(
-    agent_runtime_services: &wiring::AgentRuntimeServices,
-    context: DiagnosticsContext,
-    provider_output: &str,
-    exit_code: i32,
-    working_dir: Option<&Path>,
-) -> Result<oulipoly_runtime::diagnostics::Diagnosis, String> {
-    agent_runtime_services
-        .diagnostics_service
-        .diagnose(DiagnosticsServiceRequest::DiagnoseError {
-            diagnostics_model: context.diag_model,
-            effective_provider: context.provider,
-            provider_index: 0,
-            prompt_mode: context.prompt_mode,
-            exit_code,
-            stderr: provider_output.to_string(),
-            working_dir: working_dir.map(Path::to_path_buf),
-        })
-        .map_err(|err| err.to_string())
-        .and_then(diagnostics_output_diagnosis)
-}
-
-fn diagnostics_output_diagnosis(
-    output: DiagnosticsServiceOutput,
-) -> Result<oulipoly_runtime::diagnostics::Diagnosis, String> {
-    match output {
-        DiagnosticsServiceOutput::Diagnosis { diagnosis } => Ok(diagnosis),
-        DiagnosticsServiceOutput::ExhaustionClassification { .. } => {
-            Err("diagnostics service returned exhaustion classification".to_string())
-        }
-    }
-}
-
-fn render_diagnostics_result(
-    diagnosis: Result<oulipoly_runtime::diagnostics::Diagnosis, String>,
-) -> Option<String> {
-    match diagnosis {
-        Ok(diagnosis) => {
-            emit_diagnostics_success(&diagnosis);
-            Some(diagnostics_category_name(&diagnosis))
-        }
-        Err(e) => {
-            emit_diagnostics_failure(&e);
-            None
-        }
-    }
-}
-
-fn emit_diagnostics_success(diagnosis: &oulipoly_runtime::diagnostics::Diagnosis) {
-    eprintln!(
-        "[diagnostics] {}: {}",
-        diagnosis.category.as_str(),
-        diagnosis.summary
-    );
-}
-
-fn diagnostics_category_name(diagnosis: &oulipoly_runtime::diagnostics::Diagnosis) -> String {
-    diagnosis.category.as_str().to_string()
-}
-
-fn emit_diagnostics_failure(error: &str) {
-    eprintln!("[diagnostics] Failed to diagnose: {error}");
 }
 
 fn run_resume_list(uuid: &str) -> Result<i32, String> {

@@ -18,6 +18,22 @@ const CHAIN_A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const MODEL: &str = "claude-opus";
 const TRACE_UUID: &str = "11111111-1111-1111-1111-111111111111";
 
+fn diagnostics_source() -> &'static str {
+    concat!(
+        include_str!("../src/commands/diagnostics/orchestration.rs"),
+        "\n",
+        include_str!("../src/commands/diagnostics/service.rs"),
+        "\n",
+        include_str!("../src/commands/diagnostics/accessor.rs"),
+        "\n",
+        include_str!("../src/commands/diagnostics/mapper.rs"),
+        "\n",
+        include_str!("../src/commands/diagnostics/validator.rs"),
+        "\n",
+        include_str!("../src/commands/diagnostics/formatter.rs"),
+    )
+}
+
 struct CliFixture {
     _dir: tempfile::TempDir,
     config_home: PathBuf,
@@ -490,7 +506,7 @@ fn age_33_deferred_one_shot_agent_file_site_remains_direct_loader_call() {
 #[test]
 fn age_33_run_with_balancing_opens_state_via_opener_before_config_loads() {
     let source = include_str!("../src/main.rs");
-    let run_with_balancing = source_slice(source, "fn run_with_balancing(", "fn run_diagnostics(");
+    let run_with_balancing = source_slice(source, "fn run_with_balancing(", "fn run_resume_list(");
 
     assert!(
         run_with_balancing.contains("state_db_opener: &dyn StateDbOpener"),
@@ -523,8 +539,8 @@ fn age_33_run_with_balancing_opens_state_via_opener_before_config_loads() {
 #[test]
 fn age_33_diagnostics_and_balancing_config_fallbacks_remain_direct() {
     let source = include_str!("../src/main.rs");
-    let run_with_balancing = source_slice(source, "fn run_with_balancing(", "fn run_diagnostics(");
-    let run_diagnostics = source_slice(source, "fn run_diagnostics(", "fn run_resume_list(");
+    let run_with_balancing = source_slice(source, "fn run_with_balancing(", "fn run_resume_list(");
+    let run_diagnostics = diagnostics_source();
 
     assert!(
         run_with_balancing.contains("ProvidersConfig::load(&providers_path).unwrap_or_default()")

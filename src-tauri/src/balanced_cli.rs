@@ -27,7 +27,7 @@ pub(super) fn balanced_result_error_category(
         if diagnostics::classify_exhaustion(&input) {
             Some(super::quota_exhausted_category())
         } else {
-            super::run_diagnostics(
+            crate::commands::diagnostics::run_diagnostics(
                 agent_runtime_services,
                 &input,
                 result.exit_code,

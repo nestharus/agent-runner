@@ -10,6 +10,22 @@ fn wiring_source() -> &'static str {
     include_str!("../src/wiring.rs")
 }
 
+fn diagnostics_source() -> &'static str {
+    concat!(
+        include_str!("../src/commands/diagnostics/orchestration.rs"),
+        "\n",
+        include_str!("../src/commands/diagnostics/service.rs"),
+        "\n",
+        include_str!("../src/commands/diagnostics/accessor.rs"),
+        "\n",
+        include_str!("../src/commands/diagnostics/mapper.rs"),
+        "\n",
+        include_str!("../src/commands/diagnostics/validator.rs"),
+        "\n",
+        include_str!("../src/commands/diagnostics/formatter.rs"),
+    )
+}
+
 fn source_slice<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     let start_idx = source
         .find(start)
@@ -85,7 +101,7 @@ fn one_shot_slice() -> &'static str {
 }
 
 fn diagnostics_slice() -> &'static str {
-    source_slice(main_source(), "fn run_diagnostics(", "fn run_resume_list(")
+    diagnostics_source()
 }
 
 fn entrypoint_slice() -> &'static str {
