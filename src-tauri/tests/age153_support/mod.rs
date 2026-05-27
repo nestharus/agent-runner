@@ -548,6 +548,55 @@ pub fn main_rs_source() -> String {
     fs::read_to_string(&path).unwrap_or_else(|err| panic!("failed to read {path:?}: {err}"))
 }
 
+pub fn balancing_source() -> String {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut combined = String::new();
+    for rel in [
+        "src/run/mod.rs",
+        "src/run/balancing/mod.rs",
+        "src/run/balancing/orchestration.rs",
+        "src/run/balancing/accessor.rs",
+        "src/run/balancing/mapper.rs",
+        "src/run/balancing/parser.rs",
+        "src/run/balancing/disposition.rs",
+        "src/run/balancing/finalization.rs",
+        "src/run/balancing/formatter.rs",
+        "src/run/balancing/diagnostics.rs",
+        "src/run/balancing/predicate.rs",
+        "src/run/balancing/state_update.rs",
+        "src/run/balancing/validator.rs",
+    ] {
+        let path = root.join(rel);
+        let extra = fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("failed to read {path:?}: {err}"));
+        combined.push('\n');
+        combined.push_str(&extra);
+    }
+    combined
+}
+
+pub fn repl_source() -> String {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut combined = String::new();
+    for rel in [
+        "src/run/mod.rs",
+        "src/run/repl/mod.rs",
+        "src/run/repl/orchestration.rs",
+        "src/run/repl/disposition.rs",
+        "src/run/repl/finalization.rs",
+        "src/run/repl/formatter.rs",
+        "src/run/repl/mapper.rs",
+        "src/run/repl/validator.rs",
+    ] {
+        let path = root.join(rel);
+        let extra = fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("failed to read {path:?}: {err}"));
+        combined.push('\n');
+        combined.push_str(&extra);
+    }
+    combined
+}
+
 pub fn terminal_outcome_adapter_source() -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/terminal_outcome_adapter.rs");
     fs::read_to_string(&path).unwrap_or_else(|err| panic!("failed to read {path:?}: {err}"))
@@ -582,8 +631,26 @@ pub fn source_block_after<'a>(source: &'a str, start: &str) -> &'a str {
     panic!("missing closing brace after {start}");
 }
 
+fn signal_consumer_source() -> String {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut combined = main_rs_source();
+    combined.push('\n');
+    combined.push_str(&repl_source());
+    for rel in [
+        "src/invocation/result_envelope.rs",
+        "src/invocation/finalize.rs",
+    ] {
+        let path = root.join(rel);
+        let extra = fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("failed to read {path:?}: {err}"));
+        combined.push('\n');
+        combined.push_str(&extra);
+    }
+    combined
+}
+
 pub fn assert_signal_consumer_source_wired(function_name: &str, expected_fragments: &[&str]) {
-    let source = main_rs_source();
+    let source = signal_consumer_source();
     let body = source_block_after(&source, function_name);
     for fragment in expected_fragments {
         assert!(

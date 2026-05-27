@@ -4,8 +4,8 @@ mod age153_support;
 
 use age153_support::{
     Age153Fixture, FORCE_TERMINAL_SIGNAL_KIND, assert_no_terminal_marker_on_stdout, assert_ordered,
-    assert_single_terminal_signal, line_count, main_rs_source, quota_body, source_block_after,
-    success_body, terminal_outcome_adapter_source, terminal_signal_lines,
+    assert_single_terminal_signal, line_count, quota_body, source_block_after, success_body,
+    terminal_outcome_adapter_source, terminal_signal_lines,
 };
 
 #[test]
@@ -53,12 +53,11 @@ fn assert_marker_emission_is_adjacent_to_typed_signal_finalization() {
         "typed-signal outcome handling must be the marker emission authority"
     );
 
-    let source = main_rs_source();
-    let balanced = source_block_after(&source, "fn run_with_balancing(");
-    let signal_idx = balanced
+    let quota_retry = source_block_after(disposition_source(), "fn handle_quota_exhausted_retry(");
+    let signal_idx = quota_retry
         .find("apply_terminal_signal_outcome")
-        .expect("run_with_balancing must consume typed terminal signals");
-    let after_signal = &balanced[signal_idx..];
+        .expect("handle_quota_exhausted_retry must consume typed terminal signals");
+    let after_signal = &quota_retry[signal_idx..];
     let finalize_idx = after_signal
         .find(".finalize_invocation(")
         .expect("typed terminal signal block must include lifecycle finalization");
@@ -82,4 +81,24 @@ fn assert_marker_emission_is_adjacent_to_typed_signal_finalization() {
             "typed marker emission must be adjacent to finalization/envelope handling before {forbidden}"
         );
     }
+
+    let completed = source_block_after(finalization_source(), "fn finalize_completed_attempt(");
+    let completed_signal_idx = completed
+        .find("apply_terminal_signal_outcome")
+        .expect("finalize_completed_attempt must consume typed terminal signals");
+    let legacy_diagnostics_idx = completed
+        .find("balanced_result_error_category")
+        .expect("finalize_completed_attempt must retain legacy diagnostics fallback");
+    assert!(
+        completed_signal_idx < legacy_diagnostics_idx,
+        "typed marker emission must precede legacy diagnostics fallback"
+    );
+}
+
+fn disposition_source() -> &'static str {
+    include_str!("../src/run/balancing/disposition.rs")
+}
+
+fn finalization_source() -> &'static str {
+    include_str!("../src/run/balancing/finalization.rs")
 }

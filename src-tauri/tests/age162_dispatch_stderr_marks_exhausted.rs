@@ -17,10 +17,10 @@
 //! ```
 //!
 //! The Phase 1 cycle 1 child traced the strongest candidate path to
-//! `src-tauri/src/balanced_cli.rs::balanced_result_error_category` →
+//! `src-tauri/src/run/balancing/diagnostics.rs::balanced_result_error_category` →
 //! `oulipoly_runtime::diagnostics::classify_exhaustion` and the typed
 //! Recognizer chain → `terminal_outcome_adapter::apply_terminal_signal_outcome`
-//! → `balanced_cli::mark_provider_exhausted` (which calls
+//! → typed terminal-signal quota handling (which calls
 //! `<StateDb as ProviderQuotaRepository>::mark_exhausted`).
 //!
 //! The bug locus is the over-broad keyword set in
@@ -197,7 +197,7 @@ fn provider_next_available_at_is_set(db: &StateDb, provider: &str) -> bool {
 /// via `executor/providers/claude.rs::contains_quota_token`, which produces
 /// `TerminalSignalKind::QuotaExhaustedInband`. The typed terminal-signal
 /// outcome flow in `terminal_outcome_adapter::apply_terminal_signal_outcome`
-/// then calls `balanced_cli::mark_provider_exhausted`.
+/// then calls typed terminal-signal quota handling.
 #[test]
 fn age162_transient_rate_limit_stderr_does_not_mark_exhausted_under_claude_recognizer() {
     let fixture = Fixture::new();
@@ -239,7 +239,7 @@ fn age162_transient_rate_limit_stderr_does_not_mark_exhausted_under_claude_recog
          Bug locus: executor/providers/claude.rs::contains_quota_token \
          conflates rate-limit signatures with quota-exhausted, then \
          terminal_outcome_adapter::apply_terminal_signal_outcome routes \
-         that into balanced_cli::mark_provider_exhausted."
+         that into typed terminal-signal quota handling."
     );
 }
 

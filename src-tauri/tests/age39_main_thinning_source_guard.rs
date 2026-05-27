@@ -2,12 +2,98 @@ fn main_source() -> &'static str {
     include_str!("../src/main.rs")
 }
 
+fn dispatch_source() -> &'static str {
+    include_str!("../src/dispatch.rs")
+}
+
+fn one_shot_helper_region_source() -> &'static str {
+    concat!(
+        include_str!("../src/run/balancing/orchestration.rs"),
+        "\n",
+        include_str!("../src/run/balancing/finalization.rs"),
+        "\n",
+        include_str!("../src/run/balancing/disposition.rs"),
+        "\n",
+        include_str!("../src/run/balancing/filter.rs"),
+        "\n",
+        include_str!("../src/run/balancing/accessor.rs"),
+        "\n",
+        include_str!("../src/run/balancing/mapper.rs"),
+        "\n",
+        include_str!("../src/run/balancing/parser.rs"),
+        "\n",
+        include_str!("../src/run/balancing/predicate.rs"),
+        "\n",
+        include_str!("../src/run/balancing/formatter.rs"),
+        "\n",
+        include_str!("../src/run/balancing/state_update.rs"),
+        "\n",
+        include_str!("../src/run/balancing/validator.rs"),
+    )
+}
+
+fn resume_helper_region_source() -> &'static str {
+    concat!(
+        include_str!("../src/run/resume/orchestration.rs"),
+        "\n",
+        include_str!("../src/run/resume/disposition.rs"),
+        "\n",
+        include_str!("../src/run/resume/finalization.rs"),
+        "\n",
+        include_str!("../src/run/resume/formatter.rs"),
+        "\n",
+        include_str!("../src/run/resume/mapper.rs"),
+    )
+}
+
+fn repl_helper_region_source() -> &'static str {
+    concat!(
+        include_str!("../src/run/repl/orchestration.rs"),
+        "\n",
+        include_str!("../src/run/repl/resolution.rs"),
+        "\n",
+        include_str!("../src/run/repl/disposition.rs"),
+        "\n",
+        include_str!("../src/run/repl/finalization.rs"),
+        "\n",
+        include_str!("../src/run/repl/formatter.rs"),
+        "\n",
+        include_str!("../src/run/repl/mapper.rs"),
+        "\n",
+        include_str!("../src/run/repl/validator.rs"),
+    )
+}
+
 fn lib_source() -> &'static str {
     include_str!("../src/lib.rs")
 }
 
 fn wiring_source() -> &'static str {
     include_str!("../src/wiring.rs")
+}
+
+fn invocation_finalize_source() -> &'static str {
+    include_str!("../src/invocation/finalize.rs")
+}
+
+fn session_ingest_cli_source() -> &'static str {
+    include_str!("../src/session_ingest_cli.rs")
+}
+
+fn diagnostics_source() -> &'static str {
+    concat!(
+        include_str!("../src/commands/diagnostics/orchestration.rs"),
+        "\n",
+        include_str!("../src/commands/diagnostics/service.rs"),
+        "\n",
+        include_str!("../src/commands/diagnostics/accessor.rs"),
+        "\n",
+        include_str!("../src/commands/diagnostics/mapper.rs"),
+        "\n",
+        include_str!("../src/commands/diagnostics/validator.rs"),
+        "\n",
+        include_str!("../src/commands/diagnostics/formatter.rs"),
+    )
 }
 
 fn source_slice<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
@@ -54,42 +140,42 @@ fn assert_order(haystack: &str, first: &str, second: &str, context: &str) {
 
 fn run_slice() -> &'static str {
     source_slice(
-        main_source(),
+        dispatch_source(),
         "fn run(cli: Cli)",
-        "fn run_session_schema_probe(",
+        "fn run_default_provider_repl(",
     )
 }
 
 fn ingest_slice() -> &'static str {
     source_slice(
-        main_source(),
+        session_ingest_cli_source(),
         "fn ingest_and_emit_session_id_resume_aware(",
         "fn emit_known_session_id(",
     )
 }
 
 fn repl_slice() -> &'static str {
-    source_slice(main_source(), "fn run_repl(", "fn run_resume(")
+    repl_helper_region_source()
 }
 
 fn resume_slice() -> &'static str {
-    source_slice(main_source(), "fn run_resume(", "fn run_with_balancing(")
+    resume_helper_region_source()
 }
 
 fn one_shot_slice() -> &'static str {
-    source_slice(
-        main_source(),
-        "fn run_with_balancing(",
-        "fn supervise_captured_child_invocations(",
-    )
+    one_shot_helper_region_source()
 }
 
 fn diagnostics_slice() -> &'static str {
-    source_slice(main_source(), "fn run_diagnostics(", "fn run_migrate_db(")
+    diagnostics_source()
 }
 
 fn entrypoint_slice() -> &'static str {
-    source_slice(main_source(), "fn main() -> ExitCode", "#[cfg(test)]")
+    let source = main_source();
+    let start_idx = source
+        .find("fn main() -> ExitCode")
+        .expect("missing main entrypoint");
+    &source[start_idx..]
 }
 
 #[test]
@@ -409,21 +495,26 @@ fn age_39_startup_recovery_runs_before_cli_service_graph_and_dispatch() {
 
     assert_order(
         &run,
-        "session_replace::recover_pending_replaces()",
+        "recover_pending_session_replaces()",
         "ifcli.new",
         "startup recovery must precede --new dispatch",
     );
     assert_order(
         &run,
-        "session_replace::recover_pending_replaces()",
+        "recover_pending_session_replaces()",
         "ifletSome(command)=cli.command.clone()",
         "startup recovery must precede subcommand dispatch",
     );
     assert_order(
         &run,
-        "session_replace::recover_pending_replaces()",
+        "recover_pending_session_replaces()",
         "AgentRuntimeServices::cli_defaults()",
         "startup recovery must precede CLI service graph construction",
+    );
+    assert_contains(
+        &compact(dispatch_source()),
+        "session_replace::recover_pending_replaces()",
+        "startup recovery helper must keep pending replace recovery",
     );
     assert_order(
         &run,
@@ -439,25 +530,36 @@ fn age_39_no_arg_tauri_launch_branch_remains_before_clap_parse() {
 
     assert_order(
         &entrypoint,
-        "ifstd::env::args().len()==1",
-        "Cli::parse_from(",
+        "ifshould_run_gui()",
+        "run_cli_entrypoint()",
         "no-arg Tauri launch branch must stay before clap parsing",
     );
     assert_order(
         &entrypoint,
-        "agent_runner_lib::run_tauri()",
-        "Cli::parse_from(",
-        "Tauri launch must remain outside the argv-bearing CLI parser path",
+        "run_gui_entrypoint()",
+        "run_cli_entrypoint()",
+        "Tauri launch branch must remain outside the argv-bearing CLI parser path",
     );
+    assert_contains(
+        &entrypoint,
+        "arg_count(cli_args())==1",
+        "no-arg Tauri launch predicate",
+    );
+    assert_contains(
+        &entrypoint,
+        "agent_runner_lib::run_tauri()",
+        "Tauri launch helper",
+    );
+    assert_contains(&entrypoint, "Cli::parse_from(", "CLI parser helper");
 }
 
 #[test]
 fn age_39_no_port_residuals_remain_direct_and_explicit() {
-    let source = compact(main_source());
+    let session_ingest_cli = compact(session_ingest_cli_source());
     let finalizer_drop = source_slice(
-        main_source(),
+        invocation_finalize_source(),
         "impl Drop for FinalizerGuard",
-        "fn should_emit_invocation_line(",
+        "fn finalize_invocation_from_guard(",
     );
     let one_shot = compact(one_shot_slice());
 
@@ -467,7 +569,7 @@ fn age_39_no_port_residuals_remain_direct_and_explicit() {
         "FinalizerGuard::drop remains direct residual",
     );
     assert_contains(
-        &source,
+        &session_ingest_cli,
         "fnemit_known_session_id(",
         "known-session fallback helper remains direct residual",
     );

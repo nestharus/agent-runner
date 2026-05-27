@@ -1,5 +1,37 @@
 fn main_source() -> &'static str {
-    include_str!("../src/main.rs")
+    concat!(
+        include_str!("../src/main.rs"),
+        "\n",
+        include_str!("../src/dispatch.rs"),
+        "\n",
+        include_str!("../src/run/mod.rs"),
+        "\n",
+        include_str!("../src/run/balancing/mod.rs"),
+        "\n",
+        include_str!("../src/run/balancing/orchestration.rs"),
+        "\n",
+        include_str!("../src/run/balancing/accessor.rs"),
+        "\n",
+        include_str!("../src/run/balancing/mapper.rs"),
+        "\n",
+        include_str!("../src/run/balancing/parser.rs"),
+        "\n",
+        include_str!("../src/run/balancing/disposition.rs"),
+        "\n",
+        include_str!("../src/run/balancing/filter.rs"),
+        "\n",
+        include_str!("../src/run/balancing/finalization.rs"),
+        "\n",
+        include_str!("../src/run/balancing/formatter.rs"),
+        "\n",
+        include_str!("../src/run/balancing/diagnostics.rs"),
+        "\n",
+        include_str!("../src/run/balancing/predicate.rs"),
+        "\n",
+        include_str!("../src/run/balancing/state_update.rs"),
+        "\n",
+        include_str!("../src/run/balancing/validator.rs"),
+    )
 }
 
 fn compact(source: &str) -> String {
