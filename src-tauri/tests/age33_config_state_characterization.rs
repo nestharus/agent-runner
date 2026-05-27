@@ -18,6 +18,26 @@ const CHAIN_A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const MODEL: &str = "claude-opus";
 const TRACE_UUID: &str = "11111111-1111-1111-1111-111111111111";
 
+fn diagnostics_source() -> &'static str {
+    concat!(
+        include_str!("../src/commands/diagnostics/orchestration.rs"),
+        "\n",
+        include_str!("../src/commands/diagnostics/service.rs"),
+        "\n",
+        include_str!("../src/commands/diagnostics/accessor.rs"),
+        "\n",
+        include_str!("../src/commands/diagnostics/mapper.rs"),
+        "\n",
+        include_str!("../src/commands/diagnostics/validator.rs"),
+        "\n",
+        include_str!("../src/commands/diagnostics/formatter.rs"),
+    )
+}
+
+fn balancing_accessor_source() -> &'static str {
+    include_str!("../src/run/balancing/accessor.rs")
+}
+
 struct CliFixture {
     _dir: tempfile::TempDir,
     config_home: PathBuf,
@@ -291,6 +311,35 @@ fn source_slice<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     &source[start_idx..end_idx]
 }
 
+fn source_function_after<'a>(source: &'a str, start: &str) -> &'a str {
+    let start_idx = source
+        .find(start)
+        .unwrap_or_else(|| panic!("missing {start}"));
+    let open_idx = source[start_idx..]
+        .find('{')
+        .map(|idx| start_idx + idx)
+        .unwrap_or_else(|| panic!("missing opening brace after {start}"));
+    let mut depth = 1usize;
+    let mut idx = open_idx + 1;
+    let bytes = source.as_bytes();
+
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &source[start_idx..=idx];
+                }
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+
+    panic!("missing closing brace after {start}");
+}
+
 #[test]
 fn age_33_one_shot_loads_models_with_provider_aware_codex_overlap_validation() {
     let fixture = CliFixture::new();
@@ -436,8 +485,12 @@ fn age_33_resolve_agent_uses_default_agents_dir_and_maps_missing_agent_to_unknow
 
 #[test]
 fn age_33_resolve_agent_cutover_uses_repository_for_both_loader_paths() {
-    let source = include_str!("../src/main.rs");
-    let resolve_agent = source_slice(source, "fn resolve_agent(", "struct FinalizerGuard");
+    let source = include_str!("../src/agent_resolution.rs");
+    let resolve_agent = source_slice(
+        source,
+        "fn resolve_agent(",
+        "fn format_unknown_agent_error(",
+    );
 
     assert!(
         resolve_agent.contains("agent_config: &dyn AgentConfigRepository"),
@@ -466,31 +519,43 @@ fn age_33_resolve_agent_cutover_uses_repository_for_both_loader_paths() {
 
 #[test]
 fn age_33_deferred_one_shot_agent_file_site_remains_direct_loader_call() {
-    let source = include_str!("../src/main.rs");
-    let run = source_slice(source, "fn run(cli: Cli)", "fn resolve_agent(");
+    let dispatch_source = include_str!("../src/dispatch.rs");
+    let run = source_slice(
+        dispatch_source,
+        "fn run(cli: Cli)",
+        "fn run_default_provider_repl(",
+    );
+    let direct_model_source = include_str!("../src/commands/direct_model.rs");
+    let direct_model_prompt = source_slice(
+        direct_model_source,
+        "fn direct_model_prompt(",
+        "fn format_direct_model_agent_prompt(",
+    );
 
     assert!(
         run.contains("if let Some(ref model_name) = cli.model"),
         "direct one-shot model branch must remain in run"
     );
     assert!(
-        run.contains("if let Some(ref agent_path) = cli.agent_file"),
-        "direct one-shot agent-file branch must remain nested under model execution"
+        direct_model_prompt.contains("if let Some(ref agent_path) = cli.agent_file"),
+        "direct one-shot agent-file branch must remain in direct_model_prompt"
     );
     assert!(
-        run.contains("load_agent_file(agent_path)?"),
+        direct_model_prompt.contains("load_agent_file(agent_path)?"),
         "deferred site #1 must keep the direct load_agent_file call"
     );
     assert!(
-        !run.contains("agent_config.load_agent_file(agent_path)"),
+        !direct_model_prompt.contains("agent_config.load_agent_file(agent_path)"),
         "deferred site #1 must not be cut over by AGE-33"
     );
 }
 
 #[test]
 fn age_33_run_with_balancing_opens_state_via_opener_before_config_loads() {
-    let source = include_str!("../src/main.rs");
-    let run_with_balancing = source_slice(source, "fn run_with_balancing(", "fn run_diagnostics(");
+    let run_with_balancing = source_function_after(
+        balancing_accessor_source(),
+        "fn load_balanced_execution_environment(",
+    );
 
     assert!(
         run_with_balancing.contains("state_db_opener: &dyn StateDbOpener"),
@@ -522,9 +587,11 @@ fn age_33_run_with_balancing_opens_state_via_opener_before_config_loads() {
 
 #[test]
 fn age_33_diagnostics_and_balancing_config_fallbacks_remain_direct() {
-    let source = include_str!("../src/main.rs");
-    let run_with_balancing = source_slice(source, "fn run_with_balancing(", "fn run_diagnostics(");
-    let run_diagnostics = source_slice(source, "fn run_diagnostics(", "fn run_migrate_db(");
+    let run_with_balancing = source_function_after(
+        balancing_accessor_source(),
+        "fn load_balanced_execution_environment(",
+    );
+    let run_diagnostics = diagnostics_source();
 
     assert!(
         run_with_balancing.contains("ProvidersConfig::load(&providers_path).unwrap_or_default()")

@@ -359,6 +359,40 @@ Use terse prose.
     );
 }
 
+// Characterization test for AGE-194 — pins current behavior of named-agent execution
+// when the named agent's `model:` references a model not present in `--models-dir`.
+#[test]
+fn named_agent_with_unknown_model_emits_unknown_model_referenced_by_agent_stderr() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.agents_dir.join("writer.md"),
+        r#"---
+description: Test writer
+model: missing-model
+output_format: text
+---
+"#,
+    )
+    .unwrap();
+
+    let mut cmd = fixture.command();
+    cmd.arg("--models-dir")
+        .arg(&fixture.models_dir)
+        .arg("--agents-dir")
+        .arg(&fixture.agents_dir)
+        .arg("writer")
+        .arg("hello");
+
+    let output = cmd.output().unwrap();
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("Unknown model 'missing-model' referenced by agent 'writer'"),
+        "expected named-agent unknown-model stderr; got: {stderr}"
+    );
+}
+
 // Characterization test for AGE-8 — pins current behavior of --agent-file execution through run.
 #[test]
 fn agent_file_execution_uses_prompt_args_after_the_first_positional_slot() {

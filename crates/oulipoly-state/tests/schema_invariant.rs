@@ -109,7 +109,7 @@ fn declaration_carriers_present_in_source() {
             ][..],
         ),
         (
-            "src-tauri/src/main.rs",
+            "src-tauri/src/dispatch.rs",
             &[
                 "orchestration",
                 "parser",
@@ -175,7 +175,7 @@ fn declaration_carriers_present_in_source() {
 
     for (file_path, snippets) in [
         (
-            "src-tauri/src/main.rs",
+            "src-tauri/src/dispatch.rs",
             &[
                 "## Intrinsic-surface declarations",
                 "Domain: cli_lifecycle_orchestration",

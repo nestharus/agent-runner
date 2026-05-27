@@ -4,7 +4,7 @@
 
 - `crates/oulipoly-state/src/result_envelope.rs`
 - `crates/oulipoly-state/src/db.rs`
-- `src-tauri/src/main.rs`
+- `src-tauri/src/dispatch.rs`
 
 ## Preconditions
 
@@ -90,7 +90,7 @@ and strict recognizer compatibility.
 
 ## Cross-references
 
-- Deliberate union: `src-tauri/src/main.rs` is broadly owned by
+- Deliberate union: `src-tauri/src/dispatch.rs` is broadly owned by
   `planning/coverage/spec-tauri-client.md`; this spec owns only the
   AGE-175 result marker, failure identity, pre-invocation failure, and
   unknown-diagnostic behavior implemented there.

@@ -4,6 +4,7 @@
 
 - `src-tauri/src/lib.rs`
 - `src-tauri/src/main.rs`
+- `src-tauri/src/dispatch.rs`
 - `src-tauri/src/wiring.rs`
 - `src-tauri/src/balanced_cli.rs`
 - `src-tauri/src/cli_inputs.rs`
@@ -11,11 +12,16 @@
 - `src-tauri/src/repl_cli.rs`
 - `src-tauri/src/resume_acceptance_adapter.rs`
 - `src-tauri/src/resume_cli.rs`
-- `src-tauri/src/session_import_replace_cli.rs`
+- `src-tauri/src/commands/resume_list/mod.rs`
+- `src-tauri/src/commands/resume_list/orchestration.rs`
+- `src-tauri/src/commands/resume_list/validator.rs`
+- `src-tauri/src/commands/resume_list/formatter.rs`
+- `src-tauri/src/commands/resume_list/parser.rs`
+- `src-tauri/src/commands/session_import_replace/`
 - `src-tauri/src/session_ingest_cli.rs`
 - `src-tauri/src/session_metadata_cli.rs`
 - `src-tauri/src/terminal_outcome_adapter.rs`
-- `src-tauri/src/trace_cli.rs`
+- `src-tauri/src/commands/trace/`
 - `src-tauri/src/main/owned_turn_event_ingest.rs`
 - `src-tauri/src/setup/flow.rs`
 - `src-tauri/src/setup/mod.rs`
@@ -32,14 +38,16 @@
 | Input situation | Expected output |
 |-----------------|-----------------|
 | `main.rs` invoked with no args. | Launch the Tauri GUI. |
-| `main.rs` invoked with a sub-CLI (`balanced`, `repl`, `resume`, etc.). | Dispatch to the matching `*_cli.rs` driver via `cli_inputs.rs`. |
+| `main.rs` invoked with a sub-CLI (`balanced`, `repl`, `resume`, etc.). | Parse argv and delegate to `dispatch.rs`, which routes to the matching command driver. |
 | `balanced_cli.rs` invoked with a prompt. | Route via balancer + executor; return result; emit trace/diagnostics. |
 | `repl_cli.rs` invoked. | Open an interactive session per `repl_default_provider.rs`'s resolution. |
 | `resume_cli.rs` invoked with a session id. | Resolve via session_lifecycle, attach to existing session, continue. |
+| `resume --list <UUID>` legacy syntax, or hidden `resume-list <UUID>`, invoked. | `main.rs` normalizes legacy argv via `normalize_resume_list_args`; `dispatch.rs` routes to `run_resume_list`, which validates the UUID, reads `StateDb::open_default().resume_previews(uuid)`, and prints one `chain_id=... last_used_at=... active_provider=... active_session_id=... turn_count=... recent_turns_count=...` line per chain. |
+| `resume --list <UUID>` / `resume-list <UUID>` invoked with no matching chains. | Print `No chains found for {uuid}` and exit successfully. |
 | `session_ingest_cli.rs` invoked. | Import an externally-produced session transcript into the local state DB. |
-| `session_import_replace_cli.rs` invoked. | Replace an existing local session with an imported payload. |
+| `commands/session_import_replace/` invoked. | Replace an existing local session with an imported payload. |
 | `session_metadata_cli.rs` invoked. | Read or update metadata for a known session. |
-| `trace_cli.rs` invoked. | Surface the diagnostics/trace history for an invocation. |
+| `commands/trace/` invoked. | Surface the diagnostics/trace history for an invocation. |
 | `config_migration_cli.rs` invoked. | Migrate config schema forward. |
 | Setup flow invoked (`setup/flow.rs`). | Drive the wizard from `oulipoly-setup`; persist results via `oulipoly-config`. |
 | Tauri owned-turn event arrives. | `main/owned_turn_event_ingest.rs` parses and persists per `oulipoly-state` schema. |
@@ -54,6 +62,8 @@
 - Resume acceptance adapter sees a session in `mutability: read-only` —
   refuses gracefully (delegates to `oulipoly-runtime/session_metadata/
   mutability.rs`).
+- Resume-list UUID validation fails — return `invalid session UUID: ...`
+  before opening the state DB.
 
 ## Error conditions
 
@@ -62,6 +72,7 @@
   graph (typically an internal-config mismatch; programmer error).
 - `TauriBootFailed` — GUI surface could not initialize.
 - `AdapterError` — a typed `*_adapter.rs` translation failure.
+- Resume-list loading failure — return `Failed to list resume chains: {e}`.
 
 ## Boundaries
 
@@ -73,6 +84,8 @@
   runtime call goes through `services/` wired by `wiring.rs`.
 - Tauri client does NOT mutate config files directly — it goes through
   `oulipoly-config`.
+- Resume-list is read-only over the state DB; it lists chain previews
+  without mutating session or chain state.
 
 ## Declared test patterns
 
@@ -87,6 +100,15 @@ wiring smoke tests, adapter contract tests, workspace-layout invariants.
 - `src-tauri/tests/age151_source_guard.rs`
 - `src-tauri/tests/age154_test_model_disposition.rs`
 - `src-tauri/tests/age8_cli_characterization.rs`
+- `src-tauri/src/commands/resume_list/tests.rs`
+  (`resume_list_user_syntax_rewrites_to_hidden_subcommand`,
+  `resume_list_line_includes_required_chain_fields`)
+- `src-tauri/tests/age134_main_session_and_migrate.rs`
+  (`age134_resume_list_empty_outputs_no_chains_for_user_and_hidden_syntax`)
+- `src-tauri/tests/age_32_state_db_migrations.rs` (`resume-list` /
+  `resume --list` against state fixtures)
+- `src-tauri/tests/initiative_05_migration.rs` (populated and
+  malformed-UUID resume-list paths)
 - `src-tauri/tests/initiative_07_canonical_reader_unification.rs`
 - `src-tauri/tests/nes_259_returned_artifacts_integration.rs`
 - `src-tauri/tests/pr_a_invocation_integration.rs`

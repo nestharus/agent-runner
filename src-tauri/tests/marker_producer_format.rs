@@ -15,7 +15,65 @@ fn marker(source: &str, id: Uuid) -> CompositeInvocationId {
 }
 
 fn main_rs_source() -> &'static str {
-    include_str!("../src/main.rs")
+    concat!(
+        include_str!("../src/main.rs"),
+        "\n",
+        include_str!("../src/dispatch.rs"),
+        "\n",
+        include_str!("../src/run/mod.rs"),
+        "\n",
+        include_str!("../src/run/balancing/mod.rs"),
+        "\n",
+        include_str!("../src/run/balancing/orchestration.rs"),
+        "\n",
+        include_str!("../src/run/balancing/accessor.rs"),
+        "\n",
+        include_str!("../src/run/balancing/mapper.rs"),
+        "\n",
+        include_str!("../src/run/balancing/parser.rs"),
+        "\n",
+        include_str!("../src/run/balancing/disposition.rs"),
+        "\n",
+        include_str!("../src/run/balancing/filter.rs"),
+        "\n",
+        include_str!("../src/run/balancing/finalization.rs"),
+        "\n",
+        include_str!("../src/run/balancing/formatter.rs"),
+        "\n",
+        include_str!("../src/run/balancing/diagnostics.rs"),
+        "\n",
+        include_str!("../src/run/balancing/predicate.rs"),
+        "\n",
+        include_str!("../src/run/balancing/state_update.rs"),
+        "\n",
+        include_str!("../src/run/balancing/validator.rs"),
+        "\n",
+        include_str!("../src/run/repl/mod.rs"),
+        "\n",
+        include_str!("../src/run/repl/orchestration.rs"),
+        "\n",
+        include_str!("../src/run/repl/disposition.rs"),
+        "\n",
+        include_str!("../src/run/repl/finalization.rs"),
+        "\n",
+        include_str!("../src/run/repl/formatter.rs"),
+        "\n",
+        include_str!("../src/run/repl/mapper.rs"),
+        "\n",
+        include_str!("../src/run/repl/validator.rs"),
+        "\n",
+        include_str!("../src/run/resume/mod.rs"),
+        "\n",
+        include_str!("../src/run/resume/orchestration.rs"),
+        "\n",
+        include_str!("../src/run/resume/disposition.rs"),
+        "\n",
+        include_str!("../src/run/resume/finalization.rs"),
+        "\n",
+        include_str!("../src/run/resume/formatter.rs"),
+        "\n",
+        include_str!("../src/run/resume/mapper.rs"),
+    )
 }
 
 /// AGE-160 risk: PP-004 + A4 canonical producer-only marker grammar.
@@ -63,7 +121,9 @@ fn age160_parent_env_marker_format_matches_grammar() {
         "Tauri parent-env propagation must continue to own OULIPOLY_PARENT_INVOCATION"
     );
     assert!(
-        source.matches("serde_json::to_string(&invocation)").count() >= 3,
+        source.matches("serde_json::to_string(invocation)").count()
+            + source.matches("serde_json::to_string(&invocation)").count()
+            >= 3,
         "run/repl/resume/balanced parent env propagation must use raw compact JSON without the stderr prefix"
     );
 }

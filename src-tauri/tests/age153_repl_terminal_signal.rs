@@ -48,7 +48,7 @@ fn repl_clean_interactive_signal_finalizes_success_without_marker() {
         1
     );
     assert_signal_consumer_source_wired(
-        "fn run_repl(",
+        "fn handle_terminal_signal_disposition(",
         &[
             "TerminalSignalDisposition::InteractiveClean",
             "TerminalSignalKind::CleanExit",
