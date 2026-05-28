@@ -1,4 +1,26 @@
 //! Declared roles: orchestration, accessor, mapper, formatter, parser
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: src-tauri/src/commands/direct_model.rs
+//!     role: intrinsic-surface
+//!     Domain: direct_model_cli_dispatch
+//!     Owns:
+//!       - CLI execution context loading from provider/model config and CLI inputs
+//!       - direct model lookup and balancing dispatch entry point
+//!       - direct model pre-invocation failure emission for context and model lookup failures
+//!       - direct prompt construction from plain prompt input and --agent-file formatting
+//!   - component: src-tauri/src/commands/direct_model.rs
+//!     role: intrinsic-surface
+//!     Domain: named_agent_cli_dispatch
+//!     Owns:
+//!       - named-agent config resolution
+//!       - named-agent model lookup
+//!       - named-agent prompt construction with typed CLI inputs
+//!       - named-agent balancing dispatch helper path
+//! ```
 
 use crate::usage::cli::Cli;
 use crate::wiring;
