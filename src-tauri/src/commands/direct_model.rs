@@ -10,7 +10,7 @@
 //!     Owns:
 //!       - CLI execution context loading from provider/model config and CLI inputs
 //!       - direct model lookup and balancing dispatch entry point
-//!       - direct model pre-invocation failure emission for context and model lookup failures
+//!       - direct model pre-invocation failure emission for context, model lookup, and prompt resolution failures
 //!       - direct prompt construction from plain prompt input and --agent-file formatting
 //!   - component: src-tauri/src/commands/direct_model.rs
 //!     role: intrinsic-surface
@@ -119,7 +119,9 @@ pub(crate) fn run_direct_model_cli(
 ) -> Result<i32, String> {
     let context = load_direct_model_context(cli, model_name)?;
     let model = load_direct_model(&context, model_name)?;
-    let prompt = direct_model_prompt(cli)?;
+    let prompt = direct_model_prompt(cli).inspect_err(|err| {
+        emit_direct_model_prompt_resolution_failure(model, err);
+    })?;
     dispatch_direct_model_balancing(agent_runtime_services, &context, model, &prompt)
 }
 
@@ -145,6 +147,16 @@ fn emit_direct_model_pre_invocation_failure(model_name: &str, err: &str) {
         None,
         Vec::new(),
         Some(err),
+    );
+}
+
+fn emit_direct_model_prompt_resolution_failure(model: &ModelConfig, reason: &str) {
+    crate::dispatch::emit_pre_invocation_failure(
+        "prompt_resolution",
+        Some(&model.name),
+        None,
+        Vec::new(),
+        Some(reason),
     );
 }
 
