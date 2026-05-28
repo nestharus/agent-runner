@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "setup.schema.json",
+  "title": "Oulipoly Provider Setup Contract",
+  "type": "object",
+  "$defs": {
+    "SetupObject": { "type": "object", "additionalProperties": true },
+    "SetupDetectRequest": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/RequestEnvelope" },
+        { "type": "object", "properties": { "params": { "$ref": "#/$defs/SetupObject" } } }
+      ]
+    },
+    "SetupDetectResult": {
+      "type": "object",
+      "properties": {
+        "installed": { "type": "boolean" },
+        "binary": { "type": "object", "additionalProperties": true },
+        "auth": { "type": "string" },
+        "profiles": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+        "warnings": { "type": "array", "items": true }
+      },
+      "required": ["installed", "warnings"],
+      "additionalProperties": false
+    },
+    "SetupDetectResponse": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/SuccessResponseEnvelope" },
+        { "type": "object", "properties": { "result": { "$ref": "#/$defs/SetupDetectResult" } } }
+      ]
+    },
+    "SetupDetectErrorResponse": { "$ref": "common.schema.json#/$defs/ErrorResponseEnvelope" },
+    "SetupInstallPlanRequest": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/RequestEnvelope" },
+        { "type": "object", "properties": { "params": { "$ref": "#/$defs/SetupObject" } } }
+      ]
+    },
+    "SetupInstallPlanResult": {
+      "type": "object",
+      "properties": {
+        "steps": { "type": "array", "items": { "type": "object", "additionalProperties": true } }
+      },
+      "required": ["steps"],
+      "additionalProperties": false
+    },
+    "SetupInstallPlanResponse": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/SuccessResponseEnvelope" },
+        { "type": "object", "properties": { "result": { "$ref": "#/$defs/SetupInstallPlanResult" } } }
+      ]
+    },
+    "SetupInstallPlanErrorResponse": { "$ref": "common.schema.json#/$defs/ErrorResponseEnvelope" },
+    "SetupSyncPlanRequest": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/RequestEnvelope" },
+        { "type": "object", "properties": { "params": { "$ref": "#/$defs/SetupObject" } } }
+      ]
+    },
+    "SetupSyncPlanResult": {
+      "type": "object",
+      "properties": {
+        "operations": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+        "diagnostics": { "type": "array", "items": { "$ref": "common.schema.json#/$defs/Diagnostic" } }
+      },
+      "required": ["operations", "diagnostics"],
+      "additionalProperties": false
+    },
+    "SetupSyncPlanResponse": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/SuccessResponseEnvelope" },
+        { "type": "object", "properties": { "result": { "$ref": "#/$defs/SetupSyncPlanResult" } } }
+      ]
+    },
+    "SetupSyncPlanErrorResponse": { "$ref": "common.schema.json#/$defs/ErrorResponseEnvelope" },
+    "SetupBrainTurnRequest": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/RequestEnvelope" },
+        { "type": "object", "properties": { "params": { "$ref": "#/$defs/SetupObject" } } }
+      ]
+    },
+    "SetupBrainTurnResult": {
+      "type": "object",
+      "properties": {
+        "conversation_id": { "type": "string" },
+        "message": { "type": "object", "additionalProperties": true },
+        "markers": { "type": "array", "items": { "$ref": "common.schema.json#/$defs/Marker" } }
+      },
+      "required": ["conversation_id", "message", "markers"],
+      "additionalProperties": false
+    },
+    "SetupBrainTurnResponse": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/SuccessResponseEnvelope" },
+        { "type": "object", "properties": { "result": { "$ref": "#/$defs/SetupBrainTurnResult" } } }
+      ]
+    },
+    "SetupBrainTurnErrorResponse": { "$ref": "common.schema.json#/$defs/ErrorResponseEnvelope" }
+  }
+}

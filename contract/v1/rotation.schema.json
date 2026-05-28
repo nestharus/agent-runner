@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "rotation.schema.json",
+  "title": "Oulipoly Provider Rotation Contract",
+  "type": "object",
+  "$defs": {
+    "RotationObject": { "type": "object", "additionalProperties": true },
+    "RotationAssessParams": { "$ref": "#/$defs/RotationObject" },
+    "RotationAssessRequest": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/RequestEnvelope" },
+        { "type": "object", "properties": { "params": { "$ref": "#/$defs/RotationAssessParams" } } }
+      ]
+    },
+    "RotationAssessResult": {
+      "type": "object",
+      "properties": {
+        "allowed": { "type": "boolean" },
+        "score": { "type": "integer", "minimum": 0 },
+        "reason": { "type": "string" },
+        "requirements": { "type": "array", "items": true }
+      },
+      "required": ["allowed", "requirements"],
+      "additionalProperties": false
+    },
+    "RotationAssessResponse": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/SuccessResponseEnvelope" },
+        { "type": "object", "properties": { "result": { "$ref": "#/$defs/RotationAssessResult" } } }
+      ]
+    },
+    "RotationAssessErrorResponse": { "$ref": "common.schema.json#/$defs/ErrorResponseEnvelope" },
+    "RotationMaterializeParams": { "$ref": "#/$defs/RotationObject" },
+    "RotationMaterializeRequest": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/RequestEnvelope" },
+        { "type": "object", "properties": { "params": { "$ref": "#/$defs/RotationMaterializeParams" } } }
+      ]
+    },
+    "RotationMaterializeResult": {
+      "type": "object",
+      "properties": {
+        "changed": { "type": "boolean" },
+        "target_provider_session_id": { "type": "string" },
+        "artifacts": {
+          "type": "array",
+          "items": { "$ref": "common.schema.json#/$defs/Artifact" }
+        },
+        "host_state_plan": { "type": "object", "additionalProperties": true }
+      },
+      "required": ["changed", "artifacts", "host_state_plan"],
+      "additionalProperties": false
+    },
+    "RotationMaterializeResponse": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/SuccessResponseEnvelope" },
+        { "type": "object", "properties": { "result": { "$ref": "#/$defs/RotationMaterializeResult" } } }
+      ]
+    },
+    "RotationMaterializeErrorResponse": { "$ref": "common.schema.json#/$defs/ErrorResponseEnvelope" }
+  }
+}

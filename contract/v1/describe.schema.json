@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "describe.schema.json",
+  "title": "Oulipoly Provider Describe Contract",
+  "type": "object",
+  "$defs": {
+    "DescribeParams": {
+      "type": "object",
+      "additionalProperties": false
+    },
+    "DescribeRequest": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/RequestEnvelope" },
+        {
+          "type": "object",
+          "properties": {
+            "params": { "$ref": "#/$defs/DescribeParams" }
+          }
+        }
+      ]
+    },
+    "Capabilities": {
+      "type": "object",
+      "properties": {
+        "launch": { "type": "boolean" },
+        "policy": { "type": "boolean" },
+        "quota": { "type": "boolean" },
+        "session": { "type": "boolean" },
+        "terminal": { "type": "boolean" },
+        "rotation": { "type": "boolean" },
+        "discovery": { "type": "boolean" },
+        "settings": { "type": "boolean" },
+        "setup_brain": { "type": "boolean" },
+        "setup": { "type": "boolean" },
+        "migration": { "type": "boolean" }
+      },
+      "required": [
+        "launch",
+        "policy",
+        "quota",
+        "session",
+        "terminal",
+        "rotation",
+        "discovery",
+        "settings",
+        "setup_brain",
+        "setup",
+        "migration"
+      ],
+      "additionalProperties": false
+    },
+    "DescribeResult": {
+      "type": "object",
+      "properties": {
+        "provider_id": { "type": "string", "minLength": 1 },
+        "display_name": { "type": "string", "minLength": 1 },
+        "contract_versions": {
+          "type": "array",
+          "items": { "$ref": "common.schema.json#/$defs/ContractVersion" },
+          "minItems": 1
+        },
+        "preferred_contract": { "$ref": "common.schema.json#/$defs/ContractVersion" },
+        "capabilities": { "$ref": "#/$defs/Capabilities" },
+        "settings_schema_id": { "type": "string" },
+        "concurrency": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "provider_id",
+        "display_name",
+        "contract_versions",
+        "preferred_contract",
+        "capabilities"
+      ],
+      "additionalProperties": false
+    },
+    "DescribeResponse": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/SuccessResponseEnvelope" },
+        {
+          "type": "object",
+          "properties": {
+            "result": { "$ref": "#/$defs/DescribeResult" }
+          }
+        }
+      ]
+    },
+    "DescribeErrorResponse": {
+      "$ref": "common.schema.json#/$defs/ErrorResponseEnvelope"
+    }
+  }
+}
