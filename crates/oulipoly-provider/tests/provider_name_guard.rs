@@ -45,13 +45,13 @@ fn provider_name_grep_baseline_does_not_increase() {
 
     let numbered = String::from_utf8(output.stdout).expect("rg output must be UTF-8");
     let current_lines = numbered.lines().count();
-    let s2_matches = numbered
+    let owned_matches = numbered
         .lines()
-        .filter(|line| is_s2_owned_match(line))
+        .filter(|line| is_owned_match(line))
         .collect::<Vec<_>>();
     assert!(
-        current_lines <= BASELINE_LINES || s2_matches.is_empty(),
-        "provider-name grep line count increased from {BASELINE_LINES} to {current_lines}; S2-owned matches: {s2_matches:#?}"
+        current_lines <= BASELINE_LINES || owned_matches.is_empty(),
+        "provider-name grep line count increased from {BASELINE_LINES} to {current_lines}; owned matches: {owned_matches:#?}"
     );
 
     let nonumber = numbered
@@ -69,8 +69,8 @@ fn provider_name_grep_baseline_does_not_increase() {
 }
 
 #[test]
-fn s2_owned_files_use_only_neutral_provider_vocabulary() {
-    let files = s2_owned_files();
+fn owned_provider_contract_files_use_only_neutral_provider_vocabulary() {
+    let files = owned_files();
     let denylist = [
         real_provider_token(&["cla", "ude"]),
         real_provider_token(&["cod", "ex"]),
@@ -95,11 +95,11 @@ fn s2_owned_files_use_only_neutral_provider_vocabulary() {
 
     assert!(
         violations.is_empty(),
-        "S2-owned files must use neutral examples only: {violations:#?}"
+        "owned provider contract files must use neutral examples only: {violations:#?}"
     );
 }
 
-fn s2_owned_files() -> Vec<PathBuf> {
+fn owned_files() -> Vec<PathBuf> {
     let root = repo_root();
     let provider = root.join("crates/oulipoly-provider");
     let mut files = Vec::new();
@@ -127,6 +127,7 @@ fn s2_owned_files() -> Vec<PathBuf> {
     files.push(fixture_path());
 
     collect_rs_files(&provider.join("tests"), &mut files);
+    collect_non_rs_files(&provider.join("tests/fixtures/provider_client"), &mut files);
 
     files
 }
@@ -142,11 +143,25 @@ fn collect_rs_files(dir: &std::path::Path, files: &mut Vec<PathBuf>) {
     }
 }
 
+fn collect_non_rs_files(dir: &std::path::Path, files: &mut Vec<PathBuf>) {
+    if !dir.exists() {
+        return;
+    }
+    for entry in fs::read_dir(dir).unwrap_or_else(|err| panic!("failed reading {dir:?}: {err}")) {
+        let path = entry.expect("test fixture entry").path();
+        if path.is_dir() {
+            collect_non_rs_files(&path, files);
+        } else if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+            files.push(path);
+        }
+    }
+}
+
 fn real_provider_token(parts: &[&str]) -> String {
     parts.concat()
 }
 
-fn is_s2_owned_match(line: &str) -> bool {
+fn is_owned_match(line: &str) -> bool {
     let line = line.strip_prefix("./").unwrap_or(line);
     let Some(first_colon) = line.find(':') else {
         return false;
@@ -155,6 +170,12 @@ fn is_s2_owned_match(line: &str) -> bool {
     path.starts_with("contract/v1/")
         || path == "crates/oulipoly-provider/src/generated.rs"
         || path == "crates/oulipoly-provider/src/schemas.rs"
+        || path == "crates/oulipoly-provider/src/client.rs"
+        || path == "crates/oulipoly-provider/src/resolver.rs"
+        || path == "crates/oulipoly-provider/src/stream.rs"
+        || path == "crates/oulipoly-provider/src/error.rs"
+        || path == "crates/oulipoly-provider/src/process.rs"
+        || path == "crates/oulipoly-provider/src/testkit.rs"
         || path.starts_with("crates/oulipoly-provider/tests/")
 }
 

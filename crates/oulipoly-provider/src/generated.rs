@@ -169,6 +169,12 @@ pub enum ProcessStatus {
     Unknown,
 }
 
+impl ProcessStatus {
+    pub fn exited_successfully(&self) -> bool {
+        matches!(self, Self::Exited { code: 0 })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminalSignalKind {
@@ -182,6 +188,23 @@ pub enum TerminalSignalKind {
     ProlongedSilence,
     Cancelled,
     Unknown,
+}
+
+impl TerminalSignalKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::CleanExit => "clean_exit",
+            Self::NonzeroExit => "nonzero_exit",
+            Self::SignalExit => "signal_exit",
+            Self::SpawnError => "spawn_error",
+            Self::QuotaExhaustedInband => "quota_exhausted_inband",
+            Self::MaybeQuotaExhausted => "maybe_quota_exhausted",
+            Self::RateLimited => "rate_limited",
+            Self::ProlongedSilence => "prolonged_silence",
+            Self::Cancelled => "cancelled",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

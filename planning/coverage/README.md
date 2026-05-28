@@ -35,6 +35,7 @@ sections. The auditor returns the spec(s) that match.
 | `spec-agent-channels.md` | Sub-agent IPC (store + scratchpad + messenger). |
 | `spec-tauri-client.md` | Top-level Tauri client wiring + CLIs. |
 | `spec-result-envelope.md` | Result markers, failure identity, pre-invocation failures. |
+| `spec-provider-client.md` | Provider artifact client, resolver, process substrate, launch stream. |
 
 ## Spec schema
 
