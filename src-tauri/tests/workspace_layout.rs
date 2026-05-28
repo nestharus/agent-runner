@@ -21,6 +21,7 @@ const LIB_CRATES: &[&str] = &[
     "oulipoly-config",
     "oulipoly-state",
     "oulipoly-runtime",
+    "oulipoly-provider",
     "oulipoly-setup",
 ];
 
@@ -36,7 +37,6 @@ const EXPECTED_EDGES: &[(&str, &str)] = &[
     ("oulipoly-runtime", "oulipoly-config"),
     ("oulipoly-runtime", "oulipoly-core"),
     ("oulipoly-runtime", "oulipoly-provider"),
-    ("oulipoly-provider", "oulipoly-runtime"),
     ("oulipoly-setup", "oulipoly-state"),
     ("oulipoly-state", "oulipoly-config"),
     ("oulipoly-state", "oulipoly-agent-messenger"),

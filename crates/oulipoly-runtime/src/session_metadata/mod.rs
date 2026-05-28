@@ -68,7 +68,7 @@ use resume::{
     active_segment_id_to_metadata_error_or_value, effective_provider_for_resolved,
     fetch_active_segment_id, fetch_resume_previews,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use transcript::available_jsonl_path;
 #[cfg(test)]
@@ -90,7 +90,7 @@ pub struct SessionMetadata {
     pub mutable: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStorageType {
     ClaudeCode,

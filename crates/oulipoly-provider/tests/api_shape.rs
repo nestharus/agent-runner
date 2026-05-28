@@ -4,8 +4,10 @@ use oulipoly_provider::{
     ProviderLaunch, ProviderPolicy, ProviderQuota, ProviderRotation, ProviderSession, QuotaRequest,
     QuotaSnapshot, RotationAssessment, RotationMaterialization, RotationMaterializationRequest,
     RotationRequest, SessionCapture, SessionCaptureRequest, SessionTurnBatch, SessionTurnRequest,
-    TerminalSignal, TerminalSignalEvidence, TerminalSignalRecognizer,
+    TerminalSignal, TerminalSignalEvidence, TerminalSignalKind, TerminalSignalRecognizer,
+    TerminalStatusEvidence,
 };
+use std::time::{Duration, UNIX_EPOCH};
 
 struct DummyProvider;
 
@@ -25,8 +27,13 @@ impl ProviderPolicy for DummyProvider {
 }
 
 impl TerminalSignalRecognizer for DummyProvider {
-    fn recognize(&self, _evidence: &TerminalSignalEvidence<'_>) -> TerminalSignal {
-        TerminalSignal::default()
+    fn recognize(&self, evidence: &TerminalSignalEvidence<'_>) -> TerminalSignal {
+        TerminalSignal {
+            kind: TerminalSignalKind::Unknown,
+            provider_name: evidence.provider_name.to_string(),
+            evidence: "dummy signal".to_string(),
+            observed_at: evidence.observed_at,
+        }
     }
 }
 
@@ -100,8 +107,15 @@ fn dummy_provider_can_implement_and_call_each_trait_method() {
     assert!(provider.prepare_launch(LaunchRequest::default()).is_ok());
     assert!(provider.evaluate_policy(PolicyRequest::default()).is_ok());
 
-    let signal = provider.recognize(&TerminalSignalEvidence::default());
-    assert!(!format!("{signal:?}").is_empty());
+    let terminal_evidence = TerminalSignalEvidence {
+        provider_name: "provider-a",
+        stdout: b"",
+        stderr: b"",
+        terminal_status: TerminalStatusEvidence::Unknown,
+        observed_at: UNIX_EPOCH + Duration::from_secs(211),
+    };
+    let signal = provider.recognize(&terminal_evidence);
+    assert_eq!(signal.kind, TerminalSignalKind::Unknown);
 
     assert!(provider.has_quota_source(ProviderContext::default()));
     assert!(provider.probe_quota(QuotaRequest::default()).is_ok());

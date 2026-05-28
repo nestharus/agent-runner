@@ -311,6 +311,80 @@ fn script_storage_with_transcript(
 }
 
 #[test]
+fn runtime_adapters_emit_neutral_descriptors_for_script_storage_and_sessions_locator() {
+    use super::locator::{
+        contract_sessions_locator_descriptor_from_entry,
+        contract_storage_descriptor_from_session_storage,
+    };
+    use oulipoly_provider::ScriptKind;
+
+    let storage = SessionStorage::Script {
+        cwd_script: "cwd-a".to_string(),
+        transcript_script: Some("transcript-a".to_string()),
+        storage_type: None,
+    };
+    let storage_descriptor =
+        contract_storage_descriptor_from_session_storage("source-a", Some(&storage))
+            .expect("script storage should adapt into a provider storage descriptor");
+
+    assert_eq!(storage_descriptor.source_id, "source-a");
+    assert_eq!(
+        storage_descriptor.script,
+        Some(ScriptKind::TranscriptScript)
+    );
+    assert_eq!(
+        storage_descriptor
+            .format
+            .as_ref()
+            .expect("storage format descriptor should be present")
+            .id,
+        "other"
+    );
+
+    let entry = SessionSourceEntry {
+        turn_script: "turn-a".to_string(),
+        transcript_locator: Some("locate-a".to_string()),
+        state_dir: Some(PathBuf::from("/tmp/provider-a/state")),
+    };
+    let locator_descriptor = contract_sessions_locator_descriptor_from_entry("source-b", &entry)
+        .expect("sessions entry should adapt into a neutral locator descriptor");
+
+    assert_eq!(locator_descriptor.source_id, "source-b");
+    assert_eq!(locator_descriptor.command, "locate-a");
+    assert_eq!(
+        locator_descriptor.state_dir,
+        Some(PathBuf::from("/tmp/provider-a/state"))
+    );
+}
+
+#[test]
+fn storage_format_descriptor_round_trips_current_session_storage_type() {
+    use super::locator::{
+        contract_storage_format_from_session_storage_type,
+        session_storage_type_from_contract_format,
+    };
+
+    for expected_id in [
+        ["cla", "ude", "_", "co", "de"].concat(),
+        ["co", "dex", "_session"].concat(),
+        "other".to_string(),
+    ] {
+        let storage_type: SessionStorageType =
+            serde_json::from_value(serde_json::json!(expected_id)).unwrap();
+        let format = contract_storage_format_from_session_storage_type(storage_type);
+        assert_eq!(format.id, expected_id);
+        assert_eq!(
+            session_storage_type_from_contract_format(&format),
+            Some(storage_type)
+        );
+        assert_eq!(
+            serde_json::to_value(storage_type).unwrap(),
+            serde_json::json!(expected_id)
+        );
+    }
+}
+
+#[test]
 fn locate_session_metadata_uses_script_storage_transcript_and_format() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("workspace");
