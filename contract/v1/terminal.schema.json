@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "terminal.schema.json",
+  "title": "Oulipoly Provider Terminal Contract",
+  "type": "object",
+  "$defs": {
+    "TerminalClassifyParams": {
+      "type": "object",
+      "properties": {
+        "stdout_base64": { "type": "string" },
+        "stderr_base64": { "type": "string" },
+        "status": { "$ref": "common.schema.json#/$defs/ProcessStatus" },
+        "observed_at_unix_ms": { "$ref": "common.schema.json#/$defs/UnixMilliseconds" }
+      },
+      "required": ["stdout_base64", "stderr_base64", "status", "observed_at_unix_ms"],
+      "additionalProperties": false
+    },
+    "TerminalClassifyRequest": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/RequestEnvelope" },
+        { "type": "object", "properties": { "params": { "$ref": "#/$defs/TerminalClassifyParams" } } }
+      ]
+    },
+    "TerminalClassifyResult": {
+      "type": "object",
+      "properties": {
+        "terminal_signal": { "$ref": "common.schema.json#/$defs/TerminalSignal" }
+      },
+      "required": ["terminal_signal"],
+      "additionalProperties": false
+    },
+    "TerminalClassifyResponse": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/SuccessResponseEnvelope" },
+        { "type": "object", "properties": { "result": { "$ref": "#/$defs/TerminalClassifyResult" } } }
+      ]
+    },
+    "TerminalClassifyErrorResponse": { "$ref": "common.schema.json#/$defs/ErrorResponseEnvelope" }
+  }
+}

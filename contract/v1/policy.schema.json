@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "policy.schema.json",
+  "title": "Oulipoly Provider Policy Contract",
+  "type": "object",
+  "$defs": {
+    "PolicyEvaluateParams": {
+      "type": "object",
+      "properties": {
+        "settings_id": { "type": "string", "minLength": 1 },
+        "mode": { "type": "string", "minLength": 1 },
+        "model": { "$ref": "common.schema.json#/$defs/ProviderModelRequest" },
+        "launch": { "type": "object", "additionalProperties": true }
+      },
+      "required": ["settings_id", "mode", "model", "launch"],
+      "additionalProperties": false
+    },
+    "PolicyEvaluateRequest": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/RequestEnvelope" },
+        { "type": "object", "properties": { "params": { "$ref": "#/$defs/PolicyEvaluateParams" } } }
+      ]
+    },
+    "PolicyEvaluateResult": {
+      "type": "object",
+      "properties": {
+        "accepted": { "type": "boolean" },
+        "argv": { "type": "array", "items": { "type": "string" } },
+        "env": { "$ref": "common.schema.json#/$defs/StringMap" },
+        "stdin": { "type": ["string", "null"] },
+        "prompt": { "type": ["string", "null"] },
+        "diagnostics": {
+          "type": "array",
+          "items": { "$ref": "common.schema.json#/$defs/Diagnostic" }
+        },
+        "markers": {
+          "type": "array",
+          "items": { "$ref": "common.schema.json#/$defs/Marker" }
+        }
+      },
+      "required": ["accepted", "diagnostics", "markers"],
+      "additionalProperties": false
+    },
+    "PolicyEvaluateResponse": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/SuccessResponseEnvelope" },
+        { "type": "object", "properties": { "result": { "$ref": "#/$defs/PolicyEvaluateResult" } } }
+      ]
+    },
+    "PolicyEvaluateErrorResponse": { "$ref": "common.schema.json#/$defs/ErrorResponseEnvelope" }
+  }
+}

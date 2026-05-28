@@ -4,6 +4,8 @@ use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+pub mod generated;
+pub mod schemas;
 mod terminal;
 mod transcript;
 

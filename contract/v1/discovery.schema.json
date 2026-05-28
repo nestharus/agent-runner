@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "discovery.schema.json",
+  "title": "Oulipoly Provider Discovery Contract",
+  "type": "object",
+  "$defs": {
+    "DiscoveryObject": { "type": "object", "additionalProperties": true },
+    "DiscoveryModelsRequest": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/RequestEnvelope" },
+        { "type": "object", "properties": { "params": { "$ref": "#/$defs/DiscoveryObject" } } }
+      ]
+    },
+    "DiscoveryModelsResult": {
+      "type": "object",
+      "properties": {
+        "provider_version": { "type": "string" },
+        "models": {
+          "type": "array",
+          "items": { "type": "object", "additionalProperties": true }
+        },
+        "warnings": { "type": "array", "items": true }
+      },
+      "required": ["models", "warnings"],
+      "additionalProperties": false
+    },
+    "DiscoveryModelsResponse": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/SuccessResponseEnvelope" },
+        { "type": "object", "properties": { "result": { "$ref": "#/$defs/DiscoveryModelsResult" } } }
+      ]
+    },
+    "DiscoveryModelsErrorResponse": { "$ref": "common.schema.json#/$defs/ErrorResponseEnvelope" },
+    "DiscoveryAccountsRequest": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/RequestEnvelope" },
+        { "type": "object", "properties": { "params": { "$ref": "#/$defs/DiscoveryObject" } } }
+      ]
+    },
+    "DiscoveryAccountsResult": {
+      "type": "object",
+      "properties": {
+        "accounts": {
+          "type": "array",
+          "items": { "type": "object", "additionalProperties": true }
+        },
+        "warnings": { "type": "array", "items": true }
+      },
+      "required": ["accounts", "warnings"],
+      "additionalProperties": false
+    },
+    "DiscoveryAccountsResponse": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/SuccessResponseEnvelope" },
+        { "type": "object", "properties": { "result": { "$ref": "#/$defs/DiscoveryAccountsResult" } } }
+      ]
+    },
+    "DiscoveryAccountsErrorResponse": { "$ref": "common.schema.json#/$defs/ErrorResponseEnvelope" }
+  }
+}
