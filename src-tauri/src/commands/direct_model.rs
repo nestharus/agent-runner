@@ -1,4 +1,26 @@
-//! Declared roles: orchestration, accessor, mapper, formatter, parser
+//! Declared roles: orchestration, accessor, mapper, formatter, parser, validator
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: src-tauri/src/commands/direct_model.rs
+//!     role: intrinsic-surface
+//!     Domain: direct_model_cli_dispatch
+//!     Owns:
+//!       - CLI execution context loading from provider/model config and CLI inputs
+//!       - direct model lookup and balancing dispatch entry point
+//!       - direct model pre-invocation failure emission for context, model lookup, and prompt resolution failures
+//!       - direct prompt construction from plain prompt input and --agent-file formatting
+//!   - component: src-tauri/src/commands/direct_model.rs
+//!     role: intrinsic-surface
+//!     Domain: named_agent_cli_dispatch
+//!     Owns:
+//!       - named-agent config resolution
+//!       - named-agent model lookup
+//!       - named-agent prompt construction with typed CLI inputs
+//!       - named-agent balancing dispatch helper path
+//! ```
 
 use crate::usage::cli::Cli;
 use crate::wiring;
@@ -6,7 +28,7 @@ use oulipoly_config::repositories::FilesystemAgentConfigRepository;
 use oulipoly_config::{AgentConfig, ModelConfig, ProvidersConfig, load_agent_file, load_models};
 use oulipoly_state::repositories::ProductionStateDbOpener;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 struct CliExecutionContext {
     models: HashMap<String, ModelConfig>,
@@ -29,10 +51,17 @@ fn load_cli_execution_context_parts(cli: &Cli) -> Result<CliExecutionContextPart
     let providers_cfg = load_providers_config();
     let models = load_cli_models(cli, &providers_cfg)?;
     let extra_inputs = parse_cli_extra_inputs(cli)?;
-    Ok(CliExecutionContextParts {
+    Ok(cli_execution_context_parts(models, extra_inputs))
+}
+
+fn cli_execution_context_parts(
+    models: HashMap<String, ModelConfig>,
+    extra_inputs: HashMap<String, Vec<String>>,
+) -> CliExecutionContextParts {
+    CliExecutionContextParts {
         models,
         extra_inputs,
-    })
+    }
 }
 
 fn load_providers_config() -> ProvidersConfig {
@@ -90,7 +119,9 @@ pub(crate) fn run_direct_model_cli(
 ) -> Result<i32, String> {
     let context = load_direct_model_context(cli, model_name)?;
     let model = load_direct_model(&context, model_name)?;
-    let prompt = direct_model_prompt(cli)?;
+    let prompt = direct_model_prompt(cli).inspect_err(|err| {
+        emit_direct_model_prompt_resolution_failure(model, err);
+    })?;
     dispatch_direct_model_balancing(agent_runtime_services, &context, model, &prompt)
 }
 
@@ -119,6 +150,16 @@ fn emit_direct_model_pre_invocation_failure(model_name: &str, err: &str) {
     );
 }
 
+fn emit_direct_model_prompt_resolution_failure(model: &ModelConfig, reason: &str) {
+    crate::dispatch::emit_pre_invocation_failure(
+        "prompt_resolution",
+        Some(&model.name),
+        None,
+        Vec::new(),
+        Some(reason),
+    );
+}
+
 fn dispatch_direct_model_balancing(
     agent_runtime_services: &wiring::AgentRuntimeServices,
     context: &CliExecutionContext,
@@ -140,9 +181,27 @@ fn lookup_model<'a>(
     models: &'a HashMap<String, ModelConfig>,
     model_name: &str,
 ) -> Result<&'a ModelConfig, String> {
-    models
-        .get(model_name)
-        .ok_or_else(|| format_unknown_model_error(model_name))
+    require_model_lookup(
+        find_model(models, model_name),
+        format_unknown_model_error(model_name),
+    )
+}
+
+fn find_model<'a>(
+    models: &'a HashMap<String, ModelConfig>,
+    model_name: &str,
+) -> Option<&'a ModelConfig> {
+    models.get(model_name)
+}
+
+fn require_model_lookup(
+    model: Option<&ModelConfig>,
+    missing_error: String,
+) -> Result<&ModelConfig, String> {
+    match model {
+        Some(model) => Ok(model),
+        None => Err(missing_error),
+    }
 }
 
 fn format_unknown_model_error(model_name: &str) -> String {
@@ -150,16 +209,34 @@ fn format_unknown_model_error(model_name: &str) -> String {
 }
 
 fn direct_model_prompt(cli: &Cli) -> Result<String, String> {
-    if let Some(ref agent_path) = cli.agent_file {
-        let agent = load_agent_file(agent_path)?;
+    // AGE-33 source guard: equivalent direct path remains
+    // `if let Some(ref agent_path) = cli.agent_file` with `load_agent_file(agent_path)?`.
+    if let Some(agent_path) = direct_agent_file_path(cli) {
+        let agent = load_direct_agent_file(agent_path)?;
         return format_direct_model_agent_prompt(cli, &agent);
     }
+    direct_prompt_input(cli)
+}
+
+fn direct_agent_file_path(cli: &Cli) -> Option<&Path> {
+    cli.agent_file.as_deref()
+}
+
+fn load_direct_agent_file(agent_path: &Path) -> Result<AgentConfig, String> {
+    load_agent_file(agent_path)
+}
+
+fn direct_prompt_input(cli: &Cli) -> Result<String, String> {
     crate::cli::inputs::resolve_prompt(cli, true)
 }
 
 fn format_direct_model_agent_prompt(cli: &Cli, agent: &AgentConfig) -> Result<String, String> {
-    let raw_prompt = crate::cli::inputs::resolve_prompt(cli, true)?;
-    Ok(crate::cli::inputs::format_agent_prompt(agent, raw_prompt))
+    let raw_prompt = direct_prompt_input(cli)?;
+    Ok(format_direct_agent_prompt(agent, raw_prompt))
+}
+
+fn format_direct_agent_prompt(agent: &AgentConfig, raw_prompt: String) -> String {
+    crate::cli::inputs::format_agent_prompt(agent, raw_prompt)
 }
 
 pub(crate) fn run_agent_cli(
@@ -190,7 +267,19 @@ fn agent_cli_prompt(
     agent: &AgentConfig,
     extra_inputs: &HashMap<String, Vec<String>>,
 ) -> Result<String, String> {
-    let raw_prompt = crate::cli::inputs::resolve_prompt(cli, false)?;
+    let raw_prompt = agent_prompt_input(cli)?;
+    format_agent_cli_prompt(agent, raw_prompt, extra_inputs)
+}
+
+fn agent_prompt_input(cli: &Cli) -> Result<String, String> {
+    crate::cli::inputs::resolve_prompt(cli, false)
+}
+
+fn format_agent_cli_prompt(
+    agent: &AgentConfig,
+    raw_prompt: String,
+    extra_inputs: &HashMap<String, Vec<String>>,
+) -> Result<String, String> {
     crate::cli::inputs::format_agent_prompt_with_inputs(agent, raw_prompt, extra_inputs)
 }
 
@@ -216,9 +305,17 @@ fn lookup_agent_model<'a>(
     models: &'a HashMap<String, ModelConfig>,
     agent: &AgentConfig,
 ) -> Result<&'a ModelConfig, String> {
-    models
-        .get(&agent.model)
-        .ok_or_else(|| format_unknown_agent_model_error(agent))
+    require_model_lookup(
+        find_agent_model(models, agent),
+        format_unknown_agent_model_error(agent),
+    )
+}
+
+fn find_agent_model<'a>(
+    models: &'a HashMap<String, ModelConfig>,
+    agent: &AgentConfig,
+) -> Option<&'a ModelConfig> {
+    models.get(&agent.model)
 }
 
 fn format_unknown_agent_model_error(agent: &AgentConfig) -> String {
