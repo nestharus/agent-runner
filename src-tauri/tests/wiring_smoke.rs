@@ -28,6 +28,13 @@ fn production_wiring_builds_foundation_repositories_and_ports() {
     let paths = runtime_paths(dir.path());
 
     let services = AgentRuntimeServices::production(paths.clone()).unwrap();
+    assert!(
+        services
+            .provider_registry
+            .configured_artifact_keys()
+            .is_empty(),
+        "production wiring should construct an empty lazy provider registry without loading model refs"
+    );
 
     let db = services
         .state_db_opener
@@ -102,4 +109,5 @@ fn production_wiring_builds_foundation_repositories_and_ports() {
 
     assert!(std::sync::Arc::strong_count(&services.stdout_sink) >= 1);
     assert!(std::sync::Arc::strong_count(&services.stderr_sink) >= 1);
+    assert!(std::sync::Arc::strong_count(&services.provider_registry) >= 1);
 }

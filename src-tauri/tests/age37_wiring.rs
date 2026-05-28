@@ -32,4 +32,12 @@ fn production_wiring_builds_age37_services() {
     let _: Arc<dyn SessionLockServicePort> = Arc::clone(&services.session_lock_service);
     assert!(Arc::strong_count(&services.routing_service) >= 1);
     assert!(Arc::strong_count(&services.invocation_lifecycle_service) >= 1);
+    assert!(Arc::strong_count(&services.provider_registry) >= 1);
+    assert!(
+        services
+            .provider_registry
+            .configured_artifact_keys()
+            .is_empty(),
+        "provider registry construction must not discover ambient providers"
+    );
 }

@@ -10,6 +10,7 @@ use oulipoly_runtime::executor::RuntimeExecutorService;
 use oulipoly_runtime::ports::{
     DefaultProcessRunner, DefaultUuidGenerator, StderrWriter, StdoutWriter, SystemClock,
 };
+use oulipoly_runtime::provider_registry::{ProviderRegistry, ProviderRegistryOptions};
 use oulipoly_runtime::quota::RuntimeQuotaService;
 use oulipoly_runtime::services::{
     DiagnosticsServicePort, ExecutorServicePort, MigrationServicePort,
@@ -20,7 +21,7 @@ use oulipoly_runtime::services::{
     SessionLockServicePort, SessionReplaceServicePort, TraceServicePort,
 };
 use oulipoly_state::repositories::ProductionStateDbOpener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -51,6 +52,7 @@ pub struct AgentRuntimeServices {
     pub executor_service: Arc<dyn ExecutorServicePort>,
     pub quota_service: Arc<dyn QuotaServicePort>,
     pub diagnostics_service: Arc<dyn DiagnosticsServicePort>,
+    pub provider_registry: Arc<ProviderRegistry>,
     pub resume_service: Arc<dyn ResumeServicePort>,
     pub session_lifecycle_service: Arc<dyn SessionLifecycleServicePort>,
     pub migration_service: Arc<dyn MigrationServicePort>,
@@ -79,6 +81,9 @@ impl AgentRuntimeServices {
             executor_service: Arc::new(RuntimeExecutorService),
             quota_service: Arc::new(RuntimeQuotaService),
             diagnostics_service: Arc::new(RuntimeDiagnosticsService),
+            provider_registry: Arc::new(
+                ProviderRegistry::empty(ProviderRegistryOptions::default()),
+            ),
             resume_service: Arc::new(ProductionResumeService::new()),
             session_lifecycle_service: Arc::new(ProductionSessionLifecycleService::new()),
             migration_service: Arc::new(ProductionMigrationService::new()),
@@ -90,22 +95,7 @@ impl AgentRuntimeServices {
     }
 
     pub fn production(paths: RuntimePaths) -> Result<Self, String> {
-        std::fs::create_dir_all(&paths.config_root)
-            .map_err(|e| format!("Failed to create config root: {e}"))?;
-        std::fs::create_dir_all(&paths.models_dir)
-            .map_err(|e| format!("Failed to create models directory: {e}"))?;
-        std::fs::create_dir_all(&paths.agents_dir)
-            .map_err(|e| format!("Failed to create agents directory: {e}"))?;
-        std::fs::create_dir_all(&paths.data_root)
-            .map_err(|e| format!("Failed to create data root: {e}"))?;
-        std::fs::create_dir_all(&paths.lock_dir)
-            .map_err(|e| format!("Failed to create lock directory: {e}"))?;
-        std::fs::create_dir_all(&paths.working_dir)
-            .map_err(|e| format!("Failed to create working directory: {e}"))?;
-        if let Some(parent) = paths.state_db_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create state DB directory: {e}"))?;
-        }
+        prepare_runtime_directories(&paths)?;
 
         Ok(Self {
             state_db_opener: Arc::new(ProductionStateDbOpener),
@@ -124,6 +114,11 @@ impl AgentRuntimeServices {
             executor_service: Arc::new(RuntimeExecutorService),
             quota_service: Arc::new(RuntimeQuotaService),
             diagnostics_service: Arc::new(RuntimeDiagnosticsService),
+            provider_registry: Arc::new(ProviderRegistry::empty(
+                ProviderRegistryOptions::default()
+                    .with_config_root(paths.config_root.clone())
+                    .with_data_root(paths.data_root.clone()),
+            )),
             resume_service: Arc::new(ProductionResumeService::new()),
             session_lifecycle_service: Arc::new(ProductionSessionLifecycleService::new()),
             migration_service: Arc::new(ProductionMigrationService::new()),
@@ -133,4 +128,33 @@ impl AgentRuntimeServices {
             session_lock_service: Arc::new(ProductionSessionLockService::default()),
         })
     }
+}
+
+fn prepare_runtime_directories(paths: &RuntimePaths) -> Result<(), String> {
+    for (path, label) in runtime_directory_targets(paths) {
+        create_runtime_directory(path, label)?;
+    }
+    if let Some(parent) = paths.state_db_path.parent() {
+        create_runtime_directory(parent, "state DB directory")?;
+    }
+    Ok(())
+}
+
+fn runtime_directory_targets(paths: &RuntimePaths) -> [(&Path, &'static str); 6] {
+    [
+        (&paths.config_root, "config root"),
+        (&paths.models_dir, "models directory"),
+        (&paths.agents_dir, "agents directory"),
+        (&paths.data_root, "data root"),
+        (&paths.lock_dir, "lock directory"),
+        (&paths.working_dir, "working directory"),
+    ]
+}
+
+fn create_runtime_directory(path: &Path, label: &str) -> Result<(), String> {
+    std::fs::create_dir_all(path).map_err(|error| format_runtime_directory_error(label, error))
+}
+
+fn format_runtime_directory_error(label: &str, error: std::io::Error) -> String {
+    format!("Failed to create {label}: {error}")
 }

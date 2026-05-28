@@ -17,12 +17,30 @@ pub fn fake_provider_source() -> PathBuf {
 }
 
 pub fn executable_script() -> PathBuf {
-    provider_client_fixture_dir().join("executable-script.sh")
+    let path = provider_client_fixture_dir().join("executable-script.sh");
+    ensure_executable(&path);
+    path
 }
 
 pub fn non_executable_script() -> PathBuf {
     provider_client_fixture_dir().join("non-executable-script.sh")
 }
+
+#[cfg(unix)]
+fn ensure_executable(path: &std::path::Path) {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = fs::metadata(path)
+        .expect("executable script fixture should be readable")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions)
+        .expect("executable script fixture permissions should update");
+}
+
+#[cfg(not(unix))]
+fn ensure_executable(_path: &std::path::Path) {}
 
 pub fn temp_fixture_dir(label: &str) -> PathBuf {
     let nanos = SystemTime::now()
