@@ -1,8 +1,10 @@
 use oulipoly_provider::{
     CapabilityError, LocatedTranscript, LocatorError, LocatorRequiredCapabilities, LocatorSource,
-    ProviderCapabilities, TranscriptLocator, TranscriptLookupMode, TranscriptRequest,
+    ProviderCapabilities, StorageFormatDescriptor, TranscriptLocator, TranscriptLookupMode,
+    TranscriptRequest,
 };
 use static_assertions::assert_not_impl_any;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DummyLocator;
@@ -12,10 +14,16 @@ assert_not_impl_any!(
 );
 
 impl TranscriptLocator for DummyLocator {
-    fn locate_jsonl(&self, request: &TranscriptRequest) -> Result<LocatedTranscript, LocatorError> {
-        Err(LocatorError::NotFound {
-            source: LocatorSource::SessionsLocator,
-            session_id: request.session_id.clone(),
+    fn locate(&self, _request: TranscriptRequest<'_>) -> Result<LocatedTranscript, LocatorError> {
+        Ok(LocatedTranscript {
+            path: PathBuf::from("/tmp/provider-a/session-a.jsonl"),
+            source: LocatorSource::Other {
+                source_id: "source-a".to_string(),
+            },
+            storage_format: StorageFormatDescriptor {
+                id: "format-a".to_string(),
+                label: None,
+            },
         })
     }
 }
@@ -57,16 +65,17 @@ fn locator_required_capabilities_expose_present_locator() {
     assert!(wrapper.capabilities().transcript_locator.is_some());
 
     let request = TranscriptRequest {
-        provider: "neutral-test-provider",
-        session_id: "neutral-session".to_string(),
+        provider: "provider-a",
+        session_id: "session-a".into(),
+        lookup_mode: TranscriptLookupMode::AllowMissing,
         storage: None,
         sessions_config_locator: None,
-        mode: TranscriptLookupMode::AllowMissing,
     };
-    assert!(matches!(
-        wrapper.transcript_locator().locate_jsonl(&request),
-        Err(LocatorError::NotFound { .. })
-    ));
+    let located = wrapper
+        .transcript_locator()
+        .locate(request)
+        .expect("contract-local locator should be callable through required wrapper");
+    assert_eq!(located.storage_format.id, "format-a");
 
     let capabilities = wrapper.into_capabilities();
     assert_eq!(capabilities.transcript_locator, Some(DummyLocator));

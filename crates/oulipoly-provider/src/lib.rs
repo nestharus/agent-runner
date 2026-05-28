@@ -4,9 +4,18 @@ use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-pub use oulipoly_runtime::session_metadata::{
-    LocatedTranscript, LocatorError, LocatorSource, ScriptKind, TranscriptLocator,
-    TranscriptLookupMode, TranscriptRequest, UnsupportedStorageReason,
+mod terminal;
+mod transcript;
+
+pub use terminal::{
+    TerminalSignal, TerminalSignalEvidence, TerminalSignalKind, TerminalSignalRecognizer,
+    TerminalStatusEvidence,
+};
+pub use transcript::{
+    IoErrorKind, LocatedTranscript, LocatorError, LocatorSource, ProviderName,
+    ProviderStorageDescriptor, ScriptKind, SessionId, SessionsLocatorDescriptor,
+    StorageFormatDescriptor, TranscriptLocator, TranscriptLookupMode, TranscriptRequest,
+    UnsupportedStorageReason,
 };
 
 pub trait ProviderLaunch {
@@ -18,10 +27,6 @@ pub trait ProviderPolicy {
         &self,
         request: PolicyRequest<'_>,
     ) -> Result<PolicyTransform, CapabilityError>;
-}
-
-pub trait TerminalSignalRecognizer {
-    fn recognize(&self, evidence: &TerminalSignalEvidence<'_>) -> TerminalSignal;
 }
 
 pub trait ProviderQuota {
@@ -122,27 +127,6 @@ pub struct PolicyTransform {
     pub arguments_to_add: Vec<String>,
     pub environment_to_set: BTreeMap<String, String>,
     pub rejection: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct TerminalSignalEvidence<'a> {
-    pub stdout: &'a [u8],
-    pub stderr: &'a [u8],
-    pub status_code: Option<i32>,
-    pub elapsed: Option<Duration>,
-    pub completed_at: Option<SystemTime>,
-    marker: PhantomData<&'a ()>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum TerminalSignal {
-    #[default]
-    Unknown,
-    Success,
-    Failure,
-    Throttled,
-    AuthenticationNeeded,
-    Interrupted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

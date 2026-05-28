@@ -16,6 +16,7 @@ libc.workspace = true
 oulipoly-config = { path = "../oulipoly-config" }
 oulipoly-core = { path = "../oulipoly-core" }
 oulipoly-agent-messenger = { path = "../oulipoly-agent-messenger" }
+oulipoly-provider = { path = "../oulipoly-provider" }
 oulipoly-state = { path = "../oulipoly-state" }
 rusqlite.workspace = true
 serde.workspace = true
@@ -28,6 +29,5 @@ uuid.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
-oulipoly-provider = { path = "../oulipoly-provider" }
 oulipoly-state = { path = "../oulipoly-state", features = ["test-support"] }
 tokio = { workspace = true, features = ["macros", "rt"] }
