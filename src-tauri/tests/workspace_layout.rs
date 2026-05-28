@@ -32,6 +32,7 @@ const EXPECTED_EDGES: &[(&str, &str)] = &[
     ("src-tauri", "oulipoly-agent-messenger"),
     ("src-tauri", "oulipoly-config"),
     ("src-tauri", "oulipoly-core"),
+    ("src-tauri", "oulipoly-provider"),
     ("oulipoly-runtime", "oulipoly-state"),
     ("oulipoly-runtime", "oulipoly-agent-messenger"),
     ("oulipoly-runtime", "oulipoly-config"),

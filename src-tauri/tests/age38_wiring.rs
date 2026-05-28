@@ -69,6 +69,10 @@ fn age38_wiring_declares_gui_cutover_service_ports() {
         source.contains("pub diagnostics_service: Arc<dyn DiagnosticsServicePort>"),
         "AgentRuntimeServices must expose diagnostics_service as Arc<dyn DiagnosticsServicePort>"
     );
+    assert!(
+        source.contains("pub provider_registry: Arc<") && source.contains("ProviderRegistry"),
+        "AgentRuntimeServices must expose a neutral provider_registry field"
+    );
 }
 
 #[test]
@@ -101,6 +105,17 @@ fn age38_wiring_constructors_initialize_gui_cutover_service_ports() {
             body.contains("diagnostics_service: Arc::new(RuntimeDiagnosticsService::new())")
                 || body.contains("diagnostics_service: Arc::new(RuntimeDiagnosticsService)"),
             "{constructor} must initialize RuntimeDiagnosticsService"
+        );
+        assert!(
+            body.contains("provider_registry: Arc::new("),
+            "{constructor} must initialize the AGE-214 provider registry"
+        );
+        assert!(
+            !body.contains("describe_model_provider")
+                && !body.contains(".describe(")
+                && !body.contains("invoke_typed")
+                && !body.contains("ProviderClient::new"),
+            "{constructor} must not resolve artifacts, call describe, or spawn provider processes"
         );
     }
 }

@@ -31,4 +31,12 @@ fn agent_runtime_services_production_wires_age_36_services() {
     accept_resume_service(services.resume_service.clone());
     accept_session_lifecycle_service(services.session_lifecycle_service.clone());
     accept_migration_service(services.migration_service.clone());
+    assert!(
+        services
+            .provider_registry
+            .configured_artifact_keys()
+            .is_empty(),
+        "AGE-214 registry wiring must be lazy and empty until model provider refs are supplied"
+    );
+    assert!(Arc::strong_count(&services.provider_registry) >= 1);
 }
