@@ -4,9 +4,16 @@ use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+pub mod client;
+pub mod error;
 pub mod generated;
+mod process;
+pub mod resolver;
 pub mod schemas;
+pub mod stream;
 mod terminal;
+#[cfg(test)]
+mod testkit;
 mod transcript;
 
 pub use terminal::{
