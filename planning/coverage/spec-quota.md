@@ -6,6 +6,11 @@
 - `crates/oulipoly-runtime/src/quota/adapter_derived_source.rs`
 - `crates/oulipoly-runtime/src/quota/freshness.rs`
 - `crates/oulipoly-runtime/src/quota/in_flight.rs`
+- `crates/oulipoly-runtime/src/quota/marker_verification/mod.rs`
+- `crates/oulipoly-runtime/src/quota/marker_verification/config.rs`
+- `crates/oulipoly-runtime/src/quota/marker_verification/health.rs`
+- `crates/oulipoly-runtime/src/quota/marker_verification/lock.rs`
+- `crates/oulipoly-runtime/src/quota/marker_verification/test_support.rs`
 - `crates/oulipoly-runtime/src/quota/outcome.rs`
 - `crates/oulipoly-runtime/src/quota/parse.rs`
 - `crates/oulipoly-runtime/src/quota/process.rs`
@@ -37,6 +42,8 @@
 | SQLite quota read with no row, a missing `refreshed_at`, a window-read error, or empty windows. | Freshness predicates return stale/due so callers can refresh. |
 | Routing freshness read with a valid row and windows older than 30 seconds. | `is_routing_stale` returns stale, independent of the longer projection TTL. |
 | Topology probe read with incomplete live windows and no prior probe timestamp. | `is_topology_probe_due` returns due unless live count is zero or already meets/exceeds expected count. |
+| Marker verification reads a stale `next_available_at` marker with a healthy fresh cache or healthy refresh result. | Clear the marker through `StateDb::clear_provider_unavailable` while preserving the quota row. |
+| Marker verification reads a stale marker with exhausted, missing, empty, failed-refresh, no-script, lock-create-failure, or lock-open-failure evidence. | Retain the marker and failure class conservatively. |
 
 ## Edge cases
 
@@ -49,6 +56,11 @@
   serialize per key; one in-flight refresh per key at a time.
 - Window-read errors during freshness checks — degrade to stale/due by
   treating the window set as empty.
+- Marker verification lock failures — retain the marker rather than
+  clearing on guessed health. Portable tests cover lock directory creation
+  failure and lock file open failure; flock syscall failure remains a
+  documented non-portable branch guarded by the same conservative error
+  return.
 
 ## Error conditions
 
@@ -70,6 +82,9 @@
   `executor/terminal_signal.rs`'s job. A `rate_limited` recognizer outcome
   does NOT short-circuit a quota refresh; the recognizer signal feeds the
   balancer separately.
+- Marker verification does NOT change route eligibility directly. It only
+  clears stale provider-unavailable markers when the configured cache,
+  refresh, and lock predicates supply enough evidence.
 
 ## Declared test patterns
 
