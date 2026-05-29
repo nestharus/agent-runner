@@ -181,6 +181,9 @@ fn tauri_provider_settings_dtos_preserve_success_error_diagnostic_and_version_fi
 fn production_runtime_paths_do_not_route_through_provider_settings_dispatch() {
     let guarded_sources = [
         "../crates/oulipoly-runtime/src/balancer/mod.rs",
+        "../crates/oulipoly-runtime/src/balancer/context.rs",
+        "../crates/oulipoly-runtime/src/balancer/snapshot.rs",
+        "../crates/oulipoly-runtime/src/balancer/refresh_inputs.rs",
         "../crates/oulipoly-runtime/src/executor/mod.rs",
         "../crates/oulipoly-runtime/src/executor/cli.rs",
         "../crates/oulipoly-runtime/src/quota/in_flight.rs",

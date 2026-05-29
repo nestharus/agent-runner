@@ -4,26 +4,40 @@
 //!
 //! ## Intrinsic-surface declarations
 //! intrinsic_surface_declarations:
-//!   - component: crates/oulipoly-runtime/src/balancer/mod.rs::quota_routing_surface
+//!   - component: crates/oulipoly-runtime/src/balancer/context.rs::balance_context_surface
+//!     role: intrinsic-surface
+//!     Domain: contextual-balancer-dependencies
+//!     Owns:
+//!       - ProvidersConfig quota refresh-source contract
+//!       - SessionsConfig session scan and adapter-derived refresh contract
+//!       - InFlight refresh deduplication carrier
+//!   - component: crates/oulipoly-runtime/src/balancer/refresh_inputs.rs::contextual_refresh_surface
 //!     role: intrinsic-surface
 //!     Domain: quota_routing_orchestration
 //!     Owns:
-//!       - InFlight refresh deduplication carrier
 //!       - RefreshOutcome ignored/degraded routing result
-//!       - has_refresh_source topology-probe eligibility
 //!       - is_routing_stale route-selection refresh TTL
 //!       - is_stale projection refresh TTL
-//!       - is_topology_probe_due topology repair predicate
 //!       - refresh_provider projection refresh operation
 //!       - refresh_provider_for_routing route-selection refresh operation
+//!       - verify_or_clear_marker route-selection marker verification
+//!       - scan_provider session scan operation
+//!   - component: crates/oulipoly-runtime/src/balancer/snapshot.rs::quota_snapshot_surface
+//!     role: intrinsic-surface
+//!     Domain: quota-cache-snapshot-access
+//!     Owns:
+//!       - QuotaRecord cached read accessor
+//!       - QuotaWindow cached read accessor
+//!       - QuotaSnapshot in-memory routing/projection cache
 //!   - component: crates/oulipoly-runtime/src/balancer/mod.rs::config_topology_session_contract
 //!     role: intrinsic-surface
 //!     Domain: balancer-config-topology-and-session-contract
 //!     Owns:
 //!       - ModelConfig provider pool and model name contract
 //!       - ProviderConfig provider name/session storage contract
-//!       - ProvidersConfig quota refresh-source contract
-//!       - SessionsConfig session scan and adapter-derived refresh contract
+//!       - has_refresh_source topology-probe eligibility
+//!       - is_topology_probe_due topology repair predicate
+//!       - refresh_provider_for_routing topology repair operation
 //!       - SessionStorage resume migration eligibility contract
 //!   - component: crates/oulipoly-runtime/src/balancer/mod.rs::quota_resume_state_surface
 //!     role: intrinsic-surface
@@ -37,21 +51,26 @@
 //!       - QuotaWindow usage/reset/delta fields
 //!       - ResolvedResume active-provider contract
 
+mod context;
 pub mod forensics;
+mod refresh_inputs;
+mod snapshot;
 
+pub use context::BalanceContext;
 pub use forensics::{FailureClass, apply_post_failure_forensics};
 
 use crate::migration::{MigrationError, provider_has_derivable_claude_projects_dir};
 use crate::quota::{
-    InFlight, RefreshOutcome, has_refresh_source, is_routing_stale, is_stale,
-    is_topology_probe_due, refresh_provider, refresh_provider_for_routing, verify_or_clear_marker,
+    RefreshOutcome, has_refresh_source, is_topology_probe_due, refresh_provider_for_routing,
 };
-use crate::sessions::scan_provider;
 use chrono::{DateTime, Utc};
-use oulipoly_config::{ModelConfig, ProviderConfig, ProvidersConfig, SessionsConfig};
+use oulipoly_config::{ModelConfig, ProviderConfig};
 pub use oulipoly_core::TransitionReason;
 use oulipoly_state::{QuotaRecord, QuotaWindow, ResolvedResume, StateDb};
 use std::fmt;
+
+use refresh_inputs::{refresh_projection_inputs, refresh_routing_inputs};
+use snapshot::{QuotaSnapshot, cached_quota_record, cached_quota_windows, load_quota_snapshot};
 
 const ERROR_WINDOW_MINUTES: i64 = 30;
 const ERROR_THRESHOLD: u64 = 3;
@@ -138,23 +157,6 @@ impl fmt::Display for RoutingError {
 
 impl std::error::Error for RoutingError {}
 
-/// Contextual dependencies for quota-aware balancing. When present,
-/// `select_provider` will trigger a synchronous refresh for any provider
-/// whose cached quota is stale (older than `REFRESH_TTL_HOURS`) AND scan
-/// each provider's CLI session logs for new turns. Pass `None` to use
-/// cached-only scoring (e.g. from inside an async handler where blocking
-/// on a network call isn't desirable).
-pub struct BalanceContext<'a> {
-    pub providers_cfg: &'a ProvidersConfig,
-    pub sessions_cfg: &'a SessionsConfig,
-    pub in_flight: &'a InFlight,
-}
-
-struct QuotaSnapshot {
-    quotas: Vec<Option<QuotaRecord>>,
-    windows: Vec<Vec<QuotaWindow>>,
-}
-
 struct TopologyProbeRefresh {
     provider_index: usize,
     live_window_count: usize,
@@ -184,76 +186,6 @@ pub fn select_provider(
         &snapshot,
         filtered_indices.as_slice(),
     ))
-}
-
-fn refresh_routing_inputs(model: &ModelConfig, state: &StateDb, ctx: Option<&BalanceContext<'_>>) {
-    if let Some(ctx) = ctx {
-        let now = Utc::now();
-        for provider in &model.providers {
-            verify_provider_marker_before_routing(provider, state, ctx, now);
-            refresh_provider_for_stale_routing(provider, state, ctx);
-            scan_provider_for_routing(provider, state, ctx);
-        }
-    }
-}
-
-fn verify_provider_marker_before_routing(
-    provider: &ProviderConfig,
-    state: &StateDb,
-    ctx: &BalanceContext<'_>,
-    now: DateTime<Utc>,
-) {
-    verify_or_clear_marker(
-        state,
-        ctx.providers_cfg,
-        ctx.sessions_cfg,
-        ctx.in_flight,
-        &provider.name,
-        now,
-    );
-}
-
-fn refresh_provider_for_stale_routing(
-    provider: &ProviderConfig,
-    state: &StateDb,
-    ctx: &BalanceContext<'_>,
-) {
-    if is_routing_stale(state, &provider.name) {
-        let _: RefreshOutcome = refresh_provider_for_routing(
-            &provider.name,
-            ctx.providers_cfg,
-            ctx.sessions_cfg,
-            ctx.in_flight,
-            state,
-        );
-    }
-}
-
-fn scan_provider_for_routing(provider: &ProviderConfig, state: &StateDb, ctx: &BalanceContext<'_>) {
-    let _ = scan_provider(&provider.name, ctx.sessions_cfg, state);
-}
-
-fn load_quota_snapshot(model: &ModelConfig, state: &StateDb) -> QuotaSnapshot {
-    QuotaSnapshot {
-        quotas: model
-            .providers
-            .iter()
-            .map(|provider| cached_quota_record(state, &provider.name))
-            .collect(),
-        windows: model
-            .providers
-            .iter()
-            .map(|provider| cached_quota_windows(state, &provider.name))
-            .collect(),
-    }
-}
-
-fn cached_quota_record(state: &StateDb, provider_name: &str) -> Option<QuotaRecord> {
-    state.get_quota(provider_name).ok().flatten()
-}
-
-fn cached_quota_windows(state: &StateDb, provider_name: &str) -> Vec<QuotaWindow> {
-    state.get_windows(provider_name).unwrap_or_default()
 }
 
 fn repair_routing_topology(
@@ -531,38 +463,6 @@ pub fn compute_projections(
         &candidates,
         Utc::now(),
     )
-}
-
-fn refresh_projection_inputs(
-    model: &ModelConfig,
-    state: &StateDb,
-    ctx: Option<&BalanceContext<'_>>,
-) {
-    if let Some(ctx) = ctx {
-        for provider in &model.providers {
-            refresh_provider_for_stale_projection(provider, state, ctx);
-            scan_provider_for_projection(provider, state, ctx);
-        }
-    }
-}
-
-fn refresh_provider_for_stale_projection(
-    provider: &ProviderConfig,
-    state: &StateDb,
-    ctx: &BalanceContext<'_>,
-) {
-    if is_stale(state, &provider.name) {
-        let _: RefreshOutcome =
-            refresh_provider(&provider.name, ctx.providers_cfg, ctx.in_flight, state);
-    }
-}
-
-fn scan_provider_for_projection(
-    provider: &ProviderConfig,
-    state: &StateDb,
-    ctx: &BalanceContext<'_>,
-) {
-    let _ = scan_provider(&provider.name, ctx.sessions_cfg, state);
 }
 
 fn provider_is_quota_exhausted(
@@ -1846,6 +1746,7 @@ fn select_lowest_invocation_count(counts: &[(usize, i64)]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::quota::InFlight;
     use chrono::{Duration, SecondsFormat, Utc};
     use oulipoly_config::{
         ProviderConfig, ProviderEntry, ProvidersConfig, SessionSourceEntry, SessionStorage,
@@ -2332,30 +2233,68 @@ mod tests {
         }
     }
 
-    fn production_source() -> &'static str {
-        include_str!("mod.rs")
-            .split("mod tests")
-            .next()
-            .expect("production source precedes tests")
+    fn balancer_production_sources() -> [(&'static str, &'static str); 4] {
+        [
+            (
+                "crates/oulipoly-runtime/src/balancer/mod.rs",
+                production_balancer_source(
+                    "crates/oulipoly-runtime/src/balancer/mod.rs",
+                    include_str!("mod.rs"),
+                ),
+            ),
+            (
+                "crates/oulipoly-runtime/src/balancer/context.rs",
+                production_balancer_source(
+                    "crates/oulipoly-runtime/src/balancer/context.rs",
+                    include_str!("context.rs"),
+                ),
+            ),
+            (
+                "crates/oulipoly-runtime/src/balancer/snapshot.rs",
+                production_balancer_source(
+                    "crates/oulipoly-runtime/src/balancer/snapshot.rs",
+                    include_str!("snapshot.rs"),
+                ),
+            ),
+            (
+                "crates/oulipoly-runtime/src/balancer/refresh_inputs.rs",
+                production_balancer_source(
+                    "crates/oulipoly-runtime/src/balancer/refresh_inputs.rs",
+                    include_str!("refresh_inputs.rs"),
+                ),
+            ),
+        ]
+    }
+
+    fn production_balancer_source(module_path: &str, source: &'static str) -> &'static str {
+        if module_path.ends_with("/mod.rs") {
+            return source
+                .split("mod tests")
+                .next()
+                .expect("production source precedes tests");
+        }
+        source
     }
 
     #[test]
     fn age153_source_guard_balancer_has_no_terminal_signal_or_provider_output_authority() {
-        let source = source_without_comments(production_source());
-        for forbidden in ["TerminalSignal", "TerminalSignalKind", "terminal_signal"] {
+        for (module_path, source) in balancer_production_sources() {
+            let source = source_without_comments(source);
+            for forbidden in ["TerminalSignal", "TerminalSignalKind", "terminal_signal"] {
+                assert!(
+                    !contains_identifier_token(&source, forbidden),
+                    "{module_path} must not reference terminal-signal identifier token {forbidden:?}; AGE-153 routing authority is provider_quotas.exhausted_at"
+                );
+            }
             assert!(
-                !contains_identifier_token(&source, forbidden),
-                "balancer must not reference terminal-signal identifier token {forbidden:?}; AGE-153 routing authority is provider_quotas.exhausted_at"
+                !contains_terminal_signal_use_import(&source),
+                "{module_path} must not import terminal_signal modules or TerminalSignal types"
+            );
+            assert!(
+                !contains_provider_output_parser_identifier(&source),
+                "{module_path} must not call provider-output parser functions as routing authority"
             );
         }
-        assert!(
-            !contains_terminal_signal_use_import(&source),
-            "balancer must not import terminal_signal modules or TerminalSignal types"
-        );
-        assert!(
-            !contains_provider_output_parser_identifier(&source),
-            "balancer must not call provider-output parser functions as routing authority"
-        );
     }
 
     fn contains_identifier_token(source: &str, token: &str) -> bool {
