@@ -52,25 +52,51 @@
 //!       - QuotaWindow usage/reset/delta fields
 //!       - ResolvedResume active-provider contract
 
+mod burn_rate;
 mod context;
+mod density;
 mod eligibility;
 pub mod forensics;
+mod invocation_fallback;
+mod projection;
 mod refresh_inputs;
 mod snapshot;
 mod topology;
 
 pub use context::BalanceContext;
+pub use density::FANOUT_SCORE_BAND_RATIO;
 pub use forensics::{FailureClass, apply_post_failure_forensics};
+pub use projection::{ProviderProjection, WindowProjection, compute_projections};
+
+#[cfg(test)]
+pub(crate) use burn_rate::{
+    bootstrap_burn_rate_for_test, bootstrap_duration_ratio_for_test, project_used_percent_for_test,
+};
 
 use crate::migration::{MigrationError, provider_has_derivable_claude_projects_dir};
 use chrono::{DateTime, Utc};
 use oulipoly_config::{ModelConfig, ProviderConfig};
 pub use oulipoly_core::TransitionReason;
-use oulipoly_state::{QuotaRecord, QuotaWindow, ResolvedResume, StateDb};
+#[cfg(test)]
+use oulipoly_state::QuotaWindow;
+use oulipoly_state::{QuotaRecord, ResolvedResume, StateDb};
 use std::fmt;
 
-use eligibility::{all_provider_indices, eligible_provider_indices};
-use refresh_inputs::{refresh_projection_inputs, refresh_routing_inputs};
+#[cfg(test)]
+use burn_rate::{
+    duration_ratio_fallback_percent_per_call, duration_ratio_rate, learned_rate,
+    pool_window_avg_percent_per_call,
+};
+use density::score_by_density;
+#[cfg(test)]
+use density::{
+    FanoutUsageKey, ProviderEval, approx_eq_usage, fanout_usage_key, finite_fanout_reset,
+    finite_fanout_usage, select_binding_score_with_fanout,
+};
+use eligibility::eligible_provider_indices;
+use invocation_fallback::score_by_invocation_count;
+use projection::live_window_count;
+use refresh_inputs::refresh_routing_inputs;
 use snapshot::{QuotaSnapshot, load_quota_snapshot};
 use topology::repair_routing_topology;
 
@@ -86,37 +112,6 @@ const EPS_HOURS: f64 = 1.0 / 60.0;
 /// (idle account, different upstream behavior) and the provider should
 /// not be torpedoed for it.
 const HIDDEN_WINDOW_PENALTY_THRESHOLD: f64 = 0.85;
-pub const FANOUT_SCORE_BAND_RATIO: f64 = 2.0;
-
-#[derive(Debug, Clone)]
-struct ProviderEval {
-    index: usize,
-    binding_score: Option<f64>,
-    unlearned: bool,
-    fanout_usage: Option<FanoutUsageKey>,
-}
-
-#[derive(Copy, Clone, Debug)]
-struct FanoutUsageKey {
-    worst_projected_used: Option<f64>,
-    soonest_reset_hours: Option<f64>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ProviderProjection {
-    pub provider_index: usize,
-    pub projections_per_window: Vec<WindowProjection>,
-    pub binding_score: Option<f64>,
-    pub recent_error_count: u32,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct WindowProjection {
-    pub window_id: i64,
-    pub projected_used: f64,
-    pub hours_until_reset: f64,
-    pub remaining_headroom: f64,
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum MigrationDecision {
@@ -216,346 +211,6 @@ fn candidates_have_windows(snapshot: &QuotaSnapshot, candidates: &[usize]) -> bo
     candidates
         .iter()
         .all(|provider_index| !snapshot.windows[*provider_index].is_empty())
-}
-
-fn score_by_density(
-    model: &ModelConfig,
-    state: &StateDb,
-    quotas: &[Option<QuotaRecord>],
-    windows: &[Vec<QuotaWindow>],
-    candidates: &[usize],
-) -> usize {
-    let projections =
-        compute_projections_from_records(model, state, quotas, windows, candidates, Utc::now());
-    let evals = provider_evals_from_projections(projections.as_slice());
-    let eligible = density_eligible_evals(evals.as_slice());
-
-    if eligible.is_empty() {
-        return round_robin_fallback(model, state, candidates);
-    }
-
-    select_binding_score_with_fanout(model, &eligible)
-}
-
-fn provider_evals_from_projections(projections: &[ProviderProjection]) -> Vec<ProviderEval> {
-    projections
-        .iter()
-        .map(provider_eval_from_projection)
-        .collect()
-}
-
-fn provider_eval_from_projection(projection: &ProviderProjection) -> ProviderEval {
-    ProviderEval {
-        index: projection.provider_index,
-        binding_score: projection.binding_score,
-        unlearned: projection.binding_score.is_none()
-            && projection.recent_error_count < ERROR_THRESHOLD as u32,
-        fanout_usage: Some(fanout_usage_key(projection)),
-    }
-}
-
-fn density_eligible_evals(evals: &[ProviderEval]) -> Vec<ProviderEval> {
-    evals
-        .iter()
-        .filter(|eval| !eval.unlearned && eval.binding_score.is_some())
-        .cloned()
-        .collect()
-}
-
-pub fn compute_projections(
-    model: &ModelConfig,
-    state: &StateDb,
-    ctx: Option<&BalanceContext<'_>>,
-) -> Vec<ProviderProjection> {
-    refresh_projection_inputs(model, state, ctx);
-    let snapshot = load_quota_snapshot(model, state);
-    let candidates = all_provider_indices(model);
-    compute_projections_from_records(
-        model,
-        state,
-        &snapshot.quotas,
-        &snapshot.windows,
-        &candidates,
-        Utc::now(),
-    )
-}
-
-fn compute_projections_from_records(
-    model: &ModelConfig,
-    state: &StateDb,
-    quotas: &[Option<QuotaRecord>],
-    windows: &[Vec<QuotaWindow>],
-    candidates: &[usize],
-    now: chrono::DateTime<Utc>,
-) -> Vec<ProviderProjection> {
-    let pool_max_live_windows = pool_max_live_window_count(windows, candidates, now);
-    candidates
-        .iter()
-        .copied()
-        .map(|provider_index| {
-            provider_projection_from_records(
-                model,
-                state,
-                quotas,
-                windows,
-                provider_index,
-                pool_max_live_windows,
-                now,
-            )
-        })
-        .collect()
-}
-
-struct ProjectionAssembly {
-    binding_score: f64,
-    unlearned: bool,
-    scored_window: bool,
-    projections: Vec<WindowProjection>,
-}
-
-impl ProjectionAssembly {
-    fn new() -> Self {
-        Self {
-            binding_score: f64::INFINITY,
-            unlearned: false,
-            scored_window: false,
-            projections: Vec::new(),
-        }
-    }
-}
-
-fn pool_max_live_window_count(
-    windows: &[Vec<QuotaWindow>],
-    candidates: &[usize],
-    now: chrono::DateTime<Utc>,
-) -> usize {
-    candidates
-        .iter()
-        .map(|&provider_index| live_window_count(&windows[provider_index], now))
-        .max()
-        .unwrap_or(0)
-}
-
-fn live_window_count(windows: &[QuotaWindow], now: chrono::DateTime<Utc>) -> usize {
-    windows
-        .iter()
-        .filter(|window| window_is_live(window, now))
-        .count()
-}
-
-fn window_is_live(window: &QuotaWindow, now: chrono::DateTime<Utc>) -> bool {
-    window.resets_at > now
-}
-
-fn provider_projection_from_records(
-    model: &ModelConfig,
-    state: &StateDb,
-    quotas: &[Option<QuotaRecord>],
-    windows: &[Vec<QuotaWindow>],
-    provider_index: usize,
-    pool_max_live_windows: usize,
-    now: chrono::DateTime<Utc>,
-) -> ProviderProjection {
-    let recent_errors = projection_recent_error_count(model, state, provider_index);
-    if projection_is_recent_error_suppressed(recent_errors) {
-        return suppressed_provider_projection(provider_index, recent_errors);
-    }
-
-    let turns = assistant_turns_since_refresh(model, state, quotas, provider_index);
-    let assembly = projection_assembly_for_provider(
-        provider_index,
-        turns,
-        quotas,
-        windows,
-        pool_max_live_windows,
-        now,
-    );
-    assemble_provider_projection(provider_index, recent_errors, assembly)
-}
-
-fn projection_recent_error_count(
-    model: &ModelConfig,
-    state: &StateDb,
-    provider_index: usize,
-) -> i64 {
-    state
-        .recent_error_count(
-            &model.name,
-            &model.providers[provider_index].name,
-            ERROR_WINDOW_MINUTES,
-        )
-        .unwrap_or(0)
-}
-
-fn projection_is_recent_error_suppressed(recent_errors: i64) -> bool {
-    recent_errors >= ERROR_THRESHOLD as i64
-}
-
-fn suppressed_provider_projection(provider_index: usize, recent_errors: i64) -> ProviderProjection {
-    ProviderProjection {
-        provider_index,
-        projections_per_window: Vec::new(),
-        binding_score: None,
-        recent_error_count: recent_errors as u32,
-    }
-}
-
-fn assistant_turns_since_refresh(
-    model: &ModelConfig,
-    state: &StateDb,
-    quotas: &[Option<QuotaRecord>],
-    provider_index: usize,
-) -> u64 {
-    quotas[provider_index]
-        .as_ref()
-        .and_then(|quota| {
-            state
-                .count_assistant_turns_since(
-                    &model.providers[provider_index].name,
-                    quota.refreshed_at.as_ref(),
-                )
-                .ok()
-        })
-        .unwrap_or(0)
-}
-
-fn projection_assembly_for_provider(
-    provider_index: usize,
-    turns: u64,
-    quotas: &[Option<QuotaRecord>],
-    windows: &[Vec<QuotaWindow>],
-    pool_max_live_windows: usize,
-    now: chrono::DateTime<Utc>,
-) -> ProjectionAssembly {
-    let mut assembly = ProjectionAssembly::new();
-    apply_hidden_window_penalty(
-        &mut assembly,
-        &windows[provider_index],
-        pool_max_live_windows,
-        now,
-    );
-
-    for window in live_windows(&windows[provider_index], now) {
-        apply_window_projection(
-            &mut assembly,
-            provider_index,
-            window,
-            turns,
-            quotas,
-            windows,
-            now,
-        );
-    }
-
-    assembly
-}
-
-fn apply_hidden_window_penalty(
-    assembly: &mut ProjectionAssembly,
-    windows: &[QuotaWindow],
-    pool_max_live_windows: usize,
-    now: chrono::DateTime<Utc>,
-) {
-    if hidden_window_penalty_applies(windows, pool_max_live_windows, now) {
-        assembly.binding_score = assembly.binding_score.min(0.0);
-        assembly.scored_window = true;
-    }
-}
-
-fn hidden_window_penalty_applies(
-    windows: &[QuotaWindow],
-    pool_max_live_windows: usize,
-    now: chrono::DateTime<Utc>,
-) -> bool {
-    live_window_count(windows, now) < pool_max_live_windows
-        && any_live_window_near_cap(windows, now)
-}
-
-fn any_live_window_near_cap(windows: &[QuotaWindow], now: chrono::DateTime<Utc>) -> bool {
-    windows.iter().any(|window| {
-        window_is_live(window, now) && window.used_percent >= HIDDEN_WINDOW_PENALTY_THRESHOLD
-    })
-}
-
-fn live_windows(
-    windows: &[QuotaWindow],
-    now: chrono::DateTime<Utc>,
-) -> impl Iterator<Item = &QuotaWindow> {
-    windows
-        .iter()
-        .filter(move |window| window_is_live(window, now))
-}
-
-fn apply_window_projection(
-    assembly: &mut ProjectionAssembly,
-    provider_index: usize,
-    window: &QuotaWindow,
-    turns: u64,
-    quotas: &[Option<QuotaRecord>],
-    windows: &[Vec<QuotaWindow>],
-    now: chrono::DateTime<Utc>,
-) {
-    let Some(projected_window) =
-        projected_live_window(provider_index, window, turns, quotas, windows, now)
-    else {
-        assembly.unlearned = true;
-        return;
-    };
-    assembly.binding_score = assembly
-        .binding_score
-        .min(window_binding_score(&projected_window));
-    assembly.scored_window = true;
-    assembly.projections.push(projected_window);
-}
-
-fn projected_live_window(
-    provider_index: usize,
-    window: &QuotaWindow,
-    turns: u64,
-    quotas: &[Option<QuotaRecord>],
-    windows: &[Vec<QuotaWindow>],
-    now: chrono::DateTime<Utc>,
-) -> Option<WindowProjection> {
-    let burn_rate = bootstrap_burn_rate(provider_index, window, quotas, windows)?;
-    let projected = project_used_percent(window.used_percent, turns, burn_rate);
-    let hours = window_hours_until_reset(window, now);
-    let remaining_headroom = remaining_headroom(projected);
-    Some(WindowProjection {
-        window_id: window.window_id as i64,
-        projected_used: projected,
-        hours_until_reset: hours,
-        remaining_headroom,
-    })
-}
-
-fn window_hours_until_reset(window: &QuotaWindow, now: chrono::DateTime<Utc>) -> f64 {
-    ((window.resets_at - now).num_seconds() as f64 / 3600.0).max(EPS_HOURS)
-}
-
-fn remaining_headroom(projected_used: f64) -> f64 {
-    (1.0 - projected_used).max(0.0)
-}
-
-fn window_binding_score(window: &WindowProjection) -> f64 {
-    window.remaining_headroom * window.hours_until_reset
-}
-
-fn assemble_provider_projection(
-    provider_index: usize,
-    recent_errors: i64,
-    assembly: ProjectionAssembly,
-) -> ProviderProjection {
-    let binding_score = projection_binding_score(&assembly);
-    ProviderProjection {
-        provider_index,
-        projections_per_window: assembly.projections,
-        binding_score,
-        recent_error_count: recent_errors as u32,
-    }
-}
-
-fn projection_binding_score(assembly: &ProjectionAssembly) -> Option<f64> {
-    (!assembly.unlearned && assembly.scored_window).then_some(assembly.binding_score)
 }
 
 pub fn decide_migration(
@@ -900,592 +555,6 @@ fn migration_load_order(a: &ProviderProjection, b: &ProviderProjection) -> std::
         .partial_cmp(&provider_load(b))
         .unwrap_or(std::cmp::Ordering::Equal)
         .then_with(|| a.provider_index.cmp(&b.provider_index))
-}
-
-fn best_binding_score<'a>(evals: &[&'a ProviderEval]) -> &'a ProviderEval {
-    assert_binding_score_candidates(evals);
-    max_binding_score_eval(evals)
-}
-
-fn assert_binding_score_candidates(evals: &[&ProviderEval]) {
-    debug_assert!(!evals.is_empty(), "best_binding_score: empty slice");
-    debug_assert!(
-        evals.iter().all(|e| e.binding_score.is_some()),
-        "best_binding_score: caller must filter to providers with a learned binding_score"
-    );
-}
-
-fn max_binding_score_eval<'a>(evals: &[&'a ProviderEval]) -> &'a ProviderEval {
-    evals
-        .iter()
-        .copied()
-        .max_by(|a, b| {
-            a.binding_score
-                .unwrap()
-                .partial_cmp(&b.binding_score.unwrap())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .unwrap()
-}
-
-fn approx_eq_usage(a: f64, b: f64) -> bool {
-    (a - b).abs() <= f64::EPSILON * a.abs().max(b.abs()).max(1.0)
-}
-
-fn fanout_usage_key(projection: &ProviderProjection) -> FanoutUsageKey {
-    fanout_usage_key_from_parts(
-        worst_projected_usage(projection),
-        soonest_relevant_reset_hours(projection),
-    )
-}
-
-fn fanout_usage_key_from_parts(
-    worst_projected_used: Option<f64>,
-    soonest_reset_hours: Option<f64>,
-) -> FanoutUsageKey {
-    FanoutUsageKey {
-        worst_projected_used,
-        soonest_reset_hours,
-    }
-}
-
-fn worst_projected_usage(projection: &ProviderProjection) -> Option<f64> {
-    projection
-        .projections_per_window
-        .iter()
-        .map(|window| window.projected_used)
-        .filter(|projected_used| projected_used.is_finite())
-        .reduce(f64::max)
-}
-
-fn soonest_relevant_reset_hours(projection: &ProviderProjection) -> Option<f64> {
-    if let Some(worst) = worst_projected_usage(projection) {
-        return soonest_reset_hours_for_worst_usage(projection, worst);
-    }
-    soonest_finite_reset_hours(projection)
-}
-
-fn soonest_reset_hours_for_worst_usage(
-    projection: &ProviderProjection,
-    worst_projected_used: f64,
-) -> Option<f64> {
-    projection
-        .projections_per_window
-        .iter()
-        .filter(|window| reset_belongs_to_worst_usage(window, worst_projected_used))
-        .map(|window| window.hours_until_reset)
-        .reduce(f64::min)
-}
-
-fn reset_belongs_to_worst_usage(window: &WindowProjection, worst_projected_used: f64) -> bool {
-    window.projected_used.is_finite()
-        && approx_eq_usage(window.projected_used, worst_projected_used)
-        && window.hours_until_reset.is_finite()
-}
-
-fn soonest_finite_reset_hours(projection: &ProviderProjection) -> Option<f64> {
-    projection
-        .projections_per_window
-        .iter()
-        .map(|window| window.hours_until_reset)
-        .filter(|hours| hours.is_finite())
-        .reduce(f64::min)
-}
-
-fn finite_fanout_usage(eval: &ProviderEval) -> Option<f64> {
-    eval.fanout_usage
-        .and_then(|usage| usage.worst_projected_used)
-        .filter(|value| value.is_finite())
-}
-
-fn finite_fanout_reset(eval: &ProviderEval) -> Option<f64> {
-    eval.fanout_usage
-        .and_then(|usage| usage.soonest_reset_hours)
-        .filter(|value| value.is_finite())
-}
-
-fn fanout_candidate_order(a: &ProviderEval, b: &ProviderEval) -> std::cmp::Ordering {
-    fanout_usage_order(a, b)
-        .or_else(|| fanout_score_order(a, b))
-        .unwrap_or_else(|| fanout_reset_or_index_order(a, b))
-}
-
-fn fanout_usage_order(a: &ProviderEval, b: &ProviderEval) -> Option<std::cmp::Ordering> {
-    let (Some(a_usage), Some(b_usage)) = (finite_fanout_usage(a), finite_fanout_usage(b)) else {
-        return None;
-    };
-    (!approx_eq_usage(a_usage, b_usage)).then(|| {
-        a_usage
-            .partial_cmp(&b_usage)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    })
-}
-
-fn fanout_score_order(a: &ProviderEval, b: &ProviderEval) -> Option<std::cmp::Ordering> {
-    let (Some(a_score), Some(b_score)) = (a.binding_score, b.binding_score) else {
-        return None;
-    };
-    (finite_distinct_fanout_scores(a_score, b_score)).then(|| {
-        b_score
-            .partial_cmp(&a_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    })
-}
-
-fn finite_distinct_fanout_scores(a_score: f64, b_score: f64) -> bool {
-    a_score.is_finite() && b_score.is_finite() && !approx_eq_usage(a_score, b_score)
-}
-
-fn fanout_reset_or_index_order(a: &ProviderEval, b: &ProviderEval) -> std::cmp::Ordering {
-    match (finite_fanout_reset(a), finite_fanout_reset(b)) {
-        (Some(a_reset), Some(b_reset)) if distinct_reset_hours(a_reset, b_reset) => a_reset
-            .partial_cmp(&b_reset)
-            .unwrap_or(std::cmp::Ordering::Equal),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        _ => a.index.cmp(&b.index),
-    }
-}
-
-fn distinct_reset_hours(a_reset: f64, b_reset: f64) -> bool {
-    (a_reset - b_reset).abs() > EPS_HOURS
-}
-
-fn select_binding_score_with_fanout(model: &ModelConfig, eligible: &[ProviderEval]) -> usize {
-    let eligible_refs: Vec<&ProviderEval> = eligible.iter().collect();
-    let argmax = best_binding_score(&eligible_refs);
-
-    if fanout_should_use_argmax(eligible) {
-        return argmax.index;
-    }
-
-    let best = best_positive_binding_score(eligible);
-    if !binding_score_can_fanout(best) {
-        return argmax.index;
-    }
-
-    let mut band = fanout_score_band(eligible, best);
-    if band.len() < 2 {
-        return argmax.index;
-    }
-    band.sort_by_key(|eval| eval.index);
-
-    let selected = selected_fanout_candidate(&band);
-
-    if selected.index != argmax.index {
-        trace_fanout_selection(model, &band, selected);
-    }
-
-    selected.index
-}
-
-fn fanout_should_use_argmax(eligible: &[ProviderEval]) -> bool {
-    eligible.len() < 2 || eligible.iter().any(nonfinite_binding_score)
-}
-
-fn nonfinite_binding_score(eval: &ProviderEval) -> bool {
-    !eval.binding_score.unwrap().is_finite()
-}
-
-fn best_positive_binding_score(eligible: &[ProviderEval]) -> f64 {
-    eligible
-        .iter()
-        .filter_map(|eval| eval.binding_score.filter(|score| *score > 0.0))
-        .fold(f64::NEG_INFINITY, f64::max)
-}
-
-fn binding_score_can_fanout(best: f64) -> bool {
-    best.is_finite() && best > 0.0
-}
-
-fn fanout_score_band(eligible: &[ProviderEval], best: f64) -> Vec<&ProviderEval> {
-    eligible
-        .iter()
-        .filter(|eval| eval.binding_score.unwrap() >= best / FANOUT_SCORE_BAND_RATIO)
-        .collect()
-}
-
-fn selected_fanout_candidate<'a>(band: &[&'a ProviderEval]) -> &'a ProviderEval {
-    band.iter()
-        .copied()
-        .min_by(|a, b| fanout_candidate_order(a, b))
-        .unwrap()
-}
-
-fn trace_fanout_selection(model: &ModelConfig, band: &[&ProviderEval], selected: &ProviderEval) {
-    let selected_provider_name = &model.providers[selected.index].name;
-    let band_member_names = fanout_band_member_names(model, band);
-    tracing::info!(
-        selected_provider_name = selected_provider_name.as_str(),
-        band_member_names = band_member_names.as_str(),
-        selected_binding_score = selected.binding_score.unwrap(),
-        "fanout selected"
-    );
-}
-
-fn fanout_band_member_names(model: &ModelConfig, band: &[&ProviderEval]) -> String {
-    band.iter()
-        .map(|eval| model.providers[eval.index].name.as_str())
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-fn project_used_percent(base_used_percent: f64, turns: u64, burn_rate: f64) -> f64 {
-    (base_used_percent + (turns as f64) * burn_rate).max(0.0)
-}
-
-fn learned_rate(window: &QuotaWindow) -> Option<f64> {
-    match (window.last_delta_percent, window.last_delta_calls) {
-        (Some(delta_percent), Some(delta_calls)) if delta_percent > 0.0 && delta_calls > 0 => {
-            Some(delta_percent / delta_calls as f64)
-        }
-        _ => None,
-    }
-}
-
-fn bootstrap_burn_rate(
-    provider_index: usize,
-    window: &QuotaWindow,
-    quotas: &[Option<QuotaRecord>],
-    windows: &[Vec<QuotaWindow>],
-) -> Option<f64> {
-    learned_rate(window)
-        .or_else(|| pool_window_avg_percent_per_call(window.window_id, windows))
-        .or_else(|| {
-            duration_ratio_fallback_percent_per_call(provider_index, window, quotas, windows)
-        })
-}
-
-fn pool_window_avg_percent_per_call(window_id: u32, windows: &[Vec<QuotaWindow>]) -> Option<f64> {
-    percent_per_call(pool_window_delta_totals(window_id, windows))
-}
-
-fn pool_window_delta_totals(window_id: u32, windows: &[Vec<QuotaWindow>]) -> (f64, u64) {
-    let mut total_percent = 0.0;
-    let mut total_calls: u64 = 0;
-    for window in windows.iter().flatten() {
-        if let Some((delta_percent, delta_calls)) = learned_window_delta(window_id, window) {
-            total_percent += delta_percent;
-            total_calls += delta_calls;
-        }
-    }
-    (total_percent, total_calls)
-}
-
-fn learned_window_delta(window_id: u32, window: &QuotaWindow) -> Option<(f64, u64)> {
-    if window.window_id != window_id {
-        return None;
-    }
-    valid_delta_pair(window.last_delta_percent, window.last_delta_calls)
-}
-
-fn valid_delta_pair(delta_percent: Option<f64>, delta_calls: Option<u64>) -> Option<(f64, u64)> {
-    match (delta_percent, delta_calls) {
-        (Some(delta_percent), Some(delta_calls)) if delta_percent > 0.0 && delta_calls > 0 => {
-            Some((delta_percent, delta_calls))
-        }
-        _ => None,
-    }
-}
-
-fn percent_per_call((total_percent, total_calls): (f64, u64)) -> Option<f64> {
-    (total_calls > 0).then_some(total_percent / total_calls as f64)
-}
-
-fn duration_ratio_fallback_percent_per_call(
-    provider_index: usize,
-    target_window: &QuotaWindow,
-    quotas: &[Option<QuotaRecord>],
-    windows: &[Vec<QuotaWindow>],
-) -> Option<f64> {
-    let target_refreshed_at = refreshed_at_for_provider(quotas, provider_index)?;
-    let target_hours = window_duration_hours(target_window, target_refreshed_at);
-    longest_learned_duration_candidate(quotas, windows, target_hours)
-        .map(|candidate| duration_ratio_candidate_rate(candidate, target_hours))
-}
-
-#[derive(Clone, Copy)]
-struct DurationRatioCandidate {
-    rate: f64,
-    hours: f64,
-}
-
-fn refreshed_at_for_provider(
-    quotas: &[Option<QuotaRecord>],
-    provider_index: usize,
-) -> Option<&chrono::DateTime<Utc>> {
-    quotas
-        .get(provider_index)
-        .and_then(|quota| quota.as_ref())
-        .and_then(|quota| quota.refreshed_at.as_ref())
-}
-
-fn window_duration_hours(window: &QuotaWindow, refreshed_at: &chrono::DateTime<Utc>) -> f64 {
-    ((window.resets_at - *refreshed_at).num_seconds() as f64 / 3600.0).max(EPS_HOURS)
-}
-
-fn longest_learned_duration_candidate(
-    quotas: &[Option<QuotaRecord>],
-    windows: &[Vec<QuotaWindow>],
-    target_hours: f64,
-) -> Option<DurationRatioCandidate> {
-    learned_duration_candidates(quotas, windows, target_hours)
-        .into_iter()
-        .fold(None, |best, candidate| {
-            if best.is_none_or(|best: DurationRatioCandidate| candidate.hours > best.hours) {
-                Some(candidate)
-            } else {
-                best
-            }
-        })
-}
-
-fn learned_duration_candidates(
-    quotas: &[Option<QuotaRecord>],
-    windows: &[Vec<QuotaWindow>],
-    target_hours: f64,
-) -> Vec<DurationRatioCandidate> {
-    windows
-        .iter()
-        .enumerate()
-        .flat_map(|(provider_index, provider_windows)| {
-            learned_duration_candidates_for_provider(
-                refreshed_at_for_provider(quotas, provider_index),
-                provider_windows,
-                target_hours,
-            )
-        })
-        .collect()
-}
-
-fn learned_duration_candidates_for_provider(
-    refreshed_at: Option<&chrono::DateTime<Utc>>,
-    provider_windows: &[QuotaWindow],
-    target_hours: f64,
-) -> Vec<DurationRatioCandidate> {
-    let Some(refreshed_at) = refreshed_at else {
-        return Vec::new();
-    };
-    provider_windows
-        .iter()
-        .filter_map(|window| learned_duration_candidate(window, refreshed_at, target_hours))
-        .collect()
-}
-
-fn learned_duration_candidate(
-    window: &QuotaWindow,
-    refreshed_at: &chrono::DateTime<Utc>,
-    target_hours: f64,
-) -> Option<DurationRatioCandidate> {
-    let rate = learned_rate(window)?;
-    let hours = window_duration_hours(window, refreshed_at);
-    duration_candidate_is_longer_than_target(hours, target_hours)
-        .then_some(DurationRatioCandidate { rate, hours })
-}
-
-fn duration_candidate_is_longer_than_target(candidate_hours: f64, target_hours: f64) -> bool {
-    candidate_hours > target_hours
-}
-
-fn duration_ratio_candidate_rate(candidate: DurationRatioCandidate, target_hours: f64) -> f64 {
-    duration_ratio_rate(candidate.rate, candidate.hours, target_hours)
-}
-
-fn duration_ratio_rate(long_rate: f64, long_hours: f64, target_hours: f64) -> f64 {
-    long_rate * (long_hours / target_hours.max(EPS_HOURS))
-}
-
-#[cfg(test)]
-pub(crate) fn project_used_percent_for_test(
-    base_used_percent: f64,
-    turns: u64,
-    burn_rate: f64,
-) -> f64 {
-    project_used_percent(base_used_percent, turns, burn_rate)
-}
-
-#[cfg(test)]
-pub(crate) fn bootstrap_burn_rate_for_test(
-    model: &ModelConfig,
-    state: &StateDb,
-    provider_index: usize,
-    window_id: u32,
-) -> Option<f64> {
-    let snapshot = quota_snapshot_for_test(model, state);
-    let target = test_target_window(&snapshot, provider_index, window_id)?;
-    bootstrap_burn_rate(provider_index, target, &snapshot.quotas, &snapshot.windows)
-}
-
-#[cfg(test)]
-fn quota_snapshot_for_test(model: &ModelConfig, state: &StateDb) -> QuotaSnapshot {
-    QuotaSnapshot {
-        quotas: test_cached_quotas(model, state),
-        windows: test_cached_windows(model, state),
-    }
-}
-
-#[cfg(test)]
-fn test_cached_quotas(model: &ModelConfig, state: &StateDb) -> Vec<Option<QuotaRecord>> {
-    model
-        .providers
-        .iter()
-        .map(|provider| state.get_quota(&provider.name).ok().flatten())
-        .collect()
-}
-
-#[cfg(test)]
-fn test_cached_windows(model: &ModelConfig, state: &StateDb) -> Vec<Vec<QuotaWindow>> {
-    model
-        .providers
-        .iter()
-        .map(|provider| state.get_windows(&provider.name).unwrap_or_default())
-        .collect()
-}
-
-#[cfg(test)]
-fn test_target_window(
-    snapshot: &QuotaSnapshot,
-    provider_index: usize,
-    window_id: u32,
-) -> Option<&QuotaWindow> {
-    snapshot
-        .windows
-        .get(provider_index)?
-        .iter()
-        .find(|window| window.window_id == window_id)
-}
-
-#[cfg(test)]
-pub(crate) fn bootstrap_duration_ratio_for_test(
-    long_rate: f64,
-    long_hours: f64,
-    target_hours: f64,
-) -> f64 {
-    duration_ratio_rate(long_rate, long_hours, target_hours)
-}
-
-fn score_by_invocation_count(model: &ModelConfig, state: &StateDb, candidates: &[usize]) -> usize {
-    let mut scores = invocation_count_scores(model, state, candidates);
-    sort_invocation_count_scores(scores.as_mut_slice());
-
-    if all_invocation_candidates_suppressed(scores.as_slice()) {
-        return round_robin_fallback(model, state, candidates);
-    }
-    selected_invocation_count_score(scores.as_slice())
-}
-
-fn invocation_count_scores(
-    model: &ModelConfig,
-    state: &StateDb,
-    candidates: &[usize],
-) -> Vec<(usize, f64)> {
-    candidates
-        .iter()
-        .map(|&provider_index| invocation_count_score(model, state, provider_index))
-        .collect()
-}
-
-fn invocation_count_score(
-    model: &ModelConfig,
-    state: &StateDb,
-    provider_index: usize,
-) -> (usize, f64) {
-    let recent_errors = fallback_recent_error_count(model, state, provider_index);
-    if fallback_provider_is_suppressed(recent_errors) {
-        return (provider_index, f64::MAX);
-    }
-
-    (
-        provider_index,
-        fallback_invocation_count(model, state, provider_index) as f64
-            + fallback_error_penalty(recent_errors),
-    )
-}
-
-fn fallback_recent_error_count(model: &ModelConfig, state: &StateDb, provider_index: usize) -> i64 {
-    state
-        .recent_error_count(
-            &model.name,
-            &model.providers[provider_index].name,
-            ERROR_WINDOW_MINUTES,
-        )
-        .unwrap_or(0)
-}
-
-fn fallback_provider_is_suppressed(recent_errors: i64) -> bool {
-    recent_errors >= ERROR_THRESHOLD as i64
-}
-
-fn fallback_invocation_count(model: &ModelConfig, state: &StateDb, provider_index: usize) -> i64 {
-    state
-        .get_provider(&model.name, &model.providers[provider_index].name)
-        .ok()
-        .flatten()
-        .map(|provider| provider.invocation_count)
-        .unwrap_or(0)
-}
-
-fn fallback_error_penalty(recent_errors: i64) -> f64 {
-    recent_errors as f64 * 10.0
-}
-
-fn sort_invocation_count_scores(scores: &mut [(usize, f64)]) {
-    scores.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-}
-
-fn all_invocation_candidates_suppressed(scores: &[(usize, f64)]) -> bool {
-    scores.iter().all(|(_, score)| *score == f64::MAX)
-}
-
-fn selected_invocation_count_score(scores: &[(usize, f64)]) -> usize {
-    scores[0].0
-}
-
-fn round_robin_fallback(model: &ModelConfig, state: &StateDb, candidates: &[usize]) -> usize {
-    assert_round_robin_candidates(candidates);
-    select_lowest_invocation_count(
-        round_robin_invocation_counts(model, state, candidates).as_slice(),
-    )
-}
-
-fn assert_round_robin_candidates(candidates: &[usize]) {
-    debug_assert!(
-        !candidates.is_empty(),
-        "round_robin_fallback: caller must pass a non-empty candidates slice"
-    );
-}
-
-fn round_robin_invocation_counts(
-    model: &ModelConfig,
-    state: &StateDb,
-    candidates: &[usize],
-) -> Vec<(usize, i64)> {
-    candidates
-        .iter()
-        .map(|&provider_index| {
-            (
-                provider_index,
-                fallback_invocation_count(model, state, provider_index),
-            )
-        })
-        .collect()
-}
-
-fn select_lowest_invocation_count(counts: &[(usize, i64)]) -> usize {
-    let mut min_count = i64::MAX;
-    let mut best = counts
-        .first()
-        .map(|(provider_index, _)| *provider_index)
-        .unwrap_or(0);
-
-    for &(provider_index, count) in counts {
-        if count < min_count {
-            min_count = count;
-            best = provider_index;
-        }
-    }
-
-    best
 }
 
 #[cfg(test)]
@@ -1978,13 +1047,41 @@ mod tests {
         }
     }
 
-    fn balancer_production_sources() -> [(&'static str, &'static str); 6] {
+    fn balancer_production_sources() -> [(&'static str, &'static str); 10] {
         [
             (
                 "crates/oulipoly-runtime/src/balancer/mod.rs",
                 production_balancer_source(
                     "crates/oulipoly-runtime/src/balancer/mod.rs",
                     include_str!("mod.rs"),
+                ),
+            ),
+            (
+                "crates/oulipoly-runtime/src/balancer/projection.rs",
+                production_balancer_source(
+                    "crates/oulipoly-runtime/src/balancer/projection.rs",
+                    include_str!("projection.rs"),
+                ),
+            ),
+            (
+                "crates/oulipoly-runtime/src/balancer/burn_rate.rs",
+                production_balancer_source(
+                    "crates/oulipoly-runtime/src/balancer/burn_rate.rs",
+                    include_str!("burn_rate.rs"),
+                ),
+            ),
+            (
+                "crates/oulipoly-runtime/src/balancer/density.rs",
+                production_balancer_source(
+                    "crates/oulipoly-runtime/src/balancer/density.rs",
+                    include_str!("density.rs"),
+                ),
+            ),
+            (
+                "crates/oulipoly-runtime/src/balancer/invocation_fallback.rs",
+                production_balancer_source(
+                    "crates/oulipoly-runtime/src/balancer/invocation_fallback.rs",
+                    include_str!("invocation_fallback.rs"),
                 ),
             ),
             (

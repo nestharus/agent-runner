@@ -55,13 +55,63 @@ fn balancer_mod_has_no_terminal_signal_or_provider_output_parser_references() {
     }
 }
 
-fn balancer_production_sources() -> [(&'static str, &'static str); 6] {
+// risk: Inline AGE-153 guard could false-green after B3 modules are created; level: component/structural; source: AGE-224 contract Guard And Spec Contract / proposal A4.
+#[test]
+fn inline_age153_guard_source_list_declares_age224_b3_modules() {
+    let guard_body = balancer_source_list_body(
+        include_str!("../src/balancer/mod.rs"),
+        "fn balancer_production_sources() ->",
+        "fn production_balancer_source(",
+    );
+    assert_b3_balancer_modules_are_declared("inline AGE-153 guard", guard_body);
+}
+
+// risk: External AGE-153 guard could false-green after B3 modules are created; level: component/structural; source: AGE-224 contract Guard And Spec Contract / proposal A4.
+#[test]
+fn external_age153_guard_source_list_declares_age224_b3_modules() {
+    let guard_body = balancer_source_list_body(
+        include_str!("age153_balancer_signal_isolation.rs"),
+        "fn balancer_production_sources() ->",
+        "fn production_balancer_source(",
+    );
+    assert_b3_balancer_modules_are_declared("external AGE-153 guard", guard_body);
+}
+
+fn balancer_production_sources() -> [(&'static str, &'static str); 10] {
     [
         (
             "crates/oulipoly-runtime/src/balancer/mod.rs",
             production_balancer_source(
                 "crates/oulipoly-runtime/src/balancer/mod.rs",
                 include_str!("../src/balancer/mod.rs"),
+            ),
+        ),
+        (
+            "crates/oulipoly-runtime/src/balancer/projection.rs",
+            production_balancer_source(
+                "crates/oulipoly-runtime/src/balancer/projection.rs",
+                include_str!("../src/balancer/projection.rs"),
+            ),
+        ),
+        (
+            "crates/oulipoly-runtime/src/balancer/burn_rate.rs",
+            production_balancer_source(
+                "crates/oulipoly-runtime/src/balancer/burn_rate.rs",
+                include_str!("../src/balancer/burn_rate.rs"),
+            ),
+        ),
+        (
+            "crates/oulipoly-runtime/src/balancer/density.rs",
+            production_balancer_source(
+                "crates/oulipoly-runtime/src/balancer/density.rs",
+                include_str!("../src/balancer/density.rs"),
+            ),
+        ),
+        (
+            "crates/oulipoly-runtime/src/balancer/invocation_fallback.rs",
+            production_balancer_source(
+                "crates/oulipoly-runtime/src/balancer/invocation_fallback.rs",
+                include_str!("../src/balancer/invocation_fallback.rs"),
             ),
         ),
         (
@@ -100,6 +150,36 @@ fn balancer_production_sources() -> [(&'static str, &'static str); 6] {
             ),
         ),
     ]
+}
+
+fn assert_b3_balancer_modules_are_declared(guard_name: &str, guard_body: &str) {
+    for module in [
+        "projection.rs",
+        "burn_rate.rs",
+        "density.rs",
+        "invocation_fallback.rs",
+    ] {
+        assert!(
+            guard_body.contains(&format!("src/balancer/{module}")),
+            "{guard_name} must name crates/oulipoly-runtime/src/balancer/{module}"
+        );
+        assert!(
+            guard_body.contains(&format!("include_str!(\"../src/balancer/{module}\")"))
+                || guard_body.contains(&format!("include_str!(\"{module}\")")),
+            "{guard_name} must compile-time include balancer/{module}"
+        );
+    }
+}
+
+fn balancer_source_list_body<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+    let start_index = source
+        .rfind(start)
+        .unwrap_or_else(|| panic!("missing source-list start marker {start}"));
+    let after_start = &source[start_index..];
+    let end_index = after_start
+        .find(end)
+        .unwrap_or_else(|| panic!("missing source-list end marker {end}"));
+    &after_start[..end_index]
 }
 
 fn production_balancer_source(module_path: &str, source: &'static str) -> &'static str {
