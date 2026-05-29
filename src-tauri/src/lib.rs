@@ -24,6 +24,8 @@
 //!       - AGE-166 typed terminal-signal kind to durable-mark predicate
 //! ```
 
+#[path = "commands/provider_settings.rs"]
+pub(crate) mod provider_settings;
 pub mod setup;
 pub mod terminal_outcome_adapter;
 pub mod usage;
@@ -130,6 +132,10 @@ pub struct AppState {
     quota_service: Arc<dyn QuotaServicePort>,
     executor_service: Arc<dyn ExecutorServicePort>,
     diagnostics_service: Arc<dyn DiagnosticsServicePort>,
+    pub(crate) provider_settings: Mutex<oulipoly_runtime::provider_settings::ProviderSettingsHost>,
+    #[cfg(test)]
+    pub(crate) provider_settings_test_double:
+        Mutex<Option<provider_settings::ProviderSettingsCommandResponses>>,
     #[cfg(test)]
     setup_repository: Option<Arc<dyn SetupRepository + Send + Sync>>,
 }
@@ -163,6 +169,14 @@ impl AppState {
         let providers_config: Arc<dyn ProvidersConfigRepository + Send + Sync> =
             services.providers_config.clone();
         let routing_service: Arc<dyn RoutingServicePort> = services.routing_service.clone();
+        let provider_settings =
+            provider_settings::build_host(&models_dir, &models).unwrap_or_else(|_| {
+                oulipoly_runtime::provider_settings::ProviderSettingsHost::from_model_configs(
+                    &[],
+                    provider_settings::host_options(&models_dir),
+                )
+                .expect("empty provider settings host should build")
+            });
         Self {
             models: Mutex::new(models),
             models_dir,
@@ -174,6 +188,9 @@ impl AppState {
             quota_service: Arc::clone(&services.quota_service),
             executor_service: Arc::clone(&services.executor_service),
             diagnostics_service: Arc::clone(&services.diagnostics_service),
+            provider_settings: Mutex::new(provider_settings),
+            #[cfg(test)]
+            provider_settings_test_double: Mutex::new(None),
             #[cfg(test)]
             setup_repository: None,
         }
@@ -181,6 +198,14 @@ impl AppState {
 
     #[cfg(test)]
     fn test_default(models_dir: PathBuf, models: HashMap<String, config::ModelConfig>) -> Self {
+        let provider_settings =
+            provider_settings::build_host(&models_dir, &models).unwrap_or_else(|_| {
+                oulipoly_runtime::provider_settings::ProviderSettingsHost::from_model_configs(
+                    &[],
+                    provider_settings::host_options(&models_dir),
+                )
+                .expect("empty provider settings host should build")
+            });
         Self {
             models: Mutex::new(models),
             models_dir,
@@ -192,6 +217,8 @@ impl AppState {
             quota_service: Arc::new(oulipoly_runtime::quota::RuntimeQuotaService),
             executor_service: Arc::new(oulipoly_runtime::executor::RuntimeExecutorService),
             diagnostics_service: Arc::new(oulipoly_runtime::diagnostics::RuntimeDiagnosticsService),
+            provider_settings: Mutex::new(provider_settings),
+            provider_settings_test_double: Mutex::new(None),
             setup_repository: None,
         }
     }
@@ -322,6 +349,8 @@ fn reload_models(state: tauri::State<AppState>) -> Result<(), String> {
     let fresh = config::load_models(&state.models_dir, Some(&providers)).unwrap_or_default();
     let mut models = state.models.lock().map_err(|e| e.to_string())?;
     *models = fresh;
+    drop(models);
+    provider_settings::refresh_provider_settings_host(&state)?;
     Ok(())
 }
 
@@ -394,6 +423,8 @@ fn save_model_inner(state: &AppState, model: ModelConfig) -> Result<(), String> 
 
     let mut models = state.models.lock().map_err(|e| e.to_string())?;
     models.insert(model.name.clone(), model);
+    drop(models);
+    provider_settings::refresh_provider_settings_host(state)?;
     Ok(())
 }
 
@@ -405,6 +436,8 @@ fn delete_model(state: tauri::State<AppState>, name: String) -> Result<(), Strin
     }
     let mut models = state.models.lock().map_err(|e| e.to_string())?;
     models.remove(&name);
+    drop(models);
+    provider_settings::refresh_provider_settings_host(&state)?;
     Ok(())
 }
 
@@ -1097,6 +1130,15 @@ pub fn run_tauri() {
             save_model,
             delete_model,
             list_pools,
+            provider_settings::list_provider_settings_targets,
+            provider_settings::get_provider_settings_schema,
+            provider_settings::list_provider_settings,
+            provider_settings::get_provider_settings,
+            provider_settings::create_provider_settings,
+            provider_settings::update_provider_settings,
+            provider_settings::delete_provider_settings,
+            provider_settings::validate_provider_settings,
+            provider_settings::migrate_provider_settings,
             refresh_quotas,
             update_pool,
             test_model,
@@ -1120,6 +1162,7 @@ mod tests {
 
     use super::*;
     use config::{ModelConfig, PromptMode, ProviderConfig};
+    use oulipoly_config::provider_implementation_ref::ProviderImplementationRef;
     use oulipoly_config::repositories::ProvidersConfigRepository;
     use oulipoly_config::{
         ClaudeRestrictions, CodexRestrictions, ProviderEntry, ProvidersConfig, ToolRestrictionKind,
@@ -1173,6 +1216,22 @@ mod tests {
         }
     }
 
+    fn model_with_provider_artifact(name: &str, provider_name: &str, path: &Path) -> ModelConfig {
+        ModelConfig {
+            name: name.to_string(),
+            prompt_mode: PromptMode::Arg,
+            providers: vec![ProviderConfig::model_provider(provider_name, Vec::new())],
+            inputs: vec![],
+            provider: Some(ProviderImplementationRef {
+                path: Some(path.display().to_string()),
+                crate_name: None,
+                version: None,
+                binary: None,
+                script: None,
+            }),
+        }
+    }
+
     fn test_state(models_dir: PathBuf, models: HashMap<String, ModelConfig>) -> AppState {
         AppState::test_default(models_dir, models)
     }
@@ -1193,6 +1252,14 @@ mod tests {
             models: HashMap<String, ModelConfig>,
             services: Phase6bServiceBundle,
         ) -> AppState {
+            let provider_settings = provider_settings::build_host(&models_dir, &models)
+                .unwrap_or_else(|_| {
+                    oulipoly_runtime::provider_settings::ProviderSettingsHost::from_model_configs(
+                        &[],
+                        provider_settings::host_options(&models_dir),
+                    )
+                    .expect("empty provider settings host should build")
+                });
             AppState {
                 models: Mutex::new(models),
                 models_dir,
@@ -1204,6 +1271,8 @@ mod tests {
                 quota_service: services.quota_service,
                 executor_service: services.executor_service,
                 diagnostics_service: services.diagnostics_service,
+                provider_settings: Mutex::new(provider_settings),
+                provider_settings_test_double: Mutex::new(None),
                 setup_repository: Some(services.setup_repository),
             }
         }
@@ -3512,5 +3581,430 @@ prompt_mode = "arg"
 
         assert!(!result.success);
         assert_eq!(result.exit_code, 143);
+    }
+
+    // risk: Cross-language IPC drift; level: Rust Tauri command; source: contract "Argument casing must be stable for TypeScript callers"
+    #[test]
+    fn provider_settings_command_args_deserialize_camel_case_ipc_payloads() {
+        let schema_args: provider_settings::GetProviderSettingsSchemaArgs =
+            serde_json::from_value(serde_json::json!({
+                "modelName": "example-model",
+                "schemaId": "example.settings/v1",
+            }))
+            .expect("camelCase schema payload should deserialize for Tauri IPC");
+        assert_eq!(schema_args.model_name, "example-model");
+        assert_eq!(schema_args.schema_id, "example.settings/v1");
+
+        let update_args: provider_settings::UpdateProviderSettingsArgs =
+            serde_json::from_value(serde_json::json!({
+                "modelName": "example-model",
+                "id": "record",
+                "version": "opaque-version",
+                "values": {"endpoint": "https://example.test", "enabled": true},
+            }))
+            .expect("camelCase update payload should deserialize for Tauri IPC");
+        assert_eq!(update_args.model_name, "example-model");
+        assert_eq!(update_args.id, "record");
+        assert_eq!(update_args.version, "opaque-version");
+        assert_eq!(
+            update_args.values["endpoint"],
+            serde_json::json!("https://example.test")
+        );
+
+        let migrate_args: provider_settings::MigrateProviderSettingsArgs =
+            serde_json::from_value(serde_json::json!({
+                "modelName": "example-model",
+                "dryRun": true,
+                "legacy": {"providers": {"provider-a": {"command": "example"}}},
+            }))
+            .expect("camelCase migrate payload should deserialize for Tauri IPC");
+        assert_eq!(migrate_args.model_name, "example-model");
+        assert!(migrate_args.dry_run);
+        assert_eq!(
+            migrate_args.legacy["providers"]["provider-a"]["command"],
+            "example"
+        );
+    }
+
+    // risk: Provider diagnostics loss and opaque version data loss; level: Rust Tauri command; source: contract "Structured IPC DTOs"
+    #[test]
+    fn provider_settings_command_preserves_structured_conflict_and_transport_errors() {
+        let mut harness = provider_settings::ProviderSettingsCommandHarness::new();
+        harness.fail_update_with_provider_error(provider_settings::ProviderSettingsErrorDto {
+            category: "conflict".to_string(),
+            code: Some("settings_conflict".to_string()),
+            message: "record changed".to_string(),
+            retryable: Some(false),
+            details: Some(serde_json::json!({"remoteVersion": "remote-version"})),
+            diagnostics: vec![provider_settings::ProviderDiagnosticDto {
+                severity: "warning".to_string(),
+                message: "Reload before saving".to_string(),
+                path: Some("/endpoint".to_string()),
+                code: Some("stale".to_string()),
+            }],
+            process_status: Some(provider_settings::ProviderProcessStatusDto {
+                exit_code: Some(17),
+                signal: None,
+                kind: "exited".to_string(),
+            }),
+        });
+
+        let conflict = provider_settings::update_provider_settings_inner(
+            harness.state(),
+            provider_settings::UpdateProviderSettingsArgs {
+                model_name: "example-model".to_string(),
+                id: "record".to_string(),
+                version: "stale-version".to_string(),
+                values: serde_json::json!({"endpoint": "https://example.test"}),
+            },
+        )
+        .expect_err("provider conflict must surface as structured conflict DTO");
+
+        assert_eq!(conflict.category, "conflict");
+        assert_eq!(conflict.code.as_deref(), Some("settings_conflict"));
+        assert_eq!(conflict.retryable, Some(false));
+        assert_eq!(conflict.details.unwrap()["remoteVersion"], "remote-version");
+        assert_eq!(conflict.diagnostics[0].path.as_deref(), Some("/endpoint"));
+        assert_eq!(
+            conflict.process_status.and_then(|status| status.exit_code),
+            Some(17)
+        );
+
+        harness.fail_validate_with_transport_error("transport", "provider process failed");
+        let transport = provider_settings::validate_provider_settings_inner(
+            harness.state(),
+            provider_settings::ValidateProviderSettingsArgs {
+                model_name: "example-model".to_string(),
+                values: serde_json::json!({"endpoint": "https://example.test"}),
+            },
+        )
+        .expect_err("transport/capability failures must surface as structured error DTOs");
+        assert_eq!(transport.category, "transport");
+        assert_eq!(transport.message, "provider process failed");
+        assert!(transport.diagnostics.is_empty());
+    }
+
+    // risk: Provider diagnostics loss; level: Rust Tauri command; source: contract "settings.migrate diagnostics must survive the real provider-host mapper"
+    #[cfg(unix)]
+    #[test]
+    fn provider_settings_command_preserves_migration_diagnostics_from_real_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider_path = dir.path().join("provider-settings.py");
+        write_executable(
+            &provider_path,
+            provider_settings_diagnostic_provider_script(),
+        );
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let model = model_with_provider_artifact("example-model", "provider-a", &provider_path);
+        let state = test_state(models_dir, HashMap::from([(model.name.clone(), model)]));
+
+        let migrated = provider_settings::migrate_provider_settings_inner(
+            &state,
+            provider_settings::MigrateProviderSettingsArgs {
+                model_name: "example-model".to_string(),
+                dry_run: true,
+                legacy: serde_json::json!({"providers": {"provider-a": {"command": "example"}}}),
+            },
+        )
+        .expect("real provider settings host should map provider migration output");
+
+        assert_eq!(
+            migrated.actions,
+            vec![serde_json::json!({"kind": "would-write", "target": "record"})]
+        );
+        assert_eq!(migrated.warnings, vec!["review before apply"]);
+        assert!(migrated.requires_user_input);
+        assert_eq!(migrated.diagnostics.len(), 1);
+        assert_eq!(migrated.diagnostics[0].severity, "warning");
+        assert_eq!(migrated.diagnostics[0].message, "Legacy field needs review");
+        assert_eq!(
+            migrated.diagnostics[0].path.as_deref(),
+            Some("/providers/provider-a")
+        );
+        assert_eq!(
+            migrated.diagnostics[0].code.as_deref(),
+            Some("legacy_field")
+        );
+    }
+
+    // risk: Supported-surface target listing failure; level: Rust Tauri command; source: contract "central-config-only models must not break provider settings targets"
+    #[cfg(unix)]
+    #[test]
+    fn provider_settings_targets_skip_central_config_only_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider_path = dir.path().join("provider-settings.py");
+        write_executable(
+            &provider_path,
+            provider_settings_diagnostic_provider_script(),
+        );
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let artifact_model =
+            model_with_provider_artifact("artifact-model", "provider-a", &provider_path);
+        let central_model = make_model("central-only-model", &["provider-a"]);
+        let state = test_state(
+            models_dir,
+            HashMap::from([
+                (artifact_model.name.clone(), artifact_model),
+                (central_model.name.clone(), central_model),
+            ]),
+        );
+
+        let targets = provider_settings::list_provider_settings_targets_inner(&state)
+            .expect("mixed central and artifact models should list configured targets");
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].model_name, "artifact-model");
+        assert_eq!(targets[0].provider_id, "provider-a");
+    }
+
+    #[cfg(unix)]
+    fn provider_settings_diagnostic_provider_script() -> &'static str {
+        r#"#!/usr/bin/env python3
+import json
+import sys
+
+subcommand = sys.argv[1] if len(sys.argv) > 1 else ""
+request = json.loads(sys.stdin.read() or "{}")
+
+def envelope(result):
+    return {
+        "contract": request.get("contract"),
+        "request_id": request.get("request_id"),
+        "ok": True,
+        "result": result,
+    }
+
+if subcommand == "describe":
+    response = envelope({
+        "provider_id": "provider-a",
+        "display_name": "Provider A",
+        "contract_versions": [request.get("contract")],
+        "preferred_contract": request.get("contract"),
+        "capabilities": {
+            "launch": True,
+            "policy": False,
+            "quota": False,
+            "session": False,
+            "terminal": False,
+            "rotation": False,
+            "discovery": False,
+            "settings": True,
+            "setup_brain": False,
+            "setup": False,
+            "migration": False,
+        },
+        "settings_schema_id": "example.settings/v1",
+    })
+elif subcommand == "settings.migrate":
+    response = envelope({
+        "actions": [{"kind": "would-write", "target": "record"}],
+        "warnings": ["review before apply"],
+        "requires_user_input": True,
+        "diagnostics": [{
+            "severity": "warning",
+            "message": "Legacy field needs review",
+            "path": "/providers/provider-a",
+            "code": "legacy_field",
+        }],
+    })
+else:
+    response = {
+        "contract": request.get("contract"),
+        "request_id": request.get("request_id"),
+        "ok": False,
+        "error": {
+            "category": "unsupported",
+            "code": "unsupported_subcommand",
+            "message": "unsupported",
+            "retryable": False,
+        },
+    }
+
+print(json.dumps(response))
+"#
+    }
+
+    // risk: Migration mutating or interpreting central config; level: Rust Tauri command; source: contract "settings.migrate receives opaque legacy central-config blocks"
+    #[cfg(unix)]
+    #[test]
+    fn provider_settings_migration_packages_central_config_blocks_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider_path = dir.path().join("provider-settings.py");
+        let record_path = dir.path().join("migration-record.jsonl");
+        write_executable(
+            &provider_path,
+            &provider_settings_migration_recording_provider_script(&record_path),
+        );
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let model_path = models_dir.join("example-model.toml");
+        let providers_path = dir.path().join("providers.toml");
+        let provider_path_toml =
+            serde_json::to_string(&provider_path.display().to_string()).unwrap();
+        let model_toml = format!(
+            r#"
+name = "example-model"
+prompt_mode = "arg"
+
+[[providers]]
+name = "provider-a"
+args = ["--profile", "record"]
+
+[provider]
+path = {provider_path_toml}
+"#
+        );
+        let providers_toml = r#"
+[provider-a]
+command = "example"
+args = ["--endpoint", "https://example.test"]
+prompt_mode = "arg"
+"#;
+        std::fs::write(&model_path, model_toml).unwrap();
+        std::fs::write(&providers_path, providers_toml).unwrap();
+        let providers = super::load_providers_for_models_dir(&models_dir);
+        let models = config::load_models(&models_dir, Some(&providers)).unwrap();
+        let state = test_state(models_dir.clone(), models);
+        let before_model = std::fs::read_to_string(&model_path).unwrap();
+        let before_providers = std::fs::read_to_string(&providers_path).unwrap();
+
+        let legacy = provider_settings::package_migration_legacy_payload(&state, "example-model")
+            .expect("migration legacy packaging should read central config");
+
+        assert_eq!(
+            legacy["models"]["example-model"]["providers"][0]["name"],
+            "provider-a"
+        );
+        assert_eq!(
+            legacy["models"]["example-model"]["providers"][0]["args"][0],
+            "--profile"
+        );
+        assert_eq!(
+            legacy["models"]["example-model"]["provider"]["path"],
+            provider_path.display().to_string()
+        );
+        assert_eq!(legacy["providers"]["provider-a"]["command"], "example");
+        assert_eq!(
+            legacy["providers"]["provider-a"]["args"][1],
+            "https://example.test"
+        );
+        assert_eq!(std::fs::read_to_string(&model_path).unwrap(), before_model);
+        assert_eq!(
+            std::fs::read_to_string(&providers_path).unwrap(),
+            before_providers
+        );
+
+        let migrated = provider_settings::migrate_provider_settings_inner(
+            &state,
+            provider_settings::MigrateProviderSettingsArgs {
+                model_name: "example-model".to_string(),
+                dry_run: false,
+                legacy: serde_json::Value::Null,
+            },
+        )
+        .expect("real provider migrate should receive packaged central config");
+        assert_eq!(
+            migrated.actions,
+            vec![serde_json::json!({"kind": "would-write", "target": "record"})]
+        );
+        assert_eq!(migrated.warnings, vec!["review"]);
+
+        let recorded = read_provider_settings_migration_record(&record_path);
+        assert_eq!(recorded["params"]["dry_run"], false);
+        assert_eq!(
+            recorded["params"]["legacy"]["models"]["example-model"]["providers"][0]["name"],
+            "provider-a"
+        );
+        assert_eq!(
+            recorded["params"]["legacy"]["providers"]["provider-a"]["command"],
+            "example"
+        );
+        assert_eq!(std::fs::read_to_string(&model_path).unwrap(), before_model);
+        assert_eq!(
+            std::fs::read_to_string(&providers_path).unwrap(),
+            before_providers
+        );
+    }
+
+    #[cfg(unix)]
+    fn provider_settings_migration_recording_provider_script(record_path: &Path) -> String {
+        let record_path = serde_json::to_string(&record_path.display().to_string()).unwrap();
+        format!(
+            r#"#!/usr/bin/env python3
+import json
+import pathlib
+import sys
+
+record_path = pathlib.Path({record_path})
+subcommand = sys.argv[1] if len(sys.argv) > 1 else ""
+request = json.loads(sys.stdin.read() or "{{}}")
+
+def envelope(result):
+    return {{
+        "contract": request.get("contract"),
+        "request_id": request.get("request_id"),
+        "ok": True,
+        "result": result,
+    }}
+
+if subcommand == "describe":
+    response = envelope({{
+        "provider_id": "provider-a",
+        "display_name": "Provider A",
+        "contract_versions": [request.get("contract")],
+        "preferred_contract": request.get("contract"),
+        "capabilities": {{
+            "launch": True,
+            "policy": False,
+            "quota": False,
+            "session": False,
+            "terminal": False,
+            "rotation": False,
+            "discovery": False,
+            "settings": True,
+            "setup_brain": False,
+            "setup": False,
+            "migration": False,
+        }},
+        "settings_schema_id": "example.settings/v1",
+    }})
+elif subcommand == "settings.migrate":
+    with record_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(request, sort_keys=True) + "\n")
+    response = envelope({{
+        "actions": [{{"kind": "would-write", "target": "record"}}],
+        "warnings": ["review"],
+        "requires_user_input": False,
+        "diagnostics": [],
+    }})
+else:
+    response = {{
+        "contract": request.get("contract"),
+        "request_id": request.get("request_id"),
+        "ok": False,
+        "error": {{
+            "category": "unsupported",
+            "code": "unsupported_subcommand",
+            "message": "unsupported",
+            "retryable": False,
+        }},
+    }}
+
+print(json.dumps(response))
+"#,
+            record_path = record_path
+        )
+    }
+
+    #[cfg(unix)]
+    fn read_provider_settings_migration_record(record_path: &Path) -> serde_json::Value {
+        std::fs::read_to_string(record_path)
+            .expect("settings.migrate record should exist")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("recorded request should parse"))
+            .next()
+            .expect("settings.migrate request should be recorded")
     }
 }

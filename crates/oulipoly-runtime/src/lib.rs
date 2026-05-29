@@ -5,6 +5,7 @@ pub mod executor;
 pub mod migration;
 pub mod ports;
 pub mod provider_registry;
+pub mod provider_settings;
 pub mod quota;
 pub mod repl_default_provider;
 pub mod services;

@@ -42,7 +42,7 @@
     },
     "settings.migrate": {
       "request": {"contract":"oulipoly.provider/v1","request_id":"req-settings-migrate","provider_instance_id":"acct-primary","host":{"app":"oulipoly-agent-runner"},"params":{"dry_run":true,"legacy":{"provider_entry":{"command":"example","args":["--profile","work"]},"model_provider":{"args":["--model","high"]}}}},
-      "success_response": {"contract":"oulipoly.provider/v1","request_id":"req-settings-migrate","ok":true,"result":{"actions":[{"kind":"create_settings","settings_id":"work","display_name":"Work"}],"warnings":[],"requires_user_input":false}},
+    "success_response": {"contract":"oulipoly.provider/v1","request_id":"req-settings-migrate","ok":true,"result":{"actions":[{"kind":"create_settings","settings_id":"work","display_name":"Work"}],"warnings":[],"requires_user_input":false,"diagnostics":[]}},
       "error_response": {"contract":"oulipoly.provider/v1","request_id":"req-settings-migrate","ok":false,"error":{"code":"migration_failed","category":"failed","message":"settings migration failed","retryable":false,"details":{}}}
     },
     "policy.evaluate": {

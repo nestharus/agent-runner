@@ -11,6 +11,7 @@ import ModelPanel from "../components/ModelPanel";
 import type { TagStatus } from "../components/PoolCard";
 import PoolCard from "../components/PoolCard";
 import PoolSettingsPanel from "../components/PoolSettingsPanel";
+import ProviderSettingsPanel from "../components/provider-settings/ProviderSettingsPanel";
 import SetupSession from "../components/SetupSession";
 import {
 	isDeniedProviderLevelFlag,
@@ -44,6 +45,7 @@ export default function PoolsView(props: PoolsViewProps) {
 		{},
 	);
 	const [selectedTag, setSelectedTag] = createSignal<string | null>(null);
+	const [showProviderSettings, setShowProviderSettings] = createSignal(false);
 
 	// Add-pool state
 	const [addingPool, setAddingPool] = createSignal(false);
@@ -335,6 +337,10 @@ export default function PoolsView(props: PoolsViewProps) {
 		}
 	}
 
+	function toggleProviderSettings() {
+		setShowProviderSettings(!showProviderSettings());
+	}
+
 	return (
 		// biome-ignore lint/a11y/noStaticElementInteractions: click deselects tags
 		// biome-ignore lint/a11y/useKeyWithClickEvents: click deselects tags
@@ -346,29 +352,47 @@ export default function PoolsView(props: PoolsViewProps) {
 			{/* Header */}
 			<div class="mb-6 flex items-center justify-between">
 				<h2 class="text-xl font-semibold text-text">Provider Pools</h2>
-				<button
-					type="button"
-					class={`flex h-8 w-8 items-center justify-center rounded-lg text-sm font-bold transition-colors ${
-						addingPool()
-							? "bg-border text-text-dim hover:bg-surface-alt"
-							: "bg-accent text-black hover:bg-accent-hover"
-					}`}
-					onClick={() => {
-						if (addingPool()) {
-							setAddingPool(false);
-							setNewCliName("");
-							setSetupRunning(false);
-						} else {
-							setAddingPool(true);
-						}
-					}}
-					title={addingPool() ? "Cancel" : "Add provider pool"}
-				>
-					<Show when={addingPool()} fallback={<Icon icon={faPlus} size={16} />}>
-						<Icon icon={faXmark} size={16} />
-					</Show>
-				</button>
+				<div class="flex items-center gap-2">
+					<button
+						type="button"
+						class="rounded border border-border px-3 py-1 text-sm text-text"
+						onClick={toggleProviderSettings}
+					>
+						Provider Settings
+					</button>
+					<button
+						type="button"
+						class={`flex h-8 w-8 items-center justify-center rounded-lg text-sm font-bold transition-colors ${
+							addingPool()
+								? "bg-border text-text-dim hover:bg-surface-alt"
+								: "bg-accent text-black hover:bg-accent-hover"
+						}`}
+						onClick={() => {
+							if (addingPool()) {
+								setAddingPool(false);
+								setNewCliName("");
+								setSetupRunning(false);
+							} else {
+								setAddingPool(true);
+							}
+						}}
+						title={addingPool() ? "Cancel" : "Add provider pool"}
+					>
+						<Show
+							when={addingPool()}
+							fallback={<Icon icon={faPlus} size={16} />}
+						>
+							<Icon icon={faXmark} size={16} />
+						</Show>
+					</button>
+				</div>
 			</div>
+
+			<Show when={showProviderSettings()}>
+				<div class="mb-4">
+					<ProviderSettingsPanel />
+				</div>
+			</Show>
 
 			{/* Add-pool inline row */}
 			<Show when={addingPool()}>

@@ -8,7 +8,8 @@ mod options;
 
 use artifact_key::{ArtifactKey, artifact_key};
 use cache::DescribeCache;
-use describe::{DescribeHostOptions, describe_provider};
+pub(crate) use describe::DescribeHostOptions;
+use describe::describe_provider;
 use oulipoly_config::{ModelConfig, provider_implementation_ref::ProviderImplementationRef};
 use oulipoly_provider::generated::DescribeResult;
 use std::collections::{BTreeMap, HashMap};
@@ -104,6 +105,12 @@ impl ProviderRegistry {
         self.model_artifacts.get(model_name).cloned()
     }
 
+    pub fn configured_model_names(&self) -> Vec<String> {
+        let mut names = self.model_artifacts.keys().cloned().collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
     pub fn describe_model_provider(
         &self,
         model_name: &str,
@@ -123,6 +130,30 @@ impl ProviderRegistry {
             .ok_or_else(|| ProviderRegistryError::ModelProviderNotConfigured {
                 model_name: model_name.to_string(),
             })
+    }
+
+    pub(crate) fn enabled_artifact_for_model(
+        &self,
+        model_name: &str,
+    ) -> Result<oulipoly_provider::resolver::ProviderArtifactRef, ProviderRegistryError> {
+        let key = self.lookup_artifact_key(model_name)?;
+        match self.lookup_artifact(model_name, &key)? {
+            RuntimeProviderArtifact::Enabled(artifact) => Ok(artifact),
+            RuntimeProviderArtifact::RuntimeDisabled(artifact) => {
+                Err(ProviderRegistryError::RuntimeDisabledArtifact {
+                    kind: "runtime_disabled".to_string(),
+                    artifact,
+                })
+            }
+        }
+    }
+
+    pub(crate) fn client_factory(&self) -> &ProviderClientFactory {
+        &self.client_factory
+    }
+
+    pub(crate) fn host_options(&self) -> &DescribeHostOptions {
+        &self.host_options
     }
 
     fn cached_describe(&self, key: &ArtifactKey) -> Option<DescribeResult> {

@@ -229,9 +229,10 @@
       "properties": {
         "actions": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
         "warnings": { "type": "array", "items": true },
-        "requires_user_input": { "type": "boolean" }
+        "requires_user_input": { "type": "boolean" },
+        "diagnostics": { "type": "array", "items": { "$ref": "common.schema.json#/$defs/Diagnostic" } }
       },
-      "required": ["actions", "warnings", "requires_user_input"],
+      "required": ["actions", "warnings", "requires_user_input", "diagnostics"],
       "additionalProperties": false
     },
     "SettingsMigrateResponse": {

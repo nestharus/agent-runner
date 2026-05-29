@@ -112,6 +112,8 @@ pub struct ErrorObject {
     pub retryable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<JsonObject>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -120,6 +122,8 @@ pub struct ErrorResponseEnvelope {
     pub request_id: String,
     pub ok: FalseBool,
     pub error: ErrorObject,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_status: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -377,6 +381,7 @@ pub struct SettingsMigrateResult {
     pub actions: Vec<Value>,
     pub warnings: Vec<String>,
     pub requires_user_input: bool,
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

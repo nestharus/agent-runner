@@ -193,6 +193,93 @@ export interface PoolSummary {
 	model_names: string[];
 }
 
+export type JsonValue =
+	| null
+	| boolean
+	| number
+	| string
+	| JsonValue[]
+	| { [key: string]: JsonValue };
+
+export interface ProviderSettingsTarget {
+	modelName: string;
+	displayName: string;
+	providerId?: string;
+	settingsSupported: boolean;
+	schemaId: string | null;
+}
+
+export interface ProviderSettingsSchema {
+	schemaId: string;
+	schema: Record<string, unknown>;
+	ui?: Record<string, unknown> | null;
+}
+
+export interface ProviderSettingsRecordSummary {
+	id: string;
+	displayName: string;
+	version: string;
+	summary?: Record<string, JsonValue> | null;
+}
+
+export interface ProviderSettingsRecord {
+	id: string;
+	displayName: string;
+	version: string;
+	values: Record<string, JsonValue>;
+}
+
+export interface ProviderDiagnostic {
+	severity: string;
+	message: string;
+	path?: string | null;
+	code?: string | null;
+}
+
+export interface ProviderSettingsList {
+	records: ProviderSettingsRecordSummary[];
+}
+
+export interface ProviderSettingsGet {
+	record: ProviderSettingsRecord;
+}
+
+export interface ProviderSettingsWrite {
+	record: ProviderSettingsRecord;
+	diagnostics: ProviderDiagnostic[];
+}
+
+export interface ProviderSettingsDelete {
+	deleted: boolean;
+	id: string;
+}
+
+export interface ProviderSettingsValidate {
+	valid: boolean;
+	diagnostics: ProviderDiagnostic[];
+}
+
+export interface ProviderSettingsMigrate {
+	actions: JsonValue[];
+	warnings: string[];
+	requiresUserInput: boolean;
+	diagnostics?: ProviderDiagnostic[];
+}
+
+export interface ProviderSettingsError {
+	category: string;
+	code?: string | null;
+	message: string;
+	retryable?: boolean | null;
+	details?: JsonValue | null;
+	diagnostics: ProviderDiagnostic[];
+	processStatus?: {
+		exitCode?: number | null;
+		signal?: number | null;
+		kind: string;
+	} | null;
+}
+
 export interface CliInfo {
 	name: string;
 	installed: boolean;

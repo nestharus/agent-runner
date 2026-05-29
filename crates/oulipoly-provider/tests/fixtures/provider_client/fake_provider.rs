@@ -12,8 +12,12 @@ fn main() {
     let mode = env::var("FAKE_PROVIDER_MODE").unwrap_or_else(|_| "success".to_owned());
     let code = match mode.as_str() {
         "record-argv-stdin" => record_argv_stdin(),
+        "s5-record-argv-stdin" => {
+            record_argv_stdin_with_response_kind(ResponseKind::S5Success)
+        }
         "stdin-eof" => stdin_eof(),
         "success" => success(),
+        "s5-success" => s5_success(),
         "success-stderr" => success_stderr(),
         "provider-error" => provider_error("failed", "example_failed", 0),
         "provider-timeout-error" => provider_error("timeout", "example_timeout", 0),
@@ -157,21 +161,136 @@ fn write_stderr(text: &str) -> i32 {
 }
 
 fn record_argv_stdin() -> i32 {
-    let path = env::var("FAKE_PROVIDER_RECORD_PATH").expect("record path should be set");
-    if let Some(parent) = std::path::Path::new(&path).parent() {
+    record_argv_stdin_with_response_kind(ResponseKind::DescribeSuccess)
+}
+
+enum ResponseKind {
+    DescribeSuccess,
+    S5Success,
+}
+
+struct InvocationRecord {
+    path: String,
+    argv: Vec<String>,
+    stdin: String,
+}
+
+struct ProviderErrorFields<'a> {
+    category: &'a str,
+    code: &'a str,
+    retryable: bool,
+    message: String,
+}
+
+fn record_argv_stdin_with_response_kind(kind: ResponseKind) -> i32 {
+    record_current_invocation();
+    write_response_for_kind(kind)
+}
+
+fn record_current_invocation() {
+    let record = current_invocation_record();
+    let text = format_invocation_record(&record);
+    write_invocation_record(&record.path, &text);
+}
+
+fn current_invocation_record() -> InvocationRecord {
+    InvocationRecord {
+        path: env::var("FAKE_PROVIDER_RECORD_PATH").expect("record path should be set"),
+        argv: env::args().collect(),
+        stdin: read_stdin_to_string(),
+    }
+}
+
+fn format_invocation_record(record: &InvocationRecord) -> String {
+    format!("argv:\n{}\nstdin:\n{}", record.argv.join("\n"), record.stdin)
+}
+
+fn write_invocation_record(path: &str, text: &str) {
+    if let Some(parent) = std::path::Path::new(path).parent() {
         fs::create_dir_all(parent).expect("record directory should be writable");
     }
-    let argv = env::args().collect::<Vec<_>>().join("\n");
-    let stdin = read_stdin_to_string();
-    fs::write(path, format!("argv:\n{argv}\nstdin:\n{stdin}"))
-        .expect("record file should be writable");
-    if env::args().any(|arg| arg == "launch") {
-        write_jsonl(&stdout_event(1, "YQ=="));
-        write_jsonl(&exit_event(2, 0));
-        0
+    fs::write(path, text).expect("record file should be writable");
+}
+
+fn write_response_for_kind(kind: ResponseKind) -> i32 {
+    if launch_subcommand_requested() {
+        write_launch_success_events()
     } else {
-        write_stdout(&success_json())
+        write_stdout(&response_json_for_kind(kind))
     }
+}
+
+fn launch_subcommand_requested() -> bool {
+    env::args().any(|arg| arg == "launch")
+}
+
+fn write_launch_success_events() -> i32 {
+    write_jsonl(&stdout_event(1, "YQ=="));
+    write_jsonl(&exit_event(2, 0));
+    0
+}
+
+fn response_json_for_kind(kind: ResponseKind) -> String {
+    match kind {
+        ResponseKind::DescribeSuccess => success_json(),
+        ResponseKind::S5Success => s5_success_json(),
+    }
+}
+
+fn provider_error_fields<'a>(category: &'a str, code: &'a str) -> ProviderErrorFields<'a> {
+    ProviderErrorFields {
+        category,
+        code,
+        retryable: category == "timeout",
+        message: format!("{category} from fake-provider"),
+    }
+}
+
+fn provider_error_json(fields: &ProviderErrorFields<'_>) -> String {
+    format!(
+        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{REQUEST_ID}\",\"ok\":false,\"error\":{{\"category\":\"{}\",\"code\":\"{}\",\"retryable\":{},\"message\":\"{}\",\"details\":{{\"source\":\"example\"}}}}}}\n",
+        fields.category, fields.code, fields.retryable, fields.message
+    )
+}
+
+fn current_subcommand() -> String {
+    env::args().nth(1).unwrap_or_default()
+}
+
+fn s5_result_json_for_subcommand(subcommand: &str) -> &'static str {
+    match subcommand {
+        "schema" => {
+            r#"{"schema_id":"example.settings/v1","schema":{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","required":["profile_id"],"properties":{"profile_id":{"type":"string","title":"Profile"}},"additionalProperties":false},"ui":{"sections":[{"id":"account","title":"Account","fields":["profile_id"]}]}}"#
+        }
+        "settings.list" => {
+            r#"{"records":[{"id":"example-settings","display_name":"Example Settings","version":"7","summary":{"status":"ready"}}]}"#
+        }
+        _ => {
+            r#"{"provider_id":"fake-provider","display_name":"Fake Provider","contract_versions":["oulipoly.provider/v1"],"preferred_contract":"oulipoly.provider/v1","capabilities":{"launch":true,"policy":false,"quota":false,"session":false,"terminal":false,"rotation":false,"discovery":false,"settings":true,"setup_brain":false,"setup":false,"migration":false},"settings_schema_id":"example.settings/v1","concurrency":{"safe_for_parallel_invocation":true,"state_locking":"none"}}"#
+        }
+    }
+}
+
+fn s5_success_envelope(result: &str) -> String {
+    format!(
+        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{REQUEST_ID}\",\"ok\":true,\"result\":{result}}}\n"
+    )
+}
+
+fn terminal_signal_for_exit_code(code: i32) -> &'static str {
+    if code == 0 {
+        "clean_exit"
+    } else {
+        "nonzero_exit"
+    }
+}
+
+fn launch_exit_event_json(seq: u64, code: i32, signal: &str) -> String {
+    format!(
+        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{REQUEST_ID}\",\"seq\":{seq},\"time_unix_ms\":{},\"kind\":\"exit\",\"status\":{{\"kind\":\"exited\",\"code\":{code}}},\"terminal_signal\":{{\"kind\":\"{signal}\",\"evidence\":\"fake-provider exit event\",\"observed_at_unix_ms\":{}}},\"session\":{{\"provider_session_id\":\"example-session\"}}}}",
+        1000 + seq,
+        1000 + seq
+    )
 }
 
 fn stdin_eof() -> i32 {
@@ -190,6 +309,11 @@ fn success() -> i32 {
     write_stdout(&success_json())
 }
 
+fn s5_success() -> i32 {
+    let _ = read_stdin_to_string();
+    write_stdout(&s5_success_json())
+}
+
 fn success_stderr() -> i32 {
     eprintln!("fake-provider diagnostic on stderr");
     success()
@@ -197,10 +321,8 @@ fn success_stderr() -> i32 {
 
 fn provider_error(category: &str, code: &str, exit_code: i32) -> i32 {
     let _ = read_stdin_to_string();
-    write_stdout(&format!(
-        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{REQUEST_ID}\",\"ok\":false,\"error\":{{\"category\":\"{category}\",\"code\":\"{code}\",\"retryable\":{},\"message\":\"{category} from fake-provider\",\"details\":{{\"source\":\"example\"}}}}}}\n",
-        category == "timeout"
-    ));
+    let fields = provider_error_fields(category, code);
+    write_stdout(&provider_error_json(&fields));
     exit_code
 }
 
@@ -208,6 +330,12 @@ fn success_json() -> String {
     format!(
         "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{REQUEST_ID}\",\"ok\":true,\"result\":{{\"provider_id\":\"fake-provider\",\"display_name\":\"Fake Provider\",\"contract_versions\":[\"{CONTRACT}\"],\"preferred_contract\":\"{CONTRACT}\",\"capabilities\":{{\"launch\":true,\"policy\":false,\"quota\":false,\"session\":false,\"terminal\":false,\"rotation\":false,\"discovery\":false,\"settings\":false,\"setup_brain\":false,\"setup\":false,\"migration\":false}},\"concurrency\":{{\"safe_for_parallel_invocation\":true,\"state_locking\":\"none\"}}}}}}\n"
     )
+}
+
+fn s5_success_json() -> String {
+    let subcommand = current_subcommand();
+    let result = s5_result_json_for_subcommand(&subcommand);
+    s5_success_envelope(result)
 }
 
 fn large_stdout_stderr() -> i32 {
@@ -268,9 +396,7 @@ fn spawn_probe_child(ignore_sigterm: bool) -> i32 {
     if let Ok(probe_dir) = env::var("FAKE_PROVIDER_PROBE_DIR") {
         child_command.env("FAKE_PROVIDER_PROBE_DIR", probe_dir);
     }
-    let mut child = child_command
-        .spawn()
-        .expect("child should spawn");
+    let mut child = child_command.spawn().expect("child should spawn");
     let _ = child.wait();
     sleep_forever()
 }
@@ -394,16 +520,7 @@ fn heartbeat_event(seq: u64) -> String {
 }
 
 fn exit_event(seq: u64, code: i32) -> String {
-    let signal = if code == 0 {
-        "clean_exit"
-    } else {
-        "nonzero_exit"
-    };
-    format!(
-        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{REQUEST_ID}\",\"seq\":{seq},\"time_unix_ms\":{},\"kind\":\"exit\",\"status\":{{\"kind\":\"exited\",\"code\":{code}}},\"terminal_signal\":{{\"kind\":\"{signal}\",\"evidence\":\"fake-provider exit event\",\"observed_at_unix_ms\":{}}},\"session\":{{\"provider_session_id\":\"example-session\"}}}}",
-        1000 + seq,
-        1000 + seq
-    )
+    launch_exit_event_json(seq, code, terminal_signal_for_exit_code(code))
 }
 
 fn cancelled_exit_event(seq: u64) -> String {
