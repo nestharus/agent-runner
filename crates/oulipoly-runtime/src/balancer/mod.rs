@@ -1,6 +1,7 @@
 //! ## Declared roles
 //!
-//! `orchestration`, `filter`, `predicate`, `mapper`, `accessor`, `formatter`, `validator`.
+//! `orchestration`, `filter`, `predicate`, `mapper`, `accessor`, `formatter`, `validator`,
+//! `parser`.
 //!
 //! ## Intrinsic-surface declarations
 //! intrinsic_surface_declarations:
@@ -52,30 +53,30 @@
 //!       - ResolvedResume active-provider contract
 
 mod context;
+mod eligibility;
 pub mod forensics;
 mod refresh_inputs;
 mod snapshot;
+mod topology;
 
 pub use context::BalanceContext;
 pub use forensics::{FailureClass, apply_post_failure_forensics};
 
 use crate::migration::{MigrationError, provider_has_derivable_claude_projects_dir};
-use crate::quota::{
-    RefreshOutcome, has_refresh_source, is_topology_probe_due, refresh_provider_for_routing,
-};
 use chrono::{DateTime, Utc};
 use oulipoly_config::{ModelConfig, ProviderConfig};
 pub use oulipoly_core::TransitionReason;
 use oulipoly_state::{QuotaRecord, QuotaWindow, ResolvedResume, StateDb};
 use std::fmt;
 
+use eligibility::{all_provider_indices, eligible_provider_indices};
 use refresh_inputs::{refresh_projection_inputs, refresh_routing_inputs};
-use snapshot::{QuotaSnapshot, cached_quota_record, cached_quota_windows, load_quota_snapshot};
+use snapshot::{QuotaSnapshot, load_quota_snapshot};
+use topology::repair_routing_topology;
 
 const ERROR_WINDOW_MINUTES: i64 = 30;
 const ERROR_THRESHOLD: u64 = 3;
 const EPS_HOURS: f64 = 1.0 / 60.0;
-const EXHAUSTED_USED_PERCENT: f64 = 1.0;
 /// Visible-usage threshold for the missing-window penalty. Anthropic's
 /// usage API hides the 5h window when an account is near weekly cap
 /// (observed live at 91% weekly). ChatGPT's API hides the 5h window
@@ -157,13 +158,6 @@ impl fmt::Display for RoutingError {
 
 impl std::error::Error for RoutingError {}
 
-struct TopologyProbeRefresh {
-    provider_index: usize,
-    live_window_count: usize,
-    pool_expected_live_windows: usize,
-    topology_peak_live_window_count: usize,
-}
-
 pub fn select_provider(
     model: &ModelConfig,
     state: &StateDb,
@@ -186,185 +180,6 @@ pub fn select_provider(
         &snapshot,
         filtered_indices.as_slice(),
     ))
-}
-
-fn repair_routing_topology(
-    model: &ModelConfig,
-    state: &StateDb,
-    ctx: &BalanceContext<'_>,
-    snapshot: &mut QuotaSnapshot,
-) {
-    let now = Utc::now();
-    let live_window_counts = live_window_counts(snapshot.windows.as_slice(), now);
-    let topology_peak_counts = topology_peak_counts(snapshot.quotas.as_slice());
-    let pool_expected_live_windows =
-        expected_pool_live_window_count(&live_window_counts, &topology_peak_counts);
-
-    for (provider_index, provider) in model.providers.iter().enumerate() {
-        if topology_probe_should_refresh(
-            state,
-            provider,
-            ctx,
-            live_window_counts[provider_index],
-            pool_expected_live_windows,
-        ) {
-            let probe = TopologyProbeRefresh {
-                provider_index,
-                live_window_count: live_window_counts[provider_index],
-                pool_expected_live_windows,
-                topology_peak_live_window_count: topology_peak_counts[provider_index],
-            };
-            record_topology_probe_and_refresh(model, state, ctx, snapshot, probe);
-        }
-    }
-}
-
-fn live_window_counts(windows: &[Vec<QuotaWindow>], now: chrono::DateTime<Utc>) -> Vec<usize> {
-    windows
-        .iter()
-        .map(|provider_windows| live_window_count(provider_windows, now))
-        .collect()
-}
-
-fn topology_peak_counts(quotas: &[Option<QuotaRecord>]) -> Vec<usize> {
-    quotas
-        .iter()
-        .map(|quota| {
-            quota
-                .as_ref()
-                .map(|quota| quota.topology_peak_live_window_count)
-                .unwrap_or(0)
-        })
-        .collect()
-}
-
-fn expected_pool_live_window_count(
-    live_window_counts: &[usize],
-    topology_peak_counts: &[usize],
-) -> usize {
-    live_window_counts
-        .iter()
-        .zip(topology_peak_counts.iter())
-        .map(|(live, peak)| (*live).max(*peak))
-        .max()
-        .unwrap_or(0)
-}
-
-fn topology_probe_should_refresh(
-    state: &StateDb,
-    provider: &ProviderConfig,
-    ctx: &BalanceContext<'_>,
-    live_window_count: usize,
-    pool_expected_live_windows: usize,
-) -> bool {
-    has_refresh_source(&provider.name, ctx.providers_cfg, ctx.sessions_cfg)
-        && is_topology_probe_due(
-            state,
-            &provider.name,
-            live_window_count,
-            pool_expected_live_windows,
-        )
-}
-
-fn record_topology_probe_and_refresh(
-    model: &ModelConfig,
-    state: &StateDb,
-    ctx: &BalanceContext<'_>,
-    snapshot: &mut QuotaSnapshot,
-    probe: TopologyProbeRefresh,
-) {
-    let provider = &model.providers[probe.provider_index];
-    let _ = state.record_topology_probe(&provider.name);
-    trace_topology_probe(
-        provider,
-        probe.live_window_count,
-        probe.pool_expected_live_windows,
-        probe.topology_peak_live_window_count,
-    );
-    let _: RefreshOutcome = refresh_provider_for_routing(
-        &provider.name,
-        ctx.providers_cfg,
-        ctx.sessions_cfg,
-        ctx.in_flight,
-        state,
-    );
-    snapshot.quotas[probe.provider_index] = cached_quota_record(state, &provider.name);
-    snapshot.windows[probe.provider_index] = cached_quota_windows(state, &provider.name);
-}
-
-fn trace_topology_probe(
-    provider: &ProviderConfig,
-    live_window_count: usize,
-    pool_expected_live_windows: usize,
-    topology_peak_live_window_count: usize,
-) {
-    tracing::info!(
-        provider_name = provider.name.as_str(),
-        live_window_count = live_window_count,
-        pool_expected_live_window_count = pool_expected_live_windows,
-        topology_peak_live_window_count = topology_peak_live_window_count,
-        "topology probe fired"
-    );
-}
-
-fn eligible_provider_indices(
-    model: &ModelConfig,
-    state: &StateDb,
-    snapshot: &QuotaSnapshot,
-    now: chrono::DateTime<Utc>,
-) -> Vec<usize> {
-    let all_indices = all_provider_indices(model);
-    let reset_implied = reset_implied_flags(&all_indices, snapshot, now);
-    clear_reset_implied_flags(state, model, &reset_implied);
-    route_eligible_provider_indices(all_indices, snapshot, &reset_implied, now)
-}
-
-fn route_eligible_provider_indices(
-    provider_indices: Vec<usize>,
-    snapshot: &QuotaSnapshot,
-    reset_implied: &[bool],
-    now: chrono::DateTime<Utc>,
-) -> Vec<usize> {
-    provider_indices
-        .into_iter()
-        .filter(|&provider_index| {
-            provider_is_route_eligible(provider_index, snapshot, reset_implied, now)
-        })
-        .collect()
-}
-
-fn all_provider_indices(model: &ModelConfig) -> Vec<usize> {
-    (0..model.providers.len()).collect()
-}
-
-fn reset_implied_flags(
-    provider_indices: &[usize],
-    snapshot: &QuotaSnapshot,
-    now: chrono::DateTime<Utc>,
-) -> Vec<bool> {
-    provider_indices
-        .iter()
-        .map(|provider_index| {
-            reset_implied(
-                snapshot.quotas[*provider_index].as_ref(),
-                &snapshot.windows[*provider_index],
-                now,
-            )
-        })
-        .collect()
-}
-
-fn provider_is_route_eligible(
-    provider_index: usize,
-    snapshot: &QuotaSnapshot,
-    reset_implied: &[bool],
-    now: chrono::DateTime<Utc>,
-) -> bool {
-    !provider_is_quota_exhausted(
-        snapshot.quotas[provider_index].as_ref(),
-        &snapshot.windows[provider_index],
-        now,
-    ) || reset_implied[provider_index]
 }
 
 fn all_providers_quota_exhausted_error(model: &ModelConfig) -> RoutingError {
@@ -463,76 +278,6 @@ pub fn compute_projections(
         &candidates,
         Utc::now(),
     )
-}
-
-fn provider_is_quota_exhausted(
-    quota: Option<&QuotaRecord>,
-    windows: &[QuotaWindow],
-    now: chrono::DateTime<Utc>,
-) -> bool {
-    quota
-        .and_then(|quota| quota.exhausted_at.as_ref())
-        .is_some()
-        || quota
-            .and_then(|quota| quota.next_available_at)
-            .is_some_and(|ts| marker_blocks_routing(ts, now))
-        || windows
-            .iter()
-            .any(|window| window.resets_at > now && window.used_percent >= EXHAUSTED_USED_PERCENT)
-}
-
-/// Honour `next_available_at` only while it's more than the release-slack
-/// window in the future. Markers inside the slack window are treated as
-/// expired so the next dispatch can probe the provider rather than wait
-/// for the exact release timestamp (clock skew + cooldown bookkeeping).
-/// Reads `OULIPOLY_MARKER_RELEASE_SLACK_SECS` via the shared helper so
-/// cached-only routing (`ctx=None`) matches the verify path's slack.
-fn marker_blocks_routing(next_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
-    next_at
-        > now + chrono::Duration::seconds(crate::quota::marker_verification::release_slack_secs())
-}
-
-fn reset_implied(
-    quota: Option<&QuotaRecord>,
-    windows: &[QuotaWindow],
-    now: chrono::DateTime<Utc>,
-) -> bool {
-    quota
-        .and_then(|quota| quota.exhausted_at.as_ref())
-        .is_some()
-        && !windows.is_empty()
-        && windows.iter().all(|window| window.resets_at <= now)
-}
-
-fn clear_reset_implied_flags(state: &StateDb, model: &ModelConfig, reset_implied: &[bool]) {
-    for provider in reset_implied_providers(model, reset_implied) {
-        clear_reset_implied_provider(state, provider);
-    }
-}
-
-fn reset_implied_providers<'a>(
-    model: &'a ModelConfig,
-    reset_implied: &'a [bool],
-) -> impl Iterator<Item = &'a ProviderConfig> {
-    model
-        .providers
-        .iter()
-        .zip(reset_implied.iter())
-        .filter_map(|(provider, is_reset_implied)| is_reset_implied.then_some(provider))
-}
-
-fn clear_reset_implied_provider(state: &StateDb, provider: &ProviderConfig) {
-    if let Err(error) = state.clear_exhausted(&provider.name) {
-        warn_reset_implied_clear_failed(provider, error.as_str());
-    }
-}
-
-fn warn_reset_implied_clear_failed(provider: &ProviderConfig, error: &str) {
-    tracing::warn!(
-        provider_name = provider.name.as_str(),
-        error = error,
-        "failed to clear reset-implied quota exhaustion flag"
-    );
 }
 
 fn compute_projections_from_records(
@@ -2233,13 +1978,20 @@ mod tests {
         }
     }
 
-    fn balancer_production_sources() -> [(&'static str, &'static str); 4] {
+    fn balancer_production_sources() -> [(&'static str, &'static str); 6] {
         [
             (
                 "crates/oulipoly-runtime/src/balancer/mod.rs",
                 production_balancer_source(
                     "crates/oulipoly-runtime/src/balancer/mod.rs",
                     include_str!("mod.rs"),
+                ),
+            ),
+            (
+                "crates/oulipoly-runtime/src/balancer/eligibility.rs",
+                production_balancer_source(
+                    "crates/oulipoly-runtime/src/balancer/eligibility.rs",
+                    include_str!("eligibility.rs"),
                 ),
             ),
             (
@@ -2261,6 +2013,13 @@ mod tests {
                 production_balancer_source(
                     "crates/oulipoly-runtime/src/balancer/refresh_inputs.rs",
                     include_str!("refresh_inputs.rs"),
+                ),
+            ),
+            (
+                "crates/oulipoly-runtime/src/balancer/topology.rs",
+                production_balancer_source(
+                    "crates/oulipoly-runtime/src/balancer/topology.rs",
+                    include_str!("topology.rs"),
                 ),
             ),
         ]
@@ -2330,33 +2089,103 @@ mod tests {
     }
 
     fn source_without_comments(source: &str) -> String {
-        let mut output = String::with_capacity(source.len());
-        let mut chars = source.chars().peekable();
-        let mut in_block_comment = false;
-        while let Some(ch) = chars.next() {
-            if in_block_comment {
-                if ch == '*' && chars.peek() == Some(&'/') {
-                    chars.next();
-                    in_block_comment = false;
-                }
-                continue;
-            }
-            if ch == '/' && chars.peek() == Some(&'*') {
-                chars.next();
-                in_block_comment = true;
-                continue;
-            }
-            if ch == '/' && chars.peek() == Some(&'/') {
-                for next in chars.by_ref() {
-                    if next == '\n' {
-                        output.push('\n');
-                        break;
-                    }
-                }
-                continue;
-            }
-            output.push(ch);
+        let spans = rust_comment_spans(source);
+        source_excluding_spans(source, spans.as_slice())
+    }
+
+    #[derive(Clone, Copy)]
+    enum CommentDelimiter {
+        Line,
+        Block,
+    }
+
+    #[derive(Clone, Copy)]
+    struct CommentStart {
+        index: usize,
+        delimiter: CommentDelimiter,
+    }
+
+    fn rust_comment_spans(source: &str) -> Vec<std::ops::Range<usize>> {
+        let mut spans = Vec::new();
+        let mut cursor = 0;
+        while let Some(start) = next_comment_start(source, cursor) {
+            let end = comment_end(source, start);
+            spans.push(start.index..end);
+            cursor = end;
         }
+        spans
+    }
+
+    fn next_comment_start(source: &str, cursor: usize) -> Option<CommentStart> {
+        nearest_comment_start(
+            line_comment_start(source, cursor),
+            block_comment_start(source, cursor),
+        )
+    }
+
+    fn line_comment_start(source: &str, cursor: usize) -> Option<CommentStart> {
+        source[cursor..].find("//").map(|offset| CommentStart {
+            index: cursor + offset,
+            delimiter: CommentDelimiter::Line,
+        })
+    }
+
+    fn block_comment_start(source: &str, cursor: usize) -> Option<CommentStart> {
+        source[cursor..].find("/*").map(|offset| CommentStart {
+            index: cursor + offset,
+            delimiter: CommentDelimiter::Block,
+        })
+    }
+
+    fn nearest_comment_start(
+        line: Option<CommentStart>,
+        block: Option<CommentStart>,
+    ) -> Option<CommentStart> {
+        match (line, block) {
+            (Some(line), Some(block)) => Some(earlier_comment_start(line, block)),
+            (Some(line), None) => Some(line),
+            (None, Some(block)) => Some(block),
+            (None, None) => None,
+        }
+    }
+
+    fn earlier_comment_start(left: CommentStart, right: CommentStart) -> CommentStart {
+        if left.index <= right.index {
+            left
+        } else {
+            right
+        }
+    }
+
+    fn comment_end(source: &str, start: CommentStart) -> usize {
+        match start.delimiter {
+            CommentDelimiter::Line => line_comment_end(source, start.index),
+            CommentDelimiter::Block => block_comment_end(source, start.index),
+        }
+    }
+
+    fn line_comment_end(source: &str, start: usize) -> usize {
+        source[start..]
+            .find('\n')
+            .map(|offset| start + offset)
+            .unwrap_or(source.len())
+    }
+
+    fn block_comment_end(source: &str, start: usize) -> usize {
+        source[start + 2..]
+            .find("*/")
+            .map(|offset| start + 2 + offset + 2)
+            .unwrap_or(source.len())
+    }
+
+    fn source_excluding_spans(source: &str, spans: &[std::ops::Range<usize>]) -> String {
+        let mut output = String::with_capacity(source.len());
+        let mut cursor = 0;
+        for span in spans {
+            output.push_str(&source[cursor..span.start]);
+            cursor = span.end;
+        }
+        output.push_str(&source[cursor..]);
         output
     }
 
@@ -2769,7 +2598,7 @@ mod tests {
             failure_class: Some("UpstreamApiDown".to_string()),
         };
         assert!(
-            !provider_is_quota_exhausted(Some(&quota_within_slack), &[], now),
+            !eligibility::provider_is_quota_exhausted(Some(&quota_within_slack), &[], now),
             "marker within slack window must not pin the provider as exhausted"
         );
 
@@ -2778,7 +2607,7 @@ mod tests {
             ..quota_within_slack
         };
         assert!(
-            provider_is_quota_exhausted(Some(&quota_beyond_slack), &[], now),
+            eligibility::provider_is_quota_exhausted(Some(&quota_beyond_slack), &[], now),
             "marker well beyond slack window must keep provider exhausted"
         );
     }
@@ -2830,32 +2659,6 @@ mod tests {
         assert_eq!(
             selected, 1,
             "quota/window read failures should degrade to empty cache and use invocation-count fallback"
-        );
-    }
-
-    #[test]
-    fn clear_reset_implied_flags_does_not_abort_when_clear_fails() {
-        let (_dir, path, db) = file_backed_state("clear-reset-fails");
-        let model = single_provider_model();
-        seed_windows_with_deltas(&db, "a", &[(1.0, -1, 0.01, 22)]);
-        db.mark_exhausted("a").unwrap();
-        let conn = Connection::open(path).unwrap();
-        conn.execute_batch(
-            "CREATE TRIGGER fail_clear_exhausted
-             BEFORE UPDATE OF exhausted_at ON provider_quotas
-             WHEN NEW.exhausted_at IS NULL
-             BEGIN
-                SELECT RAISE(ABORT, 'clear denied');
-             END;",
-        )
-        .unwrap();
-
-        let selected = select_provider(&model, &db, None).unwrap();
-
-        assert_eq!(selected, 0);
-        assert!(
-            db.get_quota("a").unwrap().unwrap().exhausted_at.is_some(),
-            "failed reset-implied clear is swallowed after warning and leaves the flag intact"
         );
     }
 

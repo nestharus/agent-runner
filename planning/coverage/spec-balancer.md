@@ -3,9 +3,11 @@
 ## Source files
 
 - `crates/oulipoly-runtime/src/balancer/mod.rs`
+- `crates/oulipoly-runtime/src/balancer/eligibility.rs`
 - `crates/oulipoly-runtime/src/balancer/context.rs`
 - `crates/oulipoly-runtime/src/balancer/snapshot.rs`
 - `crates/oulipoly-runtime/src/balancer/refresh_inputs.rs`
+- `crates/oulipoly-runtime/src/balancer/topology.rs`
 
 ## Preconditions
 
