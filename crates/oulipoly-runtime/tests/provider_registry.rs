@@ -1438,7 +1438,11 @@ fn production_service_sources_do_not_route_current_paths_through_provider_regist
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     for relative in [
         "executor/mod.rs",
+        "quota/in_flight.rs",
         "quota/mod.rs",
+        "quota/outcome.rs",
+        "quota/parse.rs",
+        "quota/process.rs",
         "diagnostics/mod.rs",
         "services/adapters.rs",
         "services/session_lifecycle.rs",
