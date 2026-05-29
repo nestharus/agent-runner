@@ -5,6 +5,14 @@ import type {
 	ModelConfig,
 	ModelSummary,
 	PoolSummary,
+	ProviderSettingsDelete,
+	ProviderSettingsGet,
+	ProviderSettingsList,
+	ProviderSettingsMigrate,
+	ProviderSettingsSchema,
+	ProviderSettingsTarget,
+	ProviderSettingsValidate,
+	ProviderSettingsWrite,
 	SetupEvent,
 	TestModelResult,
 	UserResponse,
@@ -80,4 +88,100 @@ export function chatSend(
 	onEvent: Channel<ChatStreamEvent>,
 ): Promise<void> {
 	return tauriInvoke<void>("chat_send", { message, context, onEvent });
+}
+
+export function listProviderSettingsTargets(): Promise<
+	ProviderSettingsTarget[]
+> {
+	return tauriInvoke<ProviderSettingsTarget[]>(
+		"list_provider_settings_targets",
+	);
+}
+
+export function getProviderSettingsSchema(
+	modelName: string,
+	schemaId: string,
+): Promise<ProviderSettingsSchema> {
+	return tauriInvoke<ProviderSettingsSchema>("get_provider_settings_schema", {
+		modelName,
+		schemaId,
+	});
+}
+
+export function listProviderSettings(
+	modelName: string,
+): Promise<ProviderSettingsList> {
+	return tauriInvoke<ProviderSettingsList>("list_provider_settings", {
+		modelName,
+	});
+}
+
+export function getProviderSettings(
+	modelName: string,
+	id: string,
+): Promise<ProviderSettingsGet> {
+	return tauriInvoke<ProviderSettingsGet>("get_provider_settings", {
+		modelName,
+		id,
+	});
+}
+
+export function createProviderSettings(
+	modelName: string,
+	displayName: string | null,
+	values: Record<string, unknown>,
+): Promise<ProviderSettingsWrite> {
+	return tauriInvoke<ProviderSettingsWrite>("create_provider_settings", {
+		modelName,
+		displayName,
+		values,
+	});
+}
+
+export function updateProviderSettings(
+	modelName: string,
+	id: string,
+	version: string,
+	values: Record<string, unknown>,
+): Promise<ProviderSettingsWrite> {
+	return tauriInvoke<ProviderSettingsWrite>("update_provider_settings", {
+		modelName,
+		id,
+		version,
+		values,
+	});
+}
+
+export function deleteProviderSettings(
+	modelName: string,
+	id: string,
+	version: string,
+): Promise<ProviderSettingsDelete> {
+	return tauriInvoke<ProviderSettingsDelete>("delete_provider_settings", {
+		modelName,
+		id,
+		version,
+	});
+}
+
+export function validateProviderSettings(
+	modelName: string,
+	values: Record<string, unknown>,
+): Promise<ProviderSettingsValidate> {
+	return tauriInvoke<ProviderSettingsValidate>("validate_provider_settings", {
+		modelName,
+		values,
+	});
+}
+
+export function migrateProviderSettings(
+	modelName: string,
+	dryRun: boolean,
+	legacy: Record<string, unknown> | null,
+): Promise<ProviderSettingsMigrate> {
+	return tauriInvoke<ProviderSettingsMigrate>("migrate_provider_settings", {
+		modelName,
+		dryRun,
+		legacy,
+	});
 }

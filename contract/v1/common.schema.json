@@ -198,6 +198,10 @@
         },
         "details": {
           "$ref": "#/$defs/JsonObject"
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Diagnostic" }
         }
       },
       "required": [
@@ -222,6 +226,10 @@
         },
         "error": {
           "$ref": "#/$defs/ErrorObject"
+        },
+        "process_status": {
+          "type": "object",
+          "additionalProperties": true
         }
       },
       "required": [

@@ -72,6 +72,28 @@ pub fn describe_request() -> Value {
     })
 }
 
+pub fn schema_request() -> Value {
+    json!({
+        "contract": oulipoly_provider::generated::CONTRACT_VERSION,
+        "request_id": REQUEST_ID,
+        "provider_instance_id": PROVIDER_INSTANCE_ID,
+        "host": host_context(),
+        "params": {
+            "schema_id": "example.settings/v1"
+        }
+    })
+}
+
+pub fn settings_list_request() -> Value {
+    json!({
+        "contract": oulipoly_provider::generated::CONTRACT_VERSION,
+        "request_id": REQUEST_ID,
+        "provider_instance_id": PROVIDER_INSTANCE_ID,
+        "host": host_context(),
+        "params": {}
+    })
+}
+
 pub fn launch_request() -> Value {
     json!({
         "contract": oulipoly_provider::generated::CONTRACT_VERSION,
@@ -130,16 +152,42 @@ pub fn describe_success_response() -> Value {
     })
 }
 
+struct DescribeErrorFields<'a> {
+    category: &'a str,
+    code: &'a str,
+    retryable: bool,
+    message: String,
+}
+
+struct RecordedInvocationSections {
+    argv: Vec<String>,
+    stdin: String,
+}
+
 pub fn describe_error_response(category: &str, code: &str) -> Value {
+    let error = describe_error_fields(category, code);
+    describe_error_response_json(&error)
+}
+
+fn describe_error_fields<'a>(category: &'a str, code: &'a str) -> DescribeErrorFields<'a> {
+    DescribeErrorFields {
+        category,
+        code,
+        retryable: category == "timeout",
+        message: format!("{category} from fake-provider"),
+    }
+}
+
+fn describe_error_response_json(error: &DescribeErrorFields<'_>) -> Value {
     json!({
         "contract": oulipoly_provider::generated::CONTRACT_VERSION,
         "request_id": REQUEST_ID,
         "ok": false,
         "error": {
-            "category": category,
-            "code": code,
-            "retryable": category == "timeout",
-            "message": format!("{category} from fake-provider"),
+            "category": error.category,
+            "code": error.code,
+            "retryable": error.retryable,
+            "message": error.message,
             "details": {
                 "source": "example"
             }
@@ -195,6 +243,18 @@ pub fn launch_heartbeat_event(seq: u64) -> Value {
 }
 
 pub fn launch_exit_event(seq: u64, code: i32) -> Value {
+    launch_exit_event_json(seq, code, launch_terminal_signal_kind(code))
+}
+
+fn launch_terminal_signal_kind(code: i32) -> &'static str {
+    if code == 0 {
+        "clean_exit"
+    } else {
+        "nonzero_exit"
+    }
+}
+
+fn launch_exit_event_json(seq: u64, code: i32, signal_kind: &str) -> Value {
     json!({
         "contract": oulipoly_provider::generated::CONTRACT_VERSION,
         "request_id": REQUEST_ID,
@@ -206,7 +266,7 @@ pub fn launch_exit_event(seq: u64, code: i32) -> Value {
             "code": code
         },
         "terminal_signal": {
-            "kind": if code == 0 { "clean_exit" } else { "nonzero_exit" },
+            "kind": signal_kind,
             "evidence": "fake-provider exit event",
             "observed_at_unix_ms": 1000 + seq
         },
@@ -229,7 +289,16 @@ pub struct RecordedInvocation {
 }
 
 pub fn read_recorded_invocation(path: impl AsRef<std::path::Path>) -> RecordedInvocation {
-    let recorded = std::fs::read_to_string(path).expect("record should be written");
+    let recorded = read_recorded_invocation_text(path);
+    let sections = parse_recorded_invocation(&recorded);
+    recorded_invocation_from_sections(sections)
+}
+
+fn read_recorded_invocation_text(path: impl AsRef<std::path::Path>) -> String {
+    std::fs::read_to_string(path).expect("record should be written")
+}
+
+fn parse_recorded_invocation(recorded: &str) -> RecordedInvocationSections {
     let (argv, stdin) = recorded
         .split_once("\nstdin:\n")
         .expect("record should contain stdin section");
@@ -239,9 +308,16 @@ pub fn read_recorded_invocation(path: impl AsRef<std::path::Path>) -> RecordedIn
         .lines()
         .map(str::to_owned)
         .collect();
-    RecordedInvocation {
+    RecordedInvocationSections {
         argv,
         stdin: stdin.to_owned(),
+    }
+}
+
+fn recorded_invocation_from_sections(sections: RecordedInvocationSections) -> RecordedInvocation {
+    RecordedInvocation {
+        argv: sections.argv,
+        stdin: sections.stdin,
     }
 }
 

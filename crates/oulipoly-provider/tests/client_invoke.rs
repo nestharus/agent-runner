@@ -4,12 +4,14 @@ pub mod support {
 
 use oulipoly_provider::client::{ProviderClient, ProviderClientOptions, ProviderOutputLimits};
 use oulipoly_provider::error::ProviderClientError;
-use oulipoly_provider::generated::DescribeResult;
+use oulipoly_provider::generated::{DescribeResult, SchemaResult, SettingsListResult};
 use oulipoly_provider::resolver::ProviderArtifactRef;
+use std::ffi::OsString;
+use std::path::Path;
 use std::time::Duration;
 use support::provider_client::{
     REQUEST_ID, describe_request, executable_script, fake_provider_source,
-    read_recorded_invocation, temp_fixture_dir,
+    read_recorded_invocation, schema_request, settings_list_request, temp_fixture_dir,
     testkit::{FakeProvider, FakeProviderMode},
 };
 
@@ -60,6 +62,51 @@ fn invoke_writes_request_on_stdin_not_argv() {
         recorded
             .stdin
             .contains("\"request_id\":\"request-example-001\"")
+    );
+}
+
+#[test]
+fn invoke_schema_subcommand_returns_typed_result_through_one_shot_provider() {
+    let fake = FakeProvider::compile(fake_provider_source());
+    let record = temp_fixture_dir("schema-record").join("record.txt");
+    let client = client_for(fake.path());
+
+    let result: SchemaResult = client
+        .invoke_typed("schema", schema_request(), s5_record_env(&record))
+        .expect("registered schema subcommand should return a typed schema result");
+
+    assert_eq!(result.schema_id, "example.settings/v1");
+    assert_eq!(result.schema["type"], "object");
+
+    let recorded = read_recorded_invocation(record);
+    assert_eq!(
+        client.last_invocation_argv(),
+        vec![fake.path().into_os_string(), "schema".into()]
+    );
+    assert_eq!(recorded.argv.len(), 2);
+    assert_eq!(recorded.argv[1], "schema");
+    assert!(
+        recorded
+            .stdin
+            .contains("\"schema_id\":\"example.settings/v1\"")
+    );
+}
+
+#[test]
+fn invoke_settings_list_subcommand_returns_typed_result_through_one_shot_provider() {
+    let fake = FakeProvider::compile(fake_provider_source());
+    let client = client_for(fake.path());
+
+    let result: SettingsListResult = client
+        .invoke_typed("settings.list", settings_list_request(), s5_success_env())
+        .expect("registered settings.list subcommand should return a typed result");
+
+    assert_eq!(result.records.len(), 1);
+    assert_eq!(result.records[0].id, "example-settings");
+    assert_eq!(result.records[0].version, "7");
+    assert_eq!(
+        client.last_invocation_argv(),
+        vec![fake.path().into_os_string(), "settings.list".into()]
     );
 }
 
@@ -221,4 +268,21 @@ fn client_for(path: impl Into<std::path::PathBuf>) -> ProviderClient {
             ..ProviderClientOptions::default()
         },
     )
+}
+
+fn s5_success_env() -> Vec<(String, String)> {
+    vec![("FAKE_PROVIDER_MODE".to_owned(), "s5-success".to_owned())]
+}
+
+fn s5_record_env(record: &Path) -> Vec<(String, OsString)> {
+    vec![
+        (
+            "FAKE_PROVIDER_MODE".to_owned(),
+            OsString::from("s5-record-argv-stdin"),
+        ),
+        (
+            "FAKE_PROVIDER_RECORD_PATH".to_owned(),
+            record.as_os_str().to_os_string(),
+        ),
+    ]
 }

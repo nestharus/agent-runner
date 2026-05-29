@@ -36,6 +36,11 @@ vi.mock("@tauri-apps/api/core", () => {
 		invoke: vi.fn((cmd: string, args?: unknown) => {
 			if (handlers[cmd]) return handlers[cmd](args);
 			if (defaultHandlers[cmd]) return defaultHandlers[cmd]();
+			if (cmd.includes("provider_settings")) {
+				return Promise.reject(
+					new Error(`Missing Tauri mock handler for ${cmd}`),
+				);
+			}
 			return Promise.resolve();
 		}),
 		Channel: vi.fn().mockImplementation(function (this: {

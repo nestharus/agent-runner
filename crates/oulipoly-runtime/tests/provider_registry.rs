@@ -203,6 +203,87 @@ fn write_fake_provider_script(
     materialize_executable_script(&script, body)
 }
 
+fn write_fake_provider_settings_describe_script(
+    dir: &Path,
+    name: &str,
+    counter: &Path,
+    provider_id: &str,
+    settings_schema_id: &str,
+) -> PathBuf {
+    let script = dir.join(name);
+    initialize_count_file(counter);
+    let body =
+        fake_provider_settings_describe_script_body(counter, provider_id, settings_schema_id);
+    materialize_executable_script(&script, body)
+}
+
+fn fake_provider_settings_describe_script_body(
+    counter: &Path,
+    provider_id: &str,
+    settings_schema_id: &str,
+) -> String {
+    let counter_literal = path_literal(counter);
+    format!(
+        r#"#!/usr/bin/env python3
+import json
+import pathlib
+import sys
+
+count_file = pathlib.Path({counter_literal})
+current = int(count_file.read_text()) if count_file.exists() else 0
+count_file.write_text(str(current + 1))
+request = json.loads(sys.stdin.read() or "{{}}")
+if len(sys.argv) < 2 or sys.argv[1] != "describe":
+    response = {{
+        "contract": request.get("contract", "{contract}"),
+        "request_id": request.get("request_id", "request-example-001"),
+        "ok": False,
+        "error": {{
+            "category": "unsupported",
+            "code": "unsupported_subcommand",
+            "retryable": False,
+            "message": "unsupported",
+        }},
+    }}
+else:
+    response = {{
+        "contract": request.get("contract", "{contract}"),
+        "request_id": request.get("request_id", "request-example-001"),
+        "ok": True,
+        "result": {{
+            "provider_id": "{provider_id}",
+            "display_name": "Fake Provider",
+            "contract_versions": ["{contract}"],
+            "preferred_contract": "{contract}",
+            "capabilities": {{
+                "launch": True,
+                "policy": False,
+                "quota": False,
+                "session": False,
+                "terminal": False,
+                "rotation": False,
+                "discovery": False,
+                "settings": True,
+                "setup_brain": False,
+                "setup": False,
+                "migration": False,
+            }},
+            "settings_schema_id": "{settings_schema_id}",
+            "concurrency": {{
+                "safe_for_parallel_invocation": True,
+                "state_locking": "none",
+            }},
+        }},
+    }}
+print(json.dumps(response))
+"#,
+        counter_literal = counter_literal,
+        contract = CONTRACT_VERSION,
+        provider_id = provider_id,
+        settings_schema_id = settings_schema_id
+    )
+}
+
 fn fake_provider_script_body(counter: &Path, result: Result<&str, &str>) -> String {
     match result {
         Ok(provider_id) => fake_provider_success_script_body(counter, provider_id),
@@ -410,31 +491,87 @@ fn make_non_executable(path: &Path) {
 fn make_non_executable(_path: &Path) {}
 
 fn read_count(path: &Path) -> usize {
-    fs::read_to_string(path)
-        .ok()
+    parse_count(&count_text(path))
+}
+
+fn count_text(path: &Path) -> Option<String> {
+    fs::read_to_string(path).ok()
+}
+
+fn parse_count(value: &Option<String>) -> usize {
+    value
+        .as_deref()
         .and_then(|value| value.parse().ok())
         .unwrap_or(0)
 }
 
 fn protected_tree_snapshot(roots: &[&Path]) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+    sorted_snapshot_entries(snapshot_entries_for_roots(&existing_snapshot_roots(roots)))
+}
+
+fn existing_snapshot_roots<'a>(roots: &[&'a Path]) -> Vec<&'a Path> {
+    roots.iter().copied().filter(|root| root.exists()).collect()
+}
+
+fn snapshot_entries_for_roots(roots: &[&Path]) -> Vec<(PathBuf, Option<Vec<u8>>)> {
     let mut entries = Vec::new();
     for root in roots {
-        if root.exists() {
-            collect_paths(root, root, &mut entries);
-        }
+        collect_paths(root, root, &mut entries);
     }
+    entries
+}
+
+fn sorted_snapshot_entries(
+    mut entries: Vec<(PathBuf, Option<Vec<u8>>)>,
+) -> Vec<(PathBuf, Option<Vec<u8>>)> {
     entries.sort_by(|left, right| left.0.cmp(&right.0));
     entries
 }
 
 fn collect_paths(root: &Path, current: &Path, out: &mut Vec<(PathBuf, Option<Vec<u8>>)>) {
-    for entry in fs::read_dir(current).expect("snapshot directory should be readable") {
-        let entry = entry.expect("snapshot entry should be readable");
-        let path = entry.path();
-        out.push(snapshot_entry(root, &path));
-        if is_snapshot_directory(&path) {
-            collect_paths(root, &path, out);
-        }
+    let paths = snapshot_dir_paths(current);
+    append_snapshot_entries(root, &paths, out);
+    collect_child_snapshot_paths(root, &snapshot_child_dirs(&paths), out);
+}
+
+fn snapshot_dir_paths(current: &Path) -> Vec<PathBuf> {
+    dir_entry_paths(read_snapshot_dir_entries(current))
+}
+
+fn read_snapshot_dir_entries(current: &Path) -> Vec<fs::DirEntry> {
+    fs::read_dir(current)
+        .expect("snapshot directory should be readable")
+        .map(|entry| entry.expect("snapshot entry should be readable"))
+        .collect()
+}
+
+fn dir_entry_paths(entries: Vec<fs::DirEntry>) -> Vec<PathBuf> {
+    entries.into_iter().map(|entry| entry.path()).collect()
+}
+
+fn append_snapshot_entries(
+    root: &Path,
+    paths: &[PathBuf],
+    out: &mut Vec<(PathBuf, Option<Vec<u8>>)>,
+) {
+    out.extend(paths.iter().map(|path| snapshot_entry(root, path)));
+}
+
+fn snapshot_child_dirs(paths: &[PathBuf]) -> Vec<PathBuf> {
+    paths
+        .iter()
+        .filter(|path| is_snapshot_directory(path))
+        .cloned()
+        .collect()
+}
+
+fn collect_child_snapshot_paths(
+    root: &Path,
+    child_dirs: &[PathBuf],
+    out: &mut Vec<(PathBuf, Option<Vec<u8>>)>,
+) {
+    for path in child_dirs {
+        collect_paths(root, path, out);
     }
 }
 
@@ -595,6 +732,35 @@ fn enabled_ref_flavors_resolve_describe_and_parse_capability_description() {
     assert_eq!(script_result.provider_id, "script-provider");
     assert!(script_result.capabilities.launch);
     assert_eq!(read_count(&script_count), 1);
+}
+
+#[test]
+fn describe_propagates_settings_capability_and_schema_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let count = temp.path().join("describe-count");
+    let fake = write_fake_provider_settings_describe_script(
+        temp.path(),
+        "fake-provider",
+        &count,
+        "fake-provider",
+        "example.settings/v1",
+    );
+
+    let registry = registry_from_single_ref(
+        path_ref(fake.display().to_string()),
+        ProviderRegistryOptions::default(),
+    );
+    let result = registry
+        .describe_model_provider("example-model")
+        .expect("settings-capable provider should describe successfully");
+
+    assert_eq!(result.provider_id, "fake-provider");
+    assert!(result.capabilities.settings);
+    assert_eq!(
+        result.settings_schema_id.as_deref(),
+        Some("example.settings/v1")
+    );
+    assert_eq!(read_count(&count), 1);
 }
 
 #[test]
@@ -1055,10 +1221,15 @@ fn describe_request_envelope_matches_provider_contract() {
 }
 
 fn recorded_describe_request(request_record: &Path) -> Value {
-    serde_json::from_slice(
-        &fs::read(request_record).expect("fake provider should record describe request"),
-    )
-    .expect("recorded request should be valid JSON")
+    parse_recorded_describe_request(&recorded_describe_request_bytes(request_record))
+}
+
+fn recorded_describe_request_bytes(request_record: &Path) -> Vec<u8> {
+    fs::read(request_record).expect("fake provider should record describe request")
+}
+
+fn parse_recorded_describe_request(bytes: &[u8]) -> Value {
+    serde_json::from_slice(bytes).expect("recorded request should be valid JSON")
 }
 
 fn expected_host_root_strings(config_root: &Path, data_root: &Path) -> (String, String) {
