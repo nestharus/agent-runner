@@ -36,26 +36,66 @@ fn seed_live_window(db: &StateDb, provider_name: &str) {
 
 #[test]
 fn balancer_mod_has_no_terminal_signal_or_provider_output_parser_references() {
-    let source = include_str!("../src/balancer/mod.rs");
-    let production_source = source
-        .split("mod tests")
-        .next()
-        .expect("production balancer source before tests");
-    let code = source_without_comments(production_source);
-    for forbidden in ["TerminalSignal", "TerminalSignalKind", "terminal_signal"] {
+    for (module_path, source) in balancer_production_sources() {
+        let code = source_without_comments(source);
+        for forbidden in ["TerminalSignal", "TerminalSignalKind", "terminal_signal"] {
+            assert!(
+                !contains_identifier_token(&code, forbidden),
+                "{module_path} must not reference terminal-signal identifier token {forbidden:?}"
+            );
+        }
         assert!(
-            !contains_identifier_token(&code, forbidden),
-            "balancer must not reference terminal-signal identifier token {forbidden:?}"
+            !contains_terminal_signal_use_import(&code),
+            "{module_path} must not import terminal_signal modules or TerminalSignal types"
+        );
+        assert!(
+            !contains_provider_output_parser_identifier(&code),
+            "{module_path} must not call provider-output parser functions as routing authority"
         );
     }
-    assert!(
-        !contains_terminal_signal_use_import(&code),
-        "balancer must not import terminal_signal modules or TerminalSignal types"
-    );
-    assert!(
-        !contains_provider_output_parser_identifier(&code),
-        "balancer must not call provider-output parser functions as routing authority"
-    );
+}
+
+fn balancer_production_sources() -> [(&'static str, &'static str); 4] {
+    [
+        (
+            "crates/oulipoly-runtime/src/balancer/mod.rs",
+            production_balancer_source(
+                "crates/oulipoly-runtime/src/balancer/mod.rs",
+                include_str!("../src/balancer/mod.rs"),
+            ),
+        ),
+        (
+            "crates/oulipoly-runtime/src/balancer/context.rs",
+            production_balancer_source(
+                "crates/oulipoly-runtime/src/balancer/context.rs",
+                include_str!("../src/balancer/context.rs"),
+            ),
+        ),
+        (
+            "crates/oulipoly-runtime/src/balancer/snapshot.rs",
+            production_balancer_source(
+                "crates/oulipoly-runtime/src/balancer/snapshot.rs",
+                include_str!("../src/balancer/snapshot.rs"),
+            ),
+        ),
+        (
+            "crates/oulipoly-runtime/src/balancer/refresh_inputs.rs",
+            production_balancer_source(
+                "crates/oulipoly-runtime/src/balancer/refresh_inputs.rs",
+                include_str!("../src/balancer/refresh_inputs.rs"),
+            ),
+        ),
+    ]
+}
+
+fn production_balancer_source(module_path: &str, source: &'static str) -> &'static str {
+    if module_path.ends_with("/mod.rs") {
+        return source
+            .split("mod tests")
+            .next()
+            .expect("production balancer source before tests");
+    }
+    source
 }
 
 fn contains_identifier_token(source: &str, token: &str) -> bool {

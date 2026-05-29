@@ -3,6 +3,9 @@
 ## Source files
 
 - `crates/oulipoly-runtime/src/balancer/mod.rs`
+- `crates/oulipoly-runtime/src/balancer/context.rs`
+- `crates/oulipoly-runtime/src/balancer/snapshot.rs`
+- `crates/oulipoly-runtime/src/balancer/refresh_inputs.rs`
 
 ## Preconditions
 
@@ -58,8 +61,9 @@
 - Balancer does NOT call provider executables directly — that is
   `executor/cli.rs`'s job. The balancer's output is a provider selection,
   not a process invocation.
-- Balancer does NOT refresh quota — that is `quota/mod.rs`'s job. The
-  balancer reads the most recent `QuotaSnapshot` made available to it.
+- `select_provider(Some(ctx))` owns contextual refresh orchestration before
+  route selection, including stale-cache refresh calls and session scans, but
+  quota-script internals remain `quota/mod.rs`'s job.
 - Balancer does NOT classify terminal signals — that is
   `executor/terminal_signal.rs` and the per-provider recognizers' job. The
   balancer reads classifications, not raw stderr.

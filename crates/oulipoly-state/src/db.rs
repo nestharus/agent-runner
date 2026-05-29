@@ -5104,6 +5104,44 @@ impl StateDb {
         Ok(())
     }
 
+    /// Test-only: make a cached quota row unreadable through the public
+    /// `get_quota` API by writing a storage value that production parsing
+    /// rejects.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn force_unreadable_cached_quota_for_test(
+        &self,
+        provider_name: &str,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE provider_quotas
+                 SET topology_peak_live_window_count = -1
+                 WHERE provider_name = ?1",
+                sqlite::params![provider_name],
+            )
+            .map_err(|e| format!("Failed to force unreadable cached quota: {e}"))?;
+        Ok(())
+    }
+
+    /// Test-only: make cached window rows unreadable through the public
+    /// `get_windows` API by writing a timestamp value that strict window
+    /// parsing rejects.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn force_unreadable_cached_windows_for_test(
+        &self,
+        provider_name: &str,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE provider_quota_windows
+                 SET resets_at = 'not-rfc3339'
+                 WHERE provider_name = ?1",
+                sqlite::params![provider_name],
+            )
+            .map_err(|e| format!("Failed to force unreadable cached windows: {e}"))?;
+        Ok(())
+    }
+
     /// Bump `calls_since_refresh` for a provider. Creates the row with 1 call
     /// and zeroed quota if the provider isn't tracked yet.
     pub fn increment_calls_since_refresh(&self, provider_name: &str) -> Result<(), String> {
