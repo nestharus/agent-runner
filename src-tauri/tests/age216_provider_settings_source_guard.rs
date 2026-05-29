@@ -181,6 +181,10 @@ fn tauri_provider_settings_dtos_preserve_success_error_diagnostic_and_version_fi
 fn production_runtime_paths_do_not_route_through_provider_settings_dispatch() {
     let guarded_sources = [
         "../crates/oulipoly-runtime/src/balancer/mod.rs",
+        "../crates/oulipoly-runtime/src/balancer/projection.rs",
+        "../crates/oulipoly-runtime/src/balancer/burn_rate.rs",
+        "../crates/oulipoly-runtime/src/balancer/density.rs",
+        "../crates/oulipoly-runtime/src/balancer/invocation_fallback.rs",
         "../crates/oulipoly-runtime/src/balancer/eligibility.rs",
         "../crates/oulipoly-runtime/src/balancer/context.rs",
         "../crates/oulipoly-runtime/src/balancer/snapshot.rs",
@@ -227,6 +231,27 @@ fn production_runtime_paths_do_not_route_through_provider_settings_dispatch() {
         violations.is_empty(),
         "production paths must not switch to provider settings dispatch: {violations:?}"
     );
+}
+
+// risk: AGE-216 provider-settings guard could omit B3 balancer modules after extraction; level: source guard; source: AGE-224 contract Guard And Spec Contract / proposal A4.
+#[test]
+fn provider_settings_guard_source_list_declares_age224_b3_modules() {
+    let guard_body = function_body(
+        include_str!("age216_provider_settings_source_guard.rs"),
+        "fn production_runtime_paths_do_not_route_through_provider_settings_dispatch()",
+    );
+    for module in [
+        "projection.rs",
+        "burn_rate.rs",
+        "density.rs",
+        "invocation_fallback.rs",
+    ] {
+        let path = format!("../crates/oulipoly-runtime/src/balancer/{module}");
+        assert!(
+            guard_body.contains(&path),
+            "AGE-216 provider-settings guard must include {path}"
+        );
+    }
 }
 
 // risk: Provider-specific vocabulary drift; level: source guard; source: contract "Out of scope"

@@ -1,5 +1,13 @@
 # Project Decisions
 
+## D-AGE-224-cold-start-estimate — proceed without baseline estimate
+
+- **Source**: Phase 2.5 inherited-estimate cold-start gate on AGE-224. Linear ticket read returned `story_point_estimate: null` and `estimate_source: missing`.
+- **Decision**: Proceed without a baseline estimate. Phase 3 will produce the refined estimate from the approved problem map and HIGH risk profile.
+- **Rationale**: Manager answered the Phase 2.5 gate with "Proceed exhaustive" and explicitly accepted the missing estimate. AGE-224 is an output-preserving decomposition slice with concrete B3 scope from the core-file decomposition plan and focused characterization tests already added for the uncovered scoring behaviors.
+- **Evidence**: `/home/nes/projects/agent-runner/planning/age-224-balancer-b3/scratch/questions/q-age-224-phase-2-5-manager-gate.question.json`; `/home/nes/projects/agent-runner/planning/age-224-balancer-b3/risk/age-224-risk-profile.md`; `/home/nes/projects/agent-runner/planning/age-224-balancer-b3/scratch/phase25/age-224-characterization-tests.md`.
+- **Revisit when**: never for this WU; refined estimate is captured in Phase 3 and actual estimate in closure.
+
 Out-of-scope choices recorded explicitly so they are not "deferrals" — these
 are decisions that were considered, evaluated, and **declined** for the
 indicated version. Each entry names the originating finding, the chosen

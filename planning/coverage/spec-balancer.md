@@ -8,6 +8,10 @@
 - `crates/oulipoly-runtime/src/balancer/snapshot.rs`
 - `crates/oulipoly-runtime/src/balancer/refresh_inputs.rs`
 - `crates/oulipoly-runtime/src/balancer/topology.rs`
+- `crates/oulipoly-runtime/src/balancer/projection.rs`
+- `crates/oulipoly-runtime/src/balancer/burn_rate.rs`
+- `crates/oulipoly-runtime/src/balancer/density.rs`
+- `crates/oulipoly-runtime/src/balancer/invocation_fallback.rs`
 
 ## Preconditions
 
