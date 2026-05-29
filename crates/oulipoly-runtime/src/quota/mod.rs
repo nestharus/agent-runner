@@ -2,19 +2,23 @@
 //! `providers.toml`) that hits the provider's usage API and prints JSON on
 //! stdout. The parsed reading lands in `provider_quotas` + `provider_quota_windows`.
 
+mod in_flight;
 pub mod marker_verification;
+mod outcome;
+mod parse;
+mod process;
 
+pub use in_flight::{InFlight, InFlightGuard};
 pub use marker_verification::verify_or_clear_marker;
+pub use outcome::{QuotaScriptWindow, RefreshOutcome};
+pub use parse::parse_output;
+pub use process::{run_refresh_command, run_script};
 
 use crate::services::{QuotaServiceOutput, QuotaServicePort, QuotaServiceRequest, ServiceError};
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use oulipoly_config::{ProviderEntry, ProvidersConfig, SessionStorage, SessionsConfig};
 use oulipoly_state::{QuotaWindowInput, StateDb};
-use serde::Deserialize;
-use std::collections::HashSet;
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::sync::Mutex;
 
 /// Minimum refresh TTL. Below 5 minutes we burn API calls without useful
 /// signal change; the density projection already catches short-term spikes.
@@ -26,120 +30,10 @@ const MAX_TTL_SECS: i64 = 24 * 3600;
 const REFRESH_WINDOW_DIVISOR: i64 = 5;
 pub const TOPOLOGY_PROBE_COOLDOWN_SECS: u64 = 60 * 60;
 
-/// Script timeout — scripts hitting the internet shouldn't hang the caller.
-const SCRIPT_TIMEOUT_SECS: u64 = 30;
-/// Auth-refresh command timeout. Should be quick (the CLI hits its own auth
-/// endpoint and exits); kept tight to avoid hanging the quota path.
-const REFRESH_TIMEOUT_SECS: u64 = 15;
 /// Routing needs fresher data than the long-lived dashboard/projection cache.
 /// This keeps a single burst of dispatches from hammering provider APIs while
 /// still correcting stale account availability before each routing decision.
 const ROUTING_REFRESH_TTL_SECS: i64 = 30;
-
-/// Tracks in-flight refreshes so two callers for the same provider collapse
-/// into one run. The set holds provider names currently being refreshed.
-#[derive(Default)]
-pub struct InFlight {
-    inner: Mutex<HashSet<String>>,
-}
-
-impl InFlight {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Try to claim a slot for this provider. Returns a guard that releases
-    /// on drop, or None if the provider is already being refreshed.
-    pub fn try_claim(&self, provider: &str) -> Option<InFlightGuard<'_>> {
-        let mut set = self.inner.lock().ok()?;
-        if set.contains(provider) {
-            return None;
-        }
-        set.insert(provider.to_string());
-        Some(InFlightGuard {
-            set: &self.inner,
-            name: provider.to_string(),
-        })
-    }
-}
-
-pub struct InFlightGuard<'a> {
-    set: &'a Mutex<HashSet<String>>,
-    name: String,
-}
-
-impl Drop for InFlightGuard<'_> {
-    fn drop(&mut self) {
-        if let Ok(mut set) = self.set.lock() {
-            set.remove(&self.name);
-        }
-    }
-}
-
-/// Script output shape — prefer the new `windows` array, fall back to the
-/// old flat `{used_percent, resets_at}` shape so existing scripts keep working.
-#[derive(Debug, Deserialize)]
-struct QuotaScriptOutput {
-    /// New multi-window shape. One entry per rolling window the CLI exposes.
-    #[serde(default)]
-    windows: Option<Vec<QuotaScriptWindow>>,
-    /// Legacy single-window shape.
-    #[serde(default)]
-    used_percent: Option<f64>,
-    #[serde(default)]
-    resets_at: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct QuotaScriptWindow {
-    #[serde(default)]
-    pub window_id: u32,
-    /// Percent on a 0..100 scale. Values outside that range are rejected.
-    /// Scripts wrapping APIs that report a 0..1 fraction must multiply by 100
-    /// before emitting.
-    pub used_percent: f64,
-    pub resets_at: String,
-    #[serde(default)]
-    pub label: Option<String>,
-    #[serde(default)]
-    pub limit: Option<u64>,
-    #[serde(default)]
-    pub remaining: Option<u64>,
-    #[serde(default)]
-    pub unit: Option<String>,
-}
-
-impl QuotaScriptWindow {
-    /// Converts to `QuotaWindowInput` for routing.
-    ///
-    /// # Panics
-    /// Panics if `resets_at` is not a valid RFC3339 timestamp. Callers must
-    /// ensure this struct was produced by `parse_output`, which validates the
-    /// field; constructing a `QuotaScriptWindow` directly bypasses that check.
-    pub fn to_quota_window_input(&self) -> QuotaWindowInput {
-        let resets_at = DateTime::parse_from_rfc3339(&self.resets_at)
-            .expect("QuotaScriptWindow is validated by parse_output")
-            .with_timezone(&Utc);
-        QuotaWindowInput {
-            used_percent: self.used_percent / 100.0,
-            resets_at,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum RefreshOutcome {
-    Updated {
-        windows: Vec<QuotaWindowInput>,
-    },
-    /// Provider is missing a `quota_script` entry in providers.toml — caller
-    /// should fall back to invocation-count.
-    NoScript,
-    /// Another caller is already refreshing — use the existing cached value.
-    AlreadyInFlight,
-    /// Script ran but the output didn't parse / exit was non-zero.
-    Failed(String),
-}
 
 pub struct RuntimeQuotaService;
 
@@ -454,229 +348,16 @@ pub fn dynamic_ttl_secs(windows: &[oulipoly_state::QuotaWindow]) -> i64 {
     (min_hours / REFRESH_WINDOW_DIVISOR).clamp(MIN_TTL_SECS, MAX_TTL_SECS)
 }
 
-pub fn run_refresh_command(cmd_str: &str) -> Result<(), String> {
-    use std::io::Read;
-
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(cmd_str);
-    cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::null());
-    cmd.stderr(Stdio::piped());
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed to spawn auth_refresh_command: {e}"))?;
-
-    let stderr = child.stderr.take().expect("piped");
-    let stderr_handle = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = { stderr }.read_to_string(&mut buf);
-        buf
-    });
-
-    let timeout = std::time::Duration::from_secs(REFRESH_TIMEOUT_SECS);
-    let start = std::time::Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(s)) => break s,
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    return Err(format!(
-                        "auth_refresh_command timed out after {REFRESH_TIMEOUT_SECS}s"
-                    ));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Err(e) => return Err(format!("auth_refresh_command wait failed: {e}")),
-        }
-    };
-
-    let stderr_text = stderr_handle.join().unwrap_or_default();
-    if !status.success() {
-        return Err(format!(
-            "auth_refresh_command exited {}: {}",
-            status.code().unwrap_or(-1),
-            stderr_text.trim()
-        ));
-    }
-    Ok(())
-}
-
-pub fn run_script(script: &str) -> Result<String, String> {
-    use std::io::Read;
-
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(script);
-    cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed to spawn quota script: {e}"))?;
-
-    // Drain stdout/stderr concurrently to avoid pipe-full deadlocks for
-    // scripts that write a lot (unlikely for quota scripts but consistent
-    // with the sessions-module pattern).
-    let stdout = child.stdout.take().expect("piped");
-    let stderr = child.stderr.take().expect("piped");
-    let stdout_handle = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = { stdout }.read_to_string(&mut buf);
-        buf
-    });
-    let stderr_handle = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = { stderr }.read_to_string(&mut buf);
-        buf
-    });
-
-    let timeout = std::time::Duration::from_secs(SCRIPT_TIMEOUT_SECS);
-    let start = std::time::Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(s)) => break s,
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    return Err(format!(
-                        "Quota script timed out after {SCRIPT_TIMEOUT_SECS}s"
-                    ));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Err(e) => return Err(format!("Quota script wait failed: {e}")),
-        }
-    };
-
-    let stdout_text = stdout_handle.join().unwrap_or_default();
-    let stderr_text = stderr_handle.join().unwrap_or_default();
-
-    if !status.success() {
-        return Err(format!(
-            "Quota script exited {}: {}",
-            status.code().unwrap_or(-1),
-            stderr_text.trim()
-        ));
-    }
-
-    Ok(stdout_text)
-}
-
-pub fn parse_output(stdout: &str) -> Result<Vec<QuotaScriptWindow>, String> {
-    let trimmed = stdout.trim();
-    let parsed: QuotaScriptOutput = serde_json::from_str(trimmed)
-        .map_err(|e| format!("Invalid JSON from quota script: {e} (got: {stdout})"))?;
-
-    let raw_windows: Vec<QuotaScriptWindow> = match parsed.windows {
-        Some(ws) => ws,
-        None => {
-            // Legacy single-window shape.
-            let Some(pct) = parsed.used_percent else {
-                return Err(format!(
-                    "quota script emitted neither `windows` nor `used_percent` (got: {stdout})"
-                ));
-            };
-            let Some(resets_at) = parsed.resets_at else {
-                return Err(format!(
-                    "legacy quota script emitted `used_percent` without `resets_at` (got: {stdout})"
-                ));
-            };
-            vec![QuotaScriptWindow {
-                window_id: 0,
-                used_percent: pct,
-                resets_at,
-                label: None,
-                limit: None,
-                remaining: None,
-                unit: None,
-            }]
-        }
-    };
-
-    let mut out = Vec::with_capacity(raw_windows.len());
-    for (index, mut w) in raw_windows.into_iter().enumerate() {
-        DateTime::parse_from_rfc3339(&w.resets_at)
-            .map_err(|e| format!("Bad resets_at {}: {e}", w.resets_at))?;
-        if !(0.0..=100.0).contains(&w.used_percent) || w.used_percent.is_nan() {
-            return Err(format!(
-                "quota script emitted used_percent={} outside 0..100 (got: {stdout})",
-                w.used_percent
-            ));
-        }
-        w.window_id = index as u32;
-        out.push(w);
-    }
-    Ok(out)
-}
-
 // Keep for tests that want to model "short" vs "long" windows by constructing
 // synthetic resets_at values.
 #[cfg(test)]
-fn hours_from_now(h: i64) -> DateTime<Utc> {
+fn hours_from_now(h: i64) -> chrono::DateTime<Utc> {
     Utc::now() + chrono::Duration::hours(h)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn in_flight_single_claim() {
-        let f = InFlight::new();
-        let g = f.try_claim("claude").unwrap();
-        assert!(f.try_claim("claude").is_none());
-        drop(g);
-        assert!(f.try_claim("claude").is_some());
-    }
-
-    #[test]
-    fn in_flight_different_providers() {
-        let f = InFlight::new();
-        let _a = f.try_claim("claude").unwrap();
-        let _b = f.try_claim("codex").unwrap();
-    }
-
-    #[test]
-    fn parse_multi_window_output() {
-        let json = r#"{"windows":[
-            {"used_percent":1, "resets_at":"2026-04-23T19:00:00Z"},
-            {"used_percent":86, "resets_at":"2026-04-17T15:00:00Z"}
-        ]}"#;
-        let windows = parse_output(json).unwrap();
-        assert_eq!(windows.len(), 2);
-        assert!((windows[0].used_percent - 1.0).abs() < 1e-6);
-        assert!((windows[1].used_percent - 86.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn parse_legacy_single_window_output() {
-        let json = r#"{"used_percent":12, "resets_at":"2026-04-23T19:00:00Z"}"#;
-        let windows = parse_output(json).unwrap();
-        assert_eq!(windows.len(), 1);
-        assert!((windows[0].used_percent - 12.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn parse_rejects_legacy_without_resets_at() {
-        let json = r#"{"used_percent":12}"#;
-        assert!(parse_output(json).is_err());
-    }
-
-    #[test]
-    fn parse_rejects_used_percent_above_100() {
-        let json = r#"{"windows":[{"used_percent":150, "resets_at":"2026-04-23T19:00:00Z"}]}"#;
-        let err = parse_output(json).unwrap_err();
-        assert!(err.contains("outside 0..100"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn parse_rejects_negative_used_percent() {
-        let json = r#"{"windows":[{"used_percent":-1, "resets_at":"2026-04-23T19:00:00Z"}]}"#;
-        let err = parse_output(json).unwrap_err();
-        assert!(err.contains("outside 0..100"), "unexpected error: {err}");
-    }
 
     #[test]
     fn is_stale_forces_refresh_when_windows_empty() {
