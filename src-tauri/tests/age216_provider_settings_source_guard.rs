@@ -184,10 +184,13 @@ fn production_runtime_paths_do_not_route_through_provider_settings_dispatch() {
         "../crates/oulipoly-runtime/src/executor/mod.rs",
         "../crates/oulipoly-runtime/src/executor/cli.rs",
         "../crates/oulipoly-runtime/src/quota/in_flight.rs",
+        "../crates/oulipoly-runtime/src/quota/adapter_derived_source.rs",
         "../crates/oulipoly-runtime/src/quota/mod.rs",
         "../crates/oulipoly-runtime/src/quota/outcome.rs",
         "../crates/oulipoly-runtime/src/quota/parse.rs",
         "../crates/oulipoly-runtime/src/quota/process.rs",
+        "../crates/oulipoly-runtime/src/quota/refresh.rs",
+        "../crates/oulipoly-runtime/src/quota/source.rs",
         "../crates/oulipoly-runtime/src/session_metadata/mod.rs",
         "../crates/oulipoly-runtime/src/sessions/mod.rs",
         "../crates/oulipoly-runtime/src/migration/mod.rs",
@@ -310,7 +313,9 @@ fn production_source(relative: &str, source: &str) -> String {
 }
 
 fn source_term_violations(relative: &'static str, forbidden_terms: &[&'static str]) -> Vec<String> {
-    let source = read(relative);
+    let Ok(source) = fs::read_to_string(manifest_path(relative)) else {
+        return vec![format!("{relative}:<missing guarded source>")];
+    };
     forbidden_terms
         .iter()
         .copied()
