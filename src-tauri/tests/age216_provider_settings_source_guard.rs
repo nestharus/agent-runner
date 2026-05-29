@@ -185,6 +185,7 @@ fn production_runtime_paths_do_not_route_through_provider_settings_dispatch() {
         "../crates/oulipoly-runtime/src/executor/cli.rs",
         "../crates/oulipoly-runtime/src/quota/in_flight.rs",
         "../crates/oulipoly-runtime/src/quota/adapter_derived_source.rs",
+        "../crates/oulipoly-runtime/src/quota/freshness.rs",
         "../crates/oulipoly-runtime/src/quota/mod.rs",
         "../crates/oulipoly-runtime/src/quota/outcome.rs",
         "../crates/oulipoly-runtime/src/quota/parse.rs",
