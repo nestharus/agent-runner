@@ -1,17 +1,14 @@
 //! ## Declared roles
 //!
-//! Roles: orchestration, formatter, mapper, validator.
+//! Roles: orchestration.
 //!
 //! - orchestration: top-level [`execute`], [`execute_effective`],
 //!   [`execute_effective_with_start_known_provider_session_id`],
 //!   [`execute_resume`], [`execute_interactive`], and
-//!   [`execute_interactive_with_result`] entrypoints. This module composes
-//!   the per-component submodules listed below; predicates, parsers,
-//!   validators, formatters, mappers, accessors, and filters all live in
-//!   sibling files under `executor/cli/`.
-//! - formatter: [`interactive_args_missing_error`].
-//! - mapper: [`interactive_result_from_status`].
-//! - validator: [`validated_interactive_args`].
+//!   [`execute_interactive_with_result`] public entrypoints. This module owns
+//!   the facade re-exports and composes the per-component submodules listed
+//!   below; predicates, parsers, validators, formatters, mappers, accessors,
+//!   and filters all live in sibling files under `executor/cli/`.
 //!
 //! ## Adapter declarations
 //!
@@ -51,6 +48,8 @@
 //!   onto executor session-capture result DTOs.
 //! - [`headless`] — headless public execution entrypoints and effective
 //!   execution orchestration.
+//! - [`interactive`] — interactive public execution entrypoints, validation,
+//!   direct spawn/wait posture, Unix signal-guard callsite, and result mapping.
 //! - [`session_capture`] (c5) — `start_known_provider_session_id`, capture
 //!   plans, and stdout JSONL parsers. Carries the ACR-251 canonical-doc-
 //!   as-schema declarations for PP-007 + PP-008.
@@ -65,6 +64,7 @@
 mod capture_result;
 mod headless;
 mod input_flags;
+mod interactive;
 mod ipc;
 mod launch;
 mod policy;
@@ -82,6 +82,9 @@ mod terminal_signal;
 pub use headless::{
     execute, execute_effective, execute_effective_with_start_known_provider_session_id,
 };
+pub use interactive::{
+    InteractiveExecutionResult, execute_interactive, execute_interactive_with_result,
+};
 pub use provider_identity::{provider_name, shell_split};
 pub use request::EffectiveExecuteRequest;
 pub use resume::{ResumePayload, compose_resume_args};
@@ -90,106 +93,9 @@ pub use session_capture::start_known_provider_session_id;
 pub use terminal_signal::classify_terminal_reason;
 
 #[cfg(test)]
-use headless::execute_effective_with_supervisor_config;
-use launch::build_command;
-use oulipoly_config::ProviderConfig;
-use policy::apply_provider_policy;
-use resume::compose_resume_provider_args;
-use std::path::Path;
-use std::process::{ExitStatus, Stdio};
-
 use super::TerminalSignal;
-
-pub fn execute_interactive(
-    provider: &ProviderConfig,
-    working_dir: Option<&Path>,
-    parent_invocation_env: Option<&str>,
-    resume: Option<ResumePayload<'_>>,
-) -> Result<i32, String> {
-    execute_interactive_with_result(provider, working_dir, parent_invocation_env, resume)
-        .map(|result| result.exit_code)
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct InteractiveExecutionResult {
-    pub exit_code: i32,
-    pub terminal_reason: Option<String>,
-    pub terminal_signal: Option<TerminalSignal>,
-}
-
-pub fn execute_interactive_with_result(
-    provider: &ProviderConfig,
-    working_dir: Option<&Path>,
-    parent_invocation_env: Option<&str>,
-    resume: Option<ResumePayload<'_>>,
-) -> Result<InteractiveExecutionResult, String> {
-    let mut provider_args = validated_interactive_args(provider)?;
-    let mut no_prompt = None;
-    apply_provider_policy(provider, &mut provider_args, &mut no_prompt)?;
-    if let Some(resume) = resume {
-        provider_args = compose_resume_provider_args(provider_args, resume)?;
-    }
-
-    let mut cmd = build_command(
-        provider,
-        &provider_args,
-        working_dir,
-        parent_invocation_env,
-        None,
-    )?;
-    cmd.stdin(Stdio::inherit());
-    cmd.stdout(Stdio::inherit());
-    cmd.stderr(Stdio::inherit());
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed to spawn '{}': {e}", provider.command))?;
-
-    #[cfg(unix)]
-    let signal_guard = terminal_signal::InteractiveSignalGuard::install(&mut child)?;
-
-    let status = child
-        .wait()
-        .map_err(|e| format!("Failed to wait for process: {e}"))?;
-
-    #[cfg(unix)]
-    drop(signal_guard);
-
-    Ok(interactive_result_from_status(provider, &status))
-}
-
-fn validated_interactive_args(provider: &ProviderConfig) -> Result<Vec<String>, String> {
-    provider
-        .interactive_args
-        .clone()
-        .ok_or_else(|| interactive_args_missing_error(provider))
-}
-
-fn interactive_args_missing_error(provider: &ProviderConfig) -> String {
-    format!(
-        "provider {} has no interactive_args; cannot launch interactively",
-        provider.name
-    )
-}
-
-fn interactive_result_from_status(
-    provider: &ProviderConfig,
-    status: &ExitStatus,
-) -> InteractiveExecutionResult {
-    let terminal_reason = classify_terminal_reason(status);
-    let terminal_signal = terminal_signal::recognize_terminal_signal(
-        &provider.name,
-        provider_identity::ProviderRecognizer::for_provider(provider),
-        &[],
-        &[],
-        terminal_signal::terminal_status_from_exit_status(status),
-    );
-    InteractiveExecutionResult {
-        exit_code: terminal_signal::exit_code_from_status(status),
-        terminal_reason,
-        terminal_signal: Some(terminal_signal),
-    }
-}
+#[cfg(test)]
+use headless::execute_effective_with_supervisor_config;
 
 #[cfg(test)]
 mod tests {
