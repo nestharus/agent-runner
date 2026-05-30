@@ -60,10 +60,15 @@ fn tauri_provider_settings_handlers_are_thin_runtime_adapters() {
 // risk: Registry/model reload staleness; level: Tauri state lifecycle; source: contract "Runtime state signals"
 #[test]
 fn model_reload_save_and_delete_refresh_configured_provider_settings_registry() {
-    let source = read("src/lib.rs");
+    let lib_source = read("src/lib.rs");
+    let model_source = read("src/commands/models/orchestration.rs");
 
-    for function_name in ["fn reload_models", "fn save_model_inner", "fn delete_model"] {
-        let body = function_body(&source, function_name);
+    for (source, function_name) in [
+        (&lib_source, "fn reload_models"),
+        (&model_source, "fn save_model_inner"),
+        (&model_source, "fn delete_model"),
+    ] {
+        let body = function_body(source, function_name);
         assert!(
             body.contains("provider_settings") || body.contains("provider_registry"),
             "{function_name} must refresh the configured provider settings registry/service"
@@ -108,7 +113,12 @@ fn settings_migration_packaging_is_read_only_and_separate_from_central_config_mi
 fn s5_does_not_retire_central_provider_or_model_config_parsing() {
     let model_source = read("../crates/oulipoly-config/src/model.rs");
     let providers_source = read("../crates/oulipoly-config/src/providers.rs");
-    let tauri_source = read("src/lib.rs");
+    let tauri_source = [
+        read("src/lib.rs"),
+        read("src/commands/models/formatter.rs"),
+        read("src/commands/pools/writer.rs"),
+    ]
+    .join("\n");
     let app_paths_source = read("src/app_paths.rs");
 
     for required in [
