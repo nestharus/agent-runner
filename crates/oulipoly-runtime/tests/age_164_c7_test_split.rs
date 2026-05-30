@@ -207,9 +207,9 @@ fn interactive_execution_propagates_parent_invocation_env() {
     std::fs::set_permissions(&script_path, perms).unwrap();
     let provider = ProviderConfig {
         name: "env-fixture".to_string(),
-        command: script_path.to_string_lossy().into_owned(),
+        command: "bash".to_string(),
         args: Vec::new(),
-        interactive_args: Some(vec!["launch".to_string()]),
+        interactive_args: Some(vec![script_path.to_string_lossy().into_owned()]),
         resume: None,
         session_capture: None,
         resume_acceptance: None,

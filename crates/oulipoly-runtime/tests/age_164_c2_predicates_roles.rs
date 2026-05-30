@@ -32,6 +32,7 @@ const CLI_MODULES: &[&str] = &[
     "capture_result",
     "headless",
     "input_flags",
+    "interactive",
     "ipc",
     "launch",
     "policy",
@@ -215,6 +216,7 @@ fn executor_coverage_spec_lists_required_cli_leaves() {
 
     for module in [
         "headless",
+        "interactive",
         "provider_execution",
         "provider_lookup",
         "request",

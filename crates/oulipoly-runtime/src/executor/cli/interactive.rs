@@ -1,0 +1,127 @@
+//! ## Declared roles
+//!
+//! Roles: orchestration, validator, formatter, mapper.
+//!
+//! - orchestration: public interactive entrypoints sequence validation,
+//!   provider policy, optional resume args, command build, stdio inheritance,
+//!   direct spawn/wait, signal guard lifetime, and result mapping.
+//! - validator: [`validated_interactive_args`] accepts provider configs with
+//!   interactive args or returns validation failure.
+//! - formatter: [`interactive_args_missing_error`] formats the stable
+//!   validation error.
+//! - mapper: [`interactive_result_from_status`] maps [`std::process::ExitStatus`]
+//!   plus provider recognizer evidence into [`InteractiveExecutionResult`].
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: crates/oulipoly-runtime/src/executor/cli/interactive.rs
+//!     role: adapter
+//!     Translates:
+//!       - executor-public-interactive-entrypoint-contract
+//!       - provider-interactive-launch-contract
+//!       - terminal-status-to-interactive-result-contract
+//!       - unix-interactive-signal-guard-callsite-contract
+//! ```
+
+use super::super::TerminalSignal;
+use super::launch::build_command;
+use super::policy::apply_provider_policy;
+use super::provider_identity::ProviderRecognizer;
+use super::resume::{ResumePayload, compose_resume_provider_args};
+use super::terminal_signal;
+use oulipoly_config::ProviderConfig;
+use std::path::Path;
+use std::process::{ExitStatus, Stdio};
+
+pub fn execute_interactive(
+    provider: &ProviderConfig,
+    working_dir: Option<&Path>,
+    parent_invocation_env: Option<&str>,
+    resume: Option<ResumePayload<'_>>,
+) -> Result<i32, String> {
+    execute_interactive_with_result(provider, working_dir, parent_invocation_env, resume)
+        .map(|result| result.exit_code)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct InteractiveExecutionResult {
+    pub exit_code: i32,
+    pub terminal_reason: Option<String>,
+    pub terminal_signal: Option<TerminalSignal>,
+}
+
+pub fn execute_interactive_with_result(
+    provider: &ProviderConfig,
+    working_dir: Option<&Path>,
+    parent_invocation_env: Option<&str>,
+    resume: Option<ResumePayload<'_>>,
+) -> Result<InteractiveExecutionResult, String> {
+    let mut provider_args = validated_interactive_args(provider)?;
+    let mut no_prompt = None;
+    apply_provider_policy(provider, &mut provider_args, &mut no_prompt)?;
+    if let Some(resume) = resume {
+        provider_args = compose_resume_provider_args(provider_args, resume)?;
+    }
+
+    let mut cmd = build_command(
+        provider,
+        &provider_args,
+        working_dir,
+        parent_invocation_env,
+        None,
+    )?;
+    cmd.stdin(Stdio::inherit());
+    cmd.stdout(Stdio::inherit());
+    cmd.stderr(Stdio::inherit());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to spawn '{}': {e}", provider.command))?;
+
+    #[cfg(unix)]
+    let signal_guard = terminal_signal::InteractiveSignalGuard::install(&mut child)?;
+
+    let status = child
+        .wait()
+        .map_err(|e| format!("Failed to wait for process: {e}"))?;
+
+    #[cfg(unix)]
+    drop(signal_guard);
+
+    Ok(interactive_result_from_status(provider, &status))
+}
+
+fn validated_interactive_args(provider: &ProviderConfig) -> Result<Vec<String>, String> {
+    provider
+        .interactive_args
+        .clone()
+        .ok_or_else(|| interactive_args_missing_error(provider))
+}
+
+fn interactive_args_missing_error(provider: &ProviderConfig) -> String {
+    format!(
+        "provider {} has no interactive_args; cannot launch interactively",
+        provider.name
+    )
+}
+
+fn interactive_result_from_status(
+    provider: &ProviderConfig,
+    status: &ExitStatus,
+) -> InteractiveExecutionResult {
+    let terminal_reason = terminal_signal::classify_terminal_reason(status);
+    let terminal_signal = terminal_signal::recognize_terminal_signal(
+        &provider.name,
+        ProviderRecognizer::for_provider(provider),
+        &[],
+        &[],
+        terminal_signal::terminal_status_from_exit_status(status),
+    );
+    InteractiveExecutionResult {
+        exit_code: terminal_signal::exit_code_from_status(status),
+        terminal_reason,
+        terminal_signal: Some(terminal_signal),
+    }
+}
