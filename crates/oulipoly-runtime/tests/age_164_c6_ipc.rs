@@ -516,6 +516,10 @@ fn child_marker_parser_drops_malformed_lines_and_dedupes_by_composite_id() {
     assert_eq!(result.exit_code, 0);
     assert_eq!(result.captured_child_invocations.len(), 1);
     assert_eq!(result.captured_child_invocations[0].composite_id, marker);
+    assert_eq!(
+        result.captured_child_invocations[0].raw_marker_line,
+        marker_line
+    );
 }
 
 // ---------------------------------------------------------------------------
