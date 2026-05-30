@@ -24,24 +24,35 @@
 //!       - AGE-166 typed terminal-signal kind to durable-mark predicate
 //! ```
 
+mod app_paths;
+mod app_state;
 #[path = "commands/provider_settings.rs"]
 pub(crate) mod provider_settings;
+mod run_tauri;
 pub mod setup;
 pub mod terminal_outcome_adapter;
 pub mod usage;
 mod wiring;
 pub mod zero_turn_orchestration;
 
-use oulipoly_config as config;
-use oulipoly_config::repositories::{
-    FilesystemProvidersConfigRepository, ProvidersConfigRepository,
+pub use app_paths::{
+    AppConfig, load_app_config, load_providers_for_models_dir, load_providers_for_models_dir_with,
 };
+pub use app_state::AppState;
+#[cfg(test)]
+pub(crate) use app_state::AppStateTestServices;
+pub use run_tauri::run_tauri;
+
+use oulipoly_config as config;
+#[cfg(test)]
+use oulipoly_config::repositories::FilesystemProvidersConfigRepository;
+use oulipoly_config::repositories::ProvidersConfigRepository;
 use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig, ProvidersConfig};
 use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind;
 use oulipoly_runtime::services::{
     DiagnosticsServiceOutput, DiagnosticsServicePort, DiagnosticsServiceRequest,
-    ExecutorServicePort, ExecutorServiceRequest, QuotaServicePort, QuotaServiceRequest,
-    RoutingServicePort, RoutingServiceRequest,
+    ExecutorServicePort, ExecutorServiceRequest, QuotaServiceRequest, RoutingServicePort,
+    RoutingServiceRequest,
 };
 use oulipoly_runtime::{discovery, quota};
 use oulipoly_setup as setup_core;
@@ -56,21 +67,14 @@ use oulipoly_state::{AccountRecord, AuthMethod, AuthStatus, CliProviderRecord};
 use oulipoly_state::{DiscoveredModel, ModelParameter};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 use tauri::ipc::Channel;
 use tokio::sync::mpsc;
-
-pub type AppConfig = oulipoly_config::app::AppConfig;
-
-pub fn load_app_config() -> AppConfig {
-    let config_dir = dirs::config_dir()
-        .map(|d| d.join("oulipoly-agent-runner"))
-        .unwrap_or_else(|| PathBuf::from("."));
-
-    let config_path = config_dir.join("config.toml");
-    oulipoly_config::app::AppConfig::load(&config_path).unwrap_or_default()
-}
 
 #[derive(Serialize, Clone)]
 pub struct TestModelResult {
@@ -118,117 +122,6 @@ fn derive_pools(models: &HashMap<String, config::ModelConfig>) -> Vec<PoolSummar
 
     pools.sort_by(|a, b| a.commands.cmp(&b.commands));
     pools
-}
-
-pub struct AppState {
-    pub models: Mutex<HashMap<String, config::ModelConfig>>,
-    pub models_dir: PathBuf,
-    pub setup_input_tx: Mutex<Option<mpsc::Sender<UserResponse>>>,
-    /// Tracks quota-refresh calls in flight so duplicate callers collapse.
-    pub quota_in_flight: quota::InFlight,
-    state_db_opener: Arc<dyn StateDbOpener + Send + Sync>,
-    providers_config: Arc<dyn ProvidersConfigRepository + Send + Sync>,
-    routing_service: Arc<dyn RoutingServicePort>,
-    quota_service: Arc<dyn QuotaServicePort>,
-    executor_service: Arc<dyn ExecutorServicePort>,
-    diagnostics_service: Arc<dyn DiagnosticsServicePort>,
-    pub(crate) provider_settings: Mutex<oulipoly_runtime::provider_settings::ProviderSettingsHost>,
-    #[cfg(test)]
-    pub(crate) provider_settings_test_double:
-        Mutex<Option<provider_settings::ProviderSettingsCommandResponses>>,
-    #[cfg(test)]
-    setup_repository: Option<Arc<dyn SetupRepository + Send + Sync>>,
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn load_providers_for_models_dir(models_dir: &Path) -> config::ProvidersConfig {
-    let repo = FilesystemProvidersConfigRepository;
-    load_providers_for_models_dir_with(models_dir, &repo)
-}
-
-fn load_providers_for_models_dir_with(
-    models_dir: &Path,
-    repo: &dyn ProvidersConfigRepository,
-) -> config::ProvidersConfig {
-    let config_root = models_dir
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    repo.load_providers(&config_root.join("providers.toml"))
-        .unwrap_or_default()
-}
-
-impl AppState {
-    fn new(
-        models_dir: PathBuf,
-        models: HashMap<String, config::ModelConfig>,
-        services: &wiring::AgentRuntimeServices,
-    ) -> Self {
-        let state_db_opener: Arc<dyn StateDbOpener + Send + Sync> =
-            services.state_db_opener.clone();
-        let providers_config: Arc<dyn ProvidersConfigRepository + Send + Sync> =
-            services.providers_config.clone();
-        let routing_service: Arc<dyn RoutingServicePort> = services.routing_service.clone();
-        let provider_settings =
-            provider_settings::build_host(&models_dir, &models).unwrap_or_else(|_| {
-                oulipoly_runtime::provider_settings::ProviderSettingsHost::from_model_configs(
-                    &[],
-                    provider_settings::host_options(&models_dir),
-                )
-                .expect("empty provider settings host should build")
-            });
-        Self {
-            models: Mutex::new(models),
-            models_dir,
-            setup_input_tx: Mutex::new(None),
-            quota_in_flight: quota::InFlight::new(),
-            state_db_opener,
-            providers_config,
-            routing_service,
-            quota_service: Arc::clone(&services.quota_service),
-            executor_service: Arc::clone(&services.executor_service),
-            diagnostics_service: Arc::clone(&services.diagnostics_service),
-            provider_settings: Mutex::new(provider_settings),
-            #[cfg(test)]
-            provider_settings_test_double: Mutex::new(None),
-            #[cfg(test)]
-            setup_repository: None,
-        }
-    }
-
-    #[cfg(test)]
-    fn test_default(models_dir: PathBuf, models: HashMap<String, config::ModelConfig>) -> Self {
-        let provider_settings =
-            provider_settings::build_host(&models_dir, &models).unwrap_or_else(|_| {
-                oulipoly_runtime::provider_settings::ProviderSettingsHost::from_model_configs(
-                    &[],
-                    provider_settings::host_options(&models_dir),
-                )
-                .expect("empty provider settings host should build")
-            });
-        Self {
-            models: Mutex::new(models),
-            models_dir,
-            setup_input_tx: Mutex::new(None),
-            quota_in_flight: quota::InFlight::new(),
-            state_db_opener: Arc::new(ProductionStateDbOpener),
-            providers_config: Arc::new(FilesystemProvidersConfigRepository),
-            routing_service: Arc::new(oulipoly_runtime::services::ProductionRoutingService),
-            quota_service: Arc::new(oulipoly_runtime::quota::RuntimeQuotaService),
-            executor_service: Arc::new(oulipoly_runtime::executor::RuntimeExecutorService),
-            diagnostics_service: Arc::new(oulipoly_runtime::diagnostics::RuntimeDiagnosticsService),
-            provider_settings: Mutex::new(provider_settings),
-            provider_settings_test_double: Mutex::new(None),
-            setup_repository: None,
-        }
-    }
-
-    fn db_path(&self) -> PathBuf {
-        self.models_dir
-            .parent()
-            .unwrap_or(&self.models_dir)
-            .join("state.db")
-    }
 }
 
 #[tauri::command]
@@ -1090,72 +983,6 @@ fn get_model_parameters_inner(
     })
 }
 
-pub fn run_tauri() {
-    let models_dir = dirs::config_dir()
-        .map(|d| d.join("oulipoly-agent-runner").join("models"))
-        .unwrap_or_else(|| PathBuf::from("models"));
-
-    let config_root = models_dir
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let runtime_paths = wiring::RuntimePaths {
-        config_root: config_root.clone(),
-        models_dir: models_dir.clone(),
-        agents_dir: config_root.join("agents"),
-        data_root: config_root.clone(),
-        state_db_path: config_root.join("state.db"),
-        lock_dir: config_root.join("locks"),
-        working_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-    };
-    let services = wiring::AgentRuntimeServices::production(runtime_paths)
-        .expect("failed to initialize runtime services");
-
-    let providers = load_providers_for_models_dir_with(&models_dir, &*services.providers_config);
-    let models = config::load_models(&models_dir, Some(&providers)).unwrap_or_default();
-
-    tauri::Builder::default()
-        .manage(AppState::new(models_dir.clone(), models, &services))
-        .invoke_handler(tauri::generate_handler![
-            check_setup_needed,
-            start_setup,
-            start_cli_setup,
-            reload_models,
-            setup_respond,
-            cancel_setup,
-            detect_clis,
-            get_memory_graph,
-            list_models,
-            get_model,
-            save_model,
-            delete_model,
-            list_pools,
-            provider_settings::list_provider_settings_targets,
-            provider_settings::get_provider_settings_schema,
-            provider_settings::list_provider_settings,
-            provider_settings::get_provider_settings,
-            provider_settings::create_provider_settings,
-            provider_settings::update_provider_settings,
-            provider_settings::delete_provider_settings,
-            provider_settings::validate_provider_settings,
-            provider_settings::migrate_provider_settings,
-            refresh_quotas,
-            update_pool,
-            test_model,
-            list_cli_providers,
-            get_cli_provider,
-            list_accounts,
-            add_account,
-            remove_account,
-            sync_provider,
-            discover_models_cmd,
-            list_discovered_models,
-            get_model_parameters,
-        ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(dead_code)]
@@ -1234,48 +1061,6 @@ mod tests {
 
     fn test_state(models_dir: PathBuf, models: HashMap<String, ModelConfig>) -> AppState {
         AppState::test_default(models_dir, models)
-    }
-
-    struct Phase6bServiceBundle {
-        providers_config: Arc<dyn ProvidersConfigRepository + Send + Sync>,
-        state_db_opener: Arc<dyn StateDbOpener + Send + Sync>,
-        setup_repository: Arc<dyn SetupRepository + Send + Sync>,
-        quota_service: Arc<dyn QuotaServicePort>,
-        executor_service: Arc<dyn ExecutorServicePort>,
-        diagnostics_service: Arc<dyn DiagnosticsServicePort>,
-    }
-
-    impl AppState {
-        #[cfg(test)]
-        fn with_services(
-            models_dir: PathBuf,
-            models: HashMap<String, ModelConfig>,
-            services: Phase6bServiceBundle,
-        ) -> AppState {
-            let provider_settings = provider_settings::build_host(&models_dir, &models)
-                .unwrap_or_else(|_| {
-                    oulipoly_runtime::provider_settings::ProviderSettingsHost::from_model_configs(
-                        &[],
-                        provider_settings::host_options(&models_dir),
-                    )
-                    .expect("empty provider settings host should build")
-                });
-            AppState {
-                models: Mutex::new(models),
-                models_dir,
-                setup_input_tx: Mutex::new(None),
-                quota_in_flight: quota::InFlight::new(),
-                state_db_opener: services.state_db_opener,
-                providers_config: services.providers_config,
-                routing_service: Arc::new(oulipoly_runtime::services::ProductionRoutingService),
-                quota_service: services.quota_service,
-                executor_service: services.executor_service,
-                diagnostics_service: services.diagnostics_service,
-                provider_settings: Mutex::new(provider_settings),
-                provider_settings_test_double: Mutex::new(None),
-                setup_repository: Some(services.setup_repository),
-            }
-        }
     }
 
     struct StubProvidersConfigRepository {
@@ -1808,8 +1593,8 @@ mod tests {
         quota_service: Arc<dyn QuotaServicePort>,
         executor_service: Arc<dyn ExecutorServicePort>,
         diagnostics_service: Arc<dyn DiagnosticsServicePort>,
-    ) -> Phase6bServiceBundle {
-        Phase6bServiceBundle {
+    ) -> AppStateTestServices {
+        AppStateTestServices {
             providers_config,
             state_db_opener,
             setup_repository,
@@ -1819,7 +1604,7 @@ mod tests {
         }
     }
 
-    fn default_services(root: &Path) -> Phase6bServiceBundle {
+    fn default_services(root: &Path) -> AppStateTestServices {
         let db_path = root.join("state.db");
         services(
             Arc::new(StubProvidersConfigRepository::default()),
@@ -2664,15 +2449,6 @@ interactive_args = ["exec", "--dangerously-bypass-approvals-and-sandbox"]
     }
 
     #[test]
-    fn app_state_db_path_returns_models_parent_state_db() {
-        let dir = tempfile::tempdir().unwrap();
-        let models_dir = dir.path().join("models");
-        let state = test_state(models_dir, HashMap::new());
-
-        assert_eq!(state.db_path(), dir.path().join("state.db"));
-    }
-
-    #[test]
     fn open_state_db_opens_models_parent_state_db_and_returns_state_db() {
         let dir = tempfile::tempdir().unwrap();
         let models_dir = dir.path().join("models");
@@ -2689,33 +2465,6 @@ interactive_args = ["exec", "--dangerously-bypass-approvals-and-sandbox"]
             db.get_cli_provider("codex").unwrap().unwrap().display_name,
             "OpenAI"
         );
-    }
-
-    #[test]
-    fn load_providers_for_models_dir_loads_parent_providers_and_defaults_errors() {
-        let dir = tempfile::tempdir().unwrap();
-        let models_dir = dir.path().join("models");
-        std::fs::create_dir_all(&models_dir).unwrap();
-        std::fs::write(
-            dir.path().join("providers.toml"),
-            r#"
-[codex]
-command = "codex"
-args = ["exec"]
-"#,
-        )
-        .unwrap();
-
-        let providers = super::load_providers_for_models_dir(&models_dir);
-        assert!(providers.entries.contains_key("codex"));
-
-        std::fs::write(dir.path().join("providers.toml"), "not = [valid").unwrap();
-        let providers = super::load_providers_for_models_dir(&models_dir);
-        assert!(providers.entries.is_empty());
-
-        std::fs::remove_file(dir.path().join("providers.toml")).unwrap();
-        let providers = super::load_providers_for_models_dir(&models_dir);
-        assert!(providers.entries.is_empty());
     }
 
     #[test]

@@ -811,17 +811,19 @@ sessions_dir = {:?}
 #[test]
 fn age_33_tauri_private_helpers_keep_models_dir_parent_config_and_state_policy() {
     let lib_source = include_str!("../src/lib.rs");
+    let app_paths_source = include_str!("../src/app_paths.rs");
+    let app_state_source = include_str!("../src/app_state.rs");
 
     assert!(
-        lib_source.contains("fn load_providers_for_models_dir(models_dir: &Path)")
-            && lib_source.contains(".parent()")
-            && lib_source.contains("join(\"providers.toml\")")
-            && lib_source.contains("unwrap_or_default()"),
+        app_paths_source.contains("pub fn load_providers_for_models_dir(models_dir: &Path)")
+            && app_paths_source.contains(".parent()")
+            && app_paths_source.contains("join(\"providers.toml\")")
+            && app_paths_source.contains("unwrap_or_default()"),
         "GUI provider loading must keep deriving providers.toml from models_dir.parent()"
     );
     assert!(
-        lib_source.contains("fn db_path(&self) -> PathBuf")
-            && lib_source.contains("join(\"state.db\")"),
+        app_state_source.contains("pub fn db_path(&self) -> PathBuf")
+            && app_state_source.contains("join(\"state.db\")"),
         "GUI state helpers must keep opening state.db beside models_dir.parent()"
     );
     assert!(

@@ -254,10 +254,16 @@ fn ti_15_tauri_state_command_open_errors_preserve_variant_and_rebuild_guidance()
         "{message}"
     );
     let lib_source = include_str!("../src/lib.rs");
+    let app_state_source = include_str!("../src/app_state.rs");
     assert!(
         lib_source.contains("fn open_state_db")
             && lib_source.contains("StateDb::open(&state.db_path())"),
         "Tauri state commands must share the migration-aware StateDb opener"
+    );
+    assert!(
+        app_state_source.contains("pub fn db_path(&self) -> PathBuf")
+            && app_state_source.contains("join(\"state.db\")"),
+        "AppState must keep deriving state.db beside models_dir.parent()"
     );
 }
 
