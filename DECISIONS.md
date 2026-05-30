@@ -1,5 +1,27 @@
 # Project Decisions
 
+## D-AGE-236-D8-spec-tauri-client-same-diff — quota-refresh spec registration ratified
+
+- **Source**: AGE-236 L4 Phase 7/8 D-8 same-diff ratification for `planning/coverage/spec-tauri-client.md`.
+- **Decision**: PASS. The spec diff is the same behavioral concern as the AGE-236 implementation: moving GUI quota-refresh IPC handling out of `lib.rs` into `commands/quota_refresh/*` while preserving the existing output contract.
+- **Sub-checks**:
+  - Source-file registration PASS: the five new quota-refresh module files are listed under `## Source files`.
+  - Behavior registration PASS: the input/output matrix names the quota-refresh command behavior at the same abstraction level as the Tauri client spec.
+  - Edge/error registration PASS: the spec captures fresh-cache short-circuit, in-flight DTO status `"in_flight"`, and state DB open error `Failed to open state DB: {e}`.
+  - Test registration PASS: `src-tauri/tests/age236_quota_refresh_extraction.rs` is listed in declared test patterns.
+  - Drift preservation PASS: AGE-237 remains owner of usage-CLI/quota-refresh outcome consolidation; the spec explicitly records that AGE-236 does not normalize or repair that drift.
+- **Evidence**: `planning/coverage/spec-tauri-client.md`; `src-tauri/src/commands/quota_refresh/*`; `src-tauri/tests/age236_quota_refresh_extraction.rs`; Phase 6 join manifest `/home/nes/projects/agent-runner/planning/age-236-lib-l4/risk/phase-6-join-manifest.json`.
+- **Revisit when**: AGE-237 changes the usage/quota outcome contract or a future Tauri client spec update broadens quota-refresh behavior beyond current GUI output preservation.
+
+## D-AGE-236-phase-2-5-manager-disposition — proceed exhaustive without estimate provenance
+
+- **Source**: Phase 2.5 manager gate for AGE-236, question `/home/nes/projects/agent-runner/planning/age-236-lib-l4/scratch/questions/q-bdd0c737-a4a6-4a80-8444-23d7f0b33763.question.json`.
+- **Decision**: Proceed to Phase 3 in exhaustive, strictly output-preserving mode. Accept the unsourced Linear `story_point_estimate=5` as a manager-set cold-start baseline with `manager_estimate_source_disposition: manager-set-coldstart`; Phase 3 will refine from the approved problem map and HIGH risk profile.
+- **Risk disposition**: Approve the Phase 2.5 problem map and HIGH risk profile. Defer-to-prototype is not taken because only one defer signal fired.
+- **AGE-237 drift disposition**: Proceed with note. AGE-237 tracks adjacent `usage_cli_quota_refresh_outcome_state_machine` drift and owns the broader consolidation question. AGE-236 must preserve current GUI quota-refresh behavior and current usage-CLI outcome behavior exactly; it must not unify, normalize, or repair the drift.
+- **Evidence**: `/home/nes/projects/agent-runner/planning/age-236-lib-l4/research/age-236-problem-map.md`; `/home/nes/projects/agent-runner/planning/age-236-lib-l4/risk/age-236-risk-profile.md`; `/home/nes/projects/agent-runner/planning/age-236-lib-l4/risk/age-236-age-237-drift-disposition.md`.
+- **Revisit when**: AGE-237 is scheduled or AGE-236 implementation requires behavior changes, which would violate this disposition and require manager input.
+
 ## D-AGE-225-cold-start-estimate — proceed without baseline estimate
 
 - **Source**: Phase 2.5 inherited-estimate cold-start gate on AGE-225. Linear ticket read returned `story_point_estimate: null` and `estimate_source: missing`.
