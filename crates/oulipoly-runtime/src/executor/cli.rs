@@ -49,290 +49,56 @@
 //!   Carries the ACR-251 canonical-doc-as-schema declaration for PP-009.
 //! - [`capture_result`] (c5) — maps capture plans and parsed provider output
 //!   onto executor session-capture result DTOs.
+//! - [`headless`] — headless public execution entrypoints and effective
+//!   execution orchestration.
 //! - [`session_capture`] (c5) — `start_known_provider_session_id`, capture
 //!   plans, and stdout JSONL parsers. Carries the ACR-251 canonical-doc-
 //!   as-schema declarations for PP-007 + PP-008.
+//! - [`provider_execution`] — provider launch/supervisor/return-channel
+//!   orchestration for headless and resume execution.
+//! - [`resume_execution`] — resume public entrypoints and resume execution
+//!   orchestration.
 //! - [`supervision`] (c3) — provider supervisor + child IO.
 //! - [`terminal_signal`] (c3) — terminal reason classifier and the
 //!   interactive signal-forwarding guard.
 
 mod capture_result;
+mod headless;
 mod input_flags;
 mod ipc;
 mod launch;
 mod policy;
+mod provider_execution;
 mod provider_identity;
 mod provider_lookup;
 mod request;
 mod result;
 mod resume;
+mod resume_execution;
 mod session_capture;
 mod supervision;
 mod terminal_signal;
 
+pub use headless::{
+    execute, execute_effective, execute_effective_with_start_known_provider_session_id,
+};
 pub use provider_identity::{provider_name, shell_split};
 pub use request::EffectiveExecuteRequest;
 pub use resume::{ResumePayload, compose_resume_args};
+pub use resume_execution::{execute_resume, execute_resume_optional_prompt};
 pub use session_capture::start_known_provider_session_id;
 pub use terminal_signal::classify_terminal_reason;
 
-use input_flags::resolve_input_flags;
-use launch::{ProviderLaunch, ProviderLaunchRequest, assemble_provider_launch, build_command};
-use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig};
-use policy::apply_provider_policy;
-use provider_lookup::provider_for_index;
-use result::{
-    RawResult, cleanup_temp_files, execution_result_from_raw, raw_result_from_supervised_output,
-};
-use resume::{classify_resume_acceptance, compose_resume_provider_args};
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::process::{ExitStatus, Stdio};
-use supervision::{SupervisorConfig, run_provider_supervisor};
-
-use super::{ExecutionResult, SessionCaptureMethod, SessionCaptureResult, TerminalSignal};
-
-pub fn execute(
-    model: &ModelConfig,
-    provider_index: usize,
-    prompt: &str,
-    working_dir: Option<&Path>,
-    extra_inputs: &HashMap<String, Vec<String>>,
-    parent_invocation_env: Option<&str>,
-) -> Result<ExecutionResult, String> {
-    let provider = provider_for_index(model, provider_index)?;
-    let input_args = resolve_input_flags(model, extra_inputs)?;
-    let (result, temp_files) = execute_provider(
-        provider,
-        model.prompt_mode,
-        prompt,
-        working_dir,
-        &input_args,
-        parent_invocation_env,
-        None,
-    )?;
-    cleanup_temp_files(temp_files);
-
-    Ok(execution_result_from_raw(
-        result,
-        provider_index,
-        None,
-        None,
-    ))
-}
-
-pub fn execute_effective(request: EffectiveExecuteRequest<'_>) -> Result<ExecutionResult, String> {
-    execute_effective_with_start_known_provider_session_id(request, None)
-}
-
-pub fn execute_effective_with_start_known_provider_session_id(
-    request: EffectiveExecuteRequest<'_>,
-    start_known_provider_session_id: Option<&str>,
-) -> Result<ExecutionResult, String> {
-    execute_effective_with_optional_supervisor_config(
-        request,
-        start_known_provider_session_id,
-        None,
-    )
-}
-
 #[cfg(test)]
-fn execute_effective_with_supervisor_config(
-    request: EffectiveExecuteRequest<'_>,
-    start_known_provider_session_id: Option<&str>,
-    supervisor_config: SupervisorConfig,
-) -> Result<ExecutionResult, String> {
-    execute_effective_with_optional_supervisor_config(
-        request,
-        start_known_provider_session_id,
-        Some(supervisor_config),
-    )
-}
+use headless::execute_effective_with_supervisor_config;
+use launch::build_command;
+use oulipoly_config::ProviderConfig;
+use policy::apply_provider_policy;
+use resume::compose_resume_provider_args;
+use std::path::Path;
+use std::process::{ExitStatus, Stdio};
 
-fn execute_effective_with_optional_supervisor_config(
-    request: EffectiveExecuteRequest<'_>,
-    start_known_provider_session_id: Option<&str>,
-    supervisor_config: Option<SupervisorConfig>,
-) -> Result<ExecutionResult, String> {
-    let input_args = resolve_input_flags(request.model, request.extra_inputs)?;
-    let (result, temp_files) = execute_provider_with_arg_parts_and_supervisor_config(
-        request.provider,
-        &request.provider.args,
-        &[],
-        request.prompt_mode,
-        Some(request.prompt),
-        request.working_dir,
-        &input_args,
-        request.parent_invocation_env,
-        start_known_provider_session_id,
-        supervisor_config,
-    )?;
-    cleanup_temp_files(temp_files);
-
-    Ok(execution_result_from_raw(
-        result,
-        request.provider_index,
-        None,
-        None,
-    ))
-}
-
-fn execute_provider(
-    provider: &ProviderConfig,
-    prompt_mode: PromptMode,
-    prompt: &str,
-    working_dir: Option<&Path>,
-    input_args: &[String],
-    parent_invocation_env: Option<&str>,
-    start_known_provider_session_id: Option<&str>,
-) -> Result<(RawResult, Vec<PathBuf>), String> {
-    execute_provider_with_arg_parts_and_supervisor_config(
-        provider,
-        &provider.args,
-        &[],
-        prompt_mode,
-        Some(prompt),
-        working_dir,
-        input_args,
-        parent_invocation_env,
-        start_known_provider_session_id,
-        None,
-    )
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "executor call shape keeps base args, lifecycle tail args, prompt mode, cwd, input flags, parent marker, optional start-bound session, and optional supervisor test injection explicit"
-)]
-fn execute_provider_with_arg_parts_and_supervisor_config(
-    provider: &ProviderConfig,
-    provider_args: &[String],
-    tail_args: &[String],
-    prompt_mode: PromptMode,
-    prompt: Option<&str>,
-    working_dir: Option<&Path>,
-    input_args: &[String],
-    parent_invocation_env: Option<&str>,
-    start_known_provider_session_id: Option<&str>,
-    supervisor_config: Option<SupervisorConfig>,
-) -> Result<(RawResult, Vec<PathBuf>), String> {
-    let launch = assemble_provider_launch(
-        ProviderLaunchRequest {
-            provider,
-            provider_args,
-            tail_args,
-            prompt_mode,
-            prompt,
-            working_dir,
-            input_args,
-            parent_invocation_env,
-            start_known_provider_session_id,
-        },
-        supervisor_config,
-    )?;
-    let ProviderLaunch {
-        cmd,
-        supervisor_config,
-        capture_plan,
-        return_channel,
-        temp_files,
-    } = launch;
-    let output = run_provider_supervisor(cmd, provider, supervisor_config)?;
-    let returned_artifacts = ipc::read_and_cleanup_return_channel(&return_channel);
-    let result = raw_result_from_supervised_output(&capture_plan, output, returned_artifacts);
-
-    Ok((result, temp_files))
-}
-
-pub fn execute_resume(
-    provider: &ProviderConfig,
-    provider_index: usize,
-    prompt_mode: PromptMode,
-    prompt: &str,
-    working_dir: Option<&Path>,
-    parent_invocation_env: Option<&str>,
-    resume: ResumePayload<'_>,
-) -> Result<ExecutionResult, String> {
-    execute_resume_optional_prompt(
-        provider,
-        provider_index,
-        prompt_mode,
-        Some(prompt),
-        working_dir,
-        parent_invocation_env,
-        resume,
-    )
-}
-
-pub fn execute_resume_optional_prompt(
-    provider: &ProviderConfig,
-    provider_index: usize,
-    prompt_mode: PromptMode,
-    prompt: Option<&str>,
-    working_dir: Option<&Path>,
-    parent_invocation_env: Option<&str>,
-    resume: ResumePayload<'_>,
-) -> Result<ExecutionResult, String> {
-    execute_resume_with_optional_supervisor_config(
-        provider,
-        provider_index,
-        prompt_mode,
-        prompt,
-        working_dir,
-        parent_invocation_env,
-        resume,
-        None,
-    )
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "resume execution keeps provider, prompt, cwd, parent marker, resume payload, and optional supervisor test injection explicit"
-)]
-fn execute_resume_with_optional_supervisor_config(
-    provider: &ProviderConfig,
-    provider_index: usize,
-    prompt_mode: PromptMode,
-    prompt: Option<&str>,
-    working_dir: Option<&Path>,
-    parent_invocation_env: Option<&str>,
-    resume: ResumePayload<'_>,
-    supervisor_config: Option<SupervisorConfig>,
-) -> Result<ExecutionResult, String> {
-    let session_id = resume.session_id.to_string();
-    let resume_args = compose_resume_args(resume.strategy, resume.session_id)?;
-    let mut provider_without_capture = provider.clone();
-    provider_without_capture.session_capture = None;
-    let (result, temp_files) = execute_provider_with_arg_parts_and_supervisor_config(
-        &provider_without_capture,
-        &provider.args,
-        &resume_args,
-        prompt_mode,
-        prompt,
-        working_dir,
-        &[],
-        parent_invocation_env,
-        None,
-        supervisor_config,
-    )?;
-    cleanup_temp_files(temp_files);
-    let resume_acceptance = classify_resume_acceptance(
-        provider.resume_acceptance.as_ref(),
-        result.exit_code,
-        &result.telemetry_stdout,
-        result.stderr.as_bytes(),
-        &session_id,
-    );
-    Ok(execution_result_from_raw(
-        result,
-        provider_index,
-        Some(resume_acceptance),
-        Some(SessionCaptureResult {
-            session_id: None,
-            method: SessionCaptureMethod::None,
-        }),
-    ))
-}
+use super::TerminalSignal;
 
 pub fn execute_interactive(
     provider: &ProviderConfig,
@@ -435,10 +201,16 @@ mod tests {
     //! Public-API tests live in `crates/oulipoly-runtime/tests/`.
 
     use super::*;
+    use crate::executor::cli::supervision::SupervisorConfig;
     use crate::executor::terminal_signal::TerminalSignalKind;
-    use oulipoly_config::{ProviderConfig, SessionCapture, SessionCaptureKind};
+    use crate::executor::{ExecutionResult, SessionCaptureMethod};
+    use oulipoly_config::{
+        ModelConfig, PromptMode, ProviderConfig, SessionCapture, SessionCaptureKind,
+    };
+    use std::collections::HashMap;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
     struct FixtureScript {

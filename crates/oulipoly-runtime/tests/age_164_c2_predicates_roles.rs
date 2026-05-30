@@ -30,15 +30,18 @@ use std::path::PathBuf;
 
 const CLI_MODULES: &[&str] = &[
     "capture_result",
+    "headless",
     "input_flags",
     "ipc",
     "launch",
     "policy",
+    "provider_execution",
     "provider_lookup",
     "provider_identity",
     "request",
     "result",
     "resume",
+    "resume_execution",
     "session_capture",
     "supervision",
     "terminal_signal",
@@ -207,14 +210,21 @@ fn cli_submodules_have_adapter_declaration_translates_blocks() {
 }
 
 #[test]
-fn executor_coverage_spec_lists_age226_cli_leaves() {
+fn executor_coverage_spec_lists_required_cli_leaves() {
     let spec = std::fs::read_to_string(coverage_spec_path()).expect("executor spec readable");
 
-    for module in ["provider_lookup", "request", "result"] {
+    for module in [
+        "headless",
+        "provider_execution",
+        "provider_lookup",
+        "request",
+        "result",
+        "resume_execution",
+    ] {
         let expected = format!("- `crates/oulipoly-runtime/src/executor/cli/{module}.rs`");
         assert!(
             spec.contains(&expected),
-            "planning/coverage/spec-executor.md must list {module}.rs for AGE-226 audit discovery"
+            "planning/coverage/spec-executor.md must list {module}.rs for executor audit discovery"
         );
     }
 }
