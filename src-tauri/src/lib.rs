@@ -36,8 +36,7 @@ pub(crate) use test_model_command::{
 };
 
 use oulipoly_config as config;
-use oulipoly_runtime::services::QuotaServiceRequest;
-use oulipoly_runtime::{discovery, quota};
+use oulipoly_runtime::discovery;
 use oulipoly_setup as setup_core;
 use oulipoly_setup::actions::{SetupEvent, UserResponse};
 #[cfg(test)]
@@ -46,7 +45,7 @@ use oulipoly_state::StateDb;
 use oulipoly_state::repositories::SetupRepository;
 use oulipoly_state::{AccountRecord, AuthMethod, AuthStatus, CliProviderRecord};
 use oulipoly_state::{DiscoveredModel, ModelParameter};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 #[cfg(test)]
 use std::path::Path;
 use std::sync::Arc;
@@ -194,129 +193,6 @@ fn get_memory_graph(
         .join("state.db");
     let graph = setup_core::memory::MemoryGraph::open(&db_path)?;
     graph.snapshot()
-}
-
-#[derive(Serialize)]
-pub struct QuotaRefreshWindow {
-    pub used_percent: f64,
-    pub resets_at: String,
-}
-
-#[derive(Serialize)]
-pub struct QuotaRefreshEntry {
-    pub provider_name: String,
-    pub status: String,
-    pub windows: Vec<QuotaRefreshWindow>,
-    pub message: Option<String>,
-}
-
-/// Refresh quotas for every distinct provider that participates in at least
-/// one multi-provider model. Single-provider models are skipped since there's
-/// no load-balancing decision to inform.
-#[tauri::command]
-async fn refresh_quotas(
-    state: tauri::State<'_, AppState>,
-) -> Result<Vec<QuotaRefreshEntry>, String> {
-    refresh_quotas_inner(&state)
-}
-
-fn refresh_quotas_inner(state: &AppState) -> Result<Vec<QuotaRefreshEntry>, String> {
-    // Collect the set of provider names that can actually benefit from a
-    // quota refresh — i.e. names that appear in any model with >1 provider.
-    let candidates: Vec<String> = {
-        let models = state.models.lock().map_err(|e| e.to_string())?;
-        let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for m in models.values() {
-            if m.providers.len() > 1 {
-                for p in &m.providers {
-                    set.insert(p.name.clone());
-                }
-            }
-        }
-        let mut candidates: Vec<String> = set.into_iter().collect();
-        candidates.sort();
-        candidates
-    };
-
-    let providers_path = state
-        .models_dir
-        .parent()
-        .unwrap_or(&state.models_dir)
-        .join("providers.toml");
-    let providers_cfg = state
-        .providers_config
-        .load_providers(&providers_path)
-        .unwrap_or_default();
-
-    let db_path = state
-        .models_dir
-        .parent()
-        .unwrap_or(&state.models_dir)
-        .join("state.db");
-
-    let db = state
-        .state_db_opener
-        .open_at(&db_path)
-        .map_err(|e| format!("Failed to open state DB: {e}"))?;
-    let in_flight = &state.quota_in_flight;
-    let mut results = Vec::with_capacity(candidates.len());
-
-    for provider_name in candidates {
-        if !quota::is_stale(&db, &provider_name) {
-            results.push(QuotaRefreshEntry {
-                provider_name,
-                status: "fresh".into(),
-                windows: vec![],
-                message: None,
-            });
-            continue;
-        }
-
-        let outcome = state
-            .quota_service
-            .refresh_quota(QuotaServiceRequest {
-                provider_name: provider_name.clone(),
-                providers_cfg: &providers_cfg,
-                in_flight,
-                state: &db,
-            })
-            .map_err(|error| error.to_string())?
-            .outcome;
-        results.push(match outcome {
-            quota::RefreshOutcome::Updated { windows } => QuotaRefreshEntry {
-                provider_name,
-                status: "updated".into(),
-                windows: windows
-                    .into_iter()
-                    .map(|w| QuotaRefreshWindow {
-                        used_percent: w.used_percent,
-                        resets_at: w.resets_at.to_rfc3339(),
-                    })
-                    .collect(),
-                message: None,
-            },
-            quota::RefreshOutcome::NoScript => QuotaRefreshEntry {
-                provider_name,
-                status: "no_script".into(),
-                windows: vec![],
-                message: None,
-            },
-            quota::RefreshOutcome::AlreadyInFlight => QuotaRefreshEntry {
-                provider_name,
-                status: "in_flight".into(),
-                windows: vec![],
-                message: None,
-            },
-            quota::RefreshOutcome::Failed(msg) => QuotaRefreshEntry {
-                provider_name,
-                status: "failed".into(),
-                windows: vec![],
-                message: Some(msg),
-            },
-        });
-    }
-
-    Ok(results)
 }
 
 // --- Provider & Account commands ---
@@ -579,6 +455,7 @@ mod tests {
         CapturedChildInvocation, ExecutionResult, ResumeAcceptanceResult, SessionCaptureMethod,
         SessionCaptureResult, TerminalSignal,
     };
+    use oulipoly_runtime::quota;
     use oulipoly_runtime::services::{
         DiagnosticsServiceOutput, DiagnosticsServicePort, DiagnosticsServiceRequest,
         ExecutorServiceOutput, ExecutorServicePort, ExecutorServiceRequest, QuotaServiceOutput,
@@ -1264,122 +1141,6 @@ mod tests {
 
         assert_eq!(err, "sentinel opener failure");
         assert_eq!(opener.calls(), vec![dir.path().join("state.db")]);
-    }
-
-    #[test]
-    fn age38_refresh_quotas_routes_load_open_and_refresh_through_stubs() {
-        let dir = tempfile::tempdir().unwrap();
-        let models_dir = dir.path().join("models");
-        let providers = Arc::new(StubProvidersConfigRepository::returning(Ok(
-            ProvidersConfig::default(),
-        )));
-        let opener = Arc::new(StubStateDbOpener::opening(dir.path().join("stub-state.db")));
-        let quota_service = Arc::new(StubQuotaService::updated());
-        let state = AppState::with_services(
-            models_dir,
-            HashMap::from([(
-                "multi".to_string(),
-                make_model("multi", &["age38-a", "age38-b"]),
-            )]),
-            services(
-                providers.clone(),
-                opener.clone(),
-                Arc::new(StubSetupRepository::default()),
-                quota_service.clone(),
-                Arc::new(StubExecutorService::with_exit(0, b"", "")),
-                Arc::new(StubDiagnosticsService::returning(false)),
-            ),
-        );
-
-        let results = super::refresh_quotas_inner(&state).unwrap();
-
-        assert_eq!(providers.calls(), vec![dir.path().join("providers.toml")]);
-        assert_eq!(opener.calls(), vec![dir.path().join("state.db")]);
-        let mut quota_calls = quota_service.calls();
-        quota_calls.sort();
-        assert_eq!(quota_calls, vec!["age38-a", "age38-b"]);
-        assert!(
-            results
-                .iter()
-                .any(|entry| entry.provider_name == "age38-a" && entry.status == "updated"),
-            "stub quota output should be mapped to an updated DTO"
-        );
-    }
-
-    #[test]
-    fn age38_refresh_quotas_keeps_fresh_gate_before_quota_service() {
-        let dir = tempfile::tempdir().unwrap();
-        let models_dir = dir.path().join("models");
-        let opened_db_path = dir.path().join("stub-state.db");
-        let db = StateDb::open(&opened_db_path).unwrap();
-        db.upsert_quota_refresh(
-            "fresh-provider",
-            &[state::QuotaWindowInput {
-                used_percent: 0.10,
-                resets_at: chrono::Utc::now() + chrono::Duration::hours(24),
-            }],
-        )
-        .unwrap();
-        drop(db);
-        let opener = Arc::new(StubStateDbOpener::opening(opened_db_path));
-        let quota_service = Arc::new(StubQuotaService::updated());
-        let state = AppState::with_services(
-            models_dir,
-            HashMap::from([(
-                "multi".to_string(),
-                make_model("multi", &["fresh-provider", "stale-provider"]),
-            )]),
-            services(
-                Arc::new(StubProvidersConfigRepository::default()),
-                opener,
-                Arc::new(StubSetupRepository::default()),
-                quota_service.clone(),
-                Arc::new(StubExecutorService::with_exit(0, b"", "")),
-                Arc::new(StubDiagnosticsService::returning(false)),
-            ),
-        );
-
-        let results = super::refresh_quotas_inner(&state).unwrap();
-
-        assert!(
-            !quota_service
-                .calls()
-                .contains(&"fresh-provider".to_string())
-        );
-        let fresh = results
-            .iter()
-            .find(|entry| entry.provider_name == "fresh-provider")
-            .unwrap();
-        assert_eq!(fresh.status, "fresh");
-    }
-
-    #[test]
-    fn age38_refresh_quotas_wraps_injected_db_open_error_and_skips_quota_service() {
-        let dir = tempfile::tempdir().unwrap();
-        let quota_service = Arc::new(StubQuotaService::updated());
-        let state = AppState::with_services(
-            dir.path().join("models"),
-            HashMap::from([(
-                "multi".to_string(),
-                make_model("multi", &["age38-a", "age38-b"]),
-            )]),
-            services(
-                Arc::new(StubProvidersConfigRepository::default()),
-                Arc::new(StubStateDbOpener::failing("sentinel opener failure")),
-                Arc::new(StubSetupRepository::default()),
-                quota_service.clone(),
-                Arc::new(StubExecutorService::with_exit(0, b"", "")),
-                Arc::new(StubDiagnosticsService::returning(false)),
-            ),
-        );
-
-        let err = match super::refresh_quotas_inner(&state) {
-            Ok(_) => panic!("refresh_quotas_inner should return the injected opener error"),
-            Err(err) => err,
-        };
-
-        assert_eq!(err, "Failed to open state DB: sentinel opener failure");
-        assert!(quota_service.calls().is_empty());
     }
 
     #[test]
@@ -2078,169 +1839,6 @@ interactive_args = ["exec", "--dangerously-bypass-approvals-and-sandbox"]
             err,
             "provider missing-provider is missing from providers.toml"
         );
-    }
-
-    #[test]
-    fn refresh_quotas_filters_to_multi_provider_candidates() {
-        let dir = tempfile::tempdir().unwrap();
-        let models_dir = dir.path().join("models");
-        let models = HashMap::from([
-            (
-                "single".to_string(),
-                make_model("single", &["single-provider"]),
-            ),
-            (
-                "multi".to_string(),
-                make_model("multi", &["multi-a", "multi-b"]),
-            ),
-        ]);
-        let state = test_state(models_dir, models);
-
-        let mut results = super::refresh_quotas_inner(&state).unwrap();
-        results.sort_by(|a, b| a.provider_name.cmp(&b.provider_name));
-
-        assert_eq!(
-            results
-                .iter()
-                .map(|entry| entry.provider_name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["multi-a", "multi-b"]
-        );
-        assert!(results.iter().all(|entry| entry.status == "no_script"));
-    }
-
-    #[test]
-    fn refresh_quotas_skips_fresh_providers() {
-        let dir = tempfile::tempdir().unwrap();
-        let models_dir = dir.path().join("models");
-        let state = test_state(
-            models_dir,
-            HashMap::from([(
-                "multi".to_string(),
-                make_model("multi", &["fresh-provider", "stale-provider"]),
-            )]),
-        );
-        let db = StateDb::open(&state.db_path()).unwrap();
-        db.upsert_quota_refresh(
-            "fresh-provider",
-            &[state::QuotaWindowInput {
-                used_percent: 0.20,
-                resets_at: chrono::Utc::now() + chrono::Duration::hours(24),
-            }],
-        )
-        .unwrap();
-        drop(db);
-
-        let mut results = super::refresh_quotas_inner(&state).unwrap();
-        results.sort_by(|a, b| a.provider_name.cmp(&b.provider_name));
-
-        let fresh = results
-            .iter()
-            .find(|entry| entry.provider_name == "fresh-provider")
-            .unwrap();
-        assert_eq!(fresh.status, "fresh");
-        assert!(fresh.windows.is_empty());
-        let stale = results
-            .iter()
-            .find(|entry| entry.provider_name == "stale-provider")
-            .unwrap();
-        assert_eq!(stale.status, "no_script");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn refresh_quotas_marks_in_flight_providers() {
-        let dir = tempfile::tempdir().unwrap();
-        let models_dir = dir.path().join("models");
-        let script = dir.path().join("quota.sh");
-        write_executable(
-            &script,
-            r#"#!/usr/bin/env bash
-printf '%s\n' '{"windows":[{"used_percent":42,"resets_at":"2099-01-01T00:00:00Z"}]}'
-"#,
-        );
-        std::fs::write(
-            dir.path().join("providers.toml"),
-            format!(
-                r#"[in-flight-provider]
-quota_script = "{}"
-"#,
-                script.display()
-            ),
-        )
-        .unwrap();
-        let state = test_state(
-            models_dir,
-            HashMap::from([(
-                "multi".to_string(),
-                make_model("multi", &["in-flight-provider", "other-provider"]),
-            )]),
-        );
-        let _guard = state
-            .quota_in_flight
-            .try_claim("in-flight-provider")
-            .unwrap();
-
-        let results = super::refresh_quotas_inner(&state).unwrap();
-
-        let entry = results
-            .iter()
-            .find(|entry| entry.provider_name == "in-flight-provider")
-            .unwrap();
-        assert_eq!(entry.status, "in_flight");
-        assert!(entry.windows.is_empty());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn refresh_quotas_maps_refresh_outcome_to_dto() {
-        let dir = tempfile::tempdir().unwrap();
-        let models_dir = dir.path().join("models");
-        let script = dir.path().join("quota.sh");
-        write_executable(
-            &script,
-            r#"#!/usr/bin/env bash
-printf '%s\n' '{"windows":[{"used_percent":42,"resets_at":"2099-01-01T00:00:00Z"}]}'
-"#,
-        );
-        std::fs::write(
-            dir.path().join("providers.toml"),
-            format!(
-                r#"[updated-provider]
-quota_script = "{}"
-
-[no-script-provider]
-"#,
-                script.display()
-            ),
-        )
-        .unwrap();
-        let state = test_state(
-            models_dir,
-            HashMap::from([(
-                "multi".to_string(),
-                make_model("multi", &["updated-provider", "no-script-provider"]),
-            )]),
-        );
-
-        let results = super::refresh_quotas_inner(&state).unwrap();
-
-        let updated = results
-            .iter()
-            .find(|entry| entry.provider_name == "updated-provider")
-            .unwrap();
-        assert_eq!(updated.status, "updated");
-        assert_eq!(updated.windows.len(), 1);
-        assert!((updated.windows[0].used_percent - 0.42).abs() < 1e-6);
-        assert_eq!(updated.windows[0].resets_at, "2099-01-01T00:00:00+00:00");
-
-        let no_script = results
-            .iter()
-            .find(|entry| entry.provider_name == "no-script-provider")
-            .unwrap();
-        assert_eq!(no_script.status, "no_script");
-        assert!(no_script.windows.is_empty());
-        assert!(no_script.message.is_none());
     }
 
     #[test]

@@ -21,6 +21,11 @@
 - `src-tauri/src/commands/pools/accessor.rs`
 - `src-tauri/src/commands/pools/validator.rs`
 - `src-tauri/src/commands/pools/writer.rs`
+- `src-tauri/src/commands/quota_refresh/mod.rs`
+- `src-tauri/src/commands/quota_refresh/orchestration.rs`
+- `src-tauri/src/commands/quota_refresh/candidates.rs`
+- `src-tauri/src/commands/quota_refresh/accessor.rs`
+- `src-tauri/src/commands/quota_refresh/mapper.rs`
 - `src-tauri/src/commands/test_model/mod.rs`
 - `src-tauri/src/commands/test_model/orchestration.rs`
 - `src-tauri/src/commands/test_model/lookup.rs`
@@ -73,6 +78,11 @@
 | `config_migration_cli.rs` invoked. | Migrate config schema forward. |
 | Setup flow invoked (`setup/flow.rs`). | Drive the wizard from `oulipoly-setup`; persist results via `oulipoly-config`. |
 | Tauri owned-turn event arrives. | `main/owned_turn_event_ingest.rs` parses and persists per `oulipoly-state` schema. |
+| `commands/quota_refresh/` invoked. | Refresh stale quota data only for providers in multi-provider models, preserve sorted provider-name output, map runtime quota outcomes to the stable frontend DTO strings. |
+
+AGE-237 owns the adjacent usage-CLI/quota-refresh outcome drift. This spec
+records the current quota-refresh command behavior only; it does not normalize
+or consolidate usage CLI row-state strings with the quota-refresh DTO strings.
 
 ## Edge cases
 
@@ -81,6 +91,10 @@
   still works; GUI mode reports a clear error.
 - Adapter (e.g. `terminal_outcome_adapter.rs`) receives an envelope
   whose schema does not match — typed error; do not swallow.
+- Quota refresh sees a fresh cached provider — return `fresh` without calling
+  the runtime quota service.
+- Quota refresh sees an in-flight runtime refresh — return `in_flight`
+  byte-identically for the DTO status.
 - Resume acceptance adapter sees a session in `mutability: read-only` —
   refuses gracefully (delegates to `oulipoly-runtime/session_metadata/
   mutability.rs`).
@@ -95,6 +109,7 @@
 - `TauriBootFailed` — GUI surface could not initialize.
 - `AdapterError` — a typed `*_adapter.rs` translation failure.
 - Resume-list loading failure — return `Failed to list resume chains: {e}`.
+- Quota refresh state DB open failure — return `Failed to open state DB: {e}`.
 
 ## Boundaries
 
@@ -119,6 +134,7 @@ wiring smoke tests, adapter contract tests, workspace-layout invariants.
 - `src-tauri/tests/age38_test_model_services.rs`
 - `src-tauri/tests/age38_wiring.rs`
 - `src-tauri/tests/age39_main_thinning_source_guard.rs`
+- `src-tauri/tests/age236_quota_refresh_extraction.rs`
 - `src-tauri/tests/age151_source_guard.rs`
 - `src-tauri/tests/age154_test_model_disposition.rs`
 - `src-tauri/tests/age8_cli_characterization.rs`

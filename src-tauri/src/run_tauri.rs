@@ -63,7 +63,7 @@ pub fn run_tauri() {
             provider_settings::delete_provider_settings,
             provider_settings::validate_provider_settings,
             provider_settings::migrate_provider_settings,
-            crate::refresh_quotas,
+            commands::quota_refresh::refresh_quotas,
             commands::pools::update_pool,
             test_model_command::orchestration::test_model,
             crate::list_cli_providers,

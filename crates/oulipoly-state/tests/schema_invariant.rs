@@ -191,6 +191,26 @@ fn declaration_carriers_present_in_source() {
             &["accessor", "formatter"][..],
         ),
         (
+            "src-tauri/src/commands/quota_refresh/mod.rs",
+            &["mapper"][..],
+        ),
+        (
+            "src-tauri/src/commands/quota_refresh/orchestration.rs",
+            &["orchestration"][..],
+        ),
+        (
+            "src-tauri/src/commands/quota_refresh/candidates.rs",
+            &["filter", "mapper"][..],
+        ),
+        (
+            "src-tauri/src/commands/quota_refresh/accessor.rs",
+            &["accessor", "mapper", "predicate", "formatter"][..],
+        ),
+        (
+            "src-tauri/src/commands/quota_refresh/mapper.rs",
+            &["mapper"][..],
+        ),
+        (
             "src-tauri/src/terminal_outcome_adapter.rs",
             &[
                 "mapper",
@@ -319,6 +339,16 @@ fn declaration_carriers_present_in_source() {
                 "src-tauri/src/commands/pools/writer.rs",
             ][..],
         ),
+        (
+            "src-tauri/src/commands/quota_refresh/orchestration.rs",
+            &[
+                "## Intrinsic-surface declarations",
+                "Domain: quota-refresh lifecycle",
+                "src-tauri/src/commands/quota_refresh/candidates.rs",
+                "src-tauri/src/commands/quota_refresh/accessor.rs",
+                "src-tauri/src/commands/quota_refresh/mapper.rs",
+            ][..],
+        ),
     ] {
         assert_carrier(file_path, "## Intrinsic-surface declarations", snippets);
     }
@@ -431,6 +461,46 @@ fn declaration_carriers_present_in_source() {
             &[
                 "provider-aware pool TOML rendering contract",
                 "pool model file write contract",
+            ][..],
+        ),
+        (
+            "src-tauri/src/commands/quota_refresh/mod.rs",
+            &[
+                "QuotaRefreshEntry serialization contract",
+                "QuotaRefreshWindow serialization contract",
+                "frontend quota-refresh DTO compatibility contract",
+            ][..],
+        ),
+        (
+            "src-tauri/src/commands/quota_refresh/orchestration.rs",
+            &[
+                "Tauri IPC quota-refresh command contract",
+                "runtime quota service orchestration contract",
+            ][..],
+        ),
+        (
+            "src-tauri/src/commands/quota_refresh/candidates.rs",
+            &[
+                "multi-provider quota-refresh candidate contract",
+                "sorted provider-name output contract",
+                "deduplicated provider-name output contract",
+            ][..],
+        ),
+        (
+            "src-tauri/src/commands/quota_refresh/accessor.rs",
+            &[
+                "providers.toml parent-path contract",
+                "state.db parent-path contract",
+                "quota service request contract",
+                "quota staleness predicate contract",
+            ][..],
+        ),
+        (
+            "src-tauri/src/commands/quota_refresh/mapper.rs",
+            &[
+                "quota refresh outcome to QuotaRefreshEntry DTO contract",
+                "in-flight status string wire contract",
+                "quota window timestamp string wire contract",
             ][..],
         ),
     ] {
