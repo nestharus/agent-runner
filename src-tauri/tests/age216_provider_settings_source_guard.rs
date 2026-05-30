@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 // risk: Cross-language IPC drift; level: Tauri command registration; source: contract "Tauri IPC Contract"
 #[test]
 fn tauri_registers_exact_provider_settings_command_names() {
-    let source = production_source("src/lib.rs", &read("src/lib.rs"));
+    let source = production_source("src/run_tauri.rs", &read("src/run_tauri.rs"));
     let missing = provider_settings_commands()
         .into_iter()
         .filter(|command| !source.contains(command))
@@ -109,6 +109,7 @@ fn s5_does_not_retire_central_provider_or_model_config_parsing() {
     let model_source = read("../crates/oulipoly-config/src/model.rs");
     let providers_source = read("../crates/oulipoly-config/src/providers.rs");
     let tauri_source = read("src/lib.rs");
+    let app_paths_source = read("src/app_paths.rs");
 
     for required in [
         "pub struct ModelConfig",
@@ -136,16 +137,16 @@ fn s5_does_not_retire_central_provider_or_model_config_parsing() {
         );
     }
 
-    for required in [
-        "load_providers_for_models_dir_with",
-        "config::load_models",
-        "config::render_validated_model_toml",
-    ] {
+    for required in ["config::load_models", "config::render_validated_model_toml"] {
         assert!(
             tauri_source.contains(required),
             "S5 settings CRUD must remain additive and keep central config consumers: {required}"
         );
     }
+    assert!(
+        app_paths_source.contains("load_providers_for_models_dir_with"),
+        "S5 settings CRUD must keep central providers.toml loading in app_paths.rs"
+    );
 }
 
 // risk: Provider diagnostics loss; level: Tauri IPC DTOs; source: contract "Structured IPC DTOs must expose"

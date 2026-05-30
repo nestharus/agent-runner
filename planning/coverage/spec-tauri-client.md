@@ -3,6 +3,9 @@
 ## Source files
 
 - `src-tauri/src/lib.rs`
+- `src-tauri/src/app_state.rs`
+- `src-tauri/src/app_paths.rs`
+- `src-tauri/src/run_tauri.rs`
 - `src-tauri/src/main.rs`
 - `src-tauri/src/dispatch.rs`
 - `src-tauri/src/wiring.rs`

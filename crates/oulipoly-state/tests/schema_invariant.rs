@@ -41,16 +41,57 @@ fn source(file_path: &str) -> String {
 
 fn assert_declared_roles(file_path: &str, roles: &[&str]) {
     let source = source(file_path);
-    assert!(
-        source.contains("## Declared roles"),
-        "{file_path} must include a ## Declared roles carrier"
-    );
-    for role in roles {
+    if !matches!(
+        file_path,
+        "src-tauri/src/app_state.rs" | "src-tauri/src/app_paths.rs" | "src-tauri/src/run_tauri.rs"
+    ) {
         assert!(
-            source.contains(role),
-            "{file_path} declared roles carrier must include {role:?}"
+            source.contains("## Declared roles"),
+            "{file_path} must include a ## Declared roles carrier"
         );
+        for role in roles {
+            assert!(
+                source.contains(role),
+                "{file_path} declared roles carrier must include {role:?}"
+            );
+        }
+        return;
     }
+
+    let declared = declared_roles(&source)
+        .unwrap_or_else(|| panic!("{file_path} must include a ## Declared roles carrier"));
+    let expected = roles
+        .iter()
+        .copied()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        declared, expected,
+        "{file_path} declared roles carrier must exactly match expected roles"
+    );
+}
+
+fn declared_roles(source: &str) -> Option<Vec<String>> {
+    let after_header = source.split("## Declared roles").nth(1)?;
+    let block = after_header
+        .lines()
+        .skip_while(|line| line.trim().is_empty() || line.trim() == "//!")
+        .take_while(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty() && trimmed != "//!" && !trimmed.contains("## ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let roles = block
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .flat_map(|chunk| chunk.split(','))
+        .map(str::trim)
+        .filter(|role| !role.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    (!roles.is_empty()).then_some(roles)
 }
 
 fn assert_carrier(file_path: &str, header: &str, snippets: &[&str]) {
@@ -97,6 +138,15 @@ fn declaration_carriers_present_in_source() {
         (
             "src-tauri/src/lib.rs",
             &["orchestration", "mapper", "predicate", "formatter"][..],
+        ),
+        (
+            "src-tauri/src/app_state.rs",
+            &["orchestration", "mapper"][..],
+        ),
+        ("src-tauri/src/app_paths.rs", &["accessor", "mapper"][..]),
+        (
+            "src-tauri/src/run_tauri.rs",
+            &["orchestration", "mapper"][..],
         ),
         (
             "src-tauri/src/terminal_outcome_adapter.rs",
@@ -241,6 +291,14 @@ fn declaration_carriers_present_in_source() {
                 "provider quota mutation",
                 "TestModelResult",
             ][..],
+        ),
+        (
+            "src-tauri/src/app_paths.rs",
+            &["config-directory contract", "providers.toml parent-path"][..],
+        ),
+        (
+            "src-tauri/src/run_tauri.rs",
+            &["Tauri IPC command-registration", "RuntimePaths"][..],
         ),
     ] {
         assert_carrier(file_path, "## Adapter declarations", snippets);
