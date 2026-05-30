@@ -17,6 +17,7 @@
 
 use crate::AppState;
 use crate::app_paths;
+use crate::commands;
 use crate::provider_settings;
 use crate::test_model_command;
 use crate::wiring;
@@ -48,11 +49,11 @@ pub fn run_tauri() {
             crate::cancel_setup,
             crate::detect_clis,
             crate::get_memory_graph,
-            crate::list_models,
-            crate::get_model,
-            crate::save_model,
-            crate::delete_model,
-            crate::list_pools,
+            commands::models::list_models,
+            commands::models::get_model,
+            commands::models::save_model,
+            commands::models::delete_model,
+            commands::pools::list_pools,
             provider_settings::list_provider_settings_targets,
             provider_settings::get_provider_settings_schema,
             provider_settings::list_provider_settings,
@@ -63,7 +64,7 @@ pub fn run_tauri() {
             provider_settings::validate_provider_settings,
             provider_settings::migrate_provider_settings,
             crate::refresh_quotas,
-            crate::update_pool,
+            commands::pools::update_pool,
             test_model_command::orchestration::test_model,
             crate::list_cli_providers,
             crate::get_cli_provider,

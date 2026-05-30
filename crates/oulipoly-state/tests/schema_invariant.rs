@@ -152,6 +152,44 @@ fn declaration_carriers_present_in_source() {
             "src-tauri/src/run_tauri.rs",
             &["orchestration", "mapper"][..],
         ),
+        ("src-tauri/src/commands/models/mod.rs", &["none"][..]),
+        (
+            "src-tauri/src/commands/models/accessor.rs",
+            &["accessor"][..],
+        ),
+        (
+            "src-tauri/src/commands/models/validator.rs",
+            &["validator"][..],
+        ),
+        (
+            "src-tauri/src/commands/models/formatter.rs",
+            &["formatter"][..],
+        ),
+        (
+            "src-tauri/src/commands/models/orchestration.rs",
+            &["orchestration"][..],
+        ),
+        ("src-tauri/src/commands/pools/mod.rs", &["none"][..]),
+        (
+            "src-tauri/src/commands/pools/derive.rs",
+            &["mapper", "filter"][..],
+        ),
+        (
+            "src-tauri/src/commands/pools/update.rs",
+            &["orchestration", "mapper"][..],
+        ),
+        (
+            "src-tauri/src/commands/pools/accessor.rs",
+            &["accessor"][..],
+        ),
+        (
+            "src-tauri/src/commands/pools/validator.rs",
+            &["validator"][..],
+        ),
+        (
+            "src-tauri/src/commands/pools/writer.rs",
+            &["accessor", "formatter"][..],
+        ),
         (
             "src-tauri/src/terminal_outcome_adapter.rs",
             &[
@@ -264,6 +302,23 @@ fn declaration_carriers_present_in_source() {
                 "count_session_turns",
             ][..],
         ),
+        (
+            "src-tauri/src/commands/models/orchestration.rs",
+            &[
+                "## Intrinsic-surface declarations",
+                "Domain: model-save lifecycle",
+                "src-tauri/src/commands/models/validator.rs",
+            ][..],
+        ),
+        (
+            "src-tauri/src/commands/pools/update.rs",
+            &[
+                "## Intrinsic-surface declarations",
+                "Domain: pool-update lifecycle",
+                "src-tauri/src/commands/pools/accessor.rs",
+                "src-tauri/src/commands/pools/writer.rs",
+            ][..],
+        ),
     ] {
         assert_carrier(file_path, "## Intrinsic-surface declarations", snippets);
     }
@@ -303,6 +358,80 @@ fn declaration_carriers_present_in_source() {
         (
             "src-tauri/src/run_tauri.rs",
             &["Tauri IPC command-registration", "RuntimePaths"][..],
+        ),
+        (
+            "src-tauri/src/commands/models/mod.rs",
+            &[
+                "ModelSummary serialization contract",
+                "frontend model-list DTO",
+            ][..],
+        ),
+        (
+            "src-tauri/src/commands/models/orchestration.rs",
+            &[
+                "Tauri IPC model command contract",
+                "provider-settings refresh lifecycle contract",
+            ][..],
+        ),
+        (
+            "src-tauri/src/commands/models/accessor.rs",
+            &[
+                "AppState model-cache mutex contract",
+                "model file persistence contract",
+            ][..],
+        ),
+        (
+            "src-tauri/src/commands/models/validator.rs",
+            &[
+                "Tauri-side model prevalidation contract",
+                "provider-name emptiness contract",
+            ][..],
+        ),
+        (
+            "src-tauri/src/commands/models/formatter.rs",
+            &[
+                "provider-aware model TOML rendering contract",
+                "model command IO error-string contract",
+            ][..],
+        ),
+        (
+            "src-tauri/src/commands/pools/mod.rs",
+            &[
+                "PoolSummary serialization contract",
+                "frontend pool-list DTO",
+            ][..],
+        ),
+        (
+            "src-tauri/src/commands/pools/update.rs",
+            &["Tauri IPC pool command contract", "pool rewrite lifecycle"][..],
+        ),
+        (
+            "src-tauri/src/commands/pools/derive.rs",
+            &[
+                "ProviderConfig.name pool grouping contract",
+                "sorted/deduplicated command-set contract",
+            ][..],
+        ),
+        (
+            "src-tauri/src/commands/pools/accessor.rs",
+            &[
+                "AppState pool model-cache mutex contract",
+                "pool model cache update contract",
+            ][..],
+        ),
+        (
+            "src-tauri/src/commands/pools/validator.rs",
+            &[
+                "pool command-set validation contract",
+                "zero-provider prevention contract",
+            ][..],
+        ),
+        (
+            "src-tauri/src/commands/pools/writer.rs",
+            &[
+                "provider-aware pool TOML rendering contract",
+                "pool model file write contract",
+            ][..],
         ),
     ] {
         assert_carrier(file_path, "## Adapter declarations", snippets);
