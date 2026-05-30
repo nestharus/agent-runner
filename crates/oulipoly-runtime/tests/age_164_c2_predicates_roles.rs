@@ -34,7 +34,10 @@ const CLI_MODULES: &[&str] = &[
     "ipc",
     "launch",
     "policy",
+    "provider_lookup",
     "provider_identity",
+    "request",
+    "result",
     "resume",
     "session_capture",
     "supervision",
@@ -65,6 +68,22 @@ fn cli_root_path() -> PathBuf {
         .join("src")
         .join("executor")
         .join("cli.rs")
+}
+
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates dir")
+        .parent()
+        .expect("workspace root")
+        .to_path_buf()
+}
+
+fn coverage_spec_path() -> PathBuf {
+    workspace_root()
+        .join("planning")
+        .join("coverage")
+        .join("spec-executor.md")
 }
 
 fn cli_root_source() -> String {
@@ -183,6 +202,19 @@ fn cli_submodules_have_adapter_declaration_translates_blocks() {
                 "//!   - component: crates/oulipoly-runtime/src/executor/cli/{module}.rs"
             )),
             "{module} adapter declaration must name the module path"
+        );
+    }
+}
+
+#[test]
+fn executor_coverage_spec_lists_age226_cli_leaves() {
+    let spec = std::fs::read_to_string(coverage_spec_path()).expect("executor spec readable");
+
+    for module in ["provider_lookup", "request", "result"] {
+        let expected = format!("- `crates/oulipoly-runtime/src/executor/cli/{module}.rs`");
+        assert!(
+            spec.contains(&expected),
+            "planning/coverage/spec-executor.md must list {module}.rs for AGE-226 audit discovery"
         );
     }
 }

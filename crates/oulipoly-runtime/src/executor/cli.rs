@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! Roles: orchestration, accessor, formatter, mapper, validator.
+//! Roles: orchestration, formatter, mapper, validator.
 //!
 //! - orchestration: top-level [`execute`], [`execute_effective`],
 //!   [`execute_effective_with_start_known_provider_session_id`],
@@ -9,12 +9,8 @@
 //!   the per-component submodules listed below; predicates, parsers,
 //!   validators, formatters, mappers, accessors, and filters all live in
 //!   sibling files under `executor/cli/`.
-//! - accessor: [`provider_for_index`] retrieves the configured provider.
-//! - formatter: [`provider_index_out_of_range_message`],
-//!   [`interactive_args_missing_error`].
-//! - mapper: [`execution_result_from_raw`],
-//!   [`raw_result_from_supervised_output`],
-//!   [`interactive_result_from_status`].
+//! - formatter: [`interactive_args_missing_error`].
+//! - mapper: [`interactive_result_from_status`].
 //! - validator: [`validated_interactive_args`].
 //!
 //! ## Adapter declarations
@@ -25,7 +21,6 @@
 //!     role: adapter
 //!     Translates:
 //!       - executor-public-entrypoint-contract
-//!       - executor-result-dto-contract
 //!       - executor-cli-component-set-contract
 //!       - executor-cli-test-fixture-contract
 //!       - tempfile-unix-permissions-test-contract
@@ -41,10 +36,15 @@
 //!   stderr marker prefix, and JSONL semantics bit-for-bit.
 //! - [`launch`] (c3) — provider launch + command construction.
 //! - [`policy`] (c4) — provider policy emission for Claude/Codex.
+//! - [`provider_lookup`] — configured provider lookup and provider-index
+//!   error formatting.
 //! - [`provider_identity`] (c4) — `shell_split`, `provider_name`,
 //!   `provider_executable_name`, and the ACR-205 intrinsic-surface
 //!   declaration for the bounded `claude | codex | openai_compat`
 //!   provider set.
+//! - [`request`] — public effective execution request carrier.
+//! - [`result`] — maps supervised output and return-channel artifacts onto
+//!   executor result DTOs, plus prompt/session temp-file cleanup.
 //! - [`resume`] (c5) — resume args composition + acceptance classification.
 //!   Carries the ACR-251 canonical-doc-as-schema declaration for PP-009.
 //! - [`capture_result`] (c5) — maps capture plans and parsed provider output
@@ -62,32 +62,35 @@ mod ipc;
 mod launch;
 mod policy;
 mod provider_identity;
+mod provider_lookup;
+mod request;
+mod result;
 mod resume;
 mod session_capture;
 mod supervision;
 mod terminal_signal;
 
 pub use provider_identity::{provider_name, shell_split};
+pub use request::EffectiveExecuteRequest;
 pub use resume::{ResumePayload, compose_resume_args};
 pub use session_capture::start_known_provider_session_id;
 pub use terminal_signal::classify_terminal_reason;
 
-use capture_result::{finalize_capture, maybe_restore_plain_stdout};
 use input_flags::resolve_input_flags;
 use launch::{ProviderLaunch, ProviderLaunchRequest, assemble_provider_launch, build_command};
 use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig};
 use policy::apply_provider_policy;
+use provider_lookup::provider_for_index;
+use result::{
+    RawResult, cleanup_temp_files, execution_result_from_raw, raw_result_from_supervised_output,
+};
 use resume::{classify_resume_acceptance, compose_resume_provider_args};
-use session_capture::remove_unsanctioned_money_fields;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use supervision::{SupervisedOutput, SupervisorConfig, run_provider_supervisor};
+use supervision::{SupervisorConfig, run_provider_supervisor};
 
-use super::{
-    CapturedChildInvocation, ExecutionResult, ResumeAcceptanceResult, ReturnedArtifactRef,
-    SessionCaptureMethod, SessionCaptureResult, TerminalSignal,
-};
+use super::{ExecutionResult, SessionCaptureMethod, SessionCaptureResult, TerminalSignal};
 
 pub fn execute(
     model: &ModelConfig,
@@ -116,34 +119,6 @@ pub fn execute(
         None,
         None,
     ))
-}
-
-fn provider_for_index(
-    model: &ModelConfig,
-    provider_index: usize,
-) -> Result<&ProviderConfig, String> {
-    model
-        .providers
-        .get(provider_index)
-        .ok_or_else(|| provider_index_out_of_range_message(model, provider_index))
-}
-
-fn provider_index_out_of_range_message(model: &ModelConfig, provider_index: usize) -> String {
-    format!(
-        "Provider index {} out of range for model {}",
-        provider_index, model.name
-    )
-}
-
-pub struct EffectiveExecuteRequest<'a> {
-    pub model: &'a ModelConfig,
-    pub provider: &'a ProviderConfig,
-    pub provider_index: usize,
-    pub prompt_mode: PromptMode,
-    pub prompt: &'a str,
-    pub working_dir: Option<&'a Path>,
-    pub extra_inputs: &'a HashMap<String, Vec<String>>,
-    pub parent_invocation_env: Option<&'a str>,
 }
 
 pub fn execute_effective(request: EffectiveExecuteRequest<'_>) -> Result<ExecutionResult, String> {
@@ -200,44 +175,6 @@ fn execute_effective_with_optional_supervisor_config(
         None,
         None,
     ))
-}
-
-fn cleanup_temp_files(temp_files: Vec<PathBuf>) {
-    for path in temp_files {
-        let _ = std::fs::remove_file(path);
-    }
-}
-
-fn execution_result_from_raw(
-    result: RawResult,
-    provider_index: usize,
-    resume_acceptance: Option<ResumeAcceptanceResult>,
-    session_capture_override: Option<SessionCaptureResult>,
-) -> ExecutionResult {
-    ExecutionResult {
-        stdout: result.stdout,
-        stderr: result.stderr,
-        exit_code: result.exit_code,
-        provider_index,
-        session_capture: session_capture_override.unwrap_or(result.session_capture),
-        resume_acceptance,
-        terminal_reason: result.terminal_reason,
-        terminal_signal: result.terminal_signal,
-        captured_child_invocations: result.captured_child_invocations,
-        returned_artifacts: result.returned_artifacts,
-    }
-}
-
-struct RawResult {
-    stdout: Vec<u8>,
-    telemetry_stdout: Vec<u8>,
-    stderr: String,
-    exit_code: i32,
-    session_capture: SessionCaptureResult,
-    terminal_reason: Option<String>,
-    terminal_signal: Option<TerminalSignal>,
-    captured_child_invocations: Vec<CapturedChildInvocation>,
-    returned_artifacts: Vec<ReturnedArtifactRef>,
 }
 
 fn execute_provider(
@@ -305,29 +242,6 @@ fn execute_provider_with_arg_parts_and_supervisor_config(
     let result = raw_result_from_supervised_output(&capture_plan, output, returned_artifacts);
 
     Ok((result, temp_files))
-}
-
-fn raw_result_from_supervised_output(
-    capture_plan: &session_capture::CapturePlan,
-    output: SupervisedOutput,
-    returned_artifacts: Vec<ReturnedArtifactRef>,
-) -> RawResult {
-    let capture_outcome = finalize_capture(capture_plan, &output.stdout);
-    let stdout = maybe_restore_plain_stdout(capture_plan, &capture_outcome, &output.stdout);
-    let stdout = remove_unsanctioned_money_fields(stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    let captured_child_invocations = ipc::captured_child_invocations_from_stderr(&stderr);
-    RawResult {
-        stdout,
-        telemetry_stdout: output.stdout.clone(),
-        captured_child_invocations,
-        stderr,
-        exit_code: output.exit_code,
-        terminal_reason: output.terminal_reason,
-        terminal_signal: Some(output.terminal_signal),
-        session_capture: capture_outcome,
-        returned_artifacts,
-    }
 }
 
 pub fn execute_resume(
