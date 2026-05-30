@@ -1,3 +1,7 @@
+//! ## Declared roles
+//!
+//! `accessor`, `parser`, `filter`, `validator`
+
 use oulipoly_state::{migrations, schema};
 use std::path::{Path, PathBuf};
 
@@ -283,7 +287,7 @@ fn declaration_carriers_present_in_source() {
             ][..],
         ),
         (
-            "src-tauri/src/lib.rs",
+            "src-tauri/src/commands/test_model/mod.rs",
             &[
                 "test_model",
                 "Tauri IPC",

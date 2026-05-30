@@ -13,8 +13,20 @@ struct SourceBounds {
     body_end: usize,
 }
 
-fn lib_source() -> &'static str {
-    include_str!("../src/lib.rs")
+fn orchestration_source() -> &'static str {
+    include_str!("../src/commands/test_model/orchestration.rs")
+}
+
+fn dispatch_source() -> &'static str {
+    include_str!("../src/commands/test_model/dispatch.rs")
+}
+
+fn mapper_source() -> &'static str {
+    include_str!("../src/commands/test_model/mapper.rs")
+}
+
+fn validator_source() -> &'static str {
+    include_str!("../src/commands/test_model/validator.rs")
 }
 
 fn source_bounds(source: &str, start: &str, end: &str) -> SourceBounds {
@@ -39,22 +51,21 @@ fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
 
 fn test_model_body() -> &'static str {
     source_between(
-        lib_source(),
+        orchestration_source(),
         "async fn test_model(",
-        "struct TestModelServices",
-    )
-}
-
-fn test_model_with_db_path_body() -> &'static str {
-    source_between(
-        lib_source(),
-        "fn test_model_with_db_path(",
-        "fn diagnostic_input(",
+        "pub(crate) fn test_model_with_db_path",
     )
 }
 
 fn combined_test_model_surface() -> String {
-    format!("{}\n{}", test_model_body(), test_model_with_db_path_body())
+    format!(
+        "{}\n{}\n{}\n{}\n{}",
+        test_model_body(),
+        orchestration_source(),
+        validator_source(),
+        dispatch_source(),
+        mapper_source()
+    )
 }
 
 fn assert_contains(haystack: &str, needle: &str, context: &str) {
@@ -108,22 +119,22 @@ fn age154_test_model_keeps_accepted_service_boundary_disposition() {
     //   degraded-mode fallback that runs only when the typed terminal-signal
     //   is absent (e.g., pre-typed-signal provider in a degraded execution
     //   path).
-    let body = test_model_with_db_path_body();
+    let body = combined_test_model_surface();
     for required in [
         "select_route(RoutingServiceRequest",
         "ctx: None",
         "ExecutorServiceRequest::Effective",
         "working_dir: None",
         "parent_invocation_env: None",
-        "result.exit_code != 0",
+        "should_run_diagnostics_fallback(result.exit_code)",
         "result.terminal_signal",
         "TerminalSignalKind::QuotaExhaustedInband",
         "DiagnosticsServiceRequest::ClassifyExhaustion",
-        "if should_mark_exhausted",
+        "if validator::should_mark_quota_exhausted",
         "<StateDb as ProviderQuotaRepository>::mark_exhausted",
     ] {
         assert_contains(
-            body,
+            &body,
             required,
             "expected observable signal: accepted test_model service boundary",
         );
@@ -136,7 +147,7 @@ fn age154_test_model_keeps_accepted_service_boundary_disposition() {
         "db.mark_exhausted(",
     ] {
         assert_not_contains(
-            body,
+            &body,
             forbidden,
             "test_model_with_db_path must stay outside lifecycle mutation paths",
         );
@@ -150,7 +161,7 @@ fn age156_test_model_with_db_path_gates_legacy_classifier_behind_typed_signal_ab
     // run on the degraded-mode `None` branch of `result.terminal_signal`.
     // The persistent-quota typed kind `QuotaExhaustedInband` must be the
     // authority on the `Some(signal)` branch.
-    let body = test_model_with_db_path_body();
+    let body = combined_test_model_surface();
 
     let signal_idx = body
         .find("result.terminal_signal")

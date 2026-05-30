@@ -9,6 +9,13 @@
 - `src-tauri/src/main.rs`
 - `src-tauri/src/dispatch.rs`
 - `src-tauri/src/wiring.rs`
+- `src-tauri/src/commands/test_model/mod.rs`
+- `src-tauri/src/commands/test_model/orchestration.rs`
+- `src-tauri/src/commands/test_model/lookup.rs`
+- `src-tauri/src/commands/test_model/dispatch.rs`
+- `src-tauri/src/commands/test_model/validator.rs`
+- `src-tauri/src/commands/test_model/formatter.rs`
+- `src-tauri/src/commands/test_model/mapper.rs`
 - `src-tauri/src/balanced_cli.rs`
 - `src-tauri/src/cli_inputs.rs`
 - `src-tauri/src/config_migration_cli.rs`

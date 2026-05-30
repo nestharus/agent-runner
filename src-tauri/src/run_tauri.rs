@@ -18,6 +18,7 @@
 use crate::AppState;
 use crate::app_paths;
 use crate::provider_settings;
+use crate::test_model_command;
 use crate::wiring;
 use oulipoly_config as config;
 use std::path::{Path, PathBuf};
@@ -63,7 +64,7 @@ pub fn run_tauri() {
             provider_settings::migrate_provider_settings,
             crate::refresh_quotas,
             crate::update_pool,
-            crate::test_model,
+            test_model_command::orchestration::test_model,
             crate::list_cli_providers,
             crate::get_cli_provider,
             crate::list_accounts,

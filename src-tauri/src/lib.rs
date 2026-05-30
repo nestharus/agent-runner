@@ -1,28 +1,6 @@
 //! ## Declared roles
 //!
 //! `orchestration`, `mapper`, `predicate`, `formatter`, `accessor`, `validator`
-//!
-//! `accessor` covers state-DB open + providers-config load on the Tauri
-//! `test_model` IPC path. `validator` covers AGE-166 typed-signal
-//! discrimination (the durable `mark_exhausted` write is gated by
-//! `TerminalSignalKind::QuotaExhaustedInband`, `RateLimited` is allowed
-//! through, and `MaybeQuotaExhausted` is non-durable) plus the legacy
-//! diagnostic-input fallback validator when no typed signal is present.
-//!
-//! ## Adapter declarations
-//!
-//! ```yaml
-//! adapter_declarations:
-//!   - component: src-tauri/src/lib.rs::test_model
-//!     role: adapter
-//!     Translates:
-//!       - Tauri IPC
-//!       - Tauri test_model IPC contract
-//!       - executor service output contract
-//!       - provider quota mutation contract
-//!       - frontend TestModelResult contract
-//!       - AGE-166 typed terminal-signal kind to durable-mark predicate
-//! ```
 
 mod app_paths;
 mod app_state;
@@ -31,6 +9,8 @@ pub(crate) mod provider_settings;
 mod run_tauri;
 pub mod setup;
 pub mod terminal_outcome_adapter;
+#[path = "commands/test_model/mod.rs"]
+mod test_model_command;
 pub mod usage;
 mod wiring;
 pub mod zero_turn_orchestration;
@@ -42,47 +22,33 @@ pub use app_state::AppState;
 #[cfg(test)]
 pub(crate) use app_state::AppStateTestServices;
 pub use run_tauri::run_tauri;
+pub use test_model_command::{TestModelResult, effective_provider_for_model_provider};
+#[cfg(test)]
+pub(crate) use test_model_command::{
+    TestModelServices, test_model_for_test, test_model_with_db_path,
+};
 
 use oulipoly_config as config;
-#[cfg(test)]
-use oulipoly_config::repositories::FilesystemProvidersConfigRepository;
-use oulipoly_config::repositories::ProvidersConfigRepository;
-use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig, ProvidersConfig};
-use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind;
-use oulipoly_runtime::services::{
-    DiagnosticsServiceOutput, DiagnosticsServicePort, DiagnosticsServiceRequest,
-    ExecutorServicePort, ExecutorServiceRequest, QuotaServiceRequest, RoutingServicePort,
-    RoutingServiceRequest,
-};
+use oulipoly_config::ModelConfig;
+use oulipoly_runtime::services::QuotaServiceRequest;
 use oulipoly_runtime::{discovery, quota};
 use oulipoly_setup as setup_core;
 use oulipoly_setup::actions::{SetupEvent, UserResponse};
 #[cfg(test)]
 use oulipoly_state as state;
 use oulipoly_state::StateDb;
-#[cfg(test)]
-use oulipoly_state::repositories::ProductionStateDbOpener;
-use oulipoly_state::repositories::{ProviderQuotaRepository, SetupRepository, StateDbOpener};
+use oulipoly_state::repositories::SetupRepository;
 use oulipoly_state::{AccountRecord, AuthMethod, AuthStatus, CliProviderRecord};
 use oulipoly_state::{DiscoveredModel, ModelParameter};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 #[cfg(test)]
 use std::path::Path;
-use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
 use tauri::ipc::Channel;
 use tokio::sync::mpsc;
-
-#[derive(Serialize, Clone)]
-pub struct TestModelResult {
-    pub success: bool,
-    pub stdout: String,
-    pub stderr: String,
-    pub exit_code: i32,
-}
 
 #[derive(Serialize)]
 pub struct ModelSummary {
@@ -552,194 +518,6 @@ fn update_pool_inner(
     Ok(())
 }
 
-#[tauri::command]
-async fn test_model(
-    state: tauri::State<'_, AppState>,
-    name: String,
-) -> Result<TestModelResult, String> {
-    let model = {
-        let models = state.models.lock().map_err(|e| e.to_string())?;
-        models
-            .get(&name)
-            .cloned()
-            .ok_or_else(|| format!("Model '{}' not found", name))?
-    };
-
-    let models_dir = state.models_dir.clone();
-    let db_path = models_dir.parent().unwrap_or(&models_dir).join("state.db");
-    let state_db_opener = Arc::clone(&state.state_db_opener);
-    let providers_config = Arc::clone(&state.providers_config);
-    let routing_service = Arc::clone(&state.routing_service);
-    let executor_service = Arc::clone(&state.executor_service);
-    let diagnostics_service = Arc::clone(&state.diagnostics_service);
-
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        let services = TestModelServices {
-            state_db_opener: &*state_db_opener,
-            providers_repository: &*providers_config,
-            routing_service: &*routing_service,
-            executor_service: &*executor_service,
-            diagnostics_service: &*diagnostics_service,
-        };
-        test_model_with_db_path(
-            services,
-            model,
-            models_dir,
-            db_path,
-            "Say hello in one sentence.",
-        )
-    })
-    .await
-    .map_err(|e| e.to_string())??;
-
-    Ok(result)
-}
-
-struct TestModelServices<'a> {
-    state_db_opener: &'a (dyn StateDbOpener + Send + Sync),
-    providers_repository: &'a (dyn ProvidersConfigRepository + Send + Sync),
-    routing_service: &'a dyn RoutingServicePort,
-    executor_service: &'a dyn ExecutorServicePort,
-    diagnostics_service: &'a dyn DiagnosticsServicePort,
-}
-
-fn test_model_with_db_path(
-    services: TestModelServices<'_>,
-    model: ModelConfig,
-    models_dir: PathBuf,
-    db_path: PathBuf,
-    prompt: &str,
-) -> Result<TestModelResult, String> {
-    let db = services
-        .state_db_opener
-        .open_at(&db_path)
-        .map_err(|e| e.to_string())?;
-    let provider_index = services
-        .routing_service
-        .select_route(RoutingServiceRequest {
-            model: &model,
-            state: &db,
-            ctx: None,
-        })
-        .map_err(|error| error.to_string())?
-        .provider_index;
-    let providers_path = models_dir
-        .parent()
-        .unwrap_or(&models_dir)
-        .join("providers.toml");
-    let providers_cfg = services
-        .providers_repository
-        .load_providers(&providers_path)
-        .unwrap_or_default();
-    let (provider, prompt_mode) =
-        effective_provider_for_model_provider(&model, provider_index, &providers_cfg)?;
-    let result = services
-        .executor_service
-        .execute(ExecutorServiceRequest::Effective {
-            model,
-            provider: provider.clone(),
-            provider_index,
-            prompt_mode,
-            prompt: prompt.to_string(),
-            working_dir: None,
-            extra_inputs: HashMap::new(),
-            parent_invocation_env: None,
-        })
-        .map_err(|error| error.to_string())?
-        .result;
-    // AGE-156: typed-signal precedence consolidation. QuotaExhaustedInband is
-    // authoritative for durable exhausted_at writes; absent a typed signal, fall
-    // back to the LLM diagnostics classifier.
-    if result.exit_code != 0 {
-        let should_mark_exhausted = if let Some(signal) = result.terminal_signal.as_ref() {
-            matches!(signal.kind, TerminalSignalKind::QuotaExhaustedInband)
-        } else {
-            let input = diagnostic_input(&result.stderr, &result.stdout);
-            let DiagnosticsServiceOutput::ExhaustionClassification { is_exhausted } = services
-                .diagnostics_service
-                .diagnose(DiagnosticsServiceRequest::ClassifyExhaustion { stderr: input })
-                .map_err(|error| error.to_string())?
-            else {
-                return Err("Diagnostics service returned unexpected output".to_string());
-            };
-            is_exhausted
-        };
-        if should_mark_exhausted {
-            <StateDb as ProviderQuotaRepository>::mark_exhausted(&db, &provider.name)?;
-        }
-    }
-    Ok(map_test_model_result(&result))
-}
-
-fn map_test_model_result(result: &oulipoly_runtime::executor::ExecutionResult) -> TestModelResult {
-    TestModelResult {
-        success: result.exit_code == 0,
-        stdout: String::from_utf8_lossy(&result.stdout).into_owned(),
-        stderr: result.stderr.clone(),
-        exit_code: result.exit_code,
-    }
-}
-
-fn diagnostic_input(stderr: &str, stdout: &[u8]) -> String {
-    let stdout = String::from_utf8_lossy(stdout);
-    let stdout = stdout.trim();
-    let stderr = stderr.trim();
-    match (stderr.is_empty(), stdout.is_empty()) {
-        (true, true) => String::new(),
-        (false, true) => stderr.to_string(),
-        (true, false) => stdout.to_string(),
-        (false, false) => format!("{stderr}\n{stdout}"),
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn test_model_for_test(
-    models: HashMap<String, ModelConfig>,
-    models_dir: PathBuf,
-    name: &str,
-) -> Result<TestModelResult, String> {
-    let model = models
-        .get(name)
-        .cloned()
-        .ok_or_else(|| format!("Model '{}' not found", name))?;
-    let db_path = models_dir.parent().unwrap_or(&models_dir).join("state.db");
-    let state_db_opener = ProductionStateDbOpener;
-    let providers_config = FilesystemProvidersConfigRepository;
-    let routing_service = oulipoly_runtime::services::ProductionRoutingService;
-    let executor_service = oulipoly_runtime::executor::RuntimeExecutorService;
-    let diagnostics_service = oulipoly_runtime::diagnostics::RuntimeDiagnosticsService;
-    let services = TestModelServices {
-        state_db_opener: &state_db_opener,
-        providers_repository: &providers_config,
-        routing_service: &routing_service,
-        executor_service: &executor_service,
-        diagnostics_service: &diagnostics_service,
-    };
-    test_model_with_db_path(
-        services,
-        model,
-        models_dir,
-        db_path,
-        "Say hello in one sentence.",
-    )
-}
-
-pub fn effective_provider_for_model_provider(
-    model: &ModelConfig,
-    provider_index: usize,
-    providers_cfg: &ProvidersConfig,
-) -> Result<(ProviderConfig, PromptMode), String> {
-    let provider = model
-        .providers
-        .get(provider_index)
-        .ok_or_else(|| "provider_index out of range".to_string())?;
-    match providers_cfg.effective_provider(provider) {
-        Ok(effective) => Ok(effective),
-        Err(_) if !provider.command.trim().is_empty() => Ok((provider.clone(), model.prompt_mode)),
-        Err(err) => Err(err),
-    }
-}
-
 // --- Provider & Account commands ---
 
 /// Helper to open the state DB from AppState.
@@ -1003,11 +781,13 @@ mod tests {
     use oulipoly_runtime::services::{
         DiagnosticsServiceOutput, DiagnosticsServicePort, DiagnosticsServiceRequest,
         ExecutorServiceOutput, ExecutorServicePort, ExecutorServiceRequest, QuotaServiceOutput,
-        QuotaServicePort, QuotaServiceRequest, RoutingServiceOutput, ServiceError,
+        QuotaServicePort, QuotaServiceRequest, RoutingServiceOutput, RoutingServicePort,
+        RoutingServiceRequest, ServiceError,
     };
     use oulipoly_state::repositories::{SetupRepository, StateDbOpener};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
 
     #[cfg(unix)]
     fn write_executable(path: &std::path::Path, body: &str) {

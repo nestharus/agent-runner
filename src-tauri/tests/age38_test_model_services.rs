@@ -1,3 +1,7 @@
+//! ## Declared roles
+//!
+//! `parser`, `accessor`, `formatter`, `validator`
+
 use std::fs;
 use std::path::Path;
 
@@ -25,23 +29,39 @@ fn source_block_after(source: &str, needle: &str) -> String {
     panic!("missing closing brace for {needle}");
 }
 
-fn lib_source() -> String {
-    let source_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
+fn source_file(relative_path: &str) -> String {
+    let source_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative_path);
     fs::read_to_string(&source_path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", source_path.display()))
 }
 
+fn test_model_surface() -> String {
+    [
+        "src/commands/test_model/orchestration.rs",
+        "src/commands/test_model/lookup.rs",
+        "src/commands/test_model/dispatch.rs",
+        "src/commands/test_model/validator.rs",
+        "src/commands/test_model/formatter.rs",
+        "src/commands/test_model/mapper.rs",
+    ]
+    .into_iter()
+    .map(source_file)
+    .collect::<Vec<_>>()
+    .join("\n")
+}
+
 #[test]
 fn age38_test_model_with_db_path_routes_executor_effective_request_through_service() {
-    let source = lib_source();
-    let body = source_block_after(&source, "fn test_model_with_db_path(");
+    let source = test_model_surface();
+    let body = source_block_after(&source, "fn build_effective_executor_request(");
+    let dispatch = source_block_after(&source, "fn execute_effective_request(");
 
     assert!(
         body.contains("ExecutorServiceRequest::Effective"),
         "test_model_with_db_path must build an ExecutorServiceRequest::Effective"
     );
     assert!(
-        body.contains(".execute("),
+        dispatch.contains(".execute("),
         "test_model_with_db_path must invoke ExecutorServicePort::execute"
     );
     assert!(
@@ -64,19 +84,20 @@ fn age38_test_model_with_db_path_routes_executor_effective_request_through_servi
 
 #[test]
 fn age38_test_model_with_db_path_routes_diagnostics_only_for_nonzero_exit() {
-    let source = lib_source();
-    let body = source_block_after(&source, "fn test_model_with_db_path(");
+    let source = test_model_surface();
+    let body = source_block_after(&source, "fn apply_exhaustion_disposition(");
+    let dispatch = source_block_after(&source, "fn diagnostics_output_for_result(");
 
     assert!(
-        body.contains("DiagnosticsServiceRequest::ClassifyExhaustion"),
+        dispatch.contains("DiagnosticsServiceRequest::ClassifyExhaustion"),
         "nonzero exits must classify exhaustion through DiagnosticsServiceRequest"
     );
     assert!(
-        body.contains(".diagnose("),
+        dispatch.contains(".diagnose("),
         "nonzero exits must call DiagnosticsServicePort::diagnose"
     );
     assert!(
-        body.contains("result.exit_code != 0"),
+        body.contains("should_run_diagnostics_fallback(result.exit_code)"),
         "diagnostics must remain gated to nonzero executor exits"
     );
     assert!(
@@ -87,15 +108,19 @@ fn age38_test_model_with_db_path_routes_diagnostics_only_for_nonzero_exit() {
 
 #[test]
 fn age38_test_model_with_db_path_marks_exhausted_through_quota_repository_only_when_classified() {
-    let source = lib_source();
-    let body = source_block_after(&source, "fn test_model_with_db_path(");
+    let source = test_model_surface();
+    let body = source_block_after(&source, "fn apply_exhaustion_disposition(");
+    let dispatch = source_block_after(&source, "fn mark_effective_provider_exhausted(");
 
     assert!(
-        body.contains("ProviderQuotaRepository")
-            || body.contains("<StateDb as")
-                && body.contains("mark_exhausted(&")
-                && body.contains("provider.name"),
+        dispatch.contains("ProviderQuotaRepository")
+            && dispatch.contains("mark_exhausted(db, provider_name)"),
         "exhaustion marking must route through ProviderQuotaRepository::mark_exhausted"
+    );
+    assert!(
+        body.contains("mark_effective_provider_exhausted(db, provider_name)")
+            && body.contains("should_mark_quota_exhausted(should_mark_exhausted)"),
+        "mark_exhausted must receive the effective provider name after exhaustion classification"
     );
     assert!(
         body.contains("is_exhausted") || body.contains("exhausted"),
@@ -109,20 +134,23 @@ fn age38_test_model_with_db_path_marks_exhausted_through_quota_repository_only_w
 
 #[test]
 fn age38_test_model_with_db_path_uses_injected_openers_loaders_and_keeps_no_lifecycle() {
-    let source = lib_source();
+    let source = test_model_surface();
     let body = source_block_after(&source, "fn test_model_with_db_path(");
+    let lookup = source_block_after(&source, "fn open_test_model_state_db(");
+    let providers = source_block_after(&source, "fn load_providers_config_or_default(");
+    let route = source_block_after(&source, "fn select_test_model_route(");
 
     assert!(
-        body.contains(".open_at(&db_path)") || body.contains(".open_at(db_path"),
+        lookup.contains(".open_at(db_path"),
         "test_model_with_db_path must open state through StateDbOpener::open_at"
     );
     assert!(
-        body.contains(".load_providers(&providers_path)")
-            || body.contains(".load_providers(providers_path"),
+        providers.contains(".load_providers(&providers_path)")
+            || providers.contains(".load_providers(providers_path"),
         "test_model_with_db_path must load providers through ProvidersConfigRepository"
     );
     assert!(
-        body.contains("ctx: None"),
+        route.contains("ctx: None"),
         "test_model_with_db_path must keep cached-only routing"
     );
     for forbidden in [

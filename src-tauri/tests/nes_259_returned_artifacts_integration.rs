@@ -1,4 +1,7 @@
 #![cfg(unix)]
+//! ## Declared roles
+//!
+//! `accessor`, `formatter`, `parser`, `mapper`, `validator`, `orchestration`
 
 use chrono::{TimeZone, Utc};
 use oulipoly_agent_messenger::{ReturnedArtifactRef, ReturnedArtifactSource, StoreAddress};
@@ -658,7 +661,8 @@ fn trace_json_includes_returned_artifacts_and_legacy_missing_defaults_to_empty()
 // selected level: runtime_integration
 #[test]
 fn test_model_ipc_result_source_shape_has_no_returned_artifacts_field() {
-    let source_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
+    let source_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/test_model/mapper.rs");
     let source = fs::read_to_string(&source_path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", source_path.display()));
     let struct_start = source
