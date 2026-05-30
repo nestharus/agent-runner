@@ -58,9 +58,9 @@ fn balancer_mod_has_no_terminal_signal_or_provider_output_parser_references() {
 // risk: Inline AGE-153 guard could false-green after B3 modules are created; level: component/structural; source: AGE-224 contract Guard And Spec Contract / proposal A4.
 #[test]
 fn inline_age153_guard_source_list_declares_age224_b3_modules() {
-    let guard_body = balancer_source_list_body(
+    let guard_body = inline_balancer_source_list_body(
         include_str!("../src/balancer/mod.rs"),
-        "fn balancer_production_sources() ->",
+        "fn balancer_production_sources() -> [",
         "fn production_balancer_source(",
     );
     assert_b3_balancer_modules_are_declared("inline AGE-153 guard", guard_body);
@@ -77,7 +77,29 @@ fn external_age153_guard_source_list_declares_age224_b3_modules() {
     assert_b3_balancer_modules_are_declared("external AGE-153 guard", guard_body);
 }
 
-fn balancer_production_sources() -> [(&'static str, &'static str); 10] {
+// risk: Inline AGE-153 guard could false-green after B4 modules are extracted; level: component/structural; source: AGE-225 contract Guard And Spec Contract.
+#[test]
+fn inline_age153_guard_source_list_declares_age225_b4_modules() {
+    let guard_body = inline_balancer_source_list_body(
+        include_str!("../src/balancer/mod.rs"),
+        "fn balancer_production_sources() -> [",
+        "fn production_balancer_source(",
+    );
+    assert_age225_b4_balancer_modules_are_declared("inline AGE-153 guard", guard_body);
+}
+
+// risk: External AGE-153 guard could false-green after B4 modules are extracted; level: component/structural; source: AGE-225 contract Guard And Spec Contract.
+#[test]
+fn external_age153_guard_source_list_declares_age225_b4_modules() {
+    let guard_body = balancer_source_list_body(
+        include_str!("age153_balancer_signal_isolation.rs"),
+        "fn balancer_production_sources() ->",
+        "fn production_balancer_source(",
+    );
+    assert_age225_b4_balancer_modules_are_declared("external AGE-153 guard", guard_body);
+}
+
+fn balancer_production_sources() -> [(&'static str, &'static str); 12] {
     [
         (
             "crates/oulipoly-runtime/src/balancer/mod.rs",
@@ -149,6 +171,20 @@ fn balancer_production_sources() -> [(&'static str, &'static str); 10] {
                 include_str!("../src/balancer/topology.rs"),
             ),
         ),
+        (
+            "crates/oulipoly-runtime/src/balancer/migration.rs",
+            production_balancer_source(
+                "crates/oulipoly-runtime/src/balancer/migration.rs",
+                include_str!("../src/balancer/migration.rs"),
+            ),
+        ),
+        (
+            "crates/oulipoly-runtime/src/balancer/working_set.rs",
+            production_balancer_source(
+                "crates/oulipoly-runtime/src/balancer/working_set.rs",
+                include_str!("../src/balancer/working_set.rs"),
+            ),
+        ),
     ]
 }
 
@@ -171,19 +207,64 @@ fn assert_b3_balancer_modules_are_declared(guard_name: &str, guard_body: &str) {
     }
 }
 
-fn balancer_source_list_body<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+fn assert_age225_b4_balancer_modules_are_declared(guard_name: &str, guard_body: &str) {
+    for module in ["migration.rs", "working_set.rs"] {
+        assert!(
+            guard_body.contains(&format!("src/balancer/{module}")),
+            "{guard_name} must name crates/oulipoly-runtime/src/balancer/{module}"
+        );
+        assert!(
+            guard_body.contains(&format!("include_str!(\"../src/balancer/{module}\")"))
+                || guard_body.contains(&format!("include_str!(\"{module}\")")),
+            "{guard_name} must compile-time include balancer/{module}"
+        );
+    }
+}
+
+fn balancer_source_list_body<'a>(source: &'a str, start: &str, _end: &str) -> &'a str {
     let start_index = source
         .rfind(start)
         .unwrap_or_else(|| panic!("missing source-list start marker {start}"));
     let after_start = &source[start_index..];
-    let end_index = after_start
-        .find(end)
-        .unwrap_or_else(|| panic!("missing source-list end marker {end}"));
-    &after_start[..end_index]
+    rust_function_source(after_start)
+}
+
+fn inline_balancer_source_list_body<'a>(source: &'a str, start: &str, _end: &str) -> &'a str {
+    let start_index = source
+        .find(start)
+        .unwrap_or_else(|| panic!("missing source-list start marker {start}"));
+    let after_start = &source[start_index..];
+    rust_function_source(after_start)
+}
+
+fn rust_function_source(source: &str) -> &str {
+    let body_start = source
+        .find('{')
+        .unwrap_or_else(|| panic!("missing function body"));
+    let mut depth = 0usize;
+    for (offset, ch) in source[body_start..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &source[..body_start + offset + ch.len_utf8()];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unterminated function body")
 }
 
 fn production_balancer_source(module_path: &str, source: &'static str) -> &'static str {
-    if module_path.ends_with("/mod.rs") {
+    if [
+        "crates/oulipoly-runtime/src/balancer/mod.rs",
+        "crates/oulipoly-runtime/src/balancer/migration.rs",
+        "crates/oulipoly-runtime/src/balancer/working_set.rs",
+    ]
+    .contains(&module_path)
+    {
         return source
             .split("mod tests")
             .next()
