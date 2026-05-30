@@ -1,5 +1,13 @@
 # Project Decisions
 
+## D-AGE-225-cold-start-estimate — proceed without baseline estimate
+
+- **Source**: Phase 2.5 inherited-estimate cold-start gate on AGE-225. Linear ticket read returned `story_point_estimate: null` and `estimate_source: missing`.
+- **Decision**: Proceed without a baseline estimate. Phase 3 will produce the refined estimate from the approved problem map and HIGH risk profile.
+- **Rationale**: Manager answered the Phase 2.5 gate with "Proceed exhaustive" and explicitly accepted the missing estimate. AGE-225 is an output-preserving final balancer decomposition slice with concrete B4 scope and focused characterization tests already added for the uncovered migration/working-set behaviors.
+- **Evidence**: `/home/nes/projects/agent-runner/planning/age-225-balancer-b4/scratch/questions/q-age-225-phase-2-5-manager-gate.question.json`; `/home/nes/projects/agent-runner/planning/age-225-balancer-b4/risk/age-225-risk-profile.md`; `/home/nes/projects/agent-runner/planning/age-225-balancer-b4/scratch/phase25/age-225-characterization-tests.md`.
+- **Revisit when**: never for this WU; refined estimate is captured in Phase 3 and actual estimate in closure.
+
 ## D-AGE-224-cold-start-estimate — proceed without baseline estimate
 
 - **Source**: Phase 2.5 inherited-estimate cold-start gate on AGE-224. Linear ticket read returned `story_point_estimate: null` and `estimate_source: missing`.

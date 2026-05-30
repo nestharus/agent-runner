@@ -12,6 +12,8 @@
 - `crates/oulipoly-runtime/src/balancer/burn_rate.rs`
 - `crates/oulipoly-runtime/src/balancer/density.rs`
 - `crates/oulipoly-runtime/src/balancer/invocation_fallback.rs`
+- `crates/oulipoly-runtime/src/balancer/migration.rs`
+- `crates/oulipoly-runtime/src/balancer/working_set.rs`
 
 ## Preconditions
 

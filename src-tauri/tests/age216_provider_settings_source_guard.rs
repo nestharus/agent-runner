@@ -190,6 +190,8 @@ fn production_runtime_paths_do_not_route_through_provider_settings_dispatch() {
         "../crates/oulipoly-runtime/src/balancer/snapshot.rs",
         "../crates/oulipoly-runtime/src/balancer/refresh_inputs.rs",
         "../crates/oulipoly-runtime/src/balancer/topology.rs",
+        "../crates/oulipoly-runtime/src/balancer/migration.rs",
+        "../crates/oulipoly-runtime/src/balancer/working_set.rs",
         "../crates/oulipoly-runtime/src/executor/mod.rs",
         "../crates/oulipoly-runtime/src/executor/cli.rs",
         "../crates/oulipoly-runtime/src/quota/in_flight.rs",
@@ -246,6 +248,22 @@ fn provider_settings_guard_source_list_declares_age224_b3_modules() {
         "density.rs",
         "invocation_fallback.rs",
     ] {
+        let path = format!("../crates/oulipoly-runtime/src/balancer/{module}");
+        assert!(
+            guard_body.contains(&path),
+            "AGE-216 provider-settings guard must include {path}"
+        );
+    }
+}
+
+// risk: AGE-216 provider-settings guard could omit B4 balancer modules after extraction; level: source guard; source: AGE-225 contract Guard And Spec Contract.
+#[test]
+fn provider_settings_guard_source_list_declares_age225_b4_modules() {
+    let guard_body = function_body(
+        include_str!("age216_provider_settings_source_guard.rs"),
+        "fn production_runtime_paths_do_not_route_through_provider_settings_dispatch()",
+    );
+    for module in ["migration.rs", "working_set.rs"] {
         let path = format!("../crates/oulipoly-runtime/src/balancer/{module}");
         assert!(
             guard_body.contains(&path),
