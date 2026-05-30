@@ -4,9 +4,12 @@
 
 - `crates/oulipoly-runtime/src/executor/mod.rs`
 - `crates/oulipoly-runtime/src/executor/cli.rs`
+- `crates/oulipoly-runtime/src/executor/cli/headless.rs`
+- `crates/oulipoly-runtime/src/executor/cli/provider_execution.rs`
 - `crates/oulipoly-runtime/src/executor/cli/provider_lookup.rs`
 - `crates/oulipoly-runtime/src/executor/cli/request.rs`
 - `crates/oulipoly-runtime/src/executor/cli/result.rs`
+- `crates/oulipoly-runtime/src/executor/cli/resume_execution.rs`
 - `crates/oulipoly-runtime/src/executor/providers/claude.rs`
 - `crates/oulipoly-runtime/src/executor/providers/codex.rs`
 - `crates/oulipoly-runtime/src/executor/providers/mod.rs`
