@@ -178,6 +178,22 @@ const CLI_SOURCES: &[CliSource] = &[
         path: "src/executor/cli/policy.rs",
     },
     CliSource {
+        label: "policy/messages.rs",
+        path: "src/executor/cli/policy/messages.rs",
+    },
+    CliSource {
+        label: "policy/orchestration.rs",
+        path: "src/executor/cli/policy/orchestration.rs",
+    },
+    CliSource {
+        label: "policy/predicates.rs",
+        path: "src/executor/cli/policy/predicates.rs",
+    },
+    CliSource {
+        label: "policy/validation.rs",
+        path: "src/executor/cli/policy/validation.rs",
+    },
+    CliSource {
         label: "provider_execution.rs",
         path: "src/executor/cli/provider_execution.rs",
     },
@@ -202,12 +218,64 @@ const CLI_SOURCES: &[CliSource] = &[
         path: "src/executor/cli/resume.rs",
     },
     CliSource {
+        label: "resume/acceptance.rs",
+        path: "src/executor/cli/resume/acceptance.rs",
+    },
+    CliSource {
+        label: "resume/args.rs",
+        path: "src/executor/cli/resume/args.rs",
+    },
+    CliSource {
+        label: "resume/messages.rs",
+        path: "src/executor/cli/resume/messages.rs",
+    },
+    CliSource {
+        label: "resume/output.rs",
+        path: "src/executor/cli/resume/output.rs",
+    },
+    CliSource {
+        label: "resume/patterns.rs",
+        path: "src/executor/cli/resume/patterns.rs",
+    },
+    CliSource {
         label: "resume_execution.rs",
         path: "src/executor/cli/resume_execution.rs",
     },
     CliSource {
         label: "session_capture.rs",
         path: "src/executor/cli/session_capture.rs",
+    },
+    CliSource {
+        label: "session_capture/args.rs",
+        path: "src/executor/cli/session_capture/args.rs",
+    },
+    CliSource {
+        label: "session_capture/json_path.rs",
+        path: "src/executor/cli/session_capture/json_path.rs",
+    },
+    CliSource {
+        label: "session_capture/messages.rs",
+        path: "src/executor/cli/session_capture/messages.rs",
+    },
+    CliSource {
+        label: "session_capture/parse_forced_flag.rs",
+        path: "src/executor/cli/session_capture/parse_forced_flag.rs",
+    },
+    CliSource {
+        label: "session_capture/parse_stdout_event.rs",
+        path: "src/executor/cli/session_capture/parse_stdout_event.rs",
+    },
+    CliSource {
+        label: "session_capture/paths.rs",
+        path: "src/executor/cli/session_capture/paths.rs",
+    },
+    CliSource {
+        label: "session_capture/plan.rs",
+        path: "src/executor/cli/session_capture/plan.rs",
+    },
+    CliSource {
+        label: "session_capture/start_known.rs",
+        path: "src/executor/cli/session_capture/start_known.rs",
     },
     CliSource {
         label: "supervision/mod.rs",
@@ -272,6 +340,34 @@ const CLI_SOURCES: &[CliSource] = &[
     CliSource {
         label: "terminal_signal.rs",
         path: "src/executor/cli/terminal_signal.rs",
+    },
+    CliSource {
+        label: "provider_specific/mod.rs",
+        path: "src/executor/provider_specific/mod.rs",
+    },
+    CliSource {
+        label: "provider_specific/policy/mod.rs",
+        path: "src/executor/provider_specific/policy/mod.rs",
+    },
+    CliSource {
+        label: "provider_specific/policy/claude.rs",
+        path: "src/executor/provider_specific/policy/claude.rs",
+    },
+    CliSource {
+        label: "provider_specific/policy/codex.rs",
+        path: "src/executor/provider_specific/policy/codex.rs",
+    },
+    CliSource {
+        label: "provider_specific/resume_acceptance.rs",
+        path: "src/executor/provider_specific/resume_acceptance.rs",
+    },
+    CliSource {
+        label: "provider_specific/session_capture/mod.rs",
+        path: "src/executor/provider_specific/session_capture/mod.rs",
+    },
+    CliSource {
+        label: "provider_specific/session_capture/telemetry_scrub.rs",
+        path: "src/executor/provider_specific/session_capture/telemetry_scrub.rs",
     },
 ];
 
@@ -454,6 +550,105 @@ const E4_SPLIT_SOURCES: &[CliSource] = &[
     },
 ];
 
+const E5_SPLIT_SOURCES: &[CliSource] = &[
+    CliSource {
+        label: "policy/messages.rs",
+        path: "src/executor/cli/policy/messages.rs",
+    },
+    CliSource {
+        label: "policy/orchestration.rs",
+        path: "src/executor/cli/policy/orchestration.rs",
+    },
+    CliSource {
+        label: "policy/predicates.rs",
+        path: "src/executor/cli/policy/predicates.rs",
+    },
+    CliSource {
+        label: "policy/validation.rs",
+        path: "src/executor/cli/policy/validation.rs",
+    },
+    CliSource {
+        label: "resume/acceptance.rs",
+        path: "src/executor/cli/resume/acceptance.rs",
+    },
+    CliSource {
+        label: "resume/args.rs",
+        path: "src/executor/cli/resume/args.rs",
+    },
+    CliSource {
+        label: "resume/messages.rs",
+        path: "src/executor/cli/resume/messages.rs",
+    },
+    CliSource {
+        label: "resume/output.rs",
+        path: "src/executor/cli/resume/output.rs",
+    },
+    CliSource {
+        label: "resume/patterns.rs",
+        path: "src/executor/cli/resume/patterns.rs",
+    },
+    CliSource {
+        label: "session_capture/args.rs",
+        path: "src/executor/cli/session_capture/args.rs",
+    },
+    CliSource {
+        label: "session_capture/json_path.rs",
+        path: "src/executor/cli/session_capture/json_path.rs",
+    },
+    CliSource {
+        label: "session_capture/messages.rs",
+        path: "src/executor/cli/session_capture/messages.rs",
+    },
+    CliSource {
+        label: "session_capture/parse_forced_flag.rs",
+        path: "src/executor/cli/session_capture/parse_forced_flag.rs",
+    },
+    CliSource {
+        label: "session_capture/parse_stdout_event.rs",
+        path: "src/executor/cli/session_capture/parse_stdout_event.rs",
+    },
+    CliSource {
+        label: "session_capture/paths.rs",
+        path: "src/executor/cli/session_capture/paths.rs",
+    },
+    CliSource {
+        label: "session_capture/plan.rs",
+        path: "src/executor/cli/session_capture/plan.rs",
+    },
+    CliSource {
+        label: "session_capture/start_known.rs",
+        path: "src/executor/cli/session_capture/start_known.rs",
+    },
+    CliSource {
+        label: "provider_specific/mod.rs",
+        path: "src/executor/provider_specific/mod.rs",
+    },
+    CliSource {
+        label: "provider_specific/policy/mod.rs",
+        path: "src/executor/provider_specific/policy/mod.rs",
+    },
+    CliSource {
+        label: "provider_specific/policy/claude.rs",
+        path: "src/executor/provider_specific/policy/claude.rs",
+    },
+    CliSource {
+        label: "provider_specific/policy/codex.rs",
+        path: "src/executor/provider_specific/policy/codex.rs",
+    },
+    CliSource {
+        label: "provider_specific/resume_acceptance.rs",
+        path: "src/executor/provider_specific/resume_acceptance.rs",
+    },
+    CliSource {
+        label: "provider_specific/session_capture/mod.rs",
+        path: "src/executor/provider_specific/session_capture/mod.rs",
+    },
+    CliSource {
+        label: "provider_specific/session_capture/telemetry_scrub.rs",
+        path: "src/executor/provider_specific/session_capture/telemetry_scrub.rs",
+    },
+];
+
 const ROLE_VOCABULARY: &[&str] = &[
     "orchestration",
     "mapper",
@@ -531,6 +726,10 @@ fn assert_declared_role_header_before_imports(label: &str, source: &str) {
 }
 
 fn assert_declared_roles_use_known_vocabulary(label: &str, source: &str) {
+    if source_declares_no_roles(source) {
+        assert_functionless_inventory(label, source);
+        return;
+    }
     let roles = role_tokens(declared_roles_line(source));
     assert!(
         !roles.is_empty(),
@@ -542,6 +741,26 @@ fn assert_declared_roles_use_known_vocabulary(label: &str, source: &str) {
             "{label} declares unknown role {role}"
         );
     }
+}
+
+fn source_declares_no_roles(source: &str) -> bool {
+    let roles = role_tokens(declared_roles_line(source));
+    roles.len() == 1 && roles[0] == "none"
+}
+
+fn assert_functionless_inventory(label: &str, source: &str) {
+    let has_function_definition = source.lines().any(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with("fn ") || trimmed.starts_with("pub") && trimmed.contains(" fn ")
+    });
+    assert!(
+        source.contains("Functionless module inventory; no A1 function-role claim."),
+        "{label} functionless inventory must say it has no A1 function-role claim"
+    );
+    assert!(
+        !has_function_definition,
+        "{label} declares Roles: none but contains a function definition"
+    );
 }
 
 fn assert_source_path_inventory_includes(path: &str) {
@@ -604,38 +823,46 @@ fn adapter_component_lines(source: &str) -> Vec<&str> {
 #[test]
 fn cli_submodules_have_adapter_declaration_translates_blocks() {
     for source_path in CLI_SOURCES {
-        let source = cli_source(*source_path);
-        assert!(
-            source.contains("//! ## Adapter declarations"),
-            "{} missing adapter declarations header",
-            source_path.label
-        );
-        assert!(
-            source.contains("//!     Translates:"),
-            "{} missing Translates block",
-            source_path.label
-        );
-        assert!(
-            !translates_entries(&source).is_empty(),
-            "{} Translates block must name at least one contract",
-            source_path.label
-        );
-        let expected_component = format!("//!   - component: {}", source_path.component_path());
-        let component_lines = adapter_component_lines(&source);
-        assert!(
-            !component_lines.is_empty(),
-            "{} missing adapter component declaration",
-            source_path.label
-        );
-        assert!(
-            component_lines
-                .iter()
-                .all(|component| *component == expected_component),
-            "{} adapter component declaration must match nested source path {}; got {component_lines:?}",
-            source_path.label,
-            source_path.component_path()
-        );
+        check_source_adapter_declarations(*source_path);
     }
+}
+
+fn check_source_adapter_declarations(source_path: CliSource) {
+    let source = cli_source(source_path);
+    if source_declares_no_roles(&source) {
+        assert_functionless_inventory(source_path.label, &source);
+        return;
+    }
+    assert!(
+        source.contains("//! ## Adapter declarations"),
+        "{} missing adapter declarations header",
+        source_path.label
+    );
+    assert!(
+        source.contains("//!     Translates:"),
+        "{} missing Translates block",
+        source_path.label
+    );
+    assert!(
+        !translates_entries(&source).is_empty(),
+        "{} Translates block must name at least one contract",
+        source_path.label
+    );
+    let expected_component = format!("//!   - component: {}", source_path.component_path());
+    let component_lines = adapter_component_lines(&source);
+    assert!(
+        !component_lines.is_empty(),
+        "{} missing adapter component declaration",
+        source_path.label
+    );
+    assert!(
+        component_lines
+            .iter()
+            .all(|component| *component == expected_component),
+        "{} adapter component declaration must match nested source path {}; got {component_lines:?}",
+        source_path.label,
+        source_path.component_path()
+    );
 }
 
 #[test]
@@ -656,6 +883,13 @@ fn phase6_e4_source_inventory_names_every_split_leaf() {
                 .any(|source| source.path == old_flat_source),
             "C2 E4 inventory must use nested split leaves, not old flat carrier {old_flat_source}"
         );
+    }
+}
+
+#[test]
+fn phase6_e5_source_inventory_names_every_split_leaf_and_island() {
+    for source_path in E5_SPLIT_SOURCES {
+        assert_source_path_inventory_includes(source_path.path);
     }
 }
 
@@ -695,6 +929,7 @@ fn executor_coverage_spec_lists_required_cli_leaves() {
     ]
     .into_iter()
     .chain(E4_SPLIT_SOURCES.iter().copied())
+    .chain(E5_SPLIT_SOURCES.iter().copied())
     {
         let expected = format!("- `{}`", source_path.component_path());
         assert!(

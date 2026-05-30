@@ -1,4 +1,20 @@
+//! ## Declared roles
+//!
+//! Roles: accessor, mapper, orchestration.
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: crates/oulipoly-runtime/src/executor/mod.rs
+//!     role: adapter
+//!     Translates:
+//!       - executor-service-contract
+//!       - executor-facade-wrapper-contract
+//! ```
+
 pub mod cli;
+mod provider_specific;
 pub mod providers;
 pub mod terminal_signal;
 
@@ -30,9 +46,6 @@ pub use self::providers::openai_compat::Recognizer as OpenAiCompatRecognizer;
 /// ```
 pub use self::terminal_signal::TerminalSignal;
 pub use self::terminal_signal::TerminalSignalRecognizer;
-
-// ## Declared roles
-// accessor, formatter, orchestration, mapper
 
 #[derive(Debug)]
 #[allow(dead_code)]

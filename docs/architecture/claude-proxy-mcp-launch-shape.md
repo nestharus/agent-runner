@@ -43,7 +43,7 @@ Print rows (M1 = `claude -p`, M2 = `claude --print --output-format stream-json`)
 Two spellings of the allow-list flag exist in the code paths that touch Claude Code:
 
 - `--allowedTools` (camelCase) — the spelling AGE-104 proved succeeds under interactive PTY MCP replacement (rows M3-C2).
-- `--allowed-tools` (kebab-case) — the spelling currently emitted by the Rust executor at `crates/oulipoly-runtime/src/executor/cli.rs::apply_provider_policy` (which also emits `--disallowed-tools`).
+- `--allowed-tools` (kebab-case) — the spelling currently emitted by the Rust executor through `crates/oulipoly-runtime/src/executor/cli/policy/orchestration.rs::apply_provider_policy` and `crates/oulipoly-runtime/src/executor/provider_specific/policy/claude.rs` (which also emits `--disallowed-tools`).
 
 PTY MCP equivalence between `--allowedTools` and `--allowed-tools` is **not in evidence**. AGE-104 only proved camelCase `--allowedTools` for the M3-C2 positive control; kebab-case `--allowed-tools` was not exercised under interactive PTY MCP replacement on Claude Code 2.1.141–2.1.143. This runbook does not claim equivalence. Do not assume `--allowed-tools` works for interactive PTY MCP replacement until a focused harness run proves or disproves it; this is recorded as Assumption A5 in `planning/age-114-claude-launch-shape-doc/proposals/age-114-AGE-114.md`.
 
@@ -75,5 +75,5 @@ When a new Claude Code release lands (or an existing installed version changes),
 - `AGENTS.md` § `Model Command Syntax` — repo-local agent pointer for agents constructing or modifying Claude launch argv.
 - AGE-104 dossier directory: `/home/nes/projects/agent-runner/planning/prototype-age-104-pty-mcp-gap/dossier/` — full evidence including truth table, per-vector verdicts, and harness sources.
 - PR #90 — <https://github.com/nestharus/agent-runner/pull/90> — canonical prototype harness.
-- Production touchpoint: `crates/oulipoly-runtime/src/executor/cli.rs` (`apply_provider_policy`) — current Rust executor that emits `--allowed-tools` / `--disallowed-tools` (see `## Bounded Spelling Ambiguity`).
+- Production touchpoint: `crates/oulipoly-runtime/src/executor/cli/policy/orchestration.rs` (`apply_provider_policy`) delegates Claude argv emission to `crates/oulipoly-runtime/src/executor/provider_specific/policy/claude.rs` — current Rust executor path that emits `--allowed-tools` / `--disallowed-tools` (see `## Bounded Spelling Ambiguity`).
 - Sister tickets: AGE-101, AGE-102, AGE-103, AGE-113, AGE-115.

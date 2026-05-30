@@ -57,7 +57,9 @@ use oulipoly_config::{
     SessionCapture, SessionCaptureKind,
 };
 use oulipoly_runtime::executor::cli::{
-    ResumePayload, compose_resume_args, execute, execute_resume, start_known_provider_session_id,
+    EffectiveExecuteRequest, ResumePayload, compose_resume_args, execute,
+    execute_effective_with_start_known_provider_session_id, execute_resume,
+    start_known_provider_session_id,
 };
 use oulipoly_runtime::executor::{ResumeAcceptanceStatus, SessionCaptureMethod};
 use std::collections::HashMap;
@@ -80,6 +82,16 @@ fn provider_script_body(body: &str) -> String {
 
 fn provider_for(path: &std::path::Path) -> ProviderConfig {
     ProviderConfig::new(path.to_string_lossy().into_owned(), Vec::new())
+}
+
+fn model_for(name: &str, provider: ProviderConfig) -> ModelConfig {
+    ModelConfig {
+        name: name.to_string(),
+        prompt_mode: PromptMode::Arg,
+        providers: vec![provider],
+        inputs: Vec::new(),
+        provider: None,
+    }
 }
 
 fn flag_strategy() -> ResumeStrategy {
@@ -288,6 +300,264 @@ fn start_known_provider_session_id_forced_flag_verified_missing_flag_errors() {
     });
     let err = start_known_provider_session_id(&provider).unwrap_err();
     assert_eq!(err, "session_capture.flag is required");
+}
+
+// ===========================================================================
+// AGE-230 PP-010: telemetry scrub byte behavior.
+// ===========================================================================
+
+#[test]
+fn age230_pp010_telemetry_scrub_leaves_non_utf8_stdout_unchanged() {
+    let (_dir, path) = script(r#"printf '\377{"type":"result","cost":1}\n'"#);
+    let provider = provider_for(&path);
+    let model = model_for("age230-non-utf8-model", provider);
+
+    let result = execute(&model, 0, "prompt", None, &HashMap::new(), None).expect("execute");
+
+    let mut expected = vec![0xff];
+    expected.extend_from_slice(br#"{"type":"result","cost":1}"#);
+    expected.push(b'\n');
+    assert_eq!(result.stdout, expected);
+}
+
+#[test]
+fn age230_pp010_telemetry_scrub_leaves_non_json_and_non_telemetry_json_unchanged() {
+    let (_dir, path) = script(
+        r#"
+printf '%s\n' 'not json'
+printf '%s\n' '{"type":"message","nested":{"usd":3},"ok":true}'
+"#,
+    );
+    let provider = provider_for(&path);
+    let model = model_for("age230-non-telemetry-model", provider);
+
+    let result = execute(&model, 0, "prompt", None, &HashMap::new(), None).expect("execute");
+
+    assert_eq!(
+        result.stdout,
+        br#"not json
+{"type":"message","nested":{"usd":3},"ok":true}
+"#
+    );
+}
+
+#[test]
+fn age230_pp010_telemetry_scrub_rewrites_eligible_json_and_preserves_line_endings() {
+    let (_dir, path) = script(
+        r#"
+printf '%s\n' '{"type":"result","cost_usd":12,"keep":{"price":1,"ok":true},"items":[{"usd":2,"name":"a"}],"list":[1]}'
+printf '%s\r\n' '{"modelUsage":{"total":7,"usd":9},"ok":1}'
+printf '%s' '{"price":3,"z":2}'
+"#,
+    );
+    let provider = provider_for(&path);
+    let model = model_for("age230-telemetry-scrub-model", provider);
+
+    let result = execute(&model, 0, "prompt", None, &HashMap::new(), None).expect("execute");
+
+    assert_eq!(
+        result.stdout,
+        concat!(
+            r#"{"items":[{"name":"a"}],"keep":{"ok":true},"list":[1],"type":"result"}"#,
+            "\n",
+            r#"{"modelUsage":{"total":7},"ok":1}"#,
+            "\r\n",
+            r#"{"z":2}"#,
+        )
+        .as_bytes()
+    );
+    assert!(
+        result
+            .stdout
+            .windows(b"\r\n".len())
+            .any(|window| window == b"\r\n"),
+        "CRLF line ending must be preserved in rewritten JSON"
+    );
+    assert!(
+        !result.stdout.ends_with(b"\n"),
+        "no-final-newline line must remain unterminated"
+    );
+}
+
+#[test]
+fn age230_resume_acceptance_matches_unsanitized_telemetry_stdout() {
+    let (_dir, path) = script(
+        r#"printf '%s\n' '{"type":"result","costEvidence":"resume-token","safe":"visible"}'; exit 0"#,
+    );
+    let mut provider = provider_for(&path);
+    provider.resume_acceptance = Some(ResumeAcceptanceRules {
+        accepted_output_patterns: Some(vec!["resume-token".to_string()]),
+        rejected_output_patterns: None,
+    });
+    let strategy = flag_strategy();
+
+    let result = execute_resume(
+        &provider,
+        0,
+        PromptMode::Arg,
+        "prompt",
+        None,
+        None,
+        ResumePayload {
+            session_id: "11111111-1111-1111-1111-111111111111",
+            strategy: &strategy,
+        },
+    )
+    .expect("resume execute");
+
+    assert_eq!(
+        result.stdout,
+        br#"{"safe":"visible","type":"result"}
+"#
+    );
+    let acceptance = result
+        .resume_acceptance
+        .expect("resume acceptance populated");
+    assert_eq!(acceptance.status, ResumeAcceptanceStatus::Accepted);
+    assert_eq!(
+        acceptance.evidence.as_deref(),
+        Some("matched accept pattern: resume-token")
+    );
+}
+
+// ===========================================================================
+// AGE-230 stdout-json-event capture validation.
+// ===========================================================================
+
+fn stdout_json_event_capture() -> SessionCapture {
+    SessionCapture {
+        kind: SessionCaptureKind::StdoutJsonEvent,
+        flag: None,
+        readback_args: None,
+        event_type: Some("agent.session_started".to_string()),
+        event_id_path: Some("data.id".to_string()),
+        json_flag: Some("--json".to_string()),
+        last_message_flag: Some("--last-message".to_string()),
+    }
+}
+
+fn execute_with_session_capture(capture: SessionCapture) -> Result<(), String> {
+    let mut provider = ProviderConfig::new("echo", Vec::new());
+    provider.session_capture = Some(capture);
+    let model = model_for("age230-capture-validation-model", provider);
+    execute(&model, 0, "prompt", None, &HashMap::new(), None).map(|_| ())
+}
+
+#[test]
+fn age230_stdout_json_event_capture_requires_json_flag() {
+    let mut capture = stdout_json_event_capture();
+    capture.json_flag = None;
+
+    let err = execute_with_session_capture(capture).unwrap_err();
+
+    assert_eq!(err, "session_capture.json_flag is required");
+}
+
+#[test]
+fn age230_stdout_json_event_capture_requires_last_message_flag() {
+    let mut capture = stdout_json_event_capture();
+    capture.last_message_flag = None;
+
+    let err = execute_with_session_capture(capture).unwrap_err();
+
+    assert_eq!(err, "session_capture.last_message_flag is required");
+}
+
+#[test]
+fn age230_stdout_json_event_capture_requires_event_type() {
+    let mut capture = stdout_json_event_capture();
+    capture.event_type = None;
+
+    let err = execute_with_session_capture(capture).unwrap_err();
+
+    assert_eq!(err, "session_capture.event_type is required");
+}
+
+#[test]
+fn age230_stdout_json_event_capture_requires_event_id_path() {
+    let mut capture = stdout_json_event_capture();
+    capture.event_id_path = None;
+
+    let err = execute_with_session_capture(capture).unwrap_err();
+
+    assert_eq!(err, "session_capture.event_id_path is required");
+}
+
+#[test]
+fn age230_forced_flag_readback_mismatch_uses_requested_observed_evidence() {
+    let (_dir, path) =
+        script(r#"printf '%s\n' '{"type":"result","session_id":"observed-session"}'"#);
+    let mut provider = provider_for(&path);
+    provider.session_capture = Some(SessionCapture {
+        kind: SessionCaptureKind::ForcedFlagVerified,
+        flag: Some("--session-id".to_string()),
+        readback_args: None,
+        event_type: None,
+        event_id_path: None,
+        json_flag: None,
+        last_message_flag: None,
+    });
+    let model = model_for("age230-readback-mismatch-model", provider.clone());
+    let extra_inputs = HashMap::new();
+
+    let result = execute_effective_with_start_known_provider_session_id(
+        EffectiveExecuteRequest {
+            model: &model,
+            provider: &provider,
+            provider_index: 0,
+            prompt_mode: PromptMode::Arg,
+            prompt: "prompt",
+            working_dir: None,
+            extra_inputs: &extra_inputs,
+            parent_invocation_env: None,
+        },
+        Some("requested-session"),
+    )
+    .expect("execute");
+
+    match result.session_capture.method {
+        SessionCaptureMethod::Failed(reason) => {
+            assert_eq!(
+                reason,
+                "readback mismatch: requested requested-session, observed observed-session"
+            );
+        }
+        other => panic!("expected Failed; got {other:?}"),
+    }
+}
+
+#[test]
+fn age230_stdout_json_event_missing_last_message_sidecar_falls_back_to_provider_stdout() {
+    let (_dir, path) = script(
+        r#"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --last-message) shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf '%s\n' '{"type":"agent.session_started","data":{"id":"sidecar-missing"}}'
+"#,
+    );
+    let mut provider = provider_for(&path);
+    provider.session_capture = Some(stdout_json_event_capture());
+    let model = model_for("age230-sidecar-missing-model", provider);
+
+    let result = execute(&model, 0, "prompt", None, &HashMap::new(), None).expect("execute");
+
+    assert!(matches!(
+        result.session_capture.method,
+        SessionCaptureMethod::StdoutJsonEvent
+    ));
+    assert_eq!(
+        result.session_capture.session_id.as_deref(),
+        Some("sidecar-missing")
+    );
+    assert_eq!(
+        result.stdout,
+        br#"{"type":"agent.session_started","data":{"id":"sidecar-missing"}}
+"#
+    );
 }
 
 // ===========================================================================

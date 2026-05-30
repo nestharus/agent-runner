@@ -217,6 +217,9 @@ fn production_runtime_paths_do_not_route_through_provider_settings_dispatch() {
     .chain(recursive_runtime_production_sources(
         "../crates/oulipoly-runtime/src/executor/cli",
     ))
+    .chain(recursive_runtime_production_sources(
+        "../crates/oulipoly-runtime/src/executor/provider_specific",
+    ))
     .collect::<Vec<_>>();
     let forbidden_terms = [
         "ProviderSettingsHost",
@@ -292,6 +295,19 @@ fn provider_settings_guard_recursively_collects_age229_e4_executor_cli_sources()
     assert!(
         guard_body.contains("../crates/oulipoly-runtime/src/executor/cli"),
         "AGE-216 provider-settings guard must anchor recursive collection at executor/cli"
+    );
+}
+
+// risk: AGE-216 provider-settings guard could omit AGE-230 E5 provider-specific islands after split; level: source guard; source: AGE-230 Phase 5 contract Guard And Spec Contract.
+#[test]
+fn provider_settings_guard_recursively_collects_age230_e5_provider_specific_sources() {
+    let guard_body = function_body(
+        include_str!("age216_provider_settings_source_guard.rs"),
+        "fn production_runtime_paths_do_not_route_through_provider_settings_dispatch()",
+    );
+    assert!(
+        guard_body.contains("../crates/oulipoly-runtime/src/executor/provider_specific"),
+        "AGE-216 provider-settings guard must anchor recursive collection at executor/provider_specific"
     );
 }
 
