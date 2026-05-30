@@ -743,9 +743,18 @@ fn age_35_non_resume_repl_uses_balance_context_to_refresh_and_scan_all_model_pro
 
 #[test]
 fn age_35_gui_test_model_with_db_path_remains_outside_invocation_lifecycle() {
-    let source_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
+    let source_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/test_model/orchestration.rs");
+    let dispatch_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/test_model/dispatch.rs");
+    let mapper_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/test_model/mapper.rs");
     let source = fs::read_to_string(&source_path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", source_path.display()));
+    let dispatch = fs::read_to_string(&dispatch_path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", dispatch_path.display()));
+    let mapper = fs::read_to_string(&mapper_path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", mapper_path.display()));
     let command_start = source
         .find("async fn test_model(")
         .expect("test_model command signature");
@@ -755,6 +764,9 @@ fn age_35_gui_test_model_with_db_path_remains_outside_invocation_lifecycle() {
         .expect("test_model command signature close");
     let command_decl = &source[command_start..=command_decl_end];
     let body = source_block_after(&source, "fn test_model_with_db_path(");
+    let route_body = source_block_after(&dispatch, "fn select_test_model_route(");
+    let request_body = source_block_after(&mapper, "fn build_effective_executor_request(");
+    let mark_body = source_block_after(&dispatch, "fn mark_effective_provider_exhausted(");
 
     assert!(
         command_decl.contains("name: String"),
@@ -769,39 +781,48 @@ fn age_35_gui_test_model_with_db_path_remains_outside_invocation_lifecycle() {
         "test_model Tauri command must not expose routing over IPC"
     );
     assert!(
-        body.contains("RoutingServiceRequest"),
+        route_body.contains("RoutingServiceRequest"),
         "test_model_with_db_path should route through the routing service request"
     );
     assert!(
-        body.contains(".select_route("),
+        route_body.contains(".select_route("),
         "test_model_with_db_path should select via RoutingServicePort"
     );
     assert!(
-        body.contains("ctx: None"),
+        route_body.contains("ctx: None"),
         "test_model_with_db_path should keep cached-only routing"
     );
     assert!(
         !body.contains("balancer::select_provider"),
         "test_model_with_db_path should not call balancer::select_provider directly after cutover"
     );
-    let route = body.find(".select_route(").expect("routing service call");
+    let route = body
+        .find("select_test_model_route")
+        .expect("routing service call");
     let effective_provider = body
         .find("effective_provider_for_model_provider")
         .expect("effective provider resolution");
+    let executor_dispatch = body
+        .find("execute_effective_request")
+        .expect("executor service dispatch");
     let exhausted_mark = body
-        .find("mark_exhausted(&")
-        .expect("caller-owned exhausted mark");
+        .find("apply_exhaustion_disposition")
+        .expect("caller-owned exhausted disposition");
     assert!(
         route < effective_provider,
         "effective-provider resolution must remain downstream of provider index selection"
     );
     assert!(
-        effective_provider < exhausted_mark,
+        effective_provider < executor_dispatch && executor_dispatch < exhausted_mark,
         "quota-like stderr exhaustion marking must remain caller-owned after execution"
     );
     assert!(
-        body.contains("parent_invocation_env: None"),
+        request_body.contains("parent_invocation_env: None"),
         "test_model_with_db_path should execute without parent invocation env"
+    );
+    assert!(
+        mark_body.contains("ProviderQuotaRepository"),
+        "test_model_with_db_path should keep quota marking behind the repository"
     );
     for lifecycle_call in [
         "start_invocation(",
