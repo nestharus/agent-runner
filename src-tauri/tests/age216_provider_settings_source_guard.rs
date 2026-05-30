@@ -211,7 +211,13 @@ fn production_runtime_paths_do_not_route_through_provider_settings_dispatch() {
         "../crates/oulipoly-runtime/src/sessions/mod.rs",
         "../crates/oulipoly-runtime/src/migration/mod.rs",
         "src/setup/flow.rs",
-    ];
+    ]
+    .into_iter()
+    .map(ToOwned::to_owned)
+    .chain(recursive_runtime_production_sources(
+        "../crates/oulipoly-runtime/src/executor/cli",
+    ))
+    .collect::<Vec<_>>();
     let forbidden_terms = [
         "ProviderSettingsHost",
         "provider_settings",
@@ -227,7 +233,7 @@ fn production_runtime_paths_do_not_route_through_provider_settings_dispatch() {
 
     let violations = guarded_sources
         .into_iter()
-        .flat_map(|relative| source_term_violations(relative, &forbidden_terms))
+        .flat_map(|relative| source_term_violations(&relative, &forbidden_terms))
         .collect::<Vec<_>>();
     assert!(
         violations.is_empty(),
@@ -270,6 +276,23 @@ fn provider_settings_guard_source_list_declares_age225_b4_modules() {
             "AGE-216 provider-settings guard must include {path}"
         );
     }
+}
+
+// risk: AGE-216 provider-settings guard could omit nested AGE-229 E4 executor CLI leaves after split; level: source guard; source: AGE-229 Phase 6a contract Guard And Spec Contract.
+#[test]
+fn provider_settings_guard_recursively_collects_age229_e4_executor_cli_sources() {
+    let guard_body = function_body(
+        include_str!("age216_provider_settings_source_guard.rs"),
+        "fn production_runtime_paths_do_not_route_through_provider_settings_dispatch()",
+    );
+    assert!(
+        guard_body.contains("recursive_runtime_production_sources("),
+        "AGE-216 provider-settings guard must recursively include executor/cli/** production leaves"
+    );
+    assert!(
+        guard_body.contains("../crates/oulipoly-runtime/src/executor/cli"),
+        "AGE-216 provider-settings guard must anchor recursive collection at executor/cli"
+    );
 }
 
 // risk: Provider-specific vocabulary drift; level: source guard; source: contract "Out of scope"
@@ -365,7 +388,7 @@ fn production_source(relative: &str, source: &str) -> String {
     }
 }
 
-fn source_term_violations(relative: &'static str, forbidden_terms: &[&'static str]) -> Vec<String> {
+fn source_term_violations(relative: &str, forbidden_terms: &[&'static str]) -> Vec<String> {
     let Ok(source) = fs::read_to_string(manifest_path(relative)) else {
         return vec![format!("{relative}:<missing guarded source>")];
     };
@@ -375,6 +398,40 @@ fn source_term_violations(relative: &'static str, forbidden_terms: &[&'static st
         .filter(|term| source.contains(term))
         .map(|term| format!("{relative}:{term}"))
         .collect()
+}
+
+fn recursive_runtime_production_sources(relative_dir: &str) -> Vec<String> {
+    let mut sources = Vec::new();
+    collect_rust_sources(&manifest_path(relative_dir), relative_dir, &mut sources);
+    sources
+}
+
+fn collect_rust_sources(dir: &Path, relative_dir: &str, out: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries {
+        let path = entry.unwrap().path();
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        let relative = format!("{relative_dir}/{file_name}");
+        if path.is_dir() {
+            collect_rust_sources(&path, &relative, out);
+        } else if path.extension().is_some_and(|extension| extension == "rs")
+            && !is_test_source_path(&relative)
+        {
+            out.push(relative);
+        }
+    }
+}
+
+fn is_test_source_path(relative: &str) -> bool {
+    relative.contains("/tests/")
+        || relative.ends_with("_test.rs")
+        || relative.ends_with("-test.rs")
+        || relative.ends_with("tests.rs")
 }
 
 fn optional_source(relative: &'static str) -> Option<(&'static str, String)> {
