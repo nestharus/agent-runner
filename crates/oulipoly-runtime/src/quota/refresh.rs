@@ -1,26 +1,83 @@
+//! ## Declared roles
+//!
+//! `orchestration`, `mapper`, `accessor`, `formatter`, `predicate`, `validator`
+//!
 use super::{
     InFlight, QuotaScriptWindow, RefreshOutcome, parse_output, run_refresh_command, run_script,
 };
-use crate::services::{QuotaServiceOutput, QuotaServicePort, QuotaServiceRequest, ServiceError};
+use crate::provider_registry::ProviderRegistryHandle;
+use crate::services::{
+    QuotaServiceExternalProviderIdentity, QuotaServiceOutput, QuotaServicePort,
+    QuotaServiceRequest, ServiceError,
+};
 use oulipoly_config::{ProvidersConfig, SessionsConfig};
 use oulipoly_state::{QuotaWindowInput, StateDb};
 
-pub struct RuntimeQuotaService;
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeQuotaService {
+    provider_registry: Option<ProviderRegistryHandle>,
+}
+
+#[allow(non_upper_case_globals)]
+pub const RuntimeQuotaService: RuntimeQuotaService = RuntimeQuotaService {
+    provider_registry: None,
+};
+
+impl RuntimeQuotaService {
+    pub fn with_registry_handle(provider_registry: ProviderRegistryHandle) -> Self {
+        Self {
+            provider_registry: Some(provider_registry),
+        }
+    }
+}
 
 impl QuotaServicePort for RuntimeQuotaService {
     fn refresh_quota(
         &self,
         request: QuotaServiceRequest<'_>,
     ) -> Result<QuotaServiceOutput, ServiceError> {
-        let outcome = refresh_provider(
-            &request.provider_name,
-            request.providers_cfg,
-            request.in_flight,
-            request.state,
-        );
+        let outcome = match request.external_provider.clone() {
+            Some(identity) => self.refresh_external(request, identity),
+            None => refresh_provider(
+                &request.provider_name,
+                request.providers_cfg,
+                request.in_flight,
+                request.state,
+            ),
+        };
 
         Ok(QuotaServiceOutput { outcome })
     }
+}
+
+impl RuntimeQuotaService {
+    fn refresh_external(
+        &self,
+        request: QuotaServiceRequest<'_>,
+        identity: QuotaServiceExternalProviderIdentity,
+    ) -> RefreshOutcome {
+        let registry = match external_provider_registry(&self.provider_registry) {
+            Ok(registry) => registry,
+            Err(outcome) => return outcome,
+        };
+        super::external_provider::refresh_external_provider_quota(registry, request, identity)
+    }
+}
+
+fn external_provider_registry(
+    registry: &Option<ProviderRegistryHandle>,
+) -> Result<&ProviderRegistryHandle, RefreshOutcome> {
+    registry
+        .as_ref()
+        .ok_or_else(external_provider_registry_unavailable)
+}
+
+fn external_provider_registry_unavailable() -> RefreshOutcome {
+    RefreshOutcome::Failed(external_provider_registry_unavailable_message())
+}
+
+fn external_provider_registry_unavailable_message() -> String {
+    "external provider quota registry is unavailable".to_string()
 }
 
 /// Refresh one provider's quota. Caller is responsible for checking staleness.
@@ -130,11 +187,31 @@ fn persist_windows(
     windows: Vec<QuotaScriptWindow>,
     state: &StateDb,
 ) -> RefreshOutcome {
-    let routing_windows: Vec<QuotaWindowInput> = windows
+    let routing_windows = quota_window_inputs(&windows);
+    let persist_result = upsert_quota_windows(state, provider_name, &routing_windows);
+    refresh_outcome_from_persist_result(persist_result, routing_windows)
+}
+
+fn quota_window_inputs(windows: &[QuotaScriptWindow]) -> Vec<QuotaWindowInput> {
+    windows
         .iter()
         .map(QuotaScriptWindow::to_quota_window_input)
-        .collect();
-    if let Err(e) = state.upsert_quota_refresh(provider_name, &routing_windows) {
+        .collect()
+}
+
+fn upsert_quota_windows(
+    state: &StateDb,
+    provider_name: &str,
+    windows: &[QuotaWindowInput],
+) -> Result<(), String> {
+    state.upsert_quota_refresh(provider_name, windows)
+}
+
+fn refresh_outcome_from_persist_result(
+    result: Result<(), String>,
+    routing_windows: Vec<QuotaWindowInput>,
+) -> RefreshOutcome {
+    if let Err(e) = result {
         return RefreshOutcome::Failed(e);
     }
     RefreshOutcome::Updated {
@@ -178,6 +255,16 @@ mod tests {
     use chrono::Utc;
     use oulipoly_config::ProviderEntry;
 
+    const TEST_PROVIDER: &str = "p";
+
+    struct RefreshFixture {
+        _dir: Option<tempfile::TempDir>,
+        marker: Option<std::path::PathBuf>,
+        providers: ProvidersConfig,
+        state: StateDb,
+        in_flight: InFlight,
+    }
+
     /// Build a ProvidersConfig with one provider, optionally configured
     /// with an auth_refresh_command.
     fn cfg(name: &str, quota_script: &str, refresh: Option<&str>) -> ProvidersConfig {
@@ -210,111 +297,118 @@ mod tests {
         Utc::now() + chrono::Duration::hours(h)
     }
 
-    #[test]
-    fn refresh_runs_auth_refresh_when_script_empty_and_prior_exists() {
-        // First quota_script call emits empty windows; auth_refresh_command
-        // creates a marker; second quota_script call sees the marker and
-        // emits populated windows.
+    fn refresh_fixture(
+        providers: ProvidersConfig,
+        marker: Option<std::path::PathBuf>,
+        dir: Option<tempfile::TempDir>,
+    ) -> RefreshFixture {
+        RefreshFixture {
+            _dir: dir,
+            marker,
+            providers,
+            state: StateDb::open(std::path::Path::new(":memory:")).unwrap(),
+            in_flight: InFlight::new(),
+        }
+    }
+
+    fn empty_then_success_fixture() -> RefreshFixture {
+        marker_refresh_fixture("refreshed", empty_then_success_quota_script)
+    }
+
+    fn first_empty_fixture() -> RefreshFixture {
+        marker_refresh_fixture("ran", |_| empty_windows_quota_script())
+    }
+
+    fn failure_then_success_fixture() -> RefreshFixture {
+        marker_refresh_fixture("refreshed", failure_then_success_quota_script)
+    }
+
+    fn marker_refresh_fixture(
+        marker_name: &str,
+        quota_script_for_marker: fn(&std::path::Path) -> String,
+    ) -> RefreshFixture {
         let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join("refreshed");
-        let quota_script = format!(
+        let marker = dir.path().join(marker_name);
+        let quota_script = quota_script_for_marker(&marker);
+        let refresh_cmd = touch_marker_command(&marker);
+        let providers = providers_for_quota_fixture(&quota_script, &refresh_cmd);
+        refresh_fixture(providers, Some(marker), Some(dir))
+    }
+
+    fn empty_then_success_quota_script(marker: &std::path::Path) -> String {
+        format!(
             "if [ -e {m} ]; then echo '{{\"windows\":[{{\"used_percent\":7,\"resets_at\":\"2099-01-01T00:00:00Z\"}}]}}'; else echo '{{\"windows\":[]}}'; fi",
             m = marker.display()
+        )
+    }
+
+    fn empty_windows_quota_script() -> String {
+        "echo '{\"windows\":[]}'".to_string()
+    }
+
+    fn failure_then_success_quota_script(marker: &std::path::Path) -> String {
+        format!(
+            "if [ -e {m} ]; then echo '{{\"windows\":[{{\"used_percent\":3,\"resets_at\":\"2099-01-01T00:00:00Z\"}}]}}'; else echo 'auth error' >&2; exit 1; fi",
+            m = marker.display()
+        )
+    }
+
+    fn touch_marker_command(marker: &std::path::Path) -> String {
+        format!("touch {}", marker.display())
+    }
+
+    fn providers_for_quota_fixture(quota_script: &str, refresh_cmd: &str) -> ProvidersConfig {
+        cfg(TEST_PROVIDER, quota_script, Some(refresh_cmd))
+    }
+
+    fn retry_still_fails_fixture() -> RefreshFixture {
+        let providers = cfg(TEST_PROVIDER, "exit 1", Some("true"));
+        refresh_fixture(providers, None, None)
+    }
+
+    fn both_fail_fixture() -> RefreshFixture {
+        let providers = cfg(
+            TEST_PROVIDER,
+            "exit 1",
+            Some("echo 'token gone' >&2; exit 7"),
         );
-        let refresh_cmd = format!("touch {}", marker.display());
-        let providers = cfg("p", &quota_script, Some(&refresh_cmd));
+        refresh_fixture(providers, None, None)
+    }
 
-        let state = StateDb::open(std::path::Path::new(":memory:")).unwrap();
-        seed_prior_windows(&state, "p");
-        let in_flight = InFlight::new();
+    fn run_refresh_fixture(fixture: &RefreshFixture) -> RefreshOutcome {
+        refresh_provider(
+            TEST_PROVIDER,
+            &fixture.providers,
+            &fixture.in_flight,
+            &fixture.state,
+        )
+    }
 
-        let outcome = refresh_provider("p", &providers, &in_flight, &state);
+    fn assert_updated_window(outcome: RefreshOutcome, expected_used_percent: f64, context: &str) {
         match outcome {
             RefreshOutcome::Updated { windows } => {
                 assert_eq!(windows.len(), 1);
-                assert!((windows[0].used_percent - 0.07).abs() < 1e-6);
+                assert!((windows[0].used_percent - expected_used_percent).abs() < 1e-6);
             }
-            other => panic!("expected Updated, got {other:?}"),
+            other => panic!("expected Updated {context}, got {other:?}"),
         }
-        assert!(marker.exists(), "auth_refresh_command should have run");
     }
 
-    #[test]
-    fn refresh_skips_auth_refresh_when_no_prior_windows() {
-        // Empty windows on a first-time fetch is normal (not an expired
-        // token). auth_refresh_command must NOT run.
-        let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join("ran");
-        let quota_script = "echo '{\"windows\":[]}'".to_string();
-        let refresh_cmd = format!("touch {}", marker.display());
-        let providers = cfg("p", &quota_script, Some(&refresh_cmd));
-
-        let state = StateDb::open(std::path::Path::new(":memory:")).unwrap();
-        let in_flight = InFlight::new();
-
-        let outcome = refresh_provider("p", &providers, &in_flight, &state);
+    fn assert_empty_updated(outcome: RefreshOutcome) {
         assert!(
             matches!(outcome, RefreshOutcome::Updated { ref windows } if windows.is_empty()),
             "expected Updated with empty windows, got {outcome:?}"
         );
-        assert!(
-            !marker.exists(),
-            "auth_refresh_command must not run on a first-time empty result"
-        );
     }
 
-    #[test]
-    fn refresh_runs_auth_refresh_on_script_failure_then_retries() {
-        // First call exits 1; refresh creates marker; second call succeeds.
-        let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join("refreshed");
-        let quota_script = format!(
-            "if [ -e {m} ]; then echo '{{\"windows\":[{{\"used_percent\":3,\"resets_at\":\"2099-01-01T00:00:00Z\"}}]}}'; else echo 'auth error' >&2; exit 1; fi",
-            m = marker.display()
-        );
-        let refresh_cmd = format!("touch {}", marker.display());
-        let providers = cfg("p", &quota_script, Some(&refresh_cmd));
-
-        let state = StateDb::open(std::path::Path::new(":memory:")).unwrap();
-        let in_flight = InFlight::new();
-
-        let outcome = refresh_provider("p", &providers, &in_flight, &state);
-        match outcome {
-            RefreshOutcome::Updated { windows } => {
-                assert_eq!(windows.len(), 1);
-                assert!((windows[0].used_percent - 0.03).abs() < 1e-6);
-            }
-            other => panic!("expected Updated after retry, got {other:?}"),
-        }
-        assert!(marker.exists());
-    }
-
-    #[test]
-    fn refresh_returns_failed_when_retry_still_fails() {
-        let quota_script = "exit 1".to_string();
-        let refresh_cmd = "true".to_string();
-        let providers = cfg("p", &quota_script, Some(&refresh_cmd));
-
-        let state = StateDb::open(std::path::Path::new(":memory:")).unwrap();
-        let in_flight = InFlight::new();
-
-        let outcome = refresh_provider("p", &providers, &in_flight, &state);
+    fn assert_failed_outcome(outcome: RefreshOutcome) {
         assert!(
             matches!(outcome, RefreshOutcome::Failed(_)),
             "expected Failed, got {outcome:?}"
         );
     }
 
-    #[test]
-    fn refresh_includes_auth_refresh_error_when_both_fail() {
-        let quota_script = "exit 1".to_string();
-        let refresh_cmd = "echo 'token gone' >&2; exit 7".to_string();
-        let providers = cfg("p", &quota_script, Some(&refresh_cmd));
-
-        let state = StateDb::open(std::path::Path::new(":memory:")).unwrap();
-        let in_flight = InFlight::new();
-
-        let outcome = refresh_provider("p", &providers, &in_flight, &state);
+    fn assert_combined_auth_refresh_error(outcome: RefreshOutcome) {
         match outcome {
             RefreshOutcome::Failed(msg) => {
                 assert!(
@@ -325,5 +419,77 @@ mod tests {
             }
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    fn assert_marker_exists(fixture: &RefreshFixture, message: &str) {
+        assert!(
+            fixture
+                .marker
+                .as_ref()
+                .is_some_and(|marker| marker.exists()),
+            "{message}"
+        );
+    }
+
+    fn assert_marker_missing(fixture: &RefreshFixture, message: &str) {
+        assert!(
+            fixture
+                .marker
+                .as_ref()
+                .is_some_and(|marker| !marker.exists()),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn refresh_runs_auth_refresh_when_script_empty_and_prior_exists() {
+        let fixture = empty_then_success_fixture();
+        seed_prior_windows(&fixture.state, TEST_PROVIDER);
+
+        let outcome = run_refresh_fixture(&fixture);
+
+        assert_updated_window(outcome, 0.07, "after empty script auth refresh");
+        assert_marker_exists(&fixture, "auth_refresh_command should have run");
+    }
+
+    #[test]
+    fn refresh_skips_auth_refresh_when_no_prior_windows() {
+        let fixture = first_empty_fixture();
+
+        let outcome = run_refresh_fixture(&fixture);
+
+        assert_empty_updated(outcome);
+        assert_marker_missing(
+            &fixture,
+            "auth_refresh_command must not run on a first-time empty result",
+        );
+    }
+
+    #[test]
+    fn refresh_runs_auth_refresh_on_script_failure_then_retries() {
+        let fixture = failure_then_success_fixture();
+
+        let outcome = run_refresh_fixture(&fixture);
+
+        assert_updated_window(outcome, 0.03, "after retry");
+        assert_marker_exists(&fixture, "auth_refresh_command should have run");
+    }
+
+    #[test]
+    fn refresh_returns_failed_when_retry_still_fails() {
+        let fixture = retry_still_fails_fixture();
+
+        let outcome = run_refresh_fixture(&fixture);
+
+        assert_failed_outcome(outcome);
+    }
+
+    #[test]
+    fn refresh_includes_auth_refresh_error_when_both_fail() {
+        let fixture = both_fail_fixture();
+
+        let outcome = run_refresh_fixture(&fixture);
+
+        assert_combined_auth_refresh_error(outcome);
     }
 }

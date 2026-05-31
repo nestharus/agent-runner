@@ -251,6 +251,14 @@ pub struct QuotaServiceRequest<'a> {
     pub providers_cfg: &'a ProvidersConfig,
     pub in_flight: &'a InFlight,
     pub state: &'a StateDb,
+    pub external_provider: Option<QuotaServiceExternalProviderIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuotaServiceExternalProviderIdentity {
+    pub model_name: String,
+    pub provider_instance_id: String,
+    pub settings_id: String,
 }
 
 pub struct QuotaServiceOutput {

@@ -51,11 +51,21 @@
         "checked_at_unix_ms": { "$ref": "common.schema.json#/$defs/UnixMilliseconds" },
         "windows": {
           "type": "array",
-          "items": { "type": "object", "additionalProperties": true }
+          "items": { "$ref": "#/$defs/QuotaProbeWindow" }
         },
         "detail": { "type": "string" }
       },
       "required": ["available", "checked_at_unix_ms", "windows"],
+      "additionalProperties": false
+    },
+    "QuotaProbeWindow": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "remaining_ratio": { "type": "number" },
+        "resets_at_unix_ms": { "$ref": "common.schema.json#/$defs/UnixMilliseconds" }
+      },
+      "required": ["remaining_ratio", "resets_at_unix_ms"],
       "additionalProperties": false
     },
     "QuotaProbeResponse": {

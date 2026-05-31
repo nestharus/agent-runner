@@ -16,6 +16,7 @@
 
 mod accessor;
 mod candidates;
+mod identity;
 mod mapper;
 pub mod orchestration;
 

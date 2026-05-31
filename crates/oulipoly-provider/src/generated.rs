@@ -454,9 +454,17 @@ pub struct QuotaSourceResult {
 pub struct QuotaProbeResult {
     pub available: bool,
     pub checked_at_unix_ms: u64,
-    pub windows: Vec<JsonObject>,
+    pub windows: Vec<QuotaProbeWindow>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QuotaProbeWindow {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub remaining_ratio: f64,
+    pub resets_at_unix_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
