@@ -26,6 +26,23 @@
 - `src-tauri/src/commands/quota_refresh/candidates.rs`
 - `src-tauri/src/commands/quota_refresh/accessor.rs`
 - `src-tauri/src/commands/quota_refresh/mapper.rs`
+- `src-tauri/src/commands/accessor.rs`
+- `src-tauri/src/commands/setup_flow/mod.rs`
+- `src-tauri/src/commands/setup_flow/orchestration.rs`
+- `src-tauri/src/commands/setup_flow/accessor.rs`
+- `src-tauri/src/commands/setup_flow/formatter.rs`
+- `src-tauri/src/commands/providers_accounts/mod.rs`
+- `src-tauri/src/commands/providers_accounts/orchestration.rs`
+- `src-tauri/src/commands/providers_accounts/accessor.rs`
+- `src-tauri/src/commands/providers_accounts/validator.rs`
+- `src-tauri/src/commands/providers_accounts/mapper.rs`
+- `src-tauri/src/commands/providers_accounts/formatter.rs`
+- `src-tauri/src/commands/providers_accounts/display_name.rs`
+- `src-tauri/src/commands/discovery/mod.rs`
+- `src-tauri/src/commands/discovery/orchestration.rs`
+- `src-tauri/src/commands/discovery/accessor.rs`
+- `src-tauri/src/commands/discovery/predicate.rs`
+- `src-tauri/src/commands/discovery/formatter.rs`
 - `src-tauri/src/commands/test_model/mod.rs`
 - `src-tauri/src/commands/test_model/orchestration.rs`
 - `src-tauri/src/commands/test_model/lookup.rs`
@@ -77,6 +94,9 @@
 | `commands/trace/` invoked. | Surface the diagnostics/trace history for an invocation. |
 | `config_migration_cli.rs` invoked. | Migrate config schema forward. |
 | Setup flow invoked (`setup/flow.rs`). | Drive the wizard from `oulipoly-setup`; persist results via `oulipoly-config`. |
+| Tauri setup-flow IPC commands invoked (`commands/setup_flow/`). | Preserve UUID session ids, response channel capacity 16, sender storage/clear behavior, setup response strings, memory DB path beside `models_dir`, memory-open error event text with `recoverable: false`, CLI detection delegation, and the existing `which claude` setup-needed residual probe. |
+| Tauri provider/account IPC commands invoked (`commands/providers_accounts/`). | Route reads and mutations through `SetupRepository`, prefer test repository injection before real DB fallback, preserve `AddAccountInput` fields, account validation strings, provider-not-found strings, `AuthStatus::Unknown`, RFC3339 timestamps, delete boolean results, sync detection delegation, and the residual display-name map. |
+| Tauri discovery IPC commands invoked (`commands/discovery/`). | Run runtime discovery in a blocking task, open the GUI-derived `state.db`, map join failures to `Discovery task failed: {e}`, preserve empty-result stale-delete guard, delete stale rows before model upserts before parameter upserts, and preserve provider/model read filters through `SetupRepository`. |
 | Tauri owned-turn event arrives. | `main/owned_turn_event_ingest.rs` parses and persists per `oulipoly-state` schema. |
 | `commands/quota_refresh/` invoked. | Refresh stale quota data only for providers in multi-provider models, preserve sorted provider-name output, map runtime quota outcomes to the stable frontend DTO strings. |
 
@@ -95,6 +115,10 @@ or consolidate usage CLI row-state strings with the quota-refresh DTO strings.
   the runtime quota service.
 - Quota refresh sees an in-flight runtime refresh — return `in_flight`
   byte-identically for the DTO status.
+- Setup response without an active setup session returns `No active setup session`;
+  sending to a closed setup response channel returns `Failed to send response: {e}`.
+- Discovery persistence with no discovered models preserves existing rows; a
+  non-empty result deletes stale rows before upserting models and parameters.
 - Resume acceptance adapter sees a session in `mutability: read-only` —
   refuses gracefully (delegates to `oulipoly-runtime/session_metadata/
   mutability.rs`).
@@ -110,6 +134,12 @@ or consolidate usage CLI row-state strings with the quota-refresh DTO strings.
 - `AdapterError` — a typed `*_adapter.rs` translation failure.
 - Resume-list loading failure — return `Failed to list resume chains: {e}`.
 - Quota refresh state DB open failure — return `Failed to open state DB: {e}`.
+- Setup memory graph open failure emits `Failed to open memory store: {e}` with
+  `recoverable: false` on the setup event channel.
+- Provider/account validation failures return `Account id cannot be empty`,
+  `Account provider cannot be empty`, or `Account profile_name cannot be empty`;
+  missing providers return `Provider '{name}' not found`.
+- Discovery blocking task join failures return `Discovery task failed: {e}`.
 
 ## Boundaries
 
