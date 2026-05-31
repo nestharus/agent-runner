@@ -1,4 +1,4 @@
-//! Declared roles: orchestration, accessor, formatter, validator
+//! Declared roles: orchestration, accessor, formatter, validator, mapper
 
 use super::formatter::{emit_export_error, emit_metadata_error};
 use super::mapper::{self, ExportOutputOutcome};
@@ -6,8 +6,9 @@ use super::validator::{validate_locate_session_id, validate_session_export_args}
 use crate::cli::paths::{default_config_root, default_models_dir};
 use crate::wiring;
 use oulipoly_config::{ModelConfig, ProvidersConfig, load_models};
+use oulipoly_runtime::provider_registry::{ProviderRegistry, ProviderRegistryOptions};
 use oulipoly_runtime::session_export::ExportError;
-use oulipoly_runtime::session_metadata::locate_session_metadata;
+use oulipoly_runtime::session_metadata::locate_session_metadata_with_provider_dispatch;
 use oulipoly_state::StateDb;
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -29,13 +30,16 @@ fn run_valid_session_locate(session_id: &str) -> Result<i32, String> {
         Ok(env) => env,
         Err(exit_code) => return Ok(exit_code),
     };
-    crate::session_metadata_cli::render_session_metadata(locate_session_metadata(
-        &env.state,
-        &env.models,
-        &env.providers_cfg,
-        &env.sessions_cfg,
-        session_id,
-    ))
+    crate::session_metadata_cli::render_session_metadata(
+        locate_session_metadata_with_provider_dispatch(
+            &env.state,
+            &env.models,
+            &env.providers_cfg,
+            &env.sessions_cfg,
+            Some(&env.provider_registry),
+            session_id,
+        ),
+    )
 }
 
 fn load_session_locate_environment_or_exit() -> Result<SessionLocateEnvironment, i32> {
@@ -47,6 +51,7 @@ pub(super) struct SessionLocateEnvironment {
     pub(super) providers_cfg: ProvidersConfig,
     pub(super) models: HashMap<String, ModelConfig>,
     pub(super) sessions_cfg: oulipoly_config::SessionsConfig,
+    pub(super) provider_registry: ProviderRegistry,
 }
 
 impl SessionLocateEnvironment {
@@ -55,33 +60,89 @@ impl SessionLocateEnvironment {
         providers_cfg: ProvidersConfig,
         models: HashMap<String, ModelConfig>,
         sessions_cfg: oulipoly_config::SessionsConfig,
+        provider_registry: ProviderRegistry,
     ) -> Self {
-        mapper::session_locate_environment(state, providers_cfg, models, sessions_cfg)
+        mapper::session_locate_environment(
+            state,
+            providers_cfg,
+            models,
+            sessions_cfg,
+            provider_registry,
+        )
     }
 }
 
 fn load_session_locate_environment() -> Result<SessionLocateEnvironment, i32> {
-    load_session_locate_environment_result().map_err(|message| {
-        let err = mapper::operational_metadata_error(message);
-        emit_metadata_error(&err);
-        1
-    })
+    load_session_locate_environment_result()
+        .map_err(map_session_locate_environment_error)
+        .map_err(emit_session_locate_environment_error)
+}
+
+fn map_session_locate_environment_error(
+    message: String,
+) -> oulipoly_runtime::session_metadata::MetadataError {
+    mapper::operational_metadata_error(message)
+}
+
+fn emit_session_locate_environment_error(
+    error: oulipoly_runtime::session_metadata::MetadataError,
+) -> i32 {
+    emit_metadata_error(&error);
+    1
 }
 
 fn load_session_locate_environment_result() -> Result<SessionLocateEnvironment, String> {
-    let state = StateDb::open_default()?;
     let config_root = default_config_root();
-    let providers_cfg = oulipoly_config::ProvidersConfig::load(&config_root.join("providers.toml"))
-        .unwrap_or_default();
-    let models = load_models(&default_models_dir(), Some(&providers_cfg))?;
-    let sessions_cfg = oulipoly_config::SessionsConfig::load(&config_root.join("sessions.toml"))
-        .unwrap_or_default();
+    let state = open_default_locate_state()?;
+    let providers_cfg = load_default_locate_providers(&config_root);
+    let models = load_default_locate_models(&providers_cfg)?;
+    let sessions_cfg = load_default_locate_sessions(&config_root);
+    let provider_registry = build_session_locate_provider_registry(&models, config_root)?;
     Ok(SessionLocateEnvironment::new(
         state,
         providers_cfg,
         models,
         sessions_cfg,
+        provider_registry,
     ))
+}
+
+fn open_default_locate_state() -> Result<StateDb, String> {
+    StateDb::open_default()
+}
+
+fn load_default_locate_providers(config_root: &std::path::Path) -> ProvidersConfig {
+    oulipoly_config::ProvidersConfig::load(&config_root.join("providers.toml")).unwrap_or_default()
+}
+
+fn load_default_locate_models(
+    providers_cfg: &ProvidersConfig,
+) -> Result<HashMap<String, ModelConfig>, String> {
+    load_models(&default_models_dir(), Some(providers_cfg)).map_err(|error| error.to_string())
+}
+
+fn load_default_locate_sessions(config_root: &std::path::Path) -> oulipoly_config::SessionsConfig {
+    oulipoly_config::SessionsConfig::load(&config_root.join("sessions.toml")).unwrap_or_default()
+}
+
+fn build_session_locate_provider_registry(
+    models: &HashMap<String, ModelConfig>,
+    config_root: std::path::PathBuf,
+) -> Result<ProviderRegistry, String> {
+    ProviderRegistry::from_model_configs(
+        &models.values().cloned().collect::<Vec<_>>(),
+        ProviderRegistryOptions::default()
+            .with_config_root(config_root)
+            .with_data_root(default_data_root()?),
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn default_data_root() -> Result<std::path::PathBuf, String> {
+    oulipoly_state::StateDb::default_path()?
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .ok_or_else(|| "Could not determine data root".to_string())
 }
 
 pub(crate) fn run_session_export(

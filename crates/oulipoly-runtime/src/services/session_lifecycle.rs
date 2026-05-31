@@ -4,22 +4,32 @@
 //! Session lifecycle orchestration helper. It sequences invocation lookup,
 //! provider scanning, session-window selection, and marker emission.
 
-use super::dtos::{SessionLifecycleIngestMode, SessionLifecycleOutput, SessionLifecycleRequest};
+use super::dtos::{
+    SessionLifecycleIngestMode, SessionLifecycleOutput, SessionLifecycleRequest,
+    SessionServiceExternalProviderIdentity,
+};
 use super::error::ServiceError;
 use super::marker::{emit_known_session_id_for_service, emit_pinned_session_id_for_service};
 use super::session_warning::write_session_ingest_warning;
 use super::session_window::find_session_for_invocation_window;
+use crate::provider_registry::ProviderRegistryHandle;
+use crate::session_provider::{self, SessionProviderIdentity, SessionProviderLifecycleContext};
 use oulipoly_state::{InvocationRecord, StateDb};
 use std::io::Write;
 
-pub(super) fn ingest_session(
+const S7A_READ_TURNS_SUBCOMMAND: &str = "session.read_turns";
+const S7A_CAPTURE_SUBCOMMAND: &str = "session.capture";
+
+pub(super) fn ingest_session_with_registry(
     request: SessionLifecycleRequest<'_>,
+    provider_registry: Option<&ProviderRegistryHandle>,
 ) -> Result<SessionLifecycleOutput, ServiceError> {
     let SessionLifecycleRequest {
         state,
         sessions_cfg,
         providers_cfg,
         provider_name,
+        external_provider,
         invocation_row_id,
         invocation_uuid,
         effective_cwd,
@@ -50,8 +60,23 @@ pub(super) fn ingest_session(
         );
     };
 
-    let report = crate::sessions::scan_provider(provider_name, sessions_cfg, state);
-    emit_session_scan_errors(stderr, provider_name, report.errors)?;
+    let provider_capture_session_id = match external_provider {
+        Some(identity) => ingest_external_provider_session(ExternalSessionIngestRequest {
+            state,
+            provider_registry,
+            identity,
+            invocation: &invocation,
+            invocation_row_id,
+            invocation_uuid,
+            effective_cwd,
+            mode: &mode,
+        })?,
+        None => {
+            let report = crate::sessions::scan_provider(provider_name, sessions_cfg, state);
+            emit_session_scan_errors(stderr, provider_name, report.errors)?;
+            None
+        }
+    };
     let matched_session_id = resolve_session_window_match(SessionWindowMatchRequest {
         state,
         providers_cfg,
@@ -62,6 +87,7 @@ pub(super) fn ingest_session(
         stderr,
         invocation_uuid,
     })?;
+    let matched_session_id = provider_capture_session_id.or(matched_session_id);
 
     emit_session_lifecycle_output(
         state,
@@ -74,6 +100,76 @@ pub(super) fn ingest_session(
     )
 }
 
+struct ExternalSessionIngestRequest<'a> {
+    state: &'a StateDb,
+    provider_registry: Option<&'a ProviderRegistryHandle>,
+    identity: SessionServiceExternalProviderIdentity,
+    invocation: &'a InvocationRecord,
+    invocation_row_id: i64,
+    invocation_uuid: &'a str,
+    effective_cwd: Option<&'a std::path::Path>,
+    mode: &'a SessionLifecycleIngestMode,
+}
+
+fn ingest_external_provider_session(
+    request: ExternalSessionIngestRequest<'_>,
+) -> Result<Option<String>, ServiceError> {
+    let registry = request
+        .provider_registry
+        .ok_or_else(external_provider_registry_unavailable)?
+        .current();
+    let context = external_provider_context(&request, registry.as_ref());
+    let turns = session_provider::read_turns_for_lifecycle(&context)
+        .map_err(|error| external_provider_service_error(S7A_READ_TURNS_SUBCOMMAND, error))?;
+    session_provider::ingest_owned_turns(request.state, &request.identity.provider_name, &turns)
+        .map_err(|error| external_provider_service_error(S7A_READ_TURNS_SUBCOMMAND, error))?;
+    let capture = session_provider::capture_for_lifecycle(&context)
+        .map_err(|error| external_provider_service_error(S7A_CAPTURE_SUBCOMMAND, error))?;
+    Ok(capture.provider_session_id)
+}
+
+fn external_provider_context<'a>(
+    request: &'a ExternalSessionIngestRequest<'a>,
+    registry: &'a crate::provider_registry::ProviderRegistry,
+) -> SessionProviderLifecycleContext<'a> {
+    SessionProviderLifecycleContext {
+        registry,
+        identity: SessionProviderIdentity {
+            model_name: request.identity.model_name.clone(),
+            provider_name: request.identity.provider_name.clone(),
+            provider_instance_id: request.identity.provider_instance_id.clone(),
+            settings_id: request.identity.settings_id.clone(),
+        },
+        invocation_uuid: request.invocation_uuid,
+        invocation_row_id: request.invocation_row_id,
+        effective_cwd: request.effective_cwd,
+        pinned_target: pinned_target(request.mode),
+        start_bound_provider_session_id: request.invocation.provider_session_id.as_deref(),
+    }
+}
+
+fn pinned_target(mode: &SessionLifecycleIngestMode) -> Option<&str> {
+    match mode {
+        SessionLifecycleIngestMode::Pinned { resume_target } => Some(resume_target),
+        SessionLifecycleIngestMode::Unpinned { .. } => None,
+    }
+}
+
+fn external_provider_registry_unavailable() -> ServiceError {
+    ServiceError::Unavailable {
+        message: "session_provider_registry_unavailable".to_string(),
+    }
+}
+
+fn external_provider_service_error(
+    subcommand: &str,
+    error: session_provider::SessionProviderError,
+) -> ServiceError {
+    ServiceError::Unavailable {
+        message: format!("{subcommand}: {error}"),
+    }
+}
+
 fn load_or_warn_for_session_ingest(
     state: &StateDb,
     stderr: &mut dyn Write,
@@ -81,17 +177,56 @@ fn load_or_warn_for_session_ingest(
     invocation_uuid: &str,
     _mode: &SessionLifecycleIngestMode,
 ) -> Result<Option<InvocationRecord>, ServiceError> {
+    handle_invocation_load_outcome(
+        stderr,
+        invocation_uuid,
+        invocation_load_outcome(state, invocation_uuid),
+    )
+}
+
+enum InvocationLoadOutcome {
+    Found(Box<InvocationRecord>),
+    Missing,
+    Failed(String),
+}
+
+fn invocation_load_outcome(state: &StateDb, invocation_uuid: &str) -> InvocationLoadOutcome {
     match load_invocation_for_session_ingest(state, invocation_uuid) {
-        Ok(Some(row)) => Ok(Some(row)),
-        Ok(None) => {
-            write_missing_invocation_warning(stderr, invocation_uuid)?;
-            Ok(None)
-        }
-        Err(err) => {
-            write_invocation_load_failure_warning(stderr, invocation_uuid, err)?;
-            Ok(None)
+        Ok(Some(row)) => InvocationLoadOutcome::Found(Box::new(row)),
+        Ok(None) => InvocationLoadOutcome::Missing,
+        Err(err) => InvocationLoadOutcome::Failed(err),
+    }
+}
+
+fn handle_invocation_load_outcome(
+    stderr: &mut dyn Write,
+    invocation_uuid: &str,
+    outcome: InvocationLoadOutcome,
+) -> Result<Option<InvocationRecord>, ServiceError> {
+    match outcome {
+        InvocationLoadOutcome::Found(row) => Ok(Some(*row)),
+        InvocationLoadOutcome::Missing => missing_invocation_fallback(stderr, invocation_uuid),
+        InvocationLoadOutcome::Failed(err) => {
+            invocation_load_failure_fallback(stderr, invocation_uuid, err)
         }
     }
+}
+
+fn missing_invocation_fallback(
+    stderr: &mut dyn Write,
+    invocation_uuid: &str,
+) -> Result<Option<InvocationRecord>, ServiceError> {
+    write_missing_invocation_warning(stderr, invocation_uuid)?;
+    Ok(None)
+}
+
+fn invocation_load_failure_fallback(
+    stderr: &mut dyn Write,
+    invocation_uuid: &str,
+    err: String,
+) -> Result<Option<InvocationRecord>, ServiceError> {
+    write_invocation_load_failure_warning(stderr, invocation_uuid, err)?;
+    Ok(None)
 }
 
 struct SessionWindowMatchRequest<'a> {
@@ -106,9 +241,16 @@ struct SessionWindowMatchRequest<'a> {
 }
 
 fn resolve_session_window_match(
-    request: SessionWindowMatchRequest<'_>,
+    mut request: SessionWindowMatchRequest<'_>,
 ) -> Result<Option<String>, ServiceError> {
-    match find_session_for_invocation_window(
+    let result = session_window_match_result(&mut request);
+    handle_session_window_match_result(request.stderr, request.invocation_uuid, result)
+}
+
+fn session_window_match_result(
+    request: &mut SessionWindowMatchRequest<'_>,
+) -> Result<Option<String>, String> {
+    find_session_for_invocation_window(
         request.state,
         request.providers_cfg,
         request.provider_name,
@@ -116,17 +258,27 @@ fn resolve_session_window_match(
         request.finished_at,
         request.effective_cwd,
         request.stderr,
-    ) {
+    )
+}
+
+fn handle_session_window_match_result(
+    stderr: &mut dyn Write,
+    invocation_uuid: &str,
+    result: Result<Option<String>, String>,
+) -> Result<Option<String>, ServiceError> {
+    match result {
         Ok(session_id) => Ok(session_id),
-        Err(err) => {
-            write_session_window_match_failure_warning(
-                request.stderr,
-                request.invocation_uuid,
-                err,
-            )?;
-            Ok(None)
-        }
+        Err(err) => session_window_match_failure_fallback(stderr, invocation_uuid, err),
     }
+}
+
+fn session_window_match_failure_fallback(
+    stderr: &mut dyn Write,
+    invocation_uuid: &str,
+    err: String,
+) -> Result<Option<String>, ServiceError> {
+    write_session_window_match_failure_warning(stderr, invocation_uuid, err)?;
+    Ok(None)
 }
 
 fn load_invocation_for_session_ingest(
@@ -160,12 +312,13 @@ fn emit_session_scan_errors(
     errors: Vec<String>,
 ) -> Result<(), ServiceError> {
     for err in errors {
-        write_session_ingest_warning(
-            stderr,
-            &format!("Session ingest failed for {provider_name}: {err}"),
-        )?;
+        write_session_ingest_warning(stderr, &session_scan_error_warning(provider_name, &err))?;
     }
     Ok(())
+}
+
+fn session_scan_error_warning(provider_name: &str, error: &str) -> String {
+    format!("Session ingest failed for {provider_name}: {error}")
 }
 
 fn emit_session_lifecycle_output(

@@ -349,7 +349,7 @@ fn run_with_balancing_environment(
                             zero_turn_provider_session_id.as_deref(),
                         ),
                         (&result, &balanced_terminal_signal, &mut terminal_signal_ctx),
-                        (all_models, working_dir),
+                        (model, all_models, working_dir),
                         (attempts, max_attempts),
                     ))
                 }

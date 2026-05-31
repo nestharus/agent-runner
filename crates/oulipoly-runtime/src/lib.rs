@@ -12,6 +12,7 @@ pub mod services;
 pub mod session_export;
 pub mod session_lock;
 pub mod session_metadata;
+pub mod session_provider;
 pub mod session_replace;
 pub mod sessions;
 pub mod trace;

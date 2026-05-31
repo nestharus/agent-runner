@@ -80,11 +80,20 @@ pub struct SessionLifecycleRequest<'a> {
     pub sessions_cfg: &'a oulipoly_config::SessionsConfig,
     pub providers_cfg: Option<&'a oulipoly_config::ProvidersConfig>,
     pub provider_name: &'a str,
+    pub external_provider: Option<SessionServiceExternalProviderIdentity>,
     pub invocation_row_id: i64,
     pub invocation_uuid: &'a str,
     pub effective_cwd: Option<&'a Path>,
     pub mode: SessionLifecycleIngestMode,
     pub stderr: &'a mut dyn Write,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionServiceExternalProviderIdentity {
+    pub model_name: String,
+    pub provider_name: String,
+    pub provider_instance_id: Option<String>,
+    pub settings_id: String,
 }
 
 #[derive(Debug, Clone)]

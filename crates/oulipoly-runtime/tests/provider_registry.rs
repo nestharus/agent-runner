@@ -1445,6 +1445,10 @@ fn production_service_sources_do_not_route_current_paths_through_provider_regist
         &root,
         "diagnostics/mod.rs",
     ));
+    assert_session_lifecycle_provider_registry_refs_are_s7a_only(
+        &read_runtime_source(&root, "services/adapters.rs"),
+        &read_runtime_source(&root, "services/session_lifecycle.rs"),
+    );
 }
 
 fn provider_registry_forbidden_sources() -> &'static [&'static str] {
@@ -1458,8 +1462,6 @@ fn provider_registry_forbidden_sources() -> &'static [&'static str] {
         "quota/outcome.rs",
         "quota/parse.rs",
         "quota/process.rs",
-        "services/adapters.rs",
-        "services/session_lifecycle.rs",
         "session_export/mod.rs",
         "session_replace/mod.rs",
         "services/migration.rs",
@@ -1526,6 +1528,150 @@ fn assert_diagnostics_classify_exhaustion_branch_has_no_registry(source: &str) {
         )),
         "built-in ClassifyExhaustion branch must not route through provider registry"
     );
+}
+
+fn assert_session_lifecycle_provider_registry_refs_are_s7a_only(
+    adapters_source: &str,
+    lifecycle_source: &str,
+) {
+    assert_adapters_provider_registry_refs_are_s7a_only(adapters_source);
+    assert_lifecycle_provider_registry_refs_are_s7a_only(lifecycle_source);
+    assert_adapters_provider_registry_wiring_terms(adapters_source);
+    assert_lifecycle_provider_registry_dispatch_terms(lifecycle_source);
+    assert_deferred_provider_registry_flows_absent(adapters_source, lifecycle_source);
+}
+
+fn assert_adapters_provider_registry_refs_are_s7a_only(adapters_source: &str) {
+    assert_provider_registry_refs_match_allowed_lines(
+        "services/adapters.rs",
+        adapters_source,
+        &[
+            "use crate::provider_registry::ProviderRegistryHandle;",
+            "provider_registry: Option<ProviderRegistryHandle>,",
+            "pub fn with_registry_handle(provider_registry: ProviderRegistryHandle) -> Self {",
+            "provider_registry: Some(provider_registry),",
+            "self.provider_registry.as_ref(),",
+        ],
+    );
+}
+
+fn assert_lifecycle_provider_registry_refs_are_s7a_only(lifecycle_source: &str) {
+    assert_provider_registry_refs_match_allowed_lines(
+        "services/session_lifecycle.rs",
+        lifecycle_source,
+        &[
+            "use crate::provider_registry::ProviderRegistryHandle;",
+            "provider_registry: Option<&ProviderRegistryHandle>,",
+            "provider_registry,",
+            "provider_registry: Option<&'a ProviderRegistryHandle>,",
+            ".provider_registry",
+            ".ok_or_else(external_provider_registry_unavailable)?",
+            "registry: &'a crate::provider_registry::ProviderRegistry,",
+            "fn external_provider_registry_unavailable() -> ServiceError {",
+            "message: \"session_provider_registry_unavailable\".to_string(),",
+        ],
+    );
+}
+
+fn assert_adapters_provider_registry_wiring_terms(adapters_source: &str) {
+    for expected in [
+        "ProductionSessionLifecycleService",
+        "with_registry_handle",
+        "ProviderRegistryHandle",
+    ] {
+        assert!(
+            adapters_source.contains(expected),
+            "services/adapters.rs may reference provider registry only to wire AGE-243 S7a session lifecycle dispatch: {expected}"
+        );
+    }
+}
+
+fn assert_lifecycle_provider_registry_dispatch_terms(lifecycle_source: &str) {
+    for expected in [
+        "SessionServiceExternalProviderIdentity",
+        "session_provider",
+        "session.read_turns",
+        "session.capture",
+    ] {
+        assert!(
+            lifecycle_source.contains(expected),
+            "services/session_lifecycle.rs may reference provider registry only for AGE-243 S7a read/capture dispatch: {expected}"
+        );
+    }
+}
+
+fn assert_deferred_provider_registry_flows_absent(adapters_source: &str, lifecycle_source: &str) {
+    for forbidden in ["session_export", "session_replace", "migration", "rotation"] {
+        assert_deferred_provider_registry_flow_absent("adapters", adapters_source, forbidden);
+        assert_deferred_provider_registry_flow_absent("lifecycle", lifecycle_source, forbidden);
+    }
+}
+
+fn assert_deferred_provider_registry_flow_absent(label: &str, source: &str, forbidden: &str) {
+    assert!(
+        !source.contains(&deferred_provider_registry_flow_pattern(forbidden)),
+        "S7a must not add provider registry dispatch for deferred {forbidden} flows in {label}"
+    );
+}
+
+fn deferred_provider_registry_flow_pattern(forbidden: &str) -> String {
+    format!("{forbidden}::external_provider")
+}
+
+fn assert_provider_registry_refs_match_allowed_lines(
+    relative: &str,
+    source: &str,
+    allowed_lines: &[&str],
+) {
+    let refs = provider_registry_reference_lines(source);
+    let unexpected_refs = unexpected_provider_registry_reference_lines(&refs, allowed_lines);
+    assert_provider_registry_refs_allowed(relative, &unexpected_refs);
+}
+
+fn unexpected_provider_registry_reference_lines(
+    refs: &[String],
+    allowed_lines: &[&str],
+) -> Vec<String> {
+    refs.iter()
+        .filter(|line| !line_matches_allowed_provider_registry_ref(line, allowed_lines))
+        .cloned()
+        .collect()
+}
+
+fn line_matches_allowed_provider_registry_ref(line: &str, allowed_lines: &[&str]) -> bool {
+    allowed_lines.iter().any(|allowed| line.contains(allowed))
+}
+
+fn assert_provider_registry_refs_allowed(relative: &str, unexpected_refs: &[String]) {
+    assert!(
+        unexpected_refs.is_empty(),
+        "{relative} provider-registry references must stay inside sanctioned S7a session lifecycle construction/read/capture paths: {unexpected_refs:?}"
+    );
+}
+
+fn provider_registry_reference_lines(source: &str) -> Vec<String> {
+    trim_source_lines(filter_provider_registry_reference_lines(source_lines(
+        source,
+    )))
+}
+
+fn source_lines(source: &str) -> Vec<&str> {
+    source.lines().collect()
+}
+
+fn filter_provider_registry_reference_lines(lines: Vec<&str>) -> Vec<&str> {
+    lines
+        .into_iter()
+        .filter(|line| has_provider_registry_reference(line))
+        .collect()
+}
+
+fn trim_source_lines(lines: Vec<&str>) -> Vec<String> {
+    lines.into_iter().map(trim_source_line).collect()
+}
+
+fn trim_source_line(line: &str) -> String {
+    line.trim().to_string()
 }
 
 fn diagnostics_request_branch_until<'a>(

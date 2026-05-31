@@ -135,6 +135,22 @@ impl LocateFixture {
         fs::write(self.models_dir.join(format!("{model_name}.toml")), body).unwrap();
     }
 
+    pub fn write_external_model(
+        &self,
+        model_name: &str,
+        provider_name: &str,
+        provider_path: &Path,
+    ) {
+        self.write_model_body(
+            model_name,
+            &external_model_toml(provider_name, provider_path),
+        );
+    }
+
+    fn write_model_body(&self, model_name: &str, body: &str) {
+        fs::write(self.models_dir.join(format!("{model_name}.toml")), body).unwrap();
+    }
+
     pub fn write_provider(
         &self,
         provider_name: &str,
@@ -465,6 +481,14 @@ cwd_script = {cwd_script:?}
         }
         specs
     }
+}
+
+fn external_model_toml(provider_name: &str, provider_path: &Path) -> String {
+    format!(
+        "provider = {{ path = {:?} }}\n\n[[providers]]\nname = {:?}\n\n",
+        provider_path.display().to_string(),
+        provider_name
+    )
 }
 
 pub fn cli_claude_success_fixture() -> PreparedLocate {

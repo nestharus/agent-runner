@@ -18,6 +18,7 @@
 use super::dtos::*;
 use super::error::ServiceError;
 use super::ports::*;
+use crate::provider_registry::ProviderRegistryHandle;
 use oulipoly_state::StateDb;
 use oulipoly_state::repositories::ResumeRepository;
 
@@ -48,12 +49,20 @@ impl ProductionResumeService {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ProductionSessionLifecycleService;
+#[derive(Debug, Clone, Default)]
+pub struct ProductionSessionLifecycleService {
+    provider_registry: Option<ProviderRegistryHandle>,
+}
 
 impl ProductionSessionLifecycleService {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    pub fn with_registry_handle(provider_registry: ProviderRegistryHandle) -> Self {
+        Self {
+            provider_registry: Some(provider_registry),
+        }
     }
 }
 
@@ -191,7 +200,10 @@ impl SessionLifecycleServicePort for ProductionSessionLifecycleService {
         &self,
         request: SessionLifecycleRequest<'_>,
     ) -> Result<SessionLifecycleOutput, ServiceError> {
-        super::session_lifecycle::ingest_session(request)
+        super::session_lifecycle::ingest_session_with_registry(
+            request,
+            self.provider_registry.as_ref(),
+        )
     }
 }
 
