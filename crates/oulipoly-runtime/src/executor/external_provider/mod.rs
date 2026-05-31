@@ -25,5 +25,6 @@ mod launch_result_mapper;
 mod policy_transform;
 mod request_builder;
 mod terminal_cancel_mapper;
+mod terminal_classify_handoff;
 
 pub(crate) use dispatch::dispatch;

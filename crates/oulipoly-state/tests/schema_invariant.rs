@@ -155,12 +155,13 @@ fn declaration_carriers_present_in_source() {
                 "formatter",
                 "predicate",
                 "orchestration",
+                "validator",
             ][..],
         ),
         ("src-tauri/src/lib.rs", &["none"][..]),
         (
             "src-tauri/src/app_state.rs",
-            &["orchestration", "mapper"][..],
+            &["orchestration", "mapper", "accessor"][..],
         ),
         ("src-tauri/src/app_paths.rs", &["accessor", "mapper"][..]),
         (
@@ -310,6 +311,7 @@ fn declaration_carriers_present_in_source() {
                 "parser",
                 "predicate",
                 "orchestration",
+                "validator",
             ][..],
         ),
         (

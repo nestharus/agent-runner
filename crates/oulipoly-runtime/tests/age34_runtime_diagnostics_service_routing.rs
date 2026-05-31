@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+// Declared roles: mapper, formatter, accessor, orchestration, validator.
+
 use oulipoly_config::{InvocationMode, ModelConfig, PromptMode, ProviderConfig};
 use oulipoly_runtime::diagnostics::{self, ErrorCategory};
 use oulipoly_runtime::services::{
@@ -80,7 +82,7 @@ impl DiagnosticsServicePort for RecordingDiagnosticsService {
         if let Some(provider) = capture_request_provider(&request) {
             store_captured_provider(&self.received_effective_provider, provider);
         }
-        diagnostics::RuntimeDiagnosticsService.diagnose(request)
+        diagnostics::RuntimeDiagnosticsService::default().diagnose(request)
     }
 }
 
@@ -94,7 +96,8 @@ fn runtime_diagnostics_service_classify_mode_matches_direct_classifier() {
     let stderr = "Billing limit reached for this workspace";
     let direct = diagnostics::classify_exhaustion(stderr);
 
-    let service: &dyn DiagnosticsServicePort = &diagnostics::RuntimeDiagnosticsService;
+    let service_impl = diagnostics::RuntimeDiagnosticsService::default();
+    let service: &dyn DiagnosticsServicePort = &service_impl;
     let output = service
         .diagnose(DiagnosticsServiceRequest::ClassifyExhaustion {
             stderr: stderr.to_string(),
@@ -117,48 +120,92 @@ fn runtime_diagnostics_service_classify_mode_matches_direct_classifier() {
 // AGE-27 invariant.
 #[test]
 fn runtime_diagnostics_service_model_backed_mode_matches_direct_diagnose_error() {
+    let fixture = diagnostic_provider_fixture();
+    let model = migrated_diagnostic_model();
+    let provider = effective_diagnostic_provider(fixture.script);
+    let stderr = "opaque child failure from primary provider";
+
+    let direct = direct_diagnosis(&model, &provider, 7, stderr, fixture.dir.path());
+    let output = service_diagnosis_output(&model, &provider, 7, stderr, fixture.dir.path());
+
+    assert_service_diagnosis_matches_direct(output, direct);
+    assert_diagnostic_prompt_dump(&fixture.prompt_dump, stderr);
+}
+
+struct DiagnosticProviderFixture {
+    dir: tempfile::TempDir,
+    script: PathBuf,
+    prompt_dump: PathBuf,
+}
+
+fn diagnostic_provider_fixture() -> DiagnosticProviderFixture {
     let dir = tempfile::tempdir().expect("tempdir");
     let prompt_dump = dir.path().join("diagnostic-prompt.txt");
     let script = dir.path().join("diagnostic-provider.sh");
-    write_executable(
-        &script,
-        &format!(
-            r#"#!/usr/bin/env bash
+    write_executable(&script, &diagnostic_provider_script(&prompt_dump));
+    DiagnosticProviderFixture {
+        dir,
+        script,
+        prompt_dump,
+    }
+}
+
+fn diagnostic_provider_script(prompt_dump: &Path) -> String {
+    format!(
+        r#"#!/usr/bin/env bash
 set -euo pipefail
 cat > "{prompt_dump}"
 printf 'network_error\nDiagnostic model saw network trouble\n'
 "#,
-            prompt_dump = prompt_dump.display()
-        ),
-    );
-    let model = migrated_diagnostic_model();
-    let provider = effective_diagnostic_provider(script);
-    let stderr = "opaque child failure from primary provider";
+        prompt_dump = prompt_dump.display()
+    )
+}
 
-    let direct = diagnostics::diagnose_error(
-        &model,
-        &provider,
+fn direct_diagnosis(
+    model: &ModelConfig,
+    provider: &ProviderConfig,
+    exit_code: i32,
+    stderr: &str,
+    working_dir: &Path,
+) -> diagnostics::Diagnosis {
+    diagnostics::diagnose_error(
+        model,
+        provider,
         0,
         PromptMode::Stdin,
-        7,
+        exit_code,
         stderr,
-        Some(dir.path()),
+        Some(working_dir),
     )
-    .expect("direct diagnose");
+    .expect("direct diagnose")
+}
 
-    let service: &dyn DiagnosticsServicePort = &diagnostics::RuntimeDiagnosticsService;
-    let output = service
+fn service_diagnosis_output(
+    model: &ModelConfig,
+    provider: &ProviderConfig,
+    exit_code: i32,
+    stderr: &str,
+    working_dir: &Path,
+) -> DiagnosticsServiceOutput {
+    let service_impl = diagnostics::RuntimeDiagnosticsService::default();
+    let service: &dyn DiagnosticsServicePort = &service_impl;
+    service
         .diagnose(DiagnosticsServiceRequest::DiagnoseError {
             diagnostics_model: model.clone(),
             effective_provider: provider.clone(),
             provider_index: 0,
             prompt_mode: PromptMode::Stdin,
-            exit_code: 7,
+            exit_code,
             stderr: stderr.to_string(),
-            working_dir: Some(dir.path().to_path_buf()),
+            working_dir: Some(working_dir.to_path_buf()),
         })
-        .expect("service diagnose");
+        .expect("service diagnose")
+}
 
+fn assert_service_diagnosis_matches_direct(
+    output: DiagnosticsServiceOutput,
+    direct: diagnostics::Diagnosis,
+) {
     match output {
         DiagnosticsServiceOutput::Diagnosis { diagnosis } => {
             assert_eq!(diagnosis.category, direct.category);
@@ -167,7 +214,9 @@ printf 'network_error\nDiagnostic model saw network trouble\n'
         }
         other => panic!("expected Diagnosis output, got {other:?}"),
     }
+}
 
+fn assert_diagnostic_prompt_dump(prompt_dump: &Path, stderr: &str) {
     let prompt = std::fs::read_to_string(prompt_dump).expect("prompt dump");
     assert!(prompt.contains("Exit code: 7"), "{prompt}");
     assert!(prompt.contains(stderr), "{prompt}");

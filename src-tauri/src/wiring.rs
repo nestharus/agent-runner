@@ -96,7 +96,9 @@ impl AgentRuntimeServices {
             quota_service: Arc::new(RuntimeQuotaService::with_registry_handle(
                 provider_registry_handle.clone(),
             )),
-            diagnostics_service: Arc::new(RuntimeDiagnosticsService),
+            diagnostics_service: Arc::new(RuntimeDiagnosticsService::with_registry_handle(
+                provider_registry_handle.clone(),
+            )),
             provider_registry,
             provider_registry_handle,
             provider_registry_options,
@@ -141,7 +143,9 @@ impl AgentRuntimeServices {
             quota_service: Arc::new(RuntimeQuotaService::with_registry_handle(
                 provider_registry_handle.clone(),
             )),
-            diagnostics_service: Arc::new(RuntimeDiagnosticsService),
+            diagnostics_service: Arc::new(RuntimeDiagnosticsService::with_registry_handle(
+                provider_registry_handle.clone(),
+            )),
             provider_registry,
             provider_registry_handle,
             provider_registry_options: registry_options,

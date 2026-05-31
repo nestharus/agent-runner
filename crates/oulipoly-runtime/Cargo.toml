@@ -8,6 +8,7 @@ rust-version.workspace = true
 name = "oulipoly_runtime"
 
 [dependencies]
+base64 = "0.22"
 chrono.workspace = true
 dirs.workspace = true
 fs4.workspace = true

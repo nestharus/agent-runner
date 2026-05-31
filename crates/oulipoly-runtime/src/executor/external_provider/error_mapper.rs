@@ -1,6 +1,8 @@
-//! Role: mapper.
+//! Role: mapper, predicate.
 
-use super::error_formatter::format_external_dispatch_error;
+use super::error_formatter::{
+    format_external_dispatch_error, format_external_input_validation_error,
+};
 use super::errors::ExternalProviderDispatchError;
 use crate::provider_registry::ProviderRegistryError;
 use crate::services::ServiceError;
@@ -60,6 +62,12 @@ pub(crate) fn protocol_service_error(category: &'static str) -> ServiceError {
     service_error(ExternalProviderDispatchError::provider_protocol_failure(
         category,
     ))
+}
+
+pub(crate) fn invalid_provider_input_error(message: String) -> ServiceError {
+    ServiceError::InvalidRequest {
+        message: format_external_input_validation_error(&message),
+    }
 }
 
 pub(crate) fn service_error(error: ExternalProviderDispatchError) -> ServiceError {

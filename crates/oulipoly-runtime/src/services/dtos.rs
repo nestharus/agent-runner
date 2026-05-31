@@ -3,19 +3,34 @@
 //!
 //! Service DTO contract carrier. This module owns request and output shapes only;
 //! production adapters and helper orchestration live in sibling modules.
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-runtime/src/services/dtos.rs
+//!     role: intrinsic-surface
+//!     Domain: service-boundary DTO carrier
+//!     Owns:
+//!       - service request DTOs
+//!       - service output DTOs
+//!       - byte-carrying terminal-classify request DTO
+//!       - terminal-classify output DTO
+//! ```
 
 use crate::diagnostics::Diagnosis;
 use crate::executor::ExecutionResult;
+use crate::executor::terminal_signal::TerminalSignal;
 use crate::quota::{InFlight, RefreshOutcome};
 use crate::session_export::ExportError;
 use crate::session_lock::{Lease, LockError, ReleaseReceipt};
 use crate::session_replace::{ReplaceError, ReplaceReceipt, ReplaceSource};
 use crate::trace::{TraceOptions, TraceReport};
 use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig, ProvidersConfig, SessionsConfig};
+use oulipoly_provider::generated::ProcessStatus;
 use oulipoly_state::{ResumeError, StateDb};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 macro_rules! service_dto {
     ($($name:ident),+ $(,)?) => {
@@ -274,6 +289,7 @@ pub enum DiagnosticsServiceRequest {
     ClassifyExhaustion {
         stderr: String,
     },
+    ClassifyTerminal(TerminalClassifyServiceRequest),
     DiagnoseError {
         diagnostics_model: ModelConfig,
         effective_provider: ProviderConfig,
@@ -288,7 +304,26 @@ pub enum DiagnosticsServiceRequest {
 #[derive(Debug)]
 pub enum DiagnosticsServiceOutput {
     ExhaustionClassification { is_exhausted: bool },
+    TerminalClassification(TerminalClassification),
     Diagnosis { diagnosis: Diagnosis },
+}
+
+#[derive(Debug, Clone)]
+pub struct TerminalClassifyServiceRequest {
+    pub model_name: String,
+    pub provider_name: String,
+    pub settings_id: String,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub status: ProcessStatus,
+    pub observed_at: SystemTime,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TerminalClassification {
+    pub exit_code: i32,
+    pub terminal_reason: Option<String>,
+    pub terminal_signal: TerminalSignal,
 }
 
 pub struct RoutingServiceRequest<'a> {

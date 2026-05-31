@@ -186,7 +186,7 @@ fn age_34_runtime_service_adapters_are_send_sync_trait_object_usable() {
     let _: Box<dyn QuotaServicePort + Send + Sync> =
         Box::new(oulipoly_runtime::quota::RuntimeQuotaService);
     let _: Box<dyn DiagnosticsServicePort + Send + Sync> =
-        Box::new(oulipoly_runtime::diagnostics::RuntimeDiagnosticsService);
+        Box::new(oulipoly_runtime::diagnostics::RuntimeDiagnosticsService::default());
 }
 
 #[test]

@@ -25,3 +25,7 @@ pub(crate) fn format_external_dispatch_error(error: ExternalProviderDispatchErro
         }
     }
 }
+
+pub(crate) fn format_external_input_validation_error(message: &str) -> String {
+    format!("external provider input validation failed: {message}")
+}

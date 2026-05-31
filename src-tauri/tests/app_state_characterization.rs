@@ -106,7 +106,7 @@ fn assert_test_default_service_wiring(source: &str) {
         "providers_config:Arc::new(FilesystemProvidersConfigRepository)",
         "quota_service:Arc::new(oulipoly_runtime::quota::RuntimeQuotaService::with_registry_handle(provider_registry.clone()",
         "executor_service:Arc::new(oulipoly_runtime::executor::RuntimeExecutorService::with_registry_handle(provider_registry.clone()",
-        "diagnostics_service:Arc::new(oulipoly_runtime::diagnostics::RuntimeDiagnosticsService)",
+        "diagnostics_service:Arc::new(oulipoly_runtime::diagnostics::RuntimeDiagnosticsService::with_registry_handle(provider_registry.clone()",
         "provider_registry",
     ] {
         assert!(
@@ -138,13 +138,20 @@ fn compact(source: &str) -> String {
 }
 
 fn function_body<'a>(source: &'a str, marker: &str) -> &'a str {
-    let start = source
+    let start = function_marker_index(source, marker);
+    let end = function_body_end(&source[start..], marker);
+    &source[start..start + end]
+}
+
+fn function_marker_index(source: &str, marker: &str) -> usize {
+    source
         .find(marker)
-        .unwrap_or_else(|| panic!("missing function marker {marker}"));
-    let after = &source[start..];
-    let next_fn = after[marker.len()..]
+        .unwrap_or_else(|| panic!("missing function marker {marker}"))
+}
+
+fn function_body_end(after: &str, marker: &str) -> usize {
+    after[marker.len()..]
         .find("fn")
         .map(|offset| marker.len() + offset)
-        .unwrap_or(after.len());
-    &after[..next_fn]
+        .unwrap_or(after.len())
 }
