@@ -82,6 +82,7 @@ mod terminal_signal;
 pub use headless::{
     execute, execute_effective, execute_effective_with_start_known_provider_session_id,
 };
+pub(crate) use input_flags::resolve_input_flags;
 pub use interactive::{
     InteractiveExecutionResult, execute_interactive, execute_interactive_with_result,
 };

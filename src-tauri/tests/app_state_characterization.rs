@@ -76,8 +76,9 @@ fn app_state_constructor_and_fallback_surface_remain_anchored() {
         "state_db_opener:Arc::new(ProductionStateDbOpener)",
         "providers_config:Arc::new(FilesystemProvidersConfigRepository)",
         "quota_service:Arc::new(oulipoly_runtime::quota::RuntimeQuotaService)",
-        "executor_service:Arc::new(oulipoly_runtime::executor::RuntimeExecutorService)",
+        "executor_service:Arc::new(oulipoly_runtime::executor::RuntimeExecutorService::with_registry_handle(provider_registry.clone()",
         "diagnostics_service:Arc::new(oulipoly_runtime::diagnostics::RuntimeDiagnosticsService)",
+        "provider_registry",
     ] {
         assert!(
             test_default_body.contains(required),

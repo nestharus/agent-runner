@@ -93,7 +93,10 @@ fn age38_wiring_constructors_initialize_gui_cutover_service_ports() {
         let body = source_block_after(&source, constructor);
         assert!(
             body.contains("executor_service: Arc::new(RuntimeExecutorService::new())")
-                || body.contains("executor_service: Arc::new(RuntimeExecutorService)"),
+                || body.contains("executor_service: Arc::new(RuntimeExecutorService)")
+                || body.contains(
+                    "executor_service: Arc::new(RuntimeExecutorService::with_registry_handle("
+                ),
             "{constructor} must initialize RuntimeExecutorService"
         );
         assert!(
@@ -107,8 +110,11 @@ fn age38_wiring_constructors_initialize_gui_cutover_service_ports() {
             "{constructor} must initialize RuntimeDiagnosticsService"
         );
         assert!(
-            body.contains("provider_registry: Arc::new("),
-            "{constructor} must initialize the AGE-214 provider registry"
+            body.contains("let provider_registry =")
+                && body.contains("Arc::new(")
+                && body.contains("let provider_registry_handle = ProviderRegistryHandle::new(")
+                && body.contains("provider_registry_handle,"),
+            "{constructor} must initialize the provider registry and shared handle"
         );
         assert!(
             !body.contains("describe_model_provider")

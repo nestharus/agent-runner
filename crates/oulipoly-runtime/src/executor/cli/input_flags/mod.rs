@@ -30,7 +30,7 @@ use std::collections::HashMap;
 /// Map user-provided inputs to CLI flag arguments based on the model's input
 /// schema. Orchestrates validation and formatting; preserves unknown-input
 /// passthrough behavior.
-pub(super) fn resolve_input_flags(
+pub(crate) fn resolve_input_flags(
     model: &ModelConfig,
     extra_inputs: &HashMap<String, Vec<String>>,
 ) -> Result<Vec<String>, String> {

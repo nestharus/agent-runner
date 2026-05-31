@@ -18,7 +18,7 @@
 //!       - Tauri command registration contract
 //! ```
 
-use crate::{AppState, app_paths, provider_settings};
+use crate::{AppState, app_paths, app_state, provider_settings};
 use oulipoly_config as config;
 
 #[tauri::command]
@@ -33,6 +33,7 @@ pub fn reload_models_inner(state: &AppState) -> Result<(), String> {
     let mut models = state.models.lock().map_err(|e| e.to_string())?;
     *models = fresh;
     drop(models);
+    app_state::refresh_provider_registry(state)?;
     provider_settings::refresh_provider_settings_host(state)?;
     Ok(())
 }

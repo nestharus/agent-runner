@@ -62,6 +62,24 @@ fn launch_request_and_event_fixtures_validate_against_schema_targets() {
     }
 }
 
+#[test]
+fn policy_response_schema_permits_absent_empty_argv_and_env() {
+    let response = json!({
+        "contract": "oulipoly.provider/v1",
+        "request_id": "req-policy",
+        "ok": true,
+        "result": {
+            "accepted": true,
+            "stdin": null,
+            "prompt": null,
+            "diagnostics": [],
+            "markers": []
+        }
+    });
+
+    validate_against_def("policy", "PolicyEvaluateResponse", &response);
+}
+
 fn validate_against_def(capability: &str, definition: &str, instance: &Value) {
     let mut schema = load_json(&schema_file_for(capability));
     let common = load_json(&schema_file_for("common"));

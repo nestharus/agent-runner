@@ -12,9 +12,7 @@ fn main() {
     let mode = env::var("FAKE_PROVIDER_MODE").unwrap_or_else(|_| "success".to_owned());
     let code = match mode.as_str() {
         "record-argv-stdin" => record_argv_stdin(),
-        "s5-record-argv-stdin" => {
-            record_argv_stdin_with_response_kind(ResponseKind::S5Success)
-        }
+        "s5-record-argv-stdin" => record_argv_stdin_with_response_kind(ResponseKind::S5Success),
         "stdin-eof" => stdin_eof(),
         "success" => success(),
         "s5-success" => s5_success(),
@@ -72,13 +70,15 @@ fn main() {
             6
         }
         "launch-provider-nonzero-no-final" => {
-            write_jsonl(&stdout_event(1, "YQ=="));
+            let request_id = read_request_id();
+            write_jsonl(&stdout_event(&request_id, 1, "YQ=="));
             8
         }
         "launch-cancelled-final-event" => {
-            write_jsonl(&stdout_event(1, "YQ=="));
+            let request_id = read_request_id();
+            write_jsonl(&stdout_event(&request_id, 1, "YQ=="));
             thread::sleep(Duration::from_millis(150));
-            write_jsonl(&cancelled_exit_event(2));
+            write_jsonl(&cancelled_exit_event(&request_id, 2));
             0
         }
         "launch-malformed-line" => write_stdout("{not-json}\n"),
@@ -91,34 +91,40 @@ fn main() {
             write_stdout("{not-json}\n")
         }
         "launch-blank-line" => {
-            write_jsonl(&stdout_event(1, "YQ=="));
+            let request_id = read_request_id();
+            write_jsonl(&stdout_event(&request_id, 1, "YQ=="));
             println!("   ");
-            write_jsonl(&exit_event(2, 0));
+            write_jsonl(&exit_event(&request_id, 2, 0));
             0
         }
         "launch-exit-then-large-stdout" => {
-            write_jsonl(&exit_event(1, 0));
+            let request_id = read_request_id();
+            write_jsonl(&exit_event(&request_id, 1, 0));
             print!("{}", "x".repeat(1024 * 1024));
             let _ = io::stdout().flush();
             0
         }
         "launch-invalid-base64" => {
-            write_jsonl(&stdout_event(1, "@@@"));
-            write_jsonl(&exit_event(2, 0));
+            let request_id = read_request_id();
+            write_jsonl(&stdout_event(&request_id, 1, "@@@"));
+            write_jsonl(&exit_event(&request_id, 2, 0));
             0
         }
         "launch-duplicate-exit" => {
-            write_jsonl(&exit_event(1, 0));
-            write_jsonl(&exit_event(2, 0));
+            let request_id = read_request_id();
+            write_jsonl(&exit_event(&request_id, 1, 0));
+            write_jsonl(&exit_event(&request_id, 2, 0));
             0
         }
         "launch-event-after-exit" => {
-            write_jsonl(&exit_event(1, 0));
-            write_jsonl(&stdout_event(2, "Yg=="));
+            let request_id = read_request_id();
+            write_jsonl(&exit_event(&request_id, 1, 0));
+            write_jsonl(&stdout_event(&request_id, 2, "Yg=="));
             0
         }
         "launch-partial-hang" => {
-            write_jsonl(&stdout_event(1, "YQ=="));
+            let request_id = read_request_id();
+            write_jsonl(&stdout_event(&request_id, 1, "YQ=="));
             let _ = io::stdout().flush();
             sleep_forever()
         }
@@ -183,14 +189,15 @@ struct ProviderErrorFields<'a> {
 }
 
 fn record_argv_stdin_with_response_kind(kind: ResponseKind) -> i32 {
-    record_current_invocation();
-    write_response_for_kind(kind)
+    let record = record_current_invocation();
+    write_response_for_kind(kind, Some(&record.stdin))
 }
 
-fn record_current_invocation() {
+fn record_current_invocation() -> InvocationRecord {
     let record = current_invocation_record();
     let text = format_invocation_record(&record);
     write_invocation_record(&record.path, &text);
+    record
 }
 
 fn current_invocation_record() -> InvocationRecord {
@@ -202,7 +209,11 @@ fn current_invocation_record() -> InvocationRecord {
 }
 
 fn format_invocation_record(record: &InvocationRecord) -> String {
-    format!("argv:\n{}\nstdin:\n{}", record.argv.join("\n"), record.stdin)
+    format!(
+        "argv:\n{}\nstdin:\n{}",
+        record.argv.join("\n"),
+        record.stdin
+    )
 }
 
 fn write_invocation_record(path: &str, text: &str) {
@@ -212,9 +223,9 @@ fn write_invocation_record(path: &str, text: &str) {
     fs::write(path, text).expect("record file should be writable");
 }
 
-fn write_response_for_kind(kind: ResponseKind) -> i32 {
+fn write_response_for_kind(kind: ResponseKind, stdin: Option<&str>) -> i32 {
     if launch_subcommand_requested() {
-        write_launch_success_events()
+        write_launch_success_events(stdin.unwrap_or_default())
     } else {
         write_stdout(&response_json_for_kind(kind))
     }
@@ -224,9 +235,10 @@ fn launch_subcommand_requested() -> bool {
     env::args().any(|arg| arg == "launch")
 }
 
-fn write_launch_success_events() -> i32 {
-    write_jsonl(&stdout_event(1, "YQ=="));
-    write_jsonl(&exit_event(2, 0));
+fn write_launch_success_events(stdin: &str) -> i32 {
+    let request_id = request_id_from_stdin(stdin);
+    write_jsonl(&stdout_event(&request_id, 1, "YQ=="));
+    write_jsonl(&exit_event(&request_id, 2, 0));
     0
 }
 
@@ -285,9 +297,10 @@ fn terminal_signal_for_exit_code(code: i32) -> &'static str {
     }
 }
 
-fn launch_exit_event_json(seq: u64, code: i32, signal: &str) -> String {
+fn launch_exit_event_json(request_id: &str, seq: u64, code: i32, signal: &str) -> String {
+    let request_id = json_escape(request_id);
     format!(
-        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{REQUEST_ID}\",\"seq\":{seq},\"time_unix_ms\":{},\"kind\":\"exit\",\"status\":{{\"kind\":\"exited\",\"code\":{code}}},\"terminal_signal\":{{\"kind\":\"{signal}\",\"evidence\":\"fake-provider exit event\",\"observed_at_unix_ms\":{}}},\"session\":{{\"provider_session_id\":\"example-session\"}}}}",
+        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"seq\":{seq},\"time_unix_ms\":{},\"kind\":\"exit\",\"status\":{{\"kind\":\"exited\",\"code\":{code}}},\"terminal_signal\":{{\"kind\":\"{signal}\",\"evidence\":\"fake-provider exit event\",\"observed_at_unix_ms\":{}}},\"session\":{{\"provider_session_id\":\"example-session\"}}}}",
         1000 + seq,
         1000 + seq
     )
@@ -477,12 +490,12 @@ fn early_stdin_empty() -> i32 {
 }
 
 fn launch_valid(exit_code: i32) -> i32 {
-    let _ = read_stdin_to_string();
-    write_jsonl(&stdout_event(1, "AAH/"));
-    write_jsonl(&stderr_event(2, "ZXJy"));
-    write_jsonl(&marker_event(3));
-    write_jsonl(&heartbeat_event(4));
-    write_jsonl(&exit_event(5, exit_code));
+    let request_id = read_request_id();
+    write_jsonl(&stdout_event(&request_id, 1, "AAH/"));
+    write_jsonl(&stderr_event(&request_id, 2, "ZXJy"));
+    write_jsonl(&marker_event(&request_id, 3));
+    write_jsonl(&heartbeat_event(&request_id, 4));
+    write_jsonl(&exit_event(&request_id, 5, exit_code));
     0
 }
 
@@ -491,41 +504,67 @@ fn write_jsonl(line: &str) {
     let _ = io::stdout().flush();
 }
 
-fn stdout_event(seq: u64, data_base64: &str) -> String {
+fn read_request_id() -> String {
+    request_id_from_stdin(&read_stdin_to_string())
+}
+
+fn request_id_from_stdin(stdin: &str) -> String {
+    json_string_field(stdin, "request_id").unwrap_or_else(|| REQUEST_ID.to_owned())
+}
+
+fn json_string_field(input: &str, field: &str) -> Option<String> {
+    let needle = format!("\"{field}\"");
+    let field_start = input.find(&needle)? + needle.len();
+    let after_colon = input[field_start..].split_once(':')?.1.trim_start();
+    let value = after_colon.strip_prefix('"')?;
+    let end = value.find('"')?;
+    Some(value[..end].to_owned())
+}
+
+fn json_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn stdout_event(request_id: &str, seq: u64, data_base64: &str) -> String {
+    let request_id = json_escape(request_id);
     format!(
-        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{REQUEST_ID}\",\"seq\":{seq},\"time_unix_ms\":{},\"kind\":\"stdout\",\"data_base64\":\"{data_base64}\"}}",
+        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"seq\":{seq},\"time_unix_ms\":{},\"kind\":\"stdout\",\"data_base64\":\"{data_base64}\"}}",
         1000 + seq
     )
 }
 
-fn stderr_event(seq: u64, data_base64: &str) -> String {
+fn stderr_event(request_id: &str, seq: u64, data_base64: &str) -> String {
+    let request_id = json_escape(request_id);
     format!(
-        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{REQUEST_ID}\",\"seq\":{seq},\"time_unix_ms\":{},\"kind\":\"stderr\",\"data_base64\":\"{data_base64}\"}}",
+        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"seq\":{seq},\"time_unix_ms\":{},\"kind\":\"stderr\",\"data_base64\":\"{data_base64}\"}}",
         1000 + seq
     )
 }
 
-fn marker_event(seq: u64) -> String {
+fn marker_event(request_id: &str, seq: u64) -> String {
+    let request_id = json_escape(request_id);
     format!(
-        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{REQUEST_ID}\",\"seq\":{seq},\"time_unix_ms\":{},\"kind\":\"marker\",\"name\":\"example-marker\",\"value\":{{\"phase\":\"example\"}}}}",
+        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"seq\":{seq},\"time_unix_ms\":{},\"kind\":\"marker\",\"name\":\"example-marker\",\"value\":{{\"phase\":\"example\"}}}}",
         1000 + seq
     )
 }
 
-fn heartbeat_event(seq: u64) -> String {
+fn heartbeat_event(request_id: &str, seq: u64) -> String {
+    let request_id = json_escape(request_id);
     format!(
-        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{REQUEST_ID}\",\"seq\":{seq},\"time_unix_ms\":{},\"kind\":\"heartbeat\",\"detail\":\"example heartbeat\"}}",
+        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"seq\":{seq},\"time_unix_ms\":{},\"kind\":\"heartbeat\",\"detail\":\"example heartbeat\"}}",
         1000 + seq
     )
 }
 
-fn exit_event(seq: u64, code: i32) -> String {
-    launch_exit_event_json(seq, code, terminal_signal_for_exit_code(code))
+fn exit_event(request_id: &str, seq: u64, code: i32) -> String {
+    launch_exit_event_json(request_id, seq, code, terminal_signal_for_exit_code(code))
 }
 
-fn cancelled_exit_event(seq: u64) -> String {
+fn cancelled_exit_event(request_id: &str, seq: u64) -> String {
+    let request_id = json_escape(request_id);
     format!(
-        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{REQUEST_ID}\",\"seq\":{seq},\"time_unix_ms\":{},\"kind\":\"exit\",\"status\":{{\"kind\":\"cancelled\"}},\"terminal_signal\":{{\"kind\":\"cancelled\",\"evidence\":\"fake-provider cancellation\",\"observed_at_unix_ms\":{}}},\"session\":{{\"provider_session_id\":\"example-session\"}}}}",
+        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"seq\":{seq},\"time_unix_ms\":{},\"kind\":\"exit\",\"status\":{{\"kind\":\"cancelled\"}},\"terminal_signal\":{{\"kind\":\"cancelled\",\"evidence\":\"fake-provider cancellation\",\"observed_at_unix_ms\":{}}},\"session\":{{\"provider_session_id\":\"example-session\"}}}}",
         1000 + seq,
         1000 + seq
     )

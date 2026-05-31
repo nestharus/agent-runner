@@ -107,7 +107,7 @@ pub fn test_model_for_test(
     let state_db_opener = ProductionStateDbOpener;
     let providers_config = FilesystemProvidersConfigRepository;
     let routing_service = oulipoly_runtime::services::ProductionRoutingService;
-    let executor_service = oulipoly_runtime::executor::RuntimeExecutorService;
+    let executor_service = oulipoly_runtime::executor::RuntimeExecutorService::default();
     let diagnostics_service = oulipoly_runtime::diagnostics::RuntimeDiagnosticsService;
     let services = mapper::test_model_services_from_parts(
         &state_db_opener,

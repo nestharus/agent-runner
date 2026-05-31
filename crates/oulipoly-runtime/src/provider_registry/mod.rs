@@ -4,6 +4,7 @@ mod client_factory;
 mod conversion;
 mod describe;
 mod error;
+mod handle;
 mod options;
 
 use artifact_key::{ArtifactKey, artifact_key};
@@ -17,6 +18,7 @@ use std::collections::{BTreeMap, HashMap};
 pub use client_factory::ProviderClientFactory;
 pub use conversion::{ArtifactKind, RuntimeProviderArtifact};
 pub use error::ProviderRegistryError;
+pub use handle::ProviderRegistryHandle;
 pub use options::ProviderRegistryOptions;
 
 // ## Adapter declarations
