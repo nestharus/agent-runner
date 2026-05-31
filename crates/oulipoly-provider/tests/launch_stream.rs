@@ -47,6 +47,17 @@ fn launch_accepts_valid_jsonl_and_preserves_decoded_binary_order() {
 }
 
 #[test]
+fn launch_fake_provider_echoes_host_supplied_request_id() {
+    let fake = FakeProvider::compile(fake_provider_source());
+    let mut request = launch_request();
+    request["request_id"] = "request-host-generated-217".into();
+
+    launch_client(fake.path())
+        .launch(request, FakeProviderMode::LaunchValid.env())
+        .expect("launch events should correlate with the host request id");
+}
+
+#[test]
 fn launch_model_nonzero_final_exit_is_outcome_not_provider_transport_failure() {
     let fake = FakeProvider::compile(fake_provider_source());
     let result = launch_client(fake.path())

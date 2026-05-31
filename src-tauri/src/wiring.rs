@@ -1,16 +1,19 @@
 #![allow(dead_code)]
 
+use oulipoly_config as config;
 use oulipoly_config::repositories::{
     FilesystemAgentConfigRepository, FilesystemAppConfigRepository,
     FilesystemModelConfigRepository, FilesystemProvidersConfigRepository,
-    FilesystemSessionsConfigRepository,
+    FilesystemSessionsConfigRepository, ProvidersConfigRepository,
 };
 use oulipoly_runtime::diagnostics::RuntimeDiagnosticsService;
 use oulipoly_runtime::executor::RuntimeExecutorService;
 use oulipoly_runtime::ports::{
     DefaultProcessRunner, DefaultUuidGenerator, StderrWriter, StdoutWriter, SystemClock,
 };
-use oulipoly_runtime::provider_registry::{ProviderRegistry, ProviderRegistryOptions};
+use oulipoly_runtime::provider_registry::{
+    ProviderRegistry, ProviderRegistryHandle, ProviderRegistryOptions,
+};
 use oulipoly_runtime::quota::RuntimeQuotaService;
 use oulipoly_runtime::services::{
     DiagnosticsServicePort, ExecutorServicePort, MigrationServicePort,
@@ -53,6 +56,8 @@ pub struct AgentRuntimeServices {
     pub quota_service: Arc<dyn QuotaServicePort>,
     pub diagnostics_service: Arc<dyn DiagnosticsServicePort>,
     pub provider_registry: Arc<ProviderRegistry>,
+    pub provider_registry_handle: ProviderRegistryHandle,
+    pub provider_registry_options: ProviderRegistryOptions,
     pub resume_service: Arc<dyn ResumeServicePort>,
     pub session_lifecycle_service: Arc<dyn SessionLifecycleServicePort>,
     pub migration_service: Arc<dyn MigrationServicePort>,
@@ -64,6 +69,10 @@ pub struct AgentRuntimeServices {
 
 impl AgentRuntimeServices {
     pub fn cli_defaults() -> Self {
+        let provider_registry_options = ProviderRegistryOptions::default();
+        let provider_registry =
+            Arc::new(ProviderRegistry::empty(provider_registry_options.clone()));
+        let provider_registry_handle = ProviderRegistryHandle::new(provider_registry.clone());
         Self {
             state_db_opener: Arc::new(ProductionStateDbOpener),
             app_config: Arc::new(FilesystemAppConfigRepository),
@@ -78,12 +87,14 @@ impl AgentRuntimeServices {
             stderr_sink: Arc::new(StderrWriter),
             routing_service: Arc::new(ProductionRoutingService),
             invocation_lifecycle_service: Arc::new(ProductionInvocationLifecycleService),
-            executor_service: Arc::new(RuntimeExecutorService),
+            executor_service: Arc::new(RuntimeExecutorService::with_registry_handle(
+                provider_registry_handle.clone(),
+            )),
             quota_service: Arc::new(RuntimeQuotaService),
             diagnostics_service: Arc::new(RuntimeDiagnosticsService),
-            provider_registry: Arc::new(
-                ProviderRegistry::empty(ProviderRegistryOptions::default()),
-            ),
+            provider_registry,
+            provider_registry_handle,
+            provider_registry_options,
             resume_service: Arc::new(ProductionResumeService::new()),
             session_lifecycle_service: Arc::new(ProductionSessionLifecycleService::new()),
             migration_service: Arc::new(ProductionMigrationService::new()),
@@ -96,6 +107,14 @@ impl AgentRuntimeServices {
 
     pub fn production(paths: RuntimePaths) -> Result<Self, String> {
         prepare_runtime_directories(&paths)?;
+        let registry_options = ProviderRegistryOptions::default()
+            .with_config_root(paths.config_root.clone())
+            .with_data_root(paths.data_root.clone());
+        let provider_registry = Arc::new(production_provider_registry(
+            &paths,
+            registry_options.clone(),
+        ));
+        let provider_registry_handle = ProviderRegistryHandle::new(provider_registry.clone());
 
         Ok(Self {
             state_db_opener: Arc::new(ProductionStateDbOpener),
@@ -111,14 +130,14 @@ impl AgentRuntimeServices {
             stderr_sink: Arc::new(StderrWriter),
             routing_service: Arc::new(ProductionRoutingService),
             invocation_lifecycle_service: Arc::new(ProductionInvocationLifecycleService),
-            executor_service: Arc::new(RuntimeExecutorService),
+            executor_service: Arc::new(RuntimeExecutorService::with_registry_handle(
+                provider_registry_handle.clone(),
+            )),
             quota_service: Arc::new(RuntimeQuotaService),
             diagnostics_service: Arc::new(RuntimeDiagnosticsService),
-            provider_registry: Arc::new(ProviderRegistry::empty(
-                ProviderRegistryOptions::default()
-                    .with_config_root(paths.config_root.clone())
-                    .with_data_root(paths.data_root.clone()),
-            )),
+            provider_registry,
+            provider_registry_handle,
+            provider_registry_options: registry_options,
             resume_service: Arc::new(ProductionResumeService::new()),
             session_lifecycle_service: Arc::new(ProductionSessionLifecycleService::new()),
             migration_service: Arc::new(ProductionMigrationService::new()),
@@ -128,6 +147,20 @@ impl AgentRuntimeServices {
             session_lock_service: Arc::new(ProductionSessionLockService::default()),
         })
     }
+}
+
+fn production_provider_registry(
+    paths: &RuntimePaths,
+    options: ProviderRegistryOptions,
+) -> ProviderRegistry {
+    let fallback_options = options.clone();
+    let providers_path = paths.config_root.join("providers.toml");
+    let providers = FilesystemProvidersConfigRepository
+        .load_providers(&providers_path)
+        .unwrap_or_default();
+    let models = config::load_models(&paths.models_dir, Some(&providers)).unwrap_or_default();
+    ProviderRegistry::from_model_configs(&models.into_values().collect::<Vec<_>>(), options)
+        .unwrap_or_else(|_| ProviderRegistry::empty(fallback_options))
 }
 
 fn prepare_runtime_directories(paths: &RuntimePaths) -> Result<(), String> {

@@ -10,12 +10,13 @@
         "settings_id": { "type": "string", "minLength": 1 },
         "mode": { "type": "string", "minLength": 1 },
         "model": { "$ref": "common.schema.json#/$defs/ProviderModelRequest" },
+        "argv": { "type": "array", "items": { "type": "string" } },
         "working_directory": { "type": "string", "minLength": 1 },
         "env": { "$ref": "common.schema.json#/$defs/StringMap" },
         "stdin": { "$ref": "common.schema.json#/$defs/BytePayload" },
         "session": { "type": "object", "additionalProperties": true }
       },
-      "required": ["settings_id", "mode", "model", "working_directory"],
+      "required": ["settings_id", "mode", "model", "argv", "working_directory"],
       "additionalProperties": false
     },
     "LaunchRequest": {

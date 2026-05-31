@@ -116,7 +116,7 @@ impl ExecutorServicePort for RecordingExecutorService {
         if let Some(provider) = capture_request_provider(&request) {
             store_captured_provider(&self.received_effective_provider, provider);
         }
-        executor::RuntimeExecutorService.execute(request)
+        executor::RuntimeExecutorService::default().execute(request)
     }
 }
 
@@ -155,7 +155,8 @@ printf 'stderr:%s\n' "$1" >&2"#,
     })
     .expect("direct execute");
 
-    let service: &dyn ExecutorServicePort = &executor::RuntimeExecutorService;
+    let service_impl = executor::RuntimeExecutorService::default();
+    let service: &dyn ExecutorServicePort = &service_impl;
     let ExecutorServiceOutput { result } = service
         .execute(ExecutorServiceRequest::Effective {
             model: model.clone(),
@@ -189,7 +190,8 @@ fn runtime_executor_service_raw_request_matches_direct_executor_call() {
     let direct = cli::execute(&model, 0, "raw-prompt", None, &extra_inputs, None)
         .expect("direct raw execute");
 
-    let service: &dyn ExecutorServicePort = &executor::RuntimeExecutorService;
+    let service_impl = executor::RuntimeExecutorService::default();
+    let service: &dyn ExecutorServicePort = &service_impl;
     let ExecutorServiceOutput { result } = service
         .execute(ExecutorServiceRequest::Facade {
             model: model.clone(),

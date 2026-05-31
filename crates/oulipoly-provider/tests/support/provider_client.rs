@@ -110,6 +110,7 @@ pub fn launch_request() -> Value {
                     "named": {}
                 }
             },
+            "argv": ["example-provider", "--model", "example-model"],
             "working_directory": ".",
             "env": {},
             "stdin": {

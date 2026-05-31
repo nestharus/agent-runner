@@ -1437,7 +1437,6 @@ fn registry_construction_and_cache_operations_do_not_mutate_state_config_or_cach
 fn production_service_sources_do_not_route_current_paths_through_provider_registry_seams() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     for relative in [
-        "executor/mod.rs",
         "quota/in_flight.rs",
         "quota/mod.rs",
         "quota/marker_verification/mod.rs",

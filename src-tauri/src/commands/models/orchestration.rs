@@ -39,7 +39,7 @@
 //! ```
 
 use super::{ModelSummary, accessor, formatter, validator};
-use crate::{AppState, provider_settings};
+use crate::{AppState, app_state, provider_settings};
 use oulipoly_config::ModelConfig;
 
 #[tauri::command]
@@ -71,6 +71,7 @@ pub fn save_model_inner(state: &AppState, model: ModelConfig) -> Result<(), Stri
     accessor::persist_model_file(&state.models_dir, &path, &toml_content)
         .map_err(formatter::format_model_persistence_error)?;
     accessor::commit_saved_model(state, model)?;
+    app_state::refresh_provider_registry(state)?;
     provider_settings::refresh_provider_settings_host(state)?;
     Ok(())
 }
@@ -82,6 +83,7 @@ pub(crate) fn delete_model(state: tauri::State<AppState>, name: String) -> Resul
         std::fs::remove_file(&path).map_err(formatter::delete_model_file_error)?;
     }
     accessor::remove_cached_model(&state, &name)?;
+    app_state::refresh_provider_registry(&state)?;
     provider_settings::refresh_provider_settings_host(&state)?;
     Ok(())
 }

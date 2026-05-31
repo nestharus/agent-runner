@@ -10,6 +10,11 @@ pub struct ProviderRegistryOptions {
 }
 
 impl ProviderRegistryOptions {
+    pub fn with_client_options(mut self, client: ProviderClientOptions) -> Self {
+        self.client = client;
+        self
+    }
+
     pub fn with_path_entries<I>(mut self, entries: I) -> Self
     where
         I: IntoIterator<Item = PathBuf>,

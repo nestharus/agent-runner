@@ -410,6 +410,7 @@ pub struct LaunchParams {
     pub settings_id: String,
     pub mode: String,
     pub model: ProviderModelRequest,
+    pub argv: Vec<String>,
     pub working_directory: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub env: Option<BTreeMap<String, String>>,

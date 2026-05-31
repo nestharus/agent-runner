@@ -147,7 +147,7 @@
     }
   },
   "launch": {
-    "request": {"contract":"oulipoly.provider/v1","request_id":"req-launch","provider_instance_id":"acct-primary","host":{"app":"oulipoly-agent-runner","working_directory":"/home/user/project"},"params":{"settings_id":"work","mode":"headless","model":{"name":"example~high","provider_args":["--model","high"],"inputs":{"prompt":"Summarize this repo","named":{}}},"working_directory":"/home/user/project","env":{"OULIPOLY_INVOCATION_ID":"inv-123"},"stdin":{"encoding":"utf8","data":"Summarize this repo"},"session":{"resume_session_id":null,"known_provider_session_id":null}}},
+    "request": {"contract":"oulipoly.provider/v1","request_id":"req-launch","provider_instance_id":"acct-primary","host":{"app":"oulipoly-agent-runner","working_directory":"/home/user/project"},"params":{"settings_id":"work","mode":"headless","model":{"name":"example~high","provider_args":["--model","high"],"inputs":{"prompt":"Summarize this repo","named":{}}},"argv":["example-cli","--model","high"],"working_directory":"/home/user/project","env":{"OULIPOLY_INVOCATION_ID":"inv-123"},"stdin":{"encoding":"utf8","data":"Summarize this repo"},"session":{"resume_session_id":null,"known_provider_session_id":null}}},
     "events": {
       "stdout": {"contract":"oulipoly.provider/v1","request_id":"req-launch","seq":1,"time_unix_ms":1779991000001,"kind":"stdout","data_base64":"SGVsbG8K"},
       "stderr": {"contract":"oulipoly.provider/v1","request_id":"req-launch","seq":2,"time_unix_ms":1779991000050,"kind":"stderr","data_base64":"V2FybmluZwo="},

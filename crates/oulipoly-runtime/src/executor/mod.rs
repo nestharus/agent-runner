@@ -14,18 +14,22 @@
 //! ```
 
 pub mod cli;
+mod external_provider;
 mod provider_specific;
 pub mod providers;
 pub mod terminal_signal;
 
+use crate::provider_registry::{ProviderRegistry, ProviderRegistryHandle, ProviderRegistryOptions};
 use crate::services::{
     ExecutorServiceOutput, ExecutorServicePort, ExecutorServiceRequest, ServiceError,
 };
+use external_provider::context::ExternalProviderDispatchInput;
 pub use oulipoly_agent_messenger::ReturnedArtifactRef;
-use oulipoly_config::ModelConfig;
+use oulipoly_config::{ModelConfig, ProviderConfig};
 use oulipoly_state::CompositeInvocationId;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 pub use self::providers::claude::Recognizer as ClaudeRecognizer;
 pub use self::providers::codex::Recognizer as CodexRecognizer;
@@ -119,39 +123,94 @@ impl SessionCaptureMethod {
 
 pub use cli::provider_name;
 
-pub struct RuntimeExecutorService;
+#[derive(Clone, Debug)]
+pub struct RuntimeExecutorService {
+    provider_registry: ProviderRegistryHandle,
+}
+
+impl RuntimeExecutorService {
+    pub fn new(provider_registry: Arc<ProviderRegistry>) -> Self {
+        Self {
+            provider_registry: ProviderRegistryHandle::new(provider_registry),
+        }
+    }
+
+    pub fn with_registry_handle(provider_registry: ProviderRegistryHandle) -> Self {
+        Self { provider_registry }
+    }
+}
+
+impl Default for RuntimeExecutorService {
+    fn default() -> Self {
+        Self::new(Arc::new(ProviderRegistry::empty(
+            ProviderRegistryOptions::default(),
+        )))
+    }
+}
 
 impl ExecutorServicePort for RuntimeExecutorService {
     fn execute(
         &self,
         request: ExecutorServiceRequest,
     ) -> Result<ExecutorServiceOutput, ServiceError> {
-        let result = match request {
-            ExecutorServiceRequest::Facade {
-                model,
-                provider_index,
-                prompt,
-                working_dir,
-                extra_inputs,
-                parent_invocation_env,
-            } => cli::execute(
-                &model,
-                provider_index,
-                &prompt,
-                working_dir.as_deref(),
-                &extra_inputs,
-                parent_invocation_env.as_deref(),
-            ),
-            ExecutorServiceRequest::Effective {
-                model,
-                provider,
-                provider_index,
-                prompt_mode,
-                prompt,
-                working_dir,
-                extra_inputs,
-                parent_invocation_env,
-            } => cli::execute_effective(cli::EffectiveExecuteRequest {
+        let result = if request_model_has_external_provider(&request) {
+            execute_external_provider(self.provider_registry.current(), request)
+        } else {
+            execute_legacy(request)
+        }?;
+
+        Ok(ExecutorServiceOutput { result })
+    }
+}
+
+fn execute_legacy(request: ExecutorServiceRequest) -> Result<ExecutionResult, ServiceError> {
+    match request {
+        ExecutorServiceRequest::Facade {
+            model,
+            provider_index,
+            prompt,
+            working_dir,
+            extra_inputs,
+            parent_invocation_env,
+        } => cli::execute(
+            &model,
+            provider_index,
+            &prompt,
+            working_dir.as_deref(),
+            &extra_inputs,
+            parent_invocation_env.as_deref(),
+        ),
+        ExecutorServiceRequest::Effective {
+            model,
+            provider,
+            provider_index,
+            prompt_mode,
+            prompt,
+            working_dir,
+            extra_inputs,
+            parent_invocation_env,
+        } => cli::execute_effective(cli::EffectiveExecuteRequest {
+            model: &model,
+            provider: &provider,
+            provider_index,
+            prompt_mode,
+            prompt: &prompt,
+            working_dir: working_dir.as_deref(),
+            extra_inputs: &extra_inputs,
+            parent_invocation_env: parent_invocation_env.as_deref(),
+        }),
+        ExecutorServiceRequest::EffectiveWithStartKnownProviderSessionId {
+            model,
+            provider,
+            provider_index,
+            prompt_mode,
+            prompt,
+            working_dir,
+            extra_inputs,
+            parent_invocation_env,
+            start_known_provider_session_id,
+        } => cli::execute_effective_with_start_known_provider_session_id(
+            cli::EffectiveExecuteRequest {
                 model: &model,
                 provider: &provider,
                 provider_index,
@@ -160,35 +219,113 @@ impl ExecutorServicePort for RuntimeExecutorService {
                 working_dir: working_dir.as_deref(),
                 extra_inputs: &extra_inputs,
                 parent_invocation_env: parent_invocation_env.as_deref(),
-            }),
-            ExecutorServiceRequest::EffectiveWithStartKnownProviderSessionId {
+            },
+            Some(&start_known_provider_session_id),
+        ),
+    }
+    .map_err(|message| ServiceError::Dependency { message })
+}
+
+fn execute_external_provider(
+    provider_registry: Arc<ProviderRegistry>,
+    request: ExecutorServiceRequest,
+) -> Result<ExecutionResult, ServiceError> {
+    let context = match request {
+        ExecutorServiceRequest::Facade {
+            model,
+            provider_index,
+            prompt,
+            working_dir,
+            extra_inputs,
+            parent_invocation_env,
+        } => {
+            let provider = provider_for_external_context(&model, provider_index)?;
+            let prompt_mode = model.prompt_mode;
+            ExternalProviderDispatchInput {
                 model,
                 provider,
                 provider_index,
                 prompt_mode,
                 prompt,
-                working_dir,
                 extra_inputs,
+                working_dir,
                 parent_invocation_env,
-                start_known_provider_session_id,
-            } => cli::execute_effective_with_start_known_provider_session_id(
-                cli::EffectiveExecuteRequest {
-                    model: &model,
-                    provider: &provider,
-                    provider_index,
-                    prompt_mode,
-                    prompt: &prompt,
-                    working_dir: working_dir.as_deref(),
-                    extra_inputs: &extra_inputs,
-                    parent_invocation_env: parent_invocation_env.as_deref(),
-                },
-                Some(&start_known_provider_session_id),
-            ),
+                start_known_provider_session_id: None,
+            }
+            .into()
         }
-        .map_err(|message| ServiceError::Dependency { message })?;
+        ExecutorServiceRequest::Effective {
+            model,
+            provider,
+            provider_index,
+            prompt_mode,
+            prompt,
+            working_dir,
+            extra_inputs,
+            parent_invocation_env,
+        } => ExternalProviderDispatchInput {
+            model,
+            provider,
+            provider_index,
+            prompt_mode,
+            prompt,
+            extra_inputs,
+            working_dir,
+            parent_invocation_env,
+            start_known_provider_session_id: None,
+        }
+        .into(),
+        ExecutorServiceRequest::EffectiveWithStartKnownProviderSessionId {
+            model,
+            provider,
+            provider_index,
+            prompt_mode,
+            prompt,
+            working_dir,
+            extra_inputs,
+            parent_invocation_env,
+            start_known_provider_session_id,
+        } => ExternalProviderDispatchInput {
+            model,
+            provider,
+            provider_index,
+            prompt_mode,
+            prompt,
+            extra_inputs,
+            working_dir,
+            parent_invocation_env,
+            start_known_provider_session_id: Some(start_known_provider_session_id),
+        }
+        .into(),
+    };
 
-        Ok(ExecutorServiceOutput { result })
+    external_provider::dispatch(&provider_registry, context)
+}
+
+fn request_model_has_external_provider(request: &ExecutorServiceRequest) -> bool {
+    match request {
+        ExecutorServiceRequest::Facade { model, .. }
+        | ExecutorServiceRequest::Effective { model, .. }
+        | ExecutorServiceRequest::EffectiveWithStartKnownProviderSessionId { model, .. } => {
+            model.provider.is_some()
+        }
     }
+}
+
+fn provider_for_external_context(
+    model: &ModelConfig,
+    provider_index: usize,
+) -> Result<ProviderConfig, ServiceError> {
+    model
+        .providers
+        .get(provider_index)
+        .cloned()
+        .ok_or_else(|| ServiceError::Dependency {
+            message: format!(
+                "Provider index {} out of range for model {}",
+                provider_index, model.name
+            ),
+        })
 }
 
 /// Execute a model with the original prompt-only interface (backwards compat).
@@ -198,7 +335,7 @@ pub fn execute(
     prompt: &str,
     working_dir: Option<&Path>,
 ) -> Result<ExecutionResult, String> {
-    let service = RuntimeExecutorService;
+    let service = RuntimeExecutorService::default();
     service
         .execute(ExecutorServiceRequest::Facade {
             model: model.clone(),
@@ -220,7 +357,7 @@ pub fn execute_with_inputs(
     working_dir: Option<&Path>,
     extra_inputs: &HashMap<String, Vec<String>>,
 ) -> Result<ExecutionResult, String> {
-    let service = RuntimeExecutorService;
+    let service = RuntimeExecutorService::default();
     service
         .execute(ExecutorServiceRequest::Facade {
             model: model.clone(),
@@ -243,7 +380,7 @@ pub fn execute_with_inputs_and_env(
     extra_inputs: &HashMap<String, Vec<String>>,
     parent_invocation_env: Option<&str>,
 ) -> Result<ExecutionResult, String> {
-    let service = RuntimeExecutorService;
+    let service = RuntimeExecutorService::default();
     service
         .execute(ExecutorServiceRequest::Facade {
             model: model.clone(),
@@ -260,7 +397,7 @@ pub fn execute_with_inputs_and_env(
 pub fn execute_effective_with_inputs_and_env(
     request: cli::EffectiveExecuteRequest<'_>,
 ) -> Result<ExecutionResult, String> {
-    let service = RuntimeExecutorService;
+    let service = RuntimeExecutorService::default();
     service
         .execute(ExecutorServiceRequest::Effective {
             model: request.model.clone(),

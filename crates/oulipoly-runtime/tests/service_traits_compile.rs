@@ -180,7 +180,7 @@ fn service_port_traits_are_send_sync_trait_object_usable() {
 #[test]
 fn age_34_runtime_service_adapters_are_send_sync_trait_object_usable() {
     let _: Box<dyn ExecutorServicePort + Send + Sync> =
-        Box::new(oulipoly_runtime::executor::RuntimeExecutorService);
+        Box::new(oulipoly_runtime::executor::RuntimeExecutorService::default());
     let _: Box<dyn LauncherServicePort + Send + Sync> =
         Box::new(oulipoly_runtime::repl_default_provider::RuntimeLauncherService);
     let _: Box<dyn QuotaServicePort + Send + Sync> =
