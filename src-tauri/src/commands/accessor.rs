@@ -26,7 +26,6 @@ pub fn with_setup_repository<T>(
     state: &AppState,
     f: impl FnOnce(&dyn SetupRepository) -> Result<T, String>,
 ) -> Result<T, String> {
-    #[cfg(test)]
     if let Some(repo) = state.setup_repository.as_ref() {
         return f(repo.as_ref());
     }

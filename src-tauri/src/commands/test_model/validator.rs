@@ -19,7 +19,7 @@ pub(crate) fn validate_provider_index(
     }
 }
 
-pub(crate) fn validate_diagnostics_output_variant(
+pub fn validate_diagnostics_output_variant(
     output: DiagnosticsServiceOutput,
 ) -> Result<bool, String> {
     let DiagnosticsServiceOutput::ExhaustionClassification { is_exhausted } = output else {

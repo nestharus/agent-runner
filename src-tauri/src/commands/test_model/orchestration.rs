@@ -2,18 +2,15 @@
 //!
 //! `orchestration`
 
-#[cfg(test)]
 use oulipoly_config::repositories::FilesystemProvidersConfigRepository;
 use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig, ProvidersConfig};
-#[cfg(test)]
 use oulipoly_state::repositories::ProductionStateDbOpener;
-#[cfg(test)]
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::app_state::AppState;
 
-use super::{dispatch, formatter, lookup, mapper, validator};
+use super::{diagnostics_fallback, dispatch, lookup, mapper, validator};
 use mapper::{TestModelResult, TestModelServices};
 
 #[tauri::command]
@@ -50,7 +47,7 @@ pub(crate) async fn test_model(
     .map_err(|e| e.to_string())?
 }
 
-pub(crate) fn test_model_with_db_path(
+pub fn test_model_with_db_path(
     services: TestModelServices<'_>,
     model: ModelConfig,
     models_dir: PathBuf,
@@ -92,10 +89,7 @@ fn apply_exhaustion_disposition(
     let should_mark_exhausted = if let Some(signal) = result.terminal_signal.as_ref() {
         validator::typed_signal_is_quota_exhausted_inband(signal.kind)
     } else {
-        let input = formatter::diagnostic_input(&result.stderr, &result.stdout);
-        let output = dispatch::diagnostics_output_for_result(services.diagnostics_service, input)?;
-        let is_exhausted = validator::validate_diagnostics_output_variant(output)?;
-        validator::diagnostics_output_is_quota_exhausted(is_exhausted)
+        diagnostics_fallback::diagnostics_fallback_should_mark_exhausted(services, result)?
     };
 
     if validator::should_mark_quota_exhausted(should_mark_exhausted) {
@@ -104,8 +98,7 @@ fn apply_exhaustion_disposition(
     Ok(())
 }
 
-#[cfg(test)]
-pub(crate) fn test_model_for_test(
+pub fn test_model_for_test(
     models: HashMap<String, ModelConfig>,
     models_dir: PathBuf,
     name: &str,

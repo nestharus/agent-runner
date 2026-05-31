@@ -1,5 +1,22 @@
 # Project Decisions
 
+## D-AGE-240-phase-4-manager-disposition — revise proposal carriers and rerun coupling only
+
+- **Source**: Phase 4 manager gate for AGE-240, question `/home/nes/projects/agent-runner/planning/age-240-lib-l6/scratch/questions/q-6f6e7bd3-1948-455f-9847-48cfb46c7d0a.question.json`.
+- **Decision**: Treat the initial coupling-auditor HIGH as proposal-precision only, not a code defect and not an override. Revise the Phase 3 proposal to add concrete `## Adapter declarations`, `## Intrinsic-surface declarations`, and a per-target external test ownership map, then rerun only coupling directly at top level.
+- **Scope constraints**: Keep `reload_models` out of `commands/models/orchestration.rs`; place it in a dedicated owner such as `commands/models/reload.rs` with <=5 adapter contracts. Keep the diagnostics-fallback island narrow so validator/quota/state sequencing stays in test-model orchestration. Preserve the diagnostic-input duplicate exactly.
+- **Evidence**: proposal revision dispatch `b5a42690-0781-4cee-8343-77559f64cc9a`; coupling rerun dispatch `1313e078-2585-4a37-9df6-f10da8c59983`; LOW report `/home/nes/projects/agent-runner/planning/age-240-lib-l6/code-quality/age-240-phase-4/reports/rerun-coupling-auditor.md`; join manifest `/home/nes/projects/agent-runner/planning/age-240-lib-l6/risk/phase-4-join-manifest.json`.
+- **Revisit when**: Phase 6 implementation diverges from the revised proposal carrier map or produces any real non-LOW in L6-owned code.
+
+## D-AGE-240-phase-2-5-manager-disposition — proceed exhaustive and preserve diagnostic-input duplicate
+
+- **Source**: Phase 2.5 manager gate for AGE-240, question `/home/nes/projects/agent-runner/planning/age-240-lib-l6/scratch/questions/q-ed761f8f-a1db-440a-b72f-6a3aa49439fb.question.json`.
+- **Decision**: Proceed to Phase 3 in exhaustive, strictly output-preserving mode. Approve the Phase 2.5 problem map and HIGH risk profile. Accept the Linear numeric `story_point_estimate=8` as a manager-set cold-start baseline with `estimate_source` disposition `manager-set-coldstart`; Phase 3 must refine from the approved problem map.
+- **Duplicate disposition**: Preserve the `test_model` diagnostic-input duplicate exactly. Do not consolidate it with `redaction::diagnostic_input` inside AGE-240. If consolidation is worth doing, file a linked follow-up tracker under AGE-240; L6 isolates and converges but does not consolidate duplicate behavior.
+- **Risk disposition**: 0/5 defer-to-prototype signals fired; no prototype. No blocking-ticket discoveries were found.
+- **Evidence**: `/home/nes/projects/agent-runner/planning/age-240-lib-l6/research/age-240-problem-map.md`; `/home/nes/projects/agent-runner/planning/age-240-lib-l6/risk/age-240-risk-profile.md`; `/home/nes/projects/agent-runner/planning/age-240-lib-l6/scratch/phase25/age-240-characterization-tests.md`.
+- **Revisit when**: never for AGE-240; a separate follow-up tracker may evaluate diagnostic-input consolidation after L6 completes.
+
 ## D-AGE-236-D8-spec-tauri-client-same-diff — quota-refresh spec registration ratified
 
 - **Source**: AGE-236 L4 Phase 7/8 D-8 same-diff ratification for `planning/coverage/spec-tauri-client.md`.

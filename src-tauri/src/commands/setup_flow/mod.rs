@@ -1,8 +1,8 @@
 //! Setup-flow Tauri command facade.
 //!
-//! `check_setup_needed` intentionally preserves the existing provider-specific
-//! Claude availability probe as an L6/S10/S11 residual. AGE-238 only relocates
-//! that command and does not generalize the probe.
+//! `check_setup_needed` calls the provider-specific Claude availability probe
+//! residual island in `provider_probe.rs`. AGE-240 only relocates that probe
+//! and does not generalize it.
 //!
 //! ## Declared roles
 //!
@@ -24,6 +24,7 @@
 mod accessor;
 mod formatter;
 pub mod orchestration;
+pub(crate) mod provider_probe;
 
 pub(crate) use orchestration::{
     __cmd__cancel_setup, __cmd__check_setup_needed, __cmd__detect_clis, __cmd__get_memory_graph,

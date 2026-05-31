@@ -62,17 +62,15 @@
 //!       - model command provider fallback predicate
 //! ```
 
+pub mod diagnostics_fallback;
 pub(crate) mod dispatch;
 mod formatter;
 pub(crate) mod lookup;
 mod mapper;
 pub(crate) mod orchestration;
-mod validator;
+pub mod validator;
 
 pub use mapper::TestModelResult;
+pub use mapper::TestModelServices;
 pub use orchestration::effective_provider_for_model_provider;
-
-#[cfg(test)]
-pub(crate) use mapper::TestModelServices;
-#[cfg(test)]
-pub(crate) use orchestration::{test_model_for_test, test_model_with_db_path};
+pub use orchestration::{test_model_for_test, test_model_with_db_path};

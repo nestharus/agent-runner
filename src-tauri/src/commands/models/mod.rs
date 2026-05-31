@@ -17,6 +17,7 @@
 mod accessor;
 mod formatter;
 pub mod orchestration;
+pub mod reload;
 mod validator;
 
 use oulipoly_config as config;
@@ -34,3 +35,4 @@ pub(crate) use orchestration::{
     __cmd__delete_model, __cmd__get_model, __cmd__list_models, __cmd__save_model, delete_model,
     get_model, list_models, save_model,
 };
+pub use reload::reload_models_inner;

@@ -309,7 +309,6 @@ pub fn update_provider_settings_inner(
     state: &AppState,
     args: UpdateProviderSettingsArgs,
 ) -> ProviderSettingsCommandResult<ProviderSettingsWriteDto> {
-    #[cfg(test)]
     if let Some(result) = test_update_result(state) {
         return result;
     }
@@ -334,7 +333,6 @@ pub fn validate_provider_settings_inner(
     state: &AppState,
     args: ValidateProviderSettingsArgs,
 ) -> ProviderSettingsCommandResult<ProviderSettingsValidateDto> {
-    #[cfg(test)]
     if let Some(result) = test_validate_result(state) {
         return result;
     }
@@ -586,19 +584,22 @@ fn simple_error(category: &str, error: impl std::fmt::Display) -> Box<ProviderSe
     })
 }
 
-#[cfg(test)]
 #[derive(Clone, Default)]
 pub struct ProviderSettingsCommandResponses {
     update_error: Option<ProviderSettingsErrorDto>,
     validate_error: Option<ProviderSettingsErrorDto>,
 }
 
-#[cfg(test)]
 pub struct ProviderSettingsCommandHarness {
     state: AppState,
 }
 
-#[cfg(test)]
+impl Default for ProviderSettingsCommandHarness {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ProviderSettingsCommandHarness {
     pub fn new() -> Self {
         Self::with_state(AppState::test_default(
@@ -640,7 +641,6 @@ impl ProviderSettingsCommandHarness {
     }
 }
 
-#[cfg(test)]
 fn test_update_result(
     state: &AppState,
 ) -> Option<ProviderSettingsCommandResult<ProviderSettingsWriteDto>> {
@@ -656,7 +656,6 @@ fn test_update_result(
         .map(|error| Err(Box::new(error)))
 }
 
-#[cfg(test)]
 fn test_validate_result(
     state: &AppState,
 ) -> Option<ProviderSettingsCommandResult<ProviderSettingsValidateDto>> {

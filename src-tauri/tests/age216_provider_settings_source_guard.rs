@@ -60,11 +60,11 @@ fn tauri_provider_settings_handlers_are_thin_runtime_adapters() {
 // risk: Registry/model reload staleness; level: Tauri state lifecycle; source: contract "Runtime state signals"
 #[test]
 fn model_reload_save_and_delete_refresh_configured_provider_settings_registry() {
-    let lib_source = read("src/lib.rs");
+    let reload_source = read("src/commands/models/reload.rs");
     let model_source = read("src/commands/models/orchestration.rs");
 
     for (source, function_name) in [
-        (&lib_source, "fn reload_models"),
+        (&reload_source, "fn reload_models_inner"),
         (&model_source, "fn save_model_inner"),
         (&model_source, "fn delete_model"),
     ] {
@@ -114,7 +114,7 @@ fn s5_does_not_retire_central_provider_or_model_config_parsing() {
     let model_source = read("../crates/oulipoly-config/src/model.rs");
     let providers_source = read("../crates/oulipoly-config/src/providers.rs");
     let tauri_source = [
-        read("src/lib.rs"),
+        read("src/commands/models/reload.rs"),
         read("src/commands/models/formatter.rs"),
         read("src/commands/pools/writer.rs"),
     ]

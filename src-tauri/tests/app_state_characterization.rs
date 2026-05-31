@@ -35,7 +35,7 @@ fn app_state_constructor_and_fallback_surface_remain_anchored() {
     for constructor in [
         "pub(crate)fnnew(",
         "pubfntest_default(",
-        "pub(crate)fnwith_services(",
+        "pubfnwith_services(",
     ] {
         let body = function_body(&source, constructor);
         assert!(
@@ -85,7 +85,7 @@ fn app_state_constructor_and_fallback_surface_remain_anchored() {
         );
     }
 
-    let with_services_body = function_body(&source, "pub(crate)fnwith_services(");
+    let with_services_body = function_body(&source, "pubfnwith_services(");
     for required in [
         "state_db_opener:services.state_db_opener",
         "providers_config:services.providers_config",

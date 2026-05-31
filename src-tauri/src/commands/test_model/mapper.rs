@@ -20,12 +20,12 @@ pub struct TestModelResult {
     pub exit_code: i32,
 }
 
-pub(crate) struct TestModelServices<'a> {
-    pub(crate) state_db_opener: &'a (dyn StateDbOpener + Send + Sync),
-    pub(crate) providers_repository: &'a (dyn ProvidersConfigRepository + Send + Sync),
-    pub(crate) routing_service: &'a dyn RoutingServicePort,
-    pub(crate) executor_service: &'a dyn ExecutorServicePort,
-    pub(crate) diagnostics_service: &'a dyn DiagnosticsServicePort,
+pub struct TestModelServices<'a> {
+    pub state_db_opener: &'a (dyn StateDbOpener + Send + Sync),
+    pub providers_repository: &'a (dyn ProvidersConfigRepository + Send + Sync),
+    pub routing_service: &'a dyn RoutingServicePort,
+    pub executor_service: &'a dyn ExecutorServicePort,
+    pub diagnostics_service: &'a dyn DiagnosticsServicePort,
 }
 
 pub(crate) fn test_model_services_from_parts<'a>(

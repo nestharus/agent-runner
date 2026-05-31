@@ -30,7 +30,7 @@
 //!
 //! Provider-specific availability probe residual is flagged for L6/S10/S11.
 
-use super::{accessor, formatter};
+use super::{accessor, formatter, provider_probe};
 use crate::{AppState, setup};
 use oulipoly_setup as setup_core;
 use oulipoly_setup::actions::{SetupEvent, UserResponse};
@@ -44,12 +44,7 @@ pub(crate) fn check_setup_needed(state: tauri::State<AppState>) -> Result<bool, 
     if models_empty {
         return Ok(true);
     }
-    // Provider-specific Claude probe residual for L6/S10/S11; preserve exactly.
-    let output = std::process::Command::new("which").arg("claude").output();
-    match output {
-        Ok(o) if o.status.success() => Ok(false),
-        _ => Ok(true),
-    }
+    Ok(provider_probe::claude_probe_requires_setup())
 }
 
 #[tauri::command]

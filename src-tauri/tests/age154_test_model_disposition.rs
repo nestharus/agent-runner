@@ -53,7 +53,7 @@ fn test_model_body() -> &'static str {
     source_between(
         orchestration_source(),
         "async fn test_model(",
-        "pub(crate) fn test_model_with_db_path",
+        "pub fn test_model_with_db_path",
     )
 }
 
