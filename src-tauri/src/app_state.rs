@@ -8,17 +8,14 @@
 //! intrinsic_surface_declarations:
 //!   - component: src-tauri/src/app_state.rs
 //!     role: intrinsic-surface
-//!     Domain: application runtime state container for the Tauri host
+//!     Domain: app_state_quota_registry_wiring
 //!     Owns:
-//!       - model cache and models root-path state (models, models_dir)
-//!       - setup response input channel state (setup_input_tx, mpsc::Sender<UserResponse>)
-//!       - runtime service-bundle input (wiring::AgentRuntimeServices)
-//!       - runtime service-port aggregate (state_db_opener, providers_config, routing_service, quota_service, executor_service, diagnostics_service)
-//!       - production service defaults (ProductionStateDbOpener, FilesystemProvidersConfigRepository, ProductionRoutingService, RuntimeQuotaService, RuntimeExecutorService, RuntimeDiagnosticsService)
-//!       - test service defaults and doubles (AppStateTestServices, provider_settings_test_double, setup_repository)
-//!       - provider-settings host surface (ProviderSettingsHost, ProviderSettingsCommandResponses, build_host/from_model_configs/host_options)
-//!       - quota in-flight state (quota::InFlight)
-//!       - setup/providers repositories + test-only doubles
+//!       - AppState::test_default
+//!       - test_provider_registry
+//!       - empty_provider_registry_handle
+//!       - RuntimeQuotaService::with_registry_handle provider_registry.clone()
+//!       - RuntimeExecutorService::with_registry_handle provider_registry.clone()
+//!       - provider_registry field initialization
 //! ```
 
 use crate::provider_settings;
@@ -102,14 +99,7 @@ impl AppState {
 
     pub fn test_default(models_dir: PathBuf, models: HashMap<String, config::ModelConfig>) -> Self {
         let provider_registry_options = provider_registry_options(&models_dir);
-        let provider_registry = ProviderRegistryHandle::new(Arc::new(ProviderRegistry::empty(
-            provider_registry_options.clone(),
-        )));
-        refresh_provider_registry_handle_with_options(
-            &provider_registry,
-            &models,
-            provider_registry_options.clone(),
-        );
+        let provider_registry = test_provider_registry(&models, provider_registry_options.clone());
         let provider_settings = provider_settings_host_for_models(&models_dir, &models);
         Self {
             models: Mutex::new(models),
@@ -119,7 +109,11 @@ impl AppState {
             state_db_opener: Arc::new(ProductionStateDbOpener),
             providers_config: Arc::new(FilesystemProvidersConfigRepository),
             routing_service: Arc::new(oulipoly_runtime::services::ProductionRoutingService),
-            quota_service: Arc::new(oulipoly_runtime::quota::RuntimeQuotaService),
+            quota_service: Arc::new(
+                oulipoly_runtime::quota::RuntimeQuotaService::with_registry_handle(
+                    provider_registry.clone(),
+                ),
+            ),
             executor_service: Arc::new(
                 oulipoly_runtime::executor::RuntimeExecutorService::with_registry_handle(
                     provider_registry.clone(),
@@ -140,6 +134,25 @@ impl AppState {
             .unwrap_or(&self.models_dir)
             .join("state.db")
     }
+}
+
+fn test_provider_registry(
+    models: &HashMap<String, config::ModelConfig>,
+    provider_registry_options: ProviderRegistryOptions,
+) -> ProviderRegistryHandle {
+    let provider_registry = empty_provider_registry_handle(provider_registry_options.clone());
+    refresh_provider_registry_handle_with_options(
+        &provider_registry,
+        models,
+        provider_registry_options,
+    );
+    provider_registry
+}
+
+fn empty_provider_registry_handle(
+    provider_registry_options: ProviderRegistryOptions,
+) -> ProviderRegistryHandle {
+    ProviderRegistryHandle::new(Arc::new(ProviderRegistry::empty(provider_registry_options)))
 }
 
 pub struct AppStateTestServices {

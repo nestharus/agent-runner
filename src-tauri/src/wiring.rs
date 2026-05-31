@@ -1,4 +1,7 @@
 #![allow(dead_code)]
+//! ## Declared roles
+//!
+//! `orchestration`, `accessor`, `mapper`, `formatter`
 
 use oulipoly_config as config;
 use oulipoly_config::repositories::{
@@ -90,7 +93,9 @@ impl AgentRuntimeServices {
             executor_service: Arc::new(RuntimeExecutorService::with_registry_handle(
                 provider_registry_handle.clone(),
             )),
-            quota_service: Arc::new(RuntimeQuotaService),
+            quota_service: Arc::new(RuntimeQuotaService::with_registry_handle(
+                provider_registry_handle.clone(),
+            )),
             diagnostics_service: Arc::new(RuntimeDiagnosticsService),
             provider_registry,
             provider_registry_handle,
@@ -133,7 +138,9 @@ impl AgentRuntimeServices {
             executor_service: Arc::new(RuntimeExecutorService::with_registry_handle(
                 provider_registry_handle.clone(),
             )),
-            quota_service: Arc::new(RuntimeQuotaService),
+            quota_service: Arc::new(RuntimeQuotaService::with_registry_handle(
+                provider_registry_handle.clone(),
+            )),
             diagnostics_service: Arc::new(RuntimeDiagnosticsService),
             provider_registry,
             provider_registry_handle,
@@ -154,13 +161,34 @@ fn production_provider_registry(
     options: ProviderRegistryOptions,
 ) -> ProviderRegistry {
     let fallback_options = options.clone();
-    let providers_path = paths.config_root.join("providers.toml");
-    let providers = FilesystemProvidersConfigRepository
-        .load_providers(&providers_path)
-        .unwrap_or_default();
-    let models = config::load_models(&paths.models_dir, Some(&providers)).unwrap_or_default();
+    let providers = load_registry_providers(paths);
+    let models = load_registry_models(paths, &providers);
+    registry_from_model_configs(models, options)
+        .unwrap_or_else(|_| empty_provider_registry(fallback_options))
+}
+
+fn load_registry_providers(paths: &RuntimePaths) -> config::ProvidersConfig {
+    FilesystemProvidersConfigRepository
+        .load_providers(&paths.config_root.join("providers.toml"))
+        .unwrap_or_default()
+}
+
+fn load_registry_models(
+    paths: &RuntimePaths,
+    providers: &config::ProvidersConfig,
+) -> std::collections::HashMap<String, config::ModelConfig> {
+    config::load_models(&paths.models_dir, Some(providers)).unwrap_or_default()
+}
+
+fn registry_from_model_configs(
+    models: std::collections::HashMap<String, config::ModelConfig>,
+    options: ProviderRegistryOptions,
+) -> Result<ProviderRegistry, oulipoly_runtime::provider_registry::ProviderRegistryError> {
     ProviderRegistry::from_model_configs(&models.into_values().collect::<Vec<_>>(), options)
-        .unwrap_or_else(|_| ProviderRegistry::empty(fallback_options))
+}
+
+fn empty_provider_registry(options: ProviderRegistryOptions) -> ProviderRegistry {
+    ProviderRegistry::empty(options)
 }
 
 fn prepare_runtime_directories(paths: &RuntimePaths) -> Result<(), String> {

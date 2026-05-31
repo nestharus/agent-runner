@@ -10,17 +10,7 @@ fn no_schema_bump_for_age_166() {
     // AGE-166 must not introduce its own state DB migration. The schema
     // baseline is whatever main currently provides; AGE-166 only verifies
     // no migration file is named after this WU.
-    let migrations_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
-    let has_age166_migration = std::fs::read_dir(&migrations_dir)
-        .unwrap()
-        .filter_map(Result::ok)
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .any(|file_name| file_name.contains("age_166") || file_name.contains("age166"));
-
-    assert!(
-        !has_age166_migration,
-        "AGE-166 must not add a state DB migration"
-    );
+    assert_no_age166_migration(migration_file_names(&migrations_dir()));
 
     // Belt-and-suspenders: the manifest's last entry must agree with the
     // exported CURRENT_SCHEMA_VERSION constant; AGE-166 is not allowed to
@@ -28,6 +18,31 @@ fn no_schema_bump_for_age_166() {
     let manifest = migrations::manifest();
     let last = manifest.last().expect("migration manifest is non-empty");
     assert_eq!(last.target_version, schema::CURRENT_SCHEMA_VERSION);
+}
+
+fn migrations_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations")
+}
+
+fn migration_file_names(migrations_dir: &Path) -> Vec<String> {
+    std::fs::read_dir(migrations_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+fn assert_no_age166_migration(file_names: Vec<String>) {
+    assert!(
+        !has_age166_migration(file_names),
+        "AGE-166 must not add a state DB migration"
+    );
+}
+
+fn has_age166_migration(file_names: Vec<String>) -> bool {
+    file_names
+        .iter()
+        .any(|file_name| file_name.contains("age_166") || file_name.contains("age166"))
 }
 
 fn repo_root() -> PathBuf {
@@ -430,10 +445,10 @@ fn declaration_carriers_present_in_source() {
             "src-tauri/src/commands/quota_refresh/orchestration.rs",
             &[
                 "## Intrinsic-surface declarations",
-                "Domain: quota-refresh lifecycle",
-                "src-tauri/src/commands/quota_refresh/candidates.rs",
-                "src-tauri/src/commands/quota_refresh/accessor.rs",
-                "src-tauri/src/commands/quota_refresh/mapper.rs",
+                "Domain: quota_refresh_orchestration",
+                "refresh_candidate_provider_names",
+                "refresh_entry_for_provider",
+                "identity::quota_service_external_identity_for_provider",
             ][..],
         ),
         (
