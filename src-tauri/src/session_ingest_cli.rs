@@ -2,13 +2,14 @@
 //!
 //! ## Declared roles
 //!
-//! `orchestration`, `mapper`, `formatter`, `accessor`, `predicate`
+//! `orchestration`, `mapper`, `formatter`, `accessor`, `filter`, `predicate`, `validator`, `parser`
 
 use std::path::Path;
 
-use oulipoly_config::ProvidersConfig;
+use oulipoly_config::{ModelConfig, ProvidersConfig};
 use oulipoly_runtime::services::{
     ServiceError, SessionLifecycleIngestMode, SessionLifecycleRequest,
+    SessionServiceExternalProviderIdentity,
 };
 use oulipoly_state::{InvocationRecord, StateDb};
 
@@ -24,6 +25,7 @@ pub(crate) struct SessionIngestRequest<'a> {
     pub(crate) sessions_cfg: &'a oulipoly_config::SessionsConfig,
     pub(crate) providers_cfg: Option<&'a ProvidersConfig>,
     pub(crate) provider_name: &'a str,
+    pub(crate) external_provider: Option<SessionServiceExternalProviderIdentity>,
     pub(crate) invocation_row_id: i64,
     pub(crate) invocation_uuid: &'a str,
     pub(crate) effective_cwd: Option<&'a Path>,
@@ -40,6 +42,7 @@ pub(crate) fn ingest_and_emit_session_id_resume_aware(
         sessions_cfg,
         providers_cfg,
         provider_name,
+        external_provider,
         invocation_row_id,
         invocation_uuid,
         effective_cwd,
@@ -50,6 +53,7 @@ pub(crate) fn ingest_and_emit_session_id_resume_aware(
         sessions_cfg,
         providers_cfg,
         provider_name,
+        external_provider,
         invocation_row_id,
         invocation_uuid,
         effective_cwd,
@@ -104,6 +108,7 @@ struct SessionLifecycleRequestInput<'a> {
     sessions_cfg: &'a oulipoly_config::SessionsConfig,
     providers_cfg: Option<&'a ProvidersConfig>,
     provider_name: &'a str,
+    external_provider: Option<SessionServiceExternalProviderIdentity>,
     invocation_row_id: i64,
     invocation_uuid: &'a str,
     effective_cwd: Option<&'a Path>,
@@ -119,12 +124,111 @@ fn session_lifecycle_request(
         sessions_cfg: input.sessions_cfg,
         providers_cfg: input.providers_cfg,
         provider_name: input.provider_name,
+        external_provider: input.external_provider,
         invocation_row_id: input.invocation_row_id,
         invocation_uuid: input.invocation_uuid,
         effective_cwd: input.effective_cwd,
         mode: input.mode,
         stderr: input.stderr,
     }
+}
+
+pub(crate) fn session_external_provider_identity(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    model: Option<&ModelConfig>,
+    provider_name: &str,
+) -> Option<SessionServiceExternalProviderIdentity> {
+    let model = external_provider_model(model)?;
+    let describe = describe_external_provider_for_session(agent_runtime_services, &model.name)?;
+    Some(session_service_external_provider_identity(
+        model,
+        provider_name,
+        describe,
+    ))
+}
+
+struct ExternalProviderSessionDescribe {
+    provider_instance_id: Option<String>,
+    settings_id: String,
+}
+
+fn describe_external_provider_for_session(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    model_name: &str,
+) -> Option<ExternalProviderSessionDescribe> {
+    let registry = session_provider_registry(agent_runtime_services);
+    require_external_provider_artifact(&registry, model_name)?;
+    let describe = describe_session_provider_model(&registry, model_name);
+    Some(external_provider_session_describe(describe.as_ref()))
+}
+
+fn session_provider_registry(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+) -> std::sync::Arc<oulipoly_runtime::provider_registry::ProviderRegistry> {
+    agent_runtime_services.provider_registry_handle.current()
+}
+
+fn require_external_provider_artifact(
+    registry: &oulipoly_runtime::provider_registry::ProviderRegistry,
+    model_name: &str,
+) -> Option<()> {
+    registry.artifact_key_for_model(model_name)?;
+    Some(())
+}
+
+fn describe_session_provider_model(
+    registry: &oulipoly_runtime::provider_registry::ProviderRegistry,
+    model_name: &str,
+) -> Option<oulipoly_provider::generated::DescribeResult> {
+    registry.describe_model_provider(model_name).ok()
+}
+
+fn external_provider_session_describe(
+    describe: Option<&oulipoly_provider::generated::DescribeResult>,
+) -> ExternalProviderSessionDescribe {
+    ExternalProviderSessionDescribe {
+        provider_instance_id: provider_instance_id_from_describe(describe),
+        settings_id: settings_id_from_describe(describe),
+    }
+}
+
+fn provider_instance_id_from_describe(
+    describe: Option<&oulipoly_provider::generated::DescribeResult>,
+) -> Option<String> {
+    describe.map(|result| format_provider_instance_id(&result.provider_id))
+}
+
+fn format_provider_instance_id(provider_id: &str) -> String {
+    format!("{provider_id}-instance")
+}
+
+fn settings_id_from_describe(
+    describe: Option<&oulipoly_provider::generated::DescribeResult>,
+) -> String {
+    describe
+        .and_then(|result| result.settings_schema_id.clone())
+        .unwrap_or_else(default_session_settings_id)
+}
+
+fn default_session_settings_id() -> String {
+    oulipoly_runtime::session_provider::S7A_NEUTRAL_SETTINGS_ID.to_string()
+}
+
+fn session_service_external_provider_identity(
+    model: &ModelConfig,
+    provider_name: &str,
+    describe: ExternalProviderSessionDescribe,
+) -> SessionServiceExternalProviderIdentity {
+    SessionServiceExternalProviderIdentity {
+        model_name: model.name.clone(),
+        provider_name: provider_name.to_string(),
+        provider_instance_id: describe.provider_instance_id,
+        settings_id: describe.settings_id,
+    }
+}
+
+fn external_provider_model(model: Option<&ModelConfig>) -> Option<&ModelConfig> {
+    model.filter(|model| model.provider.is_some())
 }
 
 fn session_lifecycle_ingest_mode(mode: ResumeIngestMode<'_>) -> SessionLifecycleIngestMode {
@@ -216,6 +320,289 @@ fn mint_known_session_chain(state: &StateDb, invocation_row_id: i64) -> Result<(
 
 fn emit_known_session_chain_warning(err: &str) {
     eprintln!("Warning: Failed to mint session chain: {err}");
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use oulipoly_config::provider_implementation_ref::ProviderImplementationRef;
+    use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig, ProvidersConfig};
+    use oulipoly_runtime::provider_registry::{
+        ProviderRegistry, ProviderRegistryHandle, ProviderRegistryOptions,
+    };
+    use oulipoly_runtime::services::ProductionSessionLifecycleService;
+    use oulipoly_state::InvocationStart;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    const MODEL: &str = "provider-a-model";
+    const PROVIDER: &str = "provider-a-account";
+    const SESSION: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const INVOCATION: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+    #[test]
+    fn production_lifecycle_ingest_routes_external_session_read_and_capture() {
+        let fixture = ProductionSessionFixture::new();
+        let row_id = fixture.seed_finalized_invocation();
+        let model = external_model(&fixture.provider_path);
+        let services = fixture.services(&model);
+        let sessions_cfg = oulipoly_config::SessionsConfig::default();
+        let providers_cfg = ProvidersConfig::default();
+
+        let emitted = ingest_and_emit_session_id_resume_aware(
+            &services,
+            SessionIngestRequest {
+                state: &fixture.state,
+                sessions_cfg: &sessions_cfg,
+                providers_cfg: Some(&providers_cfg),
+                provider_name: PROVIDER,
+                external_provider: session_external_provider_identity(
+                    &services,
+                    Some(&model),
+                    PROVIDER,
+                ),
+                invocation_row_id: row_id,
+                invocation_uuid: INVOCATION,
+                effective_cwd: Some(fixture.dir.path()),
+                mode: ResumeIngestMode::Pinned {
+                    resume_target: SESSION,
+                },
+            },
+        );
+
+        assert!(emitted);
+        assert_eq!(
+            fixture.provider_subcommands(),
+            vec!["describe", "session.read_turns", "session.capture"]
+        );
+        assert_eq!(fixture.session_turn_count(), 1);
+    }
+
+    #[test]
+    fn production_identity_is_none_for_builtin_models() {
+        let fixture = ProductionSessionFixture::new();
+        let services = fixture.services(&external_model(&fixture.provider_path));
+        let builtin = ModelConfig {
+            name: "provider-a-builtin-model".to_string(),
+            prompt_mode: PromptMode::Arg,
+            providers: vec![ProviderConfig::model_provider(PROVIDER, Vec::new())],
+            inputs: Vec::new(),
+            provider: None,
+        };
+
+        assert_eq!(
+            session_external_provider_identity(&services, Some(&builtin), PROVIDER),
+            None
+        );
+    }
+
+    struct ProductionSessionFixture {
+        dir: tempfile::TempDir,
+        state: StateDb,
+        state_path: PathBuf,
+        provider_path: PathBuf,
+        record_path: PathBuf,
+    }
+
+    impl ProductionSessionFixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let state_path = dir.path().join("state.db");
+            let state = StateDb::open(&state_path).expect("state db");
+            let record_path = dir.path().join("provider-records.jsonl");
+            let provider_path = write_provider_script(dir.path(), &record_path);
+            Self {
+                dir,
+                state,
+                state_path,
+                provider_path,
+                record_path,
+            }
+        }
+
+        fn seed_finalized_invocation(&self) -> i64 {
+            let row_id = self
+                .state
+                .start_invocation(&InvocationStart {
+                    invocation_uuid: INVOCATION.to_string(),
+                    model_name: MODEL.to_string(),
+                    provider_name: PROVIDER.to_string(),
+                    provider_index: 0,
+                    parent_invocation_id: None,
+                })
+                .expect("start invocation");
+            self.state
+                .finalize_invocation(row_id, true, 0, None, Some("completed"))
+                .expect("finalize invocation");
+            row_id
+        }
+
+        fn services(&self, model: &ModelConfig) -> wiring::AgentRuntimeServices {
+            let registry = Arc::new(
+                ProviderRegistry::from_model_configs(
+                    std::slice::from_ref(model),
+                    ProviderRegistryOptions::default()
+                        .with_config_root(self.dir.path().join("config-root"))
+                        .with_data_root(self.dir.path().join("data-root")),
+                )
+                .expect("registry"),
+            );
+            let handle = ProviderRegistryHandle::new(registry.clone());
+            let mut services = wiring::AgentRuntimeServices::cli_defaults();
+            services.provider_registry = registry;
+            services.provider_registry_handle = handle.clone();
+            services.session_lifecycle_service = Arc::new(
+                ProductionSessionLifecycleService::with_registry_handle(handle),
+            );
+            services
+        }
+
+        fn provider_subcommands(&self) -> Vec<String> {
+            provider_subcommands_from_lines(&provider_record_lines(&provider_records_text(
+                &self.record_path,
+            )))
+        }
+
+        fn session_turn_count(&self) -> i64 {
+            rusqlite::Connection::open(&self.state_path)
+                .expect("sqlite")
+                .query_row("SELECT COUNT(*) FROM session_turns", [], |row| row.get(0))
+                .expect("turn count")
+        }
+    }
+
+    fn provider_records_text(record_path: &Path) -> String {
+        fs::read_to_string(record_path).unwrap_or_default()
+    }
+
+    fn provider_record_lines(records: &str) -> Vec<&str> {
+        records
+            .lines()
+            .filter(|line| provider_record_line_is_non_empty(line))
+            .collect()
+    }
+
+    fn provider_record_line_is_non_empty(line: &str) -> bool {
+        !line.trim().is_empty()
+    }
+
+    fn provider_subcommands_from_lines(lines: &[&str]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| parse_provider_record(line))
+            .map(|record| provider_record_subcommand(&record))
+            .collect()
+    }
+
+    fn parse_provider_record(line: &str) -> serde_json::Value {
+        serde_json::from_str(line).expect("json")
+    }
+
+    fn provider_record_subcommand(record: &serde_json::Value) -> String {
+        record["subcommand"].as_str().unwrap().to_string()
+    }
+
+    fn external_model(provider_path: &Path) -> ModelConfig {
+        ModelConfig {
+            name: MODEL.to_string(),
+            prompt_mode: PromptMode::Arg,
+            providers: vec![ProviderConfig::model_provider(PROVIDER, Vec::new())],
+            inputs: Vec::new(),
+            provider: Some(ProviderImplementationRef {
+                path: Some(provider_path.display().to_string()),
+                crate_name: None,
+                version: None,
+                binary: None,
+                script: None,
+            }),
+        }
+    }
+
+    fn write_provider_script(dir: &Path, record_path: &Path) -> PathBuf {
+        fs::write(record_path, "").expect("record init");
+        let script = dir.join("provider-a-session.py");
+        fs::write(&script, provider_script(record_path)).expect("script");
+        let mut perms = fs::metadata(&script).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script, perms).expect("chmod");
+        script
+    }
+
+    fn provider_script(record_path: &Path) -> String {
+        format!(
+            r#"#!/usr/bin/env python3
+import json
+import pathlib
+import sys
+
+CONTRACT = "oulipoly.provider/v1"
+subcommand = sys.argv[1] if len(sys.argv) > 1 else ""
+request = json.loads(sys.stdin.read() or "{{}}")
+with pathlib.Path({record_path}).open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps({{"subcommand": subcommand, "request": request}}, sort_keys=True) + "\n")
+
+def envelope(result):
+    return {{
+        "contract": request.get("contract", CONTRACT),
+        "request_id": request.get("request_id", "request-age243"),
+        "ok": True,
+        "result": result,
+    }}
+
+if subcommand == "describe":
+    response = envelope({{
+        "provider_id": "provider-a",
+        "display_name": "Provider A",
+        "contract_versions": [CONTRACT],
+        "preferred_contract": CONTRACT,
+        "capabilities": {{
+            "launch": False,
+            "policy": False,
+            "quota": False,
+            "session": True,
+            "terminal": False,
+            "rotation": False,
+            "discovery": False,
+            "settings": False,
+            "setup_brain": False,
+            "setup": False,
+            "migration": False,
+        }},
+        "settings_schema_id": "provider-a-test-settings",
+    }})
+elif subcommand == "session.read_turns":
+    response = envelope({{
+        "turns": [{{
+            "session_id": {session_id},
+            "turn_id": "turn-1",
+            "timestamp": "2026-05-01T00:00:00Z",
+            "role": "assistant",
+            "body": [{{"type": "text", "text": "ok"}}],
+        }}],
+        "turn_count": 1,
+        "complete": True,
+    }})
+elif subcommand == "session.capture":
+    response = envelope({{
+        "provider_session_id": {session_id},
+        "state": {{"captured": True}},
+        "artifacts": [],
+    }})
+else:
+    response = {{
+        "contract": request.get("contract", CONTRACT),
+        "request_id": request.get("request_id", "request-age243"),
+        "ok": False,
+        "error": {{"category": "unsupported", "code": "unsupported_subcommand", "message": subcommand, "retryable": False}},
+    }}
+print(json.dumps(response))
+"#,
+            record_path = serde_json::to_string(&record_path.display().to_string()).unwrap(),
+            session_id = serde_json::to_string(SESSION).unwrap(),
+        )
+    }
 }
 
 fn emit_known_session_marker(payload: oulipoly_state::SessionMarkerPayload) {

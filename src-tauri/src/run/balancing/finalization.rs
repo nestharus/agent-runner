@@ -31,6 +31,7 @@ pub(super) struct CompletedAttemptInput<'a, 'state, 'ctx> {
     pub(super) invocation_row_id: i64,
     pub(super) guard: &'a mut FinalizerGuard<'state>,
     pub(super) provider_name: &'a str,
+    pub(super) model: &'a ModelConfig,
     pub(super) provider_index: usize,
     pub(super) result: &'a executor::ExecutionResult,
     pub(super) terminal_signal: &'a Option<executor::TerminalSignal>,

@@ -2,7 +2,7 @@
 //!
 //! ## Declared roles
 //!
-//! `orchestration`, `parser`, `validator`, `mapper`, `formatter`, `predicate`
+//! `orchestration`, `accessor`, `filter`, `parser`, `validator`, `mapper`, `formatter`, `predicate`
 //!
 //! ## Intrinsic-surface declarations
 //!
@@ -38,8 +38,10 @@ use oulipoly_config::{SessionSourceEntry, SessionsConfig};
 use oulipoly_state::{SessionTurnIngest, StateDb};
 use serde::Deserialize;
 use serde_json::Value;
+use std::io::Read;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
+use std::thread::JoinHandle;
 
 // Generous to accommodate first-run scans across thousands of historical
 // session files. Subsequent scans are bounded by the script's mtime cursor
@@ -71,17 +73,19 @@ pub struct ScanReport {
     pub errors: Vec<String>,
 }
 
-fn is_canonical_body_shape(body: &Value) -> bool {
+pub(crate) fn is_canonical_body_shape(body: &Value) -> bool {
     let Value::Array(chunks) = body else {
         return false;
     };
-    chunks.iter().all(|chunk| {
-        let Value::Object(map) = chunk else {
-            return false;
-        };
-        map.get("type").is_some_and(Value::is_string)
-            && map.get("text").map(Value::is_string).unwrap_or(true)
-    })
+    chunks.iter().all(is_canonical_body_chunk)
+}
+
+fn is_canonical_body_chunk(chunk: &Value) -> bool {
+    let Value::Object(map) = chunk else {
+        return false;
+    };
+    map.get("type").is_some_and(Value::is_string)
+        && map.get("text").map(Value::is_string).unwrap_or(true)
 }
 
 /// Run the adapter script for `provider_name` and ingest every turn it emits.
@@ -95,103 +99,279 @@ pub fn scan_provider(
     db: &StateDb,
 ) -> ScanReport {
     let mut report = ScanReport::default();
-    let Some(entry) = sessions_cfg.get(provider_name) else {
+    let Some(entry) = provider_session_source(sessions_cfg, provider_name) else {
         return report;
     };
 
     let state_dir = resolve_state_dir(provider_name, entry);
-    if let Err(e) = std::fs::create_dir_all(&state_dir) {
-        report.errors.push(format!(
-            "could not create state_dir {}: {e}",
-            state_dir.display()
-        ));
-        return report;
+    if let Err(error) = create_session_state_dir(&state_dir) {
+        return scan_report_with_error(report, error);
     }
 
     let stdout = match run_turn_script(&entry.turn_script, &state_dir) {
-        Ok(s) => s,
-        Err(e) => {
-            report.errors.push(e);
-            return report;
-        }
+        Ok(stdout) => stdout,
+        Err(error) => return scan_report_with_error(report, error),
     };
 
-    // Collect all turns first, then batch-insert in one transaction. For
-    // the bootstrap scan (hundreds of thousands of rows), per-row inserts
-    // are 100x slower than a transactional batch.
-    let mut batch: Vec<SessionTurnIngest> = Vec::new();
-    for line in stdout.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        report.script_lines += 1;
-        let turn: ScriptTurn = match serde_json::from_str(trimmed) {
-            Ok(t) => t,
-            Err(e) => {
-                report
-                    .errors
-                    .push(format!("malformed turn line ({e}): {trimmed}"));
-                continue;
-            }
-        };
-        let timestamp = match DateTime::parse_from_rfc3339(&turn.timestamp) {
-            Ok(t) => t.with_timezone(&Utc),
-            Err(e) => {
-                report
-                    .errors
-                    .push(format!("bad timestamp {}: {e}", turn.timestamp));
-                continue;
-            }
-        };
-        let body = match turn.body {
-            Some(body) if !is_canonical_body_shape(&body) => {
-                report.errors.push(format!(
-                    "invalid body shape for provider {provider_name} line {}: expected canonical content chunk array",
-                    report.script_lines
-                ));
-                None
-            }
-            Some(body) => match serde_json::to_string(&body) {
-                Ok(serialized) => Some(serialized),
-                Err(e) => {
-                    report.errors.push(format!(
-                        "failed to serialize body for provider {provider_name} line {}: {e}",
-                        report.script_lines
-                    ));
-                    None
-                }
-            },
-            None => None,
-        };
-        batch.push(SessionTurnIngest {
-            session_id: turn.session_id,
-            turn_id: turn.turn_id,
-            timestamp,
-            role: turn.role,
-            parent_turn_id: turn.parent_turn_id,
-            is_sidechain: turn.is_sidechain.unwrap_or(false),
-            is_compaction_boundary: turn.is_compaction_boundary.unwrap_or(false),
-            body,
-        });
-    }
-    match db.ingest_session_turns_batch(provider_name, &batch) {
-        Ok(n) => {
-            report.new_turns = n;
-            for turn in &batch {
-                if let Err(e) = db.mint_imported_chain_if_absent(
-                    provider_name,
-                    &turn.session_id,
-                    &turn.timestamp,
-                    "<unknown>",
-                ) {
-                    report.errors.push(e);
-                }
-            }
-        }
-        Err(e) => report.errors.push(e),
-    }
+    let batch = collect_turn_script_batch(provider_name, &stdout, &mut report);
+    persist_scanned_turns(provider_name, db, &batch, &mut report);
     report
+}
+
+fn provider_session_source<'a>(
+    sessions_cfg: &'a SessionsConfig,
+    provider_name: &str,
+) -> Option<&'a SessionSourceEntry> {
+    sessions_cfg.get(provider_name)
+}
+
+fn scan_report_with_error(mut report: ScanReport, error: String) -> ScanReport {
+    report.errors.push(error);
+    report
+}
+
+fn create_session_state_dir(state_dir: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(state_dir)
+        .map_err(|error| format_state_dir_create_error(state_dir, error))
+}
+
+fn format_state_dir_create_error(state_dir: &std::path::Path, error: std::io::Error) -> String {
+    format!(
+        "could not create state_dir {}: {error}",
+        state_dir.display()
+    )
+}
+
+fn collect_turn_script_batch(
+    provider_name: &str,
+    stdout: &str,
+    report: &mut ScanReport,
+) -> Vec<SessionTurnIngest> {
+    let mut batch = Vec::new();
+    for line in non_empty_script_lines(stdout) {
+        let line_number = record_script_line_seen(report);
+        match script_line_to_ingest(provider_name, line, line_number) {
+            Ok(parsed) => {
+                record_optional_scan_error(report, parsed.body_error);
+                push_script_turn_ingest(&mut batch, parsed.ingest);
+            }
+            Err(error) => record_scan_error(report, error),
+        }
+    }
+    batch
+}
+
+fn non_empty_script_lines(stdout: &str) -> Vec<&str> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+fn record_script_line_seen(report: &mut ScanReport) -> u64 {
+    report.script_lines += 1;
+    report.script_lines
+}
+
+fn record_optional_scan_error(report: &mut ScanReport, error: Option<String>) {
+    if let Some(error) = error {
+        record_scan_error(report, error);
+    }
+}
+
+fn record_scan_error(report: &mut ScanReport, error: String) {
+    report.errors.push(error);
+}
+
+fn push_script_turn_ingest(batch: &mut Vec<SessionTurnIngest>, ingest: SessionTurnIngest) {
+    batch.push(ingest);
+}
+
+fn script_line_to_ingest(
+    provider_name: &str,
+    trimmed: &str,
+    line_number: u64,
+) -> Result<ParsedScriptTurnIngest, String> {
+    let turn = parse_script_turn_line(trimmed)?;
+    let timestamp = parse_script_turn_timestamp(&turn.timestamp)?;
+    let body_validation = validate_script_turn_body(provider_name, line_number, &turn.body);
+    let body = serialize_selected_script_turn_body(
+        provider_name,
+        line_number,
+        selected_script_turn_body(&body_validation),
+    )?;
+    let body_error = script_turn_body_error(&body_validation);
+    Ok(script_turn_ingest_from_parts(
+        turn, timestamp, body, body_error,
+    ))
+}
+
+struct ParsedScriptTurnIngest {
+    ingest: SessionTurnIngest,
+    body_error: Option<String>,
+}
+
+enum ValidatedScriptTurnBody<'a> {
+    Accepted(Option<&'a Value>),
+    Rejected(String),
+}
+
+fn parsed_script_turn_ingest(
+    ingest: SessionTurnIngest,
+    body_error: Option<String>,
+) -> ParsedScriptTurnIngest {
+    ParsedScriptTurnIngest { ingest, body_error }
+}
+
+fn parse_script_turn_line(trimmed: &str) -> Result<ScriptTurn, String> {
+    serde_json::from_str(trimmed).map_err(|error| format_malformed_turn_line(error, trimmed))
+}
+
+fn format_malformed_turn_line(error: serde_json::Error, trimmed: &str) -> String {
+    format!("malformed turn line ({error}): {trimmed}")
+}
+
+fn parse_script_turn_timestamp(timestamp: &str) -> Result<DateTime<Utc>, String> {
+    DateTime::parse_from_rfc3339(timestamp)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .map_err(|error| format_bad_timestamp(timestamp, error))
+}
+
+fn format_bad_timestamp(timestamp: &str, error: chrono::ParseError) -> String {
+    format!("bad timestamp {timestamp}: {error}")
+}
+
+fn validate_script_turn_body<'a>(
+    provider_name: &str,
+    line_number: u64,
+    body: &'a Option<Value>,
+) -> ValidatedScriptTurnBody<'a> {
+    let Some(body) = body else {
+        return ValidatedScriptTurnBody::Accepted(None);
+    };
+    match validate_script_turn_body_shape(provider_name, line_number, body) {
+        Ok(()) => ValidatedScriptTurnBody::Accepted(Some(body)),
+        Err(error) => ValidatedScriptTurnBody::Rejected(error),
+    }
+}
+
+fn validate_script_turn_body_shape(
+    provider_name: &str,
+    line_number: u64,
+    body: &Value,
+) -> Result<(), String> {
+    if is_canonical_body_shape(body) {
+        Ok(())
+    } else {
+        Err(format_invalid_body_shape(provider_name, line_number))
+    }
+}
+
+fn format_invalid_body_shape(provider_name: &str, line_number: u64) -> String {
+    format!(
+        "invalid body shape for provider {provider_name} line {line_number}: expected canonical content chunk array"
+    )
+}
+
+fn serialize_script_turn_body(
+    provider_name: &str,
+    line_number: u64,
+    body: &Value,
+) -> Result<Option<String>, String> {
+    serde_json::to_string(body)
+        .map(Some)
+        .map_err(|error| format_body_serialize_error(provider_name, line_number, error))
+}
+
+fn selected_script_turn_body<'a>(body: &'a ValidatedScriptTurnBody<'a>) -> Option<&'a Value> {
+    match body {
+        ValidatedScriptTurnBody::Accepted(Some(body)) => Some(body),
+        ValidatedScriptTurnBody::Accepted(None) | ValidatedScriptTurnBody::Rejected(_) => None,
+    }
+}
+
+fn serialize_selected_script_turn_body(
+    provider_name: &str,
+    line_number: u64,
+    body: Option<&Value>,
+) -> Result<Option<String>, String> {
+    body.map(|body| serialize_script_turn_body(provider_name, line_number, body))
+        .transpose()
+        .map(Option::flatten)
+}
+
+fn format_body_serialize_error(
+    provider_name: &str,
+    line_number: u64,
+    error: serde_json::Error,
+) -> String {
+    format!("failed to serialize body for provider {provider_name} line {line_number}: {error}")
+}
+
+fn script_turn_to_ingest(
+    turn: ScriptTurn,
+    timestamp: DateTime<Utc>,
+    body: Option<String>,
+) -> SessionTurnIngest {
+    SessionTurnIngest {
+        session_id: turn.session_id,
+        turn_id: turn.turn_id,
+        timestamp,
+        role: turn.role,
+        parent_turn_id: turn.parent_turn_id,
+        is_sidechain: turn.is_sidechain.unwrap_or(false),
+        is_compaction_boundary: turn.is_compaction_boundary.unwrap_or(false),
+        body,
+    }
+}
+
+fn script_turn_ingest_from_parts(
+    turn: ScriptTurn,
+    timestamp: DateTime<Utc>,
+    body: Option<String>,
+    body_error: Option<String>,
+) -> ParsedScriptTurnIngest {
+    parsed_script_turn_ingest(script_turn_to_ingest(turn, timestamp, body), body_error)
+}
+
+fn script_turn_body_error(body_validation: &ValidatedScriptTurnBody<'_>) -> Option<String> {
+    match body_validation {
+        ValidatedScriptTurnBody::Accepted(_) => None,
+        ValidatedScriptTurnBody::Rejected(error) => Some(error.clone()),
+    }
+}
+
+fn persist_scanned_turns(
+    provider_name: &str,
+    db: &StateDb,
+    batch: &[SessionTurnIngest],
+    report: &mut ScanReport,
+) {
+    match db.ingest_session_turns_batch(provider_name, batch) {
+        Ok(new_turns) => persist_imported_chains(provider_name, db, batch, report, new_turns),
+        Err(error) => report.errors.push(error),
+    }
+}
+
+fn persist_imported_chains(
+    provider_name: &str,
+    db: &StateDb,
+    batch: &[SessionTurnIngest],
+    report: &mut ScanReport,
+    new_turns: u64,
+) {
+    report.new_turns = new_turns;
+    for turn in batch {
+        if let Err(error) = db.mint_imported_chain_if_absent(
+            provider_name,
+            &turn.session_id,
+            &turn.timestamp,
+            "<unknown>",
+        ) {
+            report.errors.push(error);
+        }
+    }
 }
 
 /// Scan every provider listed in `sessions_cfg`. Failures in one provider
@@ -226,29 +406,43 @@ pub fn locate_transcript(
     provider_name: &str,
     session_id: &str,
 ) -> Result<Option<PathBuf>, String> {
-    let Some(entry) = sessions_cfg.get(provider_name) else {
+    let Some(entry) = session_source_entry(sessions_cfg, provider_name) else {
         return Ok(None);
     };
-    let Some(locator) = entry.transcript_locator.as_deref() else {
+    let Some(locator) = transcript_locator_script(entry) else {
         return Ok(None);
     };
 
     let state_dir = resolve_state_dir(provider_name, entry);
-    std::fs::create_dir_all(&state_dir)
-        .map_err(|e| format!("could not create state_dir {}: {e}", state_dir.display()))?;
+    create_session_state_dir(&state_dir)?;
 
     let stdout = run_session_script(locator, &state_dir, Some(session_id), "transcript locator")?;
-    let lines = stdout
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>();
+    let lines = non_empty_script_lines(&stdout);
+    let line = single_transcript_stdout_line(&lines)?;
+    Ok(Some(transcript_path_from_line(line)))
+}
 
-    match lines.as_slice() {
+fn session_source_entry<'a>(
+    sessions_cfg: &'a SessionsConfig,
+    provider_name: &str,
+) -> Option<&'a SessionSourceEntry> {
+    sessions_cfg.get(provider_name)
+}
+
+fn transcript_locator_script(entry: &SessionSourceEntry) -> Option<&str> {
+    entry.transcript_locator.as_deref()
+}
+
+fn single_transcript_stdout_line<'a>(lines: &'a [&'a str]) -> Result<&'a str, String> {
+    match lines {
         [] => Err("transcript locator returned empty stdout".to_string()),
-        [line] => Ok(Some(PathBuf::from(line))),
+        [line] => Ok(line),
         _ => Err("transcript locator stdout was not a single line".to_string()),
     }
+}
+
+fn transcript_path_from_line(line: &str) -> PathBuf {
+    PathBuf::from(line)
 }
 
 fn run_session_script(
@@ -257,8 +451,43 @@ fn run_session_script(
     session_id: Option<&str>,
     script_kind: &str,
 ) -> Result<String, String> {
-    use std::io::Read;
+    let mut cmd = session_script_command(script, state_dir, session_id);
+    let mut child = spawn_session_script_child(&mut cmd, script_kind)?;
 
+    // Drain stdout/stderr concurrently. A naive `try_wait` loop deadlocks
+    // for scripts that produce more than ~64KB on stdout: the kernel pipe
+    // fills up, the script blocks on write, the loop waits for exit forever.
+    let stdout_handle = spawn_stdout_reader(take_child_stdout(&mut child));
+    let stderr_handle = spawn_stderr_reader(take_child_stderr(&mut child));
+    let status = wait_for_session_script(&mut child, script_kind)?;
+    let stdout_text = join_script_reader(stdout_handle);
+    let stderr_text = join_script_reader(stderr_handle);
+
+    validate_session_script_success(script_kind, status, &stderr_text)?;
+    Ok(stdout_text)
+}
+
+fn validate_session_script_success(
+    script_kind: &str,
+    status: ExitStatus,
+    stderr_text: &str,
+) -> Result<(), String> {
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format_session_script_nonzero(
+            script_kind,
+            status,
+            stderr_text,
+        ))
+    }
+}
+
+fn session_script_command(
+    script: &str,
+    state_dir: &std::path::Path,
+    session_id: Option<&str>,
+) -> Command {
     let mut cmd = Command::new("sh");
     cmd.arg("-c").arg(script);
     cmd.env("STATE_DIR", state_dir);
@@ -268,65 +497,116 @@ fn run_session_script(
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    cmd
+}
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed to spawn {script_kind}: {e}"))?;
+fn spawn_session_script_child(cmd: &mut Command, script_kind: &str) -> Result<Child, String> {
+    cmd.spawn()
+        .map_err(|error| format_session_script_spawn_error(script_kind, error))
+}
 
-    // Drain stdout/stderr concurrently. A naive `try_wait` loop deadlocks
-    // for scripts that produce more than ~64KB on stdout: the kernel pipe
-    // fills up, the script blocks on write, the loop waits for exit forever.
-    let stdout = child.stdout.take().expect("piped");
-    let stderr = child.stderr.take().expect("piped");
-    let stdout_handle = std::thread::spawn(move || {
+fn format_session_script_spawn_error(script_kind: &str, error: std::io::Error) -> String {
+    format!("Failed to spawn {script_kind}: {error}")
+}
+
+fn take_child_stdout(child: &mut Child) -> ChildStdout {
+    child.stdout.take().expect("piped")
+}
+
+fn take_child_stderr(child: &mut Child) -> ChildStderr {
+    child.stderr.take().expect("piped")
+}
+
+fn spawn_stdout_reader(stdout: ChildStdout) -> JoinHandle<String> {
+    spawn_script_reader(stdout)
+}
+
+fn spawn_stderr_reader(stderr: ChildStderr) -> JoinHandle<String> {
+    spawn_script_reader(stderr)
+}
+
+fn spawn_script_reader<R>(mut reader: R) -> JoinHandle<String>
+where
+    R: Read + Send + 'static,
+{
+    std::thread::spawn(move || {
         let mut buf = String::new();
-        let mut s = stdout;
-        s.read_to_string(&mut buf).ok();
+        reader.read_to_string(&mut buf).ok();
         buf
-    });
-    let stderr_handle = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let mut s = stderr;
-        s.read_to_string(&mut buf).ok();
-        buf
-    });
+    })
+}
 
+fn wait_for_session_script(child: &mut Child, script_kind: &str) -> Result<ExitStatus, String> {
     let timeout = std::time::Duration::from_secs(SCRIPT_TIMEOUT_SECS);
     let start = std::time::Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(s)) => break s,
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    return Err(format!(
-                        "{} timed out after {SCRIPT_TIMEOUT_SECS}s",
-                        capitalize_script_kind(script_kind)
-                    ));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Err(e) => {
-                return Err(format!(
-                    "{} wait failed: {e}",
-                    capitalize_script_kind(script_kind)
-                ));
-            }
+    loop {
+        match poll_session_script(child) {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => wait_for_pending_session_script(child, start, timeout, script_kind)?,
+            Err(error) => return Err(format_session_script_wait_error(script_kind, error)),
         }
-    };
-
-    let stdout_text = stdout_handle.join().unwrap_or_default();
-    let stderr_text = stderr_handle.join().unwrap_or_default();
-
-    if !status.success() {
-        return Err(format!(
-            "{} exited {}: {}",
-            capitalize_script_kind(script_kind),
-            status.code().unwrap_or(-1),
-            stderr_text.trim()
-        ));
     }
-    Ok(stdout_text)
+}
+
+fn poll_session_script(child: &mut Child) -> Result<Option<ExitStatus>, std::io::Error> {
+    child.try_wait()
+}
+
+fn wait_for_pending_session_script(
+    child: &mut Child,
+    start: std::time::Instant,
+    timeout: std::time::Duration,
+    script_kind: &str,
+) -> Result<(), String> {
+    if script_wait_timed_out(start, timeout) {
+        kill_timed_out_session_script(child);
+        return Err(format_session_script_timeout(script_kind));
+    }
+    sleep_before_next_session_script_poll();
+    Ok(())
+}
+
+fn script_wait_timed_out(start: std::time::Instant, timeout: std::time::Duration) -> bool {
+    start.elapsed() >= timeout
+}
+
+fn kill_timed_out_session_script(child: &mut Child) {
+    let _ = child.kill();
+}
+
+fn sleep_before_next_session_script_poll() {
+    std::thread::sleep(std::time::Duration::from_millis(50));
+}
+
+fn format_session_script_timeout(script_kind: &str) -> String {
+    format!(
+        "{} timed out after {SCRIPT_TIMEOUT_SECS}s",
+        capitalize_script_kind(script_kind)
+    )
+}
+
+fn format_session_script_wait_error(script_kind: &str, error: std::io::Error) -> String {
+    format!(
+        "{} wait failed: {error}",
+        capitalize_script_kind(script_kind)
+    )
+}
+
+fn join_script_reader(handle: JoinHandle<String>) -> String {
+    handle.join().unwrap_or_default()
+}
+
+fn format_session_script_nonzero(
+    script_kind: &str,
+    status: ExitStatus,
+    stderr_text: &str,
+) -> String {
+    format!(
+        "{} exited {}: {}",
+        capitalize_script_kind(script_kind),
+        status.code().unwrap_or(-1),
+        stderr_text.trim()
+    )
 }
 
 fn capitalize_script_kind(kind: &str) -> String {

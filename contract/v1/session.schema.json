@@ -73,8 +73,8 @@
     "SessionCaptureResult": {
       "type": "object",
       "properties": {
-        "provider_session_id": { "type": "string" },
-        "state": { "type": "object", "additionalProperties": true },
+        "provider_session_id": { "type": ["string", "null"] },
+        "state": { "type": ["object", "null"], "additionalProperties": true },
         "artifacts": {
           "type": "array",
           "items": { "$ref": "common.schema.json#/$defs/Artifact" }

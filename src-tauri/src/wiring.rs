@@ -76,6 +76,10 @@ impl AgentRuntimeServices {
         let provider_registry =
             Arc::new(ProviderRegistry::empty(provider_registry_options.clone()));
         let provider_registry_handle = ProviderRegistryHandle::new(provider_registry.clone());
+        let session_lifecycle_service =
+            Arc::new(ProductionSessionLifecycleService::with_registry_handle(
+                provider_registry_handle.clone(),
+            ));
         Self {
             state_db_opener: Arc::new(ProductionStateDbOpener),
             app_config: Arc::new(FilesystemAppConfigRepository),
@@ -103,7 +107,7 @@ impl AgentRuntimeServices {
             provider_registry_handle,
             provider_registry_options,
             resume_service: Arc::new(ProductionResumeService::new()),
-            session_lifecycle_service: Arc::new(ProductionSessionLifecycleService::new()),
+            session_lifecycle_service,
             migration_service: Arc::new(ProductionMigrationService::new()),
             trace_service: Arc::new(ProductionTraceService::default()),
             session_export_service: Arc::new(ProductionSessionExportService::default()),
@@ -122,6 +126,10 @@ impl AgentRuntimeServices {
             registry_options.clone(),
         ));
         let provider_registry_handle = ProviderRegistryHandle::new(provider_registry.clone());
+        let session_lifecycle_service =
+            Arc::new(ProductionSessionLifecycleService::with_registry_handle(
+                provider_registry_handle.clone(),
+            ));
 
         Ok(Self {
             state_db_opener: Arc::new(ProductionStateDbOpener),
@@ -150,7 +158,7 @@ impl AgentRuntimeServices {
             provider_registry_handle,
             provider_registry_options: registry_options,
             resume_service: Arc::new(ProductionResumeService::new()),
-            session_lifecycle_service: Arc::new(ProductionSessionLifecycleService::new()),
+            session_lifecycle_service,
             migration_service: Arc::new(ProductionMigrationService::new()),
             trace_service: Arc::new(ProductionTraceService::default()),
             session_export_service: Arc::new(ProductionSessionExportService::default()),

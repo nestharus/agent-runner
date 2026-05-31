@@ -300,6 +300,7 @@ fn age_36_resume_session_migration_services_are_object_safe_with_contract_dtos()
         sessions_cfg: &sessions_cfg,
         providers_cfg: None,
         provider_name: "compile-provider",
+        external_provider: None,
         invocation_row_id,
         invocation_uuid: &start.invocation_uuid,
         effective_cwd: None,

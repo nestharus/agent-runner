@@ -4,6 +4,7 @@
 
 use std::path::Path;
 
+use oulipoly_config::ModelConfig;
 use oulipoly_runtime::services::InvocationLifecycleServicePort;
 use oulipoly_state::CompositeInvocationId;
 
@@ -20,6 +21,7 @@ pub(super) struct CompletedReplAttemptInput<'a, 'state> {
     pub(super) invocation_row_id: i64,
     pub(super) guard: &'a mut FinalizerGuard<'state>,
     pub(super) provider_name: &'a str,
+    pub(super) model: &'a ModelConfig,
     pub(super) result: &'a oulipoly_runtime::executor::cli::InteractiveExecutionResult,
     pub(super) resume: Option<&'a str>,
     pub(super) resume_session_id: Option<&'a str>,
@@ -57,6 +59,11 @@ fn ingest_successful_repl_session(input: &CompletedReplAttemptInput<'_, '_>) {
             sessions_cfg: &input.env.sessions_cfg,
             providers_cfg: Some(&input.env.providers_cfg),
             provider_name: input.provider_name,
+            external_provider: crate::session_ingest_cli::session_external_provider_identity(
+                input.agent_runtime_services,
+                Some(input.model),
+                input.provider_name,
+            ),
             invocation_row_id: input.invocation_row_id,
             invocation_uuid: &input.invocation.id,
             effective_cwd: Some(input.interactive_effective_cwd),

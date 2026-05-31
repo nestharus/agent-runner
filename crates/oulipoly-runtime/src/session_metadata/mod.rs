@@ -54,6 +54,8 @@ pub use registry::{
     hydrate_transcript_locator_registry,
 };
 
+use crate::provider_registry::ProviderRegistry;
+use crate::session_provider::{self, SessionProviderIdentity, SessionProviderLocateRequest};
 use ambiguity::{
     AmbiguityPolicy, count_recent_previews, recency_cutoff_for_resume_previews,
     reject_ambiguous_recent_matches, rejects_recent_ambiguity,
@@ -170,6 +172,25 @@ pub fn locate_session_metadata(
     )
 }
 
+pub fn locate_session_metadata_with_provider_dispatch(
+    state: &StateDb,
+    models: &ModelStore,
+    providers_cfg: &ProvidersConfig,
+    sessions_cfg: &SessionsConfig,
+    provider_registry: Option<&ProviderRegistry>,
+    input: &str,
+) -> Result<SessionMetadata, MetadataError> {
+    locate_session_metadata_with_dispatch_policy(
+        state,
+        models,
+        providers_cfg,
+        sessions_cfg,
+        provider_registry,
+        input,
+        AmbiguityPolicy::Reject,
+    )
+}
+
 pub fn locate_resume_session_metadata(
     state: &StateDb,
     models: &ModelStore,
@@ -195,53 +216,323 @@ fn locate_session_metadata_with_policy(
     input: &str,
     ambiguity_policy: AmbiguityPolicy,
 ) -> Result<SessionMetadata, MetadataError> {
-    let parsed_input = parse_session_uuid(input)?;
+    let parsed_input = parse_metadata_input(input)?;
+    reject_recent_ambiguity_for_policy(state, input, ambiguity_policy)?;
+    let facts = load_builtin_metadata_facts(state, models, providers_cfg, sessions_cfg, input)?;
+    Ok(map_builtin_session_metadata(parsed_input, facts))
+}
 
-    if rejects_recent_ambiguity(ambiguity_policy) {
-        let previews = metadata_db_result(fetch_resume_previews(state, input))?;
-        let cutoff = recency_cutoff_for_resume_previews();
-        reject_ambiguous_recent_matches(input, count_recent_previews(&previews, cutoff))?;
+fn locate_session_metadata_with_dispatch_policy(
+    state: &StateDb,
+    models: &ModelStore,
+    providers_cfg: &ProvidersConfig,
+    sessions_cfg: &SessionsConfig,
+    provider_registry: Option<&ProviderRegistry>,
+    input: &str,
+    ambiguity_policy: AmbiguityPolicy,
+) -> Result<SessionMetadata, MetadataError> {
+    let Some(registry) = provider_registry else {
+        return locate_session_metadata_with_policy(
+            state,
+            models,
+            providers_cfg,
+            sessions_cfg,
+            input,
+            ambiguity_policy,
+        );
+    };
+    let parsed_input = parse_metadata_input(input)?;
+    reject_recent_ambiguity_for_policy(state, input, ambiguity_policy)?;
+    let resolved = resolve_metadata_session(state, models, input)?;
+    if !resolved_uses_external_provider(&resolved) {
+        return locate_session_metadata_with_policy(
+            state,
+            models,
+            providers_cfg,
+            sessions_cfg,
+            input,
+            ambiguity_policy,
+        );
     }
+    locate_external_provider_session_metadata(
+        state,
+        providers_cfg,
+        registry,
+        parsed_input,
+        &resolved,
+    )
+}
 
-    let resolved = state
+fn parse_metadata_input(input: &str) -> Result<uuid::Uuid, MetadataError> {
+    parse_session_uuid(input)
+}
+
+fn reject_recent_ambiguity_for_policy(
+    state: &StateDb,
+    input: &str,
+    ambiguity_policy: AmbiguityPolicy,
+) -> Result<(), MetadataError> {
+    if !rejects_recent_ambiguity(ambiguity_policy) {
+        return Ok(());
+    }
+    let previews = metadata_db_result(fetch_resume_previews(state, input))?;
+    let cutoff = recency_cutoff_for_resume_previews();
+    reject_ambiguous_recent_matches(input, count_recent_previews(&previews, cutoff))
+}
+
+fn resolve_metadata_session(
+    state: &StateDb,
+    models: &ModelStore,
+    input: &str,
+) -> Result<oulipoly_state::ResolvedResume, MetadataError> {
+    state
         .resolve_resume(models, input, None)
-        .map_err(map_resume_error)?;
+        .map_err(map_resume_error)
+}
+
+fn resolved_uses_external_provider(resolved: &oulipoly_state::ResolvedResume) -> bool {
+    resolved
+        .model
+        .as_ref()
+        .is_some_and(|model| model.provider.is_some())
+}
+
+fn locate_external_provider_session_metadata(
+    state: &StateDb,
+    providers_cfg: &ProvidersConfig,
+    registry: &ProviderRegistry,
+    parsed_input: uuid::Uuid,
+    resolved: &oulipoly_state::ResolvedResume,
+) -> Result<SessionMetadata, MetadataError> {
+    let facts = load_external_metadata_facts(state, providers_cfg, registry, resolved)?;
+    Ok(map_external_session_metadata(parsed_input, resolved, facts))
+}
+
+struct BuiltinMetadataFacts {
+    resolved: oulipoly_state::ResolvedResume,
+    provider: oulipoly_config::ProviderConfig,
+    provider_name: String,
+    active_segment_id: i64,
+    located_transcript: LocatedTranscript,
+    workspace_root: PathBuf,
+}
+
+fn load_builtin_metadata_facts(
+    state: &StateDb,
+    models: &ModelStore,
+    providers_cfg: &ProvidersConfig,
+    sessions_cfg: &SessionsConfig,
+    input: &str,
+) -> Result<BuiltinMetadataFacts, MetadataError> {
+    let resolved = resolve_metadata_session(state, models, input)?;
     let provider = effective_provider_for_resolved(&resolved, providers_cfg)?;
     let provider_name = resolved.active_provider.clone();
-    let active_segment_id = active_segment_id_to_metadata_error_or_value(
-        metadata_db_result(fetch_active_segment_id(state, &resolved))?,
-        &resolved.chain_id,
-    )?;
-
+    let active_segment_id = external_active_segment_id(state, &resolved)?;
     let located_transcript = available_jsonl_path(
         sessions_cfg,
         provider.session_storage.as_ref(),
         &provider_name,
         &resolved.active_session_id,
     )?;
-    let storage_type = located_transcript.storage_classification;
-    let jsonl_path = located_transcript.path;
     let workspace_root = resolve_cwd_from_session_storage(
         provider.session_storage.as_ref(),
         &provider_name,
         &resolved.active_session_id,
     )?;
+    Ok(BuiltinMetadataFacts {
+        resolved,
+        provider,
+        provider_name,
+        active_segment_id,
+        located_transcript,
+        workspace_root,
+    })
+}
 
+fn map_builtin_session_metadata(
+    parsed_input: uuid::Uuid,
+    facts: BuiltinMetadataFacts,
+) -> SessionMetadata {
+    let storage_type = facts.located_transcript.storage_classification;
+    let jsonl_path = facts.located_transcript.path;
+    let active_session_uuid =
+        parse_optional_uuid(&facts.resolved.active_session_id).unwrap_or(parsed_input);
+    let chain_uuid = parse_optional_uuid(&facts.resolved.chain_id);
+    let mutable = is_metadata_mutable(
+        storage_type,
+        &facts.provider,
+        &jsonl_path,
+        &facts.workspace_root,
+    );
+    session_metadata_from_parts(SessionMetadataParts {
+        session_id: format_uuid(active_session_uuid),
+        chain_id: format_optional_uuid(&facts.resolved.chain_id, chain_uuid),
+        active_segment_id: facts.active_segment_id,
+        provider_name: facts.provider_name,
+        storage_type,
+        jsonl_path,
+        workspace_root: facts.workspace_root,
+        mutable,
+    })
+}
+
+struct ExternalMetadataFacts {
+    provider: oulipoly_config::ProviderConfig,
+    provider_name: String,
+    active_segment_id: i64,
+    located_transcript: LocatedTranscript,
+    workspace_root: PathBuf,
+}
+
+fn load_external_metadata_facts(
+    state: &StateDb,
+    providers_cfg: &ProvidersConfig,
+    registry: &ProviderRegistry,
+    resolved: &oulipoly_state::ResolvedResume,
+) -> Result<ExternalMetadataFacts, MetadataError> {
+    let provider = effective_provider_for_resolved(resolved, providers_cfg)?;
+    let provider_name = resolved.active_provider.clone();
+    let model_name = external_resolved_model_name(resolved)?;
+    let active_segment_id = external_active_segment_id(state, resolved)?;
+    let identity = external_locate_identity(registry, model_name, &provider_name)?;
+    let located_transcript =
+        locate_external_provider_transcript(registry, identity, &resolved.active_session_id)?;
+    let workspace_root = external_workspace_root(
+        provider.session_storage.as_ref(),
+        &provider_name,
+        &resolved.active_session_id,
+    );
+    Ok(ExternalMetadataFacts {
+        provider,
+        provider_name,
+        active_segment_id,
+        located_transcript,
+        workspace_root,
+    })
+}
+
+fn map_external_session_metadata(
+    parsed_input: uuid::Uuid,
+    resolved: &oulipoly_state::ResolvedResume,
+    facts: ExternalMetadataFacts,
+) -> SessionMetadata {
+    let storage_type = facts.located_transcript.storage_classification;
+    let jsonl_path = facts.located_transcript.path;
     let active_session_uuid =
         parse_optional_uuid(&resolved.active_session_id).unwrap_or(parsed_input);
     let chain_uuid = parse_optional_uuid(&resolved.chain_id);
-    let mutable = is_metadata_mutable(storage_type, &provider, &jsonl_path, &workspace_root);
-
-    Ok(session_metadata_from_parts(SessionMetadataParts {
+    let mutable = is_metadata_mutable(
+        storage_type,
+        &facts.provider,
+        &jsonl_path,
+        &facts.workspace_root,
+    );
+    session_metadata_from_parts(SessionMetadataParts {
         session_id: format_uuid(active_session_uuid),
         chain_id: format_optional_uuid(&resolved.chain_id, chain_uuid),
-        active_segment_id,
-        provider_name,
+        active_segment_id: facts.active_segment_id,
+        provider_name: facts.provider_name,
         storage_type,
         jsonl_path,
-        workspace_root,
+        workspace_root: facts.workspace_root,
         mutable,
-    }))
+    })
+}
+
+fn external_resolved_model_name(
+    resolved: &oulipoly_state::ResolvedResume,
+) -> Result<&str, MetadataError> {
+    resolved
+        .model_name
+        .as_deref()
+        .ok_or_else(|| MetadataError::Operational {
+            message: "session_provider_model_name_missing".to_string(),
+        })
+}
+
+fn external_active_segment_id(
+    state: &StateDb,
+    resolved: &oulipoly_state::ResolvedResume,
+) -> Result<i64, MetadataError> {
+    active_segment_id_to_metadata_error_or_value(
+        metadata_db_result(fetch_active_segment_id(state, resolved))?,
+        &resolved.chain_id,
+    )
+}
+
+fn locate_external_provider_transcript(
+    registry: &ProviderRegistry,
+    identity: SessionProviderIdentity,
+    session_id: &str,
+) -> Result<LocatedTranscript, MetadataError> {
+    session_provider::locate_transcript(SessionProviderLocateRequest {
+        registry,
+        identity,
+        session_id,
+        lookup_mode: TranscriptLookupMode::RequireExisting,
+        effective_cwd: None,
+    })
+    .map_err(session_provider_metadata_error)
+}
+
+fn external_locate_identity(
+    registry: &ProviderRegistry,
+    model_name: &str,
+    provider_name: &str,
+) -> Result<SessionProviderIdentity, MetadataError> {
+    let describe = external_locate_describe(registry, model_name)?;
+    Ok(external_identity_from_describe(
+        model_name,
+        provider_name,
+        describe,
+    ))
+}
+
+fn external_locate_describe(
+    registry: &ProviderRegistry,
+    model_name: &str,
+) -> Result<oulipoly_provider::generated::DescribeResult, MetadataError> {
+    registry
+        .describe_model_provider(model_name)
+        .map_err(|error| MetadataError::Operational {
+            message: format!("session_provider_describe_failed: {error}"),
+        })
+}
+
+fn external_identity_from_describe(
+    model_name: &str,
+    provider_name: &str,
+    describe: oulipoly_provider::generated::DescribeResult,
+) -> SessionProviderIdentity {
+    SessionProviderIdentity {
+        model_name: model_name.to_string(),
+        provider_name: provider_name.to_string(),
+        provider_instance_id: Some(format_external_provider_instance_id(&describe.provider_id)),
+        settings_id: external_settings_id(describe.settings_schema_id),
+    }
+}
+
+fn format_external_provider_instance_id(provider_id: &str) -> String {
+    format!("{provider_id}-instance")
+}
+
+fn external_settings_id(settings_schema_id: Option<String>) -> String {
+    settings_schema_id.unwrap_or_else(|| session_provider::S7A_NEUTRAL_SETTINGS_ID.to_string())
+}
+
+fn external_workspace_root(
+    session_storage: Option<&SessionStorage>,
+    provider_name: &str,
+    session_id: &str,
+) -> PathBuf {
+    resolve_cwd_from_session_storage(session_storage, provider_name, session_id)
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+fn session_provider_metadata_error(error: session_provider::SessionProviderError) -> MetadataError {
+    MetadataError::Operational {
+        message: error.to_string(),
+    }
 }
 
 pub fn resolve_resume_workspace_root(

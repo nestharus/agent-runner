@@ -1,6 +1,7 @@
 //! Declared roles: mapper, formatter, validator
 
 use oulipoly_config::{ModelConfig, ProvidersConfig};
+use oulipoly_runtime::provider_registry::ProviderRegistry;
 use oulipoly_runtime::services::SessionExportServiceRequest;
 use oulipoly_runtime::session_export::ExportError;
 use oulipoly_runtime::session_metadata::MetadataError;
@@ -201,12 +202,14 @@ pub(super) fn session_locate_environment(
     providers_cfg: ProvidersConfig,
     models: HashMap<String, ModelConfig>,
     sessions_cfg: oulipoly_config::SessionsConfig,
+    provider_registry: ProviderRegistry,
 ) -> super::orchestration::SessionLocateEnvironment {
     super::orchestration::SessionLocateEnvironment {
         state,
         providers_cfg,
         models,
         sessions_cfg,
+        provider_registry,
     }
 }
 
