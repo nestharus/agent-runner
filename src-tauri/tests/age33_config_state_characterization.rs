@@ -810,7 +810,16 @@ sessions_dir = {:?}
 
 #[test]
 fn age_33_tauri_private_helpers_keep_models_dir_parent_config_and_state_policy() {
-    let lib_source = include_str!("../src/lib.rs");
+    let setup_flow_source = concat!(
+        include_str!("../src/commands/setup_flow/orchestration.rs"),
+        "\n",
+        include_str!("../src/commands/setup_flow/accessor.rs"),
+    );
+    let discovery_source = concat!(
+        include_str!("../src/commands/discovery/orchestration.rs"),
+        "\n",
+        include_str!("../src/commands/discovery/accessor.rs"),
+    );
     let app_paths_source = include_str!("../src/app_paths.rs");
     let app_state_source = include_str!("../src/app_state.rs");
 
@@ -827,19 +836,19 @@ fn age_33_tauri_private_helpers_keep_models_dir_parent_config_and_state_policy()
         "GUI state helpers must keep opening state.db beside models_dir.parent()"
     );
     assert!(
-        lib_source.contains("MemoryGraph::open(&db_path)")
-            && lib_source.contains("state.models_dir")
-            && lib_source.contains("join(\"state.db\")"),
+        setup_flow_source.contains("MemoryGraph::open(db_path)")
+            && setup_flow_source.contains("state.models_dir")
+            && setup_flow_source.contains("join(\"state.db\")"),
         "setup memory command helpers must keep deriving the memory DB beside models_dir"
     );
     let discover_models_cmd = source_slice(
-        lib_source,
+        discovery_source,
         "async fn discover_models_cmd(",
         "fn persist_discovery_result(",
     );
     let discovery_opens_gui_db_path = discover_models_cmd
-        .contains("let db_path = state.db_path();")
-        && discover_models_cmd.contains("state_db_opener.open_at(&db_path)?");
+        .contains("let db_path = accessor::state_db_path(&state);")
+        && discovery_source.contains("opener.open_at(db_path)");
     assert!(
         discovery_opens_gui_db_path,
         "real backend discovery command must keep opening the GUI-derived DB path"

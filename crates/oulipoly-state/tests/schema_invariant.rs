@@ -139,10 +139,7 @@ fn declaration_carriers_present_in_source() {
                 "orchestration",
             ][..],
         ),
-        (
-            "src-tauri/src/lib.rs",
-            &["orchestration", "mapper", "predicate", "formatter"][..],
-        ),
+        ("src-tauri/src/lib.rs", &["orchestration"][..]),
         (
             "src-tauri/src/app_state.rs",
             &["orchestration", "mapper"][..],
@@ -209,6 +206,71 @@ fn declaration_carriers_present_in_source() {
         (
             "src-tauri/src/commands/quota_refresh/mapper.rs",
             &["mapper"][..],
+        ),
+        ("src-tauri/src/commands/accessor.rs", &["accessor"][..]),
+        (
+            "src-tauri/src/commands/setup_flow/mod.rs",
+            &["orchestration"][..],
+        ),
+        (
+            "src-tauri/src/commands/setup_flow/accessor.rs",
+            &["accessor"][..],
+        ),
+        (
+            "src-tauri/src/commands/setup_flow/formatter.rs",
+            &["formatter"][..],
+        ),
+        (
+            "src-tauri/src/commands/setup_flow/orchestration.rs",
+            &["orchestration"][..],
+        ),
+        (
+            "src-tauri/src/commands/providers_accounts/mod.rs",
+            &["orchestration"][..],
+        ),
+        (
+            "src-tauri/src/commands/providers_accounts/accessor.rs",
+            &["accessor"][..],
+        ),
+        (
+            "src-tauri/src/commands/providers_accounts/validator.rs",
+            &["validator"][..],
+        ),
+        (
+            "src-tauri/src/commands/providers_accounts/mapper.rs",
+            &["mapper"][..],
+        ),
+        (
+            "src-tauri/src/commands/providers_accounts/formatter.rs",
+            &["formatter"][..],
+        ),
+        (
+            "src-tauri/src/commands/providers_accounts/display_name.rs",
+            &["mapper"][..],
+        ),
+        (
+            "src-tauri/src/commands/providers_accounts/orchestration.rs",
+            &["orchestration"][..],
+        ),
+        (
+            "src-tauri/src/commands/discovery/mod.rs",
+            &["orchestration"][..],
+        ),
+        (
+            "src-tauri/src/commands/discovery/accessor.rs",
+            &["accessor"][..],
+        ),
+        (
+            "src-tauri/src/commands/discovery/predicate.rs",
+            &["predicate"][..],
+        ),
+        (
+            "src-tauri/src/commands/discovery/formatter.rs",
+            &["formatter"][..],
+        ),
+        (
+            "src-tauri/src/commands/discovery/orchestration.rs",
+            &["orchestration"][..],
         ),
         (
             "src-tauri/src/terminal_outcome_adapter.rs",
@@ -347,6 +409,33 @@ fn declaration_carriers_present_in_source() {
                 "src-tauri/src/commands/quota_refresh/candidates.rs",
                 "src-tauri/src/commands/quota_refresh/accessor.rs",
                 "src-tauri/src/commands/quota_refresh/mapper.rs",
+            ][..],
+        ),
+        (
+            "src-tauri/src/commands/setup_flow/orchestration.rs",
+            &[
+                "## Intrinsic-surface declarations",
+                "Domain: setup-flow command lifecycle",
+                "src-tauri/src/commands/setup_flow/accessor.rs",
+                "src-tauri/src/commands/setup_flow/formatter.rs",
+            ][..],
+        ),
+        (
+            "src-tauri/src/commands/providers_accounts/orchestration.rs",
+            &[
+                "## Intrinsic-surface declarations",
+                "Domain: provider-account command lifecycle",
+                "src-tauri/src/commands/providers_accounts/accessor.rs",
+                "src-tauri/src/commands/accessor.rs",
+            ][..],
+        ),
+        (
+            "src-tauri/src/commands/discovery/orchestration.rs",
+            &[
+                "## Intrinsic-surface declarations",
+                "Domain: discovery persistence lifecycle",
+                "src-tauri/src/commands/discovery/predicate.rs",
+                "src-tauri/src/commands/accessor.rs",
             ][..],
         ),
     ] {
@@ -502,6 +591,113 @@ fn declaration_carriers_present_in_source() {
                 "in-flight status string wire contract",
                 "quota window timestamp string wire contract",
             ][..],
+        ),
+        (
+            "src-tauri/src/commands/accessor.rs",
+            &[
+                "AppState setup repository access contract",
+                "test SetupRepository injection preference contract",
+            ][..],
+        ),
+        (
+            "src-tauri/src/commands/setup_flow/mod.rs",
+            &[
+                "Tauri IPC setup-flow command contract",
+                "setup session id string contract",
+            ][..],
+        ),
+        (
+            "src-tauri/src/commands/setup_flow/orchestration.rs",
+            &[
+                "Tauri IPC setup-flow command contract",
+                "setup input channel lifecycle contract",
+            ][..],
+        ),
+        (
+            "src-tauri/src/commands/setup_flow/accessor.rs",
+            &[
+                "AppState model-cache mutex contract",
+                "setup input sender storage contract",
+            ][..],
+        ),
+        (
+            "src-tauri/src/commands/setup_flow/formatter.rs",
+            &[
+                "setup memory-open error event string contract",
+                "setup response send-error string contract",
+            ][..],
+        ),
+        (
+            "src-tauri/src/commands/providers_accounts/mod.rs",
+            &[
+                "AddAccountInput deserialization contract",
+                "AddAccountInput field-name wire contract",
+            ][..],
+        ),
+        (
+            "src-tauri/src/commands/providers_accounts/orchestration.rs",
+            &[
+                "Tauri IPC provider/account command contract",
+                "provider sync detection delegation contract",
+            ][..],
+        ),
+        (
+            "src-tauri/src/commands/providers_accounts/accessor.rs",
+            &[
+                "SetupRepository provider/account read contract",
+                "SetupRepository account mutation contract",
+            ][..],
+        ),
+        (
+            "src-tauri/src/commands/providers_accounts/validator.rs",
+            &[
+                "AddAccountInput emptiness validation contract",
+                "account validation error string contract",
+            ][..],
+        ),
+        (
+            "src-tauri/src/commands/providers_accounts/mapper.rs",
+            &[
+                "AddAccountInput to AccountRecord mapping contract",
+                "RFC3339 timestamp field contract",
+            ][..],
+        ),
+        (
+            "src-tauri/src/commands/providers_accounts/formatter.rs",
+            &["provider-not-found error string contract"][..],
+        ),
+        (
+            "src-tauri/src/commands/providers_accounts/display_name.rs",
+            &["provider CLI name to display-name residual contract"][..],
+        ),
+        (
+            "src-tauri/src/commands/discovery/mod.rs",
+            &[
+                "Tauri IPC discovery command contract",
+                "discovered model DTO wire contract",
+            ][..],
+        ),
+        (
+            "src-tauri/src/commands/discovery/orchestration.rs",
+            &[
+                "Tauri IPC discovery command contract",
+                "discovery persistence ordering contract",
+            ][..],
+        ),
+        (
+            "src-tauri/src/commands/discovery/accessor.rs",
+            &[
+                "runtime discovery invocation contract",
+                "SetupRepository discovery persistence/read contract",
+            ][..],
+        ),
+        (
+            "src-tauri/src/commands/discovery/predicate.rs",
+            &["non-empty discovery stale-delete guard contract"][..],
+        ),
+        (
+            "src-tauri/src/commands/discovery/formatter.rs",
+            &["discovery blocking task join-error string contract"][..],
         ),
     ] {
         assert_carrier(file_path, "## Adapter declarations", snippets);
