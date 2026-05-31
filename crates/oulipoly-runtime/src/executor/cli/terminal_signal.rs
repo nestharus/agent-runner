@@ -31,6 +31,15 @@
 //!       - signal-hook-forwarding-contract
 //!       - executor-terminal-signal-dto-contract
 //!       - terminal-signal-recognizer-contract
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-runtime/src/executor/cli/terminal_signal.rs
+//!     role: intrinsic-surface
+//!     Domain: runtime terminal-signal vocabulary + reason mapping
+//!     Owns:
+//!       - full TerminalSignalKind vocabulary
+//!       - terminal status and synthetic exit-code mapping
+//!       - built-in terminal evidence construction
+//!       - terminal reason canonicalization hook
 //! ```
 
 #[cfg(unix)]
@@ -144,15 +153,17 @@ pub(super) fn terminal_reason_from_signal(
     status: Option<&ExitStatus>,
 ) -> Option<String> {
     match signal.kind {
-        TerminalSignalKind::ProlongedSilence => Some("bounded_silence".to_string()),
-        TerminalSignalKind::QuotaExhaustedInband => Some("quota_exhausted_inband".to_string()),
-        TerminalSignalKind::MaybeQuotaExhausted => Some("maybe_quota_exhausted".to_string()),
-        TerminalSignalKind::RateLimited => Some("rate_limited".to_string()),
+        TerminalSignalKind::ProlongedSilence
+        | TerminalSignalKind::QuotaExhaustedInband
+        | TerminalSignalKind::MaybeQuotaExhausted
+        | TerminalSignalKind::RateLimited
+        | TerminalSignalKind::SpawnError
+        | TerminalSignalKind::Unknown => {
+            crate::diagnostics::canonical_terminal_reason_for_kind(signal.kind).map(str::to_string)
+        }
         TerminalSignalKind::CleanExit
         | TerminalSignalKind::NonzeroExit
         | TerminalSignalKind::SignalExit => status.and_then(classify_terminal_reason),
-        TerminalSignalKind::SpawnError => Some("spawn_error".to_string()),
-        TerminalSignalKind::Unknown => Some("unknown_exit".to_string()),
     }
 }
 

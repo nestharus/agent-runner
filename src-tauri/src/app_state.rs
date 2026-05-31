@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! `orchestration`, `mapper`
+//! `orchestration`, `mapper`, `accessor`
 //!
 //! ## Intrinsic-surface declarations
 //!
@@ -119,7 +119,11 @@ impl AppState {
                     provider_registry.clone(),
                 ),
             ),
-            diagnostics_service: Arc::new(oulipoly_runtime::diagnostics::RuntimeDiagnosticsService),
+            diagnostics_service: Arc::new(
+                oulipoly_runtime::diagnostics::RuntimeDiagnosticsService::with_registry_handle(
+                    provider_registry.clone(),
+                ),
+            ),
             provider_registry,
             provider_registry_options,
             provider_settings: Mutex::new(provider_settings),

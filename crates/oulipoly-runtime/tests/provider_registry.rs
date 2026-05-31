@@ -1,3 +1,5 @@
+//! Declared roles: accessor, predicate, validator, parser, mapper, formatter, orchestration.
+
 use oulipoly_config::{
     ModelConfig, PromptMode, ProviderConfig,
     provider_implementation_ref::{ProviderImplementationRef, ProviderImplementationRefError},
@@ -1436,7 +1438,17 @@ fn registry_construction_and_cache_operations_do_not_mutate_state_config_or_cach
 #[test]
 fn production_service_sources_do_not_route_current_paths_through_provider_registry_seams() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    for relative in [
+    for relative in provider_registry_forbidden_sources() {
+        assert_source_forbids_provider_registry(relative, &read_runtime_source(&root, relative));
+    }
+    assert_diagnostics_provider_registry_refs_are_terminal_classify_only(&read_runtime_source(
+        &root,
+        "diagnostics/mod.rs",
+    ));
+}
+
+fn provider_registry_forbidden_sources() -> &'static [&'static str] {
+    &[
         "quota/in_flight.rs",
         "quota/mod.rs",
         "quota/marker_verification/mod.rs",
@@ -1446,23 +1458,86 @@ fn production_service_sources_do_not_route_current_paths_through_provider_regist
         "quota/outcome.rs",
         "quota/parse.rs",
         "quota/process.rs",
-        "diagnostics/mod.rs",
         "services/adapters.rs",
         "services/session_lifecycle.rs",
         "session_export/mod.rs",
         "session_replace/mod.rs",
         "services/migration.rs",
+    ]
+}
+
+fn read_runtime_source(root: &Path, relative: &str) -> String {
+    let path = root.join(relative);
+    fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
+}
+
+fn assert_source_forbids_provider_registry(relative: &str, source: &str) {
+    assert!(
+        !has_provider_registry_reference(source),
+        "{relative} must stay on the current production path in AGE-214 S4"
+    );
+}
+
+fn has_provider_registry_reference(source: &str) -> bool {
+    source.contains("provider_registry")
+        || source.contains("ProviderRegistry")
+        || source.contains("describe_model_provider")
+}
+
+fn assert_diagnostics_provider_registry_refs_are_terminal_classify_only(source: &str) {
+    assert_diagnostics_terminal_classify_registry_hook_present(source);
+    assert_diagnostics_legacy_error_branch_has_no_registry(source);
+    assert_diagnostics_classify_exhaustion_branch_has_no_registry(source);
+}
+
+fn assert_diagnostics_terminal_classify_registry_hook_present(source: &str) {
+    for expected in [
+        "DiagnosticsServiceRequest::ClassifyTerminal",
+        "classify_terminal_with_registry",
+        "diagnose_terminal_classify_hook",
+        "external_provider::classify_terminal",
+        "ProviderRegistryHandle::current",
     ] {
-        let path = root.join(relative);
-        let source = fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
         assert!(
-            !source.contains("provider_registry")
-                && !source.contains("ProviderRegistry")
-                && !source.contains("describe_model_provider"),
-            "{relative} must stay on the current production path in AGE-214 S4"
+            source.contains(expected),
+            "diagnostics/mod.rs must keep the sanctioned external terminal.classify registry hook: {expected}"
         );
     }
+}
+
+fn assert_diagnostics_legacy_error_branch_has_no_registry(source: &str) {
+    assert!(
+        !has_provider_registry_reference(diagnostics_request_branch_until(
+            source,
+            "DiagnosticsServiceRequest::DiagnoseError",
+            ".map_err(|message| ServiceError::Dependency { message }),",
+        )),
+        "built-in diagnostics DiagnoseError branch must not route through provider registry"
+    );
+}
+
+fn assert_diagnostics_classify_exhaustion_branch_has_no_registry(source: &str) {
+    assert!(
+        !has_provider_registry_reference(diagnostics_request_branch_until(
+            source,
+            "DiagnosticsServiceRequest::ClassifyExhaustion",
+            "DiagnosticsServiceRequest::ClassifyTerminal",
+        )),
+        "built-in ClassifyExhaustion branch must not route through provider registry"
+    );
+}
+
+fn diagnostics_request_branch_until<'a>(
+    source: &'a str,
+    marker: &str,
+    terminator: &str,
+) -> &'a str {
+    source
+        .split(marker)
+        .nth(1)
+        .and_then(|after| after.split(terminator).next())
+        .unwrap_or("")
 }
 
 #[test]

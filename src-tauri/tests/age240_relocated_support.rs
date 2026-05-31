@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+// Declared roles: accessor, formatter, mapper, validator, orchestration.
+
 use agent_runner_lib::commands::accessor;
 use agent_runner_lib::provider_settings;
 use agent_runner_lib::test_model_command::{
@@ -562,10 +564,13 @@ impl DiagnosticsServicePort for StubDiagnosticsService {
                 self.calls
                     .lock()
                     .unwrap()
-                    .push(format!("classify:{stderr}"));
+                    .push(classify_exhaustion_call_label(&stderr));
                 Ok(DiagnosticsServiceOutput::ExhaustionClassification {
                     is_exhausted: self.exhausted,
                 })
+            }
+            DiagnosticsServiceRequest::ClassifyTerminal(_) => {
+                panic!("terminal classify is outside AGE-240 diagnostics support")
             }
             DiagnosticsServiceRequest::DiagnoseError { .. } => {
                 self.calls
@@ -581,6 +586,10 @@ impl DiagnosticsServicePort for StubDiagnosticsService {
             }
         }
     }
+}
+
+fn classify_exhaustion_call_label(stderr: &str) -> String {
+    format!("classify:{stderr}")
 }
 
 struct StubRoutingService {

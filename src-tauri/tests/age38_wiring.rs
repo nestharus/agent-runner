@@ -24,22 +24,34 @@ fn runtime_paths(root: &std::path::Path) -> RuntimePaths {
 }
 
 fn source_block_after(source: &str, needle: &str) -> String {
-    let start = source
-        .find(needle)
-        .unwrap_or_else(|| panic!("missing {needle}"));
-    let open = source[start..]
+    let open = source_block_open_index(source, needle);
+    let close = source_block_close_index(source, open, needle);
+    source[open..=open + close].to_string()
+}
+
+fn source_block_open_index(source: &str, needle: &str) -> usize {
+    let start = source_marker_index(source, needle);
+    source[start..]
         .find('{')
         .map(|idx| start + idx)
-        .unwrap_or_else(|| panic!("missing opening brace for {needle}"));
+        .unwrap_or_else(|| panic!("missing opening brace for {needle}"))
+}
+
+fn source_marker_index(source: &str, needle: &str) -> usize {
+    source
+        .find(needle)
+        .unwrap_or_else(|| panic!("missing {needle}"))
+}
+
+fn source_block_close_index(source: &str, open: usize, needle: &str) -> usize {
     let mut depth = 0usize;
-    let close = source[open..]
+    source[open..]
         .char_indices()
         .find_map(|(offset, ch)| {
             depth = next_source_block_depth(depth, ch);
             source_block_close_offset(depth, ch, offset)
         })
-        .unwrap_or_else(|| panic!("missing closing brace for {needle}"));
-    source[open..=open + close].to_string()
+        .unwrap_or_else(|| panic!("missing closing brace for {needle}"))
 }
 
 fn next_source_block_depth(depth: usize, ch: char) -> usize {
@@ -120,7 +132,10 @@ fn assert_constructor_body_initializes_runtime_services(constructor: &str, body:
     );
     assert!(
         body.contains("diagnostics_service: Arc::new(RuntimeDiagnosticsService::new())")
-            || body.contains("diagnostics_service: Arc::new(RuntimeDiagnosticsService)"),
+            || body.contains("diagnostics_service: Arc::new(RuntimeDiagnosticsService)")
+            || body.contains(
+                "diagnostics_service: Arc::new(RuntimeDiagnosticsService::with_registry_handle(",
+            ),
         "{constructor} must initialize RuntimeDiagnosticsService"
     );
 }

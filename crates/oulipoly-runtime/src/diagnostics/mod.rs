@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! `accessor`, `mapper`, `parser`, `formatter`, `predicate`, `orchestration`
+//! `accessor`, `mapper`, `parser`, `formatter`, `predicate`, `orchestration`, `validator`
 //!
 //! ## Intrinsic-surface declarations
 //!
@@ -8,21 +8,28 @@
 //! intrinsic_surface_declarations:
 //!   - component: crates/oulipoly-runtime/src/diagnostics/mod.rs
 //!     role: intrinsic-surface
-//!     Domain: diagnostic_classification
+//!     Domain: runtime diagnostics service facade
 //!     Owns:
 //!       - error category vocabulary
 //!       - non-authoritative quota/rate-limit classification fallback (`classify_exhaustion` always false post-PR #126)
 //!       - diagnostic model port + prompt structure
-//!       - service DTO + request/error shape
+//!       - diagnostics service request/output/port surface
+//!       - registry-backed external-provider terminal-classify hook
 //! ```
 
+pub(crate) mod external_provider;
+
 use crate::executor;
+use crate::executor::terminal_signal::TerminalSignalKind;
+use crate::provider_registry::{ProviderRegistry, ProviderRegistryHandle};
 use crate::services::{
     DiagnosticsServiceOutput, DiagnosticsServicePort, DiagnosticsServiceRequest, ServiceError,
+    TerminalClassification, TerminalClassifyServiceRequest,
 };
 use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 const MAX_STDERR_LEN: usize = 2000;
 
@@ -59,7 +66,24 @@ impl ErrorCategory {
     }
 }
 
-pub struct RuntimeDiagnosticsService;
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeDiagnosticsService {
+    provider_registry: Option<ProviderRegistryHandle>,
+}
+
+impl RuntimeDiagnosticsService {
+    pub fn new(provider_registry: Arc<ProviderRegistry>) -> Self {
+        Self {
+            provider_registry: Some(ProviderRegistryHandle::new(provider_registry)),
+        }
+    }
+
+    pub fn with_registry_handle(provider_registry: ProviderRegistryHandle) -> Self {
+        Self {
+            provider_registry: Some(provider_registry),
+        }
+    }
+}
 
 impl DiagnosticsServicePort for RuntimeDiagnosticsService {
     fn diagnose(
@@ -71,6 +95,10 @@ impl DiagnosticsServicePort for RuntimeDiagnosticsService {
                 Ok(DiagnosticsServiceOutput::ExhaustionClassification {
                     is_exhausted: classify_exhaustion(&stderr),
                 })
+            }
+            DiagnosticsServiceRequest::ClassifyTerminal(request) => {
+                diagnose_terminal_classify_hook(self.provider_registry.as_ref(), request)
+                    .map(DiagnosticsServiceOutput::TerminalClassification)
             }
             DiagnosticsServiceRequest::DiagnoseError {
                 diagnostics_model,
@@ -92,6 +120,33 @@ impl DiagnosticsServicePort for RuntimeDiagnosticsService {
             .map(|diagnosis| DiagnosticsServiceOutput::Diagnosis { diagnosis })
             .map_err(|message| ServiceError::Dependency { message }),
         }
+    }
+}
+
+pub fn classify_terminal_with_registry(
+    registry: &ProviderRegistry,
+    request: TerminalClassifyServiceRequest,
+) -> Result<TerminalClassification, ServiceError> {
+    external_provider::classify_terminal(registry, request)
+}
+
+pub fn canonical_terminal_reason_for_kind(kind: TerminalSignalKind) -> Option<&'static str> {
+    external_provider::fixed_reason_for_kind(kind)
+}
+
+fn diagnose_terminal_classify_hook(
+    provider_registry: Option<&ProviderRegistryHandle>,
+    request: TerminalClassifyServiceRequest,
+) -> Result<TerminalClassification, ServiceError> {
+    let registry = provider_registry
+        .map(ProviderRegistryHandle::current)
+        .ok_or_else(terminal_registry_unavailable)?;
+    classify_terminal_with_registry(&registry, request)
+}
+
+fn terminal_registry_unavailable() -> ServiceError {
+    ServiceError::Unavailable {
+        message: "external provider terminal classify registry unavailable".to_string(),
     }
 }
 
@@ -136,20 +191,52 @@ pub fn diagnose_error(
 ) -> Result<Diagnosis, String> {
     let truncated = truncate_stderr_for_prompt(stderr);
     let prompt = format_diagnosis_prompt(exit_code, &truncated);
-
     let extra_inputs = HashMap::new();
-    let result =
-        executor::execute_effective_with_inputs_and_env(executor::cli::EffectiveExecuteRequest {
-            model: diagnostics_model,
-            provider: effective_provider,
-            provider_index,
-            prompt_mode,
-            prompt: &prompt,
-            working_dir,
-            extra_inputs: &extra_inputs,
-            parent_invocation_env: None,
-        })?;
+    let request = diagnostic_execute_request(
+        diagnostics_model,
+        effective_provider,
+        provider_index,
+        prompt_mode,
+        &prompt,
+        working_dir,
+        &extra_inputs,
+    );
+    let result = execute_diagnostics_request(request)?;
+    diagnosis_from_execution_result(&result, stderr, exit_code)
+}
 
+fn diagnostic_execute_request<'a>(
+    diagnostics_model: &'a ModelConfig,
+    effective_provider: &'a ProviderConfig,
+    provider_index: usize,
+    prompt_mode: PromptMode,
+    prompt: &'a str,
+    working_dir: Option<&'a Path>,
+    extra_inputs: &'a HashMap<String, Vec<String>>,
+) -> executor::cli::EffectiveExecuteRequest<'a> {
+    executor::cli::EffectiveExecuteRequest {
+        model: diagnostics_model,
+        provider: effective_provider,
+        provider_index,
+        prompt_mode,
+        prompt,
+        working_dir,
+        extra_inputs,
+        parent_invocation_env: None,
+    }
+}
+
+fn execute_diagnostics_request(
+    request: executor::cli::EffectiveExecuteRequest<'_>,
+) -> Result<executor::ExecutionResult, String> {
+    executor::execute_effective_with_inputs_and_env(request)
+}
+
+fn diagnosis_from_execution_result(
+    result: &executor::ExecutionResult,
+    stderr: &str,
+    exit_code: i32,
+) -> Result<Diagnosis, String> {
     if result.exit_code != 0 {
         return Ok(heuristic_diagnosis(stderr, exit_code));
     }
@@ -185,11 +272,19 @@ fn diagnosis_summary_text(lines: &[&str]) -> String {
 
 fn parse_diagnosis(output: &str, stderr: &str, exit_code: i32) -> Result<Diagnosis, String> {
     let lines = parse_diagnosis_output_lines(output);
+    diagnosis_from_parsed_lines(&lines, stderr, exit_code)
+}
+
+fn diagnosis_from_parsed_lines(
+    lines: &[&str],
+    stderr: &str,
+    exit_code: i32,
+) -> Result<Diagnosis, String> {
     if lines.is_empty() {
         return Ok(heuristic_diagnosis(stderr, exit_code));
     }
 
-    let category = map_error_category_token(lines[0].trim());
+    let category = diagnosis_category_from_lines(lines);
 
     if category == ErrorCategory::Unknown {
         let heuristic = heuristic_diagnosis(stderr, exit_code);
@@ -198,8 +293,12 @@ fn parse_diagnosis(output: &str, stderr: &str, exit_code: i32) -> Result<Diagnos
         }
     }
 
-    let summary = diagnosis_summary_text(&lines);
+    let summary = diagnosis_summary_text(lines);
     Ok(Diagnosis { category, summary })
+}
+
+fn diagnosis_category_from_lines(lines: &[&str]) -> ErrorCategory {
+    map_error_category_token(lines[0].trim())
 }
 
 fn normalize_stderr_for_heuristic(stderr: &str) -> String {
