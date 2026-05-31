@@ -258,7 +258,7 @@ fn ti_15_tauri_state_command_open_errors_preserve_variant_and_rebuild_guidance()
     let app_state_source = include_str!("../src/app_state.rs");
     assert!(
         lib_commands_source.contains("#[path = \"commands/accessor.rs\"]")
-            && lib_commands_source.contains("pub(crate) mod accessor;")
+            && lib_commands_source.contains("pub mod accessor;")
             && command_accessor_source.contains("fn open_state_db")
             && command_accessor_source.contains("state.state_db_opener.open_at(&state.db_path())"),
         "Tauri state commands must share the migration-aware StateDb opener"

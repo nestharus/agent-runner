@@ -1,5 +1,5 @@
 #[path = "commands/accessor.rs"]
-pub(crate) mod accessor;
+pub mod accessor;
 
 #[path = "commands/discovery/mod.rs"]
 pub mod discovery;

@@ -44,7 +44,7 @@ pub fn run_tauri() {
             commands::setup_flow::check_setup_needed,
             commands::setup_flow::start_setup,
             commands::setup_flow::start_cli_setup,
-            crate::reload_models,
+            commands::models::reload::reload_models,
             commands::setup_flow::setup_respond,
             commands::setup_flow::cancel_setup,
             commands::setup_flow::detect_clis,

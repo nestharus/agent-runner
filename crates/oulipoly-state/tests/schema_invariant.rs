@@ -47,7 +47,10 @@ fn assert_declared_roles(file_path: &str, roles: &[&str]) {
     let source = source(file_path);
     if !matches!(
         file_path,
-        "src-tauri/src/app_state.rs" | "src-tauri/src/app_paths.rs" | "src-tauri/src/run_tauri.rs"
+        "src-tauri/src/app_state.rs"
+            | "src-tauri/src/app_paths.rs"
+            | "src-tauri/src/run_tauri.rs"
+            | "src-tauri/src/lib.rs"
     ) {
         assert!(
             source.contains("## Declared roles"),
@@ -139,7 +142,7 @@ fn declaration_carriers_present_in_source() {
                 "orchestration",
             ][..],
         ),
-        ("src-tauri/src/lib.rs", &["orchestration"][..]),
+        ("src-tauri/src/lib.rs", &["none"][..]),
         (
             "src-tauri/src/app_state.rs",
             &["orchestration", "mapper"][..],
@@ -164,6 +167,10 @@ fn declaration_carriers_present_in_source() {
         ),
         (
             "src-tauri/src/commands/models/orchestration.rs",
+            &["orchestration"][..],
+        ),
+        (
+            "src-tauri/src/commands/models/reload.rs",
             &["orchestration"][..],
         ),
         ("src-tauri/src/commands/pools/mod.rs", &["none"][..]),
@@ -225,6 +232,10 @@ fn declaration_carriers_present_in_source() {
             &["orchestration"][..],
         ),
         (
+            "src-tauri/src/commands/setup_flow/provider_probe.rs",
+            &["predicate"][..],
+        ),
+        (
             "src-tauri/src/commands/providers_accounts/mod.rs",
             &["orchestration"][..],
         ),
@@ -250,6 +261,10 @@ fn declaration_carriers_present_in_source() {
         ),
         (
             "src-tauri/src/commands/providers_accounts/orchestration.rs",
+            &["orchestration"][..],
+        ),
+        (
+            "src-tauri/src/commands/test_model/diagnostics_fallback.rs",
             &["orchestration"][..],
         ),
         (
@@ -348,6 +363,16 @@ fn declaration_carriers_present_in_source() {
     }
 
     for (file_path, snippets) in [
+        (
+            "src-tauri/src/lib.rs",
+            &[
+                "## Intrinsic-surface declarations",
+                "Domain: tauri-client facade",
+                "functionless facade sentinel",
+                "public re-export compatibility",
+                "module declaration boundary",
+            ][..],
+        ),
         (
             "src-tauri/src/dispatch.rs",
             &[
@@ -493,6 +518,16 @@ fn declaration_carriers_present_in_source() {
             ][..],
         ),
         (
+            "src-tauri/src/commands/models/reload.rs",
+            &[
+                "model-reload lifecycle contract",
+                "provider-config load contract",
+                "model-cache mutation contract",
+                "provider-settings refresh contract",
+                "Tauri command registration contract",
+            ][..],
+        ),
+        (
             "src-tauri/src/commands/models/accessor.rs",
             &[
                 "AppState model-cache mutex contract",
@@ -614,6 +649,15 @@ fn declaration_carriers_present_in_source() {
             ][..],
         ),
         (
+            "src-tauri/src/commands/setup_flow/provider_probe.rs",
+            &[
+                "std::process::Command host-command probe contract",
+                "which executable lookup contract",
+                "claude provider availability invocation contract",
+                "setup-needed boolean contract",
+            ][..],
+        ),
+        (
             "src-tauri/src/commands/setup_flow/accessor.rs",
             &[
                 "AppState model-cache mutex contract",
@@ -669,6 +713,15 @@ fn declaration_carriers_present_in_source() {
         (
             "src-tauri/src/commands/providers_accounts/display_name.rs",
             &["provider CLI name to display-name residual contract"][..],
+        ),
+        (
+            "src-tauri/src/commands/test_model/diagnostics_fallback.rs",
+            &[
+                "terminal-text diagnostics-fallback decision contract",
+                "local diagnostic-input duplicate contract",
+                "diagnostics classify-exhaustion request contract",
+                "fallback disposition result contract",
+            ][..],
         ),
         (
             "src-tauri/src/commands/discovery/mod.rs",

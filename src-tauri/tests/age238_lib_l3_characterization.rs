@@ -8,6 +8,8 @@ fn setup_flow_source() -> &'static str {
         "\n",
         include_str!("../src/commands/setup_flow/orchestration.rs"),
         "\n",
+        include_str!("../src/commands/setup_flow/provider_probe.rs"),
+        "\n",
         include_str!("../src/commands/setup_flow/accessor.rs"),
         "\n",
         include_str!("../src/commands/setup_flow/formatter.rs"),
@@ -56,6 +58,10 @@ fn run_tauri_source() -> &'static str {
 
 fn lib_commands_source() -> &'static str {
     include_str!("../src/lib_commands.rs")
+}
+
+fn models_reload_source() -> &'static str {
+    include_str!("../src/commands/models/reload.rs")
 }
 
 fn command_accessor_source() -> &'static str {
@@ -144,6 +150,7 @@ fn occurrence_count(haystack: &str, needle: &str) -> usize {
 fn age238_check_setup_needed_keeps_empty_models_and_claude_probe_residual() {
     let body = function_body(setup_flow_source(), "fn check_setup_needed");
     let compacted = compact(body);
+    let compacted_surface = compact(setup_flow_source());
 
     assert_contains(
         &compacted,
@@ -156,25 +163,26 @@ fn age238_check_setup_needed_keeps_empty_models_and_claude_probe_residual() {
         "empty model cache must require setup",
     );
     assert_contains(
-        body,
+        setup_flow_source(),
         "std::process::Command::new(\"which\").arg(\"claude\").output()",
-        "existing Claude availability probe residual must remain visible before L6",
+        "existing Claude availability probe residual must remain visible in the L6 island",
     );
     assert_contains(
-        &compacted,
-        "Ok(o)ifo.status.success()=>Ok(false)",
+        &compacted_surface,
+        "!matches!(output,Ok(o)ifo.status.success())",
         "successful which claude probe currently suppresses setup",
     );
     assert_contains(
         &compacted,
-        "_=>Ok(true)",
+        "Ok(provider_probe::claude_probe_requires_setup())",
         "failed which claude probe currently requires setup",
     );
 }
 
 #[test]
 fn age238_check_setup_needed_probe_shape_is_exact_and_emits_no_output() {
-    let body = function_body(setup_flow_source(), "fn check_setup_needed");
+    let setup_body = function_body(setup_flow_source(), "fn check_setup_needed");
+    let body = function_body(setup_flow_source(), "fn claude_probe_requires_setup");
     let compacted = compact(body);
 
     assert_contains(
@@ -183,9 +191,9 @@ fn age238_check_setup_needed_probe_shape_is_exact_and_emits_no_output() {
         "Claude residual probe must keep exact which/arg/output shape",
     );
     assert_order(
-        body,
+        setup_body,
         "if models_empty",
-        "std::process::Command::new(\"which\")",
+        "provider_probe::claude_probe_requires_setup()",
         "empty cache return must precede provider-specific probe",
     );
 
@@ -673,7 +681,7 @@ fn age238_run_tauri_registration_keeps_reload_models_adjacency_before_extraction
         "commands::setup_flow::check_setup_needed",
         "commands::setup_flow::start_setup",
         "commands::setup_flow::start_cli_setup",
-        "crate::reload_models",
+        "commands::models::reload::reload_models",
         "commands::setup_flow::setup_respond",
         "commands::providers_accounts::list_cli_providers",
         "commands::discovery::discover_models_cmd",
@@ -687,12 +695,12 @@ fn age238_run_tauri_registration_keeps_reload_models_adjacency_before_extraction
     assert_order(
         handler,
         "commands::setup_flow::start_cli_setup",
-        "crate::reload_models",
+        "commands::models::reload::reload_models",
         "reload_models must remain adjacent to setup command registration",
     );
     assert_order(
         handler,
-        "crate::reload_models",
+        "commands::models::reload::reload_models",
         "commands::setup_flow::setup_respond",
         "reload_models must stay before setup response registration",
     );
@@ -700,17 +708,17 @@ fn age238_run_tauri_registration_keeps_reload_models_adjacency_before_extraction
 
 #[test]
 fn age238_provider_settings_adjacency_guard_remains_source_local_before_extraction() {
-    let reload = function_body(lib_source(), "fn reload_models");
+    let reload = function_body(models_reload_source(), "fn reload_models_inner");
 
     assert_contains(
         reload,
-        "provider_settings::refresh_provider_settings_host(&state)?",
-        "provider-settings refresh must remain attached to reload_models while lib.rs is the residual owner",
+        "provider_settings::refresh_provider_settings_host(state)?",
+        "provider-settings refresh must remain attached to reload_models in its dedicated owner",
     );
     assert_contains(
         lib_source(),
         "#[path = \"commands/provider_settings.rs\"]",
-        "provider-settings module path must remain available beside the lib.rs residual reload handler",
+        "provider-settings module path must remain available to the dedicated reload handler",
     );
 }
 

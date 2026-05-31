@@ -39,7 +39,6 @@ pub(crate) fn test_model_command_inputs(
     ))
 }
 
-#[cfg(test)]
 pub(crate) fn test_model_for_test_inputs(
     models: &HashMap<String, ModelConfig>,
     models_dir: &Path,

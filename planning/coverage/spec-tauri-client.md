@@ -15,6 +15,7 @@
 - `src-tauri/src/commands/models/validator.rs`
 - `src-tauri/src/commands/models/formatter.rs`
 - `src-tauri/src/commands/models/orchestration.rs`
+- `src-tauri/src/commands/models/reload.rs`
 - `src-tauri/src/commands/pools/mod.rs`
 - `src-tauri/src/commands/pools/derive.rs`
 - `src-tauri/src/commands/pools/update.rs`
@@ -29,6 +30,7 @@
 - `src-tauri/src/commands/accessor.rs`
 - `src-tauri/src/commands/setup_flow/mod.rs`
 - `src-tauri/src/commands/setup_flow/orchestration.rs`
+- `src-tauri/src/commands/setup_flow/provider_probe.rs`
 - `src-tauri/src/commands/setup_flow/accessor.rs`
 - `src-tauri/src/commands/setup_flow/formatter.rs`
 - `src-tauri/src/commands/providers_accounts/mod.rs`
@@ -45,6 +47,7 @@
 - `src-tauri/src/commands/discovery/formatter.rs`
 - `src-tauri/src/commands/test_model/mod.rs`
 - `src-tauri/src/commands/test_model/orchestration.rs`
+- `src-tauri/src/commands/test_model/diagnostics_fallback.rs`
 - `src-tauri/src/commands/test_model/lookup.rs`
 - `src-tauri/src/commands/test_model/dispatch.rs`
 - `src-tauri/src/commands/test_model/validator.rs`

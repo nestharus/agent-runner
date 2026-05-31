@@ -29,7 +29,6 @@ use oulipoly_config::repositories::{
 };
 use oulipoly_setup::actions::UserResponse;
 use oulipoly_state::repositories::ProductionStateDbOpener;
-#[cfg(test)]
 use oulipoly_state::repositories::SetupRepository;
 use oulipoly_state::repositories::StateDbOpener;
 use std::collections::HashMap;
@@ -53,10 +52,8 @@ pub struct AppState {
     pub(crate) executor_service: Arc<dyn oulipoly_runtime::services::ExecutorServicePort>,
     pub(crate) diagnostics_service: Arc<dyn oulipoly_runtime::services::DiagnosticsServicePort>,
     pub(crate) provider_settings: Mutex<oulipoly_runtime::provider_settings::ProviderSettingsHost>,
-    #[cfg(test)]
     pub(crate) provider_settings_test_double:
         Mutex<Option<provider_settings::ProviderSettingsCommandResponses>>,
-    #[cfg(test)]
     pub(crate) setup_repository: Option<Arc<dyn SetupRepository + Send + Sync>>,
 }
 
@@ -85,9 +82,7 @@ impl AppState {
             executor_service: Arc::clone(&services.executor_service),
             diagnostics_service: Arc::clone(&services.diagnostics_service),
             provider_settings: Mutex::new(provider_settings),
-            #[cfg(test)]
             provider_settings_test_double: Mutex::new(None),
-            #[cfg(test)]
             setup_repository: None,
         }
     }
@@ -106,9 +101,7 @@ impl AppState {
             executor_service: Arc::new(oulipoly_runtime::executor::RuntimeExecutorService),
             diagnostics_service: Arc::new(oulipoly_runtime::diagnostics::RuntimeDiagnosticsService),
             provider_settings: Mutex::new(provider_settings),
-            #[cfg(test)]
             provider_settings_test_double: Mutex::new(None),
-            #[cfg(test)]
             setup_repository: None,
         }
     }
@@ -121,19 +114,17 @@ impl AppState {
     }
 }
 
-#[cfg(test)]
-pub(crate) struct AppStateTestServices {
-    pub(crate) providers_config: Arc<dyn ProvidersConfigRepository + Send + Sync>,
-    pub(crate) state_db_opener: Arc<dyn StateDbOpener + Send + Sync>,
-    pub(crate) setup_repository: Arc<dyn SetupRepository + Send + Sync>,
-    pub(crate) quota_service: Arc<dyn oulipoly_runtime::services::QuotaServicePort>,
-    pub(crate) executor_service: Arc<dyn oulipoly_runtime::services::ExecutorServicePort>,
-    pub(crate) diagnostics_service: Arc<dyn oulipoly_runtime::services::DiagnosticsServicePort>,
+pub struct AppStateTestServices {
+    pub providers_config: Arc<dyn ProvidersConfigRepository + Send + Sync>,
+    pub state_db_opener: Arc<dyn StateDbOpener + Send + Sync>,
+    pub setup_repository: Arc<dyn SetupRepository + Send + Sync>,
+    pub quota_service: Arc<dyn oulipoly_runtime::services::QuotaServicePort>,
+    pub executor_service: Arc<dyn oulipoly_runtime::services::ExecutorServicePort>,
+    pub diagnostics_service: Arc<dyn oulipoly_runtime::services::DiagnosticsServicePort>,
 }
 
-#[cfg(test)]
 impl AppState {
-    pub(crate) fn with_services(
+    pub fn with_services(
         models_dir: PathBuf,
         models: HashMap<String, config::ModelConfig>,
         services: AppStateTestServices,
