@@ -1,17 +1,47 @@
 //! ## Declared roles
-//! orchestration, mapper, formatter
+//! orchestration, predicate, mapper, formatter
 //!
 //! Migration service output mapper. It preserves the service-level distinction
 //! between nonfatal migration decisions and infrastructure failures.
 
+mod candidate_failure_orchestration;
+mod candidate_failure_state_access;
+mod error_formatter;
+mod external_branch_orchestration;
+mod external_identity_accessor;
+mod external_target_validator;
+mod provider_name_accessor;
+mod rejection_mapper;
+
 use super::dtos::{MigrationServiceOutput, MigrationServiceRequest, RotationFailedReason};
 use super::error::ServiceError;
 use crate::balancer::{
-    FailureClass, ManualMigrationRejection, MigrationDecision, TransitionReason,
-    apply_post_failure_forensics, decide_manual_migration, select_next_working_candidate,
+    MigrationDecision, TransitionReason, decide_manual_migration, select_next_working_candidate,
 };
+use crate::provider_registry::ProviderRegistryHandle;
 
 pub(super) fn migrate(
+    request: MigrationServiceRequest<'_>,
+    provider_registry: Option<&ProviderRegistryHandle>,
+) -> Result<MigrationServiceOutput, ServiceError> {
+    if external_branch_orchestration::model_declares_external_provider(&request) {
+        crate::rotation_journal::startup_recovery_before_provider_dispatch(&request)
+            .map_err(error_formatter::construct_migration_service_error)?;
+    }
+    match external_branch_orchestration::select_migration_branch(&request, provider_registry)? {
+        external_branch_orchestration::MigrationBranch::BuiltIn => migrate_built_in(request),
+        external_branch_orchestration::MigrationBranch::External { identity } => {
+            crate::rotation_external_provider::materialize_rotation(
+                provider_registry.expect("external identity requires registry"),
+                identity,
+                &request,
+            )
+            .map_err(error_formatter::construct_migration_service_error)
+        }
+    }
+}
+
+fn migrate_built_in(
     request: MigrationServiceRequest<'_>,
 ) -> Result<MigrationServiceOutput, ServiceError> {
     // AGE-163 WU-A.5: explicit manual-target requests route through the
@@ -23,9 +53,7 @@ pub(super) fn migrate(
     }
     match decide_service_migration(&request) {
         Ok(MigrationDecision::Stay) => Ok(MigrationServiceOutput::Stay),
-        Err(err) => Err(ServiceError::Dependency {
-            message: format!("{err:?}"),
-        }),
+        Err(err) => Err(error_formatter::migration_dependency_error(err)),
         Ok(MigrationDecision::Migrate {
             target_provider_index,
             reason,
@@ -44,30 +72,11 @@ fn migrate_manual(
             reason,
         }) => match attempt_migration(&mut request, target_provider_index, reason) {
             Ok(segment) => Ok(MigrationServiceOutput::Migrated { segment }),
-            Err(err) => Err(ServiceError::Dependency {
-                message: format!("{err:?}"),
-            }),
+            Err(err) => Err(error_formatter::migration_dependency_error(err)),
         },
         Err(rejection) => Ok(MigrationServiceOutput::RotationFailed {
-            reason: rejection_to_rotation_failed(rejection),
+            reason: rejection_mapper::rejection_to_rotation_failed(rejection),
         }),
-    }
-}
-
-fn rejection_to_rotation_failed(rejection: ManualMigrationRejection) -> RotationFailedReason {
-    match rejection {
-        ManualMigrationRejection::SingleProviderPool { provider } => {
-            RotationFailedReason::ManualTargetIsSingleProviderPool { provider }
-        }
-        ManualMigrationRejection::ActiveProviderNotInPool { active } => {
-            RotationFailedReason::ManualTargetActiveNotInPool { active }
-        }
-        ManualMigrationRejection::TargetNotInPool { target, pool } => {
-            RotationFailedReason::ManualTargetNotInPool { target, pool }
-        }
-        ManualMigrationRejection::NotMigratablePair { source, target } => {
-            RotationFailedReason::ManualTargetNotMigratable { source, target }
-        }
     }
 }
 
@@ -98,9 +107,7 @@ fn run_service_migration(
         ) if auto_rotate_path => {
             iterate_working_set_candidates(&mut request, initial_target_index, reason, err)
         }
-        Err(err) => Err(ServiceError::Dependency {
-            message: format!("{err:?}"),
-        }),
+        Err(err) => Err(error_formatter::migration_dependency_error(err)),
     }
 }
 
@@ -128,7 +135,7 @@ fn iterate_working_set_candidates(
     initial_error: crate::migration::MigrationError,
 ) -> Result<MigrationServiceOutput, ServiceError> {
     let mut candidates_tried = Vec::new();
-    record_failed_candidate(
+    candidate_failure_orchestration::record_failed_candidate(
         request,
         initial_target_index,
         &initial_error,
@@ -143,9 +150,7 @@ fn iterate_working_set_candidates(
             now,
             Some(last_failure_index),
         )
-        .map_err(|err| ServiceError::Dependency {
-            message: format!("{err:?}"),
-        })?;
+        .map_err(error_formatter::migration_dependency_error)?;
         let Some(candidate_index) = next else {
             return Ok(MigrationServiceOutput::RotationFailed {
                 reason: RotationFailedReason::WorkingSetExhausted { candidates_tried },
@@ -162,33 +167,17 @@ fn iterate_working_set_candidates(
                 err @ (crate::migration::MigrationError::SourceMissingStorage { .. }
                 | crate::migration::MigrationError::SourceMissing { .. }),
             ) => {
-                record_failed_candidate(request, candidate_index, &err, &mut candidates_tried);
+                candidate_failure_orchestration::record_failed_candidate(
+                    request,
+                    candidate_index,
+                    &err,
+                    &mut candidates_tried,
+                );
                 last_failure_index = candidate_index;
             }
             Err(err) => {
-                return Err(ServiceError::Dependency {
-                    message: format!("{err:?}"),
-                });
+                return Err(error_formatter::migration_dependency_error(err));
             }
         }
     }
-}
-
-fn record_failed_candidate(
-    request: &MigrationServiceRequest<'_>,
-    candidate_index: usize,
-    err: &crate::migration::MigrationError,
-    candidates_tried: &mut Vec<String>,
-) {
-    let provider_name = request.migration_model.providers[candidate_index]
-        .name
-        .clone();
-    let _ = apply_post_failure_forensics(
-        request.state,
-        &provider_name,
-        FailureClass::UpstreamApiDown,
-        chrono::Utc::now(),
-    );
-    candidates_tried.push(provider_name);
-    let _ = err;
 }

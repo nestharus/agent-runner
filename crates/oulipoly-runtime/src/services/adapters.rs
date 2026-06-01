@@ -1,16 +1,6 @@
 //! ## Declared roles
 //! orchestration, accessor, mapper, formatter
 //!
-//! ## Adapter declarations
-//! adapter_declarations:
-//!   - component: crates/oulipoly-runtime/src/services/adapters.rs::runtime_service_config_adapter
-//!     role: adapter
-//!     Translates:
-//!       - oulipoly_config.model_contract
-//!       - oulipoly_config.provider_contract
-//!       - oulipoly_config.sessions_contract
-//!       - oulipoly_runtime.service_dto_contract
-//!
 //! ```yaml
 //! intrinsic_surface_declarations:
 //!   - component: crates/oulipoly-runtime/src/services/adapters.rs
@@ -78,12 +68,20 @@ impl ProductionSessionLifecycleService {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ProductionMigrationService;
+#[derive(Debug, Clone, Default)]
+pub struct ProductionMigrationService {
+    provider_registry: Option<ProviderRegistryHandle>,
+}
 
 impl ProductionMigrationService {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    pub fn with_registry_handle(provider_registry: ProviderRegistryHandle) -> Self {
+        Self {
+            provider_registry: Some(provider_registry),
+        }
     }
 }
 
@@ -236,7 +234,7 @@ impl MigrationServicePort for ProductionMigrationService {
         &self,
         request: MigrationServiceRequest<'_>,
     ) -> Result<MigrationServiceOutput, ServiceError> {
-        super::migration::migrate(request)
+        super::migration::migrate(request, self.provider_registry.as_ref())
     }
 }
 

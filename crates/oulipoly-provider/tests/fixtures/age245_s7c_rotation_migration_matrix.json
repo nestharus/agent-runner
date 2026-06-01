@@ -1,0 +1,100 @@
+{
+  "schema": "age245.s7c.rotation-migration-fixtures.v1",
+  "rotation_assess": [
+    {
+      "id": "assess-success",
+      "mode": "s7c-rotation-assess-success",
+      "request": {
+        "contract": "oulipoly.provider/v1",
+        "request_id": "request-example-001",
+        "provider_instance_id": "fake-provider",
+        "host": { "app": "oulipoly-test" },
+        "params": {
+          "source": { "provider": "source-provider", "settings_id": "source-settings", "provider_session_id": "session-source" },
+          "target": { "provider": "target-provider", "settings_id": "target-settings" },
+          "session": { "chain_id": "chain-alpha", "workspace": "/tmp/project-alpha" },
+          "reason": "quota_exhausted"
+        }
+      },
+      "response": {
+        "contract": "oulipoly.provider/v1",
+        "request_id": "request-example-001",
+        "ok": true,
+        "result": { "allowed": true, "score": 80, "reason": "target-provider accepted", "requirements": [] }
+      }
+    },
+    {
+      "id": "assess-denied",
+      "mode": "s7c-rotation-assess-denied",
+      "response": {
+        "contract": "oulipoly.provider/v1",
+        "request_id": "request-example-001",
+        "ok": true,
+        "result": { "allowed": false, "score": 0, "reason": "target-provider denied", "requirements": [{ "kind": "quota" }] }
+      }
+    },
+    {
+      "id": "assess-provider-error",
+      "mode": "provider-error",
+      "response": {
+        "contract": "oulipoly.provider/v1",
+        "request_id": "request-example-001",
+        "ok": false,
+        "error": { "category": "failed", "code": "rotation_assess_failed", "retryable": false, "message": "rotation assess failed", "details": {} }
+      }
+    },
+    {
+      "id": "assess-protocol-invalid",
+      "mode": "schema-invalid-success",
+      "response": { "contract": "oulipoly.provider/v1", "request_id": "request-example-001", "ok": true, "result": {} }
+    },
+    {
+      "id": "assess-capability-missing",
+      "mode": "describe-rotation-disabled",
+      "describe": {
+        "provider_id": "fake-provider",
+        "capabilities": { "rotation": false, "migration": true }
+      }
+    },
+    {
+      "id": "assess-transport-failure",
+      "mode": "exit-nonzero-no-envelope",
+      "transport": { "exit_code": 7 }
+    }
+  ],
+  "rotation_materialize": [
+    { "id": "materialize-success", "mode": "s7c-rotation-materialize-success", "changed": true },
+    { "id": "materialize-missing-source", "mode": "s7c-rotation-materialize-missing-source", "error_code": "source_missing" },
+    { "id": "materialize-dry-run", "mode": "s7c-rotation-materialize-dry-run", "changed": false },
+    { "id": "materialize-no-change", "mode": "s7c-rotation-materialize-no-change", "changed": false },
+    { "id": "materialize-no-change-wrong-chain", "mode": "s7c-rotation-materialize-no-change-wrong-chain", "error_code": "semantic_host_plan_rejection" },
+    { "id": "materialize-compaction-boundary", "mode": "s7c-rotation-materialize-compaction-boundary", "changed": true },
+    { "id": "materialize-no-mutation-on-failure", "mode": "s7c-rotation-materialize-artifact-hash-mismatch", "error_code": "artifact_hash_mismatch" },
+    { "id": "materialize-provider-error", "mode": "provider-error", "error_code": "rotation_failed" },
+    { "id": "materialize-protocol-invalid", "mode": "s7c-rotation-materialize-protocol-invalid", "error_code": "protocol_invalid" },
+    { "id": "materialize-crash-after-artifact", "mode": "s7c-rotation-materialize-crash-after-artifact", "journal": "pending-after-artifact" },
+    { "id": "materialize-crash-during-apply", "mode": "s7c-rotation-materialize-crash-during-apply", "journal": "pending-during-apply" }
+  ],
+  "migration": [
+    { "id": "migration-plan-success", "subcommand": "migration.plan", "mode": "s7c-migration-plan-success" },
+    { "id": "migration-plan-capability-missing", "subcommand": "migration.plan", "mode": "describe-migration-disabled", "capabilities": { "rotation": true, "migration": false } },
+    { "id": "migration-plan-error", "subcommand": "migration.plan", "mode": "provider-error" },
+    { "id": "migration-plan-protocol-invalid", "subcommand": "migration.plan", "mode": "s7c-migration-plan-protocol-invalid" },
+    { "id": "migration-apply-success", "subcommand": "migration.apply", "mode": "s7c-migration-apply-success" },
+    { "id": "migration-apply-capability-missing", "subcommand": "migration.apply", "mode": "describe-migration-disabled", "capabilities": { "rotation": true, "migration": false } },
+    { "id": "migration-apply-error", "subcommand": "migration.apply", "mode": "provider-error" },
+    { "id": "migration-apply-protocol-invalid", "subcommand": "migration.apply", "mode": "s7c-migration-apply-protocol-invalid" }
+  ],
+  "host_state_plan_rejections": [
+    { "id": "reject-additional-property", "plan": { "schema_version": 1, "operation": "rotation.materialize", "chain_id": "chain-alpha", "unexpected": true } },
+    { "id": "reject-wrong-chain-id", "plan": { "schema_version": 1, "operation": "rotation.materialize", "chain_id": "chain-other" } },
+    { "id": "reject-mismatched-provider", "plan": { "schema_version": 1, "operation": "rotation.materialize", "chain_id": "chain-alpha", "source_provider": "target-provider" } },
+    { "id": "reject-wrong-session-id", "plan": { "schema_version": 1, "operation": "rotation.materialize", "chain_id": "chain-alpha", "source_session_id": "session-other" } },
+    { "id": "reject-invalid-transition-reason", "plan": { "schema_version": 1, "operation": "rotation.materialize", "chain_id": "chain-alpha", "transition_reason": "invalid" } },
+    { "id": "reject-stale-snapshot", "plan": { "schema_version": 1, "operation": "rotation.materialize", "chain_id": "chain-alpha", "snapshot_version": "stale" } },
+    { "id": "reject-conflicting-active-target", "plan": { "schema_version": 1, "operation": "rotation.materialize", "chain_id": "chain-alpha", "target_active_conflict": true } },
+    { "id": "reject-missing-artifact", "plan": { "schema_version": 1, "operation": "rotation.materialize", "chain_id": "chain-alpha", "artifacts": [] } },
+    { "id": "reject-hash-mismatch", "plan": { "schema_version": 1, "operation": "rotation.materialize", "chain_id": "chain-alpha", "artifacts": [{ "path": "/tmp/artifact", "sha256": "bad" }] } },
+    { "id": "reject-unsupported-version", "plan": { "schema_version": 999, "operation": "rotation.materialize", "chain_id": "chain-alpha" } }
+  ]
+}

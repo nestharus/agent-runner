@@ -31,13 +31,16 @@ pub use db::SessionTurnIngest;
 pub use db::StateDb;
 pub use db::{AccountRecord, AuthMethod, AuthStatus, CliProviderRecord};
 pub use db::{
+    ActiveChainSegmentSnapshot, ChainSegmentRotationInput, QuotaRecord, QuotaWindow,
+    QuotaWindowInput,
+};
+pub use db::{
     BackfillReport, ChainPreview, ModelStore, ProviderSessionBinding, ResolvedResume, ResumeError,
     SessionMarkerPayload, TurnPreview, WrongIdKindInput,
 };
 pub use db::{CliMapping, DiscoveredModel, ModelParameter, ParamType};
 pub use db::{CompactSummaryEvidence, OwnedTurnEvent, OwnedTurnEventRow};
 pub use db::{InvocationRecord, InvocationStart, InvocationStatus};
-pub use db::{QuotaRecord, QuotaWindow, QuotaWindowInput};
 pub use invocation_marker::CompositeInvocationId;
 pub use lifecycle_log::{LifecycleEventSink, NoopLifecycleEventSink};
 pub use result_envelope::{
