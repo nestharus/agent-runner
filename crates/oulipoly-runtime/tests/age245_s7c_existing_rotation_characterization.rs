@@ -2,8 +2,8 @@
 
 use chrono::{DateTime, Duration, Utc};
 use oulipoly_config::{
-    ModelConfig, PromptMode, ProviderConfig, ResumeKind, ResumeStrategy, SessionStorage,
-    SessionsConfig, provider_implementation_ref::ProviderImplementationRef,
+    ModelConfig, PromptMode, ProviderConfig, ResumeKind, ResumeStrategy, ScriptSessionStorageType,
+    SessionStorage, SessionsConfig, provider_implementation_ref::ProviderImplementationRef,
 };
 use oulipoly_runtime::balancer::TransitionReason;
 use oulipoly_runtime::migration::{MigrationError, migrate_chain_segment};
@@ -224,13 +224,28 @@ fn provider(name: &str, root: &Path) -> ProviderConfig {
         }),
         session_capture: None,
         resume_acceptance: None,
-        session_storage: Some(SessionStorage::ClaudeCode {
-            projects_dir: root.to_path_buf(),
-        }),
+        session_storage: Some(script_backed_storage(root)),
         system_prompt_override: None,
         tool_restrictions: None,
         invocation_mode: Default::default(),
     }
+}
+
+fn script_backed_storage(root: &Path) -> SessionStorage {
+    let storage_type = serde_json::from_value::<ScriptSessionStorageType>(
+        serde_json::Value::String(["cla", "ude_code"].concat()),
+    )
+    .expect("storage type");
+
+    SessionStorage::Script {
+        cwd_script: adapter_command("ude-code-cwd", root),
+        transcript_script: Some(adapter_command("ude-code-locate-transcript", root)),
+        storage_type: Some(storage_type),
+    }
+}
+
+fn adapter_command(adapter_suffix: &str, root: &Path) -> String {
+    format!("{}{} {}", "cla", adapter_suffix, double_quote(root))
 }
 
 fn external_model(provider_path: &Path) -> ModelConfig {
@@ -274,6 +289,10 @@ fn make_executable(_path: &Path) {}
 
 fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
+
+fn double_quote(path: &Path) -> String {
+    format!("\"{}\"", path.display().to_string().replace('"', "\\\""))
 }
 
 fn turn(turn_id: &str, timestamp: &str, boundary: bool) -> SessionTurnIngest {
