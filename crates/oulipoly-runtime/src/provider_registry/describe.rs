@@ -27,7 +27,7 @@ pub fn describe_provider(
         .map_err(map_describe_error)
 }
 
-fn describe_request(host_options: &DescribeHostOptions) -> Result<Value, ProviderRegistryError> {
+fn describe_request(_host_options: &DescribeHostOptions) -> Result<Value, ProviderRegistryError> {
     serde_json::to_value(DescribeRequest {
         contract: CONTRACT_VERSION.to_string(),
         request_id: format!("provider-registry-{}", uuid::Uuid::new_v4()),
@@ -37,14 +37,8 @@ fn describe_request(host_options: &DescribeHostOptions) -> Result<Value, Provide
             app_version: None,
             platform: None,
             working_directory: None,
-            config_root: host_options
-                .config_root
-                .as_ref()
-                .map(|path| path.display().to_string()),
-            data_root: host_options
-                .data_root
-                .as_ref()
-                .map(|path| path.display().to_string()),
+            config_root: None,
+            data_root: None,
             env: BTreeMap::new(),
             deadline_unix_ms: None,
         },

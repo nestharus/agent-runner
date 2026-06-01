@@ -125,7 +125,9 @@ impl AgentRuntimeServices {
             provider_registry_options,
             resume_service: Arc::new(ProductionResumeService::new()),
             session_lifecycle_service,
-            migration_service: Arc::new(ProductionMigrationService::new()),
+            migration_service: Arc::new(ProductionMigrationService::with_registry_handle(
+                provider_registry_handle.clone(),
+            )),
             trace_service: Arc::new(ProductionTraceService::default()),
             session_export_service: Arc::new(ProductionSessionExportService::with_registry_handle(
                 provider_registry_handle.clone(),
@@ -182,7 +184,9 @@ impl AgentRuntimeServices {
             provider_registry_options: registry_options,
             resume_service: Arc::new(ProductionResumeService::new()),
             session_lifecycle_service,
-            migration_service: Arc::new(ProductionMigrationService::new()),
+            migration_service: Arc::new(ProductionMigrationService::with_registry_handle(
+                provider_registry_handle.clone(),
+            )),
             trace_service: Arc::new(ProductionTraceService::default()),
             session_export_service: Arc::new(ProductionSessionExportService::with_registry_handle(
                 provider_registry_handle.clone(),

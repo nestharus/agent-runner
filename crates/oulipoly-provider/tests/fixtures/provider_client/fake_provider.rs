@@ -1,3 +1,11 @@
+//! ## Declared roles
+//! orchestration, accessor, mapper, formatter
+//!
+//! ## Adapter declarations
+//! adapter_declarations:
+//!   - component: s7c-fake-provider-fixture-adapter
+//!     role: adapter
+
 use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -17,17 +25,45 @@ fn main() {
         "success" => success(),
         "s5-success" => s5_success(),
         "success-stderr" => success_stderr(),
-        "provider-error" => provider_error("failed", "example_failed", 0),
+        "provider-error" => provider_error_after_describe("failed", "example_failed", 0),
         "provider-timeout-error" => provider_error("timeout", "example_timeout", 0),
         "provider-error-nonzero" => provider_error("failed", "example_failed", 7),
-        "exit-nonzero-no-envelope" => 7,
+        "exit-nonzero-no-envelope" => exit_nonzero_after_describe(),
+        "describe-failed" => provider_error("failed", "describe_failed", 0),
+        "describe-rotation-disabled" => describe_with_capabilities(false, true),
+        "describe-migration-disabled" => describe_with_capabilities(true, false),
+        "s7c-rotation-assess-success" => s7c_rotation_assess_success(),
+        "s7c-rotation-assess-denied" => s7c_rotation_assess_denied(),
+        "s7c-rotation-materialize-success" => s7c_rotation_materialize_success(true),
+        "s7c-rotation-materialize-missing-source" => {
+            s7c_rotation_materialize_provider_error("source_missing")
+        }
+        "s7c-rotation-materialize-dry-run" => s7c_rotation_materialize_no_change(),
+        "s7c-rotation-materialize-no-change" => s7c_rotation_materialize_no_change(),
+        "s7c-rotation-materialize-no-change-wrong-chain" => {
+            s7c_rotation_materialize_no_change_wrong_chain()
+        }
+        "s7c-rotation-materialize-compaction-boundary" => s7c_rotation_materialize_success(true),
+        "s7c-rotation-materialize-artifact-hash-mismatch" => {
+            s7c_rotation_materialize_hash_mismatch()
+        }
+        "s7c-rotation-materialize-protocol-invalid" => s7c_protocol_invalid_after_describe(),
+        "s7c-rotation-materialize-crash-after-artifact" => {
+            s7c_rotation_materialize_crash_after_artifact()
+        }
+        "s7c-rotation-materialize-crash-during-apply" => {
+            let _ = s7c_rotation_materialize_success(true);
+            write_stderr("crash_during_apply\n")
+        }
+        "s7c-migration-plan-success" => s7c_migration_plan_success(),
+        "s7c-migration-plan-protocol-invalid" => s7c_protocol_invalid_after_describe(),
+        "s7c-migration-apply-success" => s7c_migration_apply_success(),
+        "s7c-migration-apply-protocol-invalid" => s7c_protocol_invalid_after_describe(),
         "success-then-nonzero" => {
             success();
             7
         }
-        "schema-invalid-success" => write_stdout(&format!(
-            "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{REQUEST_ID}\",\"ok\":true,\"result\":{{}}}}\n"
-        )),
+        "schema-invalid-success" => schema_invalid_success_after_describe(),
         "invalid-utf8" => {
             let _ = read_stdin_to_string();
             write_bytes(&[0xff, 0xfe, 0xfd])
@@ -223,6 +259,29 @@ fn write_invocation_record(path: &str, text: &str) {
     fs::write(path, text).expect("record file should be writable");
 }
 
+fn record_invocation_if_requested(stdin: &str) {
+    increment_count_if_requested();
+    if let Ok(path) = env::var("FAKE_PROVIDER_RECORD_PATH") {
+        let record = InvocationRecord {
+            path,
+            argv: env::args().collect(),
+            stdin: stdin.to_string(),
+        };
+        write_invocation_record(&record.path, &format_invocation_record(&record));
+    }
+}
+
+fn increment_count_if_requested() {
+    let Ok(path) = env::var("FAKE_PROVIDER_COUNT_PATH") else {
+        return;
+    };
+    let current = fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    fs::write(path, (current + 1).to_string()).expect("count file should be writable");
+}
+
 fn write_response_for_kind(kind: ResponseKind, stdin: Option<&str>) -> i32 {
     if launch_subcommand_requested() {
         write_launch_success_events(stdin.unwrap_or_default())
@@ -258,9 +317,9 @@ fn provider_error_fields<'a>(category: &'a str, code: &'a str) -> ProviderErrorF
     }
 }
 
-fn provider_error_json(fields: &ProviderErrorFields<'_>) -> String {
+fn provider_error_json(request_id: &str, fields: &ProviderErrorFields<'_>) -> String {
     format!(
-        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{REQUEST_ID}\",\"ok\":false,\"error\":{{\"category\":\"{}\",\"code\":\"{}\",\"retryable\":{},\"message\":\"{}\",\"details\":{{\"source\":\"example\"}}}}}}\n",
+        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":false,\"error\":{{\"category\":\"{}\",\"code\":\"{}\",\"retryable\":{},\"message\":\"{}\",\"details\":{{\"source\":\"example\"}}}}}}\n",
         fields.category, fields.code, fields.retryable, fields.message
     )
 }
@@ -333,16 +392,245 @@ fn success_stderr() -> i32 {
 }
 
 fn provider_error(category: &str, code: &str, exit_code: i32) -> i32 {
-    let _ = read_stdin_to_string();
+    let stdin = read_stdin_to_string();
+    record_invocation_if_requested(&stdin);
     let fields = provider_error_fields(category, code);
-    write_stdout(&provider_error_json(&fields));
+    write_stdout(&provider_error_json(&request_id_from_stdin(&stdin), &fields));
     exit_code
+}
+
+fn provider_error_after_describe(category: &str, code: &str, exit_code: i32) -> i32 {
+    if current_subcommand() == "describe" && s7c_runtime_fixture_requested() {
+        return describe_with_capabilities(true, true);
+    }
+    provider_error(category, code, exit_code)
+}
+
+fn exit_nonzero_after_describe() -> i32 {
+    if current_subcommand() == "describe" && s7c_runtime_fixture_requested() {
+        return describe_with_capabilities(true, true);
+    }
+    let stdin = read_stdin_to_string();
+    record_invocation_if_requested(&stdin);
+    7
+}
+
+fn schema_invalid_success_after_describe() -> i32 {
+    if current_subcommand() == "describe" && s7c_runtime_fixture_requested() {
+        return describe_with_capabilities(true, true);
+    }
+    let stdin = read_stdin_to_string();
+    record_invocation_if_requested(&stdin);
+    write_stdout(&format!(
+        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{}\",\"ok\":true,\"result\":{{}}}}\n",
+        request_id_from_stdin(&stdin)
+    ))
 }
 
 fn success_json() -> String {
     format!(
         "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{REQUEST_ID}\",\"ok\":true,\"result\":{{\"provider_id\":\"fake-provider\",\"display_name\":\"Fake Provider\",\"contract_versions\":[\"{CONTRACT}\"],\"preferred_contract\":\"{CONTRACT}\",\"capabilities\":{{\"launch\":true,\"policy\":false,\"quota\":false,\"session\":false,\"terminal\":false,\"rotation\":false,\"discovery\":false,\"settings\":false,\"setup_brain\":false,\"setup\":false,\"migration\":false}},\"concurrency\":{{\"safe_for_parallel_invocation\":true,\"state_locking\":\"none\"}}}}}}\n"
     )
+}
+
+fn describe_with_capabilities(rotation: bool, migration: bool) -> i32 {
+    let stdin = read_stdin_to_string();
+    record_invocation_if_requested(&stdin);
+    write_stdout(&describe_json(&request_id_from_stdin(&stdin), rotation, migration))
+}
+
+fn describe_json(request_id: &str, rotation: bool, migration: bool) -> String {
+    format!(
+        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"provider_id\":\"fake-provider\",\"display_name\":\"Fake Provider\",\"contract_versions\":[\"{CONTRACT}\"],\"preferred_contract\":\"{CONTRACT}\",\"capabilities\":{{\"launch\":true,\"policy\":false,\"quota\":false,\"session\":false,\"terminal\":false,\"rotation\":{rotation},\"discovery\":false,\"settings\":false,\"setup_brain\":false,\"setup\":false,\"migration\":{migration}}},\"settings_schema_id\":\"fake-settings\",\"concurrency\":{{\"safe_for_parallel_invocation\":true,\"state_locking\":\"host\"}}}}}}\n"
+    )
+}
+
+fn s7c_rotation_assess_success() -> i32 {
+    if current_subcommand() == "describe" {
+        return describe_with_capabilities(true, true);
+    }
+    let stdin = read_stdin_to_string();
+    record_invocation_if_requested(&stdin);
+    let request_id = request_id_from_stdin(&stdin);
+    write_stdout(&format!(
+        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"allowed\":true,\"score\":80,\"reason\":\"target-provider accepted\",\"requirements\":[]}}}}\n"
+    ))
+}
+
+fn s7c_rotation_assess_denied() -> i32 {
+    if current_subcommand() == "describe" {
+        return describe_with_capabilities(true, true);
+    }
+    let stdin = read_stdin_to_string();
+    record_invocation_if_requested(&stdin);
+    let request_id = request_id_from_stdin(&stdin);
+    write_stdout(&format!(
+        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"allowed\":false,\"score\":0,\"reason\":\"target-provider denied\",\"requirements\":[{{\"kind\":\"quota\"}}]}}}}\n"
+    ))
+}
+
+fn s7c_rotation_materialize_success(changed: bool) -> i32 {
+    if current_subcommand() == "describe" {
+        return describe_with_capabilities(true, true);
+    }
+    let stdin = read_stdin_to_string();
+    record_invocation_if_requested(&stdin);
+    let request_id = request_id_from_stdin(&stdin);
+    write_empty_materialize_artifact();
+    write_stdout(&format!(
+        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"changed\":{changed},\"target_provider_session_id\":\"{}\",\"artifacts\":[{}],\"host_state_plan\":{}}}}}\n",
+        s7c_target_session_id(),
+        s7c_artifact_json(),
+        s7c_host_state_plan_json()
+    ))
+}
+
+fn s7c_rotation_materialize_no_change() -> i32 {
+    if current_subcommand() == "describe" {
+        return describe_with_capabilities(true, true);
+    }
+    let stdin = read_stdin_to_string();
+    record_invocation_if_requested(&stdin);
+    let request_id = request_id_from_stdin(&stdin);
+    write_stdout(&format!(
+        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"changed\":false,\"artifacts\":[{}],\"host_state_plan\":{}}}}}\n",
+        s7c_artifact_json(),
+        s7c_host_state_plan_json()
+    ))
+}
+
+fn s7c_rotation_materialize_no_change_wrong_chain() -> i32 {
+    if current_subcommand() == "describe" {
+        return describe_with_capabilities(true, true);
+    }
+    let stdin = read_stdin_to_string();
+    record_invocation_if_requested(&stdin);
+    let request_id = request_id_from_stdin(&stdin);
+    write_stdout(&format!(
+        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"changed\":false,\"artifacts\":[{}],\"host_state_plan\":{}}}}}\n",
+        s7c_artifact_json(),
+        s7c_host_state_plan_json_with_chain("wrong-chain")
+    ))
+}
+
+fn s7c_rotation_materialize_hash_mismatch() -> i32 {
+    if current_subcommand() == "describe" {
+        return describe_with_capabilities(true, true);
+    }
+    let stdin = read_stdin_to_string();
+    record_invocation_if_requested(&stdin);
+    let request_id = request_id_from_stdin(&stdin);
+    write_empty_materialize_artifact();
+    write_stdout(&format!(
+        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"changed\":true,\"target_provider_session_id\":\"{}\",\"artifacts\":[{{\"kind\":\"file\",\"path\":\"{}\",\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"}}],\"host_state_plan\":{}}}}}\n",
+        s7c_target_session_id(),
+        json_escape(&s7c_artifact_path()),
+        s7c_host_state_plan_json()
+    ))
+}
+
+fn s7c_rotation_materialize_crash_after_artifact() -> i32 {
+    if current_subcommand() == "describe" {
+        return describe_with_capabilities(true, true);
+    }
+    s7c_rotation_materialize_hash_mismatch()
+}
+
+fn s7c_rotation_materialize_provider_error(code: &str) -> i32 {
+    if current_subcommand() == "describe" {
+        return describe_with_capabilities(true, true);
+    }
+    provider_error("failed", code, 0)
+}
+
+fn s7c_migration_plan_success() -> i32 {
+    if current_subcommand() == "describe" {
+        return describe_with_capabilities(true, true);
+    }
+    let stdin = read_stdin_to_string();
+    record_invocation_if_requested(&stdin);
+    let request_id = request_id_from_stdin(&stdin);
+    write_stdout(&format!(
+        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"actions\":[{{\"kind\":\"noop\"}}],\"warnings\":[],\"requires_backup\":false}}}}\n"
+    ))
+}
+
+fn s7c_migration_apply_success() -> i32 {
+    if current_subcommand() == "describe" {
+        return describe_with_capabilities(true, true);
+    }
+    let stdin = read_stdin_to_string();
+    record_invocation_if_requested(&stdin);
+    let request_id = request_id_from_stdin(&stdin);
+    write_stdout(&format!(
+        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"applied_actions\":[{{\"kind\":\"noop\"}}],\"artifacts\":[],\"warnings\":[],\"outcome\":{{\"changed\":false}}}}}}\n"
+    ))
+}
+
+fn s7c_protocol_invalid_after_describe() -> i32 {
+    if current_subcommand() == "describe" {
+        return describe_with_capabilities(true, true);
+    }
+    let stdin = read_stdin_to_string();
+    record_invocation_if_requested(&stdin);
+    write_stdout("not json\n")
+}
+
+fn s7c_artifact_json() -> String {
+    format!(
+        "{{\"kind\":\"file\",\"path\":\"{}\",\"sha256\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"}}",
+        json_escape(&s7c_artifact_path())
+    )
+}
+
+fn s7c_host_state_plan_json() -> String {
+    let chain_id = s7c_env_or("S7C_CHAIN_ID", "chain-alpha");
+    s7c_host_state_plan_json_with_chain(&chain_id)
+}
+
+fn s7c_host_state_plan_json_with_chain(chain_id: &str) -> String {
+    let source_provider = s7c_env_or("S7C_SOURCE_PROVIDER", "source-provider");
+    let target_provider = s7c_env_or("S7C_TARGET_PROVIDER", "target-provider");
+    let source_session = s7c_env_or("S7C_SOURCE_SESSION_ID", "session-source");
+    let target_session = s7c_target_session_id();
+    format!(
+        "{{\"schema_version\":1,\"operation\":\"rotation.materialize\",\"chain_id\":\"{}\",\"source_provider\":\"{}\",\"target_provider\":\"{}\",\"source_session_id\":\"{}\",\"target_session_id\":\"{}\",\"transition_reason\":\"quota_threshold\",\"segments\":[{{\"provider\":\"{}\",\"session_id\":\"{}\",\"ended_at\":\"2026-05-01T00:00:00Z\"}},{{\"provider\":\"{}\",\"session_id\":\"{}\",\"started_at\":\"2026-05-01T00:00:00Z\"}}],\"artifacts\":[{}]}}",
+        json_escape(chain_id),
+        json_escape(&source_provider),
+        json_escape(&target_provider),
+        json_escape(&source_session),
+        json_escape(&target_session),
+        json_escape(&source_provider),
+        json_escape(&source_session),
+        json_escape(&target_provider),
+        json_escape(&target_session),
+        s7c_artifact_json()
+    )
+}
+
+fn write_empty_materialize_artifact() {
+    let artifact_path = s7c_artifact_path();
+    let path = std::path::Path::new(&artifact_path);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, []);
+}
+
+fn s7c_artifact_path() -> String {
+    s7c_env_or("S7C_ARTIFACT_PATH", "/tmp/oulipoly/session-target.jsonl")
+}
+
+fn s7c_target_session_id() -> String {
+    s7c_env_or("S7C_TARGET_SESSION_ID", "session-target")
+}
+
+fn s7c_env_or(key: &str, fallback: &str) -> String {
+    env::var(key).unwrap_or_else(|_| fallback.to_string())
+}
+
+fn s7c_runtime_fixture_requested() -> bool {
+    env::var_os("S7C_CHAIN_ID").is_some()
 }
 
 fn s5_success_json() -> String {

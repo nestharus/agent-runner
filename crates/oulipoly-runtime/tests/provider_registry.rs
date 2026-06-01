@@ -1186,8 +1186,6 @@ fn describe_request_envelope_matches_provider_contract() {
         .expect("request-recording provider should describe successfully");
 
     let request = recorded_describe_request(&request_record);
-    let (config_root_display, data_root_display) =
-        expected_host_root_strings(&config_root, &data_root);
     assert_eq!(request["contract"].as_str(), Some(CONTRACT_VERSION));
     assert!(
         request["request_id"]
@@ -1210,11 +1208,13 @@ fn describe_request_envelope_matches_provider_contract() {
     );
     assert_eq!(
         request["host"]["config_root"].as_str(),
-        Some(config_root_display.as_str())
+        None,
+        "describe must not disclose host config roots to provider subprocesses"
     );
     assert_eq!(
         request["host"]["data_root"].as_str(),
-        Some(data_root_display.as_str())
+        None,
+        "describe must not disclose host data roots to provider subprocesses"
     );
     assert!(
         request["host"].as_object().is_some(),
@@ -1232,13 +1232,6 @@ fn recorded_describe_request_bytes(request_record: &Path) -> Vec<u8> {
 
 fn parse_recorded_describe_request(bytes: &[u8]) -> Value {
     serde_json::from_slice(bytes).expect("recorded request should be valid JSON")
-}
-
-fn expected_host_root_strings(config_root: &Path, data_root: &Path) -> (String, String) {
-    (
-        config_root.display().to_string(),
-        data_root.display().to_string(),
-    )
 }
 
 #[test]
@@ -1464,7 +1457,8 @@ fn provider_registry_forbidden_sources() -> &'static [&'static str] {
         "quota/process.rs",
         "session_export/mod.rs",
         "session_replace/mod.rs",
-        "services/migration.rs",
+        // AGE-245 S7c intentionally makes services/migration.rs registry-aware
+        // for external rotation while preserving built-in provider == None.
     ]
 }
 
@@ -1534,7 +1528,7 @@ fn assert_session_lifecycle_provider_registry_refs_are_s7a_only(
     adapters_source: &str,
     lifecycle_source: &str,
 ) {
-    assert_adapters_provider_registry_refs_are_s7a_s7b_only(adapters_source);
+    assert_adapters_provider_registry_refs_are_approved_service_wiring(adapters_source);
     assert_lifecycle_provider_registry_refs_are_s7a_only(lifecycle_source);
     assert_adapters_provider_registry_wiring_terms(adapters_source);
     assert_lifecycle_provider_registry_dispatch_terms(lifecycle_source);
@@ -1543,7 +1537,7 @@ fn assert_session_lifecycle_provider_registry_refs_are_s7a_only(
     assert_deferred_provider_registry_flows_absent(adapters_source, lifecycle_source);
 }
 
-fn assert_adapters_provider_registry_refs_are_s7a_s7b_only(adapters_source: &str) {
+fn assert_adapters_provider_registry_refs_are_approved_service_wiring(adapters_source: &str) {
     assert_provider_registry_refs_match_allowed_lines(
         "services/adapters.rs",
         adapters_source,
@@ -1553,6 +1547,7 @@ fn assert_adapters_provider_registry_refs_are_s7a_s7b_only(adapters_source: &str
             "pub fn with_registry_handle(provider_registry: ProviderRegistryHandle) -> Self {",
             "provider_registry: Some(provider_registry),",
             "self.provider_registry.as_ref(),",
+            "super::migration::migrate(request, self.provider_registry.as_ref())",
         ],
     );
 }
