@@ -114,6 +114,35 @@
       ]
     },
     "SessionExportErrorResponse": { "$ref": "common.schema.json#/$defs/ErrorResponseEnvelope" },
+    "SessionReplaceHostStatePlan": {
+      "type": "object",
+      "properties": {
+        "schema_version": { "const": 1 },
+        "operation": { "const": "session.replace" },
+        "session_id": { "type": "string", "minLength": 1 },
+        "provider_name": { "type": "string", "minLength": 1 },
+        "canonical_format": { "const": "oulipoly.canonical_transcript/v1" },
+        "turn_count": { "type": "integer", "minimum": 0 },
+        "records_sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+        "postimage_sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+        "artifacts": {
+          "type": "array",
+          "items": { "$ref": "common.schema.json#/$defs/Artifact" }
+        }
+      },
+      "required": [
+        "schema_version",
+        "operation",
+        "session_id",
+        "provider_name",
+        "canonical_format",
+        "turn_count",
+        "records_sha256",
+        "postimage_sha256",
+        "artifacts"
+      ],
+      "additionalProperties": false
+    },
     "SessionReplaceRequest": {
       "allOf": [
         { "$ref": "common.schema.json#/$defs/RequestEnvelope" },
@@ -128,9 +157,19 @@
         "artifacts": {
           "type": "array",
           "items": { "$ref": "common.schema.json#/$defs/Artifact" }
-        }
+        },
+        "host_state_plan": { "$ref": "#/$defs/SessionReplaceHostStatePlan" }
       },
       "required": ["changed", "artifacts"],
+      "allOf": [
+        {
+          "if": {
+            "properties": { "changed": { "const": true } },
+            "required": ["changed"]
+          },
+          "then": { "required": ["postimage_sha256", "host_state_plan"] }
+        }
+      ],
       "additionalProperties": false
     },
     "SessionReplaceResponse": {

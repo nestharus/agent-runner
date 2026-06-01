@@ -66,7 +66,7 @@ fn validate_import_replace_args_accepts_valid_uuid_and_valid_preimage() {
 
 #[test]
 fn import_replace_request_maps_absent_file_to_stdin_source() {
-    let request = import_replace_request(VALID_SESSION_ID, None, None);
+    let request = import_replace_request(VALID_SESSION_ID, None, None, None);
 
     assert_eq!(request.source, ReplaceSource::Stdin);
 }
@@ -74,14 +74,14 @@ fn import_replace_request_maps_absent_file_to_stdin_source() {
 #[test]
 fn import_replace_request_maps_present_file_to_file_source() {
     let path = Path::new("/tmp/oulipoly-import-replace.jsonl");
-    let request = import_replace_request(VALID_SESSION_ID, Some(path), None);
+    let request = import_replace_request(VALID_SESSION_ID, Some(path), None, None);
 
     assert_eq!(request.source, ReplaceSource::File(path.to_path_buf()));
 }
 
 #[test]
 fn import_replace_request_preserves_session_id_and_absent_preimage() {
-    let request = import_replace_request(VALID_SESSION_ID, None, None);
+    let request = import_replace_request(VALID_SESSION_ID, None, None, None);
 
     assert_eq!(
         request,
@@ -89,6 +89,7 @@ fn import_replace_request_preserves_session_id_and_absent_preimage() {
             session_id: VALID_SESSION_ID.to_string(),
             source: ReplaceSource::Stdin,
             preimage_sha256: None,
+            external_provider: None,
         }
     );
 }
@@ -96,7 +97,12 @@ fn import_replace_request_preserves_session_id_and_absent_preimage() {
 #[test]
 fn import_replace_request_preserves_session_id_and_present_preimage() {
     let path = Path::new("/tmp/oulipoly-import-replace.jsonl");
-    let request = import_replace_request(VALID_SESSION_ID, Some(path), Some(VALID_PREIMAGE_SHA256));
+    let request = import_replace_request(
+        VALID_SESSION_ID,
+        Some(path),
+        Some(VALID_PREIMAGE_SHA256),
+        None,
+    );
 
     assert_eq!(
         request,
@@ -104,6 +110,7 @@ fn import_replace_request_preserves_session_id_and_present_preimage() {
             session_id: VALID_SESSION_ID.to_string(),
             source: ReplaceSource::File(path.to_path_buf()),
             preimage_sha256: Some(VALID_PREIMAGE_SHA256.to_string()),
+            external_provider: None,
         }
     );
 }

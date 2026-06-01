@@ -537,6 +537,8 @@ pub struct SessionReplaceResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub postimage_sha256: Option<String>,
     pub artifacts: Vec<Artifact>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_state_plan: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -4,6 +4,17 @@
 //! Configured transcript locator and AGE-137 provider-locator contract types.
 //! Provider-private storage scans are exposed through this stable trait while
 //! metadata lookup hydrates the registry boundary before pulling paths.
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-runtime/src/session_metadata/locator.rs
+//!     role: intrinsic-surface
+//!     Domain: session transcript location
+//!     Owns:
+//!       - configured transcript locator command construction and execution
+//!       - provider locator response parsing and validation
+//!       - built-in provider locator adapters and content fallbacks
+//! ```
 
 use super::SessionStorageType;
 use oulipoly_config::{ScriptSessionStorageType, SessionSourceEntry, SessionStorage};

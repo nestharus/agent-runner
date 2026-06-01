@@ -2,6 +2,18 @@
 //! ## Declared roles
 //!
 //! `orchestration`, `accessor`, `mapper`, `formatter`
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: src-tauri/src/wiring.rs
+//!     role: intrinsic-surface
+//!     Domain: Tauri runtime service composition
+//!     Owns:
+//!       - production repository and service construction
+//!       - shared provider registry handle propagation
+//!       - CLI-default service graph construction
+//!       - configured runtime path wiring
+//! ```
 
 use oulipoly_config as config;
 use oulipoly_config::repositories::{
@@ -72,9 +84,14 @@ pub struct AgentRuntimeServices {
 
 impl AgentRuntimeServices {
     pub fn cli_defaults() -> Self {
-        let provider_registry_options = ProviderRegistryOptions::default();
-        let provider_registry =
-            Arc::new(ProviderRegistry::empty(provider_registry_options.clone()));
+        let paths = default_cli_runtime_paths();
+        let provider_registry_options = ProviderRegistryOptions::default()
+            .with_config_root(paths.config_root.clone())
+            .with_data_root(paths.data_root.clone());
+        let provider_registry = Arc::new(production_provider_registry(
+            &paths,
+            provider_registry_options.clone(),
+        ));
         let provider_registry_handle = ProviderRegistryHandle::new(provider_registry.clone());
         let session_lifecycle_service =
             Arc::new(ProductionSessionLifecycleService::with_registry_handle(
@@ -104,14 +121,20 @@ impl AgentRuntimeServices {
                 provider_registry_handle.clone(),
             )),
             provider_registry,
-            provider_registry_handle,
+            provider_registry_handle: provider_registry_handle.clone(),
             provider_registry_options,
             resume_service: Arc::new(ProductionResumeService::new()),
             session_lifecycle_service,
             migration_service: Arc::new(ProductionMigrationService::new()),
             trace_service: Arc::new(ProductionTraceService::default()),
-            session_export_service: Arc::new(ProductionSessionExportService::default()),
-            session_replace_service: Arc::new(ProductionSessionReplaceService::default()),
+            session_export_service: Arc::new(ProductionSessionExportService::with_registry_handle(
+                provider_registry_handle.clone(),
+            )),
+            session_replace_service: Arc::new(
+                ProductionSessionReplaceService::with_registry_handle(
+                    provider_registry_handle.clone(),
+                ),
+            ),
             session_lock_service: Arc::new(ProductionSessionLockService::default()),
         }
     }
@@ -155,16 +178,41 @@ impl AgentRuntimeServices {
                 provider_registry_handle.clone(),
             )),
             provider_registry,
-            provider_registry_handle,
+            provider_registry_handle: provider_registry_handle.clone(),
             provider_registry_options: registry_options,
             resume_service: Arc::new(ProductionResumeService::new()),
             session_lifecycle_service,
             migration_service: Arc::new(ProductionMigrationService::new()),
             trace_service: Arc::new(ProductionTraceService::default()),
-            session_export_service: Arc::new(ProductionSessionExportService::default()),
-            session_replace_service: Arc::new(ProductionSessionReplaceService::default()),
+            session_export_service: Arc::new(ProductionSessionExportService::with_registry_handle(
+                provider_registry_handle.clone(),
+            )),
+            session_replace_service: Arc::new(
+                ProductionSessionReplaceService::with_registry_handle(
+                    provider_registry_handle.clone(),
+                ),
+            ),
             session_lock_service: Arc::new(ProductionSessionLockService::default()),
         })
+    }
+}
+
+fn default_cli_runtime_paths() -> RuntimePaths {
+    let config_root = dirs::config_dir()
+        .map(|dir| dir.join("oulipoly-agent-runner"))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let models_dir = config_root.join("models");
+    let data_root = dirs::data_dir()
+        .map(|dir| dir.join("oulipoly-agent-runner"))
+        .unwrap_or_else(|| config_root.clone());
+    RuntimePaths {
+        config_root: config_root.clone(),
+        models_dir,
+        agents_dir: config_root.join("agents"),
+        data_root: data_root.clone(),
+        state_db_path: data_root.join("state.db"),
+        lock_dir: data_root.join("locks"),
+        working_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     }
 }
 

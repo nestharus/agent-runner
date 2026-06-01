@@ -1,4 +1,16 @@
 //! Declared roles: orchestration, accessor, formatter, validator, mapper
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: src-tauri/src/commands/session_locate_export/orchestration.rs
+//!     role: intrinsic-surface
+//!     Domain: session locate/export command orchestration
+//!     Owns:
+//!       - session locate command validation and metadata dispatch
+//!       - session export command validation and service dispatch
+//!       - default config/model/provider loading for locate metadata
+//!       - external provider identity resolver sequencing for export requests
+//! ```
 
 use super::formatter::{emit_export_error, emit_metadata_error};
 use super::mapper::{self, ExportOutputOutcome};
@@ -154,9 +166,20 @@ pub(crate) fn run_session_export(
         return Ok(handle_session_export_args_rejection(&rejection));
     }
 
+    let external_provider =
+        match crate::commands::session_external_provider_identity::resolve_session_external_provider_identity(
+            session_id,
+        ) {
+            Ok(identity) => identity,
+            Err(message) => return Ok(handle_export_error(&ExportError::Operational { message })),
+        };
+
     let service_output = agent_runtime_services
         .session_export_service
-        .export_session(mapper::session_export_service_request(session_id))
+        .export_session(mapper::session_export_service_request(
+            session_id,
+            external_provider,
+        ))
         .map_err(|err| err.to_string())?;
 
     let output = match unwrap_export_output(service_output.result) {

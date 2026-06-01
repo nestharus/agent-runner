@@ -1534,14 +1534,16 @@ fn assert_session_lifecycle_provider_registry_refs_are_s7a_only(
     adapters_source: &str,
     lifecycle_source: &str,
 ) {
-    assert_adapters_provider_registry_refs_are_s7a_only(adapters_source);
+    assert_adapters_provider_registry_refs_are_s7a_s7b_only(adapters_source);
     assert_lifecycle_provider_registry_refs_are_s7a_only(lifecycle_source);
     assert_adapters_provider_registry_wiring_terms(adapters_source);
     assert_lifecycle_provider_registry_dispatch_terms(lifecycle_source);
+    assert_adapters_session_export_replace_registry_wiring_terms(adapters_source);
+    assert_s7b_operation_strings_are_sanctioned_and_bounded();
     assert_deferred_provider_registry_flows_absent(adapters_source, lifecycle_source);
 }
 
-fn assert_adapters_provider_registry_refs_are_s7a_only(adapters_source: &str) {
+fn assert_adapters_provider_registry_refs_are_s7a_s7b_only(adapters_source: &str) {
     assert_provider_registry_refs_match_allowed_lines(
         "services/adapters.rs",
         adapters_source,
@@ -1586,6 +1588,62 @@ fn assert_adapters_provider_registry_wiring_terms(adapters_source: &str) {
     }
 }
 
+fn assert_adapters_session_export_replace_registry_wiring_terms(adapters_source: &str) {
+    for expected in [
+        "ProductionSessionExportService",
+        "ProductionSessionReplaceService",
+        "crate::session_external_provider::export_session",
+        "crate::session_external_provider::replace_session",
+    ] {
+        assert!(
+            adapters_source.contains(expected),
+            "services/adapters.rs may reference provider registry for sanctioned AGE-244 S7b session export/replace dispatch: {expected}"
+        );
+    }
+}
+
+fn assert_s7b_operation_strings_are_sanctioned_and_bounded() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let client_invoker = read_runtime_source(&root, "session_external_provider/client_invoker.rs");
+    for expected in [
+        "client.invoke_typed(\"session.export\"",
+        "client.invoke_typed(\"session.replace\"",
+    ] {
+        assert!(
+            client_invoker.contains(expected),
+            "S7b may dispatch only the sanctioned session export/replace operation string: {expected}"
+        );
+    }
+
+    let adapter_sources = session_external_provider_sources(&root);
+    for forbidden in [
+        "session.rotate",
+        "session.rotation",
+        "session.materialize",
+        "session.migrate",
+        "migration.",
+        "rotation.",
+    ] {
+        assert!(
+            adapter_sources
+                .iter()
+                .all(|source| !source.contains(forbidden)),
+            "S7b session_external_provider adapter must not introduce deferred provider operation string {forbidden}"
+        );
+    }
+}
+
+fn session_external_provider_sources(root: &Path) -> Vec<String> {
+    fs::read_dir(root.join("session_external_provider"))
+        .expect("session_external_provider dir")
+        .map(|entry| {
+            let path = entry.expect("source entry").path();
+            fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
+        })
+        .collect()
+}
+
 fn assert_lifecycle_provider_registry_dispatch_terms(lifecycle_source: &str) {
     for expected in [
         "SessionServiceExternalProviderIdentity",
@@ -1601,7 +1659,7 @@ fn assert_lifecycle_provider_registry_dispatch_terms(lifecycle_source: &str) {
 }
 
 fn assert_deferred_provider_registry_flows_absent(adapters_source: &str, lifecycle_source: &str) {
-    for forbidden in ["session_export", "session_replace", "migration", "rotation"] {
+    for forbidden in ["migration", "rotation"] {
         assert_deferred_provider_registry_flow_absent("adapters", adapters_source, forbidden);
         assert_deferred_provider_registry_flow_absent("lifecycle", lifecycle_source, forbidden);
     }
@@ -1610,7 +1668,7 @@ fn assert_deferred_provider_registry_flows_absent(adapters_source: &str, lifecyc
 fn assert_deferred_provider_registry_flow_absent(label: &str, source: &str, forbidden: &str) {
     assert!(
         !source.contains(&deferred_provider_registry_flow_pattern(forbidden)),
-        "S7a must not add provider registry dispatch for deferred {forbidden} flows in {label}"
+        "S7a/S7b must not add provider registry dispatch for deferred {forbidden} flows in {label}"
     );
 }
 

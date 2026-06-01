@@ -1,8 +1,22 @@
 //! Declared roles: mapper, formatter, validator
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: src-tauri/src/commands/session_locate_export/mapper.rs
+//!     role: intrinsic-surface
+//!     Domain: session locate/export command DTO mapping
+//!     Owns:
+//!       - metadata/export error exit-code and JSON-code mapping
+//!       - export output outcome mapping and formatting
+//!       - session export service request construction
+//!       - provider identity DTO carriage into the export service boundary
+//! ```
 
 use oulipoly_config::{ModelConfig, ProvidersConfig};
 use oulipoly_runtime::provider_registry::ProviderRegistry;
-use oulipoly_runtime::services::SessionExportServiceRequest;
+use oulipoly_runtime::services::{
+    SessionExportServiceRequest, SessionServiceExternalProviderIdentity,
+};
 use oulipoly_runtime::session_export::ExportError;
 use oulipoly_runtime::session_metadata::MetadataError;
 use oulipoly_state::StateDb;
@@ -183,9 +197,13 @@ pub(super) fn export_error_message(err: &ExportError) -> String {
     }
 }
 
-pub(super) fn session_export_service_request(session_id: &str) -> SessionExportServiceRequest {
+pub(super) fn session_export_service_request(
+    session_id: &str,
+    external_provider: Option<SessionServiceExternalProviderIdentity>,
+) -> SessionExportServiceRequest {
     SessionExportServiceRequest {
         session_id: session_id.to_string(),
+        external_provider,
     }
 }
 
