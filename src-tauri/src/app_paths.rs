@@ -24,8 +24,12 @@ use std::path::{Path, PathBuf};
 pub type AppConfig = oulipoly_config::app::AppConfig;
 
 pub fn load_app_config() -> AppConfig {
+    try_load_app_config().unwrap_or_default()
+}
+
+pub fn try_load_app_config() -> Result<AppConfig, String> {
     let config_path = app_config_path();
-    oulipoly_config::app::AppConfig::load(&config_path).unwrap_or_default()
+    oulipoly_config::app::AppConfig::load(&config_path)
 }
 
 pub fn load_providers_for_models_dir(models_dir: &Path) -> config::ProvidersConfig {

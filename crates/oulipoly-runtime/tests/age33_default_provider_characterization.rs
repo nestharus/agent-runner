@@ -295,7 +295,8 @@ prompt_mode = "arg"
     })
     .unwrap_err();
 
-    assert!(err.contains("'default_provider' must be set in"), "{err}");
+    assert!(err.contains("failed to parse app config"), "{err}");
+    assert!(err.contains("TOML parse error"), "{err}");
     assert!(err.contains("config.toml"), "{err}");
     assert!(
         !malformed_config_marker.exists(),

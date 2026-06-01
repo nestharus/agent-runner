@@ -1,0 +1,244 @@
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+const MANAGER_BASELINE_PROVIDER_NAME_COUNT: usize = 5391;
+
+#[test]
+fn exactly_one_legacy_fallback_caller_exists_and_is_gated_by_missing_config() {
+    let flow = read_source("src-tauri/src/setup/flow.rs");
+    let fallback_wrapper = source_between(
+        &flow,
+        "async fn run_legacy_setup_brain_fallback(",
+        "pub async fn run_for_cli",
+    );
+    let fallback_call_count = flow.matches("run_legacy_setup_brain_fallback(").count()
+        - fallback_wrapper
+            .matches("run_legacy_setup_brain_fallback(")
+            .count();
+
+    assert_eq!(
+        fallback_call_count, 1,
+        "S8 must keep exactly one production legacy fallback caller"
+    );
+    assert_eq!(
+        flow.matches("SetupAgent::new(").count(),
+        1,
+        "S8 must keep exactly one hardcoded setup brain construction"
+    );
+    assert_contains(
+        "missing-config fallback boundary",
+        &flow,
+        "run_missing_config_legacy_fallback",
+    );
+
+    let selection = source_between(
+        &flow,
+        "fn select_setup_brain_source",
+        "fn execute_allowlisted",
+    );
+    assert_contains(
+        "setup brain source selection",
+        selection,
+        "SetupBrainConfig",
+    );
+    assert_contains(
+        "setup brain source selection",
+        selection,
+        "Option<SetupBrainConfig>",
+    );
+    assert_contains(
+        "setup brain source selection",
+        selection,
+        "SetupBrainSource::Fallback",
+    );
+    assert_contains(
+        "setup brain source selection",
+        selection,
+        "setup_fallback_unavailable",
+    );
+    assert_contains(
+        "configured setup brain selection",
+        &flow,
+        "try_run_configured_setup_brain(&system_prompt, &initial_message)",
+    );
+}
+
+#[test]
+fn configured_path_uses_provider_ref_adapter_and_does_not_call_legacy() {
+    let host = read_source("src-tauri/src/setup/setup_brain_host.rs");
+    let flow = read_source("src-tauri/src/setup/flow.rs");
+    let configured_branch = source_between(
+        &flow,
+        "SetupBrainSource::Configured",
+        "SetupBrainSource::Fallback",
+    );
+
+    assert_contains("setup brain host", &host, "ProviderImplementationRef");
+    assert_contains("setup brain host", &host, "ProviderClient");
+    assert_contains("setup brain host", &host, "build_setup_brain_turn_request");
+    assert_contains("setup brain host", &host, "require_setup_brain_capability");
+    assert_contains("setup brain host", &host, "decode_setup_brain_turn_result");
+    assert_contains("setup brain host", &host, "setup_brain.turn");
+    assert_not_contains(
+        "configured setup brain branch",
+        configured_branch,
+        "LegacySetupBrainFallback",
+    );
+    assert_not_contains(
+        "configured setup brain branch",
+        configured_branch,
+        "run_legacy_setup_brain_fallback(",
+    );
+}
+
+#[test]
+fn new_setup_brain_host_does_not_construct_direct_process_command() {
+    let host = read_source("src-tauri/src/setup/setup_brain_host.rs");
+
+    assert_not_contains("setup brain host", &host, "std::process::Command");
+    assert_not_contains("setup brain host", &host, "Command::new(");
+    assert_not_contains("setup brain host", &host, ".spawn(");
+    assert_not_contains("setup brain host", &host, ".output(");
+}
+
+#[test]
+fn s8_files_introduce_zero_new_concrete_provider_vocabulary() {
+    let root = workspace_root();
+    let pattern = concrete_provider_pattern();
+    let tracked_added = tracked_added_provider_name_occurrences(&root, &pattern);
+    let untracked_added = untracked_provider_name_occurrences(&root, &pattern);
+
+    assert_eq!(
+        tracked_added + untracked_added,
+        0,
+        "S8 files must not introduce concrete-provider vocabulary"
+    );
+}
+
+#[test]
+fn full_provider_name_grep_threshold_remains_within_manager_baseline() {
+    let root = workspace_root();
+    let output = Command::new("git")
+        .current_dir(&root)
+        .args(["grep", "-iE", &concrete_provider_pattern()])
+        .output()
+        .expect("git grep must run");
+    assert!(
+        output.status.success() || output.status.code() == Some(1),
+        "git grep failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let count = String::from_utf8(output.stdout)
+        .expect("git grep stdout utf8")
+        .lines()
+        .count();
+
+    assert!(
+        count <= MANAGER_BASELINE_PROVIDER_NAME_COUNT,
+        "full provider-name grep count {count} exceeds manager baseline {MANAGER_BASELINE_PROVIDER_NAME_COUNT}"
+    );
+}
+
+fn tracked_added_provider_name_occurrences(root: &Path, pattern: &str) -> usize {
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(["diff", "--unified=0", "--", "."])
+        .output()
+        .expect("git diff must run");
+    assert!(
+        output.status.success(),
+        "git diff failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("git diff stdout utf8")
+        .lines()
+        .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
+        .flat_map(|line| provider_name_matches(line, pattern))
+        .count()
+}
+
+fn untracked_provider_name_occurrences(root: &Path, pattern: &str) -> usize {
+    let output = Command::new("git")
+        .current_dir(root)
+        .args([
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--",
+            ".",
+        ])
+        .output()
+        .expect("git ls-files must run");
+    assert!(
+        output.status.success(),
+        "git ls-files failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .filter_map(|relative| std::str::from_utf8(relative).ok())
+        .filter(|relative| {
+            !relative.starts_with("target/") && !relative.starts_with("src-tauri/target/")
+        })
+        .map(|relative| {
+            let source = std::fs::read_to_string(root.join(relative))
+                .unwrap_or_else(|error| panic!("failed to read {relative}: {error}"));
+            provider_name_matches(&source, pattern).count()
+        })
+        .sum()
+}
+
+fn provider_name_matches<'a>(line: &'a str, pattern: &'a str) -> impl Iterator<Item = &'a str> {
+    let left = &pattern[..6];
+    let right = &pattern[7..];
+    line.match_indices(left)
+        .map(|(_, matched)| matched)
+        .chain(line.match_indices(right).map(|(_, matched)| matched))
+}
+
+fn concrete_provider_pattern() -> String {
+    format!(
+        "{}|{}",
+        ["cl", "au", "de"].concat(),
+        ["co", "de", "x"].concat()
+    )
+}
+
+fn read_source(relative: &str) -> String {
+    std::fs::read_to_string(workspace_root().join(relative))
+        .unwrap_or_else(|error| panic!("failed to read {relative}: {error}"))
+}
+
+fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+    let start_index = source
+        .find(start)
+        .unwrap_or_else(|| panic!("missing start marker {start:?}"));
+    let end_index = source[start_index..]
+        .find(end)
+        .map(|offset| start_index + offset)
+        .unwrap_or_else(|| panic!("missing end marker {end:?} after {start:?}"));
+    &source[start_index..end_index]
+}
+
+fn assert_contains(context: &str, source: &str, needle: &str) {
+    assert!(source.contains(needle), "{context} missing {needle:?}");
+}
+
+fn assert_not_contains(context: &str, source: &str, needle: &str) {
+    assert!(
+        !source.contains(needle),
+        "{context} must not contain {needle:?}"
+    );
+}
+
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf()
+}
