@@ -32,6 +32,7 @@ pub mod zero_turn_orchestration;
 
 pub use app_paths::{
     AppConfig, load_app_config, load_providers_for_models_dir, load_providers_for_models_dir_with,
+    try_load_app_config,
 };
 pub use app_state::{AppState, AppStateTestServices};
 pub use commands::models::ModelSummary;
