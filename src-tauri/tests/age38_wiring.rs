@@ -145,7 +145,8 @@ fn assert_constructor_body_initializes_provider_registry(constructor: &str, body
         body.contains("let provider_registry =")
             && body.contains("Arc::new(")
             && body.contains("let provider_registry_handle = ProviderRegistryHandle::new(")
-            && body.contains("provider_registry_handle,"),
+            && (body.contains("provider_registry_handle,")
+                || body.contains("provider_registry_handle: provider_registry_handle.clone(),")),
         "{constructor} must initialize the provider registry and shared handle"
     );
 }

@@ -241,6 +241,7 @@ fn export_service_returns_canonical_bytes_matching_direct_path() {
     let output = service
         .export_session(SessionExportServiceRequest {
             session_id: SESSION_A.to_string(),
+            external_provider: None,
         })
         .unwrap();
 
@@ -258,6 +259,7 @@ fn export_service_preserves_invocation_count() {
     let output = service
         .export_session(SessionExportServiceRequest {
             session_id: SESSION_A.to_string(),
+            external_provider: None,
         })
         .unwrap();
 
@@ -307,6 +309,7 @@ fn session_export_parity_unchanged_under_contract() {
     let output = service
         .export_session(SessionExportServiceRequest {
             session_id: SESSION_A.to_string(),
+            external_provider: None,
         })
         .unwrap();
 
@@ -324,6 +327,7 @@ fn export_error_for(fixture: ExportFixture, session_id: &str) -> ExportError {
     let err = service
         .export_session(SessionExportServiceRequest {
             session_id: session_id.to_string(),
+            external_provider: None,
         })
         .unwrap()
         .result

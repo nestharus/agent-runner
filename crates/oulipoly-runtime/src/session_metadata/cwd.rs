@@ -2,6 +2,16 @@
 //! accessor, formatter, mapper, parser, validator
 //!
 //! Workspace-root resolution from the configured session storage cwd script.
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-runtime/src/session_metadata/cwd.rs
+//!     role: intrinsic-surface
+//!     Domain: session storage cwd script resolution
+//!     Owns:
+//!       - cwd script command construction and execution
+//!       - cwd script stdout parsing and validation
+//! ```
 
 use oulipoly_config::SessionStorage;
 use serde::Deserialize;

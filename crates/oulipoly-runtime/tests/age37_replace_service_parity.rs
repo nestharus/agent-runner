@@ -219,6 +219,7 @@ fn replace_service_delegates_to_run_import_replace_for_happy_path() {
             session_id: SESSION_A.to_string(),
             source: ReplaceSource::File(service_fixture.input_path.clone()),
             preimage_sha256: None,
+            external_provider: None,
         })
         .unwrap();
 
@@ -236,6 +237,7 @@ fn replace_service_preserves_replace_error_invalid_input_transcript() {
             session_id: SESSION_A.to_string(),
             source: ReplaceSource::File(missing),
             preimage_sha256: None,
+            external_provider: None,
         })
         .unwrap()
         .result
@@ -261,6 +263,7 @@ fn session_replace_active_segment_parity_under_contract() {
             session_id: SESSION_A.to_string(),
             source: ReplaceSource::File(fixture.input_path.clone()),
             preimage_sha256: None,
+            external_provider: None,
         })
         .unwrap();
     let receipt = output.result.unwrap();

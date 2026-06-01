@@ -163,6 +163,19 @@ impl ImportReplaceFixture {
         fs::write(self.models_dir.join(format!("{model_name}.toml")), body).unwrap();
     }
 
+    pub fn write_external_model(
+        &self,
+        model_name: &str,
+        provider_name: &str,
+        provider_path: &Path,
+    ) {
+        fs::write(
+            self.models_dir.join(format!("{model_name}.toml")),
+            external_model_toml(provider_name, provider_path),
+        )
+        .unwrap();
+    }
+
     pub fn write_provider(&self, provider_name: &str, storage: StorageKind<'_>) {
         let storage_block = match storage {
             StorageKind::ClaudeCode { projects_dir } => format!(
@@ -198,6 +211,68 @@ kind = "flag"
 flag = "--resume"
 {storage_block}
 "#
+        ));
+        fs::write(providers_path, body).unwrap();
+    }
+
+    pub fn write_provider_with_storage_kind_text(
+        &self,
+        provider_name: &str,
+        storage_kind: &str,
+        storage_path: &Path,
+    ) {
+        fs::create_dir_all(&self.app_config_dir).unwrap();
+        let providers_path = self.app_config_dir.join("providers.toml");
+        let mut body = fs::read_to_string(&providers_path).unwrap_or_default();
+        body.push_str(&format!(
+            r#"[{provider_name}]
+command = "provider-command-that-must-not-run"
+args = []
+interactive_args = ["launch"]
+prompt_mode = "arg"
+
+[{provider_name}.resume]
+kind = "flag"
+flag = "--resume"
+
+[{provider_name}.session_storage]
+kind = "{storage_kind}"
+projects_dir = "{}"
+"#,
+            storage_path.display()
+        ));
+        fs::write(providers_path, body).unwrap();
+    }
+
+    pub fn write_provider_with_script_storage(
+        &self,
+        provider_name: &str,
+        storage_type: &str,
+        cwd_script: &Path,
+        transcript_script: &Path,
+    ) {
+        fs::create_dir_all(&self.app_config_dir).unwrap();
+        let providers_path = self.app_config_dir.join("providers.toml");
+        let mut body = fs::read_to_string(&providers_path).unwrap_or_default();
+        body.push_str(&format!(
+            r#"[{provider_name}]
+command = "provider-command-that-must-not-run"
+args = []
+interactive_args = ["launch"]
+prompt_mode = "arg"
+
+[{provider_name}.resume]
+kind = "flag"
+flag = "--resume"
+
+[{provider_name}.session_storage]
+kind = "script"
+cwd_script = "{}"
+transcript_script = "{}"
+storage_type = "{storage_type}"
+"#,
+            cwd_script.display(),
+            transcript_script.display()
         ));
         fs::write(providers_path, body).unwrap();
     }
@@ -507,6 +582,14 @@ flag = "--resume"
         )
         .unwrap()
     }
+}
+
+fn external_model_toml(provider_name: &str, provider_path: &Path) -> String {
+    format!(
+        "provider = {{ path = {:?} }}\n\n[[providers]]\nname = {:?}\n\n",
+        provider_path.display().to_string(),
+        provider_name
+    )
 }
 
 pub fn prepared_claude_replace_fixture() -> PreparedReplace {

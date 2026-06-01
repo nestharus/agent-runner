@@ -113,6 +113,19 @@ impl ExportFixture {
         fs::write(self.models_dir.join(format!("{model_name}.toml")), body).unwrap();
     }
 
+    pub fn write_external_model(
+        &self,
+        model_name: &str,
+        provider_name: &str,
+        provider_path: &Path,
+    ) {
+        fs::write(
+            self.models_dir.join(format!("{model_name}.toml")),
+            external_model_toml(provider_name, provider_path),
+        )
+        .unwrap();
+    }
+
     pub fn write_provider(
         &self,
         provider_name: &str,
@@ -318,6 +331,14 @@ prompt_mode = "arg"
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
         cmd.output().unwrap()
     }
+}
+
+fn external_model_toml(provider_name: &str, provider_path: &Path) -> String {
+    format!(
+        "provider = {{ path = {:?} }}\n\n[[providers]]\nname = {:?}\n\n",
+        provider_path.display().to_string(),
+        provider_name
+    )
 }
 
 pub fn cli_claude_export_fixture() -> PreparedExport {

@@ -6,6 +6,7 @@ pub(crate) mod handshake;
 pub(crate) mod migrate;
 pub(crate) mod resume_list;
 pub(crate) mod schema_probe;
+pub(crate) mod session_external_provider_identity;
 pub(crate) mod session_import_replace;
 pub(crate) mod session_locate_export;
 pub(crate) mod trace;

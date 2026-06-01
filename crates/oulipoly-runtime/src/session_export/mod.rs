@@ -1,3 +1,15 @@
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-runtime/src/session_export/mod.rs
+//!     role: intrinsic-surface
+//!     Domain: session export canonical projection
+//!     Owns:
+//!       - provider transcript to canonical record parsing
+//!       - canonical JSONL serialization
+//!       - export metadata resolution delegation
+//!       - state-db fallback transcript projection
+//! ```
+
 mod metadata;
 
 use chrono::{DateTime, Utc};

@@ -365,11 +365,13 @@ fn age_37_trace_export_replace_lock_services_are_object_safe_with_contract_dtos(
     };
     let export_request = SessionExportServiceRequest {
         session_id: "5169694d-de0f-40d1-890c-6e28e55bab27".to_string(),
+        external_provider: None,
     };
     let replace_request = SessionReplaceServiceRequest {
         session_id: "5169694d-de0f-40d1-890c-6e28e55bab27".to_string(),
         source: oulipoly_runtime::session_replace::ReplaceSource::Stdin,
         preimage_sha256: Some("0".repeat(64)),
+        external_provider: None,
     };
     let acquire_request = SessionLockServiceRequest::Acquire {
         session_id: "5169694d-de0f-40d1-890c-6e28e55bab27".to_string(),

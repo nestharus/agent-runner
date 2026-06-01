@@ -169,6 +169,7 @@ pub enum TraceServiceFailure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionExportServiceRequest {
     pub session_id: String,
+    pub external_provider: Option<SessionServiceExternalProviderIdentity>,
 }
 
 #[derive(Debug)]
@@ -181,6 +182,7 @@ pub struct SessionReplaceServiceRequest {
     pub session_id: String,
     pub source: ReplaceSource,
     pub preimage_sha256: Option<String>,
+    pub external_provider: Option<SessionServiceExternalProviderIdentity>,
 }
 
 #[derive(Debug)]

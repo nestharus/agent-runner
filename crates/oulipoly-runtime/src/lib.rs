@@ -10,6 +10,7 @@ pub mod quota;
 pub mod repl_default_provider;
 pub mod services;
 pub mod session_export;
+pub mod session_external_provider;
 pub mod session_lock;
 pub mod session_metadata;
 pub mod session_provider;
