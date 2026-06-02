@@ -403,9 +403,11 @@ fn exhausted_attempt_reason(
 fn finalize_spawn_error(input: super::mapper::SpawnErrorInput<'_, '_>) {
     let signal = spawn_error_signal(&input);
     apply_spawn_error_terminal_outcome(&input, &signal);
-    finalize_spawn_error_invocation(&input, &signal);
+    let finalized = finalize_spawn_error_invocation(&input, &signal);
     emit_spawn_error_envelope(&input, &signal);
-    input.guard.mark_finalized();
+    if finalized {
+        input.guard.mark_finalized();
+    }
 }
 
 fn spawn_error_signal(
@@ -441,18 +443,22 @@ fn spawn_error_terminal_signal_context_ids(
 fn finalize_spawn_error_invocation(
     input: &super::mapper::SpawnErrorInput<'_, '_>,
     signal: &oulipoly_runtime::executor::TerminalSignal,
-) {
+) -> bool {
     let terminal_reason = formatter::spawn_error_terminal_reason(signal);
-    input
+    match input
         .agent_runtime_services
         .invocation_lifecycle_service
         .finalize_invocation(super::mapper::spawn_error_finalize_request(
             &input.env.state,
             input.invocation_row_id,
             terminal_reason,
-        ))
-        .map(|_| ())
-        .unwrap_or_else(formatter::emit_finalize_invocation_warning);
+        )) {
+        Ok(_) => true,
+        Err(err) => {
+            formatter::emit_finalize_invocation_warning(err);
+            false
+        }
+    }
 }
 
 fn emit_spawn_error_envelope(
