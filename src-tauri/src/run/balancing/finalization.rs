@@ -24,6 +24,9 @@ use crate::session_ingest_cli::{emit_known_session_id, ingest_and_emit_session_i
 use crate::terminal_outcome_adapter::{TerminalSignalContext, apply_terminal_signal_outcome};
 use crate::wiring;
 
+const TERMINAL_PERSISTENCE_ERROR_CATEGORY: &str = "terminal_persistence";
+const TERMINAL_PERSISTENCE_TERMINAL_REASON: &str = "terminal_persistence_failed";
+
 pub(super) struct CompletedAttemptInput<'a, 'state, 'ctx> {
     pub(super) agent_runtime_services: &'a wiring::AgentRuntimeServices,
     pub(super) env: &'a BalancedExecutionEnvironment,
@@ -94,7 +97,7 @@ pub(super) fn finalize_completed_attempt(
         "no_retry",
     );
 
-    input
+    let finalize_result = input
         .agent_runtime_services
         .invocation_lifecycle_service
         .finalize_invocation(mapper::completed_finalize_request(
@@ -104,9 +107,20 @@ pub(super) fn finalize_completed_attempt(
             input.result.exit_code,
             error_category.as_deref(),
             input.result.terminal_reason.as_deref(),
-        ))
-        .map(|_| ())
-        .unwrap_or_else(formatter::emit_finalize_invocation_warning);
+        ));
+    if let Err(err) = finalize_result {
+        formatter::emit_finalize_invocation_warning(err);
+        formatter::emit_failure_result_envelope(mapper::failure_result_envelope_input(
+            &input.env.state,
+            &input.invocation.id,
+            input.provider_name,
+            input.zero_turn_provider_session_id,
+            1,
+            Some(TERMINAL_PERSISTENCE_ERROR_CATEGORY),
+            Some(TERMINAL_PERSISTENCE_TERMINAL_REASON),
+        ));
+        return BalancedLoopControl::Return(Ok(1));
+    }
     input.guard.mark_finalized();
 
     if success && let Err(err) = ingest_completed_attempt_session(&input) {
@@ -159,15 +173,13 @@ fn record_returned_artifacts_for_completed_attempt(
 
 fn finalize_returned_artifacts_persist_failure(input: mapper::ArtifactPersistFailureInput<'_, '_>) {
     formatter::emit_returned_artifacts_error(input.error);
-    input
+    let finalize_result = input
         .agent_runtime_services
         .invocation_lifecycle_service
         .finalize_invocation(mapper::returned_artifacts_finalize_request(
             &input.env.state,
             input.invocation_row_id,
-        ))
-        .map(|_| ())
-        .unwrap_or_else(formatter::emit_finalize_invocation_warning);
+        ));
     formatter::emit_failure_result_envelope(mapper::failure_result_envelope_input(
         &input.env.state,
         input.invocation_id,
@@ -177,7 +189,10 @@ fn finalize_returned_artifacts_persist_failure(input: mapper::ArtifactPersistFai
         Some("returned_artifacts"),
         Some("returned_artifacts_persist_failed"),
     ));
-    input.guard.mark_finalized();
+    match finalize_result {
+        Ok(_) => input.guard.mark_finalized(),
+        Err(err) => formatter::emit_finalize_invocation_warning(err),
+    }
 }
 
 fn ingest_completed_attempt_session(

@@ -71,7 +71,7 @@ pub(super) fn handle_maybe_quota_verify(
         input.typed.result,
     );
     let confirmed = confirmed_zero_turn_action(input.zero_turn_action);
-    input
+    let finalize_result = input
         .typed
         .agent_runtime_services
         .invocation_lifecycle_service
@@ -81,10 +81,11 @@ pub(super) fn handle_maybe_quota_verify(
             input.typed.result.exit_code,
             confirmed,
             terminal_reason,
-        ))
-        .map(|_| ())
-        .unwrap_or_else(formatter::emit_finalize_invocation_warning);
-    input.typed.guard.mark_finalized();
+        ));
+    match finalize_result {
+        Ok(_) => input.typed.guard.mark_finalized(),
+        Err(err) => formatter::emit_finalize_invocation_warning(err),
+    }
     bump_quota_tick(input.typed.env, input.typed.provider_name);
     match input.zero_turn_action {
         ZeroTurnAction::VerifySameProvider => {
@@ -140,7 +141,7 @@ pub(super) fn handle_quota_exhausted_retry(
     );
     emit_session_capture_failure(input.result);
     update_session_capture(input.env, input.invocation_row_id, input.result);
-    input
+    let finalize_result = input
         .agent_runtime_services
         .invocation_lifecycle_service
         .finalize_invocation(mapper::quota_exhausted_finalize_request(
@@ -148,10 +149,11 @@ pub(super) fn handle_quota_exhausted_retry(
             input.invocation_row_id,
             input.result.exit_code,
             terminal_reason,
-        ))
-        .map(|_| ())
-        .unwrap_or_else(formatter::emit_finalize_invocation_warning);
-    input.guard.mark_finalized();
+        ));
+    match finalize_result {
+        Ok(_) => input.guard.mark_finalized(),
+        Err(err) => formatter::emit_finalize_invocation_warning(err),
+    }
     bump_quota_tick(input.env, input.provider_name);
     // [routing] provider {provider_name} returned quota_exhausted; retrying another provider
     if retry_available(input.attempts, input.max_attempts) {
@@ -181,7 +183,7 @@ pub(super) fn handle_prolonged_silence_fail(
     );
     emit_session_capture_failure(input.result);
     update_session_capture(input.env, input.invocation_row_id, input.result);
-    input
+    let finalize_result = input
         .agent_runtime_services
         .invocation_lifecycle_service
         .finalize_invocation(mapper::terminal_failure_finalize_request(
@@ -189,10 +191,11 @@ pub(super) fn handle_prolonged_silence_fail(
             input.invocation_row_id,
             input.result,
             terminal_reason,
-        ))
-        .map(|_| ())
-        .unwrap_or_else(formatter::emit_finalize_invocation_warning);
-    input.guard.mark_finalized();
+        ));
+    match finalize_result {
+        Ok(_) => input.guard.mark_finalized(),
+        Err(err) => formatter::emit_finalize_invocation_warning(err),
+    }
     formatter::emit_failure_output(
         mapper::failure_result_envelope_input(
             &input.env.state,
@@ -229,7 +232,7 @@ pub(super) fn handle_interactive_fail(
     );
     emit_session_capture_failure(input.result);
     update_session_capture(input.env, input.invocation_row_id, input.result);
-    input
+    let finalize_result = input
         .agent_runtime_services
         .invocation_lifecycle_service
         .finalize_invocation(mapper::terminal_failure_finalize_request(
@@ -237,10 +240,11 @@ pub(super) fn handle_interactive_fail(
             input.invocation_row_id,
             input.result,
             terminal_reason,
-        ))
-        .map(|_| ())
-        .unwrap_or_else(formatter::emit_finalize_invocation_warning);
-    input.guard.mark_finalized();
+        ));
+    match finalize_result {
+        Ok(_) => input.guard.mark_finalized(),
+        Err(err) => formatter::emit_finalize_invocation_warning(err),
+    }
     formatter::emit_failure_output(
         mapper::failure_result_envelope_input(
             &input.env.state,
