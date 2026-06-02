@@ -1,29 +1,44 @@
 //! ## Declared roles
 //!
-//! `orchestration`, `filter`, `predicate`, `mapper`, `accessor`, `formatter`, `validator`.
+//! `orchestration`, `filter`, `predicate`, `mapper`, `accessor`, `formatter`, `validator`,
+//! `parser`.
 //!
 //! ## Intrinsic-surface declarations
 //! intrinsic_surface_declarations:
-//!   - component: crates/oulipoly-runtime/src/balancer/mod.rs::quota_routing_surface
+//!   - component: crates/oulipoly-runtime/src/balancer/context.rs::balance_context_surface
+//!     role: intrinsic-surface
+//!     Domain: contextual-balancer-dependencies
+//!     Owns:
+//!       - ProvidersConfig quota refresh-source contract
+//!       - SessionsConfig session scan and adapter-derived refresh contract
+//!       - InFlight refresh deduplication carrier
+//!   - component: crates/oulipoly-runtime/src/balancer/refresh_inputs.rs::contextual_refresh_surface
 //!     role: intrinsic-surface
 //!     Domain: quota_routing_orchestration
 //!     Owns:
-//!       - InFlight refresh deduplication carrier
 //!       - RefreshOutcome ignored/degraded routing result
-//!       - has_refresh_source topology-probe eligibility
 //!       - is_routing_stale route-selection refresh TTL
 //!       - is_stale projection refresh TTL
-//!       - is_topology_probe_due topology repair predicate
 //!       - refresh_provider projection refresh operation
 //!       - refresh_provider_for_routing route-selection refresh operation
+//!       - verify_or_clear_marker route-selection marker verification
+//!       - scan_provider session scan operation
+//!   - component: crates/oulipoly-runtime/src/balancer/snapshot.rs::quota_snapshot_surface
+//!     role: intrinsic-surface
+//!     Domain: quota-cache-snapshot-access
+//!     Owns:
+//!       - QuotaRecord cached read accessor
+//!       - QuotaWindow cached read accessor
+//!       - QuotaSnapshot in-memory routing/projection cache
 //!   - component: crates/oulipoly-runtime/src/balancer/mod.rs::config_topology_session_contract
 //!     role: intrinsic-surface
 //!     Domain: balancer-config-topology-and-session-contract
 //!     Owns:
 //!       - ModelConfig provider pool and model name contract
 //!       - ProviderConfig provider name/session storage contract
-//!       - ProvidersConfig quota refresh-source contract
-//!       - SessionsConfig session scan and adapter-derived refresh contract
+//!       - has_refresh_source topology-probe eligibility
+//!       - is_topology_probe_due topology repair predicate
+//!       - refresh_provider_for_routing topology repair operation
 //!       - SessionStorage resume migration eligibility contract
 //!   - component: crates/oulipoly-runtime/src/balancer/mod.rs::quota_resume_state_surface
 //!     role: intrinsic-surface
@@ -37,26 +52,66 @@
 //!       - QuotaWindow usage/reset/delta fields
 //!       - ResolvedResume active-provider contract
 
+mod burn_rate;
+mod context;
+mod density;
+mod eligibility;
 pub mod forensics;
+mod invocation_fallback;
+mod migration;
+mod projection;
+mod refresh_inputs;
+mod snapshot;
+mod topology;
+mod working_set;
 
+pub use context::BalanceContext;
+pub use density::FANOUT_SCORE_BAND_RATIO;
 pub use forensics::{FailureClass, apply_post_failure_forensics};
-
-use crate::migration::{MigrationError, provider_has_derivable_claude_projects_dir};
-use crate::quota::{
-    InFlight, RefreshOutcome, has_refresh_source, is_routing_stale, is_stale,
-    is_topology_probe_due, refresh_provider, refresh_provider_for_routing, verify_or_clear_marker,
+pub use migration::{
+    ManualMigrationRejection, MigrationDecision, decide_manual_migration, decide_migration,
 };
-use crate::sessions::scan_provider;
-use chrono::{DateTime, Utc};
-use oulipoly_config::{ModelConfig, ProviderConfig, ProvidersConfig, SessionsConfig};
+pub use projection::{ProviderProjection, WindowProjection, compute_projections};
+pub use working_set::{select_next_working_candidate, working_set_member};
+
+#[cfg(test)]
+pub(crate) use burn_rate::{
+    bootstrap_burn_rate_for_test, bootstrap_duration_ratio_for_test, project_used_percent_for_test,
+};
+
+#[cfg(test)]
+use crate::migration::MigrationError;
+use chrono::Utc;
+use oulipoly_config::ModelConfig;
 pub use oulipoly_core::TransitionReason;
-use oulipoly_state::{QuotaRecord, QuotaWindow, ResolvedResume, StateDb};
+#[cfg(test)]
+use oulipoly_state::QuotaRecord;
+#[cfg(test)]
+use oulipoly_state::QuotaWindow;
+use oulipoly_state::StateDb;
 use std::fmt;
+
+#[cfg(test)]
+use burn_rate::{
+    duration_ratio_fallback_percent_per_call, duration_ratio_rate, learned_rate,
+    pool_window_avg_percent_per_call,
+};
+use density::score_by_density;
+#[cfg(test)]
+use density::{
+    FanoutUsageKey, ProviderEval, approx_eq_usage, fanout_usage_key, finite_fanout_reset,
+    finite_fanout_usage, select_binding_score_with_fanout,
+};
+use eligibility::eligible_provider_indices;
+use invocation_fallback::score_by_invocation_count;
+use projection::live_window_count;
+use refresh_inputs::refresh_routing_inputs;
+use snapshot::{QuotaSnapshot, load_quota_snapshot};
+use topology::repair_routing_topology;
 
 const ERROR_WINDOW_MINUTES: i64 = 30;
 const ERROR_THRESHOLD: u64 = 3;
 const EPS_HOURS: f64 = 1.0 / 60.0;
-const EXHAUSTED_USED_PERCENT: f64 = 1.0;
 /// Visible-usage threshold for the missing-window penalty. Anthropic's
 /// usage API hides the 5h window when an account is near weekly cap
 /// (observed live at 91% weekly). ChatGPT's API hides the 5h window
@@ -66,46 +121,6 @@ const EXHAUSTED_USED_PERCENT: f64 = 1.0;
 /// (idle account, different upstream behavior) and the provider should
 /// not be torpedoed for it.
 const HIDDEN_WINDOW_PENALTY_THRESHOLD: f64 = 0.85;
-pub const FANOUT_SCORE_BAND_RATIO: f64 = 2.0;
-
-#[derive(Debug, Clone)]
-struct ProviderEval {
-    index: usize,
-    binding_score: Option<f64>,
-    unlearned: bool,
-    fanout_usage: Option<FanoutUsageKey>,
-}
-
-#[derive(Copy, Clone, Debug)]
-struct FanoutUsageKey {
-    worst_projected_used: Option<f64>,
-    soonest_reset_hours: Option<f64>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ProviderProjection {
-    pub provider_index: usize,
-    pub projections_per_window: Vec<WindowProjection>,
-    pub binding_score: Option<f64>,
-    pub recent_error_count: u32,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct WindowProjection {
-    pub window_id: i64,
-    pub projected_used: f64,
-    pub hours_until_reset: f64,
-    pub remaining_headroom: f64,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum MigrationDecision {
-    Stay,
-    Migrate {
-        target_provider_index: usize,
-        reason: TransitionReason,
-    },
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoutingError {
@@ -138,30 +153,6 @@ impl fmt::Display for RoutingError {
 
 impl std::error::Error for RoutingError {}
 
-/// Contextual dependencies for quota-aware balancing. When present,
-/// `select_provider` will trigger a synchronous refresh for any provider
-/// whose cached quota is stale (older than `REFRESH_TTL_HOURS`) AND scan
-/// each provider's CLI session logs for new turns. Pass `None` to use
-/// cached-only scoring (e.g. from inside an async handler where blocking
-/// on a network call isn't desirable).
-pub struct BalanceContext<'a> {
-    pub providers_cfg: &'a ProvidersConfig,
-    pub sessions_cfg: &'a SessionsConfig,
-    pub in_flight: &'a InFlight,
-}
-
-struct QuotaSnapshot {
-    quotas: Vec<Option<QuotaRecord>>,
-    windows: Vec<Vec<QuotaWindow>>,
-}
-
-struct TopologyProbeRefresh {
-    provider_index: usize,
-    live_window_count: usize,
-    pool_expected_live_windows: usize,
-    topology_peak_live_window_count: usize,
-}
-
 pub fn select_provider(
     model: &ModelConfig,
     state: &StateDb,
@@ -184,255 +175,6 @@ pub fn select_provider(
         &snapshot,
         filtered_indices.as_slice(),
     ))
-}
-
-fn refresh_routing_inputs(model: &ModelConfig, state: &StateDb, ctx: Option<&BalanceContext<'_>>) {
-    if let Some(ctx) = ctx {
-        let now = Utc::now();
-        for provider in &model.providers {
-            verify_provider_marker_before_routing(provider, state, ctx, now);
-            refresh_provider_for_stale_routing(provider, state, ctx);
-            scan_provider_for_routing(provider, state, ctx);
-        }
-    }
-}
-
-fn verify_provider_marker_before_routing(
-    provider: &ProviderConfig,
-    state: &StateDb,
-    ctx: &BalanceContext<'_>,
-    now: DateTime<Utc>,
-) {
-    verify_or_clear_marker(
-        state,
-        ctx.providers_cfg,
-        ctx.sessions_cfg,
-        ctx.in_flight,
-        &provider.name,
-        now,
-    );
-}
-
-fn refresh_provider_for_stale_routing(
-    provider: &ProviderConfig,
-    state: &StateDb,
-    ctx: &BalanceContext<'_>,
-) {
-    if is_routing_stale(state, &provider.name) {
-        let _: RefreshOutcome = refresh_provider_for_routing(
-            &provider.name,
-            ctx.providers_cfg,
-            ctx.sessions_cfg,
-            ctx.in_flight,
-            state,
-        );
-    }
-}
-
-fn scan_provider_for_routing(provider: &ProviderConfig, state: &StateDb, ctx: &BalanceContext<'_>) {
-    let _ = scan_provider(&provider.name, ctx.sessions_cfg, state);
-}
-
-fn load_quota_snapshot(model: &ModelConfig, state: &StateDb) -> QuotaSnapshot {
-    QuotaSnapshot {
-        quotas: model
-            .providers
-            .iter()
-            .map(|provider| cached_quota_record(state, &provider.name))
-            .collect(),
-        windows: model
-            .providers
-            .iter()
-            .map(|provider| cached_quota_windows(state, &provider.name))
-            .collect(),
-    }
-}
-
-fn cached_quota_record(state: &StateDb, provider_name: &str) -> Option<QuotaRecord> {
-    state.get_quota(provider_name).ok().flatten()
-}
-
-fn cached_quota_windows(state: &StateDb, provider_name: &str) -> Vec<QuotaWindow> {
-    state.get_windows(provider_name).unwrap_or_default()
-}
-
-fn repair_routing_topology(
-    model: &ModelConfig,
-    state: &StateDb,
-    ctx: &BalanceContext<'_>,
-    snapshot: &mut QuotaSnapshot,
-) {
-    let now = Utc::now();
-    let live_window_counts = live_window_counts(snapshot.windows.as_slice(), now);
-    let topology_peak_counts = topology_peak_counts(snapshot.quotas.as_slice());
-    let pool_expected_live_windows =
-        expected_pool_live_window_count(&live_window_counts, &topology_peak_counts);
-
-    for (provider_index, provider) in model.providers.iter().enumerate() {
-        if topology_probe_should_refresh(
-            state,
-            provider,
-            ctx,
-            live_window_counts[provider_index],
-            pool_expected_live_windows,
-        ) {
-            let probe = TopologyProbeRefresh {
-                provider_index,
-                live_window_count: live_window_counts[provider_index],
-                pool_expected_live_windows,
-                topology_peak_live_window_count: topology_peak_counts[provider_index],
-            };
-            record_topology_probe_and_refresh(model, state, ctx, snapshot, probe);
-        }
-    }
-}
-
-fn live_window_counts(windows: &[Vec<QuotaWindow>], now: chrono::DateTime<Utc>) -> Vec<usize> {
-    windows
-        .iter()
-        .map(|provider_windows| live_window_count(provider_windows, now))
-        .collect()
-}
-
-fn topology_peak_counts(quotas: &[Option<QuotaRecord>]) -> Vec<usize> {
-    quotas
-        .iter()
-        .map(|quota| {
-            quota
-                .as_ref()
-                .map(|quota| quota.topology_peak_live_window_count)
-                .unwrap_or(0)
-        })
-        .collect()
-}
-
-fn expected_pool_live_window_count(
-    live_window_counts: &[usize],
-    topology_peak_counts: &[usize],
-) -> usize {
-    live_window_counts
-        .iter()
-        .zip(topology_peak_counts.iter())
-        .map(|(live, peak)| (*live).max(*peak))
-        .max()
-        .unwrap_or(0)
-}
-
-fn topology_probe_should_refresh(
-    state: &StateDb,
-    provider: &ProviderConfig,
-    ctx: &BalanceContext<'_>,
-    live_window_count: usize,
-    pool_expected_live_windows: usize,
-) -> bool {
-    has_refresh_source(&provider.name, ctx.providers_cfg, ctx.sessions_cfg)
-        && is_topology_probe_due(
-            state,
-            &provider.name,
-            live_window_count,
-            pool_expected_live_windows,
-        )
-}
-
-fn record_topology_probe_and_refresh(
-    model: &ModelConfig,
-    state: &StateDb,
-    ctx: &BalanceContext<'_>,
-    snapshot: &mut QuotaSnapshot,
-    probe: TopologyProbeRefresh,
-) {
-    let provider = &model.providers[probe.provider_index];
-    let _ = state.record_topology_probe(&provider.name);
-    trace_topology_probe(
-        provider,
-        probe.live_window_count,
-        probe.pool_expected_live_windows,
-        probe.topology_peak_live_window_count,
-    );
-    let _: RefreshOutcome = refresh_provider_for_routing(
-        &provider.name,
-        ctx.providers_cfg,
-        ctx.sessions_cfg,
-        ctx.in_flight,
-        state,
-    );
-    snapshot.quotas[probe.provider_index] = cached_quota_record(state, &provider.name);
-    snapshot.windows[probe.provider_index] = cached_quota_windows(state, &provider.name);
-}
-
-fn trace_topology_probe(
-    provider: &ProviderConfig,
-    live_window_count: usize,
-    pool_expected_live_windows: usize,
-    topology_peak_live_window_count: usize,
-) {
-    tracing::info!(
-        provider_name = provider.name.as_str(),
-        live_window_count = live_window_count,
-        pool_expected_live_window_count = pool_expected_live_windows,
-        topology_peak_live_window_count = topology_peak_live_window_count,
-        "topology probe fired"
-    );
-}
-
-fn eligible_provider_indices(
-    model: &ModelConfig,
-    state: &StateDb,
-    snapshot: &QuotaSnapshot,
-    now: chrono::DateTime<Utc>,
-) -> Vec<usize> {
-    let all_indices = all_provider_indices(model);
-    let reset_implied = reset_implied_flags(&all_indices, snapshot, now);
-    clear_reset_implied_flags(state, model, &reset_implied);
-    route_eligible_provider_indices(all_indices, snapshot, &reset_implied, now)
-}
-
-fn route_eligible_provider_indices(
-    provider_indices: Vec<usize>,
-    snapshot: &QuotaSnapshot,
-    reset_implied: &[bool],
-    now: chrono::DateTime<Utc>,
-) -> Vec<usize> {
-    provider_indices
-        .into_iter()
-        .filter(|&provider_index| {
-            provider_is_route_eligible(provider_index, snapshot, reset_implied, now)
-        })
-        .collect()
-}
-
-fn all_provider_indices(model: &ModelConfig) -> Vec<usize> {
-    (0..model.providers.len()).collect()
-}
-
-fn reset_implied_flags(
-    provider_indices: &[usize],
-    snapshot: &QuotaSnapshot,
-    now: chrono::DateTime<Utc>,
-) -> Vec<bool> {
-    provider_indices
-        .iter()
-        .map(|provider_index| {
-            reset_implied(
-                snapshot.quotas[*provider_index].as_ref(),
-                &snapshot.windows[*provider_index],
-                now,
-            )
-        })
-        .collect()
-}
-
-fn provider_is_route_eligible(
-    provider_index: usize,
-    snapshot: &QuotaSnapshot,
-    reset_implied: &[bool],
-    now: chrono::DateTime<Utc>,
-) -> bool {
-    !provider_is_quota_exhausted(
-        snapshot.quotas[provider_index].as_ref(),
-        &snapshot.windows[provider_index],
-        now,
-    ) || reset_implied[provider_index]
 }
 
 fn all_providers_quota_exhausted_error(model: &ModelConfig) -> RoutingError {
@@ -471,1385 +213,14 @@ fn candidates_have_windows(snapshot: &QuotaSnapshot, candidates: &[usize]) -> bo
         .all(|provider_index| !snapshot.windows[*provider_index].is_empty())
 }
 
-fn score_by_density(
-    model: &ModelConfig,
-    state: &StateDb,
-    quotas: &[Option<QuotaRecord>],
-    windows: &[Vec<QuotaWindow>],
-    candidates: &[usize],
-) -> usize {
-    let projections =
-        compute_projections_from_records(model, state, quotas, windows, candidates, Utc::now());
-    let evals = provider_evals_from_projections(projections.as_slice());
-    let eligible = density_eligible_evals(evals.as_slice());
-
-    if eligible.is_empty() {
-        return round_robin_fallback(model, state, candidates);
-    }
-
-    select_binding_score_with_fanout(model, &eligible)
-}
-
-fn provider_evals_from_projections(projections: &[ProviderProjection]) -> Vec<ProviderEval> {
-    projections
-        .iter()
-        .map(provider_eval_from_projection)
-        .collect()
-}
-
-fn provider_eval_from_projection(projection: &ProviderProjection) -> ProviderEval {
-    ProviderEval {
-        index: projection.provider_index,
-        binding_score: projection.binding_score,
-        unlearned: projection.binding_score.is_none()
-            && projection.recent_error_count < ERROR_THRESHOLD as u32,
-        fanout_usage: Some(fanout_usage_key(projection)),
-    }
-}
-
-fn density_eligible_evals(evals: &[ProviderEval]) -> Vec<ProviderEval> {
-    evals
-        .iter()
-        .filter(|eval| !eval.unlearned && eval.binding_score.is_some())
-        .cloned()
-        .collect()
-}
-
-pub fn compute_projections(
-    model: &ModelConfig,
-    state: &StateDb,
-    ctx: Option<&BalanceContext<'_>>,
-) -> Vec<ProviderProjection> {
-    refresh_projection_inputs(model, state, ctx);
-    let snapshot = load_quota_snapshot(model, state);
-    let candidates = all_provider_indices(model);
-    compute_projections_from_records(
-        model,
-        state,
-        &snapshot.quotas,
-        &snapshot.windows,
-        &candidates,
-        Utc::now(),
-    )
-}
-
-fn refresh_projection_inputs(
-    model: &ModelConfig,
-    state: &StateDb,
-    ctx: Option<&BalanceContext<'_>>,
-) {
-    if let Some(ctx) = ctx {
-        for provider in &model.providers {
-            refresh_provider_for_stale_projection(provider, state, ctx);
-            scan_provider_for_projection(provider, state, ctx);
-        }
-    }
-}
-
-fn refresh_provider_for_stale_projection(
-    provider: &ProviderConfig,
-    state: &StateDb,
-    ctx: &BalanceContext<'_>,
-) {
-    if is_stale(state, &provider.name) {
-        let _: RefreshOutcome =
-            refresh_provider(&provider.name, ctx.providers_cfg, ctx.in_flight, state);
-    }
-}
-
-fn scan_provider_for_projection(
-    provider: &ProviderConfig,
-    state: &StateDb,
-    ctx: &BalanceContext<'_>,
-) {
-    let _ = scan_provider(&provider.name, ctx.sessions_cfg, state);
-}
-
-fn provider_is_quota_exhausted(
-    quota: Option<&QuotaRecord>,
-    windows: &[QuotaWindow],
-    now: chrono::DateTime<Utc>,
-) -> bool {
-    quota
-        .and_then(|quota| quota.exhausted_at.as_ref())
-        .is_some()
-        || quota
-            .and_then(|quota| quota.next_available_at)
-            .is_some_and(|ts| marker_blocks_routing(ts, now))
-        || windows
-            .iter()
-            .any(|window| window.resets_at > now && window.used_percent >= EXHAUSTED_USED_PERCENT)
-}
-
-/// Honour `next_available_at` only while it's more than the release-slack
-/// window in the future. Markers inside the slack window are treated as
-/// expired so the next dispatch can probe the provider rather than wait
-/// for the exact release timestamp (clock skew + cooldown bookkeeping).
-/// Reads `OULIPOLY_MARKER_RELEASE_SLACK_SECS` via the shared helper so
-/// cached-only routing (`ctx=None`) matches the verify path's slack.
-fn marker_blocks_routing(next_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
-    next_at
-        > now + chrono::Duration::seconds(crate::quota::marker_verification::release_slack_secs())
-}
-
-fn reset_implied(
-    quota: Option<&QuotaRecord>,
-    windows: &[QuotaWindow],
-    now: chrono::DateTime<Utc>,
-) -> bool {
-    quota
-        .and_then(|quota| quota.exhausted_at.as_ref())
-        .is_some()
-        && !windows.is_empty()
-        && windows.iter().all(|window| window.resets_at <= now)
-}
-
-fn clear_reset_implied_flags(state: &StateDb, model: &ModelConfig, reset_implied: &[bool]) {
-    for provider in reset_implied_providers(model, reset_implied) {
-        clear_reset_implied_provider(state, provider);
-    }
-}
-
-fn reset_implied_providers<'a>(
-    model: &'a ModelConfig,
-    reset_implied: &'a [bool],
-) -> impl Iterator<Item = &'a ProviderConfig> {
-    model
-        .providers
-        .iter()
-        .zip(reset_implied.iter())
-        .filter_map(|(provider, is_reset_implied)| is_reset_implied.then_some(provider))
-}
-
-fn clear_reset_implied_provider(state: &StateDb, provider: &ProviderConfig) {
-    if let Err(error) = state.clear_exhausted(&provider.name) {
-        warn_reset_implied_clear_failed(provider, error.as_str());
-    }
-}
-
-fn warn_reset_implied_clear_failed(provider: &ProviderConfig, error: &str) {
-    tracing::warn!(
-        provider_name = provider.name.as_str(),
-        error = error,
-        "failed to clear reset-implied quota exhaustion flag"
-    );
-}
-
-fn compute_projections_from_records(
-    model: &ModelConfig,
-    state: &StateDb,
-    quotas: &[Option<QuotaRecord>],
-    windows: &[Vec<QuotaWindow>],
-    candidates: &[usize],
-    now: chrono::DateTime<Utc>,
-) -> Vec<ProviderProjection> {
-    let pool_max_live_windows = pool_max_live_window_count(windows, candidates, now);
-    candidates
-        .iter()
-        .copied()
-        .map(|provider_index| {
-            provider_projection_from_records(
-                model,
-                state,
-                quotas,
-                windows,
-                provider_index,
-                pool_max_live_windows,
-                now,
-            )
-        })
-        .collect()
-}
-
-struct ProjectionAssembly {
-    binding_score: f64,
-    unlearned: bool,
-    scored_window: bool,
-    projections: Vec<WindowProjection>,
-}
-
-impl ProjectionAssembly {
-    fn new() -> Self {
-        Self {
-            binding_score: f64::INFINITY,
-            unlearned: false,
-            scored_window: false,
-            projections: Vec::new(),
-        }
-    }
-}
-
-fn pool_max_live_window_count(
-    windows: &[Vec<QuotaWindow>],
-    candidates: &[usize],
-    now: chrono::DateTime<Utc>,
-) -> usize {
-    candidates
-        .iter()
-        .map(|&provider_index| live_window_count(&windows[provider_index], now))
-        .max()
-        .unwrap_or(0)
-}
-
-fn live_window_count(windows: &[QuotaWindow], now: chrono::DateTime<Utc>) -> usize {
-    windows
-        .iter()
-        .filter(|window| window_is_live(window, now))
-        .count()
-}
-
-fn window_is_live(window: &QuotaWindow, now: chrono::DateTime<Utc>) -> bool {
-    window.resets_at > now
-}
-
-fn provider_projection_from_records(
-    model: &ModelConfig,
-    state: &StateDb,
-    quotas: &[Option<QuotaRecord>],
-    windows: &[Vec<QuotaWindow>],
-    provider_index: usize,
-    pool_max_live_windows: usize,
-    now: chrono::DateTime<Utc>,
-) -> ProviderProjection {
-    let recent_errors = projection_recent_error_count(model, state, provider_index);
-    if projection_is_recent_error_suppressed(recent_errors) {
-        return suppressed_provider_projection(provider_index, recent_errors);
-    }
-
-    let turns = assistant_turns_since_refresh(model, state, quotas, provider_index);
-    let assembly = projection_assembly_for_provider(
-        provider_index,
-        turns,
-        quotas,
-        windows,
-        pool_max_live_windows,
-        now,
-    );
-    assemble_provider_projection(provider_index, recent_errors, assembly)
-}
-
-fn projection_recent_error_count(
-    model: &ModelConfig,
-    state: &StateDb,
-    provider_index: usize,
-) -> i64 {
-    state
-        .recent_error_count(
-            &model.name,
-            &model.providers[provider_index].name,
-            ERROR_WINDOW_MINUTES,
-        )
-        .unwrap_or(0)
-}
-
-fn projection_is_recent_error_suppressed(recent_errors: i64) -> bool {
-    recent_errors >= ERROR_THRESHOLD as i64
-}
-
-fn suppressed_provider_projection(provider_index: usize, recent_errors: i64) -> ProviderProjection {
-    ProviderProjection {
-        provider_index,
-        projections_per_window: Vec::new(),
-        binding_score: None,
-        recent_error_count: recent_errors as u32,
-    }
-}
-
-fn assistant_turns_since_refresh(
-    model: &ModelConfig,
-    state: &StateDb,
-    quotas: &[Option<QuotaRecord>],
-    provider_index: usize,
-) -> u64 {
-    quotas[provider_index]
-        .as_ref()
-        .and_then(|quota| {
-            state
-                .count_assistant_turns_since(
-                    &model.providers[provider_index].name,
-                    quota.refreshed_at.as_ref(),
-                )
-                .ok()
-        })
-        .unwrap_or(0)
-}
-
-fn projection_assembly_for_provider(
-    provider_index: usize,
-    turns: u64,
-    quotas: &[Option<QuotaRecord>],
-    windows: &[Vec<QuotaWindow>],
-    pool_max_live_windows: usize,
-    now: chrono::DateTime<Utc>,
-) -> ProjectionAssembly {
-    let mut assembly = ProjectionAssembly::new();
-    apply_hidden_window_penalty(
-        &mut assembly,
-        &windows[provider_index],
-        pool_max_live_windows,
-        now,
-    );
-
-    for window in live_windows(&windows[provider_index], now) {
-        apply_window_projection(
-            &mut assembly,
-            provider_index,
-            window,
-            turns,
-            quotas,
-            windows,
-            now,
-        );
-    }
-
-    assembly
-}
-
-fn apply_hidden_window_penalty(
-    assembly: &mut ProjectionAssembly,
-    windows: &[QuotaWindow],
-    pool_max_live_windows: usize,
-    now: chrono::DateTime<Utc>,
-) {
-    if hidden_window_penalty_applies(windows, pool_max_live_windows, now) {
-        assembly.binding_score = assembly.binding_score.min(0.0);
-        assembly.scored_window = true;
-    }
-}
-
-fn hidden_window_penalty_applies(
-    windows: &[QuotaWindow],
-    pool_max_live_windows: usize,
-    now: chrono::DateTime<Utc>,
-) -> bool {
-    live_window_count(windows, now) < pool_max_live_windows
-        && any_live_window_near_cap(windows, now)
-}
-
-fn any_live_window_near_cap(windows: &[QuotaWindow], now: chrono::DateTime<Utc>) -> bool {
-    windows.iter().any(|window| {
-        window_is_live(window, now) && window.used_percent >= HIDDEN_WINDOW_PENALTY_THRESHOLD
-    })
-}
-
-fn live_windows(
-    windows: &[QuotaWindow],
-    now: chrono::DateTime<Utc>,
-) -> impl Iterator<Item = &QuotaWindow> {
-    windows
-        .iter()
-        .filter(move |window| window_is_live(window, now))
-}
-
-fn apply_window_projection(
-    assembly: &mut ProjectionAssembly,
-    provider_index: usize,
-    window: &QuotaWindow,
-    turns: u64,
-    quotas: &[Option<QuotaRecord>],
-    windows: &[Vec<QuotaWindow>],
-    now: chrono::DateTime<Utc>,
-) {
-    let Some(projected_window) =
-        projected_live_window(provider_index, window, turns, quotas, windows, now)
-    else {
-        assembly.unlearned = true;
-        return;
-    };
-    assembly.binding_score = assembly
-        .binding_score
-        .min(window_binding_score(&projected_window));
-    assembly.scored_window = true;
-    assembly.projections.push(projected_window);
-}
-
-fn projected_live_window(
-    provider_index: usize,
-    window: &QuotaWindow,
-    turns: u64,
-    quotas: &[Option<QuotaRecord>],
-    windows: &[Vec<QuotaWindow>],
-    now: chrono::DateTime<Utc>,
-) -> Option<WindowProjection> {
-    let burn_rate = bootstrap_burn_rate(provider_index, window, quotas, windows)?;
-    let projected = project_used_percent(window.used_percent, turns, burn_rate);
-    let hours = window_hours_until_reset(window, now);
-    let remaining_headroom = remaining_headroom(projected);
-    Some(WindowProjection {
-        window_id: window.window_id as i64,
-        projected_used: projected,
-        hours_until_reset: hours,
-        remaining_headroom,
-    })
-}
-
-fn window_hours_until_reset(window: &QuotaWindow, now: chrono::DateTime<Utc>) -> f64 {
-    ((window.resets_at - now).num_seconds() as f64 / 3600.0).max(EPS_HOURS)
-}
-
-fn remaining_headroom(projected_used: f64) -> f64 {
-    (1.0 - projected_used).max(0.0)
-}
-
-fn window_binding_score(window: &WindowProjection) -> f64 {
-    window.remaining_headroom * window.hours_until_reset
-}
-
-fn assemble_provider_projection(
-    provider_index: usize,
-    recent_errors: i64,
-    assembly: ProjectionAssembly,
-) -> ProviderProjection {
-    let binding_score = projection_binding_score(&assembly);
-    ProviderProjection {
-        provider_index,
-        projections_per_window: assembly.projections,
-        binding_score,
-        recent_error_count: recent_errors as u32,
-    }
-}
-
-fn projection_binding_score(assembly: &ProjectionAssembly) -> Option<f64> {
-    (!assembly.unlearned && assembly.scored_window).then_some(assembly.binding_score)
-}
-
-pub fn decide_migration(
-    state: &StateDb,
-    model: &ModelConfig,
-    resolved: &ResolvedResume,
-    manual_target: Option<&str>,
-) -> Result<MigrationDecision, MigrationError> {
-    // AGE-163 WU-A.5: the seam's manual-rotate path now consults
-    // `decide_manual_migration` directly (see
-    // `services::migration::migrate`); when this function is invoked with
-    // `manual_target.is_some()`, it falls back to the legacy
-    // `manual_migration_decision` so non-seam callers (e.g. existing tests)
-    // retain pre-WU-A.5 behavior. The seam path is the one that surfaces
-    // typed `ManualMigrationRejection` to the operator.
-    if !model_has_migration_alternative(model) {
-        return Ok(MigrationDecision::Stay);
-    }
-
-    let Some(active_provider_index) = active_provider_index(model, resolved) else {
-        return Ok(MigrationDecision::Stay);
-    };
-    let active = &model.providers[active_provider_index];
-
-    if let Some(decision) = manual_migration_decision(model, active, manual_target) {
-        return Ok(decision);
-    }
-
-    if !active_provider_supports_resume_migration(active) {
-        return Ok(MigrationDecision::Stay);
-    }
-
-    let active_exhausted = active_provider_is_exhausted(state, active)?;
-    let projections = compute_projections(model, state, None);
-
-    if active_exhausted {
-        return Ok(exhausted_migration_decision(
-            model,
-            &projections,
-            active,
-            active_provider_index,
-        ));
-    }
-
-    Ok(quota_threshold_migration_decision(
-        model,
-        &projections,
-        active,
-        active_provider_index,
-    ))
-}
-
-/// AGE-163 WU-A.5 typed manual-rotate decision. Translates the three
-/// pre-existing silent-`Stay` fall-throughs into named rejection variants
-/// the caller can render to the operator instead of silently dispatching
-/// the original bound provider.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ManualMigrationRejection {
-    SingleProviderPool { provider: String },
-    ActiveProviderNotInPool { active: String },
-    TargetNotInPool { target: String, pool: Vec<String> },
-    NotMigratablePair { source: String, target: String },
-}
-
-pub fn decide_manual_migration(
-    model: &ModelConfig,
-    resolved: &ResolvedResume,
-    manual_target: &str,
-) -> Result<MigrationDecision, ManualMigrationRejection> {
-    if !model_has_migration_alternative(model) {
-        let provider = model
-            .providers
-            .first()
-            .map(|p| p.name.clone())
-            .unwrap_or_else(|| resolved.active_provider.clone());
-        return Err(ManualMigrationRejection::SingleProviderPool { provider });
-    }
-    let Some(active_index) = active_provider_index(model, resolved) else {
-        return Err(ManualMigrationRejection::ActiveProviderNotInPool {
-            active: resolved.active_provider.clone(),
-        });
-    };
-    let active = &model.providers[active_index];
-    let Some(target_index) = model
-        .providers
-        .iter()
-        .position(|provider| provider.name == manual_target)
-    else {
-        return Err(ManualMigrationRejection::TargetNotInPool {
-            target: manual_target.to_string(),
-            pool: model.providers.iter().map(|p| p.name.clone()).collect(),
-        });
-    };
-    if !is_resume_migratable_pair(active, &model.providers[target_index]) {
-        return Err(ManualMigrationRejection::NotMigratablePair {
-            source: active.name.clone(),
-            target: manual_target.to_string(),
-        });
-    }
-    Ok(MigrationDecision::Migrate {
-        target_provider_index: target_index,
-        reason: TransitionReason::Manual,
-    })
-}
-
-fn model_has_migration_alternative(model: &ModelConfig) -> bool {
-    model.providers.len() > 1
-}
-
-fn active_provider_index(model: &ModelConfig, resolved: &ResolvedResume) -> Option<usize> {
-    model
-        .providers
-        .iter()
-        .position(|provider| provider.name == resolved.active_provider)
-}
-
-fn manual_migration_decision(
-    model: &ModelConfig,
-    active: &ProviderConfig,
-    manual_target: Option<&str>,
-) -> Option<MigrationDecision> {
-    manual_target.map(|target| {
-        manual_target_provider_index(model, active, target)
-            .map(manual_migration_to)
-            .unwrap_or(MigrationDecision::Stay)
-    })
-}
-
-fn manual_target_provider_index(
-    model: &ModelConfig,
-    active: &ProviderConfig,
-    target: &str,
-) -> Option<usize> {
-    model
-        .providers
-        .iter()
-        .position(|provider| provider.name == target)
-        .filter(|target_provider_index| {
-            is_resume_migratable_pair(active, &model.providers[*target_provider_index])
-        })
-}
-
-fn manual_migration_to(target_provider_index: usize) -> MigrationDecision {
-    MigrationDecision::Migrate {
-        target_provider_index,
-        reason: TransitionReason::Manual,
-    }
-}
-
-fn active_provider_supports_resume_migration(active: &ProviderConfig) -> bool {
-    is_resume_migratable_pair(active, active)
-}
-
-fn active_provider_is_exhausted(
-    state: &StateDb,
-    active: &ProviderConfig,
-) -> Result<bool, MigrationError> {
-    let quota = active_provider_quota(state, active)?;
-    Ok(quota_is_exhausted(quota.as_ref()))
-}
-
-fn active_provider_quota(
-    state: &StateDb,
-    active: &ProviderConfig,
-) -> Result<Option<QuotaRecord>, MigrationError> {
-    state
-        .get_quota(&active.name)
-        .map_err(|message| MigrationError::Db { message })
-}
-
-fn quota_is_exhausted(quota: Option<&QuotaRecord>) -> bool {
-    // AGE-163 WU-A.4: the typed forensics writer lands durable
-    // unavailability on `next_available_at` (and the failure class). The
-    // legacy `exhausted_at` column is preserved for back-compat read sites
-    // and for the legacy reset-implied clear path. A provider is treated
-    // as currently exhausted if either signal is active for the current
-    // wall-clock — this aligns `quota_is_exhausted` with
-    // `working_set_member` so the existing migration-decision path
-    // honors the new typed state.
-    let Some(quota) = quota else {
-        return false;
-    };
-    quota.exhausted_at.is_some() || quota.next_available_at.is_some_and(|ts| ts > Utc::now())
-}
-
-fn exhausted_migration_decision(
-    model: &ModelConfig,
-    projections: &[ProviderProjection],
-    active: &ProviderConfig,
-    active_provider_index: usize,
-) -> MigrationDecision {
-    lowest_load_migration_target(model, projections, active, Some(active_provider_index))
-        .map(|target| migration_to(target.provider_index, TransitionReason::Exhausted))
-        .unwrap_or(MigrationDecision::Stay)
-}
-
-fn quota_threshold_migration_decision(
-    model: &ModelConfig,
-    projections: &[ProviderProjection],
-    active: &ProviderConfig,
-    active_provider_index: usize,
-) -> MigrationDecision {
-    let Some(best) = lowest_load_migration_target(model, projections, active, None) else {
-        return MigrationDecision::Stay;
-    };
-    if best.provider_index == active_provider_index {
-        return MigrationDecision::Stay;
-    }
-    // AGE-163 WU-A.2: only rotate when the best sibling's projected load is
-    // strictly lower than the active provider's. The prior tie-break (lowest
-    // provider_index) forced a migration when both candidates were unlearned
-    // (load=0), which the new seam now surfaces as a working-set-exhaustion
-    // RotationFailed if the chosen sibling's source JSONL is missing. The
-    // design contract's "no rotation without reason" intent is preserved by
-    // requiring strict-better evidence.
-    let active_load = projections
-        .iter()
-        .find(|projection| projection.provider_index == active_provider_index)
-        .map(provider_load);
-    if let Some(active_load) = active_load
-        && provider_load(best) >= active_load
-    {
-        return MigrationDecision::Stay;
-    }
-
-    migration_to(best.provider_index, TransitionReason::QuotaThreshold)
-}
-
-fn migration_to(target_provider_index: usize, reason: TransitionReason) -> MigrationDecision {
-    MigrationDecision::Migrate {
-        target_provider_index,
-        reason,
-    }
-}
-
-fn is_resume_migratable_pair(source: &ProviderConfig, target: &ProviderConfig) -> bool {
-    provider_has_derivable_claude_projects_dir(source)
-        && provider_has_derivable_claude_projects_dir(target)
-}
-
-/// AGE-163 WU-A.1 working-set membership predicate. A provider is in the
-/// working set iff its `next_available_at` is null or has elapsed: the
-/// post-failure forensics writer sets this column to push a provider out of
-/// rotation for a typed cooldown window.
-pub fn working_set_member(quota: Option<&QuotaRecord>, now: DateTime<Utc>) -> bool {
-    quota
-        .and_then(|q| q.next_available_at)
-        .is_none_or(|ts| ts <= now)
-}
-
-/// AGE-163 WU-A.3 round-robin candidate selection. Walks the model's
-/// provider pool starting after the persisted round-robin cursor, filters
-/// through `working_set_member`, and returns the first eligible index.
-/// `exclude_provider_index` skips a candidate (e.g. the one that just
-/// failed). On success, advances the persisted cursor. Returns `Ok(None)`
-/// when the working set is exhausted.
-pub fn select_next_working_candidate(
-    state: &StateDb,
-    model: &ModelConfig,
-    now: DateTime<Utc>,
-    exclude_provider_index: Option<usize>,
-) -> Result<Option<usize>, MigrationError> {
-    let pool_len = model.providers.len();
-    if pool_len == 0 {
-        return Ok(None);
-    }
-    let cursor = state
-        .next_round_robin_index_for_model(&model.name)
-        .map_err(|message| MigrationError::Db { message })?
-        .unwrap_or(usize::MAX);
-    let start = if cursor == usize::MAX {
-        0
-    } else {
-        (cursor + 1) % pool_len
-    };
-    for offset in 0..pool_len {
-        let candidate_index = (start + offset) % pool_len;
-        if Some(candidate_index) == exclude_provider_index {
-            continue;
-        }
-        let provider = &model.providers[candidate_index];
-        let quota = state
-            .get_quota(&provider.name)
-            .map_err(|message| MigrationError::Db { message })?;
-        if working_set_member(quota.as_ref(), now) {
-            state
-                .advance_round_robin_index(&model.name, candidate_index, now)
-                .map_err(|message| MigrationError::Db { message })?;
-            return Ok(Some(candidate_index));
-        }
-    }
-    Ok(None)
-}
-
-fn provider_load(projection: &ProviderProjection) -> f64 {
-    let max_projected_used = projection
-        .projections_per_window
-        .iter()
-        .map(|window| window.projected_used)
-        .fold(f64::NEG_INFINITY, f64::max);
-    if max_projected_used.is_finite() {
-        max_projected_used
-    } else {
-        0.0
-    }
-}
-
-fn lowest_load_migration_target<'a>(
-    model: &ModelConfig,
-    projections: &'a [ProviderProjection],
-    source_provider: &ProviderConfig,
-    exclude_provider_index: Option<usize>,
-) -> Option<&'a ProviderProjection> {
-    projections
-        .iter()
-        .filter(|projection| {
-            migration_projection_is_eligible(
-                model,
-                source_provider,
-                exclude_provider_index,
-                projection,
-            )
-        })
-        .min_by(|a, b| migration_load_order(a, b))
-}
-
-fn migration_projection_is_eligible(
-    model: &ModelConfig,
-    source_provider: &ProviderConfig,
-    exclude_provider_index: Option<usize>,
-    projection: &ProviderProjection,
-) -> bool {
-    Some(projection.provider_index) != exclude_provider_index
-        && model
-            .providers
-            .get(projection.provider_index)
-            .is_some_and(|candidate| is_resume_migratable_pair(source_provider, candidate))
-}
-
-fn migration_load_order(a: &ProviderProjection, b: &ProviderProjection) -> std::cmp::Ordering {
-    provider_load(a)
-        .partial_cmp(&provider_load(b))
-        .unwrap_or(std::cmp::Ordering::Equal)
-        .then_with(|| a.provider_index.cmp(&b.provider_index))
-}
-
-fn best_binding_score<'a>(evals: &[&'a ProviderEval]) -> &'a ProviderEval {
-    assert_binding_score_candidates(evals);
-    max_binding_score_eval(evals)
-}
-
-fn assert_binding_score_candidates(evals: &[&ProviderEval]) {
-    debug_assert!(!evals.is_empty(), "best_binding_score: empty slice");
-    debug_assert!(
-        evals.iter().all(|e| e.binding_score.is_some()),
-        "best_binding_score: caller must filter to providers with a learned binding_score"
-    );
-}
-
-fn max_binding_score_eval<'a>(evals: &[&'a ProviderEval]) -> &'a ProviderEval {
-    evals
-        .iter()
-        .copied()
-        .max_by(|a, b| {
-            a.binding_score
-                .unwrap()
-                .partial_cmp(&b.binding_score.unwrap())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .unwrap()
-}
-
-fn approx_eq_usage(a: f64, b: f64) -> bool {
-    (a - b).abs() <= f64::EPSILON * a.abs().max(b.abs()).max(1.0)
-}
-
-fn fanout_usage_key(projection: &ProviderProjection) -> FanoutUsageKey {
-    fanout_usage_key_from_parts(
-        worst_projected_usage(projection),
-        soonest_relevant_reset_hours(projection),
-    )
-}
-
-fn fanout_usage_key_from_parts(
-    worst_projected_used: Option<f64>,
-    soonest_reset_hours: Option<f64>,
-) -> FanoutUsageKey {
-    FanoutUsageKey {
-        worst_projected_used,
-        soonest_reset_hours,
-    }
-}
-
-fn worst_projected_usage(projection: &ProviderProjection) -> Option<f64> {
-    projection
-        .projections_per_window
-        .iter()
-        .map(|window| window.projected_used)
-        .filter(|projected_used| projected_used.is_finite())
-        .reduce(f64::max)
-}
-
-fn soonest_relevant_reset_hours(projection: &ProviderProjection) -> Option<f64> {
-    if let Some(worst) = worst_projected_usage(projection) {
-        return soonest_reset_hours_for_worst_usage(projection, worst);
-    }
-    soonest_finite_reset_hours(projection)
-}
-
-fn soonest_reset_hours_for_worst_usage(
-    projection: &ProviderProjection,
-    worst_projected_used: f64,
-) -> Option<f64> {
-    projection
-        .projections_per_window
-        .iter()
-        .filter(|window| reset_belongs_to_worst_usage(window, worst_projected_used))
-        .map(|window| window.hours_until_reset)
-        .reduce(f64::min)
-}
-
-fn reset_belongs_to_worst_usage(window: &WindowProjection, worst_projected_used: f64) -> bool {
-    window.projected_used.is_finite()
-        && approx_eq_usage(window.projected_used, worst_projected_used)
-        && window.hours_until_reset.is_finite()
-}
-
-fn soonest_finite_reset_hours(projection: &ProviderProjection) -> Option<f64> {
-    projection
-        .projections_per_window
-        .iter()
-        .map(|window| window.hours_until_reset)
-        .filter(|hours| hours.is_finite())
-        .reduce(f64::min)
-}
-
-fn finite_fanout_usage(eval: &ProviderEval) -> Option<f64> {
-    eval.fanout_usage
-        .and_then(|usage| usage.worst_projected_used)
-        .filter(|value| value.is_finite())
-}
-
-fn finite_fanout_reset(eval: &ProviderEval) -> Option<f64> {
-    eval.fanout_usage
-        .and_then(|usage| usage.soonest_reset_hours)
-        .filter(|value| value.is_finite())
-}
-
-fn fanout_candidate_order(a: &ProviderEval, b: &ProviderEval) -> std::cmp::Ordering {
-    fanout_usage_order(a, b)
-        .or_else(|| fanout_score_order(a, b))
-        .unwrap_or_else(|| fanout_reset_or_index_order(a, b))
-}
-
-fn fanout_usage_order(a: &ProviderEval, b: &ProviderEval) -> Option<std::cmp::Ordering> {
-    let (Some(a_usage), Some(b_usage)) = (finite_fanout_usage(a), finite_fanout_usage(b)) else {
-        return None;
-    };
-    (!approx_eq_usage(a_usage, b_usage)).then(|| {
-        a_usage
-            .partial_cmp(&b_usage)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    })
-}
-
-fn fanout_score_order(a: &ProviderEval, b: &ProviderEval) -> Option<std::cmp::Ordering> {
-    let (Some(a_score), Some(b_score)) = (a.binding_score, b.binding_score) else {
-        return None;
-    };
-    (finite_distinct_fanout_scores(a_score, b_score)).then(|| {
-        b_score
-            .partial_cmp(&a_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    })
-}
-
-fn finite_distinct_fanout_scores(a_score: f64, b_score: f64) -> bool {
-    a_score.is_finite() && b_score.is_finite() && !approx_eq_usage(a_score, b_score)
-}
-
-fn fanout_reset_or_index_order(a: &ProviderEval, b: &ProviderEval) -> std::cmp::Ordering {
-    match (finite_fanout_reset(a), finite_fanout_reset(b)) {
-        (Some(a_reset), Some(b_reset)) if distinct_reset_hours(a_reset, b_reset) => a_reset
-            .partial_cmp(&b_reset)
-            .unwrap_or(std::cmp::Ordering::Equal),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        _ => a.index.cmp(&b.index),
-    }
-}
-
-fn distinct_reset_hours(a_reset: f64, b_reset: f64) -> bool {
-    (a_reset - b_reset).abs() > EPS_HOURS
-}
-
-fn select_binding_score_with_fanout(model: &ModelConfig, eligible: &[ProviderEval]) -> usize {
-    let eligible_refs: Vec<&ProviderEval> = eligible.iter().collect();
-    let argmax = best_binding_score(&eligible_refs);
-
-    if fanout_should_use_argmax(eligible) {
-        return argmax.index;
-    }
-
-    let best = best_positive_binding_score(eligible);
-    if !binding_score_can_fanout(best) {
-        return argmax.index;
-    }
-
-    let mut band = fanout_score_band(eligible, best);
-    if band.len() < 2 {
-        return argmax.index;
-    }
-    band.sort_by_key(|eval| eval.index);
-
-    let selected = selected_fanout_candidate(&band);
-
-    if selected.index != argmax.index {
-        trace_fanout_selection(model, &band, selected);
-    }
-
-    selected.index
-}
-
-fn fanout_should_use_argmax(eligible: &[ProviderEval]) -> bool {
-    eligible.len() < 2 || eligible.iter().any(nonfinite_binding_score)
-}
-
-fn nonfinite_binding_score(eval: &ProviderEval) -> bool {
-    !eval.binding_score.unwrap().is_finite()
-}
-
-fn best_positive_binding_score(eligible: &[ProviderEval]) -> f64 {
-    eligible
-        .iter()
-        .filter_map(|eval| eval.binding_score.filter(|score| *score > 0.0))
-        .fold(f64::NEG_INFINITY, f64::max)
-}
-
-fn binding_score_can_fanout(best: f64) -> bool {
-    best.is_finite() && best > 0.0
-}
-
-fn fanout_score_band(eligible: &[ProviderEval], best: f64) -> Vec<&ProviderEval> {
-    eligible
-        .iter()
-        .filter(|eval| eval.binding_score.unwrap() >= best / FANOUT_SCORE_BAND_RATIO)
-        .collect()
-}
-
-fn selected_fanout_candidate<'a>(band: &[&'a ProviderEval]) -> &'a ProviderEval {
-    band.iter()
-        .copied()
-        .min_by(|a, b| fanout_candidate_order(a, b))
-        .unwrap()
-}
-
-fn trace_fanout_selection(model: &ModelConfig, band: &[&ProviderEval], selected: &ProviderEval) {
-    let selected_provider_name = &model.providers[selected.index].name;
-    let band_member_names = fanout_band_member_names(model, band);
-    tracing::info!(
-        selected_provider_name = selected_provider_name.as_str(),
-        band_member_names = band_member_names.as_str(),
-        selected_binding_score = selected.binding_score.unwrap(),
-        "fanout selected"
-    );
-}
-
-fn fanout_band_member_names(model: &ModelConfig, band: &[&ProviderEval]) -> String {
-    band.iter()
-        .map(|eval| model.providers[eval.index].name.as_str())
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-fn project_used_percent(base_used_percent: f64, turns: u64, burn_rate: f64) -> f64 {
-    (base_used_percent + (turns as f64) * burn_rate).max(0.0)
-}
-
-fn learned_rate(window: &QuotaWindow) -> Option<f64> {
-    match (window.last_delta_percent, window.last_delta_calls) {
-        (Some(delta_percent), Some(delta_calls)) if delta_percent > 0.0 && delta_calls > 0 => {
-            Some(delta_percent / delta_calls as f64)
-        }
-        _ => None,
-    }
-}
-
-fn bootstrap_burn_rate(
-    provider_index: usize,
-    window: &QuotaWindow,
-    quotas: &[Option<QuotaRecord>],
-    windows: &[Vec<QuotaWindow>],
-) -> Option<f64> {
-    learned_rate(window)
-        .or_else(|| pool_window_avg_percent_per_call(window.window_id, windows))
-        .or_else(|| {
-            duration_ratio_fallback_percent_per_call(provider_index, window, quotas, windows)
-        })
-}
-
-fn pool_window_avg_percent_per_call(window_id: u32, windows: &[Vec<QuotaWindow>]) -> Option<f64> {
-    percent_per_call(pool_window_delta_totals(window_id, windows))
-}
-
-fn pool_window_delta_totals(window_id: u32, windows: &[Vec<QuotaWindow>]) -> (f64, u64) {
-    let mut total_percent = 0.0;
-    let mut total_calls: u64 = 0;
-    for window in windows.iter().flatten() {
-        if let Some((delta_percent, delta_calls)) = learned_window_delta(window_id, window) {
-            total_percent += delta_percent;
-            total_calls += delta_calls;
-        }
-    }
-    (total_percent, total_calls)
-}
-
-fn learned_window_delta(window_id: u32, window: &QuotaWindow) -> Option<(f64, u64)> {
-    if window.window_id != window_id {
-        return None;
-    }
-    valid_delta_pair(window.last_delta_percent, window.last_delta_calls)
-}
-
-fn valid_delta_pair(delta_percent: Option<f64>, delta_calls: Option<u64>) -> Option<(f64, u64)> {
-    match (delta_percent, delta_calls) {
-        (Some(delta_percent), Some(delta_calls)) if delta_percent > 0.0 && delta_calls > 0 => {
-            Some((delta_percent, delta_calls))
-        }
-        _ => None,
-    }
-}
-
-fn percent_per_call((total_percent, total_calls): (f64, u64)) -> Option<f64> {
-    (total_calls > 0).then_some(total_percent / total_calls as f64)
-}
-
-fn duration_ratio_fallback_percent_per_call(
-    provider_index: usize,
-    target_window: &QuotaWindow,
-    quotas: &[Option<QuotaRecord>],
-    windows: &[Vec<QuotaWindow>],
-) -> Option<f64> {
-    let target_refreshed_at = refreshed_at_for_provider(quotas, provider_index)?;
-    let target_hours = window_duration_hours(target_window, target_refreshed_at);
-    longest_learned_duration_candidate(quotas, windows, target_hours)
-        .map(|candidate| duration_ratio_candidate_rate(candidate, target_hours))
-}
-
-#[derive(Clone, Copy)]
-struct DurationRatioCandidate {
-    rate: f64,
-    hours: f64,
-}
-
-fn refreshed_at_for_provider(
-    quotas: &[Option<QuotaRecord>],
-    provider_index: usize,
-) -> Option<&chrono::DateTime<Utc>> {
-    quotas
-        .get(provider_index)
-        .and_then(|quota| quota.as_ref())
-        .and_then(|quota| quota.refreshed_at.as_ref())
-}
-
-fn window_duration_hours(window: &QuotaWindow, refreshed_at: &chrono::DateTime<Utc>) -> f64 {
-    ((window.resets_at - *refreshed_at).num_seconds() as f64 / 3600.0).max(EPS_HOURS)
-}
-
-fn longest_learned_duration_candidate(
-    quotas: &[Option<QuotaRecord>],
-    windows: &[Vec<QuotaWindow>],
-    target_hours: f64,
-) -> Option<DurationRatioCandidate> {
-    learned_duration_candidates(quotas, windows, target_hours)
-        .into_iter()
-        .fold(None, |best, candidate| {
-            if best.is_none_or(|best: DurationRatioCandidate| candidate.hours > best.hours) {
-                Some(candidate)
-            } else {
-                best
-            }
-        })
-}
-
-fn learned_duration_candidates(
-    quotas: &[Option<QuotaRecord>],
-    windows: &[Vec<QuotaWindow>],
-    target_hours: f64,
-) -> Vec<DurationRatioCandidate> {
-    windows
-        .iter()
-        .enumerate()
-        .flat_map(|(provider_index, provider_windows)| {
-            learned_duration_candidates_for_provider(
-                refreshed_at_for_provider(quotas, provider_index),
-                provider_windows,
-                target_hours,
-            )
-        })
-        .collect()
-}
-
-fn learned_duration_candidates_for_provider(
-    refreshed_at: Option<&chrono::DateTime<Utc>>,
-    provider_windows: &[QuotaWindow],
-    target_hours: f64,
-) -> Vec<DurationRatioCandidate> {
-    let Some(refreshed_at) = refreshed_at else {
-        return Vec::new();
-    };
-    provider_windows
-        .iter()
-        .filter_map(|window| learned_duration_candidate(window, refreshed_at, target_hours))
-        .collect()
-}
-
-fn learned_duration_candidate(
-    window: &QuotaWindow,
-    refreshed_at: &chrono::DateTime<Utc>,
-    target_hours: f64,
-) -> Option<DurationRatioCandidate> {
-    let rate = learned_rate(window)?;
-    let hours = window_duration_hours(window, refreshed_at);
-    duration_candidate_is_longer_than_target(hours, target_hours)
-        .then_some(DurationRatioCandidate { rate, hours })
-}
-
-fn duration_candidate_is_longer_than_target(candidate_hours: f64, target_hours: f64) -> bool {
-    candidate_hours > target_hours
-}
-
-fn duration_ratio_candidate_rate(candidate: DurationRatioCandidate, target_hours: f64) -> f64 {
-    duration_ratio_rate(candidate.rate, candidate.hours, target_hours)
-}
-
-fn duration_ratio_rate(long_rate: f64, long_hours: f64, target_hours: f64) -> f64 {
-    long_rate * (long_hours / target_hours.max(EPS_HOURS))
-}
-
-#[cfg(test)]
-pub(crate) fn project_used_percent_for_test(
-    base_used_percent: f64,
-    turns: u64,
-    burn_rate: f64,
-) -> f64 {
-    project_used_percent(base_used_percent, turns, burn_rate)
-}
-
-#[cfg(test)]
-pub(crate) fn bootstrap_burn_rate_for_test(
-    model: &ModelConfig,
-    state: &StateDb,
-    provider_index: usize,
-    window_id: u32,
-) -> Option<f64> {
-    let snapshot = quota_snapshot_for_test(model, state);
-    let target = test_target_window(&snapshot, provider_index, window_id)?;
-    bootstrap_burn_rate(provider_index, target, &snapshot.quotas, &snapshot.windows)
-}
-
-#[cfg(test)]
-fn quota_snapshot_for_test(model: &ModelConfig, state: &StateDb) -> QuotaSnapshot {
-    QuotaSnapshot {
-        quotas: test_cached_quotas(model, state),
-        windows: test_cached_windows(model, state),
-    }
-}
-
-#[cfg(test)]
-fn test_cached_quotas(model: &ModelConfig, state: &StateDb) -> Vec<Option<QuotaRecord>> {
-    model
-        .providers
-        .iter()
-        .map(|provider| state.get_quota(&provider.name).ok().flatten())
-        .collect()
-}
-
-#[cfg(test)]
-fn test_cached_windows(model: &ModelConfig, state: &StateDb) -> Vec<Vec<QuotaWindow>> {
-    model
-        .providers
-        .iter()
-        .map(|provider| state.get_windows(&provider.name).unwrap_or_default())
-        .collect()
-}
-
-#[cfg(test)]
-fn test_target_window(
-    snapshot: &QuotaSnapshot,
-    provider_index: usize,
-    window_id: u32,
-) -> Option<&QuotaWindow> {
-    snapshot
-        .windows
-        .get(provider_index)?
-        .iter()
-        .find(|window| window.window_id == window_id)
-}
-
-#[cfg(test)]
-pub(crate) fn bootstrap_duration_ratio_for_test(
-    long_rate: f64,
-    long_hours: f64,
-    target_hours: f64,
-) -> f64 {
-    duration_ratio_rate(long_rate, long_hours, target_hours)
-}
-
-fn score_by_invocation_count(model: &ModelConfig, state: &StateDb, candidates: &[usize]) -> usize {
-    let mut scores = invocation_count_scores(model, state, candidates);
-    sort_invocation_count_scores(scores.as_mut_slice());
-
-    if all_invocation_candidates_suppressed(scores.as_slice()) {
-        return round_robin_fallback(model, state, candidates);
-    }
-    selected_invocation_count_score(scores.as_slice())
-}
-
-fn invocation_count_scores(
-    model: &ModelConfig,
-    state: &StateDb,
-    candidates: &[usize],
-) -> Vec<(usize, f64)> {
-    candidates
-        .iter()
-        .map(|&provider_index| invocation_count_score(model, state, provider_index))
-        .collect()
-}
-
-fn invocation_count_score(
-    model: &ModelConfig,
-    state: &StateDb,
-    provider_index: usize,
-) -> (usize, f64) {
-    let recent_errors = fallback_recent_error_count(model, state, provider_index);
-    if fallback_provider_is_suppressed(recent_errors) {
-        return (provider_index, f64::MAX);
-    }
-
-    (
-        provider_index,
-        fallback_invocation_count(model, state, provider_index) as f64
-            + fallback_error_penalty(recent_errors),
-    )
-}
-
-fn fallback_recent_error_count(model: &ModelConfig, state: &StateDb, provider_index: usize) -> i64 {
-    state
-        .recent_error_count(
-            &model.name,
-            &model.providers[provider_index].name,
-            ERROR_WINDOW_MINUTES,
-        )
-        .unwrap_or(0)
-}
-
-fn fallback_provider_is_suppressed(recent_errors: i64) -> bool {
-    recent_errors >= ERROR_THRESHOLD as i64
-}
-
-fn fallback_invocation_count(model: &ModelConfig, state: &StateDb, provider_index: usize) -> i64 {
-    state
-        .get_provider(&model.name, &model.providers[provider_index].name)
-        .ok()
-        .flatten()
-        .map(|provider| provider.invocation_count)
-        .unwrap_or(0)
-}
-
-fn fallback_error_penalty(recent_errors: i64) -> f64 {
-    recent_errors as f64 * 10.0
-}
-
-fn sort_invocation_count_scores(scores: &mut [(usize, f64)]) {
-    scores.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-}
-
-fn all_invocation_candidates_suppressed(scores: &[(usize, f64)]) -> bool {
-    scores.iter().all(|(_, score)| *score == f64::MAX)
-}
-
-fn selected_invocation_count_score(scores: &[(usize, f64)]) -> usize {
-    scores[0].0
-}
-
-fn round_robin_fallback(model: &ModelConfig, state: &StateDb, candidates: &[usize]) -> usize {
-    assert_round_robin_candidates(candidates);
-    select_lowest_invocation_count(
-        round_robin_invocation_counts(model, state, candidates).as_slice(),
-    )
-}
-
-fn assert_round_robin_candidates(candidates: &[usize]) {
-    debug_assert!(
-        !candidates.is_empty(),
-        "round_robin_fallback: caller must pass a non-empty candidates slice"
-    );
-}
-
-fn round_robin_invocation_counts(
-    model: &ModelConfig,
-    state: &StateDb,
-    candidates: &[usize],
-) -> Vec<(usize, i64)> {
-    candidates
-        .iter()
-        .map(|&provider_index| {
-            (
-                provider_index,
-                fallback_invocation_count(model, state, provider_index),
-            )
-        })
-        .collect()
-}
-
-fn select_lowest_invocation_count(counts: &[(usize, i64)]) -> usize {
-    let mut min_count = i64::MAX;
-    let mut best = counts
-        .first()
-        .map(|(provider_index, _)| *provider_index)
-        .unwrap_or(0);
-
-    for &(provider_index, count) in counts {
-        if count < min_count {
-            min_count = count;
-            best = provider_index;
-        }
-    }
-
-    best
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::quota::InFlight;
     use chrono::{Duration, SecondsFormat, Utc};
     use oulipoly_config::{
-        ProviderConfig, ProviderEntry, ProvidersConfig, SessionSourceEntry, SessionStorage,
-        SessionsConfig, model::PromptMode,
+        ProviderConfig, ProviderEntry, ProvidersConfig, SessionSourceEntry, SessionsConfig,
+        model::PromptMode,
     };
     use rusqlite::Connection;
     use std::path::{Path, PathBuf};
@@ -1866,184 +237,6 @@ mod tests {
         let id = db.start_invocation(&start).unwrap();
         db.finalize_invocation(id, success, if success { 0 } else { 1 }, None, None)
             .unwrap();
-    }
-
-    fn quota_record_with_next_available_at(
-        next_available_at: Option<DateTime<Utc>>,
-    ) -> QuotaRecord {
-        QuotaRecord {
-            provider_name: "p".to_string(),
-            calls_since_refresh: 0,
-            refreshed_at: None,
-            exhausted_at: None,
-            topology_peak_live_window_count: 0,
-            last_topology_probe_at: None,
-            next_available_at,
-            last_refresh_at: None,
-            failure_class: None,
-        }
-    }
-
-    #[test]
-    fn working_set_member_true_when_next_available_at_null() {
-        let now = Utc::now();
-        let q = quota_record_with_next_available_at(None);
-        assert!(working_set_member(Some(&q), now));
-        assert!(working_set_member(None, now));
-    }
-
-    #[test]
-    fn working_set_member_true_when_next_available_at_past() {
-        let now = Utc::now();
-        let q = quota_record_with_next_available_at(Some(now - Duration::hours(1)));
-        assert!(working_set_member(Some(&q), now));
-    }
-
-    #[test]
-    fn working_set_member_false_when_next_available_at_future() {
-        let now = Utc::now();
-        let q = quota_record_with_next_available_at(Some(now + Duration::hours(1)));
-        assert!(!working_set_member(Some(&q), now));
-    }
-
-    #[test]
-    fn decide_manual_migration_emits_target_not_in_pool_rejection() {
-        let model = migratable_model(&[("claude", "claude_code"), ("claude2", "claude_code")]);
-        let resolved = resolved_for(&model, 0);
-        let result = decide_manual_migration(&model, &resolved, "claude-missing");
-        match result {
-            Err(ManualMigrationRejection::TargetNotInPool { target, pool }) => {
-                assert_eq!(target, "claude-missing");
-                assert_eq!(pool, vec!["claude".to_string(), "claude2".to_string()]);
-            }
-            other => panic!("expected TargetNotInPool, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn decide_manual_migration_emits_single_provider_pool_rejection() {
-        let model = migratable_model(&[("claude", "claude_code")]);
-        let resolved = resolved_for(&model, 0);
-        let result = decide_manual_migration(&model, &resolved, "claude");
-        assert!(matches!(
-            result,
-            Err(ManualMigrationRejection::SingleProviderPool { ref provider })
-                if provider == "claude"
-        ));
-    }
-
-    #[test]
-    fn decide_manual_migration_emits_active_not_in_pool_rejection() {
-        let model = migratable_model(&[("claude", "claude_code"), ("claude2", "claude_code")]);
-        let mut resolved = resolved_for(&model, 0);
-        resolved.active_provider = "archived".to_string();
-        let result = decide_manual_migration(&model, &resolved, "claude2");
-        assert!(matches!(
-            result,
-            Err(ManualMigrationRejection::ActiveProviderNotInPool { ref active })
-                if active == "archived"
-        ));
-    }
-
-    #[test]
-    fn decide_manual_migration_emits_not_migratable_pair_rejection() {
-        let model = migratable_model(&[("claude", "claude_code"), ("claude2", "none")]);
-        let resolved = resolved_for(&model, 0);
-        let result = decide_manual_migration(&model, &resolved, "claude2");
-        match result {
-            Err(ManualMigrationRejection::NotMigratablePair { source, target }) => {
-                assert_eq!(source, "claude");
-                assert_eq!(target, "claude2");
-            }
-            other => panic!("expected NotMigratablePair, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn decide_manual_migration_rejects_unparseable_claude_script_target() {
-        let model = migratable_model(&[
-            ("claude", "claude_code"),
-            ("claude2", "claude_custom_script"),
-        ]);
-        let resolved = resolved_for(&model, 0);
-        let result = decide_manual_migration(&model, &resolved, "claude2");
-
-        assert!(matches!(
-            result,
-            Err(ManualMigrationRejection::NotMigratablePair { ref source, ref target })
-                if source == "claude" && target == "claude2"
-        ));
-    }
-
-    fn working_set_model(provider_names: &[&str]) -> ModelConfig {
-        ModelConfig {
-            name: "working-set-fixture".to_string(),
-            prompt_mode: PromptMode::Arg,
-            providers: provider_names
-                .iter()
-                .map(|name| ProviderConfig {
-                    name: (*name).to_string(),
-                    command: (*name).to_string(),
-                    args: Vec::new(),
-                    interactive_args: Some(vec!["launch".to_string()]),
-                    resume: None,
-                    session_capture: None,
-                    resume_acceptance: None,
-                    session_storage: Some(SessionStorage::ClaudeCode {
-                        projects_dir: PathBuf::from(format!("/tmp/{name}/projects")),
-                    }),
-                    system_prompt_override: None,
-                    tool_restrictions: None,
-                    invocation_mode: Default::default(),
-                })
-                .collect(),
-            inputs: Vec::new(),
-            provider: None,
-        }
-    }
-
-    #[test]
-    fn select_next_working_candidate_round_robins_through_working_set() {
-        let db = StateDb::open(Path::new(":memory:")).unwrap();
-        let model = working_set_model(&["a", "b", "c"]);
-        let now = Utc::now();
-
-        let first = select_next_working_candidate(&db, &model, now, None).unwrap();
-        assert_eq!(first, Some(0));
-
-        let second = select_next_working_candidate(&db, &model, now, None).unwrap();
-        assert_eq!(second, Some(1));
-
-        let third = select_next_working_candidate(&db, &model, now, None).unwrap();
-        assert_eq!(third, Some(2));
-
-        let fourth = select_next_working_candidate(&db, &model, now, None).unwrap();
-        assert_eq!(fourth, Some(0), "cursor wraps around the pool");
-    }
-
-    #[test]
-    fn select_next_working_candidate_skips_exclude_index() {
-        let db = StateDb::open(Path::new(":memory:")).unwrap();
-        let model = working_set_model(&["a", "b"]);
-        let now = Utc::now();
-
-        let picked = select_next_working_candidate(&db, &model, now, Some(0)).unwrap();
-        assert_eq!(picked, Some(1));
-    }
-
-    #[test]
-    fn select_next_working_candidate_returns_none_when_all_unavailable() {
-        let db = StateDb::open(Path::new(":memory:")).unwrap();
-        let model = working_set_model(&["a", "b"]);
-        let now = Utc::now();
-        let future = now + Duration::hours(1);
-        db.record_provider_unavailable("a", Some(future), "RollingWindow5h")
-            .unwrap();
-        db.record_provider_unavailable("b", Some(future), "RollingWindow5h")
-            .unwrap();
-
-        let picked = select_next_working_candidate(&db, &model, now, None).unwrap();
-        assert_eq!(picked, None);
     }
 
     fn invocation_start_for_test(
@@ -2332,30 +525,182 @@ mod tests {
         }
     }
 
-    fn production_source() -> &'static str {
-        include_str!("mod.rs")
-            .split("mod tests")
-            .next()
-            .expect("production source precedes tests")
+    fn balancer_production_sources() -> [(&'static str, &'static str); 12] {
+        [
+            (
+                "crates/oulipoly-runtime/src/balancer/mod.rs",
+                production_balancer_source(
+                    "crates/oulipoly-runtime/src/balancer/mod.rs",
+                    include_str!("mod.rs"),
+                ),
+            ),
+            (
+                "crates/oulipoly-runtime/src/balancer/projection.rs",
+                production_balancer_source(
+                    "crates/oulipoly-runtime/src/balancer/projection.rs",
+                    include_str!("projection.rs"),
+                ),
+            ),
+            (
+                "crates/oulipoly-runtime/src/balancer/burn_rate.rs",
+                production_balancer_source(
+                    "crates/oulipoly-runtime/src/balancer/burn_rate.rs",
+                    include_str!("burn_rate.rs"),
+                ),
+            ),
+            (
+                "crates/oulipoly-runtime/src/balancer/density.rs",
+                production_balancer_source(
+                    "crates/oulipoly-runtime/src/balancer/density.rs",
+                    include_str!("density.rs"),
+                ),
+            ),
+            (
+                "crates/oulipoly-runtime/src/balancer/invocation_fallback.rs",
+                production_balancer_source(
+                    "crates/oulipoly-runtime/src/balancer/invocation_fallback.rs",
+                    include_str!("invocation_fallback.rs"),
+                ),
+            ),
+            (
+                "crates/oulipoly-runtime/src/balancer/eligibility.rs",
+                production_balancer_source(
+                    "crates/oulipoly-runtime/src/balancer/eligibility.rs",
+                    include_str!("eligibility.rs"),
+                ),
+            ),
+            (
+                "crates/oulipoly-runtime/src/balancer/context.rs",
+                production_balancer_source(
+                    "crates/oulipoly-runtime/src/balancer/context.rs",
+                    include_str!("context.rs"),
+                ),
+            ),
+            (
+                "crates/oulipoly-runtime/src/balancer/snapshot.rs",
+                production_balancer_source(
+                    "crates/oulipoly-runtime/src/balancer/snapshot.rs",
+                    include_str!("snapshot.rs"),
+                ),
+            ),
+            (
+                "crates/oulipoly-runtime/src/balancer/refresh_inputs.rs",
+                production_balancer_source(
+                    "crates/oulipoly-runtime/src/balancer/refresh_inputs.rs",
+                    include_str!("refresh_inputs.rs"),
+                ),
+            ),
+            (
+                "crates/oulipoly-runtime/src/balancer/topology.rs",
+                production_balancer_source(
+                    "crates/oulipoly-runtime/src/balancer/topology.rs",
+                    include_str!("topology.rs"),
+                ),
+            ),
+            (
+                "crates/oulipoly-runtime/src/balancer/migration.rs",
+                production_balancer_source(
+                    "crates/oulipoly-runtime/src/balancer/migration.rs",
+                    include_str!("migration.rs"),
+                ),
+            ),
+            (
+                "crates/oulipoly-runtime/src/balancer/working_set.rs",
+                production_balancer_source(
+                    "crates/oulipoly-runtime/src/balancer/working_set.rs",
+                    include_str!("working_set.rs"),
+                ),
+            ),
+        ]
+    }
+
+    fn production_balancer_source(module_path: &str, source: &'static str) -> &'static str {
+        if [
+            "crates/oulipoly-runtime/src/balancer/mod.rs",
+            "crates/oulipoly-runtime/src/balancer/migration.rs",
+            "crates/oulipoly-runtime/src/balancer/working_set.rs",
+        ]
+        .contains(&module_path)
+        {
+            return source
+                .split("mod tests")
+                .next()
+                .expect("production source precedes tests");
+        }
+        source
     }
 
     #[test]
     fn age153_source_guard_balancer_has_no_terminal_signal_or_provider_output_authority() {
-        let source = source_without_comments(production_source());
-        for forbidden in ["TerminalSignal", "TerminalSignalKind", "terminal_signal"] {
+        for (module_path, source) in balancer_production_sources() {
+            let source = source_without_comments(source);
+            for forbidden in ["TerminalSignal", "TerminalSignalKind", "terminal_signal"] {
+                assert!(
+                    !contains_identifier_token(&source, forbidden),
+                    "{module_path} must not reference terminal-signal identifier token {forbidden:?}; AGE-153 routing authority is provider_quotas.exhausted_at"
+                );
+            }
             assert!(
-                !contains_identifier_token(&source, forbidden),
-                "balancer must not reference terminal-signal identifier token {forbidden:?}; AGE-153 routing authority is provider_quotas.exhausted_at"
+                !contains_terminal_signal_use_import(&source),
+                "{module_path} must not import terminal_signal modules or TerminalSignal types"
+            );
+            assert!(
+                !contains_provider_output_parser_identifier(&source),
+                "{module_path} must not call provider-output parser functions as routing authority"
             );
         }
-        assert!(
-            !contains_terminal_signal_use_import(&source),
-            "balancer must not import terminal_signal modules or TerminalSignal types"
+    }
+
+    // risk: Inline AGE-153 guard could false-green after B4 modules are extracted; level: component/structural; source: AGE-225 contract Guard And Spec Contract.
+    #[test]
+    fn age153_inline_guard_source_list_declares_age225_b4_modules() {
+        let guard_body = balancer_source_list_body(
+            include_str!("mod.rs"),
+            "fn balancer_production_sources() -> [",
+            "fn production_balancer_source(",
         );
-        assert!(
-            !contains_provider_output_parser_identifier(&source),
-            "balancer must not call provider-output parser functions as routing authority"
-        );
+        assert_age225_b4_balancer_modules_are_declared("inline AGE-153 guard", guard_body);
+    }
+
+    fn assert_age225_b4_balancer_modules_are_declared(guard_name: &str, guard_body: &str) {
+        for module in ["migration.rs", "working_set.rs"] {
+            assert!(
+                guard_body.contains(&format!("src/balancer/{module}")),
+                "{guard_name} must name crates/oulipoly-runtime/src/balancer/{module}"
+            );
+            assert!(
+                guard_body.contains(&format!("include_str!(\"{module}\")")),
+                "{guard_name} must compile-time include balancer/{module}"
+            );
+        }
+    }
+
+    fn balancer_source_list_body<'a>(source: &'a str, start: &str, _end: &str) -> &'a str {
+        let start_index = source
+            .find(start)
+            .unwrap_or_else(|| panic!("missing source-list start marker {start}"));
+        let after_start = &source[start_index..];
+        rust_function_source(after_start)
+    }
+
+    fn rust_function_source(source: &str) -> &str {
+        let body_start = source
+            .find('{')
+            .unwrap_or_else(|| panic!("missing function body"));
+        let mut depth = 0usize;
+        for (offset, ch) in source[body_start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[..body_start + offset + ch.len_utf8()];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unterminated function body")
     }
 
     fn contains_identifier_token(source: &str, token: &str) -> bool {
@@ -2391,33 +736,103 @@ mod tests {
     }
 
     fn source_without_comments(source: &str) -> String {
-        let mut output = String::with_capacity(source.len());
-        let mut chars = source.chars().peekable();
-        let mut in_block_comment = false;
-        while let Some(ch) = chars.next() {
-            if in_block_comment {
-                if ch == '*' && chars.peek() == Some(&'/') {
-                    chars.next();
-                    in_block_comment = false;
-                }
-                continue;
-            }
-            if ch == '/' && chars.peek() == Some(&'*') {
-                chars.next();
-                in_block_comment = true;
-                continue;
-            }
-            if ch == '/' && chars.peek() == Some(&'/') {
-                for next in chars.by_ref() {
-                    if next == '\n' {
-                        output.push('\n');
-                        break;
-                    }
-                }
-                continue;
-            }
-            output.push(ch);
+        let spans = rust_comment_spans(source);
+        source_excluding_spans(source, spans.as_slice())
+    }
+
+    #[derive(Clone, Copy)]
+    enum CommentDelimiter {
+        Line,
+        Block,
+    }
+
+    #[derive(Clone, Copy)]
+    struct CommentStart {
+        index: usize,
+        delimiter: CommentDelimiter,
+    }
+
+    fn rust_comment_spans(source: &str) -> Vec<std::ops::Range<usize>> {
+        let mut spans = Vec::new();
+        let mut cursor = 0;
+        while let Some(start) = next_comment_start(source, cursor) {
+            let end = comment_end(source, start);
+            spans.push(start.index..end);
+            cursor = end;
         }
+        spans
+    }
+
+    fn next_comment_start(source: &str, cursor: usize) -> Option<CommentStart> {
+        nearest_comment_start(
+            line_comment_start(source, cursor),
+            block_comment_start(source, cursor),
+        )
+    }
+
+    fn line_comment_start(source: &str, cursor: usize) -> Option<CommentStart> {
+        source[cursor..].find("//").map(|offset| CommentStart {
+            index: cursor + offset,
+            delimiter: CommentDelimiter::Line,
+        })
+    }
+
+    fn block_comment_start(source: &str, cursor: usize) -> Option<CommentStart> {
+        source[cursor..].find("/*").map(|offset| CommentStart {
+            index: cursor + offset,
+            delimiter: CommentDelimiter::Block,
+        })
+    }
+
+    fn nearest_comment_start(
+        line: Option<CommentStart>,
+        block: Option<CommentStart>,
+    ) -> Option<CommentStart> {
+        match (line, block) {
+            (Some(line), Some(block)) => Some(earlier_comment_start(line, block)),
+            (Some(line), None) => Some(line),
+            (None, Some(block)) => Some(block),
+            (None, None) => None,
+        }
+    }
+
+    fn earlier_comment_start(left: CommentStart, right: CommentStart) -> CommentStart {
+        if left.index <= right.index {
+            left
+        } else {
+            right
+        }
+    }
+
+    fn comment_end(source: &str, start: CommentStart) -> usize {
+        match start.delimiter {
+            CommentDelimiter::Line => line_comment_end(source, start.index),
+            CommentDelimiter::Block => block_comment_end(source, start.index),
+        }
+    }
+
+    fn line_comment_end(source: &str, start: usize) -> usize {
+        source[start..]
+            .find('\n')
+            .map(|offset| start + offset)
+            .unwrap_or(source.len())
+    }
+
+    fn block_comment_end(source: &str, start: usize) -> usize {
+        source[start + 2..]
+            .find("*/")
+            .map(|offset| start + 2 + offset + 2)
+            .unwrap_or(source.len())
+    }
+
+    fn source_excluding_spans(source: &str, spans: &[std::ops::Range<usize>]) -> String {
+        let mut output = String::with_capacity(source.len());
+        let mut cursor = 0;
+        for span in spans {
+            output.push_str(&source[cursor..span.start]);
+            cursor = span.end;
+        }
+        output.push_str(&source[cursor..]);
         output
     }
 
@@ -2830,7 +1245,7 @@ mod tests {
             failure_class: Some("UpstreamApiDown".to_string()),
         };
         assert!(
-            !provider_is_quota_exhausted(Some(&quota_within_slack), &[], now),
+            !eligibility::provider_is_quota_exhausted(Some(&quota_within_slack), &[], now),
             "marker within slack window must not pin the provider as exhausted"
         );
 
@@ -2839,7 +1254,7 @@ mod tests {
             ..quota_within_slack
         };
         assert!(
-            provider_is_quota_exhausted(Some(&quota_beyond_slack), &[], now),
+            eligibility::provider_is_quota_exhausted(Some(&quota_beyond_slack), &[], now),
             "marker well beyond slack window must keep provider exhausted"
         );
     }
@@ -2891,32 +1306,6 @@ mod tests {
         assert_eq!(
             selected, 1,
             "quota/window read failures should degrade to empty cache and use invocation-count fallback"
-        );
-    }
-
-    #[test]
-    fn clear_reset_implied_flags_does_not_abort_when_clear_fails() {
-        let (_dir, path, db) = file_backed_state("clear-reset-fails");
-        let model = single_provider_model();
-        seed_windows_with_deltas(&db, "a", &[(1.0, -1, 0.01, 22)]);
-        db.mark_exhausted("a").unwrap();
-        let conn = Connection::open(path).unwrap();
-        conn.execute_batch(
-            "CREATE TRIGGER fail_clear_exhausted
-             BEFORE UPDATE OF exhausted_at ON provider_quotas
-             WHEN NEW.exhausted_at IS NULL
-             BEGIN
-                SELECT RAISE(ABORT, 'clear denied');
-             END;",
-        )
-        .unwrap();
-
-        let selected = select_provider(&model, &db, None).unwrap();
-
-        assert_eq!(selected, 0);
-        assert!(
-            db.get_quota("a").unwrap().unwrap().exhausted_at.is_some(),
-            "failed reset-implied clear is swallowed after warning and leaves the flag intact"
         );
     }
 
@@ -3721,31 +2110,6 @@ mod tests {
     // other tests (#11 sibling rescue, #12 duration-ratio rescue, #14
     // no learning anywhere, #16 fresh pool round-robin). Do not
     // resurrect this slot without first amending the cascade design.
-
-    #[test]
-    fn provider_load_falls_back_to_zero_without_finite_window_projection() {
-        let projection = ProviderProjection {
-            provider_index: 0,
-            projections_per_window: vec![
-                WindowProjection {
-                    window_id: 0,
-                    projected_used: f64::NAN,
-                    hours_until_reset: 2.0,
-                    remaining_headroom: 0.0,
-                },
-                WindowProjection {
-                    window_id: 1,
-                    projected_used: f64::INFINITY,
-                    hours_until_reset: 4.0,
-                    remaining_headroom: 0.0,
-                },
-            ],
-            binding_score: Some(1.0),
-            recent_error_count: 0,
-        };
-
-        assert_eq!(provider_load(&projection), 0.0);
-    }
 
     #[test]
     fn approx_eq_usage_uses_near_epsilon_relative_threshold() {

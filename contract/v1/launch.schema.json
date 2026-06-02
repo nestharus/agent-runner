@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "launch.schema.json",
+  "title": "Oulipoly Provider Launch Contract",
+  "type": "object",
+  "$defs": {
+    "LaunchParams": {
+      "type": "object",
+      "properties": {
+        "settings_id": { "type": "string", "minLength": 1 },
+        "mode": { "type": "string", "minLength": 1 },
+        "model": { "$ref": "common.schema.json#/$defs/ProviderModelRequest" },
+        "argv": { "type": "array", "items": { "type": "string" } },
+        "working_directory": { "type": "string", "minLength": 1 },
+        "env": { "$ref": "common.schema.json#/$defs/StringMap" },
+        "stdin": { "$ref": "common.schema.json#/$defs/BytePayload" },
+        "session": { "type": "object", "additionalProperties": true }
+      },
+      "required": ["settings_id", "mode", "model", "argv", "working_directory"],
+      "additionalProperties": false
+    },
+    "LaunchRequest": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/RequestEnvelope" },
+        { "type": "object", "properties": { "params": { "$ref": "#/$defs/LaunchParams" } } }
+      ]
+    },
+    "LaunchStdoutEvent": {
+      "type": "object",
+      "properties": {
+        "contract": { "$ref": "common.schema.json#/$defs/ContractVersion" },
+        "request_id": { "$ref": "common.schema.json#/$defs/RequestId" },
+        "seq": { "type": "integer", "minimum": 1 },
+        "time_unix_ms": { "$ref": "common.schema.json#/$defs/UnixMilliseconds" },
+        "kind": { "const": "stdout" },
+        "data_base64": { "type": "string" }
+      },
+      "required": ["contract", "request_id", "seq", "time_unix_ms", "kind", "data_base64"],
+      "additionalProperties": false
+    },
+    "LaunchStderrEvent": {
+      "type": "object",
+      "properties": {
+        "contract": { "$ref": "common.schema.json#/$defs/ContractVersion" },
+        "request_id": { "$ref": "common.schema.json#/$defs/RequestId" },
+        "seq": { "type": "integer", "minimum": 1 },
+        "time_unix_ms": { "$ref": "common.schema.json#/$defs/UnixMilliseconds" },
+        "kind": { "const": "stderr" },
+        "data_base64": { "type": "string" }
+      },
+      "required": ["contract", "request_id", "seq", "time_unix_ms", "kind", "data_base64"],
+      "additionalProperties": false
+    },
+    "LaunchMarkerEvent": {
+      "type": "object",
+      "properties": {
+        "contract": { "$ref": "common.schema.json#/$defs/ContractVersion" },
+        "request_id": { "$ref": "common.schema.json#/$defs/RequestId" },
+        "seq": { "type": "integer", "minimum": 1 },
+        "time_unix_ms": { "$ref": "common.schema.json#/$defs/UnixMilliseconds" },
+        "kind": { "const": "marker" },
+        "name": { "type": "string", "minLength": 1 },
+        "value": true
+      },
+      "required": ["contract", "request_id", "seq", "time_unix_ms", "kind", "name", "value"],
+      "additionalProperties": false
+    },
+    "LaunchHeartbeatEvent": {
+      "type": "object",
+      "properties": {
+        "contract": { "$ref": "common.schema.json#/$defs/ContractVersion" },
+        "request_id": { "$ref": "common.schema.json#/$defs/RequestId" },
+        "seq": { "type": "integer", "minimum": 1 },
+        "time_unix_ms": { "$ref": "common.schema.json#/$defs/UnixMilliseconds" },
+        "kind": { "const": "heartbeat" },
+        "detail": { "type": "string" }
+      },
+      "required": ["contract", "request_id", "seq", "time_unix_ms", "kind"],
+      "additionalProperties": false
+    },
+    "LaunchExitEvent": {
+      "type": "object",
+      "properties": {
+        "contract": { "$ref": "common.schema.json#/$defs/ContractVersion" },
+        "request_id": { "$ref": "common.schema.json#/$defs/RequestId" },
+        "seq": { "type": "integer", "minimum": 1 },
+        "time_unix_ms": { "$ref": "common.schema.json#/$defs/UnixMilliseconds" },
+        "kind": { "const": "exit" },
+        "status": { "$ref": "common.schema.json#/$defs/ProcessStatus" },
+        "terminal_signal": { "$ref": "common.schema.json#/$defs/TerminalSignal" },
+        "session": { "type": "object", "additionalProperties": true }
+      },
+      "required": [
+        "contract",
+        "request_id",
+        "seq",
+        "time_unix_ms",
+        "kind",
+        "status",
+        "terminal_signal"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

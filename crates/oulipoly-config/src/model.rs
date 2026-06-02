@@ -882,7 +882,6 @@ fn validate_legacy_model_fields(raw: &RawModelToml) -> Result<(), ModelError> {
         || raw.args.is_some()
         || raw.interactive_args.is_some()
         || raw.resume.is_some()
-        || raw.prompt_mode.is_some()
         || raw.session_capture.is_some()
         || raw.resume_acceptance.is_some()
         || raw.session_storage.is_some()

@@ -1,15 +1,17 @@
 //! ## Declared roles
 //! orchestration, accessor, mapper, formatter
 //!
-//! ## Adapter declarations
-//! adapter_declarations:
-//!   - component: crates/oulipoly-runtime/src/services/adapters.rs::runtime_service_config_adapter
-//!     role: adapter
-//!     Translates:
-//!       - oulipoly_config.model_contract
-//!       - oulipoly_config.provider_contract
-//!       - oulipoly_config.sessions_contract
-//!       - oulipoly_runtime.service_dto_contract
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-runtime/src/services/adapters.rs
+//!     role: intrinsic-surface
+//!     Domain: production service adapter wiring
+//!     Owns:
+//!       - production service struct construction
+//!       - service-port implementation branching
+//!       - built-in versus external-provider session export/replace dispatch selection
+//!       - service DTO to runtime helper delegation
+//! ```
 //!
 //! Production service adapters. This module owns concrete adapter structs and
 //! trait implementations; branch-heavy service work is delegated to focused
@@ -18,6 +20,7 @@
 use super::dtos::*;
 use super::error::ServiceError;
 use super::ports::*;
+use crate::provider_registry::ProviderRegistryHandle;
 use oulipoly_state::StateDb;
 use oulipoly_state::repositories::ResumeRepository;
 
@@ -48,21 +51,37 @@ impl ProductionResumeService {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ProductionSessionLifecycleService;
+#[derive(Debug, Clone, Default)]
+pub struct ProductionSessionLifecycleService {
+    provider_registry: Option<ProviderRegistryHandle>,
+}
 
 impl ProductionSessionLifecycleService {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    pub fn with_registry_handle(provider_registry: ProviderRegistryHandle) -> Self {
+        Self {
+            provider_registry: Some(provider_registry),
+        }
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ProductionMigrationService;
+#[derive(Debug, Clone, Default)]
+pub struct ProductionMigrationService {
+    provider_registry: Option<ProviderRegistryHandle>,
+}
 
 impl ProductionMigrationService {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    pub fn with_registry_handle(provider_registry: ProviderRegistryHandle) -> Self {
+        Self {
+            provider_registry: Some(provider_registry),
+        }
     }
 }
 
@@ -77,25 +96,37 @@ impl ProductionTraceService {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct ProductionSessionExportService {
-    _private: (),
+    provider_registry: Option<ProviderRegistryHandle>,
 }
 
 impl ProductionSessionExportService {
     pub fn new() -> Self {
         Self::default()
     }
+
+    pub fn with_registry_handle(provider_registry: ProviderRegistryHandle) -> Self {
+        Self {
+            provider_registry: Some(provider_registry),
+        }
+    }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct ProductionSessionReplaceService {
-    _private: (),
+    provider_registry: Option<ProviderRegistryHandle>,
 }
 
 impl ProductionSessionReplaceService {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_registry_handle(provider_registry: ProviderRegistryHandle) -> Self {
+        Self {
+            provider_registry: Some(provider_registry),
+        }
     }
 }
 
@@ -191,7 +222,10 @@ impl SessionLifecycleServicePort for ProductionSessionLifecycleService {
         &self,
         request: SessionLifecycleRequest<'_>,
     ) -> Result<SessionLifecycleOutput, ServiceError> {
-        super::session_lifecycle::ingest_session(request)
+        super::session_lifecycle::ingest_session_with_registry(
+            request,
+            self.provider_registry.as_ref(),
+        )
     }
 }
 
@@ -200,7 +234,7 @@ impl MigrationServicePort for ProductionMigrationService {
         &self,
         request: MigrationServiceRequest<'_>,
     ) -> Result<MigrationServiceOutput, ServiceError> {
-        super::migration::migrate(request)
+        super::migration::migrate(request, self.provider_registry.as_ref())
     }
 }
 
@@ -215,6 +249,15 @@ impl SessionExportServicePort for ProductionSessionExportService {
         &self,
         request: SessionExportServiceRequest,
     ) -> Result<SessionExportServiceOutput, ServiceError> {
+        if let Some(identity) = request.external_provider {
+            let result = crate::session_external_provider::export_session(
+                self.provider_registry.as_ref(),
+                identity,
+                &request.session_id,
+            );
+            return Ok(SessionExportServiceOutput { result });
+        }
+
         let result = crate::session_export::resolve_export_session_metadata(&request.session_id)
             .and_then(|metadata| {
                 crate::session_export::read_canonical_transcript(&metadata)
@@ -229,6 +272,17 @@ impl SessionReplaceServicePort for ProductionSessionReplaceService {
         &self,
         request: SessionReplaceServiceRequest,
     ) -> Result<SessionReplaceServiceOutput, ServiceError> {
+        if let Some(identity) = request.external_provider {
+            let result = crate::session_external_provider::replace_session(
+                self.provider_registry.as_ref(),
+                identity,
+                &request.session_id,
+                &request.source,
+                request.preimage_sha256.as_deref(),
+            );
+            return Ok(SessionReplaceServiceOutput { result });
+        }
+
         let input_path = match &request.source {
             crate::session_replace::ReplaceSource::File(path) => Some(path.as_path()),
             crate::session_replace::ReplaceSource::Stdin => None,

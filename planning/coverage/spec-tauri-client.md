@@ -3,9 +3,56 @@
 ## Source files
 
 - `src-tauri/src/lib.rs`
+- `src-tauri/src/app_state.rs`
+- `src-tauri/src/app_paths.rs`
+- `src-tauri/src/run_tauri.rs`
 - `src-tauri/src/main.rs`
 - `src-tauri/src/dispatch.rs`
 - `src-tauri/src/wiring.rs`
+- `src-tauri/src/lib_commands.rs`
+- `src-tauri/src/commands/models/mod.rs`
+- `src-tauri/src/commands/models/accessor.rs`
+- `src-tauri/src/commands/models/validator.rs`
+- `src-tauri/src/commands/models/formatter.rs`
+- `src-tauri/src/commands/models/orchestration.rs`
+- `src-tauri/src/commands/models/reload.rs`
+- `src-tauri/src/commands/pools/mod.rs`
+- `src-tauri/src/commands/pools/derive.rs`
+- `src-tauri/src/commands/pools/update.rs`
+- `src-tauri/src/commands/pools/accessor.rs`
+- `src-tauri/src/commands/pools/validator.rs`
+- `src-tauri/src/commands/pools/writer.rs`
+- `src-tauri/src/commands/quota_refresh/mod.rs`
+- `src-tauri/src/commands/quota_refresh/orchestration.rs`
+- `src-tauri/src/commands/quota_refresh/candidates.rs`
+- `src-tauri/src/commands/quota_refresh/accessor.rs`
+- `src-tauri/src/commands/quota_refresh/mapper.rs`
+- `src-tauri/src/commands/accessor.rs`
+- `src-tauri/src/commands/setup_flow/mod.rs`
+- `src-tauri/src/commands/setup_flow/orchestration.rs`
+- `src-tauri/src/commands/setup_flow/provider_probe.rs`
+- `src-tauri/src/commands/setup_flow/accessor.rs`
+- `src-tauri/src/commands/setup_flow/formatter.rs`
+- `src-tauri/src/commands/providers_accounts/mod.rs`
+- `src-tauri/src/commands/providers_accounts/orchestration.rs`
+- `src-tauri/src/commands/providers_accounts/accessor.rs`
+- `src-tauri/src/commands/providers_accounts/validator.rs`
+- `src-tauri/src/commands/providers_accounts/mapper.rs`
+- `src-tauri/src/commands/providers_accounts/formatter.rs`
+- `src-tauri/src/commands/providers_accounts/display_name.rs`
+- `src-tauri/src/commands/discovery/mod.rs`
+- `src-tauri/src/commands/discovery/orchestration.rs`
+- `src-tauri/src/commands/discovery/accessor.rs`
+- `src-tauri/src/commands/discovery/predicate.rs`
+- `src-tauri/src/commands/discovery/formatter.rs`
+- `src-tauri/src/commands/test_model/mod.rs`
+- `src-tauri/src/commands/test_model/orchestration.rs`
+- `src-tauri/src/commands/test_model/diagnostics_fallback.rs`
+- `src-tauri/src/commands/test_model/lookup.rs`
+- `src-tauri/src/commands/test_model/dispatch.rs`
+- `src-tauri/src/commands/test_model/validator.rs`
+- `src-tauri/src/commands/test_model/formatter.rs`
+- `src-tauri/src/commands/test_model/mapper.rs`
 - `src-tauri/src/balanced_cli.rs`
 - `src-tauri/src/cli_inputs.rs`
 - `src-tauri/src/config_migration_cli.rs`
@@ -50,7 +97,15 @@
 | `commands/trace/` invoked. | Surface the diagnostics/trace history for an invocation. |
 | `config_migration_cli.rs` invoked. | Migrate config schema forward. |
 | Setup flow invoked (`setup/flow.rs`). | Drive the wizard from `oulipoly-setup`; persist results via `oulipoly-config`. |
+| Tauri setup-flow IPC commands invoked (`commands/setup_flow/`). | Preserve UUID session ids, response channel capacity 16, sender storage/clear behavior, setup response strings, memory DB path beside `models_dir`, memory-open error event text with `recoverable: false`, CLI detection delegation, and the existing `which claude` setup-needed residual probe. |
+| Tauri provider/account IPC commands invoked (`commands/providers_accounts/`). | Route reads and mutations through `SetupRepository`, prefer test repository injection before real DB fallback, preserve `AddAccountInput` fields, account validation strings, provider-not-found strings, `AuthStatus::Unknown`, RFC3339 timestamps, delete boolean results, sync detection delegation, and the residual display-name map. |
+| Tauri discovery IPC commands invoked (`commands/discovery/`). | Run runtime discovery in a blocking task, open the GUI-derived `state.db`, map join failures to `Discovery task failed: {e}`, preserve empty-result stale-delete guard, delete stale rows before model upserts before parameter upserts, and preserve provider/model read filters through `SetupRepository`. |
 | Tauri owned-turn event arrives. | `main/owned_turn_event_ingest.rs` parses and persists per `oulipoly-state` schema. |
+| `commands/quota_refresh/` invoked. | Refresh stale quota data only for providers in multi-provider models, preserve sorted provider-name output, map runtime quota outcomes to the stable frontend DTO strings. |
+
+AGE-237 owns the adjacent usage-CLI/quota-refresh outcome drift. This spec
+records the current quota-refresh command behavior only; it does not normalize
+or consolidate usage CLI row-state strings with the quota-refresh DTO strings.
 
 ## Edge cases
 
@@ -59,6 +114,14 @@
   still works; GUI mode reports a clear error.
 - Adapter (e.g. `terminal_outcome_adapter.rs`) receives an envelope
   whose schema does not match — typed error; do not swallow.
+- Quota refresh sees a fresh cached provider — return `fresh` without calling
+  the runtime quota service.
+- Quota refresh sees an in-flight runtime refresh — return `in_flight`
+  byte-identically for the DTO status.
+- Setup response without an active setup session returns `No active setup session`;
+  sending to a closed setup response channel returns `Failed to send response: {e}`.
+- Discovery persistence with no discovered models preserves existing rows; a
+  non-empty result deletes stale rows before upserting models and parameters.
 - Resume acceptance adapter sees a session in `mutability: read-only` —
   refuses gracefully (delegates to `oulipoly-runtime/session_metadata/
   mutability.rs`).
@@ -73,6 +136,13 @@
 - `TauriBootFailed` — GUI surface could not initialize.
 - `AdapterError` — a typed `*_adapter.rs` translation failure.
 - Resume-list loading failure — return `Failed to list resume chains: {e}`.
+- Quota refresh state DB open failure — return `Failed to open state DB: {e}`.
+- Setup memory graph open failure emits `Failed to open memory store: {e}` with
+  `recoverable: false` on the setup event channel.
+- Provider/account validation failures return `Account id cannot be empty`,
+  `Account provider cannot be empty`, or `Account profile_name cannot be empty`;
+  missing providers return `Provider '{name}' not found`.
+- Discovery blocking task join failures return `Discovery task failed: {e}`.
 
 ## Boundaries
 
@@ -97,6 +167,7 @@ wiring smoke tests, adapter contract tests, workspace-layout invariants.
 - `src-tauri/tests/age38_test_model_services.rs`
 - `src-tauri/tests/age38_wiring.rs`
 - `src-tauri/tests/age39_main_thinning_source_guard.rs`
+- `src-tauri/tests/age236_quota_refresh_extraction.rs`
 - `src-tauri/tests/age151_source_guard.rs`
 - `src-tauri/tests/age154_test_model_disposition.rs`
 - `src-tauri/tests/age8_cli_characterization.rs`

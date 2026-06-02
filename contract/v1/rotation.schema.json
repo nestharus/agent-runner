@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "rotation.schema.json",
+  "title": "Oulipoly Provider Rotation Contract",
+  "type": "object",
+  "$defs": {
+    "RotationObject": { "type": "object", "additionalProperties": true },
+    "RotationHostStatePlanSegment": {
+      "type": "object",
+      "properties": {
+        "provider": { "type": "string", "minLength": 1 },
+        "session_id": { "type": "string", "minLength": 1 },
+        "started_at": { "type": "string", "format": "date-time" },
+        "ended_at": { "type": "string", "format": "date-time" }
+      },
+      "required": ["provider", "session_id"],
+      "additionalProperties": false
+    },
+    "RotationHostStatePlanArtifact": {
+      "type": "object",
+      "properties": {
+        "kind": { "const": "file" },
+        "path": { "type": "string", "minLength": 1 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      },
+      "required": ["kind", "path", "sha256"],
+      "additionalProperties": false
+    },
+    "RotationHostStatePlan": {
+      "type": "object",
+      "properties": {
+        "schema_version": { "const": 1 },
+        "operation": { "const": "rotation.materialize" },
+        "chain_id": { "type": "string", "minLength": 1 },
+        "source_provider": { "type": "string", "minLength": 1 },
+        "target_provider": { "type": "string", "minLength": 1 },
+        "source_session_id": { "type": "string", "minLength": 1 },
+        "target_session_id": { "type": "string", "minLength": 1 },
+        "transition_reason": {
+          "type": "string",
+          "enum": ["manual", "quota_threshold", "exhausted"]
+        },
+        "segments": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/RotationHostStatePlanSegment" }
+        },
+        "artifacts": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/RotationHostStatePlanArtifact" }
+        }
+      },
+      "required": [
+        "schema_version",
+        "operation",
+        "chain_id",
+        "source_provider",
+        "target_provider",
+        "source_session_id",
+        "target_session_id",
+        "transition_reason",
+        "segments",
+        "artifacts"
+      ],
+      "additionalProperties": false
+    },
+    "RotationAssessParams": { "$ref": "#/$defs/RotationObject" },
+    "RotationAssessRequest": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/RequestEnvelope" },
+        { "type": "object", "properties": { "params": { "$ref": "#/$defs/RotationAssessParams" } } }
+      ]
+    },
+    "RotationAssessResult": {
+      "type": "object",
+      "properties": {
+        "allowed": { "type": "boolean" },
+        "score": { "type": "integer", "minimum": 0 },
+        "reason": { "type": "string" },
+        "requirements": { "type": "array", "items": true }
+      },
+      "required": ["allowed", "requirements"],
+      "additionalProperties": false
+    },
+    "RotationAssessResponse": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/SuccessResponseEnvelope" },
+        { "type": "object", "properties": { "result": { "$ref": "#/$defs/RotationAssessResult" } } }
+      ]
+    },
+    "RotationAssessErrorResponse": { "$ref": "common.schema.json#/$defs/ErrorResponseEnvelope" },
+    "RotationMaterializeParams": { "$ref": "#/$defs/RotationObject" },
+    "RotationMaterializeRequest": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/RequestEnvelope" },
+        { "type": "object", "properties": { "params": { "$ref": "#/$defs/RotationMaterializeParams" } } }
+      ]
+    },
+    "RotationMaterializeResult": {
+      "type": "object",
+      "properties": {
+        "changed": { "type": "boolean" },
+        "target_provider_session_id": { "type": "string" },
+        "artifacts": {
+          "type": "array",
+          "items": { "$ref": "common.schema.json#/$defs/Artifact" }
+        },
+        "host_state_plan": { "$ref": "#/$defs/RotationHostStatePlan" }
+      },
+      "required": ["changed", "artifacts", "host_state_plan"],
+      "additionalProperties": false
+    },
+    "RotationMaterializeResponse": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/SuccessResponseEnvelope" },
+        { "type": "object", "properties": { "result": { "$ref": "#/$defs/RotationMaterializeResult" } } }
+      ]
+    },
+    "RotationMaterializeErrorResponse": { "$ref": "common.schema.json#/$defs/ErrorResponseEnvelope" }
+  }
+}

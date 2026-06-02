@@ -1,21 +1,14 @@
 //! ## Declared roles
 //!
-//! Roles: orchestration, accessor, formatter, mapper, validator.
+//! Roles: orchestration.
 //!
 //! - orchestration: top-level [`execute`], [`execute_effective`],
 //!   [`execute_effective_with_start_known_provider_session_id`],
 //!   [`execute_resume`], [`execute_interactive`], and
-//!   [`execute_interactive_with_result`] entrypoints. This module composes
-//!   the per-component submodules listed below; predicates, parsers,
-//!   validators, formatters, mappers, accessors, and filters all live in
-//!   sibling files under `executor/cli/`.
-//! - accessor: [`provider_for_index`] retrieves the configured provider.
-//! - formatter: [`provider_index_out_of_range_message`],
-//!   [`interactive_args_missing_error`].
-//! - mapper: [`execution_result_from_raw`],
-//!   [`raw_result_from_supervised_output`],
-//!   [`interactive_result_from_status`].
-//! - validator: [`validated_interactive_args`].
+//!   [`execute_interactive_with_result`] public entrypoints. This module owns
+//!   the facade re-exports and composes the per-component submodules listed
+//!   below; predicates, parsers, validators, formatters, mappers, accessors,
+//!   and filters all live in sibling files under `executor/cli/`.
 //!
 //! ## Adapter declarations
 //!
@@ -25,7 +18,6 @@
 //!     role: adapter
 //!     Translates:
 //!       - executor-public-entrypoint-contract
-//!       - executor-result-dto-contract
 //!       - executor-cli-component-set-contract
 //!       - executor-cli-test-fixture-contract
 //!       - tempfile-unix-permissions-test-contract
@@ -41,475 +33,70 @@
 //!   stderr marker prefix, and JSONL semantics bit-for-bit.
 //! - [`launch`] (c3) — provider launch + command construction.
 //! - [`policy`] (c4) — provider policy emission for Claude/Codex.
+//! - [`provider_lookup`] — configured provider lookup and provider-index
+//!   error formatting.
 //! - [`provider_identity`] (c4) — `shell_split`, `provider_name`,
 //!   `provider_executable_name`, and the ACR-205 intrinsic-surface
 //!   declaration for the bounded `claude | codex | openai_compat`
 //!   provider set.
+//! - [`request`] — public effective execution request carrier.
+//! - [`result`] — maps supervised output and return-channel artifacts onto
+//!   executor result DTOs, plus prompt/session temp-file cleanup.
 //! - [`resume`] (c5) — resume args composition + acceptance classification.
 //!   Carries the ACR-251 canonical-doc-as-schema declaration for PP-009.
 //! - [`capture_result`] (c5) — maps capture plans and parsed provider output
 //!   onto executor session-capture result DTOs.
+//! - [`headless`] — headless public execution entrypoints and effective
+//!   execution orchestration.
+//! - [`interactive`] — interactive public execution entrypoints, validation,
+//!   direct spawn/wait posture, Unix signal-guard callsite, and result mapping.
 //! - [`session_capture`] (c5) — `start_known_provider_session_id`, capture
 //!   plans, and stdout JSONL parsers. Carries the ACR-251 canonical-doc-
 //!   as-schema declarations for PP-007 + PP-008.
+//! - [`provider_execution`] — provider launch/supervisor/return-channel
+//!   orchestration for headless and resume execution.
+//! - [`resume_execution`] — resume public entrypoints and resume execution
+//!   orchestration.
 //! - [`supervision`] (c3) — provider supervisor + child IO.
 //! - [`terminal_signal`] (c3) — terminal reason classifier and the
 //!   interactive signal-forwarding guard.
 
 mod capture_result;
+mod headless;
 mod input_flags;
+mod interactive;
 mod ipc;
 mod launch;
 mod policy;
+mod provider_execution;
 mod provider_identity;
+mod provider_lookup;
+mod request;
+mod result;
 mod resume;
+mod resume_execution;
 mod session_capture;
 mod supervision;
 mod terminal_signal;
 
+pub use headless::{
+    execute, execute_effective, execute_effective_with_start_known_provider_session_id,
+};
+pub(crate) use input_flags::resolve_input_flags;
+pub use interactive::{
+    InteractiveExecutionResult, execute_interactive, execute_interactive_with_result,
+};
 pub use provider_identity::{provider_name, shell_split};
+pub use request::EffectiveExecuteRequest;
 pub use resume::{ResumePayload, compose_resume_args};
+pub use resume_execution::{execute_resume, execute_resume_optional_prompt};
 pub use session_capture::start_known_provider_session_id;
 pub use terminal_signal::classify_terminal_reason;
 
-use capture_result::{finalize_capture, maybe_restore_plain_stdout};
-use input_flags::resolve_input_flags;
-use launch::{ProviderLaunch, ProviderLaunchRequest, assemble_provider_launch, build_command};
-use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig};
-use policy::apply_provider_policy;
-use resume::{classify_resume_acceptance, compose_resume_provider_args};
-use session_capture::remove_unsanctioned_money_fields;
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::process::{ExitStatus, Stdio};
-use supervision::{SupervisedOutput, SupervisorConfig, run_provider_supervisor};
-
-use super::{
-    CapturedChildInvocation, ExecutionResult, ResumeAcceptanceResult, ReturnedArtifactRef,
-    SessionCaptureMethod, SessionCaptureResult, TerminalSignal,
-};
-
-pub fn execute(
-    model: &ModelConfig,
-    provider_index: usize,
-    prompt: &str,
-    working_dir: Option<&Path>,
-    extra_inputs: &HashMap<String, Vec<String>>,
-    parent_invocation_env: Option<&str>,
-) -> Result<ExecutionResult, String> {
-    let provider = provider_for_index(model, provider_index)?;
-    let input_args = resolve_input_flags(model, extra_inputs)?;
-    let (result, temp_files) = execute_provider(
-        provider,
-        model.prompt_mode,
-        prompt,
-        working_dir,
-        &input_args,
-        parent_invocation_env,
-        None,
-    )?;
-    cleanup_temp_files(temp_files);
-
-    Ok(execution_result_from_raw(
-        result,
-        provider_index,
-        None,
-        None,
-    ))
-}
-
-fn provider_for_index(
-    model: &ModelConfig,
-    provider_index: usize,
-) -> Result<&ProviderConfig, String> {
-    model
-        .providers
-        .get(provider_index)
-        .ok_or_else(|| provider_index_out_of_range_message(model, provider_index))
-}
-
-fn provider_index_out_of_range_message(model: &ModelConfig, provider_index: usize) -> String {
-    format!(
-        "Provider index {} out of range for model {}",
-        provider_index, model.name
-    )
-}
-
-pub struct EffectiveExecuteRequest<'a> {
-    pub model: &'a ModelConfig,
-    pub provider: &'a ProviderConfig,
-    pub provider_index: usize,
-    pub prompt_mode: PromptMode,
-    pub prompt: &'a str,
-    pub working_dir: Option<&'a Path>,
-    pub extra_inputs: &'a HashMap<String, Vec<String>>,
-    pub parent_invocation_env: Option<&'a str>,
-}
-
-pub fn execute_effective(request: EffectiveExecuteRequest<'_>) -> Result<ExecutionResult, String> {
-    execute_effective_with_start_known_provider_session_id(request, None)
-}
-
-pub fn execute_effective_with_start_known_provider_session_id(
-    request: EffectiveExecuteRequest<'_>,
-    start_known_provider_session_id: Option<&str>,
-) -> Result<ExecutionResult, String> {
-    execute_effective_with_optional_supervisor_config(
-        request,
-        start_known_provider_session_id,
-        None,
-    )
-}
-
 #[cfg(test)]
-fn execute_effective_with_supervisor_config(
-    request: EffectiveExecuteRequest<'_>,
-    start_known_provider_session_id: Option<&str>,
-    supervisor_config: SupervisorConfig,
-) -> Result<ExecutionResult, String> {
-    execute_effective_with_optional_supervisor_config(
-        request,
-        start_known_provider_session_id,
-        Some(supervisor_config),
-    )
-}
-
-fn execute_effective_with_optional_supervisor_config(
-    request: EffectiveExecuteRequest<'_>,
-    start_known_provider_session_id: Option<&str>,
-    supervisor_config: Option<SupervisorConfig>,
-) -> Result<ExecutionResult, String> {
-    let input_args = resolve_input_flags(request.model, request.extra_inputs)?;
-    let (result, temp_files) = execute_provider_with_arg_parts_and_supervisor_config(
-        request.provider,
-        &request.provider.args,
-        &[],
-        request.prompt_mode,
-        Some(request.prompt),
-        request.working_dir,
-        &input_args,
-        request.parent_invocation_env,
-        start_known_provider_session_id,
-        supervisor_config,
-    )?;
-    cleanup_temp_files(temp_files);
-
-    Ok(execution_result_from_raw(
-        result,
-        request.provider_index,
-        None,
-        None,
-    ))
-}
-
-fn cleanup_temp_files(temp_files: Vec<PathBuf>) {
-    for path in temp_files {
-        let _ = std::fs::remove_file(path);
-    }
-}
-
-fn execution_result_from_raw(
-    result: RawResult,
-    provider_index: usize,
-    resume_acceptance: Option<ResumeAcceptanceResult>,
-    session_capture_override: Option<SessionCaptureResult>,
-) -> ExecutionResult {
-    ExecutionResult {
-        stdout: result.stdout,
-        stderr: result.stderr,
-        exit_code: result.exit_code,
-        provider_index,
-        session_capture: session_capture_override.unwrap_or(result.session_capture),
-        resume_acceptance,
-        terminal_reason: result.terminal_reason,
-        terminal_signal: result.terminal_signal,
-        captured_child_invocations: result.captured_child_invocations,
-        returned_artifacts: result.returned_artifacts,
-    }
-}
-
-struct RawResult {
-    stdout: Vec<u8>,
-    telemetry_stdout: Vec<u8>,
-    stderr: String,
-    exit_code: i32,
-    session_capture: SessionCaptureResult,
-    terminal_reason: Option<String>,
-    terminal_signal: Option<TerminalSignal>,
-    captured_child_invocations: Vec<CapturedChildInvocation>,
-    returned_artifacts: Vec<ReturnedArtifactRef>,
-}
-
-fn execute_provider(
-    provider: &ProviderConfig,
-    prompt_mode: PromptMode,
-    prompt: &str,
-    working_dir: Option<&Path>,
-    input_args: &[String],
-    parent_invocation_env: Option<&str>,
-    start_known_provider_session_id: Option<&str>,
-) -> Result<(RawResult, Vec<PathBuf>), String> {
-    execute_provider_with_arg_parts_and_supervisor_config(
-        provider,
-        &provider.args,
-        &[],
-        prompt_mode,
-        Some(prompt),
-        working_dir,
-        input_args,
-        parent_invocation_env,
-        start_known_provider_session_id,
-        None,
-    )
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "executor call shape keeps base args, lifecycle tail args, prompt mode, cwd, input flags, parent marker, optional start-bound session, and optional supervisor test injection explicit"
-)]
-fn execute_provider_with_arg_parts_and_supervisor_config(
-    provider: &ProviderConfig,
-    provider_args: &[String],
-    tail_args: &[String],
-    prompt_mode: PromptMode,
-    prompt: Option<&str>,
-    working_dir: Option<&Path>,
-    input_args: &[String],
-    parent_invocation_env: Option<&str>,
-    start_known_provider_session_id: Option<&str>,
-    supervisor_config: Option<SupervisorConfig>,
-) -> Result<(RawResult, Vec<PathBuf>), String> {
-    let launch = assemble_provider_launch(
-        ProviderLaunchRequest {
-            provider,
-            provider_args,
-            tail_args,
-            prompt_mode,
-            prompt,
-            working_dir,
-            input_args,
-            parent_invocation_env,
-            start_known_provider_session_id,
-        },
-        supervisor_config,
-    )?;
-    let ProviderLaunch {
-        cmd,
-        supervisor_config,
-        capture_plan,
-        return_channel,
-        temp_files,
-    } = launch;
-    let output = run_provider_supervisor(cmd, provider, supervisor_config)?;
-    let returned_artifacts = ipc::read_and_cleanup_return_channel(&return_channel);
-    let result = raw_result_from_supervised_output(&capture_plan, output, returned_artifacts);
-
-    Ok((result, temp_files))
-}
-
-fn raw_result_from_supervised_output(
-    capture_plan: &session_capture::CapturePlan,
-    output: SupervisedOutput,
-    returned_artifacts: Vec<ReturnedArtifactRef>,
-) -> RawResult {
-    let capture_outcome = finalize_capture(capture_plan, &output.stdout);
-    let stdout = maybe_restore_plain_stdout(capture_plan, &capture_outcome, &output.stdout);
-    let stdout = remove_unsanctioned_money_fields(stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    let captured_child_invocations = ipc::captured_child_invocations_from_stderr(&stderr);
-    RawResult {
-        stdout,
-        telemetry_stdout: output.stdout.clone(),
-        captured_child_invocations,
-        stderr,
-        exit_code: output.exit_code,
-        terminal_reason: output.terminal_reason,
-        terminal_signal: Some(output.terminal_signal),
-        session_capture: capture_outcome,
-        returned_artifacts,
-    }
-}
-
-pub fn execute_resume(
-    provider: &ProviderConfig,
-    provider_index: usize,
-    prompt_mode: PromptMode,
-    prompt: &str,
-    working_dir: Option<&Path>,
-    parent_invocation_env: Option<&str>,
-    resume: ResumePayload<'_>,
-) -> Result<ExecutionResult, String> {
-    execute_resume_optional_prompt(
-        provider,
-        provider_index,
-        prompt_mode,
-        Some(prompt),
-        working_dir,
-        parent_invocation_env,
-        resume,
-    )
-}
-
-pub fn execute_resume_optional_prompt(
-    provider: &ProviderConfig,
-    provider_index: usize,
-    prompt_mode: PromptMode,
-    prompt: Option<&str>,
-    working_dir: Option<&Path>,
-    parent_invocation_env: Option<&str>,
-    resume: ResumePayload<'_>,
-) -> Result<ExecutionResult, String> {
-    execute_resume_with_optional_supervisor_config(
-        provider,
-        provider_index,
-        prompt_mode,
-        prompt,
-        working_dir,
-        parent_invocation_env,
-        resume,
-        None,
-    )
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "resume execution keeps provider, prompt, cwd, parent marker, resume payload, and optional supervisor test injection explicit"
-)]
-fn execute_resume_with_optional_supervisor_config(
-    provider: &ProviderConfig,
-    provider_index: usize,
-    prompt_mode: PromptMode,
-    prompt: Option<&str>,
-    working_dir: Option<&Path>,
-    parent_invocation_env: Option<&str>,
-    resume: ResumePayload<'_>,
-    supervisor_config: Option<SupervisorConfig>,
-) -> Result<ExecutionResult, String> {
-    let session_id = resume.session_id.to_string();
-    let resume_args = compose_resume_args(resume.strategy, resume.session_id)?;
-    let mut provider_without_capture = provider.clone();
-    provider_without_capture.session_capture = None;
-    let (result, temp_files) = execute_provider_with_arg_parts_and_supervisor_config(
-        &provider_without_capture,
-        &provider.args,
-        &resume_args,
-        prompt_mode,
-        prompt,
-        working_dir,
-        &[],
-        parent_invocation_env,
-        None,
-        supervisor_config,
-    )?;
-    cleanup_temp_files(temp_files);
-    let resume_acceptance = classify_resume_acceptance(
-        provider.resume_acceptance.as_ref(),
-        result.exit_code,
-        &result.telemetry_stdout,
-        result.stderr.as_bytes(),
-        &session_id,
-    );
-    Ok(execution_result_from_raw(
-        result,
-        provider_index,
-        Some(resume_acceptance),
-        Some(SessionCaptureResult {
-            session_id: None,
-            method: SessionCaptureMethod::None,
-        }),
-    ))
-}
-
-pub fn execute_interactive(
-    provider: &ProviderConfig,
-    working_dir: Option<&Path>,
-    parent_invocation_env: Option<&str>,
-    resume: Option<ResumePayload<'_>>,
-) -> Result<i32, String> {
-    execute_interactive_with_result(provider, working_dir, parent_invocation_env, resume)
-        .map(|result| result.exit_code)
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct InteractiveExecutionResult {
-    pub exit_code: i32,
-    pub terminal_reason: Option<String>,
-    pub terminal_signal: Option<TerminalSignal>,
-}
-
-pub fn execute_interactive_with_result(
-    provider: &ProviderConfig,
-    working_dir: Option<&Path>,
-    parent_invocation_env: Option<&str>,
-    resume: Option<ResumePayload<'_>>,
-) -> Result<InteractiveExecutionResult, String> {
-    let mut provider_args = validated_interactive_args(provider)?;
-    let mut no_prompt = None;
-    apply_provider_policy(provider, &mut provider_args, &mut no_prompt)?;
-    if let Some(resume) = resume {
-        provider_args = compose_resume_provider_args(provider_args, resume)?;
-    }
-
-    let mut cmd = build_command(
-        provider,
-        &provider_args,
-        working_dir,
-        parent_invocation_env,
-        None,
-    )?;
-    cmd.stdin(Stdio::inherit());
-    cmd.stdout(Stdio::inherit());
-    cmd.stderr(Stdio::inherit());
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed to spawn '{}': {e}", provider.command))?;
-
-    #[cfg(unix)]
-    let signal_guard = terminal_signal::InteractiveSignalGuard::install(&mut child)?;
-
-    let status = child
-        .wait()
-        .map_err(|e| format!("Failed to wait for process: {e}"))?;
-
-    #[cfg(unix)]
-    drop(signal_guard);
-
-    Ok(interactive_result_from_status(provider, &status))
-}
-
-fn validated_interactive_args(provider: &ProviderConfig) -> Result<Vec<String>, String> {
-    provider
-        .interactive_args
-        .clone()
-        .ok_or_else(|| interactive_args_missing_error(provider))
-}
-
-fn interactive_args_missing_error(provider: &ProviderConfig) -> String {
-    format!(
-        "provider {} has no interactive_args; cannot launch interactively",
-        provider.name
-    )
-}
-
-fn interactive_result_from_status(
-    provider: &ProviderConfig,
-    status: &ExitStatus,
-) -> InteractiveExecutionResult {
-    let terminal_reason = classify_terminal_reason(status);
-    let terminal_signal = terminal_signal::recognize_terminal_signal(
-        &provider.name,
-        provider_identity::ProviderRecognizer::for_provider(provider),
-        &[],
-        &[],
-        terminal_signal::terminal_status_from_exit_status(status),
-    );
-    InteractiveExecutionResult {
-        exit_code: terminal_signal::exit_code_from_status(status),
-        terminal_reason,
-        terminal_signal: Some(terminal_signal),
-    }
-}
+use super::TerminalSignal;
+#[cfg(test)]
+use headless::execute_effective_with_supervisor_config;
 
 #[cfg(test)]
 mod tests {
@@ -521,10 +108,16 @@ mod tests {
     //! Public-API tests live in `crates/oulipoly-runtime/tests/`.
 
     use super::*;
+    use crate::executor::cli::supervision::SupervisorConfig;
     use crate::executor::terminal_signal::TerminalSignalKind;
-    use oulipoly_config::{ProviderConfig, SessionCapture, SessionCaptureKind};
+    use crate::executor::{ExecutionResult, SessionCaptureMethod};
+    use oulipoly_config::{
+        ModelConfig, PromptMode, ProviderConfig, SessionCapture, SessionCaptureKind,
+    };
+    use std::collections::HashMap;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
     struct FixtureScript {

@@ -21,9 +21,18 @@ export interface MockConfig {
 	checkSetup?: boolean;
 	pools?: PoolMock[];
 	models?: ModelMock[];
+	providerSettings?: {
+		targets?: unknown[];
+		schema?: unknown;
+		records?: unknown[];
+		record?: unknown;
+		validate?: unknown;
+		migrate?: unknown;
+	};
 	events?: SetupEventMock[];
 	eventDelay?: number;
 	respondFails?: boolean;
+	strictCommands?: boolean;
 	testModelResult?: {
 		success: boolean;
 		stdout: string;
@@ -44,8 +53,28 @@ export interface MockConfig {
 export function buildMockScript(config: MockConfig): string {
 	const poolsJSON = JSON.stringify(config.pools ?? []);
 	const modelsJSON = JSON.stringify(config.models ?? []);
+	const providerSettingsJSON = JSON.stringify(
+		config.providerSettings ?? {
+			targets: [],
+			schema: {
+				schemaId: "example.settings/v1",
+				schema: { type: "object", properties: {} },
+				ui: {},
+			},
+			records: [],
+			record: null,
+			validate: { valid: true, diagnostics: [] },
+			migrate: {
+				actions: [],
+				warnings: [],
+				requiresUserInput: false,
+				diagnostics: [],
+			},
+		},
+	);
 	const eventsJSON = JSON.stringify(config.events ?? []);
 	const eventDelay = config.eventDelay ?? 200;
+	const strictCommands = config.strictCommands ?? false;
 	const testResult = JSON.stringify(
 		config.testModelResult ?? {
 			success: true,
@@ -89,6 +118,17 @@ export function buildMockScript(config: MockConfig): string {
 					if (cmd === 'check_setup_needed') return Promise.resolve(${config.checkSetup ?? false});
 
 					if (cmd === 'list_pools') return Promise.resolve(${poolsJSON});
+					const providerSettings = ${providerSettingsJSON};
+
+					if (cmd === 'list_provider_settings_targets') return Promise.resolve(providerSettings.targets ?? []);
+					if (cmd === 'get_provider_settings_schema') return Promise.resolve(providerSettings.schema);
+					if (cmd === 'list_provider_settings') return Promise.resolve({ records: providerSettings.records ?? [] });
+					if (cmd === 'get_provider_settings') return Promise.resolve({ record: providerSettings.record });
+					if (cmd === 'create_provider_settings') return Promise.resolve({ record: { ...(providerSettings.record ?? {}), values: args?.values, version: 'provider-created-version' }, diagnostics: [] });
+					if (cmd === 'update_provider_settings') return Promise.resolve({ record: { ...(providerSettings.record ?? {}), values: args?.values, version: 'provider-updated-version' }, diagnostics: [] });
+					if (cmd === 'delete_provider_settings') return Promise.resolve({ deleted: true, id: args?.id });
+					if (cmd === 'validate_provider_settings') return Promise.resolve(providerSettings.validate ?? { valid: true, diagnostics: [] });
+					if (cmd === 'migrate_provider_settings') return Promise.resolve(providerSettings.migrate ?? { actions: [], warnings: [], requiresUserInput: false, diagnostics: [] });
 
 					if (cmd === 'list_models') {
 						const models = ${modelsJSON};
@@ -146,7 +186,7 @@ export function buildMockScript(config: MockConfig): string {
 						return Promise.resolve();
 					}
 
-					return Promise.resolve();
+					return ${strictCommands} ? Promise.reject(new Error('Unhandled Tauri mock command: ' + cmd)) : Promise.resolve();
 				},
 				metadata: {
 					currentWindow: { label: 'main' },
@@ -161,7 +201,10 @@ export function buildMockScript(config: MockConfig): string {
 /**
  * Inject the Tauri mock into a Playwright page via addInitScript.
  */
-export async function injectMock(page: Page, config: MockConfig): Promise<void> {
+export async function injectMock(
+	page: Page,
+	config: MockConfig,
+): Promise<void> {
 	await page.addInitScript(buildMockScript(config));
 }
 

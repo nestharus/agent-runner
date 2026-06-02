@@ -72,6 +72,7 @@ pub(super) fn diagnostics_service_request(
 pub(super) fn diagnosis_from_output(output: DiagnosticsServiceOutput) -> Option<Diagnosis> {
     match output {
         DiagnosticsServiceOutput::Diagnosis { diagnosis } => Some(diagnosis),
-        DiagnosticsServiceOutput::ExhaustionClassification { .. } => None,
+        DiagnosticsServiceOutput::ExhaustionClassification { .. }
+        | DiagnosticsServiceOutput::TerminalClassification(_) => None,
     }
 }

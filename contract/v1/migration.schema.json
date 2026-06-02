@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "migration.schema.json",
+  "title": "Oulipoly Provider Migration Contract",
+  "type": "object",
+  "$defs": {
+    "MigrationObject": { "type": "object", "additionalProperties": true },
+    "MigrationPlanRequest": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/RequestEnvelope" },
+        { "type": "object", "properties": { "params": { "$ref": "#/$defs/MigrationObject" } } }
+      ]
+    },
+    "MigrationPlanResult": {
+      "type": "object",
+      "properties": {
+        "actions": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+        "warnings": { "type": "array", "items": true },
+        "requires_backup": { "type": "boolean" },
+        "confirmation": { "type": "object", "additionalProperties": true }
+      },
+      "required": ["actions", "warnings", "requires_backup"],
+      "additionalProperties": false
+    },
+    "MigrationPlanResponse": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/SuccessResponseEnvelope" },
+        { "type": "object", "properties": { "result": { "$ref": "#/$defs/MigrationPlanResult" } } }
+      ]
+    },
+    "MigrationPlanErrorResponse": { "$ref": "common.schema.json#/$defs/ErrorResponseEnvelope" },
+    "MigrationApplyRequest": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/RequestEnvelope" },
+        { "type": "object", "properties": { "params": { "$ref": "#/$defs/MigrationObject" } } }
+      ]
+    },
+    "MigrationApplyResult": {
+      "type": "object",
+      "properties": {
+        "applied_actions": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+        "artifacts": { "type": "array", "items": { "$ref": "common.schema.json#/$defs/Artifact" } },
+        "warnings": { "type": "array", "items": true },
+        "outcome": { "type": "object", "additionalProperties": true }
+      },
+      "required": ["applied_actions", "artifacts", "warnings", "outcome"],
+      "additionalProperties": false
+    },
+    "MigrationApplyResponse": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/SuccessResponseEnvelope" },
+        { "type": "object", "properties": { "result": { "$ref": "#/$defs/MigrationApplyResult" } } }
+      ]
+    },
+    "MigrationApplyErrorResponse": { "$ref": "common.schema.json#/$defs/ErrorResponseEnvelope" }
+  }
+}

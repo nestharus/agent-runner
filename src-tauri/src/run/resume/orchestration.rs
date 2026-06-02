@@ -561,6 +561,7 @@ fn handle_resume_attempt_terminal_signal(
         invocation_row_id: attempt.invocation_row_id,
         guard: &mut attempt.guard,
         provider_name: &provider.name,
+        model: input.resolved.model.as_ref(),
         result,
         working_dir: input.working_dir,
         manual_migrate: input.manual_migrate,

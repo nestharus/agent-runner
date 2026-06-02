@@ -64,8 +64,8 @@ fn repl_helper_region_source() -> &'static str {
     )
 }
 
-fn lib_source() -> &'static str {
-    include_str!("../src/lib.rs")
+fn run_tauri_source() -> &'static str {
+    include_str!("../src/run_tauri.rs")
 }
 
 fn wiring_source() -> &'static str {
@@ -587,28 +587,25 @@ fn age_39_no_port_residuals_remain_direct_and_explicit() {
 
 #[test]
 fn age_39_tauri_ipc_adjacency_preserves_generate_handler_and_service_graph_fields() {
-    let lib = compact(lib_source());
+    let run_tauri_raw = run_tauri_source();
+    let run_tauri = compact(run_tauri_raw);
     let wiring = compact(wiring_source());
 
     assert_contains(
-        &lib,
-        "tauri::generate_handler![",
-        "Tauri command handler registration",
+        &run_tauri,
+        "invoke_handler(tauri::generate_handler![commands::setup_flow::check_setup_needed,commands::setup_flow::start_setup,commands::setup_flow::start_cli_setup,commands::models::reload::reload_models,commands::setup_flow::setup_respond,commands::setup_flow::cancel_setup,commands::setup_flow::detect_clis,commands::setup_flow::get_memory_graph,commands::models::list_models,commands::models::get_model,commands::models::save_model,commands::models::delete_model,commands::pools::list_pools,provider_settings::list_provider_settings_targets,provider_settings::get_provider_settings_schema,provider_settings::list_provider_settings,provider_settings::get_provider_settings,provider_settings::create_provider_settings,provider_settings::update_provider_settings,provider_settings::delete_provider_settings,provider_settings::validate_provider_settings,provider_settings::migrate_provider_settings,commands::quota_refresh::refresh_quotas,commands::pools::update_pool,test_model_command::orchestration::test_model,commands::providers_accounts::list_cli_providers,commands::providers_accounts::get_cli_provider,commands::providers_accounts::list_accounts,commands::providers_accounts::add_account,commands::providers_accounts::remove_account,commands::providers_accounts::sync_provider,commands::discovery::discover_models_cmd,commands::discovery::list_discovered_models,commands::discovery::get_model_parameters,])",
+        "exact ordered Tauri command handler registration",
     );
-    for command in [
-        "check_setup_needed",
-        "start_setup",
-        "list_models",
-        "get_model",
-        "save_model",
-        "delete_model",
-        "list_pools",
-        "refresh_quotas",
-        "update_pool",
-        "test_model",
-    ] {
-        assert_contains(&lib, command, "Tauri command handler registration");
-    }
+    assert_contains(
+        run_tauri_raw,
+        "const RUNTIME_SERVICES_INIT_EXPECT_MESSAGE: &str = \"failed to initialize runtime services\";",
+        "runtime services startup panic message",
+    );
+    assert_contains(
+        run_tauri_raw,
+        "const TAURI_RUN_EXPECT_MESSAGE: &str = \"error while running tauri application\";",
+        "Tauri run panic message",
+    );
 
     for field in [
         "pubrouting_service:Arc<ProductionRoutingService>",

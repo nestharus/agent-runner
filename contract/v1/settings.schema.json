@@ -1,0 +1,246 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "settings.schema.json",
+  "title": "Oulipoly Provider Settings Contract",
+  "type": "object",
+  "$defs": {
+    "SettingsId": { "type": "string", "minLength": 1 },
+    "SettingsVersion": { "type": "string", "minLength": 1 },
+    "SettingsValues": { "type": "object", "additionalProperties": true },
+    "SettingsSummary": { "type": "object", "additionalProperties": true },
+    "SettingsRecordSummary": {
+      "type": "object",
+      "properties": {
+        "id": { "$ref": "#/$defs/SettingsId" },
+        "display_name": { "type": "string", "minLength": 1 },
+        "version": { "$ref": "#/$defs/SettingsVersion" },
+        "summary": { "$ref": "#/$defs/SettingsSummary" }
+      },
+      "required": ["id", "display_name", "version"],
+      "additionalProperties": false
+    },
+    "SettingsRecord": {
+      "type": "object",
+      "properties": {
+        "id": { "$ref": "#/$defs/SettingsId" },
+        "display_name": { "type": "string", "minLength": 1 },
+        "version": { "$ref": "#/$defs/SettingsVersion" },
+        "values": { "$ref": "#/$defs/SettingsValues" }
+      },
+      "required": ["id", "display_name", "version", "values"],
+      "additionalProperties": false
+    },
+    "SettingsListParams": {
+      "type": "object",
+      "additionalProperties": false
+    },
+    "SettingsListRequest": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/RequestEnvelope" },
+        { "type": "object", "properties": { "params": { "$ref": "#/$defs/SettingsListParams" } } }
+      ]
+    },
+    "SettingsListResult": {
+      "type": "object",
+      "properties": {
+        "records": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/SettingsRecordSummary" }
+        }
+      },
+      "required": ["records"],
+      "additionalProperties": false
+    },
+    "SettingsListResponse": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/SuccessResponseEnvelope" },
+        { "type": "object", "properties": { "result": { "$ref": "#/$defs/SettingsListResult" } } }
+      ]
+    },
+    "SettingsListErrorResponse": { "$ref": "common.schema.json#/$defs/ErrorResponseEnvelope" },
+    "SettingsGetParams": {
+      "type": "object",
+      "properties": {
+        "id": { "$ref": "#/$defs/SettingsId" }
+      },
+      "required": ["id"],
+      "additionalProperties": false
+    },
+    "SettingsGetRequest": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/RequestEnvelope" },
+        { "type": "object", "properties": { "params": { "$ref": "#/$defs/SettingsGetParams" } } }
+      ]
+    },
+    "SettingsGetResult": {
+      "type": "object",
+      "properties": {
+        "record": { "$ref": "#/$defs/SettingsRecord" }
+      },
+      "required": ["record"],
+      "additionalProperties": false
+    },
+    "SettingsGetResponse": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/SuccessResponseEnvelope" },
+        { "type": "object", "properties": { "result": { "$ref": "#/$defs/SettingsGetResult" } } }
+      ]
+    },
+    "SettingsGetErrorResponse": { "$ref": "common.schema.json#/$defs/ErrorResponseEnvelope" },
+    "SettingsCreateParams": {
+      "type": "object",
+      "properties": {
+        "display_name": { "type": "string" },
+        "values": { "$ref": "#/$defs/SettingsValues" }
+      },
+      "required": ["values"],
+      "additionalProperties": false
+    },
+    "SettingsCreateRequest": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/RequestEnvelope" },
+        { "type": "object", "properties": { "params": { "$ref": "#/$defs/SettingsCreateParams" } } }
+      ]
+    },
+    "SettingsCreateResult": {
+      "type": "object",
+      "properties": {
+        "record": { "$ref": "#/$defs/SettingsRecord" },
+        "diagnostics": {
+          "type": "array",
+          "items": { "$ref": "common.schema.json#/$defs/Diagnostic" }
+        }
+      },
+      "required": ["record", "diagnostics"],
+      "additionalProperties": false
+    },
+    "SettingsCreateResponse": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/SuccessResponseEnvelope" },
+        { "type": "object", "properties": { "result": { "$ref": "#/$defs/SettingsCreateResult" } } }
+      ]
+    },
+    "SettingsCreateErrorResponse": { "$ref": "common.schema.json#/$defs/ErrorResponseEnvelope" },
+    "SettingsUpdateParams": {
+      "type": "object",
+      "properties": {
+        "id": { "$ref": "#/$defs/SettingsId" },
+        "version": { "$ref": "#/$defs/SettingsVersion" },
+        "values": { "$ref": "#/$defs/SettingsValues" }
+      },
+      "required": ["id", "version", "values"],
+      "additionalProperties": false
+    },
+    "SettingsUpdateRequest": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/RequestEnvelope" },
+        { "type": "object", "properties": { "params": { "$ref": "#/$defs/SettingsUpdateParams" } } }
+      ]
+    },
+    "SettingsUpdateResult": { "$ref": "#/$defs/SettingsCreateResult" },
+    "SettingsUpdateResponse": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/SuccessResponseEnvelope" },
+        { "type": "object", "properties": { "result": { "$ref": "#/$defs/SettingsUpdateResult" } } }
+      ]
+    },
+    "SettingsUpdateErrorResponse": { "$ref": "common.schema.json#/$defs/ErrorResponseEnvelope" },
+    "SettingsDeleteParams": {
+      "type": "object",
+      "properties": {
+        "id": { "$ref": "#/$defs/SettingsId" },
+        "version": { "$ref": "#/$defs/SettingsVersion" }
+      },
+      "required": ["id", "version"],
+      "additionalProperties": false
+    },
+    "SettingsDeleteRequest": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/RequestEnvelope" },
+        { "type": "object", "properties": { "params": { "$ref": "#/$defs/SettingsDeleteParams" } } }
+      ]
+    },
+    "SettingsDeleteResult": {
+      "type": "object",
+      "properties": {
+        "deleted": { "type": "boolean" },
+        "id": { "$ref": "#/$defs/SettingsId" }
+      },
+      "required": ["deleted", "id"],
+      "additionalProperties": false
+    },
+    "SettingsDeleteResponse": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/SuccessResponseEnvelope" },
+        { "type": "object", "properties": { "result": { "$ref": "#/$defs/SettingsDeleteResult" } } }
+      ]
+    },
+    "SettingsDeleteErrorResponse": { "$ref": "common.schema.json#/$defs/ErrorResponseEnvelope" },
+    "SettingsValidateParams": {
+      "type": "object",
+      "properties": {
+        "values": { "$ref": "#/$defs/SettingsValues" }
+      },
+      "required": ["values"],
+      "additionalProperties": false
+    },
+    "SettingsValidateRequest": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/RequestEnvelope" },
+        { "type": "object", "properties": { "params": { "$ref": "#/$defs/SettingsValidateParams" } } }
+      ]
+    },
+    "SettingsValidateResult": {
+      "type": "object",
+      "properties": {
+        "valid": { "type": "boolean" },
+        "diagnostics": {
+          "type": "array",
+          "items": { "$ref": "common.schema.json#/$defs/Diagnostic" }
+        }
+      },
+      "required": ["valid", "diagnostics"],
+      "additionalProperties": false
+    },
+    "SettingsValidateResponse": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/SuccessResponseEnvelope" },
+        { "type": "object", "properties": { "result": { "$ref": "#/$defs/SettingsValidateResult" } } }
+      ]
+    },
+    "SettingsValidateErrorResponse": { "$ref": "common.schema.json#/$defs/ErrorResponseEnvelope" },
+    "SettingsMigrateParams": {
+      "type": "object",
+      "properties": {
+        "dry_run": { "type": "boolean" },
+        "legacy": { "type": "object", "additionalProperties": true }
+      },
+      "required": ["dry_run", "legacy"],
+      "additionalProperties": false
+    },
+    "SettingsMigrateRequest": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/RequestEnvelope" },
+        { "type": "object", "properties": { "params": { "$ref": "#/$defs/SettingsMigrateParams" } } }
+      ]
+    },
+    "SettingsMigrateResult": {
+      "type": "object",
+      "properties": {
+        "actions": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+        "warnings": { "type": "array", "items": true },
+        "requires_user_input": { "type": "boolean" },
+        "diagnostics": { "type": "array", "items": { "$ref": "common.schema.json#/$defs/Diagnostic" } }
+      },
+      "required": ["actions", "warnings", "requires_user_input", "diagnostics"],
+      "additionalProperties": false
+    },
+    "SettingsMigrateResponse": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/SuccessResponseEnvelope" },
+        { "type": "object", "properties": { "result": { "$ref": "#/$defs/SettingsMigrateResult" } } }
+      ]
+    },
+    "SettingsMigrateErrorResponse": { "$ref": "common.schema.json#/$defs/ErrorResponseEnvelope" }
+  }
+}

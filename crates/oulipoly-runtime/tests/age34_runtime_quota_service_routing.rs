@@ -1,8 +1,19 @@
-use oulipoly_config::{ProviderEntry, ProvidersConfig};
+//! ## Declared roles
+//!
+//! `mapper`, `orchestration`, `accessor`, `validator`
+//!
+use oulipoly_config::{
+    ModelConfig, PromptMode, ProviderConfig, ProviderEntry, ProvidersConfig,
+    provider_implementation_ref::ProviderImplementationRef,
+};
+use oulipoly_runtime::provider_registry::{
+    ProviderRegistry, ProviderRegistryHandle, ProviderRegistryOptions,
+};
 use oulipoly_runtime::quota::{self, InFlight, RefreshOutcome};
 use oulipoly_runtime::services::{QuotaServiceOutput, QuotaServicePort, QuotaServiceRequest};
-use oulipoly_state::StateDb;
+use oulipoly_state::{QuotaRecord, QuotaWindow, StateDb};
 use std::path::Path;
+use std::sync::Arc;
 
 fn providers_with_quota_script(script: &str) -> ProvidersConfig {
     providers_with_quota_script_and_refresh(script, None)
@@ -32,6 +43,30 @@ fn providers_without_quota_script() -> ProvidersConfig {
     providers
 }
 
+fn populated_registry_handle() -> ProviderRegistryHandle {
+    let registry = ProviderRegistry::from_model_configs(
+        &[ModelConfig {
+            name: "neutral-quota-model".to_string(),
+            prompt_mode: PromptMode::Arg,
+            providers: vec![ProviderConfig::model_provider(
+                "neutral-quota-provider",
+                Vec::new(),
+            )],
+            inputs: Vec::new(),
+            provider: Some(ProviderImplementationRef {
+                path: Some("/neutral-provider-placeholder".to_string()),
+                crate_name: None,
+                version: None,
+                binary: None,
+                script: None,
+            }),
+        }],
+        ProviderRegistryOptions::default(),
+    )
+    .expect("populated registry");
+    ProviderRegistryHandle::new(Arc::new(registry))
+}
+
 fn assert_updated_window(outcome: RefreshOutcome, expected: f64) {
     match outcome {
         RefreshOutcome::Updated { windows } => {
@@ -43,19 +78,73 @@ fn assert_updated_window(outcome: RefreshOutcome, expected: f64) {
 }
 
 fn assert_persisted_window(state: &StateDb, expected: f64) {
+    let evidence = persisted_window_evidence(state);
+    assert_persisted_window_evidence(evidence, expected);
+}
+
+struct PersistedWindowEvidence {
+    quota: QuotaRecord,
+    windows: Vec<QuotaWindow>,
+}
+
+fn persisted_window_evidence(state: &StateDb) -> PersistedWindowEvidence {
     let quota = state
         .get_quota("quota-provider")
         .expect("get quota")
         .expect("quota row");
-    assert_eq!(quota.provider_name, "quota-provider");
     let windows = state.get_windows("quota-provider").expect("get windows");
-    assert_eq!(windows.len(), 1);
-    assert!((windows[0].used_percent - expected).abs() < 1e-6);
+    PersistedWindowEvidence { quota, windows }
 }
 
-fn direct_and_service_outcomes(
+fn assert_persisted_window_evidence(evidence: PersistedWindowEvidence, expected: f64) {
+    assert_eq!(evidence.quota.provider_name, "quota-provider");
+    assert_eq!(evidence.windows.len(), 1);
+    assert!((evidence.windows[0].used_percent - expected).abs() < 1e-6);
+}
+
+struct DirectAndServiceEvidence {
+    direct: RefreshOutcome,
+    service: RefreshOutcome,
+    service_in_flight: InFlight,
+}
+
+struct PersistedDirectAndServiceEvidence {
+    direct: RefreshOutcome,
+    service: RefreshOutcome,
+    direct_state: StateDb,
+    service_state: StateDb,
+    service_in_flight: InFlight,
+}
+
+struct DirectRunEvidence {
+    outcome: RefreshOutcome,
+    state: StateDb,
+}
+
+struct ServiceRunEvidence {
+    outcome: RefreshOutcome,
+    state: StateDb,
+    in_flight: InFlight,
+}
+
+fn direct_and_service_outcomes(providers: &ProvidersConfig) -> DirectAndServiceEvidence {
+    let evidence = persisted_direct_and_service_outcomes(providers);
+    DirectAndServiceEvidence {
+        direct: evidence.direct,
+        service: evidence.service,
+        service_in_flight: evidence.service_in_flight,
+    }
+}
+
+fn persisted_direct_and_service_outcomes(
     providers: &ProvidersConfig,
-) -> (RefreshOutcome, RefreshOutcome, InFlight) {
+) -> PersistedDirectAndServiceEvidence {
+    let direct = persisted_direct_run(providers);
+    let service = persisted_service_run(providers);
+    persisted_direct_and_service_evidence(direct, service)
+}
+
+fn persisted_direct_run(providers: &ProvidersConfig) -> DirectRunEvidence {
     let direct_state = StateDb::open(Path::new(":memory:")).expect("direct state");
     let direct_in_flight = InFlight::new();
     let direct = quota::refresh_provider(
@@ -64,23 +153,69 @@ fn direct_and_service_outcomes(
         &direct_in_flight,
         &direct_state,
     );
-
-    let service_state = StateDb::open(Path::new(":memory:")).expect("service state");
-    let service_in_flight = InFlight::new();
-    let service: &dyn QuotaServicePort = &quota::RuntimeQuotaService;
-    let QuotaServiceOutput { outcome } = service
-        .refresh_quota(QuotaServiceRequest {
-            provider_name: "quota-provider".to_string(),
-            providers_cfg: providers,
-            in_flight: &service_in_flight,
-            state: &service_state,
-        })
-        .expect("service refresh");
-
-    (direct, outcome, service_in_flight)
+    direct_run_evidence(direct, direct_state)
 }
 
-fn assert_failed_with_same_message(direct: RefreshOutcome, service: RefreshOutcome) {
+fn direct_run_evidence(outcome: RefreshOutcome, state: StateDb) -> DirectRunEvidence {
+    DirectRunEvidence { outcome, state }
+}
+
+fn persisted_service_run(providers: &ProvidersConfig) -> ServiceRunEvidence {
+    let service_state = StateDb::open(Path::new(":memory:")).expect("service state");
+    let service_in_flight = InFlight::new();
+    let quota_service =
+        quota::RuntimeQuotaService::with_registry_handle(populated_registry_handle());
+    let service: &dyn QuotaServicePort = &quota_service;
+    let QuotaServiceOutput { outcome } = service
+        .refresh_quota(quota_service_request(
+            providers,
+            &service_in_flight,
+            &service_state,
+        ))
+        .expect("service refresh");
+    service_run_evidence(outcome, service_state, service_in_flight)
+}
+
+fn service_run_evidence(
+    outcome: RefreshOutcome,
+    state: StateDb,
+    in_flight: InFlight,
+) -> ServiceRunEvidence {
+    ServiceRunEvidence {
+        outcome,
+        state,
+        in_flight,
+    }
+}
+
+fn quota_service_request<'a>(
+    providers: &'a ProvidersConfig,
+    in_flight: &'a InFlight,
+    state: &'a StateDb,
+) -> QuotaServiceRequest<'a> {
+    QuotaServiceRequest {
+        provider_name: "quota-provider".to_string(),
+        providers_cfg: providers,
+        in_flight,
+        state,
+        external_provider: None,
+    }
+}
+
+fn persisted_direct_and_service_evidence(
+    direct: DirectRunEvidence,
+    service: ServiceRunEvidence,
+) -> PersistedDirectAndServiceEvidence {
+    PersistedDirectAndServiceEvidence {
+        direct: direct.outcome,
+        service: service.outcome,
+        direct_state: direct.state,
+        service_state: service.state,
+        service_in_flight: service.in_flight,
+    }
+}
+
+fn assert_failed_outcomes(direct: RefreshOutcome, service: RefreshOutcome) {
     match (direct, service) {
         (RefreshOutcome::Failed(direct), RefreshOutcome::Failed(service)) => {
             assert_eq!(service, direct);
@@ -89,6 +224,81 @@ fn assert_failed_with_same_message(direct: RefreshOutcome, service: RefreshOutco
             panic!("expected matching Failed outcomes, got {direct:?}/{service:?}")
         }
     }
+}
+
+fn assert_no_script_outcomes(evidence: &DirectAndServiceEvidence) {
+    assert!(matches!(evidence.direct, RefreshOutcome::NoScript));
+    assert!(matches!(evidence.service, RefreshOutcome::NoScript));
+}
+
+fn assert_service_in_flight_released(in_flight: &InFlight, message: &str) {
+    assert!(in_flight.try_claim("quota-provider").is_some(), "{message}");
+}
+
+fn assert_persisted_success_evidence(evidence: PersistedDirectAndServiceEvidence, expected: f64) {
+    assert_updated_window(evidence.direct, expected);
+    assert_updated_window(evidence.service, expected);
+    assert_persisted_window(&evidence.direct_state, expected);
+    assert_persisted_window(&evidence.service_state, expected);
+    assert_service_in_flight_released(
+        &evidence.service_in_flight,
+        "service adapter must not hold the in-flight guard after refresh",
+    );
+}
+
+struct PreclaimedInFlightEvidence {
+    outcome: RefreshOutcome,
+    in_flight: InFlight,
+}
+
+fn preclaimed_in_flight_outcome(providers: &ProvidersConfig) -> PreclaimedInFlightEvidence {
+    let state = StateDb::open(Path::new(":memory:")).expect("state");
+    let in_flight = InFlight::new();
+    let guard = in_flight
+        .try_claim("quota-provider")
+        .expect("pre-claim provider");
+    let outcome = preclaimed_service_outcome(providers, &in_flight, &state);
+    drop(guard);
+    preclaimed_in_flight_evidence(outcome, in_flight)
+}
+
+fn preclaimed_service_outcome(
+    providers: &ProvidersConfig,
+    in_flight: &InFlight,
+    state: &StateDb,
+) -> RefreshOutcome {
+    let quota_service =
+        quota::RuntimeQuotaService::with_registry_handle(populated_registry_handle());
+    let service: &dyn QuotaServicePort = &quota_service;
+    let QuotaServiceOutput { outcome } = service
+        .refresh_quota(quota_service_request(providers, in_flight, state))
+        .expect("service refresh");
+    outcome
+}
+
+fn preclaimed_in_flight_evidence(
+    outcome: RefreshOutcome,
+    in_flight: InFlight,
+) -> PreclaimedInFlightEvidence {
+    PreclaimedInFlightEvidence { outcome, in_flight }
+}
+
+fn assert_preclaimed_in_flight_evidence(evidence: PreclaimedInFlightEvidence) {
+    assert!(matches!(evidence.outcome, RefreshOutcome::AlreadyInFlight));
+    assert_service_in_flight_released(
+        &evidence.in_flight,
+        "caller-owned guard release must remain visible after service call",
+    );
+}
+
+fn assert_failure_and_guard_release(evidence: DirectAndServiceEvidence, message: &str) {
+    let DirectAndServiceEvidence {
+        direct,
+        service,
+        service_in_flight,
+    } = evidence;
+    assert_failed_outcomes(direct, service);
+    assert_service_in_flight_released(&service_in_flight, message);
 }
 
 // Risk: R-A5 / proposal T12 - quota service routing must borrow caller-owned
@@ -102,36 +312,8 @@ fn runtime_quota_service_matches_direct_refresh_provider_and_persists_windows() 
     let script =
         "echo '{\"windows\":[{\"used_percent\":42,\"resets_at\":\"2099-01-01T00:00:00Z\"}]}'";
     let providers = providers_with_quota_script(script);
-
-    let direct_state = StateDb::open(Path::new(":memory:")).expect("direct state");
-    let direct_in_flight = InFlight::new();
-    let direct = quota::refresh_provider(
-        "quota-provider",
-        &providers,
-        &direct_in_flight,
-        &direct_state,
-    );
-
-    let service_state = StateDb::open(Path::new(":memory:")).expect("service state");
-    let service_in_flight = InFlight::new();
-    let service: &dyn QuotaServicePort = &quota::RuntimeQuotaService;
-    let QuotaServiceOutput { outcome } = service
-        .refresh_quota(QuotaServiceRequest {
-            provider_name: "quota-provider".to_string(),
-            providers_cfg: &providers,
-            in_flight: &service_in_flight,
-            state: &service_state,
-        })
-        .expect("service refresh");
-
-    assert_updated_window(direct, 0.42);
-    assert_updated_window(outcome, 0.42);
-    assert_persisted_window(&direct_state, 0.42);
-    assert_persisted_window(&service_state, 0.42);
-    assert!(
-        service_in_flight.try_claim("quota-provider").is_some(),
-        "service adapter must not hold the in-flight guard after refresh"
-    );
+    let evidence = persisted_direct_and_service_outcomes(&providers);
+    assert_persisted_success_evidence(evidence, 0.42);
 }
 
 // Risk: R-A5 / proposal T12 - quota service routing must preserve the
@@ -144,28 +326,8 @@ fn runtime_quota_service_preserves_caller_owned_in_flight_already_claimed_state(
     let providers = providers_with_quota_script(
         "echo '{\"windows\":[{\"used_percent\":1,\"resets_at\":\"2099-01-01T00:00:00Z\"}]}'",
     );
-    let state = StateDb::open(Path::new(":memory:")).expect("state");
-    let in_flight = InFlight::new();
-    let guard = in_flight
-        .try_claim("quota-provider")
-        .expect("pre-claim provider");
-
-    let service: &dyn QuotaServicePort = &quota::RuntimeQuotaService;
-    let QuotaServiceOutput { outcome } = service
-        .refresh_quota(QuotaServiceRequest {
-            provider_name: "quota-provider".to_string(),
-            providers_cfg: &providers,
-            in_flight: &in_flight,
-            state: &state,
-        })
-        .expect("service refresh");
-
-    assert!(matches!(outcome, RefreshOutcome::AlreadyInFlight));
-    drop(guard);
-    assert!(
-        in_flight.try_claim("quota-provider").is_some(),
-        "caller-owned guard release must remain visible after service call"
-    );
+    let evidence = preclaimed_in_flight_outcome(&providers);
+    assert_preclaimed_in_flight_evidence(evidence);
 }
 
 // Risk: R-A5 / proposal T12 - quota service routing must preserve the direct
@@ -175,13 +337,11 @@ fn runtime_quota_service_preserves_caller_owned_in_flight_already_claimed_state(
 #[test]
 fn runtime_quota_service_no_script_matches_direct_refresh_provider() {
     let providers = providers_without_quota_script();
-    let (direct, service, service_in_flight) = direct_and_service_outcomes(&providers);
-
-    assert!(matches!(direct, RefreshOutcome::NoScript));
-    assert!(matches!(service, RefreshOutcome::NoScript));
-    assert!(
-        service_in_flight.try_claim("quota-provider").is_some(),
-        "NoScript path must not retain an in-flight guard"
+    let evidence = direct_and_service_outcomes(&providers);
+    assert_no_script_outcomes(&evidence);
+    assert_service_in_flight_released(
+        &evidence.service_in_flight,
+        "NoScript path must not retain an in-flight guard",
     );
 }
 
@@ -195,12 +355,10 @@ fn runtime_quota_service_failed_retry_matches_direct_refresh_provider() {
         "echo 'quota unavailable' >&2; exit 7",
         Some("true"),
     );
-    let (direct, service, service_in_flight) = direct_and_service_outcomes(&providers);
-
-    assert_failed_with_same_message(direct, service);
-    assert!(
-        service_in_flight.try_claim("quota-provider").is_some(),
-        "Failed retry path must release the service in-flight guard"
+    let evidence = direct_and_service_outcomes(&providers);
+    assert_failure_and_guard_release(
+        evidence,
+        "Failed retry path must release the service in-flight guard",
     );
 }
 
@@ -211,12 +369,10 @@ fn runtime_quota_service_failed_retry_matches_direct_refresh_provider() {
 #[test]
 fn runtime_quota_service_invalid_json_matches_direct_refresh_provider() {
     let providers = providers_with_quota_script("echo 'not-json'");
-    let (direct, service, service_in_flight) = direct_and_service_outcomes(&providers);
-
-    assert_failed_with_same_message(direct, service);
-    assert!(
-        service_in_flight.try_claim("quota-provider").is_some(),
-        "Invalid JSON path must release the service in-flight guard"
+    let evidence = direct_and_service_outcomes(&providers);
+    assert_failure_and_guard_release(
+        evidence,
+        "Invalid JSON path must release the service in-flight guard",
     );
 }
 
@@ -229,12 +385,10 @@ fn runtime_quota_service_bad_resets_at_matches_direct_refresh_provider() {
     let providers = providers_with_quota_script(
         "echo '{\"windows\":[{\"used_percent\":42,\"resets_at\":\"not-a-date\"}]}'",
     );
-    let (direct, service, service_in_flight) = direct_and_service_outcomes(&providers);
-
-    assert_failed_with_same_message(direct, service);
-    assert!(
-        service_in_flight.try_claim("quota-provider").is_some(),
-        "Bad resets_at path must release the service in-flight guard"
+    let evidence = direct_and_service_outcomes(&providers);
+    assert_failure_and_guard_release(
+        evidence,
+        "Bad resets_at path must release the service in-flight guard",
     );
 }
 
@@ -247,11 +401,9 @@ fn runtime_quota_service_used_percent_validation_matches_direct_refresh_provider
     let providers = providers_with_quota_script(
         "echo '{\"windows\":[{\"used_percent\":150,\"resets_at\":\"2099-01-01T00:00:00Z\"}]}'",
     );
-    let (direct, service, service_in_flight) = direct_and_service_outcomes(&providers);
-
-    assert_failed_with_same_message(direct, service);
-    assert!(
-        service_in_flight.try_claim("quota-provider").is_some(),
-        "Validation-failure path must release the service in-flight guard"
+    let evidence = direct_and_service_outcomes(&providers);
+    assert_failure_and_guard_release(
+        evidence,
+        "Validation-failure path must release the service in-flight guard",
     );
 }

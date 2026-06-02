@@ -1,0 +1,664 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "common.schema.json",
+  "title": "Oulipoly Provider Contract Common Types",
+  "type": "object",
+  "$defs": {
+    "ContractVersion": {
+      "type": "string",
+      "const": "oulipoly.provider/v1"
+    },
+    "RequestId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "ProviderInstanceId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "UnixMilliseconds": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "JsonObject": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "JsonValue": true,
+    "StringMap": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "HostContext": {
+      "type": "object",
+      "properties": {
+        "app": {
+          "type": "string",
+          "minLength": 1
+        },
+        "app_version": {
+          "type": "string"
+        },
+        "platform": {
+          "type": "string"
+        },
+        "working_directory": {
+          "type": "string"
+        },
+        "config_root": {
+          "type": "string"
+        },
+        "data_root": {
+          "type": "string"
+        },
+        "env": {
+          "$ref": "#/$defs/StringMap"
+        },
+        "deadline_unix_ms": {
+          "$ref": "#/$defs/UnixMilliseconds"
+        }
+      },
+      "required": [
+        "app"
+      ],
+      "additionalProperties": false
+    },
+    "ArtifactRef": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "path"
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "kind",
+            "path"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "binary"
+            },
+            "binary": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "kind",
+            "binary"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "script"
+            },
+            "script": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "kind",
+            "script"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "RequestEnvelope": {
+      "type": "object",
+      "properties": {
+        "contract": {
+          "$ref": "#/$defs/ContractVersion"
+        },
+        "request_id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "provider_instance_id": {
+          "$ref": "#/$defs/ProviderInstanceId"
+        },
+        "host": {
+          "$ref": "#/$defs/HostContext"
+        },
+        "params": true
+      },
+      "required": [
+        "contract",
+        "request_id",
+        "host",
+        "params"
+      ],
+      "additionalProperties": false
+    },
+    "SuccessResponseEnvelope": {
+      "type": "object",
+      "properties": {
+        "contract": {
+          "$ref": "#/$defs/ContractVersion"
+        },
+        "request_id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "ok": {
+          "const": true
+        },
+        "result": true
+      },
+      "required": [
+        "contract",
+        "request_id",
+        "ok",
+        "result"
+      ],
+      "additionalProperties": false
+    },
+    "ErrorCategory": {
+      "type": "string",
+      "enum": [
+        "unsupported",
+        "invalid_request",
+        "invalid_settings",
+        "unavailable",
+        "timeout",
+        "conflict",
+        "failed"
+      ]
+    },
+    "ErrorObject": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string",
+          "minLength": 1
+        },
+        "category": {
+          "$ref": "#/$defs/ErrorCategory"
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "details": {
+          "$ref": "#/$defs/JsonObject"
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Diagnostic" }
+        }
+      },
+      "required": [
+        "code",
+        "category",
+        "message",
+        "retryable"
+      ],
+      "additionalProperties": false
+    },
+    "ErrorResponseEnvelope": {
+      "type": "object",
+      "properties": {
+        "contract": {
+          "$ref": "#/$defs/ContractVersion"
+        },
+        "request_id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "ok": {
+          "const": false
+        },
+        "error": {
+          "$ref": "#/$defs/ErrorObject"
+        },
+        "process_status": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "contract",
+        "request_id",
+        "ok",
+        "error"
+      ],
+      "additionalProperties": false
+    },
+    "DiagnosticSeverity": {
+      "type": "string",
+      "enum": [
+        "info",
+        "warning",
+        "error"
+      ]
+    },
+    "Diagnostic": {
+      "type": "object",
+      "properties": {
+        "severity": {
+          "$ref": "#/$defs/DiagnosticSeverity"
+        },
+        "path": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
+        },
+        "code": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "severity",
+        "message"
+      ],
+      "additionalProperties": false
+    },
+    "Marker": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "value": true
+      },
+      "required": [
+        "name",
+        "value"
+      ],
+      "additionalProperties": false
+    },
+    "Artifact": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "minLength": 1
+        },
+        "path": {
+          "type": "string"
+        },
+        "uri": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "additionalProperties": false
+    },
+    "BytePayload": {
+      "type": "object",
+      "properties": {
+        "encoding": {
+          "type": "string",
+          "enum": [
+            "base64",
+            "utf8"
+          ]
+        },
+        "data": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "encoding",
+        "data"
+      ],
+      "additionalProperties": false
+    },
+    "ProcessStatus": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "exited"
+            },
+            "code": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "code"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "signal_terminated"
+            },
+            "signal": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "signal"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "spawn_error"
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "kind",
+            "reason"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "prolonged_silence"
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "kind",
+            "reason"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "cancelled"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "unknown"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "TerminalSignalKind": {
+      "type": "string",
+      "enum": [
+        "clean_exit",
+        "nonzero_exit",
+        "signal_exit",
+        "spawn_error",
+        "quota_exhausted_inband",
+        "maybe_quota_exhausted",
+        "rate_limited",
+        "prolonged_silence",
+        "cancelled",
+        "unknown"
+      ]
+    },
+    "TerminalSignal": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/TerminalSignalKind"
+        },
+        "evidence": {
+          "type": "string"
+        },
+        "observed_at_unix_ms": {
+          "$ref": "#/$defs/UnixMilliseconds"
+        }
+      },
+      "required": [
+        "kind",
+        "observed_at_unix_ms"
+      ],
+      "additionalProperties": false
+    },
+    "Timeout": {
+      "type": "object",
+      "properties": {
+        "deadline_unix_ms": {
+          "$ref": "#/$defs/UnixMilliseconds"
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "Cancellation": {
+      "type": "object",
+      "properties": {
+        "requested": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "requested"
+      ],
+      "additionalProperties": false
+    },
+    "FieldDescriptor": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "string",
+            "integer",
+            "number",
+            "boolean",
+            "enum",
+            "array",
+            "object"
+          ]
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "description": {
+          "type": "string"
+        },
+        "default": true,
+        "minimum": {
+          "type": "number"
+        },
+        "maximum": {
+          "type": "number"
+        },
+        "options": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "item_type": {
+          "type": "string"
+        },
+        "flag": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "type"
+      ],
+      "additionalProperties": false
+    },
+    "ModelInput": {
+      "type": "object",
+      "properties": {
+        "prompt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "named": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "required": [
+        "named"
+      ],
+      "additionalProperties": false
+    },
+    "ProviderModelRequest": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "provider_args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "inputs": {
+          "$ref": "#/$defs/ModelInput"
+        }
+      },
+      "required": [
+        "name",
+        "provider_args",
+        "inputs"
+      ],
+      "additionalProperties": false
+    },
+    "TranscriptHint": {
+      "type": "object",
+      "properties": {
+        "format_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "path": {
+          "type": "string"
+        },
+        "fields": {
+          "$ref": "#/$defs/JsonObject"
+        }
+      },
+      "required": [
+        "format_id"
+      ],
+      "additionalProperties": false
+    },
+    "TranscriptSource": {
+      "type": "object",
+      "properties": {
+        "source_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "format_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "fields": {
+          "$ref": "#/$defs/JsonObject"
+        }
+      },
+      "required": [
+        "source_id",
+        "format_id"
+      ],
+      "additionalProperties": false
+    },
+    "CanonicalTranscriptSource": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "path"
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "kind",
+            "path"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "bytes"
+            },
+            "data_base64": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "data_base64"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    }
+  }
+}

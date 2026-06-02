@@ -1,5 +1,60 @@
 # Project Decisions
 
+## D-AGE-240-phase-4-manager-disposition — revise proposal carriers and rerun coupling only
+
+- **Source**: Phase 4 manager gate for AGE-240, question `/home/nes/projects/agent-runner/planning/age-240-lib-l6/scratch/questions/q-6f6e7bd3-1948-455f-9847-48cfb46c7d0a.question.json`.
+- **Decision**: Treat the initial coupling-auditor HIGH as proposal-precision only, not a code defect and not an override. Revise the Phase 3 proposal to add concrete `## Adapter declarations`, `## Intrinsic-surface declarations`, and a per-target external test ownership map, then rerun only coupling directly at top level.
+- **Scope constraints**: Keep `reload_models` out of `commands/models/orchestration.rs`; place it in a dedicated owner such as `commands/models/reload.rs` with <=5 adapter contracts. Keep the diagnostics-fallback island narrow so validator/quota/state sequencing stays in test-model orchestration. Preserve the diagnostic-input duplicate exactly.
+- **Evidence**: proposal revision dispatch `b5a42690-0781-4cee-8343-77559f64cc9a`; coupling rerun dispatch `1313e078-2585-4a37-9df6-f10da8c59983`; LOW report `/home/nes/projects/agent-runner/planning/age-240-lib-l6/code-quality/age-240-phase-4/reports/rerun-coupling-auditor.md`; join manifest `/home/nes/projects/agent-runner/planning/age-240-lib-l6/risk/phase-4-join-manifest.json`.
+- **Revisit when**: Phase 6 implementation diverges from the revised proposal carrier map or produces any real non-LOW in L6-owned code.
+
+## D-AGE-240-phase-2-5-manager-disposition — proceed exhaustive and preserve diagnostic-input duplicate
+
+- **Source**: Phase 2.5 manager gate for AGE-240, question `/home/nes/projects/agent-runner/planning/age-240-lib-l6/scratch/questions/q-ed761f8f-a1db-440a-b72f-6a3aa49439fb.question.json`.
+- **Decision**: Proceed to Phase 3 in exhaustive, strictly output-preserving mode. Approve the Phase 2.5 problem map and HIGH risk profile. Accept the Linear numeric `story_point_estimate=8` as a manager-set cold-start baseline with `estimate_source` disposition `manager-set-coldstart`; Phase 3 must refine from the approved problem map.
+- **Duplicate disposition**: Preserve the `test_model` diagnostic-input duplicate exactly. Do not consolidate it with `redaction::diagnostic_input` inside AGE-240. If consolidation is worth doing, file a linked follow-up tracker under AGE-240; L6 isolates and converges but does not consolidate duplicate behavior.
+- **Risk disposition**: 0/5 defer-to-prototype signals fired; no prototype. No blocking-ticket discoveries were found.
+- **Evidence**: `/home/nes/projects/agent-runner/planning/age-240-lib-l6/research/age-240-problem-map.md`; `/home/nes/projects/agent-runner/planning/age-240-lib-l6/risk/age-240-risk-profile.md`; `/home/nes/projects/agent-runner/planning/age-240-lib-l6/scratch/phase25/age-240-characterization-tests.md`.
+- **Revisit when**: never for AGE-240; a separate follow-up tracker may evaluate diagnostic-input consolidation after L6 completes.
+
+## D-AGE-236-D8-spec-tauri-client-same-diff — quota-refresh spec registration ratified
+
+- **Source**: AGE-236 L4 Phase 7/8 D-8 same-diff ratification for `planning/coverage/spec-tauri-client.md`.
+- **Decision**: PASS. The spec diff is the same behavioral concern as the AGE-236 implementation: moving GUI quota-refresh IPC handling out of `lib.rs` into `commands/quota_refresh/*` while preserving the existing output contract.
+- **Sub-checks**:
+  - Source-file registration PASS: the five new quota-refresh module files are listed under `## Source files`.
+  - Behavior registration PASS: the input/output matrix names the quota-refresh command behavior at the same abstraction level as the Tauri client spec.
+  - Edge/error registration PASS: the spec captures fresh-cache short-circuit, in-flight DTO status `"in_flight"`, and state DB open error `Failed to open state DB: {e}`.
+  - Test registration PASS: `src-tauri/tests/age236_quota_refresh_extraction.rs` is listed in declared test patterns.
+  - Drift preservation PASS: AGE-237 remains owner of usage-CLI/quota-refresh outcome consolidation; the spec explicitly records that AGE-236 does not normalize or repair that drift.
+- **Evidence**: `planning/coverage/spec-tauri-client.md`; `src-tauri/src/commands/quota_refresh/*`; `src-tauri/tests/age236_quota_refresh_extraction.rs`; Phase 6 join manifest `/home/nes/projects/agent-runner/planning/age-236-lib-l4/risk/phase-6-join-manifest.json`.
+- **Revisit when**: AGE-237 changes the usage/quota outcome contract or a future Tauri client spec update broadens quota-refresh behavior beyond current GUI output preservation.
+
+## D-AGE-236-phase-2-5-manager-disposition — proceed exhaustive without estimate provenance
+
+- **Source**: Phase 2.5 manager gate for AGE-236, question `/home/nes/projects/agent-runner/planning/age-236-lib-l4/scratch/questions/q-bdd0c737-a4a6-4a80-8444-23d7f0b33763.question.json`.
+- **Decision**: Proceed to Phase 3 in exhaustive, strictly output-preserving mode. Accept the unsourced Linear `story_point_estimate=5` as a manager-set cold-start baseline with `manager_estimate_source_disposition: manager-set-coldstart`; Phase 3 will refine from the approved problem map and HIGH risk profile.
+- **Risk disposition**: Approve the Phase 2.5 problem map and HIGH risk profile. Defer-to-prototype is not taken because only one defer signal fired.
+- **AGE-237 drift disposition**: Proceed with note. AGE-237 tracks adjacent `usage_cli_quota_refresh_outcome_state_machine` drift and owns the broader consolidation question. AGE-236 must preserve current GUI quota-refresh behavior and current usage-CLI outcome behavior exactly; it must not unify, normalize, or repair the drift.
+- **Evidence**: `/home/nes/projects/agent-runner/planning/age-236-lib-l4/research/age-236-problem-map.md`; `/home/nes/projects/agent-runner/planning/age-236-lib-l4/risk/age-236-risk-profile.md`; `/home/nes/projects/agent-runner/planning/age-236-lib-l4/risk/age-236-age-237-drift-disposition.md`.
+- **Revisit when**: AGE-237 is scheduled or AGE-236 implementation requires behavior changes, which would violate this disposition and require manager input.
+
+## D-AGE-225-cold-start-estimate — proceed without baseline estimate
+
+- **Source**: Phase 2.5 inherited-estimate cold-start gate on AGE-225. Linear ticket read returned `story_point_estimate: null` and `estimate_source: missing`.
+- **Decision**: Proceed without a baseline estimate. Phase 3 will produce the refined estimate from the approved problem map and HIGH risk profile.
+- **Rationale**: Manager answered the Phase 2.5 gate with "Proceed exhaustive" and explicitly accepted the missing estimate. AGE-225 is an output-preserving final balancer decomposition slice with concrete B4 scope and focused characterization tests already added for the uncovered migration/working-set behaviors.
+- **Evidence**: `/home/nes/projects/agent-runner/planning/age-225-balancer-b4/scratch/questions/q-age-225-phase-2-5-manager-gate.question.json`; `/home/nes/projects/agent-runner/planning/age-225-balancer-b4/risk/age-225-risk-profile.md`; `/home/nes/projects/agent-runner/planning/age-225-balancer-b4/scratch/phase25/age-225-characterization-tests.md`.
+- **Revisit when**: never for this WU; refined estimate is captured in Phase 3 and actual estimate in closure.
+
+## D-AGE-224-cold-start-estimate — proceed without baseline estimate
+
+- **Source**: Phase 2.5 inherited-estimate cold-start gate on AGE-224. Linear ticket read returned `story_point_estimate: null` and `estimate_source: missing`.
+- **Decision**: Proceed without a baseline estimate. Phase 3 will produce the refined estimate from the approved problem map and HIGH risk profile.
+- **Rationale**: Manager answered the Phase 2.5 gate with "Proceed exhaustive" and explicitly accepted the missing estimate. AGE-224 is an output-preserving decomposition slice with concrete B3 scope from the core-file decomposition plan and focused characterization tests already added for the uncovered scoring behaviors.
+- **Evidence**: `/home/nes/projects/agent-runner/planning/age-224-balancer-b3/scratch/questions/q-age-224-phase-2-5-manager-gate.question.json`; `/home/nes/projects/agent-runner/planning/age-224-balancer-b3/risk/age-224-risk-profile.md`; `/home/nes/projects/agent-runner/planning/age-224-balancer-b3/scratch/phase25/age-224-characterization-tests.md`.
+- **Revisit when**: never for this WU; refined estimate is captured in Phase 3 and actual estimate in closure.
+
 Out-of-scope choices recorded explicitly so they are not "deferrals" — these
 are decisions that were considered, evaluated, and **declined** for the
 indicated version. Each entry names the originating finding, the chosen

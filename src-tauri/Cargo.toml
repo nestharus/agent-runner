@@ -18,6 +18,7 @@ clap.workspace = true
 dirs.workspace = true
 oulipoly-config = { path = "../crates/oulipoly-config" }
 oulipoly-core = { path = "../crates/oulipoly-core" }
+oulipoly-provider = { path = "../crates/oulipoly-provider" }
 oulipoly-runtime = { path = "../crates/oulipoly-runtime" }
 oulipoly-setup = { path = "../crates/oulipoly-setup" }
 oulipoly-state = { path = "../crates/oulipoly-state" }

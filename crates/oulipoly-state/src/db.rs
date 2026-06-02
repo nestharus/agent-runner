@@ -226,6 +226,27 @@ pub struct QuotaRecord {
     pub failure_class: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveChainSegmentSnapshot {
+    pub chain_id: String,
+    pub active_provider: String,
+    pub active_session_id: String,
+    pub active_started_at: String,
+    pub active_ended_at: Option<String>,
+    pub active_last_turn_id: Option<String>,
+    pub latest_turn_at: Option<String>,
+}
+
+pub struct ChainSegmentRotationInput<'a> {
+    pub chain_id: &'a str,
+    pub source_provider_name: &'a str,
+    pub source_session_id: &'a str,
+    pub target_provider_name: &'a str,
+    pub target_session_id: &'a str,
+    pub changed_at: &'a DateTime<Utc>,
+    pub reason: TransitionReason,
+}
+
 /// One rolling-quota window reported by a provider's quota script.
 /// `window_id` is a stable per-provider position index (window 0, 1, …)
 /// so the same window survives across refreshes for delta-learning.
@@ -5104,6 +5125,44 @@ impl StateDb {
         Ok(())
     }
 
+    /// Test-only: make a cached quota row unreadable through the public
+    /// `get_quota` API by writing a storage value that production parsing
+    /// rejects.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn force_unreadable_cached_quota_for_test(
+        &self,
+        provider_name: &str,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE provider_quotas
+                 SET topology_peak_live_window_count = -1
+                 WHERE provider_name = ?1",
+                sqlite::params![provider_name],
+            )
+            .map_err(|e| format!("Failed to force unreadable cached quota: {e}"))?;
+        Ok(())
+    }
+
+    /// Test-only: make cached window rows unreadable through the public
+    /// `get_windows` API by writing a timestamp value that strict window
+    /// parsing rejects.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn force_unreadable_cached_windows_for_test(
+        &self,
+        provider_name: &str,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE provider_quota_windows
+                 SET resets_at = 'not-rfc3339'
+                 WHERE provider_name = ?1",
+                sqlite::params![provider_name],
+            )
+            .map_err(|e| format!("Failed to force unreadable cached windows: {e}"))?;
+        Ok(())
+    }
+
     /// Bump `calls_since_refresh` for a provider. Creates the row with 1 call
     /// and zeroed quota if the provider isn't tracked yet.
     pub fn increment_calls_since_refresh(&self, provider_name: &str) -> Result<(), String> {
@@ -5869,6 +5928,83 @@ impl StateDb {
         Self::read_open_chain_segment_id(&self.conn, chain_id, provider_name, session_id)
     }
 
+    pub fn rotate_chain_segment_transactionally(
+        &self,
+        input: ChainSegmentRotationInput<'_>,
+    ) -> Result<(i64, i64), DbError> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("Failed to begin session chain rotation transaction: {e}"))?;
+        let closed_id = Self::close_expected_active_segment_returning_on(
+            &tx,
+            input.chain_id,
+            input.source_provider_name,
+            input.source_session_id,
+            input.changed_at,
+        )?
+        .ok_or_else(|| "validated source segment was no longer active".to_string())?;
+        Self::upsert_open_chain_segment(
+            &tx,
+            input.chain_id,
+            input.target_provider_name,
+            input.target_session_id,
+            &input.changed_at.to_rfc3339(),
+            input.reason,
+        )?;
+        let opened_id = Self::read_open_chain_segment_id(
+            &tx,
+            input.chain_id,
+            input.target_provider_name,
+            input.target_session_id,
+        )?;
+        tx.commit()
+            .map_err(|e| format!("Failed to commit session chain rotation transaction: {e}"))?;
+        Ok((closed_id, opened_id))
+    }
+
+    pub fn active_chain_segment_snapshot(
+        &self,
+        chain_id: &str,
+    ) -> Result<Option<ActiveChainSegmentSnapshot>, DbError> {
+        self.conn
+            .query_row(
+                "SELECT sc.chain_id,
+                        s.provider_name,
+                        s.session_id,
+                        s.started_at,
+                        s.ended_at,
+                        s.last_turn_id,
+                        (
+                            SELECT st.timestamp
+                            FROM session_turns st
+                            WHERE st.provider_name = s.provider_name
+                              AND st.session_id = s.session_id
+                            ORDER BY st.timestamp DESC, st.id DESC
+                            LIMIT 1
+                        )
+                 FROM session_chains sc
+                 JOIN session_chain_segments s ON s.chain_id = sc.chain_id
+                 WHERE sc.chain_id = ?1 AND s.ended_at IS NULL
+                 ORDER BY s.started_at DESC, s.id DESC
+                 LIMIT 1",
+                params![chain_id],
+                |row| {
+                    Ok(ActiveChainSegmentSnapshot {
+                        chain_id: row.get(0)?,
+                        active_provider: row.get(1)?,
+                        active_session_id: row.get(2)?,
+                        active_started_at: row.get(3)?,
+                        active_ended_at: row.get(4)?,
+                        active_last_turn_id: row.get(5)?,
+                        latest_turn_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| format!("Failed to read active chain segment snapshot: {e}"))
+    }
+
     fn upsert_open_chain_segment(
         conn: &sqlite::Connection,
         chain_id: &str,
@@ -6018,25 +6154,61 @@ impl StateDb {
         chain_id: &str,
         ended_at: &DateTime<Utc>,
     ) -> Result<Option<i64>, DbError> {
-        self.conn
-            .query_row(
-                "UPDATE session_chain_segments
-                 SET ended_at = ?2,
-                     last_turn_id = (
-                        SELECT st.turn_id
-                        FROM session_turns st
-                        WHERE st.provider_name = session_chain_segments.provider_name
-                          AND st.session_id = session_chain_segments.session_id
-                        ORDER BY st.timestamp DESC, st.id DESC
-                        LIMIT 1
-                     )
-                 WHERE chain_id = ?1 AND ended_at IS NULL
-                 RETURNING id",
-                sqlite::params![chain_id, ended_at.to_rfc3339()],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| format!("Failed to close active session chain segment: {e}"))
+        Self::close_active_segment_returning_on(&self.conn, chain_id, ended_at)
+    }
+
+    fn close_active_segment_returning_on(
+        conn: &sqlite::Connection,
+        chain_id: &str,
+        ended_at: &DateTime<Utc>,
+    ) -> Result<Option<i64>, DbError> {
+        Self::close_matching_active_segment_returning_on(conn, chain_id, None, None, ended_at)
+    }
+
+    fn close_expected_active_segment_returning_on(
+        conn: &sqlite::Connection,
+        chain_id: &str,
+        provider_name: &str,
+        session_id: &str,
+        ended_at: &DateTime<Utc>,
+    ) -> Result<Option<i64>, DbError> {
+        Self::close_matching_active_segment_returning_on(
+            conn,
+            chain_id,
+            Some(provider_name),
+            Some(session_id),
+            ended_at,
+        )
+    }
+
+    fn close_matching_active_segment_returning_on(
+        conn: &sqlite::Connection,
+        chain_id: &str,
+        provider_name: Option<&str>,
+        session_id: Option<&str>,
+        ended_at: &DateTime<Utc>,
+    ) -> Result<Option<i64>, DbError> {
+        conn.query_row(
+            "UPDATE session_chain_segments
+             SET ended_at = ?2,
+                 last_turn_id = (
+                    SELECT st.turn_id
+                    FROM session_turns st
+                    WHERE st.provider_name = session_chain_segments.provider_name
+                      AND st.session_id = session_chain_segments.session_id
+                    ORDER BY st.timestamp DESC, st.id DESC
+                    LIMIT 1
+                 )
+             WHERE chain_id = ?1
+               AND ended_at IS NULL
+               AND (?3 IS NULL OR provider_name = ?3)
+               AND (?4 IS NULL OR session_id = ?4)
+             RETURNING id",
+            sqlite::params![chain_id, ended_at.to_rfc3339(), provider_name, session_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("Failed to close active session chain segment: {e}"))
     }
 
     pub fn update_chain_last_used(&self, chain_id: &str) -> Result<(), DbError> {

@@ -253,11 +253,20 @@ fn ti_15_tauri_state_command_open_errors_preserve_variant_and_rebuild_guidance()
         message.contains(fixture.db_path().to_string_lossy().as_ref()),
         "{message}"
     );
-    let lib_source = include_str!("../src/lib.rs");
+    let lib_commands_source = include_str!("../src/lib_commands.rs");
+    let command_accessor_source = include_str!("../src/commands/accessor.rs");
+    let app_state_source = include_str!("../src/app_state.rs");
     assert!(
-        lib_source.contains("fn open_state_db")
-            && lib_source.contains("StateDb::open(&state.db_path())"),
+        lib_commands_source.contains("#[path = \"commands/accessor.rs\"]")
+            && lib_commands_source.contains("pub mod accessor;")
+            && command_accessor_source.contains("fn open_state_db")
+            && command_accessor_source.contains("state.state_db_opener.open_at(&state.db_path())"),
         "Tauri state commands must share the migration-aware StateDb opener"
+    );
+    assert!(
+        app_state_source.contains("pub fn db_path(&self) -> PathBuf")
+            && app_state_source.contains("join(\"state.db\")"),
+        "AppState must keep deriving state.db beside models_dir.parent()"
     );
 }
 

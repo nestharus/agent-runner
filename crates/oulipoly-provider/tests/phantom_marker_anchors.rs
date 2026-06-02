@@ -1,6 +1,29 @@
-const PROVIDER_SOURCE: &str = include_str!("../src/lib.rs");
 const MARKER_FIELD: &str = "marker: PhantomData<&'a ()>";
 const MARKER_FIELD_WITH_COMMA: &str = "marker: PhantomData<&'a ()>,";
+
+fn provider_source() -> String {
+    let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut source = String::new();
+
+    for entry in std::fs::read_dir(&src_dir)
+        .unwrap_or_else(|error| panic!("failed to read provider source directory: {error}"))
+    {
+        let path = entry
+            .expect("provider source entry should be readable")
+            .path();
+        if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+            source.push_str(&std::fs::read_to_string(&path).unwrap_or_else(|error| {
+                panic!(
+                    "failed to read provider source file {}: {error}",
+                    path.display()
+                )
+            }));
+            source.push('\n');
+        }
+    }
+
+    source
+}
 
 fn struct_body<'a>(source: &'a str, struct_name: &str) -> &'a str {
     let declaration = format!("pub struct {struct_name}<'a>");
@@ -20,10 +43,10 @@ fn struct_body<'a>(source: &'a str, struct_name: &str) -> &'a str {
 
 #[test]
 fn borrow_carrying_request_structs_keep_marker_anchors() {
+    let provider_source = provider_source();
     let struct_names = [
         "LaunchRequest",
         "PolicyRequest",
-        "TerminalSignalEvidence",
         "ProviderContext",
         "QuotaRequest",
         "AuthRefreshRequest",
@@ -35,12 +58,12 @@ fn borrow_carrying_request_structs_keep_marker_anchors() {
     ];
 
     for struct_name in struct_names {
-        let body = struct_body(PROVIDER_SOURCE, struct_name);
+        let body = struct_body(&provider_source, struct_name);
         assert!(
             body.contains(MARKER_FIELD),
             "{struct_name} must retain the borrow marker field"
         );
     }
 
-    assert_eq!(PROVIDER_SOURCE.matches(MARKER_FIELD_WITH_COMMA).count(), 11);
+    assert_eq!(provider_source.matches(MARKER_FIELD_WITH_COMMA).count(), 10);
 }

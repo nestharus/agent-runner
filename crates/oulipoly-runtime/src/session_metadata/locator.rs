@@ -4,9 +4,24 @@
 //! Configured transcript locator and AGE-137 provider-locator contract types.
 //! Provider-private storage scans are exposed through this stable trait while
 //! metadata lookup hydrates the registry boundary before pulling paths.
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-runtime/src/session_metadata/locator.rs
+//!     role: intrinsic-surface
+//!     Domain: session transcript location
+//!     Owns:
+//!       - configured transcript locator command construction and execution
+//!       - provider locator response parsing and validation
+//!       - built-in provider locator adapters and content fallbacks
+//! ```
 
 use super::SessionStorageType;
 use oulipoly_config::{ScriptSessionStorageType, SessionSourceEntry, SessionStorage};
+#[cfg(test)]
+use oulipoly_provider::{
+    ProviderStorageDescriptor, SessionsLocatorDescriptor, StorageFormatDescriptor,
+};
 use std::io::ErrorKind as StdIoErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -322,6 +337,79 @@ pub(super) fn no_locator() -> LocatorError {
     LocatorError::UnsupportedStorage {
         reason: UnsupportedStorageReason::NoLocatorForUnknownStorage,
     }
+}
+
+#[cfg(test)]
+pub(super) fn contract_storage_descriptor_from_session_storage(
+    source_id: &str,
+    storage: Option<&SessionStorage>,
+) -> Option<ProviderStorageDescriptor> {
+    storage.map(|storage| ProviderStorageDescriptor {
+        source_id: source_id.to_string(),
+        root: contract_storage_root(storage),
+        format: Some(contract_storage_format_from_session_storage_type(
+            storage_classification(Some(storage)),
+        )),
+        script: contract_script_kind_from_session_storage(storage),
+    })
+}
+
+#[cfg(test)]
+pub(super) fn contract_sessions_locator_descriptor_from_entry(
+    source_id: &str,
+    entry: &SessionSourceEntry,
+) -> Option<SessionsLocatorDescriptor> {
+    entry
+        .transcript_locator
+        .as_ref()
+        .map(|command| SessionsLocatorDescriptor {
+            source_id: source_id.to_string(),
+            command: command.clone(),
+            state_dir: entry.state_dir.clone(),
+        })
+}
+
+#[cfg(test)]
+pub(super) fn contract_storage_format_from_session_storage_type(
+    storage_type: SessionStorageType,
+) -> StorageFormatDescriptor {
+    StorageFormatDescriptor {
+        id: session_storage_type_contract_id(storage_type),
+        label: None,
+    }
+}
+
+#[cfg(test)]
+pub(super) fn session_storage_type_from_contract_format(
+    format: &StorageFormatDescriptor,
+) -> Option<SessionStorageType> {
+    serde_json::from_value(serde_json::Value::String(format.id.clone())).ok()
+}
+
+#[cfg(test)]
+fn contract_storage_root(storage: &SessionStorage) -> Option<PathBuf> {
+    match storage {
+        SessionStorage::Script { .. } => None,
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+fn contract_script_kind_from_session_storage(
+    storage: &SessionStorage,
+) -> Option<oulipoly_provider::ScriptKind> {
+    match storage {
+        SessionStorage::Script { .. } => Some(oulipoly_provider::ScriptKind::TranscriptScript),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+fn session_storage_type_contract_id(storage_type: SessionStorageType) -> String {
+    serde_json::to_value(storage_type)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "other".to_string())
 }
 
 pub(super) fn located(

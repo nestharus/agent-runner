@@ -1,0 +1,502 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+
+// risk: Cross-language IPC drift; level: Tauri command registration; source: contract "Tauri IPC Contract"
+#[test]
+fn tauri_registers_exact_provider_settings_command_names() {
+    let source = production_source("src/run_tauri.rs", &read("src/run_tauri.rs"));
+    let missing = provider_settings_commands()
+        .into_iter()
+        .filter(|command| !source.contains(command))
+        .collect::<Vec<_>>();
+
+    assert!(
+        missing.is_empty(),
+        "missing provider settings Tauri command registrations: {missing:?}"
+    );
+}
+
+// risk: Broad provider dispatch shortcut; level: Tauri command adapter; source: proposal "Tauri command design"
+#[test]
+fn tauri_provider_settings_handlers_are_thin_runtime_adapters() {
+    let source = provider_settings_command_source();
+
+    for forbidden in [
+        "SchemaRequest",
+        "SettingsListRequest",
+        "SettingsGetRequest",
+        "SettingsCreateRequest",
+        "SettingsUpdateRequest",
+        "SettingsDeleteRequest",
+        "SettingsValidateRequest",
+        "SettingsMigrateRequest",
+        "invoke_typed",
+        "ProviderClient::new",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "Tauri settings handlers must not construct provider envelopes or clients directly: {forbidden}"
+        );
+    }
+
+    for required in [
+        "describe_settings_target",
+        "settings_schema",
+        "settings_list",
+        "settings_get",
+        "settings_create",
+        "settings_update",
+        "settings_delete",
+        "settings_validate",
+        "settings_migrate",
+    ] {
+        assert!(
+            source.contains(required),
+            "Tauri settings handlers must delegate to runtime settings host method {required}"
+        );
+    }
+}
+
+// risk: Registry/model reload staleness; level: Tauri state lifecycle; source: contract "Runtime state signals"
+#[test]
+fn model_reload_save_and_delete_refresh_configured_provider_settings_registry() {
+    let reload_source = read("src/commands/models/reload.rs");
+    let model_source = read("src/commands/models/orchestration.rs");
+
+    for (source, function_name) in [
+        (&reload_source, "fn reload_models_inner"),
+        (&model_source, "fn save_model_inner"),
+        (&model_source, "fn delete_model"),
+    ] {
+        let body = function_body(source, function_name);
+        assert!(
+            body.contains("provider_settings") || body.contains("provider_registry"),
+            "{function_name} must refresh the configured provider settings registry/service"
+        );
+        assert!(
+            body.contains("from_model_configs") || body.contains("refresh"),
+            "{function_name} must rebuild/replace registry state from the updated model map"
+        );
+    }
+}
+
+// risk: Migration mutating or interpreting central config; level: Tauri migration packaging; source: contract "Migration Contract"
+#[test]
+fn settings_migration_packaging_is_read_only_and_separate_from_central_config_migration() {
+    let source = provider_settings_command_source();
+
+    assert!(
+        source.contains("legacy"),
+        "settings.migrate must receive a legacy payload"
+    );
+    assert!(
+        source.contains("dryRun") || source.contains("dry_run"),
+        "settings.migrate must expose dry-run state"
+    );
+    for forbidden in [
+        "migrate_config_files",
+        "write_model",
+        "save_model_inner",
+        "delete_model",
+        "fs::write",
+        "std::fs::write",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "settings.migrate packaging must not mutate central config or call central migration: {forbidden}"
+        );
+    }
+}
+
+// risk: Migration mutating or interpreting central config; level: source guard; source: contract "S5 must not retire central config"
+#[test]
+fn s5_does_not_retire_central_provider_or_model_config_parsing() {
+    let model_source = read("../crates/oulipoly-config/src/model.rs");
+    let providers_source = read("../crates/oulipoly-config/src/providers.rs");
+    let tauri_source = [
+        read("src/commands/models/reload.rs"),
+        read("src/commands/models/formatter.rs"),
+        read("src/commands/pools/writer.rs"),
+    ]
+    .join("\n");
+    let app_paths_source = read("src/app_paths.rs");
+
+    for required in [
+        "pub struct ModelConfig",
+        "pub providers: Vec<ProviderConfig>",
+        "pub provider: Option<ProviderImplementationRef>",
+        "pub fn load_models",
+        "pub fn render_validated_model_toml",
+    ] {
+        assert!(
+            model_source.contains(required),
+            "S5 must keep central model config parsing/rendering surface: {required}"
+        );
+    }
+
+    for required in [
+        "pub struct ProviderEntry",
+        "pub struct ProvidersConfig",
+        "pub fn load",
+        "pub fn effective_provider",
+        "pub fn runtime_provider",
+    ] {
+        assert!(
+            providers_source.contains(required),
+            "S5 must keep central providers.toml parsing/runtime surface: {required}"
+        );
+    }
+
+    for required in ["config::load_models", "config::render_validated_model_toml"] {
+        assert!(
+            tauri_source.contains(required),
+            "S5 settings CRUD must remain additive and keep central config consumers: {required}"
+        );
+    }
+    assert!(
+        app_paths_source.contains("load_providers_for_models_dir_with"),
+        "S5 settings CRUD must keep central providers.toml loading in app_paths.rs"
+    );
+}
+
+// risk: Provider diagnostics loss; level: Tauri IPC DTOs; source: contract "Structured IPC DTOs must expose"
+#[test]
+fn tauri_provider_settings_dtos_preserve_success_error_diagnostic_and_version_fields() {
+    let source = provider_settings_command_source();
+
+    for required in [
+        "ProviderSettingsTarget",
+        "ProviderSettingsSchema",
+        "ProviderSettingsRecord",
+        "ProviderSettingsError",
+        "diagnostics",
+        "category",
+        "code",
+        "message",
+        "retryable",
+        "details",
+        "processStatus",
+        "version",
+        "schemaId",
+        "displayName",
+    ] {
+        assert!(
+            source.contains(required),
+            "Tauri provider settings DTOs must preserve structured field {required}"
+        );
+    }
+}
+
+// risk: Production routing/quota/session cutover; level: source guard; source: contract "Out of scope"
+#[test]
+fn production_runtime_paths_do_not_route_through_provider_settings_dispatch() {
+    let guarded_sources = [
+        "../crates/oulipoly-runtime/src/balancer/mod.rs",
+        "../crates/oulipoly-runtime/src/balancer/projection.rs",
+        "../crates/oulipoly-runtime/src/balancer/burn_rate.rs",
+        "../crates/oulipoly-runtime/src/balancer/density.rs",
+        "../crates/oulipoly-runtime/src/balancer/invocation_fallback.rs",
+        "../crates/oulipoly-runtime/src/balancer/eligibility.rs",
+        "../crates/oulipoly-runtime/src/balancer/context.rs",
+        "../crates/oulipoly-runtime/src/balancer/snapshot.rs",
+        "../crates/oulipoly-runtime/src/balancer/refresh_inputs.rs",
+        "../crates/oulipoly-runtime/src/balancer/topology.rs",
+        "../crates/oulipoly-runtime/src/balancer/migration.rs",
+        "../crates/oulipoly-runtime/src/balancer/working_set.rs",
+        "../crates/oulipoly-runtime/src/executor/mod.rs",
+        "../crates/oulipoly-runtime/src/executor/cli.rs",
+        "../crates/oulipoly-runtime/src/quota/in_flight.rs",
+        "../crates/oulipoly-runtime/src/quota/adapter_derived_source.rs",
+        "../crates/oulipoly-runtime/src/quota/freshness.rs",
+        "../crates/oulipoly-runtime/src/quota/mod.rs",
+        "../crates/oulipoly-runtime/src/quota/marker_verification/mod.rs",
+        "../crates/oulipoly-runtime/src/quota/marker_verification/config.rs",
+        "../crates/oulipoly-runtime/src/quota/marker_verification/health.rs",
+        "../crates/oulipoly-runtime/src/quota/marker_verification/lock.rs",
+        "../crates/oulipoly-runtime/src/quota/outcome.rs",
+        "../crates/oulipoly-runtime/src/quota/parse.rs",
+        "../crates/oulipoly-runtime/src/quota/process.rs",
+        "../crates/oulipoly-runtime/src/quota/refresh.rs",
+        "../crates/oulipoly-runtime/src/quota/source.rs",
+        "../crates/oulipoly-runtime/src/session_metadata/mod.rs",
+        "../crates/oulipoly-runtime/src/sessions/mod.rs",
+        "../crates/oulipoly-runtime/src/migration/mod.rs",
+        "src/setup/flow.rs",
+    ]
+    .into_iter()
+    .map(ToOwned::to_owned)
+    .chain(recursive_runtime_production_sources(
+        "../crates/oulipoly-runtime/src/executor/cli",
+    ))
+    .chain(recursive_runtime_production_sources(
+        "../crates/oulipoly-runtime/src/executor/provider_specific",
+    ))
+    .collect::<Vec<_>>();
+    let forbidden_terms = [
+        "ProviderSettingsHost",
+        "provider_settings",
+        "settings_schema(",
+        "settings_list(",
+        "settings_get(",
+        "settings_create(",
+        "settings_update(",
+        "settings_delete(",
+        "settings_validate(",
+        "settings_migrate(",
+    ];
+
+    let violations = guarded_sources
+        .into_iter()
+        .flat_map(|relative| source_term_violations(&relative, &forbidden_terms))
+        .collect::<Vec<_>>();
+    assert!(
+        violations.is_empty(),
+        "production paths must not switch to provider settings dispatch: {violations:?}"
+    );
+}
+
+// risk: AGE-216 provider-settings guard could omit B3 balancer modules after extraction; level: source guard; source: AGE-224 contract Guard And Spec Contract / proposal A4.
+#[test]
+fn provider_settings_guard_source_list_declares_age224_b3_modules() {
+    let guard_body = function_body(
+        include_str!("age216_provider_settings_source_guard.rs"),
+        "fn production_runtime_paths_do_not_route_through_provider_settings_dispatch()",
+    );
+    for module in [
+        "projection.rs",
+        "burn_rate.rs",
+        "density.rs",
+        "invocation_fallback.rs",
+    ] {
+        let path = format!("../crates/oulipoly-runtime/src/balancer/{module}");
+        assert!(
+            guard_body.contains(&path),
+            "AGE-216 provider-settings guard must include {path}"
+        );
+    }
+}
+
+// risk: AGE-216 provider-settings guard could omit B4 balancer modules after extraction; level: source guard; source: AGE-225 contract Guard And Spec Contract.
+#[test]
+fn provider_settings_guard_source_list_declares_age225_b4_modules() {
+    let guard_body = function_body(
+        include_str!("age216_provider_settings_source_guard.rs"),
+        "fn production_runtime_paths_do_not_route_through_provider_settings_dispatch()",
+    );
+    for module in ["migration.rs", "working_set.rs"] {
+        let path = format!("../crates/oulipoly-runtime/src/balancer/{module}");
+        assert!(
+            guard_body.contains(&path),
+            "AGE-216 provider-settings guard must include {path}"
+        );
+    }
+}
+
+// risk: AGE-216 provider-settings guard could omit nested AGE-229 E4 executor CLI leaves after split; level: source guard; source: AGE-229 Phase 6a contract Guard And Spec Contract.
+#[test]
+fn provider_settings_guard_recursively_collects_age229_e4_executor_cli_sources() {
+    let guard_body = function_body(
+        include_str!("age216_provider_settings_source_guard.rs"),
+        "fn production_runtime_paths_do_not_route_through_provider_settings_dispatch()",
+    );
+    assert!(
+        guard_body.contains("recursive_runtime_production_sources("),
+        "AGE-216 provider-settings guard must recursively include executor/cli/** production leaves"
+    );
+    assert!(
+        guard_body.contains("../crates/oulipoly-runtime/src/executor/cli"),
+        "AGE-216 provider-settings guard must anchor recursive collection at executor/cli"
+    );
+}
+
+// risk: AGE-216 provider-settings guard could omit AGE-230 E5 provider-specific islands after split; level: source guard; source: AGE-230 Phase 5 contract Guard And Spec Contract.
+#[test]
+fn provider_settings_guard_recursively_collects_age230_e5_provider_specific_sources() {
+    let guard_body = function_body(
+        include_str!("age216_provider_settings_source_guard.rs"),
+        "fn production_runtime_paths_do_not_route_through_provider_settings_dispatch()",
+    );
+    assert!(
+        guard_body.contains("../crates/oulipoly-runtime/src/executor/provider_specific"),
+        "AGE-216 provider-settings guard must anchor recursive collection at executor/provider_specific"
+    );
+}
+
+// risk: Provider-specific vocabulary drift; level: source guard; source: contract "Out of scope"
+#[test]
+fn new_s5_provider_settings_surfaces_use_neutral_vocabulary() {
+    let candidate_files = [
+        "src/commands/provider_settings.rs",
+        "src/commands/provider_settings/mod.rs",
+        "../src/lib/providerSettings.ts",
+        "../src/components/provider-settings/ProviderSettingsPanel.tsx",
+        "../src/components/provider-settings/JsonSchemaRenderer.tsx",
+        "../src/views/ProviderSettingsView.tsx",
+        "../e2e/provider-settings.spec.ts",
+    ];
+    let forbidden_terms = [
+        "claude",
+        "codex",
+        "gemini",
+        "opencode",
+        "anthropic",
+        "openai",
+    ];
+
+    let violations = candidate_files
+        .into_iter()
+        .filter_map(optional_source)
+        .flat_map(|(relative, source)| {
+            lowercase_term_violations(relative, source, &forbidden_terms)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        violations.is_empty(),
+        "new S5 provider settings fixtures/copy must remain neutral: {violations:?}"
+    );
+}
+
+// risk: oulipoly-provider dependency independence; level: source guard; source: proposal "Forbidden behavior"
+#[test]
+fn oulipoly_provider_dependency_independence_remains_intact_for_s5() {
+    let manifest = read("../crates/oulipoly-provider/Cargo.toml");
+    for forbidden in [
+        "oulipoly-runtime",
+        "oulipoly-config",
+        "oulipoly-state",
+        "oulipoly-agent-runner",
+    ] {
+        assert!(
+            !manifest.contains(forbidden),
+            "oulipoly-provider must remain independent of host/runtime crates for S5: {forbidden}"
+        );
+    }
+}
+
+fn provider_settings_commands() -> Vec<&'static str> {
+    vec![
+        "list_provider_settings_targets",
+        "get_provider_settings_schema",
+        "list_provider_settings",
+        "get_provider_settings",
+        "create_provider_settings",
+        "update_provider_settings",
+        "delete_provider_settings",
+        "validate_provider_settings",
+        "migrate_provider_settings",
+    ]
+}
+
+fn provider_settings_command_source() -> String {
+    let candidates = [
+        "src/commands/provider_settings.rs",
+        "src/commands/provider_settings/mod.rs",
+        "src/lib.rs",
+    ];
+    candidates
+        .into_iter()
+        .find_map(|relative| {
+            let path = manifest_path(relative);
+            path.exists()
+                .then(|| production_source(relative, &fs::read_to_string(path).unwrap()))
+        })
+        .expect("provider settings Tauri command source should exist")
+}
+
+fn production_source(relative: &str, source: &str) -> String {
+    if relative == "src/lib.rs" {
+        source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap_or(source)
+            .to_string()
+    } else {
+        source.to_string()
+    }
+}
+
+fn source_term_violations(relative: &str, forbidden_terms: &[&'static str]) -> Vec<String> {
+    let Ok(source) = fs::read_to_string(manifest_path(relative)) else {
+        return vec![format!("{relative}:<missing guarded source>")];
+    };
+    forbidden_terms
+        .iter()
+        .copied()
+        .filter(|term| source.contains(term))
+        .map(|term| format!("{relative}:{term}"))
+        .collect()
+}
+
+fn recursive_runtime_production_sources(relative_dir: &str) -> Vec<String> {
+    let mut sources = Vec::new();
+    collect_rust_sources(&manifest_path(relative_dir), relative_dir, &mut sources);
+    sources
+}
+
+fn collect_rust_sources(dir: &Path, relative_dir: &str, out: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries {
+        let path = entry.unwrap().path();
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        let relative = format!("{relative_dir}/{file_name}");
+        if path.is_dir() {
+            collect_rust_sources(&path, &relative, out);
+        } else if path.extension().is_some_and(|extension| extension == "rs")
+            && !is_test_source_path(&relative)
+        {
+            out.push(relative);
+        }
+    }
+}
+
+fn is_test_source_path(relative: &str) -> bool {
+    relative.contains("/tests/")
+        || relative.ends_with("_test.rs")
+        || relative.ends_with("-test.rs")
+        || relative.ends_with("tests.rs")
+}
+
+fn optional_source(relative: &'static str) -> Option<(&'static str, String)> {
+    let path = manifest_path(relative);
+    path.exists()
+        .then(|| (relative, fs::read_to_string(path).unwrap().to_lowercase()))
+}
+
+fn lowercase_term_violations(
+    relative: &'static str,
+    source: String,
+    forbidden_terms: &[&'static str],
+) -> Vec<String> {
+    forbidden_terms
+        .iter()
+        .copied()
+        .filter(|term| source.contains(term))
+        .map(|term| format!("{relative}:{term}"))
+        .collect()
+}
+
+fn function_body<'a>(source: &'a str, marker: &str) -> &'a str {
+    let start = source
+        .find(marker)
+        .unwrap_or_else(|| panic!("missing function marker {marker}"));
+    let after = &source[start..];
+    let next_fn = after[marker.len()..]
+        .find("\nfn ")
+        .map(|offset| marker.len() + offset)
+        .unwrap_or(after.len());
+    &after[..next_fn]
+}
+
+fn read(relative: &str) -> String {
+    fs::read_to_string(manifest_path(relative))
+        .unwrap_or_else(|error| panic!("failed to read {relative}: {error}"))
+}
+
+fn manifest_path(relative: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
+}

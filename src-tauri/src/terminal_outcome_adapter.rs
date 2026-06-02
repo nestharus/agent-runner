@@ -2,7 +2,7 @@
 //!
 //! ## Declared roles
 //!
-//! `mapper`, `formatter`, `parser`, `predicate`, `orchestration`
+//! `mapper`, `formatter`, `parser`, `predicate`, `orchestration`, `validator`
 //!
 //! ## Adapter declarations
 //!
@@ -17,6 +17,15 @@
 //!       - oulipoly_runtime::diagnostics error-category contract
 //!       - src-tauri CLI quota retry/error-category contract
 //!       - AGE-153 forced terminal-signal fixture contract
+//! intrinsic_surface_declarations:
+//!   - component: src-tauri/src/terminal_outcome_adapter.rs
+//!     role: intrinsic-surface
+//!     Domain: Tauri terminal-signal disposition
+//!     Owns:
+//!       - full TerminalSignalKind disposition vocabulary
+//!       - terminal marker vocabulary
+//!       - terminal error-category projection
+//!       - external-cancelled projection hook
 //! ```
 
 use oulipoly_runtime::balancer::{FailureClass, apply_post_failure_forensics};
@@ -106,14 +115,29 @@ pub fn emit_terminal_signal_marker(
     session_id: Option<&Uuid>,
     stderr: &mut impl io::Write,
 ) -> io::Result<()> {
-    let payload = serde_json::json!({
+    let payload = terminal_signal_marker_payload(signal, invocation_id, session_id);
+    write_terminal_signal_marker(stderr, &payload)
+}
+
+fn terminal_signal_marker_payload(
+    signal: &TerminalSignal,
+    invocation_id: &Uuid,
+    session_id: Option<&Uuid>,
+) -> serde_json::Value {
+    serde_json::json!({
         "kind": format!("{:?}", signal.kind),
         "evidence": {
             "excerpt": signal.evidence.as_str(),
         },
         "invocation_id": invocation_id.to_string(),
         "session_id": session_id.map(Uuid::to_string),
-    });
+    })
+}
+
+fn write_terminal_signal_marker(
+    stderr: &mut impl io::Write,
+    payload: &serde_json::Value,
+) -> io::Result<()> {
     writeln!(
         stderr,
         "OULIPOLY_TERMINAL_SIGNAL={}",
@@ -227,17 +251,7 @@ fn emit_terminal_signal_marker_or_warn<W: io::Write>(
 }
 
 pub fn typed_terminal_reason_fallback(signal: &TerminalSignal) -> Option<&'static str> {
-    match signal.kind {
-        TerminalSignalKind::CleanExit => None,
-        TerminalSignalKind::QuotaExhaustedInband => Some("quota_exhausted_inband"),
-        TerminalSignalKind::MaybeQuotaExhausted => Some("maybe_quota_exhausted"),
-        TerminalSignalKind::RateLimited => Some("rate_limited"),
-        TerminalSignalKind::ProlongedSilence => Some("bounded_silence"),
-        TerminalSignalKind::NonzeroExit => Some("exit_nonzero"),
-        TerminalSignalKind::SignalExit => Some("signal_exit"),
-        TerminalSignalKind::SpawnError => Some("spawn_error"),
-        TerminalSignalKind::Unknown => Some("unknown_exit"),
-    }
+    oulipoly_runtime::diagnostics::canonical_terminal_reason_for_kind(signal.kind)
 }
 
 pub fn terminal_signal_reason<'a>(
@@ -413,16 +427,25 @@ fn build_forced_terminal_signal(
     kind: TerminalSignalKind,
 ) -> TerminalSignal {
     match existing {
-        Some(mut signal) => {
-            signal.kind = kind;
-            signal
-        }
-        None => TerminalSignal {
-            kind,
-            provider_name: String::new(),
-            evidence: "age153 fixture override".to_string(),
-            observed_at: std::time::SystemTime::now(),
-        },
+        Some(signal) => forced_existing_terminal_signal(signal, kind),
+        None => forced_new_terminal_signal(kind),
+    }
+}
+
+fn forced_existing_terminal_signal(
+    mut signal: TerminalSignal,
+    kind: TerminalSignalKind,
+) -> TerminalSignal {
+    signal.kind = kind;
+    signal
+}
+
+fn forced_new_terminal_signal(kind: TerminalSignalKind) -> TerminalSignal {
+    TerminalSignal {
+        kind,
+        provider_name: String::new(),
+        evidence: "age153 fixture override".to_string(),
+        observed_at: std::time::SystemTime::now(),
     }
 }
 
@@ -500,13 +523,26 @@ mod tests {
 
     fn production_block_after(start: &str) -> &'static str {
         let source = production_source();
-        let start_idx = source
-            .find(start)
-            .unwrap_or_else(|| panic!("missing {start}"));
-        let open_idx = source[start_idx..]
+        let open_idx = production_block_open_index(source, start);
+        let close_idx = production_block_close_index(source, open_idx, start);
+        &source[open_idx + 1..close_idx]
+    }
+
+    fn production_block_open_index(source: &str, start: &str) -> usize {
+        let start_idx = production_block_start_index(source, start);
+        source[start_idx..]
             .find('{')
             .map(|idx| start_idx + idx)
-            .unwrap_or_else(|| panic!("missing opening brace after {start}"));
+            .unwrap_or_else(|| panic!("missing opening brace after {start}"))
+    }
+
+    fn production_block_start_index(source: &str, start: &str) -> usize {
+        source
+            .find(start)
+            .unwrap_or_else(|| panic!("missing {start}"))
+    }
+
+    fn production_block_close_index(source: &str, open_idx: usize, start: &str) -> usize {
         let mut depth = 1usize;
         let mut idx = open_idx + 1;
         let bytes = source.as_bytes();
@@ -517,7 +553,7 @@ mod tests {
                 b'}' => {
                     depth -= 1;
                     if depth == 0 {
-                        return &source[open_idx + 1..idx];
+                        return idx;
                     }
                 }
                 _ => {}
@@ -667,15 +703,19 @@ mod tests {
     #[test]
     fn age153_emit_terminal_signal_marker_unit_contract_is_key_json_stderr_line() {
         assert_production_contains(&["fn ", "emit_terminal_signal_marker", "("]);
-        let helper = production_block_after("fn emit_terminal_signal_marker(");
-        assert!(helper.contains("OULIPOLY_TERMINAL_SIGNAL="), "{helper}");
-        assert!(helper.contains("serde_json"), "{helper}");
-        assert!(helper.contains("kind"), "{helper}");
-        assert!(helper.contains("evidence"), "{helper}");
-        assert!(helper.contains("invocation_id"), "{helper}");
-        assert!(helper.contains("session_id"), "{helper}");
+        let payload_helper = production_block_after("fn terminal_signal_marker_payload(");
+        let write_helper = production_block_after("fn write_terminal_signal_marker(");
         assert!(
-            helper.contains("writeln!") || helper.contains("write_all"),
+            write_helper.contains("OULIPOLY_TERMINAL_SIGNAL="),
+            "{write_helper}"
+        );
+        assert!(write_helper.contains("serde_json"), "{write_helper}");
+        assert!(payload_helper.contains("kind"), "{payload_helper}");
+        assert!(payload_helper.contains("evidence"), "{payload_helper}");
+        assert!(payload_helper.contains("invocation_id"), "{payload_helper}");
+        assert!(payload_helper.contains("session_id"), "{payload_helper}");
+        assert!(
+            write_helper.contains("writeln!") || write_helper.contains("write_all"),
             "marker helper must write exactly one newline-terminated stderr record"
         );
     }
@@ -716,6 +756,88 @@ mod tests {
             marker.contains("\"kind\":\"MaybeQuotaExhausted\""),
             "{marker}"
         );
+    }
+
+    struct CancelledTerminalFixture {
+        db: StateDb,
+        invocation_id: Uuid,
+        signal: TerminalSignal,
+        stderr: Vec<u8>,
+    }
+
+    fn cancelled_terminal_fixture() -> CancelledTerminalFixture {
+        let db = StateDb::open(std::path::Path::new(":memory:")).unwrap();
+        db.upsert_quota_refresh("provider-a", &[]).unwrap();
+        CancelledTerminalFixture {
+            db,
+            invocation_id: Uuid::nil(),
+            signal: cancelled_terminal_signal(),
+            stderr: Vec::new(),
+        }
+    }
+
+    fn cancelled_terminal_signal() -> TerminalSignal {
+        let mut cancelled = signal(TerminalSignalKind::Unknown);
+        cancelled.evidence = "terminal-classify-cancelled".to_string();
+        cancelled
+    }
+
+    fn apply_cancelled_terminal_outcome(
+        fixture: &mut CancelledTerminalFixture,
+    ) -> TerminalSignalDisposition {
+        let mut ctx = TerminalSignalContext {
+            invocation_id: &fixture.invocation_id,
+            session_id: None,
+            provider: "provider-a",
+            state_db: &fixture.db,
+            stderr: &mut fixture.stderr,
+        };
+        apply_terminal_signal_outcome(&Some(fixture.signal.clone()), &mut ctx)
+    }
+
+    fn cancelled_terminal_reason() -> &'static str {
+        terminal_signal_reason(&Some(cancelled_terminal_signal()), Some("cancelled"))
+            .expect("reason")
+    }
+
+    fn cancelled_terminal_category(terminal_reason: &str) -> Option<&str> {
+        terminal_signal_error_category(&Some(signal(TerminalSignalKind::Unknown)), terminal_reason)
+    }
+
+    fn assert_cancelled_terminal_outcome(
+        fixture: &CancelledTerminalFixture,
+        disposition: TerminalSignalDisposition,
+        terminal_reason: &str,
+        category: Option<&str>,
+    ) {
+        assert!(matches!(
+            disposition,
+            TerminalSignalDisposition::InteractiveFail
+        ));
+        assert_eq!(terminal_reason, "cancelled");
+        assert_eq!(category, Some("cancelled"));
+        assert_eq!(
+            fixture
+                .db
+                .get_quota("provider-a")
+                .unwrap()
+                .unwrap()
+                .exhausted_at,
+            None
+        );
+        let marker = String::from_utf8(fixture.stderr.clone()).unwrap();
+        assert!(marker.contains("OULIPOLY_TERMINAL_SIGNAL="), "{marker}");
+        assert!(marker.contains("terminal-classify-cancelled"), "{marker}");
+    }
+
+    #[test]
+    fn terminal_outcome_adapter_cancelled_reason_is_nondurable_interactive_failure() {
+        let mut fixture = cancelled_terminal_fixture();
+        let disposition = apply_cancelled_terminal_outcome(&mut fixture);
+        let terminal_reason = cancelled_terminal_reason();
+        let category = cancelled_terminal_category(terminal_reason);
+
+        assert_cancelled_terminal_outcome(&fixture, disposition, terminal_reason, category);
     }
 
     #[test]

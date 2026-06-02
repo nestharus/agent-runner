@@ -1,3 +1,16 @@
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-runtime/src/session_replace/mod.rs
+//!     role: intrinsic-surface
+//!     Domain: session import-replace host lifecycle
+//!     Owns:
+//!       - canonical replacement input parsing and renderability validation
+//!       - built-in canonical-to-native transcript rendering
+//!       - import-replace journal, lock, recovery, hash verification, and SQLite mutation
+//!       - external-provider write-ahead preimage snapshots and recovery reconcile
+//!       - external-provider postimage artifact hash accessors and validators
+//! ```
+
 use crate::session_export::{self as export, ContentChunk, ExportError, ExportSessionMetadata};
 use crate::session_lock::{Lease, LockError, SessionLock};
 use crate::session_metadata::{
@@ -305,9 +318,11 @@ struct ReplaceJournal {
     storage_type: String,
     jsonl_path: PathBuf,
     preimage_sha256: Option<String>,
-    #[serde(alias = "postimage_sha256_expected")]
-    postimage_sha256: String,
+    #[serde(default, alias = "postimage_sha256_expected")]
+    postimage_sha256: Option<String>,
     canonical_records_path: PathBuf,
+    #[serde(default)]
+    preimage_snapshot_path: Option<PathBuf>,
     db_state_pending: bool,
     expected_turn_count: usize,
 }
@@ -356,27 +371,377 @@ fn probe_state_schema_compatible(data_root: &Path, session_id: &str) -> Result<(
         })
 }
 
-fn run_import_replace_bytes(
+pub(crate) fn run_import_replace_bytes(
     session_id: &str,
     input: &[u8],
     preimage_sha256: Option<&str>,
 ) -> Result<ReplaceReceipt, ReplaceError> {
+    run_import_replace_with_postimage(
+        session_id,
+        input,
+        preimage_sha256,
+        ReplacePostimageAuthority::BuiltInRender,
+    )
+}
+
+pub(crate) fn validate_import_replace_bytes_for_session(
+    session_id: &str,
+    input: &[u8],
+) -> Result<u64, ReplaceError> {
     Uuid::try_parse(session_id).map_err(|_| ReplaceError::InvalidSessionId {
         input: session_id.to_string(),
     })?;
-    let input_text =
-        std::str::from_utf8(input).map_err(|e| ReplaceError::InvalidInputTranscript {
-            reason: format!("input is not utf-8: {e}"),
-            line: None,
-        })?;
-    let records = parse_canonical_jsonl(input_text)?;
-    for record in &records {
-        validate_record_for_render(record)?;
+    let records = parse_and_validate_canonical_input(input)?;
+    let metadata = resolve_replace_metadata(session_id)?;
+    if metadata.storage_type == SessionStorageType::Other {
+        return Err(ReplaceError::UnsupportedStorage {
+            provider_name: metadata.provider_name,
+            reason: "provider has no supported session_storage".to_string(),
+        });
     }
-    let canonical_bytes = input_text.as_bytes().to_vec();
+    validate_records_match_metadata(&records, &metadata)?;
+    Ok(records.len() as u64)
+}
 
+pub(crate) fn begin_external_provider_replace(
+    session_id: &str,
+    input: &[u8],
+    preimage_sha256: Option<&str>,
+) -> Result<ExternalProviderReplaceTransaction, ReplaceError> {
+    let replace_input = prepare_replace_input(session_id, input)?;
+    let data_root = prepare_replace_data_root(session_id)?;
+    let workspace = stage_replace_journal_input(&data_root, &replace_input.canonical_bytes)?;
+    let metadata =
+        resolve_replace_metadata_for_staged_input(session_id, &replace_input.records, &workspace)?;
+    let lock = initialize_replace_session_lock(&data_root)?;
+    let lease = acquire_external_provider_replace_lease(&lock, &metadata, &workspace)?;
+    maybe_test_hook(TEST_SLEEP_AFTER_LOCK_MS);
+
+    let preimage = canonical_hash_from_provider_file(&metadata).inspect_err(|_| {
+        release_external_provider_lease(&lock, &lease).ok();
+        remove_staged_replace_input(&workspace);
+    })?;
+    validate_requested_preimage(preimage_sha256, &preimage).inspect_err(|_| {
+        release_external_provider_lease(&lock, &lease).ok();
+        remove_staged_replace_input(&workspace);
+    })?;
+    let preimage_snapshot_path = write_external_provider_preimage_snapshot(&workspace, &metadata)
+        .inspect_err(|_| {
+        release_external_provider_lease(&lock, &lease).ok();
+        remove_staged_replace_input(&workspace);
+    })?;
+    let published = publish_replace_journal_with_snapshot(
+        &workspace,
+        &metadata,
+        replace_input.records.len(),
+        Some(&preimage),
+        None,
+        Some(preimage_snapshot_path),
+    )
+    .inspect_err(|_| {
+        release_external_provider_lease(&lock, &lease).ok();
+        remove_staged_replace_input(&workspace);
+    })?;
+    Ok(ExternalProviderReplaceTransaction {
+        input: replace_input,
+        metadata,
+        workspace,
+        published,
+        lock,
+        lease,
+        preimage_sha256: preimage,
+    })
+}
+
+impl ExternalProviderReplaceTransaction {
+    pub(crate) fn canonical_bytes(&self) -> &[u8] {
+        &self.input.canonical_bytes
+    }
+
+    pub(crate) fn preimage_sha256(&self) -> &str {
+        &self.preimage_sha256
+    }
+
+    pub(crate) fn turn_count(&self) -> u64 {
+        self.input.records.len() as u64
+    }
+}
+
+pub(crate) fn rollback_external_provider_replace(
+    transaction: ExternalProviderReplaceTransaction,
+) -> Result<(), ReplaceError> {
+    restore_external_provider_preimage_snapshot(&transaction)?;
+    cleanup_replace_journal_publication(&transaction.workspace, &transaction.published)?;
+    release_external_provider_lease(&transaction.lock, &transaction.lease)
+}
+
+pub(crate) fn rollback_external_provider_replace_after_error(
+    transaction: ExternalProviderReplaceTransaction,
+    error: ReplaceError,
+) -> ReplaceError {
+    match rollback_external_provider_replace(transaction) {
+        Ok(()) => error,
+        Err(rollback_error) => external_provider_rollback_error(error, rollback_error),
+    }
+}
+
+pub(crate) fn commit_external_provider_replace(
+    transaction: ExternalProviderReplaceTransaction,
+    expected_postimage_sha256: &str,
+) -> Result<ReplaceReceipt, ReplaceError> {
+    let actual_postimage =
+        match verify_external_provider_commit_postimage(&transaction, expected_postimage_sha256) {
+            Ok(postimage) => postimage,
+            Err(error) => return rollback_external_provider_precommit_error(transaction, error),
+        };
+    if let Err(error) = update_replace_journal_postimage(&transaction, expected_postimage_sha256) {
+        return rollback_external_provider_precommit_error(transaction, error);
+    }
+    if let Err(error) = apply_replace_sqlite(&transaction.metadata, &transaction.input.records) {
+        return external_provider_postcommit_error(&transaction, error);
+    }
+    if let Err(error) =
+        cleanup_replace_journal_publication(&transaction.workspace, &transaction.published)
+    {
+        return external_provider_postcommit_error(&transaction, error);
+    }
+    release_external_provider_lease(&transaction.lock, &transaction.lease)?;
+    Ok(format_replace_receipt(
+        &transaction.metadata,
+        transaction.preimage_sha256,
+        actual_postimage,
+    ))
+}
+
+fn verify_external_provider_commit_postimage(
+    transaction: &ExternalProviderReplaceTransaction,
+    expected_postimage_sha256: &str,
+) -> Result<String, ReplaceError> {
+    verify_replace_postimage(
+        &transaction.metadata,
+        &transaction.input.records,
+        expected_postimage_sha256,
+    )
+}
+
+fn rollback_external_provider_precommit_error(
+    transaction: ExternalProviderReplaceTransaction,
+    error: ReplaceError,
+) -> Result<ReplaceReceipt, ReplaceError> {
+    Err(rollback_external_provider_replace_after_error(
+        transaction,
+        error,
+    ))
+}
+
+fn external_provider_postcommit_error(
+    transaction: &ExternalProviderReplaceTransaction,
+    error: ReplaceError,
+) -> Result<ReplaceReceipt, ReplaceError> {
+    release_external_provider_lease(&transaction.lock, &transaction.lease).ok();
+    Err(error)
+}
+
+fn external_provider_rollback_error(
+    primary_error: ReplaceError,
+    rollback_error: ReplaceError,
+) -> ReplaceError {
+    ReplaceError::OperationalError {
+        message: format!(
+            "external provider replace failed before durable commit ({}); rollback failed ({})",
+            primary_error.code(),
+            rollback_error.code()
+        ),
+    }
+}
+
+pub(crate) fn parse_external_provider_postimage_canonical_input(
+    input: &[u8],
+) -> Result<Vec<CanonicalRecord>, ReplaceError> {
+    parse_and_validate_canonical_input(input)
+}
+
+pub(crate) fn access_external_provider_replace_metadata(
+    session_id: &str,
+) -> Result<SessionMetadata, ReplaceError> {
+    resolve_replace_metadata(session_id)
+}
+
+pub(crate) fn map_external_provider_postimage_artifact_metadata(
+    mut metadata: SessionMetadata,
+    artifact_path: &Path,
+) -> SessionMetadata {
+    metadata.jsonl_path = artifact_path.to_path_buf();
+    metadata
+}
+
+pub(crate) fn access_external_provider_artifact_canonical_hash(
+    metadata: &SessionMetadata,
+) -> Result<String, ReplaceError> {
+    access_external_provider_artifact_file(metadata)?;
+    canonical_hash_from_provider_file(metadata)
+}
+
+fn access_external_provider_artifact_file(metadata: &SessionMetadata) -> Result<(), ReplaceError> {
+    let file_metadata = fs::metadata(&metadata.jsonl_path)
+        .map_err(|_| format_invalid_external_provider_artifact_error())?;
+    if !file_metadata.is_file() {
+        return Err(format_invalid_external_provider_artifact_error());
+    }
+    File::open(&metadata.jsonl_path)
+        .map(|_| ())
+        .map_err(|_| format_invalid_external_provider_artifact_error())
+}
+
+fn format_invalid_external_provider_artifact_error() -> ReplaceError {
+    ReplaceError::OperationalError {
+        message: "invalid_artifact".to_string(),
+    }
+}
+
+pub(crate) fn validate_external_provider_postimage_hash(
+    actual_postimage_sha256: &str,
+    expected_postimage_sha256: &str,
+) -> Result<(), ReplaceError> {
+    if actual_postimage_sha256 == expected_postimage_sha256 {
+        Ok(())
+    } else {
+        Err(format_postimage_hash_mismatch_error())
+    }
+}
+
+pub(crate) fn access_external_provider_artifact_canonical_records(
+    metadata: &SessionMetadata,
+) -> Result<Vec<CanonicalRecord>, ReplaceError> {
+    access_external_provider_artifact_file(metadata)?;
+    canonical_records_from_provider_file(metadata)
+}
+
+pub(crate) fn validate_external_provider_postimage_semantics(
+    expected: &[CanonicalRecord],
+    actual: &[CanonicalRecord],
+) -> Result<(), ReplaceError> {
+    if canonical_semantics_equal(expected, actual) {
+        Ok(())
+    } else {
+        Err(format_semantic_verification_mismatch_error())
+    }
+}
+
+fn format_postimage_hash_mismatch_error() -> ReplaceError {
+    ReplaceError::OperationalError {
+        message: "postimage_hash_mismatch".to_string(),
+    }
+}
+
+fn format_semantic_verification_mismatch_error() -> ReplaceError {
+    ReplaceError::OperationalError {
+        message: "semantic_verification_mismatch".to_string(),
+    }
+}
+
+enum ReplacePostimageAuthority {
+    BuiltInRender,
+}
+
+struct ReplaceInput {
+    records: Vec<CanonicalRecord>,
+    canonical_bytes: Vec<u8>,
+}
+
+struct ReplaceJournalWorkspace {
+    journal_root: PathBuf,
+    staging_path: PathBuf,
+    operation_uuid: String,
+}
+
+struct PublishedReplaceJournal {
+    pending_path: PathBuf,
+    canonical_records_path: PathBuf,
+    preimage_snapshot_path: Option<PathBuf>,
+}
+
+struct ReplacePostimagePlan {
+    rendered: Option<Vec<u8>>,
+    expected_sha256: String,
+}
+
+pub(crate) struct ExternalProviderReplaceTransaction {
+    input: ReplaceInput,
+    metadata: SessionMetadata,
+    workspace: ReplaceJournalWorkspace,
+    published: PublishedReplaceJournal,
+    lock: SessionLock,
+    lease: Lease,
+    preimage_sha256: String,
+}
+
+fn run_import_replace_with_postimage(
+    session_id: &str,
+    input: &[u8],
+    preimage_sha256: Option<&str>,
+    postimage_authority: ReplacePostimageAuthority,
+) -> Result<ReplaceReceipt, ReplaceError> {
+    let replace_input = prepare_replace_input(session_id, input)?;
+    let data_root = prepare_replace_data_root(session_id)?;
+    let workspace = stage_replace_journal_input(&data_root, &replace_input.canonical_bytes)?;
+    let metadata =
+        resolve_replace_metadata_for_staged_input(session_id, &replace_input.records, &workspace)?;
+    let postimage_plan =
+        map_replace_postimage_authority(&postimage_authority, &metadata, &replace_input.records)
+            .inspect_err(|_| remove_staged_replace_input(&workspace))?;
+    let lock = initialize_replace_session_lock(&data_root)?;
+    let lease = acquire_import_replace_lease(&lock, &metadata, &workspace)?;
+    maybe_test_hook(TEST_SLEEP_AFTER_LOCK_MS);
+
+    let preimage = resolve_replace_preimage(&postimage_authority, &metadata, &workspace)?;
+    let published = publish_replace_journal(
+        &workspace,
+        &metadata,
+        replace_input.records.len(),
+        &preimage,
+        &postimage_plan.expected_sha256,
+    )?;
+    validate_requested_preimage(preimage_sha256, &preimage)?;
+    orchestrate_replace_transcript_write(&metadata, &postimage_plan, &workspace.operation_uuid)?;
+
+    maybe_test_hook(TEST_BLOCK_AFTER_RENAME);
+    let actual_postimage = verify_replace_postimage(
+        &metadata,
+        &replace_input.records,
+        &postimage_plan.expected_sha256,
+    )?;
+    apply_replace_sqlite(&metadata, &replace_input.records)?;
+    cleanup_replace_journal_publication(&workspace, &published)?;
+    lease.commit()?;
+
+    Ok(format_replace_receipt(
+        &metadata,
+        preimage,
+        actual_postimage,
+    ))
+}
+
+fn prepare_replace_input(session_id: &str, input: &[u8]) -> Result<ReplaceInput, ReplaceError> {
+    Uuid::try_parse(session_id).map_err(|_| ReplaceError::InvalidSessionId {
+        input: session_id.to_string(),
+    })?;
+    Ok(ReplaceInput {
+        records: parse_and_validate_canonical_input(input)?,
+        canonical_bytes: input.to_vec(),
+    })
+}
+
+fn prepare_replace_data_root(session_id: &str) -> Result<PathBuf, ReplaceError> {
     let data_root = default_data_root()?;
     probe_state_schema_compatible(&data_root, session_id)?;
+    Ok(data_root)
+}
+
+fn stage_replace_journal_input(
+    data_root: &Path,
+    canonical_bytes: &[u8],
+) -> Result<ReplaceJournalWorkspace, ReplaceError> {
     let journal_root = data_root.join("replace_journal");
     let staging_dir = journal_root.join("staging");
     let quarantine_dir = journal_root.join("quarantine");
@@ -384,33 +749,82 @@ fn run_import_replace_bytes(
 
     let operation_uuid = Uuid::new_v4().to_string();
     let staging_path = staging_dir.join(format!("{operation_uuid}.canonical.jsonl"));
-    atomic_write_bytes(&staging_path, &canonical_bytes)?;
+    atomic_write_bytes(&staging_path, canonical_bytes)?;
 
-    let metadata = match resolve_replace_metadata(session_id) {
-        Ok(metadata) => metadata,
-        Err(err) => {
-            let _ = fs::remove_file(&staging_path);
-            return Err(err);
-        }
-    };
+    Ok(ReplaceJournalWorkspace {
+        journal_root,
+        staging_path,
+        operation_uuid,
+    })
+}
+
+fn remove_staged_replace_input(workspace: &ReplaceJournalWorkspace) {
+    let _ = fs::remove_file(&workspace.staging_path);
+}
+
+fn resolve_replace_metadata_for_staged_input(
+    session_id: &str,
+    records: &[CanonicalRecord],
+    workspace: &ReplaceJournalWorkspace,
+) -> Result<SessionMetadata, ReplaceError> {
+    let metadata = resolve_replace_metadata(session_id).inspect_err(|_| {
+        remove_staged_replace_input(workspace);
+    })?;
+    validate_replace_metadata_for_input(&metadata, records).inspect_err(|_| {
+        remove_staged_replace_input(workspace);
+    })?;
+    Ok(metadata)
+}
+
+fn validate_replace_metadata_for_input(
+    metadata: &SessionMetadata,
+    records: &[CanonicalRecord],
+) -> Result<(), ReplaceError> {
     if metadata.storage_type == SessionStorageType::Other {
-        let _ = fs::remove_file(&staging_path);
         return Err(ReplaceError::UnsupportedStorage {
-            provider_name: metadata.provider_name,
+            provider_name: metadata.provider_name.clone(),
             reason: "provider has no supported session_storage".to_string(),
         });
     }
-    validate_records_match_metadata(&records, &metadata).inspect_err(|_| {
-        let _ = fs::remove_file(&staging_path);
-    })?;
+    validate_records_match_metadata(records, metadata)
+}
 
-    let rendered = render_for_storage(&metadata.storage_type, &records)?;
-    let postimage_expected = canonical_hash_from_provider_bytes(&metadata, &rendered)?;
+fn map_replace_postimage_authority(
+    authority: &ReplacePostimageAuthority,
+    metadata: &SessionMetadata,
+    records: &[CanonicalRecord],
+) -> Result<ReplacePostimagePlan, ReplaceError> {
+    match authority {
+        ReplacePostimageAuthority::BuiltInRender => {
+            map_builtin_render_postimage_authority(metadata, records)
+        }
+    }
+}
 
+fn map_builtin_render_postimage_authority(
+    metadata: &SessionMetadata,
+    records: &[CanonicalRecord],
+) -> Result<ReplacePostimagePlan, ReplaceError> {
+    let rendered = render_for_storage(&metadata.storage_type, records)?;
+    let expected_sha256 = canonical_hash_from_provider_bytes(metadata, &rendered)?;
+    Ok(ReplacePostimagePlan {
+        rendered: Some(rendered),
+        expected_sha256,
+    })
+}
+
+fn initialize_replace_session_lock(data_root: &Path) -> Result<SessionLock, ReplaceError> {
     let lock_dir = data_root.join("locks");
-    let lock = SessionLock::new(&lock_dir).map_err(|e| ReplaceError::OperationalError {
+    SessionLock::new(&lock_dir).map_err(|e| ReplaceError::OperationalError {
         message: format!("failed to initialize session lock: {e}"),
-    })?;
+    })
+}
+
+fn acquire_import_replace_lease<'a>(
+    lock: &'a SessionLock,
+    metadata: &SessionMetadata,
+    workspace: &ReplaceJournalWorkspace,
+) -> Result<ImportReplaceLease<'a>, ReplaceError> {
     let lease = match lock.acquire(
         &metadata.session_id,
         &metadata.provider_name,
@@ -418,40 +832,150 @@ fn run_import_replace_bytes(
     ) {
         Ok(lease) => lease,
         Err(err) => {
-            let _ = fs::remove_file(&staging_path);
+            remove_staged_replace_input(workspace);
             return Err(map_lock_error(err));
         }
     };
-    let lease = ImportReplaceLease {
-        lock: &lock,
+    Ok(ImportReplaceLease {
+        lock,
         session_id: metadata.session_id.clone(),
         lease: Some(lease),
-    };
-    maybe_test_hook(TEST_SLEEP_AFTER_LOCK_MS);
+    })
+}
 
-    let preimage = match canonical_hash_from_provider_file(&metadata) {
-        Ok(preimage) => preimage,
-        Err(err) => {
-            let _ = fs::remove_file(&staging_path);
-            return Err(err);
-        }
-    };
+fn acquire_external_provider_replace_lease(
+    lock: &SessionLock,
+    metadata: &SessionMetadata,
+    workspace: &ReplaceJournalWorkspace,
+) -> Result<Lease, ReplaceError> {
+    lock.acquire(
+        &metadata.session_id,
+        &metadata.provider_name,
+        Duration::from_secs(300),
+    )
+    .inspect_err(|_| remove_staged_replace_input(workspace))
+    .map_err(map_lock_error)
+}
 
-    let canonical_records_path =
-        journal_root.join(format!("session-{}.canonical.jsonl", metadata.session_id));
-    fs::rename(&staging_path, &canonical_records_path).map_err(|e| {
-        let _ = fs::remove_file(&staging_path);
+fn release_external_provider_lease(lock: &SessionLock, lease: &Lease) -> Result<(), ReplaceError> {
+    lock.release(&lease.session_id, &lease.token)
+        .map(|_| ())
+        .map_err(map_lock_error)
+}
+
+fn write_external_provider_preimage_snapshot(
+    workspace: &ReplaceJournalWorkspace,
+    metadata: &SessionMetadata,
+) -> Result<PathBuf, ReplaceError> {
+    let bytes = fs::read(&metadata.jsonl_path).map_err(|e| ReplaceError::OperationalError {
+        message: format!(
+            "failed to snapshot transcript {}: {e}",
+            metadata.jsonl_path.display()
+        ),
+    })?;
+    let snapshot_path = workspace
+        .journal_root
+        .join(format!("session-{}.preimage", metadata.session_id));
+    atomic_write_bytes(&snapshot_path, &bytes)?;
+    Ok(snapshot_path)
+}
+
+fn restore_external_provider_preimage_snapshot(
+    transaction: &ExternalProviderReplaceTransaction,
+) -> Result<(), ReplaceError> {
+    let Some(snapshot_path) = &transaction.published.preimage_snapshot_path else {
+        return Ok(());
+    };
+    let bytes = fs::read(snapshot_path).map_err(|e| ReplaceError::OperationalError {
+        message: format!(
+            "failed to read external replace preimage snapshot {}: {e}",
+            snapshot_path.display()
+        ),
+    })?;
+    atomic_write_bytes(&transaction.metadata.jsonl_path, &bytes)
+}
+
+fn update_replace_journal_postimage(
+    transaction: &ExternalProviderReplaceTransaction,
+    postimage_sha256: &str,
+) -> Result<(), ReplaceError> {
+    let journal = ReplaceJournal {
+        schema_version: 1,
+        operation: "import-replace".to_string(),
+        operation_uuid: transaction.workspace.operation_uuid.clone(),
+        started_at: Utc::now().to_rfc3339(),
+        session_id: transaction.metadata.session_id.clone(),
+        chain_id: transaction.metadata.chain_id.clone(),
+        active_segment_id: transaction.metadata.active_segment_id,
+        provider_name: transaction.metadata.provider_name.clone(),
+        storage_type: storage_type_as_str(transaction.metadata.storage_type).to_string(),
+        jsonl_path: transaction.metadata.jsonl_path.clone(),
+        preimage_sha256: Some(transaction.preimage_sha256.clone()),
+        postimage_sha256: Some(postimage_sha256.to_string()),
+        canonical_records_path: transaction.published.canonical_records_path.clone(),
+        preimage_snapshot_path: transaction.published.preimage_snapshot_path.clone(),
+        db_state_pending: true,
+        expected_turn_count: transaction.input.records.len(),
+    };
+    atomic_write_json(&transaction.published.pending_path, &journal)
+}
+
+fn resolve_replace_preimage(
+    authority: &ReplacePostimageAuthority,
+    metadata: &SessionMetadata,
+    workspace: &ReplaceJournalWorkspace,
+) -> Result<String, ReplaceError> {
+    match authority {
+        ReplacePostimageAuthority::BuiltInRender => canonical_hash_from_provider_file(metadata)
+            .inspect_err(|_| {
+                remove_staged_replace_input(workspace);
+            }),
+    }
+}
+
+fn publish_replace_journal(
+    workspace: &ReplaceJournalWorkspace,
+    metadata: &SessionMetadata,
+    expected_turn_count: usize,
+    preimage_sha256: &str,
+    postimage_sha256: &str,
+) -> Result<PublishedReplaceJournal, ReplaceError> {
+    publish_replace_journal_with_snapshot(
+        workspace,
+        metadata,
+        expected_turn_count,
+        Some(preimage_sha256),
+        Some(postimage_sha256),
+        None,
+    )
+}
+
+fn publish_replace_journal_with_snapshot(
+    workspace: &ReplaceJournalWorkspace,
+    metadata: &SessionMetadata,
+    expected_turn_count: usize,
+    preimage_sha256: Option<&str>,
+    postimage_sha256: Option<&str>,
+    preimage_snapshot_path: Option<PathBuf>,
+) -> Result<PublishedReplaceJournal, ReplaceError> {
+    let canonical_records_path = workspace
+        .journal_root
+        .join(format!("session-{}.canonical.jsonl", metadata.session_id));
+    fs::rename(&workspace.staging_path, &canonical_records_path).map_err(|e| {
+        remove_staged_replace_input(workspace);
         ReplaceError::OperationalError {
             message: format!("failed to publish canonical records: {e}"),
         }
     })?;
-    fsync_dir(&journal_root)?;
+    fsync_dir(&workspace.journal_root)?;
 
-    let pending_path = journal_root.join(format!("session-{}.pending", metadata.session_id));
+    let pending_path = workspace
+        .journal_root
+        .join(format!("session-{}.pending", metadata.session_id));
     let journal = ReplaceJournal {
         schema_version: 1,
         operation: "import-replace".to_string(),
-        operation_uuid: operation_uuid.clone(),
+        operation_uuid: workspace.operation_uuid.clone(),
         started_at: Utc::now().to_rfc3339(),
         session_id: metadata.session_id.clone(),
         chain_id: metadata.chain_id.clone(),
@@ -459,26 +983,48 @@ fn run_import_replace_bytes(
         provider_name: metadata.provider_name.clone(),
         storage_type: storage_type_as_str(metadata.storage_type).to_string(),
         jsonl_path: metadata.jsonl_path.clone(),
-        preimage_sha256: Some(preimage.clone()),
-        postimage_sha256: postimage_expected.clone(),
+        preimage_sha256: preimage_sha256.map(str::to_string),
+        postimage_sha256: postimage_sha256.map(str::to_string),
         canonical_records_path: canonical_records_path.clone(),
+        preimage_snapshot_path: preimage_snapshot_path.clone(),
         db_state_pending: true,
-        expected_turn_count: records.len(),
+        expected_turn_count,
     };
     atomic_write_json(&pending_path, &journal)?;
-    if let Some(expected) = preimage_sha256
-        && expected != preimage
+    Ok(PublishedReplaceJournal {
+        pending_path,
+        canonical_records_path,
+        preimage_snapshot_path,
+    })
+}
+
+fn validate_requested_preimage(
+    expected_preimage: Option<&str>,
+    actual_preimage: &str,
+) -> Result<(), ReplaceError> {
+    if let Some(expected) = expected_preimage
+        && expected != actual_preimage
     {
         return Err(ReplaceError::PreimageMismatch {
             expected: expected.to_string(),
-            actual: preimage,
+            actual: actual_preimage.to_string(),
         });
     }
+    Ok(())
+}
 
+fn orchestrate_replace_transcript_write(
+    metadata: &SessionMetadata,
+    postimage_plan: &ReplacePostimagePlan,
+    operation_uuid: &str,
+) -> Result<(), ReplaceError> {
+    let Some(rendered) = postimage_plan.rendered.as_deref() else {
+        return Ok(());
+    };
     let tmp_path = metadata
         .jsonl_path
         .with_extension(format!("jsonl.tmp-import-replace-{operation_uuid}"));
-    write_new_file_synced(&tmp_path, &rendered)?;
+    write_new_file_synced(&tmp_path, rendered)?;
     if let Err(e) = fs::rename(&tmp_path, &metadata.jsonl_path) {
         let _ = fs::remove_file(&tmp_path);
         return Err(ReplaceError::OperationalError {
@@ -488,54 +1034,90 @@ fn run_import_replace_bytes(
     if let Some(parent) = metadata.jsonl_path.parent() {
         fsync_dir(parent)?;
     }
+    Ok(())
+}
 
-    maybe_test_hook(TEST_BLOCK_AFTER_RENAME);
+fn verify_replace_postimage(
+    metadata: &SessionMetadata,
+    records: &[CanonicalRecord],
+    expected_postimage: &str,
+) -> Result<String, ReplaceError> {
     if std::env::var(TEST_HOOK_ENV).as_deref() == Ok(TEST_FAIL_POSTIMAGE_VERIFY) {
         return Err(ReplaceError::OperationalError {
             message: "forced postimage verification failure".to_string(),
         });
     }
 
-    let actual_postimage = canonical_hash_from_provider_file(&metadata)?;
-    if actual_postimage != postimage_expected {
+    let actual_postimage = canonical_hash_from_provider_file(metadata)?;
+    if actual_postimage != expected_postimage {
         return Err(ReplaceError::OperationalError {
             message: "postimage verification hash mismatch".to_string(),
         });
     }
-    let fresh = canonical_records_from_provider_file(&metadata)?;
-    if !canonical_semantics_equal(&records, &fresh) {
+    let fresh = canonical_records_from_provider_file(metadata)?;
+    if !canonical_semantics_equal(records, &fresh) {
         return Err(ReplaceError::OperationalError {
             message: "fresh export verification mismatch".to_string(),
         });
     }
+    Ok(actual_postimage)
+}
 
+fn apply_replace_sqlite(
+    metadata: &SessionMetadata,
+    records: &[CanonicalRecord],
+) -> Result<(), ReplaceError> {
     let mut state = StateDb::open_default().map_err(|e| ReplaceError::OperationalError {
         message: format!("failed to open state db: {e}"),
     })?;
     state
-        .with_write_txn(|tx| {
-            replace_db_turns(tx, &metadata, &records).map_err(|e| format!("{e:?}"))
-        })
+        .with_write_txn(|tx| replace_db_turns(tx, metadata, records).map_err(|e| format!("{e:?}")))
         .map_err(|e| ReplaceError::OperationalError {
             message: format!("failed to update state db: {e}"),
-        })?;
+        })
+}
 
-    fs::remove_file(&pending_path).ok();
-    fs::remove_file(&canonical_records_path).ok();
-    fsync_dir(&journal_root)?;
-    lease.commit()?;
+fn cleanup_replace_journal_publication(
+    workspace: &ReplaceJournalWorkspace,
+    published: &PublishedReplaceJournal,
+) -> Result<(), ReplaceError> {
+    fs::remove_file(&published.pending_path).ok();
+    fs::remove_file(&published.canonical_records_path).ok();
+    if let Some(path) = &published.preimage_snapshot_path {
+        fs::remove_file(path).ok();
+    }
+    fsync_dir(&workspace.journal_root)
+}
 
-    Ok(ReplaceReceipt {
-        session_id: metadata.session_id,
-        provider_name: metadata.provider_name,
+fn format_replace_receipt(
+    metadata: &SessionMetadata,
+    preimage_sha256: String,
+    postimage_sha256: String,
+) -> ReplaceReceipt {
+    ReplaceReceipt {
+        session_id: metadata.session_id.clone(),
+        provider_name: metadata.provider_name.clone(),
         storage_type: storage_type_as_str(metadata.storage_type).to_string(),
         operation: "import-replace".to_string(),
-        preimage_sha256: preimage,
-        postimage_sha256: actual_postimage,
-        jsonl_path: metadata.jsonl_path,
+        preimage_sha256,
+        postimage_sha256,
+        jsonl_path: metadata.jsonl_path.clone(),
         state_updated: true,
         committed_at: Utc::now().to_rfc3339(),
-    })
+    }
+}
+
+fn parse_and_validate_canonical_input(input: &[u8]) -> Result<Vec<CanonicalRecord>, ReplaceError> {
+    let input_text =
+        std::str::from_utf8(input).map_err(|e| ReplaceError::InvalidInputTranscript {
+            reason: format!("input is not utf-8: {e}"),
+            line: None,
+        })?;
+    let records = parse_canonical_jsonl(input_text)?;
+    for record in &records {
+        validate_record_for_render(record)?;
+    }
+    Ok(records)
 }
 
 pub fn recover_pending_replaces() -> Result<(), ReplaceError> {
@@ -586,49 +1168,102 @@ pub fn recover_pending_replaces() -> Result<(), ReplaceError> {
             transcript_state: TranscriptState::Available,
             mutable: true,
         };
-        let current_hash = canonical_hash_from_provider_file(&metadata);
-        match (journal.preimage_sha256.as_deref(), current_hash) {
-            (_, Ok(hash)) if hash == journal.postimage_sha256 => {
-                let Ok(canonical) = fs::read_to_string(&journal.canonical_records_path) else {
-                    move_to_quarantine(&path, &quarantine_dir);
-                    continue;
-                };
-                let Ok(records) = parse_canonical_jsonl(&canonical) else {
-                    move_to_quarantine(&path, &quarantine_dir);
-                    continue;
-                };
-                let mut state =
-                    StateDb::open_default().map_err(|e| ReplaceError::OperationalError {
-                        message: format!("failed to open state db during recovery: {e}"),
-                    })?;
-                state
-                    .with_write_txn(|tx| {
-                        replace_db_turns(tx, &metadata, &records).map_err(|e| format!("{e:?}"))
-                    })
-                    .map_err(|e| ReplaceError::OperationalError {
-                        message: format!("failed to update state db during recovery: {e}"),
-                    })?;
-                fs::remove_file(&path).ok();
-                fs::remove_file(&journal.canonical_records_path).ok();
-                fsync_dir(&journal_root)?;
-            }
-            (Some(preimage), Ok(hash)) if hash == preimage => {
-                fs::remove_file(&path).ok();
-                fs::remove_file(&journal.canonical_records_path).ok();
-                fsync_dir(&journal_root)?;
-            }
-            (None, _) => {
-                fs::remove_file(&path).ok();
-                fs::remove_file(&journal.canonical_records_path).ok();
-                fsync_dir(&journal_root)?;
-            }
-            _ => {
-                move_to_quarantine(&path, &quarantine_dir);
-            }
-        }
+        recover_replace_journal_entry(&journal_root, &quarantine_dir, &path, &journal, &metadata)?;
     }
     cleanup_orphan_canonical_records(&data_root, &journal_root, &quarantine_dir)?;
     Ok(())
+}
+
+fn recover_replace_journal_entry(
+    journal_root: &Path,
+    quarantine_dir: &Path,
+    pending_path: &Path,
+    journal: &ReplaceJournal,
+    metadata: &SessionMetadata,
+) -> Result<(), ReplaceError> {
+    let current_hash = canonical_hash_from_provider_file(metadata);
+    match (
+        journal.preimage_sha256.as_deref(),
+        journal.postimage_sha256.as_deref(),
+        current_hash,
+    ) {
+        (_, Some(postimage), Ok(hash)) if hash == postimage => roll_forward_replace_journal(
+            journal_root,
+            quarantine_dir,
+            pending_path,
+            journal,
+            metadata,
+        ),
+        (Some(preimage), _, Ok(hash)) if hash == preimage => {
+            cleanup_recovered_replace_journal(journal_root, pending_path, journal)
+        }
+        (Some(_), _, _) if journal.preimage_snapshot_path.is_some() => {
+            roll_back_external_replace_journal(journal_root, pending_path, journal, metadata)
+        }
+        (None, _, _) => cleanup_recovered_replace_journal(journal_root, pending_path, journal),
+        _ => {
+            move_to_quarantine(pending_path, quarantine_dir);
+            Ok(())
+        }
+    }
+}
+
+fn roll_forward_replace_journal(
+    journal_root: &Path,
+    quarantine_dir: &Path,
+    pending_path: &Path,
+    journal: &ReplaceJournal,
+    metadata: &SessionMetadata,
+) -> Result<(), ReplaceError> {
+    let Ok(canonical) = fs::read_to_string(&journal.canonical_records_path) else {
+        move_to_quarantine(pending_path, quarantine_dir);
+        return Ok(());
+    };
+    let Ok(records) = parse_canonical_jsonl(&canonical) else {
+        move_to_quarantine(pending_path, quarantine_dir);
+        return Ok(());
+    };
+    let mut state = StateDb::open_default().map_err(|e| ReplaceError::OperationalError {
+        message: format!("failed to open state db during recovery: {e}"),
+    })?;
+    state
+        .with_write_txn(|tx| replace_db_turns(tx, metadata, &records).map_err(|e| format!("{e:?}")))
+        .map_err(|e| ReplaceError::OperationalError {
+            message: format!("failed to update state db during recovery: {e}"),
+        })?;
+    cleanup_recovered_replace_journal(journal_root, pending_path, journal)
+}
+
+fn roll_back_external_replace_journal(
+    journal_root: &Path,
+    pending_path: &Path,
+    journal: &ReplaceJournal,
+    metadata: &SessionMetadata,
+) -> Result<(), ReplaceError> {
+    let Some(snapshot_path) = &journal.preimage_snapshot_path else {
+        return cleanup_recovered_replace_journal(journal_root, pending_path, journal);
+    };
+    let bytes = fs::read(snapshot_path).map_err(|e| ReplaceError::OperationalError {
+        message: format!(
+            "failed to read external replace recovery snapshot {}: {e}",
+            snapshot_path.display()
+        ),
+    })?;
+    atomic_write_bytes(&metadata.jsonl_path, &bytes)?;
+    cleanup_recovered_replace_journal(journal_root, pending_path, journal)
+}
+
+fn cleanup_recovered_replace_journal(
+    journal_root: &Path,
+    pending_path: &Path,
+    journal: &ReplaceJournal,
+) -> Result<(), ReplaceError> {
+    fs::remove_file(pending_path).ok();
+    fs::remove_file(&journal.canonical_records_path).ok();
+    if let Some(path) = &journal.preimage_snapshot_path {
+        fs::remove_file(path).ok();
+    }
+    fsync_dir(journal_root)
 }
 
 fn cleanup_orphan_canonical_records(
@@ -648,6 +1283,14 @@ fn cleanup_orphan_canonical_records(
             continue;
         };
         let Some(session_part) = name.strip_suffix(".canonical.jsonl") else {
+            if let Some(session_part) = name.strip_suffix(".preimage") {
+                cleanup_orphan_preimage_snapshot(
+                    journal_root,
+                    quarantine_dir,
+                    &path,
+                    session_part,
+                )?;
+            }
             continue;
         };
         if !session_part.starts_with("session-") {
@@ -668,6 +1311,26 @@ fn cleanup_orphan_canonical_records(
             })?;
             fsync_dir(journal_root)?;
         }
+    }
+    Ok(())
+}
+
+fn cleanup_orphan_preimage_snapshot(
+    journal_root: &Path,
+    quarantine_dir: &Path,
+    path: &Path,
+    session_part: &str,
+) -> Result<(), ReplaceError> {
+    if !session_part.starts_with("session-") {
+        return Ok(());
+    }
+    let pending = journal_root.join(format!("{session_part}.pending"));
+    let quarantined_pending = quarantine_dir.join(format!("{session_part}.pending"));
+    if !pending.exists() && !quarantined_pending.exists() {
+        fs::remove_file(path).map_err(|e| ReplaceError::OperationalError {
+            message: format!("failed to remove orphan preimage snapshot: {e}"),
+        })?;
+        fsync_dir(journal_root)?;
     }
     Ok(())
 }

@@ -54,9 +54,11 @@ use oulipoly_config::{
 };
 use oulipoly_runtime::executor::SessionCaptureMethod;
 use oulipoly_runtime::executor::cli::{
-    ResumePayload, classify_terminal_reason, compose_resume_args, execute, execute_interactive,
-    execute_interactive_with_result, execute_resume, provider_name, shell_split,
-    start_known_provider_session_id,
+    EffectiveExecuteRequest, InteractiveExecutionResult, ResumePayload, classify_terminal_reason,
+    compose_resume_args, execute, execute_effective,
+    execute_effective_with_start_known_provider_session_id, execute_interactive,
+    execute_interactive_with_result, execute_resume, execute_resume_optional_prompt, provider_name,
+    shell_split, start_known_provider_session_id,
 };
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
@@ -207,9 +209,9 @@ fn interactive_execution_propagates_parent_invocation_env() {
     std::fs::set_permissions(&script_path, perms).unwrap();
     let provider = ProviderConfig {
         name: "env-fixture".to_string(),
-        command: script_path.to_string_lossy().into_owned(),
+        command: "bash".to_string(),
         args: Vec::new(),
-        interactive_args: Some(vec!["launch".to_string()]),
+        interactive_args: Some(vec![script_path.to_string_lossy().into_owned()]),
         resume: None,
         session_capture: None,
         resume_acceptance: None,
@@ -395,6 +397,15 @@ fn t20_execute_facade_still_callable_via_executor_cli_execute() {
             &std::collections::HashMap<String, Vec<String>>,
             Option<&str>,
         ) -> Result<oulipoly_runtime::executor::ExecutionResult, String>;
+    let _ = execute_effective
+        as fn(
+            EffectiveExecuteRequest<'_>,
+        ) -> Result<oulipoly_runtime::executor::ExecutionResult, String>;
+    let _ = execute_effective_with_start_known_provider_session_id
+        as fn(
+            EffectiveExecuteRequest<'_>,
+            Option<&str>,
+        ) -> Result<oulipoly_runtime::executor::ExecutionResult, String>;
     let _ = execute_interactive
         as fn(
             &oulipoly_config::ProviderConfig,
@@ -408,14 +419,23 @@ fn t20_execute_facade_still_callable_via_executor_cli_execute() {
             Option<&std::path::Path>,
             Option<&str>,
             Option<ResumePayload<'_>>,
-        )
-            -> Result<oulipoly_runtime::executor::cli::InteractiveExecutionResult, String>;
+        ) -> Result<InteractiveExecutionResult, String>;
     let _ = execute_resume
         as fn(
             &oulipoly_config::ProviderConfig,
             usize,
             oulipoly_config::PromptMode,
             &str,
+            Option<&std::path::Path>,
+            Option<&str>,
+            ResumePayload<'_>,
+        ) -> Result<oulipoly_runtime::executor::ExecutionResult, String>;
+    let _ = execute_resume_optional_prompt
+        as fn(
+            &oulipoly_config::ProviderConfig,
+            usize,
+            oulipoly_config::PromptMode,
+            Option<&str>,
             Option<&std::path::Path>,
             Option<&str>,
             ResumePayload<'_>,

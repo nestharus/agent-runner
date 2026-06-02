@@ -598,6 +598,7 @@ pub(super) struct CompletedAttemptInputSource<'a, 'state, 'ctx> {
     pub(super) invocation_row_id: i64,
     pub(super) guard: &'a mut FinalizerGuard<'state>,
     pub(super) provider_name: &'a str,
+    pub(super) model: &'a ModelConfig,
     pub(super) provider_index: usize,
     pub(super) result: &'a executor::ExecutionResult,
     pub(super) terminal_signal: &'a Option<executor::TerminalSignal>,
@@ -619,6 +620,7 @@ pub(super) fn completed_attempt_input<'a, 'state, 'ctx>(
         invocation_row_id: source.invocation_row_id,
         guard: source.guard,
         provider_name: source.provider_name,
+        model: source.model,
         provider_index: source.provider_index,
         result: source.result,
         terminal_signal: source.terminal_signal,
@@ -631,7 +633,11 @@ pub(super) fn completed_attempt_input<'a, 'state, 'ctx>(
     }
 }
 
-pub(super) type CompletedAttemptRunInput<'a> = (&'a HashMap<String, ModelConfig>, Option<&'a Path>);
+pub(super) type CompletedAttemptRunInput<'a> = (
+    &'a ModelConfig,
+    &'a HashMap<String, ModelConfig>,
+    Option<&'a Path>,
+);
 
 pub(super) fn completed_attempt_input_for_attempt<'a, 'state, 'ctx>(
     lifecycle: AttemptLifecycleInput<'a, 'state>,
@@ -643,7 +649,7 @@ pub(super) fn completed_attempt_input_for_attempt<'a, 'state, 'ctx>(
     let (agent_runtime_services, env, invocation, invocation_row_id, guard) = lifecycle;
     let (provider_name, provider_index, zero_turn_provider_session_id) = provider;
     let (result, terminal_signal, terminal_signal_ctx) = terminal;
-    let (all_models, working_dir) = run_input;
+    let (model, all_models, working_dir) = run_input;
     let (attempts, max_attempts) = budget;
     completed_attempt_input(CompletedAttemptInputSource {
         agent_runtime_services,
@@ -652,6 +658,7 @@ pub(super) fn completed_attempt_input_for_attempt<'a, 'state, 'ctx>(
         invocation_row_id,
         guard,
         provider_name,
+        model,
         provider_index,
         result,
         terminal_signal,
@@ -756,7 +763,9 @@ pub(super) fn terminal_failure_error_category<'a>(
 }
 
 pub(super) struct CompletedSessionIngestRequestInput<'a> {
+    pub(super) agent_runtime_services: &'a wiring::AgentRuntimeServices,
     pub(super) env: &'a BalancedExecutionEnvironment,
+    pub(super) model: &'a ModelConfig,
     pub(super) provider_name: &'a str,
     pub(super) invocation_row_id: i64,
     pub(super) invocation_id: &'a str,
@@ -771,6 +780,11 @@ pub(super) fn completed_session_ingest_request<'a>(
         sessions_cfg: &input.env.sessions_cfg,
         providers_cfg: Some(&input.env.providers_cfg),
         provider_name: input.provider_name,
+        external_provider: crate::session_ingest_cli::session_external_provider_identity(
+            input.agent_runtime_services,
+            Some(input.model),
+            input.provider_name,
+        ),
         invocation_row_id: input.invocation_row_id,
         invocation_uuid: input.invocation_id,
         effective_cwd: Some(input.effective_cwd),
@@ -785,7 +799,9 @@ pub(super) fn completed_session_ingest_request_for_attempt<'a>(
     effective_cwd: &'a Path,
 ) -> SessionIngestRequest<'a> {
     completed_session_ingest_request(CompletedSessionIngestRequestInput {
+        agent_runtime_services: input.agent_runtime_services,
         env: input.env,
+        model: input.model,
         provider_name: input.provider_name,
         invocation_row_id: input.invocation_row_id,
         invocation_id: &input.invocation.id,

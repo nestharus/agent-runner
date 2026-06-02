@@ -180,13 +180,13 @@ fn service_port_traits_are_send_sync_trait_object_usable() {
 #[test]
 fn age_34_runtime_service_adapters_are_send_sync_trait_object_usable() {
     let _: Box<dyn ExecutorServicePort + Send + Sync> =
-        Box::new(oulipoly_runtime::executor::RuntimeExecutorService);
+        Box::new(oulipoly_runtime::executor::RuntimeExecutorService::default());
     let _: Box<dyn LauncherServicePort + Send + Sync> =
         Box::new(oulipoly_runtime::repl_default_provider::RuntimeLauncherService);
     let _: Box<dyn QuotaServicePort + Send + Sync> =
         Box::new(oulipoly_runtime::quota::RuntimeQuotaService);
     let _: Box<dyn DiagnosticsServicePort + Send + Sync> =
-        Box::new(oulipoly_runtime::diagnostics::RuntimeDiagnosticsService);
+        Box::new(oulipoly_runtime::diagnostics::RuntimeDiagnosticsService::default());
 }
 
 #[test]
@@ -300,6 +300,7 @@ fn age_36_resume_session_migration_services_are_object_safe_with_contract_dtos()
         sessions_cfg: &sessions_cfg,
         providers_cfg: None,
         provider_name: "compile-provider",
+        external_provider: None,
         invocation_row_id,
         invocation_uuid: &start.invocation_uuid,
         effective_cwd: None,
@@ -364,11 +365,13 @@ fn age_37_trace_export_replace_lock_services_are_object_safe_with_contract_dtos(
     };
     let export_request = SessionExportServiceRequest {
         session_id: "5169694d-de0f-40d1-890c-6e28e55bab27".to_string(),
+        external_provider: None,
     };
     let replace_request = SessionReplaceServiceRequest {
         session_id: "5169694d-de0f-40d1-890c-6e28e55bab27".to_string(),
         source: oulipoly_runtime::session_replace::ReplaceSource::Stdin,
         preimage_sha256: Some("0".repeat(64)),
+        external_provider: None,
     };
     let acquire_request = SessionLockServiceRequest::Acquire {
         session_id: "5169694d-de0f-40d1-890c-6e28e55bab27".to_string(),

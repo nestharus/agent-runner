@@ -1,0 +1,142 @@
+pub mod support {
+    pub mod provider_client;
+}
+
+use oulipoly_provider::stream::LaunchJsonlReader;
+use serde_json::json;
+use support::provider_client::{
+    REQUEST_ID, json_line, launch_exit_event, launch_heartbeat_event, launch_marker_event,
+    launch_stderr_event, launch_stdout_event,
+};
+
+#[test]
+fn launch_reader_accepts_stdout_stderr_marker_heartbeat_and_final_exit() {
+    let jsonl = [
+        json_line(&launch_stdout_event(1, "AAH/")),
+        json_line(&launch_stderr_event(2, "ZXJy")),
+        json_line(&launch_marker_event(3)),
+        json_line(&launch_heartbeat_event(4)),
+        json_line(&launch_exit_event(5, 0)),
+    ]
+    .join("");
+
+    let result = LaunchJsonlReader::new(REQUEST_ID)
+        .read(jsonl.as_bytes())
+        .expect("ordered valid JSONL should parse");
+
+    assert_eq!(result.events.len(), 5);
+    assert_eq!(result.stdout_bytes(), vec![0x00, 0x01, 0xff]);
+    assert_eq!(result.stderr_bytes(), b"err".to_vec());
+}
+
+#[test]
+fn launch_reader_rejects_malformed_line_unknown_kind_and_schema_invalid_event() {
+    let cases = [
+        ("malformed", "{not-json}\n".to_owned(), "malformed_line"),
+        (
+            "blank-line",
+            format!(
+                "{}   \n{}",
+                json_line(&launch_stdout_event(1, "YQ==")),
+                json_line(&launch_exit_event(2, 0))
+            ),
+            "malformed_line",
+        ),
+        (
+            "unknown-kind",
+            "{\"contract\":\"oulipoly.provider/v1\",\"request_id\":\"request-example-001\",\"seq\":1,\"time_unix_ms\":1,\"kind\":\"unknown\"}\n".to_owned(),
+            "unknown_event_kind",
+        ),
+        (
+            "schema-invalid",
+            "{\"contract\":\"oulipoly.provider/v1\",\"request_id\":\"request-example-001\",\"seq\":1,\"time_unix_ms\":1,\"kind\":\"stdout\"}\n".to_owned(),
+            "schema_invalid_event",
+        ),
+    ];
+
+    for (label, jsonl, expected) in cases {
+        let error = LaunchJsonlReader::new(REQUEST_ID)
+            .read(jsonl.as_bytes())
+            .expect_err("invalid launch JSONL should fail");
+        assert_eq!(error.transport_kind(), expected, "{label}");
+    }
+}
+
+#[test]
+fn launch_reader_rejects_invalid_base64_wrong_contract_and_wrong_request_id() {
+    let mut wrong_contract = launch_stdout_event(1, "YQ==");
+    wrong_contract["contract"] = json!("example.contract/v0");
+    let mut wrong_request_id = launch_stdout_event(1, "YQ==");
+    wrong_request_id["request_id"] = json!("request-example-other");
+
+    let cases = [
+        (
+            "invalid-base64",
+            json_line(&launch_stdout_event(1, "@@@")),
+            "invalid_base64",
+        ),
+        (
+            "wrong-contract",
+            json_line(&wrong_contract),
+            "mismatched_contract",
+        ),
+        (
+            "wrong-request-id",
+            json_line(&wrong_request_id),
+            "mismatched_request_id",
+        ),
+    ];
+
+    for (label, jsonl, expected) in cases {
+        let error = LaunchJsonlReader::new(REQUEST_ID)
+            .read(jsonl.as_bytes())
+            .expect_err("correlation or base64 error should fail");
+        assert_eq!(error.transport_kind(), expected, "{label}");
+    }
+}
+
+#[test]
+fn launch_reader_rejects_sequence_and_finality_errors() {
+    let duplicate_seq = [
+        json_line(&launch_stdout_event(1, "YQ==")),
+        json_line(&launch_stderr_event(1, "Yg==")),
+    ]
+    .join("");
+    let skipped_seq = [
+        json_line(&launch_stdout_event(1, "YQ==")),
+        json_line(&launch_exit_event(3, 0)),
+    ]
+    .join("");
+    let decreasing_seq = [
+        json_line(&launch_stdout_event(2, "YQ==")),
+        json_line(&launch_exit_event(1, 0)),
+    ]
+    .join("");
+    let missing_final = json_line(&launch_stdout_event(1, "YQ=="));
+    let duplicate_exit = [
+        json_line(&launch_exit_event(1, 0)),
+        json_line(&launch_exit_event(2, 0)),
+    ]
+    .join("");
+    let event_after_exit = [
+        json_line(&launch_exit_event(1, 0)),
+        json_line(&launch_stdout_event(2, "YQ==")),
+    ]
+    .join("");
+
+    let cases = [
+        ("duplicate-seq", duplicate_seq, "duplicate_seq"),
+        ("skipped-seq", skipped_seq, "skipped_seq"),
+        ("decreasing-seq", decreasing_seq, "decreasing_seq"),
+        ("missing-final", missing_final, "missing_final_exit"),
+        ("duplicate-exit", duplicate_exit, "duplicate_exit"),
+        ("event-after-exit", event_after_exit, "event_after_exit"),
+    ];
+
+    for (label, jsonl, expected) in cases {
+        let error = LaunchJsonlReader::new(REQUEST_ID)
+            .read(jsonl.as_bytes())
+            .expect_err("ordering or finality error should fail");
+        assert_eq!(error.transport_kind(), expected, "{label}");
+    }
+}

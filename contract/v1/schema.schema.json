@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "schema.schema.json",
+  "title": "Oulipoly Provider Schema Lookup Contract",
+  "type": "object",
+  "$defs": {
+    "SchemaParams": {
+      "type": "object",
+      "properties": {
+        "schema_id": { "type": "string", "minLength": 1 }
+      },
+      "required": ["schema_id"],
+      "additionalProperties": false
+    },
+    "SchemaRequest": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/RequestEnvelope" },
+        {
+          "type": "object",
+          "properties": {
+            "params": { "$ref": "#/$defs/SchemaParams" }
+          }
+        }
+      ]
+    },
+    "SchemaResult": {
+      "type": "object",
+      "properties": {
+        "schema_id": { "type": "string", "minLength": 1 },
+        "schema": { "type": "object", "additionalProperties": true },
+        "ui": true
+      },
+      "required": ["schema_id", "schema"],
+      "additionalProperties": false
+    },
+    "SchemaResponse": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/SuccessResponseEnvelope" },
+        {
+          "type": "object",
+          "properties": {
+            "result": { "$ref": "#/$defs/SchemaResult" }
+          }
+        }
+      ]
+    },
+    "SchemaErrorResponse": {
+      "$ref": "common.schema.json#/$defs/ErrorResponseEnvelope"
+    }
+  }
+}

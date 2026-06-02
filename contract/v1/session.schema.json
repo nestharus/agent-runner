@@ -1,0 +1,183 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "session.schema.json",
+  "title": "Oulipoly Provider Session Contract",
+  "type": "object",
+  "$defs": {
+    "SessionBaseParams": {
+      "type": "object",
+      "properties": {
+        "settings_id": { "type": "string", "minLength": 1 },
+        "session_id": { "type": "string" }
+      },
+      "required": ["settings_id"],
+      "additionalProperties": true
+    },
+    "SessionLocateTranscriptRequest": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/RequestEnvelope" },
+        { "type": "object", "properties": { "params": { "$ref": "#/$defs/SessionBaseParams" } } }
+      ]
+    },
+    "SessionLocateTranscriptResult": {
+      "type": "object",
+      "properties": {
+        "located": { "type": "boolean" },
+        "path": { "type": "string" },
+        "format_id": { "type": "string" },
+        "source_id": { "type": "string" },
+        "require_existing_observed": { "type": "boolean" }
+      },
+      "required": ["located"],
+      "additionalProperties": false
+    },
+    "SessionLocateTranscriptResponse": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/SuccessResponseEnvelope" },
+        { "type": "object", "properties": { "result": { "$ref": "#/$defs/SessionLocateTranscriptResult" } } }
+      ]
+    },
+    "SessionLocateTranscriptErrorResponse": { "$ref": "common.schema.json#/$defs/ErrorResponseEnvelope" },
+    "SessionReadTurnsRequest": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/RequestEnvelope" },
+        { "type": "object", "properties": { "params": { "$ref": "#/$defs/SessionBaseParams" } } }
+      ]
+    },
+    "SessionReadTurnsResult": {
+      "type": "object",
+      "properties": {
+        "turns": {
+          "type": "array",
+          "items": { "type": "object", "additionalProperties": true }
+        },
+        "turn_count": { "type": "integer", "minimum": 0 },
+        "complete": { "type": "boolean" }
+      },
+      "required": ["turns", "turn_count", "complete"],
+      "additionalProperties": false
+    },
+    "SessionReadTurnsResponse": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/SuccessResponseEnvelope" },
+        { "type": "object", "properties": { "result": { "$ref": "#/$defs/SessionReadTurnsResult" } } }
+      ]
+    },
+    "SessionReadTurnsErrorResponse": { "$ref": "common.schema.json#/$defs/ErrorResponseEnvelope" },
+    "SessionCaptureRequest": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/RequestEnvelope" },
+        { "type": "object", "properties": { "params": { "$ref": "#/$defs/SessionBaseParams" } } }
+      ]
+    },
+    "SessionCaptureResult": {
+      "type": "object",
+      "properties": {
+        "provider_session_id": { "type": ["string", "null"] },
+        "state": { "type": ["object", "null"], "additionalProperties": true },
+        "artifacts": {
+          "type": "array",
+          "items": { "$ref": "common.schema.json#/$defs/Artifact" }
+        }
+      },
+      "required": ["artifacts"],
+      "additionalProperties": false
+    },
+    "SessionCaptureResponse": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/SuccessResponseEnvelope" },
+        { "type": "object", "properties": { "result": { "$ref": "#/$defs/SessionCaptureResult" } } }
+      ]
+    },
+    "SessionCaptureErrorResponse": { "$ref": "common.schema.json#/$defs/ErrorResponseEnvelope" },
+    "SessionExportRequest": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/RequestEnvelope" },
+        { "type": "object", "properties": { "params": { "$ref": "#/$defs/SessionBaseParams" } } }
+      ]
+    },
+    "SessionExportResult": {
+      "type": "object",
+      "properties": {
+        "canonical_format": { "type": "string", "minLength": 1 },
+        "data_base64": { "type": "string" },
+        "turn_count": { "type": "integer", "minimum": 0 },
+        "sha256": { "type": "string" }
+      },
+      "required": ["canonical_format", "data_base64", "turn_count", "sha256"],
+      "additionalProperties": false
+    },
+    "SessionExportResponse": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/SuccessResponseEnvelope" },
+        { "type": "object", "properties": { "result": { "$ref": "#/$defs/SessionExportResult" } } }
+      ]
+    },
+    "SessionExportErrorResponse": { "$ref": "common.schema.json#/$defs/ErrorResponseEnvelope" },
+    "SessionReplaceHostStatePlan": {
+      "type": "object",
+      "properties": {
+        "schema_version": { "const": 1 },
+        "operation": { "const": "session.replace" },
+        "session_id": { "type": "string", "minLength": 1 },
+        "provider_name": { "type": "string", "minLength": 1 },
+        "canonical_format": { "const": "oulipoly.canonical_transcript/v1" },
+        "turn_count": { "type": "integer", "minimum": 0 },
+        "records_sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+        "postimage_sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+        "artifacts": {
+          "type": "array",
+          "items": { "$ref": "common.schema.json#/$defs/Artifact" }
+        }
+      },
+      "required": [
+        "schema_version",
+        "operation",
+        "session_id",
+        "provider_name",
+        "canonical_format",
+        "turn_count",
+        "records_sha256",
+        "postimage_sha256",
+        "artifacts"
+      ],
+      "additionalProperties": false
+    },
+    "SessionReplaceRequest": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/RequestEnvelope" },
+        { "type": "object", "properties": { "params": { "$ref": "#/$defs/SessionBaseParams" } } }
+      ]
+    },
+    "SessionReplaceResult": {
+      "type": "object",
+      "properties": {
+        "changed": { "type": "boolean" },
+        "postimage_sha256": { "type": "string" },
+        "artifacts": {
+          "type": "array",
+          "items": { "$ref": "common.schema.json#/$defs/Artifact" }
+        },
+        "host_state_plan": { "$ref": "#/$defs/SessionReplaceHostStatePlan" }
+      },
+      "required": ["changed", "artifacts"],
+      "allOf": [
+        {
+          "if": {
+            "properties": { "changed": { "const": true } },
+            "required": ["changed"]
+          },
+          "then": { "required": ["postimage_sha256", "host_state_plan"] }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "SessionReplaceResponse": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/SuccessResponseEnvelope" },
+        { "type": "object", "properties": { "result": { "$ref": "#/$defs/SessionReplaceResult" } } }
+      ]
+    },
+    "SessionReplaceErrorResponse": { "$ref": "common.schema.json#/$defs/ErrorResponseEnvelope" }
+  }
+}

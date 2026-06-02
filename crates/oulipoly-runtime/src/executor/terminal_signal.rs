@@ -10,53 +10,13 @@
 //! `TerminalSignalEvidence`, `TerminalStatusEvidence`) and the
 //! `TerminalSignalRecognizer` trait that consumers use.
 
-use std::time::SystemTime;
+pub use oulipoly_provider::{
+    TerminalSignal, TerminalSignalEvidence, TerminalSignalKind, TerminalSignalRecognizer,
+    TerminalStatusEvidence,
+};
 
 // ## Declared roles
 // accessor, formatter, mapper, orchestration, validator
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TerminalSignalKind {
-    CleanExit,
-    NonzeroExit,
-    SignalExit,
-    SpawnError,
-    QuotaExhaustedInband,
-    MaybeQuotaExhausted,
-    RateLimited,
-    ProlongedSilence,
-    Unknown,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct TerminalSignal {
-    pub kind: TerminalSignalKind,
-    pub provider_name: String,
-    pub evidence: String,
-    pub observed_at: SystemTime,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TerminalStatusEvidence {
-    Exited { code: i32 },
-    SignalTerminated { signal: i32 },
-    SpawnError { reason: String },
-    ProlongedSilence { reason: String },
-    Unknown,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct TerminalSignalEvidence<'a> {
-    pub provider_name: &'a str,
-    pub stdout: &'a [u8],
-    pub stderr: &'a [u8],
-    pub terminal_status: TerminalStatusEvidence,
-    pub observed_at: SystemTime,
-}
-
-pub trait TerminalSignalRecognizer: Send + Sync {
-    fn recognize(&self, evidence: &TerminalSignalEvidence<'_>) -> TerminalSignal;
-}
 
 pub(crate) const TERMINAL_SIGNAL_EVIDENCE_MAX_LEN: usize = 160;
 
@@ -134,7 +94,7 @@ pub fn build_zero_turn_evidence(
 mod tests {
     use super::*;
     use crate::executor::providers;
-    use std::time::{Duration, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn observed_at() -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(139)
@@ -360,6 +320,20 @@ mod tests {
         assert_eq!(
             label_for_kind(TerminalSignalKind::QuotaExhaustedInband),
             "quota_exhausted_inband"
+        );
+    }
+
+    #[test]
+    fn terminal_dto_imports_resolve_through_provider_contract() {
+        fn assert_same_type<T>(_left: T, _right: T) {}
+
+        assert_same_type(
+            TerminalSignalKind::Unknown,
+            oulipoly_provider::TerminalSignalKind::Unknown,
+        );
+        assert_same_type(
+            TerminalStatusEvidence::Unknown,
+            oulipoly_provider::TerminalStatusEvidence::Unknown,
         );
     }
 }

@@ -5,6 +5,7 @@
 use std::io::Write as _;
 use std::path::Path;
 
+use oulipoly_config::ModelConfig;
 use oulipoly_runtime::services::InvocationLifecycleServicePort;
 use oulipoly_state::CompositeInvocationId;
 
@@ -29,6 +30,7 @@ pub(super) struct CompletedAttemptInput<'a, 'state> {
     pub(super) invocation_row_id: i64,
     pub(super) guard: &'a mut FinalizerGuard<'state>,
     pub(super) provider_name: &'a str,
+    pub(super) model: Option<&'a ModelConfig>,
     pub(super) result: &'a oulipoly_runtime::executor::ExecutionResult,
     pub(super) working_dir: Option<&'a Path>,
     pub(super) manual_migrate: Option<&'a str>,
@@ -128,6 +130,11 @@ fn handle_completed_success(input: &CompletedAttemptInput<'_, '_>) -> CompletedA
             sessions_cfg: &input.env.sessions_cfg,
             providers_cfg: Some(&input.env.providers_cfg),
             provider_name: input.provider_name,
+            external_provider: crate::session_ingest_cli::session_external_provider_identity(
+                input.agent_runtime_services,
+                input.model,
+                input.provider_name,
+            ),
             invocation_row_id: input.invocation_row_id,
             invocation_uuid: &input.invocation.id,
             effective_cwd: Some(input.effective_spawn_cwd),

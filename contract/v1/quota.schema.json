@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "quota.schema.json",
+  "title": "Oulipoly Provider Quota Contract",
+  "type": "object",
+  "$defs": {
+    "QuotaContext": { "type": "object", "additionalProperties": true },
+    "QuotaBaseParams": {
+      "type": "object",
+      "properties": {
+        "settings_id": { "type": "string", "minLength": 1 },
+        "model_name": { "type": "string" },
+        "context": { "$ref": "#/$defs/QuotaContext" }
+      },
+      "required": ["settings_id"],
+      "additionalProperties": false
+    },
+    "QuotaSourceRequest": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/RequestEnvelope" },
+        { "type": "object", "properties": { "params": { "$ref": "#/$defs/QuotaBaseParams" } } }
+      ]
+    },
+    "QuotaSourceResult": {
+      "type": "object",
+      "properties": {
+        "has_source": { "type": "boolean" },
+        "source_id": { "type": "string" },
+        "freshness": { "type": "string" }
+      },
+      "required": ["has_source", "freshness"],
+      "additionalProperties": false
+    },
+    "QuotaSourceResponse": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/SuccessResponseEnvelope" },
+        { "type": "object", "properties": { "result": { "$ref": "#/$defs/QuotaSourceResult" } } }
+      ]
+    },
+    "QuotaSourceErrorResponse": { "$ref": "common.schema.json#/$defs/ErrorResponseEnvelope" },
+    "QuotaProbeRequest": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/RequestEnvelope" },
+        { "type": "object", "properties": { "params": { "$ref": "#/$defs/QuotaBaseParams" } } }
+      ]
+    },
+    "QuotaProbeResult": {
+      "type": "object",
+      "properties": {
+        "available": { "type": "boolean" },
+        "checked_at_unix_ms": { "$ref": "common.schema.json#/$defs/UnixMilliseconds" },
+        "windows": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/QuotaProbeWindow" }
+        },
+        "detail": { "type": "string" }
+      },
+      "required": ["available", "checked_at_unix_ms", "windows"],
+      "additionalProperties": false
+    },
+    "QuotaProbeWindow": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "remaining_ratio": { "type": "number" },
+        "resets_at_unix_ms": { "$ref": "common.schema.json#/$defs/UnixMilliseconds" }
+      },
+      "required": ["remaining_ratio", "resets_at_unix_ms"],
+      "additionalProperties": false
+    },
+    "QuotaProbeResponse": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/SuccessResponseEnvelope" },
+        { "type": "object", "properties": { "result": { "$ref": "#/$defs/QuotaProbeResult" } } }
+      ]
+    },
+    "QuotaProbeErrorResponse": { "$ref": "common.schema.json#/$defs/ErrorResponseEnvelope" },
+    "QuotaRefreshAuthParams": {
+      "type": "object",
+      "properties": {
+        "settings_id": { "type": "string", "minLength": 1 },
+        "force": { "type": "boolean" },
+        "context": { "$ref": "#/$defs/QuotaContext" }
+      },
+      "required": ["settings_id"],
+      "additionalProperties": false
+    },
+    "QuotaRefreshAuthRequest": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/RequestEnvelope" },
+        { "type": "object", "properties": { "params": { "$ref": "#/$defs/QuotaRefreshAuthParams" } } }
+      ]
+    },
+    "QuotaRefreshAuthResult": {
+      "type": "object",
+      "properties": {
+        "refreshed": { "type": "boolean" },
+        "available": { "type": "boolean" },
+        "checked_at_unix_ms": { "$ref": "common.schema.json#/$defs/UnixMilliseconds" },
+        "detail": { "type": "string" }
+      },
+      "required": ["refreshed", "available", "checked_at_unix_ms"],
+      "additionalProperties": false
+    },
+    "QuotaRefreshAuthResponse": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/SuccessResponseEnvelope" },
+        { "type": "object", "properties": { "result": { "$ref": "#/$defs/QuotaRefreshAuthResult" } } }
+      ]
+    },
+    "QuotaRefreshAuthErrorResponse": { "$ref": "common.schema.json#/$defs/ErrorResponseEnvelope" }
+  }
+}
