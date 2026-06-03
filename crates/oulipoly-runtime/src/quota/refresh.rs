@@ -2,8 +2,22 @@
 //!
 //! `orchestration`, `mapper`, `accessor`, `formatter`, `predicate`, `validator`
 //!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: crates/oulipoly-runtime/src/quota/refresh.rs
+//!     role: adapter
+//!     Translates:
+//!       - quota service port contract (`QuotaServicePort`, `QuotaServiceRequest`, `QuotaServiceOutput`, `QuotaServiceExternalProviderIdentity`, `ServiceError`)
+//!       - quota refresh primitive contract (`InFlight`, `RefreshOutcome`, `QuotaScriptWindow`, `parse_output`, `run_script`, `run_auth_refresh_command_coalesced`, `AuthRefreshAttempt`)
+//!       - quota state persistence contract (`StateDb`, `QuotaWindowInput`, `upsert_quota_refresh`, `get_windows`)
+//!       - provider/session config and external-provider registry contract (`ProvidersConfig`, `SessionsConfig`, `ProviderRegistryHandle`)
+//!       - in-file test harness contract (`EnvGuard`, `chrono::Utc`, `tempfile::TempDir`, `ProviderEntry`, in-memory `StateDb` fixtures)
+//! ```
 use super::{
-    InFlight, QuotaScriptWindow, RefreshOutcome, parse_output, run_refresh_command, run_script,
+    AuthRefreshAttempt, InFlight, QuotaScriptWindow, RefreshOutcome, parse_output,
+    run_auth_refresh_command_coalesced, run_script,
 };
 use crate::provider_registry::ProviderRegistryHandle;
 use crate::services::{
@@ -164,10 +178,22 @@ fn refresh_after_auth_command(
     refresh_cmd: &str,
     state: &StateDb,
 ) -> RefreshOutcome {
-    let refresh_err = run_refresh_command(refresh_cmd).err();
+    let refresh_err = auth_refresh_error(provider_name, refresh_cmd);
     match run_quota_script(script) {
         Ok(windows) => persist_windows(provider_name, windows, state),
         Err(retry_err) => RefreshOutcome::Failed(combine_retry_error(retry_err, refresh_err)),
+    }
+}
+
+/// Run `auth_refresh_command` under the per-account single-flight lock. Only a
+/// shell-out we actually performed can contribute an error to the combined
+/// retry message; a coalesced or lock-unavailable attempt is a clean skip
+/// (another holder owns the rotation, or we fail closed), so there is nothing
+/// to combine and the quota script is simply retried with the current token.
+fn auth_refresh_error(provider_name: &str, refresh_cmd: &str) -> Option<String> {
+    match run_auth_refresh_command_coalesced(provider_name, refresh_cmd) {
+        AuthRefreshAttempt::Ran(result) => result.err(),
+        AuthRefreshAttempt::Coalesced | AuthRefreshAttempt::LockUnavailable => None,
     }
 }
 
@@ -252,6 +278,7 @@ fn has_prior_windows(state: &StateDb, provider_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::quota::marker_verification::test_support::EnvGuard;
     use chrono::Utc;
     use oulipoly_config::ProviderEntry;
 
@@ -259,6 +286,12 @@ mod tests {
 
     struct RefreshFixture {
         _dir: Option<tempfile::TempDir>,
+        // Per-test data home so the auth-refresh single-flight lock's freshness
+        // stamp starts empty and never coalesces one test's shell-out against
+        // another's. The EnvGuard also holds the process-wide env lock for the
+        // fixture lifetime, serializing these tests with the marker tests.
+        _lock_home: tempfile::TempDir,
+        _env: EnvGuard,
         marker: Option<std::path::PathBuf>,
         providers: ProvidersConfig,
         state: StateDb,
@@ -302,8 +335,12 @@ mod tests {
         marker: Option<std::path::PathBuf>,
         dir: Option<tempfile::TempDir>,
     ) -> RefreshFixture {
+        let lock_home = tempfile::tempdir().unwrap();
+        let env = EnvGuard::set("OULIPOLY_DATA_HOME", lock_home.path());
         RefreshFixture {
             _dir: dir,
+            _lock_home: lock_home,
+            _env: env,
             marker,
             providers,
             state: StateDb::open(std::path::Path::new(":memory:")).unwrap(),

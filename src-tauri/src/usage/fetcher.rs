@@ -1,3 +1,21 @@
+//! Usage-CLI quota fetcher: per-account quota-script execution, auth-refresh
+//! coalescing, and cache persistence.
+//!
+//! ## Declared roles
+//! orchestration, accessor, formatter, mapper, predicate, validator
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: src-tauri/src/usage/fetcher.rs
+//!     role: adapter
+//!     Translates:
+//!       - runtime quota refresh + shared lock-root contract (`oulipoly_runtime::quota`, `run_script`, `parse_output`, `run_auth_refresh_command_coalesced`, `AuthRefreshAttempt`, `QuotaScriptWindow`, `lock_data_home`, `sanitize_lock_key`)
+//!       - usage-refresh-lock filesystem contract (`std::fs`, `File`, `OpenOptions`, `std::io`, `std::time::SystemTime`, `Duration`)
+//!       - enumerated-account and state persistence contract (`EnumeratedAccount`, `StateDb`, `QuotaWindowInput`, `upsert_quota_refresh`, `get_windows`)
+//! ```
+
 use crate::usage::row::EnumeratedAccount;
 use oulipoly_runtime::quota::{self, QuotaScriptWindow};
 use oulipoly_state::{QuotaWindowInput, StateDb};
@@ -43,15 +61,32 @@ fn fetch_one(state: &StateDb, account: &EnumeratedAccount) -> QuotaScriptOutcome
     if should_attempt_auth_refresh(&account.account_id, &first, state)
         && let Some(refresh_cmd) = account.provider_entry.auth_refresh_command.as_deref()
     {
-        let refresh_err = quota::run_refresh_command(refresh_cmd).err();
-        let retry = run_and_parse(script).map_err(|retry_err| match refresh_err {
-            Some(err) => format!("{retry_err} (auth_refresh_command also failed: {err})"),
-            None => retry_err,
-        });
+        let refresh_err = auth_refresh_error(&account.account_id, refresh_cmd);
+        let retry =
+            run_and_parse(script).map_err(|retry_err| combine_retry_error(retry_err, refresh_err));
         return finish_updated(&account.account_id, retry, state);
     }
 
     finish_updated(&account.account_id, first, state)
+}
+
+/// Run `auth_refresh_command` through the runtime's per-account single-flight
+/// lock so the usage CLI can never race the balancer (or another usage run)
+/// into a concurrent OAuth token rotation. Only a shell-out we actually ran can
+/// contribute an error to the combined message; a coalesced / lock-unavailable
+/// attempt is a clean skip.
+fn auth_refresh_error(account_id: &str, refresh_cmd: &str) -> Option<String> {
+    match quota::run_auth_refresh_command_coalesced(account_id, refresh_cmd) {
+        quota::AuthRefreshAttempt::Ran(result) => result.err(),
+        quota::AuthRefreshAttempt::Coalesced | quota::AuthRefreshAttempt::LockUnavailable => None,
+    }
+}
+
+fn combine_retry_error(retry_err: String, refresh_err: Option<String>) -> String {
+    match refresh_err {
+        Some(err) => format!("{retry_err} (auth_refresh_command also failed: {err})"),
+        None => retry_err,
+    }
 }
 
 fn run_and_parse(script: &str) -> Result<Vec<QuotaScriptWindow>, String> {
@@ -103,7 +138,7 @@ impl RefreshFileLock {
         let dir = usage_lock_dir();
         fs::create_dir_all(&dir)
             .map_err(|err| format!("failed to create {}: {err}", dir.display()))?;
-        let path = dir.join(format!("{}.lock", sanitize_lock_name(account_id)));
+        let path = dir.join(format!("{}.lock", quota::sanitize_lock_key(account_id)));
 
         match create_lock_file(&path) {
             Ok(Some(file)) => Ok(Some(Self { path, _file: file })),
@@ -128,18 +163,7 @@ impl Drop for RefreshFileLock {
 }
 
 fn usage_lock_dir() -> PathBuf {
-    if let Some(root) = std::env::var_os("OULIPOLY_DATA_HOME") {
-        return PathBuf::from(root)
-            .join("oulipoly-agent-runner")
-            .join("usage-refresh-locks");
-    }
-    if let Some(root) = std::env::var_os("XDG_DATA_HOME") {
-        return PathBuf::from(root)
-            .join("oulipoly-agent-runner")
-            .join("usage-refresh-locks");
-    }
-    dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
+    quota::lock_data_home()
         .join("oulipoly-agent-runner")
         .join("usage-refresh-locks")
 }
@@ -176,18 +200,6 @@ fn remove_stale_lock(path: &Path) -> Result<(), String> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(format!("failed to remove stale {}: {err}", path.display())),
     }
-}
-
-fn sanitize_lock_name(name: &str) -> String {
-    name.chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 #[cfg(test)]

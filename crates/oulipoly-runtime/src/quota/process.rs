@@ -1,3 +1,21 @@
+//! Quota-script and auth-refresh process spawning, draining, and timeout
+//! handling.
+//!
+//! ## Declared roles
+//! orchestration, accessor, formatter, mapper, predicate
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: crates/oulipoly-runtime/src/quota/process.rs
+//!     role: adapter
+//!     Translates:
+//!       - std process execution contract (`std::process::Command`, `Child`, `ExitStatus`, `Stdio`)
+//!       - std concurrent stream draining contract (`std::io::Read`, `std::thread`, `JoinHandle`)
+//!       - std timeout contract (`std::time::Instant`, `std::time::Duration`)
+//! ```
+
 use std::io::Read;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread::JoinHandle;
@@ -8,6 +26,11 @@ const SCRIPT_TIMEOUT_SECS: u64 = 30;
 /// endpoint and exits); kept tight to avoid hanging the quota path.
 const REFRESH_TIMEOUT_SECS: u64 = 15;
 
+/// Raw `auth_refresh_command` shell-out. This rotates a single-use OAuth
+/// refresh token, so production callers MUST go through
+/// [`super::run_auth_refresh_command_coalesced`] (the per-account single-flight
+/// lock) rather than calling this directly; an unsynchronized invocation can
+/// race a concurrent refresh and trigger provider reuse-detection revocation.
 pub fn run_refresh_command(cmd_str: &str) -> Result<(), String> {
     let mut child = spawn_refresh_command(cmd_str)?;
     let stderr_handle = drain_child_stderr(&mut child);

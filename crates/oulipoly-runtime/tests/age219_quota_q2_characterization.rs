@@ -1,3 +1,20 @@
+//! ## Declared roles
+//! orchestration, accessor, formatter, mapper, validator, predicate
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-runtime/tests/age219_quota_q2_characterization.rs
+//!     role: intrinsic-surface
+//!     Domain: quota_q2_routing_characterization_harness
+//!     Owns:
+//!       - PATH and OULIPOLY_DATA_HOME env override isolation under a process mutex
+//!       - provider/session config and StateDb fixture construction
+//!       - quota/usage shell-script fixture formatting and shell-word quoting
+//!       - quota refresh routing/source/auth-refresh behavior assertions
+//! ```
+
 use oulipoly_config::{
     ProviderEntry, ProvidersConfig, SessionSourceEntry, SessionStorage, SessionsConfig,
 };
@@ -49,6 +66,44 @@ impl Drop for PathOverride {
             match &self.previous {
                 Some(previous) => std::env::set_var("PATH", previous),
                 None => std::env::remove_var("PATH"),
+            }
+        }
+    }
+}
+
+/// Points `OULIPOLY_DATA_HOME` at a fresh tempdir so the per-account
+/// auth-refresh single-flight lock's freshness stamp starts empty for this
+/// test (otherwise a reused provider key would coalesce one auth test's
+/// shell-out against another's). Caller MUST hold `env_lock()` for the guard's
+/// lifetime.
+struct DataHomeOverride {
+    _home: tempfile::TempDir,
+    previous: Option<OsString>,
+}
+
+impl DataHomeOverride {
+    fn set() -> Self {
+        let home = tempfile::tempdir().expect("data home tempdir");
+        let previous = std::env::var_os("OULIPOLY_DATA_HOME");
+        // SAFETY: callers hold ENV_LOCK for the override's lifetime, serializing
+        // this process-global mutation with every other env-mutating test here.
+        unsafe {
+            std::env::set_var("OULIPOLY_DATA_HOME", home.path());
+        }
+        Self {
+            _home: home,
+            previous,
+        }
+    }
+}
+
+impl Drop for DataHomeOverride {
+    fn drop(&mut self) {
+        // SAFETY: the owning test still holds ENV_LOCK until after this restore.
+        unsafe {
+            match &self.previous {
+                Some(previous) => std::env::set_var("OULIPOLY_DATA_HOME", previous),
+                None => std::env::remove_var("OULIPOLY_DATA_HOME"),
             }
         }
     }
@@ -421,6 +476,7 @@ fn legacy_sessions_fallback_derives_and_executes_claude_and_codex_quota_scripts(
 #[test]
 fn auth_refresh_command_is_preserved_for_explicit_provider_storage_and_legacy_sources() {
     let _env_guard = env_lock();
+    let _data_home = DataHomeOverride::set();
     let dir = tempfile::tempdir().expect("tempdir");
     let bin_dir = dir.path().join("bin");
     fs::create_dir(&bin_dir).expect("bin dir");
@@ -559,6 +615,8 @@ fn has_refresh_source_matrix_covers_explicit_derived_unsupported_missing_and_emp
 
 #[test]
 fn auth_refresh_command_failure_is_non_fatal_when_retried_quota_script_succeeds() {
+    let _env_guard = env_lock();
+    let _data_home = DataHomeOverride::set();
     let dir = tempfile::tempdir().expect("tempdir");
     let first_run_marker = dir.path().join("first-run");
     let quota_script = format!(
@@ -584,6 +642,8 @@ fn auth_refresh_command_failure_is_non_fatal_when_retried_quota_script_succeeds(
 
 #[test]
 fn auth_refresh_retries_empty_windows_when_prior_windows_exist() {
+    let _env_guard = env_lock();
+    let _data_home = DataHomeOverride::set();
     let dir = tempfile::tempdir().expect("tempdir");
     let refreshed_marker = dir.path().join("refreshed");
     let quota_script = format!(
@@ -628,6 +688,8 @@ fn auth_refresh_skips_first_contact_empty_windows() {
 
 #[test]
 fn auth_refresh_retries_after_script_failure() {
+    let _env_guard = env_lock();
+    let _data_home = DataHomeOverride::set();
     let dir = tempfile::tempdir().expect("tempdir");
     let refreshed_marker = dir.path().join("refreshed");
     let quota_script = format!(
@@ -651,6 +713,8 @@ fn auth_refresh_retries_after_script_failure() {
 
 #[test]
 fn auth_refresh_returns_failed_when_retry_still_fails() {
+    let _env_guard = env_lock();
+    let _data_home = DataHomeOverride::set();
     let providers = provider_with(ProviderEntry {
         quota_script: Some("printf 'quota denied\\n' >&2; exit 1".to_string()),
         auth_refresh_command: Some("true".to_string()),
@@ -664,6 +728,8 @@ fn auth_refresh_returns_failed_when_retry_still_fails() {
 
 #[test]
 fn auth_refresh_combines_retry_and_refresh_errors_when_both_fail() {
+    let _env_guard = env_lock();
+    let _data_home = DataHomeOverride::set();
     let providers = provider_with(ProviderEntry {
         quota_script: Some("printf 'quota denied\\n' >&2; exit 1".to_string()),
         auth_refresh_command: Some("printf 'token gone\\n' >&2; exit 7".to_string()),
