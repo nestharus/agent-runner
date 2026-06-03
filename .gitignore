@@ -42,5 +42,9 @@ tmp/
 .tmp/
 CODERABBIT_*.md
 
+# Per-WU gate/audit evidence (auditor reports, prompts, logs, RCA notes —
+# persisted on disk for review, never committed or vocabulary-scanned)
+/planning/fix-*/
+
 # Worktrees (per-PR isolation for phase 6)
 /worktrees/

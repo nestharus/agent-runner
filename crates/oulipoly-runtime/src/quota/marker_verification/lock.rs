@@ -15,7 +15,7 @@
 //!       - marker verification lock naming contract (`sanitize_lock_name`, `.lock`, `oulipoly-agent-runner/usage-refresh-locks`)
 //! ```
 
-use std::ffi::OsString;
+use crate::quota::lock_paths;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 
@@ -94,53 +94,11 @@ fn provider_lock_file_name(provider_name: &str) -> String {
 }
 
 pub(super) fn usage_lock_dir() -> PathBuf {
-    usage_data_home()
+    lock_paths::data_home()
         .join("oulipoly-agent-runner")
         .join("usage-refresh-locks")
 }
 
-fn usage_data_home() -> PathBuf {
-    configured_oulipoly_data_home()
-        .or_else(configured_xdg_data_home)
-        .unwrap_or_else(default_data_home)
-}
-
-fn configured_oulipoly_data_home() -> Option<PathBuf> {
-    env_path("OULIPOLY_DATA_HOME")
-}
-
-fn configured_xdg_data_home() -> Option<PathBuf> {
-    env_path("XDG_DATA_HOME")
-}
-
-fn env_path(name: &str) -> Option<PathBuf> {
-    env_os(name).map(path_from_os)
-}
-
-fn env_os(name: &str) -> Option<OsString> {
-    std::env::var_os(name)
-}
-
-fn path_from_os(value: OsString) -> PathBuf {
-    PathBuf::from(value)
-}
-
-fn default_data_home() -> PathBuf {
-    dirs::data_dir().unwrap_or_else(current_dir_path)
-}
-
-fn current_dir_path() -> PathBuf {
-    PathBuf::from(".")
-}
-
 pub(super) fn sanitize_lock_name(name: &str) -> String {
-    name.chars().map(sanitize_lock_char).collect()
-}
-
-fn sanitize_lock_char(ch: char) -> char {
-    if lock_char_is_safe(ch) { ch } else { '_' }
-}
-
-fn lock_char_is_safe(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'
+    lock_paths::sanitize_lock_name(name)
 }

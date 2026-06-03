@@ -1,6 +1,20 @@
 //! ## Declared roles
 //!
-//! `mapper`, `orchestration`, `accessor`, `validator`
+//! `mapper`, `orchestration`, `accessor`, `validator`, `formatter`
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-runtime/tests/age34_runtime_quota_service_routing.rs
+//!     role: intrinsic-surface
+//!     Domain: runtime_quota_service_routing_parity_harness
+//!     Owns:
+//!       - OULIPOLY_DATA_HOME env override isolation under a process mutex
+//!       - provider config, provider-registry handle, and StateDb fixture construction
+//!       - direct-vs-service refresh parity evidence mapping
+//!       - quota service routing/in-flight/failure assertions
+//! ```
 //!
 use oulipoly_config::{
     ModelConfig, PromptMode, ProviderConfig, ProviderEntry, ProvidersConfig,
@@ -12,8 +26,56 @@ use oulipoly_runtime::provider_registry::{
 use oulipoly_runtime::quota::{self, InFlight, RefreshOutcome};
 use oulipoly_runtime::services::{QuotaServiceOutput, QuotaServicePort, QuotaServiceRequest};
 use oulipoly_state::{QuotaRecord, QuotaWindow, StateDb};
+use std::ffi::OsString;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+
+static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn env_lock() -> MutexGuard<'static, ()> {
+    ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Points `OULIPOLY_DATA_HOME` at a fresh tempdir for the lifetime of the
+/// guard so the per-account auth-refresh single-flight lock's freshness stamp
+/// starts empty and never bleeds across tests or test binaries.
+struct DataHomeOverride {
+    _home: tempfile::TempDir,
+    _lock: MutexGuard<'static, ()>,
+    previous: Option<OsString>,
+}
+
+impl DataHomeOverride {
+    fn new() -> Self {
+        let lock = env_lock();
+        let home = tempfile::tempdir().expect("data home tempdir");
+        let previous = std::env::var_os("OULIPOLY_DATA_HOME");
+        // SAFETY: the held ENV_LOCK serializes this process-global mutation.
+        unsafe {
+            std::env::set_var("OULIPOLY_DATA_HOME", home.path());
+        }
+        Self {
+            _home: home,
+            _lock: lock,
+            previous,
+        }
+    }
+}
+
+impl Drop for DataHomeOverride {
+    fn drop(&mut self) {
+        // SAFETY: this guard still holds ENV_LOCK until after the restore.
+        unsafe {
+            match &self.previous {
+                Some(previous) => std::env::set_var("OULIPOLY_DATA_HOME", previous),
+                None => std::env::remove_var("OULIPOLY_DATA_HOME"),
+            }
+        }
+    }
+}
 
 fn providers_with_quota_script(script: &str) -> ProvidersConfig {
     providers_with_quota_script_and_refresh(script, None)
@@ -351,6 +413,7 @@ fn runtime_quota_service_no_script_matches_direct_refresh_provider() {
 // Source: AGE-34 contract "Expected observable signals" for Q1 error paths.
 #[test]
 fn runtime_quota_service_failed_retry_matches_direct_refresh_provider() {
+    let _data_home = DataHomeOverride::new();
     let providers = providers_with_quota_script_and_refresh(
         "echo 'quota unavailable' >&2; exit 7",
         Some("true"),
