@@ -442,10 +442,10 @@ index ef17867..3d64012 100644
  
  if args != ["export", "ses_fixture"]:
 diff --git a/scripts/opencode-turns b/scripts/opencode-turns
-index 7d99ff6..dc3070d 100644
+index 7d99ff6..92e789b 100644
 --- a/scripts/opencode-turns
 +++ b/scripts/opencode-turns
-@@ -6,29 +6,103 @@ Usage: opencode-turns BASE_DIR [SESSION_ID ...]
+@@ -6,29 +6,106 @@ Usage: opencode-turns BASE_DIR [SESSION_ID ...]
     e.g. opencode-turns ~/.local/share/opencode ses_abc123
  
  Session IDs and message content are read through the public OpenCode CLI:
@@ -487,8 +487,10 @@ index 7d99ff6..dc3070d 100644
  
  
  MESSAGE_LIST_KEYS = ("messages", "turns", "items", "entries")
++CONTENT_NESTED_KEYS = ("parts", "content", "message")
  SESSION_ID_RE = re.compile(r"\bses_[A-Za-z0-9_-]+\b")
 +SESSION_ID_KEYS = ("sessionID", "sessionId", "session_id", "id")
++TURN_ID_KEYS = ("id", "messageID", "messageId", "message_id")
 +SESSION_TIMESTAMP_KEYS = (
 +    "updatedAt",
 +    "updated_at",
@@ -504,6 +506,7 @@ index 7d99ff6..dc3070d 100644
 +DEFAULT_MAX_SESSIONS = 25
 +DEFAULT_CALL_TIMEOUT_SECS = 20.0
 +DEFAULT_DEADLINE_SECS = 60.0
++JSON_PARSE_FAILED = object()
 +
 +
 +class Options:
@@ -552,34 +555,125 @@ index 7d99ff6..dc3070d 100644
  
  
  def text_chunk(text: str) -> dict:
-@@ -91,32 +165,121 @@ def session_ids_from_value(value: Any) -> list[str]:
+@@ -45,23 +122,47 @@ def canonical_chunk_type(native_type) -> str:
+ 
+ def extract_content_chunks(value) -> list:
+     if isinstance(value, str):
+-        return [text_chunk(value)]
++        return content_chunks_from_text(value)
+     if isinstance(value, list):
+-        chunks = []
+-        for item in value:
+-            chunks.extend(extract_content_chunks(item))
+-        return chunks
++        return content_chunks_from_items(value)
+     if isinstance(value, dict):
+-        text = value.get("text")
+-        if text is None:
+-            text = value.get("content")
+-        if isinstance(text, str):
+-            native_type = value.get("type") or "text"
+-            return [{"type": canonical_chunk_type(native_type), "text": text}]
+-        for key in ("parts", "content", "message"):
+-            chunks = extract_content_chunks(value.get(key))
+-            if chunks:
+-                return chunks
++        return content_chunks_from_obj(value)
++    return []
++
++
++def content_chunks_from_text(value: str) -> list:
++    return [text_chunk(value)]
++
++
++def content_chunks_from_items(values: list) -> list:
++    chunks = []
++    for item in values:
++        chunks.extend(extract_content_chunks(item))
++    return chunks
++
++
++def content_chunks_from_obj(obj: dict) -> list:
++    chunks = direct_content_chunks_from_obj(obj)
++    if chunks:
++        return chunks
++    return nested_content_chunks_from_obj(obj)
++
++
++def direct_content_chunks_from_obj(obj: dict) -> list:
++    text = obj.get("text")
++    if text is None:
++        text = obj.get("content")
++    if not isinstance(text, str):
++        return []
++    native_type = obj.get("type") or "text"
++    return [{"type": canonical_chunk_type(native_type), "text": text}]
++
++
++def nested_content_chunks_from_obj(obj: dict) -> list:
++    for key in CONTENT_NESTED_KEYS:
++        chunks = extract_content_chunks(obj.get(key))
++        if chunks:
++            return chunks
+     return []
+ 
+ 
+@@ -91,32 +192,156 @@ def session_ids_from_value(value: Any) -> list[str]:
      return []
  
  
 -def parse_session_list_stdout(stdout: str) -> list[str]:
 +def parse_session_list_stdout(stdout: str, options: Options) -> list[str]:
-     try:
-         parsed = json.loads(stdout)
-     except json.JSONDecodeError:
--        parsed = stdout
--    return sorted(unique_values(session_ids_from_value(parsed)))
-+        return unique_values(session_ids_from_value(stdout))[: options.max_sessions]
++    parsed = parse_session_list_json(stdout)
++    if parsed is JSON_PARSE_FAILED:
++        return capped_session_ids_from_value(stdout, options.max_sessions)
 +
 +    candidates = unique_session_candidates(session_candidates_from_value(parsed))
 +    if not candidates:
-+        return unique_values(session_ids_from_value(parsed))[: options.max_sessions]
++        return capped_session_ids_from_value(parsed, options.max_sessions)
 +
-+    if any(candidate.get("timestamp") is not None for candidate in candidates):
-+        cutoff = datetime.now(timezone.utc) - timedelta(hours=options.window_hours)
-+        return [
-+            candidate["session_id"]
-+            for candidate in candidates
-+            if candidate.get("timestamp") is not None and candidate["timestamp"] >= cutoff
-+        ]
-+
-+    return [candidate["session_id"] for candidate in candidates][: options.max_sessions]
++    return session_ids_from_candidates(candidates, options)
 +
 +
++def parse_session_list_json(stdout: str):
+     try:
+-        parsed = json.loads(stdout)
++        return json.loads(stdout)
+     except json.JSONDecodeError:
+-        parsed = stdout
+-    return sorted(unique_values(session_ids_from_value(parsed)))
++        return JSON_PARSE_FAILED
++
++
++def capped_session_ids_from_value(value: Any, max_sessions: int) -> list[str]:
++    return unique_values(session_ids_from_value(value))[:max_sessions]
++
++
++def session_ids_from_candidates(candidates: list[dict], options: Options) -> list[str]:
++    if candidates_have_timestamps(candidates):
++        return recent_session_ids(candidates, options.window_hours)
++    return capped_candidate_session_ids(candidates, options.max_sessions)
++
++
++def candidates_have_timestamps(candidates: list[dict]) -> bool:
++    return any(candidate.get("timestamp") is not None for candidate in candidates)
++
++
++def recent_session_ids(candidates: list[dict], window_hours: float) -> list[str]:
++    cutoff = datetime.now(timezone.utc) - timedelta(hours=window_hours)
++    return [
++        candidate["session_id"]
++        for candidate in candidates
++        if candidate.get("timestamp") is not None and candidate["timestamp"] >= cutoff
++    ]
++
++
++def capped_candidate_session_ids(candidates: list[dict], max_sessions: int) -> list[str]:
++    return [candidate["session_id"] for candidate in candidates][:max_sessions]
+ 
+ 
+-def discover_session_ids() -> list[str]:
+-    command = opencode_command() + ["session", "list"]
 +def unique_session_candidates(candidates: list[dict]) -> list[dict]:
 +    seen = set()
 +    unique = []
@@ -594,28 +688,36 @@ index 7d99ff6..dc3070d 100644
 +
 +def session_candidates_from_value(value: Any) -> list[dict]:
 +    if isinstance(value, list):
-+        candidates = []
-+        for item in value:
-+            candidates.extend(session_candidates_from_value(item))
-+        return candidates
++        return session_candidates_from_items(value)
 +    if isinstance(value, dict):
-+        session_id = session_list_session_id(value)
-+        if session_id:
-+            return [
-+                {
-+                    "session_id": session_id,
-+                    "timestamp": session_list_timestamp(value),
-+                }
-+            ]
-+        candidates = []
-+        for item in value.values():
-+            candidates.extend(session_candidates_from_value(item))
-+        return candidates
++        return session_candidates_from_obj(value)
 +    return []
- 
- 
--def discover_session_ids() -> list[str]:
--    command = opencode_command() + ["session", "list"]
++
++
++def session_candidates_from_items(values) -> list[dict]:
++    candidates = []
++    for item in values:
++        candidates.extend(session_candidates_from_value(item))
++    return candidates
++
++
++def session_candidates_from_obj(obj: dict) -> list[dict]:
++    if has_session_candidate_shape(obj):
++        return [session_candidate_from_obj(obj)]
++    return session_candidates_from_items(obj.values())
++
++
++def has_session_candidate_shape(obj: dict) -> bool:
++    return session_list_session_id(obj) is not None
++
++
++def session_candidate_from_obj(obj: dict) -> dict:
++    return {
++        "session_id": session_list_session_id(obj),
++        "timestamp": session_list_timestamp(obj),
++    }
++
++
 +def session_list_session_id(obj: dict) -> str | None:
 +    for key in SESSION_ID_KEYS:
 +        value = obj.get(key)
@@ -661,7 +763,7 @@ index 7d99ff6..dc3070d 100644
 +        parsed = parsed.replace(tzinfo=timezone.utc)
 +    return parsed.astimezone(timezone.utc)
 +
- 
++
 +def numeric_timestamp_datetime(value: int | float) -> datetime | None:
 +    seconds = value / 1000 if value > 10_000_000_000 else value
 +    try:
@@ -669,8 +771,8 @@ index 7d99ff6..dc3070d 100644
 +    except (OverflowError, OSError, ValueError):
 +        return None
  
+ 
 -def requested_session_ids(args: list[str]) -> list[str]:
-+
 +def discover_session_ids(options: Options, deadline: Deadline) -> tuple[list[str], bool]:
 +    stdout, timed_out = run_opencode(["session", "list", "--json"], options, deadline)
 +    if timed_out:
@@ -691,7 +793,43 @@ index 7d99ff6..dc3070d 100644
  
  
  def numeric_timestamp(value) -> str | None:
-@@ -174,6 +337,53 @@ def opencode_command() -> list[str]:
+@@ -156,16 +381,28 @@ def role_from_obj(obj: dict) -> str | None:
+ 
+ 
+ def turn_id_from_obj(obj: dict, default_session_id: str, index: int) -> str:
+-    for key in ("id", "messageID", "messageId", "message_id"):
++    return turn_id_field_from_obj(obj) or fallback_turn_id(default_session_id, index)
++
++
++def turn_id_field_from_obj(obj: dict) -> str | None:
++    value = turn_id_field_from_mapping(obj)
++    if value:
++        return value
++    message = obj.get("message")
++    if isinstance(message, dict):
++        return turn_id_field_from_mapping(message)
++    return None
++
++
++def turn_id_field_from_mapping(obj: dict) -> str | None:
++    for key in TURN_ID_KEYS:
+         value = obj.get(key)
+         if isinstance(value, str) and value:
+             return value
+-    message = obj.get("message")
+-    if isinstance(message, dict):
+-        for key in ("id", "messageID", "messageId", "message_id"):
+-            value = message.get(key)
+-            if isinstance(value, str) and value:
+-                return value
++    return None
++
++
++def fallback_turn_id(default_session_id: str, index: int) -> str:
+     return f"{default_session_id}:{index}"
+ 
+ 
+@@ -174,6 +411,86 @@ def opencode_command() -> list[str]:
      return shlex.split(configured) or ["opencode"]
  
  
@@ -699,28 +837,61 @@ index 7d99ff6..dc3070d 100644
 +    args: list[str], options: Options, deadline: Deadline
 +) -> tuple[str | None, bool]:
 +    timeout = deadline.call_timeout(options.call_timeout)
-+    if timeout <= 0:
-+        return None, True
++    if opencode_deadline_expired(timeout):
++        return degraded_opencode_result()
 +    try:
-+        process = subprocess.Popen(
-+            opencode_command() + args,
-+            stdout=subprocess.PIPE,
-+            stderr=subprocess.PIPE,
-+            stdin=subprocess.DEVNULL,
-+            text=True,
-+            start_new_session=True,
-+        )
++        process = spawn_opencode_process(args)
 +    except OSError:
-+        return None, False
++        return failed_opencode_result()
 +
++    stdout, timed_out = communicate_opencode_process(process, timeout)
++    if timed_out:
++        kill_process_group(process)
++        return degraded_opencode_result()
++
++    if opencode_process_failed(process):
++        return failed_opencode_result()
++    return successful_opencode_result(stdout)
++
++
++def opencode_deadline_expired(timeout: float) -> bool:
++    return timeout <= 0
++
++
++def spawn_opencode_process(args: list[str]) -> subprocess.Popen:
++    return subprocess.Popen(
++        opencode_command() + args,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        stdin=subprocess.DEVNULL,
++        text=True,
++        start_new_session=True,
++    )
++
++
++def communicate_opencode_process(
++    process: subprocess.Popen, timeout: float
++) -> tuple[str | None, bool]:
 +    try:
 +        stdout, _stderr = process.communicate(timeout=timeout)
 +    except subprocess.TimeoutExpired:
-+        kill_process_group(process)
 +        return None, True
++    return stdout, False
 +
-+    if process.returncode != 0:
-+        return None, False
++
++def opencode_process_failed(process: subprocess.Popen) -> bool:
++    return process.returncode != 0
++
++
++def degraded_opencode_result() -> tuple[str | None, bool]:
++    return None, True
++
++
++def failed_opencode_result() -> tuple[str | None, bool]:
++    return None, False
++
++
++def successful_opencode_result(stdout: str | None) -> tuple[str | None, bool]:
 +    return stdout, False
 +
 +
@@ -745,7 +916,7 @@ index 7d99ff6..dc3070d 100644
  def parse_export_stdout(stdout: str) -> Any | None:
      try:
          return json.loads(stdout)
-@@ -181,18 +391,15 @@ def parse_export_stdout(stdout: str) -> Any | None:
+@@ -181,67 +498,117 @@ def parse_export_stdout(stdout: str) -> Any | None:
          return None
  
  
@@ -773,15 +944,102 @@ index 7d99ff6..dc3070d 100644
  
  
  def exported_message_items(exported: Any) -> list[dict]:
-@@ -229,19 +436,39 @@ def record_from_message(default_session_id: str, index: int, obj: dict) -> dict
++    items = exported_message_item_values(exported)
++    if items is None:
++        return []
++    return dict_items(items)
++
++
++def exported_message_item_values(exported: Any) -> list | None:
+     if isinstance(exported, list):
+-        return [item for item in exported if isinstance(item, dict)]
++        return exported
+     if not isinstance(exported, dict):
+-        return []
++        return None
+     for key in MESSAGE_LIST_KEYS:
+         value = exported.get(key)
+         if isinstance(value, list):
+-            return [item for item in value if isinstance(item, dict)]
++            return value
+     if role_from_obj(exported):
+         return [exported]
+-    return []
++    return None
++
++
++def dict_items(items: list) -> list[dict]:
++    return [item for item in items if isinstance(item, dict)]
+ 
+ 
+ def record_from_message(default_session_id: str, index: int, obj: dict) -> dict | None:
+-    session_id = session_id_from_obj(obj) or default_session_id
+-    role = role_from_obj(obj)
+-    timestamp = timestamp_from_obj(obj)
+-    if not session_id or not role or not timestamp:
++    fields = message_record_fields(default_session_id, obj)
++    if not has_required_message_record_fields(fields):
+         return None
+-    record = {
+-        "session_id": session_id,
+-        "turn_id": turn_id_from_obj(obj, default_session_id, index),
+-        "timestamp": timestamp,
+-        "role": role,
+-    }
+-    body = extract_content_chunks(obj.get("parts")) or extract_content_chunks(
+-        obj.get("content")
+-    ) or extract_content_chunks(obj.get("message"))
++    record = message_record_from_fields(
++        fields, turn_id_from_obj(obj, default_session_id, index)
++    )
++    body = message_body_chunks(obj)
+     if body:
+         record["body"] = body
      return record
  
  
+-def emit_record(record: dict, out) -> None:
+-    out.write(json.dumps(record, separators=(",", ":")))
+-    out.write("\n")
++def message_record_fields(default_session_id: str, obj: dict) -> dict:
++    return {
++        "session_id": session_id_from_obj(obj) or default_session_id,
++        "role": role_from_obj(obj),
++        "timestamp": timestamp_from_obj(obj),
++    }
++
++
++def has_required_message_record_fields(fields: dict) -> bool:
++    return bool(fields.get("session_id") and fields.get("role") and fields.get("timestamp"))
++
++
++def message_record_from_fields(fields: dict, turn_id: str) -> dict:
++    return {
++        "session_id": fields["session_id"],
++        "turn_id": turn_id,
++        "timestamp": fields["timestamp"],
++        "role": fields["role"],
++    }
++
++
++def message_body_chunks(obj: dict) -> list:
++    return (
++        extract_content_chunks(obj.get("parts"))
++        or extract_content_chunks(obj.get("content"))
++        or extract_content_chunks(obj.get("message"))
++    )
+ 
+ 
+-def emit_session(session_id: str, out) -> None:
+-    exported = export_session(session_id)
+-    if exported is None:
+-        return
 +def records_from_exported_session(session_id: str, exported: Any) -> list[dict]:
 +    records = []
-+    for index, obj in enumerate(exported_message_items(exported), start=1):
-+        record = record_from_message(session_id, index, obj)
-+        if record:
+     for index, obj in enumerate(exported_message_items(exported), start=1):
+         record = record_from_message(session_id, index, obj)
+         if record:
+-            emit_record(record, out)
 +            records.append(record)
 +    return records
 +
@@ -802,26 +1060,18 @@ index 7d99ff6..dc3070d 100644
 +    return records, degraded
 +
 +
- def emit_record(record: dict, out) -> None:
-     out.write(json.dumps(record, separators=(",", ":")))
-     out.write("\n")
- 
- 
--def emit_session(session_id: str, out) -> None:
--    exported = export_session(session_id)
--    if exported is None:
--        return
--    for index, obj in enumerate(exported_message_items(exported), start=1):
--        record = record_from_message(session_id, index, obj)
--        if record:
--            emit_record(record, out)
++def emit_record(record: dict, out) -> None:
++    out.write(json.dumps(record, separators=(",", ":")))
++    out.write("\n")
++
++
 +def emit_degraded_marker(records: list[dict], out) -> None:
 +    count = sum(1 for record in records if record.get("role") == "assistant")
 +    emit_record({"degraded": True, "count": count}, out)
  
  
  def main() -> int:
-@@ -249,9 +476,16 @@ def main() -> int:
+@@ -249,9 +616,16 @@ def main() -> int:
          print("usage: opencode-turns BASE_DIR [SESSION_ID ...]", file=sys.stderr)
          return 2
      _base_dir = sys.argv[1]

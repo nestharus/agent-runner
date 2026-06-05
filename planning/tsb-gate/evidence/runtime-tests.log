@@ -1,6 +1,6 @@
 # tsb gate evidence
 
-Base diff regenerated with `git diff 9545ff8` into `planning/tsb-gate/gates/diff.patch`.
+Base diff regenerated with `git diff 9545ff8 -- <touched source/test paths>` into `planning/tsb-gate/gates/diff.patch`.
 
 The following gates were run with `OULIPOLY_DATA_DIR` unset and XDG paths isolated:
 

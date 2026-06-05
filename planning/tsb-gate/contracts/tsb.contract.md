@@ -69,12 +69,27 @@ Only added or meaningfully changed production functions are listed for Rust file
 | `env_int` | `parser` | Parses a positive integer env value with fallback default. | None. |
 | `text_chunk` | `mapper` | Maps text into the canonical body chunk shape. | None. |
 | `canonical_chunk_type` | `mapper` | Maps OpenCode/native chunk type names to canonical chunk type names. | None. |
-| `extract_content_chunks` | `parser` | Extracts canonical chunks from nested OpenCode content shapes. | `MULTI-CLASSIFIER-RISK`: recursive parsing and canonical mapping are combined. |
+| `extract_content_chunks` | `orchestration` | Dispatches content extraction by value shape to single-role chunk helpers. | None; recursion and per-shape parsing/mapping are delegated. |
+| `content_chunks_from_text` | `mapper` | Maps a plain string content value into one canonical text chunk. | None. |
+| `content_chunks_from_items` | `orchestration` | Recursively accumulates chunks from a list of content values. | None. |
+| `content_chunks_from_obj` | `orchestration` | Applies direct-object chunk parsing before nested-object recursion. | None; both branches are delegated. |
+| `direct_content_chunks_from_obj` | `parser` | Parses one text-bearing content dictionary into a canonical chunk shape. | None; type canonicalization is delegated. |
+| `nested_content_chunks_from_obj` | `orchestration` | Tries known nested content fields and returns the first non-empty recursive chunk result. | None. |
 | `unique_values` | `filter` | Deduplicates values while preserving order. | None. |
 | `session_ids_from_value` | `parser` | Recursively extracts `ses_*` identifiers from arbitrary values. | None. |
-| `parse_session_list_stdout` | `parser` | Parses OpenCode session-list stdout and returns bounded session IDs. | `MULTI-CLASSIFIER-RISK`: parses JSON, filters by recent window, and applies max-session cap fallback. |
+| `parse_session_list_stdout` | `orchestration` | Coordinates session-list JSON parsing, candidate extraction, and fallback ID selection. | None; parse, recent-window filtering, and cap filtering are delegated. |
+| `parse_session_list_json` | `parser` | Parses OpenCode session-list stdout as JSON or returns the parse-failed sentinel. | None. |
+| `capped_session_ids_from_value` | `filter` | Extracts unique session IDs from a value and applies the max-session cap. | None. |
+| `session_ids_from_candidates` | `orchestration` | Selects timestamp-window filtering or max-cap filtering for candidate rows. | None; predicate and filters are delegated. |
+| `candidates_have_timestamps` | `predicate` | Answers whether any session candidate has a parsed timestamp. | None. |
+| `recent_session_ids` | `filter` | Filters timestamped candidates to the recent quota-balancing window. | None. |
+| `capped_candidate_session_ids` | `filter` | Applies the max-session cap to candidate session IDs. | None. |
 | `unique_session_candidates` | `filter` | Deduplicates candidate session dictionaries by `session_id`. | None. |
-| `session_candidates_from_value` | `parser` | Recursively extracts session candidate dictionaries from parsed OpenCode output. | `MULTI-CLASSIFIER-RISK`: recursive parsing and candidate mapping are combined. |
+| `session_candidates_from_value` | `orchestration` | Dispatches recursive candidate extraction by parsed value shape. | None; candidate-shape predicate and mapping are delegated. |
+| `session_candidates_from_items` | `orchestration` | Recursively accumulates candidate rows from iterable parsed values. | None. |
+| `session_candidates_from_obj` | `orchestration` | Routes one dictionary either to candidate mapping or recursive value traversal. | None; shape predicate and mapping are delegated. |
+| `has_session_candidate_shape` | `predicate` | Answers whether a dictionary has a recognizable OpenCode session ID field. | None. |
+| `session_candidate_from_obj` | `mapper` | Maps a recognized session-list object into a session candidate row. | None; field parsing is delegated. |
 | `session_list_session_id` | `parser` | Extracts a session ID from known OpenCode session-list fields. | None. |
 | `session_list_timestamp` | `parser` | Extracts a session timestamp from known OpenCode session-list fields. | None. |
 | `timestamp_datetime` | `parser` | Parses string or numeric timestamps into UTC datetimes. | None. |
@@ -85,14 +100,30 @@ Only added or meaningfully changed production functions are listed for Rust file
 | `timestamp_from_obj` | `parser` | Extracts a turn timestamp from exported OpenCode message objects. | None. |
 | `session_id_from_obj` | `parser` | Extracts a session ID from exported OpenCode message objects. | None. |
 | `role_from_obj` | `parser` | Extracts `user` or `assistant` role from message objects. | None. |
-| `turn_id_from_obj` | `parser` | Extracts a turn ID or synthesizes a deterministic fallback ID. | `MULTI-CLASSIFIER-RISK`: field parsing plus fallback ID formatting. |
+| `turn_id_from_obj` | `orchestration` | Selects a parsed turn ID or deterministic fallback ID. | None; field parsing and fallback formatting are delegated. |
+| `turn_id_field_from_obj` | `parser` | Extracts a turn ID from top-level or nested message objects. | None. |
+| `turn_id_field_from_mapping` | `parser` | Extracts a turn ID from known ID fields on one mapping. | None. |
+| `fallback_turn_id` | `formatter` | Formats the deterministic fallback turn ID from session ID and index. | None. |
 | `opencode_command` | `parser` | Parses `OPENCODE_BIN` into argv tokens with default fallback. | None. |
-| `run_opencode` | `orchestration` | Spawns OpenCode CLI, applies per-call/deadline timeout, kills on timeout, and returns stdout/degraded state. | `MULTI-CLASSIFIER-RISK`: process execution, deadline classification, and timeout kill handling are combined. |
+| `run_opencode` | `orchestration` | Sequences OpenCode CLI spawn, communicate, timeout handling, and result selection. | None; deadline predicate, process spawn/wait, kill action, and result construction are delegated. |
+| `opencode_deadline_expired` | `predicate` | Answers whether the remaining deadline leaves no call budget. | None. |
+| `spawn_opencode_process` | `orchestration` | Starts the OpenCode subprocess with bounded stdio/session settings. | None. |
+| `communicate_opencode_process` | `orchestration` | Waits for one OpenCode subprocess call and reports stdout or timeout status. | None. |
+| `opencode_process_failed` | `predicate` | Answers whether the completed OpenCode subprocess exited non-zero. | None. |
+| `degraded_opencode_result` | `mapper` | Constructs the degraded result tuple used for timeout paths. | None. |
+| `failed_opencode_result` | `mapper` | Constructs the non-degraded empty result tuple used for failed CLI calls. | None. |
+| `successful_opencode_result` | `mapper` | Constructs the successful stdout result tuple. | None. |
 | `kill_process_group` | `orchestration` | Kills an OpenCode subprocess group and drains it. | None. |
 | `parse_export_stdout` | `parser` | Parses OpenCode export stdout as JSON. | None. |
 | `export_session` | `orchestration` | Runs `opencode export <session>` and parses output unless the call times out. | None. |
-| `exported_message_items` | `parser` | Extracts message dictionaries from supported export shapes. | `MULTI-CLASSIFIER-RISK`: parser plus dict-item filtering. |
-| `record_from_message` | `mapper` | Maps one exported message object into one normalized turn record. | `MULTI-CLASSIFIER-RISK`: required-field validation, fallback ID generation, and mapping are combined. |
+| `exported_message_items` | `orchestration` | Coordinates supported export-shape extraction and dictionary filtering. | None; shape parsing and dict filtering are delegated. |
+| `exported_message_item_values` | `parser` | Extracts raw message item lists from supported OpenCode export shapes. | None. |
+| `dict_items` | `filter` | Keeps only dictionary items from a raw message item list. | None. |
+| `record_from_message` | `orchestration` | Coordinates required-field validation, turn-ID selection, record mapping, and optional body attachment. | None; validation, fallback ID formatting, and record mapping are delegated. |
+| `message_record_fields` | `parser` | Extracts normalized required record fields from one exported message object. | None. |
+| `has_required_message_record_fields` | `validator` | Validates that session ID, role, and timestamp are present before emission. | None. |
+| `message_record_from_fields` | `mapper` | Maps validated fields and turn ID into the normalized record base. | None. |
+| `message_body_chunks` | `parser` | Extracts optional normalized body chunks from supported message content fields. | None. |
 | `records_from_exported_session` | `mapper` | Maps all exported message items into normalized records. | None. |
 | `collect_records` | `orchestration` | Iterates sessions, exports each one, stops on timeout, and returns records plus degraded state. | None. |
 | `emit_record` | `formatter` | Emits one compact JSONL record. | None. |
