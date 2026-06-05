@@ -34,7 +34,24 @@ pub(super) struct SpawnIdentityContext {
     model_name: Option<String>,
     session_id: Option<String>,
     mode: SpawnRuntimeMode,
+    pty_control_path: Option<String>,
     effective_cwd: Option<String>,
+}
+
+impl SpawnIdentityContext {
+    pub(super) fn invocation_uuid(&self) -> &str {
+        &self.invocation_uuid
+    }
+
+    pub(super) fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
+    pub(super) fn with_pty_control_path(&self, path: impl Into<String>) -> Self {
+        let mut cloned = self.clone();
+        cloned.pty_control_path = Some(path.into());
+        cloned
+    }
 }
 
 pub(super) fn context_from_parent_invocation_env(
@@ -52,6 +69,7 @@ pub(super) fn context_from_parent_invocation_env(
         model_name: model_name.map(str::to_string),
         session_id: session_id.map(str::to_string),
         mode,
+        pty_control_path: None,
         effective_cwd: effective_cwd.map(|path| path.to_string_lossy().into_owned()),
     })
 }
@@ -119,6 +137,7 @@ fn session_runtime_running_update<'a>(
         provider_name: Some(&context.provider_name),
         model_name: context.model_name.as_deref(),
         identity,
+        pty_control_path: context.pty_control_path.as_deref(),
         turn_start_max_mailbox_seq: None,
         models_dir: None,
         effective_cwd: context.effective_cwd.as_deref(),

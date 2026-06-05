@@ -3,12 +3,19 @@
 //! `accessor`, `filter`, `formatter`, `mapper`, `orchestration`, `parser`,
 //! `validator`
 
-use oulipoly_state::mailbox::{AgentBashCompleteEnqueue, EnqueueResult, MailboxDb, MailboxRow};
+use oulipoly_state::mailbox::{
+    AgentBashCompleteEnqueue, EnqueueResult, MailboxDb, MailboxRow, SessionRuntimeRow,
+};
 use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRow, ProcessIdentity};
 use oulipoly_state::{InvocationRecord, StateDb};
 use serde::Serialize;
 use serde_json::Value;
 use std::path::Path;
+
+#[cfg(unix)]
+use oulipoly_runtime::executor::cli::pty_broker::{
+    PtyControlClientErrorKind, inject_control_envelope,
+};
 
 use crate::wake_coordinator::WakeDiagnostic;
 
@@ -24,7 +31,18 @@ struct NotifyResponse {
     owner_session_id: Option<String>,
     session_source: Option<String>,
     seq: Option<i64>,
+    pty_delivery: Option<PtyDeliveryDiagnostic>,
     wake: Option<WakeDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PtyDeliveryDiagnostic {
+    attempted: bool,
+    status: String,
+    control_path: Option<String>,
+    delivered_seqs: Vec<i64>,
+    remaining_pending: Option<usize>,
+    message: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -120,12 +138,14 @@ enum NotifyOutcome {
     Enqueued {
         owner: ResolvedOwner,
         row: MailboxRow,
-        wake: WakeDiagnostic,
+        pty_delivery: PtyDeliveryDiagnostic,
+        wake: Option<WakeDiagnostic>,
     },
     AlreadyEnqueued {
         owner: ResolvedOwner,
         row: MailboxRow,
-        wake: WakeDiagnostic,
+        pty_delivery: PtyDeliveryDiagnostic,
+        wake: Option<WakeDiagnostic>,
     },
     NoOwner,
 }
@@ -178,16 +198,234 @@ fn enqueue_owner_notification(
         .map_err(NotifyError::Storage)?
     {
         EnqueueResult::Inserted(row) => {
-            let wake = crate::wake_coordinator::trigger_notify_wake(&owner.session_id);
-            Ok(NotifyOutcome::Enqueued { owner, row, wake })
+            let (pty_delivery, wake) =
+                delivery_and_wake_after_enqueue(&mut mailbox, &owner.session_id);
+            Ok(NotifyOutcome::Enqueued {
+                owner,
+                row,
+                pty_delivery,
+                wake,
+            })
         }
         EnqueueResult::AlreadyEnqueued(row) => {
-            let wake = crate::wake_coordinator::trigger_notify_wake(&owner.session_id);
-            Ok(NotifyOutcome::AlreadyEnqueued { owner, row, wake })
+            let (pty_delivery, wake) =
+                delivery_and_wake_after_enqueue(&mut mailbox, &owner.session_id);
+            Ok(NotifyOutcome::AlreadyEnqueued {
+                owner,
+                row,
+                pty_delivery,
+                wake,
+            })
         }
         EnqueueResult::Conflict { existing } => Err(NotifyError::Conflict {
             existing: Box::new(existing),
         }),
+    }
+}
+
+fn delivery_and_wake_after_enqueue(
+    mailbox: &mut MailboxDb,
+    session_id: &str,
+) -> (PtyDeliveryDiagnostic, Option<WakeDiagnostic>) {
+    let pty_delivery = attempt_pty_delivery(mailbox, session_id);
+    let wake = if pty_delivery.delivered_seqs.is_empty() {
+        Some(crate::wake_coordinator::trigger_notify_wake(session_id))
+    } else {
+        None
+    };
+    (pty_delivery, wake)
+}
+
+#[cfg(unix)]
+fn attempt_pty_delivery(mailbox: &mut MailboxDb, session_id: &str) -> PtyDeliveryDiagnostic {
+    let runtime = match mailbox.session_runtime(session_id) {
+        Ok(Some(runtime)) => runtime,
+        Ok(None) => {
+            return pty_status(
+                false,
+                "no_runtime",
+                None,
+                Vec::new(),
+                pending_count(mailbox, session_id),
+                None,
+            );
+        }
+        Err(err) => return pty_status(false, "no_runtime", None, Vec::new(), None, Some(err)),
+    };
+    if runtime.mode != "pty_interactive" {
+        return pty_status(
+            false,
+            "not_pty",
+            None,
+            Vec::new(),
+            pending_count(mailbox, session_id),
+            None,
+        );
+    }
+    let Some(control_path) = live_pty_control_path(&runtime) else {
+        return pty_status(
+            false,
+            "no_socket",
+            runtime.pty_control_path,
+            Vec::new(),
+            pending_count(mailbox, session_id),
+            None,
+        );
+    };
+    let Some(prepared) =
+        (match crate::mailbox_delivery::prepare_pty_mailbox_delivery(mailbox, session_id) {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                return pty_status(
+                    false,
+                    "protocol_error",
+                    Some(control_path),
+                    Vec::new(),
+                    None,
+                    Some(err),
+                );
+            }
+        })
+    else {
+        return pty_status(
+            false,
+            "no_pending",
+            Some(control_path),
+            Vec::new(),
+            Some(0),
+            None,
+        );
+    };
+    if prepared.envelope.len() > crate::mailbox_delivery::mailbox_prefix_max_bytes() {
+        return pty_status(
+            false,
+            "protocol_error",
+            Some(control_path),
+            Vec::new(),
+            pending_count(mailbox, session_id),
+            Some("oversize_frame".to_string()),
+        );
+    }
+    match inject_control_envelope(&control_path, &prepared.envelope) {
+        Ok(response) if response.ack => {
+            mark_pty_batch_delivered(mailbox, session_id, &runtime, &prepared.seqs, control_path)
+        }
+        Ok(response) => {
+            let status = if response.message == "unsafe_mid_line" {
+                "unsafe_mid_line"
+            } else {
+                "protocol_error"
+            };
+            pty_status(
+                true,
+                status,
+                Some(control_path),
+                Vec::new(),
+                pending_count(mailbox, session_id),
+                Some(response.message),
+            )
+        }
+        Err(err) => {
+            pty_client_error_status(mailbox, session_id, control_path, err.kind, err.message)
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn attempt_pty_delivery(_mailbox: &mut MailboxDb, _session_id: &str) -> PtyDeliveryDiagnostic {
+    pty_status(false, "not_pty", None, Vec::new(), None, None)
+}
+
+#[cfg(unix)]
+fn live_pty_control_path(runtime: &SessionRuntimeRow) -> Option<String> {
+    (runtime.run_state == "running")
+        .then_some(runtime.pty_control_path.as_ref())
+        .flatten()
+        .filter(|path| !path.is_empty())
+        .cloned()
+}
+
+#[cfg(unix)]
+fn mark_pty_batch_delivered(
+    mailbox: &mut MailboxDb,
+    session_id: &str,
+    runtime: &SessionRuntimeRow,
+    seqs: &[i64],
+    control_path: String,
+) -> PtyDeliveryDiagnostic {
+    let Some(invocation_uuid) = runtime.running_invocation_uuid.as_deref() else {
+        return pty_status(
+            true,
+            "mark_delivered_error",
+            Some(control_path),
+            Vec::new(),
+            pending_count(mailbox, session_id),
+            Some("running invocation missing".to_string()),
+        );
+    };
+    match mailbox.mark_delivered(session_id, seqs, invocation_uuid) {
+        Ok(()) => pty_status(
+            true,
+            "acked",
+            Some(control_path),
+            seqs.to_vec(),
+            pending_count(mailbox, session_id),
+            Some("ok".to_string()),
+        ),
+        Err(err) => pty_status(
+            true,
+            "mark_delivered_error",
+            Some(control_path),
+            Vec::new(),
+            pending_count(mailbox, session_id),
+            Some(err),
+        ),
+    }
+}
+
+#[cfg(unix)]
+fn pty_client_error_status(
+    mailbox: &MailboxDb,
+    session_id: &str,
+    control_path: String,
+    kind: PtyControlClientErrorKind,
+    message: String,
+) -> PtyDeliveryDiagnostic {
+    let status = match kind {
+        PtyControlClientErrorKind::Connect => "connect_error",
+        PtyControlClientErrorKind::Protocol
+        | PtyControlClientErrorKind::Oversize
+        | PtyControlClientErrorKind::EmptyPayload => "protocol_error",
+    };
+    pty_status(
+        true,
+        status,
+        Some(control_path),
+        Vec::new(),
+        pending_count(mailbox, session_id),
+        Some(message),
+    )
+}
+
+fn pending_count(mailbox: &MailboxDb, session_id: &str) -> Option<usize> {
+    mailbox.list_pending(session_id).map(|rows| rows.len()).ok()
+}
+
+fn pty_status(
+    attempted: bool,
+    status: &str,
+    control_path: Option<String>,
+    delivered_seqs: Vec<i64>,
+    remaining_pending: Option<usize>,
+    message: Option<String>,
+) -> PtyDeliveryDiagnostic {
+    PtyDeliveryDiagnostic {
+        attempted,
+        status: status.to_string(),
+        control_path,
+        delivered_seqs,
+        remaining_pending,
+        message,
     }
 }
 
@@ -558,23 +796,35 @@ fn notify_success_response(
     outcome: NotifyOutcome,
 ) -> NotifyResponse {
     match outcome {
-        NotifyOutcome::Enqueued { owner, row, wake } => notify_response(
+        NotifyOutcome::Enqueued {
+            owner,
+            row,
+            pty_delivery,
+            wake,
+        } => notify_response(
             args,
             "enqueued",
             true,
             Some(&owner),
             Some(row.seq),
+            Some(pty_delivery),
             Some(wake),
         ),
-        NotifyOutcome::AlreadyEnqueued { owner, row, wake } => notify_response(
+        NotifyOutcome::AlreadyEnqueued {
+            owner,
+            row,
+            pty_delivery,
+            wake,
+        } => notify_response(
             args,
             "already_enqueued",
             true,
             Some(&owner),
             Some(row.seq),
+            Some(pty_delivery),
             Some(wake),
         ),
-        NotifyOutcome::NoOwner => notify_response(args, "no_owner", false, None, None, None),
+        NotifyOutcome::NoOwner => notify_response(args, "no_owner", false, None, None, None, None),
     }
 }
 
@@ -620,6 +870,7 @@ fn render_notify_error_value(
         None,
         None,
         None,
+        None,
     ))
     .map_err(|err| format!("Failed to serialize notify response JSON: {err}"))?;
     if let Some(message) = &render.message {
@@ -643,7 +894,8 @@ fn notify_response(
     enqueued: bool,
     owner: Option<&ResolvedOwner>,
     seq: Option<i64>,
-    wake: Option<WakeDiagnostic>,
+    pty_delivery: Option<PtyDeliveryDiagnostic>,
+    wake: Option<Option<WakeDiagnostic>>,
 ) -> NotifyResponse {
     NotifyResponse {
         status: status.to_string(),
@@ -656,7 +908,8 @@ fn notify_response(
         owner_session_id: owner.map(|owner| owner.session_id.clone()),
         session_source: owner.map(|owner| owner.source.as_str().to_string()),
         seq,
-        wake,
+        pty_delivery,
+        wake: wake.flatten(),
     }
 }
 

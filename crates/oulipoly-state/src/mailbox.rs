@@ -84,6 +84,7 @@ pub struct SessionRuntimeRunningUpdate<'a> {
     pub provider_name: Option<&'a str>,
     pub model_name: Option<&'a str>,
     pub identity: &'a ProcessIdentity,
+    pub pty_control_path: Option<&'a str>,
     pub turn_start_max_mailbox_seq: Option<i64>,
     pub models_dir: Option<&'a str>,
     pub effective_cwd: Option<&'a str>,
@@ -580,6 +581,7 @@ impl MailboxDb {
                 "UPDATE session_runtime
                  SET run_state = 'idle',
                      updated_at = ?3,
+                     pty_control_path = NULL,
                      running_invocation_uuid = NULL,
                      running_os_pid = NULL,
                      running_os_boot_id = NULL,
@@ -692,13 +694,14 @@ fn mark_session_running_row(
             last_exit_code,
             models_dir,
             effective_cwd
-         ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, 'running', ?3, ?7, ?8, ?9, ?6, NULL, ?10, NULL, ?11, ?12)
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'running', ?3, ?8, ?9, ?10, ?7, NULL, ?11, NULL, ?12, ?13)
          ON CONFLICT(session_id)
          DO UPDATE SET
             mode = excluded.mode,
             invocation_uuid = excluded.invocation_uuid,
             provider_name = excluded.provider_name,
             model_name = excluded.model_name,
+            pty_control_path = excluded.pty_control_path,
             updated_at = excluded.updated_at,
             run_state = 'running',
             running_invocation_uuid = excluded.running_invocation_uuid,
@@ -717,6 +720,7 @@ fn mark_session_running_row(
             input.invocation_uuid,
             input.provider_name,
             input.model_name,
+            input.pty_control_path,
             now,
             input.identity.os_pid,
             &input.identity.os_boot_id,
@@ -740,6 +744,7 @@ fn mark_session_idle_row(
             "UPDATE session_runtime
              SET run_state = 'idle',
                  updated_at = ?3,
+                 pty_control_path = NULL,
                  running_invocation_uuid = NULL,
                  running_os_pid = NULL,
                  running_os_boot_id = NULL,
@@ -1279,6 +1284,7 @@ mod tests {
             provider_name: Some("provider-a"),
             model_name: Some("model-a"),
             identity: &identity,
+            pty_control_path: None,
             turn_start_max_mailbox_seq: Some(7),
             models_dir: Some("/tmp/models"),
             effective_cwd: Some("/tmp/work"),
@@ -1309,6 +1315,34 @@ mod tests {
     }
 
     #[test]
+    fn runtime_mark_running_records_pty_control_path_without_schema_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let identity = current_identity();
+
+        db.mark_session_running(SessionRuntimeRunningUpdate {
+            session_id: "session-a",
+            mode: "pty_interactive",
+            invocation_uuid: "invocation-a",
+            provider_name: Some("provider-a"),
+            model_name: Some("model-a"),
+            identity: &identity,
+            pty_control_path: Some("/tmp/oulipoly-a.sock"),
+            turn_start_max_mailbox_seq: None,
+            models_dir: None,
+            effective_cwd: None,
+        })
+        .unwrap();
+
+        let row = db.session_runtime("session-a").unwrap().unwrap();
+        assert_eq!(row.mode, "pty_interactive");
+        assert_eq!(
+            row.pty_control_path.as_deref(),
+            Some("/tmp/oulipoly-a.sock")
+        );
+    }
+
+    #[test]
     fn runtime_mark_idle_is_invocation_guarded() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
@@ -1321,6 +1355,7 @@ mod tests {
             provider_name: Some("provider-a"),
             model_name: Some("model-a"),
             identity: &identity,
+            pty_control_path: Some("/tmp/oulipoly-test.sock"),
             turn_start_max_mailbox_seq: None,
             models_dir: None,
             effective_cwd: None,
@@ -1354,6 +1389,7 @@ mod tests {
         assert!(row.turn_ended_at.is_some());
         assert!(row.running_invocation_uuid.is_none());
         assert!(row.running_os_pid.is_none());
+        assert!(row.pty_control_path.is_none());
     }
 
     #[test]
@@ -1368,6 +1404,7 @@ mod tests {
             provider_name: None,
             model_name: None,
             identity: &identity,
+            pty_control_path: None,
             turn_start_max_mailbox_seq: None,
             models_dir: None,
             effective_cwd: None,
@@ -1397,6 +1434,7 @@ mod tests {
             provider_name: None,
             model_name: None,
             identity: &identity,
+            pty_control_path: Some("/tmp/stale.sock"),
             turn_start_max_mailbox_seq: None,
             models_dir: None,
             effective_cwd: None,
@@ -1411,6 +1449,7 @@ mod tests {
         assert_eq!(row.run_state, "idle");
         assert!(row.running_invocation_uuid.is_none());
         assert!(row.running_os_pid.is_none());
+        assert!(row.pty_control_path.is_none());
     }
 
     #[test]
@@ -1458,6 +1497,7 @@ mod tests {
             provider_name: None,
             model_name: None,
             identity: &identity,
+            pty_control_path: None,
             turn_start_max_mailbox_seq: None,
             models_dir: None,
             effective_cwd: None,
@@ -1577,6 +1617,7 @@ mod tests {
                 provider_name: Some("provider-a"),
                 model_name: Some("model-a"),
                 identity: &identity,
+                pty_control_path: None,
                 turn_start_max_mailbox_seq: None,
                 models_dir: None,
                 effective_cwd: None,

@@ -229,9 +229,17 @@ pub(super) struct InteractiveSignalGuard {
 #[cfg(unix)]
 impl InteractiveSignalGuard {
     pub(super) fn install(child: &mut Child) -> Result<Self, String> {
+        Self::install_for_target(SignalForwardTarget::ChildPid(child_signal_pid(child)))
+    }
+
+    pub(super) fn install_process_group(child_pid: u32) -> Result<Self, String> {
+        Self::install_for_target(SignalForwardTarget::ProcessGroup(child_pid as i32))
+    }
+
+    fn install_for_target(target: SignalForwardTarget) -> Result<Self, String> {
         let signals = install_interactive_signals()?;
         let handle = signals.handle();
-        let thread = spawn_interactive_signal_thread(signals, child_signal_pid(child));
+        let thread = spawn_interactive_signal_thread(signals, target);
 
         Ok(Self {
             handle,
@@ -256,24 +264,51 @@ fn child_signal_pid(child: &Child) -> i32 {
 }
 
 #[cfg(unix)]
-fn spawn_interactive_signal_thread(mut signals: Signals, child_pid: i32) -> thread::JoinHandle<()> {
+#[derive(Clone, Copy)]
+enum SignalForwardTarget {
+    ChildPid(i32),
+    ProcessGroup(i32),
+}
+
+#[cfg(unix)]
+fn spawn_interactive_signal_thread(
+    mut signals: Signals,
+    target: SignalForwardTarget,
+) -> thread::JoinHandle<()> {
     let forwarded_sigterm = Arc::new(AtomicBool::new(false));
     let thread_forwarded_sigterm = Arc::clone(&forwarded_sigterm);
 
     thread::spawn(move || {
-        forward_interactive_signals(&mut signals, child_pid, &thread_forwarded_sigterm);
+        forward_interactive_signals(&mut signals, target, &thread_forwarded_sigterm);
     })
 }
 
 #[cfg(unix)]
 fn forward_interactive_signals(
     signals: &mut Signals,
-    child_pid: i32,
+    target: SignalForwardTarget,
     forwarded_sigterm: &AtomicBool,
 ) {
     for signal in signals.forever() {
-        if should_forward_interactive_sigterm(signal, forwarded_sigterm) {
-            send_sigterm(child_pid);
+        if should_forward_interactive_signal(signal, target, forwarded_sigterm) {
+            send_signal(target, signal);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn should_forward_interactive_signal(
+    signal: i32,
+    target: SignalForwardTarget,
+    forwarded_sigterm: &AtomicBool,
+) -> bool {
+    match target {
+        SignalForwardTarget::ChildPid(_) => {
+            should_forward_interactive_sigterm(signal, forwarded_sigterm)
+        }
+        SignalForwardTarget::ProcessGroup(_) => {
+            (signal == SIGINT || signal == SIGHUP)
+                || should_forward_interactive_sigterm(signal, forwarded_sigterm)
         }
     }
 }
@@ -294,12 +329,16 @@ impl Drop for InteractiveSignalGuard {
 }
 
 #[cfg(unix)]
-fn send_sigterm(pid: i32) {
+fn send_signal(target: SignalForwardTarget, signal: i32) {
     unsafe extern "C" {
         fn kill(pid: i32, sig: i32) -> i32;
     }
 
-    let _ = unsafe { kill(pid, SIGTERM) };
+    let pid = match target {
+        SignalForwardTarget::ChildPid(pid) => pid,
+        SignalForwardTarget::ProcessGroup(pid) => -pid,
+    };
+    let _ = unsafe { kill(pid, signal) };
 }
 
 #[cfg(test)]

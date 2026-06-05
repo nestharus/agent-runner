@@ -29,9 +29,12 @@ use super::super::TerminalSignal;
 use super::launch::build_command;
 use super::policy::apply_provider_policy;
 use super::provider_identity::ProviderRecognizer;
+#[cfg(unix)]
+use super::pty_broker;
 use super::resume::{ResumePayload, compose_resume_provider_args};
 use super::spawn_identity::{
-    SpawnRuntimeMode, context_from_parent_invocation_env, record_child_identity,
+    SpawnIdentityContext, SpawnRuntimeMode, context_from_parent_invocation_env,
+    record_child_identity,
 };
 use super::terminal_signal;
 use oulipoly_config::ProviderConfig;
@@ -79,19 +82,29 @@ pub fn execute_interactive_with_result_and_model_identity(
 ) -> Result<InteractiveExecutionResult, String> {
     let resume_session_id = resume.as_ref().map(|resume| resume.session_id);
     let provider_args = interactive_provider_args(provider, resume)?;
-    let cmd = interactive_command(provider, &provider_args, working_dir, parent_invocation_env)?;
-    let mut child = spawn_interactive_child(cmd, provider)?;
-
-    #[cfg(unix)]
-    let signal_guard = terminal_signal::InteractiveSignalGuard::install(&mut child)?;
-    record_interactive_child_identity(
-        child.id(),
+    let spawn_identity = interactive_spawn_identity_context(
         parent_invocation_env,
         provider,
         model_name,
         resume_session_id,
         working_dir,
     );
+    #[cfg(unix)]
+    if pty_broker::controlling_terminal_available() {
+        let cmd =
+            interactive_command(provider, &provider_args, working_dir, parent_invocation_env)?;
+        let status = pty_broker::execute_interactive_child(cmd, provider, spawn_identity.as_ref())?;
+        return Ok(interactive_result_from_status(provider, &status));
+    }
+
+    let mut cmd =
+        interactive_command(provider, &provider_args, working_dir, parent_invocation_env)?;
+    configure_interactive_stdio(&mut cmd);
+    let mut child = spawn_interactive_child(cmd, provider)?;
+
+    #[cfg(unix)]
+    let signal_guard = terminal_signal::InteractiveSignalGuard::install(&mut child)?;
+    record_child_identity(child.id(), spawn_identity.as_ref());
 
     let status = wait_for_interactive_child(&mut child)?;
 
@@ -120,15 +133,13 @@ fn interactive_command(
     working_dir: Option<&Path>,
     parent_invocation_env: Option<&str>,
 ) -> Result<Command, String> {
-    let mut cmd = build_command(
+    build_command(
         provider,
         provider_args,
         working_dir,
         parent_invocation_env,
         None,
-    )?;
-    configure_interactive_stdio(&mut cmd);
-    Ok(cmd)
+    )
 }
 
 fn configure_interactive_stdio(cmd: &mut Command) {
@@ -142,23 +153,21 @@ fn spawn_interactive_child(mut cmd: Command, provider: &ProviderConfig) -> Resul
         .map_err(|e| format!("Failed to spawn '{}': {e}", provider.command))
 }
 
-fn record_interactive_child_identity(
-    child_id: u32,
+fn interactive_spawn_identity_context(
     parent_invocation_env: Option<&str>,
     provider: &ProviderConfig,
     model_name: Option<&str>,
     resume_session_id: Option<&str>,
     working_dir: Option<&Path>,
-) {
-    let spawn_identity = context_from_parent_invocation_env(
+) -> Option<SpawnIdentityContext> {
+    context_from_parent_invocation_env(
         parent_invocation_env,
         &provider.name,
         model_name,
         resume_session_id,
         SpawnRuntimeMode::PtyInteractive,
         working_dir,
-    );
-    record_child_identity(child_id, spawn_identity.as_ref());
+    )
 }
 
 fn wait_for_interactive_child(child: &mut Child) -> Result<ExitStatus, String> {

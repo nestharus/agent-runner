@@ -4,14 +4,16 @@
 //! `validator`
 
 use oulipoly_state::mailbox::{
-    MailboxDb, SessionRuntimeIdleUpdate, SessionRuntimeRow, WakeClaimAcquireResult,
-    WakeClaimRequest, WakeClaimRow,
+    MailboxDb, SessionLiveness, SessionRuntimeIdleUpdate, SessionRuntimeRow,
+    WakeClaimAcquireResult, WakeClaimRequest, WakeClaimRow,
 };
 use serde::Serialize;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use uuid::Uuid;
 
+#[cfg(unix)]
+use oulipoly_runtime::executor::cli::pty_broker;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
@@ -266,8 +268,10 @@ fn start_wake_chain(input: StartWakeInput<'_>) -> WakeDiagnostic {
         Ok(row) => row,
         Err(err) => return storage_error_diagnostic(err),
     };
-    if pty_runtime_is_busy(runtime.as_ref()) {
-        return WakeDiagnostic::status("busy");
+    match pty_runtime_is_busy(&mut db, input.session_id, runtime.as_ref()) {
+        Ok(true) => return WakeDiagnostic::status("busy"),
+        Ok(false) => {}
+        Err(err) => return storage_error_diagnostic(err),
     }
     let claim_result = match acquire_wake_claim(&mut db, input, &claim_token) {
         Ok(result) => result,
@@ -324,9 +328,34 @@ fn session_runtime_for_wake(
     db.session_runtime(session_id)
 }
 
-fn pty_runtime_is_busy(runtime: Option<&SessionRuntimeRow>) -> bool {
-    runtime.is_some_and(|row| row.mode == "pty_interactive")
+fn pty_runtime_is_busy(
+    db: &mut MailboxDb,
+    session_id: &str,
+    runtime: Option<&SessionRuntimeRow>,
+) -> Result<bool, String> {
+    let Some(row) = runtime else {
+        return Ok(false);
+    };
+    if row.mode != "pty_interactive" || row.run_state != "running" {
+        return Ok(false);
+    }
+    let control_path = row.pty_control_path.clone();
+    let liveness = db.session_liveness(session_id)?;
+    if liveness == SessionLiveness::Idle {
+        unlink_stale_pty_socket(control_path.as_deref());
+    }
+    Ok(liveness == SessionLiveness::Busy)
 }
+
+#[cfg(unix)]
+fn unlink_stale_pty_socket(path: Option<&str>) {
+    if let Some(path) = path {
+        let _ = pty_broker::unlink_control_socket_if_owned(path);
+    }
+}
+
+#[cfg(not(unix))]
+fn unlink_stale_pty_socket(_path: Option<&str>) {}
 
 fn acquire_wake_claim(
     db: &mut MailboxDb,

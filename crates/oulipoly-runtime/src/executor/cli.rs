@@ -71,6 +71,8 @@ mod policy;
 mod provider_execution;
 mod provider_identity;
 mod provider_lookup;
+#[cfg(unix)]
+pub mod pty_broker;
 mod request;
 mod result;
 mod resume;

@@ -14,6 +14,29 @@ pub(crate) struct PreparedMailboxDelivery {
     pub seqs: Vec<i64>,
 }
 
+pub(crate) struct PreparedPtyMailboxDelivery {
+    pub envelope: String,
+    pub seqs: Vec<i64>,
+}
+
+pub(crate) fn prepare_pty_mailbox_delivery(
+    db: &MailboxDb,
+    session_id: &str,
+) -> Result<Option<PreparedPtyMailboxDelivery>, String> {
+    let pending = pending_mailbox_rows(db, session_id)?;
+    if !has_pending_rows(&pending) {
+        return Ok(None);
+    }
+    let batch = select_batch(&pending);
+    let seqs = batch_seqs(&batch);
+    let envelope = render_notification_prefix(&batch.rows, batch.remaining_count);
+    Ok(Some(PreparedPtyMailboxDelivery { envelope, seqs }))
+}
+
+pub(crate) fn mailbox_prefix_max_bytes() -> usize {
+    MAILBOX_PREFIX_MAX_BYTES
+}
+
 pub(crate) fn prepare_headless_resume_delivery(
     resolved: &oulipoly_state::ResolvedResume,
     answer: Option<String>,

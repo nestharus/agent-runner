@@ -119,6 +119,7 @@ fn s7c_provider_name_grep_invariant_uses_authoritative_manager_baseline() {
             ":(exclude)src-tauri/target/**",
             ":(exclude)target/**",
             ":(exclude)planning/*-gate/**",
+            ":(exclude)planning/wu-e/**",
             ":(exclude)planning/opencode-contract/**",
         ])
         .output()
@@ -155,6 +156,8 @@ fn provider_name_occurrence_count(root: &Path, pattern: &str) -> usize {
             "!target/**",
             "-g",
             "!planning/*-gate/**",
+            "-g",
+            "!planning/wu-e/**",
             "-g",
             "!planning/opencode-contract/**",
         ])
@@ -207,6 +210,7 @@ fn is_ignored_generated_path(relative: &str) -> bool {
     relative.starts_with("src-tauri/target/")
         || relative.starts_with("target/")
         || is_planning_gate_artifact(relative)
+        || relative.starts_with("planning/wu-e/")
         || relative.starts_with("planning/opencode-contract/")
 }
 

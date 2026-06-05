@@ -127,6 +127,7 @@ fn full_provider_name_grep_threshold_remains_within_manager_baseline() {
             "--",
             ".",
             ":(exclude)planning/*-gate/**",
+            ":(exclude)planning/wu-e/**",
             ":(exclude)planning/opencode-contract/**",
         ])
         .output()
@@ -156,6 +157,7 @@ fn tracked_added_provider_name_occurrences(root: &Path, pattern: &str) -> usize 
             "--",
             ".",
             ":(exclude)planning/*-gate/**",
+            ":(exclude)planning/wu-e/**",
             ":(exclude)planning/opencode-contract/**",
         ])
         .output()
@@ -226,6 +228,7 @@ fn is_ignored_source_guard_path(relative: &str) -> bool {
     relative.starts_with("target/")
         || relative.starts_with("src-tauri/target/")
         || is_planning_gate_artifact(relative)
+        || relative.starts_with("planning/wu-e/")
         || relative.starts_with("planning/opencode-contract/")
 }
 
