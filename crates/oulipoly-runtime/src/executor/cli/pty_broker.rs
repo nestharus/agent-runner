@@ -69,13 +69,11 @@ pub fn control_socket_accepts_connection(path: impl AsRef<Path>) -> bool {
 
 pub fn unlink_control_socket_if_owned(path: impl AsRef<Path>) -> bool {
     let path = path.as_ref();
-    let Ok(dir) = control_socket_dir() else {
-        return false;
-    };
-    if !path.starts_with(&dir) {
-        return false;
-    }
-    fs::remove_file(path).is_ok()
+    control_socket_path_is_owned(path) && fs::remove_file(path).is_ok()
+}
+
+fn control_socket_path_is_owned(path: &Path) -> bool {
+    matches!(control_socket_dir(), Ok(dir) if path.starts_with(&dir))
 }
 
 pub(super) fn controlling_terminal_available() -> bool {
@@ -498,16 +496,29 @@ fn stable_socket_hash(session_id: &str, invocation_uuid: &str) -> String {
 }
 
 fn unlink_stale_or_refuse_active(path: &Path, owned_dir: &Path) -> Result<(), String> {
-    if !path.exists() {
+    if control_socket_is_absent(path) {
         return Ok(());
     }
-    if UnixStream::connect(path).is_ok() {
+    validate_control_socket_not_active(path)?;
+    unlink_owned_socket(path, owned_dir);
+    Ok(())
+}
+
+fn control_socket_is_absent(path: &Path) -> bool {
+    !path.exists()
+}
+
+fn control_socket_is_active(path: &Path) -> bool {
+    UnixStream::connect(path).is_ok()
+}
+
+fn validate_control_socket_not_active(path: &Path) -> Result<(), String> {
+    if control_socket_is_active(path) {
         return Err(format!(
             "PTY control socket already active at {}",
             path.display()
         ));
     }
-    unlink_owned_socket(path, owned_dir);
     Ok(())
 }
 

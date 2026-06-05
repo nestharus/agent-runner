@@ -6,67 +6,90 @@ use oulipoly_runtime::executor::cli::{
 };
 use oulipoly_state::CompositeInvocationId;
 use oulipoly_state::mailbox::MailboxDb;
-use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::process::Command;
 
 const INVOCATION_UUID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const SESSION_ID: &str = "5169694d-de0f-40d1-890c-6e28e55bab27";
-
-struct EnvGuard {
-    _lock: MutexGuard<'static, ()>,
-    old_xdg_data_home: Option<OsString>,
-}
-
-impl EnvGuard {
-    fn set_xdg_data_home(path: &Path) -> Self {
-        let lock = env_lock().lock().unwrap();
-        let old_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", path);
-        }
-        Self {
-            _lock: lock,
-            old_xdg_data_home,
-        }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        unsafe {
-            match self.old_xdg_data_home.take() {
-                Some(value) => std::env::set_var("XDG_DATA_HOME", value),
-                None => std::env::remove_var("XDG_DATA_HOME"),
-            }
-        }
-    }
-}
-
-fn env_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
+const FALLBACK_HELPER_ENV: &str = "WU_E_FALLBACK_HELPER";
+const PROVIDER_SCRIPT_ENV: &str = "WU_E_PROVIDER_SCRIPT";
+const CHILD_RESULT_ENV: &str = "WU_E_CHILD_RESULT";
 
 #[test]
 fn no_controlling_terminal_fallback_records_no_pty_control_path() {
-    if std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")
-        .is_ok()
-    {
-        eprintln!("skipping fallback assertion because test process has a controlling terminal");
-        return;
-    }
     let dir = tempfile::tempdir().unwrap();
+    let config_home = dir.path().join("config");
     let data_home = dir.path().join("data");
+    let runtime_dir = dir.path().join("runtime");
+    let state_home = dir.path().join("state");
+    let home_dir = dir.path().join("home");
+    fs::create_dir_all(&config_home).unwrap();
+    fs::create_dir_all(&data_home).unwrap();
+    fs::create_dir_all(&runtime_dir).unwrap();
+    fs::create_dir_all(&state_home).unwrap();
+    fs::create_dir_all(&home_dir).unwrap();
+    fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700)).unwrap();
     let sidecar_path = data_home
         .join("oulipoly-agent-runner")
         .join("pid-identity.db");
     let script = fixture_script(dir.path());
+    let child_result = dir.path().join("child-result.txt");
+
+    let mut cmd = Command::new(std::env::current_exe().unwrap());
+    cmd.arg("--exact")
+        .arg("helper_runs_no_controlling_terminal_fallback")
+        .arg("--nocapture")
+        .env(FALLBACK_HELPER_ENV, "1")
+        .env(PROVIDER_SCRIPT_ENV, &script)
+        .env(CHILD_RESULT_ENV, &child_result)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_DATA_HOME", &data_home)
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .env("XDG_STATE_HOME", &state_home)
+        .env("HOME", &home_dir)
+        .env_remove("OULIPOLY_PARENT_INVOCATION");
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "child failed: status={:?}\nstdout={}\nstderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read_to_string(&child_result).unwrap(), "ok\n");
+
+    let db = MailboxDb::open(&sidecar_path).unwrap();
+    let runtime = db.session_runtime(SESSION_ID).unwrap().unwrap();
+    assert_eq!(runtime.mode, "pty_interactive");
+    assert!(runtime.pty_control_path.is_none());
+}
+
+#[test]
+fn helper_runs_no_controlling_terminal_fallback() {
+    if std::env::var_os(FALLBACK_HELPER_ENV).is_none() {
+        return;
+    }
+    assert!(
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .is_err(),
+        "setsid child unexpectedly retained a controlling terminal"
+    );
+    let script = PathBuf::from(std::env::var_os(PROVIDER_SCRIPT_ENV).unwrap());
+    let child_result = PathBuf::from(std::env::var_os(CHILD_RESULT_ENV).unwrap());
     let provider = fixture_provider(&script);
     let strategy = ResumeStrategy {
         kind: ResumeKind::Flag,
@@ -75,26 +98,19 @@ fn no_controlling_terminal_fallback_records_no_pty_control_path() {
     };
     let invocation_env = invocation_env();
 
-    {
-        let _guard = EnvGuard::set_xdg_data_home(&data_home);
-        let result = execute_interactive_with_result_and_model_identity(
-            &provider,
-            None,
-            Some(&invocation_env),
-            Some(ResumePayload {
-                session_id: SESSION_ID,
-                strategy: &strategy,
-            }),
-            Some("fixture-model"),
-        )
-        .unwrap();
-        assert_eq!(result.exit_code, 0);
-    }
-
-    let db = MailboxDb::open(&sidecar_path).unwrap();
-    let runtime = db.session_runtime(SESSION_ID).unwrap().unwrap();
-    assert_eq!(runtime.mode, "pty_interactive");
-    assert!(runtime.pty_control_path.is_none());
+    let result = execute_interactive_with_result_and_model_identity(
+        &provider,
+        None,
+        Some(&invocation_env),
+        Some(ResumePayload {
+            session_id: SESSION_ID,
+            strategy: &strategy,
+        }),
+        Some("fixture-model"),
+    )
+    .unwrap();
+    assert_eq!(result.exit_code, 0);
+    fs::write(child_result, "ok\n").unwrap();
 }
 
 fn fixture_script(dir: &Path) -> PathBuf {
