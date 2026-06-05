@@ -1,8 +1,11 @@
 #![cfg(target_os = "linux")]
 
-use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig};
-use oulipoly_runtime::executor::RuntimeExecutorService;
+use oulipoly_config::{
+    ModelConfig, PromptMode, ProviderConfig, SessionCapture, SessionCaptureKind,
+};
+use oulipoly_runtime::executor::{RuntimeExecutorService, SessionCaptureMethod};
 use oulipoly_runtime::services::{ExecutorServicePort, ExecutorServiceRequest};
+use oulipoly_state::mailbox::{MailboxDb, SessionLiveness};
 use oulipoly_state::pid_identity::PidIdentityDb;
 use oulipoly_state::{CompositeInvocationId, StateDb};
 use rusqlite::{Connection, OpenFlags};
@@ -13,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 const INVOCATION_UUID: &str = "aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa";
+const CAPTURED_SESSION_ID: &str = "ses_capture_backfill";
 
 struct EnvGuard {
     _lock: MutexGuard<'static, ()>,
@@ -111,12 +115,140 @@ fn spawn_capture_writes_verified_sidecar_row_without_state_schema_change() {
     assert!(!row.os_boot_id.is_empty());
     assert!(row.os_pid_starttime_ticks > 0);
     assert_eq!(row.invocation_uuid, INVOCATION_UUID);
+    assert_eq!(row.session_id, None);
     assert_eq!(row.provider_name.as_deref(), Some("fixture-provider"));
     assert_eq!(row.model_name.as_deref(), Some("fixture-model"));
+    let mailbox = MailboxDb::open(&sidecar_path).unwrap();
+    assert!(
+        mailbox
+            .session_runtime("fixture-missing-session")
+            .unwrap()
+            .is_none(),
+        "no capture plan must not invent a session_runtime row"
+    );
 
     let (after_version, after_columns) = read_state_schema_snapshot(&state_path);
     assert_eq!(after_version, baseline_version);
     assert_eq!(after_columns, baseline_columns);
+}
+
+#[test]
+fn stdout_json_event_capture_backfills_sidecar_and_marks_runtime_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_home = dir.path().join("data");
+    let app_data_dir = data_home.join("oulipoly-agent-runner");
+    let sidecar_path = app_data_dir.join("pid-identity.db");
+    let script = stdout_json_event_fixture_script(dir.path(), CAPTURED_SESSION_ID);
+    let mut provider = fixture_provider(&script);
+    provider.session_capture = Some(stdout_json_event_capture());
+    let model = fixture_model(provider.clone());
+    let invocation_env = invocation_env();
+
+    {
+        let _guard = EnvGuard::set_xdg_data_home(&data_home);
+        let output = RuntimeExecutorService::default()
+            .execute(ExecutorServiceRequest::Effective {
+                model: model.clone(),
+                provider: provider.clone(),
+                provider_index: 0,
+                prompt_mode: PromptMode::Arg,
+                prompt: "hello".to_string(),
+                working_dir: None,
+                extra_inputs: HashMap::new(),
+                parent_invocation_env: Some(invocation_env),
+            })
+            .unwrap()
+            .result;
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(
+            output.session_capture.session_id.as_deref(),
+            Some(CAPTURED_SESSION_ID)
+        );
+        assert!(matches!(
+            output.session_capture.method,
+            SessionCaptureMethod::StdoutJsonEvent
+        ));
+    }
+
+    let sidecar = PidIdentityDb::open_read_only(&sidecar_path).unwrap();
+    let rows = sidecar.lookup_by_invocation_uuid(INVOCATION_UUID).unwrap();
+    assert_eq!(rows.len(), 1, "expected exactly one spawn sidecar row");
+    let row = &rows[0];
+    assert_eq!(row.session_id.as_deref(), Some(CAPTURED_SESSION_ID));
+
+    let mut mailbox = MailboxDb::open(&sidecar_path).unwrap();
+    let runtime = mailbox
+        .session_runtime(CAPTURED_SESSION_ID)
+        .unwrap()
+        .expect("captured session must be marked running");
+    assert_eq!(runtime.run_state, "running");
+    assert_eq!(runtime.invocation_uuid.as_deref(), Some(INVOCATION_UUID));
+    assert_eq!(runtime.provider_name.as_deref(), Some("fixture-provider"));
+    assert_eq!(runtime.model_name.as_deref(), Some("fixture-model"));
+    assert_eq!(
+        runtime.running_invocation_uuid.as_deref(),
+        Some(INVOCATION_UUID)
+    );
+    assert_eq!(runtime.running_os_pid, Some(row.os_pid));
+    assert_eq!(
+        runtime.running_os_boot_id.as_deref(),
+        Some(row.os_boot_id.as_str())
+    );
+    assert_eq!(
+        runtime.running_os_pid_starttime_ticks,
+        Some(row.os_pid_starttime_ticks)
+    );
+
+    assert_eq!(
+        mailbox.session_liveness(CAPTURED_SESSION_ID).unwrap(),
+        SessionLiveness::Idle
+    );
+    let idle_runtime = mailbox
+        .session_runtime(CAPTURED_SESSION_ID)
+        .unwrap()
+        .expect("captured session runtime row must remain after idle cleanup");
+    assert_eq!(idle_runtime.run_state, "idle");
+    assert!(idle_runtime.turn_started_at.is_some());
+    assert!(idle_runtime.turn_ended_at.is_some());
+}
+
+#[test]
+fn stdout_json_event_capture_without_spawn_identity_does_not_backfill_sidecar() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_home = dir.path().join("data");
+    let app_data_dir = data_home.join("oulipoly-agent-runner");
+    let sidecar_path = app_data_dir.join("pid-identity.db");
+    let script = stdout_json_event_fixture_script(dir.path(), CAPTURED_SESSION_ID);
+    let mut provider = fixture_provider(&script);
+    provider.session_capture = Some(stdout_json_event_capture());
+    let model = fixture_model(provider.clone());
+
+    {
+        let _guard = EnvGuard::set_xdg_data_home(&data_home);
+        let output = RuntimeExecutorService::default()
+            .execute(ExecutorServiceRequest::Effective {
+                model: model.clone(),
+                provider: provider.clone(),
+                provider_index: 0,
+                prompt_mode: PromptMode::Arg,
+                prompt: "hello".to_string(),
+                working_dir: None,
+                extra_inputs: HashMap::new(),
+                parent_invocation_env: None,
+            })
+            .unwrap()
+            .result;
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(
+            output.session_capture.session_id.as_deref(),
+            Some(CAPTURED_SESSION_ID)
+        );
+    }
+
+    assert!(
+        !sidecar_path.exists(),
+        "capture without spawn identity must not create or backfill a sidecar row"
+    );
 }
 
 #[test]
@@ -210,6 +342,39 @@ fn env_recording_fixture_script(dir: &Path) -> PathBuf {
     permissions.set_mode(0o755);
     std::fs::set_permissions(&path, permissions).unwrap();
     path
+}
+
+fn stdout_json_event_fixture_script(dir: &Path, session_id: &str) -> PathBuf {
+    let path = dir.join("stdout-json-event-provider.sh");
+    let event = serde_json::json!({
+        "type": "step_start",
+        "sessionID": session_id,
+    });
+    std::fs::write(
+        &path,
+        format!(
+            "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' '{}'\nsleep 0.2\nprintf 'ok\\n'\n",
+            event
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&path, permissions).unwrap();
+    path
+}
+
+fn stdout_json_event_capture() -> SessionCapture {
+    SessionCapture {
+        kind: SessionCaptureKind::StdoutJsonEvent,
+        flag: None,
+        readback_args: None,
+        event_type: Some("step_start".to_string()),
+        event_id_path: Some("sessionID".to_string()),
+        json_flag: None,
+        json_args: Some(vec!["--json".to_string()]),
+        last_message_flag: None,
+    }
 }
 
 fn fixture_provider(script: &Path) -> ProviderConfig {

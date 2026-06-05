@@ -97,7 +97,7 @@ pub(super) fn execute_interactive_child(
     let recorded_context = control.as_ref().and_then(|control| {
         context.map(|context| context.with_pty_control_path(control.path_string()))
     });
-    record_child_identity(child.id(), recorded_context.as_ref().or(context));
+    let _ = record_child_identity(child.id(), recorded_context.as_ref().or(context));
     let mut idle_guard = SessionRuntimeIdleGuard::new(context);
     drop(pty.slave);
 

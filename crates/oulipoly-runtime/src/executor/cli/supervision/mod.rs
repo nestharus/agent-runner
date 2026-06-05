@@ -38,9 +38,12 @@ mod termination;
 
 use super::provider_identity::ProviderRecognizer;
 use super::session_capture::{CapturePlan, parse_stdout_json_event_session_id};
-use super::spawn_identity::{SpawnIdentityContext, record_child_identity};
+use super::spawn_identity::{
+    SpawnIdentityContext, backfill_captured_session_id, record_child_identity,
+};
 use crate::executor::terminal_signal::{TerminalSignal, TerminalStatusEvidence};
 use oulipoly_config::{PromptMode, ProviderConfig};
+use oulipoly_state::pid_identity::ProcessIdentity;
 use std::process::{Command, ExitStatus};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -126,7 +129,7 @@ fn execute_with_supervisor(
     process::configure_supervised_command(&mut cmd, &config);
     process::configure_supervised_process_group(&mut cmd);
     let mut child = process::spawn_supervised_child(cmd, provider_name)?;
-    record_child_identity(child.id(), spawn_identity);
+    let recorded_identity = record_child_identity(child.id(), spawn_identity);
     let drains = drain::start_child_drains(&mut child)?;
     let stdin_writer = stdin::start_child_stdin_writer(&mut child, &mut config)?;
     let mut stdout = Vec::new();
@@ -136,7 +139,13 @@ fn execute_with_supervisor(
 
     let (terminal_status, terminal_signal, real_status) = loop {
         drain::drain_output_events(&drains.rx, &mut stdout, &mut stderr, &mut last_output_seen);
-        observe_streamed_session_id(capture_plan, &stdout, &mut streamed_session_id);
+        observe_streamed_session_id(
+            capture_plan,
+            &stdout,
+            &mut streamed_session_id,
+            spawn_identity,
+            recorded_identity.as_ref(),
+        );
 
         if let Some(status) = status::poll_child_status(&mut child)? {
             break terminal_outcome::terminal_outcome_from_status(status);
@@ -163,11 +172,23 @@ fn execute_with_supervisor(
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {}
         }
-        observe_streamed_session_id(capture_plan, &stdout, &mut streamed_session_id);
+        observe_streamed_session_id(
+            capture_plan,
+            &stdout,
+            &mut streamed_session_id,
+            spawn_identity,
+            recorded_identity.as_ref(),
+        );
     };
 
     drain::finish_child_drains(drains, &mut stdout, &mut stderr, &mut last_output_seen);
-    observe_streamed_session_id(capture_plan, &stdout, &mut streamed_session_id);
+    observe_streamed_session_id(
+        capture_plan,
+        &stdout,
+        &mut streamed_session_id,
+        spawn_identity,
+        recorded_identity.as_ref(),
+    );
     let stdin_write_error = stdin::finish_stdin_writer(stdin_writer);
     let mut output = terminal_outcome::supervised_output_from_terminal(
         provider_name,
@@ -191,6 +212,8 @@ fn observe_streamed_session_id(
     capture_plan: &CapturePlan,
     stdout: &[u8],
     streamed_session_id: &mut Option<String>,
+    spawn_identity: Option<&SpawnIdentityContext>,
+    recorded_identity: Option<&ProcessIdentity>,
 ) {
     if streamed_session_id.is_some() {
         return;
@@ -204,6 +227,7 @@ fn observe_streamed_session_id(
         return;
     };
     if let Ok(session_id) = parse_stdout_json_event_session_id(stdout, event_type, event_id_path) {
+        backfill_captured_session_id(spawn_identity, recorded_identity, &session_id);
         *streamed_session_id = Some(session_id);
     }
 }

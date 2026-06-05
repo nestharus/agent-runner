@@ -104,7 +104,7 @@ pub fn execute_interactive_with_result_and_model_identity(
 
     #[cfg(unix)]
     let signal_guard = terminal_signal::InteractiveSignalGuard::install(&mut child)?;
-    record_child_identity(child.id(), spawn_identity.as_ref());
+    let _ = record_child_identity(child.id(), spawn_identity.as_ref());
 
     let status = wait_for_interactive_child(&mut child)?;
 

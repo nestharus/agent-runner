@@ -9,7 +9,9 @@
 
 use oulipoly_state::CompositeInvocationId;
 use oulipoly_state::mailbox::{MailboxDb, SessionRuntimeRunningUpdate};
-use oulipoly_state::pid_identity::{self, LiveProcessIdentityRecord};
+use oulipoly_state::pid_identity::{
+    self, LiveProcessIdentityRecord, PidIdentityDb, ProcessIdentity,
+};
 use std::path::Path;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,17 +76,37 @@ pub(super) fn context_from_parent_invocation_env(
     })
 }
 
-pub(super) fn record_child_identity(child_id: u32, context: Option<&SpawnIdentityContext>) {
-    let Some(context) = context else {
-        return;
-    };
+pub(super) fn record_child_identity(
+    child_id: u32,
+    context: Option<&SpawnIdentityContext>,
+) -> Option<ProcessIdentity> {
+    let context = context?;
     match pid_identity::record_live_process_identity(live_process_identity_record(
         child_id, context,
     )) {
-        Ok(Some(row)) => mark_session_running(context, &row.identity()),
-        Ok(None) => {}
-        Err(err) => warn_child_identity_record_failed(context, child_id, &err),
+        Ok(Some(row)) => {
+            let identity = row.identity();
+            mark_session_running(context, &identity);
+            Some(identity)
+        }
+        Ok(None) => None,
+        Err(err) => {
+            warn_child_identity_record_failed(context, child_id, &err);
+            None
+        }
     }
+}
+
+pub(super) fn backfill_captured_session_id(
+    context: Option<&SpawnIdentityContext>,
+    identity: Option<&ProcessIdentity>,
+    session_id: &str,
+) {
+    let (Some(context), Some(identity)) = (context, identity) else {
+        return;
+    };
+    backfill_pid_identity_session_id(context, identity, session_id);
+    mark_session_running_with_session_id(context, session_id, identity);
 }
 
 fn live_process_identity_record<'a>(
@@ -108,13 +130,18 @@ fn warn_child_identity_record_failed(context: &SpawnIdentityContext, child_id: u
     );
 }
 
-fn mark_session_running(
-    context: &SpawnIdentityContext,
-    identity: &oulipoly_state::pid_identity::ProcessIdentity,
-) {
+fn mark_session_running(context: &SpawnIdentityContext, identity: &ProcessIdentity) {
     let Some(session_id) = context.session_id.as_deref() else {
         return;
     };
+    mark_session_running_with_session_id(context, session_id, identity);
+}
+
+fn mark_session_running_with_session_id(
+    context: &SpawnIdentityContext,
+    session_id: &str,
+    identity: &ProcessIdentity,
+) {
     match MailboxDb::open_default().and_then(|mut db| {
         db.mark_session_running(session_runtime_running_update(
             context, session_id, identity,
@@ -128,7 +155,7 @@ fn mark_session_running(
 fn session_runtime_running_update<'a>(
     context: &'a SpawnIdentityContext,
     session_id: &'a str,
-    identity: &'a oulipoly_state::pid_identity::ProcessIdentity,
+    identity: &'a ProcessIdentity,
 ) -> SessionRuntimeRunningUpdate<'a> {
     SessionRuntimeRunningUpdate {
         session_id,
@@ -149,6 +176,45 @@ fn warn_mark_session_running_failed(context: &SpawnIdentityContext, session_id: 
         invocation_uuid = %context.invocation_uuid,
         session_id,
         "Failed to mark session runtime running: {err}"
+    );
+}
+
+fn backfill_pid_identity_session_id(
+    context: &SpawnIdentityContext,
+    identity: &ProcessIdentity,
+    session_id: &str,
+) {
+    match PidIdentityDb::open_default().and_then(|db| db.set_session_id(identity, session_id)) {
+        Ok(true) => {}
+        Ok(false) => warn_pid_identity_session_backfill_missing(context, identity, session_id),
+        Err(err) => warn_pid_identity_session_backfill_failed(context, identity, session_id, &err),
+    }
+}
+
+fn warn_pid_identity_session_backfill_missing(
+    context: &SpawnIdentityContext,
+    identity: &ProcessIdentity,
+    session_id: &str,
+) {
+    tracing::warn!(
+        invocation_uuid = %context.invocation_uuid,
+        session_id,
+        os_pid = identity.os_pid,
+        "PID identity sidecar row was missing during captured session_id backfill"
+    );
+}
+
+fn warn_pid_identity_session_backfill_failed(
+    context: &SpawnIdentityContext,
+    identity: &ProcessIdentity,
+    session_id: &str,
+    err: &str,
+) {
+    tracing::warn!(
+        invocation_uuid = %context.invocation_uuid,
+        session_id,
+        os_pid = identity.os_pid,
+        "Failed to backfill PID identity sidecar session_id: {err}"
     );
 }
 

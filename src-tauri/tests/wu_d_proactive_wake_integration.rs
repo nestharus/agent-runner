@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 const MODEL: &str = "wu-d-fixture-model";
 const PROVIDER: &str = "wu-d-fixture-provider";
 const SESSION: &str = "5169694d-de0f-40d1-890c-6e28e55bab27";
+const CAPTURED_OPENCODE_SESSION: &str = "ses_capturemidturn";
 const INVOCATION: &str = "11111111-1111-4111-8111-111111111111";
 
 struct Fixture {
@@ -166,6 +167,55 @@ flag = "--session"
             ),
         )
         .unwrap();
+    }
+
+    fn write_opencode_capture_provider(&self, body: &str) {
+        let script = self.write_script("opencode-capture.sh", body);
+        fs::write(
+            self.models_dir.join(format!("{MODEL}.toml")),
+            r#"[[providers]]
+name = "opencode"
+args = []
+"#,
+        )
+        .unwrap();
+        fs::write(
+            self.app_config_dir.join("providers.toml"),
+            format!(
+                r#"[opencode]
+command = {}
+args = []
+interactive_args = ["interactive"]
+prompt_mode = "arg"
+
+[opencode.session_capture]
+kind = "stdout_json_event"
+json_args = ["--json"]
+event_type = "step_start"
+event_id_path = "sessionID"
+
+[opencode.resume]
+kind = "flag"
+flag = "--session"
+"#,
+                toml_string(&path_string(&script))
+            ),
+        )
+        .unwrap();
+    }
+
+    fn pid_identity_session_id_for_provider(&self, provider_name: &str) -> String {
+        self.sidecar_conn()
+            .query_row(
+                "SELECT session_id
+                 FROM pid_identity
+                 WHERE provider_name = ?1
+                 ORDER BY recorded_at DESC, os_pid DESC
+                 LIMIT 1",
+                rusqlite::params![provider_name],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 
     fn write_script(&self, name: &str, body: &str) -> PathBuf {
@@ -579,6 +629,90 @@ fi"#,
             .list_pending("ses_fixture")
             .unwrap()
             .is_empty()
+    );
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
+fn opencode_mid_turn_notify_resolves_capture_time_sidecar_owner() {
+    let _guard = integration_test_guard();
+    let fixture = Fixture::new();
+    let event = json!({
+        "type": "step_start",
+        "sessionID": CAPTURED_OPENCODE_SESSION,
+    });
+    fixture.write_opencode_capture_provider(&provider_script(
+        &format!(
+            r#"printf '%s\n' '{}'
+sleep 0.2
+notify_handle h-capture-midturn 0
+sleep 0.2"#,
+            event
+        ),
+        r#"if [ "$resume" != "ses_capturemidturn" ]; then
+  printf 'expected --session ses_capturemidturn, got %s\n' "$resume" >&2
+  exit 66
+fi"#,
+        "opencode-capture-resumed.txt",
+    ));
+    fixture.seed_active_chain_for(
+        "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        "opencode",
+        CAPTURED_OPENCODE_SESSION,
+        MODEL,
+    );
+
+    let output = fixture.run_agent("dispatch capture race");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+
+    let notify_json = wait_for_file(&fixture.work_dir.join("h-capture-midturn/notify.json"));
+    let notify: Value = serde_json::from_str(&notify_json).unwrap();
+    assert_eq!(
+        notify.get("status").and_then(Value::as_str),
+        Some("enqueued")
+    );
+    assert_eq!(notify.get("enqueued").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        notify.get("owner_session_id").and_then(Value::as_str),
+        Some(CAPTURED_OPENCODE_SESSION)
+    );
+    assert_eq!(
+        notify.get("session_source").and_then(Value::as_str),
+        Some("sidecar_session_id")
+    );
+    assert_eq!(
+        notify
+            .get("wake")
+            .and_then(|wake| wake.get("status"))
+            .and_then(Value::as_str),
+        Some("busy")
+    );
+
+    assert_eq!(
+        fixture.pid_identity_session_id_for_provider("opencode"),
+        CAPTURED_OPENCODE_SESSION
+    );
+    let prompt = wait_for_file(&fixture.prompt_file("opencode-capture-resumed.txt"));
+    assert!(prompt.contains("handle: h-capture-midturn"), "{prompt}");
+    wait_until("captured opencode mailbox delivered", || {
+        let db = fixture.mailbox();
+        let rows = db.list_mailbox(CAPTURED_OPENCODE_SESSION, true).unwrap();
+        rows.len() == 1
+            && rows[0].handle == "h-capture-midturn"
+            && rows[0].delivered_at.is_some()
+            && rows[0].owner_invocation_uuid.is_some()
+            && rows[0].matched_os_pid.is_some()
+            && rows[0].matched_chain_index == Some(0)
+            && db.wake_claim(CAPTURED_OPENCODE_SESSION).unwrap().is_none()
+    });
+    assert_eq!(
+        fixture
+            .mailbox()
+            .session_runtime(CAPTURED_OPENCODE_SESSION)
+            .unwrap()
+            .unwrap()
+            .run_state,
+        "idle"
     );
     fixture.assert_xdg_isolated();
 }
