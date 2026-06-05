@@ -4,314 +4,342 @@
 
 - `worktree_path=/home/nes/projects/agent-runner/worktrees/age-pid-sidecar`
 - `repo_root=/home/nes/projects/agent-runner/worktrees/age-pid-sidecar`
-- `planning_dir=/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/planning/tsb-gate`
-- `wu_id=tsb`
-- `proposal_path=/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/planning/tsb-gate/proposal.md`
-- `contract_path=/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/planning/tsb-gate/contracts/tsb.contract.md`
 - `diff_path=/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/planning/tsb-gate/gates/diff.patch`
 - `touched_surfaces_path=/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/planning/tsb-gate/gates/touched-files.txt`
+- `proposal_path=/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/planning/tsb-gate/proposal.md`
+- `contract_path=/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/planning/tsb-gate/contracts/tsb.contract.md`
 - `output_path=/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/planning/tsb-gate/code-quality/tsb/reports/function-classification-auditor.md`
 - `mode=phase-6`
 
 ## References Read
 
-- `/home/nes/ai/conventions/code-quality.md`: A1 source of truth. Confirmed `orchestration`, `filter`, `validator`, `predicate`, `mapper`, `accessor`, `formatter`, and `parser` category list at lines 60-69; single-classification rule at lines 54-58; touched-file ownership at lines 143-149; `Function categories per function` threshold row at lines 295-300; `multi-classifier function` failure mode at lines 304-310.
-- `/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/planning/tsb-gate/contracts/tsb.contract.md`: Phase 6 contract. Confirmed component declared roles and touched files at lines 3-18, production function inventory at lines 19-131, adapter declarations at lines 133-157, intrinsic-surface declarations at lines 159-188.
-- `/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/planning/tsb-gate/proposal.md`: proposal context and proof claims at lines 1-69.
-- `/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/planning/tsb-gate/gates/diff.patch`: touched-file and changed-body evidence.
-- `/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/planning/tsb-gate/gates/touched-files.txt`: touched-file list.
-- Source files under `worktree_path`: `crates/oulipoly-runtime/src/quota/process.rs`, `crates/oulipoly-runtime/src/sessions/mod.rs`, `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs`, `scripts/opencode-turns`, `scripts/tests/opencode-turns.test.sh`.
+- `/home/nes/ai/conventions/code-quality.md` lines 52-69: A1 single-classification rule and category list.
+- `/home/nes/ai/conventions/code-quality.md` lines 21-27 and 143-149: auditor scope boundary and touched-file ownership.
+- `/home/nes/ai/conventions/code-quality.md` lines 295-300: `Function categories per function` threshold row, LOW = 1 and HIGH >= 2.
+- `/home/nes/ai/conventions/code-quality.md` lines 304-310: `multi-classifier function` failure mode.
+- `planning/tsb-gate/contracts/tsb.contract.md` lines 3-17: Phase 6 component roles and touched-file set.
+- `planning/tsb-gate/contracts/tsb.contract.md` lines 193-256: adapter and intrinsic-surface declarations used as context only.
+- `planning/tsb-gate/proposal.md` lines 3-6: bounded OpenCode turn scan and runtime script deadline intent.
+- `planning/tsb-gate/proposal.md` lines 17-63: proof claims for bounded enumeration, degraded markers, and process-group timeout behavior.
+
+A1 preservation check: present and non-contradictory. The metric source contains the exact A1 category list (`orchestration`, `filter`, `validator`, `predicate`, `mapper`, `accessor`, `formatter`, `parser`), the single-classification rule, the `Function categories per function` threshold row, touched-file ownership, and the `multi-classifier function` failure mode.
 
 ## Functions In Touched Files
 
 | Path | Function / symbol | Line span or diff hunk | Inferred category | Verdict | Evidence |
 |---|---|---|---|---|---|
-| `crates/oulipoly-runtime/src/quota/process.rs` | `run_refresh_command` | 36-42 | `orchestration` | LOW | Sequences spawn, drain, wait, join, and success validation through named helpers. |
-| `crates/oulipoly-runtime/src/quota/process.rs` | `run_script` | 44-46 | `orchestration` | LOW | Delegates to timeout-aware runner with the configured quota timeout. |
-| `crates/oulipoly-runtime/src/quota/process.rs` | `run_script_with_timeout` | 48-62 | `orchestration` | LOW | Sequences quota script spawn, stream drains, bounded wait, output joins, and success validation through helpers. |
-| `crates/oulipoly-runtime/src/quota/process.rs` | `spawn_refresh_command` | 64-69 | `orchestration` | LOW | Configures a command via helper and spawns it for auth refresh. |
-| `crates/oulipoly-runtime/src/quota/process.rs` | `spawn_quota_script` | 71-76 | `orchestration` | LOW | Configures a command via helper and spawns it for quota. |
-| `crates/oulipoly-runtime/src/quota/process.rs` | `shell_command` | 78-84 | `mapper` | LOW | Maps shell text into a configured `Command`. |
-| `crates/oulipoly-runtime/src/quota/process.rs` | `configure_script_process_group` | 87-91 | `mapper` | LOW | Maps Unix child command configuration to process-group settings. |
-| `crates/oulipoly-runtime/src/quota/process.rs` | `configure_script_process_group` | 94 | `mapper` | LOW | Non-Unix no-op command configuration branch. |
-| `crates/oulipoly-runtime/src/quota/process.rs` | `drain_child_stdout` | 96-98 | `accessor` | LOW | Takes child stdout and exposes a drain handle. |
-| `crates/oulipoly-runtime/src/quota/process.rs` | `drain_child_stderr` | 100-102 | `accessor` | LOW | Takes child stderr and exposes a drain handle. |
-| `crates/oulipoly-runtime/src/quota/process.rs` | `spawn_string_drain` | 104-109 | `orchestration` | LOW | Dispatches reader draining into a spawned thread using a named helper. |
-| `crates/oulipoly-runtime/src/quota/process.rs` | `drain_to_string` | 111-115 | `accessor` | LOW | Reads a stream into a string without changing meaning. |
-| `crates/oulipoly-runtime/src/quota/process.rs` | `wait_for_child` | 117-130 | `orchestration` | LOW | Sequences wait-step polling, sleep, and finalization helpers. |
-| `crates/oulipoly-runtime/src/quota/process.rs` | `try_wait_child` | 132-137 | `accessor` | LOW | Exposes child wait status with formatted error delegation. |
-| `crates/oulipoly-runtime/src/quota/process.rs` | `wait_step` | 139-149 | `orchestration` | LOW | Coordinates try-wait and timeout-step helpers. |
-| `crates/oulipoly-runtime/src/quota/process.rs` | `timeout_wait_step` | 151-156 | `mapper` | LOW | Maps elapsed time versus timeout into a `WaitStep`. |
-| `crates/oulipoly-runtime/src/quota/process.rs` | `finish_wait_step` | 158-169 | `orchestration` | LOW | Dispatches completed, timed-out, or impossible pending wait-step outcomes. |
-| `crates/oulipoly-runtime/src/quota/process.rs` | `kill_timed_out_child` | 171-178 | `orchestration` | LOW | Sequences process-group kill and timeout error helper. |
-| `crates/oulipoly-runtime/src/quota/process.rs` | `kill_child_process_group` | 181-189 | `orchestration` | LOW | Performs Unix timeout cleanup actions for the child process group. |
-| `crates/oulipoly-runtime/src/quota/process.rs` | `kill_child_process_group` | 192-195 | `orchestration` | LOW | Performs non-Unix timeout cleanup actions for the child. |
-| `crates/oulipoly-runtime/src/quota/process.rs` | `joined_text` | 197-199 | `accessor` | LOW | Exposes joined thread text with default fallback. |
-| `crates/oulipoly-runtime/src/quota/process.rs` | `ensure_refresh_success` | 201-206 | `validator` | LOW | Validates successful auth-refresh exit status or returns failure. |
-| `crates/oulipoly-runtime/src/quota/process.rs` | `ensure_quota_success` | 208-213 | `validator` | LOW | Validates successful quota exit status or returns failure. |
-| `crates/oulipoly-runtime/src/quota/process.rs` | `format_refresh_spawn_error` | 227-229 | `formatter` | LOW | Formats auth-refresh spawn error text. |
-| `crates/oulipoly-runtime/src/quota/process.rs` | `format_quota_spawn_error` | 231-233 | `formatter` | LOW | Formats quota spawn error text. |
-| `crates/oulipoly-runtime/src/quota/process.rs` | `format_timeout` | 235-244 | `formatter` | LOW | Formats timeout messages by process kind. |
-| `crates/oulipoly-runtime/src/quota/process.rs` | `format_wait_error` | 246-251 | `formatter` | LOW | Formats wait errors by process kind. |
-| `crates/oulipoly-runtime/src/quota/process.rs` | `format_refresh_exit` | 253-259 | `formatter` | LOW | Formats auth-refresh non-zero exit text. |
-| `crates/oulipoly-runtime/src/quota/process.rs` | `format_quota_exit` | 261-267 | `formatter` | LOW | Formats quota non-zero exit text. |
-| `crates/oulipoly-runtime/src/quota/process.rs` | `tests::quota_script_timeout_is_classified` | 275-280 | `validator` | LOW | Test body asserts timeout error classification tokens. |
-| `crates/oulipoly-runtime/src/quota/process.rs` | `tests::quota_script_timeout_kills_process_group_children` | 284-300 | `validator` | LOW | Test body asserts timeout classification and no leaked process marker. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `is_canonical_body_shape` | 76-81 | `predicate` | LOW | Answers whether body is an array of canonical chunks. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `is_canonical_body_chunk` | 83-89 | `predicate` | LOW | Answers whether one chunk has canonical fields. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `scan_provider` | 96-102 | `orchestration` | LOW | Delegates public scan to timeout-aware scan helper. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `scan_provider_with_timeout` | 104-128 | `orchestration` | LOW | Sequences source lookup, state-dir setup, script run, batch collection, persistence, and report return through helpers. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `provider_session_source` | 130-135 | `accessor` | LOW | Retrieves provider session source from config. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `scan_report_with_error` | 137-140 | `mapper` | LOW | Maps a report plus error into an updated report. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `create_session_state_dir` | 142-145 | `orchestration` | LOW | Dispatches directory creation and error formatting. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `format_state_dir_create_error` | 147-152 | `formatter` | LOW | Formats state-dir creation error text. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `collect_turn_script_batch` | 154-175 | `orchestration` | LOW | Iterates script lines and delegates degraded-marker, parse, error recording, and batch push work to helpers. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `degraded_marker_error` | 177-183 | `orchestration` | LOW | Pure helper dispatch for marker parse, marker predicate, count access, and error formatting. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `parse_degraded_marker_jsonl` | 185-187 | `parser` | LOW | Parses JSONL text into a JSON value. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `is_degraded_marker` | 189-194 | `predicate` | LOW | Answers whether JSON value has `degraded=true`. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `degraded_marker_count` | 196-201 | `accessor` | LOW | Retrieves optional degraded count with fallback. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `format_degraded_marker_error` | 203-205 | `formatter` | LOW | Formats degraded scan error text. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `non_empty_script_lines` | 207-213 | `mapper`, `filter` | HIGH | FC-001: splits stdout lines, trims line values, filters empty values, and collects. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `record_script_line_seen` | 215-218 | `accessor` | LOW | Updates and exposes the next script line count. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `record_optional_scan_error` | 220-224 | `orchestration` | LOW | Delegates optional error recording through named helper. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `record_scan_error` | 226-228 | `mapper` | LOW | Maps an error into the report's error list. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `push_script_turn_ingest` | 230-232 | `mapper` | LOW | Maps one ingest item into the batch collection. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `script_line_to_ingest` | 234-251 | `orchestration` | LOW | Delegates parse, timestamp parse, body validation, body serialization, error extraction, and ingest construction. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `parsed_script_turn_ingest` | 263-268 | `mapper` | LOW | Maps ingest plus body error into `ParsedScriptTurnIngest`. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `parse_script_turn_line` | 270-272 | `parser` | LOW | Parses one JSONL turn line into `ScriptTurn`. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `format_malformed_turn_line` | 274-276 | `formatter` | LOW | Formats malformed turn line error text. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `parse_script_turn_timestamp` | 278-282 | `parser` | LOW | Parses RFC3339 timestamp text into UTC `DateTime`. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `format_bad_timestamp` | 284-286 | `formatter` | LOW | Formats invalid timestamp error text. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `validate_script_turn_body` | 288-300 | `validator` | LOW | Accepts absent or valid body and rejects invalid body with error. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `validate_script_turn_body_shape` | 302-312 | `validator` | LOW | Validates canonical body shape or returns formatted validation error. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `format_invalid_body_shape` | 314-318 | `formatter` | LOW | Formats canonical body shape validation error text. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `serialize_script_turn_body` | 320-328 | `formatter` | LOW | Serializes body value to text and delegates error formatting. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `selected_script_turn_body` | 330-335 | `accessor` | LOW | Selects accepted body reference from validation result. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `serialize_selected_script_turn_body` | 337-345 | `orchestration` | LOW | Dispatches optional body serialization through named helper. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `format_body_serialize_error` | 347-353 | `formatter` | LOW | Formats body serialization error text. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `script_turn_to_ingest` | 355-370 | `mapper` | LOW | Maps parsed script turn fields into `SessionTurnIngest`. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `script_turn_ingest_from_parts` | 372-379 | `mapper` | LOW | Maps turn parts into `ParsedScriptTurnIngest`. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `script_turn_body_error` | 381-386 | `accessor` | LOW | Retrieves body validation error when present. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `persist_scanned_turns` | 388-398 | `orchestration` | LOW | Dispatches DB ingest result into chain persistence or error recording. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `persist_imported_chains` | 400-418 | `orchestration` | LOW | Sequences new-turn report update and imported-chain minting. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `scan_all` | 422-430 | `orchestration` | LOW | Iterates providers, dispatches scans, records reports, and sorts output. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `resolve_state_dir` | 432-438 | `mapper` | LOW | Maps provider source entry and provider name into a state directory path. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `default_app_data_dir` | 440-443 | `accessor` | LOW | Retrieves configured data dir with fallback. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `run_turn_script` | 445-451 | `orchestration` | LOW | Delegates turn script execution to timeout-aware session script runner. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `locate_transcript` | 453-472 | `orchestration` | LOW | Sequences entry lookup, locator lookup, state-dir creation, script run, line validation, and path mapping through helpers. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `session_source_entry` | 474-479 | `accessor` | LOW | Retrieves provider session source entry. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `transcript_locator_script` | 481-483 | `accessor` | LOW | Retrieves optional locator script text. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `single_transcript_stdout_line` | 485-491 | `validator` | LOW | Validates transcript locator stdout has exactly one line. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `transcript_path_from_line` | 493-495 | `mapper` | LOW | Maps one stdout line into `PathBuf`. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `run_session_script` | 497-510 | `orchestration` | LOW | Delegates to timeout-aware session script runner with default timeout. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `run_session_script_with_timeout` | 512-533 | `orchestration` | LOW | Sequences command construction, spawn, stream readers, wait, join, and success validation through helpers. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `validate_session_script_success` | 535-549 | `validator` | LOW | Validates session script exit status or returns non-zero error. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `session_script_command` | 551-567 | `mapper` | LOW | Maps script, state dir, and optional session ID into configured `Command`. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `configure_session_script_process_group` | 570-574 | `mapper` | LOW | Maps Unix session script command configuration to process-group settings. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `configure_session_script_process_group` | 577 | `mapper` | LOW | Non-Unix no-op command configuration branch. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `spawn_session_script_child` | 579-582 | `orchestration` | LOW | Spawns configured command and delegates spawn-error formatting. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `format_session_script_spawn_error` | 584-586 | `formatter` | LOW | Formats session script spawn error text. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `take_child_stdout` | 588-590 | `accessor` | LOW | Retrieves child stdout pipe. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `take_child_stderr` | 592-594 | `accessor` | LOW | Retrieves child stderr pipe. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `spawn_stdout_reader` | 596-598 | `orchestration` | LOW | Dispatches stdout reader spawning to common helper. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `spawn_stderr_reader` | 600-602 | `orchestration` | LOW | Dispatches stderr reader spawning to common helper. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `spawn_script_reader` | 604-613 | `orchestration`, `accessor` | HIGH | FC-002: spawns a thread and inlines stream-to-string draining inside the spawned closure. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `wait_for_session_script` | 615-631 | `orchestration` | LOW | Polls session script and delegates pending, success, and wait-error handling. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `poll_session_script` | 633-635 | `accessor` | LOW | Retrieves child wait status. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `wait_for_pending_session_script` | 637-649 | `orchestration` | LOW | Dispatches timeout predicate, timeout failure helper, and sleep helper. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `pending_session_script_timed_out` | 651-656 | `predicate` | LOW | Answers whether pending wait exceeded timeout. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `fail_timed_out_pending_session_script` | 658-668 | `orchestration` | LOW | Sequences timeout kill and timeout error construction through helpers. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `kill_timed_out_pending_session_script` | 670-672 | `orchestration` | LOW | Delegates timeout kill to process-group cleanup helper. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `kill_session_script_process_group` | 675-683 | `orchestration` | LOW | Performs Unix timeout cleanup actions for the session script process group. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `kill_session_script_process_group` | 686-689 | `orchestration` | LOW | Performs non-Unix timeout cleanup actions for the child. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `sleep_before_next_session_script_poll` | 691-693 | `orchestration` | LOW | Performs bounded polling sleep action. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `format_pending_session_script_timeout` | 695-697 | `formatter` | LOW | Formats session script timeout text. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `format_session_script_wait_error` | 699-704 | `formatter` | LOW | Formats session script wait error text. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `join_script_reader` | 706-708 | `accessor` | LOW | Exposes joined reader thread text with fallback. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `format_session_script_nonzero` | 710-721 | `formatter` | LOW | Formats non-zero session script exit text. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `capitalize_script_kind` | 723-729 | `formatter` | LOW | Formats script-kind casing for messages. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `tests::db` | 737-739 | `accessor` | LOW | Opens in-memory state DB fixture. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `tests::fixture_script` | 749-757 | `mapper` | LOW | Maps script body text into an executable fixture path wrapper. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `tests::cfg_with` | 759-770 | `mapper` | LOW | Maps provider and script path into `SessionsConfig`. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `tests::cfg_with_locator` | 772-787 | `mapper` | LOW | Maps provider, locator path, and state dir into `SessionsConfig`. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `tests::ingests_assistant_turns_and_advances_count` | 790-805 | `validator` | LOW | Test body asserts ingest and assistant-count behavior. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `tests::duplicate_turns_are_idempotent_per_unique_constraint` | 808-820 | `validator` | LOW | Test body asserts duplicate turns dedupe by unique constraint. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `tests::script_turn_legacy_json_deserializes_with_none_defaults` | 823-835 | `validator` | LOW | Test body asserts legacy JSON defaults. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `tests::script_turn_full_json_deserializes_parent_and_sidechain_fields` | 838-848 | `validator` | LOW | Test body asserts optional parent and sidechain fields. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `tests::scan_provider_persists_body_encoding_edge_cases` | 851-879 | `validator` | LOW | Test body asserts body encoding persistence. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `tests::scan_provider_rejects_non_canonical_body_shape` | 882-914 | `validator` | LOW | Test body asserts invalid body shape errors and persisted empty bodies. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `tests::malformed_lines_collect_as_errors_but_dont_abort` | 917-930 | `validator` | LOW | Test body asserts malformed lines collect errors without abort. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `tests::nonzero_exit_is_an_error` | 933-941 | `validator` | LOW | Test body asserts non-zero script exit is recorded. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `tests::turn_script_timeout_is_classified_and_does_not_persist_turns` | 944-956 | `validator` | LOW | Test body asserts timeout classification and no persisted turns. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `tests::degraded_marker_is_reported_without_malformed_turn_error` | 959-970 | `validator` | LOW | Test body asserts degraded marker is not treated as malformed turn JSON. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `tests::script_receives_state_dir_env` | 973-995 | `validator` | LOW | Test body asserts state-dir env delivery. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `tests::locate_transcript_returns_none_when_no_locator_is_configured` | 998-1004 | `validator` | LOW | Test body asserts missing locator returns none. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `tests::locate_transcript_returns_script_stdout_path` | 1007-1026 | `validator` | LOW | Test body asserts locator stdout path and session env. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `tests::locate_transcript_returns_error_on_nonzero_exit` | 1029-1036 | `validator` | LOW | Test body asserts non-zero locator error. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `tests::locate_transcript_returns_error_on_empty_stdout` | 1043-1053 | `validator` | LOW | Test body asserts empty locator stdout is rejected. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `tests::cfg_from_adapter_fixture` | 1055-1069 | `mapper` | LOW | Maps fixture name into script fixture and sessions config. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `tests::turn_script_optional_compaction_field_defaults_false` | 1073-1086 | `validator` | LOW | Test body asserts compaction default behavior. |
-| `crates/oulipoly-runtime/src/sessions/mod.rs` | `tests::turn_script_compaction_field_propagates_to_session_turns` | 1090-1103 | `validator` | LOW | Test body asserts compaction boundary propagation. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `Fixture::new` | 78-97 | `mapper` | LOW | Maps tempdir, state DB, file paths, and fake provider into fixture struct. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `Fixture::set_mode` | 99-101 | `orchestration` | LOW | Performs mode-file write action. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `Fixture::registry` | 103-111 | `mapper` | LOW | Maps fixture provider path and roots into provider registry. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `Fixture::hostile_registry` | 113-121 | `mapper` | LOW | Maps fixture provider path and hostile roots into provider registry. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `Fixture::timeout_registry` | 123-133 | `mapper` | LOW | Maps fixture provider path and timeout client options into provider registry. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `Fixture::unrelated_registry` | 135-143 | `mapper` | LOW | Maps unrelated model configuration into provider registry. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `Fixture::records` | 145-147 | `accessor` | LOW | Retrieves provider record values from record path. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `Fixture::request_records_for` | 149-154 | `filter` | LOW | Selects provider records matching a subcommand. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `Fixture::snapshot` | 156-158 | `accessor` | LOW | Retrieves SQLite snapshot for fixture connection. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `Fixture::state_path` | 160-162 | `accessor` | LOW | Exposes fixture state DB path. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `Fixture::conn` | 164-166 | `accessor` | LOW | Opens fixture SQLite connection. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `Fixture::seed_finalized_invocation` | 168-183 | `orchestration` | LOW | Sequences invocation start and finalize fixture setup. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `Fixture::seed_chain` | 185-200 | `orchestration` | LOW | Sequences chain and chain segment fixture inserts. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `provider_record_text` | 203-205 | `accessor` | LOW | Reads provider record file text. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `provider_record_values` | 207-209 | `parser` | LOW | Parses record text lines into JSON values through a helper. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `provider_record_value` | 211-213 | `parser` | LOW | Parses one provider record JSON line. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `external_model` | 215-229 | `mapper` | LOW | Maps model name and provider path into `ModelConfig`. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `provider_identity` | 231-238 | `mapper` | LOW | Maps constants into `SessionProviderIdentity`. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `locate_request` | 240-252 | `mapper` | LOW | Maps registry, session ID, and lookup mode into locate request. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `read_request` | 254-264 | `mapper` | LOW | Maps registry and session ID into read-turns request. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `capture_request` | 266-276 | `mapper` | LOW | Maps registry and invocation UUID into capture request. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `no_ref_dispatch_aware_lifecycle_path_preserves_session_capture_marker_and_sqlite_bytes` | 279-312 | `validator` | LOW | Test body asserts no-ref dispatch lifecycle and SQLite equivalence. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `external_provider_locate_dispatch_maps_success_and_request_identity` | 315-341 | `validator` | LOW | Test body asserts locate success mapping and request identity. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `external_provider_locate_failure_matrix_does_not_fall_back_to_private_layouts` | 344-392 | `validator` | LOW | Test body asserts locate failure matrix tokens and no host mutation. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `external_provider_locate_unknown_format_maps_to_other_storage_class` | 395-420 | `validator` | LOW | Test body asserts unknown format storage classification. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `external_provider_read_turns_maps_transport_into_owned_turn_interface_before_persistence` | 423-478 | `validator` | LOW | Test body asserts read-turn mapping before persistence. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `external_provider_read_turns_provider_transport_and_schema_failures_do_not_mutate_sqlite` | 481-514 | `validator` | LOW | Test body asserts read-turn failure tokens and no mutation. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `external_provider_read_turns_rejects_invalid_or_mismatched_provider_evidence_without_mutation` | 517-540 | `validator` | LOW | Test body asserts invalid read evidence is rejected without mutation. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `external_provider_read_turns_complete_partial_idempotency_and_turn_count_are_evidence_only` | 543-591 | `validator` | LOW | Test body asserts complete/partial evidence and idempotency. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `external_provider_read_turns_ingest_uses_owned_interface_and_host_idempotency` | 594-633 | `validator` | LOW | Test body asserts owned ingest and host idempotency. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `opencode_read_turns_ingests_normalized_jsonl` | 636-659 | `validator` | LOW | Test body asserts OpenCode adapter JSONL ingest and repeat scan behavior. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `external_provider_capture_maps_facts_without_mutating_capture_rows` | 662-690 | `validator` | LOW | Test body asserts capture facts without SQLite mutation. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `external_provider_capture_provider_transport_and_schema_failures_do_not_mutate_sqlite` | 693-728 | `validator` | LOW | Test body asserts capture failure tokens and no mutation. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `external_provider_timeout_is_stable_transport_token_without_mutation` | 731-750 | `validator` | LOW | Test body asserts timeout token and no mutation. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `external_provider_error_tokens_are_stable_by_failure_class` | 753-775 | `validator` | LOW | Test body asserts stable error tokens by failure class. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `hostile_provider_cannot_discover_or_mutate_runner_sqlite_through_session_dispatch` | 778-821 | `validator` | LOW | Test body asserts hostile provider cannot discover or mutate runner SQLite. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `assert_error_token` | 823-829 | `validator` | LOW | Assertion helper validates stable token presence. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `NoRefDispatchProofFixture::new` | 836-850 | `mapper`, `validator` | HIGH | FC-003: constructs/seeds proof fixture and asserts row-id invariant in the same body. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `NoRefDispatchProofFixture::request_without_registry` | 852-862 | `mapper` | LOW | Maps fixture state and constants into no-ref proof request. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `NoRefDispatchProofFixture::request_with_registry` | 864-872 | `mapper` | LOW | Maps registry override into no-ref proof request. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `NoRefDispatchProofFixture::snapshot` | 874-876 | `accessor` | LOW | Exposes fixture snapshot. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `hostile_marker` | 879-881 | `mapper` | LOW | Maps fixture and route into marker path. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `DataDirOverride::remove` | 888-896 | `orchestration` | LOW | Sequences env capture and temporary env removal. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `DataDirOverride::drop` | 900-908 | `orchestration` | LOW | Restores or removes env value during drop cleanup. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `hostile_markers_json` | 911-921 | `formatter` | LOW | Formats hostile marker paths into JSON text. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `assert_request_shape` | 923-938 | `validator` | LOW | Assertion helper validates request JSON shape. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `sqlite_snapshot` | 940-947 | `mapper` | LOW | Maps database rows into `SqliteSnapshot`. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `invocation_snapshot_rows` | 949-957 | `accessor` | LOW | Retrieves invocation snapshot rows via query helper. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `invocation_snapshot_row` | 959-967 | `mapper` | LOW | Maps a SQLite row into invocation snapshot tuple. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `session_turn_snapshot_rows` | 969-977 | `accessor` | LOW | Retrieves session turn snapshot rows via query helper. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `session_turn_snapshot_row` | 979-990 | `mapper` | LOW | Maps a SQLite row into session-turn snapshot tuple. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `session_chain_snapshot_rows` | 992-998 | `accessor` | LOW | Retrieves session chain snapshot rows via query helper. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `session_chain_snapshot_row` | 1000-1002 | `mapper` | LOW | Maps a SQLite row into session-chain tuple. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `session_chain_segment_snapshot_rows` | 1004-1011 | `accessor` | LOW | Retrieves session chain segment snapshot rows via query helper. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `session_chain_segment_snapshot_row` | 1013-1017 | `mapper` | LOW | Maps a SQLite row into chain segment tuple. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `query_rows` | 1019-1028 | `accessor` | LOW | Retrieves query rows and applies supplied row mapper. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `parse_ts` | 1030-1034 | `parser` | LOW | Parses RFC3339 timestamp into UTC `DateTime`. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `write_fake_provider` | 1036-1052 | `orchestration` | LOW | Sequences fake provider body formatting, file write, chmod, and path return. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `fake_provider_body` | 1054-1328 | `formatter` | LOW | Formats fake provider Python source text from paths and constants; embedded Python functions are string payload, not Rust inventory symbols. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `json_string` | 1330-1332 | `formatter` | LOW | Formats path display text as JSON string. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `repo_script_path` | 1334-1339 | `mapper` | LOW | Maps script name into repository script path. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `opencode_sessions_config` | 1341-1362 | `mapper` | LOW | Maps script/opencode/state paths into `SessionsConfig`. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `write_fake_opencode` | 1364-1407 | `orchestration` | LOW | Sequences fake OpenCode script file write, chmod, and path return. |
-| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `shell_single_quote_path` | 1409-1411 | `formatter` | LOW | Formats shell-quoted path text. |
-| `scripts/opencode-turns` | `Options.__init__` | 67-71 | `orchestration` | LOW | Dispatches option parsing to env helpers and assigns option fields. |
-| `scripts/opencode-turns` | `Deadline.__init__` | 75-77 | `mapper` | LOW | Maps duration into deadline state. |
-| `scripts/opencode-turns` | `Deadline.remaining` | 79-80 | `accessor` | LOW | Exposes remaining deadline budget. |
-| `scripts/opencode-turns` | `Deadline.call_timeout` | 82-86 | `filter` | LOW | Bounds max call timeout by remaining deadline. |
-| `scripts/opencode-turns` | `env_float` | 89-97 | `parser` | LOW | Parses positive float env value with fallback. |
-| `scripts/opencode-turns` | `env_int` | 100-108 | `parser` | LOW | Parses positive integer env value with fallback. |
-| `scripts/opencode-turns` | `text_chunk` | 111-112 | `mapper` | LOW | Maps text into canonical text chunk. |
-| `scripts/opencode-turns` | `canonical_chunk_type` | 115-120 | `mapper` | LOW | Maps native chunk type names to canonical names. |
-| `scripts/opencode-turns` | `extract_content_chunks` | 123-130 | `orchestration` | LOW | Dispatches content extraction by value shape to helper functions. |
-| `scripts/opencode-turns` | `content_chunks_from_text` | 133-134 | `mapper` | LOW | Maps plain text into canonical chunk list. |
-| `scripts/opencode-turns` | `content_chunks_from_items` | 137-141 | `orchestration` | LOW | Recursively dispatches content extraction for list items. |
-| `scripts/opencode-turns` | `content_chunks_from_obj` | 144-148 | `orchestration` | LOW | Delegates direct object parsing before nested recursion. |
-| `scripts/opencode-turns` | `direct_content_chunks_from_obj` | 151-158 | `parser` | LOW | Parses a text-bearing content dictionary into canonical chunk shape. |
-| `scripts/opencode-turns` | `nested_content_chunks_from_obj` | 161-166 | `orchestration` | LOW | Tries known nested content fields and returns first recursive chunk result. |
-| `scripts/opencode-turns` | `unique_values` | 169-176 | `filter` | LOW | Deduplicates values while preserving order. |
-| `scripts/opencode-turns` | `session_ids_from_value` | 179-192 | `parser` | LOW | Recursively extracts session IDs from arbitrary value shapes. |
-| `scripts/opencode-turns` | `parse_session_list_stdout` | 195-204 | `orchestration` | LOW | Coordinates session-list JSON parsing, candidate extraction, fallback ID extraction, and bounded selection through helpers. |
-| `scripts/opencode-turns` | `parse_session_list_json` | 207-211 | `parser` | LOW | Parses session list stdout as JSON or returns sentinel. |
-| `scripts/opencode-turns` | `capped_session_ids_from_value` | 214-215 | `filter` | LOW | Extracts unique session IDs through helper and applies cap. |
-| `scripts/opencode-turns` | `session_ids_from_candidates` | 218-221 | `orchestration` | LOW | Selects timestamp-window filtering or cap filtering through helpers. |
-| `scripts/opencode-turns` | `candidates_have_timestamps` | 224-225 | `predicate` | LOW | Answers whether candidates include parsed timestamps. |
-| `scripts/opencode-turns` | `recent_session_ids` | 228-234 | `filter` | LOW | Selects candidate session IDs within recent window. |
-| `scripts/opencode-turns` | `capped_candidate_session_ids` | 237-238 | `filter` | LOW | Applies max-session cap to candidate session IDs. |
-| `scripts/opencode-turns` | `unique_session_candidates` | 241-250 | `filter` | LOW | Deduplicates session candidates by session ID. |
-| `scripts/opencode-turns` | `session_candidates_from_value` | 253-258 | `orchestration` | LOW | Dispatches candidate extraction by value shape. |
-| `scripts/opencode-turns` | `session_candidates_from_items` | 261-265 | `orchestration` | LOW | Recursively accumulates candidates from iterable values. |
-| `scripts/opencode-turns` | `session_candidates_from_obj` | 268-271 | `orchestration` | LOW | Routes dictionary candidate mapping or recursive traversal through helpers. |
-| `scripts/opencode-turns` | `has_session_candidate_shape` | 274-275 | `predicate` | LOW | Answers whether an object has a recognizable session ID. |
-| `scripts/opencode-turns` | `session_candidate_from_obj` | 278-282 | `mapper` | LOW | Maps recognized session-list object into candidate row. |
-| `scripts/opencode-turns` | `session_list_session_id` | 285-293 | `parser` | LOW | Parses a session ID from known fields. |
-| `scripts/opencode-turns` | `session_list_timestamp` | 296-301 | `parser` | LOW | Parses a timestamp from known session-list fields. |
-| `scripts/opencode-turns` | `timestamp_datetime` | 304-319 | `parser` | LOW | Parses numeric or string timestamp values into UTC datetime. |
-| `scripts/opencode-turns` | `numeric_timestamp_datetime` | 322-327 | `parser` | LOW | Parses numeric seconds or milliseconds into UTC datetime. |
-| `scripts/opencode-turns` | `discover_session_ids` | 330-336 | `orchestration` | LOW | Runs session discovery and delegates timeout/result parsing. |
-| `scripts/opencode-turns` | `requested_session_ids` | 339-344 | `orchestration` | LOW | Selects explicit session IDs or implicit discovery through helpers. |
-| `scripts/opencode-turns` | `numeric_timestamp` | 347-351 | `formatter` | LOW | Formats numeric timestamp as UTC ISO text. |
-| `scripts/opencode-turns` | `timestamp_from_obj` | 354-362 | `parser` | LOW | Parses turn timestamp from known object fields. |
-| `scripts/opencode-turns` | `session_id_from_obj` | 365-370 | `parser` | LOW | Parses session ID from exported message object. |
-| `scripts/opencode-turns` | `role_from_obj` | 373-380 | `parser` | LOW | Parses supported role from top-level or nested message object. |
-| `scripts/opencode-turns` | `turn_id_from_obj` | 383-384 | `orchestration` | LOW | Selects parsed turn ID or fallback through helpers. |
-| `scripts/opencode-turns` | `turn_id_field_from_obj` | 387-394 | `parser` | LOW | Parses turn ID from top-level or nested message object. |
-| `scripts/opencode-turns` | `turn_id_field_from_mapping` | 397-402 | `parser` | LOW | Parses turn ID from known ID fields. |
-| `scripts/opencode-turns` | `fallback_turn_id` | 405-406 | `formatter` | LOW | Formats deterministic fallback turn ID. |
-| `scripts/opencode-turns` | `opencode_command` | 409-411 | `parser` | LOW | Parses `OPENCODE_BIN` shell words with fallback. |
-| `scripts/opencode-turns` | `run_opencode` | 414-432 | `orchestration` | LOW | Sequences deadline, spawn, communicate, timeout cleanup, failure classification, and result construction through helpers. |
-| `scripts/opencode-turns` | `opencode_deadline_expired` | 435-436 | `predicate` | LOW | Answers whether no per-call timeout budget remains. |
-| `scripts/opencode-turns` | `spawn_opencode_process` | 439-447 | `orchestration` | LOW | Starts OpenCode subprocess with bounded stdio/session settings. |
-| `scripts/opencode-turns` | `communicate_opencode_process` | 450-457 | `orchestration` | LOW | Waits for process output and reports timeout status. |
-| `scripts/opencode-turns` | `opencode_process_failed` | 460-461 | `predicate` | LOW | Answers whether subprocess exit code is non-zero. |
-| `scripts/opencode-turns` | `degraded_opencode_result` | 464-465 | `mapper` | LOW | Maps timeout condition into degraded result tuple. |
-| `scripts/opencode-turns` | `failed_opencode_result` | 468-469 | `mapper` | LOW | Maps failed process condition into non-degraded empty result tuple. |
-| `scripts/opencode-turns` | `successful_opencode_result` | 472-473 | `mapper` | LOW | Maps stdout into successful result tuple. |
-| `scripts/opencode-turns` | `kill_process_group` | 476-491 | `orchestration` | LOW | Sequences process-group kill, fallback process kill, and drain. |
-| `scripts/opencode-turns` | `parse_export_stdout` | 494-498 | `parser` | LOW | Parses export stdout as JSON or returns none. |
-| `scripts/opencode-turns` | `export_session` | 501-509 | `orchestration` | LOW | Runs export command and delegates timeout/result parsing. |
-| `scripts/opencode-turns` | `exported_message_items` | 512-516 | `orchestration` | LOW | Coordinates export-shape extraction and dictionary filtering through helpers. |
-| `scripts/opencode-turns` | `exported_message_item_values` | 519-530 | `parser` | LOW | Parses raw message item list from supported export shapes. |
-| `scripts/opencode-turns` | `dict_items` | 533-534 | `filter` | LOW | Keeps only dictionary items from a raw item list. |
-| `scripts/opencode-turns` | `record_from_message` | 537-547 | `orchestration`, `mapper` | HIGH | FC-004: coordinates field parsing/validation/record mapping and also mutates the mapped record with optional body inline. |
-| `scripts/opencode-turns` | `message_record_fields` | 550-555 | `parser` | LOW | Extracts normalized required fields from message object. |
-| `scripts/opencode-turns` | `has_required_message_record_fields` | 558-559 | `validator` | LOW | Validates that required message record fields are present. |
-| `scripts/opencode-turns` | `message_record_from_fields` | 562-568 | `mapper` | LOW | Maps validated fields and turn ID into normalized record base. |
-| `scripts/opencode-turns` | `message_body_chunks` | 571-576 | `parser` | LOW | Extracts optional body chunks from supported message content fields. |
-| `scripts/opencode-turns` | `records_from_exported_session` | 579-585 | `mapper` | LOW | Maps exported message items into normalized records, omitting non-record results. |
-| `scripts/opencode-turns` | `collect_records` | 588-601 | `orchestration` | LOW | Iterates sessions, exports each, stops on timeout, and accumulates records through helpers. |
-| `scripts/opencode-turns` | `emit_record` | 604-606 | `formatter` | LOW | Emits one compact JSONL record. |
-| `scripts/opencode-turns` | `emit_degraded_marker` | 609-611 | `filter`, `formatter` | HIGH | FC-005: counts assistant records with inline predicate/filter logic and emits the degraded JSONL marker. |
-| `scripts/opencode-turns` | `main` | 614-629 | `validator`, `formatter`, `orchestration` | HIGH | FC-006: validates argv and prints usage inline, then orchestrates options/deadline, record collection, record emission, and degraded marker emission. |
-| `scripts/tests/opencode-turns.test.sh` | `fail` | 10-13 | `validator` | LOW | Test failure helper reports and exits on validation failure. |
-| `scripts/tests/opencode-turns.test.sh` | `assert_eq` | 15-23 | `validator` | LOW | Assertion helper validates equality. |
-| `scripts/tests/opencode-turns.test.sh` | `assert_status_zero` | 25-32 | `validator` | LOW | Assertion helper validates zero exit status. |
-| `scripts/tests/opencode-turns.test.sh` | `assert_stdout_contains` | 34-41 | `validator` | LOW | Assertion helper validates stdout contains fixed text. |
-| `scripts/tests/opencode-turns.test.sh` | `assert_stdout_not_contains` | 43-50 | `validator` | LOW | Assertion helper validates stdout excludes fixed text. |
-| `scripts/tests/opencode-turns.test.sh` | `write_window_filter_mock` | 52-88 | `orchestration` | LOW | Writes and chmods mock OpenCode executable for window-filter proof. |
-| `scripts/tests/opencode-turns.test.sh` | `write_timeout_mock` | 90-122 | `orchestration` | LOW | Writes and chmods mock OpenCode executable for timeout proof. |
-| `scripts/tests/opencode-turns.test.sh` | `run_opencode_turns` | 124-143 | `orchestration` | LOW | Runs adapter with fixture env and captures stdout/stderr/status. |
-| `scripts/tests/opencode-turns.test.sh` | `test_exports_only_recent_window_sessions` | 145-162 | `validator` | LOW | Test body asserts recent-window export behavior and non-degraded output. |
-| `scripts/tests/opencode-turns.test.sh` | `test_timeout_emits_degraded_best_effort_and_exits_zero` | 164-185 | `validator` | LOW | Test body asserts timeout-degraded best-effort behavior and elapsed bound. |
+| `crates/oulipoly-runtime/src/quota/process.rs` | `run_refresh_command` | L36-L42 | `orchestration` | LOW | Sequences spawn, stderr drain, wait, join, and success helper dispatch. |
+| `crates/oulipoly-runtime/src/quota/process.rs` | `run_script` | L44-L46 | `orchestration` | LOW | Delegates to bounded runner with the default timeout. |
+| `crates/oulipoly-runtime/src/quota/process.rs` | `run_script_with_timeout` | L48-L62 | `orchestration` | LOW | Sequences child spawn, stream drains, wait, success validation helper, and stdout return. |
+| `crates/oulipoly-runtime/src/quota/process.rs` | `spawn_refresh_command` | L64-L69 | `orchestration` | LOW | Builds and spawns the refresh command, delegating error text to a formatter helper. |
+| `crates/oulipoly-runtime/src/quota/process.rs` | `spawn_quota_script` | L71-L76 | `orchestration` | LOW | Builds and spawns the quota script, delegating error text to a formatter helper. |
+| `crates/oulipoly-runtime/src/quota/process.rs` | `shell_command` | L78-L84 | `mapper` | LOW | Maps a shell command string into a configured `Command`. |
+| `crates/oulipoly-runtime/src/quota/process.rs` | `configure_script_process_group` unix | L86-L91 | `mapper` | LOW | Maps a `Command` to process-group configured state. |
+| `crates/oulipoly-runtime/src/quota/process.rs` | `configure_script_process_group` non-unix | L93-L94 | `mapper` | LOW | No-op mapping for unsupported platforms. |
+| `crates/oulipoly-runtime/src/quota/process.rs` | `drain_child_stdout` | L96-L98 | `accessor` | LOW | Takes child stdout and exposes it to the drain helper. |
+| `crates/oulipoly-runtime/src/quota/process.rs` | `drain_child_stderr` | L100-L102 | `accessor` | LOW | Takes child stderr and exposes it to the drain helper. |
+| `crates/oulipoly-runtime/src/quota/process.rs` | `spawn_string_drain` | L104-L109 | `orchestration` | LOW | Starts a drain thread and delegates stream reading to `drain_to_string`. |
+| `crates/oulipoly-runtime/src/quota/process.rs` | closure `move || drain_to_string(reader)` | L108 | `orchestration` | LOW | Dispatches only to the named drain helper. |
+| `crates/oulipoly-runtime/src/quota/process.rs` | `drain_to_string` | L111-L115 | `accessor` | LOW | Reads stream contents into a string. |
+| `crates/oulipoly-runtime/src/quota/process.rs` | `wait_for_child` | L117-L130 | `orchestration` | LOW | Poll/sleep loop delegates step evaluation and finalization. |
+| `crates/oulipoly-runtime/src/quota/process.rs` | `try_wait_child` | L132-L137 | `accessor` | LOW | Retrieves child wait state and maps only error text through helper. |
+| `crates/oulipoly-runtime/src/quota/process.rs` | closure `|e| format_wait_error(kind, e)` | L136 | `formatter` | LOW | Formats a wait error through a named helper. |
+| `crates/oulipoly-runtime/src/quota/process.rs` | `wait_step` | L139-L149 | `orchestration` | LOW | Sequences child wait result and timeout-step helper. |
+| `crates/oulipoly-runtime/src/quota/process.rs` | `timeout_wait_step` | L151-L156 | `mapper` | LOW | Maps elapsed timeout state to a `WaitStep` enum. |
+| `crates/oulipoly-runtime/src/quota/process.rs` | `finish_wait_step` | L158-L169 | `orchestration` | LOW | Dispatches the wait outcome to completion or timeout kill helper. |
+| `crates/oulipoly-runtime/src/quota/process.rs` | `kill_timed_out_child` | L171-L178 | `orchestration` | LOW | Sequences process-group kill and timeout-error helper. |
+| `crates/oulipoly-runtime/src/quota/process.rs` | `kill_child_process_group` unix | L180-L189 | `orchestration` | LOW | Sequences process-group kill, child kill, and wait. |
+| `crates/oulipoly-runtime/src/quota/process.rs` | `kill_child_process_group` non-unix | L191-L195 | `orchestration` | LOW | Sequences child kill and wait. |
+| `crates/oulipoly-runtime/src/quota/process.rs` | `joined_text` | L197-L199 | `accessor` | LOW | Retrieves joined thread output with default. |
+| `crates/oulipoly-runtime/src/quota/process.rs` | `ensure_refresh_success` | L201-L206 | `validator` | LOW | Accepts successful status or returns refresh failure. |
+| `crates/oulipoly-runtime/src/quota/process.rs` | `ensure_quota_success` | L208-L213 | `validator` | LOW | Accepts successful status or returns quota failure. |
+| `crates/oulipoly-runtime/src/quota/process.rs` | `format_refresh_spawn_error` | L227-L229 | `formatter` | LOW | Formats refresh spawn failure text. |
+| `crates/oulipoly-runtime/src/quota/process.rs` | `format_quota_spawn_error` | L231-L233 | `formatter` | LOW | Formats quota spawn failure text. |
+| `crates/oulipoly-runtime/src/quota/process.rs` | `format_timeout` | L235-L244 | `formatter` | LOW | Formats auth/quota timeout messages. |
+| `crates/oulipoly-runtime/src/quota/process.rs` | `format_wait_error` | L246-L251 | `formatter` | LOW | Formats auth/quota wait errors. |
+| `crates/oulipoly-runtime/src/quota/process.rs` | `format_refresh_exit` | L253-L259 | `formatter` | LOW | Formats refresh nonzero exit text. |
+| `crates/oulipoly-runtime/src/quota/process.rs` | `format_quota_exit` | L261-L267 | `formatter` | LOW | Formats quota nonzero exit text. |
+| `crates/oulipoly-runtime/src/quota/process.rs` | `quota_script_timeout_is_classified` | L274-L280 | `validator` | LOW | Test validates timeout error tokens. |
+| `crates/oulipoly-runtime/src/quota/process.rs` | `quota_script_timeout_kills_process_group_children` | L282-L300 | `validator` | LOW | Test validates timeout token and leaked-marker absence. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `is_canonical_body_shape` | L76-L81 | `predicate` | LOW | Answers whether a body is a canonical chunk array. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `is_canonical_body_chunk` | L83-L89 | `predicate` | LOW | Answers whether one chunk has canonical fields. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `scan_provider` | L96-L102 | `orchestration` | LOW | Delegates scan to timeout-aware helper. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `scan_provider_with_timeout` | L104-L128 | `orchestration` | LOW | Sequences source lookup, state dir creation, script run, batch collection, and persistence helpers. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `provider_session_source` | L130-L135 | `accessor` | LOW | Retrieves provider session source entry. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `scan_report_with_error` | L137-L140 | `mapper` | LOW | Maps a report plus error into an updated report. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `create_session_state_dir` | L142-L145 | `orchestration` | LOW | Calls directory creation and delegates error formatting. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | closure `|error| format_state_dir_create_error(...)` | L144 | `formatter` | LOW | Formats create-dir error through helper. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `format_state_dir_create_error` | L147-L152 | `formatter` | LOW | Formats state-dir creation failure text. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `collect_turn_script_batch` | L154-L175 | `orchestration` | LOW | Iterates lines and dispatches marker, parse, record-error, and push helpers. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `degraded_marker_error` | L177-L183 | `orchestration` | LOW | Composes marker parse, predicate, count accessor, and formatter helpers. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `parse_degraded_marker_jsonl` | L185-L187 | `parser` | LOW | Parses one JSONL line as JSON. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `is_degraded_marker` | L189-L194 | `predicate` | LOW | Answers whether JSON is the degraded marker. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `degraded_marker_count` | L196-L201 | `accessor` | LOW | Retrieves optional degraded-marker count. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `format_degraded_marker_error` | L203-L205 | `formatter` | LOW | Formats degraded-marker error text. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `non_empty_script_lines` | L207-L209 | `orchestration` | LOW | Composes trim mapper and non-empty filter helpers. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `trimmed_script_lines` | L211-L213 | `mapper` | LOW | Maps stdout lines to trimmed line values. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `non_empty_trimmed_lines` | L215-L217 | `filter` | LOW | Filters empty trimmed lines. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | closure `|line| !line.is_empty()` | L216 | `predicate` | LOW | Answers whether a line is non-empty. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `record_script_line_seen` | L219-L222 | `mapper` | LOW | Updates report line count and returns it. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `record_optional_scan_error` | L224-L228 | `orchestration` | LOW | Dispatches optional error to the recorder helper. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `record_scan_error` | L230-L232 | `mapper` | LOW | Adds an error to the report. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `push_script_turn_ingest` | L234-L236 | `mapper` | LOW | Adds an ingest row to the batch. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `script_line_to_ingest` | L238-L255 | `orchestration` | LOW | Dispatches parse, timestamp parse, body validation, serialization, and ingest mapping helpers. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `parsed_script_turn_ingest` | L267-L272 | `mapper` | LOW | Maps ingest plus body error to `ParsedScriptTurnIngest`. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `parse_script_turn_line` | L274-L276 | `parser` | LOW | Parses JSONL into `ScriptTurn`. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | closure `|error| format_malformed_turn_line(...)` | L275 | `formatter` | LOW | Formats malformed-line parse error. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `format_malformed_turn_line` | L278-L280 | `formatter` | LOW | Formats malformed turn line text. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `parse_script_turn_timestamp` | L282-L286 | `parser` | LOW | Parses RFC3339 timestamp to UTC. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | closure `|timestamp| timestamp.with_timezone(&Utc)` | L284 | `mapper` | LOW | Maps parsed timestamp to UTC. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | closure `|error| format_bad_timestamp(...)` | L285 | `formatter` | LOW | Formats timestamp parse error. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `format_bad_timestamp` | L288-L290 | `formatter` | LOW | Formats bad timestamp text. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `validate_script_turn_body` | L292-L304 | `validator` | LOW | Accepts missing/valid body or returns rejected body state. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `validate_script_turn_body_shape` | L306-L316 | `validator` | LOW | Accepts canonical body shape or returns validation error. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `format_invalid_body_shape` | L318-L322 | `formatter` | LOW | Formats invalid body-shape error. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `serialize_script_turn_body` | L324-L332 | `formatter` | LOW | Serializes body for storage and delegates serialization error text. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | closure `|error| format_body_serialize_error(...)` | L331 | `formatter` | LOW | Formats body serialization error. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `selected_script_turn_body` | L334-L339 | `accessor` | LOW | Exposes selected accepted body. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `serialize_selected_script_turn_body` | L341-L349 | `orchestration` | LOW | Dispatches optional body to serialization helper. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | closure `|body| serialize_script_turn_body(...)` | L346 | `formatter` | LOW | Dispatches body to serializer helper. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `format_body_serialize_error` | L351-L357 | `formatter` | LOW | Formats body serialization error text. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `script_turn_to_ingest` | L359-L374 | `mapper` | LOW | Maps `ScriptTurn` fields into `SessionTurnIngest`. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `script_turn_ingest_from_parts` | L376-L383 | `mapper` | LOW | Maps parts into parsed ingest wrapper. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `script_turn_body_error` | L385-L390 | `accessor` | LOW | Retrieves optional body-validation error. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `persist_scanned_turns` | L392-L402 | `orchestration` | LOW | Sequences batch ingest and imported-chain persistence/error recording. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `persist_imported_chains` | L404-L422 | `orchestration` | LOW | Sets report count and delegates per-turn chain minting. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `scan_all` | L426-L434 | `orchestration` | LOW | Iterates configured providers, scans, records, and sorts results. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | closure `|a, b| a.0.cmp(&b.0)` | L432 | `accessor` | LOW | Exposes tuple keys for sort comparison. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `resolve_state_dir` | L436-L442 | `accessor` | LOW | Retrieves configured state dir or default provider path. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `default_app_data_dir` | L444-L447 | `accessor` | LOW | Retrieves app data dir with fallback. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | closure `|_| PathBuf::from(...).join(...)` | L446 | `mapper` | LOW | Maps fallback error case to fallback path. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `run_turn_script` | L449-L455 | `orchestration` | LOW | Delegates to session-script runner with turn-script label. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `locate_transcript` | L457-L476 | `orchestration` | LOW | Sequences source lookup, locator lookup, script run, line validation, and path conversion helpers. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `session_source_entry` | L478-L483 | `accessor` | LOW | Retrieves provider session source entry. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `transcript_locator_script` | L485-L487 | `accessor` | LOW | Retrieves optional transcript locator script. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `single_transcript_stdout_line` | L489-L495 | `validator` | LOW | Accepts exactly one non-empty stdout line or returns error. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `transcript_path_from_line` | L497-L499 | `mapper` | LOW | Maps stdout line to `PathBuf`. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `run_session_script` | L501-L514 | `orchestration` | LOW | Delegates to timeout-aware script runner. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `run_session_script_with_timeout` | L516-L537 | `orchestration` | LOW | Sequences command creation, spawn, stream draining, wait, validation helper, and stdout return. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `validate_session_script_success` | L539-L553 | `validator` | LOW | Accepts success status or returns nonzero error. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `session_script_command` | L555-L571 | `mapper` | LOW | Maps script/state/session inputs into a configured `Command`. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `configure_session_script_process_group` unix | L573-L578 | `mapper` | LOW | Maps command to process-group configured state. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `configure_session_script_process_group` non-unix | L580-L581 | `mapper` | LOW | No-op mapping for unsupported platforms. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `spawn_session_script_child` | L583-L586 | `orchestration` | LOW | Spawns child and delegates spawn-error formatting. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | closure `|error| format_session_script_spawn_error(...)` | L585 | `formatter` | LOW | Formats spawn error through helper. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `format_session_script_spawn_error` | L588-L590 | `formatter` | LOW | Formats session script spawn error. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `take_child_stdout` | L592-L594 | `accessor` | LOW | Retrieves child stdout pipe. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `take_child_stderr` | L596-L598 | `accessor` | LOW | Retrieves child stderr pipe. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `spawn_stdout_reader` | L600-L602 | `orchestration` | LOW | Dispatches stdout pipe to generic reader spawn helper. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `spawn_stderr_reader` | L604-L606 | `orchestration` | LOW | Dispatches stderr pipe to generic reader spawn helper. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `spawn_script_reader` | L608-L613 | `orchestration` | LOW | Starts reader thread and dispatches stream drain. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | closure `move || drain_script_reader_to_string(...)` | L612 | `orchestration` | LOW | Dispatches only to named drain helper. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `drain_script_reader_to_string` | L615-L622 | `accessor` | LOW | Reads script stream to a string. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `wait_for_session_script` | L624-L640 | `orchestration` | LOW | Poll loop delegates poll, pending wait, and error formatting helpers. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `poll_session_script` | L642-L644 | `accessor` | LOW | Retrieves child wait state. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `wait_for_pending_session_script` | L646-L658 | `orchestration` | LOW | Dispatches timeout predicate to failure helper or sleep helper. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `pending_session_script_timed_out` | L660-L665 | `predicate` | LOW | Answers whether elapsed time exceeded timeout. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `fail_timed_out_pending_session_script` | L667-L677 | `orchestration` | LOW | Sequences timeout kill and timeout message helper. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `kill_timed_out_pending_session_script` | L679-L681 | `orchestration` | LOW | Delegates timeout kill to process-group helper. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `kill_session_script_process_group` unix | L683-L692 | `orchestration` | LOW | Sequences process-group kill, child kill, and wait. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `kill_session_script_process_group` non-unix | L694-L698 | `orchestration` | LOW | Sequences child kill and wait. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `sleep_before_next_session_script_poll` | L700-L702 | `orchestration` | LOW | Sleeps between polls. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `format_pending_session_script_timeout` | L704-L706 | `formatter` | LOW | Formats timeout message. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `format_session_script_wait_error` | L708-L713 | `formatter` | LOW | Formats wait error text. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `join_script_reader` | L715-L717 | `accessor` | LOW | Retrieves joined reader output. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `format_session_script_nonzero` | L719-L730 | `formatter` | LOW | Formats nonzero exit message. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | `capitalize_script_kind` | L732-L738 | `formatter` | LOW | Formats script kind with leading uppercase. |
+| `crates/oulipoly-runtime/src/sessions/mod.rs` | test helpers and tests | L747-L1137 | `validator` / `mapper` / `orchestration` / `formatter` | LOW | Individual test helpers and test bodies are single-purpose: fixture/config builders map or orchestrate fixtures; test bodies validate expected scan/locator behavior. No multi-classifier test symbol observed in this file. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `Fixture::new` | L78-L97 | `orchestration` | LOW | Creates temp fixture resources and returns fixture. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `Fixture::set_mode` | L99-L101 | `mapper` | LOW | Updates fixture mode file. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `Fixture::registry` | L103-L111 | `mapper` | LOW | Maps fixture paths to provider registry. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `Fixture::hostile_registry` | L113-L121 | `mapper` | LOW | Maps fixture paths to hostile registry. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `Fixture::timeout_registry` | L123-L133 | `mapper` | LOW | Maps fixture provider path and timeout options to registry. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `Fixture::unrelated_registry` | L135-L143 | `mapper` | LOW | Maps unrelated model fixture to registry. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `Fixture::records` | L145-L147 | `accessor` | LOW | Retrieves provider record values. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `Fixture::request_records_for` | L149-L154 | `filter` | LOW | Filters fixture records by subcommand. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | closure `|record| record["subcommand"] == subcommand` | L152 | `predicate` | LOW | Answers whether a record matches the subcommand. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `Fixture::snapshot` | L156-L158 | `accessor` | LOW | Retrieves SQLite snapshot. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `Fixture::state_path` | L160-L162 | `accessor` | LOW | Retrieves fixture state path. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `Fixture::conn` | L164-L166 | `accessor` | LOW | Opens fixture connection. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `Fixture::seed_finalized_invocation` | L168-L183 | `orchestration` | LOW | Sequences invocation start/finalize fixture setup. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `Fixture::seed_chain` | L185-L200 | `orchestration` | LOW | Sequences fixture SQL inserts. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `provider_record_text` | L203-L205 | `accessor` | LOW | Reads provider record text. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `provider_record_values` | L207-L209 | `parser` | LOW | Parses record text lines through JSON parser helper. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `provider_record_value` | L211-L213 | `parser` | LOW | Parses one JSON record line. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `external_model` | L215-L229 | `mapper` | LOW | Maps model/provider inputs into `ModelConfig`. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `provider_identity` | L231-L238 | `mapper` | LOW | Maps constants into session provider identity. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `locate_request` | L240-L252 | `mapper` | LOW | Maps registry/session/mode to locate request. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `read_request` | L254-L264 | `mapper` | LOW | Maps registry/session to read-turns request. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `capture_request` | L266-L276 | `mapper` | LOW | Maps registry/invocation UUID to capture request. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | test functions | L278-L824 | `validator` | LOW | Test bodies validate session dispatch, transport, schema, timeout, and host-mutation behavior. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | closures in read-turn assertions | L446-L448, L579, L805 | `accessor` / `mapper` | LOW | Inline closures expose nested values or map records/turns for assertions. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `assert_error_token` | L826-L832 | `validator` | LOW | Validates expected stable token in error text. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `NoRefDispatchProofFixture::new` | L840-L853 | `orchestration` | LOW | Creates fixture, seeds invocation/chain, stores row id. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `NoRefDispatchProofFixture::request_without_registry` | L855-L865 | `mapper` | LOW | Maps fixture state/constants into no-ref request. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `NoRefDispatchProofFixture::request_with_registry` | L867-L875 | `mapper` | LOW | Maps registry plus base request into registry-backed request. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `NoRefDispatchProofFixture::snapshot` | L877-L879 | `accessor` | LOW | Retrieves fixture snapshot. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `assert_no_ref_dispatch_fixture_row_id` | L882-L887 | `validator` | LOW | Validates fresh fixture row id. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `hostile_marker` | L889-L891 | `mapper` | LOW | Maps route to hostile marker path. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `DataDirOverride::remove` | L898-L906 | `orchestration` | LOW | Captures and removes env override for fixture setup. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `DataDirOverride::drop` | L910-L919 | `orchestration` | LOW | Restores prior env override. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `hostile_markers_json` | L921-L931 | `formatter` | LOW | Formats hostile marker paths as JSON. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | closure `|route| dir.join(format!(...))` | L922 | `formatter` | LOW | Formats one hostile marker path. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `assert_request_shape` | L933-L948 | `validator` | LOW | Validates request record shape. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `sqlite_snapshot` | L950-L957 | `mapper` | LOW | Maps connection to snapshot struct. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `invocation_snapshot_rows` | L959-L967 | `accessor` | LOW | Retrieves invocation snapshot rows. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `invocation_snapshot_row` | L969-L977 | `mapper` | LOW | Maps SQLite row into tuple. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `session_turn_snapshot_rows` | L979-L987 | `accessor` | LOW | Retrieves session turn snapshot rows. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `session_turn_snapshot_row` | L989-L1000 | `mapper` | LOW | Maps SQLite row into tuple. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `session_chain_snapshot_rows` | L1002-L1008 | `accessor` | LOW | Retrieves chain snapshot rows. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `session_chain_snapshot_row` | L1010-L1012 | `mapper` | LOW | Maps SQLite row into tuple. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `session_chain_segment_snapshot_rows` | L1014-L1021 | `accessor` | LOW | Retrieves chain segment snapshot rows. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `session_chain_segment_snapshot_row` | L1023-L1027 | `mapper` | LOW | Maps SQLite row into tuple. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `query_rows` | L1029-L1038 | `orchestration` | LOW | Sequences query preparation, row mapping, and collection through caller mapper. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | closures in `query_rows` | L1034, L1036 | `mapper` / `validator` | LOW | One applies caller mapper; one unwraps expected row result. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `parse_ts` | L1040-L1044 | `parser` | LOW | Parses RFC3339 timestamp to UTC. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `write_fake_provider` | L1046-L1062 | `orchestration` | LOW | Writes fake provider script and chmods it. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `fake_provider_body` | L1064-L1338 | `formatter` | LOW | Formats fake provider Python source text from fixture values. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `json_string` | L1340-L1342 | `formatter` | LOW | Formats path as JSON string. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `repo_script_path` | L1344-L1349 | `accessor` | LOW | Retrieves repo script path. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `opencode_sessions_config` | L1351-L1372 | `mapper` | LOW | Maps script/bin/root/state inputs into `SessionsConfig`. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `write_fake_opencode` | L1374-L1417 | `orchestration` | LOW | Writes and chmods fake OpenCode executable. |
+| `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `shell_single_quote_path` | L1419-L1421 | `formatter` | LOW | Formats shell-quoted path. |
+| `scripts/opencode-turns` | `Options.__init__` | L66-L71 | `orchestration` | LOW | Assembles option fields by dispatching to env parser/validator helpers. |
+| `scripts/opencode-turns` | `Deadline.__init__` | L74-L77 | `mapper` | LOW | Maps duration into deadline state. |
+| `scripts/opencode-turns` | `Deadline.remaining` | L79-L80 | `accessor` | LOW | Retrieves remaining deadline budget. |
+| `scripts/opencode-turns` | `Deadline.call_timeout` | L82-L86 | `filter` | LOW | Bounds per-call timeout by remaining deadline. |
+| `scripts/opencode-turns` | `env_float` | L89-L90 | `orchestration` | LOW | Delegates env float parsing and positive/default validation to named helpers. |
+| `scripts/opencode-turns` | `parsed_env_float` | L93-L100 | `parser` | LOW | Parses an environment value into a float candidate or absence. |
+| `scripts/opencode-turns` | `positive_float_or_default` | L103-L106 | `validator` | LOW | Accepts positive float candidates or returns the default. |
+| `scripts/opencode-turns` | `env_int` | L109-L110 | `orchestration` | LOW | Delegates env int parsing and positive/default validation to named helpers. |
+| `scripts/opencode-turns` | `parsed_env_int` | L113-L120 | `parser` | LOW | Parses an environment value into an integer candidate or absence. |
+| `scripts/opencode-turns` | `positive_int_or_default` | L123-L126 | `validator` | LOW | Accepts positive integer candidates or returns the default. |
+| `scripts/opencode-turns` | `text_chunk` | L129-L130 | `mapper` | LOW | Maps text into canonical chunk dict. |
+| `scripts/opencode-turns` | `canonical_chunk_type` | L133-L138 | `mapper` | LOW | Maps native chunk type names to canonical type names. |
+| `scripts/opencode-turns` | `extract_content_chunks` | L141-L148 | `orchestration` | LOW | Dispatches content extraction by value shape to helpers. |
+| `scripts/opencode-turns` | `content_chunks_from_text` | L151-L152 | `mapper` | LOW | Maps text to chunk list. |
+| `scripts/opencode-turns` | `content_chunks_from_items` | L155-L159 | `orchestration` | LOW | Iterates items and delegates extraction. |
+| `scripts/opencode-turns` | `content_chunks_from_obj` | L162-L166 | `orchestration` | LOW | Dispatches object extraction to direct/nested helpers. |
+| `scripts/opencode-turns` | `direct_content_chunks_from_obj` | L169-L173 | `orchestration` | LOW | Selects direct content candidate parsing and canonical chunk mapping helpers. |
+| `scripts/opencode-turns` | `direct_content_candidate_from_obj` | L176-L182 | `parser` | LOW | Extracts accepted direct text/type candidates from content dictionaries. |
+| `scripts/opencode-turns` | `direct_content_chunks_from_candidate` | L185-L186 | `mapper` | LOW | Maps accepted content candidate into canonical chunk dictionaries. |
+| `scripts/opencode-turns` | `nested_content_chunks_from_obj` | L189-L194 | `orchestration` | LOW | Iterates known nested keys and delegates recursive extraction. |
+| `scripts/opencode-turns` | `unique_values` | L197-L204 | `filter` | LOW | Deduplicates values while preserving order. |
+| `scripts/opencode-turns` | `session_ids_from_value` | L207-L220 | `parser` | LOW | Recursively extracts session IDs from external values. |
+| `scripts/opencode-turns` | `parse_session_list_stdout` | L223-L232 | `orchestration` | LOW | Coordinates parse, candidate extraction, fallback cap, and candidate selection helpers. |
+| `scripts/opencode-turns` | `parse_session_list_json` | L235-L239 | `parser` | LOW | Parses OpenCode session-list stdout JSON or sentinel. |
+| `scripts/opencode-turns` | `capped_session_ids_from_value` | L242-L243 | `filter` | LOW | Applies max-session cap after delegated ID extraction. |
+| `scripts/opencode-turns` | `session_ids_from_candidates` | L246-L249 | `orchestration` | LOW | Dispatches timestamp-window or max-cap selection helpers. |
+| `scripts/opencode-turns` | `candidates_have_timestamps` | L252-L253 | `predicate` | LOW | Answers whether candidates include timestamps. |
+| `scripts/opencode-turns` | `recent_session_ids` | L256-L259 | `orchestration` | LOW | Composes recent-candidate filter and ID projection helpers. |
+| `scripts/opencode-turns` | `recent_session_candidates` | L262-L268 | `filter` | LOW | Filters timestamped candidates to the recent quota-balancing window. |
+| `scripts/opencode-turns` | `capped_candidate_session_ids` | L271-L274 | `orchestration` | LOW | Composes max-cap filter and ID projection helpers. |
+| `scripts/opencode-turns` | `capped_session_candidates` | L277-L278 | `filter` | LOW | Applies the max-session cap while preserving candidate shape. |
+| `scripts/opencode-turns` | `session_ids_from_candidates_rows` | L281-L282 | `mapper` | LOW | Projects candidate rows to session ID strings. |
+| `scripts/opencode-turns` | `unique_session_candidates` | L285-L294 | `filter` | LOW | Deduplicates candidate dictionaries while preserving candidate shape. |
+| `scripts/opencode-turns` | `session_candidates_from_value` | L297-L302 | `orchestration` | LOW | Dispatches candidate extraction by value shape. |
+| `scripts/opencode-turns` | `session_candidates_from_items` | L305-L309 | `orchestration` | LOW | Iterates items and delegates recursive candidate extraction. |
+| `scripts/opencode-turns` | `session_candidates_from_obj` | L312-L315 | `orchestration` | LOW | Routes candidate-shaped object to mapper or recurses into values. |
+| `scripts/opencode-turns` | `has_session_candidate_shape` | L318-L319 | `predicate` | LOW | Answers whether object has recognizable session ID. |
+| `scripts/opencode-turns` | `session_candidate_from_obj` | L322-L326 | `mapper` | LOW | Maps object to candidate row using parser helpers. |
+| `scripts/opencode-turns` | `session_list_session_id` | L329-L337 | `parser` | LOW | Extracts session ID from known fields using regex. |
+| `scripts/opencode-turns` | `session_list_timestamp` | L340-L345 | `parser` | LOW | Extracts timestamp from known fields through timestamp parser. |
+| `scripts/opencode-turns` | `timestamp_datetime` | L348-L363 | `parser` | LOW | Parses numeric/string timestamp input into UTC datetime. |
+| `scripts/opencode-turns` | `numeric_timestamp_datetime` | L366-L371 | `parser` | LOW | Parses numeric seconds/milliseconds into UTC datetime. |
+| `scripts/opencode-turns` | `discover_session_ids` | L374-L380 | `orchestration` | LOW | Runs public CLI and delegates timeout/failure/parse handling. |
+| `scripts/opencode-turns` | `requested_session_ids` | L383-L388 | `orchestration` | LOW | Selects explicit IDs or discovery helper. |
+| `scripts/opencode-turns` | `numeric_timestamp` | L391-L395 | `orchestration` | LOW | Selects numeric timestamp acceptance and formatting helpers. |
+| `scripts/opencode-turns` | `accepted_numeric_timestamp` | L398-L401 | `validator` | LOW | Accepts numeric timestamp candidates. |
+| `scripts/opencode-turns` | `formatted_numeric_timestamp` | L404-L406 | `formatter` | LOW | Formats accepted numeric timestamps as UTC text. |
+| `scripts/opencode-turns` | `timestamp_from_obj` | L409-L417 | `parser` | LOW | Extracts turn timestamp from known fields. |
+| `scripts/opencode-turns` | `session_id_from_obj` | L420-L425 | `parser` | LOW | Extracts session ID from known fields. |
+| `scripts/opencode-turns` | `role_from_obj` | L428-L435 | `parser` | LOW | Extracts accepted role from top-level or nested message object. |
+| `scripts/opencode-turns` | `turn_id_from_obj` | L438-L439 | `orchestration` | LOW | Selects parsed ID or fallback helper. |
+| `scripts/opencode-turns` | `turn_id_field_from_obj` | L442-L449 | `parser` | LOW | Extracts turn ID from top-level or nested mapping. |
+| `scripts/opencode-turns` | `turn_id_field_from_mapping` | L452-L457 | `parser` | LOW | Extracts turn ID from known fields. |
+| `scripts/opencode-turns` | `fallback_turn_id` | L460-L461 | `formatter` | LOW | Formats deterministic fallback turn ID. |
+| `scripts/opencode-turns` | `opencode_command` | L464-L466 | `parser` | LOW | Parses configured command string into argv tokens. |
+| `scripts/opencode-turns` | `run_opencode` | L469-L487 | `orchestration` | LOW | Sequences deadline check, process spawn, communicate, timeout kill, failure, and result helpers. |
+| `scripts/opencode-turns` | `opencode_deadline_expired` | L490-L491 | `predicate` | LOW | Answers whether timeout budget is exhausted. |
+| `scripts/opencode-turns` | `spawn_opencode_process` | L494-L502 | `orchestration` | LOW | Spawns OpenCode process with configured stdio/session settings. |
+| `scripts/opencode-turns` | `communicate_opencode_process` | L505-L512 | `orchestration` | LOW | Waits for subprocess and reports timeout status. |
+| `scripts/opencode-turns` | `opencode_process_failed` | L515-L516 | `predicate` | LOW | Answers whether subprocess returned nonzero. |
+| `scripts/opencode-turns` | `degraded_opencode_result` | L519-L520 | `mapper` | LOW | Maps degraded timeout path to result tuple. |
+| `scripts/opencode-turns` | `failed_opencode_result` | L523-L524 | `mapper` | LOW | Maps failed CLI path to result tuple. |
+| `scripts/opencode-turns` | `successful_opencode_result` | L527-L528 | `mapper` | LOW | Maps stdout to success tuple. |
+| `scripts/opencode-turns` | `kill_process_group` | L531-L546 | `orchestration` | LOW | Sequences process-group kill/fallback kill/drain. |
+| `scripts/opencode-turns` | `parse_export_stdout` | L549-L553 | `parser` | LOW | Parses export stdout JSON. |
+| `scripts/opencode-turns` | `export_session` | L556-L564 | `orchestration` | LOW | Runs export command and delegates timeout/failure/parse handling. |
+| `scripts/opencode-turns` | `exported_message_items` | L567-L571 | `orchestration` | LOW | Coordinates message-item extraction and dictionary filtering helpers. |
+| `scripts/opencode-turns` | `exported_message_item_values` | L574-L585 | `parser` | LOW | Extracts raw item list from supported export shapes. |
+| `scripts/opencode-turns` | `dict_items` | L588-L589 | `filter` | LOW | Keeps only dictionary items. |
+| `scripts/opencode-turns` | `record_from_message` | L592-L599 | `orchestration` | LOW | Coordinates field extraction, validation, ID selection, mapping, and optional body helper dispatch. |
+| `scripts/opencode-turns` | `message_record_fields` | L602-L607 | `parser` | LOW | Extracts required normalized record fields. |
+| `scripts/opencode-turns` | `has_required_message_record_fields` | L610-L611 | `validator` | LOW | Validates required record fields are present. |
+| `scripts/opencode-turns` | `message_record_from_fields` | L614-L620 | `mapper` | LOW | Maps validated fields plus turn ID to normalized record. |
+| `scripts/opencode-turns` | `record_with_optional_body` | L623-L626 | `mapper` | LOW | Maps base record and optional body into emitted record. |
+| `scripts/opencode-turns` | `message_body_chunks` | L629-L634 | `parser` | LOW | Extracts optional body chunks from supported content fields. |
+| `scripts/opencode-turns` | `records_from_exported_session` | L637-L643 | `mapper` | LOW | Maps exported message items into normalized records. |
+| `scripts/opencode-turns` | `collect_records` | L646-L659 | `orchestration` | LOW | Iterates sessions, exports, stops on timeout, and accumulates record helpers. |
+| `scripts/opencode-turns` | `emit_record` | L662-L664 | `formatter` | LOW | Emits compact JSONL record. |
+| `scripts/opencode-turns` | `assistant_record_count` | L667-L668 | `filter` | LOW | Counts assistant-role records. |
+| `scripts/opencode-turns` | `emit_degraded_marker` | L671-L672 | `formatter` | LOW | Emits degraded marker JSONL. |
+| `scripts/opencode-turns` | `has_base_dir_arg` | L675-L676 | `validator` | LOW | Validates argv length for required base-dir slot. |
+| `scripts/opencode-turns` | `usage_message` | L679-L680 | `formatter` | LOW | Formats usage text. |
+| `scripts/opencode-turns` | `emit_usage` | L683-L684 | `formatter` | LOW | Emits usage text. |
+| `scripts/opencode-turns` | `session_args_from_argv` | L687-L688 | `accessor` | LOW | Exposes explicit session ID arguments. |
+| `scripts/opencode-turns` | `main` | L691-L707 | `orchestration` | LOW | Coordinates argv handling, options/deadline, collection, record emission, and degraded marker emission. |
+| `scripts/tests/opencode-turns.test.sh` | `fail` | L10-L13 | `formatter` | LOW | Emits supplied failure text and exits. |
+| `scripts/tests/opencode-turns.test.sh` | `values_equal` | L15-L17 | `predicate` | LOW | Answers whether two assertion values are equal. |
+| `scripts/tests/opencode-turns.test.sh` | `assert_eq_failure_message` | L19-L25 | `formatter` | LOW | Formats equality assertion diagnostics. |
+| `scripts/tests/opencode-turns.test.sh` | `assert_eq` | L27-L35 | `validator` | LOW | Enforces equality by delegating comparison and failure-message construction. |
+| `scripts/tests/opencode-turns.test.sh` | `status_zero` | L37-L39 | `predicate` | LOW | Answers whether captured exit status is zero. |
+| `scripts/tests/opencode-turns.test.sh` | `status_zero_failure_message` | L41-L46 | `formatter` | LOW | Formats exit-status diagnostics with stderr evidence. |
+| `scripts/tests/opencode-turns.test.sh` | `assert_status_zero` | L48-L55 | `validator` | LOW | Enforces successful adapter exit status. |
+| `scripts/tests/opencode-turns.test.sh` | `stdout_contains_pattern` | L57-L59 | `predicate` | LOW | Answers whether stdout contains a fixed-string pattern. |
+| `scripts/tests/opencode-turns.test.sh` | `stdout_contains_failure_message` | L61-L66 | `formatter` | LOW | Formats missing-stdout-pattern diagnostics. |
+| `scripts/tests/opencode-turns.test.sh` | `assert_stdout_contains` | L68-L75 | `validator` | LOW | Enforces fixed-string presence in captured stdout. |
+| `scripts/tests/opencode-turns.test.sh` | `stdout_excludes_pattern` | L77-L79 | `predicate` | LOW | Answers whether stdout excludes a fixed-string pattern. |
+| `scripts/tests/opencode-turns.test.sh` | `stdout_unexpected_failure_message` | L81-L86 | `formatter` | LOW | Formats unexpected-stdout-pattern diagnostics. |
+| `scripts/tests/opencode-turns.test.sh` | `assert_stdout_not_contains` | L88-L95 | `validator` | LOW | Enforces fixed-string absence from captured stdout. |
+| `scripts/tests/opencode-turns.test.sh` | `file_size_bytes` | L97-L105 | `accessor` | LOW | Retrieves file size or zero when absent. |
+| `scripts/tests/opencode-turns.test.sh` | `marker_size_sample` | L107-L113 | `accessor` | LOW | Samples descendant-marker file size before and after a wait. |
+| `scripts/tests/opencode-turns.test.sh` | `marker_size_stable` | L115-L117 | `predicate` | LOW | Answers whether marker size samples are equal. |
+| `scripts/tests/opencode-turns.test.sh` | `marker_growth_failure_message` | L119-L125 | `formatter` | LOW | Formats descendant-marker growth diagnostics. |
+| `scripts/tests/opencode-turns.test.sh` | `assert_marker_stopped_growing` | L127-L139 | `validator` | LOW | Enforces descendant-marker stability through named sampling, predicate, and formatter helpers. |
+| `scripts/tests/opencode-turns.test.sh` | `process_state` | L141-L149 | `accessor` | LOW | Retrieves descendant process state or absent sentinel. |
+| `scripts/tests/opencode-turns.test.sh` | `process_state_allowed` | L151-L155 | `predicate` | LOW | Answers whether process state is allowed after timeout cleanup. |
+| `scripts/tests/opencode-turns.test.sh` | `process_running_failure_message` | L157-L163 | `formatter` | LOW | Formats surviving-descendant diagnostics. |
+| `scripts/tests/opencode-turns.test.sh` | `assert_process_not_running` | L165-L175 | `validator` | LOW | Enforces descendant process cleanup through named accessor, predicate, and formatter helpers. |
+| `scripts/tests/opencode-turns.test.sh` | `write_executable_mock` | L177-L183 | `orchestration` | LOW | Materializes a mock executable by running a body emitter and chmod. |
+| `scripts/tests/opencode-turns.test.sh` | `emit_timestampless_cap_mock_body` | L185-L213 | `formatter` | LOW | Emits the timestampless-cap mock OpenCode script body. |
+| `scripts/tests/opencode-turns.test.sh` | `write_timestampless_cap_mock` | L215-L219 | `orchestration` | LOW | Materializes the timestampless-cap mock through named helper dispatch. |
+| `scripts/tests/opencode-turns.test.sh` | `emit_window_filter_mock_body` | L221-L253 | `formatter` | LOW | Emits the timestamp-window mock OpenCode script body. |
+| `scripts/tests/opencode-turns.test.sh` | `write_window_filter_mock` | L255-L259 | `orchestration` | LOW | Materializes the timestamp-window mock through named helper dispatch. |
+| `scripts/tests/opencode-turns.test.sh` | `emit_timeout_mock_body` | L261-L289 | `formatter` | LOW | Emits the timeout mock OpenCode script body. |
+| `scripts/tests/opencode-turns.test.sh` | `write_timeout_mock` | L291-L295 | `orchestration` | LOW | Materializes the timeout mock through named helper dispatch. |
+| `scripts/tests/opencode-turns.test.sh` | `emit_descendant_timeout_mock_body` | L297-L325 | `formatter` | LOW | Emits the descendant-timeout mock OpenCode script body. |
+| `scripts/tests/opencode-turns.test.sh` | `write_descendant_timeout_mock` | L327-L331 | `orchestration` | LOW | Materializes the descendant-timeout mock through named helper dispatch. |
+| `scripts/tests/opencode-turns.test.sh` | `run_opencode_turns` | L333-L352 | `orchestration` | LOW | Coordinates temp stdout/stderr/export-log setup and adapter invocation. |
+| `scripts/tests/opencode-turns.test.sh` | `test_timestampless_session_list_applies_max_sessions_cap` | L354-L371 | `validator` | LOW | Validates capped timestampless session behavior via assertion helpers. |
+| `scripts/tests/opencode-turns.test.sh` | `test_exports_only_recent_window_sessions` | L373-L390 | `validator` | LOW | Validates recent-window export selection via assertion helpers. |
+| `scripts/tests/opencode-turns.test.sh` | `test_timeout_emits_degraded_best_effort_and_exits_zero` | L392-L413 | `validator` | LOW | Validates degraded timeout behavior and elapsed bound. |
+| `scripts/tests/opencode-turns.test.sh` | `test_timeout_kills_opencode_process_group_descendant` | L415-L438 | `validator` | LOW | Validates degraded marker, descendant marker, and descendant process cleanup. |
 
 ## Multi-Classifier Findings
 
 | ID | Path | Function / symbol | Categories mixed | Evidence | Suggested split | Blocking or residual | Finding origin | Domain relation |
 |---|---|---|---|---|---|---|---|---|
-| FC-001 | `crates/oulipoly-runtime/src/sessions/mod.rs` | `non_empty_script_lines` | `mapper`, `filter` | `failure_mode: multi-classifier function`. Lines 208-212 call `.lines()`, `.map(str::trim)`, `.filter(|line| !line.is_empty())`, and `.collect()`: the body both changes each line to a trimmed representation and excludes empty lines. | Split line normalization from empty-line selection. Keep one helper that maps stdout to trimmed line values, and a separate helper that filters non-empty values. Convergence: current finding FC-001 is closed because the current mixed trim-plus-filter body disappears; introduced helpers are each audited under the same overlay and must remain single-class. | blocking | pre_existing_in_touched_file | same_domain |
-| FC-002 | `crates/oulipoly-runtime/src/sessions/mod.rs` | `spawn_script_reader` | `orchestration`, `accessor` | `failure_mode: multi-classifier function`. Lines 608-612 spawn a thread and inline stream draining inside the closure (`read_to_string` into `buf`, then return `buf`), so the function both orchestrates thread execution and performs stream-to-string data retrieval. | Split stream draining into a named accessor/reader helper and leave `spawn_script_reader` as the thread-spawn dispatcher. Convergence: current finding FC-002 is closed because the orchestration body no longer performs inline read/drain work; introduced helper is audited as the single accessor under overlay. | blocking | pre_existing_in_touched_file | same_domain |
-| FC-003 | `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `NoRefDispatchProofFixture::new` | `mapper`, `validator` | `failure_mode: multi-classifier function`. Lines 837-849 construct and seed a `NoRefDispatchProofFixture`, while lines 840-843 assert `invocation_row_id == 1`; the body combines fixture construction/mapping with invariant validation. | Split proof-fixture construction/seeding from the row-id assertion. Keep constructor-like work in a mapper/setup helper and move the assertion to the calling test or a validator helper. Convergence: current finding FC-003 is closed because the fixture constructor no longer validates an invariant inline; any assertion helper is audited separately as validator. | blocking | pre_existing_in_touched_file | same_domain |
-| FC-004 | `scripts/opencode-turns` | `record_from_message` | `orchestration`, `mapper` | `failure_mode: multi-classifier function`. Lines 538-543 coordinate field parsing, required-field validation, record mapping, and turn-ID selection through helpers; lines 544-546 then perform inline optional-body mapping by mutating `record["body"] = body`. | Split optional body attachment into a named mapper helper, leaving `record_from_message` as orchestration over field extraction, validation, base-record mapping, body extraction, and attachment helper. Convergence: current finding FC-004 is closed because the orchestrator stops mutating the record shape inline; introduced body-attachment helper is audited separately as mapper. | blocking | changed_function | same_domain |
-| FC-005 | `scripts/opencode-turns` | `emit_degraded_marker` | `filter`, `formatter` | `failure_mode: multi-classifier function`. Line 610 computes `count = sum(1 for record in records if record.get("role") == "assistant")`, selecting/counting assistant records; line 611 formats/emits the degraded marker JSONL. | Split assistant-count selection into a filter/accessor-style helper and keep `emit_degraded_marker` focused on marker formatting/emission from a supplied count. Convergence: current finding FC-005 is closed because the formatter no longer performs inline assistant-role filtering; introduced count helper is audited separately as filter. | blocking | changed_function | same_domain |
-| FC-006 | `scripts/opencode-turns` | `main` | `validator`, `formatter`, `orchestration` | `failure_mode: multi-classifier function`. Lines 615-617 validate CLI argv shape and print usage text; lines 619-628 construct options/deadline, collect records, emit records, and conditionally emit degraded marker. The body mixes entrypoint validation/formatting with runtime orchestration. | Split argv validation/usage rendering into a validator/formatter boundary that returns an accepted argument set or usage failure, leaving `main` to orchestrate accepted options, collection, and emission. Convergence: current finding FC-006 is closed because `main` no longer performs inline argv validation or usage formatting; introduced validation/formatting helpers are each audited under the same overlay. | blocking | changed_function | same_domain |
+| none | n/a | n/a | n/a | No function in the touched-file inventory inferred two or more A1 categories after applying the pure-orchestrator helper-dispatch rule. | n/a | n/a | n/a | n/a |
 
 ## Residual Ambiguity / Stop-Condition Notes
 
-- Embedded shell/Python/YAML/text payloads inside heredocs or Rust string literals were excluded from the A5 inventory because they are fixture/document payloads in the touched source file rather than language-level function symbols of the touched file itself. The source functions that produce those payloads, such as `fake_provider_body`, `write_window_filter_mock`, and `write_timeout_mock`, were included.
-- Inline method-argument closures were inspected as body evidence for their containing function. They did not change any LOW/HIGH conclusion beyond the explicit closure-backed finding for `spawn_script_reader`, where the closure body performs non-trivial stream draining inline.
-- No `NEEDS_INPUT` condition was found. Required Phase 6 `contract_path` and `proposal_path` were readable before scoring.
+- Diff evidence identified five touched files: `crates/oulipoly-runtime/src/quota/process.rs`, `crates/oulipoly-runtime/src/sessions/mod.rs`, `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs`, `scripts/opencode-turns`, and `scripts/tests/opencode-turns.test.sh`.
+- Markdown procedure prose, contract tables, YAML carriers, and heredoc/script literal contents were not admitted as separate A5 function inventory items. Shell functions and named Python/Rust functions in touched files were admitted. Trivial Rust closures found in touched files were included where they are executable closure bodies.
+- `crates/oulipoly-runtime/src/sessions/mod.rs` contains many test functions and helpers; their bodies were reviewed as executable symbols. No multi-classifier finding was emitted there because the test bodies primarily validate behavior, while fixture builders and formatters are individually single-classified.
+- No `NEEDS_INPUT` condition was encountered. The Phase 6 contract and proposal were readable before scoring.
+- The previous split-sensitive shapes in `scripts/opencode-turns` and `scripts/tests/opencode-turns.test.sh` now delegate parser/validator/filter/mapper/formatter work to named helpers, so their remaining caller bodies classify as orchestration only under the pure-orchestrator recognition rule.
 
-Verdict: HIGH
+Verdict: LOW
 
-VERDICT: HIGH
+VERDICT: LOW
