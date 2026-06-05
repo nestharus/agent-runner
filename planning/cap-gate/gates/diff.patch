@@ -1,0 +1,1693 @@
+diff --git a/crates/oulipoly-runtime/src/balancer/mod.rs b/crates/oulipoly-runtime/src/balancer/mod.rs
+index ec6f248..9c732f8 100755
+--- a/crates/oulipoly-runtime/src/balancer/mod.rs
++++ b/crates/oulipoly-runtime/src/balancer/mod.rs
+@@ -1135,10 +1135,13 @@ mod tests {
+     #[test]
+     fn select_provider_clears_stale_next_available_at_when_refresh_shows_healthy() {
+         let _lock_dir = tempfile::tempdir().unwrap();
+-        let _env_guard = crate::quota::marker_verification::test_support::EnvGuard::set(
+-            "OULIPOLY_DATA_HOME",
+-            _lock_dir.path(),
+-        );
++        let _env_guard = crate::quota::marker_verification::test_support::EnvGuard::set_many(vec![
++            (
++                "OULIPOLY_DATA_HOME",
++                Some(_lock_dir.path().as_os_str().to_os_string()),
++            ),
++            ("OULIPOLY_DATA_DIR", None),
++        ]);
+         let db = StateDb::open(Path::new(":memory:")).unwrap();
+         let model = two_provider_model();
+         // Provider "a" has a stuck UpstreamApiDown marker far in the future;
+@@ -1184,10 +1187,13 @@ mod tests {
+     #[test]
+     fn select_provider_keeps_marker_when_refresh_shows_exhausted_window() {
+         let _lock_dir = tempfile::tempdir().unwrap();
+-        let _env_guard = crate::quota::marker_verification::test_support::EnvGuard::set(
+-            "OULIPOLY_DATA_HOME",
+-            _lock_dir.path(),
+-        );
++        let _env_guard = crate::quota::marker_verification::test_support::EnvGuard::set_many(vec![
++            (
++                "OULIPOLY_DATA_HOME",
++                Some(_lock_dir.path().as_os_str().to_os_string()),
++            ),
++            ("OULIPOLY_DATA_DIR", None),
++        ]);
+         let db = StateDb::open(Path::new(":memory:")).unwrap();
+         let model = two_provider_model();
+         let marker_at = Utc::now() + Duration::hours(2);
+diff --git a/crates/oulipoly-runtime/src/executor/cli/interactive.rs b/crates/oulipoly-runtime/src/executor/cli/interactive.rs
+index f54f032..049b45a 100644
+--- a/crates/oulipoly-runtime/src/executor/cli/interactive.rs
++++ b/crates/oulipoly-runtime/src/executor/cli/interactive.rs
+@@ -104,7 +104,7 @@ pub fn execute_interactive_with_result_and_model_identity(
+ 
+     #[cfg(unix)]
+     let signal_guard = terminal_signal::InteractiveSignalGuard::install(&mut child)?;
+-    record_child_identity(child.id(), spawn_identity.as_ref());
++    let _ = record_child_identity(child.id(), spawn_identity.as_ref());
+ 
+     let status = wait_for_interactive_child(&mut child)?;
+ 
+diff --git a/crates/oulipoly-runtime/src/executor/cli/pty_broker.rs b/crates/oulipoly-runtime/src/executor/cli/pty_broker.rs
+index 72f209d..ae48286 100644
+--- a/crates/oulipoly-runtime/src/executor/cli/pty_broker.rs
++++ b/crates/oulipoly-runtime/src/executor/cli/pty_broker.rs
+@@ -97,7 +97,7 @@ pub(super) fn execute_interactive_child(
+     let recorded_context = control.as_ref().and_then(|control| {
+         context.map(|context| context.with_pty_control_path(control.path_string()))
+     });
+-    record_child_identity(child.id(), recorded_context.as_ref().or(context));
++    let _ = record_child_identity(child.id(), recorded_context.as_ref().or(context));
+     let mut idle_guard = SessionRuntimeIdleGuard::new(context);
+     drop(pty.slave);
+ 
+diff --git a/crates/oulipoly-runtime/src/executor/cli/spawn_identity.rs b/crates/oulipoly-runtime/src/executor/cli/spawn_identity.rs
+index fe0766a..70d4d3f 100644
+--- a/crates/oulipoly-runtime/src/executor/cli/spawn_identity.rs
++++ b/crates/oulipoly-runtime/src/executor/cli/spawn_identity.rs
+@@ -9,7 +9,9 @@
+ 
+ use oulipoly_state::CompositeInvocationId;
+ use oulipoly_state::mailbox::{MailboxDb, SessionRuntimeRunningUpdate};
+-use oulipoly_state::pid_identity::{self, LiveProcessIdentityRecord};
++use oulipoly_state::pid_identity::{
++    self, LiveProcessIdentityRecord, PidIdentityDb, ProcessIdentity,
++};
+ use std::path::Path;
+ 
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+@@ -74,19 +76,39 @@ pub(super) fn context_from_parent_invocation_env(
+     })
+ }
+ 
+-pub(super) fn record_child_identity(child_id: u32, context: Option<&SpawnIdentityContext>) {
+-    let Some(context) = context else {
+-        return;
+-    };
++pub(super) fn record_child_identity(
++    child_id: u32,
++    context: Option<&SpawnIdentityContext>,
++) -> Option<ProcessIdentity> {
++    let context = context?;
+     match pid_identity::record_live_process_identity(live_process_identity_record(
+         child_id, context,
+     )) {
+-        Ok(Some(row)) => mark_session_running(context, &row.identity()),
+-        Ok(None) => {}
+-        Err(err) => warn_child_identity_record_failed(context, child_id, &err),
++        Ok(Some(row)) => {
++            let identity = row.identity();
++            mark_session_running(context, &identity);
++            Some(identity)
++        }
++        Ok(None) => None,
++        Err(err) => {
++            warn_child_identity_record_failed(context, child_id, &err);
++            None
++        }
+     }
+ }
+ 
++pub(super) fn backfill_captured_session_id(
++    context: Option<&SpawnIdentityContext>,
++    identity: Option<&ProcessIdentity>,
++    session_id: &str,
++) {
++    let (Some(context), Some(identity)) = (context, identity) else {
++        return;
++    };
++    backfill_pid_identity_session_id(context, identity, session_id);
++    mark_session_running_with_session_id(context, session_id, identity);
++}
++
+ fn live_process_identity_record<'a>(
+     child_id: u32,
+     context: &'a SpawnIdentityContext,
+@@ -108,13 +130,18 @@ fn warn_child_identity_record_failed(context: &SpawnIdentityContext, child_id: u
+     );
+ }
+ 
+-fn mark_session_running(
+-    context: &SpawnIdentityContext,
+-    identity: &oulipoly_state::pid_identity::ProcessIdentity,
+-) {
++fn mark_session_running(context: &SpawnIdentityContext, identity: &ProcessIdentity) {
+     let Some(session_id) = context.session_id.as_deref() else {
+         return;
+     };
++    mark_session_running_with_session_id(context, session_id, identity);
++}
++
++fn mark_session_running_with_session_id(
++    context: &SpawnIdentityContext,
++    session_id: &str,
++    identity: &ProcessIdentity,
++) {
+     match MailboxDb::open_default().and_then(|mut db| {
+         db.mark_session_running(session_runtime_running_update(
+             context, session_id, identity,
+@@ -128,7 +155,7 @@ fn mark_session_running(
+ fn session_runtime_running_update<'a>(
+     context: &'a SpawnIdentityContext,
+     session_id: &'a str,
+-    identity: &'a oulipoly_state::pid_identity::ProcessIdentity,
++    identity: &'a ProcessIdentity,
+ ) -> SessionRuntimeRunningUpdate<'a> {
+     SessionRuntimeRunningUpdate {
+         session_id,
+@@ -152,6 +179,45 @@ fn warn_mark_session_running_failed(context: &SpawnIdentityContext, session_id:
+     );
+ }
+ 
++fn backfill_pid_identity_session_id(
++    context: &SpawnIdentityContext,
++    identity: &ProcessIdentity,
++    session_id: &str,
++) {
++    match PidIdentityDb::open_default().and_then(|db| db.set_session_id(identity, session_id)) {
++        Ok(true) => {}
++        Ok(false) => warn_pid_identity_session_backfill_missing(context, identity, session_id),
++        Err(err) => warn_pid_identity_session_backfill_failed(context, identity, session_id, &err),
++    }
++}
++
++fn warn_pid_identity_session_backfill_missing(
++    context: &SpawnIdentityContext,
++    identity: &ProcessIdentity,
++    session_id: &str,
++) {
++    tracing::warn!(
++        invocation_uuid = %context.invocation_uuid,
++        session_id,
++        os_pid = identity.os_pid,
++        "PID identity sidecar row was missing during captured session_id backfill"
++    );
++}
++
++fn warn_pid_identity_session_backfill_failed(
++    context: &SpawnIdentityContext,
++    identity: &ProcessIdentity,
++    session_id: &str,
++    err: &str,
++) {
++    tracing::warn!(
++        invocation_uuid = %context.invocation_uuid,
++        session_id,
++        os_pid = identity.os_pid,
++        "Failed to backfill PID identity sidecar session_id: {err}"
++    );
++}
++
+ fn parse_invocation_env_silent(value: &str) -> Option<CompositeInvocationId> {
+     CompositeInvocationId::parse_env_value(value).ok()
+ }
+diff --git a/crates/oulipoly-runtime/src/executor/cli/supervision/mod.rs b/crates/oulipoly-runtime/src/executor/cli/supervision/mod.rs
+index 83f7e80..67512da 100644
+--- a/crates/oulipoly-runtime/src/executor/cli/supervision/mod.rs
++++ b/crates/oulipoly-runtime/src/executor/cli/supervision/mod.rs
+@@ -38,9 +38,12 @@ mod termination;
+ 
+ use super::provider_identity::ProviderRecognizer;
+ use super::session_capture::{CapturePlan, parse_stdout_json_event_session_id};
+-use super::spawn_identity::{SpawnIdentityContext, record_child_identity};
++use super::spawn_identity::{
++    SpawnIdentityContext, backfill_captured_session_id, record_child_identity,
++};
+ use crate::executor::terminal_signal::{TerminalSignal, TerminalStatusEvidence};
+ use oulipoly_config::{PromptMode, ProviderConfig};
++use oulipoly_state::pid_identity::ProcessIdentity;
+ use std::process::{Command, ExitStatus};
+ use std::sync::mpsc;
+ use std::time::{Duration, Instant};
+@@ -126,7 +129,7 @@ fn execute_with_supervisor(
+     process::configure_supervised_command(&mut cmd, &config);
+     process::configure_supervised_process_group(&mut cmd);
+     let mut child = process::spawn_supervised_child(cmd, provider_name)?;
+-    record_child_identity(child.id(), spawn_identity);
++    let recorded_identity = record_child_identity(child.id(), spawn_identity);
+     let drains = drain::start_child_drains(&mut child)?;
+     let stdin_writer = stdin::start_child_stdin_writer(&mut child, &mut config)?;
+     let mut stdout = Vec::new();
+@@ -136,7 +139,13 @@ fn execute_with_supervisor(
+ 
+     let (terminal_status, terminal_signal, real_status) = loop {
+         drain::drain_output_events(&drains.rx, &mut stdout, &mut stderr, &mut last_output_seen);
+-        observe_streamed_session_id(capture_plan, &stdout, &mut streamed_session_id);
++        observe_streamed_session_id(
++            capture_plan,
++            &stdout,
++            &mut streamed_session_id,
++            spawn_identity,
++            recorded_identity.as_ref(),
++        );
+ 
+         if let Some(status) = status::poll_child_status(&mut child)? {
+             break terminal_outcome::terminal_outcome_from_status(status);
+@@ -163,11 +172,23 @@ fn execute_with_supervisor(
+             Err(mpsc::RecvTimeoutError::Timeout) => {}
+             Err(mpsc::RecvTimeoutError::Disconnected) => {}
+         }
+-        observe_streamed_session_id(capture_plan, &stdout, &mut streamed_session_id);
++        observe_streamed_session_id(
++            capture_plan,
++            &stdout,
++            &mut streamed_session_id,
++            spawn_identity,
++            recorded_identity.as_ref(),
++        );
+     };
+ 
+     drain::finish_child_drains(drains, &mut stdout, &mut stderr, &mut last_output_seen);
+-    observe_streamed_session_id(capture_plan, &stdout, &mut streamed_session_id);
++    observe_streamed_session_id(
++        capture_plan,
++        &stdout,
++        &mut streamed_session_id,
++        spawn_identity,
++        recorded_identity.as_ref(),
++    );
+     let stdin_write_error = stdin::finish_stdin_writer(stdin_writer);
+     let mut output = terminal_outcome::supervised_output_from_terminal(
+         provider_name,
+@@ -191,6 +212,8 @@ fn observe_streamed_session_id(
+     capture_plan: &CapturePlan,
+     stdout: &[u8],
+     streamed_session_id: &mut Option<String>,
++    spawn_identity: Option<&SpawnIdentityContext>,
++    recorded_identity: Option<&ProcessIdentity>,
+ ) {
+     if streamed_session_id.is_some() {
+         return;
+@@ -204,6 +227,7 @@ fn observe_streamed_session_id(
+         return;
+     };
+     if let Ok(session_id) = parse_stdout_json_event_session_id(stdout, event_type, event_id_path) {
++        backfill_captured_session_id(spawn_identity, recorded_identity, &session_id);
+         *streamed_session_id = Some(session_id);
+     }
+ }
+diff --git a/crates/oulipoly-runtime/src/quota/marker_verification/tests.rs b/crates/oulipoly-runtime/src/quota/marker_verification/tests.rs
+index e26ddde..5dd0dd3 100644
+--- a/crates/oulipoly-runtime/src/quota/marker_verification/tests.rs
++++ b/crates/oulipoly-runtime/src/quota/marker_verification/tests.rs
+@@ -502,7 +502,13 @@ fn lock_dir_create_failure_retains_marker() {
+     let dir = tempdir().unwrap();
+     let file_root = dir.path().join("not-a-directory");
+     std::fs::write(&file_root, "").unwrap();
+-    let _env_guard = EnvGuard::set("OULIPOLY_DATA_HOME", file_root.as_os_str());
++    let _env_guard = EnvGuard::set_many(vec![
++        ("OULIPOLY_DATA_DIR", None),
++        (
++            "OULIPOLY_DATA_HOME",
++            Some(file_root.as_os_str().to_os_string()),
++        ),
++    ]);
+     let db = open_db();
+     let now = Utc::now();
+     let marker_at = now + Duration::hours(1);
+diff --git a/crates/oulipoly-runtime/src/quota/refresh.rs b/crates/oulipoly-runtime/src/quota/refresh.rs
+index f807d1d..698d4ac 100644
+--- a/crates/oulipoly-runtime/src/quota/refresh.rs
++++ b/crates/oulipoly-runtime/src/quota/refresh.rs
+@@ -336,7 +336,13 @@ mod tests {
+         dir: Option<tempfile::TempDir>,
+     ) -> RefreshFixture {
+         let lock_home = tempfile::tempdir().unwrap();
+-        let env = EnvGuard::set("OULIPOLY_DATA_HOME", lock_home.path());
++        let env = EnvGuard::set_many(vec![
++            ("OULIPOLY_DATA_DIR", None),
++            (
++                "OULIPOLY_DATA_HOME",
++                Some(lock_home.path().as_os_str().to_os_string()),
++            ),
++        ]);
+         RefreshFixture {
+             _dir: dir,
+             _lock_home: lock_home,
+diff --git a/crates/oulipoly-runtime/src/session_export/mod.rs b/crates/oulipoly-runtime/src/session_export/mod.rs
+index de79532..10e3bf1 100644
+--- a/crates/oulipoly-runtime/src/session_export/mod.rs
++++ b/crates/oulipoly-runtime/src/session_export/mod.rs
+@@ -569,11 +569,21 @@ mod tests {
+ 
+     fn with_data_home<T>(data_home: &Path, test: impl FnOnce() -> T) -> T {
+         let _guard = env_lock().lock().unwrap();
++        let old_data_dir = std::env::var_os("OULIPOLY_DATA_DIR");
+         let old = std::env::var_os("XDG_DATA_HOME");
+         unsafe {
++            std::env::remove_var("OULIPOLY_DATA_DIR");
+             std::env::set_var("XDG_DATA_HOME", data_home);
+         }
+         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(test));
++        match old_data_dir {
++            Some(value) => unsafe {
++                std::env::set_var("OULIPOLY_DATA_DIR", value);
++            },
++            None => unsafe {
++                std::env::remove_var("OULIPOLY_DATA_DIR");
++            },
++        }
+         match old {
+             Some(value) => unsafe {
+                 std::env::set_var("XDG_DATA_HOME", value);
+diff --git a/crates/oulipoly-runtime/src/session_replace/mod.rs b/crates/oulipoly-runtime/src/session_replace/mod.rs
+index fc91989..4688d03 100644
+--- a/crates/oulipoly-runtime/src/session_replace/mod.rs
++++ b/crates/oulipoly-runtime/src/session_replace/mod.rs
+@@ -1808,6 +1808,7 @@ mod tests {
+ 
+     fn with_homes<T>(config_home: &Path, data_home: &Path, test: impl FnOnce() -> T) -> T {
+         let _guard = env_lock().lock().unwrap();
++        let old_data_dir = std::env::var_os("OULIPOLY_DATA_DIR");
+         let old_config = std::env::var_os("XDG_CONFIG_HOME");
+         let old_data = std::env::var_os("XDG_DATA_HOME");
+         let old_path = std::env::var_os("PATH");
+@@ -1823,11 +1824,20 @@ mod tests {
+         )
+         .unwrap();
+         unsafe {
++            std::env::remove_var("OULIPOLY_DATA_DIR");
+             std::env::set_var("XDG_CONFIG_HOME", config_home);
+             std::env::set_var("XDG_DATA_HOME", data_home);
+             std::env::set_var("PATH", path);
+         }
+         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(test));
++        match old_data_dir {
++            Some(value) => unsafe {
++                std::env::set_var("OULIPOLY_DATA_DIR", value);
++            },
++            None => unsafe {
++                std::env::remove_var("OULIPOLY_DATA_DIR");
++            },
++        }
+         match old_config {
+             Some(value) => unsafe {
+                 std::env::set_var("XDG_CONFIG_HOME", value);
+diff --git a/crates/oulipoly-runtime/tests/age219_quota_q2_characterization.rs b/crates/oulipoly-runtime/tests/age219_quota_q2_characterization.rs
+index bee2219..9c143bf 100644
+--- a/crates/oulipoly-runtime/tests/age219_quota_q2_characterization.rs
++++ b/crates/oulipoly-runtime/tests/age219_quota_q2_characterization.rs
+@@ -9,7 +9,7 @@
+ //!     role: intrinsic-surface
+ //!     Domain: quota_q2_routing_characterization_harness
+ //!     Owns:
+-//!       - PATH and OULIPOLY_DATA_HOME env override isolation under a process mutex
++//!       - PATH, OULIPOLY_DATA_HOME, and OULIPOLY_DATA_DIR env override isolation under a process mutex
+ //!       - provider/session config and StateDb fixture construction
+ //!       - quota/usage shell-script fixture formatting and shell-word quoting
+ //!       - quota refresh routing/source/auth-refresh behavior assertions
+@@ -78,21 +78,25 @@ impl Drop for PathOverride {
+ /// lifetime.
+ struct DataHomeOverride {
+     _home: tempfile::TempDir,
+-    previous: Option<OsString>,
++    previous_home: Option<OsString>,
++    previous_data_dir: Option<OsString>,
+ }
+ 
+ impl DataHomeOverride {
+     fn set() -> Self {
+         let home = tempfile::tempdir().expect("data home tempdir");
+-        let previous = std::env::var_os("OULIPOLY_DATA_HOME");
++        let previous_home = std::env::var_os("OULIPOLY_DATA_HOME");
++        let previous_data_dir = std::env::var_os("OULIPOLY_DATA_DIR");
+         // SAFETY: callers hold ENV_LOCK for the override's lifetime, serializing
+         // this process-global mutation with every other env-mutating test here.
+         unsafe {
++            std::env::remove_var("OULIPOLY_DATA_DIR");
+             std::env::set_var("OULIPOLY_DATA_HOME", home.path());
+         }
+         Self {
+             _home: home,
+-            previous,
++            previous_home,
++            previous_data_dir,
+         }
+     }
+ }
+@@ -101,10 +105,14 @@ impl Drop for DataHomeOverride {
+     fn drop(&mut self) {
+         // SAFETY: the owning test still holds ENV_LOCK until after this restore.
+         unsafe {
+-            match &self.previous {
++            match &self.previous_home {
+                 Some(previous) => std::env::set_var("OULIPOLY_DATA_HOME", previous),
+                 None => std::env::remove_var("OULIPOLY_DATA_HOME"),
+             }
++            match &self.previous_data_dir {
++                Some(previous) => std::env::set_var("OULIPOLY_DATA_DIR", previous),
++                None => std::env::remove_var("OULIPOLY_DATA_DIR"),
++            }
+         }
+     }
+ }
+diff --git a/crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs b/crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs
+index caaa5f7..ef17867 100644
+--- a/crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs
++++ b/crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs
+@@ -21,6 +21,7 @@ use oulipoly_state::{InvocationStart, StateDb};
+ use rusqlite::{Connection, params};
+ use serde_json::Value;
+ use std::collections::HashMap;
++use std::ffi::OsString;
+ use std::fmt::Display;
+ use std::fs;
+ use std::os::unix::fs::PermissionsExt;
+@@ -783,6 +784,7 @@ fn hostile_provider_cannot_discover_or_mutate_runner_sqlite_through_session_disp
+         PROVIDER_NAME,
+         HOSTILE_SESSION_ID,
+     );
++    let _data_dir_override = DataDirOverride::remove();
+     let registry = fixture.hostile_registry();
+     let before = fixture.snapshot();
+     let effective_cwd = fixture.dir.path().join("hostile-cwd");
+@@ -878,6 +880,34 @@ fn hostile_marker(fixture: &Fixture, route: &str) -> PathBuf {
+     fixture.dir.path().join(format!("hostile-mutated-{route}"))
+ }
+ 
++struct DataDirOverride {
++    previous: Option<OsString>,
++}
++
++impl DataDirOverride {
++    fn remove() -> Self {
++        let previous = std::env::var_os("OULIPOLY_DATA_DIR");
++        // SAFETY: this test temporarily scrubs the parent data-dir pin before
++        // spawning a hostile provider that deliberately scans inherited env.
++        unsafe {
++            std::env::remove_var("OULIPOLY_DATA_DIR");
++        }
++        Self { previous }
++    }
++}
++
++impl Drop for DataDirOverride {
++    fn drop(&mut self) {
++        // SAFETY: restore the process env to its pre-test value.
++        unsafe {
++            match &self.previous {
++                Some(previous) => std::env::set_var("OULIPOLY_DATA_DIR", previous),
++                None => std::env::remove_var("OULIPOLY_DATA_DIR"),
++            }
++        }
++    }
++}
++
+ fn hostile_markers_json(dir: &Path) -> String {
+     let marker = |route: &str| dir.join(format!("hostile-mutated-{route}"));
+     serde_json::to_string(&serde_json::json!({
+diff --git a/crates/oulipoly-runtime/tests/age244_s7b_export_replace_dispatch.rs b/crates/oulipoly-runtime/tests/age244_s7b_export_replace_dispatch.rs
+index d78a9c7..b0eb5d2 100644
+--- a/crates/oulipoly-runtime/tests/age244_s7b_export_replace_dispatch.rs
++++ b/crates/oulipoly-runtime/tests/age244_s7b_export_replace_dispatch.rs
+@@ -46,6 +46,7 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
+ 
+ struct EnvGuard {
+     old_config: Option<OsString>,
++    old_oulipoly_data_dir: Option<OsString>,
+     old_data: Option<OsString>,
+     old_home: Option<OsString>,
+     old_path: Option<OsString>,
+@@ -55,6 +56,7 @@ impl EnvGuard {
+     fn new(config_home: &Path, data_home: &Path) -> Self {
+         let guard = Self {
+             old_config: std::env::var_os("XDG_CONFIG_HOME"),
++            old_oulipoly_data_dir: std::env::var_os("OULIPOLY_DATA_DIR"),
+             old_data: std::env::var_os("XDG_DATA_HOME"),
+             old_home: std::env::var_os("HOME"),
+             old_path: std::env::var_os("PATH"),
+@@ -65,6 +67,7 @@ impl EnvGuard {
+         )))
+         .expect("test PATH");
+         unsafe {
++            std::env::remove_var("OULIPOLY_DATA_DIR");
+             std::env::set_var("XDG_CONFIG_HOME", config_home);
+             std::env::set_var("XDG_DATA_HOME", data_home);
+             std::env::set_var("HOME", data_home);
+@@ -78,6 +81,7 @@ impl Drop for EnvGuard {
+     fn drop(&mut self) {
+         unsafe {
+             restore_env("XDG_CONFIG_HOME", self.old_config.take());
++            restore_env("OULIPOLY_DATA_DIR", self.old_oulipoly_data_dir.take());
+             restore_env("XDG_DATA_HOME", self.old_data.take());
+             restore_env("HOME", self.old_home.take());
+             restore_env("PATH", self.old_path.take());
+diff --git a/crates/oulipoly-runtime/tests/age33_default_provider_characterization.rs b/crates/oulipoly-runtime/tests/age33_default_provider_characterization.rs
+index 95384a1..cce75bf 100644
+--- a/crates/oulipoly-runtime/tests/age33_default_provider_characterization.rs
++++ b/crates/oulipoly-runtime/tests/age33_default_provider_characterization.rs
+@@ -12,21 +12,35 @@ use std::sync::{Arc, Mutex};
+ static ENV_LOCK: Mutex<()> = Mutex::new(());
+ 
+ struct EnvRestore {
++    old_data_dir: Option<std::ffi::OsString>,
+     old_data_home: Option<std::ffi::OsString>,
+ }
+ 
+ impl EnvRestore {
+     fn set_xdg_data_home(path: &Path) -> Self {
++        let old_data_dir = std::env::var_os("OULIPOLY_DATA_DIR");
+         let old_data_home = std::env::var_os("XDG_DATA_HOME");
+         unsafe {
++            std::env::remove_var("OULIPOLY_DATA_DIR");
+             std::env::set_var("XDG_DATA_HOME", path);
+         }
+-        Self { old_data_home }
++        Self {
++            old_data_dir,
++            old_data_home,
++        }
+     }
+ }
+ 
+ impl Drop for EnvRestore {
+     fn drop(&mut self) {
++        match self.old_data_dir.take() {
++            Some(value) => unsafe {
++                std::env::set_var("OULIPOLY_DATA_DIR", value);
++            },
++            None => unsafe {
++                std::env::remove_var("OULIPOLY_DATA_DIR");
++            },
++        }
+         match self.old_data_home.take() {
+             Some(value) => unsafe {
+                 std::env::set_var("XDG_DATA_HOME", value);
+diff --git a/crates/oulipoly-runtime/tests/age34_runtime_quota_service_routing.rs b/crates/oulipoly-runtime/tests/age34_runtime_quota_service_routing.rs
+index ab308a1..24049a4 100644
+--- a/crates/oulipoly-runtime/tests/age34_runtime_quota_service_routing.rs
++++ b/crates/oulipoly-runtime/tests/age34_runtime_quota_service_routing.rs
+@@ -10,7 +10,7 @@
+ //!     role: intrinsic-surface
+ //!     Domain: runtime_quota_service_routing_parity_harness
+ //!     Owns:
+-//!       - OULIPOLY_DATA_HOME env override isolation under a process mutex
++//!       - OULIPOLY_DATA_HOME and OULIPOLY_DATA_DIR env override isolation under a process mutex
+ //!       - provider config, provider-registry handle, and StateDb fixture construction
+ //!       - direct-vs-service refresh parity evidence mapping
+ //!       - quota service routing/in-flight/failure assertions
+@@ -40,27 +40,32 @@ fn env_lock() -> MutexGuard<'static, ()> {
+ }
+ 
+ /// Points `OULIPOLY_DATA_HOME` at a fresh tempdir for the lifetime of the
+-/// guard so the per-account auth-refresh single-flight lock's freshness stamp
+-/// starts empty and never bleeds across tests or test binaries.
++/// guard, and scrubs the higher-precedence `OULIPOLY_DATA_DIR`, so the
++/// per-account auth-refresh single-flight lock's freshness stamp starts empty
++/// and never bleeds across tests or test binaries.
+ struct DataHomeOverride {
+     _home: tempfile::TempDir,
+     _lock: MutexGuard<'static, ()>,
+-    previous: Option<OsString>,
++    previous_home: Option<OsString>,
++    previous_data_dir: Option<OsString>,
+ }
+ 
+ impl DataHomeOverride {
+     fn new() -> Self {
+         let lock = env_lock();
+         let home = tempfile::tempdir().expect("data home tempdir");
+-        let previous = std::env::var_os("OULIPOLY_DATA_HOME");
++        let previous_home = std::env::var_os("OULIPOLY_DATA_HOME");
++        let previous_data_dir = std::env::var_os("OULIPOLY_DATA_DIR");
+         // SAFETY: the held ENV_LOCK serializes this process-global mutation.
+         unsafe {
++            std::env::remove_var("OULIPOLY_DATA_DIR");
+             std::env::set_var("OULIPOLY_DATA_HOME", home.path());
+         }
+         Self {
+             _home: home,
+             _lock: lock,
+-            previous,
++            previous_home,
++            previous_data_dir,
+         }
+     }
+ }
+@@ -69,10 +74,14 @@ impl Drop for DataHomeOverride {
+     fn drop(&mut self) {
+         // SAFETY: this guard still holds ENV_LOCK until after the restore.
+         unsafe {
+-            match &self.previous {
++            match &self.previous_home {
+                 Some(previous) => std::env::set_var("OULIPOLY_DATA_HOME", previous),
+                 None => std::env::remove_var("OULIPOLY_DATA_HOME"),
+             }
++            match &self.previous_data_dir {
++                Some(previous) => std::env::set_var("OULIPOLY_DATA_DIR", previous),
++                None => std::env::remove_var("OULIPOLY_DATA_DIR"),
++            }
+         }
+     }
+ }
+diff --git a/crates/oulipoly-runtime/tests/age37_export_service_parity.rs b/crates/oulipoly-runtime/tests/age37_export_service_parity.rs
+index c2a2b41..05b318f 100644
+--- a/crates/oulipoly-runtime/tests/age37_export_service_parity.rs
++++ b/crates/oulipoly-runtime/tests/age37_export_service_parity.rs
+@@ -24,6 +24,7 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
+ 
+ struct EnvGuard {
+     old_config: Option<OsString>,
++    old_oulipoly_data_dir: Option<OsString>,
+     old_data: Option<OsString>,
+     old_home: Option<OsString>,
+ }
+@@ -32,10 +33,12 @@ impl EnvGuard {
+     fn new(config_home: &Path, data_home: &Path) -> Self {
+         let guard = Self {
+             old_config: std::env::var_os("XDG_CONFIG_HOME"),
++            old_oulipoly_data_dir: std::env::var_os("OULIPOLY_DATA_DIR"),
+             old_data: std::env::var_os("XDG_DATA_HOME"),
+             old_home: std::env::var_os("HOME"),
+         };
+         unsafe {
++            std::env::remove_var("OULIPOLY_DATA_DIR");
+             std::env::set_var("XDG_CONFIG_HOME", config_home);
+             std::env::set_var("XDG_DATA_HOME", data_home);
+             std::env::set_var("HOME", data_home);
+@@ -48,6 +51,7 @@ impl Drop for EnvGuard {
+     fn drop(&mut self) {
+         unsafe {
+             restore_env("XDG_CONFIG_HOME", self.old_config.take());
++            restore_env("OULIPOLY_DATA_DIR", self.old_oulipoly_data_dir.take());
+             restore_env("XDG_DATA_HOME", self.old_data.take());
+             restore_env("HOME", self.old_home.take());
+         }
+diff --git a/crates/oulipoly-runtime/tests/age37_lock_service_parity.rs b/crates/oulipoly-runtime/tests/age37_lock_service_parity.rs
+index 984e0d5..48ad41c 100644
+--- a/crates/oulipoly-runtime/tests/age37_lock_service_parity.rs
++++ b/crates/oulipoly-runtime/tests/age37_lock_service_parity.rs
+@@ -22,6 +22,7 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
+ 
+ struct EnvGuard {
+     old_config: Option<OsString>,
++    old_oulipoly_data_dir: Option<OsString>,
+     old_data: Option<OsString>,
+     old_home: Option<OsString>,
+ }
+@@ -30,10 +31,12 @@ impl EnvGuard {
+     fn new(config_home: &Path, data_home: &Path) -> Self {
+         let guard = Self {
+             old_config: std::env::var_os("XDG_CONFIG_HOME"),
++            old_oulipoly_data_dir: std::env::var_os("OULIPOLY_DATA_DIR"),
+             old_data: std::env::var_os("XDG_DATA_HOME"),
+             old_home: std::env::var_os("HOME"),
+         };
+         unsafe {
++            std::env::remove_var("OULIPOLY_DATA_DIR");
+             std::env::set_var("XDG_CONFIG_HOME", config_home);
+             std::env::set_var("XDG_DATA_HOME", data_home);
+             std::env::set_var("HOME", data_home);
+@@ -46,6 +49,7 @@ impl Drop for EnvGuard {
+     fn drop(&mut self) {
+         unsafe {
+             restore_env("XDG_CONFIG_HOME", self.old_config.take());
++            restore_env("OULIPOLY_DATA_DIR", self.old_oulipoly_data_dir.take());
+             restore_env("XDG_DATA_HOME", self.old_data.take());
+             restore_env("HOME", self.old_home.take());
+         }
+diff --git a/crates/oulipoly-runtime/tests/age37_replace_service_parity.rs b/crates/oulipoly-runtime/tests/age37_replace_service_parity.rs
+index be1d7b1..5a6c0cb 100644
+--- a/crates/oulipoly-runtime/tests/age37_replace_service_parity.rs
++++ b/crates/oulipoly-runtime/tests/age37_replace_service_parity.rs
+@@ -20,6 +20,7 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
+ 
+ struct EnvGuard {
+     old_config: Option<OsString>,
++    old_oulipoly_data_dir: Option<OsString>,
+     old_data: Option<OsString>,
+     old_home: Option<OsString>,
+     old_path: Option<OsString>,
+@@ -29,6 +30,7 @@ impl EnvGuard {
+     fn new(config_home: &Path, data_home: &Path) -> Self {
+         let guard = Self {
+             old_config: std::env::var_os("XDG_CONFIG_HOME"),
++            old_oulipoly_data_dir: std::env::var_os("OULIPOLY_DATA_DIR"),
+             old_data: std::env::var_os("XDG_DATA_HOME"),
+             old_home: std::env::var_os("HOME"),
+             old_path: std::env::var_os("PATH"),
+@@ -44,6 +46,7 @@ impl EnvGuard {
+         )))
+         .unwrap();
+         unsafe {
++            std::env::remove_var("OULIPOLY_DATA_DIR");
+             std::env::set_var("XDG_CONFIG_HOME", config_home);
+             std::env::set_var("XDG_DATA_HOME", data_home);
+             std::env::set_var("HOME", data_home);
+@@ -57,6 +60,7 @@ impl Drop for EnvGuard {
+     fn drop(&mut self) {
+         unsafe {
+             restore_env("XDG_CONFIG_HOME", self.old_config.take());
++            restore_env("OULIPOLY_DATA_DIR", self.old_oulipoly_data_dir.take());
+             restore_env("XDG_DATA_HOME", self.old_data.take());
+             restore_env("HOME", self.old_home.take());
+             restore_env("PATH", self.old_path.take());
+diff --git a/crates/oulipoly-runtime/tests/age_pid_sidecar_spawn.rs b/crates/oulipoly-runtime/tests/age_pid_sidecar_spawn.rs
+index 9b8619e..4487c89 100644
+--- a/crates/oulipoly-runtime/tests/age_pid_sidecar_spawn.rs
++++ b/crates/oulipoly-runtime/tests/age_pid_sidecar_spawn.rs
+@@ -1,8 +1,11 @@
+ #![cfg(target_os = "linux")]
+ 
+-use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig};
+-use oulipoly_runtime::executor::RuntimeExecutorService;
++use oulipoly_config::{
++    ModelConfig, PromptMode, ProviderConfig, SessionCapture, SessionCaptureKind,
++};
++use oulipoly_runtime::executor::{RuntimeExecutorService, SessionCaptureMethod};
+ use oulipoly_runtime::services::{ExecutorServicePort, ExecutorServiceRequest};
++use oulipoly_state::mailbox::{MailboxDb, SessionLiveness};
+ use oulipoly_state::pid_identity::PidIdentityDb;
+ use oulipoly_state::{CompositeInvocationId, StateDb};
+ use rusqlite::{Connection, OpenFlags};
+@@ -13,6 +16,7 @@ use std::path::{Path, PathBuf};
+ use std::sync::{Mutex, MutexGuard, OnceLock};
+ 
+ const INVOCATION_UUID: &str = "aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa";
++const CAPTURED_SESSION_ID: &str = "ses_capture_backfill";
+ 
+ struct EnvGuard {
+     _lock: MutexGuard<'static, ()>,
+@@ -111,14 +115,142 @@ fn spawn_capture_writes_verified_sidecar_row_without_state_schema_change() {
+     assert!(!row.os_boot_id.is_empty());
+     assert!(row.os_pid_starttime_ticks > 0);
+     assert_eq!(row.invocation_uuid, INVOCATION_UUID);
++    assert_eq!(row.session_id, None);
+     assert_eq!(row.provider_name.as_deref(), Some("fixture-provider"));
+     assert_eq!(row.model_name.as_deref(), Some("fixture-model"));
++    let mailbox = MailboxDb::open(&sidecar_path).unwrap();
++    assert!(
++        mailbox
++            .session_runtime("fixture-missing-session")
++            .unwrap()
++            .is_none(),
++        "no capture plan must not invent a session_runtime row"
++    );
+ 
+     let (after_version, after_columns) = read_state_schema_snapshot(&state_path);
+     assert_eq!(after_version, baseline_version);
+     assert_eq!(after_columns, baseline_columns);
+ }
+ 
++#[test]
++fn stdout_json_event_capture_backfills_sidecar_and_marks_runtime_running() {
++    let dir = tempfile::tempdir().unwrap();
++    let data_home = dir.path().join("data");
++    let app_data_dir = data_home.join("oulipoly-agent-runner");
++    let sidecar_path = app_data_dir.join("pid-identity.db");
++    let script = stdout_json_event_fixture_script(dir.path(), CAPTURED_SESSION_ID);
++    let mut provider = fixture_provider(&script);
++    provider.session_capture = Some(stdout_json_event_capture());
++    let model = fixture_model(provider.clone());
++    let invocation_env = invocation_env();
++
++    {
++        let _guard = EnvGuard::set_xdg_data_home(&data_home);
++        let output = RuntimeExecutorService::default()
++            .execute(ExecutorServiceRequest::Effective {
++                model: model.clone(),
++                provider: provider.clone(),
++                provider_index: 0,
++                prompt_mode: PromptMode::Arg,
++                prompt: "hello".to_string(),
++                working_dir: None,
++                extra_inputs: HashMap::new(),
++                parent_invocation_env: Some(invocation_env),
++            })
++            .unwrap()
++            .result;
++        assert_eq!(output.exit_code, 0);
++        assert_eq!(
++            output.session_capture.session_id.as_deref(),
++            Some(CAPTURED_SESSION_ID)
++        );
++        assert!(matches!(
++            output.session_capture.method,
++            SessionCaptureMethod::StdoutJsonEvent
++        ));
++    }
++
++    let sidecar = PidIdentityDb::open_read_only(&sidecar_path).unwrap();
++    let rows = sidecar.lookup_by_invocation_uuid(INVOCATION_UUID).unwrap();
++    assert_eq!(rows.len(), 1, "expected exactly one spawn sidecar row");
++    let row = &rows[0];
++    assert_eq!(row.session_id.as_deref(), Some(CAPTURED_SESSION_ID));
++
++    let mut mailbox = MailboxDb::open(&sidecar_path).unwrap();
++    let runtime = mailbox
++        .session_runtime(CAPTURED_SESSION_ID)
++        .unwrap()
++        .expect("captured session must be marked running");
++    assert_eq!(runtime.run_state, "running");
++    assert_eq!(runtime.invocation_uuid.as_deref(), Some(INVOCATION_UUID));
++    assert_eq!(runtime.provider_name.as_deref(), Some("fixture-provider"));
++    assert_eq!(runtime.model_name.as_deref(), Some("fixture-model"));
++    assert_eq!(
++        runtime.running_invocation_uuid.as_deref(),
++        Some(INVOCATION_UUID)
++    );
++    assert_eq!(runtime.running_os_pid, Some(row.os_pid));
++    assert_eq!(
++        runtime.running_os_boot_id.as_deref(),
++        Some(row.os_boot_id.as_str())
++    );
++    assert_eq!(
++        runtime.running_os_pid_starttime_ticks,
++        Some(row.os_pid_starttime_ticks)
++    );
++
++    assert_eq!(
++        mailbox.session_liveness(CAPTURED_SESSION_ID).unwrap(),
++        SessionLiveness::Idle
++    );
++    let idle_runtime = mailbox
++        .session_runtime(CAPTURED_SESSION_ID)
++        .unwrap()
++        .expect("captured session runtime row must remain after idle cleanup");
++    assert_eq!(idle_runtime.run_state, "idle");
++    assert!(idle_runtime.turn_started_at.is_some());
++    assert!(idle_runtime.turn_ended_at.is_some());
++}
++
++#[test]
++fn stdout_json_event_capture_without_spawn_identity_does_not_backfill_sidecar() {
++    let dir = tempfile::tempdir().unwrap();
++    let data_home = dir.path().join("data");
++    let app_data_dir = data_home.join("oulipoly-agent-runner");
++    let sidecar_path = app_data_dir.join("pid-identity.db");
++    let script = stdout_json_event_fixture_script(dir.path(), CAPTURED_SESSION_ID);
++    let mut provider = fixture_provider(&script);
++    provider.session_capture = Some(stdout_json_event_capture());
++    let model = fixture_model(provider.clone());
++
++    {
++        let _guard = EnvGuard::set_xdg_data_home(&data_home);
++        let output = RuntimeExecutorService::default()
++            .execute(ExecutorServiceRequest::Effective {
++                model: model.clone(),
++                provider: provider.clone(),
++                provider_index: 0,
++                prompt_mode: PromptMode::Arg,
++                prompt: "hello".to_string(),
++                working_dir: None,
++                extra_inputs: HashMap::new(),
++                parent_invocation_env: None,
++            })
++            .unwrap()
++            .result;
++        assert_eq!(output.exit_code, 0);
++        assert_eq!(
++            output.session_capture.session_id.as_deref(),
++            Some(CAPTURED_SESSION_ID)
++        );
++    }
++
++    assert!(
++        !sidecar_path.exists(),
++        "capture without spawn identity must not create or backfill a sidecar row"
++    );
++}
++
+ #[test]
+ fn spawn_preserves_preexisting_oulipoly_data_dir_in_provider_child() {
+     let dir = tempfile::tempdir().unwrap();
+@@ -212,6 +344,39 @@ fn env_recording_fixture_script(dir: &Path) -> PathBuf {
+     path
+ }
+ 
++fn stdout_json_event_fixture_script(dir: &Path, session_id: &str) -> PathBuf {
++    let path = dir.join("stdout-json-event-provider.sh");
++    let event = serde_json::json!({
++        "type": "step_start",
++        "sessionID": session_id,
++    });
++    std::fs::write(
++        &path,
++        format!(
++            "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' '{}'\nsleep 0.2\nprintf 'ok\\n'\n",
++            event
++        ),
++    )
++    .unwrap();
++    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
++    permissions.set_mode(0o755);
++    std::fs::set_permissions(&path, permissions).unwrap();
++    path
++}
++
++fn stdout_json_event_capture() -> SessionCapture {
++    SessionCapture {
++        kind: SessionCaptureKind::StdoutJsonEvent,
++        flag: None,
++        readback_args: None,
++        event_type: Some("step_start".to_string()),
++        event_id_path: Some("sessionID".to_string()),
++        json_flag: None,
++        json_args: Some(vec!["--json".to_string()]),
++        last_message_flag: None,
++    }
++}
++
+ fn fixture_provider(script: &Path) -> ProviderConfig {
+     ProviderConfig {
+         name: "fixture-provider".to_string(),
+diff --git a/crates/oulipoly-runtime/tests/auth_refresh_single_flight.rs b/crates/oulipoly-runtime/tests/auth_refresh_single_flight.rs
+index 86f92d5..45dd060 100644
+--- a/crates/oulipoly-runtime/tests/auth_refresh_single_flight.rs
++++ b/crates/oulipoly-runtime/tests/auth_refresh_single_flight.rs
+@@ -24,7 +24,7 @@
+ //!     role: intrinsic-surface
+ //!     Domain: auth_refresh_single_flight_behavior_harness
+ //!     Owns:
+-//!       - OULIPOLY_DATA_HOME env-scope isolation under a process mutex
++//!       - OULIPOLY_DATA_HOME and OULIPOLY_DATA_DIR env-scope isolation under a process mutex
+ //!       - shell counting-command formatting and shell-out counting
+ //!       - concurrent multi-thread/barrier attempt orchestration
+ //!       - disposition tally mapping and single-flight invariant assertions
+@@ -46,8 +46,9 @@ fn env_lock() -> MutexGuard<'static, ()> {
+ }
+ 
+ /// Isolates `OULIPOLY_DATA_HOME` (where the auth-refresh lock dir lives) to a
+-/// fresh tempdir and optionally sets extra env vars, restoring all of them on
+-/// drop. Holds the process env lock for its whole lifetime.
++/// fresh tempdir, scrubs the higher-precedence `OULIPOLY_DATA_DIR`, and
++/// optionally sets extra env vars, restoring all of them on drop. Holds the
++/// process env lock for its whole lifetime.
+ struct EnvScope {
+     _home: tempfile::TempDir,
+     _lock: MutexGuard<'static, ()>,
+@@ -58,7 +59,11 @@ impl EnvScope {
+     fn new(extra: &[(&'static str, &str)]) -> Self {
+         let lock = env_lock();
+         let home = tempfile::tempdir().expect("data home tempdir");
+-        let mut restores = vec![("OULIPOLY_DATA_HOME", std::env::var_os("OULIPOLY_DATA_HOME"))];
++        let mut restores = vec![
++            ("OULIPOLY_DATA_HOME", std::env::var_os("OULIPOLY_DATA_HOME")),
++            ("OULIPOLY_DATA_DIR", std::env::var_os("OULIPOLY_DATA_DIR")),
++        ];
++        remove_env("OULIPOLY_DATA_DIR");
+         set_env("OULIPOLY_DATA_HOME", home.path().as_os_str());
+         for (key, value) in extra {
+             restores.push((*key, std::env::var_os(key)));
+diff --git a/crates/oulipoly-runtime/tests/wu_e_interactive_fallback.rs b/crates/oulipoly-runtime/tests/wu_e_interactive_fallback.rs
+index 96770c0..3392a67 100644
+--- a/crates/oulipoly-runtime/tests/wu_e_interactive_fallback.rs
++++ b/crates/oulipoly-runtime/tests/wu_e_interactive_fallback.rs
+@@ -47,6 +47,7 @@ fn no_controlling_terminal_fallback_records_no_pty_control_path() {
+         .env(CHILD_RESULT_ENV, &child_result)
+         .env("XDG_CONFIG_HOME", &config_home)
+         .env("XDG_DATA_HOME", &data_home)
++        .env_remove("OULIPOLY_DATA_DIR")
+         .env("XDG_RUNTIME_DIR", &runtime_dir)
+         .env("XDG_STATE_HOME", &state_home)
+         .env("HOME", &home_dir)
+diff --git a/src-tauri/tests/age100_one_shot_quota_migration.rs b/src-tauri/tests/age100_one_shot_quota_migration.rs
+index 8ca0f4b..d9b4d4a 100644
+--- a/src-tauri/tests/age100_one_shot_quota_migration.rs
++++ b/src-tauri/tests/age100_one_shot_quota_migration.rs
+@@ -105,6 +105,7 @@ prompt_mode = "arg"
+             .arg("prompt");
+         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+         cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd.env("HOME", &self.data_home);
+         cmd.env(FORCE_KIND, "QuotaExhaustedInband");
+         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+diff --git a/src-tauri/tests/age100_resume_quota_migration.rs b/src-tauri/tests/age100_resume_quota_migration.rs
+index e74057c..80b264a 100644
+--- a/src-tauri/tests/age100_resume_quota_migration.rs
++++ b/src-tauri/tests/age100_resume_quota_migration.rs
+@@ -206,6 +206,7 @@ prompt_mode = "stdin"
+         cmd.current_dir(self.dir.path());
+         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+         cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+         cmd
+     }
+diff --git a/src-tauri/tests/age123_resume_provider_identity.rs b/src-tauri/tests/age123_resume_provider_identity.rs
+index d873c98..4850b80 100644
+--- a/src-tauri/tests/age123_resume_provider_identity.rs
++++ b/src-tauri/tests/age123_resume_provider_identity.rs
+@@ -287,6 +287,7 @@ prompt_mode = "stdin"
+         cmd.current_dir(self.dir.path());
+         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+         cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+         cmd.output().unwrap()
+     }
+diff --git a/src-tauri/tests/age134_main_prompt_resolution.rs b/src-tauri/tests/age134_main_prompt_resolution.rs
+index 4f72a04..3375115 100644
+--- a/src-tauri/tests/age134_main_prompt_resolution.rs
++++ b/src-tauri/tests/age134_main_prompt_resolution.rs
+@@ -73,6 +73,7 @@ impl CliFixture {
+         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+         cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd.env("HOME", &self.data_home);
+         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+         cmd
+@@ -183,6 +184,7 @@ flag = "--resume"
+             .arg(&typescript)
+             .env("XDG_CONFIG_HOME", &self.config_home)
+             .env("XDG_DATA_HOME", &self.data_home)
++            .env_remove("OULIPOLY_DATA_DIR")
+             .env("HOME", &self.data_home)
+             .env_remove("OULIPOLY_PARENT_INVOCATION");
+         let output = script.output().unwrap();
+diff --git a/src-tauri/tests/age134_main_session_and_migrate.rs b/src-tauri/tests/age134_main_session_and_migrate.rs
+index b35f851..4d6a52c 100644
+--- a/src-tauri/tests/age134_main_session_and_migrate.rs
++++ b/src-tauri/tests/age134_main_session_and_migrate.rs
+@@ -45,6 +45,7 @@ impl CliFixture {
+         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+         cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd.env("HOME", &self.data_home);
+         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+         cmd
+diff --git a/src-tauri/tests/age149_owned_turn_event_schema.rs b/src-tauri/tests/age149_owned_turn_event_schema.rs
+index ee077e9..7f413ba 100644
+--- a/src-tauri/tests/age149_owned_turn_event_schema.rs
++++ b/src-tauri/tests/age149_owned_turn_event_schema.rs
+@@ -69,6 +69,7 @@ impl CliFixture {
+         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+         cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd.env("HOME", &self.data_home);
+         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+         cmd
+diff --git a/src-tauri/tests/age151_config_migration_cli.rs b/src-tauri/tests/age151_config_migration_cli.rs
+index 3335769..b5b501a 100644
+--- a/src-tauri/tests/age151_config_migration_cli.rs
++++ b/src-tauri/tests/age151_config_migration_cli.rs
+@@ -33,6 +33,7 @@ impl CliFixture {
+         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+         cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd.env("HOME", &self.data_home);
+         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+         cmd
+diff --git a/src-tauri/tests/age153_support/mod.rs b/src-tauri/tests/age153_support/mod.rs
+index e5bed42..022d1a5 100644
+--- a/src-tauri/tests/age153_support/mod.rs
++++ b/src-tauri/tests/age153_support/mod.rs
+@@ -239,6 +239,7 @@ projects_dir = {}
+         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+         cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd.env("HOME", &self.data_home);
+         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+         cmd
+diff --git a/src-tauri/tests/age15_usage_cli_characterization.rs b/src-tauri/tests/age15_usage_cli_characterization.rs
+index 931da10..0d87de2 100644
+--- a/src-tauri/tests/age15_usage_cli_characterization.rs
++++ b/src-tauri/tests/age15_usage_cli_characterization.rs
+@@ -63,6 +63,7 @@ impl Fixture {
+         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+         cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd.env("OULIPOLY_CONFIG_HOME", &self.config_home);
+         cmd.env("OULIPOLY_DATA_HOME", &self.data_home);
+         cmd
+diff --git a/src-tauri/tests/age162_dispatch_stderr_marks_exhausted.rs b/src-tauri/tests/age162_dispatch_stderr_marks_exhausted.rs
+index ccc12a1..ea97ce8 100644
+--- a/src-tauri/tests/age162_dispatch_stderr_marks_exhausted.rs
++++ b/src-tauri/tests/age162_dispatch_stderr_marks_exhausted.rs
+@@ -157,6 +157,7 @@ prompt_mode = "arg"
+             .arg("prompt");
+         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+         cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd.env("HOME", &self.data_home);
+         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+         cmd.output().unwrap()
+diff --git a/src-tauri/tests/age162_explicit_migrate_routes_to_target.rs b/src-tauri/tests/age162_explicit_migrate_routes_to_target.rs
+index c8c7db4..701278a 100644
+--- a/src-tauri/tests/age162_explicit_migrate_routes_to_target.rs
++++ b/src-tauri/tests/age162_explicit_migrate_routes_to_target.rs
+@@ -230,6 +230,7 @@ prompt_mode = "stdin"
+         cmd.current_dir(self.dir.path());
+         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+         cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+         cmd.output().unwrap()
+     }
+diff --git a/src-tauri/tests/age162_usage_missing_provider_warn_and_skip.rs b/src-tauri/tests/age162_usage_missing_provider_warn_and_skip.rs
+index 3607e71..4213bf1 100644
+--- a/src-tauri/tests/age162_usage_missing_provider_warn_and_skip.rs
++++ b/src-tauri/tests/age162_usage_missing_provider_warn_and_skip.rs
+@@ -66,6 +66,7 @@ impl Fixture {
+         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+         cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd.env("OULIPOLY_CONFIG_HOME", &self.config_home);
+         cmd.env("OULIPOLY_DATA_HOME", &self.data_home);
+         cmd
+diff --git a/src-tauri/tests/age181_prompt_resolution_failure.rs b/src-tauri/tests/age181_prompt_resolution_failure.rs
+index 27b1a16..3087208 100644
+--- a/src-tauri/tests/age181_prompt_resolution_failure.rs
++++ b/src-tauri/tests/age181_prompt_resolution_failure.rs
+@@ -64,6 +64,7 @@ impl Age181Fixture {
+         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+         cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd.env("HOME", &self.data_home);
+         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+         cmd
+diff --git a/src-tauri/tests/age247_session_load_exit144_repro.rs b/src-tauri/tests/age247_session_load_exit144_repro.rs
+index c9a0185..dac3561 100644
+--- a/src-tauri/tests/age247_session_load_exit144_repro.rs
++++ b/src-tauri/tests/age247_session_load_exit144_repro.rs
+@@ -206,6 +206,7 @@ fn fixture_command(fixture: &ScratchFixture) -> Command {
+     command
+         .env("XDG_CONFIG_HOME", &fixture.config_home)
+         .env("XDG_DATA_HOME", &fixture.data_home)
++        .env_remove("OULIPOLY_DATA_DIR")
+         .env("OULIPOLY_DATA_HOME", &fixture.data_home)
+         .env("HOME", &fixture.root)
+         .env("LD_PRELOAD", &fixture.preload_library)
+diff --git a/src-tauri/tests/age27_diagnostics_effective_provider.rs b/src-tauri/tests/age27_diagnostics_effective_provider.rs
+index 99d4d5e..fbc3451 100644
+--- a/src-tauri/tests/age27_diagnostics_effective_provider.rs
++++ b/src-tauri/tests/age27_diagnostics_effective_provider.rs
+@@ -45,6 +45,7 @@ impl Fixture {
+         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+         cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+         cmd
+     }
+diff --git a/src-tauri/tests/age28_provider_policy_routing.rs b/src-tauri/tests/age28_provider_policy_routing.rs
+index 25bbaa4..e1ef4b5 100644
+--- a/src-tauri/tests/age28_provider_policy_routing.rs
++++ b/src-tauri/tests/age28_provider_policy_routing.rs
+@@ -51,6 +51,7 @@ impl Fixture {
+         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+         cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd.env("HOME", &self.data_home);
+         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+         cmd
+diff --git a/src-tauri/tests/age31_new_repl_integration.rs b/src-tauri/tests/age31_new_repl_integration.rs
+index 11711bb..bdc6097 100644
+--- a/src-tauri/tests/age31_new_repl_integration.rs
++++ b/src-tauri/tests/age31_new_repl_integration.rs
+@@ -54,6 +54,7 @@ impl TempXdgHome {
+         cmd.arg("--new")
+             .env("XDG_CONFIG_HOME", &self.config_home)
+             .env("XDG_DATA_HOME", &self.data_home)
++            .env_remove("OULIPOLY_DATA_DIR")
+             .env_remove("OULIPOLY_PARENT_INVOCATION");
+         cmd.output().unwrap()
+     }
+diff --git a/src-tauri/tests/age33_config_state_characterization.rs b/src-tauri/tests/age33_config_state_characterization.rs
+index d52dee3..00336a5 100644
+--- a/src-tauri/tests/age33_config_state_characterization.rs
++++ b/src-tauri/tests/age33_config_state_characterization.rs
+@@ -100,6 +100,7 @@ impl CliFixture {
+         .unwrap();
+         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+         cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd.env("HOME", &self.data_home);
+         cmd.env("PATH", path);
+         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+@@ -677,6 +678,7 @@ fn age_33_session_export_default_open_operational_error_is_json_without_stdout()
+ 
+     let mut cmd = fixture.command();
+     cmd.env("XDG_DATA_HOME", &blocked_data_home)
++        .env_remove("OULIPOLY_DATA_DIR")
+         .arg("session")
+         .arg("export")
+         .arg(SESSION_A);
+diff --git a/src-tauri/tests/age35_routing_lifecycle_characterization.rs b/src-tauri/tests/age35_routing_lifecycle_characterization.rs
+index af20eaf..cf90578 100644
+--- a/src-tauri/tests/age35_routing_lifecycle_characterization.rs
++++ b/src-tauri/tests/age35_routing_lifecycle_characterization.rs
+@@ -50,6 +50,7 @@ impl CliFixture {
+         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+         cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd.env("HOME", &self.data_home);
+         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+         cmd
+diff --git a/src-tauri/tests/age8_cli_characterization.rs b/src-tauri/tests/age8_cli_characterization.rs
+index 63d12f3..afd58ba 100644
+--- a/src-tauri/tests/age8_cli_characterization.rs
++++ b/src-tauri/tests/age8_cli_characterization.rs
+@@ -93,6 +93,7 @@ prompt_mode = "arg"
+         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+         cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd
+     }
+ }
+@@ -132,6 +133,7 @@ fn one_shot_fails_closed_when_default_state_db_cannot_open() {
+ 
+     let mut cmd = fixture.command();
+     cmd.env("XDG_DATA_HOME", &blocked_data_home);
++    cmd.env_remove("OULIPOLY_DATA_DIR");
+     cmd.arg("--models-dir")
+         .arg(&fixture.models_dir)
+         .arg("--model")
+diff --git a/src-tauri/tests/age_32_state_db_migrations.rs b/src-tauri/tests/age_32_state_db_migrations.rs
+index debbd3e..06d65f3 100644
+--- a/src-tauri/tests/age_32_state_db_migrations.rs
++++ b/src-tauri/tests/age_32_state_db_migrations.rs
+@@ -52,6 +52,7 @@ impl CliFixture {
+         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+         cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+         cmd
+     }
+diff --git a/src-tauri/tests/age_54_trace_row_preservation.rs b/src-tauri/tests/age_54_trace_row_preservation.rs
+index d3656e8..aef1cdd 100644
+--- a/src-tauri/tests/age_54_trace_row_preservation.rs
++++ b/src-tauri/tests/age_54_trace_row_preservation.rs
+@@ -93,6 +93,7 @@ impl TraceFixture {
+         cmd.arg("trace").arg(invocation_uuid).arg("--json");
+         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+         cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd.output().unwrap()
+     }
+ }
+diff --git a/src-tauri/tests/age_pid_sidecar_cli.rs b/src-tauri/tests/age_pid_sidecar_cli.rs
+index 5563dd9..e5b34be 100644
+--- a/src-tauri/tests/age_pid_sidecar_cli.rs
++++ b/src-tauri/tests/age_pid_sidecar_cli.rs
+@@ -107,6 +107,7 @@ impl Fixture {
+         cmd.args(args);
+         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+         cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd.output().unwrap()
+     }
+ }
+diff --git a/src-tauri/tests/empty_bodies_ref_rca/mod.rs b/src-tauri/tests/empty_bodies_ref_rca/mod.rs
+index 94d14ef..6eb9549 100644
+--- a/src-tauri/tests/empty_bodies_ref_rca/mod.rs
++++ b/src-tauri/tests/empty_bodies_ref_rca/mod.rs
+@@ -365,6 +365,7 @@ fn export_command() -> Command {
+ fn apply_export_env(cmd: &mut Command, fixture: &RcaFixture) {
+     cmd.env("XDG_CONFIG_HOME", &fixture.config_home);
+     cmd.env("XDG_DATA_HOME", &fixture.data_home);
++    cmd.env_remove("OULIPOLY_DATA_DIR");
+     cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+ }
+ 
+diff --git a/src-tauri/tests/fixtures/initiative_06.rs b/src-tauri/tests/fixtures/initiative_06.rs
+index 932a3cf..6e7e22a 100644
+--- a/src-tauri/tests/fixtures/initiative_06.rs
++++ b/src-tauri/tests/fixtures/initiative_06.rs
+@@ -457,6 +457,7 @@ cwd_script = {cwd_script:?}
+         cmd.args(extra_args);
+         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+         cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd.env("PATH", path);
+         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+         cmd.output().unwrap()
+diff --git a/src-tauri/tests/fixtures/initiative_06_export.rs b/src-tauri/tests/fixtures/initiative_06_export.rs
+index b4c8030..5ece18f 100644
+--- a/src-tauri/tests/fixtures/initiative_06_export.rs
++++ b/src-tauri/tests/fixtures/initiative_06_export.rs
+@@ -328,6 +328,7 @@ prompt_mode = "arg"
+         cmd.args(extra_args);
+         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+         cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+         cmd.output().unwrap()
+     }
+diff --git a/src-tauri/tests/fixtures/initiative_06_import_replace.rs b/src-tauri/tests/fixtures/initiative_06_import_replace.rs
+index b226f2e..aa8ab3a 100644
+--- a/src-tauri/tests/fixtures/initiative_06_import_replace.rs
++++ b/src-tauri/tests/fixtures/initiative_06_import_replace.rs
+@@ -1050,6 +1050,7 @@ fn base_command(config_home: &Path, data_home: &Path) -> Command {
+     .unwrap();
+     cmd.env("XDG_CONFIG_HOME", config_home);
+     cmd.env("XDG_DATA_HOME", data_home);
++    cmd.env_remove("OULIPOLY_DATA_DIR");
+     cmd.env("HOME", data_home);
+     cmd.env("PATH", path);
+     cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+diff --git a/src-tauri/tests/fixtures/initiative_06_pause_handshake.rs b/src-tauri/tests/fixtures/initiative_06_pause_handshake.rs
+index 63328b9..7220133 100644
+--- a/src-tauri/tests/fixtures/initiative_06_pause_handshake.rs
++++ b/src-tauri/tests/fixtures/initiative_06_pause_handshake.rs
+@@ -350,6 +350,7 @@ fn base_command(config_home: &Path, data_home: &Path) -> Command {
+     let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+     cmd.env("XDG_CONFIG_HOME", config_home);
+     cmd.env("XDG_DATA_HOME", data_home);
++    cmd.env_remove("OULIPOLY_DATA_DIR");
+     cmd.env("HOME", data_home);
+     cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+     cmd
+diff --git a/src-tauri/tests/fixtures/initiative_06_schema_probe.rs b/src-tauri/tests/fixtures/initiative_06_schema_probe.rs
+index 71d2f7d..ed1b895 100644
+--- a/src-tauri/tests/fixtures/initiative_06_schema_probe.rs
++++ b/src-tauri/tests/fixtures/initiative_06_schema_probe.rs
+@@ -65,6 +65,7 @@ impl SchemaProbeFixture {
+         cmd.args(extra_args);
+         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+         cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+         cmd.output().unwrap()
+     }
+diff --git a/src-tauri/tests/initiative_05_migration.rs b/src-tauri/tests/initiative_05_migration.rs
+index 4a7bc7a..fb74a28 100644
+--- a/src-tauri/tests/initiative_05_migration.rs
++++ b/src-tauri/tests/initiative_05_migration.rs
+@@ -205,6 +205,7 @@ flag = "--resume"
+         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+         cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+         cmd
+     }
+@@ -1756,6 +1757,7 @@ fn migrate_db_command_reports_open_error() {
+     let data_home = data_home_file_fixture(&fixture);
+     let mut command = fixture.command();
+     command.env("XDG_DATA_HOME", data_home);
++    command.env_remove("OULIPOLY_DATA_DIR");
+ 
+     let output = command.arg("migrate-db").output().unwrap();
+ 
+diff --git a/src-tauri/tests/nes_259_returned_artifacts_integration.rs b/src-tauri/tests/nes_259_returned_artifacts_integration.rs
+index c6d977a..a42ea51 100644
+--- a/src-tauri/tests/nes_259_returned_artifacts_integration.rs
++++ b/src-tauri/tests/nes_259_returned_artifacts_integration.rs
+@@ -132,6 +132,7 @@ flag = "--resume"
+     fn apply_env(&self, cmd: &mut Command) {
+         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+         cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+         cmd.env_remove("OULIPOLY_RETURN_CHANNEL");
+     }
+diff --git a/src-tauri/tests/pipeline_status_propagation_rca/mod.rs b/src-tauri/tests/pipeline_status_propagation_rca/mod.rs
+index 9a89470..4c3b5b0 100644
+--- a/src-tauri/tests/pipeline_status_propagation_rca/mod.rs
++++ b/src-tauri/tests/pipeline_status_propagation_rca/mod.rs
+@@ -78,6 +78,7 @@ impl PipelineFixture {
+ fn apply_fixture_xdg_env(cmd: &mut Command, fixture: &PipelineFixture) {
+     cmd.env("XDG_CONFIG_HOME", &fixture.config_home);
+     cmd.env("XDG_DATA_HOME", &fixture.data_home);
++    cmd.env_remove("OULIPOLY_DATA_DIR");
+     cmd.env("XDG_STATE_HOME", &fixture.state_home);
+ }
+ 
+diff --git a/src-tauri/tests/pr_a_invocation_integration.rs b/src-tauri/tests/pr_a_invocation_integration.rs
+index 4b3d2b8..06be04e 100644
+--- a/src-tauri/tests/pr_a_invocation_integration.rs
++++ b/src-tauri/tests/pr_a_invocation_integration.rs
+@@ -97,6 +97,7 @@ prompt_mode = "arg"
+             .arg("ping");
+         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+         cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+         if let Some(value) = parent_env {
+             cmd.env("OULIPOLY_PARENT_INVOCATION", value);
+@@ -132,6 +133,7 @@ fn run_trace_json(fixture: &Fixture, invocation_uuid: &str) -> Value {
+     cmd.arg("trace").arg(invocation_uuid).arg("--json");
+     cmd.env("XDG_CONFIG_HOME", &fixture.config_home);
+     cmd.env("XDG_DATA_HOME", &fixture.data_home);
++    cmd.env_remove("OULIPOLY_DATA_DIR");
+     let output = cmd.output().unwrap();
+     assert_eq!(output.status.code(), Some(0), "{output:?}");
+     serde_json::from_slice(&output.stdout).unwrap()
+diff --git a/src-tauri/tests/pr_b_trace_integration.rs b/src-tauri/tests/pr_b_trace_integration.rs
+index 3e3e5ec..133297c 100644
+--- a/src-tauri/tests/pr_b_trace_integration.rs
++++ b/src-tauri/tests/pr_b_trace_integration.rs
+@@ -151,6 +151,7 @@ prompt_mode = "arg"
+         cmd.args(extra_args);
+         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+         cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd.output().unwrap()
+     }
+ 
+@@ -161,6 +162,7 @@ prompt_mode = "arg"
+         cmd.args(extra_args);
+         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+         cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd.output().unwrap()
+     }
+ 
+@@ -173,6 +175,7 @@ prompt_mode = "arg"
+             .arg("ping");
+         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+         cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd.output().unwrap()
+     }
+ }
+diff --git a/src-tauri/tests/pr_e_repl_integration.rs b/src-tauri/tests/pr_e_repl_integration.rs
+index 84fef2f..d8527cd 100644
+--- a/src-tauri/tests/pr_e_repl_integration.rs
++++ b/src-tauri/tests/pr_e_repl_integration.rs
+@@ -124,6 +124,7 @@ prompt_mode = "arg"
+             .arg(model_name);
+         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+         cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+         if let Some(parent_env) = parent_env {
+             cmd.env("OULIPOLY_PARENT_INVOCATION", parent_env);
+diff --git a/src-tauri/tests/pr_f_resume_integration.rs b/src-tauri/tests/pr_f_resume_integration.rs
+index 35e2476..396d342 100644
+--- a/src-tauri/tests/pr_f_resume_integration.rs
++++ b/src-tauri/tests/pr_f_resume_integration.rs
+@@ -363,6 +363,7 @@ sessions_dir = "{}"
+             .arg(&self.models_dir);
+         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+         cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+         cmd
+     }
+@@ -403,6 +404,7 @@ sessions_dir = "{}"
+         cmd.current_dir(self.dir.path());
+         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+         cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+         cmd
+     }
+@@ -423,6 +425,7 @@ sessions_dir = "{}"
+         cmd.current_dir(self.dir.path());
+         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+         cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+         cmd
+     }
+@@ -442,6 +445,7 @@ sessions_dir = "{}"
+         cmd.current_dir(self.dir.path());
+         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+         cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+         cmd
+     }
+@@ -454,6 +458,7 @@ sessions_dir = "{}"
+             .arg(&self.models_dir);
+         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+         cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+         cmd
+     }
+@@ -614,6 +619,7 @@ fn run_trace_json(fixture: &Fixture, invocation_uuid: &str) -> Value {
+     cmd.arg("trace").arg(invocation_uuid).arg("--json");
+     cmd.env("XDG_CONFIG_HOME", &fixture.config_home);
+     cmd.env("XDG_DATA_HOME", &fixture.data_home);
++    cmd.env_remove("OULIPOLY_DATA_DIR");
+     let output = cmd.output().unwrap();
+     assert_eq!(output.status.code(), Some(0), "{output:?}");
+     serde_json::from_slice(&output.stdout).unwrap()
+diff --git a/src-tauri/tests/wu_d_proactive_wake_integration.rs b/src-tauri/tests/wu_d_proactive_wake_integration.rs
+index 42c11fa..04433a5 100644
+--- a/src-tauri/tests/wu_d_proactive_wake_integration.rs
++++ b/src-tauri/tests/wu_d_proactive_wake_integration.rs
+@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
+ const MODEL: &str = "wu-d-fixture-model";
+ const PROVIDER: &str = "wu-d-fixture-provider";
+ const SESSION: &str = "5169694d-de0f-40d1-890c-6e28e55bab27";
++const CAPTURED_OPENCODE_SESSION: &str = "ses_capturemidturn";
+ const INVOCATION: &str = "11111111-1111-4111-8111-111111111111";
+ 
+ struct Fixture {
+@@ -168,6 +169,55 @@ flag = "--session"
+         .unwrap();
+     }
+ 
++    fn write_opencode_capture_provider(&self, body: &str) {
++        let script = self.write_script("opencode-capture.sh", body);
++        fs::write(
++            self.models_dir.join(format!("{MODEL}.toml")),
++            r#"[[providers]]
++name = "opencode"
++args = []
++"#,
++        )
++        .unwrap();
++        fs::write(
++            self.app_config_dir.join("providers.toml"),
++            format!(
++                r#"[opencode]
++command = {}
++args = []
++interactive_args = ["interactive"]
++prompt_mode = "arg"
++
++[opencode.session_capture]
++kind = "stdout_json_event"
++json_args = ["--json"]
++event_type = "step_start"
++event_id_path = "sessionID"
++
++[opencode.resume]
++kind = "flag"
++flag = "--session"
++"#,
++                toml_string(&path_string(&script))
++            ),
++        )
++        .unwrap();
++    }
++
++    fn pid_identity_session_id_for_provider(&self, provider_name: &str) -> String {
++        self.sidecar_conn()
++            .query_row(
++                "SELECT session_id
++                 FROM pid_identity
++                 WHERE provider_name = ?1
++                 ORDER BY recorded_at DESC, os_pid DESC
++                 LIMIT 1",
++                rusqlite::params![provider_name],
++                |row| row.get(0),
++            )
++            .unwrap()
++    }
++
+     fn write_script(&self, name: &str, body: &str) -> PathBuf {
+         let path = self.dir.path().join(name);
+         fs::write(
+@@ -583,6 +633,90 @@ fi"#,
+     fixture.assert_xdg_isolated();
+ }
+ 
++#[test]
++fn opencode_mid_turn_notify_resolves_capture_time_sidecar_owner() {
++    let _guard = integration_test_guard();
++    let fixture = Fixture::new();
++    let event = json!({
++        "type": "step_start",
++        "sessionID": CAPTURED_OPENCODE_SESSION,
++    });
++    fixture.write_opencode_capture_provider(&provider_script(
++        &format!(
++            r#"printf '%s\n' '{}'
++sleep 0.2
++notify_handle h-capture-midturn 0
++sleep 0.2"#,
++            event
++        ),
++        r#"if [ "$resume" != "ses_capturemidturn" ]; then
++  printf 'expected --session ses_capturemidturn, got %s\n' "$resume" >&2
++  exit 66
++fi"#,
++        "opencode-capture-resumed.txt",
++    ));
++    fixture.seed_active_chain_for(
++        "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
++        "opencode",
++        CAPTURED_OPENCODE_SESSION,
++        MODEL,
++    );
++
++    let output = fixture.run_agent("dispatch capture race");
++    assert_eq!(output.status.code(), Some(0), "{output:?}");
++
++    let notify_json = wait_for_file(&fixture.work_dir.join("h-capture-midturn/notify.json"));
++    let notify: Value = serde_json::from_str(&notify_json).unwrap();
++    assert_eq!(
++        notify.get("status").and_then(Value::as_str),
++        Some("enqueued")
++    );
++    assert_eq!(notify.get("enqueued").and_then(Value::as_bool), Some(true));
++    assert_eq!(
++        notify.get("owner_session_id").and_then(Value::as_str),
++        Some(CAPTURED_OPENCODE_SESSION)
++    );
++    assert_eq!(
++        notify.get("session_source").and_then(Value::as_str),
++        Some("sidecar_session_id")
++    );
++    assert_eq!(
++        notify
++            .get("wake")
++            .and_then(|wake| wake.get("status"))
++            .and_then(Value::as_str),
++        Some("busy")
++    );
++
++    assert_eq!(
++        fixture.pid_identity_session_id_for_provider("opencode"),
++        CAPTURED_OPENCODE_SESSION
++    );
++    let prompt = wait_for_file(&fixture.prompt_file("opencode-capture-resumed.txt"));
++    assert!(prompt.contains("handle: h-capture-midturn"), "{prompt}");
++    wait_until("captured opencode mailbox delivered", || {
++        let db = fixture.mailbox();
++        let rows = db.list_mailbox(CAPTURED_OPENCODE_SESSION, true).unwrap();
++        rows.len() == 1
++            && rows[0].handle == "h-capture-midturn"
++            && rows[0].delivered_at.is_some()
++            && rows[0].owner_invocation_uuid.is_some()
++            && rows[0].matched_os_pid.is_some()
++            && rows[0].matched_chain_index == Some(0)
++            && db.wake_claim(CAPTURED_OPENCODE_SESSION).unwrap().is_none()
++    });
++    assert_eq!(
++        fixture
++            .mailbox()
++            .session_runtime(CAPTURED_OPENCODE_SESSION)
++            .unwrap()
++            .unwrap()
++            .run_state,
++        "idle"
++    );
++    fixture.assert_xdg_isolated();
++}
++
+ #[test]
+ fn batch_cap_followup_wake() {
+     let _guard = integration_test_guard();

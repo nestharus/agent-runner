@@ -1,0 +1,28 @@
+# Runtime test evidence — cap gate (42200fb..9ba1275), XDG-isolated
+## age_pid_sidecar_spawn (incl. capture backfill + negative)
+test spawn_preserves_preexisting_oulipoly_data_dir_in_provider_child ... ok
+test stdout_json_event_capture_without_spawn_identity_does_not_backfill_sidecar ... ok
+test stdout_json_event_capture_backfills_sidecar_and_marks_runtime_running ... ok
+test spawn_capture_writes_verified_sidecar_row_without_state_schema_change ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.64s
+## wu_d_proactive_wake_integration (incl. mid-turn notify live-race repro)
+test batch_cap_followup_wake ... ok
+test busy_then_turn_end_delivers ... ok
+test auto_wake_cap_stops_self_replicating_session ... ok
+test idle_wake_delivers ... ok
+test concurrent_notify_single_flight ... ok
+test manual_resume_race_is_safe ... ok
+test no_undelivered_no_wake_and_loop_terminates ... ok
+test opencode_mid_turn_notify_resolves_capture_time_sidecar_owner ... ok
+test opencode_notify_idle_wakes_resume_with_ses_session ... ok
+test provider_shadow_xdg_notify_uses_pinned_data_dir_and_wakes ... ok
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.06s
+## wu_b mailbox + wu_e pty delivery (regression)
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.80s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.24s
+## immunity spot-proof: age100 one-shot quota under POISON pin (was the live failure)
+test one_shot_all_pool_members_quota_exhausted_returns_blocked_all_providers_exhausted ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+## full-workspace immunity runs (executed by sweep agent at 9ba1275):
+poisoned: 300 suites, 2550 passed, 0 failed, 9 ignored
+clean:    300 suites, 2550 passed, 0 failed, 9 ignored
