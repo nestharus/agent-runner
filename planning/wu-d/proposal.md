@@ -441,13 +441,13 @@ Existing WU-B tests remain relevant and should continue to pass:
 - Resume prompt composition and delivered marking tests.
 - Batch cap and resolved active session id tests.
 
-## Proof Plan
+## Proof plan
 
 | Runtime claim | Proof method | Evidence-class match |
 |---|---|---|
 | Notify-triggered idle wake launches a detached resume that drains the mailbox and records delivery. | `src-tauri/tests/wu_d_proactive_wake_integration.rs::idle_wake_delivers`. | Invokes the compiled runner with isolated XDG/HOME, a fixture provider script, real sidecar state, and production notify/resume subprocesses; the resumed prompt and delivered mailbox row are runtime artifacts. |
 | Busy sessions defer wake until turn-end recheck, with one wake chain for queued work. | `src-tauri/tests/wu_d_proactive_wake_integration.rs::busy_then_turn_end_delivers`. | The provider remains live while notify calls run, so liveness and turn-end recheck are exercised through production runtime state rather than seeded-only assertions. |
-| Wake claims are single-flight and safe against manual-race overlap. | `src-tauri/tests/wu_d_proactive_wake_integration.rs::concurrent_notify_single_flight` and `manual_resume_race_is_safe`. | Concurrent compiled-runner notify/resume processes contend on the real `session_wake_claim` table; the assertions observe persisted claim and delivery effects. |
+| Wake claims are single-flight and safe against manual-race overlap. | `src-tauri/tests/wu_d_proactive_wake_integration.rs::concurrent_notify_single_flight` and `manual_resume_race_is_safe`. `concurrent_notify_single_flight` asserts exactly one notify response reports `wake.status="spawned"`, all non-null wake claim tokens collapse to one token, and the provider-side wake launch log has exactly one entry. | Concurrent compiled-runner notify/resume processes contend on the real `session_wake_claim` table; the assertions observe the wake diagnostic claim token artifact, final claim cleanup, delivered rows, and a detached wake-child launch log. This proves one claim winner and one wake child for concurrent notify rather than only eventual delivery. |
 | Auto-wake chains terminate on no pending rows, respect batch follow-up, and stop at the configured cap. | `src-tauri/tests/wu_d_proactive_wake_integration.rs::no_undelivered_no_wake_and_loop_terminates`, `batch_cap_followup_wake`, and `auto_wake_cap_stops_self_replicating_session`. | The tests set production auto-wake environment variables and observe real detached resume behavior, pending/delivered mailbox rows, and cap diagnostics through sidecar state. |
 
 ## Risks And Follow-Ups

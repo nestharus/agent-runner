@@ -19,20 +19,34 @@ pub(crate) fn prepare_headless_resume_delivery(
     answer: Option<String>,
     models_dir: Option<&Path>,
 ) -> Result<PreparedMailboxDelivery, String> {
-    let session_id = resolved.active_session_id.clone();
+    let session_id = delivery_session_id(resolved);
     let Some(mut db) = open_mailbox_sidecar()? else {
         return Ok(empty_delivery(answer, session_id));
     };
     record_headless_session_runtime(&mut db, resolved, models_dir)?;
-    let pending = db.list_pending(&session_id)?;
+    let pending = pending_mailbox_rows(&db, &session_id)?;
+    Ok(delivery_for_pending(session_id, pending, answer))
+}
+
+fn delivery_session_id(resolved: &oulipoly_state::ResolvedResume) -> String {
+    resolved.active_session_id.clone()
+}
+
+fn pending_mailbox_rows(db: &MailboxDb, session_id: &str) -> Result<Vec<MailboxRow>, String> {
+    db.list_pending(session_id)
+}
+
+fn delivery_for_pending(
+    session_id: String,
+    pending: Vec<MailboxRow>,
+    answer: Option<String>,
+) -> PreparedMailboxDelivery {
     if !has_pending_rows(&pending) {
-        return Ok(empty_delivery(answer, session_id));
+        return empty_delivery(answer, session_id);
     }
 
     let batch = select_batch(&pending);
-    let seqs = batch_seqs(&batch);
-    let prefix = render_notification_prefix(&batch.rows, batch.remaining_count);
-    Ok(prepared_delivery(session_id, seqs, prefix, answer))
+    delivery_for_batch(session_id, batch, answer)
 }
 
 fn open_mailbox_sidecar() -> Result<Option<MailboxDb>, String> {
@@ -53,6 +67,16 @@ fn has_pending_rows(rows: &[MailboxRow]) -> bool {
 
 fn batch_seqs(batch: &MailboxBatch) -> Vec<i64> {
     batch.rows.iter().map(|row| row.seq).collect()
+}
+
+fn delivery_for_batch(
+    session_id: String,
+    batch: MailboxBatch,
+    answer: Option<String>,
+) -> PreparedMailboxDelivery {
+    let seqs = batch_seqs(&batch);
+    let prefix = render_notification_prefix(&batch.rows, batch.remaining_count);
+    prepared_delivery(session_id, seqs, prefix, answer)
 }
 
 fn prepared_delivery(
@@ -118,26 +142,54 @@ fn models_dir_string(path: Option<&Path>) -> Option<String> {
 }
 
 fn select_batch(pending: &[MailboxRow]) -> MailboxBatch {
-    let mut rows = Vec::new();
-    for row in pending.iter().take(MAILBOX_BATCH_MAX_ROWS) {
-        rows.push(row.clone());
-        let remaining_count = pending.len().saturating_sub(rows.len());
-        if batch_exceeds_prefix_limit(&rows, remaining_count) {
-            rows.pop();
-            break;
-        }
-    }
-    if rows.is_empty() && !pending.is_empty() {
-        rows.push(pending[0].clone());
-    }
+    let prefix_lengths = candidate_prefix_lengths(pending);
+    select_batch_by_prefix_lengths(pending, &prefix_lengths)
+}
+
+fn candidate_prefix_lengths(pending: &[MailboxRow]) -> Vec<usize> {
+    (1..=candidate_count(pending))
+        .map(|row_count| candidate_prefix_len(pending, row_count))
+        .collect()
+}
+
+fn candidate_count(pending: &[MailboxRow]) -> usize {
+    pending.len().min(MAILBOX_BATCH_MAX_ROWS)
+}
+
+fn candidate_prefix_len(pending: &[MailboxRow], row_count: usize) -> usize {
+    let remaining_count = pending.len().saturating_sub(row_count);
+    notification_prefix_len(&pending[..row_count], remaining_count)
+}
+
+fn select_batch_by_prefix_lengths(
+    pending: &[MailboxRow],
+    prefix_lengths: &[usize],
+) -> MailboxBatch {
+    let selected_count = selected_batch_len(pending, prefix_lengths);
+    let rows = pending
+        .iter()
+        .take(selected_count)
+        .cloned()
+        .collect::<Vec<_>>();
     MailboxBatch {
         remaining_count: pending.len().saturating_sub(rows.len()),
         rows,
     }
 }
 
-fn batch_exceeds_prefix_limit(rows: &[MailboxRow], remaining_count: usize) -> bool {
-    notification_prefix_len(rows, remaining_count) > MAILBOX_PREFIX_MAX_BYTES && rows.len() > 1
+fn selected_batch_len(pending: &[MailboxRow], prefix_lengths: &[usize]) -> usize {
+    if pending.is_empty() {
+        return 0;
+    }
+    prefix_lengths
+        .iter()
+        .position(|length| *length > MAILBOX_PREFIX_MAX_BYTES)
+        .map(|index| selected_len_before_limit(index + 1))
+        .unwrap_or(prefix_lengths.len())
+}
+
+fn selected_len_before_limit(row_count: usize) -> usize {
+    if row_count > 1 { row_count - 1 } else { 1 }
 }
 
 fn notification_prefix_len(rows: &[MailboxRow], remaining_count: usize) -> usize {

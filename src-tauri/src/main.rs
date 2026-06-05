@@ -69,7 +69,9 @@ fn run_gui_entrypoint() -> ExitCode {
 }
 
 fn run_cli_entrypoint() -> ExitCode {
-    cli_exit_code(dispatch::run(parse_cli()))
+    let exit = cli_exit(dispatch::run(parse_cli()));
+    emit_cli_error_if_needed(&exit);
+    cli_exit_to_code(&exit)
 }
 
 fn initialize_tracing() {
@@ -94,12 +96,6 @@ fn cli_args() -> std::env::Args {
 
 fn arg_count(args: std::env::Args) -> usize {
     args.len()
-}
-
-fn cli_exit_code(result: Result<i32, String>) -> ExitCode {
-    let exit = cli_exit(result);
-    emit_cli_error_if_needed(&exit);
-    cli_exit_to_code(&exit)
 }
 
 fn cli_exit_to_code(exit: &CliExit) -> ExitCode {

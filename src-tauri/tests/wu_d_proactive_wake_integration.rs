@@ -388,20 +388,28 @@ notify_handle "h-auto-${count}" 0"#,
 fn concurrent_notify_single_flight() {
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
-    fixture.write_provider(&provider_script("", "", "concurrent-resume.txt"));
+    fixture.write_provider(&provider_script(
+        "",
+        r#"printf 'wake\n' >> "$work/concurrent-wake-launches.log"
+sleep 0.2"#,
+        "concurrent-resume.txt",
+    ));
     fixture.seed_session_turn();
     fixture.seed_idle_runtime();
     let identity = identity(9_200, "boot-concurrent", 123);
     fixture.record_identity(&identity);
 
-    let mut child_a = notify_command(&fixture, "h-concurrent-a", &identity)
+    let child_a = notify_command(&fixture, "h-concurrent-a", &identity)
         .spawn()
         .unwrap();
-    let mut child_b = notify_command(&fixture, "h-concurrent-b", &identity)
+    let child_b = notify_command(&fixture, "h-concurrent-b", &identity)
         .spawn()
         .unwrap();
-    assert!(child_a.wait().unwrap().success());
-    assert!(child_b.wait().unwrap().success());
+    let output_a = child_a.wait_with_output().unwrap();
+    let output_b = child_b.wait_with_output().unwrap();
+    assert_notify_success(&output_a);
+    assert_notify_success(&output_b);
+    assert_single_wake_claim_won(&[notify_wake(&output_a), notify_wake(&output_b)]);
 
     let prompt = wait_for_file(&fixture.prompt_file("concurrent-resume.txt"));
     assert!(prompt.contains("handle: h-concurrent-"), "{prompt}");
@@ -412,6 +420,9 @@ fn concurrent_notify_single_flight() {
             && rows.iter().all(|row| row.delivered_at.is_some())
             && db.wake_claim(SESSION).unwrap().is_none()
     });
+    assert_single_wake_child_launch(&wait_for_file(
+        &fixture.prompt_file("concurrent-wake-launches.log"),
+    ));
     assert!(fixture.mailbox().wake_claim(SESSION).unwrap().is_none());
     fixture.assert_xdg_isolated();
 }
@@ -525,10 +536,49 @@ fn notify_command(fixture: &Fixture, handle: &str, identity: &ProcessIdentity) -
         .env("AGENT_BASH_AGENT_RUNNER_BIN", runner_bin())
         .env("WU_D_WORK_DIR", &fixture.work_dir)
         .env_remove("OULIPOLY_PARENT_INVOCATION")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .current_dir(fixture.dir.path());
     cmd
+}
+
+fn assert_notify_success(output: &Output) {
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn notify_wake(output: &Output) -> Value {
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    response.get("wake").cloned().unwrap_or(Value::Null)
+}
+
+fn assert_single_wake_claim_won(wakes: &[Value]) {
+    let statuses = wakes
+        .iter()
+        .filter_map(|wake| wake.get("status").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    let spawned_count = statuses
+        .iter()
+        .filter(|status| **status == "spawned")
+        .count();
+    assert_eq!(spawned_count, 1, "wake statuses: {statuses:?}");
+
+    let mut claim_tokens = wakes
+        .iter()
+        .filter_map(|wake| wake.get("claim_token").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    claim_tokens.sort_unstable();
+    claim_tokens.dedup();
+    assert_eq!(claim_tokens.len(), 1, "wake diagnostics: {wakes:?}");
+}
+
+fn assert_single_wake_child_launch(log: &str) {
+    let launches = log.lines().filter(|line| *line == "wake").count();
+    assert_eq!(launches, 1, "wake launch log: {log:?}");
 }
 
 fn integration_test_lock() -> &'static Mutex<()> {

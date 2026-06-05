@@ -169,8 +169,8 @@ fn enqueue_owner_notification(
     rc: i32,
     owner: ResolvedOwner,
 ) -> Result<NotifyOutcome, NotifyError> {
-    let payload_json = payload_json(metadata, args, rc, &owner)?;
     let paths = notify_path_strings(args);
+    let payload_json = payload_json(metadata, args, rc, &owner, &paths)?;
     let enqueue = agent_bash_complete_enqueue(args, &payload_json, rc, &owner, &paths);
     let mut mailbox = MailboxDb::open_default().map_err(NotifyError::Storage)?;
     match mailbox
@@ -236,13 +236,19 @@ fn read_metadata(path: &Path) -> Result<Value, NotifyError> {
 }
 
 fn read_metadata_raw(path: &Path) -> Result<String, NotifyError> {
-    std::fs::read_to_string(path)
-        .map_err(|err| NotifyError::MalformedMetadata(format!("failed to read meta.json: {err}")))
+    std::fs::read_to_string(path).map_err(read_metadata_error)
 }
 
 fn parse_metadata_json(raw: &str) -> Result<Value, NotifyError> {
-    serde_json::from_str(raw)
-        .map_err(|err| NotifyError::MalformedMetadata(format!("failed to parse meta.json: {err}")))
+    serde_json::from_str(raw).map_err(parse_metadata_error)
+}
+
+fn read_metadata_error(err: std::io::Error) -> NotifyError {
+    NotifyError::MalformedMetadata(format!("failed to read meta.json: {err}"))
+}
+
+fn parse_metadata_error(err: serde_json::Error) -> NotifyError {
+    NotifyError::MalformedMetadata(format!("failed to parse meta.json: {err}"))
 }
 
 fn parse_caller_chain(metadata: &Value) -> Result<Vec<CallerIdentity>, NotifyError> {
@@ -350,11 +356,23 @@ fn owned_string(value: &str) -> String {
 }
 
 fn read_rc(path: &Path) -> Result<i32, NotifyError> {
-    let raw = std::fs::read_to_string(path)
-        .map_err(|err| NotifyError::MalformedMetadata(format!("failed to read rc file: {err}")))?;
-    raw.trim()
-        .parse::<i32>()
-        .map_err(|err| NotifyError::MalformedMetadata(format!("failed to parse rc file: {err}")))
+    parse_rc(&read_rc_raw(path)?)
+}
+
+fn read_rc_raw(path: &Path) -> Result<String, NotifyError> {
+    std::fs::read_to_string(path).map_err(read_rc_error)
+}
+
+fn parse_rc(raw: &str) -> Result<i32, NotifyError> {
+    raw.trim().parse::<i32>().map_err(parse_rc_error)
+}
+
+fn read_rc_error(err: std::io::Error) -> NotifyError {
+    NotifyError::MalformedMetadata(format!("failed to read rc file: {err}"))
+}
+
+fn parse_rc_error(err: std::num::ParseIntError) -> NotifyError {
+    NotifyError::MalformedMetadata(format!("failed to parse rc file: {err}"))
 }
 
 fn resolve_owner(chain: &[CallerIdentity]) -> Result<Option<ResolvedOwner>, NotifyError> {
@@ -399,14 +417,25 @@ fn owner_from_pid_row(
     entry: &CallerIdentity,
     row: &PidIdentityRow,
 ) -> Result<Option<ResolvedOwner>, NotifyError> {
-    if let Some(session_id) = row.session_id.clone() {
-        return Ok(Some(resolved_owner(
-            entry,
-            row,
-            session_id,
-            OwnerSessionSource::SidecarSessionId,
-        )));
+    if let Some(owner) = owner_from_sidecar_session(entry, row) {
+        return Ok(Some(owner));
     }
+    owner_from_state_invocation(entry, row)
+}
+
+fn owner_from_sidecar_session(
+    entry: &CallerIdentity,
+    row: &PidIdentityRow,
+) -> Option<ResolvedOwner> {
+    row.session_id.clone().map(|session_id| {
+        resolved_owner(entry, row, session_id, OwnerSessionSource::SidecarSessionId)
+    })
+}
+
+fn owner_from_state_invocation(
+    entry: &CallerIdentity,
+    row: &PidIdentityRow,
+) -> Result<Option<ResolvedOwner>, NotifyError> {
     Ok(resolve_state_invocation_session(row)?.map(|session_id| {
         resolved_owner(
             entry,
@@ -436,10 +465,17 @@ fn resolve_state_invocation_session(row: &PidIdentityRow) -> Result<Option<Strin
     let Some(state) = open_state_read_only_optional().map_err(NotifyError::Storage)? else {
         return Ok(None);
     };
-    let record = state
-        .get_invocation_by_uuid(&row.invocation_uuid)
-        .map_err(NotifyError::Storage)?;
+    let record = invocation_record_for_pid_row(&state, row)?;
     Ok(record.as_ref().and_then(resolved_invocation_session_id))
+}
+
+fn invocation_record_for_pid_row(
+    state: &StateDb,
+    row: &PidIdentityRow,
+) -> Result<Option<InvocationRecord>, NotifyError> {
+    state
+        .get_invocation_by_uuid(&row.invocation_uuid)
+        .map_err(NotifyError::Storage)
 }
 
 fn resolved_invocation_session_id(record: &InvocationRecord) -> Option<String> {
@@ -472,8 +508,9 @@ fn payload_json(
     args: &AgentBashCompleteArgs<'_>,
     rc: i32,
     owner: &ResolvedOwner,
+    paths: &NotifyPathStrings,
 ) -> Result<String, NotifyError> {
-    render_payload_json(&payload_value(metadata, args, rc, owner))
+    render_payload_json(&payload_value(metadata, args, rc, owner, paths))
 }
 
 fn payload_value(
@@ -481,16 +518,17 @@ fn payload_value(
     args: &AgentBashCompleteArgs<'_>,
     rc: i32,
     owner: &ResolvedOwner,
+    paths: &NotifyPathStrings,
 ) -> Value {
     serde_json::json!({
         "schema_version": 1,
         "kind": "agent_bash_complete",
         "handle": args.handle,
         "rc": rc,
-        "state_dir": path_string(args.state_dir),
-        "meta_path": path_string(args.meta),
-        "log_path": path_string(args.log),
-        "rc_path": path_string(args.rc),
+        "state_dir": paths.state_dir,
+        "meta_path": paths.meta_path,
+        "log_path": paths.log_path,
+        "rc_path": paths.rc_path,
         "owner": {
             "session_id": owner.session_id,
             "invocation_uuid": owner.invocation_uuid,
@@ -546,12 +584,18 @@ fn render_notify_error(
 ) -> Result<i32, String> {
     if args.json {
         render_notify_error_json(args, &render)?;
-    } else if let Some(message) = &render.message {
+    } else {
+        render_notify_error_human(&render);
+    }
+    Ok(render.exit_code)
+}
+
+fn render_notify_error_human(render: &NotifyErrorRender) {
+    if let Some(message) = &render.message {
         eprintln!("{}: {message}", render.status);
     } else {
         eprintln!("{}", render.status);
     }
-    Ok(render.exit_code)
 }
 
 fn render_notify_error_json(
@@ -618,20 +662,29 @@ fn notify_response(
 
 fn render_response(response: &NotifyResponse, json: bool) -> Result<(), String> {
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(response)
-                .map_err(|err| format!("Failed to render notify JSON: {err}"))?
-        );
+        render_response_json(response)?;
     } else {
-        println!(
-            "{} handle={} session={}",
-            response.status,
-            response.handle,
-            response.owner_session_id.as_deref().unwrap_or("-")
-        );
+        render_response_human(response);
     }
     Ok(())
+}
+
+fn render_response_json(response: &NotifyResponse) -> Result<(), String> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(response)
+            .map_err(|err| format!("Failed to render notify JSON: {err}"))?
+    );
+    Ok(())
+}
+
+fn render_response_human(response: &NotifyResponse) {
+    println!(
+        "{} handle={} session={}",
+        response.status,
+        response.handle,
+        response.owner_session_id.as_deref().unwrap_or("-")
+    );
 }
 
 fn path_string(path: &Path) -> String {
