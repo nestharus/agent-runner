@@ -699,6 +699,36 @@ fn topology_drift_route_harness() -> RouteHarness {
     }
 }
 
+fn opencode_five_account_harness() -> RouteHarness {
+    let fixture = ScriptFixture::new();
+    let exhausted = quota_output_body(100, &future_timestamp(24));
+    let healthy = quota_output_body(10, &future_timestamp(24));
+    let providers_cfg = providers_config_with_script_bodies(
+        &fixture,
+        &[
+            ("opencode", exhausted.as_str()),
+            ("opencode2", exhausted.as_str()),
+            ("opencode3", exhausted.as_str()),
+            ("opencode4", exhausted.as_str()),
+            ("opencode5", healthy.as_str()),
+        ],
+    );
+    RouteHarness {
+        _fixture: fixture,
+        db: open_memory_state(),
+        model: model_with(&[
+            "opencode",
+            "opencode2",
+            "opencode3",
+            "opencode4",
+            "opencode5",
+        ]),
+        providers_cfg,
+        sessions_cfg: SessionsConfig::default(),
+        in_flight: InFlight::new(),
+    }
+}
+
 #[test]
 fn age_35_select_provider_with_balance_context_refreshes_stale_quotas_and_scans_sessions() {
     let harness = live_route_harness();
@@ -810,6 +840,32 @@ fn age_35_production_routing_service_matches_direct_select_provider_cached_only(
     );
     assert_cached_route_has_no_live_side_effects(&harness.direct_db, "direct select_provider");
     assert_cached_route_has_no_live_side_effects(&harness.service_db, "ProductionRoutingService");
+}
+
+#[test]
+fn opencode_five_account_quota_scripts_route_healthy_accounts() {
+    let harness = opencode_five_account_harness();
+
+    let selected = select_service_with_context(&harness);
+
+    assert_selected_index(
+        selected,
+        4,
+        "routing must skip exhausted opencode accounts and select the healthy fifth account",
+    );
+    for provider in [
+        "opencode",
+        "opencode2",
+        "opencode3",
+        "opencode4",
+        "opencode5",
+    ] {
+        assert_eq!(
+            harness.db.get_windows(provider).unwrap().len(),
+            1,
+            "fake quota script should have refreshed {provider}"
+        );
+    }
 }
 
 #[test]

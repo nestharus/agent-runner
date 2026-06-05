@@ -34,6 +34,7 @@ use std::sync::Arc;
 pub use self::providers::claude::Recognizer as ClaudeRecognizer;
 pub use self::providers::codex::Recognizer as CodexRecognizer;
 pub use self::providers::openai_compat::Recognizer as OpenAiCompatRecognizer;
+pub use self::providers::opencode::Recognizer as OpenCodeRecognizer;
 /// Executor facade terminal-signal DTO re-export.
 ///
 /// Negative guard: `oulipoly_runtime::executor::TerminalSignalKind` must not

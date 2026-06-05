@@ -289,6 +289,11 @@ mod tests {
     }
 
     #[test]
+    fn trait_object_polymorphism_matches_static_call_for_opencode() {
+        assert_dyn_matches_static("opencode", providers::opencode::Recognizer);
+    }
+
+    #[test]
     fn terminal_signal_kind_maybe_quota_exhausted_round_trips() {
         assert_terminal_signal_round_trip(TerminalSignalKind::MaybeQuotaExhausted);
         assert_eq!(

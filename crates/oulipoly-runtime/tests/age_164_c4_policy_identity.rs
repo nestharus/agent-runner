@@ -2,10 +2,10 @@
 //!
 //! Verifies the runtime-owned provider-identity intrinsic surface:
 //!
-//!   The bounded set of recognized providers is `claude`, `codex`, and the
-//!   default `openai_compat` fallback. The recognition uses `provider.name`
-//!   prefix (`starts_with("claude"|"codex")`) AND/OR the command executable
-//!   token (after env-prefix/option skipping and basename normalization).
+//!   The bounded set of recognized providers is the two original CLI families,
+//!   OpenCode, and the default OpenAI-compatible fallback. Recognition uses
+//!   account-name prefixes and/or the command executable token after env-prefix,
+//!   option skipping, and basename normalization.
 //!   These tests pin that bounded set without depending on private helper
 //!   names — the verification is via observable policy-driven argv shape.
 //!
@@ -248,8 +248,8 @@ fn provider_name_empty_falls_back_to_input_string() {
 // ---------------------------------------------------------------------------
 // ACR-205 intrinsic-surface verification (PP-002): bounded provider set.
 //
-// The runtime identity domain has exactly three values: `Claude`, `Codex`,
-// and an `OpenAiCompat` fallback. We pin this through the OBSERVABLE effects:
+// The runtime identity domain has exactly four values: `Claude`, `Codex`,
+// `OpenCode`, and an `OpenAiCompat` fallback. We pin this through the OBSERVABLE effects:
 // applying Claude tool_restrictions to a provider whose name and command both
 // suggest "claude" produces `--disallowed-tools ...`; doing the same with a
 // name "codex" produces a Codex policy block (`<<<NESTHARUS-POLICY>>>` etc.

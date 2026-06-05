@@ -3,7 +3,8 @@
 
 use chrono::{DateTime, Utc};
 use oulipoly_config::{
-    ModelConfig, PromptMode, ProviderConfig, provider_implementation_ref::ProviderImplementationRef,
+    ModelConfig, PromptMode, ProviderConfig, SessionSourceEntry, SessionsConfig,
+    provider_implementation_ref::ProviderImplementationRef,
 };
 use oulipoly_provider::client::ProviderClientOptions;
 use oulipoly_runtime::provider_registry::{
@@ -19,6 +20,7 @@ use oulipoly_runtime::session_provider::{
 use oulipoly_state::{InvocationStart, StateDb};
 use rusqlite::{Connection, params};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fmt::Display;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -33,6 +35,7 @@ const PROVIDER_INSTANCE_ID: &str = "provider-a-instance";
 const SETTINGS_ID: &str = "provider-a-test-settings";
 const SESSION_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const HOSTILE_SESSION_ID: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const OPENCODE_SESSION_ID: &str = "ses_fixture";
 
 struct Fixture {
     dir: tempfile::TempDir,
@@ -626,6 +629,45 @@ fn external_provider_read_turns_ingest_uses_owned_interface_and_host_idempotency
             ),
         ]
     );
+}
+
+#[test]
+fn opencode_read_turns_ingests_normalized_jsonl() {
+    let fixture = tempfile::tempdir().expect("tempdir");
+    let state = StateDb::open(&fixture.path().join("state.db")).expect("state db");
+    let opencode_root = fixture.path().join("opencode-data");
+    let message_dir = opencode_root
+        .join("storage")
+        .join("message")
+        .join(OPENCODE_SESSION_ID);
+    fs::create_dir_all(&message_dir).expect("message dir");
+    fs::write(
+        message_dir.join("msg_user.json"),
+        r#"{"id":"msg_user","sessionID":"ses_fixture","timestamp":"2026-05-01T00:00:01Z","role":"user","parts":[{"type":"text","text":"hello"}]}"#,
+    )
+    .expect("user message");
+    fs::write(
+        message_dir.join("msg_assistant.json"),
+        r#"{"id":"msg_assistant","timestamp":"2026-05-01T00:00:02Z","role":"assistant","content":[{"type":"text","text":"world"}]}"#,
+    )
+    .expect("assistant message");
+    let sessions_cfg = opencode_sessions_config(
+        &repo_script_path("opencode-turns"),
+        &opencode_root,
+        &fixture.path().join("cursor"),
+    );
+
+    let report = oulipoly_runtime::sessions::scan_provider("opencode", &sessions_cfg, &state);
+    let repeated = oulipoly_runtime::sessions::scan_provider("opencode", &sessions_cfg, &state);
+    let counts = state
+        .count_session_turns("opencode", OPENCODE_SESSION_ID)
+        .expect("count turns");
+
+    assert_eq!(report.errors, Vec::<String>::new());
+    assert_eq!(report.new_turns, 2);
+    assert_eq!(repeated.new_turns, 0);
+    assert_eq!(counts.total, 2);
+    assert_eq!(counts.assistant, 1);
 }
 
 #[test]
@@ -1270,4 +1312,36 @@ print(json.dumps(response))
 
 fn json_string(path: &Path) -> String {
     serde_json::to_string(&path.display().to_string()).expect("json path")
+}
+
+fn repo_script_path(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("scripts")
+        .join(name)
+}
+
+fn opencode_sessions_config(
+    script_path: &Path,
+    opencode_root: &Path,
+    state_dir: &Path,
+) -> SessionsConfig {
+    SessionsConfig {
+        entries: HashMap::from([(
+            "opencode".to_string(),
+            SessionSourceEntry {
+                turn_script: format!(
+                    "{} {}",
+                    shell_single_quote_path(script_path),
+                    shell_single_quote_path(opencode_root)
+                ),
+                transcript_locator: None,
+                state_dir: Some(state_dir.to_path_buf()),
+            },
+        )]),
+    }
+}
+
+fn shell_single_quote_path(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }

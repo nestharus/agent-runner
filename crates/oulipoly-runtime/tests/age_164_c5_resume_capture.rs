@@ -21,8 +21,12 @@
 //!
 //! ### Resume missing-session phrase set (PP-009)
 //! - Lowercase substring matching for `"no conversation found"` and
-//!   `"no session found"`; the mapped result evidence is
+//!   `"no session found"`, plus fixture-backed OpenCode placeholders
+//!   `"session not found"`, `"session <id> not found"`,
+//!   `"session does not exist"`, and `"session id mismatch"`; the mapped result evidence is
 //!   `"resume_session_mismatch: provider reported missing session"`.
+//!   TODO(opencode): replace/trim the placeholder phrases after a fake-isolated
+//!   live OpenCode bad-`--session` sandbox identifies the exact wording.
 //!
 //! These constitute the ACR-251 canonical-doc-as-schema declaration for
 //! the three pull sites. Step 6c MUST publish the same schema via rustdoc
@@ -1072,6 +1076,35 @@ fn acr251_pp009_no_session_found_lowercase_matches() {
     let acceptance = result
         .resume_acceptance
         .expect("resume acceptance populated");
+    assert_eq!(acceptance.status, ResumeAcceptanceStatus::Rejected);
+    assert_eq!(
+        acceptance.evidence.as_deref(),
+        Some("resume_session_mismatch: provider reported missing session")
+    );
+}
+
+#[test]
+fn opencode_placeholder_session_not_found_phrase_maps_to_resume_session_mismatch() {
+    let (_dir, path) = script(r#"printf 'Error: session ses_fixture not found\n' >&2; exit 1"#);
+    let provider = provider_for(&path);
+    let strategy = flag_strategy();
+    let result = execute_resume(
+        &provider,
+        0,
+        PromptMode::Arg,
+        "prompt",
+        None,
+        None,
+        ResumePayload {
+            session_id: "ses_fixture",
+            strategy: &strategy,
+        },
+    )
+    .expect("resume execute");
+    let acceptance = result
+        .resume_acceptance
+        .expect("resume acceptance populated");
+
     assert_eq!(acceptance.status, ResumeAcceptanceStatus::Rejected);
     assert_eq!(
         acceptance.evidence.as_deref(),

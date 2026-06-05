@@ -32,14 +32,16 @@
 //! ```
 //!
 //! The runtime owns the provider-identity domain as an intrinsic surface.
-//! The bounded set of recognized providers is **exactly three**:
+//! The bounded set of recognized providers is **exactly four**:
 //!
 //! - `claude` — selected when `provider.name` starts with `"claude"` OR when
 //!   the recognized command executable basename starts with `"claude"`.
 //! - `codex` — selected when `provider.name` starts with `"codex"` OR when
 //!   the recognized command executable basename starts with `"codex"`.
+//! - `opencode` — selected when `provider.name` starts with `"opencode"` OR when
+//!   the recognized command executable basename starts with `"opencode"`.
 //! - `openai_compat` — the default fallback for any provider that does not
-//!   match either Claude or Codex.
+//!   match Claude, Codex, or OpenCode.
 //!
 //! The recognition rule walks tokens after `shell_split`-splitting
 //! `provider.command` and concatenating `provider.args`; `env`/`/.../env`
@@ -76,6 +78,7 @@ use oulipoly_config::{ProviderConfig, ToolRestrictionKind};
 pub(super) enum ProviderRecognizer {
     Claude,
     Codex,
+    OpenCode,
     OpenAiCompat,
 }
 
@@ -87,6 +90,9 @@ impl ProviderRecognizer {
             Self::Claude
         } else if provider.name.starts_with("codex") || command_provider.starts_with("codex") {
             Self::Codex
+        } else if provider.name.starts_with("opencode") || command_provider.starts_with("opencode")
+        {
+            Self::OpenCode
         } else {
             Self::OpenAiCompat
         }
@@ -97,6 +103,7 @@ impl ProviderRecognizer {
         match self {
             Self::Claude => crate::executor::providers::claude::Recognizer.recognize(evidence),
             Self::Codex => crate::executor::providers::codex::Recognizer.recognize(evidence),
+            Self::OpenCode => crate::executor::providers::opencode::Recognizer.recognize(evidence),
             Self::OpenAiCompat => {
                 crate::executor::providers::openai_compat::Recognizer.recognize(evidence)
             }

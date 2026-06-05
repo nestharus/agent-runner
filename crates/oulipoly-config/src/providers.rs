@@ -1213,6 +1213,9 @@ json_args = ["--format", "json"]
 event_type = "step_start"
 event_id_path = "sessionID"
 
+[opencode.resume_acceptance]
+rejected_output_patterns = ["session not found", "session does not exist", "session id mismatch"]
+
 [opencode2]
 command = "opencode2"
 prompt_mode = "arg"
@@ -1222,6 +1225,9 @@ kind = "stdout_json_event"
 json_args = ["--format", "json"]
 event_type = "step_start"
 event_id_path = "sessionID"
+
+[opencode2.resume_acceptance]
+rejected_output_patterns = ["session not found", "session does not exist", "session id mismatch"]
 
 [opencode3]
 command = "opencode3"
@@ -1233,6 +1239,9 @@ json_args = ["--format", "json"]
 event_type = "step_start"
 event_id_path = "sessionID"
 
+[opencode3.resume_acceptance]
+rejected_output_patterns = ["session not found", "session does not exist", "session id mismatch"]
+
 [opencode4]
 command = "opencode4"
 prompt_mode = "arg"
@@ -1243,6 +1252,9 @@ json_args = ["--format", "json"]
 event_type = "step_start"
 event_id_path = "sessionID"
 
+[opencode4.resume_acceptance]
+rejected_output_patterns = ["session not found", "session does not exist", "session id mismatch"]
+
 [opencode5]
 command = "opencode5"
 prompt_mode = "arg"
@@ -1252,6 +1264,9 @@ kind = "stdout_json_event"
 json_args = ["--format", "json"]
 event_type = "step_start"
 event_id_path = "sessionID"
+
+[opencode5.resume_acceptance]
+rejected_output_patterns = ["session not found", "session does not exist", "session id mismatch"]
 "#
         )
         .unwrap();
@@ -1277,6 +1292,19 @@ event_id_path = "sessionID"
             assert_eq!(capture.event_type.as_deref(), Some("step_start"));
             assert_eq!(capture.event_id_path.as_deref(), Some("sessionID"));
             assert!(capture.last_message_flag.is_none());
+            assert_eq!(
+                cfg.entries
+                    .get(name)
+                    .and_then(|entry| entry.resume_acceptance.as_ref())
+                    .and_then(|rules| rules.rejected_output_patterns.as_deref()),
+                Some(
+                    &[
+                        "session not found".to_string(),
+                        "session does not exist".to_string(),
+                        "session id mismatch".to_string(),
+                    ][..]
+                )
+            );
         }
     }
 

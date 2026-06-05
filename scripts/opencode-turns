@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""
+Reference adapter: emit OpenCode session messages as normalized JSONL.
+
+Usage: opencode-turns BASE_DIR
+   e.g. opencode-turns ~/.local/share/opencode
+
+Expected native layout:
+  BASE_DIR/storage/message/ses_<id>/msg_*.json
+
+The runner sets STATE_DIR to a writable dir for incremental bookkeeping. We
+track the highest mtime emitted; subsequent runs skip files unchanged since.
+
+Emits one JSON object per line on stdout:
+  {"session_id":"ses_...","turn_id":"msg_...","timestamp":"<rfc3339>","role":"user|assistant","body":[{"type":"text","text":"..."}]}
+"""
+
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def text_chunk(text: str) -> dict:
+    return {"type": "text", "text": text}
+
+
+def canonical_chunk_type(native_type) -> str:
+    if not isinstance(native_type, str):
+        return "text"
+    if native_type in ("input_text", "output_text", "markdown"):
+        return "text"
+    return native_type
+
+
+def extract_content_chunks(value) -> list:
+    if isinstance(value, str):
+        return [text_chunk(value)]
+    if isinstance(value, list):
+        chunks = []
+        for item in value:
+            chunks.extend(extract_content_chunks(item))
+        return chunks
+    if isinstance(value, dict):
+        text = value.get("text")
+        if text is None:
+            text = value.get("content")
+        if isinstance(text, str):
+            native_type = value.get("type") or "text"
+            return [{"type": canonical_chunk_type(native_type), "text": text}]
+        for key in ("parts", "content", "message"):
+            chunks = extract_content_chunks(value.get(key))
+            if chunks:
+                return chunks
+    return []
+
+
+def message_roots(base: Path) -> list:
+    candidates = []
+    if base.name == "message":
+        candidates.append(base)
+    candidates.append(base / "storage" / "message")
+    candidates.append(base / "message")
+    seen = set()
+    roots = []
+    for candidate in candidates:
+        resolved = candidate.expanduser()
+        key = str(resolved)
+        if key not in seen and resolved.exists():
+            seen.add(key)
+            roots.append(resolved)
+    return roots
+
+
+def message_paths(base: Path) -> list:
+    paths = []
+    for root in message_roots(base):
+        paths.extend(root.glob("ses_*/msg_*.json"))
+    if not paths:
+        paths.extend(base.glob("**/ses_*/msg_*.json"))
+    return sorted(set(paths))
+
+
+def read_cursor(state_dir: Path) -> int:
+    cursor_file = state_dir / "last_mtime"
+    if not cursor_file.exists():
+        return 0
+    try:
+        return int(cursor_file.read_text().strip())
+    except ValueError:
+        return 0
+
+
+def write_cursor(state_dir: Path, value: int) -> None:
+    (state_dir / "last_mtime").write_text(str(value))
+
+
+def numeric_timestamp(value) -> str | None:
+    if not isinstance(value, (int, float)):
+        return None
+    seconds = value / 1000 if value > 10_000_000_000 else value
+    return datetime.fromtimestamp(seconds, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def timestamp_from_obj(obj: dict, path: Path) -> str:
+    for key in ("timestamp", "createdAt", "created_at", "time"):
+        value = obj.get(key)
+        if isinstance(value, str) and value:
+            return value
+        converted = numeric_timestamp(value)
+        if converted:
+            return converted
+    return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat().replace(
+        "+00:00", "Z"
+    )
+
+
+def session_id_from_obj(obj: dict, path: Path) -> str | None:
+    for key in ("sessionID", "sessionId", "session_id"):
+        value = obj.get(key)
+        if isinstance(value, str) and value:
+            return value
+    for parent in path.parents:
+        if parent.name.startswith("ses_"):
+            return parent.name
+    return None
+
+
+def role_from_obj(obj: dict) -> str | None:
+    value = obj.get("role")
+    if value in ("user", "assistant"):
+        return value
+    message = obj.get("message")
+    if isinstance(message, dict) and message.get("role") in ("user", "assistant"):
+        return message.get("role")
+    return None
+
+
+def turn_id_from_obj(obj: dict, path: Path) -> str:
+    for key in ("id", "messageID", "messageId", "message_id"):
+        value = obj.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return path.stem
+
+
+def record_from_message(path: Path, obj: dict) -> dict | None:
+    session_id = session_id_from_obj(obj, path)
+    role = role_from_obj(obj)
+    if not session_id or not role:
+        return None
+    record = {
+        "session_id": session_id,
+        "turn_id": turn_id_from_obj(obj, path),
+        "timestamp": timestamp_from_obj(obj, path),
+        "role": role,
+    }
+    body = extract_content_chunks(obj.get("parts")) or extract_content_chunks(
+        obj.get("content")
+    ) or extract_content_chunks(obj.get("message"))
+    if body:
+        record["body"] = body
+    return record
+
+
+def emit_file(path: Path, out) -> None:
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(obj, dict):
+        return
+    record = record_from_message(path, obj)
+    if not record:
+        return
+    out.write(json.dumps(record, separators=(",", ":")))
+    out.write("\n")
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        print("usage: opencode-turns BASE_DIR", file=sys.stderr)
+        return 2
+    base = Path(sys.argv[1]).expanduser()
+    state_dir = Path(os.environ.get("STATE_DIR", "/tmp/opencode-turns-state"))
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+    last_mtime = read_cursor(state_dir)
+    new_max = last_mtime
+    out = sys.stdout
+    for path in message_paths(base):
+        try:
+            mtime = int(path.stat().st_mtime)
+        except OSError:
+            continue
+        if mtime <= last_mtime:
+            continue
+        new_max = max(new_max, mtime)
+        emit_file(path, out)
+
+    write_cursor(state_dir, new_max)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

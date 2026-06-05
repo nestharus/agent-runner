@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const BUILTIN_PROVIDER: &str = "neutral-built-in-provider";
+const OPENCODE_PROVIDER: &str = "opencode";
 const UNRELATED_MODEL: &str = "neutral-unrelated-external-model";
 
 struct ScriptFixture {
@@ -82,11 +83,15 @@ fn provider_ref_path(path: &Path) -> ProviderImplementationRef {
 }
 
 fn builtin_model_for_command(command: &str) -> ModelConfig {
+    builtin_model_for_provider_command(BUILTIN_PROVIDER, command)
+}
+
+fn builtin_model_for_provider_command(provider_name: &str, command: &str) -> ModelConfig {
     ModelConfig {
         name: "neutral-built-in-terminal-model".to_string(),
         prompt_mode: PromptMode::Arg,
         providers: vec![ProviderConfig {
-            name: BUILTIN_PROVIDER.to_string(),
+            name: provider_name.to_string(),
             command: command.to_string(),
             args: Vec::new(),
             interactive_args: None,
@@ -101,6 +106,10 @@ fn builtin_model_for_command(command: &str) -> ModelConfig {
         inputs: Vec::new(),
         provider: None,
     }
+}
+
+fn opencode_builtin_model_for_command(command: &str) -> ModelConfig {
+    builtin_model_for_provider_command(OPENCODE_PROVIDER, command)
 }
 
 fn unrelated_external_model(script: &ScriptFixture) -> ModelConfig {
@@ -141,6 +150,20 @@ fn assert_unrelated_registry_is_populated(registry: &ProviderRegistry) {
 fn direct_execute(model: &ModelConfig) -> Result<executor::ExecutionResult, String> {
     let extra_inputs = empty_extra_inputs();
     invoke_direct_execute(direct_execute_request(model, &extra_inputs))
+}
+
+fn execute_opencode_fixture(body: &str) -> ExecutionPair {
+    let script = fixture_script("opencode-built-in.sh", body);
+    let model = opencode_builtin_model_for_command(&script.path.to_string_lossy());
+    let unrelated = fixture_script(
+        "neutral-unrelated-provider.sh",
+        "printf 'unrelated external provider should not run\\n'",
+    );
+    let registry = unrelated_registry(&unrelated);
+    let direct = direct_execute(&model).expect("direct opencode execution should succeed");
+    let service =
+        service_execute(registry, model).expect("service opencode execution should succeed");
+    ExecutionPair { direct, service }
 }
 
 fn empty_extra_inputs() -> HashMap<String, Vec<String>> {
@@ -487,4 +510,56 @@ fn builtin_no_ref_does_not_invoke_unrelated_provider_registry_for_terminal_class
         assert_service_signal_provider_is_builtin(&pair);
     }
     assert_counter_unchanged(counter.path());
+}
+
+#[test]
+fn opencode_json_error_429_is_rate_limited() {
+    let pair = execute_opencode_fixture(
+        r#"printf '%s\n' '{"type":"error","sessionID":"ses_fixture","error":{"data":{"message":"Rate limit exceeded","statusCode":429}}}'
+exit 1"#,
+    );
+
+    for (label, result) in [("direct", &pair.direct), ("service", &pair.service)] {
+        let signal = terminal_signal(result);
+        assert_eq!(signal.kind, TerminalSignalKind::RateLimited, "{label}");
+        assert_eq!(signal.provider_name, OPENCODE_PROVIDER, "{label}");
+        assert!(
+            signal.evidence.contains("Rate limit exceeded"),
+            "{label}: evidence={:?}",
+            signal.evidence
+        );
+        assert_eq!(
+            result.terminal_reason.as_deref(),
+            Some("rate_limited"),
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn opencode_json_error_persistent_quota_is_quota_exhausted() {
+    let pair = execute_opencode_fixture(
+        r#"printf '%s\n' '{"type":"error","sessionID":"ses_fixture","error":{"data":{"message":"Insufficient quota for this account"}}}' >&2
+exit 1"#,
+    );
+
+    for (label, result) in [("direct", &pair.direct), ("service", &pair.service)] {
+        let signal = terminal_signal(result);
+        assert_eq!(
+            signal.kind,
+            TerminalSignalKind::QuotaExhaustedInband,
+            "{label}"
+        );
+        assert_eq!(signal.provider_name, OPENCODE_PROVIDER, "{label}");
+        assert!(
+            signal.evidence.contains("Insufficient quota"),
+            "{label}: evidence={:?}",
+            signal.evidence
+        );
+        assert_eq!(
+            result.terminal_reason.as_deref(),
+            Some("quota_exhausted_inband"),
+            "{label}"
+        );
+    }
 }
