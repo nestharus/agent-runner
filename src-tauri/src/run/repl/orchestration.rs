@@ -299,11 +299,12 @@ fn execute_and_finalize_repl_attempt(input: ReplExecutionInput<'_, '_>) -> Resul
         input.resume_session_id,
     );
 
-    match executor::cli::execute_interactive_with_result(
+    match executor::cli::execute_interactive_with_result_and_model_identity(
         input.provider,
         repl_execution_cwd(input.resume_spawn_cwd, input.working_dir),
         Some(input.invocation_env),
         resume_payload,
+        Some(&input.model.name),
     ) {
         Ok(mut result) => {
             classify_repl_result(

@@ -250,6 +250,26 @@ pub(crate) enum SessionSubcommands {
         #[arg(long)]
         ttl_ms: Option<u64>,
     },
+    /// Resolve a live OS PID to its verified sidecar session identity.
+    OfPid {
+        pid: u32,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Return whether a live OS PID is sidecar-recorded and identity-verified.
+    Alive {
+        pid: u32,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Resolve a live OS PID and print its invocation subtree.
+    Subtree {
+        pid: u32,
+        #[arg(long)]
+        json: bool,
+        #[arg(long, default_value = "64")]
+        max_depth: usize,
+    },
     /// Release a previously acquired advisory pause lease.
     ResumeHandshake {
         session_id: String,

@@ -279,6 +279,17 @@ fn dispatch_session_subcommand(
                 agent_runtime_services,
             )
         }
+        SessionSubcommands::OfPid { pid, json } => {
+            crate::commands::pid_session::run_of_pid(pid, json)
+        }
+        SessionSubcommands::Alive { pid, json } => {
+            crate::commands::pid_session::run_alive(pid, json)
+        }
+        SessionSubcommands::Subtree {
+            pid,
+            json,
+            max_depth,
+        } => crate::commands::pid_session::run_subtree(pid, json, max_depth),
         SessionSubcommands::ResumeHandshake { session_id, token } => {
             crate::commands::handshake::run_resume_handshake(
                 &session_id,

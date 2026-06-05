@@ -4,6 +4,7 @@ pub(crate) mod diagnostics;
 pub(crate) mod direct_model;
 pub(crate) mod handshake;
 pub(crate) mod migrate;
+pub(crate) mod pid_session;
 pub(crate) mod resume_list;
 pub(crate) mod schema_probe;
 pub(crate) mod session_external_provider_identity;

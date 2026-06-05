@@ -30,6 +30,7 @@ use super::launch::build_command;
 use super::policy::apply_provider_policy;
 use super::provider_identity::ProviderRecognizer;
 use super::resume::{ResumePayload, compose_resume_provider_args};
+use super::spawn_identity::{context_from_parent_invocation_env, record_child_identity};
 use super::terminal_signal;
 use oulipoly_config::ProviderConfig;
 use std::path::Path;
@@ -58,9 +59,26 @@ pub fn execute_interactive_with_result(
     parent_invocation_env: Option<&str>,
     resume: Option<ResumePayload<'_>>,
 ) -> Result<InteractiveExecutionResult, String> {
+    execute_interactive_with_result_and_model_identity(
+        provider,
+        working_dir,
+        parent_invocation_env,
+        resume,
+        None,
+    )
+}
+
+pub fn execute_interactive_with_result_and_model_identity(
+    provider: &ProviderConfig,
+    working_dir: Option<&Path>,
+    parent_invocation_env: Option<&str>,
+    resume: Option<ResumePayload<'_>>,
+    model_name: Option<&str>,
+) -> Result<InteractiveExecutionResult, String> {
     let mut provider_args = validated_interactive_args(provider)?;
     let mut no_prompt = None;
     apply_provider_policy(provider, &mut provider_args, &mut no_prompt)?;
+    let resume_session_id = resume.as_ref().map(|resume| resume.session_id);
     if let Some(resume) = resume {
         provider_args = compose_resume_provider_args(provider_args, resume)?;
     }
@@ -82,6 +100,13 @@ pub fn execute_interactive_with_result(
 
     #[cfg(unix)]
     let signal_guard = terminal_signal::InteractiveSignalGuard::install(&mut child)?;
+    let spawn_identity = context_from_parent_invocation_env(
+        parent_invocation_env,
+        &provider.name,
+        model_name,
+        resume_session_id,
+    );
+    record_child_identity(child.id(), spawn_identity.as_ref());
 
     let status = child
         .wait()

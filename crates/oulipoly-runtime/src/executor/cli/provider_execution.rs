@@ -21,10 +21,15 @@
 use super::ipc;
 use super::launch::{ProviderLaunch, ProviderLaunchRequest, assemble_provider_launch};
 use super::result::{RawResult, raw_result_from_supervised_output};
+use super::spawn_identity::SpawnIdentityContext;
 use super::supervision::{SupervisorConfig, run_provider_supervisor};
 use oulipoly_config::{PromptMode, ProviderConfig};
 use std::path::{Path, PathBuf};
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "executor provider launch keeps prompt mode, cwd, inputs, parent marker, start-bound session, and optional spawn identity explicit"
+)]
 pub(super) fn execute_provider(
     provider: &ProviderConfig,
     prompt_mode: PromptMode,
@@ -33,6 +38,7 @@ pub(super) fn execute_provider(
     input_args: &[String],
     parent_invocation_env: Option<&str>,
     start_known_provider_session_id: Option<&str>,
+    spawn_identity: Option<SpawnIdentityContext>,
 ) -> Result<(RawResult, Vec<PathBuf>), String> {
     execute_provider_with_arg_parts_and_supervisor_config(
         provider,
@@ -44,13 +50,14 @@ pub(super) fn execute_provider(
         input_args,
         parent_invocation_env,
         start_known_provider_session_id,
+        spawn_identity,
         None,
     )
 }
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "executor call shape keeps base args, lifecycle tail args, prompt mode, cwd, input flags, parent marker, optional start-bound session, and optional supervisor test injection explicit"
+    reason = "executor call shape keeps base args, lifecycle tail args, prompt mode, cwd, input flags, parent marker, optional start-bound session, optional spawn identity, and optional supervisor test injection explicit"
 )]
 pub(super) fn execute_provider_with_arg_parts_and_supervisor_config(
     provider: &ProviderConfig,
@@ -62,6 +69,7 @@ pub(super) fn execute_provider_with_arg_parts_and_supervisor_config(
     input_args: &[String],
     parent_invocation_env: Option<&str>,
     start_known_provider_session_id: Option<&str>,
+    spawn_identity: Option<SpawnIdentityContext>,
     supervisor_config: Option<SupervisorConfig>,
 ) -> Result<(RawResult, Vec<PathBuf>), String> {
     let launch = assemble_provider_launch(
@@ -85,7 +93,8 @@ pub(super) fn execute_provider_with_arg_parts_and_supervisor_config(
         return_channel,
         temp_files,
     } = launch;
-    let output = run_provider_supervisor(cmd, provider, supervisor_config)?;
+    let output =
+        run_provider_supervisor(cmd, provider, supervisor_config, spawn_identity.as_ref())?;
     let returned_artifacts = ipc::read_and_cleanup_return_channel(&return_channel);
     let result = raw_result_from_supervised_output(&capture_plan, output, returned_artifacts);
 

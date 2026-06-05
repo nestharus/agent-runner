@@ -24,6 +24,7 @@ use super::super::{ExecutionResult, SessionCaptureMethod, SessionCaptureResult};
 use super::provider_execution::execute_provider_with_arg_parts_and_supervisor_config;
 use super::result::{cleanup_temp_files, execution_result_from_raw};
 use super::resume::{ResumePayload, classify_resume_acceptance, compose_resume_args};
+use super::spawn_identity::context_from_parent_invocation_env;
 use super::supervision::SupervisorConfig;
 use oulipoly_config::{PromptMode, ProviderConfig};
 use std::path::Path;
@@ -66,6 +67,34 @@ pub fn execute_resume_optional_prompt(
         parent_invocation_env,
         resume,
         None,
+        None,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "resume execution facade keeps provider, prompt, cwd, parent marker, resume payload, and spawn model identity explicit"
+)]
+pub fn execute_resume_optional_prompt_with_model_identity(
+    provider: &ProviderConfig,
+    provider_index: usize,
+    prompt_mode: PromptMode,
+    prompt: Option<&str>,
+    working_dir: Option<&Path>,
+    parent_invocation_env: Option<&str>,
+    resume: ResumePayload<'_>,
+    model_name: &str,
+) -> Result<ExecutionResult, String> {
+    execute_resume_with_optional_supervisor_config(
+        provider,
+        provider_index,
+        prompt_mode,
+        prompt,
+        working_dir,
+        parent_invocation_env,
+        resume,
+        Some(model_name),
+        None,
     )
 }
 
@@ -81,6 +110,7 @@ fn execute_resume_with_optional_supervisor_config(
     working_dir: Option<&Path>,
     parent_invocation_env: Option<&str>,
     resume: ResumePayload<'_>,
+    model_name: Option<&str>,
     supervisor_config: Option<SupervisorConfig>,
 ) -> Result<ExecutionResult, String> {
     let session_id = resume.session_id.to_string();
@@ -97,6 +127,12 @@ fn execute_resume_with_optional_supervisor_config(
         &[],
         parent_invocation_env,
         None,
+        context_from_parent_invocation_env(
+            parent_invocation_env,
+            &provider_without_capture.name,
+            model_name,
+            Some(&session_id),
+        ),
         supervisor_config,
     )?;
     cleanup_temp_files(temp_files);

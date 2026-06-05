@@ -2671,6 +2671,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "dirs",
+ "libc",
  "oulipoly-agent-messenger",
  "oulipoly-config",
  "oulipoly-core",

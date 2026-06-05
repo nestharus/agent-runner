@@ -76,6 +76,7 @@ mod result;
 mod resume;
 mod resume_execution;
 mod session_capture;
+mod spawn_identity;
 mod supervision;
 mod terminal_signal;
 
@@ -85,11 +86,15 @@ pub use headless::{
 pub(crate) use input_flags::resolve_input_flags;
 pub use interactive::{
     InteractiveExecutionResult, execute_interactive, execute_interactive_with_result,
+    execute_interactive_with_result_and_model_identity,
 };
 pub use provider_identity::{provider_name, shell_split};
 pub use request::EffectiveExecuteRequest;
 pub use resume::{ResumePayload, compose_resume_args};
-pub use resume_execution::{execute_resume, execute_resume_optional_prompt};
+pub use resume_execution::{
+    execute_resume, execute_resume_optional_prompt,
+    execute_resume_optional_prompt_with_model_identity,
+};
 pub use session_capture::start_known_provider_session_id;
 pub use terminal_signal::classify_terminal_reason;
 

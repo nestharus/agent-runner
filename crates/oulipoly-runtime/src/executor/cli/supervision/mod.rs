@@ -37,6 +37,7 @@ mod terminal_outcome;
 mod termination;
 
 use super::provider_identity::ProviderRecognizer;
+use super::spawn_identity::{SpawnIdentityContext, record_child_identity};
 use crate::executor::terminal_signal::{TerminalSignal, TerminalStatusEvidence};
 use oulipoly_config::{PromptMode, ProviderConfig};
 use std::process::{Command, ExitStatus};
@@ -100,8 +101,9 @@ pub(super) fn run_provider_supervisor(
     cmd: Command,
     provider: &ProviderConfig,
     supervisor_config: SupervisorConfig,
+    spawn_identity: Option<&SpawnIdentityContext>,
 ) -> Result<SupervisedOutput, String> {
-    execute_with_supervisor(cmd, &provider.name, supervisor_config)
+    execute_with_supervisor(cmd, &provider.name, supervisor_config, spawn_identity)
         .map_err(errors::supervisor_error_for_executor)
 }
 
@@ -109,10 +111,12 @@ fn execute_with_supervisor(
     mut cmd: Command,
     provider_name: &str,
     mut config: SupervisorConfig,
+    spawn_identity: Option<&SpawnIdentityContext>,
 ) -> Result<SupervisedOutput, String> {
     process::configure_supervised_command(&mut cmd, &config);
     process::configure_supervised_process_group(&mut cmd);
     let mut child = process::spawn_supervised_child(cmd, provider_name)?;
+    record_child_identity(child.id(), spawn_identity);
     let drains = drain::start_child_drains(&mut child)?;
     let stdin_writer = stdin::start_child_stdin_writer(&mut child, &mut config)?;
     let mut stdout = Vec::new();

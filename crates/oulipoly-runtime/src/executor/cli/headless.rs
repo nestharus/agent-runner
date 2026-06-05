@@ -27,6 +27,7 @@ use super::provider_execution::{
 use super::provider_lookup::provider_for_index;
 use super::request::EffectiveExecuteRequest;
 use super::result::{cleanup_temp_files, execution_result_from_raw};
+use super::spawn_identity::context_from_parent_invocation_env;
 use super::supervision::SupervisorConfig;
 use oulipoly_config::ModelConfig;
 use std::collections::HashMap;
@@ -50,6 +51,12 @@ pub fn execute(
         &input_args,
         parent_invocation_env,
         None,
+        context_from_parent_invocation_env(
+            parent_invocation_env,
+            &provider.name,
+            Some(&model.name),
+            None,
+        ),
     )?;
     cleanup_temp_files(temp_files);
 
@@ -105,6 +112,12 @@ fn execute_effective_with_optional_supervisor_config(
         &input_args,
         request.parent_invocation_env,
         start_known_provider_session_id,
+        context_from_parent_invocation_env(
+            request.parent_invocation_env,
+            &request.provider.name,
+            Some(&request.model.name),
+            start_known_provider_session_id,
+        ),
         supervisor_config,
     )?;
     cleanup_temp_files(temp_files);

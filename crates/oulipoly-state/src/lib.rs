@@ -15,6 +15,7 @@ pub mod deployment;
 pub mod invocation_marker;
 mod lifecycle_log;
 pub mod migrations;
+pub mod pid_identity;
 pub mod repositories;
 pub mod result_envelope;
 pub mod schema;

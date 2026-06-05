@@ -330,7 +330,7 @@ fn execute_resume_attempt_command(
     invocation_env: &str,
     strategy: &oulipoly_config::ResumeStrategy,
 ) -> Result<executor::ExecutionResult, String> {
-    executor::cli::execute_resume_optional_prompt(
+    executor::cli::execute_resume_optional_prompt_with_model_identity(
         provider,
         provider_index,
         prompt_mode,
@@ -341,6 +341,7 @@ fn execute_resume_attempt_command(
             session_id: &input.resolved.active_session_id,
             strategy,
         },
+        input.resolved.model_name.as_deref().unwrap_or("<unknown>"),
     )
 }
 
