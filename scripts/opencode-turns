@@ -87,25 +87,43 @@ class Deadline:
 
 
 def env_float(name: str, default: float) -> float:
+    return positive_float_or_default(parsed_env_float(name), default)
+
+
+def parsed_env_float(name: str) -> float | None:
     value = os.environ.get(name)
     if value is None:
-        return default
+        return None
     try:
-        parsed = float(value)
+        return float(value)
     except ValueError:
+        return None
+
+
+def positive_float_or_default(value: float | None, default: float) -> float:
+    if value is None:
         return default
-    return parsed if parsed > 0 else default
+    return value if value > 0 else default
 
 
 def env_int(name: str, default: int) -> int:
+    return positive_int_or_default(parsed_env_int(name), default)
+
+
+def parsed_env_int(name: str) -> int | None:
     value = os.environ.get(name)
     if value is None:
-        return default
+        return None
     try:
-        parsed = int(value)
+        return int(value)
     except ValueError:
+        return None
+
+
+def positive_int_or_default(value: int | None, default: int) -> int:
+    if value is None:
         return default
-    return parsed if parsed > 0 else default
+    return value if value > 0 else default
 
 
 def text_chunk(text: str) -> dict:
@@ -149,13 +167,23 @@ def content_chunks_from_obj(obj: dict) -> list:
 
 
 def direct_content_chunks_from_obj(obj: dict) -> list:
+    candidate = direct_content_candidate_from_obj(obj)
+    if candidate is None:
+        return []
+    return direct_content_chunks_from_candidate(candidate)
+
+
+def direct_content_candidate_from_obj(obj: dict) -> dict | None:
     text = obj.get("text")
     if text is None:
         text = obj.get("content")
     if not isinstance(text, str):
-        return []
-    native_type = obj.get("type") or "text"
-    return [{"type": canonical_chunk_type(native_type), "text": text}]
+        return None
+    return {"text": text, "type": obj.get("type") or "text"}
+
+
+def direct_content_chunks_from_candidate(candidate: dict) -> list:
+    return [{"type": canonical_chunk_type(candidate["type"]), "text": candidate["text"]}]
 
 
 def nested_content_chunks_from_obj(obj: dict) -> list:
@@ -226,16 +254,32 @@ def candidates_have_timestamps(candidates: list[dict]) -> bool:
 
 
 def recent_session_ids(candidates: list[dict], window_hours: float) -> list[str]:
+    return session_ids_from_candidates_rows(
+        recent_session_candidates(candidates, window_hours)
+    )
+
+
+def recent_session_candidates(candidates: list[dict], window_hours: float) -> list[dict]:
     cutoff = datetime.now(timezone.utc) - timedelta(hours=window_hours)
     return [
-        candidate["session_id"]
+        candidate
         for candidate in candidates
         if candidate.get("timestamp") is not None and candidate["timestamp"] >= cutoff
     ]
 
 
 def capped_candidate_session_ids(candidates: list[dict], max_sessions: int) -> list[str]:
-    return [candidate["session_id"] for candidate in candidates][:max_sessions]
+    return session_ids_from_candidates_rows(
+        capped_session_candidates(candidates, max_sessions)
+    )
+
+
+def capped_session_candidates(candidates: list[dict], max_sessions: int) -> list[dict]:
+    return candidates[:max_sessions]
+
+
+def session_ids_from_candidates_rows(candidates: list[dict]) -> list[str]:
+    return [candidate["session_id"] for candidate in candidates]
 
 
 def unique_session_candidates(candidates: list[dict]) -> list[dict]:
@@ -345,8 +389,19 @@ def requested_session_ids(
 
 
 def numeric_timestamp(value) -> str | None:
+    accepted = accepted_numeric_timestamp(value)
+    if accepted is None:
+        return None
+    return formatted_numeric_timestamp(accepted)
+
+
+def accepted_numeric_timestamp(value) -> int | float | None:
     if not isinstance(value, (int, float)):
         return None
+    return value
+
+
+def formatted_numeric_timestamp(value: int | float) -> str:
     seconds = value / 1000 if value > 10_000_000_000 else value
     return datetime.fromtimestamp(seconds, tz=timezone.utc).isoformat().replace("+00:00", "Z")
 

@@ -11,7 +11,7 @@ Touched files in scope:
 | File | Declared roles | Role notes |
 |---|---|---|
 | `scripts/opencode-turns` | `orchestration`, `parser`, `mapper`, `filter`, `validator`, `predicate`, `accessor`, `formatter` | Shipped OpenCode turn adapter; translates public OpenCode CLI output into normalized runtime JSONL and owns its OPENCODE_TURNS option parsing. |
-| `scripts/tests/opencode-turns.test.sh` | `orchestration`, `validator`, `formatter` | Shell proof harness that builds mock OpenCode CLIs, runs the adapter, and asserts stdout/export/deadline behavior. |
+| `scripts/tests/opencode-turns.test.sh` | `orchestration`, `accessor`, `predicate`, `validator`, `formatter` | Shell proof harness that builds mock OpenCode CLIs, samples process/file state, runs the adapter, and asserts stdout/export/deadline behavior. |
 | `crates/oulipoly-runtime/src/quota/process.rs` | `orchestration`, `accessor`, `formatter`, `mapper`, `predicate`, `validator` | Quota/auth script process execution, timeout, stream draining, process-group kill, and error formatting. File-local comments currently omit `validator`; the `ensure_*_success` functions are validator work. |
 | `crates/oulipoly-runtime/src/sessions/mod.rs` | `orchestration`, `accessor`, `filter`, `parser`, `validator`, `mapper`, `formatter`, `predicate` | Session adapter stdout ingestion, degraded-marker recognition, session script execution, transcript locator execution, and StateDb ingest. |
 | `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs` | `orchestration`, `accessor`, `filter`, `parser`, `validator`, `mapper`, `formatter`, `predicate` | Integration fixture and proof surface for provider/session dispatch and the OpenCode adapter path. |
@@ -70,15 +70,21 @@ Only added or meaningfully changed production functions are listed for Rust file
 | `Deadline.__init__` | `mapper` | Builds deadline state from a duration. | None. |
 | `Deadline.remaining` | `accessor` | Exposes remaining wall-clock budget. | None. |
 | `Deadline.call_timeout` | `filter` | Bounds a per-call timeout by remaining deadline. | None. |
-| `env_float` | `parser` | Parses a positive float env value with fallback default. | None. |
-| `env_int` | `parser` | Parses a positive integer env value with fallback default. | None. |
+| `env_float` | `orchestration` | Selects the parsed float env candidate and positive/default validation helper. | None; parsing and validation are delegated. |
+| `parsed_env_float` | `parser` | Parses a float env value into a candidate or absence. | None. |
+| `positive_float_or_default` | `validator` | Accepts positive float candidates and otherwise returns the fallback default. | None. |
+| `env_int` | `orchestration` | Selects the parsed integer env candidate and positive/default validation helper. | None; parsing and validation are delegated. |
+| `parsed_env_int` | `parser` | Parses an integer env value into a candidate or absence. | None. |
+| `positive_int_or_default` | `validator` | Accepts positive integer candidates and otherwise returns the fallback default. | None. |
 | `text_chunk` | `mapper` | Maps text into the canonical body chunk shape. | None. |
 | `canonical_chunk_type` | `mapper` | Maps OpenCode/native chunk type names to canonical chunk type names. | None. |
 | `extract_content_chunks` | `orchestration` | Dispatches content extraction by value shape to single-role chunk helpers. | None; recursion and per-shape parsing/mapping are delegated. |
 | `content_chunks_from_text` | `mapper` | Maps a plain string content value into one canonical text chunk. | None. |
 | `content_chunks_from_items` | `orchestration` | Recursively accumulates chunks from a list of content values. | None. |
 | `content_chunks_from_obj` | `orchestration` | Applies direct-object chunk parsing before nested-object recursion. | None; both branches are delegated. |
-| `direct_content_chunks_from_obj` | `parser` | Parses one text-bearing content dictionary into a canonical chunk shape. | None; type canonicalization is delegated. |
+| `direct_content_chunks_from_obj` | `orchestration` | Selects direct content candidate parsing and canonical chunk construction. | None; parser and mapper work are delegated. |
+| `direct_content_candidate_from_obj` | `parser` | Extracts accepted direct text/type candidates from text-bearing content dictionaries. | None. |
+| `direct_content_chunks_from_candidate` | `mapper` | Maps an accepted direct content candidate into canonical chunk dictionaries. | None. |
 | `nested_content_chunks_from_obj` | `orchestration` | Tries known nested content fields and returns the first non-empty recursive chunk result. | None. |
 | `unique_values` | `filter` | Deduplicates values while preserving order. | None. |
 | `session_ids_from_value` | `parser` | Recursively extracts `ses_*` identifiers from arbitrary values. | None. |
@@ -87,8 +93,11 @@ Only added or meaningfully changed production functions are listed for Rust file
 | `capped_session_ids_from_value` | `filter` | Extracts unique session IDs from a value and applies the max-session cap. | None. |
 | `session_ids_from_candidates` | `orchestration` | Selects timestamp-window filtering or max-cap filtering for candidate rows. | None; predicate and filters are delegated. |
 | `candidates_have_timestamps` | `predicate` | Answers whether any session candidate has a parsed timestamp. | None. |
-| `recent_session_ids` | `filter` | Filters timestamped candidates to the recent quota-balancing window. | None. |
-| `capped_candidate_session_ids` | `filter` | Applies the max-session cap to candidate session IDs. | None. |
+| `recent_session_ids` | `orchestration` | Applies recent-candidate filtering and candidate-to-ID projection through named helpers. | None. |
+| `recent_session_candidates` | `filter` | Filters timestamped candidates to the recent quota-balancing window while preserving candidate shape. | None. |
+| `capped_candidate_session_ids` | `orchestration` | Applies max-cap candidate filtering and candidate-to-ID projection through named helpers. | None. |
+| `capped_session_candidates` | `filter` | Applies the max-session cap while preserving candidate shape. | None. |
+| `session_ids_from_candidates_rows` | `mapper` | Projects selected candidate rows to session ID strings. | None. |
 | `unique_session_candidates` | `filter` | Deduplicates candidate session dictionaries by `session_id`. | None. |
 | `session_candidates_from_value` | `orchestration` | Dispatches recursive candidate extraction by parsed value shape. | None; candidate-shape predicate and mapping are delegated. |
 | `session_candidates_from_items` | `orchestration` | Recursively accumulates candidate rows from iterable parsed values. | None. |
@@ -101,7 +110,9 @@ Only added or meaningfully changed production functions are listed for Rust file
 | `numeric_timestamp_datetime` | `parser` | Parses seconds/milliseconds numeric timestamps into UTC datetimes. | None. |
 | `discover_session_ids` | `orchestration` | Runs public OpenCode session discovery and parses IDs unless the call times out. | None. |
 | `requested_session_ids` | `orchestration` | Selects explicit session IDs or implicit discovery. | None. |
-| `numeric_timestamp` | `formatter` | Formats numeric timestamps as RFC3339-like UTC strings for emitted turns. | None. |
+| `numeric_timestamp` | `orchestration` | Selects numeric timestamp acceptance and timestamp string formatting helpers. | None; validation and formatting are delegated. |
+| `accepted_numeric_timestamp` | `validator` | Accepts numeric timestamp candidates for emitted turns. | None. |
+| `formatted_numeric_timestamp` | `formatter` | Formats accepted numeric timestamps as RFC3339-like UTC strings for emitted turns. | None. |
 | `timestamp_from_obj` | `parser` | Extracts a turn timestamp from exported OpenCode message objects. | None. |
 | `session_id_from_obj` | `parser` | Extracts a session ID from exported OpenCode message objects. | None. |
 | `role_from_obj` | `parser` | Extracts `user` or `assistant` role from message objects. | None. |
@@ -140,6 +151,44 @@ Only added or meaningfully changed production functions are listed for Rust file
 | `emit_usage` | `formatter` | Emits the usage message to the supplied stream. | None. |
 | `session_args_from_argv` | `accessor` | Exposes explicit session ID arguments from argv after the base-dir slot. | None. |
 | `main` | `orchestration` | CLI entry point that delegates argv boundary handling, constructs options/deadline, collects records, emits records, and emits degraded marker when needed. | None. |
+
+## Test function inventory
+
+Only added or meaningfully changed shell test-harness functions are listed.
+
+### `scripts/tests/opencode-turns.test.sh`
+
+| Function | A1 class | Meaning | Risk |
+|---|---|---|---|
+| `values_equal` | `predicate` | Answers whether two assertion values are equal. | None. |
+| `assert_eq_failure_message` | `formatter` | Formats equality assertion diagnostics. | None. |
+| `assert_eq` | `validator` | Enforces equality by delegating comparison and failure-message construction. | None; predicate and formatting are delegated. |
+| `status_zero` | `predicate` | Answers whether a captured exit status is zero. | None. |
+| `status_zero_failure_message` | `formatter` | Formats exit-status assertion diagnostics with stderr evidence. | None. |
+| `assert_status_zero` | `validator` | Enforces successful adapter exit status. | None; predicate and formatting are delegated. |
+| `stdout_contains_pattern` | `predicate` | Answers whether captured stdout contains a fixed-string pattern. | None. |
+| `stdout_contains_failure_message` | `formatter` | Formats missing-stdout-pattern diagnostics. | None. |
+| `assert_stdout_contains` | `validator` | Enforces fixed-string presence in captured stdout. | None; predicate and formatting are delegated. |
+| `stdout_excludes_pattern` | `predicate` | Answers whether captured stdout excludes a fixed-string pattern. | None. |
+| `stdout_unexpected_failure_message` | `formatter` | Formats unexpected-stdout-pattern diagnostics. | None. |
+| `assert_stdout_not_contains` | `validator` | Enforces fixed-string absence from captured stdout. | None; predicate and formatting are delegated. |
+| `marker_size_sample` | `accessor` | Samples descendant-marker file size before and after the timeout observation window. | None. |
+| `marker_size_stable` | `validator` | Validates descendant-marker size stability. | None. |
+| `marker_growth_failure_message` | `formatter` | Formats descendant-marker growth diagnostics. | None. |
+| `assert_marker_stopped_growing` | `validator` | Enforces descendant-marker stability after timeout kill. | None; sampling, validation, and formatting are delegated. |
+| `process_state` | `accessor` | Retrieves descendant process state or an absent sentinel. | None. |
+| `process_state_allowed` | `validator` | Accepts absent or zombie descendant process states. | None. |
+| `process_running_failure_message` | `formatter` | Formats surviving-descendant diagnostics. | None. |
+| `assert_process_not_running` | `validator` | Enforces descendant process cleanup after timeout kill. | None; state access, validation, and formatting are delegated. |
+| `write_executable_mock` | `orchestration` | Materializes a mock executable by running a body emitter and applying executable mode. | None. |
+| `emit_timestampless_cap_mock_body` | `formatter` | Emits the timestampless-cap mock OpenCode script body. | None. |
+| `write_timestampless_cap_mock` | `orchestration` | Materializes the timestampless-cap mock through named helpers. | None. |
+| `emit_window_filter_mock_body` | `formatter` | Emits the timestamp-window mock OpenCode script body. | None. |
+| `write_window_filter_mock` | `orchestration` | Materializes the timestamp-window mock through named helpers. | None. |
+| `emit_timeout_mock_body` | `formatter` | Emits the timeout mock OpenCode script body. | None. |
+| `write_timeout_mock` | `orchestration` | Materializes the timeout mock through named helpers. | None. |
+| `emit_descendant_timeout_mock_body` | `formatter` | Emits the descendant-timeout mock OpenCode script body. | None. |
+| `write_descendant_timeout_mock` | `orchestration` | Materializes the descendant-timeout mock through named helpers. | None. |
 
 ## Adapter declarations
 

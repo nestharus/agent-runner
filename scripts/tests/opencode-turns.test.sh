@@ -12,40 +12,85 @@ fail() {
   exit 1
 }
 
+values_equal() {
+  [[ "$1" == "$2" ]]
+}
+
+assert_eq_failure_message() {
+  local label="$1"
+  local expected="$2"
+  local actual="$3"
+
+  printf '%s: expected <%s>, got <%s>' "$label" "$expected" "$actual"
+}
+
 assert_eq() {
   local actual="$1"
   local expected="$2"
   local label="$3"
 
-  if [[ "$actual" != "$expected" ]]; then
-    fail "$label: expected <$expected>, got <$actual>"
+  if ! values_equal "$actual" "$expected"; then
+    fail "$(assert_eq_failure_message "$label" "$expected" "$actual")"
   fi
+}
+
+status_zero() {
+  [[ "$1" -eq 0 ]]
+}
+
+status_zero_failure_message() {
+  local label="$1"
+  local status="$2"
+
+  printf '%s: expected exit 0, got %s; stderr: %s' "$label" "$status" "$(cat "$RUN_STDERR")"
 }
 
 assert_status_zero() {
   local status="$1"
   local label="$2"
 
-  if [[ "$status" -ne 0 ]]; then
-    fail "$label: expected exit 0, got $status; stderr: $(cat "$RUN_STDERR")"
+  if ! status_zero "$status"; then
+    fail "$(status_zero_failure_message "$label" "$status")"
   fi
+}
+
+stdout_contains_pattern() {
+  grep -Fq "$1" "$RUN_STDOUT"
+}
+
+stdout_contains_failure_message() {
+  local label="$1"
+  local pattern="$2"
+
+  printf '%s: stdout did not contain <%s>; stdout: %s' "$label" "$pattern" "$(cat "$RUN_STDOUT")"
 }
 
 assert_stdout_contains() {
   local pattern="$1"
   local label="$2"
 
-  if ! grep -Fq "$pattern" "$RUN_STDOUT"; then
-    fail "$label: stdout did not contain <$pattern>; stdout: $(cat "$RUN_STDOUT")"
+  if ! stdout_contains_pattern "$pattern"; then
+    fail "$(stdout_contains_failure_message "$label" "$pattern")"
   fi
+}
+
+stdout_excludes_pattern() {
+  ! grep -Fq "$1" "$RUN_STDOUT"
+}
+
+stdout_unexpected_failure_message() {
+  local label="$1"
+  local pattern="$2"
+
+  printf '%s: stdout unexpectedly contained <%s>; stdout: %s' "$label" "$pattern" "$(cat "$RUN_STDOUT")"
 }
 
 assert_stdout_not_contains() {
   local pattern="$1"
   local label="$2"
 
-  if grep -Fq "$pattern" "$RUN_STDOUT"; then
-    fail "$label: stdout unexpectedly contained <$pattern>; stdout: $(cat "$RUN_STDOUT")"
+  if ! stdout_excludes_pattern "$pattern"; then
+    fail "$(stdout_unexpected_failure_message "$label" "$pattern")"
   fi
 }
 
@@ -59,17 +104,62 @@ file_size_bytes() {
   wc -c <"$path" | tr -d ' '
 }
 
+marker_size_sample() {
+  local marker="$1"
+
+  file_size_bytes "$marker"
+  sleep 1
+  file_size_bytes "$marker"
+}
+
+marker_size_stable() {
+  [[ "$1" == "$2" ]]
+}
+
+marker_growth_failure_message() {
+  local label="$1"
+  local before="$2"
+  local after="$3"
+
+  printf '%s: descendant marker kept growing after timeout kill (%s -> %s bytes)' "$label" "$before" "$after"
+}
+
 assert_marker_stopped_growing() {
   local marker="$1"
   local label="$2"
+  local -a sizes
   local before after
 
-  before="$(file_size_bytes "$marker")"
-  sleep 1
-  after="$(file_size_bytes "$marker")"
-  if [[ "$before" != "$after" ]]; then
-    fail "$label: descendant marker kept growing after timeout kill ($before -> $after bytes)"
+  mapfile -t sizes < <(marker_size_sample "$marker")
+  before="${sizes[0]}"
+  after="${sizes[1]}"
+  if ! marker_size_stable "$before" "$after"; then
+    fail "$(marker_growth_failure_message "$label" "$before" "$after")"
   fi
+}
+
+process_state() {
+  local pid="$1"
+
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo absent
+    return
+  fi
+  ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ' || true
+}
+
+process_state_allowed() {
+  local state="$1"
+
+  [[ "$state" == absent || "$state" == Z* ]]
+}
+
+process_running_failure_message() {
+  local label="$1"
+  local pid="$2"
+  local state="$3"
+
+  printf '%s: descendant process %s survived timeout kill with state <%s>' "$label" "$pid" "$state"
 }
 
 assert_process_not_running() {
@@ -77,20 +167,23 @@ assert_process_not_running() {
   local label="$2"
   local state
 
-  if ! kill -0 "$pid" 2>/dev/null; then
+  state="$(process_state "$pid")"
+  if process_state_allowed "$state"; then
     return
   fi
-  state="$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
-  if [[ "$state" == Z* ]]; then
-    return
-  fi
-  fail "$label: descendant process $pid survived timeout kill with state <$state>"
+  fail "$(process_running_failure_message "$label" "$pid" "$state")"
 }
 
-write_timestampless_cap_mock() {
+write_executable_mock() {
   local path="$1"
+  local body_writer="$2"
 
-  cat >"$path" <<'MOCK_OPENCODE'
+  "$body_writer" >"$path"
+  chmod +x "$path"
+}
+
+emit_timestampless_cap_mock_body() {
+  cat <<'MOCK_OPENCODE'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -117,14 +210,16 @@ fi
 echo "unexpected opencode args: $*" >&2
 exit 64
 MOCK_OPENCODE
-
-  chmod +x "$path"
 }
 
-write_window_filter_mock() {
+write_timestampless_cap_mock() {
   local path="$1"
 
-  cat >"$path" <<'MOCK_OPENCODE'
+  write_executable_mock "$path" emit_timestampless_cap_mock_body
+}
+
+emit_window_filter_mock_body() {
+  cat <<'MOCK_OPENCODE'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -155,14 +250,16 @@ fi
 echo "unexpected opencode args: $*" >&2
 exit 64
 MOCK_OPENCODE
-
-  chmod +x "$path"
 }
 
-write_timeout_mock() {
+write_window_filter_mock() {
   local path="$1"
 
-  cat >"$path" <<'MOCK_OPENCODE'
+  write_executable_mock "$path" emit_window_filter_mock_body
+}
+
+emit_timeout_mock_body() {
+  cat <<'MOCK_OPENCODE'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -189,14 +286,16 @@ fi
 echo "unexpected opencode args: $*" >&2
 exit 64
 MOCK_OPENCODE
-
-  chmod +x "$path"
 }
 
-write_descendant_timeout_mock() {
+write_timeout_mock() {
   local path="$1"
 
-  cat >"$path" <<'MOCK_OPENCODE'
+  write_executable_mock "$path" emit_timeout_mock_body
+}
+
+emit_descendant_timeout_mock_body() {
+  cat <<'MOCK_OPENCODE'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -223,8 +322,12 @@ fi
 echo "unexpected opencode args: $*" >&2
 exit 64
 MOCK_OPENCODE
+}
 
-  chmod +x "$path"
+write_descendant_timeout_mock() {
+  local path="$1"
+
+  write_executable_mock "$path" emit_descendant_timeout_mock_body
 }
 
 run_opencode_turns() {
