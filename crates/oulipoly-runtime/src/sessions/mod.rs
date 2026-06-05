@@ -175,17 +175,33 @@ fn collect_turn_script_batch(
 }
 
 fn degraded_marker_error(trimmed: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(trimmed).ok()?;
-    let Value::Object(map) = value else {
-        return None;
-    };
-    if map.get("degraded").and_then(Value::as_bool) != Some(true) {
+    let marker = parse_degraded_marker_jsonl(trimmed)?;
+    if !is_degraded_marker(&marker) {
         return None;
     }
-    let count = map.get("count").and_then(Value::as_u64).unwrap_or(0);
-    Some(format!(
-        "turn script degraded before completing scan; best_count={count}"
-    ))
+    Some(format_degraded_marker_error(degraded_marker_count(&marker)))
+}
+
+fn parse_degraded_marker_jsonl(trimmed: &str) -> Option<Value> {
+    serde_json::from_str(trimmed).ok()
+}
+
+fn is_degraded_marker(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => map.get("degraded").and_then(Value::as_bool) == Some(true),
+        _ => false,
+    }
+}
+
+fn degraded_marker_count(value: &Value) -> u64 {
+    match value {
+        Value::Object(map) => map.get("count").and_then(Value::as_u64).unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn format_degraded_marker_error(count: u64) -> String {
+    format!("turn script degraded before completing scan; best_count={count}")
 }
 
 fn non_empty_script_lines(stdout: &str) -> Vec<&str> {
@@ -625,19 +641,33 @@ fn wait_for_pending_session_script(
     script_kind: &str,
     timeout_secs: u64,
 ) -> Result<(), String> {
-    if script_wait_timed_out(start, timeout) {
-        kill_timed_out_session_script(child);
-        return Err(format_session_script_timeout(script_kind, timeout_secs));
+    if pending_session_script_timed_out(start, timeout) {
+        return fail_timed_out_pending_session_script(child, script_kind, timeout_secs);
     }
     sleep_before_next_session_script_poll();
     Ok(())
 }
 
-fn script_wait_timed_out(start: std::time::Instant, timeout: std::time::Duration) -> bool {
+fn pending_session_script_timed_out(
+    start: std::time::Instant,
+    timeout: std::time::Duration,
+) -> bool {
     start.elapsed() >= timeout
 }
 
-fn kill_timed_out_session_script(child: &mut Child) {
+fn fail_timed_out_pending_session_script(
+    child: &mut Child,
+    script_kind: &str,
+    timeout_secs: u64,
+) -> Result<(), String> {
+    kill_timed_out_pending_session_script(child);
+    Err(format_pending_session_script_timeout(
+        script_kind,
+        timeout_secs,
+    ))
+}
+
+fn kill_timed_out_pending_session_script(child: &mut Child) {
     kill_session_script_process_group(child);
 }
 
@@ -662,7 +692,7 @@ fn sleep_before_next_session_script_poll() {
     std::thread::sleep(std::time::Duration::from_millis(50));
 }
 
-fn format_session_script_timeout(script_kind: &str, timeout_secs: u64) -> String {
+fn format_pending_session_script_timeout(script_kind: &str, timeout_secs: u64) -> String {
     format!("script_timeout: {script_kind} timed out after {timeout_secs}s")
 }
 

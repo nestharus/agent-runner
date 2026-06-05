@@ -1,0 +1,1038 @@
+diff --git a/crates/oulipoly-runtime/src/quota/process.rs b/crates/oulipoly-runtime/src/quota/process.rs
+index 97cf8da..4c0d7ce 100644
+--- a/crates/oulipoly-runtime/src/quota/process.rs
++++ b/crates/oulipoly-runtime/src/quota/process.rs
+@@ -20,8 +20,10 @@ use std::io::Read;
+ use std::process::{Child, Command, ExitStatus, Stdio};
+ use std::thread::JoinHandle;
+ 
+-/// Script timeout — scripts hitting the internet shouldn't hang the caller.
+-const SCRIPT_TIMEOUT_SECS: u64 = 30;
++/// Quota scripts run on the pre-dispatch path. Ninety seconds is intentionally
++/// long enough for slow CLI/API startup but short enough that metrics can never
++/// wedge provider selection indefinitely.
++const SCRIPT_TIMEOUT_SECS: u64 = 90;
+ /// Auth-refresh command timeout. Should be quick (the CLI hits its own auth
+ /// endpoint and exits); kept tight to avoid hanging the quota path.
+ const REFRESH_TIMEOUT_SECS: u64 = 15;
+@@ -40,6 +42,10 @@ pub fn run_refresh_command(cmd_str: &str) -> Result<(), String> {
+ }
+ 
+ pub fn run_script(script: &str) -> Result<String, String> {
++    run_script_with_timeout(script, SCRIPT_TIMEOUT_SECS)
++}
++
++fn run_script_with_timeout(script: &str, timeout_secs: u64) -> Result<String, String> {
+     let mut child = spawn_quota_script(script)?;
+ 
+     // Drain stdout/stderr concurrently to avoid pipe-full deadlocks for
+@@ -47,7 +53,7 @@ pub fn run_script(script: &str) -> Result<String, String> {
+     // with the sessions-module pattern).
+     let stdout_handle = drain_child_stdout(&mut child);
+     let stderr_handle = drain_child_stderr(&mut child);
+-    let status = wait_for_child(&mut child, SCRIPT_TIMEOUT_SECS, RefreshProcessKind::Quota)?;
++    let status = wait_for_child(&mut child, timeout_secs, RefreshProcessKind::Quota)?;
+     let stdout_text = joined_text(stdout_handle);
+     let stderr_text = joined_text(stderr_handle);
+ 
+@@ -73,9 +79,20 @@ fn shell_command(command: &str) -> Command {
+     let mut cmd = Command::new("sh");
+     cmd.arg("-c").arg(command);
+     cmd.stdin(Stdio::null());
++    configure_script_process_group(&mut cmd);
+     cmd
+ }
+ 
++#[cfg(unix)]
++fn configure_script_process_group(cmd: &mut Command) {
++    use std::os::unix::process::CommandExt;
++
++    cmd.process_group(0);
++}
++
++#[cfg(not(unix))]
++fn configure_script_process_group(_cmd: &mut Command) {}
++
+ fn drain_child_stdout(child: &mut Child) -> JoinHandle<String> {
+     spawn_string_drain(child.stdout.take().expect("piped"))
+ }
+@@ -156,10 +173,27 @@ fn kill_timed_out_child(
+     kind: RefreshProcessKind,
+     timeout_secs: u64,
+ ) -> Result<ExitStatus, String> {
+-    let _ = child.kill();
++    kill_child_process_group(child);
+     Err(format_timeout(kind, timeout_secs))
+ }
+ 
++#[cfg(unix)]
++fn kill_child_process_group(child: &mut Child) {
++    let pgid = -(child.id() as libc::pid_t);
++    // SAFETY: `pgid` targets the process group created with `process_group(0)`
++    // for this child. Killing the group is required so shell grandchildren do
++    // not keep pipes open or continue running after the metrics deadline.
++    let _ = unsafe { libc::kill(pgid, libc::SIGKILL) };
++    let _ = child.kill();
++    let _ = child.wait();
++}
++
++#[cfg(not(unix))]
++fn kill_child_process_group(child: &mut Child) {
++    let _ = child.kill();
++    let _ = child.wait();
++}
++
+ fn joined_text(handle: JoinHandle<String>) -> String {
+     handle.join().unwrap_or_default()
+ }
+@@ -203,7 +237,9 @@ fn format_timeout(kind: RefreshProcessKind, timeout_secs: u64) -> String {
+         RefreshProcessKind::Auth => {
+             format!("auth_refresh_command timed out after {timeout_secs}s")
+         }
+-        RefreshProcessKind::Quota => format!("Quota script timed out after {timeout_secs}s"),
++        RefreshProcessKind::Quota => {
++            format!("script_timeout: quota script timed out after {timeout_secs}s")
++        }
+     }
+ }
+ 
+@@ -229,3 +265,37 @@ fn format_quota_exit(status: ExitStatus, stderr_text: &str) -> String {
+         stderr_text.trim()
+     )
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::time::Duration;
++
++    #[test]
++    fn quota_script_timeout_is_classified() {
++        let err = run_script_with_timeout("sleep 60", 1).unwrap_err();
++
++        assert!(err.contains("script_timeout"), "{err}");
++        assert!(err.contains("quota script"), "{err}");
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn quota_script_timeout_kills_process_group_children() {
++        let dir = tempfile::tempdir().unwrap();
++        let leaked_marker = dir.path().join("leaked");
++        let script = format!(
++            "(sleep 2; printf leaked > {}) & wait",
++            leaked_marker.display()
++        );
++
++        let err = run_script_with_timeout(&script, 1).unwrap_err();
++        std::thread::sleep(Duration::from_secs(3));
++
++        assert!(err.contains("script_timeout"), "{err}");
++        assert!(
++            !leaked_marker.exists(),
++            "timed-out quota script left a process-group child running"
++        );
++    }
++}
+diff --git a/crates/oulipoly-runtime/src/sessions/mod.rs b/crates/oulipoly-runtime/src/sessions/mod.rs
+index 38bc837..e215203 100644
+--- a/crates/oulipoly-runtime/src/sessions/mod.rs
++++ b/crates/oulipoly-runtime/src/sessions/mod.rs
+@@ -43,10 +43,10 @@ use std::path::PathBuf;
+ use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
+ use std::thread::JoinHandle;
+ 
+-// Generous to accommodate first-run scans across thousands of historical
+-// session files. Subsequent scans are bounded by the script's mtime cursor
+-// and finish in seconds.
+-const SCRIPT_TIMEOUT_SECS: u64 = 600;
++// Turn scripts run on the pre-dispatch metrics path. Ninety seconds is long
++// enough for slow CLI/API startup but prevents provider selection from being
++// wedged by a broken adapter or an unexpectedly large history scan.
++const SCRIPT_TIMEOUT_SECS: u64 = 90;
+ 
+ /// A turn as emitted by an adapter script.
+ #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+@@ -97,6 +97,15 @@ pub fn scan_provider(
+     provider_name: &str,
+     sessions_cfg: &SessionsConfig,
+     db: &StateDb,
++) -> ScanReport {
++    scan_provider_with_timeout(provider_name, sessions_cfg, db, SCRIPT_TIMEOUT_SECS)
++}
++
++fn scan_provider_with_timeout(
++    provider_name: &str,
++    sessions_cfg: &SessionsConfig,
++    db: &StateDb,
++    timeout_secs: u64,
+ ) -> ScanReport {
+     let mut report = ScanReport::default();
+     let Some(entry) = provider_session_source(sessions_cfg, provider_name) else {
+@@ -108,7 +117,7 @@ pub fn scan_provider(
+         return scan_report_with_error(report, error);
+     }
+ 
+-    let stdout = match run_turn_script(&entry.turn_script, &state_dir) {
++    let stdout = match run_turn_script(&entry.turn_script, &state_dir, timeout_secs) {
+         Ok(stdout) => stdout,
+         Err(error) => return scan_report_with_error(report, error),
+     };
+@@ -150,6 +159,10 @@ fn collect_turn_script_batch(
+     let mut batch = Vec::new();
+     for line in non_empty_script_lines(stdout) {
+         let line_number = record_script_line_seen(report);
++        if let Some(error) = degraded_marker_error(line) {
++            record_scan_error(report, error);
++            continue;
++        }
+         match script_line_to_ingest(provider_name, line, line_number) {
+             Ok(parsed) => {
+                 record_optional_scan_error(report, parsed.body_error);
+@@ -161,6 +174,36 @@ fn collect_turn_script_batch(
+     batch
+ }
+ 
++fn degraded_marker_error(trimmed: &str) -> Option<String> {
++    let marker = parse_degraded_marker_jsonl(trimmed)?;
++    if !is_degraded_marker(&marker) {
++        return None;
++    }
++    Some(format_degraded_marker_error(degraded_marker_count(&marker)))
++}
++
++fn parse_degraded_marker_jsonl(trimmed: &str) -> Option<Value> {
++    serde_json::from_str(trimmed).ok()
++}
++
++fn is_degraded_marker(value: &Value) -> bool {
++    match value {
++        Value::Object(map) => map.get("degraded").and_then(Value::as_bool) == Some(true),
++        _ => false,
++    }
++}
++
++fn degraded_marker_count(value: &Value) -> u64 {
++    match value {
++        Value::Object(map) => map.get("count").and_then(Value::as_u64).unwrap_or(0),
++        _ => 0,
++    }
++}
++
++fn format_degraded_marker_error(count: u64) -> String {
++    format!("turn script degraded before completing scan; best_count={count}")
++}
++
+ fn non_empty_script_lines(stdout: &str) -> Vec<&str> {
+     stdout
+         .lines()
+@@ -399,8 +442,12 @@ fn default_app_data_dir() -> PathBuf {
+         .unwrap_or_else(|_| PathBuf::from(".").join(oulipoly_state::paths::APP_DATA_DIR_NAME))
+ }
+ 
+-fn run_turn_script(script: &str, state_dir: &std::path::Path) -> Result<String, String> {
+-    run_session_script(script, state_dir, None, "turn script")
++fn run_turn_script(
++    script: &str,
++    state_dir: &std::path::Path,
++    timeout_secs: u64,
++) -> Result<String, String> {
++    run_session_script_with_timeout(script, state_dir, None, "turn script", timeout_secs)
+ }
+ 
+ pub fn locate_transcript(
+@@ -452,6 +499,22 @@ fn run_session_script(
+     state_dir: &std::path::Path,
+     session_id: Option<&str>,
+     script_kind: &str,
++) -> Result<String, String> {
++    run_session_script_with_timeout(
++        script,
++        state_dir,
++        session_id,
++        script_kind,
++        SCRIPT_TIMEOUT_SECS,
++    )
++}
++
++fn run_session_script_with_timeout(
++    script: &str,
++    state_dir: &std::path::Path,
++    session_id: Option<&str>,
++    script_kind: &str,
++    timeout_secs: u64,
+ ) -> Result<String, String> {
+     let mut cmd = session_script_command(script, state_dir, session_id);
+     let mut child = spawn_session_script_child(&mut cmd, script_kind)?;
+@@ -461,7 +524,7 @@ fn run_session_script(
+     // fills up, the script blocks on write, the loop waits for exit forever.
+     let stdout_handle = spawn_stdout_reader(take_child_stdout(&mut child));
+     let stderr_handle = spawn_stderr_reader(take_child_stderr(&mut child));
+-    let status = wait_for_session_script(&mut child, script_kind)?;
++    let status = wait_for_session_script(&mut child, script_kind, timeout_secs)?;
+     let stdout_text = join_script_reader(stdout_handle);
+     let stderr_text = join_script_reader(stderr_handle);
+ 
+@@ -499,9 +562,20 @@ fn session_script_command(
+     cmd.stdin(Stdio::null());
+     cmd.stdout(Stdio::piped());
+     cmd.stderr(Stdio::piped());
++    configure_session_script_process_group(&mut cmd);
+     cmd
+ }
+ 
++#[cfg(unix)]
++fn configure_session_script_process_group(cmd: &mut Command) {
++    use std::os::unix::process::CommandExt;
++
++    cmd.process_group(0);
++}
++
++#[cfg(not(unix))]
++fn configure_session_script_process_group(_cmd: &mut Command) {}
++
+ fn spawn_session_script_child(cmd: &mut Command, script_kind: &str) -> Result<Child, String> {
+     cmd.spawn()
+         .map_err(|error| format_session_script_spawn_error(script_kind, error))
+@@ -538,13 +612,19 @@ where
+     })
+ }
+ 
+-fn wait_for_session_script(child: &mut Child, script_kind: &str) -> Result<ExitStatus, String> {
+-    let timeout = std::time::Duration::from_secs(SCRIPT_TIMEOUT_SECS);
++fn wait_for_session_script(
++    child: &mut Child,
++    script_kind: &str,
++    timeout_secs: u64,
++) -> Result<ExitStatus, String> {
++    let timeout = std::time::Duration::from_secs(timeout_secs);
+     let start = std::time::Instant::now();
+     loop {
+         match poll_session_script(child) {
+             Ok(Some(status)) => return Ok(status),
+-            Ok(None) => wait_for_pending_session_script(child, start, timeout, script_kind)?,
++            Ok(None) => {
++                wait_for_pending_session_script(child, start, timeout, script_kind, timeout_secs)?
++            }
+             Err(error) => return Err(format_session_script_wait_error(script_kind, error)),
+         }
+     }
+@@ -559,32 +639,61 @@ fn wait_for_pending_session_script(
+     start: std::time::Instant,
+     timeout: std::time::Duration,
+     script_kind: &str,
++    timeout_secs: u64,
+ ) -> Result<(), String> {
+-    if script_wait_timed_out(start, timeout) {
+-        kill_timed_out_session_script(child);
+-        return Err(format_session_script_timeout(script_kind));
++    if pending_session_script_timed_out(start, timeout) {
++        return fail_timed_out_pending_session_script(child, script_kind, timeout_secs);
+     }
+     sleep_before_next_session_script_poll();
+     Ok(())
+ }
+ 
+-fn script_wait_timed_out(start: std::time::Instant, timeout: std::time::Duration) -> bool {
++fn pending_session_script_timed_out(
++    start: std::time::Instant,
++    timeout: std::time::Duration,
++) -> bool {
+     start.elapsed() >= timeout
+ }
+ 
+-fn kill_timed_out_session_script(child: &mut Child) {
++fn fail_timed_out_pending_session_script(
++    child: &mut Child,
++    script_kind: &str,
++    timeout_secs: u64,
++) -> Result<(), String> {
++    kill_timed_out_pending_session_script(child);
++    Err(format_pending_session_script_timeout(
++        script_kind,
++        timeout_secs,
++    ))
++}
++
++fn kill_timed_out_pending_session_script(child: &mut Child) {
++    kill_session_script_process_group(child);
++}
++
++#[cfg(unix)]
++fn kill_session_script_process_group(child: &mut Child) {
++    let pgid = -(child.id() as libc::pid_t);
++    // SAFETY: `pgid` targets the process group created with `process_group(0)`
++    // for this child. Killing the group prevents shell grandchildren from
++    // continuing to run or holding stdout/stderr pipes after timeout.
++    let _ = unsafe { libc::kill(pgid, libc::SIGKILL) };
++    let _ = child.kill();
++    let _ = child.wait();
++}
++
++#[cfg(not(unix))]
++fn kill_session_script_process_group(child: &mut Child) {
+     let _ = child.kill();
++    let _ = child.wait();
+ }
+ 
+ fn sleep_before_next_session_script_poll() {
+     std::thread::sleep(std::time::Duration::from_millis(50));
+ }
+ 
+-fn format_session_script_timeout(script_kind: &str) -> String {
+-    format!(
+-        "{} timed out after {SCRIPT_TIMEOUT_SECS}s",
+-        capitalize_script_kind(script_kind)
+-    )
++fn format_pending_session_script_timeout(script_kind: &str, timeout_secs: u64) -> String {
++    format!("script_timeout: {script_kind} timed out after {timeout_secs}s")
+ }
+ 
+ fn format_session_script_wait_error(script_kind: &str, error: std::io::Error) -> String {
+@@ -831,6 +940,35 @@ EOF"#,
+         assert!(r.errors[0].contains("exited 7"));
+     }
+ 
++    #[test]
++    fn turn_script_timeout_is_classified_and_does_not_persist_turns() {
++        let db = db();
++        let script = fixture_script("sleep 60");
++        let cfg = cfg_with("p", &script.path);
++
++        let r = scan_provider_with_timeout("p", &cfg, &db, 1);
++
++        assert_eq!(r.new_turns, 0);
++        assert_eq!(db.count_assistant_turns_since("p", None).unwrap(), 0);
++        assert_eq!(r.errors.len(), 1);
++        assert!(r.errors[0].contains("script_timeout"), "{:?}", r.errors);
++        assert!(r.errors[0].contains("turn script"), "{:?}", r.errors);
++    }
++
++    #[test]
++    fn degraded_marker_is_reported_without_malformed_turn_error() {
++        let db = db();
++        let script = fixture_script(r#"printf '%s\n' '{"degraded":true,"count":1}'"#);
++        let cfg = cfg_with("p", &script.path);
++
++        let r = scan_provider("p", &cfg, &db);
++
++        assert_eq!(r.new_turns, 0);
++        assert_eq!(r.errors.len(), 1);
++        assert!(r.errors[0].contains("degraded"), "{:?}", r.errors);
++        assert!(!r.errors[0].contains("malformed"), "{:?}", r.errors);
++    }
++
+     #[test]
+     fn script_receives_state_dir_env() {
+         let db = db();
+diff --git a/crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs b/crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs
+index ef17867..3d64012 100644
+--- a/crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs
++++ b/crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs
+@@ -1371,9 +1371,8 @@ import sys
+ 
+ args = sys.argv[1:]
+ 
+-if args == ["session", "list"]:
+-    print("ID\tTitle")
+-    print("ses_fixture\tFixture session")
++if args == ["session", "list", "--json"]:
++    print(json.dumps([{"id": "ses_fixture"}], separators=(",", ":")))
+     sys.exit(0)
+ 
+ if args != ["export", "ses_fixture"]:
+diff --git a/scripts/opencode-turns b/scripts/opencode-turns
+index 7d99ff6..dc3070d 100644
+--- a/scripts/opencode-turns
++++ b/scripts/opencode-turns
+@@ -6,29 +6,103 @@ Usage: opencode-turns BASE_DIR [SESSION_ID ...]
+    e.g. opencode-turns ~/.local/share/opencode ses_abc123
+ 
+ Session IDs and message content are read through the public OpenCode CLI:
+-  opencode session list
++  opencode session list --json
+   opencode export <sessionID>
+ 
+ When SESSION_ID arguments are supplied, they are used directly. BASE_DIR is
+ accepted for compatibility with existing session source configuration; implicit
+-discovery uses `opencode session list`, not OpenCode's private storage layout.
++discovery uses `opencode session list --json`, not OpenCode's private storage
++layout.
++
++Implicit discovery is bounded to the recent quota-balancing window. If the
++session list does not expose timestamps, the adapter falls back to a small cap
++of most-recent CLI-listed sessions.
+ 
+ Emits one JSON object per line on stdout:
+   {"session_id":"ses_...","turn_id":"msg_...","timestamp":"<rfc3339>","role":"user|assistant","body":[{"type":"text","text":"..."}]}
++
++If an OpenCode CLI call times out, the adapter emits every turn collected so far
++and then appends:
++  {"degraded":true,"count":<assistant-turns-collected>}
++The process still exits 0 so a partial turn count never hangs provider
++selection.
+ """
+ 
+ import json
+ import os
+ import re
+ import shlex
++import signal
+ import subprocess
+ import sys
+-from datetime import datetime, timezone
++import time
++from datetime import datetime, timedelta, timezone
+ from typing import Any
+ 
+ 
+ MESSAGE_LIST_KEYS = ("messages", "turns", "items", "entries")
+ SESSION_ID_RE = re.compile(r"\bses_[A-Za-z0-9_-]+\b")
++SESSION_ID_KEYS = ("sessionID", "sessionId", "session_id", "id")
++SESSION_TIMESTAMP_KEYS = (
++    "updatedAt",
++    "updated_at",
++    "updated",
++    "createdAt",
++    "created_at",
++    "created",
++    "timestamp",
++    "time",
++)
++
++DEFAULT_WINDOW_HOURS = 6.0
++DEFAULT_MAX_SESSIONS = 25
++DEFAULT_CALL_TIMEOUT_SECS = 20.0
++DEFAULT_DEADLINE_SECS = 60.0
++
++
++class Options:
++    def __init__(self) -> None:
++        self.window_hours = env_float("OPENCODE_TURNS_WINDOW_HOURS", DEFAULT_WINDOW_HOURS)
++        self.max_sessions = env_int("OPENCODE_TURNS_MAX_SESSIONS", DEFAULT_MAX_SESSIONS)
++        self.call_timeout = env_float("OPENCODE_TURNS_CALL_TIMEOUT", DEFAULT_CALL_TIMEOUT_SECS)
++        self.deadline = env_float("OPENCODE_TURNS_DEADLINE", DEFAULT_DEADLINE_SECS)
++
++
++class Deadline:
++    def __init__(self, seconds: float) -> None:
++        self.started_at = time.monotonic()
++        self.seconds = seconds
++
++    def remaining(self) -> float:
++        return max(0.0, self.seconds - (time.monotonic() - self.started_at))
++
++    def call_timeout(self, max_call_timeout: float) -> float:
++        remaining = self.remaining()
++        if remaining <= 0:
++            return 0.0
++        return min(max_call_timeout, remaining)
++
++
++def env_float(name: str, default: float) -> float:
++    value = os.environ.get(name)
++    if value is None:
++        return default
++    try:
++        parsed = float(value)
++    except ValueError:
++        return default
++    return parsed if parsed > 0 else default
++
++
++def env_int(name: str, default: int) -> int:
++    value = os.environ.get(name)
++    if value is None:
++        return default
++    try:
++        parsed = int(value)
++    except ValueError:
++        return default
++    return parsed if parsed > 0 else default
+ 
+ 
+ def text_chunk(text: str) -> dict:
+@@ -91,32 +165,121 @@ def session_ids_from_value(value: Any) -> list[str]:
+     return []
+ 
+ 
+-def parse_session_list_stdout(stdout: str) -> list[str]:
++def parse_session_list_stdout(stdout: str, options: Options) -> list[str]:
+     try:
+         parsed = json.loads(stdout)
+     except json.JSONDecodeError:
+-        parsed = stdout
+-    return sorted(unique_values(session_ids_from_value(parsed)))
++        return unique_values(session_ids_from_value(stdout))[: options.max_sessions]
++
++    candidates = unique_session_candidates(session_candidates_from_value(parsed))
++    if not candidates:
++        return unique_values(session_ids_from_value(parsed))[: options.max_sessions]
++
++    if any(candidate.get("timestamp") is not None for candidate in candidates):
++        cutoff = datetime.now(timezone.utc) - timedelta(hours=options.window_hours)
++        return [
++            candidate["session_id"]
++            for candidate in candidates
++            if candidate.get("timestamp") is not None and candidate["timestamp"] >= cutoff
++        ]
++
++    return [candidate["session_id"] for candidate in candidates][: options.max_sessions]
++
++
++def unique_session_candidates(candidates: list[dict]) -> list[dict]:
++    seen = set()
++    unique = []
++    for candidate in candidates:
++        session_id = candidate.get("session_id")
++        if not session_id or session_id in seen:
++            continue
++        seen.add(session_id)
++        unique.append(candidate)
++    return unique
++
++
++def session_candidates_from_value(value: Any) -> list[dict]:
++    if isinstance(value, list):
++        candidates = []
++        for item in value:
++            candidates.extend(session_candidates_from_value(item))
++        return candidates
++    if isinstance(value, dict):
++        session_id = session_list_session_id(value)
++        if session_id:
++            return [
++                {
++                    "session_id": session_id,
++                    "timestamp": session_list_timestamp(value),
++                }
++            ]
++        candidates = []
++        for item in value.values():
++            candidates.extend(session_candidates_from_value(item))
++        return candidates
++    return []
+ 
+ 
+-def discover_session_ids() -> list[str]:
+-    command = opencode_command() + ["session", "list"]
++def session_list_session_id(obj: dict) -> str | None:
++    for key in SESSION_ID_KEYS:
++        value = obj.get(key)
++        if not isinstance(value, str):
++            continue
++        match = SESSION_ID_RE.search(value)
++        if match:
++            return match.group(0)
++    return None
++
++
++def session_list_timestamp(obj: dict) -> datetime | None:
++    for key in SESSION_TIMESTAMP_KEYS:
++        converted = timestamp_datetime(obj.get(key))
++        if converted:
++            return converted
++    return None
++
++
++def timestamp_datetime(value) -> datetime | None:
++    if isinstance(value, (int, float)):
++        return numeric_timestamp_datetime(value)
++    if not isinstance(value, str) or not value.strip():
++        return None
++    stripped = value.strip()
++    if re.fullmatch(r"\d+(\.\d+)?", stripped):
++        return numeric_timestamp_datetime(float(stripped))
++    normalized = stripped.replace("Z", "+00:00")
+     try:
+-        completed = subprocess.run(
+-            command,
+-            check=True,
+-            capture_output=True,
+-            text=True,
+-        )
+-    except (OSError, subprocess.CalledProcessError):
+-        return []
+-    return parse_session_list_stdout(completed.stdout)
++        parsed = datetime.fromisoformat(normalized)
++    except ValueError:
++        return None
++    if parsed.tzinfo is None:
++        parsed = parsed.replace(tzinfo=timezone.utc)
++    return parsed.astimezone(timezone.utc)
++
+ 
++def numeric_timestamp_datetime(value: int | float) -> datetime | None:
++    seconds = value / 1000 if value > 10_000_000_000 else value
++    try:
++        return datetime.fromtimestamp(seconds, tz=timezone.utc)
++    except (OverflowError, OSError, ValueError):
++        return None
+ 
+-def requested_session_ids(args: list[str]) -> list[str]:
++
++def discover_session_ids(options: Options, deadline: Deadline) -> tuple[list[str], bool]:
++    stdout, timed_out = run_opencode(["session", "list", "--json"], options, deadline)
++    if timed_out:
++        return [], True
++    if stdout is None:
++        return [], False
++    return parse_session_list_stdout(stdout, options), False
++
++
++def requested_session_ids(
++    args: list[str], options: Options, deadline: Deadline
++) -> tuple[list[str], bool]:
+     if args:
+-        return unique_values(args)
+-    return discover_session_ids()
++        return unique_values(args), False
++    return discover_session_ids(options, deadline)
+ 
+ 
+ def numeric_timestamp(value) -> str | None:
+@@ -174,6 +337,53 @@ def opencode_command() -> list[str]:
+     return shlex.split(configured) or ["opencode"]
+ 
+ 
++def run_opencode(
++    args: list[str], options: Options, deadline: Deadline
++) -> tuple[str | None, bool]:
++    timeout = deadline.call_timeout(options.call_timeout)
++    if timeout <= 0:
++        return None, True
++    try:
++        process = subprocess.Popen(
++            opencode_command() + args,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,
++            stdin=subprocess.DEVNULL,
++            text=True,
++            start_new_session=True,
++        )
++    except OSError:
++        return None, False
++
++    try:
++        stdout, _stderr = process.communicate(timeout=timeout)
++    except subprocess.TimeoutExpired:
++        kill_process_group(process)
++        return None, True
++
++    if process.returncode != 0:
++        return None, False
++    return stdout, False
++
++
++def kill_process_group(process: subprocess.Popen) -> None:
++    try:
++        os.killpg(process.pid, signal.SIGKILL)
++    except (OSError, ProcessLookupError):
++        try:
++            process.kill()
++        except OSError:
++            pass
++    try:
++        process.communicate(timeout=1)
++    except subprocess.TimeoutExpired:
++        try:
++            process.kill()
++        except OSError:
++            pass
++        process.communicate()
++
++
+ def parse_export_stdout(stdout: str) -> Any | None:
+     try:
+         return json.loads(stdout)
+@@ -181,18 +391,15 @@ def parse_export_stdout(stdout: str) -> Any | None:
+         return None
+ 
+ 
+-def export_session(session_id: str) -> Any | None:
+-    command = opencode_command() + ["export", session_id]
+-    try:
+-        completed = subprocess.run(
+-            command,
+-            check=True,
+-            capture_output=True,
+-            text=True,
+-        )
+-    except (OSError, subprocess.CalledProcessError):
+-        return None
+-    return parse_export_stdout(completed.stdout)
++def export_session(
++    session_id: str, options: Options, deadline: Deadline
++) -> tuple[Any | None, bool]:
++    stdout, timed_out = run_opencode(["export", session_id], options, deadline)
++    if timed_out:
++        return None, True
++    if stdout is None:
++        return None, False
++    return parse_export_stdout(stdout), False
+ 
+ 
+ def exported_message_items(exported: Any) -> list[dict]:
+@@ -229,19 +436,39 @@ def record_from_message(default_session_id: str, index: int, obj: dict) -> dict
+     return record
+ 
+ 
++def records_from_exported_session(session_id: str, exported: Any) -> list[dict]:
++    records = []
++    for index, obj in enumerate(exported_message_items(exported), start=1):
++        record = record_from_message(session_id, index, obj)
++        if record:
++            records.append(record)
++    return records
++
++
++def collect_records(
++    session_ids: list[str], options: Options, deadline: Deadline
++) -> tuple[list[dict], bool]:
++    records = []
++    degraded = False
++    for session_id in session_ids:
++        exported, timed_out = export_session(session_id, options, deadline)
++        if timed_out:
++            degraded = True
++            break
++        if exported is None:
++            continue
++        records.extend(records_from_exported_session(session_id, exported))
++    return records, degraded
++
++
+ def emit_record(record: dict, out) -> None:
+     out.write(json.dumps(record, separators=(",", ":")))
+     out.write("\n")
+ 
+ 
+-def emit_session(session_id: str, out) -> None:
+-    exported = export_session(session_id)
+-    if exported is None:
+-        return
+-    for index, obj in enumerate(exported_message_items(exported), start=1):
+-        record = record_from_message(session_id, index, obj)
+-        if record:
+-            emit_record(record, out)
++def emit_degraded_marker(records: list[dict], out) -> None:
++    count = sum(1 for record in records if record.get("role") == "assistant")
++    emit_record({"degraded": True, "count": count}, out)
+ 
+ 
+ def main() -> int:
+@@ -249,9 +476,16 @@ def main() -> int:
+         print("usage: opencode-turns BASE_DIR [SESSION_ID ...]", file=sys.stderr)
+         return 2
+     _base_dir = sys.argv[1]
++    options = Options()
++    deadline = Deadline(options.deadline)
+     out = sys.stdout
+-    for session_id in requested_session_ids(sys.argv[2:]):
+-        emit_session(session_id, out)
++
++    session_ids, discovery_degraded = requested_session_ids(sys.argv[2:], options, deadline)
++    records, export_degraded = collect_records(session_ids, options, deadline)
++    for record in records:
++        emit_record(record, out)
++    if discovery_degraded or export_degraded:
++        emit_degraded_marker(records, out)
+     return 0
+ 
+ 
+diff --git a/scripts/tests/opencode-turns.test.sh b/scripts/tests/opencode-turns.test.sh
+new file mode 100644
+index 0000000..8391837
+--- /dev/null
++++ b/scripts/tests/opencode-turns.test.sh
+@@ -0,0 +1,190 @@
++#!/usr/bin/env bash
++#
++# Run from the repo root:
++#   cd <repo-root> && scripts/tests/opencode-turns.test.sh
++
++set -euo pipefail
++
++SCRIPT="$PWD/scripts/opencode-turns"
++
++fail() {
++  echo "$*" >&2
++  exit 1
++}
++
++assert_eq() {
++  local actual="$1"
++  local expected="$2"
++  local label="$3"
++
++  if [[ "$actual" != "$expected" ]]; then
++    fail "$label: expected <$expected>, got <$actual>"
++  fi
++}
++
++assert_status_zero() {
++  local status="$1"
++  local label="$2"
++
++  if [[ "$status" -ne 0 ]]; then
++    fail "$label: expected exit 0, got $status; stderr: $(cat "$RUN_STDERR")"
++  fi
++}
++
++assert_stdout_contains() {
++  local pattern="$1"
++  local label="$2"
++
++  if ! grep -Fq "$pattern" "$RUN_STDOUT"; then
++    fail "$label: stdout did not contain <$pattern>; stdout: $(cat "$RUN_STDOUT")"
++  fi
++}
++
++assert_stdout_not_contains() {
++  local pattern="$1"
++  local label="$2"
++
++  if grep -Fq "$pattern" "$RUN_STDOUT"; then
++    fail "$label: stdout unexpectedly contained <$pattern>; stdout: $(cat "$RUN_STDOUT")"
++  fi
++}
++
++write_window_filter_mock() {
++  local path="$1"
++
++  cat >"$path" <<'MOCK_OPENCODE'
++#!/usr/bin/env bash
++set -euo pipefail
++
++if [[ "$1" == "session" && "$2" == "list" && "${3:-}" == "--json" ]]; then
++  python3 - <<'PY'
++import json
++from datetime import datetime, timedelta, timezone
++
++now = datetime.now(timezone.utc)
++sessions = [
++    {"id": "ses_recent_one", "updatedAt": (now - timedelta(hours=1)).isoformat().replace("+00:00", "Z")},
++    {"sessionID": "ses_recent_two", "createdAt": (now - timedelta(hours=5)).isoformat().replace("+00:00", "Z")},
++    {"sessionId": "ses_old", "updatedAt": (now - timedelta(hours=9)).isoformat().replace("+00:00", "Z")},
++    {"id": "ses_without_timestamp"},
++]
++print(json.dumps(sessions))
++PY
++  exit 0
++fi
++
++if [[ "$1" == "export" ]]; then
++  session_id="$2"
++  printf '%s\n' "$session_id" >>"$OPENCODE_TURNS_EXPORT_LOG"
++  printf '[{"sessionID":"%s","messageID":"turn-%s","timestamp":"2099-01-01T00:00:00Z","role":"assistant","content":"ok"}]\n' "$session_id" "$session_id"
++  exit 0
++fi
++
++echo "unexpected opencode args: $*" >&2
++exit 64
++MOCK_OPENCODE
++
++  chmod +x "$path"
++}
++
++write_timeout_mock() {
++  local path="$1"
++
++  cat >"$path" <<'MOCK_OPENCODE'
++#!/usr/bin/env bash
++set -euo pipefail
++
++if [[ "$1" == "session" && "$2" == "list" && "${3:-}" == "--json" ]]; then
++  cat <<'JSON'
++[
++  {"id":"ses_fast"},
++  {"id":"ses_slow"}
++]
++JSON
++  exit 0
++fi
++
++if [[ "$1" == "export" ]]; then
++  session_id="$2"
++  printf '%s\n' "$session_id" >>"$OPENCODE_TURNS_EXPORT_LOG"
++  if [[ "$session_id" == "ses_slow" ]]; then
++    sleep 5
++  fi
++  printf '[{"sessionID":"%s","messageID":"turn-%s","timestamp":"2099-01-01T00:00:00Z","role":"assistant","content":"ok"}]\n' "$session_id" "$session_id"
++  exit 0
++fi
++
++echo "unexpected opencode args: $*" >&2
++exit 64
++MOCK_OPENCODE
++
++  chmod +x "$path"
++}
++
++run_opencode_turns() {
++  local tmpdir="$1"
++  local opencode_bin="$2"
++
++  RUN_STDOUT="$tmpdir/stdout.jsonl"
++  RUN_STDERR="$tmpdir/stderr.txt"
++  OPENCODE_TURNS_EXPORT_LOG="$tmpdir/exports.log"
++  export OPENCODE_TURNS_EXPORT_LOG
++  : >"$OPENCODE_TURNS_EXPORT_LOG"
++
++  set +e
++  OPENCODE_BIN="$opencode_bin" \
++    OPENCODE_TURNS_WINDOW_HOURS="${OPENCODE_TURNS_WINDOW_HOURS:-6}" \
++    OPENCODE_TURNS_MAX_SESSIONS="${OPENCODE_TURNS_MAX_SESSIONS:-25}" \
++    OPENCODE_TURNS_CALL_TIMEOUT="${OPENCODE_TURNS_CALL_TIMEOUT:-20}" \
++    OPENCODE_TURNS_DEADLINE="${OPENCODE_TURNS_DEADLINE:-60}" \
++    "$SCRIPT" "$tmpdir/opencode-root" >"$RUN_STDOUT" 2>"$RUN_STDERR"
++  RUN_STATUS=$?
++  set -e
++}
++
++test_exports_only_recent_window_sessions() {
++  local tmpdir
++  tmpdir="$(mktemp -d)"
++  trap "rm -rf '$tmpdir'" RETURN
++
++  mkdir -p "$tmpdir/bin"
++  write_window_filter_mock "$tmpdir/bin/opencode"
++
++  run_opencode_turns "$tmpdir" "$tmpdir/bin/opencode"
++
++  assert_status_zero "$RUN_STATUS" "$FUNCNAME"
++  assert_eq "$(cat "$OPENCODE_TURNS_EXPORT_LOG")" $'ses_recent_one\nses_recent_two' "$FUNCNAME exports"
++  assert_stdout_contains '"session_id":"ses_recent_one"' "$FUNCNAME recent one"
++  assert_stdout_contains '"session_id":"ses_recent_two"' "$FUNCNAME recent two"
++  assert_stdout_not_contains 'ses_old' "$FUNCNAME old excluded"
++  assert_stdout_not_contains 'ses_without_timestamp' "$FUNCNAME timestampless excluded when list has timestamps"
++  assert_stdout_not_contains '"degraded":true' "$FUNCNAME not degraded"
++}
++
++test_timeout_emits_degraded_best_effort_and_exits_zero() {
++  local tmpdir
++  tmpdir="$(mktemp -d)"
++  trap "rm -rf '$tmpdir'" RETURN
++
++  mkdir -p "$tmpdir/bin"
++  write_timeout_mock "$tmpdir/bin/opencode"
++
++  local start end elapsed
++  start="$(date +%s)"
++  OPENCODE_TURNS_CALL_TIMEOUT=1 OPENCODE_TURNS_DEADLINE=3 run_opencode_turns "$tmpdir" "$tmpdir/bin/opencode"
++  end="$(date +%s)"
++  elapsed=$((end - start))
++
++  assert_status_zero "$RUN_STATUS" "$FUNCNAME"
++  assert_stdout_contains '"session_id":"ses_fast"' "$FUNCNAME fast record"
++  assert_stdout_contains '"degraded":true' "$FUNCNAME degraded marker"
++  assert_stdout_contains '"count":1' "$FUNCNAME best count"
++  if [[ "$elapsed" -gt 4 ]]; then
++    fail "$FUNCNAME: expected deadline-bounded execution, took ${elapsed}s"
++  fi
++}
++
++test_exports_only_recent_window_sessions
++test_timeout_emits_degraded_best_effort_and_exits_zero
++
++echo "opencode-turns tests passed"

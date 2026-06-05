@@ -1,0 +1,18 @@
+# tsb gate evidence
+
+Base diff regenerated with `git diff 9545ff8` into `planning/tsb-gate/gates/diff.patch`.
+
+The following gates were run with `OULIPOLY_DATA_DIR` unset and XDG paths isolated:
+
+- `cargo fmt --all -- --check` passed.
+- `cargo clippy --workspace --all-targets -- -D warnings` passed.
+- `cargo test --workspace` passed.
+- `scripts/tests/opencode-turns.test.sh` passed.
+
+Targeted evidence still covered by the workspace test run:
+
+- `sessions::tests::degraded_marker_is_reported_without_malformed_turn_error` passed.
+- `sessions::tests::turn_script_timeout_is_classified_and_does_not_persist_turns` passed.
+- `quota::process::tests::quota_script_timeout_is_classified` passed.
+- `quota::process::tests::quota_script_timeout_kills_process_group_children` passed.
+- `tests/age243_s7a_session_dispatch.rs` passed, including `opencode_read_turns_ingests_normalized_jsonl`.
