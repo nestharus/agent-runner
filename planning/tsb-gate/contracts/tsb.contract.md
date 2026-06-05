@@ -44,11 +44,16 @@ Only added or meaningfully changed production functions are listed for Rust file
 | `is_degraded_marker` | `predicate` | Answers whether a parsed JSON value is the degraded marker. | None. |
 | `degraded_marker_count` | `accessor` | Reads the optional degraded marker count, defaulting to zero. | None. |
 | `format_degraded_marker_error` | `formatter` | Formats the runtime error text for a degraded marker count. | None. |
+| `non_empty_script_lines` | `orchestration` | Composes script stdout line trimming and non-empty line selection through named helpers. | None. |
+| `trimmed_script_lines` | `mapper` | Maps raw stdout lines into trimmed line values. | None. |
+| `non_empty_trimmed_lines` | `filter` | Selects non-empty trimmed script lines. | None. |
 | `run_turn_script` | `orchestration` | Runs a provider turn script with caller-supplied timeout. | None. |
 | `run_session_script` | `orchestration` | Runs a session script with the default runtime deadline. | None. |
 | `run_session_script_with_timeout` | `orchestration` | Spawns session script, drains stdout/stderr, waits with supplied timeout, validates exit, and returns stdout. | None; sequencing is thin around named helpers. |
 | `session_script_command` | `mapper` | Maps script/state/session inputs to a configured child `Command`. | None. |
 | `configure_session_script_process_group` | `mapper` | Adds process-group configuration to session script commands on Unix; no-op elsewhere. | None. |
+| `spawn_script_reader` | `orchestration` | Spawns a reader-drain thread and delegates stream draining to a named helper. | None. |
+| `drain_script_reader_to_string` | `accessor` | Reads a script stdout/stderr stream into a string. | None. |
 | `wait_for_session_script` | `orchestration` | Polls child process until completion, timeout, or wait error. | None. |
 | `wait_for_pending_session_script` | `orchestration` | Applies pending-state timeout/sleep behavior through named timeout helpers. | None; predicate, kill action, and message formatting are delegated. |
 | `pending_session_script_timed_out` | `predicate` | Answers whether the pending session-script wait exceeded its deadline. | None. |
@@ -123,12 +128,18 @@ Only added or meaningfully changed production functions are listed for Rust file
 | `message_record_fields` | `parser` | Extracts normalized required record fields from one exported message object. | None. |
 | `has_required_message_record_fields` | `validator` | Validates that session ID, role, and timestamp are present before emission. | None. |
 | `message_record_from_fields` | `mapper` | Maps validated fields and turn ID into the normalized record base. | None. |
+| `record_with_optional_body` | `mapper` | Maps a base normalized record plus optional body chunks into the emitted record shape. | None. |
 | `message_body_chunks` | `parser` | Extracts optional normalized body chunks from supported message content fields. | None. |
 | `records_from_exported_session` | `mapper` | Maps all exported message items into normalized records. | None. |
 | `collect_records` | `orchestration` | Iterates sessions, exports each one, stops on timeout, and returns records plus degraded state. | None. |
 | `emit_record` | `formatter` | Emits one compact JSONL record. | None. |
-| `emit_degraded_marker` | `formatter` | Emits compact JSONL degraded marker with assistant-turn count. | None. |
-| `main` | `orchestration` | CLI entry point that validates argv shape, constructs options/deadline, collects records, emits records, and emits degraded marker when needed. | None. |
+| `assistant_record_count` | `filter` | Counts collected assistant records for degraded-marker reporting. | None. |
+| `emit_degraded_marker` | `formatter` | Emits compact JSONL degraded marker from a supplied assistant-turn count. | None. |
+| `has_base_dir_arg` | `validator` | Validates that argv includes the compatibility base-dir argument. | None. |
+| `usage_message` | `formatter` | Formats the adapter CLI usage message. | None. |
+| `emit_usage` | `formatter` | Emits the usage message to the supplied stream. | None. |
+| `session_args_from_argv` | `accessor` | Exposes explicit session ID arguments from argv after the base-dir slot. | None. |
+| `main` | `orchestration` | CLI entry point that delegates argv boundary handling, constructs options/deadline, collects records, emits records, and emits degraded marker when needed. | None. |
 
 ## Adapter declarations
 
@@ -140,6 +151,8 @@ adapter_declarations:
       - OpenCode public CLI surface (`opencode session list --json`, `opencode export <sessionID>`)
       - Oulipoly session turn JSONL contract (`session_id`, `turn_id`, `timestamp`, `role`, optional `body`)
       - Oulipoly degraded turn-scan marker contract (`degraded: true`, `count`)
+      - Python stdlib process/time surface (`subprocess`, `signal`, `os`, `time`, `datetime`)
+      - Python stdlib data/argv parsing surface (`json`, `re`, `shlex`, `sys`)
   - component: crates/oulipoly-runtime/src/sessions/mod.rs
     role: adapter
     Translates:
@@ -162,12 +175,16 @@ Runtime-side deadline owner note: `crates/oulipoly-runtime/src/sessions/mod.rs` 
 intrinsic_surface_declarations:
   - component: scripts/opencode-turns
     role: intrinsic-surface
-    Domain: opencode_turns_adapter_options
+    Domain: opencode_turns_adapter_runtime
     Owns:
       - OPENCODE_TURNS_WINDOW_HOURS
       - OPENCODE_TURNS_MAX_SESSIONS
       - OPENCODE_TURNS_CALL_TIMEOUT
       - OPENCODE_TURNS_DEADLINE
+      - Python stdlib process spawn contract (`subprocess.Popen`, `subprocess.PIPE`, `subprocess.DEVNULL`, `subprocess.TimeoutExpired`)
+      - Python stdlib process-group kill contract (`os.killpg`, `signal.SIGKILL`, fallback `process.kill`)
+      - Python stdlib deadline and timestamp contract (`time.monotonic`, `datetime`, `timedelta`, `timezone`)
+      - Python stdlib data/argv parsing contract (`json`, `re`, `shlex`, `sys`)
   - component: crates/oulipoly-runtime/src/sessions/mod.rs
     role: intrinsic-surface
     Domain: session_script_execution_deadline
@@ -188,3 +205,28 @@ intrinsic_surface_declarations:
 ```
 
 No other intrinsic surfaces are declared for this gate.
+
+## Test-harness declarations
+
+```yaml
+test_harness_declarations:
+  - component: crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs
+    role: test-harness
+    Surface:
+      - runtime provider/session dispatch integration-test surface
+      - oulipoly-config model/provider/session config fixture surface
+      - oulipoly-provider client/options/session contract surface
+      - oulipoly-state StateDb fixture and SQLite snapshot surface
+      - rusqlite query/assertion surface
+      - serde_json envelope/request/response fixture surface
+      - std filesystem/env/temp-path fixture surface
+  - component: scripts/tests/opencode-turns.test.sh
+    role: test-harness
+    Surface:
+      - scripts/opencode-turns adapter invocation surface
+      - mock OpenCode CLI shell surface
+      - OPENCODE_TURNS env option surface
+      - stdout/stderr/export-log assertion surface
+      - Python JSON/datetime helper fixture surface
+      - shell process deadline and descendant-marker proof surface
+```

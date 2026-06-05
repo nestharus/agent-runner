@@ -282,6 +282,9 @@ fn no_ref_dispatch_aware_lifecycle_path_preserves_session_capture_marker_and_sql
     let unrelated = Fixture::new();
     let unrelated_registry = ProviderRegistryHandle::new(Arc::new(unrelated.unrelated_registry()));
 
+    assert_no_ref_dispatch_fixture_row_id(&baseline);
+    assert_no_ref_dispatch_fixture_row_id(&dispatch);
+
     let baseline_output = session_provider::dispatch_aware_no_ref_lifecycle_proof(
         baseline.request_without_registry(),
     )
@@ -830,6 +833,7 @@ fn assert_error_token(error: &impl Display, expected_token: &str) {
 
 struct NoRefDispatchProofFixture {
     fixture: Fixture,
+    invocation_row_id: i64,
 }
 
 impl NoRefDispatchProofFixture {
@@ -837,16 +841,15 @@ impl NoRefDispatchProofFixture {
         let fixture = Fixture::new();
         let invocation_uuid = "33333333-3333-4333-8333-333333333333";
         let invocation_row_id = fixture.seed_finalized_invocation(invocation_uuid);
-        assert_eq!(
-            invocation_row_id, 1,
-            "fresh proof fixture should use row id 1"
-        );
         fixture.seed_chain(
             "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
             PROVIDER_NAME,
             SESSION_ID,
         );
-        Self { fixture }
+        Self {
+            fixture,
+            invocation_row_id,
+        }
     }
 
     fn request_without_registry<'a>(&'a self) -> session_provider::NoRefProofRequest<'a> {
@@ -856,7 +859,7 @@ impl NoRefDispatchProofFixture {
             model_name: MODEL,
             provider_name: PROVIDER_NAME,
             session_id: SESSION_ID,
-            invocation_row_id: 1,
+            invocation_row_id: self.invocation_row_id,
             invocation_uuid: "33333333-3333-4333-8333-333333333333",
         }
     }
@@ -874,6 +877,13 @@ impl NoRefDispatchProofFixture {
     fn snapshot(&self) -> SqliteSnapshot {
         self.fixture.snapshot()
     }
+}
+
+fn assert_no_ref_dispatch_fixture_row_id(fixture: &NoRefDispatchProofFixture) {
+    assert_eq!(
+        fixture.invocation_row_id, 1,
+        "fresh proof fixture should use row id 1"
+    );
 }
 
 fn hostile_marker(fixture: &Fixture, route: &str) -> PathBuf {

@@ -541,10 +541,7 @@ def record_from_message(default_session_id: str, index: int, obj: dict) -> dict 
     record = message_record_from_fields(
         fields, turn_id_from_obj(obj, default_session_id, index)
     )
-    body = message_body_chunks(obj)
-    if body:
-        record["body"] = body
-    return record
+    return record_with_optional_body(record, message_body_chunks(obj))
 
 
 def message_record_fields(default_session_id: str, obj: dict) -> dict:
@@ -566,6 +563,12 @@ def message_record_from_fields(fields: dict, turn_id: str) -> dict:
         "timestamp": fields["timestamp"],
         "role": fields["role"],
     }
+
+
+def record_with_optional_body(record: dict, body: list) -> dict:
+    if not body:
+        return record
+    return {**record, "body": body}
 
 
 def message_body_chunks(obj: dict) -> list:
@@ -606,26 +609,46 @@ def emit_record(record: dict, out) -> None:
     out.write("\n")
 
 
-def emit_degraded_marker(records: list[dict], out) -> None:
-    count = sum(1 for record in records if record.get("role") == "assistant")
+def assistant_record_count(records: list[dict]) -> int:
+    return sum(1 for record in records if record.get("role") == "assistant")
+
+
+def emit_degraded_marker(count: int, out) -> None:
     emit_record({"degraded": True, "count": count}, out)
 
 
+def has_base_dir_arg(argv: list[str]) -> bool:
+    return len(argv) >= 2
+
+
+def usage_message() -> str:
+    return "usage: opencode-turns BASE_DIR [SESSION_ID ...]"
+
+
+def emit_usage(out) -> None:
+    print(usage_message(), file=out)
+
+
+def session_args_from_argv(argv: list[str]) -> list[str]:
+    return argv[2:]
+
+
 def main() -> int:
-    if len(sys.argv) < 2:
-        print("usage: opencode-turns BASE_DIR [SESSION_ID ...]", file=sys.stderr)
+    if not has_base_dir_arg(sys.argv):
+        emit_usage(sys.stderr)
         return 2
-    _base_dir = sys.argv[1]
     options = Options()
     deadline = Deadline(options.deadline)
     out = sys.stdout
 
-    session_ids, discovery_degraded = requested_session_ids(sys.argv[2:], options, deadline)
+    session_ids, discovery_degraded = requested_session_ids(
+        session_args_from_argv(sys.argv), options, deadline
+    )
     records, export_degraded = collect_records(session_ids, options, deadline)
     for record in records:
         emit_record(record, out)
     if discovery_degraded or export_degraded:
-        emit_degraded_marker(records, out)
+        emit_degraded_marker(assistant_record_count(records), out)
     return 0
 
 

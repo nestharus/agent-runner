@@ -49,6 +49,78 @@ assert_stdout_not_contains() {
   fi
 }
 
+file_size_bytes() {
+  local path="$1"
+
+  if [[ ! -f "$path" ]]; then
+    echo 0
+    return
+  fi
+  wc -c <"$path" | tr -d ' '
+}
+
+assert_marker_stopped_growing() {
+  local marker="$1"
+  local label="$2"
+  local before after
+
+  before="$(file_size_bytes "$marker")"
+  sleep 1
+  after="$(file_size_bytes "$marker")"
+  if [[ "$before" != "$after" ]]; then
+    fail "$label: descendant marker kept growing after timeout kill ($before -> $after bytes)"
+  fi
+}
+
+assert_process_not_running() {
+  local pid="$1"
+  local label="$2"
+  local state
+
+  if ! kill -0 "$pid" 2>/dev/null; then
+    return
+  fi
+  state="$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+  if [[ "$state" == Z* ]]; then
+    return
+  fi
+  fail "$label: descendant process $pid survived timeout kill with state <$state>"
+}
+
+write_timestampless_cap_mock() {
+  local path="$1"
+
+  cat >"$path" <<'MOCK_OPENCODE'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$1" == "session" && "$2" == "list" && "${3:-}" == "--json" ]]; then
+  cat <<'JSON'
+[
+  {"id":"ses_cap_one"},
+  {"id":"ses_cap_two"},
+  {"id":"ses_cap_three"},
+  {"id":"ses_cap_four"},
+  {"id":"ses_cap_five"}
+]
+JSON
+  exit 0
+fi
+
+if [[ "$1" == "export" ]]; then
+  session_id="$2"
+  printf '%s\n' "$session_id" >>"$OPENCODE_TURNS_EXPORT_LOG"
+  printf '[{"sessionID":"%s","messageID":"turn-%s","timestamp":"2099-01-01T00:00:00Z","role":"assistant","content":"ok"}]\n' "$session_id" "$session_id"
+  exit 0
+fi
+
+echo "unexpected opencode args: $*" >&2
+exit 64
+MOCK_OPENCODE
+
+  chmod +x "$path"
+}
+
 write_window_filter_mock() {
   local path="$1"
 
@@ -121,6 +193,40 @@ MOCK_OPENCODE
   chmod +x "$path"
 }
 
+write_descendant_timeout_mock() {
+  local path="$1"
+
+  cat >"$path" <<'MOCK_OPENCODE'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$1" == "session" && "$2" == "list" && "${3:-}" == "--json" ]]; then
+  printf '[{"id":"ses_descendant"}]\n'
+  exit 0
+fi
+
+if [[ "$1" == "export" ]]; then
+  session_id="$2"
+  printf '%s\n' "$session_id" >>"$OPENCODE_TURNS_EXPORT_LOG"
+  (
+    printf tick >>"$OPENCODE_TURNS_DESCENDANT_MARKER"
+    while true; do
+      sleep 0.2
+      printf tick >>"$OPENCODE_TURNS_DESCENDANT_MARKER"
+    done
+  ) &
+  printf '%s\n' "$!" >"$OPENCODE_TURNS_DESCENDANT_PID"
+  sleep 30
+  exit 0
+fi
+
+echo "unexpected opencode args: $*" >&2
+exit 64
+MOCK_OPENCODE
+
+  chmod +x "$path"
+}
+
 run_opencode_turns() {
   local tmpdir="$1"
   local opencode_bin="$2"
@@ -140,6 +246,25 @@ run_opencode_turns() {
     "$SCRIPT" "$tmpdir/opencode-root" >"$RUN_STDOUT" 2>"$RUN_STDERR"
   RUN_STATUS=$?
   set -e
+}
+
+test_timestampless_session_list_applies_max_sessions_cap() {
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  trap "rm -rf '$tmpdir'" RETURN
+
+  mkdir -p "$tmpdir/bin"
+  write_timestampless_cap_mock "$tmpdir/bin/opencode"
+
+  OPENCODE_TURNS_MAX_SESSIONS=3 run_opencode_turns "$tmpdir" "$tmpdir/bin/opencode"
+
+  assert_status_zero "$RUN_STATUS" "$FUNCNAME"
+  assert_eq "$(cat "$OPENCODE_TURNS_EXPORT_LOG")" $'ses_cap_one\nses_cap_two\nses_cap_three' "$FUNCNAME exports"
+  assert_eq "$(wc -l <"$OPENCODE_TURNS_EXPORT_LOG" | tr -d ' ')" "3" "$FUNCNAME export count"
+  assert_stdout_contains '"session_id":"ses_cap_one"' "$FUNCNAME cap one"
+  assert_stdout_contains '"session_id":"ses_cap_three"' "$FUNCNAME cap three"
+  assert_stdout_not_contains 'ses_cap_four' "$FUNCNAME cap excludes fourth"
+  assert_stdout_not_contains 'ses_cap_five' "$FUNCNAME cap excludes fifth"
 }
 
 test_exports_only_recent_window_sessions() {
@@ -184,7 +309,34 @@ test_timeout_emits_degraded_best_effort_and_exits_zero() {
   fi
 }
 
+test_timeout_kills_opencode_process_group_descendant() {
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  trap "rm -rf '$tmpdir'" RETURN
+
+  mkdir -p "$tmpdir/bin"
+  write_descendant_timeout_mock "$tmpdir/bin/opencode"
+  OPENCODE_TURNS_DESCENDANT_MARKER="$tmpdir/descendant-marker"
+  OPENCODE_TURNS_DESCENDANT_PID="$tmpdir/descendant.pid"
+  export OPENCODE_TURNS_DESCENDANT_MARKER OPENCODE_TURNS_DESCENDANT_PID
+
+  OPENCODE_TURNS_CALL_TIMEOUT=1 OPENCODE_TURNS_DEADLINE=3 run_opencode_turns "$tmpdir" "$tmpdir/bin/opencode"
+
+  assert_status_zero "$RUN_STATUS" "$FUNCNAME"
+  assert_stdout_contains '"degraded":true' "$FUNCNAME degraded marker"
+  assert_stdout_contains '"count":0' "$FUNCNAME no completed assistant records"
+  [[ -s "$OPENCODE_TURNS_DESCENDANT_PID" ]] || fail "$FUNCNAME: descendant pid file was not written"
+  [[ -s "$OPENCODE_TURNS_DESCENDANT_MARKER" ]] || fail "$FUNCNAME: descendant marker was not written"
+
+  local descendant_pid
+  descendant_pid="$(cat "$OPENCODE_TURNS_DESCENDANT_PID")"
+  assert_marker_stopped_growing "$OPENCODE_TURNS_DESCENDANT_MARKER" "$FUNCNAME"
+  assert_process_not_running "$descendant_pid" "$FUNCNAME"
+}
+
+test_timestampless_session_list_applies_max_sessions_cap
 test_exports_only_recent_window_sessions
 test_timeout_emits_degraded_best_effort_and_exits_zero
+test_timeout_kills_opencode_process_group_descendant
 
 echo "opencode-turns tests passed"

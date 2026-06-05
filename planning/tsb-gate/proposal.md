@@ -18,25 +18,25 @@ Runtime claim: Implicit OpenCode discovery is recent-window bounded when session
 
 Proof method: `scripts/tests/opencode-turns.test.sh::test_exports_only_recent_window_sessions`.
 
-Evidence-class match: script integration; mock sessions at 1h and 5h are exported, the 9h session and the timestampless session are excluded, stdout contains only recent session IDs, and no degraded marker is emitted. Evidence log records the shell suite as `opencode-turns tests passed` but does not enumerate this function name.
+Evidence-class match: script integration; mock sessions at 1h and 5h are exported, the 9h session and the timestampless session are excluded, stdout contains only recent session IDs, and no degraded marker is emitted. Evidence log records the shell suite command as passed.
 
 Runtime claim: OpenCode export timeout degrades best-effort instead of hanging provider selection.
 
 Proof method: `scripts/tests/opencode-turns.test.sh::test_timeout_emits_degraded_best_effort_and_exits_zero`.
 
-Evidence-class match: script integration; with `OPENCODE_TURNS_CALL_TIMEOUT=1` and `OPENCODE_TURNS_DEADLINE=3`, the adapter exits 0, emits the fast session record, emits `"degraded":true`, emits `"count":1`, and finishes within the asserted elapsed bound. Evidence log records the shell suite as `opencode-turns tests passed` but does not enumerate this function name.
+Evidence-class match: script integration; with `OPENCODE_TURNS_CALL_TIMEOUT=1` and `OPENCODE_TURNS_DEADLINE=3`, the adapter exits 0, emits the fast session record, emits `"degraded":true`, emits `"count":1`, and finishes within the asserted elapsed bound. Evidence log records the shell suite command as passed.
 
 Runtime claim: Runtime session ingest recognizes the adapter degraded marker as degradation evidence rather than malformed turn JSON.
 
 Proof method: `crates/oulipoly-runtime/src/sessions/mod.rs::tests::degraded_marker_is_reported_without_malformed_turn_error`.
 
-Evidence-class match: unit; scan over `{"degraded":true,"count":1}` yields `new_turns == 0`, exactly one error containing `degraded`, and no `malformed` error. This is a shipped test, but it is not shown in `planning/tsb-gate/evidence/runtime-tests.log`.
+Evidence-class match: unit; scan over `{"degraded":true,"count":1}` yields `new_turns == 0`, exactly one error containing `degraded`, and no `malformed` error. Evidence log records this related regression test by name.
 
 Runtime claim: Runtime session script timeout is classified and proceeds conservatively without persisting turns.
 
 Proof method: `crates/oulipoly-runtime/src/sessions/mod.rs::tests::turn_script_timeout_is_classified_and_does_not_persist_turns`.
 
-Evidence-class match: unit; `scan_provider_with_timeout(..., 1)` against `sleep 60` yields `new_turns == 0`, DB assistant count `0`, one error containing `script_timeout`, and one error containing `turn script`. This is a shipped test, but it is not shown in `planning/tsb-gate/evidence/runtime-tests.log`.
+Evidence-class match: unit; `scan_provider_with_timeout(..., 1)` against `sleep 60` yields `new_turns == 0`, DB assistant count `0`, one error containing `script_timeout`, and one error containing `turn script`. Evidence log records this related regression test by name.
 
 Runtime claim: Runtime quota script timeout is classified with a stable `script_timeout` token.
 
@@ -52,18 +52,18 @@ Evidence-class match: unit, Unix-only; a timed-out quota script starts a backgro
 
 Runtime claim: Timestampless implicit OpenCode discovery falls back to the configured max-session cap.
 
-Proof method: No shipped test directly covers an over-cap timestampless session list or `OPENCODE_TURNS_MAX_SESSIONS` truncation. `test_timeout_emits_degraded_best_effort_and_exits_zero` uses two timestampless sessions, but it does not prove cap enforcement.
+Proof method: `scripts/tests/opencode-turns.test.sh::test_timestampless_session_list_applies_max_sessions_cap`.
 
-Evidence-class match: unproven by shipped tests.
+Evidence-class match: script integration; the mock `opencode session list --json` returns five timestampless sessions, the test runs with `OPENCODE_TURNS_MAX_SESSIONS=3`, and assertions verify exactly the first three sessions are exported while the fourth and fifth are absent from stdout. Evidence log records this proof-risk test by name.
 
 Runtime claim: Python adapter timeout cleanup kills all OpenCode process-group descendants, not just the direct process.
 
-Proof method: No shipped test creates a leaking descendant marker under `scripts/opencode-turns`. The shell timeout test proves elapsed-time bounding and degraded output, not child-process leak absence.
+Proof method: `scripts/tests/opencode-turns.test.sh::test_timeout_kills_opencode_process_group_descendant`.
 
-Evidence-class match: unproven by shipped tests.
+Evidence-class match: script integration; the mock OpenCode export spawns a same-process-group descendant that writes a marker periodically, then wedges past `OPENCODE_TURNS_CALL_TIMEOUT=1`. The test asserts the adapter exits 0 with a degraded marker, the descendant marker stops growing after timeout cleanup, and the descendant process is no longer running. Evidence log records this proof-risk test by name.
 
 Runtime claim: Runtime session-script process-group timeout kills shell grandchildren.
 
-Proof method: No shipped session-script test mirrors the quota child-marker test. `turn_script_timeout_is_classified_and_does_not_persist_turns` proves classification and conservative persistence behavior, not grandchild cleanup.
+Proof method: `crates/oulipoly-runtime/src/sessions/mod.rs::tests::turn_script_timeout_kills_process_group_children`.
 
-Evidence-class match: unproven by shipped tests.
+Evidence-class match: unit, Unix-only; a timed-out session turn script starts a background child that would write a marker after 2s, the timeout fires at 1s, and after 3s the marker does not exist. Evidence log records this proof-risk test by name.

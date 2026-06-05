@@ -205,11 +205,15 @@ fn format_degraded_marker_error(count: u64) -> String {
 }
 
 fn non_empty_script_lines(stdout: &str) -> Vec<&str> {
-    stdout
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect()
+    non_empty_trimmed_lines(trimmed_script_lines(stdout))
+}
+
+fn trimmed_script_lines(stdout: &str) -> Vec<&str> {
+    stdout.lines().map(str::trim).collect()
+}
+
+fn non_empty_trimmed_lines(lines: Vec<&str>) -> Vec<&str> {
+    lines.into_iter().filter(|line| !line.is_empty()).collect()
 }
 
 fn record_script_line_seen(report: &mut ScanReport) -> u64 {
@@ -605,11 +609,16 @@ fn spawn_script_reader<R>(mut reader: R) -> JoinHandle<String>
 where
     R: Read + Send + 'static,
 {
-    std::thread::spawn(move || {
-        let mut buf = String::new();
-        reader.read_to_string(&mut buf).ok();
-        buf
-    })
+    std::thread::spawn(move || drain_script_reader_to_string(&mut reader))
+}
+
+fn drain_script_reader_to_string<R>(reader: &mut R) -> String
+where
+    R: Read,
+{
+    let mut buf = String::new();
+    reader.read_to_string(&mut buf).ok();
+    buf
 }
 
 fn wait_for_session_script(
@@ -733,6 +742,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
 
     fn db() -> StateDb {
         StateDb::open(std::path::Path::new(":memory:")).unwrap()
@@ -953,6 +963,30 @@ EOF"#,
         assert_eq!(r.errors.len(), 1);
         assert!(r.errors[0].contains("script_timeout"), "{:?}", r.errors);
         assert!(r.errors[0].contains("turn script"), "{:?}", r.errors);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn turn_script_timeout_kills_process_group_children() {
+        let db = db();
+        let dir = tempfile::tempdir().unwrap();
+        let leaked_marker = dir.path().join("leaked");
+        let script = fixture_script(&format!(
+            "(sleep 2; printf leaked > {}) & wait",
+            leaked_marker.display()
+        ));
+        let cfg = cfg_with("p", &script.path);
+
+        let r = scan_provider_with_timeout("p", &cfg, &db, 1);
+        std::thread::sleep(Duration::from_secs(3));
+
+        assert_eq!(r.new_turns, 0);
+        assert_eq!(r.errors.len(), 1);
+        assert!(r.errors[0].contains("script_timeout"), "{:?}", r.errors);
+        assert!(
+            !leaked_marker.exists(),
+            "timed-out turn script left a process-group child running"
+        );
     }
 
     #[test]

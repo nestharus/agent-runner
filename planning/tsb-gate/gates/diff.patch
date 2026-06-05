@@ -135,7 +135,7 @@ index 97cf8da..4c0d7ce 100644
 +    }
 +}
 diff --git a/crates/oulipoly-runtime/src/sessions/mod.rs b/crates/oulipoly-runtime/src/sessions/mod.rs
-index 38bc837..e215203 100644
+index 38bc837..bdc79dc 100644
 --- a/crates/oulipoly-runtime/src/sessions/mod.rs
 +++ b/crates/oulipoly-runtime/src/sessions/mod.rs
 @@ -43,10 +43,10 @@ use std::path::PathBuf;
@@ -189,7 +189,7 @@ index 38bc837..e215203 100644
          match script_line_to_ingest(provider_name, line, line_number) {
              Ok(parsed) => {
                  record_optional_scan_error(report, parsed.body_error);
-@@ -161,6 +174,36 @@ fn collect_turn_script_batch(
+@@ -161,12 +174,46 @@ fn collect_turn_script_batch(
      batch
  }
  
@@ -224,9 +224,24 @@ index 38bc837..e215203 100644
 +}
 +
  fn non_empty_script_lines(stdout: &str) -> Vec<&str> {
-     stdout
-         .lines()
-@@ -399,8 +442,12 @@ fn default_app_data_dir() -> PathBuf {
+-    stdout
+-        .lines()
+-        .map(str::trim)
+-        .filter(|line| !line.is_empty())
+-        .collect()
++    non_empty_trimmed_lines(trimmed_script_lines(stdout))
++}
++
++fn trimmed_script_lines(stdout: &str) -> Vec<&str> {
++    stdout.lines().map(str::trim).collect()
++}
++
++fn non_empty_trimmed_lines(lines: Vec<&str>) -> Vec<&str> {
++    lines.into_iter().filter(|line| !line.is_empty()).collect()
+ }
+ 
+ fn record_script_line_seen(report: &mut ScanReport) -> u64 {
+@@ -399,8 +446,12 @@ fn default_app_data_dir() -> PathBuf {
          .unwrap_or_else(|_| PathBuf::from(".").join(oulipoly_state::paths::APP_DATA_DIR_NAME))
  }
  
@@ -241,7 +256,7 @@ index 38bc837..e215203 100644
  }
  
  pub fn locate_transcript(
-@@ -452,6 +499,22 @@ fn run_session_script(
+@@ -452,6 +503,22 @@ fn run_session_script(
      state_dir: &std::path::Path,
      session_id: Option<&str>,
      script_kind: &str,
@@ -264,7 +279,7 @@ index 38bc837..e215203 100644
  ) -> Result<String, String> {
      let mut cmd = session_script_command(script, state_dir, session_id);
      let mut child = spawn_session_script_child(&mut cmd, script_kind)?;
-@@ -461,7 +524,7 @@ fn run_session_script(
+@@ -461,7 +528,7 @@ fn run_session_script(
      // fills up, the script blocks on write, the loop waits for exit forever.
      let stdout_handle = spawn_stdout_reader(take_child_stdout(&mut child));
      let stderr_handle = spawn_stderr_reader(take_child_stderr(&mut child));
@@ -273,7 +288,7 @@ index 38bc837..e215203 100644
      let stdout_text = join_script_reader(stdout_handle);
      let stderr_text = join_script_reader(stderr_handle);
  
-@@ -499,9 +562,20 @@ fn session_script_command(
+@@ -499,9 +566,20 @@ fn session_script_command(
      cmd.stdin(Stdio::null());
      cmd.stdout(Stdio::piped());
      cmd.stderr(Stdio::piped());
@@ -294,8 +309,25 @@ index 38bc837..e215203 100644
  fn spawn_session_script_child(cmd: &mut Command, script_kind: &str) -> Result<Child, String> {
      cmd.spawn()
          .map_err(|error| format_session_script_spawn_error(script_kind, error))
-@@ -538,13 +612,19 @@ where
-     })
+@@ -531,20 +609,31 @@ fn spawn_script_reader<R>(mut reader: R) -> JoinHandle<String>
+ where
+     R: Read + Send + 'static,
+ {
+-    std::thread::spawn(move || {
+-        let mut buf = String::new();
+-        reader.read_to_string(&mut buf).ok();
+-        buf
+-    })
++    std::thread::spawn(move || drain_script_reader_to_string(&mut reader))
++}
++
++fn drain_script_reader_to_string<R>(reader: &mut R) -> String
++where
++    R: Read,
++{
++    let mut buf = String::new();
++    reader.read_to_string(&mut buf).ok();
++    buf
  }
  
 -fn wait_for_session_script(child: &mut Child, script_kind: &str) -> Result<ExitStatus, String> {
@@ -317,7 +349,7 @@ index 38bc837..e215203 100644
              Err(error) => return Err(format_session_script_wait_error(script_kind, error)),
          }
      }
-@@ -559,32 +639,61 @@ fn wait_for_pending_session_script(
+@@ -559,32 +648,61 @@ fn wait_for_pending_session_script(
      start: std::time::Instant,
      timeout: std::time::Duration,
      script_kind: &str,
@@ -389,7 +421,15 @@ index 38bc837..e215203 100644
  }
  
  fn format_session_script_wait_error(script_kind: &str, error: std::io::Error) -> String {
-@@ -831,6 +940,35 @@ EOF"#,
+@@ -624,6 +742,7 @@ mod tests {
+     use super::*;
+     use std::collections::HashMap;
+     use std::os::unix::fs::PermissionsExt;
++    use std::time::Duration;
+ 
+     fn db() -> StateDb {
+         StateDb::open(std::path::Path::new(":memory:")).unwrap()
+@@ -831,6 +950,59 @@ EOF"#,
          assert!(r.errors[0].contains("exited 7"));
      }
  
@@ -406,6 +446,30 @@ index 38bc837..e215203 100644
 +        assert_eq!(r.errors.len(), 1);
 +        assert!(r.errors[0].contains("script_timeout"), "{:?}", r.errors);
 +        assert!(r.errors[0].contains("turn script"), "{:?}", r.errors);
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn turn_script_timeout_kills_process_group_children() {
++        let db = db();
++        let dir = tempfile::tempdir().unwrap();
++        let leaked_marker = dir.path().join("leaked");
++        let script = fixture_script(&format!(
++            "(sleep 2; printf leaked > {}) & wait",
++            leaked_marker.display()
++        ));
++        let cfg = cfg_with("p", &script.path);
++
++        let r = scan_provider_with_timeout("p", &cfg, &db, 1);
++        std::thread::sleep(Duration::from_secs(3));
++
++        assert_eq!(r.new_turns, 0);
++        assert_eq!(r.errors.len(), 1);
++        assert!(r.errors[0].contains("script_timeout"), "{:?}", r.errors);
++        assert!(
++            !leaked_marker.exists(),
++            "timed-out turn script left a process-group child running"
++        );
 +    }
 +
 +    #[test]
@@ -426,10 +490,72 @@ index 38bc837..e215203 100644
      fn script_receives_state_dir_env() {
          let db = db();
 diff --git a/crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs b/crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs
-index ef17867..3d64012 100644
+index ef17867..647b249 100644
 --- a/crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs
 +++ b/crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs
-@@ -1371,9 +1371,8 @@ import sys
+@@ -282,6 +282,9 @@ fn no_ref_dispatch_aware_lifecycle_path_preserves_session_capture_marker_and_sql
+     let unrelated = Fixture::new();
+     let unrelated_registry = ProviderRegistryHandle::new(Arc::new(unrelated.unrelated_registry()));
+ 
++    assert_no_ref_dispatch_fixture_row_id(&baseline);
++    assert_no_ref_dispatch_fixture_row_id(&dispatch);
++
+     let baseline_output = session_provider::dispatch_aware_no_ref_lifecycle_proof(
+         baseline.request_without_registry(),
+     )
+@@ -830,6 +833,7 @@ fn assert_error_token(error: &impl Display, expected_token: &str) {
+ 
+ struct NoRefDispatchProofFixture {
+     fixture: Fixture,
++    invocation_row_id: i64,
+ }
+ 
+ impl NoRefDispatchProofFixture {
+@@ -837,16 +841,15 @@ impl NoRefDispatchProofFixture {
+         let fixture = Fixture::new();
+         let invocation_uuid = "33333333-3333-4333-8333-333333333333";
+         let invocation_row_id = fixture.seed_finalized_invocation(invocation_uuid);
+-        assert_eq!(
+-            invocation_row_id, 1,
+-            "fresh proof fixture should use row id 1"
+-        );
+         fixture.seed_chain(
+             "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+             PROVIDER_NAME,
+             SESSION_ID,
+         );
+-        Self { fixture }
++        Self {
++            fixture,
++            invocation_row_id,
++        }
+     }
+ 
+     fn request_without_registry<'a>(&'a self) -> session_provider::NoRefProofRequest<'a> {
+@@ -856,7 +859,7 @@ impl NoRefDispatchProofFixture {
+             model_name: MODEL,
+             provider_name: PROVIDER_NAME,
+             session_id: SESSION_ID,
+-            invocation_row_id: 1,
++            invocation_row_id: self.invocation_row_id,
+             invocation_uuid: "33333333-3333-4333-8333-333333333333",
+         }
+     }
+@@ -876,6 +879,13 @@ impl NoRefDispatchProofFixture {
+     }
+ }
+ 
++fn assert_no_ref_dispatch_fixture_row_id(fixture: &NoRefDispatchProofFixture) {
++    assert_eq!(
++        fixture.invocation_row_id, 1,
++        "fresh proof fixture should use row id 1"
++    );
++}
++
+ fn hostile_marker(fixture: &Fixture, route: &str) -> PathBuf {
+     fixture.dir.path().join(format!("hostile-mutated-{route}"))
+ }
+@@ -1371,9 +1381,8 @@ import sys
  
  args = sys.argv[1:]
  
@@ -442,7 +568,7 @@ index ef17867..3d64012 100644
  
  if args != ["export", "ses_fixture"]:
 diff --git a/scripts/opencode-turns b/scripts/opencode-turns
-index 7d99ff6..92e789b 100644
+index 7d99ff6..bf705a2 100644
 --- a/scripts/opencode-turns
 +++ b/scripts/opencode-turns
 @@ -6,29 +6,106 @@ Usage: opencode-turns BASE_DIR [SESSION_ID ...]
@@ -653,8 +779,10 @@ index 7d99ff6..92e789b 100644
 +    if candidates_have_timestamps(candidates):
 +        return recent_session_ids(candidates, options.window_hours)
 +    return capped_candidate_session_ids(candidates, options.max_sessions)
-+
-+
+ 
+ 
+-def discover_session_ids() -> list[str]:
+-    command = opencode_command() + ["session", "list"]
 +def candidates_have_timestamps(candidates: list[dict]) -> bool:
 +    return any(candidate.get("timestamp") is not None for candidate in candidates)
 +
@@ -670,10 +798,8 @@ index 7d99ff6..92e789b 100644
 +
 +def capped_candidate_session_ids(candidates: list[dict], max_sessions: int) -> list[str]:
 +    return [candidate["session_id"] for candidate in candidates][:max_sessions]
- 
- 
--def discover_session_ids() -> list[str]:
--    command = opencode_command() + ["session", "list"]
++
++
 +def unique_session_candidates(candidates: list[dict]) -> list[dict]:
 +    seen = set()
 +    unique = []
@@ -762,17 +888,17 @@ index 7d99ff6..92e789b 100644
 +    if parsed.tzinfo is None:
 +        parsed = parsed.replace(tzinfo=timezone.utc)
 +    return parsed.astimezone(timezone.utc)
-+
-+
+ 
+ 
+-def requested_session_ids(args: list[str]) -> list[str]:
 +def numeric_timestamp_datetime(value: int | float) -> datetime | None:
 +    seconds = value / 1000 if value > 10_000_000_000 else value
 +    try:
 +        return datetime.fromtimestamp(seconds, tz=timezone.utc)
 +    except (OverflowError, OSError, ValueError):
 +        return None
- 
- 
--def requested_session_ids(args: list[str]) -> list[str]:
++
++
 +def discover_session_ids(options: Options, deadline: Deadline) -> tuple[list[str], bool]:
 +    stdout, timed_out = run_opencode(["session", "list", "--json"], options, deadline)
 +    if timed_out:
@@ -916,7 +1042,7 @@ index 7d99ff6..92e789b 100644
  def parse_export_stdout(stdout: str) -> Any | None:
      try:
          return json.loads(stdout)
-@@ -181,67 +498,117 @@ def parse_export_stdout(stdout: str) -> Any | None:
+@@ -181,77 +498,157 @@ def parse_export_stdout(stdout: str) -> Any | None:
          return None
  
  
@@ -985,30 +1111,29 @@ index 7d99ff6..92e789b 100644
 -        "turn_id": turn_id_from_obj(obj, default_session_id, index),
 -        "timestamp": timestamp,
 -        "role": role,
--    }
--    body = extract_content_chunks(obj.get("parts")) or extract_content_chunks(
--        obj.get("content")
--    ) or extract_content_chunks(obj.get("message"))
 +    record = message_record_from_fields(
 +        fields, turn_id_from_obj(obj, default_session_id, index)
 +    )
-+    body = message_body_chunks(obj)
-     if body:
-         record["body"] = body
-     return record
- 
- 
--def emit_record(record: dict, out) -> None:
--    out.write(json.dumps(record, separators=(",", ":")))
--    out.write("\n")
++    return record_with_optional_body(record, message_body_chunks(obj))
++
++
 +def message_record_fields(default_session_id: str, obj: dict) -> dict:
 +    return {
 +        "session_id": session_id_from_obj(obj) or default_session_id,
 +        "role": role_from_obj(obj),
 +        "timestamp": timestamp_from_obj(obj),
-+    }
-+
-+
+     }
+-    body = extract_content_chunks(obj.get("parts")) or extract_content_chunks(
+-        obj.get("content")
+-    ) or extract_content_chunks(obj.get("message"))
+-    if body:
+-        record["body"] = body
+-    return record
+ 
+ 
+-def emit_record(record: dict, out) -> None:
+-    out.write(json.dumps(record, separators=(",", ":")))
+-    out.write("\n")
 +def has_required_message_record_fields(fields: dict) -> bool:
 +    return bool(fields.get("session_id") and fields.get("role") and fields.get("timestamp"))
 +
@@ -1022,6 +1147,12 @@ index 7d99ff6..92e789b 100644
 +    }
 +
 +
++def record_with_optional_body(record: dict, body: list) -> dict:
++    if not body:
++        return record
++    return {**record, "body": body}
++
+ 
 +def message_body_chunks(obj: dict) -> list:
 +    return (
 +        extract_content_chunks(obj.get("parts"))
@@ -1029,11 +1160,11 @@ index 7d99ff6..92e789b 100644
 +        or extract_content_chunks(obj.get("message"))
 +    )
  
- 
 -def emit_session(session_id: str, out) -> None:
 -    exported = export_session(session_id)
 -    if exported is None:
 -        return
++
 +def records_from_exported_session(session_id: str, exported: Any) -> list[dict]:
 +    records = []
      for index, obj in enumerate(exported_message_items(exported), start=1):
@@ -1065,37 +1196,60 @@ index 7d99ff6..92e789b 100644
 +    out.write("\n")
 +
 +
-+def emit_degraded_marker(records: list[dict], out) -> None:
-+    count = sum(1 for record in records if record.get("role") == "assistant")
++def assistant_record_count(records: list[dict]) -> int:
++    return sum(1 for record in records if record.get("role") == "assistant")
++
++
++def emit_degraded_marker(count: int, out) -> None:
 +    emit_record({"degraded": True, "count": count}, out)
++
++
++def has_base_dir_arg(argv: list[str]) -> bool:
++    return len(argv) >= 2
++
++
++def usage_message() -> str:
++    return "usage: opencode-turns BASE_DIR [SESSION_ID ...]"
++
++
++def emit_usage(out) -> None:
++    print(usage_message(), file=out)
++
++
++def session_args_from_argv(argv: list[str]) -> list[str]:
++    return argv[2:]
  
  
  def main() -> int:
-@@ -249,9 +616,16 @@ def main() -> int:
-         print("usage: opencode-turns BASE_DIR [SESSION_ID ...]", file=sys.stderr)
+-    if len(sys.argv) < 2:
+-        print("usage: opencode-turns BASE_DIR [SESSION_ID ...]", file=sys.stderr)
++    if not has_base_dir_arg(sys.argv):
++        emit_usage(sys.stderr)
          return 2
-     _base_dir = sys.argv[1]
+-    _base_dir = sys.argv[1]
 +    options = Options()
 +    deadline = Deadline(options.deadline)
      out = sys.stdout
 -    for session_id in requested_session_ids(sys.argv[2:]):
 -        emit_session(session_id, out)
 +
-+    session_ids, discovery_degraded = requested_session_ids(sys.argv[2:], options, deadline)
++    session_ids, discovery_degraded = requested_session_ids(
++        session_args_from_argv(sys.argv), options, deadline
++    )
 +    records, export_degraded = collect_records(session_ids, options, deadline)
 +    for record in records:
 +        emit_record(record, out)
 +    if discovery_degraded or export_degraded:
-+        emit_degraded_marker(records, out)
++        emit_degraded_marker(assistant_record_count(records), out)
      return 0
  
  
 diff --git a/scripts/tests/opencode-turns.test.sh b/scripts/tests/opencode-turns.test.sh
 new file mode 100644
-index 0000000..8391837
+index 0000000..52bf08e
 --- /dev/null
 +++ b/scripts/tests/opencode-turns.test.sh
-@@ -0,0 +1,190 @@
+@@ -0,0 +1,342 @@
 +#!/usr/bin/env bash
 +#
 +# Run from the repo root:
@@ -1145,6 +1299,78 @@ index 0000000..8391837
 +  if grep -Fq "$pattern" "$RUN_STDOUT"; then
 +    fail "$label: stdout unexpectedly contained <$pattern>; stdout: $(cat "$RUN_STDOUT")"
 +  fi
++}
++
++file_size_bytes() {
++  local path="$1"
++
++  if [[ ! -f "$path" ]]; then
++    echo 0
++    return
++  fi
++  wc -c <"$path" | tr -d ' '
++}
++
++assert_marker_stopped_growing() {
++  local marker="$1"
++  local label="$2"
++  local before after
++
++  before="$(file_size_bytes "$marker")"
++  sleep 1
++  after="$(file_size_bytes "$marker")"
++  if [[ "$before" != "$after" ]]; then
++    fail "$label: descendant marker kept growing after timeout kill ($before -> $after bytes)"
++  fi
++}
++
++assert_process_not_running() {
++  local pid="$1"
++  local label="$2"
++  local state
++
++  if ! kill -0 "$pid" 2>/dev/null; then
++    return
++  fi
++  state="$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
++  if [[ "$state" == Z* ]]; then
++    return
++  fi
++  fail "$label: descendant process $pid survived timeout kill with state <$state>"
++}
++
++write_timestampless_cap_mock() {
++  local path="$1"
++
++  cat >"$path" <<'MOCK_OPENCODE'
++#!/usr/bin/env bash
++set -euo pipefail
++
++if [[ "$1" == "session" && "$2" == "list" && "${3:-}" == "--json" ]]; then
++  cat <<'JSON'
++[
++  {"id":"ses_cap_one"},
++  {"id":"ses_cap_two"},
++  {"id":"ses_cap_three"},
++  {"id":"ses_cap_four"},
++  {"id":"ses_cap_five"}
++]
++JSON
++  exit 0
++fi
++
++if [[ "$1" == "export" ]]; then
++  session_id="$2"
++  printf '%s\n' "$session_id" >>"$OPENCODE_TURNS_EXPORT_LOG"
++  printf '[{"sessionID":"%s","messageID":"turn-%s","timestamp":"2099-01-01T00:00:00Z","role":"assistant","content":"ok"}]\n' "$session_id" "$session_id"
++  exit 0
++fi
++
++echo "unexpected opencode args: $*" >&2
++exit 64
++MOCK_OPENCODE
++
++  chmod +x "$path"
 +}
 +
 +write_window_filter_mock() {
@@ -1219,6 +1445,40 @@ index 0000000..8391837
 +  chmod +x "$path"
 +}
 +
++write_descendant_timeout_mock() {
++  local path="$1"
++
++  cat >"$path" <<'MOCK_OPENCODE'
++#!/usr/bin/env bash
++set -euo pipefail
++
++if [[ "$1" == "session" && "$2" == "list" && "${3:-}" == "--json" ]]; then
++  printf '[{"id":"ses_descendant"}]\n'
++  exit 0
++fi
++
++if [[ "$1" == "export" ]]; then
++  session_id="$2"
++  printf '%s\n' "$session_id" >>"$OPENCODE_TURNS_EXPORT_LOG"
++  (
++    printf tick >>"$OPENCODE_TURNS_DESCENDANT_MARKER"
++    while true; do
++      sleep 0.2
++      printf tick >>"$OPENCODE_TURNS_DESCENDANT_MARKER"
++    done
++  ) &
++  printf '%s\n' "$!" >"$OPENCODE_TURNS_DESCENDANT_PID"
++  sleep 30
++  exit 0
++fi
++
++echo "unexpected opencode args: $*" >&2
++exit 64
++MOCK_OPENCODE
++
++  chmod +x "$path"
++}
++
 +run_opencode_turns() {
 +  local tmpdir="$1"
 +  local opencode_bin="$2"
@@ -1238,6 +1498,25 @@ index 0000000..8391837
 +    "$SCRIPT" "$tmpdir/opencode-root" >"$RUN_STDOUT" 2>"$RUN_STDERR"
 +  RUN_STATUS=$?
 +  set -e
++}
++
++test_timestampless_session_list_applies_max_sessions_cap() {
++  local tmpdir
++  tmpdir="$(mktemp -d)"
++  trap "rm -rf '$tmpdir'" RETURN
++
++  mkdir -p "$tmpdir/bin"
++  write_timestampless_cap_mock "$tmpdir/bin/opencode"
++
++  OPENCODE_TURNS_MAX_SESSIONS=3 run_opencode_turns "$tmpdir" "$tmpdir/bin/opencode"
++
++  assert_status_zero "$RUN_STATUS" "$FUNCNAME"
++  assert_eq "$(cat "$OPENCODE_TURNS_EXPORT_LOG")" $'ses_cap_one\nses_cap_two\nses_cap_three' "$FUNCNAME exports"
++  assert_eq "$(wc -l <"$OPENCODE_TURNS_EXPORT_LOG" | tr -d ' ')" "3" "$FUNCNAME export count"
++  assert_stdout_contains '"session_id":"ses_cap_one"' "$FUNCNAME cap one"
++  assert_stdout_contains '"session_id":"ses_cap_three"' "$FUNCNAME cap three"
++  assert_stdout_not_contains 'ses_cap_four' "$FUNCNAME cap excludes fourth"
++  assert_stdout_not_contains 'ses_cap_five' "$FUNCNAME cap excludes fifth"
 +}
 +
 +test_exports_only_recent_window_sessions() {
@@ -1282,7 +1561,34 @@ index 0000000..8391837
 +  fi
 +}
 +
++test_timeout_kills_opencode_process_group_descendant() {
++  local tmpdir
++  tmpdir="$(mktemp -d)"
++  trap "rm -rf '$tmpdir'" RETURN
++
++  mkdir -p "$tmpdir/bin"
++  write_descendant_timeout_mock "$tmpdir/bin/opencode"
++  OPENCODE_TURNS_DESCENDANT_MARKER="$tmpdir/descendant-marker"
++  OPENCODE_TURNS_DESCENDANT_PID="$tmpdir/descendant.pid"
++  export OPENCODE_TURNS_DESCENDANT_MARKER OPENCODE_TURNS_DESCENDANT_PID
++
++  OPENCODE_TURNS_CALL_TIMEOUT=1 OPENCODE_TURNS_DEADLINE=3 run_opencode_turns "$tmpdir" "$tmpdir/bin/opencode"
++
++  assert_status_zero "$RUN_STATUS" "$FUNCNAME"
++  assert_stdout_contains '"degraded":true' "$FUNCNAME degraded marker"
++  assert_stdout_contains '"count":0' "$FUNCNAME no completed assistant records"
++  [[ -s "$OPENCODE_TURNS_DESCENDANT_PID" ]] || fail "$FUNCNAME: descendant pid file was not written"
++  [[ -s "$OPENCODE_TURNS_DESCENDANT_MARKER" ]] || fail "$FUNCNAME: descendant marker was not written"
++
++  local descendant_pid
++  descendant_pid="$(cat "$OPENCODE_TURNS_DESCENDANT_PID")"
++  assert_marker_stopped_growing "$OPENCODE_TURNS_DESCENDANT_MARKER" "$FUNCNAME"
++  assert_process_not_running "$descendant_pid" "$FUNCNAME"
++}
++
++test_timestampless_session_list_applies_max_sessions_cap
 +test_exports_only_recent_window_sessions
 +test_timeout_emits_degraded_best_effort_and_exits_zero
++test_timeout_kills_opencode_process_group_descendant
 +
 +echo "opencode-turns tests passed"

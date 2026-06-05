@@ -2,17 +2,22 @@
 
 Base diff regenerated with `git diff 9545ff8 -- <touched source/test paths>` into `planning/tsb-gate/gates/diff.patch`.
 
-The following gates were run with `OULIPOLY_DATA_DIR` unset and XDG paths isolated:
+The following gates passed:
 
-- `cargo fmt --all -- --check` passed.
-- `cargo clippy --workspace --all-targets -- -D warnings` passed.
-- `cargo test --workspace` passed.
-- `scripts/tests/opencode-turns.test.sh` passed.
+- `cargo fmt --all -- --check`
+- `bash -n scripts/tests/opencode-turns.test.sh`
+- `env -u OULIPOLY_DATA_DIR XDG_CONFIG_HOME="$tmpdir/config" XDG_DATA_HOME="$tmpdir/data" XDG_CACHE_HOME="$tmpdir/cache" bash scripts/tests/opencode-turns.test.sh`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test --workspace`
 
-Targeted evidence still covered by the workspace test run:
+Targeted proof-risk evidence covered by the shell and workspace test runs:
 
-- `sessions::tests::degraded_marker_is_reported_without_malformed_turn_error` passed.
-- `sessions::tests::turn_script_timeout_is_classified_and_does_not_persist_turns` passed.
-- `quota::process::tests::quota_script_timeout_is_classified` passed.
-- `quota::process::tests::quota_script_timeout_kills_process_group_children` passed.
-- `tests/age243_s7a_session_dispatch.rs` passed, including `opencode_read_turns_ingests_normalized_jsonl`.
+- `scripts/tests/opencode-turns.test.sh::test_timestampless_session_list_applies_max_sessions_cap`
+- `scripts/tests/opencode-turns.test.sh::test_timeout_kills_opencode_process_group_descendant`
+- `sessions::tests::turn_script_timeout_kills_process_group_children`
+
+Related regression evidence still covered by the workspace test run:
+
+- `sessions::tests::degraded_marker_is_reported_without_malformed_turn_error`
+- `sessions::tests::turn_script_timeout_is_classified_and_does_not_persist_turns`
+- `tests/age243_s7a_session_dispatch.rs`, including `opencode_read_turns_ingests_normalized_jsonl`
