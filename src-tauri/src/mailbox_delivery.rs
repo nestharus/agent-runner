@@ -3,6 +3,7 @@
 //! `orchestration`, `formatter`, `filter`, `predicate`
 
 use oulipoly_state::mailbox::{MailboxDb, MailboxRow, SessionRuntimeUpsert};
+use std::path::Path;
 
 const MAILBOX_BATCH_MAX_ROWS: usize = 20;
 const MAILBOX_PREFIX_MAX_BYTES: usize = 64 * 1024;
@@ -16,6 +17,7 @@ pub(crate) struct PreparedMailboxDelivery {
 pub(crate) fn prepare_headless_resume_delivery(
     resolved: &oulipoly_state::ResolvedResume,
     answer: Option<String>,
+    models_dir: Option<&Path>,
 ) -> Result<PreparedMailboxDelivery, String> {
     let session_id = resolved.active_session_id.clone();
     let Some(mut db) = MailboxDb::open_default_if_exists()? else {
@@ -25,7 +27,7 @@ pub(crate) fn prepare_headless_resume_delivery(
             seqs: Vec::new(),
         });
     };
-    record_headless_session_runtime(&mut db, resolved)?;
+    record_headless_session_runtime(&mut db, resolved, models_dir)?;
     let pending = db.list_pending(&session_id)?;
     if pending.is_empty() {
         return Ok(PreparedMailboxDelivery {
@@ -67,7 +69,9 @@ struct MailboxBatch {
 fn record_headless_session_runtime(
     db: &mut MailboxDb,
     resolved: &oulipoly_state::ResolvedResume,
+    models_dir: Option<&Path>,
 ) -> Result<(), String> {
+    let models_dir = models_dir.map(|path| path.to_string_lossy().into_owned());
     db.upsert_session_runtime(SessionRuntimeUpsert {
         session_id: &resolved.active_session_id,
         mode: "headless",
@@ -75,6 +79,8 @@ fn record_headless_session_runtime(
         provider_name: Some(&resolved.active_provider),
         model_name: resolved.model_name.as_deref(),
         pty_control_path: None,
+        models_dir: models_dir.as_deref(),
+        effective_cwd: None,
     })
 }
 

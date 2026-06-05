@@ -24,7 +24,7 @@ use super::super::{ExecutionResult, SessionCaptureMethod, SessionCaptureResult};
 use super::provider_execution::execute_provider_with_arg_parts_and_supervisor_config;
 use super::result::{cleanup_temp_files, execution_result_from_raw};
 use super::resume::{ResumePayload, classify_resume_acceptance, compose_resume_args};
-use super::spawn_identity::context_from_parent_invocation_env;
+use super::spawn_identity::{SpawnRuntimeMode, context_from_parent_invocation_env};
 use super::supervision::SupervisorConfig;
 use oulipoly_config::{PromptMode, ProviderConfig};
 use std::path::Path;
@@ -132,6 +132,8 @@ fn execute_resume_with_optional_supervisor_config(
             &provider_without_capture.name,
             model_name,
             Some(&session_id),
+            SpawnRuntimeMode::Headless,
+            working_dir,
         ),
         supervisor_config,
     )?;

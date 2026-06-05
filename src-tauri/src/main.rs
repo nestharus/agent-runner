@@ -43,6 +43,7 @@ mod session_metadata_cli;
 mod spawn_cwd;
 mod terminal_outcome_adapter;
 mod usage;
+mod wake_coordinator;
 mod wiring;
 mod zero_turn_orchestration;
 

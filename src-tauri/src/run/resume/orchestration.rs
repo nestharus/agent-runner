@@ -53,6 +53,12 @@ pub(crate) fn run_resume(
     if let Some(exit_code) = reject_invalid_resume_input(session_id) {
         return Ok(exit_code);
     }
+    if let Some(exit_code) = crate::wake_coordinator::validate_auto_wake_child(session_id)? {
+        return Ok(exit_code);
+    }
+    if !crate::wake_coordinator::is_auto_wake_invocation() {
+        crate::wake_coordinator::reset_manual_resume_wake_claim(session_id)?;
+    }
     // Source guard marker: agent_runtime_services.resume_service.resolve_resume(ResumeServiceRequest)
 
     let mut prepared = match prepare_headless_resume_execution(
@@ -65,7 +71,10 @@ pub(crate) fn run_resume(
         models_dir_override,
     )? {
         Ok(prepared) => prepared,
-        Err(exit_code) => return Ok(exit_code),
+        Err(exit_code) => {
+            crate::wake_coordinator::release_current_auto_wake_claim_for_session(session_id);
+            return Ok(exit_code);
+        }
     };
     run_resume_loop(ResumeLoopInput {
         agent_runtime_services,
@@ -128,8 +137,11 @@ fn prepare_headless_resume_execution(
     let effective_spawn_cwd = effective_resume_execution_cwd(&env, session_id, working_dir)?;
     let parent_invocation_id = crate::dispatch::resolve_parent_invocation_id(&env.state);
     let max_attempts = headless_resume_retry_budget(&resolved);
-    let mailbox_delivery =
-        crate::mailbox_delivery::prepare_headless_resume_delivery(&resolved, answer)?;
+    let mailbox_delivery = crate::mailbox_delivery::prepare_headless_resume_delivery(
+        &resolved,
+        answer,
+        Some(&env.models_dir),
+    )?;
     Ok(Ok(PreparedHeadlessResumeExecution {
         answer: mailbox_delivery.answer,
         mailbox_session_id: mailbox_delivery.session_id,
@@ -368,6 +380,11 @@ fn finalize_resume_spawn_error(
         ))
         .map_err(|err| err.to_string())?;
     attempt.guard.mark_finalized();
+    mark_resume_attempt_idle(
+        &input.resolved.active_session_id,
+        &attempt.invocation.id,
+        Some(1),
+    )?;
     Ok(())
 }
 
@@ -557,9 +574,15 @@ fn handle_resume_attempt_terminal_signal(
         zero_turn_action,
     })? {
         ResumeLoopControl::Continue => {
+            mark_resume_attempt_idle(
+                provider_session_id,
+                &attempt.invocation.id,
+                Some(result.exit_code),
+            )?;
             return Ok(ResumeAttemptLoopControl::Continue(result.exit_code));
         }
         ResumeLoopControl::Return(exit_code) => {
+            mark_resume_attempt_idle(provider_session_id, &attempt.invocation.id, Some(exit_code))?;
             return Ok(ResumeAttemptLoopControl::Return(exit_code));
         }
         ResumeLoopControl::CompletedAttempt => {}
@@ -583,6 +606,11 @@ fn handle_resume_attempt_terminal_signal(
         max_attempts: input.max_attempts,
     })? {
         CompletedAttemptControl::Continue => {
+            mark_resume_attempt_idle(
+                provider_session_id,
+                &attempt.invocation.id,
+                Some(result.exit_code),
+            )?;
             Ok(ResumeAttemptLoopControl::Continue(result.exit_code))
         }
         CompletedAttemptControl::Return(exit_code) => {
@@ -592,10 +620,33 @@ fn handle_resume_attempt_terminal_signal(
                     input.mailbox_delivery_seqs,
                     &attempt.invocation.id,
                 )?;
+                let _ = crate::wake_coordinator::mark_successful_turn_idle_and_recheck(
+                    provider_session_id,
+                    &attempt.invocation.id,
+                    exit_code,
+                )?;
+            } else {
+                mark_resume_attempt_idle(
+                    provider_session_id,
+                    &attempt.invocation.id,
+                    Some(exit_code),
+                )?;
             }
             Ok(ResumeAttemptLoopControl::Return(exit_code))
         }
     }
+}
+
+fn mark_resume_attempt_idle(
+    provider_session_id: &str,
+    invocation_uuid: &str,
+    exit_code: Option<i32>,
+) -> Result<(), String> {
+    crate::wake_coordinator::mark_session_idle_after_turn(
+        provider_session_id,
+        invocation_uuid,
+        exit_code,
+    )
 }
 
 fn resolve_resume_for_headless_execution(

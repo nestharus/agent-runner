@@ -30,7 +30,9 @@ use super::launch::build_command;
 use super::policy::apply_provider_policy;
 use super::provider_identity::ProviderRecognizer;
 use super::resume::{ResumePayload, compose_resume_provider_args};
-use super::spawn_identity::{context_from_parent_invocation_env, record_child_identity};
+use super::spawn_identity::{
+    SpawnRuntimeMode, context_from_parent_invocation_env, record_child_identity,
+};
 use super::terminal_signal;
 use oulipoly_config::ProviderConfig;
 use std::path::Path;
@@ -105,6 +107,8 @@ pub fn execute_interactive_with_result_and_model_identity(
         &provider.name,
         model_name,
         resume_session_id,
+        SpawnRuntimeMode::PtyInteractive,
+        working_dir,
     );
     record_child_identity(child.id(), spawn_identity.as_ref());
 

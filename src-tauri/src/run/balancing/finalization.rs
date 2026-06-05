@@ -119,6 +119,11 @@ pub(super) fn finalize_completed_attempt(
             Some(TERMINAL_PERSISTENCE_ERROR_CATEGORY),
             Some(TERMINAL_PERSISTENCE_TERMINAL_REASON),
         ));
+        mark_balanced_attempt_idle(
+            input.zero_turn_provider_session_id,
+            &input.invocation.id,
+            Some(1),
+        );
         return BalancedLoopControl::Return(Ok(1));
     }
     input.guard.mark_finalized();
@@ -130,6 +135,11 @@ pub(super) fn finalize_completed_attempt(
     bump_quota_tick(input.env, input.provider_name);
 
     if success {
+        mark_balanced_successful_attempt_idle_and_recheck(
+            input.zero_turn_provider_session_id,
+            &input.invocation.id,
+            input.result.exit_code,
+        );
         formatter::emit_success_output(
             &input.invocation.id,
             input.result.exit_code,
@@ -140,6 +150,11 @@ pub(super) fn finalize_completed_attempt(
         return BalancedLoopControl::Return(Ok(input.result.exit_code));
     }
     if quota_exhausted {
+        mark_balanced_attempt_idle(
+            input.zero_turn_provider_session_id,
+            &input.invocation.id,
+            Some(input.result.exit_code),
+        );
         if retry_available(input.attempts, input.max_attempts) {
             formatter::emit_routing_retry(input.provider_name);
         }
@@ -158,7 +173,54 @@ pub(super) fn finalize_completed_attempt(
         &input.result.stderr,
         error_category.as_deref(),
     );
+    mark_balanced_attempt_idle(
+        input.zero_turn_provider_session_id,
+        &input.invocation.id,
+        Some(input.result.exit_code),
+    );
     BalancedLoopControl::Return(Ok(input.result.exit_code))
+}
+
+fn mark_balanced_attempt_idle(
+    provider_session_id: Option<&str>,
+    invocation_uuid: &str,
+    exit_code: Option<i32>,
+) {
+    let Some(provider_session_id) = provider_session_id else {
+        return;
+    };
+    if let Err(err) = crate::wake_coordinator::mark_session_idle_after_turn(
+        provider_session_id,
+        invocation_uuid,
+        exit_code,
+    ) {
+        tracing::warn!(
+            session_id = provider_session_id,
+            invocation_uuid,
+            "Failed to mark balanced session idle: {err}"
+        );
+    }
+}
+
+fn mark_balanced_successful_attempt_idle_and_recheck(
+    provider_session_id: Option<&str>,
+    invocation_uuid: &str,
+    exit_code: i32,
+) {
+    let Some(provider_session_id) = provider_session_id else {
+        return;
+    };
+    if let Err(err) = crate::wake_coordinator::mark_successful_turn_idle_and_recheck(
+        provider_session_id,
+        invocation_uuid,
+        exit_code,
+    ) {
+        tracing::warn!(
+            session_id = provider_session_id,
+            invocation_uuid,
+            "Failed to run balanced wake recheck: {err}"
+        );
+    }
 }
 
 fn record_returned_artifacts_for_completed_attempt(
@@ -193,6 +255,7 @@ fn finalize_returned_artifacts_persist_failure(input: mapper::ArtifactPersistFai
         Ok(_) => input.guard.mark_finalized(),
         Err(err) => formatter::emit_finalize_invocation_warning(err),
     }
+    mark_balanced_attempt_idle(input.provider_session_id, input.invocation_id, Some(1));
 }
 
 fn ingest_completed_attempt_session(

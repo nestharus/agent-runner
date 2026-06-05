@@ -408,6 +408,19 @@ fn finalize_spawn_error(input: super::mapper::SpawnErrorInput<'_, '_>) {
     if finalized {
         input.guard.mark_finalized();
     }
+    if let Some(session_id) = input.provider_session_id
+        && let Err(err) = crate::wake_coordinator::mark_session_idle_after_turn(
+            session_id,
+            input.invocation_id,
+            Some(1),
+        )
+    {
+        tracing::warn!(
+            session_id,
+            invocation_uuid = input.invocation_id,
+            "Failed to mark balanced spawn-error session idle: {err}"
+        );
+    }
 }
 
 fn spawn_error_signal(

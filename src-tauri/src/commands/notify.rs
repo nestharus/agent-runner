@@ -9,6 +9,8 @@ use serde::Serialize;
 use serde_json::Value;
 use std::path::Path;
 
+use crate::wake_coordinator::WakeDiagnostic;
+
 #[derive(Debug, Serialize)]
 struct NotifyResponse {
     status: String,
@@ -21,6 +23,7 @@ struct NotifyResponse {
     owner_session_id: Option<String>,
     session_source: Option<String>,
     seq: Option<i64>,
+    wake: Option<WakeDiagnostic>,
 }
 
 #[derive(Debug, Clone)]
@@ -89,10 +92,12 @@ enum NotifyOutcome {
     Enqueued {
         owner: ResolvedOwner,
         row: MailboxRow,
+        wake: WakeDiagnostic,
     },
     AlreadyEnqueued {
         owner: ResolvedOwner,
         row: MailboxRow,
+        wake: WakeDiagnostic,
     },
     NoOwner,
 }
@@ -133,8 +138,14 @@ fn run_agent_bash_complete_inner(
         .enqueue_agent_bash_complete(&enqueue)
         .map_err(NotifyError::Storage)?
     {
-        EnqueueResult::Inserted(row) => Ok(NotifyOutcome::Enqueued { owner, row }),
-        EnqueueResult::AlreadyEnqueued(row) => Ok(NotifyOutcome::AlreadyEnqueued { owner, row }),
+        EnqueueResult::Inserted(row) => {
+            let wake = crate::wake_coordinator::trigger_notify_wake(&owner.session_id);
+            Ok(NotifyOutcome::Enqueued { owner, row, wake })
+        }
+        EnqueueResult::AlreadyEnqueued(row) => {
+            let wake = crate::wake_coordinator::trigger_notify_wake(&owner.session_id);
+            Ok(NotifyOutcome::AlreadyEnqueued { owner, row, wake })
+        }
         EnqueueResult::Conflict { existing } => Err(NotifyError::Conflict {
             existing: Box::new(existing),
         }),
@@ -324,19 +335,32 @@ fn render_notify_success(
     outcome: NotifyOutcome,
 ) -> Result<i32, String> {
     match outcome {
-        NotifyOutcome::Enqueued { owner, row } => {
-            let response = notify_response(args, "enqueued", true, Some(&owner), Some(row.seq));
+        NotifyOutcome::Enqueued { owner, row, wake } => {
+            let response = notify_response(
+                args,
+                "enqueued",
+                true,
+                Some(&owner),
+                Some(row.seq),
+                Some(wake),
+            );
             render_response(&response, args.json)?;
             Ok(0)
         }
-        NotifyOutcome::AlreadyEnqueued { owner, row } => {
-            let response =
-                notify_response(args, "already_enqueued", true, Some(&owner), Some(row.seq));
+        NotifyOutcome::AlreadyEnqueued { owner, row, wake } => {
+            let response = notify_response(
+                args,
+                "already_enqueued",
+                true,
+                Some(&owner),
+                Some(row.seq),
+                Some(wake),
+            );
             render_response(&response, args.json)?;
             Ok(0)
         }
         NotifyOutcome::NoOwner => {
-            let response = notify_response(args, "no_owner", false, None, None);
+            let response = notify_response(args, "no_owner", false, None, None, None);
             render_response(&response, args.json)?;
             Ok(0)
         }
@@ -351,8 +375,9 @@ fn render_notify_error(
     existing: Option<&MailboxRow>,
 ) -> Result<i32, String> {
     if args.json {
-        let mut value = serde_json::to_value(notify_response(args, status, false, None, None))
-            .map_err(|err| format!("Failed to serialize notify response JSON: {err}"))?;
+        let mut value =
+            serde_json::to_value(notify_response(args, status, false, None, None, None))
+                .map_err(|err| format!("Failed to serialize notify response JSON: {err}"))?;
         if let Some(message) = message {
             value["message"] = Value::String(message);
         }
@@ -379,6 +404,7 @@ fn notify_response(
     enqueued: bool,
     owner: Option<&ResolvedOwner>,
     seq: Option<i64>,
+    wake: Option<WakeDiagnostic>,
 ) -> NotifyResponse {
     NotifyResponse {
         status: status.to_string(),
@@ -391,6 +417,7 @@ fn notify_response(
         owner_session_id: owner.map(|owner| owner.session_id.clone()),
         session_source: owner.map(|owner| owner.source.as_str().to_string()),
         seq,
+        wake,
     }
 }
 

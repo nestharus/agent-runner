@@ -28,7 +28,7 @@
 //! ```
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use oulipoly_config::{ModelConfig, ProviderConfig, ProvidersConfig, SessionStorage, load_models};
 use oulipoly_runtime::session_metadata::resolve_workspace_root_for_provider_session;
@@ -74,6 +74,7 @@ pub(crate) struct ResumeExecutionEnvironment {
     pub(crate) providers_cfg: ProvidersConfig,
     pub(crate) models: HashMap<String, ModelConfig>,
     pub(crate) sessions_cfg: oulipoly_config::SessionsConfig,
+    pub(crate) models_dir: PathBuf,
 }
 
 pub(crate) fn load_resume_execution_environment(
@@ -92,6 +93,7 @@ pub(crate) fn load_resume_execution_environment(
         providers_cfg,
         models,
         sessions_cfg,
+        models_dir,
     ))
 }
 
@@ -106,11 +108,13 @@ fn resume_execution_environment(
     providers_cfg: ProvidersConfig,
     models: HashMap<String, ModelConfig>,
     sessions_cfg: oulipoly_config::SessionsConfig,
+    models_dir: PathBuf,
 ) -> ResumeExecutionEnvironment {
     ResumeExecutionEnvironment {
         state,
         providers_cfg,
         models,
         sessions_cfg,
+        models_dir,
     }
 }

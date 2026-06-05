@@ -16,6 +16,7 @@ path = "src/main.rs"
 chrono.workspace = true
 clap.workspace = true
 dirs.workspace = true
+libc.workspace = true
 oulipoly-config = { path = "../crates/oulipoly-config" }
 oulipoly-core = { path = "../crates/oulipoly-core" }
 oulipoly-provider = { path = "../crates/oulipoly-provider" }
@@ -28,6 +29,7 @@ serde_json.workspace = true
 tauri.workspace = true
 tokio.workspace = true
 toml.workspace = true
+tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
 

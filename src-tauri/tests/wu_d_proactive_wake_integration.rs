@@ -1,0 +1,678 @@
+#![cfg(unix)]
+
+use chrono::{DateTime, Utc};
+use oulipoly_state::mailbox::{
+    AgentBashCompleteEnqueue, MailboxDb, SessionRuntimeUpsert, WakeClaimAcquireResult,
+    WakeClaimRequest,
+};
+use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRecord, ProcessIdentity};
+use oulipoly_state::{SessionTurnIngest, StateDb};
+use rusqlite::Connection;
+use serde_json::{Value, json};
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
+
+const MODEL: &str = "wu-d-fixture-model";
+const PROVIDER: &str = "wu-d-fixture-provider";
+const SESSION: &str = "5169694d-de0f-40d1-890c-6e28e55bab27";
+const INVOCATION: &str = "11111111-1111-4111-8111-111111111111";
+
+struct Fixture {
+    dir: tempfile::TempDir,
+    config_home: PathBuf,
+    data_home: PathBuf,
+    home_dir: PathBuf,
+    app_config_dir: PathBuf,
+    models_dir: PathBuf,
+    work_dir: PathBuf,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let config_home = dir.path().join("xdg-config");
+        let data_home = dir.path().join("xdg-data");
+        let home_dir = dir.path().join("home");
+        let app_config_dir = config_home.join("oulipoly-agent-runner");
+        let models_dir = app_config_dir.join("models");
+        let work_dir = dir.path().join("work");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::create_dir_all(&home_dir).unwrap();
+        fs::create_dir_all(&work_dir).unwrap();
+        Self {
+            dir,
+            config_home,
+            data_home,
+            home_dir,
+            app_config_dir,
+            models_dir,
+            work_dir,
+        }
+    }
+
+    fn sidecar_path(&self) -> PathBuf {
+        self.data_home
+            .join("oulipoly-agent-runner")
+            .join("pid-identity.db")
+    }
+
+    fn state_path(&self) -> PathBuf {
+        self.data_home
+            .join("oulipoly-agent-runner")
+            .join("state.db")
+    }
+
+    fn run(&self, mut cmd: Command) -> Output {
+        cmd.env("XDG_CONFIG_HOME", &self.config_home)
+            .env("XDG_DATA_HOME", &self.data_home)
+            .env("HOME", &self.home_dir)
+            .env("AGENT_BASH_AGENT_RUNNER_BIN", runner_bin())
+            .env("WU_D_WORK_DIR", &self.work_dir)
+            .env_remove("OULIPOLY_PARENT_INVOCATION")
+            .current_dir(self.dir.path());
+        cmd.output().unwrap()
+    }
+
+    fn run_agent(&self, prompt: &str) -> Output {
+        let mut cmd = Command::new(runner_bin());
+        cmd.arg("-m")
+            .arg(MODEL)
+            .arg("--models-dir")
+            .arg(&self.models_dir)
+            .arg(prompt);
+        self.run(cmd)
+    }
+
+    fn run_resume(&self) -> Output {
+        let mut cmd = Command::new(runner_bin());
+        cmd.arg("resume")
+            .arg("-m")
+            .arg(MODEL)
+            .arg("--session-id")
+            .arg(SESSION)
+            .arg("--models-dir")
+            .arg(&self.models_dir);
+        self.run(cmd)
+    }
+
+    fn write_provider(&self, body: &str) {
+        let script = self.write_script("provider.sh", body);
+        fs::write(
+            self.models_dir.join(format!("{MODEL}.toml")),
+            format!(
+                r#"[[providers]]
+name = "{PROVIDER}"
+args = []
+"#,
+            ),
+        )
+        .unwrap();
+        fs::write(
+            self.app_config_dir.join("providers.toml"),
+            format!(
+                r#"[{PROVIDER}]
+command = {}
+args = []
+interactive_args = ["interactive"]
+prompt_mode = "arg"
+
+[{PROVIDER}.session_capture]
+kind = "forced_flag_verified"
+flag = "--session-id"
+
+[{PROVIDER}.resume]
+kind = "flag"
+flag = "--resume"
+"#,
+                toml_string(&path_string(&script))
+            ),
+        )
+        .unwrap();
+    }
+
+    fn write_script(&self, name: &str, body: &str) -> PathBuf {
+        let path = self.dir.path().join(name);
+        fs::write(
+            &path,
+            format!("#!/usr/bin/env bash\nset -euo pipefail\n{body}\n"),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    fn mailbox(&self) -> MailboxDb {
+        MailboxDb::open(&self.sidecar_path()).unwrap()
+    }
+
+    fn sidecar_conn(&self) -> Connection {
+        Connection::open(self.sidecar_path()).unwrap()
+    }
+
+    fn seed_session_turn(&self) {
+        let db = StateDb::open(&self.state_path()).unwrap();
+        db.ingest_session_turns_batch(
+            PROVIDER,
+            &[SessionTurnIngest {
+                session_id: SESSION.to_string(),
+                turn_id: "turn-a".to_string(),
+                timestamp: ts("2026-06-04T12:00:00Z"),
+                role: "assistant".to_string(),
+                parent_turn_id: None,
+                is_sidechain: false,
+                is_compaction_boundary: false,
+                body: None,
+            }],
+        )
+        .unwrap();
+    }
+
+    fn seed_idle_runtime(&self) {
+        let mut db = MailboxDb::open(&self.sidecar_path()).unwrap();
+        let models_dir = path_string(&self.models_dir);
+        db.upsert_session_runtime(SessionRuntimeUpsert {
+            session_id: SESSION,
+            mode: "headless",
+            invocation_uuid: None,
+            provider_name: Some(PROVIDER),
+            model_name: Some(MODEL),
+            pty_control_path: None,
+            models_dir: Some(&models_dir),
+            effective_cwd: None,
+        })
+        .unwrap();
+    }
+
+    fn seed_mailbox(&self, session_id: &str, handle: &str) {
+        let state_dir = self.work_dir.join(format!("seed-{handle}"));
+        fs::create_dir_all(&state_dir).unwrap();
+        let meta = state_dir.join("meta.json");
+        let log = state_dir.join("log");
+        let rc = state_dir.join("rc");
+        fs::write(&meta, r#"{"caller_chain":[]}"#).unwrap();
+        fs::write(&log, format!("log {handle}\n")).unwrap();
+        fs::write(&rc, "0\n").unwrap();
+        let mut db = MailboxDb::open(&self.sidecar_path()).unwrap();
+        db.enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
+            session_id,
+            handle,
+            payload_json: r#"{"schema_version":1,"kind":"agent_bash_complete"}"#,
+            owner_invocation_uuid: Some(INVOCATION),
+            matched_os_pid: Some(9_300),
+            matched_os_boot_id: Some("boot-seeded"),
+            matched_os_pid_starttime_ticks: Some(456),
+            matched_chain_index: Some(0),
+            state_dir: &path_string(&state_dir),
+            meta_path: &path_string(&meta),
+            log_path: &path_string(&log),
+            rc_path: &path_string(&rc),
+            rc: 0,
+        })
+        .unwrap();
+    }
+
+    fn record_identity(&self, identity: &ProcessIdentity) {
+        let sidecar = PidIdentityDb::open(&self.sidecar_path()).unwrap();
+        sidecar
+            .record_identity(PidIdentityRecord {
+                identity,
+                os_pgid: None,
+                invocation_uuid: INVOCATION,
+                session_id: Some(SESSION),
+                provider_name: Some(PROVIDER),
+                model_name: Some(MODEL),
+                recorded_at: "2026-06-04T12:00:00Z",
+            })
+            .unwrap();
+    }
+
+    fn prompt_file(&self, name: &str) -> PathBuf {
+        self.work_dir.join(name)
+    }
+
+    fn assert_xdg_isolated(&self) {
+        assert!(
+            !self
+                .home_dir
+                .join(".local/share/oulipoly-agent-runner")
+                .exists(),
+            "state must stay in isolated XDG_DATA_HOME"
+        );
+        assert!(
+            !self.home_dir.join(".config/oulipoly-agent-runner").exists(),
+            "config must stay in isolated XDG_CONFIG_HOME"
+        );
+    }
+}
+
+#[test]
+fn idle_wake_delivers() {
+    let _guard = integration_test_guard();
+    let fixture = Fixture::new();
+    fixture.write_provider(&provider_script(
+        r#"( sleep 0.3; notify_handle h-idle 0 ) >/dev/null 2>&1 &"#,
+        "",
+        "resumed-input.txt",
+    ));
+
+    let output = fixture.run_agent("dispatch background work");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+
+    let prompt = wait_for_file(&fixture.prompt_file("resumed-input.txt"));
+    assert!(prompt.starts_with("[OULIPOLY NOTIFICATIONS]"), "{prompt}");
+    assert!(prompt.contains("kind: agent_bash_complete"), "{prompt}");
+    assert!(prompt.contains("handle: h-idle"), "{prompt}");
+    assert!(prompt.contains("rc: 0"), "{prompt}");
+    let session_id = wait_for_mailbox_session(&fixture);
+    wait_until("mailbox delivered", || {
+        let db = fixture.mailbox();
+        let rows = db.list_mailbox(&session_id, true).unwrap();
+        rows.len() == 1
+            && rows[0].delivered_at.is_some()
+            && db.wake_claim(&session_id).unwrap().is_none()
+    });
+    let mailbox = fixture.mailbox();
+    assert!(mailbox.list_pending(&session_id).unwrap().is_empty());
+    assert_eq!(
+        mailbox
+            .session_runtime(&session_id)
+            .unwrap()
+            .unwrap()
+            .run_state,
+        "idle"
+    );
+    assert!(mailbox.wake_claim(&session_id).unwrap().is_none());
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
+fn busy_then_turn_end_delivers() {
+    let _guard = integration_test_guard();
+    let fixture = Fixture::new();
+    fixture.write_provider(&provider_script(
+        r#"( sleep 0.1; notify_handle h-a 0 ) >/dev/null 2>&1 &
+( sleep 0.2; notify_handle h-b 0 ) >/dev/null 2>&1 &
+( sleep 0.3; notify_handle h-c 0 ) >/dev/null 2>&1 &
+sleep 1"#,
+        "",
+        "busy-resumed-input.txt",
+    ));
+
+    let output = fixture.run_agent("dispatch busy work");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+
+    let prompt = wait_for_file(&fixture.prompt_file("busy-resumed-input.txt"));
+    assert!(prompt.starts_with("[OULIPOLY NOTIFICATIONS]"), "{prompt}");
+    let pos_a = prompt.find("handle: h-a").unwrap();
+    let pos_b = prompt.find("handle: h-b").unwrap();
+    let pos_c = prompt.find("handle: h-c").unwrap();
+    assert!(pos_a < pos_b && pos_b < pos_c, "{prompt}");
+    let session_id = wait_for_mailbox_session(&fixture);
+    wait_until("busy rows delivered", || {
+        let db = fixture.mailbox();
+        let rows = db.list_mailbox(&session_id, true).unwrap();
+        rows.len() == 3
+            && rows.iter().all(|row| row.delivered_at.is_some())
+            && db.wake_claim(&session_id).unwrap().is_none()
+    });
+    assert!(fixture.mailbox().wake_claim(&session_id).unwrap().is_none());
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
+fn no_undelivered_no_wake_and_loop_terminates() {
+    let _guard = integration_test_guard();
+    let fixture = Fixture::new();
+    fixture.write_provider(&provider_script("", "", "no-pending-resume.txt"));
+
+    let output = fixture.run_agent("no pending");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+
+    let session_id = wait_for_runtime_session(&fixture);
+    wait_until("runtime idle", || {
+        fixture
+            .mailbox()
+            .session_runtime(&session_id)
+            .unwrap()
+            .is_some_and(|row| row.run_state == "idle")
+    });
+    let mailbox = fixture.mailbox();
+    assert!(mailbox.list_pending(&session_id).unwrap().is_empty());
+    assert!(mailbox.wake_claim(&session_id).unwrap().is_none());
+    assert!(!fixture.prompt_file("no-pending-resume.txt").exists());
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
+fn auto_wake_cap_stops_self_replicating_session() {
+    let _guard = integration_test_guard();
+    let fixture = Fixture::new();
+    fixture.write_provider(&provider_script(
+        r#"( sleep 0.3; notify_handle h-start 0 ) >/dev/null 2>&1 &"#,
+        r#"count="${OULIPOLY_AUTO_WAKE_COUNT:-0}"
+notify_handle "h-auto-${count}" 0"#,
+        "resumed-${OULIPOLY_AUTO_WAKE_COUNT:-0}.txt",
+    ));
+    let mut cmd = Command::new(runner_bin());
+    cmd.arg("-m")
+        .arg(MODEL)
+        .arg("--models-dir")
+        .arg(&fixture.models_dir)
+        .arg("self replicate")
+        .env("OULIPOLY_AUTO_WAKE_MAX", "2");
+    let output = fixture.run(cmd);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+
+    let first = wait_for_file(&fixture.prompt_file("resumed-1.txt"));
+    let second = wait_for_file(&fixture.prompt_file("resumed-2.txt"));
+    let session_id = wait_for_mailbox_session(&fixture);
+    assert!(first.contains("handle: h-start"), "{first}");
+    assert!(second.contains("handle: h-auto-1"), "{second}");
+    wait_until("cap leaves pending", || {
+        let db = fixture.mailbox();
+        let pending = db.list_pending(&session_id).unwrap();
+        pending.len() == 1
+            && pending[0].handle == "h-auto-2"
+            && db.wake_claim(&session_id).unwrap().is_none()
+    });
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
+fn concurrent_notify_single_flight() {
+    let _guard = integration_test_guard();
+    let fixture = Fixture::new();
+    fixture.write_provider(&provider_script("", "", "concurrent-resume.txt"));
+    fixture.seed_session_turn();
+    fixture.seed_idle_runtime();
+    let identity = identity(9_200, "boot-concurrent", 123);
+    fixture.record_identity(&identity);
+
+    let mut child_a = notify_command(&fixture, "h-concurrent-a", &identity)
+        .spawn()
+        .unwrap();
+    let mut child_b = notify_command(&fixture, "h-concurrent-b", &identity)
+        .spawn()
+        .unwrap();
+    assert!(child_a.wait().unwrap().success());
+    assert!(child_b.wait().unwrap().success());
+
+    let prompt = wait_for_file(&fixture.prompt_file("concurrent-resume.txt"));
+    assert!(prompt.contains("handle: h-concurrent-"), "{prompt}");
+    wait_until("concurrent rows delivered", || {
+        let db = fixture.mailbox();
+        let rows = db.list_mailbox(SESSION, true).unwrap();
+        rows.len() == 2
+            && rows.iter().all(|row| row.delivered_at.is_some())
+            && db.wake_claim(SESSION).unwrap().is_none()
+    });
+    assert!(fixture.mailbox().wake_claim(SESSION).unwrap().is_none());
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
+fn manual_resume_race_is_safe() {
+    let _guard = integration_test_guard();
+    let fixture = Fixture::new();
+    fixture.write_provider(&provider_script("", "", "manual-race.txt"));
+    fixture.seed_session_turn();
+    fixture.seed_idle_runtime();
+    fixture.seed_mailbox(SESSION, "h-manual-race");
+    let mut db = fixture.mailbox();
+    assert!(matches!(
+        db.try_acquire_wake_claim(WakeClaimRequest {
+            session_id: SESSION,
+            claim_token: "manual-race-token",
+            reason: "notify_idle",
+            auto_wake_count: 1,
+            wake_invocation_uuid: None,
+            stale_after_seconds: 600,
+        })
+        .unwrap(),
+        WakeClaimAcquireResult::Acquired(_)
+    ));
+    drop(db);
+
+    let output = fixture.run_resume();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+
+    let prompt = wait_for_file(&fixture.prompt_file("manual-race.txt"));
+    assert!(prompt.contains("handle: h-manual-race"), "{prompt}");
+    wait_until("manual race delivered", || {
+        let db = fixture.mailbox();
+        let rows = db.list_mailbox(SESSION, true).unwrap();
+        rows.len() == 1
+            && rows[0].delivered_at.is_some()
+            && db.wake_claim(SESSION).unwrap().is_none()
+    });
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
+fn batch_cap_followup_wake() {
+    let _guard = integration_test_guard();
+    let fixture = Fixture::new();
+    fixture.write_provider(&provider_script(
+        "",
+        "",
+        "batch-${OULIPOLY_AUTO_WAKE_COUNT:-manual}.txt",
+    ));
+    fixture.seed_session_turn();
+    fixture.seed_idle_runtime();
+    for index in 0..25 {
+        fixture.seed_mailbox(SESSION, &format!("h-batch-{index:02}"));
+    }
+
+    let output = fixture.run_resume();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+
+    let first = wait_for_file(&fixture.prompt_file("batch-manual.txt"));
+    let second = wait_for_file(&fixture.prompt_file("batch-1.txt"));
+    assert!(
+        first.contains("5 additional notification(s) remain queued"),
+        "{first}"
+    );
+    assert!(second.contains("handle: h-batch-20"), "{second}");
+    wait_until("batch rows delivered", || {
+        let db = fixture.mailbox();
+        let rows = db.list_mailbox(SESSION, true).unwrap();
+        rows.len() == 25
+            && rows.iter().all(|row| row.delivered_at.is_some())
+            && db.list_pending(SESSION).unwrap().is_empty()
+            && db.wake_claim(SESSION).unwrap().is_none()
+    });
+    fixture.assert_xdg_isolated();
+}
+
+fn notify_command(fixture: &Fixture, handle: &str, identity: &ProcessIdentity) -> Command {
+    let state_dir = fixture.work_dir.join(format!("concurrent-{handle}"));
+    fs::create_dir_all(&state_dir).unwrap();
+    let meta = state_dir.join("meta.json");
+    let log = state_dir.join("log");
+    let rc = state_dir.join("rc");
+    fs::write(
+        &meta,
+        serde_json::to_string(&caller_chain(identity)).unwrap(),
+    )
+    .unwrap();
+    fs::write(&log, format!("log {handle}\n")).unwrap();
+    fs::write(&rc, "0\n").unwrap();
+    let mut cmd = Command::new(runner_bin());
+    cmd.arg("notify")
+        .arg("agent-bash-complete")
+        .arg("--caller-ppid")
+        .arg(std::process::id().to_string())
+        .arg("--handle")
+        .arg(handle)
+        .arg("--state-dir")
+        .arg(&state_dir)
+        .arg("--meta")
+        .arg(&meta)
+        .arg("--log")
+        .arg(&log)
+        .arg("--rc")
+        .arg(&rc)
+        .arg("--json")
+        .env("XDG_CONFIG_HOME", &fixture.config_home)
+        .env("XDG_DATA_HOME", &fixture.data_home)
+        .env("HOME", &fixture.home_dir)
+        .env("AGENT_BASH_AGENT_RUNNER_BIN", runner_bin())
+        .env("WU_D_WORK_DIR", &fixture.work_dir)
+        .env_remove("OULIPOLY_PARENT_INVOCATION")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .current_dir(fixture.dir.path());
+    cmd
+}
+
+fn integration_test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn integration_test_guard() -> MutexGuard<'static, ()> {
+    integration_test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn provider_script(on_initial: &str, on_resume: &str, prompt_file: &str) -> String {
+    let prompt_file = prompt_file.replace('"', "\\\"");
+    format!(
+        r#"runner="${{AGENT_BASH_AGENT_RUNNER_BIN:?missing}}"
+work="${{WU_D_WORK_DIR:?missing}}"
+session=""
+resume=""
+for ((i=1; i <= $#; i++)); do
+  arg="${{!i}}"
+  if [ "$arg" = "--session-id" ]; then
+    j=$((i + 1))
+    session="${{!j}}"
+  fi
+  if [ "$arg" = "--resume" ]; then
+    j=$((i + 1))
+    resume="${{!j}}"
+  fi
+done
+last="${{@: -1}}"
+provider_pid="$$"
+boot_id="$(< /proc/sys/kernel/random/boot_id)"
+stat_line="$(< "/proc/${{provider_pid}}/stat")"
+after=
+after="${{stat_line##*) }}"
+read -r -a stat_fields <<< "$after"
+start_ticks="${{stat_fields[19]}}"
+notify_handle() {{
+  handle="$1"
+  rc_value="$2"
+  state="$work/$handle"
+  mkdir -p "$state"
+  printf '{{"caller_chain":[{{"pid":%s,"boot_id":"%s","starttime_ticks":%s}}]}}\n' "$provider_pid" "$boot_id" "$start_ticks" > "$state/meta.json"
+  printf 'log for %s\n' "$handle" > "$state/log"
+  printf '%s\n' "$rc_value" > "$state/rc"
+  "$runner" notify agent-bash-complete \
+    --caller-ppid "$provider_pid" \
+    --handle "$handle" \
+    --state-dir "$state" \
+    --meta "$state/meta.json" \
+    --log "$state/log" \
+    --rc "$state/rc" \
+    --json > "$state/notify.json" 2> "$state/notify.err" || true
+}}
+if [ -n "$resume" ]; then
+  target="$work/{prompt_file}"
+  mkdir -p "$(dirname "$target")"
+  printf '%s' "$last" > "$target"
+  {on_resume}
+  exit 0
+fi
+{on_initial}
+exit 0
+"#
+    )
+}
+
+fn wait_for_file(path: &Path) -> String {
+    wait_until(&format!("{} exists", path.display()), || path.exists());
+    fs::read_to_string(path).unwrap()
+}
+
+fn wait_for_mailbox_session(fixture: &Fixture) -> String {
+    wait_for_sidecar_session(fixture, "mailbox")
+}
+
+fn wait_for_runtime_session(fixture: &Fixture) -> String {
+    wait_for_sidecar_session(fixture, "session_runtime")
+}
+
+fn wait_for_sidecar_session(fixture: &Fixture, table: &str) -> String {
+    let mut found = None;
+    wait_until(&format!("{table} session id"), || {
+        found = sidecar_session_id(fixture, table);
+        found.is_some()
+    });
+    found.unwrap()
+}
+
+fn sidecar_session_id(fixture: &Fixture, table: &str) -> Option<String> {
+    let conn = fixture.sidecar_conn();
+    conn.query_row(
+        &format!("SELECT session_id FROM {table} ORDER BY session_id LIMIT 1"),
+        [],
+        |row| row.get(0),
+    )
+    .ok()
+}
+
+fn wait_until(label: &str, mut predicate: impl FnMut() -> bool) {
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(10) {
+        if predicate() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("timed out waiting for {label}");
+}
+
+fn caller_chain(identity: &ProcessIdentity) -> Value {
+    json!({
+        "caller_chain": [{
+            "pid": identity.os_pid,
+            "boot_id": identity.os_boot_id,
+            "starttime_ticks": identity.os_pid_starttime_ticks,
+        }]
+    })
+}
+
+fn identity(os_pid: i64, os_boot_id: &str, os_pid_starttime_ticks: i64) -> ProcessIdentity {
+    ProcessIdentity {
+        os_pid,
+        os_boot_id: os_boot_id.to_string(),
+        os_pid_starttime_ticks,
+    }
+}
+
+fn runner_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_oulipoly-agent-runner")
+}
+
+fn ts(value: &str) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(value)
+        .unwrap()
+        .with_timezone(&Utc)
+}
+
+fn path_string(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn toml_string(value: &str) -> String {
+    serde_json::to_string(value).unwrap()
+}
