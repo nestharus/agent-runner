@@ -43,10 +43,10 @@ use std::path::PathBuf;
 use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
 use std::thread::JoinHandle;
 
-// Generous to accommodate first-run scans across thousands of historical
-// session files. Subsequent scans are bounded by the script's mtime cursor
-// and finish in seconds.
-const SCRIPT_TIMEOUT_SECS: u64 = 600;
+// Turn scripts run on the pre-dispatch metrics path. Ninety seconds is long
+// enough for slow CLI/API startup but prevents provider selection from being
+// wedged by a broken adapter or an unexpectedly large history scan.
+const SCRIPT_TIMEOUT_SECS: u64 = 90;
 
 /// A turn as emitted by an adapter script.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -98,6 +98,15 @@ pub fn scan_provider(
     sessions_cfg: &SessionsConfig,
     db: &StateDb,
 ) -> ScanReport {
+    scan_provider_with_timeout(provider_name, sessions_cfg, db, SCRIPT_TIMEOUT_SECS)
+}
+
+fn scan_provider_with_timeout(
+    provider_name: &str,
+    sessions_cfg: &SessionsConfig,
+    db: &StateDb,
+    timeout_secs: u64,
+) -> ScanReport {
     let mut report = ScanReport::default();
     let Some(entry) = provider_session_source(sessions_cfg, provider_name) else {
         return report;
@@ -108,7 +117,7 @@ pub fn scan_provider(
         return scan_report_with_error(report, error);
     }
 
-    let stdout = match run_turn_script(&entry.turn_script, &state_dir) {
+    let stdout = match run_turn_script(&entry.turn_script, &state_dir, timeout_secs) {
         Ok(stdout) => stdout,
         Err(error) => return scan_report_with_error(report, error),
     };
@@ -150,6 +159,10 @@ fn collect_turn_script_batch(
     let mut batch = Vec::new();
     for line in non_empty_script_lines(stdout) {
         let line_number = record_script_line_seen(report);
+        if let Some(error) = degraded_marker_error(line) {
+            record_scan_error(report, error);
+            continue;
+        }
         match script_line_to_ingest(provider_name, line, line_number) {
             Ok(parsed) => {
                 record_optional_scan_error(report, parsed.body_error);
@@ -159,6 +172,20 @@ fn collect_turn_script_batch(
         }
     }
     batch
+}
+
+fn degraded_marker_error(trimmed: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(trimmed).ok()?;
+    let Value::Object(map) = value else {
+        return None;
+    };
+    if map.get("degraded").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let count = map.get("count").and_then(Value::as_u64).unwrap_or(0);
+    Some(format!(
+        "turn script degraded before completing scan; best_count={count}"
+    ))
 }
 
 fn non_empty_script_lines(stdout: &str) -> Vec<&str> {
@@ -399,8 +426,12 @@ fn default_app_data_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(".").join(oulipoly_state::paths::APP_DATA_DIR_NAME))
 }
 
-fn run_turn_script(script: &str, state_dir: &std::path::Path) -> Result<String, String> {
-    run_session_script(script, state_dir, None, "turn script")
+fn run_turn_script(
+    script: &str,
+    state_dir: &std::path::Path,
+    timeout_secs: u64,
+) -> Result<String, String> {
+    run_session_script_with_timeout(script, state_dir, None, "turn script", timeout_secs)
 }
 
 pub fn locate_transcript(
@@ -453,6 +484,22 @@ fn run_session_script(
     session_id: Option<&str>,
     script_kind: &str,
 ) -> Result<String, String> {
+    run_session_script_with_timeout(
+        script,
+        state_dir,
+        session_id,
+        script_kind,
+        SCRIPT_TIMEOUT_SECS,
+    )
+}
+
+fn run_session_script_with_timeout(
+    script: &str,
+    state_dir: &std::path::Path,
+    session_id: Option<&str>,
+    script_kind: &str,
+    timeout_secs: u64,
+) -> Result<String, String> {
     let mut cmd = session_script_command(script, state_dir, session_id);
     let mut child = spawn_session_script_child(&mut cmd, script_kind)?;
 
@@ -461,7 +508,7 @@ fn run_session_script(
     // fills up, the script blocks on write, the loop waits for exit forever.
     let stdout_handle = spawn_stdout_reader(take_child_stdout(&mut child));
     let stderr_handle = spawn_stderr_reader(take_child_stderr(&mut child));
-    let status = wait_for_session_script(&mut child, script_kind)?;
+    let status = wait_for_session_script(&mut child, script_kind, timeout_secs)?;
     let stdout_text = join_script_reader(stdout_handle);
     let stderr_text = join_script_reader(stderr_handle);
 
@@ -499,8 +546,19 @@ fn session_script_command(
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    configure_session_script_process_group(&mut cmd);
     cmd
 }
+
+#[cfg(unix)]
+fn configure_session_script_process_group(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    cmd.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_session_script_process_group(_cmd: &mut Command) {}
 
 fn spawn_session_script_child(cmd: &mut Command, script_kind: &str) -> Result<Child, String> {
     cmd.spawn()
@@ -538,13 +596,19 @@ where
     })
 }
 
-fn wait_for_session_script(child: &mut Child, script_kind: &str) -> Result<ExitStatus, String> {
-    let timeout = std::time::Duration::from_secs(SCRIPT_TIMEOUT_SECS);
+fn wait_for_session_script(
+    child: &mut Child,
+    script_kind: &str,
+    timeout_secs: u64,
+) -> Result<ExitStatus, String> {
+    let timeout = std::time::Duration::from_secs(timeout_secs);
     let start = std::time::Instant::now();
     loop {
         match poll_session_script(child) {
             Ok(Some(status)) => return Ok(status),
-            Ok(None) => wait_for_pending_session_script(child, start, timeout, script_kind)?,
+            Ok(None) => {
+                wait_for_pending_session_script(child, start, timeout, script_kind, timeout_secs)?
+            }
             Err(error) => return Err(format_session_script_wait_error(script_kind, error)),
         }
     }
@@ -559,10 +623,11 @@ fn wait_for_pending_session_script(
     start: std::time::Instant,
     timeout: std::time::Duration,
     script_kind: &str,
+    timeout_secs: u64,
 ) -> Result<(), String> {
     if script_wait_timed_out(start, timeout) {
         kill_timed_out_session_script(child);
-        return Err(format_session_script_timeout(script_kind));
+        return Err(format_session_script_timeout(script_kind, timeout_secs));
     }
     sleep_before_next_session_script_poll();
     Ok(())
@@ -573,18 +638,32 @@ fn script_wait_timed_out(start: std::time::Instant, timeout: std::time::Duration
 }
 
 fn kill_timed_out_session_script(child: &mut Child) {
+    kill_session_script_process_group(child);
+}
+
+#[cfg(unix)]
+fn kill_session_script_process_group(child: &mut Child) {
+    let pgid = -(child.id() as libc::pid_t);
+    // SAFETY: `pgid` targets the process group created with `process_group(0)`
+    // for this child. Killing the group prevents shell grandchildren from
+    // continuing to run or holding stdout/stderr pipes after timeout.
+    let _ = unsafe { libc::kill(pgid, libc::SIGKILL) };
     let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(not(unix))]
+fn kill_session_script_process_group(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn sleep_before_next_session_script_poll() {
     std::thread::sleep(std::time::Duration::from_millis(50));
 }
 
-fn format_session_script_timeout(script_kind: &str) -> String {
-    format!(
-        "{} timed out after {SCRIPT_TIMEOUT_SECS}s",
-        capitalize_script_kind(script_kind)
-    )
+fn format_session_script_timeout(script_kind: &str, timeout_secs: u64) -> String {
+    format!("script_timeout: {script_kind} timed out after {timeout_secs}s")
 }
 
 fn format_session_script_wait_error(script_kind: &str, error: std::io::Error) -> String {
@@ -829,6 +908,35 @@ EOF"#,
         assert_eq!(r.new_turns, 0);
         assert_eq!(r.errors.len(), 1);
         assert!(r.errors[0].contains("exited 7"));
+    }
+
+    #[test]
+    fn turn_script_timeout_is_classified_and_does_not_persist_turns() {
+        let db = db();
+        let script = fixture_script("sleep 60");
+        let cfg = cfg_with("p", &script.path);
+
+        let r = scan_provider_with_timeout("p", &cfg, &db, 1);
+
+        assert_eq!(r.new_turns, 0);
+        assert_eq!(db.count_assistant_turns_since("p", None).unwrap(), 0);
+        assert_eq!(r.errors.len(), 1);
+        assert!(r.errors[0].contains("script_timeout"), "{:?}", r.errors);
+        assert!(r.errors[0].contains("turn script"), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn degraded_marker_is_reported_without_malformed_turn_error() {
+        let db = db();
+        let script = fixture_script(r#"printf '%s\n' '{"degraded":true,"count":1}'"#);
+        let cfg = cfg_with("p", &script.path);
+
+        let r = scan_provider("p", &cfg, &db);
+
+        assert_eq!(r.new_turns, 0);
+        assert_eq!(r.errors.len(), 1);
+        assert!(r.errors[0].contains("degraded"), "{:?}", r.errors);
+        assert!(!r.errors[0].contains("malformed"), "{:?}", r.errors);
     }
 
     #[test]

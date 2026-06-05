@@ -20,8 +20,10 @@ use std::io::Read;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread::JoinHandle;
 
-/// Script timeout — scripts hitting the internet shouldn't hang the caller.
-const SCRIPT_TIMEOUT_SECS: u64 = 30;
+/// Quota scripts run on the pre-dispatch path. Ninety seconds is intentionally
+/// long enough for slow CLI/API startup but short enough that metrics can never
+/// wedge provider selection indefinitely.
+const SCRIPT_TIMEOUT_SECS: u64 = 90;
 /// Auth-refresh command timeout. Should be quick (the CLI hits its own auth
 /// endpoint and exits); kept tight to avoid hanging the quota path.
 const REFRESH_TIMEOUT_SECS: u64 = 15;
@@ -40,6 +42,10 @@ pub fn run_refresh_command(cmd_str: &str) -> Result<(), String> {
 }
 
 pub fn run_script(script: &str) -> Result<String, String> {
+    run_script_with_timeout(script, SCRIPT_TIMEOUT_SECS)
+}
+
+fn run_script_with_timeout(script: &str, timeout_secs: u64) -> Result<String, String> {
     let mut child = spawn_quota_script(script)?;
 
     // Drain stdout/stderr concurrently to avoid pipe-full deadlocks for
@@ -47,7 +53,7 @@ pub fn run_script(script: &str) -> Result<String, String> {
     // with the sessions-module pattern).
     let stdout_handle = drain_child_stdout(&mut child);
     let stderr_handle = drain_child_stderr(&mut child);
-    let status = wait_for_child(&mut child, SCRIPT_TIMEOUT_SECS, RefreshProcessKind::Quota)?;
+    let status = wait_for_child(&mut child, timeout_secs, RefreshProcessKind::Quota)?;
     let stdout_text = joined_text(stdout_handle);
     let stderr_text = joined_text(stderr_handle);
 
@@ -73,8 +79,19 @@ fn shell_command(command: &str) -> Command {
     let mut cmd = Command::new("sh");
     cmd.arg("-c").arg(command);
     cmd.stdin(Stdio::null());
+    configure_script_process_group(&mut cmd);
     cmd
 }
+
+#[cfg(unix)]
+fn configure_script_process_group(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    cmd.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_script_process_group(_cmd: &mut Command) {}
 
 fn drain_child_stdout(child: &mut Child) -> JoinHandle<String> {
     spawn_string_drain(child.stdout.take().expect("piped"))
@@ -156,8 +173,25 @@ fn kill_timed_out_child(
     kind: RefreshProcessKind,
     timeout_secs: u64,
 ) -> Result<ExitStatus, String> {
-    let _ = child.kill();
+    kill_child_process_group(child);
     Err(format_timeout(kind, timeout_secs))
+}
+
+#[cfg(unix)]
+fn kill_child_process_group(child: &mut Child) {
+    let pgid = -(child.id() as libc::pid_t);
+    // SAFETY: `pgid` targets the process group created with `process_group(0)`
+    // for this child. Killing the group is required so shell grandchildren do
+    // not keep pipes open or continue running after the metrics deadline.
+    let _ = unsafe { libc::kill(pgid, libc::SIGKILL) };
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(not(unix))]
+fn kill_child_process_group(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn joined_text(handle: JoinHandle<String>) -> String {
@@ -203,7 +237,9 @@ fn format_timeout(kind: RefreshProcessKind, timeout_secs: u64) -> String {
         RefreshProcessKind::Auth => {
             format!("auth_refresh_command timed out after {timeout_secs}s")
         }
-        RefreshProcessKind::Quota => format!("Quota script timed out after {timeout_secs}s"),
+        RefreshProcessKind::Quota => {
+            format!("script_timeout: quota script timed out after {timeout_secs}s")
+        }
     }
 }
 
@@ -228,4 +264,38 @@ fn format_quota_exit(status: ExitStatus, stderr_text: &str) -> String {
         status.code().unwrap_or(-1),
         stderr_text.trim()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn quota_script_timeout_is_classified() {
+        let err = run_script_with_timeout("sleep 60", 1).unwrap_err();
+
+        assert!(err.contains("script_timeout"), "{err}");
+        assert!(err.contains("quota script"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quota_script_timeout_kills_process_group_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let leaked_marker = dir.path().join("leaked");
+        let script = format!(
+            "(sleep 2; printf leaked > {}) & wait",
+            leaked_marker.display()
+        );
+
+        let err = run_script_with_timeout(&script, 1).unwrap_err();
+        std::thread::sleep(Duration::from_secs(3));
+
+        assert!(err.contains("script_timeout"), "{err}");
+        assert!(
+            !leaked_marker.exists(),
+            "timed-out quota script left a process-group child running"
+        );
+    }
 }

@@ -1371,9 +1371,8 @@ import sys
 
 args = sys.argv[1:]
 
-if args == ["session", "list"]:
-    print("ID\tTitle")
-    print("ses_fixture\tFixture session")
+if args == ["session", "list", "--json"]:
+    print(json.dumps([{"id": "ses_fixture"}], separators=(",", ":")))
     sys.exit(0)
 
 if args != ["export", "ses_fixture"]:
