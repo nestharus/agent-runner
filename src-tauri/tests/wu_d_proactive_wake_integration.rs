@@ -134,6 +134,35 @@ flag = "--resume"
         .unwrap();
     }
 
+    fn write_opencode_provider(&self, body: &str) {
+        let script = self.write_script("opencode.sh", body);
+        fs::write(
+            self.models_dir.join(format!("{MODEL}.toml")),
+            r#"[[providers]]
+name = "opencode"
+args = []
+"#,
+        )
+        .unwrap();
+        fs::write(
+            self.app_config_dir.join("providers.toml"),
+            format!(
+                r#"[opencode]
+command = {}
+args = []
+interactive_args = ["interactive"]
+prompt_mode = "arg"
+
+[opencode.resume]
+kind = "flag"
+flag = "--session"
+"#,
+                toml_string(&path_string(&script))
+            ),
+        )
+        .unwrap();
+    }
+
     fn write_script(&self, name: &str, body: &str) -> PathBuf {
         let path = self.dir.path().join(name);
         fs::write(
@@ -174,18 +203,46 @@ flag = "--resume"
     }
 
     fn seed_idle_runtime(&self) {
+        self.seed_idle_runtime_for(SESSION, PROVIDER, MODEL);
+    }
+
+    fn seed_idle_runtime_for(&self, session_id: &str, provider_name: &str, model_name: &str) {
         let mut db = MailboxDb::open(&self.sidecar_path()).unwrap();
         let models_dir = path_string(&self.models_dir);
         db.upsert_session_runtime(SessionRuntimeUpsert {
-            session_id: SESSION,
+            session_id,
             mode: "headless",
             invocation_uuid: None,
-            provider_name: Some(PROVIDER),
-            model_name: Some(MODEL),
+            provider_name: Some(provider_name),
+            model_name: Some(model_name),
             pty_control_path: None,
             models_dir: Some(&models_dir),
             effective_cwd: None,
         })
+        .unwrap();
+    }
+
+    fn seed_active_chain_for(
+        &self,
+        chain_id: &str,
+        provider_name: &str,
+        session_id: &str,
+        model_name: &str,
+    ) {
+        let _ = StateDb::open(&self.state_path()).unwrap();
+        let conn = Connection::open(self.state_path()).unwrap();
+        conn.execute(
+            "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
+             VALUES (?1, '2026-06-04T12:00:00Z', '2026-06-04T12:00:00Z', ?2)",
+            rusqlite::params![chain_id, model_name],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_chain_segments
+                (chain_id, provider_name, session_id, started_at, transition_reason)
+             VALUES (?1, ?2, ?3, '2026-06-04T12:00:00Z', 'initial')",
+            rusqlite::params![chain_id, provider_name, session_id],
+        )
         .unwrap();
     }
 
@@ -218,15 +275,25 @@ flag = "--resume"
     }
 
     fn record_identity(&self, identity: &ProcessIdentity) {
+        self.record_identity_for(identity, SESSION, PROVIDER, MODEL);
+    }
+
+    fn record_identity_for(
+        &self,
+        identity: &ProcessIdentity,
+        session_id: &str,
+        provider_name: &str,
+        model_name: &str,
+    ) {
         let sidecar = PidIdentityDb::open(&self.sidecar_path()).unwrap();
         sidecar
             .record_identity(PidIdentityRecord {
                 identity,
                 os_pgid: None,
                 invocation_uuid: INVOCATION,
-                session_id: Some(SESSION),
-                provider_name: Some(PROVIDER),
-                model_name: Some(MODEL),
+                session_id: Some(session_id),
+                provider_name: Some(provider_name),
+                model_name: Some(model_name),
                 recorded_at: "2026-06-04T12:00:00Z",
             })
             .unwrap();
@@ -466,6 +533,52 @@ fn manual_resume_race_is_safe() {
 }
 
 #[test]
+fn opencode_notify_idle_wakes_resume_with_ses_session() {
+    let _guard = integration_test_guard();
+    let fixture = Fixture::new();
+    fixture.write_opencode_provider(&provider_script(
+        "",
+        r#"if [ "$resume" != "ses_fixture" ]; then
+  printf 'expected --session ses_fixture, got %s\n' "$resume" >&2
+  exit 66
+fi"#,
+        "opencode-resumed.txt",
+    ));
+    fixture.seed_active_chain_for(
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "opencode",
+        "ses_fixture",
+        MODEL,
+    );
+    fixture.seed_idle_runtime_for("ses_fixture", "opencode", MODEL);
+    let identity = identity(9_400, "boot-opencode", 789);
+    fixture.record_identity_for(&identity, "ses_fixture", "opencode", MODEL);
+
+    let output = notify_command(&fixture, "h-opencode", &identity)
+        .output()
+        .unwrap();
+
+    assert_notify_success(&output);
+    let prompt = wait_for_file(&fixture.prompt_file("opencode-resumed.txt"));
+    assert!(prompt.contains("handle: h-opencode"), "{prompt}");
+    wait_until("opencode mailbox delivered", || {
+        let db = fixture.mailbox();
+        let rows = db.list_mailbox("ses_fixture", true).unwrap();
+        rows.len() == 1
+            && rows[0].delivered_at.is_some()
+            && db.wake_claim("ses_fixture").unwrap().is_none()
+    });
+    assert!(
+        fixture
+            .mailbox()
+            .list_pending("ses_fixture")
+            .unwrap()
+            .is_empty()
+    );
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
 fn batch_cap_followup_wake() {
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
@@ -606,6 +719,10 @@ for ((i=1; i <= $#; i++)); do
     session="${{!j}}"
   fi
   if [ "$arg" = "--resume" ]; then
+    j=$((i + 1))
+    resume="${{!j}}"
+  fi
+  if [ "$arg" = "--session" ]; then
     j=$((i + 1))
     resume="${{!j}}"
   fi

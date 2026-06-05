@@ -137,6 +137,7 @@ printf '{{"type":"agent.session_started","data":{{"id":"age-226-session"}}}}\n'
         event_type: Some("agent.session_started".to_string()),
         event_id_path: Some("data.id".to_string()),
         json_flag: Some("--json".to_string()),
+        json_args: None,
         last_message_flag: Some("--last-message".to_string()),
     });
 

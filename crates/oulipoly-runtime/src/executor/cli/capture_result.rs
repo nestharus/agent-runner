@@ -31,7 +31,11 @@ use super::session_capture::{
 };
 use std::path::Path;
 
-pub(super) fn finalize_capture(plan: &CapturePlan, stdout: &[u8]) -> SessionCaptureResult {
+pub(super) fn finalize_capture(
+    plan: &CapturePlan,
+    stdout: &[u8],
+    streamed_session_id: Option<&str>,
+) -> SessionCaptureResult {
     match plan {
         CapturePlan::None => no_capture_result(),
         CapturePlan::ForcedFlagVerified {
@@ -41,7 +45,12 @@ pub(super) fn finalize_capture(plan: &CapturePlan, stdout: &[u8]) -> SessionCapt
             event_type,
             event_id_path,
             ..
-        } => finalize_stdout_json_event_capture(stdout, event_type, event_id_path),
+        } => finalize_stdout_json_event_capture(
+            stdout,
+            event_type,
+            event_id_path,
+            streamed_session_id,
+        ),
     }
 }
 
@@ -100,7 +109,11 @@ fn finalize_stdout_json_event_capture(
     stdout: &[u8],
     event_type: &str,
     event_id_path: &str,
+    streamed_session_id: Option<&str>,
 ) -> SessionCaptureResult {
+    if let Some(session_id) = streamed_session_id {
+        return stdout_json_event_capture_result(Ok(session_id.to_string()));
+    }
     stdout_json_event_capture_result(parse_stdout_json_event_session_id(
         stdout,
         event_type,
@@ -132,7 +145,8 @@ pub(super) fn maybe_restore_plain_stdout(
 ) -> Vec<u8> {
     match plan {
         CapturePlan::StdoutJsonEvent {
-            last_message_path, ..
+            last_message_path: Some(last_message_path),
+            ..
         } => restore_plain_stdout_from_file(last_message_path, capture, stdout),
         _ => fallback_plain_stdout(stdout),
     }

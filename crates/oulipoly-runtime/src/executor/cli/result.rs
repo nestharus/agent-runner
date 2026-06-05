@@ -76,7 +76,11 @@ pub(super) fn raw_result_from_supervised_output(
     output: SupervisedOutput,
     returned_artifacts: Vec<ReturnedArtifactRef>,
 ) -> RawResult {
-    let capture_outcome = finalize_capture(capture_plan, &output.stdout);
+    let capture_outcome = finalize_capture(
+        capture_plan,
+        &output.stdout,
+        output.streamed_session_id.as_deref(),
+    );
     let stdout = maybe_restore_plain_stdout(capture_plan, &capture_outcome, &output.stdout);
     let stdout = remove_unsanctioned_money_fields(stdout);
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();

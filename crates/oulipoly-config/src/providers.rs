@@ -1198,6 +1198,89 @@ cwd_script = "codex-cwd /tmp/codex-sessions"
     }
 
     #[test]
+    fn parses_opencode_session_capture_json_args_for_all_accounts() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            r#"
+[opencode]
+command = "opencode1"
+prompt_mode = "arg"
+
+[opencode.session_capture]
+kind = "stdout_json_event"
+json_args = ["--format", "json"]
+event_type = "step_start"
+event_id_path = "sessionID"
+
+[opencode2]
+command = "opencode2"
+prompt_mode = "arg"
+
+[opencode2.session_capture]
+kind = "stdout_json_event"
+json_args = ["--format", "json"]
+event_type = "step_start"
+event_id_path = "sessionID"
+
+[opencode3]
+command = "opencode3"
+prompt_mode = "arg"
+
+[opencode3.session_capture]
+kind = "stdout_json_event"
+json_args = ["--format", "json"]
+event_type = "step_start"
+event_id_path = "sessionID"
+
+[opencode4]
+command = "opencode4"
+prompt_mode = "arg"
+
+[opencode4.session_capture]
+kind = "stdout_json_event"
+json_args = ["--format", "json"]
+event_type = "step_start"
+event_id_path = "sessionID"
+
+[opencode5]
+command = "opencode5"
+prompt_mode = "arg"
+
+[opencode5.session_capture]
+kind = "stdout_json_event"
+json_args = ["--format", "json"]
+event_type = "step_start"
+event_id_path = "sessionID"
+"#
+        )
+        .unwrap();
+
+        let cfg = ProvidersConfig::load(f.path()).unwrap();
+
+        for name in [
+            "opencode",
+            "opencode2",
+            "opencode3",
+            "opencode4",
+            "opencode5",
+        ] {
+            let capture = cfg
+                .entries
+                .get(name)
+                .and_then(|entry| entry.session_capture.as_ref())
+                .unwrap_or_else(|| panic!("missing capture for {name}"));
+            assert_eq!(
+                capture.json_args.as_deref(),
+                Some(&["--format".to_string(), "json".to_string()][..])
+            );
+            assert_eq!(capture.event_type.as_deref(), Some("step_start"));
+            assert_eq!(capture.event_id_path.as_deref(), Some("sessionID"));
+            assert!(capture.last_message_flag.is_none());
+        }
+    }
+
+    #[test]
     fn parses_script_session_storage() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         writeln!(

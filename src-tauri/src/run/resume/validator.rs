@@ -1,9 +1,8 @@
 //! validator
 
-use uuid::Uuid;
-
-pub(super) fn validate_resume_uuid(session_id: &str) -> Result<(), String> {
-    Uuid::parse_str(session_id)
-        .map(|_| ())
-        .map_err(|_| format!("invalid session UUID: {session_id}"))
+pub(super) fn validate_resume_input(session_id: &str) -> Result<(), String> {
+    if session_id.trim().is_empty() {
+        return Err("session id is required".to_string());
+    }
+    Ok(())
 }

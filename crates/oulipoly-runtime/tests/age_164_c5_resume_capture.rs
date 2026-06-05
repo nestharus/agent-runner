@@ -206,6 +206,19 @@ fn resume_flag_kind_formats_as_flag_value_pair() {
 }
 
 #[test]
+fn opencode_resume_flag_composes_session() {
+    let strategy = ResumeStrategy {
+        kind: ResumeKind::Flag,
+        flag: Some("--session".to_string()),
+        subcommand: None,
+    };
+
+    let args = compose_resume_args(&strategy, "ses_fixture").unwrap();
+
+    assert_eq!(args, vec!["--session", "ses_fixture"]);
+}
+
+#[test]
 fn resume_subcommand_kind_formats_as_subcommand_with_session_id_tail() {
     let strategy = ResumeStrategy {
         kind: ResumeKind::Subcommand,
@@ -260,6 +273,7 @@ fn start_known_provider_session_id_none_for_stdout_json_event_kind() {
         event_type: Some("agent.session_started".to_string()),
         event_id_path: Some("data.id".to_string()),
         json_flag: Some("--json".to_string()),
+        json_args: None,
         last_message_flag: Some("--last-message".to_string()),
     });
     // StdoutJsonEvent always returns None (no preflight session id).
@@ -276,6 +290,7 @@ fn start_known_provider_session_id_some_uuid_for_forced_flag_verified_kind() {
         event_type: None,
         event_id_path: None,
         json_flag: None,
+        json_args: None,
         last_message_flag: None,
     });
     let id = start_known_provider_session_id(&provider)
@@ -296,6 +311,7 @@ fn start_known_provider_session_id_forced_flag_verified_missing_flag_errors() {
         event_type: None,
         event_id_path: None,
         json_flag: None,
+        json_args: None,
         last_message_flag: None,
     });
     let err = start_known_provider_session_id(&provider).unwrap_err();
@@ -432,6 +448,7 @@ fn stdout_json_event_capture() -> SessionCapture {
         event_type: Some("agent.session_started".to_string()),
         event_id_path: Some("data.id".to_string()),
         json_flag: Some("--json".to_string()),
+        json_args: None,
         last_message_flag: Some("--last-message".to_string()),
     }
 }
@@ -444,23 +461,25 @@ fn execute_with_session_capture(capture: SessionCapture) -> Result<(), String> {
 }
 
 #[test]
-fn age230_stdout_json_event_capture_requires_json_flag() {
+fn age230_stdout_json_event_capture_requires_json_flag_or_json_args() {
     let mut capture = stdout_json_event_capture();
     capture.json_flag = None;
+    capture.json_args = None;
 
     let err = execute_with_session_capture(capture).unwrap_err();
 
-    assert_eq!(err, "session_capture.json_flag is required");
+    assert_eq!(
+        err,
+        "session_capture.json_flag or session_capture.json_args is required"
+    );
 }
 
 #[test]
-fn age230_stdout_json_event_capture_requires_last_message_flag() {
+fn age230_stdout_json_event_capture_allows_missing_last_message_sidecar() {
     let mut capture = stdout_json_event_capture();
     capture.last_message_flag = None;
 
-    let err = execute_with_session_capture(capture).unwrap_err();
-
-    assert_eq!(err, "session_capture.last_message_flag is required");
+    execute_with_session_capture(capture).expect("last-message sidecar is optional");
 }
 
 #[test]
@@ -495,6 +514,7 @@ fn age230_forced_flag_readback_mismatch_uses_requested_observed_evidence() {
         event_type: None,
         event_id_path: None,
         json_flag: None,
+        json_args: None,
         last_message_flag: None,
     });
     let model = model_for("age230-readback-mismatch-model", provider.clone());
@@ -560,6 +580,98 @@ printf '%s\n' '{"type":"agent.session_started","data":{"id":"sidecar-missing"}}'
     );
 }
 
+#[test]
+fn opencode_stdout_json_event_step_start_session_id() {
+    let (_dir, path) = script(
+        r#"
+printf '%s\n' '{"type":"step_start","timestamp":1767036059338,"sessionID":"ses_fixture","part":{"sessionID":"ses_fixture","type":"step-start"}}'
+printf '%s\n' '{"type":"text","timestamp":1767036059444,"sessionID":"ses_fixture","part":{"type":"text","text":"ok"}}'
+"#,
+    );
+    let mut provider = provider_for(&path);
+    provider.session_capture = Some(SessionCapture {
+        kind: SessionCaptureKind::StdoutJsonEvent,
+        flag: None,
+        readback_args: None,
+        event_type: Some("step_start".to_string()),
+        event_id_path: Some("sessionID".to_string()),
+        json_flag: None,
+        json_args: Some(vec!["--format".to_string(), "json".to_string()]),
+        last_message_flag: None,
+    });
+    let model = model_for("opencode-step-start-model", provider);
+
+    let result = execute(&model, 0, "prompt", None, &HashMap::new(), None).expect("execute");
+
+    assert!(matches!(
+        result.session_capture.method,
+        SessionCaptureMethod::StdoutJsonEvent
+    ));
+    assert_eq!(
+        result.session_capture.session_id.as_deref(),
+        Some("ses_fixture")
+    );
+}
+
+#[test]
+fn opencode_launch_argv_uses_format_json_and_captures_session() {
+    let (_dir, path) = script(
+        r#"
+expected=(run --dangerously-skip-permissions -m openai/gpt-5.5 --variant high --format json opencode-prompt)
+if [ "$#" -ne "${#expected[@]}" ]; then
+  printf 'unexpected argc: %s\n' "$#" >&2
+  printf 'argv: %s\n' "$*" >&2
+  exit 64
+fi
+for ((i=0; i < ${#expected[@]}; i++)); do
+  j=$((i + 1))
+  actual="${!j}"
+  if [ "$actual" != "${expected[$i]}" ]; then
+    printf 'argv[%s] expected %s got %s\n' "$i" "${expected[$i]}" "$actual" >&2
+    exit 65
+  fi
+done
+printf '%s\n' '{"type":"step_start","timestamp":1767036059338,"sessionID":"ses_fixture","part":{"sessionID":"ses_fixture","type":"step-start"}}'
+printf '%s\n' '{"type":"text","timestamp":1767036059444,"sessionID":"ses_fixture","part":{"type":"text","text":"ok"}}'
+printf '%s\n' '{"type":"step_finish","timestamp":1767036059555,"sessionID":"ses_fixture","part":{"type":"step-finish","reason":"stop"}}'
+"#,
+    );
+    let mut provider = provider_for(&path);
+    provider.name = "opencode".to_string();
+    provider.args = vec![
+        "run".to_string(),
+        "--dangerously-skip-permissions".to_string(),
+        "-m".to_string(),
+        "openai/gpt-5.5".to_string(),
+        "--variant".to_string(),
+        "high".to_string(),
+    ];
+    provider.session_capture = Some(SessionCapture {
+        kind: SessionCaptureKind::StdoutJsonEvent,
+        flag: None,
+        readback_args: None,
+        event_type: Some("step_start".to_string()),
+        event_id_path: Some("sessionID".to_string()),
+        json_flag: None,
+        json_args: Some(vec!["--format".to_string(), "json".to_string()]),
+        last_message_flag: None,
+    });
+    let model = model_for("gpt-high", provider);
+
+    let result =
+        execute(&model, 0, "opencode-prompt", None, &HashMap::new(), None).expect("execute");
+
+    assert_eq!(result.exit_code, 0, "stderr={}", result.stderr);
+    assert_eq!(
+        result.session_capture.session_id.as_deref(),
+        Some("ses_fixture")
+    );
+    assert!(matches!(
+        result.session_capture.method,
+        SessionCaptureMethod::StdoutJsonEvent
+    ));
+}
+
 // ===========================================================================
 // ACR-251 PP-007: forced-flag verified stdout JSONL schema.
 // ===========================================================================
@@ -588,6 +700,7 @@ printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$requested"
         event_type: None,
         event_id_path: None,
         json_flag: None,
+        json_args: None,
         last_message_flag: None,
     });
     let model = ModelConfig {
@@ -630,6 +743,7 @@ printf '{"type":"result","session_id":"%s"}\n' "$requested"
         event_type: None,
         event_id_path: None,
         json_flag: None,
+        json_args: None,
         last_message_flag: None,
     });
     let model = ModelConfig {
@@ -660,6 +774,7 @@ fn acr251_pp007_forced_flag_verified_no_event_fails_with_canonical_message() {
         event_type: None,
         event_id_path: None,
         json_flag: None,
+        json_args: None,
         last_message_flag: None,
     });
     let model = ModelConfig {
@@ -693,6 +808,7 @@ fn acr251_pp007_forced_flag_verified_system_init_missing_session_id_errors() {
         event_type: None,
         event_id_path: None,
         json_flag: None,
+        json_args: None,
         last_message_flag: None,
     });
     let model = ModelConfig {
@@ -739,6 +855,7 @@ printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$requested"
         event_type: None,
         event_id_path: None,
         json_flag: None,
+        json_args: None,
         last_message_flag: None,
     });
     let model = ModelConfig {
@@ -785,6 +902,7 @@ printf '{"type":"agent.session_started","data":{"id":"nested-uuid"}}\n'
         event_type: Some("agent.session_started".to_string()),
         event_id_path: Some("data.id".to_string()),
         json_flag: Some("--json".to_string()),
+        json_args: None,
         last_message_flag: Some("--last-message".to_string()),
     });
     let model = ModelConfig {
@@ -831,6 +949,7 @@ printf 'no events here\n'
         event_type: Some("agent.session_started".to_string()),
         event_id_path: Some("data.id".to_string()),
         json_flag: Some("--json".to_string()),
+        json_args: None,
         last_message_flag: Some("--last-message".to_string()),
     });
     let model = ModelConfig {
@@ -876,6 +995,7 @@ printf '{"type":"agent.session_started","data":{}}\n'
         event_type: Some("agent.session_started".to_string()),
         event_id_path: Some("data.id".to_string()),
         json_flag: Some("--json".to_string()),
+        json_args: None,
         last_message_flag: Some("--last-message".to_string()),
     });
     let model = ModelConfig {
@@ -1280,6 +1400,7 @@ fn execute_resume_forces_session_capture_to_none_in_returned_result() {
         event_type: None,
         event_id_path: None,
         json_flag: None,
+        json_args: None,
         last_message_flag: None,
     });
     let strategy = flag_strategy();

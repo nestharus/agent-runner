@@ -86,7 +86,7 @@ pub(crate) fn run_resume(
 }
 
 fn reject_invalid_resume_input(session_id: &str) -> Option<i32> {
-    match validator::validate_resume_uuid(session_id) {
+    match validator::validate_resume_input(session_id) {
         Ok(()) => None,
         Err(message) => {
             formatter::emit_stderr(&message);

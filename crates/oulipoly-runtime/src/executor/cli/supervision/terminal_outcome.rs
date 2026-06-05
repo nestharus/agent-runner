@@ -63,5 +63,6 @@ pub(super) fn supervised_output_from_terminal(
         exit_code,
         terminal_reason,
         terminal_signal,
+        streamed_session_id: None,
     }
 }

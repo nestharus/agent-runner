@@ -93,8 +93,13 @@ pub(super) fn execute_provider_with_arg_parts_and_supervisor_config(
         return_channel,
         temp_files,
     } = launch;
-    let output =
-        run_provider_supervisor(cmd, provider, supervisor_config, spawn_identity.as_ref())?;
+    let output = run_provider_supervisor(
+        cmd,
+        provider,
+        supervisor_config,
+        spawn_identity.as_ref(),
+        &capture_plan,
+    )?;
     let returned_artifacts = ipc::read_and_cleanup_return_channel(&return_channel);
     let result = raw_result_from_supervised_output(&capture_plan, output, returned_artifacts);
 

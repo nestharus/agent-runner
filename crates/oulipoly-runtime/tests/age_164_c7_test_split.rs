@@ -254,6 +254,7 @@ fn resume_execution_clears_session_capture_and_preserves_invocation_mode() {
             event_type: None,
             event_id_path: None,
             json_flag: None,
+            json_args: None,
             last_message_flag: None,
         }),
         resume_acceptance: None,

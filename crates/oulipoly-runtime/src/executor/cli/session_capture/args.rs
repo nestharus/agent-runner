@@ -28,13 +28,14 @@ pub(super) fn forced_flag_capture_args(
 }
 
 pub(super) fn stdout_json_event_capture_args(
-    json_flag: String,
-    last_message_flag: String,
-    last_message_path: &Path,
+    json_args: Vec<String>,
+    last_message_flag: Option<String>,
+    last_message_path: Option<&Path>,
 ) -> Vec<String> {
-    vec![
-        json_flag,
-        last_message_flag,
-        last_message_path.to_string_lossy().into_owned(),
-    ]
+    let mut args = json_args;
+    if let (Some(flag), Some(path)) = (last_message_flag, last_message_path) {
+        args.push(flag);
+        args.push(path.to_string_lossy().into_owned());
+    }
+    args
 }

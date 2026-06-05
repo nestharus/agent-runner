@@ -6293,7 +6293,6 @@ impl StateDb {
         input: &str,
         model_override: Option<&str>,
     ) -> Result<ResolvedResume, ResumeError> {
-        Self::validate_resume_input_uuid(input)?;
         self.reject_wrong_resume_id_kind(input)?;
         let chain_id = self.resolve_resume_chain_id(input)?;
         let (active_provider, active_session_id) = self.require_active_segment(&chain_id)?;
@@ -6307,14 +6306,6 @@ impl StateDb {
             active_provider,
             active_session_id,
         ))
-    }
-
-    fn validate_resume_input_uuid(input: &str) -> Result<(), ResumeError> {
-        Uuid::try_parse(input)
-            .map(|_| ())
-            .map_err(|_| ResumeError::InvalidUuid {
-                input: input.to_string(),
-            })
     }
 
     fn reject_wrong_resume_id_kind(&self, input: &str) -> Result<(), ResumeError> {
@@ -12289,7 +12280,7 @@ interactive_args = ["launch"]
             test_db()
                 .resolve_resume(&models, "not-a-uuid", None)
                 .unwrap_err(),
-            ResumeError::InvalidUuid { .. }
+            ResumeError::NoChainFound { .. }
         ));
         assert!(matches!(
             test_db()
@@ -12373,6 +12364,34 @@ interactive_args = ["launch"]
             }
             other => panic!("expected wrong-id-kind rejection, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn resolve_resume_accepts_opencode_provider_session_id() {
+        let db = test_db();
+        let models = model_store_from_toml(&[(
+            "gpt-high",
+            r#"
+[[providers]]
+name = "opencode"
+interactive_args = ["run"]
+"#,
+        )]);
+        seed_test_chain(
+            &db,
+            CHAIN_A,
+            "opencode",
+            "ses_fixture",
+            "gpt-high",
+            "2026-06-04T08:00:00Z",
+        );
+
+        let resolved = db.resolve_resume(&models, "ses_fixture", None).unwrap();
+
+        assert_eq!(resolved.chain_id, CHAIN_A);
+        assert_eq!(resolved.active_provider, "opencode");
+        assert_eq!(resolved.active_session_id, "ses_fixture");
+        assert_eq!(resolved.model_name.as_deref(), Some("gpt-high"));
     }
 
     #[test]

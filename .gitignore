@@ -45,6 +45,7 @@ CODERABBIT_*.md
 # Per-WU gate/audit evidence (auditor reports, prompts, logs, RCA notes —
 # persisted on disk for review, never committed or vocabulary-scanned)
 /planning/fix-*/
+/planning/opencode-contract/
 
 # Worktrees (per-PR isolation for phase 6)
 /worktrees/

@@ -223,6 +223,8 @@ pub struct SessionCapture {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub json_flag: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_args: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_message_flag: Option<String>,
 }
 
@@ -250,14 +252,17 @@ impl SessionCapture {
                 Ok(())
             }
             SessionCaptureKind::StdoutJsonEvent => {
-                if self.json_flag.is_none() {
+                if let Some(json_args) = &self.json_args
+                    && json_args.is_empty()
+                {
                     return Err(
-                        "session_capture.kind = stdout_json_event requires `json_flag`".into(),
+                        "session_capture.kind = stdout_json_event requires non-empty `json_args`"
+                            .into(),
                     );
                 }
-                if self.last_message_flag.is_none() {
+                if self.json_flag.is_none() && self.json_args.is_none() {
                     return Err(
-                        "session_capture.kind = stdout_json_event requires `last_message_flag`"
+                        "session_capture.kind = stdout_json_event requires `json_flag` or `json_args`"
                             .into(),
                     );
                 }

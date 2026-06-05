@@ -465,6 +465,14 @@ fn ts(value: &str) -> DateTime<Utc> {
         .with_timezone(&Utc)
 }
 
+fn path_string(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn toml_string(value: &str) -> String {
+    serde_json::to_string(value).unwrap()
+}
+
 pub(crate) fn parse_invocation(stderr: &str) -> CompositeInvocationId {
     let lines: Vec<&str> = stderr
         .lines()
@@ -655,33 +663,151 @@ fn invocation_count_for_session(fixture: &Fixture, session_id: &str) -> i64 {
 }
 
 #[test]
-fn headless_resume_rejects_malformed_uuid_before_state_or_config_open() {
+fn headless_resume_unknown_non_uuid_reports_no_chain_found() {
     let fixture = Fixture::new();
+    let script = fixture.write_script("provider.sh", "exit 0");
+    fixture.write_single_provider_model(
+        "gpt-high",
+        "opencode",
+        &script,
+        r#"
+[providers.resume]
+kind = "flag"
+flag = "--resume"
+"#,
+    );
     let output = fixture
-        .base_resume_command("claude-opus", "not-a-uuid")
+        .base_resume_command("gpt-high", "not-a-uuid")
         .arg("--prompt")
         .arg("answer text")
         .output()
         .unwrap();
 
     assert_eq!(output.status.code(), Some(1), "{output:?}");
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
-        "invalid session UUID: not-a-uuid\n"
-    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        !fixture.db_path().exists(),
-        "malformed UUID must return before state DB initialization"
+        stderr.contains("No session found matching not-a-uuid"),
+        "{stderr}"
     );
-    let app_config_dir = fixture.config_home.join("oulipoly-agent-runner");
-    assert!(
-        !app_config_dir.join("providers.toml").exists(),
-        "malformed UUID must not initialize provider config"
+}
+
+#[test]
+fn opencode_resume_accepts_ses_provider_session_id() {
+    let fixture = Fixture::new();
+    let script = fixture.write_script(
+        "opencode.sh",
+        r#"
+session=""
+for ((i=1; i <= $#; i++)); do
+  arg="${!i}"
+  if [ "$arg" = "--session" ]; then
+    j=$((i + 1))
+    session="${!j}"
+  fi
+done
+if [ "$session" != "ses_fixture" ]; then
+  printf 'expected --session ses_fixture, got %s\n' "$session" >&2
+  exit 66
+fi
+printf 'opencode resumed\n'
+"#,
     );
-    assert!(
-        !app_config_dir.join("sessions.toml").exists(),
-        "malformed UUID must not initialize session config"
+    fixture.write_single_provider_model(
+        "gpt-high",
+        "opencode",
+        &script,
+        r#"
+[providers.resume]
+kind = "flag"
+flag = "--session"
+"#,
     );
+    fixture.seed_active_chain(
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "opencode",
+        "ses_fixture",
+        "gpt-high",
+    );
+
+    let output = fixture
+        .base_resume_command("gpt-high", "ses_fixture")
+        .arg("--prompt")
+        .arg("answer text")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let invocation = parse_invocation(&stderr);
+    assert_resume_dual_id_row(&fixture, &invocation.id, "ses_fixture", "ses_fixture");
+}
+
+#[test]
+fn opencode_balanced_launch_captures_ses_session_id() {
+    let fixture = Fixture::new();
+    let script = fixture.write_script(
+        "opencode1.sh",
+        r#"
+expected=(run --dangerously-skip-permissions -m openai/gpt-5.5 --variant high --format json opencode-prompt)
+if [ "$#" -ne "${#expected[@]}" ]; then
+  printf 'unexpected argc: %s argv: %s\n' "$#" "$*" >&2
+  exit 64
+fi
+for ((i=0; i < ${#expected[@]}; i++)); do
+  j=$((i + 1))
+  actual="${!j}"
+  if [ "$actual" != "${expected[$i]}" ]; then
+    printf 'argv[%s] expected %s got %s\n' "$i" "${expected[$i]}" "$actual" >&2
+    exit 65
+  fi
+done
+printf '%s\n' '{"type":"step_start","timestamp":1767036059338,"sessionID":"ses_fixture","part":{"sessionID":"ses_fixture","type":"step-start"}}'
+printf '%s\n' '{"type":"text","timestamp":1767036059444,"sessionID":"ses_fixture","part":{"type":"text","text":"ok"}}'
+printf '%s\n' '{"type":"step_finish","timestamp":1767036059555,"sessionID":"ses_fixture","part":{"type":"step-finish","reason":"stop"}}'
+"#,
+    );
+    fixture.write_model_body(
+        "gpt-high",
+        r#"[[providers]]
+name = "opencode"
+args = ["-m", "openai/gpt-5.5", "--variant", "high"]
+"#,
+    );
+    fixture.write_providers_body(&format!(
+        r#"[opencode]
+command = {}
+args = ["run", "--dangerously-skip-permissions"]
+prompt_mode = "arg"
+
+[opencode.session_capture]
+kind = "stdout_json_event"
+json_args = ["--format", "json"]
+event_type = "step_start"
+event_id_path = "sessionID"
+
+[opencode.resume]
+kind = "flag"
+flag = "--session"
+"#,
+        toml_string(&path_string(&script))
+    ));
+
+    let output = fixture
+        .base_model_command("gpt-high")
+        .arg("opencode-prompt")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let invocation = parse_invocation(&stderr);
+    let session_id = parse_session_line(&stderr, &invocation.id);
+    assert_eq!(session_id, "ses_fixture");
+    let (provider_session_id, resume_input_id, capture_method) =
+        invocation_dual_id_columns(&fixture, &invocation.id);
+    assert_eq!(provider_session_id.as_deref(), Some("ses_fixture"));
+    assert_eq!(resume_input_id, None);
+    assert_eq!(capture_method.as_deref(), Some("stdout_json_event"));
 }
 
 #[test]
@@ -2068,7 +2194,7 @@ subcommand = ["resume"]
 }
 
 #[test]
-fn resume_rejects_malformed_uuid_before_lookup() {
+fn resume_unknown_non_uuid_reports_no_chain_found() {
     let fixture = Fixture::new();
     let script = fixture.write_script("claude.sh", "exit 0");
     fixture.write_single_provider_model(
@@ -2087,7 +2213,7 @@ flag = "--resume"
 
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert!(
-        stderr.contains("invalid session UUID: not-a-uuid"),
+        stderr.contains("No session found matching not-a-uuid"),
         "{stderr}"
     );
 }

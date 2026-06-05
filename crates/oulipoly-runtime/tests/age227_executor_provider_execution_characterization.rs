@@ -250,6 +250,7 @@ printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$requested""#,
         event_type: None,
         event_id_path: None,
         json_flag: None,
+        json_args: None,
         last_message_flag: None,
     });
     let model = model_for(provider.clone(), PromptMode::Arg);
