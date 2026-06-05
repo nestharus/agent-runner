@@ -1,0 +1,72 @@
+# Runtime test evidence — pin gate (c49bf80), XDG-isolated, OULIPOLY_DATA_DIR unset in harness env
+## data_dir_precedence (oulipoly-state)
+test default_state_locations_prefer_oulipoly_data_dir_over_xdg_data_home ... ok
+test default_state_locations_fall_back_to_xdg_data_home_when_unpinned ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+## age_pid_sidecar_spawn (oulipoly-runtime)
+test spawn_capture_writes_verified_sidecar_row_without_state_schema_change ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s
+## wu_d_proactive_wake_integration (oulipoly-agent-runner)
+test auto_wake_cap_stops_self_replicating_session ... ok
+test batch_cap_followup_wake ... ok
+test busy_then_turn_end_delivers ... ok
+test concurrent_notify_single_flight ... ok
+test idle_wake_delivers ... ok
+test manual_resume_race_is_safe ... ok
+test no_undelivered_no_wake_and_loop_terminates ... ok
+test opencode_notify_idle_wakes_resume_with_ses_session ... ok
+test provider_shadow_xdg_notify_uses_pinned_data_dir_and_wakes ... ok
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.80s
+## wu_b_mailbox_integration (oulipoly-agent-runner)
+test notify_no_owner_valid_chain_returns_zero ... ok
+test notify_rejects_reuse_mismatch ... ok
+test notify_missing_chain_is_usage_error ... ok
+test notify_handle_conflict_different_session ... ok
+test notify_resolves_nearest_ancestor_sidecar_session ... ok
+test notify_idempotent_retried_handle ... ok
+test notify_works_after_caller_dead ... ok
+test mailbox_isolation ... ok
+test notify_ordering_by_seq ... ok
+test notify_resolves_from_state_when_sidecar_session_null ... ok
+test resume_without_mailbox_preserves_payload ... ok
+test resume_without_mailbox_and_without_prompt_preserves_native_resume ... ok
+test resume_failure_leaves_pending ... ok
+test resume_with_only_mailbox_sends_notification_prompt ... ok
+test resume_marks_delivered_after_success ... ok
+test resume_uses_resolved_active_session_id ... ok
+test resume_with_pending_mailbox_prepends_notifications ... ok
+test resume_drains_in_order_and_respects_batch_cap ... ok
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.18s
+## wu_e_pty_delivery_integration (oulipoly-agent-runner)
+test notify_live_pty_failure_leaves_pending_and_wake_busy ... ok
+test notify_live_pty_ack_marks_delivered_and_skips_headless_wake ... ok
+test notify_stale_socket_cleans_runtime_and_does_not_report_busy ... ok
+test fixture_interactive_session_agent_bash_completion_arrives_live ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.41s
+## quota marker_verification unit tests (oulipoly-runtime lib)
+test quota::marker_verification::tests::cooldown_secs_uses_default_trimmed_override_and_invalid_fallback ... ok
+test quota::marker_verification::tests::env_guard_restores_previous_values_and_removes_absent_variables ... ok
+test quota::marker_verification::tests::clear_marker_failure_does_not_panic_and_leaves_marker_intact ... ok
+test quota::marker_verification::tests::lock_file_open_failure_retains_marker ... ok
+test quota::marker_verification::tests::lock_dir_create_failure_retains_marker ... ok
+test quota::marker_verification::tests::many_threads_collapse_into_one_refresh ... ok
+test quota::marker_verification::tests::marker_with_fresh_cache_and_empty_windows_is_kept ... ok
+test quota::marker_verification::tests::release_slack_secs_uses_default_trimmed_override_and_invalid_fallback ... ok
+test quota::marker_verification::tests::marker_with_fresh_cache_and_healthy_windows_is_cleared ... ok
+test quota::marker_verification::tests::marker_with_fresh_cache_and_exhausted_window_is_kept ... ok
+test quota::marker_verification::tests::marker_with_stale_cache_keeps_marker_when_refresh_shows_exhausted ... ok
+test quota::marker_verification::tests::marker_with_stale_cache_runs_refresh_and_clears_when_healthy ... ok
+test quota::marker_verification::tests::no_marker_no_action ... ok
+test quota::marker_verification::tests::marker_within_release_slack_is_cleared_without_refresh ... ok
+test quota::marker_verification::tests::past_reset_exhausted_window_does_not_pin_but_future_exhausted_window_does ... ok
+test quota::marker_verification::tests::stale_marker_with_configured_provider_but_no_quota_script_keeps_marker_and_failure_class ... ok
+test quota::marker_verification::tests::shortened_cooldown_forces_stale_cache_refresh_instead_of_fresh_cache_bypass ... ok
+test quota::marker_verification::tests::stale_marker_with_failed_quota_script_keeps_marker_and_failure_class ... ok
+test quota::marker_verification::tests::lock_name_sanitization_and_lock_dir_env_precedence_are_stable ... ok
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 333 filtered out; finished in 4.09s
+## age_pid_sidecar_spawn pre-existing pin preservation (oulipoly-runtime)
+test spawn_preserves_preexisting_oulipoly_data_dir_in_provider_child ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+## wu_d_proactive_wake_integration resume pin preservation (oulipoly-agent-runner)
+test provider_shadow_xdg_notify_uses_pinned_data_dir_and_wakes ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.55s

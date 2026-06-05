@@ -66,6 +66,10 @@ impl Fixture {
             .join("state.db")
     }
 
+    fn pinned_data_dir(&self) -> PathBuf {
+        self.data_home.join("oulipoly-agent-runner")
+    }
+
     fn run(&self, mut cmd: Command) -> Output {
         cmd.env("XDG_CONFIG_HOME", &self.config_home)
             .env("XDG_DATA_HOME", &self.data_home)
@@ -668,7 +672,7 @@ fn provider_shadow_xdg_notify_uses_pinned_data_dir_and_wakes() {
 fi
 export XDG_DATA_HOME="$work/shadow-xdg"
 ( sleep 0.3; notify_handle h-shadow-xdg 0 ) >/dev/null 2>&1 &"#,
-        "",
+        r#"printf '%s\n' "${OULIPOLY_DATA_DIR:-}" > "$work/shadow-resumed-data-dir.txt""#,
         "shadow-resumed-input.txt",
     ));
 
@@ -677,6 +681,10 @@ export XDG_DATA_HOME="$work/shadow-xdg"
 
     let prompt = wait_for_file(&fixture.prompt_file("shadow-resumed-input.txt"));
     assert!(prompt.contains("handle: h-shadow-xdg"), "{prompt}");
+    let resumed_data_dir = wait_for_file(&fixture.prompt_file("shadow-resumed-data-dir.txt"));
+    let expected_data_dir = fixture.pinned_data_dir();
+    let expected_data_dir = expected_data_dir.to_string_lossy();
+    assert_eq!(resumed_data_dir.trim_end(), expected_data_dir.as_ref());
     let session_id = wait_for_mailbox_session(&fixture);
     wait_until("shadow-xdg mailbox delivered", || {
         let db = fixture.mailbox();
