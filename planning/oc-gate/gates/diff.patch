@@ -1,0 +1,2180 @@
+diff --git a/.gitignore b/.gitignore
+index 5c1548d..e3bd147 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -45,6 +45,7 @@ CODERABBIT_*.md
+ # Per-WU gate/audit evidence (auditor reports, prompts, logs, RCA notes —
+ # persisted on disk for review, never committed or vocabulary-scanned)
+ /planning/fix-*/
++/planning/opencode-contract/
+ 
+ # Worktrees (per-PR isolation for phase 6)
+ /worktrees/
+diff --git a/crates/oulipoly-config/src/model.rs b/crates/oulipoly-config/src/model.rs
+index 4406f8f..cc7708e 100755
+--- a/crates/oulipoly-config/src/model.rs
++++ b/crates/oulipoly-config/src/model.rs
+@@ -223,6 +223,8 @@ pub struct SessionCapture {
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub json_flag: Option<String>,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub json_args: Option<Vec<String>>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub last_message_flag: Option<String>,
+ }
+ 
+@@ -250,14 +252,17 @@ impl SessionCapture {
+                 Ok(())
+             }
+             SessionCaptureKind::StdoutJsonEvent => {
+-                if self.json_flag.is_none() {
++                if let Some(json_args) = &self.json_args
++                    && json_args.is_empty()
++                {
+                     return Err(
+-                        "session_capture.kind = stdout_json_event requires `json_flag`".into(),
++                        "session_capture.kind = stdout_json_event requires non-empty `json_args`"
++                            .into(),
+                     );
+                 }
+-                if self.last_message_flag.is_none() {
++                if self.json_flag.is_none() && self.json_args.is_none() {
+                     return Err(
+-                        "session_capture.kind = stdout_json_event requires `last_message_flag`"
++                        "session_capture.kind = stdout_json_event requires `json_flag` or `json_args`"
+                             .into(),
+                     );
+                 }
+diff --git a/crates/oulipoly-config/src/providers.rs b/crates/oulipoly-config/src/providers.rs
+index 06da6d4..5102f3d 100644
+--- a/crates/oulipoly-config/src/providers.rs
++++ b/crates/oulipoly-config/src/providers.rs
+@@ -1197,6 +1197,117 @@ cwd_script = "codex-cwd /tmp/codex-sessions"
+         assert!(provider.session_storage.is_some());
+     }
+ 
++    #[test]
++    fn parses_opencode_session_capture_json_args_for_all_accounts() {
++        let mut f = tempfile::NamedTempFile::new().unwrap();
++        writeln!(
++            f,
++            r#"
++[opencode]
++command = "opencode1"
++prompt_mode = "arg"
++
++[opencode.session_capture]
++kind = "stdout_json_event"
++json_args = ["--format", "json"]
++event_type = "step_start"
++event_id_path = "sessionID"
++
++[opencode.resume_acceptance]
++rejected_output_patterns = ["session not found", "session does not exist", "session id mismatch"]
++
++[opencode2]
++command = "opencode2"
++prompt_mode = "arg"
++
++[opencode2.session_capture]
++kind = "stdout_json_event"
++json_args = ["--format", "json"]
++event_type = "step_start"
++event_id_path = "sessionID"
++
++[opencode2.resume_acceptance]
++rejected_output_patterns = ["session not found", "session does not exist", "session id mismatch"]
++
++[opencode3]
++command = "opencode3"
++prompt_mode = "arg"
++
++[opencode3.session_capture]
++kind = "stdout_json_event"
++json_args = ["--format", "json"]
++event_type = "step_start"
++event_id_path = "sessionID"
++
++[opencode3.resume_acceptance]
++rejected_output_patterns = ["session not found", "session does not exist", "session id mismatch"]
++
++[opencode4]
++command = "opencode4"
++prompt_mode = "arg"
++
++[opencode4.session_capture]
++kind = "stdout_json_event"
++json_args = ["--format", "json"]
++event_type = "step_start"
++event_id_path = "sessionID"
++
++[opencode4.resume_acceptance]
++rejected_output_patterns = ["session not found", "session does not exist", "session id mismatch"]
++
++[opencode5]
++command = "opencode5"
++prompt_mode = "arg"
++
++[opencode5.session_capture]
++kind = "stdout_json_event"
++json_args = ["--format", "json"]
++event_type = "step_start"
++event_id_path = "sessionID"
++
++[opencode5.resume_acceptance]
++rejected_output_patterns = ["session not found", "session does not exist", "session id mismatch"]
++"#
++        )
++        .unwrap();
++
++        let cfg = ProvidersConfig::load(f.path()).unwrap();
++
++        for name in [
++            "opencode",
++            "opencode2",
++            "opencode3",
++            "opencode4",
++            "opencode5",
++        ] {
++            let capture = cfg
++                .entries
++                .get(name)
++                .and_then(|entry| entry.session_capture.as_ref())
++                .unwrap_or_else(|| panic!("missing capture for {name}"));
++            assert_eq!(
++                capture.json_args.as_deref(),
++                Some(&["--format".to_string(), "json".to_string()][..])
++            );
++            assert_eq!(capture.event_type.as_deref(), Some("step_start"));
++            assert_eq!(capture.event_id_path.as_deref(), Some("sessionID"));
++            assert!(capture.last_message_flag.is_none());
++            assert_eq!(
++                cfg.entries
++                    .get(name)
++                    .and_then(|entry| entry.resume_acceptance.as_ref())
++                    .and_then(|rules| rules.rejected_output_patterns.as_deref()),
++                Some(
++                    &[
++                        "session not found".to_string(),
++                        "session does not exist".to_string(),
++                        "session id mismatch".to_string(),
++                    ][..]
++                )
++            );
++        }
++    }
++
+     #[test]
+     fn parses_script_session_storage() {
+         let mut f = tempfile::NamedTempFile::new().unwrap();
+diff --git a/crates/oulipoly-runtime/src/executor/cli.rs b/crates/oulipoly-runtime/src/executor/cli.rs
+index f7568b6..b6d84c7 100644
+--- a/crates/oulipoly-runtime/src/executor/cli.rs
++++ b/crates/oulipoly-runtime/src/executor/cli.rs
+@@ -392,6 +392,7 @@ printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$requested""#,
+             event_type: None,
+             event_id_path: None,
+             json_flag: None,
++            json_args: None,
+             last_message_flag: None,
+         });
+         let model = age141_model_for_provider(provider.clone(), PromptMode::Arg);
+diff --git a/crates/oulipoly-runtime/src/executor/cli/capture_result.rs b/crates/oulipoly-runtime/src/executor/cli/capture_result.rs
+index a98a24f..93fa4d0 100644
+--- a/crates/oulipoly-runtime/src/executor/cli/capture_result.rs
++++ b/crates/oulipoly-runtime/src/executor/cli/capture_result.rs
+@@ -31,7 +31,11 @@ use super::session_capture::{
+ };
+ use std::path::Path;
+ 
+-pub(super) fn finalize_capture(plan: &CapturePlan, stdout: &[u8]) -> SessionCaptureResult {
++pub(super) fn finalize_capture(
++    plan: &CapturePlan,
++    stdout: &[u8],
++    streamed_session_id: Option<&str>,
++) -> SessionCaptureResult {
+     match plan {
+         CapturePlan::None => no_capture_result(),
+         CapturePlan::ForcedFlagVerified {
+@@ -41,7 +45,12 @@ pub(super) fn finalize_capture(plan: &CapturePlan, stdout: &[u8]) -> SessionCapt
+             event_type,
+             event_id_path,
+             ..
+-        } => finalize_stdout_json_event_capture(stdout, event_type, event_id_path),
++        } => finalize_stdout_json_event_capture(
++            stdout,
++            event_type,
++            event_id_path,
++            streamed_session_id,
++        ),
+     }
+ }
+ 
+@@ -100,7 +109,11 @@ fn finalize_stdout_json_event_capture(
+     stdout: &[u8],
+     event_type: &str,
+     event_id_path: &str,
++    streamed_session_id: Option<&str>,
+ ) -> SessionCaptureResult {
++    if let Some(session_id) = streamed_session_id {
++        return stdout_json_event_capture_result(Ok(session_id.to_string()));
++    }
+     stdout_json_event_capture_result(parse_stdout_json_event_session_id(
+         stdout,
+         event_type,
+@@ -132,7 +145,8 @@ pub(super) fn maybe_restore_plain_stdout(
+ ) -> Vec<u8> {
+     match plan {
+         CapturePlan::StdoutJsonEvent {
+-            last_message_path, ..
++            last_message_path: Some(last_message_path),
++            ..
+         } => restore_plain_stdout_from_file(last_message_path, capture, stdout),
+         _ => fallback_plain_stdout(stdout),
+     }
+diff --git a/crates/oulipoly-runtime/src/executor/cli/provider_execution.rs b/crates/oulipoly-runtime/src/executor/cli/provider_execution.rs
+index b83b3f6..34d74ce 100644
+--- a/crates/oulipoly-runtime/src/executor/cli/provider_execution.rs
++++ b/crates/oulipoly-runtime/src/executor/cli/provider_execution.rs
+@@ -93,8 +93,13 @@ pub(super) fn execute_provider_with_arg_parts_and_supervisor_config(
+         return_channel,
+         temp_files,
+     } = launch;
+-    let output =
+-        run_provider_supervisor(cmd, provider, supervisor_config, spawn_identity.as_ref())?;
++    let output = run_provider_supervisor(
++        cmd,
++        provider,
++        supervisor_config,
++        spawn_identity.as_ref(),
++        &capture_plan,
++    )?;
+     let returned_artifacts = ipc::read_and_cleanup_return_channel(&return_channel);
+     let result = raw_result_from_supervised_output(&capture_plan, output, returned_artifacts);
+ 
+diff --git a/crates/oulipoly-runtime/src/executor/cli/provider_identity.rs b/crates/oulipoly-runtime/src/executor/cli/provider_identity.rs
+index ca3afe3..28dc23f 100644
+--- a/crates/oulipoly-runtime/src/executor/cli/provider_identity.rs
++++ b/crates/oulipoly-runtime/src/executor/cli/provider_identity.rs
+@@ -32,14 +32,16 @@
+ //! ```
+ //!
+ //! The runtime owns the provider-identity domain as an intrinsic surface.
+-//! The bounded set of recognized providers is **exactly three**:
++//! The bounded set of recognized providers is **exactly four**:
+ //!
+ //! - `claude` — selected when `provider.name` starts with `"claude"` OR when
+ //!   the recognized command executable basename starts with `"claude"`.
+ //! - `codex` — selected when `provider.name` starts with `"codex"` OR when
+ //!   the recognized command executable basename starts with `"codex"`.
++//! - `opencode` — selected when `provider.name` starts with `"opencode"` OR when
++//!   the recognized command executable basename starts with `"opencode"`.
+ //! - `openai_compat` — the default fallback for any provider that does not
+-//!   match either Claude or Codex.
++//!   match Claude, Codex, or OpenCode.
+ //!
+ //! The recognition rule walks tokens after `shell_split`-splitting
+ //! `provider.command` and concatenating `provider.args`; `env`/`/.../env`
+@@ -76,6 +78,7 @@ use oulipoly_config::{ProviderConfig, ToolRestrictionKind};
+ pub(super) enum ProviderRecognizer {
+     Claude,
+     Codex,
++    OpenCode,
+     OpenAiCompat,
+ }
+ 
+@@ -87,6 +90,9 @@ impl ProviderRecognizer {
+             Self::Claude
+         } else if provider.name.starts_with("codex") || command_provider.starts_with("codex") {
+             Self::Codex
++        } else if provider.name.starts_with("opencode") || command_provider.starts_with("opencode")
++        {
++            Self::OpenCode
+         } else {
+             Self::OpenAiCompat
+         }
+@@ -97,6 +103,7 @@ impl ProviderRecognizer {
+         match self {
+             Self::Claude => crate::executor::providers::claude::Recognizer.recognize(evidence),
+             Self::Codex => crate::executor::providers::codex::Recognizer.recognize(evidence),
++            Self::OpenCode => crate::executor::providers::opencode::Recognizer.recognize(evidence),
+             Self::OpenAiCompat => {
+                 crate::executor::providers::openai_compat::Recognizer.recognize(evidence)
+             }
+diff --git a/crates/oulipoly-runtime/src/executor/cli/result.rs b/crates/oulipoly-runtime/src/executor/cli/result.rs
+index d81c713..832393b 100644
+--- a/crates/oulipoly-runtime/src/executor/cli/result.rs
++++ b/crates/oulipoly-runtime/src/executor/cli/result.rs
+@@ -76,7 +76,11 @@ pub(super) fn raw_result_from_supervised_output(
+     output: SupervisedOutput,
+     returned_artifacts: Vec<ReturnedArtifactRef>,
+ ) -> RawResult {
+-    let capture_outcome = finalize_capture(capture_plan, &output.stdout);
++    let capture_outcome = finalize_capture(
++        capture_plan,
++        &output.stdout,
++        output.streamed_session_id.as_deref(),
++    );
+     let stdout = maybe_restore_plain_stdout(capture_plan, &capture_outcome, &output.stdout);
+     let stdout = remove_unsanctioned_money_fields(stdout);
+     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+diff --git a/crates/oulipoly-runtime/src/executor/cli/session_capture/args.rs b/crates/oulipoly-runtime/src/executor/cli/session_capture/args.rs
+index eb2e22b..fd761d5 100644
+--- a/crates/oulipoly-runtime/src/executor/cli/session_capture/args.rs
++++ b/crates/oulipoly-runtime/src/executor/cli/session_capture/args.rs
+@@ -28,13 +28,14 @@ pub(super) fn forced_flag_capture_args(
+ }
+ 
+ pub(super) fn stdout_json_event_capture_args(
+-    json_flag: String,
+-    last_message_flag: String,
+-    last_message_path: &Path,
++    json_args: Vec<String>,
++    last_message_flag: Option<String>,
++    last_message_path: Option<&Path>,
+ ) -> Vec<String> {
+-    vec![
+-        json_flag,
+-        last_message_flag,
+-        last_message_path.to_string_lossy().into_owned(),
+-    ]
++    let mut args = json_args;
++    if let (Some(flag), Some(path)) = (last_message_flag, last_message_path) {
++        args.push(flag);
++        args.push(path.to_string_lossy().into_owned());
++    }
++    args
+ }
+diff --git a/crates/oulipoly-runtime/src/executor/cli/session_capture/plan.rs b/crates/oulipoly-runtime/src/executor/cli/session_capture/plan.rs
+index 6647da7..7fd041f 100644
+--- a/crates/oulipoly-runtime/src/executor/cli/session_capture/plan.rs
++++ b/crates/oulipoly-runtime/src/executor/cli/session_capture/plan.rs
+@@ -28,7 +28,7 @@ pub(in crate::executor::cli) enum CapturePlan {
+     StdoutJsonEvent {
+         event_type: String,
+         event_id_path: String,
+-        last_message_path: PathBuf,
++        last_message_path: Option<PathBuf>,
+     },
+ }
+ 
+@@ -72,26 +72,43 @@ fn build_forced_flag_capture_plan(
+ fn build_stdout_json_event_capture_plan(
+     capture: &SessionCapture,
+ ) -> Result<(CapturePlan, Vec<String>, Vec<PathBuf>), String> {
+-    let json_flag = required_capture_field(&capture.json_flag, "session_capture.json_flag")?;
+-    let last_message_flag = required_capture_field(
+-        &capture.last_message_flag,
+-        "session_capture.last_message_flag",
+-    )?;
++    let json_args = stdout_json_event_json_args(capture)?;
+     let event_type = required_capture_field(&capture.event_type, "session_capture.event_type")?;
+     let event_id_path =
+         required_capture_field(&capture.event_id_path, "session_capture.event_id_path")?;
+-    let last_message_path = last_message_capture_path();
++    let last_message_path = capture
++        .last_message_flag
++        .as_ref()
++        .map(|_| last_message_capture_path());
++    let temp_files = last_message_path.iter().cloned().collect::<Vec<_>>();
+     Ok((
+         CapturePlan::StdoutJsonEvent {
+             event_type,
+             event_id_path,
+             last_message_path: last_message_path.clone(),
+         },
+-        stdout_json_event_capture_args(json_flag, last_message_flag, &last_message_path),
+-        vec![last_message_path],
++        stdout_json_event_capture_args(
++            json_args,
++            capture.last_message_flag.clone(),
++            last_message_path.as_deref(),
++        ),
++        temp_files,
+     ))
+ }
+ 
++fn stdout_json_event_json_args(capture: &SessionCapture) -> Result<Vec<String>, String> {
++    match (&capture.json_args, &capture.json_flag) {
++        (Some(args), _) if args.is_empty() => {
++            Err(required_capture_field_message("session_capture.json_args"))
++        }
++        (Some(args), _) => Ok(args.clone()),
++        (None, Some(flag)) => Ok(vec![flag.clone()]),
++        (None, None) => Err(required_capture_field_message(
++            "session_capture.json_flag or session_capture.json_args",
++        )),
++    }
++}
++
+ fn required_capture_field(field: &Option<String>, name: &str) -> Result<String, String> {
+     field
+         .clone()
+diff --git a/crates/oulipoly-runtime/src/executor/cli/supervision/mod.rs b/crates/oulipoly-runtime/src/executor/cli/supervision/mod.rs
+index a14ecd7..83f7e80 100644
+--- a/crates/oulipoly-runtime/src/executor/cli/supervision/mod.rs
++++ b/crates/oulipoly-runtime/src/executor/cli/supervision/mod.rs
+@@ -37,6 +37,7 @@ mod terminal_outcome;
+ mod termination;
+ 
+ use super::provider_identity::ProviderRecognizer;
++use super::session_capture::{CapturePlan, parse_stdout_json_event_session_id};
+ use super::spawn_identity::{SpawnIdentityContext, record_child_identity};
+ use crate::executor::terminal_signal::{TerminalSignal, TerminalStatusEvidence};
+ use oulipoly_config::{PromptMode, ProviderConfig};
+@@ -83,6 +84,7 @@ pub(super) struct SupervisedOutput {
+     pub(super) exit_code: i32,
+     pub(super) terminal_reason: Option<String>,
+     pub(super) terminal_signal: TerminalSignal,
++    pub(super) streamed_session_id: Option<String>,
+ }
+ 
+ #[derive(Clone, Copy)]
+@@ -102,9 +104,16 @@ pub(super) fn run_provider_supervisor(
+     provider: &ProviderConfig,
+     supervisor_config: SupervisorConfig,
+     spawn_identity: Option<&SpawnIdentityContext>,
++    capture_plan: &CapturePlan,
+ ) -> Result<SupervisedOutput, String> {
+-    execute_with_supervisor(cmd, &provider.name, supervisor_config, spawn_identity)
+-        .map_err(errors::supervisor_error_for_executor)
++    execute_with_supervisor(
++        cmd,
++        &provider.name,
++        supervisor_config,
++        spawn_identity,
++        capture_plan,
++    )
++    .map_err(errors::supervisor_error_for_executor)
+ }
+ 
+ fn execute_with_supervisor(
+@@ -112,6 +121,7 @@ fn execute_with_supervisor(
+     provider_name: &str,
+     mut config: SupervisorConfig,
+     spawn_identity: Option<&SpawnIdentityContext>,
++    capture_plan: &CapturePlan,
+ ) -> Result<SupervisedOutput, String> {
+     process::configure_supervised_command(&mut cmd, &config);
+     process::configure_supervised_process_group(&mut cmd);
+@@ -121,10 +131,12 @@ fn execute_with_supervisor(
+     let stdin_writer = stdin::start_child_stdin_writer(&mut child, &mut config)?;
+     let mut stdout = Vec::new();
+     let mut stderr = Vec::new();
++    let mut streamed_session_id = None;
+     let mut last_output_seen = Instant::now();
+ 
+     let (terminal_status, terminal_signal, real_status) = loop {
+         drain::drain_output_events(&drains.rx, &mut stdout, &mut stderr, &mut last_output_seen);
++        observe_streamed_session_id(capture_plan, &stdout, &mut streamed_session_id);
+ 
+         if let Some(status) = status::poll_child_status(&mut child)? {
+             break terminal_outcome::terminal_outcome_from_status(status);
+@@ -151,11 +163,13 @@ fn execute_with_supervisor(
+             Err(mpsc::RecvTimeoutError::Timeout) => {}
+             Err(mpsc::RecvTimeoutError::Disconnected) => {}
+         }
++        observe_streamed_session_id(capture_plan, &stdout, &mut streamed_session_id);
+     };
+ 
+     drain::finish_child_drains(drains, &mut stdout, &mut stderr, &mut last_output_seen);
++    observe_streamed_session_id(capture_plan, &stdout, &mut streamed_session_id);
+     let stdin_write_error = stdin::finish_stdin_writer(stdin_writer);
+-    let output = terminal_outcome::supervised_output_from_terminal(
++    let mut output = terminal_outcome::supervised_output_from_terminal(
+         provider_name,
+         config.recognizer,
+         stdout,
+@@ -164,6 +178,7 @@ fn execute_with_supervisor(
+         terminal_signal,
+         real_status,
+     );
++    output.streamed_session_id = streamed_session_id;
+     if stdin_predicates::stdin_write_error_is_fatal(stdin_write_error.as_deref(), &output)
+         && let Some(err) = stdin_write_error
+     {
+@@ -172,6 +187,27 @@ fn execute_with_supervisor(
+     Ok(output)
+ }
+ 
++fn observe_streamed_session_id(
++    capture_plan: &CapturePlan,
++    stdout: &[u8],
++    streamed_session_id: &mut Option<String>,
++) {
++    if streamed_session_id.is_some() {
++        return;
++    }
++    let CapturePlan::StdoutJsonEvent {
++        event_type,
++        event_id_path,
++        ..
++    } = capture_plan
++    else {
++        return;
++    };
++    if let Ok(session_id) = parse_stdout_json_event_session_id(stdout, event_type, event_id_path) {
++        *streamed_session_id = Some(session_id);
++    }
++}
++
+ fn live_quota_terminal_outcome(
+     child: &mut std::process::Child,
+     provider_name: &str,
+diff --git a/crates/oulipoly-runtime/src/executor/cli/supervision/terminal_outcome.rs b/crates/oulipoly-runtime/src/executor/cli/supervision/terminal_outcome.rs
+index 896a09b..bc78d6f 100644
+--- a/crates/oulipoly-runtime/src/executor/cli/supervision/terminal_outcome.rs
++++ b/crates/oulipoly-runtime/src/executor/cli/supervision/terminal_outcome.rs
+@@ -63,5 +63,6 @@ pub(super) fn supervised_output_from_terminal(
+         exit_code,
+         terminal_reason,
+         terminal_signal,
++        streamed_session_id: None,
+     }
+ }
+diff --git a/crates/oulipoly-runtime/src/executor/mod.rs b/crates/oulipoly-runtime/src/executor/mod.rs
+index 0d26a2f..f519cdb 100755
+--- a/crates/oulipoly-runtime/src/executor/mod.rs
++++ b/crates/oulipoly-runtime/src/executor/mod.rs
+@@ -34,6 +34,7 @@ use std::sync::Arc;
+ pub use self::providers::claude::Recognizer as ClaudeRecognizer;
+ pub use self::providers::codex::Recognizer as CodexRecognizer;
+ pub use self::providers::openai_compat::Recognizer as OpenAiCompatRecognizer;
++pub use self::providers::opencode::Recognizer as OpenCodeRecognizer;
+ /// Executor facade terminal-signal DTO re-export.
+ ///
+ /// Negative guard: `oulipoly_runtime::executor::TerminalSignalKind` must not
+diff --git a/crates/oulipoly-runtime/src/executor/provider_specific/resume_acceptance.rs b/crates/oulipoly-runtime/src/executor/provider_specific/resume_acceptance.rs
+index a68beea..8f9f583 100644
+--- a/crates/oulipoly-runtime/src/executor/provider_specific/resume_acceptance.rs
++++ b/crates/oulipoly-runtime/src/executor/provider_specific/resume_acceptance.rs
+@@ -10,6 +10,12 @@
+ //!
+ //! - `"no conversation found"`
+ //! - `"no session found"`
++//! - `"session not found"` (OpenCode fixture; verify live phrasing in an
++//!   isolated sandbox before applying production config)
++//! - `"session <id> not found"` via tokenized `"session "` + `" not found"`
++//!   matching (OpenCode fixture; same validation TODO)
++//! - `"session does not exist"` (OpenCode fixture; same validation TODO)
++//! - `"session id mismatch"` (OpenCode fixture; same validation TODO)
+ //!
+ //! `tests/age_164_c5_resume_capture.rs` (`acr251_pp009_*`) pins these strings;
+ //! this provider-specific island owns the phrase schema.
+@@ -26,5 +32,10 @@
+ 
+ pub(in crate::executor) fn output_reports_missing_session(output: &str) -> bool {
+     let lower = output.to_lowercase();
+-    lower.contains("no conversation found") || lower.contains("no session found")
++    lower.contains("no conversation found")
++        || lower.contains("no session found")
++        || lower.contains("session not found")
++        || (lower.contains("session ") && lower.contains(" not found"))
++        || lower.contains("session does not exist")
++        || lower.contains("session id mismatch")
+ }
+diff --git a/crates/oulipoly-runtime/src/executor/providers/mod.rs b/crates/oulipoly-runtime/src/executor/providers/mod.rs
+index fe86ce7..35f85b5 100644
+--- a/crates/oulipoly-runtime/src/executor/providers/mod.rs
++++ b/crates/oulipoly-runtime/src/executor/providers/mod.rs
+@@ -1,3 +1,4 @@
+ pub mod claude;
+ pub mod codex;
+ pub mod openai_compat;
++pub mod opencode;
+diff --git a/crates/oulipoly-runtime/src/executor/providers/opencode.rs b/crates/oulipoly-runtime/src/executor/providers/opencode.rs
+new file mode 100644
+index 0000000..a3c6ac5
+--- /dev/null
++++ b/crates/oulipoly-runtime/src/executor/providers/opencode.rs
+@@ -0,0 +1,170 @@
++//! OpenCode terminal-signal recognizer.
++//!
++//! OpenCode runs through the OpenAI-compatible launch path, but its
++//! `--format json` stream has provider-specific `error` events. Keep generic
++//! `openai_compat` substring matching disabled and classify only structured
++//! OpenCode error JSON here.
++
++use crate::executor::terminal_signal::{
++    TERMINAL_SIGNAL_EVIDENCE_MAX_LEN, TerminalSignal, TerminalSignalEvidence, TerminalSignalKind,
++    TerminalSignalRecognizer, bounded_excerpt, post_quota_terminal_signal_kind,
++    pre_quota_terminal_signal_kind, terminal_signal, terminal_status_evidence,
++};
++use serde_json::Value;
++
++#[derive(Clone, Copy, Debug, Default)]
++pub struct Recognizer;
++
++impl TerminalSignalRecognizer for Recognizer {
++    fn recognize(&self, evidence: &TerminalSignalEvidence<'_>) -> TerminalSignal {
++        if let Some(kind) = pre_quota_terminal_signal_kind(&evidence.terminal_status) {
++            let signal_evidence = terminal_status_evidence(&evidence.terminal_status)
++                .unwrap_or_else(|| "unknown".to_string());
++            return terminal_signal(evidence, kind, signal_evidence);
++        }
++
++        if let Some((kind, signal_evidence)) = opencode_json_error_signal(evidence) {
++            return terminal_signal(evidence, kind, signal_evidence);
++        }
++
++        if let Some(kind) = post_quota_terminal_signal_kind(&evidence.terminal_status) {
++            let signal_evidence = terminal_status_evidence(&evidence.terminal_status)
++                .unwrap_or_else(|| "unknown".to_string());
++            return terminal_signal(evidence, kind, signal_evidence);
++        }
++
++        terminal_signal(evidence, TerminalSignalKind::Unknown, "unknown".to_string())
++    }
++}
++
++fn opencode_json_error_signal(
++    evidence: &TerminalSignalEvidence<'_>,
++) -> Option<(TerminalSignalKind, String)> {
++    json_error_signal_from_stream(evidence.stdout)
++        .or_else(|| json_error_signal_from_stream(evidence.stderr))
++}
++
++fn json_error_signal_from_stream(bytes: &[u8]) -> Option<(TerminalSignalKind, String)> {
++    let text = String::from_utf8_lossy(bytes);
++    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
++        let Some(kind) = json_error_line_kind(line) else {
++            continue;
++        };
++        return Some((
++            kind,
++            bounded_excerpt(line, TERMINAL_SIGNAL_EVIDENCE_MAX_LEN),
++        ));
++    }
++    None
++}
++
++fn json_error_line_kind(line: &str) -> Option<TerminalSignalKind> {
++    let value: Value = serde_json::from_str(line).ok()?;
++    if value.get("type").and_then(Value::as_str) != Some("error") {
++        return None;
++    }
++
++    let error = value.get("error")?;
++    let message = error_message(error);
++    let lower_message = message.to_lowercase();
++    if error_status_code(error) == Some(429) || message_reports_rate_limit(&lower_message) {
++        return Some(TerminalSignalKind::RateLimited);
++    }
++    if message_reports_persistent_quota(&lower_message) {
++        return Some(TerminalSignalKind::QuotaExhaustedInband);
++    }
++    None
++}
++
++fn error_status_code(error: &Value) -> Option<i64> {
++    value_at_paths(
++        error,
++        &[
++            "/data/statusCode",
++            "/data/status_code",
++            "/statusCode",
++            "/status",
++        ],
++    )
++    .and_then(number_or_numeric_string)
++}
++
++fn error_message(error: &Value) -> String {
++    value_at_paths(error, &["/data/message", "/message"])
++        .and_then(Value::as_str)
++        .unwrap_or_default()
++        .to_string()
++}
++
++fn value_at_paths<'a>(value: &'a Value, paths: &[&str]) -> Option<&'a Value> {
++    paths.iter().find_map(|path| value.pointer(path))
++}
++
++fn number_or_numeric_string(value: &Value) -> Option<i64> {
++    value
++        .as_i64()
++        .or_else(|| value.as_str().and_then(|text| text.parse::<i64>().ok()))
++}
++
++fn message_reports_rate_limit(message: &str) -> bool {
++    message.contains("rate limit exceeded") || message.contains("too many requests")
++}
++
++fn message_reports_persistent_quota(message: &str) -> bool {
++    (message.contains("quota")
++        && (message.contains("exceeded")
++            || message.contains("exhausted")
++            || message.contains("insufficient")))
++        || (message.contains("usage limit")
++            && (message.contains("reached") || message.contains("exceeded")))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::Recognizer;
++    use crate::executor::terminal_signal::{
++        TerminalSignalEvidence, TerminalSignalKind, TerminalSignalRecognizer,
++        TerminalStatusEvidence,
++    };
++    use std::time::SystemTime;
++
++    fn evidence(stdout: &'static [u8], stderr: &'static [u8]) -> TerminalSignalEvidence<'static> {
++        TerminalSignalEvidence {
++            provider_name: "opencode",
++            stdout,
++            stderr,
++            terminal_status: TerminalStatusEvidence::Exited { code: 1 },
++            observed_at: SystemTime::UNIX_EPOCH,
++        }
++    }
++
++    #[test]
++    fn status_code_429_maps_to_rate_limited() {
++        let signal = Recognizer.recognize(&evidence(
++            br#"{"type":"error","error":{"data":{"message":"anything","statusCode":429}}}"#,
++            b"",
++        ));
++
++        assert_eq!(signal.kind, TerminalSignalKind::RateLimited);
++    }
++
++    #[test]
++    fn persistent_quota_message_maps_to_quota_exhausted() {
++        let signal = Recognizer.recognize(&evidence(
++            b"",
++            br#"{"type":"error","error":{"data":{"message":"quota exhausted for account"}}}"#,
++        ));
++
++        assert_eq!(signal.kind, TerminalSignalKind::QuotaExhaustedInband);
++    }
++
++    #[test]
++    fn unrelated_error_falls_back_to_nonzero_exit() {
++        let signal = Recognizer.recognize(&evidence(
++            br#"{"type":"error","error":{"data":{"message":"syntax error"}}}"#,
++            b"",
++        ));
++
++        assert_eq!(signal.kind, TerminalSignalKind::NonzeroExit);
++    }
++}
+diff --git a/crates/oulipoly-runtime/src/executor/terminal_signal.rs b/crates/oulipoly-runtime/src/executor/terminal_signal.rs
+index 0e5083e..7d8e65c 100644
+--- a/crates/oulipoly-runtime/src/executor/terminal_signal.rs
++++ b/crates/oulipoly-runtime/src/executor/terminal_signal.rs
+@@ -288,6 +288,11 @@ mod tests {
+         assert_dyn_matches_static("gemini", providers::openai_compat::Recognizer);
+     }
+ 
++    #[test]
++    fn trait_object_polymorphism_matches_static_call_for_opencode() {
++        assert_dyn_matches_static("opencode", providers::opencode::Recognizer);
++    }
++
+     #[test]
+     fn terminal_signal_kind_maybe_quota_exhausted_round_trips() {
+         assert_terminal_signal_round_trip(TerminalSignalKind::MaybeQuotaExhausted);
+diff --git a/crates/oulipoly-runtime/tests/age226_executor_cli_facade_characterization.rs b/crates/oulipoly-runtime/tests/age226_executor_cli_facade_characterization.rs
+index 5c9bf42..9d82b6d 100644
+--- a/crates/oulipoly-runtime/tests/age226_executor_cli_facade_characterization.rs
++++ b/crates/oulipoly-runtime/tests/age226_executor_cli_facade_characterization.rs
+@@ -137,6 +137,7 @@ printf '{{"type":"agent.session_started","data":{{"id":"age-226-session"}}}}\n'
+         event_type: Some("agent.session_started".to_string()),
+         event_id_path: Some("data.id".to_string()),
+         json_flag: Some("--json".to_string()),
++        json_args: None,
+         last_message_flag: Some("--last-message".to_string()),
+     });
+ 
+diff --git a/crates/oulipoly-runtime/tests/age227_executor_provider_execution_characterization.rs b/crates/oulipoly-runtime/tests/age227_executor_provider_execution_characterization.rs
+index 0ccc141..1217110 100644
+--- a/crates/oulipoly-runtime/tests/age227_executor_provider_execution_characterization.rs
++++ b/crates/oulipoly-runtime/tests/age227_executor_provider_execution_characterization.rs
+@@ -250,6 +250,7 @@ printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$requested""#,
+         event_type: None,
+         event_id_path: None,
+         json_flag: None,
++        json_args: None,
+         last_message_flag: None,
+     });
+     let model = model_for(provider.clone(), PromptMode::Arg);
+diff --git a/crates/oulipoly-runtime/tests/age242_terminal_classify_characterization.rs b/crates/oulipoly-runtime/tests/age242_terminal_classify_characterization.rs
+index 7e37d89..a986456 100644
+--- a/crates/oulipoly-runtime/tests/age242_terminal_classify_characterization.rs
++++ b/crates/oulipoly-runtime/tests/age242_terminal_classify_characterization.rs
+@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
+ use std::sync::Arc;
+ 
+ const BUILTIN_PROVIDER: &str = "neutral-built-in-provider";
++const OPENCODE_PROVIDER: &str = "opencode";
+ const UNRELATED_MODEL: &str = "neutral-unrelated-external-model";
+ 
+ struct ScriptFixture {
+@@ -82,11 +83,15 @@ fn provider_ref_path(path: &Path) -> ProviderImplementationRef {
+ }
+ 
+ fn builtin_model_for_command(command: &str) -> ModelConfig {
++    builtin_model_for_provider_command(BUILTIN_PROVIDER, command)
++}
++
++fn builtin_model_for_provider_command(provider_name: &str, command: &str) -> ModelConfig {
+     ModelConfig {
+         name: "neutral-built-in-terminal-model".to_string(),
+         prompt_mode: PromptMode::Arg,
+         providers: vec![ProviderConfig {
+-            name: BUILTIN_PROVIDER.to_string(),
++            name: provider_name.to_string(),
+             command: command.to_string(),
+             args: Vec::new(),
+             interactive_args: None,
+@@ -103,6 +108,10 @@ fn builtin_model_for_command(command: &str) -> ModelConfig {
+     }
+ }
+ 
++fn opencode_builtin_model_for_command(command: &str) -> ModelConfig {
++    builtin_model_for_provider_command(OPENCODE_PROVIDER, command)
++}
++
+ fn unrelated_external_model(script: &ScriptFixture) -> ModelConfig {
+     ModelConfig {
+         name: UNRELATED_MODEL.to_string(),
+@@ -143,6 +152,20 @@ fn direct_execute(model: &ModelConfig) -> Result<executor::ExecutionResult, Stri
+     invoke_direct_execute(direct_execute_request(model, &extra_inputs))
+ }
+ 
++fn execute_opencode_fixture(body: &str) -> ExecutionPair {
++    let script = fixture_script("opencode-built-in.sh", body);
++    let model = opencode_builtin_model_for_command(&script.path.to_string_lossy());
++    let unrelated = fixture_script(
++        "neutral-unrelated-provider.sh",
++        "printf 'unrelated external provider should not run\\n'",
++    );
++    let registry = unrelated_registry(&unrelated);
++    let direct = direct_execute(&model).expect("direct opencode execution should succeed");
++    let service =
++        service_execute(registry, model).expect("service opencode execution should succeed");
++    ExecutionPair { direct, service }
++}
++
+ fn empty_extra_inputs() -> HashMap<String, Vec<String>> {
+     HashMap::new()
+ }
+@@ -488,3 +511,55 @@ fn builtin_no_ref_does_not_invoke_unrelated_provider_registry_for_terminal_class
+     }
+     assert_counter_unchanged(counter.path());
+ }
++
++#[test]
++fn opencode_json_error_429_is_rate_limited() {
++    let pair = execute_opencode_fixture(
++        r#"printf '%s\n' '{"type":"error","sessionID":"ses_fixture","error":{"data":{"message":"Rate limit exceeded","statusCode":429}}}'
++exit 1"#,
++    );
++
++    for (label, result) in [("direct", &pair.direct), ("service", &pair.service)] {
++        let signal = terminal_signal(result);
++        assert_eq!(signal.kind, TerminalSignalKind::RateLimited, "{label}");
++        assert_eq!(signal.provider_name, OPENCODE_PROVIDER, "{label}");
++        assert!(
++            signal.evidence.contains("Rate limit exceeded"),
++            "{label}: evidence={:?}",
++            signal.evidence
++        );
++        assert_eq!(
++            result.terminal_reason.as_deref(),
++            Some("rate_limited"),
++            "{label}"
++        );
++    }
++}
++
++#[test]
++fn opencode_json_error_persistent_quota_is_quota_exhausted() {
++    let pair = execute_opencode_fixture(
++        r#"printf '%s\n' '{"type":"error","sessionID":"ses_fixture","error":{"data":{"message":"Insufficient quota for this account"}}}' >&2
++exit 1"#,
++    );
++
++    for (label, result) in [("direct", &pair.direct), ("service", &pair.service)] {
++        let signal = terminal_signal(result);
++        assert_eq!(
++            signal.kind,
++            TerminalSignalKind::QuotaExhaustedInband,
++            "{label}"
++        );
++        assert_eq!(signal.provider_name, OPENCODE_PROVIDER, "{label}");
++        assert!(
++            signal.evidence.contains("Insufficient quota"),
++            "{label}: evidence={:?}",
++            signal.evidence
++        );
++        assert_eq!(
++            result.terminal_reason.as_deref(),
++            Some("quota_exhausted_inband"),
++            "{label}"
++        );
++    }
++}
+diff --git a/crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs b/crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs
+index 7827f5d..f8123d8 100644
+--- a/crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs
++++ b/crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs
+@@ -3,7 +3,8 @@
+ 
+ use chrono::{DateTime, Utc};
+ use oulipoly_config::{
+-    ModelConfig, PromptMode, ProviderConfig, provider_implementation_ref::ProviderImplementationRef,
++    ModelConfig, PromptMode, ProviderConfig, SessionSourceEntry, SessionsConfig,
++    provider_implementation_ref::ProviderImplementationRef,
+ };
+ use oulipoly_provider::client::ProviderClientOptions;
+ use oulipoly_runtime::provider_registry::{
+@@ -19,6 +20,7 @@ use oulipoly_runtime::session_provider::{
+ use oulipoly_state::{InvocationStart, StateDb};
+ use rusqlite::{Connection, params};
+ use serde_json::Value;
++use std::collections::HashMap;
+ use std::fmt::Display;
+ use std::fs;
+ use std::os::unix::fs::PermissionsExt;
+@@ -33,6 +35,7 @@ const PROVIDER_INSTANCE_ID: &str = "provider-a-instance";
+ const SETTINGS_ID: &str = "provider-a-test-settings";
+ const SESSION_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+ const HOSTILE_SESSION_ID: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
++const OPENCODE_SESSION_ID: &str = "ses_fixture";
+ 
+ struct Fixture {
+     dir: tempfile::TempDir,
+@@ -628,6 +631,45 @@ fn external_provider_read_turns_ingest_uses_owned_interface_and_host_idempotency
+     );
+ }
+ 
++#[test]
++fn opencode_read_turns_ingests_normalized_jsonl() {
++    let fixture = tempfile::tempdir().expect("tempdir");
++    let state = StateDb::open(&fixture.path().join("state.db")).expect("state db");
++    let opencode_root = fixture.path().join("opencode-data");
++    let message_dir = opencode_root
++        .join("storage")
++        .join("message")
++        .join(OPENCODE_SESSION_ID);
++    fs::create_dir_all(&message_dir).expect("message dir");
++    fs::write(
++        message_dir.join("msg_user.json"),
++        r#"{"id":"msg_user","sessionID":"ses_fixture","timestamp":"2026-05-01T00:00:01Z","role":"user","parts":[{"type":"text","text":"hello"}]}"#,
++    )
++    .expect("user message");
++    fs::write(
++        message_dir.join("msg_assistant.json"),
++        r#"{"id":"msg_assistant","timestamp":"2026-05-01T00:00:02Z","role":"assistant","content":[{"type":"text","text":"world"}]}"#,
++    )
++    .expect("assistant message");
++    let sessions_cfg = opencode_sessions_config(
++        &repo_script_path("opencode-turns"),
++        &opencode_root,
++        &fixture.path().join("cursor"),
++    );
++
++    let report = oulipoly_runtime::sessions::scan_provider("opencode", &sessions_cfg, &state);
++    let repeated = oulipoly_runtime::sessions::scan_provider("opencode", &sessions_cfg, &state);
++    let counts = state
++        .count_session_turns("opencode", OPENCODE_SESSION_ID)
++        .expect("count turns");
++
++    assert_eq!(report.errors, Vec::<String>::new());
++    assert_eq!(report.new_turns, 2);
++    assert_eq!(repeated.new_turns, 0);
++    assert_eq!(counts.total, 2);
++    assert_eq!(counts.assistant, 1);
++}
++
+ #[test]
+ fn external_provider_capture_maps_facts_without_mutating_capture_rows() {
+     for (mode, expected_session, artifact_count) in [
+@@ -1271,3 +1313,35 @@ print(json.dumps(response))
+ fn json_string(path: &Path) -> String {
+     serde_json::to_string(&path.display().to_string()).expect("json path")
+ }
++
++fn repo_script_path(name: &str) -> PathBuf {
++    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
++        .join("../..")
++        .join("scripts")
++        .join(name)
++}
++
++fn opencode_sessions_config(
++    script_path: &Path,
++    opencode_root: &Path,
++    state_dir: &Path,
++) -> SessionsConfig {
++    SessionsConfig {
++        entries: HashMap::from([(
++            "opencode".to_string(),
++            SessionSourceEntry {
++                turn_script: format!(
++                    "{} {}",
++                    shell_single_quote_path(script_path),
++                    shell_single_quote_path(opencode_root)
++                ),
++                transcript_locator: None,
++                state_dir: Some(state_dir.to_path_buf()),
++            },
++        )]),
++    }
++}
++
++fn shell_single_quote_path(path: &Path) -> String {
++    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
++}
+diff --git a/crates/oulipoly-runtime/tests/age34_runtime_executor_service_routing.rs b/crates/oulipoly-runtime/tests/age34_runtime_executor_service_routing.rs
+index 2d9618f..781095d 100644
+--- a/crates/oulipoly-runtime/tests/age34_runtime_executor_service_routing.rs
++++ b/crates/oulipoly-runtime/tests/age34_runtime_executor_service_routing.rs
+@@ -285,6 +285,7 @@ printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$requested""#,
+         event_type: None,
+         event_id_path: None,
+         json_flag: None,
++        json_args: None,
+         last_message_flag: None,
+     });
+     provider.invocation_mode = InvocationMode::Proxy;
+diff --git a/crates/oulipoly-runtime/tests/age35_routing_characterization.rs b/crates/oulipoly-runtime/tests/age35_routing_characterization.rs
+index 7809cc8..1b1c12d 100644
+--- a/crates/oulipoly-runtime/tests/age35_routing_characterization.rs
++++ b/crates/oulipoly-runtime/tests/age35_routing_characterization.rs
+@@ -699,6 +699,36 @@ fn topology_drift_route_harness() -> RouteHarness {
+     }
+ }
+ 
++fn opencode_five_account_harness() -> RouteHarness {
++    let fixture = ScriptFixture::new();
++    let exhausted = quota_output_body(100, &future_timestamp(24));
++    let healthy = quota_output_body(10, &future_timestamp(24));
++    let providers_cfg = providers_config_with_script_bodies(
++        &fixture,
++        &[
++            ("opencode", exhausted.as_str()),
++            ("opencode2", exhausted.as_str()),
++            ("opencode3", exhausted.as_str()),
++            ("opencode4", exhausted.as_str()),
++            ("opencode5", healthy.as_str()),
++        ],
++    );
++    RouteHarness {
++        _fixture: fixture,
++        db: open_memory_state(),
++        model: model_with(&[
++            "opencode",
++            "opencode2",
++            "opencode3",
++            "opencode4",
++            "opencode5",
++        ]),
++        providers_cfg,
++        sessions_cfg: SessionsConfig::default(),
++        in_flight: InFlight::new(),
++    }
++}
++
+ #[test]
+ fn age_35_select_provider_with_balance_context_refreshes_stale_quotas_and_scans_sessions() {
+     let harness = live_route_harness();
+@@ -812,6 +842,32 @@ fn age_35_production_routing_service_matches_direct_select_provider_cached_only(
+     assert_cached_route_has_no_live_side_effects(&harness.service_db, "ProductionRoutingService");
+ }
+ 
++#[test]
++fn opencode_five_account_quota_scripts_route_healthy_accounts() {
++    let harness = opencode_five_account_harness();
++
++    let selected = select_service_with_context(&harness);
++
++    assert_selected_index(
++        selected,
++        4,
++        "routing must skip exhausted opencode accounts and select the healthy fifth account",
++    );
++    for provider in [
++        "opencode",
++        "opencode2",
++        "opencode3",
++        "opencode4",
++        "opencode5",
++    ] {
++        assert_eq!(
++            harness.db.get_windows(provider).unwrap().len(),
++            1,
++            "fake quota script should have refreshed {provider}"
++        );
++    }
++}
++
+ #[test]
+ fn age_35_routing_service_preserves_select_provider_topology_probe_drift_from_compute_projections()
+ {
+diff --git a/crates/oulipoly-runtime/tests/age_164_c4_policy_identity.rs b/crates/oulipoly-runtime/tests/age_164_c4_policy_identity.rs
+index c59fd00..7c38670 100644
+--- a/crates/oulipoly-runtime/tests/age_164_c4_policy_identity.rs
++++ b/crates/oulipoly-runtime/tests/age_164_c4_policy_identity.rs
+@@ -2,10 +2,10 @@
+ //!
+ //! Verifies the runtime-owned provider-identity intrinsic surface:
+ //!
+-//!   The bounded set of recognized providers is `claude`, `codex`, and the
+-//!   default `openai_compat` fallback. The recognition uses `provider.name`
+-//!   prefix (`starts_with("claude"|"codex")`) AND/OR the command executable
+-//!   token (after env-prefix/option skipping and basename normalization).
++//!   The bounded set of recognized providers is the two original CLI families,
++//!   OpenCode, and the default OpenAI-compatible fallback. Recognition uses
++//!   account-name prefixes and/or the command executable token after env-prefix,
++//!   option skipping, and basename normalization.
+ //!   These tests pin that bounded set without depending on private helper
+ //!   names — the verification is via observable policy-driven argv shape.
+ //!
+@@ -248,8 +248,8 @@ fn provider_name_empty_falls_back_to_input_string() {
+ // ---------------------------------------------------------------------------
+ // ACR-205 intrinsic-surface verification (PP-002): bounded provider set.
+ //
+-// The runtime identity domain has exactly three values: `Claude`, `Codex`,
+-// and an `OpenAiCompat` fallback. We pin this through the OBSERVABLE effects:
++// The runtime identity domain has exactly four values: `Claude`, `Codex`,
++// `OpenCode`, and an `OpenAiCompat` fallback. We pin this through the OBSERVABLE effects:
+ // applying Claude tool_restrictions to a provider whose name and command both
+ // suggest "claude" produces `--disallowed-tools ...`; doing the same with a
+ // name "codex" produces a Codex policy block (`<<<NESTHARUS-POLICY>>>` etc.
+diff --git a/crates/oulipoly-runtime/tests/age_164_c5_resume_capture.rs b/crates/oulipoly-runtime/tests/age_164_c5_resume_capture.rs
+index 7204708..22ea14b 100644
+--- a/crates/oulipoly-runtime/tests/age_164_c5_resume_capture.rs
++++ b/crates/oulipoly-runtime/tests/age_164_c5_resume_capture.rs
+@@ -21,8 +21,12 @@
+ //!
+ //! ### Resume missing-session phrase set (PP-009)
+ //! - Lowercase substring matching for `"no conversation found"` and
+-//!   `"no session found"`; the mapped result evidence is
++//!   `"no session found"`, plus fixture-backed OpenCode placeholders
++//!   `"session not found"`, `"session <id> not found"`,
++//!   `"session does not exist"`, and `"session id mismatch"`; the mapped result evidence is
+ //!   `"resume_session_mismatch: provider reported missing session"`.
++//!   TODO(opencode): replace/trim the placeholder phrases after a fake-isolated
++//!   live OpenCode bad-`--session` sandbox identifies the exact wording.
+ //!
+ //! These constitute the ACR-251 canonical-doc-as-schema declaration for
+ //! the three pull sites. Step 6c MUST publish the same schema via rustdoc
+@@ -205,6 +209,19 @@ fn resume_flag_kind_formats_as_flag_value_pair() {
+     assert_eq!(args, vec!["--resume", "abc"]);
+ }
+ 
++#[test]
++fn opencode_resume_flag_composes_session() {
++    let strategy = ResumeStrategy {
++        kind: ResumeKind::Flag,
++        flag: Some("--session".to_string()),
++        subcommand: None,
++    };
++
++    let args = compose_resume_args(&strategy, "ses_fixture").unwrap();
++
++    assert_eq!(args, vec!["--session", "ses_fixture"]);
++}
++
+ #[test]
+ fn resume_subcommand_kind_formats_as_subcommand_with_session_id_tail() {
+     let strategy = ResumeStrategy {
+@@ -260,6 +277,7 @@ fn start_known_provider_session_id_none_for_stdout_json_event_kind() {
+         event_type: Some("agent.session_started".to_string()),
+         event_id_path: Some("data.id".to_string()),
+         json_flag: Some("--json".to_string()),
++        json_args: None,
+         last_message_flag: Some("--last-message".to_string()),
+     });
+     // StdoutJsonEvent always returns None (no preflight session id).
+@@ -276,6 +294,7 @@ fn start_known_provider_session_id_some_uuid_for_forced_flag_verified_kind() {
+         event_type: None,
+         event_id_path: None,
+         json_flag: None,
++        json_args: None,
+         last_message_flag: None,
+     });
+     let id = start_known_provider_session_id(&provider)
+@@ -296,6 +315,7 @@ fn start_known_provider_session_id_forced_flag_verified_missing_flag_errors() {
+         event_type: None,
+         event_id_path: None,
+         json_flag: None,
++        json_args: None,
+         last_message_flag: None,
+     });
+     let err = start_known_provider_session_id(&provider).unwrap_err();
+@@ -432,6 +452,7 @@ fn stdout_json_event_capture() -> SessionCapture {
+         event_type: Some("agent.session_started".to_string()),
+         event_id_path: Some("data.id".to_string()),
+         json_flag: Some("--json".to_string()),
++        json_args: None,
+         last_message_flag: Some("--last-message".to_string()),
+     }
+ }
+@@ -444,23 +465,25 @@ fn execute_with_session_capture(capture: SessionCapture) -> Result<(), String> {
+ }
+ 
+ #[test]
+-fn age230_stdout_json_event_capture_requires_json_flag() {
++fn age230_stdout_json_event_capture_requires_json_flag_or_json_args() {
+     let mut capture = stdout_json_event_capture();
+     capture.json_flag = None;
++    capture.json_args = None;
+ 
+     let err = execute_with_session_capture(capture).unwrap_err();
+ 
+-    assert_eq!(err, "session_capture.json_flag is required");
++    assert_eq!(
++        err,
++        "session_capture.json_flag or session_capture.json_args is required"
++    );
+ }
+ 
+ #[test]
+-fn age230_stdout_json_event_capture_requires_last_message_flag() {
++fn age230_stdout_json_event_capture_allows_missing_last_message_sidecar() {
+     let mut capture = stdout_json_event_capture();
+     capture.last_message_flag = None;
+ 
+-    let err = execute_with_session_capture(capture).unwrap_err();
+-
+-    assert_eq!(err, "session_capture.last_message_flag is required");
++    execute_with_session_capture(capture).expect("last-message sidecar is optional");
+ }
+ 
+ #[test]
+@@ -495,6 +518,7 @@ fn age230_forced_flag_readback_mismatch_uses_requested_observed_evidence() {
+         event_type: None,
+         event_id_path: None,
+         json_flag: None,
++        json_args: None,
+         last_message_flag: None,
+     });
+     let model = model_for("age230-readback-mismatch-model", provider.clone());
+@@ -560,6 +584,98 @@ printf '%s\n' '{"type":"agent.session_started","data":{"id":"sidecar-missing"}}'
+     );
+ }
+ 
++#[test]
++fn opencode_stdout_json_event_step_start_session_id() {
++    let (_dir, path) = script(
++        r#"
++printf '%s\n' '{"type":"step_start","timestamp":1767036059338,"sessionID":"ses_fixture","part":{"sessionID":"ses_fixture","type":"step-start"}}'
++printf '%s\n' '{"type":"text","timestamp":1767036059444,"sessionID":"ses_fixture","part":{"type":"text","text":"ok"}}'
++"#,
++    );
++    let mut provider = provider_for(&path);
++    provider.session_capture = Some(SessionCapture {
++        kind: SessionCaptureKind::StdoutJsonEvent,
++        flag: None,
++        readback_args: None,
++        event_type: Some("step_start".to_string()),
++        event_id_path: Some("sessionID".to_string()),
++        json_flag: None,
++        json_args: Some(vec!["--format".to_string(), "json".to_string()]),
++        last_message_flag: None,
++    });
++    let model = model_for("opencode-step-start-model", provider);
++
++    let result = execute(&model, 0, "prompt", None, &HashMap::new(), None).expect("execute");
++
++    assert!(matches!(
++        result.session_capture.method,
++        SessionCaptureMethod::StdoutJsonEvent
++    ));
++    assert_eq!(
++        result.session_capture.session_id.as_deref(),
++        Some("ses_fixture")
++    );
++}
++
++#[test]
++fn opencode_launch_argv_uses_format_json_and_captures_session() {
++    let (_dir, path) = script(
++        r#"
++expected=(run --dangerously-skip-permissions -m openai/gpt-5.5 --variant high --format json opencode-prompt)
++if [ "$#" -ne "${#expected[@]}" ]; then
++  printf 'unexpected argc: %s\n' "$#" >&2
++  printf 'argv: %s\n' "$*" >&2
++  exit 64
++fi
++for ((i=0; i < ${#expected[@]}; i++)); do
++  j=$((i + 1))
++  actual="${!j}"
++  if [ "$actual" != "${expected[$i]}" ]; then
++    printf 'argv[%s] expected %s got %s\n' "$i" "${expected[$i]}" "$actual" >&2
++    exit 65
++  fi
++done
++printf '%s\n' '{"type":"step_start","timestamp":1767036059338,"sessionID":"ses_fixture","part":{"sessionID":"ses_fixture","type":"step-start"}}'
++printf '%s\n' '{"type":"text","timestamp":1767036059444,"sessionID":"ses_fixture","part":{"type":"text","text":"ok"}}'
++printf '%s\n' '{"type":"step_finish","timestamp":1767036059555,"sessionID":"ses_fixture","part":{"type":"step-finish","reason":"stop"}}'
++"#,
++    );
++    let mut provider = provider_for(&path);
++    provider.name = "opencode".to_string();
++    provider.args = vec![
++        "run".to_string(),
++        "--dangerously-skip-permissions".to_string(),
++        "-m".to_string(),
++        "openai/gpt-5.5".to_string(),
++        "--variant".to_string(),
++        "high".to_string(),
++    ];
++    provider.session_capture = Some(SessionCapture {
++        kind: SessionCaptureKind::StdoutJsonEvent,
++        flag: None,
++        readback_args: None,
++        event_type: Some("step_start".to_string()),
++        event_id_path: Some("sessionID".to_string()),
++        json_flag: None,
++        json_args: Some(vec!["--format".to_string(), "json".to_string()]),
++        last_message_flag: None,
++    });
++    let model = model_for("gpt-high", provider);
++
++    let result =
++        execute(&model, 0, "opencode-prompt", None, &HashMap::new(), None).expect("execute");
++
++    assert_eq!(result.exit_code, 0, "stderr={}", result.stderr);
++    assert_eq!(
++        result.session_capture.session_id.as_deref(),
++        Some("ses_fixture")
++    );
++    assert!(matches!(
++        result.session_capture.method,
++        SessionCaptureMethod::StdoutJsonEvent
++    ));
++}
++
+ // ===========================================================================
+ // ACR-251 PP-007: forced-flag verified stdout JSONL schema.
+ // ===========================================================================
+@@ -588,6 +704,7 @@ printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$requested"
+         event_type: None,
+         event_id_path: None,
+         json_flag: None,
++        json_args: None,
+         last_message_flag: None,
+     });
+     let model = ModelConfig {
+@@ -630,6 +747,7 @@ printf '{"type":"result","session_id":"%s"}\n' "$requested"
+         event_type: None,
+         event_id_path: None,
+         json_flag: None,
++        json_args: None,
+         last_message_flag: None,
+     });
+     let model = ModelConfig {
+@@ -660,6 +778,7 @@ fn acr251_pp007_forced_flag_verified_no_event_fails_with_canonical_message() {
+         event_type: None,
+         event_id_path: None,
+         json_flag: None,
++        json_args: None,
+         last_message_flag: None,
+     });
+     let model = ModelConfig {
+@@ -693,6 +812,7 @@ fn acr251_pp007_forced_flag_verified_system_init_missing_session_id_errors() {
+         event_type: None,
+         event_id_path: None,
+         json_flag: None,
++        json_args: None,
+         last_message_flag: None,
+     });
+     let model = ModelConfig {
+@@ -739,6 +859,7 @@ printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$requested"
+         event_type: None,
+         event_id_path: None,
+         json_flag: None,
++        json_args: None,
+         last_message_flag: None,
+     });
+     let model = ModelConfig {
+@@ -785,6 +906,7 @@ printf '{"type":"agent.session_started","data":{"id":"nested-uuid"}}\n'
+         event_type: Some("agent.session_started".to_string()),
+         event_id_path: Some("data.id".to_string()),
+         json_flag: Some("--json".to_string()),
++        json_args: None,
+         last_message_flag: Some("--last-message".to_string()),
+     });
+     let model = ModelConfig {
+@@ -831,6 +953,7 @@ printf 'no events here\n'
+         event_type: Some("agent.session_started".to_string()),
+         event_id_path: Some("data.id".to_string()),
+         json_flag: Some("--json".to_string()),
++        json_args: None,
+         last_message_flag: Some("--last-message".to_string()),
+     });
+     let model = ModelConfig {
+@@ -876,6 +999,7 @@ printf '{"type":"agent.session_started","data":{}}\n'
+         event_type: Some("agent.session_started".to_string()),
+         event_id_path: Some("data.id".to_string()),
+         json_flag: Some("--json".to_string()),
++        json_args: None,
+         last_message_flag: Some("--last-message".to_string()),
+     });
+     let model = ModelConfig {
+@@ -959,6 +1083,35 @@ fn acr251_pp009_no_session_found_lowercase_matches() {
+     );
+ }
+ 
++#[test]
++fn opencode_placeholder_session_not_found_phrase_maps_to_resume_session_mismatch() {
++    let (_dir, path) = script(r#"printf 'Error: session ses_fixture not found\n' >&2; exit 1"#);
++    let provider = provider_for(&path);
++    let strategy = flag_strategy();
++    let result = execute_resume(
++        &provider,
++        0,
++        PromptMode::Arg,
++        "prompt",
++        None,
++        None,
++        ResumePayload {
++            session_id: "ses_fixture",
++            strategy: &strategy,
++        },
++    )
++    .expect("resume execute");
++    let acceptance = result
++        .resume_acceptance
++        .expect("resume acceptance populated");
++
++    assert_eq!(acceptance.status, ResumeAcceptanceStatus::Rejected);
++    assert_eq!(
++        acceptance.evidence.as_deref(),
++        Some("resume_session_mismatch: provider reported missing session")
++    );
++}
++
+ #[test]
+ fn no_conversation_found_phrase_maps_to_resume_session_mismatch() {
+     let session_id = "11111111-1111-1111-1111-111111111111";
+@@ -1280,6 +1433,7 @@ fn execute_resume_forces_session_capture_to_none_in_returned_result() {
+         event_type: None,
+         event_id_path: None,
+         json_flag: None,
++        json_args: None,
+         last_message_flag: None,
+     });
+     let strategy = flag_strategy();
+diff --git a/crates/oulipoly-runtime/tests/age_164_c7_test_split.rs b/crates/oulipoly-runtime/tests/age_164_c7_test_split.rs
+index 441b76c..d5c5a0b 100644
+--- a/crates/oulipoly-runtime/tests/age_164_c7_test_split.rs
++++ b/crates/oulipoly-runtime/tests/age_164_c7_test_split.rs
+@@ -254,6 +254,7 @@ fn resume_execution_clears_session_capture_and_preserves_invocation_mode() {
+             event_type: None,
+             event_id_path: None,
+             json_flag: None,
++            json_args: None,
+             last_message_flag: None,
+         }),
+         resume_acceptance: None,
+diff --git a/crates/oulipoly-state/src/db.rs b/crates/oulipoly-state/src/db.rs
+index f25287a..e0c5aa8 100755
+--- a/crates/oulipoly-state/src/db.rs
++++ b/crates/oulipoly-state/src/db.rs
+@@ -6293,7 +6293,6 @@ impl StateDb {
+         input: &str,
+         model_override: Option<&str>,
+     ) -> Result<ResolvedResume, ResumeError> {
+-        Self::validate_resume_input_uuid(input)?;
+         self.reject_wrong_resume_id_kind(input)?;
+         let chain_id = self.resolve_resume_chain_id(input)?;
+         let (active_provider, active_session_id) = self.require_active_segment(&chain_id)?;
+@@ -6309,14 +6308,6 @@ impl StateDb {
+         ))
+     }
+ 
+-    fn validate_resume_input_uuid(input: &str) -> Result<(), ResumeError> {
+-        Uuid::try_parse(input)
+-            .map(|_| ())
+-            .map_err(|_| ResumeError::InvalidUuid {
+-                input: input.to_string(),
+-            })
+-    }
+-
+     fn reject_wrong_resume_id_kind(&self, input: &str) -> Result<(), ResumeError> {
+         match self
+             .wrong_id_kind_invocation_match(input)
+@@ -12289,7 +12280,7 @@ interactive_args = ["launch"]
+             test_db()
+                 .resolve_resume(&models, "not-a-uuid", None)
+                 .unwrap_err(),
+-            ResumeError::InvalidUuid { .. }
++            ResumeError::NoChainFound { .. }
+         ));
+         assert!(matches!(
+             test_db()
+@@ -12375,6 +12366,34 @@ interactive_args = ["launch"]
+         }
+     }
+ 
++    #[test]
++    fn resolve_resume_accepts_opencode_provider_session_id() {
++        let db = test_db();
++        let models = model_store_from_toml(&[(
++            "gpt-high",
++            r#"
++[[providers]]
++name = "opencode"
++interactive_args = ["run"]
++"#,
++        )]);
++        seed_test_chain(
++            &db,
++            CHAIN_A,
++            "opencode",
++            "ses_fixture",
++            "gpt-high",
++            "2026-06-04T08:00:00Z",
++        );
++
++        let resolved = db.resolve_resume(&models, "ses_fixture", None).unwrap();
++
++        assert_eq!(resolved.chain_id, CHAIN_A);
++        assert_eq!(resolved.active_provider, "opencode");
++        assert_eq!(resolved.active_session_id, "ses_fixture");
++        assert_eq!(resolved.model_name.as_deref(), Some("gpt-high"));
++    }
++
+     #[test]
+     fn age132_timestamp_policies_preserve_strict_forgiving_and_fallback_callers() {
+         let db = test_db();
+diff --git a/scripts/opencode-turns b/scripts/opencode-turns
+new file mode 100644
+index 0000000..4e0f035
+--- /dev/null
++++ b/scripts/opencode-turns
+@@ -0,0 +1,207 @@
++#!/usr/bin/env python3
++"""
++Reference adapter: emit OpenCode session messages as normalized JSONL.
++
++Usage: opencode-turns BASE_DIR
++   e.g. opencode-turns ~/.local/share/opencode
++
++Expected native layout:
++  BASE_DIR/storage/message/ses_<id>/msg_*.json
++
++The runner sets STATE_DIR to a writable dir for incremental bookkeeping. We
++track the highest mtime emitted; subsequent runs skip files unchanged since.
++
++Emits one JSON object per line on stdout:
++  {"session_id":"ses_...","turn_id":"msg_...","timestamp":"<rfc3339>","role":"user|assistant","body":[{"type":"text","text":"..."}]}
++"""
++
++import json
++import os
++import sys
++from datetime import datetime, timezone
++from pathlib import Path
++
++
++def text_chunk(text: str) -> dict:
++    return {"type": "text", "text": text}
++
++
++def canonical_chunk_type(native_type) -> str:
++    if not isinstance(native_type, str):
++        return "text"
++    if native_type in ("input_text", "output_text", "markdown"):
++        return "text"
++    return native_type
++
++
++def extract_content_chunks(value) -> list:
++    if isinstance(value, str):
++        return [text_chunk(value)]
++    if isinstance(value, list):
++        chunks = []
++        for item in value:
++            chunks.extend(extract_content_chunks(item))
++        return chunks
++    if isinstance(value, dict):
++        text = value.get("text")
++        if text is None:
++            text = value.get("content")
++        if isinstance(text, str):
++            native_type = value.get("type") or "text"
++            return [{"type": canonical_chunk_type(native_type), "text": text}]
++        for key in ("parts", "content", "message"):
++            chunks = extract_content_chunks(value.get(key))
++            if chunks:
++                return chunks
++    return []
++
++
++def message_roots(base: Path) -> list:
++    candidates = []
++    if base.name == "message":
++        candidates.append(base)
++    candidates.append(base / "storage" / "message")
++    candidates.append(base / "message")
++    seen = set()
++    roots = []
++    for candidate in candidates:
++        resolved = candidate.expanduser()
++        key = str(resolved)
++        if key not in seen and resolved.exists():
++            seen.add(key)
++            roots.append(resolved)
++    return roots
++
++
++def message_paths(base: Path) -> list:
++    paths = []
++    for root in message_roots(base):
++        paths.extend(root.glob("ses_*/msg_*.json"))
++    if not paths:
++        paths.extend(base.glob("**/ses_*/msg_*.json"))
++    return sorted(set(paths))
++
++
++def read_cursor(state_dir: Path) -> int:
++    cursor_file = state_dir / "last_mtime"
++    if not cursor_file.exists():
++        return 0
++    try:
++        return int(cursor_file.read_text().strip())
++    except ValueError:
++        return 0
++
++
++def write_cursor(state_dir: Path, value: int) -> None:
++    (state_dir / "last_mtime").write_text(str(value))
++
++
++def numeric_timestamp(value) -> str | None:
++    if not isinstance(value, (int, float)):
++        return None
++    seconds = value / 1000 if value > 10_000_000_000 else value
++    return datetime.fromtimestamp(seconds, tz=timezone.utc).isoformat().replace("+00:00", "Z")
++
++
++def timestamp_from_obj(obj: dict, path: Path) -> str:
++    for key in ("timestamp", "createdAt", "created_at", "time"):
++        value = obj.get(key)
++        if isinstance(value, str) and value:
++            return value
++        converted = numeric_timestamp(value)
++        if converted:
++            return converted
++    return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat().replace(
++        "+00:00", "Z"
++    )
++
++
++def session_id_from_obj(obj: dict, path: Path) -> str | None:
++    for key in ("sessionID", "sessionId", "session_id"):
++        value = obj.get(key)
++        if isinstance(value, str) and value:
++            return value
++    for parent in path.parents:
++        if parent.name.startswith("ses_"):
++            return parent.name
++    return None
++
++
++def role_from_obj(obj: dict) -> str | None:
++    value = obj.get("role")
++    if value in ("user", "assistant"):
++        return value
++    message = obj.get("message")
++    if isinstance(message, dict) and message.get("role") in ("user", "assistant"):
++        return message.get("role")
++    return None
++
++
++def turn_id_from_obj(obj: dict, path: Path) -> str:
++    for key in ("id", "messageID", "messageId", "message_id"):
++        value = obj.get(key)
++        if isinstance(value, str) and value:
++            return value
++    return path.stem
++
++
++def record_from_message(path: Path, obj: dict) -> dict | None:
++    session_id = session_id_from_obj(obj, path)
++    role = role_from_obj(obj)
++    if not session_id or not role:
++        return None
++    record = {
++        "session_id": session_id,
++        "turn_id": turn_id_from_obj(obj, path),
++        "timestamp": timestamp_from_obj(obj, path),
++        "role": role,
++    }
++    body = extract_content_chunks(obj.get("parts")) or extract_content_chunks(
++        obj.get("content")
++    ) or extract_content_chunks(obj.get("message"))
++    if body:
++        record["body"] = body
++    return record
++
++
++def emit_file(path: Path, out) -> None:
++    try:
++        obj = json.loads(path.read_text(encoding="utf-8"))
++    except (OSError, json.JSONDecodeError):
++        return
++    if not isinstance(obj, dict):
++        return
++    record = record_from_message(path, obj)
++    if not record:
++        return
++    out.write(json.dumps(record, separators=(",", ":")))
++    out.write("\n")
++
++
++def main() -> int:
++    if len(sys.argv) < 2:
++        print("usage: opencode-turns BASE_DIR", file=sys.stderr)
++        return 2
++    base = Path(sys.argv[1]).expanduser()
++    state_dir = Path(os.environ.get("STATE_DIR", "/tmp/opencode-turns-state"))
++    state_dir.mkdir(parents=True, exist_ok=True)
++
++    last_mtime = read_cursor(state_dir)
++    new_max = last_mtime
++    out = sys.stdout
++    for path in message_paths(base):
++        try:
++            mtime = int(path.stat().st_mtime)
++        except OSError:
++            continue
++        if mtime <= last_mtime:
++            continue
++        new_max = max(new_max, mtime)
++        emit_file(path, out)
++
++    write_cursor(state_dir, new_max)
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/src-tauri/src/run/resume/orchestration.rs b/src-tauri/src/run/resume/orchestration.rs
+index 6b8dbd1..aca94e3 100644
+--- a/src-tauri/src/run/resume/orchestration.rs
++++ b/src-tauri/src/run/resume/orchestration.rs
+@@ -86,7 +86,7 @@ pub(crate) fn run_resume(
+ }
+ 
+ fn reject_invalid_resume_input(session_id: &str) -> Option<i32> {
+-    match validator::validate_resume_uuid(session_id) {
++    match validator::validate_resume_input(session_id) {
+         Ok(()) => None,
+         Err(message) => {
+             formatter::emit_stderr(&message);
+diff --git a/src-tauri/src/run/resume/validator.rs b/src-tauri/src/run/resume/validator.rs
+index b2b46e8..0cf5b4f 100644
+--- a/src-tauri/src/run/resume/validator.rs
++++ b/src-tauri/src/run/resume/validator.rs
+@@ -1,9 +1,8 @@
+ //! validator
+ 
+-use uuid::Uuid;
+-
+-pub(super) fn validate_resume_uuid(session_id: &str) -> Result<(), String> {
+-    Uuid::parse_str(session_id)
+-        .map(|_| ())
+-        .map_err(|_| format!("invalid session UUID: {session_id}"))
++pub(super) fn validate_resume_input(session_id: &str) -> Result<(), String> {
++    if session_id.trim().is_empty() {
++        return Err("session id is required".to_string());
++    }
++    Ok(())
+ }
+diff --git a/src-tauri/tests/pr_f_resume_integration.rs b/src-tauri/tests/pr_f_resume_integration.rs
+index e6ec70c..a05a81e 100644
+--- a/src-tauri/tests/pr_f_resume_integration.rs
++++ b/src-tauri/tests/pr_f_resume_integration.rs
+@@ -465,6 +465,14 @@ fn ts(value: &str) -> DateTime<Utc> {
+         .with_timezone(&Utc)
+ }
+ 
++fn path_string(path: &Path) -> String {
++    path.to_string_lossy().into_owned()
++}
++
++fn toml_string(value: &str) -> String {
++    serde_json::to_string(value).unwrap()
++}
++
+ pub(crate) fn parse_invocation(stderr: &str) -> CompositeInvocationId {
+     let lines: Vec<&str> = stderr
+         .lines()
+@@ -655,33 +663,151 @@ fn invocation_count_for_session(fixture: &Fixture, session_id: &str) -> i64 {
+ }
+ 
+ #[test]
+-fn headless_resume_rejects_malformed_uuid_before_state_or_config_open() {
++fn headless_resume_unknown_non_uuid_reports_no_chain_found() {
+     let fixture = Fixture::new();
++    let script = fixture.write_script("provider.sh", "exit 0");
++    fixture.write_single_provider_model(
++        "gpt-high",
++        "opencode",
++        &script,
++        r#"
++[providers.resume]
++kind = "flag"
++flag = "--resume"
++"#,
++    );
+     let output = fixture
+-        .base_resume_command("claude-opus", "not-a-uuid")
++        .base_resume_command("gpt-high", "not-a-uuid")
+         .arg("--prompt")
+         .arg("answer text")
+         .output()
+         .unwrap();
+ 
+     assert_eq!(output.status.code(), Some(1), "{output:?}");
+-    assert_eq!(
+-        String::from_utf8_lossy(&output.stderr),
+-        "invalid session UUID: not-a-uuid\n"
+-    );
++    let stderr = String::from_utf8_lossy(&output.stderr);
+     assert!(
+-        !fixture.db_path().exists(),
+-        "malformed UUID must return before state DB initialization"
++        stderr.contains("No session found matching not-a-uuid"),
++        "{stderr}"
+     );
+-    let app_config_dir = fixture.config_home.join("oulipoly-agent-runner");
+-    assert!(
+-        !app_config_dir.join("providers.toml").exists(),
+-        "malformed UUID must not initialize provider config"
++}
++
++#[test]
++fn opencode_resume_accepts_ses_provider_session_id() {
++    let fixture = Fixture::new();
++    let script = fixture.write_script(
++        "opencode.sh",
++        r#"
++session=""
++for ((i=1; i <= $#; i++)); do
++  arg="${!i}"
++  if [ "$arg" = "--session" ]; then
++    j=$((i + 1))
++    session="${!j}"
++  fi
++done
++if [ "$session" != "ses_fixture" ]; then
++  printf 'expected --session ses_fixture, got %s\n' "$session" >&2
++  exit 66
++fi
++printf 'opencode resumed\n'
++"#,
+     );
+-    assert!(
+-        !app_config_dir.join("sessions.toml").exists(),
+-        "malformed UUID must not initialize session config"
++    fixture.write_single_provider_model(
++        "gpt-high",
++        "opencode",
++        &script,
++        r#"
++[providers.resume]
++kind = "flag"
++flag = "--session"
++"#,
++    );
++    fixture.seed_active_chain(
++        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
++        "opencode",
++        "ses_fixture",
++        "gpt-high",
+     );
++
++    let output = fixture
++        .base_resume_command("gpt-high", "ses_fixture")
++        .arg("--prompt")
++        .arg("answer text")
++        .output()
++        .unwrap();
++
++    assert_eq!(output.status.code(), Some(0), "{output:?}");
++    let stderr = String::from_utf8_lossy(&output.stderr);
++    let invocation = parse_invocation(&stderr);
++    assert_resume_dual_id_row(&fixture, &invocation.id, "ses_fixture", "ses_fixture");
++}
++
++#[test]
++fn opencode_balanced_launch_captures_ses_session_id() {
++    let fixture = Fixture::new();
++    let script = fixture.write_script(
++        "opencode1.sh",
++        r#"
++expected=(run --dangerously-skip-permissions -m openai/gpt-5.5 --variant high --format json opencode-prompt)
++if [ "$#" -ne "${#expected[@]}" ]; then
++  printf 'unexpected argc: %s argv: %s\n' "$#" "$*" >&2
++  exit 64
++fi
++for ((i=0; i < ${#expected[@]}; i++)); do
++  j=$((i + 1))
++  actual="${!j}"
++  if [ "$actual" != "${expected[$i]}" ]; then
++    printf 'argv[%s] expected %s got %s\n' "$i" "${expected[$i]}" "$actual" >&2
++    exit 65
++  fi
++done
++printf '%s\n' '{"type":"step_start","timestamp":1767036059338,"sessionID":"ses_fixture","part":{"sessionID":"ses_fixture","type":"step-start"}}'
++printf '%s\n' '{"type":"text","timestamp":1767036059444,"sessionID":"ses_fixture","part":{"type":"text","text":"ok"}}'
++printf '%s\n' '{"type":"step_finish","timestamp":1767036059555,"sessionID":"ses_fixture","part":{"type":"step-finish","reason":"stop"}}'
++"#,
++    );
++    fixture.write_model_body(
++        "gpt-high",
++        r#"[[providers]]
++name = "opencode"
++args = ["-m", "openai/gpt-5.5", "--variant", "high"]
++"#,
++    );
++    fixture.write_providers_body(&format!(
++        r#"[opencode]
++command = {}
++args = ["run", "--dangerously-skip-permissions"]
++prompt_mode = "arg"
++
++[opencode.session_capture]
++kind = "stdout_json_event"
++json_args = ["--format", "json"]
++event_type = "step_start"
++event_id_path = "sessionID"
++
++[opencode.resume]
++kind = "flag"
++flag = "--session"
++"#,
++        toml_string(&path_string(&script))
++    ));
++
++    let output = fixture
++        .base_model_command("gpt-high")
++        .arg("opencode-prompt")
++        .output()
++        .unwrap();
++
++    assert_eq!(output.status.code(), Some(0), "{output:?}");
++    let stderr = String::from_utf8_lossy(&output.stderr);
++    let invocation = parse_invocation(&stderr);
++    let session_id = parse_session_line(&stderr, &invocation.id);
++    assert_eq!(session_id, "ses_fixture");
++    let (provider_session_id, resume_input_id, capture_method) =
++        invocation_dual_id_columns(&fixture, &invocation.id);
++    assert_eq!(provider_session_id.as_deref(), Some("ses_fixture"));
++    assert_eq!(resume_input_id, None);
++    assert_eq!(capture_method.as_deref(), Some("stdout_json_event"));
+ }
+ 
+ #[test]
+@@ -2068,7 +2194,7 @@ subcommand = ["resume"]
+ }
+ 
+ #[test]
+-fn resume_rejects_malformed_uuid_before_lookup() {
++fn resume_unknown_non_uuid_reports_no_chain_found() {
+     let fixture = Fixture::new();
+     let script = fixture.write_script("claude.sh", "exit 0");
+     fixture.write_single_provider_model(
+@@ -2087,7 +2213,7 @@ flag = "--resume"
+ 
+     assert_eq!(output.status.code(), Some(1), "{output:?}");
+     assert!(
+-        stderr.contains("invalid session UUID: not-a-uuid"),
++        stderr.contains("No session found matching not-a-uuid"),
+         "{stderr}"
+     );
+ }
+diff --git a/src-tauri/tests/wu_d_proactive_wake_integration.rs b/src-tauri/tests/wu_d_proactive_wake_integration.rs
+index f939e79..8ad6b9b 100644
+--- a/src-tauri/tests/wu_d_proactive_wake_integration.rs
++++ b/src-tauri/tests/wu_d_proactive_wake_integration.rs
+@@ -134,6 +134,35 @@ flag = "--resume"
+         .unwrap();
+     }
+ 
++    fn write_opencode_provider(&self, body: &str) {
++        let script = self.write_script("opencode.sh", body);
++        fs::write(
++            self.models_dir.join(format!("{MODEL}.toml")),
++            r#"[[providers]]
++name = "opencode"
++args = []
++"#,
++        )
++        .unwrap();
++        fs::write(
++            self.app_config_dir.join("providers.toml"),
++            format!(
++                r#"[opencode]
++command = {}
++args = []
++interactive_args = ["interactive"]
++prompt_mode = "arg"
++
++[opencode.resume]
++kind = "flag"
++flag = "--session"
++"#,
++                toml_string(&path_string(&script))
++            ),
++        )
++        .unwrap();
++    }
++
+     fn write_script(&self, name: &str, body: &str) -> PathBuf {
+         let path = self.dir.path().join(name);
+         fs::write(
+@@ -174,14 +203,18 @@ flag = "--resume"
+     }
+ 
+     fn seed_idle_runtime(&self) {
++        self.seed_idle_runtime_for(SESSION, PROVIDER, MODEL);
++    }
++
++    fn seed_idle_runtime_for(&self, session_id: &str, provider_name: &str, model_name: &str) {
+         let mut db = MailboxDb::open(&self.sidecar_path()).unwrap();
+         let models_dir = path_string(&self.models_dir);
+         db.upsert_session_runtime(SessionRuntimeUpsert {
+-            session_id: SESSION,
++            session_id,
+             mode: "headless",
+             invocation_uuid: None,
+-            provider_name: Some(PROVIDER),
+-            model_name: Some(MODEL),
++            provider_name: Some(provider_name),
++            model_name: Some(model_name),
+             pty_control_path: None,
+             models_dir: Some(&models_dir),
+             effective_cwd: None,
+@@ -189,6 +222,30 @@ flag = "--resume"
+         .unwrap();
+     }
+ 
++    fn seed_active_chain_for(
++        &self,
++        chain_id: &str,
++        provider_name: &str,
++        session_id: &str,
++        model_name: &str,
++    ) {
++        let _ = StateDb::open(&self.state_path()).unwrap();
++        let conn = Connection::open(self.state_path()).unwrap();
++        conn.execute(
++            "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
++             VALUES (?1, '2026-06-04T12:00:00Z', '2026-06-04T12:00:00Z', ?2)",
++            rusqlite::params![chain_id, model_name],
++        )
++        .unwrap();
++        conn.execute(
++            "INSERT INTO session_chain_segments
++                (chain_id, provider_name, session_id, started_at, transition_reason)
++             VALUES (?1, ?2, ?3, '2026-06-04T12:00:00Z', 'initial')",
++            rusqlite::params![chain_id, provider_name, session_id],
++        )
++        .unwrap();
++    }
++
+     fn seed_mailbox(&self, session_id: &str, handle: &str) {
+         let state_dir = self.work_dir.join(format!("seed-{handle}"));
+         fs::create_dir_all(&state_dir).unwrap();
+@@ -218,15 +275,25 @@ flag = "--resume"
+     }
+ 
+     fn record_identity(&self, identity: &ProcessIdentity) {
++        self.record_identity_for(identity, SESSION, PROVIDER, MODEL);
++    }
++
++    fn record_identity_for(
++        &self,
++        identity: &ProcessIdentity,
++        session_id: &str,
++        provider_name: &str,
++        model_name: &str,
++    ) {
+         let sidecar = PidIdentityDb::open(&self.sidecar_path()).unwrap();
+         sidecar
+             .record_identity(PidIdentityRecord {
+                 identity,
+                 os_pgid: None,
+                 invocation_uuid: INVOCATION,
+-                session_id: Some(SESSION),
+-                provider_name: Some(PROVIDER),
+-                model_name: Some(MODEL),
++                session_id: Some(session_id),
++                provider_name: Some(provider_name),
++                model_name: Some(model_name),
+                 recorded_at: "2026-06-04T12:00:00Z",
+             })
+             .unwrap();
+@@ -465,6 +532,52 @@ fn manual_resume_race_is_safe() {
+     fixture.assert_xdg_isolated();
+ }
+ 
++#[test]
++fn opencode_notify_idle_wakes_resume_with_ses_session() {
++    let _guard = integration_test_guard();
++    let fixture = Fixture::new();
++    fixture.write_opencode_provider(&provider_script(
++        "",
++        r#"if [ "$resume" != "ses_fixture" ]; then
++  printf 'expected --session ses_fixture, got %s\n' "$resume" >&2
++  exit 66
++fi"#,
++        "opencode-resumed.txt",
++    ));
++    fixture.seed_active_chain_for(
++        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
++        "opencode",
++        "ses_fixture",
++        MODEL,
++    );
++    fixture.seed_idle_runtime_for("ses_fixture", "opencode", MODEL);
++    let identity = identity(9_400, "boot-opencode", 789);
++    fixture.record_identity_for(&identity, "ses_fixture", "opencode", MODEL);
++
++    let output = notify_command(&fixture, "h-opencode", &identity)
++        .output()
++        .unwrap();
++
++    assert_notify_success(&output);
++    let prompt = wait_for_file(&fixture.prompt_file("opencode-resumed.txt"));
++    assert!(prompt.contains("handle: h-opencode"), "{prompt}");
++    wait_until("opencode mailbox delivered", || {
++        let db = fixture.mailbox();
++        let rows = db.list_mailbox("ses_fixture", true).unwrap();
++        rows.len() == 1
++            && rows[0].delivered_at.is_some()
++            && db.wake_claim("ses_fixture").unwrap().is_none()
++    });
++    assert!(
++        fixture
++            .mailbox()
++            .list_pending("ses_fixture")
++            .unwrap()
++            .is_empty()
++    );
++    fixture.assert_xdg_isolated();
++}
++
+ #[test]
+ fn batch_cap_followup_wake() {
+     let _guard = integration_test_guard();
+@@ -609,6 +722,10 @@ for ((i=1; i <= $#; i++)); do
+     j=$((i + 1))
+     resume="${{!j}}"
+   fi
++  if [ "$arg" = "--session" ]; then
++    j=$((i + 1))
++    resume="${{!j}}"
++  fi
+ done
+ last="${{@: -1}}"
+ provider_pid="$$"

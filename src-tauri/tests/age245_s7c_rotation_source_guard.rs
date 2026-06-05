@@ -118,6 +118,8 @@ fn s7c_provider_name_grep_invariant_uses_authoritative_manager_baseline() {
             ".",
             ":(exclude)src-tauri/target/**",
             ":(exclude)target/**",
+            ":(exclude)planning/*-gate/**",
+            ":(exclude)planning/opencode-contract/**",
         ])
         .output()
         .expect("git diff must run for AGE-245 S7c provider-name invariant");
@@ -151,6 +153,10 @@ fn provider_name_occurrence_count(root: &Path, pattern: &str) -> usize {
             "!src-tauri/target/**",
             "-g",
             "!target/**",
+            "-g",
+            "!planning/*-gate/**",
+            "-g",
+            "!planning/opencode-contract/**",
         ])
         .output()
         .expect("rg must run for AGE-245 S7c provider-name invariant");
@@ -198,7 +204,17 @@ fn untracked_provider_name_occurrence_count(root: &Path, pattern: &str) -> usize
 }
 
 fn is_ignored_generated_path(relative: &str) -> bool {
-    relative.starts_with("src-tauri/target/") || relative.starts_with("target/")
+    relative.starts_with("src-tauri/target/")
+        || relative.starts_with("target/")
+        || is_planning_gate_artifact(relative)
+        || relative.starts_with("planning/opencode-contract/")
+}
+
+fn is_planning_gate_artifact(relative: &str) -> bool {
+    relative
+        .strip_prefix("planning/")
+        .and_then(|suffix| suffix.split_once('/'))
+        .is_some_and(|(dir, _)| dir.ends_with("-gate"))
 }
 
 fn read_sources_under(relative: &str) -> Vec<String> {

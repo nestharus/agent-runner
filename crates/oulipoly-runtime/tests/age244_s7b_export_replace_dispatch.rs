@@ -1221,14 +1221,31 @@ fn external_replace_dry_run_no_change_returns_no_state_update_and_no_host_mutati
 #[test]
 fn no_new_concrete_provider_name_grep_hits_are_introduced_against_base_ref() {
     let root = repo_root();
-    let base = grep_snapshot(&root, &[BASE_REF, "--", "."]);
-    let current = grep_snapshot(&root, &["--untracked", "--", "."]);
+    let base = grep_snapshot(&root, &grep_scope_args(Some(BASE_REF), false));
+    let current = grep_snapshot(&root, &grep_scope_args(None, true));
     let new_hits = current.difference(&base).cloned().collect::<Vec<_>>();
 
     assert!(
         new_hits.is_empty(),
         "AGE-244 S7b must not introduce concrete built-in provider-name grep hits: {new_hits:#?}"
     );
+}
+
+fn grep_scope_args(base_ref: Option<&'static str>, include_untracked: bool) -> Vec<&'static str> {
+    let mut args = Vec::new();
+    if include_untracked {
+        args.push("--untracked");
+    }
+    if let Some(base_ref) = base_ref {
+        args.push(base_ref);
+    }
+    args.extend([
+        "--",
+        ".",
+        ":(exclude)planning/*-gate/**",
+        ":(exclude)planning/opencode-contract/**",
+    ]);
+    args
 }
 
 fn comparable_replace_state(

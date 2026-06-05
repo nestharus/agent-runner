@@ -1,0 +1,22 @@
+# opencode P0+P1 touched production surfaces (incremental 225a903..HEAD)
+
+- crates/oulipoly-config/src/model.rs
+- crates/oulipoly-config/src/providers.rs
+- crates/oulipoly-runtime/src/executor/cli.rs
+- crates/oulipoly-runtime/src/executor/cli/capture_result.rs
+- crates/oulipoly-runtime/src/executor/cli/provider_execution.rs
+- crates/oulipoly-runtime/src/executor/cli/provider_identity.rs
+- crates/oulipoly-runtime/src/executor/cli/result.rs
+- crates/oulipoly-runtime/src/executor/cli/session_capture/args.rs
+- crates/oulipoly-runtime/src/executor/cli/session_capture/plan.rs
+- crates/oulipoly-runtime/src/executor/cli/supervision/mod.rs
+- crates/oulipoly-runtime/src/executor/cli/supervision/terminal_outcome.rs
+- crates/oulipoly-runtime/src/executor/mod.rs
+- crates/oulipoly-runtime/src/executor/provider_specific/resume_acceptance.rs
+- crates/oulipoly-runtime/src/executor/providers/mod.rs
+- crates/oulipoly-runtime/src/executor/providers/opencode.rs
+- crates/oulipoly-runtime/src/executor/terminal_signal.rs
+- crates/oulipoly-state/src/db.rs
+- scripts/opencode-turns
+- src-tauri/src/run/resume/orchestration.rs
+- src-tauri/src/run/resume/validator.rs

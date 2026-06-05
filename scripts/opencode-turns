@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-Reference adapter: emit OpenCode session messages as normalized JSONL.
+Reference adapter: emit OpenCode exported sessions as normalized JSONL.
 
-Usage: opencode-turns BASE_DIR
-   e.g. opencode-turns ~/.local/share/opencode
+Usage: opencode-turns BASE_DIR [SESSION_ID ...]
+   e.g. opencode-turns ~/.local/share/opencode ses_abc123
 
-Expected native layout:
-  BASE_DIR/storage/message/ses_<id>/msg_*.json
+Message content is read through the public OpenCode CLI:
+  opencode export <sessionID>
 
-The runner sets STATE_DIR to a writable dir for incremental bookkeeping. We
-track the highest mtime emitted; subsequent runs skip files unchanged since.
+When SESSION_ID arguments are supplied, the adapter does not inspect OpenCode
+storage. Without explicit IDs, it discovers candidate session IDs from the
+directory names under BASE_DIR/storage/message/ses_*. That discovery fallback is
+the only remaining private-layout touch; message JSON files are never read.
 
 Emits one JSON object per line on stdout:
   {"session_id":"ses_...","turn_id":"msg_...","timestamp":"<rfc3339>","role":"user|assistant","body":[{"type":"text","text":"..."}]}
@@ -17,9 +19,15 @@ Emits one JSON object per line on stdout:
 
 import json
 import os
+import shlex
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
+
+
+MESSAGE_LIST_KEYS = ("messages", "turns", "items", "entries")
 
 
 def text_chunk(text: str) -> dict:
@@ -56,44 +64,27 @@ def extract_content_chunks(value) -> list:
     return []
 
 
-def message_roots(base: Path) -> list:
-    candidates = []
-    if base.name == "message":
-        candidates.append(base)
-    candidates.append(base / "storage" / "message")
-    candidates.append(base / "message")
+def unique_values(values: list[str]) -> list[str]:
     seen = set()
-    roots = []
-    for candidate in candidates:
-        resolved = candidate.expanduser()
-        key = str(resolved)
-        if key not in seen and resolved.exists():
-            seen.add(key)
-            roots.append(resolved)
-    return roots
+    unique = []
+    for value in values:
+        if value and value not in seen:
+            seen.add(value)
+            unique.append(value)
+    return unique
 
 
-def message_paths(base: Path) -> list:
-    paths = []
-    for root in message_roots(base):
-        paths.extend(root.glob("ses_*/msg_*.json"))
-    if not paths:
-        paths.extend(base.glob("**/ses_*/msg_*.json"))
-    return sorted(set(paths))
+def discover_session_ids(base: Path) -> list[str]:
+    message_root = base.expanduser() / "storage" / "message"
+    if not message_root.exists():
+        return []
+    return sorted(path.name for path in message_root.glob("ses_*") if path.is_dir())
 
 
-def read_cursor(state_dir: Path) -> int:
-    cursor_file = state_dir / "last_mtime"
-    if not cursor_file.exists():
-        return 0
-    try:
-        return int(cursor_file.read_text().strip())
-    except ValueError:
-        return 0
-
-
-def write_cursor(state_dir: Path, value: int) -> None:
-    (state_dir / "last_mtime").write_text(str(value))
+def requested_session_ids(base: Path, args: list[str]) -> list[str]:
+    if args:
+        return unique_values(args)
+    return discover_session_ids(base)
 
 
 def numeric_timestamp(value) -> str | None:
@@ -103,7 +94,7 @@ def numeric_timestamp(value) -> str | None:
     return datetime.fromtimestamp(seconds, tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def timestamp_from_obj(obj: dict, path: Path) -> str:
+def timestamp_from_obj(obj: dict) -> str | None:
     for key in ("timestamp", "createdAt", "created_at", "time"):
         value = obj.get(key)
         if isinstance(value, str) and value:
@@ -111,19 +102,14 @@ def timestamp_from_obj(obj: dict, path: Path) -> str:
         converted = numeric_timestamp(value)
         if converted:
             return converted
-    return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat().replace(
-        "+00:00", "Z"
-    )
+    return None
 
 
-def session_id_from_obj(obj: dict, path: Path) -> str | None:
+def session_id_from_obj(obj: dict) -> str | None:
     for key in ("sessionID", "sessionId", "session_id"):
         value = obj.get(key)
         if isinstance(value, str) and value:
             return value
-    for parent in path.parents:
-        if parent.name.startswith("ses_"):
-            return parent.name
     return None
 
 
@@ -137,23 +123,70 @@ def role_from_obj(obj: dict) -> str | None:
     return None
 
 
-def turn_id_from_obj(obj: dict, path: Path) -> str:
+def turn_id_from_obj(obj: dict, default_session_id: str, index: int) -> str:
     for key in ("id", "messageID", "messageId", "message_id"):
         value = obj.get(key)
         if isinstance(value, str) and value:
             return value
-    return path.stem
+    message = obj.get("message")
+    if isinstance(message, dict):
+        for key in ("id", "messageID", "messageId", "message_id"):
+            value = message.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return f"{default_session_id}:{index}"
 
 
-def record_from_message(path: Path, obj: dict) -> dict | None:
-    session_id = session_id_from_obj(obj, path)
+def opencode_command() -> list[str]:
+    configured = os.environ.get("OPENCODE_BIN", "opencode")
+    return shlex.split(configured) or ["opencode"]
+
+
+def parse_export_stdout(stdout: str) -> Any | None:
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def export_session(session_id: str) -> Any | None:
+    command = opencode_command() + ["export", session_id]
+    try:
+        completed = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return parse_export_stdout(completed.stdout)
+
+
+def exported_message_items(exported: Any) -> list[dict]:
+    if isinstance(exported, list):
+        return [item for item in exported if isinstance(item, dict)]
+    if not isinstance(exported, dict):
+        return []
+    for key in MESSAGE_LIST_KEYS:
+        value = exported.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    if role_from_obj(exported):
+        return [exported]
+    return []
+
+
+def record_from_message(default_session_id: str, index: int, obj: dict) -> dict | None:
+    session_id = session_id_from_obj(obj) or default_session_id
     role = role_from_obj(obj)
-    if not session_id or not role:
+    timestamp = timestamp_from_obj(obj)
+    if not session_id or not role or not timestamp:
         return None
     record = {
         "session_id": session_id,
-        "turn_id": turn_id_from_obj(obj, path),
-        "timestamp": timestamp_from_obj(obj, path),
+        "turn_id": turn_id_from_obj(obj, default_session_id, index),
+        "timestamp": timestamp,
         "role": role,
     }
     body = extract_content_chunks(obj.get("parts")) or extract_content_chunks(
@@ -164,42 +197,29 @@ def record_from_message(path: Path, obj: dict) -> dict | None:
     return record
 
 
-def emit_file(path: Path, out) -> None:
-    try:
-        obj = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return
-    if not isinstance(obj, dict):
-        return
-    record = record_from_message(path, obj)
-    if not record:
-        return
+def emit_record(record: dict, out) -> None:
     out.write(json.dumps(record, separators=(",", ":")))
     out.write("\n")
 
 
+def emit_session(session_id: str, out) -> None:
+    exported = export_session(session_id)
+    if exported is None:
+        return
+    for index, obj in enumerate(exported_message_items(exported), start=1):
+        record = record_from_message(session_id, index, obj)
+        if record:
+            emit_record(record, out)
+
+
 def main() -> int:
     if len(sys.argv) < 2:
-        print("usage: opencode-turns BASE_DIR", file=sys.stderr)
+        print("usage: opencode-turns BASE_DIR [SESSION_ID ...]", file=sys.stderr)
         return 2
     base = Path(sys.argv[1]).expanduser()
-    state_dir = Path(os.environ.get("STATE_DIR", "/tmp/opencode-turns-state"))
-    state_dir.mkdir(parents=True, exist_ok=True)
-
-    last_mtime = read_cursor(state_dir)
-    new_max = last_mtime
     out = sys.stdout
-    for path in message_paths(base):
-        try:
-            mtime = int(path.stat().st_mtime)
-        except OSError:
-            continue
-        if mtime <= last_mtime:
-            continue
-        new_max = max(new_max, mtime)
-        emit_file(path, out)
-
-    write_cursor(state_dir, new_max)
+    for session_id in requested_session_ids(base, sys.argv[2:]):
+        emit_session(session_id, out)
     return 0
 
 

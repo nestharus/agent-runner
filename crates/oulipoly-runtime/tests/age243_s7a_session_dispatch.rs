@@ -641,18 +641,10 @@ fn opencode_read_turns_ingests_normalized_jsonl() {
         .join("message")
         .join(OPENCODE_SESSION_ID);
     fs::create_dir_all(&message_dir).expect("message dir");
-    fs::write(
-        message_dir.join("msg_user.json"),
-        r#"{"id":"msg_user","sessionID":"ses_fixture","timestamp":"2026-05-01T00:00:01Z","role":"user","parts":[{"type":"text","text":"hello"}]}"#,
-    )
-    .expect("user message");
-    fs::write(
-        message_dir.join("msg_assistant.json"),
-        r#"{"id":"msg_assistant","timestamp":"2026-05-01T00:00:02Z","role":"assistant","content":[{"type":"text","text":"world"}]}"#,
-    )
-    .expect("assistant message");
+    let opencode_bin = write_fake_opencode_export(fixture.path());
     let sessions_cfg = opencode_sessions_config(
         &repo_script_path("opencode-turns"),
+        &opencode_bin,
         &opencode_root,
         &fixture.path().join("cursor"),
     );
@@ -1323,6 +1315,7 @@ fn repo_script_path(name: &str) -> PathBuf {
 
 fn opencode_sessions_config(
     script_path: &Path,
+    opencode_bin: &Path,
     opencode_root: &Path,
     state_dir: &Path,
 ) -> SessionsConfig {
@@ -1331,7 +1324,8 @@ fn opencode_sessions_config(
             "opencode".to_string(),
             SessionSourceEntry {
                 turn_script: format!(
-                    "{} {}",
+                    "OPENCODE_BIN={} {} {}",
+                    shell_single_quote_path(opencode_bin),
                     shell_single_quote_path(script_path),
                     shell_single_quote_path(opencode_root)
                 ),
@@ -1340,6 +1334,45 @@ fn opencode_sessions_config(
             },
         )]),
     }
+}
+
+fn write_fake_opencode_export(dir: &Path) -> PathBuf {
+    let script = dir.join("opencode");
+    fs::write(
+        &script,
+        r#"#!/usr/bin/env python3
+import json
+import sys
+
+if sys.argv[1:] != ["export", "ses_fixture"]:
+    print("unexpected argv: " + repr(sys.argv[1:]), file=sys.stderr)
+    sys.exit(3)
+
+print(json.dumps({
+    "sessionID": "ses_fixture",
+    "messages": [
+        {
+            "id": "msg_user",
+            "sessionID": "ses_fixture",
+            "timestamp": "2026-05-01T00:00:01Z",
+            "role": "user",
+            "parts": [{"type": "text", "text": "hello"}],
+        },
+        {
+            "id": "msg_assistant",
+            "timestamp": "2026-05-01T00:00:02Z",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "world"}],
+        },
+    ],
+}, separators=(",", ":")))
+"#,
+    )
+    .expect("write fake opencode");
+    let mut perms = fs::metadata(&script).expect("metadata").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&script, perms).expect("chmod fake opencode");
+    script
 }
 
 fn shell_single_quote_path(path: &Path) -> String {

@@ -1,5 +1,26 @@
 # Project Decisions
 
+## D-OC-VI-001-stdout-json-event-without-sidecar — ratified for OpenCode capture
+
+- **Source**: `planning/oc-gate/code-quality/oc/reports/validation-integrity-auditor.md` VI-001.
+- **Decision**: Ratify `stdout_json_event` capture with multi-token `json_args` and no required last-message sidecar. OpenCode needs `--format json` and exposes `step_start.sessionID`; it does not expose a documented last-message sidecar equivalent.
+- **Evidence**: `planning/opencode-contract/gap-matrix.md` § `Proof plan`; tests `opencode_launch_argv_uses_format_json_and_captures_session`, `opencode_stdout_json_event_step_start_session_id`, and `parses_opencode_session_capture_json_args_for_all_accounts`.
+- **Revisit when**: live isolated OpenCode evidence shows `--format json` cannot deterministically emit `step_start.sessionID` for completed runner invocations.
+
+## D-OC-VI-002-non-uuid-resume-input — ratified for provider session IDs
+
+- **Source**: `planning/oc-gate/code-quality/oc/reports/validation-integrity-auditor.md` VI-002.
+- **Decision**: Ratify accepting non-empty resume input and relying on `StateDb::resolve_resume` as the real validation surface. OpenCode native sessions are `ses_...`, so UUID-only prevalidation incorrectly rejects valid provider session IDs before DB resolution can bind them to a known chain/provider.
+- **Evidence**: `planning/opencode-contract/gap-matrix.md` § `Proof plan`; tests `resolve_resume_accepts_opencode_provider_session_id`, `opencode_resume_flag_composes_session`, `opencode_resume_accepts_ses_provider_session_id`, and `opencode_notify_idle_wakes_resume_with_ses_session`.
+- **Revisit when**: a provider session ID format causes ambiguous or unsafe resolution that `resolve_resume` cannot disambiguate with the current chain/active-segment rules.
+
+## D-OC-VI-003-opencode-resume-acceptance-phrases — deferred until live wording is verified
+
+- **Source**: `planning/oc-gate/code-quality/oc/reports/validation-integrity-auditor.md` VI-003.
+- **Decision**: Do not ship guessed OpenCode resume-missing phrases. The resume-acceptance plumbing remains, but the OpenCode phrase list stays empty until a live isolated bad-`--session` run verifies deterministic wording.
+- **Evidence**: `crates/oulipoly-runtime/src/executor/provider_specific/resume_acceptance.rs`; test `opencode_unverified_session_not_found_phrase_does_not_map_to_resume_session_mismatch`; `planning/opencode-contract/gap-matrix.md` § `Proof plan`.
+- **Revisit when**: an isolated live OpenCode run produces stable missing-session or mismatch output that can be pinned in tests and added to the phrase set.
+
 ## D-AGE-240-phase-4-manager-disposition — revise proposal carriers and rerun coupling only
 
 - **Source**: Phase 4 manager gate for AGE-240, question `/home/nes/projects/agent-runner/planning/age-240-lib-l6/scratch/questions/q-6f6e7bd3-1948-455f-9847-48cfb46c7d0a.question.json`.

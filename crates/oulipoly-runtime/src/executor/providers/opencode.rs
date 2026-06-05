@@ -11,6 +11,7 @@ use crate::executor::terminal_signal::{
     pre_quota_terminal_signal_kind, terminal_signal, terminal_status_evidence,
 };
 use serde_json::Value;
+use std::borrow::Cow;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Recognizer;
@@ -45,32 +46,61 @@ fn opencode_json_error_signal(
 }
 
 fn json_error_signal_from_stream(bytes: &[u8]) -> Option<(TerminalSignalKind, String)> {
-    let text = String::from_utf8_lossy(bytes);
-    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+    let text = stream_text(bytes);
+    for line in non_empty_stream_lines(text.as_ref()) {
         let Some(kind) = json_error_line_kind(line) else {
             continue;
         };
-        return Some((
-            kind,
-            bounded_excerpt(line, TERMINAL_SIGNAL_EVIDENCE_MAX_LEN),
-        ));
+        return Some((kind, json_error_line_evidence(line)));
     }
     None
 }
 
+fn stream_text(bytes: &[u8]) -> Cow<'_, str> {
+    String::from_utf8_lossy(bytes)
+}
+
+fn non_empty_stream_lines(text: &str) -> Vec<&str> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+fn json_error_line_evidence(line: &str) -> String {
+    bounded_excerpt(line, TERMINAL_SIGNAL_EVIDENCE_MAX_LEN)
+}
+
 fn json_error_line_kind(line: &str) -> Option<TerminalSignalKind> {
-    let value: Value = serde_json::from_str(line).ok()?;
+    let value = parse_json_error_line(line)?;
+    let error = json_error_event_error(&value)?;
+    let lower_message = normalized_error_message(error);
+    terminal_signal_kind_from_json_error(error, &lower_message)
+}
+
+fn parse_json_error_line(line: &str) -> Option<Value> {
+    serde_json::from_str(line).ok()
+}
+
+fn json_error_event_error(value: &Value) -> Option<&Value> {
     if value.get("type").and_then(Value::as_str) != Some("error") {
         return None;
     }
+    value.get("error")
+}
 
-    let error = value.get("error")?;
-    let message = error_message(error);
-    let lower_message = message.to_lowercase();
-    if error_status_code(error) == Some(429) || message_reports_rate_limit(&lower_message) {
+fn normalized_error_message(error: &Value) -> String {
+    error_message(error).to_lowercase()
+}
+
+fn terminal_signal_kind_from_json_error(
+    error: &Value,
+    lower_message: &str,
+) -> Option<TerminalSignalKind> {
+    if error_reports_rate_limit(error, lower_message) {
         return Some(TerminalSignalKind::RateLimited);
     }
-    if message_reports_persistent_quota(&lower_message) {
+    if error_reports_persistent_quota(lower_message) {
         return Some(TerminalSignalKind::QuotaExhaustedInband);
     }
     None
@@ -106,11 +136,15 @@ fn number_or_numeric_string(value: &Value) -> Option<i64> {
         .or_else(|| value.as_str().and_then(|text| text.parse::<i64>().ok()))
 }
 
+fn error_reports_rate_limit(error: &Value, message: &str) -> bool {
+    error_status_code(error) == Some(429) || message_reports_rate_limit(message)
+}
+
 fn message_reports_rate_limit(message: &str) -> bool {
     message.contains("rate limit exceeded") || message.contains("too many requests")
 }
 
-fn message_reports_persistent_quota(message: &str) -> bool {
+fn error_reports_persistent_quota(message: &str) -> bool {
     (message.contains("quota")
         && (message.contains("exceeded")
             || message.contains("exhausted")

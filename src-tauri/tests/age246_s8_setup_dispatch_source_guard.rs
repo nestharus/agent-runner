@@ -120,7 +120,15 @@ fn full_provider_name_grep_threshold_remains_within_manager_baseline() {
     let root = workspace_root();
     let output = Command::new("git")
         .current_dir(&root)
-        .args(["grep", "-iE", &concrete_provider_pattern()])
+        .args([
+            "grep",
+            "-iE",
+            &concrete_provider_pattern(),
+            "--",
+            ".",
+            ":(exclude)planning/*-gate/**",
+            ":(exclude)planning/opencode-contract/**",
+        ])
         .output()
         .expect("git grep must run");
     assert!(
@@ -142,7 +150,14 @@ fn full_provider_name_grep_threshold_remains_within_manager_baseline() {
 fn tracked_added_provider_name_occurrences(root: &Path, pattern: &str) -> usize {
     let output = Command::new("git")
         .current_dir(root)
-        .args(["diff", "--unified=0", "--", "."])
+        .args([
+            "diff",
+            "--unified=0",
+            "--",
+            ".",
+            ":(exclude)planning/*-gate/**",
+            ":(exclude)planning/opencode-contract/**",
+        ])
         .output()
         .expect("git diff must run");
     assert!(
@@ -182,9 +197,7 @@ fn untracked_provider_name_occurrences(root: &Path, pattern: &str) -> usize {
         .split(|byte| *byte == 0)
         .filter(|path| !path.is_empty())
         .filter_map(|relative| std::str::from_utf8(relative).ok())
-        .filter(|relative| {
-            !relative.starts_with("target/") && !relative.starts_with("src-tauri/target/")
-        })
+        .filter(|relative| !is_ignored_source_guard_path(relative))
         .map(|relative| {
             let source = std::fs::read_to_string(root.join(relative))
                 .unwrap_or_else(|error| panic!("failed to read {relative}: {error}"));
@@ -207,6 +220,20 @@ fn concrete_provider_pattern() -> String {
         ["cl", "au", "de"].concat(),
         ["co", "de", "x"].concat()
     )
+}
+
+fn is_ignored_source_guard_path(relative: &str) -> bool {
+    relative.starts_with("target/")
+        || relative.starts_with("src-tauri/target/")
+        || is_planning_gate_artifact(relative)
+        || relative.starts_with("planning/opencode-contract/")
+}
+
+fn is_planning_gate_artifact(relative: &str) -> bool {
+    relative
+        .strip_prefix("planning/")
+        .and_then(|suffix| suffix.split_once('/'))
+        .is_some_and(|(dir, _)| dir.ends_with("-gate"))
 }
 
 fn read_source(relative: &str) -> String {
