@@ -1,6 +1,7 @@
 //! ## Declared roles
 //!
-//! `accessor`, `orchestration`, `formatter`, `validator`
+//! `accessor`, `filter`, `formatter`, `mapper`, `orchestration`, `parser`,
+//! `predicate`, `validator`
 //!
 //! Resume-backed notification mailbox storage in the PID identity sidecar DB.
 //! This module deliberately owns only additive sidecar tables and never touches
@@ -330,130 +331,32 @@ impl MailboxDb {
         &mut self,
         input: SessionRuntimeRunningUpdate<'_>,
     ) -> Result<(), String> {
-        validate_run_state("running")?;
+        validate_running_run_state()?;
         let now = now_rfc3339();
-        let turn_start_max_mailbox_seq = match input.turn_start_max_mailbox_seq {
-            Some(seq) => Some(seq),
-            None => self.max_mailbox_seq(input.session_id)?,
-        };
-        self.conn
-            .execute(
-                "INSERT INTO session_runtime (
-                    session_id,
-                    mode,
-                    invocation_uuid,
-                    provider_name,
-                    model_name,
-                    pty_control_path,
-                    updated_at,
-                    run_state,
-                    running_invocation_uuid,
-                    running_os_pid,
-                    running_os_boot_id,
-                    running_os_pid_starttime_ticks,
-                    turn_started_at,
-                    turn_ended_at,
-                    turn_start_max_mailbox_seq,
-                    last_exit_code,
-                    models_dir,
-                    effective_cwd
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, 'running', ?3, ?7, ?8, ?9, ?6, NULL, ?10, NULL, ?11, ?12)
-                 ON CONFLICT(session_id)
-                 DO UPDATE SET
-                    mode = excluded.mode,
-                    invocation_uuid = excluded.invocation_uuid,
-                    provider_name = excluded.provider_name,
-                    model_name = excluded.model_name,
-                    updated_at = excluded.updated_at,
-                    run_state = 'running',
-                    running_invocation_uuid = excluded.running_invocation_uuid,
-                    running_os_pid = excluded.running_os_pid,
-                    running_os_boot_id = excluded.running_os_boot_id,
-                    running_os_pid_starttime_ticks = excluded.running_os_pid_starttime_ticks,
-                    turn_started_at = excluded.turn_started_at,
-                    turn_ended_at = NULL,
-                    turn_start_max_mailbox_seq = excluded.turn_start_max_mailbox_seq,
-                    last_exit_code = NULL,
-                    models_dir = COALESCE(excluded.models_dir, session_runtime.models_dir),
-                    effective_cwd = COALESCE(excluded.effective_cwd, session_runtime.effective_cwd)",
-                params![
-                    input.session_id,
-                    input.mode,
-                    input.invocation_uuid,
-                    input.provider_name,
-                    input.model_name,
-                    &now,
-                    input.identity.os_pid,
-                    &input.identity.os_boot_id,
-                    input.identity.os_pid_starttime_ticks,
-                    turn_start_max_mailbox_seq,
-                    input.models_dir,
-                    input.effective_cwd,
-                ],
-            )
-            .map_err(|err| format!("Failed to mark session runtime running: {err}"))?;
-        Ok(())
+        let turn_start_max_mailbox_seq = self.running_turn_start_max_mailbox_seq(&input)?;
+        mark_session_running_row(&self.conn, input, &now, turn_start_max_mailbox_seq)
     }
 
     pub fn mark_session_idle(
         &mut self,
         input: SessionRuntimeIdleUpdate<'_>,
     ) -> Result<bool, String> {
-        validate_run_state("idle")?;
+        validate_idle_run_state()?;
         let now = now_rfc3339();
-        let changed = self
-            .conn
-            .execute(
-                "UPDATE session_runtime
-                 SET run_state = 'idle',
-                     updated_at = ?3,
-                     running_invocation_uuid = NULL,
-                     running_os_pid = NULL,
-                     running_os_boot_id = NULL,
-                     running_os_pid_starttime_ticks = NULL,
-                     turn_ended_at = ?3,
-                     last_exit_code = ?4
-                 WHERE session_id = ?1
-                   AND running_invocation_uuid = ?2",
-                params![
-                    input.session_id,
-                    input.invocation_uuid,
-                    &now,
-                    input.last_exit_code,
-                ],
-            )
-            .map_err(|err| format!("Failed to mark session runtime idle: {err}"))?;
-        Ok(changed > 0)
+        mark_session_idle_row(&self.conn, input, &now)
     }
 
     pub fn session_runtime(&self, session_id: &str) -> Result<Option<SessionRuntimeRow>, String> {
-        self.conn
-            .query_row(
-                "SELECT session_id, mode, invocation_uuid, provider_name, model_name,
-                        pty_control_path, updated_at, run_state, running_invocation_uuid,
-                        running_os_pid, running_os_boot_id, running_os_pid_starttime_ticks,
-                        turn_started_at, turn_ended_at, turn_start_max_mailbox_seq,
-                        last_exit_code, models_dir, effective_cwd
-                 FROM session_runtime
-                 WHERE session_id = ?1",
-                params![session_id],
-                map_session_runtime_row,
-            )
-            .optional()
-            .map_err(|err| format!("Failed to read session runtime row: {err}"))
-            .and_then(|row| {
-                if let Some(row) = &row {
-                    validate_run_state(&row.run_state)?;
-                }
-                Ok(row)
-            })
+        let row = session_runtime_row(&self.conn, session_id)?;
+        validate_session_runtime_row(row.as_ref())?;
+        Ok(row)
     }
 
     pub fn session_liveness(&mut self, session_id: &str) -> Result<SessionLiveness, String> {
         let Some(row) = self.session_runtime(session_id)? else {
             return Ok(SessionLiveness::Idle);
         };
-        if row.run_state != "running" {
+        if runtime_row_is_idle(&row) {
             return Ok(SessionLiveness::Idle);
         }
         let Some(invocation_uuid) = row.running_invocation_uuid.as_deref() else {
@@ -464,13 +367,12 @@ impl MailboxDb {
             self.clear_stale_running_row(session_id, Some(invocation_uuid))?;
             return Ok(SessionLiveness::Idle);
         };
-        match pid_identity::read_live_process_identity(recorded.os_pid)? {
-            Some(live) if live == recorded => Ok(SessionLiveness::Busy),
-            _ => {
-                self.clear_stale_running_row(session_id, Some(invocation_uuid))?;
-                Ok(SessionLiveness::Idle)
-            }
+        let live = live_process_identity_for_runtime(&recorded)?;
+        if runtime_identity_is_live(live.as_ref(), &recorded) {
+            return Ok(SessionLiveness::Busy);
         }
+        self.clear_stale_running_row(session_id, Some(invocation_uuid))?;
+        Ok(SessionLiveness::Idle)
     }
 
     pub fn try_acquire_wake_claim(
@@ -485,10 +387,10 @@ impl MailboxDb {
         input: WakeClaimRequest<'_>,
         renew_token: Option<&str>,
     ) -> Result<WakeClaimAcquireResult, String> {
-        if self.list_pending(input.session_id)?.is_empty() {
+        if !self.session_has_pending_mailbox(input.session_id)? {
             return Ok(WakeClaimAcquireResult::NoPending);
         }
-        if self.session_liveness(input.session_id)? == SessionLiveness::Busy {
+        if self.session_is_busy(input.session_id)? {
             return Ok(WakeClaimAcquireResult::Busy);
         }
         let now = now_rfc3339();
@@ -502,51 +404,17 @@ impl MailboxDb {
                 .map_err(|err| format!("Failed to commit empty wake claim transaction: {err}"))?;
             return Ok(WakeClaimAcquireResult::NoPending);
         };
-        if let Some(existing) = wake_claim_tx(&tx, input.session_id)? {
-            let renews_existing = renew_token == Some(existing.claim_token.as_str());
-            if !claim_is_stale(&existing, input.stale_after_seconds) && !renews_existing {
-                tx.commit().map_err(|err| {
-                    format!("Failed to commit existing wake claim transaction: {err}")
-                })?;
-                return Ok(WakeClaimAcquireResult::AlreadyInFlight(existing));
-            }
+        if let Some(existing) = fresh_in_flight_wake_claim(
+            wake_claim_tx(&tx, input.session_id)?,
+            input.stale_after_seconds,
+            renew_token,
+        ) {
+            tx.commit().map_err(|err| {
+                format!("Failed to commit existing wake claim transaction: {err}")
+            })?;
+            return Ok(WakeClaimAcquireResult::AlreadyInFlight(existing));
         }
-        tx.execute(
-            "INSERT INTO session_wake_claim (
-                session_id,
-                claim_token,
-                claimed_at,
-                wake_pid,
-                wake_invocation_uuid,
-                reason,
-                auto_wake_count,
-                min_pending_seq_at_claim,
-                max_pending_seq_at_claim
-             ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8)
-             ON CONFLICT(session_id)
-             DO UPDATE SET
-                claim_token = excluded.claim_token,
-                claimed_at = excluded.claimed_at,
-                wake_pid = excluded.wake_pid,
-                wake_invocation_uuid = excluded.wake_invocation_uuid,
-                reason = excluded.reason,
-                auto_wake_count = excluded.auto_wake_count,
-                min_pending_seq_at_claim = excluded.min_pending_seq_at_claim,
-                max_pending_seq_at_claim = excluded.max_pending_seq_at_claim",
-            params![
-                input.session_id,
-                input.claim_token,
-                &now,
-                input.wake_invocation_uuid,
-                input.reason,
-                input.auto_wake_count,
-                min_seq,
-                max_seq,
-            ],
-        )
-        .map_err(|err| format!("Failed to acquire wake claim: {err}"))?;
-        let claim = wake_claim_tx(&tx, input.session_id)?
-            .ok_or_else(|| "Wake claim missing immediately after acquisition".to_string())?;
+        let claim = acquire_wake_claim_tx(&tx, input, &now, min_seq, max_seq)?;
         tx.commit()
             .map_err(|err| format!("Failed to commit wake claim transaction: {err}"))?;
         Ok(WakeClaimAcquireResult::Acquired(claim))
@@ -602,14 +470,10 @@ impl MailboxDb {
         let Some(claim) = self.wake_claim(session_id)? else {
             return Ok(false);
         };
-        if claim.claim_token != claim_token {
+        if !wake_claim_matches_child(&claim, claim_token) {
             return Ok(false);
         }
-        if self.session_liveness(session_id)? == SessionLiveness::Busy {
-            self.release_wake_claim(session_id, Some(claim_token))?;
-            return Ok(false);
-        }
-        Ok(true)
+        self.release_busy_child_wake_claim(session_id, claim_token)
     }
 
     #[cfg(test)]
@@ -673,6 +537,38 @@ impl MailboxDb {
             .map_err(|err| format!("Failed to read mailbox max seq: {err}"))
     }
 
+    fn running_turn_start_max_mailbox_seq(
+        &self,
+        input: &SessionRuntimeRunningUpdate<'_>,
+    ) -> Result<Option<i64>, String> {
+        let Some(seq) = input.turn_start_max_mailbox_seq else {
+            return self.max_mailbox_seq(input.session_id);
+        };
+        Ok(Some(seq))
+    }
+
+    fn session_has_pending_mailbox(&self, session_id: &str) -> Result<bool, String> {
+        self.list_pending(session_id)
+            .map(|pending| !pending.is_empty())
+    }
+
+    fn session_is_busy(&mut self, session_id: &str) -> Result<bool, String> {
+        self.session_liveness(session_id)
+            .map(|liveness| liveness == SessionLiveness::Busy)
+    }
+
+    fn release_busy_child_wake_claim(
+        &mut self,
+        session_id: &str,
+        claim_token: &str,
+    ) -> Result<bool, String> {
+        if self.session_is_busy(session_id)? {
+            self.release_wake_claim(session_id, Some(claim_token))?;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     fn clear_stale_running_row(
         &mut self,
         session_id: &str,
@@ -705,55 +601,269 @@ fn enqueue_agent_bash_complete_in_tx(
     input: &AgentBashCompleteEnqueue<'_>,
     now: &str,
 ) -> Result<EnqueueResult, String> {
-    let changed = tx
-        .execute(
-            "INSERT OR IGNORE INTO mailbox (
-                session_id,
-                kind,
-                handle,
-                payload_json,
-                enqueued_at,
-                owner_invocation_uuid,
-                matched_os_pid,
-                matched_os_boot_id,
-                matched_os_pid_starttime_ticks,
-                matched_chain_index,
-                state_dir,
-                meta_path,
-                log_path,
-                rc_path,
-                rc
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-            params![
-                input.session_id,
-                AGENT_BASH_COMPLETE_KIND,
-                input.handle,
-                input.payload_json,
-                now,
-                input.owner_invocation_uuid,
-                input.matched_os_pid,
-                input.matched_os_boot_id,
-                input.matched_os_pid_starttime_ticks,
-                input.matched_chain_index,
-                input.state_dir,
-                input.meta_path,
-                input.log_path,
-                input.rc_path,
-                input.rc,
-            ],
-        )
-        .map_err(|err| format!("Failed to insert mailbox row: {err}"))?;
-
+    let changed = insert_agent_bash_complete_tx(tx, input, now)?;
     let row = query_mailbox_by_kind_handle_tx(tx, AGENT_BASH_COMPLETE_KIND, input.handle)?
         .ok_or_else(|| "Mailbox row missing after enqueue conflict check".to_string())?;
+    Ok(agent_bash_enqueue_result(changed, row, input))
+}
+
+fn insert_agent_bash_complete_tx(
+    tx: &rusqlite::Transaction<'_>,
+    input: &AgentBashCompleteEnqueue<'_>,
+    now: &str,
+) -> Result<usize, String> {
+    tx.execute(
+        "INSERT OR IGNORE INTO mailbox (
+            session_id,
+            kind,
+            handle,
+            payload_json,
+            enqueued_at,
+            owner_invocation_uuid,
+            matched_os_pid,
+            matched_os_boot_id,
+            matched_os_pid_starttime_ticks,
+            matched_chain_index,
+            state_dir,
+            meta_path,
+            log_path,
+            rc_path,
+            rc
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        params![
+            input.session_id,
+            AGENT_BASH_COMPLETE_KIND,
+            input.handle,
+            input.payload_json,
+            now,
+            input.owner_invocation_uuid,
+            input.matched_os_pid,
+            input.matched_os_boot_id,
+            input.matched_os_pid_starttime_ticks,
+            input.matched_chain_index,
+            input.state_dir,
+            input.meta_path,
+            input.log_path,
+            input.rc_path,
+            input.rc,
+        ],
+    )
+    .map_err(|err| format!("Failed to insert mailbox row: {err}"))
+}
+
+fn agent_bash_enqueue_result(
+    changed: usize,
+    row: MailboxRow,
+    input: &AgentBashCompleteEnqueue<'_>,
+) -> EnqueueResult {
     if changed > 0 {
-        return Ok(EnqueueResult::Inserted(row));
+        return EnqueueResult::Inserted(row);
     }
     if row.session_id == input.session_id {
-        Ok(EnqueueResult::AlreadyEnqueued(row))
+        EnqueueResult::AlreadyEnqueued(row)
     } else {
-        Ok(EnqueueResult::Conflict { existing: row })
+        EnqueueResult::Conflict { existing: row }
     }
+}
+
+fn mark_session_running_row(
+    conn: &Connection,
+    input: SessionRuntimeRunningUpdate<'_>,
+    now: &str,
+    turn_start_max_mailbox_seq: Option<i64>,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO session_runtime (
+            session_id,
+            mode,
+            invocation_uuid,
+            provider_name,
+            model_name,
+            pty_control_path,
+            updated_at,
+            run_state,
+            running_invocation_uuid,
+            running_os_pid,
+            running_os_boot_id,
+            running_os_pid_starttime_ticks,
+            turn_started_at,
+            turn_ended_at,
+            turn_start_max_mailbox_seq,
+            last_exit_code,
+            models_dir,
+            effective_cwd
+         ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, 'running', ?3, ?7, ?8, ?9, ?6, NULL, ?10, NULL, ?11, ?12)
+         ON CONFLICT(session_id)
+         DO UPDATE SET
+            mode = excluded.mode,
+            invocation_uuid = excluded.invocation_uuid,
+            provider_name = excluded.provider_name,
+            model_name = excluded.model_name,
+            updated_at = excluded.updated_at,
+            run_state = 'running',
+            running_invocation_uuid = excluded.running_invocation_uuid,
+            running_os_pid = excluded.running_os_pid,
+            running_os_boot_id = excluded.running_os_boot_id,
+            running_os_pid_starttime_ticks = excluded.running_os_pid_starttime_ticks,
+            turn_started_at = excluded.turn_started_at,
+            turn_ended_at = NULL,
+            turn_start_max_mailbox_seq = excluded.turn_start_max_mailbox_seq,
+            last_exit_code = NULL,
+            models_dir = COALESCE(excluded.models_dir, session_runtime.models_dir),
+            effective_cwd = COALESCE(excluded.effective_cwd, session_runtime.effective_cwd)",
+        params![
+            input.session_id,
+            input.mode,
+            input.invocation_uuid,
+            input.provider_name,
+            input.model_name,
+            now,
+            input.identity.os_pid,
+            &input.identity.os_boot_id,
+            input.identity.os_pid_starttime_ticks,
+            turn_start_max_mailbox_seq,
+            input.models_dir,
+            input.effective_cwd,
+        ],
+    )
+    .map_err(|err| format!("Failed to mark session runtime running: {err}"))?;
+    Ok(())
+}
+
+fn mark_session_idle_row(
+    conn: &Connection,
+    input: SessionRuntimeIdleUpdate<'_>,
+    now: &str,
+) -> Result<bool, String> {
+    let changed = conn
+        .execute(
+            "UPDATE session_runtime
+             SET run_state = 'idle',
+                 updated_at = ?3,
+                 running_invocation_uuid = NULL,
+                 running_os_pid = NULL,
+                 running_os_boot_id = NULL,
+                 running_os_pid_starttime_ticks = NULL,
+                 turn_ended_at = ?3,
+                 last_exit_code = ?4
+             WHERE session_id = ?1
+               AND running_invocation_uuid = ?2",
+            params![
+                input.session_id,
+                input.invocation_uuid,
+                now,
+                input.last_exit_code,
+            ],
+        )
+        .map_err(|err| format!("Failed to mark session runtime idle: {err}"))?;
+    Ok(changed > 0)
+}
+
+fn session_runtime_row(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<SessionRuntimeRow>, String> {
+    conn.query_row(
+        "SELECT session_id, mode, invocation_uuid, provider_name, model_name,
+                pty_control_path, updated_at, run_state, running_invocation_uuid,
+                running_os_pid, running_os_boot_id, running_os_pid_starttime_ticks,
+                turn_started_at, turn_ended_at, turn_start_max_mailbox_seq,
+                last_exit_code, models_dir, effective_cwd
+         FROM session_runtime
+         WHERE session_id = ?1",
+        params![session_id],
+        map_session_runtime_row,
+    )
+    .optional()
+    .map_err(|err| format!("Failed to read session runtime row: {err}"))
+}
+
+fn validate_session_runtime_row(row: Option<&SessionRuntimeRow>) -> Result<(), String> {
+    let Some(row) = row else {
+        return Ok(());
+    };
+    validate_run_state(&row.run_state)
+}
+
+fn validate_running_run_state() -> Result<(), String> {
+    validate_run_state("running")
+}
+
+fn validate_idle_run_state() -> Result<(), String> {
+    validate_run_state("idle")
+}
+
+fn runtime_row_is_idle(row: &SessionRuntimeRow) -> bool {
+    row.run_state != "running"
+}
+
+fn live_process_identity_for_runtime(
+    recorded: &ProcessIdentity,
+) -> Result<Option<ProcessIdentity>, String> {
+    pid_identity::read_live_process_identity(recorded.os_pid)
+}
+
+fn runtime_identity_is_live(live: Option<&ProcessIdentity>, recorded: &ProcessIdentity) -> bool {
+    live.is_some_and(|live| live == recorded)
+}
+
+fn fresh_in_flight_wake_claim(
+    existing: Option<WakeClaimRow>,
+    stale_after_seconds: i64,
+    renew_token: Option<&str>,
+) -> Option<WakeClaimRow> {
+    let existing = existing?;
+    let renews_existing = renew_token == Some(existing.claim_token.as_str());
+    (!claim_is_stale(&existing, stale_after_seconds) && !renews_existing).then_some(existing)
+}
+
+fn acquire_wake_claim_tx(
+    tx: &rusqlite::Transaction<'_>,
+    input: WakeClaimRequest<'_>,
+    now: &str,
+    min_seq: i64,
+    max_seq: i64,
+) -> Result<WakeClaimRow, String> {
+    tx.execute(
+        "INSERT INTO session_wake_claim (
+            session_id,
+            claim_token,
+            claimed_at,
+            wake_pid,
+            wake_invocation_uuid,
+            reason,
+            auto_wake_count,
+            min_pending_seq_at_claim,
+            max_pending_seq_at_claim
+         ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(session_id)
+         DO UPDATE SET
+            claim_token = excluded.claim_token,
+            claimed_at = excluded.claimed_at,
+            wake_pid = excluded.wake_pid,
+            wake_invocation_uuid = excluded.wake_invocation_uuid,
+            reason = excluded.reason,
+            auto_wake_count = excluded.auto_wake_count,
+            min_pending_seq_at_claim = excluded.min_pending_seq_at_claim,
+            max_pending_seq_at_claim = excluded.max_pending_seq_at_claim",
+        params![
+            input.session_id,
+            input.claim_token,
+            now,
+            input.wake_invocation_uuid,
+            input.reason,
+            input.auto_wake_count,
+            min_seq,
+            max_seq,
+        ],
+    )
+    .map_err(|err| format!("Failed to acquire wake claim: {err}"))?;
+    wake_claim_tx(tx, input.session_id)?
+        .ok_or_else(|| "Wake claim missing immediately after acquisition".to_string())
+}
+
+fn wake_claim_matches_child(claim: &WakeClaimRow, claim_token: &str) -> bool {
+    claim.claim_token == claim_token
 }
 
 fn query_mailbox_by_kind_handle_tx(
@@ -860,7 +970,14 @@ fn ensure_mailbox_schema(conn: &Connection) -> Result<(), String> {
 
 fn ensure_session_runtime_columns(conn: &Connection) -> Result<(), String> {
     let columns = table_columns(conn, "session_runtime")?;
-    let additions = [
+    for (name, definition) in missing_session_runtime_columns(&columns) {
+        add_session_runtime_column(conn, name, definition)?;
+    }
+    Ok(())
+}
+
+fn session_runtime_column_additions() -> [(&'static str, &'static str); 11] {
+    [
         ("run_state", "TEXT NOT NULL DEFAULT 'idle'"),
         ("running_invocation_uuid", "TEXT"),
         ("running_os_pid", "INTEGER"),
@@ -872,17 +989,27 @@ fn ensure_session_runtime_columns(conn: &Connection) -> Result<(), String> {
         ("last_exit_code", "INTEGER"),
         ("models_dir", "TEXT"),
         ("effective_cwd", "TEXT"),
-    ];
-    for (name, definition) in additions {
-        if columns.iter().any(|column| column == name) {
-            continue;
-        }
-        conn.execute_batch(&format!(
-            "ALTER TABLE session_runtime ADD COLUMN {name} {definition};"
-        ))
-        .map_err(|err| format!("Failed to add session_runtime.{name}: {err}"))?;
-    }
-    Ok(())
+    ]
+}
+
+fn missing_session_runtime_columns(columns: &[String]) -> Vec<(&'static str, &'static str)> {
+    session_runtime_column_additions()
+        .into_iter()
+        .filter(|(name, _)| !columns.iter().any(|column| column == name))
+        .collect()
+}
+
+fn add_session_runtime_column(
+    conn: &Connection,
+    name: &str,
+    definition: &str,
+) -> Result<(), String> {
+    conn.execute_batch(&session_runtime_add_column_sql(name, definition))
+        .map_err(|err| format!("Failed to add session_runtime.{name}: {err}"))
+}
+
+fn session_runtime_add_column_sql(name: &str, definition: &str) -> String {
+    format!("ALTER TABLE session_runtime ADD COLUMN {name} {definition};")
 }
 
 fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>, String> {
@@ -959,10 +1086,20 @@ fn wake_claim_tx(
 }
 
 fn claim_is_stale(claim: &WakeClaimRow, stale_after_seconds: i64) -> bool {
-    let Ok(claimed_at) = DateTime::parse_from_rfc3339(&claim.claimed_at) else {
+    let Some(claimed_at) = parse_claimed_at(&claim.claimed_at) else {
         return true;
     };
-    let age = Utc::now().signed_duration_since(claimed_at.with_timezone(&Utc));
+    claim_age_exceeds_stale_after(claimed_at, stale_after_seconds)
+}
+
+fn parse_claimed_at(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|value| value.with_timezone(&Utc))
+}
+
+fn claim_age_exceeds_stale_after(claimed_at: DateTime<Utc>, stale_after_seconds: i64) -> bool {
+    let age = Utc::now().signed_duration_since(claimed_at);
     age > Duration::seconds(stale_after_seconds)
 }
 

@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! Roles: orchestration, mapper.
+//! Roles: formatter, mapper, orchestration, parser.
 //!
 //! - orchestration: records verified child process identity in the independent
 //!   PID sidecar after successful provider spawns.
@@ -60,23 +60,34 @@ pub(super) fn record_child_identity(child_id: u32, context: Option<&SpawnIdentit
     let Some(context) = context else {
         return;
     };
-    match pid_identity::record_live_process_identity(LiveProcessIdentityRecord {
+    match pid_identity::record_live_process_identity(live_process_identity_record(
+        child_id, context,
+    )) {
+        Ok(Some(row)) => mark_session_running(context, &row.identity()),
+        Ok(None) => {}
+        Err(err) => warn_child_identity_record_failed(context, child_id, &err),
+    }
+}
+
+fn live_process_identity_record<'a>(
+    child_id: u32,
+    context: &'a SpawnIdentityContext,
+) -> LiveProcessIdentityRecord<'a> {
+    LiveProcessIdentityRecord {
         os_pid: i64::from(child_id),
         invocation_uuid: &context.invocation_uuid,
         session_id: context.session_id.as_deref(),
         provider_name: Some(&context.provider_name),
         model_name: context.model_name.as_deref(),
-    }) {
-        Ok(Some(row)) => mark_session_running(context, &row.identity()),
-        Ok(None) => {}
-        Err(err) => {
-            tracing::warn!(
-                invocation_uuid = %context.invocation_uuid,
-                child_pid = child_id,
-                "Failed to record PID identity sidecar row: {err}"
-            );
-        }
     }
+}
+
+fn warn_child_identity_record_failed(context: &SpawnIdentityContext, child_id: u32, err: &str) {
+    tracing::warn!(
+        invocation_uuid = %context.invocation_uuid,
+        child_pid = child_id,
+        "Failed to record PID identity sidecar row: {err}"
+    );
 }
 
 fn mark_session_running(
@@ -87,27 +98,39 @@ fn mark_session_running(
         return;
     };
     match MailboxDb::open_default().and_then(|mut db| {
-        db.mark_session_running(SessionRuntimeRunningUpdate {
-            session_id,
-            mode: context.mode.as_str(),
-            invocation_uuid: &context.invocation_uuid,
-            provider_name: Some(&context.provider_name),
-            model_name: context.model_name.as_deref(),
-            identity,
-            turn_start_max_mailbox_seq: None,
-            models_dir: None,
-            effective_cwd: context.effective_cwd.as_deref(),
-        })
+        db.mark_session_running(session_runtime_running_update(
+            context, session_id, identity,
+        ))
     }) {
         Ok(()) => {}
-        Err(err) => {
-            tracing::warn!(
-                invocation_uuid = %context.invocation_uuid,
-                session_id,
-                "Failed to mark session runtime running: {err}"
-            );
-        }
+        Err(err) => warn_mark_session_running_failed(context, session_id, &err),
     }
+}
+
+fn session_runtime_running_update<'a>(
+    context: &'a SpawnIdentityContext,
+    session_id: &'a str,
+    identity: &'a oulipoly_state::pid_identity::ProcessIdentity,
+) -> SessionRuntimeRunningUpdate<'a> {
+    SessionRuntimeRunningUpdate {
+        session_id,
+        mode: context.mode.as_str(),
+        invocation_uuid: &context.invocation_uuid,
+        provider_name: Some(&context.provider_name),
+        model_name: context.model_name.as_deref(),
+        identity,
+        turn_start_max_mailbox_seq: None,
+        models_dir: None,
+        effective_cwd: context.effective_cwd.as_deref(),
+    }
+}
+
+fn warn_mark_session_running_failed(context: &SpawnIdentityContext, session_id: &str, err: &str) {
+    tracing::warn!(
+        invocation_uuid = %context.invocation_uuid,
+        session_id,
+        "Failed to mark session runtime running: {err}"
+    );
 }
 
 fn parse_invocation_env_silent(value: &str) -> Option<CompositeInvocationId> {

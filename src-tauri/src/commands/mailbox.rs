@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! `orchestration`, `formatter`, `accessor`
+//! `accessor`, `formatter`, `mapper`, `orchestration`
 
 use oulipoly_state::mailbox::{MailboxDb, MailboxRow};
 use serde::Serialize;
@@ -14,16 +14,34 @@ struct MailboxListResponse {
 
 pub(crate) fn run_list(session_id: &str, all: bool, json: bool) -> Result<i32, String> {
     let rows = list_rows(session_id, all)?;
+    render_mailbox_list(session_id, all, rows, json)?;
+    Ok(0)
+}
+
+fn render_mailbox_list(
+    session_id: &str,
+    all: bool,
+    rows: Vec<MailboxRow>,
+    json: bool,
+) -> Result<(), String> {
     if json {
-        print_json(&MailboxListResponse {
-            session_id: session_id.to_string(),
-            all,
-            rows,
-        })?;
+        print_json(&mailbox_list_response(session_id, all, rows))?;
     } else {
         print_human_rows(&rows);
     }
-    Ok(0)
+    Ok(())
+}
+
+fn mailbox_list_response(
+    session_id: &str,
+    all: bool,
+    rows: Vec<MailboxRow>,
+) -> MailboxListResponse {
+    MailboxListResponse {
+        session_id: session_id.to_string(),
+        all,
+        rows,
+    }
 }
 
 fn list_rows(session_id: &str, all: bool) -> Result<Vec<MailboxRow>, String> {

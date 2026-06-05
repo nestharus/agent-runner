@@ -1,6 +1,7 @@
 //! ## Declared roles
 //!
-//! `orchestration`, `parser`, `validator`, `accessor`, `formatter`, `mapper`
+//! `accessor`, `filter`, `formatter`, `mapper`, `orchestration`, `parser`,
+//! `validator`
 
 use oulipoly_state::mailbox::{AgentBashCompleteEnqueue, EnqueueResult, MailboxDb, MailboxRow};
 use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRow, ProcessIdentity};
@@ -69,23 +70,50 @@ pub(crate) struct AgentBashCompleteArgs<'a> {
 pub(crate) fn run_agent_bash_complete(args: AgentBashCompleteArgs<'_>) -> Result<i32, String> {
     match run_agent_bash_complete_inner(&args) {
         Ok(outcome) => render_notify_success(&args, outcome),
-        Err(NotifyError::MalformedMetadata(message)) => {
-            render_notify_error(&args, 64, "malformed_metadata", Some(message), None)
-        }
-        Err(NotifyError::Storage(message)) => {
-            render_notify_error(&args, 74, "storage_error", Some(message), None)
-        }
-        Err(NotifyError::Conflict { existing }) => {
-            let message = format!("existing handle belongs to session {}", existing.session_id);
-            render_notify_error(
-                &args,
-                73,
-                "idempotency_conflict",
-                Some(message),
-                Some(&existing),
-            )
-        }
+        Err(error) => render_mapped_notify_error(&args, error),
     }
+}
+
+fn render_mapped_notify_error(
+    args: &AgentBashCompleteArgs<'_>,
+    error: NotifyError,
+) -> Result<i32, String> {
+    let render = notify_error_render(error);
+    render_notify_error(args, render)
+}
+
+struct NotifyErrorRender {
+    exit_code: i32,
+    status: &'static str,
+    message: Option<String>,
+    existing: Option<Box<MailboxRow>>,
+}
+
+fn notify_error_render(error: NotifyError) -> NotifyErrorRender {
+    match error {
+        NotifyError::MalformedMetadata(message) => NotifyErrorRender {
+            exit_code: 64,
+            status: "malformed_metadata",
+            message: Some(message),
+            existing: None,
+        },
+        NotifyError::Storage(message) => NotifyErrorRender {
+            exit_code: 74,
+            status: "storage_error",
+            message: Some(message),
+            existing: None,
+        },
+        NotifyError::Conflict { existing } => NotifyErrorRender {
+            exit_code: 73,
+            status: "idempotency_conflict",
+            message: Some(conflict_message(&existing)),
+            existing: Some(existing),
+        },
+    }
+}
+
+fn conflict_message(existing: &MailboxRow) -> String {
+    format!("existing handle belongs to session {}", existing.session_id)
 }
 
 enum NotifyOutcome {
@@ -111,28 +139,39 @@ enum NotifyError {
 fn run_agent_bash_complete_inner(
     args: &AgentBashCompleteArgs<'_>,
 ) -> Result<NotifyOutcome, NotifyError> {
+    let input = parse_notify_input(args)?;
+    let Some(owner) = resolve_owner(&input.caller_chain)? else {
+        return Ok(NotifyOutcome::NoOwner);
+    };
+    enqueue_owner_notification(args, &input.metadata, input.rc, owner)
+}
+
+struct NotifyInput {
+    metadata: Value,
+    caller_chain: Vec<CallerIdentity>,
+    rc: i32,
+}
+
+fn parse_notify_input(args: &AgentBashCompleteArgs<'_>) -> Result<NotifyInput, NotifyError> {
     let metadata = read_metadata(args.meta)?;
     let caller_chain = parse_caller_chain(&metadata)?;
     let rc = read_rc(args.rc)?;
-    let Some(owner) = resolve_owner(&caller_chain)? else {
-        return Ok(NotifyOutcome::NoOwner);
-    };
-    let payload_json = payload_json(&metadata, args, rc, &owner)?;
-    let enqueue = AgentBashCompleteEnqueue {
-        session_id: &owner.session_id,
-        handle: args.handle,
-        payload_json: &payload_json,
-        owner_invocation_uuid: Some(&owner.invocation_uuid),
-        matched_os_pid: Some(owner.matched_identity.os_pid),
-        matched_os_boot_id: Some(&owner.matched_identity.os_boot_id),
-        matched_os_pid_starttime_ticks: Some(owner.matched_identity.os_pid_starttime_ticks),
-        matched_chain_index: Some(owner.matched_chain_index as i64),
-        state_dir: &path_string(args.state_dir),
-        meta_path: &path_string(args.meta),
-        log_path: &path_string(args.log),
-        rc_path: &path_string(args.rc),
+    Ok(NotifyInput {
+        metadata,
+        caller_chain,
         rc,
-    };
+    })
+}
+
+fn enqueue_owner_notification(
+    args: &AgentBashCompleteArgs<'_>,
+    metadata: &Value,
+    rc: i32,
+    owner: ResolvedOwner,
+) -> Result<NotifyOutcome, NotifyError> {
+    let payload_json = payload_json(metadata, args, rc, &owner)?;
+    let paths = notify_path_strings(args);
+    let enqueue = agent_bash_complete_enqueue(args, &payload_json, rc, &owner, &paths);
     let mut mailbox = MailboxDb::open_default().map_err(NotifyError::Storage)?;
     match mailbox
         .enqueue_agent_bash_complete(&enqueue)
@@ -152,25 +191,85 @@ fn run_agent_bash_complete_inner(
     }
 }
 
+fn agent_bash_complete_enqueue<'a>(
+    args: &'a AgentBashCompleteArgs<'_>,
+    payload_json: &'a str,
+    rc: i32,
+    owner: &'a ResolvedOwner,
+    paths: &'a NotifyPathStrings,
+) -> AgentBashCompleteEnqueue<'a> {
+    AgentBashCompleteEnqueue {
+        session_id: &owner.session_id,
+        handle: args.handle,
+        payload_json,
+        owner_invocation_uuid: Some(&owner.invocation_uuid),
+        matched_os_pid: Some(owner.matched_identity.os_pid),
+        matched_os_boot_id: Some(&owner.matched_identity.os_boot_id),
+        matched_os_pid_starttime_ticks: Some(owner.matched_identity.os_pid_starttime_ticks),
+        matched_chain_index: Some(owner.matched_chain_index as i64),
+        state_dir: &paths.state_dir,
+        meta_path: &paths.meta_path,
+        log_path: &paths.log_path,
+        rc_path: &paths.rc_path,
+        rc,
+    }
+}
+
+struct NotifyPathStrings {
+    state_dir: String,
+    meta_path: String,
+    log_path: String,
+    rc_path: String,
+}
+
+fn notify_path_strings(args: &AgentBashCompleteArgs<'_>) -> NotifyPathStrings {
+    NotifyPathStrings {
+        state_dir: path_string(args.state_dir),
+        meta_path: path_string(args.meta),
+        log_path: path_string(args.log),
+        rc_path: path_string(args.rc),
+    }
+}
+
 fn read_metadata(path: &Path) -> Result<Value, NotifyError> {
-    let raw = std::fs::read_to_string(path).map_err(|err| {
-        NotifyError::MalformedMetadata(format!("failed to read meta.json: {err}"))
-    })?;
-    serde_json::from_str(&raw)
+    parse_metadata_json(&read_metadata_raw(path)?)
+}
+
+fn read_metadata_raw(path: &Path) -> Result<String, NotifyError> {
+    std::fs::read_to_string(path)
+        .map_err(|err| NotifyError::MalformedMetadata(format!("failed to read meta.json: {err}")))
+}
+
+fn parse_metadata_json(raw: &str) -> Result<Value, NotifyError> {
+    serde_json::from_str(raw)
         .map_err(|err| NotifyError::MalformedMetadata(format!("failed to parse meta.json: {err}")))
 }
 
 fn parse_caller_chain(metadata: &Value) -> Result<Vec<CallerIdentity>, NotifyError> {
-    let Some(chain) = metadata.get("caller_chain").and_then(Value::as_array) else {
-        return Err(NotifyError::MalformedMetadata(
-            "meta.json must contain caller_chain array".to_string(),
-        ));
-    };
-    if chain.is_empty() {
-        return Err(NotifyError::MalformedMetadata(
-            "meta.json caller_chain must not be empty".to_string(),
-        ));
+    let chain = caller_chain_array(metadata)?;
+    validate_non_empty_caller_chain(chain)?;
+    parse_caller_identities(chain)
+}
+
+fn caller_chain_array(metadata: &Value) -> Result<&Vec<Value>, NotifyError> {
+    metadata
+        .get("caller_chain")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            NotifyError::MalformedMetadata("meta.json must contain caller_chain array".to_string())
+        })
+}
+
+fn validate_non_empty_caller_chain(chain: &[Value]) -> Result<(), NotifyError> {
+    if !chain.is_empty() {
+        return Ok(());
     }
+    Err(NotifyError::MalformedMetadata(
+        "meta.json caller_chain must not be empty".to_string(),
+    ))
+}
+
+fn parse_caller_identities(chain: &[Value]) -> Result<Vec<CallerIdentity>, NotifyError> {
     chain
         .iter()
         .enumerate()
@@ -181,37 +280,73 @@ fn parse_caller_chain(metadata: &Value) -> Result<Vec<CallerIdentity>, NotifyErr
 fn parse_caller_identity(
     (chain_index, value): (usize, &Value),
 ) -> Result<CallerIdentity, NotifyError> {
-    let pid = integer_field(value, &["pid", "os_pid"])?;
-    let starttime_ticks = integer_field(value, &["starttime_ticks", "os_pid_starttime_ticks"])?;
-    let boot_id = string_field(value, &["boot_id", "os_boot_id"])?;
-    Ok(CallerIdentity {
-        chain_index,
-        identity: ProcessIdentity {
-            os_pid: pid,
-            os_boot_id: boot_id,
-            os_pid_starttime_ticks: starttime_ticks,
-        },
+    let fields = parse_caller_identity_fields(value)?;
+    Ok(caller_identity(chain_index, fields))
+}
+
+struct CallerIdentityFields {
+    pid: i64,
+    starttime_ticks: i64,
+    boot_id: String,
+}
+
+fn parse_caller_identity_fields(value: &Value) -> Result<CallerIdentityFields, NotifyError> {
+    Ok(CallerIdentityFields {
+        pid: integer_field(value, &["pid", "os_pid"])?,
+        starttime_ticks: integer_field(value, &["starttime_ticks", "os_pid_starttime_ticks"])?,
+        boot_id: string_field(value, &["boot_id", "os_boot_id"])?,
     })
 }
 
+fn caller_identity(chain_index: usize, fields: CallerIdentityFields) -> CallerIdentity {
+    CallerIdentity {
+        chain_index,
+        identity: ProcessIdentity {
+            os_pid: fields.pid,
+            os_boot_id: fields.boot_id,
+            os_pid_starttime_ticks: fields.starttime_ticks,
+        },
+    }
+}
+
 fn integer_field(value: &Value, names: &[&str]) -> Result<i64, NotifyError> {
+    require_integer_field(find_integer_field(value, names), names)
+}
+
+fn find_integer_field(value: &Value, names: &[&str]) -> Option<i64> {
     names
         .iter()
         .find_map(|name| value.get(*name).and_then(Value::as_i64))
-        .ok_or_else(|| {
-            NotifyError::MalformedMetadata(format!("caller_chain entry missing integer {names:?}"))
-        })
+}
+
+fn require_integer_field(value: Option<i64>, names: &[&str]) -> Result<i64, NotifyError> {
+    value.ok_or_else(|| {
+        NotifyError::MalformedMetadata(format!("caller_chain entry missing integer {names:?}"))
+    })
 }
 
 fn string_field(value: &Value, names: &[&str]) -> Result<String, NotifyError> {
+    let value = require_string_field(find_string_field(value, names), names)?;
+    Ok(owned_string(value))
+}
+
+fn find_string_field<'a>(value: &'a Value, names: &[&str]) -> Option<&'a str> {
     names
         .iter()
         .find_map(|name| value.get(*name).and_then(Value::as_str))
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .ok_or_else(|| {
-            NotifyError::MalformedMetadata(format!("caller_chain entry missing string {names:?}"))
-        })
+}
+
+fn require_string_field<'a>(
+    value: Option<&'a str>,
+    names: &[&str],
+) -> Result<&'a str, NotifyError> {
+    value.filter(|value| !value.is_empty()).ok_or_else(|| {
+        NotifyError::MalformedMetadata(format!("caller_chain entry missing string {names:?}"))
+    })
+}
+
+fn owned_string(value: &str) -> String {
+    value.to_string()
 }
 
 fn read_rc(path: &Path) -> Result<i32, NotifyError> {
@@ -226,31 +361,60 @@ fn resolve_owner(chain: &[CallerIdentity]) -> Result<Option<ResolvedOwner>, Noti
     let Some(sidecar) = open_sidecar_read_only_optional().map_err(NotifyError::Storage)? else {
         return Ok(None);
     };
+    nearest_resolved_owner(&sidecar, chain)
+}
+
+fn nearest_resolved_owner(
+    sidecar: &PidIdentityDb,
+    chain: &[CallerIdentity],
+) -> Result<Option<ResolvedOwner>, NotifyError> {
     for entry in chain {
-        let Some(row) = sidecar
-            .lookup_by_identity(&entry.identity)
-            .map_err(NotifyError::Storage)?
-        else {
-            continue;
-        };
-        if let Some(session_id) = row.session_id.clone() {
-            return Ok(Some(resolved_owner(
-                entry,
-                &row,
-                session_id,
-                OwnerSessionSource::SidecarSessionId,
-            )));
-        }
-        if let Some(session_id) = resolve_state_invocation_session(&row)? {
-            return Ok(Some(resolved_owner(
-                entry,
-                &row,
-                session_id,
-                OwnerSessionSource::StateDbInvocationJoin,
-            )));
+        if let Some(owner) = resolve_owner_for_chain_entry(sidecar, entry)? {
+            return Ok(Some(owner));
         }
     }
     Ok(None)
+}
+
+fn resolve_owner_for_chain_entry(
+    sidecar: &PidIdentityDb,
+    entry: &CallerIdentity,
+) -> Result<Option<ResolvedOwner>, NotifyError> {
+    let Some(row) = lookup_chain_entry_pid_row(sidecar, entry)? else {
+        return Ok(None);
+    };
+    owner_from_pid_row(entry, &row)
+}
+
+fn lookup_chain_entry_pid_row(
+    sidecar: &PidIdentityDb,
+    entry: &CallerIdentity,
+) -> Result<Option<PidIdentityRow>, NotifyError> {
+    sidecar
+        .lookup_by_identity(&entry.identity)
+        .map_err(NotifyError::Storage)
+}
+
+fn owner_from_pid_row(
+    entry: &CallerIdentity,
+    row: &PidIdentityRow,
+) -> Result<Option<ResolvedOwner>, NotifyError> {
+    if let Some(session_id) = row.session_id.clone() {
+        return Ok(Some(resolved_owner(
+            entry,
+            row,
+            session_id,
+            OwnerSessionSource::SidecarSessionId,
+        )));
+    }
+    Ok(resolve_state_invocation_session(row)?.map(|session_id| {
+        resolved_owner(
+            entry,
+            row,
+            session_id,
+            OwnerSessionSource::StateDbInvocationJoin,
+        )
+    }))
 }
 
 fn resolved_owner(
@@ -309,7 +473,16 @@ fn payload_json(
     rc: i32,
     owner: &ResolvedOwner,
 ) -> Result<String, NotifyError> {
-    let payload = serde_json::json!({
+    render_payload_json(&payload_value(metadata, args, rc, owner))
+}
+
+fn payload_value(
+    metadata: &Value,
+    args: &AgentBashCompleteArgs<'_>,
+    rc: i32,
+    owner: &ResolvedOwner,
+) -> Value {
+    serde_json::json!({
         "schema_version": 1,
         "kind": "agent_bash_complete",
         "handle": args.handle,
@@ -325,8 +498,11 @@ fn payload_json(
         },
         "caller_chain": metadata.get("caller_chain").cloned().unwrap_or(Value::Null),
         "meta": metadata,
-    });
-    serde_json::to_string(&payload)
+    })
+}
+
+fn render_payload_json(payload: &Value) -> Result<String, NotifyError> {
+    serde_json::to_string(payload)
         .map_err(|err| NotifyError::Storage(format!("failed to serialize payload JSON: {err}")))
 }
 
@@ -334,68 +510,87 @@ fn render_notify_success(
     args: &AgentBashCompleteArgs<'_>,
     outcome: NotifyOutcome,
 ) -> Result<i32, String> {
+    let response = notify_success_response(args, outcome);
+    render_response(&response, args.json)?;
+    Ok(0)
+}
+
+fn notify_success_response(
+    args: &AgentBashCompleteArgs<'_>,
+    outcome: NotifyOutcome,
+) -> NotifyResponse {
     match outcome {
-        NotifyOutcome::Enqueued { owner, row, wake } => {
-            let response = notify_response(
-                args,
-                "enqueued",
-                true,
-                Some(&owner),
-                Some(row.seq),
-                Some(wake),
-            );
-            render_response(&response, args.json)?;
-            Ok(0)
-        }
-        NotifyOutcome::AlreadyEnqueued { owner, row, wake } => {
-            let response = notify_response(
-                args,
-                "already_enqueued",
-                true,
-                Some(&owner),
-                Some(row.seq),
-                Some(wake),
-            );
-            render_response(&response, args.json)?;
-            Ok(0)
-        }
-        NotifyOutcome::NoOwner => {
-            let response = notify_response(args, "no_owner", false, None, None, None);
-            render_response(&response, args.json)?;
-            Ok(0)
-        }
+        NotifyOutcome::Enqueued { owner, row, wake } => notify_response(
+            args,
+            "enqueued",
+            true,
+            Some(&owner),
+            Some(row.seq),
+            Some(wake),
+        ),
+        NotifyOutcome::AlreadyEnqueued { owner, row, wake } => notify_response(
+            args,
+            "already_enqueued",
+            true,
+            Some(&owner),
+            Some(row.seq),
+            Some(wake),
+        ),
+        NotifyOutcome::NoOwner => notify_response(args, "no_owner", false, None, None, None),
     }
 }
 
 fn render_notify_error(
     args: &AgentBashCompleteArgs<'_>,
-    exit_code: i32,
-    status: &str,
-    message: Option<String>,
-    existing: Option<&MailboxRow>,
+    render: NotifyErrorRender,
 ) -> Result<i32, String> {
     if args.json {
-        let mut value =
-            serde_json::to_value(notify_response(args, status, false, None, None, None))
-                .map_err(|err| format!("Failed to serialize notify response JSON: {err}"))?;
-        if let Some(message) = message {
-            value["message"] = Value::String(message);
-        }
-        if let Some(existing) = existing {
-            value["existing"] = serde_json::to_value(existing)
-                .map_err(|err| format!("Failed to serialize notify existing row JSON: {err}"))?;
-        }
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&value)
-                .map_err(|err| format!("Failed to render notify JSON: {err}"))?
-        );
-    } else if let Some(message) = message {
-        eprintln!("{status}: {message}");
+        render_notify_error_json(args, &render)?;
+    } else if let Some(message) = &render.message {
+        eprintln!("{}: {message}", render.status);
     } else {
-        eprintln!("{status}");
+        eprintln!("{}", render.status);
     }
-    Ok(exit_code)
+    Ok(render.exit_code)
+}
+
+fn render_notify_error_json(
+    args: &AgentBashCompleteArgs<'_>,
+    render: &NotifyErrorRender,
+) -> Result<(), String> {
+    println!(
+        "{}",
+        notify_error_json(render_notify_error_value(args, render)?)?
+    );
+    Ok(())
+}
+
+fn render_notify_error_value(
+    args: &AgentBashCompleteArgs<'_>,
+    render: &NotifyErrorRender,
+) -> Result<Value, String> {
+    let mut value = serde_json::to_value(notify_response(
+        args,
+        render.status,
+        false,
+        None,
+        None,
+        None,
+    ))
+    .map_err(|err| format!("Failed to serialize notify response JSON: {err}"))?;
+    if let Some(message) = &render.message {
+        value["message"] = Value::String(message.clone());
+    }
+    if let Some(existing) = &render.existing {
+        value["existing"] = serde_json::to_value(existing)
+            .map_err(|err| format!("Failed to serialize notify existing row JSON: {err}"))?;
+    }
+    Ok(value)
+}
+
+fn notify_error_json(value: Value) -> Result<String, String> {
+    serde_json::to_string_pretty(&value)
+        .map_err(|err| format!("Failed to render notify JSON: {err}"))
 }
 
 fn notify_response(

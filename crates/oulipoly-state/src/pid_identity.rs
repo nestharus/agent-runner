@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! `accessor`, `orchestration`, `parser`, `validator`
+//! `accessor`, `formatter`, `mapper`, `orchestration`, `parser`, `validator`
 //!
 //! PID identity sidecar storage. This module owns the independent
 //! `pid-identity.db` schema and Linux `/proc` identity reads used to guard
@@ -113,43 +113,9 @@ impl PidIdentityDb {
     }
 
     pub fn record_identity(&self, record: PidIdentityRecord<'_>) -> Result<PidIdentityRow, String> {
-        self.conn
-            .execute(
-                "INSERT INTO pid_identity (
-                    os_pid,
-                    os_boot_id,
-                    os_pid_starttime_ticks,
-                    os_pgid,
-                    invocation_uuid,
-                    session_id,
-                    provider_name,
-                    model_name,
-                    recorded_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                 ON CONFLICT(os_pid, os_boot_id, os_pid_starttime_ticks)
-                 DO UPDATE SET
-                    os_pgid = excluded.os_pgid,
-                    invocation_uuid = excluded.invocation_uuid,
-                    session_id = COALESCE(excluded.session_id, pid_identity.session_id),
-                    provider_name = COALESCE(excluded.provider_name, pid_identity.provider_name),
-                    model_name = COALESCE(excluded.model_name, pid_identity.model_name),
-                    recorded_at = excluded.recorded_at",
-                params![
-                    record.identity.os_pid,
-                    &record.identity.os_boot_id,
-                    record.identity.os_pid_starttime_ticks,
-                    record.os_pgid,
-                    record.invocation_uuid,
-                    record.session_id,
-                    record.provider_name,
-                    record.model_name,
-                    record.recorded_at,
-                ],
-            )
-            .map_err(|err| format!("Failed to record PID identity: {err}"))?;
-
-        self.lookup_by_identity(record.identity)?
-            .ok_or_else(|| "Failed to reread PID identity immediately after recording".to_string())
+        upsert_pid_identity_row(&self.conn, record)?;
+        let row = self.lookup_by_identity(record.identity)?;
+        require_recorded_identity(row)
     }
 
     pub fn set_session_id(
@@ -238,18 +204,13 @@ pub fn record_live_process_identity(
     let Some(identity) = read_live_process_identity(input.os_pid)? else {
         return Ok(None);
     };
-    let os_pgid = process_group_id(input.os_pid);
-    let recorded_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let recorded_at = recorded_at_now();
     let db = PidIdentityDb::open_default()?;
-    db.record_identity(PidIdentityRecord {
-        identity: &identity,
-        os_pgid,
-        invocation_uuid: input.invocation_uuid,
-        session_id: input.session_id,
-        provider_name: input.provider_name,
-        model_name: input.model_name,
-        recorded_at: &recorded_at,
-    })
+    db.record_identity(pid_identity_record_from_live(
+        input,
+        &identity,
+        &recorded_at,
+    ))
     .map(Some)
 }
 
@@ -310,6 +271,67 @@ where
         .map_err(|err| format!("Failed to read PID identity row: {err}"))
 }
 
+fn upsert_pid_identity_row(conn: &Connection, record: PidIdentityRecord<'_>) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO pid_identity (
+            os_pid,
+            os_boot_id,
+            os_pid_starttime_ticks,
+            os_pgid,
+            invocation_uuid,
+            session_id,
+            provider_name,
+            model_name,
+            recorded_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(os_pid, os_boot_id, os_pid_starttime_ticks)
+         DO UPDATE SET
+            os_pgid = excluded.os_pgid,
+            invocation_uuid = excluded.invocation_uuid,
+            session_id = COALESCE(excluded.session_id, pid_identity.session_id),
+            provider_name = COALESCE(excluded.provider_name, pid_identity.provider_name),
+            model_name = COALESCE(excluded.model_name, pid_identity.model_name),
+            recorded_at = excluded.recorded_at",
+        params![
+            record.identity.os_pid,
+            &record.identity.os_boot_id,
+            record.identity.os_pid_starttime_ticks,
+            record.os_pgid,
+            record.invocation_uuid,
+            record.session_id,
+            record.provider_name,
+            record.model_name,
+            record.recorded_at,
+        ],
+    )
+    .map_err(|err| format!("Failed to record PID identity: {err}"))?;
+    Ok(())
+}
+
+fn require_recorded_identity(row: Option<PidIdentityRow>) -> Result<PidIdentityRow, String> {
+    row.ok_or_else(|| "Failed to reread PID identity immediately after recording".to_string())
+}
+
+fn recorded_at_now() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+fn pid_identity_record_from_live<'a>(
+    input: LiveProcessIdentityRecord<'a>,
+    identity: &'a ProcessIdentity,
+    recorded_at: &'a str,
+) -> PidIdentityRecord<'a> {
+    PidIdentityRecord {
+        identity,
+        os_pgid: process_group_id(input.os_pid),
+        invocation_uuid: input.invocation_uuid,
+        session_id: input.session_id,
+        provider_name: input.provider_name,
+        model_name: input.model_name,
+        recorded_at,
+    }
+}
+
 fn single_or_ambiguous(rows: Vec<PidIdentityRow>) -> Result<Option<PidIdentityRow>, String> {
     match rows.len() {
         0 => Ok(None),
@@ -320,7 +342,7 @@ fn single_or_ambiguous(rows: Vec<PidIdentityRow>) -> Result<Option<PidIdentityRo
 
 #[cfg(target_os = "linux")]
 fn read_live_process_identity_impl(os_pid: i64) -> Result<Option<ProcessIdentity>, String> {
-    if os_pid <= 0 {
+    if !valid_os_pid(os_pid) {
         return Ok(None);
     }
     let Some(os_pid_starttime_ticks) = read_proc_starttime_ticks(os_pid)? else {
@@ -329,11 +351,29 @@ fn read_live_process_identity_impl(os_pid: i64) -> Result<Option<ProcessIdentity
     let Some(os_boot_id) = read_boot_id()? else {
         return Ok(None);
     };
-    Ok(Some(ProcessIdentity {
+    Ok(Some(process_identity(
         os_pid,
         os_boot_id,
         os_pid_starttime_ticks,
-    }))
+    )))
+}
+
+#[cfg(target_os = "linux")]
+fn valid_os_pid(os_pid: i64) -> bool {
+    os_pid > 0
+}
+
+#[cfg(target_os = "linux")]
+fn process_identity(
+    os_pid: i64,
+    os_boot_id: String,
+    os_pid_starttime_ticks: i64,
+) -> ProcessIdentity {
+    ProcessIdentity {
+        os_pid,
+        os_boot_id,
+        os_pid_starttime_ticks,
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -343,14 +383,16 @@ fn read_live_process_identity_impl(_os_pid: i64) -> Result<Option<ProcessIdentit
 
 #[cfg(target_os = "linux")]
 fn read_proc_starttime_ticks(os_pid: i64) -> Result<Option<i64>, String> {
-    let path = PathBuf::from("/proc").join(os_pid.to_string()).join("stat");
-    let stat = match std::fs::read_to_string(&path) {
-        Ok(stat) => stat,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return Ok(None),
-        Err(err) => return Err(format!("Failed to read {}: {err}", path.display())),
+    let path = proc_stat_path(os_pid);
+    let Some(stat) = read_optional_file_to_string(&path, "proc stat")? else {
+        return Ok(None);
     };
     Ok(parse_proc_stat_starttime_ticks(&stat))
+}
+
+#[cfg(target_os = "linux")]
+fn proc_stat_path(os_pid: i64) -> PathBuf {
+    PathBuf::from("/proc").join(os_pid.to_string()).join("stat")
 }
 
 #[cfg(target_os = "linux")]
@@ -362,15 +404,40 @@ fn parse_proc_stat_starttime_ticks(stat: &str) -> Option<i64> {
 
 #[cfg(target_os = "linux")]
 fn read_boot_id() -> Result<Option<String>, String> {
-    match std::fs::read_to_string("/proc/sys/kernel/random/boot_id") {
-        Ok(value) => {
-            let trimmed = value.trim().to_string();
-            Ok((!trimmed.is_empty()).then_some(trimmed))
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => Ok(None),
-        Err(err) => Err(format!("Failed to read OS boot id: {err}")),
+    let Some(value) =
+        read_optional_file_to_string(Path::new("/proc/sys/kernel/random/boot_id"), "OS boot id")?
+    else {
+        return Ok(None);
+    };
+    Ok(non_empty_trimmed(value))
+}
+
+#[cfg(target_os = "linux")]
+fn read_optional_file_to_string(path: &Path, description: &str) -> Result<Option<String>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(value) => Ok(Some(value)),
+        Err(err) if optional_file_read_error(&err) => Ok(None),
+        Err(err) => Err(file_read_error(path, description, &err)),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn optional_file_read_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn file_read_error(path: &Path, description: &str, err: &std::io::Error) -> String {
+    format!("Failed to read {description} at {}: {err}", path.display())
+}
+
+#[cfg(target_os = "linux")]
+fn non_empty_trimmed(value: String) -> Option<String> {
+    let trimmed = value.trim().to_string();
+    (!trimmed.is_empty()).then_some(trimmed)
 }
 
 #[cfg(unix)]

@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! `orchestration`, `formatter`, `filter`, `predicate`
+//! `accessor`, `filter`, `formatter`, `mapper`, `orchestration`, `predicate`
 
 use oulipoly_state::mailbox::{MailboxDb, MailboxRow, SessionRuntimeUpsert};
 use std::path::Path;
@@ -20,31 +20,52 @@ pub(crate) fn prepare_headless_resume_delivery(
     models_dir: Option<&Path>,
 ) -> Result<PreparedMailboxDelivery, String> {
     let session_id = resolved.active_session_id.clone();
-    let Some(mut db) = MailboxDb::open_default_if_exists()? else {
-        return Ok(PreparedMailboxDelivery {
-            answer,
-            session_id,
-            seqs: Vec::new(),
-        });
+    let Some(mut db) = open_mailbox_sidecar()? else {
+        return Ok(empty_delivery(answer, session_id));
     };
     record_headless_session_runtime(&mut db, resolved, models_dir)?;
     let pending = db.list_pending(&session_id)?;
-    if pending.is_empty() {
-        return Ok(PreparedMailboxDelivery {
-            answer,
-            session_id,
-            seqs: Vec::new(),
-        });
+    if !has_pending_rows(&pending) {
+        return Ok(empty_delivery(answer, session_id));
     }
 
     let batch = select_batch(&pending);
-    let seqs = batch.rows.iter().map(|row| row.seq).collect();
+    let seqs = batch_seqs(&batch);
     let prefix = render_notification_prefix(&batch.rows, batch.remaining_count);
-    Ok(PreparedMailboxDelivery {
+    Ok(prepared_delivery(session_id, seqs, prefix, answer))
+}
+
+fn open_mailbox_sidecar() -> Result<Option<MailboxDb>, String> {
+    MailboxDb::open_default_if_exists()
+}
+
+fn empty_delivery(answer: Option<String>, session_id: String) -> PreparedMailboxDelivery {
+    PreparedMailboxDelivery {
+        answer,
+        session_id,
+        seqs: Vec::new(),
+    }
+}
+
+fn has_pending_rows(rows: &[MailboxRow]) -> bool {
+    !rows.is_empty()
+}
+
+fn batch_seqs(batch: &MailboxBatch) -> Vec<i64> {
+    batch.rows.iter().map(|row| row.seq).collect()
+}
+
+fn prepared_delivery(
+    session_id: String,
+    seqs: Vec<i64>,
+    prefix: String,
+    answer: Option<String>,
+) -> PreparedMailboxDelivery {
+    PreparedMailboxDelivery {
         answer: Some(compose_answer(prefix, answer)),
         session_id,
         seqs,
-    })
+    }
 }
 
 pub(crate) fn mark_headless_resume_delivered(
@@ -71,17 +92,29 @@ fn record_headless_session_runtime(
     resolved: &oulipoly_state::ResolvedResume,
     models_dir: Option<&Path>,
 ) -> Result<(), String> {
-    let models_dir = models_dir.map(|path| path.to_string_lossy().into_owned());
-    db.upsert_session_runtime(SessionRuntimeUpsert {
+    let models_dir = models_dir_string(models_dir);
+    let input = headless_session_runtime_upsert(resolved, models_dir.as_deref());
+    db.upsert_session_runtime(input)
+}
+
+fn headless_session_runtime_upsert<'a>(
+    resolved: &'a oulipoly_state::ResolvedResume,
+    models_dir: Option<&'a str>,
+) -> SessionRuntimeUpsert<'a> {
+    SessionRuntimeUpsert {
         session_id: &resolved.active_session_id,
         mode: "headless",
         invocation_uuid: None,
         provider_name: Some(&resolved.active_provider),
         model_name: resolved.model_name.as_deref(),
         pty_control_path: None,
-        models_dir: models_dir.as_deref(),
+        models_dir,
         effective_cwd: None,
-    })
+    }
+}
+
+fn models_dir_string(path: Option<&Path>) -> Option<String> {
+    path.map(|path| path.to_string_lossy().into_owned())
 }
 
 fn select_batch(pending: &[MailboxRow]) -> MailboxBatch {
@@ -89,9 +122,7 @@ fn select_batch(pending: &[MailboxRow]) -> MailboxBatch {
     for row in pending.iter().take(MAILBOX_BATCH_MAX_ROWS) {
         rows.push(row.clone());
         let remaining_count = pending.len().saturating_sub(rows.len());
-        if render_notification_prefix(&rows, remaining_count).len() > MAILBOX_PREFIX_MAX_BYTES
-            && rows.len() > 1
-        {
+        if batch_exceeds_prefix_limit(&rows, remaining_count) {
             rows.pop();
             break;
         }
@@ -103,6 +134,14 @@ fn select_batch(pending: &[MailboxRow]) -> MailboxBatch {
         remaining_count: pending.len().saturating_sub(rows.len()),
         rows,
     }
+}
+
+fn batch_exceeds_prefix_limit(rows: &[MailboxRow], remaining_count: usize) -> bool {
+    notification_prefix_len(rows, remaining_count) > MAILBOX_PREFIX_MAX_BYTES && rows.len() > 1
+}
+
+fn notification_prefix_len(rows: &[MailboxRow], remaining_count: usize) -> usize {
+    render_notification_prefix(rows, remaining_count).len()
 }
 
 fn render_notification_prefix(rows: &[MailboxRow], remaining_count: usize) -> String {

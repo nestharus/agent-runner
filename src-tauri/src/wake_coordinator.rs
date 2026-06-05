@@ -1,6 +1,7 @@
 //! ## Declared roles
 //!
-//! `orchestration`, `accessor`, `predicate`, `mapper`
+//! `accessor`, `formatter`, `mapper`, `orchestration`, `parser`, `predicate`,
+//! `validator`
 
 use oulipoly_state::mailbox::{
     MailboxDb, SessionRuntimeIdleUpdate, SessionRuntimeRow, WakeClaimAcquireResult,
@@ -87,22 +88,52 @@ pub(crate) fn mark_successful_turn_idle_and_recheck(
     exit_code: i32,
 ) -> Result<WakeDiagnostic, String> {
     mark_session_idle_after_turn(session_id, invocation_uuid, Some(exit_code))?;
-    Ok(trigger_turn_end_recheck(session_id))
+    Ok(successful_turn_recheck(session_id))
+}
+
+fn successful_turn_recheck(session_id: &str) -> WakeDiagnostic {
+    trigger_turn_end_recheck(session_id)
 }
 
 pub(crate) fn validate_auto_wake_child(session_id: &str) -> Result<Option<i32>, String> {
-    if std::env::var_os(AUTO_WAKE_ENV).is_none() {
+    if !auto_wake_marker_present() {
         return Ok(None);
     }
-    let expected_session = std::env::var(AUTO_WAKE_SESSION_ID_ENV).unwrap_or_default();
-    let claim_token = std::env::var(AUTO_WAKE_TOKEN_ENV).unwrap_or_default();
-    if expected_session != session_id || claim_token.is_empty() {
+    let marker = auto_wake_child_marker();
+    if !auto_wake_child_marker_matches(session_id, &marker) {
         return Ok(Some(0));
     }
+    validate_auto_wake_child_claim(session_id, &marker.claim_token)
+}
+
+struct AutoWakeChildMarker {
+    expected_session: String,
+    claim_token: String,
+}
+
+fn auto_wake_marker_present() -> bool {
+    std::env::var_os(AUTO_WAKE_ENV).is_some()
+}
+
+fn auto_wake_child_marker() -> AutoWakeChildMarker {
+    AutoWakeChildMarker {
+        expected_session: std::env::var(AUTO_WAKE_SESSION_ID_ENV).unwrap_or_default(),
+        claim_token: std::env::var(AUTO_WAKE_TOKEN_ENV).unwrap_or_default(),
+    }
+}
+
+fn auto_wake_child_marker_matches(session_id: &str, marker: &AutoWakeChildMarker) -> bool {
+    marker.expected_session == session_id && !marker.claim_token.is_empty()
+}
+
+fn validate_auto_wake_child_claim(
+    session_id: &str,
+    claim_token: &str,
+) -> Result<Option<i32>, String> {
     let Some(mut db) = MailboxDb::open_default_if_exists()? else {
         return Ok(Some(0));
     };
-    if db.validate_wake_claim_for_child(session_id, &claim_token)? {
+    if db.validate_wake_claim_for_child(session_id, claim_token)? {
         Ok(None)
     } else {
         Ok(Some(0))
@@ -110,7 +141,7 @@ pub(crate) fn validate_auto_wake_child(session_id: &str) -> Result<Option<i32>, 
 }
 
 pub(crate) fn is_auto_wake_invocation() -> bool {
-    std::env::var_os(AUTO_WAKE_ENV).is_some()
+    auto_wake_marker_present()
 }
 
 pub(crate) fn reset_manual_resume_wake_claim(session_id: &str) -> Result<(), String> {
@@ -127,25 +158,21 @@ pub(crate) fn release_current_auto_wake_claim_for_session(session_id: &str) {
 }
 
 fn trigger_turn_end_recheck(session_id: &str) -> WakeDiagnostic {
-    let pending_count = match pending_count(session_id) {
+    let pending_count = match turn_end_pending_count(session_id) {
         Ok(count) => count,
-        Err(err) => return WakeDiagnostic::with_message("storage_error", err),
+        Err(err) => return storage_error_diagnostic(err),
     };
     let auto_wake = current_auto_wake();
-    if pending_count == 0 {
+    if no_pending(pending_count) {
         release_current_auto_wake_claim(session_id, auto_wake.as_ref());
         return WakeDiagnostic::status("no_pending");
     }
     let current_count = auto_wake.as_ref().map(|wake| wake.count).unwrap_or(0);
     let max_count = auto_wake_max();
-    if current_count >= max_count {
+    if auto_wake_cap_reached(current_count, max_count) {
         release_current_auto_wake_claim(session_id, auto_wake.as_ref());
-        eprintln!(
-            "auto_wake_cap_reached session_id={session_id} count={current_count} max={max_count}"
-        );
-        let mut diagnostic = WakeDiagnostic::status("auto_wake_cap_reached");
-        diagnostic.auto_wake_count = Some(current_count);
-        return diagnostic;
+        emit_auto_wake_cap_reached(session_id, current_count, max_count);
+        return auto_wake_cap_diagnostic(current_count);
     }
     start_wake_chain(StartWakeInput {
         session_id,
@@ -155,11 +182,40 @@ fn trigger_turn_end_recheck(session_id: &str) -> WakeDiagnostic {
     })
 }
 
+fn turn_end_pending_count(session_id: &str) -> Result<usize, String> {
+    pending_count(session_id)
+}
+
+fn no_pending(pending_count: usize) -> bool {
+    pending_count == 0
+}
+
+fn auto_wake_cap_reached(current_count: i64, max_count: i64) -> bool {
+    current_count >= max_count
+}
+
+fn emit_auto_wake_cap_reached(session_id: &str, current_count: i64, max_count: i64) {
+    eprintln!(
+        "auto_wake_cap_reached session_id={session_id} count={current_count} max={max_count}"
+    );
+}
+
+fn auto_wake_cap_diagnostic(current_count: i64) -> WakeDiagnostic {
+    let mut diagnostic = WakeDiagnostic::status("auto_wake_cap_reached");
+    diagnostic.auto_wake_count = Some(current_count);
+    diagnostic
+}
+
+fn storage_error_diagnostic(err: String) -> WakeDiagnostic {
+    WakeDiagnostic::with_message("storage_error", err)
+}
+
 struct AutoWakeEnv {
     token: String,
     count: i64,
 }
 
+#[derive(Clone, Copy)]
 struct StartWakeInput<'a> {
     session_id: &'a str,
     reason: &'a str,
@@ -169,42 +225,25 @@ struct StartWakeInput<'a> {
 
 fn start_wake_chain(input: StartWakeInput<'_>) -> WakeDiagnostic {
     let claim_token = Uuid::new_v4().to_string();
-    let mut db = match MailboxDb::open_default() {
+    let mut db = match open_wake_mailbox() {
         Ok(db) => db,
-        Err(err) => return WakeDiagnostic::with_message("storage_error", err),
+        Err(err) => return storage_error_diagnostic(err),
     };
-    let runtime = match db.session_runtime(input.session_id) {
+    let runtime = match session_runtime_for_wake(&db, input.session_id) {
         Ok(row) => row,
-        Err(err) => return WakeDiagnostic::with_message("storage_error", err),
+        Err(err) => return storage_error_diagnostic(err),
     };
-    if runtime
-        .as_ref()
-        .is_some_and(|row| row.mode == "pty_interactive")
-    {
+    if pty_runtime_is_busy(runtime.as_ref()) {
         return WakeDiagnostic::status("busy");
     }
-    let claim = match db.try_acquire_or_renew_wake_claim(
-        WakeClaimRequest {
-            session_id: input.session_id,
-            claim_token: &claim_token,
-            reason: input.reason,
-            auto_wake_count: input.auto_wake_count,
-            wake_invocation_uuid: None,
-            stale_after_seconds: WAKE_CLAIM_STALE_AFTER_SECONDS,
-        },
-        input.renew_token,
-    ) {
+    let claim = match acquire_wake_claim(&mut db, input, &claim_token) {
         Ok(WakeClaimAcquireResult::Acquired(claim)) => claim,
         Ok(WakeClaimAcquireResult::NoPending) => return WakeDiagnostic::status("no_pending"),
         Ok(WakeClaimAcquireResult::Busy) => return WakeDiagnostic::status("busy"),
         Ok(WakeClaimAcquireResult::AlreadyInFlight(claim)) => {
-            let mut diagnostic = WakeDiagnostic::status("already_in_flight");
-            diagnostic.claim_token = Some(claim.claim_token);
-            diagnostic.wake_pid = claim.wake_pid;
-            diagnostic.auto_wake_count = Some(claim.auto_wake_count);
-            return diagnostic;
+            return already_in_flight_diagnostic(claim);
         }
-        Err(err) => return WakeDiagnostic::with_message("storage_error", err),
+        Err(err) => return storage_error_diagnostic(err),
     };
     let spawn = spawn_detached_resume(
         input.session_id,
@@ -214,35 +253,91 @@ fn start_wake_chain(input: StartWakeInput<'_>) -> WakeDiagnostic {
     );
     match spawn {
         Ok(wake_pid) => {
-            if let Err(err) =
-                db.record_wake_claim_pid(input.session_id, &claim.claim_token, wake_pid)
-            {
-                tracing::warn!(
-                    session_id = input.session_id,
-                    claim_token = %claim.claim_token,
-                    "Failed to record wake PID: {err}"
-                );
-            }
-            WakeDiagnostic {
-                attempted: true,
-                status: "spawned".to_string(),
-                claim_token: Some(claim.claim_token),
-                wake_pid: Some(wake_pid),
-                auto_wake_count: Some(input.auto_wake_count),
-                message: None,
-            }
+            record_wake_pid_or_warn(&mut db, input.session_id, &claim.claim_token, wake_pid);
+            spawned_wake_diagnostic(claim.claim_token, wake_pid, input.auto_wake_count)
         }
         Err(err) => {
             let _ = db.release_wake_claim(input.session_id, Some(&claim.claim_token));
-            WakeDiagnostic {
-                attempted: true,
-                status: "spawn_error".to_string(),
-                claim_token: Some(claim.claim_token),
-                wake_pid: None,
-                auto_wake_count: Some(input.auto_wake_count),
-                message: Some(err),
-            }
+            spawn_error_diagnostic(claim.claim_token, input.auto_wake_count, err)
         }
+    }
+}
+
+fn open_wake_mailbox() -> Result<MailboxDb, String> {
+    MailboxDb::open_default()
+}
+
+fn session_runtime_for_wake(
+    db: &MailboxDb,
+    session_id: &str,
+) -> Result<Option<SessionRuntimeRow>, String> {
+    db.session_runtime(session_id)
+}
+
+fn pty_runtime_is_busy(runtime: Option<&SessionRuntimeRow>) -> bool {
+    runtime.is_some_and(|row| row.mode == "pty_interactive")
+}
+
+fn acquire_wake_claim(
+    db: &mut MailboxDb,
+    input: StartWakeInput<'_>,
+    claim_token: &str,
+) -> Result<WakeClaimAcquireResult, String> {
+    db.try_acquire_or_renew_wake_claim(wake_claim_request(input, claim_token), input.renew_token)
+}
+
+fn wake_claim_request<'a>(input: StartWakeInput<'a>, claim_token: &'a str) -> WakeClaimRequest<'a> {
+    WakeClaimRequest {
+        session_id: input.session_id,
+        claim_token,
+        reason: input.reason,
+        auto_wake_count: input.auto_wake_count,
+        wake_invocation_uuid: None,
+        stale_after_seconds: WAKE_CLAIM_STALE_AFTER_SECONDS,
+    }
+}
+
+fn already_in_flight_diagnostic(claim: oulipoly_state::mailbox::WakeClaimRow) -> WakeDiagnostic {
+    let mut diagnostic = WakeDiagnostic::status("already_in_flight");
+    diagnostic.claim_token = Some(claim.claim_token);
+    diagnostic.wake_pid = claim.wake_pid;
+    diagnostic.auto_wake_count = Some(claim.auto_wake_count);
+    diagnostic
+}
+
+fn record_wake_pid_or_warn(db: &mut MailboxDb, session_id: &str, claim_token: &str, wake_pid: i64) {
+    if let Err(err) = db.record_wake_claim_pid(session_id, claim_token, wake_pid) {
+        tracing::warn!(session_id, claim_token, "Failed to record wake PID: {err}");
+    }
+}
+
+fn spawned_wake_diagnostic(
+    claim_token: String,
+    wake_pid: i64,
+    auto_wake_count: i64,
+) -> WakeDiagnostic {
+    WakeDiagnostic {
+        attempted: true,
+        status: "spawned".to_string(),
+        claim_token: Some(claim_token),
+        wake_pid: Some(wake_pid),
+        auto_wake_count: Some(auto_wake_count),
+        message: None,
+    }
+}
+
+fn spawn_error_diagnostic(
+    claim_token: String,
+    auto_wake_count: i64,
+    err: String,
+) -> WakeDiagnostic {
+    WakeDiagnostic {
+        attempted: true,
+        status: "spawn_error".to_string(),
+        claim_token: Some(claim_token),
+        wake_pid: None,
+        auto_wake_count: Some(auto_wake_count),
+        message: Some(err),
     }
 }
 
@@ -252,20 +347,55 @@ fn spawn_detached_resume(
     claim_token: &str,
     auto_wake_count: i64,
 ) -> Result<i64, String> {
-    let exe = std::env::current_exe()
-        .map_err(|err| format!("Failed to resolve current agents binary: {err}"))?;
+    let exe = current_agents_exe()?;
+    let mut cmd = detached_resume_command(exe, session_id, runtime, claim_token, auto_wake_count);
+    let child = cmd
+        .spawn()
+        .map_err(|err| format!("Failed to spawn detached wake resume: {err}"))?;
+    Ok(i64::from(child.id()))
+}
+
+fn current_agents_exe() -> Result<std::path::PathBuf, String> {
+    std::env::current_exe().map_err(|err| format!("Failed to resolve current agents binary: {err}"))
+}
+
+fn detached_resume_command(
+    exe: std::path::PathBuf,
+    session_id: &str,
+    runtime: Option<&SessionRuntimeRow>,
+    claim_token: &str,
+    auto_wake_count: i64,
+) -> Command {
     let mut cmd = Command::new(exe);
+    configure_resume_args(&mut cmd, session_id, runtime);
+    configure_wake_stdio_and_env(&mut cmd, session_id, claim_token, auto_wake_count);
+    configure_detached(&mut cmd);
+    cmd
+}
+
+fn configure_resume_args(cmd: &mut Command, session_id: &str, runtime: Option<&SessionRuntimeRow>) {
     cmd.arg("resume").arg("--session-id").arg(session_id);
-    if let Some(model_name) = runtime.and_then(|row| row.model_name.as_deref())
-        && !model_name.is_empty()
-    {
-        cmd.arg("-m").arg(model_name);
-    }
-    if let Some(models_dir) = runtime.and_then(|row| row.models_dir.as_deref())
-        && !models_dir.is_empty()
-    {
-        cmd.arg("--models-dir").arg(models_dir);
-    }
+    append_non_empty_arg(cmd, "-m", runtime.and_then(|row| row.model_name.as_deref()));
+    append_non_empty_arg(
+        cmd,
+        "--models-dir",
+        runtime.and_then(|row| row.models_dir.as_deref()),
+    );
+}
+
+fn append_non_empty_arg(cmd: &mut Command, flag: &str, value: Option<&str>) {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return;
+    };
+    cmd.arg(flag).arg(value);
+}
+
+fn configure_wake_stdio_and_env(
+    cmd: &mut Command,
+    session_id: &str,
+    claim_token: &str,
+    auto_wake_count: i64,
+) {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -274,11 +404,6 @@ fn spawn_detached_resume(
         .env(AUTO_WAKE_TOKEN_ENV, claim_token)
         .env(AUTO_WAKE_COUNT_ENV, auto_wake_count.to_string())
         .env_remove(PARENT_INVOCATION_ENV);
-    configure_detached(&mut cmd);
-    let child = cmd
-        .spawn()
-        .map_err(|err| format!("Failed to spawn detached wake resume: {err}"))?;
-    Ok(i64::from(child.id()))
 }
 
 #[cfg(unix)]
@@ -304,21 +429,45 @@ fn pending_count(session_id: &str) -> Result<usize, String> {
 }
 
 fn current_auto_wake() -> Option<AutoWakeEnv> {
-    std::env::var_os(AUTO_WAKE_ENV)?;
-    let token = std::env::var(AUTO_WAKE_TOKEN_ENV).ok()?;
-    let count = std::env::var(AUTO_WAKE_COUNT_ENV)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(1);
-    Some(AutoWakeEnv { token, count })
+    auto_wake_marker_present().then_some(())?;
+    Some(auto_wake_env(
+        auto_wake_token()?,
+        parse_auto_wake_count(auto_wake_count_value()),
+    ))
 }
 
 fn auto_wake_max() -> i64 {
-    std::env::var(AUTO_WAKE_MAX_ENV)
-        .ok()
-        .and_then(|value| value.parse::<i64>().ok())
+    validated_auto_wake_max(parse_auto_wake_max(auto_wake_max_value()))
+}
+
+fn auto_wake_token() -> Option<String> {
+    std::env::var(AUTO_WAKE_TOKEN_ENV).ok()
+}
+
+fn auto_wake_count_value() -> Option<String> {
+    std::env::var(AUTO_WAKE_COUNT_ENV).ok()
+}
+
+fn auto_wake_max_value() -> Option<String> {
+    std::env::var(AUTO_WAKE_MAX_ENV).ok()
+}
+
+fn parse_auto_wake_count(value: Option<String>) -> i64 {
+    value.and_then(|value| value.parse().ok()).unwrap_or(1)
+}
+
+fn parse_auto_wake_max(value: Option<String>) -> Option<i64> {
+    value.and_then(|value| value.parse::<i64>().ok())
+}
+
+fn validated_auto_wake_max(value: Option<i64>) -> i64 {
+    value
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_AUTO_WAKE_MAX)
+}
+
+fn auto_wake_env(token: String, count: i64) -> AutoWakeEnv {
+    AutoWakeEnv { token, count }
 }
 
 fn release_current_auto_wake_claim(session_id: &str, auto_wake: Option<&AutoWakeEnv>) {

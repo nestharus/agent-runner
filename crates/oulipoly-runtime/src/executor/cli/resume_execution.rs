@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! Roles: orchestration.
+//! Roles: mapper, orchestration.
 //!
 //! - orchestration: resume execution sequences resume payload translation,
 //!   provider-capture disabling, provider execution, temp cleanup, resume
@@ -22,9 +22,11 @@
 
 use super::super::{ExecutionResult, SessionCaptureMethod, SessionCaptureResult};
 use super::provider_execution::execute_provider_with_arg_parts_and_supervisor_config;
-use super::result::{cleanup_temp_files, execution_result_from_raw};
+use super::result::{RawResult, cleanup_temp_files, execution_result_from_raw};
 use super::resume::{ResumePayload, classify_resume_acceptance, compose_resume_args};
-use super::spawn_identity::{SpawnRuntimeMode, context_from_parent_invocation_env};
+use super::spawn_identity::{
+    SpawnIdentityContext, SpawnRuntimeMode, context_from_parent_invocation_env,
+};
 use super::supervision::SupervisorConfig;
 use oulipoly_config::{PromptMode, ProviderConfig};
 use std::path::Path;
@@ -113,45 +115,112 @@ fn execute_resume_with_optional_supervisor_config(
     model_name: Option<&str>,
     supervisor_config: Option<SupervisorConfig>,
 ) -> Result<ExecutionResult, String> {
-    let session_id = resume.session_id.to_string();
-    let resume_args = compose_resume_args(resume.strategy, resume.session_id)?;
-    let mut provider_without_capture = provider.clone();
-    provider_without_capture.session_capture = None;
+    let input = resume_execution_input(
+        provider,
+        resume,
+        parent_invocation_env,
+        model_name,
+        working_dir,
+    )?;
     let (result, temp_files) = execute_provider_with_arg_parts_and_supervisor_config(
-        &provider_without_capture,
+        &input.provider_without_capture,
         &provider.args,
-        &resume_args,
+        &input.resume_args,
         prompt_mode,
         prompt,
         working_dir,
         &[],
         parent_invocation_env,
         None,
-        context_from_parent_invocation_env(
-            parent_invocation_env,
-            &provider_without_capture.name,
-            model_name,
-            Some(&session_id),
-            SpawnRuntimeMode::Headless,
-            working_dir,
-        ),
+        input.spawn_identity,
         supervisor_config,
     )?;
     cleanup_temp_files(temp_files);
+    Ok(resume_execution_result(
+        provider,
+        provider_index,
+        result,
+        &input.session_id,
+    ))
+}
+
+struct ResumeExecutionInput {
+    session_id: String,
+    resume_args: Vec<String>,
+    provider_without_capture: ProviderConfig,
+    spawn_identity: Option<SpawnIdentityContext>,
+}
+
+fn resume_execution_input(
+    provider: &ProviderConfig,
+    resume: ResumePayload<'_>,
+    parent_invocation_env: Option<&str>,
+    model_name: Option<&str>,
+    working_dir: Option<&Path>,
+) -> Result<ResumeExecutionInput, String> {
+    let session_id = resume.session_id.to_string();
+    let provider_without_capture = provider_without_capture(provider);
+    Ok(ResumeExecutionInput {
+        resume_args: compose_resume_args(resume.strategy, resume.session_id)?,
+        spawn_identity: resume_spawn_identity(
+            parent_invocation_env,
+            &provider_without_capture,
+            model_name,
+            &session_id,
+            working_dir,
+        ),
+        provider_without_capture,
+        session_id,
+    })
+}
+
+fn provider_without_capture(provider: &ProviderConfig) -> ProviderConfig {
+    let mut provider = provider.clone();
+    provider.session_capture = None;
+    provider
+}
+
+fn resume_spawn_identity(
+    parent_invocation_env: Option<&str>,
+    provider: &ProviderConfig,
+    model_name: Option<&str>,
+    session_id: &str,
+    working_dir: Option<&Path>,
+) -> Option<SpawnIdentityContext> {
+    context_from_parent_invocation_env(
+        parent_invocation_env,
+        &provider.name,
+        model_name,
+        Some(session_id),
+        SpawnRuntimeMode::Headless,
+        working_dir,
+    )
+}
+
+fn resume_execution_result(
+    provider: &ProviderConfig,
+    provider_index: usize,
+    result: RawResult,
+    session_id: &str,
+) -> ExecutionResult {
     let resume_acceptance = classify_resume_acceptance(
         provider.resume_acceptance.as_ref(),
         result.exit_code,
         &result.telemetry_stdout,
         result.stderr.as_bytes(),
-        &session_id,
+        session_id,
     );
-    Ok(execution_result_from_raw(
+    execution_result_from_raw(
         result,
         provider_index,
         Some(resume_acceptance),
-        Some(SessionCaptureResult {
-            session_id: None,
-            method: SessionCaptureMethod::None,
-        }),
-    ))
+        Some(no_session_capture_result()),
+    )
+}
+
+fn no_session_capture_result() -> SessionCaptureResult {
+    SessionCaptureResult {
+        session_id: None,
+        method: SessionCaptureMethod::None,
+    }
 }

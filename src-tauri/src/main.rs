@@ -97,13 +97,22 @@ fn arg_count(args: std::env::Args) -> usize {
 }
 
 fn cli_exit_code(result: Result<i32, String>) -> ExitCode {
-    match cli_exit(result) {
+    let exit = cli_exit(result);
+    emit_cli_error_if_needed(&exit);
+    cli_exit_to_code(&exit)
+}
+
+fn cli_exit_to_code(exit: &CliExit) -> ExitCode {
+    match exit {
         CliExit::Success => ExitCode::SUCCESS,
-        CliExit::Code(code) => ExitCode::from(code as u8),
-        CliExit::Error(error) => {
-            emit_cli_error(&error);
-            ExitCode::FAILURE
-        }
+        CliExit::Code(code) => ExitCode::from(*code as u8),
+        CliExit::Error(_) => ExitCode::FAILURE,
+    }
+}
+
+fn emit_cli_error_if_needed(exit: &CliExit) {
+    if let CliExit::Error(error) = exit {
+        emit_cli_error(error);
     }
 }
 

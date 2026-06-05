@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! Roles: orchestration, mapper.
+//! Roles: mapper, orchestration, predicate.
 //!
 //! - orchestration: runs the supervised child lifecycle from command setup
 //!   through spawn, pipe drains, stdin writing, live signal recognition,
@@ -130,21 +130,14 @@ fn execute_with_supervisor(
             break terminal_outcome::terminal_outcome_from_status(status);
         }
 
-        let live_signal = live_quota::recognize_live_terminal_signal(
+        if let Some(outcome) = live_quota_terminal_outcome(
+            &mut child,
             provider_name,
             config.recognizer,
             &stdout,
             &stderr,
-        );
-        if predicates::live_signal_is_quota_exhausted_inband(&live_signal) {
-            break live_quota::terminate_for_live_quota(
-                &mut child,
-                provider_name,
-                config.recognizer,
-                &stdout,
-                &stderr,
-                live_signal,
-            )?;
+        )? {
+            break outcome;
         }
 
         match drains.rx.recv_timeout(SUPERVISOR_POLL_INTERVAL) {
@@ -177,4 +170,27 @@ fn execute_with_supervisor(
         return Err(err);
     }
     Ok(output)
+}
+
+fn live_quota_terminal_outcome(
+    child: &mut std::process::Child,
+    provider_name: &str,
+    recognizer: ProviderRecognizer,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<Option<SupervisedTerminalOutcome>, String> {
+    let live_signal =
+        live_quota::recognize_live_terminal_signal(provider_name, recognizer, stdout, stderr);
+    if !predicates::live_signal_is_quota_exhausted_inband(&live_signal) {
+        return Ok(None);
+    }
+    live_quota::terminate_for_live_quota(
+        child,
+        provider_name,
+        recognizer,
+        stdout,
+        stderr,
+        live_signal,
+    )
+    .map(Some)
 }

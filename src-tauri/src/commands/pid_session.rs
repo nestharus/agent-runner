@@ -1,6 +1,7 @@
 //! ## Declared roles
 //!
-//! `accessor`, `formatter`, `mapper`, `orchestration`, `predicate`
+//! `accessor`, `filter`, `formatter`, `mapper`, `orchestration`, `predicate`,
+//! `validator`
 //!
 //! `session of-pid`, `session alive`, and `session subtree` query the
 //! independent PID identity sidecar and never mutate the versioned state DB.
@@ -72,20 +73,7 @@ pub(crate) fn run_of_pid(pid: u32, json: bool) -> Result<i32, String> {
 
 pub(crate) fn run_alive(pid: u32, json: bool) -> Result<i32, String> {
     let row = lookup_verified_live_row(pid)?;
-    let response = match row {
-        Some(row) => AliveResponse {
-            pid,
-            alive: true,
-            session_id: resolve_row_session_id(&row)?,
-            invocation_uuid: Some(row.invocation_uuid),
-        },
-        None => AliveResponse {
-            pid,
-            alive: false,
-            invocation_uuid: None,
-            session_id: None,
-        },
-    };
+    let response = alive_response(pid, row)?;
     render_alive(&response, json)
 }
 
@@ -93,10 +81,21 @@ pub(crate) fn run_subtree(pid: u32, json: bool, max_depth: usize) -> Result<i32,
     let Some(row) = lookup_verified_live_row(pid)? else {
         return render_subtree_not_found(pid, json);
     };
+    let Some(response) = subtree_response(pid, &row, max_depth)? else {
+        return render_subtree_not_found(pid, json);
+    };
+    render_subtree_found(&response, json)
+}
+
+fn subtree_response(
+    pid: u32,
+    row: &PidIdentityRow,
+    max_depth: usize,
+) -> Result<Option<SubtreeResponse>, String> {
     let state = open_state_read_only_required()?;
     let sidecar = open_sidecar_read_only_required()?;
     let Some(root_record) = state.get_invocation_by_uuid(&row.invocation_uuid)? else {
-        return render_subtree_not_found(pid, json);
+        return Ok(None);
     };
     let mut visited = HashSet::from([root_record.id]);
     let root_uuid = root_record.invocation_uuid.clone();
@@ -109,14 +108,17 @@ pub(crate) fn run_subtree(pid: u32, json: bool, max_depth: usize) -> Result<i32,
         max_depth,
         &mut visited,
     )?;
-    let response = SubtreeResponse {
+    Ok(Some(subtree_found_response(pid, root_uuid, root)))
+}
+
+fn subtree_found_response(pid: u32, root_uuid: String, root: SubtreeNode) -> SubtreeResponse {
+    SubtreeResponse {
         found: true,
         pid,
         root_invocation_uuid: Some(root_uuid),
         generated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
         root: Some(root),
-    };
-    render_subtree_found(&response, json)
+    }
 }
 
 fn lookup_verified_live_row(pid: u32) -> Result<Option<PidIdentityRow>, String> {
@@ -142,7 +144,7 @@ fn open_sidecar_read_only_optional() -> Result<Option<PidIdentityDb>, String> {
 }
 
 fn open_sidecar_read_only_required() -> Result<PidIdentityDb, String> {
-    open_sidecar_read_only_optional()?.ok_or_else(|| "PID identity sidecar not found".to_string())
+    require_sidecar(open_sidecar_read_only_optional()?)
 }
 
 fn open_state_read_only_optional() -> Result<Option<StateDb>, String> {
@@ -156,21 +158,36 @@ fn open_state_read_only_optional() -> Result<Option<StateDb>, String> {
 }
 
 fn open_state_read_only_required() -> Result<StateDb, String> {
-    open_state_read_only_optional()?.ok_or_else(|| "state.db not found".to_string())
+    require_state_db(open_state_read_only_optional()?)
+}
+
+fn require_sidecar(db: Option<PidIdentityDb>) -> Result<PidIdentityDb, String> {
+    db.ok_or_else(|| "PID identity sidecar not found".to_string())
+}
+
+fn require_state_db(db: Option<StateDb>) -> Result<StateDb, String> {
+    db.ok_or_else(|| "state.db not found".to_string())
 }
 
 fn resolve_row_session_id(row: &PidIdentityRow) -> Result<Option<String>, String> {
-    if row.session_id.is_some() {
-        return Ok(row.session_id.clone());
+    if let Some(session_id) = sidecar_session_id(row) {
+        return Ok(Some(session_id));
     }
+    state_invocation_session_id(&row.invocation_uuid)
+}
+
+fn sidecar_session_id(row: &PidIdentityRow) -> Option<String> {
+    row.session_id.clone()
+}
+
+fn state_invocation_session_id(invocation_uuid: &str) -> Result<Option<String>, String> {
     let Some(state) = open_state_read_only_optional()? else {
         return Ok(None);
     };
-    let session_id = state
-        .get_invocation_by_uuid(&row.invocation_uuid)?
-        .map(|record| resolved_invocation_session_id(&record))
-        .unwrap_or(None);
-    Ok(session_id)
+    Ok(state
+        .get_invocation_by_uuid(invocation_uuid)?
+        .as_ref()
+        .and_then(resolved_invocation_session_id))
 }
 
 fn resolved_invocation_session_id(record: &InvocationRecord) -> Option<String> {
@@ -190,13 +207,39 @@ fn build_subtree_node(
     visited: &mut HashSet<i64>,
 ) -> Result<SubtreeNode, String> {
     let annotation = pid_annotation_for_invocation(sidecar, &record.invocation_uuid)?;
-    let children = if depth >= max_depth {
-        Vec::new()
-    } else {
-        build_subtree_children(state, sidecar, &record, depth, max_depth, visited)?
-    };
+    let children = subtree_children_for_depth(state, sidecar, &record, depth, max_depth, visited)?;
     let session_id = resolved_invocation_session_id(&record);
-    Ok(SubtreeNode {
+    Ok(subtree_node(
+        record,
+        parent_invocation_uuid,
+        session_id,
+        annotation,
+        children,
+    ))
+}
+
+fn subtree_children_for_depth(
+    state: &StateDb,
+    sidecar: &PidIdentityDb,
+    record: &InvocationRecord,
+    depth: usize,
+    max_depth: usize,
+    visited: &mut HashSet<i64>,
+) -> Result<Vec<SubtreeNode>, String> {
+    if depth >= max_depth {
+        return Ok(Vec::new());
+    }
+    build_subtree_children(state, sidecar, record, depth, max_depth, visited)
+}
+
+fn subtree_node(
+    record: InvocationRecord,
+    parent_invocation_uuid: Option<String>,
+    session_id: Option<String>,
+    annotation: PidAnnotation,
+    children: Vec<SubtreeNode>,
+) -> SubtreeNode {
+    SubtreeNode {
         row_id: record.id,
         invocation_uuid: record.invocation_uuid,
         parent_invocation_uuid,
@@ -206,7 +249,7 @@ fn build_subtree_node(
         pid: annotation.pid,
         alive: annotation.alive,
         children,
-    })
+    }
 }
 
 fn build_subtree_children(
@@ -218,51 +261,86 @@ fn build_subtree_children(
     visited: &mut HashSet<i64>,
 ) -> Result<Vec<SubtreeNode>, String> {
     let mut children = Vec::new();
-    for child in state.list_invocation_children(record.id)? {
-        if !visited.insert(child.id) {
+    for child in child_invocations(state, record.id)? {
+        if !mark_child_visited(visited, child.id) {
             continue;
         }
         let child_id = child.id;
-        let node = build_subtree_node(
-            state,
-            sidecar,
-            child,
-            Some(record.invocation_uuid.clone()),
-            depth + 1,
-            max_depth,
-            visited,
-        )?;
-        visited.remove(&child_id);
+        let node =
+            build_child_subtree_node(state, sidecar, record, child, depth, max_depth, visited)?;
+        unmark_child_visited(visited, child_id);
         children.push(node);
     }
     Ok(children)
+}
+
+fn child_invocations(state: &StateDb, row_id: i64) -> Result<Vec<InvocationRecord>, String> {
+    state.list_invocation_children(row_id)
+}
+
+fn mark_child_visited(visited: &mut HashSet<i64>, child_id: i64) -> bool {
+    visited.insert(child_id)
+}
+
+fn unmark_child_visited(visited: &mut HashSet<i64>, child_id: i64) {
+    visited.remove(&child_id);
+}
+
+fn build_child_subtree_node(
+    state: &StateDb,
+    sidecar: &PidIdentityDb,
+    parent: &InvocationRecord,
+    child: InvocationRecord,
+    depth: usize,
+    max_depth: usize,
+    visited: &mut HashSet<i64>,
+) -> Result<SubtreeNode, String> {
+    build_subtree_node(
+        state,
+        sidecar,
+        child,
+        Some(parent.invocation_uuid.clone()),
+        depth + 1,
+        max_depth,
+        visited,
+    )
 }
 
 fn pid_annotation_for_invocation(
     sidecar: &PidIdentityDb,
     invocation_uuid: &str,
 ) -> Result<PidAnnotation, String> {
-    let rows = sidecar.lookup_by_invocation_uuid(invocation_uuid)?;
+    let rows = pid_rows_for_invocation(sidecar, invocation_uuid)?;
+    Ok(pid_annotation_from_rows(rows))
+}
+
+fn pid_rows_for_invocation(
+    sidecar: &PidIdentityDb,
+    invocation_uuid: &str,
+) -> Result<Vec<PidIdentityRow>, String> {
+    sidecar.lookup_by_invocation_uuid(invocation_uuid)
+}
+
+fn pid_annotation_from_rows(rows: Vec<PidIdentityRow>) -> PidAnnotation {
     let mut fallback = None;
     for row in rows {
-        let alive = row_is_alive(&row);
-        if fallback.is_none() {
-            fallback = Some(PidAnnotation {
-                pid: Some(row.os_pid),
-                alive,
-            });
-        }
-        if alive {
-            return Ok(PidAnnotation {
-                pid: Some(row.os_pid),
-                alive: true,
-            });
+        let annotation = pid_annotation_for_row(&row);
+        fallback = fallback.or_else(|| Some(annotation.clone()));
+        if annotation.alive {
+            return annotation;
         }
     }
-    Ok(fallback.unwrap_or(PidAnnotation {
+    fallback.unwrap_or(PidAnnotation {
         pid: None,
         alive: false,
-    }))
+    })
+}
+
+fn pid_annotation_for_row(row: &PidIdentityRow) -> PidAnnotation {
+    PidAnnotation {
+        pid: Some(row.os_pid),
+        alive: row_is_alive(row),
+    }
 }
 
 fn row_is_alive(row: &PidIdentityRow) -> bool {
@@ -295,8 +373,43 @@ fn of_pid_response(
     }
 }
 
+fn alive_response(pid: u32, row: Option<PidIdentityRow>) -> Result<AliveResponse, String> {
+    let Some(row) = row else {
+        return Ok(alive_not_found_response(pid));
+    };
+    alive_found_response(pid, row)
+}
+
+fn alive_found_response(pid: u32, row: PidIdentityRow) -> Result<AliveResponse, String> {
+    Ok(AliveResponse {
+        pid,
+        alive: true,
+        session_id: resolve_row_session_id(&row)?,
+        invocation_uuid: Some(row.invocation_uuid),
+    })
+}
+
+fn alive_not_found_response(pid: u32) -> AliveResponse {
+    AliveResponse {
+        pid,
+        alive: false,
+        invocation_uuid: None,
+        session_id: None,
+    }
+}
+
 fn render_of_pid_not_found(pid: u32, json: bool) -> Result<i32, String> {
-    let response = PidSessionResponse {
+    let response = of_pid_not_found_response(pid);
+    if json {
+        print_json(&response)?;
+    } else {
+        eprintln!("No verified session identity found for pid {pid}");
+    }
+    Ok(not_found_exit_code())
+}
+
+fn of_pid_not_found_response(pid: u32) -> PidSessionResponse {
+    PidSessionResponse {
         found: false,
         pid,
         invocation_uuid: None,
@@ -307,13 +420,7 @@ fn render_of_pid_not_found(pid: u32, json: bool) -> Result<i32, String> {
         os_pid_starttime_ticks: None,
         os_pgid: None,
         recorded_at: None,
-    };
-    if json {
-        print_json(&response)?;
-    } else {
-        eprintln!("No verified session identity found for pid {pid}");
     }
-    Ok(1)
 }
 
 fn render_of_pid_found(response: &PidSessionResponse, json: bool) -> Result<i32, String> {
@@ -327,7 +434,7 @@ fn render_of_pid_found(response: &PidSessionResponse, json: bool) -> Result<i32,
             response.session_id.as_deref().unwrap_or("-")
         );
     }
-    Ok(0)
+    Ok(success_exit_code())
 }
 
 fn render_alive(response: &AliveResponse, json: bool) -> Result<i32, String> {
@@ -336,23 +443,27 @@ fn render_alive(response: &AliveResponse, json: bool) -> Result<i32, String> {
     } else {
         println!("{}", response.alive);
     }
-    Ok(if response.alive { 0 } else { 1 })
+    Ok(alive_exit_code(response.alive))
 }
 
 fn render_subtree_not_found(pid: u32, json: bool) -> Result<i32, String> {
-    let response = SubtreeResponse {
-        found: false,
-        pid,
-        root_invocation_uuid: None,
-        generated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-        root: None,
-    };
+    let response = subtree_not_found_response(pid);
     if json {
         print_json(&response)?;
     } else {
         eprintln!("No verified invocation subtree root found for pid {pid}");
     }
-    Ok(1)
+    Ok(not_found_exit_code())
+}
+
+fn subtree_not_found_response(pid: u32) -> SubtreeResponse {
+    SubtreeResponse {
+        found: false,
+        pid,
+        root_invocation_uuid: None,
+        generated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+        root: None,
+    }
 }
 
 fn render_subtree_found(response: &SubtreeResponse, json: bool) -> Result<i32, String> {
@@ -361,21 +472,44 @@ fn render_subtree_found(response: &SubtreeResponse, json: bool) -> Result<i32, S
     } else if let Some(root) = &response.root {
         render_subtree_node(root, 0);
     }
-    Ok(0)
+    Ok(success_exit_code())
 }
 
 fn render_subtree_node(node: &SubtreeNode, depth: usize) {
-    let indent = "  ".repeat(depth);
-    println!(
-        "{indent}{} pid={} alive={}",
-        node.invocation_uuid,
-        node.pid
-            .map(|pid| pid.to_string())
-            .unwrap_or_else(|| "-".to_string()),
-        node.alive
-    );
+    println!("{}", subtree_node_line(node, depth));
     for child in &node.children {
         render_subtree_node(child, depth + 1);
+    }
+}
+
+fn subtree_node_line(node: &SubtreeNode, depth: usize) -> String {
+    let indent = "  ".repeat(depth);
+    format!(
+        "{indent}{} pid={} alive={}",
+        node.invocation_uuid,
+        rendered_pid(node.pid),
+        node.alive
+    )
+}
+
+fn rendered_pid(pid: Option<i64>) -> String {
+    pid.map(|pid| pid.to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn success_exit_code() -> i32 {
+    0
+}
+
+fn not_found_exit_code() -> i32 {
+    1
+}
+
+fn alive_exit_code(alive: bool) -> i32 {
+    if alive {
+        success_exit_code()
+    } else {
+        not_found_exit_code()
     }
 }
 
