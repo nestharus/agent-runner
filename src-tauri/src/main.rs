@@ -27,6 +27,7 @@ mod dispatch;
 mod error_emit;
 mod invocation;
 mod json_error;
+mod mailbox_delivery;
 mod migration_providers;
 #[allow(dead_code)]
 #[path = "main/owned_turn_event_ingest.rs"]

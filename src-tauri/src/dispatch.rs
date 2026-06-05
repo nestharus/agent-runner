@@ -57,7 +57,9 @@ use oulipoly_runtime::session_replace;
 
 use crate::cli::inputs::{TopLevelResumePromptSource, resolve_top_level_resume_prompt_source};
 use crate::resume_cli::format_resume_error;
-use crate::usage::cli::{Cli, SessionSubcommands, Subcommands};
+use crate::usage::cli::{
+    Cli, MailboxSubcommands, NotifySubcommands, SessionSubcommands, Subcommands,
+};
 use crate::{commands, run, usage, wiring};
 
 mod clock;
@@ -207,12 +209,48 @@ fn dispatch_subcommand(
         Subcommands::Session { command } => {
             dispatch_session_subcommand(command, agent_runtime_services)
         }
+        Subcommands::Notify { command } => dispatch_notify_subcommand(command),
+        Subcommands::Mailbox { command } => dispatch_mailbox_subcommand(command),
         Subcommands::ResumeList { uuid } => crate::commands::resume_list::run_resume_list(&uuid),
         Subcommands::MigrateDb => commands::migrate::run_migrate_db(),
         Subcommands::Migrate { rebuild } => commands::migrate::run_migrate(rebuild),
         Subcommands::MigrateConfig { models_dir } => {
             commands::config_migration::run_migrate_config(models_dir.as_deref())
         }
+    }
+}
+
+fn dispatch_notify_subcommand(command: NotifySubcommands) -> Result<i32, String> {
+    match command {
+        NotifySubcommands::AgentBashComplete {
+            caller_ppid,
+            handle,
+            state_dir,
+            meta,
+            log,
+            rc,
+            json,
+        } => crate::commands::notify::run_agent_bash_complete(
+            crate::commands::notify::AgentBashCompleteArgs {
+                caller_ppid,
+                handle: &handle,
+                state_dir: &state_dir,
+                meta: &meta,
+                log: &log,
+                rc: &rc,
+                json,
+            },
+        ),
+    }
+}
+
+fn dispatch_mailbox_subcommand(command: MailboxSubcommands) -> Result<i32, String> {
+    match command {
+        MailboxSubcommands::List {
+            session_id,
+            all,
+            json,
+        } => crate::commands::mailbox::run_list(&session_id, all, json),
     }
 }
 

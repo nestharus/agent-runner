@@ -206,6 +206,16 @@ pub(crate) enum Subcommands {
         #[command(subcommand)]
         command: SessionSubcommands,
     },
+    /// Receive durable notifications from external agent workloads.
+    Notify {
+        #[command(subcommand)]
+        command: NotifySubcommands,
+    },
+    /// Inspect queued session mailbox notifications.
+    Mailbox {
+        #[command(subcommand)]
+        command: MailboxSubcommands,
+    },
     /// Hidden normalized form for `resume --list <UUID>`.
     #[command(hide = true, name = "resume-list")]
     ResumeList { uuid: String },
@@ -222,6 +232,58 @@ pub(crate) enum Subcommands {
         /// Override models directory.
         #[arg(long = "models-dir")]
         models_dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub(crate) enum NotifySubcommands {
+    /// Queue an agent-bash completion notification for the owning session.
+    AgentBashComplete {
+        /// Diagnostic producer caller PID; not used for owner identity.
+        #[arg(long = "caller-ppid")]
+        caller_ppid: u32,
+
+        /// Stable workload handle for idempotent enqueue.
+        #[arg(long)]
+        handle: String,
+
+        /// Spooler state directory.
+        #[arg(long = "state-dir")]
+        state_dir: PathBuf,
+
+        /// Path to meta.json containing caller_chain.
+        #[arg(long)]
+        meta: PathBuf,
+
+        /// Path to retained workload log.
+        #[arg(long)]
+        log: PathBuf,
+
+        /// Path to workload rc file.
+        #[arg(long)]
+        rc: PathBuf,
+
+        /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub(crate) enum MailboxSubcommands {
+    /// List queued mailbox notifications for a session.
+    List {
+        /// Provider session id.
+        #[arg(long = "session-id")]
+        session_id: String,
+
+        /// Include delivered rows.
+        #[arg(long)]
+        all: bool,
+
+        /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 

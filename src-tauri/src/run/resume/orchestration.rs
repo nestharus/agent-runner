@@ -88,6 +88,8 @@ fn reject_invalid_resume_input(session_id: &str) -> Option<i32> {
 
 struct PreparedHeadlessResumeExecution {
     answer: Option<String>,
+    mailbox_session_id: String,
+    mailbox_delivery_seqs: Vec<i64>,
     env: crate::migration_providers::ResumeExecutionEnvironment,
     resolved: oulipoly_state::ResolvedResume,
     effective_spawn_cwd: std::path::PathBuf,
@@ -126,8 +128,12 @@ fn prepare_headless_resume_execution(
     let effective_spawn_cwd = effective_resume_execution_cwd(&env, session_id, working_dir)?;
     let parent_invocation_id = crate::dispatch::resolve_parent_invocation_id(&env.state);
     let max_attempts = headless_resume_retry_budget(&resolved);
+    let mailbox_delivery =
+        crate::mailbox_delivery::prepare_headless_resume_delivery(&resolved, answer)?;
     Ok(Ok(PreparedHeadlessResumeExecution {
-        answer,
+        answer: mailbox_delivery.answer,
+        mailbox_session_id: mailbox_delivery.session_id,
+        mailbox_delivery_seqs: mailbox_delivery.seqs,
         env,
         resolved,
         effective_spawn_cwd,
@@ -185,6 +191,8 @@ fn run_resume_loop(input: ResumeLoopInput<'_>) -> Result<i32, String> {
             env: &input.prepared.env,
             resolved: &mut input.prepared.resolved,
             answer: input.prepared.answer.as_deref(),
+            mailbox_session_id: &input.prepared.mailbox_session_id,
+            mailbox_delivery_seqs: &input.prepared.mailbox_delivery_seqs,
             manual_migrate: input.manual_migrate,
             session_id: input.session_id,
             working_dir: input.working_dir,
@@ -225,6 +233,8 @@ struct ResumeAttemptInput<'a> {
     env: &'a crate::migration_providers::ResumeExecutionEnvironment,
     resolved: &'a mut oulipoly_state::ResolvedResume,
     answer: Option<&'a str>,
+    mailbox_session_id: &'a str,
+    mailbox_delivery_seqs: &'a [i64],
     manual_migrate: Option<&'a str>,
     session_id: &'a str,
     working_dir: Option<&'a Path>,
@@ -576,6 +586,13 @@ fn handle_resume_attempt_terminal_signal(
             Ok(ResumeAttemptLoopControl::Continue(result.exit_code))
         }
         CompletedAttemptControl::Return(exit_code) => {
+            if exit_code == 0 {
+                crate::mailbox_delivery::mark_headless_resume_delivered(
+                    input.mailbox_session_id,
+                    input.mailbox_delivery_seqs,
+                    &attempt.invocation.id,
+                )?;
+            }
             Ok(ResumeAttemptLoopControl::Return(exit_code))
         }
     }

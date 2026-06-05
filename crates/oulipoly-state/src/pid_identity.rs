@@ -83,7 +83,7 @@ impl PidIdentityDb {
         let conn = Connection::open(path)
             .map_err(|err| format!("Failed to open PID identity sidecar: {err}"))?;
         set_wal_mode(&conn)?;
-        ensure_schema(&conn)?;
+        ensure_identity_schema(&conn)?;
         Ok(Self {
             conn,
             path: path.to_path_buf(),
@@ -270,7 +270,7 @@ fn set_wal_mode(conn: &Connection) -> Result<(), String> {
         .map_err(|err| format!("Failed to set PID identity sidecar WAL mode: {err}"))
 }
 
-fn ensure_schema(conn: &Connection) -> Result<(), String> {
+pub(crate) fn ensure_identity_schema(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS pid_identity (
             os_pid                  INTEGER NOT NULL,
