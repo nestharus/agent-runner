@@ -62,7 +62,7 @@ fn resume_resolution_error_payload(
     match err {
         ResumeError::InvalidUuid { input } => ResumeResolutionErrorPayload::JsonError {
             code: "invalid-session-id",
-            message: invalid_session_uuid_message(&input),
+            message: invalid_session_id_message(&input),
         },
         ResumeError::NoChainFound { input } => ResumeResolutionErrorPayload::JsonError {
             code: "session-not-found",
@@ -257,8 +257,8 @@ fn emit_unknown_diagnostic_payload(payload: &serde_json::Value) {
     }
 }
 
-fn invalid_session_uuid_message(input: &str) -> String {
-    format!("invalid session UUID: {input}")
+fn invalid_session_id_message(input: &str) -> String {
+    format!("invalid session id: {input}")
 }
 
 fn no_chain_found_message(input: &str) -> String {

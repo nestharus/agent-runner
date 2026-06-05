@@ -44,6 +44,10 @@ pub(crate) fn run_repl(
     working_dir: Option<&Path>,
     models_dir_override: Option<&Path>,
 ) -> Result<i32, String> {
+    if let Some(session_id) = resume {
+        crate::run::resume::validate_resume_input(session_id)?;
+    }
+
     let mut prepared = prepare_repl_execution(
         agent_runtime_services,
         model_name,

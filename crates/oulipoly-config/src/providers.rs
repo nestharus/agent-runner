@@ -1289,6 +1289,91 @@ event_id_path = "sessionID"
     }
 
     #[test]
+    fn rejects_stdout_json_event_json_flag_without_last_message_flag() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            r#"
+[json-provider]
+command = "json-provider"
+
+[json-provider.session_capture]
+kind = "stdout_json_event"
+json_flag = "--json"
+event_type = "agent.session_started"
+event_id_path = "data.id"
+"#
+        )
+        .unwrap();
+
+        let err = ProvidersConfig::load(f.path()).unwrap_err();
+
+        assert!(
+            err.contains(
+                "providers.toml provider json-provider: session_capture.kind = stdout_json_event requires `last_message_flag` when `json_flag` is set"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_stdout_json_event_json_args_with_last_message_flag() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            r#"
+[opencode]
+command = "opencode"
+
+[opencode.session_capture]
+kind = "stdout_json_event"
+json_args = ["--format", "json"]
+last_message_flag = "--last-message"
+event_type = "step_start"
+event_id_path = "sessionID"
+"#
+        )
+        .unwrap();
+
+        let err = ProvidersConfig::load(f.path()).unwrap_err();
+
+        assert!(
+            err.contains(
+                "providers.toml provider opencode: session_capture.kind = stdout_json_event does not allow `last_message_flag` with `json_args`"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_stdout_json_event_empty_json_args() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            r#"
+[opencode]
+command = "opencode"
+
+[opencode.session_capture]
+kind = "stdout_json_event"
+json_args = []
+event_type = "step_start"
+event_id_path = "sessionID"
+"#
+        )
+        .unwrap();
+
+        let err = ProvidersConfig::load(f.path()).unwrap_err();
+
+        assert!(
+            err.contains(
+                "providers.toml provider opencode: session_capture.kind = stdout_json_event requires non-empty `json_args`"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn parses_script_session_storage() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         writeln!(

@@ -1,18 +1,18 @@
 # Project Decisions
 
-## D-OC-VI-001-stdout-json-event-without-sidecar — ratified for OpenCode capture
+## D-OC-VI-001-stdout-json-event-dual-shape — strict OpenCode capture support
 
 - **Source**: `planning/oc-gate/code-quality/oc/reports/validation-integrity-auditor.md` VI-001.
-- **Decision**: Ratify `stdout_json_event` capture with multi-token `json_args` and no required last-message sidecar. OpenCode needs `--format json` and exposes `step_start.sessionID`; it does not expose a documented last-message sidecar equivalent.
-- **Evidence**: `planning/opencode-contract/gap-matrix.md` § `Proof plan`; tests `opencode_launch_argv_uses_format_json_and_captures_session`, `opencode_stdout_json_event_step_start_session_id`, and `parses_opencode_session_capture_json_args_for_all_accounts`.
-- **Revisit when**: live isolated OpenCode evidence shows `--format json` cannot deterministically emit `step_start.sessionID` for completed runner invocations.
+- **Decision**: Preserve strict `stdout_json_event` validation through two exclusive shapes. The `json_flag` shape requires both `json_flag` and `last_message_flag`; the OpenCode args shape requires non-empty `json_args` and rejects `json_flag` or `last_message_flag` mixing.
+- **Evidence**: `planning/opencode-contract/gap-matrix.md` § `Proof plan`; tests `age230_stdout_json_event_capture_requires_last_message_flag`, `opencode_stdout_json_event_capture_rejects_stray_last_message_flag_with_json_args`, `opencode_stdout_json_event_capture_rejects_stray_json_flag_with_json_args`, `opencode_stdout_json_event_capture_rejects_empty_json_args`, `opencode_launch_argv_uses_format_json_and_captures_session`, `opencode_stdout_json_event_step_start_session_id`, and `parses_opencode_session_capture_json_args_for_all_accounts`.
+- **Revisit when**: another provider needs a third strictly-validated capture shape with a documented session-id event contract.
 
-## D-OC-VI-002-non-uuid-resume-input — ratified for provider session IDs
+## D-OC-VI-002-dual-grammar-resume-input — strict provider session IDs
 
 - **Source**: `planning/oc-gate/code-quality/oc/reports/validation-integrity-auditor.md` VI-002.
-- **Decision**: Ratify accepting non-empty resume input and relying on `StateDb::resolve_resume` as the real validation surface. OpenCode native sessions are `ses_...`, so UUID-only prevalidation incorrectly rejects valid provider session IDs before DB resolution can bind them to a known chain/provider.
-- **Evidence**: `planning/opencode-contract/gap-matrix.md` § `Proof plan`; tests `resolve_resume_accepts_opencode_provider_session_id`, `opencode_resume_flag_composes_session`, `opencode_resume_accepts_ses_provider_session_id`, and `opencode_notify_idle_wakes_resume_with_ses_session`.
-- **Revisit when**: a provider session ID format causes ambiguous or unsafe resolution that `resolve_resume` cannot disambiguate with the current chain/active-segment rules.
+- **Decision**: Preserve fail-fast resume validation through a strict dual grammar. Resume input must be either the existing UUID grammar or an OpenCode provider session id matching `ses_` plus an alphanumeric suffix of sane length; malformed input is rejected before DB/config initialization.
+- **Evidence**: `planning/opencode-contract/gap-matrix.md` § `Proof plan`; tests `headless_resume_malformed_id_fails_fast_without_state_db`, `repl_resume_malformed_id_fails_fast_without_state_db`, `top_level_resume_malformed_id_fails_fast_without_state_db_or_provider_config`, `resolve_resume_accepts_opencode_provider_session_id`, `opencode_resume_flag_composes_session`, `opencode_resume_accepts_ses_provider_session_id`, and `opencode_notify_idle_wakes_resume_with_ses_session`.
+- **Revisit when**: a provider needs another documented provider-session grammar that can be validated before DB/config initialization without admitting arbitrary input.
 
 ## D-OC-VI-003-opencode-resume-acceptance-phrases — deferred until live wording is verified
 

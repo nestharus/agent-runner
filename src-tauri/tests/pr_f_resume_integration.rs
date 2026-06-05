@@ -663,19 +663,8 @@ fn invocation_count_for_session(fixture: &Fixture, session_id: &str) -> i64 {
 }
 
 #[test]
-fn headless_resume_unknown_non_uuid_reports_no_chain_found() {
+fn headless_resume_malformed_id_fails_fast_without_state_db() {
     let fixture = Fixture::new();
-    let script = fixture.write_script("provider.sh", "exit 0");
-    fixture.write_single_provider_model(
-        "gpt-high",
-        "opencode",
-        &script,
-        r#"
-[providers.resume]
-kind = "flag"
-flag = "--resume"
-"#,
-    );
     let output = fixture
         .base_resume_command("gpt-high", "not-a-uuid")
         .arg("--prompt")
@@ -686,9 +675,10 @@ flag = "--resume"
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("No session found matching not-a-uuid"),
+        stderr.contains("invalid session id: not-a-uuid"),
         "{stderr}"
     );
+    assert!(!fixture.db_path().exists());
 }
 
 #[test]
@@ -2194,27 +2184,41 @@ subcommand = ["resume"]
 }
 
 #[test]
-fn resume_unknown_non_uuid_reports_no_chain_found() {
+fn repl_resume_malformed_id_fails_fast_without_state_db() {
     let fixture = Fixture::new();
-    let script = fixture.write_script("claude.sh", "exit 0");
-    fixture.write_single_provider_model(
-        "claude-opus",
-        "claude2",
-        &script,
-        r#"
-[providers.resume]
-kind = "flag"
-flag = "--resume"
-"#,
-    );
 
     let output = fixture.run_repl("claude-opus", Some("not-a-uuid"));
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert!(
-        stderr.contains("No session found matching not-a-uuid"),
+        stderr.contains("invalid session id: not-a-uuid"),
         "{stderr}"
+    );
+    assert!(!fixture.db_path().exists());
+}
+
+#[test]
+fn top_level_resume_malformed_id_fails_fast_without_state_db_or_provider_config() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .base_top_level_resume_without_model_command("not-a-uuid")
+        .output()
+        .unwrap();
+
+    assert_ne!(output.status.code(), Some(0), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid session id: not-a-uuid"),
+        "{stderr}"
+    );
+    assert!(!fixture.db_path().exists());
+    assert!(
+        !fixture
+            .config_home
+            .join("oulipoly-agent-runner")
+            .join("providers.toml")
+            .exists()
     );
 }
 

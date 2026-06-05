@@ -477,11 +477,53 @@ fn age230_stdout_json_event_capture_requires_json_flag_or_json_args() {
 }
 
 #[test]
-fn age230_stdout_json_event_capture_allows_missing_last_message_sidecar() {
+fn age230_stdout_json_event_capture_requires_last_message_flag() {
     let mut capture = stdout_json_event_capture();
     capture.last_message_flag = None;
 
-    execute_with_session_capture(capture).expect("last-message sidecar is optional");
+    let err = execute_with_session_capture(capture).unwrap_err();
+
+    assert_eq!(err, "session_capture.last_message_flag is required");
+}
+
+#[test]
+fn opencode_stdout_json_event_capture_rejects_stray_last_message_flag_with_json_args() {
+    let mut capture = stdout_json_event_capture();
+    capture.json_flag = None;
+    capture.json_args = Some(vec!["--format".to_string(), "json".to_string()]);
+
+    let err = execute_with_session_capture(capture).unwrap_err();
+
+    assert_eq!(
+        err,
+        "session_capture.last_message_flag is not allowed when session_capture.json_args is set"
+    );
+}
+
+#[test]
+fn opencode_stdout_json_event_capture_rejects_stray_json_flag_with_json_args() {
+    let mut capture = stdout_json_event_capture();
+    capture.json_args = Some(vec!["--format".to_string(), "json".to_string()]);
+    capture.last_message_flag = None;
+
+    let err = execute_with_session_capture(capture).unwrap_err();
+
+    assert_eq!(
+        err,
+        "session_capture.json_flag is not allowed when session_capture.json_args is set"
+    );
+}
+
+#[test]
+fn opencode_stdout_json_event_capture_rejects_empty_json_args() {
+    let mut capture = stdout_json_event_capture();
+    capture.json_flag = None;
+    capture.json_args = Some(Vec::new());
+    capture.last_message_flag = None;
+
+    let err = execute_with_session_capture(capture).unwrap_err();
+
+    assert_eq!(err, "session_capture.json_args must be non-empty");
 }
 
 #[test]

@@ -12,3 +12,4 @@ mod source_guard;
 mod validator;
 
 pub(crate) use orchestration::run_resume;
+pub(crate) use validator::validate_resume_input;

@@ -20,6 +20,11 @@ use super::paths::last_message_capture_path;
 use oulipoly_config::{SessionCapture, SessionCaptureKind};
 use std::path::PathBuf;
 
+struct StdoutJsonEventShape {
+    json_args: Vec<String>,
+    last_message_flag: Option<String>,
+}
+
 pub(in crate::executor::cli) enum CapturePlan {
     None,
     ForcedFlagVerified {
@@ -72,11 +77,11 @@ fn build_forced_flag_capture_plan(
 fn build_stdout_json_event_capture_plan(
     capture: &SessionCapture,
 ) -> Result<(CapturePlan, Vec<String>, Vec<PathBuf>), String> {
-    let json_args = stdout_json_event_json_args(capture)?;
+    let shape = stdout_json_event_shape(capture)?;
     let event_type = required_capture_field(&capture.event_type, "session_capture.event_type")?;
     let event_id_path =
         required_capture_field(&capture.event_id_path, "session_capture.event_id_path")?;
-    let last_message_path = capture
+    let last_message_path = shape
         .last_message_flag
         .as_ref()
         .map(|_| last_message_capture_path());
@@ -88,25 +93,51 @@ fn build_stdout_json_event_capture_plan(
             last_message_path: last_message_path.clone(),
         },
         stdout_json_event_capture_args(
-            json_args,
-            capture.last_message_flag.clone(),
+            shape.json_args,
+            shape.last_message_flag,
             last_message_path.as_deref(),
         ),
         temp_files,
     ))
 }
 
-fn stdout_json_event_json_args(capture: &SessionCapture) -> Result<Vec<String>, String> {
-    match (&capture.json_args, &capture.json_flag) {
-        (Some(args), _) if args.is_empty() => {
-            Err(required_capture_field_message("session_capture.json_args"))
+fn stdout_json_event_shape(capture: &SessionCapture) -> Result<StdoutJsonEventShape, String> {
+    if let Some(args) = &capture.json_args {
+        if args.is_empty() {
+            return Err("session_capture.json_args must be non-empty".to_string());
         }
-        (Some(args), _) => Ok(args.clone()),
-        (None, Some(flag)) => Ok(vec![flag.clone()]),
-        (None, None) => Err(required_capture_field_message(
-            "session_capture.json_flag or session_capture.json_args",
-        )),
+        if capture.json_flag.is_some() {
+            return Err(
+                "session_capture.json_flag is not allowed when session_capture.json_args is set"
+                    .to_string(),
+            );
+        }
+        if capture.last_message_flag.is_some() {
+            return Err(
+                "session_capture.last_message_flag is not allowed when session_capture.json_args is set"
+                    .to_string(),
+            );
+        }
+        return Ok(StdoutJsonEventShape {
+            json_args: args.clone(),
+            last_message_flag: None,
+        });
     }
+
+    if let Some(flag) = &capture.json_flag {
+        let last_message_flag = required_capture_field(
+            &capture.last_message_flag,
+            "session_capture.last_message_flag",
+        )?;
+        return Ok(StdoutJsonEventShape {
+            json_args: vec![flag.clone()],
+            last_message_flag: Some(last_message_flag),
+        });
+    }
+
+    Err(required_capture_field_message(
+        "session_capture.json_flag or session_capture.json_args",
+    ))
 }
 
 fn required_capture_field(field: &Option<String>, name: &str) -> Result<String, String> {

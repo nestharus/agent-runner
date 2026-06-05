@@ -66,6 +66,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use uuid::Uuid;
 
+const OPENCODE_SESSION_PREFIX: &str = "ses_";
+const OPENCODE_SESSION_MIN_SUFFIX_LEN: usize = 3;
+
 /// Ceiling on the per-turn burn rate that `upsert_quota_refresh` is willing
 /// to learn from a single refresh-to-refresh sample. A transient upstream
 /// spike (observed on the ChatGPT usage endpoint: `used_percent` briefly
@@ -6293,6 +6296,7 @@ impl StateDb {
         input: &str,
         model_override: Option<&str>,
     ) -> Result<ResolvedResume, ResumeError> {
+        Self::validate_resume_input_id(input)?;
         self.reject_wrong_resume_id_kind(input)?;
         let chain_id = self.resolve_resume_chain_id(input)?;
         let (active_provider, active_session_id) = self.require_active_segment(&chain_id)?;
@@ -6306,6 +6310,25 @@ impl StateDb {
             active_provider,
             active_session_id,
         ))
+    }
+
+    fn validate_resume_input_id(input: &str) -> Result<(), ResumeError> {
+        if Uuid::parse_str(input).is_ok() || Self::is_opencode_provider_session_id(input) {
+            return Ok(());
+        }
+
+        Err(ResumeError::InvalidUuid {
+            input: input.to_string(),
+        })
+    }
+
+    fn is_opencode_provider_session_id(input: &str) -> bool {
+        let Some(suffix) = input.strip_prefix(OPENCODE_SESSION_PREFIX) else {
+            return false;
+        };
+
+        suffix.len() >= OPENCODE_SESSION_MIN_SUFFIX_LEN
+            && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
     }
 
     fn reject_wrong_resume_id_kind(&self, input: &str) -> Result<(), ResumeError> {
@@ -12280,7 +12303,13 @@ interactive_args = ["launch"]
             test_db()
                 .resolve_resume(&models, "not-a-uuid", None)
                 .unwrap_err(),
-            ResumeError::NoChainFound { .. }
+            ResumeError::InvalidUuid { .. }
+        ));
+        assert!(matches!(
+            test_db()
+                .resolve_resume(&models, "ses_ab", None)
+                .unwrap_err(),
+            ResumeError::InvalidUuid { .. }
         ));
         assert!(matches!(
             test_db()

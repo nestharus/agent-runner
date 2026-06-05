@@ -20,9 +20,9 @@ This is the honest post-split union for changed production Rust bodies after Ope
 Focused sub-surfaces:
 
 - OpenCode terminal recognition: `orchestration`, `parser`, `filter`, `formatter`, `validator`, `mapper`, `accessor`, `predicate`
-- Session capture JSON args, planning, streaming observation, and capture results: `formatter`, `validator`, `mapper`, `orchestration`
+- Session capture strict dual-shape validation, planning, streaming observation, and capture results: `formatter`, `validator`, `mapper`, `orchestration`
 - Provider identity dispatch and facade exports: `mapper`, `orchestration`, `accessor`
-- Resume input, resume acceptance, and non-UUID resume resolution: `validator`, `predicate`, `orchestration`
+- Resume input, resume acceptance, and dual-grammar resume resolution: `validator`, `predicate`, `orchestration`
 - Config parsing surfaces touched only by tests or schema fields keep their file-local role declarations rather than expanding the WU component role set.
 
 ## Per-file declared roles
@@ -46,8 +46,11 @@ Focused sub-surfaces:
 | `crates/oulipoly-runtime/src/executor/providers/opencode.rs` | `orchestration`, `parser`, `filter`, `formatter`, `validator`, `mapper`, `accessor`, `predicate` | New provider recognizer; OpenCode JSON stream decoding, line filtering, event validation, terminal mapping, and evidence formatting are split into single-classification helpers. |
 | `crates/oulipoly-runtime/src/executor/terminal_signal.rs` | `accessor`, `formatter`, `mapper`, `orchestration`, `validator` | Existing shared DTO/helper roles; this WU only adds tests, no changed production function inventory entry. |
 | `crates/oulipoly-state/src/db.rs` | `accessor`, `mapper`, `formatter`, `predicate`, `validator`, `parser`, `orchestration`, `filter` | Existing declared multi-role StateDb persistence adapter; changed production function is resume-resolution orchestration. |
-| `src-tauri/src/run/resume/orchestration.rs` | `orchestration`, `validator`, `accessor`, `mapper`, `filter`, `predicate`, `formatter` | Existing resume orchestration roles; changed production function delegates to the relaxed validator. |
-| `src-tauri/src/run/resume/validator.rs` | `validator` | Replaced UUID-only validation with non-empty resume input validation. |
+| `src-tauri/src/error_emit.rs` | `formatter`, `mapper`, `orchestration` | Existing resume-resolution error emission roles; changed production helper formats invalid resume ids with the dual-grammar wording. |
+| `src-tauri/src/resume_cli.rs` | `formatter`, `mapper`, `orchestration`, `validator` | Existing resume CLI rendering and target-composition roles; changed production function formats invalid resume ids with the dual-grammar wording. |
+| `src-tauri/src/run/repl/orchestration.rs` | `orchestration`, `validator`, `accessor`, `mapper`, `filter`, `predicate`, `formatter` | Existing REPL orchestration roles; changed production function delegates early resume input validation before environment loading. |
+| `src-tauri/src/run/resume/orchestration.rs` | `orchestration`, `validator`, `accessor`, `mapper`, `filter`, `predicate`, `formatter` | Existing resume orchestration roles; changed production function delegates to the strict dual-grammar validator. |
+| `src-tauri/src/run/resume/validator.rs` | `validator`, `predicate` | Replaced non-empty resume input validation with strict UUID-or-OpenCode-provider-session validation. |
 | `scripts/opencode-turns` | `parser`, `accessor`, `mapper`, `formatter`, `filter`, `validator`, `orchestration` | Non-Rust adapter invokes public `opencode session list` for implicit discovery, invokes public `opencode export <sessionID>` for content, and maps exported session JSON to normalized turn JSONL. |
 
 Touched non-Rust adapter surface: `scripts/opencode-turns`. It is intentionally excluded from the Rust A5 function inventory, but has an explicit A6 per-file role declaration above because A6 is language-neutral.
@@ -58,10 +61,11 @@ Production functions added or meaningfully changed in the touched Rust are liste
 
 | Function | A1 classification | Justification |
 |---|---|---|
-| `crates/oulipoly-config/src/model.rs::SessionCapture::validate` | `validator` | Accepts or rejects `SessionCapture` by kind, now allowing non-empty `json_args` or `json_flag` and optional last-message sidecar. |
+| `crates/oulipoly-config/src/model.rs::SessionCapture::validate` | `validator` | Accepts or rejects `SessionCapture` by kind and delegates stdout-json-event shape validation before required event fields. |
+| `crates/oulipoly-config/src/model.rs::SessionCapture::validate_stdout_json_event_shape` | `validator` | Enforces the exclusive codex shape (`json_flag` plus `last_message_flag`) or args shape (non-empty `json_args` with no sidecar or flag mixing). |
 | `crates/oulipoly-runtime/src/executor/cli/session_capture/args.rs::stdout_json_event_capture_args` | `formatter` | Formats capture configuration into provider argv tokens for JSON mode and optional last-message reconstruction. |
-| `crates/oulipoly-runtime/src/executor/cli/session_capture/plan.rs::build_stdout_json_event_capture_plan` | `mapper` | Maps a valid `SessionCapture` into `CapturePlan`, argv fragments, and temp-file ownership; validation is delegated. |
-| `crates/oulipoly-runtime/src/executor/cli/session_capture/plan.rs::stdout_json_event_json_args` | `validator` | Accepts non-empty `json_args` or legacy `json_flag` and returns the validated argv fragment, otherwise errors. |
+| `crates/oulipoly-runtime/src/executor/cli/session_capture/plan.rs::build_stdout_json_event_capture_plan` | `mapper` | Maps a strictly-shaped `SessionCapture` into `CapturePlan`, argv fragments, and temp-file ownership; shape validation is delegated. |
+| `crates/oulipoly-runtime/src/executor/cli/session_capture/plan.rs::stdout_json_event_shape` | `validator` | Enforces the runtime exclusive codex shape (`json_flag` plus `last_message_flag`) or args shape (non-empty `json_args` with no sidecar or flag mixing). |
 | `crates/oulipoly-runtime/src/executor/cli/capture_result.rs::finalize_capture` | `mapper` | Maps capture plan variant plus stdout or streamed session ID into a `SessionCaptureResult`. |
 | `crates/oulipoly-runtime/src/executor/cli/capture_result.rs::finalize_stdout_json_event_capture` | `mapper` | Maps a streamed session ID or parsed stdout JSON event into the stdout-json-event capture result. |
 | `crates/oulipoly-runtime/src/executor/cli/capture_result.rs::maybe_restore_plain_stdout` | `orchestration` | Chooses sidecar restoration only when the capture plan owns a last-message path, otherwise uses stdout fallback. |
@@ -92,11 +96,17 @@ Production functions added or meaningfully changed in the touched Rust are liste
 | `crates/oulipoly-runtime/src/executor/providers/opencode.rs::error_reports_rate_limit` | `predicate` | Answers whether status code or message text reports a rate limit. |
 | `crates/oulipoly-runtime/src/executor/providers/opencode.rs::message_reports_rate_limit` | `predicate` | Answers whether a lowercased provider message reports rate limiting. |
 | `crates/oulipoly-runtime/src/executor/providers/opencode.rs::error_reports_persistent_quota` | `predicate` | Answers whether lowercased provider message text reports persistent quota exhaustion. |
-| `crates/oulipoly-state/src/db.rs::StateDb::resolve_resume` | `orchestration` | Sequences wrong-ID-kind rejection, chain lookup, active segment lookup, model resolution, and result assembly; UUID validation was removed. |
-| `src-tauri/src/run/resume/orchestration.rs::reject_invalid_resume_input` | `orchestration` | Delegates validation and routes failure to stderr plus exit code, now using the non-UUID validator. |
-| `src-tauri/src/run/resume/validator.rs::validate_resume_input` | `validator` | Accepts any non-empty resume input and rejects only blank input. |
+| `crates/oulipoly-state/src/db.rs::StateDb::resolve_resume` | `orchestration` | Sequences strict dual-grammar resume input validation, wrong-ID-kind rejection, chain lookup, active segment lookup, model resolution, and result assembly. |
+| `crates/oulipoly-state/src/db.rs::StateDb::validate_resume_input_id` | `validator` | Accepts the existing UUID grammar or strict OpenCode `ses_` provider-session grammar before any DB lookup. |
+| `crates/oulipoly-state/src/db.rs::StateDb::is_opencode_provider_session_id` | `predicate` | Answers whether an input has the strict `ses_` plus alphanumeric minimum-length suffix grammar. |
+| `src-tauri/src/error_emit.rs::invalid_session_id_message` | `formatter` | Formats malformed resume input with provider-session-neutral `invalid session id` wording. |
+| `src-tauri/src/resume_cli.rs::format_resume_error` | `formatter` | Formats `ResumeError` variants for CLI stderr, including the provider-session-neutral invalid id wording. |
+| `src-tauri/src/run/repl/orchestration.rs::run_repl` | `orchestration` | Sequences early dual-grammar resume input validation before REPL environment/config/DB loading, then continues existing REPL preparation and launch. |
+| `src-tauri/src/run/resume/orchestration.rs::reject_invalid_resume_input` | `orchestration` | Delegates validation and routes failure to stderr plus exit code, now using the strict dual-grammar validator. |
+| `src-tauri/src/run/resume/validator.rs::validate_resume_input` | `validator` | Accepts either a UUID or strict OpenCode `ses_` provider-session id and rejects blank or malformed input. |
+| `src-tauri/src/run/resume/validator.rs::is_opencode_provider_session_id` | `predicate` | Answers whether an input has the strict `ses_` plus alphanumeric minimum-length suffix grammar. |
 
-Removed production function, not a current-body A5 inventory item: `crates/oulipoly-state/src/db.rs::StateDb::validate_resume_input_uuid`.
+Removed production function, not a current-body A5 inventory item: `crates/oulipoly-state/src/db.rs::StateDb::validate_resume_input_uuid`; replaced by strict dual-grammar `StateDb::validate_resume_input_id`.
 
 No production function inventory entries for these touched Rust files because the diff only changed tests, comments, exports, module declarations, or data fields: `crates/oulipoly-config/src/providers.rs`, `crates/oulipoly-runtime/src/executor/cli.rs`, `crates/oulipoly-runtime/src/executor/mod.rs`, `crates/oulipoly-runtime/src/executor/providers/mod.rs`, `crates/oulipoly-runtime/src/executor/terminal_signal.rs`.
 
@@ -128,7 +138,7 @@ adapter_declarations:
 
 `opencode-format-json-event-stream-contract` covers the OpenCode `--format json` stream fields used here: `step_start.sessionID` for session capture context and `error` events carrying `statusCode`, `status_code`, `status`, or message text that reports `429`, rate limit, or quota exhaustion.
 
-`provider-stdout-json-event-session-contract` covers provider stdout JSON events selected by configured `event_type` and `event_id_path`, with launch-time `json_args` or legacy `json_flag`, optional last-message sidecar argv, live streamed session observation, and final capture-result mapping.
+`provider-stdout-json-event-session-contract` covers provider stdout JSON events selected by configured `event_type` and `event_id_path`, with an exclusive launch-time shape: either non-empty `json_args` with no last-message sidecar or `json_flag` plus required `last_message_flag`, live streamed session observation, and final capture-result mapping.
 
 `scripts/opencode-turns` is a non-Rust adapter surface. It translates public `opencode session list` output into candidate session IDs, translates the public `opencode export <sessionID>` JSON result into runner-normalized turn JSONL, and is intentionally excluded from the Rust A5 function inventory. It does not read OpenCode private storage or native message JSON files.
 
@@ -144,7 +154,7 @@ intrinsic_surface_declarations:
     role: intrinsic-surface
     Domain: model_provider_session_config
     Owns:
-      - session_capture_json_args_validation
+      - stdout_json_event_dual_shape_validation
       - stdout_json_event_capture_required_fields
   - component: crates/oulipoly-runtime/src/executor/cli/provider_identity.rs
     role: intrinsic-surface
@@ -158,8 +168,8 @@ intrinsic_surface_declarations:
     Domain: provider_stdout_json_session_capture
     Owns:
       - stdout_json_event_session_id_path_extraction
-      - json_args_or_json_flag_capture_argv
-      - optional_last_message_sidecar
+      - codex_json_flag_last_message_shape
+      - json_args_without_sidecar_shape
   - component: crates/oulipoly-runtime/src/executor/providers/opencode.rs
     role: intrinsic-surface
     Domain: opencode_terminal_signal_json
@@ -178,8 +188,14 @@ intrinsic_surface_declarations:
     role: intrinsic-surface
     Domain: state_db_resume_resolution
     Owns:
+      - dual_grammar_resume_input_validation
       - provider_session_id_resume_lookup
       - wrong_id_kind_invocation_guard
+  - component: src-tauri/src/run/resume/validator.rs
+    role: intrinsic-surface
+    Domain: cli_resume_input_validation
+    Owns:
+      - fail_fast_uuid_or_opencode_session_id_validation
 ```
 
-No intrinsic-surface declaration is made for `src-tauri/src/run/resume/validator.rs` or `src-tauri/src/run/resume/orchestration.rs`; those files consume the resume-input and state-resolution contracts rather than owning a provider or parsing surface.
+No intrinsic-surface declaration is made for `src-tauri/src/run/resume/orchestration.rs`; it consumes the resume-input and state-resolution contracts rather than owning a provider or parsing surface.
