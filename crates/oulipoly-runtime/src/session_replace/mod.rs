@@ -1721,11 +1721,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn default_data_root() -> Result<PathBuf, ReplaceError> {
-    dirs::data_dir()
-        .map(|dir| dir.join("oulipoly-agent-runner"))
-        .ok_or_else(|| ReplaceError::OperationalError {
-            message: "could not determine data directory".to_string(),
-        })
+    oulipoly_state::paths::data_dir().map_err(|_| ReplaceError::OperationalError {
+        message: "could not determine data directory".to_string(),
+    })
 }
 
 fn default_config_root() -> PathBuf {

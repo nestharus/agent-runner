@@ -60,7 +60,10 @@ fn lock_dir_env_vars(
     path: &Path,
     extra_env: Vec<(&'static str, Option<std::ffi::OsString>)>,
 ) -> Vec<(&'static str, Option<std::ffi::OsString>)> {
-    let mut vars = vec![("OULIPOLY_DATA_HOME", Some(path.as_os_str().to_os_string()))];
+    let mut vars = vec![
+        ("OULIPOLY_DATA_DIR", None),
+        ("OULIPOLY_DATA_HOME", Some(path.as_os_str().to_os_string())),
+    ];
     vars.extend(extra_env);
     vars
 }
@@ -292,8 +295,31 @@ fn lock_name_sanitization_and_lock_dir_env_precedence_are_stable() {
 
     let oulipoly_home = tempdir().unwrap();
     let xdg_home = tempdir().unwrap();
+    let pinned_home = tempdir().unwrap();
     {
         let _env_guard = EnvGuard::set_many(vec![
+            (
+                "OULIPOLY_DATA_DIR",
+                Some(pinned_home.path().as_os_str().to_os_string()),
+            ),
+            (
+                "OULIPOLY_DATA_HOME",
+                Some(oulipoly_home.path().as_os_str().to_os_string()),
+            ),
+            (
+                "XDG_DATA_HOME",
+                Some(xdg_home.path().as_os_str().to_os_string()),
+            ),
+        ]);
+        assert_eq!(
+            lock::usage_lock_dir(),
+            pinned_home.path().join("usage-refresh-locks")
+        );
+    }
+
+    {
+        let _env_guard = EnvGuard::set_many(vec![
+            ("OULIPOLY_DATA_DIR", None),
             (
                 "OULIPOLY_DATA_HOME",
                 Some(oulipoly_home.path().as_os_str().to_os_string()),
@@ -314,6 +340,7 @@ fn lock_name_sanitization_and_lock_dir_env_precedence_are_stable() {
 
     {
         let _env_guard = EnvGuard::set_many(vec![
+            ("OULIPOLY_DATA_DIR", None),
             ("OULIPOLY_DATA_HOME", None),
             (
                 "XDG_DATA_HOME",

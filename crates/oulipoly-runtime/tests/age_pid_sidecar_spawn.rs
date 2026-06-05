@@ -16,18 +16,22 @@ const INVOCATION_UUID: &str = "aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa";
 
 struct EnvGuard {
     _lock: MutexGuard<'static, ()>,
+    old_oulipoly_data_dir: Option<OsString>,
     old_xdg_data_home: Option<OsString>,
 }
 
 impl EnvGuard {
     fn set_xdg_data_home(path: &Path) -> Self {
         let lock = env_lock().lock().unwrap();
+        let old_oulipoly_data_dir = std::env::var_os("OULIPOLY_DATA_DIR");
         let old_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
         unsafe {
+            std::env::remove_var("OULIPOLY_DATA_DIR");
             std::env::set_var("XDG_DATA_HOME", path);
         }
         Self {
             _lock: lock,
+            old_oulipoly_data_dir,
             old_xdg_data_home,
         }
     }
@@ -36,6 +40,10 @@ impl EnvGuard {
 impl Drop for EnvGuard {
     fn drop(&mut self) {
         unsafe {
+            match self.old_oulipoly_data_dir.take() {
+                Some(value) => std::env::set_var("OULIPOLY_DATA_DIR", value),
+                None => std::env::remove_var("OULIPOLY_DATA_DIR"),
+            }
             match self.old_xdg_data_home.take() {
                 Some(value) => std::env::set_var("XDG_DATA_HOME", value),
                 None => std::env::remove_var("XDG_DATA_HOME"),

@@ -94,9 +94,7 @@ fn provider_lock_file_name(provider_name: &str) -> String {
 }
 
 pub(super) fn usage_lock_dir() -> PathBuf {
-    lock_paths::data_home()
-        .join("oulipoly-agent-runner")
-        .join("usage-refresh-locks")
+    lock_paths::app_data_dir().join("usage-refresh-locks")
 }
 
 pub(super) fn sanitize_lock_name(name: &str) -> String {

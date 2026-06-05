@@ -206,9 +206,7 @@ fn default_cli_runtime_paths() -> RuntimePaths {
         .map(|dir| dir.join("oulipoly-agent-runner"))
         .unwrap_or_else(|| PathBuf::from("."));
     let models_dir = config_root.join("models");
-    let data_root = dirs::data_dir()
-        .map(|dir| dir.join("oulipoly-agent-runner"))
-        .unwrap_or_else(|| config_root.clone());
+    let data_root = oulipoly_state::paths::data_dir().unwrap_or_else(|_| config_root.clone());
     RuntimePaths {
         config_root: config_root.clone(),
         models_dir,

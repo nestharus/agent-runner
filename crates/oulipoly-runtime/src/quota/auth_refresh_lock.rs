@@ -50,7 +50,7 @@
 //! failure is non-fatal to the surrounding quota refresh (the caller just
 //! retries the quota script with the existing token).
 
-use super::lock_paths::{data_home, sanitize_lock_name};
+use super::lock_paths::{app_data_dir, sanitize_lock_name};
 use super::process::run_refresh_command;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -188,9 +188,7 @@ fn lock_path(account_key: &str) -> PathBuf {
 }
 
 fn auth_refresh_lock_dir() -> PathBuf {
-    data_home()
-        .join("oulipoly-agent-runner")
-        .join("auth-refresh-locks")
+    app_data_dir().join("auth-refresh-locks")
 }
 
 fn ensure_parent_dir(path: &Path) -> Result<(), String> {

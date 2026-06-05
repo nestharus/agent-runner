@@ -390,11 +390,13 @@ fn resolve_state_dir(provider_name: &str, entry: &SessionSourceEntry) -> PathBuf
     if let Some(dir) = &entry.state_dir {
         return dir.clone();
     }
-    let base = dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("oulipoly-agent-runner")
-        .join("sessions");
+    let base = default_app_data_dir().join("sessions");
     base.join(provider_name)
+}
+
+fn default_app_data_dir() -> PathBuf {
+    oulipoly_state::paths::data_dir()
+        .unwrap_or_else(|_| PathBuf::from(".").join(oulipoly_state::paths::APP_DATA_DIR_NAME))
 }
 
 fn run_turn_script(script: &str, state_dir: &std::path::Path) -> Result<String, String> {

@@ -398,9 +398,9 @@ fn control_socket_dir() -> Result<PathBuf, String> {
     if let Some(state) = std::env::var_os("XDG_STATE_HOME") {
         return Ok(PathBuf::from(state).join("oulipoly-agent-runner/runtime/pty"));
     }
-    let base =
-        dirs::data_dir().ok_or_else(|| "Failed to resolve user data directory".to_string())?;
-    Ok(base.join("oulipoly-agent-runner/runtime/pty"))
+    let base = oulipoly_state::paths::data_dir()
+        .map_err(|_| "Failed to resolve user data directory".to_string())?;
+    Ok(base.join("runtime/pty"))
 }
 
 fn create_private_dir(dir: &Path) -> Result<(), String> {

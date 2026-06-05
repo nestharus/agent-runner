@@ -35,7 +35,10 @@ pub use freshness::{
     is_topology_probe_due,
 };
 pub use in_flight::{InFlight, InFlightGuard};
-pub use lock_paths::{data_home as lock_data_home, sanitize_lock_name as sanitize_lock_key};
+pub use lock_paths::{
+    app_data_dir as lock_app_data_dir, data_home as lock_data_home,
+    sanitize_lock_name as sanitize_lock_key,
+};
 pub use marker_verification::verify_or_clear_marker;
 pub use outcome::{QuotaScriptWindow, RefreshOutcome};
 pub use parse::parse_output;

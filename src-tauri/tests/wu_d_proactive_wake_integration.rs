@@ -72,6 +72,7 @@ impl Fixture {
             .env("HOME", &self.home_dir)
             .env("AGENT_BASH_AGENT_RUNNER_BIN", runner_bin())
             .env("WU_D_WORK_DIR", &self.work_dir)
+            .env_remove("OULIPOLY_DATA_DIR")
             .env_remove("OULIPOLY_PARENT_INVOCATION")
             .current_dir(self.dir.path());
         cmd.output().unwrap()
@@ -648,11 +649,52 @@ fn notify_command(fixture: &Fixture, handle: &str, identity: &ProcessIdentity) -
         .env("HOME", &fixture.home_dir)
         .env("AGENT_BASH_AGENT_RUNNER_BIN", runner_bin())
         .env("WU_D_WORK_DIR", &fixture.work_dir)
+        .env_remove("OULIPOLY_DATA_DIR")
         .env_remove("OULIPOLY_PARENT_INVOCATION")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .current_dir(fixture.dir.path());
     cmd
+}
+
+#[test]
+fn provider_shadow_xdg_notify_uses_pinned_data_dir_and_wakes() {
+    let _guard = integration_test_guard();
+    let fixture = Fixture::new();
+    fixture.write_provider(&provider_script(
+        r#"if [ -z "${OULIPOLY_DATA_DIR:-}" ]; then
+  printf 'missing OULIPOLY_DATA_DIR\n' >&2
+  exit 65
+fi
+export XDG_DATA_HOME="$work/shadow-xdg"
+( sleep 0.3; notify_handle h-shadow-xdg 0 ) >/dev/null 2>&1 &"#,
+        "",
+        "shadow-resumed-input.txt",
+    ));
+
+    let output = fixture.run_agent("dispatch from shadowed provider");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+
+    let prompt = wait_for_file(&fixture.prompt_file("shadow-resumed-input.txt"));
+    assert!(prompt.contains("handle: h-shadow-xdg"), "{prompt}");
+    let session_id = wait_for_mailbox_session(&fixture);
+    wait_until("shadow-xdg mailbox delivered", || {
+        let db = fixture.mailbox();
+        let rows = db.list_mailbox(&session_id, true).unwrap();
+        rows.len() == 1
+            && rows[0].handle == "h-shadow-xdg"
+            && rows[0].delivered_at.is_some()
+            && db.wake_claim(&session_id).unwrap().is_none()
+    });
+    assert!(
+        !fixture
+            .work_dir
+            .join("shadow-xdg")
+            .join("oulipoly-agent-runner")
+            .exists(),
+        "shadow XDG_DATA_HOME must not receive agent-runner state"
+    );
+    fixture.assert_xdg_isolated();
 }
 
 fn assert_notify_success(output: &Output) {

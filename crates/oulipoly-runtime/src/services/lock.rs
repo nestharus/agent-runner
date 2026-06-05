@@ -181,9 +181,9 @@ fn default_models_dir() -> PathBuf {
 }
 
 fn default_lock_dir() -> Result<PathBuf, LockError> {
-    dirs::data_dir()
-        .map(|dir| dir.join("oulipoly-agent-runner").join("locks"))
-        .ok_or_else(|| LockError::Operational {
+    oulipoly_state::paths::data_dir()
+        .map(|dir| dir.join("locks"))
+        .map_err(|_| LockError::Operational {
             message: "Could not determine data directory".to_string(),
         })
 }

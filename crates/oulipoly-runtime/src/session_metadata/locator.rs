@@ -661,9 +661,8 @@ fn configured_state_dir(entry: &SessionSourceEntry) -> Option<PathBuf> {
 }
 
 fn default_state_dir(provider_name: &str) -> PathBuf {
-    dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("oulipoly-agent-runner")
+    oulipoly_state::paths::data_dir()
+        .unwrap_or_else(|_| PathBuf::from(".").join(oulipoly_state::paths::APP_DATA_DIR_NAME))
         .join("sessions")
         .join(provider_name)
 }

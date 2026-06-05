@@ -93,6 +93,7 @@ impl Fixture {
         cmd.env("XDG_RUNTIME_DIR", &self.runtime_dir);
         cmd.env("XDG_STATE_HOME", &self.state_home);
         cmd.env("HOME", &self.home_dir);
+        cmd.env_remove("OULIPOLY_DATA_DIR");
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
         cmd.output().unwrap()
     }
@@ -137,6 +138,7 @@ impl Fixture {
         cmd.env("XDG_RUNTIME_DIR", &self.runtime_dir);
         cmd.env("XDG_STATE_HOME", &self.state_home);
         cmd.env("HOME", &self.home_dir);
+        cmd.env_remove("OULIPOLY_DATA_DIR");
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
     }
 

@@ -1265,9 +1265,7 @@ impl StateDb {
     }
 
     pub fn default_path() -> Result<PathBuf, String> {
-        let data_dir =
-            dirs::data_dir().ok_or_else(|| "Could not determine data directory".to_string())?;
-        Ok(data_dir.join("oulipoly-agent-runner").join("state.db"))
+        Ok(crate::paths::data_dir()?.join("state.db"))
     }
 
     pub fn connection(&self) -> &sqlite::Connection {

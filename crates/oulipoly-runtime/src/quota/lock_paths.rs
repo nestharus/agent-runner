@@ -10,7 +10,7 @@
 //!   - component: crates/oulipoly-runtime/src/quota/lock_paths.rs
 //!     role: adapter
 //!     Translates:
-//!       - process data-home environment contract (`OULIPOLY_DATA_HOME`, `XDG_DATA_HOME`, `dirs::data_dir`)
+//!       - process data-home environment contract (`OULIPOLY_DATA_DIR`, `OULIPOLY_DATA_HOME`, `XDG_DATA_HOME`, `dirs::data_dir`)
 //!       - lock-name sanitization contract (`[A-Za-z0-9_-]`)
 //! ```
 //!
@@ -30,6 +30,11 @@ pub fn data_home() -> PathBuf {
     env_path("OULIPOLY_DATA_HOME")
         .or_else(|| env_path("XDG_DATA_HOME"))
         .unwrap_or_else(default_data_home)
+}
+
+pub fn app_data_dir() -> PathBuf {
+    env_path(oulipoly_state::paths::DATA_DIR_ENV)
+        .unwrap_or_else(|| data_home().join(oulipoly_state::paths::APP_DATA_DIR_NAME))
 }
 
 fn env_path(name: &str) -> Option<PathBuf> {

@@ -11,7 +11,7 @@
 //!   - component: src-tauri/src/usage/fetcher.rs
 //!     role: adapter
 //!     Translates:
-//!       - runtime quota refresh + shared lock-root contract (`oulipoly_runtime::quota`, `run_script`, `parse_output`, `run_auth_refresh_command_coalesced`, `AuthRefreshAttempt`, `QuotaScriptWindow`, `lock_data_home`, `sanitize_lock_key`)
+//!       - runtime quota refresh + shared lock-root contract (`oulipoly_runtime::quota`, `run_script`, `parse_output`, `run_auth_refresh_command_coalesced`, `AuthRefreshAttempt`, `QuotaScriptWindow`, `lock_app_data_dir`, `sanitize_lock_key`)
 //!       - usage-refresh-lock filesystem contract (`std::fs`, `File`, `OpenOptions`, `std::io`, `std::time::SystemTime`, `Duration`)
 //!       - enumerated-account and state persistence contract (`EnumeratedAccount`, `StateDb`, `QuotaWindowInput`, `upsert_quota_refresh`, `get_windows`)
 //! ```
@@ -163,9 +163,7 @@ impl Drop for RefreshFileLock {
 }
 
 fn usage_lock_dir() -> PathBuf {
-    quota::lock_data_home()
-        .join("oulipoly-agent-runner")
-        .join("usage-refresh-locks")
+    quota::lock_app_data_dir().join("usage-refresh-locks")
 }
 
 fn create_lock_file(path: &Path) -> Result<Option<File>, io::Error> {

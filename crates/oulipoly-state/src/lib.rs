@@ -16,6 +16,7 @@ pub mod invocation_marker;
 mod lifecycle_log;
 pub mod mailbox;
 pub mod migrations;
+pub mod paths;
 pub mod pid_identity;
 pub mod repositories;
 pub mod result_envelope;
