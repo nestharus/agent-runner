@@ -93,6 +93,7 @@ prompt_mode = "arg"
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
+        cmd.env_remove("OULIPOLY_DATA_DIR");
         cmd
     }
 }
@@ -132,6 +133,7 @@ fn one_shot_fails_closed_when_default_state_db_cannot_open() {
 
     let mut cmd = fixture.command();
     cmd.env("XDG_DATA_HOME", &blocked_data_home);
+    cmd.env_remove("OULIPOLY_DATA_DIR");
     cmd.arg("--models-dir")
         .arg(&fixture.models_dir)
         .arg("--model")

@@ -350,6 +350,7 @@ fn base_command(config_home: &Path, data_home: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_DATA_HOME", data_home);
+    cmd.env_remove("OULIPOLY_DATA_DIR");
     cmd.env("HOME", data_home);
     cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
     cmd

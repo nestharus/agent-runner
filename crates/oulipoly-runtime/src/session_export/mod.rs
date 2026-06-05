@@ -569,11 +569,21 @@ mod tests {
 
     fn with_data_home<T>(data_home: &Path, test: impl FnOnce() -> T) -> T {
         let _guard = env_lock().lock().unwrap();
+        let old_data_dir = std::env::var_os("OULIPOLY_DATA_DIR");
         let old = std::env::var_os("XDG_DATA_HOME");
         unsafe {
+            std::env::remove_var("OULIPOLY_DATA_DIR");
             std::env::set_var("XDG_DATA_HOME", data_home);
         }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(test));
+        match old_data_dir {
+            Some(value) => unsafe {
+                std::env::set_var("OULIPOLY_DATA_DIR", value);
+            },
+            None => unsafe {
+                std::env::remove_var("OULIPOLY_DATA_DIR");
+            },
+        }
         match old {
             Some(value) => unsafe {
                 std::env::set_var("XDG_DATA_HOME", value);

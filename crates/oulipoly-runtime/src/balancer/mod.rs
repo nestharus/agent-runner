@@ -1135,10 +1135,13 @@ mod tests {
     #[test]
     fn select_provider_clears_stale_next_available_at_when_refresh_shows_healthy() {
         let _lock_dir = tempfile::tempdir().unwrap();
-        let _env_guard = crate::quota::marker_verification::test_support::EnvGuard::set(
-            "OULIPOLY_DATA_HOME",
-            _lock_dir.path(),
-        );
+        let _env_guard = crate::quota::marker_verification::test_support::EnvGuard::set_many(vec![
+            (
+                "OULIPOLY_DATA_HOME",
+                Some(_lock_dir.path().as_os_str().to_os_string()),
+            ),
+            ("OULIPOLY_DATA_DIR", None),
+        ]);
         let db = StateDb::open(Path::new(":memory:")).unwrap();
         let model = two_provider_model();
         // Provider "a" has a stuck UpstreamApiDown marker far in the future;
@@ -1184,10 +1187,13 @@ mod tests {
     #[test]
     fn select_provider_keeps_marker_when_refresh_shows_exhausted_window() {
         let _lock_dir = tempfile::tempdir().unwrap();
-        let _env_guard = crate::quota::marker_verification::test_support::EnvGuard::set(
-            "OULIPOLY_DATA_HOME",
-            _lock_dir.path(),
-        );
+        let _env_guard = crate::quota::marker_verification::test_support::EnvGuard::set_many(vec![
+            (
+                "OULIPOLY_DATA_HOME",
+                Some(_lock_dir.path().as_os_str().to_os_string()),
+            ),
+            ("OULIPOLY_DATA_DIR", None),
+        ]);
         let db = StateDb::open(Path::new(":memory:")).unwrap();
         let model = two_provider_model();
         let marker_at = Utc::now() + Duration::hours(2);

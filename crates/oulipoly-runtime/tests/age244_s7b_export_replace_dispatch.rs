@@ -46,6 +46,7 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 struct EnvGuard {
     old_config: Option<OsString>,
+    old_oulipoly_data_dir: Option<OsString>,
     old_data: Option<OsString>,
     old_home: Option<OsString>,
     old_path: Option<OsString>,
@@ -55,6 +56,7 @@ impl EnvGuard {
     fn new(config_home: &Path, data_home: &Path) -> Self {
         let guard = Self {
             old_config: std::env::var_os("XDG_CONFIG_HOME"),
+            old_oulipoly_data_dir: std::env::var_os("OULIPOLY_DATA_DIR"),
             old_data: std::env::var_os("XDG_DATA_HOME"),
             old_home: std::env::var_os("HOME"),
             old_path: std::env::var_os("PATH"),
@@ -65,6 +67,7 @@ impl EnvGuard {
         )))
         .expect("test PATH");
         unsafe {
+            std::env::remove_var("OULIPOLY_DATA_DIR");
             std::env::set_var("XDG_CONFIG_HOME", config_home);
             std::env::set_var("XDG_DATA_HOME", data_home);
             std::env::set_var("HOME", data_home);
@@ -78,6 +81,7 @@ impl Drop for EnvGuard {
     fn drop(&mut self) {
         unsafe {
             restore_env("XDG_CONFIG_HOME", self.old_config.take());
+            restore_env("OULIPOLY_DATA_DIR", self.old_oulipoly_data_dir.take());
             restore_env("XDG_DATA_HOME", self.old_data.take());
             restore_env("HOME", self.old_home.take());
             restore_env("PATH", self.old_path.take());

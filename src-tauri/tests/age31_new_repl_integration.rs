@@ -54,6 +54,7 @@ impl TempXdgHome {
         cmd.arg("--new")
             .env("XDG_CONFIG_HOME", &self.config_home)
             .env("XDG_DATA_HOME", &self.data_home)
+            .env_remove("OULIPOLY_DATA_DIR")
             .env_remove("OULIPOLY_PARENT_INVOCATION");
         cmd.output().unwrap()
     }

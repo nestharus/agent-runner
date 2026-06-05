@@ -9,7 +9,7 @@
 //!     role: intrinsic-surface
 //!     Domain: quota_q2_routing_characterization_harness
 //!     Owns:
-//!       - PATH and OULIPOLY_DATA_HOME env override isolation under a process mutex
+//!       - PATH, OULIPOLY_DATA_HOME, and OULIPOLY_DATA_DIR env override isolation under a process mutex
 //!       - provider/session config and StateDb fixture construction
 //!       - quota/usage shell-script fixture formatting and shell-word quoting
 //!       - quota refresh routing/source/auth-refresh behavior assertions
@@ -78,21 +78,25 @@ impl Drop for PathOverride {
 /// lifetime.
 struct DataHomeOverride {
     _home: tempfile::TempDir,
-    previous: Option<OsString>,
+    previous_home: Option<OsString>,
+    previous_data_dir: Option<OsString>,
 }
 
 impl DataHomeOverride {
     fn set() -> Self {
         let home = tempfile::tempdir().expect("data home tempdir");
-        let previous = std::env::var_os("OULIPOLY_DATA_HOME");
+        let previous_home = std::env::var_os("OULIPOLY_DATA_HOME");
+        let previous_data_dir = std::env::var_os("OULIPOLY_DATA_DIR");
         // SAFETY: callers hold ENV_LOCK for the override's lifetime, serializing
         // this process-global mutation with every other env-mutating test here.
         unsafe {
+            std::env::remove_var("OULIPOLY_DATA_DIR");
             std::env::set_var("OULIPOLY_DATA_HOME", home.path());
         }
         Self {
             _home: home,
-            previous,
+            previous_home,
+            previous_data_dir,
         }
     }
 }
@@ -101,9 +105,13 @@ impl Drop for DataHomeOverride {
     fn drop(&mut self) {
         // SAFETY: the owning test still holds ENV_LOCK until after this restore.
         unsafe {
-            match &self.previous {
+            match &self.previous_home {
                 Some(previous) => std::env::set_var("OULIPOLY_DATA_HOME", previous),
                 None => std::env::remove_var("OULIPOLY_DATA_HOME"),
+            }
+            match &self.previous_data_dir {
+                Some(previous) => std::env::set_var("OULIPOLY_DATA_DIR", previous),
+                None => std::env::remove_var("OULIPOLY_DATA_DIR"),
             }
         }
     }

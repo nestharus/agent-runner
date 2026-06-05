@@ -363,6 +363,7 @@ sessions_dir = "{}"
             .arg(&self.models_dir);
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
+        cmd.env_remove("OULIPOLY_DATA_DIR");
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
         cmd
     }
@@ -403,6 +404,7 @@ sessions_dir = "{}"
         cmd.current_dir(self.dir.path());
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
+        cmd.env_remove("OULIPOLY_DATA_DIR");
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
         cmd
     }
@@ -423,6 +425,7 @@ sessions_dir = "{}"
         cmd.current_dir(self.dir.path());
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
+        cmd.env_remove("OULIPOLY_DATA_DIR");
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
         cmd
     }
@@ -442,6 +445,7 @@ sessions_dir = "{}"
         cmd.current_dir(self.dir.path());
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
+        cmd.env_remove("OULIPOLY_DATA_DIR");
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
         cmd
     }
@@ -454,6 +458,7 @@ sessions_dir = "{}"
             .arg(&self.models_dir);
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
+        cmd.env_remove("OULIPOLY_DATA_DIR");
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
         cmd
     }
@@ -614,6 +619,7 @@ fn run_trace_json(fixture: &Fixture, invocation_uuid: &str) -> Value {
     cmd.arg("trace").arg(invocation_uuid).arg("--json");
     cmd.env("XDG_CONFIG_HOME", &fixture.config_home);
     cmd.env("XDG_DATA_HOME", &fixture.data_home);
+    cmd.env_remove("OULIPOLY_DATA_DIR");
     let output = cmd.output().unwrap();
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     serde_json::from_slice(&output.stdout).unwrap()

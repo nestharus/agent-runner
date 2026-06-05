@@ -47,6 +47,7 @@ fn no_controlling_terminal_fallback_records_no_pty_control_path() {
         .env(CHILD_RESULT_ENV, &child_result)
         .env("XDG_CONFIG_HOME", &config_home)
         .env("XDG_DATA_HOME", &data_home)
+        .env_remove("OULIPOLY_DATA_DIR")
         .env("XDG_RUNTIME_DIR", &runtime_dir)
         .env("XDG_STATE_HOME", &state_home)
         .env("HOME", &home_dir)

@@ -100,6 +100,7 @@ impl CliFixture {
         .unwrap();
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
+        cmd.env_remove("OULIPOLY_DATA_DIR");
         cmd.env("HOME", &self.data_home);
         cmd.env("PATH", path);
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
@@ -677,6 +678,7 @@ fn age_33_session_export_default_open_operational_error_is_json_without_stdout()
 
     let mut cmd = fixture.command();
     cmd.env("XDG_DATA_HOME", &blocked_data_home)
+        .env_remove("OULIPOLY_DATA_DIR")
         .arg("session")
         .arg("export")
         .arg(SESSION_A);

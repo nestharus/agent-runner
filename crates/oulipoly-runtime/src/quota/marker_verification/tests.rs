@@ -502,7 +502,13 @@ fn lock_dir_create_failure_retains_marker() {
     let dir = tempdir().unwrap();
     let file_root = dir.path().join("not-a-directory");
     std::fs::write(&file_root, "").unwrap();
-    let _env_guard = EnvGuard::set("OULIPOLY_DATA_HOME", file_root.as_os_str());
+    let _env_guard = EnvGuard::set_many(vec![
+        ("OULIPOLY_DATA_DIR", None),
+        (
+            "OULIPOLY_DATA_HOME",
+            Some(file_root.as_os_str().to_os_string()),
+        ),
+    ]);
     let db = open_db();
     let now = Utc::now();
     let marker_at = now + Duration::hours(1);

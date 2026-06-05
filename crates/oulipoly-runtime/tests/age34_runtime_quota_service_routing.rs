@@ -10,7 +10,7 @@
 //!     role: intrinsic-surface
 //!     Domain: runtime_quota_service_routing_parity_harness
 //!     Owns:
-//!       - OULIPOLY_DATA_HOME env override isolation under a process mutex
+//!       - OULIPOLY_DATA_HOME and OULIPOLY_DATA_DIR env override isolation under a process mutex
 //!       - provider config, provider-registry handle, and StateDb fixture construction
 //!       - direct-vs-service refresh parity evidence mapping
 //!       - quota service routing/in-flight/failure assertions
@@ -40,27 +40,32 @@ fn env_lock() -> MutexGuard<'static, ()> {
 }
 
 /// Points `OULIPOLY_DATA_HOME` at a fresh tempdir for the lifetime of the
-/// guard so the per-account auth-refresh single-flight lock's freshness stamp
-/// starts empty and never bleeds across tests or test binaries.
+/// guard, and scrubs the higher-precedence `OULIPOLY_DATA_DIR`, so the
+/// per-account auth-refresh single-flight lock's freshness stamp starts empty
+/// and never bleeds across tests or test binaries.
 struct DataHomeOverride {
     _home: tempfile::TempDir,
     _lock: MutexGuard<'static, ()>,
-    previous: Option<OsString>,
+    previous_home: Option<OsString>,
+    previous_data_dir: Option<OsString>,
 }
 
 impl DataHomeOverride {
     fn new() -> Self {
         let lock = env_lock();
         let home = tempfile::tempdir().expect("data home tempdir");
-        let previous = std::env::var_os("OULIPOLY_DATA_HOME");
+        let previous_home = std::env::var_os("OULIPOLY_DATA_HOME");
+        let previous_data_dir = std::env::var_os("OULIPOLY_DATA_DIR");
         // SAFETY: the held ENV_LOCK serializes this process-global mutation.
         unsafe {
+            std::env::remove_var("OULIPOLY_DATA_DIR");
             std::env::set_var("OULIPOLY_DATA_HOME", home.path());
         }
         Self {
             _home: home,
             _lock: lock,
-            previous,
+            previous_home,
+            previous_data_dir,
         }
     }
 }
@@ -69,9 +74,13 @@ impl Drop for DataHomeOverride {
     fn drop(&mut self) {
         // SAFETY: this guard still holds ENV_LOCK until after the restore.
         unsafe {
-            match &self.previous {
+            match &self.previous_home {
                 Some(previous) => std::env::set_var("OULIPOLY_DATA_HOME", previous),
                 None => std::env::remove_var("OULIPOLY_DATA_HOME"),
+            }
+            match &self.previous_data_dir {
+                Some(previous) => std::env::set_var("OULIPOLY_DATA_DIR", previous),
+                None => std::env::remove_var("OULIPOLY_DATA_DIR"),
             }
         }
     }

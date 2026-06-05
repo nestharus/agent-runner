@@ -78,6 +78,7 @@ impl PipelineFixture {
 fn apply_fixture_xdg_env(cmd: &mut Command, fixture: &PipelineFixture) {
     cmd.env("XDG_CONFIG_HOME", &fixture.config_home);
     cmd.env("XDG_DATA_HOME", &fixture.data_home);
+    cmd.env_remove("OULIPOLY_DATA_DIR");
     cmd.env("XDG_STATE_HOME", &fixture.state_home);
 }
 

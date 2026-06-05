@@ -24,7 +24,7 @@
 //!     role: intrinsic-surface
 //!     Domain: auth_refresh_single_flight_behavior_harness
 //!     Owns:
-//!       - OULIPOLY_DATA_HOME env-scope isolation under a process mutex
+//!       - OULIPOLY_DATA_HOME and OULIPOLY_DATA_DIR env-scope isolation under a process mutex
 //!       - shell counting-command formatting and shell-out counting
 //!       - concurrent multi-thread/barrier attempt orchestration
 //!       - disposition tally mapping and single-flight invariant assertions
@@ -46,8 +46,9 @@ fn env_lock() -> MutexGuard<'static, ()> {
 }
 
 /// Isolates `OULIPOLY_DATA_HOME` (where the auth-refresh lock dir lives) to a
-/// fresh tempdir and optionally sets extra env vars, restoring all of them on
-/// drop. Holds the process env lock for its whole lifetime.
+/// fresh tempdir, scrubs the higher-precedence `OULIPOLY_DATA_DIR`, and
+/// optionally sets extra env vars, restoring all of them on drop. Holds the
+/// process env lock for its whole lifetime.
 struct EnvScope {
     _home: tempfile::TempDir,
     _lock: MutexGuard<'static, ()>,
@@ -58,7 +59,11 @@ impl EnvScope {
     fn new(extra: &[(&'static str, &str)]) -> Self {
         let lock = env_lock();
         let home = tempfile::tempdir().expect("data home tempdir");
-        let mut restores = vec![("OULIPOLY_DATA_HOME", std::env::var_os("OULIPOLY_DATA_HOME"))];
+        let mut restores = vec![
+            ("OULIPOLY_DATA_HOME", std::env::var_os("OULIPOLY_DATA_HOME")),
+            ("OULIPOLY_DATA_DIR", std::env::var_os("OULIPOLY_DATA_DIR")),
+        ];
+        remove_env("OULIPOLY_DATA_DIR");
         set_env("OULIPOLY_DATA_HOME", home.path().as_os_str());
         for (key, value) in extra {
             restores.push((*key, std::env::var_os(key)));

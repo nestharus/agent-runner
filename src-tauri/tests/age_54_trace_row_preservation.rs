@@ -93,6 +93,7 @@ impl TraceFixture {
         cmd.arg("trace").arg(invocation_uuid).arg("--json");
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
+        cmd.env_remove("OULIPOLY_DATA_DIR");
         cmd.output().unwrap()
     }
 }

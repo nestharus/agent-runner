@@ -107,6 +107,7 @@ impl Fixture {
         cmd.args(args);
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
+        cmd.env_remove("OULIPOLY_DATA_DIR");
         cmd.output().unwrap()
     }
 }

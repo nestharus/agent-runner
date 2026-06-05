@@ -1808,6 +1808,7 @@ mod tests {
 
     fn with_homes<T>(config_home: &Path, data_home: &Path, test: impl FnOnce() -> T) -> T {
         let _guard = env_lock().lock().unwrap();
+        let old_data_dir = std::env::var_os("OULIPOLY_DATA_DIR");
         let old_config = std::env::var_os("XDG_CONFIG_HOME");
         let old_data = std::env::var_os("XDG_DATA_HOME");
         let old_path = std::env::var_os("PATH");
@@ -1823,11 +1824,20 @@ mod tests {
         )
         .unwrap();
         unsafe {
+            std::env::remove_var("OULIPOLY_DATA_DIR");
             std::env::set_var("XDG_CONFIG_HOME", config_home);
             std::env::set_var("XDG_DATA_HOME", data_home);
             std::env::set_var("PATH", path);
         }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(test));
+        match old_data_dir {
+            Some(value) => unsafe {
+                std::env::set_var("OULIPOLY_DATA_DIR", value);
+            },
+            None => unsafe {
+                std::env::remove_var("OULIPOLY_DATA_DIR");
+            },
+        }
         match old_config {
             Some(value) => unsafe {
                 std::env::set_var("XDG_CONFIG_HOME", value);

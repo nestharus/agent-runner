@@ -336,7 +336,13 @@ mod tests {
         dir: Option<tempfile::TempDir>,
     ) -> RefreshFixture {
         let lock_home = tempfile::tempdir().unwrap();
-        let env = EnvGuard::set("OULIPOLY_DATA_HOME", lock_home.path());
+        let env = EnvGuard::set_many(vec![
+            ("OULIPOLY_DATA_DIR", None),
+            (
+                "OULIPOLY_DATA_HOME",
+                Some(lock_home.path().as_os_str().to_os_string()),
+            ),
+        ]);
         RefreshFixture {
             _dir: dir,
             _lock_home: lock_home,

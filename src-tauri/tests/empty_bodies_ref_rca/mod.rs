@@ -365,6 +365,7 @@ fn export_command() -> Command {
 fn apply_export_env(cmd: &mut Command, fixture: &RcaFixture) {
     cmd.env("XDG_CONFIG_HOME", &fixture.config_home);
     cmd.env("XDG_DATA_HOME", &fixture.data_home);
+    cmd.env_remove("OULIPOLY_DATA_DIR");
     cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
 }
 

@@ -12,21 +12,35 @@ use std::sync::{Arc, Mutex};
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 struct EnvRestore {
+    old_data_dir: Option<std::ffi::OsString>,
     old_data_home: Option<std::ffi::OsString>,
 }
 
 impl EnvRestore {
     fn set_xdg_data_home(path: &Path) -> Self {
+        let old_data_dir = std::env::var_os("OULIPOLY_DATA_DIR");
         let old_data_home = std::env::var_os("XDG_DATA_HOME");
         unsafe {
+            std::env::remove_var("OULIPOLY_DATA_DIR");
             std::env::set_var("XDG_DATA_HOME", path);
         }
-        Self { old_data_home }
+        Self {
+            old_data_dir,
+            old_data_home,
+        }
     }
 }
 
 impl Drop for EnvRestore {
     fn drop(&mut self) {
+        match self.old_data_dir.take() {
+            Some(value) => unsafe {
+                std::env::set_var("OULIPOLY_DATA_DIR", value);
+            },
+            None => unsafe {
+                std::env::remove_var("OULIPOLY_DATA_DIR");
+            },
+        }
         match self.old_data_home.take() {
             Some(value) => unsafe {
                 std::env::set_var("XDG_DATA_HOME", value);
