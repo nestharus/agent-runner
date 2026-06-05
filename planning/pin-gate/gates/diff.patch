@@ -1,0 +1,816 @@
+diff --git a/crates/oulipoly-runtime/src/executor/cli/launch/command_format.rs b/crates/oulipoly-runtime/src/executor/cli/launch/command_format.rs
+index 861ab6d..554c537 100644
+--- a/crates/oulipoly-runtime/src/executor/cli/launch/command_format.rs
++++ b/crates/oulipoly-runtime/src/executor/cli/launch/command_format.rs
+@@ -45,10 +45,20 @@ pub(super) fn command_from_parts(
+     } else {
+         cmd.env_remove("OULIPOLY_RETURN_CHANNEL");
+     }
++    pin_agent_data_dir_if_unset(&mut cmd);
+ 
+     cmd
+ }
+ 
++fn pin_agent_data_dir_if_unset(cmd: &mut Command) {
++    if std::env::var_os(oulipoly_state::paths::DATA_DIR_ENV).is_some() {
++        return;
++    }
++    if let Ok(data_dir) = oulipoly_state::paths::data_dir() {
++        cmd.env(oulipoly_state::paths::DATA_DIR_ENV, data_dir);
++    }
++}
++
+ pub(in crate::executor::cli) fn append_command_args(cmd: &mut Command, args: &[String]) {
+     for arg in args {
+         cmd.arg(arg);
+diff --git a/crates/oulipoly-runtime/src/executor/cli/pty_broker.rs b/crates/oulipoly-runtime/src/executor/cli/pty_broker.rs
+index de9533d..72f209d 100644
+--- a/crates/oulipoly-runtime/src/executor/cli/pty_broker.rs
++++ b/crates/oulipoly-runtime/src/executor/cli/pty_broker.rs
+@@ -398,9 +398,9 @@ fn control_socket_dir() -> Result<PathBuf, String> {
+     if let Some(state) = std::env::var_os("XDG_STATE_HOME") {
+         return Ok(PathBuf::from(state).join("oulipoly-agent-runner/runtime/pty"));
+     }
+-    let base =
+-        dirs::data_dir().ok_or_else(|| "Failed to resolve user data directory".to_string())?;
+-    Ok(base.join("oulipoly-agent-runner/runtime/pty"))
++    let base = oulipoly_state::paths::data_dir()
++        .map_err(|_| "Failed to resolve user data directory".to_string())?;
++    Ok(base.join("runtime/pty"))
+ }
+ 
+ fn create_private_dir(dir: &Path) -> Result<(), String> {
+diff --git a/crates/oulipoly-runtime/src/quota/auth_refresh_lock.rs b/crates/oulipoly-runtime/src/quota/auth_refresh_lock.rs
+index 29d16f0..b9e7053 100644
+--- a/crates/oulipoly-runtime/src/quota/auth_refresh_lock.rs
++++ b/crates/oulipoly-runtime/src/quota/auth_refresh_lock.rs
+@@ -50,7 +50,7 @@
+ //! failure is non-fatal to the surrounding quota refresh (the caller just
+ //! retries the quota script with the existing token).
+ 
+-use super::lock_paths::{data_home, sanitize_lock_name};
++use super::lock_paths::{app_data_dir, sanitize_lock_name};
+ use super::process::run_refresh_command;
+ use std::fs::{self, File, OpenOptions};
+ use std::io::{Read, Seek, SeekFrom, Write};
+@@ -188,9 +188,7 @@ fn lock_path(account_key: &str) -> PathBuf {
+ }
+ 
+ fn auth_refresh_lock_dir() -> PathBuf {
+-    data_home()
+-        .join("oulipoly-agent-runner")
+-        .join("auth-refresh-locks")
++    app_data_dir().join("auth-refresh-locks")
+ }
+ 
+ fn ensure_parent_dir(path: &Path) -> Result<(), String> {
+diff --git a/crates/oulipoly-runtime/src/quota/lock_paths.rs b/crates/oulipoly-runtime/src/quota/lock_paths.rs
+index 148e9e6..b531904 100644
+--- a/crates/oulipoly-runtime/src/quota/lock_paths.rs
++++ b/crates/oulipoly-runtime/src/quota/lock_paths.rs
+@@ -10,7 +10,7 @@
+ //!   - component: crates/oulipoly-runtime/src/quota/lock_paths.rs
+ //!     role: adapter
+ //!     Translates:
+-//!       - process data-home environment contract (`OULIPOLY_DATA_HOME`, `XDG_DATA_HOME`, `dirs::data_dir`)
++//!       - process data-home environment contract (`OULIPOLY_DATA_DIR`, `OULIPOLY_DATA_HOME`, `XDG_DATA_HOME`, `dirs::data_dir`)
+ //!       - lock-name sanitization contract (`[A-Za-z0-9_-]`)
+ //! ```
+ //!
+@@ -32,6 +32,11 @@ pub fn data_home() -> PathBuf {
+         .unwrap_or_else(default_data_home)
+ }
+ 
++pub fn app_data_dir() -> PathBuf {
++    env_path(oulipoly_state::paths::DATA_DIR_ENV)
++        .unwrap_or_else(|| data_home().join(oulipoly_state::paths::APP_DATA_DIR_NAME))
++}
++
+ fn env_path(name: &str) -> Option<PathBuf> {
+     env_os(name).map(PathBuf::from)
+ }
+diff --git a/crates/oulipoly-runtime/src/quota/marker_verification/lock.rs b/crates/oulipoly-runtime/src/quota/marker_verification/lock.rs
+index fdbdce6..dc9daea 100644
+--- a/crates/oulipoly-runtime/src/quota/marker_verification/lock.rs
++++ b/crates/oulipoly-runtime/src/quota/marker_verification/lock.rs
+@@ -94,9 +94,7 @@ fn provider_lock_file_name(provider_name: &str) -> String {
+ }
+ 
+ pub(super) fn usage_lock_dir() -> PathBuf {
+-    lock_paths::data_home()
+-        .join("oulipoly-agent-runner")
+-        .join("usage-refresh-locks")
++    lock_paths::app_data_dir().join("usage-refresh-locks")
+ }
+ 
+ pub(super) fn sanitize_lock_name(name: &str) -> String {
+diff --git a/crates/oulipoly-runtime/src/quota/marker_verification/tests.rs b/crates/oulipoly-runtime/src/quota/marker_verification/tests.rs
+index 63524b7..e26ddde 100644
+--- a/crates/oulipoly-runtime/src/quota/marker_verification/tests.rs
++++ b/crates/oulipoly-runtime/src/quota/marker_verification/tests.rs
+@@ -60,7 +60,10 @@ fn lock_dir_env_vars(
+     path: &Path,
+     extra_env: Vec<(&'static str, Option<std::ffi::OsString>)>,
+ ) -> Vec<(&'static str, Option<std::ffi::OsString>)> {
+-    let mut vars = vec![("OULIPOLY_DATA_HOME", Some(path.as_os_str().to_os_string()))];
++    let mut vars = vec![
++        ("OULIPOLY_DATA_DIR", None),
++        ("OULIPOLY_DATA_HOME", Some(path.as_os_str().to_os_string())),
++    ];
+     vars.extend(extra_env);
+     vars
+ }
+@@ -292,8 +295,31 @@ fn lock_name_sanitization_and_lock_dir_env_precedence_are_stable() {
+ 
+     let oulipoly_home = tempdir().unwrap();
+     let xdg_home = tempdir().unwrap();
++    let pinned_home = tempdir().unwrap();
+     {
+         let _env_guard = EnvGuard::set_many(vec![
++            (
++                "OULIPOLY_DATA_DIR",
++                Some(pinned_home.path().as_os_str().to_os_string()),
++            ),
++            (
++                "OULIPOLY_DATA_HOME",
++                Some(oulipoly_home.path().as_os_str().to_os_string()),
++            ),
++            (
++                "XDG_DATA_HOME",
++                Some(xdg_home.path().as_os_str().to_os_string()),
++            ),
++        ]);
++        assert_eq!(
++            lock::usage_lock_dir(),
++            pinned_home.path().join("usage-refresh-locks")
++        );
++    }
++
++    {
++        let _env_guard = EnvGuard::set_many(vec![
++            ("OULIPOLY_DATA_DIR", None),
+             (
+                 "OULIPOLY_DATA_HOME",
+                 Some(oulipoly_home.path().as_os_str().to_os_string()),
+@@ -314,6 +340,7 @@ fn lock_name_sanitization_and_lock_dir_env_precedence_are_stable() {
+ 
+     {
+         let _env_guard = EnvGuard::set_many(vec![
++            ("OULIPOLY_DATA_DIR", None),
+             ("OULIPOLY_DATA_HOME", None),
+             (
+                 "XDG_DATA_HOME",
+diff --git a/crates/oulipoly-runtime/src/quota/mod.rs b/crates/oulipoly-runtime/src/quota/mod.rs
+index 3ff9b7a..16df995 100644
+--- a/crates/oulipoly-runtime/src/quota/mod.rs
++++ b/crates/oulipoly-runtime/src/quota/mod.rs
+@@ -35,7 +35,10 @@ pub use freshness::{
+     is_topology_probe_due,
+ };
+ pub use in_flight::{InFlight, InFlightGuard};
+-pub use lock_paths::{data_home as lock_data_home, sanitize_lock_name as sanitize_lock_key};
++pub use lock_paths::{
++    app_data_dir as lock_app_data_dir, data_home as lock_data_home,
++    sanitize_lock_name as sanitize_lock_key,
++};
+ pub use marker_verification::verify_or_clear_marker;
+ pub use outcome::{QuotaScriptWindow, RefreshOutcome};
+ pub use parse::parse_output;
+diff --git a/crates/oulipoly-runtime/src/services/lock.rs b/crates/oulipoly-runtime/src/services/lock.rs
+index 75fe2c5..259318d 100644
+--- a/crates/oulipoly-runtime/src/services/lock.rs
++++ b/crates/oulipoly-runtime/src/services/lock.rs
+@@ -181,9 +181,9 @@ fn default_models_dir() -> PathBuf {
+ }
+ 
+ fn default_lock_dir() -> Result<PathBuf, LockError> {
+-    dirs::data_dir()
+-        .map(|dir| dir.join("oulipoly-agent-runner").join("locks"))
+-        .ok_or_else(|| LockError::Operational {
++    oulipoly_state::paths::data_dir()
++        .map(|dir| dir.join("locks"))
++        .map_err(|_| LockError::Operational {
+             message: "Could not determine data directory".to_string(),
+         })
+ }
+diff --git a/crates/oulipoly-runtime/src/session_metadata/locator.rs b/crates/oulipoly-runtime/src/session_metadata/locator.rs
+index 5235907..f1200d5 100644
+--- a/crates/oulipoly-runtime/src/session_metadata/locator.rs
++++ b/crates/oulipoly-runtime/src/session_metadata/locator.rs
+@@ -661,9 +661,8 @@ fn configured_state_dir(entry: &SessionSourceEntry) -> Option<PathBuf> {
+ }
+ 
+ fn default_state_dir(provider_name: &str) -> PathBuf {
+-    dirs::data_dir()
+-        .unwrap_or_else(|| PathBuf::from("."))
+-        .join("oulipoly-agent-runner")
++    oulipoly_state::paths::data_dir()
++        .unwrap_or_else(|_| PathBuf::from(".").join(oulipoly_state::paths::APP_DATA_DIR_NAME))
+         .join("sessions")
+         .join(provider_name)
+ }
+diff --git a/crates/oulipoly-runtime/src/session_replace/mod.rs b/crates/oulipoly-runtime/src/session_replace/mod.rs
+index a63346c..fc91989 100644
+--- a/crates/oulipoly-runtime/src/session_replace/mod.rs
++++ b/crates/oulipoly-runtime/src/session_replace/mod.rs
+@@ -1721,11 +1721,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
+ }
+ 
+ fn default_data_root() -> Result<PathBuf, ReplaceError> {
+-    dirs::data_dir()
+-        .map(|dir| dir.join("oulipoly-agent-runner"))
+-        .ok_or_else(|| ReplaceError::OperationalError {
+-            message: "could not determine data directory".to_string(),
+-        })
++    oulipoly_state::paths::data_dir().map_err(|_| ReplaceError::OperationalError {
++        message: "could not determine data directory".to_string(),
++    })
+ }
+ 
+ fn default_config_root() -> PathBuf {
+diff --git a/crates/oulipoly-runtime/src/sessions/mod.rs b/crates/oulipoly-runtime/src/sessions/mod.rs
+index 56bf99c..38bc837 100644
+--- a/crates/oulipoly-runtime/src/sessions/mod.rs
++++ b/crates/oulipoly-runtime/src/sessions/mod.rs
+@@ -390,13 +390,15 @@ fn resolve_state_dir(provider_name: &str, entry: &SessionSourceEntry) -> PathBuf
+     if let Some(dir) = &entry.state_dir {
+         return dir.clone();
+     }
+-    let base = dirs::data_dir()
+-        .unwrap_or_else(|| PathBuf::from("."))
+-        .join("oulipoly-agent-runner")
+-        .join("sessions");
++    let base = default_app_data_dir().join("sessions");
+     base.join(provider_name)
+ }
+ 
++fn default_app_data_dir() -> PathBuf {
++    oulipoly_state::paths::data_dir()
++        .unwrap_or_else(|_| PathBuf::from(".").join(oulipoly_state::paths::APP_DATA_DIR_NAME))
++}
++
+ fn run_turn_script(script: &str, state_dir: &std::path::Path) -> Result<String, String> {
+     run_session_script(script, state_dir, None, "turn script")
+ }
+diff --git a/crates/oulipoly-runtime/tests/age_pid_sidecar_spawn.rs b/crates/oulipoly-runtime/tests/age_pid_sidecar_spawn.rs
+index f779bbf..9b8619e 100644
+--- a/crates/oulipoly-runtime/tests/age_pid_sidecar_spawn.rs
++++ b/crates/oulipoly-runtime/tests/age_pid_sidecar_spawn.rs
+@@ -16,18 +16,37 @@ const INVOCATION_UUID: &str = "aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa";
+ 
+ struct EnvGuard {
+     _lock: MutexGuard<'static, ()>,
++    old_oulipoly_data_dir: Option<OsString>,
+     old_xdg_data_home: Option<OsString>,
+ }
+ 
+ impl EnvGuard {
+     fn set_xdg_data_home(path: &Path) -> Self {
+         let lock = env_lock().lock().unwrap();
++        let old_oulipoly_data_dir = std::env::var_os("OULIPOLY_DATA_DIR");
+         let old_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
+         unsafe {
++            std::env::remove_var("OULIPOLY_DATA_DIR");
+             std::env::set_var("XDG_DATA_HOME", path);
+         }
+         Self {
+             _lock: lock,
++            old_oulipoly_data_dir,
++            old_xdg_data_home,
++        }
++    }
++
++    fn set_xdg_data_home_and_oulipoly_data_dir(xdg_data_home: &Path, data_dir: &Path) -> Self {
++        let lock = env_lock().lock().unwrap();
++        let old_oulipoly_data_dir = std::env::var_os("OULIPOLY_DATA_DIR");
++        let old_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
++        unsafe {
++            std::env::set_var("OULIPOLY_DATA_DIR", data_dir);
++            std::env::set_var("XDG_DATA_HOME", xdg_data_home);
++        }
++        Self {
++            _lock: lock,
++            old_oulipoly_data_dir,
+             old_xdg_data_home,
+         }
+     }
+@@ -36,6 +55,10 @@ impl EnvGuard {
+ impl Drop for EnvGuard {
+     fn drop(&mut self) {
+         unsafe {
++            match self.old_oulipoly_data_dir.take() {
++                Some(value) => std::env::set_var("OULIPOLY_DATA_DIR", value),
++                None => std::env::remove_var("OULIPOLY_DATA_DIR"),
++            }
+             match self.old_xdg_data_home.take() {
+                 Some(value) => std::env::set_var("XDG_DATA_HOME", value),
+                 None => std::env::remove_var("XDG_DATA_HOME"),
+@@ -96,6 +119,47 @@ fn spawn_capture_writes_verified_sidecar_row_without_state_schema_change() {
+     assert_eq!(after_columns, baseline_columns);
+ }
+ 
++#[test]
++fn spawn_preserves_preexisting_oulipoly_data_dir_in_provider_child() {
++    let dir = tempfile::tempdir().unwrap();
++    let data_home = dir.path().join("data");
++    let custom_data_dir = dir.path().join("custom-data-dir");
++    std::fs::create_dir_all(&custom_data_dir).unwrap();
++    let observed_env_path = dir.path().join("observed-oulipoly-data-dir.txt");
++    let default_app_data_dir = data_home.join("oulipoly-agent-runner");
++    let script = env_recording_fixture_script(dir.path());
++    let mut provider = fixture_provider(&script);
++    provider.args = vec![observed_env_path.to_string_lossy().into_owned()];
++    let model = fixture_model(provider.clone());
++
++    {
++        let _guard =
++            EnvGuard::set_xdg_data_home_and_oulipoly_data_dir(&data_home, &custom_data_dir);
++        let output = RuntimeExecutorService::default()
++            .execute(ExecutorServiceRequest::Effective {
++                model: model.clone(),
++                provider: provider.clone(),
++                provider_index: 0,
++                prompt_mode: PromptMode::Arg,
++                prompt: "hello".to_string(),
++                working_dir: None,
++                extra_inputs: HashMap::new(),
++                parent_invocation_env: None,
++            })
++            .unwrap()
++            .result;
++        assert_eq!(output.exit_code, 0);
++    }
++
++    let observed = std::fs::read_to_string(&observed_env_path).unwrap();
++    let expected_data_dir = custom_data_dir.to_string_lossy();
++    assert_eq!(observed.trim_end(), expected_data_dir.as_ref());
++    assert!(
++        !default_app_data_dir.exists(),
++        "provider child must not receive the runner's XDG-derived default data dir"
++    );
++}
++
+ fn create_state_schema_snapshot(path: &Path) -> (i64, Vec<String>) {
+     let db = StateDb::open(path).unwrap();
+     (
+@@ -135,6 +199,19 @@ fn fixture_script(dir: &Path) -> PathBuf {
+     path
+ }
+ 
++fn env_recording_fixture_script(dir: &Path) -> PathBuf {
++    let path = dir.join("env-recording-provider.sh");
++    std::fs::write(
++        &path,
++        "#!/usr/bin/env bash\nset -euo pipefail\nenv_path=\"${1:?missing env path}\"\nprintf '%s\\n' \"${OULIPOLY_DATA_DIR:?missing OULIPOLY_DATA_DIR}\" > \"$env_path\"\nprintf 'ok\\n'\n",
++    )
++    .unwrap();
++    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
++    permissions.set_mode(0o755);
++    std::fs::set_permissions(&path, permissions).unwrap();
++    path
++}
++
+ fn fixture_provider(script: &Path) -> ProviderConfig {
+     ProviderConfig {
+         name: "fixture-provider".to_string(),
+diff --git a/crates/oulipoly-state/src/db.rs b/crates/oulipoly-state/src/db.rs
+index 61337d6..271a982 100755
+--- a/crates/oulipoly-state/src/db.rs
++++ b/crates/oulipoly-state/src/db.rs
+@@ -1265,9 +1265,7 @@ impl StateDb {
+     }
+ 
+     pub fn default_path() -> Result<PathBuf, String> {
+-        let data_dir =
+-            dirs::data_dir().ok_or_else(|| "Could not determine data directory".to_string())?;
+-        Ok(data_dir.join("oulipoly-agent-runner").join("state.db"))
++        Ok(crate::paths::data_dir()?.join("state.db"))
+     }
+ 
+     pub fn connection(&self) -> &sqlite::Connection {
+diff --git a/crates/oulipoly-state/src/lib.rs b/crates/oulipoly-state/src/lib.rs
+index 1030804..ffb4673 100755
+--- a/crates/oulipoly-state/src/lib.rs
++++ b/crates/oulipoly-state/src/lib.rs
+@@ -16,6 +16,7 @@ pub mod invocation_marker;
+ mod lifecycle_log;
+ pub mod mailbox;
+ pub mod migrations;
++pub mod paths;
+ pub mod pid_identity;
+ pub mod repositories;
+ pub mod result_envelope;
+diff --git a/crates/oulipoly-state/src/paths.rs b/crates/oulipoly-state/src/paths.rs
+new file mode 100644
+index 0000000..36174ea
+--- /dev/null
++++ b/crates/oulipoly-state/src/paths.rs
+@@ -0,0 +1,19 @@
++//! Default agent-runner data path resolution.
++
++use std::path::PathBuf;
++
++pub const APP_DATA_DIR_NAME: &str = "oulipoly-agent-runner";
++pub const DATA_DIR_ENV: &str = "OULIPOLY_DATA_DIR";
++
++pub fn data_dir() -> Result<PathBuf, String> {
++    std::env::var_os(DATA_DIR_ENV)
++        .map(PathBuf::from)
++        .map(Ok)
++        .unwrap_or_else(default_data_dir)
++}
++
++fn default_data_dir() -> Result<PathBuf, String> {
++    let data_dir =
++        dirs::data_dir().ok_or_else(|| "Could not determine data directory".to_string())?;
++    Ok(data_dir.join(APP_DATA_DIR_NAME))
++}
+diff --git a/crates/oulipoly-state/src/pid_identity.rs b/crates/oulipoly-state/src/pid_identity.rs
+index 6424ae1..e8bbf9b 100644
+--- a/crates/oulipoly-state/src/pid_identity.rs
++++ b/crates/oulipoly-state/src/pid_identity.rs
+@@ -193,9 +193,7 @@ impl PidIdentityDb {
+ }
+ 
+ pub fn default_path() -> Result<PathBuf, String> {
+-    let data_dir =
+-        dirs::data_dir().ok_or_else(|| "Could not determine data directory".to_string())?;
+-    Ok(data_dir.join("oulipoly-agent-runner").join(SIDECAR_DB_NAME))
++    Ok(crate::paths::data_dir()?.join(SIDECAR_DB_NAME))
+ }
+ 
+ pub fn record_live_process_identity(
+diff --git a/crates/oulipoly-state/tests/data_dir_precedence.rs b/crates/oulipoly-state/tests/data_dir_precedence.rs
+new file mode 100644
+index 0000000..9a74ee6
+--- /dev/null
++++ b/crates/oulipoly-state/tests/data_dir_precedence.rs
+@@ -0,0 +1,97 @@
++#![cfg(target_os = "linux")]
++
++use oulipoly_state::StateDb;
++use oulipoly_state::mailbox::MailboxDb;
++use oulipoly_state::pid_identity::PidIdentityDb;
++use std::ffi::OsString;
++use std::path::Path;
++use std::sync::{Mutex, MutexGuard, OnceLock};
++
++const DATA_DIR_ENV: &str = "OULIPOLY_DATA_DIR";
++
++struct EnvGuard {
++    _lock: MutexGuard<'static, ()>,
++    old_oulipoly_data_dir: Option<OsString>,
++    old_xdg_data_home: Option<OsString>,
++}
++
++impl EnvGuard {
++    fn set(oulipoly_data_dir: Option<&Path>, xdg_data_home: Option<&Path>) -> Self {
++        let lock = env_lock()
++            .lock()
++            .unwrap_or_else(|poisoned| poisoned.into_inner());
++        let old_oulipoly_data_dir = std::env::var_os(DATA_DIR_ENV);
++        let old_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
++        unsafe {
++            set_or_remove(DATA_DIR_ENV, oulipoly_data_dir);
++            set_or_remove("XDG_DATA_HOME", xdg_data_home);
++        }
++        Self {
++            _lock: lock,
++            old_oulipoly_data_dir,
++            old_xdg_data_home,
++        }
++    }
++}
++
++impl Drop for EnvGuard {
++    fn drop(&mut self) {
++        unsafe {
++            restore_env(DATA_DIR_ENV, self.old_oulipoly_data_dir.take());
++            restore_env("XDG_DATA_HOME", self.old_xdg_data_home.take());
++        }
++    }
++}
++
++#[test]
++fn default_state_locations_prefer_oulipoly_data_dir_over_xdg_data_home() {
++    let dir = tempfile::tempdir().unwrap();
++    let pinned = dir.path().join("canonical-app-data");
++    let shadow_xdg = dir.path().join("shadow-xdg-data");
++    let _guard = EnvGuard::set(Some(&pinned), Some(&shadow_xdg));
++
++    assert_default_paths_under(&pinned);
++}
++
++#[test]
++fn default_state_locations_fall_back_to_xdg_data_home_when_unpinned() {
++    let dir = tempfile::tempdir().unwrap();
++    let xdg = dir.path().join("xdg-data");
++    let _guard = EnvGuard::set(None, Some(&xdg));
++
++    assert_default_paths_under(&xdg.join("oulipoly-agent-runner"));
++}
++
++fn assert_default_paths_under(app_data_dir: &Path) {
++    assert_eq!(
++        StateDb::default_path().unwrap(),
++        app_data_dir.join("state.db")
++    );
++    assert_eq!(
++        PidIdentityDb::default_path().unwrap(),
++        app_data_dir.join("pid-identity.db")
++    );
++    assert_eq!(
++        MailboxDb::default_path().unwrap(),
++        PidIdentityDb::default_path().unwrap()
++    );
++}
++
++fn env_lock() -> &'static Mutex<()> {
++    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
++    LOCK.get_or_init(|| Mutex::new(()))
++}
++
++unsafe fn set_or_remove(name: &str, value: Option<&Path>) {
++    match value {
++        Some(value) => unsafe { std::env::set_var(name, value) },
++        None => unsafe { std::env::remove_var(name) },
++    }
++}
++
++unsafe fn restore_env(name: &str, value: Option<OsString>) {
++    match value {
++        Some(value) => unsafe { std::env::set_var(name, value) },
++        None => unsafe { std::env::remove_var(name) },
++    }
++}
+diff --git a/planning/pin-gate/evidence/runtime-tests.log b/planning/pin-gate/evidence/runtime-tests.log
+new file mode 100644
+index 0000000..fc43686
+--- /dev/null
++++ b/planning/pin-gate/evidence/runtime-tests.log
+@@ -0,0 +1,72 @@
++# Runtime test evidence — pin gate (c49bf80), XDG-isolated, OULIPOLY_DATA_DIR unset in harness env
++## data_dir_precedence (oulipoly-state)
++test default_state_locations_prefer_oulipoly_data_dir_over_xdg_data_home ... ok
++test default_state_locations_fall_back_to_xdg_data_home_when_unpinned ... ok
++test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
++## age_pid_sidecar_spawn (oulipoly-runtime)
++test spawn_capture_writes_verified_sidecar_row_without_state_schema_change ... ok
++test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s
++## wu_d_proactive_wake_integration (oulipoly-agent-runner)
++test auto_wake_cap_stops_self_replicating_session ... ok
++test batch_cap_followup_wake ... ok
++test busy_then_turn_end_delivers ... ok
++test concurrent_notify_single_flight ... ok
++test idle_wake_delivers ... ok
++test manual_resume_race_is_safe ... ok
++test no_undelivered_no_wake_and_loop_terminates ... ok
++test opencode_notify_idle_wakes_resume_with_ses_session ... ok
++test provider_shadow_xdg_notify_uses_pinned_data_dir_and_wakes ... ok
++test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.80s
++## wu_b_mailbox_integration (oulipoly-agent-runner)
++test notify_no_owner_valid_chain_returns_zero ... ok
++test notify_rejects_reuse_mismatch ... ok
++test notify_missing_chain_is_usage_error ... ok
++test notify_handle_conflict_different_session ... ok
++test notify_resolves_nearest_ancestor_sidecar_session ... ok
++test notify_idempotent_retried_handle ... ok
++test notify_works_after_caller_dead ... ok
++test mailbox_isolation ... ok
++test notify_ordering_by_seq ... ok
++test notify_resolves_from_state_when_sidecar_session_null ... ok
++test resume_without_mailbox_preserves_payload ... ok
++test resume_without_mailbox_and_without_prompt_preserves_native_resume ... ok
++test resume_failure_leaves_pending ... ok
++test resume_with_only_mailbox_sends_notification_prompt ... ok
++test resume_marks_delivered_after_success ... ok
++test resume_uses_resolved_active_session_id ... ok
++test resume_with_pending_mailbox_prepends_notifications ... ok
++test resume_drains_in_order_and_respects_batch_cap ... ok
++test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.18s
++## wu_e_pty_delivery_integration (oulipoly-agent-runner)
++test notify_live_pty_failure_leaves_pending_and_wake_busy ... ok
++test notify_live_pty_ack_marks_delivered_and_skips_headless_wake ... ok
++test notify_stale_socket_cleans_runtime_and_does_not_report_busy ... ok
++test fixture_interactive_session_agent_bash_completion_arrives_live ... ok
++test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.41s
++## quota marker_verification unit tests (oulipoly-runtime lib)
++test quota::marker_verification::tests::cooldown_secs_uses_default_trimmed_override_and_invalid_fallback ... ok
++test quota::marker_verification::tests::env_guard_restores_previous_values_and_removes_absent_variables ... ok
++test quota::marker_verification::tests::clear_marker_failure_does_not_panic_and_leaves_marker_intact ... ok
++test quota::marker_verification::tests::lock_file_open_failure_retains_marker ... ok
++test quota::marker_verification::tests::lock_dir_create_failure_retains_marker ... ok
++test quota::marker_verification::tests::many_threads_collapse_into_one_refresh ... ok
++test quota::marker_verification::tests::marker_with_fresh_cache_and_empty_windows_is_kept ... ok
++test quota::marker_verification::tests::release_slack_secs_uses_default_trimmed_override_and_invalid_fallback ... ok
++test quota::marker_verification::tests::marker_with_fresh_cache_and_healthy_windows_is_cleared ... ok
++test quota::marker_verification::tests::marker_with_fresh_cache_and_exhausted_window_is_kept ... ok
++test quota::marker_verification::tests::marker_with_stale_cache_keeps_marker_when_refresh_shows_exhausted ... ok
++test quota::marker_verification::tests::marker_with_stale_cache_runs_refresh_and_clears_when_healthy ... ok
++test quota::marker_verification::tests::no_marker_no_action ... ok
++test quota::marker_verification::tests::marker_within_release_slack_is_cleared_without_refresh ... ok
++test quota::marker_verification::tests::past_reset_exhausted_window_does_not_pin_but_future_exhausted_window_does ... ok
++test quota::marker_verification::tests::stale_marker_with_configured_provider_but_no_quota_script_keeps_marker_and_failure_class ... ok
++test quota::marker_verification::tests::shortened_cooldown_forces_stale_cache_refresh_instead_of_fresh_cache_bypass ... ok
++test quota::marker_verification::tests::stale_marker_with_failed_quota_script_keeps_marker_and_failure_class ... ok
++test quota::marker_verification::tests::lock_name_sanitization_and_lock_dir_env_precedence_are_stable ... ok
++test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 333 filtered out; finished in 4.09s
++## age_pid_sidecar_spawn pre-existing pin preservation (oulipoly-runtime)
++test spawn_preserves_preexisting_oulipoly_data_dir_in_provider_child ... ok
++test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
++## wu_d_proactive_wake_integration resume pin preservation (oulipoly-agent-runner)
++test provider_shadow_xdg_notify_uses_pinned_data_dir_and_wakes ... ok
++test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.55s
+diff --git a/planning/pin-gate/proposal.md b/planning/pin-gate/proposal.md
+new file mode 100644
+index 0000000..ac07702
+--- /dev/null
++++ b/planning/pin-gate/proposal.md
+@@ -0,0 +1,35 @@
++# OULIPOLY_DATA_DIR Pin Fix Proposal
++
++The live bug is that a wrapper or descendant provider can override `XDG_DATA_HOME`, then descendant `agents` invocations resolve agent-runner state under that shadow data root instead of the spawning runner's sidecar. The fix is to pin the canonical app data directory into provider child process environments as `OULIPOLY_DATA_DIR`, and to make default state resolution prefer that pin before falling back to the XDG-derived platform data directory.
++
++Precedence is intentionally narrow: an existing `OULIPOLY_DATA_DIR` wins, default resolution otherwise derives the app directory from `dirs::data_dir()`, and explicit user/config paths remain unchanged because the reroutes only affect default path helpers.
++
++## Proof plan
++
++Runtime claim: Default state path resolution prefers `OULIPOLY_DATA_DIR` over the XDG-derived fallback.
++Proof method: `crates/oulipoly-state/tests/data_dir_precedence.rs::default_state_locations_prefer_oulipoly_data_dir_over_xdg_data_home`.
++Evidence-class match: The test sets both env surfaces and calls the shipped default path APIs (`StateDb::default_path`, `PidIdentityDb::default_path`, `MailboxDb::default_path`), so it exercises the runtime resolution path rather than inspecting helper internals.
++
++Runtime claim: Default state path resolution falls back to the XDG-derived app data directory when `OULIPOLY_DATA_DIR` is unset.
++Proof method: `crates/oulipoly-state/tests/data_dir_precedence.rs::default_state_locations_fall_back_to_xdg_data_home_when_unpinned`.
++Evidence-class match: The test removes the pin, sets `XDG_DATA_HOME`, and asserts the shipped default path APIs resolve under `XDG_DATA_HOME/oulipoly-agent-runner`, so it covers the actual unpinned runtime fallback.
++
++Runtime claim: A spawned provider child receives an `OULIPOLY_DATA_DIR` pin when the spawning runner starts from an unpinned XDG data root.
++Proof method: `src-tauri/tests/wu_d_proactive_wake_integration.rs::provider_shadow_xdg_notify_uses_pinned_data_dir_and_wakes`.
++Evidence-class match: The provider script runs as the real spawned provider child and exits if `OULIPOLY_DATA_DIR` is absent, so the evidence is the child process environment produced by the runtime spawn path.
++
++Runtime claim: Spawn-side sidecar capture still writes the verified sidecar row under the expected app data directory with the harness pin removed.
++Proof method: `crates/oulipoly-runtime/tests/age_pid_sidecar_spawn.rs::spawn_capture_writes_verified_sidecar_row_without_state_schema_change`.
++Evidence-class match: The test executes `RuntimeExecutorService::execute`, reads the actual PID identity sidecar DB under the XDG-derived app data directory, and verifies state schema stability; it is runtime sidecar evidence, but it does not directly assert the child env value or pre-existing-pin preservation.
++
++Runtime claim: A pre-existing `OULIPOLY_DATA_DIR` in the parent environment is not overridden during provider spawn.
++Proof method: `crates/oulipoly-runtime/tests/age_pid_sidecar_spawn.rs::spawn_preserves_preexisting_oulipoly_data_dir_in_provider_child`.
++Evidence-class match: The test sets the spawning process env to `OULIPOLY_DATA_DIR=<custom dir>` with an isolated `XDG_DATA_HOME`, executes a real fixture provider through `RuntimeExecutorService::execute`, and asserts the child-recorded env equals the custom pin rather than the runner's XDG-derived default.
++
++Runtime claim: A child whose environment changes `XDG_DATA_HOME` still notifies into the spawning runner's sidecar and the wake fires.
++Proof method: `src-tauri/tests/wu_d_proactive_wake_integration.rs::provider_shadow_xdg_notify_uses_pinned_data_dir_and_wakes`.
++Evidence-class match: The provider process exports a different `XDG_DATA_HOME`, runs a real descendant `notify`, waits for the resumed prompt containing `handle: h-shadow-xdg`, verifies the mailbox row is delivered in the original fixture sidecar, and asserts the shadow XDG app state directory was not created.
++
++Runtime claim: Wake-resume env preserves the data-dir pin into the resumed provider child.
++Proof method: `src-tauri/tests/wu_d_proactive_wake_integration.rs::provider_shadow_xdg_notify_uses_pinned_data_dir_and_wakes`.
++Evidence-class match: The provider process shadows `XDG_DATA_HOME`, a real descendant `notify` triggers the wake-resume path, and the resumed provider child records `OULIPOLY_DATA_DIR`; the test asserts that value equals the spawning runner's pinned app data directory.
+diff --git a/src-tauri/src/usage/fetcher.rs b/src-tauri/src/usage/fetcher.rs
+index d341cc9..6e8740f 100644
+--- a/src-tauri/src/usage/fetcher.rs
++++ b/src-tauri/src/usage/fetcher.rs
+@@ -11,7 +11,7 @@
+ //!   - component: src-tauri/src/usage/fetcher.rs
+ //!     role: adapter
+ //!     Translates:
+-//!       - runtime quota refresh + shared lock-root contract (`oulipoly_runtime::quota`, `run_script`, `parse_output`, `run_auth_refresh_command_coalesced`, `AuthRefreshAttempt`, `QuotaScriptWindow`, `lock_data_home`, `sanitize_lock_key`)
++//!       - runtime quota refresh + shared lock-root contract (`oulipoly_runtime::quota`, `run_script`, `parse_output`, `run_auth_refresh_command_coalesced`, `AuthRefreshAttempt`, `QuotaScriptWindow`, `lock_app_data_dir`, `sanitize_lock_key`)
+ //!       - usage-refresh-lock filesystem contract (`std::fs`, `File`, `OpenOptions`, `std::io`, `std::time::SystemTime`, `Duration`)
+ //!       - enumerated-account and state persistence contract (`EnumeratedAccount`, `StateDb`, `QuotaWindowInput`, `upsert_quota_refresh`, `get_windows`)
+ //! ```
+@@ -163,9 +163,7 @@ impl Drop for RefreshFileLock {
+ }
+ 
+ fn usage_lock_dir() -> PathBuf {
+-    quota::lock_data_home()
+-        .join("oulipoly-agent-runner")
+-        .join("usage-refresh-locks")
++    quota::lock_app_data_dir().join("usage-refresh-locks")
+ }
+ 
+ fn create_lock_file(path: &Path) -> Result<Option<File>, io::Error> {
+diff --git a/src-tauri/src/wiring.rs b/src-tauri/src/wiring.rs
+index 7ac6345..62610f0 100644
+--- a/src-tauri/src/wiring.rs
++++ b/src-tauri/src/wiring.rs
+@@ -206,9 +206,7 @@ fn default_cli_runtime_paths() -> RuntimePaths {
+         .map(|dir| dir.join("oulipoly-agent-runner"))
+         .unwrap_or_else(|| PathBuf::from("."));
+     let models_dir = config_root.join("models");
+-    let data_root = dirs::data_dir()
+-        .map(|dir| dir.join("oulipoly-agent-runner"))
+-        .unwrap_or_else(|| config_root.clone());
++    let data_root = oulipoly_state::paths::data_dir().unwrap_or_else(|_| config_root.clone());
+     RuntimePaths {
+         config_root: config_root.clone(),
+         models_dir,
+diff --git a/src-tauri/tests/wu_b_mailbox_integration.rs b/src-tauri/tests/wu_b_mailbox_integration.rs
+index ed9f379..a9a3583 100644
+--- a/src-tauri/tests/wu_b_mailbox_integration.rs
++++ b/src-tauri/tests/wu_b_mailbox_integration.rs
+@@ -80,6 +80,7 @@ impl Fixture {
+         cmd.env("XDG_CONFIG_HOME", &self.config_home);
+         cmd.env("XDG_DATA_HOME", &self.data_home);
+         cmd.env("HOME", &self.home_dir);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+         cmd.output().unwrap()
+     }
+diff --git a/src-tauri/tests/wu_d_proactive_wake_integration.rs b/src-tauri/tests/wu_d_proactive_wake_integration.rs
+index 8ad6b9b..42c11fa 100644
+--- a/src-tauri/tests/wu_d_proactive_wake_integration.rs
++++ b/src-tauri/tests/wu_d_proactive_wake_integration.rs
+@@ -66,12 +66,17 @@ impl Fixture {
+             .join("state.db")
+     }
+ 
++    fn pinned_data_dir(&self) -> PathBuf {
++        self.data_home.join("oulipoly-agent-runner")
++    }
++
+     fn run(&self, mut cmd: Command) -> Output {
+         cmd.env("XDG_CONFIG_HOME", &self.config_home)
+             .env("XDG_DATA_HOME", &self.data_home)
+             .env("HOME", &self.home_dir)
+             .env("AGENT_BASH_AGENT_RUNNER_BIN", runner_bin())
+             .env("WU_D_WORK_DIR", &self.work_dir)
++            .env_remove("OULIPOLY_DATA_DIR")
+             .env_remove("OULIPOLY_PARENT_INVOCATION")
+             .current_dir(self.dir.path());
+         cmd.output().unwrap()
+@@ -648,6 +653,7 @@ fn notify_command(fixture: &Fixture, handle: &str, identity: &ProcessIdentity) -
+         .env("HOME", &fixture.home_dir)
+         .env("AGENT_BASH_AGENT_RUNNER_BIN", runner_bin())
+         .env("WU_D_WORK_DIR", &fixture.work_dir)
++        .env_remove("OULIPOLY_DATA_DIR")
+         .env_remove("OULIPOLY_PARENT_INVOCATION")
+         .stdout(Stdio::piped())
+         .stderr(Stdio::piped())
+@@ -655,6 +661,50 @@ fn notify_command(fixture: &Fixture, handle: &str, identity: &ProcessIdentity) -
+     cmd
+ }
+ 
++#[test]
++fn provider_shadow_xdg_notify_uses_pinned_data_dir_and_wakes() {
++    let _guard = integration_test_guard();
++    let fixture = Fixture::new();
++    fixture.write_provider(&provider_script(
++        r#"if [ -z "${OULIPOLY_DATA_DIR:-}" ]; then
++  printf 'missing OULIPOLY_DATA_DIR\n' >&2
++  exit 65
++fi
++export XDG_DATA_HOME="$work/shadow-xdg"
++( sleep 0.3; notify_handle h-shadow-xdg 0 ) >/dev/null 2>&1 &"#,
++        r#"printf '%s\n' "${OULIPOLY_DATA_DIR:-}" > "$work/shadow-resumed-data-dir.txt""#,
++        "shadow-resumed-input.txt",
++    ));
++
++    let output = fixture.run_agent("dispatch from shadowed provider");
++    assert_eq!(output.status.code(), Some(0), "{output:?}");
++
++    let prompt = wait_for_file(&fixture.prompt_file("shadow-resumed-input.txt"));
++    assert!(prompt.contains("handle: h-shadow-xdg"), "{prompt}");
++    let resumed_data_dir = wait_for_file(&fixture.prompt_file("shadow-resumed-data-dir.txt"));
++    let expected_data_dir = fixture.pinned_data_dir();
++    let expected_data_dir = expected_data_dir.to_string_lossy();
++    assert_eq!(resumed_data_dir.trim_end(), expected_data_dir.as_ref());
++    let session_id = wait_for_mailbox_session(&fixture);
++    wait_until("shadow-xdg mailbox delivered", || {
++        let db = fixture.mailbox();
++        let rows = db.list_mailbox(&session_id, true).unwrap();
++        rows.len() == 1
++            && rows[0].handle == "h-shadow-xdg"
++            && rows[0].delivered_at.is_some()
++            && db.wake_claim(&session_id).unwrap().is_none()
++    });
++    assert!(
++        !fixture
++            .work_dir
++            .join("shadow-xdg")
++            .join("oulipoly-agent-runner")
++            .exists(),
++        "shadow XDG_DATA_HOME must not receive agent-runner state"
++    );
++    fixture.assert_xdg_isolated();
++}
++
+ fn assert_notify_success(output: &Output) {
+     assert!(
+         output.status.success(),
+diff --git a/src-tauri/tests/wu_e_pty_delivery_integration.rs b/src-tauri/tests/wu_e_pty_delivery_integration.rs
+index c260cd7..f87b1ab 100644
+--- a/src-tauri/tests/wu_e_pty_delivery_integration.rs
++++ b/src-tauri/tests/wu_e_pty_delivery_integration.rs
+@@ -93,6 +93,7 @@ impl Fixture {
+         cmd.env("XDG_RUNTIME_DIR", &self.runtime_dir);
+         cmd.env("XDG_STATE_HOME", &self.state_home);
+         cmd.env("HOME", &self.home_dir);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+         cmd.output().unwrap()
+     }
+@@ -137,6 +138,7 @@ impl Fixture {
+         cmd.env("XDG_RUNTIME_DIR", &self.runtime_dir);
+         cmd.env("XDG_STATE_HOME", &self.state_home);
+         cmd.env("HOME", &self.home_dir);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
+         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+     }
+ 
