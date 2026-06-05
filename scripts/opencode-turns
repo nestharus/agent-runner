@@ -5,13 +5,13 @@ Reference adapter: emit OpenCode exported sessions as normalized JSONL.
 Usage: opencode-turns BASE_DIR [SESSION_ID ...]
    e.g. opencode-turns ~/.local/share/opencode ses_abc123
 
-Message content is read through the public OpenCode CLI:
+Session IDs and message content are read through the public OpenCode CLI:
+  opencode session list
   opencode export <sessionID>
 
-When SESSION_ID arguments are supplied, the adapter does not inspect OpenCode
-storage. Without explicit IDs, it discovers candidate session IDs from the
-directory names under BASE_DIR/storage/message/ses_*. That discovery fallback is
-the only remaining private-layout touch; message JSON files are never read.
+When SESSION_ID arguments are supplied, they are used directly. BASE_DIR is
+accepted for compatibility with existing session source configuration; implicit
+discovery uses `opencode session list`, not OpenCode's private storage layout.
 
 Emits one JSON object per line on stdout:
   {"session_id":"ses_...","turn_id":"msg_...","timestamp":"<rfc3339>","role":"user|assistant","body":[{"type":"text","text":"..."}]}
@@ -19,15 +19,16 @@ Emits one JSON object per line on stdout:
 
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 
 MESSAGE_LIST_KEYS = ("messages", "turns", "items", "entries")
+SESSION_ID_RE = re.compile(r"\bses_[A-Za-z0-9_-]+\b")
 
 
 def text_chunk(text: str) -> dict:
@@ -74,17 +75,48 @@ def unique_values(values: list[str]) -> list[str]:
     return unique
 
 
-def discover_session_ids(base: Path) -> list[str]:
-    message_root = base.expanduser() / "storage" / "message"
-    if not message_root.exists():
+def session_ids_from_value(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return SESSION_ID_RE.findall(value)
+    if isinstance(value, list):
+        session_ids = []
+        for item in value:
+            session_ids.extend(session_ids_from_value(item))
+        return session_ids
+    if isinstance(value, dict):
+        session_ids = []
+        for item in value.values():
+            session_ids.extend(session_ids_from_value(item))
+        return session_ids
+    return []
+
+
+def parse_session_list_stdout(stdout: str) -> list[str]:
+    try:
+        parsed = json.loads(stdout)
+    except json.JSONDecodeError:
+        parsed = stdout
+    return sorted(unique_values(session_ids_from_value(parsed)))
+
+
+def discover_session_ids() -> list[str]:
+    command = opencode_command() + ["session", "list"]
+    try:
+        completed = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
         return []
-    return sorted(path.name for path in message_root.glob("ses_*") if path.is_dir())
+    return parse_session_list_stdout(completed.stdout)
 
 
-def requested_session_ids(base: Path, args: list[str]) -> list[str]:
+def requested_session_ids(args: list[str]) -> list[str]:
     if args:
         return unique_values(args)
-    return discover_session_ids(base)
+    return discover_session_ids()
 
 
 def numeric_timestamp(value) -> str | None:
@@ -216,9 +248,9 @@ def main() -> int:
     if len(sys.argv) < 2:
         print("usage: opencode-turns BASE_DIR [SESSION_ID ...]", file=sys.stderr)
         return 2
-    base = Path(sys.argv[1]).expanduser()
+    _base_dir = sys.argv[1]
     out = sys.stdout
-    for session_id in requested_session_ids(base, sys.argv[2:]):
+    for session_id in requested_session_ids(sys.argv[2:]):
         emit_session(session_id, out)
     return 0
 

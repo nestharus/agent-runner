@@ -636,12 +636,7 @@ fn opencode_read_turns_ingests_normalized_jsonl() {
     let fixture = tempfile::tempdir().expect("tempdir");
     let state = StateDb::open(&fixture.path().join("state.db")).expect("state db");
     let opencode_root = fixture.path().join("opencode-data");
-    let message_dir = opencode_root
-        .join("storage")
-        .join("message")
-        .join(OPENCODE_SESSION_ID);
-    fs::create_dir_all(&message_dir).expect("message dir");
-    let opencode_bin = write_fake_opencode_export(fixture.path());
+    let opencode_bin = write_fake_opencode(fixture.path());
     let sessions_cfg = opencode_sessions_config(
         &repo_script_path("opencode-turns"),
         &opencode_bin,
@@ -1336,7 +1331,7 @@ fn opencode_sessions_config(
     }
 }
 
-fn write_fake_opencode_export(dir: &Path) -> PathBuf {
+fn write_fake_opencode(dir: &Path) -> PathBuf {
     let script = dir.join("opencode");
     fs::write(
         &script,
@@ -1344,7 +1339,14 @@ fn write_fake_opencode_export(dir: &Path) -> PathBuf {
 import json
 import sys
 
-if sys.argv[1:] != ["export", "ses_fixture"]:
+args = sys.argv[1:]
+
+if args == ["session", "list"]:
+    print("ID\tTitle")
+    print("ses_fixture\tFixture session")
+    sys.exit(0)
+
+if args != ["export", "ses_fixture"]:
     print("unexpected argv: " + repr(sys.argv[1:]), file=sys.stderr)
     sys.exit(3)
 

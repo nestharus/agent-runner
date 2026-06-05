@@ -48,7 +48,7 @@ Focused sub-surfaces:
 | `crates/oulipoly-state/src/db.rs` | `accessor`, `mapper`, `formatter`, `predicate`, `validator`, `parser`, `orchestration`, `filter` | Existing declared multi-role StateDb persistence adapter; changed production function is resume-resolution orchestration. |
 | `src-tauri/src/run/resume/orchestration.rs` | `orchestration`, `validator`, `accessor`, `mapper`, `filter`, `predicate`, `formatter` | Existing resume orchestration roles; changed production function delegates to the relaxed validator. |
 | `src-tauri/src/run/resume/validator.rs` | `validator` | Replaced UUID-only validation with non-empty resume input validation. |
-| `scripts/opencode-turns` | `parser`, `accessor`, `mapper`, `formatter`, `filter`, `validator`, `orchestration` | Non-Rust adapter invokes public `opencode export <sessionID>`, maps exported session JSON to normalized turn JSONL, and retains only residual session-id directory enumeration when no IDs are supplied. |
+| `scripts/opencode-turns` | `parser`, `accessor`, `mapper`, `formatter`, `filter`, `validator`, `orchestration` | Non-Rust adapter invokes public `opencode session list` for implicit discovery, invokes public `opencode export <sessionID>` for content, and maps exported session JSON to normalized turn JSONL. |
 
 Touched non-Rust adapter surface: `scripts/opencode-turns`. It is intentionally excluded from the Rust A5 function inventory, but has an explicit A6 per-file role declaration above because A6 is language-neutral.
 
@@ -121,6 +121,7 @@ adapter_declarations:
   - component: scripts/opencode-turns
     role: adapter
     Translates:
+      - opencode-session-list-output-contract
       - opencode-export-session-json-contract
       - runner-normalized-session-turn-jsonl-contract
 ```
@@ -129,13 +130,11 @@ adapter_declarations:
 
 `provider-stdout-json-event-session-contract` covers provider stdout JSON events selected by configured `event_type` and `event_id_path`, with launch-time `json_args` or legacy `json_flag`, optional last-message sidecar argv, live streamed session observation, and final capture-result mapping.
 
-`scripts/opencode-turns` is a non-Rust adapter surface. It translates the public `opencode export <sessionID>` JSON result into runner-normalized turn JSONL and is intentionally excluded from the Rust A5 function inventory. It does not read OpenCode message JSON files. When no explicit session IDs are supplied, it retains the residual private-layout touch of enumerating `BASE_DIR/storage/message/ses_*` directory names only to discover candidate session IDs for the public export call.
+`scripts/opencode-turns` is a non-Rust adapter surface. It translates public `opencode session list` output into candidate session IDs, translates the public `opencode export <sessionID>` JSON result into runner-normalized turn JSONL, and is intentionally excluded from the Rust A5 function inventory. It does not read OpenCode private storage or native message JSON files.
 
 ## Residual declarations
 
-| id | severity | surface | anchor | evidence | blocking-or-residual |
-|---|---|---|---|---|---|
-| OC-RESIDUAL-001 | LOW-residual | `scripts/opencode-turns` | `discover_session_ids` | No public OpenCode session-list CLI is used by this adapter. Without explicit session IDs, it enumerates only `BASE_DIR/storage/message/ses_*` directory names to feed `opencode export <sessionID>`; message file content and native message JSON shape are not read. | residual |
+No residual declarations remain for `scripts/opencode-turns`; implicit session discovery and content export both use public OpenCode CLI interfaces.
 
 ## Intrinsic-surface declarations
 
