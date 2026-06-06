@@ -11,6 +11,11 @@ The command defaults to `opencode`, or to `opencodeN` when BASE_DIR contains
   opencode session list --json
   opencode export <sessionID>
 
+If `opencode export` exits successfully but emits invalid JSON, the adapter
+falls back to BASE_DIR/opencode.db for requested session IDs. This preserves
+quota and delivery-confirmation reads for large OpenCode sessions whose export
+output is truncated.
+
 When SESSION_ID arguments are supplied, they are used directly. BASE_DIR is
 accepted for compatibility with existing session source configuration; implicit
 discovery uses `opencode session list --json`, not OpenCode's private storage
@@ -35,6 +40,7 @@ import os
 import re
 import shlex
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -410,10 +416,26 @@ def formatted_numeric_timestamp(value: int | float) -> str:
 
 def timestamp_from_obj(obj: dict) -> str | None:
     for key in ("timestamp", "createdAt", "created_at", "time"):
-        value = obj.get(key)
-        if isinstance(value, str) and value:
-            return value
-        converted = numeric_timestamp(value)
+        converted = timestamp_from_value(obj.get(key))
+        if converted:
+            return converted
+    return None
+
+
+def timestamp_from_value(value) -> str | None:
+    if isinstance(value, str) and value:
+        return value
+    converted = numeric_timestamp(value)
+    if converted:
+        return converted
+    if isinstance(value, dict):
+        return timestamp_from_mapping(value)
+    return None
+
+
+def timestamp_from_mapping(value: dict) -> str | None:
+    for key in ("created", "updated", "createdAt", "updatedAt", "time_created"):
+        converted = timestamp_from_value(value.get(key))
         if converted:
             return converted
     return None
@@ -654,8 +676,108 @@ def records_from_exported_session(session_id: str, exported: Any) -> list[dict]:
     return records
 
 
+def records_from_sqlite_session(base_dir: str, session_id: str) -> list[dict]:
+    db_path = opencode_db_path(base_dir)
+    if not os.path.exists(db_path):
+        return []
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1)
+        conn.row_factory = sqlite3.Row
+        return records_from_sqlite_conn(conn, session_id)
+    except (OSError, sqlite3.Error):
+        return []
+    finally:
+        try:
+            conn.close()
+        except (NameError, sqlite3.Error):
+            pass
+
+
+def opencode_db_path(base_dir: str) -> str:
+    return os.path.join(os.path.expanduser(base_dir), "opencode.db")
+
+
+def records_from_sqlite_conn(conn: sqlite3.Connection, session_id: str) -> list[dict]:
+    try:
+        rows = conn.execute(
+            "SELECT id, session_id, time_created, data "
+            "FROM message WHERE session_id = ? ORDER BY time_created, id",
+            (session_id,),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    records = []
+    for row in rows:
+        record = record_from_sqlite_message(conn, row)
+        if record:
+            records.append(record)
+    return records
+
+
+def record_from_sqlite_message(conn: sqlite3.Connection, row: sqlite3.Row) -> dict | None:
+    try:
+        data = json.loads(row["data"])
+    except (TypeError, json.JSONDecodeError):
+        return None
+    obj = sqlite_message_obj(row, data)
+    record = record_from_message(row["session_id"], 0, obj)
+    if record is None:
+        return None
+    return record_with_optional_body(
+        {**record, "turn_id": row["id"]}, sqlite_message_body_chunks(conn, row, data)
+    )
+
+
+def sqlite_message_obj(row: sqlite3.Row, data: dict) -> dict:
+    return {
+        **data,
+        "session_id": row["session_id"],
+        "id": row["id"],
+        "time": sqlite_message_timestamp(row, data),
+    }
+
+
+def sqlite_message_timestamp(row: sqlite3.Row, data: dict):
+    if data.get("time") is not None:
+        return data.get("time")
+    return row["time_created"]
+
+
+def sqlite_message_body_chunks(
+    conn: sqlite3.Connection, row: sqlite3.Row, data: dict
+) -> list:
+    chunks = sqlite_part_body_chunks(conn, row["session_id"], row["id"])
+    if chunks:
+        return chunks
+    return message_body_chunks(data)
+
+
+def sqlite_part_body_chunks(
+    conn: sqlite3.Connection, session_id: str, message_id: str
+) -> list:
+    try:
+        rows = conn.execute(
+            "SELECT data FROM part WHERE session_id = ? AND message_id = ? "
+            "ORDER BY time_created, id",
+            (session_id, message_id),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    chunks = []
+    for row in rows:
+        chunks.extend(sqlite_part_chunks(row["data"]))
+    return chunks
+
+
+def sqlite_part_chunks(data: str) -> list:
+    try:
+        return extract_content_chunks(json.loads(data))
+    except (TypeError, json.JSONDecodeError):
+        return []
+
+
 def collect_records(
-    session_ids: list[str], options: Options, deadline: Deadline
+    base_dir: str, session_ids: list[str], options: Options, deadline: Deadline
 ) -> tuple[list[dict], bool]:
     records = []
     degraded = False
@@ -665,6 +787,7 @@ def collect_records(
             degraded = True
             break
         if exported is None:
+            records.extend(records_from_sqlite_session(base_dir, session_id))
             continue
         records.extend(records_from_exported_session(session_id, exported))
     return records, degraded
@@ -714,7 +837,9 @@ def main() -> int:
     session_ids, discovery_degraded = requested_session_ids(
         session_args_from_argv(sys.argv), options, deadline
     )
-    records, export_degraded = collect_records(session_ids, options, deadline)
+    records, export_degraded = collect_records(
+        base_dir_arg(sys.argv), session_ids, options, deadline
+    )
     for record in records:
         emit_record(record, out)
     if discovery_degraded or export_degraded:

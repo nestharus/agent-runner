@@ -355,6 +355,72 @@ write_command_derivation_mock() {
   write_executable_mock "$path" emit_command_derivation_mock_body
 }
 
+emit_invalid_export_mock_body() {
+  cat <<'MOCK_OPENCODE'
+#!/usr/bin/env bash
+set -euo pipefail
+
+printf '%s\n' "$(basename "$0")" >>"$OPENCODE_TURNS_COMMAND_LOG"
+
+if [[ "$1" == "export" ]]; then
+  session_id="$2"
+  printf '%s\n' "$session_id" >>"$OPENCODE_TURNS_EXPORT_LOG"
+  printf '{"messages":[{"role":"user","content":"unterminated'
+  exit 0
+fi
+
+echo "unexpected opencode args: $*" >&2
+exit 64
+MOCK_OPENCODE
+}
+
+write_invalid_export_mock() {
+  local path="$1"
+
+  write_executable_mock "$path" emit_invalid_export_mock_body
+}
+
+write_opencode_sqlite_fixture() {
+  local db_path="$1"
+
+  python3 - "$db_path" <<'PY'
+import json
+import sqlite3
+import sys
+
+db_path = sys.argv[1]
+conn = sqlite3.connect(db_path)
+conn.execute(
+    "CREATE TABLE message (id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)"
+)
+conn.execute(
+    "CREATE TABLE part (id TEXT, message_id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)"
+)
+conn.execute(
+    "INSERT INTO message VALUES (?, ?, ?, ?, ?)",
+    (
+        "msg_sqlite_user",
+        "ses_sqlite_fallback",
+        1780779200000,
+        1780779200000,
+        json.dumps({"role": "user", "time": {"created": 1780779200000}}),
+    ),
+)
+conn.execute(
+    "INSERT INTO part VALUES (?, ?, ?, ?, ?, ?)",
+    (
+        "prt_sqlite_text",
+        "msg_sqlite_user",
+        "ses_sqlite_fallback",
+        1780779200000,
+        1780779200000,
+        json.dumps({"type": "text", "text": "[OULIPOLY NOTIFICATIONS]\nhandle: h-1\n"}),
+    ),
+)
+conn.commit()
+PY
+}
+
 run_opencode_turns() {
   local tmpdir="$1"
   local opencode_bin="$2"
@@ -494,10 +560,49 @@ test_base_dir_suffix_selects_matching_opencode_command() {
   assert_stdout_contains '"role":"user"' "$FUNCNAME user record"
 }
 
+test_invalid_export_json_falls_back_to_opencode_sqlite() {
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  trap "rm -rf '$tmpdir'" RETURN
+
+  mkdir -p "$tmpdir/bin" "$tmpdir/.opencode3/opencode"
+  write_invalid_export_mock "$tmpdir/bin/opencode3"
+  write_opencode_sqlite_fixture "$tmpdir/.opencode3/opencode/opencode.db"
+  RUN_STDOUT="$tmpdir/stdout.jsonl"
+  RUN_STDERR="$tmpdir/stderr.txt"
+  OPENCODE_TURNS_EXPORT_LOG="$tmpdir/exports.log"
+  OPENCODE_TURNS_COMMAND_LOG="$tmpdir/commands.log"
+  export OPENCODE_TURNS_EXPORT_LOG OPENCODE_TURNS_COMMAND_LOG
+  : >"$OPENCODE_TURNS_EXPORT_LOG"
+  : >"$OPENCODE_TURNS_COMMAND_LOG"
+
+  set +e
+  env -u OPENCODE_BIN \
+    PATH="$tmpdir/bin:$PATH" \
+    OPENCODE_TURNS_WINDOW_HOURS=6 \
+    OPENCODE_TURNS_MAX_SESSIONS=25 \
+    OPENCODE_TURNS_CALL_TIMEOUT=20 \
+    OPENCODE_TURNS_DEADLINE=60 \
+    "$SCRIPT" "$tmpdir/.opencode3/opencode" ses_sqlite_fallback >"$RUN_STDOUT" 2>"$RUN_STDERR"
+  RUN_STATUS=$?
+  set -e
+
+  assert_status_zero "$RUN_STATUS" "$FUNCNAME"
+  assert_eq "$(cat "$OPENCODE_TURNS_COMMAND_LOG")" "opencode3" "$FUNCNAME command"
+  assert_eq "$(cat "$OPENCODE_TURNS_EXPORT_LOG")" "ses_sqlite_fallback" "$FUNCNAME export"
+  assert_stdout_contains '"session_id":"ses_sqlite_fallback"' "$FUNCNAME session"
+  assert_stdout_contains '"turn_id":"msg_sqlite_user"' "$FUNCNAME turn id"
+  assert_stdout_contains '"role":"user"' "$FUNCNAME role"
+  assert_stdout_contains '[OULIPOLY NOTIFICATIONS]' "$FUNCNAME notification body"
+  assert_stdout_contains 'handle: h-1' "$FUNCNAME handle body"
+  assert_stdout_not_contains '"degraded":true' "$FUNCNAME not degraded"
+}
+
 test_timestampless_session_list_applies_max_sessions_cap
 test_exports_only_recent_window_sessions
 test_timeout_emits_degraded_best_effort_and_exits_zero
 test_timeout_kills_opencode_process_group_descendant
 test_base_dir_suffix_selects_matching_opencode_command
+test_invalid_export_json_falls_back_to_opencode_sqlite
 
 echo "opencode-turns tests passed"
