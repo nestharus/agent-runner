@@ -500,6 +500,7 @@ mod tests {
                 evidence: "typed evidence".to_string(),
                 observed_at: SystemTime::UNIX_EPOCH,
             }),
+            submitted_user_turn: None,
             captured_child_invocations: Vec::<CapturedChildInvocation>::new(),
             returned_artifacts: Vec::new(),
         }

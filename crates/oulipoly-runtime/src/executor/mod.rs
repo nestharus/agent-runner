@@ -64,8 +64,17 @@ pub struct ExecutionResult {
     pub resume_acceptance: Option<ResumeAcceptanceResult>,
     pub terminal_reason: Option<String>,
     pub terminal_signal: Option<TerminalSignal>,
+    pub submitted_user_turn: Option<SubmittedUserTurn>,
     pub captured_child_invocations: Vec<CapturedChildInvocation>,
     pub returned_artifacts: Vec<ReturnedArtifactRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmittedUserTurn {
+    pub provider_session_id: String,
+    pub prompt_sha256: String,
+    pub source: Option<String>,
+    pub message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

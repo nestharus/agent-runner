@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 const HOME_ENV: &str = "HOME";
+const AGENT_BASH_AGENT_RUNNER_BIN_ENV: &str = "AGENT_BASH_AGENT_RUNNER_BIN";
 const DATA_DIR_ENV: &str = oulipoly_state::paths::DATA_DIR_ENV;
 const OPENCODE_ACCOUNT_PREFIX: &str = "opencode";
 const PATH_ENV: &str = "PATH";
@@ -47,6 +48,7 @@ fn declared_launch_env(context: &ExternalProviderDispatchContext) -> BTreeMap<St
     let mut env = BTreeMap::new();
     insert_ambient_env(&mut env, PATH_ENV);
     insert_ambient_env(&mut env, HOME_ENV);
+    insert_ambient_env(&mut env, AGENT_BASH_AGENT_RUNNER_BIN_ENV);
     insert_pinned_agent_data_dir(&mut env);
     insert_selected_opencode_auth_env(&mut env, context);
     if let Some(parent) = &context.parent_invocation_env {

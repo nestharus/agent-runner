@@ -1031,8 +1031,10 @@ fn external_provider_launch_env_carries_host_linkage_without_openai_keys() {
         .display()
         .to_string();
     let parent_invocation_env = "parent-provider-a-invocation".to_string();
+    let agent_runner_bin = "/tmp/target-release/oulipoly-agent-runner";
     let _env = EnvScope::set_optional(&[
         ("XDG_DATA_HOME", Some(xdg_data.as_str())),
+        ("AGENT_BASH_AGENT_RUNNER_BIN", Some(agent_runner_bin)),
         ("OULIPOLY_DATA_DIR", None),
         (
             "OPENAI_API_KEY",
@@ -1075,6 +1077,12 @@ fn external_provider_launch_env_carries_host_linkage_without_openai_keys() {
                 .and_then(|value| value.as_str()),
             Some(parent_invocation_env.as_str()),
             "external launch params.env must carry parent invocation linkage"
+        );
+        assert_eq!(
+            env.get("AGENT_BASH_AGENT_RUNNER_BIN")
+                .and_then(|value| value.as_str()),
+            Some(agent_runner_bin),
+            "external launch params.env must let provider-spawned agent-bash notify via the same runner binary"
         );
         assert!(
             env.keys().all(|key| {

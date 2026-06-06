@@ -526,6 +526,7 @@ mod tests {
             resume_acceptance: None,
             terminal_reason: None,
             terminal_signal: Some(terminal_signal),
+            submitted_user_turn: None,
             captured_child_invocations: Vec::<CapturedChildInvocation>::new(),
             returned_artifacts: Vec::new(),
         }

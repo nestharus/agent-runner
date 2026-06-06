@@ -341,6 +341,66 @@ fn external_provider_wake_does_not_mark_delivered_when_resume_produces_no_turn()
 }
 
 #[test]
+fn external_provider_wake_confirms_delivery_from_submitted_turn_marker() {
+    let fixture = Fixture::new();
+    fixture.write_external_provider();
+
+    let output = fixture.run_agent_with_env(
+        "dispatch external provider wake confirmed by marker",
+        &[
+            ("S11_EMIT_SUBMITTED_TURN_MARKER", "1"),
+            ("S11_SKIP_SCAN_WAKE_TURN", "1"),
+        ],
+    );
+    assert_success(&output);
+
+    let prompt = wait_for_file(&fixture.prompt_file("external-wake-resumed.txt"));
+    assert!(prompt.starts_with("[OULIPOLY NOTIFICATIONS]"), "{prompt}");
+    wait_until("submitted-turn marker delivered pending mailbox", || {
+        let db = fixture.mailbox();
+        let rows = db.list_mailbox(SESSION, true).unwrap();
+        rows.len() == 1
+            && rows[0].delivered_at.is_some()
+            && rows[0].delivery_error.is_none()
+            && db.wake_claim(SESSION).unwrap().is_none()
+    });
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
+fn external_provider_wake_ignores_submitted_turn_marker_for_different_payload() {
+    let fixture = Fixture::new();
+    fixture.write_external_provider();
+
+    let output = fixture.run_agent_with_env(
+        "dispatch external provider wake mismatched marker",
+        &[
+            ("S11_EMIT_SUBMITTED_TURN_MARKER", "1"),
+            ("S11_MARKER_PROMPT_SHA_MISMATCH", "1"),
+            ("S11_SKIP_SCAN_WAKE_TURN", "1"),
+            ("OULIPOLY_AUTO_WAKE_MAX", "1"),
+        ],
+    );
+    assert_success(&output);
+
+    let prompt = wait_for_file(&fixture.prompt_file("external-wake-resumed.txt"));
+    assert!(prompt.starts_with("[OULIPOLY NOTIFICATIONS]"), "{prompt}");
+    wait_until(
+        "mismatched submitted-turn marker leaves mailbox pending",
+        || {
+            let db = fixture.mailbox();
+            let rows = db.list_mailbox(SESSION, true).unwrap();
+            rows.len() == 1
+                && rows[0].delivered_at.is_none()
+                && rows[0].delivery_attempts == 1
+                && rows[0].delivery_error.as_deref() == Some("mailbox_delivery_unconfirmed")
+                && db.wake_claim(SESSION).unwrap().is_none()
+        },
+    );
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
 fn external_provider_failed_wake_releases_claim_and_retries_pending_mailbox() {
     let fixture = Fixture::new();
     fixture.write_external_provider();
@@ -446,6 +506,7 @@ fn external_provider_policy_rejection_terminal_signal_excerpt_includes_diagnosti
 fn external_provider_script() -> &'static str {
     r#"#!/usr/bin/env python3
 import base64
+import hashlib
 import json
 import os
 import pathlib
@@ -527,6 +588,25 @@ def stdout_event(request, seq, payload):
         "data_base64": base64.b64encode(payload.encode("utf-8")).decode("ascii"),
     }
 
+def submitted_turn_marker_event(request, seq, session_id, prompt):
+    prompt_sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    if os.environ.get("S11_MARKER_PROMPT_SHA_MISMATCH") == "1":
+        prompt_sha = hashlib.sha256(b"different payload").hexdigest()
+    return {
+        "contract": CONTRACT,
+        "request_id": request_id(request),
+        "seq": seq,
+        "time_unix_ms": 1000 + seq,
+        "kind": "marker",
+        "name": "oulipoly.submitted_user_turn",
+        "value": {
+            "provider_session_id": session_id,
+            "prompt_sha256": prompt_sha,
+            "source": "s11.fixture",
+            "message_id": "msg-s11-submitted",
+        },
+    }
+
 def exit_event(request, seq, session_id):
     event = {
         "contract": CONTRACT,
@@ -601,7 +681,13 @@ def launch(request):
         target = pathlib.Path(os.environ["S11_WORK_DIR"]) / "external-wake-resumed.txt"
         target.write_text(prompt, encoding="utf-8")
         emit(stdout_event(request, 1, "resumed\n"))
-        emit(exit_event(request, 2, known))
+        if os.environ.get("S11_SKIP_SCAN_WAKE_TURN") == "1":
+            (pathlib.Path(os.environ["S11_WORK_DIR"]) / "skip-scan-wake-turn.txt").write_text("skip\n", encoding="utf-8")
+        if os.environ.get("S11_EMIT_SUBMITTED_TURN_MARKER") == "1":
+            emit(submitted_turn_marker_event(request, 2, known, prompt))
+            emit(exit_event(request, 3, known))
+        else:
+            emit(exit_event(request, 2, known))
         return
     if os.environ.get("S11_NO_NOTIFY") != "1":
         spawn_notify_workload()
@@ -757,7 +843,7 @@ def emit(turn_id, text):
 
 work = pathlib.Path(os.environ["S11_WORK_DIR"])
 emit("turn-s11-initial", "initial fixture turn")
-if (work / "external-wake-resumed.txt").exists():
+if (work / "external-wake-resumed.txt").exists() and not (work / "skip-scan-wake-turn.txt").exists():
     emit("turn-s11-woke", "WOKE reply")
 "#
 }

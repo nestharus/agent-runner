@@ -13,6 +13,7 @@ use oulipoly_runtime::services::{
     ExecutorServiceRequest, InvocationLifecycleServicePort, MigrationServiceOutput,
     ResumeServiceOutput, ServiceError,
 };
+use sha2::{Digest, Sha256};
 
 use super::disposition::{
     ResumeLoopControl, ResumeTerminalDispositionInput, confirmed_zero_turn_maybe_quota,
@@ -758,7 +759,7 @@ fn mailbox_delivery_unconfirmed(
     zero_turn_action: ZeroTurnAction,
 ) -> bool {
     mailbox_delivery_requires_turn_confirmation(input, provider_name, result)
-        && !mailbox_delivery_turn_confirmed(zero_turn_action)
+        && !mailbox_delivery_turn_confirmed(input, result, zero_turn_action)
 }
 
 fn mailbox_delivery_requires_turn_confirmation(
@@ -772,8 +773,32 @@ fn mailbox_delivery_requires_turn_confirmation(
         && input.env.sessions_cfg.get(provider_name).is_some()
 }
 
-fn mailbox_delivery_turn_confirmed(zero_turn_action: ZeroTurnAction) -> bool {
+fn mailbox_delivery_turn_confirmed(
+    input: &ResumeAttemptInput<'_>,
+    result: &executor::ExecutionResult,
+    zero_turn_action: ZeroTurnAction,
+) -> bool {
     matches!(zero_turn_action, ZeroTurnAction::Continue)
+        || submitted_user_turn_confirms_mailbox_delivery(input, result)
+}
+
+fn submitted_user_turn_confirms_mailbox_delivery(
+    input: &ResumeAttemptInput<'_>,
+    result: &executor::ExecutionResult,
+) -> bool {
+    let Some(submitted) = result.submitted_user_turn.as_ref() else {
+        return false;
+    };
+    let Some(answer) = input.answer else {
+        return false;
+    };
+    submitted.provider_session_id == input.resolved.active_session_id
+        && submitted.prompt_sha256 == sha256_hex(answer.as_bytes())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn finalize_unconfirmed_mailbox_delivery(
