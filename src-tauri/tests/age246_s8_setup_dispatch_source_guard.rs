@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 
 const MANAGER_BASELINE_PROVIDER_NAME_COUNT: usize = 5391;
 
@@ -118,12 +118,27 @@ fn s8_files_introduce_zero_new_concrete_provider_vocabulary() {
 #[test]
 fn full_provider_name_grep_threshold_remains_within_manager_baseline() {
     let root = workspace_root();
-    let output = Command::new("git")
-        .current_dir(&root)
+    let count = full_provider_name_occurrence_count(&root, &concrete_provider_pattern());
+
+    assert!(
+        count <= MANAGER_BASELINE_PROVIDER_NAME_COUNT,
+        "full provider-name grep count {count} exceeds manager baseline {MANAGER_BASELINE_PROVIDER_NAME_COUNT}"
+    );
+}
+
+fn full_provider_name_occurrence_count(root: &Path, pattern: &str) -> usize {
+    let output = full_provider_name_grep_output(root, pattern);
+    assert_full_provider_name_grep_status(&output);
+    stdout_line_count(output.stdout, "git grep stdout utf8")
+}
+
+fn full_provider_name_grep_output(root: &Path, pattern: &str) -> Output {
+    Command::new("git")
+        .current_dir(root)
         .args([
             "grep",
             "-iE",
-            &concrete_provider_pattern(),
+            pattern,
             "--",
             ".",
             ":(exclude)planning/*-gate/**",
@@ -132,25 +147,32 @@ fn full_provider_name_grep_threshold_remains_within_manager_baseline() {
             ":(exclude)planning/s10-moveout/**",
         ])
         .output()
-        .expect("git grep must run");
+        .expect("git grep must run")
+}
+
+fn assert_full_provider_name_grep_status(output: &Output) {
     assert!(
         output.status.success() || output.status.code() == Some(1),
         "git grep failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let count = String::from_utf8(output.stdout)
-        .expect("git grep stdout utf8")
-        .lines()
-        .count();
+}
 
-    assert!(
-        count <= MANAGER_BASELINE_PROVIDER_NAME_COUNT,
-        "full provider-name grep count {count} exceeds manager baseline {MANAGER_BASELINE_PROVIDER_NAME_COUNT}"
-    );
+fn stdout_line_count(stdout: Vec<u8>, expect_message: &str) -> usize {
+    String::from_utf8(stdout)
+        .expect(expect_message)
+        .lines()
+        .count()
 }
 
 fn tracked_added_provider_name_occurrences(root: &Path, pattern: &str) -> usize {
-    let output = Command::new("git")
+    let output = tracked_diff_output(root);
+    assert_tracked_diff_status(&output);
+    added_provider_name_occurrence_count(output.stdout, pattern)
+}
+
+fn tracked_diff_output(root: &Path) -> Output {
+    Command::new("git")
         .current_dir(root)
         .args([
             "diff",
@@ -163,13 +185,19 @@ fn tracked_added_provider_name_occurrences(root: &Path, pattern: &str) -> usize 
             ":(exclude)planning/s10-moveout/**",
         ])
         .output()
-        .expect("git diff must run");
+        .expect("git diff must run")
+}
+
+fn assert_tracked_diff_status(output: &Output) {
     assert!(
         output.status.success(),
         "git diff failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    String::from_utf8(output.stdout)
+}
+
+fn added_provider_name_occurrence_count(stdout: Vec<u8>, pattern: &str) -> usize {
+    String::from_utf8(stdout)
         .expect("git diff stdout utf8")
         .lines()
         .filter(|line| line.starts_with('+') && !line.starts_with("+++"))

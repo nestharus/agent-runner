@@ -1,0 +1,1764 @@
+# s10 gate runtime evidence
+
+XDG isolation root: /tmp/tmp.iqIcnocTUs
+OULIPOLY_DATA_DIR: removed via env -u
+Code state: 3435985..7ad8ebd touched suites.
+
+## oulipoly-runtime s10_external_launch_session
+
+$ env -u OULIPOLY_DATA_DIR XDG_CONFIG_HOME="/tmp/tmp.iqIcnocTUs/config" XDG_DATA_HOME="/tmp/tmp.iqIcnocTUs/data" XDG_CACHE_HOME="/tmp/tmp.iqIcnocTUs/cache" XDG_STATE_HOME="/tmp/tmp.iqIcnocTUs/state" cargo test -p oulipoly-runtime --test s10_external_launch_session
+
+   Compiling oulipoly-state v0.1.0 (/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/crates/oulipoly-state)
+   Compiling oulipoly-runtime v0.1.0 (/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/crates/oulipoly-runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.14s
+     Running tests/s10_external_launch_session.rs (src-tauri/target/debug/deps/s10_external_launch_session-253c649171ce5111)
+
+running 1 test
+test external_launch_exit_session_populates_capture_and_resume_request ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+
+Suite rc: 0
+
+## oulipoly-runtime age244_s7b_export_replace_dispatch
+
+$ env -u OULIPOLY_DATA_DIR XDG_CONFIG_HOME="/tmp/tmp.iqIcnocTUs/config" XDG_DATA_HOME="/tmp/tmp.iqIcnocTUs/data" XDG_CACHE_HOME="/tmp/tmp.iqIcnocTUs/cache" XDG_STATE_HOME="/tmp/tmp.iqIcnocTUs/state" cargo test -p oulipoly-runtime --test age244_s7b_export_replace_dispatch
+
+   Compiling oulipoly-runtime v0.1.0 (/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/crates/oulipoly-runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.07s
+     Running tests/age244_s7b_export_replace_dispatch.rs (src-tauri/target/debug/deps/age244_s7b_export_replace_dispatch-019d4373ae18430d)
+
+running 21 tests
+test no_new_concrete_provider_name_grep_hits_are_introduced_against_base_ref ... ok
+test external_export_malformed_canonical_jsonl_rejects_hash_valid_payload_without_fallback ... ok
+test external_export_provider_error_protocol_and_hash_failures_do_not_fallback_or_mutate_sqlite ... ok
+test external_export_requires_registry_handle_without_builtin_fallback ... ok
+test external_export_success_validates_provider_bytes_request_shape_and_keeps_host_state_read_only ... ok
+test external_export_transport_failure_does_not_mutate_sqlite_or_use_builtin_fallback ... ok
+test external_replace_commit_verification_failure_rolls_back_provider_mutation_and_journal ... ok
+test external_replace_preimage_mismatch_rejects_stale_write_without_host_mutation ... ok
+test external_replace_dry_run_no_change_returns_no_state_update_and_no_host_mutation ... ok
+test external_replace_provider_protocol_hash_plan_and_source_failures_do_not_mutate_host_state ... ok
+test external_replace_recovery_rolls_forward_with_durable_preimage_snapshot_and_postimage ... ok
+test external_replace_recovery_rolls_back_provider_mutation_without_postimage_claim ... ok
+test external_replace_rejects_malformed_canonical_input_before_provider_invocation ... ok
+test external_replace_session_busy_rejects_before_provider_mutates_storage ... ok
+test external_replace_requires_registry_handle_before_host_mutation_or_builtin_fallback ... ok
+test external_replace_semantic_verification_mismatch_does_not_mutate_host_state ... ok
+test external_replace_transport_failure_does_not_mutate_host_state_or_use_builtin_fallback ... ok
+test no_ref_export_uses_dispatch_service_with_populated_registry_and_preserves_stdout_bytes ... ok
+test external_replace_success_uses_provider_transform_and_host_owned_apply_lifecycle ... ok
+test no_ref_replace_uses_dispatch_service_with_populated_registry_and_preserves_host_state ... ok
+test startup_pending_replace_recovery_is_host_owned_and_ordered_before_provider_dispatch ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.16s
+
+
+Suite rc: 0
+
+## oulipoly-setup context tests
+
+$ env -u OULIPOLY_DATA_DIR XDG_CONFIG_HOME="/tmp/tmp.iqIcnocTUs/config" XDG_DATA_HOME="/tmp/tmp.iqIcnocTUs/data" XDG_CACHE_HOME="/tmp/tmp.iqIcnocTUs/cache" XDG_STATE_HOME="/tmp/tmp.iqIcnocTUs/state" cargo test -p oulipoly-setup context::tests
+
+   Compiling oulipoly-state v0.1.0 (/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/crates/oulipoly-state)
+   Compiling oulipoly-setup v0.1.0 (/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/crates/oulipoly-setup)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.32s
+     Running unittests src/lib.rs (src-tauri/target/debug/deps/oulipoly_setup-94f5c89a51853d08)
+
+running 2 tests
+test context::tests::system_prompt_contains_claude_and_codex_examples ... ok
+test context::tests::cli_setup_prompt_contains_claude_and_codex_examples ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 0.00s
+
+     Running tests/setup_agent_send_turn.rs (src-tauri/target/debug/deps/setup_agent_send_turn-a21a657c3c7f599e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+Suite rc: 0
+
+## oulipoly-agent-runner config_migration unit tests
+
+$ env -u OULIPOLY_DATA_DIR XDG_CONFIG_HOME="/tmp/tmp.iqIcnocTUs/config" XDG_DATA_HOME="/tmp/tmp.iqIcnocTUs/data" XDG_CACHE_HOME="/tmp/tmp.iqIcnocTUs/cache" XDG_STATE_HOME="/tmp/tmp.iqIcnocTUs/state" cargo test -p oulipoly-agent-runner commands::config_migration::tests
+
+   Compiling oulipoly-state v0.1.0 (/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/crates/oulipoly-state)
+   Compiling oulipoly-agent-runner v0.1.0 (/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/src-tauri)
+   Compiling oulipoly-setup v0.1.0 (/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/crates/oulipoly-setup)
+   Compiling oulipoly-runtime v0.1.0 (/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/crates/oulipoly-runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 21.21s
+     Running unittests src/lib.rs (src-tauri/target/debug/deps/agent_runner_lib-b59b81190a07cb78)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 30 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (src-tauri/target/debug/deps/oulipoly_agent_runner-af014df39f76f625)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 137 filtered out; finished in 0.00s
+
+     Running tests/age100_one_shot_quota_migration.rs (src-tauri/target/debug/deps/age100_one_shot_quota_migration-06418b78dec9d3f9)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/age100_resume_quota_migration.rs (src-tauri/target/debug/deps/age100_resume_quota_migration-f0380be3c3fb7f35)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/age123_resume_provider_identity.rs (src-tauri/target/debug/deps/age123_resume_provider_identity-f5958df953a247e4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/age134_main_prompt_resolution.rs (src-tauri/target/debug/deps/age134_main_prompt_resolution-5ef32b855f318280)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/age134_main_session_and_migrate.rs (src-tauri/target/debug/deps/age134_main_session_and_migrate-b14b6a781e20e6ce)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+
+     Running tests/age149_owned_turn_event_schema.rs (src-tauri/target/debug/deps/age149_owned_turn_event_schema-d7ccceb3f2d9a2af)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/age151_config_migration_cli.rs (src-tauri/target/debug/deps/age151_config_migration_cli-940fc490f26fdb91)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/age151_source_guard.rs (src-tauri/target/debug/deps/age151_source_guard-c0576414603c7e26)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/age153_captured_child_supervision.rs (src-tauri/target/debug/deps/age153_captured_child_supervision-1170fa8728afbd23)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/age153_one_shot_terminal_signal.rs (src-tauri/target/debug/deps/age153_one_shot_terminal_signal-a5f9d69b7d7b10ca)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+     Running tests/age153_repl_terminal_signal.rs (src-tauri/target/debug/deps/age153_repl_terminal_signal-9303d38d1b4b94c4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/age153_result_envelope_compat.rs (src-tauri/target/debug/deps/age153_result_envelope_compat-a5312b6dc3a8d083)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/age153_resume_terminal_signal.rs (src-tauri/target/debug/deps/age153_resume_terminal_signal-6201b4e2b1d46841)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/age153_terminal_signal_marker.rs (src-tauri/target/debug/deps/age153_terminal_signal_marker-1cb3e1e197a9eece)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/age154_age140_carried_regression.rs (src-tauri/target/debug/deps/age154_age140_carried_regression-9ecb7e73ce7b3f6a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/age154_marker_compatibility.rs (src-tauri/target/debug/deps/age154_marker_compatibility-9e22cfc9a06b08e6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/age154_test_model_disposition.rs (src-tauri/target/debug/deps/age154_test_model_disposition-6131f58942936fa3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/age15_usage_cli_characterization.rs (src-tauri/target/debug/deps/age15_usage_cli_characterization-e40e39854409bdeb)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.00s
+
+     Running tests/age162_dispatch_stderr_marks_exhausted.rs (src-tauri/target/debug/deps/age162_dispatch_stderr_marks_exhausted-d7808dd286c4f04b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/age162_explicit_migrate_routes_to_target.rs (src-tauri/target/debug/deps/age162_explicit_migrate_routes_to_target-7298df9e5866d935)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/age162_usage_missing_provider_warn_and_skip.rs (src-tauri/target/debug/deps/age162_usage_missing_provider_warn_and_skip-2aff235d8b701a4f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/age163_rotate_provider_tristate.rs (src-tauri/target/debug/deps/age163_rotate_provider_tristate-f34f22ada68db0c6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/age166_one_shot_zero_turn.rs (src-tauri/target/debug/deps/age166_one_shot_zero_turn-6a04a259a4e4a495)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+     Running tests/age166_resume_zero_turn.rs (src-tauri/target/debug/deps/age166_resume_zero_turn-a13108e3d8926f02)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 50 filtered out; finished in 0.00s
+
+     Running tests/age166_zero_turn_classifier.rs (src-tauri/target/debug/deps/age166_zero_turn_classifier-c27c1f2a2493fe4e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/age166_zero_turn_orchestration_e2e.rs (src-tauri/target/debug/deps/age166_zero_turn_orchestration_e2e-45d8fdc3cb9e28f8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/age175_failure_response_identity.rs (src-tauri/target/debug/deps/age175_failure_response_identity-5a16b063e0afd50d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+     Running tests/age181_prompt_resolution_failure.rs (src-tauri/target/debug/deps/age181_prompt_resolution_failure-f5dd4ad3c9ad7bc2)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/age182_marker_byte_characterization.rs (src-tauri/target/debug/deps/age182_marker_byte_characterization-018bff2e924241c4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/age208_balancing_source_guard.rs (src-tauri/target/debug/deps/age208_balancing_source_guard-a1e077445adf329e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/age216_provider_settings_source_guard.rs (src-tauri/target/debug/deps/age216_provider_settings_source_guard-385157f38c629ef7)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 0.00s
+
+     Running tests/age235_model_command_characterization.rs (src-tauri/target/debug/deps/age235_model_command_characterization-a85c90a6ff99bf82)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/age235_model_pool_extraction.rs (src-tauri/target/debug/deps/age235_model_pool_extraction-c1d2cb2341262a30)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+     Running tests/age236_quota_refresh_extraction.rs (src-tauri/target/debug/deps/age236_quota_refresh_extraction-4afccfac97062f85)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+     Running tests/age238_lib_l3_behavior.rs (src-tauri/target/debug/deps/age238_lib_l3_behavior-823de51ceb037ad7)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+     Running tests/age238_lib_l3_characterization.rs (src-tauri/target/debug/deps/age238_lib_l3_characterization-9e086c7ff5e44f56)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 0.00s
+
+     Running tests/age240_phase25_characterization.rs (src-tauri/target/debug/deps/age240_phase25_characterization-65ad7e811325608b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/age240_relocated_app_state_paths.rs (src-tauri/target/debug/deps/age240_relocated_app_state_paths-2f7cf84c1720e97a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/age240_relocated_model_grouping.rs (src-tauri/target/debug/deps/age240_relocated_model_grouping-f0001b98f583ef06)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/age240_relocated_model_reload.rs (src-tauri/target/debug/deps/age240_relocated_model_reload-a6d3e0176345e820)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/age240_relocated_provider_discovery.rs (src-tauri/target/debug/deps/age240_relocated_provider_discovery-ece3932a69d3a98a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/age240_relocated_provider_settings.rs (src-tauri/target/debug/deps/age240_relocated_provider_settings-0eee988fc1cb4240)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/age240_relocated_support.rs (src-tauri/target/debug/deps/age240_relocated_support-0461704c209a01aa)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/age240_relocated_test_model.rs (src-tauri/target/debug/deps/age240_relocated_test_model-70d76ca1200df8c2)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+
+     Running tests/age243_s7a_production_wiring_source_guard.rs (src-tauri/target/debug/deps/age243_s7a_production_wiring_source_guard-7150c36e38b97d74)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/age243_s7a_session_locate_cli.rs (src-tauri/target/debug/deps/age243_s7a_session_locate_cli-a07fad0f1dfdfd19)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/age244_s7b_production_wiring_source_guard.rs (src-tauri/target/debug/deps/age244_s7b_production_wiring_source_guard-ff7291f9a058833b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/age244_s7b_session_export_replace_cli.rs (src-tauri/target/debug/deps/age244_s7b_session_export_replace_cli-9ca3607d7db73ffd)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/age245_s7c_rotation_source_guard.rs (src-tauri/target/debug/deps/age245_s7c_rotation_source_guard-c6543833de8a198f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/age246_s8_setup_action_executor_characterization.rs (src-tauri/target/debug/deps/age246_s8_setup_action_executor_characterization-14726969d10199a9)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+     Running tests/age246_s8_setup_brain_dispatch.rs (src-tauri/target/debug/deps/age246_s8_setup_brain_dispatch-dafd17a8acfd375f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+     Running tests/age246_s8_setup_dispatch_source_guard.rs (src-tauri/target/debug/deps/age246_s8_setup_dispatch_source_guard-aaf5dbd64640c6a8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/age246_s8_setup_provider_operations.rs (src-tauri/target/debug/deps/age246_s8_setup_provider_operations-2e5193400573c66b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/age247_session_load_exit144_repro.rs (src-tauri/target/debug/deps/age247_session_load_exit144_repro-a06796b14eedb399)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/age27_diagnostics_effective_provider.rs (src-tauri/target/debug/deps/age27_diagnostics_effective_provider-dd4d97e0f0acd14f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/age27_raw_executor_callsite_scan.rs (src-tauri/target/debug/deps/age27_raw_executor_callsite_scan-7b54faa299693da9)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/age28_provider_policy_routing.rs (src-tauri/target/debug/deps/age28_provider_policy_routing-73487d4abe815a93)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+     Running tests/age31_new_repl_integration.rs (src-tauri/target/debug/deps/age31_new_repl_integration-39331c9663c2b1fc)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/age33_config_state_characterization.rs (src-tauri/target/debug/deps/age33_config_state_characterization-458a88388f7c1bfd)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 0.00s
+
+     Running tests/age35_routing_lifecycle_characterization.rs (src-tauri/target/debug/deps/age35_routing_lifecycle_characterization-eef511f673dd6b1c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+     Running tests/age36_wiring.rs (src-tauri/target/debug/deps/age36_wiring-ca5875b6ef6e0b9b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/age37_session_export_format_validation.rs (src-tauri/target/debug/deps/age37_session_export_format_validation-0c40450f86ebfe28)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/age37_session_import_replace_missing_file.rs (src-tauri/target/debug/deps/age37_session_import_replace_missing_file-33525608b2a90014)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/age37_session_lock_malformed_metadata.rs (src-tauri/target/debug/deps/age37_session_lock_malformed_metadata-198571c86b3714a8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/age37_session_pause_handshake_lock_operational.rs (src-tauri/target/debug/deps/age37_session_pause_handshake_lock_operational-a79dc124b7a42853)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/age37_wiring.rs (src-tauri/target/debug/deps/age37_wiring-0b33b102eab005d3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/age38_test_model_services.rs (src-tauri/target/debug/deps/age38_test_model_services-66d8bf36fd80fcac)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/age38_wiring.rs (src-tauri/target/debug/deps/age38_wiring-60585dc828102043)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/age39_main_thinning_source_guard.rs (src-tauri/target/debug/deps/age39_main_thinning_source_guard-4a8e8f87780938ca)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 0.00s
+
+     Running tests/age53_session_id_dual_id_integration.rs (src-tauri/target/debug/deps/age53_session_id_dual_id_integration-165eba6342908426)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/age8_cli_characterization.rs (src-tauri/target/debug/deps/age8_cli_characterization-b4f086f63228aa5a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+     Running tests/age_191_session_import_replace_relocation.rs (src-tauri/target/debug/deps/age_191_session_import_replace_relocation-1bbff8dbdf55c5ce)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 16 filtered out; finished in 0.00s
+
+     Running tests/age_192_schema_probe_relocation.rs (src-tauri/target/debug/deps/age_192_schema_probe_relocation-248a8238ebbb183d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+
+     Running tests/age_32_state_db_migrations.rs (src-tauri/target/debug/deps/age_32_state_db_migrations-ba5f2101f159e7ee)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s
+
+     Running tests/age_54_trace_row_preservation.rs (src-tauri/target/debug/deps/age_54_trace_row_preservation-4a16cc4f13699ba8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/age_pid_sidecar_cli.rs (src-tauri/target/debug/deps/age_pid_sidecar_cli-3ad8fd02c7ee5ab8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/app_paths_characterization.rs (src-tauri/target/debug/deps/app_paths_characterization-2570049fcd856963)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/app_state_characterization.rs (src-tauri/target/debug/deps/app_state_characterization-f7fe0bf005562a0e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/claude_path_hash_rca.rs (src-tauri/target/debug/deps/claude_path_hash_rca-a5c42d084aee19d8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/cwd_scripts.rs (src-tauri/target/debug/deps/cwd_scripts-86410299ac46b22a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/empty_bodies_ref_rca.rs (src-tauri/target/debug/deps/empty_bodies_ref_rca-678ca20ee20feddb)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+     Running tests/initiative_05_migration.rs (src-tauri/target/debug/deps/initiative_05_migration-8c5f50679fea49ba)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 31 filtered out; finished in 0.00s
+
+     Running tests/initiative_06_export.rs (src-tauri/target/debug/deps/initiative_06_export-d25a1b97c7e61c43)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+     Running tests/initiative_06_import_replace.rs (src-tauri/target/debug/deps/initiative_06_import_replace-48c51ea7c7df4c6a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 31 filtered out; finished in 0.00s
+
+     Running tests/initiative_06_locate.rs (src-tauri/target/debug/deps/initiative_06_locate-c76268746b4c2512)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+
+     Running tests/initiative_06_pause_handshake.rs (src-tauri/target/debug/deps/initiative_06_pause_handshake-a45ffdf8a1980750)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+     Running tests/initiative_06_schema_probe.rs (src-tauri/target/debug/deps/initiative_06_schema_probe-6714ed620bcf5d32)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s
+
+     Running tests/initiative_07_canonical_reader_unification.rs (src-tauri/target/debug/deps/initiative_07_canonical_reader_unification-293217baac26293b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/initiative_09_internal_unification.rs (src-tauri/target/debug/deps/initiative_09_internal_unification-fda35599cb51bf77)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/load_app_config_characterization.rs (src-tauri/target/debug/deps/load_app_config_characterization-a3a54ebcf8798455)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/marker_producer_format.rs (src-tauri/target/debug/deps/marker_producer_format-730b581564c969ff)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/nes_259_returned_artifacts_integration.rs (src-tauri/target/debug/deps/nes_259_returned_artifacts_integration-bb261da9ce26fd58)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+     Running tests/pipeline_status_propagation_rca.rs (src-tauri/target/debug/deps/pipeline_status_propagation_rca-4c7174fc56b0ee8b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 33 filtered out; finished in 0.00s
+
+     Running tests/pr_a_invocation_integration.rs (src-tauri/target/debug/deps/pr_a_invocation_integration-e86d8a04823f04ed)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 0.00s
+
+     Running tests/pr_b_trace_integration.rs (src-tauri/target/debug/deps/pr_b_trace_integration-e60c827c982a5715)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+     Running tests/pr_c_locator_scripts.rs (src-tauri/target/debug/deps/pr_c_locator_scripts-a65655918adfdcec)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/pr_d_claude_code_turns.rs (src-tauri/target/debug/deps/pr_d_claude_code_turns-58e8b083baabf30c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/pr_e_repl_integration.rs (src-tauri/target/debug/deps/pr_e_repl_integration-edab75fea4dd4eca)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+     Running tests/pr_f_resume_integration.rs (src-tauri/target/debug/deps/pr_f_resume_integration-da72a176c9b7b517)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 47 filtered out; finished in 0.00s
+
+     Running tests/rca_routing_claude_skipped.rs (src-tauri/target/debug/deps/rca_routing_claude_skipped-6f5672e6e8465458)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/release_yml_contract.rs (src-tauri/target/debug/deps/release_yml_contract-20260913c7996d9b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/routing_fanout_rca.rs (src-tauri/target/debug/deps/routing_fanout_rca-8632cd4be03de83e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/scripts.rs (src-tauri/target/debug/deps/scripts-db95eb8553aeae41)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/session_lock_cross_platform.rs (src-tauri/target/debug/deps/session_lock_cross_platform-2deeb5c26bcb41ce)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/session_metadata_component.rs (src-tauri/target/debug/deps/session_metadata_component-0f32615c4044b33c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 41 filtered out; finished in 0.00s
+
+     Running tests/session_migration_rca.rs (src-tauri/target/debug/deps/session_migration_rca-bd8f231678b31955)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/structural_segmentation.rs (src-tauri/target/debug/deps/structural_segmentation-4f37ba994a45355b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/wiring_smoke.rs (src-tauri/target/debug/deps/wiring_smoke-a99c16bb63ba33c6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/workflow_yml_contract.rs (src-tauri/target/debug/deps/workflow_yml_contract-45e13ca3c3a1c26a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 0.00s
+
+     Running tests/workspace_layout.rs (src-tauri/target/debug/deps/workspace_layout-fa95fc1869234c13)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+     Running tests/wu_b_mailbox_integration.rs (src-tauri/target/debug/deps/wu_b_mailbox_integration-43e8ac22b11a6c48)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 0.00s
+
+     Running tests/wu_d_proactive_wake_integration.rs (src-tauri/target/debug/deps/wu_d_proactive_wake_integration-788ec77c301a74cf)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+
+     Running tests/wu_e_pty_delivery_integration.rs (src-tauri/target/debug/deps/wu_e_pty_delivery_integration-6a6d067c30495bbe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+
+Suite rc: 0
+
+## oulipoly-agent-runner age245_s7c_rotation_source_guard
+
+$ env -u OULIPOLY_DATA_DIR XDG_CONFIG_HOME="/tmp/tmp.iqIcnocTUs/config" XDG_DATA_HOME="/tmp/tmp.iqIcnocTUs/data" XDG_CACHE_HOME="/tmp/tmp.iqIcnocTUs/cache" XDG_STATE_HOME="/tmp/tmp.iqIcnocTUs/state" cargo test -p oulipoly-agent-runner --test age245_s7c_rotation_source_guard
+
+   Compiling oulipoly-agent-runner v0.1.0 (/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.29s
+     Running tests/age245_s7c_rotation_source_guard.rs (src-tauri/target/debug/deps/age245_s7c_rotation_source_guard-c6543833de8a198f)
+
+running 4 tests
+test s7c_production_wiring_passes_registry_handle_into_migration_service ... ok
+test s7c_resume_and_repl_delegate_rotation_identity_to_runtime_service_only ... ok
+test s7c_legacy_migration_commands_remain_distinct_from_provider_migration_plan_apply ... ok
+test s7c_provider_name_grep_invariant_uses_authoritative_manager_baseline ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+
+Suite rc: 0
+
+## oulipoly-agent-runner age246_s8_setup_dispatch_source_guard
+
+$ env -u OULIPOLY_DATA_DIR XDG_CONFIG_HOME="/tmp/tmp.iqIcnocTUs/config" XDG_DATA_HOME="/tmp/tmp.iqIcnocTUs/data" XDG_CACHE_HOME="/tmp/tmp.iqIcnocTUs/cache" XDG_STATE_HOME="/tmp/tmp.iqIcnocTUs/state" cargo test -p oulipoly-agent-runner --test age246_s8_setup_dispatch_source_guard
+
+   Compiling oulipoly-agent-runner v0.1.0 (/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 12.14s
+     Running tests/age246_s8_setup_dispatch_source_guard.rs (src-tauri/target/debug/deps/age246_s8_setup_dispatch_source_guard-aaf5dbd64640c6a8)
+
+running 5 tests
+test exactly_one_legacy_fallback_caller_exists_and_is_gated_by_missing_config ... ok
+test configured_path_uses_provider_ref_adapter_and_does_not_call_legacy ... ok
+test new_setup_brain_host_does_not_construct_direct_process_command ... ok
+test s8_files_introduce_zero_new_concrete_provider_vocabulary ... ok
+test full_provider_name_grep_threshold_remains_within_manager_baseline ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+
+Suite rc: 0
+
+Runtime evidence commands completed with rc 0.
+
+# s10 required PLK proof evidence
+
+XDG isolation root: /tmp/tmp.PlIVj2KY3a
+OULIPOLY_DATA_DIR: removed via env -u
+AGENT_BASH_BIN: /home/nes/.local/bin/agent-bash
+
+## PLK nested agent-bash parent inheritance
+
+$ env -u OULIPOLY_DATA_DIR XDG_CONFIG_HOME="/tmp/tmp.PlIVj2KY3a/config" XDG_DATA_HOME="/tmp/tmp.PlIVj2KY3a/data" XDG_CACHE_HOME="/tmp/tmp.PlIVj2KY3a/cache" XDG_STATE_HOME="/tmp/tmp.PlIVj2KY3a/state" AGENT_BASH_BIN="/home/nes/.local/bin/agent-bash" cargo test -p oulipoly-agent-runner --test pr_a_invocation_integration nested_agent_bash_chain_records_parent_id_from_inherited_env
+
+   Compiling oulipoly-agent-runner v0.1.0 (/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.50s
+     Running tests/pr_a_invocation_integration.rs (src-tauri/target/debug/deps/pr_a_invocation_integration-e86d8a04823f04ed)
+
+running 1 test
+test nested_agent_bash_chain_records_parent_id_from_inherited_env ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.24s
+
+
+Suite rc: 0
+
+## PLK stale-running reconciliation with PID sidecar evidence
+
+$ env -u OULIPOLY_DATA_DIR XDG_CONFIG_HOME="/tmp/tmp.PlIVj2KY3a/config" XDG_DATA_HOME="/tmp/tmp.PlIVj2KY3a/data" XDG_CACHE_HOME="/tmp/tmp.PlIVj2KY3a/cache" XDG_STATE_HOME="/tmp/tmp.PlIVj2KY3a/state" AGENT_BASH_BIN="/home/nes/.local/bin/agent-bash" cargo test -p oulipoly-agent-runner --test pr_b_trace_integration trace_reconciles_liveness_stale_running_row_with_dead_pid
+
+   Compiling oulipoly-agent-runner v0.1.0 (/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.72s
+     Running tests/pr_b_trace_integration.rs (src-tauri/target/debug/deps/pr_b_trace_integration-e60c827c982a5715)
+
+running 1 test
+test trace_reconciles_liveness_stale_running_row_with_dead_pid ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.24s
+
+
+Suite rc: 0
+
+## PLK same-DB UUID source-drift resolver
+
+$ env -u OULIPOLY_DATA_DIR XDG_CONFIG_HOME="/tmp/tmp.PlIVj2KY3a/config" XDG_DATA_HOME="/tmp/tmp.PlIVj2KY3a/data" XDG_CACHE_HOME="/tmp/tmp.PlIVj2KY3a/cache" XDG_STATE_HOME="/tmp/tmp.PlIVj2KY3a/state" AGENT_BASH_BIN="/home/nes/.local/bin/agent-bash" cargo test -p oulipoly-agent-runner --bin oulipoly-agent-runner resolve_parent_invocation_id_uses_same_db_uuid_despite_source_name_drift
+
+   Compiling oulipoly-agent-runner v0.1.0 (/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.36s
+     Running unittests src/main.rs (src-tauri/target/debug/deps/oulipoly_agent_runner-af014df39f76f625)
+
+running 1 test
+test dispatch::tests::resolve_parent_invocation_id_uses_same_db_uuid_despite_source_name_drift ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 136 filtered out; finished in 0.01s
+
+
+Suite rc: 0
+
+Required PLK proof evidence commands completed with rc 0.
+
+## Post-FC runtime S10 external launch session
+
+$ env -u OULIPOLY_DATA_DIR XDG_CONFIG_HOME=/tmp/tmp.9mCVgRVqVD/config XDG_DATA_HOME=/tmp/tmp.9mCVgRVqVD/data XDG_CACHE_HOME=/tmp/tmp.9mCVgRVqVD/cache XDG_STATE_HOME=/tmp/tmp.9mCVgRVqVD/state cargo test -p oulipoly-runtime --test s10_external_launch_session
+
+   Compiling oulipoly-runtime v0.1.0 (/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/crates/oulipoly-runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.88s
+     Running tests/s10_external_launch_session.rs (src-tauri/target/debug/deps/s10_external_launch_session-253c649171ce5111)
+
+running 1 test
+test external_launch_exit_session_populates_capture_and_resume_request ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+
+## Post-FC runtime AGE-244 export replace dispatch
+
+$ env -u OULIPOLY_DATA_DIR XDG_CONFIG_HOME=/tmp/tmp.lkp4WD8WvV/config XDG_DATA_HOME=/tmp/tmp.lkp4WD8WvV/data XDG_CACHE_HOME=/tmp/tmp.lkp4WD8WvV/cache XDG_STATE_HOME=/tmp/tmp.lkp4WD8WvV/state cargo test -p oulipoly-runtime --test age244_s7b_export_replace_dispatch
+
+   Compiling oulipoly-runtime v0.1.0 (/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/crates/oulipoly-runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.12s
+     Running tests/age244_s7b_export_replace_dispatch.rs (src-tauri/target/debug/deps/age244_s7b_export_replace_dispatch-019d4373ae18430d)
+
+running 21 tests
+test no_new_concrete_provider_name_grep_hits_are_introduced_against_base_ref ... ok
+test external_export_malformed_canonical_jsonl_rejects_hash_valid_payload_without_fallback ... ok
+test external_export_provider_error_protocol_and_hash_failures_do_not_fallback_or_mutate_sqlite ... ok
+test external_export_requires_registry_handle_without_builtin_fallback ... ok
+test external_export_success_validates_provider_bytes_request_shape_and_keeps_host_state_read_only ... ok
+test external_export_transport_failure_does_not_mutate_sqlite_or_use_builtin_fallback ... ok
+test external_replace_commit_verification_failure_rolls_back_provider_mutation_and_journal ... ok
+test external_replace_dry_run_no_change_returns_no_state_update_and_no_host_mutation ... ok
+test external_replace_preimage_mismatch_rejects_stale_write_without_host_mutation ... ok
+test external_replace_provider_protocol_hash_plan_and_source_failures_do_not_mutate_host_state ... ok
+test external_replace_recovery_rolls_back_provider_mutation_without_postimage_claim ... ok
+test external_replace_recovery_rolls_forward_with_durable_preimage_snapshot_and_postimage ... ok
+test external_replace_rejects_malformed_canonical_input_before_provider_invocation ... ok
+test external_replace_semantic_verification_mismatch_does_not_mutate_host_state ... ok
+test external_replace_requires_registry_handle_before_host_mutation_or_builtin_fallback ... ok
+test external_replace_session_busy_rejects_before_provider_mutates_storage ... ok
+test external_replace_success_uses_provider_transform_and_host_owned_apply_lifecycle ... ok
+test external_replace_transport_failure_does_not_mutate_host_state_or_use_builtin_fallback ... ok
+test no_ref_export_uses_dispatch_service_with_populated_registry_and_preserves_stdout_bytes ... ok
+test no_ref_replace_uses_dispatch_service_with_populated_registry_and_preserves_host_state ... ok
+test startup_pending_replace_recovery_is_host_owned_and_ordered_before_provider_dispatch ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.20s
+
+
+## Post-FC setup context tests
+
+$ env -u OULIPOLY_DATA_DIR XDG_CONFIG_HOME=/tmp/tmp.4x4vPwjyGr/config XDG_DATA_HOME=/tmp/tmp.4x4vPwjyGr/data XDG_CACHE_HOME=/tmp/tmp.4x4vPwjyGr/cache XDG_STATE_HOME=/tmp/tmp.4x4vPwjyGr/state cargo test -p oulipoly-setup context::tests
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s
+     Running unittests src/lib.rs (src-tauri/target/debug/deps/oulipoly_setup-94f5c89a51853d08)
+
+running 2 tests
+test context::tests::cli_setup_prompt_contains_claude_and_codex_examples ... ok
+test context::tests::system_prompt_contains_claude_and_codex_examples ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 0.00s
+
+     Running tests/setup_agent_send_turn.rs (src-tauri/target/debug/deps/setup_agent_send_turn-a21a657c3c7f599e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+## Post-FC config migration tests
+
+$ env -u OULIPOLY_DATA_DIR XDG_CONFIG_HOME=/tmp/tmp.a4HkNT256Y/config XDG_DATA_HOME=/tmp/tmp.a4HkNT256Y/data XDG_CACHE_HOME=/tmp/tmp.a4HkNT256Y/cache XDG_STATE_HOME=/tmp/tmp.a4HkNT256Y/state cargo test -p oulipoly-agent-runner commands::config_migration::tests
+
+   Compiling oulipoly-runtime v0.1.0 (/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/crates/oulipoly-runtime)
+   Compiling oulipoly-agent-runner v0.1.0 (/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 17.63s
+     Running unittests src/lib.rs (src-tauri/target/debug/deps/agent_runner_lib-b59b81190a07cb78)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 30 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (src-tauri/target/debug/deps/oulipoly_agent_runner-af014df39f76f625)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 137 filtered out; finished in 0.00s
+
+     Running tests/age100_one_shot_quota_migration.rs (src-tauri/target/debug/deps/age100_one_shot_quota_migration-06418b78dec9d3f9)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/age100_resume_quota_migration.rs (src-tauri/target/debug/deps/age100_resume_quota_migration-f0380be3c3fb7f35)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/age123_resume_provider_identity.rs (src-tauri/target/debug/deps/age123_resume_provider_identity-f5958df953a247e4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/age134_main_prompt_resolution.rs (src-tauri/target/debug/deps/age134_main_prompt_resolution-5ef32b855f318280)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/age134_main_session_and_migrate.rs (src-tauri/target/debug/deps/age134_main_session_and_migrate-b14b6a781e20e6ce)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+
+     Running tests/age149_owned_turn_event_schema.rs (src-tauri/target/debug/deps/age149_owned_turn_event_schema-d7ccceb3f2d9a2af)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/age151_config_migration_cli.rs (src-tauri/target/debug/deps/age151_config_migration_cli-940fc490f26fdb91)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/age151_source_guard.rs (src-tauri/target/debug/deps/age151_source_guard-c0576414603c7e26)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/age153_captured_child_supervision.rs (src-tauri/target/debug/deps/age153_captured_child_supervision-1170fa8728afbd23)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/age153_one_shot_terminal_signal.rs (src-tauri/target/debug/deps/age153_one_shot_terminal_signal-a5f9d69b7d7b10ca)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+     Running tests/age153_repl_terminal_signal.rs (src-tauri/target/debug/deps/age153_repl_terminal_signal-9303d38d1b4b94c4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/age153_result_envelope_compat.rs (src-tauri/target/debug/deps/age153_result_envelope_compat-a5312b6dc3a8d083)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/age153_resume_terminal_signal.rs (src-tauri/target/debug/deps/age153_resume_terminal_signal-6201b4e2b1d46841)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/age153_terminal_signal_marker.rs (src-tauri/target/debug/deps/age153_terminal_signal_marker-1cb3e1e197a9eece)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/age154_age140_carried_regression.rs (src-tauri/target/debug/deps/age154_age140_carried_regression-9ecb7e73ce7b3f6a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/age154_marker_compatibility.rs (src-tauri/target/debug/deps/age154_marker_compatibility-9e22cfc9a06b08e6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/age154_test_model_disposition.rs (src-tauri/target/debug/deps/age154_test_model_disposition-6131f58942936fa3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/age15_usage_cli_characterization.rs (src-tauri/target/debug/deps/age15_usage_cli_characterization-e40e39854409bdeb)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.00s
+
+     Running tests/age162_dispatch_stderr_marks_exhausted.rs (src-tauri/target/debug/deps/age162_dispatch_stderr_marks_exhausted-d7808dd286c4f04b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/age162_explicit_migrate_routes_to_target.rs (src-tauri/target/debug/deps/age162_explicit_migrate_routes_to_target-7298df9e5866d935)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/age162_usage_missing_provider_warn_and_skip.rs (src-tauri/target/debug/deps/age162_usage_missing_provider_warn_and_skip-2aff235d8b701a4f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/age163_rotate_provider_tristate.rs (src-tauri/target/debug/deps/age163_rotate_provider_tristate-f34f22ada68db0c6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/age166_one_shot_zero_turn.rs (src-tauri/target/debug/deps/age166_one_shot_zero_turn-6a04a259a4e4a495)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+     Running tests/age166_resume_zero_turn.rs (src-tauri/target/debug/deps/age166_resume_zero_turn-a13108e3d8926f02)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 50 filtered out; finished in 0.00s
+
+     Running tests/age166_zero_turn_classifier.rs (src-tauri/target/debug/deps/age166_zero_turn_classifier-c27c1f2a2493fe4e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/age166_zero_turn_orchestration_e2e.rs (src-tauri/target/debug/deps/age166_zero_turn_orchestration_e2e-45d8fdc3cb9e28f8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/age175_failure_response_identity.rs (src-tauri/target/debug/deps/age175_failure_response_identity-5a16b063e0afd50d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+     Running tests/age181_prompt_resolution_failure.rs (src-tauri/target/debug/deps/age181_prompt_resolution_failure-f5dd4ad3c9ad7bc2)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/age182_marker_byte_characterization.rs (src-tauri/target/debug/deps/age182_marker_byte_characterization-018bff2e924241c4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/age208_balancing_source_guard.rs (src-tauri/target/debug/deps/age208_balancing_source_guard-a1e077445adf329e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/age216_provider_settings_source_guard.rs (src-tauri/target/debug/deps/age216_provider_settings_source_guard-385157f38c629ef7)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 0.00s
+
+     Running tests/age235_model_command_characterization.rs (src-tauri/target/debug/deps/age235_model_command_characterization-a85c90a6ff99bf82)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/age235_model_pool_extraction.rs (src-tauri/target/debug/deps/age235_model_pool_extraction-c1d2cb2341262a30)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+     Running tests/age236_quota_refresh_extraction.rs (src-tauri/target/debug/deps/age236_quota_refresh_extraction-4afccfac97062f85)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+     Running tests/age238_lib_l3_behavior.rs (src-tauri/target/debug/deps/age238_lib_l3_behavior-823de51ceb037ad7)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+     Running tests/age238_lib_l3_characterization.rs (src-tauri/target/debug/deps/age238_lib_l3_characterization-9e086c7ff5e44f56)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 0.00s
+
+     Running tests/age240_phase25_characterization.rs (src-tauri/target/debug/deps/age240_phase25_characterization-65ad7e811325608b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/age240_relocated_app_state_paths.rs (src-tauri/target/debug/deps/age240_relocated_app_state_paths-2f7cf84c1720e97a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/age240_relocated_model_grouping.rs (src-tauri/target/debug/deps/age240_relocated_model_grouping-f0001b98f583ef06)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/age240_relocated_model_reload.rs (src-tauri/target/debug/deps/age240_relocated_model_reload-a6d3e0176345e820)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/age240_relocated_provider_discovery.rs (src-tauri/target/debug/deps/age240_relocated_provider_discovery-ece3932a69d3a98a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/age240_relocated_provider_settings.rs (src-tauri/target/debug/deps/age240_relocated_provider_settings-0eee988fc1cb4240)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/age240_relocated_support.rs (src-tauri/target/debug/deps/age240_relocated_support-0461704c209a01aa)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/age240_relocated_test_model.rs (src-tauri/target/debug/deps/age240_relocated_test_model-70d76ca1200df8c2)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+
+     Running tests/age243_s7a_production_wiring_source_guard.rs (src-tauri/target/debug/deps/age243_s7a_production_wiring_source_guard-7150c36e38b97d74)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/age243_s7a_session_locate_cli.rs (src-tauri/target/debug/deps/age243_s7a_session_locate_cli-a07fad0f1dfdfd19)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/age244_s7b_production_wiring_source_guard.rs (src-tauri/target/debug/deps/age244_s7b_production_wiring_source_guard-ff7291f9a058833b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/age244_s7b_session_export_replace_cli.rs (src-tauri/target/debug/deps/age244_s7b_session_export_replace_cli-9ca3607d7db73ffd)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/age245_s7c_rotation_source_guard.rs (src-tauri/target/debug/deps/age245_s7c_rotation_source_guard-c6543833de8a198f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/age246_s8_setup_action_executor_characterization.rs (src-tauri/target/debug/deps/age246_s8_setup_action_executor_characterization-14726969d10199a9)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+     Running tests/age246_s8_setup_brain_dispatch.rs (src-tauri/target/debug/deps/age246_s8_setup_brain_dispatch-dafd17a8acfd375f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+     Running tests/age246_s8_setup_dispatch_source_guard.rs (src-tauri/target/debug/deps/age246_s8_setup_dispatch_source_guard-aaf5dbd64640c6a8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/age246_s8_setup_provider_operations.rs (src-tauri/target/debug/deps/age246_s8_setup_provider_operations-2e5193400573c66b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/age247_session_load_exit144_repro.rs (src-tauri/target/debug/deps/age247_session_load_exit144_repro-a06796b14eedb399)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/age27_diagnostics_effective_provider.rs (src-tauri/target/debug/deps/age27_diagnostics_effective_provider-dd4d97e0f0acd14f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/age27_raw_executor_callsite_scan.rs (src-tauri/target/debug/deps/age27_raw_executor_callsite_scan-7b54faa299693da9)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/age28_provider_policy_routing.rs (src-tauri/target/debug/deps/age28_provider_policy_routing-73487d4abe815a93)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+     Running tests/age31_new_repl_integration.rs (src-tauri/target/debug/deps/age31_new_repl_integration-39331c9663c2b1fc)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/age33_config_state_characterization.rs (src-tauri/target/debug/deps/age33_config_state_characterization-458a88388f7c1bfd)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 0.00s
+
+     Running tests/age35_routing_lifecycle_characterization.rs (src-tauri/target/debug/deps/age35_routing_lifecycle_characterization-eef511f673dd6b1c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+     Running tests/age36_wiring.rs (src-tauri/target/debug/deps/age36_wiring-ca5875b6ef6e0b9b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/age37_session_export_format_validation.rs (src-tauri/target/debug/deps/age37_session_export_format_validation-0c40450f86ebfe28)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/age37_session_import_replace_missing_file.rs (src-tauri/target/debug/deps/age37_session_import_replace_missing_file-33525608b2a90014)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/age37_session_lock_malformed_metadata.rs (src-tauri/target/debug/deps/age37_session_lock_malformed_metadata-198571c86b3714a8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/age37_session_pause_handshake_lock_operational.rs (src-tauri/target/debug/deps/age37_session_pause_handshake_lock_operational-a79dc124b7a42853)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/age37_wiring.rs (src-tauri/target/debug/deps/age37_wiring-0b33b102eab005d3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/age38_test_model_services.rs (src-tauri/target/debug/deps/age38_test_model_services-66d8bf36fd80fcac)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/age38_wiring.rs (src-tauri/target/debug/deps/age38_wiring-60585dc828102043)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/age39_main_thinning_source_guard.rs (src-tauri/target/debug/deps/age39_main_thinning_source_guard-4a8e8f87780938ca)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 0.00s
+
+     Running tests/age53_session_id_dual_id_integration.rs (src-tauri/target/debug/deps/age53_session_id_dual_id_integration-165eba6342908426)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/age8_cli_characterization.rs (src-tauri/target/debug/deps/age8_cli_characterization-b4f086f63228aa5a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+     Running tests/age_191_session_import_replace_relocation.rs (src-tauri/target/debug/deps/age_191_session_import_replace_relocation-1bbff8dbdf55c5ce)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 16 filtered out; finished in 0.00s
+
+     Running tests/age_192_schema_probe_relocation.rs (src-tauri/target/debug/deps/age_192_schema_probe_relocation-248a8238ebbb183d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+
+     Running tests/age_32_state_db_migrations.rs (src-tauri/target/debug/deps/age_32_state_db_migrations-ba5f2101f159e7ee)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s
+
+     Running tests/age_54_trace_row_preservation.rs (src-tauri/target/debug/deps/age_54_trace_row_preservation-4a16cc4f13699ba8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/age_pid_sidecar_cli.rs (src-tauri/target/debug/deps/age_pid_sidecar_cli-3ad8fd02c7ee5ab8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/app_paths_characterization.rs (src-tauri/target/debug/deps/app_paths_characterization-2570049fcd856963)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/app_state_characterization.rs (src-tauri/target/debug/deps/app_state_characterization-f7fe0bf005562a0e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/claude_path_hash_rca.rs (src-tauri/target/debug/deps/claude_path_hash_rca-a5c42d084aee19d8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/cwd_scripts.rs (src-tauri/target/debug/deps/cwd_scripts-86410299ac46b22a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/empty_bodies_ref_rca.rs (src-tauri/target/debug/deps/empty_bodies_ref_rca-678ca20ee20feddb)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+     Running tests/initiative_05_migration.rs (src-tauri/target/debug/deps/initiative_05_migration-8c5f50679fea49ba)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 31 filtered out; finished in 0.00s
+
+     Running tests/initiative_06_export.rs (src-tauri/target/debug/deps/initiative_06_export-d25a1b97c7e61c43)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+     Running tests/initiative_06_import_replace.rs (src-tauri/target/debug/deps/initiative_06_import_replace-48c51ea7c7df4c6a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 31 filtered out; finished in 0.00s
+
+     Running tests/initiative_06_locate.rs (src-tauri/target/debug/deps/initiative_06_locate-c76268746b4c2512)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+
+     Running tests/initiative_06_pause_handshake.rs (src-tauri/target/debug/deps/initiative_06_pause_handshake-a45ffdf8a1980750)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+     Running tests/initiative_06_schema_probe.rs (src-tauri/target/debug/deps/initiative_06_schema_probe-6714ed620bcf5d32)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s
+
+     Running tests/initiative_07_canonical_reader_unification.rs (src-tauri/target/debug/deps/initiative_07_canonical_reader_unification-293217baac26293b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/initiative_09_internal_unification.rs (src-tauri/target/debug/deps/initiative_09_internal_unification-fda35599cb51bf77)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/load_app_config_characterization.rs (src-tauri/target/debug/deps/load_app_config_characterization-a3a54ebcf8798455)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/marker_producer_format.rs (src-tauri/target/debug/deps/marker_producer_format-730b581564c969ff)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/nes_259_returned_artifacts_integration.rs (src-tauri/target/debug/deps/nes_259_returned_artifacts_integration-bb261da9ce26fd58)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+     Running tests/pipeline_status_propagation_rca.rs (src-tauri/target/debug/deps/pipeline_status_propagation_rca-4c7174fc56b0ee8b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 33 filtered out; finished in 0.00s
+
+     Running tests/pr_a_invocation_integration.rs (src-tauri/target/debug/deps/pr_a_invocation_integration-e86d8a04823f04ed)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 0.00s
+
+     Running tests/pr_b_trace_integration.rs (src-tauri/target/debug/deps/pr_b_trace_integration-e60c827c982a5715)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+     Running tests/pr_c_locator_scripts.rs (src-tauri/target/debug/deps/pr_c_locator_scripts-a65655918adfdcec)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/pr_d_claude_code_turns.rs (src-tauri/target/debug/deps/pr_d_claude_code_turns-58e8b083baabf30c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/pr_e_repl_integration.rs (src-tauri/target/debug/deps/pr_e_repl_integration-edab75fea4dd4eca)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+     Running tests/pr_f_resume_integration.rs (src-tauri/target/debug/deps/pr_f_resume_integration-da72a176c9b7b517)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 47 filtered out; finished in 0.00s
+
+     Running tests/rca_routing_claude_skipped.rs (src-tauri/target/debug/deps/rca_routing_claude_skipped-6f5672e6e8465458)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/release_yml_contract.rs (src-tauri/target/debug/deps/release_yml_contract-20260913c7996d9b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/routing_fanout_rca.rs (src-tauri/target/debug/deps/routing_fanout_rca-8632cd4be03de83e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/scripts.rs (src-tauri/target/debug/deps/scripts-db95eb8553aeae41)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/session_lock_cross_platform.rs (src-tauri/target/debug/deps/session_lock_cross_platform-2deeb5c26bcb41ce)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/session_metadata_component.rs (src-tauri/target/debug/deps/session_metadata_component-0f32615c4044b33c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 41 filtered out; finished in 0.00s
+
+     Running tests/session_migration_rca.rs (src-tauri/target/debug/deps/session_migration_rca-bd8f231678b31955)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/structural_segmentation.rs (src-tauri/target/debug/deps/structural_segmentation-4f37ba994a45355b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/wiring_smoke.rs (src-tauri/target/debug/deps/wiring_smoke-a99c16bb63ba33c6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/workflow_yml_contract.rs (src-tauri/target/debug/deps/workflow_yml_contract-45e13ca3c3a1c26a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 0.00s
+
+     Running tests/workspace_layout.rs (src-tauri/target/debug/deps/workspace_layout-fa95fc1869234c13)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+     Running tests/wu_b_mailbox_integration.rs (src-tauri/target/debug/deps/wu_b_mailbox_integration-43e8ac22b11a6c48)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 0.00s
+
+     Running tests/wu_d_proactive_wake_integration.rs (src-tauri/target/debug/deps/wu_d_proactive_wake_integration-788ec77c301a74cf)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+
+     Running tests/wu_e_pty_delivery_integration.rs (src-tauri/target/debug/deps/wu_e_pty_delivery_integration-6a6d067c30495bbe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+
+## Post-FC rotation source guard
+
+$ env -u OULIPOLY_DATA_DIR XDG_CONFIG_HOME=/tmp/tmp.O1g2SGr1k9/config XDG_DATA_HOME=/tmp/tmp.O1g2SGr1k9/data XDG_CACHE_HOME=/tmp/tmp.O1g2SGr1k9/cache XDG_STATE_HOME=/tmp/tmp.O1g2SGr1k9/state cargo test -p oulipoly-agent-runner --test age245_s7c_rotation_source_guard
+
+   Compiling oulipoly-agent-runner v0.1.0 (/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.60s
+     Running tests/age245_s7c_rotation_source_guard.rs (src-tauri/target/debug/deps/age245_s7c_rotation_source_guard-c6543833de8a198f)
+
+running 4 tests
+test s7c_production_wiring_passes_registry_handle_into_migration_service ... ok
+test s7c_resume_and_repl_delegate_rotation_identity_to_runtime_service_only ... ok
+test s7c_legacy_migration_commands_remain_distinct_from_provider_migration_plan_apply ... ok
+test s7c_provider_name_grep_invariant_uses_authoritative_manager_baseline ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+
+## Post-FC setup dispatch source guard
+
+$ env -u OULIPOLY_DATA_DIR XDG_CONFIG_HOME=/tmp/tmp.neJfAiLrxy/config XDG_DATA_HOME=/tmp/tmp.neJfAiLrxy/data XDG_CACHE_HOME=/tmp/tmp.neJfAiLrxy/cache XDG_STATE_HOME=/tmp/tmp.neJfAiLrxy/state cargo test -p oulipoly-agent-runner --test age246_s8_setup_dispatch_source_guard
+
+   Compiling oulipoly-agent-runner v0.1.0 (/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 11.24s
+     Running tests/age246_s8_setup_dispatch_source_guard.rs (src-tauri/target/debug/deps/age246_s8_setup_dispatch_source_guard-aaf5dbd64640c6a8)
+
+running 5 tests
+test exactly_one_legacy_fallback_caller_exists_and_is_gated_by_missing_config ... ok
+test configured_path_uses_provider_ref_adapter_and_does_not_call_legacy ... ok
+test new_setup_brain_host_does_not_construct_direct_process_command ... ok
+test s8_files_introduce_zero_new_concrete_provider_vocabulary ... ok
+test full_provider_name_grep_threshold_remains_within_manager_baseline ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+
+## Post-proof stale-running dead-PID reconciliation
+
+$ env -u OULIPOLY_DATA_DIR XDG_CONFIG_HOME=/tmp/tmp.ql3e3w0tjK/config XDG_DATA_HOME=/tmp/tmp.ql3e3w0tjK/data XDG_CACHE_HOME=/tmp/tmp.ql3e3w0tjK/cache XDG_STATE_HOME=/tmp/tmp.ql3e3w0tjK/state cargo test -p oulipoly-agent-runner --test pr_b_trace_integration trace_reconciles_liveness_stale_running_row_with_dead_pid
+
+   Compiling oulipoly-agent-runner v0.1.0 (/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.91s
+     Running tests/pr_b_trace_integration.rs (src-tauri/target/debug/deps/pr_b_trace_integration-e60c827c982a5715)
+
+running 1 test
+test trace_reconciles_liveness_stale_running_row_with_dead_pid ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.11s
+
+
+## Post-proof stale-running no-sidecar control
+
+$ env -u OULIPOLY_DATA_DIR XDG_CONFIG_HOME=/tmp/tmp.t7WHeJm9sy/config XDG_DATA_HOME=/tmp/tmp.t7WHeJm9sy/data XDG_CACHE_HOME=/tmp/tmp.t7WHeJm9sy/cache XDG_STATE_HOME=/tmp/tmp.t7WHeJm9sy/state cargo test -p oulipoly-agent-runner --test pr_b_trace_integration trace_json_stale_running_row_is_lifted_without_mutating_db
+
+   Compiling oulipoly-agent-runner v0.1.0 (/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.01s
+     Running tests/pr_b_trace_integration.rs (src-tauri/target/debug/deps/pr_b_trace_integration-e60c827c982a5715)
+
+running 1 test
+test trace_json_stale_running_row_is_lifted_without_mutating_db ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.17s
+
+
+## Post-proof config migration exact filter
+
+$ env -u OULIPOLY_DATA_DIR XDG_CONFIG_HOME=/tmp/tmp.mO3Vttelq5/config XDG_DATA_HOME=/tmp/tmp.mO3Vttelq5/data XDG_CACHE_HOME=/tmp/tmp.mO3Vttelq5/cache XDG_STATE_HOME=/tmp/tmp.mO3Vttelq5/state cargo test -p oulipoly-agent-runner --bin oulipoly-agent-runner migrate_config_
+
+   Compiling oulipoly-agent-runner v0.1.0 (/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.43s
+     Running unittests src/main.rs (src-tauri/target/debug/deps/oulipoly_agent_runner-af014df39f76f625)
+
+running 13 tests
+test commands::config_migration::config_migration_tests::tests::migrate_config_aborts_on_conflicting_command ... ok
+test commands::config_migration::config_migration_tests::tests::migrate_config_aborts_on_conflicting_runtime_args ... ok
+test commands::config_migration::config_migration_tests::tests::migrate_config_lifts_runtime_args_strips_model_flags ... ok
+test commands::config_migration::config_migration_tests::tests::migrate_config_strips_dash_m_pairs ... ok
+test commands::config_migration::config_migration_tests::tests::migrate_config_keeps_model_only_interactive_args_out_of_provider_conflict ... ok
+test commands::config_migration::config_migration_tests::tests::migrate_config_backfills_moved_model_external_provider_binary ... ok
+test commands::config_migration::config_migration_tests::tests::migrate_config_repairs_prior_empty_runtime_args ... ok
+test commands::config_migration::config_migration_tests::tests::migrate_config_idempotent_after_proper_lift ... ok
+test commands::config_migration::config_migration_tests::tests::migrate_config_backfills_session_storage_from_turn_scripts ... ok
+test commands::config_migration::config_migration_tests::tests::migrate_config_strips_interactive_args_same_filter ... ok
+test commands::config_migration::config_migration_tests::tests::migrate_config_idempotent ... ok
+test commands::config_migration::config_migration_tests::tests::migrate_config_lifts_per_provider_blocks ... ok
+test commands::config_migration::config_migration_tests::tests::migrate_config_strips_model_prefixed_c_keys ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 124 filtered out; finished in 0.00s
+
+
+## Post-FC source-guard split verification
+
+$ env -u OULIPOLY_DATA_DIR XDG_CONFIG_HOME=/tmp/tmp.sY1ZHn32LE/config XDG_DATA_HOME=/tmp/tmp.sY1ZHn32LE/data XDG_CACHE_HOME=/tmp/tmp.sY1ZHn32LE/cache XDG_STATE_HOME=/tmp/tmp.sY1ZHn32LE/state cargo test -p oulipoly-agent-runner --test age245_s7c_rotation_source_guard --test age246_s8_setup_dispatch_source_guard
+
+   Compiling oulipoly-agent-runner v0.1.0 (/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.81s
+     Running tests/age245_s7c_rotation_source_guard.rs (src-tauri/target/debug/deps/age245_s7c_rotation_source_guard-c6543833de8a198f)
+
+running 4 tests
+test s7c_production_wiring_passes_registry_handle_into_migration_service ... ok
+test s7c_resume_and_repl_delegate_rotation_identity_to_runtime_service_only ... ok
+test s7c_legacy_migration_commands_remain_distinct_from_provider_migration_plan_apply ... ok
+test s7c_provider_name_grep_invariant_uses_authoritative_manager_baseline ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/age246_s8_setup_dispatch_source_guard.rs (src-tauri/target/debug/deps/age246_s8_setup_dispatch_source_guard-aaf5dbd64640c6a8)
+
+running 5 tests
+test configured_path_uses_provider_ref_adapter_and_does_not_call_legacy ... ok
+test exactly_one_legacy_fallback_caller_exists_and_is_gated_by_missing_config ... ok
+test new_setup_brain_host_does_not_construct_direct_process_command ... ok
+test s8_files_introduce_zero_new_concrete_provider_vocabulary ... ok
+test full_provider_name_grep_threshold_remains_within_manager_baseline ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+

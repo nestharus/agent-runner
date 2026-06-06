@@ -1,7 +1,7 @@
 //! Declared roles: accessor, predicate, validator.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 
 const BASELINE_COMMIT: &str = "8718b547557cddfc79c47f30a0146fd7d994c00b";
 const MANAGER_BASELINE_PROVIDER_NAME_COUNT: usize = 5391;
@@ -108,8 +108,25 @@ fn s7c_provider_name_grep_invariant_uses_authoritative_manager_baseline() {
         current_count <= MANAGER_BASELINE_PROVIDER_NAME_COUNT,
         "provider-name invariant found {current_count} current occurrence(s), above manager baseline {MANAGER_BASELINE_PROVIDER_NAME_COUNT}"
     );
-    let output = Command::new("git")
-        .current_dir(&root)
+    let tracked_added_count =
+        tracked_added_provider_name_occurrences_since_baseline(&root, &pattern);
+    let untracked_added_count = untracked_provider_name_occurrence_count(&root, &pattern);
+    let count = tracked_added_count + untracked_added_count;
+    assert!(
+        count == 0,
+        "provider-name invariant found {count} new provider-name occurrence(s) after AGE-245 baseline"
+    );
+}
+
+fn tracked_added_provider_name_occurrences_since_baseline(root: &Path, pattern: &str) -> usize {
+    let output = tracked_diff_output_since_baseline(root);
+    assert_tracked_diff_status(&output);
+    added_provider_name_occurrence_count(output.stdout, pattern)
+}
+
+fn tracked_diff_output_since_baseline(root: &Path) -> Output {
+    Command::new("git")
+        .current_dir(root)
         .args([
             "diff",
             "--unified=0",
@@ -124,28 +141,34 @@ fn s7c_provider_name_grep_invariant_uses_authoritative_manager_baseline() {
             ":(exclude)planning/s10-moveout/**",
         ])
         .output()
-        .expect("git diff must run for AGE-245 S7c provider-name invariant");
+        .expect("git diff must run for AGE-245 S7c provider-name invariant")
+}
+
+fn assert_tracked_diff_status(output: &Output) {
     assert!(
         output.status.success(),
         "git diff failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let diff = String::from_utf8(output.stdout).expect("git diff stdout utf8");
-    let tracked_added_count = diff
+}
+
+fn added_provider_name_occurrence_count(stdout: Vec<u8>, pattern: &str) -> usize {
+    String::from_utf8(stdout)
+        .expect("git diff stdout utf8")
         .lines()
         .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
-        .flat_map(|line| provider_name_matches(line, &pattern))
-        .count();
-    let untracked_added_count = untracked_provider_name_occurrence_count(&root, &pattern);
-    let count = tracked_added_count + untracked_added_count;
-    assert!(
-        count == 0,
-        "provider-name invariant found {count} new provider-name occurrence(s) after AGE-245 baseline"
-    );
+        .flat_map(|line| provider_name_matches(line, pattern))
+        .count()
 }
 
 fn provider_name_occurrence_count(root: &Path, pattern: &str) -> usize {
-    let output = Command::new("rg")
+    let output = provider_name_occurrence_output(root, pattern);
+    assert_provider_name_occurrence_status(&output);
+    stdout_line_count(output.stdout, "rg stdout utf8")
+}
+
+fn provider_name_occurrence_output(root: &Path, pattern: &str) -> Output {
+    Command::new("rg")
         .current_dir(root)
         .args([
             "--hidden",
@@ -165,14 +188,20 @@ fn provider_name_occurrence_count(root: &Path, pattern: &str) -> usize {
             "!planning/s10-moveout/**",
         ])
         .output()
-        .expect("rg must run for AGE-245 S7c provider-name invariant");
+        .expect("rg must run for AGE-245 S7c provider-name invariant")
+}
+
+fn assert_provider_name_occurrence_status(output: &Output) {
     assert!(
         output.status.success() || output.status.code() == Some(1),
         "rg failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    String::from_utf8(output.stdout)
-        .expect("rg stdout utf8")
+}
+
+fn stdout_line_count(stdout: Vec<u8>, expect_message: &str) -> usize {
+    String::from_utf8(stdout)
+        .expect(expect_message)
         .lines()
         .count()
 }

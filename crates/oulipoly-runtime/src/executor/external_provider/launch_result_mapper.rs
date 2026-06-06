@@ -60,9 +60,17 @@ fn launch_provider_session_id(result: &LaunchResult) -> Option<String> {
 }
 
 fn provider_session_id_from_value(value: &Value) -> Option<String> {
-    value
-        .get("provider_session_id")
-        .and_then(Value::as_str)
-        .filter(|session_id| !session_id.is_empty())
-        .map(str::to_string)
+    raw_provider_session_id(value).and_then(accepted_provider_session_id)
+}
+
+fn raw_provider_session_id(value: &Value) -> Option<&str> {
+    value.get("provider_session_id").and_then(Value::as_str)
+}
+
+fn accepted_provider_session_id(session_id: &str) -> Option<String> {
+    if session_id.is_empty() {
+        None
+    } else {
+        Some(session_id.to_string())
+    }
 }

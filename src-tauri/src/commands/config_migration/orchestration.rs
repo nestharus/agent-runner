@@ -130,11 +130,19 @@ pub(crate) fn migrate_model_config_table(
 }
 
 fn backfill_moved_external_provider_ref(table: &mut toml::Table) -> bool {
-    if table.contains_key("provider") || !model_has_moved_provider(table) {
+    if !should_backfill_moved_external_provider_ref(table) {
         return false;
     }
-    table.insert("provider".to_string(), moved_external_provider_ref_value());
+    insert_moved_external_provider_ref(table);
     true
+}
+
+fn should_backfill_moved_external_provider_ref(table: &toml::Table) -> bool {
+    !table.contains_key("provider") && model_has_moved_provider(table)
+}
+
+fn insert_moved_external_provider_ref(table: &mut toml::Table) {
+    table.insert("provider".to_string(), moved_external_provider_ref_value());
 }
 
 fn model_has_moved_provider(table: &toml::Table) -> bool {

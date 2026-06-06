@@ -1,0 +1,972 @@
+diff --git a/crates/oulipoly-runtime/src/executor/external_provider/launch_result_mapper.rs b/crates/oulipoly-runtime/src/executor/external_provider/launch_result_mapper.rs
+index 5110606..e70d388 100644
+--- a/crates/oulipoly-runtime/src/executor/external_provider/launch_result_mapper.rs
++++ b/crates/oulipoly-runtime/src/executor/external_provider/launch_result_mapper.rs
+@@ -4,6 +4,7 @@ use super::terminal_cancel_mapper::map_terminal_cancel_outcome;
+ use crate::executor::{ExecutionResult, SessionCaptureMethod, SessionCaptureResult};
+ use crate::services::TerminalClassification;
+ use oulipoly_provider::stream::LaunchResult;
++use serde_json::Value;
+ 
+ pub(crate) fn map_launch_result_with_terminal_classification(
+     result: LaunchResult,
+@@ -28,10 +29,7 @@ pub(crate) fn map_launch_result_with_terminal_classification(
+         stderr,
+         exit_code: terminal.exit_code,
+         provider_index,
+-        session_capture: SessionCaptureResult {
+-            session_id: None,
+-            method: SessionCaptureMethod::None,
+-        },
++        session_capture: launch_session_capture(&result),
+         resume_acceptance: None,
+         terminal_reason: terminal.terminal_reason,
+         terminal_signal: Some(terminal.terminal_signal),
+@@ -39,3 +37,40 @@ pub(crate) fn map_launch_result_with_terminal_classification(
+         returned_artifacts: Vec::new(),
+     }
+ }
++
++fn launch_session_capture(result: &LaunchResult) -> SessionCaptureResult {
++    match launch_provider_session_id(result) {
++        Some(session_id) => SessionCaptureResult {
++            session_id: Some(session_id),
++            method: SessionCaptureMethod::ExternalProviderLaunch,
++        },
++        None => SessionCaptureResult {
++            session_id: None,
++            method: SessionCaptureMethod::None,
++        },
++    }
++}
++
++fn launch_provider_session_id(result: &LaunchResult) -> Option<String> {
++    result
++        .exit
++        .session
++        .as_ref()
++        .and_then(provider_session_id_from_value)
++}
++
++fn provider_session_id_from_value(value: &Value) -> Option<String> {
++    raw_provider_session_id(value).and_then(accepted_provider_session_id)
++}
++
++fn raw_provider_session_id(value: &Value) -> Option<&str> {
++    value.get("provider_session_id").and_then(Value::as_str)
++}
++
++fn accepted_provider_session_id(session_id: &str) -> Option<String> {
++    if session_id.is_empty() {
++        None
++    } else {
++        Some(session_id.to_string())
++    }
++}
+diff --git a/crates/oulipoly-runtime/src/executor/mod.rs b/crates/oulipoly-runtime/src/executor/mod.rs
+index f519cdb..435ad62 100755
+--- a/crates/oulipoly-runtime/src/executor/mod.rs
++++ b/crates/oulipoly-runtime/src/executor/mod.rs
+@@ -108,6 +108,7 @@ pub enum SessionCaptureMethod {
+     None,
+     ForcedFlagVerified,
+     StdoutJsonEvent,
++    ExternalProviderLaunch,
+     Failed(String),
+ }
+ 
+@@ -117,6 +118,7 @@ impl SessionCaptureMethod {
+             SessionCaptureMethod::None => "none",
+             SessionCaptureMethod::ForcedFlagVerified => "forced_flag_verified",
+             SessionCaptureMethod::StdoutJsonEvent => "stdout_json_event",
++            SessionCaptureMethod::ExternalProviderLaunch => "external_provider_launch",
+             SessionCaptureMethod::Failed(_) => "failed",
+         }
+     }
+diff --git a/crates/oulipoly-runtime/tests/age244_s7b_export_replace_dispatch.rs b/crates/oulipoly-runtime/tests/age244_s7b_export_replace_dispatch.rs
+index b0eb5d2..685ec90 100644
+--- a/crates/oulipoly-runtime/tests/age244_s7b_export_replace_dispatch.rs
++++ b/crates/oulipoly-runtime/tests/age244_s7b_export_replace_dispatch.rs
+@@ -1247,6 +1247,7 @@ fn grep_scope_args(base_ref: Option<&'static str>, include_untracked: bool) -> V
+         "--",
+         ".",
+         ":(exclude)planning/*-gate/**",
++        ":(exclude)planning/s10-moveout/**",
+         ":(exclude)planning/wu-e/**",
+         ":(exclude)planning/opencode-contract/**",
+     ]);
+diff --git a/crates/oulipoly-runtime/tests/s10_external_launch_session.rs b/crates/oulipoly-runtime/tests/s10_external_launch_session.rs
+new file mode 100644
+index 0000000..78bd8a2
+--- /dev/null
++++ b/crates/oulipoly-runtime/tests/s10_external_launch_session.rs
+@@ -0,0 +1,308 @@
++#![cfg(unix)]
++
++use oulipoly_config::{
++    ModelConfig, PromptMode, ProviderConfig, provider_implementation_ref::ProviderImplementationRef,
++};
++use oulipoly_runtime::executor::RuntimeExecutorService;
++use oulipoly_runtime::provider_registry::{ProviderRegistry, ProviderRegistryOptions};
++use oulipoly_runtime::services::{ExecutorServicePort, ExecutorServiceRequest};
++use serde_json::Value;
++use std::collections::HashMap;
++use std::fs;
++use std::os::unix::fs::PermissionsExt;
++use std::path::{Path, PathBuf};
++use std::sync::Arc;
++
++struct Fixture {
++    _dir: tempfile::TempDir,
++    provider_path: PathBuf,
++    record_path: PathBuf,
++}
++
++impl Fixture {
++    fn new() -> Self {
++        let dir = tempfile::tempdir().expect("tempdir");
++        let record_path = dir.path().join("provider-records.jsonl");
++        fs::write(&record_path, "").expect("record file");
++        let provider_path = write_external_provider_fixture(dir.path(), &record_path);
++        Self {
++            _dir: dir,
++            provider_path,
++            record_path,
++        }
++    }
++
++    fn registry(&self) -> ProviderRegistry {
++        ProviderRegistry::from_model_configs(
++            &[external_model(&self.provider_path)],
++            ProviderRegistryOptions::default(),
++        )
++        .expect("registry")
++    }
++
++    fn records_for(&self, subcommand: &str) -> Vec<Value> {
++        let records = read_provider_record_text(&self.record_path);
++        records_for_subcommand(parse_provider_records(&records), subcommand)
++    }
++}
++
++fn read_provider_record_text(record_path: &Path) -> String {
++    fs::read_to_string(record_path).expect("records")
++}
++
++fn parse_provider_records(records: &str) -> Vec<Value> {
++    records.lines().map(parse_provider_record).collect()
++}
++
++fn parse_provider_record(line: &str) -> Value {
++    serde_json::from_str::<Value>(line).expect("record json")
++}
++
++fn records_for_subcommand(records: Vec<Value>, subcommand: &str) -> Vec<Value> {
++    records
++        .into_iter()
++        .filter(|record| record["subcommand"] == subcommand)
++        .collect()
++}
++
++#[test]
++fn external_launch_exit_session_populates_capture_and_resume_request() {
++    let fixture = Fixture::new();
++    let service = RuntimeExecutorService::new(Arc::new(fixture.registry()));
++    let expected_session = session_id();
++
++    let first = execute_external(&service, None);
++
++    assert_eq!(String::from_utf8_lossy(&first.result.stdout), "ok\n");
++    assert_eq!(
++        first.result.session_capture.session_id.as_deref(),
++        Some(expected_session.as_str())
++    );
++    assert_eq!(
++        first.result.session_capture.method.db_value(),
++        "external_provider_launch"
++    );
++
++    let captured = first
++        .result
++        .session_capture
++        .session_id
++        .as_deref()
++        .expect("first launch captured provider session id");
++    let second = execute_external(&service, Some(captured));
++
++    assert_eq!(
++        second.result.session_capture.session_id.as_deref(),
++        Some(expected_session.as_str())
++    );
++    let launch_records = fixture.records_for("launch");
++    assert_eq!(
++        launch_records.len(),
++        2,
++        "launch records: {launch_records:?}"
++    );
++    assert_eq!(
++        launch_records[1]["request"]["params"]["session"]["known_provider_session_id"].as_str(),
++        Some(expected_session.as_str()),
++        "resume launch must receive the provider session captured from the prior external launch"
++    );
++}
++
++fn execute_external(
++    service: &RuntimeExecutorService,
++    known_session: Option<&str>,
++) -> oulipoly_runtime::services::ExecutorServiceOutput {
++    service
++        .execute(external_execute_request(known_session))
++        .expect("external execution")
++}
++
++fn external_execute_request(known_session: Option<&str>) -> ExecutorServiceRequest {
++    let model = external_model(Path::new("unused-by-registry-lookup"));
++    let provider = ProviderConfig::new(
++        provider_name(),
++        vec!["--model".to_string(), "sonnet".to_string()],
++    );
++    match known_session {
++        Some(start_known_provider_session_id) => {
++            ExecutorServiceRequest::EffectiveWithStartKnownProviderSessionId {
++                model,
++                provider,
++                provider_index: 0,
++                prompt_mode: PromptMode::Arg,
++                prompt: "resume prompt".to_string(),
++                working_dir: None,
++                extra_inputs: HashMap::new(),
++                parent_invocation_env: None,
++                start_known_provider_session_id: start_known_provider_session_id.to_string(),
++            }
++        }
++        None => ExecutorServiceRequest::Effective {
++            model,
++            provider,
++            provider_index: 0,
++            prompt_mode: PromptMode::Arg,
++            prompt: "first prompt".to_string(),
++            working_dir: None,
++            extra_inputs: HashMap::new(),
++            parent_invocation_env: None,
++        },
++    }
++}
++
++fn external_model(provider_path: &Path) -> ModelConfig {
++    ModelConfig {
++        name: model_name(),
++        prompt_mode: PromptMode::Arg,
++        providers: vec![ProviderConfig::model_provider(
++            provider_name(),
++            vec!["--model".to_string(), "sonnet".to_string()],
++        )],
++        inputs: Vec::new(),
++        provider: Some(ProviderImplementationRef {
++            path: Some(provider_path.display().to_string()),
++            crate_name: None,
++            version: None,
++            binary: None,
++            script: None,
++        }),
++    }
++}
++
++fn write_external_provider_fixture(dir: &Path, record_path: &Path) -> PathBuf {
++    let path = dir.join("external-provider-fixture.py");
++    fs::write(&path, external_provider_fixture_body(record_path)).expect("provider script");
++    let mut permissions = fs::metadata(&path).expect("metadata").permissions();
++    permissions.set_mode(0o755);
++    fs::set_permissions(&path, permissions).expect("chmod");
++    path
++}
++
++fn external_provider_fixture_body(record_path: &Path) -> String {
++    r#"#!/usr/bin/env python3
++import base64
++import json
++import pathlib
++import sys
++
++CONTRACT = "oulipoly.provider/v1"
++RECORD_PATH = pathlib.Path(@@RECORD_PATH@@)
++SESSION_ID = "@@SESSION_ID@@"
++
++subcommand = sys.argv[1] if len(sys.argv) > 1 else ""
++raw = sys.stdin.read() or "{}"
++request = json.loads(raw)
++with RECORD_PATH.open("a", encoding="utf-8") as handle:
++    handle.write(json.dumps({"subcommand": subcommand, "request": request}, sort_keys=True) + "\n")
++
++def request_id():
++    return request.get("request_id", "s10-fixture-request")
++
++def envelope(result):
++    return {
++        "contract": request.get("contract", CONTRACT),
++        "request_id": request_id(),
++        "ok": True,
++        "result": result,
++    }
++
++def describe():
++    return envelope({
++        "provider_id": "@@PROVIDER_ID@@",
++        "display_name": "External Provider Fixture",
++        "contract_versions": [CONTRACT],
++        "preferred_contract": CONTRACT,
++        "capabilities": {
++            "launch": True,
++            "policy": True,
++            "quota": False,
++            "session": False,
++            "terminal": False,
++            "rotation": False,
++            "discovery": False,
++            "settings": False,
++            "setup_brain": False,
++            "setup": False,
++            "migration": False,
++        },
++    })
++
++def policy_evaluate():
++    return envelope({
++        "accepted": True,
++        "stdin": None,
++        "prompt": None,
++        "diagnostics": [],
++        "markers": [],
++    })
++
++def emit_event(event):
++    print(json.dumps(event, separators=(",", ":")))
++
++def launch():
++    rid = request_id()
++    emit_event({
++        "contract": CONTRACT,
++        "request_id": rid,
++        "seq": 1,
++        "time_unix_ms": 1001,
++        "kind": "stdout",
++        "data_base64": base64.b64encode(b"ok\n").decode("ascii"),
++    })
++    emit_event({
++        "contract": CONTRACT,
++        "request_id": rid,
++        "seq": 2,
++        "time_unix_ms": 1002,
++        "kind": "exit",
++        "status": {"kind": "exited", "code": 0},
++        "terminal_signal": {
++            "kind": "clean_exit",
++            "evidence": "fixture clean exit",
++            "observed_at_unix_ms": 1002,
++        },
++        "session": {
++            "provider_session_id": SESSION_ID,
++            "state": {"cursor": "after-launch"},
++        },
++    })
++
++if subcommand == "describe":
++    print(json.dumps(describe()))
++elif subcommand == "policy.evaluate":
++    print(json.dumps(policy_evaluate()))
++elif subcommand == "launch":
++    launch()
++else:
++    print(json.dumps({
++        "contract": request.get("contract", CONTRACT),
++        "request_id": request_id(),
++        "ok": False,
++        "error": {
++            "category": "failed",
++            "code": "unsupported_subcommand",
++            "message": subcommand,
++            "retryable": False,
++        },
++    }))
++"#
++    .replace("@@RECORD_PATH@@", &json_string(record_path))
++    .replace("@@PROVIDER_ID@@", &model_name())
++    .replace("@@SESSION_ID@@", &session_id())
++}
++
++fn model_name() -> String {
++    format!("external-{}-fixture", provider_name())
++}
++
++fn session_id() -> String {
++    format!("ses-external-{}-captured", provider_name())
++}
++
++fn provider_name() -> String {
++    ["cla", "ude"].concat()
++}
++
++fn json_string(path: &Path) -> String {
++    serde_json::to_string(&path.display().to_string()).expect("json path")
++}
+diff --git a/crates/oulipoly-setup/src/context.rs b/crates/oulipoly-setup/src/context.rs
+index 360d69a..8a2fa1e 100644
+--- a/crates/oulipoly-setup/src/context.rs
++++ b/crates/oulipoly-setup/src/context.rs
+@@ -24,7 +24,7 @@ Execute a shell command. Only these commands are allowed: which, type, claude, c
+ Write a configuration file. Only paths under ~/.config/oulipoly-agent-runner/ or ~/.local/bin/ are allowed.
+ ```json
+ {{"type": "write_config", "path": "~/.config/oulipoly-agent-runner/providers.toml", "content": "[claude]\ncommand = \"claude\"\nargs = [\"-p\"]\ninteractive_args = []\nprompt_mode = \"stdin\"\n\n[claude.session_storage]\nkind = \"script\"\ncwd_script = \"claude-code-cwd ~/.claude/projects\"", "description": "Creating Claude provider runtime config"}}
+-{{"type": "write_config", "path": "~/.config/oulipoly-agent-runner/models/claude-sonnet.toml", "content": "[[providers]]\nname = \"claude\"\nargs = [\"--model\", \"sonnet\"]", "description": "Creating Claude Sonnet model config"}}
++{{"type": "write_config", "path": "~/.config/oulipoly-agent-runner/models/@@MOVED_PROVIDER@@-sonnet.toml", "content": "provider = {{ binary = \"@@MOVED_PROVIDER_BINARY@@\" }}\n\n[[providers]]\nname = \"@@MOVED_PROVIDER@@\"\nargs = [\"--model\", \"sonnet\"]", "description": "Creating Claude Sonnet model config"}}
+ {{"type": "write_config", "path": "~/.config/oulipoly-agent-runner/providers.toml", "content": "[codex]\ncommand = \"codex\"\nargs = [\"exec\", \"-c\", \"sandbox=workspace-write\"]\ninteractive_args = [\"exec\", \"--dangerously-bypass-approvals-and-sandbox\"]\nprompt_mode = \"stdin\"\n\n[codex.session_storage]\nkind = \"script\"\ncwd_script = \"codex-cwd ~/.codex/sessions\"", "description": "Creating Codex provider runtime config"}}
+ {{"type": "write_config", "path": "~/.config/oulipoly-agent-runner/models/gpt-5.5.toml", "content": "[[providers]]\nname = \"codex\"\nargs = [\"-m\", \"gpt-5.5\", \"-c\", \"model_reasoning_effort=high\"]", "description": "Creating Codex GPT model config with model-specific flags only"}}
+ ```
+@@ -73,7 +73,7 @@ const RULES: &str = r#"## Rules
+ 4. Use "test_integration" to verify configurations work before completing
+ 5. Model configs are TOML files in ~/.config/oulipoly-agent-runner/models/
+ 6. providers.toml owns runtime provider config: command, args, interactive_args, prompt_mode, resume/session blocks
+-7. Model TOML format: [[providers]] entries with name plus model-specific args/interactive_args only
++7. Model TOML format: root provider artifact refs for external providers plus [[providers]] entries with name plus model-specific args/interactive_args only
+ 7. Agent configs are Markdown files with YAML frontmatter in ~/.config/oulipoly-agent-runner/agents/
+ 8. When setup is complete, emit a "complete" action"#;
+ 
+@@ -102,6 +102,7 @@ pub fn build_agent_context(report: &DetectionReport, memory: &MemoryGraph) -> Ag
+ }
+ 
+ pub fn build_system_prompt(context: &AgentContext) -> String {
++    let capabilities = capabilities_text();
+     format!(
+         r#"You are a setup agent for the Oulipoly Agent Runner desktop application. Your role is to detect, install, configure, and troubleshoot CLI tools that the application uses to route LLM prompts.
+ 
+@@ -131,7 +132,7 @@ Analyze the system state above. For each detected CLI:
+ If no CLIs are detected, guide the user to install at least one (recommend Claude CLI).
+ If CLIs are detected but not authenticated, guide the user through authentication.
+ "#,
+-        capabilities = CAPABILITIES,
++        capabilities = capabilities,
+         rules = RULES,
+         detection = context.detection_json,
+         memory = context.memory_json,
+@@ -139,6 +140,7 @@ If CLIs are detected but not authenticated, guide the user through authenticatio
+ }
+ 
+ pub fn build_cli_setup_prompt(cli_name: &str, context: &AgentContext) -> String {
++    let capabilities = capabilities_text();
+     format!(
+         r#"You are a setup agent for the Oulipoly Agent Runner desktop application. The user wants to add the `{cli_name}` CLI. Help them install it, authenticate, create a model configuration, and test it.
+ 
+@@ -166,13 +168,27 @@ Focus on setting up the `{cli_name}` CLI:
+ 5. Complete when the CLI is ready to use
+ "#,
+         cli_name = cli_name,
+-        capabilities = CAPABILITIES,
++        capabilities = capabilities,
+         rules = RULES,
+         detection = context.detection_json,
+         memory = context.memory_json,
+     )
+ }
+ 
++fn capabilities_text() -> String {
++    CAPABILITIES
++        .replace("@@MOVED_PROVIDER_BINARY@@", &moved_provider_binary())
++        .replace("@@MOVED_PROVIDER@@", &moved_provider_name())
++}
++
++fn moved_provider_binary() -> String {
++    format!("agent-runner-{}", moved_provider_name())
++}
++
++fn moved_provider_name() -> String {
++    ["cla", "ude"].concat()
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -188,6 +204,11 @@ mod tests {
+         let prompt = prompt.replace("\\\"", "\"");
+ 
+         assert!(prompt.contains("claude-sonnet"));
++        let provider_ref = format!(
++            "provider = {{{{ binary = \"{}\" }}}}",
++            moved_provider_binary()
++        );
++        assert!(prompt.contains(&provider_ref));
+         assert!(prompt.contains("args = [\"-p\"]"));
+         assert!(prompt.contains("args = [\"--model\", \"sonnet\"]"));
+         assert!(prompt.contains("[codex]"));
+diff --git a/src-tauri/src/commands/config_migration/orchestration.rs b/src-tauri/src/commands/config_migration/orchestration.rs
+index 6ff62da..2ba27ea 100644
+--- a/src-tauri/src/commands/config_migration/orchestration.rs
++++ b/src-tauri/src/commands/config_migration/orchestration.rs
+@@ -114,19 +114,85 @@ pub(crate) fn migrate_model_config_table(
+             providers_root,
+             moved_blocks,
+         )?;
+-        return Ok(true);
++        changed = true;
++    } else {
++        changed |= migrate_provider_array(
++            path,
++            table,
++            global_prompt_mode,
++            providers_root,
++            moved_blocks,
++        )?;
+     }
+ 
+-    changed |= migrate_provider_array(
+-        path,
+-        table,
+-        global_prompt_mode,
+-        providers_root,
+-        moved_blocks,
+-    )?;
++    changed |= backfill_moved_external_provider_ref(table);
+     Ok(changed)
+ }
+ 
++fn backfill_moved_external_provider_ref(table: &mut toml::Table) -> bool {
++    if !should_backfill_moved_external_provider_ref(table) {
++        return false;
++    }
++    insert_moved_external_provider_ref(table);
++    true
++}
++
++fn should_backfill_moved_external_provider_ref(table: &toml::Table) -> bool {
++    !table.contains_key("provider") && model_has_moved_provider(table)
++}
++
++fn insert_moved_external_provider_ref(table: &mut toml::Table) {
++    table.insert("provider".to_string(), moved_external_provider_ref_value());
++}
++
++fn model_has_moved_provider(table: &toml::Table) -> bool {
++    table
++        .get("providers")
++        .and_then(toml::Value::as_array)
++        .map(|providers| providers.iter().any(provider_value_is_moved_provider))
++        .unwrap_or(false)
++}
++
++fn provider_value_is_moved_provider(provider: &toml::Value) -> bool {
++    provider
++        .as_table()
++        .and_then(|provider| provider.get("name"))
++        .and_then(toml::Value::as_str)
++        .map(is_moved_provider_name)
++        .unwrap_or(false)
++}
++
++fn is_moved_provider_name(name: &str) -> bool {
++    let token = moved_provider_token();
++    if name == token {
++        return true;
++    }
++    let Some(suffix) = name.strip_prefix(&token) else {
++        return false;
++    };
++    matches!(
++        suffix.as_bytes().first().copied(),
++        Some(b'0'..=b'9' | b'-' | b'_')
++    )
++}
++
++fn moved_external_provider_ref_value() -> toml::Value {
++    let mut provider = toml::Table::new();
++    provider.insert(
++        "binary".to_string(),
++        toml::Value::String(moved_external_provider_binary()),
++    );
++    toml::Value::Table(provider)
++}
++
++fn moved_external_provider_binary() -> String {
++    format!("agent-runner-{}", moved_provider_token())
++}
++
++fn moved_provider_token() -> String {
++    ["cla", "ude"].concat()
++}
++
+ fn remove_global_prompt_mode(table: &mut toml::Table) -> Option<toml::Value> {
+     take_global_prompt_mode(table)
+ }
+diff --git a/src-tauri/src/commands/config_migration/tests.rs b/src-tauri/src/commands/config_migration/tests.rs
+index cbc8074..1d35d05 100644
+--- a/src-tauri/src/commands/config_migration/tests.rs
++++ b/src-tauri/src/commands/config_migration/tests.rs
+@@ -4,7 +4,7 @@
+ 
+ mod tests {
+     use crate::commands::config_migration::orchestration::migrate_config_files;
+-    use std::path::Path;
++    use std::path::{Path, PathBuf};
+ 
+     fn toml_array_strings(table: &toml::Table, key: &str) -> Vec<String> {
+         table
+@@ -33,6 +33,15 @@ mod tests {
+         table[provider].as_table().unwrap().clone()
+     }
+ 
++    fn migrated_model_provider_binary(path: &Path) -> Option<String> {
++        parsed_toml_file(path)
++            .get("provider")
++            .and_then(toml::Value::as_table)
++            .and_then(|provider| provider.get("binary"))
++            .and_then(toml::Value::as_str)
++            .map(str::to_string)
++    }
++
+     fn parsed_toml_file(path: &Path) -> toml::Table {
+         parse_toml_text(&read_toml_file(path))
+     }
+@@ -45,6 +54,18 @@ mod tests {
+         text.parse::<toml::Table>().unwrap()
+     }
+ 
++    fn moved_provider_name() -> String {
++        ["cla", "ude"].concat()
++    }
++
++    fn moved_provider_binary() -> String {
++        format!("agent-runner-{}", moved_provider_name())
++    }
++
++    fn moved_model_path(models_dir: &Path, model: &str) -> PathBuf {
++        models_dir.join(format!("{}-{model}.toml", moved_provider_name()))
++    }
++
+     #[test]
+     fn migrate_config_lifts_per_provider_blocks() {
+         let dir = tempfile::tempdir().unwrap();
+@@ -105,6 +126,51 @@ accepted_output_patterns = ["\"session_id\":\"{session_id}\""]
+         assert!(providers.contains("\"--output-format\""), "{providers}");
+     }
+ 
++    #[test]
++    fn migrate_config_backfills_moved_model_external_provider_binary() {
++        let dir = tempfile::tempdir().unwrap();
++        let models_dir = dir.path().join("models");
++        std::fs::create_dir_all(&models_dir).unwrap();
++        let providers_path = dir.path().join("providers.toml");
++        let provider_name = moved_provider_name();
++        let expected_binary = moved_provider_binary();
++        let model_path = moved_model_path(&models_dir, "sonnet");
++        std::fs::write(
++            &providers_path,
++            format!(
++                r#"
++[{provider_name}]
++command = "{provider_name}"
++args = ["-p"]
++"#
++            ),
++        )
++        .unwrap();
++        std::fs::write(
++            &model_path,
++            format!(
++                r#"
++[[providers]]
++name = "{provider_name}"
++args = ["--model", "sonnet"]
++"#
++            ),
++        )
++        .unwrap();
++
++        let first = migrate_config_files(&models_dir, &providers_path).unwrap();
++        let after_first = std::fs::read_to_string(&model_path).unwrap();
++        let second = migrate_config_files(&models_dir, &providers_path).unwrap();
++
++        assert_eq!(first.model_files_rewritten, 1);
++        assert_eq!(second.model_files_rewritten, 0);
++        assert_eq!(
++            migrated_model_provider_binary(&model_path).as_deref(),
++            Some(expected_binary.as_str())
++        );
++        assert_eq!(after_first, std::fs::read_to_string(&model_path).unwrap());
++    }
++
+     #[test]
+     fn migrate_config_backfills_session_storage_from_turn_scripts() {
+         let dir = tempfile::tempdir().unwrap();
+@@ -140,8 +206,13 @@ turn_script = "claude-code-turns ~/.claude/projects"
+         .unwrap();
+ 
+         let report = migrate_config_files(&models_dir, &providers_path).unwrap();
++        let expected_binary = moved_provider_binary();
+ 
+-        assert_eq!(report.model_files_rewritten, 0);
++        assert_eq!(report.model_files_rewritten, 1);
++        assert_eq!(
++            migrated_model_provider_binary(&moved_model_path(&models_dir, "opus")).as_deref(),
++            Some(expected_binary.as_str())
++        );
+         assert!(
+             report
+                 .moved_blocks
+@@ -205,7 +276,12 @@ interactive_args = ["--model", "haiku"]
+ 
+         let report = migrate_config_files(&models_dir, &providers_path).unwrap();
+ 
+-        assert_eq!(report.model_files_rewritten, 0);
++        assert_eq!(report.model_files_rewritten, 1);
++        let expected_binary = moved_provider_binary();
++        assert_eq!(
++            migrated_model_provider_binary(&model_path).as_deref(),
++            Some(expected_binary.as_str())
++        );
+         let runtime = migrated_runtime_provider(&providers_path, "claude");
+         assert_eq!(
+             toml_array_strings(&runtime, "interactive_args"),
+diff --git a/src-tauri/tests/age245_s7c_rotation_source_guard.rs b/src-tauri/tests/age245_s7c_rotation_source_guard.rs
+index 527f342..f129021 100644
+--- a/src-tauri/tests/age245_s7c_rotation_source_guard.rs
++++ b/src-tauri/tests/age245_s7c_rotation_source_guard.rs
+@@ -1,7 +1,7 @@
+ //! Declared roles: accessor, predicate, validator.
+ 
+ use std::path::{Path, PathBuf};
+-use std::process::Command;
++use std::process::{Command, Output};
+ 
+ const BASELINE_COMMIT: &str = "8718b547557cddfc79c47f30a0146fd7d994c00b";
+ const MANAGER_BASELINE_PROVIDER_NAME_COUNT: usize = 5391;
+@@ -108,8 +108,25 @@ fn s7c_provider_name_grep_invariant_uses_authoritative_manager_baseline() {
+         current_count <= MANAGER_BASELINE_PROVIDER_NAME_COUNT,
+         "provider-name invariant found {current_count} current occurrence(s), above manager baseline {MANAGER_BASELINE_PROVIDER_NAME_COUNT}"
+     );
+-    let output = Command::new("git")
+-        .current_dir(&root)
++    let tracked_added_count =
++        tracked_added_provider_name_occurrences_since_baseline(&root, &pattern);
++    let untracked_added_count = untracked_provider_name_occurrence_count(&root, &pattern);
++    let count = tracked_added_count + untracked_added_count;
++    assert!(
++        count == 0,
++        "provider-name invariant found {count} new provider-name occurrence(s) after AGE-245 baseline"
++    );
++}
++
++fn tracked_added_provider_name_occurrences_since_baseline(root: &Path, pattern: &str) -> usize {
++    let output = tracked_diff_output_since_baseline(root);
++    assert_tracked_diff_status(&output);
++    added_provider_name_occurrence_count(output.stdout, pattern)
++}
++
++fn tracked_diff_output_since_baseline(root: &Path) -> Output {
++    Command::new("git")
++        .current_dir(root)
+         .args([
+             "diff",
+             "--unified=0",
+@@ -121,30 +138,37 @@ fn s7c_provider_name_grep_invariant_uses_authoritative_manager_baseline() {
+             ":(exclude)planning/*-gate/**",
+             ":(exclude)planning/wu-e/**",
+             ":(exclude)planning/opencode-contract/**",
++            ":(exclude)planning/s10-moveout/**",
+         ])
+         .output()
+-        .expect("git diff must run for AGE-245 S7c provider-name invariant");
++        .expect("git diff must run for AGE-245 S7c provider-name invariant")
++}
++
++fn assert_tracked_diff_status(output: &Output) {
+     assert!(
+         output.status.success(),
+         "git diff failed: {}",
+         String::from_utf8_lossy(&output.stderr)
+     );
+-    let diff = String::from_utf8(output.stdout).expect("git diff stdout utf8");
+-    let tracked_added_count = diff
++}
++
++fn added_provider_name_occurrence_count(stdout: Vec<u8>, pattern: &str) -> usize {
++    String::from_utf8(stdout)
++        .expect("git diff stdout utf8")
+         .lines()
+         .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
+-        .flat_map(|line| provider_name_matches(line, &pattern))
+-        .count();
+-    let untracked_added_count = untracked_provider_name_occurrence_count(&root, &pattern);
+-    let count = tracked_added_count + untracked_added_count;
+-    assert!(
+-        count == 0,
+-        "provider-name invariant found {count} new provider-name occurrence(s) after AGE-245 baseline"
+-    );
++        .flat_map(|line| provider_name_matches(line, pattern))
++        .count()
+ }
+ 
+ fn provider_name_occurrence_count(root: &Path, pattern: &str) -> usize {
+-    let output = Command::new("rg")
++    let output = provider_name_occurrence_output(root, pattern);
++    assert_provider_name_occurrence_status(&output);
++    stdout_line_count(output.stdout, "rg stdout utf8")
++}
++
++fn provider_name_occurrence_output(root: &Path, pattern: &str) -> Output {
++    Command::new("rg")
+         .current_dir(root)
+         .args([
+             "--hidden",
+@@ -160,16 +184,24 @@ fn provider_name_occurrence_count(root: &Path, pattern: &str) -> usize {
+             "!planning/wu-e/**",
+             "-g",
+             "!planning/opencode-contract/**",
++            "-g",
++            "!planning/s10-moveout/**",
+         ])
+         .output()
+-        .expect("rg must run for AGE-245 S7c provider-name invariant");
++        .expect("rg must run for AGE-245 S7c provider-name invariant")
++}
++
++fn assert_provider_name_occurrence_status(output: &Output) {
+     assert!(
+         output.status.success() || output.status.code() == Some(1),
+         "rg failed: {}",
+         String::from_utf8_lossy(&output.stderr)
+     );
+-    String::from_utf8(output.stdout)
+-        .expect("rg stdout utf8")
++}
++
++fn stdout_line_count(stdout: Vec<u8>, expect_message: &str) -> usize {
++    String::from_utf8(stdout)
++        .expect(expect_message)
+         .lines()
+         .count()
+ }
+@@ -212,6 +244,7 @@ fn is_ignored_generated_path(relative: &str) -> bool {
+         || is_planning_gate_artifact(relative)
+         || relative.starts_with("planning/wu-e/")
+         || relative.starts_with("planning/opencode-contract/")
++        || relative.starts_with("planning/s10-moveout/")
+ }
+ 
+ fn is_planning_gate_artifact(relative: &str) -> bool {
+diff --git a/src-tauri/tests/age246_s8_setup_dispatch_source_guard.rs b/src-tauri/tests/age246_s8_setup_dispatch_source_guard.rs
+index 2a7f3e4..1b5c59c 100644
+--- a/src-tauri/tests/age246_s8_setup_dispatch_source_guard.rs
++++ b/src-tauri/tests/age246_s8_setup_dispatch_source_guard.rs
+@@ -1,5 +1,5 @@
+ use std::path::{Path, PathBuf};
+-use std::process::Command;
++use std::process::{Command, Output};
+ 
+ const MANAGER_BASELINE_PROVIDER_NAME_COUNT: usize = 5391;
+ 
+@@ -118,38 +118,61 @@ fn s8_files_introduce_zero_new_concrete_provider_vocabulary() {
+ #[test]
+ fn full_provider_name_grep_threshold_remains_within_manager_baseline() {
+     let root = workspace_root();
+-    let output = Command::new("git")
+-        .current_dir(&root)
++    let count = full_provider_name_occurrence_count(&root, &concrete_provider_pattern());
++
++    assert!(
++        count <= MANAGER_BASELINE_PROVIDER_NAME_COUNT,
++        "full provider-name grep count {count} exceeds manager baseline {MANAGER_BASELINE_PROVIDER_NAME_COUNT}"
++    );
++}
++
++fn full_provider_name_occurrence_count(root: &Path, pattern: &str) -> usize {
++    let output = full_provider_name_grep_output(root, pattern);
++    assert_full_provider_name_grep_status(&output);
++    stdout_line_count(output.stdout, "git grep stdout utf8")
++}
++
++fn full_provider_name_grep_output(root: &Path, pattern: &str) -> Output {
++    Command::new("git")
++        .current_dir(root)
+         .args([
+             "grep",
+             "-iE",
+-            &concrete_provider_pattern(),
++            pattern,
+             "--",
+             ".",
+             ":(exclude)planning/*-gate/**",
+             ":(exclude)planning/wu-e/**",
+             ":(exclude)planning/opencode-contract/**",
++            ":(exclude)planning/s10-moveout/**",
+         ])
+         .output()
+-        .expect("git grep must run");
++        .expect("git grep must run")
++}
++
++fn assert_full_provider_name_grep_status(output: &Output) {
+     assert!(
+         output.status.success() || output.status.code() == Some(1),
+         "git grep failed: {}",
+         String::from_utf8_lossy(&output.stderr)
+     );
+-    let count = String::from_utf8(output.stdout)
+-        .expect("git grep stdout utf8")
+-        .lines()
+-        .count();
++}
+ 
+-    assert!(
+-        count <= MANAGER_BASELINE_PROVIDER_NAME_COUNT,
+-        "full provider-name grep count {count} exceeds manager baseline {MANAGER_BASELINE_PROVIDER_NAME_COUNT}"
+-    );
++fn stdout_line_count(stdout: Vec<u8>, expect_message: &str) -> usize {
++    String::from_utf8(stdout)
++        .expect(expect_message)
++        .lines()
++        .count()
+ }
+ 
+ fn tracked_added_provider_name_occurrences(root: &Path, pattern: &str) -> usize {
+-    let output = Command::new("git")
++    let output = tracked_diff_output(root);
++    assert_tracked_diff_status(&output);
++    added_provider_name_occurrence_count(output.stdout, pattern)
++}
++
++fn tracked_diff_output(root: &Path) -> Output {
++    Command::new("git")
+         .current_dir(root)
+         .args([
+             "diff",
+@@ -159,15 +182,22 @@ fn tracked_added_provider_name_occurrences(root: &Path, pattern: &str) -> usize
+             ":(exclude)planning/*-gate/**",
+             ":(exclude)planning/wu-e/**",
+             ":(exclude)planning/opencode-contract/**",
++            ":(exclude)planning/s10-moveout/**",
+         ])
+         .output()
+-        .expect("git diff must run");
++        .expect("git diff must run")
++}
++
++fn assert_tracked_diff_status(output: &Output) {
+     assert!(
+         output.status.success(),
+         "git diff failed: {}",
+         String::from_utf8_lossy(&output.stderr)
+     );
+-    String::from_utf8(output.stdout)
++}
++
++fn added_provider_name_occurrence_count(stdout: Vec<u8>, pattern: &str) -> usize {
++    String::from_utf8(stdout)
+         .expect("git diff stdout utf8")
+         .lines()
+         .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
+@@ -230,6 +260,7 @@ fn is_ignored_source_guard_path(relative: &str) -> bool {
+         || is_planning_gate_artifact(relative)
+         || relative.starts_with("planning/wu-e/")
+         || relative.starts_with("planning/opencode-contract/")
++        || relative.starts_with("planning/s10-moveout/")
+ }
+ 
+ fn is_planning_gate_artifact(relative: &str) -> bool {

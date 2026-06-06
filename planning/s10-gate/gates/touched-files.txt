@@ -1,0 +1,9 @@
+crates/oulipoly-runtime/src/executor/external_provider/launch_result_mapper.rs
+crates/oulipoly-runtime/src/executor/mod.rs
+crates/oulipoly-runtime/tests/age244_s7b_export_replace_dispatch.rs
+crates/oulipoly-runtime/tests/s10_external_launch_session.rs
+crates/oulipoly-setup/src/context.rs
+src-tauri/src/commands/config_migration/orchestration.rs
+src-tauri/src/commands/config_migration/tests.rs
+src-tauri/tests/age245_s7c_rotation_source_guard.rs
+src-tauri/tests/age246_s8_setup_dispatch_source_guard.rs

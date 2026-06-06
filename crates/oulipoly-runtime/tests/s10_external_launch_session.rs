@@ -41,13 +41,28 @@ impl Fixture {
     }
 
     fn records_for(&self, subcommand: &str) -> Vec<Value> {
-        fs::read_to_string(&self.record_path)
-            .expect("records")
-            .lines()
-            .map(|line| serde_json::from_str::<Value>(line).expect("record json"))
-            .filter(|record| record["subcommand"] == subcommand)
-            .collect()
+        let records = read_provider_record_text(&self.record_path);
+        records_for_subcommand(parse_provider_records(&records), subcommand)
     }
+}
+
+fn read_provider_record_text(record_path: &Path) -> String {
+    fs::read_to_string(record_path).expect("records")
+}
+
+fn parse_provider_records(records: &str) -> Vec<Value> {
+    records.lines().map(parse_provider_record).collect()
+}
+
+fn parse_provider_record(line: &str) -> Value {
+    serde_json::from_str::<Value>(line).expect("record json")
+}
+
+fn records_for_subcommand(records: Vec<Value>, subcommand: &str) -> Vec<Value> {
+    records
+        .into_iter()
+        .filter(|record| record["subcommand"] == subcommand)
+        .collect()
 }
 
 #[test]
