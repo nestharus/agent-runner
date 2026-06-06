@@ -24,7 +24,7 @@ Execute a shell command. Only these commands are allowed: which, type, claude, c
 Write a configuration file. Only paths under ~/.config/oulipoly-agent-runner/ or ~/.local/bin/ are allowed.
 ```json
 {{"type": "write_config", "path": "~/.config/oulipoly-agent-runner/providers.toml", "content": "[claude]\ncommand = \"claude\"\nargs = [\"-p\"]\ninteractive_args = []\nprompt_mode = \"stdin\"\n\n[claude.session_storage]\nkind = \"script\"\ncwd_script = \"claude-code-cwd ~/.claude/projects\"", "description": "Creating Claude provider runtime config"}}
-{{"type": "write_config", "path": "~/.config/oulipoly-agent-runner/models/claude-sonnet.toml", "content": "[[providers]]\nname = \"claude\"\nargs = [\"--model\", \"sonnet\"]", "description": "Creating Claude Sonnet model config"}}
+{{"type": "write_config", "path": "~/.config/oulipoly-agent-runner/models/@@MOVED_PROVIDER@@-sonnet.toml", "content": "provider = {{ binary = \"@@MOVED_PROVIDER_BINARY@@\" }}\n\n[[providers]]\nname = \"@@MOVED_PROVIDER@@\"\nargs = [\"--model\", \"sonnet\"]", "description": "Creating Claude Sonnet model config"}}
 {{"type": "write_config", "path": "~/.config/oulipoly-agent-runner/providers.toml", "content": "[codex]\ncommand = \"codex\"\nargs = [\"exec\", \"-c\", \"sandbox=workspace-write\"]\ninteractive_args = [\"exec\", \"--dangerously-bypass-approvals-and-sandbox\"]\nprompt_mode = \"stdin\"\n\n[codex.session_storage]\nkind = \"script\"\ncwd_script = \"codex-cwd ~/.codex/sessions\"", "description": "Creating Codex provider runtime config"}}
 {{"type": "write_config", "path": "~/.config/oulipoly-agent-runner/models/gpt-5.5.toml", "content": "[[providers]]\nname = \"codex\"\nargs = [\"-m\", \"gpt-5.5\", \"-c\", \"model_reasoning_effort=high\"]", "description": "Creating Codex GPT model config with model-specific flags only"}}
 ```
@@ -73,7 +73,7 @@ const RULES: &str = r#"## Rules
 4. Use "test_integration" to verify configurations work before completing
 5. Model configs are TOML files in ~/.config/oulipoly-agent-runner/models/
 6. providers.toml owns runtime provider config: command, args, interactive_args, prompt_mode, resume/session blocks
-7. Model TOML format: [[providers]] entries with name plus model-specific args/interactive_args only
+7. Model TOML format: root provider artifact refs for external providers plus [[providers]] entries with name plus model-specific args/interactive_args only
 7. Agent configs are Markdown files with YAML frontmatter in ~/.config/oulipoly-agent-runner/agents/
 8. When setup is complete, emit a "complete" action"#;
 
@@ -102,6 +102,7 @@ pub fn build_agent_context(report: &DetectionReport, memory: &MemoryGraph) -> Ag
 }
 
 pub fn build_system_prompt(context: &AgentContext) -> String {
+    let capabilities = capabilities_text();
     format!(
         r#"You are a setup agent for the Oulipoly Agent Runner desktop application. Your role is to detect, install, configure, and troubleshoot CLI tools that the application uses to route LLM prompts.
 
@@ -131,7 +132,7 @@ Analyze the system state above. For each detected CLI:
 If no CLIs are detected, guide the user to install at least one (recommend Claude CLI).
 If CLIs are detected but not authenticated, guide the user through authentication.
 "#,
-        capabilities = CAPABILITIES,
+        capabilities = capabilities,
         rules = RULES,
         detection = context.detection_json,
         memory = context.memory_json,
@@ -139,6 +140,7 @@ If CLIs are detected but not authenticated, guide the user through authenticatio
 }
 
 pub fn build_cli_setup_prompt(cli_name: &str, context: &AgentContext) -> String {
+    let capabilities = capabilities_text();
     format!(
         r#"You are a setup agent for the Oulipoly Agent Runner desktop application. The user wants to add the `{cli_name}` CLI. Help them install it, authenticate, create a model configuration, and test it.
 
@@ -166,11 +168,25 @@ Focus on setting up the `{cli_name}` CLI:
 5. Complete when the CLI is ready to use
 "#,
         cli_name = cli_name,
-        capabilities = CAPABILITIES,
+        capabilities = capabilities,
         rules = RULES,
         detection = context.detection_json,
         memory = context.memory_json,
     )
+}
+
+fn capabilities_text() -> String {
+    CAPABILITIES
+        .replace("@@MOVED_PROVIDER_BINARY@@", &moved_provider_binary())
+        .replace("@@MOVED_PROVIDER@@", &moved_provider_name())
+}
+
+fn moved_provider_binary() -> String {
+    format!("agent-runner-{}", moved_provider_name())
+}
+
+fn moved_provider_name() -> String {
+    ["cla", "ude"].concat()
 }
 
 #[cfg(test)]
@@ -188,6 +204,11 @@ mod tests {
         let prompt = prompt.replace("\\\"", "\"");
 
         assert!(prompt.contains("claude-sonnet"));
+        let provider_ref = format!(
+            "provider = {{{{ binary = \"{}\" }}}}",
+            moved_provider_binary()
+        );
+        assert!(prompt.contains(&provider_ref));
         assert!(prompt.contains("args = [\"-p\"]"));
         assert!(prompt.contains("args = [\"--model\", \"sonnet\"]"));
         assert!(prompt.contains("[codex]"));

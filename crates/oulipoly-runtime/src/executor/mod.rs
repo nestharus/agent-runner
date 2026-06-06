@@ -108,6 +108,7 @@ pub enum SessionCaptureMethod {
     None,
     ForcedFlagVerified,
     StdoutJsonEvent,
+    ExternalProviderLaunch,
     Failed(String),
 }
 
@@ -117,6 +118,7 @@ impl SessionCaptureMethod {
             SessionCaptureMethod::None => "none",
             SessionCaptureMethod::ForcedFlagVerified => "forced_flag_verified",
             SessionCaptureMethod::StdoutJsonEvent => "stdout_json_event",
+            SessionCaptureMethod::ExternalProviderLaunch => "external_provider_launch",
             SessionCaptureMethod::Failed(_) => "failed",
         }
     }

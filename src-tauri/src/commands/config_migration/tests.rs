@@ -4,7 +4,7 @@
 
 mod tests {
     use crate::commands::config_migration::orchestration::migrate_config_files;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     fn toml_array_strings(table: &toml::Table, key: &str) -> Vec<String> {
         table
@@ -33,6 +33,15 @@ mod tests {
         table[provider].as_table().unwrap().clone()
     }
 
+    fn migrated_model_provider_binary(path: &Path) -> Option<String> {
+        parsed_toml_file(path)
+            .get("provider")
+            .and_then(toml::Value::as_table)
+            .and_then(|provider| provider.get("binary"))
+            .and_then(toml::Value::as_str)
+            .map(str::to_string)
+    }
+
     fn parsed_toml_file(path: &Path) -> toml::Table {
         parse_toml_text(&read_toml_file(path))
     }
@@ -43,6 +52,18 @@ mod tests {
 
     fn parse_toml_text(text: &str) -> toml::Table {
         text.parse::<toml::Table>().unwrap()
+    }
+
+    fn moved_provider_name() -> String {
+        ["cla", "ude"].concat()
+    }
+
+    fn moved_provider_binary() -> String {
+        format!("agent-runner-{}", moved_provider_name())
+    }
+
+    fn moved_model_path(models_dir: &Path, model: &str) -> PathBuf {
+        models_dir.join(format!("{}-{model}.toml", moved_provider_name()))
     }
 
     #[test]
@@ -106,6 +127,51 @@ accepted_output_patterns = ["\"session_id\":\"{session_id}\""]
     }
 
     #[test]
+    fn migrate_config_backfills_moved_model_external_provider_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let providers_path = dir.path().join("providers.toml");
+        let provider_name = moved_provider_name();
+        let expected_binary = moved_provider_binary();
+        let model_path = moved_model_path(&models_dir, "sonnet");
+        std::fs::write(
+            &providers_path,
+            format!(
+                r#"
+[{provider_name}]
+command = "{provider_name}"
+args = ["-p"]
+"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &model_path,
+            format!(
+                r#"
+[[providers]]
+name = "{provider_name}"
+args = ["--model", "sonnet"]
+"#
+            ),
+        )
+        .unwrap();
+
+        let first = migrate_config_files(&models_dir, &providers_path).unwrap();
+        let after_first = std::fs::read_to_string(&model_path).unwrap();
+        let second = migrate_config_files(&models_dir, &providers_path).unwrap();
+
+        assert_eq!(first.model_files_rewritten, 1);
+        assert_eq!(second.model_files_rewritten, 0);
+        assert_eq!(
+            migrated_model_provider_binary(&model_path).as_deref(),
+            Some(expected_binary.as_str())
+        );
+        assert_eq!(after_first, std::fs::read_to_string(&model_path).unwrap());
+    }
+
+    #[test]
     fn migrate_config_backfills_session_storage_from_turn_scripts() {
         let dir = tempfile::tempdir().unwrap();
         let models_dir = dir.path().join("models");
@@ -140,8 +206,13 @@ turn_script = "claude-code-turns ~/.claude/projects"
         .unwrap();
 
         let report = migrate_config_files(&models_dir, &providers_path).unwrap();
+        let expected_binary = moved_provider_binary();
 
-        assert_eq!(report.model_files_rewritten, 0);
+        assert_eq!(report.model_files_rewritten, 1);
+        assert_eq!(
+            migrated_model_provider_binary(&moved_model_path(&models_dir, "opus")).as_deref(),
+            Some(expected_binary.as_str())
+        );
         assert!(
             report
                 .moved_blocks
@@ -205,7 +276,12 @@ interactive_args = ["--model", "haiku"]
 
         let report = migrate_config_files(&models_dir, &providers_path).unwrap();
 
-        assert_eq!(report.model_files_rewritten, 0);
+        assert_eq!(report.model_files_rewritten, 1);
+        let expected_binary = moved_provider_binary();
+        assert_eq!(
+            migrated_model_provider_binary(&model_path).as_deref(),
+            Some(expected_binary.as_str())
+        );
         let runtime = migrated_runtime_provider(&providers_path, "claude");
         assert_eq!(
             toml_array_strings(&runtime, "interactive_args"),

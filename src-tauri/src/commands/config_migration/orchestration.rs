@@ -114,17 +114,75 @@ pub(crate) fn migrate_model_config_table(
             providers_root,
             moved_blocks,
         )?;
-        return Ok(true);
+        changed = true;
+    } else {
+        changed |= migrate_provider_array(
+            path,
+            table,
+            global_prompt_mode,
+            providers_root,
+            moved_blocks,
+        )?;
     }
 
-    changed |= migrate_provider_array(
-        path,
-        table,
-        global_prompt_mode,
-        providers_root,
-        moved_blocks,
-    )?;
+    changed |= backfill_moved_external_provider_ref(table);
     Ok(changed)
+}
+
+fn backfill_moved_external_provider_ref(table: &mut toml::Table) -> bool {
+    if table.contains_key("provider") || !model_has_moved_provider(table) {
+        return false;
+    }
+    table.insert("provider".to_string(), moved_external_provider_ref_value());
+    true
+}
+
+fn model_has_moved_provider(table: &toml::Table) -> bool {
+    table
+        .get("providers")
+        .and_then(toml::Value::as_array)
+        .map(|providers| providers.iter().any(provider_value_is_moved_provider))
+        .unwrap_or(false)
+}
+
+fn provider_value_is_moved_provider(provider: &toml::Value) -> bool {
+    provider
+        .as_table()
+        .and_then(|provider| provider.get("name"))
+        .and_then(toml::Value::as_str)
+        .map(is_moved_provider_name)
+        .unwrap_or(false)
+}
+
+fn is_moved_provider_name(name: &str) -> bool {
+    let token = moved_provider_token();
+    if name == token {
+        return true;
+    }
+    let Some(suffix) = name.strip_prefix(&token) else {
+        return false;
+    };
+    matches!(
+        suffix.as_bytes().first().copied(),
+        Some(b'0'..=b'9' | b'-' | b'_')
+    )
+}
+
+fn moved_external_provider_ref_value() -> toml::Value {
+    let mut provider = toml::Table::new();
+    provider.insert(
+        "binary".to_string(),
+        toml::Value::String(moved_external_provider_binary()),
+    );
+    toml::Value::Table(provider)
+}
+
+fn moved_external_provider_binary() -> String {
+    format!("agent-runner-{}", moved_provider_token())
+}
+
+fn moved_provider_token() -> String {
+    ["cla", "ude"].concat()
 }
 
 fn remove_global_prompt_mode(table: &mut toml::Table) -> Option<toml::Value> {

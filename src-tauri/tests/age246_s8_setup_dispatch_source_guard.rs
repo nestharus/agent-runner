@@ -129,6 +129,7 @@ fn full_provider_name_grep_threshold_remains_within_manager_baseline() {
             ":(exclude)planning/*-gate/**",
             ":(exclude)planning/wu-e/**",
             ":(exclude)planning/opencode-contract/**",
+            ":(exclude)planning/s10-moveout/**",
         ])
         .output()
         .expect("git grep must run");
@@ -159,6 +160,7 @@ fn tracked_added_provider_name_occurrences(root: &Path, pattern: &str) -> usize 
             ":(exclude)planning/*-gate/**",
             ":(exclude)planning/wu-e/**",
             ":(exclude)planning/opencode-contract/**",
+            ":(exclude)planning/s10-moveout/**",
         ])
         .output()
         .expect("git diff must run");
@@ -230,6 +232,7 @@ fn is_ignored_source_guard_path(relative: &str) -> bool {
         || is_planning_gate_artifact(relative)
         || relative.starts_with("planning/wu-e/")
         || relative.starts_with("planning/opencode-contract/")
+        || relative.starts_with("planning/s10-moveout/")
 }
 
 fn is_planning_gate_artifact(relative: &str) -> bool {

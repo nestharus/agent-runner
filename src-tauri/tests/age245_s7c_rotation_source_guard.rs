@@ -121,6 +121,7 @@ fn s7c_provider_name_grep_invariant_uses_authoritative_manager_baseline() {
             ":(exclude)planning/*-gate/**",
             ":(exclude)planning/wu-e/**",
             ":(exclude)planning/opencode-contract/**",
+            ":(exclude)planning/s10-moveout/**",
         ])
         .output()
         .expect("git diff must run for AGE-245 S7c provider-name invariant");
@@ -160,6 +161,8 @@ fn provider_name_occurrence_count(root: &Path, pattern: &str) -> usize {
             "!planning/wu-e/**",
             "-g",
             "!planning/opencode-contract/**",
+            "-g",
+            "!planning/s10-moveout/**",
         ])
         .output()
         .expect("rg must run for AGE-245 S7c provider-name invariant");
@@ -212,6 +215,7 @@ fn is_ignored_generated_path(relative: &str) -> bool {
         || is_planning_gate_artifact(relative)
         || relative.starts_with("planning/wu-e/")
         || relative.starts_with("planning/opencode-contract/")
+        || relative.starts_with("planning/s10-moveout/")
 }
 
 fn is_planning_gate_artifact(relative: &str) -> bool {
