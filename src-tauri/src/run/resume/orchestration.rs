@@ -763,7 +763,7 @@ fn mailbox_delivery_unconfirmed(
     zero_turn_action: ZeroTurnAction,
 ) -> bool {
     mailbox_delivery_requires_turn_confirmation(input, provider_name, result)
-        && !mailbox_delivery_turn_confirmed(input, result, zero_turn_action)
+        && !mailbox_delivery_turn_confirmed(input, provider_name, result, zero_turn_action)
 }
 
 fn mailbox_delivery_requires_turn_confirmation(
@@ -779,11 +779,13 @@ fn mailbox_delivery_requires_turn_confirmation(
 
 fn mailbox_delivery_turn_confirmed(
     input: &ResumeAttemptInput<'_>,
+    provider_name: &str,
     result: &executor::ExecutionResult,
     zero_turn_action: ZeroTurnAction,
 ) -> bool {
     matches!(zero_turn_action, ZeroTurnAction::Continue)
         || submitted_user_turn_confirms_mailbox_delivery(input, result)
+        || ingested_user_turn_confirms_mailbox_delivery(input, provider_name)
 }
 
 fn submitted_user_turn_confirms_mailbox_delivery(
@@ -809,6 +811,20 @@ fn submitted_user_turn_payload_confirms_mailbox_delivery(
         return submitted.delivery_nonce.as_deref() == Some(delivery_nonce);
     }
     submitted.prompt_sha256 == sha256_hex(answer.as_bytes())
+}
+
+fn ingested_user_turn_confirms_mailbox_delivery(
+    input: &ResumeAttemptInput<'_>,
+    provider_name: &str,
+) -> bool {
+    let Some(answer) = input.answer else {
+        return false;
+    };
+    input
+        .env
+        .state
+        .has_session_user_text_turn(provider_name, &input.resolved.active_session_id, answer)
+        .unwrap_or(false)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

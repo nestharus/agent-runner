@@ -208,6 +208,12 @@ prompt_mode = "stdin"
         cmd.env("XDG_DATA_HOME", &self.data_home);
         cmd.env_remove("OULIPOLY_DATA_DIR");
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+        cmd.env_remove("OULIPOLY_AUTO_WAKE");
+        cmd.env_remove("OULIPOLY_AUTO_WAKE_SESSION_ID");
+        cmd.env_remove("OULIPOLY_AUTO_WAKE_TOKEN");
+        cmd.env_remove("OULIPOLY_AUTO_WAKE_COUNT");
+        cmd.env_remove("OULIPOLY_AUTO_WAKE_MAX");
+        cmd.env_remove("OULIPOLY_AUTO_WAKE_RETRY_BASE_MS");
         cmd
     }
 

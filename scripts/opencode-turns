@@ -5,7 +5,9 @@ Reference adapter: emit OpenCode exported sessions as normalized JSONL.
 Usage: opencode-turns BASE_DIR [SESSION_ID ...]
    e.g. opencode-turns ~/.local/share/opencode ses_abc123
 
-Session IDs and message content are read through the public OpenCode CLI:
+Session IDs and message content are read through the public OpenCode CLI.
+The command defaults to `opencode`, or to `opencodeN` when BASE_DIR contains
+`.opencodeN`; `OPENCODE_BIN` overrides this:
   opencode session list --json
   opencode export <sessionID>
 
@@ -462,8 +464,17 @@ def fallback_turn_id(default_session_id: str, index: int) -> str:
 
 
 def opencode_command() -> list[str]:
-    configured = os.environ.get("OPENCODE_BIN", "opencode")
+    configured = os.environ.get("OPENCODE_BIN")
+    if configured is None:
+        return [opencode_command_name_from_base_dir(base_dir_arg(sys.argv))]
     return shlex.split(configured) or ["opencode"]
+
+
+def opencode_command_name_from_base_dir(base_dir: str) -> str:
+    match = re.search(r"(?:^|/)\.opencode([0-9]+)(?:/|$)", os.path.expanduser(base_dir))
+    if match:
+        return f"opencode{match.group(1)}"
+    return "opencode"
 
 
 def run_opencode(
@@ -674,6 +685,10 @@ def emit_degraded_marker(count: int, out) -> None:
 
 def has_base_dir_arg(argv: list[str]) -> bool:
     return len(argv) >= 2
+
+
+def base_dir_arg(argv: list[str]) -> str:
+    return argv[1] if has_base_dir_arg(argv) else ""
 
 
 def usage_message() -> str:

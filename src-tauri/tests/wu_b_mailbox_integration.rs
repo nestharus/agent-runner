@@ -82,6 +82,12 @@ impl Fixture {
         cmd.env("HOME", &self.home_dir);
         cmd.env_remove("OULIPOLY_DATA_DIR");
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+        cmd.env_remove("OULIPOLY_AUTO_WAKE");
+        cmd.env_remove("OULIPOLY_AUTO_WAKE_SESSION_ID");
+        cmd.env_remove("OULIPOLY_AUTO_WAKE_TOKEN");
+        cmd.env_remove("OULIPOLY_AUTO_WAKE_COUNT");
+        cmd.env_remove("OULIPOLY_AUTO_WAKE_MAX");
+        cmd.env_remove("OULIPOLY_AUTO_WAKE_RETRY_BASE_MS");
         cmd.output().unwrap()
     }
 
@@ -283,6 +289,20 @@ kind = "flag"
 flag = "--resume"
 "#,
                 toml_string(&path_string(script))
+            ),
+        )
+        .unwrap();
+    }
+
+    fn write_sessions_config(&self, provider: &str, turn_script: &Path) {
+        fs::create_dir_all(&self.app_config_dir).unwrap();
+        fs::write(
+            self.app_config_dir.join("sessions.toml"),
+            format!(
+                r#"[{provider}]
+turn_script = {}
+"#,
+                toml_string(&path_string(turn_script))
             ),
         )
         .unwrap();
@@ -545,6 +565,7 @@ fn resume_with_pending_mailbox_prepends_notifications() {
     let output = fixture.run(cmd);
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(prompt_dump.exists(), "{output:?}");
     let prompt = fs::read_to_string(&prompt_dump).unwrap();
     assert!(prompt.starts_with("[OULIPOLY NOTIFICATIONS]"), "{prompt}");
     assert!(prompt.find("handle: h-1").unwrap() < prompt.find("handle: h-2").unwrap());
@@ -647,6 +668,99 @@ fn resume_marks_delivered_after_success() {
     assert_eq!(
         delivered.delivered_by_invocation_uuid.as_deref(),
         Some(invocation.id.as_str())
+    );
+    fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
+fn resume_marks_delivered_from_exact_ingested_user_turn_without_assistant_delta() {
+    let fixture = Fixture::new();
+    let prompt_dump = fixture.dir.path().join("prompt.txt");
+    let turns = fixture.dir.path().join("turns.jsonl");
+    let turn_script = fixture.write_script(
+        "turns-exact.sh",
+        &format!(
+            "if [ -f {} ]; then cat {}; fi",
+            shell_path(&turns),
+            shell_path(&turns)
+        ),
+    );
+    let script = fixture.write_script(
+        "resume-exact-user-turn.sh",
+        &write_user_turn_script(&prompt_dump, &turns, SESSION_A, None, 0),
+    );
+    fixture.write_single_provider_model("fixture-model", "fixture-provider", &script);
+    fixture.write_sessions_config("fixture-provider", &turn_script);
+    fixture.seed_session_turn("fixture-provider", SESSION_A);
+    let row = fixture.seed_mailbox(SESSION_A, "h-exact-user", 0);
+
+    let mut cmd = fixture.base_resume_command("fixture-model", SESSION_A);
+    cmd.arg("--prompt").arg("continue");
+    let output = fixture.run(cmd);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let prompt = fs::read_to_string(&prompt_dump).unwrap();
+    assert!(prompt.starts_with("[OULIPOLY NOTIFICATIONS]"), "{prompt}");
+    let invocation = parse_invocation(&String::from_utf8_lossy(&output.stderr));
+    let rows = fixture.mailbox_rows(SESSION_A, true);
+    let delivered = rows
+        .iter()
+        .find(|candidate| candidate.seq == row.seq)
+        .unwrap();
+    assert!(delivered.delivered_at.is_some());
+    assert_eq!(
+        delivered.delivered_by_invocation_uuid.as_deref(),
+        Some(invocation.id.as_str())
+    );
+    fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
+fn resume_rejects_different_ingested_user_turn_without_assistant_delta() {
+    let fixture = Fixture::new();
+    let prompt_dump = fixture.dir.path().join("prompt.txt");
+    let turns = fixture.dir.path().join("turns.jsonl");
+    let turn_script = fixture.write_script(
+        "turns-different.sh",
+        &format!(
+            "if [ -f {} ]; then cat {}; fi",
+            shell_path(&turns),
+            shell_path(&turns)
+        ),
+    );
+    let script = fixture.write_script(
+        "resume-different-user-turn.sh",
+        &write_user_turn_script(
+            &prompt_dump,
+            &turns,
+            SESSION_A,
+            Some("different payload"),
+            0,
+        ),
+    );
+    fixture.write_single_provider_model("fixture-model", "fixture-provider", &script);
+    fixture.write_sessions_config("fixture-provider", &turn_script);
+    fixture.seed_session_turn("fixture-provider", SESSION_A);
+    let row = fixture.seed_mailbox(SESSION_A, "h-different-user", 0);
+
+    let mut cmd = fixture.base_resume_command("fixture-model", SESSION_A);
+    cmd.arg("--prompt").arg("continue");
+    let output = fixture.run(cmd);
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(prompt_dump.exists(), "{output:?}");
+    let prompt = fs::read_to_string(&prompt_dump).unwrap();
+    assert!(prompt.starts_with("[OULIPOLY NOTIFICATIONS]"), "{prompt}");
+    let rows = fixture.mailbox_rows(SESSION_A, true);
+    let pending = rows
+        .iter()
+        .find(|candidate| candidate.seq == row.seq)
+        .unwrap();
+    assert!(pending.delivered_at.is_none());
+    assert_eq!(pending.delivery_attempts, 1);
+    assert_eq!(
+        pending.delivery_error.as_deref(),
+        Some("mailbox_delivery_unconfirmed")
     );
     fixture.assert_default_user_paths_untouched();
 }
@@ -795,6 +909,42 @@ fn dump_last_arg_script(prompt_dump: &Path, argv_dump: Option<&Path>, exit_code:
 printf '%s' "$last" > {}
 exit {exit_code}"#,
         shell_path(prompt_dump)
+    )
+}
+
+fn write_user_turn_script(
+    prompt_dump: &Path,
+    turns: &Path,
+    session_id: &str,
+    replacement_text: Option<&str>,
+    exit_code: i32,
+) -> String {
+    let text_assignment = replacement_text
+        .map(|text| format!("prompt={}\n", shell_path(Path::new(text))))
+        .unwrap_or_default();
+    format!(
+        r#"last="${{@: -1}}"
+printf '%s' "$last" > {}
+prompt="$last"
+{text_assignment}python3 - "$prompt" {} <<'PY'
+import json
+import sys
+
+prompt = sys.argv[1]
+turns = sys.argv[2]
+record = {{
+    "session_id": "{session_id}",
+    "turn_id": "user-delivery-proof",
+    "timestamp": "2026-04-17T08:00:01Z",
+    "role": "user",
+    "body": [{{"type": "text", "text": prompt}}],
+}}
+with open(turns, "w", encoding="utf-8") as out:
+    out.write(json.dumps(record, separators=(",", ":")) + "\n")
+PY
+exit {exit_code}"#,
+        shell_path(prompt_dump),
+        shell_path(turns),
     )
 }
 

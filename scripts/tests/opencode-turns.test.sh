@@ -330,6 +330,31 @@ write_descendant_timeout_mock() {
   write_executable_mock "$path" emit_descendant_timeout_mock_body
 }
 
+emit_command_derivation_mock_body() {
+  cat <<'MOCK_OPENCODE'
+#!/usr/bin/env bash
+set -euo pipefail
+
+printf '%s\n' "$(basename "$0")" >>"$OPENCODE_TURNS_COMMAND_LOG"
+
+if [[ "$1" == "export" ]]; then
+  session_id="$2"
+  printf '%s\n' "$session_id" >>"$OPENCODE_TURNS_EXPORT_LOG"
+  printf '[{"sessionID":"%s","messageID":"turn-%s","timestamp":"2099-01-01T00:00:00Z","role":"user","content":"submitted"}]\n' "$session_id" "$session_id"
+  exit 0
+fi
+
+echo "unexpected opencode args: $*" >&2
+exit 64
+MOCK_OPENCODE
+}
+
+write_command_derivation_mock() {
+  local path="$1"
+
+  write_executable_mock "$path" emit_command_derivation_mock_body
+}
+
 run_opencode_turns() {
   local tmpdir="$1"
   local opencode_bin="$2"
@@ -437,9 +462,42 @@ test_timeout_kills_opencode_process_group_descendant() {
   assert_process_not_running "$descendant_pid" "$FUNCNAME"
 }
 
+test_base_dir_suffix_selects_matching_opencode_command() {
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  trap "rm -rf '$tmpdir'" RETURN
+
+  mkdir -p "$tmpdir/bin" "$tmpdir/.opencode3/opencode"
+  write_command_derivation_mock "$tmpdir/bin/opencode3"
+  RUN_STDOUT="$tmpdir/stdout.jsonl"
+  RUN_STDERR="$tmpdir/stderr.txt"
+  OPENCODE_TURNS_EXPORT_LOG="$tmpdir/exports.log"
+  OPENCODE_TURNS_COMMAND_LOG="$tmpdir/commands.log"
+  export OPENCODE_TURNS_EXPORT_LOG OPENCODE_TURNS_COMMAND_LOG
+  : >"$OPENCODE_TURNS_EXPORT_LOG"
+  : >"$OPENCODE_TURNS_COMMAND_LOG"
+
+  set +e
+  env -u OPENCODE_BIN \
+    PATH="$tmpdir/bin:$PATH" \
+    OPENCODE_TURNS_WINDOW_HOURS=6 \
+    OPENCODE_TURNS_MAX_SESSIONS=25 \
+    OPENCODE_TURNS_CALL_TIMEOUT=20 \
+    OPENCODE_TURNS_DEADLINE=60 \
+    "$SCRIPT" "$tmpdir/.opencode3/opencode" ses_account >"$RUN_STDOUT" 2>"$RUN_STDERR"
+  RUN_STATUS=$?
+  set -e
+
+  assert_status_zero "$RUN_STATUS" "$FUNCNAME"
+  assert_eq "$(cat "$OPENCODE_TURNS_COMMAND_LOG")" "opencode3" "$FUNCNAME command"
+  assert_eq "$(cat "$OPENCODE_TURNS_EXPORT_LOG")" "ses_account" "$FUNCNAME export"
+  assert_stdout_contains '"role":"user"' "$FUNCNAME user record"
+}
+
 test_timestampless_session_list_applies_max_sessions_cap
 test_exports_only_recent_window_sessions
 test_timeout_emits_degraded_best_effort_and_exits_zero
 test_timeout_kills_opencode_process_group_descendant
+test_base_dir_suffix_selects_matching_opencode_command
 
 echo "opencode-turns tests passed"

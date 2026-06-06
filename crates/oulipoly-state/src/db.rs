@@ -5760,6 +5760,69 @@ impl StateDb {
         })
     }
 
+    pub fn has_session_user_text_turn(
+        &self,
+        provider_name: &str,
+        session_id: &str,
+        text: &str,
+    ) -> Result<bool, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT body
+                 FROM session_turns
+                 WHERE provider_name = ?1
+                   AND session_id = ?2
+                   AND role = 'user'
+                   AND body IS NOT NULL",
+            )
+            .map_err(|e| format!("Failed to prepare session user turn lookup: {e}"))?;
+        let rows = stmt
+            .query_map(sqlite::params![provider_name, session_id], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|e| format!("Failed to query session user turns: {e}"))?;
+
+        for row in rows {
+            let body = row.map_err(|e| format!("Failed to read session user turn body: {e}"))?;
+            if Self::session_turn_body_has_exact_text(&body, text) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn session_turn_body_has_exact_text(body: &str, text: &str) -> bool {
+        serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .is_some_and(|value| Self::canonical_body_has_exact_text(&value, text))
+    }
+
+    fn canonical_body_has_exact_text(body: &serde_json::Value, text: &str) -> bool {
+        let serde_json::Value::Array(chunks) = body else {
+            return false;
+        };
+        let mut canonical_text = String::new();
+        let mut has_text = false;
+        for chunk in chunks {
+            if !Self::session_turn_chunk_is_text(chunk) {
+                continue;
+            }
+            if let Some(candidate) = chunk.get("text").and_then(serde_json::Value::as_str) {
+                canonical_text.push_str(candidate);
+                has_text = true;
+            }
+        }
+        has_text && canonical_text == text
+    }
+
+    fn session_turn_chunk_is_text(chunk: &serde_json::Value) -> bool {
+        chunk
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|chunk_type| chunk_type == "text")
+    }
+
     pub fn backfill_session_chains(&self) -> Result<BackfillReport, DbError> {
         if Self::session_chains_backfill_exists(&self.conn)? {
             return Ok(BackfillReport {
@@ -10501,6 +10564,73 @@ name = "fixture-provider"
         assert_eq!(counts.total, 3);
         assert_eq!(counts.assistant, 2);
         assert_eq!(counts.sidechain, 1);
+    }
+
+    #[test]
+    fn has_session_user_text_turn_requires_exact_user_body_match() {
+        let db = test_db();
+        let expected = "[OULIPOLY NOTIFICATIONS]\nhandle: h-exact\n";
+
+        db.ingest_session_turns_batch(
+            "fixture-provider",
+            &[
+                SessionTurnIngest {
+                    session_id: "session-a".to_string(),
+                    turn_id: "user-exact".to_string(),
+                    timestamp: ts("2026-04-17T08:00:00Z"),
+                    role: "user".to_string(),
+                    parent_turn_id: None,
+                    is_sidechain: false,
+                    is_compaction_boundary: false,
+                    body: Some(
+                        serde_json::json!([{ "type": "text", "text": expected }]).to_string(),
+                    ),
+                },
+                SessionTurnIngest {
+                    session_id: "session-a".to_string(),
+                    turn_id: "assistant-same-text".to_string(),
+                    timestamp: ts("2026-04-17T08:00:01Z"),
+                    role: "assistant".to_string(),
+                    parent_turn_id: None,
+                    is_sidechain: false,
+                    is_compaction_boundary: false,
+                    body: Some(
+                        serde_json::json!([{ "type": "text", "text": "assistant text" }])
+                            .to_string(),
+                    ),
+                },
+            ],
+        )
+        .unwrap();
+
+        let extra_text_body = serde_json::json!([
+            { "type": "text", "text": expected },
+            { "type": "text", "text": "extra" }
+        ])
+        .to_string();
+
+        assert!(
+            db.has_session_user_text_turn("fixture-provider", "session-a", expected)
+                .unwrap()
+        );
+        assert!(
+            !db.has_session_user_text_turn("fixture-provider", "session-a", "handle: h")
+                .unwrap(),
+            "partial text must not confirm delivery"
+        );
+        assert!(
+            !StateDb::session_turn_body_has_exact_text(&extra_text_body, expected),
+            "multi-chunk turns must match the submitted payload exactly"
+        );
+        assert!(StateDb::session_turn_body_has_exact_text(
+            &extra_text_body,
+            &format!("{expected}extra")
+        ));
+        assert!(
+            !db.has_session_user_text_turn("other-provider", "session-a", expected)
+                .unwrap(),
+            "provider identity must match"
+        );
     }
 
     #[test]
