@@ -775,7 +775,8 @@ fn validate_headless_resume_target(
     selected_provider: &str,
 ) -> Result<(), i32> {
     if resolved_uses_provider_ref(resolved) {
-        return Ok(());
+        return validate_provider_ref_headless_resume_target(resolved, target, selected_provider)
+            .map_err(|message| provider_ref_resume_block_exit_code(&message));
     }
     if headless_resume_target_has_resume(target) {
         Ok(())
@@ -784,12 +785,53 @@ fn validate_headless_resume_target(
     }
 }
 
+fn validate_provider_ref_headless_resume_target(
+    resolved: &oulipoly_state::ResolvedResume,
+    target: &crate::resume_cli::ResumeExecutionTarget,
+    selected_provider: &str,
+) -> Result<(), String> {
+    let Some(model) = resolved.model.as_ref() else {
+        return Err(format!(
+            "provider-ref resume target {selected_provider} has no model config"
+        ));
+    };
+    if model.provider.is_none() {
+        return Err(format!(
+            "provider-ref resume target {selected_provider} has no provider implementation"
+        ));
+    }
+    let Some(target_member) = model.providers.get(target.provider_index) else {
+        return Err(format!(
+            "provider-ref resume target {selected_provider} has invalid provider index {}",
+            target.provider_index
+        ));
+    };
+    if target_member.name != selected_provider {
+        return Err(format!(
+            "provider-ref resume target {selected_provider} resolved provider {}",
+            target_member.name
+        ));
+    }
+    if target.provider.name != selected_provider {
+        return Err(format!(
+            "provider-ref resume target {selected_provider} loaded provider {}",
+            target.provider.name
+        ));
+    }
+    Ok(())
+}
+
 fn headless_resume_target_has_resume(target: &crate::resume_cli::ResumeExecutionTarget) -> bool {
     target.provider.resume.is_some()
 }
 
 fn headless_missing_resume_block_exit_code(selected_provider: &str) -> i32 {
     formatter::emit_missing_resume_block(selected_provider);
+    1
+}
+
+fn provider_ref_resume_block_exit_code(message: &str) -> i32 {
+    formatter::emit_stderr(message);
     1
 }
 
@@ -803,6 +845,8 @@ fn migrate_resume_target(
     effective_spawn_cwd: &Path,
 ) -> Result<(), i32> {
     if should_skip_provider_ref_default_migration(resolved, manual_migrate) {
+        validate_provider_ref_headless_resume_target(resolved, target, &resolved.active_provider)
+            .map_err(|message| provider_ref_resume_block_exit_code(&message))?;
         return Ok(());
     }
     let migration_model = migration_model_for_attempt(env, resolved, manual_migrate, attempts);

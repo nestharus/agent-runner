@@ -123,7 +123,7 @@ pub struct ErrorResponseEnvelope {
     pub ok: FalseBool,
     pub error: ErrorObject,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub process_status: Option<Value>,
+    pub process_status: Option<ProcessStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

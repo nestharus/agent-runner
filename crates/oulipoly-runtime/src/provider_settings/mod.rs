@@ -439,10 +439,11 @@ impl From<ProviderClientError> for ProviderSettingsError {
                         .unwrap_or_else(|| Value::Object(Map::new())),
                 ),
                 diagnostics: capability.error().diagnostics.clone().into_boxed_slice(),
-                process_status: provider_error_process_status_from_stdout(
-                    &capability.diagnostics().stdout,
+                process_status: provider_error_status(
+                    capability
+                        .provider_reported_process_status()
+                        .or_else(|| capability.process_status()),
                 )
-                .or_else(|| provider_error_status(capability.process_status()))
                 .map(Box::new),
             },
             other => {
@@ -528,28 +529,6 @@ fn provider_error_status(status: Option<&ProcessStatus>) -> Option<ProviderSetti
             signal: None,
             kind: "unknown".to_string(),
         },
-    })
-}
-
-fn provider_error_process_status_from_stdout(
-    stdout: &oulipoly_provider::error::CapturedBytes,
-) -> Option<ProviderSettingsProcessStatus> {
-    let envelope = serde_json::from_slice::<Value>(&stdout.bytes).ok()?;
-    let status = envelope.get("process_status")?;
-    Some(ProviderSettingsProcessStatus {
-        exit_code: status
-            .get("exit_code")
-            .and_then(Value::as_i64)
-            .and_then(|code| i32::try_from(code).ok()),
-        signal: status
-            .get("signal")
-            .and_then(Value::as_i64)
-            .and_then(|signal| i32::try_from(signal).ok()),
-        kind: status
-            .get("kind")
-            .and_then(Value::as_str)
-            .unwrap_or("exited")
-            .to_string(),
     })
 }
 

@@ -162,6 +162,10 @@ impl ProviderCapabilityError {
         &self.envelope.error
     }
 
+    pub fn provider_reported_process_status(&self) -> Option<&ProcessStatus> {
+        self.envelope.process_status.as_ref()
+    }
+
     pub fn diagnostics(&self) -> &ProviderDiagnostics {
         self.diagnostics.as_ref()
     }

@@ -541,7 +541,7 @@ def error():
             "details": {{"remote_version": "provider-updated-version"}},
             "diagnostics": [{{"severity": "warning", "message": "Reload before saving", "path": "/endpoint", "code": "stale"}}],
         }},
-        "process_status": {{"exit_code": 17}},
+        "process_status": {{"kind": "exited", "code": 17}},
     }}
 
 if subcommand == "schema":
