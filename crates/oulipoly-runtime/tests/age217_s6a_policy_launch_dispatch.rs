@@ -1229,6 +1229,62 @@ fn external_provider_policy_rejection_skips_launch() {
 }
 
 #[test]
+fn external_provider_policy_request_canonicalizes_opencode_account_one_settings_id() {
+    let fixture = make_external_fixture(
+        Capabilities {
+            policy: true,
+            launch: true,
+        },
+        PolicyMode::Accept,
+        LaunchMode::Success,
+    );
+    let mut model = external_model(&fixture);
+    model.name = "gpt-low".to_string();
+    model.providers[0].name = "opencode".to_string();
+    model.providers[0].args = vec![
+        "-m".to_string(),
+        "openai/gpt-5.5".to_string(),
+        "--variant".to_string(),
+        "low".to_string(),
+    ];
+    let mut provider = model.providers[0].clone();
+    provider.command = "opencode1".to_string();
+    provider.args = vec![
+        "run".to_string(),
+        "--dangerously-skip-permissions".to_string(),
+        "-m".to_string(),
+        "openai/gpt-5.5".to_string(),
+        "--variant".to_string(),
+        "low".to_string(),
+    ];
+    let registry = dispatch_registry_for_models(std::slice::from_ref(&model));
+
+    execute_dispatch_aware_result(
+        registry,
+        ExecutorServiceRequest::Effective {
+            model,
+            provider,
+            provider_index: 0,
+            prompt_mode: PromptMode::Arg,
+            prompt: "prompt-value".to_string(),
+            working_dir: None,
+            extra_inputs: HashMap::new(),
+            parent_invocation_env: None,
+        },
+    )
+    .expect("external dispatch should accept canonicalized account-one policy request");
+
+    let request = read_json(&fixture.policy_record_path);
+    assert_eq!(request["provider_instance_id"], "opencode");
+    assert_eq!(request["params"]["settings_id"], "opencode1");
+    assert_eq!(request["params"]["launch"]["command"], "opencode1");
+    assert_eq!(
+        request["params"]["launch"]["argv"][0],
+        serde_json::json!("opencode1")
+    );
+}
+
+#[test]
 fn external_provider_policy_transform_applies_once_and_no_legacy_double_policy() {
     let fixture = make_external_fixture(
         Capabilities {

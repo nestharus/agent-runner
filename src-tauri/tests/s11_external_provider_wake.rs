@@ -66,7 +66,14 @@ impl Fixture {
     }
 
     fn run_agent(&self, prompt: &str) -> Output {
+        self.run_agent_with_env(prompt, &[])
+    }
+
+    fn run_agent_with_env(&self, prompt: &str, envs: &[(&str, &str)]) -> Output {
         let mut cmd = Command::new(runner_bin());
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
         cmd.arg("-m")
             .arg(MODEL)
             .arg("--models-dir")
@@ -218,6 +225,31 @@ fn external_provider_launch_notify_uses_captured_sidecar_owner_and_wakes() {
     fixture.assert_xdg_isolated();
 }
 
+#[test]
+fn external_provider_policy_rejection_terminal_signal_excerpt_includes_diagnostics() {
+    let fixture = Fixture::new();
+    fixture.write_external_provider();
+
+    let output = fixture.run_agent_with_env(
+        "dispatch external provider reject",
+        &[("S11_POLICY_REJECT", "1")],
+    );
+
+    assert_ne!(output.status.code(), Some(0), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let marker = terminal_signal_marker(&stderr);
+    let excerpt = marker
+        .get("evidence")
+        .and_then(|evidence| evidence.get("excerpt"))
+        .and_then(Value::as_str)
+        .expect("terminal-signal marker should include evidence excerpt");
+    assert!(excerpt.contains("policy rejected"), "{excerpt}");
+    assert!(excerpt.contains("s11_policy_reject"), "{excerpt}");
+    assert!(excerpt.contains("params.launch.argv"), "{excerpt}");
+    assert!(excerpt.contains("s11 fixture rejected policy"), "{excerpt}");
+    fixture.assert_xdg_isolated();
+}
+
 fn external_provider_script() -> &'static str {
     r#"#!/usr/bin/env python3
 import base64
@@ -265,6 +297,20 @@ def describe(request):
     })
 
 def policy_evaluate(request):
+    if os.environ.get("S11_POLICY_REJECT") == "1":
+        return envelope(request, {
+            "accepted": False,
+            "env": {},
+            "stdin": None,
+            "prompt": None,
+            "diagnostics": [{
+                "severity": "error",
+                "code": "s11_policy_reject",
+                "path": "params.launch.argv",
+                "message": "s11 fixture rejected policy",
+            }],
+            "markers": [],
+        })
     return envelope(request, {
         "accepted": True,
         "env": {},
@@ -443,6 +489,14 @@ fn assert_success(output: &Output) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn terminal_signal_marker(stderr: &str) -> Value {
+    let line = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("OULIPOLY_TERMINAL_SIGNAL="))
+        .unwrap_or_else(|| panic!("missing terminal-signal marker in stderr:\n{stderr}"));
+    serde_json::from_str(line).unwrap()
 }
 
 fn wait_for_file(path: &Path) -> String {

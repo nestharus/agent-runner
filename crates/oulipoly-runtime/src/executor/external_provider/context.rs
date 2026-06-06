@@ -11,6 +11,7 @@
 
 use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig};
 use std::collections::HashMap;
+use std::path::Path;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -42,7 +43,7 @@ pub(crate) struct ExternalProviderDispatchInput {
 
 impl From<ExternalProviderDispatchInput> for ExternalProviderDispatchContext {
     fn from(input: ExternalProviderDispatchInput) -> Self {
-        let settings_id = input.provider.name.clone();
+        let settings_id = provider_settings_id(&input.provider);
         Self {
             model: input.model,
             provider: input.provider,
@@ -55,5 +56,41 @@ impl From<ExternalProviderDispatchInput> for ExternalProviderDispatchContext {
             start_known_provider_session_id: input.start_known_provider_session_id,
             settings_id,
         }
+    }
+}
+
+fn provider_settings_id(provider: &ProviderConfig) -> String {
+    canonical_opencode_settings_id(&provider.name, &provider.command)
+        .unwrap_or_else(|| provider.name.clone())
+}
+
+fn canonical_opencode_settings_id(name: &str, command: &str) -> Option<String> {
+    let index =
+        opencode_account_index(name).or_else(|| opencode_account_index_from_command(command))?;
+    Some(match index {
+        1 => "opencode1".to_string(),
+        other => format!("opencode{other}"),
+    })
+}
+
+fn opencode_account_index_from_command(command: &str) -> Option<u8> {
+    crate::executor::cli::shell_split(command)
+        .iter()
+        .rev()
+        .find_map(|part| opencode_account_index(part))
+}
+
+fn opencode_account_index(value: &str) -> Option<u8> {
+    let name = Path::new(value)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(value);
+    match name {
+        "opencode" | "opencode1" => Some(1),
+        "opencode2" => Some(2),
+        "opencode3" => Some(3),
+        "opencode4" => Some(4),
+        "opencode5" => Some(5),
+        _ => None,
     }
 }
