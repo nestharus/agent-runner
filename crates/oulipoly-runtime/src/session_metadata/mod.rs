@@ -545,12 +545,59 @@ pub fn resolve_resume_workspace_root(
     let resolved = state
         .resolve_resume(models, input, None)
         .map_err(map_resume_error)?;
+    if let Some(workspace_root) = external_session_runtime_workspace_root(&resolved)? {
+        return Ok(workspace_root);
+    }
     let provider = effective_provider_for_resolved(&resolved, providers_cfg)?;
     resolve_cwd_from_session_storage(
         provider.session_storage.as_ref(),
         &resolved.active_provider,
         &resolved.active_session_id,
     )
+}
+
+fn external_session_runtime_workspace_root(
+    resolved: &oulipoly_state::ResolvedResume,
+) -> Result<Option<PathBuf>, MetadataError> {
+    if !resolved_uses_external_provider(resolved) {
+        return Ok(None);
+    }
+    let Some(db) = external_session_runtime_db()? else {
+        return Ok(None);
+    };
+    let Some(row) = db
+        .session_runtime(&resolved.active_session_id)
+        .map_err(external_session_runtime_error)?
+    else {
+        return Ok(None);
+    };
+    row.effective_cwd
+        .map(validate_external_session_runtime_cwd)
+        .transpose()
+}
+
+fn external_session_runtime_db() -> Result<Option<oulipoly_state::mailbox::MailboxDb>, MetadataError>
+{
+    oulipoly_state::mailbox::MailboxDb::open_default_if_exists()
+        .map_err(external_session_runtime_error)
+}
+
+fn validate_external_session_runtime_cwd(value: String) -> Result<PathBuf, MetadataError> {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Err(MetadataError::Operational {
+            message: format!(
+                "session_runtime_effective_cwd_not_absolute: {}",
+                path.display()
+            ),
+        })
+    }
+}
+
+fn external_session_runtime_error(message: String) -> MetadataError {
+    MetadataError::Operational { message }
 }
 
 pub fn resolve_jsonl_path_for_provider_allow_missing(

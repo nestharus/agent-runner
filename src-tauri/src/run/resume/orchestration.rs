@@ -2,12 +2,14 @@
 //!
 //! `orchestration`, `validator`, `accessor`, `mapper`, `filter`, `predicate`, `formatter`
 
+use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::Path;
 
 use oulipoly_runtime::executor;
 use oulipoly_runtime::services::{
-    InvocationLifecycleServicePort, MigrationServiceOutput, ResumeServiceOutput, ServiceError,
+    ExecutorServiceRequest, InvocationLifecycleServicePort, MigrationServiceOutput,
+    ResumeServiceOutput, ServiceError,
 };
 
 use super::disposition::{
@@ -271,7 +273,7 @@ fn run_resume_attempt(
     };
     let provider_index = target.provider_index;
     let provider = target.provider;
-    let strategy = match resume_attempt_strategy(&provider) {
+    let strategy = match resume_attempt_strategy_for_target(input.resolved, &provider) {
         Ok(strategy) => strategy,
         Err(exit_code) => return Ok(ResumeAttemptLoopControl::Return(exit_code)),
     };
@@ -330,6 +332,16 @@ fn run_resume_attempt(
     })
 }
 
+fn resume_attempt_strategy_for_target<'a>(
+    resolved: &oulipoly_state::ResolvedResume,
+    provider: &'a oulipoly_config::ProviderConfig,
+) -> Result<Option<&'a oulipoly_config::ResumeStrategy>, i32> {
+    if resolved_uses_provider_ref(resolved) {
+        return Ok(None);
+    }
+    resume_attempt_strategy(provider).map(Some)
+}
+
 fn resume_attempt_strategy(
     provider: &oulipoly_config::ProviderConfig,
 ) -> Result<&oulipoly_config::ResumeStrategy, i32> {
@@ -350,8 +362,22 @@ fn execute_resume_attempt_command(
     provider_index: usize,
     prompt_mode: oulipoly_config::PromptMode,
     invocation_env: &str,
-    strategy: &oulipoly_config::ResumeStrategy,
+    strategy: Option<&oulipoly_config::ResumeStrategy>,
 ) -> Result<executor::ExecutionResult, String> {
+    if let Some(request) = provider_ref_resume_executor_request(
+        input,
+        provider,
+        provider_index,
+        prompt_mode,
+        invocation_env,
+    ) {
+        return input
+            .agent_runtime_services
+            .executor_service
+            .execute(request)
+            .map(|output| output.result)
+            .map_err(|err| err.to_string());
+    }
     executor::cli::execute_resume_optional_prompt_with_model_identity(
         provider,
         provider_index,
@@ -361,9 +387,33 @@ fn execute_resume_attempt_command(
         Some(invocation_env),
         executor::cli::ResumePayload {
             session_id: &input.resolved.active_session_id,
-            strategy,
+            strategy: strategy.expect("legacy resume target must have a resume strategy"),
         },
         input.resolved.model_name.as_deref().unwrap_or("<unknown>"),
+    )
+}
+
+fn provider_ref_resume_executor_request(
+    input: &ResumeAttemptInput<'_>,
+    provider: &oulipoly_config::ProviderConfig,
+    provider_index: usize,
+    prompt_mode: oulipoly_config::PromptMode,
+    invocation_env: &str,
+) -> Option<ExecutorServiceRequest> {
+    let model = input.resolved.model.as_ref()?;
+    model.provider.as_ref()?;
+    Some(
+        ExecutorServiceRequest::EffectiveWithStartKnownProviderSessionId {
+            model: model.clone(),
+            provider: provider.clone(),
+            provider_index,
+            prompt_mode,
+            prompt: input.answer.unwrap_or_default().to_string(),
+            working_dir: Some(input.effective_spawn_cwd.to_path_buf()),
+            extra_inputs: HashMap::new(),
+            parent_invocation_env: Some(invocation_env.to_string()),
+            start_known_provider_session_id: input.resolved.active_session_id.clone(),
+        },
     )
 }
 
@@ -710,7 +760,7 @@ fn prepare_initial_headless_resume_target(
 ) -> Result<(), i32> {
     let target = renderable_resume_execution_target(resolved, providers_cfg)?;
     render_resume_short_line_if_needed(stderr_is_terminal, &resolved.active_provider);
-    validate_headless_resume_target(&target, &resolved.active_provider)
+    validate_headless_resume_target(resolved, &target, &resolved.active_provider)
 }
 
 fn render_resume_short_line_if_needed(stderr_is_terminal: bool, selected_provider: &str) {
@@ -720,9 +770,13 @@ fn render_resume_short_line_if_needed(stderr_is_terminal: bool, selected_provide
 }
 
 fn validate_headless_resume_target(
+    resolved: &oulipoly_state::ResolvedResume,
     target: &crate::resume_cli::ResumeExecutionTarget,
     selected_provider: &str,
 ) -> Result<(), i32> {
+    if resolved_uses_provider_ref(resolved) {
+        return Ok(());
+    }
     if headless_resume_target_has_resume(target) {
         Ok(())
     } else {
@@ -748,6 +802,9 @@ fn migrate_resume_target(
     attempts: usize,
     effective_spawn_cwd: &Path,
 ) -> Result<(), i32> {
+    if should_skip_provider_ref_default_migration(resolved, manual_migrate) {
+        return Ok(());
+    }
     let migration_model = migration_model_for_attempt(env, resolved, manual_migrate, attempts);
     match dispatch_resume_migration(
         agent_runtime_services,
@@ -766,6 +823,20 @@ fn migrate_resume_target(
         Ok(MigrationServiceOutput::RotationFailed { reason }) => fail_rotation(reason),
         Err(err) => fail_migration_service(err),
     }
+}
+
+fn should_skip_provider_ref_default_migration(
+    resolved: &oulipoly_state::ResolvedResume,
+    manual_migrate: Option<&str>,
+) -> bool {
+    manual_migrate.is_none() && resolved_uses_provider_ref(resolved)
+}
+
+fn resolved_uses_provider_ref(resolved: &oulipoly_state::ResolvedResume) -> bool {
+    resolved
+        .model
+        .as_ref()
+        .is_some_and(|model| model.provider.is_some())
 }
 
 fn migration_model_for_attempt(
