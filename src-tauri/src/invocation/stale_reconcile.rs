@@ -2,7 +2,9 @@
 
 use chrono::{DateTime, Utc};
 use oulipoly_state::StateDb;
-use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRow, read_live_process_identity};
+use oulipoly_state::pid_identity::{
+    PidIdentityDb, PidIdentityRow, ProcessIdentity, read_live_process_identity,
+};
 use std::path::Path;
 
 const STALE_ERROR_CATEGORY: &str = "stale_running";
@@ -12,6 +14,18 @@ struct RunningInvocation {
     row_id: i64,
     invocation_uuid: String,
     created_at: DateTime<Utc>,
+}
+
+struct RunningInvocationRow {
+    row_id: i64,
+    invocation_uuid: String,
+    created_at_raw: String,
+}
+
+enum LiveProcessIdentityState {
+    Live(ProcessIdentity),
+    Dead,
+    Unknown,
 }
 
 pub(crate) fn reconcile_stale_running_invocations(state: &StateDb) -> Result<(), String> {
@@ -44,6 +58,13 @@ fn path_exists(path: &Path) -> bool {
 }
 
 fn running_invocations(state: &StateDb) -> Result<Vec<RunningInvocation>, String> {
+    running_invocation_rows(state)?
+        .into_iter()
+        .map(running_invocation_from_row)
+        .collect()
+}
+
+fn running_invocation_rows(state: &StateDb) -> Result<Vec<RunningInvocationRow>, String> {
     let mut stmt = state
         .connection()
         .prepare(
@@ -64,16 +85,41 @@ fn running_invocations(state: &StateDb) -> Result<Vec<RunningInvocation>, String
     rows.map(|row| {
         let (row_id, invocation_uuid, created_at_raw) =
             row.map_err(|err| format!("Failed to map stale-running row: {err}"))?;
-        let created_at = DateTime::parse_from_rfc3339(&created_at_raw)
-            .map(|timestamp| timestamp.with_timezone(&Utc))
-            .map_err(|err| format!("Failed to parse stale-running created_at: {err}"))?;
-        Ok(RunningInvocation {
+        Ok(running_invocation_row(
             row_id,
             invocation_uuid,
-            created_at,
-        })
+            created_at_raw,
+        ))
     })
     .collect()
+}
+
+fn running_invocation_row(
+    row_id: i64,
+    invocation_uuid: String,
+    created_at_raw: String,
+) -> RunningInvocationRow {
+    RunningInvocationRow {
+        row_id,
+        invocation_uuid,
+        created_at_raw,
+    }
+}
+
+fn running_invocation_from_row(row: RunningInvocationRow) -> Result<RunningInvocation, String> {
+    let created_at = parse_running_invocation_created_at(&row.created_at_raw)?;
+    Ok(RunningInvocation {
+        row_id: row.row_id,
+        invocation_uuid: row.invocation_uuid,
+        created_at,
+    })
+}
+
+fn parse_running_invocation_created_at(created_at_raw: &str) -> Result<DateTime<Utc>, String> {
+    let created_at = DateTime::parse_from_rfc3339(created_at_raw)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .map_err(|err| format!("Failed to parse stale-running created_at: {err}"))?;
+    Ok(created_at)
 }
 
 fn running_invocation_is_stale(row: &RunningInvocation, now: DateTime<Utc>) -> bool {
@@ -104,11 +150,25 @@ fn invocation_has_dead_pid_evidence(
 }
 
 fn pid_identity_row_liveness(row: &PidIdentityRow) -> Option<bool> {
-    match read_live_process_identity(row.os_pid) {
-        Ok(Some(identity)) => Some(identity == row.identity()),
-        Ok(None) => Some(false),
-        Err(_) => None,
+    match live_process_identity_state(row.os_pid) {
+        LiveProcessIdentityState::Live(identity) => {
+            Some(process_identity_matches_row(&identity, row))
+        }
+        LiveProcessIdentityState::Dead => Some(false),
+        LiveProcessIdentityState::Unknown => None,
     }
+}
+
+fn live_process_identity_state(os_pid: i64) -> LiveProcessIdentityState {
+    match read_live_process_identity(os_pid) {
+        Ok(Some(identity)) => LiveProcessIdentityState::Live(identity),
+        Ok(None) => LiveProcessIdentityState::Dead,
+        Err(_) => LiveProcessIdentityState::Unknown,
+    }
+}
+
+fn process_identity_matches_row(identity: &ProcessIdentity, row: &PidIdentityRow) -> bool {
+    identity == &row.identity()
 }
 
 fn finalize_stale_invocation(state: &StateDb, row_id: i64) -> Result<(), String> {
