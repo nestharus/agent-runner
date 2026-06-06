@@ -68,10 +68,7 @@ impl Fixture {
     fn new_with_provider_options(options: ProviderOptions) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let paths = fixture_paths(dir.path());
-        create_fixture_directories(&paths);
-        let provider_path = write_external_provider(dir.path(), &paths.record_path, options);
-        write_model_config(&paths.models_dir, &provider_path);
-        write_providers_config(&paths.app_config_dir);
+        materialize_fixture(dir.path(), &paths, options);
         fixture_from_paths(dir, paths)
     }
 
@@ -117,24 +114,19 @@ impl Fixture {
     }
 
     fn invocation_session_rows(&self) -> Vec<InvocationSessionRow> {
-        let conn = rusqlite::Connection::open(self.db_path()).unwrap();
-        let mut stmt = conn
-            .prepare(
-                "SELECT session_id, session_capture_method, provider_session_id,
-                        resume_input_id, provider_session_capture_method
-                   FROM invocations
-                   ORDER BY id",
-            )
-            .unwrap();
-        stmt.query_map([], invocation_session_row)
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap()
+        invocation_session_rows_from_db(&self.db_path())
     }
 
     fn records(&self) -> Vec<Value> {
-        parse_provider_records(&provider_record_text(&self.record_path))
+        provider_records_from_path(&self.record_path)
     }
+}
+
+fn materialize_fixture(root: &Path, paths: &FixturePaths, options: ProviderOptions) {
+    create_fixture_directories(paths);
+    let provider_path = write_external_provider(root, &paths.record_path, options);
+    write_model_config(&paths.models_dir, &provider_path);
+    write_providers_config(&paths.app_config_dir);
 }
 
 fn fixture_paths(root: &Path) -> FixturePaths {
@@ -209,6 +201,39 @@ fn fixture_from_paths(dir: tempfile::TempDir, paths: FixturePaths) -> Fixture {
     }
 }
 
+fn invocation_session_rows_from_db(path: &Path) -> Vec<InvocationSessionRow> {
+    let conn = open_invocation_db(path);
+    query_invocation_session_rows(&conn)
+}
+
+fn open_invocation_db(path: &Path) -> rusqlite::Connection {
+    rusqlite::Connection::open(path).unwrap()
+}
+
+fn query_invocation_session_rows(conn: &rusqlite::Connection) -> Vec<InvocationSessionRow> {
+    let mut stmt = invocation_session_rows_statement(conn);
+    collect_invocation_session_rows(&mut stmt)
+}
+
+fn invocation_session_rows_statement(conn: &rusqlite::Connection) -> rusqlite::Statement<'_> {
+    conn.prepare(
+        "SELECT session_id, session_capture_method, provider_session_id,
+                resume_input_id, provider_session_capture_method
+           FROM invocations
+           ORDER BY id",
+    )
+    .unwrap()
+}
+
+fn collect_invocation_session_rows(
+    stmt: &mut rusqlite::Statement<'_>,
+) -> Vec<InvocationSessionRow> {
+    stmt.query_map([], invocation_session_row)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
 fn invocation_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<InvocationSessionRow> {
     Ok(InvocationSessionRow {
         session_id: row.get(0)?,
@@ -223,11 +248,22 @@ fn provider_record_text(path: &Path) -> String {
     fs::read_to_string(path).unwrap()
 }
 
+fn provider_records_from_path(path: &Path) -> Vec<Value> {
+    parse_provider_records(&provider_record_text(path))
+}
+
 fn parse_provider_records(text: &str) -> Vec<Value> {
+    parse_provider_record_lines(provider_record_lines_with_content(text))
+}
+
+fn provider_record_lines_with_content(text: &str) -> Vec<&str> {
     text.lines()
         .filter(|line| provider_record_line_has_content(line))
-        .map(parse_provider_record)
         .collect()
+}
+
+fn parse_provider_record_lines(lines: Vec<&str>) -> Vec<Value> {
+    lines.into_iter().map(parse_provider_record).collect()
 }
 
 fn provider_record_line_has_content(line: &str) -> bool {
@@ -363,11 +399,15 @@ fn provider_record_subcommand(record: &Value) -> &str {
 
 fn assert_no_forbidden_provider_subcommands(subcommands: &[&str]) {
     assert!(
-        subcommands
-            .iter()
-            .all(|subcommand| provider_subcommand_is_allowed(subcommand)),
+        provider_subcommands_are_allowed(subcommands),
         "unexpected rotation/migration calls: {subcommands:?}"
     );
+}
+
+fn provider_subcommands_are_allowed(subcommands: &[&str]) -> bool {
+    subcommands
+        .iter()
+        .all(|subcommand| provider_subcommand_is_allowed(subcommand))
 }
 
 fn provider_subcommand_is_allowed(subcommand: &str) -> bool {

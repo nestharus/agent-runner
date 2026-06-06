@@ -1680,10 +1680,7 @@ fn assert_s7b_operation_strings_are_sanctioned_and_bounded() {
 }
 
 fn session_external_provider_sources(root: &Path) -> Vec<String> {
-    session_external_provider_source_paths(root)
-        .into_iter()
-        .map(read_session_external_provider_source)
-        .collect()
+    read_session_external_provider_sources(session_external_provider_source_paths(root))
 }
 
 fn session_external_provider_source_paths(root: &Path) -> Vec<PathBuf> {
@@ -1695,6 +1692,13 @@ fn session_external_provider_source_paths(root: &Path) -> Vec<PathBuf> {
 
 fn source_entry_path(entry: std::io::Result<fs::DirEntry>) -> PathBuf {
     entry.expect("source entry").path()
+}
+
+fn read_session_external_provider_sources(paths: Vec<PathBuf>) -> Vec<String> {
+    paths
+        .into_iter()
+        .map(read_session_external_provider_source)
+        .collect()
 }
 
 fn read_session_external_provider_source(path: PathBuf) -> String {

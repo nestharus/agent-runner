@@ -1,7 +1,8 @@
-use serde::de::{self, Deserializer};
+use serde::de::{self, Deserializer, Visitor};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::marker::PhantomData;
 
 pub const CONTRACT_VERSION: &str = "oulipoly.provider/v1";
 
@@ -61,15 +62,25 @@ impl<'de> Deserialize<'de> for TrueBool {
     where
         D: Deserializer<'de>,
     {
-        true_bool_from_value(deserialize_protocol_bool(deserializer)?)
+        deserializer.deserialize_bool(TrueBoolVisitor)
     }
 }
 
-fn deserialize_protocol_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    bool::deserialize(deserializer)
+struct TrueBoolVisitor;
+
+impl<'de> Visitor<'de> for TrueBoolVisitor {
+    type Value = TrueBool;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ok=true")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        true_bool_from_value(value)
+    }
 }
 
 fn true_bool_from_value<E>(value: bool) -> Result<TrueBool, E>
@@ -79,8 +90,12 @@ where
     if value {
         Ok(TrueBool)
     } else {
-        Err(E::custom("expected ok=true"))
+        Err(E::custom(true_bool_error()))
     }
+}
+
+fn true_bool_error() -> &'static str {
+    "expected ok=true"
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -100,7 +115,24 @@ impl<'de> Deserialize<'de> for FalseBool {
     where
         D: Deserializer<'de>,
     {
-        false_bool_from_value(deserialize_protocol_bool(deserializer)?)
+        deserializer.deserialize_bool(FalseBoolVisitor)
+    }
+}
+
+struct FalseBoolVisitor;
+
+impl<'de> Visitor<'de> for FalseBoolVisitor {
+    type Value = FalseBool;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ok=false")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        false_bool_from_value(value)
     }
 }
 
@@ -109,10 +141,14 @@ where
     E: de::Error,
 {
     if value {
-        Err(E::custom("expected ok=false"))
+        Err(E::custom(false_bool_error()))
     } else {
         Ok(FalseBool)
     }
+}
+
+fn false_bool_error() -> &'static str {
+    "expected ok=false"
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -691,18 +727,60 @@ macro_rules! fixed_str_type {
             where
                 D: Deserializer<'de>,
             {
-                deserialize_fixed_str_type(
-                    String::deserialize(deserializer)?,
-                    $value,
-                    stringify!($name),
-                )?;
-                Ok(Self)
+                deserialize_fixed_str_type(deserializer, $value, stringify!($name))
             }
         }
     };
 }
 
-fn deserialize_fixed_str_type<E>(actual: String, expected: &str, type_name: &str) -> Result<(), E>
+struct FixedStrTypeVisitor<T> {
+    expected: &'static str,
+    type_name: &'static str,
+    marker: PhantomData<T>,
+}
+
+impl<T> FixedStrTypeVisitor<T> {
+    fn new(expected: &'static str, type_name: &'static str) -> Self {
+        Self {
+            expected,
+            type_name,
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<'de, T> Visitor<'de> for FixedStrTypeVisitor<T>
+where
+    T: Default,
+{
+    type Value = T;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}={:?}", self.type_name, self.expected)
+    }
+
+    fn visit_str<E>(self, actual: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        validate_fixed_str_type(actual, self.expected, self.type_name)?;
+        Ok(T::default())
+    }
+}
+
+fn deserialize_fixed_str_type<'de, D, T>(
+    deserializer: D,
+    expected: &'static str,
+    type_name: &'static str,
+) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default,
+{
+    deserializer.deserialize_str(FixedStrTypeVisitor::new(expected, type_name))
+}
+
+fn validate_fixed_str_type<E>(actual: &str, expected: &str, type_name: &str) -> Result<(), E>
 where
     E: de::Error,
 {

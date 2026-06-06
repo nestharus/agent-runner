@@ -1,5 +1,19 @@
 # Project Decisions
 
+## D-S10B-VI-001-external-provider-schema-compatible-describe — validation-surface weakening ratification
+
+- **Source**: `planning/s10b-gate/code-quality/s10b/reports/validation-integrity-auditor.md` VI-001 / VI-s10b-001.
+- **Decision**: Ratify the host DTO broadening for `ProviderConcurrency` as compatibility with the external provider protocol schema, not a relaxation of runtime safety. The external provider protocol permits provider-specific concurrency metadata, so `safe_for_parallel_invocation` and `state_locking` must remain optional while unknown concurrency keys are preserved as metadata.
+- **Evidence**: `crates/oulipoly-provider/tests/client_invoke.rs::invoke_describe_accepts_schema_valid_freeform_concurrency_metadata`; `planning/s10b-gate/proposal.md` proof claim for schema-compatible describe; `planning/s10b-gate/contracts/s10b.contract.md` helper-shaped parser/validator declarations; `planning/s10b-gate/evidence/runtime-tests.log` isolated `cargo test --workspace`; live launch evidence in `/tmp/s10-e2e/final.log` and `/tmp/s10-e2e/final2.log` reached the external provider and returned `S10-EXTERNAL-OK`.
+- **Revisit when**: the provider protocol schema makes concurrency fields strict again or introduces a separate typed concurrency capability contract.
+
+## D-S10B-VI-002-provider-ref-resume-external-launch — validation-surface weakening ratification
+
+- **Source**: `planning/s10b-gate/code-quality/s10b/reports/validation-integrity-auditor.md` VI-002 / VI-s10b-002.
+- **Decision**: Ratify provider-ref resume bypassing legacy CLI resume-strategy validation and legacy default migration only when replacement provider-ref target validation succeeds. Provider-ref models are implemented by the external provider launch contract, so headless resume must launch externally with `known_provider_session_id` and recorded cwd instead of requiring a legacy provider `resume` block or running default migration/rotation; the target must still prove a resolved model, root provider implementation reference, valid provider index, and selected-provider identity agreement.
+- **Evidence**: `src-tauri/src/run/resume/orchestration.rs::validate_provider_ref_headless_resume_target`; `src-tauri/tests/s10_external_provider_resume.rs::external_provider_resume_without_rotate_uses_external_launch_and_recorded_cwd`; `crates/oulipoly-runtime/tests/s10_external_launch_session.rs::external_launch_exit_session_populates_capture_and_resume_request`; `planning/s10b-gate/proposal.md` proof claims for provider-ref resume path, target validation, and recorded cwd; `planning/s10b-gate/contracts/s10b.contract.md` validator/predicate/formatter declarations for the provider-ref target invariant; `planning/s10b-gate/evidence/runtime-tests.log` isolated `cargo test --workspace`.
+- **Revisit when**: provider-ref models gain a separate native resume capability distinct from external launch or when legacy migration becomes provider-ref aware.
+
 ## D-OC-VI-001-stdout-json-event-dual-shape — strict OpenCode capture support
 
 - **Source**: `planning/oc-gate/code-quality/oc/reports/validation-integrity-auditor.md` VI-001.

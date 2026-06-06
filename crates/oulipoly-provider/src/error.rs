@@ -132,11 +132,9 @@ impl ProviderCapabilityError {
         process_status: Option<ProcessStatus>,
     ) -> Result<Self, ProviderClientError> {
         let subcommand = subcommand.into();
-        let request_id = request_id_from(&envelope);
         let envelope = parse_error_response_envelope(envelope).map_err(|error| {
             schema_invalid_error_response(
                 &subcommand,
-                request_id,
                 error,
                 diagnostics.clone(),
                 process_status.clone(),
@@ -384,27 +382,45 @@ impl ProviderClientError {
     }
 }
 
+struct ErrorResponseEnvelopeParseError {
+    request_id: Option<String>,
+    error: serde_json::Error,
+}
+
 fn parse_error_response_envelope(
     envelope: Value,
-) -> Result<ErrorResponseEnvelope, serde_json::Error> {
+) -> Result<ErrorResponseEnvelope, ErrorResponseEnvelopeParseError> {
+    let request_id = request_id_from(&envelope);
     serde_json::from_value(envelope)
+        .map_err(|error| error_response_envelope_parse_error(request_id, error))
+}
+
+fn error_response_envelope_parse_error(
+    request_id: Option<String>,
+    error: serde_json::Error,
+) -> ErrorResponseEnvelopeParseError {
+    ErrorResponseEnvelopeParseError { request_id, error }
 }
 
 fn schema_invalid_error_response(
     subcommand: &str,
-    request_id: Option<String>,
-    error: serde_json::Error,
+    error: ErrorResponseEnvelopeParseError,
     diagnostics: ProviderDiagnostics,
     process_status: Option<ProcessStatus>,
 ) -> ProviderClientError {
+    let description = schema_invalid_error_response_description(&error.error);
     ProviderClientError::Protocol {
         kind: HostErrorKind::SchemaInvalidErrorResponse,
         subcommand: subcommand.to_string(),
-        request_id,
-        description: error.to_string(),
+        request_id: error.request_id,
+        description,
         diagnostics: Box::new(diagnostics),
         process_status: process_status.map(Box::new),
     }
+}
+
+fn schema_invalid_error_response_description(error: &serde_json::Error) -> String {
+    error.to_string()
 }
 
 fn capability_error_from_envelope(
@@ -433,20 +449,46 @@ fn missing_non_launch_envelope_result(
     process_status: &ProcessStatus,
     diagnostics: ProviderDiagnostics,
 ) -> Result<Value, ProviderClientError> {
+    map_missing_non_launch_envelope_result(
+        missing_non_launch_envelope_kind(process_status),
+        subcommand,
+        diagnostics,
+    )
+}
+
+enum MissingNonLaunchEnvelopeKind {
+    EmptySuccessfulStdout,
+    NonzeroProcess,
+}
+
+fn missing_non_launch_envelope_kind(
+    process_status: &ProcessStatus,
+) -> MissingNonLaunchEnvelopeKind {
     if process_status.exited_successfully() {
-        Err(ProviderClientError::protocol(
+        MissingNonLaunchEnvelopeKind::EmptySuccessfulStdout
+    } else {
+        MissingNonLaunchEnvelopeKind::NonzeroProcess
+    }
+}
+
+fn map_missing_non_launch_envelope_result(
+    kind: MissingNonLaunchEnvelopeKind,
+    subcommand: &str,
+    diagnostics: ProviderDiagnostics,
+) -> Result<Value, ProviderClientError> {
+    match kind {
+        MissingNonLaunchEnvelopeKind::EmptySuccessfulStdout => Err(ProviderClientError::protocol(
             HostErrorKind::EmptyStdout,
             subcommand,
             None,
             diagnostics,
-        ))
-    } else {
-        Err(ProviderClientError::host_transport(
+        )),
+        MissingNonLaunchEnvelopeKind::NonzeroProcess => Err(ProviderClientError::host_transport(
             HostErrorKind::ProviderProcessNonzero,
             subcommand,
             None,
             diagnostics,
-        ))
+        )),
     }
 }
 

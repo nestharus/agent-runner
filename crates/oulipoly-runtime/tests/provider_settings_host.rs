@@ -442,11 +442,10 @@ impl RebuildFixture {
     }
 
     fn subcommands_for(&self, provider_id: &str) -> Vec<String> {
-        recorded_calls(&self.record)
-            .into_iter()
-            .filter(|call| recorded_call_is_for_provider(call, provider_id))
-            .map(recorded_call_subcommand)
-            .collect()
+        recorded_call_subcommands(recorded_calls_for_provider(
+            recorded_calls(&self.record),
+            provider_id,
+        ))
     }
 }
 
@@ -466,8 +465,19 @@ fn parse_recorded_call(line: &str) -> RecordedCall {
     serde_json::from_str::<RecordedCall>(line).unwrap()
 }
 
+fn recorded_calls_for_provider(calls: Vec<RecordedCall>, provider_id: &str) -> Vec<RecordedCall> {
+    calls
+        .into_iter()
+        .filter(|call| recorded_call_is_for_provider(call, provider_id))
+        .collect()
+}
+
 fn recorded_call_is_for_provider(call: &RecordedCall, provider_id: &str) -> bool {
     call.request["provider_instance_id"] == provider_id
+}
+
+fn recorded_call_subcommands(calls: Vec<RecordedCall>) -> Vec<String> {
+    calls.into_iter().map(recorded_call_subcommand).collect()
 }
 
 fn recorded_call_subcommand(call: RecordedCall) -> String {

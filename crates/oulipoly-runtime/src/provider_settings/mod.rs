@@ -101,9 +101,16 @@ impl ProviderSettingsHost {
         &self,
         model_name: &str,
     ) -> Result<ProviderSettingsTarget, ProviderSettingsError> {
-        if let Some(target) = self.cached_settings_target(model_name) {
-            return Ok(target);
+        match self.cached_settings_target(model_name) {
+            Some(target) => Ok(target),
+            None => self.describe_uncached_settings_target(model_name),
         }
+    }
+
+    fn describe_uncached_settings_target(
+        &self,
+        model_name: &str,
+    ) -> Result<ProviderSettingsTarget, ProviderSettingsError> {
         let target = self.load_settings_target(model_name)?;
         self.cache_settings_target(model_name, &target);
         Ok(target)
