@@ -86,6 +86,7 @@ impl AgentRuntimeServices {
     pub fn cli_defaults() -> Self {
         let paths = default_cli_runtime_paths();
         let provider_registry_options = ProviderRegistryOptions::default()
+            .with_path_entries_from_process_path()
             .with_config_root(paths.config_root.clone())
             .with_data_root(paths.data_root.clone());
         let provider_registry = Arc::new(production_provider_registry(
@@ -144,6 +145,7 @@ impl AgentRuntimeServices {
     pub fn production(paths: RuntimePaths) -> Result<Self, String> {
         prepare_runtime_directories(&paths)?;
         let registry_options = ProviderRegistryOptions::default()
+            .with_path_entries_from_process_path()
             .with_config_root(paths.config_root.clone())
             .with_data_root(paths.data_root.clone());
         let provider_registry = Arc::new(production_provider_registry(

@@ -144,6 +144,7 @@ fn build_session_locate_provider_registry(
     ProviderRegistry::from_model_configs(
         &models.values().cloned().collect::<Vec<_>>(),
         ProviderRegistryOptions::default()
+            .with_path_entries_from_process_path()
             .with_config_root(config_root)
             .with_data_root(default_data_root()?),
     )

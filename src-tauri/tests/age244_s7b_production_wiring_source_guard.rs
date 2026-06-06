@@ -186,6 +186,50 @@ fn s7b_cli_defaults_builds_populated_default_path_provider_registry() {
     );
 }
 
+#[test]
+fn s10_production_provider_registries_populate_path_entries_from_process_path() {
+    let wiring = read_source("src-tauri/src/wiring.rs");
+    let cli_defaults = source_between(
+        &wiring,
+        "pub fn cli_defaults() -> Self",
+        "pub fn production(",
+    );
+    let production = source_between(
+        &wiring,
+        "pub fn production(",
+        "fn default_cli_runtime_paths()",
+    );
+
+    for (context, source) in [
+        ("wiring.rs::cli_defaults", cli_defaults),
+        ("wiring.rs::production", production),
+    ] {
+        assert_contains(context, source, ".with_path_entries_from_process_path()");
+    }
+
+    let locate_export =
+        read_source("src-tauri/src/commands/session_locate_export/orchestration.rs");
+    assert_contains(
+        "session_locate_export/orchestration.rs::build_session_locate_provider_registry",
+        &locate_export,
+        ".with_path_entries_from_process_path()",
+    );
+
+    let app_state = read_source("src-tauri/src/app_state.rs");
+    assert_contains(
+        "app_state.rs::provider_registry_options",
+        &app_state,
+        ".with_path_entries_from_process_path()",
+    );
+
+    let provider_settings = read_source("src-tauri/src/commands/provider_settings.rs");
+    assert_contains(
+        "provider_settings.rs::host_options",
+        &provider_settings,
+        ".with_path_entries_from_process_path()",
+    );
+}
+
 fn read_source(relative: &str) -> String {
     std::fs::read_to_string(workspace_root().join(relative))
         .unwrap_or_else(|error| panic!("failed to read {relative}: {error}"))

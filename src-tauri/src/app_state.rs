@@ -238,6 +238,7 @@ fn provider_registry_options(models_dir: &Path) -> ProviderRegistryOptions {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
     ProviderRegistryOptions::default()
+        .with_path_entries_from_process_path()
         .with_config_root(root.clone())
         .with_data_root(root)
 }

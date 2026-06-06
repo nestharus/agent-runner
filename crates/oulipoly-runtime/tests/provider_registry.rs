@@ -737,6 +737,57 @@ fn enabled_ref_flavors_resolve_describe_and_parse_capability_description() {
 }
 
 #[test]
+fn binary_ref_resolves_from_process_path_entries() {
+    let temp = tempfile::tempdir().unwrap();
+    let count = temp.path().join("process-path-count");
+    write_fake_provider_script(
+        temp.path(),
+        "agent-runner-fixture",
+        &count,
+        Ok("path-provider"),
+    );
+    let path_env = std::env::join_paths([temp.path()]).expect("fixture PATH should join");
+
+    let registry = registry_from_single_ref(
+        binary_ref("agent-runner-fixture"),
+        ProviderRegistryOptions::default().with_path_entries_from_path_env(Some(path_env)),
+    );
+
+    let result = registry
+        .describe_model_provider("example-model")
+        .expect("binary provider should resolve through PATH-derived entries");
+    assert_eq!(result.provider_id, "path-provider");
+    assert_eq!(read_count(&count), 1);
+}
+
+#[test]
+fn absent_binary_from_process_path_entries_preserves_missing_artifact() {
+    let temp = tempfile::tempdir().unwrap();
+    let path_env = std::env::join_paths([temp.path()]).expect("fixture PATH should join");
+
+    let error = registry_from_single_ref(
+        binary_ref("agent-runner-fixture"),
+        ProviderRegistryOptions::default().with_path_entries_from_path_env(Some(path_env)),
+    )
+    .describe_model_provider("example-model")
+    .expect_err("absent binary should remain a missing artifact");
+
+    assert_transport_kind(error, "missing_artifact");
+}
+
+#[test]
+fn unset_process_path_entries_preserves_missing_artifact_without_panic() {
+    let error = registry_from_single_ref(
+        binary_ref("agent-runner-fixture"),
+        ProviderRegistryOptions::default().with_path_entries_from_path_env(None),
+    )
+    .describe_model_provider("example-model")
+    .expect_err("unset PATH should not resolve binary provider refs");
+
+    assert_transport_kind(error, "missing_artifact");
+}
+
+#[test]
 fn describe_propagates_settings_capability_and_schema_id() {
     let temp = tempfile::tempdir().unwrap();
     let count = temp.path().join("describe-count");

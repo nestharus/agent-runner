@@ -385,6 +385,7 @@ pub fn host_options(models_dir: &Path) -> ProviderSettingsHostOptions {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| Path::new(".").to_path_buf());
     ProviderSettingsHostOptions::default()
+        .with_path_entries_from_process_path()
         .with_config_root(config_root.clone())
         .with_data_root(config_root)
 }

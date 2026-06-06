@@ -55,6 +55,11 @@ pub struct ProviderSettingsProcessStatus {
 }
 
 impl ProviderSettingsHostOptions {
+    pub fn with_path_entries_from_process_path(mut self) -> Self {
+        self.registry = self.registry.with_path_entries_from_process_path();
+        self
+    }
+
     pub fn with_config_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.registry = self.registry.with_config_root(root);
         self
