@@ -1,0 +1,80 @@
+# plk gate runtime evidence
+
+XDG isolation root: /tmp/tmp.GbqdnGOHqh
+OULIPOLY_DATA_DIR: removed via env -u
+AGENT_BASH_BIN: /home/nes/.local/bin/agent-bash
+Code state: post fail-closed nested agent-bash validation and stale-reconcile helper split.
+
+## pr_a_invocation_integration
+
+$ env -u OULIPOLY_DATA_DIR XDG_CONFIG_HOME="$tmpdir/config" XDG_DATA_HOME="$tmpdir/data" XDG_CACHE_HOME="$tmpdir/cache" XDG_STATE_HOME="$tmpdir/state" AGENT_BASH_BIN="/home/nes/.local/bin/agent-bash" cargo test -p oulipoly-agent-runner --test pr_a_invocation_integration
+
+   Compiling oulipoly-agent-runner v0.1.0 (/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.94s
+     Running tests/pr_a_invocation_integration.rs (src-tauri/target/debug/deps/pr_a_invocation_integration-e86d8a04823f04ed)
+
+running 13 tests
+test direct_provider_spawn_error_finalizes_failed_row_with_spawn_error_reason ... ok
+test direct_provider_nonzero_exit_finalizes_failed_row_with_child_exit_code ... ok
+test t_fence_own_row_after_wait_finalizes_even_with_malformed_child_marker_noise ... ok
+test emits_single_invocation_line_and_finalizes_succeeded_row ... ok
+test direct_provider_raw_signal_finalizes_failed_row_with_unified_signal_exit_code ... ok
+test t_fence_supervisor_ignores_captured_row_without_current_parent_lineage ... ok
+test t_fence_supervisor_signal_parent_finalizes_captured_child_with_signal_reason ... ok
+test t_fence_supervisor_clean_child_finalizes_captured_running_child_row ... ok
+test t_fence_supervisor_noop_if_captured_child_row_already_finalized ... ok
+test resolves_parent_env_and_overwrites_child_subprocess_env ... ok
+test direct_run_preserves_existing_history_with_invocation_count_sentinel ... ok
+test ignores_malformed_and_unresolved_parent_env_values ... ok
+test nested_agent_bash_chain_records_parent_id_from_inherited_env ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
+
+
+
+## pr_b_trace_integration
+
+$ env -u OULIPOLY_DATA_DIR XDG_CONFIG_HOME="$tmpdir/config" XDG_DATA_HOME="$tmpdir/data" XDG_CACHE_HOME="$tmpdir/cache" XDG_STATE_HOME="$tmpdir/state" AGENT_BASH_BIN="/home/nes/.local/bin/agent-bash" cargo test -p oulipoly-agent-runner --test pr_b_trace_integration
+
+   Compiling oulipoly-agent-runner v0.1.0 (/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.56s
+     Running tests/pr_b_trace_integration.rs (src-tauri/target/debug/deps/pr_b_trace_integration-e60c827c982a5715)
+
+running 11 tests
+test default_cli_flow_still_runs_without_subcommand ... ok
+test trace_malformed_uuid_prints_clear_error ... ok
+test trace_json_running_row_uses_null_terminal_fields_and_no_stale_warning ... ok
+test inline_transcript_with_json_is_accepted_and_returns_empty_arrays_without_turn_rows ... ok
+test inline_transcript_requires_json ... ok
+test trace_nonexistent_uuid_exits_one_and_keeps_stdout_empty ... ok
+test trace_ascii_dispatches_and_prints_seeded_root ... ok
+test trace_json_stale_running_row_is_lifted_without_mutating_db ... ok
+test trace_json_dispatches_and_returns_structured_root ... ok
+test trace_accepts_max_depth_flag ... ok
+test trace_reconciles_liveness_stale_running_row_with_dead_pid ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.33s
+
+
+
+## dispatch_parent_resolution_units
+
+$ env -u OULIPOLY_DATA_DIR XDG_CONFIG_HOME="$tmpdir/config" XDG_DATA_HOME="$tmpdir/data" XDG_CACHE_HOME="$tmpdir/cache" XDG_STATE_HOME="$tmpdir/state" AGENT_BASH_BIN="/home/nes/.local/bin/agent-bash" cargo test -p oulipoly-agent-runner --bin oulipoly-agent-runner resolve_parent_invocation_id
+
+   Compiling oulipoly-agent-runner v0.1.0 (/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.60s
+     Running unittests src/main.rs (src-tauri/target/debug/deps/oulipoly_agent_runner-af014df39f76f625)
+
+running 6 tests
+test dispatch::tests::resolve_parent_invocation_id_returns_none_for_unknown_uuid ... ok
+test dispatch::tests::resolve_parent_invocation_id_returns_existing_parent_rowid ... ok
+test dispatch::tests::resolve_parent_invocation_id_returns_none_when_env_is_unset ... ok
+test dispatch::tests::resolve_parent_invocation_id_returns_none_for_malformed_json ... ok
+test dispatch::tests::resolve_parent_invocation_id_returns_none_for_invalid_uuid_format ... ok
+test dispatch::tests::resolve_parent_invocation_id_uses_same_db_uuid_despite_source_name_drift ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 130 filtered out; finished in 0.14s
+
+
+
+Runtime evidence commands completed with rc 0.

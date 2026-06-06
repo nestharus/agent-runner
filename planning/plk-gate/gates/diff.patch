@@ -1,0 +1,615 @@
+diff --git a/src-tauri/src/commands/trace/accessor.rs b/src-tauri/src/commands/trace/accessor.rs
+index 7cbd49f..41740f3 100644
+--- a/src-tauri/src/commands/trace/accessor.rs
++++ b/src-tauri/src/commands/trace/accessor.rs
+@@ -1,4 +1,4 @@
+-//! Declared roles: accessor
++//! Declared roles: accessor, orchestration
+ 
+ use oulipoly_state::StateDb;
+ use std::path::Path;
+@@ -10,6 +10,7 @@ pub(super) struct TraceEnvironment {
+ 
+ pub(super) fn load_trace_environment() -> Result<TraceEnvironment, String> {
+     let state = StateDb::open_default()?;
++    crate::invocation::stale_reconcile::reconcile_stale_running_invocations(&state)?;
+     let sessions_path = crate::cli::paths::default_config_root().join("sessions.toml");
+     let sessions_cfg = load_trace_sessions_config(&sessions_path)?;
+     Ok(super::mapper::trace_environment(state, sessions_cfg))
+diff --git a/src-tauri/src/dispatch.rs b/src-tauri/src/dispatch.rs
+index 222d3aa..cd33938 100644
+--- a/src-tauri/src/dispatch.rs
++++ b/src-tauri/src/dispatch.rs
+@@ -1000,6 +1000,31 @@ mod tests {
+         });
+     }
+ 
++    #[test]
++    fn resolve_parent_invocation_id_uses_same_db_uuid_despite_source_name_drift() {
++        let db = test_db();
++        let parent = CompositeInvocationId {
++            source: "renamed-provider".to_string(),
++            id: Uuid::new_v4().to_string(),
++        };
++        let row_id = db
++            .start_invocation(&InvocationStart {
++                invocation_uuid: parent.id.clone(),
++                model_name: "fixture-model".to_string(),
++                provider_name: "fixture-provider".to_string(),
++                provider_index: 0,
++                parent_invocation_id: None,
++            })
++            .unwrap();
++        db.finalize_invocation(row_id, false, 1, None, Some("exit_nonzero"))
++            .unwrap();
++        let parent_env = serde_json::to_string(&parent).unwrap();
++
++        with_parent_invocation_env(Some(&parent_env), || {
++            assert_eq!(resolve_parent_invocation_id(&db), Some(row_id));
++        });
++    }
++
+     #[test]
+     fn resolve_parent_invocation_id_returns_none_for_malformed_json() {
+         let db = test_db();
+diff --git a/src-tauri/src/dispatch/parent_invocation.rs b/src-tauri/src/dispatch/parent_invocation.rs
+index 1868f87..b2144cc 100644
+--- a/src-tauri/src/dispatch/parent_invocation.rs
++++ b/src-tauri/src/dispatch/parent_invocation.rs
+@@ -5,12 +5,7 @@ use oulipoly_state::{CompositeInvocationId, InvocationRecord, StateDb};
+ pub(crate) fn resolve_parent_invocation_id(state: &StateDb) -> Option<i64> {
+     let raw_parent = read_parent_invocation_env()?;
+     let composite = super::parser::parse_parent_invocation_env(&raw_parent)?;
+-    let record = lookup_parent_invocation_record(state, &composite)?;
+-    if super::predicate::parent_invocation_source_matches(&record, &composite) {
+-        Some(record.id)
+-    } else {
+-        None
+-    }
++    lookup_parent_invocation_record(state, &composite).map(|record| record.id)
+ }
+ 
+ fn read_parent_invocation_env() -> Option<String> {
+diff --git a/src-tauri/src/dispatch/predicate.rs b/src-tauri/src/dispatch/predicate.rs
+index 61a0a75..304ffb5 100644
+--- a/src-tauri/src/dispatch/predicate.rs
++++ b/src-tauri/src/dispatch/predicate.rs
+@@ -1,7 +1,6 @@
+ //! Declared roles: predicate, accessor
+ 
+ use oulipoly_config::ModelConfig;
+-use oulipoly_state::{CompositeInvocationId, InvocationRecord};
+ use std::collections::HashMap;
+ 
+ pub(crate) fn diagnostics_model_configured(models: &HashMap<String, ModelConfig>) -> bool {
+@@ -23,10 +22,3 @@ pub(crate) fn should_emit_resume_short_line(_is_terminal: bool) -> bool {
+ pub(crate) fn execution_succeeded(exit_code: i32) -> bool {
+     exit_code == 0
+ }
+-
+-pub(super) fn parent_invocation_source_matches(
+-    record: &InvocationRecord,
+-    composite: &CompositeInvocationId,
+-) -> bool {
+-    record.provider_name.as_deref() == Some(composite.source.as_str())
+-}
+diff --git a/src-tauri/src/invocation/mod.rs b/src-tauri/src/invocation/mod.rs
+index 727b4e6..c186781 100644
+--- a/src-tauri/src/invocation/mod.rs
++++ b/src-tauri/src/invocation/mod.rs
+@@ -1,2 +1,3 @@
+ pub(crate) mod finalize;
+ pub(crate) mod result_envelope;
++pub(crate) mod stale_reconcile;
+diff --git a/src-tauri/src/invocation/stale_reconcile.rs b/src-tauri/src/invocation/stale_reconcile.rs
+new file mode 100644
+index 0000000..f1452b2
+--- /dev/null
++++ b/src-tauri/src/invocation/stale_reconcile.rs
+@@ -0,0 +1,244 @@
++//! Conservative stale-running invocation reconciliation.
++//!
++//! Declared roles: orchestration, accessor, mapper, parser, predicate, formatter
++
++use chrono::{DateTime, Utc};
++use oulipoly_state::StateDb;
++use oulipoly_state::pid_identity::{
++    PidIdentityDb, PidIdentityRow, ProcessIdentity, read_live_process_identity,
++};
++use std::path::Path;
++
++const STALE_ERROR_CATEGORY: &str = "stale_running";
++const STALE_TERMINAL_REASON: &str = "stale_running_liveness";
++
++struct RunningInvocation {
++    row_id: i64,
++    invocation_uuid: String,
++    created_at: DateTime<Utc>,
++}
++
++struct RunningInvocationRow {
++    row_id: i64,
++    invocation_uuid: String,
++    created_at_raw: String,
++}
++
++enum LiveProcessIdentityState {
++    Live(ProcessIdentity),
++    Dead,
++    Unknown,
++}
++
++pub(crate) fn reconcile_stale_running_invocations(state: &StateDb) -> Result<(), String> {
++    let Some(sidecar) = open_pid_sidecar_read_only_optional()? else {
++        return Ok(());
++    };
++    let now = Utc::now();
++    for row in running_invocations(state)? {
++        if !running_invocation_is_stale(&row, now) {
++            continue;
++        }
++        if !invocation_has_dead_pid_evidence(&sidecar, &row.invocation_uuid)? {
++            continue;
++        }
++        finalize_stale_invocation(state, row.row_id)?;
++    }
++    Ok(())
++}
++
++fn open_pid_sidecar_read_only_optional() -> Result<Option<PidIdentityDb>, String> {
++    let path = PidIdentityDb::default_path()?;
++    if !path_exists(&path) {
++        return Ok(None);
++    }
++    PidIdentityDb::open_read_only(&path).map(Some)
++}
++
++fn path_exists(path: &Path) -> bool {
++    path.exists()
++}
++
++fn running_invocations(state: &StateDb) -> Result<Vec<RunningInvocation>, String> {
++    running_invocation_rows(state)?
++        .into_iter()
++        .map(running_invocation_from_row)
++        .collect()
++}
++
++fn running_invocation_rows(state: &StateDb) -> Result<Vec<RunningInvocationRow>, String> {
++    running_invocation_row_values(state)?
++        .into_iter()
++        .map(running_invocation_row_from_values)
++        .collect()
++}
++
++fn running_invocation_row_values(
++    state: &StateDb,
++) -> Result<Vec<RunningInvocationRowValues>, String> {
++    let mut stmt = state
++        .connection()
++        .prepare(
++            "SELECT id, invocation_uuid, created_at
++             FROM invocations
++             WHERE status = 'running' AND finished_at IS NULL",
++        )
++        .map_err(format_stale_running_prepare_error)?;
++    let rows = stmt
++        .query_map([], |row| {
++            Ok(running_invocation_row_value(
++                row.get(0)?,
++                row.get(1)?,
++                row.get(2)?,
++            ))
++        })
++        .map_err(format_stale_running_query_error)?;
++    rows.map(|row| row.map_err(format_stale_running_row_error))
++        .collect()
++}
++
++struct RunningInvocationRowValues {
++    row_id: i64,
++    invocation_uuid: String,
++    created_at_raw: String,
++}
++
++fn running_invocation_row_value(
++    row_id: i64,
++    invocation_uuid: String,
++    created_at_raw: String,
++) -> RunningInvocationRowValues {
++    RunningInvocationRowValues {
++        row_id,
++        invocation_uuid,
++        created_at_raw,
++    }
++}
++
++fn running_invocation_row_from_values(
++    values: RunningInvocationRowValues,
++) -> Result<RunningInvocationRow, String> {
++    Ok(running_invocation_row(
++        values.row_id,
++        values.invocation_uuid,
++        values.created_at_raw,
++    ))
++}
++
++fn format_stale_running_prepare_error(err: impl std::fmt::Display) -> String {
++    format!("Failed to prepare stale-running query: {err}")
++}
++
++fn format_stale_running_query_error(err: impl std::fmt::Display) -> String {
++    format!("Failed to query stale-running rows: {err}")
++}
++
++fn format_stale_running_row_error(err: impl std::fmt::Display) -> String {
++    format!("Failed to map stale-running row: {err}")
++}
++
++fn running_invocation_row(
++    row_id: i64,
++    invocation_uuid: String,
++    created_at_raw: String,
++) -> RunningInvocationRow {
++    RunningInvocationRow {
++        row_id,
++        invocation_uuid,
++        created_at_raw,
++    }
++}
++
++fn running_invocation_from_row(row: RunningInvocationRow) -> Result<RunningInvocation, String> {
++    let created_at = parse_running_invocation_created_at(&row.created_at_raw)?;
++    Ok(RunningInvocation {
++        row_id: row.row_id,
++        invocation_uuid: row.invocation_uuid,
++        created_at,
++    })
++}
++
++fn parse_running_invocation_created_at(created_at_raw: &str) -> Result<DateTime<Utc>, String> {
++    let created_at = DateTime::parse_from_rfc3339(created_at_raw)
++        .map(|timestamp| timestamp.with_timezone(&Utc))
++        .map_err(|err| format!("Failed to parse stale-running created_at: {err}"))?;
++    Ok(created_at)
++}
++
++fn running_invocation_is_stale(row: &RunningInvocation, now: DateTime<Utc>) -> bool {
++    let age_seconds = now
++        .signed_duration_since(row.created_at)
++        .num_seconds()
++        .max(0) as u64;
++    age_seconds >= oulipoly_runtime::trace::STALE_RUNNING_THRESHOLD_SECONDS
++}
++
++fn invocation_has_dead_pid_evidence(
++    sidecar: &PidIdentityDb,
++    invocation_uuid: &str,
++) -> Result<bool, String> {
++    let rows = pid_identity_rows_for_invocation(sidecar, invocation_uuid)?;
++    Ok(pid_identity_rows_have_dead_evidence(&rows))
++}
++
++fn pid_identity_rows_for_invocation(
++    sidecar: &PidIdentityDb,
++    invocation_uuid: &str,
++) -> Result<Vec<PidIdentityRow>, String> {
++    sidecar.lookup_by_invocation_uuid(invocation_uuid)
++}
++
++fn pid_identity_rows_have_dead_evidence(rows: &[PidIdentityRow]) -> bool {
++    if rows.is_empty() {
++        return false;
++    }
++    let mut has_dead_evidence = false;
++    for row in rows {
++        match pid_identity_row_liveness(row) {
++            Some(true) => return false,
++            Some(false) => has_dead_evidence = true,
++            None => return false,
++        }
++    }
++    has_dead_evidence
++}
++
++fn pid_identity_row_liveness(row: &PidIdentityRow) -> Option<bool> {
++    match live_process_identity_state(row.os_pid) {
++        LiveProcessIdentityState::Live(identity) => {
++            Some(process_identity_matches_row(&identity, row))
++        }
++        LiveProcessIdentityState::Dead => Some(false),
++        LiveProcessIdentityState::Unknown => None,
++    }
++}
++
++fn live_process_identity_state(os_pid: i64) -> LiveProcessIdentityState {
++    match read_live_process_identity(os_pid) {
++        Ok(Some(identity)) => LiveProcessIdentityState::Live(identity),
++        Ok(None) => LiveProcessIdentityState::Dead,
++        Err(_) => LiveProcessIdentityState::Unknown,
++    }
++}
++
++fn process_identity_matches_row(identity: &ProcessIdentity, row: &PidIdentityRow) -> bool {
++    identity == &row.identity()
++}
++
++fn finalize_stale_invocation(state: &StateDb, row_id: i64) -> Result<(), String> {
++    match state.finalize_invocation(
++        row_id,
++        false,
++        -1,
++        Some(STALE_ERROR_CATEGORY),
++        Some(STALE_TERMINAL_REASON),
++    ) {
++        Ok(()) => Ok(()),
++        Err(err) if invocation_already_finalized(&err) => Ok(()),
++        Err(err) => Err(err),
++    }
++}
++
++fn invocation_already_finalized(err: &str) -> bool {
++    err.contains("already finalized")
++}
+diff --git a/src-tauri/tests/pr_a_invocation_integration.rs b/src-tauri/tests/pr_a_invocation_integration.rs
+index 06be04e..e57f861 100644
+--- a/src-tauri/tests/pr_a_invocation_integration.rs
++++ b/src-tauri/tests/pr_a_invocation_integration.rs
+@@ -5,12 +5,14 @@ use rusqlite::params;
+ use serde_json::Value;
+ use std::fs;
+ use std::os::unix::fs::PermissionsExt;
+-use std::path::PathBuf;
++use std::path::{Path, PathBuf};
+ use std::process::{Command, Output};
++use std::time::{Duration, Instant};
+ 
+ // These tests start with an empty invocation table. When a child row is seeded
+ // before the CLI run, the supervised parent row created by that run receives id 2.
+ const FIRST_PARENT_ROW_ID_IN_FRESH_FIXTURE: i64 = 2;
++const AGENT_BASH_BIN_ENV: &str = "AGENT_BASH_BIN";
+ 
+ struct Fixture {
+     _dir: tempfile::TempDir,
+@@ -84,6 +86,10 @@ prompt_mode = "arg"
+             .join("state.db")
+     }
+ 
++    fn state_home(&self) -> PathBuf {
++        self._dir.path().join("state")
++    }
++
+     fn open_db(&self) -> StateDb {
+         StateDb::open(&self.db_path()).unwrap()
+     }
+@@ -106,6 +112,89 @@ prompt_mode = "arg"
+     }
+ }
+ 
++fn run_agent_bash_nested_child(
++    fixture: &Fixture,
++    parent_env: &str,
++    agent_bash_bin: &Path,
++) -> String {
++    let command = nested_child_command(fixture);
++    let mut run = Command::new(agent_bash_bin);
++    run.arg("run").arg("--").arg("bash").arg("-lc").arg(command);
++    configure_agent_bash_env(&mut run, fixture, parent_env);
++    let output = run.output().unwrap();
++    assert!(output.status.success(), "{output:?}");
++    let dispatch: Value = serde_json::from_slice(&output.stdout).unwrap();
++    let handle = dispatch["handle"].as_str().expect("agent-bash handle");
++    wait_for_agent_bash_done(fixture, agent_bash_bin, handle)
++}
++
++fn nested_child_command(fixture: &Fixture) -> String {
++    format!(
++        "{} --models-dir {} --model fixture ping",
++        shell_quote(env!("CARGO_BIN_EXE_oulipoly-agent-runner")),
++        shell_quote(&fixture.models_dir.to_string_lossy())
++    )
++}
++
++fn shell_quote(value: &str) -> String {
++    format!("'{}'", value.replace('\'', "'\\''"))
++}
++
++fn configure_agent_bash_env(command: &mut Command, fixture: &Fixture, parent_env: &str) {
++    command.env("XDG_CONFIG_HOME", &fixture.config_home);
++    command.env("XDG_DATA_HOME", &fixture.data_home);
++    command.env("XDG_STATE_HOME", fixture.state_home());
++    command.env("OULIPOLY_PARENT_INVOCATION", parent_env);
++    command.env_remove("OULIPOLY_DATA_DIR");
++}
++
++fn wait_for_agent_bash_done(fixture: &Fixture, agent_bash_bin: &Path, handle: &str) -> String {
++    let deadline = Instant::now() + Duration::from_secs(10);
++    let mut last = String::new();
++    while Instant::now() < deadline {
++        last = agent_bash_status(fixture, agent_bash_bin, handle);
++        if last.starts_with("DONE") {
++            return last;
++        }
++        std::thread::sleep(Duration::from_millis(100));
++    }
++    panic!("agent-bash job did not finish: {last}");
++}
++
++fn agent_bash_status(fixture: &Fixture, agent_bash_bin: &Path, handle: &str) -> String {
++    let mut status = Command::new(agent_bash_bin);
++    status.arg("status").arg("--full").arg(handle);
++    status.env("XDG_STATE_HOME", fixture.state_home());
++    let output = status.output().unwrap();
++    assert!(output.status.success(), "{output:?}");
++    String::from_utf8_lossy(&output.stdout).to_string()
++}
++
++fn agent_bash_bin_from_env() -> PathBuf {
++    let value = std::env::var_os(AGENT_BASH_BIN_ENV)
++        .map(PathBuf::from)
++        .or_else(find_agent_bash_in_path)
++        .unwrap_or_else(|| {
++            panic!("{AGENT_BASH_BIN_ENV} must point to an agent-bash binary or agent-bash must be on PATH")
++        });
++    assert_agent_bash_bin(&value);
++    value
++}
++
++fn find_agent_bash_in_path() -> Option<PathBuf> {
++    let path = std::env::var_os("PATH")?;
++    std::env::split_paths(&path)
++        .map(|dir| dir.join("agent-bash"))
++        .find(|path| path.is_file())
++}
++
++fn assert_agent_bash_bin(path: &Path) {
++    assert!(
++        path.is_file(),
++        "{AGENT_BASH_BIN_ENV} must point to an agent-bash binary"
++    );
++}
++
+ fn parse_invocation(stderr: &str) -> CompositeInvocationId {
+     let lines: Vec<&str> = stderr
+         .lines()
+@@ -251,6 +340,37 @@ fn resolves_parent_env_and_overwrites_child_subprocess_env() {
+     );
+ }
+ 
++#[test]
++fn nested_agent_bash_chain_records_parent_id_from_inherited_env() {
++    let agent_bash_bin = agent_bash_bin_from_env();
++    let fixture = Fixture::new();
++
++    let parent_output = fixture.run(None);
++    assert!(parent_output.status.success());
++    let parent = parse_invocation(&String::from_utf8_lossy(&parent_output.stderr));
++    let parent_row = fixture
++        .open_db()
++        .get_invocation_by_uuid(&parent.id)
++        .unwrap()
++        .unwrap();
++    assert_eq!(parent_row.status, InvocationStatus::Succeeded);
++    let parent_env = serde_json::to_string(&parent).unwrap();
++
++    let status = run_agent_bash_nested_child(&fixture, &parent_env, &agent_bash_bin);
++
++    assert!(status.starts_with("DONE rc=0"), "{status}");
++    let child = parse_valid_invocations(&status)
++        .into_iter()
++        .find(|invocation| invocation.id != parent.id)
++        .expect("nested child invocation marker should be captured");
++    let child_row = fixture
++        .open_db()
++        .get_invocation_by_uuid(&child.id)
++        .unwrap()
++        .unwrap();
++    assert_eq!(child_row.parent_invocation_id, Some(parent_row.id));
++}
++
+ #[test]
+ fn ignores_malformed_and_unresolved_parent_env_values() {
+     let fixture = Fixture::new();
+diff --git a/src-tauri/tests/pr_b_trace_integration.rs b/src-tauri/tests/pr_b_trace_integration.rs
+index 133297c..0828fe7 100644
+--- a/src-tauri/tests/pr_b_trace_integration.rs
++++ b/src-tauri/tests/pr_b_trace_integration.rs
+@@ -1,6 +1,7 @@
+ #![cfg(unix)]
+ 
+ use chrono::{Duration, Utc};
++use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRecord, ProcessIdentity};
+ use oulipoly_state::{InvocationStart, InvocationStatus, StateDb};
+ use rusqlite::params;
+ use serde_json::Value;
+@@ -74,6 +75,12 @@ prompt_mode = "arg"
+             .join("state.db")
+     }
+ 
++    fn sidecar_path(&self) -> PathBuf {
++        self.data_home
++            .join("oulipoly-agent-runner")
++            .join("pid-identity.db")
++    }
++
+     fn open_db(&self) -> StateDb {
+         StateDb::open(&self.db_path()).unwrap()
+     }
+@@ -124,7 +131,7 @@ prompt_mode = "arg"
+         .unwrap();
+     }
+ 
+-    fn seed_stale_running_trace_row(&self) {
++    fn seed_stale_running_trace_row(&self) -> i64 {
+         let db = self.open_db();
+         let row_id = db
+             .start_invocation(&InvocationStart {
+@@ -142,6 +149,28 @@ prompt_mode = "arg"
+                 params![created_at, row_id],
+             )
+             .unwrap();
++        row_id
++    }
++
++    fn seed_stale_running_trace_row_with_dead_pid(&self) {
++        self.seed_stale_running_trace_row();
++        let sidecar = PidIdentityDb::open(&self.sidecar_path()).unwrap();
++        let identity = ProcessIdentity {
++            os_pid: 9_999_999,
++            os_boot_id: "fixture-boot".to_string(),
++            os_pid_starttime_ticks: 1,
++        };
++        sidecar
++            .record_identity(PidIdentityRecord {
++                identity: &identity,
++                os_pgid: None,
++                invocation_uuid: ROOT_UUID,
++                session_id: None,
++                provider_name: Some("fixture-provider"),
++                model_name: Some("fixture"),
++                recorded_at: "2026-04-17T08:00:00Z",
++            })
++            .unwrap();
+     }
+ 
+     fn run_trace(&self, extra_args: &[&str]) -> Output {
+@@ -279,6 +308,39 @@ fn trace_json_stale_running_row_is_lifted_without_mutating_db() {
+     assert_eq!(stored.finished_at, None);
+ }
+ 
++#[test]
++fn trace_reconciles_liveness_stale_running_row_with_dead_pid() {
++    let fixture = Fixture::new();
++    fixture.seed_stale_running_trace_row_with_dead_pid();
++
++    let output = fixture.run_trace(&["--json"]);
++
++    assert!(output.status.success(), "{output:?}");
++    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
++    let invocation = &json["root"]["invocation"];
++    assert_eq!(invocation["status"], "failed");
++    assert_eq!(invocation["success"], false);
++    assert_eq!(invocation["exit_code"], -1);
++    assert_eq!(invocation["terminal_reason"], "stale_running_liveness");
++    assert!(invocation["finished_at"].is_string());
++    assert!(invocation.get("stale_running").is_none());
++
++    let stored = fixture
++        .open_db()
++        .get_invocation_by_uuid(ROOT_UUID)
++        .unwrap()
++        .unwrap();
++    assert_eq!(stored.status, InvocationStatus::Failed);
++    assert_eq!(stored.success, Some(false));
++    assert_eq!(stored.exit_code, Some(-1));
++    assert_eq!(stored.error_category.as_deref(), Some("stale_running"));
++    assert_eq!(
++        stored.terminal_reason.as_deref(),
++        Some("stale_running_liveness")
++    );
++    assert!(stored.finished_at.is_some());
++}
++
+ #[test]
+ fn inline_transcript_requires_json() {
+     let fixture = Fixture::new();

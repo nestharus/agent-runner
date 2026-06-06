@@ -170,14 +170,29 @@ fn agent_bash_status(fixture: &Fixture, agent_bash_bin: &Path, handle: &str) -> 
     String::from_utf8_lossy(&output.stdout).to_string()
 }
 
-fn agent_bash_bin_from_env() -> Option<PathBuf> {
-    let value = std::env::var_os(AGENT_BASH_BIN_ENV)?;
-    let path = PathBuf::from(value);
+fn agent_bash_bin_from_env() -> PathBuf {
+    let value = std::env::var_os(AGENT_BASH_BIN_ENV)
+        .map(PathBuf::from)
+        .or_else(find_agent_bash_in_path)
+        .unwrap_or_else(|| {
+            panic!("{AGENT_BASH_BIN_ENV} must point to an agent-bash binary or agent-bash must be on PATH")
+        });
+    assert_agent_bash_bin(&value);
+    value
+}
+
+fn find_agent_bash_in_path() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join("agent-bash"))
+        .find(|path| path.is_file())
+}
+
+fn assert_agent_bash_bin(path: &Path) {
     assert!(
         path.is_file(),
         "{AGENT_BASH_BIN_ENV} must point to an agent-bash binary"
     );
-    Some(path)
 }
 
 fn parse_invocation(stderr: &str) -> CompositeInvocationId {
@@ -327,10 +342,7 @@ fn resolves_parent_env_and_overwrites_child_subprocess_env() {
 
 #[test]
 fn nested_agent_bash_chain_records_parent_id_from_inherited_env() {
-    let Some(agent_bash_bin) = agent_bash_bin_from_env() else {
-        eprintln!("skipping nested agent-bash regression; set {AGENT_BASH_BIN_ENV} to run it");
-        return;
-    };
+    let agent_bash_bin = agent_bash_bin_from_env();
     let fixture = Fixture::new();
 
     let parent_output = fixture.run(None);

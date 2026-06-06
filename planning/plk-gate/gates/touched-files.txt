@@ -1,0 +1,8 @@
+src-tauri/src/commands/trace/accessor.rs
+src-tauri/src/dispatch.rs
+src-tauri/src/dispatch/parent_invocation.rs
+src-tauri/src/dispatch/predicate.rs
+src-tauri/src/invocation/mod.rs
+src-tauri/src/invocation/stale_reconcile.rs
+src-tauri/tests/pr_a_invocation_integration.rs
+src-tauri/tests/pr_b_trace_integration.rs

@@ -67,6 +67,15 @@ fn running_invocations(state: &StateDb) -> Result<Vec<RunningInvocation>, String
 }
 
 fn running_invocation_rows(state: &StateDb) -> Result<Vec<RunningInvocationRow>, String> {
+    running_invocation_row_values(state)?
+        .into_iter()
+        .map(running_invocation_row_from_values)
+        .collect()
+}
+
+fn running_invocation_row_values(
+    state: &StateDb,
+) -> Result<Vec<RunningInvocationRowValues>, String> {
     let mut stmt = state
         .connection()
         .prepare(
@@ -74,26 +83,58 @@ fn running_invocation_rows(state: &StateDb) -> Result<Vec<RunningInvocationRow>,
              FROM invocations
              WHERE status = 'running' AND finished_at IS NULL",
         )
-        .map_err(|err| format!("Failed to prepare stale-running query: {err}"))?;
+        .map_err(format_stale_running_prepare_error)?;
     let rows = stmt
         .query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
+            Ok(running_invocation_row_value(
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
             ))
         })
-        .map_err(|err| format!("Failed to query stale-running rows: {err}"))?;
-    rows.map(|row| {
-        let (row_id, invocation_uuid, created_at_raw) =
-            row.map_err(|err| format!("Failed to map stale-running row: {err}"))?;
-        Ok(running_invocation_row(
-            row_id,
-            invocation_uuid,
-            created_at_raw,
-        ))
-    })
-    .collect()
+        .map_err(format_stale_running_query_error)?;
+    rows.map(|row| row.map_err(format_stale_running_row_error))
+        .collect()
+}
+
+struct RunningInvocationRowValues {
+    row_id: i64,
+    invocation_uuid: String,
+    created_at_raw: String,
+}
+
+fn running_invocation_row_value(
+    row_id: i64,
+    invocation_uuid: String,
+    created_at_raw: String,
+) -> RunningInvocationRowValues {
+    RunningInvocationRowValues {
+        row_id,
+        invocation_uuid,
+        created_at_raw,
+    }
+}
+
+fn running_invocation_row_from_values(
+    values: RunningInvocationRowValues,
+) -> Result<RunningInvocationRow, String> {
+    Ok(running_invocation_row(
+        values.row_id,
+        values.invocation_uuid,
+        values.created_at_raw,
+    ))
+}
+
+fn format_stale_running_prepare_error(err: impl std::fmt::Display) -> String {
+    format!("Failed to prepare stale-running query: {err}")
+}
+
+fn format_stale_running_query_error(err: impl std::fmt::Display) -> String {
+    format!("Failed to query stale-running rows: {err}")
+}
+
+fn format_stale_running_row_error(err: impl std::fmt::Display) -> String {
+    format!("Failed to map stale-running row: {err}")
 }
 
 fn running_invocation_row(
@@ -136,19 +177,30 @@ fn invocation_has_dead_pid_evidence(
     sidecar: &PidIdentityDb,
     invocation_uuid: &str,
 ) -> Result<bool, String> {
-    let rows = sidecar.lookup_by_invocation_uuid(invocation_uuid)?;
+    let rows = pid_identity_rows_for_invocation(sidecar, invocation_uuid)?;
+    Ok(pid_identity_rows_have_dead_evidence(&rows))
+}
+
+fn pid_identity_rows_for_invocation(
+    sidecar: &PidIdentityDb,
+    invocation_uuid: &str,
+) -> Result<Vec<PidIdentityRow>, String> {
+    sidecar.lookup_by_invocation_uuid(invocation_uuid)
+}
+
+fn pid_identity_rows_have_dead_evidence(rows: &[PidIdentityRow]) -> bool {
     if rows.is_empty() {
-        return Ok(false);
+        return false;
     }
     let mut has_dead_evidence = false;
     for row in rows {
-        match pid_identity_row_liveness(&row) {
-            Some(true) => return Ok(false),
+        match pid_identity_row_liveness(row) {
+            Some(true) => return false,
             Some(false) => has_dead_evidence = true,
-            None => return Ok(false),
+            None => return false,
         }
     }
-    Ok(has_dead_evidence)
+    has_dead_evidence
 }
 
 fn pid_identity_row_liveness(row: &PidIdentityRow) -> Option<bool> {
