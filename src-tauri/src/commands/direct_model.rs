@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 
 struct CliExecutionContext {
     models: HashMap<String, ModelConfig>,
+    models_dir: PathBuf,
     extra_inputs: HashMap<String, Vec<String>>,
     working_dir: Option<PathBuf>,
     state_db_opener: ProductionStateDbOpener,
@@ -39,27 +40,40 @@ struct CliExecutionContext {
 
 fn load_cli_execution_context(cli: &Cli) -> Result<CliExecutionContext, String> {
     let parts = load_cli_execution_context_parts(cli)?;
-    Ok(cli_execution_context(cli, parts.models, parts.extra_inputs))
+    Ok(cli_execution_context(
+        cli,
+        parts.models,
+        parts.models_dir,
+        parts.extra_inputs,
+    ))
 }
 
 struct CliExecutionContextParts {
     models: HashMap<String, ModelConfig>,
+    models_dir: PathBuf,
     extra_inputs: HashMap<String, Vec<String>>,
 }
 
 fn load_cli_execution_context_parts(cli: &Cli) -> Result<CliExecutionContextParts, String> {
     let providers_cfg = load_providers_config();
-    let models = load_cli_models(cli, &providers_cfg)?;
+    let models_dir = crate::cli::paths::resolve_models_dir(cli);
+    let models = load_cli_models(&models_dir, &providers_cfg)?;
     let extra_inputs = parse_cli_extra_inputs(cli)?;
-    Ok(cli_execution_context_parts(models, extra_inputs))
+    Ok(cli_execution_context_parts(
+        models,
+        models_dir,
+        extra_inputs,
+    ))
 }
 
 fn cli_execution_context_parts(
     models: HashMap<String, ModelConfig>,
+    models_dir: PathBuf,
     extra_inputs: HashMap<String, Vec<String>>,
 ) -> CliExecutionContextParts {
     CliExecutionContextParts {
         models,
+        models_dir,
         extra_inputs,
     }
 }
@@ -70,10 +84,9 @@ fn load_providers_config() -> ProvidersConfig {
 }
 
 fn load_cli_models(
-    cli: &Cli,
+    models_dir: &Path,
     providers_cfg: &ProvidersConfig,
 ) -> Result<HashMap<String, ModelConfig>, String> {
-    let models_dir = crate::cli::paths::resolve_models_dir(cli);
     Ok(load_models(&models_dir, Some(providers_cfg))?)
 }
 
@@ -84,10 +97,12 @@ fn parse_cli_extra_inputs(cli: &Cli) -> Result<HashMap<String, Vec<String>>, Str
 fn cli_execution_context(
     cli: &Cli,
     models: HashMap<String, ModelConfig>,
+    models_dir: PathBuf,
     extra_inputs: HashMap<String, Vec<String>>,
 ) -> CliExecutionContext {
     cli_execution_context_from_parts(
         models,
+        models_dir,
         extra_inputs,
         cli_working_dir(cli),
         ProductionStateDbOpener,
@@ -100,12 +115,14 @@ fn cli_working_dir(cli: &Cli) -> Option<PathBuf> {
 
 fn cli_execution_context_from_parts(
     models: HashMap<String, ModelConfig>,
+    models_dir: PathBuf,
     extra_inputs: HashMap<String, Vec<String>>,
     working_dir: Option<PathBuf>,
     state_db_opener: ProductionStateDbOpener,
 ) -> CliExecutionContext {
     CliExecutionContext {
         models,
+        models_dir,
         extra_inputs,
         working_dir,
         state_db_opener,
@@ -172,6 +189,7 @@ fn dispatch_direct_model_balancing(
         model,
         prompt,
         &context.models,
+        &context.models_dir,
         context.working_dir.as_deref(),
         &context.extra_inputs,
     )
@@ -296,6 +314,7 @@ fn dispatch_agent_cli_balancing(
         model,
         full_prompt,
         &context.models,
+        &context.models_dir,
         context.working_dir.as_deref(),
         provider_inputs,
     )

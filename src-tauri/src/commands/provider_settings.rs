@@ -415,8 +415,16 @@ fn packaged_model_block(
 }
 
 fn packaged_provider_blocks(state: &AppState) -> ProviderSettingsCommandResult<Value> {
+    load_packaged_providers(state);
+    read_provider_blocks_for_state(state)
+}
+
+fn load_packaged_providers(state: &AppState) {
     let _providers =
         load_providers_for_models_dir_with(&state.models_dir, &*state.providers_config);
+}
+
+fn read_provider_blocks_for_state(state: &AppState) -> ProviderSettingsCommandResult<Value> {
     read_provider_blocks(&providers_toml_path(state))
 }
 
@@ -464,11 +472,24 @@ fn with_host<T>(
     state: &AppState,
     action: impl FnOnce(&ProviderSettingsHost) -> Result<T, ProviderSettingsError>,
 ) -> ProviderSettingsCommandResult<T> {
-    let host = state
+    let host = locked_provider_settings_host(state)?;
+    run_with_host(&host, action)
+}
+
+fn locked_provider_settings_host(
+    state: &AppState,
+) -> ProviderSettingsCommandResult<std::sync::MutexGuard<'_, ProviderSettingsHost>> {
+    state
         .provider_settings
         .lock()
-        .map_err(settings_host_lock_error)?;
-    action(&host).map_err(map_error)
+        .map_err(settings_host_lock_error)
+}
+
+fn run_with_host<T>(
+    host: &ProviderSettingsHost,
+    action: impl FnOnce(&ProviderSettingsHost) -> Result<T, ProviderSettingsError>,
+) -> ProviderSettingsCommandResult<T> {
+    action(host).map_err(map_error)
 }
 
 fn settings_host_lock_error<T>(error: std::sync::PoisonError<T>) -> Box<ProviderSettingsErrorDto> {
@@ -677,7 +698,7 @@ fn transport_error_dto(category: &str, message: &str) -> ProviderSettingsErrorDt
 fn test_update_result(
     state: &AppState,
 ) -> Option<ProviderSettingsCommandResult<ProviderSettingsWriteDto>> {
-    test_update_error(state).map(command_error_result)
+    command_error_result_from_option(test_update_error(state))
 }
 
 fn test_update_error(state: &AppState) -> Option<ProviderSettingsErrorDto> {
@@ -695,7 +716,7 @@ fn test_update_error(state: &AppState) -> Option<ProviderSettingsErrorDto> {
 fn test_validate_result(
     state: &AppState,
 ) -> Option<ProviderSettingsCommandResult<ProviderSettingsValidateDto>> {
-    test_validate_error(state).map(command_error_result)
+    command_error_result_from_option(test_validate_error(state))
 }
 
 fn test_validate_error(state: &AppState) -> Option<ProviderSettingsErrorDto> {
@@ -712,4 +733,10 @@ fn test_validate_error(state: &AppState) -> Option<ProviderSettingsErrorDto> {
 
 fn command_error_result<T>(error: ProviderSettingsErrorDto) -> ProviderSettingsCommandResult<T> {
     Err(Box::new(error))
+}
+
+fn command_error_result_from_option<T>(
+    error: Option<ProviderSettingsErrorDto>,
+) -> Option<ProviderSettingsCommandResult<T>> {
+    error.map(command_error_result)
 }

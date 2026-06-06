@@ -264,13 +264,17 @@ fn ingest_completed_attempt_session(
 ) -> Result<(), String> {
     let ingest_effective_cwd =
         super::accessor::completed_session_ingest_effective_cwd(input.working_dir)?;
-    let emitted = ingest_and_emit_session_id_resume_aware(
+    let ingest_output = ingest_and_emit_session_id_resume_aware(
         input.agent_runtime_services,
         mapper::completed_session_ingest_request_for_attempt(input, &ingest_effective_cwd),
     );
-    record_external_session_runtime_if_needed(input, &ingest_effective_cwd);
+    record_external_session_runtime_if_needed(
+        input,
+        &ingest_effective_cwd,
+        ingest_output.session_id.as_deref(),
+    );
     if let Some(session_id) = super::filter::session_ingest_fallback_session_id(
-        emitted,
+        ingest_output.emitted,
         input.result.session_capture.session_id.as_deref(),
     ) {
         emit_known_session_id(
@@ -287,11 +291,12 @@ fn ingest_completed_attempt_session(
 fn record_external_session_runtime_if_needed(
     input: &CompletedAttemptInput<'_, '_, '_>,
     effective_cwd: &Path,
+    ingested_session_id: Option<&str>,
 ) {
     if input.model.provider.is_none() {
         return;
     }
-    let Some(session_id) = external_runtime_session_id(input) else {
+    let Some(session_id) = external_runtime_session_id(input, ingested_session_id) else {
         return;
     };
     if let Err(err) = record_external_session_runtime(input, session_id, effective_cwd) {
@@ -305,9 +310,11 @@ fn record_external_session_runtime_if_needed(
 
 fn external_runtime_session_id<'a>(
     input: &'a CompletedAttemptInput<'_, '_, '_>,
+    ingested_session_id: Option<&'a str>,
 ) -> Option<&'a str> {
     input
         .zero_turn_provider_session_id
+        .or(ingested_session_id)
         .or(input.result.session_capture.session_id.as_deref())
 }
 
@@ -325,7 +332,7 @@ fn record_external_session_runtime(
         provider_name: Some(input.provider_name),
         model_name: Some(&input.model.name),
         pty_control_path: None,
-        models_dir: None,
+        models_dir: Some(input.env.models_dir.to_string_lossy().as_ref()),
         effective_cwd: Some(effective_cwd.as_ref()),
     })
 }

@@ -46,10 +46,12 @@ pub(crate) fn run_with_balancing(
     model: &ModelConfig,
     prompt: &str,
     all_models: &HashMap<String, ModelConfig>,
+    models_dir: &Path,
     working_dir: Option<&Path>,
     extra_inputs: &HashMap<String, Vec<String>>,
 ) -> Result<i32, String> {
-    let env = load_balanced_execution_environment(state_db_opener)?;
+    let mut env = load_balanced_execution_environment(state_db_opener)?;
+    env.models_dir = models_dir.to_path_buf();
     run_with_balancing_environment(
         agent_runtime_services,
         env,

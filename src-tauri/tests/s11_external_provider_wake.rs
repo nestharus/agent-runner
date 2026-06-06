@@ -53,6 +53,12 @@ impl Fixture {
             .join("pid-identity.db")
     }
 
+    fn state_path(&self) -> PathBuf {
+        self.data_home
+            .join("oulipoly-agent-runner")
+            .join("state.db")
+    }
+
     fn run(&self, mut cmd: Command) -> Output {
         cmd.env("XDG_CONFIG_HOME", &self.config_home)
             .env("XDG_DATA_HOME", &self.data_home)
@@ -84,6 +90,7 @@ impl Fixture {
 
     fn write_external_provider(&self) {
         let provider_path = self.write_external_provider_script();
+        let turn_script_path = self.write_turn_script();
         fs::write(
             self.models_dir.join(format!("{MODEL}.toml")),
             format!(
@@ -109,11 +116,30 @@ prompt_mode = "arg"
             ),
         )
         .unwrap();
+        fs::write(
+            self.app_config_dir.join("sessions.toml"),
+            format!(
+                r#"[{PROVIDER}]
+turn_script = {}
+"#,
+                toml_string(&path_string(&turn_script_path))
+            ),
+        )
+        .unwrap();
     }
 
     fn write_external_provider_script(&self) -> PathBuf {
         let path = self.dir.path().join("external-provider.py");
         fs::write(&path, external_provider_script()).unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    fn write_turn_script(&self) -> PathBuf {
+        let path = self.dir.path().join("s11-turns.py");
+        fs::write(&path, turn_script()).unwrap();
         let mut perms = fs::metadata(&path).unwrap().permissions();
         perms.set_mode(0o755);
         fs::set_permissions(&path, perms).unwrap();
@@ -126,6 +152,17 @@ prompt_mode = "arg"
 
     fn sidecar_conn(&self) -> Connection {
         Connection::open(self.sidecar_path()).unwrap()
+    }
+
+    fn finalized_invocation_count(&self) -> i64 {
+        Connection::open(self.state_path())
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM invocations WHERE finished_at IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 
     fn pid_identity_session_id_for_provider(&self, provider_name: &str) -> Option<String> {
@@ -177,6 +214,20 @@ fn external_provider_launch_notify_uses_captured_sidecar_owner_and_wakes() {
     });
     let (notify_json, notify) =
         wait_for_json_file(&fixture.work_dir.join(HANDLE).join("notify.json"));
+    let (_, notify_env) =
+        wait_for_json_file(&fixture.work_dir.join(HANDLE).join("notify-env.json"));
+    assert_eq!(
+        notify_env.get("xdg_config_home").and_then(Value::as_str),
+        None
+    );
+    assert_eq!(
+        notify_env.get("xdg_data_home").and_then(Value::as_str),
+        None
+    );
+    assert_eq!(
+        notify_env.get("oulipoly_data_dir").and_then(Value::as_str),
+        Some(path_string(&fixture.data_home.join("oulipoly-agent-runner")).as_str())
+    );
     assert_eq!(
         notify.get("status").and_then(Value::as_str),
         Some("enqueued"),
@@ -213,14 +264,70 @@ fn external_provider_launch_notify_uses_captured_sidecar_owner_and_wakes() {
             && rows[0].matched_chain_index == Some(0)
             && db.wake_claim(SESSION).unwrap().is_none()
     });
+    let runtime = fixture.mailbox().session_runtime(SESSION).unwrap().unwrap();
+    assert_eq!(runtime.run_state, "idle");
+    let expected_models_dir = path_string(&fixture.models_dir);
     assert_eq!(
-        fixture
-            .mailbox()
-            .session_runtime(SESSION)
-            .unwrap()
-            .unwrap()
-            .run_state,
-        "idle"
+        runtime.models_dir.as_deref(),
+        Some(expected_models_dir.as_str()),
+        "detached wake must reload the same models directory as the original external launch"
+    );
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
+fn external_provider_runtime_uses_ingested_session_when_launch_capture_missing() {
+    let fixture = Fixture::new();
+    fixture.write_external_provider();
+
+    let output = fixture.run_agent_with_env(
+        "dispatch external provider without launch session capture",
+        &[("S11_NO_NOTIFY", "1"), ("S11_OMIT_EXIT_SESSION", "1")],
+    );
+    assert_success(&output);
+
+    wait_until("initial invocation finalized", || {
+        fixture.finalized_invocation_count() >= 1
+    });
+    let runtime = fixture.mailbox().session_runtime(SESSION).unwrap().unwrap();
+    let expected_models_dir = path_string(&fixture.models_dir);
+    assert_eq!(runtime.run_state, "idle");
+    assert_eq!(runtime.provider_name.as_deref(), Some(PROVIDER));
+    assert_eq!(runtime.model_name.as_deref(), Some(MODEL));
+    assert_eq!(
+        runtime.models_dir.as_deref(),
+        Some(expected_models_dir.as_str())
+    );
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
+fn external_provider_wake_does_not_mark_delivered_when_resume_produces_no_turn() {
+    let fixture = Fixture::new();
+    fixture.write_external_provider();
+
+    let output = fixture.run_agent_with_env(
+        "dispatch external provider wake dropped payload",
+        &[("S11_DROP_RESUME_PAYLOAD", "1")],
+    );
+    assert_success(&output);
+
+    let _dropped = wait_for_file(&fixture.prompt_file("external-wake-dropped.txt"));
+    wait_until("resume invocation finalized", || {
+        fixture.finalized_invocation_count() >= 2
+    });
+
+    let db = fixture.mailbox();
+    let rows = db.list_mailbox(SESSION, true).unwrap();
+    assert_eq!(rows.len(), 1, "rows: {rows:?}");
+    assert!(
+        rows[0].delivered_at.is_none(),
+        "dropped resume payload must not mark mailbox delivered: {rows:?}"
+    );
+    assert_eq!(db.list_pending(SESSION).unwrap().len(), 1);
+    assert!(
+        !fixture.prompt_file("external-wake-resumed.txt").exists(),
+        "drop mode must not write the payload-bearing resume file"
     );
     fixture.assert_xdg_isolated();
 }
@@ -334,7 +441,7 @@ def stdout_event(request, seq, payload):
     }
 
 def exit_event(request, seq, session_id):
-    return {
+    event = {
         "contract": CONTRACT,
         "request_id": request_id(request),
         "seq": seq,
@@ -346,11 +453,13 @@ def exit_event(request, seq, session_id):
             "evidence": "fixture clean exit",
             "observed_at_unix_ms": 1000 + seq,
         },
-        "session": {
+    }
+    if session_id:
+        event["session"] = {
             "provider_session_id": session_id,
             "state": {"cursor": "after-launch"},
-        },
-    }
+        }
+    return event
 
 def provider_identity():
     pid = os.getpid()
@@ -376,14 +485,22 @@ def launch(request):
     known = params.get("session", {}).get("known_provider_session_id")
     prompt = params.get("model", {}).get("inputs", {}).get("prompt", "")
     if known:
+        if os.environ.get("S11_DROP_RESUME_PAYLOAD") == "1":
+            target = pathlib.Path(os.environ["S11_WORK_DIR"]) / "external-wake-dropped.txt"
+            target.write_text("dropped\n", encoding="utf-8")
+            emit(stdout_event(request, 1, "dropped\n"))
+            emit(exit_event(request, 2, known))
+            return
         target = pathlib.Path(os.environ["S11_WORK_DIR"]) / "external-wake-resumed.txt"
         target.write_text(prompt, encoding="utf-8")
         emit(stdout_event(request, 1, "resumed\n"))
         emit(exit_event(request, 2, known))
         return
-    spawn_notify_workload()
+    if os.environ.get("S11_NO_NOTIFY") != "1":
+        spawn_notify_workload()
     emit(stdout_event(request, 1, "initial\n"))
-    emit(exit_event(request, 2, SESSION))
+    session_id = None if os.environ.get("S11_OMIT_EXIT_SESSION") == "1" else SESSION
+    emit(exit_event(request, 2, session_id))
 
 def session_id_from_request(request):
     params = request.get("params", {})
@@ -429,6 +546,15 @@ def notify_helper():
     (state / "log").write_text("external provider workload completed\n", encoding="utf-8")
     (state / "rc").write_text("0\n", encoding="utf-8")
     runner = os.environ["AGENT_BASH_AGENT_RUNNER_BIN"]
+    child_env = os.environ.copy()
+    child_env["OULIPOLY_DATA_DIR"] = str(pathlib.Path(os.environ["XDG_DATA_HOME"]) / "oulipoly-agent-runner")
+    child_env.pop("XDG_CONFIG_HOME", None)
+    child_env.pop("XDG_DATA_HOME", None)
+    (state / "notify-env.json").write_text(json.dumps({
+        "xdg_config_home": child_env.get("XDG_CONFIG_HOME"),
+        "xdg_data_home": child_env.get("XDG_DATA_HOME"),
+        "oulipoly_data_dir": child_env.get("OULIPOLY_DATA_DIR"),
+    }, separators=(",", ":")), encoding="utf-8")
     with (state / "notify.json").open("w", encoding="utf-8") as out, \
          (state / "notify.err").open("w", encoding="utf-8") as err:
         subprocess.run([
@@ -440,7 +566,7 @@ def notify_helper():
             "--log", str(state / "log"),
             "--rc", str(state / "rc"),
             "--json",
-        ], stdout=out, stderr=err, check=False, env=os.environ.copy())
+        ], stdout=out, stderr=err, check=False, env=child_env)
 
 def main():
     subcommand = sys.argv[1] if len(sys.argv) > 1 else ""
@@ -478,6 +604,30 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+"#
+}
+
+fn turn_script() -> &'static str {
+    r#"#!/usr/bin/env python3
+import json
+import os
+import pathlib
+
+SESSION = "ses_s11externalwake"
+
+def emit(turn_id, text):
+    print(json.dumps({
+        "session_id": SESSION,
+        "turn_id": turn_id,
+        "timestamp": "2026-06-06T00:00:00Z",
+        "role": "assistant",
+        "body": [{"type": "text", "text": text}],
+    }, separators=(",", ":")))
+
+work = pathlib.Path(os.environ["S11_WORK_DIR"])
+emit("turn-s11-initial", "initial fixture turn")
+if (work / "external-wake-resumed.txt").exists():
+    emit("turn-s11-woke", "WOKE reply")
 "#
 }
 

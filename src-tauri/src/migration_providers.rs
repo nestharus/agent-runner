@@ -24,7 +24,7 @@
 //!     role: adapter
 //!     Translates:
 //!       - AGE-203 H12: ProviderConfig session_storage -> resolved-account display string
-//!       - AGE-203 H12: models_dir_override + default config root -> ResumeExecutionEnvironment
+//!       - AGE-203 H12: models_dir_override + config root -> ResumeExecutionEnvironment
 //! ```
 
 use std::collections::HashMap;
@@ -74,6 +74,7 @@ pub(crate) struct ResumeExecutionEnvironment {
     pub(crate) providers_cfg: ProvidersConfig,
     pub(crate) models: HashMap<String, ModelConfig>,
     pub(crate) sessions_cfg: oulipoly_config::SessionsConfig,
+    pub(crate) config_root: PathBuf,
     pub(crate) models_dir: PathBuf,
 }
 
@@ -82,7 +83,7 @@ pub(crate) fn load_resume_execution_environment(
 ) -> Result<ResumeExecutionEnvironment, String> {
     let state = StateDb::open_default()?;
     let models_dir = resume_execution_models_dir(models_dir_override);
-    let config_root = default_config_root();
+    let config_root = resume_execution_config_root(models_dir_override, &models_dir);
     let providers_cfg = oulipoly_config::ProvidersConfig::load(&config_root.join("providers.toml"))
         .unwrap_or_default();
     let models = load_models(&models_dir, Some(&providers_cfg))?;
@@ -93,6 +94,7 @@ pub(crate) fn load_resume_execution_environment(
         providers_cfg,
         models,
         sessions_cfg,
+        config_root,
         models_dir,
     ))
 }
@@ -103,11 +105,22 @@ fn resume_execution_models_dir(models_dir_override: Option<&Path>) -> std::path:
         .unwrap_or_else(default_models_dir)
 }
 
+fn resume_execution_config_root(models_dir_override: Option<&Path>, models_dir: &Path) -> PathBuf {
+    if models_dir_override.is_some() {
+        return models_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(default_config_root);
+    }
+    default_config_root()
+}
+
 fn resume_execution_environment(
     state: StateDb,
     providers_cfg: ProvidersConfig,
     models: HashMap<String, ModelConfig>,
     sessions_cfg: oulipoly_config::SessionsConfig,
+    config_root: PathBuf,
     models_dir: PathBuf,
 ) -> ResumeExecutionEnvironment {
     ResumeExecutionEnvironment {
@@ -115,6 +128,7 @@ fn resume_execution_environment(
         providers_cfg,
         models,
         sessions_cfg,
+        config_root,
         models_dir,
     }
 }

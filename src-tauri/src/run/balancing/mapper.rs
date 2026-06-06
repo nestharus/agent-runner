@@ -99,11 +99,13 @@ pub(super) fn balanced_execution_environment(
     state: StateDb,
     providers_cfg: ProvidersConfig,
     sessions_cfg: SessionsConfig,
+    models_dir: PathBuf,
 ) -> BalancedExecutionEnvironment {
     BalancedExecutionEnvironment {
         state,
         providers_cfg,
         sessions_cfg,
+        models_dir,
     }
 }
 

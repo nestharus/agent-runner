@@ -8,7 +8,7 @@ use std::path::Path;
 
 use oulipoly_config::{ModelConfig, ProvidersConfig};
 use oulipoly_runtime::services::{
-    ServiceError, SessionLifecycleIngestMode, SessionLifecycleRequest,
+    ServiceError, SessionLifecycleIngestMode, SessionLifecycleOutput, SessionLifecycleRequest,
     SessionServiceExternalProviderIdentity,
 };
 use oulipoly_state::{InvocationRecord, StateDb};
@@ -35,7 +35,7 @@ pub(crate) struct SessionIngestRequest<'a> {
 pub(crate) fn ingest_and_emit_session_id_resume_aware(
     agent_runtime_services: &wiring::AgentRuntimeServices,
     request: SessionIngestRequest<'_>,
-) -> bool {
+) -> SessionLifecycleOutput {
     let mut stderr = std::io::stderr();
     let SessionIngestRequest {
         state,
@@ -70,10 +70,10 @@ pub(crate) fn ingest_and_emit_session_id_resume_aware(
 
 fn emit_session_lifecycle_ingest_result(
     provider_name: &str,
-    result: Result<oulipoly_runtime::services::SessionLifecycleOutput, ServiceError>,
-) -> bool {
+    result: Result<SessionLifecycleOutput, ServiceError>,
+) -> SessionLifecycleOutput {
     match session_lifecycle_ingest_result(result) {
-        SessionLifecycleIngestResult::Emitted(emitted) => emitted,
+        SessionLifecycleIngestResult::Emitted(output) => output,
         SessionLifecycleIngestResult::Failed(message) => {
             emit_session_ingest_failure(provider_name, &message);
             session_lifecycle_ingest_failed_result()
@@ -82,15 +82,15 @@ fn emit_session_lifecycle_ingest_result(
 }
 
 enum SessionLifecycleIngestResult {
-    Emitted(bool),
+    Emitted(SessionLifecycleOutput),
     Failed(String),
 }
 
 fn session_lifecycle_ingest_result(
-    result: Result<oulipoly_runtime::services::SessionLifecycleOutput, ServiceError>,
+    result: Result<SessionLifecycleOutput, ServiceError>,
 ) -> SessionLifecycleIngestResult {
     match result {
-        Ok(output) => SessionLifecycleIngestResult::Emitted(output.emitted),
+        Ok(output) => SessionLifecycleIngestResult::Emitted(output),
         Err(ServiceError::Dependency { message })
         | Err(ServiceError::InvalidRequest { message })
         | Err(ServiceError::Unavailable { message }) => {
@@ -99,8 +99,11 @@ fn session_lifecycle_ingest_result(
     }
 }
 
-fn session_lifecycle_ingest_failed_result() -> bool {
-    false
+fn session_lifecycle_ingest_failed_result() -> SessionLifecycleOutput {
+    SessionLifecycleOutput {
+        emitted: false,
+        session_id: None,
+    }
 }
 
 struct SessionLifecycleRequestInput<'a> {
@@ -372,7 +375,7 @@ mod tests {
         let sessions_cfg = oulipoly_config::SessionsConfig::default();
         let providers_cfg = ProvidersConfig::default();
 
-        let emitted = ingest_and_emit_session_id_resume_aware(
+        let output = ingest_and_emit_session_id_resume_aware(
             &services,
             SessionIngestRequest {
                 state: &fixture.state,
@@ -393,7 +396,8 @@ mod tests {
             },
         );
 
-        assert!(emitted);
+        assert!(output.emitted);
+        assert_eq!(output.session_id.as_deref(), Some(SESSION));
         assert_eq!(
             fixture.provider_subcommands(),
             vec!["describe", "session.read_turns", "session.capture"]

@@ -13,6 +13,7 @@ pub(super) struct BalancedExecutionEnvironment {
     pub(super) state: StateDb,
     pub(super) providers_cfg: ProvidersConfig,
     pub(super) sessions_cfg: SessionsConfig,
+    pub(super) models_dir: PathBuf,
 }
 
 pub(super) fn load_balanced_execution_environment(
@@ -24,7 +25,9 @@ pub(super) fn load_balanced_execution_environment(
     // SessionsConfig::load(&sessions_path).unwrap_or_default()
     // ExecutorServiceRequest::Effective
     let state = state_db_opener.open_default()?;
-    let config_paths = super::mapper::balanced_config_toml_paths(default_config_root());
+    let config_root = default_config_root();
+    let models_dir = config_root.join("models");
+    let config_paths = super::mapper::balanced_config_toml_paths(config_root);
     let providers_path = config_paths.providers_path;
     let sessions_path = config_paths.sessions_path;
     let providers_cfg = ProvidersConfig::load(&providers_path).unwrap_or_default();
@@ -33,6 +36,7 @@ pub(super) fn load_balanced_execution_environment(
         state,
         providers_cfg,
         sessions_cfg,
+        models_dir,
     ))
 }
 

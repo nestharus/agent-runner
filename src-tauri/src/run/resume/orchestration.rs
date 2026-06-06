@@ -5,8 +5,10 @@
 use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::Path;
+use std::sync::Arc;
 
 use oulipoly_runtime::executor;
+use oulipoly_runtime::provider_registry::{ProviderRegistry, ProviderRegistryOptions};
 use oulipoly_runtime::services::{
     ExecutorServiceRequest, InvocationLifecycleServicePort, MigrationServiceOutput,
     ResumeServiceOutput, ServiceError,
@@ -39,7 +41,7 @@ use crate::terminal_outcome_adapter::{
     confirm_maybe_quota_exhausted, resume_terminal_signal_for_outcome,
 };
 use crate::wiring;
-use crate::zero_turn_orchestration::{ZeroTurnConfirmationState, next_action};
+use crate::zero_turn_orchestration::{ZeroTurnAction, ZeroTurnConfirmationState, next_action};
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_resume(
@@ -120,6 +122,7 @@ fn prepare_headless_resume_execution(
 ) -> Result<Result<PreparedHeadlessResumeExecution, i32>, String> {
     let answer = resolve_resume_answer(prompt, file)?;
     let env = load_resume_execution_environment(models_dir_override)?;
+    refresh_resume_provider_registry(agent_runtime_services, &env)?;
     let resolved = match resolve_resume_for_headless_execution(
         agent_runtime_services,
         &env,
@@ -154,6 +157,35 @@ fn prepare_headless_resume_execution(
         parent_invocation_id,
         max_attempts,
     }))
+}
+
+fn refresh_resume_provider_registry(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    env: &crate::migration_providers::ResumeExecutionEnvironment,
+) -> Result<(), String> {
+    let models = env.models.values().cloned().collect::<Vec<_>>();
+    let registry =
+        ProviderRegistry::from_model_configs(&models, resume_provider_registry_options(env))
+            .map_err(|err| format!("failed to build resume provider registry: {err}"))?;
+    agent_runtime_services
+        .provider_registry_handle
+        .replace(Arc::new(registry));
+    Ok(())
+}
+
+fn resume_provider_registry_options(
+    env: &crate::migration_providers::ResumeExecutionEnvironment,
+) -> ProviderRegistryOptions {
+    ProviderRegistryOptions::default()
+        .with_path_entries_from_process_path()
+        .with_config_root(env.config_root.clone())
+        .with_data_root(resume_provider_registry_data_root(env))
+}
+
+fn resume_provider_registry_data_root(
+    env: &crate::migration_providers::ResumeExecutionEnvironment,
+) -> std::path::PathBuf {
+    oulipoly_state::paths::data_dir().unwrap_or_else(|_| env.config_root.clone())
 }
 
 fn effective_resume_execution_cwd(
@@ -638,6 +670,12 @@ fn handle_resume_attempt_terminal_signal(
         ResumeLoopControl::CompletedAttempt => {}
     }
 
+    if mailbox_delivery_unconfirmed(input, &provider.name, result, zero_turn_action) {
+        finalize_unconfirmed_mailbox_delivery(input, attempt, result)?;
+        mark_resume_attempt_idle(provider_session_id, &attempt.invocation.id, Some(1))?;
+        return Ok(ResumeAttemptLoopControl::Return(1));
+    }
+
     match finalize_completed_attempt(CompletedAttemptInput {
         agent_runtime_services: input.agent_runtime_services,
         env: input.env,
@@ -685,6 +723,55 @@ fn handle_resume_attempt_terminal_signal(
             Ok(ResumeAttemptLoopControl::Return(exit_code))
         }
     }
+}
+
+fn mailbox_delivery_unconfirmed(
+    input: &ResumeAttemptInput<'_>,
+    provider_name: &str,
+    result: &executor::ExecutionResult,
+    zero_turn_action: ZeroTurnAction,
+) -> bool {
+    mailbox_delivery_requires_turn_confirmation(input, provider_name, result)
+        && !mailbox_delivery_turn_confirmed(zero_turn_action)
+}
+
+fn mailbox_delivery_requires_turn_confirmation(
+    input: &ResumeAttemptInput<'_>,
+    provider_name: &str,
+    result: &executor::ExecutionResult,
+) -> bool {
+    result.exit_code == 0
+        && !input.mailbox_delivery_seqs.is_empty()
+        && input.answer.is_some_and(|answer| !answer.trim().is_empty())
+        && input.env.sessions_cfg.get(provider_name).is_some()
+}
+
+fn mailbox_delivery_turn_confirmed(zero_turn_action: ZeroTurnAction) -> bool {
+    matches!(zero_turn_action, ZeroTurnAction::Continue)
+}
+
+fn finalize_unconfirmed_mailbox_delivery(
+    input: &ResumeAttemptInput<'_>,
+    attempt: &mut ResumeInvocationAttempt<'_>,
+    result: &executor::ExecutionResult,
+) -> Result<(), String> {
+    formatter::emit_stderr(
+        "resume mailbox delivery was not confirmed by a new session turn; leaving mailbox rows pending",
+    );
+    input
+        .agent_runtime_services
+        .invocation_lifecycle_service
+        .finalize_invocation(mapper::finalize_request(
+            &input.env.state,
+            attempt.invocation_row_id,
+            false,
+            1,
+            Some("mailbox_delivery_unconfirmed"),
+            result.terminal_reason.as_deref(),
+        ))
+        .map_err(|err| err.to_string())?;
+    attempt.guard.mark_finalized();
+    Ok(())
 }
 
 fn mark_resume_attempt_idle(
@@ -790,35 +877,78 @@ fn validate_provider_ref_headless_resume_target(
     target: &crate::resume_cli::ResumeExecutionTarget,
     selected_provider: &str,
 ) -> Result<(), String> {
-    let Some(model) = provider_ref_resolved_model(resolved) else {
-        return Err(provider_ref_missing_model_message(selected_provider));
-    };
-    if !provider_ref_model_has_implementation(model) {
-        return Err(provider_ref_missing_implementation_message(
+    let model = require_provider_ref_resolved_model(
+        provider_ref_resolved_model(resolved),
+        selected_provider,
+    )?;
+    require_provider_ref_model_implementation(model, selected_provider)?;
+    let target_member_name = require_provider_ref_target_member_name(
+        provider_ref_target_member_name(model, target.provider_index),
+        selected_provider,
+        target.provider_index,
+    )?;
+    require_provider_ref_resolved_provider(selected_provider, target_member_name)?;
+    require_provider_ref_loaded_provider(
+        selected_provider,
+        provider_ref_loaded_provider_name(target),
+    )
+}
+
+fn require_provider_ref_resolved_model<'a>(
+    model: Option<&'a oulipoly_config::ModelConfig>,
+    selected_provider: &str,
+) -> Result<&'a oulipoly_config::ModelConfig, String> {
+    model.ok_or_else(|| provider_ref_missing_model_message(selected_provider))
+}
+
+fn require_provider_ref_model_implementation(
+    model: &oulipoly_config::ModelConfig,
+    selected_provider: &str,
+) -> Result<(), String> {
+    if provider_ref_model_has_implementation(model) {
+        Ok(())
+    } else {
+        Err(provider_ref_missing_implementation_message(
             selected_provider,
-        ));
+        ))
     }
-    let Some(target_member_name) = provider_ref_target_member_name(model, target.provider_index)
-    else {
-        return Err(provider_ref_invalid_index_message(
-            selected_provider,
-            target.provider_index,
-        ));
-    };
-    if target_member_name != selected_provider {
-        return Err(provider_ref_resolved_provider_message(
+}
+
+fn require_provider_ref_target_member_name<'a>(
+    target_member_name: Option<&'a str>,
+    selected_provider: &str,
+    provider_index: usize,
+) -> Result<&'a str, String> {
+    target_member_name
+        .ok_or_else(|| provider_ref_invalid_index_message(selected_provider, provider_index))
+}
+
+fn require_provider_ref_resolved_provider(
+    selected_provider: &str,
+    target_member_name: &str,
+) -> Result<(), String> {
+    if target_member_name == selected_provider {
+        Ok(())
+    } else {
+        Err(provider_ref_resolved_provider_message(
             selected_provider,
             target_member_name,
-        ));
+        ))
     }
-    let loaded_provider_name = provider_ref_loaded_provider_name(target);
-    if loaded_provider_name != selected_provider {
-        return Err(provider_ref_loaded_provider_message(
+}
+
+fn require_provider_ref_loaded_provider(
+    selected_provider: &str,
+    loaded_provider_name: &str,
+) -> Result<(), String> {
+    if loaded_provider_name == selected_provider {
+        Ok(())
+    } else {
+        Err(provider_ref_loaded_provider_message(
             selected_provider,
             loaded_provider_name,
-        ));
+        ))
     }
-    Ok(())
 }
 
 fn provider_ref_resolved_model(
