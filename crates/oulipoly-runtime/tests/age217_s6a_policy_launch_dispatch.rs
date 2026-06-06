@@ -478,7 +478,12 @@ def policy(request):
         "accepted": accepted,
         "stdin": None,
         "prompt": None,
-        "diagnostics": [],
+        "diagnostics": [{{
+            "severity": "error",
+            "code": "policy_live_contract_reject",
+            "path": "params.launch.argv",
+            "message": "provider expected account-specific policy argv shape"
+        }}] if not accepted else [],
         "markers": []
     }}
     if POLICY_MODE == "transform":
@@ -1030,7 +1035,20 @@ fn external_provider_policy_rejection_skips_launch() {
     let error = execute_external_fixture(&fixture)
         .expect_err("policy rejection should be an external dispatch failure");
 
-    assert!(error.to_string().contains("policy rejected"));
+    let message = error.to_string();
+    assert!(message.contains("policy rejected"), "error was: {message}");
+    assert!(
+        message.contains("policy_live_contract_reject"),
+        "provider diagnostic code should be visible: {message}"
+    );
+    assert!(
+        message.contains("params.launch.argv"),
+        "provider diagnostic path should be visible: {message}"
+    );
+    assert!(
+        message.contains("provider expected account-specific policy argv shape"),
+        "provider diagnostic message should be visible: {message}"
+    );
     assert_eq!(order_lines(&fixture.order_path), ["policy.evaluate"]);
     assert!(!fixture.launch_record_path.exists());
     assert!(!fixture.legacy_record_path.exists());

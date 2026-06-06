@@ -52,9 +52,9 @@ pub(crate) fn map_provider_client_error(error: ProviderClientError) -> ServiceEr
         ProviderClientError::Protocol { kind, .. } => service_error(
             ExternalProviderDispatchError::provider_protocol_failure(kind.as_str()),
         ),
-        ProviderClientError::ProviderCapability(_) => {
-            service_error(ExternalProviderDispatchError::policy_rejected())
-        }
+        ProviderClientError::ProviderCapability(error) => service_error(
+            ExternalProviderDispatchError::policy_rejected(error.error().diagnostics.clone()),
+        ),
     }
 }
 

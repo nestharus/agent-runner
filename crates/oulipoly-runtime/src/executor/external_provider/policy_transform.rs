@@ -8,17 +8,22 @@ pub(crate) fn apply_policy_transform(
     candidate: LaunchCandidate,
     result: PolicyEvaluateResult,
 ) -> Result<LaunchCandidate, ExternalProviderDispatchError> {
-    ensure_policy_accepted(&result)?;
-    Ok(apply_accepted_policy_transform(candidate, result))
+    Ok(apply_accepted_policy_transform(
+        candidate,
+        accepted_policy_transform(result)?,
+    ))
 }
 
-fn ensure_policy_accepted(
-    result: &PolicyEvaluateResult,
-) -> Result<(), ExternalProviderDispatchError> {
-    result
-        .accepted
-        .then_some(())
-        .ok_or_else(ExternalProviderDispatchError::policy_rejected)
+fn accepted_policy_transform(
+    result: PolicyEvaluateResult,
+) -> Result<PolicyEvaluateResult, ExternalProviderDispatchError> {
+    if result.accepted {
+        Ok(result)
+    } else {
+        Err(ExternalProviderDispatchError::policy_rejected(
+            result.diagnostics,
+        ))
+    }
 }
 
 fn apply_accepted_policy_transform(
@@ -45,11 +50,18 @@ fn apply_accepted_policy_transform(
 }
 
 fn replace_arg_prompt(argv: &mut [String], previous: &str, next: &str) {
-    if let Some(last) = argv.last_mut()
-        && prompt_arg_matches(last, previous)
-    {
-        replace_prompt_arg(last, next);
+    if let Some(target) = matching_prompt_arg(argv, previous) {
+        replace_prompt_arg(target, next);
     }
+}
+
+fn matching_prompt_arg<'a>(argv: &'a mut [String], expected: &str) -> Option<&'a mut String> {
+    let candidate = final_prompt_arg(argv)?;
+    prompt_arg_matches(candidate, expected).then_some(candidate)
+}
+
+fn final_prompt_arg(argv: &mut [String]) -> Option<&mut String> {
+    argv.last_mut()
 }
 
 fn prompt_arg_matches(candidate: &str, expected: &str) -> bool {

@@ -1,5 +1,7 @@
 //! Role: formatter.
 
+use oulipoly_provider::generated::Diagnostic;
+
 #[derive(Debug, Clone)]
 pub(crate) enum ExternalProviderDispatchError {
     MissingCapability { capability: &'static str },
@@ -7,7 +9,7 @@ pub(crate) enum ExternalProviderDispatchError {
     ProviderTransport { category: String },
     ProviderProtocol { category: String },
     CancellationFallback { reason: String },
-    PolicyRejected,
+    PolicyRejected { diagnostics: Vec<Diagnostic> },
 }
 
 impl ExternalProviderDispatchError {
@@ -37,7 +39,7 @@ impl ExternalProviderDispatchError {
         }
     }
 
-    pub(crate) fn policy_rejected() -> Self {
-        Self::PolicyRejected
+    pub(crate) fn policy_rejected(diagnostics: Vec<Diagnostic>) -> Self {
+        Self::PolicyRejected { diagnostics }
     }
 }
