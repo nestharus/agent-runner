@@ -9,7 +9,13 @@ use oulipoly_provider::generated::{
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+const HOME_ENV: &str = "HOME";
+const OPENCODE_ACCOUNT_PREFIX: &str = "opencode";
+const PATH_ENV: &str = "PATH";
+const PARENT_INVOCATION_ENV: &str = "OULIPOLY_PARENT_INVOCATION";
+const XDG_DATA_HOME_ENV: &str = "XDG_DATA_HOME";
 
 #[derive(Debug, Clone)]
 pub(crate) struct LaunchCandidate {
@@ -24,20 +30,81 @@ pub(crate) struct LaunchCandidate {
 pub(crate) fn build_launch_candidate(
     context: &ExternalProviderDispatchContext,
 ) -> Result<LaunchCandidate, String> {
-    let mut env = std::env::vars().collect::<BTreeMap<_, _>>();
-    if let Some(parent) = &context.parent_invocation_env {
-        env.insert("OULIPOLY_PARENT_INVOCATION".to_string(), parent.clone());
-    }
     let input_args = resolve_input_flags(&context.model, &context.extra_inputs)?;
 
     Ok(LaunchCandidate {
         argv: provider_argv(context, &input_args),
-        env,
+        env: declared_launch_env(context),
         stdin: launch_stdin(context),
         prompt: context.prompt.clone(),
         prompt_mode: context.prompt_mode,
         working_directory: working_directory(context),
     })
+}
+
+fn declared_launch_env(context: &ExternalProviderDispatchContext) -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    insert_ambient_env(&mut env, PATH_ENV);
+    insert_ambient_env(&mut env, HOME_ENV);
+    insert_selected_opencode_auth_env(&mut env, context);
+    if let Some(parent) = &context.parent_invocation_env {
+        env.insert(PARENT_INVOCATION_ENV.to_string(), parent.clone());
+    }
+    env
+}
+
+fn insert_ambient_env(env: &mut BTreeMap<String, String>, key: &str) {
+    if let Ok(value) = std::env::var(key) {
+        env.insert(key.to_string(), value);
+    }
+}
+
+fn insert_selected_opencode_auth_env(
+    env: &mut BTreeMap<String, String>,
+    context: &ExternalProviderDispatchContext,
+) {
+    let Some(index) = selected_opencode_account_index(context) else {
+        return;
+    };
+    if index == 1 {
+        return;
+    }
+    if let Some(home) = env.get(HOME_ENV) {
+        env.insert(
+            XDG_DATA_HOME_ENV.to_string(),
+            Path::new(home)
+                .join(format!(".{OPENCODE_ACCOUNT_PREFIX}{index}"))
+                .display()
+                .to_string(),
+        );
+    }
+}
+
+fn selected_opencode_account_index(context: &ExternalProviderDispatchContext) -> Option<u8> {
+    opencode_account_index(&context.provider.name)
+        .or_else(|| opencode_account_index_from_command(&context.provider.command))
+}
+
+fn opencode_account_index_from_command(command: &str) -> Option<u8> {
+    shell_split(command)
+        .iter()
+        .rev()
+        .find_map(|part| opencode_account_index(part))
+}
+
+fn opencode_account_index(value: &str) -> Option<u8> {
+    let name = Path::new(value)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(value);
+    match name {
+        "opencode" | "opencode1" => Some(1),
+        "opencode2" => Some(2),
+        "opencode3" => Some(3),
+        "opencode4" => Some(4),
+        "opencode5" => Some(5),
+        _ => None,
+    }
 }
 
 pub(crate) fn build_policy_request(

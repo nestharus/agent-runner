@@ -9,13 +9,15 @@ use oulipoly_runtime::executor::cli::{self, EffectiveExecuteRequest};
 use oulipoly_runtime::provider_registry::{ProviderRegistry, ProviderRegistryOptions};
 use oulipoly_runtime::services::{ExecutorServicePort, ExecutorServiceRequest, ServiceError};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 const SELECTED_PROVIDER_SETTINGS_ID: &str = "provider-a-account";
+static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 struct ScriptFixture {
     _dir: tempfile::TempDir,
@@ -64,6 +66,49 @@ enum LaunchMode {
 #[derive(Debug, Default)]
 struct DispatchSeamObservation {
     registry_injected: bool,
+}
+
+struct EnvScope {
+    previous: Vec<(&'static str, Option<OsString>)>,
+}
+
+impl EnvScope {
+    fn set(vars: &[(&'static str, &str)]) -> Self {
+        let previous = vars
+            .iter()
+            .map(|(key, _)| (*key, std::env::var_os(key)))
+            .collect();
+        for (key, value) in vars {
+            set_env(key, Some(std::ffi::OsStr::new(*value)));
+        }
+        Self { previous }
+    }
+}
+
+impl Drop for EnvScope {
+    fn drop(&mut self) {
+        for (key, value) in self.previous.drain(..) {
+            set_env(key, value.as_deref());
+        }
+    }
+}
+
+fn env_lock() -> MutexGuard<'static, ()> {
+    ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+}
+
+fn set_env(key: &str, value: Option<&std::ffi::OsStr>) {
+    // SAFETY: tests that call this helper hold ENV_LOCK for the full EnvScope lifetime.
+    unsafe {
+        if let Some(value) = value {
+            std::env::set_var(key, value);
+        } else {
+            std::env::remove_var(key);
+        }
+    }
 }
 
 fn fixture_script(body: &str) -> ScriptFixture {
@@ -965,6 +1010,135 @@ fn external_provider_launch_request_carries_selected_settings_id_and_effective_i
         launch["params"].get("stdin").is_none(),
         "arg-mode provider launches must not send the prompt on stdin"
     );
+}
+
+#[test]
+fn external_provider_launch_env_uses_selected_opencode_auth_context_without_openai_keys() {
+    let _lock = env_lock();
+    let home = tempfile::tempdir().expect("home tempdir");
+    let ambient_xdg = tempfile::tempdir().expect("ambient xdg tempdir");
+    let home = home.path().display().to_string();
+    let ambient_xdg = ambient_xdg.path().display().to_string();
+    let expected_xdg = Path::new(&home).join(".opencode2").display().to_string();
+    let _env = EnvScope::set(&[
+        ("HOME", home.as_str()),
+        ("XDG_DATA_HOME", ambient_xdg.as_str()),
+        ("OPENAI_API_KEY", "ambient-openai-secret-do-not-propagate"),
+        ("OPENAI_BASE_URL", "https://ambient-openai.example.invalid"),
+    ]);
+    let fixture = make_external_fixture(
+        Capabilities {
+            policy: true,
+            launch: true,
+        },
+        PolicyMode::Accept,
+        LaunchMode::Success,
+    );
+    let mut model = external_model(&fixture);
+    model.providers[0].name = "opencode2".to_string();
+    model.providers[0].command = "opencode2".to_string();
+    let registry = dispatch_registry_for_models(std::slice::from_ref(&model));
+
+    execute_dispatch_aware_result(
+        registry,
+        ExecutorServiceRequest::Facade {
+            model,
+            provider_index: 0,
+            prompt: "prompt-value".to_string(),
+            working_dir: None,
+            extra_inputs: HashMap::new(),
+            parent_invocation_env: None,
+        },
+    )
+    .expect("external dispatch should declare selected account auth env");
+
+    let policy = read_json(&fixture.policy_record_path);
+    let launch = read_json(&fixture.launch_record_path);
+    for env in [&policy["params"]["launch"]["env"], &launch["params"]["env"]] {
+        let env = env.as_object().expect("params.env should be an object");
+        assert_eq!(
+            env.get("HOME").and_then(|value| value.as_str()),
+            Some(home.as_str())
+        );
+        assert_eq!(
+            env.get("XDG_DATA_HOME").and_then(|value| value.as_str()),
+            Some(expected_xdg.as_str()),
+            "selected opencode2 account must override the runner's ambient XDG_DATA_HOME"
+        );
+        assert_ne!(
+            env.get("XDG_DATA_HOME").and_then(|value| value.as_str()),
+            Some(ambient_xdg.as_str()),
+            "ambient runner XDG_DATA_HOME must not leak into opencode child auth context"
+        );
+        assert!(
+            env.keys().all(|key| {
+                !key.starts_with("OPENAI_API_KEY") && !key.starts_with("OPENAI_BASE_URL")
+            }),
+            "OpenAI env keys must not cross the external-provider params.env boundary: {env:?}"
+        );
+        assert!(
+            !serde_json::to_string(env)
+                .expect("env serializes")
+                .contains("ambient-openai-secret-do-not-propagate"),
+            "OpenAI env values must not cross the external-provider params.env boundary: {env:?}"
+        );
+    }
+}
+
+#[test]
+fn external_provider_launch_env_omits_ambient_xdg_for_default_opencode_auth_context() {
+    let _lock = env_lock();
+    let ambient_xdg = tempfile::tempdir().expect("ambient xdg tempdir");
+    let ambient_xdg = ambient_xdg.path().display().to_string();
+    let _env = EnvScope::set(&[
+        ("XDG_DATA_HOME", ambient_xdg.as_str()),
+        ("OPENAI_API_KEY", "ambient-openai-secret-do-not-propagate"),
+    ]);
+    let fixture = make_external_fixture(
+        Capabilities {
+            policy: true,
+            launch: true,
+        },
+        PolicyMode::Accept,
+        LaunchMode::Success,
+    );
+    let mut model = external_model(&fixture);
+    model.providers[0].name = "opencode".to_string();
+    model.providers[0].command = "opencode1".to_string();
+    let registry = dispatch_registry_for_models(std::slice::from_ref(&model));
+
+    execute_dispatch_aware_result(
+        registry,
+        ExecutorServiceRequest::Facade {
+            model,
+            provider_index: 0,
+            prompt: "prompt-value".to_string(),
+            working_dir: None,
+            extra_inputs: HashMap::new(),
+            parent_invocation_env: None,
+        },
+    )
+    .expect("external dispatch should preserve default opencode auth env");
+
+    let policy = read_json(&fixture.policy_record_path);
+    let launch = read_json(&fixture.launch_record_path);
+    for env in [&policy["params"]["launch"]["env"], &launch["params"]["env"]] {
+        let env = env.as_object().expect("params.env should be an object");
+        assert!(
+            !env.contains_key("XDG_DATA_HOME"),
+            "default opencode auth must use the default XDG data dir, not the runner's ambient XDG_DATA_HOME: {env:?}"
+        );
+        assert!(
+            env.keys().all(|key| !key.starts_with("OPENAI_API_KEY")),
+            "OpenAI env keys must not cross the external-provider params.env boundary: {env:?}"
+        );
+        assert!(
+            !serde_json::to_string(env)
+                .expect("env serializes")
+                .contains("ambient-openai-secret-do-not-propagate"),
+            "OpenAI env values must not cross the external-provider params.env boundary: {env:?}"
+        );
+    }
 }
 
 #[test]
