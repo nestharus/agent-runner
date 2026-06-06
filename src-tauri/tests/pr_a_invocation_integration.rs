@@ -5,12 +5,14 @@ use rusqlite::params;
 use serde_json::Value;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::{Duration, Instant};
 
 // These tests start with an empty invocation table. When a child row is seeded
 // before the CLI run, the supervised parent row created by that run receives id 2.
 const FIRST_PARENT_ROW_ID_IN_FRESH_FIXTURE: i64 = 2;
+const AGENT_BASH_BIN_ENV: &str = "AGENT_BASH_BIN";
 
 struct Fixture {
     _dir: tempfile::TempDir,
@@ -84,6 +86,10 @@ prompt_mode = "arg"
             .join("state.db")
     }
 
+    fn state_home(&self) -> PathBuf {
+        self._dir.path().join("state")
+    }
+
     fn open_db(&self) -> StateDb {
         StateDb::open(&self.db_path()).unwrap()
     }
@@ -104,6 +110,74 @@ prompt_mode = "arg"
         }
         cmd.output().unwrap()
     }
+}
+
+fn run_agent_bash_nested_child(
+    fixture: &Fixture,
+    parent_env: &str,
+    agent_bash_bin: &Path,
+) -> String {
+    let command = nested_child_command(fixture);
+    let mut run = Command::new(agent_bash_bin);
+    run.arg("run").arg("--").arg("bash").arg("-lc").arg(command);
+    configure_agent_bash_env(&mut run, fixture, parent_env);
+    let output = run.output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let dispatch: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let handle = dispatch["handle"].as_str().expect("agent-bash handle");
+    wait_for_agent_bash_done(fixture, agent_bash_bin, handle)
+}
+
+fn nested_child_command(fixture: &Fixture) -> String {
+    format!(
+        "{} --models-dir {} --model fixture ping",
+        shell_quote(env!("CARGO_BIN_EXE_oulipoly-agent-runner")),
+        shell_quote(&fixture.models_dir.to_string_lossy())
+    )
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn configure_agent_bash_env(command: &mut Command, fixture: &Fixture, parent_env: &str) {
+    command.env("XDG_CONFIG_HOME", &fixture.config_home);
+    command.env("XDG_DATA_HOME", &fixture.data_home);
+    command.env("XDG_STATE_HOME", fixture.state_home());
+    command.env("OULIPOLY_PARENT_INVOCATION", parent_env);
+    command.env_remove("OULIPOLY_DATA_DIR");
+}
+
+fn wait_for_agent_bash_done(fixture: &Fixture, agent_bash_bin: &Path, handle: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last = String::new();
+    while Instant::now() < deadline {
+        last = agent_bash_status(fixture, agent_bash_bin, handle);
+        if last.starts_with("DONE") {
+            return last;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("agent-bash job did not finish: {last}");
+}
+
+fn agent_bash_status(fixture: &Fixture, agent_bash_bin: &Path, handle: &str) -> String {
+    let mut status = Command::new(agent_bash_bin);
+    status.arg("status").arg("--full").arg(handle);
+    status.env("XDG_STATE_HOME", fixture.state_home());
+    let output = status.output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+fn agent_bash_bin_from_env() -> Option<PathBuf> {
+    let value = std::env::var_os(AGENT_BASH_BIN_ENV)?;
+    let path = PathBuf::from(value);
+    assert!(
+        path.is_file(),
+        "{AGENT_BASH_BIN_ENV} must point to an agent-bash binary"
+    );
+    Some(path)
 }
 
 fn parse_invocation(stderr: &str) -> CompositeInvocationId {
@@ -249,6 +323,40 @@ fn resolves_parent_env_and_overwrites_child_subprocess_env() {
         fs::read_to_string(&fixture.env_dump_path).unwrap(),
         serde_json::to_string(&child).unwrap()
     );
+}
+
+#[test]
+fn nested_agent_bash_chain_records_parent_id_from_inherited_env() {
+    let Some(agent_bash_bin) = agent_bash_bin_from_env() else {
+        eprintln!("skipping nested agent-bash regression; set {AGENT_BASH_BIN_ENV} to run it");
+        return;
+    };
+    let fixture = Fixture::new();
+
+    let parent_output = fixture.run(None);
+    assert!(parent_output.status.success());
+    let parent = parse_invocation(&String::from_utf8_lossy(&parent_output.stderr));
+    let parent_row = fixture
+        .open_db()
+        .get_invocation_by_uuid(&parent.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(parent_row.status, InvocationStatus::Succeeded);
+    let parent_env = serde_json::to_string(&parent).unwrap();
+
+    let status = run_agent_bash_nested_child(&fixture, &parent_env, &agent_bash_bin);
+
+    assert!(status.starts_with("DONE rc=0"), "{status}");
+    let child = parse_valid_invocations(&status)
+        .into_iter()
+        .find(|invocation| invocation.id != parent.id)
+        .expect("nested child invocation marker should be captured");
+    let child_row = fixture
+        .open_db()
+        .get_invocation_by_uuid(&child.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(child_row.parent_invocation_id, Some(parent_row.id));
 }
 
 #[test]

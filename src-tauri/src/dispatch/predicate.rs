@@ -1,7 +1,6 @@
 //! Declared roles: predicate, accessor
 
 use oulipoly_config::ModelConfig;
-use oulipoly_state::{CompositeInvocationId, InvocationRecord};
 use std::collections::HashMap;
 
 pub(crate) fn diagnostics_model_configured(models: &HashMap<String, ModelConfig>) -> bool {
@@ -22,11 +21,4 @@ pub(crate) fn should_emit_resume_short_line(_is_terminal: bool) -> bool {
 
 pub(crate) fn execution_succeeded(exit_code: i32) -> bool {
     exit_code == 0
-}
-
-pub(super) fn parent_invocation_source_matches(
-    record: &InvocationRecord,
-    composite: &CompositeInvocationId,
-) -> bool {
-    record.provider_name.as_deref() == Some(composite.source.as_str())
 }

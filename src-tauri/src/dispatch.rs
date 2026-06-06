@@ -1001,6 +1001,31 @@ mod tests {
     }
 
     #[test]
+    fn resolve_parent_invocation_id_uses_same_db_uuid_despite_source_name_drift() {
+        let db = test_db();
+        let parent = CompositeInvocationId {
+            source: "renamed-provider".to_string(),
+            id: Uuid::new_v4().to_string(),
+        };
+        let row_id = db
+            .start_invocation(&InvocationStart {
+                invocation_uuid: parent.id.clone(),
+                model_name: "fixture-model".to_string(),
+                provider_name: "fixture-provider".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        db.finalize_invocation(row_id, false, 1, None, Some("exit_nonzero"))
+            .unwrap();
+        let parent_env = serde_json::to_string(&parent).unwrap();
+
+        with_parent_invocation_env(Some(&parent_env), || {
+            assert_eq!(resolve_parent_invocation_id(&db), Some(row_id));
+        });
+    }
+
+    #[test]
     fn resolve_parent_invocation_id_returns_none_for_malformed_json() {
         let db = test_db();
         with_parent_invocation_env(Some("not-json"), || {

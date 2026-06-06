@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use chrono::{Duration, Utc};
+use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRecord, ProcessIdentity};
 use oulipoly_state::{InvocationStart, InvocationStatus, StateDb};
 use rusqlite::params;
 use serde_json::Value;
@@ -74,6 +75,12 @@ prompt_mode = "arg"
             .join("state.db")
     }
 
+    fn sidecar_path(&self) -> PathBuf {
+        self.data_home
+            .join("oulipoly-agent-runner")
+            .join("pid-identity.db")
+    }
+
     fn open_db(&self) -> StateDb {
         StateDb::open(&self.db_path()).unwrap()
     }
@@ -124,7 +131,7 @@ prompt_mode = "arg"
         .unwrap();
     }
 
-    fn seed_stale_running_trace_row(&self) {
+    fn seed_stale_running_trace_row(&self) -> i64 {
         let db = self.open_db();
         let row_id = db
             .start_invocation(&InvocationStart {
@@ -141,6 +148,28 @@ prompt_mode = "arg"
                 "UPDATE invocations SET created_at = ?1 WHERE id = ?2",
                 params![created_at, row_id],
             )
+            .unwrap();
+        row_id
+    }
+
+    fn seed_stale_running_trace_row_with_dead_pid(&self) {
+        self.seed_stale_running_trace_row();
+        let sidecar = PidIdentityDb::open(&self.sidecar_path()).unwrap();
+        let identity = ProcessIdentity {
+            os_pid: 9_999_999,
+            os_boot_id: "fixture-boot".to_string(),
+            os_pid_starttime_ticks: 1,
+        };
+        sidecar
+            .record_identity(PidIdentityRecord {
+                identity: &identity,
+                os_pgid: None,
+                invocation_uuid: ROOT_UUID,
+                session_id: None,
+                provider_name: Some("fixture-provider"),
+                model_name: Some("fixture"),
+                recorded_at: "2026-04-17T08:00:00Z",
+            })
             .unwrap();
     }
 
@@ -277,6 +306,39 @@ fn trace_json_stale_running_row_is_lifted_without_mutating_db() {
     assert_eq!(stored.exit_code, None);
     assert_eq!(stored.terminal_reason, None);
     assert_eq!(stored.finished_at, None);
+}
+
+#[test]
+fn trace_reconciles_liveness_stale_running_row_with_dead_pid() {
+    let fixture = Fixture::new();
+    fixture.seed_stale_running_trace_row_with_dead_pid();
+
+    let output = fixture.run_trace(&["--json"]);
+
+    assert!(output.status.success(), "{output:?}");
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let invocation = &json["root"]["invocation"];
+    assert_eq!(invocation["status"], "failed");
+    assert_eq!(invocation["success"], false);
+    assert_eq!(invocation["exit_code"], -1);
+    assert_eq!(invocation["terminal_reason"], "stale_running_liveness");
+    assert!(invocation["finished_at"].is_string());
+    assert!(invocation.get("stale_running").is_none());
+
+    let stored = fixture
+        .open_db()
+        .get_invocation_by_uuid(ROOT_UUID)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, InvocationStatus::Failed);
+    assert_eq!(stored.success, Some(false));
+    assert_eq!(stored.exit_code, Some(-1));
+    assert_eq!(stored.error_category.as_deref(), Some("stale_running"));
+    assert_eq!(
+        stored.terminal_reason.as_deref(),
+        Some("stale_running_liveness")
+    );
+    assert!(stored.finished_at.is_some());
 }
 
 #[test]
