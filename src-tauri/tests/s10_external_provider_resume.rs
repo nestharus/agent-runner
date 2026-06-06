@@ -20,8 +20,42 @@ struct Fixture {
     record_path: PathBuf,
 }
 
+#[derive(Debug)]
+struct InvocationSessionRow {
+    session_id: Option<String>,
+    session_capture_method: Option<String>,
+    provider_session_id: Option<String>,
+    resume_input_id: Option<String>,
+    provider_session_capture_method: Option<String>,
+}
+
+struct ProviderOptions {
+    launch_session_key: &'static str,
+    session_capability: bool,
+}
+
+impl ProviderOptions {
+    fn provider_session_id() -> Self {
+        Self {
+            launch_session_key: "provider_session_id",
+            session_capability: true,
+        }
+    }
+
+    fn session_id_without_session_capability() -> Self {
+        Self {
+            launch_session_key: "session_id",
+            session_capability: false,
+        }
+    }
+}
+
 impl Fixture {
     fn new() -> Self {
+        Self::new_with_provider_options(ProviderOptions::provider_session_id())
+    }
+
+    fn new_with_provider_options(options: ProviderOptions) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let config_home = dir.path().join("config");
         let data_home = dir.path().join("data");
@@ -34,7 +68,7 @@ impl Fixture {
         fs::create_dir_all(&hostile_cwd).unwrap();
 
         let record_path = dir.path().join("provider-records.jsonl");
-        let provider_path = write_external_provider(dir.path(), &record_path);
+        let provider_path = write_external_provider(dir.path(), &record_path, options);
         fs::write(
             models_dir.join(format!("{MODEL}.toml")),
             format!(
@@ -108,6 +142,36 @@ prompt_mode = "arg"
         cmd
     }
 
+    fn db_path(&self) -> PathBuf {
+        self.data_home
+            .join("oulipoly-agent-runner")
+            .join("state.db")
+    }
+
+    fn invocation_session_rows(&self) -> Vec<InvocationSessionRow> {
+        let conn = rusqlite::Connection::open(self.db_path()).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT session_id, session_capture_method, provider_session_id,
+                        resume_input_id, provider_session_capture_method
+                   FROM invocations
+                  ORDER BY id",
+            )
+            .unwrap();
+        stmt.query_map([], |row| {
+            Ok(InvocationSessionRow {
+                session_id: row.get(0)?,
+                session_capture_method: row.get(1)?,
+                provider_session_id: row.get(2)?,
+                resume_input_id: row.get(3)?,
+                provider_session_capture_method: row.get(4)?,
+            })
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+    }
+
     fn records(&self) -> Vec<Value> {
         fs::read_to_string(&self.record_path)
             .unwrap()
@@ -162,6 +226,53 @@ fn external_provider_resume_without_rotate_uses_external_launch_and_recorded_cwd
         None,
         "provider_name lives in session requests, not launch params"
     );
+
+    assert_external_launch_session_capture_rows(&fixture.invocation_session_rows());
+}
+
+#[test]
+fn external_launch_session_id_alias_persists_external_capture_method_without_session_capability() {
+    let fixture = Fixture::new_with_provider_options(
+        ProviderOptions::session_id_without_session_capability(),
+    );
+
+    let launch = fixture.run_launch();
+    assert_success(&launch);
+    let stderr = String::from_utf8_lossy(&launch.stderr);
+    assert!(stderr.contains("Session ingest failed"), "{stderr}");
+
+    let rows = fixture.invocation_session_rows();
+    assert_eq!(rows.len(), 1, "rows: {rows:?}");
+    assert_external_launch_session_capture_row(&rows[0]);
+}
+
+fn assert_external_launch_session_capture_rows(rows: &[InvocationSessionRow]) {
+    assert_eq!(rows.len(), 2, "rows: {rows:?}");
+    assert_external_launch_session_capture_row(&rows[0]);
+
+    let resume = &rows[1];
+    assert_eq!(resume.session_id.as_deref(), Some(SESSION_ID));
+    assert_eq!(resume.session_capture_method.as_deref(), Some("resumed"));
+    assert_eq!(resume.provider_session_id.as_deref(), Some(SESSION_ID));
+    assert_eq!(resume.resume_input_id.as_deref(), Some(SESSION_ID));
+    assert_eq!(
+        resume.provider_session_capture_method.as_deref(),
+        Some("resumed")
+    );
+}
+
+fn assert_external_launch_session_capture_row(launch: &InvocationSessionRow) {
+    assert_eq!(launch.session_id.as_deref(), Some(SESSION_ID));
+    assert_eq!(
+        launch.session_capture_method.as_deref(),
+        Some("external_provider_launch")
+    );
+    assert_eq!(launch.provider_session_id.as_deref(), Some(SESSION_ID));
+    assert_eq!(launch.resume_input_id.as_deref(), None);
+    assert_eq!(
+        launch.provider_session_capture_method.as_deref(),
+        Some("external_provider_launch")
+    );
 }
 
 fn assert_success(output: &Output) {
@@ -195,17 +306,17 @@ fn assert_no_rotation_or_migration_provider_calls(records: &[Value]) {
     );
 }
 
-fn write_external_provider(dir: &Path, record_path: &Path) -> PathBuf {
+fn write_external_provider(dir: &Path, record_path: &Path, options: ProviderOptions) -> PathBuf {
     fs::write(record_path, "").unwrap();
     let path = dir.join("external-provider.py");
-    fs::write(&path, external_provider_script(record_path)).unwrap();
+    fs::write(&path, external_provider_script(record_path, options)).unwrap();
     let mut permissions = fs::metadata(&path).unwrap().permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&path, permissions).unwrap();
     path
 }
 
-fn external_provider_script(record_path: &Path) -> String {
+fn external_provider_script(record_path: &Path, options: ProviderOptions) -> String {
     format!(
         r#"#!/usr/bin/env python3
 import base64
@@ -252,7 +363,7 @@ def describe():
             "launch": True,
             "policy": True,
             "quota": False,
-            "session": True,
+            "session": {session_capability},
             "terminal": False,
             "rotation": False,
             "discovery": False,
@@ -299,7 +410,7 @@ def launch():
             "observed_at_unix_ms": 1002,
         }},
         "session": {{
-            "provider_session_id": SESSION_ID,
+            {launch_session_key}: SESSION_ID,
             "state": {{"cursor": "after-launch"}},
         }},
     }})
@@ -345,6 +456,12 @@ else:
 "#,
         provider = serde_json::to_string(PROVIDER).unwrap(),
         session_id = serde_json::to_string(SESSION_ID).unwrap(),
+        launch_session_key = serde_json::to_string(options.launch_session_key).unwrap(),
+        session_capability = if options.session_capability {
+            "True"
+        } else {
+            "False"
+        },
         record_path = serde_json::to_string(&record_path.display().to_string()).unwrap(),
     )
 }
