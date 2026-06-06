@@ -442,14 +442,36 @@ impl RebuildFixture {
     }
 
     fn subcommands_for(&self, provider_id: &str) -> Vec<String> {
-        fs::read_to_string(&self.record)
-            .unwrap_or_default()
-            .lines()
-            .map(|line| serde_json::from_str::<RecordedCall>(line).unwrap())
-            .filter(|call| call.request["provider_instance_id"] == provider_id)
-            .map(|call| call.subcommand)
+        recorded_calls(&self.record)
+            .into_iter()
+            .filter(|call| recorded_call_is_for_provider(call, provider_id))
+            .map(recorded_call_subcommand)
             .collect()
     }
+}
+
+fn recorded_calls(path: &Path) -> Vec<RecordedCall> {
+    parse_recorded_calls(&recorded_calls_text(path))
+}
+
+fn recorded_calls_text(path: &Path) -> String {
+    fs::read_to_string(path).unwrap_or_default()
+}
+
+fn parse_recorded_calls(text: &str) -> Vec<RecordedCall> {
+    text.lines().map(parse_recorded_call).collect()
+}
+
+fn parse_recorded_call(line: &str) -> RecordedCall {
+    serde_json::from_str::<RecordedCall>(line).unwrap()
+}
+
+fn recorded_call_is_for_provider(call: &RecordedCall, provider_id: &str) -> bool {
+    call.request["provider_instance_id"] == provider_id
+}
+
+fn recorded_call_subcommand(call: RecordedCall) -> String {
+    call.subcommand
 }
 
 impl SettingsHostFixture {

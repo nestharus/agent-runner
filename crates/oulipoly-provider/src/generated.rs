@@ -61,10 +61,25 @@ impl<'de> Deserialize<'de> for TrueBool {
     where
         D: Deserializer<'de>,
     {
-        match bool::deserialize(deserializer)? {
-            true => Ok(Self),
-            false => Err(de::Error::custom("expected ok=true")),
-        }
+        true_bool_from_value(deserialize_protocol_bool(deserializer)?)
+    }
+}
+
+fn deserialize_protocol_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    bool::deserialize(deserializer)
+}
+
+fn true_bool_from_value<E>(value: bool) -> Result<TrueBool, E>
+where
+    E: de::Error,
+{
+    if value {
+        Ok(TrueBool)
+    } else {
+        Err(E::custom("expected ok=true"))
     }
 }
 
@@ -85,10 +100,18 @@ impl<'de> Deserialize<'de> for FalseBool {
     where
         D: Deserializer<'de>,
     {
-        match bool::deserialize(deserializer)? {
-            false => Ok(Self),
-            true => Err(de::Error::custom("expected ok=false")),
-        }
+        false_bool_from_value(deserialize_protocol_bool(deserializer)?)
+    }
+}
+
+fn false_bool_from_value<E>(value: bool) -> Result<FalseBool, E>
+where
+    E: de::Error,
+{
+    if value {
+        Err(E::custom("expected ok=false"))
+    } else {
+        Ok(FalseBool)
     }
 }
 
@@ -668,19 +691,30 @@ macro_rules! fixed_str_type {
             where
                 D: Deserializer<'de>,
             {
-                let actual = String::deserialize(deserializer)?;
-                if actual == $value {
-                    Ok(Self)
-                } else {
-                    Err(de::Error::custom(format!(
-                        "expected {}={:?}",
-                        stringify!($name),
-                        $value
-                    )))
-                }
+                deserialize_fixed_str_type(
+                    String::deserialize(deserializer)?,
+                    $value,
+                    stringify!($name),
+                )?;
+                Ok(Self)
             }
         }
     };
+}
+
+fn deserialize_fixed_str_type<E>(actual: String, expected: &str, type_name: &str) -> Result<(), E>
+where
+    E: de::Error,
+{
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(E::custom(fixed_str_type_error(type_name, expected)))
+    }
+}
+
+fn fixed_str_type_error(type_name: &str, expected: &str) -> String {
+    format!("expected {type_name}={expected:?}")
 }
 
 fixed_str_type!(LaunchStdoutKind, "stdout");

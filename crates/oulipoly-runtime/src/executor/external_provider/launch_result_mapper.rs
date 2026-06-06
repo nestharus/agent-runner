@@ -71,9 +71,13 @@ fn raw_provider_session_id(value: &Value) -> Option<&str> {
 }
 
 fn accepted_provider_session_id(session_id: &str) -> Option<String> {
-    if session_id.is_empty() {
-        None
-    } else {
-        Some(session_id.to_string())
-    }
+    provider_session_id_is_present(session_id).then(|| owned_provider_session_id(session_id))
+}
+
+fn provider_session_id_is_present(session_id: &str) -> bool {
+    !session_id.is_empty()
+}
+
+fn owned_provider_session_id(session_id: &str) -> String {
+    session_id.to_string()
 }

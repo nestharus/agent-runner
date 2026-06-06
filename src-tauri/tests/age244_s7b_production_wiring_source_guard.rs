@@ -236,13 +236,25 @@ fn read_source(relative: &str) -> String {
 }
 
 fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
-    let start_index = source
-        .find(start)
-        .unwrap_or_else(|| panic!("missing start marker {start:?}"));
-    let end_index = source[start_index..]
+    let start_index = source_marker_index(source, start);
+    let end_index = source_end_marker_index(source, start_index, start, end);
+    source_slice_between(source, start_index, end_index)
+}
+
+fn source_marker_index(source: &str, marker: &str) -> usize {
+    source
+        .find(marker)
+        .unwrap_or_else(|| panic!("missing start marker {marker:?}"))
+}
+
+fn source_end_marker_index(source: &str, start_index: usize, start: &str, end: &str) -> usize {
+    source[start_index..]
         .find(end)
         .map(|offset| start_index + offset)
-        .unwrap_or_else(|| panic!("missing end marker {end:?} after {start:?}"));
+        .unwrap_or_else(|| panic!("missing end marker {end:?} after {start:?}"))
+}
+
+fn source_slice_between(source: &str, start_index: usize, end_index: usize) -> &str {
     &source[start_index..end_index]
 }
 
@@ -261,10 +273,17 @@ fn assert_not_contains(context: &str, source: &str, needle: &str) {
 }
 
 fn assert_not_contains_compact(context: &str, source: &str, needle: &str) {
-    let compact_source = compact_whitespace(source);
-    let compact_needle = compact_whitespace(needle);
+    let (compact_source, compact_needle) = compact_source_and_needle(source, needle);
+    assert_compact_absent(context, &compact_source, &compact_needle, needle);
+}
+
+fn compact_source_and_needle(source: &str, needle: &str) -> (String, String) {
+    (compact_whitespace(source), compact_whitespace(needle))
+}
+
+fn assert_compact_absent(context: &str, compact_source: &str, compact_needle: &str, needle: &str) {
     assert!(
-        !compact_source.contains(&compact_needle),
+        !compact_source.contains(compact_needle),
         "{context} must not hard-code missing external-provider identity: found {needle:?}"
     );
 }

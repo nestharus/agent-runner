@@ -790,35 +790,84 @@ fn validate_provider_ref_headless_resume_target(
     target: &crate::resume_cli::ResumeExecutionTarget,
     selected_provider: &str,
 ) -> Result<(), String> {
-    let Some(model) = resolved.model.as_ref() else {
-        return Err(format!(
-            "provider-ref resume target {selected_provider} has no model config"
-        ));
+    let Some(model) = provider_ref_resolved_model(resolved) else {
+        return Err(provider_ref_missing_model_message(selected_provider));
     };
-    if model.provider.is_none() {
-        return Err(format!(
-            "provider-ref resume target {selected_provider} has no provider implementation"
+    if !provider_ref_model_has_implementation(model) {
+        return Err(provider_ref_missing_implementation_message(
+            selected_provider,
         ));
     }
-    let Some(target_member) = model.providers.get(target.provider_index) else {
-        return Err(format!(
-            "provider-ref resume target {selected_provider} has invalid provider index {}",
-            target.provider_index
+    let Some(target_member_name) = provider_ref_target_member_name(model, target.provider_index)
+    else {
+        return Err(provider_ref_invalid_index_message(
+            selected_provider,
+            target.provider_index,
         ));
     };
-    if target_member.name != selected_provider {
-        return Err(format!(
-            "provider-ref resume target {selected_provider} resolved provider {}",
-            target_member.name
+    if target_member_name != selected_provider {
+        return Err(provider_ref_resolved_provider_message(
+            selected_provider,
+            target_member_name,
         ));
     }
-    if target.provider.name != selected_provider {
-        return Err(format!(
-            "provider-ref resume target {selected_provider} loaded provider {}",
-            target.provider.name
+    let loaded_provider_name = provider_ref_loaded_provider_name(target);
+    if loaded_provider_name != selected_provider {
+        return Err(provider_ref_loaded_provider_message(
+            selected_provider,
+            loaded_provider_name,
         ));
     }
     Ok(())
+}
+
+fn provider_ref_resolved_model(
+    resolved: &oulipoly_state::ResolvedResume,
+) -> Option<&oulipoly_config::ModelConfig> {
+    resolved.model.as_ref()
+}
+
+fn provider_ref_model_has_implementation(model: &oulipoly_config::ModelConfig) -> bool {
+    model.provider.is_some()
+}
+
+fn provider_ref_target_member_name(
+    model: &oulipoly_config::ModelConfig,
+    provider_index: usize,
+) -> Option<&str> {
+    model
+        .providers
+        .get(provider_index)
+        .map(|provider| provider.name.as_str())
+}
+
+fn provider_ref_loaded_provider_name(target: &crate::resume_cli::ResumeExecutionTarget) -> &str {
+    &target.provider.name
+}
+
+fn provider_ref_missing_model_message(selected_provider: &str) -> String {
+    format!("provider-ref resume target {selected_provider} has no model config")
+}
+
+fn provider_ref_missing_implementation_message(selected_provider: &str) -> String {
+    format!("provider-ref resume target {selected_provider} has no provider implementation")
+}
+
+fn provider_ref_invalid_index_message(selected_provider: &str, provider_index: usize) -> String {
+    format!(
+        "provider-ref resume target {selected_provider} has invalid provider index {provider_index}"
+    )
+}
+
+fn provider_ref_resolved_provider_message(
+    selected_provider: &str,
+    resolved_provider: &str,
+) -> String {
+    format!("provider-ref resume target {selected_provider} resolved provider {resolved_provider}")
+}
+
+fn provider_ref_loaded_provider_message(selected_provider: &str, loaded_provider: &str) -> String {
+    format!("provider-ref resume target {selected_provider} loaded provider {loaded_provider}")
 }
 
 fn headless_resume_target_has_resume(target: &crate::resume_cli::ResumeExecutionTarget) -> bool {

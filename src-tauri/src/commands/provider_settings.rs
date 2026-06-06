@@ -417,23 +417,46 @@ fn packaged_model_block(
 fn packaged_provider_blocks(state: &AppState) -> ProviderSettingsCommandResult<Value> {
     let _providers =
         load_providers_for_models_dir_with(&state.models_dir, &*state.providers_config);
-    let path = state
+    read_provider_blocks(&providers_toml_path(state))
+}
+
+fn providers_toml_path(state: &AppState) -> std::path::PathBuf {
+    state
         .models_dir
         .parent()
         .unwrap_or(&state.models_dir)
-        .join("providers.toml");
-    let raw = if path.exists() {
-        read_toml_json(&path)?
+        .join("providers.toml")
+}
+
+fn read_provider_blocks(path: &Path) -> ProviderSettingsCommandResult<Value> {
+    if provider_blocks_file_exists(path) {
+        read_toml_json(path)
     } else {
-        Value::Object(Map::new())
-    };
-    Ok(raw)
+        Ok(empty_provider_blocks())
+    }
+}
+
+fn provider_blocks_file_exists(path: &Path) -> bool {
+    path.exists()
+}
+
+fn empty_provider_blocks() -> Value {
+    Value::Object(Map::new())
 }
 
 fn read_toml_json(path: &Path) -> ProviderSettingsCommandResult<Value> {
-    let text = std::fs::read_to_string(path).map_err(|error| simple_error("unavailable", error))?;
-    let value = toml::from_str::<toml::Value>(&text)
-        .map_err(|error| simple_error("invalid_request", error))?;
+    toml_json_value(parse_toml_value(&read_toml_text(path)?)?)
+}
+
+fn read_toml_text(path: &Path) -> ProviderSettingsCommandResult<String> {
+    std::fs::read_to_string(path).map_err(|error| simple_error("unavailable", error))
+}
+
+fn parse_toml_value(text: &str) -> ProviderSettingsCommandResult<toml::Value> {
+    toml::from_str::<toml::Value>(text).map_err(|error| simple_error("invalid_request", error))
+}
+
+fn toml_json_value(value: toml::Value) -> ProviderSettingsCommandResult<Value> {
     serde_json::to_value(value).map_err(|error| simple_error("failed", error))
 }
 
@@ -441,18 +464,23 @@ fn with_host<T>(
     state: &AppState,
     action: impl FnOnce(&ProviderSettingsHost) -> Result<T, ProviderSettingsError>,
 ) -> ProviderSettingsCommandResult<T> {
-    let host = state.provider_settings.lock().map_err(|error| {
-        Box::new(ProviderSettingsErrorDto {
-            category: "failed".to_string(),
-            code: Some("settings_host_lock".to_string()),
-            message: error.to_string(),
-            retryable: Some(false),
-            details: None,
-            diagnostics: Vec::new(),
-            process_status: None,
-        })
-    })?;
+    let host = state
+        .provider_settings
+        .lock()
+        .map_err(settings_host_lock_error)?;
     action(&host).map_err(map_error)
+}
+
+fn settings_host_lock_error<T>(error: std::sync::PoisonError<T>) -> Box<ProviderSettingsErrorDto> {
+    Box::new(ProviderSettingsErrorDto {
+        category: "failed".to_string(),
+        code: Some("settings_host_lock".to_string()),
+        message: error.to_string(),
+        retryable: Some(false),
+        details: None,
+        diagnostics: Vec::new(),
+        process_status: None,
+    })
 }
 
 fn settings_values(value: Value) -> ProviderSettingsCommandResult<SettingsValues> {
@@ -622,15 +650,7 @@ impl ProviderSettingsCommandHarness {
     }
 
     pub fn fail_validate_with_transport_error(&mut self, category: &str, message: &str) {
-        let error = ProviderSettingsErrorDto {
-            category: category.to_string(),
-            code: None,
-            message: message.to_string(),
-            retryable: Some(false),
-            details: None,
-            diagnostics: Vec::new(),
-            process_status: None,
-        };
+        let error = transport_error_dto(category, message);
         self.with_responses(|responses| responses.validate_error = Some(error));
     }
 
@@ -642,9 +662,25 @@ impl ProviderSettingsCommandHarness {
     }
 }
 
+fn transport_error_dto(category: &str, message: &str) -> ProviderSettingsErrorDto {
+    ProviderSettingsErrorDto {
+        category: category.to_string(),
+        code: None,
+        message: message.to_string(),
+        retryable: Some(false),
+        details: None,
+        diagnostics: Vec::new(),
+        process_status: None,
+    }
+}
+
 fn test_update_result(
     state: &AppState,
 ) -> Option<ProviderSettingsCommandResult<ProviderSettingsWriteDto>> {
+    test_update_error(state).map(command_error_result)
+}
+
+fn test_update_error(state: &AppState) -> Option<ProviderSettingsErrorDto> {
     state
         .provider_settings_test_double
         .lock()
@@ -654,12 +690,15 @@ fn test_update_result(
                 .as_ref()
                 .and_then(|responses| responses.update_error.clone())
         })
-        .map(|error| Err(Box::new(error)))
 }
 
 fn test_validate_result(
     state: &AppState,
 ) -> Option<ProviderSettingsCommandResult<ProviderSettingsValidateDto>> {
+    test_validate_error(state).map(command_error_result)
+}
+
+fn test_validate_error(state: &AppState) -> Option<ProviderSettingsErrorDto> {
     state
         .provider_settings_test_double
         .lock()
@@ -669,5 +708,8 @@ fn test_validate_result(
                 .as_ref()
                 .and_then(|responses| responses.validate_error.clone())
         })
-        .map(|error| Err(Box::new(error)))
+}
+
+fn command_error_result<T>(error: ProviderSettingsErrorDto) -> ProviderSettingsCommandResult<T> {
+    Err(Box::new(error))
 }

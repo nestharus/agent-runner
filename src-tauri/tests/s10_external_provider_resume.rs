@@ -20,6 +20,16 @@ struct Fixture {
     record_path: PathBuf,
 }
 
+struct FixturePaths {
+    config_home: PathBuf,
+    data_home: PathBuf,
+    app_config_dir: PathBuf,
+    models_dir: PathBuf,
+    workspace: PathBuf,
+    hostile_cwd: PathBuf,
+    record_path: PathBuf,
+}
+
 #[derive(Debug)]
 struct InvocationSessionRow {
     session_id: Option<String>,
@@ -57,54 +67,12 @@ impl Fixture {
 
     fn new_with_provider_options(options: ProviderOptions) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let config_home = dir.path().join("config");
-        let data_home = dir.path().join("data");
-        let app_config_dir = config_home.join("oulipoly-agent-runner");
-        let models_dir = app_config_dir.join("models");
-        let workspace = dir.path().join("workspace");
-        let hostile_cwd = dir.path().join("hostile-cwd");
-        fs::create_dir_all(&models_dir).unwrap();
-        fs::create_dir_all(&workspace).unwrap();
-        fs::create_dir_all(&hostile_cwd).unwrap();
-
-        let record_path = dir.path().join("provider-records.jsonl");
-        let provider_path = write_external_provider(dir.path(), &record_path, options);
-        fs::write(
-            models_dir.join(format!("{MODEL}.toml")),
-            format!(
-                r#"provider = {{ path = {:?} }}
-prompt_mode = "arg"
-
-[[providers]]
-name = {:?}
-args = ["--model", "haiku"]
-"#,
-                provider_path.display().to_string(),
-                PROVIDER,
-            ),
-        )
-        .unwrap();
-        fs::write(
-            app_config_dir.join("providers.toml"),
-            format!(
-                r#"[{PROVIDER}]
-command = "native-provider"
-args = ["--base"]
-prompt_mode = "arg"
-"#,
-            ),
-        )
-        .unwrap();
-
-        Self {
-            _dir: dir,
-            config_home,
-            data_home,
-            models_dir,
-            workspace,
-            hostile_cwd,
-            record_path,
-        }
+        let paths = fixture_paths(dir.path());
+        create_fixture_directories(&paths);
+        let provider_path = write_external_provider(dir.path(), &paths.record_path, options);
+        write_model_config(&paths.models_dir, &provider_path);
+        write_providers_config(&paths.app_config_dir);
+        fixture_from_paths(dir, paths)
     }
 
     fn run_launch(&self) -> Output {
@@ -155,31 +123,119 @@ prompt_mode = "arg"
                 "SELECT session_id, session_capture_method, provider_session_id,
                         resume_input_id, provider_session_capture_method
                    FROM invocations
-                  ORDER BY id",
+                   ORDER BY id",
             )
             .unwrap();
-        stmt.query_map([], |row| {
-            Ok(InvocationSessionRow {
-                session_id: row.get(0)?,
-                session_capture_method: row.get(1)?,
-                provider_session_id: row.get(2)?,
-                resume_input_id: row.get(3)?,
-                provider_session_capture_method: row.get(4)?,
-            })
-        })
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap()
+        stmt.query_map([], invocation_session_row)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
     }
 
     fn records(&self) -> Vec<Value> {
-        fs::read_to_string(&self.record_path)
-            .unwrap()
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect()
+        parse_provider_records(&provider_record_text(&self.record_path))
     }
+}
+
+fn fixture_paths(root: &Path) -> FixturePaths {
+    let config_home = root.join("config");
+    let app_config_dir = config_home.join("oulipoly-agent-runner");
+    FixturePaths {
+        data_home: root.join("data"),
+        models_dir: app_config_dir.join("models"),
+        workspace: root.join("workspace"),
+        hostile_cwd: root.join("hostile-cwd"),
+        record_path: root.join("provider-records.jsonl"),
+        config_home,
+        app_config_dir,
+    }
+}
+
+fn create_fixture_directories(paths: &FixturePaths) {
+    fs::create_dir_all(&paths.models_dir).unwrap();
+    fs::create_dir_all(&paths.workspace).unwrap();
+    fs::create_dir_all(&paths.hostile_cwd).unwrap();
+}
+
+fn write_model_config(models_dir: &Path, provider_path: &Path) {
+    fs::write(
+        models_dir.join(format!("{MODEL}.toml")),
+        model_config_toml(provider_path),
+    )
+    .unwrap();
+}
+
+fn model_config_toml(provider_path: &Path) -> String {
+    format!(
+        r#"provider = {{ path = {:?} }}
+prompt_mode = "arg"
+
+[[providers]]
+name = {:?}
+args = ["--model", "haiku"]
+"#,
+        provider_path.display().to_string(),
+        PROVIDER,
+    )
+}
+
+fn write_providers_config(app_config_dir: &Path) {
+    fs::write(
+        app_config_dir.join("providers.toml"),
+        providers_config_toml(),
+    )
+    .unwrap();
+}
+
+fn providers_config_toml() -> String {
+    format!(
+        r#"[{PROVIDER}]
+command = "native-provider"
+args = ["--base"]
+prompt_mode = "arg"
+"#,
+    )
+}
+
+fn fixture_from_paths(dir: tempfile::TempDir, paths: FixturePaths) -> Fixture {
+    Fixture {
+        _dir: dir,
+        config_home: paths.config_home,
+        data_home: paths.data_home,
+        models_dir: paths.models_dir,
+        workspace: paths.workspace,
+        hostile_cwd: paths.hostile_cwd,
+        record_path: paths.record_path,
+    }
+}
+
+fn invocation_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<InvocationSessionRow> {
+    Ok(InvocationSessionRow {
+        session_id: row.get(0)?,
+        session_capture_method: row.get(1)?,
+        provider_session_id: row.get(2)?,
+        resume_input_id: row.get(3)?,
+        provider_session_capture_method: row.get(4)?,
+    })
+}
+
+fn provider_record_text(path: &Path) -> String {
+    fs::read_to_string(path).unwrap()
+}
+
+fn parse_provider_records(text: &str) -> Vec<Value> {
+    text.lines()
+        .filter(|line| provider_record_line_has_content(line))
+        .map(parse_provider_record)
+        .collect()
+}
+
+fn provider_record_line_has_content(line: &str) -> bool {
+    !line.trim().is_empty()
+}
+
+fn parse_provider_record(line: &str) -> Value {
+    serde_json::from_str(line).unwrap()
 }
 
 #[test]
@@ -293,17 +349,29 @@ fn records_for_subcommand<'a>(records: &'a [Value], subcommand: &str) -> Vec<&'a
 }
 
 fn assert_no_rotation_or_migration_provider_calls(records: &[Value]) {
-    let subcommands = records
-        .iter()
-        .map(|record| record["subcommand"].as_str().unwrap_or_default())
-        .collect::<Vec<_>>();
+    let subcommands = provider_record_subcommands(records);
+    assert_no_forbidden_provider_subcommands(&subcommands);
+}
+
+fn provider_record_subcommands(records: &[Value]) -> Vec<&str> {
+    records.iter().map(provider_record_subcommand).collect()
+}
+
+fn provider_record_subcommand(record: &Value) -> &str {
+    record["subcommand"].as_str().unwrap_or_default()
+}
+
+fn assert_no_forbidden_provider_subcommands(subcommands: &[&str]) {
     assert!(
         subcommands
             .iter()
-            .all(|subcommand| !subcommand.starts_with("rotation.")
-                && !subcommand.starts_with("migration.")),
+            .all(|subcommand| provider_subcommand_is_allowed(subcommand)),
         "unexpected rotation/migration calls: {subcommands:?}"
     );
+}
+
+fn provider_subcommand_is_allowed(subcommand: &str) -> bool {
+    !subcommand.starts_with("rotation.") && !subcommand.starts_with("migration.")
 }
 
 fn write_external_provider(dir: &Path, record_path: &Path, options: ProviderOptions) -> PathBuf {

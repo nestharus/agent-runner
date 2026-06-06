@@ -1680,14 +1680,26 @@ fn assert_s7b_operation_strings_are_sanctioned_and_bounded() {
 }
 
 fn session_external_provider_sources(root: &Path) -> Vec<String> {
+    session_external_provider_source_paths(root)
+        .into_iter()
+        .map(read_session_external_provider_source)
+        .collect()
+}
+
+fn session_external_provider_source_paths(root: &Path) -> Vec<PathBuf> {
     fs::read_dir(root.join("session_external_provider"))
         .expect("session_external_provider dir")
-        .map(|entry| {
-            let path = entry.expect("source entry").path();
-            fs::read_to_string(&path)
-                .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
-        })
+        .map(source_entry_path)
         .collect()
+}
+
+fn source_entry_path(entry: std::io::Result<fs::DirEntry>) -> PathBuf {
+    entry.expect("source entry").path()
+}
+
+fn read_session_external_provider_source(path: PathBuf) -> String {
+    fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
 }
 
 fn assert_lifecycle_provider_registry_dispatch_terms(lifecycle_source: &str) {

@@ -583,17 +583,36 @@ fn external_session_runtime_db() -> Result<Option<oulipoly_state::mailbox::Mailb
 }
 
 fn validate_external_session_runtime_cwd(value: String) -> Result<PathBuf, MetadataError> {
-    let path = PathBuf::from(value);
-    if path.is_absolute() {
+    require_absolute_external_session_runtime_cwd(external_session_runtime_cwd_path(value))
+}
+
+fn external_session_runtime_cwd_path(value: String) -> PathBuf {
+    PathBuf::from(value)
+}
+
+fn require_absolute_external_session_runtime_cwd(path: PathBuf) -> Result<PathBuf, MetadataError> {
+    if external_session_runtime_cwd_is_absolute(&path) {
         Ok(path)
     } else {
-        Err(MetadataError::Operational {
-            message: format!(
-                "session_runtime_effective_cwd_not_absolute: {}",
-                path.display()
-            ),
-        })
+        Err(external_session_runtime_cwd_not_absolute(&path))
     }
+}
+
+fn external_session_runtime_cwd_is_absolute(path: &std::path::Path) -> bool {
+    path.is_absolute()
+}
+
+fn external_session_runtime_cwd_not_absolute(path: &std::path::Path) -> MetadataError {
+    MetadataError::Operational {
+        message: external_session_runtime_cwd_not_absolute_message(path),
+    }
+}
+
+fn external_session_runtime_cwd_not_absolute_message(path: &std::path::Path) -> String {
+    format!(
+        "session_runtime_effective_cwd_not_absolute: {}",
+        path.display()
+    )
 }
 
 fn external_session_runtime_error(message: String) -> MetadataError {

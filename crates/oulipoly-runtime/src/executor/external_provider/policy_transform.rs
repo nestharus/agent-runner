@@ -5,12 +5,26 @@ use super::request_builder::LaunchCandidate;
 use oulipoly_provider::generated::PolicyEvaluateResult;
 
 pub(crate) fn apply_policy_transform(
-    mut candidate: LaunchCandidate,
+    candidate: LaunchCandidate,
     result: PolicyEvaluateResult,
 ) -> Result<LaunchCandidate, ExternalProviderDispatchError> {
-    if !result.accepted {
-        return Err(ExternalProviderDispatchError::policy_rejected());
-    }
+    ensure_policy_accepted(&result)?;
+    Ok(apply_accepted_policy_transform(candidate, result))
+}
+
+fn ensure_policy_accepted(
+    result: &PolicyEvaluateResult,
+) -> Result<(), ExternalProviderDispatchError> {
+    result
+        .accepted
+        .then_some(())
+        .ok_or_else(ExternalProviderDispatchError::policy_rejected)
+}
+
+fn apply_accepted_policy_transform(
+    mut candidate: LaunchCandidate,
+    result: PolicyEvaluateResult,
+) -> LaunchCandidate {
     let argv_transformed = result.argv.is_some();
     if let Some(argv) = result.argv {
         candidate.argv = argv;
@@ -27,13 +41,21 @@ pub(crate) fn apply_policy_transform(
         }
         candidate.prompt = prompt;
     }
-    Ok(candidate)
+    candidate
 }
 
 fn replace_arg_prompt(argv: &mut [String], previous: &str, next: &str) {
     if let Some(last) = argv.last_mut()
-        && last == previous
+        && prompt_arg_matches(last, previous)
     {
-        *last = next.to_string();
+        replace_prompt_arg(last, next);
     }
+}
+
+fn prompt_arg_matches(candidate: &str, expected: &str) -> bool {
+    candidate == expected
+}
+
+fn replace_prompt_arg(target: &mut String, next: &str) {
+    *target = next.to_string();
 }

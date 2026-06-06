@@ -101,28 +101,35 @@ impl ProviderSettingsHost {
         &self,
         model_name: &str,
     ) -> Result<ProviderSettingsTarget, ProviderSettingsError> {
-        if let Some(target) = self
-            .target_cache
+        if let Some(target) = self.cached_settings_target(model_name) {
+            return Ok(target);
+        }
+        let target = self.load_settings_target(model_name)?;
+        self.cache_settings_target(model_name, &target);
+        Ok(target)
+    }
+
+    fn cached_settings_target(&self, model_name: &str) -> Option<ProviderSettingsTarget> {
+        self.target_cache
             .lock()
             .expect("settings target cache should not be poisoned")
             .get(model_name)
             .cloned()
-        {
-            return Ok(target);
-        }
+    }
+
+    fn load_settings_target(
+        &self,
+        model_name: &str,
+    ) -> Result<ProviderSettingsTarget, ProviderSettingsError> {
         let description = self.describe_provider(model_name)?;
-        let target = ProviderSettingsTarget {
-            model_name: model_name.to_string(),
-            provider_id: description.provider_id,
-            display_name: description.display_name,
-            settings_supported: description.capabilities.settings,
-            schema_id: description.settings_schema_id,
-        };
+        Ok(settings_target_from_description(model_name, description))
+    }
+
+    fn cache_settings_target(&self, model_name: &str, target: &ProviderSettingsTarget) {
         self.target_cache
             .lock()
             .expect("settings target cache should not be poisoned")
             .insert(model_name.to_string(), target.clone());
-        Ok(target)
     }
 
     pub fn configured_model_names(&self) -> Vec<String> {
@@ -298,6 +305,19 @@ impl ProviderSettingsHost {
                 .or_insert_with(|| Value::Object(Map::new()));
         }
         Ok(value)
+    }
+}
+
+fn settings_target_from_description(
+    model_name: &str,
+    description: DescribeResult,
+) -> ProviderSettingsTarget {
+    ProviderSettingsTarget {
+        model_name: model_name.to_string(),
+        provider_id: description.provider_id,
+        display_name: description.display_name,
+        settings_supported: description.capabilities.settings,
+        schema_id: description.settings_schema_id,
     }
 }
 

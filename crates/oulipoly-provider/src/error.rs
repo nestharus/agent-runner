@@ -133,21 +133,21 @@ impl ProviderCapabilityError {
     ) -> Result<Self, ProviderClientError> {
         let subcommand = subcommand.into();
         let request_id = request_id_from(&envelope);
-        let envelope: ErrorResponseEnvelope =
-            serde_json::from_value(envelope).map_err(|error| ProviderClientError::Protocol {
-                kind: HostErrorKind::SchemaInvalidErrorResponse,
-                subcommand: subcommand.clone(),
+        let envelope = parse_error_response_envelope(envelope).map_err(|error| {
+            schema_invalid_error_response(
+                &subcommand,
                 request_id,
-                description: error.to_string(),
-                diagnostics: Box::new(diagnostics.clone()),
-                process_status: process_status.clone().map(Box::new),
-            })?;
-        Ok(Self {
+                error,
+                diagnostics.clone(),
+                process_status.clone(),
+            )
+        })?;
+        Ok(capability_error_from_envelope(
             subcommand,
             envelope,
-            diagnostics: Box::new(diagnostics),
-            process_status: process_status.map(Box::new),
-        })
+            diagnostics,
+            process_status,
+        ))
     }
 
     pub fn request_id(&self) -> &str {
@@ -315,44 +315,16 @@ impl ProviderClientError {
         _stdin_error: Option<HostErrorKind>,
     ) -> Result<Value, Self> {
         let Some(envelope) = envelope else {
-            if process_status.exited_successfully() {
-                return Err(Self::protocol(
-                    HostErrorKind::EmptyStdout,
-                    subcommand,
-                    None,
-                    diagnostics,
-                ));
-            }
-            return Err(Self::host_transport(
-                HostErrorKind::ProviderProcessNonzero,
-                subcommand,
-                None,
-                diagnostics,
-            ));
+            return missing_non_launch_envelope_result(subcommand, &process_status, diagnostics);
         };
-        match envelope.get("ok").and_then(Value::as_bool) {
-            Some(false) => Err(Self::from_capability(
-                ProviderCapabilityError::from_valid_envelope(
-                    subcommand,
-                    envelope,
-                    diagnostics,
-                    Some(process_status),
-                )?,
-            )),
-            Some(true) if process_status.exited_successfully() => Ok(envelope),
-            Some(true) => Err(Self::host_transport(
-                HostErrorKind::ProviderProcessNonzeroWithSuccess,
-                subcommand,
-                request_id_from(&envelope),
-                diagnostics,
-            )),
-            None => Err(Self::protocol(
-                HostErrorKind::SchemaInvalidResponse,
-                subcommand,
-                request_id_from(&envelope),
-                diagnostics,
-            )),
-        }
+        let response_kind = non_launch_response_kind(&envelope, &process_status);
+        map_non_launch_response(
+            response_kind,
+            subcommand,
+            envelope,
+            process_status,
+            diagnostics,
+        )
     }
 
     pub fn is_provider_capability(&self) -> bool {
@@ -409,6 +381,120 @@ impl ProviderClientError {
             }
             Self::ProviderCapability(error) => error.diagnostics(),
         }
+    }
+}
+
+fn parse_error_response_envelope(
+    envelope: Value,
+) -> Result<ErrorResponseEnvelope, serde_json::Error> {
+    serde_json::from_value(envelope)
+}
+
+fn schema_invalid_error_response(
+    subcommand: &str,
+    request_id: Option<String>,
+    error: serde_json::Error,
+    diagnostics: ProviderDiagnostics,
+    process_status: Option<ProcessStatus>,
+) -> ProviderClientError {
+    ProviderClientError::Protocol {
+        kind: HostErrorKind::SchemaInvalidErrorResponse,
+        subcommand: subcommand.to_string(),
+        request_id,
+        description: error.to_string(),
+        diagnostics: Box::new(diagnostics),
+        process_status: process_status.map(Box::new),
+    }
+}
+
+fn capability_error_from_envelope(
+    subcommand: String,
+    envelope: ErrorResponseEnvelope,
+    diagnostics: ProviderDiagnostics,
+    process_status: Option<ProcessStatus>,
+) -> ProviderCapabilityError {
+    ProviderCapabilityError {
+        subcommand,
+        envelope,
+        diagnostics: Box::new(diagnostics),
+        process_status: process_status.map(Box::new),
+    }
+}
+
+enum NonLaunchResponseKind {
+    ProviderError,
+    Success,
+    SuccessWithNonzero,
+    SchemaInvalid,
+}
+
+fn missing_non_launch_envelope_result(
+    subcommand: &str,
+    process_status: &ProcessStatus,
+    diagnostics: ProviderDiagnostics,
+) -> Result<Value, ProviderClientError> {
+    if process_status.exited_successfully() {
+        Err(ProviderClientError::protocol(
+            HostErrorKind::EmptyStdout,
+            subcommand,
+            None,
+            diagnostics,
+        ))
+    } else {
+        Err(ProviderClientError::host_transport(
+            HostErrorKind::ProviderProcessNonzero,
+            subcommand,
+            None,
+            diagnostics,
+        ))
+    }
+}
+
+fn non_launch_response_kind(
+    envelope: &Value,
+    process_status: &ProcessStatus,
+) -> NonLaunchResponseKind {
+    match envelope_ok(envelope) {
+        Some(false) => NonLaunchResponseKind::ProviderError,
+        Some(true) if process_status.exited_successfully() => NonLaunchResponseKind::Success,
+        Some(true) => NonLaunchResponseKind::SuccessWithNonzero,
+        None => NonLaunchResponseKind::SchemaInvalid,
+    }
+}
+
+fn envelope_ok(envelope: &Value) -> Option<bool> {
+    envelope.get("ok").and_then(Value::as_bool)
+}
+
+fn map_non_launch_response(
+    kind: NonLaunchResponseKind,
+    subcommand: &str,
+    envelope: Value,
+    process_status: ProcessStatus,
+    diagnostics: ProviderDiagnostics,
+) -> Result<Value, ProviderClientError> {
+    match kind {
+        NonLaunchResponseKind::ProviderError => Err(ProviderClientError::from_capability(
+            ProviderCapabilityError::from_valid_envelope(
+                subcommand,
+                envelope,
+                diagnostics,
+                Some(process_status),
+            )?,
+        )),
+        NonLaunchResponseKind::Success => Ok(envelope),
+        NonLaunchResponseKind::SuccessWithNonzero => Err(ProviderClientError::host_transport(
+            HostErrorKind::ProviderProcessNonzeroWithSuccess,
+            subcommand,
+            request_id_from(&envelope),
+            diagnostics,
+        )),
+        NonLaunchResponseKind::SchemaInvalid => Err(ProviderClientError::protocol(
+            HostErrorKind::SchemaInvalidResponse,
+            subcommand,
+            request_id_from(&envelope),
+            diagnostics,
+        )),
     }
 }
 
