@@ -6,14 +6,12 @@
 //!     component: crates/oulipoly-runtime/src/executor/external_provider/context.rs
 //!     role: carrier
 //!     carrier: ExternalProviderDispatchContext
-//!     invariant: carrier == actual except settings_id, which is the approved neutral S6a fixture value
+//!     invariant: carrier == actual, with settings_id derived from the selected provider account
 //! ```
 
 use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig};
 use std::collections::HashMap;
 use std::path::PathBuf;
-
-pub(crate) const S6A_NEUTRAL_SETTINGS_ID: &str = "provider-a-test";
 
 #[derive(Debug, Clone)]
 pub(crate) struct ExternalProviderDispatchContext {
@@ -44,6 +42,7 @@ pub(crate) struct ExternalProviderDispatchInput {
 
 impl From<ExternalProviderDispatchInput> for ExternalProviderDispatchContext {
     fn from(input: ExternalProviderDispatchInput) -> Self {
+        let settings_id = input.provider.name.clone();
         Self {
             model: input.model,
             provider: input.provider,
@@ -54,7 +53,7 @@ impl From<ExternalProviderDispatchInput> for ExternalProviderDispatchContext {
             working_dir: input.working_dir,
             parent_invocation_env: input.parent_invocation_env,
             start_known_provider_session_id: input.start_known_provider_session_id,
-            settings_id: S6A_NEUTRAL_SETTINGS_ID.to_string(),
+            settings_id,
         }
     }
 }

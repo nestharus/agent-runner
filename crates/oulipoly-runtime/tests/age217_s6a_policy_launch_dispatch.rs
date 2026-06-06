@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-const NEUTRAL_SETTINGS_ID: &str = "provider-a-test";
+const SELECTED_PROVIDER_SETTINGS_ID: &str = "provider-a-account";
 
 struct ScriptFixture {
     _dir: tempfile::TempDir,
@@ -43,6 +43,7 @@ enum PolicyMode {
     Accept,
     Reject,
     Transform,
+    HybridShape,
 }
 
 #[derive(Clone, Copy)]
@@ -390,6 +391,7 @@ fn fake_provider_body(
         PolicyMode::Accept => "accept",
         PolicyMode::Reject => "reject",
         PolicyMode::Transform => "transform",
+        PolicyMode::HybridShape => "hybrid_shape",
     };
     let launch_mode = match launch_mode {
         LaunchMode::Success => "success",
@@ -468,6 +470,9 @@ def describe(request):
 def policy(request):
     append_order("policy.evaluate")
     POLICY_RECORD.write_text(json.dumps(request, sort_keys=True))
+    if POLICY_MODE == "hybrid_shape":
+        response(request, hybrid_policy_result(request))
+        return
     accepted = POLICY_MODE != "reject"
     result = {{
         "accepted": accepted,
@@ -482,6 +487,28 @@ def policy(request):
         result["stdin"] = "stdin-from-policy"
         result["prompt"] = "prompt-from-policy"
     response(request, result)
+
+def hybrid_policy_result(request):
+    params = request.get("params", {{}})
+    launch = params.get("launch", {{}})
+    model = params.get("model", {{}})
+    expected_prefix = [launch.get("command")] + launch.get("args", []) + model.get("provider_args", [])
+    argv = launch.get("argv", [])
+    prompt = model.get("inputs", {{}}).get("prompt")
+    diagnostics = []
+    if params.get("settings_id") != request.get("provider_instance_id"):
+        diagnostics.append({{"severity": "error", "code": "unexpected_settings_id", "message": str(params.get("settings_id"))}})
+    if argv[:len(expected_prefix)] != expected_prefix:
+        diagnostics.append({{"severity": "error", "code": "unexpected_argv_prefix", "message": json.dumps(argv)}})
+    if not argv or argv[-1] != prompt:
+        diagnostics.append({{"severity": "error", "code": "missing_prompt_tail", "message": json.dumps(argv)}})
+    return {{
+        "accepted": not diagnostics,
+        "stdin": None,
+        "prompt": prompt,
+        "diagnostics": diagnostics,
+        "markers": []
+    }}
 
 def request_id(request):
     return request.get("request_id", "request-example-001")
@@ -734,8 +761,8 @@ fn runtime_executor_dispatch_no_ref_does_not_construct_or_invoke_provider_client
         "no-ref execution must not describe, construct, or invoke the provider client"
     );
     assert!(
-        !String::from_utf8_lossy(&result.stdout).contains(NEUTRAL_SETTINGS_ID),
-        "no-ref execution must not read or leak the neutral settings fixture"
+        !String::from_utf8_lossy(&result.stdout).contains(SELECTED_PROVIDER_SETTINGS_ID),
+        "no-ref execution must not read or leak the selected provider settings id"
     );
 }
 
@@ -785,7 +812,7 @@ fn external_provider_missing_policy_or_launch_capability_fails_without_builtin_f
 }
 
 #[test]
-fn external_provider_policy_evaluate_runs_before_launch_and_uses_neutral_settings() {
+fn external_provider_policy_evaluate_runs_before_launch_and_uses_selected_provider_settings() {
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -804,17 +831,58 @@ fn external_provider_policy_evaluate_runs_before_launch_and_uses_neutral_setting
     assert_eq!(result.stdout, vec![0, 1, 255]);
     assert_eq!(
         read_json(&fixture.policy_record_path)["params"]["settings_id"],
-        NEUTRAL_SETTINGS_ID
+        SELECTED_PROVIDER_SETTINGS_ID
     );
     assert_eq!(
         read_json(&fixture.launch_record_path)["params"]["settings_id"],
-        NEUTRAL_SETTINGS_ID
+        SELECTED_PROVIDER_SETTINGS_ID
     );
     assert!(!fixture.legacy_record_path.exists());
 }
 
 #[test]
-fn external_provider_launch_request_carries_neutral_settings_id_and_effective_inputs() {
+fn external_provider_policy_request_passes_hybrid_launch_shape() {
+    let fixture = make_external_fixture(
+        Capabilities {
+            policy: true,
+            launch: true,
+        },
+        PolicyMode::HybridShape,
+        LaunchMode::Success,
+    );
+
+    execute_external_fixture(&fixture)
+        .expect("hybrid-shaped policy should accept host launch request");
+
+    let policy = read_json(&fixture.policy_record_path);
+    let launch = &policy["params"]["launch"];
+    assert_eq!(
+        policy["params"]["settings_id"],
+        SELECTED_PROVIDER_SETTINGS_ID
+    );
+    assert_eq!(
+        policy["provider_instance_id"],
+        SELECTED_PROVIDER_SETTINGS_ID
+    );
+    assert_eq!(
+        launch["command"],
+        fixture.legacy_trap_path.display().to_string()
+    );
+    assert_eq!(launch["args"], serde_json::json!([]));
+    assert_eq!(
+        launch["argv"][0],
+        fixture.legacy_trap_path.display().to_string()
+    );
+    assert_eq!(launch["argv"][1], "--provider-arg");
+    assert_eq!(launch["argv"][2], "from-pool");
+    assert_eq!(
+        launch["argv"].as_array().and_then(|argv| argv.last()),
+        Some(&serde_json::json!("prompt-value"))
+    );
+}
+
+#[test]
+fn external_provider_launch_request_carries_selected_settings_id_and_effective_inputs() {
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -843,8 +911,14 @@ fn external_provider_launch_request_carries_neutral_settings_id_and_effective_in
 
     let policy = read_json(&fixture.policy_record_path);
     let launch = read_json(&fixture.launch_record_path);
-    assert_eq!(policy["params"]["settings_id"], NEUTRAL_SETTINGS_ID);
-    assert_eq!(launch["params"]["settings_id"], NEUTRAL_SETTINGS_ID);
+    assert_eq!(
+        policy["params"]["settings_id"],
+        SELECTED_PROVIDER_SETTINGS_ID
+    );
+    assert_eq!(
+        launch["params"]["settings_id"],
+        SELECTED_PROVIDER_SETTINGS_ID
+    );
     assert_model_request_carries_effective_inputs(&policy);
     assert_model_request_carries_effective_inputs(&launch);
     assert_eq!(
