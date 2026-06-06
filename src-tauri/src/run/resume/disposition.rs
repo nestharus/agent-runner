@@ -88,7 +88,9 @@ pub(super) fn handle_terminal_signal_disposition(
                 .map_err(|err| err.to_string())?;
             input.guard.mark_finalized();
             formatter::emit_stderr(&input.result.stderr);
-            Ok(ResumeLoopControl::Return(input.result.exit_code))
+            Ok(ResumeLoopControl::Return(failure_exit_code(
+                input.result.exit_code,
+            )))
         }
         TerminalSignalDisposition::InteractiveClean | TerminalSignalDisposition::NotApplicable => {
             Ok(ResumeLoopControl::CompletedAttempt)
@@ -132,9 +134,15 @@ fn handle_maybe_quota_verify(
                 None,
             ))?;
             formatter::emit_stderr(&result.stderr);
-            Ok(ResumeLoopControl::Return(result.exit_code))
+            Ok(ResumeLoopControl::Return(failure_exit_code(
+                result.exit_code,
+            )))
         }
     }
+}
+
+fn failure_exit_code(exit_code: i32) -> i32 {
+    if exit_code == 0 { 1 } else { exit_code }
 }
 
 fn maybe_quota_finalize_request<'a>(

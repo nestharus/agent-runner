@@ -40,6 +40,7 @@ use crate::terminal_outcome_adapter::{
 use crate::wiring;
 use crate::zero_turn_orchestration::{ZeroTurnConfirmationState, next_action};
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_with_balancing(
     agent_runtime_services: &wiring::AgentRuntimeServices,
     state_db_opener: &dyn StateDbOpener,

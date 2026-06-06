@@ -38,7 +38,7 @@ use crate::resume_cli::{
 use crate::spawn_cwd::effective_resume_spawn_cwd;
 use crate::terminal_outcome_adapter::{
     TerminalSignalDisposition, apply_age153_terminal_signal_fixture_override,
-    confirm_maybe_quota_exhausted, resume_terminal_signal_for_outcome,
+    confirm_maybe_quota_exhausted, resume_terminal_signal_for_outcome, terminal_signal_reason,
 };
 use crate::wiring;
 use crate::zero_turn_orchestration::{ZeroTurnAction, ZeroTurnConfirmationState, next_action};
@@ -80,13 +80,21 @@ pub(crate) fn run_resume(
             return Ok(exit_code);
         }
     };
-    run_resume_loop(ResumeLoopInput {
+    let result = run_resume_loop(ResumeLoopInput {
         agent_runtime_services,
         prepared: &mut prepared,
         manual_migrate,
         session_id,
         working_dir,
-    })
+    });
+    if failed_auto_wake_exit(&result) {
+        let _ = crate::wake_coordinator::recheck_after_failed_auto_wake(session_id);
+    }
+    result
+}
+
+fn failed_auto_wake_exit(result: &Result<i32, String>) -> bool {
+    crate::wake_coordinator::is_auto_wake_invocation() && !matches!(result, Ok(0))
 }
 
 fn reject_invalid_resume_input(session_id: &str) -> Option<i32> {
@@ -338,6 +346,7 @@ fn run_resume_attempt(
     ) {
         Ok(result) => result,
         Err(_spawn_err) => {
+            record_failed_mailbox_delivery_attempt(&input, "resume_spawn_error")?;
             finalize_resume_spawn_error(&input, &mut attempt)?;
             return Ok(ResumeAttemptLoopControl::Return(1));
         }
@@ -656,6 +665,10 @@ fn handle_resume_attempt_terminal_signal(
         zero_turn_action,
     })? {
         ResumeLoopControl::Continue => {
+            record_failed_mailbox_delivery_attempt(
+                input,
+                &failed_delivery_error(result, "resume_retry"),
+            )?;
             mark_resume_attempt_idle(
                 provider_session_id,
                 &attempt.invocation.id,
@@ -664,6 +677,10 @@ fn handle_resume_attempt_terminal_signal(
             return Ok(ResumeAttemptLoopControl::Continue(result.exit_code));
         }
         ResumeLoopControl::Return(exit_code) => {
+            record_failed_mailbox_delivery_attempt(
+                input,
+                &failed_delivery_error(result, "resume_failed"),
+            )?;
             mark_resume_attempt_idle(provider_session_id, &attempt.invocation.id, Some(exit_code))?;
             return Ok(ResumeAttemptLoopControl::Return(exit_code));
         }
@@ -671,6 +688,7 @@ fn handle_resume_attempt_terminal_signal(
     }
 
     if mailbox_delivery_unconfirmed(input, &provider.name, result, zero_turn_action) {
+        record_failed_mailbox_delivery_attempt(input, "mailbox_delivery_unconfirmed")?;
         finalize_unconfirmed_mailbox_delivery(input, attempt, result)?;
         mark_resume_attempt_idle(provider_session_id, &attempt.invocation.id, Some(1))?;
         return Ok(ResumeAttemptLoopControl::Return(1));
@@ -694,6 +712,10 @@ fn handle_resume_attempt_terminal_signal(
         max_attempts: input.max_attempts,
     })? {
         CompletedAttemptControl::Continue => {
+            record_failed_mailbox_delivery_attempt(
+                input,
+                &failed_delivery_error(result, "quota_exhausted"),
+            )?;
             mark_resume_attempt_idle(
                 provider_session_id,
                 &attempt.invocation.id,
@@ -714,6 +736,10 @@ fn handle_resume_attempt_terminal_signal(
                     exit_code,
                 )?;
             } else {
+                record_failed_mailbox_delivery_attempt(
+                    input,
+                    &failed_delivery_error(result, "resume_failed"),
+                )?;
                 mark_resume_attempt_idle(
                     provider_session_id,
                     &attempt.invocation.id,
@@ -772,6 +798,24 @@ fn finalize_unconfirmed_mailbox_delivery(
         .map_err(|err| err.to_string())?;
     attempt.guard.mark_finalized();
     Ok(())
+}
+
+fn record_failed_mailbox_delivery_attempt(
+    input: &ResumeAttemptInput<'_>,
+    delivery_error: &str,
+) -> Result<(), String> {
+    crate::mailbox_delivery::mark_headless_resume_delivery_failed(
+        input.mailbox_session_id,
+        input.mailbox_delivery_seqs,
+        delivery_error,
+    )
+}
+
+fn failed_delivery_error(result: &executor::ExecutionResult, fallback: &str) -> String {
+    terminal_signal_reason(&result.terminal_signal, result.terminal_reason.as_deref())
+        .or(result.terminal_reason.as_deref())
+        .unwrap_or(fallback)
+        .to_string()
 }
 
 fn mark_resume_attempt_idle(

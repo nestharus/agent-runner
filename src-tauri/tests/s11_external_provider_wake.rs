@@ -308,13 +308,21 @@ fn external_provider_wake_does_not_mark_delivered_when_resume_produces_no_turn()
 
     let output = fixture.run_agent_with_env(
         "dispatch external provider wake dropped payload",
-        &[("S11_DROP_RESUME_PAYLOAD", "1")],
+        &[
+            ("S11_DROP_RESUME_PAYLOAD", "1"),
+            ("OULIPOLY_AUTO_WAKE_MAX", "1"),
+        ],
     );
     assert_success(&output);
 
     let _dropped = wait_for_file(&fixture.prompt_file("external-wake-dropped.txt"));
-    wait_until("resume invocation finalized", || {
-        fixture.finalized_invocation_count() >= 2
+    wait_until("failed wake released claim and recorded attempt", || {
+        let db = fixture.mailbox();
+        let rows = db.list_mailbox(SESSION, true).unwrap();
+        rows.len() == 1
+            && rows[0].delivery_attempts == 1
+            && rows[0].delivery_error.as_deref() == Some("mailbox_delivery_unconfirmed")
+            && db.wake_claim(SESSION).unwrap().is_none()
     });
 
     let db = fixture.mailbox();
@@ -329,6 +337,84 @@ fn external_provider_wake_does_not_mark_delivered_when_resume_produces_no_turn()
         !fixture.prompt_file("external-wake-resumed.txt").exists(),
         "drop mode must not write the payload-bearing resume file"
     );
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
+fn external_provider_failed_wake_releases_claim_and_retries_pending_mailbox() {
+    let fixture = Fixture::new();
+    fixture.write_external_provider();
+
+    let output = fixture.run_agent_with_env(
+        "dispatch external provider wake first dropped payload",
+        &[
+            ("S11_DROP_FIRST_RESUME_PAYLOAD", "1"),
+            ("OULIPOLY_AUTO_WAKE_RETRY_BASE_MS", "1000"),
+        ],
+    );
+    assert_success(&output);
+
+    let _dropped = wait_for_file(&fixture.prompt_file("external-wake-dropped.txt"));
+    wait_until("first failed wake released claim", || {
+        let db = fixture.mailbox();
+        let rows = db.list_mailbox(SESSION, true).unwrap();
+        rows.len() == 1
+            && rows[0].delivered_at.is_none()
+            && rows[0].delivery_attempts == 1
+            && rows[0].delivery_error.as_deref() == Some("mailbox_delivery_unconfirmed")
+            && db.wake_claim(SESSION).unwrap().is_none()
+    });
+
+    let prompt = wait_for_file(&fixture.prompt_file("external-wake-resumed.txt"));
+    assert!(prompt.starts_with("[OULIPOLY NOTIFICATIONS]"), "{prompt}");
+    wait_until("retried wake delivered pending mailbox", || {
+        let db = fixture.mailbox();
+        let rows = db.list_mailbox(SESSION, true).unwrap();
+        rows.len() == 1
+            && rows[0].delivered_at.is_some()
+            && rows[0].delivery_attempts == 2
+            && rows[0].delivery_error.is_none()
+            && db.wake_claim(SESSION).unwrap().is_none()
+    });
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
+fn external_provider_rate_limited_wake_records_error_and_retries_pending_mailbox() {
+    let fixture = Fixture::new();
+    fixture.write_external_provider();
+
+    let output = fixture.run_agent_with_env(
+        "dispatch external provider wake first rate limited",
+        &[
+            ("S11_RATE_LIMIT_FIRST_RESUME", "1"),
+            ("OULIPOLY_AUTO_WAKE_RETRY_BASE_MS", "1000"),
+        ],
+    );
+    assert_success(&output);
+
+    let _rate_limited = wait_for_file(&fixture.prompt_file("external-wake-rate-limited.txt"));
+    wait_until("rate-limited wake released claim", || {
+        let db = fixture.mailbox();
+        let rows = db.list_mailbox(SESSION, true).unwrap();
+        rows.len() == 1
+            && rows[0].delivered_at.is_none()
+            && rows[0].delivery_attempts == 1
+            && rows[0].delivery_error.as_deref() == Some("rate_limited")
+            && db.wake_claim(SESSION).unwrap().is_none()
+    });
+
+    let prompt = wait_for_file(&fixture.prompt_file("external-wake-resumed.txt"));
+    assert!(prompt.starts_with("[OULIPOLY NOTIFICATIONS]"), "{prompt}");
+    wait_until("rate-limited wake retry delivered pending mailbox", || {
+        let db = fixture.mailbox();
+        let rows = db.list_mailbox(SESSION, true).unwrap();
+        rows.len() == 1
+            && rows[0].delivered_at.is_some()
+            && rows[0].delivery_attempts == 2
+            && rows[0].delivery_error.is_none()
+            && db.wake_claim(SESSION).unwrap().is_none()
+    });
     fixture.assert_xdg_isolated();
 }
 
@@ -383,6 +469,7 @@ def envelope(request, result):
     }
 
 def describe(request):
+    terminal_capability = os.environ.get("S11_RATE_LIMIT_FIRST_RESUME") == "1"
     return envelope(request, {
         "provider_id": "s11-external-provider-wake-fixture",
         "display_name": "S11 External Provider Wake Fixture",
@@ -393,7 +480,7 @@ def describe(request):
             "policy": True,
             "quota": False,
             "session": True,
-            "terminal": False,
+            "terminal": terminal_capability,
             "rotation": False,
             "discovery": False,
             "settings": False,
@@ -485,6 +572,26 @@ def launch(request):
     known = params.get("session", {}).get("known_provider_session_id")
     prompt = params.get("model", {}).get("inputs", {}).get("prompt", "")
     if known:
+        if os.environ.get("S11_RATE_LIMIT_FIRST_RESUME") == "1":
+            count_path = pathlib.Path(os.environ["S11_WORK_DIR"]) / "resume-count.txt"
+            count = int(count_path.read_text(encoding="utf-8")) if count_path.exists() else 0
+            count_path.write_text(str(count + 1), encoding="utf-8")
+            if count == 0:
+                target = pathlib.Path(os.environ["S11_WORK_DIR"]) / "external-wake-rate-limited.txt"
+                target.write_text("rate limited\n", encoding="utf-8")
+                emit(stdout_event(request, 1, "HTTP 429 rate_limit_error\n"))
+                emit(exit_event(request, 2, known))
+                return
+        if os.environ.get("S11_DROP_FIRST_RESUME_PAYLOAD") == "1":
+            count_path = pathlib.Path(os.environ["S11_WORK_DIR"]) / "resume-count.txt"
+            count = int(count_path.read_text(encoding="utf-8")) if count_path.exists() else 0
+            count_path.write_text(str(count + 1), encoding="utf-8")
+            if count == 0:
+                target = pathlib.Path(os.environ["S11_WORK_DIR"]) / "external-wake-dropped.txt"
+                target.write_text("dropped\n", encoding="utf-8")
+                emit(stdout_event(request, 1, "dropped\n"))
+                emit(exit_event(request, 2, known))
+                return
         if os.environ.get("S11_DROP_RESUME_PAYLOAD") == "1":
             target = pathlib.Path(os.environ["S11_WORK_DIR"]) / "external-wake-dropped.txt"
             target.write_text("dropped\n", encoding="utf-8")
@@ -526,6 +633,27 @@ def capture(request):
         "provider_session_id": session_id_from_request(request),
         "state": {"captured": True},
         "artifacts": [],
+    })
+
+def terminal_classify(request):
+    count_path = pathlib.Path(os.environ["S11_WORK_DIR"]) / "resume-count.txt"
+    first_rate_limited_resume = (
+        os.environ.get("S11_RATE_LIMIT_FIRST_RESUME") == "1"
+        and count_path.exists()
+        and count_path.read_text(encoding="utf-8").strip() == "1"
+    )
+    if first_rate_limited_resume:
+        kind = "rate_limited"
+        evidence = "HTTP 429 rate_limit_error"
+    else:
+        kind = "clean_exit"
+        evidence = "fixture clean exit"
+    return envelope(request, {
+        "terminal_signal": {
+            "kind": kind,
+            "evidence": evidence,
+            "observed_at_unix_ms": 2005,
+        },
     })
 
 def notify_helper():
@@ -588,6 +716,9 @@ def main():
         return 0
     if subcommand == "session.capture":
         print(json.dumps(capture(request)))
+        return 0
+    if subcommand == "terminal.classify":
+        print(json.dumps(terminal_classify(request)))
         return 0
     print(json.dumps({
         "contract": request.get("contract", CONTRACT),

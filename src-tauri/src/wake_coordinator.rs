@@ -10,6 +10,7 @@ use oulipoly_state::mailbox::{
 use serde::Serialize;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::time::Duration;
 use uuid::Uuid;
 
 #[cfg(unix)]
@@ -22,8 +23,11 @@ const AUTO_WAKE_SESSION_ID_ENV: &str = "OULIPOLY_AUTO_WAKE_SESSION_ID";
 const AUTO_WAKE_TOKEN_ENV: &str = "OULIPOLY_AUTO_WAKE_TOKEN";
 const AUTO_WAKE_COUNT_ENV: &str = "OULIPOLY_AUTO_WAKE_COUNT";
 const AUTO_WAKE_MAX_ENV: &str = "OULIPOLY_AUTO_WAKE_MAX";
+const AUTO_WAKE_RETRY_BASE_MS_ENV: &str = "OULIPOLY_AUTO_WAKE_RETRY_BASE_MS";
 const PARENT_INVOCATION_ENV: &str = "OULIPOLY_PARENT_INVOCATION";
 const DEFAULT_AUTO_WAKE_MAX: i64 = 5;
+const DEFAULT_AUTO_WAKE_RETRY_BASE_MS: u64 = 1_000;
+const AUTO_WAKE_RETRY_MAX_MS: u64 = 30_000;
 const WAKE_CLAIM_STALE_AFTER_SECONDS: i64 = 10 * 60;
 
 #[derive(Debug, Clone, Serialize)]
@@ -188,6 +192,14 @@ pub(crate) fn release_current_auto_wake_claim_for_session(session_id: &str) {
     release_current_auto_wake_claim(session_id, auto_wake.as_ref());
 }
 
+pub(crate) fn recheck_after_failed_auto_wake(session_id: &str) -> WakeDiagnostic {
+    let Some(auto_wake) = current_auto_wake() else {
+        return WakeDiagnostic::status("not_auto_wake");
+    };
+    release_current_auto_wake_claim(session_id, Some(&auto_wake));
+    failed_auto_wake_recheck(session_id, &auto_wake)
+}
+
 fn trigger_turn_end_recheck(session_id: &str) -> WakeDiagnostic {
     let pending_count = match turn_end_pending_count(session_id) {
         Ok(count) => count,
@@ -211,6 +223,56 @@ fn trigger_turn_end_recheck(session_id: &str) -> WakeDiagnostic {
         auto_wake_count: current_count + 1,
         renew_token: auto_wake.as_ref().map(|wake| wake.token.as_str()),
     })
+}
+
+fn failed_auto_wake_recheck(session_id: &str, auto_wake: &AutoWakeEnv) -> WakeDiagnostic {
+    let pending_count = match turn_end_pending_count(session_id) {
+        Ok(count) => count,
+        Err(err) => return storage_error_diagnostic(err),
+    };
+    if no_pending(pending_count) {
+        return WakeDiagnostic::status("no_pending");
+    }
+    let max_count = auto_wake_max();
+    if auto_wake_cap_reached(auto_wake.count, max_count) {
+        emit_auto_wake_cap_reached(session_id, auto_wake.count, max_count);
+        return auto_wake_cap_diagnostic(auto_wake.count);
+    }
+    sleep_before_failed_auto_wake_retry(auto_wake.count);
+    start_wake_chain(StartWakeInput {
+        session_id,
+        reason: "wake_failure_retry",
+        auto_wake_count: auto_wake.count + 1,
+        renew_token: None,
+    })
+}
+
+fn sleep_before_failed_auto_wake_retry(auto_wake_count: i64) {
+    std::thread::sleep(auto_wake_retry_delay(auto_wake_count));
+}
+
+fn auto_wake_retry_delay(auto_wake_count: i64) -> Duration {
+    Duration::from_millis(auto_wake_retry_delay_ms(auto_wake_count))
+}
+
+fn auto_wake_retry_delay_ms(auto_wake_count: i64) -> u64 {
+    let base_ms = auto_wake_retry_base_ms();
+    let exponent = auto_wake_count.saturating_sub(1).clamp(0, 10) as u32;
+    base_ms
+        .saturating_mul(2_u64.saturating_pow(exponent))
+        .min(AUTO_WAKE_RETRY_MAX_MS)
+}
+
+fn auto_wake_retry_base_ms() -> u64 {
+    parsed_auto_wake_retry_base_ms()
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_AUTO_WAKE_RETRY_BASE_MS)
+}
+
+fn parsed_auto_wake_retry_base_ms() -> Option<u64> {
+    std::env::var(AUTO_WAKE_RETRY_BASE_MS_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
 }
 
 fn current_auto_wake_count(auto_wake: Option<&AutoWakeEnv>) -> i64 {

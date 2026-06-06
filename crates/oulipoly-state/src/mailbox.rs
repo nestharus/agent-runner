@@ -284,6 +284,34 @@ impl MailboxDb {
             .map_err(|err| format!("Failed to commit mailbox delivery transaction: {err}"))
     }
 
+    pub fn mark_delivery_failed(
+        &mut self,
+        session_id: &str,
+        seqs: &[i64],
+        delivery_error: &str,
+    ) -> Result<(), String> {
+        if seqs.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction().map_err(|err| {
+            format!("Failed to start mailbox delivery failure transaction: {err}")
+        })?;
+        for seq in seqs {
+            tx.execute(
+                "UPDATE mailbox
+                 SET delivery_attempts = delivery_attempts + 1,
+                     delivery_error = ?3
+                 WHERE session_id = ?1
+                   AND seq = ?2
+                   AND delivered_at IS NULL",
+                params![session_id, seq, delivery_error],
+            )
+            .map_err(|err| format!("Failed to mark mailbox row delivery failed: {err}"))?;
+        }
+        tx.commit()
+            .map_err(|err| format!("Failed to commit mailbox delivery failure transaction: {err}"))
+    }
+
     pub fn upsert_session_runtime(
         &mut self,
         input: SessionRuntimeUpsert<'_>,
@@ -1237,6 +1265,24 @@ mod tests {
             Some("resume-1")
         );
         assert_eq!(second.delivery_attempts, 1);
+    }
+
+    #[test]
+    fn mark_delivery_failed_records_attempt_without_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let row = inserted_row(db.enqueue_agent_bash_complete(&input("handle-a", "session-a")));
+
+        db.mark_delivery_failed("session-a", &[row.seq], "mailbox_delivery_unconfirmed")
+            .unwrap();
+        let failed = db.list_mailbox("session-a", true).unwrap().remove(0);
+
+        assert!(failed.delivered_at.is_none());
+        assert_eq!(failed.delivery_attempts, 1);
+        assert_eq!(
+            failed.delivery_error.as_deref(),
+            Some("mailbox_delivery_unconfirmed")
+        );
     }
 
     #[test]

@@ -87,7 +87,7 @@ fn load_cli_models(
     models_dir: &Path,
     providers_cfg: &ProvidersConfig,
 ) -> Result<HashMap<String, ModelConfig>, String> {
-    Ok(load_models(&models_dir, Some(providers_cfg))?)
+    Ok(load_models(models_dir, Some(providers_cfg))?)
 }
 
 fn parse_cli_extra_inputs(cli: &Cli) -> Result<HashMap<String, Vec<String>>, String> {
