@@ -349,6 +349,7 @@ fn external_provider_wake_confirms_delivery_from_submitted_turn_marker() {
         "dispatch external provider wake confirmed by marker",
         &[
             ("S11_EMIT_SUBMITTED_TURN_MARKER", "1"),
+            ("S11_EXPORT_REFORMATS_PROMPT", "1"),
             ("S11_SKIP_SCAN_WAKE_TURN", "1"),
         ],
     );
@@ -356,11 +357,16 @@ fn external_provider_wake_confirms_delivery_from_submitted_turn_marker() {
 
     let prompt = wait_for_file(&fixture.prompt_file("external-wake-resumed.txt"));
     assert!(prompt.starts_with("[OULIPOLY NOTIFICATIONS]"), "{prompt}");
+    assert!(prompt.contains("[OULIPOLY-DELIVERY "), "{prompt}");
+    let exported = wait_for_file(&fixture.prompt_file("external-wake-export.txt"));
+    assert_ne!(exported, prompt);
+    assert!(exported.contains("[OULIPOLY-DELIVERY "), "{exported}");
     wait_until("submitted-turn marker delivered pending mailbox", || {
         let db = fixture.mailbox();
         let rows = db.list_mailbox(SESSION, true).unwrap();
         rows.len() == 1
             && rows[0].delivered_at.is_some()
+            && rows[0].delivery_attempts == 1
             && rows[0].delivery_error.is_none()
             && db.wake_claim(SESSION).unwrap().is_none()
     });
@@ -377,6 +383,7 @@ fn external_provider_wake_ignores_submitted_turn_marker_for_different_payload() 
         &[
             ("S11_EMIT_SUBMITTED_TURN_MARKER", "1"),
             ("S11_MARKER_PROMPT_SHA_MISMATCH", "1"),
+            ("S11_MARKER_DELIVERY_NONCE_MISMATCH", "1"),
             ("S11_SKIP_SCAN_WAKE_TURN", "1"),
             ("OULIPOLY_AUTO_WAKE_MAX", "1"),
         ],
@@ -588,10 +595,50 @@ def stdout_event(request, seq, payload):
         "data_base64": base64.b64encode(payload.encode("utf-8")).decode("ascii"),
     }
 
+def delivery_nonce(text):
+    prefix = "[OULIPOLY-DELIVERY "
+    start = text.find(prefix)
+    if start < 0:
+        return None
+    start += len(prefix)
+    end = text.find("]", start)
+    if end < 0:
+        return None
+    nonce = text[start:end].strip()
+    return nonce or None
+
+def delivery_marker(nonce):
+    return f"[OULIPOLY-DELIVERY {nonce}]"
+
+def simulated_export_text(prompt):
+    nonce = delivery_nonce(prompt)
+    if os.environ.get("S11_EXPORT_REFORMATS_PROMPT") == "1" and nonce:
+        exported = (
+            "Notifications delivered:\n"
+            f"- agent_bash_complete {HANDLE}\n\n"
+            f"{delivery_marker(nonce)}\n"
+        )
+        target = pathlib.Path(os.environ["S11_WORK_DIR"]) / "external-wake-export.txt"
+        target.write_text(exported, encoding="utf-8")
+        return exported
+    return prompt
+
 def submitted_turn_marker_event(request, seq, session_id, prompt):
+    exported = simulated_export_text(prompt)
     prompt_sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
     if os.environ.get("S11_MARKER_PROMPT_SHA_MISMATCH") == "1":
         prompt_sha = hashlib.sha256(b"different payload").hexdigest()
+    nonce = delivery_nonce(exported)
+    if os.environ.get("S11_MARKER_DELIVERY_NONCE_MISMATCH") == "1":
+        nonce = "different-delivery-nonce"
+    value = {
+        "provider_session_id": session_id,
+        "prompt_sha256": prompt_sha,
+        "source": "s11.fixture",
+        "message_id": "msg-s11-submitted",
+    }
+    if nonce:
+        value["delivery_nonce"] = nonce
     return {
         "contract": CONTRACT,
         "request_id": request_id(request),
@@ -599,12 +646,7 @@ def submitted_turn_marker_event(request, seq, session_id, prompt):
         "time_unix_ms": 1000 + seq,
         "kind": "marker",
         "name": "oulipoly.submitted_user_turn",
-        "value": {
-            "provider_session_id": session_id,
-            "prompt_sha256": prompt_sha,
-            "source": "s11.fixture",
-            "message_id": "msg-s11-submitted",
-        },
+        "value": value,
     }
 
 def exit_event(request, seq, session_id):

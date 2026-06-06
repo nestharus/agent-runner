@@ -67,6 +67,7 @@ fn submitted_user_turn_from_marker_value(value: &Value) -> Option<SubmittedUserT
     Some(SubmittedUserTurn {
         provider_session_id,
         prompt_sha256,
+        delivery_nonce: marker_string(value, "delivery_nonce"),
         source: marker_string(value, "source"),
         message_id: marker_string(value, "message_id"),
     })

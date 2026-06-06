@@ -4,14 +4,19 @@
 
 use oulipoly_state::mailbox::{MailboxDb, MailboxRow, SessionRuntimeUpsert};
 use std::path::Path;
+use uuid::Uuid;
 
 const MAILBOX_BATCH_MAX_ROWS: usize = 20;
 const MAILBOX_PREFIX_MAX_BYTES: usize = 64 * 1024;
+const DELIVERY_NONCE_PREFIX: &str = "[OULIPOLY-DELIVERY ";
+const DELIVERY_NONCE_SUFFIX: &str = "]";
+const DELIVERY_NONCE_LENGTH_PLACEHOLDER: &str = "00000000-0000-4000-8000-000000000000";
 
 pub(crate) struct PreparedMailboxDelivery {
     pub answer: Option<String>,
     pub session_id: String,
     pub seqs: Vec<i64>,
+    pub delivery_nonce: Option<String>,
 }
 
 pub(crate) struct PreparedPtyMailboxDelivery {
@@ -29,7 +34,8 @@ pub(crate) fn prepare_pty_mailbox_delivery(
     }
     let batch = select_batch(&pending);
     let seqs = batch_seqs(&batch);
-    let envelope = render_notification_prefix(&batch.rows, batch.remaining_count);
+    let envelope =
+        render_notification_prefix(&batch.rows, batch.remaining_count, &new_delivery_nonce());
     Ok(Some(PreparedPtyMailboxDelivery { envelope, seqs }))
 }
 
@@ -81,6 +87,7 @@ fn empty_delivery(answer: Option<String>, session_id: String) -> PreparedMailbox
         answer,
         session_id,
         seqs: Vec::new(),
+        delivery_nonce: None,
     }
 }
 
@@ -98,8 +105,9 @@ fn delivery_for_batch(
     answer: Option<String>,
 ) -> PreparedMailboxDelivery {
     let seqs = batch_seqs(&batch);
-    let prefix = render_notification_prefix(&batch.rows, batch.remaining_count);
-    prepared_delivery(session_id, seqs, prefix, answer)
+    let delivery_nonce = new_delivery_nonce();
+    let prefix = render_notification_prefix(&batch.rows, batch.remaining_count, &delivery_nonce);
+    prepared_delivery(session_id, seqs, prefix, answer, delivery_nonce)
 }
 
 fn prepared_delivery(
@@ -107,11 +115,13 @@ fn prepared_delivery(
     seqs: Vec<i64>,
     prefix: String,
     answer: Option<String>,
+    delivery_nonce: String,
 ) -> PreparedMailboxDelivery {
     PreparedMailboxDelivery {
         answer: Some(compose_answer(prefix, answer)),
         session_id,
         seqs,
+        delivery_nonce: Some(delivery_nonce),
     }
 }
 
@@ -230,10 +240,14 @@ fn selected_len_before_limit(row_count: usize) -> usize {
 }
 
 fn notification_prefix_len(rows: &[MailboxRow], remaining_count: usize) -> usize {
-    render_notification_prefix(rows, remaining_count).len()
+    render_notification_prefix(rows, remaining_count, DELIVERY_NONCE_LENGTH_PLACEHOLDER).len()
 }
 
-fn render_notification_prefix(rows: &[MailboxRow], remaining_count: usize) -> String {
+fn render_notification_prefix(
+    rows: &[MailboxRow],
+    remaining_count: usize,
+    delivery_nonce: &str,
+) -> String {
     let mut rendered = String::new();
     rendered.push_str("[OULIPOLY NOTIFICATIONS]\n");
     rendered.push_str(
@@ -258,8 +272,16 @@ fn render_notification_prefix(rows: &[MailboxRow], remaining_count: usize) -> St
         ));
     }
     rendered.push_str("Use the paths above if you need details. Do not assume log content unless you inspect it.\n");
+    rendered.push_str(DELIVERY_NONCE_PREFIX);
+    rendered.push_str(delivery_nonce);
+    rendered.push_str(DELIVERY_NONCE_SUFFIX);
+    rendered.push('\n');
     rendered.push_str("[END OULIPOLY NOTIFICATIONS]");
     rendered
+}
+
+fn new_delivery_nonce() -> String {
+    Uuid::new_v4().to_string()
 }
 
 fn compose_answer(prefix: String, answer: Option<String>) -> String {
@@ -289,8 +311,19 @@ mod tests {
             answer: original.clone(),
             session_id,
             seqs: Vec::new(),
+            delivery_nonce: None,
         };
 
         assert_eq!(prepared.answer, original);
+    }
+
+    #[test]
+    fn notification_prefix_includes_delivery_nonce_near_end() {
+        let prefix = render_notification_prefix(&[], 0, "nonce-123");
+
+        assert!(
+            prefix.contains("[OULIPOLY-DELIVERY nonce-123]\n[END OULIPOLY NOTIFICATIONS]"),
+            "{prefix}"
+        );
     }
 }

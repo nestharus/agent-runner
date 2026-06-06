@@ -112,6 +112,7 @@ struct PreparedHeadlessResumeExecution {
     answer: Option<String>,
     mailbox_session_id: String,
     mailbox_delivery_seqs: Vec<i64>,
+    mailbox_delivery_nonce: Option<String>,
     env: crate::migration_providers::ResumeExecutionEnvironment,
     resolved: oulipoly_state::ResolvedResume,
     effective_spawn_cwd: std::path::PathBuf,
@@ -160,6 +161,7 @@ fn prepare_headless_resume_execution(
         answer: mailbox_delivery.answer,
         mailbox_session_id: mailbox_delivery.session_id,
         mailbox_delivery_seqs: mailbox_delivery.seqs,
+        mailbox_delivery_nonce: mailbox_delivery.delivery_nonce,
         env,
         resolved,
         effective_spawn_cwd,
@@ -248,6 +250,7 @@ fn run_resume_loop(input: ResumeLoopInput<'_>) -> Result<i32, String> {
             answer: input.prepared.answer.as_deref(),
             mailbox_session_id: &input.prepared.mailbox_session_id,
             mailbox_delivery_seqs: &input.prepared.mailbox_delivery_seqs,
+            mailbox_delivery_nonce: input.prepared.mailbox_delivery_nonce.as_deref(),
             manual_migrate: input.manual_migrate,
             session_id: input.session_id,
             working_dir: input.working_dir,
@@ -290,6 +293,7 @@ struct ResumeAttemptInput<'a> {
     answer: Option<&'a str>,
     mailbox_session_id: &'a str,
     mailbox_delivery_seqs: &'a [i64],
+    mailbox_delivery_nonce: Option<&'a str>,
     manual_migrate: Option<&'a str>,
     session_id: &'a str,
     working_dir: Option<&'a Path>,
@@ -793,7 +797,18 @@ fn submitted_user_turn_confirms_mailbox_delivery(
         return false;
     };
     submitted.provider_session_id == input.resolved.active_session_id
-        && submitted.prompt_sha256 == sha256_hex(answer.as_bytes())
+        && submitted_user_turn_payload_confirms_mailbox_delivery(input, submitted, answer)
+}
+
+fn submitted_user_turn_payload_confirms_mailbox_delivery(
+    input: &ResumeAttemptInput<'_>,
+    submitted: &executor::SubmittedUserTurn,
+    answer: &str,
+) -> bool {
+    if let Some(delivery_nonce) = input.mailbox_delivery_nonce {
+        return submitted.delivery_nonce.as_deref() == Some(delivery_nonce);
+    }
+    submitted.prompt_sha256 == sha256_hex(answer.as_bytes())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

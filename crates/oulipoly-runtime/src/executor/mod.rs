@@ -73,6 +73,7 @@ pub struct ExecutionResult {
 pub struct SubmittedUserTurn {
     pub provider_session_id: String,
     pub prompt_sha256: String,
+    pub delivery_nonce: Option<String>,
     pub source: Option<String>,
     pub message_id: Option<String>,
 }
