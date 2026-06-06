@@ -15,7 +15,7 @@ use std::ffi::OsString;
 use std::sync::Mutex;
 use std::time::Duration;
 
-pub use crate::process::CancellationToken;
+pub use crate::process::{CancellationToken, ProcessSpawnObserver};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderTimeouts {
@@ -56,6 +56,7 @@ pub struct ProviderClientOptions {
     pub timeout: Duration,
     pub cancellation: Option<CancellationToken>,
     pub resolver: ProviderResolveOptions,
+    pub spawn_observer: Option<ProcessSpawnObserver>,
 }
 
 pub trait ProviderEnv {
@@ -93,6 +94,7 @@ impl Default for ProviderClientOptions {
             output_limits: ProviderOutputLimits::default(),
             cancellation: None,
             resolver: ProviderResolveOptions::default(),
+            spawn_observer: None,
         }
     }
 }
@@ -112,6 +114,11 @@ impl ProviderClientOptions {
 
     pub fn with_cancellation(mut self, cancellation: Option<CancellationToken>) -> Self {
         self.cancellation = cancellation;
+        self
+    }
+
+    pub fn with_spawn_observer(mut self, observer: Option<ProcessSpawnObserver>) -> Self {
+        self.spawn_observer = observer;
         self
     }
 }
@@ -397,6 +404,7 @@ impl ProviderClient {
             stdout_limit: ByteLimit::new(self.options.output_limits.stdout_bytes),
             stderr_limit: ByteLimit::new(self.options.output_limits.stderr_bytes),
             cancellation: self.options.cancellation.clone(),
+            spawn_observer: launch_spawn_observer(subcommand, &self.options),
         };
         let mut argv = resolved.argv_for_subcommand(subcommand);
         let program = argv.remove(0);
@@ -408,6 +416,15 @@ impl ProviderClient {
             .run(command, request_bytes, envs.into_env_vec())
             .map_err(|error| error.with_request_id_if_missing(request_id))
     }
+}
+
+fn launch_spawn_observer(
+    subcommand: &str,
+    options: &ProviderClientOptions,
+) -> Option<ProcessSpawnObserver> {
+    (subcommand == "launch")
+        .then(|| options.spawn_observer.clone())
+        .flatten()
 }
 
 fn map_request_validation_error(

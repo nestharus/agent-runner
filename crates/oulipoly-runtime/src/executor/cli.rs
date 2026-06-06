@@ -78,7 +78,7 @@ mod result;
 mod resume;
 mod resume_execution;
 mod session_capture;
-mod spawn_identity;
+pub(crate) mod spawn_identity;
 mod supervision;
 mod terminal_signal;
 

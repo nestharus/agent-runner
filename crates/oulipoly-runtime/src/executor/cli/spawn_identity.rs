@@ -15,7 +15,7 @@ use oulipoly_state::pid_identity::{
 use std::path::Path;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum SpawnRuntimeMode {
+pub(crate) enum SpawnRuntimeMode {
     Headless,
     PtyInteractive,
 }
@@ -30,7 +30,7 @@ impl SpawnRuntimeMode {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct SpawnIdentityContext {
+pub(crate) struct SpawnIdentityContext {
     invocation_uuid: String,
     provider_name: String,
     model_name: Option<String>,
@@ -56,7 +56,7 @@ impl SpawnIdentityContext {
     }
 }
 
-pub(super) fn context_from_parent_invocation_env(
+pub(crate) fn context_from_parent_invocation_env(
     parent_invocation_env: Option<&str>,
     provider_name: &str,
     model_name: Option<&str>,
@@ -76,7 +76,7 @@ pub(super) fn context_from_parent_invocation_env(
     })
 }
 
-pub(super) fn record_child_identity(
+pub(crate) fn record_child_identity(
     child_id: u32,
     context: Option<&SpawnIdentityContext>,
 ) -> Option<ProcessIdentity> {
@@ -97,7 +97,7 @@ pub(super) fn record_child_identity(
     }
 }
 
-pub(super) fn backfill_captured_session_id(
+pub(crate) fn backfill_captured_session_id(
     context: Option<&SpawnIdentityContext>,
     identity: Option<&ProcessIdentity>,
     session_id: &str,

@@ -116,6 +116,31 @@ pub struct ProcessLimits {
     pub stdout_limit: ByteLimit,
     pub stderr_limit: ByteLimit,
     pub cancellation: Option<CancellationToken>,
+    pub spawn_observer: Option<ProcessSpawnObserver>,
+}
+
+#[derive(Clone)]
+pub struct ProcessSpawnObserver {
+    callback: Arc<dyn Fn(u32) + Send + Sync>,
+}
+
+impl ProcessSpawnObserver {
+    pub fn new(callback: impl Fn(u32) + Send + Sync + 'static) -> Self {
+        Self {
+            callback: Arc::new(callback),
+        }
+    }
+
+    fn observe(&self, child_id: u32) {
+        (self.callback)(child_id);
+    }
+}
+
+impl std::fmt::Debug for ProcessSpawnObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProcessSpawnObserver")
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for ProcessLimits {
@@ -126,6 +151,7 @@ impl Default for ProcessLimits {
             stdout_limit: ByteLimit::new(1024 * 1024),
             stderr_limit: ByteLimit::new(128 * 1024),
             cancellation: None,
+            spawn_observer: None,
         }
     }
 }
@@ -240,6 +266,7 @@ impl ProcessRunner {
                 ProviderDiagnostics::with_description(error.to_string()),
             )
         })?;
+        notify_spawn_observer(&self.limits.spawn_observer, child.id());
 
         let stdout = child
             .stdout
@@ -359,6 +386,12 @@ impl ProcessRunner {
             diagnostics.provider_process_nonzero = process_nonzero(&process_status);
         }
         ProviderClientError::host_transport(kind, subcommand_for_error(&command), None, diagnostics)
+    }
+}
+
+fn notify_spawn_observer(observer: &Option<ProcessSpawnObserver>, child_id: u32) {
+    if let Some(observer) = observer {
+        observer.observe(child_id);
     }
 }
 

@@ -51,7 +51,7 @@ fn launch_session_capture(result: &LaunchResult) -> SessionCaptureResult {
     }
 }
 
-fn launch_provider_session_id(result: &LaunchResult) -> Option<String> {
+pub(crate) fn launch_provider_session_id(result: &LaunchResult) -> Option<String> {
     result
         .exit
         .session
