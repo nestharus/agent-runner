@@ -1,0 +1,2287 @@
+diff --git a/crates/oulipoly-provider/src/error.rs b/crates/oulipoly-provider/src/error.rs
+index 79ccee1..a5d16ec 100644
+--- a/crates/oulipoly-provider/src/error.rs
++++ b/crates/oulipoly-provider/src/error.rs
+@@ -133,21 +133,21 @@ impl ProviderCapabilityError {
+     ) -> Result<Self, ProviderClientError> {
+         let subcommand = subcommand.into();
+         let request_id = request_id_from(&envelope);
+-        let envelope: ErrorResponseEnvelope =
+-            serde_json::from_value(envelope).map_err(|error| ProviderClientError::Protocol {
+-                kind: HostErrorKind::SchemaInvalidErrorResponse,
+-                subcommand: subcommand.clone(),
++        let envelope = parse_error_response_envelope(envelope).map_err(|error| {
++            schema_invalid_error_response(
++                &subcommand,
+                 request_id,
+-                description: error.to_string(),
+-                diagnostics: Box::new(diagnostics.clone()),
+-                process_status: process_status.clone().map(Box::new),
+-            })?;
+-        Ok(Self {
++                error,
++                diagnostics.clone(),
++                process_status.clone(),
++            )
++        })?;
++        Ok(capability_error_from_envelope(
+             subcommand,
+             envelope,
+-            diagnostics: Box::new(diagnostics),
+-            process_status: process_status.map(Box::new),
+-        })
++            diagnostics,
++            process_status,
++        ))
+     }
+ 
+     pub fn request_id(&self) -> &str {
+@@ -162,6 +162,10 @@ impl ProviderCapabilityError {
+         &self.envelope.error
+     }
+ 
++    pub fn provider_reported_process_status(&self) -> Option<&ProcessStatus> {
++        self.envelope.process_status.as_ref()
++    }
++
+     pub fn diagnostics(&self) -> &ProviderDiagnostics {
+         self.diagnostics.as_ref()
+     }
+@@ -311,44 +315,16 @@ impl ProviderClientError {
+         _stdin_error: Option<HostErrorKind>,
+     ) -> Result<Value, Self> {
+         let Some(envelope) = envelope else {
+-            if process_status.exited_successfully() {
+-                return Err(Self::protocol(
+-                    HostErrorKind::EmptyStdout,
+-                    subcommand,
+-                    None,
+-                    diagnostics,
+-                ));
+-            }
+-            return Err(Self::host_transport(
+-                HostErrorKind::ProviderProcessNonzero,
+-                subcommand,
+-                None,
+-                diagnostics,
+-            ));
++            return missing_non_launch_envelope_result(subcommand, &process_status, diagnostics);
+         };
+-        match envelope.get("ok").and_then(Value::as_bool) {
+-            Some(false) => Err(Self::from_capability(
+-                ProviderCapabilityError::from_valid_envelope(
+-                    subcommand,
+-                    envelope,
+-                    diagnostics,
+-                    Some(process_status),
+-                )?,
+-            )),
+-            Some(true) if process_status.exited_successfully() => Ok(envelope),
+-            Some(true) => Err(Self::host_transport(
+-                HostErrorKind::ProviderProcessNonzeroWithSuccess,
+-                subcommand,
+-                request_id_from(&envelope),
+-                diagnostics,
+-            )),
+-            None => Err(Self::protocol(
+-                HostErrorKind::SchemaInvalidResponse,
+-                subcommand,
+-                request_id_from(&envelope),
+-                diagnostics,
+-            )),
+-        }
++        let response_kind = non_launch_response_kind(&envelope, &process_status);
++        map_non_launch_response(
++            response_kind,
++            subcommand,
++            envelope,
++            process_status,
++            diagnostics,
++        )
+     }
+ 
+     pub fn is_provider_capability(&self) -> bool {
+@@ -408,6 +384,120 @@ impl ProviderClientError {
+     }
+ }
+ 
++fn parse_error_response_envelope(
++    envelope: Value,
++) -> Result<ErrorResponseEnvelope, serde_json::Error> {
++    serde_json::from_value(envelope)
++}
++
++fn schema_invalid_error_response(
++    subcommand: &str,
++    request_id: Option<String>,
++    error: serde_json::Error,
++    diagnostics: ProviderDiagnostics,
++    process_status: Option<ProcessStatus>,
++) -> ProviderClientError {
++    ProviderClientError::Protocol {
++        kind: HostErrorKind::SchemaInvalidErrorResponse,
++        subcommand: subcommand.to_string(),
++        request_id,
++        description: error.to_string(),
++        diagnostics: Box::new(diagnostics),
++        process_status: process_status.map(Box::new),
++    }
++}
++
++fn capability_error_from_envelope(
++    subcommand: String,
++    envelope: ErrorResponseEnvelope,
++    diagnostics: ProviderDiagnostics,
++    process_status: Option<ProcessStatus>,
++) -> ProviderCapabilityError {
++    ProviderCapabilityError {
++        subcommand,
++        envelope,
++        diagnostics: Box::new(diagnostics),
++        process_status: process_status.map(Box::new),
++    }
++}
++
++enum NonLaunchResponseKind {
++    ProviderError,
++    Success,
++    SuccessWithNonzero,
++    SchemaInvalid,
++}
++
++fn missing_non_launch_envelope_result(
++    subcommand: &str,
++    process_status: &ProcessStatus,
++    diagnostics: ProviderDiagnostics,
++) -> Result<Value, ProviderClientError> {
++    if process_status.exited_successfully() {
++        Err(ProviderClientError::protocol(
++            HostErrorKind::EmptyStdout,
++            subcommand,
++            None,
++            diagnostics,
++        ))
++    } else {
++        Err(ProviderClientError::host_transport(
++            HostErrorKind::ProviderProcessNonzero,
++            subcommand,
++            None,
++            diagnostics,
++        ))
++    }
++}
++
++fn non_launch_response_kind(
++    envelope: &Value,
++    process_status: &ProcessStatus,
++) -> NonLaunchResponseKind {
++    match envelope_ok(envelope) {
++        Some(false) => NonLaunchResponseKind::ProviderError,
++        Some(true) if process_status.exited_successfully() => NonLaunchResponseKind::Success,
++        Some(true) => NonLaunchResponseKind::SuccessWithNonzero,
++        None => NonLaunchResponseKind::SchemaInvalid,
++    }
++}
++
++fn envelope_ok(envelope: &Value) -> Option<bool> {
++    envelope.get("ok").and_then(Value::as_bool)
++}
++
++fn map_non_launch_response(
++    kind: NonLaunchResponseKind,
++    subcommand: &str,
++    envelope: Value,
++    process_status: ProcessStatus,
++    diagnostics: ProviderDiagnostics,
++) -> Result<Value, ProviderClientError> {
++    match kind {
++        NonLaunchResponseKind::ProviderError => Err(ProviderClientError::from_capability(
++            ProviderCapabilityError::from_valid_envelope(
++                subcommand,
++                envelope,
++                diagnostics,
++                Some(process_status),
++            )?,
++        )),
++        NonLaunchResponseKind::Success => Ok(envelope),
++        NonLaunchResponseKind::SuccessWithNonzero => Err(ProviderClientError::host_transport(
++            HostErrorKind::ProviderProcessNonzeroWithSuccess,
++            subcommand,
++            request_id_from(&envelope),
++            diagnostics,
++        )),
++        NonLaunchResponseKind::SchemaInvalid => Err(ProviderClientError::protocol(
++            HostErrorKind::SchemaInvalidResponse,
++            subcommand,
++            request_id_from(&envelope),
++            diagnostics,
++        )),
++    }
++}
++
+ impl std::fmt::Display for ProviderClientError {
+     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+         write!(
+diff --git a/crates/oulipoly-provider/src/generated.rs b/crates/oulipoly-provider/src/generated.rs
+index cd4a2e2..001cc07 100644
+--- a/crates/oulipoly-provider/src/generated.rs
++++ b/crates/oulipoly-provider/src/generated.rs
+@@ -61,10 +61,25 @@ impl<'de> Deserialize<'de> for TrueBool {
+     where
+         D: Deserializer<'de>,
+     {
+-        match bool::deserialize(deserializer)? {
+-            true => Ok(Self),
+-            false => Err(de::Error::custom("expected ok=true")),
+-        }
++        true_bool_from_value(deserialize_protocol_bool(deserializer)?)
++    }
++}
++
++fn deserialize_protocol_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
++where
++    D: Deserializer<'de>,
++{
++    bool::deserialize(deserializer)
++}
++
++fn true_bool_from_value<E>(value: bool) -> Result<TrueBool, E>
++where
++    E: de::Error,
++{
++    if value {
++        Ok(TrueBool)
++    } else {
++        Err(E::custom("expected ok=true"))
+     }
+ }
+ 
+@@ -85,10 +100,18 @@ impl<'de> Deserialize<'de> for FalseBool {
+     where
+         D: Deserializer<'de>,
+     {
+-        match bool::deserialize(deserializer)? {
+-            false => Ok(Self),
+-            true => Err(de::Error::custom("expected ok=false")),
+-        }
++        false_bool_from_value(deserialize_protocol_bool(deserializer)?)
++    }
++}
++
++fn false_bool_from_value<E>(value: bool) -> Result<FalseBool, E>
++where
++    E: de::Error,
++{
++    if value {
++        Err(E::custom("expected ok=false"))
++    } else {
++        Ok(FalseBool)
+     }
+ }
+ 
+@@ -123,7 +146,7 @@ pub struct ErrorResponseEnvelope {
+     pub ok: FalseBool,
+     pub error: ErrorObject,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+-    pub process_status: Option<Value>,
++    pub process_status: Option<ProcessStatus>,
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+@@ -261,8 +284,12 @@ pub struct DescribeCapabilities {
+ 
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+ pub struct ProviderConcurrency {
+-    pub safe_for_parallel_invocation: bool,
+-    pub state_locking: String,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub safe_for_parallel_invocation: Option<bool>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub state_locking: Option<String>,
++    #[serde(flatten)]
++    pub metadata: JsonObject,
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+@@ -664,21 +691,32 @@ macro_rules! fixed_str_type {
+             where
+                 D: Deserializer<'de>,
+             {
+-                let actual = String::deserialize(deserializer)?;
+-                if actual == $value {
+-                    Ok(Self)
+-                } else {
+-                    Err(de::Error::custom(format!(
+-                        "expected {}={:?}",
+-                        stringify!($name),
+-                        $value
+-                    )))
+-                }
++                deserialize_fixed_str_type(
++                    String::deserialize(deserializer)?,
++                    $value,
++                    stringify!($name),
++                )?;
++                Ok(Self)
+             }
+         }
+     };
+ }
+ 
++fn deserialize_fixed_str_type<E>(actual: String, expected: &str, type_name: &str) -> Result<(), E>
++where
++    E: de::Error,
++{
++    if actual == expected {
++        Ok(())
++    } else {
++        Err(E::custom(fixed_str_type_error(type_name, expected)))
++    }
++}
++
++fn fixed_str_type_error(type_name: &str, expected: &str) -> String {
++    format!("expected {type_name}={expected:?}")
++}
++
+ fixed_str_type!(LaunchStdoutKind, "stdout");
+ fixed_str_type!(LaunchStderrKind, "stderr");
+ fixed_str_type!(LaunchMarkerKind, "marker");
+diff --git a/crates/oulipoly-provider/tests/client_invoke.rs b/crates/oulipoly-provider/tests/client_invoke.rs
+index 881f7a6..e8ddc78 100644
+--- a/crates/oulipoly-provider/tests/client_invoke.rs
++++ b/crates/oulipoly-provider/tests/client_invoke.rs
+@@ -6,6 +6,8 @@ use oulipoly_provider::client::{ProviderClient, ProviderClientOptions, ProviderO
+ use oulipoly_provider::error::ProviderClientError;
+ use oulipoly_provider::generated::{DescribeResult, SchemaResult, SettingsListResult};
+ use oulipoly_provider::resolver::ProviderArtifactRef;
++use oulipoly_provider::schemas::SchemaRegistry;
++use serde_json::json;
+ use std::ffi::OsString;
+ use std::path::Path;
+ use std::time::Duration;
+@@ -36,6 +38,55 @@ fn invoke_success_returns_typed_result_and_keeps_stderr_diagnostics() {
+     );
+ }
+ 
++#[test]
++fn invoke_describe_accepts_schema_valid_freeform_concurrency_metadata() {
++    let provider_id = ["cla", "ude"].concat();
++    let response = json!({
++        "contract": "oulipoly.provider/v1",
++        "ok": true,
++        "request_id": "provider-registry-f7eff50a-09d6-4cc7-968e-5f0e0c567104",
++        "result": {
++            "capabilities": {
++                "discovery": true,
++                "launch": true,
++                "migration": true,
++                "policy": true,
++                "quota": true,
++                "rotation": true,
++                "session": true,
++                "settings": true,
++                "setup": true,
++                "setup_brain": true,
++                "terminal": true
++            },
++            "concurrency": {
++                "launch_streams": "one_per_process",
++                "process_model": "one_shot_cli",
++                "state_serialization": "provider_advisory_locks"
++            },
++            "contract_versions": ["oulipoly.provider/v1"],
++            "display_name": "Example Provider",
++            "preferred_contract": "oulipoly.provider/v1",
++            "provider_id": provider_id.clone(),
++            "settings_schema_id": format!("{}.settings/v1", provider_id)
++        }
++    });
++    SchemaRegistry::new()
++        .validate_response("describe", &response)
++        .expect("captured provider describe response must validate against frozen schema");
++
++    let result = serde_json::from_value::<DescribeResult>(response["result"].clone());
++
++    assert!(
++        result.is_ok(),
++        "schema-valid describe result should deserialize for host consumers: {:?}",
++        result.err()
++    );
++    let concurrency = serde_json::to_value(result.unwrap().concurrency.unwrap())
++        .expect("concurrency metadata should serialize back to JSON");
++    assert_eq!(concurrency["launch_streams"], "one_per_process");
++}
++
+ #[test]
+ fn invoke_writes_request_on_stdin_not_argv() {
+     let fake = FakeProvider::compile(fake_provider_source());
+diff --git a/crates/oulipoly-runtime/src/executor/external_provider/launch_result_mapper.rs b/crates/oulipoly-runtime/src/executor/external_provider/launch_result_mapper.rs
+index e70d388..1bd4e9b 100644
+--- a/crates/oulipoly-runtime/src/executor/external_provider/launch_result_mapper.rs
++++ b/crates/oulipoly-runtime/src/executor/external_provider/launch_result_mapper.rs
+@@ -64,13 +64,20 @@ fn provider_session_id_from_value(value: &Value) -> Option<String> {
+ }
+ 
+ fn raw_provider_session_id(value: &Value) -> Option<&str> {
+-    value.get("provider_session_id").and_then(Value::as_str)
++    value
++        .get("provider_session_id")
++        .and_then(Value::as_str)
++        .or_else(|| value.get("session_id").and_then(Value::as_str))
+ }
+ 
+ fn accepted_provider_session_id(session_id: &str) -> Option<String> {
+-    if session_id.is_empty() {
+-        None
+-    } else {
+-        Some(session_id.to_string())
+-    }
++    provider_session_id_is_present(session_id).then(|| owned_provider_session_id(session_id))
++}
++
++fn provider_session_id_is_present(session_id: &str) -> bool {
++    !session_id.is_empty()
++}
++
++fn owned_provider_session_id(session_id: &str) -> String {
++    session_id.to_string()
+ }
+diff --git a/crates/oulipoly-runtime/src/executor/external_provider/policy_transform.rs b/crates/oulipoly-runtime/src/executor/external_provider/policy_transform.rs
+index 7cb9a8e..21b7cd5 100644
+--- a/crates/oulipoly-runtime/src/executor/external_provider/policy_transform.rs
++++ b/crates/oulipoly-runtime/src/executor/external_provider/policy_transform.rs
+@@ -5,18 +5,32 @@ use super::request_builder::LaunchCandidate;
+ use oulipoly_provider::generated::PolicyEvaluateResult;
+ 
+ pub(crate) fn apply_policy_transform(
+-    mut candidate: LaunchCandidate,
++    candidate: LaunchCandidate,
+     result: PolicyEvaluateResult,
+ ) -> Result<LaunchCandidate, ExternalProviderDispatchError> {
+-    if !result.accepted {
+-        return Err(ExternalProviderDispatchError::policy_rejected());
+-    }
++    ensure_policy_accepted(&result)?;
++    Ok(apply_accepted_policy_transform(candidate, result))
++}
++
++fn ensure_policy_accepted(
++    result: &PolicyEvaluateResult,
++) -> Result<(), ExternalProviderDispatchError> {
++    result
++        .accepted
++        .then_some(())
++        .ok_or_else(ExternalProviderDispatchError::policy_rejected)
++}
++
++fn apply_accepted_policy_transform(
++    mut candidate: LaunchCandidate,
++    result: PolicyEvaluateResult,
++) -> LaunchCandidate {
+     let argv_transformed = result.argv.is_some();
+     if let Some(argv) = result.argv {
+         candidate.argv = argv;
+     }
+     if let Some(env) = result.env {
+-        candidate.env = env;
++        candidate.env.extend(env);
+     }
+     if let Some(stdin) = result.stdin {
+         candidate.stdin = Some(stdin);
+@@ -27,13 +41,21 @@ pub(crate) fn apply_policy_transform(
+         }
+         candidate.prompt = prompt;
+     }
+-    Ok(candidate)
++    candidate
+ }
+ 
+ fn replace_arg_prompt(argv: &mut [String], previous: &str, next: &str) {
+     if let Some(last) = argv.last_mut()
+-        && last == previous
++        && prompt_arg_matches(last, previous)
+     {
+-        *last = next.to_string();
++        replace_prompt_arg(last, next);
+     }
+ }
++
++fn prompt_arg_matches(candidate: &str, expected: &str) -> bool {
++    candidate == expected
++}
++
++fn replace_prompt_arg(target: &mut String, next: &str) {
++    *target = next.to_string();
++}
+diff --git a/crates/oulipoly-runtime/src/executor/external_provider/request_builder.rs b/crates/oulipoly-runtime/src/executor/external_provider/request_builder.rs
+index ea4f684..01911b6 100644
+--- a/crates/oulipoly-runtime/src/executor/external_provider/request_builder.rs
++++ b/crates/oulipoly-runtime/src/executor/external_provider/request_builder.rs
+@@ -24,7 +24,7 @@ pub(crate) struct LaunchCandidate {
+ pub(crate) fn build_launch_candidate(
+     context: &ExternalProviderDispatchContext,
+ ) -> Result<LaunchCandidate, String> {
+-    let mut env = BTreeMap::new();
++    let mut env = std::env::vars().collect::<BTreeMap<_, _>>();
+     if let Some(parent) = &context.parent_invocation_env {
+         env.insert("OULIPOLY_PARENT_INVOCATION".to_string(), parent.clone());
+     }
+@@ -44,6 +44,7 @@ pub(crate) fn build_policy_request(
+     context: &ExternalProviderDispatchContext,
+     candidate: &LaunchCandidate,
+ ) -> Result<Value, serde_json::Error> {
++    let provider_args = model_provider_args(context);
+     serde_json::to_value(PolicyEvaluateRequest {
+         contract: CONTRACT_VERSION.to_string(),
+         request_id: request_id("policy"),
+@@ -52,8 +53,8 @@ pub(crate) fn build_policy_request(
+         params: PolicyEvaluateParams {
+             settings_id: context.settings_id.clone(),
+             mode: mode(context),
+-            model: provider_model_request(context, &candidate.prompt),
+-            launch: policy_launch_object(candidate),
++            model: provider_model_request(context, &candidate.prompt, &provider_args),
++            launch: policy_launch_object(context, candidate, &provider_args),
+         },
+     })
+ }
+@@ -79,7 +80,11 @@ pub(crate) fn build_launch_request(
+         params: LaunchParams {
+             settings_id: context.settings_id.clone(),
+             mode: mode(context),
+-            model: provider_model_request(context, &candidate.prompt),
++            model: provider_model_request(
++                context,
++                &candidate.prompt,
++                &model_provider_args(context),
++            ),
+             argv: candidate.argv.clone(),
+             working_directory: candidate.working_directory.clone(),
+             env,
+@@ -128,10 +133,11 @@ fn host_context(
+ fn provider_model_request(
+     context: &ExternalProviderDispatchContext,
+     prompt: &str,
++    provider_args: &[String],
+ ) -> ProviderModelRequest {
+     ProviderModelRequest {
+         name: context.model.name.clone(),
+-        provider_args: context.provider.args.clone(),
++        provider_args: provider_args.to_vec(),
+         inputs: json!({
+             "prompt": prompt,
+             "named": context.extra_inputs.clone(),
+@@ -139,8 +145,34 @@ fn provider_model_request(
+     }
+ }
+ 
+-fn policy_launch_object(candidate: &LaunchCandidate) -> JsonObject {
++fn policy_launch_object(
++    context: &ExternalProviderDispatchContext,
++    candidate: &LaunchCandidate,
++    model_provider_args: &[String],
++) -> JsonObject {
+     let mut object = JsonObject::new();
++    object.insert(
++        "command".to_string(),
++        Value::String(context.provider.command.clone()),
++    );
++    object.insert(
++        "args".to_string(),
++        json!(base_provider_args(context, model_provider_args)),
++    );
++    object.insert("prompt_mode".to_string(), Value::String(mode(context)));
++    object.insert(
++        "invocation_mode".to_string(),
++        json!(context.provider.invocation_mode),
++    );
++    if let Some(system_prompt) = &context.provider.system_prompt_override {
++        object.insert(
++            "system_prompt_override".to_string(),
++            Value::String(system_prompt.clone()),
++        );
++    }
++    if let Some(tool_restrictions) = &context.provider.tool_restrictions {
++        object.insert("tool_restrictions".to_string(), json!(tool_restrictions));
++    }
+     object.insert(
+         "working_directory".to_string(),
+         Value::String(candidate.working_directory.clone()),
+@@ -157,6 +189,27 @@ fn policy_launch_object(candidate: &LaunchCandidate) -> JsonObject {
+     object
+ }
+ 
++fn model_provider_args(context: &ExternalProviderDispatchContext) -> Vec<String> {
++    context
++        .model
++        .providers
++        .get(context.provider_index)
++        .map(|provider| provider.args.clone())
++        .unwrap_or_default()
++}
++
++fn base_provider_args(
++    context: &ExternalProviderDispatchContext,
++    model_provider_args: &[String],
++) -> Vec<String> {
++    let effective_args = context.provider.args.as_slice();
++    if effective_args.ends_with(model_provider_args) {
++        effective_args[..effective_args.len() - model_provider_args.len()].to_vec()
++    } else {
++        effective_args.to_vec()
++    }
++}
++
+ fn launch_session(context: &ExternalProviderDispatchContext) -> Option<JsonObject> {
+     let mut session = JsonObject::new();
+     if let Some(session_id) = &context.start_known_provider_session_id {
+diff --git a/crates/oulipoly-runtime/src/provider_registry/options.rs b/crates/oulipoly-runtime/src/provider_registry/options.rs
+index a219e02..9758fdb 100644
+--- a/crates/oulipoly-runtime/src/provider_registry/options.rs
++++ b/crates/oulipoly-runtime/src/provider_registry/options.rs
+@@ -1,4 +1,5 @@
+ use oulipoly_provider::client::ProviderClientOptions;
++use std::ffi::OsString;
+ use std::path::PathBuf;
+ 
+ #[derive(Debug, Clone, Default)]
+@@ -23,6 +24,17 @@ impl ProviderRegistryOptions {
+         self
+     }
+ 
++    pub fn with_path_entries_from_process_path(self) -> Self {
++        self.with_path_entries_from_path_env(std::env::var_os("PATH"))
++    }
++
++    pub fn with_path_entries_from_path_env(self, path_env: Option<OsString>) -> Self {
++        match path_env {
++            Some(path_env) => self.with_path_entries(std::env::split_paths(&path_env)),
++            None => self,
++        }
++    }
++
+     pub fn with_config_root(mut self, root: impl Into<PathBuf>) -> Self {
+         self.config_root = Some(root.into());
+         self
+diff --git a/crates/oulipoly-runtime/src/provider_settings/mod.rs b/crates/oulipoly-runtime/src/provider_settings/mod.rs
+index 929ab37..12ad3b7 100644
+--- a/crates/oulipoly-runtime/src/provider_settings/mod.rs
++++ b/crates/oulipoly-runtime/src/provider_settings/mod.rs
+@@ -55,6 +55,11 @@ pub struct ProviderSettingsProcessStatus {
+ }
+ 
+ impl ProviderSettingsHostOptions {
++    pub fn with_path_entries_from_process_path(mut self) -> Self {
++        self.registry = self.registry.with_path_entries_from_process_path();
++        self
++    }
++
+     pub fn with_config_root(mut self, root: impl Into<PathBuf>) -> Self {
+         self.registry = self.registry.with_config_root(root);
+         self
+@@ -96,28 +101,35 @@ impl ProviderSettingsHost {
+         &self,
+         model_name: &str,
+     ) -> Result<ProviderSettingsTarget, ProviderSettingsError> {
+-        if let Some(target) = self
+-            .target_cache
++        if let Some(target) = self.cached_settings_target(model_name) {
++            return Ok(target);
++        }
++        let target = self.load_settings_target(model_name)?;
++        self.cache_settings_target(model_name, &target);
++        Ok(target)
++    }
++
++    fn cached_settings_target(&self, model_name: &str) -> Option<ProviderSettingsTarget> {
++        self.target_cache
+             .lock()
+             .expect("settings target cache should not be poisoned")
+             .get(model_name)
+             .cloned()
+-        {
+-            return Ok(target);
+-        }
++    }
++
++    fn load_settings_target(
++        &self,
++        model_name: &str,
++    ) -> Result<ProviderSettingsTarget, ProviderSettingsError> {
+         let description = self.describe_provider(model_name)?;
+-        let target = ProviderSettingsTarget {
+-            model_name: model_name.to_string(),
+-            provider_id: description.provider_id,
+-            display_name: description.display_name,
+-            settings_supported: description.capabilities.settings,
+-            schema_id: description.settings_schema_id,
+-        };
++        Ok(settings_target_from_description(model_name, description))
++    }
++
++    fn cache_settings_target(&self, model_name: &str, target: &ProviderSettingsTarget) {
+         self.target_cache
+             .lock()
+             .expect("settings target cache should not be poisoned")
+             .insert(model_name.to_string(), target.clone());
+-        Ok(target)
+     }
+ 
+     pub fn configured_model_names(&self) -> Vec<String> {
+@@ -296,6 +308,19 @@ impl ProviderSettingsHost {
+     }
+ }
+ 
++fn settings_target_from_description(
++    model_name: &str,
++    description: DescribeResult,
++) -> ProviderSettingsTarget {
++    ProviderSettingsTarget {
++        model_name: model_name.to_string(),
++        provider_id: description.provider_id,
++        display_name: description.display_name,
++        settings_supported: description.capabilities.settings,
++        schema_id: description.settings_schema_id,
++    }
++}
++
+ #[derive(Debug, Clone, Copy)]
+ enum SettingsOperation {
+     Schema,
+@@ -434,10 +459,11 @@ impl From<ProviderClientError> for ProviderSettingsError {
+                         .unwrap_or_else(|| Value::Object(Map::new())),
+                 ),
+                 diagnostics: capability.error().diagnostics.clone().into_boxed_slice(),
+-                process_status: provider_error_process_status_from_stdout(
+-                    &capability.diagnostics().stdout,
++                process_status: provider_error_status(
++                    capability
++                        .provider_reported_process_status()
++                        .or_else(|| capability.process_status()),
+                 )
+-                .or_else(|| provider_error_status(capability.process_status()))
+                 .map(Box::new),
+             },
+             other => {
+@@ -526,28 +552,6 @@ fn provider_error_status(status: Option<&ProcessStatus>) -> Option<ProviderSetti
+     })
+ }
+ 
+-fn provider_error_process_status_from_stdout(
+-    stdout: &oulipoly_provider::error::CapturedBytes,
+-) -> Option<ProviderSettingsProcessStatus> {
+-    let envelope = serde_json::from_slice::<Value>(&stdout.bytes).ok()?;
+-    let status = envelope.get("process_status")?;
+-    Some(ProviderSettingsProcessStatus {
+-        exit_code: status
+-            .get("exit_code")
+-            .and_then(Value::as_i64)
+-            .and_then(|code| i32::try_from(code).ok()),
+-        signal: status
+-            .get("signal")
+-            .and_then(Value::as_i64)
+-            .and_then(|signal| i32::try_from(signal).ok()),
+-        kind: status
+-            .get("kind")
+-            .and_then(Value::as_str)
+-            .unwrap_or("exited")
+-            .to_string(),
+-    })
+-}
+-
+ struct NoProviderEnv;
+ 
+ impl ProviderEnv for NoProviderEnv {
+diff --git a/crates/oulipoly-runtime/src/session_metadata/mod.rs b/crates/oulipoly-runtime/src/session_metadata/mod.rs
+index 5100393..cde99d3 100644
+--- a/crates/oulipoly-runtime/src/session_metadata/mod.rs
++++ b/crates/oulipoly-runtime/src/session_metadata/mod.rs
+@@ -545,6 +545,9 @@ pub fn resolve_resume_workspace_root(
+     let resolved = state
+         .resolve_resume(models, input, None)
+         .map_err(map_resume_error)?;
++    if let Some(workspace_root) = external_session_runtime_workspace_root(&resolved)? {
++        return Ok(workspace_root);
++    }
+     let provider = effective_provider_for_resolved(&resolved, providers_cfg)?;
+     resolve_cwd_from_session_storage(
+         provider.session_storage.as_ref(),
+@@ -553,6 +556,69 @@ pub fn resolve_resume_workspace_root(
+     )
+ }
+ 
++fn external_session_runtime_workspace_root(
++    resolved: &oulipoly_state::ResolvedResume,
++) -> Result<Option<PathBuf>, MetadataError> {
++    if !resolved_uses_external_provider(resolved) {
++        return Ok(None);
++    }
++    let Some(db) = external_session_runtime_db()? else {
++        return Ok(None);
++    };
++    let Some(row) = db
++        .session_runtime(&resolved.active_session_id)
++        .map_err(external_session_runtime_error)?
++    else {
++        return Ok(None);
++    };
++    row.effective_cwd
++        .map(validate_external_session_runtime_cwd)
++        .transpose()
++}
++
++fn external_session_runtime_db() -> Result<Option<oulipoly_state::mailbox::MailboxDb>, MetadataError>
++{
++    oulipoly_state::mailbox::MailboxDb::open_default_if_exists()
++        .map_err(external_session_runtime_error)
++}
++
++fn validate_external_session_runtime_cwd(value: String) -> Result<PathBuf, MetadataError> {
++    require_absolute_external_session_runtime_cwd(external_session_runtime_cwd_path(value))
++}
++
++fn external_session_runtime_cwd_path(value: String) -> PathBuf {
++    PathBuf::from(value)
++}
++
++fn require_absolute_external_session_runtime_cwd(path: PathBuf) -> Result<PathBuf, MetadataError> {
++    if external_session_runtime_cwd_is_absolute(&path) {
++        Ok(path)
++    } else {
++        Err(external_session_runtime_cwd_not_absolute(&path))
++    }
++}
++
++fn external_session_runtime_cwd_is_absolute(path: &std::path::Path) -> bool {
++    path.is_absolute()
++}
++
++fn external_session_runtime_cwd_not_absolute(path: &std::path::Path) -> MetadataError {
++    MetadataError::Operational {
++        message: external_session_runtime_cwd_not_absolute_message(path),
++    }
++}
++
++fn external_session_runtime_cwd_not_absolute_message(path: &std::path::Path) -> String {
++    format!(
++        "session_runtime_effective_cwd_not_absolute: {}",
++        path.display()
++    )
++}
++
++fn external_session_runtime_error(message: String) -> MetadataError {
++    MetadataError::Operational { message }
++}
++
+ pub fn resolve_jsonl_path_for_provider_allow_missing(
+     sessions_cfg: &SessionsConfig,
+     session_storage: Option<&SessionStorage>,
+diff --git a/crates/oulipoly-runtime/tests/provider_registry.rs b/crates/oulipoly-runtime/tests/provider_registry.rs
+index 9a0685e..8bf461c 100644
+--- a/crates/oulipoly-runtime/tests/provider_registry.rs
++++ b/crates/oulipoly-runtime/tests/provider_registry.rs
+@@ -736,6 +736,57 @@ fn enabled_ref_flavors_resolve_describe_and_parse_capability_description() {
+     assert_eq!(read_count(&script_count), 1);
+ }
+ 
++#[test]
++fn binary_ref_resolves_from_process_path_entries() {
++    let temp = tempfile::tempdir().unwrap();
++    let count = temp.path().join("process-path-count");
++    write_fake_provider_script(
++        temp.path(),
++        "agent-runner-fixture",
++        &count,
++        Ok("path-provider"),
++    );
++    let path_env = std::env::join_paths([temp.path()]).expect("fixture PATH should join");
++
++    let registry = registry_from_single_ref(
++        binary_ref("agent-runner-fixture"),
++        ProviderRegistryOptions::default().with_path_entries_from_path_env(Some(path_env)),
++    );
++
++    let result = registry
++        .describe_model_provider("example-model")
++        .expect("binary provider should resolve through PATH-derived entries");
++    assert_eq!(result.provider_id, "path-provider");
++    assert_eq!(read_count(&count), 1);
++}
++
++#[test]
++fn absent_binary_from_process_path_entries_preserves_missing_artifact() {
++    let temp = tempfile::tempdir().unwrap();
++    let path_env = std::env::join_paths([temp.path()]).expect("fixture PATH should join");
++
++    let error = registry_from_single_ref(
++        binary_ref("agent-runner-fixture"),
++        ProviderRegistryOptions::default().with_path_entries_from_path_env(Some(path_env)),
++    )
++    .describe_model_provider("example-model")
++    .expect_err("absent binary should remain a missing artifact");
++
++    assert_transport_kind(error, "missing_artifact");
++}
++
++#[test]
++fn unset_process_path_entries_preserves_missing_artifact_without_panic() {
++    let error = registry_from_single_ref(
++        binary_ref("agent-runner-fixture"),
++        ProviderRegistryOptions::default().with_path_entries_from_path_env(None),
++    )
++    .describe_model_provider("example-model")
++    .expect_err("unset PATH should not resolve binary provider refs");
++
++    assert_transport_kind(error, "missing_artifact");
++}
++
+ #[test]
+ fn describe_propagates_settings_capability_and_schema_id() {
+     let temp = tempfile::tempdir().unwrap();
+@@ -1629,16 +1680,28 @@ fn assert_s7b_operation_strings_are_sanctioned_and_bounded() {
+ }
+ 
+ fn session_external_provider_sources(root: &Path) -> Vec<String> {
++    session_external_provider_source_paths(root)
++        .into_iter()
++        .map(read_session_external_provider_source)
++        .collect()
++}
++
++fn session_external_provider_source_paths(root: &Path) -> Vec<PathBuf> {
+     fs::read_dir(root.join("session_external_provider"))
+         .expect("session_external_provider dir")
+-        .map(|entry| {
+-            let path = entry.expect("source entry").path();
+-            fs::read_to_string(&path)
+-                .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
+-        })
++        .map(source_entry_path)
+         .collect()
+ }
+ 
++fn source_entry_path(entry: std::io::Result<fs::DirEntry>) -> PathBuf {
++    entry.expect("source entry").path()
++}
++
++fn read_session_external_provider_source(path: PathBuf) -> String {
++    fs::read_to_string(&path)
++        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
++}
++
+ fn assert_lifecycle_provider_registry_dispatch_terms(lifecycle_source: &str) {
+     for expected in [
+         "SessionServiceExternalProviderIdentity",
+diff --git a/crates/oulipoly-runtime/tests/provider_settings_host.rs b/crates/oulipoly-runtime/tests/provider_settings_host.rs
+index 003777d..5c6e989 100644
+--- a/crates/oulipoly-runtime/tests/provider_settings_host.rs
++++ b/crates/oulipoly-runtime/tests/provider_settings_host.rs
+@@ -442,16 +442,38 @@ impl RebuildFixture {
+     }
+ 
+     fn subcommands_for(&self, provider_id: &str) -> Vec<String> {
+-        fs::read_to_string(&self.record)
+-            .unwrap_or_default()
+-            .lines()
+-            .map(|line| serde_json::from_str::<RecordedCall>(line).unwrap())
+-            .filter(|call| call.request["provider_instance_id"] == provider_id)
+-            .map(|call| call.subcommand)
++        recorded_calls(&self.record)
++            .into_iter()
++            .filter(|call| recorded_call_is_for_provider(call, provider_id))
++            .map(recorded_call_subcommand)
+             .collect()
+     }
+ }
+ 
++fn recorded_calls(path: &Path) -> Vec<RecordedCall> {
++    parse_recorded_calls(&recorded_calls_text(path))
++}
++
++fn recorded_calls_text(path: &Path) -> String {
++    fs::read_to_string(path).unwrap_or_default()
++}
++
++fn parse_recorded_calls(text: &str) -> Vec<RecordedCall> {
++    text.lines().map(parse_recorded_call).collect()
++}
++
++fn parse_recorded_call(line: &str) -> RecordedCall {
++    serde_json::from_str::<RecordedCall>(line).unwrap()
++}
++
++fn recorded_call_is_for_provider(call: &RecordedCall, provider_id: &str) -> bool {
++    call.request["provider_instance_id"] == provider_id
++}
++
++fn recorded_call_subcommand(call: RecordedCall) -> String {
++    call.subcommand
++}
++
+ impl SettingsHostFixture {
+     fn new() -> Self {
+         Self::with_settings_capability(true)
+@@ -541,7 +563,7 @@ def error():
+             "details": {{"remote_version": "provider-updated-version"}},
+             "diagnostics": [{{"severity": "warning", "message": "Reload before saving", "path": "/endpoint", "code": "stale"}}],
+         }},
+-        "process_status": {{"exit_code": 17}},
++        "process_status": {{"kind": "exited", "code": 17}},
+     }}
+ 
+ if subcommand == "schema":
+diff --git a/crates/oulipoly-runtime/tests/s10_external_launch_session.rs b/crates/oulipoly-runtime/tests/s10_external_launch_session.rs
+index 78bd8a2..7693d89 100644
+--- a/crates/oulipoly-runtime/tests/s10_external_launch_session.rs
++++ b/crates/oulipoly-runtime/tests/s10_external_launch_session.rs
+@@ -6,7 +6,7 @@ use oulipoly_config::{
+ use oulipoly_runtime::executor::RuntimeExecutorService;
+ use oulipoly_runtime::provider_registry::{ProviderRegistry, ProviderRegistryOptions};
+ use oulipoly_runtime::services::{ExecutorServicePort, ExecutorServiceRequest};
+-use serde_json::Value;
++use serde_json::{Value, json};
+ use std::collections::HashMap;
+ use std::fs;
+ use std::os::unix::fs::PermissionsExt;
+@@ -106,6 +106,27 @@ fn external_launch_exit_session_populates_capture_and_resume_request() {
+         Some(expected_session.as_str()),
+         "resume launch must receive the provider session captured from the prior external launch"
+     );
++    let expected_path = std::env::var("PATH").expect("test process should have PATH");
++    assert_eq!(
++        launch_records[0]["request"]["params"]["env"]["PATH"].as_str(),
++        Some(expected_path.as_str()),
++        "external launch must pass PATH because provider launch clears inherited child env"
++    );
++    let policy_records = fixture.records_for("policy.evaluate");
++    assert_eq!(
++        policy_records.len(),
++        2,
++        "policy records: {policy_records:?}"
++    );
++    let policy_launch = &policy_records[0]["request"]["params"]["launch"];
++    let provider = provider_name();
++    assert_eq!(policy_launch["command"].as_str(), Some(provider.as_str()));
++    assert_eq!(policy_launch["args"], json!([]));
++    assert_eq!(policy_launch["prompt_mode"].as_str(), Some("arg"));
++    assert_eq!(
++        policy_records[0]["request"]["params"]["model"]["provider_args"],
++        json!(["--model", "sonnet"])
++    );
+ }
+ 
+ fn execute_external(
+@@ -230,6 +251,7 @@ def describe():
+ def policy_evaluate():
+     return envelope({
+         "accepted": True,
++        "env": {},
+         "stdin": None,
+         "prompt": None,
+         "diagnostics": [],
+diff --git a/src-tauri/src/app_state.rs b/src-tauri/src/app_state.rs
+index c7c51b2..99bb3b5 100644
+--- a/src-tauri/src/app_state.rs
++++ b/src-tauri/src/app_state.rs
+@@ -238,6 +238,7 @@ fn provider_registry_options(models_dir: &Path) -> ProviderRegistryOptions {
+         .map(Path::to_path_buf)
+         .unwrap_or_else(|| PathBuf::from("."));
+     ProviderRegistryOptions::default()
++        .with_path_entries_from_process_path()
+         .with_config_root(root.clone())
+         .with_data_root(root)
+ }
+diff --git a/src-tauri/src/commands/provider_settings.rs b/src-tauri/src/commands/provider_settings.rs
+index 84b3303..fcbe122 100644
+--- a/src-tauri/src/commands/provider_settings.rs
++++ b/src-tauri/src/commands/provider_settings.rs
+@@ -385,6 +385,7 @@ pub fn host_options(models_dir: &Path) -> ProviderSettingsHostOptions {
+         .map(Path::to_path_buf)
+         .unwrap_or_else(|| Path::new(".").to_path_buf());
+     ProviderSettingsHostOptions::default()
++        .with_path_entries_from_process_path()
+         .with_config_root(config_root.clone())
+         .with_data_root(config_root)
+ }
+@@ -416,23 +417,46 @@ fn packaged_model_block(
+ fn packaged_provider_blocks(state: &AppState) -> ProviderSettingsCommandResult<Value> {
+     let _providers =
+         load_providers_for_models_dir_with(&state.models_dir, &*state.providers_config);
+-    let path = state
++    read_provider_blocks(&providers_toml_path(state))
++}
++
++fn providers_toml_path(state: &AppState) -> std::path::PathBuf {
++    state
+         .models_dir
+         .parent()
+         .unwrap_or(&state.models_dir)
+-        .join("providers.toml");
+-    let raw = if path.exists() {
+-        read_toml_json(&path)?
++        .join("providers.toml")
++}
++
++fn read_provider_blocks(path: &Path) -> ProviderSettingsCommandResult<Value> {
++    if provider_blocks_file_exists(path) {
++        read_toml_json(path)
+     } else {
+-        Value::Object(Map::new())
+-    };
+-    Ok(raw)
++        Ok(empty_provider_blocks())
++    }
++}
++
++fn provider_blocks_file_exists(path: &Path) -> bool {
++    path.exists()
++}
++
++fn empty_provider_blocks() -> Value {
++    Value::Object(Map::new())
+ }
+ 
+ fn read_toml_json(path: &Path) -> ProviderSettingsCommandResult<Value> {
+-    let text = std::fs::read_to_string(path).map_err(|error| simple_error("unavailable", error))?;
+-    let value = toml::from_str::<toml::Value>(&text)
+-        .map_err(|error| simple_error("invalid_request", error))?;
++    toml_json_value(parse_toml_value(&read_toml_text(path)?)?)
++}
++
++fn read_toml_text(path: &Path) -> ProviderSettingsCommandResult<String> {
++    std::fs::read_to_string(path).map_err(|error| simple_error("unavailable", error))
++}
++
++fn parse_toml_value(text: &str) -> ProviderSettingsCommandResult<toml::Value> {
++    toml::from_str::<toml::Value>(text).map_err(|error| simple_error("invalid_request", error))
++}
++
++fn toml_json_value(value: toml::Value) -> ProviderSettingsCommandResult<Value> {
+     serde_json::to_value(value).map_err(|error| simple_error("failed", error))
+ }
+ 
+@@ -440,20 +464,25 @@ fn with_host<T>(
+     state: &AppState,
+     action: impl FnOnce(&ProviderSettingsHost) -> Result<T, ProviderSettingsError>,
+ ) -> ProviderSettingsCommandResult<T> {
+-    let host = state.provider_settings.lock().map_err(|error| {
+-        Box::new(ProviderSettingsErrorDto {
+-            category: "failed".to_string(),
+-            code: Some("settings_host_lock".to_string()),
+-            message: error.to_string(),
+-            retryable: Some(false),
+-            details: None,
+-            diagnostics: Vec::new(),
+-            process_status: None,
+-        })
+-    })?;
++    let host = state
++        .provider_settings
++        .lock()
++        .map_err(settings_host_lock_error)?;
+     action(&host).map_err(map_error)
+ }
+ 
++fn settings_host_lock_error<T>(error: std::sync::PoisonError<T>) -> Box<ProviderSettingsErrorDto> {
++    Box::new(ProviderSettingsErrorDto {
++        category: "failed".to_string(),
++        code: Some("settings_host_lock".to_string()),
++        message: error.to_string(),
++        retryable: Some(false),
++        details: None,
++        diagnostics: Vec::new(),
++        process_status: None,
++    })
++}
++
+ fn settings_values(value: Value) -> ProviderSettingsCommandResult<SettingsValues> {
+     serde_json::from_value(value).map_err(|error| simple_error("invalid_request", error))
+ }
+@@ -621,15 +650,7 @@ impl ProviderSettingsCommandHarness {
+     }
+ 
+     pub fn fail_validate_with_transport_error(&mut self, category: &str, message: &str) {
+-        let error = ProviderSettingsErrorDto {
+-            category: category.to_string(),
+-            code: None,
+-            message: message.to_string(),
+-            retryable: Some(false),
+-            details: None,
+-            diagnostics: Vec::new(),
+-            process_status: None,
+-        };
++        let error = transport_error_dto(category, message);
+         self.with_responses(|responses| responses.validate_error = Some(error));
+     }
+ 
+@@ -641,9 +662,25 @@ impl ProviderSettingsCommandHarness {
+     }
+ }
+ 
++fn transport_error_dto(category: &str, message: &str) -> ProviderSettingsErrorDto {
++    ProviderSettingsErrorDto {
++        category: category.to_string(),
++        code: None,
++        message: message.to_string(),
++        retryable: Some(false),
++        details: None,
++        diagnostics: Vec::new(),
++        process_status: None,
++    }
++}
++
+ fn test_update_result(
+     state: &AppState,
+ ) -> Option<ProviderSettingsCommandResult<ProviderSettingsWriteDto>> {
++    test_update_error(state).map(command_error_result)
++}
++
++fn test_update_error(state: &AppState) -> Option<ProviderSettingsErrorDto> {
+     state
+         .provider_settings_test_double
+         .lock()
+@@ -653,12 +690,15 @@ fn test_update_result(
+                 .as_ref()
+                 .and_then(|responses| responses.update_error.clone())
+         })
+-        .map(|error| Err(Box::new(error)))
+ }
+ 
+ fn test_validate_result(
+     state: &AppState,
+ ) -> Option<ProviderSettingsCommandResult<ProviderSettingsValidateDto>> {
++    test_validate_error(state).map(command_error_result)
++}
++
++fn test_validate_error(state: &AppState) -> Option<ProviderSettingsErrorDto> {
+     state
+         .provider_settings_test_double
+         .lock()
+@@ -668,5 +708,8 @@ fn test_validate_result(
+                 .as_ref()
+                 .and_then(|responses| responses.validate_error.clone())
+         })
+-        .map(|error| Err(Box::new(error)))
++}
++
++fn command_error_result<T>(error: ProviderSettingsErrorDto) -> ProviderSettingsCommandResult<T> {
++    Err(Box::new(error))
+ }
+diff --git a/src-tauri/src/commands/session_locate_export/orchestration.rs b/src-tauri/src/commands/session_locate_export/orchestration.rs
+index a41ca97..4ad4c94 100644
+--- a/src-tauri/src/commands/session_locate_export/orchestration.rs
++++ b/src-tauri/src/commands/session_locate_export/orchestration.rs
+@@ -144,6 +144,7 @@ fn build_session_locate_provider_registry(
+     ProviderRegistry::from_model_configs(
+         &models.values().cloned().collect::<Vec<_>>(),
+         ProviderRegistryOptions::default()
++            .with_path_entries_from_process_path()
+             .with_config_root(config_root)
+             .with_data_root(default_data_root()?),
+     )
+diff --git a/src-tauri/src/run/balancing/finalization.rs b/src-tauri/src/run/balancing/finalization.rs
+index 82b1252..d90a110 100644
+--- a/src-tauri/src/run/balancing/finalization.rs
++++ b/src-tauri/src/run/balancing/finalization.rs
+@@ -7,6 +7,7 @@ use oulipoly_config::ModelConfig;
+ use oulipoly_runtime::executor;
+ use oulipoly_runtime::services::InvocationLifecycleServicePort;
+ use oulipoly_state::CompositeInvocationId;
++use oulipoly_state::mailbox::{MailboxDb, SessionRuntimeUpsert};
+ 
+ use super::accessor::BalancedExecutionEnvironment;
+ use super::disposition::BalancedLoopControl;
+@@ -267,6 +268,7 @@ fn ingest_completed_attempt_session(
+         input.agent_runtime_services,
+         mapper::completed_session_ingest_request_for_attempt(input, &ingest_effective_cwd),
+     );
++    record_external_session_runtime_if_needed(input, &ingest_effective_cwd);
+     if let Some(session_id) = super::filter::session_ingest_fallback_session_id(
+         emitted,
+         input.result.session_capture.session_id.as_deref(),
+@@ -281,3 +283,49 @@ fn ingest_completed_attempt_session(
+     }
+     Ok(())
+ }
++
++fn record_external_session_runtime_if_needed(
++    input: &CompletedAttemptInput<'_, '_, '_>,
++    effective_cwd: &Path,
++) {
++    if input.model.provider.is_none() {
++        return;
++    }
++    let Some(session_id) = external_runtime_session_id(input) else {
++        return;
++    };
++    if let Err(err) = record_external_session_runtime(input, session_id, effective_cwd) {
++        tracing::warn!(
++            provider_name = input.provider_name,
++            session_id,
++            "Failed to record external session runtime cwd: {err}"
++        );
++    }
++}
++
++fn external_runtime_session_id<'a>(
++    input: &'a CompletedAttemptInput<'_, '_, '_>,
++) -> Option<&'a str> {
++    input
++        .zero_turn_provider_session_id
++        .or(input.result.session_capture.session_id.as_deref())
++}
++
++fn record_external_session_runtime(
++    input: &CompletedAttemptInput<'_, '_, '_>,
++    session_id: &str,
++    effective_cwd: &Path,
++) -> Result<(), String> {
++    let mut db = MailboxDb::open_default()?;
++    let effective_cwd = effective_cwd.to_string_lossy();
++    db.upsert_session_runtime(SessionRuntimeUpsert {
++        session_id,
++        mode: "headless",
++        invocation_uuid: Some(&input.invocation.id),
++        provider_name: Some(input.provider_name),
++        model_name: Some(&input.model.name),
++        pty_control_path: None,
++        models_dir: None,
++        effective_cwd: Some(effective_cwd.as_ref()),
++    })
++}
+diff --git a/src-tauri/src/run/resume/orchestration.rs b/src-tauri/src/run/resume/orchestration.rs
+index aca94e3..bb33cb6 100644
+--- a/src-tauri/src/run/resume/orchestration.rs
++++ b/src-tauri/src/run/resume/orchestration.rs
+@@ -2,12 +2,14 @@
+ //!
+ //! `orchestration`, `validator`, `accessor`, `mapper`, `filter`, `predicate`, `formatter`
+ 
++use std::collections::HashMap;
+ use std::io::IsTerminal;
+ use std::path::Path;
+ 
+ use oulipoly_runtime::executor;
+ use oulipoly_runtime::services::{
+-    InvocationLifecycleServicePort, MigrationServiceOutput, ResumeServiceOutput, ServiceError,
++    ExecutorServiceRequest, InvocationLifecycleServicePort, MigrationServiceOutput,
++    ResumeServiceOutput, ServiceError,
+ };
+ 
+ use super::disposition::{
+@@ -271,7 +273,7 @@ fn run_resume_attempt(
+     };
+     let provider_index = target.provider_index;
+     let provider = target.provider;
+-    let strategy = match resume_attempt_strategy(&provider) {
++    let strategy = match resume_attempt_strategy_for_target(input.resolved, &provider) {
+         Ok(strategy) => strategy,
+         Err(exit_code) => return Ok(ResumeAttemptLoopControl::Return(exit_code)),
+     };
+@@ -330,6 +332,16 @@ fn run_resume_attempt(
+     })
+ }
+ 
++fn resume_attempt_strategy_for_target<'a>(
++    resolved: &oulipoly_state::ResolvedResume,
++    provider: &'a oulipoly_config::ProviderConfig,
++) -> Result<Option<&'a oulipoly_config::ResumeStrategy>, i32> {
++    if resolved_uses_provider_ref(resolved) {
++        return Ok(None);
++    }
++    resume_attempt_strategy(provider).map(Some)
++}
++
+ fn resume_attempt_strategy(
+     provider: &oulipoly_config::ProviderConfig,
+ ) -> Result<&oulipoly_config::ResumeStrategy, i32> {
+@@ -350,8 +362,22 @@ fn execute_resume_attempt_command(
+     provider_index: usize,
+     prompt_mode: oulipoly_config::PromptMode,
+     invocation_env: &str,
+-    strategy: &oulipoly_config::ResumeStrategy,
++    strategy: Option<&oulipoly_config::ResumeStrategy>,
+ ) -> Result<executor::ExecutionResult, String> {
++    if let Some(request) = provider_ref_resume_executor_request(
++        input,
++        provider,
++        provider_index,
++        prompt_mode,
++        invocation_env,
++    ) {
++        return input
++            .agent_runtime_services
++            .executor_service
++            .execute(request)
++            .map(|output| output.result)
++            .map_err(|err| err.to_string());
++    }
+     executor::cli::execute_resume_optional_prompt_with_model_identity(
+         provider,
+         provider_index,
+@@ -361,12 +387,36 @@ fn execute_resume_attempt_command(
+         Some(invocation_env),
+         executor::cli::ResumePayload {
+             session_id: &input.resolved.active_session_id,
+-            strategy,
++            strategy: strategy.expect("legacy resume target must have a resume strategy"),
+         },
+         input.resolved.model_name.as_deref().unwrap_or("<unknown>"),
+     )
+ }
+ 
++fn provider_ref_resume_executor_request(
++    input: &ResumeAttemptInput<'_>,
++    provider: &oulipoly_config::ProviderConfig,
++    provider_index: usize,
++    prompt_mode: oulipoly_config::PromptMode,
++    invocation_env: &str,
++) -> Option<ExecutorServiceRequest> {
++    let model = input.resolved.model.as_ref()?;
++    model.provider.as_ref()?;
++    Some(
++        ExecutorServiceRequest::EffectiveWithStartKnownProviderSessionId {
++            model: model.clone(),
++            provider: provider.clone(),
++            provider_index,
++            prompt_mode,
++            prompt: input.answer.unwrap_or_default().to_string(),
++            working_dir: Some(input.effective_spawn_cwd.to_path_buf()),
++            extra_inputs: HashMap::new(),
++            parent_invocation_env: Some(invocation_env.to_string()),
++            start_known_provider_session_id: input.resolved.active_session_id.clone(),
++        },
++    )
++}
++
+ fn finalize_resume_spawn_error(
+     input: &ResumeAttemptInput<'_>,
+     attempt: &mut ResumeInvocationAttempt<'_>,
+@@ -710,7 +760,7 @@ fn prepare_initial_headless_resume_target(
+ ) -> Result<(), i32> {
+     let target = renderable_resume_execution_target(resolved, providers_cfg)?;
+     render_resume_short_line_if_needed(stderr_is_terminal, &resolved.active_provider);
+-    validate_headless_resume_target(&target, &resolved.active_provider)
++    validate_headless_resume_target(resolved, &target, &resolved.active_provider)
+ }
+ 
+ fn render_resume_short_line_if_needed(stderr_is_terminal: bool, selected_provider: &str) {
+@@ -720,9 +770,14 @@ fn render_resume_short_line_if_needed(stderr_is_terminal: bool, selected_provide
+ }
+ 
+ fn validate_headless_resume_target(
++    resolved: &oulipoly_state::ResolvedResume,
+     target: &crate::resume_cli::ResumeExecutionTarget,
+     selected_provider: &str,
+ ) -> Result<(), i32> {
++    if resolved_uses_provider_ref(resolved) {
++        return validate_provider_ref_headless_resume_target(resolved, target, selected_provider)
++            .map_err(|message| provider_ref_resume_block_exit_code(&message));
++    }
+     if headless_resume_target_has_resume(target) {
+         Ok(())
+     } else {
+@@ -730,6 +785,91 @@ fn validate_headless_resume_target(
+     }
+ }
+ 
++fn validate_provider_ref_headless_resume_target(
++    resolved: &oulipoly_state::ResolvedResume,
++    target: &crate::resume_cli::ResumeExecutionTarget,
++    selected_provider: &str,
++) -> Result<(), String> {
++    let Some(model) = provider_ref_resolved_model(resolved) else {
++        return Err(provider_ref_missing_model_message(selected_provider));
++    };
++    if !provider_ref_model_has_implementation(model) {
++        return Err(provider_ref_missing_implementation_message(
++            selected_provider,
++        ));
++    }
++    let Some(target_member_name) = provider_ref_target_member_name(model, target.provider_index)
++    else {
++        return Err(provider_ref_invalid_index_message(
++            selected_provider,
++            target.provider_index,
++        ));
++    };
++    if target_member_name != selected_provider {
++        return Err(provider_ref_resolved_provider_message(
++            selected_provider,
++            target_member_name,
++        ));
++    }
++    let loaded_provider_name = provider_ref_loaded_provider_name(target);
++    if loaded_provider_name != selected_provider {
++        return Err(provider_ref_loaded_provider_message(
++            selected_provider,
++            loaded_provider_name,
++        ));
++    }
++    Ok(())
++}
++
++fn provider_ref_resolved_model(
++    resolved: &oulipoly_state::ResolvedResume,
++) -> Option<&oulipoly_config::ModelConfig> {
++    resolved.model.as_ref()
++}
++
++fn provider_ref_model_has_implementation(model: &oulipoly_config::ModelConfig) -> bool {
++    model.provider.is_some()
++}
++
++fn provider_ref_target_member_name(
++    model: &oulipoly_config::ModelConfig,
++    provider_index: usize,
++) -> Option<&str> {
++    model
++        .providers
++        .get(provider_index)
++        .map(|provider| provider.name.as_str())
++}
++
++fn provider_ref_loaded_provider_name(target: &crate::resume_cli::ResumeExecutionTarget) -> &str {
++    &target.provider.name
++}
++
++fn provider_ref_missing_model_message(selected_provider: &str) -> String {
++    format!("provider-ref resume target {selected_provider} has no model config")
++}
++
++fn provider_ref_missing_implementation_message(selected_provider: &str) -> String {
++    format!("provider-ref resume target {selected_provider} has no provider implementation")
++}
++
++fn provider_ref_invalid_index_message(selected_provider: &str, provider_index: usize) -> String {
++    format!(
++        "provider-ref resume target {selected_provider} has invalid provider index {provider_index}"
++    )
++}
++
++fn provider_ref_resolved_provider_message(
++    selected_provider: &str,
++    resolved_provider: &str,
++) -> String {
++    format!("provider-ref resume target {selected_provider} resolved provider {resolved_provider}")
++}
++
++fn provider_ref_loaded_provider_message(selected_provider: &str, loaded_provider: &str) -> String {
++    format!("provider-ref resume target {selected_provider} loaded provider {loaded_provider}")
++}
++
+ fn headless_resume_target_has_resume(target: &crate::resume_cli::ResumeExecutionTarget) -> bool {
+     target.provider.resume.is_some()
+ }
+@@ -739,6 +879,11 @@ fn headless_missing_resume_block_exit_code(selected_provider: &str) -> i32 {
+     1
+ }
+ 
++fn provider_ref_resume_block_exit_code(message: &str) -> i32 {
++    formatter::emit_stderr(message);
++    1
++}
++
+ fn migrate_resume_target(
+     agent_runtime_services: &wiring::AgentRuntimeServices,
+     env: &crate::migration_providers::ResumeExecutionEnvironment,
+@@ -748,6 +893,11 @@ fn migrate_resume_target(
+     attempts: usize,
+     effective_spawn_cwd: &Path,
+ ) -> Result<(), i32> {
++    if should_skip_provider_ref_default_migration(resolved, manual_migrate) {
++        validate_provider_ref_headless_resume_target(resolved, target, &resolved.active_provider)
++            .map_err(|message| provider_ref_resume_block_exit_code(&message))?;
++        return Ok(());
++    }
+     let migration_model = migration_model_for_attempt(env, resolved, manual_migrate, attempts);
+     match dispatch_resume_migration(
+         agent_runtime_services,
+@@ -768,6 +918,20 @@ fn migrate_resume_target(
+     }
+ }
+ 
++fn should_skip_provider_ref_default_migration(
++    resolved: &oulipoly_state::ResolvedResume,
++    manual_migrate: Option<&str>,
++) -> bool {
++    manual_migrate.is_none() && resolved_uses_provider_ref(resolved)
++}
++
++fn resolved_uses_provider_ref(resolved: &oulipoly_state::ResolvedResume) -> bool {
++    resolved
++        .model
++        .as_ref()
++        .is_some_and(|model| model.provider.is_some())
++}
++
+ fn migration_model_for_attempt(
+     env: &crate::migration_providers::ResumeExecutionEnvironment,
+     resolved: &oulipoly_state::ResolvedResume,
+diff --git a/src-tauri/src/wiring.rs b/src-tauri/src/wiring.rs
+index 62610f0..638070b 100644
+--- a/src-tauri/src/wiring.rs
++++ b/src-tauri/src/wiring.rs
+@@ -86,6 +86,7 @@ impl AgentRuntimeServices {
+     pub fn cli_defaults() -> Self {
+         let paths = default_cli_runtime_paths();
+         let provider_registry_options = ProviderRegistryOptions::default()
++            .with_path_entries_from_process_path()
+             .with_config_root(paths.config_root.clone())
+             .with_data_root(paths.data_root.clone());
+         let provider_registry = Arc::new(production_provider_registry(
+@@ -144,6 +145,7 @@ impl AgentRuntimeServices {
+     pub fn production(paths: RuntimePaths) -> Result<Self, String> {
+         prepare_runtime_directories(&paths)?;
+         let registry_options = ProviderRegistryOptions::default()
++            .with_path_entries_from_process_path()
+             .with_config_root(paths.config_root.clone())
+             .with_data_root(paths.data_root.clone());
+         let provider_registry = Arc::new(production_provider_registry(
+diff --git a/src-tauri/tests/age244_s7b_production_wiring_source_guard.rs b/src-tauri/tests/age244_s7b_production_wiring_source_guard.rs
+index 5aafa65..7b92a37 100644
+--- a/src-tauri/tests/age244_s7b_production_wiring_source_guard.rs
++++ b/src-tauri/tests/age244_s7b_production_wiring_source_guard.rs
+@@ -186,19 +186,75 @@ fn s7b_cli_defaults_builds_populated_default_path_provider_registry() {
+     );
+ }
+ 
++#[test]
++fn s10_production_provider_registries_populate_path_entries_from_process_path() {
++    let wiring = read_source("src-tauri/src/wiring.rs");
++    let cli_defaults = source_between(
++        &wiring,
++        "pub fn cli_defaults() -> Self",
++        "pub fn production(",
++    );
++    let production = source_between(
++        &wiring,
++        "pub fn production(",
++        "fn default_cli_runtime_paths()",
++    );
++
++    for (context, source) in [
++        ("wiring.rs::cli_defaults", cli_defaults),
++        ("wiring.rs::production", production),
++    ] {
++        assert_contains(context, source, ".with_path_entries_from_process_path()");
++    }
++
++    let locate_export =
++        read_source("src-tauri/src/commands/session_locate_export/orchestration.rs");
++    assert_contains(
++        "session_locate_export/orchestration.rs::build_session_locate_provider_registry",
++        &locate_export,
++        ".with_path_entries_from_process_path()",
++    );
++
++    let app_state = read_source("src-tauri/src/app_state.rs");
++    assert_contains(
++        "app_state.rs::provider_registry_options",
++        &app_state,
++        ".with_path_entries_from_process_path()",
++    );
++
++    let provider_settings = read_source("src-tauri/src/commands/provider_settings.rs");
++    assert_contains(
++        "provider_settings.rs::host_options",
++        &provider_settings,
++        ".with_path_entries_from_process_path()",
++    );
++}
++
+ fn read_source(relative: &str) -> String {
+     std::fs::read_to_string(workspace_root().join(relative))
+         .unwrap_or_else(|error| panic!("failed to read {relative}: {error}"))
+ }
+ 
+ fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+-    let start_index = source
+-        .find(start)
+-        .unwrap_or_else(|| panic!("missing start marker {start:?}"));
+-    let end_index = source[start_index..]
++    let start_index = source_marker_index(source, start);
++    let end_index = source_end_marker_index(source, start_index, start, end);
++    source_slice_between(source, start_index, end_index)
++}
++
++fn source_marker_index(source: &str, marker: &str) -> usize {
++    source
++        .find(marker)
++        .unwrap_or_else(|| panic!("missing start marker {marker:?}"))
++}
++
++fn source_end_marker_index(source: &str, start_index: usize, start: &str, end: &str) -> usize {
++    source[start_index..]
+         .find(end)
+         .map(|offset| start_index + offset)
+-        .unwrap_or_else(|| panic!("missing end marker {end:?} after {start:?}"));
++        .unwrap_or_else(|| panic!("missing end marker {end:?} after {start:?}"))
++}
++
++fn source_slice_between(source: &str, start_index: usize, end_index: usize) -> &str {
+     &source[start_index..end_index]
+ }
+ 
+@@ -217,10 +273,17 @@ fn assert_not_contains(context: &str, source: &str, needle: &str) {
+ }
+ 
+ fn assert_not_contains_compact(context: &str, source: &str, needle: &str) {
+-    let compact_source = compact_whitespace(source);
+-    let compact_needle = compact_whitespace(needle);
++    let (compact_source, compact_needle) = compact_source_and_needle(source, needle);
++    assert_compact_absent(context, &compact_source, &compact_needle, needle);
++}
++
++fn compact_source_and_needle(source: &str, needle: &str) -> (String, String) {
++    (compact_whitespace(source), compact_whitespace(needle))
++}
++
++fn assert_compact_absent(context: &str, compact_source: &str, compact_needle: &str, needle: &str) {
+     assert!(
+-        !compact_source.contains(&compact_needle),
++        !compact_source.contains(compact_needle),
+         "{context} must not hard-code missing external-provider identity: found {needle:?}"
+     );
+ }
+diff --git a/src-tauri/tests/s10_external_provider_resume.rs b/src-tauri/tests/s10_external_provider_resume.rs
+new file mode 100644
+index 0000000..86bab11
+--- /dev/null
++++ b/src-tauri/tests/s10_external_provider_resume.rs
+@@ -0,0 +1,535 @@
++#![cfg(unix)]
++
++use serde_json::Value;
++use std::fs;
++use std::os::unix::fs::PermissionsExt;
++use std::path::{Path, PathBuf};
++use std::process::{Command, Output};
++
++const MODEL: &str = "provider-ref-model";
++const PROVIDER: &str = "provider-ref-account";
++const SESSION_ID: &str = "a9a8c8d0-8f5f-402e-857c-c5c549446beb";
++
++struct Fixture {
++    _dir: tempfile::TempDir,
++    config_home: PathBuf,
++    data_home: PathBuf,
++    models_dir: PathBuf,
++    workspace: PathBuf,
++    hostile_cwd: PathBuf,
++    record_path: PathBuf,
++}
++
++struct FixturePaths {
++    config_home: PathBuf,
++    data_home: PathBuf,
++    app_config_dir: PathBuf,
++    models_dir: PathBuf,
++    workspace: PathBuf,
++    hostile_cwd: PathBuf,
++    record_path: PathBuf,
++}
++
++#[derive(Debug)]
++struct InvocationSessionRow {
++    session_id: Option<String>,
++    session_capture_method: Option<String>,
++    provider_session_id: Option<String>,
++    resume_input_id: Option<String>,
++    provider_session_capture_method: Option<String>,
++}
++
++struct ProviderOptions {
++    launch_session_key: &'static str,
++    session_capability: bool,
++}
++
++impl ProviderOptions {
++    fn provider_session_id() -> Self {
++        Self {
++            launch_session_key: "provider_session_id",
++            session_capability: true,
++        }
++    }
++
++    fn session_id_without_session_capability() -> Self {
++        Self {
++            launch_session_key: "session_id",
++            session_capability: false,
++        }
++    }
++}
++
++impl Fixture {
++    fn new() -> Self {
++        Self::new_with_provider_options(ProviderOptions::provider_session_id())
++    }
++
++    fn new_with_provider_options(options: ProviderOptions) -> Self {
++        let dir = tempfile::tempdir().unwrap();
++        let paths = fixture_paths(dir.path());
++        create_fixture_directories(&paths);
++        let provider_path = write_external_provider(dir.path(), &paths.record_path, options);
++        write_model_config(&paths.models_dir, &provider_path);
++        write_providers_config(&paths.app_config_dir);
++        fixture_from_paths(dir, paths)
++    }
++
++    fn run_launch(&self) -> Output {
++        let mut cmd = self.command();
++        cmd.current_dir(&self.workspace)
++            .arg("--models-dir")
++            .arg(&self.models_dir)
++            .arg("--model")
++            .arg(MODEL)
++            .arg("first prompt");
++        cmd.output().unwrap()
++    }
++
++    fn run_resume(&self) -> Output {
++        let mut cmd = self.command();
++        cmd.current_dir(&self.hostile_cwd)
++            .arg("resume")
++            .arg("--models-dir")
++            .arg(&self.models_dir)
++            .arg("--model")
++            .arg(MODEL)
++            .arg("--session-id")
++            .arg(SESSION_ID)
++            .arg("--prompt")
++            .arg("resume prompt");
++        cmd.output().unwrap()
++    }
++
++    fn command(&self) -> Command {
++        let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
++        cmd.env("XDG_CONFIG_HOME", &self.config_home);
++        cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
++        cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
++        cmd
++    }
++
++    fn db_path(&self) -> PathBuf {
++        self.data_home
++            .join("oulipoly-agent-runner")
++            .join("state.db")
++    }
++
++    fn invocation_session_rows(&self) -> Vec<InvocationSessionRow> {
++        let conn = rusqlite::Connection::open(self.db_path()).unwrap();
++        let mut stmt = conn
++            .prepare(
++                "SELECT session_id, session_capture_method, provider_session_id,
++                        resume_input_id, provider_session_capture_method
++                   FROM invocations
++                   ORDER BY id",
++            )
++            .unwrap();
++        stmt.query_map([], invocation_session_row)
++            .unwrap()
++            .collect::<Result<Vec<_>, _>>()
++            .unwrap()
++    }
++
++    fn records(&self) -> Vec<Value> {
++        parse_provider_records(&provider_record_text(&self.record_path))
++    }
++}
++
++fn fixture_paths(root: &Path) -> FixturePaths {
++    let config_home = root.join("config");
++    let app_config_dir = config_home.join("oulipoly-agent-runner");
++    FixturePaths {
++        data_home: root.join("data"),
++        models_dir: app_config_dir.join("models"),
++        workspace: root.join("workspace"),
++        hostile_cwd: root.join("hostile-cwd"),
++        record_path: root.join("provider-records.jsonl"),
++        config_home,
++        app_config_dir,
++    }
++}
++
++fn create_fixture_directories(paths: &FixturePaths) {
++    fs::create_dir_all(&paths.models_dir).unwrap();
++    fs::create_dir_all(&paths.workspace).unwrap();
++    fs::create_dir_all(&paths.hostile_cwd).unwrap();
++}
++
++fn write_model_config(models_dir: &Path, provider_path: &Path) {
++    fs::write(
++        models_dir.join(format!("{MODEL}.toml")),
++        model_config_toml(provider_path),
++    )
++    .unwrap();
++}
++
++fn model_config_toml(provider_path: &Path) -> String {
++    format!(
++        r#"provider = {{ path = {:?} }}
++prompt_mode = "arg"
++
++[[providers]]
++name = {:?}
++args = ["--model", "haiku"]
++"#,
++        provider_path.display().to_string(),
++        PROVIDER,
++    )
++}
++
++fn write_providers_config(app_config_dir: &Path) {
++    fs::write(
++        app_config_dir.join("providers.toml"),
++        providers_config_toml(),
++    )
++    .unwrap();
++}
++
++fn providers_config_toml() -> String {
++    format!(
++        r#"[{PROVIDER}]
++command = "native-provider"
++args = ["--base"]
++prompt_mode = "arg"
++"#,
++    )
++}
++
++fn fixture_from_paths(dir: tempfile::TempDir, paths: FixturePaths) -> Fixture {
++    Fixture {
++        _dir: dir,
++        config_home: paths.config_home,
++        data_home: paths.data_home,
++        models_dir: paths.models_dir,
++        workspace: paths.workspace,
++        hostile_cwd: paths.hostile_cwd,
++        record_path: paths.record_path,
++    }
++}
++
++fn invocation_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<InvocationSessionRow> {
++    Ok(InvocationSessionRow {
++        session_id: row.get(0)?,
++        session_capture_method: row.get(1)?,
++        provider_session_id: row.get(2)?,
++        resume_input_id: row.get(3)?,
++        provider_session_capture_method: row.get(4)?,
++    })
++}
++
++fn provider_record_text(path: &Path) -> String {
++    fs::read_to_string(path).unwrap()
++}
++
++fn parse_provider_records(text: &str) -> Vec<Value> {
++    text.lines()
++        .filter(|line| provider_record_line_has_content(line))
++        .map(parse_provider_record)
++        .collect()
++}
++
++fn provider_record_line_has_content(line: &str) -> bool {
++    !line.trim().is_empty()
++}
++
++fn parse_provider_record(line: &str) -> Value {
++    serde_json::from_str(line).unwrap()
++}
++
++#[test]
++fn external_provider_resume_without_rotate_uses_external_launch_and_recorded_cwd() {
++    let fixture = Fixture::new();
++
++    let launch = fixture.run_launch();
++    assert_success(&launch);
++
++    let resume = fixture.run_resume();
++    assert_success(&resume);
++    let resume_stderr = String::from_utf8_lossy(&resume.stderr);
++    assert!(
++        !resume_stderr.contains("migration failed"),
++        "{resume_stderr}"
++    );
++    assert!(
++        !resume_stderr.contains("could not resolve original cwd"),
++        "{resume_stderr}"
++    );
++
++    let records = fixture.records();
++    assert_no_rotation_or_migration_provider_calls(&records);
++    let launches = records_for_subcommand(&records, "launch");
++    assert_eq!(launches.len(), 2, "records: {records:?}");
++
++    let resume_launch = &launches[1]["request"];
++    assert_eq!(
++        resume_launch["params"]["session"]["known_provider_session_id"].as_str(),
++        Some(SESSION_ID),
++        "resume must pass the provider session captured by the first external launch"
++    );
++    assert_eq!(
++        resume_launch["params"]["model"]["inputs"]["prompt"].as_str(),
++        Some("resume prompt")
++    );
++    assert_eq!(
++        resume_launch["params"]["working_directory"].as_str(),
++        Some(fixture.workspace.to_string_lossy().as_ref()),
++        "resume must use the original launch cwd, not the caller's current cwd"
++    );
++    assert_eq!(
++        resume_launch["params"]["provider_name"].as_str(),
++        None,
++        "provider_name lives in session requests, not launch params"
++    );
++
++    assert_external_launch_session_capture_rows(&fixture.invocation_session_rows());
++}
++
++#[test]
++fn external_launch_session_id_alias_persists_external_capture_method_without_session_capability() {
++    let fixture = Fixture::new_with_provider_options(
++        ProviderOptions::session_id_without_session_capability(),
++    );
++
++    let launch = fixture.run_launch();
++    assert_success(&launch);
++    let stderr = String::from_utf8_lossy(&launch.stderr);
++    assert!(stderr.contains("Session ingest failed"), "{stderr}");
++
++    let rows = fixture.invocation_session_rows();
++    assert_eq!(rows.len(), 1, "rows: {rows:?}");
++    assert_external_launch_session_capture_row(&rows[0]);
++}
++
++fn assert_external_launch_session_capture_rows(rows: &[InvocationSessionRow]) {
++    assert_eq!(rows.len(), 2, "rows: {rows:?}");
++    assert_external_launch_session_capture_row(&rows[0]);
++
++    let resume = &rows[1];
++    assert_eq!(resume.session_id.as_deref(), Some(SESSION_ID));
++    assert_eq!(resume.session_capture_method.as_deref(), Some("resumed"));
++    assert_eq!(resume.provider_session_id.as_deref(), Some(SESSION_ID));
++    assert_eq!(resume.resume_input_id.as_deref(), Some(SESSION_ID));
++    assert_eq!(
++        resume.provider_session_capture_method.as_deref(),
++        Some("resumed")
++    );
++}
++
++fn assert_external_launch_session_capture_row(launch: &InvocationSessionRow) {
++    assert_eq!(launch.session_id.as_deref(), Some(SESSION_ID));
++    assert_eq!(
++        launch.session_capture_method.as_deref(),
++        Some("external_provider_launch")
++    );
++    assert_eq!(launch.provider_session_id.as_deref(), Some(SESSION_ID));
++    assert_eq!(launch.resume_input_id.as_deref(), None);
++    assert_eq!(
++        launch.provider_session_capture_method.as_deref(),
++        Some("external_provider_launch")
++    );
++}
++
++fn assert_success(output: &Output) {
++    assert_eq!(
++        output.status.code(),
++        Some(0),
++        "stdout={}\nstderr={}",
++        String::from_utf8_lossy(&output.stdout),
++        String::from_utf8_lossy(&output.stderr)
++    );
++}
++
++fn records_for_subcommand<'a>(records: &'a [Value], subcommand: &str) -> Vec<&'a Value> {
++    records
++        .iter()
++        .filter(|record| record["subcommand"] == subcommand)
++        .collect()
++}
++
++fn assert_no_rotation_or_migration_provider_calls(records: &[Value]) {
++    let subcommands = provider_record_subcommands(records);
++    assert_no_forbidden_provider_subcommands(&subcommands);
++}
++
++fn provider_record_subcommands(records: &[Value]) -> Vec<&str> {
++    records.iter().map(provider_record_subcommand).collect()
++}
++
++fn provider_record_subcommand(record: &Value) -> &str {
++    record["subcommand"].as_str().unwrap_or_default()
++}
++
++fn assert_no_forbidden_provider_subcommands(subcommands: &[&str]) {
++    assert!(
++        subcommands
++            .iter()
++            .all(|subcommand| provider_subcommand_is_allowed(subcommand)),
++        "unexpected rotation/migration calls: {subcommands:?}"
++    );
++}
++
++fn provider_subcommand_is_allowed(subcommand: &str) -> bool {
++    !subcommand.starts_with("rotation.") && !subcommand.starts_with("migration.")
++}
++
++fn write_external_provider(dir: &Path, record_path: &Path, options: ProviderOptions) -> PathBuf {
++    fs::write(record_path, "").unwrap();
++    let path = dir.join("external-provider.py");
++    fs::write(&path, external_provider_script(record_path, options)).unwrap();
++    let mut permissions = fs::metadata(&path).unwrap().permissions();
++    permissions.set_mode(0o755);
++    fs::set_permissions(&path, permissions).unwrap();
++    path
++}
++
++fn external_provider_script(record_path: &Path, options: ProviderOptions) -> String {
++    format!(
++        r#"#!/usr/bin/env python3
++import base64
++import json
++import pathlib
++import sys
++
++CONTRACT = "oulipoly.provider/v1"
++PROVIDER = {provider}
++SESSION_ID = {session_id}
++RECORD_PATH = pathlib.Path({record_path})
++
++subcommand = sys.argv[1] if len(sys.argv) > 1 else ""
++request = json.loads(sys.stdin.read() or "{{}}")
++with RECORD_PATH.open("a", encoding="utf-8") as handle:
++    handle.write(json.dumps({{"subcommand": subcommand, "request": request}}, sort_keys=True) + "\n")
++
++def request_id():
++    return request.get("request_id", "s10-request")
++
++def envelope(result):
++    return {{
++        "contract": request.get("contract", CONTRACT),
++        "request_id": request_id(),
++        "ok": True,
++        "result": result,
++    }}
++
++def error(code):
++    return {{
++        "contract": request.get("contract", CONTRACT),
++        "request_id": request_id(),
++        "ok": False,
++        "error": {{"category": "failed", "code": code, "message": code, "retryable": False}},
++    }}
++
++def describe():
++    return envelope({{
++        "provider_id": "agent-runner-provider-ref-fixture",
++        "display_name": "External Provider Fixture",
++        "contract_versions": [CONTRACT],
++        "preferred_contract": CONTRACT,
++        "capabilities": {{
++            "launch": True,
++            "policy": True,
++            "quota": False,
++            "session": {session_capability},
++            "terminal": False,
++            "rotation": False,
++            "discovery": False,
++            "settings": False,
++            "setup_brain": False,
++            "setup": False,
++            "migration": False,
++        }},
++    }})
++
++def policy_evaluate():
++    return envelope({{
++        "accepted": True,
++        "env": {{}},
++        "stdin": None,
++        "prompt": None,
++        "diagnostics": [],
++        "markers": [],
++    }})
++
++def emit(event):
++    print(json.dumps(event, separators=(",", ":")))
++
++def launch():
++    payload = request.get("params", {{}}).get("model", {{}}).get("inputs", {{}}).get("prompt", "")
++    emit({{
++        "contract": CONTRACT,
++        "request_id": request_id(),
++        "seq": 1,
++        "time_unix_ms": 1001,
++        "kind": "stdout",
++        "data_base64": base64.b64encode(("answer:" + payload + "\n").encode("utf-8")).decode("ascii"),
++    }})
++    emit({{
++        "contract": CONTRACT,
++        "request_id": request_id(),
++        "seq": 2,
++        "time_unix_ms": 1002,
++        "kind": "exit",
++        "status": {{"kind": "exited", "code": 0}},
++        "terminal_signal": {{
++            "kind": "clean_exit",
++            "evidence": "fixture clean exit",
++            "observed_at_unix_ms": 1002,
++        }},
++        "session": {{
++            {launch_session_key}: SESSION_ID,
++            "state": {{"cursor": "after-launch"}},
++        }},
++    }})
++
++def read_turns():
++    params = request.get("params", {{}})
++    extra = params.get("extra", {{}})
++    session_id = params.get("session_id") or extra.get("start_bound_provider_session_id") or extra.get("pinned_target") or SESSION_ID
++    turn_id = "turn-" + extra.get("invocation_uuid", "fixture")[:8]
++    return envelope({{
++        "turns": [{{
++            "session_id": session_id,
++            "turn_id": turn_id,
++            "role": "assistant",
++            "timestamp": "2026-06-01T00:00:00Z",
++            "body": [{{"type": "text", "text": "fixture turn"}}],
++        }}],
++        "turn_count": 1,
++        "complete": True,
++    }})
++
++def capture():
++    params = request.get("params", {{}})
++    extra = params.get("extra", {{}})
++    return envelope({{
++        "provider_session_id": extra.get("pinned_target") or extra.get("start_bound_provider_session_id") or SESSION_ID,
++        "state": {{"captured": True}},
++        "artifacts": [],
++    }})
++
++if subcommand == "describe":
++    print(json.dumps(describe()))
++elif subcommand == "policy.evaluate":
++    print(json.dumps(policy_evaluate()))
++elif subcommand == "launch":
++    launch()
++elif subcommand == "session.read_turns":
++    print(json.dumps(read_turns()))
++elif subcommand == "session.capture":
++    print(json.dumps(capture()))
++else:
++    print(json.dumps(error("unsupported_subcommand")))
++"#,
++        provider = serde_json::to_string(PROVIDER).unwrap(),
++        session_id = serde_json::to_string(SESSION_ID).unwrap(),
++        launch_session_key = serde_json::to_string(options.launch_session_key).unwrap(),
++        session_capability = if options.session_capability {
++            "True"
++        } else {
++            "False"
++        },
++        record_path = serde_json::to_string(&record_path.display().to_string()).unwrap(),
++    )
++}

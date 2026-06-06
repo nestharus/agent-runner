@@ -1,0 +1,67 @@
+# s10b gate evidence
+
+Base diff regenerated with `git diff fce3836..HEAD` into `planning/s10b-gate/gates/diff.patch`.
+
+Touched files regenerated with `git diff --name-only fce3836..HEAD` into `planning/s10b-gate/gates/touched-files.txt`.
+
+S10B commits in the audited source range:
+
+- `a07d0a4 Resolve provider binaries from process PATH`
+- `8cb44ad Fix external provider launch protocol compatibility`
+- `ea10ba2 Fix external provider resume cwd`
+- `57d927d fix external provider launch session alias`
+- `8fc43ff Fix provider-ref resume validation`
+- `d14b1ae Split S10 provider helpers`
+
+The focused pre-fix TDD commit is `57d927d fix external provider launch session alias`.
+
+The source remediation commit for typed provider settings status and provider-ref target validation is `8fc43ff Fix provider-ref resume validation`.
+
+The function-classification/coupling remediation commit for helper role separation is `d14b1ae Split S10 provider helpers`.
+
+The following source-remediation targeted tests passed with `OULIPOLY_DATA_DIR` scrubbed and isolated XDG directories supplied by `mktemp -d`:
+
+- `env -u OULIPOLY_DATA_DIR XDG_CONFIG_HOME="$(mktemp -d)" XDG_DATA_HOME="$(mktemp -d)" XDG_CACHE_HOME="$(mktemp -d)" cargo test -p oulipoly-runtime --test provider_settings_host settings_host_preserves_conflict_error_details_and_diagnostics`
+- `env -u OULIPOLY_DATA_DIR XDG_CONFIG_HOME="$(mktemp -d)" XDG_DATA_HOME="$(mktemp -d)" XDG_CACHE_HOME="$(mktemp -d)" cargo test -p oulipoly-agent-runner --test s10_external_provider_resume external_provider_resume_without_rotate_uses_external_launch_and_recorded_cwd`
+
+The following helper-remediation targeted tests passed with `OULIPOLY_DATA_DIR` scrubbed and isolated XDG directories supplied by `mktemp -d`:
+
+- `env -u OULIPOLY_DATA_DIR XDG_CONFIG_HOME="$(mktemp -d)" XDG_DATA_HOME="$(mktemp -d)" XDG_CACHE_HOME="$(mktemp -d)" cargo test -p oulipoly-provider --test client_invoke invoke_early_stdin_close_without_valid_envelope_is_transport_error`
+- `env -u OULIPOLY_DATA_DIR XDG_CONFIG_HOME="$(mktemp -d)" XDG_DATA_HOME="$(mktemp -d)" XDG_CACHE_HOME="$(mktemp -d)" cargo test -p oulipoly-runtime --test provider_settings_host`
+- `env -u OULIPOLY_DATA_DIR XDG_CONFIG_HOME="$(mktemp -d)" XDG_DATA_HOME="$(mktemp -d)" XDG_CACHE_HOME="$(mktemp -d)" cargo test -p oulipoly-agent-runner --test s10_external_provider_resume`
+- `env -u OULIPOLY_DATA_DIR XDG_CONFIG_HOME="$(mktemp -d)" XDG_DATA_HOME="$(mktemp -d)" XDG_CACHE_HOME="$(mktemp -d)" cargo test -p oulipoly-agent-runner --test age244_s7b_production_wiring_source_guard`
+
+The following post-remediation gates passed with `OULIPOLY_DATA_DIR` scrubbed and isolated XDG directories supplied by `mktemp -d`:
+
+- `env -u OULIPOLY_DATA_DIR XDG_CONFIG_HOME="$(mktemp -d)" XDG_DATA_HOME="$(mktemp -d)" XDG_CACHE_HOME="$(mktemp -d)" cargo fmt --all -- --check`
+- `env -u OULIPOLY_DATA_DIR XDG_CONFIG_HOME="$(mktemp -d)" XDG_DATA_HOME="$(mktemp -d)" XDG_CACHE_HOME="$(mktemp -d)" cargo clippy --workspace --all-targets -- -D warnings`
+- `env -u OULIPOLY_DATA_DIR XDG_CONFIG_HOME="$(mktemp -d)" XDG_DATA_HOME="$(mktemp -d)" XDG_CACHE_HOME="$(mktemp -d)" cargo test --workspace`
+
+The full workspace-test output was truncated by the tool but completed with rc 0. Retained tool output path: `/home/nes/.opencode5/opencode/tool-output/tool_e9cf5cdd0001K86f05d1Q0wmSR`.
+
+Pre-fix TDD evidence:
+
+- RED before `57d927d`: `cargo test -p oulipoly-agent-runner --test s10_external_provider_resume -- --nocapture` failed in `external_launch_session_id_alias_persists_external_capture_method_without_session_capability` because the `session_id` LaunchExit alias was not persisted as a provider session id.
+- GREEN after `57d927d`: `cargo test -p oulipoly-agent-runner --test s10_external_provider_resume -- --nocapture` passed, and the isolated `cargo test --workspace` run above also passed this test.
+- The earlier workspace-test attempt failed once with unrelated transient `Text file busy (os error 26)` in `crates/oulipoly-runtime/tests/age_164_c7_test_split.rs::interactive_execution_uses_provider_interactive_args_for_child_argv`; the targeted rerun of `cargo test -p oulipoly-runtime --test age_164_c7_test_split` passed, and the isolated workspace rerun passed.
+
+Runtime/live evidence files inspected:
+
+- `/tmp/s10-e2e/initial.log` records a pre-fix live failure with `missing_artifact`.
+- `/tmp/s10-e2e/retry.log` records a later pre-fix live failure with `schema_invalid_response`.
+- `/tmp/s10-e2e/final.log` records live external launch success with `S10-EXTERNAL-OK` and final `OULIPOLY_RESULT.success=true`.
+- `/tmp/s10-e2e/final2.log` records a second live external launch success with `S10-EXTERNAL-OK` and final `OULIPOLY_RESULT.success=true`.
+- Both live launch success logs include a non-fatal post-run warning: `Session ingest failed for claude2: session.read_turns: missing_host_home: provider client error: provider_capability`.
+- No `/tmp/s10-e2e` file currently contains `S10-RESUME-OK`. An isolated live launch+resume attempt was started after the post-commit gates, but the launch produced no marker output and was terminated; it is not counted as passing evidence.
+
+Runtime claims covered by deterministic tests in the isolated workspace run:
+
+- `crates/oulipoly-provider/tests/client_invoke.rs::invoke_describe_accepts_schema_valid_freeform_concurrency_metadata`
+- `crates/oulipoly-runtime/tests/provider_registry.rs::binary_ref_resolves_from_process_path_entries`
+- `crates/oulipoly-runtime/tests/provider_registry.rs::absent_binary_from_process_path_entries_preserves_missing_artifact`
+- `crates/oulipoly-runtime/tests/provider_registry.rs::unset_process_path_entries_preserves_missing_artifact_without_panic`
+- `src-tauri/tests/age244_s7b_production_wiring_source_guard.rs::s10_production_provider_registries_populate_path_entries_from_process_path`
+- `crates/oulipoly-runtime/tests/provider_settings_host.rs::settings_host_preserves_conflict_error_details_and_diagnostics`
+- `crates/oulipoly-runtime/tests/s10_external_launch_session.rs::external_launch_exit_session_populates_capture_and_resume_request`
+- `src-tauri/tests/s10_external_provider_resume.rs::external_provider_resume_without_rotate_uses_external_launch_and_recorded_cwd`
+- `src-tauri/tests/s10_external_provider_resume.rs::external_launch_session_id_alias_persists_external_capture_method_without_session_capability`
