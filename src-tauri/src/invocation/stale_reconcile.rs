@@ -1,4 +1,6 @@
 //! Conservative stale-running invocation reconciliation.
+//!
+//! Declared roles: orchestration, accessor, mapper, parser, predicate, formatter
 
 use chrono::{DateTime, Utc};
 use oulipoly_state::StateDb;

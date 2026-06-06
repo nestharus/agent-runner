@@ -1,4 +1,4 @@
-//! Declared roles: accessor
+//! Declared roles: accessor, orchestration
 
 use oulipoly_state::StateDb;
 use std::path::Path;
