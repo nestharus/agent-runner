@@ -261,8 +261,12 @@ pub struct DescribeCapabilities {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderConcurrency {
-    pub safe_for_parallel_invocation: bool,
-    pub state_locking: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safe_for_parallel_invocation: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_locking: Option<String>,
+    #[serde(flatten)]
+    pub metadata: JsonObject,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

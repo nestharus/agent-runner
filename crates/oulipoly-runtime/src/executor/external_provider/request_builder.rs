@@ -24,7 +24,7 @@ pub(crate) struct LaunchCandidate {
 pub(crate) fn build_launch_candidate(
     context: &ExternalProviderDispatchContext,
 ) -> Result<LaunchCandidate, String> {
-    let mut env = BTreeMap::new();
+    let mut env = std::env::vars().collect::<BTreeMap<_, _>>();
     if let Some(parent) = &context.parent_invocation_env {
         env.insert("OULIPOLY_PARENT_INVOCATION".to_string(), parent.clone());
     }
@@ -44,6 +44,7 @@ pub(crate) fn build_policy_request(
     context: &ExternalProviderDispatchContext,
     candidate: &LaunchCandidate,
 ) -> Result<Value, serde_json::Error> {
+    let provider_args = model_provider_args(context);
     serde_json::to_value(PolicyEvaluateRequest {
         contract: CONTRACT_VERSION.to_string(),
         request_id: request_id("policy"),
@@ -52,8 +53,8 @@ pub(crate) fn build_policy_request(
         params: PolicyEvaluateParams {
             settings_id: context.settings_id.clone(),
             mode: mode(context),
-            model: provider_model_request(context, &candidate.prompt),
-            launch: policy_launch_object(candidate),
+            model: provider_model_request(context, &candidate.prompt, &provider_args),
+            launch: policy_launch_object(context, candidate, &provider_args),
         },
     })
 }
@@ -79,7 +80,11 @@ pub(crate) fn build_launch_request(
         params: LaunchParams {
             settings_id: context.settings_id.clone(),
             mode: mode(context),
-            model: provider_model_request(context, &candidate.prompt),
+            model: provider_model_request(
+                context,
+                &candidate.prompt,
+                &model_provider_args(context),
+            ),
             argv: candidate.argv.clone(),
             working_directory: candidate.working_directory.clone(),
             env,
@@ -128,10 +133,11 @@ fn host_context(
 fn provider_model_request(
     context: &ExternalProviderDispatchContext,
     prompt: &str,
+    provider_args: &[String],
 ) -> ProviderModelRequest {
     ProviderModelRequest {
         name: context.model.name.clone(),
-        provider_args: context.provider.args.clone(),
+        provider_args: provider_args.to_vec(),
         inputs: json!({
             "prompt": prompt,
             "named": context.extra_inputs.clone(),
@@ -139,8 +145,34 @@ fn provider_model_request(
     }
 }
 
-fn policy_launch_object(candidate: &LaunchCandidate) -> JsonObject {
+fn policy_launch_object(
+    context: &ExternalProviderDispatchContext,
+    candidate: &LaunchCandidate,
+    model_provider_args: &[String],
+) -> JsonObject {
     let mut object = JsonObject::new();
+    object.insert(
+        "command".to_string(),
+        Value::String(context.provider.command.clone()),
+    );
+    object.insert(
+        "args".to_string(),
+        json!(base_provider_args(context, model_provider_args)),
+    );
+    object.insert("prompt_mode".to_string(), Value::String(mode(context)));
+    object.insert(
+        "invocation_mode".to_string(),
+        json!(context.provider.invocation_mode),
+    );
+    if let Some(system_prompt) = &context.provider.system_prompt_override {
+        object.insert(
+            "system_prompt_override".to_string(),
+            Value::String(system_prompt.clone()),
+        );
+    }
+    if let Some(tool_restrictions) = &context.provider.tool_restrictions {
+        object.insert("tool_restrictions".to_string(), json!(tool_restrictions));
+    }
     object.insert(
         "working_directory".to_string(),
         Value::String(candidate.working_directory.clone()),
@@ -155,6 +187,27 @@ fn policy_launch_object(candidate: &LaunchCandidate) -> JsonObject {
         Value::String(candidate.prompt.clone()),
     );
     object
+}
+
+fn model_provider_args(context: &ExternalProviderDispatchContext) -> Vec<String> {
+    context
+        .model
+        .providers
+        .get(context.provider_index)
+        .map(|provider| provider.args.clone())
+        .unwrap_or_default()
+}
+
+fn base_provider_args(
+    context: &ExternalProviderDispatchContext,
+    model_provider_args: &[String],
+) -> Vec<String> {
+    let effective_args = context.provider.args.as_slice();
+    if effective_args.ends_with(model_provider_args) {
+        effective_args[..effective_args.len() - model_provider_args.len()].to_vec()
+    } else {
+        effective_args.to_vec()
+    }
 }
 
 fn launch_session(context: &ExternalProviderDispatchContext) -> Option<JsonObject> {

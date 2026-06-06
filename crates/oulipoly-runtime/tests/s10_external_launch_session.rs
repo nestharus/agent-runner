@@ -6,7 +6,7 @@ use oulipoly_config::{
 use oulipoly_runtime::executor::RuntimeExecutorService;
 use oulipoly_runtime::provider_registry::{ProviderRegistry, ProviderRegistryOptions};
 use oulipoly_runtime::services::{ExecutorServicePort, ExecutorServiceRequest};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -105,6 +105,27 @@ fn external_launch_exit_session_populates_capture_and_resume_request() {
         launch_records[1]["request"]["params"]["session"]["known_provider_session_id"].as_str(),
         Some(expected_session.as_str()),
         "resume launch must receive the provider session captured from the prior external launch"
+    );
+    let expected_path = std::env::var("PATH").expect("test process should have PATH");
+    assert_eq!(
+        launch_records[0]["request"]["params"]["env"]["PATH"].as_str(),
+        Some(expected_path.as_str()),
+        "external launch must pass PATH because provider launch clears inherited child env"
+    );
+    let policy_records = fixture.records_for("policy.evaluate");
+    assert_eq!(
+        policy_records.len(),
+        2,
+        "policy records: {policy_records:?}"
+    );
+    let policy_launch = &policy_records[0]["request"]["params"]["launch"];
+    let provider = provider_name();
+    assert_eq!(policy_launch["command"].as_str(), Some(provider.as_str()));
+    assert_eq!(policy_launch["args"], json!([]));
+    assert_eq!(policy_launch["prompt_mode"].as_str(), Some("arg"));
+    assert_eq!(
+        policy_records[0]["request"]["params"]["model"]["provider_args"],
+        json!(["--model", "sonnet"])
     );
 }
 
@@ -230,6 +251,7 @@ def describe():
 def policy_evaluate():
     return envelope({
         "accepted": True,
+        "env": {},
         "stdin": None,
         "prompt": None,
         "diagnostics": [],

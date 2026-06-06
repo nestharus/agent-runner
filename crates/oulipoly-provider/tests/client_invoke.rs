@@ -6,6 +6,8 @@ use oulipoly_provider::client::{ProviderClient, ProviderClientOptions, ProviderO
 use oulipoly_provider::error::ProviderClientError;
 use oulipoly_provider::generated::{DescribeResult, SchemaResult, SettingsListResult};
 use oulipoly_provider::resolver::ProviderArtifactRef;
+use oulipoly_provider::schemas::SchemaRegistry;
+use serde_json::json;
 use std::ffi::OsString;
 use std::path::Path;
 use std::time::Duration;
@@ -34,6 +36,55 @@ fn invoke_success_returns_typed_result_and_keeps_stderr_diagnostics() {
             .stderr_text()
             .contains("diagnostic")
     );
+}
+
+#[test]
+fn invoke_describe_accepts_schema_valid_freeform_concurrency_metadata() {
+    let provider_id = ["cla", "ude"].concat();
+    let response = json!({
+        "contract": "oulipoly.provider/v1",
+        "ok": true,
+        "request_id": "provider-registry-f7eff50a-09d6-4cc7-968e-5f0e0c567104",
+        "result": {
+            "capabilities": {
+                "discovery": true,
+                "launch": true,
+                "migration": true,
+                "policy": true,
+                "quota": true,
+                "rotation": true,
+                "session": true,
+                "settings": true,
+                "setup": true,
+                "setup_brain": true,
+                "terminal": true
+            },
+            "concurrency": {
+                "launch_streams": "one_per_process",
+                "process_model": "one_shot_cli",
+                "state_serialization": "provider_advisory_locks"
+            },
+            "contract_versions": ["oulipoly.provider/v1"],
+            "display_name": "Example Provider",
+            "preferred_contract": "oulipoly.provider/v1",
+            "provider_id": provider_id.clone(),
+            "settings_schema_id": format!("{}.settings/v1", provider_id)
+        }
+    });
+    SchemaRegistry::new()
+        .validate_response("describe", &response)
+        .expect("captured provider describe response must validate against frozen schema");
+
+    let result = serde_json::from_value::<DescribeResult>(response["result"].clone());
+
+    assert!(
+        result.is_ok(),
+        "schema-valid describe result should deserialize for host consumers: {:?}",
+        result.err()
+    );
+    let concurrency = serde_json::to_value(result.unwrap().concurrency.unwrap())
+        .expect("concurrency metadata should serialize back to JSON");
+    assert_eq!(concurrency["launch_streams"], "one_per_process");
 }
 
 #[test]

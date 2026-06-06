@@ -16,7 +16,7 @@ pub(crate) fn apply_policy_transform(
         candidate.argv = argv;
     }
     if let Some(env) = result.env {
-        candidate.env = env;
+        candidate.env.extend(env);
     }
     if let Some(stdin) = result.stdin {
         candidate.stdin = Some(stdin);
