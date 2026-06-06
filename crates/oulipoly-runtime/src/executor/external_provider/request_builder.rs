@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 const HOME_ENV: &str = "HOME";
+const DATA_DIR_ENV: &str = oulipoly_state::paths::DATA_DIR_ENV;
 const OPENCODE_ACCOUNT_PREFIX: &str = "opencode";
 const PATH_ENV: &str = "PATH";
 const PARENT_INVOCATION_ENV: &str = "OULIPOLY_PARENT_INVOCATION";
@@ -46,6 +47,7 @@ fn declared_launch_env(context: &ExternalProviderDispatchContext) -> BTreeMap<St
     let mut env = BTreeMap::new();
     insert_ambient_env(&mut env, PATH_ENV);
     insert_ambient_env(&mut env, HOME_ENV);
+    insert_pinned_agent_data_dir(&mut env);
     insert_selected_opencode_auth_env(&mut env, context);
     if let Some(parent) = &context.parent_invocation_env {
         env.insert(PARENT_INVOCATION_ENV.to_string(), parent.clone());
@@ -56,6 +58,12 @@ fn declared_launch_env(context: &ExternalProviderDispatchContext) -> BTreeMap<St
 fn insert_ambient_env(env: &mut BTreeMap<String, String>, key: &str) {
     if let Ok(value) = std::env::var(key) {
         env.insert(key.to_string(), value);
+    }
+}
+
+fn insert_pinned_agent_data_dir(env: &mut BTreeMap<String, String>) {
+    if let Ok(data_dir) = oulipoly_state::paths::data_dir() {
+        env.insert(DATA_DIR_ENV.to_string(), data_dir.display().to_string());
     }
 }
 

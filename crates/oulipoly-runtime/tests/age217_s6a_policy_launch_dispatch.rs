@@ -74,12 +74,21 @@ struct EnvScope {
 
 impl EnvScope {
     fn set(vars: &[(&'static str, &str)]) -> Self {
+        Self::set_optional(
+            &vars
+                .iter()
+                .map(|(key, value)| (*key, Some(*value)))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn set_optional(vars: &[(&'static str, Option<&str>)]) -> Self {
         let previous = vars
             .iter()
             .map(|(key, _)| (*key, std::env::var_os(key)))
             .collect();
         for (key, value) in vars {
-            set_env(key, Some(std::ffi::OsStr::new(*value)));
+            set_env(key, value.map(std::ffi::OsStr::new));
         }
         Self { previous }
     }
@@ -1010,6 +1019,76 @@ fn external_provider_launch_request_carries_selected_settings_id_and_effective_i
         launch["params"].get("stdin").is_none(),
         "arg-mode provider launches must not send the prompt on stdin"
     );
+}
+
+#[test]
+fn external_provider_launch_env_carries_host_linkage_without_openai_keys() {
+    let _lock = env_lock();
+    let xdg_data = tempfile::tempdir().expect("xdg data tempdir");
+    let xdg_data = xdg_data.path().display().to_string();
+    let expected_data_dir = Path::new(&xdg_data)
+        .join("oulipoly-agent-runner")
+        .display()
+        .to_string();
+    let parent_invocation_env = "parent-provider-a-invocation".to_string();
+    let _env = EnvScope::set_optional(&[
+        ("XDG_DATA_HOME", Some(xdg_data.as_str())),
+        ("OULIPOLY_DATA_DIR", None),
+        (
+            "OPENAI_API_KEY",
+            Some("ambient-openai-secret-do-not-propagate"),
+        ),
+        (
+            "OPENAI_BASE_URL",
+            Some("https://ambient-openai.example.invalid"),
+        ),
+    ]);
+    let fixture = make_external_fixture(
+        Capabilities {
+            policy: true,
+            launch: true,
+        },
+        PolicyMode::Accept,
+        LaunchMode::Success,
+    );
+
+    execute_external_fixture_effective(
+        &fixture,
+        None,
+        HashMap::new(),
+        Some(parent_invocation_env.clone()),
+    )
+    .expect("external dispatch should declare host linkage env");
+
+    let policy = read_json(&fixture.policy_record_path);
+    let launch = read_json(&fixture.launch_record_path);
+    for env in [&policy["params"]["launch"]["env"], &launch["params"]["env"]] {
+        let env = env.as_object().expect("params.env should be an object");
+        assert_eq!(
+            env.get("OULIPOLY_DATA_DIR")
+                .and_then(|value| value.as_str()),
+            Some(expected_data_dir.as_str()),
+            "external launch params.env must pin the runner data dir when the process env is scrubbed"
+        );
+        assert_eq!(
+            env.get("OULIPOLY_PARENT_INVOCATION")
+                .and_then(|value| value.as_str()),
+            Some(parent_invocation_env.as_str()),
+            "external launch params.env must carry parent invocation linkage"
+        );
+        assert!(
+            env.keys().all(|key| {
+                !key.starts_with("OPENAI_API_KEY") && !key.starts_with("OPENAI_BASE_URL")
+            }),
+            "OpenAI env keys must not cross the external-provider params.env boundary: {env:?}"
+        );
+        assert!(
+            !serde_json::to_string(env)
+                .expect("env serializes")
+                .contains("ambient-openai-secret-do-not-propagate"),
+            "OpenAI env values must not cross the external-provider params.env boundary: {env:?}"
+        );
+    }
 }
 
 #[test]
