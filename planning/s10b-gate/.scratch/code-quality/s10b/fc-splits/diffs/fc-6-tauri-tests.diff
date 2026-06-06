@@ -1,0 +1,647 @@
+diff --git a/src-tauri/tests/age244_s7b_production_wiring_source_guard.rs b/src-tauri/tests/age244_s7b_production_wiring_source_guard.rs
+index 5aafa65..7b92a37 100644
+--- a/src-tauri/tests/age244_s7b_production_wiring_source_guard.rs
++++ b/src-tauri/tests/age244_s7b_production_wiring_source_guard.rs
+@@ -186,19 +186,75 @@ fn s7b_cli_defaults_builds_populated_default_path_provider_registry() {
+     );
+ }
+ 
++#[test]
++fn s10_production_provider_registries_populate_path_entries_from_process_path() {
++    let wiring = read_source("src-tauri/src/wiring.rs");
++    let cli_defaults = source_between(
++        &wiring,
++        "pub fn cli_defaults() -> Self",
++        "pub fn production(",
++    );
++    let production = source_between(
++        &wiring,
++        "pub fn production(",
++        "fn default_cli_runtime_paths()",
++    );
++
++    for (context, source) in [
++        ("wiring.rs::cli_defaults", cli_defaults),
++        ("wiring.rs::production", production),
++    ] {
++        assert_contains(context, source, ".with_path_entries_from_process_path()");
++    }
++
++    let locate_export =
++        read_source("src-tauri/src/commands/session_locate_export/orchestration.rs");
++    assert_contains(
++        "session_locate_export/orchestration.rs::build_session_locate_provider_registry",
++        &locate_export,
++        ".with_path_entries_from_process_path()",
++    );
++
++    let app_state = read_source("src-tauri/src/app_state.rs");
++    assert_contains(
++        "app_state.rs::provider_registry_options",
++        &app_state,
++        ".with_path_entries_from_process_path()",
++    );
++
++    let provider_settings = read_source("src-tauri/src/commands/provider_settings.rs");
++    assert_contains(
++        "provider_settings.rs::host_options",
++        &provider_settings,
++        ".with_path_entries_from_process_path()",
++    );
++}
++
+ fn read_source(relative: &str) -> String {
+     std::fs::read_to_string(workspace_root().join(relative))
+         .unwrap_or_else(|error| panic!("failed to read {relative}: {error}"))
+ }
+ 
+ fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+-    let start_index = source
+-        .find(start)
+-        .unwrap_or_else(|| panic!("missing start marker {start:?}"));
+-    let end_index = source[start_index..]
++    let start_index = source_marker_index(source, start);
++    let end_index = source_end_marker_index(source, start_index, start, end);
++    source_slice_between(source, start_index, end_index)
++}
++
++fn source_marker_index(source: &str, marker: &str) -> usize {
++    source
++        .find(marker)
++        .unwrap_or_else(|| panic!("missing start marker {marker:?}"))
++}
++
++fn source_end_marker_index(source: &str, start_index: usize, start: &str, end: &str) -> usize {
++    source[start_index..]
+         .find(end)
+         .map(|offset| start_index + offset)
+-        .unwrap_or_else(|| panic!("missing end marker {end:?} after {start:?}"));
++        .unwrap_or_else(|| panic!("missing end marker {end:?} after {start:?}"))
++}
++
++fn source_slice_between(source: &str, start_index: usize, end_index: usize) -> &str {
+     &source[start_index..end_index]
+ }
+ 
+@@ -217,10 +273,17 @@ fn assert_not_contains(context: &str, source: &str, needle: &str) {
+ }
+ 
+ fn assert_not_contains_compact(context: &str, source: &str, needle: &str) {
+-    let compact_source = compact_whitespace(source);
+-    let compact_needle = compact_whitespace(needle);
++    let (compact_source, compact_needle) = compact_source_and_needle(source, needle);
++    assert_compact_absent(context, &compact_source, &compact_needle, needle);
++}
++
++fn compact_source_and_needle(source: &str, needle: &str) -> (String, String) {
++    (compact_whitespace(source), compact_whitespace(needle))
++}
++
++fn assert_compact_absent(context: &str, compact_source: &str, compact_needle: &str, needle: &str) {
+     assert!(
+-        !compact_source.contains(&compact_needle),
++        !compact_source.contains(compact_needle),
+         "{context} must not hard-code missing external-provider identity: found {needle:?}"
+     );
+ }
+diff --git a/src-tauri/tests/s10_external_provider_resume.rs b/src-tauri/tests/s10_external_provider_resume.rs
+new file mode 100644
+index 0000000..86bab11
+--- /dev/null
++++ b/src-tauri/tests/s10_external_provider_resume.rs
+@@ -0,0 +1,535 @@
++#![cfg(unix)]
++
++use serde_json::Value;
++use std::fs;
++use std::os::unix::fs::PermissionsExt;
++use std::path::{Path, PathBuf};
++use std::process::{Command, Output};
++
++const MODEL: &str = "provider-ref-model";
++const PROVIDER: &str = "provider-ref-account";
++const SESSION_ID: &str = "a9a8c8d0-8f5f-402e-857c-c5c549446beb";
++
++struct Fixture {
++    _dir: tempfile::TempDir,
++    config_home: PathBuf,
++    data_home: PathBuf,
++    models_dir: PathBuf,
++    workspace: PathBuf,
++    hostile_cwd: PathBuf,
++    record_path: PathBuf,
++}
++
++struct FixturePaths {
++    config_home: PathBuf,
++    data_home: PathBuf,
++    app_config_dir: PathBuf,
++    models_dir: PathBuf,
++    workspace: PathBuf,
++    hostile_cwd: PathBuf,
++    record_path: PathBuf,
++}
++
++#[derive(Debug)]
++struct InvocationSessionRow {
++    session_id: Option<String>,
++    session_capture_method: Option<String>,
++    provider_session_id: Option<String>,
++    resume_input_id: Option<String>,
++    provider_session_capture_method: Option<String>,
++}
++
++struct ProviderOptions {
++    launch_session_key: &'static str,
++    session_capability: bool,
++}
++
++impl ProviderOptions {
++    fn provider_session_id() -> Self {
++        Self {
++            launch_session_key: "provider_session_id",
++            session_capability: true,
++        }
++    }
++
++    fn session_id_without_session_capability() -> Self {
++        Self {
++            launch_session_key: "session_id",
++            session_capability: false,
++        }
++    }
++}
++
++impl Fixture {
++    fn new() -> Self {
++        Self::new_with_provider_options(ProviderOptions::provider_session_id())
++    }
++
++    fn new_with_provider_options(options: ProviderOptions) -> Self {
++        let dir = tempfile::tempdir().unwrap();
++        let paths = fixture_paths(dir.path());
++        create_fixture_directories(&paths);
++        let provider_path = write_external_provider(dir.path(), &paths.record_path, options);
++        write_model_config(&paths.models_dir, &provider_path);
++        write_providers_config(&paths.app_config_dir);
++        fixture_from_paths(dir, paths)
++    }
++
++    fn run_launch(&self) -> Output {
++        let mut cmd = self.command();
++        cmd.current_dir(&self.workspace)
++            .arg("--models-dir")
++            .arg(&self.models_dir)
++            .arg("--model")
++            .arg(MODEL)
++            .arg("first prompt");
++        cmd.output().unwrap()
++    }
++
++    fn run_resume(&self) -> Output {
++        let mut cmd = self.command();
++        cmd.current_dir(&self.hostile_cwd)
++            .arg("resume")
++            .arg("--models-dir")
++            .arg(&self.models_dir)
++            .arg("--model")
++            .arg(MODEL)
++            .arg("--session-id")
++            .arg(SESSION_ID)
++            .arg("--prompt")
++            .arg("resume prompt");
++        cmd.output().unwrap()
++    }
++
++    fn command(&self) -> Command {
++        let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
++        cmd.env("XDG_CONFIG_HOME", &self.config_home);
++        cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env_remove("OULIPOLY_DATA_DIR");
++        cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
++        cmd
++    }
++
++    fn db_path(&self) -> PathBuf {
++        self.data_home
++            .join("oulipoly-agent-runner")
++            .join("state.db")
++    }
++
++    fn invocation_session_rows(&self) -> Vec<InvocationSessionRow> {
++        let conn = rusqlite::Connection::open(self.db_path()).unwrap();
++        let mut stmt = conn
++            .prepare(
++                "SELECT session_id, session_capture_method, provider_session_id,
++                        resume_input_id, provider_session_capture_method
++                   FROM invocations
++                   ORDER BY id",
++            )
++            .unwrap();
++        stmt.query_map([], invocation_session_row)
++            .unwrap()
++            .collect::<Result<Vec<_>, _>>()
++            .unwrap()
++    }
++
++    fn records(&self) -> Vec<Value> {
++        parse_provider_records(&provider_record_text(&self.record_path))
++    }
++}
++
++fn fixture_paths(root: &Path) -> FixturePaths {
++    let config_home = root.join("config");
++    let app_config_dir = config_home.join("oulipoly-agent-runner");
++    FixturePaths {
++        data_home: root.join("data"),
++        models_dir: app_config_dir.join("models"),
++        workspace: root.join("workspace"),
++        hostile_cwd: root.join("hostile-cwd"),
++        record_path: root.join("provider-records.jsonl"),
++        config_home,
++        app_config_dir,
++    }
++}
++
++fn create_fixture_directories(paths: &FixturePaths) {
++    fs::create_dir_all(&paths.models_dir).unwrap();
++    fs::create_dir_all(&paths.workspace).unwrap();
++    fs::create_dir_all(&paths.hostile_cwd).unwrap();
++}
++
++fn write_model_config(models_dir: &Path, provider_path: &Path) {
++    fs::write(
++        models_dir.join(format!("{MODEL}.toml")),
++        model_config_toml(provider_path),
++    )
++    .unwrap();
++}
++
++fn model_config_toml(provider_path: &Path) -> String {
++    format!(
++        r#"provider = {{ path = {:?} }}
++prompt_mode = "arg"
++
++[[providers]]
++name = {:?}
++args = ["--model", "haiku"]
++"#,
++        provider_path.display().to_string(),
++        PROVIDER,
++    )
++}
++
++fn write_providers_config(app_config_dir: &Path) {
++    fs::write(
++        app_config_dir.join("providers.toml"),
++        providers_config_toml(),
++    )
++    .unwrap();
++}
++
++fn providers_config_toml() -> String {
++    format!(
++        r#"[{PROVIDER}]
++command = "native-provider"
++args = ["--base"]
++prompt_mode = "arg"
++"#,
++    )
++}
++
++fn fixture_from_paths(dir: tempfile::TempDir, paths: FixturePaths) -> Fixture {
++    Fixture {
++        _dir: dir,
++        config_home: paths.config_home,
++        data_home: paths.data_home,
++        models_dir: paths.models_dir,
++        workspace: paths.workspace,
++        hostile_cwd: paths.hostile_cwd,
++        record_path: paths.record_path,
++    }
++}
++
++fn invocation_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<InvocationSessionRow> {
++    Ok(InvocationSessionRow {
++        session_id: row.get(0)?,
++        session_capture_method: row.get(1)?,
++        provider_session_id: row.get(2)?,
++        resume_input_id: row.get(3)?,
++        provider_session_capture_method: row.get(4)?,
++    })
++}
++
++fn provider_record_text(path: &Path) -> String {
++    fs::read_to_string(path).unwrap()
++}
++
++fn parse_provider_records(text: &str) -> Vec<Value> {
++    text.lines()
++        .filter(|line| provider_record_line_has_content(line))
++        .map(parse_provider_record)
++        .collect()
++}
++
++fn provider_record_line_has_content(line: &str) -> bool {
++    !line.trim().is_empty()
++}
++
++fn parse_provider_record(line: &str) -> Value {
++    serde_json::from_str(line).unwrap()
++}
++
++#[test]
++fn external_provider_resume_without_rotate_uses_external_launch_and_recorded_cwd() {
++    let fixture = Fixture::new();
++
++    let launch = fixture.run_launch();
++    assert_success(&launch);
++
++    let resume = fixture.run_resume();
++    assert_success(&resume);
++    let resume_stderr = String::from_utf8_lossy(&resume.stderr);
++    assert!(
++        !resume_stderr.contains("migration failed"),
++        "{resume_stderr}"
++    );
++    assert!(
++        !resume_stderr.contains("could not resolve original cwd"),
++        "{resume_stderr}"
++    );
++
++    let records = fixture.records();
++    assert_no_rotation_or_migration_provider_calls(&records);
++    let launches = records_for_subcommand(&records, "launch");
++    assert_eq!(launches.len(), 2, "records: {records:?}");
++
++    let resume_launch = &launches[1]["request"];
++    assert_eq!(
++        resume_launch["params"]["session"]["known_provider_session_id"].as_str(),
++        Some(SESSION_ID),
++        "resume must pass the provider session captured by the first external launch"
++    );
++    assert_eq!(
++        resume_launch["params"]["model"]["inputs"]["prompt"].as_str(),
++        Some("resume prompt")
++    );
++    assert_eq!(
++        resume_launch["params"]["working_directory"].as_str(),
++        Some(fixture.workspace.to_string_lossy().as_ref()),
++        "resume must use the original launch cwd, not the caller's current cwd"
++    );
++    assert_eq!(
++        resume_launch["params"]["provider_name"].as_str(),
++        None,
++        "provider_name lives in session requests, not launch params"
++    );
++
++    assert_external_launch_session_capture_rows(&fixture.invocation_session_rows());
++}
++
++#[test]
++fn external_launch_session_id_alias_persists_external_capture_method_without_session_capability() {
++    let fixture = Fixture::new_with_provider_options(
++        ProviderOptions::session_id_without_session_capability(),
++    );
++
++    let launch = fixture.run_launch();
++    assert_success(&launch);
++    let stderr = String::from_utf8_lossy(&launch.stderr);
++    assert!(stderr.contains("Session ingest failed"), "{stderr}");
++
++    let rows = fixture.invocation_session_rows();
++    assert_eq!(rows.len(), 1, "rows: {rows:?}");
++    assert_external_launch_session_capture_row(&rows[0]);
++}
++
++fn assert_external_launch_session_capture_rows(rows: &[InvocationSessionRow]) {
++    assert_eq!(rows.len(), 2, "rows: {rows:?}");
++    assert_external_launch_session_capture_row(&rows[0]);
++
++    let resume = &rows[1];
++    assert_eq!(resume.session_id.as_deref(), Some(SESSION_ID));
++    assert_eq!(resume.session_capture_method.as_deref(), Some("resumed"));
++    assert_eq!(resume.provider_session_id.as_deref(), Some(SESSION_ID));
++    assert_eq!(resume.resume_input_id.as_deref(), Some(SESSION_ID));
++    assert_eq!(
++        resume.provider_session_capture_method.as_deref(),
++        Some("resumed")
++    );
++}
++
++fn assert_external_launch_session_capture_row(launch: &InvocationSessionRow) {
++    assert_eq!(launch.session_id.as_deref(), Some(SESSION_ID));
++    assert_eq!(
++        launch.session_capture_method.as_deref(),
++        Some("external_provider_launch")
++    );
++    assert_eq!(launch.provider_session_id.as_deref(), Some(SESSION_ID));
++    assert_eq!(launch.resume_input_id.as_deref(), None);
++    assert_eq!(
++        launch.provider_session_capture_method.as_deref(),
++        Some("external_provider_launch")
++    );
++}
++
++fn assert_success(output: &Output) {
++    assert_eq!(
++        output.status.code(),
++        Some(0),
++        "stdout={}\nstderr={}",
++        String::from_utf8_lossy(&output.stdout),
++        String::from_utf8_lossy(&output.stderr)
++    );
++}
++
++fn records_for_subcommand<'a>(records: &'a [Value], subcommand: &str) -> Vec<&'a Value> {
++    records
++        .iter()
++        .filter(|record| record["subcommand"] == subcommand)
++        .collect()
++}
++
++fn assert_no_rotation_or_migration_provider_calls(records: &[Value]) {
++    let subcommands = provider_record_subcommands(records);
++    assert_no_forbidden_provider_subcommands(&subcommands);
++}
++
++fn provider_record_subcommands(records: &[Value]) -> Vec<&str> {
++    records.iter().map(provider_record_subcommand).collect()
++}
++
++fn provider_record_subcommand(record: &Value) -> &str {
++    record["subcommand"].as_str().unwrap_or_default()
++}
++
++fn assert_no_forbidden_provider_subcommands(subcommands: &[&str]) {
++    assert!(
++        subcommands
++            .iter()
++            .all(|subcommand| provider_subcommand_is_allowed(subcommand)),
++        "unexpected rotation/migration calls: {subcommands:?}"
++    );
++}
++
++fn provider_subcommand_is_allowed(subcommand: &str) -> bool {
++    !subcommand.starts_with("rotation.") && !subcommand.starts_with("migration.")
++}
++
++fn write_external_provider(dir: &Path, record_path: &Path, options: ProviderOptions) -> PathBuf {
++    fs::write(record_path, "").unwrap();
++    let path = dir.join("external-provider.py");
++    fs::write(&path, external_provider_script(record_path, options)).unwrap();
++    let mut permissions = fs::metadata(&path).unwrap().permissions();
++    permissions.set_mode(0o755);
++    fs::set_permissions(&path, permissions).unwrap();
++    path
++}
++
++fn external_provider_script(record_path: &Path, options: ProviderOptions) -> String {
++    format!(
++        r#"#!/usr/bin/env python3
++import base64
++import json
++import pathlib
++import sys
++
++CONTRACT = "oulipoly.provider/v1"
++PROVIDER = {provider}
++SESSION_ID = {session_id}
++RECORD_PATH = pathlib.Path({record_path})
++
++subcommand = sys.argv[1] if len(sys.argv) > 1 else ""
++request = json.loads(sys.stdin.read() or "{{}}")
++with RECORD_PATH.open("a", encoding="utf-8") as handle:
++    handle.write(json.dumps({{"subcommand": subcommand, "request": request}}, sort_keys=True) + "\n")
++
++def request_id():
++    return request.get("request_id", "s10-request")
++
++def envelope(result):
++    return {{
++        "contract": request.get("contract", CONTRACT),
++        "request_id": request_id(),
++        "ok": True,
++        "result": result,
++    }}
++
++def error(code):
++    return {{
++        "contract": request.get("contract", CONTRACT),
++        "request_id": request_id(),
++        "ok": False,
++        "error": {{"category": "failed", "code": code, "message": code, "retryable": False}},
++    }}
++
++def describe():
++    return envelope({{
++        "provider_id": "agent-runner-provider-ref-fixture",
++        "display_name": "External Provider Fixture",
++        "contract_versions": [CONTRACT],
++        "preferred_contract": CONTRACT,
++        "capabilities": {{
++            "launch": True,
++            "policy": True,
++            "quota": False,
++            "session": {session_capability},
++            "terminal": False,
++            "rotation": False,
++            "discovery": False,
++            "settings": False,
++            "setup_brain": False,
++            "setup": False,
++            "migration": False,
++        }},
++    }})
++
++def policy_evaluate():
++    return envelope({{
++        "accepted": True,
++        "env": {{}},
++        "stdin": None,
++        "prompt": None,
++        "diagnostics": [],
++        "markers": [],
++    }})
++
++def emit(event):
++    print(json.dumps(event, separators=(",", ":")))
++
++def launch():
++    payload = request.get("params", {{}}).get("model", {{}}).get("inputs", {{}}).get("prompt", "")
++    emit({{
++        "contract": CONTRACT,
++        "request_id": request_id(),
++        "seq": 1,
++        "time_unix_ms": 1001,
++        "kind": "stdout",
++        "data_base64": base64.b64encode(("answer:" + payload + "\n").encode("utf-8")).decode("ascii"),
++    }})
++    emit({{
++        "contract": CONTRACT,
++        "request_id": request_id(),
++        "seq": 2,
++        "time_unix_ms": 1002,
++        "kind": "exit",
++        "status": {{"kind": "exited", "code": 0}},
++        "terminal_signal": {{
++            "kind": "clean_exit",
++            "evidence": "fixture clean exit",
++            "observed_at_unix_ms": 1002,
++        }},
++        "session": {{
++            {launch_session_key}: SESSION_ID,
++            "state": {{"cursor": "after-launch"}},
++        }},
++    }})
++
++def read_turns():
++    params = request.get("params", {{}})
++    extra = params.get("extra", {{}})
++    session_id = params.get("session_id") or extra.get("start_bound_provider_session_id") or extra.get("pinned_target") or SESSION_ID
++    turn_id = "turn-" + extra.get("invocation_uuid", "fixture")[:8]
++    return envelope({{
++        "turns": [{{
++            "session_id": session_id,
++            "turn_id": turn_id,
++            "role": "assistant",
++            "timestamp": "2026-06-01T00:00:00Z",
++            "body": [{{"type": "text", "text": "fixture turn"}}],
++        }}],
++        "turn_count": 1,
++        "complete": True,
++    }})
++
++def capture():
++    params = request.get("params", {{}})
++    extra = params.get("extra", {{}})
++    return envelope({{
++        "provider_session_id": extra.get("pinned_target") or extra.get("start_bound_provider_session_id") or SESSION_ID,
++        "state": {{"captured": True}},
++        "artifacts": [],
++    }})
++
++if subcommand == "describe":
++    print(json.dumps(describe()))
++elif subcommand == "policy.evaluate":
++    print(json.dumps(policy_evaluate()))
++elif subcommand == "launch":
++    launch()
++elif subcommand == "session.read_turns":
++    print(json.dumps(read_turns()))
++elif subcommand == "session.capture":
++    print(json.dumps(capture()))
++else:
++    print(json.dumps(error("unsupported_subcommand")))
++"#,
++        provider = serde_json::to_string(PROVIDER).unwrap(),
++        session_id = serde_json::to_string(SESSION_ID).unwrap(),
++        launch_session_key = serde_json::to_string(options.launch_session_key).unwrap(),
++        session_capability = if options.session_capability {
++            "True"
++        } else {
++            "False"
++        },
++        record_path = serde_json::to_string(&record_path.display().to_string()).unwrap(),
++    )
++}

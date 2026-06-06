@@ -1,0 +1,3 @@
+crates/oulipoly-provider/src/error.rs
+crates/oulipoly-provider/src/generated.rs
+crates/oulipoly-provider/tests/client_invoke.rs

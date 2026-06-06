@@ -1,0 +1,3 @@
+crates/oulipoly-runtime/tests/provider_registry.rs
+crates/oulipoly-runtime/tests/provider_settings_host.rs
+crates/oulipoly-runtime/tests/s10_external_launch_session.rs

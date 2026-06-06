@@ -1,0 +1,559 @@
+diff --git a/src-tauri/src/app_state.rs b/src-tauri/src/app_state.rs
+index c7c51b2..99bb3b5 100644
+--- a/src-tauri/src/app_state.rs
++++ b/src-tauri/src/app_state.rs
+@@ -238,6 +238,7 @@ fn provider_registry_options(models_dir: &Path) -> ProviderRegistryOptions {
+         .map(Path::to_path_buf)
+         .unwrap_or_else(|| PathBuf::from("."));
+     ProviderRegistryOptions::default()
++        .with_path_entries_from_process_path()
+         .with_config_root(root.clone())
+         .with_data_root(root)
+ }
+diff --git a/src-tauri/src/commands/provider_settings.rs b/src-tauri/src/commands/provider_settings.rs
+index 84b3303..fcbe122 100644
+--- a/src-tauri/src/commands/provider_settings.rs
++++ b/src-tauri/src/commands/provider_settings.rs
+@@ -385,6 +385,7 @@ pub fn host_options(models_dir: &Path) -> ProviderSettingsHostOptions {
+         .map(Path::to_path_buf)
+         .unwrap_or_else(|| Path::new(".").to_path_buf());
+     ProviderSettingsHostOptions::default()
++        .with_path_entries_from_process_path()
+         .with_config_root(config_root.clone())
+         .with_data_root(config_root)
+ }
+@@ -416,23 +417,46 @@ fn packaged_model_block(
+ fn packaged_provider_blocks(state: &AppState) -> ProviderSettingsCommandResult<Value> {
+     let _providers =
+         load_providers_for_models_dir_with(&state.models_dir, &*state.providers_config);
+-    let path = state
++    read_provider_blocks(&providers_toml_path(state))
++}
++
++fn providers_toml_path(state: &AppState) -> std::path::PathBuf {
++    state
+         .models_dir
+         .parent()
+         .unwrap_or(&state.models_dir)
+-        .join("providers.toml");
+-    let raw = if path.exists() {
+-        read_toml_json(&path)?
++        .join("providers.toml")
++}
++
++fn read_provider_blocks(path: &Path) -> ProviderSettingsCommandResult<Value> {
++    if provider_blocks_file_exists(path) {
++        read_toml_json(path)
+     } else {
+-        Value::Object(Map::new())
+-    };
+-    Ok(raw)
++        Ok(empty_provider_blocks())
++    }
++}
++
++fn provider_blocks_file_exists(path: &Path) -> bool {
++    path.exists()
++}
++
++fn empty_provider_blocks() -> Value {
++    Value::Object(Map::new())
+ }
+ 
+ fn read_toml_json(path: &Path) -> ProviderSettingsCommandResult<Value> {
+-    let text = std::fs::read_to_string(path).map_err(|error| simple_error("unavailable", error))?;
+-    let value = toml::from_str::<toml::Value>(&text)
+-        .map_err(|error| simple_error("invalid_request", error))?;
++    toml_json_value(parse_toml_value(&read_toml_text(path)?)?)
++}
++
++fn read_toml_text(path: &Path) -> ProviderSettingsCommandResult<String> {
++    std::fs::read_to_string(path).map_err(|error| simple_error("unavailable", error))
++}
++
++fn parse_toml_value(text: &str) -> ProviderSettingsCommandResult<toml::Value> {
++    toml::from_str::<toml::Value>(text).map_err(|error| simple_error("invalid_request", error))
++}
++
++fn toml_json_value(value: toml::Value) -> ProviderSettingsCommandResult<Value> {
+     serde_json::to_value(value).map_err(|error| simple_error("failed", error))
+ }
+ 
+@@ -440,20 +464,25 @@ fn with_host<T>(
+     state: &AppState,
+     action: impl FnOnce(&ProviderSettingsHost) -> Result<T, ProviderSettingsError>,
+ ) -> ProviderSettingsCommandResult<T> {
+-    let host = state.provider_settings.lock().map_err(|error| {
+-        Box::new(ProviderSettingsErrorDto {
+-            category: "failed".to_string(),
+-            code: Some("settings_host_lock".to_string()),
+-            message: error.to_string(),
+-            retryable: Some(false),
+-            details: None,
+-            diagnostics: Vec::new(),
+-            process_status: None,
+-        })
+-    })?;
++    let host = state
++        .provider_settings
++        .lock()
++        .map_err(settings_host_lock_error)?;
+     action(&host).map_err(map_error)
+ }
+ 
++fn settings_host_lock_error<T>(error: std::sync::PoisonError<T>) -> Box<ProviderSettingsErrorDto> {
++    Box::new(ProviderSettingsErrorDto {
++        category: "failed".to_string(),
++        code: Some("settings_host_lock".to_string()),
++        message: error.to_string(),
++        retryable: Some(false),
++        details: None,
++        diagnostics: Vec::new(),
++        process_status: None,
++    })
++}
++
+ fn settings_values(value: Value) -> ProviderSettingsCommandResult<SettingsValues> {
+     serde_json::from_value(value).map_err(|error| simple_error("invalid_request", error))
+ }
+@@ -621,15 +650,7 @@ impl ProviderSettingsCommandHarness {
+     }
+ 
+     pub fn fail_validate_with_transport_error(&mut self, category: &str, message: &str) {
+-        let error = ProviderSettingsErrorDto {
+-            category: category.to_string(),
+-            code: None,
+-            message: message.to_string(),
+-            retryable: Some(false),
+-            details: None,
+-            diagnostics: Vec::new(),
+-            process_status: None,
+-        };
++        let error = transport_error_dto(category, message);
+         self.with_responses(|responses| responses.validate_error = Some(error));
+     }
+ 
+@@ -641,9 +662,25 @@ impl ProviderSettingsCommandHarness {
+     }
+ }
+ 
++fn transport_error_dto(category: &str, message: &str) -> ProviderSettingsErrorDto {
++    ProviderSettingsErrorDto {
++        category: category.to_string(),
++        code: None,
++        message: message.to_string(),
++        retryable: Some(false),
++        details: None,
++        diagnostics: Vec::new(),
++        process_status: None,
++    }
++}
++
+ fn test_update_result(
+     state: &AppState,
+ ) -> Option<ProviderSettingsCommandResult<ProviderSettingsWriteDto>> {
++    test_update_error(state).map(command_error_result)
++}
++
++fn test_update_error(state: &AppState) -> Option<ProviderSettingsErrorDto> {
+     state
+         .provider_settings_test_double
+         .lock()
+@@ -653,12 +690,15 @@ fn test_update_result(
+                 .as_ref()
+                 .and_then(|responses| responses.update_error.clone())
+         })
+-        .map(|error| Err(Box::new(error)))
+ }
+ 
+ fn test_validate_result(
+     state: &AppState,
+ ) -> Option<ProviderSettingsCommandResult<ProviderSettingsValidateDto>> {
++    test_validate_error(state).map(command_error_result)
++}
++
++fn test_validate_error(state: &AppState) -> Option<ProviderSettingsErrorDto> {
+     state
+         .provider_settings_test_double
+         .lock()
+@@ -668,5 +708,8 @@ fn test_validate_result(
+                 .as_ref()
+                 .and_then(|responses| responses.validate_error.clone())
+         })
+-        .map(|error| Err(Box::new(error)))
++}
++
++fn command_error_result<T>(error: ProviderSettingsErrorDto) -> ProviderSettingsCommandResult<T> {
++    Err(Box::new(error))
+ }
+diff --git a/src-tauri/src/commands/session_locate_export/orchestration.rs b/src-tauri/src/commands/session_locate_export/orchestration.rs
+index a41ca97..4ad4c94 100644
+--- a/src-tauri/src/commands/session_locate_export/orchestration.rs
++++ b/src-tauri/src/commands/session_locate_export/orchestration.rs
+@@ -144,6 +144,7 @@ fn build_session_locate_provider_registry(
+     ProviderRegistry::from_model_configs(
+         &models.values().cloned().collect::<Vec<_>>(),
+         ProviderRegistryOptions::default()
++            .with_path_entries_from_process_path()
+             .with_config_root(config_root)
+             .with_data_root(default_data_root()?),
+     )
+diff --git a/src-tauri/src/run/balancing/finalization.rs b/src-tauri/src/run/balancing/finalization.rs
+index 82b1252..d90a110 100644
+--- a/src-tauri/src/run/balancing/finalization.rs
++++ b/src-tauri/src/run/balancing/finalization.rs
+@@ -7,6 +7,7 @@ use oulipoly_config::ModelConfig;
+ use oulipoly_runtime::executor;
+ use oulipoly_runtime::services::InvocationLifecycleServicePort;
+ use oulipoly_state::CompositeInvocationId;
++use oulipoly_state::mailbox::{MailboxDb, SessionRuntimeUpsert};
+ 
+ use super::accessor::BalancedExecutionEnvironment;
+ use super::disposition::BalancedLoopControl;
+@@ -267,6 +268,7 @@ fn ingest_completed_attempt_session(
+         input.agent_runtime_services,
+         mapper::completed_session_ingest_request_for_attempt(input, &ingest_effective_cwd),
+     );
++    record_external_session_runtime_if_needed(input, &ingest_effective_cwd);
+     if let Some(session_id) = super::filter::session_ingest_fallback_session_id(
+         emitted,
+         input.result.session_capture.session_id.as_deref(),
+@@ -281,3 +283,49 @@ fn ingest_completed_attempt_session(
+     }
+     Ok(())
+ }
++
++fn record_external_session_runtime_if_needed(
++    input: &CompletedAttemptInput<'_, '_, '_>,
++    effective_cwd: &Path,
++) {
++    if input.model.provider.is_none() {
++        return;
++    }
++    let Some(session_id) = external_runtime_session_id(input) else {
++        return;
++    };
++    if let Err(err) = record_external_session_runtime(input, session_id, effective_cwd) {
++        tracing::warn!(
++            provider_name = input.provider_name,
++            session_id,
++            "Failed to record external session runtime cwd: {err}"
++        );
++    }
++}
++
++fn external_runtime_session_id<'a>(
++    input: &'a CompletedAttemptInput<'_, '_, '_>,
++) -> Option<&'a str> {
++    input
++        .zero_turn_provider_session_id
++        .or(input.result.session_capture.session_id.as_deref())
++}
++
++fn record_external_session_runtime(
++    input: &CompletedAttemptInput<'_, '_, '_>,
++    session_id: &str,
++    effective_cwd: &Path,
++) -> Result<(), String> {
++    let mut db = MailboxDb::open_default()?;
++    let effective_cwd = effective_cwd.to_string_lossy();
++    db.upsert_session_runtime(SessionRuntimeUpsert {
++        session_id,
++        mode: "headless",
++        invocation_uuid: Some(&input.invocation.id),
++        provider_name: Some(input.provider_name),
++        model_name: Some(&input.model.name),
++        pty_control_path: None,
++        models_dir: None,
++        effective_cwd: Some(effective_cwd.as_ref()),
++    })
++}
+diff --git a/src-tauri/src/run/resume/orchestration.rs b/src-tauri/src/run/resume/orchestration.rs
+index aca94e3..bb33cb6 100644
+--- a/src-tauri/src/run/resume/orchestration.rs
++++ b/src-tauri/src/run/resume/orchestration.rs
+@@ -2,12 +2,14 @@
+ //!
+ //! `orchestration`, `validator`, `accessor`, `mapper`, `filter`, `predicate`, `formatter`
+ 
++use std::collections::HashMap;
+ use std::io::IsTerminal;
+ use std::path::Path;
+ 
+ use oulipoly_runtime::executor;
+ use oulipoly_runtime::services::{
+-    InvocationLifecycleServicePort, MigrationServiceOutput, ResumeServiceOutput, ServiceError,
++    ExecutorServiceRequest, InvocationLifecycleServicePort, MigrationServiceOutput,
++    ResumeServiceOutput, ServiceError,
+ };
+ 
+ use super::disposition::{
+@@ -271,7 +273,7 @@ fn run_resume_attempt(
+     };
+     let provider_index = target.provider_index;
+     let provider = target.provider;
+-    let strategy = match resume_attempt_strategy(&provider) {
++    let strategy = match resume_attempt_strategy_for_target(input.resolved, &provider) {
+         Ok(strategy) => strategy,
+         Err(exit_code) => return Ok(ResumeAttemptLoopControl::Return(exit_code)),
+     };
+@@ -330,6 +332,16 @@ fn run_resume_attempt(
+     })
+ }
+ 
++fn resume_attempt_strategy_for_target<'a>(
++    resolved: &oulipoly_state::ResolvedResume,
++    provider: &'a oulipoly_config::ProviderConfig,
++) -> Result<Option<&'a oulipoly_config::ResumeStrategy>, i32> {
++    if resolved_uses_provider_ref(resolved) {
++        return Ok(None);
++    }
++    resume_attempt_strategy(provider).map(Some)
++}
++
+ fn resume_attempt_strategy(
+     provider: &oulipoly_config::ProviderConfig,
+ ) -> Result<&oulipoly_config::ResumeStrategy, i32> {
+@@ -350,8 +362,22 @@ fn execute_resume_attempt_command(
+     provider_index: usize,
+     prompt_mode: oulipoly_config::PromptMode,
+     invocation_env: &str,
+-    strategy: &oulipoly_config::ResumeStrategy,
++    strategy: Option<&oulipoly_config::ResumeStrategy>,
+ ) -> Result<executor::ExecutionResult, String> {
++    if let Some(request) = provider_ref_resume_executor_request(
++        input,
++        provider,
++        provider_index,
++        prompt_mode,
++        invocation_env,
++    ) {
++        return input
++            .agent_runtime_services
++            .executor_service
++            .execute(request)
++            .map(|output| output.result)
++            .map_err(|err| err.to_string());
++    }
+     executor::cli::execute_resume_optional_prompt_with_model_identity(
+         provider,
+         provider_index,
+@@ -361,12 +387,36 @@ fn execute_resume_attempt_command(
+         Some(invocation_env),
+         executor::cli::ResumePayload {
+             session_id: &input.resolved.active_session_id,
+-            strategy,
++            strategy: strategy.expect("legacy resume target must have a resume strategy"),
+         },
+         input.resolved.model_name.as_deref().unwrap_or("<unknown>"),
+     )
+ }
+ 
++fn provider_ref_resume_executor_request(
++    input: &ResumeAttemptInput<'_>,
++    provider: &oulipoly_config::ProviderConfig,
++    provider_index: usize,
++    prompt_mode: oulipoly_config::PromptMode,
++    invocation_env: &str,
++) -> Option<ExecutorServiceRequest> {
++    let model = input.resolved.model.as_ref()?;
++    model.provider.as_ref()?;
++    Some(
++        ExecutorServiceRequest::EffectiveWithStartKnownProviderSessionId {
++            model: model.clone(),
++            provider: provider.clone(),
++            provider_index,
++            prompt_mode,
++            prompt: input.answer.unwrap_or_default().to_string(),
++            working_dir: Some(input.effective_spawn_cwd.to_path_buf()),
++            extra_inputs: HashMap::new(),
++            parent_invocation_env: Some(invocation_env.to_string()),
++            start_known_provider_session_id: input.resolved.active_session_id.clone(),
++        },
++    )
++}
++
+ fn finalize_resume_spawn_error(
+     input: &ResumeAttemptInput<'_>,
+     attempt: &mut ResumeInvocationAttempt<'_>,
+@@ -710,7 +760,7 @@ fn prepare_initial_headless_resume_target(
+ ) -> Result<(), i32> {
+     let target = renderable_resume_execution_target(resolved, providers_cfg)?;
+     render_resume_short_line_if_needed(stderr_is_terminal, &resolved.active_provider);
+-    validate_headless_resume_target(&target, &resolved.active_provider)
++    validate_headless_resume_target(resolved, &target, &resolved.active_provider)
+ }
+ 
+ fn render_resume_short_line_if_needed(stderr_is_terminal: bool, selected_provider: &str) {
+@@ -720,9 +770,14 @@ fn render_resume_short_line_if_needed(stderr_is_terminal: bool, selected_provide
+ }
+ 
+ fn validate_headless_resume_target(
++    resolved: &oulipoly_state::ResolvedResume,
+     target: &crate::resume_cli::ResumeExecutionTarget,
+     selected_provider: &str,
+ ) -> Result<(), i32> {
++    if resolved_uses_provider_ref(resolved) {
++        return validate_provider_ref_headless_resume_target(resolved, target, selected_provider)
++            .map_err(|message| provider_ref_resume_block_exit_code(&message));
++    }
+     if headless_resume_target_has_resume(target) {
+         Ok(())
+     } else {
+@@ -730,6 +785,91 @@ fn validate_headless_resume_target(
+     }
+ }
+ 
++fn validate_provider_ref_headless_resume_target(
++    resolved: &oulipoly_state::ResolvedResume,
++    target: &crate::resume_cli::ResumeExecutionTarget,
++    selected_provider: &str,
++) -> Result<(), String> {
++    let Some(model) = provider_ref_resolved_model(resolved) else {
++        return Err(provider_ref_missing_model_message(selected_provider));
++    };
++    if !provider_ref_model_has_implementation(model) {
++        return Err(provider_ref_missing_implementation_message(
++            selected_provider,
++        ));
++    }
++    let Some(target_member_name) = provider_ref_target_member_name(model, target.provider_index)
++    else {
++        return Err(provider_ref_invalid_index_message(
++            selected_provider,
++            target.provider_index,
++        ));
++    };
++    if target_member_name != selected_provider {
++        return Err(provider_ref_resolved_provider_message(
++            selected_provider,
++            target_member_name,
++        ));
++    }
++    let loaded_provider_name = provider_ref_loaded_provider_name(target);
++    if loaded_provider_name != selected_provider {
++        return Err(provider_ref_loaded_provider_message(
++            selected_provider,
++            loaded_provider_name,
++        ));
++    }
++    Ok(())
++}
++
++fn provider_ref_resolved_model(
++    resolved: &oulipoly_state::ResolvedResume,
++) -> Option<&oulipoly_config::ModelConfig> {
++    resolved.model.as_ref()
++}
++
++fn provider_ref_model_has_implementation(model: &oulipoly_config::ModelConfig) -> bool {
++    model.provider.is_some()
++}
++
++fn provider_ref_target_member_name(
++    model: &oulipoly_config::ModelConfig,
++    provider_index: usize,
++) -> Option<&str> {
++    model
++        .providers
++        .get(provider_index)
++        .map(|provider| provider.name.as_str())
++}
++
++fn provider_ref_loaded_provider_name(target: &crate::resume_cli::ResumeExecutionTarget) -> &str {
++    &target.provider.name
++}
++
++fn provider_ref_missing_model_message(selected_provider: &str) -> String {
++    format!("provider-ref resume target {selected_provider} has no model config")
++}
++
++fn provider_ref_missing_implementation_message(selected_provider: &str) -> String {
++    format!("provider-ref resume target {selected_provider} has no provider implementation")
++}
++
++fn provider_ref_invalid_index_message(selected_provider: &str, provider_index: usize) -> String {
++    format!(
++        "provider-ref resume target {selected_provider} has invalid provider index {provider_index}"
++    )
++}
++
++fn provider_ref_resolved_provider_message(
++    selected_provider: &str,
++    resolved_provider: &str,
++) -> String {
++    format!("provider-ref resume target {selected_provider} resolved provider {resolved_provider}")
++}
++
++fn provider_ref_loaded_provider_message(selected_provider: &str, loaded_provider: &str) -> String {
++    format!("provider-ref resume target {selected_provider} loaded provider {loaded_provider}")
++}
++
+ fn headless_resume_target_has_resume(target: &crate::resume_cli::ResumeExecutionTarget) -> bool {
+     target.provider.resume.is_some()
+ }
+@@ -739,6 +879,11 @@ fn headless_missing_resume_block_exit_code(selected_provider: &str) -> i32 {
+     1
+ }
+ 
++fn provider_ref_resume_block_exit_code(message: &str) -> i32 {
++    formatter::emit_stderr(message);
++    1
++}
++
+ fn migrate_resume_target(
+     agent_runtime_services: &wiring::AgentRuntimeServices,
+     env: &crate::migration_providers::ResumeExecutionEnvironment,
+@@ -748,6 +893,11 @@ fn migrate_resume_target(
+     attempts: usize,
+     effective_spawn_cwd: &Path,
+ ) -> Result<(), i32> {
++    if should_skip_provider_ref_default_migration(resolved, manual_migrate) {
++        validate_provider_ref_headless_resume_target(resolved, target, &resolved.active_provider)
++            .map_err(|message| provider_ref_resume_block_exit_code(&message))?;
++        return Ok(());
++    }
+     let migration_model = migration_model_for_attempt(env, resolved, manual_migrate, attempts);
+     match dispatch_resume_migration(
+         agent_runtime_services,
+@@ -768,6 +918,20 @@ fn migrate_resume_target(
+     }
+ }
+ 
++fn should_skip_provider_ref_default_migration(
++    resolved: &oulipoly_state::ResolvedResume,
++    manual_migrate: Option<&str>,
++) -> bool {
++    manual_migrate.is_none() && resolved_uses_provider_ref(resolved)
++}
++
++fn resolved_uses_provider_ref(resolved: &oulipoly_state::ResolvedResume) -> bool {
++    resolved
++        .model
++        .as_ref()
++        .is_some_and(|model| model.provider.is_some())
++}
++
+ fn migration_model_for_attempt(
+     env: &crate::migration_providers::ResumeExecutionEnvironment,
+     resolved: &oulipoly_state::ResolvedResume,
+diff --git a/src-tauri/src/wiring.rs b/src-tauri/src/wiring.rs
+index 62610f0..638070b 100644
+--- a/src-tauri/src/wiring.rs
++++ b/src-tauri/src/wiring.rs
+@@ -86,6 +86,7 @@ impl AgentRuntimeServices {
+     pub fn cli_defaults() -> Self {
+         let paths = default_cli_runtime_paths();
+         let provider_registry_options = ProviderRegistryOptions::default()
++            .with_path_entries_from_process_path()
+             .with_config_root(paths.config_root.clone())
+             .with_data_root(paths.data_root.clone());
+         let provider_registry = Arc::new(production_provider_registry(
+@@ -144,6 +145,7 @@ impl AgentRuntimeServices {
+     pub fn production(paths: RuntimePaths) -> Result<Self, String> {
+         prepare_runtime_directories(&paths)?;
+         let registry_options = ProviderRegistryOptions::default()
++            .with_path_entries_from_process_path()
+             .with_config_root(paths.config_root.clone())
+             .with_data_root(paths.data_root.clone());
+         let provider_registry = Arc::new(production_provider_registry(

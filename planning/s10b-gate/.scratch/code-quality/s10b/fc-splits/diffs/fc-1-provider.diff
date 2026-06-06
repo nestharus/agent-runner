@@ -1,0 +1,417 @@
+diff --git a/crates/oulipoly-provider/src/error.rs b/crates/oulipoly-provider/src/error.rs
+index 79ccee1..a5d16ec 100644
+--- a/crates/oulipoly-provider/src/error.rs
++++ b/crates/oulipoly-provider/src/error.rs
+@@ -133,21 +133,21 @@ impl ProviderCapabilityError {
+     ) -> Result<Self, ProviderClientError> {
+         let subcommand = subcommand.into();
+         let request_id = request_id_from(&envelope);
+-        let envelope: ErrorResponseEnvelope =
+-            serde_json::from_value(envelope).map_err(|error| ProviderClientError::Protocol {
+-                kind: HostErrorKind::SchemaInvalidErrorResponse,
+-                subcommand: subcommand.clone(),
++        let envelope = parse_error_response_envelope(envelope).map_err(|error| {
++            schema_invalid_error_response(
++                &subcommand,
+                 request_id,
+-                description: error.to_string(),
+-                diagnostics: Box::new(diagnostics.clone()),
+-                process_status: process_status.clone().map(Box::new),
+-            })?;
+-        Ok(Self {
++                error,
++                diagnostics.clone(),
++                process_status.clone(),
++            )
++        })?;
++        Ok(capability_error_from_envelope(
+             subcommand,
+             envelope,
+-            diagnostics: Box::new(diagnostics),
+-            process_status: process_status.map(Box::new),
+-        })
++            diagnostics,
++            process_status,
++        ))
+     }
+ 
+     pub fn request_id(&self) -> &str {
+@@ -162,6 +162,10 @@ impl ProviderCapabilityError {
+         &self.envelope.error
+     }
+ 
++    pub fn provider_reported_process_status(&self) -> Option<&ProcessStatus> {
++        self.envelope.process_status.as_ref()
++    }
++
+     pub fn diagnostics(&self) -> &ProviderDiagnostics {
+         self.diagnostics.as_ref()
+     }
+@@ -311,44 +315,16 @@ impl ProviderClientError {
+         _stdin_error: Option<HostErrorKind>,
+     ) -> Result<Value, Self> {
+         let Some(envelope) = envelope else {
+-            if process_status.exited_successfully() {
+-                return Err(Self::protocol(
+-                    HostErrorKind::EmptyStdout,
+-                    subcommand,
+-                    None,
+-                    diagnostics,
+-                ));
+-            }
+-            return Err(Self::host_transport(
+-                HostErrorKind::ProviderProcessNonzero,
+-                subcommand,
+-                None,
+-                diagnostics,
+-            ));
++            return missing_non_launch_envelope_result(subcommand, &process_status, diagnostics);
+         };
+-        match envelope.get("ok").and_then(Value::as_bool) {
+-            Some(false) => Err(Self::from_capability(
+-                ProviderCapabilityError::from_valid_envelope(
+-                    subcommand,
+-                    envelope,
+-                    diagnostics,
+-                    Some(process_status),
+-                )?,
+-            )),
+-            Some(true) if process_status.exited_successfully() => Ok(envelope),
+-            Some(true) => Err(Self::host_transport(
+-                HostErrorKind::ProviderProcessNonzeroWithSuccess,
+-                subcommand,
+-                request_id_from(&envelope),
+-                diagnostics,
+-            )),
+-            None => Err(Self::protocol(
+-                HostErrorKind::SchemaInvalidResponse,
+-                subcommand,
+-                request_id_from(&envelope),
+-                diagnostics,
+-            )),
+-        }
++        let response_kind = non_launch_response_kind(&envelope, &process_status);
++        map_non_launch_response(
++            response_kind,
++            subcommand,
++            envelope,
++            process_status,
++            diagnostics,
++        )
+     }
+ 
+     pub fn is_provider_capability(&self) -> bool {
+@@ -408,6 +384,120 @@ impl ProviderClientError {
+     }
+ }
+ 
++fn parse_error_response_envelope(
++    envelope: Value,
++) -> Result<ErrorResponseEnvelope, serde_json::Error> {
++    serde_json::from_value(envelope)
++}
++
++fn schema_invalid_error_response(
++    subcommand: &str,
++    request_id: Option<String>,
++    error: serde_json::Error,
++    diagnostics: ProviderDiagnostics,
++    process_status: Option<ProcessStatus>,
++) -> ProviderClientError {
++    ProviderClientError::Protocol {
++        kind: HostErrorKind::SchemaInvalidErrorResponse,
++        subcommand: subcommand.to_string(),
++        request_id,
++        description: error.to_string(),
++        diagnostics: Box::new(diagnostics),
++        process_status: process_status.map(Box::new),
++    }
++}
++
++fn capability_error_from_envelope(
++    subcommand: String,
++    envelope: ErrorResponseEnvelope,
++    diagnostics: ProviderDiagnostics,
++    process_status: Option<ProcessStatus>,
++) -> ProviderCapabilityError {
++    ProviderCapabilityError {
++        subcommand,
++        envelope,
++        diagnostics: Box::new(diagnostics),
++        process_status: process_status.map(Box::new),
++    }
++}
++
++enum NonLaunchResponseKind {
++    ProviderError,
++    Success,
++    SuccessWithNonzero,
++    SchemaInvalid,
++}
++
++fn missing_non_launch_envelope_result(
++    subcommand: &str,
++    process_status: &ProcessStatus,
++    diagnostics: ProviderDiagnostics,
++) -> Result<Value, ProviderClientError> {
++    if process_status.exited_successfully() {
++        Err(ProviderClientError::protocol(
++            HostErrorKind::EmptyStdout,
++            subcommand,
++            None,
++            diagnostics,
++        ))
++    } else {
++        Err(ProviderClientError::host_transport(
++            HostErrorKind::ProviderProcessNonzero,
++            subcommand,
++            None,
++            diagnostics,
++        ))
++    }
++}
++
++fn non_launch_response_kind(
++    envelope: &Value,
++    process_status: &ProcessStatus,
++) -> NonLaunchResponseKind {
++    match envelope_ok(envelope) {
++        Some(false) => NonLaunchResponseKind::ProviderError,
++        Some(true) if process_status.exited_successfully() => NonLaunchResponseKind::Success,
++        Some(true) => NonLaunchResponseKind::SuccessWithNonzero,
++        None => NonLaunchResponseKind::SchemaInvalid,
++    }
++}
++
++fn envelope_ok(envelope: &Value) -> Option<bool> {
++    envelope.get("ok").and_then(Value::as_bool)
++}
++
++fn map_non_launch_response(
++    kind: NonLaunchResponseKind,
++    subcommand: &str,
++    envelope: Value,
++    process_status: ProcessStatus,
++    diagnostics: ProviderDiagnostics,
++) -> Result<Value, ProviderClientError> {
++    match kind {
++        NonLaunchResponseKind::ProviderError => Err(ProviderClientError::from_capability(
++            ProviderCapabilityError::from_valid_envelope(
++                subcommand,
++                envelope,
++                diagnostics,
++                Some(process_status),
++            )?,
++        )),
++        NonLaunchResponseKind::Success => Ok(envelope),
++        NonLaunchResponseKind::SuccessWithNonzero => Err(ProviderClientError::host_transport(
++            HostErrorKind::ProviderProcessNonzeroWithSuccess,
++            subcommand,
++            request_id_from(&envelope),
++            diagnostics,
++        )),
++        NonLaunchResponseKind::SchemaInvalid => Err(ProviderClientError::protocol(
++            HostErrorKind::SchemaInvalidResponse,
++            subcommand,
++            request_id_from(&envelope),
++            diagnostics,
++        )),
++    }
++}
++
+ impl std::fmt::Display for ProviderClientError {
+     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+         write!(
+diff --git a/crates/oulipoly-provider/src/generated.rs b/crates/oulipoly-provider/src/generated.rs
+index cd4a2e2..001cc07 100644
+--- a/crates/oulipoly-provider/src/generated.rs
++++ b/crates/oulipoly-provider/src/generated.rs
+@@ -61,10 +61,25 @@ impl<'de> Deserialize<'de> for TrueBool {
+     where
+         D: Deserializer<'de>,
+     {
+-        match bool::deserialize(deserializer)? {
+-            true => Ok(Self),
+-            false => Err(de::Error::custom("expected ok=true")),
+-        }
++        true_bool_from_value(deserialize_protocol_bool(deserializer)?)
++    }
++}
++
++fn deserialize_protocol_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
++where
++    D: Deserializer<'de>,
++{
++    bool::deserialize(deserializer)
++}
++
++fn true_bool_from_value<E>(value: bool) -> Result<TrueBool, E>
++where
++    E: de::Error,
++{
++    if value {
++        Ok(TrueBool)
++    } else {
++        Err(E::custom("expected ok=true"))
+     }
+ }
+ 
+@@ -85,10 +100,18 @@ impl<'de> Deserialize<'de> for FalseBool {
+     where
+         D: Deserializer<'de>,
+     {
+-        match bool::deserialize(deserializer)? {
+-            false => Ok(Self),
+-            true => Err(de::Error::custom("expected ok=false")),
+-        }
++        false_bool_from_value(deserialize_protocol_bool(deserializer)?)
++    }
++}
++
++fn false_bool_from_value<E>(value: bool) -> Result<FalseBool, E>
++where
++    E: de::Error,
++{
++    if value {
++        Err(E::custom("expected ok=false"))
++    } else {
++        Ok(FalseBool)
+     }
+ }
+ 
+@@ -123,7 +146,7 @@ pub struct ErrorResponseEnvelope {
+     pub ok: FalseBool,
+     pub error: ErrorObject,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+-    pub process_status: Option<Value>,
++    pub process_status: Option<ProcessStatus>,
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+@@ -261,8 +284,12 @@ pub struct DescribeCapabilities {
+ 
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+ pub struct ProviderConcurrency {
+-    pub safe_for_parallel_invocation: bool,
+-    pub state_locking: String,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub safe_for_parallel_invocation: Option<bool>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub state_locking: Option<String>,
++    #[serde(flatten)]
++    pub metadata: JsonObject,
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+@@ -664,21 +691,32 @@ macro_rules! fixed_str_type {
+             where
+                 D: Deserializer<'de>,
+             {
+-                let actual = String::deserialize(deserializer)?;
+-                if actual == $value {
+-                    Ok(Self)
+-                } else {
+-                    Err(de::Error::custom(format!(
+-                        "expected {}={:?}",
+-                        stringify!($name),
+-                        $value
+-                    )))
+-                }
++                deserialize_fixed_str_type(
++                    String::deserialize(deserializer)?,
++                    $value,
++                    stringify!($name),
++                )?;
++                Ok(Self)
+             }
+         }
+     };
+ }
+ 
++fn deserialize_fixed_str_type<E>(actual: String, expected: &str, type_name: &str) -> Result<(), E>
++where
++    E: de::Error,
++{
++    if actual == expected {
++        Ok(())
++    } else {
++        Err(E::custom(fixed_str_type_error(type_name, expected)))
++    }
++}
++
++fn fixed_str_type_error(type_name: &str, expected: &str) -> String {
++    format!("expected {type_name}={expected:?}")
++}
++
+ fixed_str_type!(LaunchStdoutKind, "stdout");
+ fixed_str_type!(LaunchStderrKind, "stderr");
+ fixed_str_type!(LaunchMarkerKind, "marker");
+diff --git a/crates/oulipoly-provider/tests/client_invoke.rs b/crates/oulipoly-provider/tests/client_invoke.rs
+index 881f7a6..e8ddc78 100644
+--- a/crates/oulipoly-provider/tests/client_invoke.rs
++++ b/crates/oulipoly-provider/tests/client_invoke.rs
+@@ -6,6 +6,8 @@ use oulipoly_provider::client::{ProviderClient, ProviderClientOptions, ProviderO
+ use oulipoly_provider::error::ProviderClientError;
+ use oulipoly_provider::generated::{DescribeResult, SchemaResult, SettingsListResult};
+ use oulipoly_provider::resolver::ProviderArtifactRef;
++use oulipoly_provider::schemas::SchemaRegistry;
++use serde_json::json;
+ use std::ffi::OsString;
+ use std::path::Path;
+ use std::time::Duration;
+@@ -36,6 +38,55 @@ fn invoke_success_returns_typed_result_and_keeps_stderr_diagnostics() {
+     );
+ }
+ 
++#[test]
++fn invoke_describe_accepts_schema_valid_freeform_concurrency_metadata() {
++    let provider_id = ["cla", "ude"].concat();
++    let response = json!({
++        "contract": "oulipoly.provider/v1",
++        "ok": true,
++        "request_id": "provider-registry-f7eff50a-09d6-4cc7-968e-5f0e0c567104",
++        "result": {
++            "capabilities": {
++                "discovery": true,
++                "launch": true,
++                "migration": true,
++                "policy": true,
++                "quota": true,
++                "rotation": true,
++                "session": true,
++                "settings": true,
++                "setup": true,
++                "setup_brain": true,
++                "terminal": true
++            },
++            "concurrency": {
++                "launch_streams": "one_per_process",
++                "process_model": "one_shot_cli",
++                "state_serialization": "provider_advisory_locks"
++            },
++            "contract_versions": ["oulipoly.provider/v1"],
++            "display_name": "Example Provider",
++            "preferred_contract": "oulipoly.provider/v1",
++            "provider_id": provider_id.clone(),
++            "settings_schema_id": format!("{}.settings/v1", provider_id)
++        }
++    });
++    SchemaRegistry::new()
++        .validate_response("describe", &response)
++        .expect("captured provider describe response must validate against frozen schema");
++
++    let result = serde_json::from_value::<DescribeResult>(response["result"].clone());
++
++    assert!(
++        result.is_ok(),
++        "schema-valid describe result should deserialize for host consumers: {:?}",
++        result.err()
++    );
++    let concurrency = serde_json::to_value(result.unwrap().concurrency.unwrap())
++        .expect("concurrency metadata should serialize back to JSON");
++    assert_eq!(concurrency["launch_streams"], "one_per_process");
++}
++
+ #[test]
+ fn invoke_writes_request_on_stdin_not_argv() {
+     let fake = FakeProvider::compile(fake_provider_source());

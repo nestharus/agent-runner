@@ -1,0 +1,203 @@
+diff --git a/crates/oulipoly-runtime/tests/provider_registry.rs b/crates/oulipoly-runtime/tests/provider_registry.rs
+index 9a0685e..8bf461c 100644
+--- a/crates/oulipoly-runtime/tests/provider_registry.rs
++++ b/crates/oulipoly-runtime/tests/provider_registry.rs
+@@ -736,6 +736,57 @@ fn enabled_ref_flavors_resolve_describe_and_parse_capability_description() {
+     assert_eq!(read_count(&script_count), 1);
+ }
+ 
++#[test]
++fn binary_ref_resolves_from_process_path_entries() {
++    let temp = tempfile::tempdir().unwrap();
++    let count = temp.path().join("process-path-count");
++    write_fake_provider_script(
++        temp.path(),
++        "agent-runner-fixture",
++        &count,
++        Ok("path-provider"),
++    );
++    let path_env = std::env::join_paths([temp.path()]).expect("fixture PATH should join");
++
++    let registry = registry_from_single_ref(
++        binary_ref("agent-runner-fixture"),
++        ProviderRegistryOptions::default().with_path_entries_from_path_env(Some(path_env)),
++    );
++
++    let result = registry
++        .describe_model_provider("example-model")
++        .expect("binary provider should resolve through PATH-derived entries");
++    assert_eq!(result.provider_id, "path-provider");
++    assert_eq!(read_count(&count), 1);
++}
++
++#[test]
++fn absent_binary_from_process_path_entries_preserves_missing_artifact() {
++    let temp = tempfile::tempdir().unwrap();
++    let path_env = std::env::join_paths([temp.path()]).expect("fixture PATH should join");
++
++    let error = registry_from_single_ref(
++        binary_ref("agent-runner-fixture"),
++        ProviderRegistryOptions::default().with_path_entries_from_path_env(Some(path_env)),
++    )
++    .describe_model_provider("example-model")
++    .expect_err("absent binary should remain a missing artifact");
++
++    assert_transport_kind(error, "missing_artifact");
++}
++
++#[test]
++fn unset_process_path_entries_preserves_missing_artifact_without_panic() {
++    let error = registry_from_single_ref(
++        binary_ref("agent-runner-fixture"),
++        ProviderRegistryOptions::default().with_path_entries_from_path_env(None),
++    )
++    .describe_model_provider("example-model")
++    .expect_err("unset PATH should not resolve binary provider refs");
++
++    assert_transport_kind(error, "missing_artifact");
++}
++
+ #[test]
+ fn describe_propagates_settings_capability_and_schema_id() {
+     let temp = tempfile::tempdir().unwrap();
+@@ -1629,16 +1680,28 @@ fn assert_s7b_operation_strings_are_sanctioned_and_bounded() {
+ }
+ 
+ fn session_external_provider_sources(root: &Path) -> Vec<String> {
++    session_external_provider_source_paths(root)
++        .into_iter()
++        .map(read_session_external_provider_source)
++        .collect()
++}
++
++fn session_external_provider_source_paths(root: &Path) -> Vec<PathBuf> {
+     fs::read_dir(root.join("session_external_provider"))
+         .expect("session_external_provider dir")
+-        .map(|entry| {
+-            let path = entry.expect("source entry").path();
+-            fs::read_to_string(&path)
+-                .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
+-        })
++        .map(source_entry_path)
+         .collect()
+ }
+ 
++fn source_entry_path(entry: std::io::Result<fs::DirEntry>) -> PathBuf {
++    entry.expect("source entry").path()
++}
++
++fn read_session_external_provider_source(path: PathBuf) -> String {
++    fs::read_to_string(&path)
++        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
++}
++
+ fn assert_lifecycle_provider_registry_dispatch_terms(lifecycle_source: &str) {
+     for expected in [
+         "SessionServiceExternalProviderIdentity",
+diff --git a/crates/oulipoly-runtime/tests/provider_settings_host.rs b/crates/oulipoly-runtime/tests/provider_settings_host.rs
+index 003777d..5c6e989 100644
+--- a/crates/oulipoly-runtime/tests/provider_settings_host.rs
++++ b/crates/oulipoly-runtime/tests/provider_settings_host.rs
+@@ -442,16 +442,38 @@ impl RebuildFixture {
+     }
+ 
+     fn subcommands_for(&self, provider_id: &str) -> Vec<String> {
+-        fs::read_to_string(&self.record)
+-            .unwrap_or_default()
+-            .lines()
+-            .map(|line| serde_json::from_str::<RecordedCall>(line).unwrap())
+-            .filter(|call| call.request["provider_instance_id"] == provider_id)
+-            .map(|call| call.subcommand)
++        recorded_calls(&self.record)
++            .into_iter()
++            .filter(|call| recorded_call_is_for_provider(call, provider_id))
++            .map(recorded_call_subcommand)
+             .collect()
+     }
+ }
+ 
++fn recorded_calls(path: &Path) -> Vec<RecordedCall> {
++    parse_recorded_calls(&recorded_calls_text(path))
++}
++
++fn recorded_calls_text(path: &Path) -> String {
++    fs::read_to_string(path).unwrap_or_default()
++}
++
++fn parse_recorded_calls(text: &str) -> Vec<RecordedCall> {
++    text.lines().map(parse_recorded_call).collect()
++}
++
++fn parse_recorded_call(line: &str) -> RecordedCall {
++    serde_json::from_str::<RecordedCall>(line).unwrap()
++}
++
++fn recorded_call_is_for_provider(call: &RecordedCall, provider_id: &str) -> bool {
++    call.request["provider_instance_id"] == provider_id
++}
++
++fn recorded_call_subcommand(call: RecordedCall) -> String {
++    call.subcommand
++}
++
+ impl SettingsHostFixture {
+     fn new() -> Self {
+         Self::with_settings_capability(true)
+@@ -541,7 +563,7 @@ def error():
+             "details": {{"remote_version": "provider-updated-version"}},
+             "diagnostics": [{{"severity": "warning", "message": "Reload before saving", "path": "/endpoint", "code": "stale"}}],
+         }},
+-        "process_status": {{"exit_code": 17}},
++        "process_status": {{"kind": "exited", "code": 17}},
+     }}
+ 
+ if subcommand == "schema":
+diff --git a/crates/oulipoly-runtime/tests/s10_external_launch_session.rs b/crates/oulipoly-runtime/tests/s10_external_launch_session.rs
+index 78bd8a2..7693d89 100644
+--- a/crates/oulipoly-runtime/tests/s10_external_launch_session.rs
++++ b/crates/oulipoly-runtime/tests/s10_external_launch_session.rs
+@@ -6,7 +6,7 @@ use oulipoly_config::{
+ use oulipoly_runtime::executor::RuntimeExecutorService;
+ use oulipoly_runtime::provider_registry::{ProviderRegistry, ProviderRegistryOptions};
+ use oulipoly_runtime::services::{ExecutorServicePort, ExecutorServiceRequest};
+-use serde_json::Value;
++use serde_json::{Value, json};
+ use std::collections::HashMap;
+ use std::fs;
+ use std::os::unix::fs::PermissionsExt;
+@@ -106,6 +106,27 @@ fn external_launch_exit_session_populates_capture_and_resume_request() {
+         Some(expected_session.as_str()),
+         "resume launch must receive the provider session captured from the prior external launch"
+     );
++    let expected_path = std::env::var("PATH").expect("test process should have PATH");
++    assert_eq!(
++        launch_records[0]["request"]["params"]["env"]["PATH"].as_str(),
++        Some(expected_path.as_str()),
++        "external launch must pass PATH because provider launch clears inherited child env"
++    );
++    let policy_records = fixture.records_for("policy.evaluate");
++    assert_eq!(
++        policy_records.len(),
++        2,
++        "policy records: {policy_records:?}"
++    );
++    let policy_launch = &policy_records[0]["request"]["params"]["launch"];
++    let provider = provider_name();
++    assert_eq!(policy_launch["command"].as_str(), Some(provider.as_str()));
++    assert_eq!(policy_launch["args"], json!([]));
++    assert_eq!(policy_launch["prompt_mode"].as_str(), Some("arg"));
++    assert_eq!(
++        policy_records[0]["request"]["params"]["model"]["provider_args"],
++        json!(["--model", "sonnet"])
++    );
+ }
+ 
+ fn execute_external(
+@@ -230,6 +251,7 @@ def describe():
+ def policy_evaluate():
+     return envelope({
+         "accepted": True,
++        "env": {},
+         "stdin": None,
+         "prompt": None,
+         "diagnostics": [],

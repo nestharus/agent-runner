@@ -1,0 +1,6 @@
+src-tauri/src/app_state.rs
+src-tauri/src/commands/provider_settings.rs
+src-tauri/src/commands/session_locate_export/orchestration.rs
+src-tauri/src/run/balancing/finalization.rs
+src-tauri/src/run/resume/orchestration.rs
+src-tauri/src/wiring.rs

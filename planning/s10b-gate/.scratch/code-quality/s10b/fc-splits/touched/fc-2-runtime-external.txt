@@ -1,0 +1,4 @@
+crates/oulipoly-runtime/src/executor/external_provider/launch_result_mapper.rs
+crates/oulipoly-runtime/src/executor/external_provider/policy_transform.rs
+crates/oulipoly-runtime/src/executor/external_provider/request_builder.rs
+crates/oulipoly-runtime/src/provider_registry/options.rs

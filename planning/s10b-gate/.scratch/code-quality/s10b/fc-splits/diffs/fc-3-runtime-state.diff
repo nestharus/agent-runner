@@ -1,0 +1,213 @@
+diff --git a/crates/oulipoly-runtime/src/provider_settings/mod.rs b/crates/oulipoly-runtime/src/provider_settings/mod.rs
+index 929ab37..12ad3b7 100644
+--- a/crates/oulipoly-runtime/src/provider_settings/mod.rs
++++ b/crates/oulipoly-runtime/src/provider_settings/mod.rs
+@@ -55,6 +55,11 @@ pub struct ProviderSettingsProcessStatus {
+ }
+ 
+ impl ProviderSettingsHostOptions {
++    pub fn with_path_entries_from_process_path(mut self) -> Self {
++        self.registry = self.registry.with_path_entries_from_process_path();
++        self
++    }
++
+     pub fn with_config_root(mut self, root: impl Into<PathBuf>) -> Self {
+         self.registry = self.registry.with_config_root(root);
+         self
+@@ -96,28 +101,35 @@ impl ProviderSettingsHost {
+         &self,
+         model_name: &str,
+     ) -> Result<ProviderSettingsTarget, ProviderSettingsError> {
+-        if let Some(target) = self
+-            .target_cache
++        if let Some(target) = self.cached_settings_target(model_name) {
++            return Ok(target);
++        }
++        let target = self.load_settings_target(model_name)?;
++        self.cache_settings_target(model_name, &target);
++        Ok(target)
++    }
++
++    fn cached_settings_target(&self, model_name: &str) -> Option<ProviderSettingsTarget> {
++        self.target_cache
+             .lock()
+             .expect("settings target cache should not be poisoned")
+             .get(model_name)
+             .cloned()
+-        {
+-            return Ok(target);
+-        }
++    }
++
++    fn load_settings_target(
++        &self,
++        model_name: &str,
++    ) -> Result<ProviderSettingsTarget, ProviderSettingsError> {
+         let description = self.describe_provider(model_name)?;
+-        let target = ProviderSettingsTarget {
+-            model_name: model_name.to_string(),
+-            provider_id: description.provider_id,
+-            display_name: description.display_name,
+-            settings_supported: description.capabilities.settings,
+-            schema_id: description.settings_schema_id,
+-        };
++        Ok(settings_target_from_description(model_name, description))
++    }
++
++    fn cache_settings_target(&self, model_name: &str, target: &ProviderSettingsTarget) {
+         self.target_cache
+             .lock()
+             .expect("settings target cache should not be poisoned")
+             .insert(model_name.to_string(), target.clone());
+-        Ok(target)
+     }
+ 
+     pub fn configured_model_names(&self) -> Vec<String> {
+@@ -296,6 +308,19 @@ impl ProviderSettingsHost {
+     }
+ }
+ 
++fn settings_target_from_description(
++    model_name: &str,
++    description: DescribeResult,
++) -> ProviderSettingsTarget {
++    ProviderSettingsTarget {
++        model_name: model_name.to_string(),
++        provider_id: description.provider_id,
++        display_name: description.display_name,
++        settings_supported: description.capabilities.settings,
++        schema_id: description.settings_schema_id,
++    }
++}
++
+ #[derive(Debug, Clone, Copy)]
+ enum SettingsOperation {
+     Schema,
+@@ -434,10 +459,11 @@ impl From<ProviderClientError> for ProviderSettingsError {
+                         .unwrap_or_else(|| Value::Object(Map::new())),
+                 ),
+                 diagnostics: capability.error().diagnostics.clone().into_boxed_slice(),
+-                process_status: provider_error_process_status_from_stdout(
+-                    &capability.diagnostics().stdout,
++                process_status: provider_error_status(
++                    capability
++                        .provider_reported_process_status()
++                        .or_else(|| capability.process_status()),
+                 )
+-                .or_else(|| provider_error_status(capability.process_status()))
+                 .map(Box::new),
+             },
+             other => {
+@@ -526,28 +552,6 @@ fn provider_error_status(status: Option<&ProcessStatus>) -> Option<ProviderSetti
+     })
+ }
+ 
+-fn provider_error_process_status_from_stdout(
+-    stdout: &oulipoly_provider::error::CapturedBytes,
+-) -> Option<ProviderSettingsProcessStatus> {
+-    let envelope = serde_json::from_slice::<Value>(&stdout.bytes).ok()?;
+-    let status = envelope.get("process_status")?;
+-    Some(ProviderSettingsProcessStatus {
+-        exit_code: status
+-            .get("exit_code")
+-            .and_then(Value::as_i64)
+-            .and_then(|code| i32::try_from(code).ok()),
+-        signal: status
+-            .get("signal")
+-            .and_then(Value::as_i64)
+-            .and_then(|signal| i32::try_from(signal).ok()),
+-        kind: status
+-            .get("kind")
+-            .and_then(Value::as_str)
+-            .unwrap_or("exited")
+-            .to_string(),
+-    })
+-}
+-
+ struct NoProviderEnv;
+ 
+ impl ProviderEnv for NoProviderEnv {
+diff --git a/crates/oulipoly-runtime/src/session_metadata/mod.rs b/crates/oulipoly-runtime/src/session_metadata/mod.rs
+index 5100393..cde99d3 100644
+--- a/crates/oulipoly-runtime/src/session_metadata/mod.rs
++++ b/crates/oulipoly-runtime/src/session_metadata/mod.rs
+@@ -545,6 +545,9 @@ pub fn resolve_resume_workspace_root(
+     let resolved = state
+         .resolve_resume(models, input, None)
+         .map_err(map_resume_error)?;
++    if let Some(workspace_root) = external_session_runtime_workspace_root(&resolved)? {
++        return Ok(workspace_root);
++    }
+     let provider = effective_provider_for_resolved(&resolved, providers_cfg)?;
+     resolve_cwd_from_session_storage(
+         provider.session_storage.as_ref(),
+@@ -553,6 +556,69 @@ pub fn resolve_resume_workspace_root(
+     )
+ }
+ 
++fn external_session_runtime_workspace_root(
++    resolved: &oulipoly_state::ResolvedResume,
++) -> Result<Option<PathBuf>, MetadataError> {
++    if !resolved_uses_external_provider(resolved) {
++        return Ok(None);
++    }
++    let Some(db) = external_session_runtime_db()? else {
++        return Ok(None);
++    };
++    let Some(row) = db
++        .session_runtime(&resolved.active_session_id)
++        .map_err(external_session_runtime_error)?
++    else {
++        return Ok(None);
++    };
++    row.effective_cwd
++        .map(validate_external_session_runtime_cwd)
++        .transpose()
++}
++
++fn external_session_runtime_db() -> Result<Option<oulipoly_state::mailbox::MailboxDb>, MetadataError>
++{
++    oulipoly_state::mailbox::MailboxDb::open_default_if_exists()
++        .map_err(external_session_runtime_error)
++}
++
++fn validate_external_session_runtime_cwd(value: String) -> Result<PathBuf, MetadataError> {
++    require_absolute_external_session_runtime_cwd(external_session_runtime_cwd_path(value))
++}
++
++fn external_session_runtime_cwd_path(value: String) -> PathBuf {
++    PathBuf::from(value)
++}
++
++fn require_absolute_external_session_runtime_cwd(path: PathBuf) -> Result<PathBuf, MetadataError> {
++    if external_session_runtime_cwd_is_absolute(&path) {
++        Ok(path)
++    } else {
++        Err(external_session_runtime_cwd_not_absolute(&path))
++    }
++}
++
++fn external_session_runtime_cwd_is_absolute(path: &std::path::Path) -> bool {
++    path.is_absolute()
++}
++
++fn external_session_runtime_cwd_not_absolute(path: &std::path::Path) -> MetadataError {
++    MetadataError::Operational {
++        message: external_session_runtime_cwd_not_absolute_message(path),
++    }
++}
++
++fn external_session_runtime_cwd_not_absolute_message(path: &std::path::Path) -> String {
++    format!(
++        "session_runtime_effective_cwd_not_absolute: {}",
++        path.display()
++    )
++}
++
++fn external_session_runtime_error(message: String) -> MetadataError {
++    MetadataError::Operational { message }
++}
++
+ pub fn resolve_jsonl_path_for_provider_allow_missing(
+     sessions_cfg: &SessionsConfig,
+     session_storage: Option<&SessionStorage>,

@@ -1,0 +1,5 @@
+OULIPOLY_INVOCATION={"source":"opencode5","id":"98df5375-77c4-44eb-9ee0-2c598424b9d7"}
+[diagnostics] auth_expired: Heuristic classification based on stderr content
+OULIPOLY_RESULT={"agent_runner_chain_id":null,"agent_runner_invocation_id":"98df5375-77c4-44eb-9ee0-2c598424b9d7","error_category":"auth_expired","exit_code":143,"finished_at":"2026-06-06T12:57:48.306644411+00:00","id":"98df5375-77c4-44eb-9ee0-2c598424b9d7","provider_name":"opencode5","provider_session_id":"ses_1630698c3ffezMp8B7ziahfiRU","status":"failed","success":false,"terminal_reason":"signal:SIGTERM"}
+
+[diagnostics: auth_expired]

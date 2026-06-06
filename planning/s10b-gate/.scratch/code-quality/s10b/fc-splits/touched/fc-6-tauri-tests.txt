@@ -1,0 +1,2 @@
+src-tauri/tests/age244_s7b_production_wiring_source_guard.rs
+src-tauri/tests/s10_external_provider_resume.rs
