@@ -2,16 +2,17 @@
 //!
 //! Roles: parser, validator, mapper, accessor, filter, orchestration, formatter.
 //!
-//! - parser: `LaunchJsonlReader::read`, `LaunchStreamParser::{push, finish}`,
-//!   `parse_line`, `decode_event`, and `decode_base64` parse launch JSONL into
-//!   decoded event/result structures.
+//! - parser: `LaunchStreamParser::{push, process_pending_line}`,
+//!   `parse_line`, `parse_launch_event`, `parse_line_utf8`, and
+//!   `decode_base64` parse launch JSONL into decoded event/result structures.
 //! - validator: `event_kind`, `validate_event_schema`,
-//!   `LaunchStreamParser::validate_sequence`, and line-size/finality checks
-//!   enforce launch stream contract, request correlation, event schema, and
-//!   sequence invariants.
-//! - mapper: `decode_event`, protocol/transport error helpers, and retained
-//!   cost helpers translate generated DTOs, base64 payloads, and parse failures
-//!   into host-facing launch events or provider-client errors.
+//!   `LaunchStreamParser::{validate_sequence, validate_final_state}`, and
+//!   line-size/finality checks enforce launch stream contract, request
+//!   correlation, event schema, and sequence invariants.
+//! - mapper: `map_launch_event`, `LaunchStreamParser::into_launch_result`,
+//!   protocol/transport error helpers, and retained cost helpers translate
+//!   generated DTOs, base64 payloads, and parse failures into host-facing launch
+//!   events or provider-client errors.
 //! - accessor: `DecodedLaunchEvent::{seq, bytes}`, `LaunchResult` accessors,
 //!   and `LaunchJsonlReader::request_id` expose decoded event/result state.
 //! - filter: `LaunchEventRetention`, `LaunchMarkerRetention`,
@@ -20,8 +21,9 @@
 //! - orchestration: `LaunchStdoutProcessor` connects live process stdout
 //!   draining to incremental launch stream parsing while preserving raw
 //!   diagnostics.
-//! - formatter: line-limit and malformed-line helpers format stable diagnostic
-//!   descriptions for oversized or invalid launch JSONL input.
+//! - formatter: `pending_line_limit_description`, `line_limit_description`,
+//!   `blank_line_description`, and malformed-line helpers format stable
+//!   diagnostic descriptions for oversized or invalid launch JSONL input.
 //!
 //! ## Adapter declarations
 //!
@@ -215,14 +217,7 @@ impl LaunchJsonlReader {
                 Ok(0) => break,
                 Ok(read) => parser.push(&buffer[..read])?,
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(error) => {
-                    return Err(ProviderClientError::protocol(
-                        HostErrorKind::MalformedLine,
-                        "launch",
-                        Some(self.request_id.clone()),
-                        ProviderDiagnostics::with_description(error.to_string()),
-                    ));
-                }
+                Err(error) => return Err(map_launch_read_error(error, &self.request_id)),
             }
         }
         parser.finish()
@@ -351,20 +346,38 @@ impl LaunchStreamParser {
     }
 
     fn finish(mut self) -> Result<LaunchResult, ProviderClientError> {
-        if !self.pending_line.is_empty() {
-            let line = std::mem::take(&mut self.pending_line);
-            self.process_line_bytes(&line)?;
+        self.process_pending_line()?;
+        self.validate_final_state()?;
+        Ok(self.into_launch_result())
+    }
+
+    fn process_pending_line(&mut self) -> Result<(), ProviderClientError> {
+        if self.pending_line.is_empty() {
+            return Ok(());
         }
+        let line = std::mem::take(&mut self.pending_line);
+        self.process_line_bytes(&line)
+    }
+
+    fn validate_final_state(&self) -> Result<(), ProviderClientError> {
         if self.deferred_initial_skip {
             return Err(protocol_error(HostErrorKind::SkippedSeq, &self.request_id));
         }
-        let Some(exit) = self.exit else {
+        if self.exit.is_none() {
             return Err(protocol_error(
                 HostErrorKind::MissingFinalExit,
                 &self.request_id,
             ));
         };
-        Ok(LaunchResult {
+        Ok(())
+    }
+
+    fn into_launch_result(mut self) -> LaunchResult {
+        let exit = self
+            .exit
+            .take()
+            .expect("launch final state should include exit after validation");
+        LaunchResult {
             events: self.retention.events,
             exit,
             diagnostics: ProviderDiagnostics::default(),
@@ -372,7 +385,7 @@ impl LaunchStreamParser {
             stderr: self.stderr.finish(),
             retained_markers: self.markers.markers,
             retained_events_omitted: self.retention.omitted,
-        })
+        }
     }
 
     fn ensure_pending_line_within_limit(&self) -> Result<(), ProviderClientError> {
@@ -380,10 +393,7 @@ impl LaunchStreamParser {
             return Err(transport_error_with_description(
                 HostErrorKind::StdoutLimitExceeded,
                 &self.request_id,
-                format!(
-                    "launch JSONL line exceeded {} bytes",
-                    self.limits.max_line_bytes
-                ),
+                pending_line_limit_description(self.limits.max_line_bytes),
             ));
         }
         Ok(())
@@ -391,50 +401,52 @@ impl LaunchStreamParser {
 
     fn process_line_bytes(&mut self, line: &[u8]) -> Result<(), ProviderClientError> {
         self.line_number += 1;
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if line.len() > self.limits.max_line_bytes {
-            return Err(transport_error_with_description(
-                HostErrorKind::StdoutLimitExceeded,
-                &self.request_id,
-                format!(
-                    "launch JSONL line {} exceeded {} bytes",
-                    self.line_number, self.limits.max_line_bytes
-                ),
-            ));
-        }
-        let line = std::str::from_utf8(line).map_err(|error| {
-            ProviderClientError::protocol(
-                HostErrorKind::InvalidUtf8,
-                "launch",
-                Some(self.request_id.clone()),
-                ProviderDiagnostics::with_description(error.to_string()),
-            )
-        })?;
+        let line = normalize_line_bytes(line);
+        self.validate_line_bytes_within_limit(line)?;
+        let line = parse_line_utf8(line, &self.request_id)?;
         self.process_line(line)
     }
 
     fn process_line(&mut self, line: &str) -> Result<(), ProviderClientError> {
+        self.validate_line_not_blank(line)?;
+        let value = parse_line(line, &self.request_id)?;
+        self.validate_line_before_exit(&value)?;
+        self.process_launch_event_value(value)
+    }
+
+    fn validate_line_bytes_within_limit(&self, line: &[u8]) -> Result<(), ProviderClientError> {
+        if line.len() > self.limits.max_line_bytes {
+            return Err(transport_error_with_description(
+                HostErrorKind::StdoutLimitExceeded,
+                &self.request_id,
+                line_limit_description(self.line_number, self.limits.max_line_bytes),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_line_not_blank(&self, line: &str) -> Result<(), ProviderClientError> {
         if line.trim().is_empty() {
             return Err(protocol_error_with_description(
                 HostErrorKind::MalformedLine,
                 &self.request_id,
-                format!(
-                    "launch JSONL line {} was blank or whitespace-only",
-                    self.line_number
-                ),
+                blank_line_description(self.line_number),
             ));
         }
+        Ok(())
+    }
+
+    fn validate_line_before_exit(&self, value: &Value) -> Result<(), ProviderClientError> {
         if self.exit.is_some() {
-            let value = parse_line(line, &self.request_id)?;
-            let kind = value.get("kind").and_then(Value::as_str);
-            let error_kind = if kind == Some("exit") {
-                HostErrorKind::DuplicateExit
-            } else {
-                HostErrorKind::EventAfterExit
-            };
-            return Err(protocol_error(error_kind, &self.request_id));
+            return Err(protocol_error(
+                post_exit_error_kind(value),
+                &self.request_id,
+            ));
         }
-        let value = parse_line(line, &self.request_id)?;
+        Ok(())
+    }
+
+    fn process_launch_event_value(&mut self, value: Value) -> Result<(), ProviderClientError> {
         let kind = event_kind(&value, &self.request_id)?;
         check_contract_and_request(
             &value,
@@ -587,6 +599,55 @@ fn retained_marker_cost(name: &str, value: &Value) -> usize {
     name.len() + value.to_string().len()
 }
 
+fn map_launch_read_error(error: std::io::Error, request_id: &str) -> ProviderClientError {
+    ProviderClientError::protocol(
+        HostErrorKind::MalformedLine,
+        "launch",
+        Some(request_id.to_owned()),
+        ProviderDiagnostics::with_description(error.to_string()),
+    )
+}
+
+fn normalize_line_bytes(line: &[u8]) -> &[u8] {
+    line.strip_suffix(b"\r").unwrap_or(line)
+}
+
+fn parse_line_utf8<'a>(line: &'a [u8], request_id: &str) -> Result<&'a str, ProviderClientError> {
+    std::str::from_utf8(line).map_err(|error| map_invalid_utf8_line_error(error, request_id))
+}
+
+fn map_invalid_utf8_line_error(
+    error: std::str::Utf8Error,
+    request_id: &str,
+) -> ProviderClientError {
+    ProviderClientError::protocol(
+        HostErrorKind::InvalidUtf8,
+        "launch",
+        Some(request_id.to_owned()),
+        ProviderDiagnostics::with_description(error.to_string()),
+    )
+}
+
+fn pending_line_limit_description(max_line_bytes: usize) -> String {
+    format!("launch JSONL line exceeded {max_line_bytes} bytes")
+}
+
+fn line_limit_description(line_number: usize, max_line_bytes: usize) -> String {
+    format!("launch JSONL line {line_number} exceeded {max_line_bytes} bytes")
+}
+
+fn blank_line_description(line_number: usize) -> String {
+    format!("launch JSONL line {line_number} was blank or whitespace-only")
+}
+
+fn post_exit_error_kind(value: &Value) -> HostErrorKind {
+    if value.get("kind").and_then(Value::as_str) == Some("exit") {
+        HostErrorKind::DuplicateExit
+    } else {
+        HostErrorKind::EventAfterExit
+    }
+}
+
 fn parse_line(line: &str, request_id: &str) -> Result<Value, ProviderClientError> {
     serde_json::from_str(line).map_err(|_| protocol_error(HostErrorKind::MalformedLine, request_id))
 }
@@ -618,8 +679,19 @@ fn validate_event_schema(
 }
 
 fn decode_event(value: Value, request_id: &str) -> Result<DecodedLaunchEvent, ProviderClientError> {
-    let event: LaunchEvent = serde_json::from_value(value)
-        .map_err(|_| protocol_error(HostErrorKind::SchemaInvalidEvent, request_id))?;
+    let event = parse_launch_event(value, request_id)?;
+    map_launch_event(event, request_id)
+}
+
+fn parse_launch_event(value: Value, request_id: &str) -> Result<LaunchEvent, ProviderClientError> {
+    serde_json::from_value(value)
+        .map_err(|_| protocol_error(HostErrorKind::SchemaInvalidEvent, request_id))
+}
+
+fn map_launch_event(
+    event: LaunchEvent,
+    request_id: &str,
+) -> Result<DecodedLaunchEvent, ProviderClientError> {
     match event {
         LaunchEvent::Stdout {
             seq, data_base64, ..

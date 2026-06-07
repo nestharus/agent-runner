@@ -8,6 +8,30 @@
 //! CLI script formatters, fixture model mappers, record accessors, JSON/record
 //! parsers, allowed-subcommand predicates, record-line/subcommand filters,
 //! envelope/row validators, and test orchestration.
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: src-tauri/tests/s10_external_provider_resume.rs
+//!     role: adapter
+//!     Translates:
+//!       - external-provider-runtime-cli-contract
+//!       - provider-launch-jsonl-contract
+//!       - invocation-state-db-contract
+//!       - session-resume-contract
+//!       - test-fixture-process-contract
+//! intrinsic_surface_declarations:
+//!   - component: src-tauri/tests/s10_external_provider_resume.rs
+//!     role: intrinsic-surface
+//!     Domain: external-provider launch/resume CLI regression suite
+//!     Owns:
+//!       - isolated config/data fixture materialization
+//!       - external provider Python script generation and executable setup
+//!       - launch/resume command invocation and environment isolation
+//!       - provider record parsing and subcommand filtering assertions
+//!       - invocation session/outcome database assertions
+//! ```
 
 mod age153_support;
 
@@ -321,7 +345,15 @@ fn parse_provider_records(text: &str) -> Vec<Value> {
 }
 
 fn provider_record_lines_with_content(text: &str) -> Vec<&str> {
+    filter_provider_record_lines(provider_record_lines(text))
+}
+
+fn provider_record_lines(text: &str) -> std::str::Lines<'_> {
     text.lines()
+}
+
+fn filter_provider_record_lines<'a>(lines: std::str::Lines<'a>) -> Vec<&'a str> {
+    lines
         .filter(|line| provider_record_line_has_content(line))
         .collect()
 }
@@ -631,65 +663,87 @@ def policy_evaluate():
 def emit(event):
     print(json.dumps(event, separators=(",", ":")))
 
-def launch():
-    payload = request.get("params", {{}}).get("model", {{}}).get("inputs", {{}}).get("prompt", "")
-    emit({{
+def launch_payload():
+    return request.get("params", {{}}).get("model", {{}}).get("inputs", {{}}).get("prompt", "")
+
+def launch_stdout_data(payload):
+    return base64.b64encode(("answer:" + payload + "\n").encode("utf-8")).decode("ascii")
+
+def launch_stdout_event(seq, payload):
+    return {{
         "contract": CONTRACT,
         "request_id": request_id(),
-        "seq": 1,
-        "time_unix_ms": 1001,
+        "seq": seq,
+        "time_unix_ms": 1000 + seq,
         "kind": "stdout",
-        "data_base64": base64.b64encode(("answer:" + payload + "\n").encode("utf-8")).decode("ascii"),
-    }})
-    if os.environ.get("S10_PROVIDER_ERROR_EXIT_ZERO") == "1":
-        emit({{
-            "contract": CONTRACT,
-            "request_id": request_id(),
-            "seq": 2,
-            "time_unix_ms": 1002,
-            "kind": "exit",
-            "status": {{"kind": "exited", "code": 0}},
-            "terminal_signal": {{
-                "kind": "unknown",
-                "evidence": {incident_terminal_reason},
-                "observed_at_unix_ms": 1002,
-            }},
-            "session": {{
-                {launch_session_key}: SESSION_ID,
-                "state": {{"cursor": "after-launch"}},
-            }},
-        }})
-        return
-    exit_seq = 2
-    if os.environ.get("S10_LAUNCH_LONG_STREAM") == "1":
-        detail = "h" * 4096
-        for seq in range(2, 702):
-            emit({{
-                "contract": CONTRACT,
-                "request_id": request_id(),
-                "seq": seq,
-                "time_unix_ms": 1000 + seq,
-                "kind": "heartbeat",
-                "detail": detail,
-            }})
-        exit_seq = 702
-    emit({{
+        "data_base64": launch_stdout_data(payload),
+    }}
+
+def launch_error_exit_requested():
+    return os.environ.get("S10_PROVIDER_ERROR_EXIT_ZERO") == "1"
+
+def launch_long_stream_requested():
+    return os.environ.get("S10_LAUNCH_LONG_STREAM") == "1"
+
+def launch_terminal_signal(kind, evidence, seq):
+    return {{
+        "kind": kind,
+        "evidence": evidence,
+        "observed_at_unix_ms": 1000 + seq,
+    }}
+
+def launch_session_state():
+    return {{
+        {launch_session_key}: SESSION_ID,
+        "state": {{"cursor": "after-launch"}},
+    }}
+
+def launch_exit_event(seq, terminal_signal):
+    return {{
         "contract": CONTRACT,
         "request_id": request_id(),
-        "seq": exit_seq,
-        "time_unix_ms": 1000 + exit_seq,
+        "seq": seq,
+        "time_unix_ms": 1000 + seq,
         "kind": "exit",
         "status": {{"kind": "exited", "code": 0}},
-        "terminal_signal": {{
-            "kind": "clean_exit",
-            "evidence": "fixture clean exit",
-            "observed_at_unix_ms": 1000 + exit_seq,
-        }},
-        "session": {{
-            {launch_session_key}: SESSION_ID,
-            "state": {{"cursor": "after-launch"}},
-        }},
-    }})
+        "terminal_signal": terminal_signal,
+        "session": launch_session_state(),
+    }}
+
+def provider_error_exit_event():
+    return launch_exit_event(2, launch_terminal_signal("unknown", {incident_terminal_reason}, 2))
+
+def clean_exit_event(seq):
+    return launch_exit_event(seq, launch_terminal_signal("clean_exit", "fixture clean exit", seq))
+
+def launch_heartbeat_detail():
+    return "h" * 4096
+
+def launch_heartbeat_event(seq, detail):
+    return {{
+        "contract": CONTRACT,
+        "request_id": request_id(),
+        "seq": seq,
+        "time_unix_ms": 1000 + seq,
+        "kind": "heartbeat",
+        "detail": detail,
+    }}
+
+def emit_long_launch_heartbeats():
+    detail = launch_heartbeat_detail()
+    for seq in range(2, 702):
+        emit(launch_heartbeat_event(seq, detail))
+
+def launch():
+    emit(launch_stdout_event(1, launch_payload()))
+    if launch_error_exit_requested():
+        emit(provider_error_exit_event())
+        return
+    exit_seq = 2
+    if launch_long_stream_requested():
+        emit_long_launch_heartbeats()
+        exit_seq = 702
+    emit(clean_exit_event(exit_seq))
 
 def read_turns():
     params = request.get("params", {{}})

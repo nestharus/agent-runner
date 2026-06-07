@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! Roles: orchestration, accessor, mapper, formatter, parser, predicate.
+//! Roles: orchestration, accessor, mapper, formatter, parser, predicate, validator.
 //!
 //! - orchestration: `main`, `dispatch_fake_provider_mode`, launch fixture
 //!   modes, S7C/S5 fixture flows, sleep/hang modes, and probe child/grandchild
@@ -19,6 +19,8 @@
 //!   parse minimal JSON/stdin and sidecar count state used by fixtures.
 //! - predicate: provider retryability, launch/describe/subcommand selectors,
 //!   stdin/probe env checks, and SIGTERM-ignore checks choose fixture branches.
+//! - validator: unknown-mode handling rejects unsupported fixture modes with a
+//!   stable diagnostic and exit code.
 //!
 //! ## Adapter declarations
 //!
@@ -825,19 +827,7 @@ fn sigterm_resistant_child_grandchild() -> i32 {
 }
 
 fn spawn_probe_child(ignore_sigterm: bool) -> i32 {
-    let current = env::current_exe().expect("current executable should be known");
-    let mut child_command = Command::new(current);
-    child_command
-        .env("FAKE_PROVIDER_MODE", "probe-child")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    if ignore_sigterm {
-        child_command.env("FAKE_PROVIDER_IGNORE_SIGTERM", "1");
-    }
-    if let Ok(probe_dir) = env::var("FAKE_PROVIDER_PROBE_DIR") {
-        child_command.env("FAKE_PROVIDER_PROBE_DIR", probe_dir);
-    }
+    let mut child_command = probe_child_command(ignore_sigterm);
     let mut child = child_command.spawn().expect("child should spawn");
     let _ = child.wait();
     sleep_forever()
@@ -846,19 +836,7 @@ fn spawn_probe_child(ignore_sigterm: bool) -> i32 {
 fn probe_child() -> i32 {
     maybe_ignore_sigterm();
     write_probe_pid("child");
-    let current = env::current_exe().expect("current executable should be known");
-    let mut command = Command::new(current);
-    command
-        .env("FAKE_PROVIDER_MODE", "probe-grandchild")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    if env::var_os("FAKE_PROVIDER_IGNORE_SIGTERM").is_some() {
-        command.env("FAKE_PROVIDER_IGNORE_SIGTERM", "1");
-    }
-    if let Ok(probe_dir) = env::var("FAKE_PROVIDER_PROBE_DIR") {
-        command.env("FAKE_PROVIDER_PROBE_DIR", probe_dir);
-    }
+    let mut command = probe_grandchild_command();
     let _grandchild = command.spawn().expect("grandchild should spawn");
     sleep_forever()
 }
@@ -870,9 +848,57 @@ fn probe_grandchild() -> i32 {
 }
 
 fn maybe_ignore_sigterm() {
-    if env::var_os("FAKE_PROVIDER_IGNORE_SIGTERM").is_some() {
+    if ignore_sigterm_requested() {
         ignore_sigterm();
     }
+}
+
+fn probe_child_command(ignore_sigterm: bool) -> Command {
+    let mut command = probe_process_command("probe-child");
+    apply_ignore_sigterm_env(&mut command, ignore_sigterm);
+    apply_probe_dir_env(&mut command, probe_dir_env());
+    command
+}
+
+fn probe_grandchild_command() -> Command {
+    let mut command = probe_process_command("probe-grandchild");
+    apply_ignore_sigterm_env(&mut command, ignore_sigterm_requested());
+    apply_probe_dir_env(&mut command, probe_dir_env());
+    command
+}
+
+fn probe_process_command(mode: &str) -> Command {
+    let mut command = Command::new(current_executable_path());
+    command
+        .env("FAKE_PROVIDER_MODE", mode)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+fn current_executable_path() -> std::path::PathBuf {
+    env::current_exe().expect("current executable should be known")
+}
+
+fn apply_ignore_sigterm_env(command: &mut Command, enabled: bool) {
+    if enabled {
+        command.env("FAKE_PROVIDER_IGNORE_SIGTERM", "1");
+    }
+}
+
+fn ignore_sigterm_requested() -> bool {
+    env::var_os("FAKE_PROVIDER_IGNORE_SIGTERM").is_some()
+}
+
+fn apply_probe_dir_env(command: &mut Command, probe_dir: Option<String>) {
+    if let Some(probe_dir) = probe_dir {
+        command.env("FAKE_PROVIDER_PROBE_DIR", probe_dir);
+    }
+}
+
+fn probe_dir_env() -> Option<String> {
+    env::var("FAKE_PROVIDER_PROBE_DIR").ok()
 }
 
 #[cfg(unix)]

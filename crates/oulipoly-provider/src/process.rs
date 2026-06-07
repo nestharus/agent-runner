@@ -5,19 +5,19 @@
 //! - orchestration: `ProcessRunner` starts provider subprocesses, drains
 //!   stdio on worker threads, supervises total-runtime or stdout-line-gap
 //!   liveness, and terminates/reaps process trees on timeout or cancellation.
-//! - mapper: `map_completed_process_outcome`, `map_termination_diagnostics`,
-//!   `host_process_error`, `process_status`, `exit_code`, and
+//! - mapper: `map_completed_process_outcome`, `termination_diagnostics_from_parts`,
+//!   `provider_process_command`, `host_process_error`, `process_status`, `exit_code`, and
 //!   `process_nonzero` translate OS process observations into provider DTOs
 //!   and diagnostics.
-//! - predicate: `timeout_expired`, `cancellation_requested`,
+//! - predicate: `chunk_metadata`, `timeout_expired`, `cancellation_requested`,
 //!   `cancellation_grace_expired`, `should_force_kill`, `is_executable`, and
 //!   byte-content predicates classify process and capture state.
 //! - accessor: `ByteLimit::bytes`, `ProcessCommand::argv`,
 //!   `ProcessOutcome::{argv, diagnostics}`, `CancellationToken::is_cancelled`,
 //!   and test-only stdout/stderr text accessors expose owned state.
-//! - filter: `capture_window`, `ByteAccumulator`, `ByteTailAccumulator`, and
-//!   `alive_descendants` retain bounded byte/process subsets from larger
-//!   streams or process sets.
+//! - filter: `capture_window`, `retain_prefix_chunk`, `retain_tail_chunk`,
+//!   `ByteAccumulator`, `ByteTailAccumulator`, and `alive_descendants` retain
+//!   bounded byte/process subsets from larger streams or process sets.
 //! - validator: embedded process-runner and byte-accumulator tests validate
 //!   pipe pressure, process-tree cleanup, cancellation, and truncation
 //!   contracts.
@@ -105,8 +105,16 @@ impl ByteAccumulator {
     }
 
     pub fn push(&mut self, chunk: &[u8]) {
-        self.contains_nul |= chunk_contains_nul(chunk);
-        self.contains_high_bit |= chunk_contains_high_bit(chunk);
+        self.record_chunk_metadata(chunk_metadata(chunk));
+        self.retain_prefix_chunk(chunk);
+    }
+
+    fn record_chunk_metadata(&mut self, metadata: ChunkMetadata) {
+        self.contains_nul |= metadata.contains_nul;
+        self.contains_high_bit |= metadata.contains_high_bit;
+    }
+
+    fn retain_prefix_chunk(&mut self, chunk: &[u8]) {
         let window = capture_window(self.limit, self.bytes.len(), chunk.len());
         self.bytes.extend_from_slice(&chunk[..window.captured_len]);
         self.discarded_len += window.discarded_len;
@@ -147,8 +155,16 @@ impl ByteTailAccumulator {
     }
 
     pub(crate) fn push(&mut self, chunk: &[u8]) {
-        self.contains_nul |= chunk_contains_nul(chunk);
-        self.contains_high_bit |= chunk_contains_high_bit(chunk);
+        self.record_chunk_metadata(chunk_metadata(chunk));
+        self.retain_tail_chunk(chunk);
+    }
+
+    fn record_chunk_metadata(&mut self, metadata: ChunkMetadata) {
+        self.contains_nul |= metadata.contains_nul;
+        self.contains_high_bit |= metadata.contains_high_bit;
+    }
+
+    fn retain_tail_chunk(&mut self, chunk: &[u8]) {
         if self.limit.bytes == 0 {
             self.discarded_len += chunk.len();
             return;
@@ -219,9 +235,21 @@ impl StdoutProcessor for ByteCaptureProcessor {
     }
 }
 
+struct ChunkMetadata {
+    contains_nul: bool,
+    contains_high_bit: bool,
+}
+
 struct CaptureWindow {
     captured_len: usize,
     discarded_len: usize,
+}
+
+fn chunk_metadata(chunk: &[u8]) -> ChunkMetadata {
+    ChunkMetadata {
+        contains_nul: chunk_contains_nul(chunk),
+        contains_high_bit: chunk_contains_high_bit(chunk),
+    }
 }
 
 fn chunk_contains_nul(chunk: &[u8]) -> bool {
@@ -601,6 +629,17 @@ where
     K: AsRef<OsStr>,
     V: AsRef<OsStr>,
 {
+    let mut process = provider_process_command(command, envs);
+    configure_provider_process(&mut process);
+    process
+}
+
+fn provider_process_command<I, K, V>(command: &ProcessCommand, envs: I) -> Command
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<OsStr>,
+    V: AsRef<OsStr>,
+{
     let mut process = Command::new(&command.program);
     process
         .args(&command.args)
@@ -610,8 +649,11 @@ where
     for (key, value) in envs {
         process.env(key, value);
     }
-    configure_process_group(&mut process);
     process
+}
+
+fn configure_provider_process(process: &mut Command) {
+    configure_process_group(process);
 }
 
 fn start_process_threads<P: StdoutProcessor>(
@@ -747,10 +789,40 @@ fn map_termination_diagnostics<T: StdoutDrainOutput>(
     terminated: TerminatedProcess,
     host_cancellation_requested: bool,
 ) -> ProviderDiagnostics {
-    let _stdin_closed_early = join_stdin(threads.stdin);
-    let mut diagnostics = ProviderDiagnostics {
-        stdout: join_stdout(threads.stdout).captured_bytes(),
+    let joined = join_process_threads(threads);
+    termination_diagnostics_from_parts(
+        terminated,
+        host_cancellation_requested,
+        joined.stdout.captured_bytes(),
+        joined.stderr,
+    )
+}
+
+struct JoinedProcessThreads<T: StdoutDrainOutput> {
+    stdout: T,
+    stderr: CapturedBytes,
+    _stdin_closed_early: bool,
+}
+
+fn join_process_threads<T: StdoutDrainOutput>(
+    threads: ProcessThreads<T>,
+) -> JoinedProcessThreads<T> {
+    JoinedProcessThreads {
+        stdout: join_stdout(threads.stdout),
         stderr: join_capture(threads.stderr),
+        _stdin_closed_early: join_stdin(threads.stdin),
+    }
+}
+
+fn termination_diagnostics_from_parts(
+    terminated: TerminatedProcess,
+    host_cancellation_requested: bool,
+    stdout: CapturedBytes,
+    stderr: CapturedBytes,
+) -> ProviderDiagnostics {
+    let mut diagnostics = ProviderDiagnostics {
+        stdout,
+        stderr,
         process_was_force_killed: terminated.force_killed,
         process_was_reaped: terminated.status.is_some(),
         host_cancellation_requested,
@@ -813,25 +885,34 @@ fn notify_stdout_line_activity(activity: &Option<Sender<Instant>>, chunk: &[u8])
 }
 
 fn write_stdin(mut stdin: impl Write, bytes: Vec<u8>) -> bool {
+    match write_stdin_bytes(&mut stdin, &bytes) {
+        Ok(()) => stdin_flush_closed_early(&mut stdin),
+        Err(error) => stdin_error_closed_early(&error),
+    }
+}
+
+fn write_stdin_bytes(stdin: &mut impl Write, bytes: &[u8]) -> std::io::Result<()> {
     for (index, byte) in bytes.iter().enumerate() {
-        if let Err(error) = stdin.write_all(std::slice::from_ref(byte)) {
-            return stdin_write_closed_early(&error);
-        }
+        stdin.write_all(std::slice::from_ref(byte))?;
         if index == 0 {
             thread::sleep(Duration::from_millis(10));
         }
     }
-    stdin_flush_closed_early(&mut stdin)
+    Ok(())
 }
 
 fn stdin_flush_closed_early(stdin: &mut impl Write) -> bool {
-    match stdin.flush() {
+    match flush_stdin(stdin) {
         Ok(()) => false,
-        Err(error) => stdin_write_closed_early(&error),
+        Err(error) => stdin_error_closed_early(&error),
     }
 }
 
-fn stdin_write_closed_early(error: &std::io::Error) -> bool {
+fn flush_stdin(stdin: &mut impl Write) -> std::io::Result<()> {
+    stdin.flush()
+}
+
+fn stdin_error_closed_early(error: &std::io::Error) -> bool {
     error.kind() == ErrorKind::BrokenPipe || error.kind() == ErrorKind::WouldBlock
 }
 

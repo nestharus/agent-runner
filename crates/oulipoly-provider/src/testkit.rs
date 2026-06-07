@@ -10,15 +10,16 @@
 //! - mapper: `FakeProviderMode::{env, env_with_probe, env_with_record, as_str}`,
 //!   `normalize_envs`, and `record_env` map typed fixture modes and env inputs
 //!   onto subprocess environment vectors.
-//! - accessor: `FakeProvider::{path, is_executable, was_spawned}` and
-//!   `LeakProbe::observed_pids` expose fixture paths, marker state, and
-//!   descendant process observations.
+//! - accessor: `FakeProvider::{path, is_executable, was_spawned}`,
+//!   `read_probe_dir`, and `probe_marker_text` expose fixture paths, marker
+//!   state, and descendant process observations.
 //! - predicate: `is_executable`, `process_alive`, and cleanup assertion helpers
 //!   classify filesystem/process liveness state.
-//! - parser: `LeakProbe::observed_pids` parses pid marker files emitted by the
-//!   fake-provider process-tree fixtures.
-//! - filter: `alive_descendants` selects still-running descendant pids from
-//!   observed probe records.
+//! - parser: `parse_probe_pid` and `parse_probe_pid_texts` parse pid marker
+//!   files emitted by the fake-provider process-tree fixtures.
+//! - filter: `collect_readable_probe_entries`, `filter_probe_marker_texts`,
+//!   `filter_parsed_probe_pids`, and `alive_descendants` select readable marker
+//!   files, valid pid records, and still-running descendant pids.
 //! - validator: `assert_fake_provider_compiled`, `assert_descendants_observed`,
 //!   and `assert_descendants_cleaned` validate fixture compilation and leak
 //!   cleanup preconditions/results.
@@ -400,15 +401,45 @@ impl LeakProbe {
     }
 
     fn observed_pids(&self) -> Vec<u32> {
-        let Ok(entries) = fs::read_dir(&self.root) else {
-            return Vec::new();
-        };
-        entries
-            .filter_map(Result::ok)
-            .filter_map(|entry| fs::read_to_string(entry.path()).ok())
-            .filter_map(|text| text.trim().parse::<u32>().ok())
-            .collect()
+        let entries = collect_readable_probe_entries(read_probe_dir(&self.root));
+        let marker_texts = filter_probe_marker_texts(entries);
+        filter_parsed_probe_pids(parse_probe_pid_texts(marker_texts))
     }
+}
+
+fn read_probe_dir(root: &Path) -> Option<fs::ReadDir> {
+    fs::read_dir(root).ok()
+}
+
+fn collect_readable_probe_entries(entries: Option<fs::ReadDir>) -> Vec<fs::DirEntry> {
+    entries
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .collect()
+}
+
+fn filter_probe_marker_texts(entries: Vec<fs::DirEntry>) -> Vec<String> {
+    entries.into_iter().filter_map(probe_marker_text).collect()
+}
+
+fn probe_marker_text(entry: fs::DirEntry) -> Option<String> {
+    fs::read_to_string(entry.path()).ok()
+}
+
+fn parse_probe_pid_texts(texts: Vec<String>) -> Vec<Option<u32>> {
+    texts
+        .into_iter()
+        .map(|text| parse_probe_pid(&text))
+        .collect()
+}
+
+fn filter_parsed_probe_pids(pids: Vec<Option<u32>>) -> Vec<u32> {
+    pids.into_iter().flatten().collect()
+}
+
+fn parse_probe_pid(text: &str) -> Option<u32> {
+    text.trim().parse::<u32>().ok()
 }
 
 fn ensure_record_parent(record: &Path) {

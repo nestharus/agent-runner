@@ -11,7 +11,8 @@
 //!   protocol invariants before mapping outcomes.
 //! - parser: `parse_one_stdout_object`, `parse_stdout_utf8`, and
 //!   `parse_stdout_json_value` parse one non-launch provider stdout envelope.
-//! - mapper: `map_json_invocation_outcome`, the `map_*_error` helpers,
+//! - mapper: `map_json_invocation_outcome`, `map_valid_json_success_outcome`,
+//!   `map_valid_json_provider_error_outcome`, the `map_*_error` helpers,
 //!   `process_limits_for`, `process_command_from_resolved`,
 //!   `launch_diagnostics`, and `parse_launch_output` translate process,
 //!   schema, and stream outcomes into provider-client results/errors.
@@ -546,6 +547,15 @@ fn map_json_success_outcome(
     request_id: &Option<String>,
 ) -> Result<Value, ProviderClientError> {
     validate_json_success_envelope(registry, subcommand, &envelope, &diagnostics, request_id)?;
+    map_valid_json_success_outcome(subcommand, envelope, outcome, diagnostics)
+}
+
+fn map_valid_json_success_outcome(
+    subcommand: &str,
+    envelope: Value,
+    outcome: &ProcessOutcome,
+    diagnostics: ProviderDiagnostics,
+) -> Result<Value, ProviderClientError> {
     if success_envelope_has_nonzero_process(outcome) {
         return Err(ProviderClientError::host_transport(
             HostErrorKind::ProviderProcessNonzeroWithSuccess,
@@ -566,14 +576,33 @@ fn map_json_provider_error_outcome(
     request_id: &Option<String>,
 ) -> Result<Value, ProviderClientError> {
     validate_json_error_envelope(registry, subcommand, &envelope, &diagnostics, request_id)?;
-    Err(ProviderClientError::from_capability(
-        ProviderCapabilityError::from_valid_envelope(
-            subcommand,
-            envelope,
-            diagnostics,
-            Some(outcome.status),
-        )?,
+    let error = map_valid_json_provider_error_outcome(subcommand, envelope, outcome, diagnostics)?;
+    Err(error)
+}
+
+fn map_valid_json_provider_error_outcome(
+    subcommand: &str,
+    envelope: Value,
+    outcome: ProcessOutcome,
+    diagnostics: ProviderDiagnostics,
+) -> Result<ProviderClientError, ProviderClientError> {
+    Ok(ProviderClientError::from_capability(
+        valid_provider_capability_error(subcommand, envelope, outcome, diagnostics)?,
     ))
+}
+
+fn valid_provider_capability_error(
+    subcommand: &str,
+    envelope: Value,
+    outcome: ProcessOutcome,
+    diagnostics: ProviderDiagnostics,
+) -> Result<ProviderCapabilityError, ProviderClientError> {
+    ProviderCapabilityError::from_valid_envelope(
+        subcommand,
+        envelope,
+        diagnostics,
+        Some(outcome.status),
+    )
 }
 
 fn validate_json_success_envelope(
