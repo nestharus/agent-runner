@@ -783,7 +783,8 @@ fn parse_one_stdout_object(
     diagnostics: &ProviderDiagnostics,
     fallback_request_id: Option<String>,
 ) -> Result<Value, ProviderClientError> {
-    let text = parse_stdout_utf8(subcommand, bytes, diagnostics, &fallback_request_id)?;
+    validate_stdout_not_empty(subcommand, bytes, diagnostics, &fallback_request_id)?;
+    let text = map_stdout_utf8_result(parse_stdout_utf8(bytes), subcommand, &fallback_request_id)?;
     let trimmed = validate_stdout_prefix(subcommand, text, diagnostics, &fallback_request_id)?;
     let parsed = parse_stdout_json_value(subcommand, trimmed, diagnostics, &fallback_request_id)?;
     validate_stdout_object_shape(
@@ -800,12 +801,14 @@ struct ParsedStdoutJson {
     byte_offset: usize,
 }
 
-fn parse_stdout_utf8<'a>(
+type StdoutJsonStream<'a> = serde_json::StreamDeserializer<'a, serde_json::de::StrRead<'a>, Value>;
+
+fn validate_stdout_not_empty(
     subcommand: &str,
-    bytes: &'a [u8],
+    bytes: &[u8],
     diagnostics: &ProviderDiagnostics,
     fallback_request_id: &Option<String>,
-) -> Result<&'a str, ProviderClientError> {
+) -> Result<(), ProviderClientError> {
     if bytes.is_empty() {
         return Err(stdout_protocol_error(
             HostErrorKind::EmptyStdout,
@@ -814,7 +817,19 @@ fn parse_stdout_utf8<'a>(
             diagnostics,
         ));
     }
-    std::str::from_utf8(bytes).map_err(|error| {
+    Ok(())
+}
+
+fn parse_stdout_utf8(bytes: &[u8]) -> Result<&str, std::str::Utf8Error> {
+    std::str::from_utf8(bytes)
+}
+
+fn map_stdout_utf8_result<'a>(
+    result: Result<&'a str, std::str::Utf8Error>,
+    subcommand: &str,
+    fallback_request_id: &Option<String>,
+) -> Result<&'a str, ProviderClientError> {
+    result.map_err(|error| {
         stdout_protocol_error_with_description(
             HostErrorKind::InvalidUtf8,
             subcommand,
@@ -848,27 +863,61 @@ fn parse_stdout_json_value(
     diagnostics: &ProviderDiagnostics,
     fallback_request_id: &Option<String>,
 ) -> Result<ParsedStdoutJson, ProviderClientError> {
-    let mut stream = serde_json::Deserializer::from_str(trimmed).into_iter::<Value>();
-    let Some(first) = stream.next() else {
-        return Err(stdout_protocol_error(
+    let mut stream = parse_stdout_json_stream(trimmed);
+    let first = validate_stdout_json_present(
+        next_stdout_json_value(&mut stream),
+        subcommand,
+        diagnostics,
+        fallback_request_id,
+    )?;
+    let value = map_stdout_json_parse_result(first, subcommand, diagnostics, fallback_request_id)?;
+    Ok(parsed_stdout_json(value, stream.byte_offset()))
+}
+
+fn parse_stdout_json_stream(trimmed: &str) -> StdoutJsonStream<'_> {
+    serde_json::Deserializer::from_str(trimmed).into_iter::<Value>()
+}
+
+fn next_stdout_json_value(
+    stream: &mut StdoutJsonStream<'_>,
+) -> Option<Result<Value, serde_json::Error>> {
+    stream.next()
+}
+
+fn validate_stdout_json_present(
+    first: Option<Result<Value, serde_json::Error>>,
+    subcommand: &str,
+    diagnostics: &ProviderDiagnostics,
+    fallback_request_id: &Option<String>,
+) -> Result<Result<Value, serde_json::Error>, ProviderClientError> {
+    first.ok_or_else(|| {
+        stdout_protocol_error(
             HostErrorKind::EmptyStdout,
             subcommand,
             fallback_request_id.clone(),
             diagnostics,
-        ));
-    };
-    let value = first.map_err(|_| {
+        )
+    })
+}
+
+fn map_stdout_json_parse_result(
+    first: Result<Value, serde_json::Error>,
+    subcommand: &str,
+    diagnostics: &ProviderDiagnostics,
+    fallback_request_id: &Option<String>,
+) -> Result<Value, ProviderClientError> {
+    first.map_err(|_| {
         stdout_protocol_error(
             HostErrorKind::InvalidJson,
             subcommand,
             fallback_request_id.clone(),
             diagnostics,
         )
-    })?;
-    Ok(ParsedStdoutJson {
-        value,
-        byte_offset: stream.byte_offset(),
     })
+}
+
+fn parsed_stdout_json(value: Value, byte_offset: usize) -> ParsedStdoutJson {
+    ParsedStdoutJson { value, byte_offset }
 }
 
 fn validate_stdout_object_shape(

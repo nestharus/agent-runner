@@ -879,7 +879,15 @@ fn notify_stdout_line_activity(activity: &Option<Sender<Instant>>, chunk: &[u8])
     let Some(activity) = activity else {
         return;
     };
-    for _ in chunk.iter().filter(|byte| **byte == b'\n') {
+    send_stdout_line_activity(activity, stdout_line_count(chunk));
+}
+
+fn stdout_line_count(chunk: &[u8]) -> usize {
+    chunk.iter().filter(|byte| **byte == b'\n').count()
+}
+
+fn send_stdout_line_activity(activity: &Sender<Instant>, count: usize) {
+    for _ in 0..count {
         let _ = activity.send(Instant::now());
     }
 }

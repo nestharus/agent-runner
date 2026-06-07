@@ -87,6 +87,28 @@ pub enum DecodedLaunchEvent {
     Exit(LaunchExit),
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum LaunchEventWithDecodedPayloads {
+    Stdout {
+        seq: u64,
+        data: Vec<u8>,
+    },
+    Stderr {
+        seq: u64,
+        data: Vec<u8>,
+    },
+    Marker {
+        seq: u64,
+        name: String,
+        value: Value,
+    },
+    Heartbeat {
+        seq: u64,
+        detail: Option<String>,
+    },
+    Exit(LaunchExit),
+}
+
 impl DecodedLaunchEvent {
     pub fn seq(&self) -> u64 {
         match self {
@@ -162,13 +184,20 @@ pub struct LaunchStreamLimits {
 
 impl LaunchStreamLimits {
     pub fn bounded_by(bytes: usize) -> Self {
-        let bytes = bytes.max(1);
-        Self {
-            retained_events: DEFAULT_RETAINED_LAUNCH_EVENTS,
-            retained_event_bytes: bytes,
-            retained_output_bytes: bytes,
-            max_line_bytes: bytes,
-        }
+        launch_stream_limits_for_bytes(normalize_launch_stream_limit_bytes(bytes))
+    }
+}
+
+fn normalize_launch_stream_limit_bytes(bytes: usize) -> usize {
+    bytes.max(1)
+}
+
+fn launch_stream_limits_for_bytes(bytes: usize) -> LaunchStreamLimits {
+    LaunchStreamLimits {
+        retained_events: DEFAULT_RETAINED_LAUNCH_EVENTS,
+        retained_event_bytes: bytes,
+        retained_output_bytes: bytes,
+        max_line_bytes: bytes,
     }
 }
 
@@ -337,12 +366,15 @@ impl LaunchStreamParser {
 
     fn push(&mut self, chunk: &[u8]) -> Result<(), ProviderClientError> {
         self.pending_line.extend_from_slice(chunk);
-        while let Some(newline) = self.pending_line.iter().position(|byte| *byte == b'\n') {
-            let mut line = self.pending_line.drain(..=newline).collect::<Vec<_>>();
-            line.pop();
+        while let Some(line) = self.next_pending_line() {
             self.process_line_bytes(&line)?;
         }
         self.ensure_pending_line_within_limit()
+    }
+
+    fn next_pending_line(&mut self) -> Option<Vec<u8>> {
+        let newline = pending_line_newline_index(&self.pending_line)?;
+        Some(take_pending_line(&mut self.pending_line, newline))
     }
 
     fn finish(mut self) -> Result<LaunchResult, ProviderClientError> {
@@ -447,24 +479,22 @@ impl LaunchStreamParser {
     }
 
     fn process_launch_event_value(&mut self, value: Value) -> Result<(), ProviderClientError> {
-        let kind = event_kind(&value, &self.request_id)?;
+        self.validate_launch_event_value(&value)?;
+        let decoded = decode_event(value, &self.request_id)?;
+        self.record_launch_event(decoded);
+        Ok(())
+    }
+
+    fn validate_launch_event_value(&mut self, value: &Value) -> Result<(), ProviderClientError> {
+        let kind = event_kind(value, &self.request_id)?;
         check_contract_and_request(
-            &value,
+            value,
             &self.request_id,
             "launch",
             ProviderDiagnostics::default(),
         )?;
-        validate_event_schema(&self.registry, kind, &value, &self.request_id)?;
-        self.validate_sequence(&value)?;
-
-        let decoded = decode_event(value, &self.request_id)?;
-        self.record_decoded_bytes(&decoded);
-        self.record_marker(&decoded);
-        if let DecodedLaunchEvent::Exit(decoded_exit) = &decoded {
-            self.exit = Some(decoded_exit.clone());
-        }
-        self.retention.push(decoded);
-        Ok(())
+        validate_event_schema(&self.registry, kind, value, &self.request_id)?;
+        self.validate_sequence(value)
     }
 
     fn validate_sequence(&mut self, value: &Value) -> Result<(), ProviderClientError> {
@@ -509,6 +539,20 @@ impl LaunchStreamParser {
             return;
         };
         self.markers.push(name, value);
+    }
+
+    fn record_launch_event(&mut self, decoded: DecodedLaunchEvent) {
+        self.record_decoded_bytes(&decoded);
+        self.record_marker(&decoded);
+        self.record_exit(&decoded);
+        self.retention.push(decoded);
+    }
+
+    fn record_exit(&mut self, event: &DecodedLaunchEvent) {
+        let DecodedLaunchEvent::Exit(decoded_exit) = event else {
+            return;
+        };
+        self.exit = Some(decoded_exit.clone());
     }
 }
 
@@ -612,6 +656,20 @@ fn normalize_line_bytes(line: &[u8]) -> &[u8] {
     line.strip_suffix(b"\r").unwrap_or(line)
 }
 
+fn pending_line_newline_index(pending_line: &[u8]) -> Option<usize> {
+    pending_line.iter().position(|byte| *byte == b'\n')
+}
+
+fn take_pending_line(pending_line: &mut Vec<u8>, newline: usize) -> Vec<u8> {
+    let mut line = pending_line.drain(..=newline).collect::<Vec<_>>();
+    remove_line_terminator(&mut line);
+    line
+}
+
+fn remove_line_terminator(line: &mut Vec<u8>) {
+    line.pop();
+}
+
 fn parse_line_utf8<'a>(line: &'a [u8], request_id: &str) -> Result<&'a str, ProviderClientError> {
     std::str::from_utf8(line).map_err(|error| map_invalid_utf8_line_error(error, request_id))
 }
@@ -680,7 +738,8 @@ fn validate_event_schema(
 
 fn decode_event(value: Value, request_id: &str) -> Result<DecodedLaunchEvent, ProviderClientError> {
     let event = parse_launch_event(value, request_id)?;
-    map_launch_event(event, request_id)
+    let event = decode_launch_event_payloads(event, request_id)?;
+    Ok(map_launch_event(event))
 }
 
 fn parse_launch_event(value: Value, request_id: &str) -> Result<LaunchEvent, ProviderClientError> {
@@ -688,28 +747,28 @@ fn parse_launch_event(value: Value, request_id: &str) -> Result<LaunchEvent, Pro
         .map_err(|_| protocol_error(HostErrorKind::SchemaInvalidEvent, request_id))
 }
 
-fn map_launch_event(
+fn decode_launch_event_payloads(
     event: LaunchEvent,
     request_id: &str,
-) -> Result<DecodedLaunchEvent, ProviderClientError> {
+) -> Result<LaunchEventWithDecodedPayloads, ProviderClientError> {
     match event {
         LaunchEvent::Stdout {
             seq, data_base64, ..
-        } => Ok(DecodedLaunchEvent::Stdout {
+        } => Ok(LaunchEventWithDecodedPayloads::Stdout {
             seq,
             data: decode_base64(&data_base64, request_id)?,
         }),
         LaunchEvent::Stderr {
             seq, data_base64, ..
-        } => Ok(DecodedLaunchEvent::Stderr {
+        } => Ok(LaunchEventWithDecodedPayloads::Stderr {
             seq,
             data: decode_base64(&data_base64, request_id)?,
         }),
         LaunchEvent::Marker {
             seq, name, value, ..
-        } => Ok(DecodedLaunchEvent::Marker { seq, name, value }),
+        } => Ok(LaunchEventWithDecodedPayloads::Marker { seq, name, value }),
         LaunchEvent::Heartbeat { seq, detail, .. } => {
-            Ok(DecodedLaunchEvent::Heartbeat { seq, detail })
+            Ok(LaunchEventWithDecodedPayloads::Heartbeat { seq, detail })
         }
         LaunchEvent::Exit {
             seq,
@@ -717,12 +776,30 @@ fn map_launch_event(
             terminal_signal,
             session,
             ..
-        } => Ok(DecodedLaunchEvent::Exit(LaunchExit {
+        } => Ok(LaunchEventWithDecodedPayloads::Exit(LaunchExit {
             seq,
             status,
             terminal_signal,
             session,
         })),
+    }
+}
+
+fn map_launch_event(event: LaunchEventWithDecodedPayloads) -> DecodedLaunchEvent {
+    match event {
+        LaunchEventWithDecodedPayloads::Stdout { seq, data } => {
+            DecodedLaunchEvent::Stdout { seq, data }
+        }
+        LaunchEventWithDecodedPayloads::Stderr { seq, data } => {
+            DecodedLaunchEvent::Stderr { seq, data }
+        }
+        LaunchEventWithDecodedPayloads::Marker { seq, name, value } => {
+            DecodedLaunchEvent::Marker { seq, name, value }
+        }
+        LaunchEventWithDecodedPayloads::Heartbeat { seq, detail } => {
+            DecodedLaunchEvent::Heartbeat { seq, detail }
+        }
+        LaunchEventWithDecodedPayloads::Exit(exit) => DecodedLaunchEvent::Exit(exit),
     }
 }
 

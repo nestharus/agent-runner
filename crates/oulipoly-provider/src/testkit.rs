@@ -67,7 +67,7 @@ impl FakeProvider {
     pub fn compile(source: impl AsRef<Path>) -> Self {
         let root = create_fixture_root("fake-provider");
         let binary = compile_fake_provider_binary(&root, source.as_ref());
-        let marker = root.join("spawned.marker");
+        let marker = marker_path(&root);
         let path = wrapper_path(&root, &binary, &marker);
         fake_provider_fixture(root, path, marker)
     }
@@ -131,12 +131,26 @@ fn compile_fake_provider_binary(root: &Path, source: &Path) -> PathBuf {
     binary
 }
 
+fn marker_path(root: &Path) -> PathBuf {
+    root.join("spawned.marker")
+}
+
 fn run_rustc_fake_provider(source: &Path, binary: &Path) -> ExitStatus {
-    Command::new("rustc")
+    run_rustc_command(rustc_fake_provider_command(source, binary))
+}
+
+fn rustc_fake_provider_command(source: &Path, binary: &Path) -> Command {
+    let mut command = Command::new("rustc");
+    command
         .arg("--edition=2024")
         .arg(source)
         .arg("-o")
-        .arg(binary)
+        .arg(binary);
+    command
+}
+
+fn run_rustc_command(mut command: Command) -> ExitStatus {
+    command
         .status()
         .expect("rustc should run for fake-provider fixture")
 }
@@ -294,15 +308,11 @@ impl FakeProviderMode {
 
     pub fn env_with_probe(self, probe: &LeakProbe) -> Vec<(String, String)> {
         let mut env = self.env();
-        env.push((
-            "FAKE_PROVIDER_PROBE_DIR".to_owned(),
-            probe.root.display().to_string(),
-        ));
+        env.push(probe_dir_env_pair(probe_dir_env_value(&probe.root)));
         env
     }
 
     pub fn env_with_record(self, record: &Path) -> Vec<(String, OsString)> {
-        ensure_record_parent(record);
         record_env(self, record)
     }
 
@@ -374,17 +384,19 @@ impl LeakProbe {
     }
 
     pub fn wait_for_descendants(&self) {
+        assert_descendant_wait_observed(self.wait_for_descendant_observation());
+    }
+
+    fn wait_for_descendant_observation(&self) -> Vec<u32> {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while std::time::Instant::now() < deadline {
-            if self.observed_pids().len() >= 2 {
-                return;
+            let pids = self.observed_pids();
+            if descendant_observation_ready(&pids) {
+                return pids;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        panic!(
-            "expected fake provider to report at least two descendant pids, observed {:?}",
-            self.observed_pids()
-        );
+        self.observed_pids()
     }
 
     pub fn terminate_process_tree(&self, child: &mut Child) {
@@ -442,12 +454,6 @@ fn parse_probe_pid(text: &str) -> Option<u32> {
     text.trim().parse::<u32>().ok()
 }
 
-fn ensure_record_parent(record: &Path) {
-    if let Some(parent) = record.parent() {
-        fs::create_dir_all(parent).expect("record directory should be created");
-    }
-}
-
 fn record_env(mode: FakeProviderMode, record: &Path) -> Vec<(String, OsString)> {
     vec![
         (
@@ -463,6 +469,25 @@ fn record_env(mode: FakeProviderMode, record: &Path) -> Vec<(String, OsString)> 
 
 fn leak_probe(root: PathBuf) -> LeakProbe {
     LeakProbe { root }
+}
+
+fn probe_dir_env_value(root: &Path) -> String {
+    root.display().to_string()
+}
+
+fn probe_dir_env_pair(value: String) -> (String, String) {
+    ("FAKE_PROVIDER_PROBE_DIR".to_owned(), value)
+}
+
+fn descendant_observation_ready(pids: &[u32]) -> bool {
+    pids.len() >= 2
+}
+
+fn assert_descendant_wait_observed(pids: Vec<u32>) {
+    assert!(
+        descendant_observation_ready(&pids),
+        "expected fake provider to report at least two descendant pids, observed {pids:?}"
+    );
 }
 
 fn assert_descendants_observed(pids: &[u32]) {
@@ -545,7 +570,7 @@ fn retry_spawn(mut build: impl FnMut() -> Command) -> std::io::Result<Child> {
     for _ in 0..10 {
         match build().spawn() {
             Ok(child) => return Ok(child),
-            Err(error) if error.raw_os_error() == Some(26) => {
+            Err(error) if executable_busy_error(&error) => {
                 last_error = Some(error);
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -555,6 +580,10 @@ fn retry_spawn(mut build: impl FnMut() -> Command) -> std::io::Result<Child> {
     Err(last_error.expect("retry loop should retain last executable-busy error"))
 }
 
+fn executable_busy_error(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(26)
+}
+
 #[cfg(unix)]
 fn process_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
@@ -562,16 +591,38 @@ fn process_alive(pid: u32) -> bool {
 
 #[cfg(windows)]
 fn process_alive(pid: u32) -> bool {
-    Command::new("cmd")
-        .args([
-            "/C",
-            &format!("tasklist /FI \"PID eq {pid}\" | findstr {pid}"),
-        ])
+    tasklist_status_found(run_tasklist_pid_filter(tasklist_pid_command(pid)))
+}
+
+#[cfg(windows)]
+fn tasklist_pid_command(pid: u32) -> Command {
+    let mut command = Command::new("cmd");
+    command
+        .arg("/C")
+        .arg(tasklist_pid_filter(pid))
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+        .stderr(Stdio::null());
+    command
+}
+
+#[cfg(windows)]
+fn tasklist_pid_filter(pid: u32) -> String {
+    format!("tasklist /FI \"PID eq {pid}\" | findstr {pid}")
+}
+
+#[cfg(windows)]
+fn run_tasklist_pid_filter(mut command: Command) -> Option<ExitStatus> {
+    command.status().ok()
+}
+
+#[cfg(windows)]
+fn tasklist_status_found(status: Option<ExitStatus>) -> bool {
+    status.map(exit_status_success).unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn exit_status_success(status: ExitStatus) -> bool {
+    status.success()
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -598,10 +649,20 @@ fn terminate_pid(_pid: u32) {}
 
 #[cfg(unix)]
 fn wrapper_path(root: &Path, binary: &Path, marker: &Path) -> PathBuf {
-    let wrapper = root.join("fake-provider");
-    write_wrapper_script(&wrapper, &wrapper_script(binary, marker));
-    make_wrapper_executable(&wrapper);
+    let wrapper = fake_provider_wrapper_path(root);
+    materialize_wrapper(&wrapper, binary, marker);
     wrapper
+}
+
+#[cfg(unix)]
+fn fake_provider_wrapper_path(root: &Path) -> PathBuf {
+    root.join("fake-provider")
+}
+
+#[cfg(unix)]
+fn materialize_wrapper(wrapper: &Path, binary: &Path, marker: &Path) {
+    write_wrapper_script(wrapper, &wrapper_script(binary, marker));
+    make_wrapper_executable(wrapper);
 }
 
 #[cfg(unix)]
@@ -652,13 +713,31 @@ fn terminate_process_tree(child: &mut Child) {
 fn configure_test_process_group(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     unsafe {
-        command.pre_exec(|| {
-            if libc::setpgid(0, 0) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+        command.pre_exec(configure_child_process_group);
     }
+}
+
+#[cfg(unix)]
+fn configure_child_process_group() -> std::io::Result<()> {
+    validate_setpgid_result(set_current_process_group())
+}
+
+#[cfg(unix)]
+fn set_current_process_group() -> i32 {
+    unsafe { libc::setpgid(0, 0) }
+}
+
+#[cfg(unix)]
+fn validate_setpgid_result(result: i32) -> std::io::Result<()> {
+    if setpgid_failed(result) {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn setpgid_failed(result: i32) -> bool {
+    result != 0
 }
 
 #[cfg(not(unix))]

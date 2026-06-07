@@ -265,11 +265,19 @@ fn record_current_invocation() -> InvocationRecord {
 }
 
 fn current_invocation_record() -> InvocationRecord {
-    InvocationRecord {
-        path: env::var("FAKE_PROVIDER_RECORD_PATH").expect("record path should be set"),
-        argv: env::args().collect(),
-        stdin: read_stdin_to_string(),
-    }
+    invocation_record_from_parts(record_path_env(), current_argv(), read_stdin_to_string())
+}
+
+fn record_path_env() -> String {
+    env::var("FAKE_PROVIDER_RECORD_PATH").expect("record path should be set")
+}
+
+fn current_argv() -> Vec<String> {
+    env::args().collect()
+}
+
+fn invocation_record_from_parts(path: String, argv: Vec<String>, stdin: String) -> InvocationRecord {
+    InvocationRecord { path, argv, stdin }
 }
 
 fn format_invocation_record(record: &InvocationRecord) -> String {
@@ -300,11 +308,7 @@ fn invocation_record_if_requested(stdin: &str) -> Option<InvocationRecord> {
 }
 
 fn invocation_record(path: String, stdin: &str) -> InvocationRecord {
-    InvocationRecord {
-        path,
-        argv: env::args().collect(),
-        stdin: stdin.to_string(),
-    }
+    invocation_record_from_parts(path, current_argv(), stdin.to_string())
 }
 
 fn increment_count_if_requested() {
@@ -319,10 +323,15 @@ fn count_path_if_requested() -> Option<String> {
 }
 
 fn read_count(path: &str) -> u64 {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|text| parse_count(&text))
-        .unwrap_or(0)
+    parse_count_text(read_count_text(path)).unwrap_or(0)
+}
+
+fn read_count_text(path: &str) -> Option<String> {
+    fs::read_to_string(path).ok()
+}
+
+fn parse_count_text(text: Option<String>) -> Option<u64> {
+    text.and_then(|text| parse_count(&text))
 }
 
 fn parse_count(text: &str) -> Option<u64> {
@@ -450,8 +459,12 @@ fn write_empty_stdin_eof() -> i32 {
 }
 
 fn write_observed_stdin_eof() -> i32 {
-    eprintln!("observed stdin eof");
+    write_observed_stdin_eof_diagnostic();
     success()
+}
+
+fn write_observed_stdin_eof_diagnostic() {
+    eprintln!("observed stdin eof");
 }
 
 fn success() -> i32 {
@@ -465,8 +478,12 @@ fn s5_success() -> i32 {
 }
 
 fn success_stderr() -> i32 {
-    eprintln!("fake-provider diagnostic on stderr");
+    write_success_stderr_diagnostic();
     success()
+}
+
+fn write_success_stderr_diagnostic() {
+    eprintln!("fake-provider diagnostic on stderr");
 }
 
 fn provider_error(category: &str, code: &str, exit_code: i32) -> i32 {
@@ -939,21 +956,23 @@ fn probe_pid_path(root: &std::path::Path, label: &str, pid: u32) -> std::path::P
 }
 
 fn early_stdin_success() -> i32 {
-    let mut buffer = [0_u8; 1];
-    let _ = io::stdin().read(&mut buffer);
+    read_one_stdin_byte();
     write_stdout(&success_json())
 }
 
 fn early_stdin_error() -> i32 {
-    let mut buffer = [0_u8; 1];
-    let _ = io::stdin().read(&mut buffer);
+    read_one_stdin_byte();
     provider_error("failed", "example_early_stdin", 0)
 }
 
 fn early_stdin_empty() -> i32 {
+    read_one_stdin_byte();
+    0
+}
+
+fn read_one_stdin_byte() {
     let mut buffer = [0_u8; 1];
     let _ = io::stdin().read(&mut buffer);
-    0
 }
 
 fn launch_valid(exit_code: i32) -> i32 {
@@ -987,14 +1006,37 @@ fn launch_cancelled_final_event() -> i32 {
 
 fn launch_long_valid_stream() -> i32 {
     let request_id = read_request_id();
-    let mut stdout = io::stdout().lock();
-    let detail = "h".repeat(4096);
-    for seq in 1..=700 {
-        let _ = writeln!(stdout, "{}", heartbeat_event_with_detail(&request_id, seq, &detail));
-    }
-    let _ = writeln!(stdout, "{}", exit_event(&request_id, 701, 0));
-    let _ = stdout.flush();
+    write_long_valid_launch_stream(&request_id);
     0
+}
+
+fn write_long_valid_launch_stream(request_id: &str) {
+    write_launch_event_lines(&long_valid_launch_stream_events(request_id));
+}
+
+fn long_valid_launch_stream_events(request_id: &str) -> Vec<String> {
+    let detail = long_launch_heartbeat_detail();
+    let mut events = long_launch_heartbeat_events(request_id, &detail);
+    events.push(exit_event(request_id, 701, 0));
+    events
+}
+
+fn long_launch_heartbeat_events(request_id: &str, detail: &str) -> Vec<String> {
+    (1..=700)
+        .map(|seq| heartbeat_event_with_detail(request_id, seq, detail))
+        .collect()
+}
+
+fn long_launch_heartbeat_detail() -> String {
+    "h".repeat(4096)
+}
+
+fn write_launch_event_lines(events: &[String]) {
+    let mut stdout = io::stdout().lock();
+    for event in events {
+        let _ = writeln!(stdout, "{event}");
+    }
+    let _ = stdout.flush();
 }
 
 fn launch_malformed_line_nonzero() -> i32 {
@@ -1003,24 +1045,44 @@ fn launch_malformed_line_nonzero() -> i32 {
 }
 
 fn launch_malformed_line_stderr() -> i32 {
-    eprintln!("fake-provider launch diagnostic on stderr");
+    write_launch_malformed_line_diagnostic();
     write_stdout("{not-json}\n")
+}
+
+fn write_launch_malformed_line_diagnostic() {
+    eprintln!("fake-provider launch diagnostic on stderr");
 }
 
 fn launch_blank_line() -> i32 {
     let request_id = read_request_id();
-    write_jsonl(&stdout_event(&request_id, 1, "YQ=="));
-    println!("   ");
-    write_jsonl(&exit_event(&request_id, 2, 0));
+    write_launch_blank_line_events(&request_id);
     0
+}
+
+fn write_launch_blank_line_events(request_id: &str) {
+    write_jsonl(&stdout_event(request_id, 1, "YQ=="));
+    write_blank_launch_line();
+    write_jsonl(&exit_event(request_id, 2, 0));
+}
+
+fn write_blank_launch_line() {
+    println!("   ");
 }
 
 fn launch_exit_then_large_stdout() -> i32 {
     let request_id = read_request_id();
+    write_exit_then_large_stdout(&request_id);
+    0
+}
+
+fn write_exit_then_large_stdout(request_id: &str) {
     write_jsonl(&exit_event(&request_id, 1, 0));
+    write_large_launch_stdout();
+}
+
+fn write_large_launch_stdout() {
     print!("{}", large_launch_stdout_block());
     let _ = io::stdout().flush();
-    0
 }
 
 fn large_launch_stdout_block() -> String {
