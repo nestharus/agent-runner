@@ -124,17 +124,7 @@ impl Fixture {
     }
 
     fn run_launch_with_env(&self, envs: &[(&str, &str)]) -> Output {
-        let mut cmd = self.command();
-        for (key, value) in envs {
-            cmd.env(key, value);
-        }
-        cmd.current_dir(&self.workspace)
-            .arg("--models-dir")
-            .arg(&self.models_dir)
-            .arg("--model")
-            .arg(MODEL)
-            .arg("first prompt");
-        cmd.output().unwrap()
+        run_fixture_command(command_with_envs(self.launch_command(), envs))
     }
 
     fn run_resume(&self) -> Output {
@@ -142,21 +132,19 @@ impl Fixture {
     }
 
     fn run_resume_with_env(&self, envs: &[(&str, &str)]) -> Output {
+        run_fixture_command(command_with_envs(self.resume_command(), envs))
+    }
+
+    fn launch_command(&self) -> Command {
         let mut cmd = self.command();
-        for (key, value) in envs {
-            cmd.env(key, value);
-        }
-        cmd.current_dir(&self.hostile_cwd)
-            .arg("resume")
-            .arg("--models-dir")
-            .arg(&self.models_dir)
-            .arg("--model")
-            .arg(MODEL)
-            .arg("--session-id")
-            .arg(SESSION_ID)
-            .arg("--prompt")
-            .arg("resume prompt");
-        cmd.output().unwrap()
+        apply_launch_command_shape(&mut cmd, &self.workspace, &self.models_dir);
+        cmd
+    }
+
+    fn resume_command(&self) -> Command {
+        let mut cmd = self.command();
+        apply_resume_command_shape(&mut cmd, &self.hostile_cwd, &self.models_dir);
+        cmd
     }
 
     fn command(&self) -> Command {
@@ -185,6 +173,43 @@ impl Fixture {
     fn records(&self) -> Vec<Value> {
         provider_records_from_path(&self.record_path)
     }
+}
+
+fn command_with_envs(mut cmd: Command, envs: &[(&str, &str)]) -> Command {
+    apply_command_envs(&mut cmd, envs);
+    cmd
+}
+
+fn apply_command_envs(cmd: &mut Command, envs: &[(&str, &str)]) {
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+}
+
+fn apply_launch_command_shape(cmd: &mut Command, workspace: &Path, models_dir: &Path) {
+    cmd.current_dir(workspace)
+        .arg("--models-dir")
+        .arg(models_dir)
+        .arg("--model")
+        .arg(MODEL)
+        .arg("first prompt");
+}
+
+fn apply_resume_command_shape(cmd: &mut Command, hostile_cwd: &Path, models_dir: &Path) {
+    cmd.current_dir(hostile_cwd)
+        .arg("resume")
+        .arg("--models-dir")
+        .arg(models_dir)
+        .arg("--model")
+        .arg(MODEL)
+        .arg("--session-id")
+        .arg(SESSION_ID)
+        .arg("--prompt")
+        .arg("resume prompt");
+}
+
+fn run_fixture_command(mut cmd: Command) -> Output {
+    cmd.output().unwrap()
 }
 
 fn materialize_fixture(root: &Path, paths: &FixturePaths, options: ProviderOptions) {
@@ -312,15 +337,19 @@ fn invocation_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Invocatio
 fn latest_invocation_outcome_from_db(path: &Path) -> InvocationOutcomeRow {
     let conn = open_invocation_db(path);
     conn.query_row(
-        "SELECT status, success, exit_code, terminal_reason
-           FROM invocations
-          WHERE provider_name = ?1
-          ORDER BY id DESC
-          LIMIT 1",
+        latest_invocation_outcome_sql(),
         [PROVIDER],
         invocation_outcome_row,
     )
     .unwrap()
+}
+
+fn latest_invocation_outcome_sql() -> &'static str {
+    "SELECT status, success, exit_code, terminal_reason
+       FROM invocations
+      WHERE provider_name = ?1
+      ORDER BY id DESC
+      LIMIT 1"
 }
 
 fn invocation_outcome_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<InvocationOutcomeRow> {

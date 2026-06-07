@@ -413,9 +413,7 @@ impl LeakProbe {
     }
 
     fn observed_pids(&self) -> Vec<u32> {
-        let entries = collect_readable_probe_entries(read_probe_dir(&self.root));
-        let marker_texts = filter_probe_marker_texts(entries);
-        filter_parsed_probe_pids(parse_probe_pid_texts(marker_texts))
+        observed_pids_from_probe_dir(read_probe_dir(&self.root))
     }
 }
 
@@ -423,16 +421,55 @@ fn read_probe_dir(root: &Path) -> Option<fs::ReadDir> {
     fs::read_dir(root).ok()
 }
 
-fn collect_readable_probe_entries(entries: Option<fs::ReadDir>) -> Vec<fs::DirEntry> {
+fn observed_pids_from_probe_dir(entries: Option<fs::ReadDir>) -> Vec<u32> {
+    let Some(entries) = entries else {
+        return Vec::new();
+    };
+    let entries = collect_readable_probe_entries(entries);
+    let marker_texts = filter_probe_marker_texts(entries);
+    filter_parsed_probe_pids(parse_probe_pid_texts(marker_texts))
+}
+
+fn collect_readable_probe_entries(entries: fs::ReadDir) -> Vec<fs::DirEntry> {
+    let candidates = probe_entry_options(entries);
+    let present = filter_present_probe_entries(candidates);
+    map_present_probe_entries(present)
+}
+
+fn probe_entry_options(entries: fs::ReadDir) -> Vec<Option<fs::DirEntry>> {
+    entries.map(Result::ok).collect()
+}
+
+fn filter_present_probe_entries(entries: Vec<Option<fs::DirEntry>>) -> Vec<Option<fs::DirEntry>> {
+    entries.into_iter().filter(Option::is_some).collect()
+}
+
+fn map_present_probe_entries(entries: Vec<Option<fs::DirEntry>>) -> Vec<fs::DirEntry> {
     entries
         .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
+        .map(|entry| entry.expect("probe entry was filtered as present"))
         .collect()
 }
 
 fn filter_probe_marker_texts(entries: Vec<fs::DirEntry>) -> Vec<String> {
-    entries.into_iter().filter_map(probe_marker_text).collect()
+    let candidates = probe_marker_text_options(entries);
+    let present = filter_present_marker_texts(candidates);
+    map_present_marker_texts(present)
+}
+
+fn probe_marker_text_options(entries: Vec<fs::DirEntry>) -> Vec<Option<String>> {
+    entries.into_iter().map(probe_marker_text).collect()
+}
+
+fn filter_present_marker_texts(texts: Vec<Option<String>>) -> Vec<Option<String>> {
+    texts.into_iter().filter(Option::is_some).collect()
+}
+
+fn map_present_marker_texts(texts: Vec<Option<String>>) -> Vec<String> {
+    texts
+        .into_iter()
+        .map(|text| text.expect("marker text was filtered as present"))
+        .collect()
 }
 
 fn probe_marker_text(entry: fs::DirEntry) -> Option<String> {
@@ -447,7 +484,18 @@ fn parse_probe_pid_texts(texts: Vec<String>) -> Vec<Option<u32>> {
 }
 
 fn filter_parsed_probe_pids(pids: Vec<Option<u32>>) -> Vec<u32> {
-    pids.into_iter().flatten().collect()
+    let present = filter_present_probe_pids(pids);
+    map_present_probe_pids(present)
+}
+
+fn filter_present_probe_pids(pids: Vec<Option<u32>>) -> Vec<Option<u32>> {
+    pids.into_iter().filter(Option::is_some).collect()
+}
+
+fn map_present_probe_pids(pids: Vec<Option<u32>>) -> Vec<u32> {
+    pids.into_iter()
+        .map(|pid| pid.expect("probe pid was filtered as present"))
+        .collect()
 }
 
 fn parse_probe_pid(text: &str) -> Option<u32> {
