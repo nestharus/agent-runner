@@ -1879,7 +1879,8 @@ fn external_provider_launch_minimal_terminal_scope_uses_final_event_not_standalo
     let result = execute_external_fixture(&fixture)
         .expect("external launch should map only launch final terminal evidence");
 
-    assert_eq!(result.exit_code, 0);
+    assert_eq!(result.exit_code, -1);
+    assert_eq!(result.terminal_reason.as_deref(), Some("unknown_exit"));
     assert_eq!(
         result.terminal_signal.as_ref().map(|signal| &signal.kind),
         Some(&oulipoly_runtime::executor::terminal_signal::TerminalSignalKind::Unknown),

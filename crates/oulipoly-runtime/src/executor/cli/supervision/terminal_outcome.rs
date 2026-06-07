@@ -19,7 +19,7 @@
 use super::{SupervisedOutput, SupervisedTerminalOutcome};
 use crate::executor::cli::provider_identity::ProviderRecognizer;
 use crate::executor::cli::terminal_signal::{
-    exit_code_from_status, recognize_terminal_signal, synthetic_exit_code,
+    exit_code_from_status, recognize_terminal_signal, terminal_exit_code_from_signal,
     terminal_reason_from_signal, terminal_status_from_exit_status,
 };
 use crate::executor::terminal_signal::{TerminalSignal, TerminalStatusEvidence};
@@ -65,15 +65,11 @@ pub(super) fn supervised_output_from_terminal(
 }
 
 fn supervised_exit_code(terminal_signal: &TerminalSignal, real_status: Option<&ExitStatus>) -> i32 {
-    let synthetic = synthetic_exit_code(terminal_signal);
     let Some(status) = real_status else {
-        return synthetic;
+        return terminal_exit_code_from_signal(terminal_signal, 0);
     };
     let real = exit_code_from_status(status);
-    if real == 0 && synthetic != 0 {
-        return synthetic;
-    }
-    real
+    terminal_exit_code_from_signal(terminal_signal, real)
 }
 
 #[cfg(test)]

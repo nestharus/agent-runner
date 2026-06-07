@@ -99,6 +99,9 @@ pub use resume_execution::{
 };
 pub use session_capture::start_known_provider_session_id;
 pub use terminal_signal::classify_terminal_reason;
+pub(crate) use terminal_signal::{
+    terminal_exit_code_from_signal, terminal_reason_from_signal_status,
+};
 
 #[cfg(test)]
 use super::TerminalSignal;

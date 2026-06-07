@@ -108,6 +108,11 @@ fn signal_name(signal: i32) -> String {
     }
 }
 
+#[cfg(not(unix))]
+fn signal_name(signal: i32) -> String {
+    signal.to_string()
+}
+
 /// `exit_code_from_status` is the canonical executor-boundary conversion from
 /// a child `ExitStatus` to the runtime's `i32` exit-code representation:
 ///
@@ -155,6 +160,14 @@ pub(super) fn terminal_reason_from_signal(
     signal: &TerminalSignal,
     status: Option<&ExitStatus>,
 ) -> Option<String> {
+    let status = status.map(terminal_status_from_exit_status);
+    terminal_reason_from_signal_status(signal, status.as_ref())
+}
+
+pub(crate) fn terminal_reason_from_signal_status(
+    signal: &TerminalSignal,
+    status: Option<&TerminalStatusEvidence>,
+) -> Option<String> {
     match signal.kind {
         TerminalSignalKind::ProlongedSilence
         | TerminalSignalKind::QuotaExhaustedInband
@@ -166,7 +179,19 @@ pub(super) fn terminal_reason_from_signal(
         TerminalSignalKind::Unknown => unknown_terminal_reason(signal),
         TerminalSignalKind::CleanExit
         | TerminalSignalKind::NonzeroExit
-        | TerminalSignalKind::SignalExit => status.and_then(classify_terminal_reason),
+        | TerminalSignalKind::SignalExit => status.and_then(terminal_status_reason),
+    }
+}
+
+fn terminal_status_reason(status: &TerminalStatusEvidence) -> Option<String> {
+    match status {
+        TerminalStatusEvidence::Exited { code } => (*code != 0).then(|| "exit_nonzero".to_string()),
+        TerminalStatusEvidence::SignalTerminated { signal } => {
+            Some(format!("signal:{}", signal_name(*signal)))
+        }
+        TerminalStatusEvidence::Unknown => Some("unknown_exit".to_string()),
+        TerminalStatusEvidence::SpawnError { .. }
+        | TerminalStatusEvidence::ProlongedSilence { .. } => None,
     }
 }
 
@@ -190,6 +215,14 @@ pub(super) fn synthetic_exit_code(signal: &TerminalSignal) -> i32 {
         | TerminalSignalKind::SpawnError
         | TerminalSignalKind::Unknown => -1,
     }
+}
+
+pub(crate) fn terminal_exit_code_from_signal(signal: &TerminalSignal, real_exit_code: i32) -> i32 {
+    let synthetic = synthetic_exit_code(signal);
+    if real_exit_code == 0 && synthetic != 0 {
+        return synthetic;
+    }
+    real_exit_code
 }
 
 pub(super) fn recognize_terminal_signal(

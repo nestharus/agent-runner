@@ -1,5 +1,9 @@
 #![cfg(unix)]
 
+mod age153_support;
+
+use age153_support::assert_result_envelope_shape;
+use oulipoly_state::InvocationStatus;
 use serde_json::Value;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -9,6 +13,8 @@ use std::process::{Command, Output};
 const MODEL: &str = "provider-ref-model";
 const PROVIDER: &str = "provider-ref-account";
 const SESSION_ID: &str = "a9a8c8d0-8f5f-402e-857c-c5c549446beb";
+const INCIDENT_TERMINAL_REASON: &str =
+    "provider error: opencode UnknownError: Failed to execute statement";
 
 struct Fixture {
     _dir: tempfile::TempDir,
@@ -37,6 +43,14 @@ struct InvocationSessionRow {
     provider_session_id: Option<String>,
     resume_input_id: Option<String>,
     provider_session_capture_method: Option<String>,
+}
+
+#[derive(Debug)]
+struct InvocationOutcomeRow {
+    status: String,
+    success: i64,
+    exit_code: i64,
+    terminal_reason: Option<String>,
 }
 
 struct ProviderOptions {
@@ -73,7 +87,14 @@ impl Fixture {
     }
 
     fn run_launch(&self) -> Output {
+        self.run_launch_with_env(&[])
+    }
+
+    fn run_launch_with_env(&self, envs: &[(&str, &str)]) -> Output {
         let mut cmd = self.command();
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
         cmd.current_dir(&self.workspace)
             .arg("--models-dir")
             .arg(&self.models_dir)
@@ -84,7 +105,14 @@ impl Fixture {
     }
 
     fn run_resume(&self) -> Output {
+        self.run_resume_with_env(&[])
+    }
+
+    fn run_resume_with_env(&self, envs: &[(&str, &str)]) -> Output {
         let mut cmd = self.command();
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
         cmd.current_dir(&self.hostile_cwd)
             .arg("resume")
             .arg("--models-dir")
@@ -115,6 +143,10 @@ impl Fixture {
 
     fn invocation_session_rows(&self) -> Vec<InvocationSessionRow> {
         invocation_session_rows_from_db(&self.db_path())
+    }
+
+    fn latest_invocation_outcome(&self) -> InvocationOutcomeRow {
+        latest_invocation_outcome_from_db(&self.db_path())
     }
 
     fn records(&self) -> Vec<Value> {
@@ -244,6 +276,29 @@ fn invocation_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Invocatio
     })
 }
 
+fn latest_invocation_outcome_from_db(path: &Path) -> InvocationOutcomeRow {
+    let conn = open_invocation_db(path);
+    conn.query_row(
+        "SELECT status, success, exit_code, terminal_reason
+           FROM invocations
+          WHERE provider_name = ?1
+          ORDER BY id DESC
+          LIMIT 1",
+        [PROVIDER],
+        invocation_outcome_row,
+    )
+    .unwrap()
+}
+
+fn invocation_outcome_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<InvocationOutcomeRow> {
+    Ok(InvocationOutcomeRow {
+        status: row.get(0)?,
+        success: row.get(1)?,
+        exit_code: row.get(2)?,
+        terminal_reason: row.get(3)?,
+    })
+}
+
 fn provider_record_text(path: &Path) -> String {
     fs::read_to_string(path).unwrap()
 }
@@ -338,6 +393,27 @@ fn external_launch_session_id_alias_persists_external_capture_method_without_ses
     assert_external_launch_session_capture_row(&rows[0]);
 }
 
+#[test]
+fn external_provider_launch_terminal_error_exit_zero_finalizes_as_failed() {
+    let fixture = Fixture::new();
+
+    let output = fixture.run_launch_with_env(&[("S10_PROVIDER_ERROR_EXIT_ZERO", "1")]);
+
+    assert_failed_terminal_error_output(&output);
+    assert_latest_invocation_failed_with_terminal_error(&fixture);
+}
+
+#[test]
+fn external_provider_resume_terminal_error_exit_zero_finalizes_as_failed() {
+    let fixture = Fixture::new();
+    assert_success(&fixture.run_launch());
+
+    let output = fixture.run_resume_with_env(&[("S10_PROVIDER_ERROR_EXIT_ZERO", "1")]);
+
+    assert_failed_terminal_error_process(&output);
+    assert_latest_invocation_failed_with_terminal_error(&fixture);
+}
+
 fn assert_external_launch_session_capture_rows(rows: &[InvocationSessionRow]) {
     assert_eq!(rows.len(), 2, "rows: {rows:?}");
     assert_external_launch_session_capture_row(&rows[0]);
@@ -374,6 +450,37 @@ fn assert_success(output: &Output) {
         "stdout={}\nstderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn assert_failed_terminal_error_output(output: &Output) {
+    assert_failed_terminal_error_process(output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let result = assert_result_envelope_shape(&stdout);
+    assert_eq!(result["status"], "failed");
+    assert_eq!(result["success"], false);
+    assert_eq!(result["exit_code"], -1);
+    assert_eq!(result["terminal_reason"], INCIDENT_TERMINAL_REASON);
+}
+
+fn assert_failed_terminal_error_process(output: &Output) {
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn assert_latest_invocation_failed_with_terminal_error(fixture: &Fixture) {
+    let row = fixture.latest_invocation_outcome();
+    assert_eq!(row.status, InvocationStatus::Failed.as_str(), "{row:?}");
+    assert_eq!(row.success, 0, "{row:?}");
+    assert_eq!(row.exit_code, -1, "{row:?}");
+    assert_eq!(
+        row.terminal_reason.as_deref(),
+        Some(INCIDENT_TERMINAL_REASON)
     );
 }
 
@@ -429,6 +536,7 @@ fn external_provider_script(record_path: &Path, options: ProviderOptions) -> Str
         r#"#!/usr/bin/env python3
 import base64
 import json
+import os
 import pathlib
 import sys
 
@@ -505,6 +613,25 @@ def launch():
         "kind": "stdout",
         "data_base64": base64.b64encode(("answer:" + payload + "\n").encode("utf-8")).decode("ascii"),
     }})
+    if os.environ.get("S10_PROVIDER_ERROR_EXIT_ZERO") == "1":
+        emit({{
+            "contract": CONTRACT,
+            "request_id": request_id(),
+            "seq": 2,
+            "time_unix_ms": 1002,
+            "kind": "exit",
+            "status": {{"kind": "exited", "code": 0}},
+            "terminal_signal": {{
+                "kind": "unknown",
+                "evidence": {incident_terminal_reason},
+                "observed_at_unix_ms": 1002,
+            }},
+            "session": {{
+                {launch_session_key}: SESSION_ID,
+                "state": {{"cursor": "after-launch"}},
+            }},
+        }})
+        return
     emit({{
         "contract": CONTRACT,
         "request_id": request_id(),
@@ -564,6 +691,7 @@ else:
 "#,
         provider = serde_json::to_string(PROVIDER).unwrap(),
         session_id = serde_json::to_string(SESSION_ID).unwrap(),
+        incident_terminal_reason = serde_json::to_string(INCIDENT_TERMINAL_REASON).unwrap(),
         launch_session_key = serde_json::to_string(options.launch_session_key).unwrap(),
         session_capability = if options.session_capability {
             "True"

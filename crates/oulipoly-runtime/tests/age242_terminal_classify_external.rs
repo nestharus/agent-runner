@@ -297,7 +297,7 @@ fn recording_quota_provider() -> ScriptFixture {
 fn s6a_nonzero_expected() -> ExpectedTerminal {
     ExpectedTerminal {
         kind: TerminalSignalKind::NonzeroExit,
-        reason: None,
+        reason: Some("exit_nonzero"),
         exit_code: 23,
     }
 }
