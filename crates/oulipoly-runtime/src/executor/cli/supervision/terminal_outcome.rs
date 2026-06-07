@@ -51,10 +51,7 @@ pub(super) fn supervised_output_from_terminal(
             terminal_status.clone(),
         )
     });
-    let exit_code = real_status
-        .as_ref()
-        .map(exit_code_from_status)
-        .unwrap_or_else(|| synthetic_exit_code(&terminal_signal));
+    let exit_code = supervised_exit_code(&terminal_signal, real_status.as_ref());
     let terminal_reason = terminal_reason_from_signal(&terminal_signal, real_status.as_ref());
 
     SupervisedOutput {
@@ -65,6 +62,18 @@ pub(super) fn supervised_output_from_terminal(
         terminal_signal,
         streamed_session_id: None,
     }
+}
+
+fn supervised_exit_code(terminal_signal: &TerminalSignal, real_status: Option<&ExitStatus>) -> i32 {
+    let synthetic = synthetic_exit_code(terminal_signal);
+    let Some(status) = real_status else {
+        return synthetic;
+    };
+    let real = exit_code_from_status(status);
+    if real == 0 && synthetic != 0 {
+        return synthetic;
+    }
+    real
 }
 
 #[cfg(test)]
@@ -90,6 +99,7 @@ mod tests {
             Some(std::process::ExitStatus::from_raw(0)),
         );
 
+        assert_eq!(output.exit_code, -1);
         assert_eq!(output.terminal_signal.kind, TerminalSignalKind::Unknown);
         let reason = output
             .terminal_reason
@@ -99,5 +109,31 @@ mod tests {
             reason.contains("Failed to execute statement"),
             "terminal_reason should retain the incident message: {reason}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_error_event_followed_by_later_event_preserves_clean_exit() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let output = supervised_output_from_terminal(
+            "opencode",
+            ProviderRecognizer::OpenCode,
+            concat!(
+                r#"{"type":"error","timestamp":1780808654364,"sessionID":"ses_15f9407ccffelCcB6CyXvpzdXK","error":{"name":"UnknownError","data":{"message":"Failed to execute statement"}}}"#,
+                "\n",
+                r#"{"type":"assistant","message":"continued after transient provider error"}"#
+            )
+            .as_bytes()
+            .to_vec(),
+            Vec::new(),
+            TerminalStatusEvidence::Exited { code: 0 },
+            None,
+            Some(std::process::ExitStatus::from_raw(0)),
+        );
+
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(output.terminal_signal.kind, TerminalSignalKind::CleanExit);
+        assert_eq!(output.terminal_reason, None);
     }
 }
