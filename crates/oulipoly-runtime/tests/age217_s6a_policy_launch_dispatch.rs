@@ -8,6 +8,7 @@ use oulipoly_runtime::executor;
 use oulipoly_runtime::executor::cli::{self, EffectiveExecuteRequest};
 use oulipoly_runtime::provider_registry::{ProviderRegistry, ProviderRegistryOptions};
 use oulipoly_runtime::services::{ExecutorServicePort, ExecutorServiceRequest, ServiceError};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
@@ -989,15 +990,9 @@ fn external_provider_launch_request_carries_selected_settings_id_and_effective_i
         PolicyMode::Accept,
         LaunchMode::Success,
     );
-    let working_dir = fixture._dir.path().join("explicit-working-directory");
-    fs::create_dir(&working_dir).expect("working dir");
-    let mut extra_inputs = HashMap::new();
-    extra_inputs.insert("quality".to_string(), vec!["high".to_string()]);
-    extra_inputs.insert(
-        "style".to_string(),
-        vec!["plain".to_string(), "dense".to_string()],
-    );
-    let parent_invocation_env = "parent-provider-a-invocation".to_string();
+    let working_dir = explicit_working_dir(&fixture);
+    let extra_inputs = effective_extra_inputs();
+    let parent_invocation_env = parent_invocation_env();
 
     execute_external_fixture_effective(
         &fixture,
@@ -1009,6 +1004,81 @@ fn external_provider_launch_request_carries_selected_settings_id_and_effective_i
 
     let policy = read_json(&fixture.policy_record_path);
     let launch = read_json(&fixture.launch_record_path);
+    assert_selected_settings_ids(&policy, &launch);
+    assert_model_request_carries_effective_inputs(&policy);
+    assert_model_request_carries_effective_inputs(&launch);
+    assert_launch_working_dir(&launch, &working_dir);
+    assert_launch_parent_invocation(&launch, &parent_invocation_env);
+    let launch_argv = json_string_array(&launch["params"]["argv"]);
+    assert_launch_argv_prefix(&launch_argv, &fixture);
+    assert_launch_argv_tail(&launch_argv);
+    assert_effective_input_flags(&launch_argv);
+    assert_no_arg_mode_stdin(&launch);
+}
+
+fn explicit_working_dir(fixture: &ExternalFixture) -> PathBuf {
+    let working_dir = fixture._dir.path().join("explicit-working-directory");
+    fs::create_dir(&working_dir).expect("working dir");
+    working_dir
+}
+
+fn effective_extra_inputs() -> HashMap<String, Vec<String>> {
+    HashMap::from([
+        ("quality".to_string(), vec!["high".to_string()]),
+        (
+            "style".to_string(),
+            vec!["plain".to_string(), "dense".to_string()],
+        ),
+    ])
+}
+
+fn parent_invocation_env() -> String {
+    "parent-provider-a-invocation".to_string()
+}
+
+struct TestTempPath {
+    _dir: tempfile::TempDir,
+    path: String,
+}
+
+fn tempdir_path(label: &str) -> TestTempPath {
+    let dir = tempfile::tempdir().expect(label);
+    TestTempPath {
+        path: dir.path().display().to_string(),
+        _dir: dir,
+    }
+}
+
+fn runner_data_dir_from_xdg(xdg_data: &str) -> String {
+    Path::new(xdg_data)
+        .join("oulipoly-agent-runner")
+        .display()
+        .to_string()
+}
+
+fn selected_opencode_xdg(home: &str, account: &str) -> String {
+    Path::new(home)
+        .join(format!(".{account}"))
+        .display()
+        .to_string()
+}
+
+fn external_model_for_provider(
+    fixture: &ExternalFixture,
+    provider_name: &str,
+    command: &str,
+) -> ModelConfig {
+    let mut model = external_model(fixture);
+    model.providers[0].name = provider_name.to_string();
+    model.providers[0].command = command.to_string();
+    model
+}
+
+fn dispatch_registry_for_model(model: &ModelConfig) -> ProviderRegistry {
+    dispatch_registry_for_models(std::slice::from_ref(model))
+}
+
+fn assert_selected_settings_ids(policy: &Value, launch: &Value) {
     assert_eq!(
         policy["params"]["settings_id"],
         SELECTED_PROVIDER_SETTINGS_ID
@@ -1017,17 +1087,23 @@ fn external_provider_launch_request_carries_selected_settings_id_and_effective_i
         launch["params"]["settings_id"],
         SELECTED_PROVIDER_SETTINGS_ID
     );
-    assert_model_request_carries_effective_inputs(&policy);
-    assert_model_request_carries_effective_inputs(&launch);
+}
+
+fn assert_launch_working_dir(launch: &Value, working_dir: &Path) {
     assert_eq!(
         launch["params"]["working_directory"],
         working_dir.display().to_string()
     );
+}
+
+fn assert_launch_parent_invocation(launch: &Value, parent_invocation_env: &str) {
     assert_eq!(
         launch["params"]["env"]["OULIPOLY_PARENT_INVOCATION"],
         parent_invocation_env
     );
-    let launch_argv = json_string_array(&launch["params"]["argv"]);
+}
+
+fn assert_launch_argv_prefix(launch_argv: &[String], fixture: &ExternalFixture) {
     assert_eq!(
         &launch_argv[..3],
         [
@@ -1037,23 +1113,40 @@ fn external_provider_launch_request_carries_selected_settings_id_and_effective_i
         ],
         "launch argv should begin with command and pool/provider args"
     );
+}
+
+fn assert_launch_argv_tail(launch_argv: &[String]) {
     assert_eq!(
         launch_argv.last().map(String::as_str),
         Some("prompt-value"),
         "arg-mode prompt should remain the argv tail"
     );
-    for expected_pair in [
+}
+
+fn assert_effective_input_flags(launch_argv: &[String]) {
+    for expected_pair in effective_input_flag_pairs() {
+        assert_effective_input_flag(launch_argv, expected_pair);
+    }
+}
+
+fn effective_input_flag_pairs() -> [[&'static str; 2]; 3] {
+    [
         ["--quality", "high"],
         ["--style", "plain"],
         ["--style", "dense"],
-    ] {
-        assert!(
-            launch_argv
-                .windows(2)
-                .any(|pair| pair[0] == expected_pair[0] && pair[1] == expected_pair[1]),
-            "launch argv should include effective input flag pair {expected_pair:?}: {launch_argv:?}"
-        );
-    }
+    ]
+}
+
+fn assert_effective_input_flag(launch_argv: &[String], expected_pair: [&str; 2]) {
+    assert!(
+        launch_argv
+            .windows(2)
+            .any(|pair| pair[0] == expected_pair[0] && pair[1] == expected_pair[1]),
+        "launch argv should include effective input flag pair {expected_pair:?}: {launch_argv:?}"
+    );
+}
+
+fn assert_no_arg_mode_stdin(launch: &Value) {
     assert!(
         launch["params"].get("stdin").is_none(),
         "arg-mode provider launches must not send the prompt on stdin"
@@ -1063,16 +1156,12 @@ fn external_provider_launch_request_carries_selected_settings_id_and_effective_i
 #[test]
 fn external_provider_launch_env_carries_host_linkage_without_openai_keys() {
     let _lock = env_lock();
-    let xdg_data = tempfile::tempdir().expect("xdg data tempdir");
-    let xdg_data = xdg_data.path().display().to_string();
-    let expected_data_dir = Path::new(&xdg_data)
-        .join("oulipoly-agent-runner")
-        .display()
-        .to_string();
-    let parent_invocation_env = "parent-provider-a-invocation".to_string();
+    let xdg_data = tempdir_path("xdg data tempdir");
+    let expected_data_dir = runner_data_dir_from_xdg(&xdg_data.path);
+    let parent_invocation_env = parent_invocation_env();
     let agent_runner_bin = "/tmp/target-release/oulipoly-agent-runner";
     let _env = EnvScope::set_optional(&[
-        ("XDG_DATA_HOME", Some(xdg_data.as_str())),
+        ("XDG_DATA_HOME", Some(xdg_data.path.as_str())),
         ("AGENT_BASH_AGENT_RUNNER_BIN", Some(agent_runner_bin)),
         ("OULIPOLY_DATA_DIR", None),
         (
@@ -1103,52 +1192,55 @@ fn external_provider_launch_env_carries_host_linkage_without_openai_keys() {
 
     let policy = read_json(&fixture.policy_record_path);
     let launch = read_json(&fixture.launch_record_path);
-    for env in [&policy["params"]["launch"]["env"], &launch["params"]["env"]] {
-        let env = env.as_object().expect("params.env should be an object");
-        assert_eq!(
-            env.get("OULIPOLY_DATA_DIR")
-                .and_then(|value| value.as_str()),
-            Some(expected_data_dir.as_str()),
-            "external launch params.env must pin the runner data dir when the process env is scrubbed"
+    assert_host_linkage_envs(
+        &policy,
+        &launch,
+        &expected_data_dir,
+        &parent_invocation_env,
+        agent_runner_bin,
+    );
+}
+
+fn assert_host_linkage_envs(
+    policy: &Value,
+    launch: &Value,
+    expected_data_dir: &str,
+    parent_invocation_env: &str,
+    agent_runner_bin: &str,
+) {
+    for env in provider_launch_envs(policy, launch) {
+        assert_env_value(
+            env,
+            "OULIPOLY_DATA_DIR",
+            expected_data_dir,
+            "external launch params.env must pin the runner data dir when the process env is scrubbed",
         );
-        assert_eq!(
-            env.get("OULIPOLY_PARENT_INVOCATION")
-                .and_then(|value| value.as_str()),
-            Some(parent_invocation_env.as_str()),
-            "external launch params.env must carry parent invocation linkage"
+        assert_env_value(
+            env,
+            "OULIPOLY_PARENT_INVOCATION",
+            parent_invocation_env,
+            "external launch params.env must carry parent invocation linkage",
         );
-        assert_eq!(
-            env.get("AGENT_BASH_AGENT_RUNNER_BIN")
-                .and_then(|value| value.as_str()),
-            Some(agent_runner_bin),
-            "external launch params.env must let provider-spawned agent-bash notify via the same runner binary"
+        assert_env_value(
+            env,
+            "AGENT_BASH_AGENT_RUNNER_BIN",
+            agent_runner_bin,
+            "external launch params.env must let provider-spawned agent-bash notify via the same runner binary",
         );
-        assert!(
-            env.keys().all(|key| {
-                !key.starts_with("OPENAI_API_KEY") && !key.starts_with("OPENAI_BASE_URL")
-            }),
-            "OpenAI env keys must not cross the external-provider params.env boundary: {env:?}"
-        );
-        assert!(
-            !serde_json::to_string(env)
-                .expect("env serializes")
-                .contains("ambient-openai-secret-do-not-propagate"),
-            "OpenAI env values must not cross the external-provider params.env boundary: {env:?}"
-        );
+        assert_no_openai_env_keys(env);
+        assert_no_ambient_openai_secret(env);
     }
 }
 
 #[test]
 fn external_provider_launch_env_uses_selected_opencode_auth_context_without_openai_keys() {
     let _lock = env_lock();
-    let home = tempfile::tempdir().expect("home tempdir");
-    let ambient_xdg = tempfile::tempdir().expect("ambient xdg tempdir");
-    let home = home.path().display().to_string();
-    let ambient_xdg = ambient_xdg.path().display().to_string();
-    let expected_xdg = Path::new(&home).join(".opencode2").display().to_string();
+    let home = tempdir_path("home tempdir");
+    let ambient_xdg = tempdir_path("ambient xdg tempdir");
+    let expected_xdg = selected_opencode_xdg(&home.path, "opencode2");
     let _env = EnvScope::set(&[
-        ("HOME", home.as_str()),
-        ("XDG_DATA_HOME", ambient_xdg.as_str()),
+        ("HOME", home.path.as_str()),
+        ("XDG_DATA_HOME", ambient_xdg.path.as_str()),
         ("OPENAI_API_KEY", "ambient-openai-secret-do-not-propagate"),
         ("OPENAI_BASE_URL", "https://ambient-openai.example.invalid"),
     ]);
@@ -1160,10 +1252,8 @@ fn external_provider_launch_env_uses_selected_opencode_auth_context_without_open
         PolicyMode::Accept,
         LaunchMode::Success,
     );
-    let mut model = external_model(&fixture);
-    model.providers[0].name = "opencode2".to_string();
-    model.providers[0].command = "opencode2".to_string();
-    let registry = dispatch_registry_for_models(std::slice::from_ref(&model));
+    let model = external_model_for_provider(&fixture, "opencode2", "opencode2");
+    let registry = dispatch_registry_for_model(&model);
 
     execute_dispatch_aware_result(
         registry,
@@ -1180,44 +1270,42 @@ fn external_provider_launch_env_uses_selected_opencode_auth_context_without_open
 
     let policy = read_json(&fixture.policy_record_path);
     let launch = read_json(&fixture.launch_record_path);
-    for env in [&policy["params"]["launch"]["env"], &launch["params"]["env"]] {
-        let env = env.as_object().expect("params.env should be an object");
-        assert_eq!(
-            env.get("HOME").and_then(|value| value.as_str()),
-            Some(home.as_str())
+    assert_selected_opencode_auth_envs(
+        &policy,
+        &launch,
+        &home.path,
+        &expected_xdg,
+        &ambient_xdg.path,
+    );
+}
+
+fn assert_selected_opencode_auth_envs(
+    policy: &Value,
+    launch: &Value,
+    home: &str,
+    expected_xdg: &str,
+    ambient_xdg: &str,
+) {
+    for env in provider_launch_envs(policy, launch) {
+        assert_env_value(env, "HOME", home, "selected account HOME should be passed");
+        assert_env_value(
+            env,
+            "XDG_DATA_HOME",
+            expected_xdg,
+            "selected opencode2 account must override the runner's ambient XDG_DATA_HOME",
         );
-        assert_eq!(
-            env.get("XDG_DATA_HOME").and_then(|value| value.as_str()),
-            Some(expected_xdg.as_str()),
-            "selected opencode2 account must override the runner's ambient XDG_DATA_HOME"
-        );
-        assert_ne!(
-            env.get("XDG_DATA_HOME").and_then(|value| value.as_str()),
-            Some(ambient_xdg.as_str()),
-            "ambient runner XDG_DATA_HOME must not leak into opencode child auth context"
-        );
-        assert!(
-            env.keys().all(|key| {
-                !key.starts_with("OPENAI_API_KEY") && !key.starts_with("OPENAI_BASE_URL")
-            }),
-            "OpenAI env keys must not cross the external-provider params.env boundary: {env:?}"
-        );
-        assert!(
-            !serde_json::to_string(env)
-                .expect("env serializes")
-                .contains("ambient-openai-secret-do-not-propagate"),
-            "OpenAI env values must not cross the external-provider params.env boundary: {env:?}"
-        );
+        assert_env_value_not(env, "XDG_DATA_HOME", ambient_xdg);
+        assert_no_openai_env_keys(env);
+        assert_no_ambient_openai_secret(env);
     }
 }
 
 #[test]
 fn external_provider_launch_env_omits_ambient_xdg_for_default_opencode_auth_context() {
     let _lock = env_lock();
-    let ambient_xdg = tempfile::tempdir().expect("ambient xdg tempdir");
-    let ambient_xdg = ambient_xdg.path().display().to_string();
+    let ambient_xdg = tempdir_path("ambient xdg tempdir");
     let _env = EnvScope::set(&[
-        ("XDG_DATA_HOME", ambient_xdg.as_str()),
+        ("XDG_DATA_HOME", ambient_xdg.path.as_str()),
         ("OPENAI_API_KEY", "ambient-openai-secret-do-not-propagate"),
     ]);
     let fixture = make_external_fixture(
@@ -1228,10 +1316,8 @@ fn external_provider_launch_env_omits_ambient_xdg_for_default_opencode_auth_cont
         PolicyMode::Accept,
         LaunchMode::Success,
     );
-    let mut model = external_model(&fixture);
-    model.providers[0].name = "opencode".to_string();
-    model.providers[0].command = "opencode1".to_string();
-    let registry = dispatch_registry_for_models(std::slice::from_ref(&model));
+    let model = external_model_for_provider(&fixture, "opencode", "opencode1");
+    let registry = dispatch_registry_for_model(&model);
 
     execute_dispatch_aware_result(
         registry,
@@ -1248,23 +1334,91 @@ fn external_provider_launch_env_omits_ambient_xdg_for_default_opencode_auth_cont
 
     let policy = read_json(&fixture.policy_record_path);
     let launch = read_json(&fixture.launch_record_path);
-    for env in [&policy["params"]["launch"]["env"], &launch["params"]["env"]] {
-        let env = env.as_object().expect("params.env should be an object");
-        assert!(
-            !env.contains_key("XDG_DATA_HOME"),
-            "default opencode auth must use the default XDG data dir, not the runner's ambient XDG_DATA_HOME: {env:?}"
+    assert_default_opencode_auth_envs(&policy, &launch);
+}
+
+fn assert_default_opencode_auth_envs(policy: &Value, launch: &Value) {
+    for env in provider_launch_envs(policy, launch) {
+        assert_env_key_absent(
+            env,
+            "XDG_DATA_HOME",
+            "default opencode auth must use the default XDG data dir, not the runner's ambient XDG_DATA_HOME",
         );
-        assert!(
-            env.keys().all(|key| !key.starts_with("OPENAI_API_KEY")),
-            "OpenAI env keys must not cross the external-provider params.env boundary: {env:?}"
-        );
-        assert!(
-            !serde_json::to_string(env)
-                .expect("env serializes")
-                .contains("ambient-openai-secret-do-not-propagate"),
-            "OpenAI env values must not cross the external-provider params.env boundary: {env:?}"
-        );
+        assert_no_openai_api_key(env);
+        assert_no_ambient_openai_secret(env);
     }
+}
+
+fn provider_launch_envs<'a>(
+    policy: &'a Value,
+    launch: &'a Value,
+) -> [&'a serde_json::Map<String, Value>; 2] {
+    [
+        json_object(&policy["params"]["launch"]["env"]),
+        json_object(&launch["params"]["env"]),
+    ]
+}
+
+fn json_object(value: &Value) -> &serde_json::Map<String, Value> {
+    value.as_object().expect("params.env should be an object")
+}
+
+fn assert_env_value(
+    env: &serde_json::Map<String, Value>,
+    key: &str,
+    expected: &str,
+    message: &str,
+) {
+    assert_eq!(env_string(env, key), Some(expected), "{message}");
+}
+
+fn assert_env_value_not(env: &serde_json::Map<String, Value>, key: &str, unexpected: &str) {
+    assert_ne!(
+        env_string(env, key),
+        Some(unexpected),
+        "ambient runner XDG_DATA_HOME must not leak into opencode child auth context"
+    );
+}
+
+fn env_string<'a>(env: &'a serde_json::Map<String, Value>, key: &str) -> Option<&'a str> {
+    env.get(key).and_then(|value| value.as_str())
+}
+
+fn assert_env_key_absent(env: &serde_json::Map<String, Value>, key: &str, message: &str) {
+    assert!(!env.contains_key(key), "{message}: {env:?}");
+}
+
+fn assert_no_openai_env_keys(env: &serde_json::Map<String, Value>) {
+    assert!(
+        env.keys().all(openai_env_key_is_absent),
+        "OpenAI env keys must not cross the external-provider params.env boundary: {env:?}"
+    );
+}
+
+fn assert_no_openai_api_key(env: &serde_json::Map<String, Value>) {
+    assert!(
+        env.keys().all(openai_api_key_is_absent),
+        "OpenAI env keys must not cross the external-provider params.env boundary: {env:?}"
+    );
+}
+
+fn openai_env_key_is_absent(key: &str) -> bool {
+    !key.starts_with("OPENAI_API_KEY") && !key.starts_with("OPENAI_BASE_URL")
+}
+
+fn openai_api_key_is_absent(key: &str) -> bool {
+    !key.starts_with("OPENAI_API_KEY")
+}
+
+fn assert_no_ambient_openai_secret(env: &serde_json::Map<String, Value>) {
+    assert!(
+        !env_json(env).contains("ambient-openai-secret-do-not-propagate"),
+        "OpenAI env values must not cross the external-provider params.env boundary: {env:?}"
+    );
+}
+
+fn env_json(env: &serde_json::Map<String, Value>) -> String {
+    serde_json::to_string(env).expect("env serializes")
 }
 
 #[test]
