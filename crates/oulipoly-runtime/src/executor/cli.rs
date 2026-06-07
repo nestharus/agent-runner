@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! Roles: orchestration.
+//! Roles: orchestration, mapper, formatter, validator.
 //!
 //! - orchestration: top-level [`execute`], [`execute_effective`],
 //!   [`execute_effective_with_start_known_provider_session_id`],
@@ -9,6 +9,9 @@
 //!   the facade re-exports and composes the per-component submodules listed
 //!   below; predicates, parsers, validators, formatters, mappers, accessors,
 //!   and filters all live in sibling files under `executor/cli/`.
+//! - mapper: embedded test helpers map fixture models/providers.
+//! - formatter: embedded test helpers format fixture scripts.
+//! - validator: embedded tests assert terminal-signal evidence.
 //!
 //! ## Adapter declarations
 //!

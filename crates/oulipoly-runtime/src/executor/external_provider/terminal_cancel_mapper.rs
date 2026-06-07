@@ -1,4 +1,7 @@
-//! Role: mapper.
+//! Roles: mapper, validator.
+//!
+//! - mapper: provider ProcessStatus/TerminalSignal to host terminal outcome.
+//! - validator: embedded behavior tests assert exit-code/reason mapping.
 
 use crate::executor::cli::{terminal_exit_code_from_signal, terminal_reason_from_signal_status};
 use crate::executor::terminal_signal::{

@@ -1,5 +1,14 @@
 #![cfg(unix)]
 
+//! ## Declared roles
+//!
+//! Roles: orchestration, formatter, mapper, accessor, parser, validator, predicate.
+//!
+//! TEST: external-provider launch/resume end-to-end fixtures — fake provider
+//! CLI script formatters, fixture model mappers, record accessors, JSON/record
+//! parsers, allowed-subcommand predicates, envelope/row validators, and test
+//! orchestration.
+
 mod age153_support;
 
 use age153_support::assert_result_envelope_shape;

@@ -1,9 +1,11 @@
 //! ## Declared roles
 //!
-//! Roles: mapper.
+//! Roles: mapper, validator.
 //!
 //! - mapper: maps terminal status, optional live signals, and real child
 //!   status into supervised executor output.
+//! - validator: embedded behavior tests assert supervised exit-code/reason
+//!   mapping for terminal failure signals.
 //!
 //! ## Adapter declarations
 //!

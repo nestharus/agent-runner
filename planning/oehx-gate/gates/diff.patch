@@ -1,0 +1,747 @@
+diff --git a/crates/oulipoly-runtime/src/diagnostics/external_provider/reason_format.rs b/crates/oulipoly-runtime/src/diagnostics/external_provider/reason_format.rs
+index 22f08d1..760609f 100644
+--- a/crates/oulipoly-runtime/src/diagnostics/external_provider/reason_format.rs
++++ b/crates/oulipoly-runtime/src/diagnostics/external_provider/reason_format.rs
+@@ -1,29 +1,6 @@
+ //! Role: formatter.
+ 
+-use crate::executor::terminal_signal::{TerminalSignalKind, TerminalStatusEvidence};
+-use oulipoly_provider::generated::TerminalSignalKind as ProviderTerminalSignalKind;
+-
+-pub(crate) fn classify_result_reason(
+-    provider_kind: &ProviderTerminalSignalKind,
+-    status: &TerminalStatusEvidence,
+-) -> Option<String> {
+-    match provider_kind {
+-        ProviderTerminalSignalKind::CleanExit => None,
+-        ProviderTerminalSignalKind::NonzeroExit => Some("exit_nonzero".to_string()),
+-        ProviderTerminalSignalKind::SignalExit => Some(signal_reason(status)),
+-        ProviderTerminalSignalKind::SpawnError => Some("spawn_error".to_string()),
+-        ProviderTerminalSignalKind::QuotaExhaustedInband => {
+-            Some("quota_exhausted_inband".to_string())
+-        }
+-        ProviderTerminalSignalKind::MaybeQuotaExhausted => {
+-            Some("maybe_quota_exhausted".to_string())
+-        }
+-        ProviderTerminalSignalKind::RateLimited => Some("rate_limited".to_string()),
+-        ProviderTerminalSignalKind::ProlongedSilence => Some("bounded_silence".to_string()),
+-        ProviderTerminalSignalKind::Cancelled => Some("cancelled".to_string()),
+-        ProviderTerminalSignalKind::Unknown => Some("unknown_exit".to_string()),
+-    }
+-}
++use crate::executor::terminal_signal::TerminalSignalKind;
+ 
+ pub(crate) fn fixed_reason_for_kind(kind: TerminalSignalKind) -> Option<&'static str> {
+     match kind {
+@@ -38,45 +15,3 @@ pub(crate) fn fixed_reason_for_kind(kind: TerminalSignalKind) -> Option<&'static
+         TerminalSignalKind::Unknown => Some("unknown_exit"),
+     }
+ }
+-
+-fn signal_reason(status: &TerminalStatusEvidence) -> String {
+-    match status {
+-        TerminalStatusEvidence::SignalTerminated { signal } => {
+-            format!("signal:{}", signal_name(*signal))
+-        }
+-        _ => "signal_exit".to_string(),
+-    }
+-}
+-
+-#[cfg(unix)]
+-fn signal_name(signal: i32) -> String {
+-    match signal {
+-        libc::SIGHUP => "SIGHUP".to_string(),
+-        libc::SIGINT => "SIGINT".to_string(),
+-        libc::SIGQUIT => "SIGQUIT".to_string(),
+-        libc::SIGILL => "SIGILL".to_string(),
+-        libc::SIGTRAP => "SIGTRAP".to_string(),
+-        libc::SIGABRT => "SIGABRT".to_string(),
+-        libc::SIGBUS => "SIGBUS".to_string(),
+-        libc::SIGFPE => "SIGFPE".to_string(),
+-        libc::SIGKILL => "SIGKILL".to_string(),
+-        libc::SIGUSR1 => "SIGUSR1".to_string(),
+-        libc::SIGSEGV => "SIGSEGV".to_string(),
+-        libc::SIGUSR2 => "SIGUSR2".to_string(),
+-        libc::SIGPIPE => "SIGPIPE".to_string(),
+-        libc::SIGALRM => "SIGALRM".to_string(),
+-        libc::SIGTERM => "SIGTERM".to_string(),
+-        libc::SIGCHLD => "SIGCHLD".to_string(),
+-        libc::SIGCONT => "SIGCONT".to_string(),
+-        libc::SIGSTOP => "SIGSTOP".to_string(),
+-        libc::SIGTSTP => "SIGTSTP".to_string(),
+-        libc::SIGTTIN => "SIGTTIN".to_string(),
+-        libc::SIGTTOU => "SIGTTOU".to_string(),
+-        _ => signal.to_string(),
+-    }
+-}
+-
+-#[cfg(not(unix))]
+-fn signal_name(signal: i32) -> String {
+-    signal.to_string()
+-}
+diff --git a/crates/oulipoly-runtime/src/diagnostics/external_provider/result_mapper.rs b/crates/oulipoly-runtime/src/diagnostics/external_provider/result_mapper.rs
+index 23a276a..fac9c54 100644
+--- a/crates/oulipoly-runtime/src/diagnostics/external_provider/result_mapper.rs
++++ b/crates/oulipoly-runtime/src/diagnostics/external_provider/result_mapper.rs
+@@ -1,11 +1,11 @@
+ //! Role: mapper.
+ 
+-use super::reason_format;
+ use super::status_projection;
++use crate::executor::cli::{terminal_exit_code_from_signal, terminal_reason_from_signal_status};
+ use crate::executor::terminal_signal::{TerminalSignal, TerminalSignalKind};
+ use crate::services::{TerminalClassification, TerminalClassifyServiceRequest};
+ use oulipoly_provider::generated::{
+-    TerminalClassifyResult, TerminalSignalKind as ProviderTerminalSignalKind,
++    ProcessStatus, TerminalClassifyResult, TerminalSignalKind as ProviderTerminalSignalKind,
+ };
+ use std::time::{Duration, UNIX_EPOCH};
+ 
+@@ -14,21 +14,40 @@ pub(crate) fn map_terminal_classify_result(
+     result: TerminalClassifyResult,
+ ) -> Result<TerminalClassification, super::errors::TerminalClassifyError> {
+     let status = status_projection::terminal_status_evidence(&request.status);
+-    let terminal_reason =
+-        reason_format::classify_result_reason(&result.terminal_signal.kind, &status);
++    let terminal_signal = TerminalSignal {
++        kind: runtime_kind(&result.terminal_signal.kind),
++        provider_name: request.provider_name.clone(),
++        evidence: signal_evidence(&result.terminal_signal),
++        observed_at: UNIX_EPOCH + Duration::from_millis(result.terminal_signal.observed_at_unix_ms),
++    };
++    let terminal_reason = terminal_reason(&request.status, &terminal_signal, &status);
+     Ok(TerminalClassification {
+-        exit_code: status_projection::exit_code(&request.status),
++        exit_code: terminal_exit_code_from_signal(
++            &terminal_signal,
++            status_projection::exit_code(&request.status),
++        ),
+         terminal_reason,
+-        terminal_signal: TerminalSignal {
+-            kind: runtime_kind(&result.terminal_signal.kind),
+-            provider_name: request.provider_name.clone(),
+-            evidence: signal_evidence(&result.terminal_signal),
+-            observed_at: UNIX_EPOCH
+-                + Duration::from_millis(result.terminal_signal.observed_at_unix_ms),
+-        },
++        terminal_signal,
+     })
+ }
+ 
++fn terminal_reason(
++    status: &ProcessStatus,
++    signal: &TerminalSignal,
++    status_evidence: &crate::executor::terminal_signal::TerminalStatusEvidence,
++) -> Option<String> {
++    match status {
++        ProcessStatus::Cancelled => Some("cancelled".to_string()),
++        ProcessStatus::Exited { .. }
++        | ProcessStatus::SignalTerminated { .. }
++        | ProcessStatus::SpawnError { .. }
++        | ProcessStatus::ProlongedSilence { .. }
++        | ProcessStatus::Unknown => {
++            terminal_reason_from_signal_status(signal, Some(status_evidence))
++        }
++    }
++}
++
+ fn runtime_kind(kind: &ProviderTerminalSignalKind) -> TerminalSignalKind {
+     match kind {
+         ProviderTerminalSignalKind::CleanExit => TerminalSignalKind::CleanExit,
+@@ -53,3 +72,84 @@ fn signal_evidence(signal: &oulipoly_provider::generated::TerminalSignal) -> Str
+         .clone()
+         .unwrap_or_else(|| signal.kind.as_str().to_string())
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use oulipoly_provider::generated::{
++        ProcessStatus, TerminalSignal as ProviderTerminalSignal, TerminalSignalKind,
++    };
++    use std::time::SystemTime;
++
++    const INCIDENT_PROVIDER_ERROR: &str =
++        "provider error: opencode UnknownError: Failed to execute statement";
++
++    fn request(status: ProcessStatus) -> TerminalClassifyServiceRequest {
++        TerminalClassifyServiceRequest {
++            model_name: "opencode-model".to_string(),
++            provider_name: "opencode".to_string(),
++            settings_id: "opencode".to_string(),
++            stdout: Vec::new(),
++            stderr: Vec::new(),
++            status,
++            observed_at: SystemTime::UNIX_EPOCH,
++        }
++    }
++
++    fn result(kind: TerminalSignalKind, evidence: Option<&str>) -> TerminalClassifyResult {
++        TerminalClassifyResult {
++            terminal_signal: ProviderTerminalSignal {
++                kind,
++                evidence: evidence.map(str::to_string),
++                observed_at_unix_ms: 1_780_808_654_364,
++            },
++        }
++    }
++
++    #[test]
++    fn unknown_provider_error_signal_with_exit_zero_maps_synthetic_failure_and_reason() {
++        let classification = map_terminal_classify_result(
++            &request(ProcessStatus::Exited { code: 0 }),
++            result(TerminalSignalKind::Unknown, Some(INCIDENT_PROVIDER_ERROR)),
++        )
++        .expect("classification should map");
++
++        assert_eq!(classification.exit_code, -1);
++        let reason = classification
++            .terminal_reason
++            .as_deref()
++            .expect("provider error evidence should become terminal_reason");
++        assert!(
++            reason.contains("Failed to execute statement"),
++            "terminal_reason should preserve provider evidence: {reason}"
++        );
++    }
++
++    #[test]
++    fn clean_exit_signal_with_exit_zero_stays_success_without_reason() {
++        let classification = map_terminal_classify_result(
++            &request(ProcessStatus::Exited { code: 0 }),
++            result(TerminalSignalKind::CleanExit, Some("clean exit")),
++        )
++        .expect("classification should map");
++
++        assert_eq!(classification.exit_code, 0);
++        assert_eq!(classification.terminal_reason, None);
++    }
++
++    #[test]
++    fn unknown_provider_error_signal_with_real_nonzero_preserves_real_code() {
++        let classification = map_terminal_classify_result(
++            &request(ProcessStatus::Exited { code: 3 }),
++            result(TerminalSignalKind::Unknown, Some(INCIDENT_PROVIDER_ERROR)),
++        )
++        .expect("classification should map");
++
++        assert_eq!(classification.exit_code, 3);
++        let reason = classification
++            .terminal_reason
++            .as_deref()
++            .expect("provider error evidence should remain terminal_reason");
++        assert!(reason.contains("Failed to execute statement"));
++    }
++}
+diff --git a/crates/oulipoly-runtime/src/executor/cli.rs b/crates/oulipoly-runtime/src/executor/cli.rs
+index 10a2229..bcee044 100644
+--- a/crates/oulipoly-runtime/src/executor/cli.rs
++++ b/crates/oulipoly-runtime/src/executor/cli.rs
+@@ -99,6 +99,9 @@ pub use resume_execution::{
+ };
+ pub use session_capture::start_known_provider_session_id;
+ pub use terminal_signal::classify_terminal_reason;
++pub(crate) use terminal_signal::{
++    terminal_exit_code_from_signal, terminal_reason_from_signal_status,
++};
+ 
+ #[cfg(test)]
+ use super::TerminalSignal;
+diff --git a/crates/oulipoly-runtime/src/executor/cli/supervision/terminal_outcome.rs b/crates/oulipoly-runtime/src/executor/cli/supervision/terminal_outcome.rs
+index 1f2bf8a..5e76248 100644
+--- a/crates/oulipoly-runtime/src/executor/cli/supervision/terminal_outcome.rs
++++ b/crates/oulipoly-runtime/src/executor/cli/supervision/terminal_outcome.rs
+@@ -19,7 +19,7 @@
+ use super::{SupervisedOutput, SupervisedTerminalOutcome};
+ use crate::executor::cli::provider_identity::ProviderRecognizer;
+ use crate::executor::cli::terminal_signal::{
+-    exit_code_from_status, recognize_terminal_signal, synthetic_exit_code,
++    exit_code_from_status, recognize_terminal_signal, terminal_exit_code_from_signal,
+     terminal_reason_from_signal, terminal_status_from_exit_status,
+ };
+ use crate::executor::terminal_signal::{TerminalSignal, TerminalStatusEvidence};
+@@ -65,15 +65,11 @@ pub(super) fn supervised_output_from_terminal(
+ }
+ 
+ fn supervised_exit_code(terminal_signal: &TerminalSignal, real_status: Option<&ExitStatus>) -> i32 {
+-    let synthetic = synthetic_exit_code(terminal_signal);
+     let Some(status) = real_status else {
+-        return synthetic;
++        return terminal_exit_code_from_signal(terminal_signal, 0);
+     };
+     let real = exit_code_from_status(status);
+-    if real == 0 && synthetic != 0 {
+-        return synthetic;
+-    }
+-    real
++    terminal_exit_code_from_signal(terminal_signal, real)
+ }
+ 
+ #[cfg(test)]
+diff --git a/crates/oulipoly-runtime/src/executor/cli/terminal_signal.rs b/crates/oulipoly-runtime/src/executor/cli/terminal_signal.rs
+index 2bb7464..4043838 100644
+--- a/crates/oulipoly-runtime/src/executor/cli/terminal_signal.rs
++++ b/crates/oulipoly-runtime/src/executor/cli/terminal_signal.rs
+@@ -108,6 +108,11 @@ fn signal_name(signal: i32) -> String {
+     }
+ }
+ 
++#[cfg(not(unix))]
++fn signal_name(signal: i32) -> String {
++    signal.to_string()
++}
++
+ /// `exit_code_from_status` is the canonical executor-boundary conversion from
+ /// a child `ExitStatus` to the runtime's `i32` exit-code representation:
+ ///
+@@ -154,6 +159,14 @@ pub(super) fn terminal_status_from_exit_status(status: &ExitStatus) -> TerminalS
+ pub(super) fn terminal_reason_from_signal(
+     signal: &TerminalSignal,
+     status: Option<&ExitStatus>,
++) -> Option<String> {
++    let status = status.map(terminal_status_from_exit_status);
++    terminal_reason_from_signal_status(signal, status.as_ref())
++}
++
++pub(crate) fn terminal_reason_from_signal_status(
++    signal: &TerminalSignal,
++    status: Option<&TerminalStatusEvidence>,
+ ) -> Option<String> {
+     match signal.kind {
+         TerminalSignalKind::ProlongedSilence
+@@ -166,7 +179,19 @@ pub(super) fn terminal_reason_from_signal(
+         TerminalSignalKind::Unknown => unknown_terminal_reason(signal),
+         TerminalSignalKind::CleanExit
+         | TerminalSignalKind::NonzeroExit
+-        | TerminalSignalKind::SignalExit => status.and_then(classify_terminal_reason),
++        | TerminalSignalKind::SignalExit => status.and_then(terminal_status_reason),
++    }
++}
++
++fn terminal_status_reason(status: &TerminalStatusEvidence) -> Option<String> {
++    match status {
++        TerminalStatusEvidence::Exited { code } => (*code != 0).then(|| "exit_nonzero".to_string()),
++        TerminalStatusEvidence::SignalTerminated { signal } => {
++            Some(format!("signal:{}", signal_name(*signal)))
++        }
++        TerminalStatusEvidence::Unknown => Some("unknown_exit".to_string()),
++        TerminalStatusEvidence::SpawnError { .. }
++        | TerminalStatusEvidence::ProlongedSilence { .. } => None,
+     }
+ }
+ 
+@@ -192,6 +217,14 @@ pub(super) fn synthetic_exit_code(signal: &TerminalSignal) -> i32 {
+     }
+ }
+ 
++pub(crate) fn terminal_exit_code_from_signal(signal: &TerminalSignal, real_exit_code: i32) -> i32 {
++    let synthetic = synthetic_exit_code(signal);
++    if real_exit_code == 0 && synthetic != 0 {
++        return synthetic;
++    }
++    real_exit_code
++}
++
+ pub(super) fn recognize_terminal_signal(
+     provider_name: &str,
+     recognizer: ProviderRecognizer,
+diff --git a/crates/oulipoly-runtime/src/executor/external_provider/terminal_cancel_mapper.rs b/crates/oulipoly-runtime/src/executor/external_provider/terminal_cancel_mapper.rs
+index b2cb51b..f95df6f 100644
+--- a/crates/oulipoly-runtime/src/executor/external_provider/terminal_cancel_mapper.rs
++++ b/crates/oulipoly-runtime/src/executor/external_provider/terminal_cancel_mapper.rs
+@@ -1,6 +1,9 @@
+ //! Role: mapper.
+ 
+-use crate::executor::terminal_signal::{TerminalSignal, TerminalSignalKind};
++use crate::executor::cli::{terminal_exit_code_from_signal, terminal_reason_from_signal_status};
++use crate::executor::terminal_signal::{
++    TerminalSignal, TerminalSignalKind, TerminalStatusEvidence,
++};
+ use oulipoly_provider::generated::{
+     ProcessStatus, TerminalSignal as ProviderTerminalSignal,
+     TerminalSignalKind as ProviderTerminalSignalKind,
+@@ -18,18 +21,19 @@ pub(crate) fn map_terminal_cancel_outcome(
+     signal: &ProviderTerminalSignal,
+     provider_name: &str,
+ ) -> TerminalCancelOutcome {
++    let terminal_signal = TerminalSignal {
++        kind: terminal_signal_kind(&signal.kind),
++        provider_name: provider_name.to_string(),
++        evidence: signal
++            .evidence
++            .clone()
++            .unwrap_or_else(|| signal.kind.as_str().to_string()),
++        observed_at: UNIX_EPOCH + Duration::from_millis(signal.observed_at_unix_ms),
++    };
+     TerminalCancelOutcome {
+-        exit_code: exit_code(status),
+-        terminal_reason: terminal_reason(status),
+-        terminal_signal: TerminalSignal {
+-            kind: terminal_signal_kind(&signal.kind),
+-            provider_name: provider_name.to_string(),
+-            evidence: signal
+-                .evidence
+-                .clone()
+-                .unwrap_or_else(|| signal.kind.as_str().to_string()),
+-            observed_at: UNIX_EPOCH + Duration::from_millis(signal.observed_at_unix_ms),
+-        },
++        exit_code: terminal_exit_code_from_signal(&terminal_signal, exit_code(status)),
++        terminal_reason: terminal_reason(status, &terminal_signal),
++        terminal_signal,
+     }
+ }
+ 
+@@ -44,14 +48,30 @@ fn exit_code(status: &ProcessStatus) -> i32 {
+     }
+ }
+ 
+-fn terminal_reason(status: &ProcessStatus) -> Option<String> {
++fn terminal_reason(status: &ProcessStatus, signal: &TerminalSignal) -> Option<String> {
+     match status {
+         ProcessStatus::Cancelled => Some("cancelled".to_string()),
+         ProcessStatus::SpawnError { reason } | ProcessStatus::ProlongedSilence { reason } => {
+             Some(reason.clone())
+         }
+-        ProcessStatus::Unknown => Some("unknown".to_string()),
+-        ProcessStatus::Exited { .. } | ProcessStatus::SignalTerminated { .. } => None,
++        ProcessStatus::Exited { .. }
++        | ProcessStatus::SignalTerminated { .. }
++        | ProcessStatus::Unknown => {
++            terminal_reason_from_signal_status(signal, Some(&terminal_status_evidence(status)))
++        }
++    }
++}
++
++fn terminal_status_evidence(status: &ProcessStatus) -> TerminalStatusEvidence {
++    match status {
++        ProcessStatus::Exited { code } => TerminalStatusEvidence::Exited { code: *code },
++        ProcessStatus::SignalTerminated { signal } => {
++            TerminalStatusEvidence::SignalTerminated { signal: *signal }
++        }
++        ProcessStatus::Unknown
++        | ProcessStatus::Cancelled
++        | ProcessStatus::SpawnError { .. }
++        | ProcessStatus::ProlongedSilence { .. } => TerminalStatusEvidence::Unknown,
+     }
+ }
+ 
+@@ -70,3 +90,75 @@ fn terminal_signal_kind(kind: &ProviderTerminalSignalKind) -> TerminalSignalKind
+         | ProviderTerminalSignalKind::RateLimited => TerminalSignalKind::Unknown,
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const INCIDENT_PROVIDER_ERROR: &str =
++        "provider error: opencode UnknownError: Failed to execute statement";
++
++    fn provider_signal(
++        kind: ProviderTerminalSignalKind,
++        evidence: Option<&str>,
++    ) -> ProviderTerminalSignal {
++        ProviderTerminalSignal {
++            kind,
++            evidence: evidence.map(str::to_string),
++            observed_at_unix_ms: 1_780_808_654_364,
++        }
++    }
++
++    #[test]
++    fn unknown_provider_error_signal_with_exit_zero_maps_synthetic_failure_and_reason() {
++        let outcome = map_terminal_cancel_outcome(
++            &ProcessStatus::Exited { code: 0 },
++            &provider_signal(
++                ProviderTerminalSignalKind::Unknown,
++                Some(INCIDENT_PROVIDER_ERROR),
++            ),
++            "opencode",
++        );
++
++        assert_eq!(outcome.exit_code, -1);
++        let reason = outcome
++            .terminal_reason
++            .as_deref()
++            .expect("provider error evidence should become terminal_reason");
++        assert!(
++            reason.contains("Failed to execute statement"),
++            "terminal_reason should preserve provider evidence: {reason}"
++        );
++    }
++
++    #[test]
++    fn clean_exit_signal_with_exit_zero_stays_success_without_reason() {
++        let outcome = map_terminal_cancel_outcome(
++            &ProcessStatus::Exited { code: 0 },
++            &provider_signal(ProviderTerminalSignalKind::CleanExit, Some("clean exit")),
++            "opencode",
++        );
++
++        assert_eq!(outcome.exit_code, 0);
++        assert_eq!(outcome.terminal_reason, None);
++    }
++
++    #[test]
++    fn unknown_provider_error_signal_with_real_nonzero_preserves_real_code() {
++        let outcome = map_terminal_cancel_outcome(
++            &ProcessStatus::Exited { code: 3 },
++            &provider_signal(
++                ProviderTerminalSignalKind::Unknown,
++                Some(INCIDENT_PROVIDER_ERROR),
++            ),
++            "opencode",
++        );
++
++        assert_eq!(outcome.exit_code, 3);
++        let reason = outcome
++            .terminal_reason
++            .as_deref()
++            .expect("provider error evidence should remain terminal_reason");
++        assert!(reason.contains("Failed to execute statement"));
++    }
++}
+diff --git a/crates/oulipoly-runtime/tests/age217_s6a_policy_launch_dispatch.rs b/crates/oulipoly-runtime/tests/age217_s6a_policy_launch_dispatch.rs
+index cdf2453..3dfb5dd 100644
+--- a/crates/oulipoly-runtime/tests/age217_s6a_policy_launch_dispatch.rs
++++ b/crates/oulipoly-runtime/tests/age217_s6a_policy_launch_dispatch.rs
+@@ -1879,7 +1879,8 @@ fn external_provider_launch_minimal_terminal_scope_uses_final_event_not_standalo
+     let result = execute_external_fixture(&fixture)
+         .expect("external launch should map only launch final terminal evidence");
+ 
+-    assert_eq!(result.exit_code, 0);
++    assert_eq!(result.exit_code, -1);
++    assert_eq!(result.terminal_reason.as_deref(), Some("unknown_exit"));
+     assert_eq!(
+         result.terminal_signal.as_ref().map(|signal| &signal.kind),
+         Some(&oulipoly_runtime::executor::terminal_signal::TerminalSignalKind::Unknown),
+diff --git a/crates/oulipoly-runtime/tests/age242_terminal_classify_external.rs b/crates/oulipoly-runtime/tests/age242_terminal_classify_external.rs
+index d27d20b..c5a6e1e 100644
+--- a/crates/oulipoly-runtime/tests/age242_terminal_classify_external.rs
++++ b/crates/oulipoly-runtime/tests/age242_terminal_classify_external.rs
+@@ -297,7 +297,7 @@ fn recording_quota_provider() -> ScriptFixture {
+ fn s6a_nonzero_expected() -> ExpectedTerminal {
+     ExpectedTerminal {
+         kind: TerminalSignalKind::NonzeroExit,
+-        reason: None,
++        reason: Some("exit_nonzero"),
+         exit_code: 23,
+     }
+ }
+diff --git a/src-tauri/tests/s10_external_provider_resume.rs b/src-tauri/tests/s10_external_provider_resume.rs
+index 059ebd2..09b7d41 100644
+--- a/src-tauri/tests/s10_external_provider_resume.rs
++++ b/src-tauri/tests/s10_external_provider_resume.rs
+@@ -1,5 +1,9 @@
+ #![cfg(unix)]
+ 
++mod age153_support;
++
++use age153_support::assert_result_envelope_shape;
++use oulipoly_state::InvocationStatus;
+ use serde_json::Value;
+ use std::fs;
+ use std::os::unix::fs::PermissionsExt;
+@@ -9,6 +13,8 @@ use std::process::{Command, Output};
+ const MODEL: &str = "provider-ref-model";
+ const PROVIDER: &str = "provider-ref-account";
+ const SESSION_ID: &str = "a9a8c8d0-8f5f-402e-857c-c5c549446beb";
++const INCIDENT_TERMINAL_REASON: &str =
++    "provider error: opencode UnknownError: Failed to execute statement";
+ 
+ struct Fixture {
+     _dir: tempfile::TempDir,
+@@ -39,6 +45,14 @@ struct InvocationSessionRow {
+     provider_session_capture_method: Option<String>,
+ }
+ 
++#[derive(Debug)]
++struct InvocationOutcomeRow {
++    status: String,
++    success: i64,
++    exit_code: i64,
++    terminal_reason: Option<String>,
++}
++
+ struct ProviderOptions {
+     launch_session_key: &'static str,
+     session_capability: bool,
+@@ -73,7 +87,14 @@ impl Fixture {
+     }
+ 
+     fn run_launch(&self) -> Output {
++        self.run_launch_with_env(&[])
++    }
++
++    fn run_launch_with_env(&self, envs: &[(&str, &str)]) -> Output {
+         let mut cmd = self.command();
++        for (key, value) in envs {
++            cmd.env(key, value);
++        }
+         cmd.current_dir(&self.workspace)
+             .arg("--models-dir")
+             .arg(&self.models_dir)
+@@ -84,7 +105,14 @@ impl Fixture {
+     }
+ 
+     fn run_resume(&self) -> Output {
++        self.run_resume_with_env(&[])
++    }
++
++    fn run_resume_with_env(&self, envs: &[(&str, &str)]) -> Output {
+         let mut cmd = self.command();
++        for (key, value) in envs {
++            cmd.env(key, value);
++        }
+         cmd.current_dir(&self.hostile_cwd)
+             .arg("resume")
+             .arg("--models-dir")
+@@ -117,6 +145,10 @@ impl Fixture {
+         invocation_session_rows_from_db(&self.db_path())
+     }
+ 
++    fn latest_invocation_outcome(&self) -> InvocationOutcomeRow {
++        latest_invocation_outcome_from_db(&self.db_path())
++    }
++
+     fn records(&self) -> Vec<Value> {
+         provider_records_from_path(&self.record_path)
+     }
+@@ -244,6 +276,29 @@ fn invocation_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Invocatio
+     })
+ }
+ 
++fn latest_invocation_outcome_from_db(path: &Path) -> InvocationOutcomeRow {
++    let conn = open_invocation_db(path);
++    conn.query_row(
++        "SELECT status, success, exit_code, terminal_reason
++           FROM invocations
++          WHERE provider_name = ?1
++          ORDER BY id DESC
++          LIMIT 1",
++        [PROVIDER],
++        invocation_outcome_row,
++    )
++    .unwrap()
++}
++
++fn invocation_outcome_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<InvocationOutcomeRow> {
++    Ok(InvocationOutcomeRow {
++        status: row.get(0)?,
++        success: row.get(1)?,
++        exit_code: row.get(2)?,
++        terminal_reason: row.get(3)?,
++    })
++}
++
+ fn provider_record_text(path: &Path) -> String {
+     fs::read_to_string(path).unwrap()
+ }
+@@ -338,6 +393,27 @@ fn external_launch_session_id_alias_persists_external_capture_method_without_ses
+     assert_external_launch_session_capture_row(&rows[0]);
+ }
+ 
++#[test]
++fn external_provider_launch_terminal_error_exit_zero_finalizes_as_failed() {
++    let fixture = Fixture::new();
++
++    let output = fixture.run_launch_with_env(&[("S10_PROVIDER_ERROR_EXIT_ZERO", "1")]);
++
++    assert_failed_terminal_error_output(&output);
++    assert_latest_invocation_failed_with_terminal_error(&fixture);
++}
++
++#[test]
++fn external_provider_resume_terminal_error_exit_zero_finalizes_as_failed() {
++    let fixture = Fixture::new();
++    assert_success(&fixture.run_launch());
++
++    let output = fixture.run_resume_with_env(&[("S10_PROVIDER_ERROR_EXIT_ZERO", "1")]);
++
++    assert_failed_terminal_error_process(&output);
++    assert_latest_invocation_failed_with_terminal_error(&fixture);
++}
++
+ fn assert_external_launch_session_capture_rows(rows: &[InvocationSessionRow]) {
+     assert_eq!(rows.len(), 2, "rows: {rows:?}");
+     assert_external_launch_session_capture_row(&rows[0]);
+@@ -377,6 +453,37 @@ fn assert_success(output: &Output) {
+     );
+ }
+ 
++fn assert_failed_terminal_error_output(output: &Output) {
++    assert_failed_terminal_error_process(output);
++    let stdout = String::from_utf8_lossy(&output.stdout);
++    let result = assert_result_envelope_shape(&stdout);
++    assert_eq!(result["status"], "failed");
++    assert_eq!(result["success"], false);
++    assert_eq!(result["exit_code"], -1);
++    assert_eq!(result["terminal_reason"], INCIDENT_TERMINAL_REASON);
++}
++
++fn assert_failed_terminal_error_process(output: &Output) {
++    assert_ne!(
++        output.status.code(),
++        Some(0),
++        "stdout={}\nstderr={}",
++        String::from_utf8_lossy(&output.stdout),
++        String::from_utf8_lossy(&output.stderr)
++    );
++}
++
++fn assert_latest_invocation_failed_with_terminal_error(fixture: &Fixture) {
++    let row = fixture.latest_invocation_outcome();
++    assert_eq!(row.status, InvocationStatus::Failed.as_str(), "{row:?}");
++    assert_eq!(row.success, 0, "{row:?}");
++    assert_eq!(row.exit_code, -1, "{row:?}");
++    assert_eq!(
++        row.terminal_reason.as_deref(),
++        Some(INCIDENT_TERMINAL_REASON)
++    );
++}
++
+ fn records_for_subcommand<'a>(records: &'a [Value], subcommand: &str) -> Vec<&'a Value> {
+     records
+         .iter()
+@@ -429,6 +536,7 @@ fn external_provider_script(record_path: &Path, options: ProviderOptions) -> Str
+         r#"#!/usr/bin/env python3
+ import base64
+ import json
++import os
+ import pathlib
+ import sys
+ 
+@@ -505,6 +613,25 @@ def launch():
+         "kind": "stdout",
+         "data_base64": base64.b64encode(("answer:" + payload + "\n").encode("utf-8")).decode("ascii"),
+     }})
++    if os.environ.get("S10_PROVIDER_ERROR_EXIT_ZERO") == "1":
++        emit({{
++            "contract": CONTRACT,
++            "request_id": request_id(),
++            "seq": 2,
++            "time_unix_ms": 1002,
++            "kind": "exit",
++            "status": {{"kind": "exited", "code": 0}},
++            "terminal_signal": {{
++                "kind": "unknown",
++                "evidence": {incident_terminal_reason},
++                "observed_at_unix_ms": 1002,
++            }},
++            "session": {{
++                {launch_session_key}: SESSION_ID,
++                "state": {{"cursor": "after-launch"}},
++            }},
++        }})
++        return
+     emit({{
+         "contract": CONTRACT,
+         "request_id": request_id(),
+@@ -564,6 +691,7 @@ else:
+ "#,
+         provider = serde_json::to_string(PROVIDER).unwrap(),
+         session_id = serde_json::to_string(SESSION_ID).unwrap(),
++        incident_terminal_reason = serde_json::to_string(INCIDENT_TERMINAL_REASON).unwrap(),
+         launch_session_key = serde_json::to_string(options.launch_session_key).unwrap(),
+         session_capability = if options.session_capability {
+             "True"

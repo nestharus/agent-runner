@@ -1,0 +1,9 @@
+crates/oulipoly-runtime/src/diagnostics/external_provider/reason_format.rs
+crates/oulipoly-runtime/src/diagnostics/external_provider/result_mapper.rs
+crates/oulipoly-runtime/src/executor/cli.rs
+crates/oulipoly-runtime/src/executor/cli/supervision/terminal_outcome.rs
+crates/oulipoly-runtime/src/executor/cli/terminal_signal.rs
+crates/oulipoly-runtime/src/executor/external_provider/terminal_cancel_mapper.rs
+crates/oulipoly-runtime/tests/age217_s6a_policy_launch_dispatch.rs
+crates/oulipoly-runtime/tests/age242_terminal_classify_external.rs
+src-tauri/tests/s10_external_provider_resume.rs

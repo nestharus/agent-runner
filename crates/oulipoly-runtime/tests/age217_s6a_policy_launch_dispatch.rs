@@ -1,5 +1,13 @@
 #![cfg(unix)]
 
+//! ## Declared roles
+//!
+//! Roles: orchestration, mapper, formatter, parser, accessor, predicate, validator.
+//!
+//! TEST: policy launch dispatch integration suite — fixture model/provider
+//! mappers, script formatters, JSON parsers, env accessors, env-absence
+//! predicates, assertion validators, and test orchestration.
+
 use oulipoly_config::{
     InputDef, InputType, ModelConfig, PromptMode, ProviderConfig,
     provider_implementation_ref::ProviderImplementationRef,

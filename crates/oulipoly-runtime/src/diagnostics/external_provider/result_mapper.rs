@@ -1,4 +1,7 @@
-//! Role: mapper.
+//! Roles: mapper, validator.
+//!
+//! - mapper: provider launch result to host execution result construction.
+//! - validator: embedded behavior tests assert exit-code/reason mapping.
 
 use super::status_projection;
 use crate::executor::cli::{terminal_exit_code_from_signal, terminal_reason_from_signal_status};
