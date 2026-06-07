@@ -17,6 +17,29 @@ use std::time::Duration;
 
 pub use crate::process::{CancellationToken, ProcessSpawnObserver};
 
+/// Handshake (`describe` + `policy.evaluate`) timeout.
+///
+/// The handshake spawns the provider artifact, which may embed a scripting
+/// runtime that must cold-start before it can answer `describe` /
+/// `policy.evaluate`. Under machine load (many concurrent dispatches racing for
+/// CPU) that cold start has been observed to take tens of seconds. The previous
+/// 30s budget fired `host_timeout` mid-handshake, and because a transport
+/// timeout is terminal the whole dispatch failed instead of completing.
+///
+/// 90s gives roughly 3x headroom over the observed worst case while staying far
+/// below [`DEFAULT_LAUNCH_TIMEOUT`], so a genuinely hung handshake still fails
+/// in bounded time (and the host can then rotate to the next pool account
+/// rather than terminal-failing the dispatch).
+const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Launch timeout — the model turn itself can legitimately run for minutes, so
+/// this stays generous and well above the handshake budget.
+const DEFAULT_LAUNCH_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Grace period between SIGTERM and SIGKILL when tearing down a timed-out or
+/// cancelled provider process tree.
+const DEFAULT_KILL_AFTER_GRACE: Duration = Duration::from_millis(100);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderTimeouts {
     pub default: Duration,
@@ -27,9 +50,9 @@ pub struct ProviderTimeouts {
 impl Default for ProviderTimeouts {
     fn default() -> Self {
         Self {
-            default: Duration::from_secs(30),
-            launch: Duration::from_secs(300),
-            kill_after_grace: Duration::from_millis(100),
+            default: DEFAULT_HANDSHAKE_TIMEOUT,
+            launch: DEFAULT_LAUNCH_TIMEOUT,
+            kill_after_grace: DEFAULT_KILL_AFTER_GRACE,
         }
     }
 }

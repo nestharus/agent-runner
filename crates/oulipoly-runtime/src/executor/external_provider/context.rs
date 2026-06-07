@@ -59,6 +59,28 @@ impl From<ExternalProviderDispatchInput> for ExternalProviderDispatchContext {
     }
 }
 
+/// One pool account to attempt during FIX #32 transport-timeout rotation.
+#[derive(Debug, Clone)]
+pub(crate) struct AccountSelection {
+    pub(crate) provider: ProviderConfig,
+    pub(crate) provider_index: usize,
+}
+
+impl ExternalProviderDispatchContext {
+    /// Re-target this dispatch context at a different pool account, recomputing
+    /// the per-account `settings_id`. All other fields (prompt, inputs, working
+    /// dir, parent linkage) are account-independent and carried verbatim.
+    pub(crate) fn with_account(&self, account: AccountSelection) -> Self {
+        let settings_id = provider_settings_id(&account.provider);
+        Self {
+            provider: account.provider,
+            provider_index: account.provider_index,
+            settings_id,
+            ..self.clone()
+        }
+    }
+}
+
 fn provider_settings_id(provider: &ProviderConfig) -> String {
     canonical_opencode_settings_id(&provider.name, &provider.command)
         .unwrap_or_else(|| provider.name.clone())
