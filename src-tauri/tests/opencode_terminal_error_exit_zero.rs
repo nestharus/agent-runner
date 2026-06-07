@@ -98,14 +98,8 @@ fn opencode_body(lines: &[&str]) -> String {
     body
 }
 
-fn assert_invocation_row(
-    fixture: &Age153Fixture,
-    expected_status: InvocationStatus,
-    expected_success: i64,
-    expected_exit_code: i64,
-    expected_terminal_reason: Option<&str>,
-) {
-    let (status, success, exit_code, terminal_reason): (String, i64, i64, Option<String>) = fixture
+fn fetch_invocation_row(fixture: &Age153Fixture) -> (String, i64, i64, Option<String>) {
+    fixture
         .conn()
         .query_row(
             "SELECT status, success, exit_code, terminal_reason
@@ -114,7 +108,17 @@ fn assert_invocation_row(
             [INCIDENT_PROVIDER],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
-        .unwrap();
+        .unwrap()
+}
+
+fn assert_invocation_row(
+    fixture: &Age153Fixture,
+    expected_status: InvocationStatus,
+    expected_success: i64,
+    expected_exit_code: i64,
+    expected_terminal_reason: Option<&str>,
+) {
+    let (status, success, exit_code, terminal_reason) = fetch_invocation_row(fixture);
 
     assert_eq!(status, expected_status.as_str());
     assert_eq!(success, expected_success);

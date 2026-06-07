@@ -58,10 +58,15 @@ fn stream_text(bytes: &[u8]) -> Cow<'_, str> {
 }
 
 fn non_empty_stream_lines(text: &str) -> Vec<&str> {
-    text.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect()
+    retain_non_empty_lines(trimmed_stream_lines(text))
+}
+
+fn trimmed_stream_lines(text: &str) -> Vec<&str> {
+    text.lines().map(str::trim).collect()
+}
+
+fn retain_non_empty_lines(lines: Vec<&str>) -> Vec<&str> {
+    lines.into_iter().filter(|line| !line.is_empty()).collect()
 }
 
 fn json_error_line_evidence(line: &str) -> String {
