@@ -14,7 +14,7 @@ Formal inputs:
 
 Important context:
 
-- The exact `## Proof plan` must bind the three runtime claims to shipped tests: incident stream finalizes one-shot and resume as failed with provider-error evidence; recovered stream stays succeeded; F4 parity prevents ordinary quota/rate text classification.
+- The exact `## Proof plan` must bind the four runtime claims to shipped tests: external launch with failure terminal_signal plus exited(0) finalizes failed with provider-error reason (envelope + invocation row); external resume same honesty; clean external paths unchanged (clean_exit+0 succeeded, real nonzero preserved); in-tree oeh-gate semantics unchanged. Audited head is `f646b13` (functional commit 807f35c plus declared-role-header/carrier sync, zero executable change).
 - Runtime command evidence is summarized in `/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/planning/oehx-gate/evidence/runtime-tests.log`.
 - Source inspection must use `/home/nes/projects/agent-runner/worktrees/age-pid-sidecar`; `gates/diff.patch` is regenerated from the final audited source range.
 

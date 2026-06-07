@@ -2,12 +2,12 @@
 
 //! ## Declared roles
 //!
-//! Roles: orchestration, formatter, mapper, accessor, parser, validator, predicate.
+//! Roles: orchestration, formatter, mapper, accessor, parser, validator, predicate, filter.
 //!
 //! TEST: external-provider launch/resume end-to-end fixtures — fake provider
 //! CLI script formatters, fixture model mappers, record accessors, JSON/record
-//! parsers, allowed-subcommand predicates, envelope/row validators, and test
-//! orchestration.
+//! parsers, allowed-subcommand predicates, record-line/subcommand filters,
+//! envelope/row validators, and test orchestration.
 
 mod age153_support;
 

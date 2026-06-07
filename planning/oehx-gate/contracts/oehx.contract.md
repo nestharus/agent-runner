@@ -19,7 +19,7 @@ Provider CleanExit + exit 0 unchanged; real nonzero codes preserved.
 | `crates/oulipoly-runtime/src/executor/external_provider/terminal_cancel_mapper.rs` | `mapper`, `validator` | Maps provider ProcessStatus/TerminalSignal into host terminal outcome via the shared helpers. |
 | `crates/oulipoly-runtime/tests/age217_s6a_policy_launch_dispatch.rs` | `orchestration`, `mapper`, `formatter`, `parser`, `accessor`, `predicate`, `validator` (TEST) | One-line assertion sync; suite-wide fixture helpers. |
 | `crates/oulipoly-runtime/tests/age242_terminal_classify_external.rs` | `orchestration`, `formatter`, `mapper`, `accessor`, `parser`, `validator` (TEST) | One-line assertion sync; suite-wide fixture helpers. |
-| `src-tauri/tests/s10_external_provider_resume.rs` | `orchestration`, `formatter`, `mapper`, `accessor`, `parser`, `validator`, `predicate` (TEST) | High-seam external launch/resume regression fixtures incl. the incident scenario. |
+| `src-tauri/tests/s10_external_provider_resume.rs` | `orchestration`, `formatter`, `mapper`, `accessor`, `parser`, `validator`, `predicate`, `filter` (TEST) | High-seam external launch/resume regression fixtures incl. the incident scenario. |
 
 ## Focused production inventory
 

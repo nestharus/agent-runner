@@ -16,7 +16,7 @@ Inputs:
 
 Important context:
 
-- Functional source commit is `807f35c` (external-path terminal-error honesty parity: external launch/resume mappers consume the shared failure-exit/reason rules owned by terminal_signal.rs; provider failure terminal_signal + real exited(0) finalizes failed with provider-error terminal_reason; clean and real-nonzero paths unchanged).
+- Functional source commit is `f646b13` (functional commit 807f35c plus declared-role-header and gate-carrier sync f646b13 — zero executable change) (external-path terminal-error honesty parity: external launch/resume mappers consume the shared failure-exit/reason rules owned by terminal_signal.rs; provider failure terminal_signal + real exited(0) finalizes failed with provider-error terminal_reason; clean and real-nonzero paths unchanged).
 - There are no artifact-only commits in range.
 - Source inspection must use `/home/nes/projects/agent-runner/worktrees/age-pid-sidecar`; `gates/diff.patch` is regenerated from the final audited source range.
 

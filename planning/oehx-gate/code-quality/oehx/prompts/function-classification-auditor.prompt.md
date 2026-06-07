@@ -7,7 +7,7 @@ Inputs:
 - `repo_root=/home/nes/projects/agent-runner/worktrees/age-pid-sidecar`
 - `worktree_path=/home/nes/projects/agent-runner/worktrees/age-pid-sidecar`
 - `base_ref=33775d7`
-- `head_ref=HEAD`
+- `head_ref=HEAD (f646b13)`
 - `planning_dir=/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/planning/oehx-gate`
 - `wu_id=oehx`
 - `diff_path=/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/planning/oehx-gate/gates/diff.patch`
