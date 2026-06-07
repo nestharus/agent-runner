@@ -1,3 +1,43 @@
+//! ## Declared roles
+//!
+//! Roles: validator, orchestration, mapper, accessor, predicate.
+//!
+//! - validator: launch-stream integration tests assert valid stream decoding,
+//!   request-id correlation, model/provider nonzero handling, truncation,
+//!   protocol diagnostics, and exact launch argv/stdin behavior.
+//! - orchestration: each test compiles the fake provider, creates a
+//!   `ProviderClient`, invokes `ProviderClient::launch`, and inspects the
+//!   resulting success or transport error.
+//! - mapper: `launch_client` maps a fixture binary path and provider-client
+//!   options into the configured launch client under test.
+//! - accessor: tests read `LaunchResult` event, exit, diagnostic, stdout/stderr,
+//!   recorded-invocation, and last-argv surfaces.
+//! - predicate: `matches!`, `contains`, and nonzero/truncation assertions
+//!   classify expected event kinds and diagnostic states.
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: crates/oulipoly-provider/tests/launch_stream.rs
+//!     role: adapter
+//!     Translates:
+//!       - fake-provider-fixture-contract
+//!       - provider-client-options-contract
+//!       - provider-cli-subprocess-contract
+//!       - launch-jsonl-stream-contract
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-provider/tests/launch_stream.rs
+//!     role: intrinsic-surface
+//!     Domain: launch stream provider-client integration test suite
+//!     Owns:
+//!       - valid launch JSONL decoding and binary payload ordering coverage
+//!       - request-id echo and exact argv/stdin invocation coverage
+//!       - model exit versus provider process exit behavior coverage
+//!       - launch stdout truncation precedence coverage
+//!       - malformed protocol diagnostic and process-status preservation coverage
+//! ```
+
 pub mod support {
     pub mod provider_client;
 }

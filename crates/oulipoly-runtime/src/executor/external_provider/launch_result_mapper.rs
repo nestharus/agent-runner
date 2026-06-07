@@ -1,4 +1,41 @@
-//! Role: mapper.
+//! ## Declared roles
+//!
+//! Roles: mapper, accessor, predicate.
+//!
+//! - mapper: `map_launch_result_with_terminal_classification`,
+//!   `launch_session_capture`, `launch_provider_session_id`, and
+//!   `submitted_user_turn_from_marker_value` translate provider launch results
+//!   into runtime execution, terminal, session-capture, and submitted-turn
+//!   surfaces.
+//! - accessor: `marker_string`, `nonempty_marker_string`, and
+//!   `raw_provider_session_id` read optional marker/session fields from launch
+//!   JSON values.
+//! - predicate: `provider_session_id_is_present` and `nonempty_marker_string`
+//!   reject empty marker/session identifiers before runtime capture.
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: crates/oulipoly-runtime/src/executor/external_provider/launch_result_mapper.rs
+//!     role: adapter
+//!     Translates:
+//!       - launch-jsonl-stream-contract
+//!       - runtime-execution-result-contract
+//!       - terminal-cancel-outcome-contract
+//!       - session-capture-contract
+//!       - submitted-user-turn-marker-contract
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-runtime/src/executor/external_provider/launch_result_mapper.rs
+//!     role: intrinsic-surface
+//!     Domain: external-provider launch result mapping
+//!     Owns:
+//!       - LaunchResult stdout/stderr projection into ExecutionResult
+//!       - terminal classification override and fallback mapping
+//!       - launch session object to runtime session-capture mapping
+//!       - submitted-user-turn marker extraction semantics
+//!       - returned-artifact and child-invocation empty defaults for launch results
+//! ```
 
 use super::terminal_cancel_mapper::map_terminal_cancel_outcome;
 use crate::executor::{

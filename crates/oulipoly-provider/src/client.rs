@@ -1,3 +1,50 @@
+//! ## Declared roles
+//!
+//! Roles: orchestration, validator, parser, mapper, accessor, predicate.
+//!
+//! - orchestration: `ProviderClient::{invoke_typed, invoke_json, launch}`
+//!   sequence schema checks, artifact resolution, subprocess execution,
+//!   launch-stream processing, diagnostics capture, and result delivery.
+//! - validator: `validate_json_request`, `validate_launch_request`,
+//!   `validate_json_success_envelope`, `validate_json_error_envelope`, and
+//!   the stdout-presence/limit/object-shape guards enforce host/provider
+//!   protocol invariants before mapping outcomes.
+//! - parser: `parse_one_stdout_object`, `parse_stdout_utf8`, and
+//!   `parse_stdout_json_value` parse one non-launch provider stdout envelope.
+//! - mapper: `map_json_invocation_outcome`, the `map_*_error` helpers,
+//!   `process_limits_for`, `process_command_from_resolved`,
+//!   `launch_diagnostics`, and `parse_launch_output` translate process,
+//!   schema, and stream outcomes into provider-client results/errors.
+//! - accessor: `ProviderClient::options`, `last_diagnostics`,
+//!   `last_invocation_argv`, `ProviderEnv::into_env_vec`, and
+//!   `response_envelope_ok` expose option, environment, and envelope fields.
+//! - predicate: `success_envelope_has_nonzero_process`, `provider_nonzero`,
+//!   and `trailing_stdout_error_kind` classify outcome and stdout conditions.
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: crates/oulipoly-provider/src/client.rs
+//!     role: adapter
+//!     Translates:
+//!       - provider-client-options-contract
+//!       - provider-cli-subprocess-contract
+//!       - oulipoly-provider-generated-dto-contract
+//!       - launch-jsonl-stream-contract
+//!       - byte-limit-capture-contract
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-provider/src/client.rs
+//!     role: intrinsic-surface
+//!     Domain: provider client transport orchestration
+//!     Owns:
+//!       - provider timeout and output-limit defaults
+//!       - typed JSON invocation and launch entrypoints
+//!       - request validation and response-envelope protocol mapping
+//!       - stdout envelope parsing and launch stdout stream handoff
+//!       - process diagnostics and last-invocation argv capture
+//! ```
+
 use crate::error::{
     HostErrorKind, ProviderCapabilityError, ProviderClientError, ProviderDiagnostics,
     check_contract_and_request, request_id_from,

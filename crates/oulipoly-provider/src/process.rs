@@ -1,3 +1,51 @@
+//! ## Declared roles
+//!
+//! Roles: orchestration, mapper, predicate, accessor, filter, validator.
+//!
+//! - orchestration: `ProcessRunner` starts provider subprocesses, drains
+//!   stdio on worker threads, supervises total-runtime or stdout-line-gap
+//!   liveness, and terminates/reaps process trees on timeout or cancellation.
+//! - mapper: `map_completed_process_outcome`, `map_termination_diagnostics`,
+//!   `host_process_error`, `process_status`, `exit_code`, and
+//!   `process_nonzero` translate OS process observations into provider DTOs
+//!   and diagnostics.
+//! - predicate: `timeout_expired`, `cancellation_requested`,
+//!   `cancellation_grace_expired`, `should_force_kill`, `is_executable`, and
+//!   byte-content predicates classify process and capture state.
+//! - accessor: `ByteLimit::bytes`, `ProcessCommand::argv`,
+//!   `ProcessOutcome::{argv, diagnostics}`, `CancellationToken::is_cancelled`,
+//!   and test-only stdout/stderr text accessors expose owned state.
+//! - filter: `capture_window`, `ByteAccumulator`, `ByteTailAccumulator`, and
+//!   `alive_descendants` retain bounded byte/process subsets from larger
+//!   streams or process sets.
+//! - validator: embedded process-runner and byte-accumulator tests validate
+//!   pipe pressure, process-tree cleanup, cancellation, and truncation
+//!   contracts.
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: crates/oulipoly-provider/src/process.rs
+//!     role: adapter
+//!     Translates:
+//!       - provider-cli-subprocess-contract
+//!       - std-process-command-contract
+//!       - std-process-exit-status-contract
+//!       - process-supervision-liveness-contract
+//!       - byte-limit-capture-contract
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-provider/src/process.rs
+//!     role: intrinsic-surface
+//!     Domain: provider subprocess supervision and bounded byte capture
+//!     Owns:
+//!       - ByteLimit, CapturedBytes, and accumulator truncation semantics
+//!       - CancellationToken and ProcessLimits lifecycle inputs
+//!       - ProcessCommand, ProcessOutcome, and ProcessRunner public surfaces
+//!       - total-runtime and stdout-line-gap timeout behavior
+//!       - cross-platform process group termination and executable checks
+//! ```
+
 use crate::error::{HostErrorKind, ProviderClientError, ProviderDiagnostics};
 use crate::generated::ProcessStatus;
 use std::ffi::{OsStr, OsString};

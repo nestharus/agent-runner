@@ -1,3 +1,42 @@
+//! ## Declared roles
+//!
+//! Roles: validator, orchestration, formatter, mapper, accessor.
+//!
+//! - validator: launch-stream protocol tests assert accepted event mixtures,
+//!   bounded retention, malformed/kind/schema/base64/correlation failures,
+//!   sequence errors, and final-exit requirements.
+//! - orchestration: tests build JSONL fixtures, configure `LaunchJsonlReader`,
+//!   run the parser, and compare returned results or transport errors.
+//! - formatter: `format!`, JSONL helper calls, and string joins materialize
+//!   valid and invalid launch-stream fixture payloads.
+//! - mapper: table-driven case arrays map fixture labels and JSONL payloads to
+//!   expected provider-client transport kinds.
+//! - accessor: tests read event counts, retained marker values, stdout/stderr
+//!   bytes, omitted-event counts, and exit sequence values.
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: crates/oulipoly-provider/tests/launch_stream_protocol.rs
+//!     role: adapter
+//!     Translates:
+//!       - launch-jsonl-stream-contract
+//!       - oulipoly-provider-generated-dto-contract
+//!       - byte-limit-capture-contract
+//!       - provider-client-error-contract
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-provider/tests/launch_stream_protocol.rs
+//!     role: intrinsic-surface
+//!     Domain: launch JSONL protocol parser test suite
+//!     Owns:
+//!       - valid stdout, stderr, marker, heartbeat, and final-exit coverage
+//!       - bounded retention and output-byte budget coverage
+//!       - malformed line, unknown kind, and schema-invalid event coverage
+//!       - contract, request-id, and base64 rejection coverage
+//!       - sequence and finality error matrix coverage
+//! ```
+
 pub mod support {
     pub mod provider_client;
 }

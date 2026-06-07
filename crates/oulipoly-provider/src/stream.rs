@@ -1,3 +1,52 @@
+//! ## Declared roles
+//!
+//! Roles: parser, validator, mapper, accessor, filter, orchestration, formatter.
+//!
+//! - parser: `LaunchJsonlReader::read`, `LaunchStreamParser::{push, finish}`,
+//!   `parse_line`, `decode_event`, and `decode_base64` parse launch JSONL into
+//!   decoded event/result structures.
+//! - validator: `event_kind`, `validate_event_schema`,
+//!   `LaunchStreamParser::validate_sequence`, and line-size/finality checks
+//!   enforce launch stream contract, request correlation, event schema, and
+//!   sequence invariants.
+//! - mapper: `decode_event`, protocol/transport error helpers, and retained
+//!   cost helpers translate generated DTOs, base64 payloads, and parse failures
+//!   into host-facing launch events or provider-client errors.
+//! - accessor: `DecodedLaunchEvent::{seq, bytes}`, `LaunchResult` accessors,
+//!   and `LaunchJsonlReader::request_id` expose decoded event/result state.
+//! - filter: `LaunchEventRetention`, `LaunchMarkerRetention`,
+//!   `ByteAccumulator`, and `ByteTailAccumulator` keep bounded event, marker,
+//!   stdout, stderr, and raw-stdout evidence.
+//! - orchestration: `LaunchStdoutProcessor` connects live process stdout
+//!   draining to incremental launch stream parsing while preserving raw
+//!   diagnostics.
+//! - formatter: line-limit and malformed-line helpers format stable diagnostic
+//!   descriptions for oversized or invalid launch JSONL input.
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: crates/oulipoly-provider/src/stream.rs
+//!     role: adapter
+//!     Translates:
+//!       - launch-jsonl-stream-contract
+//!       - oulipoly-provider-generated-dto-contract
+//!       - byte-limit-capture-contract
+//!       - provider-client-error-contract
+//!       - launch-event-retention-contract
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-provider/src/stream.rs
+//!     role: intrinsic-surface
+//!     Domain: launch JSONL decoding and bounded retention
+//!     Owns:
+//!       - DecodedLaunchEvent, LaunchExit, and LaunchResult shapes
+//!       - LaunchStreamLimits defaults and bounded-by projection
+//!       - event order, finality, contract, request-id, and schema checks
+//!       - retained event, marker, stdout, stderr, and raw stdout budgets
+//!       - launch stdout drain behavior for live subprocess integration
+//! ```
+
 use crate::error::{
     HostErrorKind, ProviderClientError, ProviderDiagnostics, check_contract_and_request,
 };

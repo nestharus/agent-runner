@@ -1,10 +1,48 @@
 //! ## Declared roles
-//! orchestration, accessor, mapper, formatter
+//!
+//! Roles: orchestration, accessor, mapper, formatter, parser, predicate.
+//!
+//! - orchestration: `main`, `dispatch_fake_provider_mode`, launch fixture
+//!   modes, S7C/S5 fixture flows, sleep/hang modes, and probe child/grandchild
+//!   modes drive fake provider subprocess behavior for tests.
+//! - accessor: `fake_provider_mode`, `current_subcommand`, `s7c_env_or`,
+//!   `read_request_id`, `request_id_from_stdin`, and invocation/probe helpers
+//!   read environment, stdin, argv, and sidecar state.
+//! - mapper: mode dispatch, `response_json_for_kind`,
+//!   `s5_result_json_for_subcommand`, `provider_error_fields`,
+//!   `terminal_signal_for_exit_code`, and S7C value builders map fixture inputs
+//!   onto provider protocol payloads.
+//! - formatter: JSON envelope/event builders, invocation-record formatters,
+//!   S7C host-state/artifact formatters, and `json_escape` materialize stable
+//!   fake provider stdout/stderr/file payloads.
+//! - parser: `json_string_field`, `request_id_from_stdin`, and count helpers
+//!   parse minimal JSON/stdin and sidecar count state used by fixtures.
+//! - predicate: provider retryability, launch/describe/subcommand selectors,
+//!   stdin/probe env checks, and SIGTERM-ignore checks choose fixture branches.
 //!
 //! ## Adapter declarations
+//!
+//! ```yaml
 //! adapter_declarations:
-//!   - component: s7c-fake-provider-fixture-adapter
+//!   - component: crates/oulipoly-provider/tests/fixtures/provider_client/fake_provider.rs
 //!     role: adapter
+//!     Translates:
+//!       - fake-provider-fixture-contract
+//!       - provider-cli-subprocess-contract
+//!       - launch-jsonl-stream-contract
+//!       - oulipoly-provider-generated-dto-contract
+//!       - process-supervision-liveness-contract
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-provider/tests/fixtures/provider_client/fake_provider.rs
+//!     role: intrinsic-surface
+//!     Domain: fake provider executable fixture modes and protocol payloads
+//!     Owns:
+//!       - fake-provider mode vocabulary and environment dispatch
+//!       - describe, settings, rotation, migration, and launch fixture payloads
+//!       - invocation record, count, artifact, and probe sidecar file behavior
+//!       - process-tree, hang, pipe-pressure, and signal-resistance scenarios
+//!       - request-id correlation fallback and JSON escaping helpers
+//! ```
 
 use std::env;
 use std::fs;

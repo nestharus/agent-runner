@@ -1,3 +1,52 @@
+//! ## Declared roles
+//!
+//! Roles: orchestration, formatter, mapper, accessor, predicate, parser, filter, validator.
+//!
+//! - orchestration: `FakeProvider::{compile, run, run_with_env, spawn}` and
+//!   `LeakProbe` construct fixtures, launch fake provider binaries, coordinate
+//!   stdin/stdout collection, and supervise descendant cleanup.
+//! - formatter: `wrapper_script`, `unique_temp_dir`, and fixture environment
+//!   helpers format wrapper scripts, temp roots, and mode-specific env values.
+//! - mapper: `FakeProviderMode::{env, env_with_probe, env_with_record, as_str}`,
+//!   `normalize_envs`, and `record_env` map typed fixture modes and env inputs
+//!   onto subprocess environment vectors.
+//! - accessor: `FakeProvider::{path, is_executable, was_spawned}` and
+//!   `LeakProbe::observed_pids` expose fixture paths, marker state, and
+//!   descendant process observations.
+//! - predicate: `is_executable`, `process_alive`, and cleanup assertion helpers
+//!   classify filesystem/process liveness state.
+//! - parser: `LeakProbe::observed_pids` parses pid marker files emitted by the
+//!   fake-provider process-tree fixtures.
+//! - filter: `alive_descendants` selects still-running descendant pids from
+//!   observed probe records.
+//! - validator: `assert_fake_provider_compiled`, `assert_descendants_observed`,
+//!   and `assert_descendants_cleaned` validate fixture compilation and leak
+//!   cleanup preconditions/results.
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: crates/oulipoly-provider/src/testkit.rs
+//!     role: adapter
+//!     Translates:
+//!       - fake-provider-fixture-contract
+//!       - provider-cli-subprocess-contract
+//!       - process-supervision-liveness-contract
+//!       - rustc-fixture-compilation-contract
+//!       - test-process-environment-contract
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-provider/src/testkit.rs
+//!     role: intrinsic-surface
+//!     Domain: provider client fixture harness
+//!     Owns:
+//!       - FakeProvider compile/run/spawn helper surface
+//!       - FakeProviderMode vocabulary and env projection
+//!       - LeakProbe descendant observation and cleanup assertions
+//!       - cross-platform fixture executable and process cleanup helpers
+//!       - temporary fixture root and wrapper script allocation
+//! ```
+
 #![allow(dead_code)]
 
 use std::ffi::{OsStr, OsString};
