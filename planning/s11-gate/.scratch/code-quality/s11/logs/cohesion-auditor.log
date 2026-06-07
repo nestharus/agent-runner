@@ -1,4 +1,0 @@
-OULIPOLY_INVOCATION={"source":"opencode2","id":"32e0e543-709b-429e-b949-cb4e696a54b5"}
-OULIPOLY_TERMINAL_SIGNAL={"evidence":{"excerpt":"external provider transport failed: stdout_limit_exceeded"},"invocation_id":"32e0e543-709b-429e-b949-cb4e696a54b5","kind":"SpawnError","session_id":null}
-OULIPOLY_RESULT={"agent_runner_chain_id":null,"agent_runner_invocation_id":"32e0e543-709b-429e-b949-cb4e696a54b5","error_category":"spawn_error","exit_code":-1,"finished_at":"2026-06-06T21:48:07.706925447+00:00","id":"32e0e543-709b-429e-b949-cb4e696a54b5","provider_name":"opencode2","provider_session_id":null,"status":"failed","success":false,"terminal_reason":"spawn_error"}
-Error: external provider transport failed: stdout_limit_exceeded
