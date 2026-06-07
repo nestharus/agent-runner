@@ -1,4 +1,4 @@
-# opencode P0+P1 touched production surfaces (incremental 225a903..HEAD)
+# opencode P0+P1 touched production surfaces (incremental 225a903..HEAD, post strict-validation)
 
 - crates/oulipoly-config/src/model.rs
 - crates/oulipoly-config/src/providers.rs
@@ -18,5 +18,9 @@
 - crates/oulipoly-runtime/src/executor/terminal_signal.rs
 - crates/oulipoly-state/src/db.rs
 - scripts/opencode-turns
+- src-tauri/src/error_emit.rs
+- src-tauri/src/resume_cli.rs
+- src-tauri/src/run/repl/orchestration.rs
+- src-tauri/src/run/resume/mod.rs
 - src-tauri/src/run/resume/orchestration.rs
 - src-tauri/src/run/resume/validator.rs
