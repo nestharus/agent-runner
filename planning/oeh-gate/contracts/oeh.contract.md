@@ -78,11 +78,11 @@ adapter_declarations:
   - component: crates/oulipoly-runtime/src/executor/cli/terminal_signal.rs
     role: adapter
     Translates:
-      - executor-terminal-signal-dto-contract
-      - canonical-terminal-reason-vocabulary
       - std-process-exit-status-contract
       - unix-signal-name-contract
       - signal-hook-forwarding-contract
+      - executor-terminal-signal-dto-contract
+      - terminal-signal-recognizer-contract
   - component: crates/oulipoly-runtime/src/executor/providers/opencode.rs
     role: adapter
     Translates:
@@ -119,9 +119,11 @@ intrinsic_surface_declarations:
       - supervised terminal reason propagation
   - component: crates/oulipoly-runtime/src/executor/cli/terminal_signal.rs
     role: intrinsic-surface
-    Domain: terminal_reason_mapping
+    Domain: runtime terminal-signal vocabulary + reason mapping
     Owns:
-      - canonical terminal reason mapping by TerminalSignalKind
-      - provider-error evidence preservation for Unknown terminal signals
-      - std::process::ExitStatus reason mapping for clean/nonzero/signal exits
+      - full TerminalSignalKind vocabulary
+      - terminal status and synthetic exit-code mapping
+      - built-in terminal evidence construction
+      - terminal reason canonicalization hook
+      - provider-error terminal-reason evidence preservation for Unknown signals
 ```

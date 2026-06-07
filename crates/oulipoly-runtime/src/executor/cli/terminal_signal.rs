@@ -40,6 +40,7 @@
 //!       - terminal status and synthetic exit-code mapping
 //!       - built-in terminal evidence construction
 //!       - terminal reason canonicalization hook
+//!       - provider-error terminal-reason evidence preservation for Unknown signals
 //! ```
 
 #[cfg(unix)]
