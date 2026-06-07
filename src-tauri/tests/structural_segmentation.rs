@@ -90,6 +90,12 @@ fn no_dangling_doomed_dir_link_in_tracked_files() {
             continue;
         }
 
+        // Gate diff artifacts quote other files verbatim (including historical
+        // doc text); they are quotations, not live links.
+        if tracked_file.starts_with("planning/") && tracked_file.ends_with(".patch") {
+            continue;
+        }
+
         let path = root.join(tracked_file);
         let content = fs::read(&path)
             .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
