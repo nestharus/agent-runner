@@ -262,4 +262,26 @@ mod tests {
 
         assert_eq!(signal.kind, TerminalSignalKind::CleanExit);
     }
+
+    #[test]
+    fn ordinary_output_quota_and_rate_text_preserves_clean_exit() {
+        let signal = Recognizer.recognize(&evidence_with_status(
+            b"assistant mentioned quota exhausted and rate limit exceeded without an error event",
+            b"",
+            TerminalStatusEvidence::Exited { code: 0 },
+        ));
+
+        assert_eq!(signal.kind, TerminalSignalKind::CleanExit);
+    }
+
+    #[test]
+    fn ordinary_output_quota_and_rate_text_preserves_nonzero_exit() {
+        let signal = Recognizer.recognize(&evidence_with_status(
+            b"assistant mentioned quota exhausted and rate limit exceeded without an error event",
+            b"",
+            TerminalStatusEvidence::Exited { code: 1 },
+        ));
+
+        assert_eq!(signal.kind, TerminalSignalKind::NonzeroExit);
+    }
 }
