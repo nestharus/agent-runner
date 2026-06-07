@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -231,6 +232,12 @@ struct ProcessThreads {
     stdin: thread::JoinHandle<bool>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeoutMode {
+    TotalRuntime,
+    StdoutLineGap,
+}
+
 impl ProcessRunner {
     pub fn new(limits: ProcessLimits) -> Self {
         Self { limits }
@@ -241,6 +248,35 @@ impl ProcessRunner {
         command: ProcessCommand,
         stdin_bytes: Vec<u8>,
         envs: I,
+    ) -> Result<ProcessOutcome, ProviderClientError>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
+    {
+        self.run_with_timeout_mode(command, stdin_bytes, envs, TimeoutMode::TotalRuntime)
+    }
+
+    pub(crate) fn run_with_stdout_line_gap_timeout<I, K, V>(
+        &self,
+        command: ProcessCommand,
+        stdin_bytes: Vec<u8>,
+        envs: I,
+    ) -> Result<ProcessOutcome, ProviderClientError>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
+    {
+        self.run_with_timeout_mode(command, stdin_bytes, envs, TimeoutMode::StdoutLineGap)
+    }
+
+    fn run_with_timeout_mode<I, K, V>(
+        &self,
+        command: ProcessCommand,
+        stdin_bytes: Vec<u8>,
+        envs: I,
+        timeout_mode: TimeoutMode,
     ) -> Result<ProcessOutcome, ProviderClientError>
     where
         I: IntoIterator<Item = (K, V)>,
@@ -279,13 +315,18 @@ impl ProcessRunner {
         let stdin = child.stdin.take().expect("stdin pipe should be configured");
         let stdout_limit = self.limits.stdout_limit;
         let stderr_limit = self.limits.stderr_limit;
-        let stdout_thread = thread::spawn(move || drain_reader(stdout, stdout_limit));
-        let stderr_thread = thread::spawn(move || drain_reader(stderr, stderr_limit));
+        let (stdout_line_activity, stdout_line_rx) = stdout_line_activity_channel(timeout_mode);
+        let stdout_thread =
+            thread::spawn(move || drain_reader(stdout, stdout_limit, stdout_line_activity));
+        let stderr_thread = thread::spawn(move || drain_reader(stderr, stderr_limit, None));
         let stdin_thread = thread::spawn(move || write_stdin(stdin, stdin_bytes));
 
         let started = Instant::now();
+        let mut last_stdout_line = started;
         let mut cancellation_started = None;
         loop {
+            record_stdout_line_activity(&stdout_line_rx, &mut last_stdout_line);
+
             if let Some(status) = child
                 .try_wait()
                 .map_err(|error| host_process_error(HostErrorKind::WaitFailed, &command, error))?
@@ -308,7 +349,7 @@ impl ProcessRunner {
                 });
             }
 
-            if started.elapsed() >= self.limits.timeout {
+            if timeout_expired(timeout_mode, started, last_stdout_line, self.limits.timeout) {
                 return Err(self.terminate_and_collect(
                     child,
                     command,
@@ -395,18 +436,68 @@ fn notify_spawn_observer(observer: &Option<ProcessSpawnObserver>, child_id: u32)
     }
 }
 
-fn drain_reader(mut reader: impl Read, limit: ByteLimit) -> CapturedBytes {
+fn stdout_line_activity_channel(
+    timeout_mode: TimeoutMode,
+) -> (Option<Sender<Instant>>, Option<Receiver<Instant>>) {
+    match timeout_mode {
+        TimeoutMode::StdoutLineGap => {
+            let (tx, rx) = mpsc::channel();
+            (Some(tx), Some(rx))
+        }
+        TimeoutMode::TotalRuntime => (None, None),
+    }
+}
+
+fn record_stdout_line_activity(rx: &Option<Receiver<Instant>>, last_stdout_line: &mut Instant) {
+    let Some(rx) = rx else {
+        return;
+    };
+    while let Ok(observed_at) = rx.try_recv() {
+        *last_stdout_line = observed_at;
+    }
+}
+
+fn timeout_expired(
+    mode: TimeoutMode,
+    started: Instant,
+    last_stdout_line: Instant,
+    timeout: Duration,
+) -> bool {
+    match mode {
+        TimeoutMode::TotalRuntime => started.elapsed() >= timeout,
+        TimeoutMode::StdoutLineGap => last_stdout_line.elapsed() >= timeout,
+    }
+}
+
+fn drain_reader(
+    mut reader: impl Read,
+    limit: ByteLimit,
+    stdout_line_activity: Option<Sender<Instant>>,
+) -> CapturedBytes {
     let mut accumulator = ByteAccumulator::new(limit);
     let mut buffer = [0_u8; 8192];
     loop {
         match reader.read(&mut buffer) {
             Ok(0) => break,
-            Ok(read) => accumulator.push(&buffer[..read]),
+            Ok(read) => {
+                let chunk = &buffer[..read];
+                notify_stdout_line_activity(&stdout_line_activity, chunk);
+                accumulator.push(chunk);
+            }
             Err(error) if error.kind() == ErrorKind::Interrupted => {}
             Err(_) => break,
         }
     }
     accumulator.finish()
+}
+
+fn notify_stdout_line_activity(activity: &Option<Sender<Instant>>, chunk: &[u8]) {
+    let Some(activity) = activity else {
+        return;
+    };
+    for _ in chunk.iter().filter(|byte| **byte == b'\n') {
+        let _ = activity.send(Instant::now());
+    }
 }
 
 fn write_stdin(mut stdin: impl Write, bytes: Vec<u8>) -> bool {

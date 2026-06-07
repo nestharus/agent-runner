@@ -7,8 +7,8 @@
 //!
 //! The fake provider spawned here is the single shared artifact for every
 //! account in the model; it branches on `params.settings_id` (the per-account
-//! identity) so one account can hang past the host handshake timeout while a
-//! sibling account answers immediately.
+//! identity) so one account can hang past the host handshake timeout or launch
+//! heartbeat gap while a sibling account answers immediately.
 
 use oulipoly_config::{
     ModelConfig, PromptMode, ProviderConfig, provider_implementation_ref::ProviderImplementationRef,
@@ -42,13 +42,27 @@ fn write_executable(path: &Path, body: &str) {
 }
 
 fn make_fixture(slow: &[&str], unavailable: &[&str]) -> Fixture {
+    make_fixture_with_launch_stalls(slow, unavailable, &[])
+}
+
+fn make_fixture_with_launch_stalls(
+    slow: &[&str],
+    unavailable: &[&str],
+    launch_stalls: &[&str],
+) -> Fixture {
     let dir = tempfile::tempdir().expect("tempdir");
     let order_path = dir.path().join("order.txt");
     let launch_record_path = dir.path().join("launch-request.json");
     let provider_path = dir.path().join("fake-provider.py");
     write_executable(
         &provider_path,
-        &fake_provider_body(&order_path, &launch_record_path, slow, unavailable),
+        &fake_provider_body(
+            &order_path,
+            &launch_record_path,
+            slow,
+            unavailable,
+            launch_stalls,
+        ),
     );
     Fixture {
         _dir: dir,
@@ -75,6 +89,7 @@ fn fake_provider_body(
     launch_record_path: &Path,
     slow: &[&str],
     unavailable: &[&str],
+    launch_stalls: &[&str],
 ) -> String {
     format!(
         r#"#!/usr/bin/env python3
@@ -88,6 +103,7 @@ ORDER = pathlib.Path({order_path})
 LAUNCH_RECORD = pathlib.Path({launch_record_path})
 SLOW = {slow}
 UNAVAILABLE = {unavailable}
+LAUNCH_STALLS = {launch_stalls}
 SLEEP_SECONDS = {sleep}
 
 
@@ -196,6 +212,10 @@ def launch(request):
     LAUNCH_RECORD.write_text(json.dumps(request, sort_keys=True))
     reqid = request_id(request)
     write_json({{"contract": CONTRACT, "request_id": reqid, "seq": 1, "time_unix_ms": 1001, "kind": "stdout", "data_base64": "AAH/"}})
+    if sid in LAUNCH_STALLS:
+        write_json({{"contract": CONTRACT, "request_id": reqid, "seq": 2, "time_unix_ms": 1002, "kind": "heartbeat", "detail": "stall before final exit"}})
+        time.sleep(SLEEP_SECONDS)
+        return 0
     write_json(exit_event(request, 2, 0, "clean_exit"))
     return 0
 
@@ -222,6 +242,7 @@ if __name__ == "__main__":
             serde_json::to_string(&launch_record_path.display().to_string()).unwrap(),
         slow = py_set(slow),
         unavailable = py_set(unavailable),
+        launch_stalls = py_set(launch_stalls),
         sleep = SLOW_SLEEP_SECONDS,
     )
 }
@@ -323,6 +344,28 @@ fn external_provider_unavailable_rotates_to_next_account_and_succeeds() {
         order_lines(&fixture.order_path),
         ["policy:unavail-1", "policy:fast-2", "launch:fast-2"],
         "an unavailable/auth-expired account must rotate to the next pool account"
+    );
+}
+
+#[test]
+fn external_launch_heartbeat_gap_timeout_rotates_to_next_account_and_succeeds() {
+    let fixture = make_fixture_with_launch_stalls(&[], &[], &["stall-1"]);
+    let model = rotation_model(&fixture, &["stall-1", "fast-2"]);
+
+    let result =
+        execute(model, 0).expect("a launch heartbeat-gap timeout on the first account must rotate");
+
+    assert_eq!(result.exit_code, 0);
+    assert_eq!(result.stdout, vec![0, 1, 255]);
+    assert_eq!(
+        order_lines(&fixture.order_path),
+        [
+            "policy:stall-1",
+            "launch:stall-1",
+            "policy:fast-2",
+            "launch:fast-2",
+        ],
+        "launch gap timeout must rotate to the next pool account"
     );
 }
 

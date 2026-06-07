@@ -164,6 +164,10 @@ fn main() {
             let _ = io::stdout().flush();
             sleep_forever()
         }
+        "launch-heartbeats-then-exit" => launch_heartbeats_then_exit(),
+        "launch-heartbeat-then-child-grandchild-hang" => {
+            launch_heartbeat_then_child_grandchild_hang()
+        }
         other => {
             eprintln!("unknown fake-provider mode: {other}");
             64
@@ -785,6 +789,27 @@ fn launch_valid(exit_code: i32) -> i32 {
     write_jsonl(&heartbeat_event(&request_id, 4));
     write_jsonl(&exit_event(&request_id, 5, exit_code));
     0
+}
+
+fn launch_heartbeats_then_exit() -> i32 {
+    let request_id = read_request_id();
+    write_jsonl(&stdout_event(&request_id, 1, "YQ=="));
+    for seq in 2..=5 {
+        thread::sleep(Duration::from_millis(50));
+        write_jsonl(&heartbeat_event(&request_id, seq));
+    }
+    thread::sleep(Duration::from_millis(50));
+    write_jsonl(&exit_event(&request_id, 6, 0));
+    0
+}
+
+fn launch_heartbeat_then_child_grandchild_hang() -> i32 {
+    let request_id = read_request_id();
+    write_jsonl(&stdout_event(&request_id, 1, "YQ=="));
+    thread::sleep(Duration::from_millis(50));
+    write_jsonl(&heartbeat_event(&request_id, 2));
+    thread::sleep(Duration::from_millis(50));
+    child_grandchild()
 }
 
 fn write_jsonl(line: &str) {

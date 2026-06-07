@@ -3,7 +3,9 @@ pub mod support {
 }
 
 use oulipoly_provider::client::{CancellationToken, ProviderClient, ProviderClientOptions};
+use oulipoly_provider::generated::ProcessStatus;
 use oulipoly_provider::resolver::ProviderArtifactRef;
+use oulipoly_provider::stream::DecodedLaunchEvent;
 use std::time::Duration;
 use support::provider_client::{
     REQUEST_ID, fake_provider_source, launch_request,
@@ -68,6 +70,47 @@ fn launch_timeout_cleans_descendants_and_preserves_stderr_diagnostics() {
     leak_probe.assert_no_descendants();
 }
 
+#[test]
+fn launch_heartbeat_gap_does_not_cap_total_turn_runtime() {
+    let fake = FakeProvider::compile(fake_provider_source());
+    let client = launch_gap_client(fake.path(), Duration::from_millis(120));
+
+    let result = client
+        .launch(
+            launch_request(),
+            FakeProviderMode::LaunchHeartbeatsThenExit.env(),
+        )
+        .expect("heartbeat activity should keep a long launch alive");
+
+    assert_eq!(result.exit.status, ProcessStatus::Exited { code: 0 });
+    assert!(
+        result
+            .events
+            .iter()
+            .filter(|event| matches!(event, DecodedLaunchEvent::Heartbeat { .. }))
+            .count()
+            >= 4
+    );
+}
+
+#[test]
+fn launch_heartbeat_gap_timeout_kills_process_tree_after_stream_stalls() {
+    let fake = FakeProvider::compile(fake_provider_source());
+    let leak_probe = LeakProbe::new();
+    let client = launch_gap_client(fake.path(), Duration::from_millis(200));
+
+    let error = client
+        .launch(
+            launch_request(),
+            FakeProviderMode::LaunchHeartbeatThenChildGrandchildHang.env_with_probe(&leak_probe),
+        )
+        .expect_err("stalled launch stream should hit the heartbeat gap timeout");
+
+    assert_eq!(error.transport_kind(), "host_timeout");
+    assert_eq!(error.request_id(), Some(REQUEST_ID));
+    leak_probe.assert_no_descendants();
+}
+
 fn launch_client(
     path: impl Into<std::path::PathBuf>,
     cancellation: Option<CancellationToken>,
@@ -78,5 +121,14 @@ fn launch_client(
             .with_timeout(Duration::from_secs(5))
             .with_kill_after_grace(Duration::from_millis(25))
             .with_cancellation(cancellation),
+    )
+}
+
+fn launch_gap_client(path: impl Into<std::path::PathBuf>, gap: Duration) -> ProviderClient {
+    ProviderClient::new(
+        ProviderArtifactRef::Path { path: path.into() },
+        ProviderClientOptions::default()
+            .with_launch_heartbeat_gap(gap)
+            .with_kill_after_grace(Duration::from_millis(50)),
     )
 }
