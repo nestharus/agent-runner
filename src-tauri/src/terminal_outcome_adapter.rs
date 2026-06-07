@@ -92,6 +92,7 @@ fn category_for_signal_kind(kind: TerminalSignalKind) -> Option<TerminalOutcomeC
     }
 }
 
+#[derive(Clone, Copy)]
 pub enum TerminalSignalDisposition {
     QuotaExhaustedRetry,
     MaybeQuotaVerify,
@@ -154,51 +155,98 @@ pub fn apply_terminal_signal_outcome(
     };
 
     let disposition = terminal_signal_disposition(signal);
+    // AGE-153 marker authority remains emit_terminal_signal_marker via the side-effect helpers.
     match disposition {
         TerminalSignalDisposition::QuotaExhaustedRetry => {
-            // AGE-153 marker authority: emit_terminal_signal_marker.
-            emit_terminal_signal_marker_or_warn(signal, ctx);
-            // AGE-163 forensics write `next_available_at` for the routing
-            // working-set predicate; the legacy `exhausted_at` column is the
-            // immediate durable mark that AGE-166 tests + the orchestration
-            // loop's confirm path also rely on.
-            apply_typed_post_failure_forensics(signal, ctx);
-            mark_provider_exhausted(ctx.state_db, ctx.provider);
+            apply_typed_post_failure_forensics_quota_retry_side_effects(signal, ctx)
         }
         TerminalSignalDisposition::MaybeQuotaVerify => {
-            // AGE-166: maybe-quota emits the marker but does NOT mark exhausted.
-            // Confirmation (second consecutive zero-turn) routes through
-            // `confirm_maybe_quota_exhausted` which marks the provider exhausted.
-            emit_terminal_signal_marker_or_warn(signal, ctx);
+            apply_maybe_quota_verify_side_effects(signal, ctx);
         }
         TerminalSignalDisposition::ProlongedSilenceFail
         | TerminalSignalDisposition::InteractiveFail => {
-            emit_terminal_signal_marker_or_warn(signal, ctx);
-            apply_typed_post_failure_forensics(signal, ctx);
+            apply_typed_post_failure_forensics_terminal_failure_side_effects(signal, ctx);
         }
         TerminalSignalDisposition::InteractiveClean | TerminalSignalDisposition::NotApplicable => {}
     }
     disposition
 }
 
+fn apply_typed_post_failure_forensics_quota_retry_side_effects<W: io::Write>(
+    signal: &TerminalSignal,
+    ctx: &mut TerminalSignalContext<'_, W>,
+) {
+    // AGE-153 marker authority: emit_terminal_signal_marker.
+    emit_terminal_signal_marker_or_warn(signal, ctx);
+    // AGE-163 forensics write `next_available_at` for the routing
+    // working-set predicate; the legacy `exhausted_at` column is the
+    // immediate durable mark that AGE-166 tests + the orchestration
+    // loop's confirm path also rely on.
+    apply_typed_post_failure_forensics(signal, ctx);
+    mark_provider_exhausted(ctx.state_db, ctx.provider);
+}
+
+fn apply_maybe_quota_verify_side_effects<W: io::Write>(
+    signal: &TerminalSignal,
+    ctx: &mut TerminalSignalContext<'_, W>,
+) {
+    // AGE-166: maybe-quota emits the marker but does NOT mark exhausted.
+    // Confirmation (second consecutive zero-turn) routes through
+    // `confirm_maybe_quota_exhausted` which marks the provider exhausted.
+    emit_terminal_signal_marker_or_warn(signal, ctx);
+}
+
+fn apply_typed_post_failure_forensics_terminal_failure_side_effects<W: io::Write>(
+    signal: &TerminalSignal,
+    ctx: &mut TerminalSignalContext<'_, W>,
+) {
+    emit_terminal_signal_marker_or_warn(signal, ctx);
+    apply_typed_post_failure_forensics(signal, ctx);
+}
+
 fn apply_typed_post_failure_forensics<W: io::Write>(
     signal: &TerminalSignal,
     ctx: &mut TerminalSignalContext<'_, W>,
 ) {
-    let Some(failure_class) = FailureClass::from_terminal_signal_kind(signal.kind) else {
+    let Some(failure_class) = terminal_signal_failure_class(signal) else {
         return;
     };
-    if let Err(err) = apply_post_failure_forensics(
+    persist_typed_post_failure_forensics_or_warn(ctx, failure_class);
+}
+
+fn terminal_signal_failure_class(signal: &TerminalSignal) -> Option<FailureClass> {
+    FailureClass::from_terminal_signal_kind(signal.kind)
+}
+
+fn persist_typed_post_failure_forensics_or_warn<W: io::Write>(
+    ctx: &mut TerminalSignalContext<'_, W>,
+    failure_class: FailureClass,
+) {
+    if let Err(err) = persist_typed_post_failure_forensics(ctx, failure_class) {
+        warn_typed_post_failure_forensics_failed(ctx.stderr, err);
+    }
+}
+
+fn persist_typed_post_failure_forensics<W: io::Write>(
+    ctx: &TerminalSignalContext<'_, W>,
+    failure_class: FailureClass,
+) -> Result<(), oulipoly_runtime::migration::MigrationError> {
+    apply_post_failure_forensics(
         ctx.state_db,
         ctx.provider,
         failure_class,
         chrono::Utc::now(),
-    ) {
-        let _ = writeln!(
-            ctx.stderr,
-            "Warning: Failed to apply post-failure forensics: {err:?}"
-        );
-    }
+    )
+}
+
+fn warn_typed_post_failure_forensics_failed(
+    stderr: &mut impl io::Write,
+    err: oulipoly_runtime::migration::MigrationError,
+) {
+    let _ = writeln!(
+        stderr,
+        "Warning: Failed to apply post-failure forensics: {err:?}"
+    );
 }
 
 /// AGE-166: confirm a previously-tentative `MaybeQuotaExhausted` signal.
@@ -210,8 +258,19 @@ pub fn confirm_maybe_quota_exhausted<W: io::Write>(
     signal: &TerminalSignal,
     ctx: &mut TerminalSignalContext<'_, W>,
 ) -> &'static str {
+    apply_maybe_quota_confirmation_side_effects(signal, ctx);
+    confirmed_maybe_quota_error_category()
+}
+
+fn apply_maybe_quota_confirmation_side_effects<W: io::Write>(
+    signal: &TerminalSignal,
+    ctx: &mut TerminalSignalContext<'_, W>,
+) {
     emit_terminal_signal_marker_or_warn(signal, ctx);
     mark_provider_exhausted(ctx.state_db, ctx.provider);
+}
+
+fn confirmed_maybe_quota_error_category() -> &'static str {
     ErrorCategory::QuotaExhausted.as_str()
 }
 

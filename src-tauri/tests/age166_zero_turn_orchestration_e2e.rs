@@ -17,8 +17,8 @@ use agent_runner_lib::terminal_outcome_adapter::{
     classify_error_category_with_fallback, confirm_maybe_quota_exhausted, terminal_signal_reason,
 };
 use agent_runner_lib::zero_turn_orchestration::{
-    ZeroTurnAction, ZeroTurnClassification, ZeroTurnConfirmationState, classify_completion_delta,
-    next_action, record_baseline,
+    ZeroTurnAction, ZeroTurnClassification, ZeroTurnConfirmationState, ZeroTurnEvidence,
+    classify_completion_delta, next_action, record_baseline,
 };
 use oulipoly_runtime::diagnostics::ErrorCategory;
 use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind;
@@ -149,14 +149,22 @@ fn counts(assistant: u64) -> SessionTurnCounts {
 }
 
 fn maybe_signal(classification: &ZeroTurnClassification) -> TerminalSignal {
+    maybe_evidence_signal(expected_maybe_quota_evidence(classification))
+}
+
+fn expected_maybe_quota_evidence(classification: &ZeroTurnClassification) -> &ZeroTurnEvidence {
     match classification {
-        ZeroTurnClassification::MaybeQuotaExhausted { evidence } => TerminalSignal {
-            kind: TerminalSignalKind::MaybeQuotaExhausted,
-            provider_name: evidence.provider_name.clone(),
-            evidence: evidence.evidence.clone(),
-            observed_at: SystemTime::UNIX_EPOCH,
-        },
+        ZeroTurnClassification::MaybeQuotaExhausted { evidence } => evidence,
         other => panic!("expected MaybeQuotaExhausted classification, got {other:?}"),
+    }
+}
+
+fn maybe_evidence_signal(evidence: &ZeroTurnEvidence) -> TerminalSignal {
+    TerminalSignal {
+        kind: TerminalSignalKind::MaybeQuotaExhausted,
+        provider_name: evidence.provider_name.clone(),
+        evidence: evidence.evidence.clone(),
+        observed_at: SystemTime::UNIX_EPOCH,
     }
 }
 

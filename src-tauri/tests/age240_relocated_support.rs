@@ -1798,10 +1798,24 @@ print(json.dumps(response))
 
 #[cfg(unix)]
 pub fn read_provider_settings_migration_record(record_path: &Path) -> serde_json::Value {
-    std::fs::read_to_string(record_path)
-        .expect("settings.migrate record should exist")
-        .lines()
-        .map(|line| serde_json::from_str(line).expect("recorded request should parse"))
+    let text = provider_settings_migration_record_text(record_path);
+    let line = first_provider_settings_migration_record_line(&text);
+    parse_provider_settings_migration_record_line(line)
+}
+
+#[cfg(unix)]
+fn provider_settings_migration_record_text(record_path: &Path) -> String {
+    std::fs::read_to_string(record_path).expect("settings.migrate record should exist")
+}
+
+#[cfg(unix)]
+fn first_provider_settings_migration_record_line(text: &str) -> &str {
+    text.lines()
         .next()
         .expect("settings.migrate request should be recorded")
+}
+
+#[cfg(unix)]
+fn parse_provider_settings_migration_record_line(line: &str) -> serde_json::Value {
+    serde_json::from_str(line).expect("recorded request should parse")
 }

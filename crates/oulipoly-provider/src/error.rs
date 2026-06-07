@@ -132,14 +132,12 @@ impl ProviderCapabilityError {
         process_status: Option<ProcessStatus>,
     ) -> Result<Self, ProviderClientError> {
         let subcommand = subcommand.into();
-        let envelope = parse_error_response_envelope(envelope).map_err(|error| {
-            schema_invalid_error_response(
-                &subcommand,
-                error,
-                diagnostics.clone(),
-                process_status.clone(),
-            )
-        })?;
+        let envelope = parse_valid_error_response_envelope(
+            &subcommand,
+            envelope,
+            &diagnostics,
+            &process_status,
+        )?;
         Ok(capability_error_from_envelope(
             subcommand,
             envelope,
@@ -393,6 +391,22 @@ fn parse_error_response_envelope(
     let request_id = request_id_from(&envelope);
     serde_json::from_value(envelope)
         .map_err(|error| error_response_envelope_parse_error(request_id, error))
+}
+
+fn parse_valid_error_response_envelope(
+    subcommand: &str,
+    envelope: Value,
+    diagnostics: &ProviderDiagnostics,
+    process_status: &Option<ProcessStatus>,
+) -> Result<ErrorResponseEnvelope, ProviderClientError> {
+    parse_error_response_envelope(envelope).map_err(|error| {
+        schema_invalid_error_response(
+            subcommand,
+            error,
+            diagnostics.clone(),
+            process_status.clone(),
+        )
+    })
 }
 
 fn error_response_envelope_parse_error(

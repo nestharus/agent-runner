@@ -269,12 +269,15 @@ impl ProviderSettingsHost {
     }
 
     fn ensure_settings_supported(&self, model_name: &str) -> Result<(), ProviderSettingsError> {
-        let target = self.describe_settings_target(model_name)?;
-        if target.settings_supported {
-            Ok(())
-        } else {
-            Err(ProviderSettingsError::unsupported())
-        }
+        let target = self.settings_support_target(model_name)?;
+        validate_settings_supported(&target)
+    }
+
+    fn settings_support_target(
+        &self,
+        model_name: &str,
+    ) -> Result<ProviderSettingsTarget, ProviderSettingsError> {
+        self.describe_settings_target(model_name)
     }
 
     fn call_provider<R, Params>(
@@ -301,17 +304,35 @@ impl ProviderSettingsHost {
     {
         let mut value = serde_json::to_value(RequestEnvelope {
             contract: CONTRACT_VERSION.to_string(),
-            request_id: format!("provider-settings-{}", uuid::Uuid::new_v4()),
+            request_id: provider_settings_request_id(),
             provider_instance_id: Some("provider-settings".to_string()),
             host: host_context(self.registry.host_options()),
             params,
         })
         .map_err(schema_request_error)?;
-        if let Some(host) = value.get_mut("host").and_then(Value::as_object_mut) {
-            host.entry("env".to_string())
-                .or_insert_with(|| Value::Object(Map::new()));
-        }
+        ensure_host_env_object(&mut value);
         Ok(value)
+    }
+}
+
+fn validate_settings_supported(
+    target: &ProviderSettingsTarget,
+) -> Result<(), ProviderSettingsError> {
+    if target.settings_supported {
+        Ok(())
+    } else {
+        Err(ProviderSettingsError::unsupported())
+    }
+}
+
+fn provider_settings_request_id() -> String {
+    format!("provider-settings-{}", uuid::Uuid::new_v4())
+}
+
+fn ensure_host_env_object(value: &mut Value) {
+    if let Some(host) = value.get_mut("host").and_then(Value::as_object_mut) {
+        host.entry("env".to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
     }
 }
 

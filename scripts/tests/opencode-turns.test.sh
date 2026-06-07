@@ -98,10 +98,20 @@ file_size_bytes() {
   local path="$1"
 
   if [[ ! -f "$path" ]]; then
-    echo 0
+    missing_file_size_bytes
     return
   fi
+  existing_file_size_bytes "$path"
+}
+
+existing_file_size_bytes() {
+  local path="$1"
+
   wc -c <"$path" | tr -d ' '
+}
+
+missing_file_size_bytes() {
+  echo 0
 }
 
 marker_size_sample() {
@@ -141,11 +151,27 @@ assert_marker_stopped_growing() {
 process_state() {
   local pid="$1"
 
-  if ! kill -0 "$pid" 2>/dev/null; then
-    echo absent
+  if ! process_exists "$pid"; then
+    absent_process_state
     return
   fi
+  read_process_state "$pid"
+}
+
+process_exists() {
+  local pid="$1"
+
+  kill -0 "$pid" 2>/dev/null
+}
+
+read_process_state() {
+  local pid="$1"
+
   ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ' || true
+}
+
+absent_process_state() {
+  echo absent
 }
 
 process_state_allowed() {

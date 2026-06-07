@@ -48,11 +48,9 @@ pub(super) struct CompletedAttemptInput<'a, 'state, 'ctx> {
 }
 
 pub(super) fn finalize_completed_attempt(
-    input: CompletedAttemptInput<'_, '_, '_>,
+    mut input: CompletedAttemptInput<'_, '_, '_>,
 ) -> BalancedLoopControl {
-    let terminal_signal_disposition =
-        apply_terminal_signal_outcome(input.terminal_signal, input.terminal_signal_ctx);
-    validator::expect_completed_attempt_disposition(terminal_signal_disposition);
+    apply_terminal_signal_outcome_for_completed_attempt(&mut input);
     supervise_captured_child_invocations(
         &input.env.state,
         input.invocation_row_id,
@@ -63,30 +61,10 @@ pub(super) fn finalize_completed_attempt(
     emit_session_capture_failure(input.result);
     update_session_capture(input.env, input.invocation_row_id, input.result);
 
-    let success = execution_succeeded(input.result);
+    let classification = classify_completed_attempt_with_balanced_result_error_category(&input);
 
-    let error_category = balanced_result_error_category(
-        input.agent_runtime_services,
-        input.result,
-        input.all_models,
-        input.working_dir,
-    );
-    let quota_exhausted = error_category_is_quota_exhausted(error_category.as_deref());
-
-    if let Err(err) = record_returned_artifacts_for_completed_attempt(&input) {
-        finalize_returned_artifacts_persist_failure(mapper::artifact_persist_failure_input(
-            mapper::ArtifactPersistFailureInputSource {
-                agent_runtime_services: input.agent_runtime_services,
-                env: input.env,
-                invocation: input.invocation,
-                invocation_row_id: input.invocation_row_id,
-                guard: input.guard,
-                provider_name: input.provider_name,
-                provider_session_id: input.zero_turn_provider_session_id,
-                error: &err,
-            },
-        ));
-        return BalancedLoopControl::Return(Ok(1));
+    if let Some(control) = handle_returned_artifacts_persist_failure(&mut input) {
+        return control;
     }
 
     formatter::emit_unknown_diagnostic_if_settled_unknown(
@@ -94,74 +72,176 @@ pub(super) fn finalize_completed_attempt(
         input.provider_name,
         input.provider_index,
         input.result,
-        settled_unknown(error_category.as_deref()),
+        settled_unknown(classification.error_category.as_deref()),
         "no_retry",
     );
 
+    if let Some(control) = finalize_completed_attempt_lifecycle(&mut input, &classification) {
+        return control;
+    }
+
+    if classification.success
+        && let Err(err) = ingest_completed_attempt_session(&input)
+    {
+        return BalancedLoopControl::Return(Err(err));
+    }
+
+    bump_quota_tick(input.env, input.provider_name);
+
+    completed_attempt_result_control(&input, &classification)
+}
+
+fn apply_terminal_signal_outcome_for_completed_attempt(
+    input: &mut CompletedAttemptInput<'_, '_, '_>,
+) {
+    let terminal_signal_disposition =
+        apply_terminal_signal_outcome(input.terminal_signal, input.terminal_signal_ctx);
+    validator::expect_completed_attempt_disposition(terminal_signal_disposition);
+}
+
+struct CompletedAttemptClassification {
+    success: bool,
+    error_category: Option<String>,
+    quota_exhausted: bool,
+}
+
+fn classify_completed_attempt_with_balanced_result_error_category(
+    input: &CompletedAttemptInput<'_, '_, '_>,
+) -> CompletedAttemptClassification {
+    let success = execution_succeeded(input.result);
+    let error_category = balanced_result_error_category(
+        input.agent_runtime_services,
+        input.result,
+        input.all_models,
+        input.working_dir,
+    );
+    let quota_exhausted = error_category_is_quota_exhausted(error_category.as_deref());
+    CompletedAttemptClassification {
+        success,
+        error_category,
+        quota_exhausted,
+    }
+}
+
+fn handle_returned_artifacts_persist_failure(
+    input: &mut CompletedAttemptInput<'_, '_, '_>,
+) -> Option<BalancedLoopControl> {
+    let Err(err) = record_returned_artifacts_for_completed_attempt(input) else {
+        return None;
+    };
+    finalize_returned_artifacts_persist_failure(mapper::artifact_persist_failure_input(
+        mapper::ArtifactPersistFailureInputSource {
+            agent_runtime_services: input.agent_runtime_services,
+            env: input.env,
+            invocation: input.invocation,
+            invocation_row_id: input.invocation_row_id,
+            guard: &mut *input.guard,
+            provider_name: input.provider_name,
+            provider_session_id: input.zero_turn_provider_session_id,
+            error: &err,
+        },
+    ));
+    Some(BalancedLoopControl::Return(Ok(1)))
+}
+
+fn finalize_completed_attempt_lifecycle(
+    input: &mut CompletedAttemptInput<'_, '_, '_>,
+    classification: &CompletedAttemptClassification,
+) -> Option<BalancedLoopControl> {
     let finalize_result = input
         .agent_runtime_services
         .invocation_lifecycle_service
         .finalize_invocation(mapper::completed_finalize_request(
             &input.env.state,
             input.invocation_row_id,
-            success,
+            classification.success,
             input.result.exit_code,
-            error_category.as_deref(),
+            classification.error_category.as_deref(),
             input.result.terminal_reason.as_deref(),
         ));
     if let Err(err) = finalize_result {
-        formatter::emit_finalize_invocation_warning(err);
-        formatter::emit_failure_result_envelope(mapper::failure_result_envelope_input(
-            &input.env.state,
-            &input.invocation.id,
-            input.provider_name,
-            input.zero_turn_provider_session_id,
-            1,
-            Some(TERMINAL_PERSISTENCE_ERROR_CATEGORY),
-            Some(TERMINAL_PERSISTENCE_TERMINAL_REASON),
-        ));
-        mark_balanced_attempt_idle(
-            input.zero_turn_provider_session_id,
-            &input.invocation.id,
-            Some(1),
-        );
-        return BalancedLoopControl::Return(Ok(1));
+        emit_completed_attempt_finalize_failure(input, err);
+        return Some(BalancedLoopControl::Return(Ok(1)));
     }
     input.guard.mark_finalized();
+    None
+}
 
-    if success && let Err(err) = ingest_completed_attempt_session(&input) {
-        return BalancedLoopControl::Return(Err(err));
+fn emit_completed_attempt_finalize_failure(
+    input: &CompletedAttemptInput<'_, '_, '_>,
+    err: impl std::fmt::Display,
+) {
+    formatter::emit_finalize_invocation_warning(err);
+    formatter::emit_failure_result_envelope(mapper::failure_result_envelope_input(
+        &input.env.state,
+        &input.invocation.id,
+        input.provider_name,
+        input.zero_turn_provider_session_id,
+        1,
+        Some(TERMINAL_PERSISTENCE_ERROR_CATEGORY),
+        Some(TERMINAL_PERSISTENCE_TERMINAL_REASON),
+    ));
+    mark_balanced_attempt_idle(
+        input.zero_turn_provider_session_id,
+        &input.invocation.id,
+        Some(1),
+    );
+}
+
+fn completed_attempt_result_control(
+    input: &CompletedAttemptInput<'_, '_, '_>,
+    classification: &CompletedAttemptClassification,
+) -> BalancedLoopControl {
+    if classification.success {
+        return emit_completed_attempt_success(input, classification);
     }
-
-    bump_quota_tick(input.env, input.provider_name);
-
-    if success {
-        mark_balanced_successful_attempt_idle_and_recheck(
-            input.zero_turn_provider_session_id,
-            &input.invocation.id,
-            input.result.exit_code,
-        );
-        formatter::emit_success_output(
-            &input.invocation.id,
-            input.result.exit_code,
-            error_category.as_deref(),
-            input.result.terminal_reason.as_deref(),
-            &input.result.stdout,
-        );
-        return BalancedLoopControl::Return(Ok(input.result.exit_code));
+    if let Some(control) = quota_exhausted_retry_control(input, classification) {
+        return control;
     }
-    if quota_exhausted {
-        mark_balanced_attempt_idle(
-            input.zero_turn_provider_session_id,
-            &input.invocation.id,
-            Some(input.result.exit_code),
-        );
-        if retry_available(input.attempts, input.max_attempts) {
-            formatter::emit_routing_retry(input.provider_name);
-        }
-        return BalancedLoopControl::Continue;
-    }
+    emit_completed_attempt_failure(input, classification)
+}
 
+fn emit_completed_attempt_success(
+    input: &CompletedAttemptInput<'_, '_, '_>,
+    classification: &CompletedAttemptClassification,
+) -> BalancedLoopControl {
+    mark_balanced_successful_attempt_idle_and_recheck(
+        input.zero_turn_provider_session_id,
+        &input.invocation.id,
+        input.result.exit_code,
+    );
+    formatter::emit_success_output(
+        &input.invocation.id,
+        input.result.exit_code,
+        classification.error_category.as_deref(),
+        input.result.terminal_reason.as_deref(),
+        &input.result.stdout,
+    );
+    BalancedLoopControl::Return(Ok(input.result.exit_code))
+}
+
+fn quota_exhausted_retry_control(
+    input: &CompletedAttemptInput<'_, '_, '_>,
+    classification: &CompletedAttemptClassification,
+) -> Option<BalancedLoopControl> {
+    if !classification.quota_exhausted {
+        return None;
+    }
+    mark_balanced_attempt_idle(
+        input.zero_turn_provider_session_id,
+        &input.invocation.id,
+        Some(input.result.exit_code),
+    );
+    if retry_available(input.attempts, input.max_attempts) {
+        formatter::emit_routing_retry(input.provider_name);
+    }
+    Some(BalancedLoopControl::Continue)
+}
+
+fn emit_completed_attempt_failure(
+    input: &CompletedAttemptInput<'_, '_, '_>,
+    classification: &CompletedAttemptClassification,
+) -> BalancedLoopControl {
     formatter::emit_failure_output_with_diagnostics(
         mapper::completed_attempt_failure_result_envelope_input(
             &input.env.state,
@@ -169,10 +249,10 @@ pub(super) fn finalize_completed_attempt(
             input.provider_name,
             input.zero_turn_provider_session_id,
             input.result,
-            error_category.as_deref(),
+            classification.error_category.as_deref(),
         ),
         &input.result.stderr,
-        error_category.as_deref(),
+        classification.error_category.as_deref(),
     );
     mark_balanced_attempt_idle(
         input.zero_turn_provider_session_id,
@@ -235,14 +315,16 @@ fn record_returned_artifacts_for_completed_attempt(
 }
 
 fn finalize_returned_artifacts_persist_failure(input: mapper::ArtifactPersistFailureInput<'_, '_>) {
+    emit_returned_artifacts_persist_failure(&input);
+    match finalize_returned_artifacts_failure_lifecycle(&input) {
+        Ok(_) => input.guard.mark_finalized(),
+        Err(err) => formatter::emit_finalize_invocation_warning(err),
+    }
+    mark_balanced_attempt_idle(input.provider_session_id, input.invocation_id, Some(1));
+}
+
+fn emit_returned_artifacts_persist_failure(input: &mapper::ArtifactPersistFailureInput<'_, '_>) {
     formatter::emit_returned_artifacts_error(input.error);
-    let finalize_result = input
-        .agent_runtime_services
-        .invocation_lifecycle_service
-        .finalize_invocation(mapper::returned_artifacts_finalize_request(
-            &input.env.state,
-            input.invocation_row_id,
-        ));
     formatter::emit_failure_result_envelope(mapper::failure_result_envelope_input(
         &input.env.state,
         input.invocation_id,
@@ -252,11 +334,19 @@ fn finalize_returned_artifacts_persist_failure(input: mapper::ArtifactPersistFai
         Some("returned_artifacts"),
         Some("returned_artifacts_persist_failed"),
     ));
-    match finalize_result {
-        Ok(_) => input.guard.mark_finalized(),
-        Err(err) => formatter::emit_finalize_invocation_warning(err),
-    }
-    mark_balanced_attempt_idle(input.provider_session_id, input.invocation_id, Some(1));
+}
+
+fn finalize_returned_artifacts_failure_lifecycle(
+    input: &mapper::ArtifactPersistFailureInput<'_, '_>,
+) -> Result<(), oulipoly_runtime::services::ServiceError> {
+    input
+        .agent_runtime_services
+        .invocation_lifecycle_service
+        .finalize_invocation(mapper::returned_artifacts_finalize_request(
+            &input.env.state,
+            input.invocation_row_id,
+        ))
+        .map(|_| ())
 }
 
 fn ingest_completed_attempt_session(

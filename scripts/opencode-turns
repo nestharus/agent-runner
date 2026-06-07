@@ -329,13 +329,27 @@ def session_candidate_from_obj(obj: dict) -> dict:
 
 
 def session_list_session_id(obj: dict) -> str | None:
+    for value in session_list_session_id_candidates(obj):
+        session_id = parsed_session_id(value)
+        if session_id:
+            return session_id
+    return None
+
+
+def session_list_session_id_candidates(obj: dict) -> list[str]:
+    candidates = []
     for key in SESSION_ID_KEYS:
         value = obj.get(key)
         if not isinstance(value, str):
             continue
-        match = SESSION_ID_RE.search(value)
-        if match:
-            return match.group(0)
+        candidates.append(value)
+    return candidates
+
+
+def parsed_session_id(value: str) -> str | None:
+    match = SESSION_ID_RE.search(value)
+    if match:
+        return match.group(0)
     return None
 
 
@@ -355,11 +369,21 @@ def timestamp_datetime(value) -> datetime | None:
     stripped = value.strip()
     if re.fullmatch(r"\d+(\.\d+)?", stripped):
         return numeric_timestamp_datetime(float(stripped))
-    normalized = stripped.replace("Z", "+00:00")
+    parsed = parsed_iso_timestamp(stripped)
+    if parsed is None:
+        return None
+    return normalized_timestamp_datetime(parsed)
+
+
+def parsed_iso_timestamp(value: str) -> datetime | None:
+    normalized = value.replace("Z", "+00:00")
     try:
-        parsed = datetime.fromisoformat(normalized)
+        return datetime.fromisoformat(normalized)
     except ValueError:
         return None
+
+
+def normalized_timestamp_datetime(parsed: datetime) -> datetime:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
@@ -471,10 +495,20 @@ def opencode_command() -> list[str]:
 
 
 def opencode_command_name_from_base_dir(base_dir: str) -> str:
+    return formatted_opencode_command_name(opencode_base_dir_suffix(base_dir))
+
+
+def opencode_base_dir_suffix(base_dir: str) -> str | None:
     match = re.search(r"(?:^|/)\.opencode([0-9]+)(?:/|$)", os.path.expanduser(base_dir))
     if match:
-        return f"opencode{match.group(1)}"
-    return "opencode"
+        return match.group(1)
+    return None
+
+
+def formatted_opencode_command_name(suffix: str | None) -> str:
+    if suffix is None:
+        return "opencode"
+    return f"opencode{suffix}"
 
 
 def run_opencode(
@@ -646,12 +680,20 @@ def message_body_chunks(obj: dict) -> list:
 
 
 def records_from_exported_session(session_id: str, exported: Any) -> list[dict]:
+    return present_records(optional_records_from_exported_session(session_id, exported))
+
+
+def optional_records_from_exported_session(
+    session_id: str, exported: Any
+) -> list[dict | None]:
     records = []
     for index, obj in enumerate(exported_message_items(exported), start=1):
-        record = record_from_message(session_id, index, obj)
-        if record:
-            records.append(record)
+        records.append(record_from_message(session_id, index, obj))
     return records
+
+
+def present_records(records: list[dict | None]) -> list[dict]:
+    return [record for record in records if record]
 
 
 def collect_records(

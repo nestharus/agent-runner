@@ -101,32 +101,10 @@ fn settings_host_invokes_only_schema_and_settings_subcommands_with_typed_envelop
     );
 
     let calls = fixture.recorded_calls();
-    let subcommands = calls
-        .iter()
-        .map(|call| call.subcommand.as_str())
-        .collect::<Vec<_>>();
-    for subcommand in &subcommands {
-        assert!(
-            matches!(
-                *subcommand,
-                "describe"
-                    | "schema"
-                    | "settings.list"
-                    | "settings.get"
-                    | "settings.create"
-                    | "settings.update"
-                    | "settings.delete"
-                    | "settings.validate"
-                    | "settings.migrate"
-            ),
-            "settings host must not invoke broad or unrelated provider subcommands: {subcommand}"
-        );
-    }
+    let subcommands = call_subcommands(&calls);
+    assert_settings_host_subcommands_are_allowed(&subcommands);
     assert_eq!(
-        subcommands
-            .into_iter()
-            .filter(|subcommand| *subcommand != "describe")
-            .collect::<Vec<_>>(),
+        non_describe_subcommands(&subcommands),
         vec![
             "schema",
             "settings.list",
@@ -139,29 +117,10 @@ fn settings_host_invokes_only_schema_and_settings_subcommands_with_typed_envelop
         ]
     );
 
-    for call in calls {
-        assert_eq!(call.request["contract"], CONTRACT_VERSION);
-        assert!(
-            call.request["request_id"]
-                .as_str()
-                .is_some_and(|id| !id.is_empty()),
-            "request ids must be present and non-empty for {subcommand}",
-            subcommand = call.subcommand
-        );
-        assert_eq!(call.request["provider_instance_id"], "provider-settings");
-        assert_eq!(
-            call.request["host"]["config_root"],
-            fixture.config_root.display().to_string()
-        );
-        assert_eq!(
-            call.request["host"]["data_root"],
-            fixture.data_root.display().to_string()
-        );
-        assert_eq!(call.request["host"]["env"], json!({}));
-    }
+    assert_common_settings_call_envelopes(&calls, &fixture);
 
     assert_exact_settings_params(
-        &fixture.recorded_calls(),
+        &calls,
         &[
             ("schema", json!({"schema_id": "example.settings/v1"})),
             ("settings.list", json!({})),
@@ -336,11 +295,8 @@ fn settings_migrate_forwards_legacy_payload_opaquely() {
     host.settings_migrate("example-model", true, legacy.clone())
         .expect("migration dry-run should invoke provider settings.migrate");
 
-    let call = fixture
-        .recorded_calls()
-        .into_iter()
-        .find(|call| call.subcommand == "settings.migrate")
-        .expect("settings.migrate call should be recorded");
+    let calls = fixture.recorded_calls();
+    let call = recorded_call_for_subcommand(&calls, "settings.migrate");
     assert_eq!(call.request["params"]["dry_run"], true);
     assert_eq!(call.request["params"]["legacy"], legacy);
 }
@@ -373,17 +329,91 @@ fn model_with_provider_name(name: &str, provider_name: &str, path: &Path) -> Mod
     }
 }
 
-fn assert_exact_settings_params(calls: &[RecordedCall], expected: &[(&str, Value)]) {
-    for (subcommand, expected_params) in expected {
-        let call = calls
-            .iter()
-            .find(|call| call.subcommand == *subcommand)
-            .unwrap_or_else(|| panic!("missing recorded {subcommand} request"));
-        assert_eq!(
-            &call.request["params"], expected_params,
-            "{subcommand} params must match the generated provider contract exactly"
+fn call_subcommands(calls: &[RecordedCall]) -> Vec<&str> {
+    calls.iter().map(call_subcommand).collect()
+}
+
+fn call_subcommand(call: &RecordedCall) -> &str {
+    call.subcommand.as_str()
+}
+
+fn assert_settings_host_subcommands_are_allowed(subcommands: &[&str]) {
+    for subcommand in subcommands {
+        assert!(
+            settings_host_subcommand_is_allowed(subcommand),
+            "settings host must not invoke broad or unrelated provider subcommands: {subcommand}"
         );
     }
+}
+
+fn settings_host_subcommand_is_allowed(subcommand: &str) -> bool {
+    matches!(
+        subcommand,
+        "describe"
+            | "schema"
+            | "settings.list"
+            | "settings.get"
+            | "settings.create"
+            | "settings.update"
+            | "settings.delete"
+            | "settings.validate"
+            | "settings.migrate"
+    )
+}
+
+fn non_describe_subcommands<'a>(subcommands: &[&'a str]) -> Vec<&'a str> {
+    subcommands
+        .iter()
+        .copied()
+        .filter(|subcommand| *subcommand != "describe")
+        .collect()
+}
+
+fn assert_common_settings_call_envelopes(calls: &[RecordedCall], fixture: &SettingsHostFixture) {
+    for call in calls {
+        assert_eq!(call.request["contract"], CONTRACT_VERSION);
+        assert!(
+            call.request["request_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty()),
+            "request ids must be present and non-empty for {subcommand}",
+            subcommand = call.subcommand
+        );
+        assert_eq!(call.request["provider_instance_id"], "provider-settings");
+        assert_eq!(
+            call.request["host"]["config_root"],
+            fixture.config_root.display().to_string()
+        );
+        assert_eq!(
+            call.request["host"]["data_root"],
+            fixture.data_root.display().to_string()
+        );
+        assert_eq!(call.request["host"]["env"], json!({}));
+    }
+}
+
+fn assert_exact_settings_params(calls: &[RecordedCall], expected: &[(&str, Value)]) {
+    for (subcommand, expected_params) in expected {
+        let call = recorded_call_for_subcommand(calls, subcommand);
+        assert_recorded_call_params(call, subcommand, expected_params);
+    }
+}
+
+fn recorded_call_for_subcommand<'a>(
+    calls: &'a [RecordedCall],
+    subcommand: &str,
+) -> &'a RecordedCall {
+    calls
+        .iter()
+        .find(|call| call.subcommand == subcommand)
+        .unwrap_or_else(|| panic!("missing recorded {subcommand} request"))
+}
+
+fn assert_recorded_call_params(call: &RecordedCall, subcommand: &str, expected_params: &Value) {
+    assert_eq!(
+        &call.request["params"], expected_params,
+        "{subcommand} params must match the generated provider contract exactly"
+    );
 }
 
 struct SettingsHostFixture {
@@ -442,10 +472,9 @@ impl RebuildFixture {
     }
 
     fn subcommands_for(&self, provider_id: &str) -> Vec<String> {
-        recorded_call_subcommands(recorded_calls_for_provider(
-            recorded_calls(&self.record),
-            provider_id,
-        ))
+        let calls = recorded_calls(&self.record);
+        let provider_calls = recorded_calls_for_provider(calls, provider_id);
+        recorded_call_subcommands(provider_calls)
     }
 }
 
@@ -458,7 +487,15 @@ fn recorded_calls_text(path: &Path) -> String {
 }
 
 fn parse_recorded_calls(text: &str) -> Vec<RecordedCall> {
-    text.lines().map(parse_recorded_call).collect()
+    parse_recorded_call_lines(recorded_call_lines(text))
+}
+
+fn recorded_call_lines(text: &str) -> std::str::Lines<'_> {
+    text.lines()
+}
+
+fn parse_recorded_call_lines(lines: std::str::Lines<'_>) -> Vec<RecordedCall> {
+    lines.map(parse_recorded_call).collect()
 }
 
 fn parse_recorded_call(line: &str) -> RecordedCall {
@@ -523,11 +560,7 @@ impl SettingsHostFixture {
     }
 
     fn recorded_calls(&self) -> Vec<RecordedCall> {
-        fs::read_to_string(&self.record)
-            .unwrap_or_default()
-            .lines()
-            .map(|line| serde_json::from_str(line).expect("recorded call should parse"))
-            .collect()
+        recorded_calls(&self.record)
     }
 }
 

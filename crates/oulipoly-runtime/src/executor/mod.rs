@@ -23,7 +23,7 @@ use crate::provider_registry::{ProviderRegistry, ProviderRegistryHandle, Provide
 use crate::services::{
     ExecutorServiceOutput, ExecutorServicePort, ExecutorServiceRequest, ServiceError,
 };
-use external_provider::context::ExternalProviderDispatchInput;
+use external_provider::context::{ExternalProviderDispatchContext, ExternalProviderDispatchInput};
 pub use oulipoly_agent_messenger::ReturnedArtifactRef;
 use oulipoly_config::{ModelConfig, ProviderConfig};
 use oulipoly_state::CompositeInvocationId;
@@ -243,7 +243,14 @@ fn execute_external_provider(
     provider_registry: Arc<ProviderRegistry>,
     request: ExecutorServiceRequest,
 ) -> Result<ExecutionResult, ServiceError> {
-    let context = match request {
+    let context = external_provider_context_from_request(request)?;
+    external_provider::dispatch(&provider_registry, context)
+}
+
+fn external_provider_context_from_request(
+    request: ExecutorServiceRequest,
+) -> Result<ExternalProviderDispatchContext, ServiceError> {
+    Ok(match request {
         ExecutorServiceRequest::Facade {
             model,
             provider_index,
@@ -310,9 +317,7 @@ fn execute_external_provider(
             start_known_provider_session_id: Some(start_known_provider_session_id),
         }
         .into(),
-    };
-
-    external_provider::dispatch(&provider_registry, context)
+    })
 }
 
 fn request_model_has_external_provider(request: &ExecutorServiceRequest) -> bool {
@@ -329,16 +334,36 @@ fn provider_for_external_context(
     model: &ModelConfig,
     provider_index: usize,
 ) -> Result<ProviderConfig, ServiceError> {
-    model
-        .providers
-        .get(provider_index)
-        .cloned()
-        .ok_or_else(|| ServiceError::Dependency {
-            message: format!(
-                "Provider index {} out of range for model {}",
-                provider_index, model.name
-            ),
-        })
+    validate_external_provider_present(
+        model,
+        provider_index,
+        external_provider_at(model, provider_index),
+    )
+}
+
+fn external_provider_at(model: &ModelConfig, provider_index: usize) -> Option<ProviderConfig> {
+    model.providers.get(provider_index).cloned()
+}
+
+fn validate_external_provider_present(
+    model: &ModelConfig,
+    provider_index: usize,
+    provider: Option<ProviderConfig>,
+) -> Result<ProviderConfig, ServiceError> {
+    provider.ok_or_else(|| missing_external_provider_error(model, provider_index))
+}
+
+fn missing_external_provider_error(model: &ModelConfig, provider_index: usize) -> ServiceError {
+    ServiceError::Dependency {
+        message: missing_external_provider_message(model, provider_index),
+    }
+}
+
+fn missing_external_provider_message(model: &ModelConfig, provider_index: usize) -> String {
+    format!(
+        "Provider index {} out of range for model {}",
+        provider_index, model.name
+    )
 }
 
 /// Execute a model with the original prompt-only interface (backwards compat).

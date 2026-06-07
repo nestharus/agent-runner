@@ -64,8 +64,32 @@ pub(crate) fn context_from_parent_invocation_env(
     mode: SpawnRuntimeMode,
     effective_cwd: Option<&Path>,
 ) -> Option<SpawnIdentityContext> {
-    let invocation = parent_invocation_env.and_then(parse_invocation_env_silent)?;
-    Some(SpawnIdentityContext {
+    let invocation = parse_parent_invocation_env(parent_invocation_env)?;
+    Some(spawn_identity_context_from_invocation(
+        invocation,
+        provider_name,
+        model_name,
+        session_id,
+        mode,
+        effective_cwd,
+    ))
+}
+
+fn parse_parent_invocation_env(
+    parent_invocation_env: Option<&str>,
+) -> Option<CompositeInvocationId> {
+    parent_invocation_env.and_then(parse_invocation_env_silent)
+}
+
+fn spawn_identity_context_from_invocation(
+    invocation: CompositeInvocationId,
+    provider_name: &str,
+    model_name: Option<&str>,
+    session_id: Option<&str>,
+    mode: SpawnRuntimeMode,
+    effective_cwd: Option<&Path>,
+) -> SpawnIdentityContext {
+    SpawnIdentityContext {
         invocation_uuid: invocation.id,
         provider_name: provider_name.to_string(),
         model_name: model_name.map(str::to_string),
@@ -73,7 +97,7 @@ pub(crate) fn context_from_parent_invocation_env(
         mode,
         pty_control_path: None,
         effective_cwd: effective_cwd.map(|path| path.to_string_lossy().into_owned()),
-    })
+    }
 }
 
 pub(crate) fn record_child_identity(

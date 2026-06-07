@@ -155,20 +155,12 @@ impl Fixture {
     }
 
     fn write_notify_artifacts(&self, handle: &str, metadata: Value, rc: i32) -> NotifyArtifacts {
-        let state_dir = self.dir.path().join(format!("notify-{handle}"));
-        fs::create_dir_all(&state_dir).unwrap();
-        let meta = state_dir.join("meta.json");
-        let log = state_dir.join("log");
-        let rc_path = state_dir.join("rc");
-        fs::write(&meta, serde_json::to_string_pretty(&metadata).unwrap()).unwrap();
-        fs::write(&log, format!("log for {handle}\n")).unwrap();
-        fs::write(&rc_path, format!("{rc}\n")).unwrap();
-        NotifyArtifacts {
-            state_dir,
-            meta,
-            log,
-            rc: rc_path,
-        }
+        let artifacts = notify_artifact_paths(self.dir.path(), handle);
+        fs::create_dir_all(&artifacts.state_dir).unwrap();
+        fs::write(&artifacts.meta, notify_metadata_content(&metadata)).unwrap();
+        fs::write(&artifacts.log, notify_log_content(handle)).unwrap();
+        fs::write(&artifacts.rc, notify_rc_content(rc)).unwrap();
+        artifacts
     }
 
     fn record_identity(
@@ -861,27 +853,43 @@ fn identity(os_pid: i64, os_boot_id: &str, os_pid_starttime_ticks: i64) -> Proce
 }
 
 fn caller_chain(identities: &[&ProcessIdentity]) -> Value {
-    let caller_chain = identities
+    caller_chain_payload(caller_chain_entries(identities))
+}
+
+fn caller_chain_entries(identities: &[&ProcessIdentity]) -> Vec<Value> {
+    identities
         .iter()
-        .map(|identity| {
-            json!({
-                "pid": identity.os_pid,
-                "boot_id": identity.os_boot_id,
-                "starttime_ticks": identity.os_pid_starttime_ticks,
-            })
-        })
-        .collect::<Vec<_>>();
+        .map(|identity| process_identity_json(identity))
+        .collect()
+}
+
+fn process_identity_json(identity: &ProcessIdentity) -> Value {
+    json!({
+        "pid": identity.os_pid,
+        "boot_id": identity.os_boot_id,
+        "starttime_ticks": identity.os_pid_starttime_ticks,
+    })
+}
+
+fn caller_chain_payload(caller_chain: Vec<Value>) -> Value {
     json!({"caller_chain": caller_chain, "spooler_extra": "preserve-me"})
 }
 
 fn stdout_json(output: &Output) -> Value {
-    serde_json::from_slice(&output.stdout).unwrap_or_else(|err| {
-        panic!(
-            "failed to parse stdout as JSON: {err}\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        )
-    })
+    parse_stdout_json(&output.stdout)
+        .unwrap_or_else(|err| panic!("{}", stdout_json_diagnostic(&err, output)))
+}
+
+fn parse_stdout_json(stdout: &[u8]) -> serde_json::Result<Value> {
+    serde_json::from_slice(stdout)
+}
+
+fn stdout_json_diagnostic(err: &serde_json::Error, output: &Output) -> String {
+    format!(
+        "failed to parse stdout as JSON: {err}\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
 }
 
 fn row_handles(json: &Value) -> Vec<String> {
@@ -894,10 +902,48 @@ fn row_handles(json: &Value) -> Vec<String> {
 }
 
 fn inserted_row(result: Result<EnqueueResult, String>) -> MailboxRow {
-    match result.unwrap() {
-        EnqueueResult::Inserted(row) => row,
-        other => panic!("expected inserted mailbox row, got {other:?}"),
+    let result = unwrap_enqueue_result(result);
+    assert_inserted_enqueue_result(&result);
+    extract_inserted_mailbox_row(result)
+}
+
+fn unwrap_enqueue_result(result: Result<EnqueueResult, String>) -> EnqueueResult {
+    result.unwrap()
+}
+
+fn assert_inserted_enqueue_result(result: &EnqueueResult) {
+    if !matches!(result, EnqueueResult::Inserted(_)) {
+        panic!("expected inserted mailbox row, got {result:?}");
     }
+}
+
+fn extract_inserted_mailbox_row(result: EnqueueResult) -> MailboxRow {
+    match result {
+        EnqueueResult::Inserted(row) => row,
+        other => unreachable!("validated inserted mailbox row, got {other:?}"),
+    }
+}
+
+fn notify_artifact_paths(root: &Path, handle: &str) -> NotifyArtifacts {
+    let state_dir = root.join(format!("notify-{handle}"));
+    NotifyArtifacts {
+        meta: state_dir.join("meta.json"),
+        log: state_dir.join("log"),
+        rc: state_dir.join("rc"),
+        state_dir,
+    }
+}
+
+fn notify_metadata_content(metadata: &Value) -> String {
+    serde_json::to_string_pretty(metadata).unwrap()
+}
+
+fn notify_log_content(handle: &str) -> String {
+    format!("log for {handle}\n")
+}
+
+fn notify_rc_content(rc: i32) -> String {
+    format!("{rc}\n")
 }
 
 fn dump_last_arg_script(prompt_dump: &Path, argv_dump: Option<&Path>, exit_code: i32) -> String {

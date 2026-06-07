@@ -87,26 +87,48 @@ fn provider_settings_id(provider: &ProviderConfig) -> String {
 }
 
 fn canonical_opencode_settings_id(name: &str, command: &str) -> Option<String> {
-    let index =
-        opencode_account_index(name).or_else(|| opencode_account_index_from_command(command))?;
-    Some(match index {
+    opencode_settings_index(name, command).map(format_opencode_settings_id)
+}
+
+fn opencode_settings_index(name: &str, command: &str) -> Option<u8> {
+    opencode_account_index(name).or_else(|| opencode_account_index_from_command(command))
+}
+
+fn format_opencode_settings_id(index: u8) -> String {
+    match index {
         1 => "opencode1".to_string(),
         other => format!("opencode{other}"),
-    })
+    }
 }
 
 fn opencode_account_index_from_command(command: &str) -> Option<u8> {
+    let tokens = opencode_command_tokens(command);
+    opencode_account_index_from_tokens(&tokens)
+}
+
+fn opencode_command_tokens(command: &str) -> Vec<String> {
     crate::executor::cli::shell_split(command)
+}
+
+fn opencode_account_index_from_tokens(tokens: &[String]) -> Option<u8> {
+    tokens
         .iter()
         .rev()
         .find_map(|part| opencode_account_index(part))
 }
 
 fn opencode_account_index(value: &str) -> Option<u8> {
-    let name = Path::new(value)
+    opencode_account_name_index(basename_or_value(value))
+}
+
+fn basename_or_value(value: &str) -> &str {
+    Path::new(value)
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or(value);
+        .unwrap_or(value)
+}
+
+fn opencode_account_name_index(name: &str) -> Option<u8> {
     match name {
         "opencode" | "opencode1" => Some(1),
         "opencode2" => Some(2),

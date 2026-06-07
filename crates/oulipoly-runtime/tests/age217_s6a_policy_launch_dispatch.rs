@@ -441,13 +441,27 @@ fn fake_provider_body(
     policy_record_path: &Path,
     launch_record_path: &Path,
 ) -> String {
-    let policy_mode = match policy_mode {
+    fake_provider_script_body(
+        capabilities,
+        policy_mode_wire(policy_mode),
+        launch_mode_wire(launch_mode),
+        order_path,
+        policy_record_path,
+        launch_record_path,
+    )
+}
+
+fn policy_mode_wire(policy_mode: PolicyMode) -> &'static str {
+    match policy_mode {
         PolicyMode::Accept => "accept",
         PolicyMode::Reject => "reject",
         PolicyMode::Transform => "transform",
         PolicyMode::HybridShape => "hybrid_shape",
-    };
-    let launch_mode = match launch_mode {
+    }
+}
+
+fn launch_mode_wire(launch_mode: LaunchMode) -> &'static str {
+    match launch_mode {
         LaunchMode::Success => "success",
         LaunchMode::NonzeroFinal => "nonzero_final",
         LaunchMode::ProviderNonzeroAfterFinal => "provider_nonzero_after_final",
@@ -459,7 +473,17 @@ fn fake_provider_body(
         LaunchMode::CancelledFinal => "cancelled_final",
         LaunchMode::UnknownTerminalWithQuotaText => "unknown_terminal_with_quota_text",
         LaunchMode::HostCancelledBeforeFinal => "host_cancelled_before_final",
-    };
+    }
+}
+
+fn fake_provider_script_body(
+    capabilities: Capabilities,
+    policy_mode: &str,
+    launch_mode: &str,
+    order_path: &Path,
+    policy_record_path: &Path,
+    launch_record_path: &Path,
+) -> String {
     format!(
         r#"#!/usr/bin/env python3
 import json
@@ -670,29 +694,44 @@ fn py_bool(value: bool) -> &'static str {
 }
 
 fn read_json(path: &Path) -> serde_json::Value {
-    let text = fs::read_to_string(path).expect("record should exist");
-    serde_json::from_str(&text).expect("record should be json")
+    parse_json_value(&read_json_text(path))
+}
+
+fn read_json_text(path: &Path) -> String {
+    fs::read_to_string(path).expect("record should exist")
+}
+
+fn parse_json_value(text: &str) -> serde_json::Value {
+    serde_json::from_str(text).expect("record should be json")
 }
 
 fn json_string_array(value: &serde_json::Value) -> Vec<String> {
-    value
-        .as_array()
-        .expect("value should be an array")
+    json_array_items(value)
         .iter()
-        .map(|item| {
-            item.as_str()
-                .expect("array item should be a string")
-                .to_string()
-        })
+        .map(json_value_to_string)
         .collect()
 }
 
+fn json_array_items(value: &serde_json::Value) -> &[serde_json::Value] {
+    value.as_array().expect("value should be an array")
+}
+
+fn json_value_to_string(item: &serde_json::Value) -> String {
+    item.as_str()
+        .expect("array item should be a string")
+        .to_string()
+}
+
 fn order_lines(path: &Path) -> Vec<String> {
-    fs::read_to_string(path)
-        .expect("order should be recorded")
-        .lines()
-        .map(str::to_string)
-        .collect()
+    lines_to_strings(&read_order_text(path))
+}
+
+fn read_order_text(path: &Path) -> String {
+    fs::read_to_string(path).expect("order should be recorded")
+}
+
+fn lines_to_strings(text: &str) -> Vec<String> {
+    text.lines().map(str::to_string).collect()
 }
 
 fn assert_model_request_carries_effective_inputs(request: &serde_json::Value) {

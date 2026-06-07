@@ -125,6 +125,15 @@ pub enum SessionLiveness {
     Idle,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionRuntimeLivenessDecision {
+    Busy,
+    Idle,
+    Stale {
+        running_invocation_uuid: Option<String>,
+    },
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct WakeClaimRequest<'a> {
     pub session_id: &'a str,
@@ -382,26 +391,10 @@ impl MailboxDb {
     }
 
     pub fn session_liveness(&mut self, session_id: &str) -> Result<SessionLiveness, String> {
-        let Some(row) = self.session_runtime(session_id)? else {
-            return Ok(SessionLiveness::Idle);
-        };
-        if runtime_row_is_idle(&row) {
-            return Ok(SessionLiveness::Idle);
-        }
-        let Some(invocation_uuid) = row.running_invocation_uuid.as_deref() else {
-            self.clear_stale_running_row(session_id, None)?;
-            return Ok(SessionLiveness::Idle);
-        };
-        let Some(recorded) = runtime_row_identity(&row) else {
-            self.clear_stale_running_row(session_id, Some(invocation_uuid))?;
-            return Ok(SessionLiveness::Idle);
-        };
-        let live = live_process_identity_for_runtime(&recorded)?;
-        if runtime_identity_is_live(live.as_ref(), &recorded) {
-            return Ok(SessionLiveness::Busy);
-        }
-        self.clear_stale_running_row(session_id, Some(invocation_uuid))?;
-        Ok(SessionLiveness::Idle)
+        let row = self.session_runtime(session_id)?;
+        let decision = session_runtime_liveness_decision(row.as_ref())?;
+        self.clear_stale_running_row_for_liveness(session_id, &decision)?;
+        Ok(session_liveness_from_decision(&decision))
     }
 
     pub fn try_acquire_wake_claim(
@@ -496,10 +489,8 @@ impl MailboxDb {
         session_id: &str,
         claim_token: &str,
     ) -> Result<bool, String> {
-        let Some(claim) = self.wake_claim(session_id)? else {
-            return Ok(false);
-        };
-        if !wake_claim_matches_child(&claim, claim_token) {
+        let claim = self.wake_claim(session_id)?;
+        if !wake_claim_is_valid_for_child(claim.as_ref(), claim_token) {
             return Ok(false);
         }
         self.release_busy_child_wake_claim(session_id, claim_token)
@@ -591,11 +582,38 @@ impl MailboxDb {
         session_id: &str,
         claim_token: &str,
     ) -> Result<bool, String> {
-        if self.session_is_busy(session_id)? {
-            self.release_wake_claim(session_id, Some(claim_token))?;
+        if self.busy_child_wake_claim_should_release(session_id)? {
+            self.release_child_wake_claim(session_id, claim_token)?;
             return Ok(false);
         }
         Ok(true)
+    }
+
+    fn busy_child_wake_claim_should_release(&mut self, session_id: &str) -> Result<bool, String> {
+        self.session_is_busy(session_id)
+    }
+
+    fn release_child_wake_claim(
+        &mut self,
+        session_id: &str,
+        claim_token: &str,
+    ) -> Result<(), String> {
+        self.release_wake_claim(session_id, Some(claim_token))?;
+        Ok(())
+    }
+
+    fn clear_stale_running_row_for_liveness(
+        &mut self,
+        session_id: &str,
+        decision: &SessionRuntimeLivenessDecision,
+    ) -> Result<(), String> {
+        if let SessionRuntimeLivenessDecision::Stale {
+            running_invocation_uuid,
+        } = decision
+        {
+            self.clear_stale_running_row(session_id, running_invocation_uuid.as_deref())?;
+        }
+        Ok(())
     }
 
     fn clear_stale_running_row(
@@ -840,6 +858,43 @@ fn runtime_identity_is_live(live: Option<&ProcessIdentity>, recorded: &ProcessId
     live.is_some_and(|live| live == recorded)
 }
 
+fn session_runtime_liveness_decision(
+    row: Option<&SessionRuntimeRow>,
+) -> Result<SessionRuntimeLivenessDecision, String> {
+    let Some(row) = row else {
+        return Ok(SessionRuntimeLivenessDecision::Idle);
+    };
+    if runtime_row_is_idle(row) {
+        return Ok(SessionRuntimeLivenessDecision::Idle);
+    }
+    let Some(invocation_uuid) = row.running_invocation_uuid.as_deref() else {
+        return Ok(SessionRuntimeLivenessDecision::Stale {
+            running_invocation_uuid: None,
+        });
+    };
+    let Some(recorded) = runtime_row_identity(row) else {
+        return Ok(SessionRuntimeLivenessDecision::Stale {
+            running_invocation_uuid: Some(invocation_uuid.to_string()),
+        });
+    };
+    let live = live_process_identity_for_runtime(&recorded)?;
+    if runtime_identity_is_live(live.as_ref(), &recorded) {
+        return Ok(SessionRuntimeLivenessDecision::Busy);
+    }
+    Ok(SessionRuntimeLivenessDecision::Stale {
+        running_invocation_uuid: Some(invocation_uuid.to_string()),
+    })
+}
+
+fn session_liveness_from_decision(decision: &SessionRuntimeLivenessDecision) -> SessionLiveness {
+    match decision {
+        SessionRuntimeLivenessDecision::Busy => SessionLiveness::Busy,
+        SessionRuntimeLivenessDecision::Idle | SessionRuntimeLivenessDecision::Stale { .. } => {
+            SessionLiveness::Idle
+        }
+    }
+}
+
 fn fresh_in_flight_wake_claim(
     existing: Option<WakeClaimRow>,
     stale_after_seconds: i64,
@@ -897,6 +952,10 @@ fn acquire_wake_claim_tx(
 
 fn wake_claim_matches_child(claim: &WakeClaimRow, claim_token: &str) -> bool {
     claim.claim_token == claim_token
+}
+
+fn wake_claim_is_valid_for_child(claim: Option<&WakeClaimRow>, claim_token: &str) -> bool {
+    claim.is_some_and(|claim| wake_claim_matches_child(claim, claim_token))
 }
 
 fn query_mailbox_by_kind_handle_tx(

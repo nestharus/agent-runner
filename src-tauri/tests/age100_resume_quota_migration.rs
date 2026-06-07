@@ -59,11 +59,7 @@ impl Fixture {
 
     fn write_script(&self, name: &str, body: &str) -> PathBuf {
         let path = self.dir.path().join(name);
-        fs::write(
-            &path,
-            format!("#!/usr/bin/env bash\nset -euo pipefail\n{body}\n"),
-        )
-        .unwrap();
+        fs::write(&path, executable_script_body(body)).unwrap();
         let mut perms = fs::metadata(&path).unwrap().permissions();
         perms.set_mode(0o755);
         fs::set_permissions(&path, perms).unwrap();
@@ -76,60 +72,21 @@ impl Fixture {
         providers: &[ResumeProviderFixture<'_>],
         use_heuristic_diagnostics: bool,
     ) {
-        let mut model = String::new();
-        for provider in providers {
-            model.push_str(&format!(
-                r#"[[providers]]
-name = "{}"
-args = ["exec-{}"]
-
-"#,
-                provider.name, provider.name
-            ));
-        }
+        let model = resume_model_toml(providers);
         fs::write(self.models_dir.join(format!("{model_name}.toml")), model).unwrap();
 
         fs::write(
             self.models_dir.join("diagnostic.toml"),
-            r#"[[providers]]
-name = "diagnostic-provider"
-"#,
+            diagnostic_model_toml(),
         )
         .unwrap();
-        fs::write(
-            self.app_config_dir.join("config.toml"),
-            r#"diagnostics_model = "diagnostic"
-"#,
-        )
-        .unwrap();
+        fs::write(self.app_config_dir.join("config.toml"), config_toml()).unwrap();
 
         let mut providers_toml = String::new();
         for provider in providers {
             let command = self.write_script(&format!("{}-resume.sh", provider.name), provider.body);
             let projects_dir = self.provider_projects_dir(provider.name);
-            providers_toml.push_str(&format!(
-                r#"[{}]
-command = {}
-args = []
-interactive_args = ["launch-{}"]
-prompt_mode = "arg"
-
-[{}.resume]
-kind = "flag"
-flag = "--resume"
-
-[{}.session_storage]
-kind = "claude_code"
-projects_dir = {}
-
-"#,
-                provider.name,
-                toml_string(&command.display().to_string()),
-                provider.name,
-                provider.name,
-                provider.name,
-                toml_string(&projects_dir.display().to_string())
-            ));
+            providers_toml.push_str(&resume_provider_toml(provider, &command, &projects_dir));
         }
 
         let diagnostic_body = if use_heuristic_diagnostics {
@@ -138,14 +95,7 @@ projects_dir = {}
             "cat >/dev/null\nprintf '%s\\n' 'quota_exhausted' 'Diagnostic model saw exhausted quota'"
         };
         let diagnostic_command = self.write_script("diagnostic-provider.sh", diagnostic_body);
-        providers_toml.push_str(&format!(
-            r#"[diagnostic-provider]
-command = {}
-args = []
-prompt_mode = "stdin"
-"#,
-            toml_string(&diagnostic_command.display().to_string())
-        ));
+        providers_toml.push_str(&diagnostic_provider_toml(&diagnostic_command));
         fs::write(self.app_config_dir.join("providers.toml"), providers_toml).unwrap();
     }
 
@@ -279,17 +229,102 @@ fn toml_string(value: &str) -> String {
     format!("{value:?}")
 }
 
-fn provider_body(marker: &Path, shell: &str) -> String {
+fn executable_script_body(body: &str) -> String {
+    format!("#!/usr/bin/env bash\nset -euo pipefail\n{body}\n")
+}
+
+fn resume_model_toml(providers: &[ResumeProviderFixture<'_>]) -> String {
+    providers
+        .iter()
+        .map(resume_model_provider_toml)
+        .collect::<String>()
+}
+
+fn resume_model_provider_toml(provider: &ResumeProviderFixture<'_>) -> String {
     format!(
-        "printf '%s\\n' ran >> {}\n{shell}",
+        r#"[[providers]]
+name = "{}"
+args = ["exec-{}"]
+
+"#,
+        provider.name, provider.name
+    )
+}
+
+fn diagnostic_model_toml() -> &'static str {
+    r#"[[providers]]
+name = "diagnostic-provider"
+"#
+}
+
+fn config_toml() -> &'static str {
+    r#"diagnostics_model = "diagnostic"
+"#
+}
+
+fn resume_provider_toml(
+    provider: &ResumeProviderFixture<'_>,
+    command: &Path,
+    projects_dir: &Path,
+) -> String {
+    format!(
+        r#"[{}]
+command = {}
+args = []
+interactive_args = ["launch-{}"]
+prompt_mode = "arg"
+
+[{}.resume]
+kind = "flag"
+flag = "--resume"
+
+[{}.session_storage]
+kind = "{}_code"
+projects_dir = {}
+
+"#,
+        provider.name,
+        toml_string(&command.display().to_string()),
+        provider.name,
+        provider.name,
+        provider.name,
+        ["cla", "ude"].concat(),
+        toml_string(&projects_dir.display().to_string())
+    )
+}
+
+fn diagnostic_provider_toml(command: &Path) -> String {
+    format!(
+        r#"[diagnostic-provider]
+command = {}
+args = []
+prompt_mode = "stdin"
+"#,
+        toml_string(&command.display().to_string())
+    )
+}
+
+fn provider_body(marker: &Path, shell: &str) -> String {
+    format!("{}\n{shell}", provider_marker_line(marker))
+}
+
+fn provider_marker_line(marker: &Path) -> String {
+    format!(
+        "printf '%s\\n' ran >> {}",
         toml_string(&marker.display().to_string())
     )
 }
 
 fn line_count(path: &Path) -> usize {
-    fs::read_to_string(path)
-        .map(|content| content.lines().count())
-        .unwrap_or(0)
+    count_lines(optional_file_text(path).as_deref())
+}
+
+fn optional_file_text(path: &Path) -> Option<String> {
+    fs::read_to_string(path).ok()
+}
+
+fn count_lines(content: Option<&str>) -> usize {
+    content.map(|content| content.lines().count()).unwrap_or(0)
 }
 
 fn seed_base_resume_fixture(
@@ -297,13 +332,7 @@ fn seed_base_resume_fixture(
     use_heuristic_diagnostics: bool,
 ) -> Fixture {
     let fixture = Fixture::new();
-    let resume_providers: Vec<_> = providers
-        .iter()
-        .map(|(name, _marker, body)| ResumeProviderFixture {
-            name,
-            body: body.as_str(),
-        })
-        .collect();
+    let resume_providers = resume_provider_fixtures(providers);
     fixture.write_resume_pool(
         "age100-resume",
         &resume_providers,
@@ -312,6 +341,21 @@ fn seed_base_resume_fixture(
     fixture.stage_active_claude_jsonl(providers[0].0);
     fixture.seed_active_chain(providers[0].0, "age100-resume");
     fixture
+}
+
+fn resume_provider_fixtures<'a>(
+    providers: &'a [(&'a str, &Path, String)],
+) -> Vec<ResumeProviderFixture<'a>> {
+    providers.iter().map(resume_provider_fixture).collect()
+}
+
+fn resume_provider_fixture<'a>(
+    provider: &'a (&'a str, &Path, String),
+) -> ResumeProviderFixture<'a> {
+    ResumeProviderFixture {
+        name: provider.0,
+        body: provider.2.as_str(),
+    }
 }
 
 #[test]

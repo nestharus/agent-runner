@@ -1,0 +1,16 @@
+a1a3ca1 FIX #32: rotate external-provider transport timeouts over the pool; right-size handshake timeout
+1e043d3 Restore opencode-turns exec bit after revert
+c3ab19c Revert "Fallback opencode turns to SQLite on invalid export"
+2b7ab03 Fallback opencode turns to SQLite on invalid export
+1593ef8 S11 integration residue: provider DTO/settings/registry refinements from cutover fix iterations
+44e0678 Confirm built-in mailbox delivery via ingested turns
+e6bcfc0 Confirm mailbox delivery with nonce markers
+65660f8 Confirm external wake delivery via submitted turn marker
+b93d4a5 Fix failed auto-wake mailbox retries
+4014f10 Reload external provider registry on detached wake resume
+be3be3e Pin host linkage env for external providers
+bac9fcb Canonicalize OpenCode external provider settings
+ab64e50 Record external provider launch pid identity
+1c1a619 Filter external opencode launch env
+2c02cb6 Surface external provider policy diagnostics
+212cdf4 Pass selected provider settings to external policy

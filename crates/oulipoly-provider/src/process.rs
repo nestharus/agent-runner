@@ -53,12 +53,11 @@ impl ByteAccumulator {
     }
 
     pub fn push(&mut self, chunk: &[u8]) {
-        self.contains_nul |= chunk.contains(&0);
-        self.contains_high_bit |= chunk.iter().any(|byte| *byte >= 0x80);
-        let remaining = self.limit.bytes.saturating_sub(self.bytes.len());
-        let captured = remaining.min(chunk.len());
-        self.bytes.extend_from_slice(&chunk[..captured]);
-        self.discarded_len += chunk.len() - captured;
+        self.contains_nul |= chunk_contains_nul(chunk);
+        self.contains_high_bit |= chunk_contains_high_bit(chunk);
+        let window = capture_window(self.limit, self.bytes.len(), chunk.len());
+        self.bytes.extend_from_slice(&chunk[..window.captured_len]);
+        self.discarded_len += window.discarded_len;
     }
 
     pub fn finish(self) -> CapturedBytes {
@@ -72,6 +71,28 @@ impl ByteAccumulator {
             contains_nul: self.contains_nul,
             contains_high_bit: self.contains_high_bit,
         }
+    }
+}
+
+struct CaptureWindow {
+    captured_len: usize,
+    discarded_len: usize,
+}
+
+fn chunk_contains_nul(chunk: &[u8]) -> bool {
+    chunk.contains(&0)
+}
+
+fn chunk_contains_high_bit(chunk: &[u8]) -> bool {
+    chunk.iter().any(|byte| *byte >= 0x80)
+}
+
+fn capture_window(limit: ByteLimit, current_len: usize, incoming_len: usize) -> CaptureWindow {
+    let remaining = limit.bytes.saturating_sub(current_len);
+    let captured_len = remaining.min(incoming_len);
+    CaptureWindow {
+        captured_len,
+        discarded_len: incoming_len - captured_len,
     }
 }
 
@@ -232,6 +253,11 @@ struct ProcessThreads {
     stdin: thread::JoinHandle<bool>,
 }
 
+struct TerminatedProcess {
+    status: Option<ExitStatus>,
+    force_killed: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TimeoutMode {
     TotalRuntime,
@@ -284,42 +310,16 @@ impl ProcessRunner {
         V: AsRef<OsStr>,
     {
         let argv = command.argv();
-        let mut process = Command::new(&command.program);
-        process
-            .args(&command.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        for (key, value) in envs {
-            process.env(key, value);
-        }
-        configure_process_group(&mut process);
-        let mut child = process.spawn().map_err(|error| {
-            ProviderClientError::host_transport(
-                HostErrorKind::SpawnFailed,
-                subcommand_for_error(&command),
-                None,
-                ProviderDiagnostics::with_description(error.to_string()),
-            )
-        })?;
+        let mut child = spawn_provider_process(&command, envs)?;
         notify_spawn_observer(&self.limits.spawn_observer, child.id());
-
-        let stdout = child
-            .stdout
-            .take()
-            .expect("stdout pipe should be configured");
-        let stderr = child
-            .stderr
-            .take()
-            .expect("stderr pipe should be configured");
-        let stdin = child.stdin.take().expect("stdin pipe should be configured");
-        let stdout_limit = self.limits.stdout_limit;
-        let stderr_limit = self.limits.stderr_limit;
         let (stdout_line_activity, stdout_line_rx) = stdout_line_activity_channel(timeout_mode);
-        let stdout_thread =
-            thread::spawn(move || drain_reader(stdout, stdout_limit, stdout_line_activity));
-        let stderr_thread = thread::spawn(move || drain_reader(stderr, stderr_limit, None));
-        let stdin_thread = thread::spawn(move || write_stdin(stdin, stdin_bytes));
+        let threads = start_process_threads(
+            &mut child,
+            stdin_bytes,
+            self.limits.stdout_limit,
+            self.limits.stderr_limit,
+            stdout_line_activity,
+        );
 
         let started = Instant::now();
         let mut last_stdout_line = started;
@@ -327,58 +327,33 @@ impl ProcessRunner {
         loop {
             record_stdout_line_activity(&stdout_line_rx, &mut last_stdout_line);
 
-            if let Some(status) = child
-                .try_wait()
-                .map_err(|error| host_process_error(HostErrorKind::WaitFailed, &command, error))?
-            {
-                let stdin_closed_early = join_stdin(stdin_thread);
-                let stdout = join_capture(stdout_thread);
-                let stderr = join_capture(stderr_thread);
-                return Ok(ProcessOutcome {
-                    status: process_status(status),
-                    stdout,
-                    stderr,
-                    stdin_closed_early,
-                    host_cancellation_requested: cancellation_started.is_some()
-                        || self
-                            .limits
-                            .cancellation
-                            .as_ref()
-                            .is_some_and(CancellationToken::is_cancelled),
+            if let Some(status) = poll_child_status(&mut child, &command)? {
+                return Ok(map_completed_process_outcome(
+                    status,
+                    threads,
+                    cancellation_started.is_some(),
+                    &self.limits,
                     argv,
-                });
+                ));
             }
 
             if timeout_expired(timeout_mode, started, last_stdout_line, self.limits.timeout) {
                 return Err(self.terminate_and_collect(
                     child,
                     command,
-                    ProcessThreads {
-                        stdout: stdout_thread,
-                        stderr: stderr_thread,
-                        stdin: stdin_thread,
-                    },
+                    threads,
                     HostErrorKind::Timeout,
                     false,
                 ));
             }
 
-            if self
-                .limits
-                .cancellation
-                .as_ref()
-                .is_some_and(CancellationToken::is_cancelled)
-            {
+            if cancellation_requested(&self.limits) {
                 let cancelled_at = cancellation_started.get_or_insert_with(Instant::now);
-                if cancelled_at.elapsed() >= cancellation_grace(self.limits.kill_after_grace) {
+                if cancellation_grace_expired(cancelled_at, self.limits.kill_after_grace) {
                     return Err(self.terminate_and_collect(
                         child,
                         command,
-                        ProcessThreads {
-                            stdout: stdout_thread,
-                            stderr: stderr_thread,
-                            stdin: stdin_thread,
-                        },
+                        threads,
                         HostErrorKind::Cancelled,
                         true,
                     ));
@@ -398,42 +373,102 @@ impl ProcessRunner {
         host_cancellation_requested: bool,
     ) -> ProviderClientError {
         terminate_tree(&mut child);
-        let mut force_killed = false;
-        let grace_started = Instant::now();
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break Some(status),
-                Ok(None) if grace_started.elapsed() >= self.limits.kill_after_grace => {
-                    force_killed = true;
-                    kill_tree(&mut child);
-                    break child.wait().ok();
-                }
-                Ok(None) => thread::sleep(Duration::from_millis(5)),
-                Err(_) => break None,
-            }
-        };
-        let _stdin_closed_early = join_stdin(threads.stdin);
-        let mut diagnostics = ProviderDiagnostics {
-            stdout: join_capture(threads.stdout),
-            stderr: join_capture(threads.stderr),
-            process_was_force_killed: force_killed,
-            process_was_reaped: status.is_some(),
-            host_cancellation_requested,
-            ..ProviderDiagnostics::default()
-        };
-        if let Some(status) = status {
-            let process_status = process_status(status);
-            diagnostics.provider_exit_code = exit_code(&process_status);
-            diagnostics.provider_process_nonzero = process_nonzero(&process_status);
-        }
+        let terminated = wait_for_terminated_process(&mut child, self.limits.kill_after_grace);
+        let diagnostics =
+            map_termination_diagnostics(threads, terminated, host_cancellation_requested);
         ProviderClientError::host_transport(kind, subcommand_for_error(&command), None, diagnostics)
     }
 }
 
-fn notify_spawn_observer(observer: &Option<ProcessSpawnObserver>, child_id: u32) {
-    if let Some(observer) = observer {
-        observer.observe(child_id);
+fn spawn_provider_process<I, K, V>(
+    command: &ProcessCommand,
+    envs: I,
+) -> Result<Child, ProviderClientError>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<OsStr>,
+    V: AsRef<OsStr>,
+{
+    let mut process = build_provider_process(command, envs);
+    process
+        .spawn()
+        .map_err(|error| host_process_error(HostErrorKind::SpawnFailed, command, error))
+}
+
+fn build_provider_process<I, K, V>(command: &ProcessCommand, envs: I) -> Command
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<OsStr>,
+    V: AsRef<OsStr>,
+{
+    let mut process = Command::new(&command.program);
+    process
+        .args(&command.args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (key, value) in envs {
+        process.env(key, value);
     }
+    configure_process_group(&mut process);
+    process
+}
+
+fn start_process_threads(
+    child: &mut Child,
+    stdin_bytes: Vec<u8>,
+    stdout_limit: ByteLimit,
+    stderr_limit: ByteLimit,
+    stdout_line_activity: Option<Sender<Instant>>,
+) -> ProcessThreads {
+    let stdout = child
+        .stdout
+        .take()
+        .expect("stdout pipe should be configured");
+    let stderr = child
+        .stderr
+        .take()
+        .expect("stderr pipe should be configured");
+    let stdin = child.stdin.take().expect("stdin pipe should be configured");
+    ProcessThreads {
+        stdout: thread::spawn(move || drain_reader(stdout, stdout_limit, stdout_line_activity)),
+        stderr: thread::spawn(move || drain_reader(stderr, stderr_limit, None)),
+        stdin: thread::spawn(move || write_stdin(stdin, stdin_bytes)),
+    }
+}
+
+fn poll_child_status(
+    child: &mut Child,
+    command: &ProcessCommand,
+) -> Result<Option<ExitStatus>, ProviderClientError> {
+    child
+        .try_wait()
+        .map_err(|error| host_process_error(HostErrorKind::WaitFailed, command, error))
+}
+
+fn map_completed_process_outcome(
+    status: ExitStatus,
+    threads: ProcessThreads,
+    cancellation_started: bool,
+    limits: &ProcessLimits,
+    argv: Vec<OsString>,
+) -> ProcessOutcome {
+    ProcessOutcome {
+        status: process_status(status),
+        stdout: join_capture(threads.stdout),
+        stderr: join_capture(threads.stderr),
+        stdin_closed_early: join_stdin(threads.stdin),
+        host_cancellation_requested: host_cancellation_was_requested(cancellation_started, limits),
+        argv,
+    }
+}
+
+fn host_cancellation_was_requested(cancellation_started: bool, limits: &ProcessLimits) -> bool {
+    cancellation_started
+        || limits
+            .cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
 }
 
 fn stdout_line_activity_channel(
@@ -466,6 +501,70 @@ fn timeout_expired(
     match mode {
         TimeoutMode::TotalRuntime => started.elapsed() >= timeout,
         TimeoutMode::StdoutLineGap => last_stdout_line.elapsed() >= timeout,
+    }
+}
+
+fn cancellation_requested(limits: &ProcessLimits) -> bool {
+    limits
+        .cancellation
+        .as_ref()
+        .is_some_and(CancellationToken::is_cancelled)
+}
+
+fn cancellation_grace_expired(cancelled_at: &Instant, kill_after_grace: Duration) -> bool {
+    cancelled_at.elapsed() >= cancellation_grace(kill_after_grace)
+}
+
+fn wait_for_terminated_process(child: &mut Child, kill_after_grace: Duration) -> TerminatedProcess {
+    let mut force_killed = false;
+    let grace_started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if should_force_kill(&grace_started, kill_after_grace) => {
+                force_killed = true;
+                kill_tree(child);
+                break child.wait().ok();
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(5)),
+            Err(_) => break None,
+        }
+    };
+    TerminatedProcess {
+        status,
+        force_killed,
+    }
+}
+
+fn should_force_kill(grace_started: &Instant, kill_after_grace: Duration) -> bool {
+    grace_started.elapsed() >= kill_after_grace
+}
+
+fn map_termination_diagnostics(
+    threads: ProcessThreads,
+    terminated: TerminatedProcess,
+    host_cancellation_requested: bool,
+) -> ProviderDiagnostics {
+    let _stdin_closed_early = join_stdin(threads.stdin);
+    let mut diagnostics = ProviderDiagnostics {
+        stdout: join_capture(threads.stdout),
+        stderr: join_capture(threads.stderr),
+        process_was_force_killed: terminated.force_killed,
+        process_was_reaped: terminated.status.is_some(),
+        host_cancellation_requested,
+        ..ProviderDiagnostics::default()
+    };
+    if let Some(status) = terminated.status {
+        let process_status = process_status(status);
+        diagnostics.provider_exit_code = exit_code(&process_status);
+        diagnostics.provider_process_nonzero = process_nonzero(&process_status);
+    }
+    diagnostics
+}
+
+fn notify_spawn_observer(observer: &Option<ProcessSpawnObserver>, child_id: u32) {
+    if let Some(observer) = observer {
+        observer.observe(child_id);
     }
 }
 

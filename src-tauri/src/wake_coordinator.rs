@@ -206,23 +206,11 @@ fn trigger_turn_end_recheck(session_id: &str) -> WakeDiagnostic {
         Err(err) => return storage_error_diagnostic(err),
     };
     let auto_wake = current_auto_wake();
-    if no_pending(pending_count) {
-        release_current_auto_wake_claim(session_id, auto_wake.as_ref());
-        return WakeDiagnostic::status("no_pending");
-    }
-    let current_count = current_auto_wake_count(auto_wake.as_ref());
-    let max_count = auto_wake_max();
-    if auto_wake_cap_reached(current_count, max_count) {
-        release_current_auto_wake_claim(session_id, auto_wake.as_ref());
-        emit_auto_wake_cap_reached(session_id, current_count, max_count);
-        return auto_wake_cap_diagnostic(current_count);
-    }
-    start_wake_chain(StartWakeInput {
+    apply_turn_end_recheck_decision(
         session_id,
-        reason: "turn_end_recheck",
-        auto_wake_count: current_count + 1,
-        renew_token: auto_wake.as_ref().map(|wake| wake.token.as_str()),
-    })
+        auto_wake.as_ref(),
+        turn_end_recheck_decision(session_id, pending_count, auto_wake.as_ref()),
+    )
 }
 
 fn failed_auto_wake_recheck(session_id: &str, auto_wake: &AutoWakeEnv) -> WakeDiagnostic {
@@ -230,21 +218,113 @@ fn failed_auto_wake_recheck(session_id: &str, auto_wake: &AutoWakeEnv) -> WakeDi
         Ok(count) => count,
         Err(err) => return storage_error_diagnostic(err),
     };
+    apply_failed_auto_wake_recheck_decision(
+        session_id,
+        auto_wake,
+        failed_auto_wake_recheck_decision(session_id, pending_count, auto_wake),
+    )
+}
+
+enum TurnEndRecheckDecision<'a> {
+    NoPending,
+    CapReached { current_count: i64, max_count: i64 },
+    Start(StartWakeInput<'a>),
+}
+
+fn turn_end_recheck_decision<'a>(
+    session_id: &'a str,
+    pending_count: usize,
+    auto_wake: Option<&'a AutoWakeEnv>,
+) -> TurnEndRecheckDecision<'a> {
     if no_pending(pending_count) {
-        return WakeDiagnostic::status("no_pending");
+        return TurnEndRecheckDecision::NoPending;
+    }
+    let current_count = current_auto_wake_count(auto_wake);
+    let max_count = auto_wake_max();
+    if auto_wake_cap_reached(current_count, max_count) {
+        return TurnEndRecheckDecision::CapReached {
+            current_count,
+            max_count,
+        };
+    }
+    TurnEndRecheckDecision::Start(StartWakeInput {
+        session_id,
+        reason: "turn_end_recheck",
+        auto_wake_count: current_count + 1,
+        renew_token: auto_wake.map(|wake| wake.token.as_str()),
+    })
+}
+
+fn apply_turn_end_recheck_decision(
+    session_id: &str,
+    auto_wake: Option<&AutoWakeEnv>,
+    decision: TurnEndRecheckDecision<'_>,
+) -> WakeDiagnostic {
+    match decision {
+        TurnEndRecheckDecision::NoPending => {
+            release_current_auto_wake_claim(session_id, auto_wake);
+            WakeDiagnostic::status("no_pending")
+        }
+        TurnEndRecheckDecision::CapReached {
+            current_count,
+            max_count,
+        } => {
+            release_current_auto_wake_claim(session_id, auto_wake);
+            emit_auto_wake_cap_reached(session_id, current_count, max_count);
+            auto_wake_cap_diagnostic(current_count)
+        }
+        TurnEndRecheckDecision::Start(input) => start_wake_chain(input),
+    }
+}
+
+enum FailedAutoWakeRecheckDecision<'a> {
+    NoPending,
+    CapReached { current_count: i64, max_count: i64 },
+    Retry(StartWakeInput<'a>),
+}
+
+fn failed_auto_wake_recheck_decision<'a>(
+    session_id: &'a str,
+    pending_count: usize,
+    auto_wake: &'a AutoWakeEnv,
+) -> FailedAutoWakeRecheckDecision<'a> {
+    if no_pending(pending_count) {
+        return FailedAutoWakeRecheckDecision::NoPending;
     }
     let max_count = auto_wake_max();
     if auto_wake_cap_reached(auto_wake.count, max_count) {
-        emit_auto_wake_cap_reached(session_id, auto_wake.count, max_count);
-        return auto_wake_cap_diagnostic(auto_wake.count);
+        return FailedAutoWakeRecheckDecision::CapReached {
+            current_count: auto_wake.count,
+            max_count,
+        };
     }
-    sleep_before_failed_auto_wake_retry(auto_wake.count);
-    start_wake_chain(StartWakeInput {
+    FailedAutoWakeRecheckDecision::Retry(StartWakeInput {
         session_id,
         reason: "wake_failure_retry",
         auto_wake_count: auto_wake.count + 1,
         renew_token: None,
     })
+}
+
+fn apply_failed_auto_wake_recheck_decision(
+    session_id: &str,
+    auto_wake: &AutoWakeEnv,
+    decision: FailedAutoWakeRecheckDecision<'_>,
+) -> WakeDiagnostic {
+    match decision {
+        FailedAutoWakeRecheckDecision::NoPending => WakeDiagnostic::status("no_pending"),
+        FailedAutoWakeRecheckDecision::CapReached {
+            current_count,
+            max_count,
+        } => {
+            emit_auto_wake_cap_reached(session_id, current_count, max_count);
+            auto_wake_cap_diagnostic(current_count)
+        }
+        FailedAutoWakeRecheckDecision::Retry(input) => {
+            sleep_before_failed_auto_wake_retry(auto_wake.count);
+            start_wake_chain(input)
+        }
+    }
 }
 
 fn sleep_before_failed_auto_wake_retry(auto_wake_count: i64) {
@@ -322,34 +402,55 @@ struct StartWakeInput<'a> {
 
 fn start_wake_chain(input: StartWakeInput<'_>) -> WakeDiagnostic {
     let claim_token = Uuid::new_v4().to_string();
-    let mut db = match open_wake_mailbox() {
-        Ok(db) => db,
-        Err(err) => return storage_error_diagnostic(err),
-    };
-    let runtime = match session_runtime_for_wake(&db, input.session_id) {
-        Ok(row) => row,
-        Err(err) => return storage_error_diagnostic(err),
-    };
-    match pty_runtime_is_busy(&mut db, input.session_id, runtime.as_ref()) {
-        Ok(true) => return WakeDiagnostic::status("busy"),
-        Ok(false) => {}
-        Err(err) => return storage_error_diagnostic(err),
-    }
-    let claim_result = match acquire_wake_claim(&mut db, input, &claim_token) {
-        Ok(result) => result,
-        Err(err) => return storage_error_diagnostic(err),
-    };
-    let claim = match wake_claim_to_start(claim_result) {
-        Ok(claim) => claim,
+    let mut context = match prepare_wake_start_context(input, &claim_token) {
+        Ok(context) => context,
         Err(diagnostic) => return diagnostic,
     };
     let spawn = spawn_detached_resume(
         input.session_id,
-        runtime.as_ref(),
-        &claim.claim_token,
+        context.runtime.as_ref(),
+        &context.claim.claim_token,
         input.auto_wake_count,
     );
-    wake_spawn_diagnostic(&mut db, input, claim, spawn)
+    wake_spawn_diagnostic(&mut context.db, input, context.claim, spawn)
+}
+
+struct WakeStartContext {
+    db: MailboxDb,
+    runtime: Option<SessionRuntimeRow>,
+    claim: WakeClaimRow,
+}
+
+fn prepare_wake_start_context(
+    input: StartWakeInput<'_>,
+    claim_token: &str,
+) -> Result<WakeStartContext, WakeDiagnostic> {
+    let mut db = open_wake_mailbox().map_err(storage_error_diagnostic)?;
+    let runtime =
+        session_runtime_for_wake(&db, input.session_id).map_err(storage_error_diagnostic)?;
+    if wake_runtime_busy(&mut db, input.session_id, runtime.as_ref())? {
+        return Err(WakeDiagnostic::status("busy"));
+    }
+    let claim = acquire_startable_wake_claim(&mut db, input, claim_token)?;
+    Ok(WakeStartContext { db, runtime, claim })
+}
+
+fn wake_runtime_busy(
+    db: &mut MailboxDb,
+    session_id: &str,
+    runtime: Option<&SessionRuntimeRow>,
+) -> Result<bool, WakeDiagnostic> {
+    pty_runtime_is_busy(db, session_id, runtime).map_err(storage_error_diagnostic)
+}
+
+fn acquire_startable_wake_claim(
+    db: &mut MailboxDb,
+    input: StartWakeInput<'_>,
+    claim_token: &str,
+) -> Result<WakeClaimRow, WakeDiagnostic> {
+    let claim_result =
+        acquire_wake_claim(db, input, claim_token).map_err(storage_error_diagnostic)?;
+    wake_claim_to_start(claim_result)
 }
 
 fn wake_claim_to_start(result: WakeClaimAcquireResult) -> Result<WakeClaimRow, WakeDiagnostic> {
@@ -368,15 +469,29 @@ fn wake_spawn_diagnostic(
     spawn: Result<i64, String>,
 ) -> WakeDiagnostic {
     match spawn {
-        Ok(wake_pid) => {
-            record_wake_pid_or_warn(db, input.session_id, &claim.claim_token, wake_pid);
-            spawned_wake_diagnostic(claim.claim_token, wake_pid, input.auto_wake_count)
-        }
-        Err(err) => {
-            let _ = db.release_wake_claim(input.session_id, Some(&claim.claim_token));
-            spawn_error_diagnostic(claim.claim_token, input.auto_wake_count, err)
-        }
+        Ok(wake_pid) => successful_wake_spawn_diagnostic(db, input, claim, wake_pid),
+        Err(err) => failed_wake_spawn_diagnostic(db, input, claim, err),
     }
+}
+
+fn successful_wake_spawn_diagnostic(
+    db: &mut MailboxDb,
+    input: StartWakeInput<'_>,
+    claim: WakeClaimRow,
+    wake_pid: i64,
+) -> WakeDiagnostic {
+    record_wake_pid_or_warn(db, input.session_id, &claim.claim_token, wake_pid);
+    spawned_wake_diagnostic(claim.claim_token, wake_pid, input.auto_wake_count)
+}
+
+fn failed_wake_spawn_diagnostic(
+    db: &mut MailboxDb,
+    input: StartWakeInput<'_>,
+    claim: WakeClaimRow,
+    err: String,
+) -> WakeDiagnostic {
+    let _ = db.release_wake_claim(input.session_id, Some(&claim.claim_token));
+    spawn_error_diagnostic(claim.claim_token, input.auto_wake_count, err)
 }
 
 fn open_wake_mailbox() -> Result<MailboxDb, String> {
@@ -395,18 +510,33 @@ fn pty_runtime_is_busy(
     session_id: &str,
     runtime: Option<&SessionRuntimeRow>,
 ) -> Result<bool, String> {
-    let Some(row) = runtime else {
+    let Some(row) = running_pty_runtime(runtime) else {
         return Ok(false);
     };
-    if row.mode != "pty_interactive" || row.run_state != "running" {
-        return Ok(false);
-    }
-    let control_path = row.pty_control_path.clone();
-    let liveness = db.session_liveness(session_id)?;
+    let liveness = session_liveness_for_runtime(db, session_id)?;
+    cleanup_idle_pty_runtime(row, liveness);
+    Ok(pty_liveness_is_busy(liveness))
+}
+
+fn running_pty_runtime(runtime: Option<&SessionRuntimeRow>) -> Option<&SessionRuntimeRow> {
+    runtime.filter(|row| row.mode == "pty_interactive" && row.run_state == "running")
+}
+
+fn session_liveness_for_runtime(
+    db: &mut MailboxDb,
+    session_id: &str,
+) -> Result<SessionLiveness, String> {
+    db.session_liveness(session_id)
+}
+
+fn cleanup_idle_pty_runtime(row: &SessionRuntimeRow, liveness: SessionLiveness) {
     if liveness == SessionLiveness::Idle {
-        unlink_stale_pty_socket(control_path.as_deref());
+        unlink_stale_pty_socket(row.pty_control_path.as_deref());
     }
-    Ok(liveness == SessionLiveness::Busy)
+}
+
+fn pty_liveness_is_busy(liveness: SessionLiveness) -> bool {
+    liveness == SessionLiveness::Busy
 }
 
 #[cfg(unix)]

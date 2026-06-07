@@ -1,0 +1,125 @@
+# S11 Gate Evidence
+
+Audited net source range: `95699d6..a1a3ca1` plus the current working-tree S11 function-classification remediation.
+
+Functional cutoff: `95699d6..1593ef8`.
+
+Auditor source inspection worktree for the current cycle: `/home/nes/projects/agent-runner/worktrees/age-pid-sidecar` because the regenerated diff includes unstaged S11 remediation changes.
+
+Gate artifact paths:
+
+- Diff: `planning/s11-gate/gates/diff.patch`
+- Touched files: `planning/s11-gate/gates/touched-files.txt`
+- Source commit notes: `planning/s11-gate/evidence/source-commits.log`
+- Mode remediation diff: `planning/s11-gate/evidence/mode-remediation.diff`
+- Live smoke notes: `planning/s11-gate/evidence/live-smoke.md`
+
+## Source Range And Remediation
+
+`1593ef8` was the S11 functional cutoff, but it tracked `scripts/opencode-turns` as `100644`. A clean workspace test at `/tmp/s11-gate-worktree-1593` failed in `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs::opencode_read_turns_ingests_normalized_jsonl` with:
+
+```text
+Turn script exited 126: sh: 1: /tmp/s11-gate-worktree-1593/crates/oulipoly-runtime/../../scripts/opencode-turns: Permission denied
+```
+
+The post-cutoff remediation commit `1e043d3 Restore opencode-turns exec bit after revert` changes only:
+
+```text
+mode change 100644 => 100755 scripts/opencode-turns
+```
+
+The transient `2b7ab03 Fallback opencode turns to SQLite on invalid export` content was reverted by `c3ab19c`; it is not present in the net source behavior. The attempt-4 commit `a1a3ca1` is included in the audited net range and adds external-provider transport timeout/account-unavailable rotation plus `crates/oulipoly-runtime/tests/age246_external_transport_rotation.rs`. The current working-tree remediation splits function-classification risk surfaces and adds provider/test fixtures for heartbeat-gap timeout coverage.
+
+## Isolated Command Gates
+
+Final full workspace gates for the remediated working tree were rerun by the coordinator before commit. The commands below were run with `OULIPOLY_DATA_DIR` unset and isolated XDG config/data directories unless otherwise noted.
+
+Current remediated workspace command results:
+
+- `cargo fmt --all -- --check`: status `0`.
+- `cargo clippy --workspace --all-targets -- -D warnings`: status `0`.
+- `git diff --check -- ':!planning/oc-gate/**' ':!planning/abd-gate/**' ':!planning/wue-gate/**'`: status `0`; the exclusions avoid unrelated concurrently dirty gate artifacts.
+- `bash scripts/tests/opencode-turns.test.sh`: status `0`.
+- `cargo test -p oulipoly-agent-runner --test wu_d_proactive_wake_integration busy_then_turn_end_delivers -- --nocapture`: status `0`; this targeted rerun covered the only failure from the earlier full workspace attempt.
+- `cargo test --workspace`: status `0`; the final full workspace run completed successfully after the targeted rerun.
+
+The previous clean full-workspace gate for `1e043d3` is retained below only as historical continuity evidence.
+
+## Targeted Evidence Run
+
+Targeted log: `planning/s11-gate/evidence/targeted-tests.log`.
+
+Targeted status: `planning/s11-gate/evidence/targeted-tests.status` contains `targeted-tests status=0`.
+
+Environment recorded in the current targeted log:
+
+- `head=a1a3ca1+working-tree-s11-remediation` (`targeted-tests.log:3`)
+- `base=95699d6` (`targeted-tests.log:4`)
+- `worktree=/home/nes/projects/agent-runner/worktrees/age-pid-sidecar` (`targeted-tests.log:5`)
+- `CARGO_TARGET_DIR_PROVIDER=/tmp/s11-provider-test-target` (`targeted-tests.log:6`)
+- `CARGO_TARGET_DIR_RUNTIME=/tmp/s11-runtime-test-target` (`targeted-tests.log:7`)
+- `CARGO_TARGET_DIR_TAURI=/tmp/s11-tauri-test-target` (`targeted-tests.log:8`)
+
+Current targeted commands covered:
+
+- `cargo fmt --check`: `fmt_status=0` (`targeted-tests.log:10-11`)
+- `cargo test -p oulipoly-provider`: `provider_status=0` (`targeted-tests.log:13-327`), including `launch_stream_lifecycle` heartbeat-gap tests at `targeted-tests.log:180-184`.
+- `cargo test -p oulipoly-runtime --test age217_s6a_policy_launch_dispatch --test age246_external_transport_rotation --test provider_registry --test provider_settings_host`: `runtime_status=0` (`targeted-tests.log:329-421`), including `age217_s6a_policy_launch_dispatch` `26 passed` (`targeted-tests.log:363`), `age246_external_transport_rotation` `4 passed` (`targeted-tests.log:373`), and `external_launch_heartbeat_gap_timeout_rotates_to_next_account_and_succeeds` (`targeted-tests.log:370`).
+- `cargo test --manifest-path src-tauri/Cargo.toml --test s11_external_provider_wake --test wu_b_mailbox_integration --test s10_external_provider_resume --test age100_resume_quota_migration --test age166_zero_turn_orchestration_e2e --test age240_relocated_support`: `tauri_status=0` (`targeted-tests.log:423-504`), including `s11_external_provider_wake` `8 passed` (`targeted-tests.log:476`) and `wu_b_mailbox_integration` `20 passed` (`targeted-tests.log:502`).
+- `bash scripts/tests/opencode-turns.test.sh`: `opencode-turns tests passed` and `opencode_turns_status=0` (`targeted-tests.log:506-508`).
+- Final targeted status: `targeted-tests status=0` (`targeted-tests.log:511`).
+
+## Historical Full Workspace Gate
+
+Final command log: `/tmp/s11-head-clean-verify-target-component.log`.
+
+Environment recorded in the log:
+
+- `head=1e043d3`
+- `xdg=/tmp/s11-head-clean-xdg.hu2qHi`
+- `target=/tmp/s11-head-clean-build.1jST5D/target`
+- `OULIPOLY_DATA_DIR=scrubbed`
+
+The target directory intentionally contains a literal `target/` path component so `src-tauri/tests/workspace_layout.rs::binary_target_resolves` matches the workspace contract while avoiding stale shared-target binaries.
+
+Command results:
+
+- `cargo fmt --check`: `fmt_status=0` (`/tmp/s11-head-clean-verify-target-component.log:9`)
+- `cargo clippy --workspace --all-targets -- -D warnings`: `clippy_status=0` (`/tmp/s11-head-clean-verify-target-component.log:389`)
+- `cargo test --workspace`: `test_status=0` (`/tmp/s11-head-clean-verify-target-component.log:5126`)
+
+Key suites observed in the clean workspace run:
+
+- `src-tauri/tests/s10_external_provider_resume.rs`: ran at `/tmp/s11-head-clean-verify-target-component.log:2367`, `2 passed` at line 2373.
+- `src-tauri/tests/s11_external_provider_wake.rs`: ran at line 2375, `8 passed` at line 2387.
+- `src-tauri/tests/wu_b_mailbox_integration.rs`: ran at line 2526, `20 passed` at line 2550.
+- `crates/oulipoly-runtime/tests/age217_s6a_policy_launch_dispatch.rs`: ran at line 3778, `26 passed` at line 3808.
+- `crates/oulipoly-runtime/tests/age243_s7a_session_dispatch.rs::opencode_read_turns_ingests_normalized_jsonl`: `ok` at line 3973 after the executable-bit remediation.
+
+S11-specific tests observed in the clean run:
+
+- `external_provider_wake_does_not_mark_delivered_when_resume_produces_no_turn`: `ok` at line 2381.
+- `external_provider_wake_confirms_delivery_from_submitted_turn_marker`: `ok` at line 2382.
+- `external_provider_failed_wake_releases_claim_and_retries_pending_mailbox`: `ok` at line 2384.
+- `external_provider_rate_limited_wake_records_error_and_retries_pending_mailbox`: `ok` at line 2385.
+
+## Live Runtime Evidence
+
+See `planning/s11-gate/evidence/live-smoke.md` for inspected live file paths and contents.
+
+Key live artifacts:
+
+- `/tmp/s11-e2e/initial10.log` contains `DISPATCHED ab_19e9eb3c740_11963_58a0b4405542b714` and successful initial `OULIPOLY_RESULT`.
+- `/tmp/s11-e2e/fresh10-notify2.stdout` contains wake `attempted: true`, `status: spawned`, `wake_pid: 2188`, and `auto_wake_count: 1`.
+- `/tmp/s11-e2e/fresh10-opencode-argv.log` contains resumed `[OULIPOLY NOTIFICATIONS]` prompts with `rc: 0` entries.
+- `/tmp/s11-e2e/fresh10-xdg-data/oulipoly-agent-runner/pid-identity.db` mailbox rows for seq 1 and 2 were read via Python SQLite as `CONFIRMED-DELIVERED`, `delivery_attempts=1`, no delivery error, and `delivered_by_invocation_uuid='7a46a1a5-844d-45e8-bd67-aecaf9cf9194'`.
+- `/tmp/s11-e2e/fresh10-xdg-data/oulipoly-agent-runner/invocations/7a46a1a5-844d-45e8-bd67-aecaf9cf9194.result` contains `"status":"succeeded"` and `"success":true`.
+- `/tmp/s11-e2e/fresh13-export.json` contains exported session text `WOKE 0`.
+- `/tmp/s11-e2e/fresh10-workload-done.txt` and `/tmp/s11-e2e/fresh13-workload-done.txt` contain `S11-WAKE-OK`.
+- `/tmp/s10-e2e/final.log` and `/tmp/s10-e2e/final2.log` contain `S10-EXTERNAL-OK` and successful final `OULIPOLY_RESULT`.
+- Local retained `/tmp/s10-e2e` files did not contain `S10-FINAL-OK` or `S10-RESUME-OK` during this refresh; S10 resume remains bound to shipped deterministic integration tests.
+- `/tmp/claude-1000/-home-nes-projects-agent-runner/45ccb26a-8bb6-4486-9b1e-2226e29292a0/tasks/bvnh4nja0.output` contains `XHIGH-EXTERNAL-OK` and `"status":"succeeded"`.
+
+## Schema Boundary
+
+No `state.db` schema migration is declared or required. The S11 touched list does not include `crates/oulipoly-state/src/schema.rs`, `crates/oulipoly-state/src/migrations.rs`, or migration SQL. New delivery-attempt state is sidecar mailbox state.

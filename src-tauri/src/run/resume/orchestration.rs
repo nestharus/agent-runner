@@ -323,56 +323,59 @@ fn run_resume_attempt(
         Err(exit_code) => return Ok(ResumeAttemptLoopControl::Return(exit_code)),
     };
 
-    let mut attempt = start_resume_invocation(&input, &provider, provider_index)?;
-    let provider_session_id = input.resolved.active_session_id.clone();
-    bind_resume_attempt_session(
-        &input,
-        &provider,
-        attempt.invocation_row_id,
-        &provider_session_id,
-    )?;
-    let zero_turn_baseline = zero_turn_record_baseline(
-        &input.env.state,
-        &input.env.sessions_cfg,
-        &provider.name,
-        Some(&provider_session_id),
-    );
-
-    let invocation_env = resume_invocation_env(&attempt.invocation)?;
-    formatter::emit_stderr(&attempt.invocation.stderr_line());
+    let mut bound_attempt = setup_bound_resume_attempt(&input, &provider, provider_index)?;
 
     let mut result = match execute_resume_attempt_command(
         &input,
         &provider,
         provider_index,
         target.prompt_mode,
-        &invocation_env,
+        &bound_attempt.invocation_env,
         strategy,
     ) {
         Ok(result) => result,
-        Err(_spawn_err) => {
-            record_failed_mailbox_delivery_attempt(&input, "resume_spawn_error")?;
-            finalize_resume_spawn_error(&input, &mut attempt)?;
-            return Ok(ResumeAttemptLoopControl::Return(1));
-        }
+        Err(_spawn_err) => return handle_resume_attempt_spawn_error(&input, &mut bound_attempt),
     };
+
+    handle_resume_attempt_result(&mut input, &mut bound_attempt, &provider, &mut result)
+}
+
+fn handle_resume_attempt_spawn_error(
+    input: &ResumeAttemptInput<'_>,
+    bound_attempt: &mut BoundResumeAttempt<'_>,
+) -> Result<ResumeAttemptLoopControl, String> {
+    record_failed_mailbox_delivery_attempt(input, "resume_spawn_error")?;
+    finalize_resume_spawn_error(input, &mut bound_attempt.attempt)?;
+    Ok(ResumeAttemptLoopControl::Return(1))
+}
+
+fn handle_resume_attempt_result(
+    input: &mut ResumeAttemptInput<'_>,
+    bound_attempt: &mut BoundResumeAttempt<'_>,
+    provider: &oulipoly_config::ProviderConfig,
+    result: &mut executor::ExecutionResult,
+) -> Result<ResumeAttemptLoopControl, String> {
     apply_resume_attempt_classification(
         input.env,
         &provider.name,
-        &provider_session_id,
-        &zero_turn_baseline,
+        &bound_attempt.provider_session_id,
+        &bound_attempt.zero_turn_baseline,
         input.zero_turn_confirmation,
-        &mut result,
+        result,
     )
     .and_then(|zero_turn_action| {
-        record_resume_acceptance_if_present(&input, attempt.invocation_row_id, &result)?;
+        record_resume_acceptance_if_present(
+            input,
+            bound_attempt.attempt.invocation_row_id,
+            result,
+        )?;
         emit_captured_child_marker_lines(&result.captured_child_invocations);
         handle_resume_attempt_terminal_signal(
-            &input,
-            &mut attempt,
-            &provider,
-            &provider_session_id,
-            &result,
+            input,
+            &mut bound_attempt.attempt,
+            provider,
+            &bound_attempt.provider_session_id,
+            result,
             zero_turn_action,
         )
     })
@@ -510,6 +513,42 @@ struct ResumeInvocationAttempt<'state> {
     invocation: oulipoly_state::CompositeInvocationId,
     invocation_row_id: i64,
     guard: FinalizerGuard<'state>,
+}
+
+struct BoundResumeAttempt<'state> {
+    attempt: ResumeInvocationAttempt<'state>,
+    provider_session_id: String,
+    zero_turn_baseline: crate::zero_turn_orchestration::ZeroTurnBaseline,
+    invocation_env: String,
+}
+
+fn setup_bound_resume_attempt<'state>(
+    input: &ResumeAttemptInput<'state>,
+    provider: &oulipoly_config::ProviderConfig,
+    provider_index: usize,
+) -> Result<BoundResumeAttempt<'state>, String> {
+    let attempt = start_resume_invocation(input, provider, provider_index)?;
+    let provider_session_id = input.resolved.active_session_id.clone();
+    bind_resume_attempt_session(
+        input,
+        provider,
+        attempt.invocation_row_id,
+        &provider_session_id,
+    )?;
+    let zero_turn_baseline = zero_turn_record_baseline(
+        &input.env.state,
+        &input.env.sessions_cfg,
+        &provider.name,
+        Some(&provider_session_id),
+    );
+    let invocation_env = resume_invocation_env(&attempt.invocation)?;
+    formatter::emit_stderr(&attempt.invocation.stderr_line());
+    Ok(BoundResumeAttempt {
+        attempt,
+        provider_session_id,
+        zero_turn_baseline,
+        invocation_env,
+    })
 }
 
 fn start_resume_invocation<'state>(
@@ -660,7 +699,7 @@ fn handle_resume_attempt_terminal_signal(
         zero_turn_action,
     );
 
-    match handle_terminal_signal_disposition(ResumeTerminalDispositionInput {
+    let disposition_control = handle_terminal_signal_disposition(ResumeTerminalDispositionInput {
         agent_runtime_services: input.agent_runtime_services,
         env: input.env,
         invocation_row_id: attempt.invocation_row_id,
@@ -668,37 +707,100 @@ fn handle_resume_attempt_terminal_signal(
         result,
         terminal_signal_disposition,
         zero_turn_action,
-    })? {
-        ResumeLoopControl::Continue => {
+    })?;
+    if let Some(control) = apply_resume_terminal_disposition_outcome(
+        input,
+        attempt,
+        provider_session_id,
+        result,
+        terminal_disposition_outcome(disposition_control, result),
+    )? {
+        return Ok(control);
+    }
+
+    if let Some(control) = handle_unconfirmed_mailbox_delivery_if_needed(
+        input,
+        attempt,
+        provider,
+        provider_session_id,
+        result,
+        zero_turn_action,
+    )? {
+        return Ok(control);
+    }
+
+    finalize_completed_attempt_for_resume(input, attempt, provider, provider_session_id, result)
+}
+
+enum ResumeTerminalDispositionOutcome {
+    Continue(i32),
+    Return(i32),
+    CompletedAttempt,
+}
+
+fn terminal_disposition_outcome(
+    control: ResumeLoopControl,
+    result: &executor::ExecutionResult,
+) -> ResumeTerminalDispositionOutcome {
+    match control {
+        ResumeLoopControl::Continue => ResumeTerminalDispositionOutcome::Continue(result.exit_code),
+        ResumeLoopControl::Return(exit_code) => ResumeTerminalDispositionOutcome::Return(exit_code),
+        ResumeLoopControl::CompletedAttempt => ResumeTerminalDispositionOutcome::CompletedAttempt,
+    }
+}
+
+fn apply_resume_terminal_disposition_outcome(
+    input: &ResumeAttemptInput<'_>,
+    attempt: &ResumeInvocationAttempt<'_>,
+    provider_session_id: &str,
+    result: &executor::ExecutionResult,
+    outcome: ResumeTerminalDispositionOutcome,
+) -> Result<Option<ResumeAttemptLoopControl>, String> {
+    match outcome {
+        ResumeTerminalDispositionOutcome::Continue(exit_code) => {
             record_failed_mailbox_delivery_attempt(
                 input,
                 &failed_delivery_error(result, "resume_retry"),
             )?;
-            mark_resume_attempt_idle(
-                provider_session_id,
-                &attempt.invocation.id,
-                Some(result.exit_code),
-            )?;
-            return Ok(ResumeAttemptLoopControl::Continue(result.exit_code));
+            mark_resume_attempt_idle(provider_session_id, &attempt.invocation.id, Some(exit_code))?;
+            Ok(Some(ResumeAttemptLoopControl::Continue(exit_code)))
         }
-        ResumeLoopControl::Return(exit_code) => {
+        ResumeTerminalDispositionOutcome::Return(exit_code) => {
             record_failed_mailbox_delivery_attempt(
                 input,
                 &failed_delivery_error(result, "resume_failed"),
             )?;
             mark_resume_attempt_idle(provider_session_id, &attempt.invocation.id, Some(exit_code))?;
-            return Ok(ResumeAttemptLoopControl::Return(exit_code));
+            Ok(Some(ResumeAttemptLoopControl::Return(exit_code)))
         }
-        ResumeLoopControl::CompletedAttempt => {}
+        ResumeTerminalDispositionOutcome::CompletedAttempt => Ok(None),
     }
+}
 
-    if mailbox_delivery_unconfirmed(input, &provider.name, result, zero_turn_action) {
-        record_failed_mailbox_delivery_attempt(input, "mailbox_delivery_unconfirmed")?;
-        finalize_unconfirmed_mailbox_delivery(input, attempt, result)?;
-        mark_resume_attempt_idle(provider_session_id, &attempt.invocation.id, Some(1))?;
-        return Ok(ResumeAttemptLoopControl::Return(1));
+fn handle_unconfirmed_mailbox_delivery_if_needed(
+    input: &ResumeAttemptInput<'_>,
+    attempt: &mut ResumeInvocationAttempt<'_>,
+    provider: &oulipoly_config::ProviderConfig,
+    provider_session_id: &str,
+    result: &executor::ExecutionResult,
+    zero_turn_action: ZeroTurnAction,
+) -> Result<Option<ResumeAttemptLoopControl>, String> {
+    if !mailbox_delivery_unconfirmed(input, &provider.name, result, zero_turn_action) {
+        return Ok(None);
     }
+    record_failed_mailbox_delivery_attempt(input, "mailbox_delivery_unconfirmed")?;
+    finalize_unconfirmed_mailbox_delivery(input, attempt, result)?;
+    mark_resume_attempt_idle(provider_session_id, &attempt.invocation.id, Some(1))?;
+    Ok(Some(ResumeAttemptLoopControl::Return(1)))
+}
 
+fn finalize_completed_attempt_for_resume(
+    input: &ResumeAttemptInput<'_>,
+    attempt: &mut ResumeInvocationAttempt<'_>,
+    provider: &oulipoly_config::ProviderConfig,
+    provider_session_id: &str,
+    result: &executor::ExecutionResult,
+) -> Result<ResumeAttemptLoopControl, String> {
     match finalize_completed_attempt(CompletedAttemptInput {
         agent_runtime_services: input.agent_runtime_services,
         env: input.env,
@@ -905,30 +1007,60 @@ fn headless_resume_resolution_result(
     session_id: &str,
     model_name: Option<&str>,
 ) -> Result<oulipoly_state::ResolvedResume, i32> {
+    match map_headless_resume_resolution(output) {
+        HeadlessResumeResolution::Resolved(resolved) => Ok(resolved),
+        resolution => {
+            render_headless_resume_resolution_error(resolution, env, session_id, model_name);
+            Err(1)
+        }
+    }
+}
+
+enum HeadlessResumeResolution {
+    Resolved(oulipoly_state::ResolvedResume),
+    ProviderModelMismatch { active_provider: String },
+    Rejected(oulipoly_state::ResumeError),
+    ServiceFailure(String),
+}
+
+fn map_headless_resume_resolution(
+    output: Result<ResumeServiceOutput, String>,
+) -> HeadlessResumeResolution {
     match output {
-        Ok(ResumeServiceOutput::ResumeResolved { resolved }) => Ok(resolved),
+        Ok(ResumeServiceOutput::ResumeResolved { resolved }) => {
+            HeadlessResumeResolution::Resolved(resolved)
+        }
         Ok(ResumeServiceOutput::ResumeRejected {
             error:
                 oulipoly_state::ResumeError::ProviderModelMismatch {
                     active_provider, ..
                 },
-        }) => {
+        }) => HeadlessResumeResolution::ProviderModelMismatch { active_provider },
+        Ok(ResumeServiceOutput::ResumeRejected { error }) => {
+            HeadlessResumeResolution::Rejected(error)
+        }
+        Err(err) => HeadlessResumeResolution::ServiceFailure(err),
+    }
+}
+
+fn render_headless_resume_resolution_error(
+    resolution: HeadlessResumeResolution,
+    env: &crate::migration_providers::ResumeExecutionEnvironment,
+    session_id: &str,
+    model_name: Option<&str>,
+) {
+    match resolution {
+        HeadlessResumeResolution::ProviderModelMismatch { active_provider } => {
             render_resume_model_pool_mismatch(
                 &env.models,
                 model_name.unwrap_or("<unknown>"),
                 session_id,
                 &active_provider,
             );
-            Err(1)
         }
-        Ok(ResumeServiceOutput::ResumeRejected { error }) => {
-            render_resume_error(error);
-            Err(1)
-        }
-        Err(err) => {
-            render_resume_service_failure(&err);
-            Err(1)
-        }
+        HeadlessResumeResolution::Rejected(error) => render_resume_error(error),
+        HeadlessResumeResolution::ServiceFailure(err) => render_resume_service_failure(&err),
+        HeadlessResumeResolution::Resolved(_) => {}
     }
 }
 
@@ -1123,13 +1255,11 @@ fn migrate_resume_target(
     attempts: usize,
     effective_spawn_cwd: &Path,
 ) -> Result<(), i32> {
-    if should_skip_provider_ref_default_migration(resolved, manual_migrate) {
-        validate_provider_ref_headless_resume_target(resolved, target, &resolved.active_provider)
-            .map_err(|message| provider_ref_resume_block_exit_code(&message))?;
+    if validate_provider_ref_default_migration_skip(resolved, target, manual_migrate)? {
         return Ok(());
     }
     let migration_model = migration_model_for_attempt(env, resolved, manual_migrate, attempts);
-    match dispatch_resume_migration(
+    let migration_result = dispatch_resume_migration(
         agent_runtime_services,
         env,
         resolved,
@@ -1137,7 +1267,30 @@ fn migrate_resume_target(
         attempts,
         effective_spawn_cwd,
         &migration_model,
-    ) {
+    );
+    apply_resume_migration_result(env, resolved, target, migration_result)
+}
+
+fn validate_provider_ref_default_migration_skip(
+    resolved: &oulipoly_state::ResolvedResume,
+    target: &crate::resume_cli::ResumeExecutionTarget,
+    manual_migrate: Option<&str>,
+) -> Result<bool, i32> {
+    if !should_skip_provider_ref_default_migration(resolved, manual_migrate) {
+        return Ok(false);
+    }
+    validate_provider_ref_headless_resume_target(resolved, target, &resolved.active_provider)
+        .map_err(|message| provider_ref_resume_block_exit_code(&message))?;
+    Ok(true)
+}
+
+fn apply_resume_migration_result(
+    env: &crate::migration_providers::ResumeExecutionEnvironment,
+    resolved: &mut oulipoly_state::ResolvedResume,
+    target: &mut crate::resume_cli::ResumeExecutionTarget,
+    migration_result: Result<MigrationServiceOutput, ServiceError>,
+) -> Result<(), i32> {
+    match migration_result {
         Ok(MigrationServiceOutput::Migrated { segment: migrated })
         | Ok(MigrationServiceOutput::AutoRotated {
             segment: migrated, ..

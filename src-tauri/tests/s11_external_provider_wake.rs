@@ -901,33 +901,61 @@ fn assert_success(output: &Output) {
 }
 
 fn terminal_signal_marker(stderr: &str) -> Value {
-    let line = stderr
+    parse_terminal_signal_marker(terminal_signal_marker_line(stderr))
+}
+
+fn terminal_signal_marker_line(stderr: &str) -> &str {
+    stderr
         .lines()
         .find_map(|line| line.strip_prefix("OULIPOLY_TERMINAL_SIGNAL="))
-        .unwrap_or_else(|| panic!("missing terminal-signal marker in stderr:\n{stderr}"));
+        .unwrap_or_else(|| panic!("missing terminal-signal marker in stderr:\n{stderr}"))
+}
+
+fn parse_terminal_signal_marker(line: &str) -> Value {
     serde_json::from_str(line).unwrap()
 }
 
 fn wait_for_file(path: &Path) -> String {
+    wait_for_path_exists(path);
+    read_file_text(path)
+}
+
+fn wait_for_path_exists(path: &Path) {
     wait_until(&format!("{} exists", path.display()), || path.exists());
+}
+
+fn read_file_text(path: &Path) -> String {
     fs::read_to_string(path).unwrap()
 }
 
 fn wait_for_json_file(path: &Path) -> (String, Value) {
-    let mut parsed = None;
+    let text = wait_for_json_text(path);
+    let value = parse_json_text(&text).expect("wait_for_json_text should return parseable JSON");
+    (text, value)
+}
+
+fn wait_for_json_text(path: &Path) -> String {
+    let mut parsed_text = None;
     wait_until(&format!("{} contains JSON", path.display()), || {
-        let Ok(text) = fs::read_to_string(path) else {
+        let Some(text) = read_optional_file_text(path) else {
             return false;
         };
-        match serde_json::from_str::<Value>(&text) {
-            Ok(value) => {
-                parsed = Some((text, value));
-                true
-            }
-            Err(_) => false,
+        if parse_json_text(&text).is_ok() {
+            parsed_text = Some(text);
+            true
+        } else {
+            false
         }
     });
-    parsed.unwrap()
+    parsed_text.unwrap()
+}
+
+fn read_optional_file_text(path: &Path) -> Option<String> {
+    fs::read_to_string(path).ok()
+}
+
+fn parse_json_text(text: &str) -> serde_json::Result<Value> {
+    serde_json::from_str(text)
 }
 
 fn wait_until(label: &str, mut predicate: impl FnMut() -> bool) {

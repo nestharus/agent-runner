@@ -531,13 +531,9 @@ fn sorted_snapshot_entries(
 }
 
 fn collect_paths(root: &Path, current: &Path, out: &mut Vec<(PathBuf, Option<Vec<u8>>)>) {
-    let paths = snapshot_dir_paths(current);
+    let paths = dir_entry_paths(read_snapshot_dir_entries(current));
     append_snapshot_entries(root, &paths, out);
     collect_child_snapshot_paths(root, &snapshot_child_dirs(&paths), out);
-}
-
-fn snapshot_dir_paths(current: &Path) -> Vec<PathBuf> {
-    dir_entry_paths(read_snapshot_dir_entries(current))
 }
 
 fn read_snapshot_dir_entries(current: &Path) -> Vec<fs::DirEntry> {
@@ -588,11 +584,19 @@ fn snapshot_path(root: &Path, path: &Path) -> PathBuf {
 }
 
 fn snapshot_bytes(path: &Path) -> Option<Vec<u8>> {
-    if path.is_file() {
-        Some(fs::read(path).expect("snapshot file should be readable"))
+    if is_snapshot_file(path) {
+        Some(read_snapshot_file_bytes(path))
     } else {
         None
     }
+}
+
+fn is_snapshot_file(path: &Path) -> bool {
+    path.is_file()
+}
+
+fn read_snapshot_file_bytes(path: &Path) -> Vec<u8> {
+    fs::read(path).expect("snapshot file should be readable")
 }
 
 fn is_snapshot_directory(path: &Path) -> bool {

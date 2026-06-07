@@ -58,15 +58,29 @@ fn declared_launch_env(context: &ExternalProviderDispatchContext) -> BTreeMap<St
 }
 
 fn insert_ambient_env(env: &mut BTreeMap<String, String>, key: &str) {
-    if let Ok(value) = std::env::var(key) {
-        env.insert(key.to_string(), value);
+    if let Some(value) = ambient_env_value(key) {
+        insert_launch_env(env, key, value);
     }
 }
 
+fn ambient_env_value(key: &str) -> Option<String> {
+    std::env::var(key).ok()
+}
+
 fn insert_pinned_agent_data_dir(env: &mut BTreeMap<String, String>) {
-    if let Ok(data_dir) = oulipoly_state::paths::data_dir() {
-        env.insert(DATA_DIR_ENV.to_string(), data_dir.display().to_string());
+    if let Some(data_dir) = pinned_agent_data_dir() {
+        insert_launch_env(env, DATA_DIR_ENV, data_dir);
     }
+}
+
+fn pinned_agent_data_dir() -> Option<String> {
+    oulipoly_state::paths::data_dir()
+        .ok()
+        .map(|data_dir| data_dir.display().to_string())
+}
+
+fn insert_launch_env(env: &mut BTreeMap<String, String>, key: &str, value: String) {
+    env.insert(key.to_string(), value);
 }
 
 fn insert_selected_opencode_auth_env(
@@ -76,37 +90,69 @@ fn insert_selected_opencode_auth_env(
     let Some(index) = selected_opencode_account_index(context) else {
         return;
     };
-    if index == 1 {
+    if !requires_scoped_opencode_auth_env(index) {
         return;
     }
-    if let Some(home) = env.get(HOME_ENV) {
-        env.insert(
-            XDG_DATA_HOME_ENV.to_string(),
-            Path::new(home)
-                .join(format!(".{OPENCODE_ACCOUNT_PREFIX}{index}"))
-                .display()
-                .to_string(),
-        );
+    if let Some(data_home) = selected_opencode_xdg_data_home(env.get(HOME_ENV), index) {
+        insert_launch_env(env, XDG_DATA_HOME_ENV, data_home);
     }
+}
+
+fn requires_scoped_opencode_auth_env(index: u8) -> bool {
+    index != 1
+}
+
+fn selected_opencode_xdg_data_home(home: Option<&String>, index: u8) -> Option<String> {
+    home.map(|home| opencode_account_data_home(home, index))
+}
+
+fn opencode_account_data_home(home: &str, index: u8) -> String {
+    Path::new(home)
+        .join(format!(".{OPENCODE_ACCOUNT_PREFIX}{index}"))
+        .display()
+        .to_string()
 }
 
 fn selected_opencode_account_index(context: &ExternalProviderDispatchContext) -> Option<u8> {
+    selected_opencode_name_index(context).or_else(|| selected_opencode_command_index(context))
+}
+
+fn selected_opencode_name_index(context: &ExternalProviderDispatchContext) -> Option<u8> {
     opencode_account_index(&context.provider.name)
-        .or_else(|| opencode_account_index_from_command(&context.provider.command))
+}
+
+fn selected_opencode_command_index(context: &ExternalProviderDispatchContext) -> Option<u8> {
+    opencode_account_index_from_command(&context.provider.command)
 }
 
 fn opencode_account_index_from_command(command: &str) -> Option<u8> {
+    let tokens = command_tokens(command);
+    opencode_account_index_from_tokens(&tokens)
+}
+
+fn command_tokens(command: &str) -> Vec<String> {
     shell_split(command)
+}
+
+fn opencode_account_index_from_tokens(tokens: &[String]) -> Option<u8> {
+    tokens
         .iter()
         .rev()
         .find_map(|part| opencode_account_index(part))
 }
 
 fn opencode_account_index(value: &str) -> Option<u8> {
-    let name = Path::new(value)
+    opencode_account_name_index(basename_or_value(value))
+}
+
+fn basename_or_value(value: &str) -> &str {
+    Path::new(value)
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or(value);
+        .unwrap_or(value)
+}
+
+fn opencode_account_name_index(name: &str) -> Option<u8> {
     match name {
         "opencode" | "opencode1" => Some(1),
         "opencode2" => Some(2),
@@ -172,14 +218,45 @@ pub(crate) fn build_launch_request(
 }
 
 fn provider_argv(context: &ExternalProviderDispatchContext, input_args: &[String]) -> Vec<String> {
-    let mut argv = shell_split(&context.provider.command);
-    if argv.is_empty() {
-        argv.push(context.provider.command.clone());
+    provider_argv_from_parts(
+        provider_command_argv(&context.provider.command),
+        &context.provider.args,
+        input_args,
+        provider_prompt_arg(context),
+    )
+}
+
+fn provider_command_argv(command: &str) -> Vec<String> {
+    let parsed = parse_provider_command_argv(command);
+    if parsed.is_empty() {
+        provider_command_fallback_argv(command)
+    } else {
+        parsed
     }
-    argv.extend(context.provider.args.clone());
+}
+
+fn parse_provider_command_argv(command: &str) -> Vec<String> {
+    shell_split(command)
+}
+
+fn provider_command_fallback_argv(command: &str) -> Vec<String> {
+    vec![command.to_string()]
+}
+
+fn provider_prompt_arg(context: &ExternalProviderDispatchContext) -> Option<String> {
+    matches!(context.prompt_mode, PromptMode::Arg).then(|| context.prompt.clone())
+}
+
+fn provider_argv_from_parts(
+    mut argv: Vec<String>,
+    provider_args: &[String],
+    input_args: &[String],
+    prompt_arg: Option<String>,
+) -> Vec<String> {
+    argv.extend(provider_args.iter().cloned());
     argv.extend(input_args.iter().cloned());
-    if matches!(context.prompt_mode, PromptMode::Arg) {
-        argv.push(context.prompt.clone());
+    if let Some(prompt) = prompt_arg {
+        argv.push(prompt);
     }
     argv
 }
@@ -279,12 +356,32 @@ fn base_provider_args(
     context: &ExternalProviderDispatchContext,
     model_provider_args: &[String],
 ) -> Vec<String> {
-    let effective_args = context.provider.args.as_slice();
-    if effective_args.ends_with(model_provider_args) {
-        effective_args[..effective_args.len() - model_provider_args.len()].to_vec()
+    base_provider_args_from_slices(context.provider.args.as_slice(), model_provider_args)
+}
+
+fn base_provider_args_from_slices(
+    effective_args: &[String],
+    model_provider_args: &[String],
+) -> Vec<String> {
+    if provider_args_have_model_suffix(effective_args, model_provider_args) {
+        provider_args_without_model_suffix(effective_args, model_provider_args)
     } else {
         effective_args.to_vec()
     }
+}
+
+fn provider_args_have_model_suffix(
+    effective_args: &[String],
+    model_provider_args: &[String],
+) -> bool {
+    effective_args.ends_with(model_provider_args)
+}
+
+fn provider_args_without_model_suffix(
+    effective_args: &[String],
+    model_provider_args: &[String],
+) -> Vec<String> {
+    effective_args[..effective_args.len() - model_provider_args.len()].to_vec()
 }
 
 fn launch_session(context: &ExternalProviderDispatchContext) -> Option<JsonObject> {

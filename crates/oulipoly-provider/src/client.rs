@@ -3,7 +3,7 @@ use crate::error::{
     check_contract_and_request, request_id_from,
 };
 use crate::generated::ProcessStatus;
-use crate::process::{ByteLimit, ProcessCommand, ProcessLimits, ProcessRunner};
+use crate::process::{ByteLimit, ProcessCommand, ProcessLimits, ProcessOutcome, ProcessRunner};
 use crate::resolver::{
     ProviderArtifactRef, ProviderResolveOptions, ProviderResolver, ResolvedProviderCommand,
 };
@@ -202,14 +202,7 @@ impl ProviderClient {
         I: ProviderEnv,
     {
         let envelope = self.invoke_json(subcommand, request, envs)?;
-        serde_json::from_value(envelope["result"].clone()).map_err(|error| {
-            ProviderClientError::protocol(
-                HostErrorKind::SchemaInvalidResponse,
-                subcommand,
-                request_id_from(&envelope),
-                ProviderDiagnostics::with_description(error.to_string()),
-            )
-        })
+        deserialize_typed_result(subcommand, envelope)
     }
 
     pub fn invoke_json<I>(
@@ -223,118 +216,33 @@ impl ProviderClient {
     {
         let request_id = request_id_from(&request);
         let registry = SchemaRegistry::new();
-        registry
-            .validate_request(subcommand, &request)
-            .map_err(|error| map_request_validation_error(error, subcommand, request_id.clone()))?;
+        validate_json_request(&registry, subcommand, &request, request_id.clone())?;
         let resolved = self.resolve(subcommand, request_id.clone())?;
         let outcome =
             self.run_resolved(subcommand, &resolved, request, envs, self.options.timeout)?;
-        *self
-            .last_argv
-            .lock()
-            .expect("argv mutex should not be poisoned") = outcome.argv().to_vec();
         let diagnostics = outcome.diagnostics();
-        *self
-            .last_diagnostics
-            .lock()
-            .expect("diagnostics mutex should not be poisoned") = diagnostics.clone();
-        if diagnostics.stdout.truncated {
-            return Err(ProviderClientError::protocol(
-                HostErrorKind::StdoutLimitExceeded,
-                subcommand,
-                request_id,
-                diagnostics,
-            ));
-        }
-        if outcome.stdout.bytes.is_empty() {
-            let kind = if provider_nonzero(&outcome.status) {
-                HostErrorKind::ProviderProcessNonzero
-            } else if outcome.stdin_closed_early && outcome.stderr.bytes.is_empty() {
-                HostErrorKind::ProviderClosedStdinEarly
-            } else {
-                HostErrorKind::EmptyStdout
-            };
-            return Err(ProviderClientError::host_transport(
-                kind,
-                subcommand,
-                request_id,
-                diagnostics,
-            ));
-        }
-        let envelope = parse_one_stdout_object(
+        self.record_process_state(&outcome, &diagnostics);
+        ensure_invocation_stdout_within_limit(subcommand, &diagnostics, request_id.clone())?;
+        ensure_invocation_stdout_present(
+            subcommand,
+            &outcome,
+            diagnostics.clone(),
+            request_id.clone(),
+        )?;
+        let envelope = parse_invocation_stdout_object(
             subcommand,
             &outcome.stdout.bytes,
             &diagnostics,
             request_id.clone(),
         )?;
-        let ok = envelope.get("ok").and_then(Value::as_bool);
-        match ok {
-            Some(true) => {
-                check_contract_and_request(
-                    &envelope,
-                    request_id.as_deref().unwrap_or_default(),
-                    subcommand,
-                    diagnostics.clone(),
-                )?;
-                registry
-                    .validate_response(subcommand, &envelope)
-                    .map_err(|_| {
-                        ProviderClientError::protocol(
-                            HostErrorKind::SchemaInvalidResponse,
-                            subcommand,
-                            request_id_from(&envelope),
-                            diagnostics.clone(),
-                        )
-                    })?;
-                if !outcome.status.exited_successfully() && !outcome.stdin_closed_early {
-                    return Err(ProviderClientError::host_transport(
-                        HostErrorKind::ProviderProcessNonzeroWithSuccess,
-                        subcommand,
-                        request_id_from(&envelope),
-                        diagnostics,
-                    ));
-                }
-                Ok(envelope)
-            }
-            Some(false) => {
-                check_contract_and_request(
-                    &envelope,
-                    request_id.as_deref().unwrap_or_default(),
-                    subcommand,
-                    diagnostics.clone(),
-                )?;
-                registry
-                    .validate_error_response(subcommand, &envelope)
-                    .map_err(|_| {
-                        ProviderClientError::protocol(
-                            HostErrorKind::SchemaInvalidErrorResponse,
-                            subcommand,
-                            request_id_from(&envelope),
-                            diagnostics.clone(),
-                        )
-                    })?;
-                Err(ProviderClientError::from_capability(
-                    ProviderCapabilityError::from_valid_envelope(
-                        subcommand,
-                        envelope,
-                        diagnostics,
-                        Some(outcome.status),
-                    )?,
-                ))
-            }
-            None if outcome.stdin_closed_early => Err(ProviderClientError::host_transport(
-                HostErrorKind::ProviderClosedStdinEarly,
-                subcommand,
-                request_id,
-                diagnostics,
-            )),
-            None => Err(ProviderClientError::protocol(
-                HostErrorKind::SchemaInvalidResponse,
-                subcommand,
-                request_id,
-                diagnostics,
-            )),
-        }
+        map_json_invocation_outcome(
+            &registry,
+            subcommand,
+            envelope,
+            outcome,
+            diagnostics,
+            request_id,
+        )
     }
 
     pub fn launch<I>(&self, request: Value, envs: I) -> Result<LaunchResult, ProviderClientError>
@@ -343,9 +251,7 @@ impl ProviderClient {
     {
         let request_id = request_id_from(&request);
         let registry = SchemaRegistry::new();
-        registry
-            .validate_request("launch", &request)
-            .map_err(|error| map_request_validation_error(error, "launch", request_id.clone()))?;
+        validate_launch_request(&registry, &request, request_id.clone())?;
         let resolved = self.resolve("launch", request_id.clone())?;
         let outcome = self.run_resolved(
             "launch",
@@ -354,35 +260,32 @@ impl ProviderClient {
             envs,
             self.options.timeouts.launch,
         )?;
+        let diagnostics = launch_diagnostics(&outcome);
+        self.record_process_state(&outcome, &diagnostics);
+        if diagnostics.stdout.truncated {
+            return Err(map_launch_stdout_limit_error(
+                request_id,
+                diagnostics,
+                outcome.status,
+            ));
+        }
+        parse_launch_output(
+            outcome.stdout.bytes,
+            diagnostics,
+            outcome.status,
+            request_id,
+        )
+    }
+
+    fn record_process_state(&self, outcome: &ProcessOutcome, diagnostics: &ProviderDiagnostics) {
         *self
             .last_argv
             .lock()
             .expect("argv mutex should not be poisoned") = outcome.argv().to_vec();
-        let mut diagnostics = outcome.diagnostics();
-        diagnostics.provider_exit_code = provider_exit_code(&outcome.status);
-        diagnostics.provider_process_nonzero = provider_nonzero(&outcome.status);
         *self
             .last_diagnostics
             .lock()
             .expect("diagnostics mutex should not be poisoned") = diagnostics.clone();
-        if diagnostics.stdout.truncated {
-            return Err(ProviderClientError::host_transport(
-                HostErrorKind::StdoutLimitExceeded,
-                "launch",
-                request_id,
-                diagnostics.clone(),
-            )
-            .with_process_context(diagnostics, outcome.status));
-        }
-        let reader = LaunchJsonlReader::new(request_id.clone().unwrap_or_default());
-        let parsed = reader.read(&outcome.stdout.bytes[..]);
-        match parsed {
-            Ok(mut result) => {
-                result.diagnostics = diagnostics.clone();
-                Ok(result)
-            }
-            Err(error) => Err(error.with_process_context(diagnostics, outcome.status)),
-        }
     }
 
     fn resolve(
@@ -414,36 +317,9 @@ impl ProviderClient {
         I: ProviderEnv,
     {
         let request_id = request_id_from(&request);
-        let request_bytes = serde_json::to_vec(&request).map_err(|error| {
-            ProviderClientError::protocol(
-                HostErrorKind::SchemaInvalidRequest,
-                subcommand,
-                request_id.clone(),
-                ProviderDiagnostics::with_description(error.to_string()),
-            )
-        })?;
-        let kill_after_grace = if subcommand == "launch" && self.options.cancellation.is_some() {
-            self.options
-                .timeouts
-                .kill_after_grace
-                .max(Duration::from_millis(250))
-        } else {
-            self.options.timeouts.kill_after_grace
-        };
-        let limits = ProcessLimits {
-            timeout,
-            kill_after_grace,
-            stdout_limit: ByteLimit::new(self.options.output_limits.stdout_bytes),
-            stderr_limit: ByteLimit::new(self.options.output_limits.stderr_bytes),
-            cancellation: self.options.cancellation.clone(),
-            spawn_observer: launch_spawn_observer(subcommand, &self.options),
-        };
-        let mut argv = resolved.argv_for_subcommand(subcommand);
-        let program = argv.remove(0);
-        let mut command = ProcessCommand::new(program);
-        for arg in argv {
-            command = command.arg(arg);
-        }
+        let request_bytes = serialize_request_bytes(subcommand, &request, request_id.clone())?;
+        let limits = process_limits_for(subcommand, timeout, &self.options);
+        let command = process_command_from_resolved(resolved, subcommand);
         let runner = ProcessRunner::new(limits);
         let result = if subcommand == "launch" {
             runner.run_with_stdout_line_gap_timeout(command, request_bytes, envs.into_env_vec())
@@ -452,6 +328,358 @@ impl ProviderClient {
         };
         result.map_err(|error| error.with_request_id_if_missing(request_id))
     }
+}
+
+fn deserialize_typed_result<T>(subcommand: &str, envelope: Value) -> Result<T, ProviderClientError>
+where
+    T: DeserializeOwned,
+{
+    serde_json::from_value(envelope["result"].clone())
+        .map_err(|error| map_typed_result_schema_error(error, subcommand, &envelope))
+}
+
+fn map_typed_result_schema_error(
+    error: serde_json::Error,
+    subcommand: &str,
+    envelope: &Value,
+) -> ProviderClientError {
+    ProviderClientError::protocol(
+        HostErrorKind::SchemaInvalidResponse,
+        subcommand,
+        request_id_from(envelope),
+        ProviderDiagnostics::with_description(error.to_string()),
+    )
+}
+
+fn validate_json_request(
+    registry: &SchemaRegistry,
+    subcommand: &str,
+    request: &Value,
+    request_id: Option<String>,
+) -> Result<(), ProviderClientError> {
+    registry
+        .validate_request(subcommand, request)
+        .map_err(|error| map_request_validation_error(error, subcommand, request_id))
+}
+
+fn validate_launch_request(
+    registry: &SchemaRegistry,
+    request: &Value,
+    request_id: Option<String>,
+) -> Result<(), ProviderClientError> {
+    validate_json_request(registry, "launch", request, request_id)
+}
+
+fn ensure_invocation_stdout_within_limit(
+    subcommand: &str,
+    diagnostics: &ProviderDiagnostics,
+    request_id: Option<String>,
+) -> Result<(), ProviderClientError> {
+    if diagnostics.stdout.truncated {
+        return Err(ProviderClientError::protocol(
+            HostErrorKind::StdoutLimitExceeded,
+            subcommand,
+            request_id,
+            diagnostics.clone(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_invocation_stdout_present(
+    subcommand: &str,
+    outcome: &ProcessOutcome,
+    diagnostics: ProviderDiagnostics,
+    request_id: Option<String>,
+) -> Result<(), ProviderClientError> {
+    if outcome.stdout.bytes.is_empty() {
+        return Err(map_empty_invocation_stdout_error(
+            subcommand,
+            outcome,
+            diagnostics,
+            request_id,
+        ));
+    }
+    Ok(())
+}
+
+fn map_empty_invocation_stdout_error(
+    subcommand: &str,
+    outcome: &ProcessOutcome,
+    diagnostics: ProviderDiagnostics,
+    request_id: Option<String>,
+) -> ProviderClientError {
+    ProviderClientError::host_transport(
+        empty_invocation_stdout_kind(outcome),
+        subcommand,
+        request_id,
+        diagnostics,
+    )
+}
+
+fn empty_invocation_stdout_kind(outcome: &ProcessOutcome) -> HostErrorKind {
+    if provider_nonzero(&outcome.status) {
+        HostErrorKind::ProviderProcessNonzero
+    } else if outcome.stdin_closed_early && outcome.stderr.bytes.is_empty() {
+        HostErrorKind::ProviderClosedStdinEarly
+    } else {
+        HostErrorKind::EmptyStdout
+    }
+}
+
+fn parse_invocation_stdout_object(
+    subcommand: &str,
+    bytes: &[u8],
+    diagnostics: &ProviderDiagnostics,
+    fallback_request_id: Option<String>,
+) -> Result<Value, ProviderClientError> {
+    parse_one_stdout_object(subcommand, bytes, diagnostics, fallback_request_id)
+}
+
+fn map_json_invocation_outcome(
+    registry: &SchemaRegistry,
+    subcommand: &str,
+    envelope: Value,
+    outcome: ProcessOutcome,
+    diagnostics: ProviderDiagnostics,
+    request_id: Option<String>,
+) -> Result<Value, ProviderClientError> {
+    match response_envelope_ok(&envelope) {
+        Some(true) => map_json_success_outcome(
+            registry,
+            subcommand,
+            envelope,
+            &outcome,
+            diagnostics,
+            &request_id,
+        ),
+        Some(false) => map_json_provider_error_outcome(
+            registry,
+            subcommand,
+            envelope,
+            outcome,
+            diagnostics,
+            &request_id,
+        ),
+        None if outcome.stdin_closed_early => Err(ProviderClientError::host_transport(
+            HostErrorKind::ProviderClosedStdinEarly,
+            subcommand,
+            request_id,
+            diagnostics,
+        )),
+        None => Err(ProviderClientError::protocol(
+            HostErrorKind::SchemaInvalidResponse,
+            subcommand,
+            request_id,
+            diagnostics,
+        )),
+    }
+}
+
+fn map_json_success_outcome(
+    registry: &SchemaRegistry,
+    subcommand: &str,
+    envelope: Value,
+    outcome: &ProcessOutcome,
+    diagnostics: ProviderDiagnostics,
+    request_id: &Option<String>,
+) -> Result<Value, ProviderClientError> {
+    validate_json_success_envelope(registry, subcommand, &envelope, &diagnostics, request_id)?;
+    if success_envelope_has_nonzero_process(outcome) {
+        return Err(ProviderClientError::host_transport(
+            HostErrorKind::ProviderProcessNonzeroWithSuccess,
+            subcommand,
+            request_id_from(&envelope),
+            diagnostics,
+        ));
+    }
+    Ok(envelope)
+}
+
+fn map_json_provider_error_outcome(
+    registry: &SchemaRegistry,
+    subcommand: &str,
+    envelope: Value,
+    outcome: ProcessOutcome,
+    diagnostics: ProviderDiagnostics,
+    request_id: &Option<String>,
+) -> Result<Value, ProviderClientError> {
+    validate_json_error_envelope(registry, subcommand, &envelope, &diagnostics, request_id)?;
+    Err(ProviderClientError::from_capability(
+        ProviderCapabilityError::from_valid_envelope(
+            subcommand,
+            envelope,
+            diagnostics,
+            Some(outcome.status),
+        )?,
+    ))
+}
+
+fn validate_json_success_envelope(
+    registry: &SchemaRegistry,
+    subcommand: &str,
+    envelope: &Value,
+    diagnostics: &ProviderDiagnostics,
+    request_id: &Option<String>,
+) -> Result<(), ProviderClientError> {
+    check_contract_and_request(
+        envelope,
+        request_id.as_deref().unwrap_or_default(),
+        subcommand,
+        diagnostics.clone(),
+    )?;
+    registry
+        .validate_response(subcommand, envelope)
+        .map_err(|_| map_response_validation_error(subcommand, envelope, diagnostics))
+}
+
+fn validate_json_error_envelope(
+    registry: &SchemaRegistry,
+    subcommand: &str,
+    envelope: &Value,
+    diagnostics: &ProviderDiagnostics,
+    request_id: &Option<String>,
+) -> Result<(), ProviderClientError> {
+    check_contract_and_request(
+        envelope,
+        request_id.as_deref().unwrap_or_default(),
+        subcommand,
+        diagnostics.clone(),
+    )?;
+    registry
+        .validate_error_response(subcommand, envelope)
+        .map_err(|_| map_error_response_validation_error(subcommand, envelope, diagnostics))
+}
+
+fn map_response_validation_error(
+    subcommand: &str,
+    envelope: &Value,
+    diagnostics: &ProviderDiagnostics,
+) -> ProviderClientError {
+    ProviderClientError::protocol(
+        HostErrorKind::SchemaInvalidResponse,
+        subcommand,
+        request_id_from(envelope),
+        diagnostics.clone(),
+    )
+}
+
+fn map_error_response_validation_error(
+    subcommand: &str,
+    envelope: &Value,
+    diagnostics: &ProviderDiagnostics,
+) -> ProviderClientError {
+    ProviderClientError::protocol(
+        HostErrorKind::SchemaInvalidErrorResponse,
+        subcommand,
+        request_id_from(envelope),
+        diagnostics.clone(),
+    )
+}
+
+fn response_envelope_ok(envelope: &Value) -> Option<bool> {
+    envelope.get("ok").and_then(Value::as_bool)
+}
+
+fn success_envelope_has_nonzero_process(outcome: &ProcessOutcome) -> bool {
+    !outcome.status.exited_successfully() && !outcome.stdin_closed_early
+}
+
+fn launch_diagnostics(outcome: &ProcessOutcome) -> ProviderDiagnostics {
+    let mut diagnostics = outcome.diagnostics();
+    diagnostics.provider_exit_code = provider_exit_code(&outcome.status);
+    diagnostics.provider_process_nonzero = provider_nonzero(&outcome.status);
+    diagnostics
+}
+
+fn map_launch_stdout_limit_error(
+    request_id: Option<String>,
+    diagnostics: ProviderDiagnostics,
+    status: ProcessStatus,
+) -> ProviderClientError {
+    ProviderClientError::host_transport(
+        HostErrorKind::StdoutLimitExceeded,
+        "launch",
+        request_id,
+        diagnostics.clone(),
+    )
+    .with_process_context(diagnostics, status)
+}
+
+fn parse_launch_output(
+    stdout: Vec<u8>,
+    diagnostics: ProviderDiagnostics,
+    status: ProcessStatus,
+    request_id: Option<String>,
+) -> Result<LaunchResult, ProviderClientError> {
+    let reader = LaunchJsonlReader::new(request_id.unwrap_or_default());
+    match reader.read(&stdout[..]) {
+        Ok(mut result) => {
+            result.diagnostics = diagnostics.clone();
+            Ok(result)
+        }
+        Err(error) => Err(error.with_process_context(diagnostics, status)),
+    }
+}
+
+fn serialize_request_bytes(
+    subcommand: &str,
+    request: &Value,
+    request_id: Option<String>,
+) -> Result<Vec<u8>, ProviderClientError> {
+    serde_json::to_vec(request)
+        .map_err(|error| map_request_serialization_error(error, subcommand, request_id))
+}
+
+fn map_request_serialization_error(
+    error: serde_json::Error,
+    subcommand: &str,
+    request_id: Option<String>,
+) -> ProviderClientError {
+    ProviderClientError::protocol(
+        HostErrorKind::SchemaInvalidRequest,
+        subcommand,
+        request_id,
+        ProviderDiagnostics::with_description(error.to_string()),
+    )
+}
+
+fn process_limits_for(
+    subcommand: &str,
+    timeout: Duration,
+    options: &ProviderClientOptions,
+) -> ProcessLimits {
+    ProcessLimits {
+        timeout,
+        kill_after_grace: kill_after_grace_for(subcommand, options),
+        stdout_limit: ByteLimit::new(options.output_limits.stdout_bytes),
+        stderr_limit: ByteLimit::new(options.output_limits.stderr_bytes),
+        cancellation: options.cancellation.clone(),
+        spawn_observer: launch_spawn_observer(subcommand, options),
+    }
+}
+
+fn kill_after_grace_for(subcommand: &str, options: &ProviderClientOptions) -> Duration {
+    if subcommand == "launch" && options.cancellation.is_some() {
+        options
+            .timeouts
+            .kill_after_grace
+            .max(Duration::from_millis(250))
+    } else {
+        options.timeouts.kill_after_grace
+    }
+}
+
+fn process_command_from_resolved(
+    resolved: &ResolvedProviderCommand,
+    subcommand: &str,
+) -> ProcessCommand {
+    let mut argv = resolved.argv_for_subcommand(subcommand);
+    let program = argv.remove(0);
+    argv.into_iter()
+        .fold(ProcessCommand::new(program), |command, arg| {
+            command.arg(arg)
+        })
 }
 
 fn launch_spawn_observer(
@@ -481,72 +709,151 @@ fn parse_one_stdout_object(
     diagnostics: &ProviderDiagnostics,
     fallback_request_id: Option<String>,
 ) -> Result<Value, ProviderClientError> {
+    let text = parse_stdout_utf8(subcommand, bytes, diagnostics, &fallback_request_id)?;
+    let trimmed = validate_stdout_prefix(subcommand, text, diagnostics, &fallback_request_id)?;
+    let parsed = parse_stdout_json_value(subcommand, trimmed, diagnostics, &fallback_request_id)?;
+    validate_stdout_object_shape(
+        subcommand,
+        trimmed,
+        parsed,
+        diagnostics,
+        &fallback_request_id,
+    )
+}
+
+struct ParsedStdoutJson {
+    value: Value,
+    byte_offset: usize,
+}
+
+fn parse_stdout_utf8<'a>(
+    subcommand: &str,
+    bytes: &'a [u8],
+    diagnostics: &ProviderDiagnostics,
+    fallback_request_id: &Option<String>,
+) -> Result<&'a str, ProviderClientError> {
     if bytes.is_empty() {
-        return Err(ProviderClientError::protocol(
+        return Err(stdout_protocol_error(
             HostErrorKind::EmptyStdout,
             subcommand,
-            fallback_request_id,
-            diagnostics.clone(),
+            fallback_request_id.clone(),
+            diagnostics,
         ));
     }
-    let text = std::str::from_utf8(bytes).map_err(|error| {
-        ProviderClientError::protocol(
+    std::str::from_utf8(bytes).map_err(|error| {
+        stdout_protocol_error_with_description(
             HostErrorKind::InvalidUtf8,
             subcommand,
             fallback_request_id.clone(),
-            ProviderDiagnostics::with_description(error.to_string()),
+            error.to_string(),
         )
-    })?;
+    })
+}
+
+fn validate_stdout_prefix<'a>(
+    subcommand: &str,
+    text: &'a str,
+    diagnostics: &ProviderDiagnostics,
+    fallback_request_id: &Option<String>,
+) -> Result<&'a str, ProviderClientError> {
     let trimmed = text.trim_start();
     if !trimmed.starts_with('{') && trimmed.contains('{') {
-        return Err(ProviderClientError::protocol(
+        return Err(stdout_protocol_error(
             HostErrorKind::LeadingStdoutText,
             subcommand,
             fallback_request_id.clone(),
-            diagnostics.clone(),
+            diagnostics,
         ));
     }
+    Ok(trimmed)
+}
+
+fn parse_stdout_json_value(
+    subcommand: &str,
+    trimmed: &str,
+    diagnostics: &ProviderDiagnostics,
+    fallback_request_id: &Option<String>,
+) -> Result<ParsedStdoutJson, ProviderClientError> {
     let mut stream = serde_json::Deserializer::from_str(trimmed).into_iter::<Value>();
     let Some(first) = stream.next() else {
-        return Err(ProviderClientError::protocol(
+        return Err(stdout_protocol_error(
             HostErrorKind::EmptyStdout,
             subcommand,
             fallback_request_id.clone(),
-            diagnostics.clone(),
+            diagnostics,
         ));
     };
     let value = first.map_err(|_| {
-        ProviderClientError::protocol(
+        stdout_protocol_error(
             HostErrorKind::InvalidJson,
             subcommand,
             fallback_request_id.clone(),
-            diagnostics.clone(),
+            diagnostics,
         )
     })?;
+    Ok(ParsedStdoutJson {
+        value,
+        byte_offset: stream.byte_offset(),
+    })
+}
+
+fn validate_stdout_object_shape(
+    subcommand: &str,
+    trimmed: &str,
+    parsed: ParsedStdoutJson,
+    diagnostics: &ProviderDiagnostics,
+    fallback_request_id: &Option<String>,
+) -> Result<Value, ProviderClientError> {
+    let value = parsed.value;
     if !value.is_object() {
-        return Err(ProviderClientError::protocol(
+        return Err(stdout_protocol_error(
             HostErrorKind::NonObjectJson,
             subcommand,
             request_id_from(&value).or_else(|| fallback_request_id.clone()),
-            diagnostics.clone(),
+            diagnostics,
         ));
     }
-    let offset = stream.byte_offset();
-    let rest = trimmed[offset..].trim();
+    let rest = trimmed[parsed.byte_offset..].trim();
     if !rest.is_empty() {
-        let kind = if rest.starts_with('{') {
-            HostErrorKind::MultipleJsonObjects
-        } else {
-            HostErrorKind::TrailingNonWhitespace
-        };
-        return Err(ProviderClientError::protocol(
-            kind,
+        return Err(stdout_protocol_error(
+            trailing_stdout_error_kind(rest),
             subcommand,
-            request_id_from(&value).or(fallback_request_id),
-            diagnostics.clone(),
+            request_id_from(&value).or_else(|| fallback_request_id.clone()),
+            diagnostics,
         ));
     }
     Ok(value)
+}
+
+fn trailing_stdout_error_kind(rest: &str) -> HostErrorKind {
+    if rest.starts_with('{') {
+        HostErrorKind::MultipleJsonObjects
+    } else {
+        HostErrorKind::TrailingNonWhitespace
+    }
+}
+
+fn stdout_protocol_error(
+    kind: HostErrorKind,
+    subcommand: &str,
+    request_id: Option<String>,
+    diagnostics: &ProviderDiagnostics,
+) -> ProviderClientError {
+    ProviderClientError::protocol(kind, subcommand, request_id, diagnostics.clone())
+}
+
+fn stdout_protocol_error_with_description(
+    kind: HostErrorKind,
+    subcommand: &str,
+    request_id: Option<String>,
+    description: String,
+) -> ProviderClientError {
+    ProviderClientError::protocol(
+        kind,
+        subcommand,
+        request_id,
+        ProviderDiagnostics::with_description(description),
+    )
 }
 
 fn provider_exit_code(status: &ProcessStatus) -> Option<i32> {

@@ -1,0 +1,511 @@
+# S11 targeted evidence run
+started_at=2026-06-06T20:09:10-07:00
+head=a1a3ca1+working-tree-s11-remediation
+base=95699d6
+worktree=/home/nes/projects/agent-runner/worktrees/age-pid-sidecar
+CARGO_TARGET_DIR_PROVIDER=/tmp/s11-provider-test-target
+CARGO_TARGET_DIR_RUNTIME=/tmp/s11-runtime-test-target
+CARGO_TARGET_DIR_TAURI=/tmp/s11-tauri-test-target
+
+## cargo fmt --check
+fmt_status=0
+
+## cargo test -p oulipoly-provider
+   Compiling oulipoly-provider v0.1.0 (/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/crates/oulipoly-provider)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.33s
+     Running unittests src/lib.rs (/tmp/s11-provider-test-target/debug/deps/oulipoly_provider-688d0c9c75dbf4e5)
+
+running 8 tests
+test process::tests::byte_accumulator_is_byte_oriented_and_records_truncation_metadata ... ok
+test process::tests::early_stdin_close_continues_draining_stdout_stderr ... ok
+test process::tests::process_writes_one_json_object_closes_stdin_and_drains_stderr ... ok
+test process::tests::kill_after_grace_force_kills_and_reports_reaped_status ... ok
+test process::tests::host_timeout_kills_direct_child_and_descendants ... ok
+test process::tests::explicit_cancellation_kills_process_group_and_reaps_child ... ok
+test process::tests::cancellation_that_exits_during_grace_reports_no_force_kill ... ok
+test process::tests::process_concurrently_drains_stdout_and_stderr_under_pipe_pressure ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.86s
+
+     Running tests/age217_s6a_provider_boundary.rs (/tmp/s11-provider-test-target/debug/deps/age217_s6a_provider_boundary-35702d71a11d8c75)
+
+running 1 test
+test external_provider_launch_provider_client_token_cancellation_without_final_event_finalizes_at_adapter_seam ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.89s
+
+     Running tests/age245_s7c_rotation_migration_contract.rs (/tmp/s11-provider-test-target/debug/deps/age245_s7c_rotation_migration_contract-306b8013731d0134)
+
+running 5 tests
+test s7c_rotation_host_state_plan_schema_is_strict_and_declared ... ok
+test s7c_fake_provider_fixture_declares_every_matrix_mode ... ok
+test s7c_fixture_matrix_covers_required_rotation_and_migration_cases ... ok
+test s7c_rotation_materialize_success_fixture_validates_against_current_schema ... ok
+test s7c_rotation_host_state_plan_schema_rejects_fixture_negative_cases ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests/api_shape.rs (/tmp/s11-provider-test-target/debug/deps/api_shape-7ad594357f4faa76)
+
+running 1 test
+test dummy_provider_can_implement_and_call_each_trait_method ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/capabilities.rs (/tmp/s11-provider-test-target/debug/deps/capabilities-cce45f1b708f14d2)
+
+running 3 tests
+test capabilities_bundle_default_has_no_populated_slots ... ok
+test capabilities_bundle_represents_partial_implementations ... ok
+test locator_slot_accepts_test_local_marker_type ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/client_error_precedence.rs (/tmp/s11-provider-test-target/debug/deps/client_error_precedence-176f0bd7f2d618a1)
+
+running 1 test
+test client_error_precedence_table_matches_contract ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.58s
+
+     Running tests/client_invoke.rs (/tmp/s11-provider-test-target/debug/deps/client_invoke-a17af85d2894d543)
+
+running 13 tests
+test invoke_describe_accepts_schema_valid_freeform_concurrency_metadata ... ok
+test invoke_script_uses_artifact_then_single_subcommand_arg ... ok
+test invoke_rejects_schema_invalid_request_before_spawn ... ok
+test invoke_early_stdin_close_valid_ok_false_wins_as_capability_error ... ok
+test invoke_rejects_unknown_subcommand_before_spawn ... ok
+test invoke_early_stdin_close_valid_ok_true_wins ... ok
+test invoke_writes_request_on_stdin_not_argv ... ok
+test invoke_settings_list_subcommand_returns_typed_result_through_one_shot_provider ... ok
+test invoke_rejects_mismatched_contract_and_request_id ... ok
+test invoke_early_stdin_close_without_valid_envelope_is_transport_error ... ok
+test invoke_success_returns_typed_result_and_keeps_stderr_diagnostics ... ok
+test invoke_schema_subcommand_returns_typed_result_through_one_shot_provider ... ok
+test invoke_rejects_invalid_stdout_protocol_shapes ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.79s
+
+     Running tests/client_limits.rs (/tmp/s11-provider-test-target/debug/deps/client_limits-7d1d5282e05f33e9)
+
+running 2 tests
+test client_applies_stdout_and_stderr_caps_with_truncation_metadata ... ok
+test client_does_not_deadlock_when_output_exceeds_limits_while_stdin_is_written ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.55s
+
+     Running tests/completeness.rs (/tmp/s11-provider-test-target/debug/deps/completeness-aa1203411ce84fbf)
+
+running 2 tests
+test s2_completeness_matrix_covers_every_design_subcommand ... ok
+test completeness_matrix_declares_schema_dto_fixture_and_registry_targets ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/dependency_guard.rs (/tmp/s11-provider-test-target/debug/deps/dependency_guard-c2cc17bb7241d21a)
+
+running 1 test
+test provider_crate_has_only_neutral_normal_dependencies ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+
+     Running tests/dto_roundtrip.rs (/tmp/s11-provider-test-target/debug/deps/dto_roundtrip-30ee146f71f2427d)
+
+running 2 tests
+test dto_discriminants_reject_schema_invalid_values ... ok
+test dto_roundtrip_covers_every_s2_contract_type ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/error_contract.rs (/tmp/s11-provider-test-target/debug/deps/error_contract-cf4ff8cf8480befd)
+
+running 2 tests
+test shared_error_object_requires_core_fields ... ok
+test error_response_fixtures_use_locked_error_categories ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/error_mapping.rs (/tmp/s11-provider-test-target/debug/deps/error_mapping-582d78245e0a2c07)
+
+running 6 tests
+test host_cancellation_is_transport_error_without_provider_category ... ok
+test host_timeout_is_transport_error_without_provider_category ... ok
+test missing_valid_error_envelope_with_nonzero_exit_is_transport_error ... ok
+test provider_capability_error_preserves_contract_error_object ... ok
+test provider_timeout_category_is_not_host_timeout ... ok
+test valid_error_envelope_takes_precedence_over_nonzero_exit ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/fixture_validation.rs (/tmp/s11-provider-test-target/debug/deps/fixture_validation-b73429bf600f1046)
+
+running 4 tests
+test schema_validation_fixtures_cover_expected_matrix ... ok
+test policy_response_schema_permits_absent_empty_argv_and_env ... ok
+test launch_request_and_event_fixtures_validate_against_schema_targets ... ok
+test request_success_and_error_fixtures_validate_against_schema_targets ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+
+     Running tests/launch_events.rs (/tmp/s11-provider-test-target/debug/deps/launch_events-5a0a9523a5182a80)
+
+running 3 tests
+test launch_event_variants_and_terminal_exit_are_locked ... ok
+test launch_fixture_sequence_has_monotonic_seq_and_terminal_exit ... ok
+test launch_stdout_stderr_payloads_remain_base64_strings ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/launch_stream.rs (/tmp/s11-provider-test-target/debug/deps/launch_stream-a9034fdf84334c74)
+
+running 9 tests
+test launch_protocol_error_preserves_process_status_and_stderr_diagnostics ... ok
+test launch_provider_nonzero_without_final_exit_is_transport_error ... ok
+test launch_malformed_protocol_is_not_masked_by_provider_nonzero_exit ... ok
+test launch_accepts_valid_jsonl_and_preserves_decoded_binary_order ... ok
+test launch_uses_exact_launch_argv_and_request_stdin_only ... ok
+test launch_stdout_truncation_takes_precedence_over_parseable_exit_prefix ... ok
+test launch_provider_nonzero_after_valid_final_exit_is_nonfatal_diagnostic ... ok
+test launch_model_nonzero_final_exit_is_outcome_not_provider_transport_failure ... ok
+test launch_fake_provider_echoes_host_supplied_request_id ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.54s
+
+     Running tests/launch_stream_lifecycle.rs (/tmp/s11-provider-test-target/debug/deps/launch_stream_lifecycle-33aed1bc77362d73)
+
+running 5 tests
+test launch_timeout_cleans_descendants_and_preserves_stderr_diagnostics ... ok
+test launch_cancellation_with_provider_emitted_cancelled_exit_uses_final_event ... ok
+test launch_heartbeat_gap_timeout_kills_process_tree_after_stream_stalls ... ok
+test launch_heartbeat_gap_does_not_cap_total_turn_runtime ... ok
+test launch_forced_kill_without_final_event_is_host_cancellation_not_missing_final ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.78s
+
+     Running tests/launch_stream_protocol.rs (/tmp/s11-provider-test-target/debug/deps/launch_stream_protocol-0477175a10c65361)
+
+running 4 tests
+test launch_reader_rejects_invalid_base64_wrong_contract_and_wrong_request_id ... ok
+test launch_reader_rejects_malformed_line_unknown_kind_and_schema_invalid_event ... ok
+test launch_reader_accepts_stdout_stderr_marker_heartbeat_and_final_exit ... ok
+test launch_reader_rejects_sequence_and_finality_errors ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/locator_reexport.rs (/tmp/s11-provider-test-target/debug/deps/locator_reexport-6066570438eaf38c)
+
+running 2 tests
+test locator_contract_types_are_reachable_from_provider_root ... ok
+test neutral_unsupported_storage_reasons_are_constructible ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/locator_required_defense.rs (/tmp/s11-provider-test-target/debug/deps/locator_required_defense-25f480180a6df89c)
+
+running 3 tests
+test capability_error_new_variant_is_additive_for_equality ... ok
+test locator_required_capabilities_reject_missing_locator ... ok
+test locator_required_capabilities_expose_present_locator ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/phantom_marker_anchors.rs (/tmp/s11-provider-test-target/debug/deps/phantom_marker_anchors-8c2336aacbdd2b2c)
+
+running 1 test
+test borrow_carrying_request_structs_keep_marker_anchors ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/process_lifecycle.rs (/tmp/s11-provider-test-target/debug/deps/process_lifecycle-ad5358bb666cf4af)
+
+running 5 tests
+test client_process_substrate_does_not_deadlock_under_pipe_pressure ... ok
+test client_process_substrate_closes_stdin_and_drains_stderr ... ok
+test client_timeout_kills_descendants_observed_by_probe ... ok
+test client_cancellation_gracefully_reaps_sigterm_respecting_provider ... ok
+test client_cancellation_kills_descendants_observed_by_probe ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.99s
+
+     Running tests/provider_client_api.rs (/tmp/s11-provider-test-target/debug/deps/provider_client_api-51857a0c9ce7e4af)
+
+running 4 tests
+test resolved_command_public_shape_is_exact_artifact_plus_subcommand ... ok
+test downstream_can_construct_client_resolver_options_and_name_errors ... ok
+test public_launch_stream_types_preserve_decoded_bytes_and_exit ... ok
+test provider_capability_error_type_is_public_without_legacy_trait_imports ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/provider_name_guard.rs (/tmp/s11-provider-test-target/debug/deps/provider_name_guard-ca2386d0599dd7cf)
+
+running 2 tests
+test owned_provider_contract_files_use_only_neutral_provider_vocabulary ... ok
+test provider_name_grep_baseline_does_not_increase ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/public_surface_vocabulary.rs (/tmp/s11-provider-test-target/debug/deps/public_surface_vocabulary-afa30d06144f5b07)
+
+running 2 tests
+test provider_source_uses_neutral_vocabulary ... ok
+test provider_manifest_has_no_internal_crate_dependencies ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/resolver.rs (/tmp/s11-provider-test-target/debug/deps/resolver-b70d2c5143ddec3a)
+
+running 12 tests
+test rejects_binary_outside_explicit_roots_or_allowlist ... ok
+test rejects_non_executable_script_without_shell_opt_in ... ok
+test resolves_absolute_path_and_builds_exact_subcommand_argv ... ok
+test resolves_config_relative_path_against_config_directory ... ok
+test resolves_packaged_binary_only_when_allowlisted_in_search_root ... ok
+test rejects_invalid_binary_names_before_searching_roots ... ok
+test rejects_runtime_disabled_crate_flavor ... ok
+test rejects_binary_symlink_that_escapes_explicit_root ... ok
+test rejects_packaged_binary_present_but_not_allowlisted ... ok
+test rejects_missing_directory_and_non_executable_paths ... ok
+test resolves_binary_only_from_explicit_path_entries ... ok
+test resolves_direct_executable_script_without_shell_wrapper ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/schema_inventory.rs (/tmp/s11-provider-test-target/debug/deps/schema_inventory-f749b56822033eb7)
+
+running 6 tests
+test schema_file_inventory_matches_expected_contract_v1 ... ok
+test contract_v1_refs_resolve_to_checked_in_schema_defs ... ok
+test locked_error_categories_match_contract ... ok
+test common_schema_owns_shared_contract_defs ... ok
+test contract_v1_schemas_declare_draft_2020_12 ... ok
+test contract_v1_schemas_are_valid_draft_2020_12 ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/schema_registry.rs (/tmp/s11-provider-test-target/debug/deps/schema_registry-1b5835f444b11327)
+
+running 1 test
+test schema_registry_lookup_and_validation_helpers_cover_s2_matrix ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+
+     Running tests/settings_contract.rs (/tmp/s11-provider-test-target/debug/deps/settings_contract-d832c823cc090c67)
+
+running 3 tests
+test settings_create_and_validate_do_not_require_persistence_version ... ok
+test settings_update_and_delete_requests_carry_required_version_preconditions ... ok
+test settings_version_conflict_error_fixture_uses_conflict_category ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/terminal_contract.rs (/tmp/s11-provider-test-target/debug/deps/terminal_contract-c64baaa8e90d49c4)
+
+running 2 tests
+test rich_terminal_status_evidence_and_trait_object_dispatch_are_contract_local ... ok
+test rich_terminal_dtos_are_reachable_from_provider_root ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/testkit_fake_provider.rs (/tmp/s11-provider-test-target/debug/deps/testkit_fake_provider-269d452391a05983)
+
+running 4 tests
+test fake_provider_fixture_compiles_to_executable_and_cleans_up ... ok
+test leak_probe_reports_no_remaining_descendants_after_cleanup ... ok
+test fake_provider_modes_are_deterministic ... ok
+test fake_provider_records_argv_and_stdin_for_assertions ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s
+
+   Doc-tests oulipoly_provider
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+provider_status=0
+
+## cargo test -p oulipoly-runtime selected tests
+   Compiling oulipoly-provider v0.1.0 (/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/crates/oulipoly-provider)
+   Compiling oulipoly-runtime v0.1.0 (/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/crates/oulipoly-runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.05s
+     Running tests/age217_s6a_policy_launch_dispatch.rs (/tmp/s11-runtime-test-target/debug/deps/age217_s6a_policy_launch_dispatch-30ba066ca7a6633b)
+
+running 26 tests
+test external_provider_runtime_disabled_crate_fails_before_provider_call ... ok
+test runtime_executor_dispatch_no_ref_does_not_construct_or_invoke_provider_client ... ok
+test runtime_executor_dispatch_no_ref_preserves_legacy_bytes_with_unrelated_registry ... ok
+test external_provider_validates_schema_inputs_before_policy_or_launch ... ok
+test external_provider_policy_rejection_skips_launch ... ok
+test external_provider_missing_policy_or_launch_capability_fails_without_builtin_fallback ... ok
+test external_provider_launch_missing_final_is_protocol_failure_not_model_exit ... ok
+test external_provider_launch_provider_nonzero_after_final_is_diagnostic_only ... ok
+test external_provider_policy_request_canonicalizes_opencode_account_one_settings_id ... ok
+test external_provider_policy_request_passes_hybrid_launch_shape ... ok
+test external_provider_policy_transform_applies_once_and_no_legacy_double_policy ... ok
+test external_provider_launch_env_carries_host_linkage_without_openai_keys ... ok
+test external_provider_launch_provider_nonzero_before_final_is_transport_failure_not_model_exit ... ok
+test external_provider_launch_provider_emitted_cancelled_final_event_maps_minimal_cancel_outcome ... ok
+test external_provider_launch_timeout_or_host_transport_failure_is_not_model_exit ... ok
+test external_provider_launch_preserves_stdout_bytes_and_maps_stderr_boundary ... ok
+test external_provider_launch_malformed_stream_is_protocol_failure_not_model_exit ... ok
+test external_provider_launch_nonzero_final_exit_is_execution_result ... ok
+test external_provider_launch_invalid_base64_is_protocol_failure_not_model_exit ... ok
+test external_provider_policy_evaluate_runs_before_launch_and_uses_selected_provider_settings ... ok
+test external_provider_launch_request_carries_selected_settings_id_and_effective_inputs ... ok
+test external_provider_launch_minimal_terminal_scope_uses_final_event_not_standalone_classify ... ok
+test external_provider_launch_env_omits_ambient_xdg_for_default_opencode_auth_context ... ok
+test external_provider_enabled_binary_and_script_refs_dispatch_without_legacy_fallback ... ok
+test external_provider_launch_host_cancelled_before_final_uses_cancellation_fallback_message ... ok
+test external_provider_launch_env_uses_selected_opencode_auth_context_without_openai_keys ... ok
+
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.56s
+
+     Running tests/age246_external_transport_rotation.rs (/tmp/s11-runtime-test-target/debug/deps/age246_external_transport_rotation-eca330c7d7f7a289)
+
+running 4 tests
+test external_provider_unavailable_rotates_to_next_account_and_succeeds ... ok
+test external_transport_timeout_rotates_to_next_account_and_succeeds ... ok
+test external_launch_heartbeat_gap_timeout_rotates_to_next_account_and_succeeds ... ok
+test external_transport_all_slow_pool_is_bounded_terminal_failure_with_honest_category ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.08s
+
+     Running tests/provider_registry.rs (/tmp/s11-runtime-test-target/debug/deps/provider_registry-cd812c5e7ceab2fa)
+
+running 27 tests
+test construction_ignores_models_without_provider_refs ... ok
+test conversion_rejects_invalid_refs_without_panic ... ok
+test describe_result_fixture_matches_provider_contract_shape ... ok
+test conversion_accepts_all_configured_flavors_and_marks_crate_runtime_disabled ... ok
+test duplicate_crate_refs_deduplicate_to_one_disabled_artifact_key_and_runtime_disabled_error ... ok
+test lookup_does_not_discover_an_unconfigured_provider ... ok
+test distinct_artifacts_key_distinctly ... ok
+test runtime_disabled_crate_lookup_returns_runtime_disabled_error ... ok
+test production_service_sources_do_not_route_current_paths_through_provider_registry_seams ... ok
+test unset_process_path_entries_preserves_missing_artifact_without_panic ... ok
+test missing_artifact_lookup_returns_transport_error ... ok
+test non_executable_enabled_artifacts_map_to_exact_transport_kind ... ok
+test enabled_flavor_resolution_errors_map_to_exact_transport_kinds ... ok
+test schema_invalid_describe_output_returns_protocol_error ... ok
+test describe_propagates_settings_capability_and_schema_id ... ok
+test duplicate_equivalent_refs_deduplicate_to_one_artifact_and_one_describe_lookup ... ok
+test duplicate_binary_refs_deduplicate_to_one_artifact_and_one_describe_lookup ... ok
+test binary_ref_resolves_from_process_path_entries ... ok
+test duplicate_script_refs_deduplicate_to_one_artifact_and_one_describe_lookup ... ok
+test construction_with_executable_provider_does_not_describe_until_lookup ... ok
+test describe_success_is_cached_per_registry_instance_only ... ok
+test absent_binary_from_process_path_entries_preserves_missing_artifact ... ok
+test enabled_ref_flavors_resolve_describe_and_parse_capability_description ... ok
+test malformed_describe_output_returns_protocol_error ... ok
+test describe_request_envelope_matches_provider_contract ... ok
+test registry_construction_and_cache_operations_do_not_mutate_state_config_or_cache_files ... ok
+test describe_failure_returns_err_without_failing_prior_construction_or_poisoning_retry ... ok
+
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+
+     Running tests/provider_settings_host.rs (/tmp/s11-runtime-test-target/debug/deps/provider_settings_host-4e8ba5a1157320e6)
+
+running 7 tests
+test settings_host_does_not_expose_public_arbitrary_subcommand_dispatch ... ok
+test describe_settings_target_reports_capability_and_schema_id ... ok
+test settings_migrate_forwards_legacy_payload_opaquely ... ok
+test settings_host_preserves_conflict_error_details_and_diagnostics ... ok
+test unsupported_settings_target_returns_structured_unsupported_error ... ok
+test rebuild_replaces_registry_reflects_configured_artifact_changes_and_discards_settings_cache ... ok
+test settings_host_invokes_only_schema_and_settings_subcommands_with_typed_envelopes ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+
+runtime_status=0
+
+## cargo test src-tauri selected tests
+   Compiling oulipoly-runtime v0.1.0 (/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/crates/oulipoly-runtime)
+   Compiling oulipoly-agent-runner v0.1.0 (/home/nes/projects/agent-runner/worktrees/age-pid-sidecar/src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 19.61s
+     Running tests/age100_resume_quota_migration.rs (/tmp/s11-tauri-test-target/debug/deps/age100_resume_quota_migration-5b5aec095995f737)
+
+running 5 tests
+test resume_non_quota_failure_does_not_migrate_or_mark_exhausted ... ok
+test resume_quota_exhausted_marks_provider_and_migrates_to_next_pool_member ... ok
+test resume_all_pool_members_quota_exhausted_returns_all_providers_exhausted ... ok
+test resume_retries_n_minus_one_quota_exhausted_providers_then_succeeds ... ok
+test resume_heuristic_stderr_quota_uses_same_path_as_diagnostic_model_quota ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.74s
+
+     Running tests/age166_zero_turn_orchestration_e2e.rs (/tmp/s11-tauri-test-target/debug/deps/age166_zero_turn_orchestration_e2e-7024887d4cf3a1e3)
+
+running 6 tests
+test e2e_resume_zero_turn_then_turn_clears_false_alarm ... ok
+test e2e_productive_turn_with_nonzero_exit_not_quota_exhausted ... ok
+test e2e_second_zero_turn_confirms_quota_and_migrates ... ok
+test e2e_interactive_maybe_signal_no_auto_relaunch ... ok
+test e2e_first_zero_turn_resumes_same_provider_without_exhausted_write ... ok
+test e2e_resume_zero_turn_then_zero_turn_confirms_quota ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+     Running tests/age240_relocated_support.rs (/tmp/s11-tauri-test-target/debug/deps/age240_relocated_support-e135e965e2e17d32)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/s10_external_provider_resume.rs (/tmp/s11-tauri-test-target/debug/deps/s10_external_provider_resume-5c143b9a91bb88f6)
+
+running 2 tests
+test external_launch_session_id_alias_persists_external_capture_method_without_session_capability ... ok
+test external_provider_resume_without_rotate_uses_external_launch_and_recorded_cwd ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.31s
+
+     Running tests/s11_external_provider_wake.rs (/tmp/s11-tauri-test-target/debug/deps/s11_external_provider_wake-874b8f1aff81713f)
+
+running 8 tests
+test external_provider_policy_rejection_terminal_signal_excerpt_includes_diagnostics ... ok
+test external_provider_runtime_uses_ingested_session_when_launch_capture_missing ... ok
+test external_provider_wake_ignores_submitted_turn_marker_for_different_payload ... ok
+test external_provider_wake_does_not_mark_delivered_when_resume_produces_no_turn ... ok
+test external_provider_wake_confirms_delivery_from_submitted_turn_marker ... ok
+test external_provider_launch_notify_uses_captured_sidecar_owner_and_wakes ... ok
+test external_provider_failed_wake_releases_claim_and_retries_pending_mailbox ... ok
+test external_provider_rate_limited_wake_records_error_and_retries_pending_mailbox ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.59s
+
+     Running tests/wu_b_mailbox_integration.rs (/tmp/s11-tauri-test-target/debug/deps/wu_b_mailbox_integration-66846759b62c2ac7)
+
+running 20 tests
+test notify_no_owner_valid_chain_returns_zero ... ok
+test notify_rejects_reuse_mismatch ... ok
+test notify_missing_chain_is_usage_error ... ok
+test notify_works_after_caller_dead ... ok
+test notify_handle_conflict_different_session ... ok
+test notify_resolves_nearest_ancestor_sidecar_session ... ok
+test notify_idempotent_retried_handle ... ok
+test notify_ordering_by_seq ... ok
+test mailbox_isolation ... ok
+test notify_resolves_from_state_when_sidecar_session_null ... ok
+test resume_without_mailbox_and_without_prompt_preserves_native_resume ... ok
+test resume_without_mailbox_preserves_payload ... ok
+test resume_with_only_mailbox_sends_notification_prompt ... ok
+test resume_failure_leaves_pending ... ok
+test resume_marks_delivered_after_success ... ok
+test resume_uses_resolved_active_session_id ... ok
+test resume_with_pending_mailbox_prepends_notifications ... ok
+test resume_rejects_different_ingested_user_turn_without_assistant_delta ... ok
+test resume_marks_delivered_from_exact_ingested_user_turn_without_assistant_delta ... ok
+test resume_drains_in_order_and_respects_batch_cap ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.84s
+
+tauri_status=0
+
+## opencode-turns shell suite
+opencode-turns tests passed
+opencode_turns_status=0
+
+finished_at=2026-06-06T20:10:22-07:00
+targeted-tests status=0

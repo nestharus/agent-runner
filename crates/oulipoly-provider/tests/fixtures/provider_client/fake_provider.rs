@@ -399,7 +399,10 @@ fn provider_error(category: &str, code: &str, exit_code: i32) -> i32 {
     let stdin = read_stdin_to_string();
     record_invocation_if_requested(&stdin);
     let fields = provider_error_fields(category, code);
-    write_stdout(&provider_error_json(&request_id_from_stdin(&stdin), &fields));
+    write_stdout(&provider_error_json(
+        &request_id_from_stdin(&stdin),
+        &fields,
+    ));
     exit_code
 }
 
@@ -440,7 +443,11 @@ fn success_json() -> String {
 fn describe_with_capabilities(rotation: bool, migration: bool) -> i32 {
     let stdin = read_stdin_to_string();
     record_invocation_if_requested(&stdin);
-    write_stdout(&describe_json(&request_id_from_stdin(&stdin), rotation, migration))
+    write_stdout(&describe_json(
+        &request_id_from_stdin(&stdin),
+        rotation,
+        migration,
+    ))
 }
 
 fn describe_json(request_id: &str, rotation: bool, migration: bool) -> String {

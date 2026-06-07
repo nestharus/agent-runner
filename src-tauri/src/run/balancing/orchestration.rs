@@ -5,9 +5,10 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use oulipoly_config::ModelConfig;
+use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig};
 use oulipoly_runtime::executor;
 use oulipoly_runtime::services::{InvocationLifecycleServicePort, RoutingServicePort};
+use oulipoly_state::CompositeInvocationId;
 use oulipoly_state::repositories::StateDbOpener;
 
 use super::accessor::{BalancedExecutionEnvironment, load_balanced_execution_environment};
@@ -34,11 +35,13 @@ use crate::quota_zero_turn::{
     zero_turn_classify_after_completion, zero_turn_late_bind_baseline, zero_turn_record_baseline,
 };
 use crate::terminal_outcome_adapter::{
-    apply_age153_terminal_signal_fixture_override, balanced_terminal_signal_for_outcome,
-    confirm_maybe_quota_exhausted,
+    TerminalSignalContext, apply_age153_terminal_signal_fixture_override,
+    balanced_terminal_signal_for_outcome, confirm_maybe_quota_exhausted,
 };
 use crate::wiring;
-use crate::zero_turn_orchestration::{ZeroTurnConfirmationState, next_action};
+use crate::zero_turn_orchestration::{
+    ZeroTurnAction, ZeroTurnBaseline, ZeroTurnConfirmationState, next_action,
+};
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_with_balancing(
@@ -96,134 +99,54 @@ fn run_with_balancing_environment(
         attempts += 1;
 
         let pending_verification = pending_same_provider_verification.take();
-        let provider_index = match pending_verification.as_ref() {
-            Some((provider_index, _)) => *provider_index,
-            None => match select_balanced_provider_index(agent_runtime_services, model, &env, &ctx)
-            {
-                Ok(provider_index) => provider_index,
-                Err(err) => {
-                    formatter::emit_provider_selection_pre_invocation_failure(
-                        model,
-                        &err,
-                        provider_selection_pool_exhausted(attempts, model.providers.len()),
-                    );
-                    return Err(err);
-                }
-            },
-        };
-        let (provider, prompt_mode) =
-            match effective_model_for_execution(model, provider_index, &env.providers_cfg) {
-                Ok(effective) => effective,
-                Err(err) => {
-                    formatter::emit_provider_resolution_pre_invocation_failure(
-                        model,
-                        provider_index,
-                        &err,
-                    );
-                    return Err(err);
-                }
-            };
-        let provider_name = &provider.name;
-        let invocation = composite_invocation_id(provider_name);
-        let invocation_start = balanced_invocation_start(
-            &invocation,
+        let attempt_provider = resolve_balanced_attempt_provider(
+            agent_runtime_services,
             model,
-            provider_name,
+            &env,
+            &ctx,
+            attempts,
+            pending_verification.as_ref(),
+        )?;
+        let provider_index = attempt_provider.provider_index;
+        let provider = attempt_provider.provider;
+        let prompt_mode = attempt_provider.prompt_mode;
+        let provider_name = provider.name.as_str();
+        let mut attempt = start_balanced_attempt(
+            agent_runtime_services,
+            &env,
+            model,
+            &provider,
             provider_index,
             parent_invocation_id,
-        );
-        let invocation_row_id = agent_runtime_services
-            .invocation_lifecycle_service
-            // invocation_lifecycle_service.start_invocation(InvocationLifecycleStartRequest
-            .start_invocation(super::mapper::invocation_lifecycle_start_request(
-                &env.state,
-                &invocation_start,
-            ))
-            .map_err(|err| err.to_string())?
-            .invocation_row_id;
-        let mut guard = FinalizerGuard::new(&env.state, invocation_row_id);
-        let start_known_provider_session_id = match pending_verification {
-            Some((_, session_id)) => session_id,
-            None => executor::cli::start_known_provider_session_id(&provider)?,
-        };
-        bind_start_known_provider_session_if_present(
-            &env.state,
-            invocation_row_id,
-            start_known_provider_session_id.as_deref(),
-        );
-        let mut zero_turn_baseline = zero_turn_record_baseline(
-            &env.state,
-            &env.sessions_cfg,
-            provider_name,
-            start_known_provider_session_id.as_deref(),
-        );
-        let invocation_env = formatter::invocation_env(&invocation)
-            .map_err(formatter::invocation_env_serialization_error)?;
-        formatter::emit_invocation_stderr_line(&invocation);
+            pending_verification,
+        )?;
 
-        let executor_request = super::mapper::balanced_executor_request_for_attempt(
-            (model, &provider, provider_index, prompt_mode),
-            (prompt, working_dir, extra_inputs),
-            (&invocation_env, start_known_provider_session_id.clone()),
-        );
-
-        let mut result = match agent_runtime_services
-            .executor_service
-            .execute(executor_request)
-        {
-            Ok(output) => output.result,
-            Err(err) => {
-                finalize_spawn_error(super::mapper::spawn_error_input_for_attempt(
-                    (
-                        agent_runtime_services,
-                        &env,
-                        &invocation,
-                        invocation_row_id,
-                        &mut guard,
-                    ),
-                    (provider_name, start_known_provider_session_id.as_deref()),
-                    err.to_string(),
-                ));
-                return Err(err.to_string());
-            }
-        };
-        apply_age153_terminal_signal_fixture_override(&mut result);
-        let zero_turn_provider_session_id = super::accessor::zero_turn_provider_session_id(
-            start_known_provider_session_id.as_deref(),
-            &result,
-        );
-        if should_late_bind_zero_turn_baseline(
-            &zero_turn_baseline,
-            zero_turn_provider_session_id.as_deref(),
-        ) {
-            let session_id = super::validator::required_late_bind_provider_session_id(
-                zero_turn_provider_session_id.as_deref(),
-            );
-            zero_turn_baseline =
-                zero_turn_late_bind_baseline(&env.sessions_cfg, provider_name, session_id);
-        }
-        let zero_turn_classification =
-            zero_turn_classify_after_completion(&env.state, &env.sessions_cfg, &zero_turn_baseline);
-        apply_zero_turn_classification_to_result(
-            &mut result,
+        let mut result = execute_balanced_attempt(
+            agent_runtime_services,
+            &env,
+            model,
+            &provider,
+            provider_index,
+            prompt_mode,
+            prompt,
+            working_dir,
+            extra_inputs,
+            &mut attempt,
+        )?;
+        let zero_turn = classify_balanced_zero_turn_result(BalancedZeroTurnInput {
+            env: &env,
             provider_name,
-            &zero_turn_classification,
-        );
-        let zero_turn_action = next_action(
-            &mut zero_turn_confirmation,
-            zero_turn_classification_for_action(
-                zero_turn_classification,
-                &result,
-                provider_name,
-                zero_turn_provider_session_id.as_deref(),
-            ),
-        );
+            start_known_provider_session_id: attempt.start_known_provider_session_id.as_deref(),
+            result: &mut result,
+            zero_turn_baseline: &mut attempt.zero_turn_baseline,
+            zero_turn_confirmation: &mut zero_turn_confirmation,
+        });
 
         emit_captured_child_marker_lines(&result.captured_child_invocations);
 
         let terminal_signal_context_ids = super::mapper::terminal_signal_context_ids(
-            &invocation.id,
-            zero_turn_provider_session_id.as_deref(),
+            &attempt.invocation.id,
+            zero_turn.provider_session_id.as_deref(),
         );
         let mut terminal_signal_stderr = std::io::stderr();
         let mut terminal_signal_ctx = super::mapper::terminal_signal_context_for_attempt(
@@ -236,134 +159,452 @@ fn run_with_balancing_environment(
         let balanced_terminal_signal =
             balanced_terminal_signal_for_outcome(&result, should_defer_generic_exit);
 
-        let control = if confirmed_zero_turn_exhaustion(zero_turn_action, &balanced_terminal_signal)
-        {
-            let signal =
-                super::validator::required_confirmed_zero_turn_signal(&balanced_terminal_signal);
-            let _ = confirm_maybe_quota_exhausted(signal, &mut terminal_signal_ctx);
-            handle_maybe_quota_verify(super::mapper::maybe_quota_verify_input_for_attempt(
-                (
-                    agent_runtime_services,
-                    &env,
-                    &invocation,
-                    invocation_row_id,
-                    &mut guard,
-                ),
-                (
-                    provider_name,
-                    provider_index,
-                    zero_turn_provider_session_id.as_deref(),
-                ),
-                (&result, &balanced_terminal_signal, &mut terminal_signal_ctx),
-                (attempts, max_attempts),
-                zero_turn_action,
-                &mut pending_same_provider_verification,
-                true,
-            ))
-        } else {
-            match terminal_signal_branch(&balanced_terminal_signal) {
-                TerminalSignalBranch::QuotaExhaustedRetry => handle_quota_exhausted_retry(
-                    super::mapper::typed_disposition_input_for_attempt(
-                        (
-                            agent_runtime_services,
-                            &env,
-                            &invocation,
-                            invocation_row_id,
-                            &mut guard,
-                        ),
-                        (
-                            provider_name,
-                            provider_index,
-                            zero_turn_provider_session_id.as_deref(),
-                        ),
-                        (&result, &balanced_terminal_signal, &mut terminal_signal_ctx),
-                        (attempts, max_attempts),
-                    ),
-                ),
-                TerminalSignalBranch::MaybeQuotaVerify => {
-                    handle_maybe_quota_verify(super::mapper::maybe_quota_verify_input_for_attempt(
-                        (
-                            agent_runtime_services,
-                            &env,
-                            &invocation,
-                            invocation_row_id,
-                            &mut guard,
-                        ),
-                        (
-                            provider_name,
-                            provider_index,
-                            zero_turn_provider_session_id.as_deref(),
-                        ),
-                        (&result, &balanced_terminal_signal, &mut terminal_signal_ctx),
-                        (attempts, max_attempts),
-                        zero_turn_action,
-                        &mut pending_same_provider_verification,
-                        false,
-                    ))
-                }
-                TerminalSignalBranch::ProlongedSilenceFail => handle_prolonged_silence_fail(
-                    super::mapper::typed_disposition_input_for_attempt(
-                        (
-                            agent_runtime_services,
-                            &env,
-                            &invocation,
-                            invocation_row_id,
-                            &mut guard,
-                        ),
-                        (
-                            provider_name,
-                            provider_index,
-                            zero_turn_provider_session_id.as_deref(),
-                        ),
-                        (&result, &balanced_terminal_signal, &mut terminal_signal_ctx),
-                        (attempts, max_attempts),
-                    ),
-                ),
-                TerminalSignalBranch::InteractiveFail => {
-                    handle_interactive_fail(super::mapper::typed_disposition_input_for_attempt(
-                        (
-                            agent_runtime_services,
-                            &env,
-                            &invocation,
-                            invocation_row_id,
-                            &mut guard,
-                        ),
-                        (
-                            provider_name,
-                            provider_index,
-                            zero_turn_provider_session_id.as_deref(),
-                        ),
-                        (&result, &balanced_terminal_signal, &mut terminal_signal_ctx),
-                        (attempts, max_attempts),
-                    ))
-                }
-                TerminalSignalBranch::CompletedAttempt => {
-                    finalize_completed_attempt(super::mapper::completed_attempt_input_for_attempt(
-                        (
-                            agent_runtime_services,
-                            &env,
-                            &invocation,
-                            invocation_row_id,
-                            &mut guard,
-                        ),
-                        (
-                            provider_name,
-                            provider_index,
-                            zero_turn_provider_session_id.as_deref(),
-                        ),
-                        (&result, &balanced_terminal_signal, &mut terminal_signal_ctx),
-                        (model, all_models, working_dir),
-                        (attempts, max_attempts),
-                    ))
-                }
-            }
-        };
+        let control = dispatch_balanced_terminal_branch(BalancedTerminalDispatchInput {
+            agent_runtime_services,
+            env: &env,
+            model,
+            all_models,
+            working_dir,
+            invocation: &attempt.invocation,
+            invocation_row_id: attempt.invocation_row_id,
+            guard: &mut attempt.guard,
+            provider_name,
+            provider_index,
+            zero_turn_provider_session_id: zero_turn.provider_session_id.as_deref(),
+            result: &result,
+            terminal_signal: &balanced_terminal_signal,
+            terminal_signal_ctx: &mut terminal_signal_ctx,
+            attempts,
+            max_attempts,
+            zero_turn_action: zero_turn.action,
+            pending_same_provider_verification: &mut pending_same_provider_verification,
+        });
 
         match control {
             BalancedLoopControl::Continue => continue,
             BalancedLoopControl::Return(result) => return result,
         }
     }
+}
+
+struct BalancedAttemptProvider {
+    provider_index: usize,
+    provider: ProviderConfig,
+    prompt_mode: PromptMode,
+}
+
+fn resolve_balanced_attempt_provider(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    model: &ModelConfig,
+    env: &BalancedExecutionEnvironment,
+    ctx: &oulipoly_runtime::balancer::BalanceContext<'_>,
+    attempts: usize,
+    pending_verification: Option<&(usize, Option<String>)>,
+) -> Result<BalancedAttemptProvider, String> {
+    let provider_index = attempt_provider_index(
+        agent_runtime_services,
+        model,
+        env,
+        ctx,
+        attempts,
+        pending_verification,
+    )?;
+    let (provider, prompt_mode) = attempt_effective_provider(model, env, provider_index)?;
+    Ok(BalancedAttemptProvider {
+        provider_index,
+        provider,
+        prompt_mode,
+    })
+}
+
+fn attempt_provider_index(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    model: &ModelConfig,
+    env: &BalancedExecutionEnvironment,
+    ctx: &oulipoly_runtime::balancer::BalanceContext<'_>,
+    attempts: usize,
+    pending_verification: Option<&(usize, Option<String>)>,
+) -> Result<usize, String> {
+    match pending_verification {
+        Some((provider_index, _)) => Ok(*provider_index),
+        None => {
+            select_provider_index_for_new_attempt(agent_runtime_services, model, env, ctx, attempts)
+        }
+    }
+}
+
+fn select_provider_index_for_new_attempt(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    model: &ModelConfig,
+    env: &BalancedExecutionEnvironment,
+    ctx: &oulipoly_runtime::balancer::BalanceContext<'_>,
+    attempts: usize,
+) -> Result<usize, String> {
+    match select_balanced_provider_index(agent_runtime_services, model, env, ctx) {
+        Ok(provider_index) => Ok(provider_index),
+        Err(err) => {
+            formatter::emit_provider_selection_pre_invocation_failure(
+                model,
+                &err,
+                provider_selection_pool_exhausted(attempts, model.providers.len()),
+            );
+            Err(err)
+        }
+    }
+}
+
+fn attempt_effective_provider(
+    model: &ModelConfig,
+    env: &BalancedExecutionEnvironment,
+    provider_index: usize,
+) -> Result<(ProviderConfig, PromptMode), String> {
+    match effective_model_for_execution(model, provider_index, &env.providers_cfg) {
+        Ok(effective) => Ok(effective),
+        Err(err) => {
+            formatter::emit_provider_resolution_pre_invocation_failure(model, provider_index, &err);
+            Err(err)
+        }
+    }
+}
+
+struct BalancedInvocationAttempt<'state> {
+    invocation: CompositeInvocationId,
+    invocation_row_id: i64,
+    guard: FinalizerGuard<'state>,
+    start_known_provider_session_id: Option<String>,
+    zero_turn_baseline: ZeroTurnBaseline,
+    invocation_env: String,
+}
+
+fn start_balanced_attempt<'state>(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    env: &'state BalancedExecutionEnvironment,
+    model: &ModelConfig,
+    provider: &ProviderConfig,
+    provider_index: usize,
+    parent_invocation_id: Option<i64>,
+    pending_verification: Option<(usize, Option<String>)>,
+) -> Result<BalancedInvocationAttempt<'state>, String> {
+    let provider_name = provider.name.as_str();
+    let invocation = composite_invocation_id(provider_name);
+    let invocation_row_id = start_balanced_invocation_row(
+        agent_runtime_services,
+        env,
+        model,
+        provider_name,
+        provider_index,
+        parent_invocation_id,
+        &invocation,
+    )?;
+    let guard = FinalizerGuard::new(&env.state, invocation_row_id);
+    let start_known_provider_session_id =
+        start_known_provider_session_id_for_attempt(provider, pending_verification)?;
+    bind_start_known_provider_session_if_present(
+        &env.state,
+        invocation_row_id,
+        start_known_provider_session_id.as_deref(),
+    );
+    let zero_turn_baseline = zero_turn_record_baseline(
+        &env.state,
+        &env.sessions_cfg,
+        provider_name,
+        start_known_provider_session_id.as_deref(),
+    );
+    let invocation_env = formatter::invocation_env(&invocation)
+        .map_err(formatter::invocation_env_serialization_error)?;
+    formatter::emit_invocation_stderr_line(&invocation);
+    Ok(BalancedInvocationAttempt {
+        invocation,
+        invocation_row_id,
+        guard,
+        start_known_provider_session_id,
+        zero_turn_baseline,
+        invocation_env,
+    })
+}
+
+fn start_balanced_invocation_row(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    env: &BalancedExecutionEnvironment,
+    model: &ModelConfig,
+    provider_name: &str,
+    provider_index: usize,
+    parent_invocation_id: Option<i64>,
+    invocation: &CompositeInvocationId,
+) -> Result<i64, String> {
+    let invocation_start = balanced_invocation_start(
+        invocation,
+        model,
+        provider_name,
+        provider_index,
+        parent_invocation_id,
+    );
+    agent_runtime_services
+        .invocation_lifecycle_service
+        // invocation_lifecycle_service.start_invocation(InvocationLifecycleStartRequest
+        .start_invocation(super::mapper::invocation_lifecycle_start_request(
+            &env.state,
+            &invocation_start,
+        ))
+        .map(|start| start.invocation_row_id)
+        .map_err(|err| err.to_string())
+}
+
+fn start_known_provider_session_id_for_attempt(
+    provider: &ProviderConfig,
+    pending_verification: Option<(usize, Option<String>)>,
+) -> Result<Option<String>, String> {
+    match pending_verification {
+        Some((_, session_id)) => Ok(session_id),
+        None => executor::cli::start_known_provider_session_id(provider),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_balanced_attempt(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    env: &BalancedExecutionEnvironment,
+    model: &ModelConfig,
+    provider: &ProviderConfig,
+    provider_index: usize,
+    prompt_mode: PromptMode,
+    prompt: &str,
+    working_dir: Option<&Path>,
+    extra_inputs: &HashMap<String, Vec<String>>,
+    attempt: &mut BalancedInvocationAttempt<'_>,
+) -> Result<executor::ExecutionResult, String> {
+    let executor_request = super::mapper::balanced_executor_request_for_attempt(
+        (model, provider, provider_index, prompt_mode),
+        (prompt, working_dir, extra_inputs),
+        (
+            &attempt.invocation_env,
+            attempt.start_known_provider_session_id.clone(),
+        ),
+    );
+    match agent_runtime_services
+        .executor_service
+        .execute(executor_request)
+    {
+        Ok(output) => Ok(output.result),
+        Err(err) => {
+            let err = err.to_string();
+            finalize_spawn_error(super::mapper::spawn_error_input_for_attempt(
+                (
+                    agent_runtime_services,
+                    env,
+                    &attempt.invocation,
+                    attempt.invocation_row_id,
+                    &mut attempt.guard,
+                ),
+                (
+                    provider.name.as_str(),
+                    attempt.start_known_provider_session_id.as_deref(),
+                ),
+                err.clone(),
+            ));
+            Err(err)
+        }
+    }
+}
+
+struct BalancedZeroTurnInput<'a> {
+    env: &'a BalancedExecutionEnvironment,
+    provider_name: &'a str,
+    start_known_provider_session_id: Option<&'a str>,
+    result: &'a mut executor::ExecutionResult,
+    zero_turn_baseline: &'a mut ZeroTurnBaseline,
+    zero_turn_confirmation: &'a mut ZeroTurnConfirmationState,
+}
+
+struct BalancedZeroTurnOutcome {
+    provider_session_id: Option<String>,
+    action: ZeroTurnAction,
+}
+
+fn classify_balanced_zero_turn_result(input: BalancedZeroTurnInput<'_>) -> BalancedZeroTurnOutcome {
+    apply_age153_terminal_signal_fixture_override(input.result);
+    let provider_session_id = super::accessor::zero_turn_provider_session_id(
+        input.start_known_provider_session_id,
+        input.result,
+    );
+    late_bind_zero_turn_baseline_if_needed(
+        input.env,
+        input.provider_name,
+        provider_session_id.as_deref(),
+        input.zero_turn_baseline,
+    );
+    let zero_turn_classification = zero_turn_classify_after_completion(
+        &input.env.state,
+        &input.env.sessions_cfg,
+        input.zero_turn_baseline,
+    );
+    apply_zero_turn_classification_to_result(
+        input.result,
+        input.provider_name,
+        &zero_turn_classification,
+    );
+    let action = next_action(
+        input.zero_turn_confirmation,
+        zero_turn_classification_for_action(
+            zero_turn_classification,
+            input.result,
+            input.provider_name,
+            provider_session_id.as_deref(),
+        ),
+    );
+    BalancedZeroTurnOutcome {
+        provider_session_id,
+        action,
+    }
+}
+
+fn late_bind_zero_turn_baseline_if_needed(
+    env: &BalancedExecutionEnvironment,
+    provider_name: &str,
+    provider_session_id: Option<&str>,
+    zero_turn_baseline: &mut ZeroTurnBaseline,
+) {
+    if should_late_bind_zero_turn_baseline(zero_turn_baseline, provider_session_id) {
+        let session_id =
+            super::validator::required_late_bind_provider_session_id(provider_session_id);
+        *zero_turn_baseline =
+            zero_turn_late_bind_baseline(&env.sessions_cfg, provider_name, session_id);
+    }
+}
+
+struct BalancedTerminalDispatchInput<'a, 'state, 'ctx> {
+    agent_runtime_services: &'a wiring::AgentRuntimeServices,
+    env: &'a BalancedExecutionEnvironment,
+    model: &'a ModelConfig,
+    all_models: &'a HashMap<String, ModelConfig>,
+    working_dir: Option<&'a Path>,
+    invocation: &'a CompositeInvocationId,
+    invocation_row_id: i64,
+    guard: &'a mut FinalizerGuard<'state>,
+    provider_name: &'a str,
+    provider_index: usize,
+    zero_turn_provider_session_id: Option<&'a str>,
+    result: &'a executor::ExecutionResult,
+    terminal_signal: &'a Option<executor::TerminalSignal>,
+    terminal_signal_ctx: &'a mut TerminalSignalContext<'ctx, std::io::Stderr>,
+    attempts: usize,
+    max_attempts: usize,
+    zero_turn_action: ZeroTurnAction,
+    pending_same_provider_verification: &'a mut Option<(usize, Option<String>)>,
+}
+
+fn dispatch_balanced_terminal_branch(
+    input: BalancedTerminalDispatchInput<'_, '_, '_>,
+) -> BalancedLoopControl {
+    if confirmed_zero_turn_exhaustion(input.zero_turn_action, input.terminal_signal) {
+        return handle_confirmed_zero_turn_exhaustion_branch(input);
+    }
+    let branch = terminal_signal_branch(input.terminal_signal);
+    match branch {
+        TerminalSignalBranch::QuotaExhaustedRetry => {
+            handle_quota_exhausted_retry(typed_disposition_input_from_balanced_dispatch(input))
+        }
+        TerminalSignalBranch::MaybeQuotaVerify => handle_maybe_quota_verify(
+            maybe_quota_verify_input_from_balanced_dispatch(input, false),
+        ),
+        TerminalSignalBranch::ProlongedSilenceFail => {
+            handle_prolonged_silence_fail(typed_disposition_input_from_balanced_dispatch(input))
+        }
+        TerminalSignalBranch::InteractiveFail => {
+            handle_interactive_fail(typed_disposition_input_from_balanced_dispatch(input))
+        }
+        TerminalSignalBranch::CompletedAttempt => {
+            finalize_completed_attempt(completed_attempt_input_from_balanced_dispatch(input))
+        }
+    }
+}
+
+fn handle_confirmed_zero_turn_exhaustion_branch(
+    input: BalancedTerminalDispatchInput<'_, '_, '_>,
+) -> BalancedLoopControl {
+    let signal = super::validator::required_confirmed_zero_turn_signal(input.terminal_signal);
+    let _ = confirm_maybe_quota_exhausted(signal, input.terminal_signal_ctx);
+    handle_maybe_quota_verify(maybe_quota_verify_input_from_balanced_dispatch(input, true))
+}
+
+fn typed_disposition_input_from_balanced_dispatch<'a, 'state, 'ctx>(
+    input: BalancedTerminalDispatchInput<'a, 'state, 'ctx>,
+) -> super::disposition::TypedDispositionInput<'a, 'state, 'ctx> {
+    super::mapper::typed_disposition_input_for_attempt(
+        (
+            input.agent_runtime_services,
+            input.env,
+            input.invocation,
+            input.invocation_row_id,
+            input.guard,
+        ),
+        (
+            input.provider_name,
+            input.provider_index,
+            input.zero_turn_provider_session_id,
+        ),
+        (
+            input.result,
+            input.terminal_signal,
+            input.terminal_signal_ctx,
+        ),
+        (input.attempts, input.max_attempts),
+    )
+}
+
+fn maybe_quota_verify_input_from_balanced_dispatch<'a, 'state, 'ctx>(
+    input: BalancedTerminalDispatchInput<'a, 'state, 'ctx>,
+    signal_already_applied: bool,
+) -> super::disposition::MaybeQuotaVerifyInput<'a, 'state, 'ctx> {
+    super::mapper::maybe_quota_verify_input_for_attempt(
+        (
+            input.agent_runtime_services,
+            input.env,
+            input.invocation,
+            input.invocation_row_id,
+            input.guard,
+        ),
+        (
+            input.provider_name,
+            input.provider_index,
+            input.zero_turn_provider_session_id,
+        ),
+        (
+            input.result,
+            input.terminal_signal,
+            input.terminal_signal_ctx,
+        ),
+        (input.attempts, input.max_attempts),
+        input.zero_turn_action,
+        input.pending_same_provider_verification,
+        signal_already_applied,
+    )
+}
+
+fn completed_attempt_input_from_balanced_dispatch<'a, 'state, 'ctx>(
+    input: BalancedTerminalDispatchInput<'a, 'state, 'ctx>,
+) -> super::finalization::CompletedAttemptInput<'a, 'state, 'ctx> {
+    super::mapper::completed_attempt_input_for_attempt(
+        (
+            input.agent_runtime_services,
+            input.env,
+            input.invocation,
+            input.invocation_row_id,
+            input.guard,
+        ),
+        (
+            input.provider_name,
+            input.provider_index,
+            input.zero_turn_provider_session_id,
+        ),
+        (
+            input.result,
+            input.terminal_signal,
+            input.terminal_signal_ctx,
+        ),
+        (input.model, input.all_models, input.working_dir),
+        (input.attempts, input.max_attempts),
+    )
 }
 
 fn select_balanced_provider_index(
