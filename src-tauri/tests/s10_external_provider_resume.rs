@@ -423,6 +423,18 @@ fn external_provider_resume_terminal_error_exit_zero_finalizes_as_failed() {
     assert_latest_invocation_failed_with_terminal_error(&fixture);
 }
 
+#[test]
+fn external_provider_launch_stream_over_capture_limit_finalizes_succeeded() {
+    let fixture = Fixture::new();
+
+    let output = fixture.run_launch_with_env(&[("S10_LAUNCH_LONG_STREAM", "1")]);
+
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("answer:first prompt"), "{stdout}");
+    assert_latest_invocation_succeeded(&fixture);
+}
+
 fn assert_external_launch_session_capture_rows(rows: &[InvocationSessionRow]) {
     assert_eq!(rows.len(), 2, "rows: {rows:?}");
     assert_external_launch_session_capture_row(&rows[0]);
@@ -491,6 +503,13 @@ fn assert_latest_invocation_failed_with_terminal_error(fixture: &Fixture) {
         row.terminal_reason.as_deref(),
         Some(INCIDENT_TERMINAL_REASON)
     );
+}
+
+fn assert_latest_invocation_succeeded(fixture: &Fixture) {
+    let row = fixture.latest_invocation_outcome();
+    assert_eq!(row.status, InvocationStatus::Succeeded.as_str(), "{row:?}");
+    assert_eq!(row.success, 1, "{row:?}");
+    assert_eq!(row.exit_code, 0, "{row:?}");
 }
 
 fn records_for_subcommand<'a>(records: &'a [Value], subcommand: &str) -> Vec<&'a Value> {
@@ -641,17 +660,30 @@ def launch():
             }},
         }})
         return
+    exit_seq = 2
+    if os.environ.get("S10_LAUNCH_LONG_STREAM") == "1":
+        detail = "h" * 4096
+        for seq in range(2, 702):
+            emit({{
+                "contract": CONTRACT,
+                "request_id": request_id(),
+                "seq": seq,
+                "time_unix_ms": 1000 + seq,
+                "kind": "heartbeat",
+                "detail": detail,
+            }})
+        exit_seq = 702
     emit({{
         "contract": CONTRACT,
         "request_id": request_id(),
-        "seq": 2,
-        "time_unix_ms": 1002,
+        "seq": exit_seq,
+        "time_unix_ms": 1000 + exit_seq,
         "kind": "exit",
         "status": {{"kind": "exited", "code": 0}},
         "terminal_signal": {{
             "kind": "clean_exit",
             "evidence": "fixture clean exit",
-            "observed_at_unix_ms": 1002,
+            "observed_at_unix_ms": 1000 + exit_seq,
         }},
         "session": {{
             {launch_session_key}: SESSION_ID,

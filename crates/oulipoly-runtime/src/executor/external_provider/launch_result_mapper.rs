@@ -5,7 +5,7 @@ use crate::executor::{
     ExecutionResult, SessionCaptureMethod, SessionCaptureResult, SubmittedUserTurn,
 };
 use crate::services::TerminalClassification;
-use oulipoly_provider::stream::{DecodedLaunchEvent, LaunchResult};
+use oulipoly_provider::stream::LaunchResult;
 use serde_json::Value;
 
 const SUBMITTED_USER_TURN_MARKER: &str = "oulipoly.submitted_user_turn";
@@ -45,19 +45,8 @@ pub(crate) fn map_launch_result_with_terminal_classification(
 
 fn submitted_user_turn(result: &LaunchResult) -> Option<SubmittedUserTurn> {
     result
-        .events
-        .iter()
-        .find_map(submitted_user_turn_from_event)
-}
-
-fn submitted_user_turn_from_event(event: &DecodedLaunchEvent) -> Option<SubmittedUserTurn> {
-    let DecodedLaunchEvent::Marker { name, value, .. } = event else {
-        return None;
-    };
-    if name != SUBMITTED_USER_TURN_MARKER {
-        return None;
-    }
-    submitted_user_turn_from_marker_value(value)
+        .retained_marker_value(SUBMITTED_USER_TURN_MARKER)
+        .and_then(submitted_user_turn_from_marker_value)
 }
 
 fn submitted_user_turn_from_marker_value(value: &Value) -> Option<SubmittedUserTurn> {

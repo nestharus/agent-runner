@@ -2,7 +2,7 @@ pub mod support {
     pub mod provider_client;
 }
 
-use oulipoly_provider::stream::LaunchJsonlReader;
+use oulipoly_provider::stream::{LaunchJsonlReader, LaunchStreamLimits};
 use serde_json::json;
 use support::provider_client::{
     REQUEST_ID, json_line, launch_exit_event, launch_heartbeat_event, launch_marker_event,
@@ -27,6 +27,36 @@ fn launch_reader_accepts_stdout_stderr_marker_heartbeat_and_final_exit() {
     assert_eq!(result.events.len(), 5);
     assert_eq!(result.stdout_bytes(), vec![0x00, 0x01, 0xff]);
     assert_eq!(result.stderr_bytes(), b"err".to_vec());
+}
+
+#[test]
+fn launch_reader_retains_bounded_state_independent_of_stream_volume() {
+    let mut jsonl = String::new();
+    for seq in 1..=5_000 {
+        jsonl.push_str(&json_line(&launch_stdout_event(seq, "YQ==")));
+    }
+    jsonl.push_str(&json_line(&launch_marker_event(5_001)));
+    jsonl.push_str(&json_line(&launch_exit_event(5_002, 0)));
+
+    let limits = LaunchStreamLimits {
+        retained_events: 8,
+        retained_event_bytes: 128,
+        retained_output_bytes: 64,
+        max_line_bytes: 4096,
+    };
+    let result = LaunchJsonlReader::new(REQUEST_ID)
+        .with_limits(limits)
+        .read(jsonl.as_bytes())
+        .expect("large valid launch JSONL should parse with bounded retention");
+
+    assert_eq!(result.exit.seq, 5_002);
+    assert!(result.events.len() <= limits.retained_events);
+    assert!(result.retained_events_omitted() > 0);
+    assert_eq!(result.stdout_bytes().len(), limits.retained_output_bytes);
+    assert_eq!(
+        result.retained_marker_value("example-marker"),
+        Some(&json!({ "phase": "example" }))
+    );
 }
 
 #[test]

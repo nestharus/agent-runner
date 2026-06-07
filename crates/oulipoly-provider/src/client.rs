@@ -3,12 +3,14 @@ use crate::error::{
     check_contract_and_request, request_id_from,
 };
 use crate::generated::ProcessStatus;
-use crate::process::{ByteLimit, ProcessCommand, ProcessLimits, ProcessOutcome, ProcessRunner};
+use crate::process::{
+    ByteLimit, ProcessCommand, ProcessLimits, ProcessOutcome, ProcessRunner, StdoutDrainOutput,
+};
 use crate::resolver::{
     ProviderArtifactRef, ProviderResolveOptions, ProviderResolver, ResolvedProviderCommand,
 };
 use crate::schemas::{SchemaRegistry, SchemaValidationError};
-use crate::stream::{LaunchJsonlReader, LaunchResult};
+use crate::stream::{LaunchResult, LaunchStdoutDrain, LaunchStdoutProcessor};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::ffi::OsString;
@@ -253,25 +255,17 @@ impl ProviderClient {
         let registry = SchemaRegistry::new();
         validate_launch_request(&registry, &request, request_id.clone())?;
         let resolved = self.resolve("launch", request_id.clone())?;
-        let outcome = self.run_resolved(
-            "launch",
-            &resolved,
-            request,
-            envs,
-            self.options.timeouts.launch,
-        )?;
+        let outcome = self.run_launch_resolved(&resolved, request, envs)?;
         let diagnostics = launch_diagnostics(&outcome);
         self.record_process_state(&outcome, &diagnostics);
-        ensure_launch_stdout_within_limit(&diagnostics, request_id.clone(), &outcome.status)?;
-        parse_launch_output(
-            outcome.stdout.bytes,
-            diagnostics,
-            outcome.status,
-            request_id,
-        )
+        parse_launch_output(outcome.stdout, diagnostics, outcome.status)
     }
 
-    fn record_process_state(&self, outcome: &ProcessOutcome, diagnostics: &ProviderDiagnostics) {
+    fn record_process_state<T: StdoutDrainOutput>(
+        &self,
+        outcome: &ProcessOutcome<T>,
+        diagnostics: &ProviderDiagnostics,
+    ) {
         *self
             .last_argv
             .lock()
@@ -321,6 +315,32 @@ impl ProviderClient {
             runner.run(command, request_bytes, envs.into_env_vec())
         };
         result.map_err(|error| error.with_request_id_if_missing(request_id))
+    }
+
+    fn run_launch_resolved<I>(
+        &self,
+        resolved: &ResolvedProviderCommand,
+        request: Value,
+        envs: I,
+    ) -> Result<ProcessOutcome<LaunchStdoutDrain>, ProviderClientError>
+    where
+        I: ProviderEnv,
+    {
+        let request_id = request_id_from(&request);
+        let request_bytes = serialize_request_bytes("launch", &request, request_id.clone())?;
+        let limits = process_limits_for("launch", self.options.timeouts.launch, &self.options);
+        let command = process_command_from_resolved(resolved, "launch");
+        let stdout_processor =
+            LaunchStdoutProcessor::new(request_id.clone().unwrap_or_default(), limits.stdout_limit);
+        let runner = ProcessRunner::new(limits);
+        runner
+            .run_with_stdout_line_gap_timeout_and_stdout_processor(
+                command,
+                request_bytes,
+                envs.into_env_vec(),
+                stdout_processor,
+            )
+            .map_err(|error| error.with_request_id_if_missing(request_id))
     }
 }
 
@@ -579,50 +599,19 @@ fn success_envelope_has_nonzero_process(outcome: &ProcessOutcome) -> bool {
     !outcome.status.exited_successfully() && !outcome.stdin_closed_early
 }
 
-fn launch_diagnostics(outcome: &ProcessOutcome) -> ProviderDiagnostics {
+fn launch_diagnostics<T: StdoutDrainOutput>(outcome: &ProcessOutcome<T>) -> ProviderDiagnostics {
     let mut diagnostics = outcome.diagnostics();
     diagnostics.provider_exit_code = provider_exit_code(&outcome.status);
     diagnostics.provider_process_nonzero = provider_nonzero(&outcome.status);
     diagnostics
 }
 
-fn map_launch_stdout_limit_error(
-    request_id: Option<String>,
-    diagnostics: ProviderDiagnostics,
-    status: ProcessStatus,
-) -> ProviderClientError {
-    ProviderClientError::host_transport(
-        HostErrorKind::StdoutLimitExceeded,
-        "launch",
-        request_id,
-        diagnostics.clone(),
-    )
-    .with_process_context(diagnostics, status)
-}
-
-fn ensure_launch_stdout_within_limit(
-    diagnostics: &ProviderDiagnostics,
-    request_id: Option<String>,
-    status: &ProcessStatus,
-) -> Result<(), ProviderClientError> {
-    if diagnostics.stdout.truncated {
-        return Err(map_launch_stdout_limit_error(
-            request_id,
-            diagnostics.clone(),
-            status.clone(),
-        ));
-    }
-    Ok(())
-}
-
 fn parse_launch_output(
-    stdout: Vec<u8>,
+    stdout: LaunchStdoutDrain,
     diagnostics: ProviderDiagnostics,
     status: ProcessStatus,
-    request_id: Option<String>,
 ) -> Result<LaunchResult, ProviderClientError> {
-    let reader = LaunchJsonlReader::new(request_id.unwrap_or_default());
-    match reader.read(&stdout[..]) {
+    match stdout.result {
         Ok(mut result) => {
             result.diagnostics = diagnostics.clone();
             Ok(result)

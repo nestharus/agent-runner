@@ -19,6 +19,10 @@ impl ByteLimit {
     pub fn new(bytes: usize) -> Self {
         Self { bytes }
     }
+
+    pub(crate) fn bytes(self) -> usize {
+        self.bytes
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -71,6 +75,99 @@ impl ByteAccumulator {
             contains_nul: self.contains_nul,
             contains_high_bit: self.contains_high_bit,
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ByteTailAccumulator {
+    limit: ByteLimit,
+    bytes: Vec<u8>,
+    discarded_len: usize,
+    contains_nul: bool,
+    contains_high_bit: bool,
+}
+
+impl ByteTailAccumulator {
+    pub(crate) fn new(limit: ByteLimit) -> Self {
+        Self {
+            limit,
+            bytes: Vec::new(),
+            discarded_len: 0,
+            contains_nul: false,
+            contains_high_bit: false,
+        }
+    }
+
+    pub(crate) fn push(&mut self, chunk: &[u8]) {
+        self.contains_nul |= chunk_contains_nul(chunk);
+        self.contains_high_bit |= chunk_contains_high_bit(chunk);
+        if self.limit.bytes == 0 {
+            self.discarded_len += chunk.len();
+            return;
+        }
+
+        self.bytes.extend_from_slice(chunk);
+        if self.bytes.len() <= self.limit.bytes {
+            return;
+        }
+
+        let overflow = self.bytes.len() - self.limit.bytes;
+        self.bytes.drain(..overflow);
+        self.discarded_len += overflow;
+    }
+
+    pub(crate) fn finish(self) -> CapturedBytes {
+        let captured_len = self.bytes.len();
+        CapturedBytes {
+            bytes: self.bytes,
+            limit: self.limit.bytes,
+            captured_len,
+            discarded_len: self.discarded_len,
+            truncated: self.discarded_len > 0,
+            contains_nul: self.contains_nul,
+            contains_high_bit: self.contains_high_bit,
+        }
+    }
+}
+
+pub(crate) trait StdoutDrainOutput: Default + Send + 'static {
+    fn captured_bytes(&self) -> CapturedBytes;
+}
+
+impl StdoutDrainOutput for CapturedBytes {
+    fn captured_bytes(&self) -> CapturedBytes {
+        self.clone()
+    }
+}
+
+pub(crate) trait StdoutProcessor: Send + 'static {
+    type Output: StdoutDrainOutput;
+
+    fn push(&mut self, chunk: &[u8]);
+    fn finish(self) -> Self::Output;
+}
+
+struct ByteCaptureProcessor {
+    accumulator: ByteAccumulator,
+}
+
+impl ByteCaptureProcessor {
+    fn new(limit: ByteLimit) -> Self {
+        Self {
+            accumulator: ByteAccumulator::new(limit),
+        }
+    }
+}
+
+impl StdoutProcessor for ByteCaptureProcessor {
+    type Output = CapturedBytes;
+
+    fn push(&mut self, chunk: &[u8]) {
+        self.accumulator.push(chunk);
+    }
+
+    fn finish(self) -> Self::Output {
+        self.accumulator.finish()
     }
 }
 
@@ -205,16 +302,16 @@ impl ProcessCommand {
 }
 
 #[derive(Debug, Clone)]
-pub struct ProcessOutcome {
+pub struct ProcessOutcome<T = CapturedBytes> {
     pub status: ProcessStatus,
-    pub stdout: CapturedBytes,
+    pub stdout: T,
     pub stderr: CapturedBytes,
     pub stdin_closed_early: bool,
     pub host_cancellation_requested: bool,
     argv: Vec<OsString>,
 }
 
-impl ProcessOutcome {
+impl ProcessOutcome<CapturedBytes> {
     #[cfg(test)]
     pub fn stdout_text(&self) -> String {
         String::from_utf8_lossy(&self.stdout.bytes).into_owned()
@@ -224,14 +321,16 @@ impl ProcessOutcome {
     pub fn stderr_text(&self) -> String {
         String::from_utf8_lossy(&self.stderr.bytes).into_owned()
     }
+}
 
+impl<T: StdoutDrainOutput> ProcessOutcome<T> {
     pub fn argv(&self) -> &[OsString] {
         &self.argv
     }
 
     pub fn diagnostics(&self) -> ProviderDiagnostics {
         ProviderDiagnostics {
-            stdout: self.stdout.clone(),
+            stdout: self.stdout.captured_bytes(),
             stderr: self.stderr.clone(),
             stdin_closed_early: self.stdin_closed_early,
             host_cancellation_requested: self.host_cancellation_requested,
@@ -247,8 +346,8 @@ pub struct ProcessRunner {
     limits: ProcessLimits,
 }
 
-struct ProcessThreads {
-    stdout: thread::JoinHandle<CapturedBytes>,
+struct ProcessThreads<T: StdoutDrainOutput> {
+    stdout: thread::JoinHandle<T>,
     stderr: thread::JoinHandle<CapturedBytes>,
     stdin: thread::JoinHandle<bool>,
 }
@@ -297,6 +396,28 @@ impl ProcessRunner {
         self.run_with_timeout_mode(command, stdin_bytes, envs, TimeoutMode::StdoutLineGap)
     }
 
+    pub(crate) fn run_with_stdout_line_gap_timeout_and_stdout_processor<I, K, V, P>(
+        &self,
+        command: ProcessCommand,
+        stdin_bytes: Vec<u8>,
+        envs: I,
+        stdout_processor: P,
+    ) -> Result<ProcessOutcome<P::Output>, ProviderClientError>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
+        P: StdoutProcessor,
+    {
+        self.run_with_timeout_mode_and_stdout_processor(
+            command,
+            stdin_bytes,
+            envs,
+            TimeoutMode::StdoutLineGap,
+            stdout_processor,
+        )
+    }
+
     fn run_with_timeout_mode<I, K, V>(
         &self,
         command: ProcessCommand,
@@ -309,6 +430,29 @@ impl ProcessRunner {
         K: AsRef<OsStr>,
         V: AsRef<OsStr>,
     {
+        self.run_with_timeout_mode_and_stdout_processor(
+            command,
+            stdin_bytes,
+            envs,
+            timeout_mode,
+            ByteCaptureProcessor::new(self.limits.stdout_limit),
+        )
+    }
+
+    fn run_with_timeout_mode_and_stdout_processor<I, K, V, P>(
+        &self,
+        command: ProcessCommand,
+        stdin_bytes: Vec<u8>,
+        envs: I,
+        timeout_mode: TimeoutMode,
+        stdout_processor: P,
+    ) -> Result<ProcessOutcome<P::Output>, ProviderClientError>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
+        P: StdoutProcessor,
+    {
         let argv = command.argv();
         let mut child = spawn_provider_process(&command, envs)?;
         notify_spawn_observer(&self.limits.spawn_observer, child.id());
@@ -316,9 +460,9 @@ impl ProcessRunner {
         let threads = start_process_threads(
             &mut child,
             stdin_bytes,
-            self.limits.stdout_limit,
             self.limits.stderr_limit,
             stdout_line_activity,
+            stdout_processor,
         );
 
         let started = Instant::now();
@@ -364,11 +508,11 @@ impl ProcessRunner {
         }
     }
 
-    fn terminate_and_collect(
+    fn terminate_and_collect<T: StdoutDrainOutput>(
         &self,
         mut child: Child,
         command: ProcessCommand,
-        threads: ProcessThreads,
+        threads: ProcessThreads<T>,
         kind: HostErrorKind,
         host_cancellation_requested: bool,
     ) -> ProviderClientError {
@@ -422,13 +566,13 @@ where
     process
 }
 
-fn start_process_threads(
+fn start_process_threads<P: StdoutProcessor>(
     child: &mut Child,
     stdin_bytes: Vec<u8>,
-    stdout_limit: ByteLimit,
     stderr_limit: ByteLimit,
     stdout_line_activity: Option<Sender<Instant>>,
-) -> ProcessThreads {
+    stdout_processor: P,
+) -> ProcessThreads<P::Output> {
     let stdout = child
         .stdout
         .take()
@@ -439,7 +583,9 @@ fn start_process_threads(
         .expect("stderr pipe should be configured");
     let stdin = child.stdin.take().expect("stdin pipe should be configured");
     ProcessThreads {
-        stdout: thread::spawn(move || drain_reader(stdout, stdout_limit, stdout_line_activity)),
+        stdout: thread::spawn(move || {
+            drain_reader_with_processor(stdout, stdout_line_activity, stdout_processor)
+        }),
         stderr: thread::spawn(move || drain_reader(stderr, stderr_limit, None)),
         stdin: thread::spawn(move || write_stdin(stdin, stdin_bytes)),
     }
@@ -454,16 +600,16 @@ fn poll_child_status(
         .map_err(|error| host_process_error(HostErrorKind::WaitFailed, command, error))
 }
 
-fn map_completed_process_outcome(
+fn map_completed_process_outcome<T: StdoutDrainOutput>(
     status: ExitStatus,
-    threads: ProcessThreads,
+    threads: ProcessThreads<T>,
     cancellation_started: bool,
     limits: &ProcessLimits,
     argv: Vec<OsString>,
-) -> ProcessOutcome {
+) -> ProcessOutcome<T> {
     ProcessOutcome {
         status: process_status(status),
-        stdout: join_capture(threads.stdout),
+        stdout: join_stdout(threads.stdout),
         stderr: join_capture(threads.stderr),
         stdin_closed_early: join_stdin(threads.stdin),
         host_cancellation_requested: host_cancellation_was_requested(cancellation_started, limits),
@@ -548,14 +694,14 @@ fn should_force_kill(grace_started: &Instant, kill_after_grace: Duration) -> boo
     grace_started.elapsed() >= kill_after_grace
 }
 
-fn map_termination_diagnostics(
-    threads: ProcessThreads,
+fn map_termination_diagnostics<T: StdoutDrainOutput>(
+    threads: ProcessThreads<T>,
     terminated: TerminatedProcess,
     host_cancellation_requested: bool,
 ) -> ProviderDiagnostics {
     let _stdin_closed_early = join_stdin(threads.stdin);
     let mut diagnostics = ProviderDiagnostics {
-        stdout: join_capture(threads.stdout),
+        stdout: join_stdout(threads.stdout).captured_bytes(),
         stderr: join_capture(threads.stderr),
         process_was_force_killed: terminated.force_killed,
         process_was_reaped: terminated.status.is_some(),
@@ -581,7 +727,18 @@ fn drain_reader(
     limit: ByteLimit,
     stdout_line_activity: Option<Sender<Instant>>,
 ) -> CapturedBytes {
-    let mut accumulator = ByteAccumulator::new(limit);
+    drain_reader_with_processor(
+        &mut reader,
+        stdout_line_activity,
+        ByteCaptureProcessor::new(limit),
+    )
+}
+
+fn drain_reader_with_processor<P: StdoutProcessor>(
+    mut reader: impl Read,
+    stdout_line_activity: Option<Sender<Instant>>,
+    mut processor: P,
+) -> P::Output {
     let mut buffer = [0_u8; 8192];
     loop {
         match reader.read(&mut buffer) {
@@ -589,13 +746,13 @@ fn drain_reader(
             Ok(read) => {
                 let chunk = &buffer[..read];
                 notify_stdout_line_activity(&stdout_line_activity, chunk);
-                accumulator.push(chunk);
+                processor.push(chunk);
             }
             Err(error) if error.kind() == ErrorKind::Interrupted => {}
             Err(_) => break,
         }
     }
-    accumulator.finish()
+    processor.finish()
 }
 
 fn notify_stdout_line_activity(activity: &Option<Sender<Instant>>, chunk: &[u8]) {
@@ -631,6 +788,10 @@ fn stdin_write_closed_early(error: &std::io::Error) -> bool {
 }
 
 fn join_capture(handle: thread::JoinHandle<CapturedBytes>) -> CapturedBytes {
+    handle.join().unwrap_or_default()
+}
+
+fn join_stdout<T: StdoutDrainOutput>(handle: thread::JoinHandle<T>) -> T {
     handle.join().unwrap_or_default()
 }
 

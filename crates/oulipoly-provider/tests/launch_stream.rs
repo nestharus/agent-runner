@@ -88,6 +88,23 @@ fn launch_provider_nonzero_after_valid_final_exit_is_nonfatal_diagnostic() {
 }
 
 #[test]
+fn launch_accepts_valid_stream_larger_than_transport_capture_limit() {
+    let fake = FakeProvider::compile(fake_provider_source());
+    let result = launch_client(fake.path())
+        .launch(
+            launch_request(),
+            FakeProviderMode::LaunchLongValidStream.env(),
+        )
+        .expect("valid launch streams must not fail on accumulated stdout volume");
+
+    assert_eq!(result.exit.status, ProcessStatus::Exited { code: 0 });
+    assert!(
+        result.diagnostics.stdout.truncated,
+        "diagnostics should record that bounded transport evidence was retained"
+    );
+}
+
+#[test]
 fn launch_provider_nonzero_without_final_exit_is_transport_error() {
     let fake = FakeProvider::compile(fake_provider_source());
     let error = launch_client(fake.path())

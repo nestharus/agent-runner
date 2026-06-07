@@ -97,6 +97,7 @@ fn dispatch_fake_provider_mode(mode: &str) -> i32 {
         "launch-provider-nonzero-after-final" => launch_provider_nonzero_after_final(),
         "launch-provider-nonzero-no-final" => launch_provider_nonzero_no_final(),
         "launch-cancelled-final-event" => launch_cancelled_final_event(),
+        "launch-long-valid-stream" => launch_long_valid_stream(),
         "launch-malformed-line" => write_stdout("{not-json}\n"),
         "launch-malformed-line-nonzero" => launch_malformed_line_nonzero(),
         "launch-malformed-line-stderr" => launch_malformed_line_stderr(),
@@ -920,6 +921,18 @@ fn launch_cancelled_final_event() -> i32 {
     0
 }
 
+fn launch_long_valid_stream() -> i32 {
+    let request_id = read_request_id();
+    let mut stdout = io::stdout().lock();
+    let detail = "h".repeat(4096);
+    for seq in 1..=700 {
+        let _ = writeln!(stdout, "{}", heartbeat_event_with_detail(&request_id, seq, &detail));
+    }
+    let _ = writeln!(stdout, "{}", exit_event(&request_id, 701, 0));
+    let _ = stdout.flush();
+    0
+}
+
 fn launch_malformed_line_nonzero() -> i32 {
     write_stdout("{not-json}\n");
     8
@@ -1050,9 +1063,14 @@ fn marker_event(request_id: &str, seq: u64) -> String {
 }
 
 fn heartbeat_event(request_id: &str, seq: u64) -> String {
+    heartbeat_event_with_detail(request_id, seq, "example heartbeat")
+}
+
+fn heartbeat_event_with_detail(request_id: &str, seq: u64, detail: &str) -> String {
     let request_id = json_escape(request_id);
+    let detail = json_escape(detail);
     format!(
-        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"seq\":{seq},\"time_unix_ms\":{},\"kind\":\"heartbeat\",\"detail\":\"example heartbeat\"}}",
+        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"seq\":{seq},\"time_unix_ms\":{},\"kind\":\"heartbeat\",\"detail\":\"{detail}\"}}",
         1000 + seq
     )
 }
